@@ -1802,6 +1802,7 @@ pub fn getattr(obj: PyObjectRef, name: &str) -> PyResult {
             || is_range_iter(obj)
             || pyre_object::dictviewobject::is_dict_view_iterator(obj)
             || pyre_object::enumerateobject::is_enumerate(obj)
+            || pyre_object::callableiteratorobject::is_callable_iterator(obj)
         {
             let entry: Option<(fn(&[PyObjectRef]) -> PyResult, &str)> = match name {
                 "__next__" => Some((iter_next_method, "__next__")),
@@ -5526,6 +5527,10 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
         if pyre_object::enumerateobject::is_enumerate(obj) {
             return Ok(obj);
         }
+        // `iter(callable, sentinel)` product — its own iterator.
+        if pyre_object::callableiteratorobject::is_callable_iterator(obj) {
+            return Ok(obj);
+        }
         // pypy/objspace/descroperation.py:330-346 `def iter(space, w_obj)`
         // — `space.lookup(w_obj, '__iter__')` is type-MRO-only; PyPy never
         // consults the instance dict for special-method lookup (CPython
@@ -5813,6 +5818,24 @@ pub fn next(obj: PyObjectRef) -> PyResult {
         //         if w_item is None:
         //             w_item = space.next(self.w_iter_or_list)
         //         return space.newtuple2(w_index, w_item)
+        // `iter(callable, sentinel)` product (`Objects/iterobject.c`
+        // `calliter_iternext`): invoke the zero-arg callable; stop when
+        // the result equals the sentinel.  Once exhausted, `callable` is
+        // latched to `PY_NULL` so further `next()` keeps raising.
+        if pyre_object::callableiteratorobject::is_callable_iterator(obj) {
+            use pyre_object::callableiteratorobject as ci;
+            let callable = ci::w_callable_iterator_get_callable(obj);
+            if callable.is_null() {
+                return Err(PyError::stop_iteration());
+            }
+            let result = crate::call::call_function_impl_result(callable, &[])?;
+            let sentinel = ci::w_callable_iterator_get_sentinel(obj);
+            if eq_w(sentinel, result) {
+                ci::w_callable_iterator_set_callable(obj, pyre_object::PY_NULL);
+                return Err(PyError::stop_iteration());
+            }
+            return Ok(result);
+        }
         if pyre_object::enumerateobject::is_enumerate(obj) {
             use pyre_object::enumerateobject as eo;
             let w_index_slot = eo::w_enumerate_get_w_index(obj);

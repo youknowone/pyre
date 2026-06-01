@@ -2579,14 +2579,26 @@ fn builtin_super(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     })
 }
 
-/// `iter(obj)` — PyPy: baseobjspace.py iter
+/// `iter(obj)` / `iter(callable, sentinel)` — PyPy:
+/// `module/__builtin__/operation.py` iter
 fn builtin_iter(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    if args.is_empty() {
-        return Err(crate::PyError::type_error(
+    match args.len() {
+        0 => Err(crate::PyError::type_error(
             "iter() requires at least one argument",
-        ));
+        )),
+        1 => crate::baseobjspace::iter(args[0]),
+        2 => {
+            if !crate::baseobjspace::callable_w(args[0]) {
+                return Err(crate::PyError::type_error("iter(v, w): v must be callable"));
+            }
+            Ok(pyre_object::callableiteratorobject::w_callable_iterator_new(
+                args[0], args[1],
+            ))
+        }
+        n => Err(crate::PyError::type_error(format!(
+            "iter expected at most 2 arguments, got {n}"
+        ))),
     }
-    crate::baseobjspace::iter(args[0])
 }
 
 /// `next(iterator[, default])` — PyPy: baseobjspace.py next

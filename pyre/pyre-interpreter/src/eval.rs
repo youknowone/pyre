@@ -1420,6 +1420,7 @@ impl IterOpcodeHandler for PyFrame {
                 || pyre_object::itertoolsmodule::is_count(iter)
                 || pyre_object::dictviewobject::is_dict_view_iterator(iter)
                 || pyre_object::enumerateobject::is_enumerate(iter)
+                || pyre_object::callableiteratorobject::is_callable_iterator(iter)
             {
                 return Ok(());
             }
@@ -1577,6 +1578,7 @@ impl IterOpcodeHandler for PyFrame {
             if pyre_object::itertoolsmodule::is_repeat(iter)
                 || pyre_object::itertoolsmodule::is_count(iter)
                 || pyre_object::enumerateobject::is_enumerate(iter)
+                || pyre_object::callableiteratorobject::is_callable_iterator(iter)
                 || pyre_object::dictviewobject::is_dict_view_iterator(iter)
             {
                 match crate::baseobjspace::next(iter) {
@@ -1622,6 +1624,7 @@ impl IterOpcodeHandler for PyFrame {
                 || pyre_object::itertoolsmodule::is_repeat(iter)
                 || pyre_object::itertoolsmodule::is_count(iter)
                 || pyre_object::enumerateobject::is_enumerate(iter)
+                || pyre_object::callableiteratorobject::is_callable_iterator(iter)
                 || pyre_object::dictviewobject::is_dict_view_iterator(iter)
         } {
             let cached = USER_ITER_NEXT_CACHE.with(|c| c.get());

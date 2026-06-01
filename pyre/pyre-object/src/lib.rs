@@ -17,6 +17,7 @@ pub mod dict_eq_hook;
 pub mod dictmultiobject;
 pub mod dictproxyobject;
 pub mod dictstrategy;
+pub mod callableiteratorobject;
 pub mod dictviewobject;
 pub mod enumerateobject;
 pub mod excobject;
