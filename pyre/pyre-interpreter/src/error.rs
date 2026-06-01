@@ -580,6 +580,39 @@ impl PyError {
         }
     }
 
+    /// Raise an OSError carrying the C-level `(errno, strerror)` pair,
+    /// matching `OSError.__init__`'s 2-argument form: `args` becomes
+    /// `(errno, strerror)`, `str(e)` is `"[Errno N] strerror"`, and
+    /// `e.errno` / `e.strerror` read back the two values.  ENOENT keeps
+    /// the FileNotFoundError subclass mapping of `os_error_with_errno`.
+    pub fn os_error_errno_strerror(errno: i32, strerror: impl Into<String>) -> Self {
+        let strerror = strerror.into();
+        let kind = if errno == 2 {
+            PyErrorKind::FileNotFoundError
+        } else {
+            PyErrorKind::OSError
+        };
+        let exc_kind = if errno == 2 {
+            ExcKind::FileNotFoundError
+        } else {
+            ExcKind::OSError
+        };
+        let message = format!("[Errno {errno}] {strerror}");
+        let exc = w_exception_new(exc_kind, &message);
+        let args_list = pyre_object::w_list_new(vec![
+            pyre_object::w_int_new(errno as i64),
+            pyre_object::w_str_new(&strerror),
+        ]);
+        unsafe { pyre_object::excobject::w_exception_set_args(exc, args_list) };
+        PyError {
+            kind,
+            message,
+            exc_object: exc,
+            attach_tb: true,
+            reraise_lasti: -1,
+        }
+    }
+
     /// pypy/module/_weakref/interp__weakref.py:347 — raised by `force()`
     /// when the referent of a proxy is no longer alive.
     pub fn reference_error(msg: impl Into<String>) -> Self {

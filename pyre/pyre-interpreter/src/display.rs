@@ -645,6 +645,35 @@ pub unsafe fn py_str(obj: PyObjectRef) -> String {
                         return py_repr(first);
                     }
                 }
+                // `interp_exceptions.py:1330-1345 W_OSError.descr_str` —
+                // the 2-argument `(errno, strerror)` form renders as
+                // `"[Errno N] strerror"`, extended with `": 'filename'"`
+                // when a third argument is present.  Fewer than two args
+                // falls back to `W_BaseException.descr_str` below.
+                pyre_object::excobject::ExcKind::OSError
+                | pyre_object::excobject::ExcKind::FileNotFoundError => {
+                    let args = pyre_object::excobject::w_exception_get_args(obj);
+                    if !args.is_null() && pyre_object::is_tuple(args) {
+                        let n = pyre_object::w_tuple_len(args);
+                        if n >= 2 {
+                            let a0 = pyre_object::w_tuple_getitem(args, 0).unwrap_or(args);
+                            let a1 = pyre_object::w_tuple_getitem(args, 1).unwrap_or(args);
+                            let errno = py_str(a0);
+                            let strerror = py_str(a1);
+                            if n >= 3 {
+                                if let Some(fname) = pyre_object::w_tuple_getitem(args, 2) {
+                                    if !pyre_object::is_none(fname) {
+                                        return format!(
+                                            "[Errno {errno}] {strerror}: {}",
+                                            py_repr(fname)
+                                        );
+                                    }
+                                }
+                            }
+                            return format!("[Errno {errno}] {strerror}");
+                        }
+                    }
+                }
                 _ => {}
             }
             let args = pyre_object::excobject::w_exception_get_args(obj);

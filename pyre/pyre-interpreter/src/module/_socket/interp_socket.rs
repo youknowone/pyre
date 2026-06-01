@@ -1792,7 +1792,18 @@ fn socket_type() -> pyre_object::PyObjectRef {
 
 #[cfg(unix)]
 fn socket_io_err(e: std::io::Error) -> crate::PyError {
-    crate::PyError::os_error_with_errno(e.raw_os_error().unwrap_or(0), format!("socket: {e}"))
+    let errno = e.raw_os_error().unwrap_or(0);
+    // `rsocket.py` carries the C `strerror` text; build the OSError in
+    // its `(errno, strerror)` form so `e.errno` and `str(e)` match.
+    let strerror = unsafe {
+        let p = libc::strerror(errno);
+        if p.is_null() {
+            format!("Unknown error {errno}")
+        } else {
+            std::ffi::CStr::from_ptr(p).to_string_lossy().into_owned()
+        }
+    };
+    crate::PyError::os_error_errno_strerror(errno, strerror)
 }
 
 #[cfg(unix)]

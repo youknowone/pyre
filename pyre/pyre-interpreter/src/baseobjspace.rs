@@ -2807,6 +2807,50 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str) -> PyResult {
                     return Ok(w_none());
                 }
             }
+            // `interp_exceptions.py:1300-1316 W_OSError` exposes
+            // `errno` / `strerror` / `filename` / `filename2` as
+            // `readwrite_attrproperty_w` slots, set by the 2..=5-argument
+            // `descr_init` form (`errno = args[0]`, `strerror = args[1]`,
+            // `filename = args[2]`, `filename2 = args[4]`).  pyre keeps
+            // those values in `args_w`, so derive them from there with
+            // the same argument-count gate; fewer than two arguments
+            // leaves all four `None` (the class defaults).
+            "errno" | "strerror" => {
+                let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
+                if matches!(
+                    kind,
+                    pyre_object::excobject::ExcKind::OSError
+                        | pyre_object::excobject::ExcKind::FileNotFoundError
+                ) {
+                    let args = unsafe { pyre_object::excobject::w_exception_get_args(obj) };
+                    let n = unsafe { pyre_object::w_tuple_len(args) };
+                    if (2..=5).contains(&n) {
+                        let idx = if name == "errno" { 0 } else { 1 };
+                        if let Some(v) = unsafe { pyre_object::w_tuple_getitem(args, idx) } {
+                            return Ok(v);
+                        }
+                    }
+                    return Ok(w_none());
+                }
+            }
+            "filename" | "filename2" => {
+                let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
+                if matches!(
+                    kind,
+                    pyre_object::excobject::ExcKind::OSError
+                        | pyre_object::excobject::ExcKind::FileNotFoundError
+                ) {
+                    let args = unsafe { pyre_object::excobject::w_exception_get_args(obj) };
+                    let n = unsafe { pyre_object::w_tuple_len(args) };
+                    let idx: usize = if name == "filename" { 2 } else { 4 };
+                    if (3..=5).contains(&n) && idx < n {
+                        if let Some(v) = unsafe { pyre_object::w_tuple_getitem(args, idx as i64) } {
+                            return Ok(v);
+                        }
+                    }
+                    return Ok(w_none());
+                }
+            }
             // `interp_exceptions.py:468-471`
             // `readwrite_attrproperty_w('w_object', W_UnicodeTranslateError)`
             // (and `:1081-1083` / `:1201-1203` for Decode / Encode).

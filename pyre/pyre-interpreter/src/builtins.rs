@@ -730,13 +730,13 @@ pub fn install_default_builtins(namespace: &mut DictStorage) {
         make_exc_type("AssertionError", exc_assertion_error_new, exception),
     );
 
-    let os_error = make_exc_type("OSError", exc_exception_new, exception);
+    let os_error = make_exc_type("OSError", exc_os_error_new, exception);
     crate::dict_storage_store(namespace, "OSError", os_error);
     crate::dict_storage_store(namespace, "IOError", os_error);
     crate::dict_storage_store(
         namespace,
         "FileNotFoundError",
-        make_exc_type("FileNotFoundError", exc_exception_new, os_error),
+        make_exc_type("FileNotFoundError", exc_file_not_found_error_new, os_error),
     );
     crate::dict_storage_store(
         namespace,
@@ -1781,6 +1781,11 @@ exc_constructor!(
     pyre_object::excobject::ExcKind::BaseException
 );
 exc_constructor!(exc_exception, pyre_object::excobject::ExcKind::Exception);
+exc_constructor!(exc_os_error, pyre_object::excobject::ExcKind::OSError);
+exc_constructor!(
+    exc_file_not_found_error,
+    pyre_object::excobject::ExcKind::FileNotFoundError
+);
 exc_constructor!(
     exc_arithmetic_error,
     pyre_object::excobject::ExcKind::ArithmeticError
@@ -2098,6 +2103,8 @@ macro_rules! exc_new_wrapper {
 
 exc_new_wrapper!(exc_base_exception_new, exc_base_exception);
 exc_new_wrapper!(exc_exception_new, exc_exception);
+exc_new_wrapper!(exc_os_error_new, exc_os_error);
+exc_new_wrapper!(exc_file_not_found_error_new, exc_file_not_found_error);
 exc_new_wrapper!(exc_arithmetic_error_new, exc_arithmetic_error);
 exc_new_wrapper!(exc_zero_division_new, exc_zero_division);
 exc_new_wrapper!(exc_type_error_new, exc_type_error);
