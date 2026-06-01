@@ -5733,6 +5733,147 @@ fn diagnose_inline_recognition(arg_concretes: &[ConcreteValue], op_pc: usize) {
     }
 }
 
+/// #62 slice (3c): full-body-walk inline of a recognized user-function
+/// `call_fn`.  Dev-gated by `PYRE_FBW_INLINE` (default OFF — the production
+/// flag-on path is unchanged until this is validated and the gate retired).
+///
+/// Returns:
+/// * `Ok(Some((outcome, next_pc)))` — the call was inlined; caller returns it.
+/// * `Ok(None)` — not eligible (gate off, not a pure-Python function, has a
+///   closure, or not an exact-positional call).  This branch emits NO IR, so
+///   the caller's residual-call fallback is clean.
+/// * `Err(..)` — a sub-walk step hit an unsupported op AFTER emitting IR;
+///   propagated as a trace abort (sound — aborts to the interpreter rather
+///   than mixing inlined + residual emission).
+///
+/// Arg layout (measured): `r_args = [ctx@0, callable@1, positional@2..]`.
+/// Only exact-positional, closure-free callees are inlined.  Guards inside a
+/// pure-leaf callee resume to the caller's CALL boundary via the inherited
+/// single-frame snapshot (`entry_py_pc` / `outer_active_boxes`), which is
+/// sound for side-effect-free leaves (re-execute the whole call on deopt).
+fn try_walker_inline_user_call(
+    ctx: &mut WalkContext<'_, '_>,
+    op: &DecodedOp,
+    code: &[u8],
+    r_args: &[OpRef],
+    dst_bank: char,
+    dst: usize,
+) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
+    if !ctx.is_authoritative_executor || std::env::var("PYRE_FBW_INLINE").is_err() {
+        return Ok(None);
+    }
+    if r_args.len() < 2 {
+        return Ok(None);
+    }
+    let arg_concretes = read_ref_var_list_concrete(code, op, 1, ctx);
+    let ConcreteValue::Ref(callable) = arg_concretes[1] else {
+        return Ok(None);
+    };
+    if callable.is_null() {
+        return Ok(None);
+    }
+    let function_type_addr = &pyre_interpreter::FUNCTION_TYPE as *const _ as usize;
+    let (w_code, nparams, has_closure) = unsafe {
+        if !pyre_interpreter::is_function(callable)
+            || (*callable).ob_type as *const () as usize != function_type_addr
+        {
+            return Ok(None);
+        }
+        let w_code = pyre_interpreter::function_get_code(callable);
+        let raw = pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
+            as *const pyre_interpreter::CodeObject;
+        if raw.is_null() {
+            return Ok(None);
+        }
+        let closure = pyre_interpreter::function_get_closure(callable);
+        (w_code, (*raw).arg_count as usize, !closure.is_null())
+    };
+    let nargs_passed = r_args.len() - 2;
+    // Only exact-positional, closure-free calls: every callee local [0..nparams]
+    // is bound from a passed arg, none from defaults/varargs/cells.
+    if has_closure || nargs_passed != nparams {
+        return Ok(None);
+    }
+    let Some(body) = crate::state::sub_jitcode_body_for_code(w_code) else {
+        return Ok(None);
+    };
+    if nparams > body.num_regs_r {
+        return Ok(None);
+    }
+
+    let (
+        mut callee_regs_r,
+        mut callee_regs_i,
+        mut callee_regs_f,
+        mut callee_concrete_r,
+        mut callee_concrete_i,
+    ) = allocate_callee_register_banks(&body, ctx.trace_ctx);
+    for i in 0..nparams {
+        callee_regs_r[i] = r_args[2 + i];
+        callee_concrete_r[i] = arg_concretes[2 + i];
+    }
+
+    let callee_outcome = {
+        let mut sub_wc = WalkContext {
+            registers_r: &mut callee_regs_r,
+            registers_i: &mut callee_regs_i,
+            registers_f: &mut callee_regs_f,
+            concrete_registers_r: &mut callee_concrete_r,
+            concrete_registers_i: &mut callee_concrete_i,
+            descr_refs: ctx.descr_refs,
+            raw_descrs: ctx.raw_descrs,
+            is_authoritative_executor: ctx.is_authoritative_executor,
+            trace_ctx: ctx.trace_ctx,
+            done_with_this_frame_descr_ref: ctx.done_with_this_frame_descr_ref.clone(),
+            done_with_this_frame_descr_int: ctx.done_with_this_frame_descr_int.clone(),
+            done_with_this_frame_descr_float: ctx.done_with_this_frame_descr_float.clone(),
+            done_with_this_frame_descr_void: ctx.done_with_this_frame_descr_void.clone(),
+            exit_frame_with_exception_descr_ref: ctx.exit_frame_with_exception_descr_ref.clone(),
+            is_top_level: false,
+            sub_jitcode_lookup: ctx.sub_jitcode_lookup,
+            last_exc_value: None,
+            last_exc_value_concrete: ConcreteValue::Null,
+            entry_py_pc: ctx.entry_py_pc,
+            outer_jitcode_index: ctx.outer_jitcode_index,
+            outer_active_boxes: ctx.outer_active_boxes.clone(),
+        };
+        let (outcome, _end_pc) = walk(body.code, 0, &mut sub_wc)?;
+        outcome
+    };
+
+    match callee_outcome {
+        DispatchOutcome::SubReturn {
+            result: Some(value),
+        } => {
+            let concrete_for_shadow = concrete_from_recorded_opref(ctx, value);
+            match dst_bank {
+                'r' => write_ref_reg(ctx, op.pc, dst, value, concrete_for_shadow)?,
+                'i' => write_int_reg(ctx, op.pc, dst, value, concrete_for_shadow)?,
+                'v' => {}
+                _ => return Ok(None),
+            }
+            Ok(Some((DispatchOutcome::Continue, op.next_pc)))
+        }
+        DispatchOutcome::SubReturn { result: None } => {
+            if dst_bank == 'v' {
+                Ok(Some((DispatchOutcome::Continue, op.next_pc)))
+            } else {
+                Err(DispatchError::UnexpectedVoidSubReturn { pc: op.pc })
+            }
+        }
+        DispatchOutcome::SubRaise { exc, exc_concrete } => {
+            if let Some(target) = try_catch_exception_at(code, op.next_pc) {
+                ctx.last_exc_value = Some(exc);
+                ctx.last_exc_value_concrete = exc_concrete;
+                Ok(Some((DispatchOutcome::Continue, target)))
+            } else {
+                Ok(Some((DispatchOutcome::SubRaise { exc, exc_concrete }, op.next_pc)))
+            }
+        }
+        other => Ok(Some((other, op.next_pc))),
+    }
+}
+
 fn dispatch_residual_call_iRd_kind(
     code: &[u8],
     op: &DecodedOp,
@@ -5773,6 +5914,14 @@ fn dispatch_residual_call_iRd_kind(
     } else {
         code[op.pc + 1 + descr_offset + 2] as usize
     };
+
+    // #62 slice (3c): attempt full-body-walk inline of a user-function call
+    // (dev-gated PYRE_FBW_INLINE).  Eligible exact-positional closure-free
+    // calls sub-walk the callee body in place of the residual; ineligible
+    // calls fall through with no IR emitted.
+    if let Some(inlined) = try_walker_inline_user_call(ctx, op, code, &r_args, dst_bank, dst)? {
+        return Ok(inlined);
+    }
 
     // `_r_*` shape: argboxes = R-list only; argbox_types = [Ref; n].
     let argbox_types: Vec<Type> = vec![Type::Ref; r_args.len()];
