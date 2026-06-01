@@ -182,7 +182,7 @@
 use crate::jitcode_runtime::{DecodedOp, decode_op_at};
 use crate::state::{ConcreteValue, MIFrame};
 use majit_ir::{DescrRef, OopSpecIndex, OpCode, OpRef, Type, Value};
-use majit_metainterp::TraceCtx;
+use majit_metainterp::{TraceCtx, default_effect_info};
 
 /// Body of a callee jitcode that the walker needs to recurse into.
 /// RPython parity: when `inline_call_r_r/dR>r` fires, the metainterp
@@ -5800,6 +5800,15 @@ fn try_walker_inline_user_call(
     if nparams > body.num_regs_r {
         return Ok(None);
     }
+    // The callee body resolves its `d`/`j` descr operands through its OWN
+    // per-fn pool, not the caller's.  Without this the sub-walk reads the
+    // wrong descr at the first `getfield_vable_r` / `residual_call`
+    // (`VableArrayDescrMalformed` / `ResidualCallDescrNotCallDescr`).
+    let Some((callee_descr_refs, callee_perfn_descrs, callee_lookup)) =
+        crate::state::sub_jitcode_descr_pool_for_code(w_code)
+    else {
+        return Ok(None);
+    };
     if std::env::var("PYRE_FBW_INLINE_DIAG").is_ok() {
         let mut pc = 0usize;
         let mut shown = 0;
@@ -5813,6 +5822,82 @@ fn try_walker_inline_user_call(
         }
     }
 
+    // The callee per-fn JitCode is portal-shaped: it reads its params via
+    // `getfield_vable_r(r0=frame, localsplus[i])` (decode-confirmed).  For an
+    // inlined callee whose frame is NOT the active virtualizable, that read
+    // takes the `_nonstandard_virtualizable` -> GETFIELD_GC fallback against
+    // the frame's real heap `localsplus`.  So the callee needs a genuine
+    // heap frame at `r0` (mirror of the top-level portal seed at
+    // `regs_r[0] = frame_opref` above), NOT register-bound args.  Build that
+    // frame the same way `trace_opcode::build_pending_inline_frame` does.
+    //
+    // Eligibility needing a frame helper: exactly 1 or 2 positional params
+    // (the only `one_arg_callee_frame_helper` / `callee_frame_helper(n)`
+    // shapes wired so far) and a Ref-bank `r0` slot.
+    if nparams == 0 || body.num_regs_r == 0 {
+        return Ok(None);
+    }
+    // Concrete caller frame (for the execution context) + concrete args must
+    // all be live; otherwise the concrete frame build below cannot run.  Bail
+    // cleanly (no IR emitted yet) so the residual-call fallback stays valid.
+    let ConcreteValue::Ref(caller_frame_ptr) = ctx.concrete_registers_r[0] else {
+        return Ok(None);
+    };
+    let mut concrete_args: Vec<pyre_object::PyObjectRef> = Vec::with_capacity(nparams);
+    for i in 0..nparams {
+        match arg_concretes[2 + i] {
+            ConcreteValue::Ref(p) if !p.is_null() => concrete_args.push(p),
+            _ => return Ok(None),
+        }
+    }
+    let callee_frame_ptr;
+    let mut callee_frame = unsafe {
+        use pyre_interpreter::pyframe::PyFrame;
+        let exec_ctx = (*(caller_frame_ptr as *const PyFrame)).execution_context;
+        let globals = pyre_interpreter::function_get_globals(callable);
+        let globals_obj = pyre_interpreter::function_get_globals_obj(callable);
+        let closure = pyre_interpreter::function_get_closure(callable);
+        match PyFrame::try_new_for_call_with_closure_and_globals_obj(
+            w_code,
+            &concrete_args,
+            globals,
+            globals_obj,
+            exec_ctx,
+            closure,
+        ) {
+            Ok(f) => f,
+            Err(_) => return Ok(None),
+        }
+    };
+    callee_frame.fix_array_ptrs();
+    callee_frame_ptr = &callee_frame as *const _ as pyre_object::PyObjectRef;
+
+    // Emit the symbolic callee-frame OpRef (commits to inlining: IR follows).
+    // Args cross the call boundary boxed, so they are Ref-typed here.
+    let callable_opref = r_args[1];
+    let callee_frame_opref = if nparams == 1 {
+        let (helper, helper_arg_types) =
+            crate::state::one_arg_callee_frame_helper(Type::Ref, false);
+        ctx.trace_ctx.call_ref_typed_with_effect(
+            helper,
+            &[ctx.registers_r[0], callable_opref, r_args[2]],
+            &helper_arg_types,
+            default_effect_info(),
+        )
+    } else if let Some(frame_helper) = (crate::callbacks::get().callee_frame_helper)(nparams) {
+        let mut helper_args = vec![ctx.registers_r[0], callable_opref];
+        helper_args.extend_from_slice(&r_args[2..2 + nparams]);
+        let helper_arg_types = crate::state::frame_callable_arg_types(nparams);
+        ctx.trace_ctx.call_ref_typed_with_effect(
+            frame_helper,
+            &helper_args,
+            &helper_arg_types,
+            default_effect_info(),
+        )
+    } else {
+        return Ok(None);
+    };
+
     let (
         mut callee_regs_r,
         mut callee_regs_i,
@@ -5820,10 +5905,10 @@ fn try_walker_inline_user_call(
         mut callee_concrete_r,
         mut callee_concrete_i,
     ) = allocate_callee_register_banks(&body, ctx.trace_ctx);
-    for i in 0..nparams {
-        callee_regs_r[i] = r_args[2 + i];
-        callee_concrete_r[i] = arg_concretes[2 + i];
-    }
+    // r0 = the callee frame (portal-runner contract); locals live in the
+    // frame's heap localsplus, read by the body's getfield_vable_r.
+    callee_regs_r[0] = callee_frame_opref;
+    callee_concrete_r[0] = ConcreteValue::Ref(callee_frame_ptr);
 
     let callee_outcome = {
         let mut sub_wc = WalkContext {
@@ -5832,8 +5917,8 @@ fn try_walker_inline_user_call(
             registers_f: &mut callee_regs_f,
             concrete_registers_r: &mut callee_concrete_r,
             concrete_registers_i: &mut callee_concrete_i,
-            descr_refs: ctx.descr_refs,
-            raw_descrs: ctx.raw_descrs,
+            descr_refs: callee_descr_refs,
+            raw_descrs: RawDescrPool::PerFn(callee_perfn_descrs),
             is_authoritative_executor: ctx.is_authoritative_executor,
             trace_ctx: ctx.trace_ctx,
             done_with_this_frame_descr_ref: ctx.done_with_this_frame_descr_ref.clone(),
@@ -5842,7 +5927,7 @@ fn try_walker_inline_user_call(
             done_with_this_frame_descr_void: ctx.done_with_this_frame_descr_void.clone(),
             exit_frame_with_exception_descr_ref: ctx.exit_frame_with_exception_descr_ref.clone(),
             is_top_level: false,
-            sub_jitcode_lookup: ctx.sub_jitcode_lookup,
+            sub_jitcode_lookup: callee_lookup,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: ctx.entry_py_pc,
