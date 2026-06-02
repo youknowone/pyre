@@ -213,11 +213,12 @@ pub fn build_semantic_program_from_llbcs(
 ///
 /// **Whole-program metadata** (`known_struct_names`,
 /// `known_trait_names`, `struct_fields`) is populated from
-/// `type_decls` / `trait_decls` (Step 4.3.b). `fn_return_types` and
-/// `immutable_fields` remain empty until Step 4.3.c.ext widens the
-/// dedup table; the cutover at `lib.rs::build_semantic_program_via_active_frontend`
-/// fills these in via a syn-AST merge pass over the same
-/// parsed_files (Step 4.5.c).
+/// `type_decls` / `trait_decls` (Step 4.3.b); struct field-type strings
+/// are resolved by [`tyref_to_ast_string`] from Charon's type IR.
+/// `fn_return_types` stays empty — it is threaded through
+/// `parse::extract_*` but read by no production consumer.
+/// `immutable_fields` stays empty until the `#[majit_macros::immutable]`
+/// attribute is surfaced by Charon (Step 4.3.d).
 ///
 /// Functions whose body Charon could not extract (extraction error,
 /// opaque body, `null` entry) are skipped silently — the production
@@ -341,9 +342,10 @@ pub fn build_semantic_program_from_llbc(
         known_struct_names,
         known_trait_names,
         struct_fields,
-        // Step 4.5: fn_return_types empty until Step 4.3.c.ext (Charon
-        // dedup-table widening) lets us resolve TyRef→primitive name.
-        // Empty is type-validator-safe; TyRef labels are not.
+        // `fn_return_types` stays empty: it is threaded through
+        // `parse::extract_*` but read by no production consumer, so there
+        // is nothing to populate (the syn-AST merge that used to fill it
+        // was retired with the rest of the metadata side-channel).
         fn_return_types: std::collections::HashMap::new(),
         // Immutable-field tracking depends on `#[majit_macros::immutable]`
         // attribute serialization that Charon does not currently surface
@@ -364,9 +366,10 @@ pub fn build_semantic_program_from_llbc(
 /// tables.
 ///
 /// Returns `(known_struct_names, known_trait_names, struct_fields)`.
-/// Names are taken from `item_meta.name_path()`; struct field rows use
-/// `TyRef::label()` as the field type string (matching Step 4.3.a's
-/// label-as-placeholder convention).
+/// Names are taken from `item_meta.name_path()`; struct field rows
+/// resolve their type string via [`tyref_to_ast_string`] (Charon-resolved
+/// types: references stripped, raw pointers kept, `Vec<T>` / `[T;N]`
+/// generics, named structs by leaf).
 fn derive_program_metadata(
     llbc: &Llbc,
 ) -> (
@@ -392,7 +395,7 @@ fn derive_program_metadata(
                     .enumerate()
                     .map(|(i, f)| {
                         let fname = f.name.clone().unwrap_or_else(|| format!("__pos_{i}"));
-                        (fname, f.ty.label())
+                        (fname, tyref_to_ast_string(&f.ty, llbc))
                     })
                     .collect();
                 struct_fields.fields.insert(name.clone(), rows.clone());
@@ -2328,6 +2331,344 @@ fn is_unit_type(ty: &TyRef, llbc: &Llbc) -> bool {
         .and_then(|t| t.as_array())
         .is_some_and(|t| t.is_empty());
     is_tuple && empty_types
+}
+
+/// Resolve a Charon [`TyRef`] to the AST-format Rust type STRING that
+/// the retired syn metadata pass produced
+/// (`front::syn_metadata::qualified_full_type_string`), so
+/// `derive_program_metadata` can fill `struct_fields` with real type
+/// strings instead of `TyRef::label()` placeholders.
+///
+/// Format contract (mirrors the syn producer):
+///   - references are STRIPPED (`&T` / `&mut T` -> `T`);
+///   - raw pointers keep `*mut ` / `*const ` prefixes;
+///   - integer / float / bool / char primitives use their Rust spelling;
+///   - `Vec<T>` / `Option<T>` / `HashMap<K,V>` etc. are angle-bracketed
+///     with comma-joined args (no spaces);
+///   - slices `[T]`, arrays `[T;N]`, tuples `(A,B)` / `()`;
+///   - named structs/enums use their leaf name (the registry publishes
+///     both the qualified path and the bare leaf, and every consumer
+///     keys on a leaf-ish form after stripping wrappers).
+///
+/// Shapes the resolver does not yet recognise produce a `??<key>:<json>`
+/// marker so the differential gate (`PYRE_STRUCT_DIFF`) surfaces them
+/// for a follow-up widening rather than silently mislabelling a field.
+fn tyref_to_ast_string(ty: &TyRef, llbc: &Llbc) -> String {
+    let body = match ty {
+        TyRef::Inline { value: (_, v) } => Some(v),
+        TyRef::Other(v) => Some(v),
+        TyRef::Dedup { id } => llbc.dedup_body(*id),
+    };
+    match body {
+        Some(v) => charon_type_value_to_ast_string(v, llbc, 0),
+        None => match ty {
+            TyRef::Dedup { id } => format!("??unresolved_dedup#{id}"),
+            _ => "??no_body".to_string(),
+        },
+    }
+}
+
+/// Recursive worker for [`tyref_to_ast_string`] operating on a raw
+/// Charon type-expression `Value` (a TyRef body or a nested
+/// generic-argument type).  `depth` guards against pathological cycles.
+fn charon_type_value_to_ast_string(v: &serde_json::Value, llbc: &Llbc, depth: usize) -> String {
+    if depth > 24 {
+        return "??deep".to_string();
+    }
+    let Some(obj) = v.as_object() else {
+        return "??scalar".to_string();
+    };
+    // Indirections — follow the dedup table / inline hash-cons one hop.
+    if let Some(id) = obj.get("Deduplicated").and_then(serde_json::Value::as_u64) {
+        return match llbc.dedup_body(id) {
+            Some(body) => charon_type_value_to_ast_string(body, llbc, depth + 1),
+            None => format!("??unresolved_dedup#{id}"),
+        };
+    }
+    if let Some(arr) = obj
+        .get("HashConsedValue")
+        .and_then(serde_json::Value::as_array)
+        && arr.len() == 2
+    {
+        return charon_type_value_to_ast_string(&arr[1], llbc, depth + 1);
+    }
+    // Primitive literals.
+    if let Some(lit) = obj.get("Literal") {
+        return charon_literal_to_ast_string(lit);
+    }
+    // References are stripped to their referent (syn drops `&`/`&mut`).
+    if let Some(r) = obj.get("Ref") {
+        if let Some(arr) = r.as_array() {
+            // `{"Ref": [region, ty, kind]}`.
+            if let Some(inner) = arr.get(1) {
+                return charon_type_value_to_ast_string(inner, llbc, depth + 1);
+            }
+        }
+        return "??ref_shape".to_string();
+    }
+    // Raw pointers keep the mutability prefix.
+    if let Some(rp) = obj.get("RawPtr") {
+        if let Some(arr) = rp.as_array()
+            && arr.len() == 2
+        {
+            let inner = charon_type_value_to_ast_string(&arr[0], llbc, depth + 1);
+            let mutbl = arr[1].as_str().unwrap_or("");
+            let prefix = if mutbl.eq_ignore_ascii_case("Mut") {
+                "*mut "
+            } else {
+                "*const "
+            };
+            return format!("{prefix}{inner}");
+        }
+        return "??rawptr_shape".to_string();
+    }
+    // ADTs: tuples, builtins (Box/Slice/Str/Array), and named types.
+    if let Some(adt) = obj.get("Adt").and_then(|a| a.as_object()) {
+        return charon_adt_to_ast_string(adt, llbc, depth);
+    }
+    // Top-level array `{"Array": [elem, len]}` -> `[elem;len]`.
+    if let Some(arr) = obj.get("Array").and_then(serde_json::Value::as_array)
+        && arr.len() == 2
+    {
+        let elem = charon_type_value_to_ast_string(&arr[0], llbc, depth + 1);
+        let len = charon_const_generic_to_string(&arr[1]);
+        return format!("[{elem};{len}]");
+    }
+    // Top-level slice `{"Slice": elem}` -> `[elem]`.
+    if let Some(elem) = obj.get("Slice") {
+        return format!(
+            "[{}]",
+            charon_type_value_to_ast_string(elem, llbc, depth + 1)
+        );
+    }
+    // `dyn Trait` — syn emits `dyn <trait-root>`; recover the trait's
+    // leaf name from the first trait-ref's resolved decl when present.
+    if obj.contains_key("DynTrait") {
+        return charon_dyn_trait_to_ast_string(&obj["DynTrait"], llbc);
+    }
+    // Function pointers — syn renders these as `fn(..) -> ..`; the JIT
+    // consumers only ever wrapper-strip and struct-name-match field
+    // types, so a coarse `fn` marker is sufficient (no consumer parses
+    // the arrow form).
+    if obj.contains_key("FnPtr") {
+        return "fn".to_string();
+    }
+    let key = obj.keys().next().cloned().unwrap_or_else(|| "?".into());
+    format!("??{key}")
+}
+
+/// Render a Charon `DynTrait` body to `dyn <trait-leaf>`.  Falls back to
+/// `dyn` when the predicate shape does not expose a resolvable trait id.
+fn charon_dyn_trait_to_ast_string(dynt: &serde_json::Value, llbc: &Llbc) -> String {
+    // Charon nests the principal trait id a few ways across revisions;
+    // scan for the first `{"trait_decl_id": <id>}` (or bare `id`) and
+    // resolve it to the trait's leaf name.
+    fn find_trait_id(v: &serde_json::Value) -> Option<u64> {
+        match v {
+            serde_json::Value::Object(m) => {
+                if let Some(id) = m.get("trait_decl_id").and_then(serde_json::Value::as_u64) {
+                    return Some(id);
+                }
+                m.values().find_map(find_trait_id)
+            }
+            serde_json::Value::Array(a) => a.iter().find_map(find_trait_id),
+            _ => None,
+        }
+    }
+    match find_trait_id(dynt).and_then(|id| llbc.trait_by_id(id)) {
+        Some(td) => {
+            let name = td.item_meta.name_path();
+            let leaf = name.rsplit("::").next().unwrap_or(&name);
+            format!("dyn {leaf}")
+        }
+        None => "dyn".to_string(),
+    }
+}
+
+/// Map a Charon `Literal` type body to its Rust spelling.
+fn charon_literal_to_ast_string(lit: &serde_json::Value) -> String {
+    if let Some(atom) = lit.as_str() {
+        return match atom {
+            "Bool" => "bool",
+            "Char" => "char",
+            other => return format!("??lit_atom_{other}"),
+        }
+        .to_string();
+    }
+    if let Some(obj) = lit.as_object() {
+        if let Some(int) = obj.get("Int").and_then(serde_json::Value::as_str) {
+            return charon_int_kind_to_rust(int, true);
+        }
+        if let Some(uint) = obj.get("UInt").and_then(serde_json::Value::as_str) {
+            return charon_int_kind_to_rust(uint, false);
+        }
+        if let Some(int) = obj.get("Integer").and_then(serde_json::Value::as_str) {
+            // Older single-`Integer` form: kind string is already signed/unsigned.
+            let signed = !int.starts_with('U');
+            return charon_int_kind_to_rust(int, signed);
+        }
+        if let Some(float) = obj.get("Float").and_then(serde_json::Value::as_str) {
+            return match float {
+                "F16" => "f16",
+                "F32" => "f32",
+                "F64" => "f64",
+                "F128" => "f128",
+                other => return format!("??float_{other}"),
+            }
+            .to_string();
+        }
+    }
+    "??lit".to_string()
+}
+
+/// Translate a Charon integer-kind tag (`"I64"`, `"Usize"`, `"U8"`, …)
+/// to its Rust spelling.  `signed` disambiguates the `Isize`/`Usize`
+/// spelling when the kind tag itself omits the sign.
+fn charon_int_kind_to_rust(kind: &str, signed: bool) -> String {
+    let lowered = kind.to_ascii_lowercase();
+    // Kind tags already carry the leading `i`/`u` for most widths
+    // (`I64` -> `i64`, `U8` -> `u8`, `Usize` -> `usize`).  The legacy
+    // `Integer` form may hand back a bare width — fall back to `signed`.
+    if lowered.starts_with('i') || lowered.starts_with('u') {
+        return lowered;
+    }
+    if signed {
+        format!("i{lowered}")
+    } else {
+        format!("u{lowered}")
+    }
+}
+
+/// Format a Charon `Adt` type body (`{"id": …, "generics": {"types": […]}}`).
+fn charon_adt_to_ast_string(
+    adt: &serde_json::Map<String, serde_json::Value>,
+    llbc: &Llbc,
+    depth: usize,
+) -> String {
+    let id = adt.get("id");
+    let type_args: Vec<String> = adt
+        .get("generics")
+        .and_then(|g| g.as_object())
+        .and_then(|g| g.get("types"))
+        .and_then(|t| t.as_array())
+        .map(|arr| {
+            arr.iter()
+                .map(|t| charon_type_value_to_ast_string(t, llbc, depth + 1))
+                // Drop the default allocator / hasher type-args Charon
+                // makes explicit (`Vec<T, Global>`, `HashMap<K, V,
+                // RandomState, Global>`); the syn producer elides them.
+                .filter(|s| s != "Global" && s != "RandomState")
+                .collect()
+        })
+        .unwrap_or_default();
+    // `id` is either a string atom (`"Tuple"`), or an object
+    // (`{"Adt": <def_id>}`, `{"Builtin": "Box"|"Slice"|"Str"|"Array"}`).
+    if let Some(atom) = id.and_then(serde_json::Value::as_str) {
+        return match atom {
+            "Tuple" => {
+                if type_args.is_empty() {
+                    "()".to_string()
+                } else {
+                    format!("({})", type_args.join(","))
+                }
+            }
+            other => format!("??adt_atom_{other}"),
+        };
+    }
+    if let Some(id_obj) = id.and_then(|i| i.as_object()) {
+        if let Some(def_id) = id_obj.get("Adt").and_then(serde_json::Value::as_u64) {
+            let name = llbc
+                .type_by_id(def_id)
+                .map(|td| td.item_meta.name_path())
+                .unwrap_or_else(|| format!("??adt#{def_id}"));
+            let leaf = name.rsplit("::").next().unwrap_or(&name).to_string();
+            if type_args.is_empty() {
+                return leaf;
+            }
+            return format!("{leaf}<{}>", type_args.join(","));
+        }
+        if let Some(builtin) = id_obj.get("Builtin") {
+            return charon_builtin_adt_to_ast_string(builtin, &type_args, adt);
+        }
+    }
+    let key = id
+        .and_then(|i| i.as_object())
+        .and_then(|m| m.keys().next().cloned())
+        .or_else(|| id.and_then(|i| i.as_str()).map(str::to_string))
+        .unwrap_or_else(|| "?".into());
+    format!("??adt_id_{key}")
+}
+
+/// Format a Charon builtin ADT id (`Box`/`Slice`/`Str`/`Array`).
+fn charon_builtin_adt_to_ast_string(
+    builtin: &serde_json::Value,
+    type_args: &[String],
+    adt: &serde_json::Map<String, serde_json::Value>,
+) -> String {
+    let name = builtin
+        .as_str()
+        .or_else(|| {
+            builtin
+                .as_object()
+                .and_then(|m| m.keys().next().map(String::as_str))
+        })
+        .unwrap_or("?");
+    match name {
+        // `Box<T>` is transparent in the syn producer's eyes only when the
+        // source wrote it explicitly; Charon's `Box` builtin maps back to
+        // the `Box<T>` spelling.
+        "Box" => match type_args.first() {
+            Some(inner) => format!("Box<{inner}>"),
+            None => "Box".to_string(),
+        },
+        "Slice" => match type_args.first() {
+            Some(inner) => format!("[{inner}]"),
+            None => "??slice_noelem".to_string(),
+        },
+        "Str" => "str".to_string(),
+        "Array" => {
+            let elem = type_args.first().cloned().unwrap_or_default();
+            // Array length lives in the ADT's const-generic args; when
+            // absent fall back to the `N` placeholder the syn producer
+            // also emits for non-literal lengths.
+            let len = adt
+                .get("generics")
+                .and_then(|g| g.as_object())
+                .and_then(|g| g.get("const_generics"))
+                .and_then(|c| c.as_array())
+                .and_then(|c| c.first())
+                .map(charon_const_generic_to_string)
+                .unwrap_or_else(|| "N".to_string());
+            format!("[{elem};{len}]")
+        }
+        other => format!("??builtin_{other}"),
+    }
+}
+
+/// Best-effort render of a Charon const-generic (array length) value.
+fn charon_const_generic_to_string(cg: &serde_json::Value) -> String {
+    if let Some(s) = cg.as_str() {
+        return s.to_string();
+    }
+    if let Some(obj) = cg.as_object() {
+        if let Some(val) = obj.get("Value") {
+            if let Some(scalar) = val
+                .as_object()
+                .and_then(|m| m.get("Scalar"))
+                .and_then(|s| s.as_object())
+            {
+                if let Some(n) = scalar
+                    .values()
+                    .find_map(|v| v.as_object())
+                    .and_then(|m| m.get("value"))
+                    .and_then(serde_json::Value::as_u64)
+                {
+                    return n.to_string();
+                }
+            }
+        }
+    }
+    "N".to_string()
 }
 
 /// Stable short label for an [`Rvalue::Aggregate`]'s [`Field`]

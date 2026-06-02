@@ -175,24 +175,15 @@ fn build_semantic_program_via_active_frontend(
             // RPython's translator reading `func._elidable_function_` off
             // the function object.
             merge_hints_from_llbcs(&mut program, &llbcs);
-            // Step 4.5.c: hybrid metadata pass. The MIR builder
-            // cannot populate `fn_return_types` until
-            // `Step 4.3.c.ext` (Charon dedup-table widening) resolves
-            // `TyRef::Deduplicated{id}` to its primitive name.
-            // Meanwhile `extract_inherent_impl_methods` / the AST
-            // re-lowering path in `analyze_pipeline_from_parsed`
-            // consults `fn_return_types` by bare name to type-check
-            // `!is_str(x)`-style boolean expressions and
-            // typed-method receivers.  Mirror Step 4.5.b: parse the
-            // same parsed_files we already hold, collect
-            // `(name → return_type_string)` from the AST pre-walk,
-            // and merge into the MIR-built `SemanticProgram` so the
-            // bare-leaf lookups land on the syn-source-derived
-            // return-type strings.  This is the same hybrid surface
-            // model: AST stays the source of truth for metadata
-            // Charon does not yet expose; MIR replaces only the
-            // function bodies the codewriter consumes.
-            merge_fn_return_types_from_parsed_files(&mut program, parsed_files);
+            // Whole-program type metadata (`known_struct_names`,
+            // `known_trait_names`, `struct_fields`) comes from the MIR
+            // builder's `derive_program_metadata` walk over Charon's
+            // `type_decls` / `trait_decls`; struct field-type strings are
+            // resolved by `tyref_to_ast_string` (Charon-resolved types,
+            // e.g. `*mut PyObject`, `Vec<u8>`, `i64`) rather than the syn
+            // re-parse.  `fn_return_types` stays empty — it is threaded
+            // through `parse::extract_*` but read by no production
+            // consumer (only the MIR-only build test asserts it empty).
             return program;
         }
     }
@@ -377,43 +368,6 @@ fn auto_discover_workspace_llbc_paths(
         paths.push(p.to_string_lossy().into_owned());
     }
     Some(paths)
-}
-
-/// Step 4.5.c helper — populate the MIR program's
-/// `fn_return_types` / `struct_fields` / `known_struct_names` /
-/// `known_trait_names` / `immutable_fields` from the syn-AST
-/// pre-walk of the same parsed_files.  Closes the
-/// `extract_inherent_impl_methods` / annotator lookup gap that
-/// blocks every consumer with non-empty test fixtures (multi-crate
-/// loads, inline-source unit tests) under the cutover.  Entries
-/// that the MIR builder already populated win; AST adds only
-/// what MIR left empty.
-#[cfg(feature = "mir-frontend")]
-fn merge_fn_return_types_from_parsed_files(
-    program: &mut front::SemanticProgram,
-    parsed_files: &[parse::ParsedInterpreter],
-) {
-    let ast_metadata = front::syn_metadata::collect_program_metadata(parsed_files);
-    for (name, ty) in ast_metadata.fn_return_types {
-        program.fn_return_types.entry(name).or_insert(ty);
-    }
-    for name in ast_metadata.known_struct_names {
-        program.known_struct_names.insert(name);
-    }
-    for name in ast_metadata.known_trait_names {
-        program.known_trait_names.insert(name);
-    }
-    for (owner, fields) in ast_metadata.struct_fields.fields {
-        // AST field-type strings (`*mut PyFrame`, `Vec<u8>`, `&str`)
-        // are the format downstream consumers expect; MIR's
-        // `TyRef::label()` (`ty#170`, `pyre_interpreter::PyFrame`)
-        // is a placeholder until Step 4.3.c.ext dedup-table widening
-        // resolves primitives.  Override MIR's entries when the AST
-        // produces a real type string for the same owner so
-        // `receiver_type_root` / `lookup_method_return_type` see the
-        // AST-orthodox shape.
-        program.struct_fields.fields.insert(owner, fields);
-    }
 }
 
 /// Merge JIT-hint markers harvested from the ullbc surrogate consts
