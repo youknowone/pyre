@@ -2084,6 +2084,25 @@ impl InstanceRepr {
         self.gcflavor
     }
 
+    /// RPython `InstanceRepr.common_repr(self)` (rclass.py:932-933):
+    ///
+    /// ```python
+    /// def common_repr(self):  # -> object or nongcobject reprs
+    ///     return getinstancerepr(self.rtyper, None, self.gcflavor)
+    /// ```
+    ///
+    /// Returns the root `InstanceRepr` for this instance's gcflavor —
+    /// the one whose `lowleveltype` is `OBJECTPTR` (or `NONGCOBJECTPTR`
+    /// for non-GC flavors). `rtype_isinstance` (rclass.py:1019-1021)
+    /// uses this to convert `v_obj` to the common base type before the
+    /// runtime check.
+    pub fn common_repr(&self) -> Result<Arc<InstanceRepr>, TyperError> {
+        let rtyper = self.rtyper.upgrade().ok_or_else(|| {
+            TyperError::message("InstanceRepr.common_repr: rtyper weak ref expired")
+        })?;
+        getinstancerepr(&rtyper, None, self.gcflavor)
+    }
+
     /// Read-only view of the instance-level `fields` dict populated by
     /// `_setup_repr`. RPython `self.fields` (rclass.py:557).
     pub fn fields(&self) -> std::cell::Ref<'_, HashMap<String, (String, Arc<dyn Repr>)>> {
@@ -2855,6 +2874,61 @@ impl Repr for InstanceRepr {
             ClassReprArc::Root(r) => r.getclsfield(Hlvalue::Variable(v_cls), &attr, &mut llops)?,
         };
         Ok(Some(Hlvalue::Variable(var)))
+    }
+
+    /// RPython `InstanceRepr.rtype_isinstance(self, hop)` (rclass.py:1019-1032):
+    ///
+    /// ```python
+    /// def rtype_isinstance(self, hop):
+    ///     class_repr = get_type_repr(hop.rtyper)
+    ///     instance_repr = self.common_repr()
+    ///
+    ///     v_obj, v_cls = hop.inputargs(instance_repr, class_repr)
+    ///     if isinstance(v_cls, Constant):
+    ///         cls = v_cls.value
+    ///         llf, llf_nonnull = make_ll_isinstance(self.rtyper, cls)
+    ///         if hop.args_s[0].can_be_None:
+    ///             return hop.gendirectcall(llf, v_obj)
+    ///         else:
+    ///             return hop.gendirectcall(llf_nonnull, v_obj)
+    ///     else:
+    ///         return hop.gendirectcall(ll_isinstance, v_obj, v_cls)
+    /// ```
+    ///
+    /// E.3 lands the variable branch (the unconditional
+    /// `gendirectcall(ll_isinstance, v_obj, v_cls)` path). The constant
+    /// branch with `make_ll_isinstance` per-class specialization lands
+    /// in E.4 — until then a Constant `v_cls` flows through the same
+    /// variable helper (correct, just one extra `ptr_nonzero`/
+    /// `int_between` per check).
+    fn rtype_isinstance(&self, hop: &HighLevelOp) -> RTypeResult {
+        use crate::translator::rtyper::rtyper::ConvertedTo;
+
+        // upstream: `class_repr = get_type_repr(hop.rtyper)`.
+        let rtyper = self.rtyper.upgrade().ok_or_else(|| {
+            TyperError::message("InstanceRepr.rtype_isinstance: rtyper weak ref expired")
+        })?;
+        let class_repr = get_type_repr(&rtyper)?;
+        // upstream: `instance_repr = self.common_repr()`.
+        let instance_repr = self.common_repr()?;
+
+        // upstream: `v_obj, v_cls = hop.inputargs(instance_repr, class_repr)`.
+        let v_args = hop.inputargs(vec![
+            ConvertedTo::Repr(instance_repr.as_ref() as &dyn Repr),
+            ConvertedTo::Repr(class_repr.as_ref()),
+        ])?;
+        let v_obj = v_args[0].clone();
+        let v_cls = v_args[1].clone();
+
+        // upstream variable case: `gendirectcall(ll_isinstance, v_obj, v_cls)`.
+        // The constant case (E.4) will instead mint per-class helpers via
+        // make_ll_isinstance and dispatch on `hop.args_s[0].can_be_None`.
+        let helper = rtyper.lowlevel_helper_function(
+            "ll_isinstance",
+            vec![OBJECTPTR.clone(), CLASSTYPE.clone()],
+            LowLevelType::Bool,
+        )?;
+        hop.gendirectcall(&helper, vec![v_obj, v_cls])
     }
 
     /// RPython `InstanceRepr.convert_const(self, value)` (rclass.py:772-792):
