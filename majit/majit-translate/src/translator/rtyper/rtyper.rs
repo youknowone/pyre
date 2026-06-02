@@ -2939,6 +2939,7 @@ fn lowlevel_helper_graph(
             "lllong_eq",
         ),
         "ll_issubclass" => lowlevel_issubclass_helper_graph(name, args, result),
+        "ll_isinstance" => lowlevel_isinstance_helper_graph(rtyper, name, args, result),
         "ll_type" => lowlevel_type_helper_graph(name, args, result),
         _ => Ok(synthetic_lowlevel_helper_graph(name, args, result)),
     }
@@ -3089,6 +3090,123 @@ fn lowlevel_type_helper_graph(
     startblock.closeblock(vec![
         Link::new(
             vec![Hlvalue::Variable(typeptr)],
+            Some(graph.returnblock.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    let func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(graph, argnames, func))
+}
+
+/// RPython `ll_isinstance(obj, cls)` (rclass.py:1143-1147):
+///
+/// ```python
+/// def ll_isinstance(obj, cls):  # obj should be cast to OBJECT or NONGCOBJECT
+///     if not obj:
+///         return False
+///     obj_cls = obj.typeptr
+///     return ll_issubclass(obj_cls, cls)
+/// ```
+///
+/// Helper signature `(OBJECTPTR, CLASSTYPE) -> Bool`. The body branches on
+/// `ptr_nonzero(obj)`: the null arm returns `False` directly, the non-null
+/// arm reads `obj.typeptr` and tail-calls the minted `ll_issubclass`
+/// helper graph via `direct_call`.
+fn lowlevel_isinstance_helper_graph(
+    rtyper: &RPythonTyper,
+    name: &str,
+    args: &[LowLevelType],
+    result: &LowLevelType,
+) -> Result<PyGraph, TyperError> {
+    if args != [OBJECTPTR.clone(), CLASSTYPE.clone()] || result != &LowLevelType::Bool {
+        return Err(TyperError::message(format!(
+            "{name} expects (OBJECTPTR, CLASSTYPE) -> Bool, got ({args:?}) -> {result:?}"
+        )));
+    }
+
+    let argnames = vec!["arg0".to_string(), "arg1".to_string()];
+    let obj0 = variable_with_lltype("arg0", OBJECTPTR.clone());
+    let cls0 = variable_with_lltype("arg1", CLASSTYPE.clone());
+    let is_nonnull = variable_with_lltype("is_nonnull", LowLevelType::Bool);
+    let obj1 = variable_with_lltype("obj", OBJECTPTR.clone());
+    let cls1 = variable_with_lltype("cls", CLASSTYPE.clone());
+    let obj_cls = variable_with_lltype("obj_cls", CLASSTYPE.clone());
+    let call_result = variable_with_lltype("result", LowLevelType::Bool);
+    let return_var = variable_with_lltype("result", LowLevelType::Bool);
+
+    let startblock = Block::shared(vec![
+        Hlvalue::Variable(obj0.clone()),
+        Hlvalue::Variable(cls0.clone()),
+    ]);
+    let callblock = Block::shared(vec![
+        Hlvalue::Variable(obj1.clone()),
+        Hlvalue::Variable(cls1.clone()),
+    ]);
+    let mut graph = FunctionGraph::with_return_var(
+        name.to_string(),
+        startblock.clone(),
+        Hlvalue::Variable(return_var),
+    );
+
+    // upstream: `if not obj:` — emit `ptr_nonzero(obj)` so the true link
+    // continues with the typeptr read and the false link returns False.
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "ptr_nonzero",
+        vec![Hlvalue::Variable(obj0.clone())],
+        Hlvalue::Variable(is_nonnull.clone()),
+    ));
+    startblock.borrow_mut().exitswitch = Some(Hlvalue::Variable(is_nonnull));
+    startblock.closeblock(vec![
+        Link::new(
+            vec![Hlvalue::Variable(obj0.clone()), Hlvalue::Variable(cls0.clone())],
+            Some(callblock.clone()),
+            Some(constant_with_lltype(
+                ConstValue::Bool(true),
+                LowLevelType::Bool,
+            )),
+        )
+        .into_ref(),
+        Link::new(
+            vec![constant_with_lltype(
+                ConstValue::Bool(false),
+                LowLevelType::Bool,
+            )],
+            Some(graph.returnblock.clone()),
+            Some(constant_with_lltype(
+                ConstValue::Bool(false),
+                LowLevelType::Bool,
+            )),
+        )
+        .into_ref(),
+    ]);
+
+    // upstream: `obj_cls = obj.typeptr`.
+    callblock.borrow_mut().operations.push(SpaceOperation::new(
+        "getfield",
+        vec![Hlvalue::Variable(obj1), void_field_const("typeptr")],
+        Hlvalue::Variable(obj_cls.clone()),
+    ));
+    // upstream: `return ll_issubclass(obj_cls, cls)`.
+    let callee = rtyper.lowlevel_helper_function(
+        "ll_issubclass",
+        vec![CLASSTYPE.clone(), CLASSTYPE.clone()],
+        LowLevelType::Bool,
+    )?;
+    callblock.borrow_mut().operations.push(direct_call_operation(
+        rtyper,
+        &callee,
+        vec![Hlvalue::Variable(obj_cls), Hlvalue::Variable(cls1)],
+        call_result.clone(),
+    )?);
+    callblock.closeblock(vec![
+        Link::new(
+            vec![Hlvalue::Variable(call_result)],
             Some(graph.returnblock.clone()),
             None,
         )
