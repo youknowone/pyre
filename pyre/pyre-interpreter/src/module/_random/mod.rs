@@ -187,6 +187,13 @@ impl W_Random {
                 if v.sign() == Sign::Minus {
                     v += BigInt::from(1u64 << 32);
                 }
+                // space.uint_w: every word must fit an unsigned 32-bit int.
+                if v.sign() == Sign::Minus {
+                    crate::bail_overflow_error!("cannot convert negative integer to unsigned int");
+                }
+                if v >= BigInt::from(1u64 << 32) {
+                    crate::bail_overflow_error!("int too large to convert to unsigned int");
+                }
                 let (_s, digits) = v.to_u32_digits();
                 new_state[i] = digits.first().copied().unwrap_or(0);
             }
