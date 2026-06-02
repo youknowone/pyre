@@ -970,6 +970,13 @@ fn genuine_opname_tally(
 /// `pc_map`; #287 will wire it as the `None` branch of
 /// `filter_liveness_in_place`.
 ///
+/// Branch-guard PCs (#281) are re-keyed off their guard-op position, not
+/// their first insn: a branch guard emits its condition ops BEFORE its
+/// leading `-live-` marker (flatten.rs:1868-69 / 1971-72), so first-insn
+/// keying resolves to an earlier marker, whereas the runtime resumes a
+/// branch at orgpc = the guard's own pc (#285) and needs the guard's own
+/// leading marker.  Can-raise / normal PCs keep first-insn keying.
+///
 /// Returns one entry per Python PC `0..n_pcs`: `Some(idx)` = the resolved
 /// pre-merge marker insn index; `None` = either the PC carries no insn of
 /// its own (absent from `pc_first_insn_pos`) or no `-live-` marker
@@ -982,12 +989,49 @@ fn derive_pc_live_indices_from_sparse(
     ssarepr: &super::flatten::SSARepr,
     n_pcs: usize,
 ) -> Vec<Option<usize>> {
-    // py_pc -> its own first insn position (sparse; `None` when the PC
-    // emitted no op carrying its offset).
+    // py_pc -> the stream position whose nearest-`-live-`-at-or-before is
+    // the PC's resume marker.  Default = the PC's own first insn position
+    // (sparse; `None` when the PC emitted no op carrying its offset).
     let mut pos_for_pc: Vec<Option<usize>> = vec![None; n_pcs];
     for &(py_pc, pos) in &ssarepr.pc_first_insn_pos {
         if (0..n_pcs as i64).contains(&py_pc) {
             pos_for_pc[py_pc as usize] = Some(pos);
+        }
+    }
+    // Branch-guard re-key (#281): for a PC whose block ends in
+    // `goto_if_not` / `goto_if_not_*` / `switch` with a leading `-live-`
+    // at q-1, key off the guard-op position `q` instead of the PC's first
+    // insn so the resolution lands on the guard's own leading marker (the
+    // runtime resumes the branch at orgpc = the guard's pc, #285).  The
+    // guard is the block terminator, so `q` >= the owner PC's first insn;
+    // the override only moves the key forward.  `owner_pc(q)` = the py_pc
+    // whose first-insn position is the greatest at-or-before `q`, computed
+    // over the position-ascending `pc_first_insn_pos`, matching
+    // `resume_target_resolver_coverage`.
+    let mut pc_pos: Vec<(usize, usize)> = ssarepr
+        .pc_first_insn_pos
+        .iter()
+        .filter(|&&(pc, _)| pc >= 0)
+        .map(|&(pc, pos)| (pos, pc as usize))
+        .collect();
+    pc_pos.sort_unstable();
+    for (q, insn) in ssarepr.insns.iter().enumerate() {
+        let super::flatten::Insn::Op { opname, .. } = insn else {
+            continue;
+        };
+        let is_branch_guard =
+            opname == "goto_if_not" || opname.starts_with("goto_if_not_") || opname == "switch";
+        if !is_branch_guard || !q.checked_sub(1).is_some_and(|i| ssarepr.insns[i].is_live()) {
+            continue;
+        }
+        if let Some(owner) = pc_pos
+            .partition_point(|&(pos, _)| pos <= q)
+            .checked_sub(1)
+            .map(|k| pc_pos[k].1)
+        {
+            if owner < n_pcs {
+                pos_for_pc[owner] = Some(q);
+            }
         }
     }
     // `-live-` marker positions in stream order (ascending by construction).
