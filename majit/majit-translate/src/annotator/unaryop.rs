@@ -3617,12 +3617,28 @@ fn init_someinstance_overrides(
                             s_attr
                         )
                     });
-                let classdef = inst.classdef.as_ref().unwrap_or_else(|| {
-                    panic!(
-                        "AnnotatorError: SomeInstance.getattr({:?}) on classdef-less instance",
-                        attr
-                    )
-                });
+                let classdef = match inst.classdef.as_ref() {
+                    Some(cd) => cd,
+                    None => {
+                        // A classdef-less `SomeInstance` has no RPython analogue
+                        // (`SomeInstance` upstream always carries a classdef).
+                        // It arises only from pyre's pointer erasure:
+                        // `project_pyre_field_type` strips `*mut`/`*const`/`&`
+                        // and resolves the pointee — when the pointee is an
+                        // unregistered host struct the field becomes
+                        // `SomeInstance(classdef=None)`.  A raw-pointer inherent
+                        // method on such an erased receiver is answered the way
+                        // `SomePtr.getattr` would: `is_null` yields `SomeBool`
+                        // (lltype `_ptr`).  Any other attr stays fail-loud.
+                        if attr == "is_null" {
+                            return super::model::s_bool();
+                        }
+                        panic!(
+                            "AnnotatorError: SomeInstance.getattr({:?}) on classdef-less instance",
+                            attr
+                        )
+                    }
+                };
                 // unaryop.py:838-839 — `if attr == '__class__':
                 //                          return self.classdef.read_attr__class__()`.
                 if attr == "__class__" {
