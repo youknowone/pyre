@@ -897,6 +897,33 @@ pub fn translate_op(
             )])
         }
 
+        // ─── `isinstance` — RPython `space.isinstance(obj, cls)` ───
+        // `flowspace/operation.py:259 isinstance → OpKind::IsInstance`.
+        // Emitted pre-rtyper by `front/ast.rs` at `TupleStruct` /
+        // composite match-cascade payload sites where a unit-variant
+        // ptr_eq does not suffice. The rtyper dispatches `"isinstance"`
+        // at `rtyper.rs:2035 translate_unary_operation` →
+        // `InstanceRepr::rtype_isinstance`, which mints either a
+        // per-class `ll_isinstance_const_*` helper (Constant
+        // `class_carrier`) or the generic `ll_isinstance` helper
+        // (Variable `class_carrier`).
+        OpKind::IsInstance {
+            obj,
+            class_carrier,
+            ..
+        } => {
+            let obj_vid = operand_value_id(graph, obj, op, "obj")?;
+            let cls_vid = operand_value_id(graph, class_carrier, op, "class_carrier")?;
+            let obj_hl = lookup_operand(value_map, obj_vid, op, "obj")?;
+            let cls_hl = lookup_operand(value_map, cls_vid, op, "class_carrier")?;
+            let result = resolve_result_hlvalue(op, value_map, graph)?;
+            Ok(vec![FlowspaceOp::new(
+                "isinstance",
+                vec![obj_hl, cls_hl],
+                result,
+            )])
+        }
+
         // ─── FieldRead / FieldWrite ports ───
         // RPython `flowspace/operation.py:617 GetAttr.opname = 'getattr'`
         // and `setattr` (operation.py: same module). The high-level
@@ -1486,6 +1513,7 @@ fn opkind_variant_name(kind: &OpKind) -> &'static str {
         OpKind::CurrentTraceLength => "CurrentTraceLength",
         OpKind::IsConstant { .. } => "IsConstant",
         OpKind::IsVirtual { .. } => "IsVirtual",
+        OpKind::IsInstance { .. } => "IsInstance",
         OpKind::ConditionalCall { .. } => "ConditionalCall",
         OpKind::ConditionalCallValue { .. } => "ConditionalCallValue",
         OpKind::RecordKnownResult { .. } => "RecordKnownResult",
