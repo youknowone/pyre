@@ -100,6 +100,17 @@ pub fn binary_value_from_tag(
     b: PyObjectRef,
     op_tag: i64,
 ) -> Result<PyObjectRef, PyError> {
+    // In-place tags (13-24) must consult the in-place special (`__iadd__`
+    // etc.) first; route them through `binary_value`.  Tags 0-12 use the
+    // plain dispatch below.
+    if op_tag > 12 {
+        let Some(op) = crate::runtime_ops::binary_op_from_tag(op_tag) else {
+            return Err(PyError::type_error(format!(
+                "unsupported binary op tag: {op_tag}"
+            )));
+        };
+        return binary_value(a, b, op);
+    }
     match op_tag {
         0 => add(a, b),
         1 => sub(a, b),

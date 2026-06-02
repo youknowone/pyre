@@ -381,24 +381,39 @@ where
 
 pub fn binary_op_tag(op: BinaryOperator) -> Option<i64> {
     Some(match op {
-        BinaryOperator::Add | BinaryOperator::InplaceAdd => 0,
-        BinaryOperator::Subtract | BinaryOperator::InplaceSubtract => 1,
-        BinaryOperator::Multiply | BinaryOperator::InplaceMultiply => 2,
-        BinaryOperator::FloorDivide | BinaryOperator::InplaceFloorDivide => 3,
-        BinaryOperator::Remainder | BinaryOperator::InplaceRemainder => 4,
-        BinaryOperator::TrueDivide | BinaryOperator::InplaceTrueDivide => 5,
+        BinaryOperator::Add => 0,
+        BinaryOperator::Subtract => 1,
+        BinaryOperator::Multiply => 2,
+        BinaryOperator::FloorDivide => 3,
+        BinaryOperator::Remainder => 4,
+        BinaryOperator::TrueDivide => 5,
         BinaryOperator::Subscr => 6,
-        BinaryOperator::Power | BinaryOperator::InplacePower => 7,
-        BinaryOperator::Lshift | BinaryOperator::InplaceLshift => 8,
-        BinaryOperator::Rshift | BinaryOperator::InplaceRshift => 9,
-        BinaryOperator::And | BinaryOperator::InplaceAnd => 10,
-        BinaryOperator::Or | BinaryOperator::InplaceOr => 11,
-        BinaryOperator::Xor | BinaryOperator::InplaceXor => 12,
+        BinaryOperator::Power => 7,
+        BinaryOperator::Lshift => 8,
+        BinaryOperator::Rshift => 9,
+        BinaryOperator::And => 10,
+        BinaryOperator::Or => 11,
+        BinaryOperator::Xor => 12,
+        // In-place variants get distinct tags (13-24) so the residual
+        // dispatch consults the in-place special (`__iadd__` etc.) instead
+        // of collapsing to the plain binary op.
+        BinaryOperator::InplaceAdd => 13,
+        BinaryOperator::InplaceSubtract => 14,
+        BinaryOperator::InplaceMultiply => 15,
+        BinaryOperator::InplaceFloorDivide => 16,
+        BinaryOperator::InplaceRemainder => 17,
+        BinaryOperator::InplaceTrueDivide => 18,
+        BinaryOperator::InplacePower => 19,
+        BinaryOperator::InplaceLshift => 20,
+        BinaryOperator::InplaceRshift => 21,
+        BinaryOperator::InplaceAnd => 22,
+        BinaryOperator::InplaceOr => 23,
+        BinaryOperator::InplaceXor => 24,
         _ => return None,
     })
 }
 
-/// Reverse of binary_op_tag: tag (0-12) → BinaryOperator.
+/// Reverse of binary_op_tag: tag (0-24) → BinaryOperator.
 /// The blackhole interpreter receives the compact tag from the codewriter
 /// and needs to recover the original operator for binary_value dispatch.
 pub fn binary_op_from_tag(tag: i64) -> Option<BinaryOperator> {
@@ -416,6 +431,18 @@ pub fn binary_op_from_tag(tag: i64) -> Option<BinaryOperator> {
         10 => BinaryOperator::And,
         11 => BinaryOperator::Or,
         12 => BinaryOperator::Xor,
+        13 => BinaryOperator::InplaceAdd,
+        14 => BinaryOperator::InplaceSubtract,
+        15 => BinaryOperator::InplaceMultiply,
+        16 => BinaryOperator::InplaceFloorDivide,
+        17 => BinaryOperator::InplaceRemainder,
+        18 => BinaryOperator::InplaceTrueDivide,
+        19 => BinaryOperator::InplacePower,
+        20 => BinaryOperator::InplaceLshift,
+        21 => BinaryOperator::InplaceRshift,
+        22 => BinaryOperator::InplaceAnd,
+        23 => BinaryOperator::InplaceOr,
+        24 => BinaryOperator::InplaceXor,
         _ => return None,
     })
 }
