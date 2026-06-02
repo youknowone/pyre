@@ -143,14 +143,23 @@ impl W_Random {
         &mut self,
         #[default(pyre_object::w_none())] w_n: PyObjectRef,
     ) -> Result<(), crate::PyError> {
+        // None: seed from os.urandom(8); fall back to a time-based int only
+        // when urandom raises (interp_random.py:28).
+        let w_n = if unsafe { is_none(w_n) } {
+            match crate::importing::host::os::urandom(8) {
+                Ok(buf) => w_bytes_from_bytes(&buf),
+                Err(_) => w_int_new(seed_from_time() as i64),
+            }
+        } else {
+            w_n
+        };
         let n = unsafe {
-            if is_none(w_n) {
-                // urandom is unavailable here; fall back to the time source.
-                BigInt::from(seed_from_time())
-            } else if is_int_or_long(w_n) {
+            if is_int_or_long(w_n) {
+                // space.abs(w_n)
                 let v = crate::builtins::obj_to_bigint(w_n);
                 if v.sign() == Sign::Minus { -v } else { v }
             } else {
+                // n = space.hash_w(w_n); w_n = space.newint(r_uint(n))
                 BigInt::from(crate::baseobjspace::hash_w_strict(w_n)? as u64)
             }
         };
@@ -200,10 +209,8 @@ impl W_Random {
             let Some(item) = w_tuple_getitem(w_state, N as i64) else {
                 crate::bail_value_error!("state vector is the wrong size");
             };
-            if !is_int_or_long(item) {
-                crate::bail_type_error!("state vector must contain ints");
-            }
-            let index = w_int_get_value(item);
+            // space.int_w: handles long overflow / non-int (TypeError).
+            let index = crate::baseobjspace::int_w(item)?;
             if index < 0 || index > N as i64 {
                 crate::bail_value_error!("invalid state");
             }
