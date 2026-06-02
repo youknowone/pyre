@@ -2278,21 +2278,19 @@ fn build_class_inner(
     // PyPy: build_class → metaclass.__prepare__(name, bases, **kwds)
     // Returns the namespace dict to use for the class body.
     let w_namespace = if let Some(w_metaclass) = w_metaclass {
-        if unsafe { pyre_object::is_type(w_metaclass) } {
-            match crate::baseobjspace::getattr_str(w_metaclass, "__prepare__") {
-                Ok(prepare) => {
-                    let ns_obj =
-                        crate::call_function(prepare, &[pyre_object::w_str_new(name), bases]);
-                    if !ns_obj.is_null() && unsafe { !pyre_object::is_none(ns_obj) } {
-                        Some(ns_obj)
-                    } else {
-                        None
-                    }
+        // compiling.py:184 — look up __prepare__ on the metaclass whether
+        // or not it is a type; AttributeError falls back to a fresh
+        // namespace.
+        match crate::baseobjspace::getattr_str(w_metaclass, "__prepare__") {
+            Ok(prepare) => {
+                let ns_obj = crate::call_function(prepare, &[pyre_object::w_str_new(name), bases]);
+                if !ns_obj.is_null() && unsafe { !pyre_object::is_none(ns_obj) } {
+                    Some(ns_obj)
+                } else {
+                    None
                 }
-                Err(_) => None,
             }
-        } else {
-            None
+            Err(_) => None,
         }
     } else {
         None
