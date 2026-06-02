@@ -1175,6 +1175,13 @@ impl VectorizingOptimizer {
             }
         }
 
+        // vector.py:515-520 schedule(): post_schedule runs only when the cost
+        // model is profitable; an unprofitable loop returns before post_schedule
+        // mutates loop_ (matches the run_optimization path and PyPy).
+        if !sched_state.costmodel.profitable() {
+            return None;
+        }
+
         // schedule.py:762-779: VecScheduleState.post_schedule. Moves
         // invariant_oplist into loop_.prefix and routes invariant_vector_vars
         // through prefix_label/jump renaming. Reachable in the streaming path
@@ -1182,10 +1189,6 @@ impl VectorizingOptimizer {
         // the JUMP, builds this VectorLoop, and emits the finaloplist result —
         // so prefix ops land BEFORE the loop entry, not inside the body.
         sched_state.post_schedule(loop_, &mut seen);
-
-        if !sched_state.costmodel.profitable() {
-            return None;
-        }
 
         // Emit the original loop label only when post_schedule did NOT mint a
         // prefix_label (which replaces the label as the vectorized loop entry):
