@@ -673,14 +673,15 @@ pub fn ncells(code: &CodeObject) -> usize {
 /// Whether calling a code object with these flags produces a suspended
 /// frame object (generator / coroutine / async generator) rather than
 /// running the body eagerly.
-/// pyframe.py get_generator: CO_GENERATOR | CO_COROUTINE |
-/// CO_ITERABLE_COROUTINE | CO_ASYNC_GENERATOR.
+/// pyframe.py:246 `_is_generator_or_coroutine`: CO_COROUTINE |
+/// CO_GENERATOR | CO_ASYNC_GENERATOR.  CO_ITERABLE_COROUTINE is a marker
+/// layered on a generator function (it always co-occurs with
+/// CO_GENERATOR), so it is not tested here.
 #[inline]
 pub fn code_flags_make_generator(flags: crate::CodeFlags) -> bool {
     flags.intersects(
         crate::CodeFlags::GENERATOR
             | crate::CodeFlags::COROUTINE
-            | crate::CodeFlags::ITERABLE_COROUTINE
             | crate::CodeFlags::ASYNC_GENERATOR,
     )
 }

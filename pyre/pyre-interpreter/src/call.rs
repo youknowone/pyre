@@ -2647,70 +2647,59 @@ fn pack_pyre_kwargs(kw_items: &[(PyObjectRef, PyObjectRef)]) -> PyObjectRef {
 }
 
 /// `typeobject.c type_new_init_subclass` — after a class is created, call
-/// `__init_subclass__` on each base that defines it, forwarding the
-/// keyword arguments that reached `type.__new__`.  `init_subclass_kwargs`
+/// `super(w_type, w_type).__init_subclass__(**kwds)` exactly once.  The
+/// nearest `__init_subclass__` after `w_type` itself in the MRO is
+/// responsible for chaining to its own `super()`.  `init_subclass_kwargs`
 /// must already exclude the `__pyre_kw__` marker and the `metaclass` key.
+///
+/// `w_effective_bases` is unused now that resolution follows the MRO, but
+/// is kept in the signature so the call sites need not change.
 pub(crate) fn call_init_subclass_on_bases(
     w_type: PyObjectRef,
-    w_effective_bases: PyObjectRef,
+    _w_effective_bases: PyObjectRef,
     init_subclass_kwargs: &[(PyObjectRef, PyObjectRef)],
 ) -> Result<(), crate::PyError> {
-    if w_effective_bases.is_null() || unsafe { !pyre_object::is_tuple(w_effective_bases) } {
+    let Some(init_sub) =
+        (unsafe { crate::baseobjspace::lookup_in_mro_after_self(w_type, "__init_subclass__") })
+    else {
         return Ok(());
-    }
-    let n = unsafe { pyre_object::w_tuple_len(w_effective_bases) };
-    for i in 0..n {
-        let Some(base) = (unsafe { pyre_object::w_tuple_getitem(w_effective_bases, i as i64) })
-        else {
-            continue;
-        };
-        if unsafe { !pyre_object::is_type(base) } {
-            continue;
+    };
+    // Forward kwargs only to a user-defined __init_subclass__ with a
+    // real Python code object; object's builtin default has no code
+    // object, so resolve_kwargs would deref a bogus code pointer.
+    let is_user_fn = unsafe { crate::is_function(init_sub) }
+        && unsafe { !crate::is_builtin_code(crate::getcode(init_sub) as pyre_object::PyObjectRef) };
+    if !init_subclass_kwargs.is_empty() && is_user_fn {
+        let mut call_args = Vec::with_capacity(1 + init_subclass_kwargs.len());
+        call_args.push(w_type);
+        let mut names = Vec::with_capacity(init_subclass_kwargs.len());
+        for (k, v) in init_subclass_kwargs {
+            call_args.push(*v);
+            names.push(*k);
         }
-        let Some(init_sub) =
-            (unsafe { crate::baseobjspace::lookup_in_type(base, "__init_subclass__") })
-        else {
-            continue;
-        };
-        // Forward kwargs only to a user-defined __init_subclass__ with a
-        // real Python code object; object's builtin default has no code
-        // object, so resolve_kwargs would deref a bogus code pointer.
-        let is_user_fn = unsafe { crate::is_function(init_sub) }
-            && unsafe {
-                !crate::is_builtin_code(crate::getcode(init_sub) as pyre_object::PyObjectRef)
-            };
-        if !init_subclass_kwargs.is_empty() && is_user_fn {
-            let mut call_args = Vec::with_capacity(1 + init_subclass_kwargs.len());
-            call_args.push(w_type);
-            let mut names = Vec::with_capacity(init_subclass_kwargs.len());
-            for (k, v) in init_subclass_kwargs {
-                call_args.push(*v);
-                names.push(*k);
+        let kwarg_names = pyre_object::w_tuple_new(names);
+        let resolved = resolve_kwargs(init_sub, &call_args, kwarg_names)?;
+        clear_call_error();
+        let res = call_user_function_resolved_frameless(init_sub, &resolved);
+        if res.is_null() {
+            if let Some(err) = take_call_error() {
+                return Err(err);
             }
-            let kwarg_names = pyre_object::w_tuple_new(names);
-            let resolved = resolve_kwargs(init_sub, &call_args, kwarg_names)?;
-            clear_call_error();
-            let res = call_user_function_resolved_frameless(init_sub, &resolved);
-            if res.is_null() {
-                if let Some(err) = take_call_error() {
-                    return Err(err);
-                }
-            }
-        } else if init_subclass_kwargs.is_empty() {
-            clear_call_error();
-            let res = crate::call_function(init_sub, &[w_type]);
-            if res.is_null() {
-                if let Some(err) = take_call_error() {
-                    return Err(err);
-                }
-            }
-        } else {
-            // The default __init_subclass__ consumes no keywords; leftover
-            // keywords are an error rather than silently dropped.
-            return Err(crate::PyError::type_error(
-                "__init_subclass__() takes no keyword arguments",
-            ));
         }
+    } else if init_subclass_kwargs.is_empty() {
+        clear_call_error();
+        let res = crate::call_function(init_sub, &[w_type]);
+        if res.is_null() {
+            if let Some(err) = take_call_error() {
+                return Err(err);
+            }
+        }
+    } else {
+        // The default __init_subclass__ consumes no keywords; leftover
+        // keywords are an error rather than silently dropped.
+        return Err(crate::PyError::type_error(
+            "__init_subclass__() takes no keyword arguments",
+        ));
     }
     Ok(())
 }

@@ -7,16 +7,25 @@
 //! ```text
 //! __next__():
 //!     if it_callable is NULL: raise StopIteration   # exhausted
-//!     result = it_callable()
-//!     if it_sentinel == result:                     # rich __eq__
+//!     try:
+//!         result = it_callable()
+//!     except StopIteration:
+//!         it_callable = NULL                         # latch exhausted
+//!         raise
+//!     if it_callable is NULL:                        # re-entrant exhaust
+//!         raise StopIteration                        # discard result
+//!     if it_sentinel == result:                      # rich __eq__
 //!         it_callable = NULL                         # latch exhausted
 //!         raise StopIteration
 //!     return result
 //! ```
 //!
-//! `callable` is set to `PY_NULL` once the sentinel has been seen, so a
-//! second `next()` keeps raising `StopIteration` without re-invoking the
-//! callable (`calliter_iternext` `it->it_callable == NULL`).
+//! `callable` is set to `PY_NULL` once the sentinel has been seen or the
+//! callable raises `StopIteration`, so a second `next()` keeps raising
+//! `StopIteration` without re-invoking the callable.  The overloaded
+//! `PY_NULL` latch doubles as the `_exhausted` flag of
+//! `_CallableIterator` so a callable that re-enters and exhausts the
+//! iterator causes the outer `next()` to discard its result.
 
 use crate::pyobject::*;
 use pyre_macros::pyre_class;

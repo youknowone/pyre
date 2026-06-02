@@ -1045,6 +1045,19 @@ unsafe fn getitem_instance(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
     )))
 }
 
+/// Read the `i64` value of an `int` or `bool` object.  `is_int` reports
+/// `True` for `bool` (a subtype of `int`), but `bool` stores its payload
+/// in a distinct struct layout, so the value must be read through the
+/// matching accessor rather than `w_int_get_value`.
+#[inline]
+unsafe fn int_or_bool_value(obj: PyObjectRef) -> i64 {
+    if is_bool(obj) {
+        w_bool_get_value(obj) as i64
+    } else {
+        w_int_get_value(obj)
+    }
+}
+
 #[inline(never)]
 /// `rangeobject.py W_RangeObject.descr_getitem` — integer index returns
 /// the member `start + i*step` (negative folded, bounds-checked); a slice
@@ -1053,7 +1066,7 @@ unsafe fn getitem_range(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
     let (rstart, _rstop, rstep) = pyre_object::w_range_fields(obj);
     let len = pyre_object::w_range_len(obj);
     if is_int(index) {
-        return match pyre_object::w_range_getitem(obj, w_int_get_value(index)) {
+        return match pyre_object::w_range_getitem(obj, int_or_bool_value(index)) {
             Some(v) => Ok(w_int_new(v)),
             None => Err(PyError::new(
                 PyErrorKind::IndexError,
@@ -1086,13 +1099,14 @@ fn range_index_method(args: &[PyObjectRef]) -> PyResult {
         let (start, _stop, step) = pyre_object::w_range_fields(obj);
         let len = pyre_object::w_range_len(obj);
         if is_int(needle) {
-            let v = w_int_get_value(needle);
+            let v = int_or_bool_value(needle);
             if pyre_object::w_range_contains_int(obj, v) {
                 return Ok(w_int_new((v - start) / step));
             }
-            return Err(PyError::value_error(
-                "range.index(x): x not in range".to_string(),
-            ));
+            return Err(PyError::value_error(format!(
+                "{} is not in range",
+                crate::display::py_repr(needle)
+            )));
         }
         for i in 0..len {
             if is_true(compare(w_int_new(start + i * step), needle, CompareOp::Eq)?) {
@@ -3825,6 +3839,43 @@ pub(crate) unsafe fn lookup_in_type_wtf8(w_type: PyObjectRef, name: &Wtf8) -> Op
     }
     None
 }
+
+/// Resolve `name` the way `super(w_type, w_type).name` would: walk the
+/// MRO starting *after* `w_type` itself and return the first own-dict
+/// definition.  Used by `type_new_init_subclass` to invoke
+/// `__init_subclass__` exactly once on the nearest ancestor.
+pub(crate) unsafe fn lookup_in_mro_after_self(
+    w_type: PyObjectRef,
+    name: &str,
+) -> Option<PyObjectRef> {
+    if w_type.is_null() || !is_type(w_type) {
+        return None;
+    }
+    let cached = w_type_get_mro(w_type);
+    let mro_owned;
+    let mro: &[PyObjectRef] = if !cached.is_null() {
+        &*cached
+    } else {
+        mro_owned = compute_mro(w_type);
+        &mro_owned
+    };
+    for cls in mro.iter().skip(1) {
+        if (*cls).is_null() || !is_type(*cls) {
+            continue;
+        }
+        let ns_ptr = w_type_get_dict_ptr(*cls) as *mut crate::DictStorage;
+        if !ns_ptr.is_null() {
+            let ns = &*ns_ptr;
+            if let Some(&value) = ns.get(name) {
+                if !value.is_null() {
+                    return Some(value);
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Determine what `self` value to bind for a super-resolved attribute.
 ///
 /// Walks the MRO of `self_obj` starting after `super_type`, finds the
@@ -6651,21 +6702,35 @@ pub fn next(obj: PyObjectRef) -> PyResult {
         //         if w_item is None:
         //             w_item = space.next(self.w_iter_or_list)
         //         return space.newtuple2(w_index, w_item)
-        // `iter(callable, sentinel)` product (`Objects/iterobject.c`
-        // `calliter_iternext`): invoke the zero-arg callable; stop when
-        // the result equals the sentinel.  Once exhausted, `callable` is
-        // latched to `PY_NULL` so further `next()` keeps raising.
+        // `iter(callable, sentinel)` product
+        // (`__builtin__/operation.py:128 _CallableIterator.__next__`):
+        // invoke the zero-arg callable; stop when the result equals the
+        // sentinel.  Once exhausted, `callable` is latched to `PY_NULL`
+        // so further `next()` keeps raising.  The latch is also set when
+        // the callable itself raises `StopIteration`, and a re-entrant
+        // call that exhausts the iterator during `callable()` discards
+        // this call's result.
         if pyre_object::callableiteratorobject::is_callable_iterator(obj) {
             use pyre_object::callableiteratorobject as ci;
             let callable = ci::w_callable_iterator_get_callable(obj);
             if callable.is_null() {
                 return Err(PyError::stop_iteration());
             }
-            let result = crate::call::call_function_impl_result(callable, &[])?;
-            // `calliter_iternext` re-checks `it_callable` after the call: the
-            // callable may have re-entered `next()` on this same iterator and
-            // latched it to `PY_NULL`, exhausting it; discard the result and
-            // stay stopped rather than comparing a stale value to the sentinel.
+            let result = match crate::call::call_function_impl_result(callable, &[]) {
+                Ok(r) => r,
+                Err(e) if e.kind == crate::PyErrorKind::StopIteration => {
+                    // `calliter_iternext`: when the callable itself raises
+                    // `StopIteration`, latch `it_callable` to `PY_NULL` so
+                    // further `next()` stays stopped, then re-raise.
+                    ci::w_callable_iterator_set_callable(obj, pyre_object::PY_NULL);
+                    return Err(e);
+                }
+                Err(e) => return Err(e),
+            };
+            // Re-check `it_callable` after the call: the callable may have
+            // re-entered `next()` on this same iterator and latched it to
+            // `PY_NULL`, exhausting it; discard the result and stay stopped
+            // rather than comparing a stale value to the sentinel.
             if ci::w_callable_iterator_get_callable(obj).is_null() {
                 return Err(PyError::stop_iteration());
             }
@@ -7443,7 +7508,7 @@ pub fn contains(haystack: PyObjectRef, needle: PyObjectRef) -> Result<bool, PyEr
             if is_int(needle) {
                 return Ok(pyre_object::w_range_contains_int(
                     haystack,
-                    w_int_get_value(needle),
+                    int_or_bool_value(needle),
                 ));
             }
             let (start, _stop, step) = pyre_object::w_range_fields(haystack);

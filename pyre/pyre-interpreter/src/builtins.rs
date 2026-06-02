@@ -202,33 +202,32 @@ fn memoryview_ndim(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
 
 /// Unpack a memoryview-or-bytes-like operand to its element value list,
 /// or `None` when it is neither (so `__eq__` can return NotImplemented).
-unsafe fn memoryview_operand_values(obj: PyObjectRef) -> Option<Vec<i64>> {
+/// The raw contiguous buffer bytes of a memoryview or bytes-like object —
+/// the `view.as_str()` that `W_MemoryView.descr_eq` compares
+/// (`memoryobject.py`).  Comparing the underlying bytes (rather than
+/// per-`itemsize` unpacked values) keeps `==` independent of the view's
+/// cast format.
+unsafe fn memoryview_operand_bytes(obj: PyObjectRef) -> Option<Vec<u8>> {
     if let Some(t) = crate::typedef::r#type(obj) {
         if unsafe { pyre_object::w_type_get_name(t) } == "memoryview" {
-            let (data, itemsize, _) = unsafe { memoryview_data(obj) }.ok()?;
-            let n = data.len() / itemsize;
-            return Some(
-                (0..n)
-                    .map(|i| memoryview_unpack(&data, itemsize, i))
-                    .collect(),
-            );
+            let (data, _itemsize, _) = unsafe { memoryview_data(obj) }.ok()?;
+            return Some(data);
         }
     }
     if unsafe { pyre_object::bytesobject::is_bytes_like(obj) } {
-        let data = unsafe { pyre_object::bytesobject::bytes_like_data(obj) };
-        return Some(data.iter().map(|&b| b as i64).collect());
+        return Some(unsafe { pyre_object::bytesobject::bytes_like_data(obj) }.to_vec());
     }
     None
 }
 
-/// `memoryview.__eq__` — equal element values against another memoryview
+/// `memoryview.__eq__` — equal raw buffer bytes against another memoryview
 /// or bytes-like; NotImplemented for any other operand.
 fn memoryview_eq(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let mv = args.first().copied().unwrap_or(w_none());
     let other = args.get(1).copied().unwrap_or(w_none());
     unsafe {
-        let a = memoryview_operand_values(mv).unwrap_or_default();
-        match memoryview_operand_values(other) {
+        let a = memoryview_operand_bytes(mv).unwrap_or_default();
+        match memoryview_operand_bytes(other) {
             Some(b) => Ok(w_bool_from(a == b)),
             None => Ok(pyre_object::w_not_implemented()),
         }
@@ -240,8 +239,8 @@ fn memoryview_ne(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let mv = args.first().copied().unwrap_or(w_none());
     let other = args.get(1).copied().unwrap_or(w_none());
     unsafe {
-        let a = memoryview_operand_values(mv).unwrap_or_default();
-        match memoryview_operand_values(other) {
+        let a = memoryview_operand_bytes(mv).unwrap_or_default();
+        match memoryview_operand_bytes(other) {
             Some(b) => Ok(w_bool_from(a != b)),
             None => Ok(pyre_object::w_not_implemented()),
         }
