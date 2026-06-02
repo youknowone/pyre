@@ -3834,17 +3834,20 @@ fn execute_assembler(
                             // Pyre's `BlackholeResult::Failed` is a layered
                             // adaptation; SSA-authoritative live_r encoder /
                             // decoder work should eliminate the remaining
-                            // triggers. Until then
-                            // the bare `invalidate_loop` keeps the cell
-                            // retraceable; the failure surfaces in
-                            // check.py rather than being masked.
+                            // triggers.
+                            //
+                            // Increment abort_count and invalidate the
+                            // compiled loop. Once the limit is reached the
+                            // key is also marked DONT_TRACE_HERE so the
+                            // compile / guard-fail / bh-fail / invalidate /
+                            // retrace cycle stops.
                             if majit_metainterp::majit_log_enabled() {
                                 eprintln!(
-                                    "[jit][BUG] blackhole failed key={} trace={} guard={} — invalidating",
+                                    "[jit][BUG] blackhole failed key={} trace={} guard={} — recording failure",
                                     green_key, trace_id, fail_index,
                                 );
                             }
-                            driver.invalidate_loop(green_key);
+                            driver.record_blackhole_failure_and_maybe_invalidate(green_key);
                             None
                         }
                         _ => bh_result.to_pyresult().map(LoopResult::Done),
@@ -4053,7 +4056,9 @@ fn bound_reached(
                             }
                             return Some(LoopResult::ContinueRunningNormally);
                         }
-                        crate::call_jit::BlackholeResult::Failed => {}
+                        crate::call_jit::BlackholeResult::Failed => {
+                            driver.record_blackhole_failure_and_maybe_invalidate(green_key);
+                        }
                         _ => {
                             if let Some(r) = bh_result.to_pyresult() {
                                 return Some(LoopResult::Done(r));
@@ -4233,14 +4238,16 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
                             // 3b-2/3b-3 should eliminate the triggers by
                             // reading/writing registers_r at post-regalloc
                             // color instead of semantic slot index.
+                            // Increment abort_count, invalidate compiled
+                            // loop, and at limit mark DONT_TRACE_HERE.
                             if majit_metainterp::majit_log_enabled() {
                                 eprintln!(
-                                    "[jit][BUG] blackhole failed key={} — invalidating",
+                                    "[jit][BUG] blackhole failed key={} — recording failure",
                                     green_key,
                                 );
                             }
                             let (driver, _) = driver_pair();
-                            driver.invalidate_loop(green_key);
+                            driver.record_blackhole_failure_and_maybe_invalidate(green_key);
                         }
                         _ => {
                             if let Some(r) = bh_result.to_pyresult() {

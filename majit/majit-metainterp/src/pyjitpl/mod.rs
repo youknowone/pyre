@@ -7622,6 +7622,19 @@ impl<M: Clone> MetaInterp<M> {
         }
     }
 
+    /// Record a blackhole resume failure, invalidate the compiled loop,
+    /// and at the abort limit also set DONT_TRACE_HERE to stop retracing.
+    pub fn record_blackhole_failure_and_maybe_invalidate(&mut self, green_key: u64) {
+        let limit_reached = self.warm_state.record_blackhole_failure(green_key);
+        self.invalidate_loop(green_key);
+        if limit_reached && crate::majit_log_enabled() {
+            eprintln!(
+                "[jit] blackhole abort limit reached for key={} — will not retrace",
+                green_key
+            );
+        }
+    }
+
     /// rpython/rlib/rstack.py:75-90 `stack_almost_full` — delegates to
     /// the interpreter-registered hook (see
     /// `majit_metainterp::register_stack_almost_full_hook`) which reads
