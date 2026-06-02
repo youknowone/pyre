@@ -1788,16 +1788,22 @@ fn link_extravar_to_hlvalue(
 ///   `seed_variable` does (`flowspace_adapter.rs:99-115`).
 pub(crate) fn derive_subject_inputcells(
     legacy: &FunctionGraph,
-    // Retained for call-site symmetry with the rtyper entry points; the
-    // receiver's ClassDef is resolved by annotation, not seeded here.
-    _bookkeeper: Option<&Rc<crate::annotator::bookkeeper::Bookkeeper>>,
+    // Used to seed a `Ref` receiver with its cached, identity-stable
+    // struct-root `ClassDef` via `getuniqueclassdef_for_struct_root`
+    // (see the `OpKind::Input` arm below).  `None` (test fixtures) keeps
+    // every `Ref` classdef-less, narrowed later by annotation.
+    bookkeeper: Option<&Rc<crate::annotator::bookkeeper::Bookkeeper>>,
 ) -> Result<Vec<crate::annotator::model::SomeValue>, TyperError> {
     let startblock = &legacy.blocks[legacy.startblock.0];
-    let mut input_by_result: HashMap<crate::flowspace::model::Variable, &crate::model::ValueType> =
-        HashMap::new();
+    let mut input_by_result: HashMap<
+        crate::flowspace::model::Variable,
+        (&crate::model::ValueType, &Option<String>),
+    > = HashMap::new();
     for op in &startblock.operations {
-        if let (Some(result), OpKind::Input { ty, .. }) = (op.result.as_ref(), &op.kind) {
-            input_by_result.insert(result.clone(), ty);
+        if let (Some(result), OpKind::Input { ty, class_root, .. }) =
+            (op.result.as_ref(), &op.kind)
+        {
+            input_by_result.insert(result.clone(), (ty, class_root));
         }
     }
     let mut cells = Vec::with_capacity(startblock.inputargs.len());
@@ -1811,7 +1817,7 @@ pub(crate) fn derive_subject_inputcells(
             continue;
         }
         // 2. Front-end Input op at the startblock.
-        if let Some(&ty) = input_by_result.get(var) {
+        if let Some(&(ty, class_root)) = input_by_result.get(var) {
             let shell = valuetype_to_someshell(ty).ok_or_else(|| {
                 TyperError::message(format!(
                     "derive_subject_inputcells: startblock.inputargs[{idx}] \
@@ -1821,17 +1827,50 @@ pub(crate) fn derive_subject_inputcells(
                 ))
             })?;
             // A `Ref` inputarg projects to the abstract `SomeInstance(None)`
-            // that `valuetype_to_someshell` yields; its concrete ClassDef is
-            // resolved by call-propagation during annotation, the way RPython
-            // binds a method to the class observed at its call site
-            // (`description.py:283-305 FunctionDesc.pycall`).  An earlier
-            // pass eager-seeded the receiver here from `OpKind::Input
-            // .class_root` via `getuniqueclassdef_for_struct_root`; that
-            // minted a struct-root ClassDef whose identity differed from the
-            // call-propagated one, leaving the annotation fixpoint dependent
-            // on graph-processing (HashMap) order — non-deterministic
-            // classdef-less-`self` getattr.  Receiver narrowing is left to
-            // annotation.
+            // shell from `valuetype_to_someshell`.  When the front-end
+            // resolved the param's struct root (`OpKind::Input.class_root`,
+            // populated from `type_root_ident` at front/ast.rs:2107-2184)
+            // and the struct-field registry knows that root, seed the
+            // receiver with the *cached* `ClassDef` from
+            // `getuniqueclassdef_for_struct_root` (bookkeeper.rs:1522). The
+            // cache makes the classdef identity-stable across repeated
+            // lookups (`Rc::ptr_eq`), so the annotation fixpoint stays
+            // independent of graph-processing order — unlike the earlier
+            // eager seed that minted a fresh struct-root ClassDef per site
+            // (identity divergence → order-dependent fixpoint).  Host structs
+            // with no RPython classdef (e.g. `PyFrame::locals_cells_stack_w:
+            // *mut FixedObjectArray`) are never a call argument, so
+            // call-propagation never narrows them; the seed is the only path
+            // that gives them a populated receiver.  Other `Ref` variants
+            // (no `class_root`, unknown root, or no bookkeeper) keep the
+            // classdef-less shell, narrowed by call-propagation as before
+            // (`description.py:283-305 FunctionDesc.pycall`).
+            if matches!(ty, crate::model::ValueType::Ref(_)) {
+                if let (Some(root), Some(bk)) = (class_root.as_ref(), bookkeeper) {
+                    let known = bk
+                        .pyre_struct_fields
+                        .borrow()
+                        .as_ref()
+                        .is_some_and(|reg| reg.fields.contains_key(root));
+                    if known {
+                        let cd = bk.getuniqueclassdef_for_struct_root(root).map_err(|e| {
+                            TyperError::message(format!(
+                                "derive_subject_inputcells: startblock.inputargs[{idx}] \
+                                 ({var:?}) `Ref` receiver root {root:?} failed struct-root \
+                                 ClassDef registration: {e:?}"
+                            ))
+                        })?;
+                        cells.push(crate::annotator::model::SomeValue::Instance(
+                            crate::annotator::model::SomeInstance::new(
+                                Some(cd),
+                                false,
+                                std::collections::BTreeMap::new(),
+                            ),
+                        ));
+                        continue;
+                    }
+                }
+            }
             cells.push(shell);
             continue;
         }
