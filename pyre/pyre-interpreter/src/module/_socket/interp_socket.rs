@@ -2628,13 +2628,19 @@ fn init_socket_type(ns: &mut DictStorage) {
                 let fd = socket_fd(obj)?;
                 let family = socket_get_attr_i64(obj, "_family") as libc::c_int;
                 let (storage, slen) = pack_inet_addr(family, args[1])?;
-                let r = unsafe {
-                    libc::connect(fd, &storage as *const _ as *const libc::sockaddr, slen)
-                };
-                let err = if r != 0 {
-                    std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
-                } else {
-                    0
+                // `interp_socket.py:387-391` — retry while the call is
+                // interrupted (EINTR), otherwise return the errno.
+                let err = loop {
+                    let r = unsafe {
+                        libc::connect(fd, &storage as *const _ as *const libc::sockaddr, slen)
+                    };
+                    if r == 0 {
+                        break 0;
+                    }
+                    let e = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+                    if e != libc::EINTR {
+                        break e;
+                    }
                 };
                 Ok(pyre_object::w_int_new(err as i64))
             },
