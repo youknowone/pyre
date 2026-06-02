@@ -2122,6 +2122,7 @@ impl Assembler {
                 OpKind::CurrentTraceLength => "CurrentTraceLength",
                 OpKind::IsConstant { .. } => "IsConstant",
                 OpKind::IsVirtual { .. } => "IsVirtual",
+                OpKind::IsInstance { .. } => "IsInstance",
                 OpKind::ConditionalCall { .. } => "ConditionalCall",
                 OpKind::ConditionalCallValue { .. } => "ConditionalCallValue",
                 OpKind::RecordKnownResult { .. } => "RecordKnownResult",
@@ -3277,6 +3278,12 @@ fn op_kind_to_opname(kind: &crate::model::OpKind) -> String {
         OpKind::IsVirtual { kind_char, .. } => {
             format!("{}_isvirtual", kind_char_to_name(*kind_char))
         }
+        // Mirrors flowspace/operation.rs OpKind::IsInstance opname:
+        // the rtyper dispatches the `"isinstance"` string at
+        // rtyper.rs:2035 to InstanceRepr::rtype_isinstance, which
+        // resolves it to the per-class `ll_isinstance_const_*` or the
+        // unspecialised `ll_isinstance` helper.
+        OpKind::IsInstance { .. } => "isinstance".into(),
         OpKind::RecordKnownResult { result_kind, .. } => {
             format!("record_known_result_{result_kind}")
         }

@@ -356,6 +356,7 @@ fn infer_op_type(kind: &OpKind) -> ValueType {
         // Python `bool`.  RPython annotates them as `SomeBool`, not
         // `SomeInteger`.
         OpKind::IsConstant { .. } | OpKind::IsVirtual { .. } => ValueType::Bool,
+        OpKind::IsInstance { result_ty, .. } => result_ty.clone(),
         // RPython: vtable entry is a `Ptr(FuncType)` address.
         OpKind::VtableMethodPtr { .. } => ValueType::Int,
         OpKind::IndirectCall { result_ty, .. } => result_ty.clone(),

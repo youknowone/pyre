@@ -6354,6 +6354,7 @@ fn op_can_raise(op: &OpKind) -> RaiseClass {
         | OpKind::CurrentTraceLength
         | OpKind::IsConstant { .. }
         | OpKind::IsVirtual { .. }
+        | OpKind::IsInstance { .. }
         | OpKind::RecordKnownResult { .. }
         // jtransform.py:901-903 — `record_quasiimmut_field` is pure bookkeeping
         // that the metainterp converts into a guard; cannot raise.

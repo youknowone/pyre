@@ -4240,6 +4240,11 @@ fn remap_op(
             value: remap_value(value, aliases),
             kind_char: *kind_char,
         },
+        OpKind::IsInstance { obj, class_carrier, result_ty } => OpKind::IsInstance {
+            obj: remap_value(obj, aliases),
+            class_carrier: remap_value(class_carrier, aliases),
+            result_ty: result_ty.clone(),
+        },
         OpKind::CallElidable {
             funcptr,
             descriptor,

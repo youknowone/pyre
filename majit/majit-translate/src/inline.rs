@@ -658,6 +658,11 @@ fn remap_op_kind(
             value: remap_var(value),
             kind_char: *kind_char,
         },
+        OpKind::IsInstance { obj, class_carrier, result_ty } => OpKind::IsInstance {
+            obj: remap_var(obj),
+            class_carrier: remap_var(class_carrier),
+            result_ty: result_ty.clone(),
+        },
         OpKind::Live => OpKind::Live,
         OpKind::JitMergePoint {
             jitdriver_index,
@@ -874,6 +879,9 @@ pub fn op_variable_refs(kind: &OpKind) -> Vec<crate::flowspace::model::Variable>
         OpKind::AssertGreen { value, .. }
         | OpKind::IsConstant { value, .. }
         | OpKind::IsVirtual { value, .. } => vec![clone_var(value)],
+        OpKind::IsInstance { obj, class_carrier, .. } => {
+            vec![clone_var(obj), clone_var(class_carrier)]
+        }
         OpKind::VtableMethodPtr { receiver, .. } => vec![clone_var(receiver)],
         OpKind::IndirectCall { funcptr, args, .. } => {
             let mut v = vec![clone_var(funcptr)];
@@ -1124,6 +1132,7 @@ pub fn is_pure_op(kind: &OpKind) -> bool {
         | OpKind::AssertGreen { .. }
         | OpKind::IsConstant { .. }
         | OpKind::IsVirtual { .. }
+        | OpKind::IsInstance { .. }
         | OpKind::CurrentTraceLength
         | OpKind::JitDebug { .. }
         | OpKind::JitMergePoint { .. }

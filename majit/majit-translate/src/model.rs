@@ -808,6 +808,23 @@ pub enum OpKind {
         value: crate::flowspace::model::Variable,
         kind_char: char,
     },
+    /// RPython `flowspace` `isinstance(obj, cls)` (annotator/unaryop.py +
+    /// rtyper.rs:2035 dispatch — `Repr.rtype_isinstance`). The
+    /// front-end emits this op at `match` cascade sites where the
+    /// variant pattern carries a payload (`TupleStruct`) and a
+    /// ptr_eq-against-singleton check would be insufficient.
+    /// `class_carrier` is typically a `ConstRef`-wrapped vtable
+    /// Constant resolved by the rtyper to a CLASSTYPE pointer; the
+    /// rtyper then dispatches to
+    /// [`InstanceRepr::rtype_isinstance`](crate::translator::rtyper::rclass::InstanceRepr::rtype_isinstance)
+    /// which mints either `ll_isinstance_const_{,nonnull}_<min>_<max>`
+    /// (Constant `class_carrier`) or the generic `ll_isinstance`
+    /// (Variable `class_carrier`).
+    IsInstance {
+        obj: crate::flowspace::model::Variable,
+        class_carrier: crate::flowspace::model::Variable,
+        result_ty: ValueType,
+    },
 
     // ── Conditional call ops (jtransform.py:1665-1688) ──────
     //
