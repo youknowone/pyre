@@ -9849,21 +9849,32 @@ impl CodeWriter {
         // so the splice falls back to the walker stream for that graph
         // instead of aborting.  Built from a private clone of
         // `graph_regallocs` so the production allocator state is untouched.
-        let canonical_for_splice: Option<super::flatten::SSARepr> =
-            if std::env::var("PYRE_FLATTEN_SPLICE").is_ok() {
+        //
+        // #280: capture the canonical `splice_regallocs` alongside the
+        // stream.  `flatten_graph` mutates it via `enforce_input_args`
+        // (swapcolors), so the returned copy holds the FINAL colors that
+        // match the emitted stream's register indices (`getcolor(v)`).
+        // The post-recolor resume maps below are rebuilt in this canonical
+        // color space — the spliced body carries graph-lifetime colors,
+        // not walker stack-slot register numbers.
+        let canonical_for_splice: Option<(
+            super::flatten::SSARepr,
+            [super::regalloc::GraphAllocationResult; 3],
+        )> = if std::env::var("PYRE_FLATTEN_SPLICE").is_ok() {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let mut splice_regallocs = graph_regallocs.clone();
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    super::flatten::flatten_graph(
-                        &graph,
-                        &mut splice_regallocs,
-                        false,
-                        Some(self.cpu()),
-                    )
-                }))
-                .ok()
-            } else {
-                None
-            };
+                let ssarepr = super::flatten::flatten_graph(
+                    &graph,
+                    &mut splice_regallocs,
+                    false,
+                    Some(self.cpu()),
+                );
+                (ssarepr, splice_regallocs)
+            }))
+            .ok()
+        } else {
+            None
+        };
         // Walker-tracked per-PC `-live-` marker positions exposed to
         // the post-drain `pc_map` computation.  Populated inside the
         // drain block below; consumed by `filter_liveness_in_place`
@@ -9875,6 +9886,12 @@ impl CodeWriter {
         // the drain block alongside `walker_tracked_pc_live_indices_out`
         // and threaded through `filter_liveness_in_place`'s remap.
         let mut walker_after_call_pc_indices_out: Option<Vec<Option<usize>>> = None;
+        // #280: set when the canonical stream actually replaced the walker
+        // drain below.  Gates the canonical-color-space resume-map rebuild
+        // (`stack_slot_color_map` / `pyre_color_for_semantic_local` / portal
+        // regs) so spliced graphs decode resume registers via the canonical
+        // coloring, not the walker stack-slot register numbering.
+        let mut did_splice = false;
         {
             // Walker post-walk insert_renamings.
             // Run BEFORE the per-block drain so the splice positions
@@ -10067,7 +10084,7 @@ impl CodeWriter {
             // body carries graph-lifetime colors (#254/#280), so gate-ON is
             // a measurement of the next cascade blocker, NOT a green flip;
             // gate-OFF skips the entire block and stays byte-identical.
-            if let Some(canonical) = &canonical_for_splice {
+            if let Some((canonical, _)) = &canonical_for_splice {
                 // The dense `pc_map` feed `filter_liveness_in_place` consumes
                 // must reference ONLY `-live-` markers (it asserts the target
                 // insn `is_live()`).  The leading run of PCs before the first
@@ -10091,6 +10108,7 @@ impl CodeWriter {
                     ssarepr.insns = canonical.insns.clone();
                     ssarepr.pc_first_insn_pos = canonical.pc_first_insn_pos.clone();
                     walker_tracked_pc_live_indices_out = Some(dense);
+                    did_splice = true;
                     eprintln!(
                         "[flatten-splice] {} spliced insns={} pc_first={} live_feed={}",
                         ssarepr.name,
@@ -10295,16 +10313,82 @@ impl CodeWriter {
 
         super::regalloc::apply_rename(&mut ssarepr, &alloc_result.rename);
 
+        // #280: pre-rename Ref color for a walker frame slot.  The walker
+        // numbers each frame slot's register by the slot itself, so its
+        // pre-rename color IS the slot index — that is the identity branch
+        // used on every non-spliced graph.  The spliced canonical body
+        // instead colors each frame value by its graph-lifetime Variable
+        // (`splice_regallocs[Ref].getcolor(v)`), so a slot's pre-rename
+        // color is the canonical color of the Variable the walker pinned to
+        // that slot.  Build the inverse `walker_slot → canonical Ref color`
+        // from `walker_slot_for_variable` (Variable → slot) once, then the
+        // `slot_pre_color` closure feeds every resume-map lookup below
+        // through the same `apply_rename` the body went through, so the maps
+        // land in the post-recolor canonical color space the live markers
+        // carry.  Slots with >1 distinct canonical color (the #254 per-slot
+        // coalescing gap) are counted as `conflicts`: a single dense map
+        // entry cannot represent them, so they keep the first color seen
+        // and the count is logged as the next blocker's measurement.
+        let splice_slot_pre_color: Option<Vec<Option<u16>>> = if did_splice {
+            canonical_for_splice.as_ref().map(|(_, splice_regallocs)| {
+                let ref_coloring = &splice_regallocs[Kind::Ref.index()].coloring;
+                let max_slot = walker_slot_for_variable
+                    .iter()
+                    .flatten()
+                    .copied()
+                    .max()
+                    .unwrap_or(0);
+                let mut inverse: Vec<Option<u16>> = vec![None; max_slot as usize + 1];
+                let mut conflicts = 0usize;
+                for (vid, slot) in walker_slot_for_variable.iter().enumerate() {
+                    let Some(slot) = *slot else { continue };
+                    let Some(&color) = ref_coloring.get(&super::flow::VariableId(vid as u32)) else {
+                        continue;
+                    };
+                    match inverse[slot as usize] {
+                        None => inverse[slot as usize] = Some(color),
+                        Some(existing) if existing != color => conflicts += 1,
+                        Some(_) => {}
+                    }
+                }
+                eprintln!(
+                    "[flatten-splice-color] {} mapped_slots={} conflicts={}",
+                    ssarepr.name,
+                    inverse.iter().filter(|c| c.is_some()).count(),
+                    conflicts,
+                );
+                inverse
+            })
+        } else {
+            None
+        };
+        let slot_pre_color = |walker_slot: u16| -> u16 {
+            match &splice_slot_pre_color {
+                Some(inverse) => inverse
+                    .get(walker_slot as usize)
+                    .copied()
+                    .flatten()
+                    .unwrap_or(walker_slot),
+                None => walker_slot,
+            }
+        };
+
         // `flatten.py:88-100` `enforce_input_args` may rotate the
         // portal `(frame, ec)` inputargs into new colors. Keep the
         // pyre-side metadata aligned with the post-regalloc SSA/JitCode
         // slots the assembler will actually emit; the blackhole fill
         // path must write the colored portal registers, not the
         // pre-color layout placeholders.
-        let portal_frame_reg =
-            super::regalloc::rename_lookup(&alloc_result.rename, Kind::Ref, portal_frame_reg);
-        let portal_ec_reg =
-            super::regalloc::rename_lookup(&alloc_result.rename, Kind::Ref, portal_ec_reg);
+        let portal_frame_reg = super::regalloc::rename_lookup(
+            &alloc_result.rename,
+            Kind::Ref,
+            slot_pre_color(portal_frame_reg),
+        );
+        let portal_ec_reg = super::regalloc::rename_lookup(
+            &alloc_result.rename,
+            Kind::Ref,
+            slot_pre_color(portal_ec_reg),
+        );
 
         // Graph-side register allocation: record each
         // Python-semantic stack slot's post-regalloc color. With the
@@ -10326,7 +10410,7 @@ impl CodeWriter {
         let stack_map_len = max_stackdepth as u16;
         let mut stack_slot_color_map: Vec<u16> = Vec::with_capacity(stack_map_len as usize);
         for d in 0..stack_map_len {
-            let pre = stack_base + d;
+            let pre = slot_pre_color(stack_base + d);
             let post = super::regalloc::rename_lookup(&alloc_result.rename, Kind::Ref, pre);
             stack_slot_color_map.push(post);
         }
@@ -10343,7 +10427,7 @@ impl CodeWriter {
         // derive the semantic local index from a non-identity color.
         let mut pyre_color_for_semantic_local: Vec<u16> = Vec::with_capacity(nlocals);
         for i in 0..nlocals as u16 {
-            let post = super::regalloc::rename_lookup(&alloc_result.rename, Kind::Ref, i);
+            let post = super::regalloc::rename_lookup(&alloc_result.rename, Kind::Ref, slot_pre_color(i));
             pyre_color_for_semantic_local.push(post);
         }
         // After step C the chordal coloring is free to coalesce
