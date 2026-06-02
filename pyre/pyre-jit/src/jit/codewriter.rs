@@ -9837,6 +9837,33 @@ impl CodeWriter {
         } else {
             None
         };
+        // #229 / #279 / #230 path-(b) — canonical-as-production splice.
+        // Under `PYRE_FLATTEN_SPLICE` (default off → entire scaffold below
+        // is skipped → production byte-identical), build the SAME canonical
+        // `flatten_graph(graph, regallocs, false, cpu)` stream the survey
+        // measures and capture it so the drain can REPLACE the walker's
+        // SSARepr with it (`codewriter.py:53` single-driver shape).  Built
+        // under `catch_unwind` like the survey: a graph the Phase-1
+        // SCAFFOLD canonical driver cannot yet flatten (uncolored
+        // exception-edge vars, non-portal `simple_call`) yields `None`,
+        // so the splice falls back to the walker stream for that graph
+        // instead of aborting.  Built from a private clone of
+        // `graph_regallocs` so the production allocator state is untouched.
+        let canonical_for_splice: Option<super::flatten::SSARepr> =
+            if std::env::var("PYRE_FLATTEN_SPLICE").is_ok() {
+                let mut splice_regallocs = graph_regallocs.clone();
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    super::flatten::flatten_graph(
+                        &graph,
+                        &mut splice_regallocs,
+                        false,
+                        Some(self.cpu()),
+                    )
+                }))
+                .ok()
+            } else {
+                None
+            };
         // Walker-tracked per-PC `-live-` marker positions exposed to
         // the post-drain `pc_map` computation.  Populated inside the
         // drain block below; consumed by `filter_liveness_in_place`
@@ -10020,6 +10047,64 @@ impl CodeWriter {
             // (`filter_liveness_in_place`, `pc_map`) translate them
             // through the `remove_repeated_live` remap.
             walker_tracked_pc_live_indices_out = walker_tracked_pc_indices;
+            // #229 / #279 / #230 path-(b) splice (gate-staged, default off).
+            // When `canonical_for_splice` built, REPLACE the walker's
+            // drained SSARepr with the canonical `flatten_graph` stream so
+            // the rest of `transform_graph_to_jitcode` (regalloc, liveness,
+            // assemble) runs over the single-driver output rather than the
+            // per-block walker drain.  The canonical stream is SPARSE in
+            // `-live-` markers (one per canraise / before each guard, not
+            // one per PC), so the runtime's dense per-PC `pc_map` feed is
+            // reconstructed from its OWN `pc_first_insn_pos` + sparse
+            // markers via `derive_pc_live_indices_from_sparse` (#281/#287
+            // resolver — its first GATED PRODUCTION wiring).  Absent PCs
+            // (stack-only `nopc`, never a runtime resume target per
+            // #285/#296 `stranded==0`) carry the nearest preceding resolved
+            // marker; a leading run before the first marker falls back to
+            // index 0.  This path is NOT yet correct end-to-end — the
+            // SSA-side `allocate_registers` below re-colors the spliced
+            // stream against walker stack-slot colors while the canonical
+            // body carries graph-lifetime colors (#254/#280), so gate-ON is
+            // a measurement of the next cascade blocker, NOT a green flip;
+            // gate-OFF skips the entire block and stays byte-identical.
+            if let Some(canonical) = &canonical_for_splice {
+                // The dense `pc_map` feed `filter_liveness_in_place` consumes
+                // must reference ONLY `-live-` markers (it asserts the target
+                // insn `is_live()`).  The leading run of PCs before the first
+                // marker (entry PCs, never a runtime resume target per #285)
+                // takes the FIRST marker as a safe placeholder — index 0
+                // would point at the block `Label`.  A canonical stream with
+                // no markers at all (degenerate straight-line graph, no
+                // resume target) cannot feed the dense table, so fall back to
+                // the walker stream for it rather than splice.
+                let first_live = canonical.insns.iter().position(|i| i.is_live());
+                if let Some(first_live) = first_live {
+                    let derived = derive_pc_live_indices_from_sparse(canonical, num_instrs);
+                    let mut dense: Vec<usize> = Vec::with_capacity(num_instrs);
+                    let mut last = first_live;
+                    for entry in &derived {
+                        if let Some(idx) = entry {
+                            last = *idx;
+                        }
+                        dense.push(last);
+                    }
+                    ssarepr.insns = canonical.insns.clone();
+                    ssarepr.pc_first_insn_pos = canonical.pc_first_insn_pos.clone();
+                    walker_tracked_pc_live_indices_out = Some(dense);
+                    eprintln!(
+                        "[flatten-splice] {} spliced insns={} pc_first={} live_feed={}",
+                        ssarepr.name,
+                        ssarepr.insns.len(),
+                        ssarepr.pc_first_insn_pos.len(),
+                        num_instrs,
+                    );
+                } else {
+                    eprintln!(
+                        "[flatten-splice] {} skipped (canonical stream has no -live- marker)",
+                        ssarepr.name,
+                    );
+                }
+            }
             // #230.M2 DIFF bucketing survey: under PYRE_FLATTEN_MEASURE,
             // bucket both the canonical driver's insn stream (captured
             // pre-drain above) and the walker's drained `ssarepr.insns`
