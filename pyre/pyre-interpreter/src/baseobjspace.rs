@@ -5973,6 +5973,13 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                 return Err(PyError::stop_iteration());
             }
             let result = crate::call::call_function_impl_result(callable, &[])?;
+            // `calliter_iternext` re-checks `it_callable` after the call: the
+            // callable may have re-entered `next()` on this same iterator and
+            // latched it to `PY_NULL`, exhausting it; discard the result and
+            // stay stopped rather than comparing a stale value to the sentinel.
+            if ci::w_callable_iterator_get_callable(obj).is_null() {
+                return Err(PyError::stop_iteration());
+            }
             let sentinel = ci::w_callable_iterator_get_sentinel(obj);
             if is_true(compare(result, sentinel, CompareOp::Eq)?) {
                 ci::w_callable_iterator_set_callable(obj, pyre_object::PY_NULL);
