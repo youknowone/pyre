@@ -3614,7 +3614,15 @@ fn init_socket_type(ns: &mut DictStorage) {
             let fd = socket_fd(args[0])?;
             let level = (unsafe { pyre_object::w_int_get_value(args[1]) }) as libc::c_int;
             let name = (unsafe { pyre_object::w_int_get_value(args[2]) }) as libc::c_int;
-            if args.len() == 3 {
+            // `interp_socket.py:434-451 getsockopt_w` — `buflen == 0`
+            // (including when omitted) reads an int option; otherwise the
+            // length must be in `1..=1024` and a bytes buffer is returned.
+            let buflen = if args.len() >= 4 {
+                unsafe { pyre_object::w_int_get_value(args[3]) }
+            } else {
+                0
+            };
+            if buflen == 0 {
                 let mut v: libc::c_int = 0;
                 let mut sz = core::mem::size_of::<libc::c_int>() as libc::socklen_t;
                 let r = unsafe {
@@ -3631,7 +3639,10 @@ fn init_socket_type(ns: &mut DictStorage) {
                 }
                 Ok(pyre_object::w_int_new(v as i64))
             } else {
-                let buflen = (unsafe { pyre_object::w_int_get_value(args[3]) }) as usize;
+                if buflen < 0 || buflen > 1024 {
+                    return Err(crate::PyError::os_error("getsockopt buflen out of range"));
+                }
+                let buflen = buflen as usize;
                 let mut buf = vec![0u8; buflen];
                 let mut sz = buflen as libc::socklen_t;
                 let r = unsafe {
