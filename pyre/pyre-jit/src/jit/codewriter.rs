@@ -906,8 +906,9 @@ fn emit_vable_getfield_ref_walker_only(
 /// `(genuine, live, copy, structural)` so the `PYRE_FLATTEN_MEASURE`
 /// survey can attribute the canonical-vs-walker length gap to a
 /// specific category.  `live` = `-live-` markers (per-PC, retired by
-/// #287), `copy` = `*_copy` renamings (walker emits inline where
-/// upstream defers them to `insert_renamings`, #289/#290),
+/// #287), `copy` = `*_copy`/`*_push`/`*_pop` renamings (the three
+/// shapes `build_renaming_insns` emits per `insert_renamings`; walker
+/// emits them inline where upstream defers them, #289/#290),
 /// `structural` = `Label`/`---`, `genuine` = everything else.  Used on
 /// both the canonical and walker streams so the comparison is
 /// category-to-category.  Measurement-only; no production caller when
@@ -922,7 +923,13 @@ fn bucket_measure_insns(insns: &[super::flatten::Insn]) -> (usize, usize, usize,
                 super::flatten::Insn::Label(_) | super::flatten::Insn::Unreachable => {
                     structural += 1
                 }
-                super::flatten::Insn::Op { opname, .. } if opname.ends_with("_copy") => copy += 1,
+                super::flatten::Insn::Op { opname, .. }
+                    if opname.ends_with("_copy")
+                        || opname.ends_with("_push")
+                        || opname.ends_with("_pop") =>
+                {
+                    copy += 1
+                }
                 super::flatten::Insn::Op { .. } => genuine += 1,
             }
         }
@@ -932,13 +939,15 @@ fn bucket_measure_insns(insns: &[super::flatten::Insn]) -> (usize, usize, usize,
 
 /// #230.M3 measurement helper: tally the `genuine`-category opnames of an
 /// SSARepr insn stream — the same classification `bucket_measure_insns`
-/// counts as `genuine` (non-`-live-`, non-`*_copy` `Insn::Op`; `Label`/
-/// `Unreachable` are not `Op` so they fall out of the `if let`).  Run on
-/// both the canonical and walker streams so the per-graph `genuine` count
-/// residual #230.M2 left unattributed (int +7, fannkuch +5) is named
-/// opname-by-opname.  `BTreeMap` keeps the keys ordered so the logged diff
-/// is deterministic.  Measurement-only; no production caller when the gate
-/// is unset.
+/// counts as `genuine` (non-`-live-`, non-renaming `*_copy`/`*_push`/
+/// `*_pop` `Insn::Op`; `Label`/`Unreachable` are not `Op` so they fall
+/// out of the `if let`).  Run on both the canonical and walker streams so
+/// the per-graph `genuine` count residual #230.M2 left unattributed
+/// (int +7, fannkuch +5) is named opname-by-opname.  `BTreeMap` has no
+/// upstream counterpart (this is a pyre-only measurement helper, not a
+/// port; gate-off-inert, retired with the survey at #287/Phase 5); it is
+/// used purely to keep the logged diff keys deterministically ordered.
+/// Measurement-only; no production caller when the gate is unset.
 fn genuine_opname_tally(
     insns: &[super::flatten::Insn],
 ) -> std::collections::BTreeMap<String, usize> {
@@ -948,7 +957,7 @@ fn genuine_opname_tally(
             continue;
         }
         if let super::flatten::Insn::Op { opname, .. } = insn {
-            if opname.ends_with("_copy") {
+            if opname.ends_with("_copy") || opname.ends_with("_push") || opname.ends_with("_pop") {
                 continue;
             }
             *tally.entry(opname.clone()).or_insert(0) += 1;
@@ -1105,6 +1114,10 @@ fn resume_target_resolver_coverage(
             .map(|k| pc_pos[k].1)
     };
     // Fed marker set: every marker index the resolver hands to some pc.
+    // `HashSet` has no upstream counterpart (this is a pyre-only
+    // measurement helper, not a port; gate-off-inert, retired with the
+    // survey at #287/Phase 5); it is used purely for the O(1) membership
+    // test below.
     let fed: std::collections::HashSet<usize> = live_indices.iter().filter_map(|&x| x).collect();
 
     let n_pcs = live_indices.len();
@@ -9766,10 +9779,17 @@ impl CodeWriter {
         )> = if std::env::var("PYRE_FLATTEN_MEASURE").is_ok() {
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let mut measure_regallocs = graph_regallocs.clone();
+                // `_include_all_exc_links = false` matches the production
+                // canonical caller `codewriter.py:53 flatten_graph(graph,
+                // regallocs, cpu=...)` (the flag keeps its `flatten.py:63`
+                // default `False`).  Passing `true` would emit exception
+                // links the production driver skips, giving the bucket /
+                // resume-coverage survey a non-canonical stream to compare
+                // against.
                 let canonical = super::flatten::flatten_graph(
                     &graph,
                     &mut measure_regallocs,
-                    true,
+                    false,
                     Some(self.cpu()),
                 );
                 // #288: resolve each reachable Python PC to its
