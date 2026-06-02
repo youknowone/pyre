@@ -3117,15 +3117,41 @@ pub fn gateway_nonnegint_w(obj: PyObjectRef) -> Result<i64, PyError> {
     Ok(value)
 }
 
-/// intobject.py:577 uint_w.
+/// intobject.py:577 / longobject.py:164 uint_w. Unlike int_w this does NOT
+/// apply __int__/__index__ conversion: a non-int object raises TypeError
+/// (W_Root.uint_w → _typed_unwrap_error).
 fn uint_w(obj: PyObjectRef) -> Result<u64, PyError> {
-    let value = int_w(obj)?;
-    if value < 0 {
-        return Err(PyError::value_error(
-            "cannot convert negative integer to unsigned",
-        ));
+    use num_traits::ToPrimitive;
+    if obj.is_null() {
+        return Err(PyError::type_error("uint_w: null object"));
     }
-    Ok(value as u64)
+    // W_IntObject.uint_w (covers bool).
+    if unsafe { pyre_object::pyobject::is_int(obj) } {
+        let value = unsafe { pyre_object::intobject::w_int_get_value(obj) };
+        if value < 0 {
+            return Err(PyError::value_error(
+                "cannot convert negative integer to unsigned",
+            ));
+        }
+        return Ok(value as u64);
+    }
+    // W_LongObject.uint_w — num.touint().
+    if unsafe { pyre_object::pyobject::is_long(obj) } {
+        let big = unsafe { crate::builtins::obj_to_bigint(obj) };
+        if big.sign() == malachite_bigint::Sign::Minus {
+            return Err(PyError::value_error(
+                "cannot convert negative integer to unsigned int",
+            ));
+        }
+        return big
+            .to_u64()
+            .ok_or_else(|| PyError::overflow_error("int too large to convert to unsigned int"));
+    }
+    // W_Root.uint_w → _typed_unwrap_error(space, "integer").
+    let tp_name = unsafe { (*(*obj).ob_type).name };
+    Err(PyError::type_error(format!(
+        "expected integer, got {tp_name} object"
+    )))
 }
 
 /// pypy/interpreter/baseobjspace.py c_uint_w.
@@ -3181,25 +3207,25 @@ pub fn c_ushort_w(obj: PyObjectRef) -> Result<u16, PyError> {
     Ok(value as u16)
 }
 
-/// pypy/interpreter/baseobjspace.py c_uid_t_w.
+/// pypy/interpreter/baseobjspace.py c_uid_t_w. Equivalent to c_uint_w,
+/// except -1 maps to UINT_MAX ((uid_t)-1) and values below -1 raise
+/// OverflowError rather than ValueError. `uint_w` does not run any
+/// __index__ conversion, so the `int_w` retry on the negative branch sees
+/// only the real int and is side-effect free.
 pub fn c_uid_t_w(obj: PyObjectRef) -> Result<u32, PyError> {
-    // Coerce once: a side-effectful `__index__` must run a single time.
-    // `-1` is the "unchanged" sentinel that maps to the unsigned maximum.
-    let value = int_w(obj)?;
-    if value == -1 {
-        return Ok(u32::MAX);
+    match c_uint_w(obj) {
+        Ok(value) => Ok(value),
+        Err(e) if e.kind == PyErrorKind::ValueError => {
+            if int_w(obj)? == -1 {
+                Ok(u32::MAX)
+            } else {
+                Err(PyError::overflow_error(
+                    "user/group id smaller than minimum (-1)",
+                ))
+            }
+        }
+        Err(e) => Err(e),
     }
-    if value < 0 {
-        return Err(PyError::overflow_error(
-            "user/group id smaller than minimum (-1)",
-        ));
-    }
-    if value > u32::MAX as i64 {
-        return Err(PyError::overflow_error(
-            "user/group id greater than maximum",
-        ));
-    }
-    Ok(value as u32)
 }
 
 /// pypy/interpreter/baseobjspace.py truncatedint_w.
@@ -3208,7 +3234,15 @@ pub fn truncatedint_w(obj: PyObjectRef) -> Result<i64, PyError> {
         Ok(value) => Ok(value),
         Err(e) if e.kind == PyErrorKind::OverflowError => {
             use num_traits::ToPrimitive;
-            let big = unsafe { crate::builtins::obj_to_bigint(obj) };
+            // intmask(self.bigint_w(w_obj).uintmask()): bigint_w applies
+            // __int__/__index__ conversion, so read the bigint from the
+            // converted int object rather than the raw argument.
+            let w_int_obj = if unsafe { pyre_object::pyobject::is_int_or_long(obj) } {
+                obj
+            } else {
+                space_int(obj)?
+            };
+            let big = unsafe { crate::builtins::obj_to_bigint(w_int_obj) };
             let low = (&big & BigInt::from(u64::MAX)).to_u64().unwrap_or(0);
             Ok(low as i64)
         }
