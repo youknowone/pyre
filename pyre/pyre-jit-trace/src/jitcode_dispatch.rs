@@ -1361,6 +1361,99 @@ fn binop_int_record(
     Ok((DispatchOutcome::Continue, op.next_pc))
 }
 
+/// RPython `pyjitpl.py:588-595 opimpl_int_between`:
+///
+/// ```python
+/// b5 = self.execute(rop.INT_SUB, b3, b1)
+/// if isinstance(b5, ConstInt) and b5.getint() == 1:
+///     # int_between(a, b, a+1) -> b == a
+///     return self.execute(rop.INT_EQ, b2, b1)
+/// else:
+///     b4 = self.execute(rop.INT_SUB, b2, b1)
+///     return self.execute(rop.UINT_LT, b4, b5)
+/// ```
+///
+/// Decomposes `int_between(b1, b2, b3)` — i.e. `b1 <= b2 < b3` — at
+/// record time, matching upstream's choice to emit elementary
+/// `INT_SUB`/`INT_EQ`/`UINT_LT` into the trace rather than relying on
+/// the optimizer to lower `INT_BETWEEN`.  The blackhole semantics
+/// (`blackhole.py:560-561 bhimpl_int_between(a, b, c): return a <= b
+/// < c`) are preserved through the same decomposition.
+///
+/// Operand layout `iii>i`: 3B sources + 1B dst (=4 operand bytes after
+/// the opcode).  Concrete-value propagation mirrors
+/// [`binop_int_record`]: every intermediate (`b4`, `b5`) and the final
+/// result get folded when their operand pair has a known
+/// `box_value(...)`.  This is what enables the `ConstInt(1)` fast path
+/// at line 590 — the walker sees the folded `b5` and emits `INT_EQ`
+/// instead of the generic `INT_SUB + UINT_LT` pair.
+fn int_between_record(
+    code: &[u8],
+    op: &DecodedOp,
+    ctx: &mut WalkContext<'_, '_>,
+) -> Result<(DispatchOutcome, usize), DispatchError> {
+    let b1 = read_int_reg(code, op, 0, ctx)?;
+    let b2 = read_int_reg(code, op, 1, ctx)?;
+    let b3 = read_int_reg(code, op, 2, ctx)?;
+
+    // b5 = INT_SUB(b3, b1)
+    let b5 = ctx.trace_ctx.record_op(OpCode::IntSub, &[b3, b1]);
+    let b5_concrete = if let (Some(majit_ir::Value::Int(v3)), Some(majit_ir::Value::Int(v1))) =
+        (ctx.trace_ctx.box_value(b3), ctx.trace_ctx.box_value(b1))
+    {
+        let folded = majit_metainterp::eval_binop_i(OpCode::IntSub, v3, v1);
+        ctx.trace_ctx
+            .set_opref_concrete(b5, majit_ir::Value::Int(folded));
+        Some(folded)
+    } else {
+        None
+    };
+
+    // pyjitpl.py:590 ConstInt(1) fast path emits INT_EQ; otherwise
+    // emit the generic INT_SUB + UINT_LT pair.
+    let (result, concrete) = if b5_concrete == Some(1) {
+        let r = ctx.trace_ctx.record_op(OpCode::IntEq, &[b2, b1]);
+        let c = if let (Some(majit_ir::Value::Int(va)), Some(majit_ir::Value::Int(vb))) =
+            (ctx.trace_ctx.box_value(b2), ctx.trace_ctx.box_value(b1))
+        {
+            let folded = majit_metainterp::eval_binop_i(OpCode::IntEq, va, vb);
+            ctx.trace_ctx
+                .set_opref_concrete(r, majit_ir::Value::Int(folded));
+            ConcreteValue::Int(folded)
+        } else {
+            ConcreteValue::Null
+        };
+        (r, c)
+    } else {
+        let b4 = ctx.trace_ctx.record_op(OpCode::IntSub, &[b2, b1]);
+        let b4_concrete =
+            if let (Some(majit_ir::Value::Int(v2)), Some(majit_ir::Value::Int(v1))) =
+                (ctx.trace_ctx.box_value(b2), ctx.trace_ctx.box_value(b1))
+            {
+                let folded = majit_metainterp::eval_binop_i(OpCode::IntSub, v2, v1);
+                ctx.trace_ctx
+                    .set_opref_concrete(b4, majit_ir::Value::Int(folded));
+                Some(folded)
+            } else {
+                None
+            };
+        let r = ctx.trace_ctx.record_op(OpCode::UintLt, &[b4, b5]);
+        let c = if let (Some(v4), Some(v5)) = (b4_concrete, b5_concrete) {
+            let folded = majit_metainterp::eval_binop_i(OpCode::UintLt, v4, v5);
+            ctx.trace_ctx
+                .set_opref_concrete(r, majit_ir::Value::Int(folded));
+            ConcreteValue::Int(folded)
+        } else {
+            ConcreteValue::Null
+        };
+        (r, c)
+    };
+
+    let dst = code[op.pc + 4] as usize;
+    write_int_reg(ctx, op.pc, dst, result, concrete)?;
+    Ok((DispatchOutcome::Continue, op.next_pc))
+}
+
 /// RPython `pyjitpl.py:597-617 opimpl_switch`:
 ///
 /// * read the traced value box and concrete `valuebox.getint()`
@@ -5310,6 +5403,12 @@ fn handle(
         // semantically a bool but Int-typed on the bank (matches the
         // codewriter's `>i` destination shape).
         "int_is_true/i>i" => unop_int_record(code, op, ctx, OpCode::IntIsTrue),
+        // `int_between/iii>i` decomposes a 3-arg range check at record
+        // time per `pyjitpl.py:588-595 opimpl_int_between` into
+        // `INT_SUB + (INT_EQ on ConstInt(1) fast path | INT_SUB +
+        // UINT_LT generic)`. Surfaces in `make_ll_isinstance`'s
+        // range-covering branch (`rclass.py:1149-1168`).
+        "int_between/iii>i" => int_between_record(code, op, ctx),
         // `int_floordiv/ii>i` and `int_mod/ii>i` intentionally absent:
         // `jtransform.py:575-577` rewrites both to
         // `direct_call(ll_int_py_*)` before jitcode emission.  The
