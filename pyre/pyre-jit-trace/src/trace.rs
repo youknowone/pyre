@@ -88,7 +88,7 @@ pub fn trace_bytecode(
     // jitcode_pc` and lets `pc_map` retire.  Default-off → the trait path is
     // unchanged (check.py 39/39).  The harness for validating
     // guard-snapshot/resume correctness over a compiled full-body trace.
-    if std::env::var_os("PYRE_FULL_BODY_WALK").is_some() && !ctx.is_bridge_trace {
+    if std::env::var_os("PYRE_FULL_BODY_WALK").is_some() {
         let action = full_body_walk_trace(ctx, sym, w_code, start_pc, cf_addr);
         return (action, concrete_frame);
     }
@@ -636,7 +636,15 @@ fn full_body_walk_trace(
     // Clear any deferred void-store events left by a prior aborted walk so
     // they cannot leak into this one (#63).
     crate::jitcode_dispatch::void_defer_reset();
-    {
+    // A bridge resumes mid-loop from a guard failure; its input args are the
+    // guard's resumedata, already seeded into the bridge sym by
+    // `setup_bridge_sym`.  PyPy's `interpret()` (rebuild_state_after_failure →
+    // continue) registers NO merge point at the resume pc: the bridge walks
+    // forward until it reaches an existing compiled loop header and closes as
+    // a bridge there.  Registering a merge point at `start_pc` would instead
+    // treat the resume pc as a fresh loop header (the portal entry signature),
+    // which only a MAIN trace should do.  So skip it for bridges.
+    if !ctx.is_bridge_trace {
         let start_key = crate::driver::make_green_key(w_code, start_pc);
         let input_types = ctx.inputarg_types();
         let input_args: Vec<majit_metainterp::GreenBox> = input_types
