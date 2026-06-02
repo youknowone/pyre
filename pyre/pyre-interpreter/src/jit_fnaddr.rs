@@ -972,6 +972,36 @@ pub fn jit_static_ref_addrs() -> Vec<(&'static str, i64)> {
             "kwargsdict::KWARGS_DICT_STRATEGY",
             kwargsdict::KWARGS_DICT_STRATEGY
         ),
+        // Prebuilt object singletons (`None` / `NotImplemented` /
+        // `Ellipsis` / `True` / `False`).  The accessors `w_none`,
+        // `w_ellipsis`, `w_not_implemented`, `w_bool_from` read these
+        // statics as a bare same-file `LOAD_GLOBAL` and return their
+        // address; supplying the captured address lets the front-end
+        // `Expr::Path` same-file fold emit `ConstRefAddr` with the real
+        // runtime identity instead of a cross-block body-`Input`.  The
+        // statics are private (callers route through the accessors), so
+        // the address is captured through the accessor rather than the
+        // `ref_addr!` `&pyre_object::X` path form.
+        (
+            "noneobject::NONE_SINGLETON",
+            pyre_object::w_none() as usize as i64,
+        ),
+        (
+            "noneobject::NOT_IMPLEMENTED_SINGLETON",
+            pyre_object::w_not_implemented() as usize as i64,
+        ),
+        (
+            "noneobject::ELLIPSIS_SINGLETON",
+            pyre_object::w_ellipsis() as usize as i64,
+        ),
+        (
+            "boolobject::TRUE_SINGLETON",
+            pyre_object::w_bool_from(true) as usize as i64,
+        ),
+        (
+            "boolobject::FALSE_SINGLETON",
+            pyre_object::w_bool_from(false) as usize as i64,
+        ),
     ]
 }
 
