@@ -4522,6 +4522,21 @@ pub fn hash_value(obj: PyObjectRef) -> i64 {
                 .collect();
             return _hash_frozenset(&hashes);
         }
+        if pyre_object::is_w_range(obj) {
+            // functional.py W_Range.descr_hash — hash of the
+            // (length, start, step) tuple, with trailing fields set to
+            // None (hash 0) for empty and single-element ranges.
+            let (start, _stop, step) = pyre_object::w_range_fields(obj);
+            let len = pyre_object::w_range_len(obj);
+            let hashes = if len == 0 {
+                [_hash_int(0), 0, 0]
+            } else if len == 1 {
+                [_hash_int(1), _hash_int(start), 0]
+            } else {
+                [_hash_int(len), _hash_int(start), _hash_int(step)]
+            };
+            return _hash_tuple_xx(&hashes);
+        }
         if pyre_object::is_instance(obj) {
             let w_type = pyre_object::w_instance_get_type(obj);
             if let Some(method) = crate::baseobjspace::lookup_in_type(w_type, "__hash__") {

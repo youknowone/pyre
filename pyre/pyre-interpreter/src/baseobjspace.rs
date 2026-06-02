@@ -1137,6 +1137,33 @@ fn range_reversed_method(args: &[PyObjectRef]) -> PyResult {
     }
 }
 
+/// `range.__reduce__()` — `functional.py W_Range.descr_reduce`:
+/// `(type(self), (start, stop, step))`.
+fn range_reduce_method(args: &[PyObjectRef]) -> PyResult {
+    let (start, stop, step) = unsafe { pyre_object::w_range_fields(args[0]) };
+    let range_type = crate::typedef::gettypefor(&pyre_object::rangeobject::RANGE_TYPE)
+        .unwrap_or(PY_NULL);
+    let state = w_tuple_new(vec![w_int_new(start), w_int_new(stop), w_int_new(step)]);
+    Ok(w_tuple_new(vec![range_type, state]))
+}
+
+/// `range.__hash__()` — `functional.py W_Range.descr_hash`: hashes the
+/// `(length, start, step)` tuple, collapsing trailing fields to `None`
+/// for empty (`(len, None, None)`) and single-element (`(len, start,
+/// None)`) ranges so equal ranges hash equal.
+fn range_hash_method(args: &[PyObjectRef]) -> PyResult {
+    let (start, _stop, step) = unsafe { pyre_object::w_range_fields(args[0]) };
+    let len = unsafe { pyre_object::w_range_len(args[0]) };
+    let items = if len == 0 {
+        vec![w_int_new(0), w_none(), w_none()]
+    } else if len == 1 {
+        vec![w_int_new(1), w_int_new(start), w_none()]
+    } else {
+        vec![w_int_new(len), w_int_new(start), w_int_new(step)]
+    };
+    Ok(w_int_new(hash_w_strict(w_tuple_new(items))?))
+}
+
 unsafe fn getitem_range_iter(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
     let r = &*(obj as *const pyre_object::rangeobject::W_RangeIterator);
     let len = if r.step > 0 {
@@ -1970,6 +1997,8 @@ pub fn getattr_str(obj: PyObjectRef, name: &str) -> PyResult {
                 "index" => Some((range_index_method, "index", 2)),
                 "__iter__" => Some((range_iter_method, "__iter__", 1)),
                 "__reversed__" => Some((range_reversed_method, "__reversed__", 1)),
+                "__reduce__" => Some((range_reduce_method, "__reduce__", 1)),
+                "__hash__" => Some((range_hash_method, "__hash__", 1)),
                 _ => None,
             };
             if let Some((func, sname, arity)) = entry {
