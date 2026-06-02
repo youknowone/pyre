@@ -1305,6 +1305,29 @@ pub fn translate_op(
                     call_args.extend(arg_hls);
                     Ok(vec![FlowspaceOp::new("simple_call", call_args, result)])
                 }
+                CallTarget::SyntheticTransparentClass { name, owner_path } => {
+                    // Class-of-variant placeholder fallback: the post-ast
+                    // pre-rtyper `class_lookup_fold` pass is expected to
+                    // rewrite this into `OpKind::ConstRef(HostObject::Class)`
+                    // before reaching the rtyper.  Surviving residuals
+                    // route through the same `simple_call(HostObject::Class)`
+                    // shape as `SyntheticTransparentCtor` — the
+                    // `Bookkeeper.immutablevalue_hostobject` is_class arm
+                    // (`bookkeeper.rs:1984`) absorbs both spellings into
+                    // a `SomePBC([ClassDesc])`.
+                    let qualname = if owner_path.is_empty() {
+                        name.clone()
+                    } else {
+                        format!("{}.{}", owner_path.join("."), name)
+                    };
+                    let callable = Hlvalue::Constant(Constant::new(ConstValue::HostObject(
+                        HostObject::new_class(qualname, Vec::new()),
+                    )));
+                    let mut call_args = Vec::with_capacity(arg_hls.len() + 1);
+                    call_args.push(callable);
+                    call_args.extend(arg_hls);
+                    Ok(vec![FlowspaceOp::new("simple_call", call_args, result)])
+                }
                 CallTarget::SyntheticTransparentCtor { name, owner_path } => {
                     // RPython parity: tagged-union ctor `Foo(x)` annotates as
                     // `SomePBC([ClassDesc(Foo)])` then `pair_simple_call`

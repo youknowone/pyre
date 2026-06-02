@@ -3892,7 +3892,8 @@ fn target_to_call_path(target: &CallTarget) -> crate::parse::CallPath {
             crate::parse::CallPath::from_segments(segments.iter().map(String::as_str))
         }
         CallTarget::Method { name, .. } => crate::parse::CallPath::from_segments([name.as_str()]),
-        CallTarget::SyntheticTransparentCtor { name, owner_path } => {
+        CallTarget::SyntheticTransparentCtor { name, owner_path }
+        | CallTarget::SyntheticTransparentClass { name, owner_path } => {
             let mut segs: Vec<&str> = owner_path.iter().map(String::as_str).collect();
             segs.push(name.as_str());
             crate::parse::CallPath::from_segments(segs)

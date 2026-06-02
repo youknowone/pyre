@@ -3441,7 +3441,9 @@ impl CallControl {
             // the candidate `Vec<CallPath>` directly; `target_to_path` only
             // names direct_call-equivalent sites.  `call.py:94-114` indirect
             // branch.
-            CallTarget::SyntheticTransparentCtor { .. } | CallTarget::Indirect { .. } => None,
+            CallTarget::SyntheticTransparentCtor { .. }
+            | CallTarget::SyntheticTransparentClass { .. }
+            | CallTarget::Indirect { .. } => None,
             CallTarget::UnsupportedExpr => None,
         }
     }
