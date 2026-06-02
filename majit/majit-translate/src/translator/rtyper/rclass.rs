@@ -2895,14 +2895,15 @@ impl Repr for InstanceRepr {
     ///         return hop.gendirectcall(ll_isinstance, v_obj, v_cls)
     /// ```
     ///
-    /// E.3 lands the variable branch (the unconditional
-    /// `gendirectcall(ll_isinstance, v_obj, v_cls)` path). The constant
-    /// branch with `make_ll_isinstance` per-class specialization lands
-    /// in E.4 — until then a Constant `v_cls` flows through the same
-    /// variable helper (correct, just one extra `ptr_nonzero`/
-    /// `int_between` per check).
+    /// Constant `v_cls` is recognised here and routed through
+    /// [`make_ll_isinstance`] (rclass.py:1149-1168) to pick up the
+    /// per-class `int_between` / `ptr_eq` specialisation. The choice
+    /// between `ll_isinstance_const` (null-checking) and
+    /// `ll_isinstance_const_nonnull` (assumes nonnull) is driven by
+    /// `hop.args_s[0].can_be_None`. Variable `v_cls` falls through to
+    /// the unspecialised `ll_isinstance` helper minted by E.1.
     fn rtype_isinstance(&self, hop: &HighLevelOp) -> RTypeResult {
-        use crate::translator::rtyper::rtyper::ConvertedTo;
+        use crate::translator::rtyper::rtyper::{ConvertedTo, make_ll_isinstance};
 
         // upstream: `class_repr = get_type_repr(hop.rtyper)`.
         let rtyper = self.rtyper.upgrade().ok_or_else(|| {
@@ -2920,9 +2921,42 @@ impl Repr for InstanceRepr {
         let v_obj = v_args[0].clone();
         let v_cls = v_args[1].clone();
 
+        // upstream: `if isinstance(v_cls, Constant):`.
+        if let Hlvalue::Constant(c) = &v_cls {
+            // upstream: `cls = v_cls.value`. The constant carries an
+            // `_ptr` to the vtable; subclassrange_{min,max} are read
+            // off it by make_ll_isinstance.
+            let ConstValue::LLPtr(c_ptr) = &c.value else {
+                return Err(TyperError::message(format!(
+                    "InstanceRepr.rtype_isinstance: constant v_cls must \
+                     carry an _ptr, got {:?}",
+                    c.value
+                )));
+            };
+            // upstream: `llf, llf_nonnull = make_ll_isinstance(self.rtyper, cls)`.
+            let (ll_const, ll_const_nonnull) = make_ll_isinstance(&rtyper, c_ptr)?;
+            // upstream: `if hop.args_s[0].can_be_None: ...`. The
+            // `can_be_None` flag rides on the annotator's
+            // SomeInstance / SomePBC carriers — None elsewhere means
+            // the obj is statically known non-null, so the nonnull
+            // variant skips the runtime branch.
+            let can_be_none = {
+                let args_s = hop.args_s.borrow();
+                match args_s.get(0) {
+                    Some(SomeValue::Instance(inst)) => inst.can_be_none,
+                    Some(SomeValue::PBC(pbc)) => pbc.can_be_none,
+                    _ => true,
+                }
+            };
+            let helper = if can_be_none {
+                ll_const
+            } else {
+                ll_const_nonnull
+            };
+            return hop.gendirectcall(&helper, vec![v_obj]);
+        }
+
         // upstream variable case: `gendirectcall(ll_isinstance, v_obj, v_cls)`.
-        // The constant case (E.4) will instead mint per-class helpers via
-        // make_ll_isinstance and dispatch on `hop.args_s[0].can_be_None`.
         let helper = rtyper.lowlevel_helper_function(
             "ll_isinstance",
             vec![OBJECTPTR.clone(), CLASSTYPE.clone()],

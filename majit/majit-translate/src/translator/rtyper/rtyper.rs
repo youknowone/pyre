@@ -3221,6 +3221,297 @@ fn lowlevel_isinstance_helper_graph(
     Ok(helper_pygraph_from_graph(graph, argnames, func))
 }
 
+/// RPython `make_ll_isinstance(rtyper, cls)` (rclass.py:1149-1168):
+///
+/// ```python
+/// def make_ll_isinstance(rtyper, cls):
+///     try:
+///         return rtyper.isinstance_helpers[cls._obj]
+///     except KeyError:
+///         minid = cls.subclassrange_min
+///         maxid = cls.subclassrange_max
+///         if minid.number_with_subclasses():
+///             def ll_isinstance_const_nonnull(obj):
+///                 objid = obj.typeptr.subclassrange_min
+///                 return llop.int_between(Bool, minid, objid, maxid)
+///         else:
+///             def ll_isinstance_const_nonnull(obj):
+///                 return obj.typeptr == cls
+///         def ll_isinstance_const(obj):
+///             if not obj:
+///                 return False
+///             return ll_isinstance_const_nonnull(obj)
+///         result = (ll_isinstance_const, ll_isinstance_const_nonnull)
+///         rtyper.isinstance_helpers[cls._obj] = result
+///         return result
+/// ```
+///
+/// Returns `(ll_isinstance_const, ll_isinstance_const_nonnull)`. The
+/// pair is cached implicitly under synthetic helper names
+/// `ll_isinstance_const_<min>_<max>` and
+/// `ll_isinstance_const_nonnull_<min>_<max>` in
+/// `rtyper.lowlevel_helper_graphs` — `(minid, maxid)` uniquely
+/// identifies the classdef after `normalizecalls.assign_inheritance_ids`
+/// has run, mirroring upstream's `rtyper.isinstance_helpers[cls._obj]`
+/// keying by vtable identity.
+///
+/// Upstream's `number_with_subclasses()` (whether the inheritance
+/// range covers any proper subclass) is `maxid > minid` — when false
+/// the class is leaf-unique and a direct `ptr_eq(obj.typeptr, cls)`
+/// replaces the `int_between` range check.
+pub(crate) fn make_ll_isinstance(
+    rtyper: &RPythonTyper,
+    cls_ptr: &_ptr,
+) -> Result<(LowLevelFunction, LowLevelFunction), TyperError> {
+    // upstream: `minid = cls.subclassrange_min; maxid = cls.subclassrange_max`.
+    let min_val = cls_ptr
+        .getattr("subclassrange_min")
+        .map_err(TyperError::message)?;
+    let max_val = cls_ptr
+        .getattr("subclassrange_max")
+        .map_err(TyperError::message)?;
+    let LowLevelValue::Signed(minid) = min_val else {
+        return Err(TyperError::message(format!(
+            "make_ll_isinstance: subclassrange_min must be Signed, got {min_val:?}",
+        )));
+    };
+    let LowLevelValue::Signed(maxid) = max_val else {
+        return Err(TyperError::message(format!(
+            "make_ll_isinstance: subclassrange_max must be Signed, got {max_val:?}",
+        )));
+    };
+    // upstream `minid.number_with_subclasses()` — true when the
+    // inheritance range covers proper subclasses (maxid > minid).
+    let has_subclasses = maxid > minid;
+
+    let nonnull_name = format!("ll_isinstance_const_nonnull_{minid}_{maxid}");
+    let const_name = format!("ll_isinstance_const_{minid}_{maxid}");
+
+    // Mint the non-null helper first so the const helper's direct_call
+    // can resolve it via the cache when its builder runs.
+    let nonnull_name_for_builder = nonnull_name.clone();
+    let cls_ptr_for_builder = cls_ptr.clone();
+    let ll_const_nonnull = rtyper.lowlevel_helper_function_with_builder(
+        nonnull_name.clone(),
+        vec![OBJECTPTR.clone()],
+        LowLevelType::Bool,
+        move |_rtyper, args, result| {
+            build_ll_isinstance_const_nonnull_graph(
+                &nonnull_name_for_builder,
+                args,
+                result,
+                minid,
+                maxid,
+                has_subclasses,
+                cls_ptr_for_builder,
+            )
+        },
+    )?;
+
+    let const_name_for_builder = const_name.clone();
+    let nonnull_name_for_call = nonnull_name.clone();
+    let ll_const = rtyper.lowlevel_helper_function_with_builder(
+        const_name,
+        vec![OBJECTPTR.clone()],
+        LowLevelType::Bool,
+        move |rtyper, args, result| {
+            build_ll_isinstance_const_graph(
+                &const_name_for_builder,
+                rtyper,
+                args,
+                result,
+                &nonnull_name_for_call,
+            )
+        },
+    )?;
+
+    Ok((ll_const, ll_const_nonnull))
+}
+
+/// Build the `ll_isinstance_const_nonnull(obj)` helper graph
+/// (rclass.py:1156-1161). `has_subclasses` toggles between the
+/// `int_between` range check (covers proper subclasses) and the
+/// `ptr_eq(obj.typeptr, cls)` exact-match check (leaf unique class).
+fn build_ll_isinstance_const_nonnull_graph(
+    name: &str,
+    args: &[LowLevelType],
+    result: &LowLevelType,
+    minid: i64,
+    maxid: i64,
+    has_subclasses: bool,
+    cls_ptr: _ptr,
+) -> Result<PyGraph, TyperError> {
+    if args != [OBJECTPTR.clone()] || result != &LowLevelType::Bool {
+        return Err(TyperError::message(format!(
+            "{name} expects (OBJECTPTR) -> Bool, got ({args:?}) -> {result:?}"
+        )));
+    }
+
+    let argnames = vec!["arg0".to_string()];
+    let obj = variable_with_lltype("arg0", OBJECTPTR.clone());
+    let obj_cls = variable_with_lltype("obj_cls", CLASSTYPE.clone());
+    let result_var = variable_with_lltype("result", LowLevelType::Bool);
+    let return_var = variable_with_lltype("result", LowLevelType::Bool);
+
+    let startblock = Block::shared(vec![Hlvalue::Variable(obj.clone())]);
+    let mut graph = FunctionGraph::with_return_var(
+        name.to_string(),
+        startblock.clone(),
+        Hlvalue::Variable(return_var),
+    );
+
+    // upstream both branches: `obj_cls = obj.typeptr`.
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "getfield",
+        vec![Hlvalue::Variable(obj), void_field_const("typeptr")],
+        Hlvalue::Variable(obj_cls.clone()),
+    ));
+
+    if has_subclasses {
+        // upstream: `objid = obj_cls.subclassrange_min;
+        //   return int_between(Bool, minid, objid, maxid)`.
+        let objid = variable_with_lltype("objid", LowLevelType::Signed);
+        startblock.borrow_mut().operations.push(SpaceOperation::new(
+            "getfield",
+            vec![
+                Hlvalue::Variable(obj_cls),
+                void_field_const("subclassrange_min"),
+            ],
+            Hlvalue::Variable(objid.clone()),
+        ));
+        let c_min = constant_with_lltype(ConstValue::Int(minid), LowLevelType::Signed);
+        let c_max = constant_with_lltype(ConstValue::Int(maxid), LowLevelType::Signed);
+        startblock.borrow_mut().operations.push(SpaceOperation::new(
+            "int_between",
+            vec![c_min, Hlvalue::Variable(objid), c_max],
+            Hlvalue::Variable(result_var.clone()),
+        ));
+    } else {
+        // upstream: `return obj_cls == cls` — direct ptr_eq against
+        // the baked-in class pointer constant.
+        let c_cls = Constant::with_concretetype(
+            ConstValue::LLPtr(Box::new(cls_ptr)),
+            CLASSTYPE.clone(),
+        );
+        startblock.borrow_mut().operations.push(SpaceOperation::new(
+            "ptr_eq",
+            vec![Hlvalue::Variable(obj_cls), Hlvalue::Constant(c_cls)],
+            Hlvalue::Variable(result_var.clone()),
+        ));
+    }
+
+    startblock.closeblock(vec![
+        Link::new(
+            vec![Hlvalue::Variable(result_var)],
+            Some(graph.returnblock.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    let func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(graph, argnames, func))
+}
+
+/// Build the `ll_isinstance_const(obj)` helper graph
+/// (rclass.py:1162-1165) — null-check then tail-call the matching
+/// `ll_isinstance_const_nonnull` minted by
+/// [`make_ll_isinstance`].
+fn build_ll_isinstance_const_graph(
+    name: &str,
+    rtyper: &RPythonTyper,
+    args: &[LowLevelType],
+    result: &LowLevelType,
+    nonnull_name: &str,
+) -> Result<PyGraph, TyperError> {
+    if args != [OBJECTPTR.clone()] || result != &LowLevelType::Bool {
+        return Err(TyperError::message(format!(
+            "{name} expects (OBJECTPTR) -> Bool, got ({args:?}) -> {result:?}"
+        )));
+    }
+
+    let argnames = vec!["arg0".to_string()];
+    let obj0 = variable_with_lltype("arg0", OBJECTPTR.clone());
+    let is_nonnull = variable_with_lltype("is_nonnull", LowLevelType::Bool);
+    let obj1 = variable_with_lltype("obj", OBJECTPTR.clone());
+    let call_result = variable_with_lltype("result", LowLevelType::Bool);
+    let return_var = variable_with_lltype("result", LowLevelType::Bool);
+
+    let startblock = Block::shared(vec![Hlvalue::Variable(obj0.clone())]);
+    let callblock = Block::shared(vec![Hlvalue::Variable(obj1.clone())]);
+    let mut graph = FunctionGraph::with_return_var(
+        name.to_string(),
+        startblock.clone(),
+        Hlvalue::Variable(return_var),
+    );
+
+    // upstream: `if not obj: return False`.
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "ptr_nonzero",
+        vec![Hlvalue::Variable(obj0.clone())],
+        Hlvalue::Variable(is_nonnull.clone()),
+    ));
+    startblock.borrow_mut().exitswitch = Some(Hlvalue::Variable(is_nonnull));
+    startblock.closeblock(vec![
+        Link::new(
+            vec![Hlvalue::Variable(obj0)],
+            Some(callblock.clone()),
+            Some(constant_with_lltype(
+                ConstValue::Bool(true),
+                LowLevelType::Bool,
+            )),
+        )
+        .into_ref(),
+        Link::new(
+            vec![constant_with_lltype(
+                ConstValue::Bool(false),
+                LowLevelType::Bool,
+            )],
+            Some(graph.returnblock.clone()),
+            Some(constant_with_lltype(
+                ConstValue::Bool(false),
+                LowLevelType::Bool,
+            )),
+        )
+        .into_ref(),
+    ]);
+
+    // upstream: `return ll_isinstance_const_nonnull(obj)` — cache hit
+    // (the non-null helper was minted just before this one in
+    // make_ll_isinstance, so the lookup never falls back to the
+    // dispatch table's synthetic-stub branch).
+    let callee = rtyper.lowlevel_helper_function(
+        nonnull_name.to_string(),
+        vec![OBJECTPTR.clone()],
+        LowLevelType::Bool,
+    )?;
+    callblock.borrow_mut().operations.push(direct_call_operation(
+        rtyper,
+        &callee,
+        vec![Hlvalue::Variable(obj1)],
+        call_result.clone(),
+    )?);
+    callblock.closeblock(vec![
+        Link::new(
+            vec![Hlvalue::Variable(call_result)],
+            Some(graph.returnblock.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    let func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(graph, argnames, func))
+}
+
 pub(crate) fn exception_args(exc_name: &str) -> Result<Vec<Hlvalue>, TyperError> {
     let exc_cls = HOST_ENV
         .lookup_exception_class(exc_name)
