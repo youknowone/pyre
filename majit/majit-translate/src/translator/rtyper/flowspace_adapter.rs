@@ -1855,7 +1855,8 @@ pub(crate) fn derive_subject_inputcells(
         (&crate::model::ValueType, &Option<String>),
     > = HashMap::new();
     for op in &startblock.operations {
-        if let (Some(result), OpKind::Input { ty, class_root, .. }) = (op.result.as_ref(), &op.kind)
+        if let (Some(result), OpKind::Input { ty, class_root, .. }) =
+            (op.result.as_ref(), &op.kind)
         {
             input_by_result.insert(result.clone(), (ty, class_root));
         }
