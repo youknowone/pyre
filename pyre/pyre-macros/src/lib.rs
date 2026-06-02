@@ -388,17 +388,13 @@ fn typed_alias(
             quote! { crate::gateway::fsencode_w(args[#idx])? },
         ),
         "PyIndex" => (
-            // Mirrors PyPy `space.getindex_w(w_obj)` / `space_index` in
-            // baseobjspace.rs.  Consults `__index__` per PEP 357 and
-            // returns the underlying i64.  Raises TypeError when the
-            // object has no `__index__` and is not already int-like.
+            // Mirrors PyPy `space.getindex_w(w_obj, None)`: consults
+            // `__index__` per PEP 357 and returns the underlying i64,
+            // clamping to i64::MAX / i64::MIN on overflow.  Raises
+            // TypeError when the object has no `__index__` and is not
+            // already int-like.
             quote! { i64 },
-            quote! {
-                {
-                    let __obj = crate::baseobjspace::space_index(args[#idx])?;
-                    unsafe { ::pyre_object::w_int_get_value(__obj) }
-                }
-            },
+            quote! { crate::baseobjspace::getindex_w(args[#idx])? },
         ),
         // Integer aliases — route through the `space.gateway_nonnegint_w`
         // / `space.c_*_w` converters in baseobjspace.rs so the range / sign

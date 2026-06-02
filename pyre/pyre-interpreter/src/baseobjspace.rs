@@ -5226,6 +5226,25 @@ pub fn space_index(obj: PyObjectRef) -> Result<PyObjectRef, PyError> {
     )))
 }
 
+/// baseobjspace.py:1564 `getindex_w` with `w_exception=None` — apply
+/// `space.index` (`__index__`) then convert to an i64, silently clamping
+/// to `i64::MAX` / `i64::MIN` on overflow rather than raising.
+pub fn getindex_w(obj: PyObjectRef) -> Result<i64, PyError> {
+    let w_index = space_index(obj)?;
+    match int_w(w_index) {
+        Ok(index) => Ok(index),
+        Err(e) if e.kind == PyErrorKind::OverflowError => {
+            let big = unsafe { crate::builtins::obj_to_bigint(w_index) };
+            if big.sign() == malachite_bigint::Sign::Minus {
+                Ok(i64::MIN)
+            } else {
+                Ok(i64::MAX)
+            }
+        }
+        Err(e) => Err(e),
+    }
+}
+
 /// `pyframe.py:115-116 self.builtin = space.builtin.pick_builtin(
 /// w_globals)`.  Body ports `pypy/module/__builtin__/moduledef.py:89-109
 /// pick_builtin`:
