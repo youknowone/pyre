@@ -3183,19 +3183,23 @@ pub fn c_ushort_w(obj: PyObjectRef) -> Result<u16, PyError> {
 
 /// pypy/interpreter/baseobjspace.py c_uid_t_w.
 pub fn c_uid_t_w(obj: PyObjectRef) -> Result<u32, PyError> {
-    match c_uint_w(obj) {
-        Ok(value) => Ok(value),
-        Err(e) if e.kind == PyErrorKind::ValueError => {
-            if int_w(obj)? == -1 {
-                Ok(u32::MAX)
-            } else {
-                Err(PyError::overflow_error(
-                    "user/group id smaller than minimum (-1)",
-                ))
-            }
-        }
-        Err(e) => Err(e),
+    // Coerce once: a side-effectful `__index__` must run a single time.
+    // `-1` is the "unchanged" sentinel that maps to the unsigned maximum.
+    let value = int_w(obj)?;
+    if value == -1 {
+        return Ok(u32::MAX);
     }
+    if value < 0 {
+        return Err(PyError::overflow_error(
+            "user/group id smaller than minimum (-1)",
+        ));
+    }
+    if value > u32::MAX as i64 {
+        return Err(PyError::overflow_error(
+            "user/group id greater than maximum",
+        ));
+    }
+    Ok(value as u32)
 }
 
 /// pypy/interpreter/baseobjspace.py truncatedint_w.
@@ -3236,7 +3240,7 @@ pub fn c_int_w(obj: PyObjectRef) -> Result<i32, PyError> {
 
 /// baseobjspace.py:1784 text_w.
 pub fn text_w(obj: PyObjectRef) -> Result<&'static str, PyError> {
-    if unsafe { !pyre_object::is_str(obj) } {
+    if unsafe { !isinstance_str_w(obj) } {
         return Err(PyError::type_error("expected str"));
     }
     Ok(unsafe { pyre_object::w_str_get_value(obj) })
@@ -3249,7 +3253,7 @@ pub fn utf8_w(obj: PyObjectRef) -> Result<&'static str, PyError> {
 
 /// baseobjspace.py realunicode_w.
 pub fn realunicode_w(obj: PyObjectRef) -> Result<&'static str, PyError> {
-    if unsafe { !pyre_object::is_str(obj) } {
+    if unsafe { !isinstance_str_w(obj) } {
         return Err(PyError::type_error("expected unicode"));
     }
     Ok(unsafe { pyre_object::w_str_get_value(obj) })
