@@ -10,9 +10,12 @@
 
 use pyre_object::*;
 
-/// `pypy/module/_collections/interp_deque.py` — minimal `W_Deque`
-/// surface (append / appendleft / pop / popleft / clear / extend +
-/// container protocol) backed by an inner list at `self.__data__`.
+/// `pypy/module/_collections/interp_deque.py` — `W_Deque` surface
+/// (append / appendleft / pop / popleft / clear / extend / extendleft /
+/// rotate / count / remove / reverse / index / copy + container and repr
+/// protocols, with `maxlen` bounding) backed by an inner list at
+/// `self.__data__`.  The bound is kept in the private `self.__maxlen__`
+/// slot and surfaced read-only via the `maxlen` property.
 mod deque_class {
     use super::*;
 
@@ -20,83 +23,179 @@ mod deque_class {
         crate::baseobjspace::getattr(self_obj, "__data__").ok()
     }
 
+    /// Snapshot the backing list into a `Vec`.
+    fn snapshot(self_obj: PyObjectRef) -> Vec<PyObjectRef> {
+        match data(self_obj) {
+            Some(d) => unsafe {
+                (0..w_list_len(d))
+                    .filter_map(|i| w_list_getitem(d, i as i64))
+                    .collect()
+            },
+            None => Vec::new(),
+        }
+    }
+
+    /// Replace the backing list with `items`.
+    fn store(self_obj: PyObjectRef, items: Vec<PyObjectRef>) {
+        let _ = crate::baseobjspace::setattr(self_obj, "__data__", w_list_new(items));
+    }
+
+    /// `self.maxlen`: `None` (unbounded) or a non-negative bound.
+    fn maxlen_bound(self_obj: PyObjectRef) -> Option<usize> {
+        let w = crate::baseobjspace::getattr(self_obj, "__maxlen__").ok()?;
+        if w.is_null() || unsafe { is_none(w) } {
+            None
+        } else {
+            Some(unsafe { w_int_get_value(w) }.max(0) as usize)
+        }
+    }
+
+    /// `W_Deque.append` + `trimleft`: drop from the left once over the bound.
+    fn do_append(self_obj: PyObjectRef, item: PyObjectRef) {
+        let Some(d) = data(self_obj) else { return };
+        unsafe { w_list_append(d, item) };
+        if let Some(m) = maxlen_bound(self_obj) {
+            let mut items = snapshot(self_obj);
+            if items.len() > m {
+                items.drain(0..items.len() - m);
+                store(self_obj, items);
+            }
+        }
+    }
+
+    /// `W_Deque.appendleft` + `trimright`: drop from the right once over the bound.
+    fn do_appendleft(self_obj: PyObjectRef, item: PyObjectRef) {
+        let mut items = snapshot(self_obj);
+        items.insert(0, item);
+        if let Some(m) = maxlen_bound(self_obj) {
+            items.truncate(m);
+        }
+        store(self_obj, items);
+    }
+
     crate::py_class! {
         "deque",
         methods: {
-            // `__init__(iterable=(), maxlen=None)` — store items as
-            // `__data__` list, remember maxlen for future trimming.
+            // `init(iterable=None, maxlen=None)` — remember maxlen, then
+            // extend so the bound is enforced while filling.
             fn __init__(self_obj: PyObjectRef, iterable: Option<PyObjectRef>, maxlen: Option<PyObjectRef>) {
-                let items = iterable
-                    .map(|it| crate::builtins::collect_iterable(it).unwrap_or_default())
-                    .unwrap_or_default();
-                let _ = crate::baseobjspace::setattr(self_obj, "__data__", w_list_new(items));
-                let _ = crate::baseobjspace::setattr(self_obj, "maxlen", maxlen.unwrap_or(w_none()));
+                store(self_obj, vec![]);
+                let _ = crate::baseobjspace::setattr(
+                    self_obj, "__maxlen__", maxlen.unwrap_or(w_none()));
+                if let Some(it) = iterable {
+                    for item in crate::builtins::collect_iterable(it).unwrap_or_default() {
+                        do_append(self_obj, item);
+                    }
+                }
             }
             fn append(self_obj: PyObjectRef, item: PyObjectRef) {
-                if let Some(d) = data(self_obj) {
-                    unsafe { w_list_append(d, item) };
-                }
+                do_append(self_obj, item);
             }
             fn appendleft(self_obj: PyObjectRef, item: PyObjectRef) {
-                if let Some(d) = data(self_obj) {
-                    unsafe {
-                        let n = w_list_len(d);
-                        let mut items: Vec<_> = (0..n)
-                            .filter_map(|i| w_list_getitem(d, i as i64))
-                            .collect();
-                        items.insert(0, item);
-                        let _ = crate::baseobjspace::setattr(
-                            self_obj, "__data__", w_list_new(items));
-                    }
-                }
+                do_appendleft(self_obj, item);
             }
             fn pop(self_obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
-                // `interp_deque.py W_Deque.pop` — empty raises IndexError.
-                let d = data(self_obj).ok_or_else(||
+                // `W_Deque.pop` — empty raises IndexError.
+                let mut items = snapshot(self_obj);
+                let item = items.pop().ok_or_else(||
                     crate::PyError::index_error("pop from an empty deque"))?;
-                unsafe {
-                    let n = w_list_len(d);
-                    if n == 0 {
-                        return Err(crate::PyError::index_error("pop from an empty deque"));
-                    }
-                    let item = w_list_getitem(d, (n - 1) as i64).unwrap_or(w_none());
-                    let items: Vec<_> = (0..n - 1)
-                        .filter_map(|i| w_list_getitem(d, i as i64))
-                        .collect();
-                    let _ = crate::baseobjspace::setattr(
-                        self_obj, "__data__", w_list_new(items));
-                    Ok(item)
-                }
+                store(self_obj, items);
+                Ok(item)
             }
             fn popleft(self_obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
-                // `interp_deque.py W_Deque.popleft` — empty raises IndexError.
-                let d = data(self_obj).ok_or_else(||
-                    crate::PyError::index_error("pop from an empty deque"))?;
-                unsafe {
-                    let n = w_list_len(d);
-                    if n == 0 {
-                        return Err(crate::PyError::index_error("pop from an empty deque"));
-                    }
-                    let item = w_list_getitem(d, 0).unwrap_or(w_none());
-                    let items: Vec<_> = (1..n)
-                        .filter_map(|i| w_list_getitem(d, i as i64))
-                        .collect();
-                    let _ = crate::baseobjspace::setattr(
-                        self_obj, "__data__", w_list_new(items));
-                    Ok(item)
+                // `W_Deque.popleft` — empty raises IndexError.
+                let mut items = snapshot(self_obj);
+                if items.is_empty() {
+                    return Err(crate::PyError::index_error("pop from an empty deque"));
                 }
+                let item = items.remove(0);
+                store(self_obj, items);
+                Ok(item)
             }
             fn clear(self_obj: PyObjectRef) {
-                let _ = crate::baseobjspace::setattr(self_obj, "__data__", w_list_new(vec![]));
+                store(self_obj, vec![]);
             }
             fn extend(self_obj: PyObjectRef, iterable: PyObjectRef) -> Result<(), crate::PyError> {
-                let items = crate::builtins::collect_iterable(iterable)?;
-                if let Some(d) = data(self_obj) {
-                    for item in items {
-                        unsafe { w_list_append(d, item) };
-                    }
+                for item in crate::builtins::collect_iterable(iterable)? {
+                    do_append(self_obj, item);
                 }
                 Ok(())
+            }
+            fn extendleft(self_obj: PyObjectRef, iterable: PyObjectRef) -> Result<(), crate::PyError> {
+                // Each element is appended on the left, so the result is
+                // the reverse of `iterable`.
+                for item in crate::builtins::collect_iterable(iterable)? {
+                    do_appendleft(self_obj, item);
+                }
+                Ok(())
+            }
+            fn count(self_obj: PyObjectRef, x: PyObjectRef) -> i64 {
+                snapshot(self_obj)
+                    .into_iter()
+                    .filter(|&it| crate::baseobjspace::eq_w(it, x))
+                    .count() as i64
+            }
+            fn remove(self_obj: PyObjectRef, x: PyObjectRef) -> Result<(), crate::PyError> {
+                let mut items = snapshot(self_obj);
+                match items.iter().position(|&it| crate::baseobjspace::eq_w(it, x)) {
+                    Some(pos) => {
+                        items.remove(pos);
+                        store(self_obj, items);
+                        Ok(())
+                    }
+                    None => Err(crate::PyError::value_error(
+                        "deque.remove(x): x not in deque")),
+                }
+            }
+            fn __contains__(self_obj: PyObjectRef, x: PyObjectRef) -> bool {
+                snapshot(self_obj)
+                    .into_iter()
+                    .any(|it| crate::baseobjspace::eq_w(it, x))
+            }
+            fn reverse(self_obj: PyObjectRef) {
+                let mut items = snapshot(self_obj);
+                items.reverse();
+                store(self_obj, items);
+            }
+            fn rotate(self_obj: PyObjectRef, n: Option<PyObjectRef>) {
+                // Rotate right by n (negative rotates left).
+                let n = n.map(|v| unsafe { w_int_get_value(v) }).unwrap_or(1);
+                let mut items = snapshot(self_obj);
+                let len = items.len() as i64;
+                if len <= 1 {
+                    return;
+                }
+                let shift = ((n % len) + len) % len;
+                if shift != 0 {
+                    items.rotate_right(shift as usize);
+                    store(self_obj, items);
+                }
+            }
+            fn index(self_obj: PyObjectRef, x: PyObjectRef, start: Option<PyObjectRef>, stop: Option<PyObjectRef>) -> Result<i64, crate::PyError> {
+                let items = snapshot(self_obj);
+                let len = items.len() as i64;
+                let clamp = |i: i64| if i < 0 { (i + len).max(0) } else { i.min(len) };
+                let start = clamp(start.map(|v| unsafe { w_int_get_value(v) }).unwrap_or(0));
+                let stop = clamp(stop.map(|v| unsafe { w_int_get_value(v) }).unwrap_or(len));
+                let mut i = start;
+                while i < stop {
+                    if crate::baseobjspace::eq_w(items[i as usize], x) {
+                        return Ok(i);
+                    }
+                    i += 1;
+                }
+                Err(crate::PyError::value_error(
+                    format!("{} is not in deque", unsafe { crate::py_repr(x) })))
+            }
+            fn copy(self_obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+                // `type(self)(self)` or `type(self)(self, maxlen)`.
+                let ty = unsafe { w_instance_get_type(self_obj) };
+                let list = w_list_new(snapshot(self_obj));
+                match crate::baseobjspace::getattr(self_obj, "__maxlen__") {
+                    Ok(m) if !(m.is_null() || unsafe { is_none(m) }) =>
+                        crate::call::call_function_impl_result(ty, &[list, m]),
+                    _ => crate::call::call_function_impl_result(ty, &[list]),
+                }
             }
             fn __len__(self_obj: PyObjectRef) -> i64 {
                 data(self_obj)
@@ -114,6 +213,53 @@ mod deque_class {
                     Some(d) => crate::baseobjspace::getitem(d, index),
                     None => Ok(w_none()),
                 }
+            }
+            fn __setitem__(self_obj: PyObjectRef, index: PyObjectRef, value: PyObjectRef) -> Result<(), crate::PyError> {
+                let mut items = snapshot(self_obj);
+                let len = items.len() as i64;
+                let mut idx = unsafe { w_int_get_value(index) };
+                if idx < 0 {
+                    idx += len;
+                }
+                if idx < 0 || idx >= len {
+                    return Err(crate::PyError::index_error("deque index out of range"));
+                }
+                items[idx as usize] = value;
+                store(self_obj, items);
+                Ok(())
+            }
+            fn __delitem__(self_obj: PyObjectRef, index: PyObjectRef) -> Result<(), crate::PyError> {
+                let mut items = snapshot(self_obj);
+                let len = items.len() as i64;
+                let mut idx = unsafe { w_int_get_value(index) };
+                if idx < 0 {
+                    idx += len;
+                }
+                if idx < 0 || idx >= len {
+                    return Err(crate::PyError::index_error("deque index out of range"));
+                }
+                items.remove(idx as usize);
+                store(self_obj, items);
+                Ok(())
+            }
+            fn __repr__(self_obj: PyObjectRef) -> String {
+                let name = unsafe { w_type_get_name(w_instance_get_type(self_obj)) };
+                let listrepr = snapshot(self_obj)
+                    .into_iter()
+                    .map(|it| unsafe { crate::py_repr(it) })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                match maxlen_bound(self_obj) {
+                    Some(m) => format!("{name}([{listrepr}], maxlen={m})"),
+                    None => format!("{name}([{listrepr}])"),
+                }
+            }
+        },
+        properties: {
+            // GetSetProperty fget is invoked as `fget(descriptor, instance)`.
+            fn maxlen(_descr: PyObjectRef, self_obj: PyObjectRef) -> PyObjectRef {
+                crate::baseobjspace::getattr(self_obj, "__maxlen__")
+                    .unwrap_or_else(|_| w_none())
             }
         }
     }
