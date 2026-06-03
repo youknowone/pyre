@@ -2198,7 +2198,19 @@ fn init_dict_type(ns: &mut DictStorage) {
                         if let Ok(backing) = crate::baseobjspace::getattr(args[0], "__dict_data__")
                         {
                             if pyre_object::is_dict(backing) {
-                                return crate::baseobjspace::getitem(backing, args[1]);
+                                // `dictmultiobject.py:166-170` — on a miss,
+                                // dispatch `__missing__` against the SUBCLASS
+                                // instance's type, not the plain-`dict` backing
+                                // (so e.g. `defaultdict.__missing__` fires).
+                                return match pyre_object::dictmultiobject::w_dict_lookup_checked(
+                                    backing, args[1],
+                                ) {
+                                    Ok(Some(val)) => Ok(val),
+                                    Ok(None) => crate::baseobjspace::dict_missing_or_key_error(
+                                        args[0], args[1],
+                                    ),
+                                    Err(_) => Err(crate::baseobjspace::take_pending_hash_error()),
+                                };
                             }
                         }
                     }
@@ -2249,6 +2261,27 @@ fn init_dict_type(ns: &mut DictStorage) {
                     ));
                 }
                 crate::baseobjspace::len(args[0])
+            },
+            1,
+        ),
+    );
+    dict_storage_store(
+        ns,
+        "__repr__",
+        make_builtin_function_with_arity(
+            "__repr__",
+            |args| {
+                // `dictmultiobject.py:130-150 descr_repr`.  Registered as a
+                // method (not only the `py_repr` fast path) so dict-subclass
+                // instances and `super().__repr__()` format their backing.
+                if args.is_empty() {
+                    return Ok(pyre_object::w_str_new("{}"));
+                }
+                let dict = crate::type_methods::resolve_dict_backing(args[0]);
+                if dict.is_null() {
+                    return Ok(pyre_object::w_str_new("{}"));
+                }
+                unsafe { Ok(pyre_object::w_str_new(&crate::display::dict_repr(dict))) }
             },
             1,
         ),

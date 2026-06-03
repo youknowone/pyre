@@ -169,6 +169,27 @@ impl Drop for ReprGuard {
     }
 }
 
+/// `dictmultiobject.py:130-150 descr_repr` — `{k: v, ...}`.  Iterates
+/// `w_dict_items` (which routes through `is_module_dict`), guarded against
+/// self-recursion.  Shared by the `py_repr` dict fast path and the dict
+/// type's `__repr__` method (so dict-subclass instances and `super().
+/// __repr__()` format their backing the same way).
+///
+/// # Safety
+/// `obj` must be a real `W_DictObject` (caller resolves any subclass
+/// backing via `resolve_dict_backing` first).
+pub unsafe fn dict_repr(obj: PyObjectRef) -> String {
+    let Some(_guard) = ReprGuard::enter(obj) else {
+        return "{...}".to_string();
+    };
+    let entries = pyre_object::w_dict_items(obj);
+    let mut parts = Vec::with_capacity(entries.len());
+    for (k, v) in entries {
+        parts.push(format!("{}: {}", py_repr(k), py_repr(v)));
+    }
+    format!("{{{}}}", parts.join(", "))
+}
+
 /// Format a PyObjectRef for debug display.
 ///
 /// # Safety
@@ -259,21 +280,7 @@ pub unsafe fn py_repr(obj: PyObjectRef) -> String {
                 format!("({})", parts.join(", "))
             }
         } else if unsafe { pyre_object::is_dict(obj) } {
-            // `pypy/objspace/std/dictmultiobject.py:130-150 descr_repr`
-            // iterates `self.iteritems()`, which dispatches to the
-            // strategy on both `W_DictObject` and `W_ModuleDictObject`.
-            // `w_dict_items` already routes through `is_module_dict`,
-            // so reach for the unified surface instead of casting
-            // through the W_DictObject layout.
-            let Some(_guard) = ReprGuard::enter(obj) else {
-                return "{...}".to_string();
-            };
-            let entries = pyre_object::w_dict_items(obj);
-            let mut parts = Vec::with_capacity(entries.len());
-            for (k, v) in entries {
-                parts.push(format!("{}: {}", py_repr(k), py_repr(v)));
-            }
-            format!("{{{}}}", parts.join(", "))
+            unsafe { dict_repr(obj) }
         } else if pyre_object::sliceobject::is_slice(obj) {
             // `pypy/objspace/std/sliceobject.py descr_repr` —
             // `slice(%r, %r, %r)`.

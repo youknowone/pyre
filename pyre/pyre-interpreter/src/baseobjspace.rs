@@ -766,7 +766,7 @@ unsafe fn get_and_call_function(
 }
 
 #[majit_macros::dont_look_inside]
-fn dict_missing_or_key_error(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
+pub(crate) fn dict_missing_or_key_error(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
     if let Some(w_type_obj) = crate::typedef::r#type(obj) {
         let dict_type = crate::typedef::gettypeobject(&pyre_object::DICT_TYPE);
         if dict_type.is_null() == false && std::ptr::eq(w_type_obj, dict_type) == false {
