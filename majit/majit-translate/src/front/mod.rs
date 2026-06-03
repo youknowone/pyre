@@ -57,10 +57,11 @@
 //!   `#[oopspec]` — closed via Step 4.5.b hybrid pass.
 //! - `immutable_fields` from `#[majit_macros::immutable]` — closed
 //!   via Step 4.5.c hybrid pass.
-//! - `fn_return_types` MIR-native primitive resolution — closed via
-//!   Step 4.3.c.ext dedup-body widening (Task #30, commit
-//!   `654a65ba80`).  Hybrid AST pass still fills `Result<T, E>` /
-//!   `Option<T>` / non-primitive shapes Charon cannot reconstruct.
+//! - `fn_return_types` — retired entirely (Slice ③, Task #61).  The
+//!   `SemanticProgram` field and its `parse::extract_*` threading
+//!   were removed once it was confirmed that no production consumer
+//!   read the map; the per-callsite return type is taken from the
+//!   MIR-built `SemanticFunction` signature directly.
 //! - `classdef` hybrid pass — closed via Step 4.5.e (Task #31,
 //!   commit `7242bde6a7`).  Root cause was BFS path resolution,
 //!   not classdef binding: MIR routed `CallKind::Trait` to a

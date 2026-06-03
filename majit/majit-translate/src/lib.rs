@@ -61,9 +61,7 @@ pub use model::{Block, BlockId, CallTarget, FunctionGraph, OpKind, SpaceOperatio
 pub use opcode_dispatch::PipelineOpcodeArm;
 pub use parse::{
     CallPath, ExtractedHandlerCall, ExtractedOpcodeArm, OpcodeDispatchSelector, ParsedInterpreter,
-    ReceiverTraitBindings, extract_inherent_impl_methods, extract_opcode_dispatch_arms,
-    extract_opcode_dispatch_receiver_traits, extract_trait_impls, find_opcode_dispatch_match,
-    parse_source,
+    extract_inherent_impl_methods, extract_opcode_dispatch_arms, extract_trait_impls, parse_source,
 };
 pub use pipeline::{PipelineConfig, PipelineResult, PortalSpec, ProgramPipelineResult};
 
@@ -181,9 +179,7 @@ fn build_semantic_program_via_active_frontend(
             // `type_decls` / `trait_decls`; struct field-type strings are
             // resolved by `tyref_to_ast_string` (Charon-resolved types,
             // e.g. `*mut PyObject`, `Vec<u8>`, `i64`) rather than the syn
-            // re-parse.  `fn_return_types` stays empty — it is threaded
-            // through `parse::extract_*` but read by no production
-            // consumer (only the MIR-only build test asserts it empty).
+            // re-parse.
             return program;
         }
     }
@@ -800,24 +796,6 @@ fn analyze_pipeline_from_parsed(
         }
     }
     majit_ir::descr::register_struct_origins(struct_origins);
-    // Codewriter-side static catalogue.  Collected here so it can be
-    // installed on `CallControl.static_decls` further down for the
-    // adapter consumer.  The front-end `Expr::Path` arm receives the
-    // same data through `KnownStaticsCatalogue` constructed inside
-    // `build_semantic_program_from_parsed_files_with_options`.
-    let early_static_decls: Vec<(
-        Vec<String>,
-        crate::model::ValueType,
-        Option<crate::flowspace::model::ConstValue>,
-    )> = parsed_files
-        .iter()
-        .flat_map(|parsed| {
-            crate::flowspace::rust_source::register::extract_static_decls(
-                &parsed.file,
-                &parsed.module_path,
-            )
-        })
-        .collect();
     // `use <path>::*` glob roots are expanded into explicit
     // `use_imports` entries inside
     // `build_semantic_program_*_with_options` so the front-end
@@ -830,9 +808,9 @@ fn analyze_pipeline_from_parsed(
     // the annotator's narrowing gate at
     // `flowspace_adapter.rs::derive_subject_inputcells` checks
     // `attrs_populated`.  Production never drives the walker (only
-    // `extract_static_decls` and `extract_unsafe_fn_stubs` are called
-    // from `register`), which left the dict empty for parsed-only
-    // structs and forced every impl-method `self` to carry
+    // `extract_unsafe_fn_stubs` is called from `register`), which left
+    // the dict empty for parsed-only structs and forced every
+    // impl-method `self` to carry
     // `SomeInstance(classdef=None)`.  Empty `module_path` files (test
     // fixtures) skip; their structs are registered through the bare-
     // leaf walker path when the fixture explicitly calls
@@ -894,7 +872,6 @@ fn analyze_pipeline_from_parsed(
             parse::extract_trait_impls(
                 parsed,
                 &program.struct_fields,
-                &program.fn_return_types,
                 &program.known_struct_names,
                 Some(&mir_graph_lookup),
             )
@@ -904,7 +881,6 @@ fn analyze_pipeline_from_parsed(
             parse::extract_inherent_impl_methods(
                 parsed,
                 &program.struct_fields,
-                &program.fn_return_types,
                 &program.known_struct_names,
                 Some(&mir_graph_lookup),
             )
@@ -1097,12 +1073,6 @@ fn analyze_pipeline_from_parsed(
         );
     }
     call_control.unsafe_fn_stubs = unsafe_stubs;
-    // Codewriter-side mirror of the static catalogue.  Same
-    // `(segments, ty)` shape that
-    // [`KnownStaticsCatalogue::from_parsed_files`] feeds to the
-    // front-end's `Expr::Path` lookup; reusing the
-    // `early_static_decls` walk avoids a second pass.
-    call_control.static_decls = early_static_decls;
     // Populate CallControl with layouts from the provider.
     for struct_name in program.struct_fields.fields.keys() {
         if let Some(layout) = provider.get_struct_layout(struct_name) {
@@ -1643,12 +1613,8 @@ fn analyze_pipeline_from_parsed(
     };
 
     mark_phase!("call_control + canonical_trait_impls + register graphs");
-    let (opcode_dispatch, jitcodes, insns, descrs) = build_canonical_opcode_dispatch(
-        parsed_files,
-        &program.fn_return_types,
-        &config.pipeline,
-        &mut call_control,
-    );
+    let (opcode_dispatch, jitcodes, insns, descrs) =
+        build_canonical_opcode_dispatch(parsed_files, &config.pipeline, &mut call_control);
     mark_phase!("build_canonical_opcode_dispatch");
     pipeline.opcode_dispatch = opcode_dispatch;
     pipeline.jitcodes = jitcodes;
@@ -1687,7 +1653,6 @@ fn analyze_pipeline_from_parsed(
 /// it picks up callee graphs discovered during jtransform.
 fn build_canonical_opcode_dispatch(
     parsed_files: &[parse::ParsedInterpreter],
-    fn_return_types: &std::collections::HashMap<String, String>,
     pipeline_config: &pipeline::PipelineConfig,
     call_control: &mut call::CallControl,
 ) -> (
@@ -1699,7 +1664,7 @@ fn build_canonical_opcode_dispatch(
     let mut opcode_arms = Vec::new();
 
     for parsed in parsed_files {
-        let file_opcodes = parse::extract_opcode_dispatch_arms(parsed, fn_return_types);
+        let file_opcodes = parse::extract_opcode_dispatch_arms(parsed);
         if !file_opcodes.is_empty() {
             opcode_arms = file_opcodes;
             break;

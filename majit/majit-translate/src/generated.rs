@@ -72,7 +72,7 @@
 //!
 //! An earlier draft of this module ran its own narrow pipeline
 //! (opcode_* free functions + trait impl methods only, with empty
-//! `StructFieldRegistry` / `fn_return_types` / `known_struct_names`).
+//! `StructFieldRegistry` / `known_struct_names`).
 //! That shape is **narrower than `translator.graphs`** upstream assumes
 //! and drops structural context:
 //!
@@ -80,10 +80,10 @@
 //!   registered via `extract_inherent_impl_methods` in
 //!   `analyze_pipeline_from_parsed`; without them, direct_call targets
 //!   like `self.pop()` cannot resolve to a concrete graph.
-//! - `struct_fields` / `fn_return_types` / `known_struct_names` carry
-//!   array-type identity that `extract_trait_impls` consults; an empty
-//!   context silently collapses those identities and the rtyped graph
-//!   becomes syntax-only.
+//! - `struct_fields` / `known_struct_names` carry array-type identity
+//!   that `extract_trait_impls` consults; an empty context silently
+//!   collapses those identities and the rtyped graph becomes
+//!   syntax-only.
 //!
 //! Re-using `analyze_multiple_pipeline` eliminates both gaps: the same
 //! full-context registry the canonical analyzer consumes becomes this

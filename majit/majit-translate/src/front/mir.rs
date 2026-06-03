@@ -197,9 +197,7 @@ pub fn build_semantic_program_from_llbcs(
             known_struct_names: std::collections::HashSet::new(),
             known_trait_names: std::collections::HashSet::new(),
             struct_fields: crate::front::semantic::StructFieldRegistry::default(),
-            fn_return_types: std::collections::HashMap::new(),
             immutable_fields: std::collections::HashMap::new(),
-            module_statics: std::collections::HashMap::new(),
         }),
     )
 }
@@ -215,8 +213,6 @@ pub fn build_semantic_program_from_llbcs(
 /// `known_trait_names`, `struct_fields`) is populated from
 /// `type_decls` / `trait_decls` (Step 4.3.b); struct field-type strings
 /// are resolved by [`tyref_to_ast_string`] from Charon's type IR.
-/// `fn_return_types` stays empty — it is threaded through
-/// `parse::extract_*` but read by no production consumer.
 /// `immutable_fields` stays empty until the `#[majit_macros::immutable]`
 /// attribute is surfaced by Charon (Step 4.3.d).
 ///
@@ -247,11 +243,10 @@ pub fn build_semantic_program_from_llbc(
         // (`model.rs:3873`) — which mints orphan etype/evalue slots
         // the flowspace adapter then rejects with the "undefined
         // operand slot N as Link.args[0]" invariant break.  The AST
-        // front-end never registered them as call graphs either
-        // (it routes static initialiser values through
-        // `collect_module_statics` instead); preserve that policy
-        // here so the MIR cutover does not surface call-registry
-        // entries the rest of the pipeline never modelled.
+        // front-end never registered them as call graphs either;
+        // preserve that policy here so the MIR cutover does not
+        // surface call-registry entries the rest of the pipeline
+        // never modelled.
         if fd.is_global_initializer.is_some() {
             continue;
         }
@@ -342,22 +337,11 @@ pub fn build_semantic_program_from_llbc(
         known_struct_names,
         known_trait_names,
         struct_fields,
-        // `fn_return_types` stays empty: it is threaded through
-        // `parse::extract_*` but read by no production consumer, so there
-        // is nothing to populate (the syn-AST merge that used to fill it
-        // was retired with the rest of the metadata side-channel).
-        fn_return_types: std::collections::HashMap::new(),
         // Immutable-field tracking depends on `#[majit_macros::immutable]`
         // attribute serialization that Charon does not currently surface
         // (the `attributes` array carries DocComment / Outer but not our
         // proc-macro hints). Tracked under Step 4.3.d.
         immutable_fields: std::collections::HashMap::new(),
-        // Module-static literals come from the AST pre-walk
-        // (collect_program_metadata_pub via merge_module_statics_from_
-        // parsed_files); LLBC carries the encoded const values without
-        // their source spelling, so MIR leaves this empty and the AST
-        // merge populates it.
-        module_statics: std::collections::HashMap::new(),
     })
 }
 
@@ -1269,9 +1253,8 @@ impl<'a> Lowering<'a> {
 
     /// The owner_root is the LLBC TypeDecl's leaf name
     /// (`PyFrame` from `pyre_interpreter::pyframe::PyFrame`) so the
-    /// downstream `struct_fields` registry — populated in
-    /// AST-format by `merge_fn_return_types_from_parsed_files`
-    /// (lib.rs:286) — resolves with the same leaf key.
+    /// downstream `struct_fields` registry resolves with the same
+    /// leaf key.
     fn resolve_adt_field(&self, payload: &serde_json::Value) -> Option<(String, String, TyRef)> {
         let arr = payload.as_array()?;
         if arr.len() != 2 {

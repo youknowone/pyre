@@ -206,11 +206,6 @@ pub struct SemanticProgram {
     /// RPython: struct field types for resolving `op.args[0].concretetype`
     /// on FieldRead-produced array bases.
     pub struct_fields: StructFieldRegistry,
-    /// RPython: op.result.concretetype — whole-program function return types.
-    /// Maps exact callee path (e.g. "a::helper", "Type::method") → return type.
-    /// Stored here so that downstream consumers (parse.rs method graph building)
-    /// can use them for array type identity resolution.
-    pub fn_return_types: HashMap<String, String>,
     /// RPython: `_immutable_fields_ = [...]` declared on a class body.
     /// Maps struct name → `(field_name, rank)` pairs whose value never
     /// mutates after construction (or is quasi-immutable).  Both bare and
@@ -218,67 +213,6 @@ pub struct SemanticProgram {
     /// the same lookup logic works across module-prefix variants.  Rank
     /// encoding follows `rpython/rtyper/rclass.py:644-678 _parse_field_list`.
     pub immutable_fields: HashMap<String, Vec<(String, ImmutableRank)>>,
-    /// Whole-program `pub const` / `pub static` declarations gathered
-    /// across every parsed file.  Keyed by `(module_path, name)` so
-    /// the same bare name (`INT_TYPE`) can disambiguate between
-    /// different defining modules.  Mirrors PyPy's
-    /// `bookkeeper.getdesc(TYPE)` whole-program registry — pyre
-    /// carries the data per-`(module, name)` because Rust has no
-    /// `lltype` object identity to key off.
-    ///
-    /// Populated by [`collect_program_metadata_pub`] / the per-file
-    /// build entries from each [`ParsedInterpreter::module_statics`].
-    pub module_statics: HashMap<(String, String), crate::parse::ModuleStaticDecl>,
-}
-
-/// Pre-walk metadata produced by `collect_program_metadata_pub` —
-/// the four registries that `build_function_graph` /
-/// `build_function_graph_with_self_ty_pub` need before per-function
-/// graph build can resolve typed call shapes.
-pub struct ProgramMetadata {
-    pub known_struct_names: std::collections::HashSet<String>,
-    pub known_trait_names: std::collections::HashSet<String>,
-    pub struct_fields: StructFieldRegistry,
-    pub fn_return_types: HashMap<String, String>,
-    /// Bare struct name → defining module path (use-import resolver
-    /// support).  Populated when `collect_struct_names` walks per-file
-    /// `ParsedInterpreter.module_path` non-empty: each top-level
-    /// `Struct` registers as `struct_origins["Struct"] = module_path`.
-    /// PyPy parity: `annotator.bookkeeper.getdesc(TYPE)` resolves the
-    /// canonical defining-module path for every lltype reference;
-    /// pyre carries names as strings so this map carries that
-    /// resolution.  Empty when every parsed file was supplied via the
-    /// bare `parse_source` entry — caller falls back to the
-    /// dual-publish runtime convergence.
-    pub struct_origins: HashMap<String, String>,
-    /// Merged use-import table across all parsed files: each entry
-    /// `(file_module_path, alias) → fully_qualified_path` mirrors the
-    /// per-file `ParsedInterpreter.use_imports` populated by
-    /// `parse::collect_use_imports`.  Keyed by `(module, alias)` rather
-    /// than `alias` alone because the same alias `Foo` can resolve to
-    /// different paths in different files (`use other_a::Foo` in one
-    /// vs `use other_b::Foo` in another).
-    pub use_imports: HashMap<(String, String), String>,
-    /// Merged module-static table across all parsed files: each entry
-    /// `(file_module_path, static_name) → ModuleStaticDecl` mirrors the
-    /// per-file `ParsedInterpreter.module_statics` populated by
-    /// `parse::collect_module_statics`.  Keyed by `(module, name)` —
-    /// the same bare static name (e.g. `LOCAL`) can appear in multiple
-    /// files; the per-file key disambiguates.
-    pub module_statics: HashMap<(String, String), crate::parse::ModuleStaticDecl>,
-}
-
-/// Concatenate a file's `module_path` with an inline-`mod` chain
-/// (the `nested` half of a `parsed.module_statics` key) into the
-/// program-wide module-static lookup key used by `lookup_module_
-/// static_literal`.  Either component may be empty.
-pub fn qualify_module_path(module_path: &str, nested: &str) -> String {
-    match (module_path.is_empty(), nested.is_empty()) {
-        (true, true) => String::new(),
-        (false, true) => module_path.to_string(),
-        (true, false) => nested.to_string(),
-        (false, false) => format!("{}::{}", module_path, nested),
-    }
 }
 
 /// Step 6.E Slice 3.C — graph lookup table built from a

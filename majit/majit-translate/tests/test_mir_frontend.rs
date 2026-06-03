@@ -168,10 +168,6 @@ fn semantic_program_builder_lowers_every_corpus_function() {
     ] {
         assert!(names.contains(required), "missing {required}");
     }
-    // Step 4.5: fn_return_types is empty until Step 4.3.c.ext lands a
-    // dedup-table widening that resolves TyRef::Deduplicated{id} →
-    // primitive name. Empty is the type-validator-safe state.
-    assert!(program.fn_return_types.is_empty());
     // Step 4.3.b: corpus declares one struct-shaped enum (Strategy +
     // Token), one type alias (PyResult), so we expect Strategy/Token
     // and their variant paths plus the leaf names.

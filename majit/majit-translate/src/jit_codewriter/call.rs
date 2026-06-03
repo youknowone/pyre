@@ -806,24 +806,6 @@ pub struct CallControl {
         crate::flowspace::argument::Signature,
         crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
     )>,
-    /// Z2.5 Cat 2.1 metadata carrier — `(segments, ValueType,
-    /// Option<ConstValue>)` for every `pub static` / `static`
-    /// declaration discovered in the parsed source set.  Populated by
-    /// `lib.rs::analyze_pipeline_from_parsed` via
-    /// `flowspace::rust_source::register::extract_static_decls`.
-    /// Consumed by `front/ast.rs::Expr::Path` lowering (Slice 3)
-    /// to skip the body-`OpKind::Input` fallthrough for known
-    /// crate-level statics — the closure path for the SHOUTY_CASE
-    /// cross-block body Input Skip cluster.  Slice C: the `value`
-    /// component carries the literal-evaluated `ConstValue` when the
-    /// initializer is a Rust literal; `None` when the RHS is a host
-    /// call or otherwise unresolvable at extract time.  No consumer
-    /// yet on the codewriter side (Slice 2 plumbing only).
-    pub static_decls: Vec<(
-        Vec<String>,
-        crate::model::ValueType,
-        Option<crate::flowspace::model::ConstValue>,
-    )>,
 }
 
 /// Heuristic struct layout — NOT equivalent to RPython's `symbolic.get_field_token()`.
@@ -1157,7 +1139,6 @@ impl CallControl {
             parsed_module_paths: Vec::new(),
             use_imports: HashMap::new(),
             unsafe_fn_stubs: Vec::new(),
-            static_decls: Vec::new(),
         }
     }
 
@@ -4705,14 +4686,7 @@ impl CallControl {
                             let expected_result =
                                 return_type_string_to_value_type(Some(&effective_declared));
                             // RPython call.py:220 hard-fails when
-                            // `RESULT != FUNC.RESULT`.  The arm-graph
-                            // entry threads `ProgramMetadata.fn_return_types`
-                            // through to
-                            // `lower_expr_into_graph_with_signature`
-                            // (parse.rs:808), so every callsite's
-                            // expected result type is resolved from the
-                            // whole-program return-type map before it
-                            // reaches `getcalldescr`.
+                            // `RESULT != FUNC.RESULT`.
                             if result_type != expected_result {
                                 panic!(
                                     "in operation calling {target}: calling a \
