@@ -10219,8 +10219,28 @@ impl CodeWriter {
                     }
                 }
                 let first_live = spliced.insns.iter().position(|i| i.is_live());
-                if let Some(first_live) = first_live {
-                    let derived = derive_pc_live_indices_from_sparse(&spliced, num_instrs);
+                let derived = first_live
+                    .map(|_| derive_pc_live_indices_from_sparse(&spliced, num_instrs));
+                // #281 splice precondition: the dense pc_map fill above
+                // forward-carries the nearest resolved `-live-` marker for a
+                // `nopc` (stack-only) PC, which is only sound when no
+                // structural resume target's marker is `stranded` (the
+                // comment above documents this `stranded == 0` assumption).
+                // A `stranded` canraise marker is a can-raise whose
+                // fallthrough PC is stack-only, so the carry-forward hands
+                // that deopt target the WRONG (preceding) liveness
+                // (`raise_catch_loop`: 1 stranded canraise → off-by-N count).
+                // Resolving it is #286 runtime work (route the sparse
+                // resolver on `fallthrough_pc`); until then refuse to splice
+                // such graphs and keep the walker stream, which carries a
+                // correct per-PC marker for every resume target.  Gate-on
+                // only — gate-off never enters this block.
+                let stranded = derived.as_ref().map_or(0, |d| {
+                    let (rb, _rbk, rbf, rc, rcf) =
+                        resume_target_resolver_coverage(&spliced, d);
+                    (rb - rbf) + (rc - rcf)
+                });
+                if let (Some(first_live), Some(derived), 0) = (first_live, derived, stranded) {
                     let mut dense: Vec<usize> = Vec::with_capacity(num_instrs);
                     let mut last = first_live;
                     for entry in &derived {
@@ -10241,10 +10261,15 @@ impl CodeWriter {
                         num_instrs,
                         first_live,
                     );
-                } else {
+                } else if first_live.is_none() {
                     eprintln!(
                         "[flatten-splice] {} skipped (canonical stream has no -live- marker)",
                         ssarepr.name,
+                    );
+                } else {
+                    eprintln!(
+                        "[flatten-splice] {} skipped (stranded resume markers={})",
+                        ssarepr.name, stranded,
                     );
                 }
             }
