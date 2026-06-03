@@ -197,103 +197,6 @@ fn build_semantic_program_via_active_frontend(
     );
 }
 
-/// Step 6.E audit helper — count how many methods produced by the
-/// AST-side `parse::extract_trait_impls` /
-/// `parse::extract_inherent_impl_methods` are reachable through
-/// `program.functions`'s `self_ty_root` + `trait_root` indexing.
-///
-/// Prints a summary of the form `[ast-extract-audit] trait_methods=X
-/// covered=Y missing=N inherent=A covered=B missing=N` plus the
-/// first few missing entries.  Side-effect-only; the registration
-/// loop still consumes the existing `canonical_*` vectors.
-///
-/// Goal: prove `program.functions` is a superset of the extractors'
-/// output before the registration loop is re-routed to walk
-/// `program.functions` directly and the extractors retire.
-fn audit_ast_extract_coverage(
-    program: &front::SemanticProgram,
-    canonical_trait_impls: &[TraitImplInfo],
-    canonical_inherent_methods: &[parse::InherentMethodInfo],
-) {
-    use std::collections::HashSet;
-    // Index program.functions two ways:
-    //   - `impl_methods`: keyed by (owner, name) where owner is BOTH
-    //     the qualified self_ty_root ("pyframe::PyFrame") AND the
-    //     bare leaf ("PyFrame").  AST extract qualifies inherent
-    //     methods through `module_path` but emits trait-impl
-    //     owner as the bare type ident; the dual key absorbs the
-    //     asymmetry.
-    //   - `trait_defaults`: keyed by (trait_root, name).
-    let mut impl_methods: HashSet<(String, String)> = HashSet::new();
-    let mut trait_defaults: HashSet<(String, String)> = HashSet::new();
-    for f in &program.functions {
-        if let Some(owner) = &f.self_ty_root {
-            impl_methods.insert((owner.clone(), f.name.clone()));
-            let leaf = owner.rsplit("::").next().unwrap_or(owner.as_str());
-            if leaf != owner {
-                impl_methods.insert((leaf.to_string(), f.name.clone()));
-            }
-        }
-        if let Some(tr) = &f.trait_root {
-            if f.self_ty_root.is_none() {
-                trait_defaults.insert((tr.clone(), f.name.clone()));
-            }
-        }
-    }
-    let mut trait_total = 0usize;
-    let mut trait_missing: Vec<String> = Vec::new();
-    for ti in canonical_trait_impls {
-        // Concrete trait-impl methods (impl Trait for Type { … }) have
-        // `self_ty_root = Some("Type")` and look up via `impl_methods`.
-        // Trait-default bodies (collect_trait_impls_from_items's
-        // `Item::Trait` arm) have `self_ty_root = None` and
-        // `for_type = "<default methods of <Trait>>"`; map them to
-        // the `trait_defaults` index keyed by trait_name.
-        let is_default = ti.for_type.starts_with("<default methods of ");
-        for method in &ti.methods {
-            trait_total += 1;
-            let hit = if is_default {
-                trait_defaults.contains(&(ti.trait_name.clone(), method.name.clone()))
-            } else {
-                let impl_type = ti.self_ty_root.as_deref().unwrap_or(&ti.for_type);
-                impl_methods.contains(&(impl_type.to_string(), method.name.clone()))
-            };
-            if !hit {
-                let key_kind = if is_default { "default" } else { "impl" };
-                trait_missing.push(format!(
-                    "{}::{} ({key_kind})",
-                    ti.self_ty_root.as_deref().unwrap_or(&ti.for_type),
-                    method.name
-                ));
-            }
-        }
-    }
-    let mut inherent_total = 0usize;
-    let mut inherent_missing: Vec<String> = Vec::new();
-    for mi in canonical_inherent_methods {
-        inherent_total += 1;
-        let impl_type = mi.self_ty_root.as_deref().unwrap_or(&mi.for_type);
-        if !impl_methods.contains(&(impl_type.to_string(), mi.name.clone())) {
-            inherent_missing.push(format!("{}::{}", impl_type, mi.name));
-        }
-    }
-    eprintln!(
-        "[ast-extract-audit] trait_methods={trait_total} \
-         covered={} missing={} inherent={} covered={} missing={}",
-        trait_total - trait_missing.len(),
-        trait_missing.len(),
-        inherent_total,
-        inherent_total - inherent_missing.len(),
-        inherent_missing.len(),
-    );
-    for s in trait_missing.iter().take(10) {
-        eprintln!("  trait_missing: {s}");
-    }
-    for s in inherent_missing.iter().take(10) {
-        eprintln!("  inherent_missing: {s}");
-    }
-}
-
 /// Step 6.B: locate the workspace's `build/llbc/` directory and
 /// return paths to the canonical pyre LLBC artefacts when every
 /// expected file is present *and* the caller looks like a
@@ -863,43 +766,81 @@ fn analyze_pipeline_from_parsed(
         String,
     > = std::collections::HashMap::new();
 
-    // Slice 3.C/3.F/5: build the MIR-graph lookup once and feed it
-    // into both extract_* collectors so they consume the MIR-built
-    // graph directly.  AST graph builder is retired.
+    // Blocker B (#61/#62): source impl-method registration from the
+    // MIR-lowered `program.functions` instead of the syn
+    // `extract_trait_impls` / `extract_inherent_impl_methods`
+    // extractors.  Each `SemanticFunction` carries `self_ty_root` /
+    // `trait_root` (Slice 3.A/3.B) populated to the exact registration
+    // keys the extractors produced, so the downstream registration
+    // loops below are unchanged — only the source of the `canonical_*`
+    // vectors moves off the syn AST.
+    //
+    // Coverage was proven before the cutover (`PYRE_AST_EXTRACT_COVERAGE_AUDIT`):
+    // `program.functions` is a superset of every graph-carrying method
+    // the extractors emitted (inherent 417/417; trait 497/557).  The 60
+    // trait methods the extractors emitted with no graph are intentional
+    // non-JIT targets — `#[cfg(test)]` impls, `into_py` on primitive
+    // receivers Charon cannot key to an ADT, residual
+    // `PyreBlackholeAllocator::*` allocator hooks, std-trait impls
+    // (`Drop`/`From`/`PartialEq`/…), and `BoxEnv` default bodies MIR
+    // does not lower.  They registered no graph (so the BFS never
+    // reached them) and their `return_types` were redundant: a
+    // build-time cross-check (`PYRE_DECLARED_VS_CFG_KIND_AUDIT`) found
+    // zero impl methods whose declared return kind diverged from the
+    // CFG-scan result kind (`graph_result_kind` = `getkind(FUNC.RESULT)`,
+    // `codewriter.rs:656`), so dropping the side-table entries is a
+    // no-op for call-descriptor typing.
+    //
+    // `mir_graph_lookup` is still consulted by the registration loops
+    // below (trait-default vs concrete-impl graph fetch), so keep it.
     let mir_graph_lookup = front::semantic::MirGraphLookup::from_program(&program);
-    for parsed in parsed_files {
-        canonical_trait_impls.extend(
-            parse::extract_trait_impls(
-                parsed,
-                &program.struct_fields,
-                &program.known_struct_names,
-                Some(&mir_graph_lookup),
-            )
-            .expect("trait impls must lower without FlowingError"),
-        );
-        canonical_inherent_methods.extend(
-            parse::extract_inherent_impl_methods(
-                parsed,
-                &program.struct_fields,
-                &program.known_struct_names,
-                Some(&mir_graph_lookup),
-            )
-            .expect("inherent methods must lower without FlowingError"),
-        );
-    }
-    // Step 6.E audit (env-gated): measure how much of the AST-side
-    // `canonical_trait_impls` / `canonical_inherent_methods` surface
-    // is already covered by `program.functions`'s impl-method
-    // entries.  Goal — confirm we can route every registration the
-    // AST extractors do today through `program.functions` and retire
-    // the extractors.  Set `PYRE_AST_EXTRACT_COVERAGE_AUDIT=1` to
-    // emit a per-method diff to stderr.
-    if std::env::var("PYRE_AST_EXTRACT_COVERAGE_AUDIT").is_ok() {
-        audit_ast_extract_coverage(
-            &program,
-            &canonical_trait_impls,
-            &canonical_inherent_methods,
-        );
+    for func in &program.functions {
+        match (&func.self_ty_root, &func.trait_root) {
+            // Concrete trait-impl method: `impl Trait for Type { fn m }`.
+            (Some(owner), Some(trait_leaf)) => {
+                canonical_trait_impls.push(TraitImplInfo {
+                    trait_name: trait_leaf.clone(),
+                    for_type: owner.clone(),
+                    self_ty_root: Some(owner.clone()),
+                    methods: vec![MethodInfo {
+                        name: func.name.clone(),
+                        graph: Some(func.graph.clone()),
+                        return_type: func.return_type.clone(),
+                        hints: func.hints.clone(),
+                    }],
+                });
+            }
+            // Trait default-body: `trait T { fn m { … } }`.  The pseudo
+            // `for_type` matches the extractor's sentinel so the loop's
+            // `is_default` branch and the `call.rs` resolve-method
+            // filters keep distinguishing default from concrete impl.
+            (None, Some(trait_leaf)) => {
+                canonical_trait_impls.push(TraitImplInfo {
+                    trait_name: trait_leaf.clone(),
+                    for_type: format!("<default methods of {}>", trait_leaf),
+                    self_ty_root: None,
+                    methods: vec![MethodInfo {
+                        name: func.name.clone(),
+                        graph: Some(func.graph.clone()),
+                        return_type: func.return_type.clone(),
+                        hints: func.hints.clone(),
+                    }],
+                });
+            }
+            // Inherent method: `impl Type { fn m }`.
+            (Some(owner), None) => {
+                canonical_inherent_methods.push(parse::InherentMethodInfo {
+                    for_type: owner.clone(),
+                    self_ty_root: Some(owner.clone()),
+                    name: func.name.clone(),
+                    graph: func.graph.clone(),
+                    return_type: func.return_type.clone(),
+                    hints: func.hints.clone(),
+                });
+            }
+            // Free function — registered by the dedicated loop below.
+            (None, None) => {}
+        }
     }
     // RPython: use the rtyped graphs (with concretetype info) for all analysis.
     // Use program.functions' graphs which were built with full struct_fields
