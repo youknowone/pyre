@@ -121,9 +121,11 @@ mod deque_class {
 
 /// `pypy/module/_collections/interp_defaultdict.py` — `W_DefaultDict`
 /// stub backed by an inner dict at `self.__data__` plus
-/// `self.default_factory`.  Factory invocation on missing key is
-/// short-circuited to `w_none()` because callable invocation needs
-/// frame-level plumbing the macro can't yet express.
+/// `self.default_factory`.  A missing key invokes `default_factory` and
+/// stores the result (`W_DefaultDict.missing`); a missing key with no
+/// factory raises `KeyError(key)`.  Still a stub vs upstream: this type
+/// subclasses `object`, not `dict`, so `isinstance(d, dict)` is False, and
+/// `__missing__`/`__repr__`/`copy`/`__reduce__` are absent.
 mod defaultdict_class {
     use super::*;
 
