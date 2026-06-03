@@ -125,8 +125,29 @@ pub struct VariantDecl {
     pub name: String,
     #[serde(default)]
     pub fields: Vec<FieldDecl>,
+    /// Charon-assigned discriminant, kept raw because its scalar width
+    /// varies by enum (`{"Scalar":{"Unsigned":["U8","128"]}}` for
+    /// `Instruction`, `{"Scalar":{"Signed":["Isize","0"]}}` for others).
+    /// Read via [`VariantDecl::discriminant_i64`]; staying [`Value`]
+    /// keeps deserialization total under the schema-drift policy.
+    #[serde(default)]
+    pub discriminant: Option<Value>,
     #[serde(flatten)]
     pub rest: std::collections::BTreeMap<String, Value>,
+}
+
+impl VariantDecl {
+    /// Parse the discriminant to `i64` from the Charon
+    /// `{"Scalar":{"Signed"|"Unsigned":[width, decimal_string]}}` shape.
+    /// Returns `None` for an absent, non-scalar, or unparseable
+    /// discriminant rather than failing — callers that need the value
+    /// for an enum known to carry integer discriminants assert presence
+    /// at the use site.
+    pub fn discriminant_i64(&self) -> Option<i64> {
+        let scalar = self.discriminant.as_ref()?.get("Scalar")?;
+        let pair = scalar.get("Unsigned").or_else(|| scalar.get("Signed"))?;
+        pair.get(1)?.as_str()?.parse::<i64>().ok()
+    }
 }
 
 /// Trait declaration — referenced when populating

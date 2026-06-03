@@ -213,6 +213,13 @@ pub struct SemanticProgram {
     /// the same lookup logic works across module-prefix variants.  Rank
     /// encoding follows `rpython/rtyper/rclass.py:644-678 _parse_field_list`.
     pub immutable_fields: HashMap<String, Vec<(String, ImmutableRank)>>,
+    /// Enum discriminant → variant name, keyed by enum type (both the
+    /// qualified path and the bare leaf, mirroring `struct_fields`).
+    /// The opcode-dispatch MIR extractor reads
+    /// `enum_variant_by_discriminant["Instruction"]` to turn a switch
+    /// case value (`ExitCase::Const(Int(K))`, the variant discriminant —
+    /// which is *not* the variant index) back into the variant name.
+    pub enum_variant_by_discriminant: HashMap<String, HashMap<i64, String>>,
 }
 
 /// Step 6.E Slice 3.C — graph lookup table built from a
@@ -440,6 +447,7 @@ mod tests {
             known_trait_names: Default::default(),
             struct_fields: StructFieldRegistry::default(),
             immutable_fields: Default::default(),
+            enum_variant_by_discriminant: Default::default(),
         }
     }
 

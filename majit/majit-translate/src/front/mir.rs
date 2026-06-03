@@ -188,6 +188,11 @@ pub fn build_semantic_program_from_llbcs(
                 for (key, fields) in prog.struct_fields.fields {
                     acc.struct_fields.fields.entry(key).or_insert(fields);
                 }
+                for (enum_key, by_discr) in prog.enum_variant_by_discriminant {
+                    acc.enum_variant_by_discriminant
+                        .entry(enum_key)
+                        .or_insert(by_discr);
+                }
             }
         }
     }
@@ -198,6 +203,7 @@ pub fn build_semantic_program_from_llbcs(
             known_trait_names: std::collections::HashSet::new(),
             struct_fields: crate::front::semantic::StructFieldRegistry::default(),
             immutable_fields: std::collections::HashMap::new(),
+            enum_variant_by_discriminant: std::collections::HashMap::new(),
         }),
     )
 }
@@ -226,7 +232,8 @@ pub fn build_semantic_program_from_llbc(
     llbc: &Llbc,
 ) -> Result<crate::front::semantic::SemanticProgram, LowerError> {
     // ── Pass 1: walk type_decls + trait_decls (Step 4.3.b) ────────
-    let (known_struct_names, known_trait_names, struct_fields) = derive_program_metadata(llbc);
+    let (known_struct_names, known_trait_names, struct_fields, enum_variant_by_discriminant) =
+        derive_program_metadata(llbc);
 
     // ── Pass 2: lower every function body and build SemanticFunctions ─
     let mut functions = Vec::new();
@@ -342,6 +349,7 @@ pub fn build_semantic_program_from_llbc(
         // (the `attributes` array carries DocComment / Outer but not our
         // proc-macro hints). Tracked under Step 4.3.d.
         immutable_fields: std::collections::HashMap::new(),
+        enum_variant_by_discriminant,
     })
 }
 
@@ -349,7 +357,8 @@ pub fn build_semantic_program_from_llbc(
 /// `SemanticProgram` from Charon's `type_decls` + `trait_decls`
 /// tables.
 ///
-/// Returns `(known_struct_names, known_trait_names, struct_fields)`.
+/// Returns `(known_struct_names, known_trait_names, struct_fields,
+/// enum_variant_by_discriminant)`.
 /// Names are taken from `item_meta.name_path()`; struct field rows
 /// resolve their type string via [`tyref_to_ast_string`] (Charon-resolved
 /// types: references stripped, raw pointers kept, `Vec<T>` / `[T;N]`
@@ -360,10 +369,15 @@ fn derive_program_metadata(
     std::collections::HashSet<String>,
     std::collections::HashSet<String>,
     crate::front::semantic::StructFieldRegistry,
+    std::collections::HashMap<String, std::collections::HashMap<i64, String>>,
 ) {
     let mut known_struct_names = std::collections::HashSet::new();
     let mut known_trait_names = std::collections::HashSet::new();
     let mut struct_fields = crate::front::semantic::StructFieldRegistry::default();
+    let mut enum_variant_by_discriminant: std::collections::HashMap<
+        String,
+        std::collections::HashMap<i64, String>,
+    > = std::collections::HashMap::new();
 
     for td in llbc.iter_type_decls() {
         let name = td.item_meta.name_path();
@@ -394,10 +408,22 @@ fn derive_program_metadata(
                 // emitted by Step 3.9 can be matched downstream.
                 let leaf = name.rsplit("::").next().unwrap_or(&name).to_string();
                 known_struct_names.insert(name.clone());
-                known_struct_names.insert(leaf);
+                known_struct_names.insert(leaf.clone());
+                // discriminant → variant name, published under both the
+                // qualified path and the bare leaf so the opcode-dispatch
+                // extractor can resolve by either spelling.
+                let mut by_discr: std::collections::HashMap<i64, String> =
+                    std::collections::HashMap::new();
                 for v in variants {
                     let variant_path = format!("{name}::{}", v.name);
                     known_struct_names.insert(variant_path);
+                    if let Some(d) = v.discriminant_i64() {
+                        by_discr.insert(d, v.name.clone());
+                    }
+                }
+                if !by_discr.is_empty() {
+                    enum_variant_by_discriminant.insert(name.clone(), by_discr.clone());
+                    enum_variant_by_discriminant.insert(leaf, by_discr);
                 }
             }
             TypeDeclKind::Alias(_) | TypeDeclKind::Opaque | TypeDeclKind::Unknown => {}
@@ -411,7 +437,12 @@ fn derive_program_metadata(
         known_trait_names.insert(leaf);
     }
 
-    (known_struct_names, known_trait_names, struct_fields)
+    (
+        known_struct_names,
+        known_trait_names,
+        struct_fields,
+        enum_variant_by_discriminant,
+    )
 }
 
 /// Lower a single Charon [`FunDecl`] to a [`FunctionGraph`].

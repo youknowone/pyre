@@ -183,3 +183,44 @@ fn semantic_program_builder_lowers_every_corpus_function() {
     );
     assert!(program.known_struct_names.contains("Token"));
 }
+
+#[test]
+fn enum_variant_by_discriminant_round_trips_against_variant_paths() {
+    // P1 (opcode-dispatch MIR plumbing): the discriminant→variant-name
+    // map must parse Charon's `{"Scalar":{"Signed"|"Unsigned":[w,"K"]}}`
+    // discriminants and key each enum under both its qualified path and
+    // bare leaf. Validate against the corpus' Strategy enum without
+    // hard-coding variant counts: every name the map produced must have
+    // a matching `Strategy::<name>` variant path in known_struct_names,
+    // and the leaf key must mirror the qualified key.
+    let llbc = load_corpus();
+    let program = build_semantic_program_from_llbc(&llbc).expect("builder");
+
+    let by_leaf = program
+        .enum_variant_by_discriminant
+        .get("Strategy")
+        .expect("Strategy discriminant map present under bare leaf");
+    assert!(!by_leaf.is_empty(), "Strategy must carry discriminants");
+
+    // Discriminant 0 .. N-1 are distinct (HashMap keys) and every value
+    // names a real Strategy variant.
+    for name in by_leaf.values() {
+        let path = format!("charon_spike_corpus::Strategy::{name}");
+        assert!(
+            program.known_struct_names.contains(&path),
+            "discriminant map produced {name:?} with no matching variant path {path:?}"
+        );
+    }
+    // At least the variant the sibling test pins must round-trip.
+    assert!(
+        by_leaf.values().any(|n| n == "IntKeyed"),
+        "expected IntKeyed among Strategy discriminants, got {by_leaf:?}"
+    );
+
+    // Qualified-path key mirrors the bare-leaf key.
+    let by_qualified = program
+        .enum_variant_by_discriminant
+        .get("charon_spike_corpus::Strategy")
+        .expect("Strategy discriminant map present under qualified path");
+    assert_eq!(by_leaf, by_qualified, "leaf and qualified maps must match");
+}
