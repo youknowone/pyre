@@ -224,3 +224,74 @@ fn enum_variant_by_discriminant_round_trips_against_variant_paths() {
         .expect("Strategy discriminant map present under qualified path");
     assert_eq!(by_leaf, by_qualified, "leaf and qualified maps must match");
 }
+
+#[test]
+fn front_graph_carries_no_synthesized_exception_edges() {
+    // Reviewer #63 (points 2/3): the MIR driver drops every Call / Assert
+    // / Drop `on_unwind` successor (a Rust panic-cleanup path) and routes
+    // only to the success continuation, because Python exceptions ride the
+    // `Result<_, PyError>` Switch/Return edges as ordinary control flow —
+    // never a Rust unwind. Lock that structurally on the FRONT flow graph
+    // (NOT the jitcode, where can-raise is re-derived op-locally as
+    // guard_no_exception and is orthogonally correct):
+    //
+    //   A. No lowered block carries a `LastException` exitswitch — the
+    //      driver never synthesizes a typed try/except handler dispatch.
+    //   B. Every edge into the canonical exceptblock is a bare
+    //      panic-propagation raise (`UnwindResume` / `Abort` -> set_raise),
+    //      so the count of blocks linking to the exceptblock equals the
+    //      count of `UnwindResume` / `Abort` MIR terminators. A Call /
+    //      Assert / Drop success block contributes zero such edges.
+    use majit_charon_reader::ullbc::{TermKind, Unstructured};
+    use majit_translate::front::mir::lower_fun_decl;
+    use majit_translate::model::ExitSwitch;
+
+    let llbc = load_corpus();
+    let mut checked = 0usize;
+    for fd in llbc.iter_local_fns() {
+        let Some(body): Option<Unstructured> = fd.unstructured() else {
+            continue;
+        };
+        let Ok(graph) = lower_fun_decl(&llbc, fd) else {
+            continue;
+        };
+
+        // Invariant A.
+        for b in &graph.blocks {
+            assert!(
+                b.exitswitch != Some(ExitSwitch::LastException),
+                "{}: block {:?} carries a LastException exitswitch — a typed \
+                 exception-handler edge was synthesized; the MIR driver must \
+                 drop on_unwind, not lower it as try/except",
+                graph.name,
+                b.id,
+            );
+        }
+
+        // Invariant B.
+        let raises_in_mir = body
+            .body
+            .iter()
+            .filter(|blk| {
+                matches!(blk.term(), Ok(TermKind::UnwindResume) | Ok(TermKind::Abort(_)))
+            })
+            .count();
+        let edges_into_exceptblock = graph
+            .blocks
+            .iter()
+            .filter(|b| b.exits.iter().any(|l| l.target == graph.exceptblock))
+            .count();
+        assert_eq!(
+            edges_into_exceptblock, raises_in_mir,
+            "{}: {} block(s) link to the exceptblock but the MIR has {} \
+             UnwindResume/Abort terminator(s) — a Call/Assert/Drop on_unwind \
+             edge leaked into the front graph",
+            graph.name, edges_into_exceptblock, raises_in_mir,
+        );
+        checked += 1;
+    }
+    assert!(
+        checked >= 4,
+        "expected to lower at least the 4 corpus shapes, got {checked}",
+    );
+}

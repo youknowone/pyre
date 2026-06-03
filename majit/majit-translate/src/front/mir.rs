@@ -222,12 +222,24 @@ pub fn build_semantic_program_from_llbcs(
 /// `immutable_fields` stays empty until the `#[majit_macros::immutable]`
 /// attribute is surfaced by Charon (Step 4.3.d).
 ///
-/// Functions whose body Charon could not extract (extraction error,
-/// opaque body, `null` entry) are skipped silently — the production
-/// pipeline relies on `lib.rs`-level coverage audits to flag missing
-/// graphs.  Functions whose MIR shape the driver does not yet handle
-/// produce a [`LowerError`] that propagates out: the function-level
-/// failure model from [`lower_function`] applies unchanged.
+/// Functions Charon could not extract (opaque body / `null` entry) or
+/// global-initializer bodies are skipped silently — they are not JIT
+/// call targets.  A function whose MIR shape the driver cannot yet lower
+/// produces a [`LowerError`] that is captured per-function: a recognised,
+/// tracked gap (the uninitialised-local-read shape) degrades the program
+/// by dropping that one function, while any *unrecognised* lowering
+/// failure fails the whole-program build (the coverage gate at the end of
+/// this function) so a lowering regression cannot pass silently.
+fn is_known_lowering_gap(msg: &str) -> bool {
+    // The only MIR shape the driver does not yet lower but which is an
+    // accepted, tracked degradation rather than a regression: a body that
+    // reads a MIR local on a path the driver has not proven dominated by
+    // an `Assign` (`read of MIR local N before any Assign`). A handful of
+    // cold interpreter / object functions hit it; they become residual
+    // calls, never a correctness loss.
+    msg.contains("uninitialised local")
+}
+
 pub fn build_semantic_program_from_llbc(
     llbc: &Llbc,
 ) -> Result<crate::front::semantic::SemanticProgram, LowerError> {
@@ -330,13 +342,39 @@ pub fn build_semantic_program_from_llbc(
             trait_root,
         });
     }
-    if std::env::var("PYRE_MIR_FRONTEND_DEBUG").is_ok() && !skipped.is_empty() {
-        eprintln!(
-            "[mir-frontend] {} function(s) skipped during lowering:",
-            skipped.len()
-        );
-        for (name, msg) in skipped.iter().take(20) {
-            eprintln!("  {name}: {msg}");
+    // Coverage gate. Every `skipped` entry is a function whose MIR shape
+    // the driver could not lower. The single known, tracked gap is the
+    // "uninitialised local read" shape; those degrade the program by
+    // dropping the one (cold) function, which becomes a residual call —
+    // never a correctness loss. Any *other* lowering failure is a coverage
+    // regression that must not pass silently, so fail the whole-program
+    // build with the offending list. This is the fail-loud successor to
+    // the since-removed `lib.rs` coverage audit.
+    if !skipped.is_empty() {
+        let (tracked, regressions): (Vec<_>, Vec<_>) =
+            skipped.iter().partition(|(_, msg)| is_known_lowering_gap(msg));
+        if std::env::var("PYRE_MIR_FRONTEND_DEBUG").is_ok() && !tracked.is_empty() {
+            eprintln!(
+                "[mir-frontend] {} function(s) skipped via the tracked \
+                 uninitialised-local gap:",
+                tracked.len()
+            );
+            for (name, msg) in tracked.iter().take(20) {
+                eprintln!("  {name}: {msg}");
+            }
+        }
+        if !regressions.is_empty() {
+            let mut detail = String::new();
+            for (name, msg) in &regressions {
+                detail.push_str(&format!("\n  - {name}: {msg}"));
+            }
+            return Err(LowerError::Unsupported(format!(
+                "MIR lowering coverage regression: {} function(s) failed to lower with \
+                 an unrecognised error (not the tracked uninitialised-local gap). Fix the \
+                 lowering, or extend `is_known_lowering_gap` if the new shape is \
+                 intentionally unsupported:{detail}",
+                regressions.len()
+            )));
         }
     }
     Ok(crate::front::semantic::SemanticProgram {
@@ -628,10 +666,14 @@ impl<'a> Lowering<'a> {
             // The JIT does not need to materialize anything.
             StmtKind::PlaceMention(_) => Ok(()),
 
-            // Inline overflow assertion — see issue #97 prototype README
-            // §"Deltas worth calling out" §4. We strip these for now;
-            // a future widening can honour them when interpreter
-            // semantics require panic-on-overflow.
+            // Statement-level Rust overflow / bounds assertion. Current
+            // Charon emits every assert as a *terminator* (`TermKind::Assert`,
+            // handled in `lower_terminator`), so this arm is unreached in
+            // the present corpus; it is kept as defensive handling for the
+            // older paired `Assign(AddChecked) + Assert(!overflow)` shape.
+            // Stripping is correct either way — same rationale as the
+            // terminator arm: a Rust-debug check with no Python-observable
+            // meaning.
             StmtKind::Assert(_) => Ok(()),
 
             StmtKind::Assign(place, rvalue) => self.lower_assign(mir_bb, place, rvalue),
@@ -1375,9 +1417,13 @@ impl<'a> Lowering<'a> {
                 Ok(())
             }
             TermKind::UnwindResume | TermKind::Abort(_) => {
-                // Close the block as exception-propagating. The AST
-                // driver uses `set_raise` with a static reason; mirror
-                // that until the typed exception lowering pass lands.
+                // Rust panic propagation (unwind-table cleanup / abort).
+                // No RPython analogue — RPython models neither destructors
+                // nor a Rust-panic catch — so close the block as a bare
+                // exception propagation into the canonical exceptblock.
+                // Python-level exceptions never reach here: they ride the
+                // `Result<_, PyError>` Switch/Return edges as ordinary
+                // control flow.
                 self.graph.set_raise(bb_id, "mir-unwind");
                 Ok(())
             }
@@ -1394,13 +1440,17 @@ impl<'a> Lowering<'a> {
             TermKind::Assert {
                 target, on_unwind, ..
             } => {
-                // Inline overflow assertion at terminator level —
-                // strip it: branch unconditionally to the success
-                // continuation. The unwind successor (which always
-                // ends in UnwindResume in extracted bodies) becomes
-                // unreachable from us. This mirrors the policy
-                // documented in `prototype/README.md` §"Deltas
-                // worth calling out" §4.
+                // A Rust-level overflow / bounds / division-by-zero check
+                // whose `on_unwind` successor is a bare UnwindResume panic
+                // path. These are debug-build artifacts release builds
+                // elide, with no Python-observable meaning: Python ints are
+                // arbitrary-precision (no machine OverflowError), and any
+                // IndexError / ZeroDivisionError is produced by an explicit
+                // value-level guard that lowers to a `Result` Switch and is
+                // already carried by the ArrayRead / BinOp op's canraise.
+                // Strip the check — branch unconditionally to the success
+                // continuation — leaving the panic path unreachable.
+                // RPython does the same (`backendopt/removeassert.py`).
                 let _ = on_unwind;
                 let target_bb = self.block_id[target as usize];
                 self.graph.set_goto(bb_id, target_bb, vec![]);
@@ -1577,12 +1627,17 @@ impl<'a> Lowering<'a> {
             kind: op_kind,
         });
 
-        // Close the block: forward to the success target. The unwind
-        // continuation feeds the exceptblock — under current policy we
-        // do not wire a separate exception edge because the AST driver
-        // also collapses post-call unwinds to the function's single
-        // `exceptblock` and we have not yet introduced typed exception
-        // links here. Tracked under Step 3.6 follow-up.
+        // Close the block: forward to the success target. The call's
+        // `on_unwind` successor is a Rust panic-cleanup path (destructor
+        // drop-glue terminating in UnwindResume / Abort) with no Python
+        // meaning — a Python exception raised by the callee rides the
+        // SUCCESS edge as a `Result::Err` value, matched downstream as
+        // ordinary control flow, not this unwind edge. The residual-call
+        // `guard_no_exception` is re-derived op-locally from the callee
+        // graph (`jit_codewriter/call.rs` `_canraise`), so dropping the
+        // front-graph unwind edge keeps the can-raise signal. A real
+        // try/except handler would need a `LastException` edge here; the
+        // interpreter expresses exceptions as `Result`, so none arises.
         let _ = on_unwind;
         let target_bb = self.block_id[target];
         self.graph.set_goto(bb_id, target_bb, vec![]);
