@@ -1010,6 +1010,32 @@ unsafe fn needs_seq_binop_dispatch(
         || dunder_overridden(b, rev, t)
 }
 
+/// `bytes`/`bytearray` analog of `needs_seq_binop_dispatch`.  The two
+/// builtin types share one `+` branch, so each operand is judged against
+/// its own builtin base (`bytes` vs `bytearray`).  `dont_look_inside`
+/// keeps the base type-static loads in the residual call, off the traced
+/// `add` graph.
+#[majit_macros::dont_look_inside]
+unsafe fn needs_bytes_binop_dispatch(a: PyObjectRef, b: PyObjectRef, fwd: &str, rev: &str) -> bool {
+    bytes_operand_overrides(a, fwd, rev) || bytes_operand_overrides(b, fwd, rev)
+}
+
+/// True when `obj`'s type overrides `fwd`/`rev` relative to its builtin
+/// base (`bytes` or `bytearray`).  Only reached from the residual
+/// `needs_bytes_binop_dispatch`, so the type-static loads never enter a
+/// traced graph.
+unsafe fn bytes_operand_overrides(obj: PyObjectRef, fwd: &str, rev: &str) -> bool {
+    let tp: *const pyre_object::PyType = if pyre_object::bytesobject::is_bytes(obj) {
+        &pyre_object::bytesobject::BYTES_TYPE
+    } else {
+        &pyre_object::bytearrayobject::BYTEARRAY_TYPE
+    };
+    let Some(t) = crate::typedef::gettypefor(tp) else {
+        return false;
+    };
+    dunder_overridden(obj, fwd, t) || dunder_overridden(obj, rev, t)
+}
+
 pub fn add(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let a = unwrap_cell(a);
     let b = unwrap_cell(b);
@@ -1052,6 +1078,11 @@ pub fn add(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         }
         if pyre_object::bytesobject::is_bytes_like(a) && pyre_object::bytesobject::is_bytes_like(b)
         {
+            if needs_bytes_binop_dispatch(a, b, "__add__", "__radd__") {
+                if let Some(result) = try_dispatch_binary_special(a, b, "__add__", "__radd__")? {
+                    return Ok(result);
+                }
+            }
             let a_data = pyre_object::bytesobject::bytes_like_data(a);
             let b_data = pyre_object::bytesobject::bytes_like_data(b);
             let mut result = a_data.to_vec();
