@@ -222,10 +222,11 @@ pub fn arena_global_info_dynasm() -> majit_backend_dynasm::JitFrameLayoutInfo {
 
 const ARENA_CAP: usize = 64;
 
-/// PyPy GcStruct layout: [GcHeader (8 bytes)] [struct fields].
+/// GcStruct layout: [GcHeader (8 bytes)] [struct fields].
 /// Every GC object (including PyFrame / W_Root) is prepended by a
 /// zeroed GcHeader. Arena slots and heap fallbacks match this layout.
-const GC_HEADER_SIZE: usize = 8;
+/// Single source of truth: [`majit_gc::header::GcHeader::SIZE`].
+const GC_HEADER_SIZE: usize = majit_gc::header::GcHeader::SIZE;
 
 /// Arena slot with prepended GcHeader (zeroed, layout parity only).
 #[repr(C)]

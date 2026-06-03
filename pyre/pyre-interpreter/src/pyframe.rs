@@ -135,36 +135,13 @@ pub struct PyFrame {
 /// drift panics on startup.
 pub const PYFRAME_GC_TYPE_ID: u32 = 37;
 
-/// GC header size in bytes.  Matches `majit_gc::header::GcHeader::SIZE`.
-/// Every PyObjectArray and PyFrame allocation prepends this many zero bytes
-/// so that RPython-style write barriers (`*(obj + wb_byteofs) & mask`) read a
-/// valid header with `TRACK_YOUNG_PTRS=0` and skip the slow path.
-pub const GC_HEADER_SIZE: usize = 8;
-
-/// Allocate a value of type `T` with a zeroed GC header prepended.
-///
-/// incminimark write barrier reads at `obj - HEADER_SIZE`;
-/// zeroed header => `TRACK_YOUNG_PTRS` clear => barrier fast-path skips.
-///
-/// RPython objects are GC-managed references. The frame holds non-owning
-/// pointers; the GC (or, in pyre's simplified model, the allocator) owns
-/// the allocation. Never manually free pointers returned by this function
-/// from frame code — that would violate the GC ref contract and cause
-/// dangling pointers when the JIT captures these refs in snapshots.
-unsafe fn alloc_with_gc_header<T>(value: T) -> *mut T {
-    unsafe {
-        let total = GC_HEADER_SIZE + std::mem::size_of::<T>();
-        let align = std::mem::align_of::<T>().max(8);
-        let layout = std::alloc::Layout::from_size_align(total, align).unwrap();
-        let raw = std::alloc::alloc_zeroed(layout);
-        if raw.is_null() {
-            std::alloc::handle_alloc_error(layout);
-        }
-        let ptr = raw.add(GC_HEADER_SIZE) as *mut T;
-        std::ptr::write(ptr, value);
-        ptr
-    }
-}
+/// GC header size in bytes — single source of truth is
+/// [`majit_gc::header::GcHeader::SIZE`]. Every `FixedObjectArray` and
+/// `PyFrame` allocation prepends this many zero bytes so RPython-style
+/// write barriers (`*(obj + wb_byteofs) & mask`) read a valid header with
+/// `TRACK_YOUNG_PTRS=0` and skip the slow path. Scalar `value`
+/// allocations route through [`majit_gc::header::alloc_with_gc_header`].
+pub const GC_HEADER_SIZE: usize = majit_gc::header::GcHeader::SIZE;
 
 /// Allocation size (in bytes, including the GC header) for a
 /// `FixedObjectArray` of the given length.
@@ -182,8 +159,8 @@ fn fixed_array_layout(len: usize) -> std::alloc::Layout {
 
 /// Allocate a fixed-length GcArray-shaped `FixedObjectArray` with all
 /// slots initialised to `fill`. The allocation is prefixed with a
-/// zeroed GC header (same convention as [`alloc_with_gc_header`]) so the
-/// write barrier fast-path sees `TRACK_YOUNG_PTRS=0`.
+/// zeroed GC header ([`GC_HEADER_SIZE`] bytes) so the write barrier
+/// fast-path sees `TRACK_YOUNG_PTRS=0`.
 ///
 /// The returned pointer points at the length prefix; items follow
 /// immediately in memory at `FIXED_ARRAY_ITEMS_OFFSET` — matching
