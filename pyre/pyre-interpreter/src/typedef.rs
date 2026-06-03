@@ -3251,7 +3251,37 @@ fn register_dict_view_set_operators(ns: &mut DictStorage) {
     }
 }
 
+/// `dictproxyobject.py:20 descr_new(space, w_type, w_mapping)` — wrap a
+/// mapping (exposes `__getitem__`, not a list/tuple) in a read-only
+/// proxy.  `types.MappingProxyType(d)` (`type(type.__dict__)(d)`)
+/// resolves here; without it the type-call fell through to the default
+/// `object.__new__`, producing a proxy with an empty/NULL mapping.
+fn mappingproxy_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    // args[0] = cls, args[1] = mapping.
+    let w_mapping = match args.get(1) {
+        Some(&m) if !m.is_null() => m,
+        _ => {
+            return Err(crate::PyError::type_error(
+                "mappingproxy() missing required argument 'mapping' (pos 1)",
+            ));
+        }
+    };
+    let has_getitem = r#type(w_mapping)
+        .map(|t| unsafe { crate::baseobjspace::lookup_in_type(t, "__getitem__") }.is_some())
+        .unwrap_or(false);
+    let is_seq = unsafe { pyre_object::is_list(w_mapping) || pyre_object::is_tuple(w_mapping) };
+    if !has_getitem || is_seq {
+        let tp = unsafe { (*(*w_mapping).ob_type).name };
+        return Err(crate::PyError::type_error(format!(
+            "mappingproxy() argument must be a mapping, not {tp}"
+        )));
+    }
+    Ok(pyre_object::w_dict_proxy_new(w_mapping))
+}
+
 fn init_mappingproxy_type(ns: &mut DictStorage) {
+    // dictproxyobject.py:105 __new__=interp2app(descr_new)
+    dict_storage_store(ns, "__new__", make_new_descr(mappingproxy_descr_new));
     // dictproxyobject.py:32 descr_len → space.len(self.w_mapping)
     dict_storage_store(
         ns,
