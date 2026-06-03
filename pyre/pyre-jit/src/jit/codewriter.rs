@@ -1322,6 +1322,56 @@ fn collect_cfg_coalesce_pairs(
     pairs
 }
 
+/// #254: coalesce pairs that force every Variable the walker pinned to
+/// one frame slot onto a single canonical color.
+///
+/// `walker_slot_for_variable[v.id]` records the frame slot the walker
+/// assigned each Ref Variable.  The canonical graph regalloc colors by
+/// SSA graph-lifetime Variable, so distinct Variables that share a slot
+/// (successive LOAD_FAST/STORE_FAST scratch, stack-slot reuse across a
+/// loop) receive distinct colors.  The dense per-slot resume map
+/// (`stack_slot_color_map` / `pyre_color_for_semantic_local`) holds only
+/// ONE color per slot, so a multi-color slot yields an ambiguous
+/// `slot → color` inverse — the `[flatten-splice-color] conflicts` the
+/// #280 splice surfaced.
+///
+/// Emitting `(first, other)` pairs per slot group requests the regalloc
+/// pre-merge them in `perform_register_allocation_with_pairs`, so each
+/// slot's Variables land on one color and the inverse is unambiguous.
+/// The merge is coalesce-safe: the walker's own slot-numbered coloring
+/// proves a frame slot holds exactly one live value at a time
+/// (STORE_FAST / pop kills the prior occupant), so the per-slot live
+/// ranges are disjoint and never interfere.
+///
+/// Restricted to Ref Variables via the Ref-coloring membership test —
+/// `walker_slot_for_variable` only tracks Ref slots, and
+/// `perform_register_allocation_all_kinds_with_pairs` applies pairs to
+/// the Ref kind only.
+fn collect_same_slot_coalesce_pairs(
+    walker_slot_for_variable: &[Option<u16>],
+    ref_coloring: &HashMap<super::flow::VariableId, u16>,
+) -> Vec<(super::flow::VariableId, super::flow::VariableId)> {
+    let Some(max_slot) = walker_slot_for_variable.iter().flatten().copied().max() else {
+        return Vec::new();
+    };
+    let mut first_for_slot: Vec<Option<super::flow::VariableId>> = vec![None; max_slot as usize + 1];
+    let mut pairs = Vec::new();
+    for (vid, slot) in walker_slot_for_variable.iter().enumerate() {
+        let Some(slot) = *slot else { continue };
+        let vid = super::flow::VariableId(vid as u32);
+        // Ref-kind only: a Variable appears in the Ref coloring iff
+        // `perform_register_allocation` colored it as Ref.
+        if !ref_coloring.contains_key(&vid) {
+            continue;
+        }
+        match first_for_slot[slot as usize] {
+            None => first_for_slot[slot as usize] = Some(vid),
+            Some(first) => pairs.push((first, vid)),
+        }
+    }
+    pairs
+}
+
 /// Walker post-walk `insert_renamings` — port of
 /// `rpython/jit/codewriter/flatten.py:306-334`.
 ///
@@ -9862,7 +9912,28 @@ impl CodeWriter {
             [super::regalloc::GraphAllocationResult; 3],
         )> = if std::env::var("PYRE_FLATTEN_SPLICE").is_ok() {
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let mut splice_regallocs = graph_regallocs.clone();
+                // #254: build the splice regalloc FRESH with same-slot
+                // coalescing so each frame slot maps to exactly one
+                // canonical color (the dense per-slot resume map below
+                // cannot address multi-color slots).  Re-running regalloc
+                // with the merged pairs lets the chordal coloring
+                // re-optimize the surrounding Variables around the forced
+                // merges — a naive post-hoc color rewrite would not, and
+                // could collide a merged slot's color with an interfering
+                // neighbour.  Kept separate from production
+                // `graph_regallocs` (the gate-off path) so gate-off stays
+                // byte-identical.
+                let same_slot_pairs = collect_same_slot_coalesce_pairs(
+                    &walker_slot_for_variable,
+                    &graph_regallocs[Kind::Ref.index()].coloring,
+                );
+                let mut splice_pairs = cfg_variable_pairs.clone();
+                splice_pairs.extend_from_slice(&same_slot_pairs);
+                let mut splice_regallocs =
+                    super::regalloc::perform_register_allocation_all_kinds_with_pairs(
+                        &graph,
+                        &splice_pairs,
+                    );
                 let ssarepr = super::flatten::flatten_graph(
                     &graph,
                     &mut splice_regallocs,
@@ -10288,30 +10359,46 @@ impl CodeWriter {
                 Some((s, d))
             })
             .collect();
-        let alloc_result = super::regalloc::allocate_registers(
-            &ssarepr,
-            code.varnames.len(),
-            inputs,
-            &cfg_coalesce_pairs,
-        );
-        // Run graph-side
-        // `perform_register_allocation_all_kinds` +
-        // `enforce_input_args` post-walker on every
-        // production graph, matching upstream `codewriter.py:44-46`'s
-        // pre-flatten regalloc step.  The result is not consumed yet —
-        // The `(Kind, slot) → color` bridge map that
-        // the 5 SSA-side `alloc_result` consumers below currently rely
-        // on; the source of truth will be swapped later.  Running the
-        // graph-side allocator unconditionally first surfaces any
-        // graph topology that the allocator can't process before any
-        // downstream code reads from it.
+        // #254/#280: a spliced body is ALREADY final-colored by
+        // `splice_regallocs` (canonical graph-lifetime colors, post
+        // `enforce_input_args`).  Re-running the SSA-side
+        // `allocate_registers` would impose a SECOND coloring whose
+        // `enforce_ssarepr_input_args` color-monotonicity invariant
+        // (regalloc.rs:824) the canonical coloring need not satisfy, and
+        // whose recolor would desync the body from the resume maps and
+        // the live-marker kind split (`materialize_virtual_int`
+        // mismatch).  For spliced graphs adopt `splice_regallocs` as the
+        // SOLE authority: identity rename (so `apply_rename` is skipped
+        // and `rename_lookup` below returns each slot's canonical color
+        // unchanged) and `num_regs` from `splice_regallocs.num_colors`.
+        // The #254 same-slot coalescing guarantees the dense per-slot
+        // resume maps built from these colors are unambiguous.
         //
-        // `graph_regallocs` is computed earlier
-        // (pre-drain) so walker insert_renamings shares the same
-        // colors as canonical's pass below.  The duplicate compute is
-        // retired; we reuse the shared instance.
-
-        super::regalloc::apply_rename(&mut ssarepr, &alloc_result.rename);
+        // The walker (non-spliced) path keeps `codewriter.py:44-46`'s
+        // post-walk `allocate_registers` + `apply_rename`; the
+        // `graph_regallocs` it shares with `walker_post_walk_insert_
+        // renamings` are computed pre-drain so colors agree.
+        let alloc_result = if let (true, Some((_, splice_regallocs))) =
+            (did_splice, canonical_for_splice.as_ref())
+        {
+            super::regalloc::AllocationResult {
+                rename: [Vec::new(), Vec::new(), Vec::new()],
+                num_regs: [
+                    splice_regallocs[super::flatten::Kind::Int.index()].num_colors,
+                    splice_regallocs[super::flatten::Kind::Ref.index()].num_colors,
+                    splice_regallocs[super::flatten::Kind::Float.index()].num_colors,
+                ],
+            }
+        } else {
+            let alloc = super::regalloc::allocate_registers(
+                &ssarepr,
+                code.varnames.len(),
+                inputs,
+                &cfg_coalesce_pairs,
+            );
+            super::regalloc::apply_rename(&mut ssarepr, &alloc.rename);
+            alloc
+        };
 
         // #280: pre-rename Ref color for a walker frame slot.  The walker
         // numbers each frame slot's register by the slot itself, so its
