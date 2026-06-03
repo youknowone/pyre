@@ -1086,13 +1086,15 @@ impl ExecutionContext {
         self.bytecode_only_trace(frame)?;
         if self.actionflag.get_ticker() < 0 {
             // executioncontext.py:207-208 — `if actionflag.get_ticker()
-            // < 0: actionflag.action_dispatcher(self, frame)`. Pyre's
-            // ActionFlag::action_dispatcher is a stub today (the
-            // AsyncAction queue / signal handler dispatch is still a
-            // pending port), but the call surface is wired so the
-            // line-by-line shape stays correct.
+            // < 0: actionflag.action_dispatcher(self, frame)`.  Routed
+            // through the same residual boundary as `bytecode_trace` so a
+            // signal delivered during exception handling propagates.
             let self_ptr = self as *mut ExecutionContext;
-            self.actionflag.action_dispatcher(self_ptr, frame);
+            if perform_pending_actions(self_ptr as i64, frame as i64) != 0 {
+                if let Some(err) = crate::call::take_call_error() {
+                    return Err(err);
+                }
+            }
         }
         Ok(())
     }

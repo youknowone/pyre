@@ -10,13 +10,16 @@ use crate::executioncontext::{
 use crate::pyframe::PyFrame;
 use pyre_object::PyObjectRef;
 
-// `interp_signal.py:set_wakeup_fd` — stores the configured wakeup fd
-// for read-back via set_wakeup_fd(new) → previous_fd.  Real signal-to-fd
-// delivery is not wired up; this cell is the get/set contract only.
-// PyPy keeps this fd process-wide (it lives on the signal action
-// handler, not per Python-thread), so we mirror that with an atomic.
-use std::sync::atomic::{AtomicI32, Ordering};
-static WAKEUP_FD: AtomicI32 = AtomicI32::new(-1);
+/// executioncontext.py:436-441 `space.getexecutioncontext().checksignals()`
+/// — deliver a signal that may have arrived during a syscall.  Resolves
+/// the live EC from the thread-local slot (`getexecutioncontext`).
+fn checksignals_now() -> Result<(), crate::PyError> {
+    let ec = crate::call::getexecutioncontext() as *mut ExecutionContext;
+    if ec.is_null() {
+        return Ok(());
+    }
+    unsafe { (*ec).checksignals() }
+}
 
 thread_local! {
     /// interp_signal.py:157-167 `Handlers.handlers_w` — signum → handler
@@ -350,7 +353,10 @@ pub fn register_module(ns: &mut DictStorage) {
                     "set_wakeup_fd(): fd must be -1 or a valid file descriptor",
                 ));
             }
-            let prev = WAKEUP_FD.swap(fd, Ordering::SeqCst);
+            // interp_signal.py:376 — `pypysig_set_wakeup_fd`.  The OS
+            // handler writes the signal-number byte to this fd so a
+            // select/poll loop blocked elsewhere wakes up.
+            let prev = signalstate::set_wakeup_fd(fd);
             Ok(pyre_object::w_int_new(prev as i64))
         }),
     );
@@ -371,7 +377,13 @@ pub fn register_module(ns: &mut DictStorage) {
                         ));
                     };
                     match rustpython_host_env::signal::raise_signal(signum) {
-                        Ok(()) => return Ok(pyre_object::w_none()),
+                        Ok(()) => {
+                            // interp_signal.py:583-584 — the signal may
+                            // have been delivered to this thread; run the
+                            // pending handler now (may raise).
+                            checksignals_now()?;
+                            return Ok(pyre_object::w_none());
+                        }
                         Err(e) => {
                             return Err(crate::PyError::os_error_with_errno(
                                 e.raw_os_error().unwrap_or(0),
@@ -700,6 +712,9 @@ pub fn register_module(ns: &mut DictStorage) {
                                     format!("pthread_sigmask: {e}"),
                                 )
                             })?;
+                        // interp_signal.py:546-547 — if signals were
+                        // unblocked, their handlers may now be pending.
+                        checksignals_now()?;
                         let out: Vec<pyre_object::PyObjectRef> = (1..=64)
                             .filter(|s| {
                                 rustpython_host_env::signal::sigset_contains(&prev, *s as i32)
