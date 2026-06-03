@@ -664,7 +664,12 @@ impl VectorizingOptimizer {
                         let mut member_op = loop_.operations[member_idx].clone();
                         pre_emit_guard_accum(&sched_state, &mut member_op);
                         sched_state.renamer.rename(&mut member_op);
-                        seen.insert(member_op.pos.get());
+                        // schedule.py:677-680: packed members are emitted via
+                        // mark_emitted(node, unpack=False) — renamed but NOT
+                        // recorded in `seen`. They live only in box_to_vbox
+                        // (turn_into_vector → setvector_of_box) so a later
+                        // ensure_args_unpacked materializes a VecUnpack when the
+                        // result is used as a scalar (e.g. carried by the jump).
                         loop_.operations[member_idx] = member_op;
                     }
                     turn_into_vector(&mut sched_state, pack, &loop_.operations);
@@ -1201,7 +1206,12 @@ impl VectorizingOptimizer {
                         let mut member_op = loop_.operations[member_idx].clone();
                         pre_emit_guard_accum(&sched_state, &mut member_op);
                         sched_state.renamer.rename(&mut member_op);
-                        seen.insert(member_op.pos.get());
+                        // schedule.py:677-680: packed members are emitted via
+                        // mark_emitted(node, unpack=False) — renamed but NOT
+                        // recorded in `seen`. They live only in box_to_vbox
+                        // (turn_into_vector → setvector_of_box) so a later
+                        // ensure_args_unpacked materializes a VecUnpack when the
+                        // result is used as a scalar (e.g. carried by the jump).
                         loop_.operations[member_idx] = member_op;
                     }
                     turn_into_vector(&mut sched_state, pack, &loop_.operations);
@@ -1983,6 +1993,87 @@ mod tests {
         let label_pos = result.iter().position(|op| op.opcode == OpCode::Label);
         let jump_pos = result.iter().rposition(|op| op.opcode == OpCode::Jump);
         assert!(matches!((label_pos, jump_pos), (Some(l), Some(j)) if l < j));
+    }
+
+    /// schedule.py:765 + 718-732: a packed scalar result that is loop-carried by
+    /// the `Jump` must be unpacked. `turn_into_vector` records the packed member
+    /// only in `box_to_vbox`; PyPy's pack branch (`mark_emitted(node,
+    /// unpack=False)`) never adds it to `seen`. post_schedule's
+    /// `ensure_args_unpacked(jump)` therefore finds it absent from `seen`, emits
+    /// a `VecUnpack`, and rewrites the Jump arg.
+    ///
+    /// Regression guard for the scheduling-loop `seen.insert(member)` divergence:
+    /// the second half asserts that *if* the member is in `seen`, the unpack is
+    /// (wrongly) skipped — so seeding `seen` with packed members is exactly what
+    /// would leave the Jump referencing the folded scalar.
+    #[test]
+    fn test_post_schedule_unpacks_packed_member_carried_to_jump() {
+        use majit_ir::vec_set::VecSet;
+
+        fn run(member_in_seen: bool) -> (OpRef, bool) {
+            let member_ref = OpRef::int_op(7); // scalar result folded into a pack
+            let label = Op::new(
+                OpCode::Label,
+                &[BoxRef::from_opref(OpRef::input_arg_int(0))],
+            );
+            let jump = Op::new(OpCode::Jump, &[BoxRef::from_opref(member_ref)]);
+            let mut vloop = VectorLoop::new(label, Vec::new(), jump);
+
+            let mut st = VecScheduleState::new(100);
+            // turn_into_vector emits the vector op into the oplist and maps each
+            // packed scalar to a lane via setvector_of_box.
+            let vecop = st.create_vec_op(OpCode::VecIntAdd, &[], 'i', 8, true, 2);
+            let vec_ref = vecop.pos.get();
+            st.oplist.push(vecop);
+            st.setvector_of_box(member_ref, 0, vec_ref);
+
+            // seen seeded as the scheduling loop leaves it: always the label
+            // args; the packed member only when reproducing the buggy path.
+            let mut seen: VecSet<OpRef> = vloop
+                .label
+                .getarglist()
+                .iter()
+                .map(|a| a.to_opref())
+                .collect();
+            if member_in_seen {
+                seen.insert(member_ref);
+            }
+            st.post_schedule(&mut vloop, &mut seen);
+
+            let jump_arg0 = vloop.jump.getarglist_copy()[0].to_opref();
+            let has_unpack = vloop
+                .operations
+                .iter()
+                .any(|op| matches!(op.opcode, OpCode::VecUnpackI | OpCode::VecUnpackF));
+            (jump_arg0, has_unpack)
+        }
+
+        // Correct path (packed member absent from seen): the Jump arg is
+        // unpacked away from the stale scalar and a VecUnpack is materialized.
+        let (jump_arg0, has_unpack) = run(false);
+        assert_ne!(
+            jump_arg0,
+            OpRef::int_op(7),
+            "Jump must not reference the scalar folded into the vector pack"
+        );
+        assert!(
+            has_unpack,
+            "ensure_args_unpacked must emit a VecUnpack for the packed member"
+        );
+
+        // Buggy path (packed member present in seen): the unpack is skipped and
+        // the Jump still references the folded scalar — the exact failure the
+        // pack-branch `seen.insert(member)` divergence produced.
+        let (stale_arg0, no_unpack) = run(true);
+        assert_eq!(
+            stale_arg0,
+            OpRef::int_op(7),
+            "seeding seen with the packed member suppresses the unpack"
+        );
+        assert!(
+            !no_unpack,
+            "no VecUnpack is emitted when the packed member is wrongly in seen"
+        );
     }
 
     /// Streaming refactor: a non-loop `Label .. Finish` trace (no trailing Jump)
