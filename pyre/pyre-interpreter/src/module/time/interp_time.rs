@@ -259,16 +259,22 @@ pub fn clock_settime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
             ));
         }
     };
-    if !secs.is_finite() || secs < 0.0 {
-        return Err(crate::PyError::value_error("clock_settime: invalid time"));
-    }
-    let dur = std::time::Duration::from_secs_f64(secs);
-    host_time::clock_settime(host_time::ClockId::from_raw(id), dur).map_err(|e| {
-        crate::PyError::os_error_with_errno(
+    // Build a signed timespec: `integer_secs = rffi.cast(c_tv_sec, secs)`
+    // truncates toward zero, `frac = secs - integer_secs`.
+    let integer_secs = secs.trunc();
+    let frac = secs - integer_secs;
+    let ts = libc::timespec {
+        tv_sec: integer_secs as libc::time_t,
+        tv_nsec: (frac * 1e9) as libc::c_long,
+    };
+    let ret = unsafe { libc::clock_settime(id, &ts) };
+    if ret != 0 {
+        let e = std::io::Error::last_os_error();
+        return Err(crate::PyError::os_error_with_errno(
             e.raw_os_error().unwrap_or(0),
             format!("clock_settime: {e}"),
-        )
-    })?;
+        ));
+    }
     Ok(w_none())
 }
 
@@ -287,18 +293,20 @@ pub fn clock_settime_ns(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
     }
     let id = unsafe { w_int_get_value(args[0]) } as libc::clockid_t;
     let ns = unsafe { w_int_get_value(args[1]) };
-    if ns < 0 {
-        return Err(crate::PyError::value_error(
-            "clock_settime_ns: invalid time",
-        ));
-    }
-    let dur = std::time::Duration::from_nanos(ns as u64);
-    host_time::clock_settime(host_time::ClockId::from_raw(id), dur).map_err(|e| {
-        crate::PyError::os_error_with_errno(
+    // `tv_sec = ns // 10**9`, `tv_nsec = ns % 10**9` (Python floor div/mod,
+    // so a negative `ns` normalises to a non-negative `tv_nsec`).
+    let ts = libc::timespec {
+        tv_sec: ns.div_euclid(1_000_000_000) as libc::time_t,
+        tv_nsec: ns.rem_euclid(1_000_000_000) as libc::c_long,
+    };
+    let ret = unsafe { libc::clock_settime(id, &ts) };
+    if ret != 0 {
+        let e = std::io::Error::last_os_error();
+        return Err(crate::PyError::os_error_with_errno(
             e.raw_os_error().unwrap_or(0),
             format!("clock_settime_ns: {e}"),
-        )
-    })?;
+        ));
+    }
     Ok(w_none())
 }
 
