@@ -774,21 +774,21 @@ fn analyze_pipeline_from_parsed(
     // loops below are unchanged — only the source of the `canonical_*`
     // vectors moves off the syn AST.
     //
-    // Coverage was proven before the cutover (`PYRE_AST_EXTRACT_COVERAGE_AUDIT`):
-    // `program.functions` is a superset of every graph-carrying method
-    // the extractors emitted (inherent 417/417; trait 497/557).  The 60
-    // trait methods the extractors emitted with no graph are intentional
-    // non-JIT targets — `#[cfg(test)]` impls, `into_py` on primitive
-    // receivers Charon cannot key to an ADT, residual
-    // `PyreBlackholeAllocator::*` allocator hooks, std-trait impls
-    // (`Drop`/`From`/`PartialEq`/…), and `BoxEnv` default bodies MIR
-    // does not lower.  They registered no graph (so the BFS never
-    // reached them) and their `return_types` were redundant: a
-    // build-time cross-check (`PYRE_DECLARED_VS_CFG_KIND_AUDIT`) found
-    // zero impl methods whose declared return kind diverged from the
+    // Coverage was proven before the cutover (a since-removed
+    // coverage audit): `program.functions` is a superset of every
+    // graph-carrying method the extractors emitted (inherent 417/417;
+    // trait 497/557).  The 60 trait methods the extractors emitted with
+    // no graph are intentional non-JIT targets — `#[cfg(test)]` impls,
+    // `into_py` on primitive receivers Charon cannot key to an ADT,
+    // residual `PyreBlackholeAllocator::*` allocator hooks, std-trait
+    // impls (`Drop`/`From`/`PartialEq`/…), and `BoxEnv` default bodies
+    // MIR does not lower.  They registered no graph (so the BFS never
+    // reached them) and their `return_types` were redundant with the
     // CFG-scan result kind (`graph_result_kind` = `getkind(FUNC.RESULT)`,
-    // `codewriter.rs:656`), so dropping the side-table entries is a
-    // no-op for call-descriptor typing.
+    // `codewriter.rs:656`) — the calldescr builder reads the declared
+    // type only as an `i↔r` tiebreak and `debug_assert`s it against the
+    // CFG kind; no impl method diverged, so dropping the side-table
+    // entries is a no-op for call-descriptor typing.
     //
     // `mir_graph_lookup` is still consulted by the registration loops
     // below (trait-default vs concrete-impl graph fetch), so keep it.
