@@ -309,12 +309,17 @@ pub unsafe fn py_repr(obj: PyObjectRef) -> String {
             let w_class = (*obj).w_class;
             let tuple_class = crate::typedef::gettypeobject(&pyre_object::pyobject::TUPLE_TYPE);
             if !w_class.is_null() && !std::ptr::eq(w_class, tuple_class) {
-                // try_call_dunder gates on is_instance(obj); structseq
-                // instances are tuple subclasses with ob_type ==
-                // TUPLE_TYPE, so reach for the subclass __repr__
-                // directly via lookup(MRO).
-                if let Some(method) = crate::baseobjspace::lookup(obj, "__repr__") {
-                    if !method.is_null() {
+                // structseq instances are tuple subclasses with ob_type ==
+                // TUPLE_TYPE, so reach for a subclass __repr__ via the MRO.
+                // `tuple` itself installs no `__repr__` dict entry (it is
+                // handled natively below), so a plain tuple subclass
+                // resolves `__repr__` to `object` — fall through to the
+                // tuple formatting in that case rather than printing the
+                // generic `<object at ...>`.
+                if let Some((src, method)) =
+                    crate::baseobjspace::lookup_where(w_class, "__repr__")
+                {
+                    if !std::ptr::eq(src, crate::typedef::w_object()) && !method.is_null() {
                         let r = crate::call_function(method, &[obj]);
                         if !r.is_null() && pyre_object::is_str(r) {
                             return pyre_object::w_str_get_value(r).to_string();

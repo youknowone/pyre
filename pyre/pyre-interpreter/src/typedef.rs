@@ -1182,38 +1182,58 @@ fn bool_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         w_obj,
     )))
 }
-descr_new_wrapper!(list_descr_new, crate::builtins::builtin_list_ctor);
-
-/// tuple.__new__(cls, iterable) — tupleobject.py descr__new__.
-///
-/// For a tuple subclass (e.g. `collections.namedtuple`), build a fresh
-/// tuple and set `w_class = cls` so `type(obj) == cls`, attribute lookup
-/// resolves the subclass's field descriptors, and `__repr__` dispatches.
-fn tuple_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let cls = if args.is_empty() {
-        pyre_object::PY_NULL
-    } else {
-        args[0]
-    };
-    let value = crate::builtins::builtin_tuple(&args[1..])?;
+/// When `cls` is a user subclass of the builtin `base` (not `base`
+/// itself, not null/non-type), return it so `__new__` can tag the fresh
+/// builtin instance's `w_class`; otherwise `None`.  Mirrors the
+/// subclass-tagging path `str`/`int`/`float` `__new__` already use so
+/// `type(obj)` / `isinstance` / overridden-dunder dispatch see the
+/// subclass while the object keeps its builtin layout.
+fn subclass_to_tag(cls: PyObjectRef, base: &'static pyre_object::PyType) -> Option<PyObjectRef> {
     if cls.is_null() || !unsafe { pyre_object::is_type(cls) } {
-        return Ok(value);
+        return None;
     }
-    let tuple_typeobj = gettypefor(&pyre_object::pyobject::TUPLE_TYPE);
-    if tuple_typeobj.map_or(false, |t| std::ptr::eq(cls, t)) {
-        return Ok(value);
+    match gettypefor(base) {
+        Some(t) if std::ptr::eq(cls, t) => None,
+        _ => Some(cls),
     }
-    // Subclass path — copy into a fresh tuple so setting w_class does not
-    // clobber a shared/literal source tuple.
-    let n = unsafe { pyre_object::w_tuple_len(value) };
-    let items: Vec<_> = (0..n)
-        .filter_map(|i| unsafe { pyre_object::w_tuple_getitem(value, i as i64) })
-        .collect();
-    let obj = pyre_object::w_tuple_new(items);
-    unsafe {
-        (*obj).w_class = cls;
+}
+
+/// `list.__new__(cls, *args)` — `listobject.py:descr__new__` allocates a
+/// `W_ListObject` of `w_listtype`.  `builtin_list_ctor` always returns a
+/// fresh list, so a subclass instance is the same object with `w_class`
+/// retagged.
+fn list_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let cls = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+    let value = crate::builtins::builtin_list_ctor(&args[1..])?;
+    if let Some(sub) = subclass_to_tag(cls, &pyre_object::LIST_TYPE) {
+        unsafe {
+            (*value).w_class = sub;
+        }
     }
-    Ok(obj)
+    Ok(value)
+}
+
+/// `tuple.__new__(cls, *args)` — `tupleobject.py:descr__new__` allocates
+/// a `W_TupleObject` of `w_tupletype`.  `builtin_tuple` may return the
+/// argument tuple unchanged, so the subclass path rebuilds a fresh tuple
+/// before retagging to avoid aliasing the input.
+fn tuple_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let cls = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+    let value = crate::builtins::builtin_tuple(&args[1..])?;
+    if let Some(sub) = subclass_to_tag(cls, &pyre_object::TUPLE_TYPE) {
+        let n = unsafe { pyre_object::w_tuple_len(value) };
+        let items: Vec<PyObjectRef> = (0..n)
+            .filter_map(|i| unsafe { pyre_object::w_tuple_getitem(value, i as i64) })
+            .collect();
+        // Canonical array-backed layout (ob_type == TUPLE_TYPE) so the
+        // subclass tag never lands on an arity-2 specialised tuple.
+        let fresh = pyre_object::w_tuple_new_array_backed(items);
+        unsafe {
+            (*fresh).w_class = sub;
+        }
+        return Ok(fresh);
+    }
+    Ok(value)
 }
 // dict_new handled by dict_descr_new above (supports dict subclasses)
 
@@ -7201,6 +7221,20 @@ fn init_object_type(ns: &mut DictStorage) {
 }
 
 fn bytearray_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let cls = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+    let value = bytearray_descr_new_impl(args)?;
+    if let Some(sub) = subclass_to_tag(cls, &pyre_object::bytearrayobject::BYTEARRAY_TYPE) {
+        let data = unsafe { pyre_object::bytesobject::bytes_like_data(value).to_vec() };
+        let fresh = pyre_object::bytearrayobject::w_bytearray_from_bytes(&data);
+        unsafe {
+            (*fresh).w_class = sub;
+        }
+        return Ok(fresh);
+    }
+    Ok(value)
+}
+
+fn bytearray_descr_new_impl(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // args[0] = cls (ignored — bytearray subclasses still allocate the
     // primitive layout). bytearrayobject.py descr_new accepts:
     //   bytearray()           → empty
@@ -9548,6 +9582,22 @@ fn bytes_method_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
 }
 
 fn bytes_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let cls = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+    let value = bytes_descr_new_impl(args)?;
+    if let Some(sub) = subclass_to_tag(cls, &pyre_object::bytesobject::BYTES_TYPE) {
+        // `bytes(b)` may return the argument unchanged, so rebuild a
+        // fresh object before retagging to avoid aliasing the input.
+        let data = unsafe { pyre_object::bytesobject::bytes_like_data(value).to_vec() };
+        let fresh = pyre_object::bytesobject::w_bytes_from_bytes(&data);
+        unsafe {
+            (*fresh).w_class = sub;
+        }
+        return Ok(fresh);
+    }
+    Ok(value)
+}
+
+fn bytes_descr_new_impl(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // args[0] = cls (ignored for now)
     // bytes()           → empty
     // bytes(int)        → zero-filled
