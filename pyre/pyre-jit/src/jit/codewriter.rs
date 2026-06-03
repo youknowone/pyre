@@ -10158,16 +10158,47 @@ impl CodeWriter {
             if let Some((canonical, _)) = &canonical_for_splice {
                 // The dense `pc_map` feed `filter_liveness_in_place` consumes
                 // must reference ONLY `-live-` markers (it asserts the target
-                // insn `is_live()`).  The leading run of PCs before the first
-                // marker (entry PCs, never a runtime resume target per #285)
-                // takes the FIRST marker as a safe placeholder — index 0
-                // would point at the block `Label`.  A canonical stream with
-                // no markers at all (degenerate straight-line graph, no
-                // resume target) cannot feed the dense table, so fall back to
-                // the walker stream for it rather than splice.
-                let first_live = canonical.insns.iter().position(|i| i.is_live());
+                // insn `is_live()`).  The canonical stream's FIRST marker is a
+                // leading guard / trailing-canraise marker INTERIOR to a block,
+                // whose backward-liveness includes block-interior stack temps.
+                // But the runtime snapshots the outer frame at EVERY opcode
+                // entry — `dispatch_via_miframe_at_opcode_entry` takes
+                // `entry_py_pc = miframe.orgpc`, so the entry PC (pc=0) and the
+                // leading run before that interior marker ARE runtime resume
+                // targets (#281, contra the earlier "entry PCs never resume"
+                // assumption).  Forward-carrying the interior marker for them
+                // hands `collect_outer_active_boxes` a stack-temp ref color
+                // that is `OpRef::NONE` at entry → panic.
+                //
+                // #281 entry-marker: insert a bare `-live-` immediately before
+                // the first pc-carrying op (after the startblock Label).
+                // `compute_liveness` (run inside `filter_liveness_in_place`)
+                // RECOMPUTES its args via backward analysis (liveness.rs:167),
+                // so the empty marker fills to the entry-live set = inputargs
+                // only — block-interior temps are written-before-read past
+                // this point, hence not yet alive.  The leading run then
+                // resolves to ENTRY liveness instead of the forward interior
+                // marker.  Pyre-specific: the per-opcode tracer needs entry
+                // liveness that upstream RPython's guard-only resume does not.
+                // A canonical stream with no markers at all (degenerate
+                // straight-line graph, no resume target) cannot feed the dense
+                // table, so fall back to the walker stream rather than splice.
+                let mut spliced = (*canonical).clone();
+                if let Some(first_op_pos) =
+                    spliced.pc_first_insn_pos.iter().map(|&(_, pos)| pos).min()
+                {
+                    spliced
+                        .insns
+                        .insert(first_op_pos, super::flatten::Insn::live(Vec::new()));
+                    for (_, pos) in spliced.pc_first_insn_pos.iter_mut() {
+                        if *pos >= first_op_pos {
+                            *pos += 1;
+                        }
+                    }
+                }
+                let first_live = spliced.insns.iter().position(|i| i.is_live());
                 if let Some(first_live) = first_live {
-                    let derived = derive_pc_live_indices_from_sparse(canonical, num_instrs);
+                    let derived = derive_pc_live_indices_from_sparse(&spliced, num_instrs);
                     let mut dense: Vec<usize> = Vec::with_capacity(num_instrs);
                     let mut last = first_live;
                     for entry in &derived {
@@ -10176,16 +10207,17 @@ impl CodeWriter {
                         }
                         dense.push(last);
                     }
-                    ssarepr.insns = canonical.insns.clone();
-                    ssarepr.pc_first_insn_pos = canonical.pc_first_insn_pos.clone();
+                    ssarepr.insns = spliced.insns;
+                    ssarepr.pc_first_insn_pos = spliced.pc_first_insn_pos;
                     walker_tracked_pc_live_indices_out = Some(dense);
                     did_splice = true;
                     eprintln!(
-                        "[flatten-splice] {} spliced insns={} pc_first={} live_feed={}",
+                        "[flatten-splice] {} spliced insns={} pc_first={} live_feed={} entry_live={}",
                         ssarepr.name,
                         ssarepr.insns.len(),
                         ssarepr.pc_first_insn_pos.len(),
                         num_instrs,
+                        first_live,
                     );
                 } else {
                     eprintln!(
