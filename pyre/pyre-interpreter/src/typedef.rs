@@ -879,18 +879,6 @@ pub fn make_builtin_type_with_layout(
     new_typeobject_with_base_and_layout(name, init, base, layout_pytype)
 }
 
-/// Generate a `__new__` wrapper that skips `cls` (first arg) and delegates
-/// to the builtin constructor. PyPy: each type's descr__new__ strips cls
-/// and calls the type-specific allocator.
-macro_rules! descr_new_wrapper {
-    ($fn_name:ident, $ctor:path) => {
-        fn $fn_name(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-            // args[0] = cls (ignored for builtin types)
-            $ctor(&args[1..])
-        }
-    };
-}
-
 /// int.__new__(cls, *args) — PyPy: intobject.py descr__new__
 ///
 /// If cls is the builtin int type, returns a plain W_IntObject.
