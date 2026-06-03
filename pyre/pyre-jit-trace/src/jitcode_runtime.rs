@@ -1019,17 +1019,19 @@ mod tests {
 
     #[test]
     fn pop_top_lookup() {
-        // Phase D-1 MVP target: Instruction::PopTop is arm_id=14 at build
-        // time (was 13 before the StoreGlobal arm split out from
-        // StoreName).  Confirm arm → jitcode resolution works end-to-end
-        // and the jitcode carries bytecode bytes (not an empty shell).
-        let jc = jitcode_for_arm(14).expect("PopTop arm should resolve to a jitcode");
+        // Instruction::PopTop is arm_id=21 at build time (was 14 while the
+        // opcode dispatch was extracted from the syn source-match order;
+        // sourcing it from the lowered MIR switch reorders the arms by
+        // first-encounter target-block order of that switch, moving PopTop
+        // 14 -> 21). Confirm arm → jitcode resolution works end-to-end and
+        // the jitcode carries bytecode bytes (not an empty shell).
+        let jc = jitcode_for_arm(21).expect("PopTop arm should resolve to a jitcode");
         assert!(
             !jc.code.is_empty(),
             "PopTop jitcode should have non-empty bytecode"
         );
         assert_eq!(
-            jc.name, "Instruction::PopTop#14",
+            jc.name, "Instruction::PopTop#21",
             "jitcode name should match the arm selector"
         );
     }
@@ -1048,20 +1050,20 @@ mod tests {
     }
 
     #[test]
-    fn arm_id_for_pop_top_matches_arm_14() {
+    fn arm_id_for_pop_top_matches_arm_21() {
         // PopTop is a single-variant arm; `Instruction::PopTop` must
-        // resolve to the same arm_id as the direct `jitcode_for_arm(14)`
+        // resolve to the same arm_id as the direct `jitcode_for_arm(21)`
         // lookup above.
         let arm_id =
             arm_id_for_instruction(&Instruction::PopTop).expect("PopTop must resolve to an arm_id");
-        assert_eq!(arm_id, 14);
+        assert_eq!(arm_id, 21);
     }
 
     #[test]
     fn jitcode_for_instruction_matches_arm_lookup() {
         let jc = jitcode_for_instruction(&Instruction::PopTop)
             .expect("PopTop must resolve to a jitcode");
-        assert_eq!(jc.name, "Instruction::PopTop#14");
+        assert_eq!(jc.name, "Instruction::PopTop#21");
         assert!(!jc.code.is_empty());
     }
 
@@ -1483,7 +1485,7 @@ mod tests {
         let bt_jc = jitcode_for_instruction(&Instruction::PopTop)
             .expect("PopTop must resolve to a jitcode");
         assert!(!bt_jc.code.is_empty());
-        assert_eq!(bt_jc.name, "Instruction::PopTop#14");
+        assert_eq!(bt_jc.name, "Instruction::PopTop#21");
         assert_eq!(arm.entry_jitcode_index, Some(bt_jc.index()));
         assert_eq!(
             bt_jc.num_regs_and_consts_i(),
