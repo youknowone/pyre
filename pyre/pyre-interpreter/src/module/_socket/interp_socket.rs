@@ -2204,6 +2204,17 @@ fn init_socket_type(ns: &mut DictStorage) {
                 args
             };
             let (pos, kwargs) = crate::builtins::split_builtin_kwargs(after_cls);
+            // `descr_init`'s `@unwrap_spec` signature rejects unknown
+            // keywords and a parameter supplied both by position and name.
+            crate::builtins::kwarg_reject_unknown(
+                kwargs,
+                &["family", "type", "proto", "fileno"],
+                "socket",
+            )?;
+            crate::builtins::kwarg_reject_duplicate(kwargs, "socket", "family", !pos.is_empty())?;
+            crate::builtins::kwarg_reject_duplicate(kwargs, "socket", "type", pos.len() >= 2)?;
+            crate::builtins::kwarg_reject_duplicate(kwargs, "socket", "proto", pos.len() >= 3)?;
+            crate::builtins::kwarg_reject_duplicate(kwargs, "socket", "fileno", pos.len() >= 4)?;
             // `interp_socket.py:216 descr_init(family=-1, type=-1, proto=-1,
             // w_fileno=None)` — each parameter comes from its positional
             // slot, then its keyword; family/type/proto keep the sentinel
