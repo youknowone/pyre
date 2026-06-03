@@ -60,8 +60,7 @@ pub use layout::{HeuristicLayoutProvider, LayoutProvider};
 pub use model::{Block, BlockId, CallTarget, FunctionGraph, OpKind, SpaceOperation, ValueType};
 pub use opcode_dispatch::PipelineOpcodeArm;
 pub use parse::{
-    CallPath, ExtractedOpcodeArm, OpcodeDispatchSelector, ParsedInterpreter,
-    extract_inherent_impl_methods, extract_trait_impls, parse_source,
+    CallPath, ExtractedOpcodeArm, OpcodeDispatchSelector, ParsedInterpreter, parse_source,
 };
 pub use pipeline::{PipelineConfig, PipelineResult, PortalSpec, ProgramPipelineResult};
 
