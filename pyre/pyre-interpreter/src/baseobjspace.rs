@@ -3120,7 +3120,7 @@ pub fn gateway_nonnegint_w(obj: PyObjectRef) -> Result<i64, PyError> {
 /// intobject.py:577 / longobject.py:164 uint_w. Unlike int_w this does NOT
 /// apply __int__/__index__ conversion: a non-int object raises TypeError
 /// (W_Root.uint_w → _typed_unwrap_error).
-fn uint_w(obj: PyObjectRef) -> Result<u64, PyError> {
+pub fn uint_w(obj: PyObjectRef) -> Result<u64, PyError> {
     use num_traits::ToPrimitive;
     if obj.is_null() {
         return Err(PyError::type_error("uint_w: null object"));
@@ -3226,6 +3226,27 @@ pub fn c_uid_t_w(obj: PyObjectRef) -> Result<u32, PyError> {
         }
         Err(e) => Err(e),
     }
+}
+
+/// baseobjspace.py:2063 c_filedescriptor_w — an int or an object exposing
+/// a `fileno()` method (deliberately NOT an `__int__`), coerced to a
+/// non-negative C int.
+pub fn c_filedescriptor_w(obj: PyObjectRef) -> Result<i32, PyError> {
+    let w_fd = if unsafe { pyre_object::pyobject::is_int(obj) } {
+        obj
+    } else {
+        let fileno = getattr(obj, "fileno").map_err(|_| {
+            PyError::type_error("argument must be an int, or have a fileno() method.")
+        })?;
+        crate::builtins::call_and_check(fileno, &[])?
+    };
+    let fd = c_int_w(w_fd)?;
+    if fd < 0 {
+        return Err(PyError::value_error(format!(
+            "file descriptor cannot be a negative integer ({fd})"
+        )));
+    }
+    Ok(fd)
 }
 
 /// pypy/interpreter/baseobjspace.py truncatedint_w.
