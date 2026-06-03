@@ -21,6 +21,30 @@
 //!
 //! Classification (issue #112 scope #4): every pass here is **direct PyPy
 //! parity**.
+//!
+//! ## Issue #112 scope #3 — unmarked-label investigation (concluded)
+//!
+//! The `jitcode label was never marked` panic (`majit-metainterp/src/jitcode/
+//! assembler.rs::patch_labels`) fires when flatten emits a goto/switch/forwarder
+//! operand referencing a block whose `Label` is never emitted.  The only graph
+//! shapes that produce it are a dead/trivial forwarder or a dead constant-switch
+//! arm reaching flatten.  The walker-safe subset wired in
+//! `codewriter.rs` (`eliminate_empty_blocks` + `constfold_exitswitch` +
+//! `remove_trivial_links`, in `all_passes` relative order) removes exactly
+//! those: `eliminate_empty_blocks` collapses dead forwarders — and the
+//! port-boundary guard fails loud if a reachable link still targets a `dead`
+//! block; `remove_trivial_links` merges single-entry/single-exit chains; and
+//! `constfold_exitswitch` drops the dead arm through `recloseblock`, so no link
+//! references it (a still-reachable arm target keeps its `Label`).
+//!
+//! The `all_passes` entries left unwired do **not** affect label structure:
+//! `transform_dead_op_vars` / `remove_identical_vars_ssa` / `ssa_to_ssi` only
+//! rename or dedup variables; `coalesce_bool` / `transform_ovfcheck` /
+//! `transform_xxxitem` are op-level rewrites; and `simplify_exceptions` /
+//! `remove_dead_exceptions` / `remove_assertion_errors` are documented no-ops
+//! that remove no block or link on a walker graph.  So the wired subset closes
+//! the gap and the assembler `never marked` panic is a fail-loud backstop, not a
+//! live failure mode — empirically unreached at check.py 41/41 both backends.
 
 use std::collections::{HashMap, HashSet};
 
@@ -1351,5 +1375,71 @@ mod tests {
             s.exits[0].borrow().args,
             vec![Some(Constant::signed(7).into())]
         );
+    }
+
+    /// Issue #112 scope #3 conclusion as a regression guard: the walker-safe
+    /// subset wired ahead of flatten (`eliminate_empty_blocks` +
+    /// `constfold_exitswitch` + `remove_trivial_links`) removes every shape that
+    /// yields an unmarked label.  A graph carrying BOTH a dead constant-switch
+    /// arm and a trivial empty forwarder must, after the subset, leave no
+    /// reachable link pointing at a dropped or dead block — the port-boundary
+    /// invariant the assembler `patch_labels` backstop guards.
+    #[test]
+    fn wired_subset_leaves_no_reachable_link_to_unmarked_block() {
+        let start = Block::shared(vec![]);
+        let graph = FunctionGraph::new("f", start.clone(), None);
+        let returnblock = graph.returnblock.clone();
+
+        // The live (true) arm goes through a trivial empty forwarder; the dead
+        // (false) arm reaches `dead_arm`, which only the folded-away case names.
+        let fwd = graph.new_block(vec![]);
+        let tail = graph.new_block(vec![]);
+        let dead_arm = graph.new_block(vec![]);
+
+        // `tail` carries a real op so it is not itself an empty forwarder.
+        let v = graph.fresh_variable(Kind::Int);
+        push_op(
+            &tail,
+            SpaceOperation::new("int_zero", vec![], Some(v.into()), -1),
+        );
+
+        // start switches on the constant `true`: true -> fwd, false -> dead_arm.
+        start.borrow_mut().exitswitch = Some(ExitSwitch::Value(Constant::bool(true).into()));
+        let link_true =
+            Link::new(vec![], Some(fwd.clone()), Some(Constant::bool(true).into())).into_ref();
+        let link_false =
+            Link::new(vec![], Some(dead_arm.clone()), Some(Constant::bool(false).into()))
+                .into_ref();
+        start.closeblock(vec![link_true, link_false]);
+
+        fwd.closeblock(vec![Link::new(vec![], Some(tail.clone()), None).into_ref()]);
+        tail.closeblock(vec![
+            Link::new(vec![Constant::signed(0).into()], Some(returnblock.clone()), None).into_ref(),
+        ]);
+        dead_arm.closeblock(vec![
+            Link::new(vec![Constant::signed(0).into()], Some(returnblock), None).into_ref(),
+        ]);
+
+        // The wired subset, in the codewriter's relative order.
+        eliminate_empty_blocks(&graph);
+        constfold_exitswitch(&graph);
+        remove_trivial_links(&graph);
+
+        // Port-boundary invariant: every reachable link targets a live block, so
+        // flatten emits a Label for every referenced target (no unmarked label).
+        for link in graph.iterlinks() {
+            if let Some(target) = link.borrow().target.clone() {
+                assert!(
+                    !target.borrow().dead,
+                    "reachable link still targets a dead block"
+                );
+            }
+        }
+        // The dropped switch arm and the collapsed forwarder are unreachable.
+        let reachable = graph.iterblocks();
+        assert!(!reachable.contains(&dead_arm));
+        assert!(!reachable.contains(&fwd));
+        // The normalized graph is flatten-ready.
+        checkgraph(&graph);
     }
 }

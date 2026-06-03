@@ -4160,7 +4160,13 @@ impl JitCodeBuilder {
                     // offending label index, every referencing code offset, and
                     // the marked/total label counts so the origin can be traced
                     // before the panic, then point at the `simplify_graph`
-                    // passes that remove the shape.
+                    // passes that remove the shape.  Scope #3 concluded that the
+                    // walker-safe subset wired ahead of flatten
+                    // (`eliminate_empty_blocks` + `constfold_exitswitch` +
+                    // `remove_trivial_links`, see `pyre-jit/src/jit/simplify.rs`
+                    // module doc) already removes every shape that produces an
+                    // unmarked label, so this panic is a fail-loud backstop, not
+                    // a live failure mode.
                     let marked = self.labels.iter().filter(|l| l.is_some()).count();
                     let total = self.labels.len();
                     let referencing_offsets: Vec<usize> = self
