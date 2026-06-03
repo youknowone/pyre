@@ -430,14 +430,21 @@ impl MiniMarkGC {
     }
 
     /// Whether `addr` is a real old-gen object that may enter the remembered
-    /// set. Callers have already ruled out null and nursery addresses, so the
-    /// only other thing reaching here is a Box-allocated PyFrame: it carries a
-    /// GcHeader and TRACK_YOUNG_PTRS but is not GC-owned and must be excluded.
-    ///
-    /// Old-gen objects are the only ones tagged `OLDGEN_TRACKED` (set at every
-    /// old-gen allocation/promotion), so the test is an O(1) header read.
-    /// Reading the header is safe: the inline COND_CALL_GC_WB already loads the
-    /// flag byte from this same header before calling into the barrier.
+    /// set. Callers have already ruled out null and nursery addresses. Every
+    /// pointer that can still reach here carries a GcHeader, so `header_of` is
+    /// always a valid read — incminimark's "barrier only sees header-bearing
+    /// objects" invariant, upheld at allocation rather than by a membership
+    /// gate:
+    ///   - GC objects (nursery/old-gen): header from the GC allocator;
+    ///   - Box-allocated PyFrames: header from `GcPyFrame` / the
+    ///     `alloc_with_gc_header` prepend;
+    ///   - leaked `malloc_typed` host objects (dicts, cells, functions):
+    ///     header from `lltype::malloc_typed` -> `alloc_with_gc_header`.
+    /// Of these, only true old-gen objects are tagged `OLDGEN_TRACKED` (set at
+    /// every old-gen allocation/promotion); the rest carry a zeroed header and
+    /// are excluded. So the test is an O(1) header read, also safe under the
+    /// inline COND_CALL_GC_WB, which loads the flag byte from this same header
+    /// before calling into the barrier.
     ///
     /// The leading guard is a cheap defensive filter, not a membership test: a
     /// real GcRef payload is non-null, word-aligned, and well above the zero
