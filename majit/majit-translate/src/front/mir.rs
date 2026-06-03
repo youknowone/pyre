@@ -226,17 +226,23 @@ pub fn build_semantic_program_from_llbcs(
 /// global-initializer bodies are skipped silently — they are not JIT
 /// call targets.  A function whose MIR shape the driver cannot yet lower
 /// produces a [`LowerError`] that is captured per-function: a recognised,
-/// tracked gap (the uninitialised-local-read shape) degrades the program
-/// by dropping that one function, while any *unrecognised* lowering
-/// failure fails the whole-program build (the coverage gate at the end of
-/// this function) so a lowering regression cannot pass silently.
+/// tracked gap (an uninitialised-local read that survives even the
+/// reverse-postorder re-lower) degrades the program by dropping that one
+/// function, while any *unrecognised* lowering failure fails the
+/// whole-program build (the coverage gate at the end of this function) so
+/// a lowering regression cannot pass silently.
 fn is_known_lowering_gap(msg: &str) -> bool {
-    // The only MIR shape the driver does not yet lower but which is an
-    // accepted, tracked degradation rather than a regression: a body that
-    // reads a MIR local on a path the driver has not proven dominated by
-    // an `Assign` (`read of MIR local N before any Assign`). A handful of
-    // cold interpreter / object functions hit it; they become residual
-    // calls, never a correctness loss.
+    // The forward-reference shape: a body reads a MIR local on a path the
+    // driver has not yet bound (`read of MIR local N before any Assign`).
+    // `lower_fun_decl` first hits this under MIR-index order, then retries
+    // the body in reverse-postorder — which orders the defining block
+    // before the reading block and resolves every such read in the
+    // current snapshot.  This predicate has two roles: it triggers that
+    // RPO retry, and (defensively) if even RPO cannot bind the read — a
+    // genuine loop-carried definition, of which there are none today —
+    // it classifies the residual failure as a tracked degradation (the
+    // function becomes a residual call) rather than a build-failing
+    // regression.
     msg.contains("uninitialised local")
 }
 
@@ -343,9 +349,11 @@ pub fn build_semantic_program_from_llbc(
         });
     }
     // Coverage gate. Every `skipped` entry is a function whose MIR shape
-    // the driver could not lower. The single known, tracked gap is the
-    // "uninitialised local read" shape; those degrade the program by
-    // dropping the one (cold) function, which becomes a residual call —
+    // the driver could not lower — already after the reverse-postorder
+    // retry in `lower_fun_decl`. The single known, tracked gap is an
+    // "uninitialised local read" that even RPO could not bind (a genuine
+    // loop-carried def — none in the current snapshot); such a function
+    // would degrade the program by being dropped to a residual call,
     // never a correctness loss. Any *other* lowering failure is a coverage
     // regression that must not pass silently, so fail the whole-program
     // build with the offending list. This is the fail-loud successor to
@@ -491,9 +499,37 @@ pub fn lower_fun_decl(llbc: &Llbc, fd: &FunDecl) -> Result<FunctionGraph, LowerE
             fd.item_meta.name_path()
         ))
     })?;
-    let mut lo = Lowering::new(llbc, fd.item_meta.name_path(), &u)?;
-    lo.lower()?;
-    Ok(lo.graph)
+    let name = fd.item_meta.name_path();
+    let mut lo = Lowering::new(llbc, name.clone(), &u)?;
+    match lo.lower(BlockOrder::Linear) {
+        Ok(()) => Ok(lo.graph),
+        // A forward-referenced definition — typically a `TermKind::Call`
+        // dest at a higher MIR index than the block that reads it — reads
+        // as an uninitialised local under MIR-index order.  Re-lower the
+        // whole body in reverse-postorder, which visits the defining
+        // block first.  This is scoped to exactly the bodies that fail
+        // linearly (every other body keeps its linear-order bindings
+        // untouched), and RPO is proven sufficient for all of them
+        // (`classify_uninitialised_local_rpo_vs_loop_carried`: 0
+        // loop-carried, so no phi / block-inputarg threading is needed).
+        Err(LowerError::Unsupported(msg)) if is_known_lowering_gap(&msg) => {
+            let mut lo = Lowering::new(llbc, name, &u)?;
+            lo.lower(BlockOrder::ReversePostorder)?;
+            Ok(lo.graph)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Order in which [`Lowering::lower`] walks the MIR basic blocks.
+#[derive(Clone, Copy)]
+enum BlockOrder {
+    /// Plain MIR index order (`0..len`) — the default.
+    Linear,
+    /// Reverse-postorder of the CFG — the fallback used only for bodies
+    /// whose linear lowering hits a forward-referenced (uninitialised)
+    /// local.
+    ReversePostorder,
 }
 
 /// Errors the driver fails with. The driver fails loud — `Unsupported`
@@ -618,18 +654,115 @@ impl<'a> Lowering<'a> {
         })
     }
 
-    fn lower(&mut self) -> Result<(), LowerError> {
-        // BFS over MIR basic blocks. Per the §"Reference" section
-        // above, there is no mergeblock dance — every MIR basic block
-        // is its own join point, fully prepared by `create_block` /
-        // `startblock`. So iteration order is *only* about
-        // deterministic processing; we use linear MIR order (BFS in
-        // the trivial single-predecessor sense) and keep it that way
-        // for reproducibility.
-        for mir_bb in 0..self.body.body.len() {
+    fn lower(&mut self, order: BlockOrder) -> Result<(), LowerError> {
+        // Per the §"Reference" section above there is no mergeblock
+        // dance — every MIR basic block is its own join point, fully
+        // prepared by `create_block` / `startblock`, and locals live in
+        // the function-wide `local_var` table rather than being threaded
+        // as block inputargs.  `local_var` is a single monotonic slot
+        // per local, so iteration order only governs *when* each block
+        // writes its defs: a read binds as soon as *any* defining block
+        // precedes it in processing order.  The default is MIR-index
+        // (`Linear`) order, which preserves every binding the historical
+        // linear driver produced.  It fails only when a definition
+        // (notably a `TermKind::Call` dest) sits at a higher MIR index
+        // than a block that reads it, producing a spurious "uninitialised
+        // local"; `lower_fun_decl` then re-lowers in `ReversePostorder`,
+        // which visits the defining block before the reading block
+        // whenever the def forward-reaches the read.  Every such read is a
+        // *forward* reference, never a back-edge-only definition (proven
+        // by `classify_uninitialised_local_rpo_vs_loop_carried`: 15
+        // forward-ref, 0 loop-carried), so RPO binds all of them without
+        // any phi / block-inputarg threading.
+        for mir_bb in self.block_processing_order(order) {
             self.lower_block(mir_bb)?;
         }
         Ok(())
+    }
+
+    /// Block processing order.  `Linear` is plain MIR index order.
+    /// `ReversePostorder` is the reverse-postorder of the MIR CFG rooted
+    /// at bb0, followed by any blocks unreachable from bb0 (ascending
+    /// index, so the graph stays complete — every block is still
+    /// lowered).  Successors mirror the `lower_terminator` edges exactly
+    /// (normal target *and* `on_unwind` for `Call`/`Assert`/`Drop`; both
+    /// arms of an `If`; every arm plus the default of a `SwitchInt`) so
+    /// this order matches the CFG the classifier diagnostic validated.
+    fn block_processing_order(&self, order: BlockOrder) -> Vec<usize> {
+        let n = self.body.body.len();
+        if matches!(order, BlockOrder::Linear) {
+            return (0..n).collect();
+        }
+        if n == 0 {
+            return vec![];
+        }
+        let succs = |bb: usize| -> Vec<usize> {
+            let Ok(term) = self.body.body[bb].term() else {
+                return vec![];
+            };
+            let raw: Vec<u64> = match term {
+                TermKind::Goto { target } => vec![target],
+                TermKind::Call {
+                    target, on_unwind, ..
+                }
+                | TermKind::Assert {
+                    target, on_unwind, ..
+                }
+                | TermKind::Drop {
+                    target, on_unwind, ..
+                } => vec![target, on_unwind],
+                TermKind::Switch { targets, .. } => match targets {
+                    SwitchTargets::If(a, b) => vec![a, b],
+                    SwitchTargets::SwitchInt(_, arms, default) => {
+                        let mut v: Vec<u64> = arms.iter().map(|(_, bb)| *bb).collect();
+                        v.push(default);
+                        v
+                    }
+                },
+                TermKind::Return
+                | TermKind::UnwindResume
+                | TermKind::Abort(_)
+                | TermKind::Unknown => vec![],
+            };
+            raw.into_iter()
+                .map(|t| t as usize)
+                .filter(|&t| t < n)
+                .collect()
+        };
+
+        // Iterative DFS recording postorder; reverse-postorder is its
+        // reverse.  `state`: 0 = white (unvisited), 1 = grey (on stack),
+        // 2 = black (done).  Stack entries are `(node, next-succ-index)`.
+        let mut state = vec![0u8; n];
+        let mut postorder: Vec<usize> = Vec::with_capacity(n);
+        let mut stack: Vec<(usize, usize)> = Vec::new();
+        state[0] = 1;
+        stack.push((0, 0));
+        while let Some(&(node, idx)) = stack.last() {
+            let s = succs(node);
+            if idx < s.len() {
+                stack.last_mut().unwrap().1 += 1;
+                let nxt = s[idx];
+                if state[nxt] == 0 {
+                    state[nxt] = 1;
+                    stack.push((nxt, 0));
+                }
+            } else {
+                state[node] = 2;
+                postorder.push(node);
+                stack.pop();
+            }
+        }
+        let mut order: Vec<usize> = postorder.into_iter().rev().collect();
+        // Blocks unreachable from bb0 are still lowered (kept complete),
+        // last and in MIR order — after every reachable def is seeded, so
+        // they can only see *more* bindings than linear order did.
+        for bb in 0..n {
+            if state[bb] != 2 {
+                order.push(bb);
+            }
+        }
+        order
     }
 
     fn lower_block(&mut self, mir_bb: usize) -> Result<(), LowerError> {
