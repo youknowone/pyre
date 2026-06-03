@@ -335,6 +335,70 @@ impl PyreMetaInterp {
                     .unwrap_or_else(|| semantic_fallthrough_pc(code, pc));
                 // Concrete execution step
                 self.concrete_execute_step();
+                // Fused-compare concrete catch-up. A fused COMPARE+POP_JUMP
+                // (try_fused_compare_goto_if_not) records one branch guard and
+                // advances the symbolic pc PAST the POP_JUMP in a single trace
+                // step, but the concrete_execute_step above ran only the
+                // COMPARE. The inline-frame pc is read from the concrete
+                // frame's next_instr (interpret()), so leaving the concrete
+                // frame at the POP_JUMP re-steps the already-consumed branch
+                // (stack underflow during trace opcode → graceful abort,
+                // blocking inline tracing through the compare). Drive the
+                // concrete frame through the POP_JUMP — its concrete branch
+                // lands at the same `next_target` the fused step chose — until
+                // it reaches the symbolic pc. Trivia is positioned-past as
+                // interpret()'s prelude does (Cache/ExtendedArg/Nop/NotTaken,
+                // NOT Resume); only a real opcode strictly before the target
+                // (the fused POP_JUMP) is executed.
+                //
+                // Gated to NON-recursive inline frames. The catch-up is
+                // correct on its own (a non-recursive inlined callee with a
+                // compare traces cleanly with it), but letting a *recursive*
+                // inline chain proceed past the compare exposes a separate,
+                // pre-existing bug in the recursion-unroll machinery (the
+                // compiled trace fails to terminate). Until that is fixed,
+                // recursive inline frames keep the old behavior — the fused
+                // compare desyncs and the inline trace aborts gracefully, so
+                // recursion still JITs via the CALL_ASSEMBLER self-recursion
+                // path. `jitcode` appearing 2+ times on the framestack marks a
+                // recursive chain.
+                let top_jitcode = self.framestack.last().unwrap().jitcode;
+                let is_recursive_chain = self
+                    .framestack
+                    .iter()
+                    .filter(|f| f.jitcode == top_jitcode)
+                    .count()
+                    >= 2;
+                if !is_recursive_chain {
+                    let mut guard = 0u32;
+                    loop {
+                        let top = self.framestack.last_mut().unwrap();
+                        let target = top.pc;
+                        let Some(cf) = top.owned_concrete_frame.as_mut() else {
+                            break;
+                        };
+                        let ccode = unsafe { &*pyre_interpreter::pyframe_get_pycode(&**cf) };
+                        let mut ni = cf.next_instr();
+                        while ni < target {
+                            match pyre_interpreter::decode_instruction_at(ccode, ni) {
+                                Some((
+                                    Instruction::Cache
+                                    | Instruction::ExtendedArg
+                                    | Instruction::Nop
+                                    | Instruction::NotTaken,
+                                    _,
+                                )) => ni += 1,
+                                _ => break,
+                            }
+                        }
+                        cf.set_last_instr_from_next_instr(ni);
+                        if ni >= target || guard >= 16 {
+                            break;
+                        }
+                        self.concrete_execute_step();
+                        guard += 1;
+                    }
+                }
                 LoopAction::Continue
             }
             super::state::InlineTraceStepAction::Trace(TraceAction::Finish {
