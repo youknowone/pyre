@@ -2217,6 +2217,22 @@ fn build_class_inner(
 
     frame.execute_frame(None, None)?;
 
+    // type_new_classcell (typeobject.c) — capture the `__classcell__` cell
+    // so its content can be set to the new class below, then drop the
+    // compiler-internal scaffolding from the namespace so it never reaches
+    // the class `__dict__`.  `__class__` / `__classdict__` are cellvar
+    // names that `fast2locals` mirrors in; `__classcell__` /
+    // `__classdictcell__` are the cells the class body stores explicitly.
+    // CPython leaves none of them in the class dict.
+    let classcell = {
+        let class_ns = unsafe { &mut *class_ns_ptr };
+        let cell = class_ns.get("__classcell__").copied();
+        for key in ["__class__", "__classdict__", "__classcell__", "__classdictcell__"] {
+            class_ns.remove(key);
+        }
+        cell
+    };
+
     // Create W_TypeObject from the class namespace
     // PyPy: type.__new__(type, name, bases, dict_w) + compute_mro + ready()
     // PyPy: typeobject.py — if not bases_w: bases_w = [space.w_object]
@@ -2343,10 +2359,11 @@ fn build_class_inner(
         w
     };
 
-    // CPython: if __classcell__ is in the namespace, set the cell's content
-    // to the newly created class. This enables `__class__` references in methods.
-    let class_ns = unsafe { &*class_ns_ptr };
-    if let Some(&classcell) = class_ns.get("__classcell__") {
+    // type_new_classcell — set the captured `__classcell__` cell's content
+    // to the newly created class so `__class__` / zero-arg `super()`
+    // references in the methods resolve.  The namespace key was already
+    // removed above.
+    if let Some(classcell) = classcell {
         if !classcell.is_null() && unsafe { pyre_object::is_cell(classcell) } {
             unsafe { pyre_object::w_cell_set(classcell, w_type) };
         }

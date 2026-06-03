@@ -2002,25 +2002,25 @@ impl OpcodeStepExecutor for PyFrame {
         Ok(())
     }
 
-    /// MAKE_CELL — no-op in pyre.
+    /// MAKE_CELL — wrap the slot value in a W_CellObject.
     ///
     /// CPython 3.13 / RustPython MAKE_CELL — create cell object in slot.
-    ///
-    /// PyPy: pyframe.py cell initialization.
     /// Wraps the current value (PY_NULL if uninitialized) in a W_CellObject.
     /// LoadFast on cell slots returns the cell object itself (needed for
     /// closure creation via BUILD_TUPLE + SET_FUNCTION_ATTRIBUTE).
+    ///
+    /// `initialize_frame_scopes` already installs an empty cell for every
+    /// pure cellvar (a cellvar not shadowing a parameter).  Only an
+    /// argument slot promoted to a cellvar still holds a raw value here,
+    /// so wrap solely when the slot is not already a cell — otherwise a
+    /// never-reassigned cellvar like `__class__` would become a
+    /// cell-wrapping-a-cell, and `fast2locals` / closure reads would
+    /// surface the inner cell instead of the value.
     fn make_cell(&mut self, idx: usize) -> Result<(), PyError> {
-        let code = unsafe { &*crate::pyframe_get_pycode(self) };
-        if std::env::var("PYRE_DEBUG_CELL").is_ok() {
-            eprintln!("  varnames: {:?}", code.varnames);
-            eprintln!("  cellvars: {:?}", code.cellvars);
-            for (i, instr) in code.instructions.iter().enumerate().take(25) {
-                eprintln!("  {i}: {:?}", instr);
-            }
-        }
         let current = self.locals_w()[idx];
-        self.locals_w_mut()[idx] = pyre_object::w_cell_new(current);
+        if current.is_null() || !unsafe { pyre_object::is_cell(current) } {
+            self.locals_w_mut()[idx] = pyre_object::w_cell_new(current);
+        }
         Ok(())
     }
 
