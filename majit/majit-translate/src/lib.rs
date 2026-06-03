@@ -1614,7 +1614,7 @@ fn analyze_pipeline_from_parsed(
 
     mark_phase!("call_control + canonical_trait_impls + register graphs");
     let (opcode_dispatch, jitcodes, insns, descrs) =
-        build_canonical_opcode_dispatch(parsed_files, &config.pipeline, &mut call_control);
+        build_canonical_opcode_dispatch(&program, &config.pipeline, &mut call_control);
     mark_phase!("build_canonical_opcode_dispatch");
     pipeline.opcode_dispatch = opcode_dispatch;
     pipeline.jitcodes = jitcodes;
@@ -1652,7 +1652,7 @@ fn analyze_pipeline_from_parsed(
 /// orthodox `drain_pending_graphs` loop picks them up exactly the same way
 /// it picks up callee graphs discovered during jtransform.
 fn build_canonical_opcode_dispatch(
-    parsed_files: &[parse::ParsedInterpreter],
+    program: &front::SemanticProgram,
     pipeline_config: &pipeline::PipelineConfig,
     call_control: &mut call::CallControl,
 ) -> (
@@ -1661,15 +1661,13 @@ fn build_canonical_opcode_dispatch(
     majit_ir::vec_assoc::VecAssoc<String, u8>,
     Vec<jitcode::BhDescr>,
 ) {
-    let mut opcode_arms = Vec::new();
-
-    for parsed in parsed_files {
-        let file_opcodes = parse::extract_opcode_dispatch_arms(parsed);
-        if !file_opcodes.is_empty() {
-            opcode_arms = file_opcodes;
-            break;
-        }
-    }
+    // Reconstruct the opcode-dispatch arms from the lowered MIR
+    // `execute_opcode_step` graph (`front::mir_dispatch`), not the syn
+    // AST.  `reject_duplicate_opcode_selectors` keeps the parser-level
+    // uniqueness invariant.
+    let opcode_arms = parse::reject_duplicate_opcode_selectors(
+        front::mir_dispatch::extract_opcode_dispatch_arms_from_mir(program),
+    );
 
     // RPython codewriter.py:74-89: make_jitcodes().
     //

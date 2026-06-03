@@ -1225,7 +1225,9 @@ fn synthesize_raise_stub_wrapper(
     )
 }
 
-fn reject_duplicate_opcode_selectors(arms: Vec<ExtractedOpcodeArm>) -> Vec<ExtractedOpcodeArm> {
+pub(crate) fn reject_duplicate_opcode_selectors(
+    arms: Vec<ExtractedOpcodeArm>,
+) -> Vec<ExtractedOpcodeArm> {
     let mut seen = std::collections::HashMap::new();
     for (idx, arm) in arms.iter().enumerate() {
         let key = arm.selector.canonical_key();
