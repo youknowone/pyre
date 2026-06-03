@@ -134,6 +134,46 @@ pub unsafe fn header_of(obj_addr: usize) -> *mut GcHeader {
     (obj_addr - GcHeader::SIZE) as *mut GcHeader
 }
 
+/// Allocate a value of type `T` behind a leading zeroed [`GcHeader`] and
+/// return the payload pointer (`block + GcHeader::SIZE`).
+///
+/// Mirrors incminimark's `malloc_fixedsize`: reserve `size_gc_header + size`
+/// bytes, initialise the header at the block start
+/// (`init_gc_object(result, typeid, flags=0)`), and return
+/// `obj = result + size_gc_header`. The header is zeroed (`tid = 0`, all
+/// flags clear) so a write barrier reading `*(obj - SIZE)` sees
+/// `TRACK_YOUNG_PTRS = 0` / `OLDGEN_TRACKED = 0` and skips the object: it is
+/// immortal (leaked), not tracked by the nursery or old generation.
+///
+/// The allocation is intentionally leaked — these objects outlive every
+/// collection until the managed allocator takes them over. Callers MUST NOT
+/// `Box::from_raw` the result: it points past the header, not at the
+/// allocation base.
+///
+/// `T` must be word-aligned (`align_of::<T>() <= GcHeader::SIZE`), matching
+/// the fixed one-word header; a wider alignment would move the payload off
+/// the fixed `obj - SIZE` offset the barrier reads.
+pub fn alloc_with_gc_header<T>(value: T) -> *mut T {
+    debug_assert!(
+        std::mem::align_of::<T>() <= GcHeader::SIZE,
+        "object alignment exceeds GcHeader::SIZE; fixed header offset would break the write barrier",
+    );
+    let total = GcHeader::SIZE + std::mem::size_of::<T>();
+    let align = std::mem::align_of::<T>().max(GcHeader::SIZE);
+    let layout = std::alloc::Layout::from_size_align(total, align)
+        .expect("alloc_with_gc_header: invalid layout");
+    unsafe {
+        let raw = std::alloc::alloc(layout);
+        if raw.is_null() {
+            std::alloc::handle_alloc_error(layout);
+        }
+        (raw as *mut GcHeader).write(GcHeader::new(0));
+        let ptr = raw.add(GcHeader::SIZE) as *mut T;
+        ptr.write(value);
+        ptr
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -181,6 +221,21 @@ mod tests {
     #[test]
     fn test_header_size() {
         assert_eq!(GcHeader::SIZE, 8);
+    }
+
+    #[test]
+    fn alloc_with_gc_header_prepends_zeroed_header() {
+        // Leaked intentionally — the managed/immortal allocation contract
+        // forbids freeing the returned payload pointer.
+        let p = alloc_with_gc_header(0xABCD_u64);
+        unsafe {
+            assert_eq!(*p, 0xABCD);
+            let hdr = header_of(p as usize);
+            // Zeroed header => barrier reads TRACK_YOUNG_PTRS=0 and skips.
+            assert_eq!((*hdr).tid_and_flags, 0);
+            assert!(!(*hdr).has_flag(flags::TRACK_YOUNG_PTRS));
+            assert!(!(*hdr).has_flag(flags::OLDGEN_TRACKED));
+        }
     }
 
     #[test]

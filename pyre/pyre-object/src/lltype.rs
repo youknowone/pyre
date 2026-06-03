@@ -30,9 +30,15 @@
 //!    2026-04-25 review explicitly endorsed as an alternative to a
 //!    full structural GC transform.
 //!
-//! Current body: `Box::into_raw(Box::new(value))` — the pre-existing
-//! leak baseline. Future work routes through a GC-managed
-//! allocator with proper root push/pop.
+//! Current body: [`majit_gc::header::alloc_with_gc_header`] — the
+//! `malloc_fixedsize` analog that prepends a zeroed [`GcHeader`] and
+//! returns the payload pointer, so the write barrier reads a valid header
+//! (`TRACK_YOUNG_PTRS = 0`) and skips these still-leaked objects. The GC
+//! owns the header (incminimark defines its own `HDR`); the object model
+//! delegates and stays header-agnostic. Future work routes through the
+//! same allocator with nursery management and proper root push/pop.
+//!
+//! [`GcHeader`]: majit_gc::header::GcHeader
 
 /// Per-type GC metadata, mirroring the compile-time constants that
 /// RPython's `gct_fv_gc_malloc` (`framework.py:807-811`) closes over:
@@ -188,14 +194,16 @@ pub trait PyreClassPyTypeOf {
 /// adaptation of RPython's API to Rust's value-construction model.
 #[inline]
 pub fn malloc<T>(value: T) -> *mut T {
-    Box::into_raw(Box::new(value))
+    majit_gc::header::alloc_with_gc_header(value)
 }
 
 /// Typed variant of [`malloc`]: requires `T: GcType` so the future
 /// managed allocator can read `T::TYPE_ID` and `T::SIZE` without a
-/// runtime registry lookup. Current body identical to [`malloc`];
-/// will later route through the GC-managed allocator with proper
-/// `push_roots` / `pop_roots` brackets (`framework.py:853-856`).
+/// runtime registry lookup. Shares [`malloc`]'s body — the
+/// `alloc_with_gc_header` prepend — and will later route through the
+/// GC-managed allocator with proper `push_roots` / `pop_roots` brackets
+/// (`framework.py:853-856`), writing the real `T::TYPE_ID` into the
+/// header instead of the current zeroed placeholder.
 ///
 /// New call sites should prefer [`malloc_typed`] over [`malloc`]
 /// once their `T` has an assigned GC type id; the untyped variant
@@ -207,15 +215,19 @@ pub fn malloc_typed<T: GcType>(value: T) -> *mut T {
         T::SIZE,
         "GcType::SIZE drift from std::mem::size_of"
     );
-    Box::into_raw(Box::new(value))
+    majit_gc::header::alloc_with_gc_header(value)
 }
 
 /// `lltype.malloc(T, flavor='raw')` parity. Non-GC heap allocation;
 /// caller manages lifetime via `Box::from_raw` later.
 ///
-/// Distinct from [`malloc`] only in intent today (both call
-/// `Box::into_raw`); future GC integration will keep this on the
-/// raw allocator while [`malloc`] moves to the managed allocator.
+/// Unlike [`malloc`] / [`malloc_typed`] (which now prepend a [`GcHeader`]
+/// via `alloc_with_gc_header`), this stays a bare `Box::into_raw` with no
+/// header, so `Box::from_raw` on its output remains sound. Used for
+/// `String`s, dict `dstorage`, and other allocations that must NOT migrate
+/// to the managed allocator.
+///
+/// [`GcHeader`]: majit_gc::header::GcHeader
 #[inline]
 pub fn malloc_raw<T>(value: T) -> *mut T {
     Box::into_raw(Box::new(value))
@@ -244,6 +256,18 @@ mod tests {
         let p = malloc(42u32);
         unsafe {
             assert_eq!(*p, 42);
+        }
+    }
+
+    #[test]
+    fn malloc_prepends_zeroed_gc_header() {
+        let p = malloc(0x1234_5678_u64);
+        unsafe {
+            assert_eq!(*p, 0x1234_5678);
+            // A zeroed GcHeader precedes the payload, so the write barrier
+            // reads `*(obj - SIZE)` as TRACK_YOUNG_PTRS=0 and skips it.
+            let hdr = majit_gc::header::header_of(p as usize);
+            assert_eq!((*hdr).tid_and_flags, 0);
         }
     }
 
