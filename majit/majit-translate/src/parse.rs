@@ -1,5 +1,6 @@
 //! Source parsing: extract opcode dispatch and trait impls.
 
+use crate::front::opcode_wrapper::{RaiseStubReturn, WrappedUnitVariantReturn};
 use crate::{MethodInfo, TraitImplInfo};
 use serde::{Deserialize, Serialize};
 use syn::{ExprMatch, File, Item, ItemFn, Pat, Path, visit::Visit};
@@ -1018,19 +1019,6 @@ fn detect_single_tail_call(body: &syn::Expr) -> Option<(CallPath, Vec<String>)> 
     Some((CallPath { segments }, forwarded))
 }
 
-/// A constant-return arm body of the form `Wrapper(Owner::Variant)` —
-/// e.g. `Ok(StepResult::Continue)`.  `wrapper_*` is the transparent
-/// result/option ctor (`Ok`/`Err`/`Some`); `inner_*` is the synthetic
-/// unit-variant ctor it wraps.  Carries the owner/leaf split so the
-/// synthesizer builds the exact two-`Call` chain directly, with no
-/// syn-AST graph builder.
-struct WrappedUnitVariantReturn {
-    wrapper_owner: Vec<String>,
-    wrapper_name: String,
-    inner_owner: Vec<String>,
-    inner_name: String,
-}
-
 fn path_owner_leaf(segments: &[String]) -> (Vec<String>, String) {
     let (leaf, owner) = segments
         .split_last()
@@ -1104,163 +1092,53 @@ fn detect_wrapped_unit_variant_return(body: &syn::Expr) -> Option<WrappedUnitVar
 /// runtime seeds the dispatch entry from the full dispatcher register
 /// layout, so the wrapper MUST keep every dispatcher param as an
 /// inputarg even when the handler forwards only a subset.
+/// Extract the dispatcher parameter prologue `(name, ValueType)` from a
+/// syn signature, in signature order (`self` receiver typed via its
+/// reference type, named params via [`canonical_pat_name`] +
+/// [`classify_fn_arg_ty`]).  This is the only syn-touching step of arm
+/// wrapper synthesis; the resulting prologue feeds the syn-free builders
+/// in [`crate::front::opcode_wrapper`] that the MIR dispatch extractor
+/// shares.
+fn dispatcher_params_from_sig(sig: &syn::Signature) -> Vec<(String, crate::model::ValueType)> {
+    sig.inputs
+        .iter()
+        .map(|param| match param {
+            syn::FnArg::Receiver(recv) => (
+                "self".to_string(),
+                crate::front::syn_metadata::classify_fn_arg_ty(&recv.ty),
+            ),
+            syn::FnArg::Typed(pat_type) => (
+                crate::front::syn_metadata::canonical_pat_name(&pat_type.pat),
+                crate::front::syn_metadata::classify_fn_arg_ty(&pat_type.ty),
+            ),
+        })
+        .collect()
+}
+
 fn synthesize_tail_call_wrapper(
     name: &str,
     sig: &syn::Signature,
     handler_path: &CallPath,
     forwarded: &[String],
 ) -> crate::model::FunctionGraph {
-    use crate::model::{CallTarget, OpKind, ValueType};
-    let mut graph = crate::model::FunctionGraph::new(name.to_string());
-    let block = graph.startblock;
-    let mut param_vars: std::collections::HashMap<String, crate::flowspace::model::Variable> =
-        std::collections::HashMap::new();
-    for param in &sig.inputs {
-        let (pname, pty) = match param {
-            syn::FnArg::Receiver(recv) => (
-                "self".to_string(),
-                crate::front::syn_metadata::classify_fn_arg_ty(&recv.ty),
-            ),
-            syn::FnArg::Typed(pat_type) => (
-                crate::front::syn_metadata::canonical_pat_name(&pat_type.pat),
-                crate::front::syn_metadata::classify_fn_arg_ty(&pat_type.ty),
-            ),
-        };
-        if let Some(var) = graph.push_op_var(
-            block,
-            OpKind::Input {
-                name: pname.clone(),
-                ty: pty,
-                class_root: None,
-            },
-            true,
-        ) {
-            graph.name_value_var(&var, pname.clone());
-            graph.push_inputarg_var(block, var.clone());
-            param_vars.insert(pname, var);
-        }
-    }
-    let args: Vec<crate::flowspace::model::Variable> = forwarded
-        .iter()
-        .map(|pname| {
-            param_vars.get(pname).cloned().unwrap_or_else(|| {
-                panic!(
-                    "opcode arm `{name}`: tail-call forwards `{pname}`, \
-                     which is not a dispatcher parameter"
-                )
-            })
-        })
-        .collect();
-    let result = graph.push_op_var(
-        block,
-        OpKind::Call {
-            target: CallTarget::FunctionPath {
-                segments: handler_path.segments.clone(),
-            },
-            args,
-            result_ty: ValueType::Unknown,
-        },
-        true,
-    );
-    graph.set_return(block, result);
-    graph
+    crate::front::opcode_wrapper::build_tail_call_wrapper(
+        name,
+        &dispatcher_params_from_sig(sig),
+        handler_path,
+        forwarded,
+    )
 }
 
-/// Push one `OpKind::Input` per dispatcher parameter (in signature
-/// order, typed via `classify_fn_arg_ty`) as the startblock inputargs —
-/// the shared prologue of every synthesized opcode-arm wrapper.  The
-/// runtime seeds the dispatch entry from the full dispatcher register
-/// layout, so a wrapper must keep every dispatcher param as an inputarg
-/// even when the body reads only a subset (or none).
-fn push_dispatcher_inputargs(graph: &mut crate::model::FunctionGraph, sig: &syn::Signature) {
-    use crate::model::OpKind;
-    let block = graph.startblock;
-    for param in &sig.inputs {
-        let (pname, pty) = match param {
-            syn::FnArg::Receiver(recv) => (
-                "self".to_string(),
-                crate::front::syn_metadata::classify_fn_arg_ty(&recv.ty),
-            ),
-            syn::FnArg::Typed(pat_type) => (
-                crate::front::syn_metadata::canonical_pat_name(&pat_type.pat),
-                crate::front::syn_metadata::classify_fn_arg_ty(&pat_type.ty),
-            ),
-        };
-        if let Some(var) = graph.push_op_var(
-            block,
-            OpKind::Input {
-                name: pname.clone(),
-                ty: pty,
-                class_root: None,
-            },
-            true,
-        ) {
-            graph.name_value_var(&var, pname.clone());
-            graph.push_inputarg_var(block, var);
-        }
-    }
-}
-
-/// Build the dispatcher-shaped wrapper graph for a constant-return arm
-/// (`Wrapper(Owner::Variant)`, e.g. `Ok(StepResult::Continue)`), with no
-/// syn-AST graph builder.  Shape: one
-/// `OpKind::Input` per dispatcher parameter as the startblock inputargs,
-/// then a 0-arg `SyntheticTransparentCtor` Call for the inner
-/// unit-variant, then a 1-arg `SyntheticTransparentCtor` Call for the
-/// outer wrapper, then a return of the wrapper result.  Both ctor calls
-/// carry `result_ty: Unknown`; downstream `unit_variant_fold` folds the
-/// inner to a `ConstRef` and `jtransform` elides the transparent wrapper.
 fn synthesize_wrapped_unit_variant_wrapper(
     name: &str,
     sig: &syn::Signature,
     ret: &WrappedUnitVariantReturn,
 ) -> crate::model::FunctionGraph {
-    use crate::model::{CallTarget, OpKind, ValueType};
-    let mut graph = crate::model::FunctionGraph::new(name.to_string());
-    push_dispatcher_inputargs(&mut graph, sig);
-    let block = graph.startblock;
-    let inner = graph
-        .push_op_var(
-            block,
-            OpKind::Call {
-                target: CallTarget::synthetic_transparent_ctor_with_owner(
-                    ret.inner_owner.clone(),
-                    ret.inner_name.clone(),
-                ),
-                args: Vec::new(),
-                result_ty: ValueType::Unknown,
-            },
-            true,
-        )
-        .expect("SyntheticTransparentCtor Call has has_result=true");
-    let outer = graph.push_op_var(
-        block,
-        OpKind::Call {
-            target: CallTarget::synthetic_transparent_ctor_with_owner(
-                ret.wrapper_owner.clone(),
-                ret.wrapper_name.clone(),
-            ),
-            args: vec![inner],
-            result_ty: ValueType::Unknown,
-        },
-        true,
-    );
-    graph.set_return(block, outer);
-    graph
-}
-
-/// A raise-stub arm body of the form `Wrapper(FnPath(<lit>).method())` —
-/// e.g. `Err(crate::PyError::type_error("async not yet implemented").into())`.
-/// The string-literal argument lowers to an untranslatable `Abort` (so
-/// the opcode always deopts to the interpreter rather than JITing),
-/// wrapped by the constructor function call, an adapter method call, and
-/// a transparent result/option ctor.
-struct RaiseStubReturn {
-    fn_segments: Vec<String>,
-    method_name: String,
-    wrapper_owner: Vec<String>,
-    wrapper_name: String,
-    literal: crate::model::UnsupportedLiteralKind,
+    crate::front::opcode_wrapper::build_wrapped_unit_variant_wrapper(
+        name,
+        &dispatcher_params_from_sig(sig),
+        ret,
+    )
 }
 
 /// Recognize an arm body of the form `Wrapper(FnPath(<lit>).method())`
@@ -1335,72 +1213,16 @@ fn detect_raise_stub_return(body: &syn::Expr) -> Option<RaiseStubReturn> {
     })
 }
 
-/// Build the dispatcher-shaped wrapper graph for a raise-stub arm
-/// (`Wrapper(FnPath(<lit>).method())`, e.g.
-/// `Err(crate::PyError::type_error("...").into())`), with no syn-AST
-/// graph builder.  Shape: the
-/// dispatcher inputargs, then an `Abort` for the untranslatable literal,
-/// then a `FunctionPath` Call (the ctor fn) consuming it, then a `Method`
-/// Call (the `.into()` adapter), then the transparent result/option
-/// wrapper ctor, then a return of the wrapper result.  The `Abort` makes
-/// any trace that reaches this opcode deopt to the interpreter — correct
-/// for stub opcodes that always raise.
 fn synthesize_raise_stub_wrapper(
     name: &str,
     sig: &syn::Signature,
     stub: &RaiseStubReturn,
 ) -> crate::model::FunctionGraph {
-    use crate::model::{CallTarget, OpKind, UnknownKind, ValueType};
-    let mut graph = crate::model::FunctionGraph::new(name.to_string());
-    push_dispatcher_inputargs(&mut graph, sig);
-    let block = graph.startblock;
-    let literal = graph
-        .push_op_var(
-            block,
-            OpKind::Abort {
-                kind: UnknownKind::UnsupportedLiteral {
-                    variant: stub.literal.clone(),
-                },
-            },
-            true,
-        )
-        .expect("Abort has has_result=true");
-    let constructed = graph
-        .push_op_var(
-            block,
-            OpKind::Call {
-                target: CallTarget::function_path(stub.fn_segments.clone()),
-                args: vec![literal],
-                result_ty: ValueType::Unknown,
-            },
-            true,
-        )
-        .expect("FunctionPath Call has has_result=true");
-    let converted = graph
-        .push_op_var(
-            block,
-            OpKind::Call {
-                target: CallTarget::method(stub.method_name.clone(), None),
-                args: vec![constructed],
-                result_ty: ValueType::Unknown,
-            },
-            true,
-        )
-        .expect("Method Call has has_result=true");
-    let wrapped = graph.push_op_var(
-        block,
-        OpKind::Call {
-            target: CallTarget::synthetic_transparent_ctor_with_owner(
-                stub.wrapper_owner.clone(),
-                stub.wrapper_name.clone(),
-            ),
-            args: vec![converted],
-            result_ty: ValueType::Unknown,
-        },
-        true,
-    );
-    graph.set_return(block, wrapped);
-    graph
+    crate::front::opcode_wrapper::build_raise_stub_wrapper(
+        name,
+        &dispatcher_params_from_sig(sig),
+        stub,
+    )
 }
 
 fn reject_duplicate_opcode_selectors(arms: Vec<ExtractedOpcodeArm>) -> Vec<ExtractedOpcodeArm> {

@@ -220,6 +220,7 @@
 
 pub mod llbc_hints;
 pub mod mir;
+pub mod opcode_wrapper;
 pub mod raise;
 pub mod semantic;
 pub mod syn_metadata;
