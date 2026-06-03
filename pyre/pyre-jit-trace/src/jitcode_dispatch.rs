@@ -4954,6 +4954,57 @@ fn collect_outer_active_boxes(
     active
 }
 
+/// Emit the intermediate merge-point vable→heap writeback the trait's
+/// `close_loop_args_at` (`trace_opcode.rs:2875-2950`) runs at every
+/// `jit_merge_point`: override the vable `last_instr` scalar to
+/// `merge_pc - 1`, mirror it into the `virtualizable_boxes` shadow, and —
+/// when the target LABEL is the reds-only reduced shape — store the vable
+/// scalars + array back to the heap `PyFrame`.
+///
+/// The walker's loop-close path already routes through `close_loop_args_at`
+/// (`trace.rs` `run_perfn_walk` CloseLoop post-processing), so it emits the
+/// FINAL writeback.  The `jit_merge_point` REGISTER branch — an intermediate
+/// loop header reached mid-trace, e.g. a bridge re-entering the inner loop —
+/// returned `Continue` without it, so the compiled body left the heap
+/// frame's `last_instr` (and array slots) at the trace-seed (loop-header)
+/// state.  A later guard-fail resume then re-read that stale heap frame and
+/// underflowed the interpreter value stack (#62 / #67-remaining).
+fn emit_intermediate_merge_point_writeback(ctx: &mut TraceCtx, merge_pc: usize) {
+    let Some(vable_box) = ctx.standard_virtualizable_box() else {
+        return;
+    };
+    // close_loop_args_at:2875-2891 — last_instr = merge target pc - 1, so a
+    // resume into this merge point re-enters at the header opcode.
+    let last_instr_value = merge_pc as i64 - 1;
+    let opref = ctx.const_int(last_instr_value);
+    crate::trace_opcode::mirror_vable_static_to_boxes(
+        ctx,
+        "last_instr",
+        opref,
+        Value::Int(last_instr_value),
+    );
+    // close_loop_args_at:2922-2950 — heap writeback on the reds-only
+    // (reduced) target LABEL, whose patched preamble re-reads the vable
+    // static + array fields from the heap on every iteration.
+    let target_inputarg_len: Option<usize> = {
+        let (driver, _) = crate::driver::driver_pair();
+        if driver.is_bridge_tracing() {
+            driver
+                .current_trace_green_key()
+                .and_then(|gk| driver.get_loop_token(gk))
+                .map(|token| token.inputarg_types.len())
+        } else {
+            Some(ctx.inputarg_types().len())
+        }
+    };
+    if let Some(len) = target_inputarg_len {
+        let is_reduced_label = len > 0 && len < crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
+        if is_reduced_label {
+            ctx.gen_writeback_vable_to_heap(vable_box);
+        }
+    }
+}
+
 /// Walker-side port of `pyjitpl.py:2586-2602 MIFrame.capture_resumedata`
 /// for the `after_residual_call=True` path (`pyjitpl.py:2078-2082
 /// handle_possible_exception`).  Attaches a single-frame snapshot to
@@ -9830,6 +9881,14 @@ fn handle(
                 // header is `next_instr`.  Record it so the deferred void-store
                 // drain can tell whether a buffered store sits in an enclosing
                 // scope relative to the loop that ultimately closes (#63).
+                //
+                // Emit the intermediate merge-point vable→heap writeback the
+                // trait runs unconditionally via `close_loop_args_at` before
+                // the register/close decision.  Without it the compiled body
+                // (notably a bridge re-entering this header) leaves the heap
+                // `PyFrame` `last_instr`/array at the trace seed, so a later
+                // guard-fail resume mis-reads it (#62 / #67-remaining).
+                emit_intermediate_merge_point_writeback(ctx.trace_ctx, next_instr);
                 void_defer_push_register(next_instr);
                 let green_boxes: Vec<majit_metainterp::GreenBox> = live_args
                     .iter()
