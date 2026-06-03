@@ -8,22 +8,6 @@ use crate::DictStorage;
 use crate::importing::host::{fs as host_fs, os as host_os};
 use pyre_object::PyObjectRef;
 
-/// Shared plain instance bag with hasdict so that attributes can be set
-/// from Rust.  Still used by the `terminal_size` / `uname` / `statvfs` /
-/// `times` result builders below until they are migrated to structseqs.
-fn stat_result_type() -> PyObjectRef {
-    thread_local! {
-        static STAT_RESULT_TYPE: std::cell::OnceCell<PyObjectRef> = const { std::cell::OnceCell::new() };
-    }
-    STAT_RESULT_TYPE.with(|c| {
-        *c.get_or_init(|| {
-            let tp = crate::typedef::make_builtin_type("stat_result", |_ns| {});
-            unsafe { pyre_object::typeobject::w_type_set_hasdict(tp, true) };
-            tp
-        })
-    })
-}
-
 /// `posix.stat_result` — a real structseq (tuple subclass) so `st[0]`,
 /// `len(st)`, iteration and `isinstance(st, tuple)` all work, matching
 /// `posixmodule.c` `stat_result_desc`.  The 10 sequence slots hold the
@@ -50,6 +34,76 @@ fn stat_result_seq_type() -> PyObjectRef {
                     "st_atime_ns",
                     "st_mtime_ns",
                     "st_ctime_ns",
+                ],
+            )
+        })
+    })
+}
+
+/// `os.terminal_size` structseq — `(columns, lines)`.
+fn terminal_size_seq_type() -> PyObjectRef {
+    thread_local! {
+        static T: std::cell::OnceCell<PyObjectRef> = const { std::cell::OnceCell::new() };
+    }
+    T.with(|c| {
+        *c.get_or_init(|| {
+            crate::structseq::make_struct_seq("os.terminal_size", &["columns", "lines"])
+        })
+    })
+}
+
+/// `os.uname_result` structseq — `(sysname, nodename, release, version,
+/// machine)`; repr renders "posix.uname_result(...)".
+fn uname_result_seq_type() -> PyObjectRef {
+    thread_local! {
+        static T: std::cell::OnceCell<PyObjectRef> = const { std::cell::OnceCell::new() };
+    }
+    T.with(|c| {
+        *c.get_or_init(|| {
+            crate::structseq::make_struct_seq(
+                "posix.uname_result",
+                &["sysname", "nodename", "release", "version", "machine"],
+            )
+        })
+    })
+}
+
+/// `os.statvfs_result` structseq — 10 sequence slots with `f_fsid` as an
+/// extra named field (`n_sequence_fields=10`, `n_fields=11`).
+fn statvfs_result_seq_type() -> PyObjectRef {
+    thread_local! {
+        static T: std::cell::OnceCell<PyObjectRef> = const { std::cell::OnceCell::new() };
+    }
+    T.with(|c| {
+        *c.get_or_init(|| {
+            crate::structseq::make_struct_seq_with_extra(
+                "os.statvfs_result",
+                &[
+                    "f_bsize", "f_frsize", "f_blocks", "f_bfree", "f_bavail", "f_files", "f_ffree",
+                    "f_favail", "f_flag", "f_namemax",
+                ],
+                &["f_fsid"],
+            )
+        })
+    })
+}
+
+/// `os.times_result` structseq — `(user, system, children_user,
+/// children_system, elapsed)`; repr renders "posix.times_result(...)".
+fn times_result_seq_type() -> PyObjectRef {
+    thread_local! {
+        static T: std::cell::OnceCell<PyObjectRef> = const { std::cell::OnceCell::new() };
+    }
+    T.with(|c| {
+        *c.get_or_init(|| {
+            crate::structseq::make_struct_seq(
+                "posix.times_result",
+                &[
+                    "user",
+                    "system",
+                    "children_user",
+                    "children_system",
+                    "elapsed",
                 ],
             )
         })
@@ -631,42 +685,14 @@ pub fn register_module(ns: &mut DictStorage) {
             1,
         ),
     );
-    // os.terminal_size — namedtuple-like type with columns/lines.
-    // Uses stat_result_type (hasdict instance) so setattr works.
+    // os.terminal_size — structseq (columns, lines).
     fn make_terminal_size(cols: i64, lines: i64) -> pyre_object::PyObjectRef {
-        let instance = pyre_object::w_instance_new(stat_result_type());
-        let _ = crate::baseobjspace::setattr(instance, "columns", pyre_object::w_int_new(cols));
-        let _ = crate::baseobjspace::setattr(instance, "lines", pyre_object::w_int_new(lines));
-        instance
+        crate::structseq::new_instance(
+            terminal_size_seq_type(),
+            vec![pyre_object::w_int_new(cols), pyre_object::w_int_new(lines)],
+        )
     }
-    let terminal_size_type = crate::typedef::make_builtin_type("terminal_size", |ns| {
-        crate::dict_storage_store(
-            ns,
-            "__new__",
-            crate::make_builtin_function("__new__", |args| {
-                let (cols, rows) = if args.len() >= 2 {
-                    let seq = args[1];
-                    unsafe {
-                        if pyre_object::is_tuple(seq) {
-                            let c = pyre_object::w_tuple_getitem(seq, 0)
-                                .map(|v| pyre_object::w_int_get_value(v))
-                                .unwrap_or(80);
-                            let r = pyre_object::w_tuple_getitem(seq, 1)
-                                .map(|v| pyre_object::w_int_get_value(v))
-                                .unwrap_or(24);
-                            (c, r)
-                        } else {
-                            (80, 24)
-                        }
-                    }
-                } else {
-                    (80, 24)
-                };
-                Ok(make_terminal_size(cols, rows))
-            }),
-        );
-    });
-    crate::dict_storage_store(ns, "terminal_size", terminal_size_type);
+    crate::dict_storage_store(ns, "terminal_size", terminal_size_seq_type());
 
     // ── posix.get_terminal_size(fd=1) → os.terminal_size(columns, lines) ──
     crate::dict_storage_store(
@@ -691,17 +717,7 @@ pub fn register_module(ns: &mut DictStorage) {
                         (80, 24)
                     }
                 };
-                let result = pyre_object::w_tuple_new(vec![
-                    pyre_object::w_int_new(cols),
-                    pyre_object::w_int_new(rows),
-                ]);
-                let wrapper = pyre_object::w_instance_new(stat_result_type());
-                let _ =
-                    crate::baseobjspace::setattr(wrapper, "columns", pyre_object::w_int_new(cols));
-                let _ =
-                    crate::baseobjspace::setattr(wrapper, "lines", pyre_object::w_int_new(rows));
-                let _ = crate::baseobjspace::setattr(wrapper, "__tuple__", result);
-                Ok(wrapper)
+                Ok(make_terminal_size(cols, rows))
             },
             0,
         ),
@@ -910,9 +926,8 @@ pub fn register_module(ns: &mut DictStorage) {
         crate::make_builtin_function_with_arity(
             "uname",
             |_| {
-                let wrapper = pyre_object::w_instance_new(stat_result_type());
                 #[cfg(all(unix, feature = "host_env"))]
-                {
+                let (sysname, nodename, release, version, machine) = {
                     let info = rustpython_host_env::posix::uname_info().unwrap_or(
                         rustpython_host_env::posix::UnameInfo {
                             sysname: String::new(),
@@ -922,63 +937,32 @@ pub fn register_module(ns: &mut DictStorage) {
                             machine: String::new(),
                         },
                     );
-                    let _ = crate::baseobjspace::setattr(
-                        wrapper,
-                        "sysname",
-                        pyre_object::w_str_new(&info.sysname),
-                    );
-                    let _ = crate::baseobjspace::setattr(
-                        wrapper,
-                        "nodename",
-                        pyre_object::w_str_new(&info.nodename),
-                    );
-                    let _ = crate::baseobjspace::setattr(
-                        wrapper,
-                        "release",
-                        pyre_object::w_str_new(&info.release),
-                    );
-                    let _ = crate::baseobjspace::setattr(
-                        wrapper,
-                        "version",
-                        pyre_object::w_str_new(&info.version),
-                    );
-                    let _ = crate::baseobjspace::setattr(
-                        wrapper,
-                        "machine",
-                        pyre_object::w_str_new(&info.machine),
-                    );
-                }
+                    (
+                        info.sysname,
+                        info.nodename,
+                        info.release,
+                        info.version,
+                        info.machine,
+                    )
+                };
                 #[cfg(not(all(unix, feature = "host_env")))]
-                {
-                    let sysname = std::env::consts::OS.to_string();
-                    let machine = std::env::consts::ARCH.to_string();
-                    let _ = crate::baseobjspace::setattr(
-                        wrapper,
-                        "sysname",
+                let (sysname, nodename, release, version, machine) = (
+                    std::env::consts::OS.to_string(),
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                    std::env::consts::ARCH.to_string(),
+                );
+                Ok(crate::structseq::new_instance(
+                    uname_result_seq_type(),
+                    vec![
                         pyre_object::w_str_new(&sysname),
-                    );
-                    let _ = crate::baseobjspace::setattr(
-                        wrapper,
-                        "nodename",
-                        pyre_object::w_str_new(""),
-                    );
-                    let _ = crate::baseobjspace::setattr(
-                        wrapper,
-                        "release",
-                        pyre_object::w_str_new(""),
-                    );
-                    let _ = crate::baseobjspace::setattr(
-                        wrapper,
-                        "version",
-                        pyre_object::w_str_new(""),
-                    );
-                    let _ = crate::baseobjspace::setattr(
-                        wrapper,
-                        "machine",
+                        pyre_object::w_str_new(&nodename),
+                        pyre_object::w_str_new(&release),
+                        pyre_object::w_str_new(&version),
                         pyre_object::w_str_new(&machine),
-                    );
-                }
-                Ok(wrapper)
+                    ],
+                ))
             },
             0,
         ),
@@ -1570,63 +1554,20 @@ pub fn register_module(ns: &mut DictStorage) {
         fn statvfs_to_obj(
             info: rustpython_host_env::posix::StatVfsInfo,
         ) -> pyre_object::PyObjectRef {
-            let wrapper = pyre_object::w_instance_new(stat_result_type());
-            let _ = crate::baseobjspace::setattr(
-                wrapper,
-                "f_bsize",
+            let seq = vec![
                 pyre_object::w_int_new(info.f_bsize as i64),
-            );
-            let _ = crate::baseobjspace::setattr(
-                wrapper,
-                "f_frsize",
                 pyre_object::w_int_new(info.f_frsize as i64),
-            );
-            let _ = crate::baseobjspace::setattr(
-                wrapper,
-                "f_blocks",
                 pyre_object::w_int_new(info.f_blocks as i64),
-            );
-            let _ = crate::baseobjspace::setattr(
-                wrapper,
-                "f_bfree",
                 pyre_object::w_int_new(info.f_bfree as i64),
-            );
-            let _ = crate::baseobjspace::setattr(
-                wrapper,
-                "f_bavail",
                 pyre_object::w_int_new(info.f_bavail as i64),
-            );
-            let _ = crate::baseobjspace::setattr(
-                wrapper,
-                "f_files",
                 pyre_object::w_int_new(info.f_files as i64),
-            );
-            let _ = crate::baseobjspace::setattr(
-                wrapper,
-                "f_ffree",
                 pyre_object::w_int_new(info.f_ffree as i64),
-            );
-            let _ = crate::baseobjspace::setattr(
-                wrapper,
-                "f_favail",
                 pyre_object::w_int_new(info.f_favail as i64),
-            );
-            let _ = crate::baseobjspace::setattr(
-                wrapper,
-                "f_flag",
                 pyre_object::w_int_new(info.f_flag as i64),
-            );
-            let _ = crate::baseobjspace::setattr(
-                wrapper,
-                "f_namemax",
                 pyre_object::w_int_new(info.f_namemax as i64),
-            );
-            let _ = crate::baseobjspace::setattr(
-                wrapper,
-                "f_fsid",
-                pyre_object::w_int_new(info.f_fsid as i64),
-            );
-            wrapper
+            ];
+            let extras = vec![("f_fsid", pyre_object::w_int_new(info.f_fsid as i64))];
+            crate::structseq::new_instance_with_extra(statvfs_result_seq_type(), seq, extras)
         }
         #[cfg(not(target_os = "redox"))]
         crate::dict_storage_store(
@@ -1865,33 +1806,16 @@ pub fn register_module(ns: &mut DictStorage) {
                 |_| {
                     let t =
                         rustpython_host_env::time::process_times().map_err(|e| io_err(e, ""))?;
-                    let wrapper = pyre_object::w_instance_new(stat_result_type());
-                    let _ = crate::baseobjspace::setattr(
-                        wrapper,
-                        "user",
-                        pyre_object::w_float_new(t.user),
-                    );
-                    let _ = crate::baseobjspace::setattr(
-                        wrapper,
-                        "system",
-                        pyre_object::w_float_new(t.system),
-                    );
-                    let _ = crate::baseobjspace::setattr(
-                        wrapper,
-                        "children_user",
-                        pyre_object::w_float_new(t.children_user),
-                    );
-                    let _ = crate::baseobjspace::setattr(
-                        wrapper,
-                        "children_system",
-                        pyre_object::w_float_new(t.children_system),
-                    );
-                    let _ = crate::baseobjspace::setattr(
-                        wrapper,
-                        "elapsed",
-                        pyre_object::w_float_new(t.elapsed),
-                    );
-                    Ok(wrapper)
+                    Ok(crate::structseq::new_instance(
+                        times_result_seq_type(),
+                        vec![
+                            pyre_object::w_float_new(t.user),
+                            pyre_object::w_float_new(t.system),
+                            pyre_object::w_float_new(t.children_user),
+                            pyre_object::w_float_new(t.children_system),
+                            pyre_object::w_float_new(t.elapsed),
+                        ],
+                    ))
                 },
                 0,
             ),
