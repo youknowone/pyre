@@ -164,23 +164,49 @@ impl W_Kqueue {
             changelist.as_ptr()
         };
 
-        let nfds = unsafe {
-            libc::kevent(
-                self.kqfd,
-                pchangelist,
-                changelist.len() as libc::c_int,
-                eventlist.as_mut_ptr(),
-                max_events as libc::c_int,
-                ptimeout,
+        // `interp_kqueue.py:214` — EINTR retry, recomputing the remaining
+        // timeout each pass (`ptimeout` aliases the mutable `ts`).
+        let deadline = if have_timeout {
+            Some(
+                std::time::Instant::now()
+                    + std::time::Duration::new(ts.tv_sec.max(0) as u64, ts.tv_nsec.max(0) as u32),
             )
+        } else {
+            None
         };
-        if nfds < 0 {
+        let nfds = loop {
+            let r = unsafe {
+                libc::kevent(
+                    self.kqfd,
+                    pchangelist,
+                    changelist.len() as libc::c_int,
+                    eventlist.as_mut_ptr(),
+                    max_events as libc::c_int,
+                    ptimeout,
+                )
+            };
+            if r >= 0 {
+                break r;
+            }
             let e = std::io::Error::last_os_error();
+            if e.raw_os_error() == Some(libc::EINTR) {
+                if let Some(dl) = deadline {
+                    let now = std::time::Instant::now();
+                    let rem = if now >= dl {
+                        std::time::Duration::ZERO
+                    } else {
+                        dl - now
+                    };
+                    ts.tv_sec = rem.as_secs() as libc::time_t;
+                    ts.tv_nsec = rem.subsec_nanos() as libc::c_long;
+                }
+                continue;
+            }
             return Err(crate::PyError::os_error_with_errno(
                 e.raw_os_error().unwrap_or(0),
                 format!("kevent: {e}"),
             ));
-        }
+        };
         unsafe { eventlist.set_len(nfds as usize) };
 
         let result: Vec<PyObjectRef> = eventlist

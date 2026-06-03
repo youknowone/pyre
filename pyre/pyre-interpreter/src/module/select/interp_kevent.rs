@@ -52,28 +52,36 @@ impl W_Kevent {
     doc = "kevent(ident, filter=KQ_FILTER_READ, flags=KQ_EV_ADD, fflags=0, data=0, udata=0)"
 )]
 impl W_Kevent {
-    /// `interp_kqueue.py:275 descr__init__`.  `ident` is an int fd or an
-    /// object with `fileno()`; the rest are integer bitmasks.
+    /// `interp_kqueue.py:274 descr__init__`.  Mirrors
+    /// `@unwrap_spec(filter=int, flags='c_uint', fflags='c_uint', data=int,
+    /// udata=r_uint)`: `ident` is `uint_w` for an int else
+    /// `c_filedescriptor_w`; `flags`/`fflags` are `c_uint` (reject
+    /// negative / >0xffffffff); `udata` is `r_uint` (full unsigned word).
     fn __init__(
         &mut self,
         w_ident: PyObjectRef,
-        #[default(libc::EVFILT_READ as i64)] filter: i64,
-        #[default(libc::EV_ADD as i64)] flags: i64,
-        #[default(0i64)] fflags: i64,
-        #[default(0i64)] data: i64,
-        #[default(0i64)] udata: i64,
+        #[default(pyre_object::w_int_new(libc::EVFILT_READ as i64))] w_filter: PyObjectRef,
+        #[default(pyre_object::w_int_new(libc::EV_ADD as i64))] w_flags: PyObjectRef,
+        #[default(pyre_object::w_int_new(0))] w_fflags: PyObjectRef,
+        #[default(pyre_object::w_int_new(0))] w_data: PyObjectRef,
+        #[default(pyre_object::w_int_new(0))] w_udata: PyObjectRef,
     ) -> Result<(), crate::PyError> {
-        let ident = if unsafe { pyre_object::is_int(w_ident) } {
-            unsafe { pyre_object::w_int_get_value(w_ident) as u64 }
+        let ident: u64 = if unsafe { pyre_object::is_int(w_ident) } {
+            crate::baseobjspace::uint_w(w_ident)?
         } else {
             filedescriptor_w(w_ident)? as u64
         };
+        let filter = crate::baseobjspace::int_w(w_filter)?;
+        let flags = crate::baseobjspace::c_uint_w(w_flags)?;
+        let fflags = crate::baseobjspace::c_uint_w(w_fflags)?;
+        let data = crate::baseobjspace::int_w(w_data)?;
+        let udata = crate::baseobjspace::uint_w(w_udata)?;
         self.ident = ident;
         self.filter = filter as i16;
         self.flags = flags as u16;
-        self.fflags = fflags as u32;
+        self.fflags = fflags;
         self.data = data;
-        self.udata = udata as u64;
+        self.udata = udata;
         Ok(())
     }
 

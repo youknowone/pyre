@@ -68,12 +68,11 @@ impl W_Poll {
         #[default(pyre_object::w_none())] w_events: PyObjectRef,
     ) -> Result<(), crate::PyError> {
         let fd = filedescriptor_w(w_fd)?;
+        // @unwrap_spec(events="c_ushort"): reject negative / >0xffff.
         let events = if unsafe { pyre_object::is_none(w_events) } {
             default_poll_events()
-        } else if unsafe { pyre_object::is_int(w_events) } {
-            unsafe { pyre_object::w_int_get_value(w_events) as i16 }
         } else {
-            return Err(crate::PyError::type_error("events must be an integer"));
+            crate::baseobjspace::c_ushort_w(w_events)? as i16
         };
         self.fddict.insert(fd, events);
         Ok(())
@@ -83,10 +82,8 @@ impl W_Poll {
     /// a descriptor that was never registered.
     fn modify(&mut self, w_fd: PyObjectRef, w_events: PyObjectRef) -> Result<(), crate::PyError> {
         let fd = filedescriptor_w(w_fd)?;
-        if !unsafe { pyre_object::is_int(w_events) } {
-            return Err(crate::PyError::type_error("events must be an integer"));
-        }
-        let events = unsafe { pyre_object::w_int_get_value(w_events) as i16 };
+        // @unwrap_spec(events="c_ushort"): reject negative / >0xffff.
+        let events = crate::baseobjspace::c_ushort_w(w_events)? as i16;
         let known = self.fddict.contains_key(&fd);
         if known {
             self.fddict.insert(fd, events);
@@ -118,14 +115,31 @@ impl W_Poll {
         &mut self,
         #[default(pyre_object::w_none())] w_timeout: PyObjectRef,
     ) -> Result<PyObjectRef, crate::PyError> {
+        // `None` / negative → block indefinitely (timeout = -1).  Otherwise
+        // `c_int_w(space.int(w_timeout))`: truncate a float to int, then
+        // range-check to a 32-bit C int (millisecond count).
         let timeout: i32 = if unsafe { pyre_object::is_none(w_timeout) } {
             -1
         } else if unsafe { pyre_object::is_int(w_timeout) } {
             let t = unsafe { pyre_object::w_int_get_value(w_timeout) };
-            if t < 0 { -1 } else { t.min(i32::MAX as i64) as i32 }
+            if t < 0 {
+                -1
+            } else if t > i32::MAX as i64 {
+                return Err(crate::PyError::overflow_error("expected a 32-bit integer"));
+            } else {
+                t as i32
+            }
         } else if unsafe { pyre_object::is_float(w_timeout) } {
             let t = unsafe { pyre_object::w_float_get_value(w_timeout) };
-            if t < 0.0 { -1 } else { t as i32 }
+            if t < 0.0 {
+                -1
+            } else {
+                let trunc = t.trunc();
+                if trunc > i32::MAX as f64 {
+                    return Err(crate::PyError::overflow_error("expected a 32-bit integer"));
+                }
+                trunc as i32
+            }
         } else {
             return Err(crate::PyError::type_error(
                 "timeout must be an integer or None",
@@ -148,16 +162,38 @@ impl W_Poll {
             })
             .collect();
 
+        // EINTR retry with a recomputed timeout, mirroring
+        // `interp_select.py:89` (round the remaining time up to the next ms).
+        let deadline = (timeout >= 0)
+            .then(|| std::time::Instant::now() + std::time::Duration::from_millis(timeout as u64));
+        let mut cur_timeout = timeout;
         self.running = true;
-        let ret = unsafe { libc::poll(pollfds.as_mut_ptr(), pollfds.len() as _, timeout) };
-        self.running = false;
-        if ret < 0 {
+        let ret = loop {
+            let r =
+                unsafe { libc::poll(pollfds.as_mut_ptr(), pollfds.len() as _, cur_timeout) };
+            if r >= 0 {
+                break r;
+            }
             let e = std::io::Error::last_os_error();
+            if e.raw_os_error() == Some(libc::EINTR) {
+                if let Some(dl) = deadline {
+                    let now = std::time::Instant::now();
+                    cur_timeout = if now >= dl {
+                        0
+                    } else {
+                        ((dl - now).as_secs_f64() * 1000.0 + 0.999) as i32
+                    };
+                }
+                continue;
+            }
+            self.running = false;
             return Err(crate::PyError::os_error_with_errno(
                 e.raw_os_error().unwrap_or(0),
                 format!("poll: {e}"),
             ));
-        }
+        };
+        self.running = false;
+        let _ = ret;
 
         let retval: Vec<PyObjectRef> = pollfds
             .iter()
@@ -194,39 +230,17 @@ pub fn register_module(ns: &mut DictStorage) {
                     ));
                 }
 
-                // `interp_select.py:as_fdescr` — each item is either an
-                // int file descriptor or an object exposing fileno().
-                // pyre's list/tuple coverage matches CPython's
-                // PySequence_Fast usage; bare iterables (generators)
-                // would require iterator-protocol plumbing not yet
-                // exposed at this layer.
+                // `interp_select.py:226` — `space.unpackiterable` accepts any
+                // iterable (list, tuple, generator, …); each item is an int
+                // fd or an object exposing fileno().
                 fn collect_fds(
                     seq: pyre_object::PyObjectRef,
                 ) -> Result<Vec<(pyre_object::PyObjectRef, i32)>, crate::PyError> {
-                    unsafe {
-                        let is_list = pyre_object::is_list(seq);
-                        let is_tuple = pyre_object::is_tuple(seq);
-                        if !is_list && !is_tuple {
-                            return Err(crate::PyError::type_error(
-                                "select() arguments 1-3 must be sequences",
-                            ));
-                        }
-                        let n = if is_list {
-                            pyre_object::w_list_len(seq)
-                        } else {
-                            pyre_object::w_tuple_len(seq)
-                        };
-                        let mut out = Vec::with_capacity(n);
-                        for i in 0..n {
-                            let item = if is_list {
-                                pyre_object::w_list_getitem(seq, i as i64)
-                            } else {
-                                pyre_object::w_tuple_getitem(seq, i as i64)
-                            }
-                            .ok_or_else(|| {
-                                crate::PyError::value_error("select() sequence item missing")
-                            })?;
-                            let fd_val = if pyre_object::is_int(item) {
+                    let items = crate::baseobjspace::unpackiterable(seq, -1)?;
+                    let mut out = Vec::with_capacity(items.len());
+                    for item in items {
+                        let fd_val = unsafe {
+                            if pyre_object::is_int(item) {
                                 pyre_object::w_int_get_value(item)
                             } else {
                                 let fileno =
@@ -242,52 +256,39 @@ pub fn register_module(ns: &mut DictStorage) {
                                     ));
                                 }
                                 pyre_object::w_int_get_value(res)
-                            };
-                            if fd_val < 0 {
-                                return Err(crate::PyError::value_error(
-                                    "file descriptor cannot be a negative integer",
-                                ));
                             }
-                            if fd_val > i32::MAX as i64 {
-                                return Err(crate::PyError::overflow_error(
-                                    "file descriptor out of range",
-                                ));
-                            }
-                            out.push((item, fd_val as i32));
+                        };
+                        if fd_val < 0 {
+                            return Err(crate::PyError::value_error(
+                                "file descriptor cannot be a negative integer",
+                            ));
                         }
-                        Ok(out)
+                        if fd_val > i32::MAX as i64 {
+                            return Err(crate::PyError::overflow_error(
+                                "file descriptor out of range",
+                            ));
+                        }
+                        out.push((item, fd_val as i32));
                     }
+                    Ok(out)
                 }
 
                 let rfds = collect_fds(args[0])?;
                 let wfds = collect_fds(args[1])?;
                 let xfds = collect_fds(args[2])?;
 
-                let mut rset = host_select::FdSet::new();
-                let mut wset = host_select::FdSet::new();
-                let mut xset = host_select::FdSet::new();
                 let mut nfds: i32 = -1;
-                for &(_, fd) in &rfds {
-                    rset.insert(fd);
-                    if fd > nfds {
-                        nfds = fd;
-                    }
-                }
-                for &(_, fd) in &wfds {
-                    wset.insert(fd);
-                    if fd > nfds {
-                        nfds = fd;
-                    }
-                }
-                for &(_, fd) in &xfds {
-                    xset.insert(fd);
-                    if fd > nfds {
-                        nfds = fd;
+                for fds in [&rfds, &wfds, &xfds] {
+                    for &(_, fd) in fds {
+                        if fd > nfds {
+                            nfds = fd;
+                        }
                     }
                 }
 
-                let mut tv_storage;
-                let timeout_ref: Option<&mut host_select::timeval> = match args.get(3) {
+                // `interp_select.py:227-235` — `None` blocks forever, else a
+                // non-negative float second count.
+                let timeout_secs: Option<f64> = match args.get(3) {
                     None => None,
                     Some(&t) if unsafe { pyre_object::is_none(t) } => None,
                     Some(&t) => {
@@ -307,19 +308,66 @@ pub fn register_module(ns: &mut DictStorage) {
                                 "timeout must be non-negative",
                             ));
                         }
-                        tv_storage = host_select::sec_to_timeval(secs);
-                        Some(&mut tv_storage)
+                        Some(secs)
                     }
                 };
 
-                let n = host_select::select(nfds + 1, &mut rset, &mut wset, &mut xset, timeout_ref)
-                    .map_err(|e| {
-                        crate::PyError::os_error_with_errno(
-                            e.raw_os_error().unwrap_or(0),
-                            format!("select: {e}"),
-                        )
-                    })?;
-                let _ = n;
+                // `interp_select.py:166` — EINTR retry, recomputing the
+                // remaining timeout each pass and rebuilding the fd sets
+                // (select() clobbers them on every call).
+                let deadline = timeout_secs
+                    .map(|s| std::time::Instant::now() + std::time::Duration::from_secs_f64(s));
+                let mut rset = host_select::FdSet::new();
+                let mut wset = host_select::FdSet::new();
+                let mut xset = host_select::FdSet::new();
+                loop {
+                    rset = host_select::FdSet::new();
+                    wset = host_select::FdSet::new();
+                    xset = host_select::FdSet::new();
+                    for &(_, fd) in &rfds {
+                        rset.insert(fd);
+                    }
+                    for &(_, fd) in &wfds {
+                        wset.insert(fd);
+                    }
+                    for &(_, fd) in &xfds {
+                        xset.insert(fd);
+                    }
+                    let mut tv_storage;
+                    let timeout_ref: Option<&mut host_select::timeval> = match timeout_secs {
+                        None => None,
+                        Some(_) => {
+                            let remaining = deadline
+                                .map(|dl| {
+                                    let now = std::time::Instant::now();
+                                    if now >= dl {
+                                        0.0
+                                    } else {
+                                        (dl - now).as_secs_f64()
+                                    }
+                                })
+                                .unwrap_or(0.0);
+                            tv_storage = host_select::sec_to_timeval(remaining);
+                            Some(&mut tv_storage)
+                        }
+                    };
+                    match host_select::select(
+                        nfds + 1,
+                        &mut rset,
+                        &mut wset,
+                        &mut xset,
+                        timeout_ref,
+                    ) {
+                        Ok(_) => break,
+                        Err(e) if e.raw_os_error() == Some(libc::EINTR) => continue,
+                        Err(e) => {
+                            return Err(crate::PyError::os_error_with_errno(
+                                e.raw_os_error().unwrap_or(0),
+                                format!("select: {e}"),
+                            ));
+                        }
+                    }
+                }
 
                 fn build_ready(
                     set: &mut host_select::FdSet,
