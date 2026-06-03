@@ -53,6 +53,24 @@ pub fn register_module(ns: &mut DictStorage) {
                 let ispeed = host_termios::cfgetispeed(&t);
                 let ospeed = host_termios::cfgetospeed(&t);
                 let cc_list = make_cc_bytes(&t.c_cc[..]);
+                // interp_termios.py:53 — in noncanonical mode VMIN/VTIME are
+                // single-byte counters, surfaced as ints rather than bytes.
+                if (t.c_lflag & libc::ICANON) == 0 {
+                    let vmin = libc::VMIN as usize;
+                    let vtime = libc::VTIME as usize;
+                    unsafe {
+                        pyre_object::w_list_setitem(
+                            cc_list,
+                            vmin as i64,
+                            pyre_object::w_int_new(t.c_cc[vmin] as i64),
+                        );
+                        pyre_object::w_list_setitem(
+                            cc_list,
+                            vtime as i64,
+                            pyre_object::w_int_new(t.c_cc[vtime] as i64),
+                        );
+                    }
+                }
                 Ok(pyre_object::w_list_new(vec![
                     pyre_object::w_int_new(t.c_iflag as i64),
                     pyre_object::w_int_new(t.c_oflag as i64),
@@ -84,37 +102,33 @@ pub fn register_module(ns: &mut DictStorage) {
             }
             let fd = (unsafe { pyre_object::w_int_get_value(args[0]) }) as i32;
             let when = (unsafe { pyre_object::w_int_get_value(args[1]) }) as i32;
+            // interp_termios.py:23-29 — arg 3 is a 7-element list or tuple,
+            // unpacked via space.unpackiterable.
             let attrs = args[2];
-            if !unsafe { pyre_object::is_list(attrs) } {
-                return Err(crate::PyError::type_error(
-                    "tcsetattr: attributes must be a list",
-                ));
-            }
-            let n = unsafe { pyre_object::w_list_len(attrs) };
-            if n != 7 {
-                return Err(crate::PyError::type_error(
-                    "tcsetattr: attributes must be a 7-element list",
-                ));
-            }
-            let get = |i: usize| -> Result<pyre_object::PyObjectRef, crate::PyError> {
-                unsafe { pyre_object::w_list_getitem(attrs, i as i64) }
-                    .ok_or_else(|| crate::PyError::value_error("tcsetattr: missing item"))
-            };
-            for i in 0..6 {
-                let item = get(i)?;
-                if !unsafe { pyre_object::is_int(item) } {
-                    return Err(crate::PyError::type_error(
-                        "tcsetattr: numeric attribute fields must be integers",
-                    ));
+            let is_list = unsafe { pyre_object::is_list(attrs) };
+            let is_tuple = unsafe { pyre_object::is_tuple(attrs) };
+            let attr_len = unsafe {
+                if is_list {
+                    pyre_object::w_list_len(attrs)
+                } else if is_tuple {
+                    pyre_object::w_tuple_len(attrs)
+                } else {
+                    0
                 }
+            };
+            if (!is_list && !is_tuple) || attr_len != 7 {
+                return Err(crate::PyError::type_error(
+                    "tcsetattr, arg 3: must be 7 element list",
+                ));
             }
-            let iflag = unsafe { pyre_object::w_int_get_value(get(0)?) } as libc::tcflag_t;
-            let oflag = unsafe { pyre_object::w_int_get_value(get(1)?) } as libc::tcflag_t;
-            let cflag = unsafe { pyre_object::w_int_get_value(get(2)?) } as libc::tcflag_t;
-            let lflag = unsafe { pyre_object::w_int_get_value(get(3)?) } as libc::tcflag_t;
-            let ispeed = unsafe { pyre_object::w_int_get_value(get(4)?) } as libc::speed_t;
-            let ospeed = unsafe { pyre_object::w_int_get_value(get(5)?) } as libc::speed_t;
-            let cc_obj = get(6)?;
+            let fields = crate::baseobjspace::unpackiterable(attrs, 7)?;
+            let iflag = crate::baseobjspace::int_w(fields[0])? as libc::tcflag_t;
+            let oflag = crate::baseobjspace::int_w(fields[1])? as libc::tcflag_t;
+            let cflag = crate::baseobjspace::int_w(fields[2])? as libc::tcflag_t;
+            let lflag = crate::baseobjspace::int_w(fields[3])? as libc::tcflag_t;
+            let ispeed = crate::baseobjspace::int_w(fields[4])? as libc::speed_t;
+            let ospeed = crate::baseobjspace::int_w(fields[5])? as libc::speed_t;
+            let cc_obj = fields[6];
 
             // Start from the current settings so we preserve any platform-private fields.
             let mut t = host_termios::tcgetattr(fd).map_err(|e| {
@@ -140,21 +154,24 @@ pub fn register_module(ns: &mut DictStorage) {
                 )
             })?;
 
-            // Populate c_cc[] — each element is either an int or a length-1 bytes.
-            // tcgetattr returns a list, so we only accept lists here.
-            if !unsafe { pyre_object::is_list(cc_obj) } {
-                return Err(crate::PyError::type_error(
-                    "tcsetattr: c_cc slot must be a list",
-                ));
-            }
-            let cc_len = unsafe { pyre_object::w_list_len(cc_obj) };
+            // interp_termios.py:30-33 — c_cc is any iterable; an int element
+            // goes through bytes([x]) (range 0..=255), a bytes element keeps
+            // its first byte.
+            let cc_items = crate::baseobjspace::unpackiterable(cc_obj, -1)?;
             let nccs = t.c_cc.len();
-            for i in 0..cc_len.min(nccs) {
-                let item = unsafe { pyre_object::w_list_getitem(cc_obj, i as i64) }
-                    .ok_or_else(|| crate::PyError::value_error("tcsetattr: missing cc item"))?;
+            for (i, &item) in cc_items.iter().enumerate() {
+                if i >= nccs {
+                    break;
+                }
                 let byte = unsafe {
                     if pyre_object::is_int(item) {
-                        pyre_object::w_int_get_value(item) as libc::cc_t
+                        let v = pyre_object::w_int_get_value(item);
+                        if !(0..=255).contains(&v) {
+                            return Err(crate::PyError::value_error(
+                                "bytes must be in range(0, 256)",
+                            ));
+                        }
+                        v as libc::cc_t
                     } else if pyre_object::bytesobject::is_bytes_like(item) {
                         let data = pyre_object::bytesobject::bytes_like_data(item);
                         if data.is_empty() {
@@ -308,12 +325,7 @@ pub fn register_module(ns: &mut DictStorage) {
                         "tcgetwinsize() requires 1 argument",
                     ));
                 }
-                if !unsafe { pyre_object::is_int(args[0]) } {
-                    return Err(crate::PyError::type_error(
-                        "tcgetwinsize: fd must be an integer",
-                    ));
-                }
-                let fd = (unsafe { pyre_object::w_int_get_value(args[0]) }) as i32;
+                let fd = crate::baseobjspace::c_filedescriptor_w(args[0])?;
                 let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
                 let ret = unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut ws) };
                 if ret != 0 {
@@ -344,56 +356,21 @@ pub fn register_module(ns: &mut DictStorage) {
                         "tcsetwinsize() requires 2 arguments",
                     ));
                 }
-                if !unsafe { pyre_object::is_int(args[0]) } {
-                    return Err(crate::PyError::type_error(
-                        "tcsetwinsize: fd must be an integer",
-                    ));
-                }
-                let fd = (unsafe { pyre_object::w_int_get_value(args[0]) }) as i32;
-                // `interp_termios.py:110-114` — argument 2 must be a 2-sequence.
-                let seq = args[1];
-                let two = if unsafe { pyre_object::is_list(seq) } {
-                    if unsafe { pyre_object::w_list_len(seq) } == 2 {
-                        unsafe {
-                            (
-                                pyre_object::w_list_getitem(seq, 0),
-                                pyre_object::w_list_getitem(seq, 1),
-                            )
-                        }
-                    } else {
-                        (None, None)
-                    }
-                } else if unsafe { pyre_object::is_tuple(seq) } {
-                    if unsafe { pyre_object::w_tuple_len(seq) } == 2 {
-                        unsafe {
-                            (
-                                pyre_object::w_tuple_getitem(seq, 0),
-                                pyre_object::w_tuple_getitem(seq, 1),
-                            )
-                        }
-                    } else {
-                        (None, None)
-                    }
-                } else {
-                    (None, None)
-                };
-                let (w_row, w_col) = match two {
-                    (Some(r), Some(c)) => (r, c),
-                    _ => {
-                        return Err(crate::PyError::type_error(
+                let fd = crate::baseobjspace::c_filedescriptor_w(args[0])?;
+                // `interp_termios.py:110-114` — argument 2 must be a
+                // 2-sequence (any iterable); a length mismatch (ValueError
+                // from unpackiterable) is reported as a TypeError.
+                let winsz = crate::baseobjspace::unpackiterable(args[1], 2).map_err(|e| {
+                    if e.kind == crate::PyErrorKind::ValueError {
+                        crate::PyError::type_error(
                             "tcsetwinsize: argument 2 must be a 2-sequence",
-                        ));
+                        )
+                    } else {
+                        e
                     }
-                };
-                if !unsafe { pyre_object::is_int(w_row) }
-                    || !unsafe { pyre_object::is_int(w_col) }
-                {
-                    return Err(crate::PyError::type_error(
-                        "tcsetwinsize: winsize elements must be integers",
-                    ));
-                }
-                let rows = unsafe { pyre_object::w_int_get_value(w_row) };
-                let cols = unsafe { pyre_object::w_int_get_value(w_col) };
+                })?;
+                let rows = crate::baseobjspace::int_w(winsz[0])?;
+                let cols = crate::baseobjspace::int_w(winsz[1])?;
                 let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
                 // `interp_termios.py:120` reads the current winsize first so
                 // `ws_xpixel` / `ws_ypixel` are preserved across the set.
