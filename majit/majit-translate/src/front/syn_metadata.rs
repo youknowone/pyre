@@ -965,31 +965,6 @@ fn synthesize_elidable_promote_pair(
 // allocator consumes this to pre-allocate inputarg slots in the header
 // block. No graph builder state is involved.
 
-/// `Ok`/`Err`/`Some` and their qualified spellings.  Always one-arg
-/// transparent wrappers that `jtransform::is_synthetic_result_option_ctor`
-/// elides at the `args.len() == 1` site.  Valid only as call targets.
-pub(crate) fn is_synthetic_result_option_wrapper_path(segments: &[String]) -> bool {
-    let path: Vec<&str> = segments.iter().map(String::as_str).collect();
-    matches!(
-        path.as_slice(),
-        ["Ok"]
-            | ["Err"]
-            | ["Some"]
-            | ["Result", "Ok"]
-            | ["Result", "Err"]
-            | ["Option", "Some"]
-            | ["result", "Result", "Ok"]
-            | ["result", "Result", "Err"]
-            | ["option", "Option", "Some"]
-            | ["std", "result", "Result", "Ok"]
-            | ["std", "result", "Result", "Err"]
-            | ["std", "option", "Option", "Some"]
-            | ["core", "result", "Result", "Ok"]
-            | ["core", "result", "Result", "Err"]
-            | ["core", "option", "Option", "Some"]
-    )
-}
-
 /// Pyre-side `Class::Variant` unit-variant ctors.  These are valid
 /// as bare path-expression values; `flowspace_adapter` pre-folds them
 /// to `Hlvalue::Constant(ConstValue::HostObject(prebuilt_instance))`
@@ -1014,38 +989,6 @@ pub(crate) fn is_synthetic_unit_variant_path(segments: &[String]) -> bool {
             | ["CompareOp", "Eq"]
             | ["CompareOp", "Ne"]
     )
-}
-
-pub(crate) fn canonical_pat_name(pat: &syn::Pat) -> String {
-    match pat {
-        syn::Pat::Ident(ident) => ident.ident.to_string(),
-        syn::Pat::Reference(reference) => canonical_pat_name(&reference.pat),
-        syn::Pat::Type(typed) => canonical_pat_name(&typed.pat),
-        syn::Pat::TupleStruct(tuple_struct) => tuple_struct
-            .path
-            .segments
-            .iter()
-            .map(|seg| seg.ident.to_string())
-            .collect::<Vec<_>>()
-            .join("::"),
-        syn::Pat::Struct(strukt) => strukt
-            .path
-            .segments
-            .iter()
-            .map(|seg| seg.ident.to_string())
-            .collect::<Vec<_>>()
-            .join("::"),
-        syn::Pat::Tuple(_) => "tuple_pat".into(),
-        syn::Pat::Slice(_) => "slice_pat".into(),
-        syn::Pat::Lit(_) => "lit_pat".into(),
-        syn::Pat::Path(_) => "path_pat".into(),
-        syn::Pat::Wild(_) => "_".into(),
-        syn::Pat::Or(_) => "or_pat".into(),
-        syn::Pat::Range(_) => "range_pat".into(),
-        syn::Pat::Macro(_) => "macro_pat".into(),
-        syn::Pat::Paren(paren) => canonical_pat_name(&paren.pat),
-        _ => "unsupported_pat".into(),
-    }
 }
 
 /// Classify a Rust parameter/return `syn::Type` into one of the

@@ -8,8 +8,8 @@
 //! artefact (the `pyre/check.py` path) exercise it.
 
 use majit_charon_reader::Llbc;
-use majit_translate::front::mir::build_semantic_program_from_llbc;
 use majit_translate::OpcodeDispatchSelector;
+use majit_translate::front::mir::build_semantic_program_from_llbc;
 use majit_translate::front::mir_dispatch::extract_opcode_dispatch_arms_from_mir;
 
 fn interpreter_ullbc() -> Option<Llbc> {

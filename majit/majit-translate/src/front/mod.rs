@@ -209,7 +209,7 @@
 //!   (`lower_expr_into_graph_with_signature`) was retired once every
 //!   `execute_opcode_step` arm routed through a seam synthesizer
 //!   (tail-call / const-return / raise-stub / wildcard tail-call in
-//!   `parse::extract_opcode_dispatch_arms`), so no arm needs syn-AST
+//!   `front::opcode_wrapper`), so no arm needs syn-AST
 //!   lowering.  The metadata/type helpers it re-exported live in
 //!   `front/semantic` and `front/syn_metadata`; callers reference those
 //!   modules directly.  The three AST-side CFG-reconstruction shims
