@@ -2,7 +2,13 @@
 //!
 //! Verbatim move of the inline block previously in importing.rs.
 
+use super::signalstate;
 use crate::DictStorage;
+use crate::executioncontext::{
+    AsyncAction, AsyncActionOps, ExecutionContext, PeriodicAsyncAction, PeriodicAsyncActionOps,
+};
+use crate::pyframe::PyFrame;
+use pyre_object::PyObjectRef;
 
 // `interp_signal.py:set_wakeup_fd` — stores the configured wakeup fd
 // for read-back via set_wakeup_fd(new) → previous_fd.  Real signal-to-fd
@@ -11,6 +17,214 @@ use crate::DictStorage;
 // handler, not per Python-thread), so we mirror that with an atomic.
 use std::sync::atomic::{AtomicI32, Ordering};
 static WAKEUP_FD: AtomicI32 = AtomicI32::new(-1);
+
+thread_local! {
+    /// interp_signal.py:157-167 `Handlers.handlers_w` — signum → handler
+    /// (a callable, or the SIG_DFL/SIG_IGN ints).  A real Python dict so
+    /// the GC traces the handler callables; pinned for the process
+    /// lifetime.  Missing keys mean SIG_DFL (the pre-fill in PyPy's
+    /// `Handlers.__init__`).
+    static HANDLERS: std::cell::Cell<PyObjectRef> = const { std::cell::Cell::new(pyre_object::PY_NULL) };
+    /// moduledef.py:15 `default_int_handler` — cached so
+    /// `getsignal(SIGINT) is signal.default_int_handler` holds after the
+    /// startup install.
+    static DEFAULT_INT_HANDLER: std::cell::Cell<PyObjectRef> = const { std::cell::Cell::new(pyre_object::PY_NULL) };
+}
+
+fn handlers_dict() -> PyObjectRef {
+    HANDLERS.with(|cell| {
+        let mut d = cell.get();
+        if d.is_null() {
+            d = pyre_object::w_dict_new();
+            pyre_object::gc_roots::pin_root(d);
+            cell.set(d);
+        }
+        d
+    })
+}
+
+/// interp_signal.py:196-209 `handlers_w[n]` lookup.  Returns `PY_NULL`
+/// for a signum with no registered handler (the KeyError → ignore arm).
+pub fn get_handler(signum: i32) -> PyObjectRef {
+    let d = handlers_dict();
+    unsafe { pyre_object::w_dict_getitem(d, signum as i64).unwrap_or(pyre_object::PY_NULL) }
+}
+
+/// interp_signal.py:323-325 `handlers_w[signum] = w_handler`.
+pub fn set_handler(signum: i32, handler: PyObjectRef) {
+    let d = handlers_dict();
+    unsafe { pyre_object::w_dict_setitem(d, signum as i64, handler) };
+}
+
+/// interp_signal.py:254-262 `default_int_handler` — `raise
+/// KeyboardInterrupt`.  Cached so the module attribute and the SIGINT
+/// handler-dict entry share one identity.
+pub fn default_int_handler_obj() -> PyObjectRef {
+    DEFAULT_INT_HANDLER.with(|cell| {
+        let mut h = cell.get();
+        if h.is_null() {
+            h = crate::make_builtin_function_with_arity(
+                "default_int_handler",
+                // issue #2780: accept and ignore any arguments.
+                |_| {
+                    let cls = crate::builtins::lookup_exc_class("KeyboardInterrupt")
+                        .expect("KeyboardInterrupt must be installed");
+                    let exc = crate::builtins::exc_exception_new(&[cls])
+                        .expect("exc_exception_new is infallible for empty args");
+                    Err(unsafe { crate::PyError::from_exc_object(exc) })
+                },
+                2,
+            );
+            pyre_object::gc_roots::pin_root(h);
+            cell.set(h);
+        }
+        h
+    })
+}
+
+/// interp_signal.py:54-152 `CheckSignalAction` — a periodic action run
+/// whenever the C-level ticker goes negative.  It polls the pending-signal
+/// bitmask and invokes the registered app-level handler for each signal,
+/// which for SIGINT (default) raises `KeyboardInterrupt`.
+pub struct CheckSignalAction {
+    base: PeriodicAsyncAction,
+    /// interp_signal.py:65 — a signal seen but not yet reported (used by
+    /// the threaded fire-in-another-thread path; always -1 in pyre).
+    pending_signal: i32,
+    /// interp_signal.py:66/103 — re-entrancy guard so a handler that
+    /// itself triggers a checkpoint does not recurse into polling.
+    in_poll: bool,
+}
+
+impl CheckSignalAction {
+    /// interp_signal.py:62-86 `CheckSignalAction.__init__`.
+    pub fn new(space: PyObjectRef) -> Box<Self> {
+        Box::new(Self {
+            base: PeriodicAsyncAction {
+                base: AsyncAction::new_periodic_base(space),
+            },
+            pending_signal: -1,
+            in_poll: false,
+        })
+    }
+
+    /// interp_signal.py:101-109 `_poll_for_signals` — the re-entrancy
+    /// guard around the unlocked poll.
+    fn poll_for_signals(&mut self, ec: &mut ExecutionContext) -> Result<(), crate::PyError> {
+        if self.in_poll {
+            return Ok(());
+        }
+        self.in_poll = true;
+        let result = self.poll_for_signals_unlocked(ec);
+        self.in_poll = false;
+        result
+    }
+
+    /// interp_signal.py:111-141 `_poll_for_signals_unlocked`.  pyre is
+    /// single-threaded, so `signals_enabled()` is always true and the
+    /// fire-in-another-thread branch is unreachable; the wakeup-fd write
+    /// error and remote-debugger arms are not surfaced.
+    fn poll_for_signals_unlocked(
+        &mut self,
+        ec: &mut ExecutionContext,
+    ) -> Result<(), crate::PyError> {
+        let mut n = self.pending_signal;
+        if n < 0 {
+            n = signalstate::signal_poll();
+        }
+        while n >= 0 {
+            self.pending_signal = -1;
+            report_signal(ec, n)?;
+            n = self.pending_signal;
+            if n < 0 {
+                n = signalstate::signal_poll();
+            }
+        }
+        Ok(())
+    }
+}
+
+/// interp_signal.py:196-209 `report_signal`.
+fn report_signal(ec: &mut ExecutionContext, n: i32) -> Result<(), crate::PyError> {
+    let w_handler = get_handler(n);
+    if w_handler.is_null() {
+        return Ok(()); // no handler, ignore signal
+    }
+    if !crate::baseobjspace::callable_w(w_handler) {
+        return Ok(()); // w_handler is SIG_IGN or SIG_DFL (an int)
+    }
+    // interp_signal.py:205 — re-install for OSes that clear the handler
+    // (no-op on SA_RESTART platforms).
+    signalstate::pypysig_reinstall(n);
+    // interp_signal.py:207-209 — call the handler with (signum, frame).
+    // pyre does not wrap the executing frame as a Python object, so the
+    // second argument is None (a valid value per the language spec when
+    // the frame is unavailable).
+    let _ = ec;
+    let w_n = pyre_object::w_int_new(n as i64);
+    let w_frame = pyre_object::w_none();
+    let res = crate::baseobjspace::call_function(w_handler, &[w_n, w_frame]);
+    if res.is_null() {
+        if let Some(err) = crate::call::take_call_error() {
+            return Err(err);
+        }
+    }
+    Ok(())
+}
+
+impl AsyncActionOps for CheckSignalAction {
+    /// interp_signal.py:94-99 `perform`.  The
+    /// `w_async_exception_type` arm only fires across threads, which pyre
+    /// does not have, so it stays a no-op guard and we proceed straight
+    /// to polling.
+    fn perform(
+        &mut self,
+        ec: &mut ExecutionContext,
+        _frame: *mut PyFrame,
+    ) -> Result<(), crate::PyError> {
+        self.poll_for_signals(ec)
+    }
+
+    fn async_action(&self) -> &AsyncAction {
+        &self.base.base
+    }
+
+    fn async_action_mut(&mut self) -> &mut AsyncAction {
+        &mut self.base.base
+    }
+}
+
+impl PeriodicAsyncActionOps for CheckSignalAction {}
+
+/// moduledef.py:62-66 + app_main.py:926 — install the signal-checking
+/// action on the execution context and route SIGINT to
+/// `default_int_handler` (so Ctrl-C raises `KeyboardInterrupt`).  Called
+/// once at interpreter startup.  Idempotent: a second call is a no-op.
+pub fn install_signal_handling(ec: &mut ExecutionContext) {
+    if ec.check_signal_action.is_some() {
+        return;
+    }
+    // moduledef.py:64-66 — register the periodic signal-check action.
+    // The action outlives the call (the EC and actionflag hold pointers
+    // into it for the whole run), so it is leaked deliberately.
+    let action: &'static mut CheckSignalAction = Box::leak(CheckSignalAction::new(ec.space));
+    let async_ptr: *mut dyn AsyncActionOps = &mut *action;
+    action.register_periodic_action(&mut ec.actionflag, false);
+    ec.check_signal_action = Some(async_ptr);
+
+    // Hand the ticker cell address to the OS handler so it can force the
+    // ticker negative (rsignal.py:31-32 `pypysig_getaddr_occurred`).
+    signalstate::register_ticker(ec.actionflag.ticker_addr());
+
+    // app_main.py:926 — `signal.signal(SIGINT, default_int_handler)`.
+    #[cfg(unix)]
+    {
+        let sigint = libc::SIGINT;
+        if signalstate::pypysig_setflag(sigint) {
+            set_handler(sigint, default_int_handler_obj());
+        }
+    }
+}
 
 /// _signal module — PyPy: pypy/module/signal/.
 ///
@@ -42,21 +256,9 @@ pub fn register_module(ns: &mut DictStorage) {
         crate::make_builtin_function_with_arity("getsignal", |_| Ok(pyre_object::w_none()), 1),
     );
     // `interp_signal.py:default_int_handler` — `raise KeyboardInterrupt`.
-    crate::dict_storage_store(
-        ns,
-        "default_int_handler",
-        crate::make_builtin_function_with_arity(
-            "default_int_handler",
-            |_| {
-                let cls = crate::builtins::lookup_exc_class("KeyboardInterrupt")
-                    .expect("KeyboardInterrupt must be installed");
-                let exc = crate::builtins::exc_exception_new(&[cls])
-                    .expect("exc_exception_new is infallible for empty args");
-                Err(unsafe { crate::PyError::from_exc_object(exc) })
-            },
-            2,
-        ),
-    );
+    // Shares one identity with the SIGINT handler installed at startup so
+    // `getsignal(SIGINT) is signal.default_int_handler`.
+    crate::dict_storage_store(ns, "default_int_handler", default_int_handler_obj());
     // `interp_signal.py:set_wakeup_fd` — stores the fd in a
     // process-wide cell and returns the previous value.  Real signal
     // delivery on the fd needs interpreter-side trampolines (still

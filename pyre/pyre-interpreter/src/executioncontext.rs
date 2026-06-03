@@ -669,7 +669,12 @@ pub struct ExecutionContext {
     /// Cached dict wrapper over `self.builtins` — pyframe.py:200-204
     /// `space.builtin` returns the same object every call.
     builtin_dict_cache: std::cell::Cell<PyObjectRef>,
-    pub check_signal_action: Option<PyObjectRef>,
+    /// `pypy/interpreter/baseobjspace.py` `space.check_signal_action` —
+    /// the `CheckSignalAction` registered when the `signal` module loads.
+    /// `checksignals` calls its `perform` directly.  Stored as a trait
+    /// pointer into the leaked action owned by `module::_signal`
+    /// (`install_signal_handling`); `None` until installed.
+    pub check_signal_action: Option<*mut dyn AsyncActionOps>,
 }
 
 pub type PyExecutionContext = ExecutionContext;
@@ -933,10 +938,31 @@ impl ExecutionContext {
         // short-circuits before touching actionflag.
         self.bytecode_only_trace(frame)?;
         if self.actionflag.decrement_ticker(decr_by as isize) < 0 {
+            // executioncontext.py:165 — `actionflag.action_dispatcher`.
+            // Routed through a residual (dont_look_inside) boundary so the
+            // tracer never sees the action machinery's trait-object
+            // virtual calls + `Result<(), PyError>` propagation, which the
+            // JIT codewriter cannot model.  The slow path runs only when
+            // the ticker is negative (a signal / fired action), so the
+            // residual call adds nothing to the no-signal hot path.
             let self_ptr = self as *mut ExecutionContext;
-            self.actionflag.action_dispatcher(self_ptr, frame);
+            if perform_pending_actions(self_ptr as i64, frame as i64) != 0 {
+                if let Some(err) = crate::call::take_call_error() {
+                    return Err(err);
+                }
+            }
         }
         Ok(())
+    }
+
+    /// Run pending async actions (signal delivery, finalizers).  Split
+    /// out so the JIT warm-up loop can take the slow path inline once the
+    /// ticker goes negative without re-entering `bytecode_trace`'s tracer
+    /// gate.  Mirrors the `actionflag.action_dispatcher(self, frame)` call
+    /// in `bytecode_trace` (executioncontext.py:165).
+    pub fn perform_actions(&mut self, frame: *mut PyFrame) -> Result<(), crate::PyError> {
+        let self_ptr = self as *mut ExecutionContext;
+        self.actionflag.action_dispatcher(self_ptr, frame)
     }
 
     /// pypy/interpreter/executioncontext.py:173-184 `bytecode_only_trace`.
@@ -1406,17 +1432,23 @@ impl ExecutionContext {
         Ok(())
     }
 
-    pub fn checksignals(&mut self) {
-        if self.check_signal_action.is_none() {
-            return;
-        }
+    /// executioncontext.py:436-441 `checksignals`:
+    /// ```python
+    /// if self.space.check_signal_action is not None:
+    ///     self.space.check_signal_action.perform(self, None)
+    /// ```
+    /// Called from the EINTR retry paths (`raise_signal`, `pthread_kill`,
+    /// `pthread_sigmask`) to deliver a signal that may have arrived
+    /// mid-syscall.  Propagates a handler exception (e.g.
+    /// `KeyboardInterrupt`) to the caller.
+    pub fn checksignals(&mut self) -> Result<(), crate::PyError> {
         if let Some(action) = self.check_signal_action {
-            let _ = action;
-            if !self.topframeref.is_null() {
-                self.actionflag
-                    .action_dispatcher(std::ptr::null_mut(), self.topframeref);
+            let self_ptr = self as *mut ExecutionContext;
+            unsafe {
+                (*action).perform(&mut *self_ptr, std::ptr::null_mut())?;
             }
         }
+        Ok(())
     }
 
     pub fn _revdb_enter(&mut self, _frame: *mut PyFrame) {
@@ -1534,6 +1566,30 @@ impl ExecutionContext {
         // dispatching `w_dict_getitem_str` routes through
         // `ModuleDictStrategy::getitem_str` (`celldict.py:143-145`).
         unsafe { pyre_object::w_dict_getitem_str(self.builtins_module, name) }
+    }
+}
+
+/// Residual entry point for the bytecode-trace slow path: run pending
+/// async actions (signal delivery, finalizers).  Marked
+/// `dont_look_inside` so the tracer treats it as an opaque call and never
+/// follows the action machinery's trait-object virtual dispatch +
+/// `Result<(), PyError>` propagation (which the JIT codewriter cannot
+/// model).  Returns 0 on success and 1 when an action raised, stashing
+/// the error in `PENDING_CALL_ERROR` for the caller to re-raise — the
+/// same cross-residual error convention as `call_function_impl`.
+#[majit_macros::dont_look_inside]
+pub extern "C" fn perform_pending_actions(ec_ptr: i64, frame_ptr: i64) -> i64 {
+    let ec = ec_ptr as *mut ExecutionContext;
+    if ec.is_null() {
+        return 0;
+    }
+    let frame = frame_ptr as *mut PyFrame;
+    match unsafe { (*ec).perform_actions(frame) } {
+        Ok(()) => 0,
+        Err(err) => {
+            crate::call::set_call_error(err);
+            1
+        }
     }
 }
 
@@ -1752,11 +1808,15 @@ pub trait ActionFlagOps {
     ///             self.reset_ticker(-1)
     /// ```
     ///
-    /// Pyre's `AsyncAction::perform` is a no-op stub for actions that
-    /// have not yet been ported (CheckSignalAction, GcCollectAction,
-    /// etc.); the iteration shape matches PyPy so the dispatch surface
-    /// lands correctly when those actions are ported individually.
-    fn action_dispatcher(&mut self, ec: *mut ExecutionContext, frame: *mut PyFrame) {
+    /// A periodic/nonperiodic `perform` may raise (e.g.
+    /// `CheckSignalAction` delivering `KeyboardInterrupt`); the error
+    /// propagates out via `?`, aborting the remaining actions, exactly
+    /// like PyPy's `action.perform(...)` raising an `OperationError`.
+    fn action_dispatcher(
+        &mut self,
+        ec: *mut ExecutionContext,
+        frame: *mut PyFrame,
+    ) -> Result<(), crate::PyError> {
         // executioncontext.py:538 — `self.reset_ticker(self.checkinterval_scaled)`.
         let interval = self.abstract_flag().checkinterval_scaled as isize;
         self.reset_ticker(interval);
@@ -1769,7 +1829,7 @@ pub trait ActionFlagOps {
                 continue;
             }
             unsafe {
-                (*action_ptr).perform(&mut *ec, frame);
+                (*action_ptr).perform(&mut *ec, frame)?;
             }
         }
         // executioncontext.py:543-556 — nonperiodic bit-mask scan.
@@ -1784,7 +1844,7 @@ pub trait ActionFlagOps {
                     self.abstract_flag_mut()._fired_bitmask &= !mask;
                     if !action_ptr.is_null() && !ec.is_null() {
                         unsafe {
-                            (*action_ptr).perform(&mut *ec, frame);
+                            (*action_ptr).perform(&mut *ec, frame)?;
                         }
                     }
                 }
@@ -1796,9 +1856,25 @@ pub trait ActionFlagOps {
                 self.reset_ticker(-1);
             }
         }
+        Ok(())
     }
 }
 
+/// pypy/interpreter/executioncontext.py:566-585 `ActionFlag` merged with
+/// pypy/module/signal/interp_signal.py:24-51 `SignalActionFlag`.
+///
+/// PyPy starts with a plain `ActionFlag` (its ticker is a Python field)
+/// and, when the `signal` module loads, rebinds `space.actionflag` to a
+/// `SignalActionFlag` whose ticker IS the C `pypysig_counter` cell so the
+/// OS signal handler can force it negative.  pyre merges the two: the
+/// ticker stays a plain `_ticker` field (a plain field read is what the
+/// JIT codewriter can model in the per-bytecode hot path — an atomic /
+/// volatile global read is not), and the OS signal handler writes -1 into
+/// it through a pointer registered at startup
+/// (`signalstate::register_ticker` ← `ticker_addr`).  This is the same
+/// arrangement as upstream's volatile `pypysig_counter.value`: the
+/// handler stores through the cell's address while the interpreter reads
+/// the field directly.
 #[derive(Clone)]
 pub struct ActionFlag {
     base: AbstractActionFlag,
@@ -1822,6 +1898,14 @@ impl ActionFlag {
     pub fn perform_frame_action(&mut self, ec: &mut ExecutionContext, frame: *mut PyFrame) {
         let _ = (ec, frame);
     }
+
+    /// Address of the ticker cell, handed to `signalstate::register_ticker`
+    /// so the OS signal handler can force the ticker negative.  Stable for
+    /// the process lifetime — the `ExecutionContext` is created once and
+    /// never moved (held behind an `Rc` in pyrex).
+    pub fn ticker_addr(&mut self) -> *mut isize {
+        &mut self._ticker
+    }
 }
 
 /// pypy/interpreter/executioncontext.py:566-585 — `class ActionFlag(AbstractActionFlag)`.
@@ -1834,33 +1918,38 @@ impl ActionFlagOps for ActionFlag {
         &mut self.base
     }
 
-    /// pypy/interpreter/executioncontext.py:571-572 `get_ticker`.
+    /// interp_signal.py:30-32 `SignalActionFlag.get_ticker` — `p.c_value`.
+    /// The cell is the `_ticker` field; the OS handler writes it through
+    /// the registered pointer (`ticker_addr`).
     fn get_ticker(&self) -> isize {
         self._ticker
     }
 
-    /// pypy/interpreter/executioncontext.py:574-575 `reset_ticker`:
-    /// ```python
-    /// def reset_ticker(self, value):
-    ///     self._ticker = value
-    /// ```
+    /// interp_signal.py:34-36 `SignalActionFlag.reset_ticker` —
+    /// `p.c_value = value`.
     fn reset_ticker(&mut self, value: isize) {
         self._ticker = value;
     }
 
-    /// pypy/interpreter/executioncontext.py:577-585 `decrement_ticker`.
+    /// interp_signal.py:42-51 `SignalActionFlag.decrement_ticker`.
     ///
     /// ```python
     /// def decrement_ticker(self, by):
-    ///     value = self._ticker
-    ///     if self.has_bytecode_counter:
+    ///     p = pypysig_getaddr_occurred()
+    ///     value = p.c_value
+    ///     if self.has_bytecode_counter:    # this 'if' is constant-folded
     ///         if jit.isconstant(by) and by == 0:
-    ///             pass
+    ///             pass     # normally constant-folded too
     ///         else:
     ///             value -= by
-    ///             self._ticker = value
+    ///             p.c_value = value
     ///     return value
     /// ```
+    ///
+    /// `CheckSignalAction` registers with `use_bytecode_counter=False`,
+    /// so `has_bytecode_counter` stays false and the ticker is never
+    /// decremented here — it only goes negative when the OS handler calls
+    /// `signal_pushback` (or `fire` requests a non-periodic action).
     fn decrement_ticker(&mut self, by: isize) -> isize {
         if self.base.has_bytecode_counter {
             self._ticker -= by;
@@ -1988,7 +2077,15 @@ impl AsyncAction {
 pub trait AsyncActionOps {
     /// pypy/interpreter/executioncontext.py:608-609 `AsyncAction.perform`:
     /// `def perform(self, executioncontext, frame): "To be overridden."`
-    fn perform(&mut self, executioncontext: &mut ExecutionContext, frame: *mut PyFrame);
+    ///
+    /// Returns `Result` so an overriding action (e.g. `CheckSignalAction`)
+    /// can raise — PyPy's `perform` propagates an `OperationError` up
+    /// through `action_dispatcher` to the eval loop.
+    fn perform(
+        &mut self,
+        executioncontext: &mut ExecutionContext,
+        frame: *mut PyFrame,
+    ) -> Result<(), crate::PyError>;
 
     /// Composition accessor: shared `AsyncAction` state.
     fn async_action(&self) -> &AsyncAction;
@@ -2045,7 +2142,13 @@ pub trait AsyncActionOps {
 /// Default `perform` is the "To be overridden." no-op; concrete
 /// subclasses override.
 impl AsyncActionOps for AsyncAction {
-    fn perform(&mut self, _executioncontext: &mut ExecutionContext, _frame: *mut PyFrame) {}
+    fn perform(
+        &mut self,
+        _executioncontext: &mut ExecutionContext,
+        _frame: *mut PyFrame,
+    ) -> Result<(), crate::PyError> {
+        Ok(())
+    }
 
     fn async_action(&self) -> &AsyncAction {
         self
@@ -2129,7 +2232,13 @@ impl PeriodicAsyncAction {
 /// "To be overridden." `perform` from `AsyncAction`.  Concrete
 /// subclasses (CheckSignalAction etc.) override.
 impl AsyncActionOps for PeriodicAsyncAction {
-    fn perform(&mut self, _executioncontext: &mut ExecutionContext, _frame: *mut PyFrame) {}
+    fn perform(
+        &mut self,
+        _executioncontext: &mut ExecutionContext,
+        _frame: *mut PyFrame,
+    ) -> Result<(), crate::PyError> {
+        Ok(())
+    }
 
     fn async_action(&self) -> &AsyncAction {
         &self.base
@@ -2245,8 +2354,13 @@ impl UserDelAction {
 /// UserDelAction(AsyncAction)`.  `perform` (line 632-633) calls
 /// `self._run_finalizers()`.
 impl AsyncActionOps for UserDelAction {
-    fn perform(&mut self, _executioncontext: &mut ExecutionContext, _frame: *mut PyFrame) {
+    fn perform(
+        &mut self,
+        _executioncontext: &mut ExecutionContext,
+        _frame: *mut PyFrame,
+    ) -> Result<(), crate::PyError> {
         self._run_finalizers();
+        Ok(())
     }
 
     fn async_action(&self) -> &AsyncAction {

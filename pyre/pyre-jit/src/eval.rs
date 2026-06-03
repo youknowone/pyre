@@ -3262,16 +3262,43 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
                     return LoopResult::Done(Err(err));
                 }
             } else {
-                // executioncontext.py:163-164 — `actionflag.
-                // decrement_ticker(decr_by)` runs every bytecode.
-                // bytecode_trace already includes this when called
-                // above; the no-tracer fast path inlines the dec
-                // directly.
-                let _ = unsafe {
+                // executioncontext.py:163-165 — `actionflag.
+                // decrement_ticker(decr_by)` runs every bytecode, and
+                // `action_dispatcher` runs once it goes negative.
+                // bytecode_trace bundles both when a tracer is set; the
+                // no-tracer fast path inlines them.  The OS signal
+                // handler forces the ticker to -1 (signalstate::
+                // signal_pushback), so this is where Ctrl-C is delivered
+                // during JIT warm-up.  The negative branch is rarely
+                // taken — the fast path stays a load + not-taken compare.
+                let ticker = unsafe {
                     (*ec_ptr).actionflag.decrement_ticker(
                         pyre_interpreter::executioncontext::TICK_COUNTER_STEP as isize,
                     )
                 };
+                if ticker < 0 {
+                    if let Err(mut err) =
+                        unsafe { (*ec_ptr).perform_actions(frame as *mut PyFrame) }
+                    {
+                        // Deliver the action's exception (e.g. a signal
+                        // handler's KeyboardInterrupt) as if raised at the
+                        // current opcode so the frame's try/except can
+                        // catch it — CPython runs the eval-breaker
+                        // exception through the same `goto error` path.
+                        // `frame.last_instr` was set to `pc` above, so
+                        // `handle_exception` finds the covering handler.
+                        let mut next_instr = frame.next_instr();
+                        if pyre_interpreter::eval::handle_exception(
+                            frame,
+                            &mut err,
+                            &mut next_instr,
+                        ) {
+                            frame.set_last_instr_from_next_instr(next_instr);
+                            continue;
+                        }
+                        return LoopResult::Done(Err(err));
+                    }
+                }
             }
         }
         let mut next_instr = frame.next_instr();

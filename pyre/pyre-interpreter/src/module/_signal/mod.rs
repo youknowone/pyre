@@ -6,4 +6,6 @@
 //! raise_signal / strsignal / valid_signals are full implementations
 //! backed by `rustpython_host_env::signal`.
 
+pub mod signalstate;
+
 crate::pyre_module_init!(interp_signal);

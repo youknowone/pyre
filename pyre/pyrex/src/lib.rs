@@ -211,6 +211,13 @@ fn run_source(source: &str, mode: Mode, filename: &str) {
     // updates the slot.  Mirrors PyPy's `space.threadlocals` always
     // holding the active EC for the current thread.
     set_last_exec_ctx(Rc::as_ptr(&execution_context));
+    // app_main.py:926 — install SIGINT → default_int_handler so Ctrl-C
+    // raises KeyboardInterrupt, and register the periodic signal-check
+    // action on the execution context.
+    unsafe {
+        let ec_ptr = Rc::as_ptr(&execution_context) as *mut PyExecutionContext;
+        pyre_interpreter::module::_signal::interp_signal::install_signal_handling(&mut *ec_ptr);
+    }
     let mut frame = match PyFrame::new_with_context(code, execution_context) {
         Ok(frame) => frame,
         Err(e) => {

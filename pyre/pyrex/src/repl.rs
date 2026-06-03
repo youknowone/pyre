@@ -49,6 +49,13 @@ pub fn run_repl(quiet: bool) {
     let execution_context = Rc::new(PyExecutionContext::default());
     register_build_class();
     set_build_class_exec_ctx(Rc::as_ptr(&execution_context));
+    // app_main.py:926 — install SIGINT → default_int_handler so Ctrl-C
+    // at the REPL raises KeyboardInterrupt rather than killing the
+    // process, and register the periodic signal-check action.
+    unsafe {
+        let ec_ptr = Rc::as_ptr(&execution_context) as *mut PyExecutionContext;
+        pyre_interpreter::module::_signal::interp_signal::install_signal_handling(&mut *ec_ptr);
+    }
 
     let mut namespace = Box::new(execution_context.fresh_dict_storage());
     namespace.fix_ptr();
