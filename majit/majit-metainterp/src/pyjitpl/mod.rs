@@ -9438,6 +9438,25 @@ impl<M: Clone> MetaInterp<M> {
                     }
                     return false;
                 }
+                // unroll.py:119-123 `except SpeculativeError: raise InvalidLoop`
+                // — a speculative heap access proven ill-typed discards the
+                // trace exactly like InvalidLoop. The loop path converts at the
+                // optimize boundary (with_speculative_to_invalid_loop); the
+                // bridge path has no such wrapper, so without this the
+                // SpeculativeError re-unwinds past the extern "C" bh_call_r
+                // frames and aborts the process.
+                if payload
+                    .downcast_ref::<crate::optimize::SpeculativeError>()
+                    .is_some()
+                {
+                    if crate::majit_log_enabled() {
+                        eprintln!(
+                            "[jit] compile_bridge: SpeculativeError->InvalidLoop at key={} fail_index={}",
+                            green_key, fail_index
+                        );
+                    }
+                    return false;
+                }
                 std::panic::resume_unwind(payload);
             }
         };

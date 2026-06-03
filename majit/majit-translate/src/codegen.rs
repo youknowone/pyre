@@ -640,7 +640,7 @@ pub fn trace_unbox_int(
     // unit tests (`pyre/pyre-jit/src/trace_verify.rs`) the GuardClass is
     // recorded with no resume context; the test asserts only on the
     // emitted opcode shape.
-    if !ctx.heap_cache().is_class_known(obj) {
+    if !obj.is_constant() && !ctx.heap_cache().is_class_known(obj) {
         let type_const = ctx.const_int(int_type_addr);
         ctx.record_guard_typed(OpCode::GuardClass, &[obj, type_const], Vec::new());
         ctx.heap_cache_mut()
@@ -861,7 +861,7 @@ pub fn trace_unbox_float(
     floatval_descr: majit_ir::DescrRef,
 ) -> majit_ir::OpRef {
     use majit_ir::OpCode;
-    if !ctx.heap_cache().is_class_known(obj) {
+    if !obj.is_constant() && !ctx.heap_cache().is_class_known(obj) {
         let type_const = ctx.const_int(float_type_addr);
         ctx.record_guard_typed(OpCode::GuardClass, &[obj, type_const], Vec::new());
         ctx.heap_cache_mut()
