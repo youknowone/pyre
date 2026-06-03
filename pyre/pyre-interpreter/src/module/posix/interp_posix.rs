@@ -8,10 +8,9 @@ use crate::DictStorage;
 use crate::importing::host::{fs as host_fs, os as host_os};
 use pyre_object::PyObjectRef;
 
-/// Shared `posix.stat_result` builtin type — a plain instance bag with
-/// hasdict so that `st_mode`, `st_ino`, etc. attributes can be set from
-/// Rust when building stat results. PyPy builds a structseq subclass with
-/// named fields; this is the pyre approximation.
+/// Shared plain instance bag with hasdict so that attributes can be set
+/// from Rust.  Still used by the `terminal_size` / `uname` / `statvfs` /
+/// `times` result builders below until they are migrated to structseqs.
 fn stat_result_type() -> PyObjectRef {
     thread_local! {
         static STAT_RESULT_TYPE: std::cell::OnceCell<PyObjectRef> = const { std::cell::OnceCell::new() };
@@ -21,6 +20,38 @@ fn stat_result_type() -> PyObjectRef {
             let tp = crate::typedef::make_builtin_type("stat_result", |_ns| {});
             unsafe { pyre_object::typeobject::w_type_set_hasdict(tp, true) };
             tp
+        })
+    })
+}
+
+/// `posix.stat_result` — a real structseq (tuple subclass) so `st[0]`,
+/// `len(st)`, iteration and `isinstance(st, tuple)` all work, matching
+/// `posixmodule.c` `stat_result_desc`.  The 10 sequence slots hold the
+/// integer fields (`st_atime`/`st_mtime`/`st_ctime` integer-seconds at
+/// 7..10); the float time fields shadow them as extra named fields, and
+/// `st_*_ns` are extra named integers.
+fn stat_result_seq_type() -> PyObjectRef {
+    thread_local! {
+        static STAT_RESULT_SEQ_TYPE: std::cell::OnceCell<PyObjectRef> = const { std::cell::OnceCell::new() };
+    }
+    STAT_RESULT_SEQ_TYPE.with(|c| {
+        *c.get_or_init(|| {
+            crate::structseq::make_struct_seq_with_extra(
+                // Dotted name → `__name__` "stat_result", repr "os.stat_result(...)".
+                "os.stat_result",
+                &[
+                    "st_mode", "st_ino", "st_dev", "st_nlink", "st_uid", "st_gid", "st_size",
+                    "st_atime", "st_mtime", "st_ctime",
+                ],
+                &[
+                    "st_atime",
+                    "st_mtime",
+                    "st_ctime",
+                    "st_atime_ns",
+                    "st_mtime_ns",
+                    "st_ctime_ns",
+                ],
+            )
         })
     })
 }
@@ -798,7 +829,10 @@ pub fn register_module(ns: &mut DictStorage) {
             )
         };
 
-        let tuple = pyre_object::w_tuple_new(vec![
+        // The 10 sequence slots are the integer fields (integer-seconds
+        // times at 7..10); the float times and `st_*_ns` are extra named
+        // fields shadowing / extending them.
+        let seq = vec![
             pyre_object::w_int_new(st_mode),
             pyre_object::w_int_new(st_ino),
             pyre_object::w_int_new(st_dev),
@@ -809,48 +843,16 @@ pub fn register_module(ns: &mut DictStorage) {
             pyre_object::w_int_new(st_atime),
             pyre_object::w_int_new(st_mtime),
             pyre_object::w_int_new(st_ctime),
-        ]);
-        // Attach st_* attributes via a wrapping instance.
-        let wrapper = pyre_object::w_instance_new(stat_result_type());
-        let _ = crate::baseobjspace::setattr(wrapper, "__tuple__", tuple);
-        let _ = crate::baseobjspace::setattr(wrapper, "st_mode", pyre_object::w_int_new(st_mode));
-        let _ = crate::baseobjspace::setattr(wrapper, "st_ino", pyre_object::w_int_new(st_ino));
-        let _ = crate::baseobjspace::setattr(wrapper, "st_dev", pyre_object::w_int_new(st_dev));
-        let _ = crate::baseobjspace::setattr(wrapper, "st_nlink", pyre_object::w_int_new(st_nlink));
-        let _ = crate::baseobjspace::setattr(wrapper, "st_uid", pyre_object::w_int_new(st_uid));
-        let _ = crate::baseobjspace::setattr(wrapper, "st_gid", pyre_object::w_int_new(st_gid));
-        let _ = crate::baseobjspace::setattr(wrapper, "st_size", pyre_object::w_int_new(st_size));
-        let _ = crate::baseobjspace::setattr(
-            wrapper,
-            "st_atime",
-            pyre_object::w_float_new(st_atime as f64),
-        );
-        let _ = crate::baseobjspace::setattr(
-            wrapper,
-            "st_mtime",
-            pyre_object::w_float_new(st_mtime as f64),
-        );
-        let _ = crate::baseobjspace::setattr(
-            wrapper,
-            "st_ctime",
-            pyre_object::w_float_new(st_ctime as f64),
-        );
-        let _ = crate::baseobjspace::setattr(
-            wrapper,
-            "st_atime_ns",
-            pyre_object::w_int_new(st_atime_ns),
-        );
-        let _ = crate::baseobjspace::setattr(
-            wrapper,
-            "st_mtime_ns",
-            pyre_object::w_int_new(st_mtime_ns),
-        );
-        let _ = crate::baseobjspace::setattr(
-            wrapper,
-            "st_ctime_ns",
-            pyre_object::w_int_new(st_ctime_ns),
-        );
-        wrapper
+        ];
+        let extras = vec![
+            ("st_atime", pyre_object::w_float_new(st_atime as f64)),
+            ("st_mtime", pyre_object::w_float_new(st_mtime as f64)),
+            ("st_ctime", pyre_object::w_float_new(st_ctime as f64)),
+            ("st_atime_ns", pyre_object::w_int_new(st_atime_ns)),
+            ("st_mtime_ns", pyre_object::w_int_new(st_mtime_ns)),
+            ("st_ctime_ns", pyre_object::w_int_new(st_ctime_ns)),
+        ];
+        crate::structseq::new_instance_with_extra(stat_result_seq_type(), seq, extras)
     }
     fn stat_impl(
         args: &[pyre_object::PyObjectRef],
@@ -1024,9 +1026,9 @@ pub fn register_module(ns: &mut DictStorage) {
             1,
         ),
     );
-    // stat_result type — simple instance with hasdict so setattr works.
-    // Exported so that `posix.stat_result` can be looked up.
-    crate::dict_storage_store(ns, "stat_result", stat_result_type());
+    // stat_result type — structseq (tuple subclass). Exported so that
+    // `posix.stat_result` and `isinstance(os.stat(p), os.stat_result)` work.
+    crate::dict_storage_store(ns, "stat_result", stat_result_seq_type());
     // os.getcwd() — PyPy: posixmodule.c posix_getcwd.
     crate::dict_storage_store(
         ns,

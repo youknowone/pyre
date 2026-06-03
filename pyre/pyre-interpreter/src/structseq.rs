@@ -41,6 +41,15 @@ struct StructSeqDescr {
     /// Field names in positional order.  Names starting with `_` are
     /// CPython's "unnamed" placeholders (`_structseq.py:67-69`).
     fields: Vec<String>,
+    /// Named-only fields stored in the instance `__dict__` rather than the
+    /// tuple body (`_structseq.py:31-37` — the `obj.__dict__[name]` arm).
+    /// `os.stat_result` uses these for the float `st_atime`/`st_mtime`/
+    /// `st_ctime` (which shadow the integer sequence slots 7..10) and the
+    /// `st_*_ns` / `st_blksize` / `st_blocks` / `st_rdev` extras.  A name
+    /// present here takes priority over a same-named positional slot, so a
+    /// data-descriptor read resolves to the extra value while `obj[i]`
+    /// still returns the sequence integer.
+    extra_fields: Vec<String>,
 }
 
 thread_local! {
@@ -72,19 +81,48 @@ fn structseq_field_get(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     }
     let name = unsafe { pyre_object::w_str_get_value(name_obj) };
     let cls = unsafe { (*inst).w_class };
-    let idx = STRUCTSEQ_REGISTRY.with(|r| -> Option<usize> {
+
+    enum Resolved {
+        Extra,
+        Positional(usize),
+        Missing,
+    }
+    // `_structseq.py:31-37` — an extra (dict-backed) field shadows a
+    // same-named positional slot, so resolve those first.
+    let resolved = STRUCTSEQ_REGISTRY.with(|r| {
         let map = r.borrow();
-        let entry = map.get(&(cls as usize))?;
-        entry.fields.iter().position(|n| n == &name)
+        let Some(entry) = map.get(&(cls as usize)) else {
+            return Resolved::Missing;
+        };
+        if entry.extra_fields.iter().any(|n| n == &name) {
+            Resolved::Extra
+        } else if let Some(idx) = entry.fields.iter().position(|n| n == &name) {
+            Resolved::Positional(idx)
+        } else {
+            Resolved::Missing
+        }
     });
-    let Some(idx) = idx else {
-        return Err(PyError::attribute_error(format!(
+    match resolved {
+        Resolved::Extra => {
+            let w_dict = crate::baseobjspace::getdict(inst);
+            if !w_dict.is_null() {
+                if let Some(v) = unsafe { pyre_object::w_dict_getitem_str(w_dict, &name) } {
+                    return Ok(v);
+                }
+            }
+            Err(PyError::attribute_error(format!(
+                "structseq object has no field {name}"
+            )))
+        }
+        Resolved::Positional(idx) => {
+            let item = unsafe { pyre_object::w_tuple_getitem(inst, idx as i64) }
+                .ok_or_else(|| PyError::index_error("structseq field out of range"))?;
+            Ok(item)
+        }
+        Resolved::Missing => Err(PyError::attribute_error(format!(
             "structseq object has no field {name}"
-        )));
-    };
-    let item = unsafe { pyre_object::w_tuple_getitem(inst, idx as i64) }
-        .ok_or_else(|| PyError::index_error("structseq field out of range"))?;
-    Ok(item)
+        ))),
+    }
 }
 
 /// `lib_pypy/_structseq.py:156-163 structseq_repr`.
@@ -171,9 +209,31 @@ fn read_class_int(cls: PyObjectRef, attr: &str) -> Option<i64> {
 /// positional fields materialised and do not need the iteration /
 /// arity-check work `structseq_descr_new` does for app-level callers.
 pub fn new_instance(cls: PyObjectRef, items: Vec<PyObjectRef>) -> PyObjectRef {
+    new_instance_with_extra(cls, items, Vec::new())
+}
+
+/// Allocate a structseq instance carrying both the positional tuple body
+/// (`items`) and named-only extras (`extras`).  The extras are written
+/// into the instance `__dict__` so the per-field getter can resolve them
+/// (`_structseq.py:31-37`); the owning type must have been built with a
+/// matching `extra_fields` list via [`make_struct_seq_with_extra`] (which
+/// sets `hasdict`).  `os.stat_result` uses this for the float time fields
+/// and the `st_*_ns` extras.
+pub fn new_instance_with_extra(
+    cls: PyObjectRef,
+    items: Vec<PyObjectRef>,
+    extras: Vec<(&str, PyObjectRef)>,
+) -> PyObjectRef {
     let obj = pyre_object::w_tuple_new_array_backed(items);
     unsafe {
         (*obj).w_class = cls;
+    }
+    if !extras.is_empty() {
+        let w_dict = pyre_object::w_dict_new();
+        for (k, v) in extras {
+            unsafe { pyre_object::w_dict_setitem_str(w_dict, k, v) };
+        }
+        let _ = crate::baseobjspace::setdict(obj, w_dict);
     }
     obj
 }
@@ -183,9 +243,44 @@ pub fn new_instance(cls: PyObjectRef, items: Vec<PyObjectRef>) -> PyObjectRef {
 /// The returned type is the value module callers stash so future
 /// allocations route through [`new_instance`].
 pub fn make_struct_seq(name: &'static str, field_names: &[&'static str]) -> PyObjectRef {
+    make_struct_seq_impl(name, field_names, &[])
+}
+
+/// Like [`make_struct_seq`] but adds named-only fields beyond the tuple
+/// sequence (`_structseq.py:31-37` extra-field arm).  `extra_field_names`
+/// resolve through the instance `__dict__`, shadowing any same-named
+/// positional slot, and the type is marked `hasdict` so [`new_instance_with_extra`]
+/// can store them.  `os.stat_result` is the canonical user.
+pub fn make_struct_seq_with_extra(
+    name: &'static str,
+    field_names: &[&'static str],
+    extra_field_names: &[&'static str],
+) -> PyObjectRef {
+    make_struct_seq_impl(name, field_names, extra_field_names)
+}
+
+fn make_struct_seq_impl(
+    name: &'static str,
+    field_names: &[&'static str],
+    extra_field_names: &[&'static str],
+) -> PyObjectRef {
     let n_sequence_fields = field_names.len();
     let n_unnamed_fields = field_names.iter().filter(|n| n.starts_with('_')).count();
     let owned_names: Vec<String> = field_names.iter().map(|s| s.to_string()).collect();
+    let owned_extra: Vec<String> = extra_field_names.iter().map(|s| s.to_string()).collect();
+    let has_extra = !owned_extra.is_empty();
+
+    // Descriptor set = sequence names ∪ extra names (sequence order first,
+    // then extra-only).  A name in both gets a single descriptor; the
+    // getter routes it to the extra (dict) value.
+    let mut descriptor_names: Vec<String> = owned_names.clone();
+    for e in &owned_extra {
+        if !descriptor_names.contains(e) {
+            descriptor_names.push(e.clone());
+        }
+    }
+    let n_fields = descriptor_names.len();
+
     let owned_names_for_init = owned_names.clone();
 
     let tuple_type = crate::typedef::gettypeobject(&pyre_object::pyobject::TUPLE_TYPE);
@@ -219,11 +314,7 @@ pub fn make_struct_seq(name: &'static str, field_names: &[&'static str]) -> PyOb
                 "n_sequence_fields",
                 pyre_object::w_int_new(n_sequence_fields as i64),
             );
-            crate::dict_storage_store(
-                ns,
-                "n_fields",
-                pyre_object::w_int_new(n_sequence_fields as i64),
-            );
+            crate::dict_storage_store(ns, "n_fields", pyre_object::w_int_new(n_fields as i64));
             crate::dict_storage_store(
                 ns,
                 "n_unnamed_fields",
@@ -233,7 +324,7 @@ pub fn make_struct_seq(name: &'static str, field_names: &[&'static str]) -> PyOb
             // Per-field GetSetProperty descriptors.  `_structseq.py:31-37`
             // implements `structseqfield.__get__` — pyre fans out to the
             // generic `structseq_field_get` keyed by descriptor name.
-            for fname in &owned_names_for_init {
+            for fname in &descriptor_names {
                 let getter = crate::make_builtin_function_with_arity(
                     "structseq_field_get",
                     structseq_field_get,
@@ -255,12 +346,20 @@ pub fn make_struct_seq(name: &'static str, field_names: &[&'static str]) -> PyOb
         tuple_type,
     );
 
+    // Extra fields live in the instance `__dict__`, so the type must
+    // advertise `hasdict` for `setdict`/`getdict` to route through the
+    // instance-dict side table.
+    if has_extra {
+        unsafe { pyre_object::typeobject::w_type_set_hasdict(cls, true) };
+    }
+
     STRUCTSEQ_REGISTRY.with(|r| {
         r.borrow_mut().insert(
             cls as usize,
             StructSeqDescr {
                 name: name.to_string(),
                 fields: owned_names,
+                extra_fields: owned_extra,
             },
         );
     });
