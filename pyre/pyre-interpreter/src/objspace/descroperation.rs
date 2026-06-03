@@ -966,6 +966,17 @@ unsafe fn dunder_overridden(obj: PyObjectRef, dunder: &str, tp: PyObjectRef) -> 
     }
 }
 
+/// Builtin sequence base selected by [`needs_seq_binop_dispatch`].  The
+/// caller passes this discriminant instead of a `&STR_TYPE`/… static so
+/// the type-static load stays inside the residual helper, off the traced
+/// `add` graph.
+#[derive(Clone, Copy)]
+enum SeqBase {
+    Str,
+    List,
+    Tuple,
+}
+
 /// descroperation.py:708 `binop_impl` shortcut — the builtin sequence
 /// fast path (`str`/`list`/`tuple` concat) bypasses `__op__`/`__rop__`
 /// dispatch unless one operand is a subclass that actually overrides the
@@ -973,13 +984,23 @@ unsafe fn dunder_overridden(obj: PyObjectRef, dunder: &str, tp: PyObjectRef) -> 
 /// string subclass").  Returns `false` when no override exists so the
 /// caller concatenates directly — this also avoids re-entering the
 /// builtin `__add__` slot, which would recurse back into `add`.
+///
+/// `dont_look_inside`: the builtin-base type static is loaded here, so a
+/// traced caller emits a residual call instead of carrying an
+/// unresolvable `LoadStatic` into its JitCode.
+#[majit_macros::dont_look_inside]
 unsafe fn needs_seq_binop_dispatch(
     a: PyObjectRef,
     b: PyObjectRef,
-    tp: *const pyre_object::PyType,
+    base: SeqBase,
     fwd: &str,
     rev: &str,
 ) -> bool {
+    let tp: *const pyre_object::PyType = match base {
+        SeqBase::Str => &pyre_object::STR_TYPE,
+        SeqBase::List => &pyre_object::LIST_TYPE,
+        SeqBase::Tuple => &pyre_object::TUPLE_TYPE,
+    };
     let Some(t) = crate::typedef::gettypefor(tp) else {
         return false;
     };
@@ -1006,7 +1027,7 @@ pub fn add(a: PyObjectRef, b: PyObjectRef) -> PyResult {
             // descroperation.py:664 "unicode + string subclass" — a str
             // subclass overriding `__add__`/`__radd__` must reach the
             // reflected dispatch; otherwise concat directly.
-            if needs_seq_binop_dispatch(a, b, &pyre_object::STR_TYPE, "__add__", "__radd__") {
+            if needs_seq_binop_dispatch(a, b, SeqBase::Str, "__add__", "__radd__") {
                 if let Some(result) = try_dispatch_binary_special(a, b, "__add__", "__radd__")? {
                     return Ok(result);
                 }
@@ -1014,7 +1035,7 @@ pub fn add(a: PyObjectRef, b: PyObjectRef) -> PyResult {
             return str_concat(a, b);
         }
         if is_list(a) && is_list(b) {
-            if needs_seq_binop_dispatch(a, b, &pyre_object::LIST_TYPE, "__add__", "__radd__") {
+            if needs_seq_binop_dispatch(a, b, SeqBase::List, "__add__", "__radd__") {
                 if let Some(result) = try_dispatch_binary_special(a, b, "__add__", "__radd__")? {
                     return Ok(result);
                 }
@@ -1022,7 +1043,7 @@ pub fn add(a: PyObjectRef, b: PyObjectRef) -> PyResult {
             return list_concat(a, b);
         }
         if is_tuple(a) && is_tuple(b) {
-            if needs_seq_binop_dispatch(a, b, &pyre_object::TUPLE_TYPE, "__add__", "__radd__") {
+            if needs_seq_binop_dispatch(a, b, SeqBase::Tuple, "__add__", "__radd__") {
                 if let Some(result) = try_dispatch_binary_special(a, b, "__add__", "__radd__")? {
                     return Ok(result);
                 }
