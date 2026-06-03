@@ -4048,6 +4048,7 @@ fn filter_liveness_in_place(
     portal_ec_reg: u16,
     walker_tracked_pc_live_indices: Option<&[usize]>,
     walker_after_call_pc_indices: Option<&[Option<usize>]>,
+    clear_unboxed_banks: bool,
 ) -> (Vec<usize>, Vec<Option<usize>>) {
     use super::flatten::{Kind as SsaKind, Operand as SsaOperand};
     // Walker-tracked positions are required: the post-merge
@@ -4219,6 +4220,27 @@ fn filter_liveness_in_place(
             };
             pc_live_r.retain(|idx| lv_live.contains(idx));
 
+            // The Ref bank is the only bank in pyre's opcode-entry resume
+            // snapshot: pyre boxes every value before a Python opcode
+            // completes, so locals / stack hold PyObjectRefs and the
+            // resumed interpreter re-derives any unboxed int/float scratch
+            // from those boxes rather than reading it back.  The walker's
+            // per-PC `-live-` markers reflect this — they carry no Int or
+            // Float registers for any production graph.  The canonical
+            // `flatten_graph` stream, by contrast, is a jitcode-level SSA
+            // form whose backward liveness DOES surface unboxed int/float
+            // temporaries spanning the marker; under the splice those colors
+            // reach `collect_outer_active_boxes` as liveness-active
+            // registers the trace never populated (`registers_i[c] ==
+            // OpRef::NONE`) → panic.  Drop them so the spliced resume
+            // snapshot matches the interpreter-frame contract — symmetric
+            // with the Ref scratch drop above, but total, since pyre has no
+            // int/float frame slots.  `clear_unboxed_banks` is the splice
+            // path only, so the walker path stays byte-identical.
+            if clear_unboxed_banks {
+                pc_live_i.clear();
+                pc_live_f.clear();
+            }
             union_i.extend(pc_live_i);
             union_r.extend(pc_live_r);
             union_f.extend(pc_live_f);
@@ -10573,6 +10595,7 @@ impl CodeWriter {
             portal_ec_reg,
             walker_tracked_pc_live_indices_out.as_deref(),
             walker_after_call_pc_indices_out.as_deref(),
+            did_splice,
         );
         // Runtime entry/liveness lookups expect the byte offset of the
         // surviving `-live-` marker for each Python PC
@@ -12057,6 +12080,7 @@ mod tests {
             u16::MAX,
             Some(&walker_tracked_pc_live_indices),
             None,
+            false,
         );
 
         let live_idx = post_remove_live_indices[reachable_pc];
@@ -12085,6 +12109,66 @@ mod tests {
             ints,
             std::collections::BTreeSet::from([3]),
             "Int bank must be untouched by the Ref-only filter",
+        );
+    }
+
+    #[test]
+    fn filter_liveness_clears_int_float_banks_under_splice() {
+        // Mirror of `filter_liveness_drops_non_lv_live_colors_from_live_r`
+        // but with `clear_unboxed_banks = true` (the splice path).  Under
+        // the splice, the canonical jitcode-level stream surfaces unboxed
+        // int/float temporaries the interpreter-frame resume cannot supply;
+        // they must be dropped so `collect_outer_active_boxes` never reads a
+        // liveness-active int/float register the trace never populated.
+        let code = pyre_interpreter::compile_exec("x = 1\n").expect("source must compile");
+        let live_vars = pyre_jit_trace::state::liveness_for(&code as *const _);
+        let reachable_pc = (0..code.instructions.len())
+            .find(|&py_pc| live_vars.is_reachable(py_pc))
+            .expect("compiled code must have a reachable pc");
+
+        let mut ssarepr = SSARepr::new("t");
+        let mut walker_tracked_pc_live_indices: Vec<usize> =
+            Vec::with_capacity(code.instructions.len());
+        for _py_pc in 0..code.instructions.len() {
+            walker_tracked_pc_live_indices.push(ssarepr.insns.len());
+            ssarepr.insns.push(Insn::live(vec![
+                Operand::Register(Register::new(Kind::Ref, 0)),
+                Operand::Register(Register::new(Kind::Int, 3)),
+                Operand::Register(Register::new(Kind::Float, 4)),
+            ]));
+        }
+
+        let depth_at_pc: Vec<u16> = vec![0; code.instructions.len()];
+        let local_color_map: Vec<u16> = (0..code.varnames.len() as u16).collect();
+        let stack_slot_color_map: Vec<u16> = Vec::new();
+        let post_remove_live_indices = filter_liveness_in_place(
+            &mut ssarepr,
+            &code,
+            &depth_at_pc,
+            &local_color_map,
+            &stack_slot_color_map,
+            u16::MAX,
+            u16::MAX,
+            Some(&walker_tracked_pc_live_indices),
+            true,
+        );
+
+        let live_idx = post_remove_live_indices[reachable_pc];
+        let live_args = ssarepr.insns[live_idx]
+            .live_args()
+            .expect("reachable pc must keep a -live- marker");
+        let non_ref: Vec<&Operand> = live_args
+            .iter()
+            .filter(|op| {
+                matches!(
+                    op,
+                    Operand::Register(reg) if reg.kind == Kind::Int || reg.kind == Kind::Float
+                )
+            })
+            .collect();
+        assert!(
+            non_ref.is_empty(),
+            "splice path must clear Int/Float banks; found {non_ref:?}",
         );
     }
 
