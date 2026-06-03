@@ -56,6 +56,76 @@ pub fn set_handler(signum: i32, handler: PyObjectRef) {
     unsafe { pyre_object::w_dict_setitem(d, signum as i64, handler) };
 }
 
+/// `@unwrap_spec(signum=int)` — coerce the signal-number argument to an
+/// `i32`, rejecting non-integers with a `TypeError`.
+fn signum_arg(w_signum: PyObjectRef) -> Result<i32, crate::PyError> {
+    unsafe {
+        if pyre_object::is_int(w_signum) {
+            Ok(pyre_object::w_int_get_value(w_signum) as i32)
+        } else if pyre_object::is_bool(w_signum) {
+            Ok(pyre_object::w_bool_get_value(w_signum) as i32)
+        } else {
+            Err(crate::PyError::type_error("an integer is required"))
+        }
+    }
+}
+
+/// interp_signal.py:285-288 `check_signum_in_range`.
+fn check_signum_in_range(signum: i32) -> Result<(), crate::PyError> {
+    if (1..signalstate::NSIG).contains(&signum) {
+        Ok(())
+    } else {
+        Err(crate::PyError::value_error("signal number out of range"))
+    }
+}
+
+/// interp_signal.py:291-326 `signal(signum, handler) -> previous`.
+fn signal_signal(w_signum: PyObjectRef, w_handler: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+    let signum = signum_arg(w_signum)?;
+    // interp_signal.py:307-310 — `signals_enabled()` is always true in
+    // single-threaded pyre, so the main-thread guard is omitted.
+    check_signum_in_range(signum)?;
+
+    // interp_signal.py:313-321 — SIG_DFL / SIG_IGN are the ints 0 / 1;
+    // anything else must be callable.
+    let is_dfl = unsafe { pyre_object::is_int(w_handler) && pyre_object::w_int_get_value(w_handler) == 0 };
+    let is_ign = unsafe { pyre_object::is_int(w_handler) && pyre_object::w_int_get_value(w_handler) == 1 };
+    if is_dfl {
+        signalstate::pypysig_default(signum);
+    } else if is_ign {
+        signalstate::pypysig_ignore(signum);
+    } else if !crate::baseobjspace::callable_w(w_handler) {
+        return Err(crate::PyError::type_error(
+            "'handler' must be a callable or SIG_DFL or SIG_IGN",
+        ));
+    } else {
+        signalstate::pypysig_setflag(signum);
+    }
+
+    // interp_signal.py:323-326 — swap in the new handler, return the old
+    // (SIG_DFL when none was registered, matching `Handlers.__init__`).
+    let old = get_handler(signum);
+    let old = if old.is_null() {
+        pyre_object::w_int_new(0)
+    } else {
+        old
+    };
+    set_handler(signum, w_handler);
+    Ok(old)
+}
+
+/// interp_signal.py:238-251 `getsignal(signum) -> action`.
+fn signal_getsignal(w_signum: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+    let signum = signum_arg(w_signum)?;
+    check_signum_in_range(signum)?;
+    let h = get_handler(signum);
+    Ok(if h.is_null() {
+        pyre_object::w_int_new(0)
+    } else {
+        h
+    })
+}
+
 /// interp_signal.py:254-262 `default_int_handler` — `raise
 /// KeyboardInterrupt`.  Cached so the module attribute and the SIGINT
 /// handler-dict entry share one identity.
@@ -228,32 +298,26 @@ pub fn install_signal_handling(ec: &mut ExecutionContext) {
 
 /// _signal module — PyPy: pypy/module/signal/.
 ///
-/// signal() / getsignal() / set_wakeup_fd() remain stubs because the
-/// real implementations need interpreter-side trampolines to invoke
-/// Python handlers from a Rust signal context.  alarm / pause /
-/// raise_signal / strsignal / valid_signals are full implementations
-/// backed by `rustpython_host_env::signal`.  Signal-number constants
-/// are sourced from `libc::*` so they match the host's POSIX numbering
-/// (the previous macOS-flavoured hard-coded list disagreed with Linux
-/// for SIGUSR1/SIGUSR2/SIGCHLD).
+/// `signal()` / `getsignal()` register real handlers (sigaction +
+/// pending-flag, delivered by `CheckSignalAction`).  `set_wakeup_fd`
+/// records the fd but the handler does not yet write to it.  alarm /
+/// pause / raise_signal / strsignal / valid_signals are backed by
+/// `rustpython_host_env::signal`.  Signal-number constants are sourced
+/// from `libc::*` so they match the host's POSIX numbering (the previous
+/// macOS-flavoured hard-coded list disagreed with Linux for
+/// SIGUSR1/SIGUSR2/SIGCHLD).
 pub fn register_module(ns: &mut DictStorage) {
+    // interp_signal.py:291-326 `signal(signum, handler) -> previous`.
     crate::dict_storage_store(
         ns,
         "signal",
-        crate::make_builtin_function_with_arity(
-            "signal",
-            // signal(signalnum, handler) — pyre does not actually
-            // install handlers, so the "previous handler" is always
-            // SIG_DFL/None.  Returning `handler` would lie about the
-            // prior state and confuse callers that swap+restore.
-            |_| Ok(pyre_object::w_none()),
-            2,
-        ),
+        crate::make_builtin_function_with_arity("signal", |args| signal_signal(args[0], args[1]), 2),
     );
+    // interp_signal.py:238-251 `getsignal(signum) -> action`.
     crate::dict_storage_store(
         ns,
         "getsignal",
-        crate::make_builtin_function_with_arity("getsignal", |_| Ok(pyre_object::w_none()), 1),
+        crate::make_builtin_function_with_arity("getsignal", |args| signal_getsignal(args[0]), 1),
     );
     // `interp_signal.py:default_int_handler` — `raise KeyboardInterrupt`.
     // Shares one identity with the SIGINT handler installed at startup so
