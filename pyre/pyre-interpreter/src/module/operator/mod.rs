@@ -54,6 +54,11 @@ use crate::baseobjspace::{
 
 crate::py_module! {
     "operator",
+    // `itemgetter`/`attrgetter`/`methodcaller` are app-level callable
+    // classes (`pypy/module/operator/app_operator.py`), not interp-level.
+    appleveldefs: {
+        "app_operator.py" => ["itemgetter", "attrgetter", "methodcaller"],
+    },
     functions: {
         "index"    / 1 = op_index,
         "add"      / 2 = |args| { assert!(args.len() == 2); Ok(add(args[0], args[1]).unwrap_or(w_none())) },
@@ -91,10 +96,6 @@ crate::py_module! {
         "le" / 2 = |args| baseobjspace::compare(args[0], args[1], CompareOp::Le),
         "ge" / 2 = |args| baseobjspace::compare(args[0], args[1], CompareOp::Ge),
         "ne" / 2 = |args| baseobjspace::compare(args[0], args[1], CompareOp::Ne),
-        // itemgetter / attrgetter / methodcaller stubs — return first arg.
-        "itemgetter"   / * = |args| Ok(if args.is_empty() { w_none() } else { args[0] }),
-        "attrgetter"   / * = |args| Ok(if args.is_empty() { w_none() } else { args[0] }),
-        "methodcaller" / * = |args| Ok(if args.is_empty() { w_none() } else { args[0] }),
         "length_hint"  / * = op_length_hint,
     },
 }
