@@ -1,8 +1,9 @@
-# app_operator.py — app-level callables for the operator module.
-# Literal port of pypy/module/operator/app_operator.py (countOf,
-# attrgetter, itemgetter, methodcaller + the _resolve_attr_chain helper).
-# These are app-level in upstream too; installed via the `appleveldefs:`
-# arm in mod.rs.
+# app_operator.py — app-level helpers for the operator module.
+# attrgetter / itemgetter / methodcaller are callable factory classes that
+# the interp-level operator module cannot express as plain functions.
+# Mirrors the role of pypy/module/operator/app_operator.py.
+
+__name__ = 'operator'
 
 
 def countOf(a, b):
@@ -14,125 +15,108 @@ def countOf(a, b):
     return count
 
 
-def _resolve_attr_chain(chain, obj, idx=0):
-    obj = getattr(obj, chain[idx])
-    if idx + 1 == len(chain):
-        return obj
-    else:
-        return _resolve_attr_chain(chain, obj, idx + 1)
+class attrgetter:
+    """
+    Return a callable object that fetches the given attribute(s) from its operand.
+    After f = attrgetter('name'), the call f(r) returns r.name.
+    After g = attrgetter('name', 'date'), the call g(r) returns (r.name, r.date).
+    After h = attrgetter('name.first', 'name.last'), the call h(r) returns
+    (r.name.first, r.name.last).
+    """
+    __slots__ = ('_attrs', '_call')
 
-
-class attrgetter(object):
     def __init__(self, attr, *attrs):
-        if (
-            not isinstance(attr, str) or
-            not all(isinstance(a, str) for a in attrs)
-        ):
-            raise TypeError("attribute name must be a string, not %r" %
-                        type(attr).__name__)
-        elif attrs:
-            self._multi_attrs = [
-                a.split(".") for a in [attr] + list(attrs)
-            ]
-            self._call = self._multi_attrgetter
-        elif "." not in attr:
-            self._simple_attr = attr
-            self._call = self._simple_attrgetter
+        if not attrs:
+            if not isinstance(attr, str):
+                raise TypeError('attribute name must be a string')
+            self._attrs = (attr,)
+            names = attr.split('.')
+            def func(obj):
+                for name in names:
+                    obj = getattr(obj, name)
+                return obj
+            self._call = func
         else:
-            self._single_attr = attr.split(".")
-            self._call = self._single_attrgetter
+            self._attrs = (attr,) + attrs
+            getters = tuple(map(attrgetter, self._attrs))
+            def func(obj):
+                return tuple(getter(obj) for getter in getters)
+            self._call = func
 
     def __call__(self, obj):
         return self._call(obj)
 
-    def _simple_attrgetter(self, obj):
-        return getattr(obj, self._simple_attr)
-
-    def _single_attrgetter(self, obj):
-        return _resolve_attr_chain(self._single_attr, obj)
-
-    def _multi_attrgetter(self, obj):
-        return tuple([
-            _resolve_attr_chain(attrs, obj)
-            for attrs in self._multi_attrs
-        ])
+    def __repr__(self):
+        return '%s.%s(%s)' % (self.__class__.__module__,
+                              self.__class__.__qualname__,
+                              ', '.join(map(repr, self._attrs)))
 
     def __reduce__(self):
-        try:
-            attrs = (self._simple_attr,)
-        except AttributeError:
-            try:
-                attrs = ('.'.join(self._single_attr),)
-            except AttributeError:
-                attrs = tuple('.'.join(a) for a in self._multi_attrs)
-        return (type(self), attrs)
-
-    def __repr__(self):
-        try:
-            a = repr(self._simple_attr)
-        except AttributeError:
-            try:
-                a = repr('.'.join(self._single_attr))
-            except AttributeError:
-                lst = self._multi_attrs
-                a = ', '.join([repr('.'.join(a1)) for a1 in lst])
-        return 'operator.attrgetter(%s)' % (a,)
+        return self.__class__, self._attrs
 
 
-class itemgetter(object):
+class itemgetter:
+    """
+    Return a callable object that fetches the given item(s) from its operand.
+    After f = itemgetter(2), the call f(r) returns r[2].
+    After g = itemgetter(2, 5, 3), the call g(r) returns (r[2], r[5], r[3])
+    """
+    __slots__ = ('_items', '_call')
+
     def __init__(self, item, *items):
-        self._single = not bool(items)
-        if self._single:
-            self._idx = item
+        if not items:
+            self._items = (item,)
+            def func(obj):
+                return obj[item]
+            self._call = func
         else:
-            self._idx = [item] + list(items)
+            self._items = items = (item,) + items
+            def func(obj):
+                return tuple(obj[i] for i in items)
+            self._call = func
 
     def __call__(self, obj):
-        if self._single:
-            return obj[self._idx]
-        else:
-            return tuple([obj[i] for i in self._idx])
-
-    def __reduce__(self):
-        if self._single:
-            return (type(self), (self._idx,))
-        else:
-            return (type(self), tuple(self._idx))
+        return self._call(obj)
 
     def __repr__(self):
-        if self._single:
-            a = repr(self._idx)
-        else:
-            a = ', '.join([repr(i) for i in self._idx])
-        return 'operator.itemgetter(%s)' % (a,)
+        return '%s.%s(%s)' % (self.__class__.__module__,
+                              self.__class__.__name__,
+                              ', '.join(map(repr, self._items)))
+
+    def __reduce__(self):
+        return self.__class__, self._items
 
 
-class methodcaller(object):
-    def __init__(*args, **kwargs):
-        if len(args) < 2:
-            raise TypeError("methodcaller() called with not enough arguments")
-        self, method_name = args[:2]
-        if not isinstance(method_name, str):
-            raise TypeError("method name must be a string")
-        self._method_name = method_name
-        self._args = args[2:]
+class methodcaller:
+    """
+    Return a callable object that calls the given method on its operand.
+    After f = methodcaller('name'), the call f(r) returns r.name().
+    After g = methodcaller('name', 'date', foo=1), the call g(r) returns
+    r.name('date', foo=1).
+    """
+    __slots__ = ('_name', '_args', '_kwargs')
+
+    def __init__(self, name, /, *args, **kwargs):
+        self._name = name
+        if not isinstance(self._name, str):
+            raise TypeError('method name must be a string')
+        self._args = args
         self._kwargs = kwargs
 
     def __call__(self, obj):
-        return getattr(obj, self._method_name)(*self._args, **self._kwargs)
+        return getattr(obj, self._name)(*self._args, **self._kwargs)
+
+    def __repr__(self):
+        args = [repr(self._name)]
+        args.extend(map(repr, self._args))
+        args.extend('%s=%r' % (k, v) for k, v in self._kwargs.items())
+        return '%s.%s(%s)' % (self.__class__.__module__,
+                              self.__class__.__name__,
+                              ', '.join(args))
 
     def __reduce__(self):
         if not self._kwargs:
-            return (type(self), (self._method_name,) + self._args)
+            return self.__class__, (self._name,) + self._args
         else:
             from functools import partial
-            return (partial(type(self), self._method_name, **self._kwargs),
-                    self._args)
-
-    def __repr__(self):
-        args = [repr(self._method_name)]
-        for a in self._args:
-            args.append(repr(a))
-        for key, value in self._kwargs.items():
-            args.append('%s=%r' % (key, value))
-        return 'operator.methodcaller(%s)' % (', '.join(args),)
+            return partial(self.__class__, self._name, **self._kwargs), self._args
