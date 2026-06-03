@@ -2013,6 +2013,41 @@ impl RPythonAnnotator {
             let pk = super::bookkeeper::PositionKey::from_refs(graph, block, i);
             let _pg = self.bookkeeper.at_position(Some(pk));
 
+            // `same_as` — pyre's front-end cast lowering
+            // (`front/ast.rs::lower_value_cast`) emits the rtyper
+            // renaming op (`rtyper.py:478-481`) directly into the flow
+            // graph to carry an identity / source-type-unknown
+            // `Expr::Cast`'s target `result_ty` down to
+            // `rbuiltin::rtype_same_as`.  RPython's `operation.py` never
+            // registers `same_as` (it is rtyper-generated), so
+            // `OpKind::from_opname` declines it and the canonical
+            // dispatch below would fall into the "Unknown op → skip"
+            // branch, leaving the result Variable unbound — the next
+            // operation that reads it then raises an unbound-argument
+            // `AnnotatorError`.  At the annotation level the cast is a
+            // pure identity: the operand's `SomeValue` is unchanged (the
+            // lltype retype is applied later by `rtype_same_as`), so bind
+            // the result to the operand's binding, matching upstream
+            // `setbinding(op.result, binding(op.args[0]))`.
+            {
+                let is_same_as = {
+                    let blk = block.borrow();
+                    let sp = &blk.operations[i];
+                    sp.opname == "same_as" && sp.args.len() == 1
+                };
+                if is_same_as {
+                    let arg = block.borrow().operations[i].args[0].clone();
+                    if let Some(s_arg) = self.annotation(&arg) {
+                        let mut blk = block.borrow_mut();
+                        if let Hlvalue::Variable(v) = &mut blk.operations[i].result {
+                            self.setbinding(v, s_arg);
+                        }
+                    }
+                    i += 1;
+                    continue;
+                }
+            }
+
             // Reify `SpaceOperation` (Block storage) into an
             // `HLOperation` the dispatcher can consume. Upstream
             // `Block.operations` carries HLOperations directly; the
