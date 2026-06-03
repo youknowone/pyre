@@ -242,6 +242,13 @@ pub struct MirGraphLookup<'a> {
     impl_methods: HashMap<(&'a str, &'a str), Result<&'a FunctionGraph, ()>>,
     /// Trait-default bodies: keyed by (trait_root, name) with self_ty_root None.
     trait_defaults: HashMap<(&'a str, &'a str), &'a FunctionGraph>,
+    /// Free functions (no impl owner, no trait root): keyed by bare name.
+    /// `Ok(&graph)` is a unique hit; `Err(())` marks the slot ambiguous
+    /// (two or more free functions share a bare name across modules).
+    /// Lets the opcode-dispatch extractor resolve `execute_opcode_step`
+    /// and each `execute_<op>` handler graph from the MIR program by
+    /// name without re-lowering the syn arm body.
+    free_functions: HashMap<&'a str, Result<&'a FunctionGraph, ()>>,
 }
 
 impl<'a> MirGraphLookup<'a> {
@@ -252,6 +259,7 @@ impl<'a> MirGraphLookup<'a> {
         let mut impl_methods: HashMap<(&'a str, &'a str), Result<&'a FunctionGraph, ()>> =
             HashMap::new();
         let mut trait_defaults = HashMap::new();
+        let mut free_functions: HashMap<&'a str, Result<&'a FunctionGraph, ()>> = HashMap::new();
         for f in &program.functions {
             if let Some(owner) = f.self_ty_root.as_deref() {
                 Self::insert_or_mark_ambiguous(&mut impl_methods, owner, f.name.as_str(), &f.graph);
@@ -271,11 +279,17 @@ impl<'a> MirGraphLookup<'a> {
                 }
             } else if let Some(tr) = f.trait_root.as_deref() {
                 trait_defaults.insert((tr, f.name.as_str()), &f.graph);
+            } else {
+                // Free function: index by bare name so the
+                // opcode-dispatch extractor can resolve
+                // `execute_opcode_step` and each `execute_<op>` handler.
+                Self::insert_free_or_mark_ambiguous(&mut free_functions, f.name.as_str(), &f.graph);
             }
         }
         Self {
             impl_methods,
             trait_defaults,
+            free_functions,
         }
     }
 
@@ -302,6 +316,38 @@ impl<'a> MirGraphLookup<'a> {
                 }
                 // already Err(()): stays ambiguous.
             }
+        }
+    }
+
+    fn insert_free_or_mark_ambiguous(
+        map: &mut HashMap<&'a str, Result<&'a FunctionGraph, ()>>,
+        name: &'a str,
+        graph: &'a FunctionGraph,
+    ) {
+        use std::collections::hash_map::Entry;
+        match map.entry(name) {
+            Entry::Vacant(v) => {
+                v.insert(Ok(graph));
+            }
+            Entry::Occupied(mut o) => {
+                if let Ok(g0) = *o.get() {
+                    if !std::ptr::eq(g0, graph) {
+                        let _ = o.insert(Err(()));
+                    }
+                }
+                // already Err(()): stays ambiguous.
+            }
+        }
+    }
+
+    /// Returns the MIR graph for a free function (no impl owner, no
+    /// trait root) by bare name.  Returns None when the name does not
+    /// resolve to a unique graph (no entry, or two modules share the
+    /// bare name).
+    pub fn lookup_free(&self, name: &str) -> Option<&'a FunctionGraph> {
+        match self.free_functions.get(name).copied()? {
+            Ok(g) => Some(g),
+            Err(()) => None,
         }
     }
 
@@ -360,4 +406,65 @@ pub fn qualify_type_name_with_imports(
         return canonical;
     }
     format!("{}::{}", prefix, bare)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::FunctionGraph;
+
+    fn free_fn(name: &str) -> SemanticFunction {
+        SemanticFunction {
+            name: name.into(),
+            graph: FunctionGraph::new(name),
+            return_type: None,
+            self_ty_root: None,
+            module_path: String::new(),
+            hints: Vec::new(),
+            access_directly: false,
+            trait_root: None,
+        }
+    }
+
+    fn impl_method(owner: &str, name: &str) -> SemanticFunction {
+        SemanticFunction {
+            self_ty_root: Some(owner.into()),
+            ..free_fn(name)
+        }
+    }
+
+    fn program(functions: Vec<SemanticFunction>) -> SemanticProgram {
+        SemanticProgram {
+            functions,
+            known_struct_names: Default::default(),
+            known_trait_names: Default::default(),
+            struct_fields: StructFieldRegistry::default(),
+            immutable_fields: Default::default(),
+        }
+    }
+
+    #[test]
+    fn lookup_free_resolves_unique_free_function() {
+        let prog = program(vec![
+            free_fn("execute_opcode_step"),
+            free_fn("execute_pop_top"),
+            impl_method("PyFrame", "push"),
+        ]);
+        let lookup = MirGraphLookup::from_program(&prog);
+        assert!(lookup.lookup_free("execute_opcode_step").is_some());
+        assert!(lookup.lookup_free("execute_pop_top").is_some());
+        // An impl method is not a free function.
+        assert!(lookup.lookup_free("push").is_none());
+        // An unknown name resolves to nothing.
+        assert!(lookup.lookup_free("execute_nope").is_none());
+    }
+
+    #[test]
+    fn lookup_free_returns_none_on_ambiguous_bare_name() {
+        // Two free functions sharing a bare name (e.g. the same helper
+        // name in two modules) must not bind either graph.
+        let prog = program(vec![free_fn("helper"), free_fn("helper")]);
+        let lookup = MirGraphLookup::from_program(&prog);
+        assert!(lookup.lookup_free("helper").is_none());
+    }
 }
