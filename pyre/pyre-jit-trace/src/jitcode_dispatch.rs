@@ -5286,8 +5286,11 @@ fn walker_capture_snapshot_for_last_guard_impl(
     // a top snapshot for pyre (helper frames don't resume), so feed
     // the trace-time vable/vref shadow through.  Empty when no
     // virtualizable / virtualref is live, matching the upstream
-    // 0-length-array shape.
-    let (vable_boxes, vref_boxes) = ctx.trace_ctx.build_snapshot_vable_vref_boxes();
+    // 0-length-array shape.  The build is deferred until after the
+    // resume py_pc is resolved and the `last_instr` vable scalar is
+    // published, so the snapshot carries this guard's coordinate (the
+    // walker never crosses `set_orgpc`, so the scalar is otherwise
+    // stale at the loop-header pc — see the publish below).
 
     // Full-body walk (Phase 7): the walk processes the outer
     // `sym.jitcode` directly, so `op_pc` is a real resume coordinate.
@@ -5348,6 +5351,27 @@ fn walker_capture_snapshot_for_last_guard_impl(
             } else {
                 py_pc
             };
+            // Publish `last_instr = py_pc - 1` to the vable static shadow
+            // before snapshotting.  The walker walks JitCode and never
+            // crosses `set_orgpc`, so the `last_instr` scalar in
+            // `virtualizable_boxes` keeps whatever the trace seed or the
+            // previous `close_loop_args_at` override wrote (the loop-header
+            // pc).  The blackhole / vable-sync resume reads this scalar into
+            // `frame.last_instr`; a stale loop-header value makes a mid-body
+            // guard resume at the loop header instead of the guard's own
+            // opcode, re-running loop iterations and corrupting the result.
+            // Mirror of `MIFrame::publish_last_instr_to_vable`.
+            if sym.owns_virtualizable_shadow() {
+                let last_instr_value = py_pc as i64 - 1;
+                let last_instr_op = ctx.trace_ctx.const_int(last_instr_value);
+                crate::trace_opcode::mirror_vable_static_to_boxes(
+                    ctx.trace_ctx,
+                    "last_instr",
+                    last_instr_op,
+                    Value::Int(last_instr_value),
+                );
+            }
+            let (vable_boxes, vref_boxes) = ctx.trace_ctx.build_snapshot_vable_vref_boxes();
             let active = collect_outer_active_boxes(
                 sym,
                 ctx.trace_ctx,
@@ -5372,6 +5396,7 @@ fn walker_capture_snapshot_for_last_guard_impl(
     // Per-opcode arm path: `op_pc` (arm-local PC) is not a blackhole
     // resume point, so the snapshot uses the static outer coordinate.
     let _ = op_pc;
+    let (vable_boxes, vref_boxes) = ctx.trace_ctx.build_snapshot_vable_vref_boxes();
     ctx.trace_ctx
         .capture_snapshot_for_last_guard_with_vable_vref(
             &ctx.outer_active_boxes,

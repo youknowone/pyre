@@ -595,7 +595,7 @@ fn emit_call_assembler_callee_frame(
 ///
 /// No-op when `virtualizable_boxes` is not yet seeded
 /// (non-virtualizable trace, or before `init_virtualizable_boxes`).
-fn mirror_vable_static_to_boxes(
+pub(crate) fn mirror_vable_static_to_boxes(
     ctx: &mut TraceCtx,
     static_field_name: &str,
     opref: OpRef,
