@@ -7998,6 +7998,25 @@ mod tests {
         );
     }
 
+    #[test]
+    fn semantic_ref_slot_none_for_beyond_window_stack_color() {
+        // list_setslice #300: at BUILD_LIST entry (pc=40) the runtime stack
+        // is 3 deep (stack_only=3) but the SHARED canonical `-live-` marker
+        // also carries stack color 5 = stack_color_map[3], live only at the
+        // depth-4 sibling PC that shares the marker.  The reverse map must
+        // classify color 5 as dead-here (None) — it sits past the live
+        // stack window — so `collect_outer_active_boxes` substitutes a
+        // CONST_NULL placeholder rather than reading an unpopulated
+        // register.  The color still appears in `stack_color_map`, which is
+        // the signal the encoder keys the placeholder on.
+        let stack_color_map = [2u16, 3, 4, 5];
+        assert_eq!(
+            semantic_ref_slot_for_reg_color(2, 3, &[2, 2], &stack_color_map, &[0, 1], 5),
+            None,
+        );
+        assert!(stack_color_map.contains(&5));
+    }
+
     fn empty_meta() -> PyreMeta {
         PyreMeta {
             num_locals: 0,

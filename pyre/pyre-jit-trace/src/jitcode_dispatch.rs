@@ -4156,6 +4156,32 @@ fn collect_outer_active_boxes(
                         .virtualizable_box_at(nvs + s_idx)
                         .unwrap_or_else(fallback)
                 }
+                // Under the canonical splice (#281/#300) a single `-live-`
+                // marker is SHARED across a range of Python PCs at different
+                // stack depths, and its liveness banks carry the UNION of
+                // those PCs' live frame colors.  Resuming at a shallower
+                // PC therefore sees a Ref color that names a stack slot
+                // BEYOND this resume's live window (`semantic_ref_slot_for_
+                // reg_color` is `None` because the slot sits past
+                // `valid_stack_only`) — a frame slot that is dead here and
+                // was never populated in `registers_r`.  Both decode paths
+                // already tolerate this: the blackhole rebuild
+                // (`state.rs` ref-bank loop) and the bridge decoder drop a
+                // Ref color whose semantic slot is `None`.  Keep encode
+                // symmetric — substitute `CONST_NULL` (history.py:361) so
+                // the positional snapshot/liveness count stays aligned
+                // rather than failing loud on the unsourceable dead slot.
+                // Only colors that name a real frame slot (present in the
+                // stack/local color maps) qualify; a color with no frame
+                // correspondence still falls through to the fail-loud
+                // `registers_r` read so genuine liveness-coverage bugs
+                // surface.  Under the walker (gate-off) each PC owns a
+                // depth-narrowed marker, so this arm never fires.
+                None if stack_color_map.contains(&(color as u16))
+                    || local_color_map.contains(&(color as u16)) =>
+                {
+                    OpRef::const_ptr(majit_ir::GcRef(0))
+                }
                 _ => fallback(),
             }
         } else {
