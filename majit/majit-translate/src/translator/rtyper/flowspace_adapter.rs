@@ -3074,9 +3074,16 @@ mod tests {
         // `lookup_with_leaf_match`.
         use crate::flowspace::argument::Signature;
         use crate::translator::rtyper::pyre_call_registry::FunctionPathKey;
-        let mut value_map: HashMap<usize, Hlvalue> = HashMap::new();
-        value_map.insert(1, Hlvalue::Variable(Variable::new()));
-        value_map.insert(2, Hlvalue::Variable(Variable::new()));
+        let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
+        let graph = translate_op_test_graph(10);
+        value_map.insert(
+            graph.must_variable_at(1),
+            Hlvalue::Variable(Variable::new()),
+        );
+        value_map.insert(
+            graph.must_variable_at(2),
+            Hlvalue::Variable(Variable::new()),
+        );
         let registry = empty_call_registry();
         // Free-fn-shaped (snake_case module) candidate whose leaf
         // `ValueError` collides with the exception class name.
@@ -3092,7 +3099,6 @@ mod tests {
             leaf_hit.host_object.is_user_function(),
             "leaf-match fallback resolves the registered user fn"
         );
-        let graph = translate_op_test_graph(10);
         let op = SpaceOperation {
             result: Some(graph.must_variable_at(2)),
             kind: OpKind::Call {
