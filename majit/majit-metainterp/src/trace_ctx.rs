@@ -109,16 +109,17 @@ pub(crate) fn value_to_raw_bits(value: Value) -> i64 {
 }
 
 /// pyjitpl.py:1135-1138 `rop.PTR_EQ` runtime outcome.  Compare the
-/// concrete ptrs carried by two Refs (virtualizable identity).  Non-Ref
-/// values are never compared as virtualizable boxes, so falling into the
-/// catch-all `false` branch preserves the Step 4 "not standard" path in
-/// `is_nonstandard_virtualizable` — this is how an `opref` backed by a
-/// non-Ref constant (e.g. `ConstInt(0xCAFE)` in a test) still resolves to
+/// concrete ptrs carried by two Refs (virtualizable identity).  `None`
+/// (no concrete known) and non-Ref values are never the standard box, so
+/// falling into the catch-all `false` branch preserves the Step 4 "not
+/// standard" path in `is_nonstandard_virtualizable` — this is how an
+/// `opref` with no resolvable concrete, or one backed by a non-Ref
+/// constant (e.g. `ConstInt(0xCAFE)` in a test), still resolves to
 /// `isstandard = 0` and proceeds to Step 5 / `emit_force_virtualizable`,
 /// matching upstream's runtime behavior for the same bogus input.
-fn concrete_ptrs_eq(a: &Value, b: &Value) -> bool {
+fn concrete_ptrs_eq(a: Option<&Value>, b: Option<&Value>) -> bool {
     match (a, b) {
-        (Value::Ref(ra), Value::Ref(rb)) => ra == rb,
+        (Some(Value::Ref(ra)), Some(Value::Ref(rb))) => ra == rb,
         _ => false,
     }
 }
@@ -1813,28 +1814,26 @@ impl TraceCtx {
     ///      site that has the runtime result in scope (HEAP loads,
     ///      register reads, resume-data materialization).  Covers
     ///      non-Const result OpRefs whose runtime concrete is known.
-    ///   4. Fallback — a sentinel `Value::Ref(GcRef(usize::MAX))` that
-    ///      never matches a real heap pointer, so PTR_EQ comparisons with
-    ///      the standard vable resolve to "different" at trace time.
-    pub fn concrete_of_opref(&self, opref: OpRef) -> Value {
+    ///   4. Fallback — `None`: no concrete is known.  Consumers treat
+    ///      `None` as "never matches a real heap pointer", so PTR_EQ
+    ///      comparisons with the standard vable resolve to "different" at
+    ///      trace time.
+    pub fn concrete_of_opref(&self, opref: OpRef) -> Option<Value> {
         if opref.is_constant() {
             // history.py:220/261/307 box.type parity: the OpRef variant
             // carries the typed `Value` inline — the variant tag carries
             // the `Box.type` intrinsically, so no separate type lookup
             // is required.
             if let Some(value) = opref.inline_const_to_value() {
-                return value;
+                return Some(value);
             }
         }
         if Some(opref) == self.standard_virtualizable_box() {
             if let Some(v) = self.standard_virtualizable_concrete() {
-                return v;
+                return Some(v);
             }
         }
-        if let Some(v) = self.lookup_opref_concrete(opref) {
-            return v;
-        }
-        Value::Ref(majit_ir::GcRef(usize::MAX))
+        self.lookup_opref_concrete(opref)
     }
 
     /// Whether standard virtualizable boxes are active.
@@ -2304,7 +2303,7 @@ impl TraceCtx {
         pc: usize,
         vable_opref: OpRef,
         fielddescr: &DescrRef,
-        concrete: Value,
+        concrete: Option<Value>,
     ) -> bool {
         // Step 1: heapcache short-circuit.
         //     if self.metainterp.heapcache.is_known_nonstandard_virtualizable(box):
@@ -2376,9 +2375,7 @@ impl TraceCtx {
             None => true,
         };
         if descriptor_has_matching_vinfo {
-            let standard_concrete = self
-                .standard_virtualizable_concrete()
-                .unwrap_or(Value::Ref(majit_ir::GcRef(usize::MAX)));
+            let standard_concrete = self.standard_virtualizable_concrete();
             // pyjitpl.py:1135-1138 `eqbox = self.metainterp.execute_and_record(
             //     rop.PTR_EQ, None, box, standard_box);
             //     eqbox = self.implement_guard_value(eqbox, pc);
@@ -2394,7 +2391,8 @@ impl TraceCtx {
             // parameter is documented here but not consumed at this layer.
             let _ = pc;
             let eqbox = self.record_op(OpCode::PtrEq, &[vable_opref, standard_box]);
-            let isstandard: i64 = if concrete_ptrs_eq(&concrete, &standard_concrete) {
+            let isstandard: i64 = if concrete_ptrs_eq(concrete.as_ref(), standard_concrete.as_ref())
+            {
                 1
             } else {
                 0
@@ -2665,7 +2663,7 @@ impl TraceCtx {
         vable_opref: OpRef,
         fielddescr: DescrRef,
         value: OpRef,
-        concrete: Value,
+        concrete: Option<Value>,
     ) {
         let vable_concrete = self.concrete_of_opref(vable_opref);
         if self.is_nonstandard_virtualizable(pc, vable_opref, &fielddescr, vable_concrete) {
@@ -2702,7 +2700,13 @@ impl TraceCtx {
             .expect("vable_setfield: virtualizable_info missing")
             .static_field_by_descr(&fielddescr)
             .expect("vable_setfield: standard virtualizable field descr missing");
-        self.set_virtualizable_entry_at(index, value, concrete);
+        // `virtualizable_values` is a dense `Vec<Value>`, so an unknown
+        // concrete still needs a placeholder slot.  This is the lone
+        // remaining materialization of the "no concrete" marker; the
+        // role-2 shadow store keeps a `Value::Ref(GcRef(usize::MAX))`
+        // until that store is itself moved to `Vec<Option<Value>>`.
+        let stored = concrete.unwrap_or(Value::Ref(majit_ir::GcRef(usize::MAX)));
+        self.set_virtualizable_entry_at(index, value, stored);
         // pyjitpl.py:3446 write_boxes parity: mirror the updated
         // shadow slot back into the live virtualizable.
         self.synchronize_virtualizable();
@@ -4017,7 +4021,7 @@ mod tests {
             fn sync_virtualizable_before_residual_call(&self, ctx: &mut TraceCtx) {
                 // Write field 0 to heap
                 let fd = majit_ir::make_field_descr(0, 8, Type::Int, majit_ir::ArrayFlag::Signed);
-                ctx.vable_setfield(0, self.vable_ref, fd, self.field_val, Value::Int(0));
+                ctx.vable_setfield(0, self.vable_ref, fd, self.field_val, Some(Value::Int(0)));
             }
 
             fn sync_virtualizable_after_residual_call(
@@ -4167,7 +4171,7 @@ mod tests {
                     self.vable_ref,
                     fd,
                     self.field_val,
-                    Value::Ref(majit_ir::GcRef::NULL),
+                    Some(Value::Ref(majit_ir::GcRef::NULL)),
                 );
             }
 
@@ -4248,7 +4252,13 @@ mod tests {
 
             fn sync_virtualizable_before_residual_call(&self, ctx: &mut TraceCtx) {
                 let fd = majit_ir::make_field_descr(0, 8, Type::Float, majit_ir::ArrayFlag::Float);
-                ctx.vable_setfield(0, self.vable_ref, fd, self.field_val, Value::Float(0.0));
+                ctx.vable_setfield(
+                    0,
+                    self.vable_ref,
+                    fd,
+                    self.field_val,
+                    Some(Value::Float(0.0)),
+                );
             }
 
             fn sync_virtualizable_after_residual_call(
@@ -4463,7 +4473,7 @@ mod tests {
         );
 
         // setfield offset=8 → updates box0
-        ctx.vable_setfield(0, vable, fd8.clone(), new_val, ph(Type::Int));
+        ctx.vable_setfield(0, vable, fd8.clone(), new_val, Some(ph(Type::Int)));
 
         // Box 0 should now be new_val
         let (result, _) = ctx.vable_getfield_int(0, vable, 0, fd8);
@@ -4511,7 +4521,7 @@ mod tests {
         );
 
         let fd8 = majit_ir::make_field_descr(8, 8, Type::Int, majit_ir::ArrayFlag::Signed);
-        ctx.vable_setfield(0, vable, fd8, val, ph(Type::Int));
+        ctx.vable_setfield(0, vable, fd8, val, Some(ph(Type::Int)));
 
         let ops = take_all_ops(ctx);
         assert_eq!(ops.len(), 1);
@@ -4755,7 +4765,7 @@ mod tests {
         assert_eq!(boxes, vec![box0, box1, vable]);
 
         // After mutation
-        ctx.vable_setfield(0, vable, fd8, new_val, ph(Type::Int));
+        ctx.vable_setfield(0, vable, fd8, new_val, Some(ph(Type::Int)));
         let boxes = ctx.collect_virtualizable_boxes().unwrap();
         assert_eq!(boxes, vec![new_val, box1, vable]);
     }

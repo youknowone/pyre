@@ -1001,7 +1001,7 @@ fn concrete_int_for_switch(
     ctx: &WalkContext<'_, '_>,
 ) -> Result<i64, DispatchError> {
     match ctx.trace_ctx.concrete_of_opref(value) {
-        Value::Int(v) => Ok(v),
+        Some(Value::Int(v)) => Ok(v),
         _ => Err(DispatchError::SwitchValueNotConcrete { pc: op.pc, value }),
     }
 }
@@ -1220,18 +1220,18 @@ fn write_int_reg(
 /// `binop_int_record` / `unop_int_record`, and standard virtualizable
 /// box hits all surface here.
 ///
-/// Returns `ConcreteValue::Null` when the table has no entry — the
-/// caller's downstream `goto_if_not/iL` / GUARD_CLASS dispatch treats
-/// Null as "skip the fold / skip the guard".  The sentinel
-/// `Value::Ref(GcRef(usize::MAX))` (`trace_ctx.rs:1461`) is mapped to
-/// Null since it signals "no concrete known" rather than an actual
-/// pointer.
+/// Returns `ConcreteValue::Null` when `concrete_of_opref` yields `None`
+/// (no concrete known) — the caller's downstream `goto_if_not/iL` /
+/// GUARD_CLASS dispatch treats Null as "skip the fold / skip the guard".
+/// A residual `Value::Ref(GcRef(usize::MAX))` storage placeholder
+/// (`vable_setfield`) is likewise mapped to Null since it signals "no
+/// concrete known" rather than an actual pointer.
 #[inline]
 fn concrete_from_recorded_opref(ctx: &WalkContext<'_, '_>, opref: OpRef) -> ConcreteValue {
     match ctx.trace_ctx.concrete_of_opref(opref) {
-        Value::Int(v) => ConcreteValue::Int(v),
-        Value::Float(v) => ConcreteValue::Float(v),
-        Value::Ref(r) if r != majit_ir::GcRef(usize::MAX) => {
+        Some(Value::Int(v)) => ConcreteValue::Int(v),
+        Some(Value::Float(v)) => ConcreteValue::Float(v),
+        Some(Value::Ref(r)) if r != majit_ir::GcRef(usize::MAX) => {
             ConcreteValue::Ref(r.as_usize() as pyre_object::PyObjectRef)
         }
         _ => ConcreteValue::Null,
@@ -3194,7 +3194,7 @@ fn funcptr_concrete_int(ctx: &WalkContext<'_, '_>, funcptr: OpRef) -> Option<i64
         return None;
     }
     match ctx.trace_ctx.concrete_of_opref(funcptr) {
-        majit_ir::Value::Int(v) => Some(v),
+        Some(majit_ir::Value::Int(v)) => Some(v),
         _ => None,
     }
 }
@@ -5209,7 +5209,7 @@ fn handle(
             let valuebox = read_int_reg(code, op, 0, ctx)?;
             let target = read_label(code, op, 1);
             let switchcase = match ctx.trace_ctx.concrete_of_opref(valuebox) {
-                Value::Int(v) => v,
+                Some(Value::Int(v)) => v,
                 _ => {
                     return Err(DispatchError::GotoIfNotValueNotConcrete {
                         pc: op.pc,

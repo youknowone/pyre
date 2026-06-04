@@ -3835,7 +3835,7 @@ impl<M: Clone> MetaInterp<M> {
         self.tracing
             .as_mut()
             .expect("opimpl_setfield_vable_int requires active tracing")
-            .vable_setfield(pc, vable_opref, fielddescr, value, concrete);
+            .vable_setfield(pc, vable_opref, fielddescr, value, Some(concrete));
     }
 
     /// pyjitpl.py:1188-1199 `_opimpl_setfield_vable` — ref variant.
@@ -3850,7 +3850,7 @@ impl<M: Clone> MetaInterp<M> {
         self.tracing
             .as_mut()
             .expect("opimpl_setfield_vable_ref requires active tracing")
-            .vable_setfield(pc, vable_opref, fielddescr, value, concrete);
+            .vable_setfield(pc, vable_opref, fielddescr, value, Some(concrete));
     }
 
     /// pyjitpl.py:1188-1199 `_opimpl_setfield_vable` — float variant.
@@ -3865,7 +3865,7 @@ impl<M: Clone> MetaInterp<M> {
         self.tracing
             .as_mut()
             .expect("opimpl_setfield_vable_float requires active tracing")
-            .vable_setfield(pc, vable_opref, fielddescr, value, concrete);
+            .vable_setfield(pc, vable_opref, fielddescr, value, Some(concrete));
     }
 
     /// pyjitpl.py:1218-1234 `_opimpl_getarrayitem_vable` — int variant.

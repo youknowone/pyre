@@ -1679,7 +1679,7 @@ where
                     vable_opref,
                     fielddescr,
                     value,
-                    Value::Int(concrete),
+                    Some(Value::Int(concrete)),
                 );
             }
             jitcode::insns::BC_SETFIELD_VABLE_R => {
@@ -1700,7 +1700,7 @@ where
                     vable_opref,
                     fielddescr,
                     value,
-                    Value::Ref(majit_ir::GcRef(concrete as usize)),
+                    Some(Value::Ref(majit_ir::GcRef(concrete as usize))),
                 );
             }
             jitcode::insns::BC_SETFIELD_VABLE_F => {
@@ -1721,7 +1721,7 @@ where
                     vable_opref,
                     fielddescr,
                     value,
-                    Value::Float(f64::from_bits(concrete as u64)),
+                    Some(Value::Float(f64::from_bits(concrete as u64))),
                 );
             }
             // ── BC_GETARRAYITEM_GC_I (Slice C.2) ──
