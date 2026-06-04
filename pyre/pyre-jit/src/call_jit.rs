@@ -1961,6 +1961,21 @@ pub fn trace_and_compile_from_bridge(
     // that whole-loop interpreter; calling it once preserves the concrete PC
     // updates across branches/back-edges. Re-invoking it in a synthetic
     // `pc + 1` loop diverges from RPython and corrupts nested-loop bridges.
+    // The bridge tracer must leave the real frame exactly at the guard
+    // resume state so that a `BridgeCompiled` outcome re-enters
+    // `eval_loop_jit` there — the `ContinueRunningNormally` arm does NOT
+    // reconstruct the frame, it runs the interpreter forward from the live
+    // frame's `last_instr` / value stack as-is.  The trait tracer interprets
+    // a private `snapshot_for_tracing` copy and never touches the real frame,
+    // so it naturally preserves the resume state.  The full-body walker,
+    // however, runs may-force residual calls concretely through the shared
+    // execution context during the walk, which advances the live frame's
+    // `last_instr` AND its locals (e.g. a loop counter) to the walked
+    // opcode's concrete state.  Snapshot the resume state here and restore it
+    // after the walk so the post-bridge interpreter resumes at the guard
+    // point rather than mid-body or past a dropped loop iteration (a
+    // value-stack underflow / off-by-one-iteration result otherwise).
+    let resume_state = frame.snapshot_for_tracing();
     let trace_frame = frame.snapshot_for_tracing();
     let outcome = {
         let (driver, _) = crate::eval::driver_pair();
@@ -1976,6 +1991,7 @@ pub fn trace_and_compile_from_bridge(
             },
         )
     };
+    frame.restore_resume_state_from(&resume_state);
 
     // merge_point handles Finish/CloseLoop via bridge_info.
     if outcome.is_some() {

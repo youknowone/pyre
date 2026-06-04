@@ -434,6 +434,25 @@ impl PyFrame {
     pub fn locals_w_mut(&mut self) -> &mut FixedObjectArray {
         unsafe { &mut *self.locals_cells_stack_w }
     }
+
+    /// Restore the per-trace mutable frame state — instruction pointer, value
+    /// stack depth, and `locals_cells_stack_w` contents — from a snapshot
+    /// taken before a bridge trace.  `trace_and_compile_from_bridge` uses this
+    /// to undo any concrete-execution mutation the full-body walker applied to
+    /// the live frame during the walk, so a `BridgeCompiled` resume re-enters
+    /// at the exact guard state instead of mid-body / past a stepped loop
+    /// counter.  `src` is a `snapshot_for_tracing` of this same frame, so the
+    /// arrays share length; the `min` is defensive.
+    pub fn restore_resume_state_from(&mut self, src: &PyFrame) {
+        self.last_instr = src.last_instr;
+        self.valuestackdepth = src.valuestackdepth;
+        let src_vals = src.locals_w().as_slice().to_vec();
+        let dst = self.locals_w_mut();
+        let n = src_vals.len().min(dst.as_slice().len());
+        for (i, &v) in src_vals.iter().take(n).enumerate() {
+            dst[i] = v;
+        }
+    }
 }
 
 /// Extract raw CodeObject from frame's W_CodeObject.
