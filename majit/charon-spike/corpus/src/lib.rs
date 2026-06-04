@@ -80,3 +80,16 @@ pub fn desugar_mix(input: &[i64]) -> PyResult<i64> {
     }
     Ok(acc)
 }
+
+// --- 5. Tuple round-trip: construct a tuple, read .0/.1 in same fn ------
+//
+// Exercises `Rvalue::Aggregate` for a *non-Adt* (tuple) value paired
+// with `Field` projection reads of that same local. The lowering must
+// emit a `__pos_<idx>` `FieldRead` symmetric to the construction-side
+// `FieldWrite` chain rather than collapsing every `.N` to the base.
+
+#[inline(never)]
+pub fn tuple_roundtrip(a: i64, b: i64) -> i64 {
+    let pair = (a + b, a - b);
+    pair.0 * pair.1
+}

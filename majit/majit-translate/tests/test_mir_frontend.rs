@@ -135,6 +135,86 @@ fn lowers_desugar_mix_with_aggregate_and_question_mark() {
 }
 
 #[test]
+fn lowers_tuple_roundtrip_with_symmetric_positional_field_reads() {
+    // `tuple_roundtrip` constructs a real tuple `(a + b, a - b)` and
+    // reads both `.0` / `.1` in the same function.  The lowering must
+    // emit a `FieldRead __pos_<idx>` for those reads — symmetric with
+    // the construction-side `FieldWrite __pos_<idx>` chain and carrying
+    // the *same* `owner_root` — rather than collapsing every `.N` to
+    // the synthetic-ctor base Variable.
+    //
+    // The same function also exercises the case that MUST still
+    // collapse: each `a + b` / `a - b` / `pair.0 * pair.1` lowers
+    // through a `*Checked` `(value, bool)` `BinaryOp`, whose `.0` reads
+    // are `Field` projections of a `(i64, bool)` local.  Those locals
+    // are bound by `Rvalue::BinaryOp`, never an `Aggregate`, so they
+    // are absent from `positional_aggregate_locals` and their `.0`
+    // reads fall through.  Asserting the FieldRead count is exactly the
+    // two genuine tuple reads (not five) pins that boundary.
+    use majit_translate::model::{CallTarget, OpKind};
+
+    let llbc = load_corpus();
+    let graph = lower_function(&llbc, "tuple_roundtrip").expect("lowering");
+    assert_eq!(graph.name, "charon_spike_corpus::tuple_roundtrip");
+
+    let mut field_reads: Vec<(String, Option<String>)> = Vec::new();
+    let mut field_writes: Vec<(String, Option<String>)> = Vec::new();
+    let mut ctor_count = 0usize;
+    for b in &graph.blocks {
+        for op in &b.operations {
+            match &op.kind {
+                OpKind::FieldRead { field, .. } => {
+                    field_reads.push((field.name.clone(), field.owner_root.clone()));
+                }
+                OpKind::FieldWrite { field, .. } => {
+                    field_writes.push((field.name.clone(), field.owner_root.clone()));
+                }
+                OpKind::Call {
+                    target: CallTarget::SyntheticTransparentCtor { .. },
+                    ..
+                } => ctor_count += 1,
+                _ => {}
+            }
+        }
+    }
+
+    // Exactly one synthetic ctor (the genuine tuple) and its two-field
+    // `__pos_0` / `__pos_1` construction chain.
+    assert_eq!(ctor_count, 1, "expected one tuple SyntheticTransparentCtor");
+    field_writes.sort();
+    assert_eq!(
+        field_writes,
+        vec![
+            ("__pos_0".to_string(), Some("Adt".to_string())),
+            ("__pos_1".to_string(), Some("Adt".to_string())),
+        ],
+        "tuple construction must emit a __pos_0 / __pos_1 FieldWrite chain"
+    );
+
+    // Exactly the two genuine tuple reads become FieldReads. The three
+    // `*Checked` `.0` reads collapse, so a count of 2 (not 5) proves the
+    // boundary holds.
+    field_reads.sort();
+    assert_eq!(
+        field_reads,
+        vec![
+            ("__pos_0".to_string(), Some("Adt".to_string())),
+            ("__pos_1".to_string(), Some("Adt".to_string())),
+        ],
+        "tuple reads must emit __pos_0 / __pos_1 FieldReads (owner_root \
+         matching the FieldWrite chain) and *Checked .0 reads must collapse"
+    );
+
+    // Symmetry: every FieldRead pairs with an identically-keyed
+    // FieldWrite (same name AND owner_root), so the read resolves the
+    // value the construction stored.
+    assert_eq!(
+        field_reads, field_writes,
+        "FieldRead keys must match the FieldWrite chain exactly"
+    );
+}
+
+#[test]
 fn unknown_function_name_errors() {
     let llbc = load_corpus();
     let err = lower_function(&llbc, "no_such_function_anywhere").unwrap_err();
@@ -273,7 +353,10 @@ fn front_graph_carries_no_synthesized_exception_edges() {
             .body
             .iter()
             .filter(|blk| {
-                matches!(blk.term(), Ok(TermKind::UnwindResume) | Ok(TermKind::Abort(_)))
+                matches!(
+                    blk.term(),
+                    Ok(TermKind::UnwindResume) | Ok(TermKind::Abort(_))
+                )
             })
             .count();
         let edges_into_exceptblock = graph

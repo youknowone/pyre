@@ -135,9 +135,7 @@ fn place_base_local(kind: &PlaceKind) -> Option<u64> {
 /// is traversed). Returns `(rpo_index, back_edges)` where
 /// `rpo_index[b]` is `b`'s position in reverse-postorder (lower = earlier)
 /// or `usize::MAX` if `b` is unreachable from block 0.
-fn rpo_and_back_edges(
-    blocks: &[BasicBlock],
-) -> (Vec<usize>, BTreeSet<(usize, usize)>) {
+fn rpo_and_back_edges(blocks: &[BasicBlock]) -> (Vec<usize>, BTreeSet<(usize, usize)>) {
     let n = blocks.len();
     // Iterative DFS that records postorder and back-edges. `state`:
     // 0 = white (unvisited), 1 = grey (on stack), 2 = black (done).
@@ -583,7 +581,10 @@ fn mir_on_unwind_target_taxonomy() {
 
     eprintln!("\n=== on_unwind target taxonomy (whole interpreter) ===");
     eprintln!("path: {}", path.display());
-    eprintln!("total Call/Assert/Drop terminators inspected: {}", tally.total_call_terms);
+    eprintln!(
+        "total Call/Assert/Drop terminators inspected: {}",
+        tally.total_call_terms
+    );
     eprintln!("\nby terminator kind:");
     for (k, n) in &tally.by_term_kind {
         eprintln!("  {n:>8}  {k}");
@@ -599,7 +600,10 @@ fn mir_on_unwind_target_taxonomy() {
         eprintln!("  len={len:>2}  {n:>8}");
     }
     eprintln!("\nany_handler_does_real_work: {}", tally.real_work > 0);
-    eprintln!("  chains doing real (non-trivial) work: {}", tally.real_work);
+    eprintln!(
+        "  chains doing real (non-trivial) work: {}",
+        tally.real_work
+    );
     eprintln!(
         "    of which carry a Drop (destructor) in the chain: {}",
         tally.real_work_drop_in_chain

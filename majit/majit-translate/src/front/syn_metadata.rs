@@ -97,7 +97,6 @@ pub fn nolength_from_array_type_id(array_type_id: Option<&str>) -> bool {
     s.trim() != inner
 }
 
-
 // ─────────────────────────────────────────────────────────────────────
 // Type-string rendering helpers.
 //

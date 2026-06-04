@@ -359,8 +359,9 @@ pub fn build_semantic_program_from_llbc(
     // build with the offending list. This is the fail-loud successor to
     // the since-removed `lib.rs` coverage audit.
     if !skipped.is_empty() {
-        let (tracked, regressions): (Vec<_>, Vec<_>) =
-            skipped.iter().partition(|(_, msg)| is_known_lowering_gap(msg));
+        let (tracked, regressions): (Vec<_>, Vec<_>) = skipped
+            .iter()
+            .partition(|(_, msg)| is_known_lowering_gap(msg));
         if std::env::var("PYRE_MIR_FRONTEND_DEBUG").is_ok() && !tracked.is_empty() {
             eprintln!(
                 "[mir-frontend] {} function(s) skipped via the tracked \
@@ -574,6 +575,24 @@ struct Lowering<'a> {
     local_var: Vec<Option<Variable>>,
     /// `block_id[i]` = FunctionGraph BlockId for MIR basic block `i`.
     block_id: Vec<BlockId>,
+    /// Maps each MIR local whose current binding was produced by a
+    /// positional [`Rvalue::Aggregate`] (tuple / array / closure — any
+    /// kind for which [`Lowering::resolve_aggregate_adt`] returns
+    /// `None`) to the `owner_root` its construction-side `FieldWrite`
+    /// chain used.  Such a local holds a synthetic transparent-ctor
+    /// base with a `__pos_<i>` `FieldWrite` chain, so its `.N` reads
+    /// must resolve to a symmetric `FieldRead __pos_<N>` in
+    /// [`Lowering::resolve_place`] — carrying the *same* `owner_root` —
+    /// rather than collapsing to the base Variable.  The stored owner
+    /// is required because Charon's tuple `Aggregate` kind serialises
+    /// as `{"Adt": [{"id": "Tuple", ..}, ..]}` (owner_root `"Adt"`)
+    /// while the matching `Field` projection container serialises as
+    /// `{"Tuple": N}`, so the read side cannot re-derive the
+    /// construction owner from its own payload.  Excludes the
+    /// `*Checked` `(value, bool)`-as-`BinOp` locals (those are bound by
+    /// [`Rvalue::BinaryOp`], never an Aggregate), so their `.0` reads
+    /// still fall through.
+    positional_aggregate_locals: std::collections::HashMap<usize, String>,
 }
 
 impl<'a> Lowering<'a> {
@@ -651,6 +670,7 @@ impl<'a> Lowering<'a> {
             body,
             local_var,
             block_id,
+            positional_aggregate_locals: std::collections::HashMap::new(),
         })
     }
 
@@ -825,12 +845,29 @@ impl<'a> Lowering<'a> {
     ) -> Result<(), LowerError> {
         match dest.kind {
             PlaceKind::Local(i) => {
+                // Capture the construction `owner_root` if this binding
+                // is a positional aggregate, before `build_rvalue`
+                // consumes the rvalue, so `.N` reads of the local can
+                // later emit a symmetric `FieldRead __pos_<N>` carrying
+                // the same owner (see `resolve_place`).
+                let positional_owner = self.positional_aggregate_owner(&rvalue);
                 let (op, result_var) = self.build_rvalue(mir_bb, rvalue)?;
                 // The destination local takes on the freshly-minted
                 // result Variable. Subsequent reads of the local
                 // resolve to this Variable until the next Assign
                 // overwrites the slot.
                 self.local_var[i as usize] = Some(result_var.clone());
+                // Keep the aggregate-local map in sync with the
+                // last-write-wins slot: a non-aggregate rebind clears
+                // the marker so the slot's reads collapse again.
+                match positional_owner {
+                    Some(owner) => {
+                        self.positional_aggregate_locals.insert(i as usize, owner);
+                    }
+                    None => {
+                        self.positional_aggregate_locals.remove(&(i as usize));
+                    }
+                }
                 if let Some(op) = op {
                     let bb_id = self.block_id[mir_bb];
                     self.graph.block_mut(bb_id).operations.push(SpaceOperation {
@@ -1328,11 +1365,17 @@ impl<'a> Lowering<'a> {
                 // lower_field`) see the same field/owner_root shape
                 // the AST front-end emits at `front/ast.rs:4923`.
                 //
-                // Tuple-container `Field` projections still collapse
-                // (the `straight_line_add` / AddChecked `(value,
-                // bool)` shape needs `.0` reads to fall through to
-                // the underlying Variable; the paired `.1` Assert is
-                // dropped in `lower_statement`).
+                // Tuple-container `Field` projections split two ways.
+                // A local bound by a positional `Rvalue::Aggregate`
+                // (`positional_aggregate_locals`) carries a synthetic
+                // ctor base with a `__pos_<N>` `FieldWrite` chain, so
+                // its `.N` reads emit a symmetric `FieldRead
+                // __pos_<N>`.  Every other Tuple-container read still
+                // collapses to the base Variable: the `straight_line_add`
+                // / AddChecked `(value, bool)` shape lowers to a scalar
+                // `BinOp` (not an Aggregate), so its `.0` must fall
+                // through to the underlying Variable and the paired
+                // `.1` Assert is dropped in `lower_statement`.
                 //
                 // Atom projections (`Deref` and others) still
                 // collapse: `Deref` is a no-op for typed refs at the
@@ -1355,6 +1398,39 @@ impl<'a> Lowering<'a> {
                             base,
                             field: FieldDescriptor::new(field_name, Some(owner_root)),
                             ty,
+                            pure: false,
+                        },
+                    });
+                    return Ok(res);
+                }
+                // Positional aggregate `.N` read: the base local was
+                // bound by a non-Adt `Rvalue::Aggregate`, so emit the
+                // `FieldRead __pos_<N>` that pairs with the
+                // construction-side `FieldWrite __pos_<N>` instead of
+                // aliasing the base.
+                if let ProjectionElem::Tagged(v) = &elem
+                    && let PlaceKind::Local(i) = inner.kind
+                    && let Some(owner_root) =
+                        self.positional_aggregate_locals.get(&(i as usize)).cloned()
+                    && let Some(field_payload) = v.as_object().and_then(|m| m.get("Field"))
+                    && let Some(idx) = self.positional_field_index(field_payload)
+                {
+                    let base = self.local_var[i as usize].clone().ok_or_else(|| {
+                        LowerError::Unsupported(format!(
+                            "bb{mir_bb}: read of MIR local {i} before any Assign — \
+                             uninitialised local, not yet supported"
+                        ))
+                    })?;
+                    let bb_id = self.block_id[mir_bb];
+                    let res = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(res.clone()),
+                        kind: OpKind::FieldRead {
+                            base,
+                            field: FieldDescriptor::new(format!("__pos_{idx}"), Some(owner_root)),
+                            ty: ValueType::Ref(None),
                             pure: false,
                         },
                     });
@@ -1425,6 +1501,45 @@ impl<'a> Lowering<'a> {
     /// Returns `None` when the kind is not Adt or the LLBC has no
     /// `TypeDecl` for `type_id`; the caller then falls back to the
     /// generic-tag ctor name with positional `__pos_<i>` fields.
+    /// The construction-side `owner_root` when `rvalue` is an
+    /// [`Rvalue::Aggregate`] that the lowering models as a synthetic
+    /// transparent-ctor + positional `__pos_<i>` `FieldWrite` chain —
+    /// i.e. a non-Adt aggregate (tuple / array / closure) for which
+    /// [`Self::resolve_aggregate_adt`] returns `None`.  The owner is
+    /// exactly what the [`Rvalue::Aggregate`] arm uses as
+    /// `result_ty_owner` (`aggregate_ctor_name`, since `owner_path` is
+    /// empty for the unresolved branch), so storing it lets `.N` reads
+    /// emit a `FieldRead __pos_<N>` with the matching `owner_root`.
+    /// Returns `None` for Adt aggregates: their `.field` reads already
+    /// take the typed [`Self::resolve_adt_field`] path and never reach
+    /// the collapse fallback.
+    fn positional_aggregate_owner(&self, rvalue: &Rvalue) -> Option<String> {
+        match rvalue {
+            Rvalue::Aggregate(kind, _) if self.resolve_aggregate_adt(kind).is_none() => {
+                Some(aggregate_ctor_name(kind))
+            }
+            _ => None,
+        }
+    }
+
+    /// Decode a non-Adt `Field` projection payload — Charon encodes it
+    /// as `[{"Tuple"|"Array"|"Closure": ..}, idx]` — to its field
+    /// index.  Returns `None` for Adt containers (handled by
+    /// [`Self::resolve_adt_field`]) and malformed payloads, so the
+    /// caller only emits a positional `FieldRead` for genuine
+    /// tuple/array/closure reads.
+    fn positional_field_index(&self, payload: &serde_json::Value) -> Option<usize> {
+        let arr = payload.as_array()?;
+        if arr.len() != 2 {
+            return None;
+        }
+        let label = arr[0].as_object()?.keys().next()?;
+        if label == "Adt" {
+            return None;
+        }
+        Some(arr[1].as_u64()? as usize)
+    }
+
     fn resolve_aggregate_adt(
         &self,
         kind: &serde_json::Value,
