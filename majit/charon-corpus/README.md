@@ -1,4 +1,4 @@
-# Charon Fixtures
+# Charon Corpus
 
 Regression fixtures for the Charon ULLBC reader and MIR frontend work from
 [issue #97](https://github.com/youknowone/pyre/issues/97).
@@ -9,12 +9,11 @@ frontend changes can be tested without re-extracting the full pyre crates.
 ## Layout
 
 ```
-charon-fixtures/
+charon-corpus/
 ├── README.md              # this file
-├── corpus/                # hand-written micro-crate (4 representative shapes)
-│   ├── Cargo.toml
-│   └── src/lib.rs
-├── corpus.ullbc           # extracted ULLBC for the corpus crate (checked in)
+├── Cargo.toml             # the micro-crate (representative shapes)
+├── src/lib.rs
+├── corpus.ullbc           # extracted ULLBC for the crate (checked in)
 └── inspect_llbc.py        # JSON dumper used to produce the findings below
 ```
 
@@ -47,12 +46,10 @@ nightly; it only needs the `.llbc` JSON.
 # 0. install Charon (once)
 ../../scripts/install-charon.sh
 
-# 1. extract corpus
-cd corpus
-../../../build/charon/charon cargo --ullbc --dest-file ../corpus.ullbc
+# 1. extract corpus (run from this directory)
+../../build/charon/charon cargo --ullbc --dest-file corpus.ullbc
 
 # 2. inspect
-cd ..
 python3 inspect_llbc.py corpus.ullbc                  # summary
 python3 inspect_llbc.py corpus.ullbc desugar_mix      # detailed BB dump
 
@@ -63,7 +60,7 @@ cargo test -p majit-translate --test test_mir_frontend
 
 ## Corpus
 
-Four functions from `corpus/src/lib.rs`, chosen to cover the shapes called
+Four functions from `src/lib.rs`, chosen to cover the shapes called
 out in issue #97 Step 0:
 
 | Function            | Shape                                       | ULLBC BBs |
@@ -319,4 +316,4 @@ These are intentionally **not** answered in Step 0:
 | Inspect `.llbc` for locals/places/constants/calls/trait resolution/terminators/discriminants/spans/unwind | done — see §2–§4 |
 | Minimal MIR → `FunctionGraph` prototype for 1–2 functions                  | done — retired after production MIR frontend landed |
 | Comparison against AST front-end after canonical normalization             | superseded by `majit-translate::front::mir` regression tests |
-| Checked-in notes / fixtures                                                | this README + `corpus/` + `corpus.ullbc` + `inspect_llbc.py` |
+| Checked-in notes / fixtures                                                | this README + `src/lib.rs` + `corpus.ullbc` + `inspect_llbc.py` |

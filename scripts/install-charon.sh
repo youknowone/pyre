@@ -24,8 +24,8 @@
 # Update procedure (when bumping the pin):
 #   1. Edit CHARON_VERSION_DEFAULT below to the new tag.
 #   2. Re-run this script with CHARON_DEST=./build/charon (delete old first).
-#   3. Re-extract corpus: cd majit/charon-fixtures/corpus && \
-#        ../../../build/charon/charon cargo --ullbc --dest-file ../corpus.ullbc
+#   3. Re-extract corpus: cd majit/charon-corpus && \
+#        ../../build/charon/charon cargo --ullbc --dest-file corpus.ullbc
 #   4. Run the reader/frontend regression tests that consume corpus.ullbc.
 #   5. If the diff is benign (schema-format only), update the corpus notes;
 #      otherwise debug the reader or MIR frontend.

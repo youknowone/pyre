@@ -8,23 +8,16 @@ use majit_charon_reader::{
     ullbc::{CallClass, StmtKind, TermKind},
 };
 
-const CORPUS: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../charon-fixtures/corpus.ullbc",
-);
+const CORPUS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../charon-corpus/corpus.ullbc",);
 
 #[test]
 fn loads_fixture_corpus() {
     let llbc = Llbc::load(CORPUS).expect("load corpus.ullbc");
-    assert_eq!(llbc.crate_name(), "charon_fixtures_corpus");
+    assert_eq!(llbc.crate_name(), "charon_corpus");
     assert!(!llbc.file.has_errors);
     let local_count = llbc
         .iter_local_fns()
-        .filter(|f| {
-            f.item_meta
-                .name_path()
-                .starts_with("charon_fixtures_corpus::")
-        })
+        .filter(|f| f.item_meta.name_path().starts_with("charon_corpus::"))
         .count();
     assert_eq!(local_count, 6, "6 local fns expected");
 }

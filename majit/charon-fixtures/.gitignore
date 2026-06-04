@@ -1,6 +1,0 @@
-corpus/target/
-corpus/Cargo.lock
-# Charon-output artifacts that may land in the corpus dir if extraction
-# is run with default flags or without --dest-file pointing elsewhere.
-corpus/*.ullbc
-corpus/*.llbc

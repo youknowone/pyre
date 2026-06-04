@@ -1,16 +1,13 @@
 //! End-to-end smoke tests for the MIR-driven flowspace driver
 //! (issue #97 Step 3).
 //!
-//! The corpus snapshot at `majit/charon-fixtures/corpus.ullbc` is the
+//! The corpus snapshot at `majit/charon-corpus/corpus.ullbc` is the
 //! input and the regression fixture for the production MIR frontend.
 
 use majit_charon_reader::Llbc;
 use majit_translate::front::mir::{LowerError, build_semantic_program_from_llbc, lower_function};
 
-const CORPUS: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../charon-fixtures/corpus.ullbc",
-);
+const CORPUS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../charon-corpus/corpus.ullbc",);
 
 fn load_corpus() -> Llbc {
     Llbc::load(CORPUS).expect("load corpus.ullbc")
@@ -24,7 +21,7 @@ fn lowers_straight_line_add() {
     // because it identifies the LLBC source — only the
     // SemanticFunction.name has the AST-convention crate-prefix
     // stripping applied at SemanticProgram build time.
-    assert_eq!(graph.name, "charon_fixtures_corpus::straight_line_add");
+    assert_eq!(graph.name, "charon_corpus::straight_line_add");
 
     let startblock = graph.block(graph.startblock);
     assert_eq!(
@@ -70,7 +67,7 @@ fn lowers_branch_loop_sum_with_calls_and_discriminant() {
     // smoke test.
     let llbc = load_corpus();
     let graph = lower_function(&llbc, "branch_loop_sum").expect("lowering");
-    assert_eq!(graph.name, "charon_fixtures_corpus::branch_loop_sum");
+    assert_eq!(graph.name, "charon_corpus::branch_loop_sum");
 
     use majit_translate::model::OpKind;
     let mut call_count = 0usize;
@@ -101,7 +98,7 @@ fn lowers_branch_loop_sum_with_calls_and_discriminant() {
 fn lowers_strategy_len_with_discriminant_switch() {
     let llbc = load_corpus();
     let graph = lower_function(&llbc, "strategy_len").expect("lowering");
-    assert_eq!(graph.name, "charon_fixtures_corpus::strategy_len");
+    assert_eq!(graph.name, "charon_corpus::strategy_len");
     // bb0 Discriminant + Switch, bb1/bb2/bb3 arm bodies + Return,
     // bb4 Abort → 5 MIR bbs + returnblock + exceptblock = 7.
     assert_eq!(graph.blocks.len(), 7);
@@ -116,7 +113,7 @@ fn lowers_desugar_mix_with_aggregate_and_question_mark() {
     // milestone for the corpus.
     let llbc = load_corpus();
     let graph = lower_function(&llbc, "desugar_mix").expect("lowering");
-    assert_eq!(graph.name, "charon_fixtures_corpus::desugar_mix");
+    assert_eq!(graph.name, "charon_corpus::desugar_mix");
 
     use majit_translate::model::{CallTarget, OpKind};
     let mut ctor_count = 0usize;
@@ -158,7 +155,7 @@ fn lowers_tuple_roundtrip_with_symmetric_positional_field_reads() {
 
     let llbc = load_corpus();
     let graph = lower_function(&llbc, "tuple_roundtrip").expect("lowering");
-    assert_eq!(graph.name, "charon_fixtures_corpus::tuple_roundtrip");
+    assert_eq!(graph.name, "charon_corpus::tuple_roundtrip");
 
     let mut field_reads: Vec<(String, Option<String>)> = Vec::new();
     let mut field_writes: Vec<(String, Option<String>)> = Vec::new();
@@ -262,7 +259,7 @@ fn semantic_program_builder_lowers_every_corpus_function() {
     assert!(
         program
             .known_struct_names
-            .contains("charon_fixtures_corpus::Strategy::IntKeyed")
+            .contains("charon_corpus::Strategy::IntKeyed")
     );
     assert!(program.known_struct_names.contains("Token"));
 }
@@ -288,7 +285,7 @@ fn enum_variant_by_discriminant_round_trips_against_variant_paths() {
     // Discriminant 0 .. N-1 are distinct (HashMap keys) and every value
     // names a real Strategy variant.
     for name in by_leaf.values() {
-        let path = format!("charon_fixtures_corpus::Strategy::{name}");
+        let path = format!("charon_corpus::Strategy::{name}");
         assert!(
             program.known_struct_names.contains(&path),
             "discriminant map produced {name:?} with no matching variant path {path:?}"
@@ -303,7 +300,7 @@ fn enum_variant_by_discriminant_round_trips_against_variant_paths() {
     // Qualified-path key mirrors the bare-leaf key.
     let by_qualified = program
         .enum_variant_by_discriminant
-        .get("charon_fixtures_corpus::Strategy")
+        .get("charon_corpus::Strategy")
         .expect("Strategy discriminant map present under qualified path");
     assert_eq!(by_leaf, by_qualified, "leaf and qualified maps must match");
 }

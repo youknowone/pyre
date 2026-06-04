@@ -25,7 +25,7 @@
 //!
 //! ## Step 6 cutover status (2026-05-25)
 //!
-//! - **Step 6.A** — `majit/charon-fixtures` retained as the corpus
+//! - **Step 6.A** — `majit/charon-corpus` retained as the corpus
 //!   + reader integration in
 //!   `majit-charon-reader::tests::corpus` and
 //!   `majit-translate::tests::test_mir_frontend` are now the

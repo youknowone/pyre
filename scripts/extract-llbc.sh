@@ -52,7 +52,7 @@ mkdir -p "$LLBC_DEST"
 crate_info() {
     case "$1" in
         corpus)
-            echo "$repo_root/majit/charon-fixtures/corpus|"
+            echo "$repo_root/majit/charon-corpus|"
             ;;
         pyre-object)
             echo "$repo_root/pyre/pyre-object|"

@@ -55,7 +55,7 @@ whenever a new construct appears.
 ## Validation against real crates
 
 The reader is validated against the corpus snapshot (checked in at
-`majit/charon-fixtures/corpus.ullbc`) via `tests/corpus.rs`, and against
+`majit/charon-corpus/corpus.ullbc`) via `tests/corpus.rs`, and against
 the full extracted `pyre-object.ullbc` (23 MB) / `pyre-interpreter.ullbc`
 (133 MB) snapshots not committed to git (regenerable via
 `scripts/extract-llbc.sh`). At the time of the Step 2 landing every
@@ -76,4 +76,4 @@ The pyre-interpreter `Call` terminators classify as:
 ```
 
 The 36 `dynamic` count matches the Step 1 audit exactly
-(`majit/charon-fixtures/step1-compatibility.md`).
+(`majit/charon-corpus/step1-compatibility.md`).

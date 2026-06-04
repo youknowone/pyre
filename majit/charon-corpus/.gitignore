@@ -1,0 +1,6 @@
+/target/
+/Cargo.lock
+# Stray Charon extraction outputs (default-named); the checked-in fixture
+# is corpus.ullbc, regenerated via `--dest-file corpus.ullbc`.
+/charon_corpus.ullbc
+*.llbc
