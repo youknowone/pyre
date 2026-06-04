@@ -788,10 +788,7 @@ impl OptPure {
         // paired `get_box_replacement` + `get_box_replacement_box` of the
         // same `opref` was a redundant double walk.
         let resolved_box = ctx.get_box_replacement_box(opref);
-        let resolved = resolved_box
-            .as_ref()
-            .map(|b| b.to_opref())
-            .unwrap_or(opref);
+        let resolved = resolved_box.as_ref().map(|b| b.to_opref()).unwrap_or(opref);
         if resolved_box.as_ref().map_or(false, |b| ctx.is_virtual(b)) {
             let resolved_box = resolved_box.expect("recorder-populated");
             let mut info = ctx.take_ptr_info(&resolved_box).unwrap();

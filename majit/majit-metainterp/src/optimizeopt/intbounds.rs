@@ -27,6 +27,36 @@ fn autogen_eq(box1: OpRef, bound1: &IntBound, box2: OpRef, bound2: &IntBound) ->
     false
 }
 
+/// `BoxRef`-terminal variant of [`autogen_eq`]: identity via `same_box`
+/// (resoperation.py:38 `self is other`, with `Const.same_box` value
+/// comparison) instead of the OpRef-flat `==`, plus the same
+/// constant-bound equality fallback. Used by the `optimize_INT_*` bodies
+/// that resolve operands to their `_forwarded` terminal via `resolve_box`.
+///
+/// The `to_opref()` equality mirrors `OptContext::same_box`'s fallback for
+/// operands whose canonical box store is absent (test fixtures with dangling
+/// position refs): two fresh `ensure_box` materializations of the same
+/// position are not `Rc::ptr_eq` but denote the same operand. In production
+/// both operands resolve to one shared canonical box, so `same_box` already
+/// short-circuits.
+fn autogen_eq_b(
+    box1: &crate::r#box::BoxRef,
+    bound1: &IntBound,
+    box2: &crate::r#box::BoxRef,
+    bound2: &IntBound,
+) -> bool {
+    if box1.same_box(box2) || box1.to_opref() == box2.to_opref() {
+        return true;
+    }
+    if bound1.is_constant()
+        && bound2.is_constant()
+        && bound1.get_constant_int() == bound2.get_constant_int()
+    {
+        return true;
+    }
+    false
+}
+
 /// autogenintrules.py:54-55 rewrite helper:
 /// `newop = self.replace_op_with(op, opcode, args=[...]);
 ///  self.optimizer.send_extra_operation(newop); return`.
@@ -83,6 +113,13 @@ impl OptIntBounds {
                 .map(|b| ctx.getintbound_handle(&b).borrow().clone())
                 .expect("getintbound: operand must resolve to a BoxRef"),
         }
+    }
+
+    /// `BoxRef`-terminal variant of [`getintbound_box`]: reads the bound off
+    /// an operand already resolved to its `_forwarded` terminal (the box
+    /// `resolve_box` returns), so no second `get_box_replacement` walk.
+    fn getintbound_b(&self, b: &crate::r#box::BoxRef, ctx: &mut OptContext) -> IntBound {
+        ctx.getintbound_handle(b).borrow().clone()
     }
 
     /// Resolve an operand to its forwarded terminal `BoxRef`, the `op =
@@ -220,55 +257,55 @@ impl OptIntBounds {
     /// autogenintrules.py:1220-1320 optimize_INT_EQ — rules:
     /// eq_different_knownbits / eq_same / eq_one / eq_zero / eq_sub_eq.
     fn optimize_int_eq(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        let arg0 = ctx.get_box_replacement(op.arg(0).to_opref());
-        let arg1 = ctx.get_box_replacement(op.arg(1).to_opref());
-        let b0 = self.getintbound_box(arg0, ctx);
-        let b1 = self.getintbound_box(arg1, ctx);
+        let arg0 = self.resolve_box(op.arg(0).to_opref(), ctx);
+        let arg1 = self.resolve_box(op.arg(1).to_opref(), ctx);
+        let b0 = self.getintbound_b(&arg0, ctx);
+        let b1 = self.getintbound_b(&arg1, ctx);
         // eq_sub_eq: int_eq(int_sub(x, int_eq(x, a)), a) => 0 (4 forms)
-        if let Some(arg0_sub) = self.as_operation(arg0, OpCode::IntSub, ctx) {
-            let arg0_0 = ctx.get_box_replacement(arg0_sub.arg(0).to_opref());
-            let arg0_1 = ctx.get_box_replacement(arg0_sub.arg(1).to_opref());
-            let b_arg0_0 = self.getintbound_box(arg0_0, ctx);
-            if let Some(inner_eq) = self.as_operation(arg0_1, OpCode::IntEq, ctx) {
-                let inner_0 = ctx.get_box_replacement(inner_eq.arg(0).to_opref());
-                let inner_1 = ctx.get_box_replacement(inner_eq.arg(1).to_opref());
-                let b_inner_0 = self.getintbound_box(inner_0, ctx);
-                let b_inner_1 = self.getintbound_box(inner_1, ctx);
+        if let Some(arg0_sub) = self.as_operation_b(&arg0, OpCode::IntSub, ctx) {
+            let arg0_0 = self.resolve_box(arg0_sub.arg(0).to_opref(), ctx);
+            let arg0_1 = self.resolve_box(arg0_sub.arg(1).to_opref(), ctx);
+            let b_arg0_0 = self.getintbound_b(&arg0_0, ctx);
+            if let Some(inner_eq) = self.as_operation_b(&arg0_1, OpCode::IntEq, ctx) {
+                let inner_0 = self.resolve_box(inner_eq.arg(0).to_opref(), ctx);
+                let inner_1 = self.resolve_box(inner_eq.arg(1).to_opref(), ctx);
+                let b_inner_0 = self.getintbound_b(&inner_0, ctx);
+                let b_inner_1 = self.getintbound_b(&inner_1, ctx);
                 // eq_sub_eq: int_eq(int_sub(x, int_eq(x, a)), a) => 0
-                if autogen_eq(inner_0, &b_inner_0, arg0_0, &b_arg0_0)
-                    && autogen_eq(arg1, &b1, inner_1, &b_inner_1)
+                if autogen_eq_b(&inner_0, &b_inner_0, &arg0_0, &b_arg0_0)
+                    && autogen_eq_b(&arg1, &b1, &inner_1, &b_inner_1)
                 {
                     self.make_constant_int(op, 0, ctx);
                     return OptimizationResult::Remove;
                 }
                 // eq_sub_eq: int_eq(int_sub(x, int_eq(a, x)), a) => 0
-                if autogen_eq(inner_1, &b_inner_1, arg0_0, &b_arg0_0)
-                    && autogen_eq(arg1, &b1, inner_0, &b_inner_0)
+                if autogen_eq_b(&inner_1, &b_inner_1, &arg0_0, &b_arg0_0)
+                    && autogen_eq_b(&arg1, &b1, &inner_0, &b_inner_0)
                 {
                     self.make_constant_int(op, 0, ctx);
                     return OptimizationResult::Remove;
                 }
             }
         }
-        if let Some(arg1_sub) = self.as_operation(arg1, OpCode::IntSub, ctx) {
-            let arg1_0 = ctx.get_box_replacement(arg1_sub.arg(0).to_opref());
-            let arg1_1 = ctx.get_box_replacement(arg1_sub.arg(1).to_opref());
-            let b_arg1_0 = self.getintbound_box(arg1_0, ctx);
-            if let Some(inner_eq) = self.as_operation(arg1_1, OpCode::IntEq, ctx) {
-                let inner_0 = ctx.get_box_replacement(inner_eq.arg(0).to_opref());
-                let inner_1 = ctx.get_box_replacement(inner_eq.arg(1).to_opref());
-                let b_inner_0 = self.getintbound_box(inner_0, ctx);
-                let b_inner_1 = self.getintbound_box(inner_1, ctx);
+        if let Some(arg1_sub) = self.as_operation_b(&arg1, OpCode::IntSub, ctx) {
+            let arg1_0 = self.resolve_box(arg1_sub.arg(0).to_opref(), ctx);
+            let arg1_1 = self.resolve_box(arg1_sub.arg(1).to_opref(), ctx);
+            let b_arg1_0 = self.getintbound_b(&arg1_0, ctx);
+            if let Some(inner_eq) = self.as_operation_b(&arg1_1, OpCode::IntEq, ctx) {
+                let inner_0 = self.resolve_box(inner_eq.arg(0).to_opref(), ctx);
+                let inner_1 = self.resolve_box(inner_eq.arg(1).to_opref(), ctx);
+                let b_inner_0 = self.getintbound_b(&inner_0, ctx);
+                let b_inner_1 = self.getintbound_b(&inner_1, ctx);
                 // eq_sub_eq: int_eq(a, int_sub(x, int_eq(x, a))) => 0
-                if autogen_eq(inner_0, &b_inner_0, arg1_0, &b_arg1_0)
-                    && autogen_eq(inner_1, &b_inner_1, arg0, &b0)
+                if autogen_eq_b(&inner_0, &b_inner_0, &arg1_0, &b_arg1_0)
+                    && autogen_eq_b(&inner_1, &b_inner_1, &arg0, &b0)
                 {
                     self.make_constant_int(op, 0, ctx);
                     return OptimizationResult::Remove;
                 }
                 // eq_sub_eq: int_eq(a, int_sub(x, int_eq(a, x))) => 0
-                if autogen_eq(inner_0, &b_inner_0, arg0, &b0)
-                    && autogen_eq(inner_1, &b_inner_1, arg1_0, &b_arg1_0)
+                if autogen_eq_b(&inner_0, &b_inner_0, &arg0, &b0)
+                    && autogen_eq_b(&inner_1, &b_inner_1, &arg1_0, &b_arg1_0)
                 {
                     self.make_constant_int(op, 0, ctx);
                     return OptimizationResult::Remove;
@@ -276,7 +313,7 @@ impl OptIntBounds {
             }
         }
         // eq_same: int_eq(x, x) => 1
-        if autogen_eq(arg1, &b1, arg0, &b0) {
+        if autogen_eq_b(&arg1, &b1, &arg0, &b0) {
             self.make_constant_int(op, 1, ctx);
             return OptimizationResult::Remove;
         }
@@ -295,10 +332,7 @@ impl OptIntBounds {
             let b_old = ctx
                 .ensure_box(op.pos.get())
                 .expect("body-namespace OpRef must have a BoxRef slot");
-            let b_arg = ctx
-                .ensure_box(arg1)
-                .expect("body-namespace OpRef must have a BoxRef slot");
-            ctx.make_equal_to(&b_old, &b_arg);
+            ctx.make_equal_to(&b_old, &arg1);
             return OptimizationResult::Remove;
         }
         // eq_one: int_eq(x, 1) => x  (when x is bool)
@@ -306,19 +340,16 @@ impl OptIntBounds {
             let b_old = ctx
                 .ensure_box(op.pos.get())
                 .expect("body-namespace OpRef must have a BoxRef slot");
-            let b_arg = ctx
-                .ensure_box(arg0)
-                .expect("body-namespace OpRef must have a BoxRef slot");
-            ctx.make_equal_to(&b_old, &b_arg);
+            ctx.make_equal_to(&b_old, &arg0);
             return OptimizationResult::Remove;
         }
         // eq_zero: int_eq(0, x) => int_is_zero(x)
         if b0.is_constant() && b0.get_constant_int() == 0 {
-            return replace_with(op, OpCode::IntIsZero, &[arg1]);
+            return replace_with(op, OpCode::IntIsZero, &[arg1.to_opref()]);
         }
         // eq_zero: int_eq(x, 0) => int_is_zero(x)
         if b1.is_constant() && b1.get_constant_int() == 0 {
-            return replace_with(op, OpCode::IntIsZero, &[arg0]);
+            return replace_with(op, OpCode::IntIsZero, &[arg0.to_opref()]);
         }
         OptimizationResult::PassOn
     }
@@ -326,12 +357,12 @@ impl OptIntBounds {
     /// autogenintrules.py:1324-1360 optimize_INT_NE — rules:
     /// ne_different_knownbits / ne_same / ne_zero.
     fn optimize_int_ne(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        let arg0 = ctx.get_box_replacement(op.arg(0).to_opref());
-        let arg1 = ctx.get_box_replacement(op.arg(1).to_opref());
-        let b0 = self.getintbound_box(arg0, ctx);
-        let b1 = self.getintbound_box(arg1, ctx);
+        let arg0 = self.resolve_box(op.arg(0).to_opref(), ctx);
+        let arg1 = self.resolve_box(op.arg(1).to_opref(), ctx);
+        let b0 = self.getintbound_b(&arg0, ctx);
+        let b1 = self.getintbound_b(&arg1, ctx);
         // ne_same: int_ne(x, x) => 0
-        if autogen_eq(arg1, &b1, arg0, &b0) {
+        if autogen_eq_b(&arg1, &b1, &arg0, &b0) {
             self.make_constant_int(op, 0, ctx);
             return OptimizationResult::Remove;
         }
@@ -347,11 +378,11 @@ impl OptIntBounds {
         }
         // ne_zero: int_ne(0, x) => int_is_true(x)
         if b0.is_constant() && b0.get_constant_int() == 0 {
-            return replace_with(op, OpCode::IntIsTrue, &[arg1]);
+            return replace_with(op, OpCode::IntIsTrue, &[arg1.to_opref()]);
         }
         // ne_zero: int_ne(x, 0) => int_is_true(x)
         if b1.is_constant() && b1.get_constant_int() == 0 {
-            return replace_with(op, OpCode::IntIsTrue, &[arg0]);
+            return replace_with(op, OpCode::IntIsTrue, &[arg0.to_opref()]);
         }
         OptimizationResult::PassOn
     }
@@ -1737,6 +1768,18 @@ impl OptIntBounds {
         let op = ctx
             .ensure_box(opref)
             .and_then(|pb| ctx.get_producing_op(&pb))?;
+        if op.opcode == opcode { Some(op) } else { None }
+    }
+
+    /// `BoxRef`-terminal variant of [`as_operation`]: the producing op of an
+    /// operand already resolved to its terminal box (`resolve_box`).
+    fn as_operation_b(
+        &self,
+        b: &crate::r#box::BoxRef,
+        opcode: OpCode,
+        ctx: &mut OptContext,
+    ) -> Option<Op> {
+        let op = ctx.get_producing_op(b)?;
         if op.opcode == opcode { Some(op) } else { None }
     }
 
