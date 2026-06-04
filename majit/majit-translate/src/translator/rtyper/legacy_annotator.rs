@@ -356,7 +356,14 @@ fn infer_op_type(kind: &OpKind) -> ValueType {
         // Python `bool`.  RPython annotates them as `SomeBool`, not
         // `SomeInteger`.
         OpKind::IsConstant { .. } | OpKind::IsVirtual { .. } => ValueType::Bool,
-        OpKind::IsInstance { result_ty, .. } => result_ty.clone(),
+        // `isinstance(x, T)` is semantically a `bool`; the carried
+        // `result_ty` is only a constructor hint and may be left as
+        // `Unknown` by frontends that did not set it explicitly.
+        // Returning `Unknown` here widens phi merges and degrades
+        // downstream typing; enforce `Bool` directly so the inferred
+        // type matches `rclass.py InstanceRepr.rtype_isinstance`'s
+        // `LowLevelType::Bool` result.
+        OpKind::IsInstance { .. } => ValueType::Bool,
         // RPython: vtable entry is a `Ptr(FuncType)` address.
         OpKind::VtableMethodPtr { .. } => ValueType::Int,
         OpKind::IndirectCall { result_ty, .. } => result_ty.clone(),

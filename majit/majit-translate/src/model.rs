@@ -377,8 +377,21 @@ impl CallTarget {
             CallTarget::FunctionPath { segments } => {
                 Some(segments.iter().map(String::as_str).collect())
             }
-            CallTarget::SyntheticTransparentCtor { name, .. } => Some(vec![name.as_str()]),
-            CallTarget::SyntheticTransparentClass { name, .. } => Some(vec![name.as_str()]),
+            // `(owner_path, name)` is the lookup identity per the
+            // variant docs; collapsing onto the leaf alone would
+            // make `Instruction::LoadFast` and `OtherEnum::LoadFast`
+            // share segments and break any downstream caller that
+            // uses `path_segments()` for qualified identity.
+            CallTarget::SyntheticTransparentCtor { name, owner_path } => {
+                let mut segs: Vec<&str> = owner_path.iter().map(String::as_str).collect();
+                segs.push(name.as_str());
+                Some(segs)
+            }
+            CallTarget::SyntheticTransparentClass { name, owner_path } => {
+                let mut segs: Vec<&str> = owner_path.iter().map(String::as_str).collect();
+                segs.push(name.as_str());
+                Some(segs)
+            }
             CallTarget::Indirect { method_name, .. } => Some(vec![method_name.as_str()]),
             CallTarget::UnsupportedExpr => None,
         }

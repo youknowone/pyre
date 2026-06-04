@@ -1078,6 +1078,13 @@ pub fn is_pure_op(kind: &OpKind) -> bool {
         | OpKind::VtableMethodPtr { .. }
         // `newtuple` is `PureOperation` (`operation.py:542-548`).
         | OpKind::NewTuple { .. }
+        // `isinstance` lowers to `int_between` over `obj.typeptr`'s
+        // subclass-range fields plus an optional null branch — all
+        // pure reads, classified `canfold=True` upstream
+        // (`lloperation.py instance_isinstance`).  Keeping dead
+        // `IsInstance` results alive would block prune_dead_phis Step
+        // 5 even though the predicate is side-effect-free.
+        | OpKind::IsInstance { .. }
         // `LoadStatic` reads a `static` declaration's compile-time
         // address — equivalent to `LOAD_GLOBAL` → Constant lookup,
         // pure.
@@ -1132,7 +1139,6 @@ pub fn is_pure_op(kind: &OpKind) -> bool {
         | OpKind::AssertGreen { .. }
         | OpKind::IsConstant { .. }
         | OpKind::IsVirtual { .. }
-        | OpKind::IsInstance { .. }
         | OpKind::CurrentTraceLength
         | OpKind::JitDebug { .. }
         | OpKind::JitMergePoint { .. }
