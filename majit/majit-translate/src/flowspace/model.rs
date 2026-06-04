@@ -2132,12 +2132,12 @@ impl HostEnv {
             HostObject::new_builtin_callable("core.ptr.null_mut"),
         );
         core_ptr.module_set("null", HostObject::new_builtin_callable("core.ptr.null"));
-        let std_ptr = HostObject::new_module("std.ptr");
-        std_ptr.module_set(
-            "null_mut",
-            HostObject::new_builtin_callable("core.ptr.null_mut"),
-        );
-        std_ptr.module_set("null", HostObject::new_builtin_callable("core.ptr.null"));
+        // `std.ptr` was already created above with `null_mut` / `eq` /
+        // `copy_nonoverlapping`; extend that same module with `null`
+        // instead of re-creating it.  A fresh `new_module` here would
+        // shadow the earlier binding and drop its `eq` /
+        // `copy_nonoverlapping` members before the `mods.insert` below.
+        std_ptr.module_set("null", HostObject::new_builtin_callable("std.ptr.null"));
 
         let mut mods = self.modules.lock().unwrap();
         mods.insert("__builtin__".into(), self.builtin_module.clone());
