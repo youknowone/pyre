@@ -592,11 +592,16 @@ fn fmt_op_result(op: &SpaceOperation) -> String {
 /// `true` iff `kind` is a 0-arg unit-variant transparent ctor
 /// (`StepResult::Continue`, `LoopResult::Done`, …) that [`translate_op`]
 /// pre-folds to a `Constant` and emits no `FlowspaceOp` (the unit-variant
-/// guard at the top of `translate_op`).  The `?` / Result / Option
-/// transparent-ctor handling has no RPython counterpart; this is the one
-/// shape that records nothing, so [`op_canraise`] and [`translate_op`]
-/// consult the SAME predicate — `op_canraise` is false exactly when
-/// `translate_op` emits no op.
+/// guard at the top of `translate_op`).  Also matches the 0-arg
+/// `SyntheticTransparentClass` placeholder emitted by the tuple-struct
+/// match cascade (`front/ast.rs:7456`): [`legacy_const_define_hlvalue`]
+/// folds it to a `Hlvalue::Constant(HostObject::Class)` so the
+/// `isinstance` HighLevelOp's `class_carrier` arrives at
+/// `InstanceRepr::rtype_isinstance` as a Constant — matching the
+/// `if isinstance(v_cls, Constant)` branch in `rclass.py:1019`.
+///
+/// [`op_canraise`] and [`translate_op`] consult the SAME predicate —
+/// `op_canraise` is false exactly when `translate_op` emits no op.
 fn is_elided_unit_variant_ctor(kind: &OpKind) -> bool {
     if let OpKind::Call {
         target: crate::model::CallTarget::SyntheticTransparentCtor { name, owner_path },
@@ -608,6 +613,15 @@ fn is_elided_unit_variant_ctor(kind: &OpKind) -> bool {
         let mut segments = owner_path.clone();
         segments.push(name.clone());
         return crate::front::syn_metadata::is_synthetic_unit_variant_path(&segments);
+    }
+    if let OpKind::Call {
+        target: crate::model::CallTarget::SyntheticTransparentClass { .. },
+        args,
+        ..
+    } = kind
+        && args.is_empty()
+    {
+        return true;
     }
     false
 }
@@ -1740,6 +1754,38 @@ fn legacy_const_define_hlvalue(op: &SpaceOperation) -> Option<Hlvalue> {
             Some(Hlvalue::Constant(Constant::with_concretetype(
                 ConstValue::HostObject(instance),
                 crate::translator::rtyper::rclass::OBJECTPTR.clone(),
+            )))
+        }
+        // Class-of-variant placeholder fold.  Tuple-struct match
+        // cascades (`front/ast.rs:7396 classify_match_tuple_struct_cascade`)
+        // emit `OpKind::Call { target: SyntheticTransparentClass, args: [] }`
+        // whose runtime semantics is "load the class object" — i.e. a
+        // PBC reference to the class itself, not a fresh instance.
+        // Without the fold, the residual call would route through
+        // `simple_call(HostObject::Class)` and the annotator's
+        // `ClassDesc::pycall` would return `SomeInstance` (a new instance)
+        // rather than `SomePBC([ClassDesc])` (the class itself), breaking
+        // `InstanceRepr::rtype_isinstance` which checks
+        // `if isinstance(v_cls, Constant)` against the class PBC.
+        //
+        // The fold materialises `Hlvalue::Constant(HostObject::new_class)`
+        // directly; `ClassRepr::convert_const` (`rclass.rs:1463`) then
+        // converts the HostObject to an `LLPtr(vtable)` for the
+        // `make_ll_isinstance` (`rclass.py:1149`) constant-arm path.
+        OpKind::Call {
+            target: crate::model::CallTarget::SyntheticTransparentClass { name, owner_path },
+            args,
+            ..
+        } if args.is_empty() => {
+            let qualname = if owner_path.is_empty() {
+                name.clone()
+            } else {
+                format!("{}.{}", owner_path.join("."), name)
+            };
+            let class_obj = crate::flowspace::model::HostObject::new_class(qualname, Vec::new());
+            Some(Hlvalue::Constant(Constant::with_concretetype(
+                ConstValue::HostObject(class_obj),
+                crate::translator::rtyper::rclass::CLASSTYPE.clone(),
             )))
         }
         _ => None,
