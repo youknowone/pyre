@@ -248,7 +248,10 @@ pub struct MirGraphLookup<'a> {
     /// (two or more graphs share the (owner-spelling, name) tuple).
     impl_methods: HashMap<(&'a str, &'a str), Result<&'a FunctionGraph, ()>>,
     /// Trait-default bodies: keyed by (trait_root, name) with self_ty_root None.
-    trait_defaults: HashMap<(&'a str, &'a str), &'a FunctionGraph>,
+    /// `Ok(&graph)` is a unique hit; `Err(())` marks the slot ambiguous
+    /// (two distinct traits share a bare leaf + default-method name), so
+    /// the caller falls back rather than registering an arbitrary body.
+    trait_defaults: HashMap<(&'a str, &'a str), Result<&'a FunctionGraph, ()>>,
     /// Free functions (no impl owner, no trait root): keyed by bare name.
     /// `Ok(&graph)` is a unique hit; `Err(())` marks the slot ambiguous
     /// (two or more free functions share a bare name across modules).
@@ -265,7 +268,8 @@ impl<'a> MirGraphLookup<'a> {
     pub fn from_program(program: &'a SemanticProgram) -> Self {
         let mut impl_methods: HashMap<(&'a str, &'a str), Result<&'a FunctionGraph, ()>> =
             HashMap::new();
-        let mut trait_defaults = HashMap::new();
+        let mut trait_defaults: HashMap<(&'a str, &'a str), Result<&'a FunctionGraph, ()>> =
+            HashMap::new();
         let mut free_functions: HashMap<&'a str, Result<&'a FunctionGraph, ()>> = HashMap::new();
         for f in &program.functions {
             if let Some(owner) = f.self_ty_root.as_deref() {
@@ -285,7 +289,10 @@ impl<'a> MirGraphLookup<'a> {
                     );
                 }
             } else if let Some(tr) = f.trait_root.as_deref() {
-                trait_defaults.insert((tr, f.name.as_str()), &f.graph);
+                // Mark bare-leaf trait-name collisions ambiguous, mirroring
+                // the impl_methods / free_functions tables, so two distinct
+                // traits with a same-named default method do not last-win.
+                Self::insert_or_mark_ambiguous(&mut trait_defaults, tr, f.name.as_str(), &f.graph);
             } else {
                 // Free function: index by bare name so the
                 // opcode-dispatch extractor can resolve
@@ -368,9 +375,14 @@ impl<'a> MirGraphLookup<'a> {
         }
     }
 
-    /// Returns the MIR graph for a trait-default body.
+    /// Returns the MIR graph for a trait-default body.  Returns None
+    /// when the (trait_root, name) tuple does not resolve to a unique
+    /// graph (no entry or ambiguous bare-leaf trait name).
     pub fn lookup_trait_default(&self, trait_root: &str, name: &str) -> Option<&'a FunctionGraph> {
-        self.trait_defaults.get(&(trait_root, name)).copied()
+        match self.trait_defaults.get(&(trait_root, name)).copied()? {
+            Ok(g) => Some(g),
+            Err(()) => None,
+        }
     }
 }
 
