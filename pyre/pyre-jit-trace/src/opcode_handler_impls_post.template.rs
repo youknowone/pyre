@@ -47,12 +47,50 @@ impl pyre_interpreter::ControlFlowOpcodeHandler for crate::state::MIFrame {
                     .map(|b| (b.trace_id, b.fail_index));
                 let has_targets = driver.meta_interp().has_compiled_targets(back_edge_key);
                 if !has_partial && has_targets {
-                    let outcome = driver.meta_interp_mut().compile_trace(
-                        back_edge_key,
-                        &live_args,
-                        bridge_origin,
-                    );
-                    if matches!(outcome, majit_metainterp::CompileOutcome::Compiled { .. }) {
+                    let outcome = match bridge_origin {
+                        // Guard-origin: existing bridge path.
+                        Some(_) => Some(driver.meta_interp_mut().compile_trace(
+                            back_edge_key,
+                            &live_args,
+                            bridge_origin,
+                        )),
+                        // pyjitpl.py:3003-3007 interp-origin: close the trace as
+                        // an entry bridge (ResumeFromInterpDescr) jumping into the
+                        // already-compiled loop at `back_edge_key`, instead of
+                        // falling through to compile_loop -> has_compiled_targets
+                        // -> SwitchToBlackhole(ABORT_BAD_LOOP). compile_and_attach
+                        // installs an entry bridge ending in a JUMP to the target
+                        // loop (compile.py:1002-1021).
+                        None => {
+                            // `compile_trace_entry_data` returns `Some` only for
+                            // a function-entry trace (ResumeFromInterpDescr: the
+                            // interpreter portal into the function). Such a trace
+                            // runs the function prologue and closes with a JUMP
+                            // into the already-compiled hot loop at
+                            // `back_edge_key`. A trace rooted at a *loop header*
+                            // returns `None` here and falls through to
+                            // compile_loop, which aborts cleanly — closing one
+                            // loop header as an entry bridge into another would
+                            // drop the outer loop's back-edge (its iterations
+                            // would no longer run in compiled code).
+                            match driver.compile_trace_entry_data() {
+                                Some((original_green_key, entry_meta)) => {
+                                    Some(driver.meta_interp_mut().compile_trace_from_interp(
+                                        back_edge_key,
+                                        &live_args,
+                                        original_green_key,
+                                        entry_meta,
+                                    ))
+                                }
+                                None => Some(driver.meta_interp_mut().compile_trace(
+                                    back_edge_key,
+                                    &live_args,
+                                    None,
+                                )),
+                            }
+                        }
+                    };
+                    if matches!(outcome, Some(majit_metainterp::CompileOutcome::Compiled { .. })) {
                         if majit_metainterp::majit_log_enabled() {
                             eprintln!(
                                 "[jit][reached_loop_header] compile_trace success: key={} pc={} bridge={:?}",

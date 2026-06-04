@@ -1160,8 +1160,30 @@ impl<S: JitState> JitDriver<S> {
 
     /// ResumeFromInterpDescr parity: data needed to compile an entry bridge
     /// from the currently active trace.
+    ///
+    /// Returns `Some` only for a function-entry trace (`header_pc == 0`, the
+    /// interpreter portal into the function). An entry bridge runs the
+    /// function prologue and closes with a JUMP into an already-compiled hot
+    /// loop. A trace rooted at a *loop header* (`header_pc != 0`) returns
+    /// `None`: closing it as an entry bridge into another loop would drop its
+    /// own back-edge, so its iterations would no longer run in compiled code
+    /// (the caller then falls back to compile_loop, which aborts cleanly).
     pub fn compile_trace_entry_data(&mut self) -> Option<(u64, S::Meta)> {
-        let original_green_key = self.meta.trace_ctx().map(|ctx| ctx.root_green_key())?;
+        // The interp-origin entry bridge closes by redirecting the function's
+        // entry into the compiled loop (compile_entry_bridge's
+        // redirect_call_assembler). The cranelift backend's preamble
+        // entry-mode calling convention does not yet accept a function-entry
+        // preamble entry from a redirected call, so the entry bridge is wired
+        // for dynasm only; on cranelift this returns None and the caller falls
+        // back to compile_loop (baseline behavior).
+        if cfg!(feature = "cranelift") {
+            return None;
+        }
+        let original_green_key = self
+            .meta
+            .trace_ctx()
+            .filter(|ctx| ctx.header_pc == 0)
+            .map(|ctx| ctx.root_green_key())?;
         let trace_meta = self.meta.trace_meta()?.clone();
         Some((original_green_key, trace_meta))
     }

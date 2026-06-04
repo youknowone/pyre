@@ -5498,6 +5498,13 @@ impl<M: Clone> MetaInterp<M> {
         original_green_key: u64,
         entry_meta: M,
     ) -> CompileOutcome {
+        // ResumeFromInterpDescr.get_resumestorage() is None — an interp-origin
+        // entry bridge has no source-guard fail_args. Clear any pending
+        // frontend_boxes left by a previous guard-failure bridge (set at the
+        // guard-exit path) so they do not leak into this bridge's optimize and
+        // trip the bridgeopt.py:126 `len(frontend_boxes) == len(liveboxes)`
+        // assertion against the entry bridge's own inputargs.
+        self.pending_frontend_boxes = None;
         self.compile_trace_inner(
             green_key,
             finish_args,
@@ -8264,9 +8271,17 @@ impl<M: Clone> MetaInterp<M> {
     /// `is_invalidated` AND here.
     #[inline]
     pub fn has_compiled_loop(&self, green_key: u64) -> bool {
+        // warmstate.py:482-511 maybe_compile_and_run gates execution entry on
+        // `cell.get_procedure_token() is not None` (code present), NOT on
+        // has_compiled_targets. An entry bridge (ResumeFromInterpDescr) has
+        // compiled code but may carry 0 target_tokens; gating on
+        // has_target_tokens() refused to dispatch it, so the interp re-ticked
+        // the green key every back-edge -> bound_reached -> decay_all_counters
+        // flood that starved the guard-failure bridge counter. Gate on
+        // has_compiled_code() so a code-present token is entered directly.
         self.warm_state
             .get_procedure_token(green_key)
-            .map_or(false, |token| token.has_target_tokens())
+            .map_or(false, |token| token.has_compiled_code())
     }
 
     /// Check if any guard in the compiled trace has Float-typed fail_args.
@@ -9050,20 +9065,19 @@ impl<M: Clone> MetaInterp<M> {
                     },
                 );
 
+                // The entry bridge ends in a JUMP into `green_key`'s compiled
+                // loop, so it inherits THAT loop's TargetTokens (compile.py:286-296).
+                // `green_key` is guaranteed compiled (checked at the top). The
+                // prior logic inherited from `original_green_key` and fell back to
+                // an empty list when origin != target, leaving a cross-loop entry
+                // bridge (interp origin uncompiled, distinct from the compiled
+                // target) with no target tokens — hence non-dispatchable
+                // (has_compiled_loop stays false -> no nbody residency win).
                 let front_target_tokens = self
                     .compiled_loops
-                    .get(&original_green_key)
+                    .get(&green_key)
                     .map(|c| c.front_target_tokens.clone())
-                    .unwrap_or_else(|| {
-                        if original_green_key == green_key {
-                            self.compiled_loops
-                                .get(&green_key)
-                                .map(|c| c.front_target_tokens.clone())
-                                .unwrap_or_default()
-                        } else {
-                            Vec::new()
-                        }
-                    });
+                    .unwrap_or_default();
                 // `compile.py:286-296` — the bridge's destination JCT inherits
                 // the loop's TargetTokens.  Mirror them onto
                 // `JitCellToken.target_tokens` so `has_compiled_targets`
