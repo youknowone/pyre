@@ -280,12 +280,14 @@ fn adapter_rejects_execute_opcode_step_without_walker_at_cast_removal_helper() {
     // Sister oracle: WITHOUT the walker call, the rejection state is a
     // pre-walker `UnboundLocal { name }`. Since the dispatch arms were
     // lifted to per-opcode `execute_<op>` tail-calls, the first symbol
-    // the adapter cannot resolve is now the first lifted handler
-    // (`execute_load_const`, the `LoadConst` arm) rather than a
-    // cast-removal helper inlined inside an arm body (`u32_as_i64` /
-    // `u32_as_usize` / `op_arg_as_usize` / `raise_kind_as_usize`, now
-    // reachable only past the unresolved handler). Documented in
-    // `pyre/pyre-interpreter/src/pyopcode.rs:1302..1336`.
+    // the adapter cannot resolve is the first lifted handler:
+    // `execute_load_const`, the `LoadConst` arm (the arms before it —
+    // `ExtendedArg`/`Resume`/`Nop`/`Cache`/`NotTaken` — return
+    // `Ok(StepResult::Continue)` and need no symbol resolution). The
+    // dispatch lives in `pyre/pyre-interpreter/src/pyopcode.rs`'s
+    // `execute_opcode_step`. The cast-removal helpers (`u32_as_i64`
+    // etc.) only appear inside arm bodies the walker never enters in
+    // this without-walker path, so they cannot be the frontier here.
     //
     // Per-module scoping (Issue 1.3, 2026-05-05): `build_flow_from_rust`
     // mints a fresh `ModuleId` internally, so this test's lookup
@@ -304,21 +306,16 @@ fn adapter_rejects_execute_opcode_step_without_walker_at_cast_removal_helper() {
     match err {
         AdapterError::UnboundLocal { name } => {
             // The first lifted per-opcode handler (`LoadConst` arm) is
-            // the new pre-walker frontier; the cast-removal helpers stay
-            // listed because they remain the rejection point inside any
-            // arm body the walker does step into.
-            const PRE_WALKER_UNRESOLVED_SYMBOLS: &[&str] = &[
-                "execute_load_const",
-                "u32_as_i64",
-                "u32_as_usize",
-                "op_arg_as_usize",
-                "raise_kind_as_usize",
-            ];
-            assert!(
-                PRE_WALKER_UNRESOLVED_SYMBOLS.contains(&name.as_str()),
-                "without walker: expected an unresolved lifted handler or \
-                 cast-removal helper from {PRE_WALKER_UNRESOLVED_SYMBOLS:?}, \
-                 got {name:?}",
+            // the without-walker frontier: the adapter resolves the
+            // leading `Ok(StepResult::Continue)` arms cleanly and stops
+            // at the first body-bearing arm's tail call. Pinning the
+            // exact symbol keeps the oracle from silently passing if the
+            // adapter ever regressed past the lifted-handler boundary
+            // into an arm body.
+            assert_eq!(
+                name, "execute_load_const",
+                "without walker: the first lifted per-opcode handler \
+                 (`LoadConst` arm) is the pre-walker frontier; got {name:?}",
             );
         }
         other => panic!(
