@@ -9571,6 +9571,46 @@ impl<M: Clone> MetaInterp<M> {
             eprint!("{}", majit_ir::format_trace(&optimized_ops, &constants));
         }
 
+        // compile.py:27-29 giveup() parity: a bridge whose terminal JUMP
+        // targets an already-compiled loop must supply exactly as many args
+        // as that loop's LABEL — the backend regalloc asserts
+        // `arglocs.len() == target_arglocs.len()`. The full-body walk can
+        // close a bridge against an outer-loop LABEL that an unroll short
+        // preamble grew beyond the virtualizable layout the bridge close
+        // reconstructs (its loop-invariant `extra` inputargs), so the counts
+        // disagree. Give up on this bridge gracefully (blackhole resume still
+        // produces the correct result) instead of letting the backend panic.
+        // target_arglocs is empty for a not-yet-compiled target (fresh
+        // retrace token); skip the check there, matching the backend's own
+        // `target_arglocs.is_empty()` no-assert branch.
+        if let Some(jump) = optimized_ops
+            .last()
+            .filter(|op| op.opcode == majit_ir::OpCode::Jump)
+        {
+            let target_len = jump.getdescr().and_then(|d| {
+                d.as_loop_target_descr()
+                    .map(|ltd| ltd.target_arglocs().len())
+            });
+            if let Some(target_len) = target_len {
+                let jump_len = jump.getarglist().len();
+                if target_len != 0 && jump_len != target_len {
+                    if crate::majit_log_enabled() {
+                        eprintln!(
+                            "[jit] compile_bridge giveup: JUMP args {jump_len} != \
+                             target LABEL args {target_len} (key={green_key} guard={fail_index})"
+                        );
+                    }
+                    crate::debug::log_one(
+                        "jit-summary",
+                        &format!(
+                            "bridge giveup: JUMP args {jump_len} != target LABEL args {target_len}"
+                        ),
+                    );
+                    return false;
+                }
+            }
+        }
+
         self.backend
             .set_constants_pool(compiled_constants_typed.clone());
         // resume.py:1143-1188 parity — VStr/VUni Concat/Slice guard-exit
