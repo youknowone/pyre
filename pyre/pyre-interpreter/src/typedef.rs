@@ -2322,7 +2322,20 @@ fn init_dict_type(ns: &mut DictStorage) {
                 if args.len() < 2 {
                     return Err(crate::PyError::type_error("__delitem__ requires 2 args"));
                 }
-                crate::baseobjspace::delitem(args[0], args[1])?;
+                // For plain dict: direct delete. For dict subclass instance: use backing dict.
+                unsafe {
+                    if pyre_object::is_dict(args[0]) {
+                        crate::baseobjspace::delitem(args[0], args[1])?;
+                    } else if pyre_object::is_instance(args[0]) {
+                        // dict subclass — delete from __dict_data__ backing dict
+                        if let Ok(backing) = crate::baseobjspace::getattr(args[0], "__dict_data__")
+                        {
+                            if pyre_object::is_dict(backing) {
+                                crate::baseobjspace::delitem(backing, args[1])?;
+                            }
+                        }
+                    }
+                }
                 Ok(pyre_object::w_none())
             },
             2,
