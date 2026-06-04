@@ -4496,6 +4496,21 @@ fn init_type_type(ns: &mut DictStorage) {
     );
     dict_storage_store(ns, "__mro__", make_getset_descriptor(mro_getter));
 
+    // `type.mro(cls)` — typeobject.c `mro_external` / `type.mro`: the method
+    // form returns the MRO as a fresh list (the `__mro__` getset above
+    // returns the tuple).  Bound as a regular method, so `cls` is at args[0].
+    let mro_method = make_builtin_function("mro", |args| {
+        let cls = args[0];
+        unsafe {
+            let mro_ptr = pyre_object::w_type_get_mro(cls);
+            if mro_ptr.is_null() {
+                return Ok(pyre_object::w_list_new(vec![]));
+            }
+            Ok(pyre_object::w_list_new((*mro_ptr).clone()))
+        }
+    });
+    dict_storage_store(ns, "mro", mro_method);
+
     // `pypy/objspace/std/typeobject.py:614-624 get_module` /
     // `:1241-1247 descr_get__module` / `descr_set__module`.
     // For heaptype (user-defined classes) the value is read from /
