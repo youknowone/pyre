@@ -1354,7 +1354,8 @@ fn collect_same_slot_coalesce_pairs(
     let Some(max_slot) = walker_slot_for_variable.iter().flatten().copied().max() else {
         return Vec::new();
     };
-    let mut first_for_slot: Vec<Option<super::flow::VariableId>> = vec![None; max_slot as usize + 1];
+    let mut first_for_slot: Vec<Option<super::flow::VariableId>> =
+        vec![None; max_slot as usize + 1];
     let mut pairs = Vec::new();
     for (vid, slot) in walker_slot_for_variable.iter().enumerate() {
         let Some(slot) = *slot else { continue };
@@ -4271,6 +4272,30 @@ fn filter_liveness_in_place(
                 s
             };
             pc_live_r.retain(|idx| lv_live.contains(idx));
+
+            // Restore the portal red args (`interp_jit.py:67 reds =
+            // ['frame', 'ec']`) on the splice path.  The retain above only
+            // KEEPS a color present in `pc_live_r`; it cannot re-add a color
+            // the marker dropped.  The walker's explicit per-PC `-live-`
+            // markers always carry `portal_frame_reg` / `portal_ec_reg`
+            // (RPython force-alive, `liveness.py:11-12`), so `pc_live_r`
+            // holds them and the retain keeps them.  The canonical
+            // `flatten_graph` stream's markers are filled by backward
+            // `compute_liveness`, which drops a portal red never read in the
+            // body (a leaf function's `ec`), leaving `pc_live_r` short.  The
+            // bridge resume (`state.rs::setup_bridge_sym`) indexes
+            // `registers_r` by `portal_ec_reg`, so the slot MUST be present.
+            // Re-add the portal reds to reproduce the walker's force-alive
+            // shape; splice-only (`clear_unboxed_banks`) so the walker path
+            // stays byte-identical.
+            if clear_unboxed_banks {
+                if portal_frame_reg != u16::MAX && !pc_live_r.contains(&portal_frame_reg) {
+                    pc_live_r.push(portal_frame_reg);
+                }
+                if portal_ec_reg != u16::MAX && !pc_live_r.contains(&portal_ec_reg) {
+                    pc_live_r.push(portal_ec_reg);
+                }
+            }
 
             // The Ref bank is the only bank in pyre's opcode-entry resume
             // snapshot: pyre boxes every value before a Python opcode
@@ -10271,8 +10296,8 @@ impl CodeWriter {
                     }
                 }
                 let first_live = spliced.insns.iter().position(|i| i.is_live());
-                let derived = first_live
-                    .map(|_| derive_pc_live_indices_from_sparse(&spliced, num_instrs));
+                let derived =
+                    first_live.map(|_| derive_pc_live_indices_from_sparse(&spliced, num_instrs));
                 // #281 splice precondition: the dense pc_map fill above
                 // forward-carries the nearest resolved `-live-` marker for a
                 // `nopc` (stack-only) PC, which is only sound when no
@@ -10288,8 +10313,7 @@ impl CodeWriter {
                 // correct per-PC marker for every resume target.  Gate-on
                 // only — gate-off never enters this block.
                 let stranded = derived.as_ref().map_or(0, |d| {
-                    let (rb, _rbk, rbf, rc, rcf) =
-                        resume_target_resolver_coverage(&spliced, d);
+                    let (rb, _rbk, rbf, rc, rcf) = resume_target_resolver_coverage(&spliced, d);
                     (rb - rbf) + (rc - rcf)
                 });
                 // #302 splice precondition: the per-slot resume reverse
@@ -10300,13 +10324,14 @@ impl CodeWriter {
                 // restores one slot and the others keep stale values
                 // (spectral_norm gate-on 1.0).  Refuse to splice such
                 // graphs and keep the resume-correct walker stream.
-                let local_color_collision = canonical_for_splice.as_ref().map_or(false, |(_, sr)| {
-                    splice_local_color_collision(
-                        &sr[Kind::Ref.index()].coloring,
-                        &walker_slot_for_variable,
-                        code.varnames.len(),
-                    )
-                });
+                let local_color_collision =
+                    canonical_for_splice.as_ref().map_or(false, |(_, sr)| {
+                        splice_local_color_collision(
+                            &sr[Kind::Ref.index()].coloring,
+                            &walker_slot_for_variable,
+                            code.varnames.len(),
+                        )
+                    });
                 if let (Some(first_live), Some(derived), 0, false) =
                     (first_live, derived, stranded, local_color_collision)
                 {
@@ -10582,7 +10607,8 @@ impl CodeWriter {
                 let mut conflicts = 0usize;
                 for (vid, slot) in walker_slot_for_variable.iter().enumerate() {
                     let Some(slot) = *slot else { continue };
-                    let Some(&color) = ref_coloring.get(&super::flow::VariableId(vid as u32)) else {
+                    let Some(&color) = ref_coloring.get(&super::flow::VariableId(vid as u32))
+                    else {
                         continue;
                     };
                     match inverse[slot as usize] {
@@ -10667,7 +10693,8 @@ impl CodeWriter {
         // derive the semantic local index from a non-identity color.
         let mut pyre_color_for_semantic_local: Vec<u16> = Vec::with_capacity(nlocals);
         for i in 0..nlocals as u16 {
-            let post = super::regalloc::rename_lookup(&alloc_result.rename, Kind::Ref, slot_pre_color(i));
+            let post =
+                super::regalloc::rename_lookup(&alloc_result.rename, Kind::Ref, slot_pre_color(i));
             pyre_color_for_semantic_local.push(post);
         }
         // After step C the chordal coloring is free to coalesce
