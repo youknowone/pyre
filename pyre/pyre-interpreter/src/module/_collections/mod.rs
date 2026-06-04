@@ -40,13 +40,15 @@ mod deque_class {
         let _ = crate::baseobjspace::setattr(self_obj, "__data__", w_list_new(items));
     }
 
-    /// `self.maxlen`: `None` (unbounded) or a non-negative bound.
+    /// `self.maxlen`: `None` (unbounded) or a non-negative bound.  The
+    /// bound is validated non-negative at construction, so the stored
+    /// value is read back directly.
     fn maxlen_bound(self_obj: PyObjectRef) -> Option<usize> {
         let w = crate::baseobjspace::getattr(self_obj, "__maxlen__").ok()?;
         if w.is_null() || unsafe { is_none(w) } {
             None
         } else {
-            Some(unsafe { w_int_get_value(w) }.max(0) as usize)
+            Some(unsafe { w_int_get_value(w) } as usize)
         }
     }
 
@@ -78,15 +80,33 @@ mod deque_class {
         methods: {
             // `init(iterable=None, maxlen=None)` — remember maxlen, then
             // extend so the bound is enforced while filling.
-            fn __init__(self_obj: PyObjectRef, iterable: Option<PyObjectRef>, maxlen: Option<PyObjectRef>) {
+            fn __init__(self_obj: PyObjectRef, iterable: Option<PyObjectRef>, maxlen: Option<PyObjectRef>) -> Result<(), crate::PyError> {
                 store(self_obj, vec![]);
-                let _ = crate::baseobjspace::setattr(
-                    self_obj, "__maxlen__", maxlen.unwrap_or(w_none()));
+                // `gateway_nonnegint_w(w_maxlen)` — None is unbounded; a
+                // non-integer is a TypeError and a negative bound is a
+                // ValueError, both raised here at construction rather than
+                // silently clamped when the bound is later read.
+                let w_maxlen = match maxlen {
+                    Some(m) if !unsafe { is_none(m) } => {
+                        if !unsafe { is_int(m) } {
+                            return Err(crate::PyError::type_error(
+                                "an integer is required"));
+                        }
+                        if unsafe { w_int_get_value(m) } < 0 {
+                            return Err(crate::PyError::value_error(
+                                "maxlen must be non-negative"));
+                        }
+                        m
+                    }
+                    _ => w_none(),
+                };
+                let _ = crate::baseobjspace::setattr(self_obj, "__maxlen__", w_maxlen);
                 if let Some(it) = iterable {
-                    for item in crate::builtins::collect_iterable(it).unwrap_or_default() {
+                    for item in crate::builtins::collect_iterable(it)? {
                         do_append(self_obj, item);
                     }
                 }
+                Ok(())
             }
             fn append(self_obj: PyObjectRef, item: PyObjectRef) {
                 do_append(self_obj, item);
@@ -243,6 +263,11 @@ mod deque_class {
                 Ok(())
             }
             fn __repr__(self_obj: PyObjectRef) -> String {
+                // `dequerepr` — a deque reachable from its own items renders
+                // the inner reference as `[...]` instead of recursing.
+                let Some(_guard) = crate::display::ReprGuard::enter(self_obj) else {
+                    return "[...]".to_string();
+                };
                 let name = unsafe { w_type_get_name(w_instance_get_type(self_obj)) };
                 let listrepr = snapshot(self_obj)
                     .into_iter()

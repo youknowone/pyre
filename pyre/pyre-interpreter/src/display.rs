@@ -141,10 +141,10 @@ thread_local! {
 /// RAII cycle guard.  `enter` returns `None` when `obj` is already being
 /// repr'd on this thread — the caller emits the `...` placeholder — and
 /// otherwise records `obj`, removing it again when the guard drops.
-struct ReprGuard(usize);
+pub(crate) struct ReprGuard(usize);
 
 impl ReprGuard {
-    fn enter(obj: PyObjectRef) -> Option<ReprGuard> {
+    pub(crate) fn enter(obj: PyObjectRef) -> Option<ReprGuard> {
         let key = obj as usize;
         REPR_ACTIVE.with(|active| {
             let mut active = active.borrow_mut();
