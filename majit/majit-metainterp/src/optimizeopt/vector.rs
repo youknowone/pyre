@@ -443,8 +443,12 @@ impl VectorizingOptimizer {
             return Err(VectorizeError::NotVectorizeable);
         }
 
-        // vector.py:237-240: analyse_index_calculations → reorder
-        let constant_of = |_opref: OpRef| -> Option<i64> { None };
+        // vector.py:237-240: analyse_index_calculations → reorder.
+        // resoperation.py:181 reads `op.getarg(1).value` off the inline
+        // ConstInt; the standalone pass has no Optimizer context, so an
+        // inline `OpRef::ConstInt` is the only — and the faithful — const
+        // source for INT_SIGNEXT bytesize and adjacent-ref index detection.
+        let constant_of = |opref: OpRef| -> Option<i64> { opref.as_const_int() };
         if let Some(graph) = self.analyse_index_calculations(loop_, &constant_of) {
             let schedule = schedule_operations(&graph);
             if schedule.len() == loop_.operations.len() {
@@ -1832,6 +1836,35 @@ mod tests {
         assert!(vloop.prefix_label.is_none());
         assert_eq!(vloop.jump.getarglist_copy().len(), 2);
         assert_eq!(vloop.operations.len(), 1);
+    }
+
+    /// `run_optimization`'s standalone resolver has no Optimizer context, so
+    /// an `INT_SIGNEXT(x, ConstInt(n))` must take arg1's bytesize from the
+    /// inline `OpRef::ConstInt` (resoperation.py:181 reads `arg1.value`).
+    /// Regression: the resolver previously returned `None` for every opref,
+    /// so `int_signext_vecinfo`'s fail-fast `.expect()` panicked on a valid
+    /// INT_SIGNEXT.
+    #[test]
+    fn int_signext_setup_resolves_inline_const_in_standalone_pass() {
+        let signext = Op::new(
+            OpCode::IntSignext,
+            &[
+                BoxRef::from_opref(OpRef::input_arg_int(0)),
+                BoxRef::from_opref(OpRef::const_int(4)),
+            ],
+        );
+        let mut ops = vec![signext];
+        assign_positions(&mut ops, 10);
+
+        let mut st = VecScheduleState::new(100);
+        // The standalone run_optimization resolver: inline consts only.
+        let constant_of = |opref: OpRef| -> Option<i64> { opref.as_const_int() };
+        st.setup_vectorization(&ops, &constant_of);
+
+        let info = st.forwarded_vecinfo(&ops[0]);
+        assert_eq!(info.datatype, 'i');
+        assert_eq!(info.bytesize, 4);
+        assert!(info.signed);
     }
 
     /// Streaming refactor: a 4-op loop runs through the VectorizingOptimizer
