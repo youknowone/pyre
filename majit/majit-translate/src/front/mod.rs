@@ -25,8 +25,8 @@
 //!
 //! ## Step 6 cutover status (2026-05-25)
 //!
-//! - **Step 6.A** — `majit/charon-spike/prototype` marked as deletion
-//!   candidate; the corpus + reader integration in
+//! - **Step 6.A** — `majit/charon-fixtures` retained as the corpus
+//!   + reader integration in
 //!   `majit-charon-reader::tests::corpus` and
 //!   `majit-translate::tests::test_mir_frontend` are now the
 //!   authoritative regression oracle.

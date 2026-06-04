@@ -1,4 +1,4 @@
-//! End-to-end test: load the charon-spike corpus, walk every function,
+//! End-to-end test: load the Charon fixture corpus, walk every function,
 //! confirm every terminator/statement decodes into the typed enums.
 //!
 //! Run with: `cargo test -p majit-charon-reader`.
@@ -8,18 +8,25 @@ use majit_charon_reader::{
     ullbc::{CallClass, StmtKind, TermKind},
 };
 
-const CORPUS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../charon-spike/corpus.ullbc",);
+const CORPUS: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../charon-fixtures/corpus.ullbc",
+);
 
 #[test]
-fn loads_spike_corpus() {
+fn loads_fixture_corpus() {
     let llbc = Llbc::load(CORPUS).expect("load corpus.ullbc");
-    assert_eq!(llbc.crate_name(), "charon_spike_corpus");
+    assert_eq!(llbc.crate_name(), "charon_fixtures_corpus");
     assert!(!llbc.file.has_errors);
     let local_count = llbc
         .iter_local_fns()
-        .filter(|f| f.item_meta.name_path().starts_with("charon_spike_corpus::"))
+        .filter(|f| {
+            f.item_meta
+                .name_path()
+                .starts_with("charon_fixtures_corpus::")
+        })
         .count();
-    assert_eq!(local_count, 5, "5 local fns expected");
+    assert_eq!(local_count, 6, "6 local fns expected");
 }
 
 #[test]

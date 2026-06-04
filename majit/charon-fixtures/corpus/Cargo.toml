@@ -1,0 +1,12 @@
+[package]
+name = "charon_fixtures_corpus"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+# Isolate from the parent workspace so this fixture never participates in
+# the main build. Charon runs against this crate directly.
+[workspace]

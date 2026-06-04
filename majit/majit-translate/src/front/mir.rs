@@ -42,8 +42,7 @@
 //!     side-effectful `FieldWrite` / `ArrayWrite` / `__deref_write`.
 //!   - `StorageLive` / `StorageDead` / `PlaceMention` — skipped.
 //!   - `Assert` — stripped (overflow asserts collapse into success
-//!     edge; matches `prototype/README.md` §"Deltas worth calling out"
-//!     §4).
+//!     edge; see the `TermKind::Assert` lowering note below).
 //!
 //! ### Rvalues
 //!   - `Use(operand)` — same-Variable alias.
@@ -107,7 +106,7 @@ use crate::model::{
 /// Top-level entry — load `function_name` out of `llbc`, lower it,
 /// return the constructed [`FunctionGraph`].
 ///
-/// The lookup is the same `ends_with("::<name>")` rule the spike's
+/// The lookup is the same `ends_with("::<name>")` rule the reader's
 /// `local_fn` uses. Replace with a fully-qualified-path lookup once
 /// the call graph plumbing makes it useful.
 pub fn lower_function(llbc: &Llbc, function_name: &str) -> Result<FunctionGraph, LowerError> {

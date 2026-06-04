@@ -10,7 +10,7 @@
 # Usage:
 #   scripts/extract-llbc.sh                  # extract all JIT-consumed crates
 #   scripts/extract-llbc.sh pyre-object      # extract one crate
-#   scripts/extract-llbc.sh corpus           # extract the charon-spike corpus
+#   scripts/extract-llbc.sh corpus           # extract the Charon fixture corpus
 #   LLBC_DEST=./out scripts/extract-llbc.sh  # override output dir
 #
 # Notes:
@@ -40,6 +40,10 @@ if [[ ! -x "$charon_bin" ]]; then
 fi
 
 LLBC_DEST="${LLBC_DEST:-$repo_root/build/llbc}"
+case "$LLBC_DEST" in
+    /*) ;;
+    *) LLBC_DEST="$repo_root/$LLBC_DEST" ;;
+esac
 mkdir -p "$LLBC_DEST"
 
 # bash 3.2 (macOS default) has no associative arrays — use a case
@@ -48,7 +52,7 @@ mkdir -p "$LLBC_DEST"
 crate_info() {
     case "$1" in
         corpus)
-            echo "$repo_root/majit/charon-spike/corpus|"
+            echo "$repo_root/majit/charon-fixtures/corpus|"
             ;;
         pyre-object)
             echo "$repo_root/pyre/pyre-object|"

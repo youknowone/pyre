@@ -1,4 +1,4 @@
-//! Charon Step 0 corpus: four representative shapes from issue #97.
+//! Charon fixture corpus: representative shapes from issue #97.
 //!
 //! 1. `straight_line_add` — straight-line interpreter-shaped function.
 //! 2. `branch_loop_sum`   — branch + loop, like opcode dispatch fragments.

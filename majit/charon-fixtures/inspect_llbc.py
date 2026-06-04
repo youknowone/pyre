@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Charon spike inspector — dumps shape of an .llbc / .ullbc JSON file.
+"""Charon fixture inspector — dumps shape of an .llbc / .ullbc JSON file.
 
 Run on either form (`charon cargo` -> .llbc, `charon cargo --ullbc` -> .ullbc).
 Reads JSON, prints crate summary, lists local fun_decls, and for selected

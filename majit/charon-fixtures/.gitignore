@@ -4,6 +4,3 @@ corpus/Cargo.lock
 # is run with default flags or without --dest-file pointing elsewhere.
 corpus/*.ullbc
 corpus/*.llbc
-prototype/target/
-prototype/Cargo.lock
-prototype/actual/

@@ -1,33 +1,21 @@
-# Charon Step 0 Spike
+# Charon Fixtures
 
-Tracking artifact for [issue #97](https://github.com/youknowone/pyre/issues/97)
-Step 0 — _extraction spike_.
+Regression fixtures for the Charon ULLBC reader and MIR frontend work from
+[issue #97](https://github.com/youknowone/pyre/issues/97).
 
-The goal of Step 0 is **not** to start the migration. It is to prove that
-Charon can extract a usable IR from our crates, and to record what the
-extracted `.llbc` actually contains before any production code is written
-against it.
+The checked-in corpus records representative Charon output so reader and
+frontend changes can be tested without re-extracting the full pyre crates.
 
 ## Layout
 
 ```
-charon-spike/
+charon-fixtures/
 ├── README.md              # this file
 ├── corpus/                # hand-written micro-crate (4 representative shapes)
 │   ├── Cargo.toml
 │   └── src/lib.rs
 ├── corpus.ullbc           # extracted ULLBC for the corpus crate (checked in)
-├── inspect_llbc.py        # JSON dumper used to produce the findings below
-└── prototype/             # Step 0.4: minimal MIR → FunctionGraph lowering
-    ├── README.md          # mapping table + structural deltas
-    ├── Cargo.toml         # isolated workspace
-    ├── src/
-    │   ├── main.rs        # CLI: charon-spike-lower
-    │   ├── ullbc.rs       # minimal serde decode
-    │   ├── graph.rs       # FunctionGraph-shaped target IR
-    │   └── lower.rs       # ULLBC → graph translation
-    ├── expected/          # checked-in canonical snapshots
-    └── compare.sh         # regenerate + diff
+└── inspect_llbc.py        # JSON dumper used to produce the findings below
 ```
 
 ## Setup notes (Charon install)
@@ -68,8 +56,9 @@ cd ..
 python3 inspect_llbc.py corpus.ullbc                  # summary
 python3 inspect_llbc.py corpus.ullbc desugar_mix      # detailed BB dump
 
-# 3. run the prototype lowering and diff against snapshots
-cd prototype && ./compare.sh
+# 3. run the reader/frontend regression tests that consume corpus.ullbc
+cargo test -p majit-charon-reader
+cargo test -p majit-translate --test test_mir_frontend
 ```
 
 ## Corpus
@@ -251,8 +240,8 @@ front-end has to reconstruct — this is where it lives.
 
 These were **not** checked into the repo (the `.ullbc` files are too
 large to commit), but the runs are reproducible from the commands
-below. The numbers were collected on the `charon` branch at the head
-of this spike.
+below. The numbers were collected on the `charon` branch during the
+initial extraction audit.
 
 #### `pyre-object`
 
@@ -309,13 +298,9 @@ These are intentionally **not** answered in Step 0:
   (especially `DictStrategy` and friends) to classify pre-refactor.
   That belongs in its own task.
 - ~~**MIR → `FunctionGraph` prototype** (issue Step 0, paragraph 2).~~
-  Landed under [`prototype/`](prototype/) — covers all four corpus
-  functions and produces the canonical text snapshots under
-  `prototype/expected/`. Comparison against the *real* AST front-end
-  output is documented in `prototype/README.md` as a per-construct
-  delta table rather than a direct text diff (the AST front-end is
-  built for interpreter code, not arbitrary Rust like the corpus, so
-  a head-to-head graph diff would be misleading at this scale).
+  The standalone prototype has been retired. The production MIR frontend
+  in `majit-translate::front::mir`, plus `majit-charon-reader::tests::corpus`
+  and `majit-translate::tests::test_mir_frontend`, now covers the corpus.
 - **`charon-lib` dependency from stable Rust.** Issue Step 2 wants the
   downstream consumer to use `serde`/`charon-lib`. Verify that
   `charon-lib` builds on our stable Rust toolchain (not the pinned
@@ -332,6 +317,6 @@ These are intentionally **not** answered in Step 0:
 | Pick representative corpus                                                 | done   |
 | Run Charon on corpus                                                       | done   |
 | Inspect `.llbc` for locals/places/constants/calls/trait resolution/terminators/discriminants/spans/unwind | done — see §2–§4 |
-| Minimal MIR → `FunctionGraph` prototype for 1–2 functions                  | done — covers all 4 corpus functions; see `prototype/` |
-| Comparison against AST front-end after canonical normalization             | done — `prototype/README.md` "Mapping table" + "Deltas" sections; canonical snapshots under `prototype/expected/` |
-| Checked-in notes / fixtures                                                | this README + `corpus/` + `corpus.ullbc` + `inspect_llbc.py` + `prototype/` |
+| Minimal MIR → `FunctionGraph` prototype for 1–2 functions                  | done — retired after production MIR frontend landed |
+| Comparison against AST front-end after canonical normalization             | superseded by `majit-translate::front::mir` regression tests |
+| Checked-in notes / fixtures                                                | this README + `corpus/` + `corpus.ullbc` + `inspect_llbc.py` |

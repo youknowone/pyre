@@ -243,7 +243,7 @@ fn auto_discover_workspace_llbc_paths(
     let llbc_dir = workspace_root.join("build").join("llbc");
     // Canonical production set.  `pyre-module.ullbc` is intentionally
     // omitted — it is empty in current builds and adds nothing.
-    // `corpus.ullbc` is the charon-spike fixture, not production.
+    // `corpus.ullbc` is the Charon fixture, not production.
     //
     // The set is fixed at exactly this pair so the generated
     // `all_jitcodes` table is environment-invariant: the build consumes
