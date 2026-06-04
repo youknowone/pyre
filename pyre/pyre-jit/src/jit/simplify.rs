@@ -1407,14 +1407,22 @@ mod tests {
         start.borrow_mut().exitswitch = Some(ExitSwitch::Value(Constant::bool(true).into()));
         let link_true =
             Link::new(vec![], Some(fwd.clone()), Some(Constant::bool(true).into())).into_ref();
-        let link_false =
-            Link::new(vec![], Some(dead_arm.clone()), Some(Constant::bool(false).into()))
-                .into_ref();
+        let link_false = Link::new(
+            vec![],
+            Some(dead_arm.clone()),
+            Some(Constant::bool(false).into()),
+        )
+        .into_ref();
         start.closeblock(vec![link_true, link_false]);
 
         fwd.closeblock(vec![Link::new(vec![], Some(tail.clone()), None).into_ref()]);
         tail.closeblock(vec![
-            Link::new(vec![Constant::signed(0).into()], Some(returnblock.clone()), None).into_ref(),
+            Link::new(
+                vec![Constant::signed(0).into()],
+                Some(returnblock.clone()),
+                None,
+            )
+            .into_ref(),
         ]);
         dead_arm.closeblock(vec![
             Link::new(vec![Constant::signed(0).into()], Some(returnblock), None).into_ref(),

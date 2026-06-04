@@ -2227,7 +2227,12 @@ fn build_class_inner(
     let classcell = {
         let class_ns = unsafe { &mut *class_ns_ptr };
         let cell = class_ns.get("__classcell__").copied();
-        for key in ["__class__", "__classdict__", "__classcell__", "__classdictcell__"] {
+        for key in [
+            "__class__",
+            "__classdict__",
+            "__classcell__",
+            "__classdictcell__",
+        ] {
             class_ns.remove(key);
         }
         cell

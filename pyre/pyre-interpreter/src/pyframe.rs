@@ -1242,7 +1242,16 @@ impl PyFrame {
     #[inline]
     pub fn peekvalues(&self, n: usize) -> Vec<PyObjectRef> {
         let base = self.valuestackdepth - n;
-        self.assert_stack_index(base);
+        // Reads cover `[base, valuestackdepth)`; the highest index is
+        // `valuestackdepth - 1 < len`, so only the lower `base` bound needs
+        // guarding. When `n == 0` nothing is read and `base ==
+        // valuestackdepth` may equal `len` at peak depth, so skip the
+        // upper-bound `assert_stack_index` for the empty peek.
+        if n > 0 {
+            self.assert_stack_index(base);
+        } else {
+            debug_assert!(base >= self.stack_base());
+        }
         let mut values_w = vec![PY_NULL; n];
         let mut idx = n;
         while idx > 0 {
