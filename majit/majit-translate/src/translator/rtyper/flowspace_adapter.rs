@@ -912,11 +912,9 @@ pub fn translate_op(
             class_carrier,
             ..
         } => {
-            let obj_vid = operand_value_id(graph, obj, op, "obj")?;
-            let cls_vid = operand_value_id(graph, class_carrier, op, "class_carrier")?;
-            let obj_hl = lookup_operand(value_map, obj_vid, op, "obj")?;
-            let cls_hl = lookup_operand(value_map, cls_vid, op, "class_carrier")?;
-            let result = resolve_result_hlvalue(op, value_map, graph)?;
+            let obj_hl = lookup_operand(value_map, obj, op, "obj")?;
+            let cls_hl = lookup_operand(value_map, class_carrier, op, "class_carrier")?;
+            let result = resolve_result_hlvalue(op, value_map)?;
             Ok(vec![FlowspaceOp::new(
                 "isinstance",
                 vec![obj_hl, cls_hl],
