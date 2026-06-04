@@ -1231,8 +1231,8 @@ fn analyze_pipeline_from_parsed(
         // the callee graph (`funcptr._obj.TO.RESULT`), matching the
         // free-function and trait-method registration paths above.
         let graph = match &method_info.return_type {
-            Some(rt) => method_info.graph.clone().with_return_type(rt),
-            None => method_info.graph.clone(),
+            Some(rt) => graph.with_return_type(rt),
+            None => graph,
         };
         if method_info.hints.is_empty() {
             call_control.register_function_graph(path.clone(), graph);
