@@ -3505,6 +3505,33 @@ mod tests {
     }
 
     #[test]
+    fn test_make_cell_closure_over_parameter_not_double_wrapped() {
+        // An argument slot promoted to a cellvar (captured by an inner
+        // function) must wrap to a single cell, not a cell-of-cell, so the
+        // closure reads the value rather than an inner cell.
+        let (_result, frame) = run_exec_frame(
+            "def make_adder(n):\n    def add(x):\n        return x + n\n    return add\nresult = make_adder(10)(5)",
+        );
+        let w_globals = unsafe { &*frame.fget_w_globals() };
+        let result = *w_globals.get("result").expect("missing result");
+        assert_eq!(unsafe { pyre_object::w_int_get_value(result) }, 15);
+    }
+
+    #[test]
+    fn test_make_cell_class_cell_super_not_double_wrapped() {
+        // The implicit `__class__` cellvar is never reassigned in the body,
+        // so MAKE_CELL must leave the pre-installed cell alone; a
+        // cell-of-cell would make zero-arg super() resolve an inner cell
+        // instead of the class.
+        let (_result, frame) = run_exec_frame(
+            "class A:\n    def f(self):\n        return 1\nclass B(A):\n    def f(self):\n        return 10 + super().f()\nresult = B().f()",
+        );
+        let w_globals = unsafe { &*frame.fget_w_globals() };
+        let result = *w_globals.get("result").expect("missing result");
+        assert_eq!(unsafe { pyre_object::w_int_get_value(result) }, 11);
+    }
+
+    #[test]
     fn test_raise_invalid_cause_raises_typeerror() {
         let (result, _frame) = run_exec_frame("raise ValueError() from 1");
         let err = result.expect_err("invalid cause should fail");
