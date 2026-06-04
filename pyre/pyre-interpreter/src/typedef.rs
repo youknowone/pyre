@@ -2277,9 +2277,17 @@ fn init_dict_type(ns: &mut DictStorage) {
                 if args.is_empty() {
                     return Ok(pyre_object::w_str_new("{}"));
                 }
-                let dict = crate::type_methods::resolve_dict_backing(args[0]);
+                let recv = args[0];
+                let dict = crate::type_methods::resolve_dict_backing(recv);
                 if dict.is_null() {
-                    return Ok(pyre_object::w_str_new("{}"));
+                    // Unbound `dict.__repr__(x)` on a non-dict receiver —
+                    // reject it like a builtin descriptor rather than
+                    // formatting an empty `{}`.
+                    let tp_name = unsafe { (*(*recv).ob_type).name };
+                    return Err(crate::PyError::type_error(format!(
+                        "descriptor '__repr__' for 'dict' objects \
+                         doesn't apply to a '{tp_name}' object"
+                    )));
                 }
                 unsafe { Ok(pyre_object::w_str_new(&crate::display::dict_repr(dict))) }
             },
