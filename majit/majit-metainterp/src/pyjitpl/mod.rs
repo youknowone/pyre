@@ -6826,7 +6826,10 @@ impl<M: Clone> MetaInterp<M> {
                 let is_invalid_loop =
                     self.note_jit_panic_or_reraise(payload, "compile_simple_loop", green_key);
                 if is_invalid_loop && crate::majit_log_enabled() {
-                    eprintln!("[jit] compile_simple_loop: InvalidLoop at key={}", green_key);
+                    eprintln!(
+                        "[jit] compile_simple_loop: InvalidLoop at key={}",
+                        green_key
+                    );
                 }
                 // compile.py:228-230: trace.cut_at(cut_at); return None
                 self.warm_state.abort_tracing(green_key, false);

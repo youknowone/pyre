@@ -171,6 +171,21 @@ pub enum Forwarded {
     /// `optimizeopt/info.py:17 AbstractInfo (is_info_class = True)` family —
     /// `PtrInfo`, `IntBound`, `FloatConstInfo`, `EmptyInfo`, etc.
     Info(OpInfo),
+    // There is deliberately NO `VectorInfo` variant. Vectorizer scheduling
+    // scratch (`schedule.py:20-28 forwarded_vecinfo`) lives in the pos/OpRef-
+    // keyed `VecScheduleState.vecinfo_cache` (optimizeopt/schedule.rs), not in
+    // a `_forwarded` slot, on purpose: `Op::clone` resets `forwarded` to
+    // `None` (fresh identity) while preserving `pos`, and the scheduler reads
+    // vecinfo off cloned ops, so a `_forwarded`-borne scratch clone-drops and
+    // silently miscomputes INT_SIGNEXT (its dynamic arg1 bytesize resolves
+    // only at setup time through the const resolver that the bare
+    // `vectorization_info_for_op` reader does not hold). Loop `InputArg`
+    // operands also own no per-op vecinfo slot, so an OpRef-keyed cache is
+    // required regardless. `Op.vecinfo` (resoperation.rs) is the SEPARATE
+    // permanent `resoperation.py:511-518` VecOp datatype/bytesize/signed/count
+    // store and stays. Reviews recurringly flag the cache as a `_forwarded`
+    // parity regression — it is the clone-stable successor to the retired
+    // opref-keyed box_pool, not a regression; do not restore.
 }
 
 /// `Rc<Box>` newtype.
