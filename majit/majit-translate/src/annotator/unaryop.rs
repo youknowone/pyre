@@ -3665,6 +3665,137 @@ fn init_someinstance_overrides(
             can_only_throw: CanOnlyThrow::List(vec![]),
         },
     );
+    // unaryop.py:844-859 — SomeInstance.setattr.
+    //
+    //   def setattr(self, s_attr, s_obj):
+    //       if s_attr.is_constant() and isinstance(s_attr.const, str):
+    //           attr = s_attr.const
+    //           clsdef = self.classdef.locate_attribute(attr)
+    //           attrdef = clsdef.attrs[attr]
+    //           attrdef.modified(clsdef)
+    //           if attrdef.s_value.contains(s_obj):
+    //               return
+    //           clsdef.generalize_attr(attr, s_obj)
+    //           if isinstance(s_obj, SomeList):
+    //               clsdef.classdesc.maybe_return_immutable_list(attr, s_obj)
+    //       else:
+    //           raise AnnotatorError("setattr(instance, variable_attr, value)")
+    //
+    // The base `SomeObject.setattr` returns `s_ImpossibleValue`
+    // (unaryop.py:231-232); the void result is modelled as
+    // `SomeValue::Impossible`, the same shell the `SomeNone` setattr arm
+    // publishes.
+    register(
+        reg,
+        OpKind::SetAttr,
+        SomeValueTag::Instance,
+        Specialization {
+            apply: Box::new(|ann, hl| {
+                let s_self = ann
+                    .annotation(&hl.args[0])
+                    .expect("instance.setattr: self unbound");
+                let s_attr = ann
+                    .annotation(&hl.args[1])
+                    .expect("instance.setattr: attr unbound");
+                let s_obj = ann
+                    .annotation(&hl.args[2])
+                    .expect("instance.setattr: value unbound");
+                let inst = match &s_self {
+                    SomeValue::Instance(inst) => inst.clone(),
+                    other => panic!(
+                        "AnnotatorError: SomeInstance.setattr dispatched on non-instance: {:?}",
+                        other
+                    ),
+                };
+                // unaryop.py:845,858 — `if s_attr.is_constant() and
+                // isinstance(s_attr.const, str): … else: raise`.
+                let attr = s_attr
+                    .const_()
+                    .and_then(ConstValue::as_pystr)
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "AnnotatorError: setattr(instance, variable_attr, value): {:?}",
+                            s_attr
+                        )
+                    });
+                let classdef = match inst.classdef.as_ref() {
+                    Some(cd) => cd.clone(),
+                    None => {
+                        // A classdef-less `SomeInstance` (pyre pointer erasure;
+                        // see the getattr arm above) has no `ClassDef` to record
+                        // the write on.  Stays fail-loud like getattr's non-
+                        // `is_null` arm — a cast-narrowed receiver carries its
+                        // struct-root classdef (front-end pointer-downcast carry),
+                        // so a writable instance reaches here with a populated
+                        // classdef.
+                        panic!(
+                            "AnnotatorError: SomeInstance.setattr({:?}) on classdef-less instance",
+                            attr
+                        )
+                    }
+                };
+                // unaryop.py:847 — `clsdef = self.classdef.locate_attribute(attr)`.
+                let clsdef = super::classdesc::ClassDef::locate_attribute(&classdef, &attr)
+                    .unwrap_or_else(|err| {
+                        panic!(
+                            "AnnotatorError: SomeInstance.setattr({attr:?}) \
+                             locate_attribute failed: {err:?}"
+                        )
+                    });
+                // unaryop.py:848-852 — `attrdef = clsdef.attrs[attr];
+                // attrdef.modified(clsdef); if attrdef.s_value.contains(s_obj):
+                // return`.
+                let already_contains = {
+                    let mut clsdef_mut = clsdef.borrow_mut();
+                    let attrdef = clsdef_mut.attrs.get_mut(&attr).unwrap_or_else(|| {
+                        panic!(
+                            "AnnotatorError: SomeInstance.setattr({attr:?}) \
+                             attr absent after locate_attribute"
+                        )
+                    });
+                    attrdef.modified(Some(&clsdef)).unwrap_or_else(|err| {
+                        panic!(
+                            "AnnotatorError: SomeInstance.setattr({attr:?}) \
+                             modified failed: {err:?}"
+                        )
+                    });
+                    attrdef.s_value.contains(&s_obj)
+                };
+                if !already_contains {
+                    // unaryop.py:854 — `clsdef.generalize_attr(attr, s_obj)`.
+                    super::classdesc::ClassDef::generalize_attr(
+                        &clsdef,
+                        &attr,
+                        Some(s_obj.clone()),
+                    )
+                    .unwrap_or_else(|err| {
+                        panic!(
+                            "AnnotatorError: SomeInstance.setattr({attr:?}) \
+                             generalize_attr failed: {err:?}"
+                        )
+                    });
+                    // unaryop.py:856-857 — `if isinstance(s_obj, SomeList):
+                    // clsdef.classdesc.maybe_return_immutable_list(attr, s_obj)`.
+                    if matches!(s_obj, SomeValue::List(_)) {
+                        let classdesc = clsdef.borrow().classdesc.clone();
+                        super::classdesc::ClassDesc::maybe_return_immutable_list(
+                            &classdesc, &attr, &s_obj,
+                        )
+                        .unwrap_or_else(|err| {
+                            panic!(
+                                "AnnotatorError: SomeInstance.setattr({attr:?}) \
+                                 maybe_return_immutable_list failed: {err:?}"
+                            )
+                        });
+                    }
+                }
+                // unaryop.py base returns `s_ImpossibleValue` (void).
+                SomeValue::Impossible
+            }),
+            can_only_throw: CanOnlyThrow::Absent,
+        },
+    );
 }
 
 // =====================================================================
