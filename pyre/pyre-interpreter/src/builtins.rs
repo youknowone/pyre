@@ -1466,10 +1466,21 @@ fn type_descr_new_with_metaclass(
         // walks correctly.
         let mut class_ns = Box::new(crate::DictStorage::new());
         class_ns.fix_ptr();
+        // type_new_classcell — capture the `__classcell__` cell and keep
+        // both explicit class cells out of the new type's `__dict__`
+        // (CPython consumes them here rather than storing them).
+        let mut classcell = pyre_object::PY_NULL;
         if unsafe { is_dict(w_namespace_dict) } {
             for (k, v) in unsafe { pyre_object::w_dict_items(w_namespace_dict) } {
                 if unsafe { is_str(k) } {
                     let key = unsafe { pyre_object::w_str_get_value(k) };
+                    if key == "__classcell__" {
+                        classcell = v;
+                        continue;
+                    }
+                    if key == "__classdictcell__" {
+                        continue;
+                    }
                     crate::dict_storage_store(&mut class_ns, key, v);
                 }
             }
@@ -1531,6 +1542,13 @@ fn type_descr_new_with_metaclass(
         // `weak_subclasses` so `mutated()` and `__subclasses__()`
         // observe this class.
         unsafe { pyre_object::typeobject::w_type_ready(w_type) };
+
+        // type_new_classcell — bind the captured `__classcell__` to the
+        // new type so `__class__` / zero-arg `super()` in the methods
+        // resolve; the key was already dropped from the namespace above.
+        if !classcell.is_null() && unsafe { pyre_object::is_cell(classcell) } {
+            unsafe { pyre_object::w_cell_set(classcell, w_type) };
+        }
 
         // __set_name__ protocol — CPython: type_new_set_names
         // PyPy: typeobject.py type_new → call __set_name__(owner, name) on each descriptor.

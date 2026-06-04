@@ -2218,23 +2218,20 @@ fn build_class_inner(
     frame.execute_frame(None, None)?;
 
     // type_new_classcell (typeobject.c) — capture the `__classcell__` cell
-    // so its content can be set to the new class below, then drop the
-    // compiler-internal scaffolding from the namespace so it never reaches
-    // the class `__dict__`.  `__class__` / `__classdict__` are cellvar
-    // names that `fast2locals` mirrors in; `__classcell__` /
-    // `__classdictcell__` are the cells the class body stores explicitly.
-    // CPython leaves none of them in the class dict.
+    // so its content can be set to the new class below.  `__class__` /
+    // `__classdict__` are cellvar names that `fast2locals` mirrors into
+    // the namespace; CPython never exposes them as namespace keys, so drop
+    // them now before a metaclass or the class dict ever sees them.
+    // `__classcell__` / `__classdictcell__` ARE real namespace entries the
+    // class body stores explicitly: a custom metaclass observes them
+    // (type.__new__ receives the full namespace) and `type.__new__`
+    // (type_new_classcell) consumes them, so they are dropped per
+    // construction path below rather than up front.
     let classcell = {
         let class_ns = unsafe { &mut *class_ns_ptr };
         let cell = class_ns.get("__classcell__").copied();
-        for key in [
-            "__class__",
-            "__classdict__",
-            "__classcell__",
-            "__classdictcell__",
-        ] {
-            class_ns.remove(key);
-        }
+        class_ns.remove("__class__");
+        class_ns.remove("__classdict__");
         cell
     };
 
@@ -2324,6 +2321,15 @@ fn build_class_inner(
         }
         result
     } else {
+        // No metaclass observes the namespace on the default path, so
+        // consume the explicit class cells here (type_new_classcell leaves
+        // them out of the class `__dict__`); the captured `classcell` is
+        // bound to the new type below.
+        unsafe {
+            let class_ns = &mut *class_ns_ptr;
+            class_ns.remove("__classcell__");
+            class_ns.remove("__classdictcell__");
+        }
         let w = pyre_object::w_type_new(name, w_effective_bases, class_ns_ptr as *mut u8);
         // typeobject.py:1143-1204 create_all_slots parity.
         unsafe {
