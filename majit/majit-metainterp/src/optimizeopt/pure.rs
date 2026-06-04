@@ -783,8 +783,15 @@ impl Default for OptPure {
 
 impl OptPure {
     fn force_box(&mut self, opref: OpRef, ctx: &mut OptContext) -> OpRef {
-        let resolved = ctx.get_box_replacement(opref);
+        // Single resolve through the BoxRef terminal; the OpRef view is the
+        // terminal's `to_opref()` (keystone equivalence, #113), so the prior
+        // paired `get_box_replacement` + `get_box_replacement_box` of the
+        // same `opref` was a redundant double walk.
         let resolved_box = ctx.get_box_replacement_box(opref);
+        let resolved = resolved_box
+            .as_ref()
+            .map(|b| b.to_opref())
+            .unwrap_or(opref);
         if resolved_box.as_ref().map_or(false, |b| ctx.is_virtual(b)) {
             let resolved_box = resolved_box.expect("recorder-populated");
             let mut info = ctx.take_ptr_info(&resolved_box).unwrap();
