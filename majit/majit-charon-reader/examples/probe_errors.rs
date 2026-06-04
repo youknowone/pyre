@@ -58,8 +58,11 @@ fn msg(e: &str) -> &str {
 
 fn short_sample(v: &serde_json::Value) -> String {
     let s = serde_json::to_string(v).unwrap_or_default();
-    if s.len() > 240 {
-        format!("{}…", &s[..240])
+    // Truncate on a char boundary: `&s[..240]` would panic if byte 240
+    // splits a multibyte UTF-8 scalar (serde_json emits raw UTF-8).
+    if s.chars().count() > 240 {
+        let prefix: String = s.chars().take(240).collect();
+        format!("{prefix}…")
     } else {
         s
     }
