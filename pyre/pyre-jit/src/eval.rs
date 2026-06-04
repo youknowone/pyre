@@ -5694,7 +5694,7 @@ pub(crate) fn decode_and_restore_guard_failure(
     // `rd_numb` here indicates an unported guard-emission site — hard
     // assert so the gap surfaces rather than silently degrade via a
     // pyre-only single-frame synthesis.
-    {
+    let resumed_frames = {
         // compile.py:853 `ResumeGuardDescr` storage — borrow rd_numb /
         // rd_consts from the guard-owned shared Arc instead of a
         // per-guard Vec copy.
@@ -5707,18 +5707,19 @@ pub(crate) fn decode_and_restore_guard_failure(
             "rebuild_guard_fail_state: storage.rd_numb is empty (fail_index={})",
             exit_layout.fail_index
         );
-        // build_resumed_frames is driven only for its side effect: the
         // GuardFailureSync mode writes the captured vable boxes back onto
         // the physical frame (see comment above). The decoded frame chain
-        // itself is unused on the guard-failure path.
+        // is also consumed below to recover the innermost frame's section
+        // pc (its resume opcode), which the full-body walk does not track
+        // in the vable `last_instr` field.
         build_resumed_frames(
             raw_values,
             storage.rd_numb.as_slice(),
             storage.rd_consts(),
             exit_layout,
             ResumeVableMode::GuardFailureSync,
-        );
-    }
+        )
+    };
 
     // virtualizable.py:126: write fields from resumedata to frame.
     let restored = jit_state.restore_guard_failure_values(meta, &typed, &ExceptionState::default());
@@ -5742,12 +5743,9 @@ pub(crate) fn decode_and_restore_guard_failure(
         // match (the frame's `last_instr` tracks the Python pc), so this is
         // a no-op there.
         let ni = jit_state.next_instr();
-        let resume_pc = LAST_GUARD_FRAMES
-            .with(|c| {
-                c.borrow()
-                    .as_ref()
-                    .and_then(|frames| frames.last().map(|f| f.py_pc))
-            })
+        let resume_pc = resumed_frames
+            .last()
+            .map(|f| f.py_pc)
             .filter(|&section_pc| section_pc != ni)
             .unwrap_or(ni);
         Some((typed, resume_pc))
