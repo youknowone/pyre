@@ -9330,15 +9330,6 @@ impl CodeWriter {
         // `simplify.rs`).
         eliminate_empty_blocks(&graph);
         super::simplify::constfold_exitswitch(&graph);
-        // remove_trivial_links merges single-entry/single-exit chains; the
-        // merge bridge relocates each merged target's inline per_block_ssarepr
-        // into its surviving source so the drain keeps the opcodes (issue #73).
-        let trivial_link_merges = super::simplify::remove_trivial_links_recording(&graph);
-        rewrite_trivial_link_merges(
-            &trivial_link_merges,
-            &all_walker_blocks,
-            &mut walker_pc_live_marker_pos,
-        );
         // Port-boundary guard: after the collapse, no link reachable from
         // the startblock may still target a dead forwarder.  RPython has
         // no equivalent check (its graph is simplified before flatten),
@@ -9358,7 +9349,27 @@ impl CodeWriter {
                 );
             }
         }
+        // Byte-stream companion to `eliminate_empty_blocks`: retarget the
+        // walker's inline-emitted gotos that still name a collapsed dead
+        // forwarder to the surviving generalization.  MUST run before the
+        // merge bridge below: for a `source -> dead_forwarder -> target`
+        // shape `remove_trivial_links` records the merge `(source, target)`,
+        // but the source block's boundary terminator still reads
+        // `goto TLabel(dead_forwarder)` until this rewrite — so the merge
+        // strip (which looks for `block_label_name(target)`) would miss it
+        // and leave the stale terminator in front of the absorbed target
+        // opcodes, letting the single-exit renaming splice land before
+        // them (codex P2, PR #130).
         rewrite_dead_forwarder_gotos(&all_walker_blocks);
+        // remove_trivial_links merges single-entry/single-exit chains; the
+        // merge bridge relocates each merged target's inline per_block_ssarepr
+        // into its surviving source so the drain keeps the opcodes (issue #73).
+        let trivial_link_merges = super::simplify::remove_trivial_links_recording(&graph);
+        rewrite_trivial_link_merges(
+            &trivial_link_merges,
+            &all_walker_blocks,
+            &mut walker_pc_live_marker_pos,
+        );
 
         // Drain per-block accumulators into ssarepr.insns in
         // walker-block-creation order.  Mirrors `codewriter.py:53
