@@ -1609,6 +1609,24 @@ fn build_canonical_opcode_dispatch(
         front::mir_dispatch::extract_opcode_dispatch_arms_from_mir(program),
     );
 
+    // Fail loud when the interpreter is present but the dispatch table is
+    // empty.  `extract_opcode_dispatch_arms_from_mir` returns an empty
+    // vector both for a legitimately interpreter-free LLBC set and for a
+    // present-but-unrecognised dispatcher (missing `execute_opcode_step`
+    // or a non-`Value`-switch start block).  The latter would silently
+    // ship an opcode-less, non-functional JIT, so gate the emptiness on
+    // the interpreter fingerprint: the `Instruction` enum is the same
+    // signal the extractor itself keys on (front::mir_dispatch).
+    assert!(
+        !opcode_arms.is_empty()
+            || !program
+                .enum_variant_by_discriminant
+                .contains_key("Instruction"),
+        "opcode dispatch is empty but the interpreter `Instruction` enum is \
+         present: `execute_opcode_step` or its discriminant switch is missing \
+         (front::mir_dispatch::extract_opcode_dispatch_arms_from_mir)"
+    );
+
     // RPython codewriter.py:74-89: make_jitcodes().
     //
     // `Arc<JitCode>` shells live in `CallControl::jitcodes`; the drain loop
