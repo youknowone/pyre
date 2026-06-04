@@ -1287,7 +1287,12 @@ impl<'a> Lowering<'a> {
                     segments: vec!["__str_const".to_string(), s],
                 },
                 args: vec![],
-                result_ty: ValueType::Int,
+                // A `&str` / `&[u8]` literal lowers to `Ptr(STR)` (getkind
+                // `r`), so the synthetic call's result kind is a Ref, not an
+                // Int.  The `__str_const` path is never registered, so this
+                // call always residualises; correcting `result_ty` fixes the
+                // residual result kind without changing behaviour today.
+                result_ty: ValueType::Ref(None),
             },
             DecodedConst::FnPath(segments) => OpKind::Call {
                 target: CallTarget::FunctionPath { segments },
