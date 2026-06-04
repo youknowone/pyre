@@ -16,8 +16,6 @@
 //! no `syn` dependency: callers hand them the already-extracted
 //! `(param name, ValueType)` prologue and the shape data.
 
-use std::collections::HashMap;
-
 use crate::flowspace::model::Variable;
 use crate::model::{CallTarget, FunctionGraph, OpKind, UnsupportedLiteralKind, ValueType};
 use crate::parse::CallPath;
@@ -50,17 +48,19 @@ pub(crate) struct RaiseStubReturn {
 
 /// Push one `OpKind::Input` per dispatcher parameter (in order, typed by
 /// the caller) as the startblock inputargs — the shared prologue of
-/// every synthesized opcode-arm wrapper.  Returns the param-name → var
-/// map so a tail-call builder can forward the requested subset.  The
+/// every synthesized opcode-arm wrapper.  Returns the ordered
+/// `(param-name, var)` pairs so a tail-call builder can forward the
+/// requested subset by a linear scan over the fixed dispatcher param
+/// list (the same shape as `mir_dispatch`'s `input_names`).  The
 /// runtime seeds the dispatch entry from the full dispatcher register
 /// layout, so a wrapper must keep every dispatcher param as an inputarg
 /// even when the body reads only a subset (or none).
 fn push_dispatcher_inputargs(
     graph: &mut FunctionGraph,
     params: &[(String, ValueType)],
-) -> HashMap<String, Variable> {
+) -> Vec<(String, Variable)> {
     let block = graph.startblock;
-    let mut param_vars: HashMap<String, Variable> = HashMap::new();
+    let mut param_vars: Vec<(String, Variable)> = Vec::with_capacity(params.len());
     for (pname, pty) in params {
         if let Some(var) = graph.push_op_var(
             block,
@@ -73,7 +73,7 @@ fn push_dispatcher_inputargs(
         ) {
             graph.name_value_var(&var, pname.clone());
             graph.push_inputarg_var(block, var.clone());
-            param_vars.insert(pname.clone(), var);
+            param_vars.push((pname.clone(), var));
         }
     }
     param_vars
@@ -96,12 +96,16 @@ pub(crate) fn build_tail_call_wrapper(
     let args: Vec<Variable> = forwarded
         .iter()
         .map(|pname| {
-            param_vars.get(pname).cloned().unwrap_or_else(|| {
-                panic!(
-                    "opcode arm `{name}`: tail-call forwards `{pname}`, \
-                     which is not a dispatcher parameter"
-                )
-            })
+            param_vars
+                .iter()
+                .find(|(n, _)| n == pname)
+                .map(|(_, v)| v.clone())
+                .unwrap_or_else(|| {
+                    panic!(
+                        "opcode arm `{name}`: tail-call forwards `{pname}`, \
+                         which is not a dispatcher parameter"
+                    )
+                })
         })
         .collect();
     let result = graph.push_op_var(
