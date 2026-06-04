@@ -357,6 +357,18 @@ fn real_main() {
     );
     println!("cargo::rerun-if-changed=src/virtualizable_spec.rs");
     println!("cargo::rerun-if-changed=src/call_spec.rs");
+    // The active (mir-frontend) analysis derives `jit_trace_gen.rs` from
+    // the workspace LLBC artefacts — or the `PYRE_MIR_FRONTEND_LLBC`
+    // override — none of which are `.rs` sources covered above.  Track
+    // them so re-extracting the ullbc (scripts/extract-llbc.sh) or
+    // repointing the override invalidates the cached generated trace
+    // instead of silently reusing a stale one.  A `rerun-if-changed` on
+    // a not-yet-present path is harmless (Cargo reruns when it appears),
+    // so this is safe on a contributor tree without the artefacts.
+    println!("cargo::rerun-if-env-changed=PYRE_MIR_FRONTEND_LLBC");
+    for llbc in ["pyre-object.ullbc", "pyre-interpreter.ullbc"] {
+        println!("cargo::rerun-if-changed={repo_root}/build/llbc/{llbc}");
+    }
 }
 
 fn build_call_effect_overrides() -> Vec<majit_translate::CallEffectOverride> {
