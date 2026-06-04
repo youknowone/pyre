@@ -5406,24 +5406,16 @@ impl MIFrame {
                     })
                 };
                 if args.len() == 1 && canonical_list_method("append") == Some(inner_func) {
-                    // Do not replace this with `list_append_value` until
-                    // guard-failure blackhole resume is complete.  A direct
-                    // trace-visible append/pop port looks closer to PyPy, but
-                    // currently corrupts semantics: `python3 pyre/check.py
-                    // --synthetic-only --synthetic-pattern list_append_pop.py`
-                    // reports wrong output on both dynasm and cranelift when
-                    // these aborts are removed.
-                    return Err(trace_abort_error(
-                        "abort tracing builtin list.append until guard-failure blackhole resume is complete",
-                    ));
+                    let self_ref = recover_self(self);
+                    self.list_append_value(self_ref, args[0], inner_self, concrete_args[0])?;
+                    let none_ref =
+                        self.with_ctx(|_this, ctx| ctx.const_ref(pyre_object::w_none() as i64));
+                    return Ok(none_ref);
                 }
                 if args.len() == 0 && canonical_list_method("pop") == Some(inner_func) {
-                    // Keep in sync with the append guard above. Removing this
-                    // abort caused `synth/list_append_pop` correctness
-                    // failures during the PyPy-parity audit.
-                    return Err(trace_abort_error(
-                        "abort tracing builtin list.pop until guard-failure blackhole resume is complete",
-                    ));
+                    let self_ref = recover_self(self);
+                    let concrete_len = unsafe { w_list_len(inner_self) };
+                    return self.list_pop_value(callable, self_ref, inner_self, concrete_len);
                 }
                 if args.len() == 0 && canonical_list_method("reverse") == Some(inner_func) {
                     let self_ref = recover_self(self);
@@ -5466,28 +5458,18 @@ impl MIFrame {
                     && !concrete_args.first().copied().unwrap_or(PY_NULL).is_null()
                     && is_list(concrete_args[0])
                 {
-                    // Do not replace this with `list_append_value` until
-                    // guard-failure blackhole resume is complete.  A direct
-                    // trace-visible append/pop port looks closer to PyPy, but
-                    // currently corrupts semantics: `python3 pyre/check.py
-                    // --synthetic-only --synthetic-pattern list_append_pop.py`
-                    // reports wrong output on both dynasm and cranelift when
-                    // these aborts are removed.
-                    return Err(trace_abort_error(
-                        "abort tracing builtin list.append until guard-failure blackhole resume is complete",
-                    ));
+                    self.list_append_value(args[0], args[1], concrete_args[0], concrete_args[1])?;
+                    let none_ref =
+                        self.with_ctx(|_this, ctx| ctx.const_ref(pyre_object::w_none() as i64));
+                    return Ok(none_ref);
                 }
                 if args.len() == 1
                     && canonical_list_method("pop") == Some(concrete_callable)
                     && !concrete_args.first().copied().unwrap_or(PY_NULL).is_null()
                     && is_list(concrete_args[0])
                 {
-                    // Keep in sync with the append guard above. Removing this
-                    // abort caused `synth/list_append_pop` correctness
-                    // failures during the PyPy-parity audit.
-                    return Err(trace_abort_error(
-                        "abort tracing builtin list.pop until guard-failure blackhole resume is complete",
-                    ));
+                    let concrete_len = unsafe { w_list_len(concrete_args[0]) };
+                    return self.list_pop_value(callable, args[0], concrete_args[0], concrete_len);
                 }
                 if args.len() == 1
                     && canonical_list_method("reverse") == Some(concrete_callable)
