@@ -13,7 +13,12 @@ use pyre_object::PyObjectRef;
 /// executioncontext.py:436-441 `space.getexecutioncontext().checksignals()`
 /// — deliver a signal that may have arrived during a syscall.  Resolves
 /// the live EC from the thread-local slot (`getexecutioncontext`).
-fn checksignals_now() -> Result<(), crate::PyError> {
+///
+/// Called from EINTR retry branches in the blocking-IO modules (socket,
+/// select / poll, kqueue, time.sleep, `_multiprocessing` semaphores) so a
+/// signal received mid-syscall runs its handler and propagates
+/// (e.g. `KeyboardInterrupt`) instead of being swallowed by the retry.
+pub fn checksignals_now() -> Result<(), crate::PyError> {
     let ec = crate::call::getexecutioncontext() as *mut ExecutionContext;
     if ec.is_null() {
         return Ok(());

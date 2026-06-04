@@ -316,8 +316,7 @@ pub unsafe fn py_repr(obj: PyObjectRef) -> String {
                 // resolves `__repr__` to `object` — fall through to the
                 // tuple formatting in that case rather than printing the
                 // generic `<object at ...>`.
-                if let Some((src, method)) =
-                    crate::baseobjspace::lookup_where(w_class, "__repr__")
+                if let Some((src, method)) = crate::baseobjspace::lookup_where(w_class, "__repr__")
                 {
                     if !std::ptr::eq(src, crate::typedef::w_object()) && !method.is_null() {
                         let r = crate::call_function(method, &[obj]);

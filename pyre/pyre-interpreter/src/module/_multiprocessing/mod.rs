@@ -38,6 +38,9 @@ crate::py_class! {
             // EAGAIN (only meaningful for trywait) yields False and the
             // remaining errnos propagate as OSError instead of being
             // silently mapped to False.
+            // `interp_semaphore.py:378-397 semlock_acquire` — on EINTR deliver
+            // a pending signal then retry; on success deliver one too before
+            // returning (`_check_signals(space)`).
             if blocking {
                 loop {
                     let r = unsafe { libc::sem_wait(handle) };
@@ -46,19 +49,23 @@ crate::py_class! {
                     }
                     let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
                     if errno == libc::EINTR {
+                        crate::module::_signal::interp_signal::checksignals_now()?;
                         continue;
                     }
                     return Err(crate::PyError::os_error_with_errno(errno, "sem_wait"));
                 }
+                crate::module::_signal::interp_signal::checksignals_now()?;
                 Ok(true)
             } else {
                 loop {
                     let r = unsafe { libc::sem_trywait(handle) };
                     if r == 0 {
+                        crate::module::_signal::interp_signal::checksignals_now()?;
                         return Ok(true);
                     }
                     let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
                     if errno == libc::EINTR {
+                        crate::module::_signal::interp_signal::checksignals_now()?;
                         continue;
                     }
                     if errno == libc::EAGAIN {

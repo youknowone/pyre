@@ -79,6 +79,12 @@ fn parse_args(binary_name: &str) -> Result<(RunMode, bool, bool), lexopt::Error>
 }
 
 pub fn main_entry(binary_name: &'static str) {
+    // Block async signals on this (the process's original) thread so the
+    // kernel delivers process-directed signals to the interpreter thread
+    // spawned below, where they can interrupt blocking syscalls.  The
+    // interpreter thread inherits this mask and unblocks them at the top of
+    // `real_main`.
+    pyre_interpreter::module::_signal::signalstate::block_async_signals_on_origin_thread();
     std::thread::Builder::new()
         .stack_size(256 * 1024 * 1024)
         .spawn(|| real_main(binary_name))
@@ -88,6 +94,10 @@ pub fn main_entry(binary_name: &'static str) {
 }
 
 fn real_main(binary_name: &str) {
+    // Receive process-directed async signals on this thread (see
+    // `main_entry`) so blocking syscalls here are interrupted by Ctrl-C /
+    // alarms.
+    pyre_interpreter::module::_signal::signalstate::unblock_async_signals_on_interp_thread();
     // Suppress panic messages for InvalidLoop — these are caught by
     // catch_unwind in the JIT optimizer but the default panic hook still
     // prints to stderr, making it look like a crash.

@@ -69,12 +69,8 @@ pub fn signal_poll() -> i32 {
     while value != 0 {
         let j = value.trailing_zeros() as i32;
         let bit = 1i64 << j;
-        match SIG_PENDING.compare_exchange(
-            value,
-            value & !bit,
-            Ordering::SeqCst,
-            Ordering::SeqCst,
-        ) {
+        match SIG_PENDING.compare_exchange(value, value & !bit, Ordering::SeqCst, Ordering::SeqCst)
+        {
             Ok(_) => return j,
             Err(current) => value = current,
         }
@@ -150,6 +146,67 @@ pub fn pypysig_ignore(signum: i32) -> bool {
 /// unix target pyre builds for.
 #[cfg(unix)]
 pub fn pypysig_reinstall(_signum: i32) {}
+
+// ── interpreter-thread signal routing ──
+//
+// pyre runs the interpreter on a thread spawned by `pyrex::main_entry`
+// (for a large stack), not the process's original thread.  Process-directed
+// async signals (Ctrl-C `SIGINT`, `alarm` `SIGALRM`, `SIGTERM`, …) are
+// delivered by the kernel to an arbitrary thread that has them unblocked —
+// usually the original thread, which is parked in `join` — so a blocking
+// syscall on the interpreter thread is never interrupted.  Blocking the
+// async signals on the original thread and unblocking them on the
+// interpreter thread makes the interpreter thread the only eligible target,
+// so EINTR delivery (`checksignals` in the socket / select / sleep retry
+// loops) works.  Synchronous fault signals are left untouched — they must
+// reach whichever thread generated them.
+
+/// Build the set of signals routed to the interpreter thread: every signal
+/// except the synchronous fault signals.
+#[cfg(unix)]
+fn async_signal_set() -> libc::sigset_t {
+    unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigfillset(&mut set);
+        for exc in [
+            libc::SIGSEGV,
+            libc::SIGBUS,
+            libc::SIGFPE,
+            libc::SIGILL,
+            libc::SIGABRT,
+            libc::SIGTRAP,
+        ] {
+            libc::sigdelset(&mut set, exc);
+        }
+        set
+    }
+}
+
+/// Block the async signals on the calling thread — called on the process's
+/// original thread before the interpreter thread is spawned.
+#[cfg(unix)]
+pub fn block_async_signals_on_origin_thread() {
+    unsafe {
+        let set = async_signal_set();
+        libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
+    }
+}
+
+/// Unblock the async signals on the calling thread — called once on the
+/// interpreter thread so process-directed signals land here and interrupt
+/// its blocking syscalls.
+#[cfg(unix)]
+pub fn unblock_async_signals_on_interp_thread() {
+    unsafe {
+        let set = async_signal_set();
+        libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut());
+    }
+}
+
+#[cfg(not(unix))]
+pub fn block_async_signals_on_origin_thread() {}
+#[cfg(not(unix))]
+pub fn unblock_async_signals_on_interp_thread() {}
 
 #[cfg(not(unix))]
 pub fn pypysig_setflag(_signum: i32) -> bool {

@@ -190,6 +190,9 @@ impl W_Kqueue {
             }
             let e = std::io::Error::last_os_error();
             if e.raw_os_error() == Some(libc::EINTR) {
+                // `interp_kqueue.py:223-226` — deliver a pending signal, then
+                // retry with the remaining timeout recomputed.
+                crate::module::_signal::interp_signal::checksignals_now()?;
                 if let Some(dl) = deadline {
                     let now = std::time::Instant::now();
                     let rem = if now >= dl {

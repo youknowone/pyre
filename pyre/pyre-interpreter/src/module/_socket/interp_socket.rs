@@ -2537,6 +2537,9 @@ fn init_socket_type(ns: &mut DictStorage) {
                     if err.raw_os_error() != Some(libc::EINTR) {
                         return Err(socket_io_err(err));
                     }
+                    // EINTR: deliver a pending signal, then retry
+                    // (`converted_error` eintr_retry).
+                    crate::module::_signal::interp_signal::checksignals_now()?;
                 };
                 // `rsocket.py:RSocket._accept` returns the new fd with
                 // FD_CLOEXEC set (rsocket uses accept4(SOCK_CLOEXEC) on
@@ -2578,6 +2581,9 @@ fn init_socket_type(ns: &mut DictStorage) {
                     if err.raw_os_error() != Some(libc::EINTR) {
                         return Err(socket_io_err(err));
                     }
+                    // EINTR: deliver a pending signal, then retry
+                    // (`converted_error` eintr_retry).
+                    crate::module::_signal::interp_signal::checksignals_now()?;
                 };
                 unsafe {
                     libc::fcntl(cfd, libc::F_SETFD, libc::FD_CLOEXEC);
@@ -2616,6 +2622,9 @@ fn init_socket_type(ns: &mut DictStorage) {
                     if err.raw_os_error() != Some(libc::EINTR) {
                         return Err(socket_io_err(err));
                     }
+                    // EINTR: deliver a pending signal, then retry
+                    // (`converted_error` eintr_retry).
+                    crate::module::_signal::interp_signal::checksignals_now()?;
                 }
                 Ok(pyre_object::w_none())
             },
@@ -2652,6 +2661,9 @@ fn init_socket_type(ns: &mut DictStorage) {
                     if e != libc::EINTR {
                         break e;
                     }
+                    // `interp_socket.py:391` — deliver a pending signal, then
+                    // retry the connect.
+                    crate::module::_signal::interp_signal::checksignals_now()?;
                 };
                 Ok(pyre_object::w_int_new(err as i64))
             },
@@ -2692,6 +2704,9 @@ fn init_socket_type(ns: &mut DictStorage) {
                 if err.raw_os_error() != Some(libc::EINTR) {
                     return Err(socket_io_err(err));
                 }
+                // EINTR: deliver a pending signal, then retry
+                // (`converted_error` eintr_retry).
+                crate::module::_signal::interp_signal::checksignals_now()?;
             };
             Ok(pyre_object::w_int_new(n as i64))
         }),
@@ -2732,6 +2747,9 @@ fn init_socket_type(ns: &mut DictStorage) {
                 if n < 0 {
                     let err = std::io::Error::last_os_error();
                     if err.raw_os_error() == Some(libc::EINTR) {
+                        // `rsocket.py:1132` signal_checker — deliver a pending
+                        // signal, then retry the remaining bytes.
+                        crate::module::_signal::interp_signal::checksignals_now()?;
                         continue;
                     }
                     return Err(socket_io_err(err));
@@ -2777,6 +2795,9 @@ fn init_socket_type(ns: &mut DictStorage) {
                 if err.raw_os_error() != Some(libc::EINTR) {
                     return Err(socket_io_err(err));
                 }
+                // EINTR: deliver a pending signal, then retry
+                // (`converted_error` eintr_retry).
+                crate::module::_signal::interp_signal::checksignals_now()?;
             };
             buf.truncate(got as usize);
             Ok(pyre_object::bytesobject::w_bytes_from_bytes(&buf))
@@ -2834,6 +2855,9 @@ fn init_socket_type(ns: &mut DictStorage) {
                 if err.raw_os_error() != Some(libc::EINTR) {
                     return Err(socket_io_err(err));
                 }
+                // EINTR: deliver a pending signal, then retry
+                // (`converted_error` eintr_retry).
+                crate::module::_signal::interp_signal::checksignals_now()?;
             };
             Ok(pyre_object::w_int_new(n as i64))
         }),
@@ -2891,6 +2915,9 @@ fn init_socket_type(ns: &mut DictStorage) {
                 if err.raw_os_error() != Some(libc::EINTR) {
                     return Err(socket_io_err(err));
                 }
+                // EINTR: deliver a pending signal, then retry
+                // (`converted_error` eintr_retry).
+                crate::module::_signal::interp_signal::checksignals_now()?;
             };
             buf.truncate(got as usize);
             let addr = unpack_inet_addr(&storage);
@@ -2964,6 +2991,9 @@ fn init_socket_type(ns: &mut DictStorage) {
                 if err.raw_os_error() != Some(libc::EINTR) {
                     return Err(socket_io_err(err));
                 }
+                // EINTR: deliver a pending signal, then retry
+                // (`converted_error` eintr_retry).
+                crate::module::_signal::interp_signal::checksignals_now()?;
             };
             Ok(pyre_object::w_int_new(got as i64))
         }),
@@ -3041,6 +3071,9 @@ fn init_socket_type(ns: &mut DictStorage) {
                 if err.raw_os_error() != Some(libc::EINTR) {
                     return Err(socket_io_err(err));
                 }
+                // EINTR: deliver a pending signal, then retry
+                // (`converted_error` eintr_retry).
+                crate::module::_signal::interp_signal::checksignals_now()?;
             };
             let addr = unpack_inet_addr(&storage);
             Ok(pyre_object::w_tuple_new(vec![
@@ -3127,6 +3160,9 @@ fn init_socket_type(ns: &mut DictStorage) {
                 if err.raw_os_error() != Some(libc::EINTR) {
                     return Err(socket_io_err(err));
                 }
+                // EINTR: deliver a pending signal, then retry
+                // (`converted_error` eintr_retry).
+                crate::module::_signal::interp_signal::checksignals_now()?;
             };
             data.truncate(got as usize);
 
@@ -3278,6 +3314,9 @@ fn init_socket_type(ns: &mut DictStorage) {
                 if err.raw_os_error() != Some(libc::EINTR) {
                     return Err(socket_io_err(err));
                 }
+                // EINTR: deliver a pending signal, then retry
+                // (`converted_error` eintr_retry).
+                crate::module::_signal::interp_signal::checksignals_now()?;
             };
 
             let mut anc_items = Vec::new();
@@ -3500,6 +3539,9 @@ fn init_socket_type(ns: &mut DictStorage) {
                 if err.raw_os_error() != Some(libc::EINTR) {
                     return Err(socket_io_err(err));
                 }
+                // EINTR: deliver a pending signal, then retry
+                // (`converted_error` eintr_retry).
+                crate::module::_signal::interp_signal::checksignals_now()?;
             };
             Ok(pyre_object::w_int_new(sent as i64))
         }),

@@ -105,12 +105,30 @@ pub fn sleep(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let dur = std::time::Duration::from_secs_f64(secs);
     #[cfg(all(unix, feature = "host_env"))]
     {
-        return host_time::nanosleep(dur).map(|_| w_none()).map_err(|e| {
-            crate::PyError::os_error_with_errno(
-                e.raw_os_error().unwrap_or(0),
-                format!("sleep: {e}"),
-            )
-        });
+        // `interp_time.py:622-710 time_sleep` — sleep toward a monotonic
+        // deadline; on EINTR deliver any pending signal and retry with the
+        // remaining time, breaking once the deadline has passed.
+        let deadline = std::time::Instant::now() + dur;
+        let mut remaining = dur;
+        loop {
+            match host_time::nanosleep(remaining) {
+                Ok(()) => return Ok(w_none()),
+                Err(e) if e.raw_os_error() == Some(libc::EINTR) => {
+                    crate::module::_signal::interp_signal::checksignals_now()?;
+                    let now = std::time::Instant::now();
+                    if now >= deadline {
+                        return Ok(w_none());
+                    }
+                    remaining = deadline - now;
+                }
+                Err(e) => {
+                    return Err(crate::PyError::os_error_with_errno(
+                        e.raw_os_error().unwrap_or(0),
+                        format!("sleep: {e}"),
+                    ));
+                }
+            }
+        }
     }
     #[cfg(not(all(unix, feature = "host_env")))]
     {

@@ -176,6 +176,14 @@ impl W_Poll {
             }
             let e = std::io::Error::last_os_error();
             if e.raw_os_error() == Some(libc::EINTR) {
+                // `interp_select.py:94-100` — deliver a pending signal, then
+                // retry with a recomputed timeout.  Reset `running` first so
+                // a raised handler does not leave the poll object wedged
+                // (PyPy's `finally: self.running = False`).
+                if let Err(err) = crate::module::_signal::interp_signal::checksignals_now() {
+                    self.running = false;
+                    return Err(err);
+                }
                 if let Some(dl) = deadline {
                     let now = std::time::Instant::now();
                     cur_timeout = if now >= dl {
@@ -359,7 +367,13 @@ pub fn register_module(ns: &mut DictStorage) {
                         timeout_ref,
                     ) {
                         Ok(_) => break,
-                        Err(e) if e.raw_os_error() == Some(libc::EINTR) => continue,
+                        Err(e) if e.raw_os_error() == Some(libc::EINTR) => {
+                            // `interp_select.py:182` — deliver a pending
+                            // signal, then retry with the remaining timeout
+                            // recomputed at the loop head.
+                            crate::module::_signal::interp_signal::checksignals_now()?;
+                            continue;
+                        }
                         Err(e) => {
                             return Err(crate::PyError::os_error_with_errno(
                                 e.raw_os_error().unwrap_or(0),
