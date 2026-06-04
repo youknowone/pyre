@@ -1410,8 +1410,18 @@ fn int_between_record(
     };
 
     // pyjitpl.py:590 ConstInt(1) fast path emits INT_EQ; otherwise
-    // emit the generic INT_SUB + UINT_LT pair.
-    let (result, concrete) = if b5_concrete == Some(1) {
+    // emit the generic INT_SUB + UINT_LT pair.  Upstream gates the
+    // specialization on `isinstance(b5, ConstInt)` where
+    // `b5 = execute(rop.INT_SUB, b3, b1)` returns a `ConstInt` only
+    // when both inputs are themselves `ConstInt`; equivalently both
+    // `b3` and `b1` must be constant.  `box_value()` alone exposes
+    // any *observed* concrete value (including those riding on a
+    // non-Const OpRef that lacks a value guard), so checking it
+    // would specialize on a runtime sample without recording the
+    // `b3 - b1 == 1` guard — miscompiling future executions where
+    // the same boxes carry different live values.
+    let inputs_const = b1.is_constant() && b3.is_constant();
+    let (result, concrete) = if inputs_const && b5_concrete == Some(1) {
         let r = ctx.trace_ctx.record_op(OpCode::IntEq, &[b2, b1]);
         let c = if let (Some(majit_ir::Value::Int(va)), Some(majit_ir::Value::Int(vb))) =
             (ctx.trace_ctx.box_value(b2), ctx.trace_ctx.box_value(b1))
