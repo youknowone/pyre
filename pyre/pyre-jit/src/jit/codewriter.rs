@@ -1372,6 +1372,58 @@ fn collect_same_slot_coalesce_pairs(
     pairs
 }
 
+/// #302: detect when the canonical splice coloring assigns one Ref color
+/// to two DISTINCT frame-local slots, which makes the per-slot resume
+/// reverse map non-injective.
+///
+/// A spliced jitcode resumes by reverse-mapping each live Ref color back
+/// to a frame slot (`semantic_ref_slot_for_reg_color`).  The chordal
+/// coloring is free to give the same color to two locals whose SSA
+/// register live ranges are disjoint — and they always are when each
+/// `LOAD_FAST` re-reads the local from the virtualizable, so a local's
+/// SSA value dies between reads (mult's `i`/`s`/`j` all land on color 3).
+/// Those slots are nonetheless independently FRAME-live across resume
+/// points (the bytecode `LOAD_FAST`s them after the deopt), so the
+/// first-match reverse map collapses them onto one slot and the others
+/// keep a stale value at resume — spectral_norm gate-on prints 1.0,
+/// nested_loop a wrong sum.
+///
+/// The walker stream numbers each frame slot's register by the slot
+/// itself, so its reverse map is bijective and resume is correct.  Refuse
+/// to splice graphs whose local coloring is non-injective and keep the
+/// walker; the fix that makes the splice itself resume-correct (pin each
+/// frame-live body local to a distinct Ref color in the splice regalloc,
+/// matching the walker) is the next #302 sub-task.
+fn splice_local_color_collision(
+    ref_coloring: &HashMap<super::flow::VariableId, u16>,
+    walker_slot_for_variable: &[Option<u16>],
+    nlocals: usize,
+) -> bool {
+    // slot -> canonical Ref color (same-slot Variables share a color via
+    // `collect_same_slot_coalesce_pairs`, so last-write-wins is stable).
+    let mut slot_color: Vec<Option<u16>> = vec![None; nlocals];
+    for (vid, slot) in walker_slot_for_variable.iter().enumerate() {
+        let Some(slot) = *slot else { continue };
+        if (slot as usize) >= nlocals {
+            continue;
+        }
+        if let Some(&color) = ref_coloring.get(&super::flow::VariableId(vid as u32)) {
+            slot_color[slot as usize] = Some(color);
+        }
+    }
+    let mut color_owner: HashMap<u16, usize> = HashMap::new();
+    for (slot, color) in slot_color.iter().enumerate() {
+        let Some(color) = *color else { continue };
+        match color_owner.get(&color) {
+            Some(&owner) if owner != slot => return true,
+            _ => {
+                color_owner.insert(color, slot);
+            }
+        }
+    }
+    false
+}
+
 /// Walker post-walk `insert_renamings` — port of
 /// `rpython/jit/codewriter/flatten.py:306-334`.
 ///
@@ -10240,7 +10292,24 @@ impl CodeWriter {
                         resume_target_resolver_coverage(&spliced, d);
                     (rb - rbf) + (rc - rcf)
                 });
-                if let (Some(first_live), Some(derived), 0) = (first_live, derived, stranded) {
+                // #302 splice precondition: the per-slot resume reverse
+                // map is only injective when distinct frame-local slots get
+                // distinct Ref colors.  When the canonical coloring
+                // collapses two frame-live locals onto one color
+                // (mult/spectral_norm `i`/`s`/`j` → one color), the resume
+                // restores one slot and the others keep stale values
+                // (spectral_norm gate-on 1.0).  Refuse to splice such
+                // graphs and keep the resume-correct walker stream.
+                let local_color_collision = canonical_for_splice.as_ref().map_or(false, |(_, sr)| {
+                    splice_local_color_collision(
+                        &sr[Kind::Ref.index()].coloring,
+                        &walker_slot_for_variable,
+                        code.varnames.len(),
+                    )
+                });
+                if let (Some(first_live), Some(derived), 0, false) =
+                    (first_live, derived, stranded, local_color_collision)
+                {
                     let mut dense: Vec<usize> = Vec::with_capacity(num_instrs);
                     let mut last = first_live;
                     for entry in &derived {
@@ -10264,6 +10333,11 @@ impl CodeWriter {
                 } else if first_live.is_none() {
                     eprintln!(
                         "[flatten-splice] {} skipped (canonical stream has no -live- marker)",
+                        ssarepr.name,
+                    );
+                } else if local_color_collision {
+                    eprintln!(
+                        "[flatten-splice] {} skipped (frame-local Ref color collision)",
                         ssarepr.name,
                     );
                 } else {
@@ -11355,6 +11429,73 @@ mod tests {
     use pyre_interpreter::bytecode::{CodeObject, ConstantData};
     use pyre_interpreter::compile_exec;
     use std::sync::Arc;
+
+    /// #302: two distinct frame-local slots colored the same Ref color
+    /// (mult/spectral_norm's `i`/`s`/`j` collapse onto one color) makes the
+    /// per-slot resume reverse map non-injective; the predicate reports it
+    /// so the splice falls back to the resume-correct walker stream.
+    #[test]
+    fn splice_local_color_collision_flags_two_slots_one_color() {
+        // VariableId 0/1/2 map to frame slots 0/1/2; all three share color 3.
+        let walker_slot_for_variable = vec![Some(0u16), Some(1u16), Some(2u16)];
+        let mut ref_coloring: HashMap<VariableId, u16> = HashMap::new();
+        ref_coloring.insert(VariableId(0), 3);
+        ref_coloring.insert(VariableId(1), 3);
+        ref_coloring.insert(VariableId(2), 3);
+        assert!(splice_local_color_collision(
+            &ref_coloring,
+            &walker_slot_for_variable,
+            3,
+        ));
+    }
+
+    /// Distinct slots with distinct colors is injective — splice allowed.
+    #[test]
+    fn splice_local_color_collision_allows_injective_coloring() {
+        let walker_slot_for_variable = vec![Some(0u16), Some(1u16), Some(2u16)];
+        let mut ref_coloring: HashMap<VariableId, u16> = HashMap::new();
+        ref_coloring.insert(VariableId(0), 0);
+        ref_coloring.insert(VariableId(1), 1);
+        ref_coloring.insert(VariableId(2), 2);
+        assert!(!splice_local_color_collision(
+            &ref_coloring,
+            &walker_slot_for_variable,
+            3,
+        ));
+    }
+
+    /// Multiple Variables for the SAME slot sharing one color is legal
+    /// (same-slot coalescing); it is NOT a collision.
+    #[test]
+    fn splice_local_color_collision_ignores_same_slot_sharing() {
+        // VariableId 0 and 1 both belong to slot 0; slot 1 owns color 1.
+        let walker_slot_for_variable = vec![Some(0u16), Some(0u16), Some(1u16)];
+        let mut ref_coloring: HashMap<VariableId, u16> = HashMap::new();
+        ref_coloring.insert(VariableId(0), 7);
+        ref_coloring.insert(VariableId(1), 7);
+        ref_coloring.insert(VariableId(2), 1);
+        assert!(!splice_local_color_collision(
+            &ref_coloring,
+            &walker_slot_for_variable,
+            2,
+        ));
+    }
+
+    /// Beyond-window slots (slot >= nlocals) and uncolored Variables are
+    /// ignored; only in-window frame-local slots gate the splice.
+    #[test]
+    fn splice_local_color_collision_ignores_out_of_window_and_uncolored() {
+        // slot 5 is beyond nlocals=2; VariableId 2 has no color entry.
+        let walker_slot_for_variable = vec![Some(0u16), Some(5u16), Some(1u16)];
+        let mut ref_coloring: HashMap<VariableId, u16> = HashMap::new();
+        ref_coloring.insert(VariableId(0), 9);
+        ref_coloring.insert(VariableId(1), 9); // slot 5, out of window
+        assert!(!splice_local_color_collision(
+            &ref_coloring,
+            &walker_slot_for_variable,
+            2,
+        ));
+    }
 
     /// Tail-strip pass folds a `goto + Unreachable` tail into the
     /// following block when the goto's target name matches a leading
