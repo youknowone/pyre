@@ -1470,8 +1470,14 @@ fn type_descr_new_with_metaclass(
         // both explicit class cells out of the new type's `__dict__`
         // (CPython consumes them here rather than storing them).
         let mut classcell = pyre_object::PY_NULL;
-        if unsafe { is_dict(w_namespace_dict) } {
-            for (k, v) in unsafe { pyre_object::w_dict_items(w_namespace_dict) } {
+        // `type.__new__` accepts any `dict` subclass as the namespace
+        // (the check is `PyDict_Check`, not `PyDict_CheckExact`); resolve
+        // the dict backing so e.g. an `enum._EnumDict` class body is
+        // walked instead of dropped.
+        let w_ns_backing =
+            unsafe { crate::type_methods::resolve_dict_backing(w_namespace_dict) };
+        if !w_ns_backing.is_null() {
+            for (k, v) in unsafe { pyre_object::w_dict_items(w_ns_backing) } {
                 if unsafe { is_str(k) } {
                     let key = unsafe { pyre_object::w_str_get_value(k) };
                     if key == "__classcell__" {
@@ -1550,11 +1556,10 @@ fn type_descr_new_with_metaclass(
             unsafe { pyre_object::w_cell_set(classcell, w_type) };
         }
 
-        // __set_name__ protocol — CPython: type_new_set_names
-        // PyPy: typeobject.py type_new → call __set_name__(owner, name) on each descriptor.
-        // `w_dict_items` dispatches through `is_module_dict`.
-        if unsafe { is_dict(w_namespace_dict) } {
-            let entries = unsafe { pyre_object::w_dict_items(w_namespace_dict) };
+        // __set_name__ protocol — type_new_set_names
+        // typeobject.py type_new → call __set_name__(owner, name) on each descriptor.
+        if !w_ns_backing.is_null() {
+            let entries = unsafe { pyre_object::w_dict_items(w_ns_backing) };
             for (k, v) in entries {
                 if unsafe { is_str(k) } {
                     if let Ok(set_name) = crate::baseobjspace::getattr(v, "__set_name__") {
