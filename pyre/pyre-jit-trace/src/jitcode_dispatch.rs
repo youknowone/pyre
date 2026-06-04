@@ -5869,6 +5869,38 @@ mod tests {
         make_fail_descr(1)
     }
 
+    /// `ensure_residual_call_args_bound` backs the unbound-arg abort path
+    /// for all three residual-call shapes (iRd / iIRd / iIRFd); they all
+    /// funnel through this helper, so one direct test covers the guard
+    /// that otherwise lets `OpRef::NONE` reach the backend's
+    /// `resolve_opref` (a process abort).
+    #[test]
+    fn ensure_residual_call_args_bound_rejects_unbound_arg() {
+        // Fully-bound funcbox + args slice passes.
+        let bound = [OpRef::int_op(1), OpRef::int_op(2), OpRef::int_op(3)];
+        assert!(ensure_residual_call_args_bound(&bound, 7).is_ok());
+
+        // An unbound arg surfaces its position.
+        let unbound = [OpRef::int_op(1), OpRef::NONE, OpRef::int_op(3)];
+        assert!(matches!(
+            ensure_residual_call_args_bound(&unbound, 7),
+            Err(DispatchError::ResidualCallArgUnbound {
+                pc: 7,
+                arg_index: 1
+            })
+        ));
+
+        // The funcbox slot (index 0) is guarded too.
+        let unbound_func = [OpRef::NONE, OpRef::int_op(2)];
+        assert!(matches!(
+            ensure_residual_call_args_bound(&unbound_func, 4),
+            Err(DispatchError::ResidualCallArgUnbound {
+                pc: 4,
+                arg_index: 0
+            })
+        ));
+    }
+
     /// Build distinct `OpRef` constants for register slots so dataflow
     /// assertions don't get false positives from shared identity. Each
     /// slot holds `const_ref(0xC0DE_0000 + i)` for `i in 0..count`.
