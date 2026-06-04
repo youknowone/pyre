@@ -2876,6 +2876,29 @@ impl Repr for InstanceRepr {
         Ok(Some(Hlvalue::Variable(var)))
     }
 
+    /// RPython `InstanceRepr.rtype_bool(self, hop)` (rclass.py:866-868):
+    ///
+    /// ```python
+    /// def rtype_bool(self, hop):
+    ///     vinst, = hop.inputargs(self)
+    ///     return hop.genop('ptr_nonzero', [vinst], resulttype=Bool)
+    /// ```
+    ///
+    /// `InstanceRepr` does not inherit from `CanBeNull` upstream, so the
+    /// constant fast-path in [`crate::translator::rtyper::rmodel::can_be_null_rtype_bool`]
+    /// is intentionally absent here — a non-null instance always evaluates
+    /// to true and the lowleveltype carrier is a `Ptr(GcStruct)` that
+    /// `ptr_nonzero` lowers directly to a null comparison.
+    fn rtype_bool(&self, hop: &HighLevelOp) -> RTypeResult {
+        use crate::translator::rtyper::rtyper::{ConvertedTo, GenopResult};
+        let vlist = hop.inputargs(vec![ConvertedTo::Repr(self)])?;
+        Ok(hop.genop(
+            "ptr_nonzero",
+            vlist,
+            GenopResult::LLType(LowLevelType::Bool),
+        ))
+    }
+
     /// RPython `InstanceRepr.rtype_isinstance(self, hop)` (rclass.py:1019-1032):
     ///
     /// ```python
