@@ -42,8 +42,8 @@
 //! As of 2026-04-25, `all_jitcodes()` is consumed **only** by
 //! majit-translate's own integration tests
 //! (`test_phase_f_all_jitcodes.rs`,
-//! `test_make_jitcodes_produces_graph_keyed_output.rs`,
-//! `tests` mod below). The pyre runtime never imports this function.
+//! `test_make_jitcodes_produces_graph_keyed_output.rs`). The pyre
+//! runtime never imports this function.
 //!
 //! Production builds run a parallel pipeline at `pyre-jit-trace/build.rs`
 //! that calls `analyze_multiple_pipeline_with_vinfo_and_fnaddr_bindings`

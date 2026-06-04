@@ -123,9 +123,10 @@ pub fn analyze_pipeline(source: &str) -> pipeline::ProgramPipelineResult {
 ///    If every expected file exists, MIR cutover engages
 ///    automatically.
 ///
-/// Falls back to the syn-AST builder when neither source resolves
-/// (Charon not installed, contributor on stable Rust without
-/// LLBC extraction).
+/// Panics when neither source resolves: the syn-AST graph builder was
+/// retired (Slice 5 / issue #97 Step 6.F), so a missing LLBC set
+/// (Charon not installed, or `scripts/extract-llbc.sh` not run) is a
+/// fatal misconfiguration rather than a fallback to a legacy path.
 fn build_semantic_program_via_active_frontend(
     parsed_files: &[parse::ParsedInterpreter],
 ) -> front::SemanticProgram {
@@ -140,8 +141,8 @@ fn build_semantic_program_via_active_frontend(
         // single-path form continues to work.
         //
         // Step 6.B: if the env-var is unset, auto-discover the
-        // canonical workspace LLBC artefacts before falling through
-        // to AST.
+        // canonical workspace LLBC artefacts before failing loud (the
+        // AST builder fallback was retired in Slice 5).
         let resolved_paths: Option<Vec<String>> = std::env::var_os("PYRE_MIR_FRONTEND_LLBC")
             .map(|v| {
                 std::env::split_paths(&v)

@@ -72,8 +72,8 @@ default = ["mir-frontend"]
 # feature is on, `build_semantic_program_via_active_frontend`
 # resolves LLBC artefacts via `PYRE_MIR_FRONTEND_LLBC` env-var or
 # auto-discovers `<workspace>/build/llbc/{pyre-object,
-# pyre-interpreter}.ullbc`; falls back to the syn-AST builder when
-# neither source resolves (contributor without Charon installed).
+# pyre-interpreter}.ullbc`; panics when neither source resolves (the
+# syn-AST builder fallback was retired in Slice 5 / Step 6.F).
 #
 # Step 6.C.1 (Task #38) closed by widening `tyref_to_value_type`
 # to recognise Charon's current literal-type schema — `Literal::Int`
@@ -85,8 +85,9 @@ default = ["mir-frontend"]
 # that switched on integer-typed arguments (e.g.
 # `pyre_interpreter::shared_opcode::opcode_call`).
 #
-# Disable via `--no-default-features` to force AST end-to-end
-# (legacy regression mode).
+# `--no-default-features` leaves no active frontend: the analysis
+# builder then panics at run time, since the AST builder it formerly
+# fell back to no longer exists.
 mir-frontend = []
 
 [dev-dependencies]

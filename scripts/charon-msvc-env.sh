@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # Prepend the MSVC linker directory to PATH on a Windows host.
 #
 # Git for Windows ships a GNU coreutils `link.exe` in /usr/bin that shadows

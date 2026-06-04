@@ -69,7 +69,7 @@ statement and terminator in every extracted body decodes:
 
 The pyre-interpreter `Call` terminators classify as:
 
-```
+```text
   direct    25502   (Fun.Regular: monomorphized direct call)
   trait       382   (Fun.Trait: trait-bound generic, statically resolved)
   dynamic      36   (Dynamic: dyn Trait virtual call)
