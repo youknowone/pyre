@@ -1183,7 +1183,38 @@ fn bool_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     )))
 }
 descr_new_wrapper!(list_descr_new, crate::builtins::builtin_list_ctor);
-descr_new_wrapper!(tuple_descr_new, crate::builtins::builtin_tuple);
+
+/// tuple.__new__(cls, iterable) — tupleobject.py descr__new__.
+///
+/// For a tuple subclass (e.g. `collections.namedtuple`), build a fresh
+/// tuple and set `w_class = cls` so `type(obj) == cls`, attribute lookup
+/// resolves the subclass's field descriptors, and `__repr__` dispatches.
+fn tuple_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let cls = if args.is_empty() {
+        pyre_object::PY_NULL
+    } else {
+        args[0]
+    };
+    let value = crate::builtins::builtin_tuple(&args[1..])?;
+    if cls.is_null() || !unsafe { pyre_object::is_type(cls) } {
+        return Ok(value);
+    }
+    let tuple_typeobj = gettypefor(&pyre_object::pyobject::TUPLE_TYPE);
+    if tuple_typeobj.map_or(false, |t| std::ptr::eq(cls, t)) {
+        return Ok(value);
+    }
+    // Subclass path — copy into a fresh tuple so setting w_class does not
+    // clobber a shared/literal source tuple.
+    let n = unsafe { pyre_object::w_tuple_len(value) };
+    let items: Vec<_> = (0..n)
+        .filter_map(|i| unsafe { pyre_object::w_tuple_getitem(value, i as i64) })
+        .collect();
+    let obj = pyre_object::w_tuple_new(items);
+    unsafe {
+        (*obj).w_class = cls;
+    }
+    Ok(obj)
+}
 // dict_new handled by dict_descr_new above (supports dict subclasses)
 
 /// typeobject.py:511-524 W_TypeObject.check_user_subclass.
