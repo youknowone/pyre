@@ -2205,6 +2205,19 @@ fn build_class_inner(
         }
     }
 
+    // When `__prepare__` returned a custom mapping (a dict subclass such as
+    // enum._EnumDict), the class body must execute against it directly so its
+    // `__setitem__`/`__getitem__` fire mid-body — e.g. `WHITE = RED | GREEN`
+    // reads the values `_EnumDict.__setitem__` resolved on assignment, not the
+    // stale `auto()` sentinels.  Route the frame's name binding through it via
+    // setdictscope_object; an absent or plain-dict namespace keeps the
+    // DictStorage fast path.  Restricted to a dict-subclass instance with a
+    // resolvable backing so the post-execution mirror below can recover its
+    // entries — an exotic non-dict mapping keeps the legacy path unchanged.
+    let mapping_namespace = w_namespace.filter(|&w| unsafe {
+        pyre_object::is_instance(w) && !crate::type_methods::resolve_dict_backing(w).is_null()
+    });
+
     let mut frame = PyFrame::try_new_for_call_with_closure_and_globals_obj(
         w_code,
         &[],
@@ -2213,9 +2226,33 @@ fn build_class_inner(
         exec_ctx,
         closure,
     )?;
-    frame.setdictscope(class_ns_ptr)?;
+    if let Some(w_ns) = mapping_namespace {
+        frame.setdictscope_object(w_ns)?;
+    } else {
+        frame.setdictscope(class_ns_ptr)?;
+    }
 
     frame.execute_frame(None, None)?;
+
+    // The body wrote through the custom mapping; mirror its final contents
+    // into class_ns for the downstream type construction (classcell capture,
+    // create_all_slots, __set_name__), which read class_ns.
+    if let Some(w_ns) = mapping_namespace {
+        let backing = crate::type_methods::resolve_dict_backing(w_ns);
+        if !backing.is_null() && unsafe { pyre_object::is_dict(backing) } {
+            let class_ns = unsafe { &mut *class_ns_ptr };
+            for (key, value) in unsafe { pyre_object::w_dict_items(backing) } {
+                if !value.is_null() && unsafe { pyre_object::is_str(key) } {
+                    crate::dict_storage_store(
+                        class_ns,
+                        unsafe { pyre_object::w_str_get_value(key) },
+                        value,
+                    );
+                }
+            }
+            unsafe { (*class_ns_ptr).fix_ptr() };
+        }
+    }
 
     // type_new_classcell (typeobject.c) — capture the `__classcell__` cell
     // so its content can be set to the new class below.  `__class__` /
@@ -2258,13 +2295,20 @@ fn build_class_inner(
         // If __prepare__ returned a custom dict, replay stores into it
         // so that __setitem__ side effects (e.g. EnumDict tracking) fire.
         let w_namespace_dict = if let Some(w_prepared_dict) = w_namespace {
-            // Replay class body stores into prepared dict
-            let ns = unsafe { &*class_ns_ptr };
-            for (k, &v) in ns.entries() {
-                if !v.is_null() {
-                    let key = pyre_object::w_str_new(k);
-                    // Use setitem to trigger __setitem__ on EnumDict etc.
-                    let _ = crate::baseobjspace::setitem(w_prepared_dict, key, v);
+            // Replay class body stores into the prepared dict so __setitem__
+            // side effects (EnumDict tracking) fire — but only on the legacy
+            // path where the body wrote into class_ns.  When the body executed
+            // directly against the mapping (setdictscope_object above) it
+            // already holds every store; replaying would re-run __setitem__
+            // and, for _EnumDict, reject the duplicate member keys.
+            if mapping_namespace.is_none() {
+                let ns = unsafe { &*class_ns_ptr };
+                for (k, &v) in ns.entries() {
+                    if !v.is_null() {
+                        let key = pyre_object::w_str_new(k);
+                        // Use setitem to trigger __setitem__ on EnumDict etc.
+                        let _ = crate::baseobjspace::setitem(w_prepared_dict, key, v);
+                    }
                 }
             }
             w_prepared_dict
