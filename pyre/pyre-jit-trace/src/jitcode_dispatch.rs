@@ -9129,8 +9129,8 @@ mod tests {
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
         };
-        let (outcome, next_pc) = int_between_record(&code, &op, &mut wc)
-            .expect("int_between_record must dispatch");
+        let (outcome, next_pc) =
+            int_between_record(&code, &op, &mut wc).expect("int_between_record must dispatch");
         assert_eq!(outcome, DispatchOutcome::Continue);
         assert_eq!(next_pc, 5, "operand layout `iii>i` consumes 4 bytes");
         let dst_post = wc.registers_i[8];

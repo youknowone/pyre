@@ -3301,8 +3301,7 @@ pub(crate) fn make_ll_isinstance(
         _ => cls_ptr._hashable_identity(),
     };
 
-    let nonnull_name =
-        format!("ll_isinstance_const_nonnull_{class_identity}_{minid}_{maxid}");
+    let nonnull_name = format!("ll_isinstance_const_nonnull_{class_identity}_{minid}_{maxid}");
     let const_name = format!("ll_isinstance_const_{class_identity}_{minid}_{maxid}");
 
     // Mint the non-null helper first so the const helper's direct_call
