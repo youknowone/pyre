@@ -5991,6 +5991,30 @@ fn diagnose_inline_recognition(arg_concretes: &[ConcreteValue], op_pc: usize) {
     }
 }
 
+/// The FBW fast-path inline convention (`try_walker_inline_user_call`) seeds
+/// only the callee's positional-argument registers `r0..nparams`; the
+/// callee's virtualizable frame box is left unseeded.  A callee whose body
+/// reads or writes that frame through a `*_vable_*` op — emitted by the
+/// codewriter when a local must survive a sub-call — cannot be satisfied by
+/// register seeding and would abort the *whole* enclosing trace with
+/// `VableBoxNotSeeded`.  Detect that pre-flight so the call lowers to an
+/// ordinary residual call (the orthodox non-inlinable path, `should_inline`
+/// = False → `do_residual_call`, `pyjitpl.py:1422`) instead of aborting.
+fn callee_fast_path_inlinable(body_code: &[u8]) -> bool {
+    let mut pc = 0usize;
+    while pc < body_code.len() {
+        let Some(d) = crate::jitcode_runtime::decode_op_at(body_code, pc) else {
+            // Undecodable tail — be conservative and decline the fast path.
+            return false;
+        };
+        if d.opname.contains("vable") {
+            return false;
+        }
+        pc = d.next_pc;
+    }
+    true
+}
+
 /// #62 slice (3c): full-body-walk inline of a recognized user-function
 /// `call_fn`.  Dev-gated by `PYRE_FBW_INLINE` (default OFF — the production
 /// flag-on path is unchanged until this is validated and the gate retired).
@@ -6096,14 +6120,15 @@ fn try_walker_inline_user_call(
     // the same seeding `dispatch_inline_call_dr_kind` uses for `n_*`
     // inline calls and the trait path's `can_skip_traced_callee_frame`
     // branch applies (`build_pending_inline_frame`:
-    // `sym.registers_r = args.to_vec()`).  Decode-confirmed for
-    // add/mul/square/compute: the body reads its params straight from
-    // `r0`/`r1` (ref_copy + residual_call args), NOT via `getfield_vable`
-    // against a heap frame.  A callee that DOES materialize a frame
-    // (extra locals → `getfield_vable_r` / `getarrayitem_vable_r` on an
-    // unseeded register) aborts cleanly with `VableBoxNotSeeded` → trait
-    // fallback, never a miscompile.
-    if nparams == 0 {
+    // `sym.registers_r = args.to_vec()`).  This only holds for a callee
+    // that reads its params straight from `r0`/`r1` (ref_copy +
+    // residual_call args).  A callee that materializes a frame — any
+    // `*_vable_*` op, emitted when a local must survive a sub-call —
+    // reads from the unseeded frame box; inlining it would abort the
+    // *whole* enclosing trace with `VableBoxNotSeeded`.  Decline such
+    // callees (and the zero-param case) so the call lowers to an ordinary
+    // residual call rather than aborting (orthodox non-inlinable path).
+    if nparams == 0 || !callee_fast_path_inlinable(body.code) {
         return Ok(None);
     }
 
