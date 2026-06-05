@@ -5061,6 +5061,48 @@ impl Drop for InlineSubwalkCaptureGuard {
     }
 }
 
+thread_local! {
+    /// FBW inline call stack: the `w_code` pointer of every user function
+    /// currently being inlined by [`try_walker_inline_user_call`]'s
+    /// sub-walk, innermost last.  How many times a callee's `w_code`
+    /// already appears is its recursion depth at the call site; once it
+    /// reaches [`FBW_MAX_INLINE_RECURSION`] the inline bails to a residual
+    /// call instead of unrolling the callee's (possibly exponential) call
+    /// tree at trace time.  Mirrors the trait tracer's `recursive_depth >=
+    /// max_unroll_recursion` gate (`pyjitpl.py:1388-1416`,
+    /// `trace_opcode.rs:5604-5652`).
+    static FBW_INLINE_CODE_STACK: std::cell::RefCell<Vec<usize>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// `rlib/jit.py:601` `max_unroll_recursion` default (= warmstate
+/// `DEFAULT_MAX_UNROLL_RECURSION`).
+const FBW_MAX_INLINE_RECURSION: usize = 7;
+
+/// Recursion depth of `w_code` on the FBW inline stack.
+fn fbw_inline_recursion_count(w_code: usize) -> usize {
+    FBW_INLINE_CODE_STACK.with(|s| s.borrow().iter().filter(|&&c| c == w_code).count())
+}
+
+/// RAII guard: push `w_code` onto the FBW inline stack for the lifetime of
+/// a sub-walk, pop on drop so nested inlines unwind to their parent depth.
+struct InlineRecursionGuard;
+
+impl InlineRecursionGuard {
+    fn enter(w_code: usize) -> Self {
+        FBW_INLINE_CODE_STACK.with(|s| s.borrow_mut().push(w_code));
+        InlineRecursionGuard
+    }
+}
+
+impl Drop for InlineRecursionGuard {
+    fn drop(&mut self) {
+        FBW_INLINE_CODE_STACK.with(|s| {
+            s.borrow_mut().pop();
+        });
+    }
+}
+
 /// RAII guard: set [`FULL_BODY_SNAPSHOT_SYM`] for the lifetime of a
 /// full-body walk and restore the prior value on drop (so any nesting
 /// restores the parent rather than clearing to null).
@@ -6010,6 +6052,16 @@ fn try_walker_inline_user_call(
     if has_closure || nargs_passed != nparams {
         return Ok(None);
     }
+    // Bound recursive inlining at `max_unroll_recursion`: a callee already
+    // this deep on the FBW inline stack falls back to a residual call rather
+    // than unrolling its (exponentially branching) call tree at trace time.
+    // Mirror of the trait tracer's `recursion_exceeded`
+    // (`pyjitpl.py:1388-1416`) → `assembler_call` instead of trace-through
+    // (`trace_opcode.rs:5604-5642`).
+    let callee_code_key = w_code as pyre_object::PyObjectRef as usize;
+    if fbw_inline_recursion_count(callee_code_key) >= FBW_MAX_INLINE_RECURSION {
+        return Ok(None);
+    }
     let Some(body) = crate::state::sub_jitcode_body_for_code(w_code) else {
         return Ok(None);
     };
@@ -6114,6 +6166,9 @@ fn try_walker_inline_user_call(
         // from the caller), not at a callee `op_pc` that has no meaning in
         // the outer jitcode's pc_map.  See `INLINE_SUBWALK_CAPTURE_BOUNDARY`.
         let _inline_boundary = InlineSubwalkCaptureGuard::enter();
+        // Track this callee on the FBW inline stack for the lifetime of the
+        // sub-walk so a nested self-call sees the correct recursion depth.
+        let _recursion_frame = InlineRecursionGuard::enter(callee_code_key);
         let (outcome, _end_pc) = match walk(body.code, 0, &mut sub_wc) {
             Ok(v) => v,
             Err(e) => {
