@@ -1448,7 +1448,8 @@ impl Optimizer {
     /// a new operation from the trace. Used by passes that need to
     /// inject additional operations.
     pub fn send_extra_operation(&mut self, op: &Op, ctx: &mut OptContext) {
-        self.propagate_from_pass(0, op, ctx);
+        let op_rc = std::rc::Rc::new(op.clone());
+        self.propagate_from_pass(0, &op_rc, ctx);
     }
 
     /// RPython optimizer.py: emit_extra(op, emit=False) parity.
@@ -1460,7 +1461,8 @@ impl Optimizer {
         op: &Op,
         ctx: &mut OptContext,
     ) {
-        self.propagate_from_pass(after_pass_idx + 1, op, ctx);
+        let op_rc = std::rc::Rc::new(op.clone());
+        self.propagate_from_pass(after_pass_idx + 1, &op_rc, ctx);
     }
 
     /// optimizer.py:345-364: force_box — force a virtual to be materialized.
@@ -3592,7 +3594,7 @@ impl Optimizer {
     /// The Emit variant's position tracking is handled by each pass
     /// and OptContext. Adding automatic replacement mapping here
     /// causes spurious forwarding that breaks heap/guard tests.
-    fn propagate_one(&mut self, op: &Op, ctx: &mut OptContext) {
+    fn propagate_one(&mut self, op: &majit_ir::OpRc, ctx: &mut OptContext) {
         self.propagate_from_pass(0, op, ctx);
     }
 
@@ -3610,7 +3612,7 @@ impl Optimizer {
         }
     }
 
-    fn propagate_from_pass(&mut self, start_pass: usize, op: &Op, ctx: &mut OptContext) {
+    fn propagate_from_pass(&mut self, start_pass: usize, op: &majit_ir::OpRc, ctx: &mut OptContext) {
         self.propagate_from_pass_range(start_pass, self.passes.len(), op, ctx);
     }
 
@@ -3626,9 +3628,13 @@ impl Optimizer {
         &mut self,
         start_pass: usize,
         end_pass: usize,
-        op: &Op,
+        op_rc: &majit_ir::OpRc,
         ctx: &mut OptContext,
     ) {
+        // The canonical `OpRc` is threaded in so a later slice can collapse
+        // `ensure_box(op.pos.get())` to `BoxRef::from_bound_op(op_rc)`. For now
+        // the body reads through this `&Op` view (Deref), behaviour-identical.
+        let op: &Op = op_rc;
         // 5: Box.type lives intrinsically on `OpRef.ty()` (variant
         // tag, history.py:220 + resoperation.py:1693 parity) and on
         // `Op.type_` once the op lands in `new_operations`, so the
@@ -3748,7 +3754,8 @@ impl Optimizer {
                     );
                     // 5: Restart's new op carries `Op.type_` from
                     // construction; no side-table refresh needed.
-                    self.propagate_from_pass_range(0, end_pass, &op, ctx);
+                    let restart_op_rc = std::rc::Rc::new(op);
+                    self.propagate_from_pass_range(0, end_pass, &restart_op_rc, ctx);
                     // Run any postprocess callbacks accumulated in the outer
                     // chain (passes that already returned PassOn for the
                     // original op before the Restart-returning pass fired).
