@@ -1396,71 +1396,68 @@ fn int_between_record(
     let b2 = read_int_reg(code, op, 1, ctx)?;
     let b3 = read_int_reg(code, op, 2, ctx)?;
 
-    // b5 = INT_SUB(b3, b1)
-    let b5 = ctx.trace_ctx.record_op(OpCode::IntSub, &[b3, b1]);
-    let b5_concrete = if let (Some(majit_ir::Value::Int(v3)), Some(majit_ir::Value::Int(v1))) =
-        (ctx.trace_ctx.box_value(b3), ctx.trace_ctx.box_value(b1))
-    {
-        let folded = majit_metainterp::eval_binop_i(OpCode::IntSub, v3, v1);
-        ctx.trace_ctx
-            .set_opref_concrete(b5, majit_ir::Value::Int(folded));
-        Some(folded)
+    // b5 = execute(INT_SUB, b3, b1)
+    let b5 = execute_pure_binop_i(ctx, OpCode::IntSub, b3, b1);
+
+    // pyjitpl.py:590 `if isinstance(b5, ConstInt) and b5.getint() == 1`
+    // — the `ConstInt(1)` fast path emits INT_EQ; otherwise the
+    // generic INT_SUB + UINT_LT pair.  `inline_const_to_value` returns
+    // `Some(_)` exactly when `b5` is an inline-Const OpRef, mirroring
+    // `isinstance(b5, ConstInt)`.
+    let result = if let Some(majit_ir::Value::Int(1)) = b5.inline_const_to_value() {
+        // execute(INT_EQ, b2, b1)
+        execute_pure_binop_i(ctx, OpCode::IntEq, b2, b1)
     } else {
-        None
+        // b4 = execute(INT_SUB, b2, b1); execute(UINT_LT, b4, b5)
+        let b4 = execute_pure_binop_i(ctx, OpCode::IntSub, b2, b1);
+        execute_pure_binop_i(ctx, OpCode::UintLt, b4, b5)
     };
 
-    // pyjitpl.py:590 ConstInt(1) fast path emits INT_EQ; otherwise
-    // emit the generic INT_SUB + UINT_LT pair.  Upstream gates the
-    // specialization on `isinstance(b5, ConstInt)` where
-    // `b5 = execute(rop.INT_SUB, b3, b1)` returns a `ConstInt` only
-    // when both inputs are themselves `ConstInt`; equivalently both
-    // `b3` and `b1` must be constant.  `box_value()` alone exposes
-    // any *observed* concrete value (including those riding on a
-    // non-Const OpRef that lacks a value guard), so checking it
-    // would specialize on a runtime sample without recording the
-    // `b3 - b1 == 1` guard — miscompiling future executions where
-    // the same boxes carry different live values.
-    let inputs_const = b1.is_constant() && b3.is_constant();
-    let (result, concrete) = if inputs_const && b5_concrete == Some(1) {
-        let r = ctx.trace_ctx.record_op(OpCode::IntEq, &[b2, b1]);
-        let c = if let (Some(majit_ir::Value::Int(va)), Some(majit_ir::Value::Int(vb))) =
-            (ctx.trace_ctx.box_value(b2), ctx.trace_ctx.box_value(b1))
-        {
-            let folded = majit_metainterp::eval_binop_i(OpCode::IntEq, va, vb);
-            ctx.trace_ctx
-                .set_opref_concrete(r, majit_ir::Value::Int(folded));
-            ConcreteValue::Int(folded)
-        } else {
-            ConcreteValue::Null
-        };
-        (r, c)
-    } else {
-        let b4 = ctx.trace_ctx.record_op(OpCode::IntSub, &[b2, b1]);
-        let b4_concrete = if let (Some(majit_ir::Value::Int(v2)), Some(majit_ir::Value::Int(v1))) =
-            (ctx.trace_ctx.box_value(b2), ctx.trace_ctx.box_value(b1))
-        {
-            let folded = majit_metainterp::eval_binop_i(OpCode::IntSub, v2, v1);
-            ctx.trace_ctx
-                .set_opref_concrete(b4, majit_ir::Value::Int(folded));
-            Some(folded)
-        } else {
-            None
-        };
-        let r = ctx.trace_ctx.record_op(OpCode::UintLt, &[b4, b5]);
-        let c = if let (Some(v4), Some(v5)) = (b4_concrete, b5_concrete) {
-            let folded = majit_metainterp::eval_binop_i(OpCode::UintLt, v4, v5);
-            ctx.trace_ctx
-                .set_opref_concrete(r, majit_ir::Value::Int(folded));
-            ConcreteValue::Int(folded)
-        } else {
-            ConcreteValue::Null
-        };
-        (r, c)
+    let concrete = match result.inline_const_to_value() {
+        Some(majit_ir::Value::Int(v)) => ConcreteValue::Int(v),
+        _ => match ctx.trace_ctx.box_value(result) {
+            Some(majit_ir::Value::Int(v)) => ConcreteValue::Int(v),
+            _ => ConcreteValue::Null,
+        },
     };
 
     let dst = code[op.pc + 4] as usize;
     write_int_reg(ctx, op.pc, dst, result, concrete)?;
     Ok((DispatchOutcome::Continue, op.next_pc))
+}
+
+/// `pyjitpl.py:2648-2662 execute_and_record` for pure integer binops.
+/// When both operands are inline-Const, fold to a `ConstInt` OpRef
+/// (no `record_op` call); otherwise record the op and stamp the
+/// observed concrete value if both sides have one.
+///
+/// PyPy's `execute_and_record` short-circuits `_record_helper` via
+/// `executor.wrap_constant(resvalue)` when `_all_constants(*argboxes)`
+/// holds for a pure opcode.  Mirroring that here keeps the trace
+/// free of all-constant subexpressions exactly where upstream keeps
+/// it free — `opimpl_int_between` chains three such pure binops.
+fn execute_pure_binop_i(
+    ctx: &mut WalkContext<'_, '_>,
+    opcode: OpCode,
+    a: OpRef,
+    b: OpRef,
+) -> OpRef {
+    if let (Some(majit_ir::Value::Int(va)), Some(majit_ir::Value::Int(vb))) =
+        (a.inline_const_to_value(), b.inline_const_to_value())
+    {
+        let folded = majit_metainterp::eval_binop_i(opcode, va, vb);
+        return ctx.trace_ctx.const_int(folded);
+    }
+
+    let result = ctx.trace_ctx.record_op(opcode, &[a, b]);
+    if let (Some(majit_ir::Value::Int(va)), Some(majit_ir::Value::Int(vb))) =
+        (ctx.trace_ctx.box_value(a), ctx.trace_ctx.box_value(b))
+    {
+        let folded = majit_metainterp::eval_binop_i(opcode, va, vb);
+        ctx.trace_ctx
+            .set_opref_concrete(result, majit_ir::Value::Int(folded));
+    }
+    result
 }
 
 /// RPython `pyjitpl.py:597-617 opimpl_switch`:
@@ -9143,52 +9140,61 @@ mod tests {
         (new_ops, dst_post, arg_b1)
     }
 
-    /// pyjitpl.py:588-595: when `b3 - b1 == 1` AND both inputs are
-    /// constants, the fast-path emits `INT_SUB` (for b5) + `INT_EQ`
-    /// — two ops total, no `UINT_LT`.
+    /// `pyjitpl.py:2648-2662 execute_and_record` — when every argbox
+    /// is `ConstInt`, a pure op like `INT_SUB` / `INT_EQ` is folded
+    /// via `wrap_constant` and never reaches `_record_helper`.
+    /// `opimpl_int_between(ConstInt, ConstInt, ConstInt)` chains three
+    /// pure binops on all-Const inputs, so 0 ops must be recorded and
+    /// the destination must hold the folded ConstInt result.
     #[test]
     fn int_between_const_inputs_with_unit_width_takes_inteq_fast_path() {
-        let (ops, _, _) = drive_int_between(
+        let (ops, dst_post, _) = drive_int_between(
             BetweenOperand::ConstInt(5),
             BetweenOperand::ConstInt(7),
             BetweenOperand::ConstInt(6),
         );
+        assert!(
+            ops.is_empty(),
+            "all-Const inputs must fold without recording — got {ops:?}",
+        );
+        // `b5 = 6 - 5 = 1` → fast path → `IntEq(b2=7, b1=5) = 0`.
         assert_eq!(
-            ops,
-            vec![majit_ir::OpCode::IntSub, majit_ir::OpCode::IntEq],
-            "ConstInt(1) fast path must record [IntSub(b5), IntEq] — got {ops:?}",
+            dst_post.inline_const_to_value(),
+            Some(majit_ir::Value::Int(0)),
+            "ConstInt(1) fast path on all-Const inputs must fold to ConstInt(0)",
         );
     }
 
-    /// pyjitpl.py:588-595 generic path: when the gate fails the
-    /// recorder emits `INT_SUB` (b5) + `INT_SUB` (b4) + `UINT_LT` —
-    /// three ops total.
+    /// All-Const generic path: `pyjitpl.py:2648-2662` folds the three
+    /// pure binops without recording.  Destination must carry the
+    /// folded UINT_LT result.
     #[test]
     fn int_between_const_inputs_with_wide_range_takes_uintlt_generic_path() {
-        let (ops, _, _) = drive_int_between(
+        let (ops, dst_post, _) = drive_int_between(
             BetweenOperand::ConstInt(5),
             BetweenOperand::ConstInt(7),
             BetweenOperand::ConstInt(10),
         );
+        assert!(
+            ops.is_empty(),
+            "all-Const inputs must fold without recording — got {ops:?}",
+        );
+        // `b5 = 10 - 5 = 5` (not 1) → generic → `b4 = 7 - 5 = 2`,
+        // `UintLt(2, 5) = 1`.
         assert_eq!(
-            ops,
-            vec![
-                majit_ir::OpCode::IntSub,
-                majit_ir::OpCode::IntSub,
-                majit_ir::OpCode::UintLt,
-            ],
-            "wide-range generic path must record [IntSub, IntSub, UintLt] — got {ops:?}",
+            dst_post.inline_const_to_value(),
+            Some(majit_ir::Value::Int(1)),
+            "wide-range path on all-Const inputs must fold to ConstInt(1)",
         );
     }
 
-    /// Regression for the missing `is_constant` gate: when `b1`/`b3`
-    /// are non-constant OpRefs with observed concrete values
-    /// satisfying `b3-b1==1`, the recorder must still take the
-    /// generic `INT_SUB + UINT_LT` path.  Specializing to `INT_EQ`
-    /// would bake a `b3-b1==1` invariant without a runtime guard
-    /// (`box_value` only reports the observed sample), miscompiling
-    /// any future execution where the same boxes carry different
-    /// live values.
+    /// Regression: when `b1`/`b3` are non-constant OpRefs with
+    /// observed concrete values satisfying `b3-b1==1`, the recorder
+    /// must still take the generic `INT_SUB + UINT_LT` path.
+    /// Specializing to `INT_EQ` would bake a `b3-b1==1` invariant
+    /// without a runtime guard (`box_value` only reports the observed
+    /// sample), miscompiling any future execution where the same
+    /// boxes carry different live values.
     #[test]
     fn int_between_non_const_inputs_observing_unit_width_takes_generic_path() {
         let (ops, _, _) = drive_int_between(
@@ -9197,13 +9203,14 @@ mod tests {
             BetweenOperand::NonConstWithConcrete(6),
         );
         assert_eq!(
-            ops.last(),
-            Some(&majit_ir::OpCode::UintLt),
-            "non-const inputs must NOT take INT_EQ fast path; expected UintLt tail — got {ops:?}",
-        );
-        assert!(
-            !ops.contains(&majit_ir::OpCode::IntEq),
-            "INT_EQ fast path is unguarded for non-Const inputs — got {ops:?}",
+            ops,
+            vec![
+                majit_ir::OpCode::IntSub,
+                majit_ir::OpCode::IntSub,
+                majit_ir::OpCode::UintLt,
+            ],
+            "non-const inputs must NOT take INT_EQ fast path; expected \
+             [IntSub(b5), IntSub(b4), UintLt] — got {ops:?}",
         );
     }
 
