@@ -699,13 +699,13 @@ pub fn slot_for_call_flavor(flavor: CallFlavor) -> majit_metainterp::EffectInfoS
 /// `setattr` — emitted by `codewriter.rs::emit_frontend_setattr`
 /// mirroring `flowcontext.py:1031-1036 op.setattr(w_obj,
 /// w_attributename, w_newvalue)`.  Same shape as `getattr`: the
-/// `StoreAttr` arm (codewriter.rs:8551) pairs it with an inline
+/// `StoreAttr` arm (codewriter.rs:8542) pairs it with an inline
 /// `emit_abort_permanent!`, so the compiled trace bails to the
 /// interpreter at the `abort_permanent` Insn canonical already emits.
 /// A literal `setattr` Insn would be unreachable at runtime and
-/// undispatchable by the assembler.  Upstream `rclass.py rtype_setattr`
-/// rewrites to `setfield_gc(v, descr, w_value)` after rtyping; pyre's
-/// lack of rtyping keeps the HLOp unmodified.
+/// undispatchable by the assembler.  Upstream `rclass.py:859
+/// rtype_setattr` rewrites to `setfield_gc(v, descr, w_value)` after
+/// rtyping; pyre's lack of rtyping keeps the HLOp unmodified.
 fn is_pyre_canonical_elidable_hlop(opname: &str) -> bool {
     matches!(opname, "type" | "getattr" | "setattr")
 }
