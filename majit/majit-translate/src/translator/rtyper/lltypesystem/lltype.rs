@@ -4515,9 +4515,8 @@ impl _ptr_obj {
 ///   them, so those branches are dead exactly as the `hasattr` checks make
 ///   them dead upstream;
 /// - the tagged-int container case (`isinstance(container, int)`,
-///   lltype.py:1004) is gated on the tagged-int `_ptr` payload, which pyre
-///   does not carry — no `cast_opaque_ptr` input can hold one, so the
-///   branch is unreachable.
+///   lltype.py:1004) maps to pyre's `_ptr_obj::IntCast` carrier and is
+///   handled below.
 pub fn cast_opaque_ptr(PTRTYPE: &Ptr, ptr: &_ptr) -> Result<_ptr, String> {
     let curtype = ptr._TYPE.clone();
     if curtype == *PTRTYPE {

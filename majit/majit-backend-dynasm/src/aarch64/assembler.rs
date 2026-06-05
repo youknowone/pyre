@@ -3918,6 +3918,10 @@ impl<'a> AssemblerARM64<'a> {
     /// that is longer than the emitted sequence.
     unsafe fn write_redirect_branch(at: usize, target: usize, link: bool) {
         let offset = target as isize - at as isize;
+        assert!(
+            at & 0b11 == 0 && target & 0b11 == 0,
+            "AArch64 redirect branch endpoints must be 4-byte aligned: at={at:#x}, target={target:#x}"
+        );
         // B/BL imm26: signed 26-bit, scaled by 4 → ±128 MB reach.
         const B_REACH: isize = 1 << 27;
         if (-B_REACH..B_REACH).contains(&offset) {

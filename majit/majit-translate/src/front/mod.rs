@@ -30,9 +30,9 @@
 //! extracted artefacts and produces the `SemanticProgram` whose
 //! `program.functions` carry the per-method graphs the rest of the
 //! pipeline consumes.  `auto_discover_workspace_llbc_paths` in `lib.rs`
-//! resolves `<workspace>/build/llbc/{pyre-object,pyre-interpreter}.ullbc`
-//! when `PYRE_MIR_FRONTEND_LLBC` is unset; the canonical pair
-//! `pyre-object.ullbc` / `pyre-interpreter.ullbc` is REQUIRED.  Setting
+//! resolves `<workspace>/build/llbc/{pyre-object,pyre-interpreter,pyre-jit}.ullbc`
+//! when `PYRE_MIR_FRONTEND_LLBC` is unset; that canonical set is
+//! REQUIRED.  Setting
 //! `PYRE_REQUIRE_MIR_FRONTEND=1` makes
 //! `build_semantic_program_via_active_frontend` panic when no LLBC source
 //! resolves, so production builds (which set the flag in

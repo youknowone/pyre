@@ -74,17 +74,9 @@ crate_info() {
             echo "$repo_root/pyre/pyre-interpreter|--features ${CARGO_FEATURES:-cranelift}"
             ;;
         pyre-jit)
-            # pyre-jit hosts PyreBlackholeAllocator + the Drop-impl
-            # guards (JitSuppressionGuard / GuardCompilingScope /
-            # TestJitParamsGuard), which have no JIT-traceable graph.
-            # Extraction is supported for experimentation,
-            # but the production build does NOT discover this artefact
-            # (see `auto_discover_workspace_llbc_paths` in
-            # majit-translate/src/lib.rs): those entries are semantically
-            # residual runtime calls, so their `graph: None` placeholder
-            # is the correct representation and the build stays
-            # environment-invariant on the canonical pair regardless of
-            # whether `pyre-jit.ullbc` is present.
+            # pyre-jit hosts the `eval_loop_jit` portal and helper bodies
+            # referenced by the trace. Production auto-discovery requires
+            # this artefact alongside pyre-object and pyre-interpreter.
             echo "$repo_root/pyre/pyre-jit|--features ${CARGO_FEATURES:-cranelift}"
             ;;
         *)

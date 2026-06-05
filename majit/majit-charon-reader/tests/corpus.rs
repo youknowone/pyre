@@ -1,7 +1,7 @@
 //! End-to-end test: load the Charon fixture corpus, walk every function,
 //! confirm every terminator/statement decodes into the typed enums.
 //!
-//! Run with: `cargo test -p majit-charon-reader`.
+//! Run with: `cargo test -p majit-charon-reader --features dynasm`.
 
 use majit_charon_reader::{
     Llbc,

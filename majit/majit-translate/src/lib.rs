@@ -128,12 +128,12 @@ pub fn analyze_pipeline(source: &str) -> pipeline::ProgramPipelineResult {
 /// rather than a fallback to another path.
 fn build_semantic_program_via_active_frontend(
     parsed_files: &[parse::ParsedInterpreter],
+    static_addrs: HostStaticAddrs<'_>,
 ) -> front::SemanticProgram {
     #[cfg(feature = "mir-frontend")]
     {
-        // Accept an OS path-list so production can pass both
-        // `pyre-object.ullbc` and `pyre-interpreter.ullbc` (and any
-        // future per-crate ullbc) in one env-var.
+        // Accept an OS path-list so production can pass the canonical
+        // pyre LLBC set in one env-var.
         // `std::env::split_paths` uses the platform separator (`;` on
         // Windows, `:` elsewhere) so a Windows drive letter like `Z:`
         // is not mistaken for a separator.  The single-path form also
@@ -157,8 +157,11 @@ fn build_semantic_program_via_active_frontend(
                         .unwrap_or_else(|e| panic!("Step 4.4 cutover: load {p}: {e}"))
                 })
                 .collect();
-            let mut program = front::mir::build_semantic_program_from_llbcs(&llbcs)
-                .unwrap_or_else(|e| panic!("Step 4.4 cutover: lower llbcs {paths:?}: {e}"));
+            let mut program = front::mir::build_semantic_program_from_llbcs_with_static_addrs(
+                &llbcs,
+                static_addrs,
+            )
+            .unwrap_or_else(|e| panic!("Step 4.4 cutover: lower llbcs {paths:?}: {e}"));
             // JIT-hint pass.  pyre's proc-macro attributes
             // (`#[majit_macros::elidable*]` / `dont_look_inside` /
             // `loop_invariant` / `unroll_safe`) are consumed by the
@@ -167,7 +170,7 @@ fn build_semantic_program_via_active_frontend(
             // marker consts (`_elidable_function_<NAME>`, …) next to each
             // annotated fn.  Charon extracts those into `global_decls`;
             // `front::llbc_hints` reads them back and the hints merge into
-            // the MIR-driven SemanticProgram by leaf name — the analog of
+            // the MIR-driven SemanticProgram by qualified path — the analog of
             // RPython's translator reading `func._elidable_function_` off
             // the function object.
             merge_hints_from_llbcs(&mut program, &llbcs);
@@ -189,7 +192,7 @@ fn build_semantic_program_via_active_frontend(
     panic!(
         "no LLBC source resolved.\n\
          Run `scripts/extract-llbc.sh` to produce \
-         `build/llbc/{{pyre-object,pyre-interpreter}}.ullbc`, \
+         `build/llbc/{{pyre-object,pyre-interpreter,pyre-jit}}.ullbc`, \
          or set `PYRE_MIR_FRONTEND_LLBC` to an OS path-list \
          (`;`-separated on Windows, `:` elsewhere) explicitly."
     );
@@ -243,19 +246,17 @@ fn auto_discover_workspace_llbc_paths(
     // omitted — it is empty in current builds and adds nothing.
     // `corpus.ullbc` is the Charon fixture, not production.
     //
-    // The set is fixed at exactly this pair so the generated
+    // The set is fixed at exactly these crates so the generated
     // `all_jitcodes` table is environment-invariant: the build consumes
     // the same `.ullbc` inputs regardless of which artefacts happen to
     // sit in `build/llbc/`, so a local tree and CI produce byte-identical
-    // codegen.  `pyre-jit.ullbc` (which `extract-llbc.sh pyre-jit` can
-    // still produce for experimentation) is deliberately NOT discovered
-    // here — its `PyreBlackholeAllocator::bh_*` / `allocate_*` /
-    // `box_int` / `box_float` / `Drop::drop` entries are semantically
-    // residual runtime calls (the deopt-fallback allocator, not traced
-    // code), so the `extract_*` `graph: None` placeholder is their
-    // correct representation.  Their absence from the discovered set is
-    // therefore by-design, not a coverage gap.
-    const REQUIRED: &[&str] = &["pyre-object.ullbc", "pyre-interpreter.ullbc"];
+    // codegen.  `pyre-jit.ullbc` is required because it hosts the
+    // `eval_loop_jit` portal and helper bodies referenced by the trace.
+    const REQUIRED: &[&str] = &[
+        "pyre-object.ullbc",
+        "pyre-interpreter.ullbc",
+        "pyre-jit.ullbc",
+    ];
     let mut paths = Vec::with_capacity(REQUIRED.len());
     for name in REQUIRED {
         let p = llbc_dir.join(name);
@@ -274,22 +275,22 @@ fn auto_discover_workspace_llbc_paths(
 /// `#[doc(hidden)]` marker consts the `majit_macros` proc-macros emit
 /// (`_elidable_function_<NAME>`, `_jit_elidable_cannot_raise_<NAME>`,
 /// `_jit_look_inside_<NAME>`, …) out of Charon's `global_decls`,
-/// keyed by the fn leaf name.  Each `SemanticFunction` is matched by
-/// the trailing segment of its `name` (Charon's `name_path` form,
-/// e.g. `pyre_interpreter::frame::Frame::pop`) and the hints copied in.
-///
-/// Matches by leaf because the marker const and its user fn share the
-/// same leaf but sit in sibling module / impl paths that a full-path
-/// match would never align.
+/// keyed by the crate-stripped function path.  Each `SemanticFunction`
+/// is matched by its `{module_path}::{name}` path so same-named helpers
+/// in different modules cannot inherit each other's hints.
 #[cfg(feature = "mir-frontend")]
 fn merge_hints_from_llbcs(
     program: &mut front::SemanticProgram,
     llbcs: &[majit_charon_reader::Llbc],
 ) {
-    let hints_by_leaf = front::llbc_hints::harvest_hints_from_llbcs(llbcs);
+    let hints_by_path = front::llbc_hints::harvest_hints_from_llbcs(llbcs);
     for f in &mut program.functions {
-        let leaf = f.name.rsplit("::").next().unwrap_or(&f.name);
-        if let Some(h) = hints_by_leaf.get(leaf) {
+        let path = if f.module_path.is_empty() {
+            f.name.clone()
+        } else {
+            format!("{}::{}", f.module_path, f.name)
+        };
+        if let Some(h) = hints_by_path.get(&path) {
             f.hints.clone_from(h);
         }
     }
@@ -675,26 +676,6 @@ fn analyze_pipeline_from_parsed(
         crate::flowspace::rust_source::register::WalkerAliasFloorGuard::install(
             parsed_files.iter().map(|p| &p.file),
         );
-    // Use-import resolver: harvest `(bare_name → defining_module_path)`
-    // from every `ParsedInterpreter.module_path` non-empty entry, then
-    // publish into the `majit_ir::descr::STRUCT_ORIGIN_REGISTRY` global
-    // so subsequent `canonical_struct_name` lookups at `path_hash`
-    // sites resolve bare struct tokens to their qualified canonical
-    // form (PyPy `bookkeeper.getdesc(TYPE)` analog).  Empty
-    // `module_path` files skip registration; their bare-name hashes
-    // still resolve via the runtime's simple-name dual-publish slot.
-    let mut struct_origins: std::collections::HashMap<String, String> =
-        std::collections::HashMap::new();
-    for parsed in parsed_files {
-        if !parsed.module_path.is_empty() {
-            front::syn_metadata::collect_struct_origins(
-                &parsed.file.items,
-                &parsed.module_path,
-                &mut struct_origins,
-            );
-        }
-    }
-    majit_ir::descr::register_struct_origins(struct_origins);
     // `use <path>::*` glob roots are expanded into explicit
     // `use_imports` entries inside
     // `build_semantic_program_*_with_options` so the front-end
@@ -735,8 +716,72 @@ fn analyze_pipeline_from_parsed(
     // source is a Charon-extracted .ullbc snapshot (produced by
     // `scripts/extract-llbc.sh`), located via `PYRE_MIR_FRONTEND_LLBC`
     // or workspace auto-discovery.
-    mark_phase!("known_statics + struct_origins + struct_field_attrs populated");
-    let program = build_semantic_program_via_active_frontend(parsed_files);
+    mark_phase!("known_statics + struct_field_attrs populated");
+    let program = build_semantic_program_via_active_frontend(parsed_files, static_addrs);
+    // Publish the `(bare struct leaf → defining crate-relative module
+    // path)` map into the process-global `STRUCT_ORIGIN_REGISTRY` so the
+    // later `jit_codewriter` `canonical_struct_name` `path_hash` sites
+    // resolve bare struct tokens to their qualified canonical form (PyPy
+    // `bookkeeper.getdesc(TYPE)` analog).  Derived from the LLBC
+    // `iter_type_decls()` name paths in
+    // `front::mir::derive_program_metadata`; any leaf absent from the map
+    // still resolves through the runtime's simple-name dual-publish slot.
+    majit_ir::descr::register_struct_origins(program.struct_origins.clone());
+    // Tier-3 shadow probe: the syn `pre_register_struct_fields_from_file`
+    // pass above is still the active writer of
+    // `FORCE_ATTRIBUTES_INTO_CLASSES`.  Project the LLBC-sourced
+    // `program.struct_field_attrs` through the same
+    // `valuetype_to_someshell` write-time shelling and diff the two maps
+    // over the shared keys: the cutover is safe only when every shared
+    // qualname carries an identical field→someshell map.  `syn_only`
+    // mirrors the struct-set gap already characterised for
+    // `struct_origins` (cfg(test) / jit-crate structs Charon does not
+    // extract); `ull_only` is the benign crate-type superset.  Summary
+    // only, no panic, so it cannot affect the gate.
+    {
+        let syn_map = crate::annotator::classdesc::forced_attributes_snapshot();
+        let mut ull_map: std::collections::HashMap<
+            String,
+            indexmap::IndexMap<String, crate::annotator::model::SomeValue>,
+        > = std::collections::HashMap::new();
+        for (qual, rows) in &program.struct_field_attrs {
+            let mut shelled = indexmap::IndexMap::new();
+            for (name, vt) in rows {
+                if let Some(s) = crate::jit_codewriter::annotation_state::valuetype_to_someshell(vt)
+                {
+                    shelled.insert(name.clone(), s);
+                }
+            }
+            ull_map.insert(qual.clone(), shelled);
+        }
+        let mut mismatch = 0usize;
+        let mut syn_only = 0usize;
+        for (qual, syn_attrs) in &syn_map {
+            match ull_map.get(qual) {
+                Some(u) if u == syn_attrs => {}
+                Some(u) => {
+                    mismatch += 1;
+                    if mismatch <= 20 {
+                        eprintln!(
+                            "TIER3 struct_field_attrs MISMATCH {qual:?}: syn={syn_attrs:?} ull={u:?}"
+                        );
+                    }
+                }
+                None => {
+                    syn_only += 1;
+                    if syn_only <= 20 {
+                        eprintln!("TIER3 struct_field_attrs SYN-ONLY {qual:?}");
+                    }
+                }
+            }
+        }
+        let ull_only = ull_map.keys().filter(|k| !syn_map.contains_key(*k)).count();
+        eprintln!(
+            "TIER3 struct_field_attrs SUMMARY: syn={} ull={} mismatch={mismatch} syn_only={syn_only} ull_only={ull_only}",
+            syn_map.len(),
+            ull_map.len(),
+        );
+    }
     mark_phase!("build_semantic_program_from_parsed_files");
     let mut canonical_trait_impls = Vec::new();
     let mut canonical_inherent_methods = Vec::new();

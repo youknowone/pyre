@@ -60,10 +60,10 @@ pub enum Token {
 
 fn parse_one(raw: i64) -> PyResult<Token> {
     match raw {
+        i64::MIN => Ok(Token::Halt),
         0 => Err("halt-zero forbidden"),
         v if v > 0 => Ok(Token::Add(v)),
-        v if v < 0 => Ok(Token::Sub(-v)),
-        _ => Ok(Token::Halt),
+        v => Ok(Token::Sub(-v)),
     }
 }
 

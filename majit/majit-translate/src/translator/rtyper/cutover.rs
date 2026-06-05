@@ -316,9 +316,10 @@ pub(crate) fn dual_gate_check(legacy_graph: &LegacyGraph) -> Result<(), String> 
 /// production callers consume it directly.  The real path is the
 /// authoritative producer; legacy is the fallback for
 /// Skip-classified graphs.  The legacy-baseline diff inside
-/// `dual_gate_check_with_registry` is not run for production graphs —
-/// `Match` means the real path succeeded, full stop.  Test-time
-/// anchor invariants still run [`dual_gate_check`] for legacy-baseline
+/// `dual_gate_check_with_registry` still runs while the transition is
+/// active; `Match` means the real path succeeded and matched the legacy
+/// baseline when that baseline could be produced.  Test-time anchor
+/// invariants also run [`dual_gate_check`] for legacy-baseline
 /// regression checks against hand-built fixtures.  PyPy
 /// `codewriter.py:33` consumes the rtyper-produced graph directly,
 /// with no dual-gate equivalent; pyre's `Skip` arm is transitional
@@ -472,10 +473,9 @@ pub(crate) fn dual_gate_check_with_registry(
 /// iteration is ascending-slot-index so anchor-test "first
 /// divergence" messages stay deterministic across runs.
 ///
-/// Used as a [`dual_gate_check`] test helper: the production
-/// `dual_gate_check_with_registry` path runs no baseline diff, but
-/// anchor tests still diff the real path against the legacy walker
-/// for hand-built fixtures.
+/// Used by both [`dual_gate_check_with_registry`] and the
+/// [`dual_gate_check`] anchor-test helper to diff the real path against
+/// the legacy walker.
 fn project_value_to_var_to_map(
     value_to_var: &LegacyToTyped,
     constant_concretetypes: &HashMap<Variable, LowLevelType>,

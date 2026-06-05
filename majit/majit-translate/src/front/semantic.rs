@@ -210,6 +210,24 @@ pub struct SemanticProgram {
     /// case value (`ExitCase::Const(Int(K))`, the variant discriminant —
     /// which is *not* the variant index) back into the variant name.
     pub enum_variant_by_discriminant: HashMap<String, HashMap<i64, String>>,
+    /// `bare_struct_name → defining crate-relative module path`,
+    /// harvested from the LLBC `iter_type_decls()` name paths.
+    /// Feeds `majit_ir::descr::STRUCT_ORIGIN_REGISTRY` so
+    /// `canonical_struct_name` resolves a bare leaf to the qualified
+    /// `module::Bare` key the runtime's
+    /// `build_object_descr_group_with_def_path` dual-publishes (the
+    /// crate prefix is stripped to match that def-path convention).
+    pub struct_origins: HashMap<String, String>,
+    /// `crate-relative qualified struct name → declaration-ordered
+    /// `(field, ValueType)` register classes`, harvested from the LLBC
+    /// `iter_type_decls()` struct field types.  Feeds
+    /// `annotator::classdesc::register_struct_fields` →
+    /// `FORCE_ATTRIBUTES_INTO_CLASSES` so `ClassDef::_init_classdef`
+    /// pre-fills `ClassDef.attrs` before the annotator's
+    /// `attrs_populated` narrowing gate.  Key drops the crate prefix to
+    /// match the qualname `_init_classdef` reads; primitive fields carry
+    /// `Int`/`Unsigned`/`Bool`/`Float`, every other shape `Ref(None)`.
+    pub struct_field_attrs: HashMap<String, Vec<(String, crate::model::ValueType)>>,
 }
 
 /// Graph lookup table built from a `SemanticProgram` so the
@@ -401,12 +419,12 @@ pub fn qualify_type_name_with_imports(
     if let Some(full) = use_imports.get(bare) {
         return full.clone();
     }
-    if prefix.is_empty() {
-        return bare.to_string();
-    }
     let canonical = majit_ir::descr::canonical_struct_name(bare);
     if canonical != bare {
         return canonical;
+    }
+    if prefix.is_empty() {
+        return bare.to_string();
     }
     format!("{}::{}", prefix, bare)
 }
@@ -439,11 +457,7 @@ mod tests {
     fn program(functions: Vec<SemanticFunction>) -> SemanticProgram {
         SemanticProgram {
             functions,
-            known_struct_names: Default::default(),
-            known_trait_names: Default::default(),
-            struct_fields: StructFieldRegistry::default(),
-            immutable_fields: Default::default(),
-            enum_variant_by_discriminant: Default::default(),
+            ..Default::default()
         }
     }
 

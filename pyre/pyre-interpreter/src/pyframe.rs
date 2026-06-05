@@ -1018,9 +1018,8 @@ impl PyFrame {
     /// PyFrame constructor body called from `createframe` (PyPy
     /// `baseobjspace.py:796`) when `outer_func` is `None` — sets up the
     /// fixed-array stack, debug data, w_globals binding, and module-level
-    /// `w_locals = w_globals` semantics.  Crate-private: the only caller is
-    /// `createframe`, which canonicalises heap allocation and wraps the
-    /// returned value in `Box<Self>`.
+    /// `w_locals = w_globals` semantics.  Crate-private helper kept as the
+    /// namespace constructor shape even when call sites allocate directly.
     pub(crate) fn new_with_namespace(
         code: *const (),
         execution_context: *const PyExecutionContext,

@@ -326,9 +326,8 @@ fn front_graph_carries_no_synthesized_exception_edges() {
         let Some(body): Option<Unstructured> = fd.unstructured() else {
             continue;
         };
-        let Ok(graph) = lower_fun_decl(&llbc, fd) else {
-            continue;
-        };
+        let graph = lower_fun_decl(&llbc, fd)
+            .unwrap_or_else(|e| panic!("{} failed to lower: {e}", fd.item_meta.name_path()));
 
         // Invariant A.
         for b in &graph.blocks {

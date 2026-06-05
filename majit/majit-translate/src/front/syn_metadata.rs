@@ -9,6 +9,8 @@
 //! Syn-free string classifiers (type-id / generic-arg projections)
 //! live in [`crate::front::typestr`]; they parse no syn tree.
 
+use quote::ToTokens;
+
 /// Extract the declaring trait name from a `dyn T + 'a` bound list:
 /// returns the first `T::Trait`-style bound's canonical path.  Used by
 /// [`type_root_ident`] to key the indirect-call family.
@@ -26,44 +28,6 @@ pub(crate) fn trait_object_root_name(
         ),
         _ => None,
     })
-}
-
-/// Walk every top-level (and nested `mod`) `Item::Struct` declaration
-/// in `items` and record each struct's bare name → defining module
-/// path.  Mirrors PyPy `bookkeeper.getdesc(TYPE)` resolution: every
-/// observed lltype STRUCT identity has a canonical home module; pyre
-/// carries names as strings so this map serves the same role.
-///
-/// Nested `mod foo { struct Bar; }` extends the prefix to `outer::foo`
-/// so the registered origin matches what `path_hash(canonical)` would
-/// produce for the qualified key.  First-write-wins on duplicate bare
-/// names — callers can disambiguate via use-import alias.
-pub fn collect_struct_origins(
-    items: &[syn::Item],
-    module_prefix: &str,
-    origins: &mut std::collections::HashMap<String, String>,
-) {
-    for item in items {
-        match item {
-            syn::Item::Struct(s) => {
-                let bare = s.ident.to_string();
-                origins
-                    .entry(bare)
-                    .or_insert_with(|| module_prefix.to_string());
-            }
-            syn::Item::Mod(m) => {
-                if let Some((_, ref sub_items)) = m.content {
-                    let nested = if module_prefix.is_empty() {
-                        m.ident.to_string()
-                    } else {
-                        format!("{}::{}", module_prefix, m.ident)
-                    };
-                    collect_struct_origins(sub_items, &nested, origins);
-                }
-            }
-            _ => {}
-        }
-    }
 }
 
 /// Classify a Rust parameter/return `syn::Type` into one of the
@@ -120,40 +84,33 @@ pub fn classify_fn_arg_ty(ty: &syn::Type) -> crate::model::ValueType {
 }
 
 /// RPython lltype.Struct objects have globally unique identities;
-/// returning all path segments ensures `a::Foo` and `b::Foo` don't
-/// alias.  Recurses through `Box`/`Rc`/`Arc` so `Box<dyn Trait>`
-/// returns the trait root, not the container.
+/// returning all path segments plus qualifiers keeps `&a::Foo`,
+/// `*mut a::Foo`, and `a::Foo<'x, N>` from collapsing to the same key.
 pub(crate) fn type_root_ident(ty: &syn::Type) -> Option<String> {
     match ty {
-        syn::Type::Path(path) => {
-            if let Some(last) = path.path.segments.last() {
-                let wrapper = last.ident.to_string();
-                if matches!(wrapper.as_str(), "Box" | "Rc" | "Arc") {
-                    if let syn::PathArguments::AngleBracketed(args) = &last.arguments {
-                        for arg in &args.args {
-                            if let syn::GenericArgument::Type(inner) = arg {
-                                if let Some(root) = type_root_ident(inner) {
-                                    return Some(root);
-                                }
-                            }
-                        }
-                    }
-                }
+        syn::Type::Path(path) => render_path_type(path),
+        syn::Type::Reference(reference) => {
+            let inner = type_root_ident(&reference.elem)?;
+            let mut out = String::from("&");
+            if let Some(lifetime) = &reference.lifetime {
+                out.push_str(&lifetime.to_token_stream().to_string());
+                out.push(' ');
             }
-            let segments: Vec<_> = path
-                .path
-                .segments
-                .iter()
-                .map(|s| s.ident.to_string())
-                .collect();
-            if segments.is_empty() {
-                None
-            } else {
-                Some(segments.join("::"))
+            if reference.mutability.is_some() {
+                out.push_str("mut ");
             }
+            out.push_str(&inner);
+            Some(out)
         }
-        syn::Type::Reference(reference) => type_root_ident(&reference.elem),
-        syn::Type::Ptr(ptr) => type_root_ident(&ptr.elem),
+        syn::Type::Ptr(ptr) => {
+            let inner = type_root_ident(&ptr.elem)?;
+            let mutability = if ptr.mutability.is_some() {
+                "*mut"
+            } else {
+                "*const"
+            };
+            Some(format!("{mutability} {inner}"))
+        }
         syn::Type::Paren(paren) => type_root_ident(&paren.elem),
         syn::Type::Group(group) => type_root_ident(&group.elem),
         syn::Type::TraitObject(obj) => {
@@ -161,5 +118,53 @@ pub(crate) fn type_root_ident(ty: &syn::Type) -> Option<String> {
         }
         syn::Type::ImplTrait(_) => None,
         _ => None,
+    }
+}
+
+fn render_path_type(path: &syn::TypePath) -> Option<String> {
+    let segments: Vec<String> = path
+        .path
+        .segments
+        .iter()
+        .map(render_path_segment)
+        .collect::<Option<_>>()?;
+    if segments.is_empty() {
+        None
+    } else {
+        Some(segments.join("::"))
+    }
+}
+
+fn render_path_segment(seg: &syn::PathSegment) -> Option<String> {
+    let ident = seg.ident.to_string();
+    match &seg.arguments {
+        syn::PathArguments::None => Some(ident),
+        syn::PathArguments::AngleBracketed(args) => {
+            let rendered_args: Vec<String> = args.args.iter().map(render_generic_arg).collect();
+            Some(format!("{ident}<{}>", rendered_args.join(", ")))
+        }
+        syn::PathArguments::Parenthesized(args) => {
+            Some(format!("{ident}{}", args.to_token_stream()))
+        }
+    }
+}
+
+fn render_generic_arg(arg: &syn::GenericArgument) -> String {
+    match arg {
+        syn::GenericArgument::Lifetime(lifetime) => lifetime.to_token_stream().to_string(),
+        syn::GenericArgument::Type(ty) => {
+            type_root_ident(ty).unwrap_or_else(|| ty.to_token_stream().to_string())
+        }
+        syn::GenericArgument::Const(value) => value.to_token_stream().to_string(),
+        syn::GenericArgument::AssocType(binding) => {
+            let value = type_root_ident(&binding.ty)
+                .unwrap_or_else(|| binding.ty.to_token_stream().to_string());
+            format!("{} = {value}", binding.ident)
+        }
+        syn::GenericArgument::AssocConst(binding) => {
+            format!("{} = {}", binding.ident, binding.value.to_token_stream())
+        }
+        syn::GenericArgument::Constraint(constraint) => constraint.to_token_stream().to_string(),
+        _ => arg.to_token_stream().to_string(),
     }
 }

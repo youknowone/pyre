@@ -2058,12 +2058,17 @@ where
     let pair = var_nums.get(op_arg);
     let idx1 = pair.idx_1().as_usize();
     let idx2 = pair.idx_2().as_usize();
-    executor.load_fast_pair_checked(
-        idx1,
-        code.varnames[idx1].as_ref(),
-        idx2,
-        code.varnames[idx2].as_ref(),
-    )?;
+    let name1 = if idx1 < code_varnames_len(code) {
+        code.varnames[idx1].as_ref()
+    } else {
+        "<cell>"
+    };
+    let name2 = if idx2 < code_varnames_len(code) {
+        code.varnames[idx2].as_ref()
+    } else {
+        "<cell>"
+    };
+    executor.load_fast_pair_checked(idx1, name1, idx2, name2)?;
     Ok(StepResult::Continue)
 }
 

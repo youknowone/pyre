@@ -361,7 +361,18 @@ fn real_main() {
     // a not-yet-present path is harmless (Cargo reruns when it appears),
     // so this is safe on a contributor tree without the artefacts.
     println!("cargo::rerun-if-env-changed=PYRE_MIR_FRONTEND_LLBC");
-    for llbc in ["pyre-object.ullbc", "pyre-interpreter.ullbc"] {
+    if let Some(paths) = std::env::var_os("PYRE_MIR_FRONTEND_LLBC") {
+        for path in std::env::split_paths(&paths) {
+            if !path.as_os_str().is_empty() {
+                println!("cargo::rerun-if-changed={}", path.display());
+            }
+        }
+    }
+    for llbc in [
+        "pyre-object.ullbc",
+        "pyre-interpreter.ullbc",
+        "pyre-jit.ullbc",
+    ] {
         println!("cargo::rerun-if-changed={repo_root}/build/llbc/{llbc}");
     }
 }

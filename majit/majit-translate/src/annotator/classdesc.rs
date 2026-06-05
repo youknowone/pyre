@@ -294,6 +294,14 @@ pub fn forced_attributes_for(qualname: &str) -> Option<indexmap::IndexMap<String
     FORCE_ATTRIBUTES_INTO_CLASSES.with(|cell| cell.borrow().get(qualname).cloned())
 }
 
+/// Clone the entire [`FORCE_ATTRIBUTES_INTO_CLASSES`] map.  Used by the
+/// build-time equivalence probe that diffs the syn walker's registrations
+/// against the LLBC-sourced `SemanticProgram::struct_field_attrs`.
+pub fn forced_attributes_snapshot()
+-> indexmap::IndexMap<String, indexmap::IndexMap<String, SomeValue>> {
+    FORCE_ATTRIBUTES_INTO_CLASSES.with(|cell| cell.borrow().clone())
+}
+
 // ---------------------------------------------------------------------------
 // AttrSource (classdesc.py: implicit via duck-typing on InstanceSource /
 // ClassDesc).

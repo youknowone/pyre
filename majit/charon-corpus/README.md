@@ -8,7 +8,7 @@ frontend changes can be tested without re-extracting the full pyre crates.
 
 ## Layout
 
-```
+```text
 charon-corpus/
 ├── README.md              # this file
 ├── Cargo.toml             # the micro-crate (representative shapes)

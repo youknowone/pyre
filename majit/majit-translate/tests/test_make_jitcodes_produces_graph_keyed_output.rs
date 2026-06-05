@@ -38,7 +38,7 @@ use std::sync::Arc;
 fn test_make_jitcodes_produces_graph_keyed_output() {
     if !ensure_workspace_llbc_env() {
         eprintln!(
-            "skipping: build/llbc/{{pyre-object,pyre-interpreter}}.ullbc missing — \
+            "skipping: build/llbc/{{pyre-object,pyre-interpreter,pyre-jit}}.ullbc missing — \
              run `scripts/extract-llbc.sh` to enable this test"
         );
         return;
@@ -162,7 +162,11 @@ fn ensure_workspace_llbc_env() -> bool {
         .join("..")
         .join("..");
     let llbc_dir = workspace_root.join("build").join("llbc");
-    let required = ["pyre-object.ullbc", "pyre-interpreter.ullbc"];
+    let required = [
+        "pyre-object.ullbc",
+        "pyre-interpreter.ullbc",
+        "pyre-jit.ullbc",
+    ];
     let mut paths = Vec::with_capacity(required.len());
     for name in required {
         let p = llbc_dir.join(name);

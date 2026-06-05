@@ -120,6 +120,13 @@ pub fn lower_function(llbc: &Llbc, function_name: &str) -> Result<FunctionGraph,
 pub fn build_semantic_program_from_llbcs(
     llbcs: &[Llbc],
 ) -> Result<crate::front::semantic::SemanticProgram, LowerError> {
+    build_semantic_program_from_llbcs_with_static_addrs(llbcs, crate::HostStaticAddrs::default())
+}
+
+pub fn build_semantic_program_from_llbcs_with_static_addrs(
+    llbcs: &[Llbc],
+    static_addrs: crate::HostStaticAddrs<'_>,
+) -> Result<crate::front::semantic::SemanticProgram, LowerError> {
     let mut merged: Option<crate::front::semantic::SemanticProgram> = None;
     // Dedup key combines `self_ty_root` (the impl owner, when known),
     // `module_path`, and `name`.  Without `self_ty_root`, two distinct
@@ -145,7 +152,7 @@ pub fn build_semantic_program_from_llbcs(
         }
     };
     for llbc in llbcs {
-        let prog = build_semantic_program_from_llbc(llbc)?;
+        let prog = build_semantic_program_from_llbc_with_static_addrs(llbc, static_addrs)?;
         match &mut merged {
             None => {
                 for f in &prog.functions {
@@ -183,6 +190,12 @@ pub fn build_semantic_program_from_llbcs(
                         .entry(enum_key)
                         .or_insert(by_discr);
                 }
+                for (leaf, module) in prog.struct_origins {
+                    acc.struct_origins.entry(leaf).or_insert(module);
+                }
+                for (key, rows) in prog.struct_field_attrs {
+                    acc.struct_field_attrs.entry(key).or_insert(rows);
+                }
             }
         }
     }
@@ -194,6 +207,8 @@ pub fn build_semantic_program_from_llbcs(
             struct_fields: crate::front::semantic::StructFieldRegistry::default(),
             immutable_fields: std::collections::HashMap::new(),
             enum_variant_by_discriminant: std::collections::HashMap::new(),
+            struct_origins: std::collections::HashMap::new(),
+            struct_field_attrs: std::collections::HashMap::new(),
         }),
     )
 }
@@ -236,9 +251,22 @@ fn is_known_lowering_gap(msg: &str) -> bool {
 pub fn build_semantic_program_from_llbc(
     llbc: &Llbc,
 ) -> Result<crate::front::semantic::SemanticProgram, LowerError> {
+    build_semantic_program_from_llbc_with_static_addrs(llbc, crate::HostStaticAddrs::default())
+}
+
+pub fn build_semantic_program_from_llbc_with_static_addrs(
+    llbc: &Llbc,
+    static_addrs: crate::HostStaticAddrs<'_>,
+) -> Result<crate::front::semantic::SemanticProgram, LowerError> {
     // ── Pass 1: walk type_decls + trait_decls ─────────────────────
-    let (known_struct_names, known_trait_names, struct_fields, enum_variant_by_discriminant) =
-        derive_program_metadata(llbc);
+    let (
+        known_struct_names,
+        known_trait_names,
+        struct_fields,
+        enum_variant_by_discriminant,
+        struct_origins,
+        struct_field_attrs,
+    ) = derive_program_metadata(llbc);
 
     // ── Pass 2: lower every function body and build SemanticFunctions ─
     let mut functions = Vec::new();
@@ -276,7 +304,7 @@ pub fn build_semantic_program_from_llbc(
         // production keeps going with a degraded SemanticProgram —
         // failing-loud on the single broken function rather than
         // erroring out at program-build time.
-        let graph = match lower_fun_decl(llbc, fd) {
+        let graph = match lower_fun_decl_with_static_addrs(llbc, fd, static_addrs) {
             Ok(g) => g,
             Err(e) => {
                 skipped.push((name.clone(), e.to_string()));
@@ -376,6 +404,8 @@ pub fn build_semantic_program_from_llbc(
         // proc-macro hints).
         immutable_fields: std::collections::HashMap::new(),
         enum_variant_by_discriminant,
+        struct_origins,
+        struct_field_attrs,
     })
 }
 
@@ -383,11 +413,15 @@ pub fn build_semantic_program_from_llbc(
 /// Charon's `type_decls` + `trait_decls` tables.
 ///
 /// Returns `(known_struct_names, known_trait_names, struct_fields,
-/// enum_variant_by_discriminant)`.
+/// enum_variant_by_discriminant, struct_origins, struct_field_attrs)`.
 /// Names are taken from `item_meta.name_path()`; struct field rows
 /// resolve their type string via [`tyref_to_ast_string`] (Charon-resolved
 /// types: references stripped, raw pointers kept, `Vec<T>` / `[T;N]`
-/// generics, named structs by leaf).
+/// generics, named structs by leaf).  `struct_origins` maps a bare
+/// struct leaf to its defining module path with the crate prefix
+/// stripped (so the value matches the runtime def-path convention).
+/// `struct_field_attrs` maps the crate-stripped qualified struct name to
+/// its declaration-ordered `(field, ValueType)` register classes.
 fn derive_program_metadata(
     llbc: &Llbc,
 ) -> (
@@ -395,6 +429,8 @@ fn derive_program_metadata(
     std::collections::HashSet<String>,
     crate::front::semantic::StructFieldRegistry,
     std::collections::HashMap<String, std::collections::HashMap<i64, String>>,
+    std::collections::HashMap<String, String>,
+    std::collections::HashMap<String, Vec<(String, ValueType)>>,
 ) {
     let mut known_struct_names = std::collections::HashSet::new();
     let mut known_trait_names = std::collections::HashSet::new();
@@ -403,6 +439,10 @@ fn derive_program_metadata(
         String,
         std::collections::HashMap<i64, String>,
     > = std::collections::HashMap::new();
+    let mut struct_origins: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    let mut struct_field_attrs: std::collections::HashMap<String, Vec<(String, ValueType)>> =
+        std::collections::HashMap::new();
 
     for td in llbc.iter_type_decls() {
         let name = td.item_meta.name_path();
@@ -422,6 +462,40 @@ fn derive_program_metadata(
                     .collect();
                 struct_fields.fields.insert(name.clone(), rows.clone());
                 struct_fields.fields.insert(leaf.clone(), rows);
+                // `bare leaf → crate-relative module`: drop the crate
+                // prefix (first segment) and the leaf (last segment) so
+                // the value matches the runtime def-path
+                // (`intobject::W_IntObject` ← `pyre_object::intobject::
+                // W_IntObject`).  First-write-wins on duplicate leaves
+                // defined in distinct modules; the loser's qualified
+                // `name` key still resolves through the dual-publish.
+                let segs: Vec<&str> = name.split("::").collect();
+                let module = if segs.len() >= 2 {
+                    segs[1..segs.len() - 1].join("::")
+                } else {
+                    String::new()
+                };
+                struct_origins.entry(leaf.clone()).or_insert(module);
+                // Register-class rows for `FORCE_ATTRIBUTES_INTO_CLASSES`,
+                // keyed by the crate-stripped qualified name (drop only the
+                // crate prefix, keep the module path + leaf) the
+                // `_init_classdef` read uses.  Declaration order is
+                // preserved so the pre-filled `ClassDef.attrs` match the
+                // struct layout.  Last-writer-wins on the crate-stripped key.
+                let attr_key = if segs.len() >= 2 {
+                    segs[1..].join("::")
+                } else {
+                    leaf.clone()
+                };
+                let attr_rows: Vec<(String, ValueType)> = fields
+                    .iter()
+                    .enumerate()
+                    .map(|(i, f)| {
+                        let fname = f.name.clone().unwrap_or_else(|| format!("__pos_{i}"));
+                        (fname, tyref_to_attr_value_type(&f.ty, llbc))
+                    })
+                    .collect();
+                struct_field_attrs.insert(attr_key, attr_rows);
                 known_struct_names.insert(name);
                 known_struct_names.insert(leaf);
             }
@@ -466,11 +540,21 @@ fn derive_program_metadata(
         known_trait_names,
         struct_fields,
         enum_variant_by_discriminant,
+        struct_origins,
+        struct_field_attrs,
     )
 }
 
 /// Lower a single Charon [`FunDecl`] to a [`FunctionGraph`].
 pub fn lower_fun_decl(llbc: &Llbc, fd: &FunDecl) -> Result<FunctionGraph, LowerError> {
+    lower_fun_decl_with_static_addrs(llbc, fd, crate::HostStaticAddrs::default())
+}
+
+pub fn lower_fun_decl_with_static_addrs(
+    llbc: &Llbc,
+    fd: &FunDecl,
+    static_addrs: crate::HostStaticAddrs<'_>,
+) -> Result<FunctionGraph, LowerError> {
     let u = fd.unstructured().ok_or_else(|| {
         LowerError::Unsupported(format!(
             "{}: no Unstructured body (extracted with --ullbc?)",
@@ -478,7 +562,7 @@ pub fn lower_fun_decl(llbc: &Llbc, fd: &FunDecl) -> Result<FunctionGraph, LowerE
         ))
     })?;
     let name = fd.item_meta.name_path();
-    let mut lo = Lowering::new(llbc, name.clone(), &u)?;
+    let mut lo = Lowering::new(llbc, name.clone(), &u, static_addrs)?;
     match lo.lower(BlockOrder::Linear) {
         Ok(()) => Ok(lo.graph),
         // A forward-referenced definition — typically a `TermKind::Call`
@@ -491,7 +575,7 @@ pub fn lower_fun_decl(llbc: &Llbc, fd: &FunDecl) -> Result<FunctionGraph, LowerE
         // (`classify_uninitialised_local_rpo_vs_loop_carried`: 0
         // loop-carried, so no phi / block-inputarg threading is needed).
         Err(LowerError::Unsupported(msg)) if is_known_lowering_gap(&msg) => {
-            let mut lo = Lowering::new(llbc, name, &u)?;
+            let mut lo = Lowering::new(llbc, name, &u, static_addrs)?;
             lo.lower(BlockOrder::ReversePostorder)?;
             Ok(lo.graph)
         }
@@ -542,6 +626,8 @@ struct Lowering<'a> {
     graph: FunctionGraph,
     llbc: &'a Llbc,
     body: &'a Unstructured,
+    static_addrs: crate::HostStaticAddrs<'a>,
+    arg_count: usize,
     /// `local_var[i] = Some(var)` once MIR local `i` has been bound to
     /// a flowspace Variable. Slot 0 is the return value, 1..arg_count
     /// are arguments, the rest are introduced lazily by the first
@@ -552,6 +638,14 @@ struct Lowering<'a> {
     local_var: Vec<Option<Variable>>,
     /// `block_id[i]` = FunctionGraph BlockId for MIR basic block `i`.
     block_id: Vec<BlockId>,
+    /// MIR locals that are live when entering each block. Non-entry
+    /// blocks receive these through `Block.inputargs`, and predecessor
+    /// edges pass the matching current Variables via `Link.args`.
+    block_live_in: Vec<Vec<bool>>,
+    block_entry_local_var: Vec<Vec<Option<Variable>>>,
+    block_entry_positional_aggregate_locals: Vec<std::collections::HashMap<usize, String>>,
+    block_positional_seen: Vec<Vec<bool>>,
+    block_positional_conflict: Vec<Vec<bool>>,
     /// Maps each MIR local whose current binding was produced by a
     /// positional [`Rvalue::Aggregate`] (tuple / array / closure — any
     /// kind for which [`Lowering::resolve_aggregate_adt`] returns
@@ -573,7 +667,12 @@ struct Lowering<'a> {
 }
 
 impl<'a> Lowering<'a> {
-    fn new(llbc: &'a Llbc, name: String, body: &'a Unstructured) -> Result<Self, LowerError> {
+    fn new(
+        llbc: &'a Llbc,
+        name: String,
+        body: &'a Unstructured,
+        static_addrs: crate::HostStaticAddrs<'a>,
+    ) -> Result<Self, LowerError> {
         let mut graph = FunctionGraph::new(name);
         let n_locals = body.locals.locals.len();
         let mut local_var: Vec<Option<Variable>> = vec![None; n_locals];
@@ -638,36 +737,51 @@ impl<'a> Lowering<'a> {
         for _ in 1..body.body.len() {
             block_id.push(graph.create_block());
         }
+        let block_live_in = compute_mir_liveness(body);
+        let mut block_entry_local_var = vec![vec![None; n_locals]; body.body.len()];
+        let block_entry_positional_aggregate_locals =
+            vec![std::collections::HashMap::new(); body.body.len()];
+        if !block_entry_local_var.is_empty() {
+            block_entry_local_var[0] = local_var.clone();
+        }
+        for mir_bb in 1..body.body.len() {
+            for local_idx in 0..n_locals {
+                if !block_live_in
+                    .get(mir_bb)
+                    .and_then(|locals| locals.get(local_idx))
+                    .copied()
+                    .unwrap_or(false)
+                {
+                    continue;
+                }
+                let var = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                graph.push_inputarg_var(block_id[mir_bb], var.clone());
+                block_entry_local_var[mir_bb][local_idx] = Some(var);
+            }
+        }
 
         Ok(Self {
             graph,
             llbc,
             body,
+            static_addrs,
+            arg_count,
             local_var,
             block_id,
+            block_live_in,
+            block_entry_local_var,
+            block_entry_positional_aggregate_locals,
+            block_positional_seen: vec![vec![false; n_locals]; body.body.len()],
+            block_positional_conflict: vec![vec![false; n_locals]; body.body.len()],
             positional_aggregate_locals: std::collections::HashMap::new(),
         })
     }
 
     fn lower(&mut self, order: BlockOrder) -> Result<(), LowerError> {
-        // Per the §"Reference" section above there is no mergeblock
-        // dance — every MIR basic block is its own join point, fully
-        // prepared by `create_block` / `startblock`, and locals live in
-        // the function-wide `local_var` table rather than being threaded
-        // as block inputargs.  `local_var` is a single monotonic slot
-        // per local, so iteration order only governs *when* each block
-        // writes its defs: a read binds as soon as *any* defining block
-        // precedes it in processing order.  The default is MIR-index
-        // (`Linear`) order.  It fails only when a definition
-        // (notably a `TermKind::Call` dest) sits at a higher MIR index
-        // than a block that reads it, producing a spurious "uninitialised
-        // local"; `lower_fun_decl` then re-lowers in `ReversePostorder`,
-        // which visits the defining block before the reading block
-        // whenever the def forward-reaches the read.  Every such read is a
-        // *forward* reference, never a back-edge-only definition (proven
-        // by `classify_uninitialised_local_rpo_vs_loop_carried`: 15
-        // forward-ref, 0 loop-carried), so RPO binds all of them without
-        // any phi / block-inputarg threading.
+        // Each MIR basic block is a FlowGraph block.  Locals live across
+        // a successor edge are explicit `Link.args` into the target
+        // block's `inputargs`, mirroring FlowContext.mergeblock rather
+        // than relying on a function-wide slot table.
         for mir_bb in self.block_processing_order(order) {
             self.lower_block(mir_bb)?;
         }
@@ -761,6 +875,9 @@ impl<'a> Lowering<'a> {
 
     fn lower_block(&mut self, mir_bb: usize) -> Result<(), LowerError> {
         let bb: &BasicBlock = &self.body.body[mir_bb];
+        self.local_var = self.block_entry_local_var[mir_bb].clone();
+        self.positional_aggregate_locals =
+            self.block_entry_positional_aggregate_locals[mir_bb].clone();
 
         // 1. Statements -> SpaceOperations on the corresponding block.
         for (s_idx, st) in bb.statements.iter().enumerate() {
@@ -1318,6 +1435,7 @@ impl<'a> Lowering<'a> {
     }
 
     fn resolve_place(&mut self, mir_bb: usize, place: Place) -> Result<Variable, LowerError> {
+        let place_ty = clone_tyref(&place.ty);
         match place.kind {
             PlaceKind::Local(i) => self.local_var[i as usize].clone().ok_or_else(|| {
                 LowerError::Unsupported(format!(
@@ -1412,24 +1530,26 @@ impl<'a> Lowering<'a> {
                 }
             }
             // `Global { id, .. }` — static/const item reference.
-            // Modeled as a synthetic 0-arg `Call` to a `FunctionPath`
-            // carrying the global's resolved name; downstream
-            // consumers see a uniform call shape and can route on
-            // the name (e.g. recognise `__elidable_function_*` constants
-            // handled by the hint pass).
+            // The production trace supplies host addresses for the
+            // object-space singletons pyre reads from statics. Preserve
+            // those as constants; a synthetic 0-arg call would invent a
+            // callable that neither Rust nor RPython has.
             PlaceKind::Global { id, .. } => {
                 let segments = self.global_segments(mir_bb, id)?;
+                let op = self
+                    .static_addr_op(&segments)
+                    .unwrap_or_else(|| OpKind::Call {
+                        target: CallTarget::FunctionPath { segments },
+                        args: vec![],
+                        result_ty: tyref_to_value_type(&place_ty, self.llbc),
+                    });
                 let res = self
                     .graph
                     .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
                 let bb_id = self.block_id[mir_bb];
                 self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                     result: Some(res.clone()),
-                    kind: OpKind::Call {
-                        target: CallTarget::FunctionPath { segments },
-                        args: vec![],
-                        result_ty: ValueType::Int,
-                    },
+                    kind: op,
                 });
                 Ok(res)
             }
@@ -1611,6 +1731,22 @@ impl<'a> Lowering<'a> {
             })
     }
 
+    fn static_addr_op(&self, segments: &[String]) -> Option<OpKind> {
+        let full = segments.join("::");
+        let stripped = strip_crate_prefix(&full);
+        for (key, addr) in self.static_addrs.pytypes {
+            if static_key_matches(&full, &stripped, key) {
+                return Some(OpKind::ConstInt(*addr));
+            }
+        }
+        for (key, addr) in self.static_addrs.refs {
+            if static_key_matches(&full, &stripped, key) {
+                return Some(OpKind::ConstRefAddr(*addr));
+            }
+        }
+        None
+    }
+
     // -----------------------------------------------------------------------
     // Terminators
     // -----------------------------------------------------------------------
@@ -1651,12 +1787,8 @@ impl<'a> Lowering<'a> {
             }
             TermKind::Goto { target } => {
                 let target_bb = self.block_id[target as usize];
-                // For now: no LinkArgs (MIR locals are function-wide,
-                // and the target block carries no inputargs). The
-                // moment we have a target block with inputargs, this
-                // arm has to thread the matching Variables from
-                // `self.local_var` through `Link::from_variables`.
-                self.graph.set_goto(bb_id, target_bb, vec![]);
+                let args = self.edge_args(mir_bb, target as usize)?;
+                self.graph.set_goto(bb_id, target_bb, args);
                 Ok(())
             }
             TermKind::Assert {
@@ -1675,7 +1807,8 @@ impl<'a> Lowering<'a> {
                 // RPython does the same (`backendopt/removeassert.py`).
                 let _ = on_unwind;
                 let target_bb = self.block_id[target as usize];
-                self.graph.set_goto(bb_id, target_bb, vec![]);
+                let args = self.edge_args(mir_bb, target as usize)?;
+                self.graph.set_goto(bb_id, target_bb, args);
                 Ok(())
             }
             TermKind::Switch { discr, targets } => self.lower_switch(mir_bb, discr, targets),
@@ -1693,7 +1826,8 @@ impl<'a> Lowering<'a> {
             // a deeper inlining level.
             TermKind::Drop { target, .. } => {
                 let target_bb = self.block_id[target as usize];
-                self.graph.set_goto(bb_id, target_bb, vec![]);
+                let args = self.edge_args(mir_bb, target as usize)?;
+                self.graph.set_goto(bb_id, target_bb, args);
                 Ok(())
             }
             TermKind::Unknown => Err(LowerError::Unsupported(format!(
@@ -1859,7 +1993,8 @@ impl<'a> Lowering<'a> {
         // interpreter expresses exceptions as `Result`, so none arises.
         let _ = on_unwind;
         let target_bb = self.block_id[target];
-        self.graph.set_goto(bb_id, target_bb, vec![]);
+        let link_args = self.edge_args(mir_bb, target)?;
+        self.graph.set_goto(bb_id, target_bb, link_args);
         Ok(())
     }
 
@@ -2081,14 +2216,18 @@ impl<'a> Lowering<'a> {
                 // MIR discriminant for an `If` target can be a Ref
                 // (e.g. a SyntheticTransparentCtor result) whereas
                 // jit_codewriter/assembler.rs::FlatOp::GotoIfNot expects
-                // `cond.kind == RegKind::Int`.
+                // `cond.kind == RegKind::Int`.  `true_args` / `false_args`
+                // carry each target block's input arguments; `set_branch`
+                // asserts their arity against the block's `inputargs`.
+                let then_args = self.edge_args(mir_bb, then_bb as usize)?;
+                let else_args = self.edge_args(mir_bb, else_bb as usize)?;
                 self.graph.set_branch(
                     bb_id,
                     discr_var,
                     self.block_id[then_bb as usize],
-                    vec![],
+                    then_args,
                     self.block_id[else_bb as usize],
-                    vec![],
+                    else_args,
                 );
                 Ok(())
             }
@@ -2100,9 +2239,11 @@ impl<'a> Lowering<'a> {
                             "bb{mir_bb}: SwitchInt case scalar shape not yet supported: {scalar}"
                         ))
                     })?;
+                    let args = self.edge_args(mir_bb, bb as usize)?;
                     links.push(
-                        Link::new_mixed(
-                            vec![],
+                        Link::from_variables(
+                            &self.graph,
+                            args,
                             self.block_id[bb as usize],
                             Some(ExitCase::Const(case)),
                         )
@@ -2110,9 +2251,11 @@ impl<'a> Lowering<'a> {
                         .with_llexitcase_from_exitcase(),
                     );
                 }
+                let default_args = self.edge_args(mir_bb, default as usize)?;
                 links.push(
-                    Link::new_mixed(
-                        vec![],
+                    Link::from_variables(
+                        &self.graph,
+                        default_args,
                         self.block_id[default as usize],
                         Some(ExitCase::Const(ConstValue::UniStr("default".into()))),
                     )
@@ -2124,11 +2267,263 @@ impl<'a> Lowering<'a> {
             }
         }
     }
+
+    fn edge_args(&mut self, from_bb: usize, target_bb: usize) -> Result<Vec<Variable>, LowerError> {
+        let local_indices = self.target_input_locals(target_bb)?;
+        let mut args = Vec::with_capacity(local_indices.len());
+        for local_idx in local_indices {
+            let var = self
+                .local_var
+                .get(local_idx)
+                .and_then(Clone::clone)
+                .ok_or_else(|| {
+                    LowerError::Unsupported(format!(
+                        "bb{from_bb}: edge to bb{target_bb} needs live MIR local {local_idx}, \
+                         but it is uninitialised"
+                    ))
+                })?;
+            self.merge_positional_aggregate_state(target_bb, local_idx);
+            args.push(var);
+        }
+        Ok(args)
+    }
+
+    fn target_input_locals(&self, target_bb: usize) -> Result<Vec<usize>, LowerError> {
+        if target_bb >= self.block_id.len() {
+            return Err(LowerError::Schema(format!(
+                "edge references unknown target bb{target_bb}"
+            )));
+        }
+        if target_bb == 0 {
+            let mut locals = Vec::with_capacity(self.arg_count);
+            for local_idx in 1..=self.arg_count {
+                locals.push(local_idx);
+            }
+            for (local_idx, live) in self
+                .block_live_in
+                .get(target_bb)
+                .into_iter()
+                .flat_map(|v| v.iter())
+                .copied()
+                .enumerate()
+            {
+                if live && (local_idx == 0 || local_idx > self.arg_count) {
+                    return Err(LowerError::Unsupported(format!(
+                        "edge to startblock bb0 requires non-argument MIR local {local_idx}"
+                    )));
+                }
+            }
+            return Ok(locals);
+        }
+        Ok(self
+            .block_live_in
+            .get(target_bb)
+            .map(|locals| {
+                locals
+                    .iter()
+                    .copied()
+                    .enumerate()
+                    .filter_map(|(idx, live)| live.then_some(idx))
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
+    fn merge_positional_aggregate_state(&mut self, target_bb: usize, local_idx: usize) {
+        if target_bb >= self.block_positional_seen.len()
+            || local_idx >= self.block_positional_seen[target_bb].len()
+            || self.block_positional_conflict[target_bb][local_idx]
+        {
+            return;
+        }
+        let incoming = self.positional_aggregate_locals.get(&local_idx).cloned();
+        if !self.block_positional_seen[target_bb][local_idx] {
+            self.block_positional_seen[target_bb][local_idx] = true;
+            if let Some(owner) = incoming {
+                self.block_entry_positional_aggregate_locals[target_bb].insert(local_idx, owner);
+            }
+            return;
+        }
+        let current = self.block_entry_positional_aggregate_locals[target_bb]
+            .get(&local_idx)
+            .cloned();
+        if current != incoming {
+            self.block_positional_conflict[target_bb][local_idx] = true;
+            self.block_entry_positional_aggregate_locals[target_bb].remove(&local_idx);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+fn compute_mir_liveness(body: &Unstructured) -> Vec<Vec<bool>> {
+    let n_blocks = body.body.len();
+    let n_locals = body.locals.locals.len();
+    let mut uses = vec![vec![false; n_locals]; n_blocks];
+    let mut defs = vec![vec![false; n_locals]; n_blocks];
+    let mut succs = vec![Vec::<usize>::new(); n_blocks];
+
+    for (bb_idx, bb) in body.body.iter().enumerate() {
+        for stmt in &bb.statements {
+            let Ok(kind) = stmt.stmt_kind() else {
+                continue;
+            };
+            match kind {
+                StmtKind::Assign(place, rvalue) => {
+                    mark_rvalue_uses(&rvalue, &mut uses[bb_idx], &defs[bb_idx]);
+                    mark_place_write(&place, &mut uses[bb_idx], &mut defs[bb_idx]);
+                }
+                StmtKind::PlaceMention(place) => {
+                    mark_place_use(&place, &mut uses[bb_idx], &defs[bb_idx])
+                }
+                StmtKind::Assert(assert) => {
+                    mark_operand_use(&assert.cond, &mut uses[bb_idx], &defs[bb_idx])
+                }
+                StmtKind::StorageLive(_) | StmtKind::StorageDead(_) | StmtKind::Unknown => {}
+            }
+        }
+        let Ok(term) = bb.term() else {
+            continue;
+        };
+        match term {
+            TermKind::Return => mark_local_use(0, &mut uses[bb_idx], &defs[bb_idx]),
+            TermKind::Goto { target } => push_successor(&mut succs[bb_idx], target, n_blocks),
+            TermKind::Switch { discr, targets } => {
+                mark_operand_use(&discr, &mut uses[bb_idx], &defs[bb_idx]);
+                match targets {
+                    SwitchTargets::If(a, b) => {
+                        push_successor(&mut succs[bb_idx], a, n_blocks);
+                        push_successor(&mut succs[bb_idx], b, n_blocks);
+                    }
+                    SwitchTargets::SwitchInt(_, arms, default) => {
+                        for (_, bb) in arms {
+                            push_successor(&mut succs[bb_idx], bb, n_blocks);
+                        }
+                        push_successor(&mut succs[bb_idx], default, n_blocks);
+                    }
+                }
+            }
+            TermKind::Call { call, target, .. } => {
+                mark_call_uses(&call, &mut uses[bb_idx], &defs[bb_idx]);
+                mark_place_write(&call.dest, &mut uses[bb_idx], &mut defs[bb_idx]);
+                push_successor(&mut succs[bb_idx], target, n_blocks);
+            }
+            TermKind::Assert { assert, target, .. } => {
+                mark_operand_use(&assert.cond, &mut uses[bb_idx], &defs[bb_idx]);
+                push_successor(&mut succs[bb_idx], target, n_blocks);
+            }
+            TermKind::Drop { target, .. } => push_successor(&mut succs[bb_idx], target, n_blocks),
+            TermKind::UnwindResume | TermKind::Abort(_) | TermKind::Unknown => {}
+        }
+    }
+
+    let mut live_in = vec![vec![false; n_locals]; n_blocks];
+    let mut live_out = vec![vec![false; n_locals]; n_blocks];
+    loop {
+        let mut changed = false;
+        for bb_idx in (0..n_blocks).rev() {
+            let mut new_out = vec![false; n_locals];
+            for &succ in &succs[bb_idx] {
+                for (idx, live) in live_in[succ].iter().copied().enumerate() {
+                    new_out[idx] |= live;
+                }
+            }
+            let mut new_in = uses[bb_idx].clone();
+            for idx in 0..n_locals {
+                new_in[idx] |= new_out[idx] && !defs[bb_idx][idx];
+            }
+            if new_out != live_out[bb_idx] || new_in != live_in[bb_idx] {
+                live_out[bb_idx] = new_out;
+                live_in[bb_idx] = new_in;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    live_in
+}
+
+fn push_successor(out: &mut Vec<usize>, target: u64, n_blocks: usize) {
+    let target = target as usize;
+    if target < n_blocks && !out.contains(&target) {
+        out.push(target);
+    }
+}
+
+fn mark_call_uses(call: &CallPayload, uses: &mut [bool], defs: &[bool]) {
+    if let CallFunc::Dynamic(op) = &call.func {
+        mark_operand_use(op, uses, defs);
+    }
+    for arg in &call.args {
+        mark_operand_use(arg, uses, defs);
+    }
+}
+
+fn mark_rvalue_uses(rvalue: &Rvalue, uses: &mut [bool], defs: &[bool]) {
+    match rvalue {
+        Rvalue::Use(op)
+        | Rvalue::UnaryOp(_, op)
+        | Rvalue::Cast(_, op, _)
+        | Rvalue::Repeat(op, _, _)
+        | Rvalue::ShallowInitBox(op, _) => mark_operand_use(op, uses, defs),
+        Rvalue::BinaryOp(_, lhs, rhs) => {
+            mark_operand_use(lhs, uses, defs);
+            mark_operand_use(rhs, uses, defs);
+        }
+        Rvalue::Ref { place, .. }
+        | Rvalue::RawPtr { place, .. }
+        | Rvalue::Len(place)
+        | Rvalue::Discriminant(place) => mark_place_use(place, uses, defs),
+        Rvalue::Aggregate(_, operands) => {
+            for op in operands {
+                mark_operand_use(op, uses, defs);
+            }
+        }
+        Rvalue::NullaryOp(_, _) | Rvalue::Unknown => {}
+    }
+}
+
+fn mark_operand_use(op: &Operand, uses: &mut [bool], defs: &[bool]) {
+    match op {
+        Operand::Copy(place) | Operand::Move(place) => mark_place_use(place, uses, defs),
+        Operand::Const(_) => {}
+    }
+}
+
+fn mark_place_use(place: &Place, uses: &mut [bool], defs: &[bool]) {
+    match &place.kind {
+        PlaceKind::Local(i) => mark_local_use(*i as usize, uses, defs),
+        PlaceKind::Projection(inner, _) => mark_place_use(inner, uses, defs),
+        PlaceKind::Global { .. } | PlaceKind::Unknown => {}
+    }
+}
+
+fn mark_place_write(place: &Place, uses: &mut [bool], defs: &mut [bool]) {
+    match &place.kind {
+        PlaceKind::Local(i) => mark_local_def(*i as usize, defs),
+        PlaceKind::Projection(inner, _) => mark_place_use(inner, uses, defs),
+        PlaceKind::Global { .. } | PlaceKind::Unknown => {}
+    }
+}
+
+fn mark_local_use(local_idx: usize, uses: &mut [bool], defs: &[bool]) {
+    if defs.get(local_idx).copied().unwrap_or(false) {
+        return;
+    }
+    if let Some(slot) = uses.get_mut(local_idx) {
+        *slot = true;
+    }
+}
+
+fn mark_local_def(local_idx: usize, defs: &mut [bool]) {
+    if let Some(slot) = defs.get_mut(local_idx) {
+        *slot = true;
+    }
+}
 
 /// Free-function version of [`Lowering::impl_method_owner`] for callers
 /// that only have the `Llbc` + `FunDecl` and do not want to instantiate
@@ -2558,6 +2953,58 @@ fn tyref_to_value_type(ty: &TyRef, llbc: &Llbc) -> ValueType {
         if let Some(lit_obj) = lit.as_object() {
             if lit_obj.contains_key("Int")
                 || lit_obj.contains_key("UInt")
+                || lit_obj.contains_key("Integer")
+                || lit_obj.contains_key("Char")
+            {
+                return ValueType::Int;
+            }
+            if lit_obj.contains_key("Bool") {
+                return ValueType::Bool;
+            }
+            if lit_obj.contains_key("Float") {
+                return ValueType::Float;
+            }
+        }
+    }
+    ValueType::Ref(None)
+}
+
+/// Classify a struct field [`TyRef`] into the RPython `lltype` register
+/// class the annotator pre-fills into `FORCE_ATTRIBUTES_INTO_CLASSES`.
+///
+/// Unlike [`tyref_to_value_type`] (which collapses every integer width to
+/// `Int`), this keeps the signed/unsigned split: `{"Literal": {"UInt":
+/// …}}` shells to [`ValueType::Unsigned`] so `valuetype_to_someshell`
+/// picks `SomeInteger { unsigned: true }`, matching the per-field shells
+/// the syn classifier produced for `u8`..`usize`.  `char` and every
+/// signed width fold to `Int`; `bool`/`float` keep their classes; every
+/// non-primitive shape (named struct/enum, reference, raw pointer, tuple,
+/// slice, array, `Box`/`Rc`/`Arc` wrapper) folds to `Ref(None)` whose
+/// someshell ignores the payload.
+fn tyref_to_attr_value_type(ty: &TyRef, llbc: &Llbc) -> ValueType {
+    let value = match ty {
+        TyRef::Inline { value: (_, v) } => v,
+        TyRef::Other(v) => v,
+        TyRef::Dedup { id } => match llbc.dedup_body(*id) {
+            Some(v) => v,
+            None => return ValueType::Ref(None),
+        },
+    };
+    if let Some(obj) = value.as_object()
+        && let Some(lit) = obj.get("Literal")
+    {
+        if let Some(lit_atom) = lit.as_str() {
+            return match lit_atom {
+                "Bool" => ValueType::Bool,
+                "Char" => ValueType::Int,
+                _ => ValueType::Ref(None),
+            };
+        }
+        if let Some(lit_obj) = lit.as_object() {
+            if lit_obj.contains_key("UInt") {
+                return ValueType::Unsigned;
+            }
+            if lit_obj.contains_key("Int")
                 || lit_obj.contains_key("Integer")
                 || lit_obj.contains_key("Char")
             {
@@ -3033,6 +3480,17 @@ fn strip_crate_prefix(path: &str) -> String {
         // prefix in some Charon outputs): leave as-is.
         None => path.to_string(),
     }
+}
+
+fn static_key_matches(full: &str, stripped: &str, key: &str) -> bool {
+    full == key
+        || stripped == key
+        || full
+            .strip_suffix(key)
+            .is_some_and(|prefix| prefix.ends_with("::"))
+        || stripped
+            .strip_suffix(key)
+            .is_some_and(|prefix| prefix.ends_with("::"))
 }
 
 fn place_kind_label(k: &PlaceKind) -> &'static str {
