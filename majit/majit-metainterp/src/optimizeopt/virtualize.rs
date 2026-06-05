@@ -3232,21 +3232,24 @@ mod tests {
 
         let get_array_ptr = Op::with_descr(
             OpCode::GetfieldRawI,
-            &[OpRef::input_arg_ref(0)],
+            &[crate::r#box::BoxRef::from_opref(OpRef::input_arg_ref(0))],
             field_descr,
         );
         let set_item = Op::with_descr(
             OpCode::SetarrayitemGc,
             &[
-                OpRef::input_arg_ref(0),
-                OpRef::int_op(50),
-                OpRef::int_op(51),
+                crate::r#box::BoxRef::from_opref(OpRef::input_arg_ref(0)),
+                crate::r#box::BoxRef::from_opref(OpRef::int_op(50)),
+                crate::r#box::BoxRef::from_opref(OpRef::int_op(51)),
             ],
             arr_descr.clone(),
         );
         let get_item = Op::with_descr(
             OpCode::GetarrayitemGcI,
-            &[OpRef::input_arg_ref(0), OpRef::int_op(50)],
+            &[
+                crate::r#box::BoxRef::from_opref(OpRef::input_arg_ref(0)),
+                crate::r#box::BoxRef::from_opref(OpRef::int_op(50)),
+            ],
             arr_descr,
         );
 
@@ -3256,14 +3259,19 @@ mod tests {
         // resolve_array_source() sees the producing OpRef, not the bare
         // vable inputarg.
         let array_ptr_ref = ops[0].pos.get();
-        ops[1].setarg(0, array_ptr_ref);
-        ops[2].setarg(0, array_ptr_ref);
+        ops[1].setarg(0, crate::r#box::BoxRef::from_opref(array_ptr_ref));
+        ops[2].setarg(0, crate::r#box::BoxRef::from_opref(array_ptr_ref));
 
         for op in &ops {
             let mut resolved = op.clone();
             // optimizer.py:651-652 setarg loop parity.
             for i in 0..resolved.num_args() {
-                resolved.setarg(i, ctx.get_box_replacement(resolved.arg(i)));
+                resolved.setarg(
+                    i,
+                    crate::r#box::BoxRef::from_opref(
+                        ctx.get_box_replacement(resolved.arg(i).to_opref()),
+                    ),
+                );
             }
             match pass.propagate_forward(&resolved, &mut ctx) {
                 OptimizationResult::Emit(emitted) => {
