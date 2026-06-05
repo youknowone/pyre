@@ -995,6 +995,19 @@ unsafe fn binop_dispatch_first(
     operand_overrides(a, dunder) || operand_overrides(b, rdunder)
 }
 
+/// Dispatch a builtin-leaf subclass's unary operator override (`__neg__`,
+/// `__pos__`, `__invert__`) before the storage fast paths, which operate on
+/// the value and ignore the override.  `try_instance_unaryop` only fires for
+/// is_instance-shaped objects, so a builtin-storage subclass needs the
+/// w_class-driven lookup here.
+unsafe fn try_unary_override(a: PyObjectRef, dunder: &str) -> Option<PyResult> {
+    if !operand_overrides(a, dunder) {
+        return None;
+    }
+    let method = lookup_type_special(a, dunder)?;
+    Some(crate::call::call_function_impl_result(method, &[a]))
+}
+
 pub fn add(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let a = unwrap_cell(a);
     let b = unwrap_cell(b);
@@ -2398,6 +2411,9 @@ impl CompareOp {
 pub fn pos(a: PyObjectRef) -> PyResult {
     let a = unwrap_cell(a);
     unsafe {
+        if let Some(result) = try_unary_override(a, "__pos__") {
+            return result;
+        }
         if is_int(a) || is_bool(a) {
             return Ok(w_int_new(int_value(a)));
         }
@@ -2427,6 +2443,9 @@ pub fn pos(a: PyObjectRef) -> PyResult {
 pub fn neg(a: PyObjectRef) -> PyResult {
     let a = unwrap_cell(a);
     unsafe {
+        if let Some(result) = try_unary_override(a, "__neg__") {
+            return result;
+        }
         if is_int(a) || is_bool(a) {
             let v = int_value(a);
             return match v.checked_neg() {
@@ -2461,6 +2480,9 @@ pub fn neg(a: PyObjectRef) -> PyResult {
 pub fn invert(a: PyObjectRef) -> PyResult {
     let a = unwrap_cell(a);
     unsafe {
+        if let Some(result) = try_unary_override(a, "__invert__") {
+            return result;
+        }
         if is_int(a) || is_bool(a) {
             return Ok(w_int_new(!int_value(a)));
         }
