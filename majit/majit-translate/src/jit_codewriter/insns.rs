@@ -395,6 +395,14 @@ pub const BC_GETARRAYITEM_GC_I_PURE: u8 = 210;
 pub const BC_GETARRAYITEM_GC_R_PURE: u8 = 211;
 pub const BC_GETARRAYITEM_GC_F_PURE: u8 = 212;
 
+// `blackhole.py:559-561 bhimpl_int_between(a, b, c) -> i` —
+// `@arguments("i", "i", "i", returns="i")` gives canonical key
+// `int_between/iii>i`.  Pyre emits this from
+// `make_ll_isinstance`'s `has_subclasses` body
+// (`translator/rtyper/rtyper.rs::build_ll_isinstance_const_nonnull_graph`),
+// matching `rclass.py:1163-1167 ll_isinstance`'s range-check arm.
+pub const BC_INT_BETWEEN: u8 = 213;
+
 // pyre-only `abort/>r` — Ref-result variant of `abort/` (BC_ABORT = 13)
 // emitted by `Assembler::encode_op`'s default branch when an `OpKind::
 // Abort { result_kind: Ref }` reaches the assembler.  Lives in
@@ -742,6 +750,11 @@ pub fn wellknown_bh_insns() -> VecAssoc<&'static str, u8> {
     m.insert("uint_le/ii>i", BC_UINT_LE);
     m.insert("uint_gt/ii>i", BC_UINT_GT);
     m.insert("uint_ge/ii>i", BC_UINT_GE);
+    // `blackhole.py:559-561 bhimpl_int_between(a, b, c) -> i` —
+    // `a <= b < c` range check.  Emitted by
+    // `make_ll_isinstance`'s `has_subclasses` body
+    // (`rclass.py:1163-1167 ll_isinstance` range arm).
+    m.insert("int_between/iii>i", BC_INT_BETWEEN);
     // Ref/nullity primitives — `blackhole.py:584-610`.
     m.insert("ptr_eq/rr>i", BC_PTR_EQ);
     m.insert("ptr_ne/rr>i", BC_PTR_NE);
