@@ -7460,10 +7460,11 @@ mod tests {
                                 stub.arg_kinds,
                                 vec![Kind::Ref, Kind::Ref, Kind::Ref, Kind::Int]
                             );
-                            assert_eq!(
-                                stub.effect_info,
-                                effect_info_for_call_flavor(CallFlavor::Plain),
-                            );
+                            assert_eq!(stub.effect_info, {
+                                let mut ei = effect_info_for_call_flavor(CallFlavor::Plain);
+                                ei.oopspecindex = majit_ir::OopSpecIndex::LoadGlobal;
+                                ei
+                            });
                         }
                         other => panic!("expected CallDescrStub, got {other:?}"),
                     },
@@ -7593,10 +7594,11 @@ mod tests {
                                 stub.arg_kinds,
                                 vec![Kind::Ref, Kind::Ref, Kind::Ref, Kind::Int]
                             );
-                            assert_eq!(
-                                stub.effect_info,
-                                effect_info_for_call_flavor(CallFlavor::Plain),
-                            );
+                            assert_eq!(stub.effect_info, {
+                                let mut ei = effect_info_for_call_flavor(CallFlavor::Plain);
+                                ei.oopspecindex = majit_ir::OopSpecIndex::LoadGlobal;
+                                ei
+                            });
                         }
                         other => panic!("expected CallDescrStub, got {other:?}"),
                     },
@@ -7622,7 +7624,11 @@ mod tests {
         let frame_var = Variable::new(VariableId(6), Kind::Ref);
         let dst_var = Variable::new(VariableId(7), Kind::Ref);
         let descr = intern_call_descr_stub(
-            effect_info_for_call_flavor(CallFlavor::Plain),
+            {
+                let mut ei = effect_info_for_call_flavor(CallFlavor::Plain);
+                ei.oopspecindex = majit_ir::OopSpecIndex::LoadGlobal;
+                ei
+            },
             vec![Kind::Ref, Kind::Ref, Kind::Ref, Kind::Int],
             Some(Kind::Ref),
         );
