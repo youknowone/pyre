@@ -1,7 +1,17 @@
-# app_operator.py — app-level callable getters for the operator module.
-# Literal port of pypy/module/operator/app_operator.py (attrgetter,
-# itemgetter, methodcaller + the _resolve_attr_chain helper).  These are
-# app-level in upstream too; installed via the `appleveldefs:` arm in mod.rs.
+# app_operator.py — app-level callables for the operator module.
+# Literal port of pypy/module/operator/app_operator.py (countOf,
+# attrgetter, itemgetter, methodcaller + the _resolve_attr_chain helper).
+# These are app-level in upstream too; installed via the `appleveldefs:`
+# arm in mod.rs.
+
+
+def countOf(a, b):
+    'countOf(a, b) -- Return the number of times b occurs in a.'
+    count = 0
+    for x in a:
+        if x is b or x == b:
+            count += 1
+    return count
 
 
 def _resolve_attr_chain(chain, obj, idx=0):

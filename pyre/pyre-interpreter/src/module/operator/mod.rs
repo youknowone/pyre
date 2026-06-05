@@ -54,10 +54,11 @@ use crate::baseobjspace::{
 
 crate::py_module! {
     "operator",
-    // `itemgetter`/`attrgetter`/`methodcaller` are app-level callable
-    // classes (`pypy/module/operator/app_operator.py`), not interp-level.
+    // `countOf` + the `itemgetter`/`attrgetter`/`methodcaller` callable
+    // classes are app-level (`pypy/module/operator/app_operator.py`,
+    // `moduledef.py` `app_names`), not interp-level.
     appleveldefs: {
-        "app_operator.py" => ["itemgetter", "attrgetter", "methodcaller"],
+        "app_operator.py" => ["countOf", "itemgetter", "attrgetter", "methodcaller"],
     },
     functions: {
         "index"    / 1 = op_index,
