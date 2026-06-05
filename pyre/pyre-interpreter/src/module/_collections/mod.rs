@@ -65,6 +65,24 @@ mod deque_class {
         }
     }
 
+    /// `space.decode_index4` index-only case — reject a slice with a
+    /// `TypeError`, route any `__index__`-able object through
+    /// `getindex_w`, apply the negative-index wrap and the in-range
+    /// check, and return the resolved element position.
+    fn deque_index(index: PyObjectRef, len: i64) -> Result<usize, crate::PyError> {
+        if unsafe { pyre_object::is_slice(index) } {
+            return Err(crate::PyError::type_error("deque[:] is not supported"));
+        }
+        let mut idx = crate::builtins::getindex_w(index)?;
+        if idx < 0 {
+            idx += len;
+        }
+        if idx < 0 || idx >= len {
+            return Err(crate::PyError::index_error("index out of range"));
+        }
+        Ok(idx as usize)
+    }
+
     /// `W_Deque.appendleft` + `trimright`: drop from the right once over the bound.
     fn do_appendleft(self_obj: PyObjectRef, item: PyObjectRef) {
         let mut items = snapshot(self_obj);
@@ -229,36 +247,21 @@ mod deque_class {
                 }
             }
             fn __getitem__(self_obj: PyObjectRef, index: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
-                match data(self_obj) {
-                    Some(d) => crate::baseobjspace::getitem(d, index),
-                    None => Ok(w_none()),
-                }
+                let items = snapshot(self_obj);
+                let idx = deque_index(index, items.len() as i64)?;
+                Ok(items[idx])
             }
             fn __setitem__(self_obj: PyObjectRef, index: PyObjectRef, value: PyObjectRef) -> Result<(), crate::PyError> {
                 let mut items = snapshot(self_obj);
-                let len = items.len() as i64;
-                let mut idx = unsafe { w_int_get_value(index) };
-                if idx < 0 {
-                    idx += len;
-                }
-                if idx < 0 || idx >= len {
-                    return Err(crate::PyError::index_error("deque index out of range"));
-                }
-                items[idx as usize] = value;
+                let idx = deque_index(index, items.len() as i64)?;
+                items[idx] = value;
                 store(self_obj, items);
                 Ok(())
             }
             fn __delitem__(self_obj: PyObjectRef, index: PyObjectRef) -> Result<(), crate::PyError> {
                 let mut items = snapshot(self_obj);
-                let len = items.len() as i64;
-                let mut idx = unsafe { w_int_get_value(index) };
-                if idx < 0 {
-                    idx += len;
-                }
-                if idx < 0 || idx >= len {
-                    return Err(crate::PyError::index_error("deque index out of range"));
-                }
-                items.remove(idx as usize);
+                let idx = deque_index(index, items.len() as i64)?;
+                items.remove(idx);
                 store(self_obj, items);
                 Ok(())
             }
