@@ -3892,8 +3892,7 @@ fn target_to_call_path(target: &CallTarget) -> crate::parse::CallPath {
             crate::parse::CallPath::from_segments(segments.iter().map(String::as_str))
         }
         CallTarget::Method { name, .. } => crate::parse::CallPath::from_segments([name.as_str()]),
-        CallTarget::SyntheticTransparentCtor { name, owner_path }
-        | CallTarget::SyntheticTransparentClass { name, owner_path } => {
+        CallTarget::SyntheticTransparentCtor { name, owner_path } => {
             let mut segs: Vec<&str> = owner_path.iter().map(String::as_str).collect();
             segs.push(name.as_str());
             crate::parse::CallPath::from_segments(segs)
@@ -4241,7 +4240,11 @@ fn remap_op(
             value: remap_value(value, aliases),
             kind_char: *kind_char,
         },
-        OpKind::IsInstance { obj, class_carrier, result_ty } => OpKind::IsInstance {
+        OpKind::IsInstance {
+            obj,
+            class_carrier,
+            result_ty,
+        } => OpKind::IsInstance {
             obj: remap_value(obj, aliases),
             class_carrier: remap_value(class_carrier, aliases),
             result_ty: result_ty.clone(),

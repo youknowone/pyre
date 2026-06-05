@@ -1436,17 +1436,16 @@ fn int_between_record(
         (r, c)
     } else {
         let b4 = ctx.trace_ctx.record_op(OpCode::IntSub, &[b2, b1]);
-        let b4_concrete =
-            if let (Some(majit_ir::Value::Int(v2)), Some(majit_ir::Value::Int(v1))) =
-                (ctx.trace_ctx.box_value(b2), ctx.trace_ctx.box_value(b1))
-            {
-                let folded = majit_metainterp::eval_binop_i(OpCode::IntSub, v2, v1);
-                ctx.trace_ctx
-                    .set_opref_concrete(b4, majit_ir::Value::Int(folded));
-                Some(folded)
-            } else {
-                None
-            };
+        let b4_concrete = if let (Some(majit_ir::Value::Int(v2)), Some(majit_ir::Value::Int(v1))) =
+            (ctx.trace_ctx.box_value(b2), ctx.trace_ctx.box_value(b1))
+        {
+            let folded = majit_metainterp::eval_binop_i(OpCode::IntSub, v2, v1);
+            ctx.trace_ctx
+                .set_opref_concrete(b4, majit_ir::Value::Int(folded));
+            Some(folded)
+        } else {
+            None
+        };
         let r = ctx.trace_ctx.record_op(OpCode::UintLt, &[b4, b5]);
         let c = if let (Some(v4), Some(v5)) = (b4_concrete, b5_concrete) {
             let folded = majit_metainterp::eval_binop_i(OpCode::UintLt, v4, v5);

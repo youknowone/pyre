@@ -1402,8 +1402,7 @@ pub fn specialize_legacy_graph_with_registry_returning_value_to_var(
                 let needs_seed = v.annotation.borrow().is_none();
                 if needs_seed {
                     let mut tmp = v.clone();
-                    annotator
-                        .setbinding(&mut tmp, crate::annotator::model::SomeValue::Impossible);
+                    annotator.setbinding(&mut tmp, crate::annotator::model::SomeValue::Impossible);
                 }
             }
         }

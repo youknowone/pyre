@@ -3174,7 +3174,10 @@ fn lowlevel_isinstance_helper_graph(
     startblock.borrow_mut().exitswitch = Some(Hlvalue::Variable(is_nonnull));
     startblock.closeblock(vec![
         Link::new(
-            vec![Hlvalue::Variable(obj0.clone()), Hlvalue::Variable(cls0.clone())],
+            vec![
+                Hlvalue::Variable(obj0.clone()),
+                Hlvalue::Variable(cls0.clone()),
+            ],
             Some(callblock.clone()),
             Some(constant_with_lltype(
                 ConstValue::Bool(true),
@@ -3208,12 +3211,15 @@ fn lowlevel_isinstance_helper_graph(
         vec![CLASSTYPE.clone(), CLASSTYPE.clone()],
         LowLevelType::Bool,
     )?;
-    callblock.borrow_mut().operations.push(direct_call_operation(
-        rtyper,
-        &callee,
-        vec![Hlvalue::Variable(obj_cls), Hlvalue::Variable(cls1)],
-        call_result.clone(),
-    )?);
+    callblock
+        .borrow_mut()
+        .operations
+        .push(direct_call_operation(
+            rtyper,
+            &callee,
+            vec![Hlvalue::Variable(obj_cls), Hlvalue::Variable(cls1)],
+            call_result.clone(),
+        )?);
     callblock.closeblock(vec![
         Link::new(
             vec![Hlvalue::Variable(call_result)],
@@ -3437,10 +3443,8 @@ fn build_ll_isinstance_const_nonnull_graph(
     } else {
         // upstream: `return obj_cls == cls` — direct ptr_eq against
         // the baked-in class pointer constant.
-        let c_cls = Constant::with_concretetype(
-            ConstValue::LLPtr(Box::new(cls_ptr)),
-            CLASSTYPE.clone(),
-        );
+        let c_cls =
+            Constant::with_concretetype(ConstValue::LLPtr(Box::new(cls_ptr)), CLASSTYPE.clone());
         startblock.borrow_mut().operations.push(SpaceOperation::new(
             "ptr_eq",
             vec![Hlvalue::Variable(obj_cls), Hlvalue::Constant(c_cls)],
@@ -3542,12 +3546,15 @@ fn build_ll_isinstance_const_graph(
         vec![obj_lltype.clone()],
         LowLevelType::Bool,
     )?;
-    callblock.borrow_mut().operations.push(direct_call_operation(
-        rtyper,
-        &callee,
-        vec![Hlvalue::Variable(obj1)],
-        call_result.clone(),
-    )?);
+    callblock
+        .borrow_mut()
+        .operations
+        .push(direct_call_operation(
+            rtyper,
+            &callee,
+            vec![Hlvalue::Variable(obj1)],
+            call_result.clone(),
+        )?);
     callblock.closeblock(vec![
         Link::new(
             vec![Hlvalue::Variable(call_result)],

@@ -592,13 +592,7 @@ fn fmt_op_result(op: &SpaceOperation) -> String {
 /// `true` iff `kind` is a 0-arg unit-variant transparent ctor
 /// (`StepResult::Continue`, `LoopResult::Done`, …) that [`translate_op`]
 /// pre-folds to a `Constant` and emits no `FlowspaceOp` (the unit-variant
-/// guard at the top of `translate_op`).  Also matches the 0-arg
-/// `SyntheticTransparentClass` placeholder emitted by the tuple-struct
-/// match cascade (`front/ast.rs:7456`): [`legacy_const_define_hlvalue`]
-/// folds it to a `Hlvalue::Constant(HostObject::Class)` so the
-/// `isinstance` HighLevelOp's `class_carrier` arrives at
-/// `InstanceRepr::rtype_isinstance` as a Constant — matching the
-/// `if isinstance(v_cls, Constant)` branch in `rclass.py:1019`.
+/// guard at the top of `translate_op`).
 ///
 /// [`op_canraise`] and [`translate_op`] consult the SAME predicate —
 /// `op_canraise` is false exactly when `translate_op` emits no op.
@@ -613,15 +607,6 @@ fn is_elided_unit_variant_ctor(kind: &OpKind) -> bool {
         let mut segments = owner_path.clone();
         segments.push(name.clone());
         return crate::front::syn_metadata::is_synthetic_unit_variant_path(&segments);
-    }
-    if let OpKind::Call {
-        target: crate::model::CallTarget::SyntheticTransparentClass { .. },
-        args,
-        ..
-    } = kind
-        && args.is_empty()
-    {
-        return true;
     }
     false
 }
@@ -922,9 +907,7 @@ pub fn translate_op(
         // `class_carrier`) or the generic `ll_isinstance` helper
         // (Variable `class_carrier`).
         OpKind::IsInstance {
-            obj,
-            class_carrier,
-            ..
+            obj, class_carrier, ..
         } => {
             let obj_hl = lookup_operand(value_map, obj, op, "obj")?;
             let cls_hl = lookup_operand(value_map, class_carrier, op, "class_carrier")?;
@@ -1312,29 +1295,6 @@ pub fn translate_op(
                     };
                     let callable =
                         Hlvalue::Constant(Constant::new(ConstValue::HostObject(callable_host)));
-                    let mut call_args = Vec::with_capacity(arg_hls.len() + 1);
-                    call_args.push(callable);
-                    call_args.extend(arg_hls);
-                    Ok(vec![FlowspaceOp::new("simple_call", call_args, result)])
-                }
-                CallTarget::SyntheticTransparentClass { name, owner_path } => {
-                    // Class-of-variant placeholder fallback: the post-ast
-                    // pre-rtyper `class_lookup_fold` pass is expected to
-                    // rewrite this into `OpKind::ConstRef(HostObject::Class)`
-                    // before reaching the rtyper.  Surviving residuals
-                    // route through the same `simple_call(HostObject::Class)`
-                    // shape as `SyntheticTransparentCtor` — the
-                    // `Bookkeeper.immutablevalue_hostobject` is_class arm
-                    // (`bookkeeper.rs:1984`) absorbs both spellings into
-                    // a `SomePBC([ClassDesc])`.
-                    let qualname = if owner_path.is_empty() {
-                        name.clone()
-                    } else {
-                        format!("{}.{}", owner_path.join("."), name)
-                    };
-                    let callable = Hlvalue::Constant(Constant::new(ConstValue::HostObject(
-                        HostObject::new_class(qualname, Vec::new()),
-                    )));
                     let mut call_args = Vec::with_capacity(arg_hls.len() + 1);
                     call_args.push(callable);
                     call_args.extend(arg_hls);
@@ -1754,38 +1714,6 @@ fn legacy_const_define_hlvalue(op: &SpaceOperation) -> Option<Hlvalue> {
             Some(Hlvalue::Constant(Constant::with_concretetype(
                 ConstValue::HostObject(instance),
                 crate::translator::rtyper::rclass::OBJECTPTR.clone(),
-            )))
-        }
-        // Class-of-variant placeholder fold.  Tuple-struct match
-        // cascades (`front/ast.rs:7396 classify_match_tuple_struct_cascade`)
-        // emit `OpKind::Call { target: SyntheticTransparentClass, args: [] }`
-        // whose runtime semantics is "load the class object" — i.e. a
-        // PBC reference to the class itself, not a fresh instance.
-        // Without the fold, the residual call would route through
-        // `simple_call(HostObject::Class)` and the annotator's
-        // `ClassDesc::pycall` would return `SomeInstance` (a new instance)
-        // rather than `SomePBC([ClassDesc])` (the class itself), breaking
-        // `InstanceRepr::rtype_isinstance` which checks
-        // `if isinstance(v_cls, Constant)` against the class PBC.
-        //
-        // The fold materialises `Hlvalue::Constant(HostObject::new_class)`
-        // directly; `ClassRepr::convert_const` (`rclass.rs:1463`) then
-        // converts the HostObject to an `LLPtr(vtable)` for the
-        // `make_ll_isinstance` (`rclass.py:1149`) constant-arm path.
-        OpKind::Call {
-            target: crate::model::CallTarget::SyntheticTransparentClass { name, owner_path },
-            args,
-            ..
-        } if args.is_empty() => {
-            let qualname = if owner_path.is_empty() {
-                name.clone()
-            } else {
-                format!("{}.{}", owner_path.join("."), name)
-            };
-            let class_obj = crate::flowspace::model::HostObject::new_class(qualname, Vec::new());
-            Some(Hlvalue::Constant(Constant::with_concretetype(
-                ConstValue::HostObject(class_obj),
-                crate::translator::rtyper::rclass::CLASSTYPE.clone(),
             )))
         }
         _ => None,
@@ -3303,93 +3231,6 @@ mod tests {
             }
             other => panic!("result must be Variable, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn translate_op_call_synthetic_transparent_class_with_args_lowers_to_simple_call() {
-        // `SyntheticTransparentClass` with non-empty args falls back to
-        // the same `simple_call(HostObject::Class, args)` shape as
-        // `SyntheticTransparentCtor` — the annotator's
-        // `Bookkeeper::immutablevalue_hostobject` is_class arm absorbs
-        // both spellings.
-        let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
-        let graph = translate_op_test_graph(10);
-        value_map.insert(
-            graph.must_variable_at(1),
-            Hlvalue::Variable(Variable::new()),
-        );
-        value_map.insert(
-            graph.must_variable_at(2),
-            Hlvalue::Variable(Variable::new()),
-        );
-        let op = SpaceOperation {
-            result: Some(graph.must_variable_at(2)),
-            kind: OpKind::Call {
-                target: crate::model::CallTarget::SyntheticTransparentClass {
-                    name: "LoadFast".into(),
-                    owner_path: vec!["Instruction".into()],
-                },
-                args: vec![graph.must_variable_at(1)],
-                result_ty: ValueType::Ref(None),
-            },
-        };
-        let translated = translate_op(&op, &value_map, &empty_call_registry(), &graph)
-            .expect("Call::SyntheticTransparentClass with args must lower");
-        assert_eq!(translated.len(), 1);
-        assert_eq!(translated[0].opname, "simple_call");
-        let Hlvalue::Constant(ref callable) = translated[0].args[0] else {
-            panic!("simple_call callable must be a Constant");
-        };
-        let ConstValue::HostObject(ref host) = callable.value else {
-            panic!("class callable must be ConstValue::HostObject");
-        };
-        assert_eq!(
-            host.qualname(),
-            "Instruction.LoadFast",
-            "owner_path must qualify the class qualname",
-        );
-        assert!(host.is_class(), "callable must be a class HostObject");
-    }
-
-    #[test]
-    fn legacy_const_define_folds_zero_arg_synthetic_transparent_class_to_class_constant() {
-        // Empty-args `SyntheticTransparentClass` is the cascade
-        // tuple-struct *class carrier*.  `legacy_const_define_hlvalue`
-        // folds it directly to a class constant so the rtyper sees
-        // `Hlvalue::Constant(HostObject::Class)` instead of routing
-        // through `simple_call` (which would annotate to a new
-        // SomeInstance, not the class PBC `rtype_isinstance` needs).
-        let dummy = SpaceOperation {
-            result: Some(Variable::new()),
-            kind: OpKind::Call {
-                target: crate::model::CallTarget::SyntheticTransparentClass {
-                    name: "LoadFast".into(),
-                    owner_path: vec!["Instruction".into()],
-                },
-                args: Vec::new(),
-                result_ty: ValueType::Ref(None),
-            },
-        };
-        let hl = legacy_const_define_hlvalue(&dummy)
-            .expect("zero-arg SyntheticTransparentClass must fold to a constant");
-        let Hlvalue::Constant(c) = hl else {
-            panic!("expected Hlvalue::Constant, got {hl:?}");
-        };
-        let ConstValue::HostObject(ref host) = c.value else {
-            panic!("expected ConstValue::HostObject, got {:?}", c.value);
-        };
-        assert!(host.is_class(), "class carrier must be a class HostObject");
-        assert_eq!(
-            host.qualname(),
-            "Instruction.LoadFast",
-            "owner_path must qualify the class qualname",
-        );
-        // `with_concretetype` carries CLASSTYPE so ClassRepr::convert_const
-        // can route through the constant arm.
-        assert!(
-            c.concretetype.is_some(),
-            "class carrier constant must carry CLASSTYPE concretetype",
-        );
     }
 
     #[test]

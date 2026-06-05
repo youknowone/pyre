@@ -267,25 +267,6 @@ pub enum CallTarget {
         #[serde(default)]
         owner_path: Vec<String>,
     },
-    /// Rust frontend adaptation for *class-of-variant* references that
-    /// RPython lowers as `Constant(HostObject::Class)` directly.  Used
-    /// by the `match` tuple-struct cascade emitter
-    /// (`front/ast.rs::classify_match_tuple_struct_cascade`) to defer
-    /// the `HostObject::Class` lookup to a post-ast pre-rtyper fold
-    /// pass (`translator/rtyper/class_lookup_fold.rs`).  The fold pass
-    /// resolves `(owner_path, name)` via
-    /// `module_globals_lookup(parent).class_get(name)` and rewrites
-    /// the placeholder Call into `OpKind::ConstRef(HostObject::Class)`.
-    ///
-    /// `name` is the variant leaf (`"LoadFast"`).  `owner_path` is the
-    /// enclosing module/enum segments (`["Instruction"]`).  Joined
-    /// path is the qualifying identity for the class lookup, matching
-    /// RPython `getclassdef` keyed by the parent enum's classdef.
-    SyntheticTransparentClass {
-        name: String,
-        #[serde(default)]
-        owner_path: Vec<String>,
-    },
     /// RPython: `indirect_call` opname. Receiver's static type is a
     /// `dyn Trait` (Rust fat pointer); at JIT time the actual callee
     /// is resolved via vtable.  `trait_root` + `method_name` together
@@ -351,19 +332,6 @@ impl CallTarget {
         }
     }
 
-    /// Class-of-variant placeholder consumed by
-    /// `translator/rtyper/class_lookup_fold.rs`.  See the variant doc
-    /// comment for the lookup contract.
-    pub fn synthetic_transparent_class_with_owner(
-        owner_path: Vec<String>,
-        name: impl Into<String>,
-    ) -> Self {
-        Self::SyntheticTransparentClass {
-            name: name.into(),
-            owner_path,
-        }
-    }
-
     pub fn receiver_root(&self) -> Option<&str> {
         match self {
             CallTarget::Method { receiver_root, .. } => receiver_root.as_deref(),
@@ -383,11 +351,6 @@ impl CallTarget {
             // share segments and break any downstream caller that
             // uses `path_segments()` for qualified identity.
             CallTarget::SyntheticTransparentCtor { name, owner_path } => {
-                let mut segs: Vec<&str> = owner_path.iter().map(String::as_str).collect();
-                segs.push(name.as_str());
-                Some(segs)
-            }
-            CallTarget::SyntheticTransparentClass { name, owner_path } => {
                 let mut segs: Vec<&str> = owner_path.iter().map(String::as_str).collect();
                 segs.push(name.as_str());
                 Some(segs)
@@ -419,17 +382,6 @@ impl fmt::Display for CallTarget {
                     write!(
                         f,
                         "<synthetic-transparent-ctor {}::{name}>",
-                        owner_path.join("::")
-                    )
-                }
-            }
-            CallTarget::SyntheticTransparentClass { name, owner_path } => {
-                if owner_path.is_empty() {
-                    write!(f, "<synthetic-transparent-class {name}>")
-                } else {
-                    write!(
-                        f,
-                        "<synthetic-transparent-class {}::{name}>",
                         owner_path.join("::")
                     )
                 }

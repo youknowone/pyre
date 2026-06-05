@@ -383,16 +383,6 @@ fn call_target_repr(target: &crate::model::CallTarget) -> String {
                 )
             }
         }
-        CallTarget::SyntheticTransparentClass { name, owner_path } => {
-            if owner_path.is_empty() {
-                format!("$<* synthetic-transparent-class '{name}'>")
-            } else {
-                format!(
-                    "$<* synthetic-transparent-class '{}.{name}'>",
-                    owner_path.join(".")
-                )
-            }
-        }
         CallTarget::Indirect {
             trait_root,
             method_name,

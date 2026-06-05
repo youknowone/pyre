@@ -658,7 +658,11 @@ fn remap_op_kind(
             value: remap_var(value),
             kind_char: *kind_char,
         },
-        OpKind::IsInstance { obj, class_carrier, result_ty } => OpKind::IsInstance {
+        OpKind::IsInstance {
+            obj,
+            class_carrier,
+            result_ty,
+        } => OpKind::IsInstance {
             obj: remap_var(obj),
             class_carrier: remap_var(class_carrier),
             result_ty: result_ty.clone(),
@@ -879,7 +883,9 @@ pub fn op_variable_refs(kind: &OpKind) -> Vec<crate::flowspace::model::Variable>
         OpKind::AssertGreen { value, .. }
         | OpKind::IsConstant { value, .. }
         | OpKind::IsVirtual { value, .. } => vec![clone_var(value)],
-        OpKind::IsInstance { obj, class_carrier, .. } => {
+        OpKind::IsInstance {
+            obj, class_carrier, ..
+        } => {
             vec![clone_var(obj), clone_var(class_carrier)]
         }
         OpKind::VtableMethodPtr { receiver, .. } => vec![clone_var(receiver)],
