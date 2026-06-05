@@ -33,6 +33,17 @@ static SIG_PENDING: AtomicI64 = AtomicI64::new(0);
 /// -1 when disabled (`signal.set_wakeup_fd`).
 static WAKEUP_FD: AtomicI32 = AtomicI32::new(-1);
 
+/// `signals.c:132 pypysig_wakeup_fd_write_errno` — errno of a failed
+/// wakeup-fd write, stashed by the async handler (which cannot report it)
+/// and surfaced at the next interpreter checkpoint.  0 means none pending.
+static WAKEUP_FD_WRITE_ERRNO: AtomicI32 = AtomicI32::new(0);
+
+/// `signals.c:134 pypysig_get_wakeup_fd_write_errno` — read and clear the
+/// stashed wakeup-fd write errno.
+pub fn get_wakeup_fd_write_errno() -> i32 {
+    WAKEUP_FD_WRITE_ERRNO.swap(0, Ordering::SeqCst)
+}
+
 /// Register the address of the `ActionFlag` ticker so the OS handler can
 /// force it negative.  Called once at startup from
 /// `install_signal_handling`.
@@ -90,6 +101,42 @@ pub fn set_wakeup_fd(fd: i32) -> i32 {
 
 // ── OS handler + sigaction installation (unix only) ──
 
+/// Address of the calling thread's `errno`, so the handler can save and
+/// restore it across the wakeup-fd write.  libc exposes this through a
+/// different symbol per platform; unrecognised targets return null and the
+/// save/restore is skipped.
+#[cfg(unix)]
+fn errno_location() -> *mut libc::c_int {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        unsafe { libc::__errno_location() }
+    }
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "tvos",
+        target_os = "watchos",
+        target_os = "freebsd",
+        target_os = "dragonfly"
+    ))]
+    {
+        unsafe { libc::__error() }
+    }
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "tvos",
+        target_os = "watchos",
+        target_os = "freebsd",
+        target_os = "dragonfly"
+    )))]
+    {
+        std::ptr::null_mut()
+    }
+}
+
 /// `signals.c:140-174 signal_setflag_handler` — the actual OS signal
 /// handler.  Everything here must be async-signal-safe: flag the signal,
 /// then write one byte to the wakeup fd via the raw `write` syscall.
@@ -98,11 +145,28 @@ extern "C" fn signal_setflag_handler(signum: libc::c_int) {
     signal_pushback(signum as i32);
     let fd = WAKEUP_FD.load(Ordering::SeqCst);
     if fd != -1 {
-        let byte = signum as u8;
-        // Best-effort, async-signal-safe; ignore the result (signals.c
-        // stashes the errno for later — pyre does not surface it yet).
+        // `signals.c:153-170` — save errno, write the signal-number byte
+        // (retrying on EINTR), stash the errno of a real failure for the
+        // next checkpoint to report, then restore the caller's errno so the
+        // interrupted code sees no change.
         unsafe {
-            let _ = libc::write(fd, &byte as *const u8 as *const libc::c_void, 1);
+            let errno_p = errno_location();
+            let saved = if errno_p.is_null() { 0 } else { *errno_p };
+            let byte = signum as u8;
+            loop {
+                let res = libc::write(fd, &byte as *const u8 as *const libc::c_void, 1);
+                if res < 0 {
+                    let e = if errno_p.is_null() { 0 } else { *errno_p };
+                    if e == libc::EINTR {
+                        continue;
+                    }
+                    WAKEUP_FD_WRITE_ERRNO.store(e, Ordering::SeqCst);
+                }
+                break;
+            }
+            if !errno_p.is_null() {
+                *errno_p = saved;
+            }
         }
     }
 }

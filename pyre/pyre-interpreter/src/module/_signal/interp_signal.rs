@@ -200,12 +200,18 @@ impl CheckSignalAction {
 
     /// interp_signal.py:111-141 `_poll_for_signals_unlocked`.  pyre is
     /// single-threaded, so `signals_enabled()` is always true and the
-    /// fire-in-another-thread branch is unreachable; the wakeup-fd write
-    /// error and remote-debugger arms are not surfaced.
+    /// fire-in-another-thread branch is unreachable; the remote-debugger
+    /// arm is not surfaced.
     fn poll_for_signals_unlocked(
         &mut self,
         ec: &mut ExecutionContext,
     ) -> Result<(), crate::PyError> {
+        // interp_signal.py:112-115 — report any wakeup-fd write error the
+        // async handler stashed, before polling pending signals.
+        let werr = signalstate::get_wakeup_fd_write_errno();
+        if werr != 0 {
+            report_wakeup_fd_error(werr);
+        }
         let mut n = self.pending_signal;
         if n < 0 {
             n = signalstate::signal_poll();
@@ -248,6 +254,26 @@ fn report_signal(ec: &mut ExecutionContext, n: i32) -> Result<(), crate::PyError
         }
     }
     Ok(())
+}
+
+/// interp_signal.py:169-193 `_report_wakeup_fd_error` — surface the errno
+/// of a failed wakeup-fd write.  PyPy reports it through
+/// `write_unraisable_default`; pyre has no unraisable hook, so it writes
+/// the equivalent `OSError` line to stderr directly.
+fn report_wakeup_fd_error(errno_val: i32) {
+    #[cfg(unix)]
+    let msg = unsafe {
+        let p = libc::strerror(errno_val);
+        if p.is_null() {
+            format!("error {errno_val}")
+        } else {
+            std::ffi::CStr::from_ptr(p).to_string_lossy().into_owned()
+        }
+    };
+    #[cfg(not(unix))]
+    let msg = format!("error {errno_val}");
+    eprintln!("Exception ignored when trying to write to the signal wakeup fd:");
+    eprintln!("OSError: [Errno {errno_val}] {msg}");
 }
 
 impl AsyncActionOps for CheckSignalAction {
@@ -353,10 +379,41 @@ pub fn register_module(ns: &mut DictStorage) {
                     "set_wakeup_fd() requires an argument",
                 ));
             };
-            if fd < -1 {
-                return Err(crate::PyError::value_error(
-                    "set_wakeup_fd(): fd must be -1 or a valid file descriptor",
-                ));
+            // interp_signal.py:343-360 — a real fd is validated with
+            // `os.fstat` then `get_status_flags`: a bad fd is a ValueError
+            // and the fd must already be in non-blocking mode.
+            if fd != -1 {
+                #[cfg(unix)]
+                unsafe {
+                    let mut st: libc::stat = std::mem::zeroed();
+                    let bad_fd = libc::fstat(fd, &mut st) != 0;
+                    let flags = if bad_fd {
+                        -1
+                    } else {
+                        libc::fcntl(fd, libc::F_GETFL)
+                    };
+                    if bad_fd || flags < 0 {
+                        let e = std::io::Error::last_os_error();
+                        if e.raw_os_error() == Some(libc::EBADF) {
+                            return Err(crate::PyError::value_error("invalid fd"));
+                        }
+                        return Err(crate::PyError::os_error_with_errno(
+                            e.raw_os_error().unwrap_or(0),
+                            format!("{e}"),
+                        ));
+                    }
+                    if flags & libc::O_NONBLOCK == 0 {
+                        return Err(crate::PyError::value_error(format!(
+                            "the fd {fd} must be in non-blocking mode"
+                        )));
+                    }
+                }
+                #[cfg(not(unix))]
+                if fd < -1 {
+                    return Err(crate::PyError::value_error(
+                        "set_wakeup_fd(): fd must be -1 or a valid file descriptor",
+                    ));
+                }
             }
             // interp_signal.py:376 — `pypysig_set_wakeup_fd`.  The OS
             // handler writes the signal-number byte to this fd so a
