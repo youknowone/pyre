@@ -12,9 +12,10 @@ use crate::optimizeopt::dependency::DependencyGraph;
 
 /// vector.py:670-678: isomorphic — two ops can be packed if they have the
 /// same opcode AND the same vecinfo bytesize. PyPy reads each side through
-/// `forwarded_vecinfo`, so the comparison runs against the same `_forwarded`
-/// (here `vecinfo_cache`) store that `VectorizationInfo(op)` populated.
-pub fn isomorphic_with_state(state: &mut VecScheduleState, l_op: &Op, r_op: &Op) -> bool {
+/// `forwarded_vecinfo(op)`, which lives on `op._forwarded`; pyre keeps that
+/// forwarded `VectorizationInfo` in the scheduler's pos-keyed store, so the
+/// store is the extra leading argument.
+pub fn isomorphic(state: &mut VecScheduleState, l_op: &Op, r_op: &Op) -> bool {
     if l_op.opcode != r_op.opcode {
         return false;
     }
@@ -245,7 +246,7 @@ impl PackSet {
         let l_op = &graph.nodes[lnode].op;
         let r_op = &graph.nodes[rnode].op;
 
-        if !isomorphic_with_state(state, l_op, r_op) {
+        if !isomorphic(state, l_op, r_op) {
             return Ok(None);
         }
 
@@ -774,13 +775,13 @@ pub struct VecScheduleState {
     next_pos: u32,
     /// `schedule.py:20-28 forwarded_vecinfo(op)` cache — pyre's stand-in
     /// for PyPy's `op._forwarded` `VectorizationInfo` carrier. It is the
-    /// canonical store for the vector pass: `setup_vectorization` stamps
-    /// every loop op here through `VectorizationInfo(op)`, and
-    /// `forwarded_vecinfo` / `isomorphic_with_state` read it back. Living
-    /// on the state (not on the op) means it is dropped when the state
-    /// is, matching `vector.py:58-60 teardown_vectorization`'s
-    /// `set_forwarded(None)`. Keyed by full `OpRef` so InputArg/op
-    /// namespaces don't collide.
+    /// canonical store for the vector pass: `VectorLoop::setup_vectorization`
+    /// stamps every loop op here through `VectorizationInfo(op)`, and
+    /// `forwarded_vecinfo` / `isomorphic` read it back. Living on the state
+    /// (not on the op) means it is dropped when the state is, and
+    /// `VectorLoop::teardown_vectorization` clears it per op
+    /// (`vector.py:58-60 set_forwarded(None)`). Keyed by full `OpRef` so
+    /// InputArg/op namespaces don't collide.
     vecinfo_cache: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, majit_ir::VectorizationInfo>,
 }
 
@@ -801,10 +802,10 @@ impl VecScheduleState {
         }
     }
 
-    /// vector.py:54-60 setup/teardown_vectorization. Seed only the local
-    /// scheduling vecinfo state; RPython clears this `_forwarded` state
-    /// after the vector pass, so it must not leak into the main
-    /// optimizer's forwarded state.
+    /// vector.py:54-56 `op.set_forwarded(VectorizationInfo(op))` for one op:
+    /// the per-op body that `VectorLoop::setup_vectorization` iterates.
+    /// PyPy stores the vecinfo on `op._forwarded`; pyre keeps it in this
+    /// scheduler's pos-keyed store.
     ///
     /// `constant_of` resolves the optimizer's const-pool so the
     /// `resoperation.py:181-186 INT_SIGNEXT` branch can read `arg1.value`
@@ -812,15 +813,23 @@ impl VecScheduleState {
     /// directly because `_args[1]` IS the const; pyre's flat-OpRef
     /// encoding stores constants as a pool index, so the resolver fills
     /// the same role at the moment we populate the inline vecinfo slot.
-    pub fn setup_vectorization(&mut self, ops: &[Op], constant_of: &dyn Fn(OpRef) -> Option<i64>) {
-        for op in ops {
-            let info = if op.opcode == OpCode::IntSignext {
-                self.int_signext_vecinfo(op, constant_of)
-            } else {
-                self.vectorization_info_for_op(op)
-            };
-            self.set_forwarded_vecinfo(op.pos.get(), info);
-        }
+    pub(crate) fn set_op_forwarded_vecinfo(
+        &mut self,
+        op: &Op,
+        constant_of: &dyn Fn(OpRef) -> Option<i64>,
+    ) {
+        let info = if op.opcode == OpCode::IntSignext {
+            self.int_signext_vecinfo(op, constant_of)
+        } else {
+            self.vectorization_info_for_op(op)
+        };
+        self.set_forwarded_vecinfo(op.pos.get(), info);
+    }
+
+    /// vector.py:58-60 `op.set_forwarded(None)` for one op: drops the
+    /// stored vecinfo, the per-op body of `VectorLoop::teardown_vectorization`.
+    pub(crate) fn clear_op_forwarded_vecinfo(&mut self, opref: OpRef) {
+        self.vecinfo_cache.remove(&opref);
     }
 
     /// `resoperation.py:181-186 VectorizationInfo.__init__` INT_SIGNEXT

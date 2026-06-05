@@ -32,7 +32,7 @@ pub use crate::optimizeopt::dependency::{Node, schedule_operations};
 pub use crate::optimizeopt::schedule::{
     AccumEntry, AccumPack, CostModel, GenericCostModel, GuardAnalysis, NotAProfitableLoop,
     NotAVectorizeableLoop, Pack, PackSet, VecScheduleState, VectorizeError,
-    are_adjacent_memory_refs, isomorphic_with_state, turn_into_vector, unpack_from_vector,
+    are_adjacent_memory_refs, isomorphic, turn_into_vector, unpack_from_vector,
 };
 
 // ── vector.py:35-40: copy_resop ────────────────────────────────────────
@@ -103,6 +103,31 @@ impl VectorLoop {
             ops[label_pos + 1..jump_pos].to_vec(),
             ops[jump_pos].clone(),
         ))
+    }
+
+    /// vector.py:54-56: setup_vectorization — attach a `VectorizationInfo`
+    /// to every loop operation (`for op in self.operations:
+    /// op.set_forwarded(VectorizationInfo(op))`). PyPy stores it on
+    /// `op._forwarded`; pyre's flat-OpRef operands keep the per-op vecinfo
+    /// in the scheduler's pos-keyed store, so `state` carries it. INT_SIGNEXT
+    /// reads arg1's constant through `constant_of` (resoperation.py:181).
+    pub fn setup_vectorization(
+        &self,
+        state: &mut VecScheduleState,
+        constant_of: &dyn Fn(OpRef) -> Option<i64>,
+    ) {
+        for op in &self.operations {
+            state.set_op_forwarded_vecinfo(op, constant_of);
+        }
+    }
+
+    /// vector.py:58-60: teardown_vectorization — drop every loop op's
+    /// `VectorizationInfo` (`for op in self.operations:
+    /// op.set_forwarded(None)`), clearing the scheduler's forwarded store.
+    pub fn teardown_vectorization(&self, state: &mut VecScheduleState) {
+        for op in &self.operations {
+            state.clear_op_forwarded_vecinfo(op.pos.get());
+        }
     }
 
     /// vector.py:62-92: finaloplist — assemble the complete operation list
@@ -256,10 +281,11 @@ pub fn optimize_vector(
     let version = loop_.clone_loop();
 
     let result = (|| -> Result<Vec<Op>, VectorizeError> {
-        // vector.py:142-143. `run_optimization` performs vector.py:135
-        // `loop.setup_vectorization()` itself, stamping each op's
-        // VectorizationInfo into the scheduler's forwarded cache (the
-        // `_forwarded` equivalent that `forwarded_vecinfo` reads).
+        // vector.py:142-143. `run_optimization` owns the scheduler state, so
+        // it calls vector.py:135 `loop.setup_vectorization()` (and the
+        // vector.py:172 `teardown_vectorization()`) against that state
+        // internally, stamping each op's VectorizationInfo into the
+        // `_forwarded` equivalent that `forwarded_vecinfo` reads.
         let mut opt = VectorizingOptimizer::new_with_params(cost_threshold, vec_size);
         opt.run_optimization(loop_)
     })();
@@ -475,7 +501,7 @@ impl VectorizingOptimizer {
         let graph = DependencyGraph::build(&loop_.operations, &constant_of);
         // VecScheduleState is created before find_adjacent_memory_refs/
         // extend_packset because PackSet::can_be_packed now consults it via
-        // isomorphic_with_state (vector.py: packset.can_be_packed reaches
+        // isomorphic (vector.py: packset.can_be_packed reaches
         // state for accumulation/invariant lookups; pre-state form was a
         // pre-rebase fork).
         let start_pos = loop_
@@ -487,7 +513,7 @@ impl VectorizingOptimizer {
             + 1;
         let mut sched_state = VecScheduleState::new(start_pos);
         // vector.py:135 loop.setup_vectorization()
-        sched_state.setup_vectorization(&loop_.operations, &constant_of);
+        loop_.setup_vectorization(&mut sched_state, &constant_of);
         // vector.py:606-609 CostModel.__init__: savings = 0, threshold stored
         // separately. Initializing savings = self.cost_threshold inverted the
         // gate — a positive threshold made profitable() trivially true.
@@ -672,6 +698,11 @@ impl VectorizingOptimizer {
             op.clear_vecinfo();
         }
 
+        // vector.py:172 `finally: loop.teardown_vectorization()`. The
+        // earlier `?`/`return Err` exits drop `sched_state` instead, which
+        // discards the same pos-keyed forwarded store.
+        loop_.teardown_vectorization(&mut sched_state);
+
         // vector.py:271: return loop.finaloplist(jitcell_token, reset_label_token=False).
         // post_schedule already set loop_.operations / prefix / prefix_label / jump,
         // so finaloplist splices [prefix][prefix_label] operations [jump].
@@ -835,7 +866,7 @@ impl VectorizingOptimizer {
                 let l_op = &graph.nodes[l_dep].op;
                 let r_op = &graph.nodes[r_dep].op;
                 // vector.py:438-439: isomorphic and lnode.is_before(rnode)
-                if isomorphic_with_state(state, l_op, r_op) && l_dep < r_dep {
+                if isomorphic(state, l_op, r_op) && l_dep < r_dep {
                     match packset.can_be_packed(state, l_dep, r_dep, Some(pack), false, graph) {
                         Ok(Some(pair)) => packset.add_pack(pair),
                         Err(_) => return,
@@ -879,7 +910,7 @@ impl VectorizingOptimizer {
                 let l_op = &graph.nodes[l_user].op;
                 let r_op = &graph.nodes[r_user].op;
                 // vector.py:454-455: isomorphic and lnode.is_before(rnode)
-                if isomorphic_with_state(state, l_op, r_op) && l_user < r_user {
+                if isomorphic(state, l_op, r_op) && l_user < r_user {
                     match packset.can_be_packed(state, l_user, r_user, Some(pack), true, graph) {
                         Ok(Some(pair)) => packset.add_pack(pair),
                         Err(_) => return,
@@ -1015,7 +1046,7 @@ impl VectorizingOptimizer {
         // value for bytesize (resoperation.py:181); the constant_of
         // resolver feeds that through so the inline vecinfo slot matches
         // PyPy's VectorizationInfo(op) constructor.
-        sched_state.setup_vectorization(&loop_.operations, &constant_of);
+        loop_.setup_vectorization(&mut sched_state, &constant_of);
 
         // Phase 1: Schedule operations for ILP before packing.
         let dep_graph = DependencyGraph::build(&loop_.operations, &constant_of);
@@ -1026,7 +1057,7 @@ impl VectorizingOptimizer {
                 .map(|&i| loop_.operations[i].clone())
                 .collect();
             loop_.operations = scheduled;
-            sched_state.setup_vectorization(&loop_.operations, &constant_of);
+            loop_.setup_vectorization(&mut sched_state, &constant_of);
         }
 
         // Phase 2: Rebuild dependency graph and find packs.
@@ -1204,6 +1235,11 @@ impl VectorizingOptimizer {
         // correctly targets prefix_label. TODO: thread a JitCellToken when the
         // compile path is un-gated so finaloplist mints fresh prefix-label
         // tokens (vector.rs:156-185).
+        // vector.py:172 `finally: loop.teardown_vectorization()`. The earlier
+        // `return None` exits drop `sched_state` instead, discarding the same
+        // pos-keyed forwarded store.
+        loop_.teardown_vectorization(&mut sched_state);
+
         let include_label = loop_.prefix_label.is_none();
         Some(loop_.finaloplist(None, false, include_label))
     }
@@ -1846,6 +1882,10 @@ mod tests {
     /// INT_SIGNEXT.
     #[test]
     fn int_signext_setup_resolves_inline_const_in_standalone_pass() {
+        let label = Op::new(
+            OpCode::Label,
+            &[BoxRef::from_opref(OpRef::input_arg_int(0))],
+        );
         let signext = Op::new(
             OpCode::IntSignext,
             &[
@@ -1853,15 +1893,20 @@ mod tests {
                 BoxRef::from_opref(OpRef::const_int(4)),
             ],
         );
-        let mut ops = vec![signext];
-        assign_positions(&mut ops, 10);
+        let jump = Op::new(
+            OpCode::Jump,
+            &[BoxRef::from_opref(OpRef::input_arg_int(0))],
+        );
+        let mut body = vec![signext];
+        assign_positions(&mut body, 10);
+        let vloop = VectorLoop::new(label, body, jump);
 
         let mut st = VecScheduleState::new(100);
         // The standalone run_optimization resolver: inline consts only.
         let constant_of = |opref: OpRef| -> Option<i64> { opref.as_const_int() };
-        st.setup_vectorization(&ops, &constant_of);
+        vloop.setup_vectorization(&mut st, &constant_of);
 
-        let info = st.forwarded_vecinfo(&ops[0]);
+        let info = st.forwarded_vecinfo(&vloop.operations[0]);
         assert_eq!(info.datatype, 'i');
         assert_eq!(info.bytesize, 4);
         assert!(info.signed);
@@ -2556,7 +2601,7 @@ mod tests {
                 BoxRef::from_opref(OpRef::input_arg_int(103)),
             ],
         );
-        assert!(isomorphic_with_state(&mut state, &a, &b));
+        assert!(isomorphic(&mut state, &a, &b));
     }
 
     #[test]
@@ -2576,7 +2621,7 @@ mod tests {
                 BoxRef::from_opref(OpRef::input_arg_int(103)),
             ],
         );
-        assert!(!isomorphic_with_state(&mut state, &a, &b));
+        assert!(!isomorphic(&mut state, &a, &b));
     }
 
     #[test]
