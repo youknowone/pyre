@@ -2957,7 +2957,13 @@ impl Repr for InstanceRepr {
                 )));
             };
             // upstream: `llf, llf_nonnull = make_ll_isinstance(self.rtyper, cls)`.
-            let (ll_const, ll_const_nonnull) = make_ll_isinstance(&rtyper, c_ptr)?;
+            // `v_obj` has been coerced through `instance_repr.lowleveltype()`
+            // (OBJECTPTR for gc flavor, NONGCOBJECTPTR for raw); pass it
+            // through so the minted helper's `obj` parameter type matches
+            // the actual `v_obj`'s lltype upstream's "obj should be cast
+            // to OBJECT or NONGCOBJECT" polymorphism (rclass.py:1143).
+            let (ll_const, ll_const_nonnull) =
+                make_ll_isinstance(&rtyper, c_ptr, instance_repr.lowleveltype())?;
             // upstream: `if hop.args_s[0].can_be_None: ...`. The
             // `can_be_None` flag rides on the annotator's
             // SomeInstance / SomePBC carriers — None elsewhere means

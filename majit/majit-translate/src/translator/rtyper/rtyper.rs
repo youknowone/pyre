@@ -38,7 +38,8 @@ use crate::translator::rtyper::lltypesystem::lltype::{
     _ptr, LowLevelType, LowLevelValue, PtrTarget, getfunctionptr,
 };
 use crate::translator::rtyper::rclass::{
-    CLASSTYPE, Flavor, InstanceRepr, InstanceReprKey, OBJECTPTR, RootClassRepr, getinstancerepr,
+    CLASSTYPE, Flavor, InstanceRepr, InstanceReprKey, NONGCOBJECTPTR, OBJECTPTR, RootClassRepr,
+    getinstancerepr,
 };
 use crate::translator::rtyper::rmodel::{
     RTypeResult, Repr, ReprKey, inputconst, inputconst_from_lltype, rtyper_makekey, rtyper_makerepr,
@@ -3124,17 +3125,26 @@ fn lowlevel_isinstance_helper_graph(
     args: &[LowLevelType],
     result: &LowLevelType,
 ) -> Result<PyGraph, TyperError> {
-    if args != [OBJECTPTR.clone(), CLASSTYPE.clone()] || result != &LowLevelType::Bool {
+    // Upstream `ll_isinstance(obj, cls)` (rclass.py:1143) is
+    // polymorphic over `obj`'s flavor — `# obj should be cast to
+    // OBJECT or NONGCOBJECT`.  Accept either pointee so raw-flavor
+    // instances mint a helper whose body matches their lowleveltype.
+    if !(args.len() == 2
+        && (args[0] == *OBJECTPTR || args[0] == *NONGCOBJECTPTR)
+        && args[1] == *CLASSTYPE)
+        || result != &LowLevelType::Bool
+    {
         return Err(TyperError::message(format!(
-            "{name} expects (OBJECTPTR, CLASSTYPE) -> Bool, got ({args:?}) -> {result:?}"
+            "{name} expects ((OBJECTPTR|NONGCOBJECTPTR), CLASSTYPE) -> Bool, got ({args:?}) -> {result:?}"
         )));
     }
+    let obj_lltype = args[0].clone();
 
     let argnames = vec!["arg0".to_string(), "arg1".to_string()];
-    let obj0 = variable_with_lltype("arg0", OBJECTPTR.clone());
+    let obj0 = variable_with_lltype("arg0", obj_lltype.clone());
     let cls0 = variable_with_lltype("arg1", CLASSTYPE.clone());
     let is_nonnull = variable_with_lltype("is_nonnull", LowLevelType::Bool);
-    let obj1 = variable_with_lltype("obj", OBJECTPTR.clone());
+    let obj1 = variable_with_lltype("obj", obj_lltype.clone());
     let cls1 = variable_with_lltype("cls", CLASSTYPE.clone());
     let obj_cls = variable_with_lltype("obj_cls", CLASSTYPE.clone());
     let call_result = variable_with_lltype("result", LowLevelType::Bool);
@@ -3262,7 +3272,13 @@ fn lowlevel_isinstance_helper_graph(
 pub(crate) fn make_ll_isinstance(
     rtyper: &RPythonTyper,
     cls_ptr: &_ptr,
+    obj_lltype: &LowLevelType,
 ) -> Result<(LowLevelFunction, LowLevelFunction), TyperError> {
+    if !(*obj_lltype == *OBJECTPTR || *obj_lltype == *NONGCOBJECTPTR) {
+        return Err(TyperError::message(format!(
+            "make_ll_isinstance: obj_lltype must be OBJECTPTR or NONGCOBJECTPTR, got {obj_lltype:?}"
+        )));
+    }
     // upstream: `minid = cls.subclassrange_min; maxid = cls.subclassrange_max`.
     let min_val = cls_ptr
         .getattr("subclassrange_min")
@@ -3301,8 +3317,17 @@ pub(crate) fn make_ll_isinstance(
         _ => cls_ptr._hashable_identity(),
     };
 
-    let nonnull_name = format!("ll_isinstance_const_nonnull_{class_identity}_{minid}_{maxid}");
-    let const_name = format!("ll_isinstance_const_{class_identity}_{minid}_{maxid}");
+    // Differentiate the cache name suffix by gc/raw flavor so the
+    // same class with both flavor witnesses (rare but legal) does
+    // not collide on a single helper body of the wrong obj type.
+    let flavor_tag = if *obj_lltype == *NONGCOBJECTPTR {
+        "raw"
+    } else {
+        "gc"
+    };
+    let nonnull_name =
+        format!("ll_isinstance_const_nonnull_{flavor_tag}_{class_identity}_{minid}_{maxid}");
+    let const_name = format!("ll_isinstance_const_{flavor_tag}_{class_identity}_{minid}_{maxid}");
 
     // Mint the non-null helper first so the const helper's direct_call
     // can resolve it via the cache when its builder runs.
@@ -3310,7 +3335,7 @@ pub(crate) fn make_ll_isinstance(
     let cls_ptr_for_builder = cls_ptr.clone();
     let ll_const_nonnull = rtyper.lowlevel_helper_function_with_builder(
         nonnull_name.clone(),
-        vec![OBJECTPTR.clone()],
+        vec![obj_lltype.clone()],
         LowLevelType::Bool,
         move |_rtyper, args, result| {
             build_ll_isinstance_const_nonnull_graph(
@@ -3329,7 +3354,7 @@ pub(crate) fn make_ll_isinstance(
     let nonnull_name_for_call = nonnull_name.clone();
     let ll_const = rtyper.lowlevel_helper_function_with_builder(
         const_name,
-        vec![OBJECTPTR.clone()],
+        vec![obj_lltype.clone()],
         LowLevelType::Bool,
         move |rtyper, args, result| {
             build_ll_isinstance_const_graph(
@@ -3358,14 +3383,19 @@ fn build_ll_isinstance_const_nonnull_graph(
     has_subclasses: bool,
     cls_ptr: _ptr,
 ) -> Result<PyGraph, TyperError> {
-    if args != [OBJECTPTR.clone()] || result != &LowLevelType::Bool {
+    // See `lowlevel_isinstance_helper_graph` — the obj parameter is
+    // polymorphic over OBJECTPTR / NONGCOBJECTPTR.
+    if !(args.len() == 1 && (args[0] == *OBJECTPTR || args[0] == *NONGCOBJECTPTR))
+        || result != &LowLevelType::Bool
+    {
         return Err(TyperError::message(format!(
-            "{name} expects (OBJECTPTR) -> Bool, got ({args:?}) -> {result:?}"
+            "{name} expects ((OBJECTPTR|NONGCOBJECTPTR)) -> Bool, got ({args:?}) -> {result:?}"
         )));
     }
+    let obj_lltype = args[0].clone();
 
     let argnames = vec!["arg0".to_string()];
-    let obj = variable_with_lltype("arg0", OBJECTPTR.clone());
+    let obj = variable_with_lltype("arg0", obj_lltype);
     let obj_cls = variable_with_lltype("obj_cls", CLASSTYPE.clone());
     let result_var = variable_with_lltype("result", LowLevelType::Bool);
     let return_var = variable_with_lltype("result", LowLevelType::Bool);
@@ -3445,16 +3475,21 @@ fn build_ll_isinstance_const_graph(
     result: &LowLevelType,
     nonnull_name: &str,
 ) -> Result<PyGraph, TyperError> {
-    if args != [OBJECTPTR.clone()] || result != &LowLevelType::Bool {
+    // See `lowlevel_isinstance_helper_graph` — the obj parameter is
+    // polymorphic over OBJECTPTR / NONGCOBJECTPTR.
+    if !(args.len() == 1 && (args[0] == *OBJECTPTR || args[0] == *NONGCOBJECTPTR))
+        || result != &LowLevelType::Bool
+    {
         return Err(TyperError::message(format!(
-            "{name} expects (OBJECTPTR) -> Bool, got ({args:?}) -> {result:?}"
+            "{name} expects ((OBJECTPTR|NONGCOBJECTPTR)) -> Bool, got ({args:?}) -> {result:?}"
         )));
     }
+    let obj_lltype = args[0].clone();
 
     let argnames = vec!["arg0".to_string()];
-    let obj0 = variable_with_lltype("arg0", OBJECTPTR.clone());
+    let obj0 = variable_with_lltype("arg0", obj_lltype.clone());
     let is_nonnull = variable_with_lltype("is_nonnull", LowLevelType::Bool);
-    let obj1 = variable_with_lltype("obj", OBJECTPTR.clone());
+    let obj1 = variable_with_lltype("obj", obj_lltype.clone());
     let call_result = variable_with_lltype("result", LowLevelType::Bool);
     let return_var = variable_with_lltype("result", LowLevelType::Bool);
 
@@ -3503,7 +3538,7 @@ fn build_ll_isinstance_const_graph(
     // dispatch table's synthetic-stub branch).
     let callee = rtyper.lowlevel_helper_function(
         nonnull_name.to_string(),
-        vec![OBJECTPTR.clone()],
+        vec![obj_lltype.clone()],
         LowLevelType::Bool,
     )?;
     callblock.borrow_mut().operations.push(direct_call_operation(
@@ -5817,6 +5852,66 @@ mod tests {
             panic!("generate_exception_match must return a Variable");
         };
         assert_eq!(res_var.concretetype().as_ref(), Some(&LowLevelType::Bool));
+    }
+
+    #[test]
+    fn make_ll_isinstance_leaf_class_uses_ptr_eq_nonnull_helper() {
+        let (_ann, rtyper) = make_live_rtyper();
+        let Hlvalue::Constant(cls_const) = make_const_etype(7, 8) else {
+            panic!("make_const_etype must return a Constant");
+        };
+        let ConstValue::LLPtr(cls_ptr) = &cls_const.value else {
+            panic!(
+                "make_const_etype must carry an LLPtr, got {:?}",
+                cls_const.value
+            );
+        };
+
+        let (_ll_const, ll_const_nonnull) =
+            make_ll_isinstance(&rtyper, cls_ptr, &OBJECTPTR.clone())
+                .expect("make_ll_isinstance leaf");
+        let pygraph = ll_const_nonnull.graph.expect("nonnull helper graph");
+        let graph = pygraph.graph.borrow();
+        let startblock = graph.startblock.clone();
+        drop(graph);
+
+        let ops: Vec<_> = startblock
+            .borrow()
+            .operations
+            .iter()
+            .map(|op| op.opname.clone())
+            .collect();
+        assert_eq!(ops, vec!["getfield", "ptr_eq"]);
+    }
+
+    #[test]
+    fn make_ll_isinstance_class_with_subclasses_uses_int_between_nonnull_helper() {
+        let (_ann, rtyper) = make_live_rtyper();
+        let Hlvalue::Constant(cls_const) = make_const_etype(7, 9) else {
+            panic!("make_const_etype must return a Constant");
+        };
+        let ConstValue::LLPtr(cls_ptr) = &cls_const.value else {
+            panic!(
+                "make_const_etype must carry an LLPtr, got {:?}",
+                cls_const.value
+            );
+        };
+
+        let (_ll_const, ll_const_nonnull) =
+            make_ll_isinstance(&rtyper, cls_ptr, &OBJECTPTR.clone())
+                .expect("make_ll_isinstance non-leaf");
+        let pygraph = ll_const_nonnull.graph.expect("nonnull helper graph");
+        let graph = pygraph.graph.borrow();
+        let startblock = graph.startblock.clone();
+        drop(graph);
+
+        let ops: Vec<_> = startblock
+            .borrow()
+            .operations
+            .iter()
+            .map(|op| op.opname.clone())
+            .collect();
+        assert_eq!(ops, vec!["getfield", "getfield", "int_between"]);
     }
 
     #[test]
