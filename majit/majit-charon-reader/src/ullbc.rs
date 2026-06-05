@@ -3,7 +3,7 @@
 //! Mirrors the subset of Charon 0.1.196's ULLBC the Step 3 driver
 //! consumes. The layout is reverse-engineered from
 //! `majit/charon-corpus/corpus.ullbc`; see
-//! `majit/charon-corpus/step1-compatibility.md` for the rationale.
+//! `majit/charon-corpus/README.md` for the schema findings.
 //!
 //! ## Schema-drift policy
 //!

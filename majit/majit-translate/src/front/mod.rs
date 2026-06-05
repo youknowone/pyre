@@ -23,6 +23,31 @@
 //!
 //! Every non-trivial addition to this module must include a comment citing the RPython file:line it replaces or bridges. If no such line exists, the addition is further pyre-specific deviation and must be justified explicitly in the commit message.
 //!
+//! ## Step 1 — dyn-Trait / impl-Trait classification (closed)
+//!
+//! Issue #97 framed a source refactor — chiefly enum-ifying the 8-impl
+//! `dyn DictStrategy` hierarchy — as a prerequisite for Charon.  The
+//! Step 0/1 extraction audit refuted that premise: Charon extracts every
+//! `dyn Trait` / `impl Trait` site in the JIT-consumed crates
+//! (`pyre-object`, `pyre-interpreter`, `pyre-module`) cleanly, and
+//! **zero** of the 36 `Dynamic` fat-pointer calls in
+//! `pyre-interpreter.ullbc` are `DictStrategy::*` — dict dispatch is
+//! statically-resolved `Trait`-kind, not virtual.  No RPITIT / GAT /
+//! trait alias appears in scope; the only extraction gap is std
+//! `thread_local!` accessor stubs, treated as opaque ops.  (The
+//! call-classification counts that back this live in
+//! `majit-charon-reader`'s README.)
+//!
+//! Decision: **no source refactor is required to unblock Charon.**  This
+//! driver targets the as-extracted ULLBC and treats `Dynamic` calls as
+//! first-class opaque indirect calls (type-flow devirtualization only if
+//! a hot path later demands it).  The `dyn Trait` refactors the issue
+//! proposed are optional post-cutover polish, not gating work:
+//! `dyn DictStrategy` (8 impls) deferred; `dyn ActionFlagOps` (1 impl) a
+//! mechanical retire; `dyn AsyncActionOps` (pluggable registry) and
+//! `dyn FnMut` (GC visitors) stay `dyn`; `impl Trait` iterator returns
+//! extract fine.
+//!
 //! ## Step 6 cutover status (2026-05-25)
 //!
 //! - **Step 6.A** — `majit/charon-corpus` retained as the corpus

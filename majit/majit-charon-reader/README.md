@@ -75,5 +75,7 @@ The pyre-interpreter `Call` terminators classify as:
   dynamic      36   (Dynamic: dyn Trait virtual call)
 ```
 
-The 36 `dynamic` count matches the Step 1 audit exactly
-(`majit/charon-corpus/step1-compatibility.md`).
+The 36 `dynamic` count is the audited `dyn Trait` virtual-call total
+across the JIT-consumed crates (`pyre-object` / `pyre-interpreter` /
+`pyre-module`); see the Step 1 dyn-Trait classification in
+`majit-translate/src/front/mod.rs`.
