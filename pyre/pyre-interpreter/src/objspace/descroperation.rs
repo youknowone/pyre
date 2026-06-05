@@ -955,10 +955,55 @@ unsafe fn try_instance_unaryop(a: PyObjectRef, dunder: &str) -> Option<PyResult>
     None
 }
 
+/// True when `obj`'s dynamic type (`w_class`) resolves `dunder` to a
+/// user-level Python function — a genuine override rather than the inherited
+/// builtin operator slot.  A builtin-storage instance keeps `ob_type` at the
+/// canonical storage type and carries its Python class in `w_class`, so a
+/// subclass `def __add__`/`__or__` is otherwise ignored by the storage fast
+/// paths.  The discriminator is the resolved method's kind, not a storage
+/// pointer: the builtin slots are fixed-code gateway functions that re-enter
+/// `add()`/`or_()`/…, so resolving to one must not trigger early dispatch —
+/// otherwise a plain `int`/`long` operand recurses forever (a `long` carries
+/// `w_class` = the `int` type object but `ob_type` = `LONG_TYPE`, so the two
+/// cannot be told apart by a storage-type comparison).  A user `def`
+/// (including one inherited from a Python mixin) is a `FUNCTION_TYPE` object
+/// with mutable code; `is_function_with_fixed_code` excludes the gateway
+/// builtins (`function_new_with_fixed_code`) that back the operator slots.
+unsafe fn operand_overrides(obj: PyObjectRef, dunder: &str) -> bool {
+    let w_class = (*obj).w_class;
+    if w_class.is_null() || !pyre_object::is_type(w_class) {
+        return false;
+    }
+    match lookup_in_type_where(w_class, dunder) {
+        Some(found) => {
+            pyre_object::py_type_check(found, &crate::function::FUNCTION_TYPE)
+                && !crate::function::is_function_with_fixed_code(found)
+        }
+        None => false,
+    }
+}
+
+/// Whether a binary operator should consult the dunder dispatch before its
+/// builtin storage fast path: when the left operand overrides the forward
+/// dunder or the right operand overrides the reflected one.
+unsafe fn binop_dispatch_first(
+    a: PyObjectRef,
+    b: PyObjectRef,
+    dunder: &str,
+    rdunder: &str,
+) -> bool {
+    operand_overrides(a, dunder) || operand_overrides(b, rdunder)
+}
+
 pub fn add(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let a = unwrap_cell(a);
     let b = unwrap_cell(b);
     unsafe {
+        if binop_dispatch_first(a, b, "__add__", "__radd__") {
+            if let Some(result) = try_dispatch_binary_special(a, b, "__add__", "__radd__")? {
+                return Ok(result);
+            }
+        }
         if is_int_like(a) && is_int_like(b) {
             return int_add(a, b);
         }
@@ -1024,6 +1069,11 @@ pub fn sub(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let a = unwrap_cell(a);
     let b = unwrap_cell(b);
     unsafe {
+        if binop_dispatch_first(a, b, "__sub__", "__rsub__") {
+            if let Some(result) = try_dispatch_binary_special(a, b, "__sub__", "__rsub__")? {
+                return Ok(result);
+            }
+        }
         if is_int_like(a) && is_int_like(b) {
             return int_sub(a, b);
         }
@@ -1072,6 +1122,11 @@ pub fn mul(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let a = unwrap_cell(a);
     let b = unwrap_cell(b);
     unsafe {
+        if binop_dispatch_first(a, b, "__mul__", "__rmul__") {
+            if let Some(result) = try_dispatch_binary_special(a, b, "__mul__", "__rmul__")? {
+                return Ok(result);
+            }
+        }
         if is_int_like(a) && is_int_like(b) {
             return int_mul(a, b);
         }
@@ -1172,6 +1227,13 @@ pub fn floordiv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let a = unwrap_cell(a);
     let b = unwrap_cell(b);
     unsafe {
+        if binop_dispatch_first(a, b, "__floordiv__", "__rfloordiv__") {
+            if let Some(result) =
+                try_dispatch_binary_special(a, b, "__floordiv__", "__rfloordiv__")?
+            {
+                return Ok(result);
+            }
+        }
         if is_int_like(a) && is_int_like(b) {
             return int_floordiv(a, b);
         }
@@ -1199,6 +1261,11 @@ pub fn mod_(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let a = unwrap_cell(a);
     let b = unwrap_cell(b);
     unsafe {
+        if binop_dispatch_first(a, b, "__mod__", "__rmod__") {
+            if let Some(result) = try_dispatch_binary_special(a, b, "__mod__", "__rmod__")? {
+                return Ok(result);
+            }
+        }
         if is_int_like(a) && is_int_like(b) {
             return int_mod(a, b);
         }
@@ -1238,6 +1305,11 @@ pub fn truediv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let a = unwrap_cell(a);
     let b = unwrap_cell(b);
     unsafe {
+        if binop_dispatch_first(a, b, "__truediv__", "__rtruediv__") {
+            if let Some(result) = try_dispatch_binary_special(a, b, "__truediv__", "__rtruediv__")? {
+                return Ok(result);
+            }
+        }
         let a_num = is_int(a) || is_float(a) || is_long(a);
         let b_num = is_int(b) || is_float(b) || is_long(b);
         if a_num && b_num {
@@ -1273,6 +1345,11 @@ pub fn pow(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let a = unwrap_cell(a);
     let b = unwrap_cell(b);
     unsafe {
+        if binop_dispatch_first(a, b, "__pow__", "__rpow__") {
+            if let Some(result) = try_dispatch_binary_special(a, b, "__pow__", "__rpow__")? {
+                return Ok(result);
+            }
+        }
         if is_int_like(a) && is_int_like(b) {
             return int_pow(a, b);
         }
@@ -1635,6 +1712,11 @@ pub fn lshift(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let a = unwrap_cell(a);
     let b = unwrap_cell(b);
     unsafe {
+        if binop_dispatch_first(a, b, "__lshift__", "__rlshift__") {
+            if let Some(result) = try_dispatch_binary_special(a, b, "__lshift__", "__rlshift__")? {
+                return Ok(result);
+            }
+        }
         if is_int_like(a) && is_int_like(b) {
             return int_lshift(a, b);
         }
@@ -1661,6 +1743,11 @@ pub fn rshift(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let a = unwrap_cell(a);
     let b = unwrap_cell(b);
     unsafe {
+        if binop_dispatch_first(a, b, "__rshift__", "__rrshift__") {
+            if let Some(result) = try_dispatch_binary_special(a, b, "__rshift__", "__rrshift__")? {
+                return Ok(result);
+            }
+        }
         if is_int_like(a) && is_int_like(b) {
             return int_rshift(a, b);
         }
@@ -1687,6 +1774,11 @@ pub fn and_(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let a = unwrap_cell(a);
     let b = unwrap_cell(b);
     unsafe {
+        if binop_dispatch_first(a, b, "__and__", "__rand__") {
+            if let Some(result) = try_dispatch_binary_special(a, b, "__and__", "__rand__")? {
+                return Ok(result);
+            }
+        }
         // boolobject.py:74 W_BoolObject.descr_and — both operands bool
         // → space.newbool(op(a, b)). MRO ensures this runs before the
         // W_IntObject.descr_and fallback in int_bitand.
@@ -1770,6 +1862,11 @@ pub fn or_(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         }
     };
     unsafe {
+        if binop_dispatch_first(a, b, "__or__", "__ror__") {
+            if let Some(result) = try_dispatch_binary_special(a, b, "__or__", "__ror__")? {
+                return Ok(result);
+            }
+        }
         // boolobject.py:75 W_BoolObject.descr_or — both operands bool
         // → space.newbool(op(a, b)).
         if is_bool(a) && is_bool(b) {
@@ -1838,6 +1935,11 @@ pub fn xor(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let a = unwrap_cell(a);
     let b = unwrap_cell(b);
     unsafe {
+        if binop_dispatch_first(a, b, "__xor__", "__rxor__") {
+            if let Some(result) = try_dispatch_binary_special(a, b, "__xor__", "__rxor__")? {
+                return Ok(result);
+            }
+        }
         if is_bool(a) && is_bool(b) {
             return Ok(pyre_object::bool_descr_xor(a, b));
         }
