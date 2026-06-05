@@ -2071,6 +2071,42 @@ impl MIFrame {
         Ok(())
     }
 
+    /// Variant of `push_call_replay_stack` for the resolved-builtin call
+    /// shape where the receiver already occupies `args[0]` (the
+    /// `null_or_self` slot was non-null and the CALL handler folded it into
+    /// the arg list). Replays the exact CALL operand stack
+    /// `[callable, args...]` with no synthesised null sentinel.
+    fn push_call_replay_stack_self_in_args(
+        &mut self,
+        ctx: &mut TraceCtx,
+        callable: OpRef,
+        callable_concrete: ConcreteValue,
+        args: &[OpRef],
+        call_pc: usize,
+    ) {
+        // The callable carries its real concrete (a Const unbound function
+        // for resolved-builtin calls). A Const operand is numbered as
+        // TAGCONST from its concrete value at guard-failure resume, so a
+        // `ConcreteValue::Null` here would reconstruct a null callable.
+        self.push_value(ctx, callable, callable_concrete);
+        for &arg in args {
+            self.push_value(ctx, arg, ConcreteValue::Null);
+        }
+        self.sym_mut().pending_next_instr = Some(call_pc);
+    }
+
+    fn pop_call_replay_stack_self_in_args(
+        &mut self,
+        ctx: &mut TraceCtx,
+        args_len: usize,
+    ) -> Result<(), PyError> {
+        for _ in 0..(1 + args_len) {
+            let _ = self.pop_value(ctx)?;
+        }
+        self.sym_mut().pending_next_instr = None;
+        Ok(())
+    }
+
     pub(crate) fn swap_values(&mut self, ctx: &mut TraceCtx, depth: usize) -> Result<(), PyError> {
         // Read the stack depth from the
         // concrete `PyFrame` at `concrete_frame_addr` rather than the
@@ -5804,16 +5840,35 @@ impl MIFrame {
                     })
                 };
                 if args.len() == 1 && canonical_list_method("append") == Some(inner_func) {
+                    // The folded fast path emits guards (resize-guard,
+                    // strategy guard, ...) that resume at the CALL pc. Replay
+                    // the `[callable, null, value]` operand stack the CALL
+                    // handler already popped so those guards capture the real
+                    // operands; otherwise blackhole re-execution of CALL on a
+                    // resize-guard failure reads a null callable.
+                    let call_pc = self.fallthrough_pc.saturating_sub(1);
+                    self.with_ctx(|this, ctx| {
+                        this.push_call_replay_stack(ctx, callable, args, call_pc)
+                    });
                     let self_ref = recover_self(self);
-                    self.list_append_value(self_ref, args[0], inner_self, concrete_args[0])?;
+                    let res =
+                        self.list_append_value(self_ref, args[0], inner_self, concrete_args[0]);
+                    self.with_ctx(|this, ctx| this.pop_call_replay_stack(ctx, args.len()))?;
+                    res?;
                     let none_ref =
                         self.with_ctx(|_this, ctx| ctx.const_ref(pyre_object::w_none() as i64));
                     return Ok(none_ref);
                 }
                 if args.len() == 0 && canonical_list_method("pop") == Some(inner_func) {
+                    let call_pc = self.fallthrough_pc.saturating_sub(1);
+                    self.with_ctx(|this, ctx| {
+                        this.push_call_replay_stack(ctx, callable, args, call_pc)
+                    });
                     let self_ref = recover_self(self);
                     let concrete_len = unsafe { w_list_len(inner_self) };
-                    return self.list_pop_value(callable, self_ref, inner_self, concrete_len);
+                    let res = self.list_pop_value(callable, self_ref, inner_self, concrete_len);
+                    self.with_ctx(|this, ctx| this.pop_call_replay_stack(ctx, args.len()))?;
+                    return res;
                 }
                 if args.len() == 0 && canonical_list_method("reverse") == Some(inner_func) {
                     let self_ref = recover_self(self);
@@ -5856,7 +5911,31 @@ impl MIFrame {
                     && !concrete_args.first().copied().unwrap_or(PY_NULL).is_null()
                     && is_list(concrete_args[0])
                 {
-                    self.list_append_value(args[0], args[1], concrete_args[0], concrete_args[1])?;
+                    // The folded fast path emits guards (resize-guard,
+                    // strategy guard, ...) that resume at the CALL pc. Replay
+                    // the `[callable, self, value]` operand stack the CALL
+                    // handler already popped so those guards capture the real
+                    // operands for blackhole re-execution on guard failure.
+                    let call_pc = self.fallthrough_pc.saturating_sub(1);
+                    self.with_ctx(|this, ctx| {
+                        this.push_call_replay_stack_self_in_args(
+                            ctx,
+                            callable,
+                            ConcreteValue::Ref(concrete_callable),
+                            args,
+                            call_pc,
+                        )
+                    });
+                    let res = self.list_append_value(
+                        args[0],
+                        args[1],
+                        concrete_args[0],
+                        concrete_args[1],
+                    );
+                    self.with_ctx(|this, ctx| {
+                        this.pop_call_replay_stack_self_in_args(ctx, args.len())
+                    })?;
+                    res?;
                     let none_ref =
                         self.with_ctx(|_this, ctx| ctx.const_ref(pyre_object::w_none() as i64));
                     return Ok(none_ref);
@@ -5866,18 +5945,45 @@ impl MIFrame {
                     && !concrete_args.first().copied().unwrap_or(PY_NULL).is_null()
                     && is_list(concrete_args[0])
                 {
-                    let concrete_len = unsafe { w_list_len(concrete_args[0]) };
-                    return self.list_pop_value(callable, args[0], concrete_args[0], concrete_len);
+                    let call_pc = self.fallthrough_pc.saturating_sub(1);
+                    self.with_ctx(|this, ctx| {
+                        this.push_call_replay_stack_self_in_args(
+                            ctx,
+                            callable,
+                            ConcreteValue::Ref(concrete_callable),
+                            args,
+                            call_pc,
+                        )
+                    });
+                    let concrete_len = w_list_len(concrete_args[0]);
+                    let res =
+                        self.list_pop_value(callable, args[0], concrete_args[0], concrete_len);
+                    self.with_ctx(|this, ctx| {
+                        this.pop_call_replay_stack_self_in_args(ctx, args.len())
+                    })?;
+                    return res;
                 }
                 if args.len() == 1
                     && canonical_list_method("reverse") == Some(concrete_callable)
                     && !concrete_args.first().copied().unwrap_or(PY_NULL).is_null()
                     && is_list(concrete_args[0])
                 {
+                    let call_pc = self.fallthrough_pc.saturating_sub(1);
                     self.with_ctx(|this, ctx| {
-                        this.implement_guard_value(ctx, callable, concrete_callable as i64)
+                        this.implement_guard_value(ctx, callable, concrete_callable as i64);
+                        this.push_call_replay_stack_self_in_args(
+                            ctx,
+                            callable,
+                            ConcreteValue::Ref(concrete_callable),
+                            args,
+                            call_pc,
+                        );
                     });
-                    return self.list_reverse_value(callable, args[0], concrete_args[0]);
+                    let res = self.list_reverse_value(callable, args[0], concrete_args[0]);
+                    self.with_ctx(|this, ctx| {
+                        this.pop_call_replay_stack_self_in_args(ctx, args.len())
+                    })?;
+                    return res;
                 }
                 if args.len() == 1 {
                     let c_arg0 = concrete_args.first().copied().unwrap_or(PY_NULL);
@@ -8274,7 +8380,6 @@ pub fn production_walker_handles(instruction: &Instruction) -> bool {
             | Instruction::ForIter { .. }
             | Instruction::CallKw { .. }
             | Instruction::CallFunctionEx
-            | Instruction::LoadAttr { .. }
             | Instruction::StoreAttr { .. }
             // Instruction::StoreFastStoreFast excluded: routed off the
             // walker JIT path (kept on trait dispatch) until the SFSF
@@ -8958,6 +9063,40 @@ impl OpcodeStepExecutor for MIFrame {
         // below for every other receiver / descriptor shape.
         if self.try_load_method_fast_path(obj, concrete_obj, name)? {
             return Ok(());
+        }
+
+        // Resolve the foldable builtin list methods (append/pop/reverse) to
+        // a Const unbound function guarded by class, with self in the
+        // receiver slot, instead of a residual `jit_getattr` that
+        // materialises a fresh bound `W_MethodObject` every iteration. A
+        // Const callable is trivially reconstructed at guard-failure resume
+        // (a residual bound method is not — it resolves to a null callable
+        // on the blackhole CALL re-execution) and routes the following CALL
+        // through the resolved-builtin folding shape (`call_callable_value`).
+        if !concrete_obj.is_null()
+            && matches!(name, "append" | "pop" | "reverse")
+            && unsafe { is_list(concrete_obj) }
+        {
+            let list_type = pyre_interpreter::typedef::gettypeobject(&LIST_TYPE);
+            if let Some(unbound) = unsafe { pyre_interpreter::lookup_in_type(list_type, name) } {
+                if unsafe { is_function(unbound) }
+                    && unsafe {
+                        is_builtin_code(
+                            pyre_interpreter::getcode(unbound) as pyre_object::PyObjectRef
+                        )
+                    }
+                {
+                    let method_op = self.with_ctx(|this, ctx| {
+                        this.guard_class(ctx, obj.opref, &LIST_TYPE as *const PyType);
+                        ctx.const_ref(unbound as i64)
+                    });
+                    <Self as SharedOpcodeHandler>::push_value(
+                        self,
+                        FrontendOp::new(method_op, ConcreteValue::Ref(unbound)),
+                    )?;
+                    return <Self as SharedOpcodeHandler>::push_value(self, obj);
+                }
+            }
         }
 
         let attr = <Self as SharedOpcodeHandler>::load_attr(self, obj, name)?;
