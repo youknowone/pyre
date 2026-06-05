@@ -600,7 +600,7 @@ fn is_elided_unit_variant_ctor(kind: &OpKind) -> bool {
     {
         let mut segments = owner_path.clone();
         segments.push(name.clone());
-        return crate::front::syn_metadata::is_synthetic_unit_variant_path(&segments);
+        return crate::translator::rtyper::unit_variant_fold::is_synthetic_unit_variant_path(&segments);
     }
     false
 }
@@ -1661,7 +1661,7 @@ fn legacy_const_define_hlvalue(op: &SpaceOperation) -> Option<Hlvalue> {
         // op in the walker arm body that breaks
         // `production_walker_handles` activation.
         //
-        // The frontend's `is_synthetic_unit_variant_path` allowlist
+        // The `is_synthetic_unit_variant_path` allowlist
         // (StepResult, LoopResult, JitAction, CompareOp variants) is
         // the same set consulted here — both layers agree on which
         // paths are unit-variant singletons.
@@ -1672,7 +1672,7 @@ fn legacy_const_define_hlvalue(op: &SpaceOperation) -> Option<Hlvalue> {
         } if args.is_empty() => {
             let mut segments = owner_path.clone();
             segments.push(name.clone());
-            if !crate::front::syn_metadata::is_synthetic_unit_variant_path(&segments) {
+            if !crate::translator::rtyper::unit_variant_fold::is_synthetic_unit_variant_path(&segments) {
                 return None;
             }
             // PyPy rtyper folds unit-variant PBC constructors into a

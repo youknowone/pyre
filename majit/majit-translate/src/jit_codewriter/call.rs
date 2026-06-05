@@ -4677,7 +4677,7 @@ impl CallControl {
                             // comparison happens in the rtyper-derived
                             // shape upstream uses (call.py:222 `FUNC.RESULT`).
                             let effective_declared =
-                                crate::front::syn_metadata::transparent_result_ok_type(declared)
+                                crate::front::typestr::transparent_result_ok_type(declared)
                                     .map(|s| s.to_string())
                                     .unwrap_or_else(|| declared.clone());
                             let expected_result =
@@ -4721,7 +4721,7 @@ impl CallControl {
                     // return_type (RPython `funcptr.TO.RESULT`).
                     let declared = witness_graph.return_type.as_ref();
                     let effective_declared = declared.map(|declared| {
-                        crate::front::syn_metadata::transparent_result_ok_type(declared)
+                        crate::front::typestr::transparent_result_ok_type(declared)
                             .map(|s| s.to_string())
                             .unwrap_or_else(|| declared.clone())
                     });
@@ -5754,7 +5754,7 @@ fn collect_readwrite_effects(
                     // False)` (`descr.py:359`) so headerless array-of-structs
                     // shapes hash to a different bitstring slot than
                     // length-prefixed shapes of the same item type.
-                    let len_offset = if crate::front::syn_metadata::nolength_from_array_type_id(
+                    let len_offset = if crate::front::typestr::nolength_from_array_type_id(
                         resolved_id.as_deref(),
                     ) {
                         None
@@ -5825,7 +5825,7 @@ fn collect_readwrite_effects(
                     // (`descr.py:359`) so headerless array-of-structs shapes
                     // do not alias length-prefixed ones at the EffectInfo
                     // bitset.
-                    let len_offset = if crate::front::syn_metadata::nolength_from_array_type_id(
+                    let len_offset = if crate::front::typestr::nolength_from_array_type_id(
                         resolved_id.as_deref(),
                     ) {
                         None

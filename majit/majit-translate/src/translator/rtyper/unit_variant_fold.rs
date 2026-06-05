@@ -49,7 +49,7 @@ use crate::model::{CallTarget, FunctionGraph, OpKind};
 /// `Vec<(String, HostObject)>` instead of `HashMap` per the
 /// project's no-HashMap policy ([[no-hashmap-ever]]).  The variant
 /// set is closed and small (~11 entries in
-/// `front::syn_metadata::is_synthetic_unit_variant_path`), so linear
+/// [`is_synthetic_unit_variant_path`]), so linear
 /// scan is both cheap and PyPy-orthodox.
 static UNIT_VARIANT_PREBUILT_INSTANCES: LazyLock<Mutex<Vec<(String, HostObject)>>> =
     LazyLock::new(|| Mutex::new(Vec::new()));
@@ -78,9 +78,34 @@ pub(crate) fn intern_unit_variant_prebuilt_instance(qualname: &str) -> Option<Ho
     Some(instance)
 }
 
+/// Pyre-side `Class::Variant` unit-variant ctors.  These are valid
+/// as bare path-expression values; `flowspace_adapter` pre-folds them
+/// to `Hlvalue::Constant(ConstValue::HostObject(prebuilt_instance))`
+/// before the rtyper sees a call (mirrors PyPy `rtyper` resolving
+/// `SomePBC([InstanceDesc(<unit-variant>)])` to a singleton constant
+/// before `jtransform`).  Read by [`fold_unit_variant_ctors`] here and
+/// by `flowspace_adapter::is_synthetic_unit_variant_call`.
+pub(crate) fn is_synthetic_unit_variant_path(segments: &[String]) -> bool {
+    let path: Vec<&str> = segments.iter().map(String::as_str).collect();
+    matches!(
+        path.as_slice(),
+        ["LoopResult", "Done"]
+            | ["LoopResult", "ContinueRunningNormally"]
+            | ["JitAction", "Return"]
+            | ["JitAction", "Continue"]
+            | ["StepResult", "Continue"]
+            | ["CompareOp", "Lt"]
+            | ["CompareOp", "Le"]
+            | ["CompareOp", "Gt"]
+            | ["CompareOp", "Ge"]
+            | ["CompareOp", "Eq"]
+            | ["CompareOp", "Ne"]
+    )
+}
+
 /// Rewrite `OpKind::Call { target: SyntheticTransparentCtor, args: [] }`
 /// ops whose qualified path matches
-/// `front::syn_metadata::is_synthetic_unit_variant_path` into
+/// [`is_synthetic_unit_variant_path`] into
 /// `OpKind::ConstRef(prebuilt_instance)`, mirroring
 /// `rtyper/rpbc.py::SingleFrozenPBCRepr`.
 pub fn fold_unit_variant_ctors(graph: &mut FunctionGraph) {
@@ -99,7 +124,7 @@ pub fn fold_unit_variant_ctors(graph: &mut FunctionGraph) {
             }
             let mut segments = owner_path.clone();
             segments.push(name.clone());
-            if !crate::front::syn_metadata::is_synthetic_unit_variant_path(&segments) {
+            if !is_synthetic_unit_variant_path(&segments) {
                 continue;
             }
             let qualname = segments.join(".");
