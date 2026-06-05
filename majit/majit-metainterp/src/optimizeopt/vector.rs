@@ -143,13 +143,16 @@ impl VectorLoop {
     /// `label`: include `self.label` at the front. When false, follow
     ///   `vector.py:87-90` and clear the vectorize-time scratch
     ///   (`set_forwarded(None)` upstream) from every emitted prefix op plus
-    ///   the jump. In majit the vectorize-time scratch lives on
-    ///   `VectorizationInfo`, so the equivalent is `clear_vecinfo()`.
+    ///   the jump. That scratch lives in the scheduler's pos-keyed forwarded
+    ///   store (`state`), not on the permanent `Op.vecinfo`, so the
+    ///   equivalent is `state.clear_op_forwarded_vecinfo(pos)` — clearing
+    ///   `Op.vecinfo` here would instead wipe VecOperationNew metadata.
     pub fn finaloplist(
         &self,
         jitcell_token: Option<&std::sync::Arc<majit_backend::JitCellToken>>,
         reset_label_token: bool,
         label: bool,
+        state: &mut VecScheduleState,
     ) -> Vec<Op> {
         // vector.py:63-79: descr wiring against the owning JitCellToken.
         if let Some(jcell) = jitcell_token {
@@ -198,11 +201,13 @@ impl VectorLoop {
         // vector.py:87-90: when not emitting the label op (i.e. the prefix
         // is the *only* thing being compiled this round, e.g. a bridge),
         // strip vectorization scratch so nothing leaks into the next pass.
+        // The scratch is the pos-keyed forwarded store, not the permanent
+        // `Op.vecinfo`; mirror `teardown_vectorization`.
         if !label {
             for op in &oplist {
-                op.clear_vecinfo();
+                state.clear_op_forwarded_vecinfo(op.pos.get());
             }
-            self.jump.clear_vecinfo();
+            state.clear_op_forwarded_vecinfo(self.jump.pos.get());
         }
         // vector.py:91
         oplist.extend(self.operations.iter().cloned());
@@ -692,10 +697,11 @@ impl VectorizingOptimizer {
         // for op in loop.align_operations: op.set_forwarded(None).
         // We hand the align_operations back through `loop_.align_operations`
         // (already populated by `unroll_loop_iterations` on the align arm);
-        // clearing vecinfo matches the upstream `set_forwarded(None)` reset
-        // so post-vectorize passes don't see stale VectorizationInfo.
+        // clearing the pos-keyed forwarded scratch matches the upstream
+        // `set_forwarded(None)` reset so post-vectorize passes don't see
+        // stale VectorizationInfo; the permanent `Op.vecinfo` is preserved.
         for op in &loop_.align_operations {
-            op.clear_vecinfo();
+            sched_state.clear_op_forwarded_vecinfo(op.pos.get());
         }
 
         // vector.py:172 `finally: loop.teardown_vectorization()`. The
@@ -710,7 +716,7 @@ impl VectorizingOptimizer {
         // compiler; None here skips the descr/token wiring (faithful for the
         // currently-disconnected compile path). `label=false` matches RPython's
         // default (the vector.py:271 call omits the `label` argument).
-        Ok(loop_.finaloplist(None, false, false))
+        Ok(loop_.finaloplist(None, false, false, &mut sched_state))
     }
 
     // ── vector.py:273-344: unroll_loop_iterations ──────────────────────
@@ -1241,7 +1247,7 @@ impl VectorizingOptimizer {
         loop_.teardown_vectorization(&mut sched_state);
 
         let include_label = loop_.prefix_label.is_none();
-        Some(loop_.finaloplist(None, false, include_label))
+        Some(loop_.finaloplist(None, false, include_label, &mut sched_state))
     }
 
     // ── Static variants for extend/combine (used by try_vectorize) ─────
@@ -1722,11 +1728,12 @@ mod tests {
         let jump = Op::new(OpCode::Jump, &[BoxRef::from_opref(OpRef::int_op(0))]);
         let vloop = VectorLoop::new(label, ops, jump);
 
-        let with_label = vloop.finaloplist(None, true, true);
+        let mut state = VecScheduleState::new(0);
+        let with_label = vloop.finaloplist(None, true, true, &mut state);
         assert_eq!(with_label.len(), 3); // Label + IntAdd + Jump
         assert_eq!(with_label[0].opcode, OpCode::Label);
 
-        let without_label = vloop.finaloplist(None, true, false);
+        let without_label = vloop.finaloplist(None, true, false, &mut state);
         assert_eq!(without_label.len(), 2); // IntAdd + Jump
     }
 
