@@ -816,13 +816,19 @@ fn force_box_impl(
     use majit_ir::{Op, OpCode};
 
     fn force_child(orig_ref: OpRef, ctx: &mut crate::optimizeopt::OptContext) -> OpRef {
-        let value_ref = ctx.get_box_replacement(orig_ref);
         let value_box = ctx.get_box_replacement_box(orig_ref);
+        let value_ref = value_box
+            .as_ref()
+            .map(|b| b.to_opref())
+            .unwrap_or(orig_ref);
         if value_box.as_ref().map_or(false, |b| ctx.is_virtual(b)) {
             let value_box = value_box.expect("recorder-populated");
             let mut info = ctx.take_ptr_info(&value_box).unwrap();
             let forced = force_box_impl(&mut info, value_ref, ctx);
-            return ctx.get_box_replacement(forced);
+            return ctx
+                .get_box_replacement_box(forced)
+                .map(|b| b.to_opref())
+                .unwrap_or(forced);
         }
         value_ref
     }
@@ -1311,7 +1317,10 @@ fn force_box_impl(
             // vstring.py:92: lengthbox = self.getstrlen(op, optstring, mode)
             let lengthbox = match &variant {
                 VStringVariant::Plain(info) => ctx.emit_constant_int(info._chars.len() as i64),
-                VStringVariant::Slice(info) => ctx.get_box_replacement(info.lgtop),
+                VStringVariant::Slice(info) => ctx
+                    .get_box_replacement_box(info.lgtop)
+                    .map(|b| b.to_opref())
+                    .unwrap_or(info.lgtop),
                 VStringVariant::Concat(info) => {
                     let left_len = ctx.getstrlen_opref(info.vleft, mode);
                     let right_len = ctx.getstrlen_opref(info.vright, mode);
@@ -1372,7 +1381,10 @@ fn force_box_impl(
                     let one = ctx.emit_constant_int(1);
                     for ch in &info._chars {
                         if let Some(ch_ref) = ch {
-                            let ch_resolved = ctx.get_box_replacement(*ch_ref);
+                            let ch_resolved = ctx
+                                .get_box_replacement_box(*ch_ref)
+                                .map(|b| b.to_opref())
+                                .unwrap_or(*ch_ref);
                             let setitem_op = Op::new(
                                 set_opcode,
                                 &[

@@ -793,7 +793,10 @@ impl OptPure {
             let resolved_box = resolved_box.expect("recorder-populated");
             let mut info = ctx.take_ptr_info(&resolved_box).unwrap();
             let forced = info.force_box(resolved, ctx);
-            return ctx.get_box_replacement(forced);
+            return ctx
+                .get_box_replacement_box(forced)
+                .map(|b| b.to_opref())
+                .unwrap_or(forced);
         }
         resolved
     }
@@ -2713,7 +2716,11 @@ mod tests {
         op.setdescr(call_descr);
         let result = pass.propagate_forward(&op, &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
-        assert_eq!(ctx.get_box_replacement(OpRef::int_op(2)), OpRef::int_op(1));
+        assert_eq!(
+            ctx.get_box_replacement_box(OpRef::int_op(2))
+                .map(|b| b.to_opref()),
+            Some(OpRef::int_op(1))
+        );
     }
 
     #[test]
