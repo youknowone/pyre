@@ -3296,9 +3296,10 @@ pub(crate) fn make_ll_isinstance(
             "make_ll_isinstance: subclassrange_max must be Signed, got {max_val:?}",
         )));
     };
-    // upstream `minid.number_with_subclasses()` — true when the
-    // inheritance range covers proper subclasses (maxid > minid).
-    let has_subclasses = maxid > minid;
+    // upstream `minid.number_with_subclasses()` — true only when the
+    // inheritance ID scheme places at least one descendant inheritance
+    // marker between this class's start and end markers.
+    let has_subclasses = maxid > minid + 1;
 
     // Pyre-port: the cache key suffix `_<min>_<max>` is unique post-
     // `normalizecalls.assign_inheritance_ids` only.  Reading the vtable
