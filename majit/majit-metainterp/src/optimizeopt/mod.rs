@@ -565,7 +565,9 @@ pub struct OptContext {
     /// processed starting from a specific pass index (skipping earlier passes).
     /// Used by heap's force_lazy_set to route ops through remaining passes
     /// without re-entering the heap pass itself.
-    pub(crate) extra_operations_after: VecDeque<(usize, Op)>,
+    /// Held as `OpRc` (resoperation.py: emit_extra appends a ResOperation
+    /// object) so the queued op carries object identity into the drain.
+    pub(crate) extra_operations_after: VecDeque<(usize, majit_ir::OpRc)>,
     /// optimizer.py:47-54: deferred postprocess for GUARD_CLASS.
     /// Set by rewrite pass, executed by emit_operation after the guard
     /// is added to new_operations (matching RPython's callback pattern).
@@ -2529,7 +2531,7 @@ impl OptContext {
         // its type without the side-table detour.
         Self::debug_assert_box_type_invariant(&op);
         self.extra_operations_after
-            .push_back((after_pass_idx + 1, op));
+            .push_back((after_pass_idx + 1, std::rc::Rc::new(op)));
         pos_ref
     }
 

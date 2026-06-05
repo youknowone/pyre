@@ -222,7 +222,7 @@ mod tests {
 
     fn drain_extra_ops(ctx: &mut OptContext) {
         while let Some((_, op)) = ctx.extra_operations_after.pop_front() {
-            ctx.new_operations.push(std::rc::Rc::new(op));
+            ctx.new_operations.push(op);
         }
     }
 

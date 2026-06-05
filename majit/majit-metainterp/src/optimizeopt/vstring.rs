@@ -1547,7 +1547,7 @@ mod tests {
         // Drain extra_operations_after (from emit_extra during force_box)
         // into new_operations so the test can see all emitted ops.
         while let Some((_pass_idx, extra_op)) = ctx.extra_operations_after.pop_front() {
-            ctx.new_operations.push(std::rc::Rc::new(extra_op));
+            ctx.new_operations.push(extra_op);
         }
         ctx.new_operations
             .into_iter()
@@ -2446,7 +2446,7 @@ mod tests {
 
         // emit_for_force routes to extra_operations_after; drain it.
         while let Some((_pass_idx, extra_op)) = ctx.extra_operations_after.pop_front() {
-            ctx.new_operations.push(std::rc::Rc::new(extra_op));
+            ctx.new_operations.push(extra_op);
         }
 
         // Check that STRGETITEM ops were emitted (inline path) instead of
