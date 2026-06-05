@@ -1344,6 +1344,15 @@ pub fn specialize_legacy_graph_with_registry_returning_value_to_var(
     // blocks into the shared annotator; subsequent
     // `specialize_more_blocks` rtype only the newly-added blocks.
     let (annotator, rtyper) = call_registry.ensure_session()?;
+    // Scope an `added_blocks` tracker over this subject's drive of the
+    // shared annotator so the post-drain blocked-annotation guard
+    // (`raise_if_subject_blocked` below) can see exactly the blocks
+    // seeded for this subject and roll them back if any stays in the
+    // `None` (False) sentinel state. Mirrors `complete_helpers`'s
+    // `saved = self.added_blocks; self.added_blocks = {}` prologue
+    // (annrpython.py:113-114); the guard restores the previous tracker
+    // when this function returns.
+    let _subject_block_scope = annotator.enter_added_blocks_scope();
     // Queue `graph.startblock` onto the orthodox `addpendingblock`
     // queue, mirroring how callees enter through
     // `pycall -> recursivecall -> addpendingblock`
@@ -1443,6 +1452,18 @@ pub fn specialize_legacy_graph_with_registry_returning_value_to_var(
     // panics on "annotator.annotated[block] is False sentinel".
     annotator
         .complete_pending_blocks()
+        .map_err(|err| TyperError::message(format!("complete_pending_blocks failed: {err}")))?;
+    // Orthodox `complete()` blocked-annotation guard
+    // (annrpython.py:243-255): a block that stayed in the `None` (False)
+    // sentinel state after the fixpoint drain is permanently
+    // `BlockedInference`. Upstream `complete()` raises here, before
+    // `simplify`/`compute_at_fixpoint`. The dual-gate calls
+    // `complete_pending_blocks` (the bare drain) instead of
+    // `complete()`, so the guard is replicated here; the error reuses
+    // the "complete_pending_blocks failed" prefix already recognised by
+    // `is_known_unported`, routing the subject to the legacy walker.
+    annotator
+        .raise_if_subject_blocked()
         .map_err(|err| TyperError::message(format!("complete_pending_blocks failed: {err}")))?;
 
     // Populate per-callsite call-family / calltable state

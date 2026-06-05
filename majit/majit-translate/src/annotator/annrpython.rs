@@ -291,7 +291,7 @@ impl<'a> Drop for PolicyGuard<'a> {
 
 /// RAII guard for `self.added_blocks = {}; ...; finally:
 /// self.added_blocks = saved` in `complete_helpers()`.
-struct AddedBlocksGuard<'a> {
+pub(crate) struct AddedBlocksGuard<'a> {
     ann: &'a RPythonAnnotator,
     saved: Option<Option<IndexMap<BlockKey, BlockRef>>>,
 }
@@ -1178,17 +1178,7 @@ impl RPythonAnnotator {
         }
 
         if got_blocked {
-            // Upstream: flip every blocked graph's flag and construct
-            // the multi-line error string via
-            // `format_blocked_annotation_error`.
-            let mut bg = self.blocked_graphs.borrow_mut();
-            for (_k, (_g, flag)) in bg.iter_mut() {
-                *flag = true;
-            }
-            drop(bg);
-            let blocked_blocks = self.blocked_blocks.borrow();
-            let text = crate::tool::error::format_blocked_annotation_error(self, &blocked_blocks);
-            return Err(crate::annotator::model::AnnotatorError::new(text));
+            return Err(self.blocked_annotation_error());
         }
 
         // Force every return-var annotation to exist.
@@ -1231,6 +1221,80 @@ impl RPythonAnnotator {
             }
         }
         Ok(())
+    }
+
+    /// Construct the orthodox `complete()` blocked-annotation error
+    /// (annrpython.py:248-255): flip every blocked graph's flag and
+    /// render the multi-line "Blocked block" report through
+    /// `format_blocked_annotation_error`.
+    fn blocked_annotation_error(&self) -> crate::annotator::model::AnnotatorError {
+        let mut bg = self.blocked_graphs.borrow_mut();
+        for (_k, (_g, flag)) in bg.iter_mut() {
+            *flag = true;
+        }
+        drop(bg);
+        let blocked_blocks = self.blocked_blocks.borrow();
+        let text = crate::tool::error::format_blocked_annotation_error(self, &blocked_blocks);
+        crate::annotator::model::AnnotatorError::new(text)
+    }
+
+    /// Open a scoped `added_blocks` tracker around an external drive of
+    /// the pending queue, returning the RAII guard that restores the
+    /// previous tracker on drop. Mirrors the `saved = self.added_blocks;
+    /// self.added_blocks = {}` prologue of `complete_helpers`
+    /// (annrpython.py:113-114) for callers — e.g. the dual-gate
+    /// per-subject driver — that drain via `complete_pending_blocks`
+    /// directly rather than through `complete()`.
+    pub(crate) fn enter_added_blocks_scope(&self) -> AddedBlocksGuard<'_> {
+        let saved = self.added_blocks.borrow_mut().replace(IndexMap::new());
+        AddedBlocksGuard {
+            ann: self,
+            saved: Some(saved),
+        }
+    }
+
+    /// Replicate `complete()`'s blocked-annotation guard
+    /// (annrpython.py:243-255) for callers that drain the pending queue
+    /// via `complete_pending_blocks` instead of `complete()`. When any
+    /// block added in the current `added_blocks` scope stayed in the
+    /// `None` (False) sentinel state — a permanently `BlockedInference`
+    /// block — raise the blocked-annotation error.
+    ///
+    /// Upstream lets the error abort the whole translation; the pyre
+    /// dual-gate instead catches it and skips the subject to the legacy
+    /// walker, then reuses the session-shared annotator for the next
+    /// subject. The subject's blocks are therefore rolled back out of
+    /// the shared maps — otherwise the surviving `None` sentinel crashes
+    /// a later `specialize_block` (rtyper.rs:1656), and a surviving
+    /// `Some` block could insert a link conversion against an evicted
+    /// sentinel successor.
+    pub(crate) fn raise_if_subject_blocked(
+        &self,
+    ) -> Result<(), crate::annotator::model::AnnotatorError> {
+        let (added_keys, any_blocked): (Vec<BlockKey>, bool) = {
+            let added = self.added_blocks.borrow();
+            let Some(added_set) = added.as_ref() else {
+                return Ok(());
+            };
+            let annotated = self.annotated.borrow();
+            let any_blocked = added_set
+                .keys()
+                .any(|bkey| matches!(annotated.get(bkey), Some(None)));
+            (added_set.keys().cloned().collect(), any_blocked)
+        };
+        if !any_blocked {
+            return Ok(());
+        }
+        let err = self.blocked_annotation_error();
+        let mut annotated = self.annotated.borrow_mut();
+        let mut all_blocks = self.all_blocks.borrow_mut();
+        let mut blocked_blocks = self.blocked_blocks.borrow_mut();
+        for bkey in &added_keys {
+            annotated.shift_remove(bkey);
+            all_blocks.shift_remove(bkey);
+            blocked_blocks.shift_remove(bkey);
+        }
+        Err(err)
     }
 
     // ======================================================================
