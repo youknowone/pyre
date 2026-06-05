@@ -7679,10 +7679,13 @@ fn try_walker_load_global_cell_fold(
     namei: i64,
 ) -> Result<bool, DispatchError> {
     let w_globals = ns_ptr as pyre_object::PyObjectRef;
+    // `namei` is the raw `LOAD_GLOBAL` oparg; bit 0 is the push-NULL flag,
+    // so the `co_names` index is `namei >> 1` (mirror `bh_load_global_fn`).
+    let name_idx = (namei as usize) >> 1;
     let name = unsafe {
         let code = &*(pyre_interpreter::w_code_get_ptr(w_code_ptr as pyre_object::PyObjectRef)
             as *const pyre_interpreter::CodeObject);
-        match pyre_interpreter::pyframe::load_name_from_code(code, namei as usize) {
+        match pyre_interpreter::pyframe::load_name_from_code(code, name_idx) {
             Some(n) => n.to_string(),
             None => return Ok(false),
         }
@@ -7846,10 +7849,12 @@ fn dispatch_residual_call_iIRd_kind(
     // would suppress that abort and let the walk compile a try/except body it
     // cannot yet resume.
     //
-    // DEV-GATED `PYRE_FBW_LOADGLOBAL_FOLD` (default off): the fold is incomplete
-    // pending FBW call-inlining (#68) — a folded function callee mis-resolves
-    // through the in-progress inline path and produces wrong output for
-    // global-function-call loops.  See `try_walker_load_global_cell_fold`.
+    // DEV-GATED `PYRE_FBW_LOADGLOBAL_FOLD` (default off): the fold is correct
+    // (`try_walker_load_global_cell_fold` resolves the `co_names` index the
+    // same way `bh_load_global_fn` does) and reaches production parity for
+    // global-function-call loops when combined with `PYRE_FBW_INLINE`.  The
+    // gate stays until the Phase-5 production flip validates the full FBW
+    // bench suite with the fold on.
     if ctx.is_authoritative_executor
         && ei.oopspecindex == majit_ir::OopSpecIndex::LoadGlobal
         && !jitcode_has_exception_handler(code)
