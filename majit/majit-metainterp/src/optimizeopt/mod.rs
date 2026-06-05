@@ -2530,8 +2530,27 @@ impl OptContext {
         // through `propagate_one` into `new_operations`, `op_at` resolves
         // its type without the side-table detour.
         Self::debug_assert_box_type_invariant(&op);
+        let op_rc = std::rc::Rc::new(op);
+        // Register the queued op as the producer for its position, mirroring
+        // `bind_input_resops`: `find_producer_op(pos)` then resolves box lookups
+        // for this position — `ensure_box(pos)` and operand resolution alike —
+        // to this `OpRc`'s `_forwarded` host (resoperation.py:233) instead of a
+        // freshly-minted stand-in, keeping a single box identity per position.
+        // `emit`'s `live_synthetics` catch-up upgrades the binding to the real
+        // producer once the op is emitted; a folded op stays as the chain host.
+        if !pos_ref.is_none()
+            && !pos_ref.is_constant()
+            && !matches!(
+                pos_ref,
+                OpRef::InputArgInt(_) | OpRef::InputArgFloat(_) | OpRef::InputArgRef(_)
+            )
+            && !self.resop_refs.contains_key(&pos_ref)
+        {
+            self.resop_refs.insert(pos_ref, op_rc.clone());
+            self.live_synthetics.push(op_rc.clone());
+        }
         self.extra_operations_after
-            .push_back((after_pass_idx + 1, std::rc::Rc::new(op)));
+            .push_back((after_pass_idx + 1, op_rc));
         pos_ref
     }
 
