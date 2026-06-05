@@ -584,8 +584,8 @@ pub(crate) fn is_known_unported(msg: &str) -> bool {
         // `normalize_binop_name: pyre BinOp` are not Skip-classified:
         // the `not` / `deref` / `same_as` / `and` / `or` / `invert`
         // surfaces are desugared upstream — `UnOp::Not`/`Deref` at
-        // `front/ast.rs::Expr::Unary` +
-        // `flowspace/rust_source/build_flow.rs::lower_unary_not`,
+        // `flowspace/rust_source/build_flow.rs`'s `Expr::Unary` arm +
+        // `lower_unary_not`,
         // `&&`/`||` at the matching `Expr::Binary` arms.  Synthetic
         // graphs that inject these ops (anchor tests in
         // `cutover.rs::tests::anchor_unary_*_surfaces_*`) call
@@ -677,8 +677,9 @@ pub(crate) fn is_known_unported(msg: &str) -> bool {
         // TODO(post-rtyper-jtransform-variant-leak): retire this Skip
         // entry per upstream parity — `jit/codewriter/jtransform.py`
         // raises straight through on unexpected opnames.  The most
-        // frequent reach is `OpKind::Abort` emitted by
-        // `front/ast.rs::stop_unsupported` / `continue_with_unknown`
+        // frequent reach is `OpKind::Abort` emitted by the surface-Rust
+        // DSL front-end's `lower_expr` `stop_unsupported` /
+        // `continue_with_unknown` helpers
         // when the surface DSL hits an unsupported expression — pyre
         // source like `execute_opcode_step` / `eval_loop_jit` carry such
         // placeholders.  Retiring this entry needs each Abort
@@ -698,7 +699,8 @@ pub(crate) fn is_known_unported(msg: &str) -> bool {
         // local reference goes via `flowcontext.py:872-884 LOAD_FAST`
         // (which writes into `self.locals_w`) and the target block's
         // pre-allocated `inputargs[]`.  Pyre's body-`Input` emission
-        // is itself a TODO (`front/ast.rs:2127-2156`); when
+        // (the `OpKind::Input` ops `front::mir` pushes into each block)
+        // is itself a TODO; when
         // cross-block locals threading misses a shape, the adapter
         // fails loud with this message instead of silently
         // fabricating a fresh Variable (which would hide an
@@ -730,7 +732,7 @@ pub(crate) fn is_known_unported(msg: &str) -> bool {
 /// callcontrol map) instead of `SemanticProgram.functions`.  Every
 /// callee referenced from any `OpKind::Call::FunctionPath` callsite
 /// in the program lives in this map under the same path the front
-/// end emitted (`canonical_call_target`, `front/ast.rs:3497-3528`),
+/// end emitted when it canonicalised each call target,
 /// so registry lookups during the lift step always hit.
 ///
 /// Two-pass shape (same as the SemanticProgram walker — see that
@@ -1147,16 +1149,17 @@ pub(crate) fn register_unsafe_fn_stubs(
 
 /// Derive the canonical `FunctionPathKey` for a `SemanticFunction`.
 ///
-/// Mirrors the front-end's `canonical_call_target`
-/// (`front/ast.rs:3497-3528`) inverted: what an `Expr::Path`
+/// Inverts the front-end's call-target canonicalisation: what an
+/// `OpKind::Call::FunctionPath`
 /// callsite emits is what we register the callee under.
 ///
-/// Both `func.name` (e.g. `"a::helper"` after `build_graphs_from_items`
-/// prepends module prefix at `front/ast.rs:630-632`) and
-/// `func.self_ty_root` (e.g. `"a::Foo"` after `qualify_type_name` at
-/// `:638`) carry `::`-joined module-qualified strings.  Each
+/// Both `func.name` (e.g. `"a::helper"`, module-qualified by `front::mir`
+/// from Charon's `name_path()`) and
+/// `func.self_ty_root` (e.g. `"a::Foo"`, qualified by `front::semantic`'s
+/// `qualify_type_name_with_imports`) carry `::`-joined module-qualified
+/// strings.  Each
 /// `::`-separated component is one `FunctionPathKey` segment — the
-/// callsite at `front/ast.rs:3827-3835` produces `["a", "helper"]`
+/// `OpKind::Call::FunctionPath` callsite produces `["a", "helper"]`
 /// (multi-segment, no `::` in any segment), so the registered key
 /// must split each `::` boundary too.  Without the split, registry
 /// entry `["a::helper"]` (single segment containing `::`) would never

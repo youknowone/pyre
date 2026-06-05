@@ -49,14 +49,6 @@ rustpython-compiler-core = { workspace = true }
 # `config.translation.backendopt.print_statistics`).
 md-5 = { workspace = true }
 vecset = { workspace = true }
-# `stacker` grows the thread's stack on demand by spilling deeper
-# frames into a heap-allocated chunk.  `front::ast::lower_expr` is
-# recursive over `syn::Expr` and deeply-nested handler bodies (e.g.
-# `pyre-jit/src/eval.rs` `eval_loop_jit`) blow the default 2MB test
-# thread stack.  Guarding each `lower_expr` entry with
-# `stacker::maybe_grow` keeps stack usage bounded without rewriting
-# the lowering as an explicit pushdown automaton.
-stacker = { workspace = true }
 
 # Charon ULLBC reader for the MIR-driven flowspace driver.
 # Pulled in as a regular dep (not gated): the driver lives under

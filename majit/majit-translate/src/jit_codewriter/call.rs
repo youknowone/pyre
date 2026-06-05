@@ -1598,10 +1598,10 @@ impl CallControl {
                 //
                 // `descr.py:229 is_immutable = STRUCT._immutable_field(
                 // fieldname)` parity: consult
-                // `self.immutable_fields_by_struct` populated from
-                // `#[jit_immutable_fields("name", "name?", "name[*]", ...)]`
-                // attributes (`collect_immutable_field_attrs`,
-                // `front/ast.rs:437`).  `ImmutableRank::Immutable` and
+                // `self.immutable_fields_by_struct` populated from the
+                // program's `#[jit_immutable_fields("name", "name?",
+                // "name[*]", ...)]` attribute declarations.
+                // `ImmutableRank::Immutable` and
                 // `ImmutableRank::ImmutableArray` map to plain
                 // `is_immutable=true`; `QuasiImmutable*` ranks map to
                 // `is_quasi_immutable=true` (the `record_quasiimmut_field`
@@ -1609,8 +1609,8 @@ impl CallControl {
                 // the mutable default.
                 // `descr.py:108-118 cache[STRUCT]` 단일 identity 와
                 // 정렬: 분석기측 `owner_root` 가 use-site 모듈 qualifier
-                // (`qualify_type_name(type_root, ctx.module_prefix)`,
-                // `front/ast.rs:255-261`) 인 동안 런타임 publish 는
+                // (`front::semantic::qualify_type_name_with_imports`) 인
+                // 동안 런타임 publish 는
                 // `path_hash(strip_crate(module_path!())::Name)` (def-path).
                 // `canonical_struct_name` 가 `STRUCT_ORIGIN_REGISTRY`
                 // (Followup 2, `5fcab5ddc8`) 를 통해 bare-name 입력에
@@ -2043,7 +2043,7 @@ impl CallControl {
     /// is the `::`-joined type path exactly as written at the `impl`
     /// header (e.g. `"a::Foo"` for `impl a::Foo { fn bar() }`), matching
     /// the parser's `self_ty_root` canonicalization (parse.rs:702 +
-    /// front/ast.rs:106 `qualify_type_name`).  Registers
+    /// `front::semantic::qualify_type_name_with_imports`).  Registers
     /// `[impl_type_joined, method]` as a 2-segment CallPath where
     /// `impl_type_joined` is stored verbatim as a single segment — same
     /// shape `register_trait_method` / inherent method graphs use at
@@ -2061,9 +2061,9 @@ impl CallControl {
         if fnaddr == 0 || impl_type_as_written.is_empty() || method.is_empty() {
             return;
         }
-        // front/ast.rs:106 `qualify_type_name`: bare types take the
-        // current module prefix; already-qualified types keep their
-        // exact written form.  Module prefix is everything after the
+        // `front::semantic::qualify_type_name_with_imports`: bare types
+        // take the current module prefix; already-qualified types keep
+        // their exact written form.  Module prefix is everything after the
         // first `::`-separated segment (the crate name) of
         // `module_path_with_crate`, matching the parser's `prefix`
         // argument which starts empty at crate root and accumulates
@@ -2888,7 +2888,7 @@ impl CallControl {
     /// `FUNC.RESULT`. Pyre derives the calldescr's result kind char from
     /// `graph.return_type` (stamped at registration off the parsed Rust
     /// signature, mirroring `funcptr._obj.TO.RESULT`). The mapping mirrors
-    /// `front/ast.rs::type_string_to_value_type`. Returns `None` when the
+    /// `return_type_string_to_kind` below. Returns `None` when the
     /// graph carries no return type — callers (`transform_graph_to_jitcode`)
     /// fall back to a CFG scan in that case (e.g. unit-test graphs without a
     /// parsed signature).
@@ -2900,7 +2900,7 @@ impl CallControl {
 
 /// Map a Rust return-type string to the BhCallDescr kind char used by
 /// blackhole / metainterp. `None`/`""`/`"()"` → `'v'`. The integer/float
-/// recognizer is the same set as `front/ast.rs::type_string_to_value_type`.
+/// recognizer is the same set as `return_type_string_to_value_type`.
 fn return_type_string_to_kind(s: &str) -> char {
     match s {
         "" | "()" => 'v',
@@ -2913,8 +2913,8 @@ fn return_type_string_to_kind(s: &str) -> char {
 
 /// RPython parity for `call.py:220-221` `FUNC.ARGS` — collect the non-void
 /// argument types of a graph.  Parameters live on `startblock.inputargs`
-/// (RPython `flowspace/model.py` Block), populated by the front-end at
-/// `front/ast.rs:706-769` parameter registration.  The `OpKind::Input`
+/// (RPython `flowspace/model.py` Block), populated by `front::mir`'s
+/// parameter registration.  The `OpKind::Input`
 /// ops co-emitted with each parameter carry the declared type which we
 /// recover by chasing each inputarg Variable back to its defining op.
 /// Unknown/ambiguous slots default to `Ref`, matching
@@ -2973,8 +2973,8 @@ fn graph_non_void_arg_types(graph: &FunctionGraph) -> Vec<Type> {
 
 /// RPython parity for `call.py:222` `FUNC.RESULT`. Maps the declared
 /// return type string (from `graph.return_type`) to `Type`; `None` or
-/// unknown string → `Type::Void` (i.e. declared-void function). Matches
-/// `type_string_to_value_type` in `front/ast.rs`.
+/// unknown string → `Type::Void` (i.e. declared-void function). The
+/// integer/float recognizer is the same set as `return_type_string_to_kind`.
 fn return_type_string_to_value_type(s: Option<&String>) -> Type {
     match s.map(String::as_str) {
         None | Some("") | Some("()") => Type::Void,
@@ -3199,9 +3199,9 @@ impl CallControl {
                 if self.function_graphs.contains_key(&path) {
                     return Some(path);
                 }
-                // Cross-module reference fallback.  `canonical_call_target`
-                // (`front/ast.rs::canonical_call_target`) now expands
-                // single-ident callsites through the caller's
+                // Cross-module reference fallback.  `front::mir`'s
+                // call-target resolution expands single-ident callsites
+                // through the caller's
                 // `use_imports` *first*, so `use foo::bar; bar();`
                 // resolves verbatim to `["foo", "bar"]` against the
                 // registry.  The remaining case the leaf-match needs to
@@ -3355,8 +3355,8 @@ impl CallControl {
                 // `call.py:97` direct_call → `funcobj.graph` — inherent
                 // method receivers carry a canonical `module::Type` spelling
                 // (`parse::extract_inherent_impl_methods` registration and
-                // `front::ast::qualify_type_name_with_imports` callsite both
-                // route bare names through `STRUCT_ORIGIN_REGISTRY`, and
+                // `front::semantic::qualify_type_name_with_imports` callsite
+                // both route bare names through `STRUCT_ORIGIN_REGISTRY`, and
                 // `joined_use_path` strips the syntactic `crate::` prefix
                 // off `use_imports` entries), so the single qualified
                 // lookup hits the same `CallPath` registered above.
@@ -4605,7 +4605,7 @@ impl CallControl {
             CallShape::Direct(target) => {
                 // RPython call.py:223-228: NON_VOID_ARGS != FUNC.ARGS-without-void
                 // → raise Exception. Parameter list is recovered from startblock
-                // `OpKind::Input` ops (`front/ast.rs:706-748` convention) when
+                // `OpKind::Input` ops (the `front::mir` convention) when
                 // `block.inputargs` is unpopulated; `graph_non_void_arg_types`
                 // encapsulates the convention so direct-call validation matches
                 // upstream's hard-fail semantics.
@@ -4671,8 +4671,8 @@ impl CallControl {
                             // `Result<bool, PyError>` and threads
                             // exceptions through `?`. When validating
                             // the call's `result_type` (already
-                            // unwrapped through `?` at the AST lowerer)
-                            // against the declared signature, project
+                            // unwrapped through `?` at the `front::mir`
+                            // lowerer) against the declared signature, project
                             // the declared `Result<T, E>` to `T` so the
                             // comparison happens in the rtyper-derived
                             // shape upstream uses (call.py:222 `FUNC.RESULT`).
@@ -5424,8 +5424,9 @@ fn resolve_array_identity(
 /// - `[Point; 10]` → `"Point"` (fixed-size array)
 /// - `&[Point]` / `&mut [Point]` / `*const [Point]` / `*mut [Point]` —
 ///   the pointer-like prefix is stripped first so the slice body is
-///   matched normally. Mirrors `front::ast::extract_element_type_from_str`
-///   so source-level analysis and effect bookkeeping agree on the
+///   matched normally. Uses the same element-type recovery convention as
+///   the front-end's `StructFieldRegistry` array-field handling, so
+///   source-level analysis and effect bookkeeping agree on the
 ///   item type (`descr.py:241-254 get_type_flag` reads the same
 ///   `ARRAY.OF` regardless of how the lltype is referenced).
 fn extract_element_type_from_str(type_str: &str) -> Option<String> {
@@ -5454,8 +5455,8 @@ fn extract_element_type_from_str(type_str: &str) -> Option<String> {
         }
     }
     // Angle brackets: Vec<T>, Box<T>, etc.  Checked after the slice
-    // form so `[Rc<T>]` yields `Rc<T>`, not `T` — matches the front-end
-    // counterpart in `front::ast::extract_element_type_from_str`.
+    // form so `[Rc<T>]` yields `Rc<T>`, not `T` — matches the front-end's
+    // `StructFieldRegistry` array-element-type convention.
     if let (Some(start), Some(end)) = (s.find('<'), s.rfind('>')) {
         if start < end {
             return Some(s[start + 1..end].trim().to_string());
@@ -6869,7 +6870,7 @@ mod tests {
     fn graph_id_separates_same_named_methods_of_distinct_impls() {
         let mut cc = CallControl::new();
         // Both graphs share bare name "push_value"; only owner_root differs,
-        // mirroring what `front/ast.rs` stamps for impl methods.
+        // mirroring what `front::mir` stamps for impl methods.
         cc.register_trait_method(
             "push_value",
             Some("Stepper"),
@@ -6949,9 +6950,9 @@ mod tests {
         // `impl_type_as_written = "Adder"` (bare), and
         // `module_path_with_crate = "testcrate::impl_module"`.  The
         // codewriter must prepend the module prefix so the canonical
-        // CallPath matches the parser's `qualify_type_name("Adder",
-        // "impl_module") = "impl_module::Adder"` result
-        // (front/ast.rs:106).
+        // CallPath matches the parser's
+        // `front::semantic::qualify_type_name_with_imports("Adder",
+        // "impl_module", &{}) = "impl_module::Adder"` result.
         let mut cc = CallControl::new();
         cc.register_macro_impl_helper_trace_fnaddr(
             "testcrate::impl_module",
@@ -6969,7 +6970,8 @@ mod tests {
     #[test]
     fn register_macro_impl_helper_keeps_qualified_type_unchanged() {
         // `impl a::Foo { fn bar() }` — already-qualified type must not
-        // get the module prefix prepended (front/ast.rs:107 returns
+        // get the module prefix prepended
+        // (`front::semantic::qualify_type_name_with_imports` returns
         // bare-as-is when it contains `::`).  The canonical path
         // matches `CallPath::for_impl_method("a::Foo", "bar")`.
         let mut cc = CallControl::new();

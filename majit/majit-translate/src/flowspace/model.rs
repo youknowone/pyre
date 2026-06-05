@@ -1813,8 +1813,8 @@ impl HostEnv {
 
         // `rpython.rtyper.lltypesystem.lltype` — typing-time callables that
         // RPython routes through `@typer_for(lltype.<name>)` decorators
-        // (rbuiltin.py:412-415).  Pyre's surface DSL synthesises most
-        // `lltype.*` ops directly from `front/ast.rs` (no HostObject lookup
+        // (rbuiltin.py:412-415).  `front::mir` synthesises most
+        // `lltype.*` ops directly while lowering (no HostObject lookup
         // in the production dispatch), so these entries currently exist
         // only to make the BUILTIN_TYPER registry structurally match
         // upstream — the dispatch flips on once the M2.5g extern-Rust-helper
@@ -1873,9 +1873,9 @@ impl HostEnv {
         // `lltype.cast_ptr_to_int` / `cast_int_to_ptr` — registered upstream
         // at `rpython/rtyper/lltypesystem/lltype.py:2367-2382` via the
         // `ann_cast_ptr_to_int` / `ann_cast_int_to_ptr` annotator hooks plus
-        // `BUILTIN_TYPER` entries in `rbuiltin.py`. The Rust frontend lowers
-        // `Expr::Cast { Ref ↔ Int }` to a `simple_call` against these
-        // HostObjects (see `front/ast.rs::cast_builtin_name`).
+        // `BUILTIN_TYPER` entries in `rbuiltin.py`. `front::mir` projects a
+        // Charon `Ref ↔ Int` cast payload onto these `cast_ptr_to_int` /
+        // `cast_int_to_ptr` opnames while lowering (`unary_op_label`).
         lltype.module_set(
             "cast_ptr_to_int",
             HostObject::new_builtin_callable("lltype.cast_ptr_to_int"),

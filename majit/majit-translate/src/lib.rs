@@ -371,11 +371,10 @@ pub type FnAddrBindings<'a> = [(&'a str, i64)];
 
 /// Structured binding table for impl-method helpers.  Each entry is
 /// `(module_path_with_crate, impl_type_as_written, method_name, fnaddr)`.
-/// The codewriter applies the parser's `qualify_type_name` rule
-/// (front/ast.rs:106) — bare types get the module prefix (minus crate
+/// The codewriter applies the `front::semantic::qualify_type_name_with_imports`
+/// rule — bare types get the module prefix (minus crate
 /// name) prepended, qualified types are kept verbatim — before storing
-/// the canonical `[impl_type_joined, method]` 2-segment CallPath
-/// (lib.rs:406-433).
+/// the canonical `[impl_type_joined, method]` 2-segment CallPath.
 ///
 /// `#[jit_module]::__majit_helper_impl_trace_fnaddrs()` produces this
 /// shape and `analyze_pipeline_from_parsed` feeds it through
@@ -579,8 +578,7 @@ fn register_function_graph_alias(
 /// `name` is the `SemanticFunction.name` (already module-prefixed
 /// when the function lives inside a `mod foo { fn bar() }` block);
 /// `source_module` is the file's crate-stripped path (populated by
-/// `front::ast::build_semantic_program_with_options` from
-/// `parsed.module_path`).
+/// `front::mir` from the module portion of Charon's `name_path()`).
 fn free_function_alias_paths(name: &str, source_module: &str) -> Vec<crate::parse::CallPath> {
     let segments: Vec<&str> = name.split("::").collect();
     let mut paths = Vec::new();
@@ -600,7 +598,7 @@ fn free_function_alias_paths(name: &str, source_module: &str) -> Vec<crate::pars
     // The starts_with check is meant to skip the module-qualified loop
     // when `name` already carries the module prefix (e.g. a nested
     // `mod foo { fn bar() }` whose `sf.name` is set to "foo::bar"
-    // before the module stamp at `front/ast.rs:1669-1676`).  Without
+    // by `front::mir`).  Without
     // the length-strict guard, a function whose bare leaf happens to
     // equal its containing module's name (`pyre-interpreter/src/
     // stack_check.rs` `pub fn stack_check`) collides — its single-
@@ -1096,7 +1094,7 @@ fn analyze_pipeline_from_parsed(
                 // "base-class method" for every impl that does not
                 // override it. Rust-idiomatic call sites emit the call
                 // as `<Trait>::<method>(receiver, ...)` —
-                // `front/ast.rs::canonical_call_target` turns that into
+                // `front::mir` lowers that into
                 // `CallTarget::FunctionPath { segments: [<Trait>,
                 // <method>] }`. The upstream-equivalent registration key
                 // is therefore `[<Trait>, <method>]`. The pseudo-type

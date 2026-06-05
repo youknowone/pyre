@@ -3228,9 +3228,9 @@ fn op_kind_to_opname(kind: &crate::model::OpKind) -> String {
             format!("setarrayitem_vable_{}", value_type_to_kind(item_ty))
         }
         // RPython `blackhole.py:500` canonical opnames for bitwise ints are
-        // `int_and` / `int_or` / `int_xor`. pyre's front-end (`front/ast.rs`
-        // `binary_op_name`) uses Rust's `syn::BinOp` trait names
-        // (`bitand`/`bitor`/`bitxor`) for source faithfulness, so rename them
+        // `int_and` / `int_or` / `int_xor`. When an `OpKind::BinOp.op`
+        // arrives spelled with Rust's `syn::BinOp` trait names
+        // (`bitand`/`bitor`/`bitxor`) for source faithfulness, rename them
         // here at the emission boundary instead of duplicating wire entries
         // in the blackhole dispatch table.
         OpKind::BinOp { op, .. } => match op.as_str() {

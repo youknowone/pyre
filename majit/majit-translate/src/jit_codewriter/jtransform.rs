@@ -1436,13 +1436,12 @@ impl<'a> Transformer<'a> {
             // decomposition so runtime and const-fold agree.
             //
             // Coverage: today these arms are unreachable from pyre
-            // source — `front/ast.rs:classify_fn_arg_ty` folds u*
-            // into `ValueType::Int`, so the rtyper never emits
-            // `cast_uint_to_float` / `cast_float_to_uint` opnames in
-            // practice.  The wiring is staged for the eventual
-            // producer flip — see
-            // `front/ast.rs:classify_fn_arg_ty`'s
-            // TODO(unsigned-producer-flip) for the cascade list.
+            // source — no producer emits the `cast_uint_to_float` /
+            // `cast_float_to_uint` opnames in practice, so these
+            // const-fold + residual-helper arms stay dormant.  The
+            // wiring is staged for the eventual producer flip;
+            // unsigned parameter classification lives in
+            // `front::syn_metadata::classify_fn_arg_ty`.
             OpKind::UnaryOp {
                 op: unop_name,
                 operand,
@@ -2433,8 +2432,8 @@ impl<'a> Transformer<'a> {
         // construction to malloc + setfield at lowering time, so by the
         // time a graph reaches jtransform there are no `Ok(_)`-wrapper
         // SpaceOperations left to classify. Pyre's Rust frontend
-        // (`front/ast.rs:1471 syn::Expr::Call`) lowers every `Path(args)`
-        // expression to `OpKind::Call` uniformly — `Ok(StepResult::Continue)`
+        // (`front::mir`) lowers every constructor call to `OpKind::Call`
+        // uniformly — `Ok(StepResult::Continue)`
         // becomes a residual call to a `(r) → r` funcptr, and the trace
         // recorder emits a `CallR` op for it. The trait-dispatch path
         // executes the same constructor as zero-cost native code and
@@ -3234,7 +3233,7 @@ impl<'a> Transformer<'a> {
                 let jd = cc.jitdriver_sd_from_jitdriver(jitdriver_index)?;
                 let num_greens = jd.greens.len();
                 // Skip the receiver: pyre lowers `driver.jit_merge_point(...)`
-                // (`front/ast.rs::lower_expr:1181-1209`) as a method call whose
+                // (`front::mir`) as a method call whose
                 // `Call.args[0]` is the `PyPyJitDriver` receiver; the user-facing
                 // green/red arguments start at index 1. Upstream's equivalent
                 // `jit_marker` op has `args[0]=marker_name_const` and
@@ -3756,9 +3755,10 @@ impl<'a> Transformer<'a> {
         // value-level (constructed by `rpython/rtyper/lltypesystem/
         // rtagged.py` / `rtyper/llinterp.py` PBC paths, never
         // materialised at runtime).  The producer
-        // (`front/ast.rs::is_synthetic_result_option_wrapper_path`)
-        // accepts both bare (`Ok`) and qualified (`Result::Ok`,
-        // `std::option::Option::Some`) spellings; both must elide
+        // (`front::mir`) accepts both bare (`Ok`) and qualified
+        // (`Result::Ok`, `std::option::Option::Some`) spellings —
+        // qualified forms carry their leading segments as
+        // `owner_path`; both must elide
         // identically because PyPy doesn't distinguish call-site
         // spelling at the SSA layer.  Unit variants like
         // `StepResult::Continue` route through the same
@@ -6384,8 +6384,7 @@ mod tests {
     /// PyPy parity regression guard: the qualified spellings
     /// `Result::Ok`, `Option::Some`, `std::result::Result::Err` etc.
     /// must elide identically to the bare `Ok` / `Some` / `Err`
-    /// forms.  The frontend whitelist at
-    /// `front/ast.rs::is_synthetic_result_option_wrapper_path`
+    /// forms.  The frontend whitelist in `front::mir`
     /// already admits these multi-segment paths and records the
     /// leading segments as `owner_path`; jtransform must not reject
     /// the call based on `owner_path` being non-empty because PyPy's
