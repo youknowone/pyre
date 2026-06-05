@@ -85,13 +85,31 @@ pub fn monotonic(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 /// `std::thread::sleep` otherwise.
 pub fn sleep(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(args.len() == 1, "sleep() takes exactly one argument");
+    // `timeutils.py:20-38 timestamp_w` — a float rejects NaN; everything
+    // else goes through `space.bigint_w`, so bools are accepted (int
+    // subclass) and any other type raises TypeError.
     let secs = unsafe {
-        if is_int(args[0]) {
+        if is_float(args[0]) {
+            let s = floatobject::w_float_get_value(args[0]);
+            if s.is_nan() {
+                return Err(crate::PyError::value_error("timestamp is nan"));
+            }
+            s
+        } else if is_int(args[0]) {
             w_int_get_value(args[0]) as f64
-        } else if is_float(args[0]) {
-            floatobject::w_float_get_value(args[0])
+        } else if is_bool(args[0]) {
+            if boolobject::w_bool_get_value(args[0]) {
+                1.0
+            } else {
+                0.0
+            }
         } else {
-            0.0
+            let name = crate::typedef::r#type(args[0])
+                .map(|tp| w_type_get_name(tp).to_string())
+                .unwrap_or_else(|| "object".to_string());
+            return Err(crate::PyError::type_error(format!(
+                "'{name}' object cannot be interpreted as an integer"
+            )));
         }
     };
     if secs < 0.0 {
