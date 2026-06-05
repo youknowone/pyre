@@ -26,17 +26,16 @@
 //! 1. Object constructors are single allocation calls without
 //!    per-callsite TLS hooks or conditional branches.
 //! 2. Future GC integration replaces the body of [`malloc`] without
-//!    changing any caller — the "common allocation lowering" the
-//!    2026-04-25 review explicitly endorsed as an alternative to a
-//!    full structural GC transform.
+//!    changing any caller.
 //!
 //! Current body: [`majit_gc::header::alloc_with_gc_header`] — the
-//! `malloc_fixedsize` analog that prepends a zeroed [`GcHeader`] and
-//! returns the payload pointer, so the write barrier reads a valid header
-//! (`TRACK_YOUNG_PTRS = 0`) and skips these still-leaked objects. The GC
-//! owns the header (incminimark defines its own `HDR`); the object model
-//! delegates and stays header-agnostic. Future work routes through the
-//! same allocator with nursery management and proper root push/pop.
+//! `malloc_fixedsize` analog that prepends a [`GcHeader`] (type id,
+//! `flags=0`) and returns the payload pointer, so the write barrier reads a
+//! valid header instead of foreign memory. The GC owns the header
+//! (incminimark defines its own `HDR`); the object model delegates and stays
+//! header-agnostic. These objects are still leaked host allocations; routing
+//! them through the nursery allocator with root push/pop is the remaining
+//! GC work.
 //!
 //! [`GcHeader`]: majit_gc::header::GcHeader
 
@@ -177,41 +176,36 @@ pub trait PyreClassPyTypeOf {
     const PYNAME: &'static str;
 }
 
-/// `lltype.malloc(T, flavor='gc')` parity, *untyped* (no `GcType` impl
-/// required). Allocates a fixed-size GC-managed object on the heap and
-/// returns a raw pointer the caller owns until the GC takes over.
+/// `lltype.malloc(T, flavor='gc')` parity, *untyped* (no `GcType` bound).
+/// Allocates a fixed-size GC object and returns a raw pointer the caller
+/// owns until the GC takes over.
 ///
-/// Prefer [`malloc_typed`] for any `T` with a registered GC type id —
-/// the untyped variant exists only as a temporary bridge for types
-/// that have not yet been wired into the per-type metadata table.
-/// Non-PyObject heap allocations (Strings, raw `Vec`s manually freed
-/// via `Box::from_raw`) belong on [`malloc_raw`], not here, because
-/// they must NOT migrate to the managed allocator.
+/// The header type id is 0 — `OBJECT_GC_TYPE_ID`, the object root. The sole
+/// production caller is `W_InstanceObject`, which aliases that root id on
+/// purpose (a separate id would duplicate the inheritance root and break the
+/// `subclass_range` preorder invariants). Any `T` with its own assigned id
+/// must use [`malloc_typed`].
 ///
-/// In Rust the construction and allocation collapse into a single
-/// step: callers build the value first and pass it in, instead of
-/// PyPy's allocate-then-fill-fields pattern. This is the smallest
-/// adaptation of RPython's API to Rust's value-construction model.
+/// Non-PyObject heap allocations (Strings, raw `Vec`s freed via
+/// `Box::from_raw`) belong on [`malloc_raw`], not here: they must NOT migrate
+/// to the managed allocator.
 #[inline]
 pub fn malloc<T>(value: T) -> *mut T {
-    // Untyped bridge: no registered GC type id, so the header carries 0.
+    // Object-root type id (OBJECT_GC_TYPE_ID = 0).
     majit_gc::header::alloc_with_gc_header(value, 0)
 }
 
-/// Typed variant of [`malloc`]: requires `T: GcType` so the allocator can
-/// stamp the header with `T::type_id()` and check `T::SIZE` without a runtime
-/// registry lookup. Shares [`malloc`]'s body — the `alloc_with_gc_header`
-/// prepend — but passes the real GC type id (`init_gc_object(result, typeid,
-/// flags=0)` parity, `framework.py:807-811`) instead of the untyped bridge's
-/// 0. Auto-id types still resolving deliver `TypeIdCell::UNASSIGNED` until the
-/// JIT driver registers them, so that value is clamped to 0 — `u32::MAX` would
-/// index the type table out of bounds (`trace.rs` `registry.get`) if such an
-/// object were ever traced. Will later route through the GC-managed allocator
-/// with proper `push_roots` / `pop_roots` brackets (`framework.py:853-856`).
+/// Typed variant of [`malloc`]: `T: GcType` lets the allocator stamp the
+/// header with `T::type_id()` and assert `T::SIZE` without a runtime registry
+/// lookup. Same body as [`malloc`] (the `alloc_with_gc_header` prepend),
+/// passing the real GC type id — `init_gc_object(result, typeid, flags=0)`
+/// (`framework.py:807-811`).
 ///
-/// New call sites should prefer [`malloc_typed`] over [`malloc`]
-/// once their `T` has an assigned GC type id; the untyped variant
-/// remains as a temporary bridge for types not yet registered.
+/// `T::type_id()` is `TypeIdCell::UNASSIGNED` (`u32::MAX`) until the JIT
+/// driver registers an auto-id type. That sentinel is not a real id and is
+/// written as 0, since `u32::MAX` would index the type table out of bounds in
+/// the trace path (`registry.get`); the real id lands once the type is
+/// registered.
 #[inline]
 pub fn malloc_typed<T: GcType>(value: T) -> *mut T {
     debug_assert_eq!(
@@ -219,11 +213,9 @@ pub fn malloc_typed<T: GcType>(value: T) -> *mut T {
         T::SIZE,
         "GcType::SIZE drift from std::mem::size_of"
     );
-    // Auto-id types resolve to UNASSIGNED (u32::MAX) until the JIT driver
-    // registers them. Clamp that to 0 so a stray GC trace of such an object
-    // indexes the type table in-bounds (get(0)) instead of panicking on
-    // get(u32::MAX); the real id lands once the type is registered.
     let type_id = match T::type_id() {
+        // UNASSIGNED is a sentinel, not a real type id; write the object-root
+        // id 0 until the JIT driver assigns the real one.
         TypeIdCell::UNASSIGNED => 0,
         id => id,
     };

@@ -229,7 +229,7 @@ const ARENA_CAP: usize = 64;
 /// Single source of truth: [`majit_gc::header::GcHeader::SIZE`].
 const GC_HEADER_SIZE: usize = majit_gc::header::GcHeader::SIZE;
 
-/// Arena slot with prepended GcHeader (zeroed, layout parity only).
+/// Arena slot: leading GcHeader (tid 0, flags 0) then the frame payload.
 #[repr(C)]
 struct GcFrameSlot {
     gc_header: majit_gc::header::GcHeader,
