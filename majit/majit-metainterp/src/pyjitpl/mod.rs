@@ -198,6 +198,53 @@ fn make_simple_compile_views<'a>(
     }
 }
 
+/// Reject an unsound cross-loop-CUT self loop, giving up to the blackhole.
+///
+/// A cross-loop CUT synthesizes a self-loop LABEL whose inputargs are the
+/// inner merge-point boxes; valuestack temporaries that are NULL at the inner
+/// header are promoted into LABEL inputargs via the escaped-ref BFS. If the
+/// optimized body class-guards such a slot (`GuardClass`, `GuardNonnullClass`
+/// and `GuardNonnull` all assume a non-null object) while the closing `Jump`
+/// feeds back a `Const` NULL ref for that same slot, the LABEL/JUMP contract is
+/// self-inconsistent: the loop dereferences NULL on its own back edge.
+///
+/// `virtualstate.py:595-606 _generate_guards_knownclass` rejects a `KnownClass`
+/// slot fed an unknown/NULL box with `VirtualStatesCantMatch`, so a unrolled
+/// close never installs this. The no-unroll retry path
+/// (`pyjitpl.py:3044-3054`) synthesizes a LABEL with no virtual state, so the
+/// inconsistency must be detected directly and given up to the blackhole rather
+/// than installing an unsound loop.
+///
+/// Returns the offending slot index, or `None` when the contract is consistent.
+fn cross_loop_cut_label_jump_null_guard_slot(ops: &[Op]) -> Option<usize> {
+    let label = ops.first().filter(|op| op.opcode == OpCode::Label)?;
+    let jump = ops.last().filter(|op| op.opcode == OpCode::Jump)?;
+    let label_slots: Vec<OpRef> = (0..label.num_args())
+        .map(|i| label.arg(i).to_opref())
+        .collect();
+    for op in ops {
+        if !matches!(
+            op.opcode,
+            OpCode::GuardClass | OpCode::GuardNonnullClass | OpCode::GuardNonnull
+        ) {
+            continue;
+        }
+        let guarded = op.arg(0).to_opref();
+        let Some(slot) = label_slots.iter().position(|s| *s == guarded) else {
+            continue;
+        };
+        if slot >= jump.num_args() {
+            continue;
+        }
+        if let Some(Value::Ref(r)) = jump.arg(slot).const_value() {
+            if r.is_null() {
+                return Some(slot);
+            }
+        }
+    }
+    None
+}
+
 pub(crate) struct CompiledTrace {
     /// Inputargs for this trace, used to recover typed exit layouts during blackhole replay.
     pub(crate) inputargs: Vec<InputArg>,
@@ -5043,6 +5090,35 @@ impl<M: Clone> MetaInterp<M> {
         // `vable_*` operations keep the hot path on boxes instead of
         // re-materializing `GetfieldRaw*`/`GetarrayitemRaw*` entry ops.
         let (mut inputargs, optimized_ops) = (inputargs, optimized_ops);
+
+        // Reject an unsound cross-loop-CUT self loop: it can class-guard a
+        // LABEL slot that the closing JUMP feeds back a `Const` NULL — an
+        // unsound contract the no-unroll retry path (pyjitpl.py:3044-3054)
+        // builds because it carries no virtual state to reject it. The loop
+        // would deref NULL on its back edge, so give up to the blackhole (the
+        // same `CompileOutcome::Aborted` the retry-failure path takes) rather
+        // than install it. Gated on the cross-loop-CUT marker so the FBW-off
+        // production path is byte-identical. Read before
+        // `normalize_closing_jump_args`, though that pass preserves `Const` args
+        // (`compile.rs:1682`) so the slot would survive it either way.
+        if cut_inner_green_key.is_some() {
+            if let Some(slot) = cross_loop_cut_label_jump_null_guard_slot(&optimized_ops) {
+                if crate::majit_log_enabled() {
+                    eprintln!(
+                        "[jit] abort compile: cross-loop-cut LABEL slot {} is \
+                         class-guarded but the closing JUMP feeds Const(NULL) at key={}",
+                        slot, green_key
+                    );
+                }
+                crate::debug::log_one(
+                    "jit-summary",
+                    &format!("giveup cross-loop-cut null-guard slot {slot} key={green_key}"),
+                );
+                self.warm_state.abort_tracing(green_key, false);
+                self.exported_state = None;
+                return CompileOutcome::Aborted;
+            }
+        }
         let mut compiled_ops =
             compile::normalize_closing_jump_args(optimized_ops, &constants, final_num_inputs);
 
