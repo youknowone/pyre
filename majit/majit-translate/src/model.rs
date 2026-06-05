@@ -4500,6 +4500,31 @@ impl FunctionGraph {
 mod tests {
     use super::*;
 
+    /// `CallTarget::SyntheticTransparentCtor::path_segments()` must
+    /// return the full `(owner_path..., name)` join — `front/mir.rs`
+    /// `Aggregate` / `ShallowInitBox` lowerings rely on the qualified
+    /// identity to distinguish same-leaf ctors across owner enums
+    /// (`StepResult::Continue` vs `JitAction::Continue`).  Collapsing
+    /// to the bare leaf would collide their `HostObject` /
+    /// `getdesc(pyobj)` keys (`bookkeeper.py:353`).
+    #[test]
+    fn synthetic_transparent_ctor_path_segments_preserve_owner_path() {
+        let bare = CallTarget::synthetic_transparent_ctor("Continue");
+        assert_eq!(bare.path_segments(), Some(vec!["Continue"]));
+
+        let owned = CallTarget::synthetic_transparent_ctor_with_owner(
+            vec!["StepResult".to_string()],
+            "Continue",
+        );
+        assert_eq!(owned.path_segments(), Some(vec!["StepResult", "Continue"]));
+
+        let nested = CallTarget::synthetic_transparent_ctor_with_owner(
+            vec!["outer".to_string(), "Inner".to_string()],
+            "Leaf",
+        );
+        assert_eq!(nested.path_segments(), Some(vec!["outer", "Inner", "Leaf"]));
+    }
+
     #[test]
     fn graph_allocates_values_and_blocks() {
         let mut graph = FunctionGraph::new("demo");
