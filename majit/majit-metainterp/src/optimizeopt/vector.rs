@@ -1893,10 +1893,7 @@ mod tests {
                 BoxRef::from_opref(OpRef::const_int(4)),
             ],
         );
-        let jump = Op::new(
-            OpCode::Jump,
-            &[BoxRef::from_opref(OpRef::input_arg_int(0))],
-        );
+        let jump = Op::new(OpCode::Jump, &[BoxRef::from_opref(OpRef::input_arg_int(0))]);
         let mut body = vec![signext];
         assign_positions(&mut body, 10);
         let vloop = VectorLoop::new(label, body, jump);

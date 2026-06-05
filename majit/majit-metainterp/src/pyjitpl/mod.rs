@@ -9546,18 +9546,17 @@ impl<M: Clone> MetaInterp<M> {
             match bridge_result {
                 Ok(r) => r,
                 Err(payload) => {
-                    if crate::majit_log_enabled() {
-                        let msg = payload
-                            .downcast_ref::<String>()
-                            .map(|s| s.as_str())
-                            .or_else(|| payload.downcast_ref::<&str>().copied())
-                            .unwrap_or("unknown panic");
+                    let is_invalid_loop = self.note_jit_panic_or_reraise(
+                        payload,
+                        "compile_bridge backend",
+                        green_key,
+                    );
+                    if is_invalid_loop && crate::majit_log_enabled() {
                         eprintln!(
-                            "[jit] bridge compile_bridge panicked key={} guard={}: {msg}",
+                            "[jit] bridge compile_bridge InvalidLoop key={} guard={}",
                             green_key, fail_index
                         );
                     }
-                    self.note_jit_panic_or_reraise(payload, "compile_bridge backend", green_key);
                     Err(majit_backend::BackendError::CompilationFailed(
                         "panic during bridge compilation".to_string(),
                     ))
