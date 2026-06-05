@@ -24,13 +24,23 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
+repo_parent="$(dirname "$repo_root")"
+PYRE_SHARED_BUILD="${PYRE_SHARED_BUILD:-$repo_parent/.pyre-build}"
 source "$repo_root/scripts/charon-msvc-env.sh"
 charon_prepend_msvc_link
-case "$(uname -s)" in
-    MINGW*|MSYS*|CYGWIN*) charon_exe="charon.exe" ;;
-    *)                    charon_exe="charon" ;;
+case "$(uname -s)-$(uname -m)" in
+    Darwin-arm64)          charon_exe="charon"; platform_key="darwin-arm64" ;;
+    Darwin-x86_64)         charon_exe="charon"; platform_key="darwin-x86_64" ;;
+    Linux-aarch64)         charon_exe="charon"; platform_key="linux-aarch64" ;;
+    Linux-x86_64)          charon_exe="charon"; platform_key="linux-x86_64" ;;
+    MINGW*|MSYS*|CYGWIN*)  charon_exe="charon.exe"; platform_key="windows" ;;
+    *)
+        echo "extract-llbc.sh: unsupported platform $(uname -s)-$(uname -m)" >&2
+        exit 1
+        ;;
 esac
-charon_bin="$repo_root/build/charon/$charon_exe"
+CHARON_DEST="${CHARON_DEST:-$PYRE_SHARED_BUILD/charon/$platform_key}"
+charon_bin="$CHARON_DEST/$charon_exe"
 
 if [[ ! -x "$charon_bin" ]]; then
     echo "extract-llbc.sh: charon not installed at $charon_bin" >&2

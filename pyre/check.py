@@ -431,7 +431,7 @@ class Check:
             try:
                 subprocess.run(
                     [runner, script],
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
                     timeout=30,
                 )
             except Exception:
@@ -441,7 +441,7 @@ class Check:
                 try:
                     subprocess.run(
                         [self._pyre(backend), script],
-                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                        stdout=subprocess.DEVNULL,
                         timeout=30,
                     )
                 except Exception:

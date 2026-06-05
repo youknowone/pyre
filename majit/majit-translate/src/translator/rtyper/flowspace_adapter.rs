@@ -600,7 +600,9 @@ fn is_elided_unit_variant_ctor(kind: &OpKind) -> bool {
     {
         let mut segments = owner_path.clone();
         segments.push(name.clone());
-        return crate::translator::rtyper::unit_variant_fold::is_synthetic_unit_variant_path(&segments);
+        return crate::translator::rtyper::unit_variant_fold::is_synthetic_unit_variant_path(
+            &segments,
+        );
     }
     false
 }
@@ -1672,7 +1674,9 @@ fn legacy_const_define_hlvalue(op: &SpaceOperation) -> Option<Hlvalue> {
         } if args.is_empty() => {
             let mut segments = owner_path.clone();
             segments.push(name.clone());
-            if !crate::translator::rtyper::unit_variant_fold::is_synthetic_unit_variant_path(&segments) {
+            if !crate::translator::rtyper::unit_variant_fold::is_synthetic_unit_variant_path(
+                &segments,
+            ) {
                 return None;
             }
             // PyPy rtyper folds unit-variant PBC constructors into a

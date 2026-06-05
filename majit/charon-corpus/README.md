@@ -22,12 +22,14 @@ charon-corpus/
 Use the canonical fetcher:
 
 ```sh
-scripts/install-charon.sh             # installs to ./build/charon/
-./build/charon/charon toolchain-path  # one-time nightly install (~1 min)
+scripts/install-charon.sh
+../.pyre-build/charon/<platform>/charon toolchain-path  # one-time nightly install (~1 min)
 ```
 
-The script pins `CHARON_VERSION_DEFAULT="nightly-2026.05.24"` and stamps
-the installed version so re-runs are idempotent. Override with
+The script pins `CHARON_VERSION_DEFAULT="nightly-2026.05.29"` and installs
+to a shared cache at `../.pyre-build/charon/<platform>` by default, so sibling
+worktrees reuse the same Charon binary. Override with
+`PYRE_SHARED_BUILD=/path/to/cache` or `CHARON_DEST=/path/to/bin`; use
 `CHARON_VERSION=nightly-YYYY.MM.DD scripts/install-charon.sh` to bump.
 
 Charon itself is `0.1.196`. It internally pins Rust toolchain
@@ -47,7 +49,7 @@ nightly; it only needs the `.llbc` JSON.
 ../../scripts/install-charon.sh
 
 # 1. extract corpus (run from this directory)
-../../build/charon/charon cargo --ullbc --dest-file corpus.ullbc
+../../scripts/extract-llbc.sh corpus
 
 # 2. inspect
 python3 inspect_llbc.py corpus.ullbc                  # summary
