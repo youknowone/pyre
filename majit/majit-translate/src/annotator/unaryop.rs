@@ -3158,6 +3158,17 @@ pub fn call_builtin_method(
             };
             char_method_isupper(ann, &method.s_self)
         }
+        // Raw-pointer `p.is_null()` on a classdef-less `SomeInstance`
+        // (pointer-erasure receiver; bound in the SomeInstance.getattr
+        // `is_null` arm).  Zero-arg; the call always yields `SomeBool`,
+        // mirroring lltype `_ptr.is_null`.
+        "ptr_method_is_null" => {
+            let scope = bind_builtin_method_args(args_s, kwds, &[], None, &method.analyser_name)?;
+            let [] = scope.as_slice() else {
+                unreachable!();
+            };
+            super::model::s_bool()
+        }
         _ => {
             return Err(AnnotatorError::new(format!(
                 "SomeBuiltinMethod.call(): unknown analyser {}",
@@ -3628,10 +3639,20 @@ fn init_someinstance_overrides(
                         // unregistered host struct the field becomes
                         // `SomeInstance(classdef=None)`.  A raw-pointer inherent
                         // method on such an erased receiver is answered the way
-                        // `SomePtr.getattr` would: `is_null` yields `SomeBool`
-                        // (lltype `_ptr`).  Any other attr stays fail-loud.
+                        // `SomePtr.getattr` would: `is_null` resolves to a bound
+                        // method (lltype `_ptr.is_null`) whose call yields
+                        // `SomeBool`.  The frontend lowers `p.is_null()` as
+                        // `getattr(p, "is_null")` + `simple_call(bound, …)`
+                        // (`flowspace_adapter.rs` CallTarget::Method), so getattr
+                        // must return the callable bound method here — returning a
+                        // bare `SomeBool` would seat a non-callable in the
+                        // simple_call callee slot.  Any other attr stays fail-loud.
                         if attr == "is_null" {
-                            return super::model::s_bool();
+                            return SomeValue::BuiltinMethod(SomeBuiltinMethod::new(
+                                "ptr_method_is_null",
+                                s_self.clone(),
+                                "is_null",
+                            ));
                         }
                         panic!(
                             "AnnotatorError: SomeInstance.getattr({:?}) on classdef-less instance",
@@ -5352,6 +5373,26 @@ mod tests {
             panic!("str.split must be recognized");
         };
         assert_eq!(str_split.analyser_name, "str_method_split");
+    }
+
+    #[test]
+    fn classdef_less_instance_is_null_bound_method_calls_to_bool() {
+        // `p.is_null()` on a pointer-erased (classdef-less) `SomeInstance`
+        // lowers as `getattr(p, "is_null")` + `simple_call(bound, …)`
+        // (CallTarget::Method).  The bound method's call must yield
+        // `SomeBool`, so the callee slot holds a callable rather than a
+        // bare bool.
+        let ann = mk_ann();
+        let instance = SomeValue::Instance(super::super::model::SomeInstance::new(
+            None,
+            false,
+            std::collections::BTreeMap::new(),
+        ));
+        let method = SomeBuiltinMethod::new("ptr_method_is_null", instance, "is_null");
+        let args = super::super::argument::ArgumentsForTranslation::new(vec![], None, None);
+        let result =
+            call_builtin_method(&ann, &method, &args).expect("is_null bound method must call");
+        assert!(matches!(result, SomeValue::Bool(_)));
     }
 
     #[test]
