@@ -464,19 +464,16 @@ impl OptIntBounds {
     /// autogenintrules.py:23-143 optimize_INT_ADD — rules:
     /// add_zero / add_reassoc_consts / add_sub_x_c_c / add_sub_c_x_c.
     fn optimize_int_add(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        let arg0 = ctx.get_box_replacement(op.arg(0).to_opref());
-        let arg1 = ctx.get_box_replacement(op.arg(1).to_opref());
-        let b0 = self.getintbound_box(arg0, ctx);
-        let b1 = self.getintbound_box(arg1, ctx);
+        let arg0 = self.resolve_box(op.arg(0).to_opref(), ctx);
+        let arg1 = self.resolve_box(op.arg(1).to_opref(), ctx);
+        let b0 = self.getintbound_b(&arg0, ctx);
+        let b1 = self.getintbound_b(&arg1, ctx);
         // add_zero: int_add(0, x) => x
         if b0.is_constant() && b0.get_constant_int() == 0 {
             let b_old = ctx
                 .ensure_box(op.pos.get())
                 .expect("body-namespace OpRef must have a BoxRef slot");
-            let b_arg = ctx
-                .ensure_box(arg1)
-                .expect("body-namespace OpRef must have a BoxRef slot");
-            ctx.make_equal_to(&b_old, &b_arg);
+            ctx.make_equal_to(&b_old, &arg1);
             return OptimizationResult::Remove;
         }
         // add_zero: int_add(x, 0) => x
@@ -484,90 +481,87 @@ impl OptIntBounds {
             let b_old = ctx
                 .ensure_box(op.pos.get())
                 .expect("body-namespace OpRef must have a BoxRef slot");
-            let b_arg = ctx
-                .ensure_box(arg0)
-                .expect("body-namespace OpRef must have a BoxRef slot");
-            ctx.make_equal_to(&b_old, &b_arg);
+            ctx.make_equal_to(&b_old, &arg0);
             return OptimizationResult::Remove;
         }
         // autogenintrules.py:42-88 — outer const on arg0, inner producer on arg1.
         if b0.is_constant() {
             let c_outer = b0.get_constant_int();
-            if let Some(arg1_add) = self.as_operation(arg1, OpCode::IntAdd, ctx) {
-                let inner_0 = ctx.get_box_replacement(arg1_add.arg(0).to_opref());
-                let inner_1 = ctx.get_box_replacement(arg1_add.arg(1).to_opref());
-                let b_inner_0 = self.getintbound_box(inner_0, ctx);
-                let b_inner_1 = self.getintbound_box(inner_1, ctx);
+            if let Some(arg1_add) = self.as_operation_b(&arg1, OpCode::IntAdd, ctx) {
+                let inner_0 = self.resolve_box(arg1_add.arg(0).to_opref(), ctx);
+                let inner_1 = self.resolve_box(arg1_add.arg(1).to_opref(), ctx);
+                let b_inner_0 = self.getintbound_b(&inner_0, ctx);
+                let b_inner_1 = self.getintbound_b(&inner_1, ctx);
                 // add_reassoc_consts: int_add(C2, int_add(C1, x)) => int_add(x, C1+C2)
                 if b_inner_0.is_constant() {
                     let folded = c_outer.wrapping_add(b_inner_0.get_constant_int());
                     let const_ref = ctx.make_constant_int(folded);
-                    return replace_with(op, OpCode::IntAdd, &[inner_1, const_ref]);
+                    return replace_with(op, OpCode::IntAdd, &[inner_1.to_opref(), const_ref]);
                 }
                 // add_reassoc_consts: int_add(C2, int_add(x, C1)) => int_add(x, C1+C2)
                 if b_inner_1.is_constant() {
                     let folded = c_outer.wrapping_add(b_inner_1.get_constant_int());
                     let const_ref = ctx.make_constant_int(folded);
-                    return replace_with(op, OpCode::IntAdd, &[inner_0, const_ref]);
+                    return replace_with(op, OpCode::IntAdd, &[inner_0.to_opref(), const_ref]);
                 }
-            } else if let Some(arg1_sub) = self.as_operation(arg1, OpCode::IntSub, ctx) {
-                let inner_0 = ctx.get_box_replacement(arg1_sub.arg(0).to_opref());
-                let inner_1 = ctx.get_box_replacement(arg1_sub.arg(1).to_opref());
-                let b_inner_0 = self.getintbound_box(inner_0, ctx);
-                let b_inner_1 = self.getintbound_box(inner_1, ctx);
+            } else if let Some(arg1_sub) = self.as_operation_b(&arg1, OpCode::IntSub, ctx) {
+                let inner_0 = self.resolve_box(arg1_sub.arg(0).to_opref(), ctx);
+                let inner_1 = self.resolve_box(arg1_sub.arg(1).to_opref(), ctx);
+                let b_inner_0 = self.getintbound_b(&inner_0, ctx);
+                let b_inner_1 = self.getintbound_b(&inner_1, ctx);
                 // add_sub_c_x_c: int_add(C2, int_sub(C1, x)) => int_sub(C1+C2, x)
                 if b_inner_0.is_constant() {
                     let folded = c_outer.wrapping_add(b_inner_0.get_constant_int());
                     let const_ref = ctx.make_constant_int(folded);
-                    return replace_with(op, OpCode::IntSub, &[const_ref, inner_1]);
+                    return replace_with(op, OpCode::IntSub, &[const_ref, inner_1.to_opref()]);
                 }
                 // add_sub_x_c_c: int_add(C2, int_sub(x, C1)) => int_add(x, C2-C1)
                 if b_inner_1.is_constant() {
                     let folded = c_outer.wrapping_sub(b_inner_1.get_constant_int());
                     let const_ref = ctx.make_constant_int(folded);
-                    return replace_with(op, OpCode::IntAdd, &[inner_0, const_ref]);
+                    return replace_with(op, OpCode::IntAdd, &[inner_0.to_opref(), const_ref]);
                 }
             }
         } else {
             // autogenintrules.py:89-142 — inner producer on arg0, outer const on arg1.
-            if let Some(arg0_add) = self.as_operation(arg0, OpCode::IntAdd, ctx) {
-                let inner_0 = ctx.get_box_replacement(arg0_add.arg(0).to_opref());
-                let inner_1 = ctx.get_box_replacement(arg0_add.arg(1).to_opref());
-                let b_inner_0 = self.getintbound_box(inner_0, ctx);
-                let b_inner_1 = self.getintbound_box(inner_1, ctx);
+            if let Some(arg0_add) = self.as_operation_b(&arg0, OpCode::IntAdd, ctx) {
+                let inner_0 = self.resolve_box(arg0_add.arg(0).to_opref(), ctx);
+                let inner_1 = self.resolve_box(arg0_add.arg(1).to_opref(), ctx);
+                let b_inner_0 = self.getintbound_b(&inner_0, ctx);
+                let b_inner_1 = self.getintbound_b(&inner_1, ctx);
                 if b1.is_constant() {
                     let c_outer = b1.get_constant_int();
                     // add_reassoc_consts: int_add(int_add(C1, x), C2) => int_add(x, C1+C2)
                     if b_inner_0.is_constant() {
                         let folded = b_inner_0.get_constant_int().wrapping_add(c_outer);
                         let const_ref = ctx.make_constant_int(folded);
-                        return replace_with(op, OpCode::IntAdd, &[inner_1, const_ref]);
+                        return replace_with(op, OpCode::IntAdd, &[inner_1.to_opref(), const_ref]);
                     }
                     // add_reassoc_consts: int_add(int_add(x, C1), C2) => int_add(x, C1+C2)
                     if b_inner_1.is_constant() {
                         let folded = b_inner_1.get_constant_int().wrapping_add(c_outer);
                         let const_ref = ctx.make_constant_int(folded);
-                        return replace_with(op, OpCode::IntAdd, &[inner_0, const_ref]);
+                        return replace_with(op, OpCode::IntAdd, &[inner_0.to_opref(), const_ref]);
                     }
                 }
-            } else if let Some(arg0_sub) = self.as_operation(arg0, OpCode::IntSub, ctx) {
-                let inner_0 = ctx.get_box_replacement(arg0_sub.arg(0).to_opref());
-                let inner_1 = ctx.get_box_replacement(arg0_sub.arg(1).to_opref());
-                let b_inner_0 = self.getintbound_box(inner_0, ctx);
-                let b_inner_1 = self.getintbound_box(inner_1, ctx);
+            } else if let Some(arg0_sub) = self.as_operation_b(&arg0, OpCode::IntSub, ctx) {
+                let inner_0 = self.resolve_box(arg0_sub.arg(0).to_opref(), ctx);
+                let inner_1 = self.resolve_box(arg0_sub.arg(1).to_opref(), ctx);
+                let b_inner_0 = self.getintbound_b(&inner_0, ctx);
+                let b_inner_1 = self.getintbound_b(&inner_1, ctx);
                 if b1.is_constant() {
                     let c_outer = b1.get_constant_int();
                     // add_sub_c_x_c: int_add(int_sub(C1, x), C2) => int_sub(C1+C2, x)
                     if b_inner_0.is_constant() {
                         let folded = b_inner_0.get_constant_int().wrapping_add(c_outer);
                         let const_ref = ctx.make_constant_int(folded);
-                        return replace_with(op, OpCode::IntSub, &[const_ref, inner_1]);
+                        return replace_with(op, OpCode::IntSub, &[const_ref, inner_1.to_opref()]);
                     }
                     // add_sub_x_c_c: int_add(int_sub(x, C1), C2) => int_add(x, C2-C1)
                     if b_inner_1.is_constant() {
                         let folded = c_outer.wrapping_sub(b_inner_1.get_constant_int());
                         let const_ref = ctx.make_constant_int(folded);
-                        return replace_with(op, OpCode::IntAdd, &[inner_0, const_ref]);
+                        return replace_with(op, OpCode::IntAdd, &[inner_0.to_opref(), const_ref]);
                     }
                 }
             }
@@ -580,91 +574,73 @@ impl OptIntBounds {
     /// sub_add_neg / sub_sub_left_x_c_c / sub_sub_left_c_x_c /
     /// sub_xor_x_y_y / sub_or_x_y_y / sub_invert_one.
     fn optimize_int_sub(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        let arg0 = ctx.get_box_replacement(op.arg(0).to_opref());
-        let arg1 = ctx.get_box_replacement(op.arg(1).to_opref());
-        let b0 = self.getintbound_box(arg0, ctx);
-        let b1 = self.getintbound_box(arg1, ctx);
+        let arg0 = self.resolve_box(op.arg(0).to_opref(), ctx);
+        let arg1 = self.resolve_box(op.arg(1).to_opref(), ctx);
+        let b0 = self.getintbound_b(&arg0, ctx);
+        let b1 = self.getintbound_b(&arg1, ctx);
         // sub_x_x: int_sub(x, x) => 0
-        if autogen_eq(arg1, &b1, arg0, &b0) {
+        if autogen_eq_b(&arg1, &b1, &arg0, &b0) {
             self.make_constant_int(op, 0, ctx);
             return OptimizationResult::Remove;
         }
         // sub_add: int_sub(int_add(x, y), y) => x / int_sub(int_add(y, x), y) => x
-        if let Some(arg0_int_add) = self.as_operation(arg0, OpCode::IntAdd, ctx) {
-            let arg0_0 = ctx.get_box_replacement(arg0_int_add.arg(0).to_opref());
-            let arg0_1 = ctx.get_box_replacement(arg0_int_add.arg(1).to_opref());
-            let b0_0 = self.getintbound_box(arg0_0, ctx);
-            let b0_1 = self.getintbound_box(arg0_1, ctx);
-            if autogen_eq(arg1, &b1, arg0_1, &b0_1) {
+        if let Some(arg0_int_add) = self.as_operation_b(&arg0, OpCode::IntAdd, ctx) {
+            let arg0_0 = self.resolve_box(arg0_int_add.arg(0).to_opref(), ctx);
+            let arg0_1 = self.resolve_box(arg0_int_add.arg(1).to_opref(), ctx);
+            let b0_0 = self.getintbound_b(&arg0_0, ctx);
+            let b0_1 = self.getintbound_b(&arg0_1, ctx);
+            if autogen_eq_b(&arg1, &b1, &arg0_1, &b0_1) {
                 let b_old = ctx
                     .ensure_box(op.pos.get())
                     .expect("body-namespace OpRef must have a BoxRef slot");
-                let b_arg = ctx
-                    .ensure_box(arg0_0)
-                    .expect("body-namespace OpRef must have a BoxRef slot");
-                ctx.make_equal_to(&b_old, &b_arg);
+                ctx.make_equal_to(&b_old, &arg0_0);
                 return OptimizationResult::Remove;
             }
-            if autogen_eq(arg1, &b1, arg0_0, &b0_0) {
+            if autogen_eq_b(&arg1, &b1, &arg0_0, &b0_0) {
                 let b_old = ctx
                     .ensure_box(op.pos.get())
                     .expect("body-namespace OpRef must have a BoxRef slot");
-                let b_arg = ctx
-                    .ensure_box(arg0_1)
-                    .expect("body-namespace OpRef must have a BoxRef slot");
-                ctx.make_equal_to(&b_old, &b_arg);
+                ctx.make_equal_to(&b_old, &arg0_1);
                 return OptimizationResult::Remove;
             }
-        } else if let Some(arg0_int_or) = self.as_operation(arg0, OpCode::IntOr, ctx) {
+        } else if let Some(arg0_int_or) = self.as_operation_b(&arg0, OpCode::IntOr, ctx) {
             // sub_or_x_y_y: int_sub(int_or(x, y), y) => x  (when x & y == 0)
-            let arg0_0 = ctx.get_box_replacement(arg0_int_or.arg(0).to_opref());
-            let arg0_1 = ctx.get_box_replacement(arg0_int_or.arg(1).to_opref());
-            let b0_0 = self.getintbound_box(arg0_0, ctx);
-            let b0_1 = self.getintbound_box(arg0_1, ctx);
-            if autogen_eq(arg1, &b1, arg0_1, &b0_1) && b0_0.and_bound(&b0_1).known_eq_const(0) {
+            let arg0_0 = self.resolve_box(arg0_int_or.arg(0).to_opref(), ctx);
+            let arg0_1 = self.resolve_box(arg0_int_or.arg(1).to_opref(), ctx);
+            let b0_0 = self.getintbound_b(&arg0_0, ctx);
+            let b0_1 = self.getintbound_b(&arg0_1, ctx);
+            if autogen_eq_b(&arg1, &b1, &arg0_1, &b0_1) && b0_0.and_bound(&b0_1).known_eq_const(0) {
                 let b_old = ctx
                     .ensure_box(op.pos.get())
                     .expect("body-namespace OpRef must have a BoxRef slot");
-                let b_arg = ctx
-                    .ensure_box(arg0_0)
-                    .expect("body-namespace OpRef must have a BoxRef slot");
-                ctx.make_equal_to(&b_old, &b_arg);
+                ctx.make_equal_to(&b_old, &arg0_0);
                 return OptimizationResult::Remove;
             }
-            if autogen_eq(arg1, &b1, arg0_0, &b0_0) && b0_1.and_bound(&b0_0).known_eq_const(0) {
+            if autogen_eq_b(&arg1, &b1, &arg0_0, &b0_0) && b0_1.and_bound(&b0_0).known_eq_const(0) {
                 let b_old = ctx
                     .ensure_box(op.pos.get())
                     .expect("body-namespace OpRef must have a BoxRef slot");
-                let b_arg = ctx
-                    .ensure_box(arg0_1)
-                    .expect("body-namespace OpRef must have a BoxRef slot");
-                ctx.make_equal_to(&b_old, &b_arg);
+                ctx.make_equal_to(&b_old, &arg0_1);
                 return OptimizationResult::Remove;
             }
-        } else if let Some(arg0_int_xor) = self.as_operation(arg0, OpCode::IntXor, ctx) {
+        } else if let Some(arg0_int_xor) = self.as_operation_b(&arg0, OpCode::IntXor, ctx) {
             // sub_xor_x_y_y: int_sub(int_xor(x, y), y) => x  (when x & y == 0)
-            let arg0_0 = ctx.get_box_replacement(arg0_int_xor.arg(0).to_opref());
-            let arg0_1 = ctx.get_box_replacement(arg0_int_xor.arg(1).to_opref());
-            let b0_0 = self.getintbound_box(arg0_0, ctx);
-            let b0_1 = self.getintbound_box(arg0_1, ctx);
-            if autogen_eq(arg1, &b1, arg0_1, &b0_1) && b0_0.and_bound(&b0_1).known_eq_const(0) {
+            let arg0_0 = self.resolve_box(arg0_int_xor.arg(0).to_opref(), ctx);
+            let arg0_1 = self.resolve_box(arg0_int_xor.arg(1).to_opref(), ctx);
+            let b0_0 = self.getintbound_b(&arg0_0, ctx);
+            let b0_1 = self.getintbound_b(&arg0_1, ctx);
+            if autogen_eq_b(&arg1, &b1, &arg0_1, &b0_1) && b0_0.and_bound(&b0_1).known_eq_const(0) {
                 let b_old = ctx
                     .ensure_box(op.pos.get())
                     .expect("body-namespace OpRef must have a BoxRef slot");
-                let b_arg = ctx
-                    .ensure_box(arg0_0)
-                    .expect("body-namespace OpRef must have a BoxRef slot");
-                ctx.make_equal_to(&b_old, &b_arg);
+                ctx.make_equal_to(&b_old, &arg0_0);
                 return OptimizationResult::Remove;
             }
-            if autogen_eq(arg1, &b1, arg0_0, &b0_0) && b0_1.and_bound(&b0_0).known_eq_const(0) {
+            if autogen_eq_b(&arg1, &b1, &arg0_0, &b0_0) && b0_1.and_bound(&b0_0).known_eq_const(0) {
                 let b_old = ctx
                     .ensure_box(op.pos.get())
                     .expect("body-namespace OpRef must have a BoxRef slot");
-                let b_arg = ctx
-                    .ensure_box(arg0_1)
-                    .expect("body-namespace OpRef must have a BoxRef slot");
-                ctx.make_equal_to(&b_old, &b_arg);
+                ctx.make_equal_to(&b_old, &arg0_1);
                 return OptimizationResult::Remove;
             }
         }
@@ -673,75 +649,72 @@ impl OptIntBounds {
             let b_old = ctx
                 .ensure_box(op.pos.get())
                 .expect("body-namespace OpRef must have a BoxRef slot");
-            let b_arg = ctx
-                .ensure_box(arg0)
-                .expect("body-namespace OpRef must have a BoxRef slot");
-            ctx.make_equal_to(&b_old, &b_arg);
+            ctx.make_equal_to(&b_old, &arg0);
             return OptimizationResult::Remove;
         }
         // sub_from_zero: int_sub(0, x) => int_neg(x)
         if b0.is_constant() && b0.get_constant_int() == 0 {
-            return replace_with(op, OpCode::IntNeg, &[arg1]);
+            return replace_with(op, OpCode::IntNeg, &[arg1.to_opref()]);
         }
-        if let Some(arg0_int_invert) = self.as_operation(arg0, OpCode::IntInvert, ctx) {
-            let arg0_0 = ctx.get_box_replacement(arg0_int_invert.arg(0).to_opref());
+        if let Some(arg0_int_invert) = self.as_operation_b(&arg0, OpCode::IntInvert, ctx) {
+            let arg0_0 = self.resolve_box(arg0_int_invert.arg(0).to_opref(), ctx);
             // sub_invert_one: int_sub(int_invert(x), -1) => int_neg(x)
             if b1.is_constant() && b1.get_constant_int() == -1 {
-                return replace_with(op, OpCode::IntNeg, &[arg0_0]);
+                return replace_with(op, OpCode::IntNeg, &[arg0_0.to_opref()]);
             }
-        } else if let Some(arg0_int_add) = self.as_operation(arg0, OpCode::IntAdd, ctx) {
-            let arg0_0 = ctx.get_box_replacement(arg0_int_add.arg(0).to_opref());
-            let arg0_1 = ctx.get_box_replacement(arg0_int_add.arg(1).to_opref());
-            let b0_0 = self.getintbound_box(arg0_0, ctx);
-            let b0_1 = self.getintbound_box(arg0_1, ctx);
+        } else if let Some(arg0_int_add) = self.as_operation_b(&arg0, OpCode::IntAdd, ctx) {
+            let arg0_0 = self.resolve_box(arg0_int_add.arg(0).to_opref(), ctx);
+            let arg0_1 = self.resolve_box(arg0_int_add.arg(1).to_opref(), ctx);
+            let b0_0 = self.getintbound_b(&arg0_0, ctx);
+            let b0_1 = self.getintbound_b(&arg0_1, ctx);
             if b1.is_constant() {
                 let c_outer = b1.get_constant_int();
                 // sub_add_consts: int_sub(int_add(C1, x), C2) => int_sub(x, C-C1)
                 if b0_0.is_constant() {
                     let folded = c_outer.wrapping_sub(b0_0.get_constant_int());
                     let const_ref = ctx.make_constant_int(folded);
-                    return replace_with(op, OpCode::IntSub, &[arg0_1, const_ref]);
+                    return replace_with(op, OpCode::IntSub, &[arg0_1.to_opref(), const_ref]);
                 }
                 // sub_add_consts: int_sub(int_add(x, C1), C2) => int_sub(x, C-C1)
                 if b0_1.is_constant() {
                     let folded = c_outer.wrapping_sub(b0_1.get_constant_int());
                     let const_ref = ctx.make_constant_int(folded);
-                    return replace_with(op, OpCode::IntSub, &[arg0_0, const_ref]);
+                    return replace_with(op, OpCode::IntSub, &[arg0_0.to_opref(), const_ref]);
                 }
             }
-        } else if let Some(arg0_int_sub) = self.as_operation(arg0, OpCode::IntSub, ctx) {
-            let arg0_0 = ctx.get_box_replacement(arg0_int_sub.arg(0).to_opref());
-            let arg0_1 = ctx.get_box_replacement(arg0_int_sub.arg(1).to_opref());
-            let b0_0 = self.getintbound_box(arg0_0, ctx);
-            let b0_1 = self.getintbound_box(arg0_1, ctx);
+        } else if let Some(arg0_int_sub) = self.as_operation_b(&arg0, OpCode::IntSub, ctx) {
+            let arg0_0 = self.resolve_box(arg0_int_sub.arg(0).to_opref(), ctx);
+            let arg0_1 = self.resolve_box(arg0_int_sub.arg(1).to_opref(), ctx);
+            let b0_0 = self.getintbound_b(&arg0_0, ctx);
+            let b0_1 = self.getintbound_b(&arg0_1, ctx);
             if b1.is_constant() {
                 let c_outer = b1.get_constant_int();
                 // sub_sub_left_c_x_c: int_sub(int_sub(C1, x), C2) => int_sub(C1-C2, x)
                 if b0_0.is_constant() {
                     let folded = b0_0.get_constant_int().wrapping_sub(c_outer);
                     let const_ref = ctx.make_constant_int(folded);
-                    return replace_with(op, OpCode::IntSub, &[const_ref, arg0_1]);
+                    return replace_with(op, OpCode::IntSub, &[const_ref, arg0_1.to_opref()]);
                 }
                 // sub_sub_left_x_c_c: int_sub(int_sub(x, C1), C2) => int_sub(x, C1+C2)
                 if b0_1.is_constant() {
                     let folded = b0_1.get_constant_int().wrapping_add(c_outer);
                     let const_ref = ctx.make_constant_int(folded);
-                    return replace_with(op, OpCode::IntSub, &[arg0_0, const_ref]);
+                    return replace_with(op, OpCode::IntSub, &[arg0_0.to_opref(), const_ref]);
                 }
             }
         }
-        if let Some(arg1_int_add) = self.as_operation(arg1, OpCode::IntAdd, ctx) {
-            let arg1_0 = ctx.get_box_replacement(arg1_int_add.arg(0).to_opref());
-            let arg1_1 = ctx.get_box_replacement(arg1_int_add.arg(1).to_opref());
-            let b1_0 = self.getintbound_box(arg1_0, ctx);
-            let b1_1 = self.getintbound_box(arg1_1, ctx);
+        if let Some(arg1_int_add) = self.as_operation_b(&arg1, OpCode::IntAdd, ctx) {
+            let arg1_0 = self.resolve_box(arg1_int_add.arg(0).to_opref(), ctx);
+            let arg1_1 = self.resolve_box(arg1_int_add.arg(1).to_opref(), ctx);
+            let b1_0 = self.getintbound_b(&arg1_0, ctx);
+            let b1_1 = self.getintbound_b(&arg1_1, ctx);
             // sub_add_neg: int_sub(y, int_add(x, y)) => int_neg(x)
-            if autogen_eq(arg1_1, &b1_1, arg0, &b0) {
-                return replace_with(op, OpCode::IntNeg, &[arg1_0]);
+            if autogen_eq_b(&arg1_1, &b1_1, &arg0, &b0) {
+                return replace_with(op, OpCode::IntNeg, &[arg1_0.to_opref()]);
             }
             // sub_add_neg: int_sub(y, int_add(y, x)) => int_neg(x)
-            if autogen_eq(arg1_0, &b1_0, arg0, &b0) {
-                return replace_with(op, OpCode::IntNeg, &[arg1_1]);
+            if autogen_eq_b(&arg1_0, &b1_0, &arg0, &b0) {
+                return replace_with(op, OpCode::IntNeg, &[arg1_1.to_opref()]);
             }
         }
         OptimizationResult::PassOn
@@ -750,10 +723,10 @@ impl OptIntBounds {
     /// autogenintrules.py:315-410 optimize_INT_MUL — rules:
     /// mul_zero / mul_one / mul_minus_one / mul_pow2_const / mul_lshift.
     fn optimize_int_mul(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        let arg0 = ctx.get_box_replacement(op.arg(0).to_opref());
-        let arg1 = ctx.get_box_replacement(op.arg(1).to_opref());
-        let b0 = self.getintbound_box(arg0, ctx);
-        let b1 = self.getintbound_box(arg1, ctx);
+        let arg0 = self.resolve_box(op.arg(0).to_opref(), ctx);
+        let arg1 = self.resolve_box(op.arg(1).to_opref(), ctx);
+        let b0 = self.getintbound_b(&arg0, ctx);
+        let b1 = self.getintbound_b(&arg1, ctx);
         // mul_zero: int_mul(0, x) => 0
         if b0.is_constant() && b0.get_constant_int() == 0 {
             self.make_constant_int(op, 0, ctx);
@@ -769,10 +742,7 @@ impl OptIntBounds {
             let b_old = ctx
                 .ensure_box(op.pos.get())
                 .expect("body-namespace OpRef must have a BoxRef slot");
-            let b_arg = ctx
-                .ensure_box(arg1)
-                .expect("body-namespace OpRef must have a BoxRef slot");
-            ctx.make_equal_to(&b_old, &b_arg);
+            ctx.make_equal_to(&b_old, &arg1);
             return OptimizationResult::Remove;
         }
         // mul_one: int_mul(x, 1) => x
@@ -780,10 +750,7 @@ impl OptIntBounds {
             let b_old = ctx
                 .ensure_box(op.pos.get())
                 .expect("body-namespace OpRef must have a BoxRef slot");
-            let b_arg = ctx
-                .ensure_box(arg0)
-                .expect("body-namespace OpRef must have a BoxRef slot");
-            ctx.make_equal_to(&b_old, &b_arg);
+            ctx.make_equal_to(&b_old, &arg0);
             return OptimizationResult::Remove;
         }
         // Outer const on arg0: mul_minus_one / mul_pow2_const
@@ -791,27 +758,27 @@ impl OptIntBounds {
             let c = b0.get_constant_int();
             // mul_minus_one: int_mul(-1, x) => int_neg(x)
             if c == -1 {
-                return replace_with(op, OpCode::IntNeg, &[arg1]);
+                return replace_with(op, OpCode::IntNeg, &[arg1.to_opref()]);
             }
             // mul_pow2_const: int_mul(C, x) where C > 0 && (C & (C-1)) == 0
             // => int_lshift(x, highest_bit(C))
             if c > 0 && (c & c.wrapping_sub(1)) == 0 {
                 let shift = c.trailing_zeros() as i64;
                 let shift_ref = ctx.make_constant_int(shift);
-                return replace_with(op, OpCode::IntLshift, &[arg1, shift_ref]);
+                return replace_with(op, OpCode::IntLshift, &[arg1.to_opref(), shift_ref]);
             }
-        } else if let Some(arg0_lshift) = self.as_operation(arg0, OpCode::IntLshift, ctx) {
+        } else if let Some(arg0_lshift) = self.as_operation_b(&arg0, OpCode::IntLshift, ctx) {
             // mul_lshift: int_mul(int_lshift(1, y), x) => int_lshift(x, y)
-            let inner_0 = ctx.get_box_replacement(arg0_lshift.arg(0).to_opref());
-            let inner_1 = ctx.get_box_replacement(arg0_lshift.arg(1).to_opref());
-            let b_inner_0 = self.getintbound_box(inner_0, ctx);
-            let b_inner_1 = self.getintbound_box(inner_1, ctx);
+            let inner_0 = self.resolve_box(arg0_lshift.arg(0).to_opref(), ctx);
+            let inner_1 = self.resolve_box(arg0_lshift.arg(1).to_opref(), ctx);
+            let b_inner_0 = self.getintbound_b(&inner_0, ctx);
+            let b_inner_1 = self.getintbound_b(&inner_1, ctx);
             if b_inner_0.is_constant()
                 && b_inner_0.get_constant_int() == 1
                 && b_inner_1.known_ge_const(0)
                 && b_inner_1.known_le_const(64)
             {
-                return replace_with(op, OpCode::IntLshift, &[arg1, inner_1]);
+                return replace_with(op, OpCode::IntLshift, &[arg1.to_opref(), inner_1.to_opref()]);
             }
         }
         // Outer const on arg1: mul_minus_one / mul_pow2_const
@@ -819,26 +786,26 @@ impl OptIntBounds {
             let c = b1.get_constant_int();
             // mul_minus_one: int_mul(x, -1) => int_neg(x)
             if c == -1 {
-                return replace_with(op, OpCode::IntNeg, &[arg0]);
+                return replace_with(op, OpCode::IntNeg, &[arg0.to_opref()]);
             }
             // mul_pow2_const: int_mul(x, C) where C > 0 && pow2
             if c > 0 && (c & c.wrapping_sub(1)) == 0 {
                 let shift = c.trailing_zeros() as i64;
                 let shift_ref = ctx.make_constant_int(shift);
-                return replace_with(op, OpCode::IntLshift, &[arg0, shift_ref]);
+                return replace_with(op, OpCode::IntLshift, &[arg0.to_opref(), shift_ref]);
             }
-        } else if let Some(arg1_lshift) = self.as_operation(arg1, OpCode::IntLshift, ctx) {
+        } else if let Some(arg1_lshift) = self.as_operation_b(&arg1, OpCode::IntLshift, ctx) {
             // mul_lshift: int_mul(x, int_lshift(1, y)) => int_lshift(x, y)
-            let inner_0 = ctx.get_box_replacement(arg1_lshift.arg(0).to_opref());
-            let inner_1 = ctx.get_box_replacement(arg1_lshift.arg(1).to_opref());
-            let b_inner_0 = self.getintbound_box(inner_0, ctx);
-            let b_inner_1 = self.getintbound_box(inner_1, ctx);
+            let inner_0 = self.resolve_box(arg1_lshift.arg(0).to_opref(), ctx);
+            let inner_1 = self.resolve_box(arg1_lshift.arg(1).to_opref(), ctx);
+            let b_inner_0 = self.getintbound_b(&inner_0, ctx);
+            let b_inner_1 = self.getintbound_b(&inner_1, ctx);
             if b_inner_0.is_constant()
                 && b_inner_0.get_constant_int() == 1
                 && b_inner_1.known_ge_const(0)
                 && b_inner_1.known_le_const(64)
             {
-                return replace_with(op, OpCode::IntLshift, &[arg0, inner_1]);
+                return replace_with(op, OpCode::IntLshift, &[arg0.to_opref(), inner_1.to_opref()]);
             }
         }
         OptimizationResult::PassOn
@@ -848,10 +815,10 @@ impl OptIntBounds {
     /// and_known_result / and_x_c_in_range / and_x_x / and_idempotent /
     /// and_reassoc_consts / and_absorb / and_or.
     fn optimize_int_and(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        let arg0 = ctx.get_box_replacement(op.arg(0).to_opref());
-        let arg1 = ctx.get_box_replacement(op.arg(1).to_opref());
-        let b0 = self.getintbound_box(arg0, ctx);
-        let b1 = self.getintbound_box(arg1, ctx);
+        let arg0 = self.resolve_box(op.arg(0).to_opref(), ctx);
+        let arg1 = self.resolve_box(op.arg(1).to_opref(), ctx);
+        let b0 = self.getintbound_b(&arg0, ctx);
+        let b1 = self.getintbound_b(&arg1, ctx);
         // and_known_result: int_and(a, b) bound is constant => ConstInt(C)
         let bound = b0.and_bound(&b1);
         if bound.is_constant() {
@@ -872,10 +839,7 @@ impl OptIntBounds {
                 let b_old = ctx
                     .ensure_box(op.pos.get())
                     .expect("body-namespace OpRef must have a BoxRef slot");
-                let b_arg = ctx
-                    .ensure_box(arg1)
-                    .expect("body-namespace OpRef must have a BoxRef slot");
-                ctx.make_equal_to(&b_old, &b_arg);
+                ctx.make_equal_to(&b_old, &arg1);
                 return OptimizationResult::Remove;
             }
         }
@@ -887,22 +851,16 @@ impl OptIntBounds {
                 let b_old = ctx
                     .ensure_box(op.pos.get())
                     .expect("body-namespace OpRef must have a BoxRef slot");
-                let b_arg = ctx
-                    .ensure_box(arg0)
-                    .expect("body-namespace OpRef must have a BoxRef slot");
-                ctx.make_equal_to(&b_old, &b_arg);
+                ctx.make_equal_to(&b_old, &arg0);
                 return OptimizationResult::Remove;
             }
         }
         // and_x_x: int_and(a, a) => a
-        if autogen_eq(arg1, &b1, arg0, &b0) {
+        if autogen_eq_b(&arg1, &b1, &arg0, &b0) {
             let b_old = ctx
                 .ensure_box(op.pos.get())
                 .expect("body-namespace OpRef must have a BoxRef slot");
-            let b_arg = ctx
-                .ensure_box(arg0)
-                .expect("body-namespace OpRef must have a BoxRef slot");
-            ctx.make_equal_to(&b_old, &b_arg);
+            ctx.make_equal_to(&b_old, &arg0);
             return OptimizationResult::Remove;
         }
         // and_idempotent: int_and(x, y) => x
@@ -911,10 +869,7 @@ impl OptIntBounds {
             let b_old = ctx
                 .ensure_box(op.pos.get())
                 .expect("body-namespace OpRef must have a BoxRef slot");
-            let b_arg = ctx
-                .ensure_box(arg0)
-                .expect("body-namespace OpRef must have a BoxRef slot");
-            ctx.make_equal_to(&b_old, &b_arg);
+            ctx.make_equal_to(&b_old, &arg0);
             return OptimizationResult::Remove;
         }
         // and_idempotent: int_and(y, x) => x
@@ -922,43 +877,40 @@ impl OptIntBounds {
             let b_old = ctx
                 .ensure_box(op.pos.get())
                 .expect("body-namespace OpRef must have a BoxRef slot");
-            let b_arg = ctx
-                .ensure_box(arg1)
-                .expect("body-namespace OpRef must have a BoxRef slot");
-            ctx.make_equal_to(&b_old, &b_arg);
+            ctx.make_equal_to(&b_old, &arg1);
             return OptimizationResult::Remove;
         }
         if b0.is_constant() {
             let c_outer = b0.get_constant_int();
-            if let Some(arg1_and) = self.as_operation(arg1, OpCode::IntAnd, ctx) {
-                let inner_0 = ctx.get_box_replacement(arg1_and.arg(0).to_opref());
-                let inner_1 = ctx.get_box_replacement(arg1_and.arg(1).to_opref());
-                let b_inner_0 = self.getintbound_box(inner_0, ctx);
-                let b_inner_1 = self.getintbound_box(inner_1, ctx);
+            if let Some(arg1_and) = self.as_operation_b(&arg1, OpCode::IntAnd, ctx) {
+                let inner_0 = self.resolve_box(arg1_and.arg(0).to_opref(), ctx);
+                let inner_1 = self.resolve_box(arg1_and.arg(1).to_opref(), ctx);
+                let b_inner_0 = self.getintbound_b(&inner_0, ctx);
+                let b_inner_1 = self.getintbound_b(&inner_1, ctx);
                 // and_reassoc_consts: int_and(C2, int_and(C1, x)) => int_and(x, C1&C2)
                 if b_inner_0.is_constant() {
                     let folded = b_inner_0.get_constant_int() & c_outer;
                     let const_ref = ctx.make_constant_int(folded);
-                    return replace_with(op, OpCode::IntAnd, &[inner_1, const_ref]);
+                    return replace_with(op, OpCode::IntAnd, &[inner_1.to_opref(), const_ref]);
                 }
                 // and_reassoc_consts: int_and(C2, int_and(x, C1)) => int_and(x, C1&C2)
                 if b_inner_1.is_constant() {
                     let folded = b_inner_1.get_constant_int() & c_outer;
                     let const_ref = ctx.make_constant_int(folded);
-                    return replace_with(op, OpCode::IntAnd, &[inner_0, const_ref]);
+                    return replace_with(op, OpCode::IntAnd, &[inner_0.to_opref(), const_ref]);
                 }
             }
-        } else if let Some(arg0_and) = self.as_operation(arg0, OpCode::IntAnd, ctx) {
-            let inner_0 = ctx.get_box_replacement(arg0_and.arg(0).to_opref());
-            let inner_1 = ctx.get_box_replacement(arg0_and.arg(1).to_opref());
-            let b_inner_0 = self.getintbound_box(inner_0, ctx);
-            let b_inner_1 = self.getintbound_box(inner_1, ctx);
+        } else if let Some(arg0_and) = self.as_operation_b(&arg0, OpCode::IntAnd, ctx) {
+            let inner_0 = self.resolve_box(arg0_and.arg(0).to_opref(), ctx);
+            let inner_1 = self.resolve_box(arg0_and.arg(1).to_opref(), ctx);
+            let b_inner_0 = self.getintbound_b(&inner_0, ctx);
+            let b_inner_1 = self.getintbound_b(&inner_1, ctx);
             if b_inner_0.is_constant() {
                 if b1.is_constant() {
                     // and_reassoc_consts: int_and(int_and(C1, x), C2) => int_and(x, C1&C2)
                     let folded = b_inner_0.get_constant_int() & b1.get_constant_int();
                     let const_ref = ctx.make_constant_int(folded);
-                    return replace_with(op, OpCode::IntAnd, &[inner_1, const_ref]);
+                    return replace_with(op, OpCode::IntAnd, &[inner_1.to_opref(), const_ref]);
                 }
             }
             if b_inner_1.is_constant() {
@@ -966,57 +918,57 @@ impl OptIntBounds {
                     // and_reassoc_consts: int_and(int_and(x, C1), C2) => int_and(x, C1&C2)
                     let folded = b_inner_1.get_constant_int() & b1.get_constant_int();
                     let const_ref = ctx.make_constant_int(folded);
-                    return replace_with(op, OpCode::IntAnd, &[inner_0, const_ref]);
+                    return replace_with(op, OpCode::IntAnd, &[inner_0.to_opref(), const_ref]);
                 }
             }
             // and_absorb: int_and(int_and(a, b), a) => int_and(a, b)
-            if autogen_eq(arg1, &b1, inner_0, &b_inner_0) {
-                return replace_with(op, OpCode::IntAnd, &[inner_0, inner_1]);
+            if autogen_eq_b(&arg1, &b1, &inner_0, &b_inner_0) {
+                return replace_with(op, OpCode::IntAnd, &[inner_0.to_opref(), inner_1.to_opref()]);
             }
             // and_absorb: int_and(int_and(b, a), a) => int_and(a, b)
-            if autogen_eq(arg1, &b1, inner_1, &b_inner_1) {
-                return replace_with(op, OpCode::IntAnd, &[inner_1, inner_0]);
+            if autogen_eq_b(&arg1, &b1, &inner_1, &b_inner_1) {
+                return replace_with(op, OpCode::IntAnd, &[inner_1.to_opref(), inner_0.to_opref()]);
             }
-        } else if let Some(arg0_or) = self.as_operation(arg0, OpCode::IntOr, ctx) {
-            let inner_0 = ctx.get_box_replacement(arg0_or.arg(0).to_opref());
-            let inner_1 = ctx.get_box_replacement(arg0_or.arg(1).to_opref());
-            let b_inner_0 = self.getintbound_box(inner_0, ctx);
-            let b_inner_1 = self.getintbound_box(inner_1, ctx);
+        } else if let Some(arg0_or) = self.as_operation_b(&arg0, OpCode::IntOr, ctx) {
+            let inner_0 = self.resolve_box(arg0_or.arg(0).to_opref(), ctx);
+            let inner_1 = self.resolve_box(arg0_or.arg(1).to_opref(), ctx);
+            let b_inner_0 = self.getintbound_b(&inner_0, ctx);
+            let b_inner_1 = self.getintbound_b(&inner_1, ctx);
             // and_or: int_and(int_or(x, y), z) => int_and(x, z)
             if b_inner_1.and_bound(&b1).known_eq_const(0) {
-                return replace_with(op, OpCode::IntAnd, &[inner_0, arg1]);
+                return replace_with(op, OpCode::IntAnd, &[inner_0.to_opref(), arg1.to_opref()]);
             }
             // and_or: int_and(int_or(y, x), z) => int_and(x, z)
             if b_inner_0.and_bound(&b1).known_eq_const(0) {
-                return replace_with(op, OpCode::IntAnd, &[inner_1, arg1]);
+                return replace_with(op, OpCode::IntAnd, &[inner_1.to_opref(), arg1.to_opref()]);
             }
         }
         // Symmetric arm: producer on arg1.
-        if let Some(arg1_and) = self.as_operation(arg1, OpCode::IntAnd, ctx) {
-            let inner_0 = ctx.get_box_replacement(arg1_and.arg(0).to_opref());
-            let inner_1 = ctx.get_box_replacement(arg1_and.arg(1).to_opref());
-            let b_inner_0 = self.getintbound_box(inner_0, ctx);
-            let b_inner_1 = self.getintbound_box(inner_1, ctx);
+        if let Some(arg1_and) = self.as_operation_b(&arg1, OpCode::IntAnd, ctx) {
+            let inner_0 = self.resolve_box(arg1_and.arg(0).to_opref(), ctx);
+            let inner_1 = self.resolve_box(arg1_and.arg(1).to_opref(), ctx);
+            let b_inner_0 = self.getintbound_b(&inner_0, ctx);
+            let b_inner_1 = self.getintbound_b(&inner_1, ctx);
             // and_absorb: int_and(a, int_and(a, b)) => int_and(a, b)
-            if autogen_eq(inner_0, &b_inner_0, arg0, &b0) {
-                return replace_with(op, OpCode::IntAnd, &[arg0, inner_1]);
+            if autogen_eq_b(&inner_0, &b_inner_0, &arg0, &b0) {
+                return replace_with(op, OpCode::IntAnd, &[arg0.to_opref(), inner_1.to_opref()]);
             }
             // and_absorb: int_and(a, int_and(b, a)) => int_and(a, b)
-            if autogen_eq(inner_1, &b_inner_1, arg0, &b0) {
-                return replace_with(op, OpCode::IntAnd, &[arg0, inner_0]);
+            if autogen_eq_b(&inner_1, &b_inner_1, &arg0, &b0) {
+                return replace_with(op, OpCode::IntAnd, &[arg0.to_opref(), inner_0.to_opref()]);
             }
-        } else if let Some(arg1_or) = self.as_operation(arg1, OpCode::IntOr, ctx) {
-            let inner_0 = ctx.get_box_replacement(arg1_or.arg(0).to_opref());
-            let inner_1 = ctx.get_box_replacement(arg1_or.arg(1).to_opref());
-            let b_inner_0 = self.getintbound_box(inner_0, ctx);
-            let b_inner_1 = self.getintbound_box(inner_1, ctx);
+        } else if let Some(arg1_or) = self.as_operation_b(&arg1, OpCode::IntOr, ctx) {
+            let inner_0 = self.resolve_box(arg1_or.arg(0).to_opref(), ctx);
+            let inner_1 = self.resolve_box(arg1_or.arg(1).to_opref(), ctx);
+            let b_inner_0 = self.getintbound_b(&inner_0, ctx);
+            let b_inner_1 = self.getintbound_b(&inner_1, ctx);
             // and_or: int_and(z, int_or(x, y)) => int_and(x, z)
             if b_inner_1.and_bound(&b0).known_eq_const(0) {
-                return replace_with(op, OpCode::IntAnd, &[inner_0, arg0]);
+                return replace_with(op, OpCode::IntAnd, &[inner_0.to_opref(), arg0.to_opref()]);
             }
             // and_or: int_and(z, int_or(y, x)) => int_and(x, z)
             if b_inner_0.and_bound(&b0).known_eq_const(0) {
-                return replace_with(op, OpCode::IntAnd, &[inner_1, arg0]);
+                return replace_with(op, OpCode::IntAnd, &[inner_1.to_opref(), arg0.to_opref()]);
             }
         }
         OptimizationResult::PassOn
@@ -1033,10 +985,10 @@ impl OptIntBounds {
     /// when its predicate holds. Preserved here to mirror upstream's
     /// auto-generated output line for line.
     fn optimize_int_or(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        let arg0 = ctx.get_box_replacement(op.arg(0).to_opref());
-        let arg1 = ctx.get_box_replacement(op.arg(1).to_opref());
-        let b0 = self.getintbound_box(arg0, ctx);
-        let b1 = self.getintbound_box(arg1, ctx);
+        let arg0 = self.resolve_box(op.arg(0).to_opref(), ctx);
+        let arg1 = self.resolve_box(op.arg(1).to_opref(), ctx);
+        let b0 = self.getintbound_b(&arg0, ctx);
+        let b1 = self.getintbound_b(&arg1, ctx);
         // or_known_result: int_or(a, b) bound is constant => ConstInt(C)
         let bound = b0.or_bound(&b1);
         if bound.is_constant() {
@@ -1049,14 +1001,11 @@ impl OptIntBounds {
             return OptimizationResult::Remove;
         }
         // or_x_x: int_or(a, a) => a
-        if autogen_eq(arg1, &b1, arg0, &b0) {
+        if autogen_eq_b(&arg1, &b1, &arg0, &b0) {
             let b_old = ctx
                 .ensure_box(op.pos.get())
                 .expect("body-namespace OpRef must have a BoxRef slot");
-            let b_arg = ctx
-                .ensure_box(arg0)
-                .expect("body-namespace OpRef must have a BoxRef slot");
-            ctx.make_equal_to(&b_old, &b_arg);
+            ctx.make_equal_to(&b_old, &arg0);
             return OptimizationResult::Remove;
         }
         // or_idempotent: int_or(x, y) => x
@@ -1065,10 +1014,7 @@ impl OptIntBounds {
             let b_old = ctx
                 .ensure_box(op.pos.get())
                 .expect("body-namespace OpRef must have a BoxRef slot");
-            let b_arg = ctx
-                .ensure_box(arg0)
-                .expect("body-namespace OpRef must have a BoxRef slot");
-            ctx.make_equal_to(&b_old, &b_arg);
+            ctx.make_equal_to(&b_old, &arg0);
             return OptimizationResult::Remove;
         }
         // or_idempotent: int_or(y, x) => x
@@ -1076,151 +1022,148 @@ impl OptIntBounds {
             let b_old = ctx
                 .ensure_box(op.pos.get())
                 .expect("body-namespace OpRef must have a BoxRef slot");
-            let b_arg = ctx
-                .ensure_box(arg1)
-                .expect("body-namespace OpRef must have a BoxRef slot");
-            ctx.make_equal_to(&b_old, &b_arg);
+            ctx.make_equal_to(&b_old, &arg1);
             return OptimizationResult::Remove;
         }
         if b0.is_constant() {
             let c_outer = b0.get_constant_int();
-            if let Some(arg1_or) = self.as_operation(arg1, OpCode::IntOr, ctx) {
-                let inner_0 = ctx.get_box_replacement(arg1_or.arg(0).to_opref());
-                let inner_1 = ctx.get_box_replacement(arg1_or.arg(1).to_opref());
-                let b_inner_0 = self.getintbound_box(inner_0, ctx);
-                let b_inner_1 = self.getintbound_box(inner_1, ctx);
+            if let Some(arg1_or) = self.as_operation_b(&arg1, OpCode::IntOr, ctx) {
+                let inner_0 = self.resolve_box(arg1_or.arg(0).to_opref(), ctx);
+                let inner_1 = self.resolve_box(arg1_or.arg(1).to_opref(), ctx);
+                let b_inner_0 = self.getintbound_b(&inner_0, ctx);
+                let b_inner_1 = self.getintbound_b(&inner_1, ctx);
                 // or_reassoc_consts: int_or(C2, int_or(C1, x)) => int_or(x, C1|C2)
                 if b_inner_0.is_constant() {
                     let folded = b_inner_0.get_constant_int() | c_outer;
                     let const_ref = ctx.make_constant_int(folded);
-                    return replace_with(op, OpCode::IntOr, &[inner_1, const_ref]);
+                    return replace_with(op, OpCode::IntOr, &[inner_1.to_opref(), const_ref]);
                 }
                 // or_reassoc_consts: int_or(C2, int_or(x, C1)) => int_or(x, C1|C2)
                 if b_inner_1.is_constant() {
                     let folded = b_inner_1.get_constant_int() | c_outer;
                     let const_ref = ctx.make_constant_int(folded);
-                    return replace_with(op, OpCode::IntOr, &[inner_0, const_ref]);
+                    return replace_with(op, OpCode::IntOr, &[inner_0.to_opref(), const_ref]);
                 }
             }
-        } else if let Some(arg0_and) = self.as_operation(arg0, OpCode::IntAnd, ctx) {
-            let arg0_0 = ctx.get_box_replacement(arg0_and.arg(0).to_opref());
-            let arg0_1 = ctx.get_box_replacement(arg0_and.arg(1).to_opref());
-            let b_arg0_0 = self.getintbound_box(arg0_0, ctx);
-            let b_arg0_1 = self.getintbound_box(arg0_1, ctx);
+        } else if let Some(arg0_and) = self.as_operation_b(&arg0, OpCode::IntAnd, ctx) {
+            let arg0_0 = self.resolve_box(arg0_and.arg(0).to_opref(), ctx);
+            let arg0_1 = self.resolve_box(arg0_and.arg(1).to_opref(), ctx);
+            let b_arg0_0 = self.getintbound_b(&arg0_0, ctx);
+            let b_arg0_1 = self.getintbound_b(&arg0_1, ctx);
             // or_and_two_parts shapes when outer = int_and(C, x):
             if b_arg0_0.is_constant() {
                 let c_arg0_0 = b_arg0_0.get_constant_int();
-                if let Some(arg1_and) = self.as_operation(arg1, OpCode::IntAnd, ctx) {
-                    let arg1_0 = ctx.get_box_replacement(arg1_and.arg(0).to_opref());
-                    let arg1_1 = ctx.get_box_replacement(arg1_and.arg(1).to_opref());
-                    let b_arg1_0 = self.getintbound_box(arg1_0, ctx);
-                    let b_arg1_1 = self.getintbound_box(arg1_1, ctx);
+                if let Some(arg1_and) = self.as_operation_b(&arg1, OpCode::IntAnd, ctx) {
+                    let arg1_0 = self.resolve_box(arg1_and.arg(0).to_opref(), ctx);
+                    let arg1_1 = self.resolve_box(arg1_and.arg(1).to_opref(), ctx);
+                    let b_arg1_0 = self.getintbound_b(&arg1_0, ctx);
+                    let b_arg1_1 = self.getintbound_b(&arg1_1, ctx);
                     if b_arg1_0.is_constant() {
                         // int_or(int_and(C1, x), int_and(C2, x)) => int_and(x, C1|C2)
-                        if autogen_eq(arg1_1, &b_arg1_1, arg0_1, &b_arg0_1) {
+                        if autogen_eq_b(&arg1_1, &b_arg1_1, &arg0_1, &b_arg0_1) {
                             let folded = c_arg0_0 | b_arg1_0.get_constant_int();
                             let const_ref = ctx.make_constant_int(folded);
-                            return replace_with(op, OpCode::IntAnd, &[arg0_1, const_ref]);
+                            return replace_with(op, OpCode::IntAnd, &[arg0_1.to_opref(), const_ref]);
                         }
                         // dead twin per autogenintrules.py:668-673
-                        if autogen_eq(arg1_1, &b_arg1_1, arg0_1, &b_arg0_1) {
+                        if autogen_eq_b(&arg1_1, &b_arg1_1, &arg0_1, &b_arg0_1) {
                             let folded = b_arg1_0.get_constant_int() | c_arg0_0;
                             let const_ref = ctx.make_constant_int(folded);
-                            return replace_with(op, OpCode::IntAnd, &[arg0_1, const_ref]);
+                            return replace_with(op, OpCode::IntAnd, &[arg0_1.to_opref(), const_ref]);
                         }
                     }
                     if b_arg1_1.is_constant() {
                         // int_or(int_and(C, x), int_and(x, C1)) => int_and(x, C|C1)
-                        if autogen_eq(arg1_0, &b_arg1_0, arg0_1, &b_arg0_1) {
+                        if autogen_eq_b(&arg1_0, &b_arg1_0, &arg0_1, &b_arg0_1) {
                             let folded = b_arg1_1.get_constant_int() | c_arg0_0;
                             let const_ref = ctx.make_constant_int(folded);
-                            return replace_with(op, OpCode::IntAnd, &[arg0_1, const_ref]);
+                            return replace_with(op, OpCode::IntAnd, &[arg0_1.to_opref(), const_ref]);
                         }
                         // dead twin per autogenintrules.py:684-689
-                        if autogen_eq(arg1_0, &b_arg1_0, arg0_1, &b_arg0_1) {
+                        if autogen_eq_b(&arg1_0, &b_arg1_0, &arg0_1, &b_arg0_1) {
                             let folded = c_arg0_0 | b_arg1_1.get_constant_int();
                             let const_ref = ctx.make_constant_int(folded);
-                            return replace_with(op, OpCode::IntAnd, &[arg0_1, const_ref]);
+                            return replace_with(op, OpCode::IntAnd, &[arg0_1.to_opref(), const_ref]);
                         }
                     }
                 }
             }
             if b_arg0_1.is_constant() {
                 let c_arg0_1 = b_arg0_1.get_constant_int();
-                if let Some(arg1_and) = self.as_operation(arg1, OpCode::IntAnd, ctx) {
-                    let arg1_0 = ctx.get_box_replacement(arg1_and.arg(0).to_opref());
-                    let arg1_1 = ctx.get_box_replacement(arg1_and.arg(1).to_opref());
-                    let b_arg1_0 = self.getintbound_box(arg1_0, ctx);
-                    let b_arg1_1 = self.getintbound_box(arg1_1, ctx);
+                if let Some(arg1_and) = self.as_operation_b(&arg1, OpCode::IntAnd, ctx) {
+                    let arg1_0 = self.resolve_box(arg1_and.arg(0).to_opref(), ctx);
+                    let arg1_1 = self.resolve_box(arg1_and.arg(1).to_opref(), ctx);
+                    let b_arg1_0 = self.getintbound_b(&arg1_0, ctx);
+                    let b_arg1_1 = self.getintbound_b(&arg1_1, ctx);
                     if b_arg1_0.is_constant() {
                         // int_or(int_and(x, C1), int_and(C2, x)) => int_and(x, C)
-                        if autogen_eq(arg1_1, &b_arg1_1, arg0_0, &b_arg0_0) {
+                        if autogen_eq_b(&arg1_1, &b_arg1_1, &arg0_0, &b_arg0_0) {
                             let folded = c_arg0_1 | b_arg1_0.get_constant_int();
                             let const_ref = ctx.make_constant_int(folded);
-                            return replace_with(op, OpCode::IntAnd, &[arg0_0, const_ref]);
+                            return replace_with(op, OpCode::IntAnd, &[arg0_0.to_opref(), const_ref]);
                         }
                         // dead twin per autogenintrules.py:708-713
-                        if autogen_eq(arg1_1, &b_arg1_1, arg0_0, &b_arg0_0) {
+                        if autogen_eq_b(&arg1_1, &b_arg1_1, &arg0_0, &b_arg0_0) {
                             let folded = b_arg1_0.get_constant_int() | c_arg0_1;
                             let const_ref = ctx.make_constant_int(folded);
-                            return replace_with(op, OpCode::IntAnd, &[arg0_0, const_ref]);
+                            return replace_with(op, OpCode::IntAnd, &[arg0_0.to_opref(), const_ref]);
                         }
                     }
                     if b_arg1_1.is_constant() {
                         // int_or(int_and(x, C1), int_and(x, C2)) => int_and(x, C)
-                        if autogen_eq(arg1_0, &b_arg1_0, arg0_0, &b_arg0_0) {
+                        if autogen_eq_b(&arg1_0, &b_arg1_0, &arg0_0, &b_arg0_0) {
                             let folded = c_arg0_1 | b_arg1_1.get_constant_int();
                             let const_ref = ctx.make_constant_int(folded);
-                            return replace_with(op, OpCode::IntAnd, &[arg0_0, const_ref]);
+                            return replace_with(op, OpCode::IntAnd, &[arg0_0.to_opref(), const_ref]);
                         }
                         // dead twin per autogenintrules.py:724-729
-                        if autogen_eq(arg1_0, &b_arg1_0, arg0_0, &b_arg0_0) {
+                        if autogen_eq_b(&arg1_0, &b_arg1_0, &arg0_0, &b_arg0_0) {
                             let folded = b_arg1_1.get_constant_int() | c_arg0_1;
                             let const_ref = ctx.make_constant_int(folded);
-                            return replace_with(op, OpCode::IntAnd, &[arg0_0, const_ref]);
+                            return replace_with(op, OpCode::IntAnd, &[arg0_0.to_opref(), const_ref]);
                         }
                     }
                 }
             }
-        } else if let Some(arg0_or) = self.as_operation(arg0, OpCode::IntOr, ctx) {
-            let arg0_0 = ctx.get_box_replacement(arg0_or.arg(0).to_opref());
-            let arg0_1 = ctx.get_box_replacement(arg0_or.arg(1).to_opref());
-            let b_arg0_0 = self.getintbound_box(arg0_0, ctx);
-            let b_arg0_1 = self.getintbound_box(arg0_1, ctx);
+        } else if let Some(arg0_or) = self.as_operation_b(&arg0, OpCode::IntOr, ctx) {
+            let arg0_0 = self.resolve_box(arg0_or.arg(0).to_opref(), ctx);
+            let arg0_1 = self.resolve_box(arg0_or.arg(1).to_opref(), ctx);
+            let b_arg0_0 = self.getintbound_b(&arg0_0, ctx);
+            let b_arg0_1 = self.getintbound_b(&arg0_1, ctx);
             if b_arg0_0.is_constant() && b1.is_constant() {
                 // or_reassoc_consts: int_or(int_or(C1, x), C2) => int_or(x, C1|C2)
                 let folded = b_arg0_0.get_constant_int() | b1.get_constant_int();
                 let const_ref = ctx.make_constant_int(folded);
-                return replace_with(op, OpCode::IntOr, &[arg0_1, const_ref]);
+                return replace_with(op, OpCode::IntOr, &[arg0_1.to_opref(), const_ref]);
             }
             if b_arg0_1.is_constant() && b1.is_constant() {
                 // or_reassoc_consts: int_or(int_or(x, C1), C2) => int_or(x, C1|C2)
                 let folded = b_arg0_1.get_constant_int() | b1.get_constant_int();
                 let const_ref = ctx.make_constant_int(folded);
-                return replace_with(op, OpCode::IntOr, &[arg0_0, const_ref]);
+                return replace_with(op, OpCode::IntOr, &[arg0_0.to_opref(), const_ref]);
             }
             // or_absorb: int_or(int_or(a, b), a) => int_or(a, b)
-            if autogen_eq(arg1, &b1, arg0_0, &b_arg0_0) {
-                return replace_with(op, OpCode::IntOr, &[arg0_0, arg0_1]);
+            if autogen_eq_b(&arg1, &b1, &arg0_0, &b_arg0_0) {
+                return replace_with(op, OpCode::IntOr, &[arg0_0.to_opref(), arg0_1.to_opref()]);
             }
             // or_absorb: int_or(int_or(b, a), a) => int_or(a, b)
-            if autogen_eq(arg1, &b1, arg0_1, &b_arg0_1) {
-                return replace_with(op, OpCode::IntOr, &[arg0_1, arg0_0]);
+            if autogen_eq_b(&arg1, &b1, &arg0_1, &b_arg0_1) {
+                return replace_with(op, OpCode::IntOr, &[arg0_1.to_opref(), arg0_0.to_opref()]);
             }
         }
         // Symmetric arm: producer on arg1.
-        if let Some(arg1_or) = self.as_operation(arg1, OpCode::IntOr, ctx) {
-            let arg1_0 = ctx.get_box_replacement(arg1_or.arg(0).to_opref());
-            let arg1_1 = ctx.get_box_replacement(arg1_or.arg(1).to_opref());
-            let b_arg1_0 = self.getintbound_box(arg1_0, ctx);
-            let b_arg1_1 = self.getintbound_box(arg1_1, ctx);
+        if let Some(arg1_or) = self.as_operation_b(&arg1, OpCode::IntOr, ctx) {
+            let arg1_0 = self.resolve_box(arg1_or.arg(0).to_opref(), ctx);
+            let arg1_1 = self.resolve_box(arg1_or.arg(1).to_opref(), ctx);
+            let b_arg1_0 = self.getintbound_b(&arg1_0, ctx);
+            let b_arg1_1 = self.getintbound_b(&arg1_1, ctx);
             // or_absorb: int_or(a, int_or(a, b)) => int_or(a, b)
-            if autogen_eq(arg1_0, &b_arg1_0, arg0, &b0) {
-                return replace_with(op, OpCode::IntOr, &[arg0, arg1_1]);
+            if autogen_eq_b(&arg1_0, &b_arg1_0, &arg0, &b0) {
+                return replace_with(op, OpCode::IntOr, &[arg0.to_opref(), arg1_1.to_opref()]);
             }
             // or_absorb: int_or(a, int_or(b, a)) => int_or(a, b)
-            if autogen_eq(arg1_1, &b_arg1_1, arg0, &b0) {
-                return replace_with(op, OpCode::IntOr, &[arg0, arg1_0]);
+            if autogen_eq_b(&arg1_1, &b_arg1_1, &arg0, &b0) {
+                return replace_with(op, OpCode::IntOr, &[arg0.to_opref(), arg1_0.to_opref()]);
             }
         }
         OptimizationResult::PassOn
@@ -1230,10 +1173,10 @@ impl OptIntBounds {
     /// xor_x_x / xor_reassoc_consts / xor_absorb / xor_zero /
     /// xor_minus_1 / xor_known_result / xor_is_not.
     fn optimize_int_xor(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        let arg0 = ctx.get_box_replacement(op.arg(0).to_opref());
-        let arg1 = ctx.get_box_replacement(op.arg(1).to_opref());
-        let b0 = self.getintbound_box(arg0, ctx);
-        let b1 = self.getintbound_box(arg1, ctx);
+        let arg0 = self.resolve_box(op.arg(0).to_opref(), ctx);
+        let arg1 = self.resolve_box(op.arg(1).to_opref(), ctx);
+        let b0 = self.getintbound_b(&arg0, ctx);
+        let b1 = self.getintbound_b(&arg1, ctx);
         // xor_known_result: int_xor(a, b) bound is constant => ConstInt(C)
         let bound = b0.xor_bound(&b1);
         if bound.is_constant() {
@@ -1246,7 +1189,7 @@ impl OptIntBounds {
             return OptimizationResult::Remove;
         }
         // xor_x_x: int_xor(a, a) => 0
-        if autogen_eq(arg1, &b1, arg0, &b0) {
+        if autogen_eq_b(&arg1, &b1, &arg0, &b0) {
             self.make_constant_int(op, 0, ctx);
             return OptimizationResult::Remove;
         }
@@ -1256,37 +1199,28 @@ impl OptIntBounds {
                 let b_old = ctx
                     .ensure_box(op.pos.get())
                     .expect("body-namespace OpRef must have a BoxRef slot");
-                let b_arg = ctx
-                    .ensure_box(arg1)
-                    .expect("body-namespace OpRef must have a BoxRef slot");
-                ctx.make_equal_to(&b_old, &b_arg);
+                ctx.make_equal_to(&b_old, &arg1);
                 return OptimizationResult::Remove;
             }
-        } else if let Some(arg0_xor) = self.as_operation(arg0, OpCode::IntXor, ctx) {
-            let inner_0 = ctx.get_box_replacement(arg0_xor.arg(0).to_opref());
-            let inner_1 = ctx.get_box_replacement(arg0_xor.arg(1).to_opref());
-            let b_inner_0 = self.getintbound_box(inner_0, ctx);
-            let b_inner_1 = self.getintbound_box(inner_1, ctx);
+        } else if let Some(arg0_xor) = self.as_operation_b(&arg0, OpCode::IntXor, ctx) {
+            let inner_0 = self.resolve_box(arg0_xor.arg(0).to_opref(), ctx);
+            let inner_1 = self.resolve_box(arg0_xor.arg(1).to_opref(), ctx);
+            let b_inner_0 = self.getintbound_b(&inner_0, ctx);
+            let b_inner_1 = self.getintbound_b(&inner_1, ctx);
             // xor_absorb: int_xor(int_xor(a, b), b) => a
-            if autogen_eq(arg1, &b1, inner_1, &b_inner_1) {
+            if autogen_eq_b(&arg1, &b1, &inner_1, &b_inner_1) {
                 let b_old = ctx
                     .ensure_box(op.pos.get())
                     .expect("body-namespace OpRef must have a BoxRef slot");
-                let b_inner = ctx
-                    .ensure_box(inner_0)
-                    .expect("body-namespace OpRef must have a BoxRef slot");
-                ctx.make_equal_to(&b_old, &b_inner);
+                ctx.make_equal_to(&b_old, &inner_0);
                 return OptimizationResult::Remove;
             }
             // xor_absorb: int_xor(int_xor(b, a), b) => a
-            if autogen_eq(arg1, &b1, inner_0, &b_inner_0) {
+            if autogen_eq_b(&arg1, &b1, &inner_0, &b_inner_0) {
                 let b_old = ctx
                     .ensure_box(op.pos.get())
                     .expect("body-namespace OpRef must have a BoxRef slot");
-                let b_inner = ctx
-                    .ensure_box(inner_1)
-                    .expect("body-namespace OpRef must have a BoxRef slot");
-                ctx.make_equal_to(&b_old, &b_inner);
+                ctx.make_equal_to(&b_old, &inner_1);
                 return OptimizationResult::Remove;
             }
         }
@@ -1296,85 +1230,76 @@ impl OptIntBounds {
                 let b_old = ctx
                     .ensure_box(op.pos.get())
                     .expect("body-namespace OpRef must have a BoxRef slot");
-                let b_arg = ctx
-                    .ensure_box(arg0)
-                    .expect("body-namespace OpRef must have a BoxRef slot");
-                ctx.make_equal_to(&b_old, &b_arg);
+                ctx.make_equal_to(&b_old, &arg0);
                 return OptimizationResult::Remove;
             }
-        } else if let Some(arg1_xor) = self.as_operation(arg1, OpCode::IntXor, ctx) {
-            let inner_0 = ctx.get_box_replacement(arg1_xor.arg(0).to_opref());
-            let inner_1 = ctx.get_box_replacement(arg1_xor.arg(1).to_opref());
-            let b_inner_0 = self.getintbound_box(inner_0, ctx);
-            let b_inner_1 = self.getintbound_box(inner_1, ctx);
+        } else if let Some(arg1_xor) = self.as_operation_b(&arg1, OpCode::IntXor, ctx) {
+            let inner_0 = self.resolve_box(arg1_xor.arg(0).to_opref(), ctx);
+            let inner_1 = self.resolve_box(arg1_xor.arg(1).to_opref(), ctx);
+            let b_inner_0 = self.getintbound_b(&inner_0, ctx);
+            let b_inner_1 = self.getintbound_b(&inner_1, ctx);
             // xor_absorb: int_xor(b, int_xor(a, b)) => a
-            if autogen_eq(inner_1, &b_inner_1, arg0, &b0) {
+            if autogen_eq_b(&inner_1, &b_inner_1, &arg0, &b0) {
                 let b_old = ctx
                     .ensure_box(op.pos.get())
                     .expect("body-namespace OpRef must have a BoxRef slot");
-                let b_inner = ctx
-                    .ensure_box(inner_0)
-                    .expect("body-namespace OpRef must have a BoxRef slot");
-                ctx.make_equal_to(&b_old, &b_inner);
+                ctx.make_equal_to(&b_old, &inner_0);
                 return OptimizationResult::Remove;
             }
             // xor_absorb: int_xor(b, int_xor(b, a)) => a
-            if autogen_eq(inner_0, &b_inner_0, arg0, &b0) {
+            if autogen_eq_b(&inner_0, &b_inner_0, &arg0, &b0) {
                 let b_old = ctx
                     .ensure_box(op.pos.get())
                     .expect("body-namespace OpRef must have a BoxRef slot");
-                let b_inner = ctx
-                    .ensure_box(inner_1)
-                    .expect("body-namespace OpRef must have a BoxRef slot");
-                ctx.make_equal_to(&b_old, &b_inner);
+                ctx.make_equal_to(&b_old, &inner_1);
                 return OptimizationResult::Remove;
             }
         }
         // Constant-on-left arm (b_arg_0 constant): reassoc_consts/minus_1/is_not
         if b0.is_constant() {
             let c_outer = b0.get_constant_int();
-            if let Some(arg1_xor) = self.as_operation(arg1, OpCode::IntXor, ctx) {
-                let inner_0 = ctx.get_box_replacement(arg1_xor.arg(0).to_opref());
-                let inner_1 = ctx.get_box_replacement(arg1_xor.arg(1).to_opref());
-                let b_inner_0 = self.getintbound_box(inner_0, ctx);
-                let b_inner_1 = self.getintbound_box(inner_1, ctx);
+            if let Some(arg1_xor) = self.as_operation_b(&arg1, OpCode::IntXor, ctx) {
+                let inner_0 = self.resolve_box(arg1_xor.arg(0).to_opref(), ctx);
+                let inner_1 = self.resolve_box(arg1_xor.arg(1).to_opref(), ctx);
+                let b_inner_0 = self.getintbound_b(&inner_0, ctx);
+                let b_inner_1 = self.getintbound_b(&inner_1, ctx);
                 // xor_reassoc_consts: int_xor(C2, int_xor(C1, x)) => int_xor(x, C1^C2)
                 if b_inner_0.is_constant() {
                     let folded = b_inner_0.get_constant_int() ^ c_outer;
                     let const_ref = ctx.make_constant_int(folded);
-                    return replace_with(op, OpCode::IntXor, &[inner_1, const_ref]);
+                    return replace_with(op, OpCode::IntXor, &[inner_1.to_opref(), const_ref]);
                 }
                 // xor_reassoc_consts: int_xor(C2, int_xor(x, C1)) => int_xor(x, C1^C2)
                 if b_inner_1.is_constant() {
                     let folded = b_inner_1.get_constant_int() ^ c_outer;
                     let const_ref = ctx.make_constant_int(folded);
-                    return replace_with(op, OpCode::IntXor, &[inner_0, const_ref]);
+                    return replace_with(op, OpCode::IntXor, &[inner_0.to_opref(), const_ref]);
                 }
             }
             // xor_minus_1: int_xor(-1, x) => int_invert(x)
             if c_outer == -1 {
-                return replace_with(op, OpCode::IntInvert, &[arg1]);
+                return replace_with(op, OpCode::IntInvert, &[arg1.to_opref()]);
             }
             // xor_is_not: int_xor(1, x) => int_is_zero(x)  (when x is bool)
             if c_outer == 1 && b1.is_bool() {
-                return replace_with(op, OpCode::IntIsZero, &[arg1]);
+                return replace_with(op, OpCode::IntIsZero, &[arg1.to_opref()]);
             }
-        } else if let Some(arg0_xor) = self.as_operation(arg0, OpCode::IntXor, ctx) {
-            let inner_0 = ctx.get_box_replacement(arg0_xor.arg(0).to_opref());
-            let inner_1 = ctx.get_box_replacement(arg0_xor.arg(1).to_opref());
-            let b_inner_0 = self.getintbound_box(inner_0, ctx);
-            let b_inner_1 = self.getintbound_box(inner_1, ctx);
+        } else if let Some(arg0_xor) = self.as_operation_b(&arg0, OpCode::IntXor, ctx) {
+            let inner_0 = self.resolve_box(arg0_xor.arg(0).to_opref(), ctx);
+            let inner_1 = self.resolve_box(arg0_xor.arg(1).to_opref(), ctx);
+            let b_inner_0 = self.getintbound_b(&inner_0, ctx);
+            let b_inner_1 = self.getintbound_b(&inner_1, ctx);
             if b_inner_0.is_constant() && b1.is_constant() {
                 // xor_reassoc_consts: int_xor(int_xor(C1, x), C2) => int_xor(x, C1^C2)
                 let folded = b_inner_0.get_constant_int() ^ b1.get_constant_int();
                 let const_ref = ctx.make_constant_int(folded);
-                return replace_with(op, OpCode::IntXor, &[inner_1, const_ref]);
+                return replace_with(op, OpCode::IntXor, &[inner_1.to_opref(), const_ref]);
             }
             if b_inner_1.is_constant() && b1.is_constant() {
                 // xor_reassoc_consts: int_xor(int_xor(x, C1), C2) => int_xor(x, C1^C2)
                 let folded = b_inner_1.get_constant_int() ^ b1.get_constant_int();
                 let const_ref = ctx.make_constant_int(folded);
-                return replace_with(op, OpCode::IntXor, &[inner_0, const_ref]);
+                return replace_with(op, OpCode::IntXor, &[inner_0.to_opref(), const_ref]);
             }
         }
         // Constant-on-right arm (b_arg_1 constant): minus_1/is_not
@@ -1382,11 +1307,11 @@ impl OptIntBounds {
             let c = b1.get_constant_int();
             // xor_minus_1: int_xor(x, -1) => int_invert(x)
             if c == -1 {
-                return replace_with(op, OpCode::IntInvert, &[arg0]);
+                return replace_with(op, OpCode::IntInvert, &[arg0.to_opref()]);
             }
             // xor_is_not: int_xor(x, 1) => int_is_zero(x)  (when x is bool)
             if c == 1 && b0.is_bool() {
-                return replace_with(op, OpCode::IntIsZero, &[arg0]);
+                return replace_with(op, OpCode::IntIsZero, &[arg0.to_opref()]);
             }
         }
         OptimizationResult::PassOn
@@ -1394,17 +1319,14 @@ impl OptIntBounds {
 
     /// autogenintrules.py:1432-1443 optimize_INT_INVERT — rules: invert_invert.
     fn optimize_int_invert(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        let arg0 = ctx.get_box_replacement(op.arg(0).to_opref());
+        let arg0 = self.resolve_box(op.arg(0).to_opref(), ctx);
         // invert_invert: int_invert(int_invert(x)) => x
-        if let Some(inner) = self.as_operation(arg0, OpCode::IntInvert, ctx) {
-            let inner_0 = ctx.get_box_replacement(inner.arg(0).to_opref());
+        if let Some(inner) = self.as_operation_b(&arg0, OpCode::IntInvert, ctx) {
+            let inner_0 = self.resolve_box(inner.arg(0).to_opref(), ctx);
             let b_old = ctx
                 .ensure_box(op.pos.get())
                 .expect("body-namespace OpRef must have a BoxRef slot");
-            let b_inner = ctx
-                .ensure_box(inner_0)
-                .expect("body-namespace OpRef must have a BoxRef slot");
-            ctx.make_equal_to(&b_old, &b_inner);
+            ctx.make_equal_to(&b_old, &inner_0);
             return OptimizationResult::Remove;
         }
         OptimizationResult::PassOn
@@ -1412,17 +1334,14 @@ impl OptIntBounds {
 
     /// autogenintrules.py:1447-1458 optimize_INT_NEG — rules: neg_neg.
     fn optimize_int_neg(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        let arg0 = ctx.get_box_replacement(op.arg(0).to_opref());
+        let arg0 = self.resolve_box(op.arg(0).to_opref(), ctx);
         // neg_neg: int_neg(int_neg(x)) => x
-        if let Some(inner) = self.as_operation(arg0, OpCode::IntNeg, ctx) {
-            let inner_0 = ctx.get_box_replacement(inner.arg(0).to_opref());
+        if let Some(inner) = self.as_operation_b(&arg0, OpCode::IntNeg, ctx) {
+            let inner_0 = self.resolve_box(inner.arg(0).to_opref(), ctx);
             let b_old = ctx
                 .ensure_box(op.pos.get())
                 .expect("body-namespace OpRef must have a BoxRef slot");
-            let b_inner = ctx
-                .ensure_box(inner_0)
-                .expect("body-namespace OpRef must have a BoxRef slot");
-            ctx.make_equal_to(&b_old, &b_inner);
+            ctx.make_equal_to(&b_old, &inner_0);
             return OptimizationResult::Remove;
         }
         OptimizationResult::PassOn
@@ -1433,10 +1352,10 @@ impl OptIntBounds {
     /// lshift_urshift_c_c / lshift_and_urshift / lshift_lshift_c_c.
     /// LONG_BIT inlined as 64 (pyre is 64-bit only).
     fn optimize_int_lshift(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        let arg0 = ctx.get_box_replacement(op.arg(0).to_opref());
-        let arg1 = ctx.get_box_replacement(op.arg(1).to_opref());
-        let b0 = self.getintbound_box(arg0, ctx);
-        let b1 = self.getintbound_box(arg1, ctx);
+        let arg0 = self.resolve_box(op.arg(0).to_opref(), ctx);
+        let arg1 = self.resolve_box(op.arg(1).to_opref(), ctx);
+        let b0 = self.getintbound_b(&arg0, ctx);
+        let b1 = self.getintbound_b(&arg1, ctx);
         // lshift_zero_x: int_lshift(0, x) => 0
         if b0.is_constant() && b0.get_constant_int() == 0 {
             self.make_constant_int(op, 0, ctx);
@@ -1447,23 +1366,20 @@ impl OptIntBounds {
             let b_old = ctx
                 .ensure_box(op.pos.get())
                 .expect("body-namespace OpRef must have a BoxRef slot");
-            let b_arg = ctx
-                .ensure_box(arg0)
-                .expect("body-namespace OpRef must have a BoxRef slot");
-            ctx.make_equal_to(&b_old, &b_arg);
+            ctx.make_equal_to(&b_old, &arg0);
             return OptimizationResult::Remove;
         }
-        if let Some(arg0_and) = self.as_operation(arg0, OpCode::IntAnd, ctx) {
-            let inner_0 = ctx.get_box_replacement(arg0_and.arg(0).to_opref());
-            let inner_1 = ctx.get_box_replacement(arg0_and.arg(1).to_opref());
-            let b_inner_0 = self.getintbound_box(inner_0, ctx);
-            let b_inner_1 = self.getintbound_box(inner_1, ctx);
+        if let Some(arg0_and) = self.as_operation_b(&arg0, OpCode::IntAnd, ctx) {
+            let inner_0 = self.resolve_box(arg0_and.arg(0).to_opref(), ctx);
+            let inner_1 = self.resolve_box(arg0_and.arg(1).to_opref(), ctx);
+            let b_inner_0 = self.getintbound_b(&inner_0, ctx);
+            let b_inner_1 = self.getintbound_b(&inner_1, ctx);
             if b_inner_0.is_constant() {
                 let c_arg0_0 = b_inner_0.get_constant_int();
-                if let Some(rshift) = self.as_operation(inner_1, OpCode::IntRshift, ctx) {
-                    let r0 = ctx.get_box_replacement(rshift.arg(0).to_opref());
-                    let r1 = ctx.get_box_replacement(rshift.arg(1).to_opref());
-                    let b_r1 = self.getintbound_box(r1, ctx);
+                if let Some(rshift) = self.as_operation_b(&inner_1, OpCode::IntRshift, ctx) {
+                    let r0 = self.resolve_box(rshift.arg(0).to_opref(), ctx);
+                    let r1 = self.resolve_box(rshift.arg(1).to_opref(), ctx);
+                    let b_r1 = self.getintbound_b(&r1, ctx);
                     if b_r1.is_constant() && b1.is_constant() {
                         let c_r1 = b_r1.get_constant_int();
                         let c_arg1 = b1.get_constant_int();
@@ -1471,13 +1387,13 @@ impl OptIntBounds {
                         if c_arg1 == c_r1 && (0..64).contains(&c_r1) {
                             let folded = c_arg0_0.wrapping_shl(c_r1 as u32);
                             let const_ref = ctx.make_constant_int(folded);
-                            return replace_with(op, OpCode::IntAnd, &[r0, const_ref]);
+                            return replace_with(op, OpCode::IntAnd, &[r0.to_opref(), const_ref]);
                         }
                     }
-                } else if let Some(urshift) = self.as_operation(inner_1, OpCode::UintRshift, ctx) {
-                    let r0 = ctx.get_box_replacement(urshift.arg(0).to_opref());
-                    let r1 = ctx.get_box_replacement(urshift.arg(1).to_opref());
-                    let b_r1 = self.getintbound_box(r1, ctx);
+                } else if let Some(urshift) = self.as_operation_b(&inner_1, OpCode::UintRshift, ctx) {
+                    let r0 = self.resolve_box(urshift.arg(0).to_opref(), ctx);
+                    let r1 = self.resolve_box(urshift.arg(1).to_opref(), ctx);
+                    let b_r1 = self.getintbound_b(&r1, ctx);
                     if b_r1.is_constant() && b1.is_constant() {
                         let c_r1 = b_r1.get_constant_int();
                         let c_arg1 = b1.get_constant_int();
@@ -1485,14 +1401,14 @@ impl OptIntBounds {
                         if c_arg1 == c_r1 && (0..64).contains(&c_r1) {
                             let folded = c_arg0_0.wrapping_shl(c_r1 as u32);
                             let const_ref = ctx.make_constant_int(folded);
-                            return replace_with(op, OpCode::IntAnd, &[r0, const_ref]);
+                            return replace_with(op, OpCode::IntAnd, &[r0.to_opref(), const_ref]);
                         }
                     }
                 }
-            } else if let Some(rshift) = self.as_operation(inner_0, OpCode::IntRshift, ctx) {
-                let r0 = ctx.get_box_replacement(rshift.arg(0).to_opref());
-                let r1 = ctx.get_box_replacement(rshift.arg(1).to_opref());
-                let b_r1 = self.getintbound_box(r1, ctx);
+            } else if let Some(rshift) = self.as_operation_b(&inner_0, OpCode::IntRshift, ctx) {
+                let r0 = self.resolve_box(rshift.arg(0).to_opref(), ctx);
+                let r1 = self.resolve_box(rshift.arg(1).to_opref(), ctx);
+                let b_r1 = self.getintbound_b(&r1, ctx);
                 if b_r1.is_constant() && b_inner_1.is_constant() && b1.is_constant() {
                     let c_r1 = b_r1.get_constant_int();
                     let c_arg0_1 = b_inner_1.get_constant_int();
@@ -1501,13 +1417,13 @@ impl OptIntBounds {
                     if c_arg1 == c_r1 && (0..64).contains(&c_r1) {
                         let folded = c_arg0_1.wrapping_shl(c_r1 as u32);
                         let const_ref = ctx.make_constant_int(folded);
-                        return replace_with(op, OpCode::IntAnd, &[r0, const_ref]);
+                        return replace_with(op, OpCode::IntAnd, &[r0.to_opref(), const_ref]);
                     }
                 }
-            } else if let Some(urshift) = self.as_operation(inner_0, OpCode::UintRshift, ctx) {
-                let r0 = ctx.get_box_replacement(urshift.arg(0).to_opref());
-                let r1 = ctx.get_box_replacement(urshift.arg(1).to_opref());
-                let b_r1 = self.getintbound_box(r1, ctx);
+            } else if let Some(urshift) = self.as_operation_b(&inner_0, OpCode::UintRshift, ctx) {
+                let r0 = self.resolve_box(urshift.arg(0).to_opref(), ctx);
+                let r1 = self.resolve_box(urshift.arg(1).to_opref(), ctx);
+                let b_r1 = self.getintbound_b(&r1, ctx);
                 if b_r1.is_constant() && b_inner_1.is_constant() && b1.is_constant() {
                     let c_r1 = b_r1.get_constant_int();
                     let c_arg0_1 = b_inner_1.get_constant_int();
@@ -1516,14 +1432,14 @@ impl OptIntBounds {
                     if c_arg1 == c_r1 && (0..64).contains(&c_r1) {
                         let folded = c_arg0_1.wrapping_shl(c_r1 as u32);
                         let const_ref = ctx.make_constant_int(folded);
-                        return replace_with(op, OpCode::IntAnd, &[r0, const_ref]);
+                        return replace_with(op, OpCode::IntAnd, &[r0.to_opref(), const_ref]);
                     }
                 }
             }
-        } else if let Some(arg0_lshift) = self.as_operation(arg0, OpCode::IntLshift, ctx) {
-            let inner_0 = ctx.get_box_replacement(arg0_lshift.arg(0).to_opref());
-            let inner_1 = ctx.get_box_replacement(arg0_lshift.arg(1).to_opref());
-            let b_inner_1 = self.getintbound_box(inner_1, ctx);
+        } else if let Some(arg0_lshift) = self.as_operation_b(&arg0, OpCode::IntLshift, ctx) {
+            let inner_0 = self.resolve_box(arg0_lshift.arg(0).to_opref(), ctx);
+            let inner_1 = self.resolve_box(arg0_lshift.arg(1).to_opref(), ctx);
+            let b_inner_1 = self.getintbound_b(&inner_1, ctx);
             if b_inner_1.is_constant() && b1.is_constant() {
                 let c1 = b_inner_1.get_constant_int();
                 let c2 = b1.get_constant_int();
@@ -1532,14 +1448,14 @@ impl OptIntBounds {
                     let folded = c1.wrapping_add(c2);
                     if folded < 64 {
                         let const_ref = ctx.make_constant_int(folded);
-                        return replace_with(op, OpCode::IntLshift, &[inner_0, const_ref]);
+                        return replace_with(op, OpCode::IntLshift, &[inner_0.to_opref(), const_ref]);
                     }
                 }
             }
-        } else if let Some(arg0_rshift) = self.as_operation(arg0, OpCode::IntRshift, ctx) {
-            let inner_0 = ctx.get_box_replacement(arg0_rshift.arg(0).to_opref());
-            let inner_1 = ctx.get_box_replacement(arg0_rshift.arg(1).to_opref());
-            let b_inner_1 = self.getintbound_box(inner_1, ctx);
+        } else if let Some(arg0_rshift) = self.as_operation_b(&arg0, OpCode::IntRshift, ctx) {
+            let inner_0 = self.resolve_box(arg0_rshift.arg(0).to_opref(), ctx);
+            let inner_1 = self.resolve_box(arg0_rshift.arg(1).to_opref(), ctx);
+            let b_inner_1 = self.getintbound_b(&inner_1, ctx);
             if b_inner_1.is_constant() && b1.is_constant() {
                 let c1 = b_inner_1.get_constant_int();
                 let c2 = b1.get_constant_int();
@@ -1547,13 +1463,13 @@ impl OptIntBounds {
                 if c2 == c1 && (0..64).contains(&c1) {
                     let mask = (-1i64).wrapping_shl(c1 as u32);
                     let const_ref = ctx.make_constant_int(mask);
-                    return replace_with(op, OpCode::IntAnd, &[inner_0, const_ref]);
+                    return replace_with(op, OpCode::IntAnd, &[inner_0.to_opref(), const_ref]);
                 }
             }
-        } else if let Some(arg0_urshift) = self.as_operation(arg0, OpCode::UintRshift, ctx) {
-            let inner_0 = ctx.get_box_replacement(arg0_urshift.arg(0).to_opref());
-            let inner_1 = ctx.get_box_replacement(arg0_urshift.arg(1).to_opref());
-            let b_inner_1 = self.getintbound_box(inner_1, ctx);
+        } else if let Some(arg0_urshift) = self.as_operation_b(&arg0, OpCode::UintRshift, ctx) {
+            let inner_0 = self.resolve_box(arg0_urshift.arg(0).to_opref(), ctx);
+            let inner_1 = self.resolve_box(arg0_urshift.arg(1).to_opref(), ctx);
+            let b_inner_1 = self.getintbound_b(&inner_1, ctx);
             if b_inner_1.is_constant() && b1.is_constant() {
                 let c1 = b_inner_1.get_constant_int();
                 let c2 = b1.get_constant_int();
@@ -1561,7 +1477,7 @@ impl OptIntBounds {
                 if c2 == c1 && (0..64).contains(&c1) {
                     let mask = (-1i64).wrapping_shl(c1 as u32);
                     let const_ref = ctx.make_constant_int(mask);
-                    return replace_with(op, OpCode::IntAnd, &[inner_0, const_ref]);
+                    return replace_with(op, OpCode::IntAnd, &[inner_0.to_opref(), const_ref]);
                 }
             }
         }
@@ -1572,10 +1488,10 @@ impl OptIntBounds {
     /// rshift_zero_x / rshift_x_zero / rshift_known_result / rshift_lshift /
     /// rshift_rshift_c_c. LONG_BIT inlined as 64.
     fn optimize_int_rshift(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        let arg0 = ctx.get_box_replacement(op.arg(0).to_opref());
-        let arg1 = ctx.get_box_replacement(op.arg(1).to_opref());
-        let b0 = self.getintbound_box(arg0, ctx);
-        let b1 = self.getintbound_box(arg1, ctx);
+        let arg0 = self.resolve_box(op.arg(0).to_opref(), ctx);
+        let arg1 = self.resolve_box(op.arg(1).to_opref(), ctx);
+        let b0 = self.getintbound_b(&arg0, ctx);
+        let b1 = self.getintbound_b(&arg1, ctx);
         // rshift_zero_x: int_rshift(0, x) => 0
         if b0.is_constant() && b0.get_constant_int() == 0 {
             self.make_constant_int(op, 0, ctx);
@@ -1587,22 +1503,19 @@ impl OptIntBounds {
             self.make_constant_int(op, bound.get_constant_int(), ctx);
             return OptimizationResult::Remove;
         }
-        if let Some(arg0_lshift) = self.as_operation(arg0, OpCode::IntLshift, ctx) {
-            let inner_0 = ctx.get_box_replacement(arg0_lshift.arg(0).to_opref());
-            let inner_1 = ctx.get_box_replacement(arg0_lshift.arg(1).to_opref());
-            let b_inner_0 = self.getintbound_box(inner_0, ctx);
-            let b_inner_1 = self.getintbound_box(inner_1, ctx);
+        if let Some(arg0_lshift) = self.as_operation_b(&arg0, OpCode::IntLshift, ctx) {
+            let inner_0 = self.resolve_box(arg0_lshift.arg(0).to_opref(), ctx);
+            let inner_1 = self.resolve_box(arg0_lshift.arg(1).to_opref(), ctx);
+            let b_inner_0 = self.getintbound_b(&inner_0, ctx);
+            let b_inner_1 = self.getintbound_b(&inner_1, ctx);
             // rshift_lshift: int_rshift(int_lshift(x, y), y) => x
-            if autogen_eq(arg1, &b1, inner_1, &b_inner_1)
+            if autogen_eq_b(&arg1, &b1, &inner_1, &b_inner_1)
                 && b_inner_0.lshift_bound_cannot_overflow(&b_inner_1)
             {
                 let b_old = ctx
                     .ensure_box(op.pos.get())
                     .expect("body-namespace OpRef must have a BoxRef slot");
-                let b_inner = ctx
-                    .ensure_box(inner_0)
-                    .expect("body-namespace OpRef must have a BoxRef slot");
-                ctx.make_equal_to(&b_old, &b_inner);
+                ctx.make_equal_to(&b_old, &inner_0);
                 return OptimizationResult::Remove;
             }
         }
@@ -1611,16 +1524,13 @@ impl OptIntBounds {
             let b_old = ctx
                 .ensure_box(op.pos.get())
                 .expect("body-namespace OpRef must have a BoxRef slot");
-            let b_arg = ctx
-                .ensure_box(arg0)
-                .expect("body-namespace OpRef must have a BoxRef slot");
-            ctx.make_equal_to(&b_old, &b_arg);
+            ctx.make_equal_to(&b_old, &arg0);
             return OptimizationResult::Remove;
         }
-        if let Some(arg0_rshift) = self.as_operation(arg0, OpCode::IntRshift, ctx) {
-            let inner_0 = ctx.get_box_replacement(arg0_rshift.arg(0).to_opref());
-            let inner_1 = ctx.get_box_replacement(arg0_rshift.arg(1).to_opref());
-            let b_inner_1 = self.getintbound_box(inner_1, ctx);
+        if let Some(arg0_rshift) = self.as_operation_b(&arg0, OpCode::IntRshift, ctx) {
+            let inner_0 = self.resolve_box(arg0_rshift.arg(0).to_opref(), ctx);
+            let inner_1 = self.resolve_box(arg0_rshift.arg(1).to_opref(), ctx);
+            let b_inner_1 = self.getintbound_b(&inner_1, ctx);
             if b_inner_1.is_constant() && b1.is_constant() {
                 let c1 = b_inner_1.get_constant_int();
                 let c2 = b1.get_constant_int();
@@ -1629,7 +1539,7 @@ impl OptIntBounds {
                     let folded = c1.wrapping_add(c2).min(63);
                     if (0..64).contains(&folded) {
                         let const_ref = ctx.make_constant_int(folded);
-                        return replace_with(op, OpCode::IntRshift, &[inner_0, const_ref]);
+                        return replace_with(op, OpCode::IntRshift, &[inner_0.to_opref(), const_ref]);
                     }
                 }
             }
@@ -1640,8 +1550,8 @@ impl OptIntBounds {
     /// autogenintrules.py:1364-1399 optimize_INT_IS_TRUE — rules:
     /// is_true_bool / is_true_true / is_true_and_minint.
     fn optimize_int_is_true(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        let arg0 = ctx.get_box_replacement(op.arg(0).to_opref());
-        let b0 = self.getintbound_box(arg0, ctx);
+        let arg0 = self.resolve_box(op.arg(0).to_opref(), ctx);
+        let b0 = self.getintbound_b(&arg0, ctx);
         // is_true_true: int_is_true(x) => 1
         // when bound excludes 0: lower > 0, or upper < 0, or any tvalue bit set.
         if b0.lower > 0 || b0.upper < 0 || b0.tvalue != 0 {
@@ -1653,26 +1563,23 @@ impl OptIntBounds {
             let b_old = ctx
                 .ensure_box(op.pos.get())
                 .expect("body-namespace OpRef must have a BoxRef slot");
-            let b_arg = ctx
-                .ensure_box(arg0)
-                .expect("body-namespace OpRef must have a BoxRef slot");
-            ctx.make_equal_to(&b_old, &b_arg);
+            ctx.make_equal_to(&b_old, &arg0);
             return OptimizationResult::Remove;
         }
-        if let Some(arg0_and) = self.as_operation(arg0, OpCode::IntAnd, ctx) {
-            let inner_0 = ctx.get_box_replacement(arg0_and.arg(0).to_opref());
-            let inner_1 = ctx.get_box_replacement(arg0_and.arg(1).to_opref());
-            let b_inner_0 = self.getintbound_box(inner_0, ctx);
-            let b_inner_1 = self.getintbound_box(inner_1, ctx);
+        if let Some(arg0_and) = self.as_operation_b(&arg0, OpCode::IntAnd, ctx) {
+            let inner_0 = self.resolve_box(arg0_and.arg(0).to_opref(), ctx);
+            let inner_1 = self.resolve_box(arg0_and.arg(1).to_opref(), ctx);
+            let b_inner_0 = self.getintbound_b(&inner_0, ctx);
+            let b_inner_1 = self.getintbound_b(&inner_1, ctx);
             // is_true_and_minint: int_is_true(int_and(MININT, x)) => int_lt(x, 0)
             if b_inner_0.is_constant() && b_inner_0.get_constant_int() == i64::MIN {
                 let zero_ref = ctx.make_constant_int(0);
-                return replace_with(op, OpCode::IntLt, &[inner_1, zero_ref]);
+                return replace_with(op, OpCode::IntLt, &[inner_1.to_opref(), zero_ref]);
             }
             // is_true_and_minint: int_is_true(int_and(x, MININT)) => int_lt(x, 0)
             if b_inner_1.is_constant() && b_inner_1.get_constant_int() == i64::MIN {
                 let zero_ref = ctx.make_constant_int(0);
-                return replace_with(op, OpCode::IntLt, &[inner_0, zero_ref]);
+                return replace_with(op, OpCode::IntLt, &[inner_0.to_opref(), zero_ref]);
             }
         }
         OptimizationResult::PassOn
@@ -1716,10 +1623,10 @@ impl OptIntBounds {
     /// urshift_zero_x / urshift_x_zero / urshift_known_result /
     /// urshift_lshift_x_c_c.
     fn optimize_uint_rshift(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        let arg0 = ctx.get_box_replacement(op.arg(0).to_opref());
-        let arg1 = ctx.get_box_replacement(op.arg(1).to_opref());
-        let b0 = self.getintbound_box(arg0, ctx);
-        let b1 = self.getintbound_box(arg1, ctx);
+        let arg0 = self.resolve_box(op.arg(0).to_opref(), ctx);
+        let arg1 = self.resolve_box(op.arg(1).to_opref(), ctx);
+        let b0 = self.getintbound_b(&arg0, ctx);
+        let b1 = self.getintbound_b(&arg1, ctx);
         // urshift_zero_x: uint_rshift(0, x) => 0
         if b0.is_constant() && b0.get_constant_int() == 0 {
             self.make_constant_int(op, 0, ctx);
@@ -1736,16 +1643,13 @@ impl OptIntBounds {
             let b_old = ctx
                 .ensure_box(op.pos.get())
                 .expect("body-namespace OpRef must have a BoxRef slot");
-            let b_arg = ctx
-                .ensure_box(arg0)
-                .expect("body-namespace OpRef must have a BoxRef slot");
-            ctx.make_equal_to(&b_old, &b_arg);
+            ctx.make_equal_to(&b_old, &arg0);
             return OptimizationResult::Remove;
         }
-        if let Some(arg0_lshift) = self.as_operation(arg0, OpCode::IntLshift, ctx) {
-            let inner_0 = ctx.get_box_replacement(arg0_lshift.arg(0).to_opref());
-            let inner_1 = ctx.get_box_replacement(arg0_lshift.arg(1).to_opref());
-            let b_inner_1 = self.getintbound_box(inner_1, ctx);
+        if let Some(arg0_lshift) = self.as_operation_b(&arg0, OpCode::IntLshift, ctx) {
+            let inner_0 = self.resolve_box(arg0_lshift.arg(0).to_opref(), ctx);
+            let inner_1 = self.resolve_box(arg0_lshift.arg(1).to_opref(), ctx);
+            let b_inner_1 = self.getintbound_b(&inner_1, ctx);
             if b_inner_1.is_constant() && b1.is_constant() {
                 let c1 = b_inner_1.get_constant_int();
                 let c2 = b1.get_constant_int();
@@ -1754,7 +1658,7 @@ impl OptIntBounds {
                 if c2 == c1 && (0..64).contains(&c1) {
                     let mask = ((((-1i64) as u64) << c1) >> c1) as i64;
                     let const_ref = ctx.make_constant_int(mask);
-                    return replace_with(op, OpCode::IntAnd, &[inner_0, const_ref]);
+                    return replace_with(op, OpCode::IntAnd, &[inner_0.to_opref(), const_ref]);
                 }
             }
         }
@@ -2112,12 +2016,12 @@ impl OptIntBounds {
 
     /// intbounds.py:275-287 optimize_INT_SUB_OVF
     fn optimize_int_sub_ovf(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        let arg0 = ctx.get_box_replacement(op.arg(0).to_opref());
-        let arg1 = ctx.get_box_replacement(op.arg(1).to_opref());
+        let arg0 = self.resolve_box(op.arg(0).to_opref(), ctx);
+        let arg1 = self.resolve_box(op.arg(1).to_opref(), ctx);
         // intbounds.py:278-279: b0/b1 are computed before the same_box check.
-        let b0 = self.getintbound_box(arg0, ctx);
-        let b1 = self.getintbound_box(arg1, ctx);
-        if ctx.same_box(arg0, arg1) {
+        let b0 = self.getintbound_b(&arg0, ctx);
+        let b1 = self.getintbound_b(&arg1, ctx);
+        if arg0.same_box(&arg1) || arg0.to_opref() == arg1.to_opref() {
             // intbounds.py:280: arg0.same_box(arg1) → x - x = 0
             self.make_constant_int(op, 0, ctx);
             return OptimizationResult::Remove;
