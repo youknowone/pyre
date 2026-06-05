@@ -1989,12 +1989,70 @@ pub fn xor(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     }
 }
 
+/// Rich-comparison override dispatch for builtin-leaf subclasses, run before
+/// `compare`'s storage fast paths (which compare by value and ignore a
+/// subclass override).  Follows do_richcompare ordering — reflected-first
+/// when the right operand's type properly subtypes the left's and overrides
+/// the reflected comparison — but only ever invokes a genuine user override
+/// (`operand_overrides` gates each side).  The builtin comparison slots
+/// re-enter `compare`, so dispatching one here would recurse; instead, when
+/// no user override yields a result, `None` lets the caller fall through to
+/// the storage fast paths, which compute the same value comparison the
+/// builtin reflected slot would.
+unsafe fn try_compare_override(
+    a: PyObjectRef,
+    b: PyObjectRef,
+    dunder: &str,
+    rdunder: &str,
+) -> Result<Option<PyObjectRef>, PyError> {
+    let a_over = operand_overrides(a, dunder);
+    let b_over = operand_overrides(b, rdunder);
+    if !a_over && !b_over {
+        return Ok(None);
+    }
+    let reverse_first = b_over && should_try_reverse_first(a, b, rdunder);
+    if reverse_first {
+        if let Some(method) = lookup_type_special(b, rdunder) {
+            if let Some(result) = try_call_special(method, &[b, a])? {
+                return Ok(Some(result));
+            }
+        }
+    }
+    if a_over {
+        if let Some(method) = lookup_type_special(a, dunder) {
+            if let Some(result) = try_call_special(method, &[a, b])? {
+                return Ok(Some(result));
+            }
+        }
+    }
+    if b_over && !reverse_first {
+        if let Some(method) = lookup_type_special(b, rdunder) {
+            if let Some(result) = try_call_special(method, &[b, a])? {
+                return Ok(Some(result));
+            }
+        }
+    }
+    Ok(None)
+}
+
 /// Comparison operation dispatch.
 
 pub fn compare(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
     let a = unwrap_cell(a);
     let b = unwrap_cell(b);
     unsafe {
+        let cmp_dunder = match op {
+            CompareOp::Lt => "__lt__",
+            CompareOp::Le => "__le__",
+            CompareOp::Gt => "__gt__",
+            CompareOp::Ge => "__ge__",
+            CompareOp::Eq => "__eq__",
+            CompareOp::Ne => "__ne__",
+        };
+        let cmp_rdunder = reverse_dunder(cmp_dunder).unwrap_or(cmp_dunder);
+        if let Some(result) = try_compare_override(a, b, cmp_dunder, cmp_rdunder)? {
+            return Ok(result);
+        }
         if is_int_like(a) && is_int_like(b) {
             return match op {
                 CompareOp::Lt => int_lt(a, b),
