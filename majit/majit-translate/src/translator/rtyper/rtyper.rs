@@ -3284,8 +3284,26 @@ pub(crate) fn make_ll_isinstance(
     // inheritance range covers proper subclasses (maxid > minid).
     let has_subclasses = maxid > minid;
 
-    let nonnull_name = format!("ll_isinstance_const_nonnull_{minid}_{maxid}");
-    let const_name = format!("ll_isinstance_const_{minid}_{maxid}");
+    // Pyre-port: the cache key suffix `_<min>_<max>` is unique post-
+    // `normalizecalls.assign_inheritance_ids` only.  Reading the vtable
+    // before assignment would observe the default `Signed(0)` for both
+    // markers and collide every uninitialised class onto a single
+    // helper.  Pin the underlying container's stable identity (the
+    // `_struct._identity` set at allocation, preserved across `_ptr`
+    // clones) into the name so distinct classes never share a helper
+    // even if their range markers do.  Upstream keys this cache by
+    // `cls._obj` identity (`rclass.py:1149`); the container identity
+    // is the analog.
+    let class_identity: u64 = match &cls_ptr._obj0 {
+        Ok(Some(crate::translator::rtyper::lltypesystem::lltype::_ptr_obj::Struct(s))) => {
+            s._identity as u64
+        }
+        _ => cls_ptr._hashable_identity(),
+    };
+
+    let nonnull_name =
+        format!("ll_isinstance_const_nonnull_{class_identity}_{minid}_{maxid}");
+    let const_name = format!("ll_isinstance_const_{class_identity}_{minid}_{maxid}");
 
     // Mint the non-null helper first so the const helper's direct_call
     // can resolve it via the cache when its builder runs.

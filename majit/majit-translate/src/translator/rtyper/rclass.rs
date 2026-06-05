@@ -2980,9 +2980,14 @@ impl Repr for InstanceRepr {
         }
 
         // upstream variable case: `gendirectcall(ll_isinstance, v_obj, v_cls)`.
+        // `v_obj` was coerced through `instance_repr.lowleveltype()`,
+        // which is `OBJECTPTR` for the GC flavor and `NONGCOBJECTPTR`
+        // for raw-flavor instances — hard-coding `OBJECTPTR` would
+        // mint a helper signature that mismatches the actual argument
+        // type for non-GC paths.
         let helper = rtyper.lowlevel_helper_function(
             "ll_isinstance",
-            vec![OBJECTPTR.clone(), CLASSTYPE.clone()],
+            vec![instance_repr.lowleveltype().clone(), CLASSTYPE.clone()],
             LowLevelType::Bool,
         )?;
         hop.gendirectcall(&helper, vec![v_obj, v_cls])
