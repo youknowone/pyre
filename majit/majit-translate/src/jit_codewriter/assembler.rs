@@ -3274,12 +3274,21 @@ fn op_kind_to_opname(kind: &crate::model::OpKind) -> String {
         OpKind::IsVirtual { kind_char, .. } => {
             format!("{}_isvirtual", kind_char_to_name(*kind_char))
         }
-        // Mirrors flowspace/operation.rs OpKind::IsInstance opname:
-        // the rtyper dispatches the `"isinstance"` string at
-        // rtyper.rs:2035 to InstanceRepr::rtype_isinstance, which
-        // resolves it to the per-class `ll_isinstance_const_*` or the
-        // unspecialised `ll_isinstance` helper.
-        OpKind::IsInstance { .. } => "isinstance".into(),
+        // The rtyper at rtyper.rs:2035 dispatches the flowspace
+        // `"isinstance"` opname through `InstanceRepr::rtype_isinstance`,
+        // which lowers it into a direct_call to the per-class
+        // `ll_isinstance_const_*` or unspecialised `ll_isinstance`
+        // helper.  By the time the codewriter assembler runs every
+        // `OpKind::IsInstance` should already have been replaced with
+        // that direct_call, so reaching this arm signals an rtyper
+        // gap.  Fail loudly rather than emit an `"isinstance"` opname
+        // with no corresponding entry in `insns.rs::wellknown_bh_insns`.
+        OpKind::IsInstance { .. } => panic!(
+            "OpKind::IsInstance reached the JitCode assembler; the rtyper \
+             must lower isinstance to ll_isinstance* direct_call before \
+             codewriter emission (rtyper.rs:2035 / \
+             InstanceRepr::rtype_isinstance)"
+        ),
         OpKind::RecordKnownResult { result_kind, .. } => {
             format!("record_known_result_{result_kind}")
         }

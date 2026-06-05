@@ -1381,12 +1381,16 @@ fn binop_int_record(
 /// < c`) are preserved through the same decomposition.
 ///
 /// Operand layout `iii>i`: 3B sources + 1B dst (=4 operand bytes after
-/// the opcode).  Concrete-value propagation mirrors
-/// [`binop_int_record`]: every intermediate (`b4`, `b5`) and the final
-/// result get folded when their operand pair has a known
-/// `box_value(...)`.  This is what enables the `ConstInt(1)` fast path
-/// at line 590 — the walker sees the folded `b5` and emits `INT_EQ`
-/// instead of the generic `INT_SUB + UINT_LT` pair.
+/// the opcode).  Concrete-value propagation in [`execute_pure_binop_i`]
+/// runs in two layers: all-inline-Const operand pairs fold to a
+/// `const_int(...)` OpRef without recording (matching upstream
+/// `_all_constants` short-circuit at `pyjitpl.py:2654-2660`); the
+/// trailing concrete-tracked-pair path additionally stamps the recorded
+/// op via `set_opref_concrete`.  The `ConstInt(1)` fast path at
+/// `pyjitpl.py:590` keys on the inline-Const layer through
+/// `inline_const_to_value`, mirroring `isinstance(b5, ConstInt)` —
+/// box_value's concrete-stamp layer does not participate in that
+/// branch decision.
 fn int_between_record(
     code: &[u8],
     op: &DecodedOp,

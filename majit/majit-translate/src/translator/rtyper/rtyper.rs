@@ -3272,9 +3272,12 @@ fn lowlevel_isinstance_helper_graph(
 /// keying by vtable identity.
 ///
 /// Upstream's `number_with_subclasses()` (whether the inheritance
-/// range covers any proper subclass) is `maxid > minid` — when false
-/// the class is leaf-unique and a direct `ptr_eq(obj.typeptr, cls)`
-/// replaces the `int_between` range check.
+/// range covers any proper subclass) — under the eager-marker integer
+/// scheme (`normalizecalls.assign_inheritance_ids` line 325) a leaf
+/// class gets `maxid == minid + 1`, so the predicate is
+/// `maxid > minid + 1`. When false the class is leaf-unique and a
+/// direct `ptr_eq(obj.typeptr, cls)` replaces the `int_between` range
+/// check.
 pub(crate) fn make_ll_isinstance(
     rtyper: &RPythonTyper,
     cls_ptr: &_ptr,
