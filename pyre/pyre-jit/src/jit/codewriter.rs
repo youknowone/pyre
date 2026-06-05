@@ -10295,6 +10295,55 @@ impl CodeWriter {
                         }
                     }
                 }
+                // #305 block-entry resume markers.  A branch-target block's
+                // head PC (e.g. a goto_if_not / switch target block's first
+                // op) has no `-live-` of its own in the sparse canonical
+                // stream — the only markers near it are the branch's leading
+                // marker (BEFORE the branch decision) and the head op's own
+                // trailing canraise marker (AFTER it).  `derive_pc_live_
+                // indices_from_sparse` resolves a PC to the nearest `-live-`
+                // AT-OR-BEFORE its first insn, so the head PC resolves
+                // BACKWARD across the preceding goto_if_not to the branch's
+                // leading marker.  Resuming there re-runs the branch with the
+                // un-restorable scratch cond (pyre snapshots only PyFrame
+                // locals, not arm-local boxes) and takes the wrong arm — the
+                // taken-branch head returns the other branch's value (#305
+                // min305: f's `return 7` head resumes at the `goto_if_not`,
+                // returns 3).  The walker emits a per-PC leading marker before
+                // every PC's ops, so its head-PC resolution lands inside the
+                // block; mirror that by inserting a bare `-live-` after each
+                // Label whose body starts with a non-marker op.
+                // `compute_liveness` (run in `filter_liveness_in_place`)
+                // recomputes the marker's args via backward analysis, so the
+                // empty marker fills to the block-entry-live set.
+                {
+                    let mut new_insns: Vec<super::flatten::Insn> =
+                        Vec::with_capacity(spliced.insns.len() + 4);
+                    // `shift[old_pos]` = number of markers inserted strictly
+                    // before `old_pos`; a block-head op at `label_pos + 1`
+                    // gets the just-inserted marker counted, so it remaps
+                    // past its own block-entry marker.
+                    let mut shift: Vec<usize> = Vec::with_capacity(spliced.insns.len() + 1);
+                    let mut inserted = 0usize;
+                    for (i, insn) in spliced.insns.iter().enumerate() {
+                        shift.push(inserted);
+                        new_insns.push(insn.clone());
+                        if matches!(insn, super::flatten::Insn::Label(_)) {
+                            let next_blocks_marker = spliced.insns.get(i + 1).map_or(true, |n| {
+                                n.is_live() || matches!(n, super::flatten::Insn::Label(_))
+                            });
+                            if !next_blocks_marker {
+                                new_insns.push(super::flatten::Insn::live(Vec::new()));
+                                inserted += 1;
+                            }
+                        }
+                    }
+                    shift.push(inserted);
+                    for (_, pos) in spliced.pc_first_insn_pos.iter_mut() {
+                        *pos += shift[*pos];
+                    }
+                    spliced.insns = new_insns;
+                }
                 let first_live = spliced.insns.iter().position(|i| i.is_live());
                 let derived =
                     first_live.map(|_| derive_pc_live_indices_from_sparse(&spliced, num_instrs));
