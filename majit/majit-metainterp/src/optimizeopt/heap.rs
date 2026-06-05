@@ -86,7 +86,7 @@ enum DictArgKey {
 
 impl DictArgKey {
     fn from_arg(arg: OpRef, ctx: &OptContext) -> Self {
-        let resolved = ctx.get_box_replacement(arg);
+        let resolved = ctx.get_box_replacement(arg).to_opref();
         let cval = ctx
             .get_box_replacement_box(resolved)
             .and_then(|cb| cb.const_value());
@@ -317,8 +317,8 @@ impl CachedField {
                 // Only compare concrete values; Preamble entries have no
                 // known constant value.
                 if let (Some(v1), Some(v2)) = (e1.as_opref(), e2.as_opref()) {
-                    let v1r = ctx.get_box_replacement(v1);
-                    let v2r = ctx.get_box_replacement(v2);
+                    let v1r = ctx.get_box_replacement(v1).to_opref();
+                    let v2r = ctx.get_box_replacement(v2).to_opref();
                     let c1 = ctx
                         .get_box_replacement_box(v1r)
                         .and_then(|cb| cb.const_value());
@@ -344,8 +344,8 @@ impl CachedField {
             .as_ref()
             .map(OptHeap::field_slot_index)
             .unwrap_or(0);
-        let arg = ctx.get_box_replacement(op.arg(1).to_opref());
-        let struct_opref = ctx.get_box_replacement(op.arg(0).to_opref());
+        let arg = ctx.get_box_replacement(op.arg(1).to_opref()).to_opref();
+        let struct_opref = ctx.get_box_replacement(op.arg(0).to_opref()).to_opref();
         self.register_info(struct_opref);
         ctx.structinfo_setfield(op, descr_idx, arg);
     }
@@ -371,7 +371,7 @@ impl CachedField {
     ) {
         debug_assert!(self.lazy_set.is_none());
         for &cached in &self.cached_structs {
-            let structbox = ctx.get_box_replacement(cached);
+            let structbox = ctx.get_box_replacement(cached).to_opref();
             if structbox.is_none() {
                 continue;
             }
@@ -490,8 +490,12 @@ impl ArrayCachedItem {
         let len = items1.len().min(items2.len());
         for i in 0..len {
             // heap.py:289-290: value = get_box_replacement(content[index])
-            let v1 = items1[i].as_opref().map(|r| ctx.get_box_replacement(r));
-            let v2 = items2[i].as_opref().map(|r| ctx.get_box_replacement(r));
+            let v1 = items1[i]
+                .as_opref()
+                .map(|r| ctx.get_box_replacement(r).to_opref());
+            let v2 = items2[i]
+                .as_opref()
+                .map(|r| ctx.get_box_replacement(r).to_opref());
             // heap.py:291-292: if value is None: continue
             let (Some(v1), Some(v2)) = (v1, v2) else {
                 continue;
@@ -590,8 +594,8 @@ impl ArrayCachedItem {
 
     /// heap.py:252-255 ArrayCachedItem.put_field_back_to_info
     fn put_field_back_to_info(&mut self, op: &Op, ctx: &mut OptContext) {
-        let arg = ctx.get_box_replacement(op.arg(2).to_opref());
-        let struct_opref = ctx.get_box_replacement(op.arg(0).to_opref());
+        let arg = ctx.get_box_replacement(op.arg(2).to_opref()).to_opref();
+        let struct_opref = ctx.get_box_replacement(op.arg(0).to_opref()).to_opref();
         self.register_info(struct_opref);
         ctx.arrayinfo_setitem(op, self.index as usize, arg);
     }
@@ -605,7 +609,7 @@ impl ArrayCachedItem {
     ) {
         debug_assert!(self.lazy_set.is_none());
         for &cached in &self.cached_structs {
-            let arraybox = ctx.get_box_replacement(cached);
+            let arraybox = ctx.get_box_replacement(cached).to_opref();
             if arraybox.is_none() {
                 continue;
             }
@@ -711,7 +715,7 @@ impl ArrayCacheSubMap {
                 // heap.py:322: cached_arrayinfo is arrayinfo
                 //   and get_box_replacement(cached_index) is indexbox
                 if cached_arrayinfo == arrayinfo && ctx.box_is(cached_index, indexbox) {
-                    return Some(ctx.get_box_replacement(cached_result));
+                    return Some(ctx.get_box_replacement(cached_result).to_opref());
                 }
             }
         }
@@ -948,7 +952,7 @@ impl OptHeap {
     /// Canonicalizes array and index through get_box_replacement.
     fn arrayitem_key(op: &Op, ctx: &mut OptContext) -> Option<ArrayItemKey> {
         let descr = op.getdescr()?;
-        let array = ctx.get_box_replacement(op.arg(0).to_opref());
+        let array = ctx.get_box_replacement(op.arg(0).to_opref()).to_opref();
         let index_val = ctx
             .get_box_replacement_box(op.arg(1).to_opref())
             .and_then(|b| ctx.get_constant_int_box(&b))?;
@@ -1115,10 +1119,7 @@ impl OptHeap {
         // Non-virtual path: resolve forwarding and route after heap
         // optimizer.py:651-652 setarg loop parity.
         for i in 0..op.num_args() {
-            op.setarg(
-                i,
-                BoxRef::from_opref(ctx.get_box_replacement(op.arg(i).to_opref())),
-            );
+            op.setarg(i, ctx.get_box_replacement(op.arg(i).to_opref()));
         }
         // heap.py:136: emit_extra(op, emit=False) → next_optimization
         ctx.emit_extra(ctx.current_pass_idx, op.clone());
@@ -1262,10 +1263,7 @@ impl OptHeap {
             // then put_field_back_to_info restores the cache.
             // optimizer.py:651-652 setarg loop parity.
             for i in 0..op.num_args() {
-                op.setarg(
-                    i,
-                    BoxRef::from_opref(ctx.get_box_replacement(op.arg(i).to_opref())),
-                );
+                op.setarg(i, ctx.get_box_replacement(op.arg(i).to_opref()));
             }
             let final_value = op.arg(1);
             // heap.py:129,189-191: invalidate(descr) — purity self-gate
@@ -1318,10 +1316,7 @@ impl OptHeap {
 
             // optimizer.py:651-652 setarg loop parity.
             for i in 0..op.num_args() {
-                op.setarg(
-                    i,
-                    BoxRef::from_opref(ctx.get_box_replacement(op.arg(i).to_opref())),
-                );
+                op.setarg(i, ctx.get_box_replacement(op.arg(i).to_opref()));
             }
             let final_value = op.arg(2);
             let array_ref = op.arg(0);
@@ -1603,7 +1598,7 @@ impl OptHeap {
         let mut stack: Vec<OpRef> = op
             .getarglist()
             .iter()
-            .map(|arg| ctx.get_box_replacement(arg.to_opref()))
+            .map(|arg| ctx.get_box_replacement(arg.to_opref()).to_opref())
             .collect();
         while let Some(owner) = stack.pop() {
             if owners.contains(&owner) {
@@ -1611,7 +1606,10 @@ impl OptHeap {
             }
             owners.push(owner);
             if let Some(deps) = self.heapc_deps.get(&owner) {
-                stack.extend(deps.iter().map(|dep| ctx.get_box_replacement(*dep)));
+                stack.extend(
+                    deps.iter()
+                        .map(|dep| ctx.get_box_replacement(*dep).to_opref()),
+                );
             }
         }
         owners
@@ -1661,7 +1659,7 @@ impl OptHeap {
             .into_iter()
             .filter_map(|(field_idx, descr, cf)| match cf.lazy_set.as_ref() {
                 Some((obj, _)) => {
-                    let owner = ctx.get_box_replacement(*obj);
+                    let owner = ctx.get_box_replacement(*obj).to_opref();
                     if escaped_owners.contains(&owner) {
                         cf.lazy_set
                             .take()
@@ -1682,10 +1680,7 @@ impl OptHeap {
             }
             // optimizer.py:651-652 setarg loop parity.
             for i in 0..pending_op.num_args() {
-                pending_op.setarg(
-                    i,
-                    BoxRef::from_opref(ctx.get_box_replacement(pending_op.arg(i).to_opref())),
-                );
+                pending_op.setarg(i, ctx.get_box_replacement(pending_op.arg(i).to_opref()));
             }
             self.emit_postponed_if_referenced(&pending_op, heap_pass_idx, ctx);
             let final_value = pending_op.arg(1);
@@ -1705,11 +1700,16 @@ impl OptHeap {
             sort_array_index_entries_untranslated(&mut index_entries);
             for (index, cai) in index_entries {
                 if cai.lazy_set.as_ref().map_or(false, |(obj, _)| {
-                    let owner = ctx.get_box_replacement(*obj);
+                    let owner = ctx.get_box_replacement(*obj).to_opref();
                     escaped_owners.contains(&owner)
                 }) {
                     if let Some((obj, op)) = cai.lazy_set.take() {
-                        pending_arrays.push((*descr_idx, index, ctx.get_box_replacement(obj), op));
+                        pending_arrays.push((
+                            *descr_idx,
+                            index,
+                            ctx.get_box_replacement(obj).to_opref(),
+                            op,
+                        ));
                     }
                 }
             }
@@ -1717,10 +1717,7 @@ impl OptHeap {
         for (descr_idx, index, _obj, mut pending_op) in pending_arrays {
             // optimizer.py:651-652 setarg loop parity.
             for i in 0..pending_op.num_args() {
-                pending_op.setarg(
-                    i,
-                    BoxRef::from_opref(ctx.get_box_replacement(pending_op.arg(i).to_opref())),
-                );
+                pending_op.setarg(i, ctx.get_box_replacement(pending_op.arg(i).to_opref()));
             }
             self.invalidate_arrayitem_cache(descr_idx, index, ctx);
             self.emit_postponed_if_referenced(&pending_op, heap_pass_idx, ctx);
@@ -1930,7 +1927,7 @@ impl OptHeap {
         // Subsequent passes (intbounds, virtualstate) and the local
         // `setfield` mutation point all read/write that slot via the
         // canonical OpRef.
-        let obj = ctx.get_box_replacement(raw_obj);
+        let obj = ctx.get_box_replacement(raw_obj).to_opref();
         let _ = ctx.ensure_ptr_info_arg0(op);
         let mut force_lazy = false;
         if let Some(cf) = self.get_cached_field(&descr) {
@@ -2173,7 +2170,7 @@ impl OptHeap {
         let (raw_obj, _) = key;
         // heap.py:78 ensure_ptr_info_arg0 — install structinfo as a
         // side effect; canonical OpRef for the cache key.
-        let obj = ctx.get_box_replacement(raw_obj);
+        let obj = ctx.get_box_replacement(raw_obj).to_opref();
         let _ = ctx.ensure_ptr_info_arg0(op);
         // heapcache.py:224-230 _escape_from_write — pyre-specific
         // escape tracking outside the do_setfield contract.
@@ -2222,7 +2219,7 @@ impl OptHeap {
         ctx: &mut OptContext,
     ) -> OptimizationResult {
         // heap.py:80 arg1 = get_box_replacement(self._get_rhs_from_set_op(op))
-        let arg1 = ctx.get_box_replacement(Self::field_get_rhs(op));
+        let arg1 = ctx.get_box_replacement(Self::field_get_rhs(op)).to_opref();
         let field_idx = Self::field_slot_index(descr);
         // heap.py:81-83 if self.possible_aliasing(structinfo):
         //                  self.force_lazy_set(optheap, op.getdescr())
@@ -2247,7 +2244,7 @@ impl OptHeap {
         {
             match entry {
                 crate::optimizeopt::info::FieldEntry::Preamble(pop) => {
-                    let cached_seen = ctx.get_box_replacement(pop.op);
+                    let cached_seen = ctx.get_box_replacement(pop.op).to_opref();
                     // heap.py:88 not cached_field.same_box(arg1)
                     if ctx.same_box(cached_seen, arg1) {
                         let cached = ctx.force_op_from_preamble_op(&pop);
@@ -2259,7 +2256,7 @@ impl OptHeap {
                     }
                 }
                 crate::optimizeopt::info::FieldEntry::Value(cached) => {
-                    let cached_resolved = ctx.get_box_replacement(cached);
+                    let cached_resolved = ctx.get_box_replacement(cached).to_opref();
                     // heap.py:88 not cached_field.same_box(arg1)
                     if ctx.same_box(cached_resolved, arg1) {
                         // heap.py:100 self._lazy_set = None
@@ -2366,7 +2363,7 @@ impl OptHeap {
         ctx: &mut OptContext,
     ) -> OptimizationResult {
         // heap.py:80 arg1 = get_box_replacement(self._get_rhs_from_set_op(op))
-        let arg1 = ctx.get_box_replacement(Self::array_get_rhs(op));
+        let arg1 = ctx.get_box_replacement(Self::array_get_rhs(op)).to_opref();
         // heap.py:81-83 if self.possible_aliasing(structinfo):
         //                  self.force_lazy_set(optheap, op.getdescr())
         let needs_force = self
@@ -2388,7 +2385,7 @@ impl OptHeap {
         {
             match entry {
                 crate::optimizeopt::info::FieldEntry::Preamble(pop) => {
-                    let cached_seen = ctx.get_box_replacement(pop.op);
+                    let cached_seen = ctx.get_box_replacement(pop.op).to_opref();
                     // heap.py:88 not cached_field.same_box(arg1)
                     if ctx.same_box(cached_seen, arg1) {
                         let cached = ctx.force_op_from_preamble_op(&pop);
@@ -2401,7 +2398,7 @@ impl OptHeap {
                     }
                 }
                 crate::optimizeopt::info::FieldEntry::Value(cached) => {
-                    let cached_resolved = ctx.get_box_replacement(cached);
+                    let cached_resolved = ctx.get_box_replacement(cached).to_opref();
                     // heap.py:88 not cached_field.same_box(arg1)
                     if ctx.same_box(cached_resolved, arg1) {
                         // heap.py:100 self._lazy_set = None
@@ -2501,7 +2498,7 @@ impl OptHeap {
         // intermediate cache mutations can take &mut ctx without
         // tripping the borrow checker).
         let _ = ctx.ensure_ptr_info_arg0(op);
-        let array_ref = ctx.get_box_replacement(op.arg(0).to_opref());
+        let array_ref = ctx.get_box_replacement(op.arg(0).to_opref()).to_opref();
 
         // Try constant-index cache first.
         if let Some(key) = Self::arrayitem_key(op, ctx) {
@@ -2533,7 +2530,7 @@ impl OptHeap {
                         return OptimizationResult::Remove;
                     }
                     // heap.py:108 possible_aliasing_two_infos
-                    let lazy_obj_resolved = ctx.get_box_replacement(*lazy_obj);
+                    let lazy_obj_resolved = ctx.get_box_replacement(*lazy_obj).to_opref();
                     let cannot_alias = ArrayCachedItem::_cannot_alias_via_classes_or_lengths(
                         lazy_obj_resolved,
                         array,
@@ -2609,7 +2606,9 @@ impl OptHeap {
                     // can_cache=True: put_field_back_to_info
                     let final_value = lazy_op.arg(2);
                     let descr = lazy_op.getdescr();
-                    let lazy_obj = ctx.get_box_replacement(lazy_op.arg(0).to_opref());
+                    let lazy_obj = ctx
+                        .get_box_replacement(lazy_op.arg(0).to_opref())
+                        .to_opref();
                     self.cache_arrayitem(lazy_obj, descr_idx, const_index, descr.as_ref());
                     ctx.arrayinfo_setitem(&lazy_op, const_index as usize, final_value.to_opref());
                 }
@@ -2734,7 +2733,7 @@ impl OptHeap {
 
             let descr_idx = descr.index();
             let arrayinfo = array_ref;
-            let indexbox = ctx.get_box_replacement(op.arg(1).to_opref());
+            let indexbox = ctx.get_box_replacement(op.arg(1).to_opref()).to_opref();
             if let Some(submap) = self.get_cached_array_submap(descr_idx) {
                 if let Some(cached) = submap.lookup_cached(arrayinfo, indexbox, ctx) {
                     let b_old = ctx
@@ -2758,7 +2757,7 @@ impl OptHeap {
 
     fn optimize_setarrayitem(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         // heapcache.py:224-230 _escape_from_write parity:
-        let array_obj = ctx.get_box_replacement(op.arg(0).to_opref());
+        let array_obj = ctx.get_box_replacement(op.arg(0).to_opref()).to_opref();
         let stored_value = op.arg(2).to_opref();
         self.escape_from_write(array_obj, stored_value);
 
@@ -2775,9 +2774,9 @@ impl OptHeap {
                         .map(|b| ctx.getintbound_handle(&b).borrow().clone())
                         .expect("getintbound: operand must resolve to a BoxRef");
                     self.force_lazy_setarrayitem(&descr, Some(&indexb), false, ctx);
-                    let arrayinfo = ctx.get_box_replacement(op.arg(0).to_opref());
-                    let indexbox = ctx.get_box_replacement(op.arg(1).to_opref());
-                    let resbox = ctx.get_box_replacement(op.arg(2).to_opref());
+                    let arrayinfo = ctx.get_box_replacement(op.arg(0).to_opref()).to_opref();
+                    let indexbox = ctx.get_box_replacement(op.arg(1).to_opref()).to_opref();
+                    let resbox = ctx.get_box_replacement(op.arg(2).to_opref()).to_opref();
                     self.arrayitem_submap(&descr)
                         .cache_varindex_write(arrayinfo, indexbox, resbox);
                 }
@@ -3021,7 +3020,9 @@ impl OptHeap {
                             .get_box_replacement_box(pending_op.arg(1).to_opref())
                             .and_then(|b| ctx.get_constant_int_box(&b))
                         {
-                            let array = ctx.get_box_replacement(pending_op.arg(0).to_opref());
+                            let array = ctx
+                                .get_box_replacement(pending_op.arg(0).to_opref())
+                                .to_opref();
                             let cai = self.arrayitem_cache(&descr, index);
                             cai.lazy_set = Some((array, pending_op));
                         } else {
@@ -3029,7 +3030,9 @@ impl OptHeap {
                         }
                     } else {
                         let descr = pending_op.getdescr().unwrap().clone();
-                        let obj = ctx.get_box_replacement(pending_op.arg(0).to_opref());
+                        let obj = ctx
+                            .get_box_replacement(pending_op.arg(0).to_opref())
+                            .to_opref();
                         let cf = self.field_cache(&descr);
                         cf.lazy_set = Some((obj, pending_op));
                     }
@@ -3386,7 +3389,7 @@ impl Optimization for OptHeap {
                     continue;
                 };
                 // heap.py:844: box2 = box2.get_box_replacement()
-                let val = ctx.get_box_replacement(val);
+                let val = ctx.get_box_replacement(val).to_opref();
                 // heap.py:845: if box2.is_constant() or box2 in available_boxes:
                 if val.is_none() {
                     continue;
@@ -3415,7 +3418,7 @@ impl Optimization for OptHeap {
                 continue;
             }
             let field_idx = Self::field_slot_index(descr);
-            let resolved = ctx.get_box_replacement(*box1);
+            let resolved = ctx.get_box_replacement(*box1).to_opref();
             // heap.py:872-873: parent_descr = descr.get_parent_descr()
             //                  assert parent_descr.is_object()
             let parent_descr = descr.as_field_descr().and_then(|fd| fd.get_parent_descr());
@@ -3517,7 +3520,7 @@ impl Optimization for OptHeap {
                         continue;
                     };
                     // heap.py:865: box2 = box2.get_box_replacement()
-                    let val = ctx.get_box_replacement(val);
+                    let val = ctx.get_box_replacement(val).to_opref();
                     // heap.py:866: if box2.is_constant() or box2 in available_boxes:
                     if val.is_none() {
                         continue;
@@ -3550,7 +3553,7 @@ impl Optimization for OptHeap {
             if box1.is_none() || box2.is_none() {
                 continue;
             }
-            let resolved = ctx.get_box_replacement(*box1);
+            let resolved = ctx.get_box_replacement(*box1).to_opref();
             // heap.py:886-892:
             //     if box1.is_constant(): arrayinfo = info.ConstPtrInfo(box1)
             //     else:
@@ -4070,7 +4073,7 @@ mod tests {
 
         let result = heap.optimize_getfield(&op, &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
-        assert_eq!(ctx.get_box_replacement(pos2), p1);
+        assert_eq!(ctx.get_box_replacement(pos2).to_opref(), p1);
     }
 
     /// After consuming an imported short field, a cache invalidation followed
@@ -4108,7 +4111,7 @@ mod tests {
         op1.pos.set(pos2);
         let result1 = heap.optimize_getfield(&op1, &mut ctx);
         assert!(matches!(result1, OptimizationResult::Remove));
-        assert_eq!(ctx.get_box_replacement(pos2), p1);
+        assert_eq!(ctx.get_box_replacement(pos2).to_opref(), p1);
 
         // A call invalidates all mutable field caches.
         heap.clean_caches(&mut ctx);
@@ -4351,10 +4354,7 @@ mod tests {
             let mut resolved = op.clone();
             // optimizer.py:651-652 setarg loop parity.
             for i in 0..resolved.num_args() {
-                resolved.setarg(
-                    i,
-                    BoxRef::from_opref(ctx.get_box_replacement(resolved.arg(i).to_opref())),
-                );
+                resolved.setarg(i, ctx.get_box_replacement(resolved.arg(i).to_opref()));
             }
             match pass.propagate_forward(&resolved, &mut ctx) {
                 OptimizationResult::Emit(emitted) => {
@@ -4760,10 +4760,7 @@ mod tests {
             let mut resolved = op.clone();
             // optimizer.py:651-652 setarg loop parity.
             for i in 0..resolved.num_args() {
-                resolved.setarg(
-                    i,
-                    BoxRef::from_opref(ctx.get_box_replacement(resolved.arg(i).to_opref())),
-                );
+                resolved.setarg(i, ctx.get_box_replacement(resolved.arg(i).to_opref()));
             }
             match pass.propagate_forward(&resolved, &mut ctx) {
                 OptimizationResult::Emit(emitted) => {
@@ -5484,10 +5481,7 @@ mod tests {
             let mut resolved = op.clone();
             // optimizer.py:651-652 setarg loop parity.
             for i in 0..resolved.num_args() {
-                resolved.setarg(
-                    i,
-                    BoxRef::from_opref(ctx.get_box_replacement(resolved.arg(i).to_opref())),
-                );
+                resolved.setarg(i, ctx.get_box_replacement(resolved.arg(i).to_opref()));
             }
             match pass.propagate_forward(&resolved, &mut ctx) {
                 OptimizationResult::Emit(emitted) => {
@@ -6074,10 +6068,7 @@ mod tests {
             let mut resolved = op.clone();
             // optimizer.py:651-652 setarg loop parity.
             for i in 0..resolved.num_args() {
-                resolved.setarg(
-                    i,
-                    BoxRef::from_opref(ctx.get_box_replacement(resolved.arg(i).to_opref())),
-                );
+                resolved.setarg(i, ctx.get_box_replacement(resolved.arg(i).to_opref()));
             }
             match pass.propagate_forward(&resolved, &mut ctx) {
                 OptimizationResult::Emit(emitted) => {
@@ -6160,10 +6151,7 @@ mod tests {
             let mut resolved = op.clone();
             // optimizer.py:651-652 setarg loop parity.
             for i in 0..resolved.num_args() {
-                resolved.setarg(
-                    i,
-                    BoxRef::from_opref(ctx.get_box_replacement(resolved.arg(i).to_opref())),
-                );
+                resolved.setarg(i, ctx.get_box_replacement(resolved.arg(i).to_opref()));
             }
             match pass.propagate_forward(&resolved, &mut ctx) {
                 OptimizationResult::Emit(emitted) => {
@@ -6385,10 +6373,7 @@ mod tests {
             let mut resolved = op.clone();
             // optimizer.py:651-652 setarg loop parity.
             for i in 0..resolved.num_args() {
-                resolved.setarg(
-                    i,
-                    BoxRef::from_opref(ctx.get_box_replacement(resolved.arg(i).to_opref())),
-                );
+                resolved.setarg(i, ctx.get_box_replacement(resolved.arg(i).to_opref()));
             }
             match pass.propagate_forward(&resolved, &mut ctx) {
                 OptimizationResult::Emit(emitted) => {
@@ -6456,10 +6441,7 @@ mod tests {
             let mut resolved = op.clone();
             // optimizer.py:651-652 setarg loop parity.
             for i in 0..resolved.num_args() {
-                resolved.setarg(
-                    i,
-                    BoxRef::from_opref(ctx.get_box_replacement(resolved.arg(i).to_opref())),
-                );
+                resolved.setarg(i, ctx.get_box_replacement(resolved.arg(i).to_opref()));
             }
             match pass.propagate_forward(&resolved, &mut ctx) {
                 OptimizationResult::Emit(emitted) => {
@@ -6524,10 +6506,7 @@ mod tests {
             let mut resolved = op.clone();
             // optimizer.py:651-652 setarg loop parity.
             for i in 0..resolved.num_args() {
-                resolved.setarg(
-                    i,
-                    BoxRef::from_opref(ctx.get_box_replacement(resolved.arg(i).to_opref())),
-                );
+                resolved.setarg(i, ctx.get_box_replacement(resolved.arg(i).to_opref()));
             }
             match pass.propagate_forward(&resolved, &mut ctx) {
                 OptimizationResult::Emit(emitted) => {
@@ -6710,7 +6689,7 @@ mod tests {
         op2.setdescr(descr.clone());
         op2.pos.set(pos2);
         assert!(heap._optimize_call_dict_lookup(&op2, &mut ctx));
-        assert_eq!(ctx.get_box_replacement(pos2), pos1);
+        assert_eq!(ctx.get_box_replacement(pos2).to_opref(), pos1);
         assert!(heap.last_emitted_removed);
     }
 
@@ -6773,7 +6752,7 @@ mod tests {
         op2.setdescr(descr.clone());
         op2.pos.set(pos2);
         assert!(heap._optimize_call_dict_lookup(&op2, &mut ctx));
-        assert_eq!(ctx.get_box_replacement(pos2), pos1);
+        assert_eq!(ctx.get_box_replacement(pos2).to_opref(), pos1);
     }
 
     /// heap.py:390 parity: clean_caches clears cached_dict_reads.
@@ -6893,7 +6872,7 @@ mod tests {
         op2.setdescr(descr.clone());
         op2.pos.set(pos2);
         assert!(heap._optimize_call_dict_lookup(&op2, &mut ctx));
-        assert_eq!(ctx.get_box_replacement(pos2), pos1);
+        assert_eq!(ctx.get_box_replacement(pos2).to_opref(), pos1);
     }
 
     /// optimizer.py:84-87 parity: every Optimization.emit overwrite path —

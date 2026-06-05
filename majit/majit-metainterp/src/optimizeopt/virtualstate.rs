@@ -1048,7 +1048,7 @@ impl VirtualState {
                             .as_ref()
                             .and_then(|info| info.getfield(*field_idx))
                             .and_then(|e| e.as_opref())
-                            .map(|f| ctx.get_box_replacement(f))
+                            .map(|f| ctx.get_box_replacement(f).to_opref())
                             .unwrap_or(OpRef::NONE)
                     })
                     .collect();
@@ -1199,7 +1199,7 @@ impl VirtualState {
                 //             else:
                 //                 raise VirtualStatesCantMatch
                 //     boxes[self.position_in_notvirtuals] = box
-                let resolved = ctx.get_box_replacement(opref);
+                let resolved = ctx.get_box_replacement(opref).to_opref();
                 let forced = match ctx
                     .get_box_replacement_box(opref)
                     .as_ref()
@@ -1227,7 +1227,7 @@ impl VirtualState {
                      assigned by enum_top_level"
                 );
                 let slot = slot_i32 as usize;
-                let resolved_for_store = ctx.get_box_replacement(forced);
+                let resolved_for_store = ctx.get_box_replacement(forced).to_opref();
                 // virtualstate.py:417 NotVirtualStateInfo{Int,Ptr}: Box.type
                 // immutability. RPython dispatches `isinstance(self,
                 // NotVirtualStateInfoInt)` vs `NotVirtualStateInfoPtr` on a
@@ -2662,7 +2662,7 @@ fn export_single_value(
     // distinct field-side OpRefs that resolve to the same forwarded box
     // would each receive their own Rc, breaking the dedup invariant
     // `enum_forced_boxes` and RPython matching rely on.
-    let opref = ctx.get_box_replacement(opref);
+    let opref = ctx.get_box_replacement(opref).to_opref();
     // virtualstate.py:714-716: cache hit returns the cached state directly.
     if let Some(cached) = cache.finished.get(&opref) {
         return Rc::clone(cached);
@@ -3413,7 +3413,10 @@ mod tests {
         // forced allocation ref (which is what ctx.get_replacement
         // resolves the original virtual_ref to).
         assert_eq!(inputargs.len(), 1);
-        assert_eq!(inputargs[0], ctx.get_box_replacement(virtual_ref));
+        assert_eq!(
+            inputargs[0],
+            ctx.get_box_replacement(virtual_ref).to_opref()
+        );
         assert!(virtuals.is_empty());
     }
 }

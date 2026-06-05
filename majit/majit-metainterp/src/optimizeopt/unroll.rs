@@ -1171,14 +1171,14 @@ impl UnrollOptimizer {
                     // dispatcher, matching optimizer.py:306-319.
                     let resolved_jump_args: Vec<OpRef> = body_jump_args
                         .iter()
-                        .map(|&arg| final_ctx.get_box_replacement(arg))
+                        .map(|&arg| final_ctx.get_box_replacement(arg).to_opref())
                         .collect();
                     for &arg in &resolved_jump_args {
                         let _ = opt_p2.force_box_for_end_of_preamble(arg, &mut final_ctx);
                     }
                     let forced_jump_args: Vec<OpRef> = body_jump_args
                         .iter()
-                        .map(|&arg| final_ctx.get_box_replacement(arg))
+                        .map(|&arg| final_ctx.get_box_replacement(arg).to_opref())
                         .collect();
                     let current_vs = crate::optimizeopt::virtualstate::export_state(
                         &forced_jump_args,
@@ -1257,7 +1257,7 @@ impl UnrollOptimizer {
                                 continue;
                             }
                             visited_force.insert(arg);
-                            let resolved = final_ctx.get_box_replacement(arg);
+                            let resolved = final_ctx.get_box_replacement(arg).to_opref();
                             let needs_force = final_ctx
                                 .potential_extra_ops
                                 .iter()
@@ -1809,7 +1809,9 @@ impl UnrollOptimizer {
     /// unroll.py: _check_no_forwarding(lsts)
     /// Debug assertion: verify no OpRef in the lists has been forwarded.
     pub fn check_no_forwarding(ctx: &crate::optimizeopt::OptContext, oprefs: &[OpRef]) -> bool {
-        oprefs.iter().all(|&r| ctx.get_box_replacement(r) == r)
+        oprefs
+            .iter()
+            .all(|&r| ctx.get_box_replacement(r).to_opref() == r)
     }
 
     /// unroll.py: disable_retracing_if_max_retrace_guards(ops, target_token)
@@ -2822,7 +2824,7 @@ impl OptUnroll {
         let end_args: Vec<OpRef> = ctx.preamble_end_args.clone().unwrap_or_else(|| {
             original_label_args
                 .iter()
-                .map(|&a| ctx.get_box_replacement(a))
+                .map(|&a| ctx.get_box_replacement(a).to_opref())
                 .collect()
         });
         // unroll.py:457 `virtual_state = self.get_virtual_state(end_args)`
@@ -2901,7 +2903,7 @@ impl OptUnroll {
         // unroll.py:458 `end_args = [get_box_replacement(arg) for arg in end_args]`.
         let resolved_next_iteration_args: Vec<OpRef> = end_args
             .iter()
-            .map(|&a| ctx.get_box_replacement(a))
+            .map(|&a| ctx.get_box_replacement(a).to_opref())
             .collect();
         // Phase B B1: `produced_short_boxes` is derived from
         // `exported_short_boxes` lazily at the consumer site
@@ -3025,7 +3027,7 @@ impl OptUnroll {
             crate::optimizeopt::info::OpInfo,
         >,
     ) {
-        let resolved = ctx.get_box_replacement(arg);
+        let resolved = ctx.get_box_replacement(arg).to_opref();
         if infos.contains_key(&resolved) {
             // Also store under the original key so import_state can
             // find the info using the unresolved next_iteration_args key.
@@ -3212,7 +3214,7 @@ impl OptUnroll {
             .unwrap_or_else(|| crate::optimizeopt::virtualstate::export_state(jump_args, ctx));
         let mut args: Vec<OpRef> = jump_args
             .iter()
-            .map(|&a| ctx.get_box_replacement(a))
+            .map(|&a| ctx.get_box_replacement(a).to_opref())
             .collect();
 
         for (tt_idx, target_token) in target_tokens.iter_mut().enumerate() {
@@ -3343,7 +3345,7 @@ impl OptUnroll {
                     if force_boxes {
                         args = jump_args
                             .iter()
-                            .map(|&a| ctx.get_box_replacement(a))
+                            .map(|&a| ctx.get_box_replacement(a).to_opref())
                             .collect();
                         virtual_state = crate::optimizeopt::virtualstate::export_state(&args, ctx);
                     }
@@ -3691,7 +3693,7 @@ impl OptUnroll {
                         } else {
                             *mapping.get(jump_arg).expect("mapping missing jump_arg")
                         };
-                        ctx.get_box_replacement(mapped)
+                        ctx.get_box_replacement(mapped).to_opref()
                     })
                     .collect();
                 // unroll.py:419-421
@@ -3715,7 +3717,7 @@ impl OptUnroll {
             .iter()
             .map(|&jump_arg| {
                 let mapped = mapping.get(&jump_arg).copied().unwrap_or(jump_arg);
-                ctx.get_box_replacement(mapped)
+                ctx.get_box_replacement(mapped).to_opref()
             })
             .collect()
     }
@@ -3979,7 +3981,7 @@ impl OptUnroll {
         >,
     ) -> Option<crate::optimizeopt::info::OpInfo> {
         use crate::optimizeopt::info::{OpInfo, PtrInfo};
-        let resolved = ctx.get_box_replacement(opref);
+        let resolved = ctx.get_box_replacement(opref).to_opref();
         // unroll.py:432-443 `_expand_info` calls `self.optimizer.getinfo(arg)`
         // which itself runs `get_box_replacement` first, so a non-constant
         // OpRef forwarded to a Const surfaces the corresponding constant
@@ -4527,11 +4529,9 @@ fn assemble_peeled_trace_with_jump_args(
                 // Label carries the forwarded Box, but first fall-through
                 // only has the preamble source; pyre's flat OpRef model
                 // needs an explicit SameAs bridge before the Label.
-                if let Some(source) = preamble_defs
-                    .iter()
-                    .copied()
-                    .find(|&source| source != arg && ctx.get_box_replacement(source) == arg)
-                {
+                if let Some(source) = preamble_defs.iter().copied().find(|&source| {
+                    source != arg && ctx.get_box_replacement(source).to_opref() == arg
+                }) {
                     let tp = ctx
                         .opref_type(arg)
                         .or_else(|| ctx.opref_type(source))

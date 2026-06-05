@@ -1478,7 +1478,7 @@ impl ProducedShortOp {
         let result_opref = *result_map.get(&source)?;
         let _ = result_type;
         let descr_idx = descr.index();
-        let obj_resolved = ctx.get_box_replacement(obj);
+        let obj_resolved = ctx.get_box_replacement(obj).to_opref();
         // shortpreamble.py:66-68: if g.getarg(0) in exported_infos:
         //     setinfo_from_preamble(g.getarg(0), exported_infos[...])
         // Pass the Rc handle (unroll.py:61 identity preservation).
@@ -1595,7 +1595,7 @@ impl ProducedShortOp {
         // without relying on the use-before-def assembly adaptation.
         let result_opref = *result_map.get(&source)?;
         let _ = result_type;
-        let obj_resolved = ctx.get_box_replacement(obj);
+        let obj_resolved = ctx.get_box_replacement(obj).to_opref();
         // shortpreamble.py:68-71 applies to both getfield and
         // getarrayitem: if the base object has exported info, import it
         // before ensuring heap/array PtrInfo.

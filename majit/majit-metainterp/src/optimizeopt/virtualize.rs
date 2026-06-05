@@ -255,7 +255,9 @@ impl VirtualizableTracker {
         ) {
             return None;
         }
-        let frame_ref = ctx.get_box_replacement(producer.arg(0).to_opref());
+        let frame_ref = ctx
+            .get_box_replacement(producer.arg(0).to_opref())
+            .to_opref();
         let is_standard = ctx
             .get_box_replacement_box(producer.arg(0).to_opref())
             .map_or(false, |b| self.is_standard_ref(&b, ctx));
@@ -568,7 +570,7 @@ impl OptVirtualize {
         let struct_box = ctx
             .get_box_replacement_box(op.arg(0).to_opref())
             .or_else(|| ctx.ensure_box(op.arg(0).to_opref()));
-        let value_ref = ctx.get_box_replacement(op.arg(1).to_opref());
+        let value_ref = ctx.get_box_replacement(op.arg(1).to_opref()).to_opref();
         let setfield_descr_arc = op
             .getdescr()
             .expect("optimize_setfield_gc: field op without FieldDescr");
@@ -786,7 +788,7 @@ impl OptVirtualize {
             .get_box_replacement_box(op.arg(0).to_opref())
             .or_else(|| ctx.ensure_box(op.arg(0).to_opref()));
         let index_ref = op.arg(1).to_opref();
-        let value_ref = ctx.get_box_replacement(op.arg(2).to_opref());
+        let value_ref = ctx.get_box_replacement(op.arg(2).to_opref()).to_opref();
 
         if let Some(index) = ctx
             .get_box_replacement_box(index_ref)
@@ -957,7 +959,7 @@ impl OptVirtualize {
             .get_box_replacement_box(op.arg(0).to_opref())
             .or_else(|| ctx.ensure_box(op.arg(0).to_opref()));
         let index_ref = op.arg(1).to_opref();
-        let value_ref = ctx.get_box_replacement(op.arg(2).to_opref());
+        let value_ref = ctx.get_box_replacement(op.arg(2).to_opref()).to_opref();
         // `info.py:583-594 setinteriorfield_virtual` indexes the per-element
         // field list by `fielddescr.get_index()`.  Same shape as the GET
         // counterpart — strip the outer `InteriorFieldDescr` first.
@@ -1030,7 +1032,7 @@ impl OptVirtualize {
         if op.num_args() < 2 {
             return OptimizationResult::PassOn;
         }
-        let arg0 = ctx.get_box_replacement(op.arg(0).to_opref());
+        let arg0 = ctx.get_box_replacement(op.arg(0).to_opref()).to_opref();
         let Some(offset) = ctx
             .get_box_replacement_box(op.arg(1).to_opref())
             .and_then(|b| ctx.get_constant_int_box(&b))
@@ -1105,9 +1107,9 @@ impl OptVirtualize {
     }
 
     fn optimize_raw_store(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        let buf_ref = ctx.get_box_replacement(op.arg(0).to_opref());
+        let buf_ref = ctx.get_box_replacement(op.arg(0).to_opref()).to_opref();
         let offset_ref = op.arg(1).to_opref();
-        let value_ref = ctx.get_box_replacement(op.arg(2).to_opref());
+        let value_ref = ctx.get_box_replacement(op.arg(2).to_opref()).to_opref();
 
         if let Some(offset) = ctx
             .get_box_replacement_box(offset_ref)
@@ -1191,7 +1193,7 @@ impl OptVirtualize {
     /// `RawSlicePtrInfo.getitem_raw` (`info.py`) recursing through
     /// `self.parent.getitem_raw(self.offset + offset, ...)`.
     fn optimize_getarrayitem_raw(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        let array_ref = ctx.get_box_replacement(op.arg(0).to_opref());
+        let array_ref = ctx.get_box_replacement(op.arg(0).to_opref()).to_opref();
         let index_ref = op.arg(1).to_opref();
 
         if let Some(index) = ctx
@@ -1325,9 +1327,9 @@ impl OptVirtualize {
     ///     return self.emit(op)
     /// ```
     fn optimize_setarrayitem_raw(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        let array_ref = ctx.get_box_replacement(op.arg(0).to_opref());
+        let array_ref = ctx.get_box_replacement(op.arg(0).to_opref()).to_opref();
         let index_ref = op.arg(1).to_opref();
-        let value_ref = ctx.get_box_replacement(op.arg(2).to_opref());
+        let value_ref = ctx.get_box_replacement(op.arg(2).to_opref()).to_opref();
 
         if let Some(index) = ctx
             .get_box_replacement_box(index_ref)
@@ -1520,8 +1522,8 @@ impl OptVirtualize {
     /// here on the VirtualStruct half and the setfield_gc emit path is
     /// taken only when the vref has already escaped.
     fn optimize_virtual_ref_finish(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        let vref_ref = ctx.get_box_replacement(op.arg(0).to_opref());
-        let obj_ref = ctx.get_box_replacement(op.arg(1).to_opref());
+        let vref_ref = ctx.get_box_replacement(op.arg(0).to_opref()).to_opref();
+        let obj_ref = ctx.get_box_replacement(op.arg(1).to_opref()).to_opref();
 
         // virtualize.py:151: `CONST_NULL.same_constant(objbox)` — only a
         // Ref-typed null constant matches; a plain ConstInt(0) does not.
@@ -1673,7 +1675,7 @@ impl OptVirtualize {
             Some(r) if r != OpRef::NONE => r,
             _ => return false,
         };
-        let forced_resolved = ctx.get_box_replacement(forced_ref);
+        let forced_resolved = ctx.get_box_replacement(forced_ref).to_opref();
         let forced_box = ctx.get_box_replacement_box(forced_ref);
         let forced_ok = match forced_box.as_ref().and_then(|b| ctx.peek_ptr_info(b)) {
             Some(info) => !info.is_null(),
@@ -2682,7 +2684,8 @@ mod tests {
                 resolved_op.setarg(
                     i,
                     crate::r#box::BoxRef::from_opref(
-                        ctx.get_box_replacement(resolved_op.arg(i).to_opref()),
+                        ctx.get_box_replacement(resolved_op.arg(i).to_opref())
+                            .to_opref(),
                     ),
                 );
             }
@@ -2820,7 +2823,8 @@ mod tests {
                 resolved.setarg(
                     i,
                     crate::r#box::BoxRef::from_opref(
-                        ctx.get_box_replacement(resolved.arg(i).to_opref()),
+                        ctx.get_box_replacement(resolved.arg(i).to_opref())
+                            .to_opref(),
                     ),
                 );
             }
@@ -4499,7 +4503,8 @@ mod tests {
                 resolved_op.setarg(
                     i,
                     crate::r#box::BoxRef::from_opref(
-                        ctx.get_box_replacement(resolved_op.arg(i).to_opref()),
+                        ctx.get_box_replacement(resolved_op.arg(i).to_opref())
+                            .to_opref(),
                     ),
                 );
             }

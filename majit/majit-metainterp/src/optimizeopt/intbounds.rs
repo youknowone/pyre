@@ -778,7 +778,11 @@ impl OptIntBounds {
                 && b_inner_1.known_ge_const(0)
                 && b_inner_1.known_le_const(64)
             {
-                return replace_with(op, OpCode::IntLshift, &[arg1.to_opref(), inner_1.to_opref()]);
+                return replace_with(
+                    op,
+                    OpCode::IntLshift,
+                    &[arg1.to_opref(), inner_1.to_opref()],
+                );
             }
         }
         // Outer const on arg1: mul_minus_one / mul_pow2_const
@@ -805,7 +809,11 @@ impl OptIntBounds {
                 && b_inner_1.known_ge_const(0)
                 && b_inner_1.known_le_const(64)
             {
-                return replace_with(op, OpCode::IntLshift, &[arg0.to_opref(), inner_1.to_opref()]);
+                return replace_with(
+                    op,
+                    OpCode::IntLshift,
+                    &[arg0.to_opref(), inner_1.to_opref()],
+                );
             }
         }
         OptimizationResult::PassOn
@@ -923,11 +931,19 @@ impl OptIntBounds {
             }
             // and_absorb: int_and(int_and(a, b), a) => int_and(a, b)
             if autogen_eq_b(&arg1, &b1, &inner_0, &b_inner_0) {
-                return replace_with(op, OpCode::IntAnd, &[inner_0.to_opref(), inner_1.to_opref()]);
+                return replace_with(
+                    op,
+                    OpCode::IntAnd,
+                    &[inner_0.to_opref(), inner_1.to_opref()],
+                );
             }
             // and_absorb: int_and(int_and(b, a), a) => int_and(a, b)
             if autogen_eq_b(&arg1, &b1, &inner_1, &b_inner_1) {
-                return replace_with(op, OpCode::IntAnd, &[inner_1.to_opref(), inner_0.to_opref()]);
+                return replace_with(
+                    op,
+                    OpCode::IntAnd,
+                    &[inner_1.to_opref(), inner_0.to_opref()],
+                );
             }
         } else if let Some(arg0_or) = self.as_operation_b(&arg0, OpCode::IntOr, ctx) {
             let inner_0 = self.resolve_box(arg0_or.arg(0).to_opref(), ctx);
@@ -1063,13 +1079,21 @@ impl OptIntBounds {
                         if autogen_eq_b(&arg1_1, &b_arg1_1, &arg0_1, &b_arg0_1) {
                             let folded = c_arg0_0 | b_arg1_0.get_constant_int();
                             let const_ref = ctx.make_constant_int(folded);
-                            return replace_with(op, OpCode::IntAnd, &[arg0_1.to_opref(), const_ref]);
+                            return replace_with(
+                                op,
+                                OpCode::IntAnd,
+                                &[arg0_1.to_opref(), const_ref],
+                            );
                         }
                         // dead twin per autogenintrules.py:668-673
                         if autogen_eq_b(&arg1_1, &b_arg1_1, &arg0_1, &b_arg0_1) {
                             let folded = b_arg1_0.get_constant_int() | c_arg0_0;
                             let const_ref = ctx.make_constant_int(folded);
-                            return replace_with(op, OpCode::IntAnd, &[arg0_1.to_opref(), const_ref]);
+                            return replace_with(
+                                op,
+                                OpCode::IntAnd,
+                                &[arg0_1.to_opref(), const_ref],
+                            );
                         }
                     }
                     if b_arg1_1.is_constant() {
@@ -1077,13 +1101,21 @@ impl OptIntBounds {
                         if autogen_eq_b(&arg1_0, &b_arg1_0, &arg0_1, &b_arg0_1) {
                             let folded = b_arg1_1.get_constant_int() | c_arg0_0;
                             let const_ref = ctx.make_constant_int(folded);
-                            return replace_with(op, OpCode::IntAnd, &[arg0_1.to_opref(), const_ref]);
+                            return replace_with(
+                                op,
+                                OpCode::IntAnd,
+                                &[arg0_1.to_opref(), const_ref],
+                            );
                         }
                         // dead twin per autogenintrules.py:684-689
                         if autogen_eq_b(&arg1_0, &b_arg1_0, &arg0_1, &b_arg0_1) {
                             let folded = c_arg0_0 | b_arg1_1.get_constant_int();
                             let const_ref = ctx.make_constant_int(folded);
-                            return replace_with(op, OpCode::IntAnd, &[arg0_1.to_opref(), const_ref]);
+                            return replace_with(
+                                op,
+                                OpCode::IntAnd,
+                                &[arg0_1.to_opref(), const_ref],
+                            );
                         }
                     }
                 }
@@ -1100,13 +1132,21 @@ impl OptIntBounds {
                         if autogen_eq_b(&arg1_1, &b_arg1_1, &arg0_0, &b_arg0_0) {
                             let folded = c_arg0_1 | b_arg1_0.get_constant_int();
                             let const_ref = ctx.make_constant_int(folded);
-                            return replace_with(op, OpCode::IntAnd, &[arg0_0.to_opref(), const_ref]);
+                            return replace_with(
+                                op,
+                                OpCode::IntAnd,
+                                &[arg0_0.to_opref(), const_ref],
+                            );
                         }
                         // dead twin per autogenintrules.py:708-713
                         if autogen_eq_b(&arg1_1, &b_arg1_1, &arg0_0, &b_arg0_0) {
                             let folded = b_arg1_0.get_constant_int() | c_arg0_1;
                             let const_ref = ctx.make_constant_int(folded);
-                            return replace_with(op, OpCode::IntAnd, &[arg0_0.to_opref(), const_ref]);
+                            return replace_with(
+                                op,
+                                OpCode::IntAnd,
+                                &[arg0_0.to_opref(), const_ref],
+                            );
                         }
                     }
                     if b_arg1_1.is_constant() {
@@ -1114,13 +1154,21 @@ impl OptIntBounds {
                         if autogen_eq_b(&arg1_0, &b_arg1_0, &arg0_0, &b_arg0_0) {
                             let folded = c_arg0_1 | b_arg1_1.get_constant_int();
                             let const_ref = ctx.make_constant_int(folded);
-                            return replace_with(op, OpCode::IntAnd, &[arg0_0.to_opref(), const_ref]);
+                            return replace_with(
+                                op,
+                                OpCode::IntAnd,
+                                &[arg0_0.to_opref(), const_ref],
+                            );
                         }
                         // dead twin per autogenintrules.py:724-729
                         if autogen_eq_b(&arg1_0, &b_arg1_0, &arg0_0, &b_arg0_0) {
                             let folded = b_arg1_1.get_constant_int() | c_arg0_1;
                             let const_ref = ctx.make_constant_int(folded);
-                            return replace_with(op, OpCode::IntAnd, &[arg0_0.to_opref(), const_ref]);
+                            return replace_with(
+                                op,
+                                OpCode::IntAnd,
+                                &[arg0_0.to_opref(), const_ref],
+                            );
                         }
                     }
                 }
@@ -1390,7 +1438,8 @@ impl OptIntBounds {
                             return replace_with(op, OpCode::IntAnd, &[r0.to_opref(), const_ref]);
                         }
                     }
-                } else if let Some(urshift) = self.as_operation_b(&inner_1, OpCode::UintRshift, ctx) {
+                } else if let Some(urshift) = self.as_operation_b(&inner_1, OpCode::UintRshift, ctx)
+                {
                     let r0 = self.resolve_box(urshift.arg(0).to_opref(), ctx);
                     let r1 = self.resolve_box(urshift.arg(1).to_opref(), ctx);
                     let b_r1 = self.getintbound_b(&r1, ctx);
@@ -1448,7 +1497,11 @@ impl OptIntBounds {
                     let folded = c1.wrapping_add(c2);
                     if folded < 64 {
                         let const_ref = ctx.make_constant_int(folded);
-                        return replace_with(op, OpCode::IntLshift, &[inner_0.to_opref(), const_ref]);
+                        return replace_with(
+                            op,
+                            OpCode::IntLshift,
+                            &[inner_0.to_opref(), const_ref],
+                        );
                     }
                 }
             }
@@ -1539,7 +1592,11 @@ impl OptIntBounds {
                     let folded = c1.wrapping_add(c2).min(63);
                     if (0..64).contains(&folded) {
                         let const_ref = ctx.make_constant_int(folded);
-                        return replace_with(op, OpCode::IntRshift, &[inner_0.to_opref(), const_ref]);
+                        return replace_with(
+                            op,
+                            OpCode::IntRshift,
+                            &[inner_0.to_opref(), const_ref],
+                        );
                     }
                 }
             }
@@ -1705,8 +1762,18 @@ impl OptIntBounds {
         // intbounds.py:125-127:
         //   self.optimizer.pure_from_args2(rop.INT_SUB, op, arg1, arg0)
         //   self.optimizer.pure_from_args2(rop.INT_SUB, op, arg0, arg1)
-        ctx.register_pure_from_args2(OpCode::IntSub, arg0.to_opref(), op.pos.get(), arg1.to_opref());
-        ctx.register_pure_from_args2(OpCode::IntSub, arg1.to_opref(), op.pos.get(), arg0.to_opref());
+        ctx.register_pure_from_args2(
+            OpCode::IntSub,
+            arg0.to_opref(),
+            op.pos.get(),
+            arg1.to_opref(),
+        );
+        ctx.register_pure_from_args2(
+            OpCode::IntSub,
+            arg1.to_opref(),
+            op.pos.get(),
+            arg0.to_opref(),
+        );
         // intbounds.py:128-142: pick the constant arg, fall back to commutative
         // swap so `arg1` ends up holding the non-const operand.
         // intbounds.py:128/134 `isinstance(argN, ConstInt)` — raw Const
@@ -1747,8 +1814,18 @@ impl OptIntBounds {
         let b = b0.sub_bound(&b1);
         self.intersect_bound(op.pos.get(), &b, ctx);
         // Synthesis: INT_SUB(a,b)=res → INT_ADD(res,b)=a, INT_SUB(a,res)=b
-        ctx.register_pure_from_args2(OpCode::IntAdd, arg0.to_opref(), op.pos.get(), arg1.to_opref());
-        ctx.register_pure_from_args2(OpCode::IntSub, arg1.to_opref(), arg0.to_opref(), op.pos.get());
+        ctx.register_pure_from_args2(
+            OpCode::IntAdd,
+            arg0.to_opref(),
+            op.pos.get(),
+            arg1.to_opref(),
+        );
+        ctx.register_pure_from_args2(
+            OpCode::IntSub,
+            arg1.to_opref(),
+            arg0.to_opref(),
+            op.pos.get(),
+        );
         // intbounds.py: constant inversion for INT_SUB — `isinstance(arg1,
         // ConstInt)` raw Const check (no IntBound synthesis).
         if let Some(Value::Int(c1)) = arg1.const_value() {
@@ -1788,8 +1865,18 @@ impl OptIntBounds {
             // intbounds.py:66-69:
             //   pure_from_args2(rop.INT_ADD, arg0, arg1, op)
             //   pure_from_args2(rop.INT_XOR, arg0, arg1, op)
-            ctx.register_pure_from_args2(OpCode::IntAdd, op.pos.get(), arg0.to_opref(), arg1.to_opref());
-            ctx.register_pure_from_args2(OpCode::IntXor, op.pos.get(), arg0.to_opref(), arg1.to_opref());
+            ctx.register_pure_from_args2(
+                OpCode::IntAdd,
+                op.pos.get(),
+                arg0.to_opref(),
+                arg1.to_opref(),
+            );
+            ctx.register_pure_from_args2(
+                OpCode::IntXor,
+                op.pos.get(),
+                arg0.to_opref(),
+                arg1.to_opref(),
+            );
         }
         let b = b0.or_bound(&b1);
         self.intersect_bound(op.pos.get(), &b, ctx);
@@ -1806,8 +1893,18 @@ impl OptIntBounds {
             // intbounds.py:79-82:
             //   pure_from_args2(rop.INT_ADD, arg0, arg1, op)
             //   pure_from_args2(rop.INT_OR, arg0, arg1, op)
-            ctx.register_pure_from_args2(OpCode::IntAdd, op.pos.get(), arg0.to_opref(), arg1.to_opref());
-            ctx.register_pure_from_args2(OpCode::IntOr, op.pos.get(), arg0.to_opref(), arg1.to_opref());
+            ctx.register_pure_from_args2(
+                OpCode::IntAdd,
+                op.pos.get(),
+                arg0.to_opref(),
+                arg1.to_opref(),
+            );
+            ctx.register_pure_from_args2(
+                OpCode::IntOr,
+                op.pos.get(),
+                arg0.to_opref(),
+                arg1.to_opref(),
+            );
         }
         let b = b0.xor_bound(&b1);
         self.intersect_bound(op.pos.get(), &b, ctx);
@@ -1824,7 +1921,12 @@ impl OptIntBounds {
         self.intersect_bound(op.pos.get(), &b, ctx);
         // intbounds.py:185: only synthesize reverse if lshift cannot overflow
         if b0.lshift_bound_cannot_overflow(&b1) {
-            ctx.register_pure_from_args2(OpCode::IntRshift, arg0.to_opref(), op.pos.get(), arg1.to_opref());
+            ctx.register_pure_from_args2(
+                OpCode::IntRshift,
+                arg0.to_opref(),
+                op.pos.get(),
+                arg1.to_opref(),
+            );
         }
     }
 
@@ -3339,7 +3441,9 @@ mod tests {
                 resolved_op.setarg(
                     i,
                     crate::r#box::BoxRef::from_opref(
-                        ctx.get_box_replacement_box(a).map(|b| b.to_opref()).unwrap_or(a),
+                        ctx.get_box_replacement_box(a)
+                            .map(|b| b.to_opref())
+                            .unwrap_or(a),
                     ),
                 );
             }
@@ -3368,12 +3472,18 @@ mod tests {
                 match emitted.opcode {
                     OpCode::GuardTrue => {
                         let a = emitted.arg(0).to_opref();
-                        let cond = ctx.get_box_replacement_box(a).map(|b| b.to_opref()).unwrap_or(a);
+                        let cond = ctx
+                            .get_box_replacement_box(a)
+                            .map(|b| b.to_opref())
+                            .unwrap_or(a);
                         ctx.make_constant(cond, majit_ir::Value::Int(1));
                     }
                     OpCode::GuardFalse => {
                         let a = emitted.arg(0).to_opref();
-                        let cond = ctx.get_box_replacement_box(a).map(|b| b.to_opref()).unwrap_or(a);
+                        let cond = ctx
+                            .get_box_replacement_box(a)
+                            .map(|b| b.to_opref())
+                            .unwrap_or(a);
                         ctx.make_constant(cond, majit_ir::Value::Int(0));
                     }
                     _ => {}

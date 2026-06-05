@@ -817,10 +817,7 @@ fn force_box_impl(
 
     fn force_child(orig_ref: OpRef, ctx: &mut crate::optimizeopt::OptContext) -> OpRef {
         let value_box = ctx.get_box_replacement_box(orig_ref);
-        let value_ref = value_box
-            .as_ref()
-            .map(|b| b.to_opref())
-            .unwrap_or(orig_ref);
+        let value_ref = value_box.as_ref().map(|b| b.to_opref()).unwrap_or(orig_ref);
         if value_box.as_ref().map_or(false, |b| ctx.is_virtual(b)) {
             let value_box = value_box.expect("recorder-populated");
             let mut info = ctx.take_ptr_info(&value_box).unwrap();

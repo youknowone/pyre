@@ -1862,8 +1862,8 @@ impl OptRewrite {
         }
 
         // rewrite.py:528-531: null checks — fall back to OpRef for downstream
-        let arg0 = ctx.get_box_replacement(op.arg(0).to_opref());
-        let arg1 = ctx.get_box_replacement(op.arg(1).to_opref());
+        let arg0 = ctx.get_box_replacement(op.arg(0).to_opref()).to_opref();
+        let arg1 = ctx.get_box_replacement(op.arg(1).to_opref()).to_opref();
         if info1.as_ref().is_some_and(|i| i.is_null()) {
             return self.optimize_nullness(op, arg0, expect_isnot, ctx);
         }
@@ -2329,7 +2329,7 @@ impl OptRewrite {
         // rewrite.py postprocess_GUARD_VALUE:
         //   box = get_box_replacement(op.getarg(0))
         //   self.make_constant(box, op.getarg(1))
-        let box_ref = ctx.get_box_replacement(arg0.to_opref());
+        let box_ref = ctx.get_box_replacement(arg0.to_opref()).to_opref();
         let v = ctx
             .get_box_replacement_box(arg1.to_opref())
             .and_then(|b| b.const_value())
@@ -2350,7 +2350,7 @@ impl OptRewrite {
         // EnsuredPtrInfo borrow; downstream lookups re-acquire via
         // `getptrinfo` / `get_ptr_info` against the resolved OpRef.
         let _ = ctx.ensure_ptr_info_arg0(op);
-        let obj = ctx.get_box_replacement(op.arg(0).to_opref());
+        let obj = ctx.get_box_replacement(op.arg(0).to_opref()).to_opref();
         // rewrite.py:397-407: ensure_ptr_info_arg0 → info.py:880 getptrinfo.
         // `getptrinfo(ConstPtr)` returns a synthesized ConstPtrInfo, so a
         // constant Ref arg0 is handled uniformly with virtual / instance
@@ -2651,7 +2651,9 @@ impl OptRewrite {
                         .and_then(|cb| cb.const_int())
                         == Some(1)
                 {
-                    let shiftvar = ctx.get_box_replacement(shift_op.arg(1).to_opref());
+                    let shiftvar = ctx
+                        .get_box_replacement(shift_op.arg(1).to_opref())
+                        .to_opref();
                     let shiftbound = ctx
                         .ensure_box(shiftvar)
                         .map(|b| ctx.getintbound_handle(&b).borrow().clone())
@@ -2753,8 +2755,8 @@ impl OptRewrite {
             return true;
         }
 
-        let source_box = ctx.get_box_replacement(source_box);
-        let dest_box = ctx.get_box_replacement(dest_box);
+        let source_box = ctx.get_box_replacement(source_box).to_opref();
+        let dest_box = ctx.get_box_replacement(dest_box).to_opref();
         let source_is_virtual = ctx
             .get_box_replacement_box(source_box)
             .as_ref()
@@ -3269,7 +3271,7 @@ impl Optimization for OptRewrite {
                 //         if opinfo.is_nonnull(): return
                 //         elif opinfo.is_null(): raise InvalidLoop(...)
                 //     return self.emit(op)
-                let obj = ctx.get_box_replacement(op.arg(0).to_opref());
+                let obj = ctx.get_box_replacement(op.arg(0).to_opref()).to_opref();
                 let obj_box = ctx.get_box_replacement_box(op.arg(0).to_opref());
                 if let Some(info) = obj_box.as_ref().and_then(|b| ctx.getptrinfo(b)) {
                     if info.is_nonnull() {
@@ -3299,7 +3301,7 @@ impl Optimization for OptRewrite {
                 //         if info.is_null(): return
                 //         elif info.is_nonnull(): raise InvalidLoop(...)
                 //     return self.emit(op)
-                let obj = ctx.get_box_replacement(op.arg(0).to_opref());
+                let obj = ctx.get_box_replacement(op.arg(0).to_opref()).to_opref();
                 let obj_box = ctx.get_box_replacement_box(op.arg(0).to_opref());
                 if let Some(info) = obj_box.as_ref().and_then(|b| ctx.getptrinfo(b)) {
                     if info.is_null() {
@@ -3446,8 +3448,8 @@ impl Optimization for OptRewrite {
                     //     arg0 = get_box_replacement(op.getarg(0))
                     //     arg1 = get_box_replacement(op.getarg(1))
                     //     self.pure_from_args2(rop.INSTANCE_PTR_EQ, arg1, arg0, op)
-                    let arg0 = ctx.get_box_replacement(op.arg(0).to_opref());
-                    let arg1 = ctx.get_box_replacement(op.arg(1).to_opref());
+                    let arg0 = ctx.get_box_replacement(op.arg(0).to_opref()).to_opref();
+                    let arg1 = ctx.get_box_replacement(op.arg(1).to_opref()).to_opref();
                     ctx.register_pure_from_args2(OpCode::InstancePtrEq, op.pos.get(), arg1, arg0);
                 }
                 return self.optimize_oois_ooisnot(op, false, instance, ctx);
@@ -3456,8 +3458,8 @@ impl Optimization for OptRewrite {
                 let instance = matches!(op.opcode, OpCode::InstancePtrNe);
                 if instance {
                     // rewrite.py:568-571 optimize_INSTANCE_PTR_NE: same swap.
-                    let arg0 = ctx.get_box_replacement(op.arg(0).to_opref());
-                    let arg1 = ctx.get_box_replacement(op.arg(1).to_opref());
+                    let arg0 = ctx.get_box_replacement(op.arg(0).to_opref()).to_opref();
+                    let arg1 = ctx.get_box_replacement(op.arg(1).to_opref()).to_opref();
                     ctx.register_pure_from_args2(OpCode::InstancePtrNe, op.pos.get(), arg1, arg0);
                 }
                 return self.optimize_oois_ooisnot(op, true, instance, ctx);
@@ -3616,7 +3618,7 @@ impl Optimization for OptRewrite {
                             // so `take_preamble_forwarded_opinfo` reads the
                             // info seeded at result_opref's slot per the
                             // dual-slot rule (mod.rs:1817 replay_pos).
-                            let replay_pos = ctx.get_box_replacement(source);
+                            let replay_pos = ctx.get_box_replacement(source).to_opref();
                             let mut replay =
                                 Op::new(OpCode::SameAsI, &[BoxRef::from_opref(source)]);
                             replay.pos.set(replay_pos);
@@ -3923,10 +3925,7 @@ mod tests {
             let mut resolved = op.clone();
             // optimizer.py:651-652 setarg loop parity.
             for i in 0..resolved.num_args() {
-                resolved.setarg(
-                    i,
-                    BoxRef::from_opref(ctx.get_box_replacement(resolved.arg(i).to_opref())),
-                );
+                resolved.setarg(i, ctx.get_box_replacement(resolved.arg(i).to_opref()));
             }
 
             match pass.propagate_forward(&resolved, &mut ctx) {
@@ -3988,7 +3987,7 @@ mod tests {
             "{opcode:?} with const {const_val} at pos {const_pos} should Remove"
         );
         assert_eq!(
-            ctx.get_box_replacement(OpRef::int_op(2)),
+            ctx.get_box_replacement(OpRef::int_op(2)).to_opref(),
             OpRef::int_op(expected_forward_to),
             "{opcode:?} should forward to {expected_forward_to}"
         );
@@ -4472,7 +4471,10 @@ mod tests {
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[1], &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
-        assert_eq!(ctx.get_box_replacement(OpRef::int_op(1)), OpRef::int_op(0));
+        assert_eq!(
+            ctx.get_box_replacement(OpRef::int_op(1)).to_opref(),
+            OpRef::int_op(0)
+        );
     }
 
     // ── Integration test: full optimizer with OptRewrite ──
@@ -4509,10 +4511,7 @@ mod tests {
             let mut resolved = op.clone();
             // optimizer.py:651-652 setarg loop parity.
             for i in 0..resolved.num_args() {
-                resolved.setarg(
-                    i,
-                    BoxRef::from_opref(ctx.get_box_replacement(resolved.arg(i).to_opref())),
-                );
+                resolved.setarg(i, ctx.get_box_replacement(resolved.arg(i).to_opref()));
             }
             match pass.propagate_forward(&resolved, &mut ctx) {
                 OptimizationResult::Emit(emitted) => {
@@ -4543,7 +4542,10 @@ mod tests {
         // the IntAdd was removed and the result is forwarded.
         // op0 is emitted, op1 is emitted (just a constant), op2 is removed.
         // After forwarding, any reference to op2 should resolve to op0.
-        assert_eq!(ctx.get_box_replacement(OpRef::int_op(2)), OpRef::int_op(0));
+        assert_eq!(
+            ctx.get_box_replacement(OpRef::int_op(2)).to_opref(),
+            OpRef::int_op(0)
+        );
     }
 
     #[test]
@@ -4570,10 +4572,7 @@ mod tests {
                 let mut resolved = op.clone();
                 // optimizer.py:651-652 setarg loop parity.
                 for i in 0..resolved.num_args() {
-                    resolved.setarg(
-                        i,
-                        BoxRef::from_opref(ctx.get_box_replacement(resolved.arg(i).to_opref())),
-                    );
+                    resolved.setarg(i, ctx.get_box_replacement(resolved.arg(i).to_opref()));
                 }
                 match pass.propagate_forward(&resolved, &mut ctx) {
                     OptimizationResult::Emit(emitted) => {
@@ -4821,7 +4820,10 @@ mod tests {
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[2], &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
-        assert_eq!(ctx.get_box_replacement(OpRef::int_op(2)), OpRef::int_op(0));
+        assert_eq!(
+            ctx.get_box_replacement(OpRef::int_op(2)).to_opref(),
+            OpRef::int_op(0)
+        );
     }
 
     #[test]
@@ -4880,7 +4882,7 @@ mod tests {
         let result = pass.propagate_forward(&ops[2], &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(
-            ctx.get_box_replacement(OpRef::float_op(2)),
+            ctx.get_box_replacement(OpRef::float_op(2)).to_opref(),
             OpRef::float_op(0)
         );
     }
@@ -4908,7 +4910,7 @@ mod tests {
         let result = pass.propagate_forward(&ops[2], &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(
-            ctx.get_box_replacement(OpRef::float_op(2)),
+            ctx.get_box_replacement(OpRef::float_op(2)).to_opref(),
             OpRef::float_op(1)
         );
     }
@@ -4935,7 +4937,7 @@ mod tests {
         let result2 = pass.propagate_forward(&ops[2], &mut ctx);
         assert!(matches!(result2, OptimizationResult::Remove));
         assert_eq!(
-            ctx.get_box_replacement(OpRef::float_op(2)),
+            ctx.get_box_replacement(OpRef::float_op(2)).to_opref(),
             OpRef::float_op(0)
         );
     }
@@ -5084,7 +5086,7 @@ mod tests {
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[3], &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
-        let resolved = ctx.get_box_replacement(OpRef::int_op(3));
+        let resolved = ctx.get_box_replacement(OpRef::int_op(3)).to_opref();
         assert!(resolved.is_constant());
         assert_eq!(
             ctx.get_box_replacement_box(resolved)
@@ -5340,7 +5342,10 @@ mod tests {
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[1], &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
-        assert_eq!(ctx.get_box_replacement(OpRef::ref_op(1)), OpRef::ref_op(0));
+        assert_eq!(
+            ctx.get_box_replacement(OpRef::ref_op(1)).to_opref(),
+            OpRef::ref_op(0)
+        );
     }
 
     // ── CONVERT_FLOAT_BYTES tests ──
