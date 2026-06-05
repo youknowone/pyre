@@ -1005,6 +1005,16 @@ unsafe fn getitem_bytes_like(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
 
 #[inline(never)]
 unsafe fn getitem_type(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
+    // A metaclass `__getitem__` (resolved on `type(cls)`'s MRO, e.g.
+    // `EnumMeta.__getitem__`) applies before the PEP 560
+    // `__class_getitem__` fallback: `Color['RED']` is `type(Color)
+    // .__getitem__(Color, 'RED')`.  `type` itself defines no `__getitem__`,
+    // so an ordinary class still takes the `__class_getitem__` path below.
+    if let Some(w_meta) = crate::typedef::r#type(obj) {
+        if let Some(method) = lookup_in_type_where(w_meta, "__getitem__") {
+            return crate::call::call_function_impl_result(method, &[obj, index]);
+        }
+    }
     // Python 3.9+ generic subscript: type[X] → __class_getitem__(X)
     // typeobject.py type.__class_getitem__
     if let Some(method) = lookup_in_type_where(obj, "__class_getitem__") {
@@ -1481,6 +1491,16 @@ pub fn len(obj: PyObjectRef) -> PyResult {
                 w_type_get_name(w_instance_get_type(obj)),
             )))
         } else {
+            // A metaclass `__len__` (e.g. `EnumMeta.__len__`) applies when
+            // the receiver is a class; `type` itself defines none, so an
+            // ordinary class still falls through to the error below.
+            if is_type(obj) {
+                if let Some(w_meta) = crate::typedef::r#type(obj) {
+                    if let Some(method) = lookup_in_type_where(w_meta, "__len__") {
+                        return crate::builtins::call_and_check(method, &[obj]);
+                    }
+                }
+            }
             Err(PyError::type_error(format!(
                 "object of type '{}' has no len()",
                 (*(*obj).ob_type).name,
@@ -6820,6 +6840,21 @@ pub fn contains(haystack: PyObjectRef, needle: PyObjectRef) -> Result<bool, PyEr
             }
             // Also check per-instance attributes (ATTR_TABLE)
             if let Ok(method) = getattr(haystack, "__contains__") {
+                let result = crate::call_function(method, &[haystack, needle]);
+                return Ok(is_true(result));
+            }
+        }
+    }
+    // A `__contains__` resolved on the receiver's dynamic type applies
+    // before the getitem scan: covers a metaclass `__contains__` when the
+    // haystack is a class (`x in Color` → `type(Color).__contains__(Color,
+    // x)`; `type` defines none, so an ordinary class falls through) and a
+    // builtin-leaf subclass instance (`x in flag` where the flag's ob_type
+    // is the int storage type but its w_class carries `__contains__`).  The
+    // is_instance receivers are already handled above.
+    unsafe {
+        if let Some(w_type) = crate::typedef::r#type(haystack) {
+            if let Some(method) = lookup_in_type_where(w_type, "__contains__") {
                 let result = crate::call_function(method, &[haystack, needle]);
                 return Ok(is_true(result));
             }
