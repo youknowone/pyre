@@ -253,8 +253,8 @@ fn install_default_typers(map: &mut HashMap<HostObject, BuiltinTyperFn>) {
             rtype_free_non_gc_object,
         ),
         // rbuiltin.py:412-418 — `rtype_const_result` is registered for
-        // four upstream callables.  Pyre's `front/ast.rs` synthesises
-        // the production dispatch path; these entries keep the registry
+        // four upstream callables.  `front::mir` synthesises the
+        // production dispatch path; these entries keep the registry
         // structurally aligned with upstream until M2.5g lands.
         (
             "rpython.rtyper.lltypesystem.lltype",
@@ -2842,9 +2842,9 @@ fn rtype_render_immortal(hop: &HighLevelOp, kwds_i: &HashMap<String, usize>) -> 
 ///     return hop.inputconst(hop.r_result.lowleveltype, hop.s_result.const)
 /// ```
 ///
-/// Note on dispatch reach: pyre's surface DSL synthesises most
-/// `lltype.*` ops directly from `front/ast.rs` (no HostObject lookup
-/// on the production path).  Registration below mirrors upstream's
+/// Note on dispatch reach: `front::mir` synthesises most `lltype.*`
+/// ops directly (no HostObject lookup on the production path).
+/// Registration below mirrors upstream's
 /// `BUILTIN_TYPER` shape structurally; dispatch flips on once the
 /// M2.5g extern-Rust-helper walker lands.
 fn rtype_const_result(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
@@ -2885,12 +2885,12 @@ fn rtype_const_result(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RT
 /// Reached via `simple_call(lltype.cast_ptr_to_int, p) →
 /// BuiltinFunctionRepr.rtype_simple_call → BUILTIN_TYPER[lltype.\
 /// cast_ptr_to_int]` per `rbuiltin.py:14-15` registry pattern.
-/// Frontend `expr as i64` for a Ref-typed source emits `Call {
-/// target: FunctionPath { segments: ["rpython", "rtyper",
-/// "lltypesystem", "lltype", "cast_ptr_to_int"] }, args: [operand] }`
-/// (front/ast.rs:5052), picked up by the flowspace_adapter's
-/// module-qualified FunctionPath resolver → HOST_ENV.import_module
-/// (...).module_get("cast_ptr_to_int") → BUILTIN_TYPER lookup.
+/// `front::mir` lowers `expr as i64` for a Ref-typed source into
+/// `Call { target: FunctionPath { segments: ["rpython", "rtyper",
+/// "lltypesystem", "lltype", "cast_ptr_to_int"] }, args: [operand] }`,
+/// picked up by the flowspace_adapter's module-qualified FunctionPath
+/// resolver → HOST_ENV.import_module(...).module_get("cast_ptr_to_int")
+/// → BUILTIN_TYPER lookup.
 pub fn rtype_cast_ptr_to_int(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
     use crate::flowspace::model::Hlvalue;
     use crate::translator::rtyper::rmodel::PtrRepr;
@@ -2986,11 +2986,11 @@ pub fn rtype_cast_ptr_to_int(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>
 
 /// RPython `rtyper.py:478-481` — internal renaming op the rtyper
 /// emits to copy a value into a fresh result variable while
-/// preserving its lltype.  Pyre's frontend at `front/ast.rs:5106
-/// Expr::Cast` emits `OpKind::UnaryOp { op: "same_as", result_ty,
-/// .. }` for identity / source-type-unknown casts so the target
-/// `ValueType` propagates through the graph (RPython has no `expr
-/// as T` syntax — pyre adds it as a Rust adaptation).  The
+/// preserving its lltype.  `front::mir` lowers identity /
+/// source-type-unknown casts to `OpKind::UnaryOp { op: "same_as",
+/// result_ty, .. }` so the target `ValueType` propagates through the
+/// graph (RPython has no `expr as T` syntax — pyre adds it as a Rust
+/// adaptation).  The
 /// `unsimplify::split_block` Void-variable recreation
 /// (unsimplify.rs:280) and the post-rtyper backendopt pipeline
 /// (constfold / removenoops / storesink / inline) also generate

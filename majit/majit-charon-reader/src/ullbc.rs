@@ -1,6 +1,6 @@
 //! Charon ULLBC schema (basic-block CFG form).
 //!
-//! Mirrors the subset of Charon 0.1.196's ULLBC the Step 3 driver
+//! Mirrors the subset of Charon 0.1.196's ULLBC the lowering driver
 //! consumes. The layout is reverse-engineered from
 //! `majit/charon-corpus/corpus.ullbc`; see
 //! `majit/charon-corpus/README.md` for the schema findings.
@@ -70,7 +70,7 @@ impl FunDecl {
 /// Static or const item referenced via [`PlaceKind::Global`].
 ///
 /// Body / type / initialiser remain opaque (`Value`); the only field
-/// the Step 3 lowering driver consumes is [`ItemMeta::name_path`] for
+/// the lowering driver consumes is [`ItemMeta::name_path`] for
 /// constructing a stable `CallTarget::FunctionPath`-style identifier.
 #[derive(Debug, Deserialize)]
 pub struct GlobalDecl {
@@ -81,8 +81,8 @@ pub struct GlobalDecl {
 }
 
 /// User-defined type (`struct` / `enum` / `type` alias / opaque
-/// forward-decl) the program references. Issue #97 Step 4.3.b consumes
-/// the `kind` field to populate `SemanticProgram.{known_struct_names,
+/// forward-decl) the program references. The `kind` field is consumed
+/// to populate `SemanticProgram.{known_struct_names,
 /// struct_fields, known_trait_names}` from the LLBC alone.
 #[derive(Debug, Deserialize)]
 pub struct TypeDecl {
@@ -249,9 +249,9 @@ pub struct Signature {
 }
 
 // ---------------------------------------------------------------------------
-// Types — kept thin. Real lowering will need to walk the type table,
-// but the Step 3 driver currently only needs to *label* types for diff
-// output, not deeply reason about them.
+// Types — kept thin. The lowering driver only needs to *label* types
+// for diff output, not deeply reason about them, so the type table is
+// not walked here.
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Deserialize)]

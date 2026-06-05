@@ -1,5 +1,4 @@
-//! End-to-end smoke tests for the MIR-driven flowspace driver
-//! (issue #97 Step 3).
+//! End-to-end smoke tests for the MIR-driven flowspace driver.
 //!
 //! The corpus snapshot at `majit/charon-corpus/corpus.ullbc` is the
 //! input and the regression fixture for the production MIR frontend.
@@ -19,8 +18,8 @@ fn lowers_straight_line_add() {
     let graph = lower_function(&llbc, "straight_line_add").expect("lowering");
     // FunctionGraph.name keeps the full Charon-qualified path
     // because it identifies the LLBC source — only the
-    // SemanticFunction.name has the AST-convention crate-prefix
-    // stripping applied at SemanticProgram build time.
+    // SemanticFunction.name has the crate-prefix stripping applied
+    // at SemanticProgram build time.
     assert_eq!(graph.name, "charon_corpus::straight_line_add");
 
     let startblock = graph.block(graph.startblock);
@@ -59,12 +58,10 @@ fn lowers_straight_line_add() {
 
 #[test]
 fn lowers_branch_loop_sum_with_calls_and_discriminant() {
-    // `branch_loop_sum` exercises three surfaces that the early
-    // skeleton refused: `Call` terminators (`slice.iter()` /
-    // `Iterator::next`), `Drop` terminators, and `Rvalue::Discriminant`
-    // on the iterator's `Option<&i64>` step result. Each individually
-    // landed in Steps 3.5 / 3.6 / 3.7 — this is the integration
-    // smoke test.
+    // `branch_loop_sum` exercises three surfaces together: `Call`
+    // terminators (`slice.iter()` / `Iterator::next`), `Drop`
+    // terminators, and `Rvalue::Discriminant` on the iterator's
+    // `Option<&i64>` step result.
     let llbc = load_corpus();
     let graph = lower_function(&llbc, "branch_loop_sum").expect("lowering");
     assert_eq!(graph.name, "charon_corpus::branch_loop_sum");
@@ -109,8 +106,7 @@ fn lowers_desugar_mix_with_aggregate_and_question_mark() {
     // `desugar_mix` exercises every surface the corpus carries: `?`
     // desugaring (Call + Match + Discriminant on `Result`), enum
     // construction (`Rvalue::Aggregate` for `PyResult::Ok`), iterator
-    // calls, and `break`. Landing this is the final per-shape Step 3
-    // milestone for the corpus.
+    // calls, and `break`.
     let llbc = load_corpus();
     let graph = lower_function(&llbc, "desugar_mix").expect("lowering");
     assert_eq!(graph.name, "charon_corpus::desugar_mix");
@@ -223,11 +219,9 @@ fn unknown_function_name_errors() {
 
 #[test]
 fn semantic_program_builder_lowers_every_corpus_function() {
-    // Step 4.1 smoke test: building a SemanticProgram from the
-    // corpus.ullbc should succeed and surface every local function
-    // as a SemanticFunction with a populated FunctionGraph. The
-    // whole-program metadata (struct_fields etc.) is left empty by
-    // design — populating it comes from Step 4.3 (Charon type_decls).
+    // Building a SemanticProgram from the corpus.ullbc should succeed
+    // and surface every local function as a SemanticFunction with a
+    // populated FunctionGraph.
     let llbc = load_corpus();
     let program = build_semantic_program_from_llbc(&llbc).expect("builder");
     assert!(
@@ -237,9 +231,9 @@ fn semantic_program_builder_lowers_every_corpus_function() {
     );
     let names: std::collections::HashSet<_> =
         program.functions.iter().map(|f| f.name.as_str()).collect();
-    // Names are crate-prefix-stripped to match AST convention
-    // (lib.rs:444 register_function_graph_alias walks bare leaf +
-    // crate aliases off this shape).
+    // Names are crate-prefix-stripped (lib.rs:444
+    // register_function_graph_alias walks bare leaf + crate aliases
+    // off this shape).
     for required in [
         "straight_line_add",
         "branch_loop_sum",
@@ -248,9 +242,9 @@ fn semantic_program_builder_lowers_every_corpus_function() {
     ] {
         assert!(names.contains(required), "missing {required}");
     }
-    // Step 4.3.b: corpus declares one struct-shaped enum (Strategy +
-    // Token), one type alias (PyResult), so we expect Strategy/Token
-    // and their variant paths plus the leaf names.
+    // The corpus declares one struct-shaped enum (Strategy + Token),
+    // one type alias (PyResult), so we expect Strategy/Token and their
+    // variant paths plus the leaf names.
     assert!(
         program.known_struct_names.contains("Strategy"),
         "expected Strategy in known_struct_names, got {:?}",
@@ -266,13 +260,13 @@ fn semantic_program_builder_lowers_every_corpus_function() {
 
 #[test]
 fn enum_variant_by_discriminant_round_trips_against_variant_paths() {
-    // P1 (opcode-dispatch MIR plumbing): the discriminant→variant-name
-    // map must parse Charon's `{"Scalar":{"Signed"|"Unsigned":[w,"K"]}}`
-    // discriminants and key each enum under both its qualified path and
-    // bare leaf. Validate against the corpus' Strategy enum without
-    // hard-coding variant counts: every name the map produced must have
-    // a matching `Strategy::<name>` variant path in known_struct_names,
-    // and the leaf key must mirror the qualified key.
+    // The discriminant→variant-name map must parse Charon's
+    // `{"Scalar":{"Signed"|"Unsigned":[w,"K"]}}` discriminants and key
+    // each enum under both its qualified path and bare leaf. Validate
+    // against the corpus' Strategy enum without hard-coding variant
+    // counts: every name the map produced must have a matching
+    // `Strategy::<name>` variant path in known_struct_names, and the
+    // leaf key must mirror the qualified key.
     let llbc = load_corpus();
     let program = build_semantic_program_from_llbc(&llbc).expect("builder");
 
@@ -307,9 +301,9 @@ fn enum_variant_by_discriminant_round_trips_against_variant_paths() {
 
 #[test]
 fn front_graph_carries_no_synthesized_exception_edges() {
-    // Reviewer #63 (points 2/3): the MIR driver drops every Call / Assert
-    // / Drop `on_unwind` successor (a Rust panic-cleanup path) and routes
-    // only to the success continuation, because Python exceptions ride the
+    // The MIR driver drops every Call / Assert / Drop `on_unwind`
+    // successor (a Rust panic-cleanup path) and routes only to the
+    // success continuation, because Python exceptions ride the
     // `Result<_, PyError>` Switch/Return edges as ordinary control flow —
     // never a Rust unwind. Lock that structurally on the FRONT flow graph
     // (NOT the jitcode, where can-raise is re-derived op-locally as

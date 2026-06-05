@@ -19,7 +19,7 @@ charon-corpus/
 
 ## Setup notes (Charon install)
 
-Use the canonical fetcher (Step 2.1):
+Use the canonical fetcher:
 
 ```sh
 scripts/install-charon.sh             # installs to ./build/charon/
@@ -61,7 +61,7 @@ cargo test -p majit-translate --test test_mir_frontend
 ## Corpus
 
 Four functions from `src/lib.rs`, chosen to cover the shapes called
-out in issue #97 Step 0:
+out in issue #97:
 
 | Function            | Shape                                       | ULLBC BBs |
 |---------------------|---------------------------------------------|-----------|
@@ -143,8 +143,8 @@ ULLBC body shape:
 - Each local carries: `index`, optional `name` (preserved for user-named
   bindings, `null` for compiler-introduced temps), a precise source `span`,
   and a (deduplicated) `ty`.
-- This means our lowering driver can recover **user-meaningful names** for
-  bindings — the AST front-end currently does this from the `syn` tree.
+- This means the lowering driver can recover **user-meaningful names** for
+  bindings directly from the locals table.
 - It also means **rustc-introduced temporaries are visible**, including the
   tuple-typed temp used by `AddChecked` (see §4 below).
 
@@ -161,7 +161,7 @@ Observed statement `kind` variants in the corpus:
 
 `Place` is `{ "kind": Local(i) | Projection(Place, ProjectionElem), "ty": ... }`
 where `ProjectionElem` includes `Field(VariantId, FieldId)`, deref, indexing,
-etc. (none of which the AST front-end ever sees pre-resolved).
+etc., all pre-resolved.
 
 `Rvalue` observed forms include `Use(Operand)`, `BinaryOp(Op, Operand, Operand)`,
 `UnaryOp`, `Aggregate`, `Ref`, `Cast`, `Discriminant(Place)`, `Len(Place)`,
@@ -184,22 +184,21 @@ Observed terminator `kind` variants in the corpus:
 | `Drop { ..., target, on_unwind }`          | `target`, `on_unwind`   |
 
 Every fallible terminator (`Call`, `Assert`, `Drop`) carries an
-**explicit `on_unwind` edge** to the unwind landing pad. Issue #97 called
-out panic/unwind information as something MIR provides that the AST
-front-end has to reconstruct — this is where it lives.
+**explicit `on_unwind` edge** to the unwind landing pad. This is where the
+ULLBC carries panic/unwind information directly.
 
-### 3. What Charon resolves that the AST front-end re-derives
+### 3. What Charon resolves ahead of the lowering driver
 
-| Information                | `syn` AST front-end                   | Charon ULLBC                                |
-|----------------------------|----------------------------------------|-----------------------------------------------|
-| Concrete `Ty` per local    | inferred via `annotator`/`rtyper`      | already attached to every local + place      |
-| Trait method resolution    | resolved via shims                     | `Call.func.Regular.kind.Fun.Regular(<id>)` is a direct `fun_decls` index; `trait_refs` carries instantiation |
-| `?` desugaring             | manually unrolled (`front/raise.rs`)   | rewritten into `Try::branch` + `FromResidual::from_residual` calls + Switch on `ControlFlow` |
-| `for` desugaring           | manually unrolled                      | rewritten into `IntoIterator::into_iter` + loop over `Iterator::next` + Switch on `Option` |
-| Generic instantiation      | partial (best-effort)                  | full, with `generics: { regions, types, const_generics, trait_refs }` |
-| Source spans               | from `syn` tokens                      | from rustc, file_id + beg/end line/col       |
-| Overflow checks            | not visible                            | `BinaryOp("AddChecked", ...)` + paired `Assert.check_kind.Overflow(...)` (see §4) |
-| Drop / unwind edges        | not visible                            | `Drop` and unwind terminators are first-class |
+| Information                | Charon ULLBC                                |
+|----------------------------|-----------------------------------------------|
+| Concrete `Ty` per local    | already attached to every local + place      |
+| Trait method resolution    | `Call.func.Regular.kind.Fun.Regular(<id>)` is a direct `fun_decls` index; `trait_refs` carries instantiation |
+| `?` desugaring             | rewritten into `Try::branch` + `FromResidual::from_residual` calls + Switch on `ControlFlow` |
+| `for` desugaring           | rewritten into `IntoIterator::into_iter` + loop over `Iterator::next` + Switch on `Option` |
+| Generic instantiation      | full, with `generics: { regions, types, const_generics, trait_refs }` |
+| Source spans               | from rustc, file_id + beg/end line/col       |
+| Overflow checks            | `BinaryOp("AddChecked", ...)` + paired `Assert.check_kind.Overflow(...)` (see §4) |
+| Drop / unwind edges        | `Drop` and unwind terminators are first-class |
 
 ### 4. Surprises and pitfalls
 
@@ -237,8 +236,7 @@ front-end has to reconstruct — this is where it lives.
 
 These were **not** checked into the repo (the `.ullbc` files are too
 large to commit), but the runs are reproducible from the commands
-below. The numbers were collected on the `charon` branch during the
-initial extraction audit.
+below.
 
 #### `pyre-object`
 
@@ -284,36 +282,29 @@ something we can wave away.
 
 ### 6. Open questions / next steps
 
-These are intentionally **not** answered in Step 0:
-
 - **Charon version pinning.** The releases are all `prerelease: true`
-  nightlies, so "pin a stable release" (issue §Step 2) means picking a
-  specific nightly tag and committing to it. Decide which date to pin
-  in Step 2 — `nightly-2026.05.24` is a reasonable starting point.
-- **`dyn Trait` classification.** We have a low type-level count (7),
-  but issue Step 1 still requires walking the hot-path call sites
-  (especially `DictStrategy` and friends) to classify pre-refactor.
-  That belongs in its own task.
-- ~~**MIR → `FunctionGraph` prototype** (issue Step 0, paragraph 2).~~
-  The standalone prototype has been retired. The production MIR frontend
-  in `majit-translate::front::mir`, plus `majit-charon-reader::tests::corpus`
-  and `majit-translate::tests::test_mir_frontend`, now covers the corpus.
-- **`charon-lib` dependency from stable Rust.** Issue Step 2 wants the
-  downstream consumer to use `serde`/`charon-lib`. Verify that
-  `charon-lib` builds on our stable Rust toolchain (not the pinned
-  Charon nightly). The crate is published on crates.io but its
-  feature set / MSRV needs confirmation before Step 2.
+  nightlies, so pinning a stable release means picking a specific
+  nightly tag and committing to it. `nightly-2026.05.24` is a
+  reasonable starting point.
+- **`dyn Trait` classification.** The type-level count is low (7), but
+  classifying the hot-path call sites (especially `DictStrategy` and
+  friends) still requires walking them individually. That belongs in
+  its own task.
+- **`charon-lib` dependency from stable Rust.** A downstream consumer
+  that uses `serde`/`charon-lib` needs `charon-lib` to build on the
+  stable Rust toolchain (not the pinned Charon nightly). The crate is
+  published on crates.io but its feature set / MSRV needs confirmation.
 - **Caching strategy.** A 133 MB ULLBC per interpreter rebuild is too
-  much to regenerate per developer build. Step 2 needs to decide:
-  check in extracted artifacts, or cache in CI, or both?
+  much to regenerate per developer build. The options are to check in
+  extracted artifacts, cache in CI, or both.
 
-### 7. Acceptance check against issue #97
+### 7. What this corpus covers
 
-| Step 0 acceptance criterion                                                | Status |
+| Coverage                                                                   | Where |
 |----------------------------------------------------------------------------|--------|
-| Pick representative corpus                                                 | done   |
-| Run Charon on corpus                                                       | done   |
-| Inspect `.llbc` for locals/places/constants/calls/trait resolution/terminators/discriminants/spans/unwind | done — see §2–§4 |
-| Minimal MIR → `FunctionGraph` prototype for 1–2 functions                  | done — retired after production MIR frontend landed |
-| Comparison against AST front-end after canonical normalization             | superseded by `majit-translate::front::mir` regression tests |
+| Representative corpus                                                      | `src/lib.rs` |
+| Charon run over the corpus                                                | `corpus.ullbc` |
+| `.llbc` for locals/places/constants/calls/trait resolution/terminators/discriminants/spans/unwind | §2–§4 |
+| MIR → `FunctionGraph` lowering                                             | `majit-translate::front::mir` |
+| Lowering regression against the corpus                                    | `majit-charon-reader::tests::corpus`, `majit-translate::tests::test_mir_frontend` |
 | Checked-in notes / fixtures                                                | this README + `src/lib.rs` + `corpus.ullbc` + `inspect_llbc.py` |

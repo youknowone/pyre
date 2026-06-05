@@ -561,10 +561,10 @@ fn infer_concrete_from_op(kind: &OpKind) -> ConcreteType {
         OpKind::ConstFloat(_) => ConcreteType::Float,
         // RPython `rpython/annotator/annrpython.py` types every Variable
         // at annotation time, so `OpKind::Input` reaching rtyper has a
-        // concrete type.  pyre's front-end (`front/ast.rs` Expr::Path
-        // lowering) re-emits a fresh `OpKind::Input { ty: Unknown }` for
-        // each source-level identifier reference instead of binding the
-        // name to the inputarg's Variable.  Leave Unknown so the
+        // concrete type.  pyre's `front::mir` emits each graph parameter
+        // as an `OpKind::Input { ty }` whose `ty` is projected from the
+        // MIR local's declared type, which is `ValueType::Unknown`
+        // whenever that type cannot be resolved.  Leave Unknown so the
         // integer-op backward-constraint pass (`resolve_types`) can
         // upgrade operands of pure integer ops to `Signed` before the
         // final GcRef backfill.
@@ -647,8 +647,8 @@ fn infer_concrete_from_op(kind: &OpKind) -> ConcreteType {
                 c
             }
         }
-        // pyre-only `OpKind::Abort` (`front/ast.rs` lowering of Rust
-        // syntax not yet ported — macros, unsupported literals,
+        // pyre-only `OpKind::Abort` (emitted by `front::opcode_wrapper`
+        // for unsupported syntax — macros, unsupported literals,
         // fallback expressions).  Fall back to GcRef so these values
         // still get a regalloc coloring and the assembler's
         // `lookup_reg_with_kind` covers every operand. RPython has no

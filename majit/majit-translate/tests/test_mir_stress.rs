@@ -1,5 +1,5 @@
 //! Stress test the MIR-driven lowering driver against the full
-//! extracted `pyre-interpreter.ullbc` snapshot (issue #97 Step 3).
+//! extracted `pyre-interpreter.ullbc` snapshot.
 //!
 //! Skipped by default: the snapshot is 133 MB and not checked into git
 //! (regenerable via `scripts/extract-llbc.sh`). Set
@@ -51,7 +51,7 @@ fn mir_lowering_tally_pyre_interpreter() {
     for fd in llbc.iter_local_fns() {
         if fd.unstructured().is_none() {
             // Opaque body / extraction error / structured-only —
-            // outside Step 3's scope.
+            // outside this lowering driver's scope.
             continue;
         }
         total += 1;
@@ -231,7 +231,7 @@ fn parse_read_bb_and_local(msg: &str) -> Option<(usize, u64)> {
     Some((r, n))
 }
 
-/// SCOPE-DECIDING DIAGNOSTIC (issue #64): for each uninitialised-local
+/// Diagnostic: for each uninitialised-local
 /// lowering failure, classify whether processing blocks in
 /// reverse-postorder would bind the failing local before its read
 /// (forward-ref, fixable by traversal order alone, no phi) or whether the
@@ -628,7 +628,7 @@ fn mir_on_unwind_target_taxonomy() {
         tally.total_call_terms > 0,
         "expected at least one Call/Assert/Drop terminator in the snapshot"
     );
-    // Reviewer #63: the decisive invariant — no on_unwind path does
+    // The decisive invariant — no on_unwind path does
     // catch-like work (a Call/Switch/Return or a non-trivial statement)
     // other than pure destructor drop-glue. If this ever trips, the
     // corpus grew a Rust catch/cleanup that the front-graph driver would
@@ -702,7 +702,7 @@ fn bucket_message(msg: &str) -> String {
     s
 }
 
-/// SAFETY-PROOF DIAGNOSTIC (issue #64): emit an alpha-equivalence
+/// Diagnostic: emit an alpha-equivalence
 /// structural signature for every function that lowers OK, so the
 /// reverse-postorder lowering order can be proven to alter ONLY the
 /// binding of the 15 forward-ref failures and nothing else.

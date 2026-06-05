@@ -208,9 +208,10 @@ fn test_jit_module_emits_structured_impl_trace_fnaddrs() {
     let entries = impl_walk_module::__majit_helper_impl_trace_fnaddrs();
     // Entries are
     //   `(module_path_with_crate, impl_type_as_written, method, fnaddr)`
-    // 4-tuples. The codewriter applies `qualify_type_name`
-    // (front/ast.rs:106) using `module_path_with_crate` to decide
-    // whether to prepend the module prefix.
+    // 4-tuples. The codewriter applies the
+    // `front::semantic::qualify_type_name_with_imports` rule using
+    // `module_path_with_crate` to decide whether to prepend the module
+    // prefix.
     assert_eq!(entries.len(), 2);
 
     let expected_module_path = concat!(module_path!(), "::impl_walk_module");
@@ -319,8 +320,9 @@ fn test_jit_module_disambiguates_trait_impl_with_as_trait_cast() {
 // module-level trampoline (`__majit_call_target_*`), so they cannot be
 // attached inside an `impl` block (probe result: `not found in this
 // scope`).  `#[jit_elidable]` (lib.rs:993) is a pure pass-through and
-// only relies on `front::ast::collect_jit_hints`'s hint flip, so it can
-// safely sit on impl methods.  This fixture verifies that live wire.
+// only relies on `front::llbc_hints`'s hint flip (the
+// `_elidable_function_` marker const → `elidable`), so it can safely
+// sit on impl methods.  This fixture verifies that live wire.
 pub trait PureTrait {
     fn trait_elidable(&self) -> i64;
 }
@@ -374,9 +376,9 @@ fn test_jit_elidable_on_impl_methods_is_discovered() {
 
     let policies = elidable_method_module::__MAJIT_HELPER_POLICIES;
     // jit_module records the raw attribute name; normalisation happens
-    // in `front::ast::collect_jit_hints` (front/ast.rs:1971), which
-    // flips "jit_elidable" → "elidable" before mark_elidable consumes
-    // the hint.
+    // in `front::llbc_hints`, which flips the harvested
+    // `_elidable_function_` marker const to the canonical "elidable"
+    // hint before mark_elidable consumes it.
     assert!(policies.contains(&("PureCalc::compute_xor", "jit_elidable")));
     assert!(policies.contains(&("PureCalc::shifted", "jit_elidable")));
     assert!(policies.contains(&("PureCalc::trait_elidable", "jit_elidable")));
@@ -433,7 +435,7 @@ fn test_passthrough_free_fn_discovery_uses_direct_fn_address() {
 
     let policies = passthrough_free_fn_module::__MAJIT_HELPER_POLICIES;
     // jit_module records the raw attribute name; normalisation lives
-    // in front/ast.rs:2147.
+    // in `front::llbc_hints`.
     assert!(policies.contains(&("pure_xor", "jit_elidable")));
     assert!(policies.contains(&("unrolled", "unroll_safe")));
     assert!(policies.contains(&("out_of_trace", "not_in_trace")));

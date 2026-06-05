@@ -7,7 +7,7 @@
 //! ever sees the call.  See also
 //! `rclass.InstanceRepr.get_reusable_prebuilt_instance`.
 //!
-//! Pyre's frontend (`front/ast.rs:5642`) lowers a unit-variant path
+//! Pyre's frontend (`front::mir`) lowers a unit-variant path
 //! expression to `OpKind::Call { target: SyntheticTransparentCtor,
 //! args: [] }`.  The companion fold inside
 //! `translator/rtyper/flowspace_adapter.rs::legacy_const_define_hlvalue`
@@ -49,8 +49,8 @@ use crate::model::{CallTarget, FunctionGraph, OpKind};
 /// `Vec<(String, HostObject)>` instead of `HashMap` per the
 /// project's no-HashMap policy ([[no-hashmap-ever]]).  The variant
 /// set is closed and small (~11 entries in
-/// `front::ast::is_synthetic_unit_variant_path`), so linear scan is
-/// both cheap and PyPy-orthodox.
+/// `front::syn_metadata::is_synthetic_unit_variant_path`), so linear
+/// scan is both cheap and PyPy-orthodox.
 static UNIT_VARIANT_PREBUILT_INSTANCES: LazyLock<Mutex<Vec<(String, HostObject)>>> =
     LazyLock::new(|| Mutex::new(Vec::new()));
 
@@ -80,7 +80,7 @@ pub(crate) fn intern_unit_variant_prebuilt_instance(qualname: &str) -> Option<Ho
 
 /// Rewrite `OpKind::Call { target: SyntheticTransparentCtor, args: [] }`
 /// ops whose qualified path matches
-/// `front::ast::is_synthetic_unit_variant_path` into
+/// `front::syn_metadata::is_synthetic_unit_variant_path` into
 /// `OpKind::ConstRef(prebuilt_instance)`, mirroring
 /// `rtyper/rpbc.py::SingleFrozenPBCRepr`.
 pub fn fold_unit_variant_ctors(graph: &mut FunctionGraph) {

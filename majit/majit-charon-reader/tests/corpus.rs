@@ -129,9 +129,9 @@ fn call_classify_covers_corpus() {
 
 #[test]
 fn dedup_body_resolves_inline_shape() {
-    // Step 4.3.c.ext: every `HashConsedValue: [id, body]` occurrence
-    // must surface through `Llbc::dedup_body(id)` so MIR's TyRef
-    // projection can resolve `Deduplicated` references.
+    // Every `HashConsedValue: [id, body]` occurrence must surface
+    // through `Llbc::dedup_body(id)` so MIR's TyRef projection can
+    // resolve `Deduplicated` references.
     let llbc = Llbc::load(CORPUS).expect("load corpus.ullbc");
 
     // Collect a (dedup_id, body_kind) sample by walking every

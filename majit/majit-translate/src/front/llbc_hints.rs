@@ -9,12 +9,10 @@
 //! marker consts next to the user function, and Charon extracts them
 //! into `global_decls`.  Reading them back is the analog of RPython's
 //! translator reading `func._elidable_function_` off the function
-//! object, and replaces the syn re-parse hint pass that used to walk the
-//! same source with `front::syn_metadata::collect_jit_hints`.
+//! object.
 //!
-//! The harvested map reproduces the `collect_jit_hints` output (verified
-//! order- and multiplicity-exact per function) so `merge_hints_from_llbcs`
-//! is a drop-in replacement for the retired syn-AST hint merge.
+//! The harvested map is keyed and ordered so that `merge_hints_from_llbcs`
+//! can apply the hints to each function order- and multiplicity-exact.
 
 use majit_charon_reader::Llbc;
 use std::collections::HashMap;
@@ -47,9 +45,9 @@ pub fn harvest_hints_from_llbcs(llbcs: &[Llbc]) -> HashMap<String, Vec<String>> 
             for (prefix, hints) in CONST_PREFIX_HINTS {
                 if let Some(fn_name) = leaf.strip_prefix(prefix) {
                     // `elidable_promote` emits a synthetic `_orig_<name>_unlikely_name`
-                    // helper carrying `_elidable_function_`.  The syn hint walk runs
-                    // pre-expansion and never sees this generated fn, so skip it to
-                    // keep the harvested map byte-identical to the syn merge.
+                    // helper carrying `_elidable_function_`.  This generated fn is not
+                    // a user function, so skip it and only harvest hints for the
+                    // user-written functions.
                     if fn_name.starts_with("_orig_") && fn_name.ends_with("_unlikely_name") {
                         continue;
                     }

@@ -36,11 +36,11 @@ fn kind_long_name(kind: RegKind) -> &'static str {
     }
 }
 
-// `reg_byte` and the `CURRENT_GRAPH` thread-local were removed once
-// every FlatOp variant migrated to carrying a [`crate::flatten::Register`]
-// (or [`crate::flatten::RegOrConst`]) operand directly.  After Phase 3
-// the assembler reads `r.kind` / `r.index` straight off the operand —
-// no per-call kind-search, no fallback — exactly mirroring RPython's
+// `reg_byte` and the `CURRENT_GRAPH` thread-local are absent because
+// every FlatOp variant carries a [`crate::flatten::Register`] (or
+// [`crate::flatten::RegOrConst`]) operand directly.  The assembler
+// reads `r.kind` / `r.index` straight off the operand — no per-call
+// kind-search, no fallback — exactly mirroring RPython's
 // `Register(kind, index)` invariant from `flatten.py:28-33`.
 use crate::flowspace::model::ConstValue;
 use crate::jitcode::{BhCallDescr, JitCodeBody};
@@ -260,7 +260,7 @@ impl Assembler {
     ) -> JitCodeBody {
         // RPython codewriter.py:56: compute_liveness(ssarepr)
         // Must run BEFORE assembly so -live- markers carry the full
-        // set of alive registers.  Phase 3 ports the alive set to
+        // set of alive registers.  The alive set uses
         // [`crate::flatten::Register`]-based identity, so liveness
         // also takes the regalloc result for the `Variable → Register`
         // bridge on `FlatOp::Op` operands.
@@ -1334,7 +1334,7 @@ impl Assembler {
             // The result register is the integer function address that
             // `int_guard_value` and the subsequent `residual_call_*`
             // consume — backend lowering of the actual vtable slot read
-            // is deferred (separate epic).
+            // is not yet implemented.
             OpKind::VtableMethodPtr {
                 receiver,
                 trait_root,
@@ -2152,12 +2152,12 @@ impl Assembler {
                 FlatOp::GotoIfNot { .. }
                 | FlatOp::Switch { .. }
                 | FlatOp::IntBinOpJumpIfOvf { .. } => {
-                    // Phase 3 — guard ops carry [`Register`] operands
+                    // Guard ops carry [`Register`] operands
                     // (post-regalloc identity); not tracked by the
                     // pre-regalloc Variable audit.
                 }
                 FlatOp::Move { .. } | FlatOp::Push(_) | FlatOp::Pop(_) => {
-                    // Phase 3 — Move/Push/Pop carry [`Register`]
+                    // Move/Push/Pop carry [`Register`]
                     // (post-regalloc identity) rather than pre-regalloc
                     // Variables, so the audit (which is keyed on
                     // pre-regalloc Variables) can no longer attribute
@@ -2169,20 +2169,19 @@ impl Assembler {
                     // safe.
                 }
                 FlatOp::LastException { .. } | FlatOp::LastExcValue { .. } => {
-                    // Phase 3 — Register operand carries (kind, color);
+                    // Register operand carries (kind, color);
                     // not tracked by the pre-regalloc Variable audit.
                 }
                 FlatOp::IntReturn(_)
                 | FlatOp::RefReturn(_)
                 | FlatOp::FloatReturn(_)
                 | FlatOp::Raise(_) => {
-                    // Phase 3 — operand is RegOrConst (Register or
-                    // Constant); not tracked by the pre-regalloc
-                    // Variable audit.
+                    // Operand is RegOrConst (Register or Constant);
+                    // not tracked by the pre-regalloc Variable audit.
                 }
                 FlatOp::Live { .. } => {
-                    // Phase 3 — Live carries [`Register`]s now; not
-                    // tracked by the pre-regalloc Variable audit.
+                    // Live carries [`Register`]s; not tracked by the
+                    // pre-regalloc Variable audit.
                 }
                 FlatOp::Label(_)
                 | FlatOp::Jump(_)

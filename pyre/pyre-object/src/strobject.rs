@@ -123,11 +123,10 @@ pub fn box_str_constant(value: &Wtf8) -> PyObjectRef {
 ///
 /// # Panics
 /// The backing buffer is WTF-8.  Surrogateescape / surrogatepass decoding
-/// now produces surrogate-bearing strings, so a `&str` view is no longer
+/// can produce surrogate-bearing strings, so a `&str` view is not
 /// guaranteed.  Consumers that must tolerate lone surrogates read through
-/// [`w_str_get_wtf8`]; the remaining (still-unmigrated) `&str` consumers
-/// reach this accessor and panic on a surrogate rather than silently
-/// corrupting, until each is migrated to the WTF-8 view.
+/// [`w_str_get_wtf8`]; `&str` consumers reach this accessor and panic on a
+/// surrogate rather than silently corrupting.
 #[inline]
 pub unsafe fn w_str_get_value(obj: PyObjectRef) -> &'static str {
     unsafe {

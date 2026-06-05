@@ -16,8 +16,6 @@
 //! No side-table serialization: the only persisted collection is
 //! `pipeline.jitcodes`, in allocation order, matching RPython's single-store
 //! model (`feedback_single_jitcodes_store`).
-//!
-//! Phase D-1 Step 2 of the eval-loop automation plan.
 
 use std::cell::OnceCell;
 use std::collections::HashMap;
@@ -169,17 +167,14 @@ fn compute_portal_jitcode_index() -> Option<usize> {
 /// from. Returns `None` only when the build-time pipeline has no
 /// jitdriver registered (e.g. compact test inputs).
 ///
-/// Phase G consumers route trace-side user-function calls
-/// (`callee_frame_helper`, `jit_create_callee_frame_*`,
-/// `jit_force_callee_frame`) through this accessor instead of emitting
-/// runtime per-CodeObject jitcodes. The orthodox model treats every
-/// user CodeObject as the portal's `pycode` input argument and reuses
-/// the single portal JitCode for every call — see RPython
-/// `pypy/module/pypyjit/interp_jit.py portal_runner` and
-/// `rpython/jit/codewriter/jtransform.py:473` `inline_call_*` emit.
-///
-/// G.2 introduces this accessor as the surface that G.3 will plug
-/// callee dispatch into; G.2 itself does not redirect any caller.
+/// Trace-side user-function calls (`callee_frame_helper`,
+/// `jit_create_callee_frame_*`, `jit_force_callee_frame`) route through
+/// this accessor instead of emitting runtime per-CodeObject jitcodes.
+/// The orthodox model treats every user CodeObject as the portal's
+/// `pycode` input argument and reuses the single portal JitCode for
+/// every call — see RPython `pypy/module/pypyjit/interp_jit.py
+/// portal_runner` and `rpython/jit/codewriter/jtransform.py:473`
+/// `inline_call_*` emit.
 pub fn portal_jitcode() -> Option<Arc<JitCode>> {
     let idx = PORTAL_JITCODE_INDEX.with(|cell| *cell.get_or_init(compute_portal_jitcode_index))?;
     get_jitcode_by_index(idx)
@@ -276,7 +271,7 @@ pub fn arm_id_for_instruction(instruction: &Instruction) -> Option<usize> {
 }
 
 /// Resolve an `Instruction` directly to its entry jitcode. This is the
-/// MIFrame-side entry for Phase D-2 shadow dispatch.
+/// MIFrame-side entry for shadow dispatch.
 pub fn jitcode_for_instruction(instruction: &Instruction) -> Option<Arc<JitCode>> {
     jitcode_for_arm(arm_id_for_instruction(instruction)?)
 }
@@ -761,7 +756,7 @@ pub enum ResolvedResult {
 ///
 /// RPython parity: `_get_method.handler` up to the `unboundmethod(*args)`
 /// call. The bhimpl dispatch itself is intentionally left out; this
-/// struct is the data the shadow-record layer (Phase D-2) or a diff-only
+/// struct is the data the shadow-record layer or a diff-only
 /// analyzer can inspect without executing any side effect.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedOp {
@@ -993,8 +988,8 @@ mod tests {
 
     #[test]
     fn portal_jitcode_resolves_to_unique_jitdriver_entry() {
-        // Phase G G.2 — verify the portal accessor returns the single
-        // build-time JitCode whose `jitdriver_sd` is set (RPython
+        // Verify the portal accessor returns the single build-time
+        // JitCode whose `jitdriver_sd` is set (RPython
         // call.py:147 `jd.mainjitcode = self.get_jitcode(jd.portal_graph)`).
         // Production identity is currently `execute_opcode_step` because
         // `pyre-jit-trace/build.rs` does not yet include
@@ -1019,12 +1014,11 @@ mod tests {
 
     #[test]
     fn pop_top_lookup() {
-        // Instruction::PopTop is arm_id=21 at build time (was 14 while the
-        // opcode dispatch was extracted from the syn source-match order;
-        // sourcing it from the lowered MIR switch reorders the arms by
-        // first-encounter target-block order of that switch, moving PopTop
-        // 14 -> 21). Confirm arm → jitcode resolution works end-to-end and
-        // the jitcode carries bytecode bytes (not an empty shell).
+        // Instruction::PopTop is arm_id=21 at build time. The opcode
+        // dispatch is sourced from the lowered MIR switch, which orders the
+        // arms by first-encounter target-block order of that switch.
+        // Confirm arm → jitcode resolution works end-to-end and the jitcode
+        // carries bytecode bytes (not an empty shell).
         let jc = jitcode_for_arm(21).expect("PopTop arm should resolve to a jitcode");
         assert!(
             !jc.code.is_empty(),
@@ -1163,7 +1157,7 @@ mod tests {
 
     #[test]
     fn pop_top_jitcode_op_sequence_matches_expected_shape() {
-        // Phase D-2 advance: lock in the assembler-emitted op sequence
+        // Lock in the assembler-emitted op sequence
         // for `Instruction::PopTop`'s arm jitcode. The shape mirrors
         // what RPython's `assemble.assemble(ssarepr, jitcode)`
         // (assembler.py:60-86) would emit for a jtransformed
@@ -1190,15 +1184,14 @@ mod tests {
         );
         // `execute_pop_top` is `pop_value()? ; Ok(StepResult::Continue)`:
         // one residual call that can raise, then return the prebuilt
-        // `Continue`.  After the inline-constants-into-OpRef /
-        // remove-ConstantPool lowering change the body is the `int_copy`
-        // arg setup, the `residual_call_r_r` to `pop_value`, the `live/`
-        // jit_merge_point marker, then a direct `ref_return/r` of the
-        // folded `Continue` OpRef.  The previous `catch_exception/L ;
-        // ref_copy/r>r ; reraise/` exception shoulder collapsed: the arm
-        // has no exception *handler* (only `?` propagation), so the
-        // residual call's implicit exception edge carries the raise and
-        // no explicit catch/reraise pair is emitted.
+        // `Continue`.  Constants are inlined into the OpRef, so the body is
+        // the `int_copy` arg setup, the `residual_call_r_r` to `pop_value`,
+        // the `live/` jit_merge_point marker, then a direct `ref_return/r`
+        // of the folded `Continue` OpRef.  There is no `catch_exception/L ;
+        // ref_copy/r>r ; reraise/` exception shoulder: the arm has no
+        // exception *handler* (only `?` propagation), so the residual
+        // call's implicit exception edge carries the raise and no explicit
+        // catch/reraise pair is emitted.
         let expected: Vec<(String, String)> = [
             ("int_copy", "i>i"),
             ("residual_call_r_r", "iRd>r"),
@@ -1408,23 +1401,15 @@ mod tests {
         // `*_ir>i` alias.
         let (_builder, mut unwired) = build_default_bh_builder_with_unwired_report();
         unwired.sort();
-        // Lock-in: the generated insns table is now fully covered by
+        // The generated insns table is fully covered by
         // `wire_bhimpl_handlers` — every opname has a `bhimpl_*` handler,
-        // so the unwired set is empty.
-        //
-        // The prior snapshot documented three pending raw-ptr-vs-index
-        // kind-flow gaps (`int_lt/ir>i`, `int_lt/rr>i`,
-        // `residual_call_r_i/iRd`): `Lt` operands sitting in the Ref bank
-        // instead of Int, and a residual call returning Int with a Ref
-        // argument.  The `OpKind::Input` class-root retyping in the MIR
-        // frontend collapses those Ref operands to their canonical all-int
-        // shapes at emission, so the codewriter no longer produces the
-        // un-wired keys.  This is the closed-at-upstream-emission end-state
-        // the snapshot was waiting for.
-        //
-        // A non-empty set here means the codewriter / typer regressed and
-        // re-emitted a kind shape that no RPython blackhole handler has —
-        // fix at upstream emission, do NOT add a `*_r>i` / `*_ir>i` alias.
+        // so the unwired set is empty.  The `OpKind::Input` class-root
+        // retyping in the MIR frontend collapses Ref operands to their
+        // canonical all-int shapes at emission (e.g. `Lt` operands stay in
+        // the Int bank, and a residual call does not return Int with a Ref
+        // argument), so the codewriter does not produce keys like
+        // `int_lt/ir>i`, `int_lt/rr>i`, or `residual_call_r_i/iRd` that no
+        // RPython blackhole handler has.
         let expected: Vec<String> = vec![];
         assert_eq!(
             unwired, expected,
@@ -1503,7 +1488,7 @@ mod tests {
 
     #[test]
     fn dispatch_loop_executes_int_add_via_real_insns_table() {
-        // Phase D-2.0: confirm the build-time `pipeline.insns` byte
+        // Confirm the build-time `pipeline.insns` byte
         // assignments resolve to the real `wire_bhimpl_handlers`
         // dispatch entries — a hand-assembled bytecode using those
         // bytes runs end-to-end through
@@ -1565,7 +1550,7 @@ mod tests {
 
     #[test]
     fn dispatch_loop_chains_int_add_then_int_sub_via_real_insns_table() {
-        // Phase D-2.1: chain two binops + a label-free linear control
+        // Chain two binops + a label-free linear control
         // flow through `dispatch_loop`. Validates that the second
         // binop reads the register the first wrote (multi-step value
         // flow through the register file) and that two distinct wired
@@ -1633,7 +1618,7 @@ mod tests {
 
     #[test]
     fn dispatch_loop_executes_count_up_loop_via_real_insns_table() {
-        // Phase D-2.2: closed loop via `int_lt/ii>i` + `goto_if_not/iL`
+        // Closed loop via `int_lt/ii>i` + `goto_if_not/iL`
         // + `goto/L` — exercises the dispatch_loop's absolute-target
         // label semantics on both backward and forward jumps.
         //
@@ -1732,7 +1717,7 @@ mod tests {
 
     #[test]
     fn dispatch_loop_executes_float_add_via_real_insns_table() {
-        // Phase D-2.3: float register file + ff>f decode/encode +
+        // Float register file + ff>f decode/encode +
         // void_return termination.
         //
         //   PC=0:  live/
@@ -1801,7 +1786,7 @@ mod tests {
 
     #[test]
     fn dispatch_loop_loads_constant_via_setposition_lifecycle() {
-        // Phase D-2.5: full RPython-shape lifecycle —
+        // Full RPython-shape lifecycle —
         // `acquire_interp` + `setposition` + `dispatch_loop`. Earlier
         // dispatch_loop tests bypassed `setposition` by hand-setting
         // `bh.registers_i = vec![...]`; here we construct a real
@@ -1889,7 +1874,7 @@ mod tests {
 
     #[test]
     fn dispatch_loop_executes_ref_return_via_real_insns_table() {
-        // Phase D-2.6: ref register file + ref_return r-typed
+        // Ref register file + ref_return r-typed
         // termination — fills the third register-file dimension that
         // the earlier dispatch_loop tests did not touch.
         //
@@ -1953,16 +1938,16 @@ mod tests {
 
     #[test]
     fn dispatch_loop_with_probe_captures_opcode_sequence_and_preserves_result() {
-        // Phase D-2.7: probe-hook variant of dispatch_loop — first
+        // Probe-hook variant of dispatch_loop — first
         // shadow-execution scaffold. Each dispatched opcode invokes
         // the probe BEFORE the handler runs, so a shadow caller
-        // (Phase D plan: MIFrame side) can capture the jitcode op
+        // (MIFrame side) can capture the jitcode op
         // sequence and compare it against the trace IR emitted by the
         // trait-based `execute_opcode_step`. The probe must NOT
         // change the dispatch result — running the same int_add
         // bytecode through `dispatch_loop_with_probe` must produce
         // the same `tmpreg_i==42` + LeaveFrame as the bare
-        // `dispatch_loop` (D-2.0 baseline).
+        // `dispatch_loop`.
         let (mut builder, _unwired) = build_default_bh_builder_with_unwired_report();
 
         let table = insns_opname_to_byte();
@@ -1974,7 +1959,7 @@ mod tests {
             .get("int_return/i")
             .expect("`int_return/i` must be in insns");
 
-        // Same shape as D-2.0 baseline:
+        // Same shape as the bare int_add dispatch test:
         //   PC=0: live/                3 bytes
         //   PC=3: int_add r0, r1 → r2  4 bytes
         //   PC=7: int_return r2        2 bytes
@@ -2033,7 +2018,7 @@ mod tests {
 
     #[test]
     fn dispatch_loop_probe_observes_register_state_at_each_op() {
-        // Phase D-2.8: probe receives `&BlackholeInterpreter` at each
+        // Probe receives `&BlackholeInterpreter` at each
         // firing — the second piece of shadow-execution scaffolding.
         // The closure can read register values BEFORE the upcoming
         // handler runs, capturing the input data flow needed to
@@ -2041,7 +2026,8 @@ mod tests {
         // `execute_opcode_step`.
         //
         // Bytecode: live + int_add(r0,r1)→r2 + int_sub(r2,r0)→r3
-        //         + int_return(r3)  (same shape as D-2.1).
+        //         + int_return(r3)  (same shape as the chained
+        // int_add/int_sub dispatch test).
         //
         // Probe captures `registers_i[0..4]` at every firing. The
         // sequence must be:

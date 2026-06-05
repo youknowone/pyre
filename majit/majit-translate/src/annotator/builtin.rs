@@ -350,11 +350,11 @@ fn register_builtins() -> HashMap<String, BuiltinAnalyzer> {
     // `compute_result_annotation` produces
     // `SomeInteger(knowntype=Ruint, unsigned=True)`.
     // lltype.py:2367-2382 — `@analyzer_for(cast_ptr_to_int)` and
-    // `@analyzer_for(cast_int_to_ptr)`.  The Rust frontend lowers
-    // `Expr::Cast { Ref ↔ Int }` to a `simple_call` against the
-    // matching `lltype.*` HostObject (see `front/ast.rs::cast_builtin_name`),
-    // so the annotation pass routes through these analyzers when the
-    // cast surface lands in user code.  Keyed by the `qualname` that
+    // `@analyzer_for(cast_int_to_ptr)`.  `front::mir` lowers a
+    // `Ref ↔ Int` cast to a `simple_call` against the matching
+    // `lltype.*` HostObject, so the annotation pass routes through these
+    // analyzers when the cast surface lands in user code.  Keyed by the
+    // `qualname` that
     // `HostObject::new_builtin_callable("lltype.cast_ptr_to_int")`
     // produces (bookkeeper.rs:1939 reads `obj.qualname()` directly
     // for `SomeBuiltin.analyser_name`).

@@ -3899,44 +3899,62 @@ impl<'a> AssemblerARM64<'a> {
     /// Overwrite the code at `at` with a branch to `target`.
     ///
     /// `link` selects the branch form to match the upstream method this
-    /// stands in for: patch_trace overwrites a guard stub with `BL`
-    /// (branch-with-link → bridge), while redirect_call_assembler overwrites
-    /// a loop entry with a plain `B`. Both `B(target)`/`BL(target)` always
-    /// materialize the absolute target into ip0 and branch through it
-    /// (codebuilder.py:478-487 `gen_load_int_full(ip0); BR_r/BLR_r(ip0)`);
-    /// the IMM-relative form is deliberately not used ("XXX use the IMM
-    /// version if close enough"). ip0/x16 is call-clobbered scratch at every
-    /// redirect site (the bridge prologue's `_check_frame_depth` reloads it
-    /// before use).
+    /// stands in for: assembler.py patch_trace overwrites a guard stub with
+    /// `BL` (branch-with-link → bridge), while redirect_call_assembler
+    /// overwrites a loop entry with a plain `B`. A direct `B`/`BL imm26`
+    /// reaches ±128 MB; once the code arena spans more than that, a bridge /
+    /// retraced loop can land farther from the originating guard stub / loop
+    /// entry, so the scaled 26-bit displacement would silently truncate and
+    /// the branch would land on garbage. When the displacement does not fit,
+    /// fall back to materializing the absolute target in ip0 and branching
+    /// through it (`BR`/`BLR x16`) — the indirect form codebuilder.py emits
+    /// for an out-of-range `B`/`BL`. ip0/x16 is call-clobbered scratch at
+    /// every redirect site (the bridge prologue's `_check_frame_depth`
+    /// reloads it before use).
     ///
     /// # Safety
     /// `at` must point to at least 20 writable bytes of now-dead code:
     /// both callers overwrite the head of a recovery stub / loop prologue
     /// that is longer than the emitted sequence.
     unsafe fn write_redirect_branch(at: usize, target: usize, link: bool) {
-        // MOVZ/MOVK x16, target; BR/BLR x16 — 5 words. The four MOV words
-        // come from the shared encoder so the veneer stays byte-identical
-        // to emit_mov_imm64 (pinned by frame_depth_patch_words_match_emit_mov_imm64).
-        let mov = Self::encode_mov_imm64_words(16, target as i64);
-        // 0xD61F0000 = BR Xn, 0xD63F0000 = BLR Xn (Rn in bits 9:5).
-        let br = if link { 0xD63F_0000 } else { 0xD61F_0000 };
-        let words: [u32; 5] = [mov[0], mov[1], mov[2], mov[3], br | (16 << 5)];
-        codebuf::with_writable(at as *mut u8, words.len() * 4, || {
-            let p = at as *mut u32;
-            for (i, w) in words.iter().enumerate() {
-                unsafe { p.add(i).write(*w) };
-            }
-        });
-        flush_icache(at as *const u8, words.len() * 4);
+        let offset = target as isize - at as isize;
+        // B/BL imm26: signed 26-bit, scaled by 4 → ±128 MB reach.
+        const B_REACH: isize = 1 << 27;
+        if (-B_REACH..B_REACH).contains(&offset) {
+            let imm26 = ((offset >> 2) & 0x03FF_FFFF) as u32;
+            // 0x14000000 = B imm26, 0x94000000 = BL imm26.
+            let opc = if link { 0x9400_0000 } else { 0x1400_0000 };
+            let insn = opc | imm26;
+            codebuf::with_writable(at as *mut u8, 4, || {
+                unsafe { (at as *mut u32).write(insn) };
+            });
+            flush_icache(at as *const u8, 4);
+        } else {
+            // MOVZ/MOVK x16, target; BR/BLR x16 — 5 words. The four MOV words
+            // come from the shared encoder so the veneer stays byte-identical
+            // to emit_mov_imm64 (pinned by frame_depth_patch_words_match_emit_mov_imm64).
+            let mov = Self::encode_mov_imm64_words(16, target as i64);
+            // 0xD61F0000 = BR Xn, 0xD63F0000 = BLR Xn (Rn in bits 9:5).
+            let br = if link { 0xD63F_0000 } else { 0xD61F_0000 };
+            let words: [u32; 5] = [mov[0], mov[1], mov[2], mov[3], br | (16 << 5)];
+            codebuf::with_writable(at as *mut u8, words.len() * 4, || {
+                let p = at as *mut u32;
+                for (i, w) in words.iter().enumerate() {
+                    unsafe { p.add(i).write(*w) };
+                }
+            });
+            flush_icache(at as *const u8, words.len() * 4);
+        }
     }
 
     /// assembler.py:965 patch_jump_for_descr: redirect a guard to a
     /// bridge by overwriting the recovery stub with a JMP to bridge.
     ///
     /// `adr_jump_offset` is the absolute address of the recovery stub
-    /// (set by patch_pending_failure_recoveries). We overwrite the stub
-    /// with "MOVZ/MOVK x16, bridge_addr; BLR x16", matching
-    /// rpython/jit/backend/aarch64/assembler.py patch_trace() `b.BL(...)`.
+    /// (set by patch_pending_failure_recoveries). We overwrite the
+    /// stub with "MOV r11, bridge_addr; JMP r11" (x64) or "BL imm26"
+    /// (aarch64), matching rpython/jit/backend/aarch64/assembler.py
+    /// patch_trace().
     pub fn patch_jump_for_descr(descr: &dyn majit_ir::FailDescr, adr_new_target: usize) {
         let stub_addr = descr.adr_jump_offset();
         assert!(stub_addr != 0, "guard already patched");
@@ -4270,8 +4288,8 @@ impl<'a> AssemblerARM64<'a> {
         }
         let descr_arc = op.getdescr();
         if let Some(fd) = descr_arc.as_ref().and_then(|d| d.as_fail_descr()) {
-            // Step A (43c64ee0bb) installs op.descr = ResumeGuardDescr
-            // with post-numbering fail_arg_types via
+            // op.descr is a ResumeGuardDescr carrying post-numbering
+            // fail_arg_types installed by
             // store_final_boxes_in_guard (optimizeopt/mod.rs:3393-3404).
             // Prefer the descr for guards too; fall through to
             // op.fail_arg_types only for sharing-path guards

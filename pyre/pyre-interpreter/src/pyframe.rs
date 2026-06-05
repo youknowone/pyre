@@ -1041,10 +1041,9 @@ impl PyFrame {
     /// PyFrame constructor body called from `createframe` (PyPy
     /// `baseobjspace.py:796`) when `outer_func` is `None` — sets up the
     /// fixed-array stack, debug data, w_globals binding, and module-level
-    /// `w_locals = w_globals` semantics.  Crate-private since Slice C.6
-    /// (PyFrame Heap-Allocation Epic): the only caller is `createframe`,
-    /// which canonicalises heap allocation and wraps the returned value
-    /// in `Box<Self>`.
+    /// `w_locals = w_globals` semantics.  Crate-private: the only caller is
+    /// `createframe`, which canonicalises heap allocation and wraps the
+    /// returned value in `Box<Self>`.
     pub(crate) fn new_with_namespace(
         code: *const (),
         execution_context: *const PyExecutionContext,
@@ -2177,9 +2176,7 @@ impl PyFrame {
 
     /// Common tail of the frame builders: everything in `Frame.__init__`
     /// except the `pick_builtin` resolution, which is lifted to the callers
-    /// so the fallible variant can propagate.  Transitional split for the
-    /// R3.4 frame-build fallibility migration; folds back into a single
-    /// builder once the infallible variant is retired.
+    /// so the fallible variant can propagate its error.
     fn finish_for_call_with_globals_obj(
         code: *const (),
         args: &[PyObjectRef],
@@ -2433,10 +2430,8 @@ fn pyobject_from_constant(constant: &crate::bytecode::ConstantData) -> PyObjectR
 /// ```
 ///
 /// Returns `Box<PyFrame>` matching PyPy's heap-allocated PyFrame (RPython
-/// class instance — `pyframe.py:51 class PyFrame(W_Root)`).  The Box
-/// represents the canonical heap-residency invariant per the PyFrame
-/// Heap-Allocation Epic
-/// (`~/.claude/plans/pyframe-heap-allocation-epic-2026-05-05.md` Slice C.2).
+/// class instance — `pyframe.py:51 class PyFrame(W_Root)`).  The Box keeps
+/// every `PyFrame` heap-resident.
 ///
 /// The body inlines `pyframe.py:98-119 PyFrame.__init__` line-by-line:
 /// allocate `locals_cells_stack_w` of size `nlocals + ncellvars + nfreevars

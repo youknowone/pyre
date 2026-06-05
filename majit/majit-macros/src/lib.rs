@@ -1263,9 +1263,9 @@ fn parse_release_gil_save_err(attr: proc_macro2::TokenStream) -> syn::Result<i32
 ///
 /// The proc-macro is a pass-through: it leaves the struct definition
 /// untouched and exists solely so `rustc` accepts the attribute. The
-/// codewriter front-end (`majit-translate::front::ast`) reads the
-/// attribute directly from the parsed source via `syn` and feeds the
-/// field list into the struct layout / descr pipeline.
+/// codewriter front-end (`majit-translate::front::syn_metadata`) reads
+/// the attribute directly from the parsed source via `syn` and feeds
+/// the field list into the struct layout / descr pipeline.
 #[proc_macro_attribute]
 pub fn jit_immutable_fields(_attr: TokenStream, item: TokenStream) -> TokenStream {
     item
@@ -1286,9 +1286,10 @@ pub fn jit_immutable_fields(_attr: TokenStream, item: TokenStream) -> TokenStrea
 ///      resolution, which doesn't need the trampoline that free
 ///      functions get.
 ///
-/// The codewriter front-end (`majit-translate::front::ast::collect_jit_hints`)
-/// already recognises the bare attribute name `jit_elidable` and
-/// flips the function hint to `"elidable"`, which `mark_elidable`
+/// `#[jit_elidable]` emits the same hidden `_elidable_function_<NAME>`
+/// const as `#[elidable]` (see `rpython_attribute_const_for`); the
+/// ullbc hint harvester (`majit-translate::front::llbc_hints`) maps that
+/// const to the `"elidable"` function hint, which `mark_elidable`
 /// consumes downstream.
 #[proc_macro_attribute]
 pub fn jit_elidable(_attr: TokenStream, item: TokenStream) -> TokenStream {
@@ -1979,8 +1980,9 @@ const JIT_HELPER_ATTRS: &[&str] = &[
     // it inside an `impl` block fails with `not found in this scope`.
     // `#[jit_elidable]` flows the hint without a trampoline, so it can
     // be attached to a method — but discovery requires registering it
-    // in this list.  `front::ast::collect_jit_hints` (front/ast.rs:1971)
-    // then normalises "jit_elidable" → "elidable".
+    // in this list.  It emits the same `_elidable_function_<NAME>` const
+    // as `#[elidable]`, which the ullbc hint harvester
+    // (`front::llbc_hints`) maps to the "elidable" hint.
     "jit_elidable",
     "dont_look_inside",
     "dont_look_inside_cannot_raise",
@@ -2022,9 +2024,10 @@ fn jit_attr_name(attr: &syn::Attribute) -> Option<String> {
 /// exactly as written at the `impl` header (e.g. `[a, Foo]` for
 /// `impl a::Foo { ... }`). Segments are extracted from the type path
 /// (`syn::Type::Path`) so that downstream code can render the
-/// `impl_type` as a joined string matching the parser's
-/// `self_ty_root` canonicalization (parse.rs:702, front/ast.rs:106
-/// `qualify_type_name`). RPython parity: `getfunctionptr(graph)`
+/// `impl_type` as a joined string matching the
+/// `self_ty_root` canonicalization done by
+/// `front::semantic::qualify_type_name_with_imports`. RPython parity:
+/// `getfunctionptr(graph)`
 /// (call.py:174-187) does not distinguish free fns from methods; pyre
 /// keys methods by the `[impl_type_joined, method]` 2-segment CallPath
 /// (lib.rs:406-433), so the macro emits exactly that.
@@ -2201,8 +2204,9 @@ pub fn jit_module(_attr: TokenStream, item: TokenStream) -> TokenStream {
     // `stringify!` on individual idents produces clean
     // whitespace-free identifier strings (unlike `stringify!(a::Foo)`
     // which expands with spaces around `::`).  The resulting joined
-    // form matches the parser's `self_ty_root` canonicalization
-    // (parse.rs:400 → `type_root_ident` + `qualify_type_name`).
+    // form matches the `self_ty_root` canonicalization done by
+    // `front::syn_metadata::type_root_ident` +
+    // `front::semantic::qualify_type_name_with_imports`.
     let helper_name_lits: Vec<proc_macro2::TokenStream> = discovered
         .iter()
         .map(|h| {
@@ -2241,10 +2245,10 @@ pub fn jit_module(_attr: TokenStream, item: TokenStream) -> TokenStream {
     //   `(module_path_with_crate, impl_type_as_written, method, fnaddr)`.
     // The codewriter consumes this through
     // `CallControl::register_macro_impl_helper_trace_fnaddr` which applies
-    // the parser's `qualify_type_name` rule (front/ast.rs:106) to decide
-    // whether to prepend the module prefix before registering the
-    // canonical 2-segment CallPath `[impl_type_joined, method]`
-    // (lib.rs:406-433).
+    // the `qualify_type_name_with_imports` rule
+    // (`front::semantic`) to decide whether to prepend the module prefix
+    // before registering the canonical 2-segment CallPath
+    // `[impl_type_joined, method]` (lib.rs:406-433).
     let impl_entries: Vec<proc_macro2::TokenStream> = discovered
         .iter()
         .filter_map(|h| {
@@ -2299,11 +2303,11 @@ pub fn jit_module(_attr: TokenStream, item: TokenStream) -> TokenStream {
         /// its `(module_path_with_crate, impl_type_as_written, method_name, fnaddr)`
         /// 4-tuple. The codewriter consumes this through
         /// `CallControl::register_macro_impl_helper_trace_fnaddr`, which
-        /// applies the parser's `qualify_type_name` rule
-        /// (front/ast.rs:106) to decide whether to prepend the module
+        /// applies the `qualify_type_name_with_imports` rule
+        /// (`front::semantic`) to decide whether to prepend the module
         /// prefix before storing the canonical 2-segment CallPath
-        /// `[impl_type_joined, method]` — same shape the parser uses for
-        /// `self_ty_root`-keyed methods (parse.rs:702, lib.rs:406-433).
+        /// `[impl_type_joined, method]` — same shape used for
+        /// `self_ty_root`-keyed methods (lib.rs:406-433).
         #[doc(hidden)]
         #[allow(dead_code)]
         pub fn __majit_helper_impl_trace_fnaddrs()

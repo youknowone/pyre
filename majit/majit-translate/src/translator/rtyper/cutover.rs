@@ -10,9 +10,9 @@
 //!
 //! The legacy algorithms live alongside this file as
 //! `translator/rtyper/legacy_{annotator,resolve,pipeline}.rs`.  This
-//! cutover module is the long-lived bridge: the dual-gate, the
-//! default flip, and the prod migration all
-//! call into the entry points defined here.  The `flowspace_adapter`
+//! cutover module is the bridge between them: the dual-gate
+//! comparison and the production type-state path both call into the
+//! entry points defined here.  The `flowspace_adapter`
 //! sibling continues bridging pyre's surface-DSL
 //! `model::FunctionGraph` to the RPython `flowspace::FunctionGraph`
 //! shape the rtyper consumes, until pyre's
@@ -120,13 +120,12 @@ pub(crate) fn lowleveltype_to_concrete(ll: &LowLevelType) -> Result<ConcreteType
 /// `annotated`/`all_blocks` so the rtyper's specialize walk reaches
 /// them.
 ///
-// `seed_callee_blocks` retired at Step 3 (2026-05-07).  The orthodox
-// path `pycall -> recursivecall -> addpendingblock` from
-// description.py:283-305 / annrpython.py:315-336 is now reachable
-// through Step 2's `simple_call_SomeObject` registration; the
+// There is no callee-block pre-seed.  The orthodox path
+// `pycall -> recursivecall -> addpendingblock` from
+// description.py:283-305 / annrpython.py:315-336 is reachable
+// through the `simple_call_SomeObject` registration; the
 // program-wide `compute_at_fixpoint` loop discovers callees from
-// subject call sites without any pre-seed.  The prior pre-seed was
-// a workaround for the missing dispatch.
+// subject call sites without any pre-seed.
 
 /// RAII guard that snapshots every live `legacy_graph.variable_at(slot).
 /// annotation` cell and restores it on `Drop`, isolating the
@@ -274,8 +273,7 @@ pub(crate) fn dual_gate_check(legacy_graph: &LegacyGraph) -> Result<(), String> 
     // The legacy walker's kinds are read from `legacy_graph.concretetype`:
     // `resolve_types` dual-writes every populated slot through
     // `FunctionGraph::set_concretetype_of_inline`, so the graph cells
-    // carry the same view the retired `legacy_state` parameter used to
-    // surface.
+    // carry the kind view this comparison reads.
     let legacy_snapshot = legacy_graph.concretetype_snapshot();
     for (idx, legacy_kind) in legacy_snapshot.iter().enumerate() {
         if *legacy_kind == ConcreteType::Unknown {
@@ -317,17 +315,15 @@ pub(crate) fn dual_gate_check(legacy_graph: &LegacyGraph) -> Result<(), String> 
 /// `Variable.concretetype` cell set by `RPythonTyper::specialize`) so
 /// production callers consume it directly.  The real path is the
 /// authoritative producer; legacy is the fallback for
-/// Skip-classified graphs.  The per-graph divergence comparison
-/// against legacy in
-/// production; the legacy-baseline diff inside
-/// `dual_gate_check_with_registry` itself was retired afterwards —
-/// `Match` now means the real path succeeded, full stop.  Test-time
+/// Skip-classified graphs.  The legacy-baseline diff inside
+/// `dual_gate_check_with_registry` is not run for production graphs —
+/// `Match` means the real path succeeded, full stop.  Test-time
 /// anchor invariants still run [`dual_gate_check`] for legacy-baseline
 /// regression checks against hand-built fixtures.  PyPy
 /// `codewriter.py:33` consumes the rtyper-produced graph directly,
-/// with no dual-gate equivalent; pyre's `Skip` arm is the transitional
-/// scaffolding that retires once every owning epic in
-/// `is_known_unported`'s table converges.
+/// with no dual-gate equivalent; pyre's `Skip` arm is transitional
+/// scaffolding that retires once every category in
+/// `is_known_unported`'s table is implemented.
 #[derive(Debug)]
 pub(crate) enum DualGateOutcome {
     /// Real path completed without panicking and (when the legacy
@@ -363,7 +359,7 @@ pub(crate) enum DualGateOutcome {
     ///   registry (cross-crate / primitive paths the production
     ///   walker doesn't reach yet).
     /// - `undefined operand slot` from cross-block locals
-    ///   threading (Cat 3.2 deferred).
+    ///   threading not yet covered.
     /// - `unimplemented operation` from a not-yet-ported rtyper op
     ///   (e.g. `direct_call` for graphs the rpbc port doesn't
     ///   cover).
@@ -476,9 +472,10 @@ pub(crate) fn dual_gate_check_with_registry(
 /// iteration is ascending-slot-index so anchor-test "first
 /// divergence" messages stay deterministic across runs.
 ///
-/// Survives as a [`dual_gate_check`] test helper after the production
-/// `dual_gate_check_with_registry` baseline strip — anchor tests still
-/// diff the real path against the legacy walker for hand-built
+/// Used as a [`dual_gate_check`] test helper: the production
+/// `dual_gate_check_with_registry` path runs no baseline diff, but
+/// anchor tests still diff the real path against the legacy walker
+/// for hand-built fixtures.
 fn project_value_to_var_to_map(
     value_to_var: &LegacyToTyped,
     constant_concretetypes: &HashMap<Variable, LowLevelType>,
@@ -555,64 +552,62 @@ fn compare_real_against_legacy(
 /// category) and the surface of "unknown failure" shrinks.  When
 /// the predicate matches nothing, the gate is at full coverage.
 ///
-/// **TODO** (audit 2.D, 2026-05-05): each remaining entry is blocked
-/// on a specific porting epic; retiring an entry early is unsafe
-/// until the owning work converges:
+/// Each remaining entry is blocked on a specific unimplemented
+/// feature; retiring an entry early is unsafe until that feature
+/// lands:
 ///
-/// | Substring                                  | Owning work / followup                                                      |
+/// | Substring                                  | Unimplemented feature                                                        |
 /// |--------------------------------------------|------------------------------------------------------------------------------|
-/// | `not registered in PyreCallRegistry`       | Extern Rust helper registry walker (blocked).                                |
-/// | `undefined operand slot`                   | Adapter producer correctness audit.                                          |
-/// | `unimplemented operation`                  | Per-opname rtyper handler ports.                                             |
+/// | `not registered in PyreCallRegistry`       | Extern Rust helper registry walker.                                          |
+/// | `undefined operand slot`                   | Adapter producer correctness.                                                |
+/// | `unimplemented operation`                  | Per-opname rtyper handlers.                                                  |
 /// | `variable used before definition`          | Cross-block locals threading.                                                |
 /// | `MissingRTypeAttribute`                    | Typed-Ref → SomeInstance(ClassDef).                                          |
-/// | `KeyError: no binding for arg`             | Annotator gap audit (per-call coverage).                                     |
+/// | `KeyError: no binding for arg`             | Annotator per-call coverage.                                                 |
 /// | `compute_at_fixpoint failed`               | PBC dispatch / call-family coverage (per-call).                              |
 /// | `post-rtyper jtransform variant`           | Per-variant emit-site retracing (rpbc / rclass / front-end).  Includes `OpKind::Abort` (pyre-only marker; retire every `Expr::ForLoop` / `stop_unsupported` / `continue_with_unknown` emit-site at the front-end). |
 /// | `adapter cross-block body Input`           | Final emit-site retirement.                                                  |
 ///
 /// PyPy `bookkeeper.py:108-127` propagates fixpoint failures uncaught;
-/// pyre's dual-gate Skip is the cutover-time scaffolding that defers
-/// exactly the categories enumerated above.  Once every owning epic
-/// converges, every match returns `false`, the legacy walker fallback
-/// at `codewriter.rs::dual_gate_type_state` becomes dead code, and
-/// the predicate retires entirely.
+/// pyre's dual-gate Skip defers exactly the categories enumerated
+/// above.  Once every category is implemented, every match returns
+/// `false`, the legacy walker fallback at
+/// `codewriter.rs::dual_gate_type_state` becomes dead code, and the
+/// predicate retires entirely.
 pub(crate) fn is_known_unported(msg: &str) -> bool {
     msg.contains("not registered in PyreCallRegistry")
         || msg.contains("undefined operand slot")
         || msg.contains("unimplemented operation")
         || msg.contains("variable ")
             && msg.contains(" used before definition")
-        // (Retired 2026-05-05.) `normalize_unary_op_name: pyre UnaryOp`
-        // and `normalize_binop_name: pyre BinOp` were Skip-classified
-        // when production still emitted `not` / `deref` / `same_as`
-        // and `and` / `or`.  Both surfaces are now desugared upstream
-        // — `UnOp::Not`/`Deref` at `front/ast.rs::Expr::Unary` +
+        // `normalize_unary_op_name: pyre UnaryOp` and
+        // `normalize_binop_name: pyre BinOp` are not Skip-classified:
+        // the `not` / `deref` / `same_as` / `and` / `or` / `invert`
+        // surfaces are desugared upstream — `UnOp::Not`/`Deref` at
+        // `front/ast.rs::Expr::Unary` +
         // `flowspace/rust_source/build_flow.rs::lower_unary_not`,
-        // `&&`/`||` at the matching `Expr::Binary` arms.  `invert`
-        // landed in `normalize_unary_op_name` 2026-05-05.  Synthetic
+        // `&&`/`||` at the matching `Expr::Binary` arms.  Synthetic
         // graphs that inject these ops (anchor tests in
         // `cutover.rs::tests::anchor_unary_*_surfaces_*`) call
         // `specialize_legacy_graph` directly and never reach
-        // `is_known_unported`, so removing these substring matches
-        // does not affect them.  Any production reach surfaces as a
-        // dual-gate divergence panic — the parity-correct outcome.
+        // `is_known_unported`, so the absence of these substring
+        // matches does not affect them.  Any production reach surfaces
+        // as a dual-gate divergence panic — the parity-correct outcome.
         // Field / method dispatch on a `SomeInstance(classdef=None)`
         // — pyre's `Ref` ValueType currently lifts to a classdef-less
-        // SomeInstance (Cat 3.1 placeholder), so `find_attribute`
+        // SomeInstance, so `find_attribute`
         // (`rclass.py:556+find_attribute_or_None`) cannot route the
-        // dispatch.  Cat 3.1.A's `InstanceRepr::rtype_getattr` port
+        // dispatch.  `InstanceRepr::rtype_getattr`
         // (`rclass.py:838-857`) routes through `getclsfield`, which
         // surfaces the upstream-orthodox `MissingRTypeAttribute(attr)`
-        // when find_attribute returns None.  The companion
-        // `"no method ... on Instance("` substring (`rmodel.rs:828`
-        // default `rtype_getattr` find_method failure path) was
-        // retired 2026-05-06: post-Cat-3.1.A every SomeInstance
-        // dispatch goes through the InstanceRepr override, so the
-        // default fn never fires for `Instance(...)`-shaped operands.
-        // The MissingRTypeAttribute entry stays until typed-Ref
-        // ClassDef projection lands and field/method dispatch starts
-        // succeeding.
+        // when find_attribute returns None.  The `"no method ... on
+        // Instance("` substring (`rmodel.rs:828` default
+        // `rtype_getattr` find_method failure path) is not classified
+        // here: every SomeInstance dispatch goes through the
+        // InstanceRepr override, so the default fn never fires for
+        // `Instance(...)`-shaped operands.  The MissingRTypeAttribute
+        // entry stays until typed-Ref ClassDef projection lands and
+        // field/method dispatch starts succeeding.
         || msg.contains("MissingRTypeAttribute")
         // Variable's `.annotation` slot empty at `bindingrepr`
         // lookup time — `ValueType::Unknown` has no
@@ -631,17 +626,16 @@ pub(crate) fn is_known_unported(msg: &str) -> bool {
         // `AnnotatorError` reach the caller; absorbing the four
         // patterns below is a deviation that hides real
         // annotator/rtyper parity gaps as "known unported".  Direct
-        // removal verified 2026-05-12 to break `pyre-jit-trace`
-        // `build.rs` at every reachable hitter
+        // removal breaks `pyre-jit-trace` `build.rs` at every reachable
+        // hitter
         // (`make_green_key`, `Frame::load_fast`, `PyFrame::locals_w_mut`,
         // `<default methods of IterOpcodeHandler>::record_for_iter_guard`,
         // `pyjitpl_step::Cannot find attribute`); production cannot
         // compile until each underlying real-path gap is closed
         // (classdef-less SomeInstance dispatch + `PyreCallRegistry::
-        // ensure_session` coverage — the builtin-analyser binding-
-        // failure reorder converged 2026-05-12 by routing every
-        // analyser body through per-touch `arg_at` instead of the
-        // retired `args_s_concrete_or_panic` eager prefix).  Multi-session epic — until each gap-hitter is
+        // ensure_session` coverage — every analyser body routes through
+        // per-touch `arg_at` rather than an eager-prefix concrete
+        // walk).  Until each gap-hitter is
         // ported, this Skip stays as documented divergence and the
         // codewriter falls back to the legacy walker for production.
         || msg.contains("compute_at_fixpoint failed")
@@ -665,13 +659,9 @@ pub(crate) fn is_known_unported(msg: &str) -> bool {
         // threading misses a name in the predecessor link; the
         // annotator cannot merge `None` annotations.
         || msg.contains("inputarg lacks annotation")
-        // (Retired 2026-05-06.) `AnnotatorError: immutablevalue(HostObject`
-        // was Skip-classified for `SyntheticTransparentCtor` (Ok/Err/Some/
-        // None) — the adapter wrapped the ctor name as
-        // `HostObject::new_opaque(name)` which has no `is_class()` /
-        // `is_user_function()` classification, so `immutablevalue` fell
-        // through to "Don't know how to represent".  The adapter now
-        // emits `HostObject::new_class(name, [])` instead
+        // `AnnotatorError: immutablevalue(HostObject` is not
+        // Skip-classified for `SyntheticTransparentCtor` (Ok/Err/Some/
+        // None).  The adapter emits `HostObject::new_class(name, [])`
         // (`flowspace_adapter.rs:821 SyntheticTransparentCtor` arm),
         // routing through the existing `is_class()` arm in
         // [`crate::annotator::bookkeeper::Bookkeeper::immutablevalue_hostobject`]
@@ -681,13 +671,13 @@ pub(crate) fn is_known_unported(msg: &str) -> bool {
         // parity bug — let it surface as a dual-gate divergence panic.
         // TODO(post-rtyper-jtransform-variant-leak): retire this Skip
         // entry per upstream parity — `jit/codewriter/jtransform.py`
-        // raises straight through on unexpected opnames.  Today the
-        // most frequent reach is `OpKind::Abort` emitted by
+        // raises straight through on unexpected opnames.  The most
+        // frequent reach is `OpKind::Abort` emitted by
         // `front/ast.rs::stop_unsupported` / `continue_with_unknown`
         // when the surface DSL hits an unsupported expression — pyre
         // source like `execute_opcode_step` / `eval_loop_jit` carry such
-        // placeholders today.  Convergence path: retire each Abort
-        // emit-site at the front-end (per-variant epic — closure
+        // placeholders.  Retiring this entry needs each Abort
+        // emit-site at the front-end retired (closure
         // body, complex match arms, unsupported literals), then
         // every other post-rtyper variant (IndirectCall / ResidualCall
         // / Vable* / JitMergePoint / LoopHeader / InlineCall /
@@ -703,22 +693,22 @@ pub(crate) fn is_known_unported(msg: &str) -> bool {
         // local reference goes via `flowcontext.py:872-884 LOAD_FAST`
         // (which writes into `self.locals_w`) and the target block's
         // pre-allocated `inputargs[]`.  Pyre's body-`Input` emission
-        // is itself a TODO (`front/ast.rs:2127-2156`); when Cat 2.1
+        // is itself a TODO (`front/ast.rs:2127-2156`); when
         // cross-block locals threading misses a shape, the adapter
-        // now fails loud with this message instead of silently
+        // fails loud with this message instead of silently
         // fabricating a fresh Variable (which would hide an
         // SSA / alias-shape divergence from PyPy's flowspace).  Skip
-        // until either Cat 2.1 covers every shape, or the front-end's
+        // until either cross-block locals threading covers every
+        // shape, or the front-end's
         // body-`Input` emission is replaced by a Link.args / inputargs
         // threading pass that mirrors RPython.
         || msg.contains("adapter cross-block body Input")
-    // `normalize_unary_op_name: pyre UnaryOp` Skip entry retired
-    // 2026-05-06 + 2026-05-19: the 13 typed numeric / ptr / Unsigned
-    // casts now route through `simple_call(<host_callable>, v)` —
-    // reaching `Repr.rtype_int/float/bool` or
-    // `BUILTIN_TYPER[lltype.cast_*]` directly.  Only the `same_as`
-    // identity / source-type-unknown fallback remains on the
-    // `OpKind::UnaryOp` route, dispatched by
+    // There is no `normalize_unary_op_name: pyre UnaryOp` Skip entry:
+    // the 13 typed numeric / ptr / Unsigned casts route through
+    // `simple_call(<host_callable>, v)` — reaching
+    // `Repr.rtype_int/float/bool` or `BUILTIN_TYPER[lltype.cast_*]`
+    // directly.  Only the `same_as` identity / source-type-unknown
+    // fallback remains on the `OpKind::UnaryOp` route, dispatched by
     // `RPythonTyper::translate_operation` to `rbuiltin::rtype_same_as`
     // (verbatim port of `rtyper.py:478-481`).  `normalize_unary_op_name`
     // accepts `same_as` straight through; any residual fail-loud
@@ -883,15 +873,11 @@ pub(crate) fn populate_call_registry_from_call_graphs(
     Ok(())
 }
 
-// build_program_annotator / build_program_rtyper / ensure_program_
-// specialize were retired at Step 4 first slice (2026-05-07).  They
-// existed solely to drive a program-wide `compute_at_fixpoint` +
-// `RPythonTyper::specialize` over a pre-seeded annotator (Step 3
-// retired the seed; the empty annotator made the pass a no-op).
-// The matching `ProgramSpecializeState` flag and its accessors were
-// retired alongside.  Per-session
+// There is no program-wide `build_program_annotator` /
+// `build_program_rtyper` / `ensure_program_specialize` pre-pass and no
+// `ProgramSpecializeState` flag.  Per-session
 // `specialize_legacy_graph_with_registry_returning_value_to_var`
-// now runs the
+// runs the
 // orthodox flow directly: lift subject graph -> seed subject blocks
 // -> compute_at_fixpoint (drives pycall->recursivecall to discover
 // callees) -> RPythonTyper::specialize.
@@ -947,8 +933,7 @@ pub(crate) fn lift_callee_to_pygraph(
     nested_registry: &PyreCallRegistry,
 ) -> Result<Rc<PyGraph>, TyperError> {
     // The adapter also returns `value_to_var` and `constant_concretetypes`
-    // side maps, but every legacy consumer of those was a dead-write
-    // path into `PyreCallRegistry` (Issue 2.5 retirement, 2026-05-07).
+    // side maps, but they are not consumed here.
     // RPython parity: `Variable.concretetype` and `Constant.concretetype`
     // already carry the per-variable / per-constant LL type after
     // specialise; downstream readers must consult those fields directly
@@ -982,7 +967,7 @@ pub(crate) fn lift_callee_to_pygraph(
     Ok(pygraph)
 }
 
-/// Z2.5 Path C slice 2 — synthesize a minimal flowed `PyGraph` for a
+/// Synthesize a minimal flowed `PyGraph` for a
 /// callee whose real body cannot be lowered through the adapter
 /// (`unsafe fn` in `pyre-object` / `pyre-interpreter`).  The stub has
 /// a single Link from `startblock` to `returnblock` carrying a
@@ -1073,7 +1058,7 @@ pub(crate) fn build_stub_pygraph_for_unsafe_fn(
 /// (`Func` / `Struct` / `Array` / `FixedSizeArray` / `Opaque` /
 /// `ForwardReference`) that `lltype_to_annotation` rejects, and for
 /// `Address` (upstream `SomeAddress`; not yet ported to the pyre
-/// `SomeValue` enum — see `model.rs:21` TODO).  The slice 3c caller
+/// `SomeValue` enum — see `model.rs:21` TODO).  The caller
 /// treats `None` as "skip this fn"; the unported path then surfaces
 /// the original "not registered" Skip.
 pub(crate) fn default_someshell_for_lltype(
@@ -1090,7 +1075,7 @@ pub(crate) fn default_someshell_for_lltype(
     }
 }
 
-/// Z2.5 Path C slice 3c — register a batch of unsafe-fn stub
+/// Register a batch of unsafe-fn stub
 /// `(segments, signature, return_lltype)` specs into `registry`.
 /// Each entry is wrapped through [`build_stub_pygraph_for_unsafe_fn`]
 /// + [`PyreCallRegistry::register_callee`], so subsequent
@@ -1130,8 +1115,7 @@ pub(crate) fn default_someshell_for_lltype(
 /// into executable JITCode.  The actual unsafe-fn body executes
 /// through the residual-call / direct-call fnaddr lowering that
 /// the codewriter emits for the call op whose target resolves
-/// to the host-evaluator entry point.  Reviewer 2026-05-24 round
-/// item #5 audited this layering; the default-Constant return is
+/// to the host-evaluator entry point.  The default-Constant return is
 /// safe by virtue of the `function_graphs` gate, not by any
 /// `look_inside_graph` policy on the stub itself.
 pub(crate) fn register_unsafe_fn_stubs(
@@ -1219,7 +1203,7 @@ fn signature_for(func: &front::SemanticFunction) -> Signature {
 /// Walk a `SemanticProgram` and pre-register every
 /// reachable `SemanticFunction` in the call registry.
 ///
-/// Closes Issue 2.1 from the post-A.4 audit: production callers
+/// Production callers
 /// with `OpKind::Call::FunctionPath` ops cannot proceed through the
 /// real-rtyper path without the registry pre-populated, because
 /// pyre's surface DSL has no Python callable object for the
@@ -1323,16 +1307,15 @@ pub fn specialize_legacy_graph_with_registry_returning_value_to_var(
     //
     // Upstream `RPythonTyper.specialize` runs ONCE per `Translator`,
     // not per graph.  Pyre's per-graph dual-gate enters this function
-    // once per graph (one per `transform_graph_to_jitcode`), so the
-    // upstream "specialize-once" semantics are reproduced by lazily
-    // driving the program-wide pass on first entry and gating
-    // `seed_callee_blocks` on the resulting state.  After the
-    // program-wide pass succeeds, the cached PyGraphs hold
+    // once per graph (one per `transform_graph_to_jitcode`); the
+    // upstream "specialize-once" semantics are reproduced by sharing
+    // one annotator + rtyper across subjects through
+    // `PyreCallRegistry::ensure_session` and rtyping only the newly
+    // added blocks each entry.  Already-cached PyGraphs hold
     // post-specialize LL ops; re-seeding them into the per-session
     // annotator would let `specialize_more_blocks` walk the LL ops a
     // second time and trip on `unimplemented operation: 'int_add'` /
-    // `'direct_call'` — see memory
-    // `skip_unimplemented_int_add_diagnosis_2026_05_06`.
+    // `'direct_call'`.
     // ── Step 1 — adapter ─────────────────────────────────────────────
     let FlowspaceAdapterOutput {
         graph,
@@ -1346,8 +1329,8 @@ pub fn specialize_legacy_graph_with_registry_returning_value_to_var(
 
     // ── Step 2 — annotator surface ────────────────────────────────
     //
-    // Step 4 second slice (2026-05-07): the annotator + rtyper are
-    // now session-shared through `PyreCallRegistry::ensure_session`,
+    // The annotator + rtyper are
+    // session-shared through `PyreCallRegistry::ensure_session`,
     // mirroring RPython's "one annotator + one rtyper per Translator"
     // (`translator.py:69-83`).  Each per-graph subject seeds its
     // blocks into the shared annotator; subsequent
@@ -1399,21 +1382,14 @@ pub fn specialize_legacy_graph_with_registry_returning_value_to_var(
         annotator.all_blocks.borrow_mut().insert(bkey, exceptblock);
     }
 
-    // Step 3 (2026-05-07): the prior per-session `seed_callee_blocks`
-    // call was a workaround for the missing `simple_call_SomeObject`
-    // registration — without that registration, flowin trips on the
-    // first `simple_call(host_object_const, args)` op with
-    // "no unary spec for SimpleCall(PBC)".  Pre-seeding callee blocks
-    // bypassed the trip but skipped the orthodox `pycall ->
-    // recursivecall -> addpendingblock` chain entirely.
-    //
-    // Step 2 added `@op.simple_call.register(SomeObject)` (unaryop.py:
-    // 114-118 parity) so flowin now dispatches through `s_func.call(
+    // Callee blocks are seeded naturally with no explicit pre-seed:
+    // `@op.simple_call.register(SomeObject)` (unaryop.py:114-118
+    // parity) makes flowin dispatch the first
+    // `simple_call(host_object_const, args)` op through `s_func.call(
     // argspec)` -> `SomePBC.call` -> `Bookkeeper.pbc_call` ->
     // `FunctionDesc.pycall` -> `annotator.recursivecall`, which calls
     // `addpendingblock(graph, startblock, inputcells)` for the
-    // callee.  The orthodox path now seeds callee blocks naturally;
-    // the explicit pre-seed is no longer needed.
+    // callee.
 
     // Addpendingblock conversion — drain the pending
     // queue so `flowin` walks every block reachable from
@@ -1441,27 +1417,18 @@ pub fn specialize_legacy_graph_with_registry_returning_value_to_var(
     // rtyper's `FunctionRepr.call(hop)` (`rpbc.py:199`) finds the
     // matching call-family row at `find_row` time.
     //
-    // The drain runs in BOTH Done and Failed branches:
+    // The subject just seeded into this annotator is brand-new and its
+    // `simple_call` ops have not been processed yet; this drain
+    // processes the subject's (and any newly seeded callees')
+    // call_sites so their rows land in `pbc_maximal_call_families`
+    // before specialize looks them up.
     //
-    // - Done: program-wide drained the cached graphs' callsites, but
-    //   the subject we are about to specialize is brand-new (its
-    //   freshly-lifted blocks were just seeded into this annotator)
-    //   and its `simple_call` ops have not yet been processed.  The
-    //   subject's call_sites entries on the bookkeeper are processed
-    //   here so its callsites' rows land in
-    //   `pbc_maximal_call_families` before specialize tries to look
-    //   them up.
-    // - Failed / Pending-skipped: legacy entry — drains every
-    //   reachable callsite (subject + seeded callees) for the first
-    //   time.
-    //
-    // Errors propagate verbatim (Issue 3.1) — upstream
+    // Errors propagate verbatim — upstream
     // `bookkeeper.py:108-118` runs the call-site walk without a
     // `try`/`except`, so a failed `consider_call_site` terminates
     // `simplify` and unwinds out of the annotator driver.  Pyre's
     // port surfaces the same condition through `?`-propagation
-    // here, replacing the prior `let _ = ...` swallow at
-    // `bookkeeper.rs:627-648` that masked PBC dispatch failures.
+    // here rather than swallowing it at `bookkeeper.rs:627-648`.
     call_registry
         .bookkeeper()
         .compute_at_fixpoint()
@@ -1500,16 +1467,14 @@ pub fn specialize_legacy_graph_with_registry_returning_value_to_var(
 
     // ── Step 4 — validate per-slot lltype projection ──────────────
     //
-    // The eager side-table build was retired and the struct itself
-    // deleted.  Each callable that needs
-    // a kind view derives one on demand from `value_to_var` +
+    // No eager per-slot side table is built here.  Each callable that
+    // needs a kind view derives one on demand from `value_to_var` +
     // `constant_concretetypes` via
     // [`project_value_to_var_to_map`] — same `Variable.concretetype`
-    // / `Constant.concretetype` ground truth, just routed at the
+    // / `Constant.concretetype` ground truth, routed at the
     // consumer instead of eagerly materialised here.  Run a
     // validation pass so unsupported lltypes still surface as a
-    // [`TyperError`] at this boundary (mirroring the earlier
-    // fail-loud `?` propagation in the state-build loop).
+    // [`TyperError`] at this boundary (a fail-loud `?` propagation).
     for var in value_to_var.values() {
         let cell = var.concretetype.borrow();
         if let Some(lltype) = cell.as_ref() {
@@ -1755,7 +1720,7 @@ mod tests {
     #[test]
     fn specialize_legacy_graph_ref_typed_inputarg_resolves_to_gcref() {
         let _lock = anchor_lock();
-        // Cat 3.1 fix: `valuetype_to_someshell(Ref)` now lifts to
+        // `valuetype_to_someshell(Ref)` lifts to
         // `SomeInstance(classdef=None)` instead of the illegal
         // `SomeObject` placeholder (`model.py:51-69` `SomeObject` is
         // abstract).  The rtyper routes through `getinstancerepr(rtyper,
@@ -1933,16 +1898,12 @@ mod tests {
              translator.graphs instead of falling to top_result()"
         );
     }
-    // `build_program_annotator_starts_empty_after_step3` retired at
-    // Step 4 first slice (2026-05-07).  The function being tested
-    // (`build_program_annotator`) was retired together with the
-    // dead-pass `build_program_rtyper` and `ensure_program_specialize`
-    // helpers, since after Step 3 they ran a no-op against an empty
-    // annotator.  Per-session annotator construction inside
+    // There is no program-wide annotator pre-pass to test: per-session
+    // annotator construction inside
     // `specialize_legacy_graph_with_registry_returning_value_to_var`
-    // is the only remaining production lifecycle.
+    // is the only production lifecycle.
 
-    // ─── Z2.5 Path C slice 2 helpers ───
+    // ─── unsafe-fn stub helpers ───
     #[test]
     fn default_someshell_for_lltype_integer_family_yields_someinteger_no_const() {
         use crate::annotator::model::SomeValue;
@@ -2086,8 +2047,8 @@ mod tests {
                 Signature::new(vec!["obj".to_string()], None, None),
                 LowLevelType::Bool,
             ),
-            // Compound lltype — slice 2's default_constvalue_for_lltype
-            // returns None and register_unsafe_fn_stubs must skip.
+            // Compound lltype — the stub-pygraph builder returns None
+            // and register_unsafe_fn_stubs must skip.
             (
                 vec!["pyobject".to_string(), "unsupported".to_string()],
                 Signature::new(vec!["x".to_string()], None, None),
@@ -2120,7 +2081,7 @@ mod tests {
         );
     }
 
-    /// Reviewer round 2026-05-24 item #5 — pin the layering invariant
+    /// Pin the layering invariant
     /// that the synthetic stub-pygraph is annotator-only.  The
     /// `register_unsafe_fn_stubs` helper writes the stub into the
     /// `PyreCallRegistry` cache but does NOT mutate any
@@ -2196,7 +2157,7 @@ mod tests {
     #[test]
     fn build_stub_pygraph_returns_none_for_compound_lltype() {
         // Compound lltypes have no representable default; the helper
-        // must return `None` so slice 3's caller skips registration.
+        // must return `None` so the caller skips registration.
         let sig = Signature::new(vec!["x".to_string()], None, None);
         let func_ll = LowLevelType::Func(Box::new(
             crate::translator::rtyper::lltypesystem::lltype::FuncType {

@@ -4805,7 +4805,8 @@ fn lower_index(b: &mut Builder, idx: &ExprIndex) -> Result<Hlvalue, AdapterError
 fn lower_cast(_b: &mut Builder, _c: &ExprCast) -> Result<Hlvalue, AdapterError> {
     // `x as T` is rejected here pending source-type inference.
     // build_flow.rs does not track per-`Hlvalue` `ValueType` (unlike
-    // `front/ast.rs::Expr::Cast` which uses `graph_value_type`), so
+    // `front::mir`, which derives the cast label from the source and
+    // target kinds of the lowered ULLBC `Cast`), so
     // `cast_builtin_name(None, target)` would always return `None`
     // and the cast would degrade to the `same_as` identity fallback
     // — silently retyping `Int → Float`, `Float → Int`, `Bool → Int`
@@ -4821,7 +4822,7 @@ fn lower_cast(_b: &mut Builder, _c: &ExprCast) -> Result<Hlvalue, AdapterError> 
         reason: "`x as T` lowering pending source-type inference in build_flow.rs — \
             without per-Hlvalue ValueType the cast would silently fall through to \
             `same_as` and mistranslate `cast_int_to_float` / `cast_bool_to_int` / \
-            `int_is_true`. Use `front/ast.rs` (which has source-type lookup) or an \
+            `int_is_true`. Use a lowering path with source-type lookup or an \
             explicit helper call."
             .into(),
     })
@@ -8730,9 +8731,10 @@ mod tests {
         // `cast_builtin_name(None, target)` returns None and the
         // cast degrades to the transparent `same_as` fallback —
         // silently mistranslating `cast_int_to_float` /
-        // `cast_bool_to_int` / `int_is_true`.  Front/ast.rs::
-        // Expr::Cast (which has `graph_value_type`) remains the
-        // lowering path for typed casts.
+        // `cast_bool_to_int` / `int_is_true`.  `front::mir` (which
+        // derives the cast label from the source and target kinds of
+        // the lowered ULLBC `Cast`) remains the lowering path for
+        // typed casts.
         match lower("fn f(x: i64) -> i64 { x as i32 }").unwrap_err() {
             AdapterError::Unsupported { reason } => {
                 assert!(reason.contains("`x as T`"), "reason: {reason}");

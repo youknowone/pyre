@@ -176,8 +176,7 @@ pub enum ExcKind {
     /// (PyPy-orthodox, one GC type id per kind, isolated layouts) or
     /// extending `W_ExceptionObject` with the union of all per-class
     /// fields (single GC type id, every instance pays the slot cost).
-    /// Tracked as a separate multi-class epic — see task #123 for the
-    /// Unicode*Error subset.
+    /// Not yet implemented.
     UnicodeTranslateError = 28,
 }
 

@@ -559,7 +559,7 @@ pub(crate) fn bh_portal_runner(all_i: &[i64], all_r: &[i64], _all_f: &[i64]) -> 
 /// `_run_forever` must exit via exactly one of these variants.
 /// Call sites still return `BlackholeResult` and will be migrated
 /// once `consume_vable_info` guarantees resume data validity.
-#[allow(dead_code)] // populated progressively over the epic
+#[allow(dead_code)] // not all variants are constructed yet
 pub enum JitException {
     /// jitexc.py:53 ContinueRunningNormally(gi, gr, gf, ri, rr, rf):
     /// blackhole reached the merge point → restart the portal. The six
@@ -1210,10 +1210,9 @@ fn jit_blackhole_resume_from_guard(
     // IS the callee's `PyFrame*`, so `frame.pycode` plus `pc=0`
     // reconstructs the entry green_key.  This contract is
     // Python-portal-specific and would NOT hold for a non-virtualizable
-    // JIT or a portal whose first fail arg is a scalar.  Convergence:
-    // Unification replaces `(green_key, trace_id,
-    // fail_index)` keying with descr identity — at which point this
-    // whole recovery block collapses.
+    // JIT or a portal whose first fail arg is a scalar.  Keying resume
+    // storage by descr identity directly would remove the need for this
+    // recovery block.
     let actual_green_key = match majit_backend::descr_owning_jct(descr_fd).map(|j| j.green_key) {
         Some(gk) => gk,
         None if num_fail_values >= 1 => {
@@ -1734,11 +1733,11 @@ pub fn trace_and_compile_from_bridge(
     // line readers.  Both production callers — the general guard path
     // (eval.rs `handle_fail`) and the CALL_ASSEMBLER bridge entry
     // (call_jit.rs `jit_ca_handle_guard_failure`) — have an Arc available
-    // before reaching this function (T-CA + T-CA.cranelift gave both
-    // backends `Backend::fail_descr_arc_from_addr` recovery from
-    // `FailDescrCell` thin pointers), so the surrogate
-    // `(green_key, trace_id, fail_index)` parameters retired
-    // in T-final.B.
+    // before reaching this function (both backends recover it from
+    // `FailDescrCell` thin pointers via
+    // `Backend::fail_descr_arc_from_addr`), so this function takes only
+    // the descr Arc and derives `(green_key, trace_id, fail_index)`
+    // itself.
     descr_arc: &std::sync::Arc<dyn majit_ir::Descr>,
     frame: &mut PyFrame,
     raw_values: &[i64],
@@ -2011,8 +2010,8 @@ fn jit_ca_handle_guard_failure(
     // `Backend::fail_descr_arc_from_addr` panics if the raw value is not
     // a live `FailDescrCell` pointer, matching RPython's
     // `cpu.get_latest_descr(deadframe)` (warmspot.py:1021) which has no
-    // failure mode.  T-final.B made `trace_and_compile_from_bridge`
-    // itself descr-only.
+    // failure mode.  `trace_and_compile_from_bridge` itself takes only
+    // the descr Arc.
     let descr_arc: std::sync::Arc<dyn majit_ir::Descr> = {
         use majit_backend::Backend;
         let (driver, _) = crate::eval::driver_pair();
@@ -3327,11 +3326,10 @@ pub extern "C" fn bh_set_current_exception(exc: i64) {
     pyre_interpreter::eval::set_current_exception(exc as pyre_object::PyObjectRef);
 }
 
-/// On-demand resume callback (Slice QQ-2, pyre-jit side).  Registered
-/// into cranelift via `register_resumedata_deopt` (eval.rs:init_callbacks)
-/// and called from the six `recovery_layout_ref()` consumer sites
-/// once they migrate off the pre-baked `ExitRecoveryLayout` cache
-/// (Slice QQ-3+).
+/// On-demand resume callback (pyre-jit side).  Registered into cranelift
+/// via `register_resumedata_deopt` (eval.rs:init_callbacks) and called
+/// from the `recovery_layout_ref()` consumer sites that have migrated off
+/// the pre-baked `ExitRecoveryLayout` cache.
 ///
 /// PyPy parity target: `pyjitpl.py:3424
 /// MetaInterp.rebuild_state_after_failure(resumedescr, deadframe)`
@@ -3479,14 +3477,12 @@ pub fn cranelift_resumedata_deopt(
 /// Used by `CraneliftFailDescr::recovery_layout_ref` to derive the
 /// layout from the metainterp-side `StoredExitLayout.resume_layout`
 /// summary instead of reading the
-/// `ResumeGuardDescr.recovery_layout` cache (Path 1 epic — eliminate
-/// the cache so the meta-side slot can be deleted).
+/// `ResumeGuardDescr.recovery_layout` cache.
 ///
 /// Returns `None` for synthetic descrs (FINISH / external-JUMP /
 /// overlay) without a `ResumeGuardDescr` meta_descr or for descrs
 /// whose `compiled_loops` entry has been evicted; callers fall back
-/// to the meta-side slot read (current behaviour) until
-/// the slot is deleted entirely.
+/// to the meta-side slot read in that case.
 #[cfg(feature = "cranelift")]
 pub fn cranelift_recovery_layout_for_descr(
     descr_addr: usize,

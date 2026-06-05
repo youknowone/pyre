@@ -1,20 +1,16 @@
-//! Small syn-AST utility helpers extracted from `front::ast`.
+//! Small syn parsing utility helpers.
 //!
-//! These are pure string-manipulation / attribute-walking helpers
-//! that do not depend on `GraphBuildContext` or any other piece of
-//! the AST graph builder.  Carving them out is a step toward
-//! retiring `front::ast` (issue #97 Step 6.F): consumers outside the
-//! graph builder (`jit_codewriter::call`, hybrid passes in `lib.rs`)
-//! can depend on this module without pulling in 15k LOC of legacy
-//! AST lowering.
+//! These are pure string-manipulation / attribute-walking helpers over
+//! a parsed `syn` tree, used to harvest file-parse metadata (imports,
+//! statics, struct/trait origins, return-type identities).  Consumers
+//! (`jit_codewriter::call`, hybrid passes in `lib.rs`) depend on this
+//! module for that metadata alone.
 
 /// Detect the canonical `Result<T, …>` wrapper and project the inner
 /// `T`.  Returns `None` for non-`Result` shapes, for `Result<(), …>`
 /// (no transparent type to project), and for malformed inputs.
 ///
-/// `front::ast::transparent_result_ok_type` was the original home;
-/// the only consumers (`jit_codewriter::call`) live outside the AST
-/// graph builder so the helper moves with them.
+/// The only consumers live in `jit_codewriter::call`.
 pub fn transparent_result_ok_type(type_str: &str) -> Option<&str> {
     let trimmed = type_str.trim();
     for prefix in ["Result<", "std::result::Result<", "core::result::Result<"] {
@@ -37,10 +33,7 @@ pub fn transparent_result_ok_type(type_str: &str) -> Option<&str> {
 /// `args` (`"A, B<C, D>, E"` → `"A"`).  Tracks bracket depth so a
 /// nested generic boundary does not confuse the split.
 ///
-/// Lives here because [`transparent_result_ok_type`] needs it; the
-/// AST graph builder retains its own copy under
-/// `front::ast::first_top_level_generic_arg` for its private callers
-/// (`transparent_result_err_type`, `transparent_option_inner_type`).
+/// Used by [`transparent_result_ok_type`].
 pub fn first_top_level_generic_arg(args: &str) -> Option<&str> {
     let mut depth = 0usize;
     for (idx, ch) in args.char_indices() {
@@ -60,9 +53,7 @@ pub fn first_top_level_generic_arg(args: &str) -> Option<&str> {
 /// `Vec<T>` / `GcArray<T>` / `Ptr(GcArray(T))` shapes carry a length
 /// header at offset 0 and therefore keep the PyPy default `False`.
 ///
-/// Originally `front::ast::nolength_from_array_type_id`; only
-/// `jit_codewriter::call` consumes it, and it carries no AST-builder
-/// dependency.
+/// Only `jit_codewriter::call` consumes it.
 pub fn nolength_from_array_type_id(array_type_id: Option<&str>) -> bool {
     let Some(s) = array_type_id else {
         return false;
@@ -521,34 +512,13 @@ pub fn collect_struct_origins(
     }
 }
 
-// ── `match`-arm pattern classifiers ──────────────────────────────────
-//
-// Used by the AST lowering of `match`-on-bool and `match`-on-integer
-// scrutinees to extract per-arm `ExitCase` data. All helpers below
-// inspect `syn::Arm` / `syn::Pat` without touching the graph builder,
-// so they live in this module alongside the other syn-walk helpers.
-
-// ── `#[elidable_promote]` synthesis (`rlib/jit.py:180-201`) ─────────
-//
-// Pure syn-tree transformation: takes a `syn::ItemFn` and expands it
-// into the (orig, wrapper) pair when the source carries
-// `#[elidable_promote]` / `#[purefunction_promote]`, otherwise returns
-// the source unchanged. The graph builder is not involved.
-
-// ── Loop-header phi pre-scan ────────────────────────────────────────
-//
-// Static walk of a `while` / `loop` / `for` body to partition the
-// referenced names into reads and rebinds. The loop-header eager phi
-// allocator consumes this to pre-allocate inputarg slots in the header
-// block. No graph builder state is involved.
-
 /// Pyre-side `Class::Variant` unit-variant ctors.  These are valid
 /// as bare path-expression values; `flowspace_adapter` pre-folds them
 /// to `Hlvalue::Constant(ConstValue::HostObject(prebuilt_instance))`
 /// before the rtyper sees a call (mirrors PyPy `rtyper` resolving
 /// `SomePBC([InstanceDesc(<unit-variant>)])` to a singleton constant
-/// before `jtransform`).  Re-exported `pub(crate)` from `front::ast`
-/// so `translator::rtyper::flowspace_adapter::is_synthetic_unit_variant_call`
+/// before `jtransform`).  Exposed `pub(crate)` so
+/// `translator::rtyper::flowspace_adapter::is_synthetic_unit_variant_call`
 /// reads the same allowlist.
 pub(crate) fn is_synthetic_unit_variant_path(segments: &[String]) -> bool {
     let path: Vec<&str> = segments.iter().map(String::as_str).collect();

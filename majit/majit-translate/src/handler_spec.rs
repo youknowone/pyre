@@ -1,10 +1,10 @@
 //! Spec-driven derivation for the simple `OpcodeHandler` trait impls.
 //!
-//! Phase B of the eval-loop automation plan. The 5 "simple" traits
-//! (`Constant/Stack/Truth/Iter/Local`) have method bodies regular enough
-//! to describe with a small enum. `emit_simple_trait_impls()` walks the
-//! spec table and produces the exact Rust source bytes that used to live
-//! in `pyre/pyre-jit-trace/src/opcode_handler_impls.template.rs`.
+//! The 5 "simple" traits (`Constant/Stack/Truth/Iter/Local`) have method
+//! bodies regular enough to describe with a small enum.
+//! `emit_simple_trait_impls()` walks the spec table and produces the exact
+//! Rust source bytes that used to live in
+//! `pyre/pyre-jit-trace/src/opcode_handler_impls.template.rs`.
 //!
 //! The spec table is intentionally narrow — each variant captures one
 //! body *shape*, not one method. Adding a new constant kind only requires
@@ -12,8 +12,6 @@
 //!
 //! The variant traits (`Shared/Namespace/Branch/ControlFlow/Arithmetic`)
 //! are too irregular for spec abstraction and remain in the template file.
-//! Phase D will replace both layers with jitcode dispatch from the per-opcode
-//! `JitCode` artifact, so this transcription does not have to live forever.
 
 /// Description of a `*_constant` method on `ConstantOpcodeHandler`.
 struct ConstantMethod {

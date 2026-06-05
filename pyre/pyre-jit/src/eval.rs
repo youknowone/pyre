@@ -75,8 +75,9 @@ fn pyre_object_gc_alloc_stable_trampoline(type_id: u32, size: usize) -> *mut u8 
 /// dangle after collection. pyre's interpreter has no shadowstack
 /// pass and does not register every per-handler temporary, so a
 /// user-triggered `gc.collect()` from a JIT-initialised context can
-/// segfault on the next memory access. Wiring lands so the trampoline
-/// is in place; safe enablement waits on the shadowstack epic.
+/// segfault on the next memory access. The trampoline is wired up, but
+/// safe enablement is not yet implemented: it requires a shadowstack
+/// pass that registers every live PyObjectRef as a GC root.
 fn pyre_object_gc_collect_trampoline() {
     majit_gc::collect_full();
 }
@@ -520,8 +521,9 @@ thread_local! {
         // and `add_vtable_after_typeinfo` (gctypelayout.py:359-374). pyre's
         // earlier one-typeid-per-root-layout approximation under-walked
         // lists/tuples/range-iters as soon as their descr groups carried
-        // `type_id = 0`. `gc_ptr_offsets` stays empty for all four — this
-        // slice is pure bookkeeping; real pointer fields will be added later.
+        // `type_id = 0`. `gc_ptr_offsets` stays empty for all four — these
+        // registrations are pure bookkeeping; their pointer fields are
+        // not modeled here.
         let w_bool_tid = gc.register_type(TypeInfo::object_subclass(
             std::mem::size_of::<pyre_object::boolobject::W_BoolObject>(),
             w_int_tid,
@@ -534,20 +536,16 @@ thread_local! {
         debug_assert_eq!(range_iter_tid, RANGE_ITER_GC_TYPE_ID);
         // rlist.py:116 parity: W_ListObject has a single GC pointer
         // field — `items: Ptr(GcArray(OBJECTPTR))` — directly at
-        // `offset_of!(items)`. Phase L1 retired the `PyObjectArray`
-        // fat wrapper, so the GC offset no longer goes through an
-        // intermediate block-start field.
+        // `offset_of!(items)`. The GC offset points straight at `items`
+        // with no intermediate block-start field.
         //
-        // STEPPING-STONE (Phase L2 pending). The pointer shape is now
-        // correct but the block `items` points to is still
-        // `std::alloc`-owned (`alloc_items_block` in
-        // `pyre_object::object_array`), so
-        // `is_nursery_object_start` (collector.rs:377) rejects it
-        // and the walker no-ops. Activates end-to-end only after
-        // the allocator cutover (blocked on GC-root
-        // infrastructure). Do NOT promote `W_LIST_GC_TYPE_ID` to
-        // "fully-parity" status in docs/MEMORY while this stepping-
-        // stone state holds.
+        // The pointer shape is correct, but the block `items` points to
+        // is still `std::alloc`-owned (`alloc_items_block` in
+        // `pyre_object::object_array`), so `is_nursery_object_start`
+        // (collector.rs:377) rejects it and the walker no-ops. This
+        // registration is inert until `items` blocks are allocated
+        // through the GC, so `W_LIST_GC_TYPE_ID` is not yet at full
+        // parity.
         let mut w_list_ti = TypeInfo::object_subclass(
             std::mem::size_of::<pyre_object::listobject::W_ListObject>(),
             object_tid,
@@ -559,10 +557,10 @@ thread_local! {
         w_list_ti.has_gc_ptrs = true;
         let w_list_tid = gc.register_type(w_list_ti);
         debug_assert_eq!(w_list_tid, W_LIST_GC_TYPE_ID);
-        // Same stepping-stone caveat as W_LIST above; Phase T1-full
-        // (specialised arity-2 variants per
-        // `pypy/objspace/std/specialisedtupleobject.py`) + Phase L2
-        // allocator cutover together complete the tuple convergence.
+        // Same inert-until-GC-allocated caveat as W_LIST above. Full
+        // tuple convergence additionally requires specialised arity-2
+        // variants (per `pypy/objspace/std/specialisedtupleobject.py`),
+        // which are not yet modeled here.
         let mut w_tuple_ti = TypeInfo::object_subclass(
             std::mem::size_of::<pyre_object::tupleobject::W_TupleObject>(),
             object_tid,
@@ -585,17 +583,15 @@ thread_local! {
         // item slot as a Ref; NULL-initialized spare slots past the
         // live length are benign.
         //
-        // STEPPING-STONE (metadata precedes runtime). This typeid
-        // only governs blocks allocated *through the GC*. Today
-        // `alloc_items_block` uses `std::alloc::alloc`, so no
-        // concrete allocation carries this typeid at runtime — the
-        // registration shapes the GC's type table but no walker
-        // ever visits a PY_OBJECT_ARRAY_GC_TYPE_ID-tagged object.
-        // Activates once Phase L2 swaps the allocator (blocked on
-        // GC-root infrastructure). See comments on
-        // `pyre_jit_trace::descr::PY_OBJECT_ARRAY_GC_TYPE_ID` and
-        // `pyre_object::object_array::ItemsBlock` for the
-        // companion stepping-stone notices.
+        // This typeid only governs blocks allocated *through the GC*.
+        // `alloc_items_block` uses `std::alloc::alloc`, so no concrete
+        // allocation carries this typeid at runtime — the registration
+        // shapes the GC's type table but no walker ever visits a
+        // PY_OBJECT_ARRAY_GC_TYPE_ID-tagged object. It becomes live only
+        // once `items` blocks are allocated through the GC. See comments
+        // on `pyre_jit_trace::descr::PY_OBJECT_ARRAY_GC_TYPE_ID` and
+        // `pyre_object::object_array::ItemsBlock` for the companion
+        // notices.
         let py_object_array_tid = gc.register_type(TypeInfo::varsize(
             pyre_object::object_array::ITEMS_BLOCK_ITEMS_OFFSET,
             std::mem::size_of::<pyre_object::pyobject::PyObjectRef>(),
@@ -1304,7 +1300,7 @@ thread_local! {
         // hardcoded tid shifts.  `W_CodeObject` carries only raw /
         // non-GC pointers today (`code_ptr`, `w_globals`,
         // `globals_caches`), so it registers with empty gc_ptr offsets;
-        // a `w_globals_obj` PyObjectRef slot is added in a later slice.
+        // it has no `w_globals_obj` PyObjectRef slot to trace.
         // Allocation still routes through `Box::into_raw`
         // (`w_code_new` → `malloc_typed`), so this registration is inert
         // — the collector never reaches a code object until `w_code_new`
@@ -1677,15 +1673,15 @@ thread_local! {
         pyre_object::gc_hook::register_gc_identity_hash_hook(
             pyre_object_gc_identity_hash_trampoline,
         );
-        // Fix 9 — `dictmultiobject.py:1209 ObjectDictStrategy` key
-        // dispatch: register the `space.eq_w` trampoline so
-        // `dict_keys_equal` honours user-defined `__eq__`.
+        // `dictmultiobject.py:1209 ObjectDictStrategy` key dispatch:
+        // register the `space.eq_w` trampoline so `dict_keys_equal`
+        // honours user-defined `__eq__`.
         pyre_object::dict_eq_hook::register_eq_w_hook(pyre_object_eq_w_trampoline);
-        // Item 1.2 — companion `space.hash_w` hook so
+        // Companion `space.hash_w` hook so
         // `dict_keys_equal` enforces the r_dict bucket invariant
         // (eq_w + matching hash_w → same key; different hash_w → distinct).
         pyre_object::dict_eq_hook::register_hash_w_hook(pyre_object_hash_w_trampoline);
-        // Slice D5 — `dictmultiobject.py:702-705
+        // `dictmultiobject.py:702-705
         // EmptyDictStrategy.switch_to_correct_strategy` identity branch:
         // register the `W_TypeObject.compares_by_identity` trampoline so
         // user-defined classes without overridden `__eq__`/`__hash__`
@@ -3630,8 +3626,7 @@ fn resume_in_blackhole_from_exit_layout(
     // `infer_terminal_exit_layout`) and synthesized fallback layouts,
     // none of which reach the guard blackhole path. If one ever did,
     // there would be no resume data to decode — fail loudly rather than
-    // silently mis-resume. (Task #64 tracks proving storage=None can
-    // never reach here.)
+    // silently mis-resume.
     panic!(
         "resume_in_blackhole_from_exit_layout: exit_layout.storage missing \
          (trace={} fail_idx={})",
@@ -4243,10 +4238,9 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
                             // (`blackhole.py:1679` raises
                             // `ExitFrameWithExceptionRef` instead).  The
                             // `BlackholeResult::Failed` variant is a pyre
-                            // layering; SSA-authoritative live_r slices
-                            // 3b-2/3b-3 should eliminate the triggers by
-                            // reading/writing registers_r at post-regalloc
-                            // color instead of semantic slot index.
+                            // layering; reading/writing registers_r at
+                            // post-regalloc color instead of semantic slot
+                            // index would eliminate the triggers.
                             if majit_metainterp::majit_log_enabled() {
                                 eprintln!(
                                     "[jit][BUG] blackhole failed key={} — invalidating",
@@ -5514,7 +5508,7 @@ pub(crate) fn decode_and_restore_guard_failure(
     // RPython parity: every guard reaching this path MUST carry rd_numb.
     // `store_final_boxes_in_guard` (optimizeopt/mod.rs:2936) populates
     // it for tracer-origin guards; backend-origin layouts propagate it
-    // via `FailDescrLayout.rd_numb` (commit c7ea7cb58b). An empty
+    // via `FailDescrLayout.rd_numb`. An empty
     // `rd_numb` here indicates an unported guard-emission site — hard
     // assert so the gap surfaces rather than silently degrade via a
     // pyre-only single-frame synthesis.
@@ -7117,9 +7111,8 @@ mod tests {
                 r if r == color_c => values.push(Value::Ref(GcRef(w_int_new(3) as usize))),
                 r if r == color_i => values.push(Value::Int(7)),
                 // pypy/module/pypyjit/interp_jit.py:68 reds = ['frame',
-                // 'ec'] — portal red args ride the live_r mask after
-                // codewriter commit 9f0d0f6c18 (interp_jit.py parity).
-                // The two trailing live regs are portal_frame_reg /
+                // 'ec'] — portal red args ride the live_r mask. The two
+                // trailing live regs are portal_frame_reg /
                 // portal_ec_reg holding the runtime frame_ptr and ec.
                 _ if Some(reg) == live_regs.iter().rev().nth(1) => {
                     values.push(Value::Ref(GcRef(frame_ptr)));

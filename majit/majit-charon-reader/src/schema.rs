@@ -1,6 +1,6 @@
 //! Top-level Charon `.llbc` schema.
 //!
-//! Only the fields the Step 3 lowering driver actually reads are typed;
+//! Only the fields the lowering driver actually reads are typed;
 //! the rest stay as `serde_json::Value` so that newer Charon versions
 //! load without code changes.
 
@@ -25,13 +25,13 @@ pub struct Translated {
     #[serde(default)]
     pub global_decls: Vec<Option<crate::ullbc::GlobalDecl>>,
     /// User-defined types (`struct` / `enum` / alias / opaque).
-    /// Indexed by `def_id`. Step 4.3.b consumes this to populate
+    /// Indexed by `def_id`. Consumed to populate
     /// `SemanticProgram.{known_struct_names, struct_fields,
     /// immutable_fields}`.
     #[serde(default)]
     pub type_decls: Vec<Option<crate::ullbc::TypeDecl>>,
-    /// Trait declarations. Indexed by `def_id`. Step 4.3.b consumes
-    /// this for `SemanticProgram.known_trait_names`.
+    /// Trait declarations. Indexed by `def_id`. Consumed for
+    /// `SemanticProgram.known_trait_names`.
     #[serde(default)]
     pub trait_decls: Vec<Option<crate::ullbc::TraitDecl>>,
     /// `trait_impls`, `ordered_decls`, `files`, `options`,

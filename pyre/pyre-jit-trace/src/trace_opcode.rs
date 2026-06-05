@@ -586,11 +586,11 @@ pub(crate) fn write_stack_slot(
 ) {
     let semantic_idx = sym.nlocals + stack_idx;
     let reg_idx = stack_slot_reg_idx(sym, stack_idx);
-    // Path 3 slice 35b (task #225): portal frames carry the authoritative
+    // Portal frames carry the authoritative
     // stack shadow on `virtualizable_boxes` (`pyjitpl.py:1242
     // _opimpl_setarrayitem_vable`). The companion read paths
-    // (`read_stack_slot` per slice 34; `read_live` per slice 32;
-    // `get_list_of_active_boxes` snapshot fallback per slice 35a) source
+    // (`read_stack_slot`, `read_live`, and the
+    // `get_list_of_active_boxes` snapshot fallback) source
     // their portal-frame view from the vable shadow, so the pyre-only
     // `registers_r[reg_idx]` semantic-mirror write is dead for portal
     // frames.  Non-portal frames retain the lazy-fill mirror because
@@ -652,17 +652,16 @@ pub(crate) fn write_stack_slot(
 /// `GetarrayitemGcR` with a NONE base operand.
 pub(crate) fn read_stack_slot(sym: &mut PyreSym, ctx: &mut TraceCtx, stack_idx: usize) -> OpRef {
     let semantic_idx = sym.nlocals + stack_idx;
-    // Path 3 slice 34 (task #219): for portal frames, read the stack slot
+    // For portal frames, read the stack slot
     // directly from the `virtualizable_boxes` shadow — PyPy-orthodox
     // (`pyjitpl.py:1230 _opimpl_getarrayitem_vable`).  Empirical verification
-    // (slice 33, `PYRE_PATH3_VERIFY_STACK_READ`) showed zero mismatch between
+    // (`PYRE_PATH3_VERIFY_STACK_READ`) showed zero mismatch between
     // the vable shadow and the legacy `registers_r[reg_idx]` semantic-mirror
     // value across 9 benches.  Routing through vable retires one dependency
     // on the `registers_r` semantic-mirror deviation.
     //
     // Non-portal frames keep the `registers_r` lazy-fill path below — they
-    // don't own a vable shadow.  Their semantic-mirror retirement is a
-    // separate epic (Path 3 follow-up).
+    // don't own a vable shadow.  Their semantic-mirror is not yet retired.
     if sym.owns_virtualizable_shadow() {
         let nvs = crate::virtualizable_gen::NUM_VABLE_SCALARS;
         if let Some(v) = ctx.virtualizable_box_at(nvs + semantic_idx) {
@@ -1336,7 +1335,7 @@ impl MIFrame {
                 is_portal_bridge,
             )
         };
-        // SSA-authoritative live_r slice 3b-2: Ref bank entries go
+        // SSA-authoritative live_r: Ref bank entries go
         // through the read_live / lazy-fill / materialize pipeline to
         // populate registers_r[color].  Int/Float banks already live in
         // their own register arrays (registers_i / registers_f) and the
@@ -1448,7 +1447,7 @@ impl MIFrame {
         }
         let (registers_i, registers_r_bank, registers_r_semantic, registers_f) = {
             let s = self.sym();
-            // Stage 3.4 Phase B: unified abstract register file view.
+            // Unified abstract register file view.
             // When a guard is being captured mid-opcode, read from
             // `pre_opcode_registers_r` (the full snapshot of
             // `registers_r` at opcode start). Otherwise read the live
@@ -1458,7 +1457,7 @@ impl MIFrame {
             // one lookup instead of the legacy
             // `idx < nlocals ? locals : stack` split.
             //
-            // Phase A dual-writes grow `registers_r` monotonically on
+            // Dual-writes grow `registers_r` monotonically on
             // stack pushes; pop does not shrink it. Bound the view to
             // the valid locals + live stack_only range so stale slots
             // above the current (or pre-opcode) stack depth cannot
@@ -1522,7 +1521,7 @@ impl MIFrame {
                 if let Some(ref pre_r) = self.pre_opcode_registers_r {
                     pre_r[..valid_len.min(pre_r.len())].to_vec()
                 } else if s.owns_virtualizable_shadow() {
-                    // Path 3 slice 35a (task #225): portal frames have the
+                    // Portal frames have the
                     // authoritative semantic-indexed shadow in
                     // `virtualizable_boxes` (`pyjitpl.py:1242
                     // _opimpl_setarrayitem_vable`).  When no opcode-start
@@ -1634,14 +1633,13 @@ impl MIFrame {
             // `load_local_value` (line 1240-1265), so the encoder
             // emits a real OpRef for every live slot.
             //
-            // Pre-G.4.4-encoder.2/3 the encoder fell back to
+            // Earlier the encoder fell back to
             // `OpRef::NONE` for slots beyond `registers_r.len()`
             // (relying on `consume_one_section` to overwrite before
-            // BH deref); slice 2/3 closed both KNOWN-INCOMPLETE
-            // divergences from `pyjitpl.py:177-234` (single-bank
-            // read + always-box) by routing the full live range
-            // through the same lazy-load mechanism per-CodeObject
-            // mode uses.
+            // BH deref); both divergences from `pyjitpl.py:177-234`
+            // (single-bank read + always-box) are now closed by
+            // routing the full live range through the same lazy-load
+            // mechanism per-CodeObject mode uses.
             let stack_base = jc.payload.metadata.stack_base;
             let depth = jc
                 .payload
@@ -2095,8 +2093,7 @@ impl MIFrame {
                 // PYFRAME_DESCR_GROUP read path is incomplete — a
                 // direct swap to `GetfieldGcR` SIGABRTs in
                 // fib_recursive — so the swap is gated on bringing
-                // that barrier support up first (separate parity
-                // epic).  Step 2 (`lst[i]`) is `GETARRAYITEM_GC_R`
+                // that barrier support up first.  Step 2 (`lst[i]`) is `GETARRAYITEM_GC_R`
                 // indexed off the array.  `trace_array_getitem_value`
                 // uses `pyobject_gcarray_descr` (`base_size =
                 // FIXED_ARRAY_ITEMS_OFFSET`) and so requires the array
@@ -2112,7 +2109,7 @@ impl MIFrame {
                 // exist: init_symbolic (state.rs:2618-2619) seeds
                 // registers_r[idx] = OpRef::from_raw(base + idx) for every i in
                 // 0..nlocals before any load_local_value runs. Reachability
-                // audit (2026-04-28, MAJIT_PROBE_VABLE_FALLBACK) confirmed
+                // audit (`MAJIT_PROBE_VABLE_FALLBACK`) confirmed
                 // this empirically: 0 firings across debug unit tests
                 // (debug_assert!(false)) and 0 firings across 28 release
                 // benchmark runs (env-gated eprintln). The remaining
@@ -2166,7 +2163,7 @@ impl MIFrame {
             if idx >= s.registers_r.len() {
                 return Err(PyError::type_error("local index out of range in trace"));
             }
-            // Path 3 slice 37b (task #227): when `load_local_value`'s
+            // When `load_local_value`'s
             // vable-read predicate (`is_active_vable_owner` AND no
             // `bridge_local_oprefs`) fires, every reader of the local
             // OpRef sources from `virtualizable_boxes` and the
@@ -4040,7 +4037,7 @@ impl MIFrame {
         // from `self.orgpc` / `pre_opcode_registers_r` /
         // `portal_bridge_vable_vsd(orgpc)` so the snapshot encodes
         // the pre-opcode state at `resume_pc` (the PROBE-VABLE-DIV
-        // diagnostic on 2026-04-30 confirmed slot 0 / slot 2 are the
+        // diagnostic confirmed slot 0 / slot 2 are the
         // only divergence sources between the shared shadow and
         // `s.vable_*` — slots 1/3/4/5 always agree because their
         // mutators are unreachable under CPython 3.14 bytecode).
@@ -4212,15 +4209,14 @@ impl MIFrame {
                 ));
             } else {
                 // TODO: legacy `register == PyFrame
-                // slot` conflation (plan Stage 3.4) lets STORE_FAST
+                // slot` conflation lets STORE_FAST
                 // write an unboxed int into `locals_cells_stack_w[i]`
                 // when the trace IR optimizer promoted that local's
                 // OpRef to Int. Reading those raw bits back here and
                 // const-seeding them as `Const(val, Ref)` mistypes
                 // the value in the bridge optimizer's const_pool —
                 // verified root cause of the LoadFastLoadFast vable
-                // conversion regression (memory:
-                // vable_locals_lowering_analysis.md fix option b).
+                // conversion regression.
                 //
                 // Emit a NULL sentinel; the bridge resume will
                 // re-fetch the actual slot value via
@@ -4619,12 +4615,12 @@ impl MIFrame {
         let nvs = crate::virtualizable_gen::NUM_VABLE_SCALARS;
         for abs_idx in 0..total_slots {
             if s.concrete_value_at(abs_idx).to_pyobj() == concrete_obj {
-                // Path 3 slice 37a (task #227): portal frames carry the
+                // Portal frames carry the
                 // current OpRef on `virtualizable_boxes` (`pyjitpl.py:
                 // 1230 _opimpl_getarrayitem_vable`).  The legacy
                 // `registers_r[abs_idx]` semantic mirror returns the
                 // init-symbolic seed once `store_local_value` retires
-                // the mirror write (slice 37b), so consult vable first
+                // the mirror write, so consult vable first
                 // for portal frames.
                 let opref = if owns_shadow {
                     ctx.virtualizable_box_at(nvs + abs_idx).unwrap_or_else(|| {
@@ -6752,13 +6748,12 @@ impl MIFrame {
             return TraceAction::Abort;
         };
 
-        // Phase D-1 wire-up: resolve each opcode to its per-arm jitcode
+        // Resolve each opcode to its per-arm jitcode
         // through the shared `MetaInterpStaticData.jitcodes` table
         // (RPython `CallControl.jitcodes ≡ metainterp_sd.jitcodes`,
         // warmspot.py:281-282). Env-gated log-only probe — no execution —
-        // so we can confirm the build→runtime bridge stays in sync as
-        // Phase D-2 (shadow execute) and Phase D-3 (opcode migration)
-        // land. `unresolved` logs the single-variant miss so a dispatch
+        // confirming the build→runtime bridge stays in sync.
+        // `unresolved` logs the single-variant miss so a dispatch
         // gap surfaces immediately.
         if std::env::var_os("PYRE_JIT_JITCODE_PROBE").is_some() {
             match crate::jitcode_runtime::jitcode_for_instruction(&instruction) {
@@ -7564,7 +7559,7 @@ unsafe fn trace_check_exc_match_against(
 /// opcode, at which point the trait infra is deleted.
 ///
 pub fn production_walker_handles(instruction: &Instruction) -> bool {
-    // Re-enabled 2026-05-27.  The pre-jtransform unit-variant fold
+    // The pre-jtransform unit-variant fold
     // (`translator/rtyper/unit_variant_fold.rs::fold_unit_variant_ctors`)
     // rewrites zero-arg `SyntheticTransparentCtor` calls
     // (`StepResult::Continue`, `LoopResult::Done`, …) to
@@ -9037,7 +9032,7 @@ mod tests {
         let float_box = OpRef::float_op(30);
         let mut sym = PyreSym::new_uninit(OpRef::NONE);
         sym.jitcode = inner_jc_ptr;
-        // SSA-authoritative live_r slice 3b-2: the encoder reads the
+        // SSA-authoritative live_r: the encoder reads the
         // color-indexed Ref bank. Set nlocals=2 so the Ref liveness
         // color 1 reads the temporary bank at index 1 (identity for locals).
         // Int and Float banks stay kind-specific (no unification),

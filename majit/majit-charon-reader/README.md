@@ -2,9 +2,9 @@
 
 Stable-Rust parser for Charon `.llbc` / `.ullbc` JSON artefacts.
 
-Consumed by `majit-translate`'s MIR-driven flowspace driver (issue #97
-Step 3). Produced by `scripts/extract-llbc.sh` running the pinned
-Charon binary that `scripts/install-charon.sh` installs.
+Consumed by `majit-translate`'s MIR-driven flowspace driver. Produced
+by `scripts/extract-llbc.sh` running the pinned Charon binary that
+`scripts/install-charon.sh` installs.
 
 ## Usage
 
@@ -32,7 +32,7 @@ for fd in llbc.iter_local_fns() {
 
 ## Schema policy
 
-The reader covers the subset of Charon ULLBC that Step 3 of issue #97
+The reader covers the subset of Charon ULLBC that the flowspace driver
 actually consumes. Fields the driver does not read remain
 `serde_json::Value` so that newer Charon versions stay loadable
 without code changes. Variants we typed are listed by name; every
@@ -58,8 +58,8 @@ The reader is validated against the corpus snapshot (checked in at
 `majit/charon-corpus/corpus.ullbc`) via `tests/corpus.rs`, and against
 the full extracted `pyre-object.ullbc` (23 MB) / `pyre-interpreter.ullbc`
 (133 MB) snapshots not committed to git (regenerable via
-`scripts/extract-llbc.sh`). At the time of the Step 2 landing every
-statement and terminator in every extracted body decodes:
+`scripts/extract-llbc.sh`). Every statement and terminator in every
+extracted body decodes:
 
 | crate            | bodies | stmt decode errors | term decode errors |
 |------------------|-------:|-------------------:|--------------------:|
@@ -77,5 +77,5 @@ The pyre-interpreter `Call` terminators classify as:
 
 The 36 `dynamic` count is the audited `dyn Trait` virtual-call total
 across the JIT-consumed crates (`pyre-object` / `pyre-interpreter` /
-`pyre-module`); see the Step 1 dyn-Trait classification in
+`pyre-module`); see the dyn-Trait classification in
 `majit-translate/src/front/mod.rs`.

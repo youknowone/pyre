@@ -16,8 +16,7 @@
 //!   `LongFloat`, `SignedLongLong`, `UnsignedLongLong`, `Ptr`) cover every
 //!   type used by `rpbc.py FunctionRepr` / `rclass.py InstanceRepr` /
 //!   `FunctionReprBase.call` — additional container kinds (`Struct`,
-//!   `Array`, `ForwardReference`) land with the commit that consumes
-//!   them.
+//!   `Array`, `ForwardReference`) are not yet populated.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -359,11 +358,10 @@ pub enum _address {
     /// to keep the variant fixed-size.
     Fake(Box<_ptr>),
     /// Pyre's carrier for an `OpKind::ConstRefAddr` — a `Ref`-typed static
-    /// constant whose host-evaluator value is a raw pointer **integer**
-    /// (`front/ast.rs`, `(ValueType::Ref, ConstValue::Int)`), with no live
-    /// `_ptr`/container to wrap. Upstream's rtyper holds the prebuilt object's
-    /// real `_ptr` (via `convert_const`); pyre has only the integer until the
-    /// live-prebuilt `convert_const` path lands, so it carries it directly.
+    /// constant whose host-evaluator value is a raw pointer **integer**, with
+    /// no live `_ptr`/container to wrap. Upstream's rtyper holds the prebuilt
+    /// object's real `_ptr` (via `convert_const`); pyre has only the integer,
+    /// so it carries it directly.
     ///
     /// This is **not** the `cast_int_to_adr` tagged-integer fakeaddress: that
     /// path builds a proper `_NONGCREF` `_ptr` and wraps it as [`Fake`]
@@ -1647,7 +1645,7 @@ impl _arraylenref {
 /// access raises (`__getattr__`, lltype.py:175-183).
 ///
 /// The weak `_end_markers` memo (array → endmarker, llmemory.py:167) is not
-/// modeled (same value-model PRE-EXISTING-ADAPTATION as [`_subarray`] /
+/// modeled (the same value-model adaptation as [`_subarray`] /
 /// [`_arraylenref`]); the address-fold consumer threads a single derived
 /// pointer and never re-derives, so the cache's `is`-identity stability is
 /// unexercised.
@@ -1870,9 +1868,9 @@ impl Hash for _array {
 /// pointers; without it two `direct_fieldptr(p, "f")` calls yield subarrays
 /// with distinct `_identity`. The sole consumer here (`AddressOffset::ref` →
 /// the address-fold table) threads a single derived pointer and never
-/// re-derives, so the stability difference is unexercised. Convergence path:
-/// move containers behind an arena/`Rc` registry — the same epic that gates
-/// the [`_wref`] strong-ref adaptation — then a real weak-keyed cache can land.
+/// re-derives, so the stability difference is unexercised. A faithful
+/// weak-keyed cache needs containers behind an arena/`Rc` registry — the same
+/// container model the [`_wref`] strong-ref adaptation needs.
 #[derive(Clone, Debug)]
 pub struct _subarray {
     pub _identity: usize,
@@ -1968,11 +1966,11 @@ impl _opaque {
 /// by a `_identity` counter, cloned freely, with no arena and no `_free`
 /// path — so `_was_freed()` is always false and a weak ref would resolve
 /// alive exactly as the strong ref does. The behaviour is therefore
-/// identical; only the storage mechanism differs. Convergence path: move
-/// containers behind an `Rc`/arena registry (a cross-cutting epic on the
-/// whole lltype container layer), then store `rc::Weak` here and port
-/// `_free`/`_was_freed`. Until that lands the strong ref is observationally
-/// exact.
+/// identical; only the storage mechanism differs. A faithful weakref would
+/// move containers behind an `Rc`/arena registry across the whole lltype
+/// container layer, then store `rc::Weak` here and port `_free`/`_was_freed`;
+/// that is not yet implemented, and until then the strong ref is
+/// observationally exact.
 #[derive(Clone, Debug)]
 pub struct _wref {
     pub _identity: usize,
@@ -2014,8 +2012,8 @@ impl _wref {
     /// ```
     ///
     /// `None` for a dead wref; otherwise the referent unless its container
-    /// reports `_was_freed()` (always false until a `_free` caller lands —
-    /// Epic G slice 4 / llinterp). A delayed referent propagates
+    /// reports `_was_freed()` (false unless a `_free` caller has run on the
+    /// container, e.g. from `llinterp`). A delayed referent propagates
     /// `DelayedPointer` out of `_was_freed`, exactly as upstream lets it
     /// escape `_dereference`.
     pub fn _dereference(&self) -> Result<Option<_ptr>, DelayedPointer> {
@@ -2432,16 +2430,12 @@ impl _ptr {
     /// `castable` depth) walk via the first field name (`super`);
     /// up-casts via `_parentstructure()`.
     ///
-    /// Pyre-port scope: down-casts and identity casts are supported.
-    /// Null casts return `Ptr(target)._defl()`. Up-casts surface a
-    /// structured error: the object-returning `_parentstructure()`
-    /// ([`Parentable::parentstructure`]) now lands, but the upstream up-cast
-    /// also reads the parent's first inlined field by name and identity-checks
-    /// it against `struc` (`getattr(parent, PARENTTYPE._names[0]) != struc`)
-    /// before re-pointing — a container-`getattr`/identity-compare walk that is
-    /// a later slice. Exception classes only ever down-cast for
-    /// `ll_cast_to_object`, the immediate consumer, so the up-cast arm is
-    /// unreached today.
+    /// Down-casts and identity casts re-point through the first field name.
+    /// Null casts return `Ptr(target)._defl()`. Up-casts walk up the parent
+    /// chain via `_parentstructure()` ([`Parentable::parentstructure`]),
+    /// checking at each step that `struc` is the parent's first inlined field
+    /// (`getattr(parent, PARENTTYPE._names[0]) != struc`) and then verifying
+    /// the widened-to type equals `PTRTYPE.TO`.
     pub fn _cast_to(&self, ptrtype: &Ptr) -> Result<_ptr, String> {
         let down_or_up = castable(ptrtype, &self._TYPE)?;
         if down_or_up == 0 {
@@ -4522,8 +4516,8 @@ impl _ptr_obj {
 ///   them dead upstream;
 /// - the tagged-int container case (`isinstance(container, int)`,
 ///   lltype.py:1004) is gated on the tagged-int `_ptr` payload, which pyre
-///   does not carry yet — no `cast_opaque_ptr` input can hold one, so the
-///   branch is unreachable until that payload lands.
+///   does not carry — no `cast_opaque_ptr` input can hold one, so the
+///   branch is unreachable.
 pub fn cast_opaque_ptr(PTRTYPE: &Ptr, ptr: &_ptr) -> Result<_ptr, String> {
     let curtype = ptr._TYPE.clone();
     if curtype == *PTRTYPE {
@@ -6893,7 +6887,7 @@ mod tests {
 
     #[test]
     fn freed_container_reports_was_freed_and_kills_wref_deref() {
-        // Epic G slice 1: `_free` flips the container's shared `_parentable`
+        // `_free` flips the container's shared `_parentable`
         // storage; `_was_freed` (lltype.py:1681) and `_wref._dereference`
         // (llmemory.py:872-879) observe it. Before `_free` the referent is
         // live; after, the weakref dereferences to `None`.
@@ -6927,7 +6921,7 @@ mod tests {
 
     #[test]
     fn inlined_sub_container_is_freed_when_parent_is_freed() {
-        // Epic G slice 2: `_struct.__init__` wires `_setparentstructure`
+        // `_struct.__init__` wires `_setparentstructure`
         // on each inlined sub-container (lltype.py:1774-1783); `_was_freed`
         // walks the `_wrparent` chain (lltype.py:1681-1691), so freeing the
         // parent makes the inlined sub-struct report freed too.
@@ -7229,7 +7223,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "accessing freed container")]
     fn double_free_panics() {
-        // Epic G slice 3: `_free` calls `_check` first, so a second `_free`
+        // `_free` calls `_check` first, so a second `_free`
         // on the same container raises (lltype.py:1668-1669).
         let s = StructType::new("thing", vec![("x".into(), LowLevelType::Signed)]);
         let p = malloc(

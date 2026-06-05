@@ -194,7 +194,7 @@ pub struct GraphTransformResult {
 /// `codewriter::transform_graph_to_jitcode` instead, which threads
 /// `&CallControl` and runs the lowering pass before jtransform.
 /// This debug-assertion catches missed lowering sites at the
-/// remaining entries (test fixtures) — plan Rev 2 §Phase B3.
+/// remaining entries (test fixtures).
 pub fn rewrite_graph(graph: &FunctionGraph, config: &GraphTransformConfig) -> GraphTransformResult {
     #[cfg(debug_assertions)]
     crate::translator::rtyper::rpbc::assert_no_indirect_call_targets(graph);
@@ -1007,7 +1007,7 @@ impl<'a> Transformer<'a> {
             // registers (see
             // `default_bh_builder_unwired_set_matches_task_85_snapshot`).
             //
-            // Reviewer 2026-05-24 round — coverage covers all six
+            // Coverage covers all six
             // comparison ops (`eq`/`ne`/`lt`/`le`/`gt`/`ge`).  The
             // earlier "eq/ne only" restriction surfaced `int_le/r*`
             // as unwired blackhole opnames, breaking the Task #85
@@ -1070,7 +1070,7 @@ impl<'a> Transformer<'a> {
             // PyPy-orthodox close is fixing the source patterns
             // upstream (use `is_null()` / explicit `as` cast) or
             // moving the cast emission into pyre's rtyper rint
-            // compare-template — Task #146 deferred multi-session.
+            // compare-template; this is not yet implemented.
             OpKind::BinOp {
                 op: binop_name,
                 lhs,
@@ -2725,8 +2725,7 @@ impl<'a> Transformer<'a> {
         // `target_to_call_path` fallback only yields the bare method name,
         // which never matches `CallControl::register_inherent_method`'s
         // qualified key (`call.rs:941`) and leaves the shell body-less in
-        // `drain_pending_graphs`. Phase I3 of the eval-loop automation
-        // plan (`producer_side_jitcode_shell_leaks_2026_04_20.md`).
+        // `drain_pending_graphs`.
         let jitcode = if let Some(cc) = self.callcontrol.as_mut() {
             let path = cc
                 .target_to_path(target)
@@ -3274,8 +3273,8 @@ impl<'a> Transformer<'a> {
     ///
     /// Returns `[live_preamble, jit_merge_point, live_recursive]`, matching
     /// upstream's `ops + [op3, op1, op2]` shape. The leading `promote_greens`
-    /// prefix (`ops`) is empty until a follow-up slice ports `promote_greens`;
-    /// until then greens arrive as Variables/Constants and are forwarded to
+    /// prefix (`ops`) is empty because `promote_greens` is not yet ported;
+    /// greens arrive as Variables/Constants and are forwarded to
     /// the marker unchanged.
     fn handle_jit_marker__jit_merge_point(
         &mut self,

@@ -266,9 +266,9 @@ impl JitPolicy for StopAtXPolicy {
 ///   - `@look_inside` (`rlib/jit.py:147`) sets
 ///     `func._jit_look_inside_ = True`
 ///
-/// `ast.rs::collect_jit_hints` lowers those decorators into the
-/// `"dont_look_inside"` and `"jit_look_inside"` hint strings; both forms
-/// route through this helper.
+/// `front::llbc_hints::harvest_hints_from_llbcs` lowers those decorators
+/// into the `"dont_look_inside"` and `"jit_look_inside"` hint strings;
+/// both forms route through this helper.
 fn jit_look_inside_hint(hints: &[String]) -> Option<bool> {
     for h in hints {
         match h.as_str() {

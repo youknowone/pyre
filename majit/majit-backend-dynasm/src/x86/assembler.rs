@@ -2287,7 +2287,7 @@ impl<'a> Assembler386<'a> {
         // when `loc_base == ebp`.  `is_array=false` skips card marking
         // (assembler.py:2401 `if array and jit_wb_cards_set` gate); the
         // `helper_num=4` XMM-skip optimization is a perf adaptation not
-        // a correctness gap and remains a future-session task.
+        // a correctness gap and is not yet implemented.
         if crate::runner::DYNASM_ACTIVE_GC.with(|cell| {
             cell.borrow()
                 .as_ref()

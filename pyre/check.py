@@ -60,7 +60,7 @@ def _run_timed_unix(args, timeout_s):
     before = resource.getrusage(resource.RUSAGE_CHILDREN)
     try:
         proc = subprocess.run(
-            args, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            args, stdout=subprocess.PIPE,
             timeout=timeout_s,
         )
     except subprocess.TimeoutExpired:
@@ -107,7 +107,7 @@ def _run_timed_win32(args, timeout_s):
     job = kernel32.CreateJobObjectW(None, None)
 
     proc = subprocess.Popen(
-        args, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        args, stdout=subprocess.PIPE,
     )
     # Assigning right after Popen catches launchers like pypy3.exe before they
     # spawn their interpreter child; descendants inherit job membership.

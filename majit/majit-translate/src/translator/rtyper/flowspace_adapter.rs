@@ -426,9 +426,9 @@ fn resolve_result_hlvalue(
 /// `add_operator('neg', 1, ..)` at line 466 and `add_operator('bool',
 /// 1, ..)` at line 467).
 ///
-/// The 13 typed numeric / ptr / Unsigned casts retired across Slices
-/// A.3 / B.1 / A.4a / A.4b / A.4c — `front/ast.rs::Expr::Cast` now
-/// routes typed casts through `simple_call(<host_callable>, v)` per
+/// Typed numeric / ptr / Unsigned casts have no `OpKind::UnaryOp`
+/// route — `front/ast.rs::Expr::Cast` routes typed casts through
+/// `simple_call(<host_callable>, v)` per
 /// upstream `__builtin__.int/float/bool` /
 /// `lltype.cast_ptr_to_int` / `lltype.cast_int_to_ptr` /
 /// `rarithmetic.intmask` / `rarithmetic.r_uint`.  Only `same_as`
@@ -441,8 +441,7 @@ fn resolve_result_hlvalue(
 ///
 /// `not` and `deref` are the only fail-loud arms: pyre's frontend
 /// eliminates both at the source (`front/ast.rs::Expr::Unary`
-/// UnOp::Not desugar / Deref pass-through, both landed 2026-05-04 on
-/// `annrpython`).  Reaching either arm means a synthetic graph
+/// UnOp::Not desugar / Deref pass-through).  Reaching either arm means a synthetic graph
 /// injected the op directly.  RPython distinguishes logical `not`
 /// (UNARY_NOT, lowered as `bool(operand)` + branch —
 /// `flowcontext.py:531-538`) from bitwise `invert` (UNARY_INVERT —
@@ -484,9 +483,8 @@ fn normalize_unary_op_name(pyre_name: &str) -> Result<String, TyperError> {
         // backendopt pipeline's block-prefix `same_as` insertion
         // (`backendopt/constfold.rs:859`, `backendopt/all.rs:615`,
         // `removenoops.rs:86`, `storesink.rs:95`).  All other typed
-        // `(source, target)` casts retired across Slices A.3 / B.1 /
-        // A.4a / A.4b / A.4c — they now route through
-        // `simple_call(<host_callable>, v)` per upstream
+        // `(source, target)` casts have no unary-op route — they
+        // route through `simple_call(<host_callable>, v)` per upstream
         // `__builtin__.int/float/bool` / `lltype.cast_*` /
         // `rarithmetic.intmask` / `rarithmetic.r_uint`.
         "same_as" => Ok("same_as".to_string()),
@@ -528,8 +526,8 @@ fn normalize_unary_op_name(pyre_name: &str) -> Result<String, TyperError> {
 ///
 /// - The RPython-parity frontend at
 ///   `flowspace/rust_source/build_flow.rs:1191 lower_short_circuit`.
-/// - The legacy `front/ast.rs::Expr::Binary` arm now does the same
-///   (commit landed 2026-05-04 on `annrpython`), mirroring the
+/// - The legacy `front/ast.rs::Expr::Binary` arm does the same,
+///   mirroring the
 ///   build_flow.rs port: emit `bool(lhs)` + `set_branch` fork + 1-arg
 ///   join carrying `lhs_raw` (short-circuit) or `rhs_raw` (full eval).
 ///
@@ -577,9 +575,9 @@ fn normalize_binop_name(pyre_name: &str) -> Result<String, TyperError> {
 /// (inlined by the `value_map` const-folding path at every consuming
 /// op's args site, mirrored in tests by `build_value_to_hlvalue_map`).
 ///
-/// Returns `Err(TyperError)` for variants whose lowering is deferred.
+/// Returns `Err(TyperError)` for variants that are not yet lowered.
 /// The error message names the specific variant so the dual-gate
-/// failure cleanly identifies which followup needs to land.
+/// failure cleanly identifies which unported variant it hit.
 /// Format `op.result` for diagnostic messages.  Renders the result
 /// `Variable`'s identity name directly through its `Display`
 /// (`Variable.__repr__`, the `{_name}{_nr}` shape) so fail-loud
@@ -761,9 +759,9 @@ pub fn translate_op(
         // …).  RPython upstream raises `FlowingError`
         // (`flowspace/flowcontext.py:258,417`) and drops the function
         // before annotator/rtyper see it, so there is no upstream
-        // analogue.  The Slice 10C `SomeInstance(None) -> Ptr -> GcRef`
-        // synthesis was reverted because the `classdef=None` result
-        // tripped downstream `find_attribute` lookups.
+        // analogue.  A `SomeInstance(None) -> Ptr -> GcRef`
+        // synthesis is not used because the `classdef=None` result
+        // trips downstream `find_attribute` lookups.
         //
         // Post-`FORCE_ATTRIBUTES_INTO_CLASSES` pre-population (struct
         // field projection by `register_struct_fields`) impl-method
@@ -789,9 +787,9 @@ pub fn translate_op(
         //       outcome as the prior "post-rtyper jtransform
         //       variant" Skip, just at a more localised site.
         //
-        // Convergence: each emit-site is retired by lowering the
-        // specific expression form properly (per-variant epic —
-        // `ConstStr`, `Range`, `Closure`, etc.).  Until then this
+        // Each emit-site is retired by lowering the
+        // specific expression form properly (`ConstStr`, `Range`,
+        // `Closure`, etc.); until each is lowered, this
         // arm absorbs the placeholder silently so the dual-gate
         // doesn't have to round-trip through a TyperError just to
         // re-classify as Skip.
@@ -815,7 +813,7 @@ pub fn translate_op(
             Ok(vec![FlowspaceOp::new("newtuple", hl_args, result)])
         }
 
-        // ─── `LoadStatic` — Z2.5 Cat 2.1 single-segment static lookup ─
+        // ─── `LoadStatic` — single-segment static lookup ─
         // Pyre-only marker emitted by `front/ast.rs::lower_expr` when
         // `Expr::Path` resolves to a crate-level `static` declaration
         // (SHOUTY_CASE constant like `GC_WEAKREF_TYPE`).  RPython
@@ -827,7 +825,7 @@ pub fn translate_op(
         // `checkgraph` defining-var set requires every operand to
         // trace to an op result or `Block.inputargs`).
         //
-        // Slice C: when `extract_static_decls` could fold the static's
+        // When `extract_static_decls` could fold the static's
         // RHS to a `ConstValue` (`bool` / integer / float / string
         // literals + `const { LIT }` block wrapper), the adapter emits
         // `same_as(Constant(value))` — the concrete `Constant` shape PyPy
@@ -1159,7 +1157,7 @@ pub fn translate_op(
                     //     Mirrors upstream's `frame.globals[<alias>]`
                     //     hit branch.
                     //
-                    // 3b. TODO: `segments` already
+                    // 3b. `segments` already
                     //     spell out the fully-qualified Rust path
                     //     (`rpython::rtyper::lltypesystem::lltype::
                     //     cast_ptr_to_int`) without a matching `use`
@@ -1167,21 +1165,15 @@ pub fn translate_op(
                     //     directly, so pyre source frequently writes
                     //     them inline.  Upstream has no exact analog
                     //     (Python source uniformly imports before
-                    //     calling), so the legacy HOST_ENV fallback
-                    //     stays in place for backward-compat with
-                    //     existing pyre callsites.  Probed removal
-                    //     (2026-05-21): the strict gate fires on
-                    //     cranelift fib_recursive + fannkuch
-                    //     (TIMEOUT — production dependency exists),
-                    //     so a one-shot removal is out of scope.
-                    //     Convergence path: locate the production
-                    //     callsite that still relies on Branch 3b
+                    //     calling), so the HOST_ENV fallback
+                    //     stays in place for existing pyre callsites.
+                    //     A production callsite relies on this branch
                     //     (a tracing-time `OpKind::Call::FunctionPath`
                     //     with segments spelling a curated HOST_ENV
                     //     module without a matching `use_imports`
-                    //     entry), add the proper `use` to the source
-                    //     file, then gate this branch off and update
-                    //     the corresponding test fixture.
+                    //     entry), so removing the branch fails the
+                    //     strict gate (cranelift fib_recursive +
+                    //     fannkuch TIMEOUT).
                     //
                     // 3c. Unknown prefix — `TyperError` (caller must
                     //     register the path or import the prefix).
@@ -1235,11 +1227,10 @@ pub fn translate_op(
                         // with the class as `args[0]`; pyre stashes
                         // the class name in `path[1]` of the
                         // `FunctionPath` because its `Vec<Variable>`
-                        // arg carrier cannot yet hold a
+                        // arg carrier cannot hold a
                         // `Constant(HostObject(class))` alongside
-                        // `Variable`s — that conversion is the
-                        // multi-session `Vec<Variable>` →
-                        // `Vec<LinkArg>` migration (see the
+                        // `Variable`s — holding it would require a
+                        // `Vec<Variable>` → `Vec<LinkArg>` carrier (see the
                         // module-level "PRE-EXISTING-ADAPTATION"
                         // block in `front/raise.rs:120-126` for the
                         // detailed rationale).  The downstream
@@ -1253,8 +1244,9 @@ pub fn translate_op(
                         // (the exception class name) as a builtin
                         // HostObject and use it as the simple_call
                         // callable, leaving `op.args` as the
-                        // trailing message arguments.  TODO retire
-                        // when the LinkArg migration lands.
+                        // trailing message arguments.  No longer
+                        // needed once the arg carrier can hold a
+                        // `Constant` directly.
                         exc_class
                     } else if let Some(entry) = call_registry.lookup_with_leaf_match(&key) {
                         // Fuzzy leaf-match is the last registry fallback.
@@ -1546,9 +1538,9 @@ fn post_rtyper_jtransform_variant_name(kind: &OpKind) -> Option<&'static str> {
         // `Ok(Vec::new())` arm in `translate_op`, but the diagnostic
         // name is retained here so the post-rtyper variant table can
         // still surface the marker if a leak ever reaches it.
-        // Convergence path remains per-variant retirement of the
-        // front-end's `stop_unsupported` / `continue_with_unknown`
-        // emit-sites (`ConstStr`, `Range`, `Closure`, etc.).
+        // Each front-end `stop_unsupported` / `continue_with_unknown`
+        // emit-site is retired by lowering its specific expression
+        // form (`ConstStr`, `Range`, `Closure`, etc.).
         OpKind::Abort { .. } => "Abort (pyre-only abort marker)",
         _ => return None,
     })
@@ -1651,7 +1643,7 @@ fn legacy_const_define_hlvalue(op: &SpaceOperation) -> Option<Hlvalue> {
         // without this pre-fold the args=[] call falls through to
         // `handle_residual_call` and leaves a `residual_call_r/d>r`
         // op in the walker arm body that breaks
-        // `production_walker_handles` activation (Task #333).
+        // `production_walker_handles` activation.
         //
         // The frontend's `is_synthetic_unit_variant_path` allowlist
         // (StepResult, LoopResult, JitAction, CompareOp variants) is
@@ -1673,7 +1665,7 @@ fn legacy_const_define_hlvalue(op: &SpaceOperation) -> Option<Hlvalue> {
             // pre-fold here materialises the same shape inside the
             // flowspace graph so the per-graph annotator surfaces a
             // `Hlvalue::Constant(HostObject(prebuilt_instance))` to
-            // downstream rtyper passes.  NOTE (2026-05-26): this only
+            // downstream rtyper passes.  This only
             // affects graphs that go through the rtyper Match arm
             // (`dual_gate_publish_concretetypes`).  Per-opcode arm
             // body graphs registered via `register_function_graph`
@@ -1683,7 +1675,7 @@ fn legacy_const_define_hlvalue(op: &SpaceOperation) -> Option<Hlvalue> {
             // Closing that gap requires either an early-pass on
             // `FunctionGraph` ahead of jtransform or extending
             // `is_synthetic_result_option_ctor` to handle the args=0
-            // case — tracked under M4 walker re-enable.
+            // case.
             let qualname = segments.join(".");
             // Reuse the process-wide prebuilt-instance interner so this
             // legacy fold path produces the same `HostObject` Arc as the
@@ -1888,8 +1880,8 @@ pub(crate) fn derive_subject_inputcells(
 ///    exitcase) via [`link_arg_to_hlvalue`] / [`exitcase_to_hlvalue`],
 ///    and translate `exitswitch` via the `value_map`.
 ///
-/// Topology assembly. Per-OpKind operation translation depends on
-/// followups; [`translate_op`] is used as-is, which means any
+/// Topology assembly delegates per-OpKind operation translation to
+/// [`translate_op`], which means any
 /// legacy graph carrying an
 /// unported OpKind variant surfaces a fail-loud `TyperError` from this
 /// function. Trivial graphs (only `Input` / `ConstInt` / `ConstFloat`
@@ -2156,8 +2148,8 @@ pub fn function_graph_to_flowspace(
                         // `cutover.rs:439 is_known_unported` matches
                         // the substring `"adapter cross-block body
                         // Input"` and Skip-classifies the graph,
-                        // routing it through `legacy_state` until the
-                        // Cat 2.1 cross-block locals threading covers
+                        // routing it through `legacy_state` until
+                        // cross-block locals threading covers
                         // every shape.
                         return Err(TyperError::message(format!(
                             "translate_op: adapter cross-block body Input — \
@@ -2423,7 +2415,7 @@ mod tests {
 
     #[test]
     fn valuetype_unknown_returns_none_for_failloud_at_bindingrepr() {
-        // Cat 2.4 fix: `Unknown` is an annotation gap with no
+        // `Unknown` is an annotation gap with no
         // annotation-stage shell.  Returning `None` leaves
         // `Variable.annotation` empty so `bindingrepr` panics with
         // `KeyError: no binding for arg`
@@ -2467,7 +2459,7 @@ mod tests {
 
     #[test]
     fn seed_variable_unannotated_input_leaves_annotation_empty_for_failloud() {
-        // Cat 2.4 fix: when the legacy Variable carries no published
+        // When the legacy Variable carries no published
         // SomeValue shell, the seed MUST NOT fabricate a
         // SomeInstance(classdef=None) — that would silently bridge an
         // annotation gap to GcRef via the resolver-stage backfill at
@@ -3569,12 +3561,10 @@ mod tests {
 
     #[test]
     fn translate_op_undefined_operand_surfaces_invariant_break() {
-        // Although the only currently implemented arm with operands is
-        // gone (Call → followup), the lookup_operand helper is shared
-        // with future arms. Validate it surfaces a clear "adapter
+        // The lookup_operand helper is shared across every arm with
+        // operands. Validate it surfaces a clear "adapter
         // invariant broken" message and embeds the enriched diagnostic
-        // context (op variant + arg role) added by the verbose-mode
-        // groundwork pass.
+        // context (op variant + arg role).
         let value_map: HashMap<Variable, Hlvalue> = HashMap::new();
         let graph = translate_op_test_graph(100);
         let op = SpaceOperation {

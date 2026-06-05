@@ -1,13 +1,13 @@
 //! Stable-Rust parser for Charon `.llbc` / `.ullbc` JSON artefacts.
 //!
-//! This crate is the input layer of issue #97's Step 3 MIR-driven
-//! flowspace driver. It exposes:
+//! This crate is the input layer of the MIR-driven flowspace driver.
+//! It exposes:
 //!
 //!   - [`schema`] — `serde::Deserialize` structs covering the subset of
 //!     Charon's IR we actually consume. Schema fields we do not yet
 //!     consume are kept as opaque [`serde_json::Value`] so that newer
-//!     Charon versions stay round-trippable; we widen the typed schema
-//!     incrementally as Step 3 needs each piece.
+//!     Charon versions stay round-trippable; the typed schema is widened
+//!     incrementally as each piece is needed.
 //!   - [`Llbc`] — a thin wrapper around [`schema::LlbcFile`] with
 //!     lookup helpers (`local_fn`, `iter_local_fns`, etc.).
 //!   - [`SchemaError`] — fail-loud error type. The crate never silently

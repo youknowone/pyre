@@ -2,10 +2,9 @@
 # extract-llbc.sh — run Charon on the JIT-consumed crates and drop
 # `.ullbc` artefacts into ./build/llbc/.
 #
-# The Charon migration described in issue #97 lowers MIR-derived IR
-# (`.ullbc`) into pyre's `FunctionGraph`. This script is the producer
-# of those `.ullbc` files; the consumer is `majit-charon-reader` plus
-# whatever the Step 3 driver wires up.
+# The Charon-extracted-MIR front-end lowers MIR-derived IR (`.ullbc`)
+# into pyre's `FunctionGraph`. This script is the producer of those
+# `.ullbc` files; the consumer is `majit-charon-reader`.
 #
 # Usage:
 #   scripts/extract-llbc.sh                  # extract all JIT-consumed crates
@@ -67,8 +66,8 @@ crate_info() {
         pyre-jit)
             # pyre-jit hosts PyreBlackholeAllocator + the Drop-impl
             # guards (JitSuppressionGuard / GuardCompilingScope /
-            # TestJitParamsGuard) the AST extract audit lists as
-            # uncovered.  Extraction is supported for experimentation,
+            # TestJitParamsGuard), which have no JIT-traceable graph.
+            # Extraction is supported for experimentation,
             # but the production build does NOT discover this artefact
             # (see `auto_discover_workspace_llbc_paths` in
             # majit-translate/src/lib.rs): those entries are semantically
@@ -116,7 +115,8 @@ fi
 # the target-side host_env but NOT the copy a build script drags into the
 # HOST graph (built under `target/debug/deps`, no flag) — that one still
 # fails E0658.  pyre-jit's dependency graph pulls host_env into the host
-# graph; pyre-interpreter's does not, which is why only pyre-jit tripped.
+# graph; pyre-interpreter's does not, which is why only pyre-jit hits
+# this.
 # Inject the same crate-attr into the host graph via cargo's `[host]`
 # rustflags table (`-Zhost-config`, which also requires
 # `-Ztarget-applies-to-host` and `target-applies-to-host=false`).  Passed

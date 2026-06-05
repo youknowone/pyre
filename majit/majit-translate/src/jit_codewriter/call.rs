@@ -776,8 +776,7 @@ pub struct CallControl {
     /// the process-global `STRUCT_ORIGIN_REGISTRY` + `canonical_struct_name`
     /// (`majit-ir/src/descr.rs:148-225`); this carrier records the
     /// per-file module path so a future per-graph lexical resolver
-    /// (orthodox PyPy `getdesc` parity, see
-    /// [[orthodox-6item-2026-05-17]]) can consume it.
+    /// (orthodox PyPy `getdesc` parity) can consume it.
     pub parsed_module_paths: Vec<String>,
     /// Per-source-file `use` import map collected from
     /// `ParsedInterpreter.use_imports` (`parse.rs::collect_use_imports`).
@@ -785,11 +784,11 @@ pub struct CallControl {
     /// Mirrors PyPy bookkeeper's lexical/import-scope name resolution
     /// (`annrpython.Bookkeeper.getdesc` + `frame.f_globals` lookups);
     /// pyre's `qualify_type_name` does not yet consult this table,
-    /// awaiting the per-FunctionGraph use_imports carrier outlined in
-    /// [[orthodox-6item-2026-05-17]].  Populated here as the data
+    /// awaiting the per-FunctionGraph use_imports carrier.
+    /// Populated here as the data
     /// carrier so the future resolver lands without re-plumbing.
     pub use_imports: HashMap<(String, String), String>,
-    /// Z2.5 Path C metadata-only registration carrier — `(segments,
+    /// Metadata-only registration carrier — `(segments,
     /// Signature, return_lltype)` for every `unsafe fn` and unsafe
     /// impl-method discovered in the parsed source set.  These callees
     /// cannot lower their bodies (`build_flow.rs:215` rejects
@@ -1371,8 +1370,8 @@ impl CallControl {
                 // init_array_descr` stamps `descr.tid` from
                 // `layoutbuilder.get_type_id(A)` — a dense sequential
                 // GC type id allocated by the GC layoutbuilder.  Pyre
-                // does not yet port the layoutbuilder analog (multi-
-                // session epic); analyzer-side `SimpleArrayDescr.type_id`
+                // does not yet port the layoutbuilder analog;
+                // analyzer-side `SimpleArrayDescr.type_id`
                 // stays at 0 (the `get_array_descr` cache-miss-mint
                 // default at `descr.rs:515`).  Runtime-registered
                 // `SimpleArrayDescr` carries a real GC tid stamped at
@@ -2669,8 +2668,8 @@ impl CallControl {
         // path: port the integer helpers as Rust-source bodies the
         // walker can lower into a graph, register the graph via
         // `register_function_graph(canonical_name)`, then the BFS
-        // seed arm below will push the impl path naturally.  Multi-
-        // session port: requires walker reach into majit-metainterp
+        // seed arm below will push the impl path naturally.  This
+        // requires walker reach into majit-metainterp
         // and a Rust analogue of `MixLevelHelperAnnotator.constfunc`.
         // `ll_math_sqrt` additionally needs a pyre-side raise
         // protocol (PyError emission from a residual C call) before
@@ -3619,7 +3618,7 @@ impl CallControl {
             }
         }
 
-        // TODO(parity): retire when §M3 annotator wiring publishes
+        // TODO(parity): retire when annotator wiring publishes
         // classdef hints before BFS runs.
         // TODO: receiver-agnostic "unique concrete impl" fallback.
         // Upstream `call.py:175-187
@@ -3634,8 +3633,8 @@ impl CallControl {
         // annotator-derived classdef hint and no receiver-name match,
         // collapsing to the unique concrete impl is the only way to
         // include the impl's body in `candidate_graphs`.  Retired once
-        // the annotator-monomorphization epic publishes classdef hints
-        // before BFS runs (plan §M3); the
+        // the annotator publishes classdef hints
+        // before BFS runs; the
         // `find_all_graphs_closure_reaches_handler_graphs_from_dispatch_portal`
         // and `all_jitcodes_registry_contains_inherent_impl_methods`
         // oracles pin the BFS coverage this branch enables.
@@ -3986,20 +3985,18 @@ impl CallControl {
 
     // ── Graph-based analyzers (call.py:282-303) ─────────────────────
     //
-    // PRE-EXISTING-ADAPTATION. The five `analyze_*` methods below walk
+    // The five `analyze_*` methods below walk
     // `crate::model::FunctionGraph` (the flat codewriter graph), inlining
     // the generic `GraphAnalyzer.analyze_direct_call` traversal
     // (`graphanalyze.py:139-177`) into each per-analysis body with a
-    // bottom-on-cycle `seen` guard. The orthodox versions are already
+    // bottom-on-cycle `seen` guard. The orthodox versions are
     // ported over the flowspace graph model: `RaiseAnalyzer`
     // (`backendopt/canraise.rs`), `CollectAnalyzer`
     // (`backendopt/collectanalyze.rs`), and the shared `GraphAnalyzer`
     // framework (`backendopt/graphanalyze.rs`, with SCC-merge cycle
     // handling via `DependencyTracker`/`UnionFind`). These duplicates
     // exist only because `CallControl` operates on the flat graph, not on
-    // flowspace graphs. Convergence path: once `CallControl`'s graphs are
-    // flowspace graphs (the graph-model unification), delete these methods
-    // and consume the `backendopt/` analyzers directly. Do NOT extract a
+    // flowspace graphs. Do NOT extract a
     // shared skeleton here — that would add a third analysis framework
     // duplicating `graphanalyze.rs` over the wrong graph model.
 
@@ -4572,7 +4569,7 @@ impl CallControl {
         // single funcobj so the flags are always false — they are enforced
         // family-wide below.
         //
-        // Section-4 adaptation: call.py:252-257 also reads
+        // call.py:252-257 also reads
         // `_call_aroundstate_target_` here and packages it into the
         // EffectInfo's `call_release_gil_target`.  That direct-call
         // propagation is intentionally omitted from this translated-graph
@@ -7073,8 +7070,7 @@ mod tests {
         // TODO: receiver-agnostic unique-impl fallback in
         // `resolve_method` enables BFS to monomorphise
         // generic-receiver call sites at trait dispatch.  Retired
-        // when the annotator publishes classdef hints before BFS
-        // (plan §M3).
+        // when the annotator publishes classdef hints before BFS.
         assert!(
             cc.resolve_method("load_local_value", Some("handler"), None)
                 .is_some()
@@ -7619,7 +7615,7 @@ mod tests {
         assert_eq!(r2, CanRaise::Yes);
     }
 
-    /// Characterization probe (graph-model unification, Slice 1.5):
+    /// Characterization probe:
     /// feed ONE flat graph to both effect-analysis paths and assert they
     /// agree — the flat `CallControl._canraise` vs the orthodox
     /// `backendopt::canraise::RaiseAnalyzer` over the adapter-produced
@@ -7655,7 +7651,7 @@ mod tests {
         // (model.py:668-688) would reject both: every Link.args value must
         // be defined in the predecessor block (only last_exception /
         // last_exc_value may be defined only_in_link). Real front-end
-        // graphs ARE well-formed and DO convert — production cutover runs
+        // graphs ARE well-formed and DO convert — production runs
         // function_graph_to_flowspace on every graph and check.py is green.
         // So these `.is_err()` assertions pin that the adapter correctly
         // enforces SSA-definedness, not an exception-edge limitation; the
@@ -7732,14 +7728,13 @@ mod tests {
         assert!(!cc.analyze_can_raise_impl(&path, &mut seen, true));
     }
 
-    /// Graph-model unification (Slice 1, test-only): prove the orthodox
+    /// Graph-model unification (test-only): prove the orthodox
     /// flowspace `RaiseAnalyzer` (backendopt/canraise.rs) reproduces the
     /// SAME tri-state verdict as the flat `CallControl::_canraise` on
     /// well-formed lltype-vocabulary graphs. This locks the equivalence
     /// contract that is the precondition for deleting
     /// `analyze_can_raise_impl` once the flowspace analyzers are wired
-    /// into `getcalldescr` (the whole-program flowspace-registration
-    /// keystone + consumer slice).
+    /// into `getcalldescr`.
     ///
     /// Tri-state coverage, parametrized by startblock op + CFG shape:
     /// - `int_add`, no exception edge → `No` (the op cannot raise and the
@@ -8317,7 +8312,7 @@ mod tests {
         assert_eq!(cc.jitdrivers_sd[0].index_of_virtualizable, 0);
     }
 
-    // ── RPython indirect_call family tests — plan §Tests ────────────
+    // ── RPython indirect_call family tests ──────────────────────────
 
     /// `guess_call_kind` for `OpKind::IndirectCall`:
     ///   ≥1 candidate impl is a regular candidate → `Regular`

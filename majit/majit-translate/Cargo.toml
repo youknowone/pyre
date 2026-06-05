@@ -58,36 +58,31 @@ vecset = { workspace = true }
 # the lowering as an explicit pushdown automaton.
 stacker = { workspace = true }
 
-# Charon ULLBC reader — issue #97 Step 3 MIR-driven flowspace driver.
+# Charon ULLBC reader for the MIR-driven flowspace driver.
 # Pulled in as a regular dep (not gated): the driver lives under
-# `front/mir.rs` and is callable from production paths, but is not yet
-# wired into the AST front-end's call sites. Step 4 will introduce a
-# feature flag for cutover. Stable Rust; adds only serde + serde_json
-# to the dep graph, both already workspace-shared.
+# `front/mir.rs` and is callable from production paths. Stable Rust;
+# adds only serde + serde_json to the dep graph, both already
+# workspace-shared.
 majit-charon-reader = { workspace = true }
 
 [features]
 default = ["mir-frontend"]
-# Issue #97 Step 6.C: enabled by default 2026-05-25.  When the
-# feature is on, `build_semantic_program_via_active_frontend`
+# When this feature is on, `build_semantic_program_via_active_frontend`
 # resolves LLBC artefacts via `PYRE_MIR_FRONTEND_LLBC` env-var or
 # auto-discovers `<workspace>/build/llbc/{pyre-object,
-# pyre-interpreter}.ullbc`; panics when neither source resolves (the
-# syn-AST builder fallback was retired in Slice 5 / Step 6.F).
+# pyre-interpreter}.ullbc`; panics when neither source resolves.
 #
-# Step 6.C.1 (Task #38) closed by widening `tyref_to_value_type`
-# to recognise Charon's current literal-type schema — `Literal::Int`
-# (signed) / `Literal::UInt` (unsigned) for integers, and the atom
-# forms `"Bool"` / `"Char"`.  Earlier the helper only matched the
-# pre-split `Literal::Integer` shape, so every `usize` / `isize`
-# argument fell back to `Ref` and tripped
+# `tyref_to_value_type` recognises Charon's literal-type schema —
+# `Literal::Int` (signed) / `Literal::UInt` (unsigned) for integers,
+# and the atom forms `"Bool"` / `"Char"`.  Without this, `usize` /
+# `isize` arguments fall back to `Ref` and trip
 # `flatten.rs:1155 "switch exitswitch must be int"` for graphs
-# that switched on integer-typed arguments (e.g.
+# that switch on integer-typed arguments (e.g.
 # `pyre_interpreter::shared_opcode::opcode_call`).
 #
 # `--no-default-features` leaves no active frontend: the analysis
-# builder then panics at run time, since the AST builder it formerly
-# fell back to no longer exists.
+# builder then panics at run time, since there is no AST builder to
+# fall back to.
 mir-frontend = []
 
 [dev-dependencies]

@@ -538,16 +538,13 @@ where
 ///     return result
 /// ```
 ///
-/// PRE-EXISTING-ADAPTATION (`graphanalyze.py:62-68`). Upstream resolves the
-/// callback graphs through the annotator bookkeeper: `for function in
-/// funcobj._callbacks.callbacks: bk.getdesc(function).getgraphs()`. Pyre has
-/// no live bookkeeper desc walk yet, so `_callbacks` is normalised at the
+/// Upstream (`graphanalyze.py:62-68`) resolves the callback graphs through the
+/// annotator bookkeeper: `for function in funcobj._callbacks.callbacks:
+/// bk.getdesc(function).getgraphs()`. Pyre normalises `_callbacks` at the
 /// `_func.attrs` mirror (the same mirror that carries `external` / `canraise`
 /// / `random_effects_on_gcobjs`) into the already-resolved `ConstValue::Graphs`
 /// graph-key list, resolved through `TranslationContext.graphs` exactly like
-/// the `indirect_call` arm. Convergence path: reinstate the
-/// `function -> getdesc -> getgraphs` walk once the real annotator bookkeeper
-/// is wired (GH #139 real-rtyper cutover). A subclass override
+/// the `indirect_call` arm. A subclass override
 /// (e.g. [`super::collectanalyze`]) delegates here for the no-special-case
 /// path, matching upstream's `BoolGraphAnalyzer.analyze_external_call` super-call.
 pub fn framework_analyze_external_call<A, R, I>(

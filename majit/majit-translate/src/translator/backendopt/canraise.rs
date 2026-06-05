@@ -306,14 +306,9 @@ mod tests {
     /// `analyze_exceptblock_in_graph` reraise-of-caught suppression
     /// (`canraise.py:27-41`) exercised directly on a flowspace graph.
     ///
-    /// This is the standalone home for the coverage that otherwise lives
-    /// only in `jit_codewriter::call`'s
-    /// `well_formed_raise_flowspace_raiseanalyzer_matches_flat_canraise`
-    /// `MemoryErrorOnly` case — which builds a flat `crate::model` graph,
-    /// runs it through `function_graph_to_flowspace`, and compares to the
-    /// flat `_canraise`. That oracle is coupled to the flat model + the
-    /// adapter, both of which the graph-model unification retires; this
-    /// test depends on neither.
+    /// Exercises the suppression on a graph built directly in the flowspace
+    /// model, depending on neither the flat `crate::model` graph nor the
+    /// `function_graph_to_flowspace` adapter.
     ///
     /// The graph's only op is `int_add` (`canraise=[]`), so the op layer
     /// contributes no raise. The startblock reaches the graph's
@@ -521,10 +516,7 @@ mod tests {
 
     #[test]
     fn analyze_direct_call_resolves_registered_callee_else_top_result() {
-        // Behavioral payoff of the cachedgraph keystone (the registration
-        // proved by
-        // `cutover::cachedgraph_hit_registers_callee_graph_into_translator_graphs`):
-        // a caller whose only op is a `direct_call` to a SEPARATE callee
+        // A caller whose only op is a `direct_call` to a SEPARATE callee
         // graph is resolved by `RaiseAnalyzer` through `funcobj.graph` ->
         // `TranslationContext.graphs` (`framework_analyze_direct_call`,
         // graphanalyze.rs:308-321) to the callee's actual can-raise. With
@@ -532,14 +524,10 @@ mod tests {
         // the framework returns `top_result()` — the conservative `true`
         // (graphanalyze.rs:318-320, bool top is `true`).
         //
-        // The callee's only op is `int_add` (canraise=[]), proven
-        // flat<->flowspace-equivalent non-raising by `jit_codewriter::call`'s
-        // `well_formed_raise_flowspace_raiseanalyzer_matches_flat_canraise`.
-        // So the RESOLVED verdict (non-raising) is the one matching flat
-        // `_canraise`, and the unregistered `top_result` (raising) is exactly
-        // the divergence the keystone removes — the precondition for routing
-        // `CallControl` effect analysis through the flowspace `RaiseAnalyzer`
-        // on the call-recursion path.
+        // The callee's only op is `int_add` (canraise=[]), so when the
+        // callee is registered the resolved verdict is non-raising; when it
+        // is absent the lookup falls back to the conservative `top_result`
+        // (raising).
 
         // -- callee NOT registered: funcobj.graph misses -> top_result --
         {

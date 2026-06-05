@@ -1,20 +1,15 @@
-//! MIR-driven flowspace driver — issue #97 Step 3.
+//! MIR-driven flowspace driver.
 //!
-//! This module is the **new** front-end the Charon migration is building
-//! toward: it consumes Charon's ULLBC (a basic-block CFG derived from
+//! This module consumes Charon's ULLBC (a basic-block CFG derived from
 //! rustc MIR) and produces the same [`FunctionGraph`] shape the rest of
-//! the codewriter pipeline already consumes.
+//! the codewriter pipeline consumes.
 //!
-//! It is structurally simpler than the AST-based driver in `front/ast.rs`
-//! because the input is already in CFG form. The four mechanisms the AST
-//! driver carries to *reconstruct* a CFG from a recursive walk —
-//! `lazy_install_local_at_current_block_var`,
-//! `can_thread_variable_to_block`, the `lower_if_expr` fallback branch,
-//! and the per-scope binding tracking in `GraphBuildContext` — are
-//! unnecessary here and have no analog in this driver. (Issue #97
-//! Step 5 retires them once this driver covers the production target
-//! set; that retirement is a *consequence* of this driver landing, not
-//! a precondition.)
+//! It is structurally simpler than a recursive-walk driver because the
+//! input is already in CFG form: a driver that reconstructs a CFG from a
+//! recursive AST walk needs to reconstruct join points, lazily install
+//! per-block locals, thread Variables between blocks, and track per-scope
+//! bindings. None of that is needed here, because every join point is
+//! already an explicit MIR basic block with explicit predecessor edges.
 //!
 //! ## Reference
 //!
@@ -28,7 +23,7 @@
 //! mergeblock dance collapses to a no-op: every join point is already
 //! a single MIR basic block with N predecessors.
 //!
-//! ## Scope as of issue #97 Step 3 — production coverage
+//! ## Scope — production coverage
 //!
 //! The driver lowers the entire 4-function corpus end-to-end (see
 //! `tests/test_mir_frontend.rs`) and achieves ≥ 99.9% coverage on the
@@ -116,29 +111,25 @@ pub fn lower_function(llbc: &Llbc, function_name: &str) -> Result<FunctionGraph,
     lower_fun_decl(llbc, fd)
 }
 
-/// Step 4.6 multi-LLBC variant — merge functions and metadata from a
-/// slice of LLBCs into one `SemanticProgram`.  When `pyre-jit-trace`
-/// parses pyre-object + pyre-interpreter together, the cutover needs
-/// each crate's `.ullbc` so cross-crate calls in the merged
-/// SemanticProgram resolve.  Per-LLBC duplicates (a function defined
-/// in both, e.g. via dependency closure) keep the first occurrence —
-/// matches the AST builder's first-wins semantics under repeated
-/// `parsed_files` entries.
+/// Merge functions and metadata from a slice of LLBCs into one
+/// `SemanticProgram`.  When `pyre-jit-trace` parses pyre-object +
+/// pyre-interpreter together, each crate's `.ullbc` is supplied so
+/// cross-crate calls in the merged SemanticProgram resolve.  Per-LLBC
+/// duplicates (a function defined in both, e.g. via dependency closure)
+/// keep the first occurrence.
 pub fn build_semantic_program_from_llbcs(
     llbcs: &[Llbc],
 ) -> Result<crate::front::semantic::SemanticProgram, LowerError> {
     let mut merged: Option<crate::front::semantic::SemanticProgram> = None;
     // Dedup key combines `self_ty_root` (the impl owner, when known),
     // `module_path`, and `name`.  Without `self_ty_root`, two distinct
-    // impl methods can collide on a shared `{module_path}::{name}`:
+    // impl methods would collide on a shared `{module_path}::{name}`:
     // both `impl FrameDebugData { fn new(...) }` and `impl PyFrame {
     // fn new(...) }` land under `module_path = "pyframe::<Impl>"`
-    // (the Impl NameSeg renders as `<Impl>`), and the second was
-    // silently dropped before this key widening.  AST-extract coverage
-    // audit went 88% → 99%+ trait + inherent on the test_phase_f LLBC
-    // fixture after including the owner.  Falls back to the bare
-    // `{module_path}::{name}` shape (or just `name`) for entries that
-    // have no `self_ty_root`.
+    // (the Impl NameSeg renders as `<Impl>`), so without the owner in
+    // the key the second would be silently dropped.  Falls back to the
+    // bare `{module_path}::{name}` shape (or just `name`) for entries
+    // that have no `self_ty_root`.
     let mut seen_function_keys = std::collections::HashSet::new();
     let mut seen_struct_names = std::collections::HashSet::new();
     let mut seen_trait_names = std::collections::HashSet::new();
@@ -208,18 +199,15 @@ pub fn build_semantic_program_from_llbcs(
 }
 
 /// Build a [`SemanticProgram`] by lowering every local function
-/// declaration in `llbc`.
-///
-/// This is the MIR-driven analog of the retired syn-AST
-/// `build_semantic_program_from_parsed_files`, and the entry point
-/// Step 4 swaps into the production pipeline at `lib.rs:134`.
+/// declaration in `llbc`.  This is the production pipeline's
+/// program-build entry point (`lib.rs:134`).
 ///
 /// **Whole-program metadata** (`known_struct_names`,
 /// `known_trait_names`, `struct_fields`) is populated from
-/// `type_decls` / `trait_decls` (Step 4.3.b); struct field-type strings
-/// are resolved by [`tyref_to_ast_string`] from Charon's type IR.
-/// `immutable_fields` stays empty until the `#[majit_macros::immutable]`
-/// attribute is surfaced by Charon (Step 4.3.d).
+/// `type_decls` / `trait_decls`; struct field-type strings are resolved
+/// by [`tyref_to_ast_string`] from Charon's type IR.  `immutable_fields`
+/// stays empty until the `#[majit_macros::immutable]` attribute is
+/// surfaced by Charon.
 ///
 /// Functions Charon could not extract (opaque body / `null` entry) or
 /// global-initializer bodies are skipped silently — they are not JIT
@@ -248,7 +236,7 @@ fn is_known_lowering_gap(msg: &str) -> bool {
 pub fn build_semantic_program_from_llbc(
     llbc: &Llbc,
 ) -> Result<crate::front::semantic::SemanticProgram, LowerError> {
-    // ── Pass 1: walk type_decls + trait_decls (Step 4.3.b) ────────
+    // ── Pass 1: walk type_decls + trait_decls ─────────────────────
     let (known_struct_names, known_trait_names, struct_fields, enum_variant_by_discriminant) =
         derive_program_metadata(llbc);
 
@@ -266,31 +254,26 @@ pub fn build_semantic_program_from_llbc(
         // at the JIT level, and their unwind paths use `set_raise`
         // (`model.rs:3873`) — which mints orphan etype/evalue slots
         // the flowspace adapter then rejects with the "undefined
-        // operand slot N as Link.args[0]" invariant break.  The AST
-        // front-end never registered them as call graphs either;
-        // preserve that policy here so the MIR cutover does not
-        // surface call-registry entries the rest of the pipeline
-        // never modelled.
+        // operand slot N as Link.args[0]" invariant break.  Skip them
+        // so they never surface as call-registry entries the rest of
+        // the pipeline does not model.
         if fd.is_global_initializer.is_some() {
             continue;
         }
-        // Step 4.5 naming alignment: AST front-end keys SemanticFunction
-        // by bare leaf name plus a separate `module_path`.  Mirror the
-        // shape so `register_function_graph_alias` (lib.rs:444) walks
-        // `{bare, crate::*, pyre_*::*}` correctly for both front-ends
-        // and the portal lookup at lib.rs:1043 (`["eval_loop_jit"]`)
-        // resolves.
+        // Key each SemanticFunction by bare leaf name plus a separate
+        // `module_path` so `register_function_graph_alias` (lib.rs:444)
+        // walks `{bare, crate::*, pyre_*::*}` correctly and the portal
+        // lookup at lib.rs:1043 (`["eval_loop_jit"]`) resolves.
         let stripped = strip_crate_prefix(&fd.item_meta.name_path());
         let (module_path, name) = match stripped.rsplit_once("::") {
             Some((module, leaf)) => (module.to_string(), leaf.to_string()),
             None => (String::new(), stripped),
         };
-        // Step 4.5: a single function whose body the driver does not
-        // yet handle should not abort the whole-program build.
-        // Capture per-function errors into a side bucket and continue;
-        // the cutover surfaces them via `PYRE_MIR_FRONTEND_DEBUG=1`
-        // for triage, but production keeps going with a degraded
-        // SemanticProgram. This matches the AST driver's policy of
+        // A single function whose body the driver does not yet handle
+        // should not abort the whole-program build.  Capture
+        // per-function errors into a side bucket and continue; they are
+        // surfaced via `PYRE_MIR_FRONTEND_DEBUG=1` for triage, but
+        // production keeps going with a degraded SemanticProgram —
         // failing-loud on the single broken function rather than
         // erroring out at program-build time.
         let graph = match lower_fun_decl(llbc, fd) {
@@ -300,29 +283,27 @@ pub fn build_semantic_program_from_llbc(
                 continue;
             }
         };
-        // Step 4.5: return_type is intentionally `None` until the
-        // Charon dedup-table widening (Step 4.3.c.ext) can resolve a
-        // `TyRef::Deduplicated{id}` to its primitive name. The
-        // codewriter's call-signature validator at
-        // `jit_codewriter/call.rs:4234` skips the check when declared
+        // return_type is intentionally `None` until the Charon
+        // dedup-table resolution can map a `TyRef::Deduplicated{id}` to
+        // its primitive name. The codewriter's call-signature validator
+        // at `jit_codewriter/call.rs:4234` skips the check when declared
         // type is None, which is the right behaviour while the
         // resolution gap is open — TyRef labels (`ty#170`) would
         // otherwise be classified as `Type::Ref` and trip a spurious
         // mismatch panic against a real `Type::Int` callee result.
-        // Step 6.E prerequisite: surface impl-method owner on the
-        // SemanticFunction so `lib.rs:868` / `lib.rs:1086` and the
-        // (still-AST-side) `extract_inherent_impl_methods` /
-        // `extract_trait_impls` consumers see the same
-        // `self_ty_root` MIR records.  Without this, every impl method
-        // built by MIR looks like a free function to the canonical
-        // registration loop and the impl-key return-type / hint
-        // registrations get dropped.
+        // Surface the impl-method owner on the SemanticFunction so
+        // `lib.rs:868` / `lib.rs:1086` and the
+        // `extract_inherent_impl_methods` / `extract_trait_impls`
+        // consumers see the same `self_ty_root` the MIR driver records.
+        // Without this, every impl method built by the MIR driver looks
+        // like a free function to the canonical registration loop and
+        // the impl-key return-type / hint registrations get dropped.
         let self_ty_root = impl_method_owner_for_fundecl(llbc, fd).map(|(owner, _)| owner);
-        // Step 6.E follow-up: surface trait identity for trait-impl
-        // methods so the canonical registration loop can call
-        // `register_trait_method` instead of routing through
-        // `extract_trait_impls`.  Inherent impls leave `trait_root =
-        // None`; trait-impl methods carry the trait's leaf name.
+        // Surface trait identity for trait-impl methods so the
+        // canonical registration loop can call `register_trait_method`
+        // instead of routing through `extract_trait_impls`.  Inherent
+        // impls leave `trait_root = None`; trait-impl methods carry the
+        // trait's leaf name.
         //
         // Two sources feed `trait_root`:
         //   1. trait-impl bodies — penultimate NameSeg is `Impl{Trait:id}`
@@ -355,8 +336,7 @@ pub fn build_semantic_program_from_llbc(
     // would degrade the program by being dropped to a residual call,
     // never a correctness loss. Any *other* lowering failure is a coverage
     // regression that must not pass silently, so fail the whole-program
-    // build with the offending list. This is the fail-loud successor to
-    // the since-removed `lib.rs` coverage audit.
+    // build with the offending list.
     if !skipped.is_empty() {
         let (tracked, regressions): (Vec<_>, Vec<_>) = skipped
             .iter()
@@ -393,15 +373,14 @@ pub fn build_semantic_program_from_llbc(
         // Immutable-field tracking depends on `#[majit_macros::immutable]`
         // attribute serialization that Charon does not currently surface
         // (the `attributes` array carries DocComment / Outer but not our
-        // proc-macro hints). Tracked under Step 4.3.d.
+        // proc-macro hints).
         immutable_fields: std::collections::HashMap::new(),
         enum_variant_by_discriminant,
     })
 }
 
-/// Step 4.3.b: derive whole-program type-metadata fields of
-/// `SemanticProgram` from Charon's `type_decls` + `trait_decls`
-/// tables.
+/// Derive whole-program type-metadata fields of `SemanticProgram` from
+/// Charon's `type_decls` + `trait_decls` tables.
 ///
 /// Returns `(known_struct_names, known_trait_names, struct_fields,
 /// enum_variant_by_discriminant)`.
@@ -431,8 +410,7 @@ fn derive_program_metadata(
             TypeDeclKind::Struct(fields) => {
                 // Register the qualified path *and* the bare leaf name
                 // so downstream lookups (`canonical_call_target`'s
-                // bare-leaf fallback) resolve either spelling. Matches
-                // the AST driver's dual-publish convention.
+                // bare-leaf fallback) resolve either spelling.
                 let leaf = name.rsplit("::").next().unwrap_or(&name).to_string();
                 let rows: Vec<(String, String)> = fields
                     .iter()
@@ -450,8 +428,8 @@ fn derive_program_metadata(
             TypeDeclKind::Enum(variants) => {
                 // Enums register under their type name *and* under each
                 // variant path (`Strategy::Empty`, `Strategy::IntKeyed`,
-                // …) so synthetic Aggregate(SyntheticTransparentCtor)
-                // emitted by Step 3.9 can be matched downstream.
+                // …) so a synthetic Aggregate(SyntheticTransparentCtor)
+                // can be matched downstream.
                 let leaf = name.rsplit("::").next().unwrap_or(&name).to_string();
                 known_struct_names.insert(name.clone());
                 known_struct_names.insert(leaf.clone());
@@ -606,8 +584,7 @@ impl<'a> Lowering<'a> {
         // from `flowmodel.py:130` `Block(inputargs)`).
         //
         // Each parameter is also emitted as a paired `OpKind::Input { name,
-        // ty }` op into the startblock, mirroring AST
-        // (`front/ast.rs:1636-1646 / 1656-1665`).  Downstream consumers
+        // ty }` op into the startblock.  Downstream consumers
         // — `flowspace_adapter::derive_subject_inputcells`
         // (`translator/rtyper/flowspace_adapter.rs:1464+`),
         // `graph_non_void_arg_types` (`jit_codewriter/call.rs:2748+`),
@@ -624,9 +601,8 @@ impl<'a> Lowering<'a> {
             let name = local.name.clone().unwrap_or_else(|| format!("arg{i}"));
             let var = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
             // Register a stable name so canonical comparison can spot
-            // arg-renames.  The `value_names` side-table was retired;
-            // names live on the value via `name_value_var` (mirrors the
-            // `parse.rs` arg-binding path).
+            // arg-renames.  Names live on the value via `name_value_var`
+            // (mirrors the `parse.rs` arg-binding path).
             graph.name_value_var(&var, name.clone());
             local_var[i] = Some(var.clone());
             let ty = tyref_to_value_type(&local.ty, llbc);
@@ -682,8 +658,7 @@ impl<'a> Lowering<'a> {
         // per local, so iteration order only governs *when* each block
         // writes its defs: a read binds as soon as *any* defining block
         // precedes it in processing order.  The default is MIR-index
-        // (`Linear`) order, which preserves every binding the historical
-        // linear driver produced.  It fails only when a definition
+        // (`Linear`) order.  It fails only when a definition
         // (notably a `TermKind::Call` dest) sits at a higher MIR index
         // than a block that reads it, producing a spurious "uninitialised
         // local"; `lower_fun_decl` then re-lowers in `ReversePostorder`,
@@ -818,14 +793,14 @@ impl<'a> Lowering<'a> {
             // The JIT does not need to materialize anything.
             StmtKind::PlaceMention(_) => Ok(()),
 
-            // Statement-level Rust overflow / bounds assertion. Current
-            // Charon emits every assert as a *terminator* (`TermKind::Assert`,
-            // handled in `lower_terminator`), so this arm is unreached in
-            // the present corpus; it is kept as defensive handling for the
-            // older paired `Assign(AddChecked) + Assert(!overflow)` shape.
-            // Stripping is correct either way — same rationale as the
-            // terminator arm: a Rust-debug check with no Python-observable
-            // meaning.
+            // Statement-level Rust overflow / bounds assertion. Charon
+            // emits every assert as a *terminator* (`TermKind::Assert`,
+            // handled in `lower_terminator`), so this arm is not reached
+            // by the current corpus; it is kept as defensive handling
+            // for the paired `Assign(AddChecked) + Assert(!overflow)`
+            // shape. Stripping is correct either way — same rationale as
+            // the terminator arm: a Rust-debug check with no
+            // Python-observable meaning.
             StmtKind::Assert(_) => Ok(()),
 
             StmtKind::Assign(place, rvalue) => self.lower_assign(mir_bb, place, rvalue),
@@ -1054,8 +1029,7 @@ impl<'a> Lowering<'a> {
             // and downstream consumers (codewriter, regalloc) operate on
             // the value flowing through the reference, not the reference
             // itself. Aliasing the dest local to the referent Variable
-            // keeps the IR small and matches the AST driver's behaviour
-            // of treating `&x` as a same-Variable copy.
+            // keeps the IR small, treating `&x` as a same-Variable copy.
             Rvalue::Ref { place, .. } => {
                 let v = self.resolve_place(mir_bb, place)?;
                 Ok((None, v))
@@ -1108,9 +1082,8 @@ impl<'a> Lowering<'a> {
             // `Cast(kind, operand, target_ty)` — numeric/pointer
             // coercion. The JIT does not track narrow integer widths,
             // so reuse the alias path: the cast result Variable is the
-            // same as the operand Variable. PRE-EXISTING-ADAPTATION:
-            // the AST front-end also collapses `as` casts that do not
-            // change the JIT-visible kind.
+            // same as the operand Variable. `as` casts that do not
+            // change the JIT-visible kind collapse this way.
             Rvalue::Cast(_kind, operand, _ty) => {
                 let v = self.resolve_operand(mir_bb, operand)?;
                 Ok((None, v))
@@ -1262,9 +1235,9 @@ impl<'a> Lowering<'a> {
             // value. Modeled as a synthetic `FieldRead` of an
             // `__discriminant` field: tag access is morally a pure
             // field read at the bit level, and reusing the existing
-            // `FieldRead` shape keeps the IR closed under the AST
-            // front-end's opkind catalogue (per `front/mod.rs` rule —
-            // no new OpKinds in this layer). `owner_root` is left
+            // `FieldRead` shape keeps the IR closed under the opkind
+            // catalogue (per `front/mod.rs` rule — no new OpKinds in
+            // this layer). `owner_root` is left
             // `None` because Charon's [`Place`] does not yet surface a
             // resolvable enum type name; the codewriter that consumes
             // this op may look up the receiver's classdef hint from
@@ -1315,9 +1288,6 @@ impl<'a> Lowering<'a> {
             // String / char / byte-string constants — no
             // ConstStr opkind exists; synthesise a 0-arg `Call` whose
             // path encodes the literal text so the IR stays stable.
-            // PRE-EXISTING-ADAPTATION: AST front-end resolves these
-            // through `front/ast.rs::lower_expr` const folding and
-            // never emits them as a free-standing op either.
             DecodedConst::Str(s) => OpKind::Call {
                 target: CallTarget::FunctionPath {
                     segments: vec!["__str_const".to_string(), s],
@@ -1357,12 +1327,12 @@ impl<'a> Lowering<'a> {
             }),
             PlaceKind::Projection(inner, elem) => {
                 // Adt-container `Field` projections emit a typed
-                // `OpKind::FieldRead` so downstream consumers
-                // (codewriter inlining + annotator GetAttr dispatch
-                // on cross-procedural callers like
+                // `OpKind::FieldRead` carrying the field name and
+                // `owner_root` so downstream consumers (codewriter
+                // inlining + annotator GetAttr dispatch on
+                // cross-procedural callers like
                 // `flowspace/rust_source/build_flow.rs:4770
-                // lower_field`) see the same field/owner_root shape
-                // the AST front-end emits at `front/ast.rs:4923`.
+                // lower_field`) get a resolvable field/owner_root shape.
                 //
                 // Tuple-container `Field` projections split two ways.
                 // A local bound by a positional `Rvalue::Aggregate`
@@ -1446,7 +1416,7 @@ impl<'a> Lowering<'a> {
             // carrying the global's resolved name; downstream
             // consumers see a uniform call shape and can route on
             // the name (e.g. recognise `__elidable_function_*` constants
-            // already handled by the AST front-end's hint pass).
+            // handled by the hint pass).
             PlaceKind::Global { id, .. } => {
                 let segments = self.global_segments(mir_bb, id)?;
                 let res = self
@@ -1795,11 +1765,9 @@ impl<'a> Lowering<'a> {
                 // `CallTarget::Method` instead of `FunctionPath` so the
                 // annotator's `MethodDesc.func_args`
                 // (`annotator/description.rs:2278`) prepends a
-                // classdef-bound `SomeInstance` for `self`.  AST does
-                // the same at `front/ast.rs:5205` for
-                // `syn::Expr::MethodCall`; without it, the callee
-                // body's `self` lands with `classdef=None` and any
-                // `.field` projection on it panics at
+                // classdef-bound `SomeInstance` for `self`.  Without it,
+                // the callee body's `self` lands with `classdef=None`
+                // and any `.field` projection on it panics at
                 // `unaryop.rs:3587` (lib test
                 // `generic_handler_graphs_keep_symbolic_fnaddr_surface`).
                 let (segments, method_hint) = self.call_target_segments(mir_bb, &reg.kind)?;
@@ -1830,11 +1798,10 @@ impl<'a> Lowering<'a> {
                 // `dyn Trait` virtual call. The fat-pointer receiver
                 // is carried in `dyn_operand`; thread it into `args[0]`
                 // and emit a synthetic `__dyn_call` path so the
-                // codewriter sees a uniform `Call` shape.
-                // PRE-EXISTING-ADAPTATION: a faithful lowering would
-                // emit `VtableMethodPtr` + `IndirectCall`; that needs
-                // the trait_root/method_name pair Charon does not yet
-                // surface (tracked under [[step3-dynamic-call-vtable]]).
+                // codewriter sees a uniform `Call` shape.  A faithful
+                // lowering would emit `VtableMethodPtr` + `IndirectCall`;
+                // that needs the trait_root/method_name pair Charon does
+                // not yet surface.
                 let recv = self.resolve_operand(mir_bb, dyn_operand)?;
                 let mut full_args = Vec::with_capacity(args.len() + 1);
                 full_args.push(recv);
@@ -1941,9 +1908,9 @@ impl<'a> Lowering<'a> {
             // (e.g. `pyre_interpreter::shared_opcode::SharedOpcodeHandler::
             // push_value`).
             //
-            // The AST front-end's `extract_trait_impls` parses the
-            // trait declaration's default-body and registers it under
-            // BOTH `["<default methods of <Trait>>", <method>]` (the
+            // `extract_trait_impls` parses the trait declaration's
+            // default-body and registers it under BOTH
+            // `["<default methods of <Trait>>", <method>]` (the
             // selfclassdef-bound `register_trait_method` path) and the
             // direct path `[<Trait>, <method>]` (lib.rs:957-969 —
             // `register_function_graph(direct_path, …)`).  The direct
@@ -1951,21 +1918,20 @@ impl<'a> Lowering<'a> {
             // `<Trait>::<method>(receiver, …)` and the BFS-driven
             // `find_all_graphs` reaches it as a regular candidate.
             //
-            // To stay PyPy-orthodox for generic-trait dispatch in MIR
-            // mode, route the call through that same `[<Trait>,
-            // <method>]` path so:
+            // To stay PyPy-orthodox for generic-trait dispatch, route
+            // the call through that same `[<Trait>, <method>]` path so:
             //   1. BFS discovers the trait default body as a
             //      candidate, which transitively pulls in the helpers
             //      it calls (e.g. `opcode_load_const`).
-            //   2. `flowspace_adapter` emits the same `simple_call(<
-            //      callable>, args…)` shape AST does (no `getattr`
-            //      surface) so the classdef-less receiver does not
-            //      surface as a panicking `SomeInstance.getattr`.
+            //   2. `flowspace_adapter` emits a `simple_call(<
+            //      callable>, args…)` shape (no `getattr` surface) so
+            //      the classdef-less receiver does not surface as a
+            //      panicking `SomeInstance.getattr`.
             //
-            // Falls back to the legacy `["__trait_method", <label>]`
-            // synthetic path when the fn_decl cannot be resolved or
-            // does not have the trait-method shape (e.g. when arr[2]
-            // is missing or points at an `Impl` block).
+            // Falls back to the `["__trait_method", <label>]` synthetic
+            // path when the fn_decl cannot be resolved or does not have
+            // the trait-method shape (e.g. when arr[2] is missing or
+            // points at an `Impl` block).
             CallKind::Trait(v) => {
                 let fn_id = v
                     .as_array()
@@ -2192,15 +2158,13 @@ fn impl_method_owner_for_fundecl(llbc: &Llbc, fd: &FunDecl) -> Option<(String, S
     };
     let adt_def_id = resolve_impl_owner_adt_def_id_free(llbc, impl_payload)?;
     let td = llbc.type_by_id(adt_def_id)?;
-    // Match the AST builder's owner-qualification convention: bare
-    // ident qualified by the type's defining module path.  AST does
-    // `qualify_type_name_with_imports(type_root, module_prefix, …)`
-    // → `gc_roots::RootScope`; mirror that by stripping the crate
-    // name from the TypeDecl's full name_path so MIR's
-    // `self_ty_root` keys land on the same `[module::Owner, method]`
-    // CallPath the AST extractors use.  Without this alignment the
-    // canonical registration loop at `lib.rs:864-902` cannot find
-    // the MIR-built graph keyed by `[qualified_owner, method]`.
+    // Owner-qualification convention: bare ident qualified by the
+    // type's defining module path (e.g. `gc_roots::RootScope`).  Strip
+    // the crate name from the TypeDecl's full name_path so the
+    // `self_ty_root` keys land on a `[module::Owner, method]` CallPath.
+    // Without this qualification the canonical registration loop at
+    // `lib.rs:864-902` cannot find the graph keyed by
+    // `[qualified_owner, method]`.
     let owner_qualified = strip_crate_prefix(&td.item_meta.name_path());
     if owner_qualified.is_empty() {
         return None;
@@ -2246,7 +2210,7 @@ fn resolve_impl_owner_adt_def_id_free(
 /// Used by `build_semantic_program_from_llbc` to populate
 /// `SemanticFunction.trait_root` so the canonical registration loop
 /// can call `CallControl::register_trait_method` instead of routing
-/// through the AST-side `extract_trait_impls`.
+/// through `extract_trait_impls`.
 fn trait_impl_trait_root_for_fundecl(llbc: &Llbc, fd: &FunDecl) -> Option<String> {
     let segs = &fd.item_meta.name;
     let last_idx = segs
@@ -2537,10 +2501,9 @@ fn clone_tyref(ty: &TyRef) -> TyRef {
 
 /// Project a Charon [`TyRef`] to the JIT-visible [`ValueType`].
 ///
-/// Mirrors AST's `type_string_to_value_type` (front/ast.rs:10310)
-/// surface: numeric scalars → `Int` / `Float`, bool → `Bool`, unit
-/// → `Void`, everything else (structs, pointers, references) →
-/// `Ref`.  The TyRef's serialized form is the source of truth —
+/// Numeric scalars → `Int` / `Float`, bool → `Bool`, unit → `Void`,
+/// everything else (structs, pointers, references) → `Ref`.  The
+/// TyRef's serialized form is the source of truth —
 /// `TyRef::label()` produces a compact short form
 /// (`"ty#170"`, `"ty<Adt>"`) for opaque IDs, while the underlying
 /// JSON carries the primitive name for literal types.
@@ -2550,7 +2513,7 @@ fn clone_tyref(ty: &TyRef) -> TyRef {
 /// the same primitive-pattern match.  Required so FunDecl return
 /// types serialized as `Deduplicated` (≈92% in `pyre-interpreter.ullbc`)
 /// resolve to `Int` / `Bool` / `Float` instead of falling back to
-/// `Ref` (Step 4.3.c.ext / Task #30).
+/// `Ref`.
 fn tyref_to_value_type(ty: &TyRef, llbc: &Llbc) -> ValueType {
     // The HashConsedValue arm carries the body inline; primitives
     // typically land here.  The Deduplicated arm carries only an
@@ -2574,9 +2537,8 @@ fn tyref_to_value_type(ty: &TyRef, llbc: &Llbc) -> ValueType {
     //     `{"Literal": {"UInt": "Usize"}}`,
     //     `{"Literal": {"Float": "F64"}}`.
     //
-    // (Older Charon revisions used a single `{"Literal": {"Integer":
-    // …}}` shape, which we still accept for forward-compat with any
-    // pre-extracted .ullbc artefacts still floating around.)
+    // A single `{"Literal": {"Integer": …}}` shape is also accepted so
+    // .ullbc artefacts that use it still resolve.
     //
     // Unit type `()` serializes as `{"Adt": {"id": "Tuple",
     // "generics": {"types": []}}}` and routes through the final `Ref`
@@ -2654,13 +2616,12 @@ fn is_unit_type(ty: &TyRef, llbc: &Llbc) -> bool {
     is_tuple && empty_types
 }
 
-/// Resolve a Charon [`TyRef`] to the AST-format Rust type STRING that
-/// the retired syn metadata pass produced
-/// (`front::syn_metadata::qualified_full_type_string`), so
+/// Resolve a Charon [`TyRef`] to the Rust type STRING the
+/// `struct_fields` registry consumers expect, so
 /// `derive_program_metadata` can fill `struct_fields` with real type
 /// strings instead of `TyRef::label()` placeholders.
 ///
-/// Format contract (mirrors the syn producer):
+/// Format contract:
 ///   - references are STRIPPED (`&T` / `&mut T` -> `T`);
 ///   - raw pointers keep `*mut ` / `*const ` prefixes;
 ///   - integer / float / bool / char primitives use their Rust spelling;
@@ -2717,7 +2678,7 @@ fn charon_type_value_to_ast_string(v: &serde_json::Value, llbc: &Llbc, depth: us
     if let Some(lit) = obj.get("Literal") {
         return charon_literal_to_ast_string(lit);
     }
-    // References are stripped to their referent (syn drops `&`/`&mut`).
+    // References are stripped to their referent (`&T` / `&mut T` -> `T`).
     if let Some(r) = obj.get("Ref") {
         if let Some(arr) = r.as_array() {
             // `{"Ref": [region, ty, kind]}`.
@@ -2762,15 +2723,14 @@ fn charon_type_value_to_ast_string(v: &serde_json::Value, llbc: &Llbc, depth: us
             charon_type_value_to_ast_string(elem, llbc, depth + 1)
         );
     }
-    // `dyn Trait` — syn emits `dyn <trait-root>`; recover the trait's
-    // leaf name from the first trait-ref's resolved decl when present.
+    // `dyn Trait` -> `dyn <trait-root>`; recover the trait's leaf name
+    // from the first trait-ref's resolved decl when present.
     if obj.contains_key("DynTrait") {
         return charon_dyn_trait_to_ast_string(&obj["DynTrait"], llbc);
     }
-    // Function pointers — syn renders these as `fn(..) -> ..`; the JIT
-    // consumers only ever wrapper-strip and struct-name-match field
-    // types, so a coarse `fn` marker is sufficient (no consumer parses
-    // the arrow form).
+    // Function pointers — the JIT consumers only ever wrapper-strip and
+    // struct-name-match field types, so a coarse `fn` marker is
+    // sufficient (no consumer parses the `fn(..) -> ..` arrow form).
     if obj.contains_key("FnPtr") {
         return "fn".to_string();
     }
@@ -2824,7 +2784,7 @@ fn charon_literal_to_ast_string(lit: &serde_json::Value) -> String {
             return charon_int_kind_to_rust(uint, false);
         }
         if let Some(int) = obj.get("Integer").and_then(serde_json::Value::as_str) {
-            // Older single-`Integer` form: kind string is already signed/unsigned.
+            // Single-`Integer` form: kind string is already signed/unsigned.
             let signed = !int.starts_with('U');
             return charon_int_kind_to_rust(int, signed);
         }
@@ -2848,7 +2808,7 @@ fn charon_literal_to_ast_string(lit: &serde_json::Value) -> String {
 fn charon_int_kind_to_rust(kind: &str, signed: bool) -> String {
     let lowered = kind.to_ascii_lowercase();
     // Kind tags already carry the leading `i`/`u` for most widths
-    // (`I64` -> `i64`, `U8` -> `u8`, `Usize` -> `usize`).  The legacy
+    // (`I64` -> `i64`, `U8` -> `u8`, `Usize` -> `usize`).  The single
     // `Integer` form may hand back a bare width — fall back to `signed`.
     if lowered.starts_with('i') || lowered.starts_with('u') {
         return lowered;
@@ -2877,7 +2837,8 @@ fn charon_adt_to_ast_string(
                 .map(|t| charon_type_value_to_ast_string(t, llbc, depth + 1))
                 // Drop the default allocator / hasher type-args Charon
                 // makes explicit (`Vec<T, Global>`, `HashMap<K, V,
-                // RandomState, Global>`); the syn producer elides them.
+                // RandomState, Global>`) so the rendered string elides
+                // them.
                 .filter(|s| s != "Global" && s != "RandomState")
                 .collect()
         })
@@ -2935,9 +2896,7 @@ fn charon_builtin_adt_to_ast_string(
         })
         .unwrap_or("?");
     match name {
-        // `Box<T>` is transparent in the syn producer's eyes only when the
-        // source wrote it explicitly; Charon's `Box` builtin maps back to
-        // the `Box<T>` spelling.
+        // Charon's `Box` builtin maps to the `Box<T>` spelling.
         "Box" => match type_args.first() {
             Some(inner) => format!("Box<{inner}>"),
             None => "Box".to_string(),
@@ -2950,8 +2909,8 @@ fn charon_builtin_adt_to_ast_string(
         "Array" => {
             let elem = type_args.first().cloned().unwrap_or_default();
             // Array length lives in the ADT's const-generic args; when
-            // absent fall back to the `N` placeholder the syn producer
-            // also emits for non-literal lengths.
+            // absent fall back to the `N` placeholder for non-literal
+            // lengths.
             let len = adt
                 .get("generics")
                 .and_then(|g| g.as_object())
@@ -3062,13 +3021,12 @@ fn trait_call_label(v: &serde_json::Value) -> String {
 
 /// Strip the leading crate-name segment from a Charon `name_path()`.
 /// Charon prefixes every fully-qualified path with the crate name
-/// (`pyre_interpreter::frame::eval_loop_jit`), while the AST front-end
-/// names functions relative to their parsed-file root
-/// (`frame::eval_loop_jit` for a non-empty `module_path`, or the bare
-/// leaf for `module_path == ""`).  Matching the AST convention lets
-/// `register_function_graph_alias` (lib.rs:444) walk
+/// (`pyre_interpreter::frame::eval_loop_jit`); functions are named
+/// relative to their module root instead (`frame::eval_loop_jit` for a
+/// non-empty `module_path`, or the bare leaf for `module_path == ""`)
+/// so `register_function_graph_alias` (lib.rs:444) can walk
 /// `{bare, crate::*, pyre_interpreter::*, pyre_object::*, pyre_jit::*}`
-/// aliases off the same `func.name` for both front-ends.
+/// aliases off the same `func.name`.
 fn strip_crate_prefix(path: &str) -> String {
     match path.split_once("::") {
         Some((_crate, rest)) => rest.to_string(),
@@ -3112,10 +3070,10 @@ enum DecodedConst {
     Bool(bool),
     Float(u64),
     /// String / char / byte-string literals. The IR has no dedicated
-    /// string constant opkind in the AST front-end either; the
-    /// codewriter treats these as opaque pointer-typed values. We
-    /// carry the textual representation as a unique-string `ConstValue`
-    /// so the generated IR is stable across runs.
+    /// string constant opkind; the codewriter treats these as opaque
+    /// pointer-typed values. We carry the textual representation as a
+    /// unique-string `ConstValue` so the generated IR is stable across
+    /// runs.
     Str(String),
     /// Constant function pointer (`FnDef`). Encoded as a synthetic
     /// `FunctionPath` so it shares the existing `Call` lowering path
@@ -3150,12 +3108,12 @@ fn decode_constant(llbc: &Llbc, value: &serde_json::Value) -> Result<DecodedCons
     }
     // `VTableRef { ... }` — vtable pointer for dynamic dispatch.
     // Treat as an opaque pointer-typed value; covering it faithfully
-    // requires the trait dispatch widening (Step 3.11).
+    // requires the trait dispatch widening.
     if kind.contains_key("VTableRef") {
         return Ok(DecodedConst::Str("__vtable_ref".to_string()));
     }
     // `TraitConst` — trait-associated const. Opaque for now; covering
-    // it faithfully requires trait/impl resolution (Step 3.11).
+    // it faithfully requires trait/impl resolution.
     if kind.contains_key("TraitConst") {
         return Ok(DecodedConst::Str("__trait_const".to_string()));
     }

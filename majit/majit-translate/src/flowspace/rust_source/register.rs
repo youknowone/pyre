@@ -3537,8 +3537,8 @@ fn try_build_gc_struct_ptr(name: &str, fields: &syn::Fields) -> Option<Ptr> {
 /// register-class collapse that `getkind` performs
 /// (`rpython/jit/codewriter/support.py:getkind`), where `Char` /
 /// `UniChar` / `SingleFloat` all fold to `'int'`. The
-/// register-class lift in `front/ast.rs::classify_fn_arg_ty` works
-/// at the `ValueType` (= register class) layer; that layer agrees
+/// register-class lift in `front::syn_metadata::classify_fn_arg_ty`
+/// works at the `ValueType` (= register class) layer; that layer agrees
 /// with `getkind`, not with the lltype-primitive identity captured
 /// here. Mapping `char → Signed` or `f32 → Float` here would erase
 /// the lltype identity even though it would coincidentally pick the
@@ -4053,8 +4053,8 @@ fn extract_argnames_from_sig(sig: &syn::Signature) -> Result<Vec<String>, Adapte
 /// `prefix` is the module-path stem the caller derived from the source
 /// filename (`pyobject` for `pyre/pyre-object/src/pyobject.rs`); each
 /// free-fn key becomes `[prefix, ident]` (or `[ident]` when prefix is
-/// empty, matching the bare-name registration path in
-/// `front/ast.rs::collect_fn_returns`).  Impl-methods key as
+/// empty, matching the bare-name registration path through
+/// `lib.rs::register_function_graph`).  Impl-methods key as
 /// `[prefix-segments..., ImplTy-segments..., method]` — the file's
 /// module prefix is prepended only when the impl target was written as
 /// a bare ident (`impl PyFrame { ... }` in `pyframe.rs` → `["pyframe",

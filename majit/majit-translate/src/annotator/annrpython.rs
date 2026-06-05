@@ -1,10 +1,9 @@
 //! RPython `rpython/annotator/annrpython.py` — `RPythonAnnotator` driver.
 //!
-//! This file starts as a skeleton holding only the public surface that
-//! the `binaryop` / `unaryop` dispatchers immediately consume — the
-//! rest of the driver (`build_types`, `complete`, `processblock`,
-//! `consider_op`, `flowin`, …) lands with the annrpython porting
-//! commits further down the plan (Commit 7 Part A / Commit 8 Part B).
+//! Holds the `RPythonAnnotator` public surface that the `binaryop` /
+//! `unaryop` dispatchers consume, together with the driver itself
+//! (`build_types`, `complete`, `processblock`, `consider_op`, `flowin`,
+//! …).
 //!
 //! Fields and method signatures mirror upstream line-by-line; method
 //! bodies that still require un-ported machinery (pendingblocks queue,
@@ -476,8 +475,7 @@ impl RPythonAnnotator {
 
     /// RPython `warning(self, msg, pos=None)` (annrpython.py:301-...).
     ///
-    /// Driver-level logging. Non-ported methods (`build_types`,
-    /// `complete`, `processblock`, ...) land with Commit 7 Part A.
+    /// Driver-level logging.
     pub fn warning(&self, msg: &str) {
         // RPython `annrpython.py:303 log.WARNING("%s/ %s" % (pos, msg))`.
         // `log` is `py.log.Producer("annrpython")`, an unconditional
@@ -1855,8 +1853,7 @@ impl RPythonAnnotator {
             Ok(u) => u,
             Err(e) => {
                 // Upstream keeps going when `self.keepgoing` is set;
-                // otherwise re-raises. Both land cleanly once `errors`
-                // carries structured payloads (Commit 7b).
+                // otherwise re-raises.
                 if self.keepgoing {
                     self.errors.borrow_mut().push(format!("{e}"));
                     self.failed_blocks
@@ -2382,11 +2379,10 @@ impl RPythonAnnotator {
     ///     self.added_blocks[block] = True
     /// ```
     ///
-    /// The `flowin` call lands with Commit 8; until then the Rust
-    /// port's body contains the bookkeeping (annotated flip, blocked
-    /// cleanup, added_blocks tracking) that empty blocks already need.
-    /// `BlockedInference` handling is also staged for Commit 8 when
-    /// `flowin` actually throws.
+    /// The body runs `flowin(graph, block)` and performs the
+    /// bookkeeping around it (annotated flip, blocked cleanup,
+    /// added_blocks tracking). `BlockedInference` raised by `flowin`
+    /// reflects the block back into `blocked_blocks` for a later retry.
     pub fn processblock(
         &self,
         graph: &GraphRef,
@@ -3035,10 +3031,9 @@ mod tests {
 
     #[test]
     fn position_key_from_refs_upgrades_graph_and_block() {
-        // Priority #4: PositionKey carries Weak refs to
-        // FunctionGraph / Block so `reflowfromposition` can recover
-        // them. The synthetic `PositionKey::new` path leaves the refs
-        // dangling.
+        // PositionKey carries Weak refs to FunctionGraph / Block so
+        // `reflowfromposition` can recover them. The synthetic
+        // `PositionKey::new` path leaves the refs dangling.
         let graph = mk_graph("pkrefs", 0);
         let startblock = graph.borrow().startblock.clone();
         let pk = super::super::bookkeeper::PositionKey::from_refs(&graph, &startblock, 7);

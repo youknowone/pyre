@@ -1,27 +1,22 @@
-//! Front-end shared types — the data shapes both `front::ast` and
-//! `front::mir` produce, and that the rest of the pipeline
-//! (`analyze_pipeline_from_parsed`, `jit_codewriter::*`, `parse::*`)
-//! consumes.
+//! Front-end shared types — the data shapes `front::mir` produces, and
+//! that the rest of the pipeline (`analyze_pipeline_from_parsed`,
+//! `jit_codewriter::*`, `parse::*`) consumes.
 //!
-//! Carving these out of `front::ast` is the first step toward
-//! retiring the AST graph builder (issue #97 Step 6.E/6.F): the
-//! types do not depend on the syn-tree walker, so they belong
-//! outside the builder that is about to disappear.
+//! These types do not depend on any graph builder, so they live in
+//! their own module rather than inside `front::mir`.
 //!
-//! Nothing in this module performs lowering.  Builders live in
-//! `front::ast` (legacy syn-AST graph builder) and `front::mir`
-//! (Charon ULLBC driver, the default path under
-//! `mir-frontend`).
+//! Nothing in this module performs lowering.  Graphs are built by
+//! `front::mir`, the Charon ULLBC driver.
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 use crate::model::{FunctionGraph, ImmutableRank, UnknownKind};
 
-/// Options carried through the AST graph builder.  Retained as a
-/// distinct unit type so the legacy `build_semantic_program_with_options`
-/// API can keep accepting an explicit options parameter while
-/// preserving the upstream `build_flow_graph` call shape.
+/// Options carried through the semantic-program build.  A distinct unit
+/// type so the build entry point can accept an explicit options
+/// parameter while preserving the upstream `build_flow_graph` call
+/// shape.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AstGraphOptions;
 
@@ -44,9 +39,8 @@ pub enum FlowingError {
     Unsupported { kind: UnknownKind },
 }
 
-/// Legacy alias: callers that pre-date the `FlowingError` / `Lowered`
-/// split in this file still reference `LoweringAbort`.  Kept as a
-/// type alias so renames can ride a separate commit.
+/// Alias for `FlowingError`, used by callers that spell the abort
+/// type as `LoweringAbort`.
 pub type LoweringAbort = FlowingError;
 
 #[derive(Debug, Clone)]
@@ -92,14 +86,10 @@ pub struct SemanticFunction {
     /// method, the trait's name when this is a trait default-body
     /// method, otherwise `None` (free function or inherent impl).
     ///
-    /// Added 2026-05-25 as the missing piece for Step 6.E:
-    /// `parse::extract_trait_impls` currently carries the trait_name
-    /// in a parallel `TraitImplInfo` record so the registration loop
-    /// in `lib.rs:905-1019` can distinguish trait-impl methods (which
-    /// need `register_trait_method`) from inherent methods (which
-    /// need `register_function_graph`).  Surfacing it here lets that
-    /// loop walk `program.functions` directly and the AST-side
-    /// extractors retire.
+    /// Lets the registration loop in `lib.rs:905-1019` walk
+    /// `program.functions` directly and distinguish trait-impl methods
+    /// (which need `register_trait_method`) from inherent methods
+    /// (which need `register_function_graph`).
     pub trait_root: Option<String>,
 }
 
@@ -222,26 +212,20 @@ pub struct SemanticProgram {
     pub enum_variant_by_discriminant: HashMap<String, HashMap<i64, String>>,
 }
 
-/// Step 6.E Slice 3.C — graph lookup table built from a
-/// `SemanticProgram` so the AST-side `extract_trait_impls` /
-/// `extract_inherent_impl_methods` collectors can skip
-/// `build_function_graph_with_self_ty_pub` when the MIR builder already
-/// produced a graph for the same (impl_type or trait_root, method)
-/// pair.  Cuts the largest single AST-graph-builder consumer in the
-/// MIR-covered surface and is a prerequisite for retiring the
-/// AST graph builder bulk under issue #97 Step 6.F.
+/// Graph lookup table built from a `SemanticProgram` so the
+/// registration loops in `lib.rs` and the opcode-dispatch extractor in
+/// `front::mir_dispatch` can fetch the MIR-built graph for a given
+/// (impl_type or trait_root, method) pair by name.
 ///
-/// AST callers spell `self_ty_root` two ways depending on extraction
-/// path: inherent extract qualifies through `module_path` ("pyframe::
-/// PyFrame"), but trait-impl extract uses prefix="" so a top-level
-/// `impl Drop for PyFrame` yields the bare leaf "PyFrame".  MIR
-/// always stores the module-qualified spelling.  To bridge the
-/// asymmetry without forcing AST callers to re-qualify, the lookup
-/// indexes every impl method TWICE: once by qualified owner, once by
-/// the bare leaf (rsplit on "::").  Bare-leaf collisions across
-/// distinct types (e.g. `Drop::drop` on both `PyFrame` and
-/// `Other`) are tracked as ambiguous and return None — the caller
-/// must then qualify.
+/// Callers spell `self_ty_root` two ways: a qualified owner
+/// ("pyframe::PyFrame"), or — for a top-level `impl Drop for PyFrame`
+/// reached through `for_type` — the bare leaf "PyFrame".  The MIR
+/// driver always stores the module-qualified spelling.  To bridge the
+/// asymmetry without forcing callers to re-qualify, the lookup indexes
+/// every impl method TWICE: once by qualified owner, once by the bare
+/// leaf (rsplit on "::").  Bare-leaf collisions across distinct types
+/// (e.g. `Drop::drop` on both `PyFrame` and `Other`) are tracked as
+/// ambiguous and return None — the caller must then qualify.
 pub struct MirGraphLookup<'a> {
     /// Impl methods (inherent + trait-impl): keyed by (self_ty_root, name).
     /// `Ok(&graph)` is a unique hit; `Err(())` marks the slot ambiguous
@@ -257,7 +241,7 @@ pub struct MirGraphLookup<'a> {
     /// (two or more free functions share a bare name across modules).
     /// Lets the opcode-dispatch extractor resolve `execute_opcode_step`
     /// and each `execute_<op>` handler graph from the MIR program by
-    /// name without re-lowering the syn arm body.
+    /// name.
     free_functions: HashMap<&'a str, Result<&'a FunctionGraph, ()>>,
 }
 
@@ -274,9 +258,9 @@ impl<'a> MirGraphLookup<'a> {
         for f in &program.functions {
             if let Some(owner) = f.self_ty_root.as_deref() {
                 Self::insert_or_mark_ambiguous(&mut impl_methods, owner, f.name.as_str(), &f.graph);
-                // Also index by the bare leaf for AST callers (e.g.
-                // top-level `impl Drop for PyFrame`) whose
-                // self_ty_root is unqualified.  Bare leaf is the
+                // Also index by the bare leaf for callers that pass an
+                // unqualified owner (e.g. top-level `impl Drop for
+                // PyFrame` reached through `for_type`).  Bare leaf is the
                 // last "::"-separated segment; identical to qualified
                 // when self_ty_root has no module prefix.
                 let leaf = owner.rsplit("::").next().unwrap_or(owner);

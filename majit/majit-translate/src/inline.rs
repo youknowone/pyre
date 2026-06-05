@@ -1147,10 +1147,11 @@ pub fn is_pure_op(kind: &OpKind) -> bool {
 /// (`translator/rtyper/flowspace_adapter.rs:344-353`) requires the
 /// frontend to desugar `!x` away before reaching the rtyper, so DCE
 /// must surface a live `not` op to the rtyper rather than silently
-/// dropping a dead one.  Frontend gate at `front/ast.rs:3285`
-/// already retires Rust `*x` (no flowspace peer); when frontend
-/// stops emitting `not`, this whitelist will only retain
-/// post-jtransform / rtyper-emitted opnames.
+/// dropping a dead one.  `front::mir` collapses Rust deref `*x`
+/// (no flowspace peer) when it lowers `UnaryOp`/`Deref`, so the
+/// frontend never emits it; when the frontend stops emitting `not`,
+/// this whitelist will only retain post-jtransform / rtyper-emitted
+/// opnames.
 /// Whitelist of `OpKind::BinOp` opnames that are side-effect-free
 /// upstream — direct port of the binary entries in
 /// `simplify.CanRemove` (`simplify.py:405-417`) +

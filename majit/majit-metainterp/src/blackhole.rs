@@ -4056,20 +4056,18 @@ bhhandler_i_i!(handler_int_force_ge_zero, bhimpl_int_force_ge_zero);
 bhhandler_ii_i!(handler_int_add, bhimpl_int_add);
 bhhandler_ii_i!(handler_int_sub, bhimpl_int_sub);
 
-// pyre-only: `a += b` in Rust front-end (`front/ast.rs:1604` maps
-// `syn::BinOp::AddAssign` to the BinOp name `"add_assign"`). Under SSA
-// the compound assignment becomes two reads + one write, so the
-// bytecode shape is identical to `int_add/ii>i` — same primitive. Has
-// no RPython analog; canonical RPython lowers `+=` to plain BINARY_ADD
-// before reaching jtransform.
+// pyre-only: compound assignment `a += b` lowered to the BinOp name
+// `"add_assign"`. Under SSA the compound assignment becomes two reads +
+// one write, so the bytecode shape is identical to `int_add/ii>i` — same
+// primitive. Has no RPython analog; canonical RPython lowers `+=` to plain
+// BINARY_ADD before reaching jtransform.
 bhhandler_ii_i!(handler_int_add_assign_pyre, bhimpl_int_add);
 bhhandler_ii_i!(handler_int_sub_assign_pyre, bhimpl_int_sub);
 
-// pyre-only: `*x` in Rust front-end (`front/ast.rs:1577` maps
-// `syn::UnOp::Deref` to the UnaryOp name `"deref"`). After rtyper
-// lowering the &i64 input has already been resolved to a plain i64
-// value, so the operation degenerates to a copy at dispatch time. Same
-// primitive as `int_same_as`.
+// pyre-only: dereference `*x` lowered to the UnaryOp name `"deref"`.
+// After rtyper lowering the &i64 input has already been resolved to a
+// plain i64 value, so the operation degenerates to a copy at dispatch
+// time. Same primitive as `int_same_as`.
 bhhandler_i_i!(handler_int_deref_pyre, bhimpl_int_same_as);
 
 // pyre-only: `OpKind::Abort` placeholder emitted by the front-end when a

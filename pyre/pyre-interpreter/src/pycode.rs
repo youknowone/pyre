@@ -165,12 +165,12 @@ pub fn w_code_new_with_hidden_applevel(code_ptr: *const (), hidden_applevel: boo
     // RPython pointer alignment idiom (`rpython/memory/gc/minimarkpage.py:159
     // ll_assert((nsize & (WORD-1)) == 0, "malloc: size is not aligned")`):
     // bitwise AND of `cast_ptr_to_int(p)` against `(power_of_two_align - 1)`
-    // gives the misalignment residual.  The pyre frontend's `Expr::Cast`
-    // emits `cast_ptr_to_int` for `(Ref, Int)` casts (`front/ast.rs:8503`),
-    // so casting through `i64` (not `usize`) routes the pointer through
-    // the proper LL conversion.  `align_of::<T>()` is always a power of
-    // two — `& (align - 1)` is equivalent to `% align` for power-of-two
-    // alignments and matches the RPython pattern bit-for-bit.
+    // gives the misalignment residual.  `front::mir` lowers a `(Ref, Int)`
+    // cast to the `cast_ptr_to_int` op, so casting through `i64` (not
+    // `usize`) routes the pointer through the proper LL conversion.
+    // `align_of::<T>()` is always a power of two — `& (align - 1)` is
+    // equivalent to `% align` for power-of-two alignments and matches the
+    // RPython pattern bit-for-bit.
     let align_mask = std::mem::align_of::<crate::CodeObject>() as i64 - 1;
     let fast_natural_arity = if code_ptr.is_null() || (code_ptr as i64) & align_mask != 0 {
         crate::gateway::HOPELESS

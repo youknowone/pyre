@@ -1139,12 +1139,10 @@ pub fn builtin_abs(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
 /// `_match_signature` (`argument.py:173`) before the interp-level function
 /// runs; the builtin never sees a marker dict. Pyre's flat `BuiltinCodeFn`
 /// ABI lacks that Signature surface, so each kwarg-aware builtin reaches into
-/// the `__pyre_kw__`-tagged trailing dict via this shared helper. CONVERGENCE
-/// PATH (same epic as the producer note in `call.rs`): port the builtin
-/// Signature/unwrap_spec gateway, route builtin kwargs through
-/// `Arguments::_match_signature` into named slots, then delete this helper and
-/// the `__pyre_kw__` marker. Deferred — a standalone multi-slice epic that also
-/// touches the JIT inline-call flat tail (`pyre-jit/src/eval.rs`).
+/// the `__pyre_kw__`-tagged trailing dict via this shared helper. The builtin
+/// Signature/unwrap_spec gateway is not yet ported; once it routes builtin
+/// kwargs through `Arguments::_match_signature` into named slots, this helper
+/// and the `__pyre_kw__` marker can be removed.
 pub(crate) fn split_builtin_kwargs(args: &[PyObjectRef]) -> (&[PyObjectRef], Option<PyObjectRef>) {
     if let Some(&last) = args.last() {
         if unsafe {

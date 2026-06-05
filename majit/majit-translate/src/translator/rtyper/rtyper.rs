@@ -2121,8 +2121,8 @@ impl RPythonTyper {
             //     `storesink.rs:95` (these run post-rtyper but reuse
             //     `translate_operation` indirectly if any later phase
             //     re-runs the typer),
-            //   - identity / source-type-unknown `Expr::Cast`
-            //     lowering (front/ast.rs:5106) — the frontend emits
+            //   - identity / source-type-unknown `Cast` lowering in
+            //     `front::mir` — the frontend emits
             //     `OpKind::UnaryOp { op: "same_as", result_ty, .. }`
             //     to preserve target-type propagation through the
             //     graph (RPython has no `expr as T` syntax, but pyre

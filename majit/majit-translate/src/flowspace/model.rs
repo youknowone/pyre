@@ -49,10 +49,10 @@ use crate::translator::rtyper::lltypesystem::lltype::{_ptr, Ptr};
 ///    defines `LowLevelType` and the primitive singletons. Pyre
 ///    preserves that separation by re-exporting the alias here.
 /// 2. The previous placeholder `ConcretetypePlaceholder = ()` dropped
-///    Repr information; migrating to the real type closes part of
-///    Gap C (FUNC.RESULT CFG scan inference) from the epic plan,
-///    because `FuncType.args` / `FuncType.result` now carry the actual
-///    per-arg lowleveltypes instead of collapsing to unit.
+///    Repr information; carrying the real type lets `FuncType.args` /
+///    `FuncType.result` hold the actual per-arg lowleveltypes instead
+///    of collapsing to unit, which is what FUNC.RESULT CFG-scan
+///    inference relies on.
 pub type ConcretetypePlaceholder = crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
 
 /// RPython `Constant.value` 에 담기는 host-level Python object 의 일반
@@ -1035,9 +1035,9 @@ fn host_object_own_getattr(pyobj: &HostObject, name: &str) -> Option<ConstValue>
             _ => None,
         },
         "__globals__" => match &pyobj.inner.kind {
-            // Issue 2.1 (2026-05-05): re-snapshot via `live_globals`
-            // so `func.__globals__` mirrors upstream's *live* module
-            // dict reference (`flowcontext.py:284`). For
+            // Re-snapshot via `live_globals` so `func.__globals__`
+            // mirrors upstream's *live* module dict reference
+            // (`flowcontext.py:284`). For
             // rust-source-built funcs this picks up any registry
             // entries that landed after the GraphFunc was built.
             HostObjectKind::UserFunction { graph_func } => Some(graph_func.live_globals()),
@@ -1340,9 +1340,8 @@ pub fn const_runtime_getattr(obj: &ConstValue, name: &str) -> Result<Option<Cons
                     .or_else(|| split_attr_name_module(&func.name).1);
                 Ok(module_name.map(ConstValue::byte_str))
             }
-            // Issue 2.1 (2026-05-05): live-snapshot accessor mirrors
-            // upstream `func.__globals__` reading the module dict
-            // directly (`flowcontext.py:284`).
+            // Live-snapshot accessor mirrors upstream `func.__globals__`
+            // reading the module dict directly (`flowcontext.py:284`).
             "__globals__" => Ok(Some(func.live_globals())),
             "__defaults__" => {
                 if func.defaults.is_empty() {
@@ -2529,9 +2528,7 @@ fn alloc_var_id() -> u64 {
 /// adaptation for the unavoidable gap between Python's attribute-on-
 /// object model and Rust's value-type struct. CLAUDE.md permits it
 /// because the alternative (lossy per-clone-slot `annotation`) breaks
-/// annotator correctness — see `test_variable_identity_diagnostic.rs`
-/// and plan `~/.claude/plans/annotator-monomorphization-tier1-abstract-
-/// lake.md` "Feasibility probe findings".
+/// annotator correctness — see `test_variable_identity_diagnostic.rs`.
 /// Backing storage for [`Variable`] — the single heap object that all
 /// references to one logical Variable share. Mutable attributes use
 /// plain `Cell`/`RefCell` interior mutability; no per-field `Rc` is
@@ -3861,8 +3858,7 @@ pub struct GraphFunc {
     /// to `true` by RPython's `@not_rpython` decorator to mark a
     /// function as flow-space-ineligible.
     pub not_rpython: bool,
-    /// Issue 2.1 (2026-05-05): when set, `func.__globals__`
-    /// introspection paths
+    /// When set, `func.__globals__` introspection paths
     /// (`HostObject::class_get("__globals__")` /
     /// `getattr(func, "__globals__")`) re-snapshot the registry
     /// partition keyed on this id at access time, mirroring upstream
@@ -3916,8 +3912,8 @@ impl GraphFunc {
         }
     }
 
-    /// Issue 2.1 (2026-05-05): live-snapshot accessor for
-    /// `func.__globals__`. When `module_globals_id` is set,
+    /// Live-snapshot accessor for `func.__globals__`. When
+    /// `module_globals_id` is set,
     /// re-queries the registry partition so callers see any
     /// entries added after this `GraphFunc` was constructed —
     /// matching upstream's live `func.__globals__` reference

@@ -1,7 +1,7 @@
-//! Phase E acceptance anchor (lucky-growing-puzzle).
+//! Structural anchor for `make_jitcodes` graph-keyed output.
 //!
-//! Test name matches the plan's stated acceptance command
-//! (`cargo test -p majit-translate test_make_jitcodes_produces_graph_keyed_output`).
+//! Runs as
+//! `cargo test -p majit-translate test_make_jitcodes_produces_graph_keyed_output`.
 //!
 //! ## RPython references
 //!
@@ -19,16 +19,16 @@
 //!
 //! ## What this test anchors
 //!
-//! Phase E's structural claim is that `make_jitcodes` output is
-//! **graph-keyed** — one `JitCode` per `CallPath`, with no
-//! `Instruction`-variant tables, no opcode-to-fragment lookups, no
-//! anything Python bytecode-shaped. The plan's explicit prohibition is:
-//! > 산출물은 `{graph: JitCode}` 만 — variant-keyed map 도입 금지.
+//! `make_jitcodes` output is **graph-keyed** — one `JitCode` per
+//! `CallPath`, with no `Instruction`-variant tables, no
+//! opcode-to-fragment lookups, no anything Python bytecode-shaped. The
+//! structural prohibition is: output is `{graph: JitCode}` only, no
+//! variant-keyed map.
 //!
-//! `test_phase_f_all_jitcodes.rs` already covers most of the
-//! behavioural acceptance; this file adds the **structural** anchor
-//! the plan specifies by name, with focused assertions that detect
-//! any future drift toward variant-keyed output schemas.
+//! `test_phase_f_all_jitcodes.rs` covers most of the behavioural
+//! acceptance; this file adds the **structural** anchor, with focused
+//! assertions that detect any future drift toward variant-keyed output
+//! schemas.
 
 use majit_translate::{generated::with_all_jitcodes, jitcode::JitCode};
 use std::collections::HashSet;
@@ -43,8 +43,8 @@ fn test_make_jitcodes_produces_graph_keyed_output() {
         );
         return;
     }
-    // Phase E contract: `AllJitCodes::by_path` is keyed by `CallPath`
-    // (graph identity), matching upstream `call.py:87 self.jitcodes`.
+    // `AllJitCodes::by_path` is keyed by `CallPath` (graph identity),
+    // matching upstream `call.py:87 self.jitcodes`.
     // The `by_path` field's type ensures at compile time that no
     // Instruction-variant key can ever land here — this test only has
     // to verify that the live registry respects the contract without
@@ -84,14 +84,14 @@ fn test_make_jitcodes_produces_graph_keyed_output() {
             );
         }
 
-        // Invariant 3: registry size reflects the Phase A + B expected
-        // closure. Phase A confirmed 28 `opcode_*` handlers lower to
-        // FunctionGraphs. Phase B confirmed every PyFrame trait method has
-        // a graph. Phase E must produce at least that many JitCodes (plus
-        // whatever shared_opcode / inherent method closure BFS pulls in).
+        // Invariant 3: registry size reflects the expected closure. The
+        // 28 `opcode_*` handlers lower to FunctionGraphs, every PyFrame
+        // trait method has a graph, and the registry holds at least that
+        // many JitCodes (plus whatever shared_opcode / inherent method
+        // closure the BFS pulls in).
         //
         // Lower floor is intentional — the upper bound drifts as more
-        // helpers get pulled into the closure by Phase D's BFS. A count
+        // helpers get pulled into the closure by the BFS. A count
         // regression is the signal; any growth is fine.
         assert!(
             reg.in_order.len() >= 28,

@@ -109,7 +109,7 @@ pub fn analyze_pipeline(source: &str) -> pipeline::ProgramPipelineResult {
     analyze_pipeline_with_config(source, &AnalyzeConfig::default())
 }
 
-/// Issue #97 Step 4.4 — feature-gated SemanticProgram builder cutover.
+/// Feature-gated SemanticProgram builder.
 ///
 /// When the `mir-frontend` feature is enabled, route the build
 /// through [`front::mir::build_semantic_program_from_llbcs`] using
@@ -118,31 +118,29 @@ pub fn analyze_pipeline(source: &str) -> pipeline::ProgramPipelineResult {
 /// 1. `PYRE_MIR_FRONTEND_LLBC` env-var (OS path-list: `;`-separated on
 ///    Windows, `:`-separated elsewhere). Explicit override for CI /
 ///    test fixtures targeting a specific LLBC set.
-/// 2. Auto-discovery at `<workspace>/build/llbc/<expected>.ullbc`
-///    (Step 6.B 2026-05-25).  `scripts/extract-llbc.sh` writes here.
-///    If every expected file exists, MIR cutover engages
-///    automatically.
+/// 2. Auto-discovery at `<workspace>/build/llbc/<expected>.ullbc`,
+///    where `scripts/extract-llbc.sh` writes. If every expected file
+///    exists, the MIR front-end engages automatically.
 ///
-/// Panics when neither source resolves: the syn-AST graph builder was
-/// retired (Slice 5 / issue #97 Step 6.F), so a missing LLBC set
-/// (Charon not installed, or `scripts/extract-llbc.sh` not run) is a
-/// fatal misconfiguration rather than a fallback to a legacy path.
+/// Panics when neither source resolves: the MIR front-end is the only
+/// graph builder, so a missing LLBC set (Charon not installed, or
+/// `scripts/extract-llbc.sh` not run) is a fatal misconfiguration
+/// rather than a fallback to another path.
 fn build_semantic_program_via_active_frontend(
     parsed_files: &[parse::ParsedInterpreter],
 ) -> front::SemanticProgram {
     #[cfg(feature = "mir-frontend")]
     {
-        // Step 4.6 multi-LLBC cutover: accept an OS path-list so
-        // production can pass both `pyre-object.ullbc` and
-        // `pyre-interpreter.ullbc` (and any future per-crate ullbc) in
-        // one env-var.  `std::env::split_paths` uses the platform
-        // separator (`;` on Windows, `:` elsewhere) so a Windows drive
-        // letter like `Z:` is not mistaken for a separator.  The
-        // single-path form continues to work.
+        // Accept an OS path-list so production can pass both
+        // `pyre-object.ullbc` and `pyre-interpreter.ullbc` (and any
+        // future per-crate ullbc) in one env-var.
+        // `std::env::split_paths` uses the platform separator (`;` on
+        // Windows, `:` elsewhere) so a Windows drive letter like `Z:`
+        // is not mistaken for a separator.  The single-path form also
+        // works.
         //
-        // Step 6.B: if the env-var is unset, auto-discover the
-        // canonical workspace LLBC artefacts before failing loud (the
-        // AST builder fallback was retired in Slice 5).
+        // If the env-var is unset, auto-discover the canonical
+        // workspace LLBC artefacts before failing loud.
         let resolved_paths: Option<Vec<String>> = std::env::var_os("PYRE_MIR_FRONTEND_LLBC")
             .map(|v| {
                 std::env::split_paths(&v)
@@ -183,10 +181,10 @@ fn build_semantic_program_via_active_frontend(
             return program;
         }
     }
-    let _ = parsed_files; // silence unused warning when only AST is reachable
-    // Slice 5: the AST graph-builder fallback is retired.  Reaching
-    // this point means neither `PYRE_MIR_FRONTEND_LLBC` nor the
-    // workspace auto-discover located an LLBC source — surface the
+    let _ = parsed_files; // silence unused warning when the feature is off
+    // The MIR front-end is the only graph builder.  Reaching this
+    // point means neither `PYRE_MIR_FRONTEND_LLBC` nor the workspace
+    // auto-discover located an LLBC source — surface the
     // misconfiguration immediately.
     panic!(
         "no LLBC source resolved.\n\
@@ -197,10 +195,10 @@ fn build_semantic_program_via_active_frontend(
     );
 }
 
-/// Step 6.B: locate the workspace's `build/llbc/` directory and
-/// return paths to the canonical pyre LLBC artefacts when every
-/// expected file is present *and* the caller looks like a
-/// production build (not a test fixture).
+/// Locate the workspace's `build/llbc/` directory and return paths to
+/// the canonical pyre LLBC artefacts when every expected file is
+/// present *and* the caller looks like a production build (not a test
+/// fixture).
 ///
 /// Returns `None` when:
 ///   - no parsed_file carries a `module_path` (test fixtures use
@@ -255,8 +253,8 @@ fn auto_discover_workspace_llbc_paths(
     // `box_int` / `box_float` / `Drop::drop` entries are semantically
     // residual runtime calls (the deopt-fallback allocator, not traced
     // code), so the `extract_*` `graph: None` placeholder is their
-    // correct representation.  The Step 6.E audit's "missing" count for
-    // these entries is therefore by-design, not a coverage gap.
+    // correct representation.  Their absence from the discovered set is
+    // therefore by-design, not a coverage gap.
     const REQUIRED: &[&str] = &["pyre-object.ullbc", "pyre-interpreter.ullbc"];
     let mut paths = Vec::with_capacity(REQUIRED.len());
     for name in REQUIRED {
@@ -733,14 +731,12 @@ fn analyze_pipeline_from_parsed(
     // the correct response is to abort loudly so the coverage audit
     // surfaces the unsupported expression rather than silently dropping
     // a graph.
-    // Issue #97 Step 4.4: feature-gated cutover. When the
-    // `mir-frontend` feature is enabled AND `PYRE_MIR_FRONTEND_LLBC`
-    // is set, route the production SemanticProgram build through the
-    // MIR-driven `front::mir::build_semantic_program_from_llbc` path
-    // instead of the syn-AST builder. The env-var carries the path to
-    // a Charon-extracted .ullbc snapshot (produced by
-    // `scripts/extract-llbc.sh`). The flag without the env-var still
-    // takes the AST path so partial enablement stays a no-op.
+    // When the `mir-frontend` feature is enabled, route the production
+    // SemanticProgram build through the MIR-driven
+    // `front::mir::build_semantic_program_from_llbcs` path.  The LLBC
+    // source is a Charon-extracted .ullbc snapshot (produced by
+    // `scripts/extract-llbc.sh`), located via `PYRE_MIR_FRONTEND_LLBC`
+    // or workspace auto-discovery.
     mark_phase!("known_statics + struct_origins + struct_field_attrs populated");
     let program = build_semantic_program_via_active_frontend(parsed_files);
     mark_phase!("build_semantic_program_from_parsed_files");
@@ -766,33 +762,28 @@ fn analyze_pipeline_from_parsed(
         String,
     > = std::collections::HashMap::new();
 
-    // Blocker B (#61/#62): source impl-method registration from the
-    // MIR-lowered `program.functions` instead of the syn
-    // `extract_trait_impls` / `extract_inherent_impl_methods`
-    // extractors.  Each `SemanticFunction` carries `self_ty_root` /
-    // `trait_root` (Slice 3.A/3.B) populated to the exact registration
-    // keys the extractors produced, so the downstream registration
-    // loops below are unchanged — only the source of the `canonical_*`
-    // vectors moves off the syn AST.
+    // Source impl-method registration from the MIR-lowered
+    // `program.functions`.  Each `SemanticFunction` carries
+    // `self_ty_root` / `trait_root` populated to the exact registration
+    // keys the downstream loops below consume, so those loops are
+    // agnostic to where the `canonical_*` vectors come from.
     //
-    // Coverage was proven before the cutover (a since-removed
-    // coverage audit): `program.functions` is a superset of every
-    // graph-carrying method the extractors emitted (inherent 417/417;
-    // trait 497/557).  The 60 trait methods the extractors emitted with
-    // no graph are intentional non-JIT targets — `#[cfg(test)]` impls,
+    // `program.functions` is a superset of every graph-carrying
+    // method the source surface defines.  Trait methods with no
+    // graph are intentional non-JIT targets — `#[cfg(test)]` impls,
     // `into_py` on primitive receivers Charon cannot key to an ADT,
     // residual `PyreBlackholeAllocator::*` allocator hooks, std-trait
     // impls (`Drop`/`From`/`PartialEq`/…), and `BoxEnv` default bodies
-    // MIR does not lower.  They registered no graph (so the BFS never
-    // reached them) and their `return_types` were redundant with the
+    // MIR does not lower.  They carry no graph (so the BFS never
+    // reaches them) and their `return_types` are redundant with the
     // CFG-scan result kind (`graph_result_kind` = `getkind(FUNC.RESULT)`,
     // `codewriter.rs:656`) — the calldescr builder reads the declared
     // type only as an `i↔r` tiebreak and `debug_assert`s it against the
-    // CFG kind; no impl method diverged, so dropping the side-table
+    // CFG kind; no impl method diverges, so omitting the side-table
     // entries is a no-op for call-descriptor typing.
     //
-    // `mir_graph_lookup` is still consulted by the registration loops
-    // below (trait-default vs concrete-impl graph fetch), so keep it.
+    // `mir_graph_lookup` is consulted by the registration loops below
+    // (trait-default vs concrete-impl graph fetch).
     let mir_graph_lookup = front::semantic::MirGraphLookup::from_program(&program);
     for func in &program.functions {
         match (&func.self_ty_root, &func.trait_root) {
@@ -969,7 +960,7 @@ fn analyze_pipeline_from_parsed(
     // Thread per-source-file `parsed.module_path` + `use_imports`
     // into CallControl as data carriers (orthodox PyPy
     // `bookkeeper.position` + `frame.f_globals` lexical-resolution
-    // entry points, see [[orthodox-6item-2026-05-17]] item 2.3/2.4).
+    // entry points).
     // Today's consumers normalise at the runtime path_hash boundary
     // via `STRUCT_ORIGIN_REGISTRY` + `canonical_struct_name`; the
     // carriers here let a future per-graph lexical resolver land
@@ -989,17 +980,16 @@ fn analyze_pipeline_from_parsed(
         }
     }
     call_control.use_imports = use_imports_agg;
-    // Z2.5 Path C — populate the metadata-only `unsafe_fn_stubs`
-    // carrier so the codewriter's `dual_gate_registry` can register
-    // every `unsafe fn` / unsafe impl-method as a stub-pygraph entry
-    // in PyreCallRegistry.  Walks each parsed source file under its
-    // crate-stripped `module_path` prefix, dropping unsafe fns whose
-    // return type the slice 3a projection cannot represent (see
+    // Populate the metadata-only `unsafe_fn_stubs` carrier so the
+    // codewriter's `dual_gate_registry` can register every `unsafe fn`
+    // / unsafe impl-method as a stub-pygraph entry in PyreCallRegistry.
+    // Walks each parsed source file under its crate-stripped
+    // `module_path` prefix, dropping unsafe fns whose return type the
+    // projection cannot represent (see
     // `flowspace::rust_source::register::simple_return_type_to_lltype`).
-    // Closes the bulk of the "not registered in PyreCallRegistry"
-    // Skip cluster (218 events at 2026-05-22 measurement) dominated
-    // by `pyre_object::is_*` predicates whose body lowering is
-    // intentionally rejected at `build_flow.rs:215`.
+    // Covers the bulk of the "not registered in PyreCallRegistry" Skip
+    // cluster dominated by `pyre_object::is_*` predicates whose body
+    // lowering is intentionally rejected at `build_flow.rs:215`.
     let mut unsafe_stubs: Vec<(
         Vec<String>,
         crate::flowspace::argument::Signature,
@@ -1056,15 +1046,13 @@ fn analyze_pipeline_from_parsed(
             );
         }
     }
-    // Step 6.E Slice 3.B/3.C — the registration loop below substitutes
-    // the MIR-built graph for the AST-built one carried in
-    // `canonical_trait_impls` / `canonical_inherent_methods`.  The
-    // `mir_graph_lookup` built before the extract_* loop above is the
-    // same one extract_* consulted to skip its AST graph build, so a
-    // hit there means we already have the MIR graph in MethodInfo.graph;
-    // the lookup here covers the case where extract_* fell back to AST
-    // (e.g. a MIR builder failure) but MIR still produced a graph later
-    // — defensive and cheap.
+    // The registration loop below prefers the graph from
+    // `mir_graph_lookup` over the one already carried in
+    // `canonical_trait_impls` / `canonical_inherent_methods`.  Both
+    // come from `program.functions`, so the lookup is a defensive
+    // re-fetch keyed on the registration path — cheap, and it keeps a
+    // single source of truth for the trait-default vs concrete-impl
+    // distinction.
     for impl_info in &canonical_trait_impls {
         let impl_type = impl_info
             .self_ty_root
@@ -1081,12 +1069,11 @@ fn analyze_pipeline_from_parsed(
         };
         let is_default = impl_info.for_type.starts_with("<default methods of ");
         for method in &impl_info.methods {
-            // Slice 3.B/3.C/5: read the MIR-built graph from
-            // `program.functions`.  `method.graph` (`Option`) remains
-            // as a residual fallback for the ~44 MIR-uncovered entries
-            // Slice 3.E still tracks, though extract_* now emits
-            // `graph: None` for every miss so the fallback is
-            // effectively unreached today.
+            // Read the MIR-built graph from `program.functions`.
+            // `method.graph` (`Option`) remains as a residual fallback
+            // for the handful of MIR-uncovered entries, though every
+            // method registered above carries a graph so the fallback
+            // is effectively unreached.
             let mir_graph: Option<&model::FunctionGraph> = if is_default {
                 mir_graph_lookup.lookup_trait_default(&impl_info.trait_name, &method.name)
             } else {
@@ -1123,9 +1110,9 @@ fn analyze_pipeline_from_parsed(
                         impl_info.trait_name.as_str(),
                         method.name.as_str(),
                     ]);
-                    // Slice 3.B: prefer MIR's graph for the direct_path
-                    // registration too; fall back to AST when MIR has
-                    // no entry.
+                    // Prefer the MIR graph for the direct_path
+                    // registration too; fall back to `method.graph`
+                    // when the lookup has no entry.
                     let direct_source: Option<model::FunctionGraph> =
                         mir_graph.cloned().or_else(|| method.graph.clone());
                     if let Some(g) = direct_source {
@@ -1212,11 +1199,10 @@ fn analyze_pipeline_from_parsed(
             .as_deref()
             .unwrap_or(&method_info.for_type);
         let path = crate::parse::CallPath::for_impl_method(impl_type, method_info.name.as_str());
-        // Slice 3.B/3.C/5: read the MIR-built graph; `method_info.graph`
-        // is the residual fallback for ~44 MIR-uncovered entries
-        // (Slice 3.E) — extract_* `continue`s on miss today so this
-        // arm is effectively unreached for the surface
-        // `extract_inherent_impl_methods` produces.
+        // Read the MIR-built graph; `method_info.graph` is the
+        // residual fallback for the handful of MIR-uncovered entries,
+        // effectively unreached because every inherent method
+        // registered above carries a graph.
         let graph: model::FunctionGraph = mir_graph_lookup
             .lookup_impl_method(impl_type, &method_info.name)
             .map(|g| g.clone())
@@ -1361,9 +1347,9 @@ fn analyze_pipeline_from_parsed(
     // target. `execute_opcode_step` itself is a handler reached from the
     // real portal's match arm, so seeding BFS from it treats a handler
     // as an entry point — tolerable only for the legacy test
-    // configurations that have no `eval_loop_jit` at all; once those
-    // tests feed the full Phase D0 source set the fallback is never
-    // exercised and the eval_loop_jit-only identity locks in.
+    // configurations that have no `eval_loop_jit` at all.  When the
+    // tests feed the full production source set the fallback is never
+    // exercised and the eval_loop_jit-only identity is used.
     let default_portal_name = {
         // Tolerate module-qualified registrations: `eval_loop_jit` may
         // land under `["eval", "eval_loop_jit"]` when its file
@@ -1603,8 +1589,8 @@ fn build_canonical_opcode_dispatch(
     Vec<jitcode::BhDescr>,
 ) {
     // Reconstruct the opcode-dispatch arms from the lowered MIR
-    // `execute_opcode_step` graph (`front::mir_dispatch`), not the syn
-    // AST.  `reject_duplicate_opcode_selectors` keeps the parser-level
+    // `execute_opcode_step` graph (`front::mir_dispatch`).
+    // `reject_duplicate_opcode_selectors` keeps the parser-level
     // uniqueness invariant.
     let opcode_arms = parse::reject_duplicate_opcode_selectors(
         front::mir_dispatch::extract_opcode_dispatch_arms_from_mir(program),

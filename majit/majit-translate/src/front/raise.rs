@@ -1,4 +1,4 @@
-//! RPython `exc_from_raise` lowering for AST-sourced raise sites.
+//! RPython `exc_from_raise` lowering for raise sites.
 //!
 //! ## Positioning
 //!
@@ -29,7 +29,7 @@
 //!     return FSException(w_type, w_value)
 //! ```
 //!
-//! AST lowering (`front/ast.rs`) reaches the raise machinery through
+//! `front::mir` lowering reaches the raise machinery through
 //! Rust macros (`panic!`, `assert!`, `unreachable!`, …) whose adapter
 //! always produces the *(Class, optional args)* shape — `w_arg1` is a
 //! statically known exception class, and whatever the macro passes as
@@ -113,8 +113,8 @@
 //! `flowcontext.py:2861 Instruction::RaiseVarargs`, which maps
 //! `BareRaise` / `Raise` / `RaiseCause` to the canonical `(w_arg1,
 //! w_arg2)` input of `exc_from_raise`).  Keeping the version- /
-//! host-specific wiring out of this helper means AST lowering and
-//! flowspace lowering both converge on the same inlined op sequence.
+//! host-specific wiring out of this helper means `front::mir` lowering
+//! and flowspace lowering both converge on the same inlined op sequence.
 //!
 //! ## What this helper is not
 //!

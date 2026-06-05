@@ -23,12 +23,12 @@ pub enum ValueType {
     /// valuetype_to_someshell) treat `Unsigned` identically to `Int`
     /// via `Int | Unsigned` arms.
     ///
-    /// Produced by `front/ast.rs::classify_fn_arg_ty` for Rust
+    /// Produced by `front::syn_metadata::classify_fn_arg_ty` for Rust
     /// `u8`/`u16`/`u32`/`u64`/`usize` typed args.  Cast routing
     /// through `simple_call(__builtin__.float/bool, v_uint)`,
     /// `simple_call(rarithmetic.intmask, v_uint)`, and
-    /// `simple_call(rarithmetic.r_uint, v)` lives in
-    /// `front/ast.rs::cast_builtin_name` per
+    /// `simple_call(rarithmetic.r_uint, v)` lives in `front::mir`'s
+    /// `Cast` lowering per
     /// `rbuiltin.py:178-189` / `rbuiltin.py:220-225` /
     /// `rarithmetic.py:600`.
     Unsigned,
@@ -44,8 +44,8 @@ pub enum ValueType {
     /// `is`/`is not`, the unary `bool` op, and Rust `bool`-typed locals
     /// produce `Bool`.
     ///
-    /// `Lit::Bool` and the `UNARY_NOT` arms in `front/ast.rs` emit
-    /// the dedicated `OpKind::ConstBool(bool)` variant; the rtyper
+    /// Bool literals lower in `front::mir` to the dedicated
+    /// `OpKind::ConstBool(bool)` variant; the rtyper
     /// adapter lifts it to `Constant(True/False, lltype.Bool)` so the
     /// annotator selects `SomeBool` and the rtyper picks `BoolRepr`.
     /// The codewriter collapses storage to the int kind via
@@ -64,7 +64,7 @@ pub enum ValueType {
     Bool,
     /// `lltype.Ptr(<inner>)` — pointer / GC reference family.  The
     /// optional `String` carries the Rust type-root identifier
-    /// (mirrors `front/ast.rs::type_root_ident`) for the pointee when
+    /// (mirrors `front::syn_metadata::type_root_ident`) for the pointee when
     /// the producer knows it; `None` is the un-narrowed / opaque case
     /// (mirrors `lltype.Ptr(<unspecified>)` upstream where the rtyper
     /// resolves through `getinstancerepr(rtyper, None, Gc)` to the
@@ -442,12 +442,13 @@ pub enum OpKind {
         /// PyPy's annotator routes typed `&Foo` through
         /// `bookkeeper.getuniqueclassdef` (`description.py:283-305
         /// FunctionDesc.pycall`) so the rtyper's `find_attribute`
-        /// (`rclass.py:556`) lands on the actual `ClassDef`.  Populated
-        /// from the leaf segment of `type_root_ident` at
-        /// `build_function_graph` (front/ast.rs:2107-2184) when the
-        /// param's `ValueType` is `Ref(_)` and the leaf matches a known
-        /// struct in `program.struct_fields`; otherwise `None`.  Non-
-        /// `Ref` params (Int, Float, Bool, Void) always have `None`.
+        /// (`rclass.py:556`) lands on the actual `ClassDef`.  The
+        /// `front::mir` param lowering currently leaves this `None` for
+        /// every parameter; typed pointer precision, when carried, comes
+        /// from the leaf segment of the param's `ValueType::Ref(_)` root
+        /// when that leaf matches a known struct in
+        /// `program.struct_fields`.  Non-`Ref` params (Int, Float, Bool,
+        /// Void) always have `None`.
         class_root: Option<String>,
     },
     ConstInt(i64),
@@ -901,16 +902,15 @@ pub enum OpKind {
         jitdriver_index: usize,
     },
 
-    /// pyre-only marker emitted by the front-end (`front/ast.rs`
-    /// `continue_with_unknown*` / `stop_unsupported`) when a syntactic
-    /// form cannot be lowered to a canonical opname.  Reaching the op at
-    /// runtime means tracing or blackhole resume crossed an
-    /// untranslatable graph slice; downstream handlers advance past it
-    /// (see `blackhole.rs::handler_abort_marker_pyre`).  Distinct from
-    /// RPython's `SwitchToBlackhole` exception path — RPython aborts
-    /// before lowering so no equivalent opname exists.  Kept under
-    /// `kind: UnknownKind` because the same diagnostic enum is reused
-    /// by `FlowingError::Unsupported` (`front/ast.rs:53`).
+    /// pyre-only marker emitted by `front::opcode_wrapper` when an
+    /// opcode-dispatch arm cannot be lowered to a canonical opname.
+    /// Reaching the op at runtime means tracing or blackhole resume
+    /// crossed an untranslatable graph slice; downstream handlers
+    /// advance past it (see `blackhole.rs::handler_abort_marker_pyre`).
+    /// Distinct from RPython's `SwitchToBlackhole` exception path —
+    /// RPython aborts before lowering so no equivalent opname exists.
+    /// Kept under `kind: UnknownKind` because the same diagnostic enum
+    /// is reused by `front::mir`'s `LowerError::Unsupported`.
     Abort {
         kind: UnknownKind,
     },
@@ -918,19 +918,14 @@ pub enum OpKind {
     /// RPython `BUILD_TUPLE` (`flowspace/flowcontext.py:1163`) /
     /// `newtuple` operation (`operation.py:542-548`).  Constructs a
     /// new tuple from N element values; the result is a fresh tuple
-    /// object distinct from any individual element.  Emitted by
-    /// `front/ast.rs::lower_expr` for `syn::Expr::Tuple` in place of
-    /// the prior `Abort { UnsupportedExpr::Tuple }` marker.
+    /// object distinct from any individual element.
     NewTuple {
         args: Vec<crate::flowspace::model::Variable>,
     },
 
-    /// Single-segment `Expr::Path` resolving to a crate-local `static`
+    /// A single-segment path resolving to a crate-local `static`
     /// declaration (typically a SHOUTY_CASE constant like
-    /// `GC_WEAKREF_TYPE`, `INT_TYPE`, `MODULE_DICT_TYPE`).  Emitted by
-    /// `front/ast.rs::lower_expr` for `syn::Expr::Path` whose joined
-    /// `name` is present in `ctx.known_statics` (populated from
-    /// `CallControl.static_decls`).
+    /// `GC_WEAKREF_TYPE`, `INT_TYPE`, `MODULE_DICT_TYPE`).
     ///
     /// RPython parity: `flowspace/flowcontext.py:LOAD_GLOBAL` lifts a
     /// module-scope name lookup to a `Constant(value)` whose payload
@@ -1236,18 +1231,17 @@ pub struct Block {
 ///
 /// RPython parity: `flowspace/framestate.py:18 FrameState` — a tuple of
 /// `(locals_w, stack, last_exception, blocklist, next_offset)`.  Pyre's
-/// AST frontend currently runs over Rust source rather than Python
-/// bytecode, so the `stack` / `last_exception` / `blocklist` /
-/// `next_offset` projections are vestigially empty until the
-/// flowcontext-style walker rewrites `front::ast`.
+/// graphs are lowered from Charon ULLBC rather than Python bytecode, so
+/// the `stack` / `last_exception` / `blocklist` / `next_offset`
+/// projections are vestigially empty.
 ///
 /// All five fields are present in the struct now so
 /// shape parity is locked in at the model layer; downstream merging
 /// passes already thread them via `union`.  The flowcontext walker
 /// (`flowspace::flowcontext::FlowContext`) and `flowspace::framestate::
 /// FrameState` are the upstream-orthodox surfaces this struct is
-/// converging toward — eventually `front::ast` produces flowspace
-/// graphs directly and this AST-shaped `FrameState` retires.
+/// converging toward — eventually flowspace graphs are produced directly
+/// and this slot-indexed `FrameState` retires.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FrameState {
     /// Slot `i` ↔ graph-wide first-bind name at index `i`; `None` if
@@ -1439,7 +1433,7 @@ impl FrameState {
         // `self.next_offset` against `other.*` — those equality
         // assertions live in `framestate.py:53-59 matches`, which is a
         // separate predicate the caller invokes AFTER union.  Pyre's
-        // AST frontend keeps both projections at trivial defaults
+        // frontend keeps both projections at trivial defaults
         // today (empty Vec, next_offset 0); even when they diverge,
         // upstream still produces a merged FrameState that just
         // carries `self.{blocklist,next_offset}` and lets `matches`
@@ -1495,7 +1489,7 @@ impl FrameState {
         // through `flowspace::framestate::union` (Hlvalue-domain
         // per-cell union — `framestate.py:105-128`).  Upstream
         // `_union(seq1, seq2)` zips equal-length sequences; pyre's
-        // AST frontend can grow the locals projection across the
+        // frontend can grow the locals projection across the
         // sub-block boundary when a name is first bound on one side,
         // so we extend to `max(len, len)` and treat the trailing
         // unpadded slot as `None` (per-cell `union` returns
@@ -1927,9 +1921,8 @@ impl FrameState {
             .all(|(w1, w2)| cell_match(w1, w2))
     }
 
-    /// cfg(test) constructor mirror of [`entry_slots`] in
-    /// `front/ast.rs`: project a slice of `Option<usize>` slot indices
-    /// into a `Vec<Option<Variable>>` ready for
+    /// cfg(test) constructor that projects a slice of `Option<usize>`
+    /// slot indices into a `Vec<Option<Variable>>` ready for
     /// `FrameState { entries: ..., .. }` initialization.  Used by
     /// hand-built test fixtures so each fixture stays slot-indexed
     /// while the storage carrier holds Variable identities.  Each slot
@@ -2375,9 +2368,8 @@ pub fn prune_dead_phis(graph: &mut FunctionGraph) {
     // Inputarg-shaped Input ops keep their result Variable in `read_vars`
     // via Step 1+3+dependency-routing, so the live ones survive
     // unconditionally; dead ones get removed alongside their
-    // matching inputarg trim in Step 7.  Naked Input ops (the
-    // legacy fallback at `front/ast.rs` for cross-block reads not
-    // yet routed through `lazy_install_local_at_current_block`) do
+    // matching inputarg trim in Step 7.  Naked Input ops (any Input
+    // op whose result is not pinned by a matching inputarg) do
     // NOT have inputarg pinning, so the same `result not in
     // read_vars` predicate retires them — `simplify.py` itself has
     // no standalone Input op shape, but the line-by-line port
@@ -2977,8 +2969,8 @@ impl FunctionGraph {
 
     /// Builder-style setter for `owner_root` — the impl-block self-type
     /// root for graphs produced from `impl <T> { fn m(&self, ...) }`.
-    /// Front-end production paths set this from `impl_block.self_ty`
-    /// (`front/ast.rs::build_function_graph` callers pass `self_ty_root`);
+    /// `front::mir` sets this from the impl-method owner it records as
+    /// `SemanticFunction.self_ty_root`;
     /// `derive_subject_inputcells` consults it to project the receiver
     /// inputarg as `SomeInstance(Some(getuniqueclassdef(im_class)))`.
     pub fn with_owner_root(mut self, owner: impl Into<String>) -> Self {
@@ -3151,9 +3143,9 @@ impl FunctionGraph {
     /// Variable's `concretetype` onto the placeholder at `idx`.  The
     /// production rtyper hand-off
     /// ([`crate::jit_codewriter::type_state::apply_from_flowspace_variables`])
-    /// no longer routes through a slot: it writes `v.concretetype = T`
-    /// straight onto the legacy graph Variable carried by the
-    /// identity-keyed `LegacyToTyped` map.
+    /// writes `v.concretetype = T` straight onto the legacy graph
+    /// Variable carried by the identity-keyed `LegacyToTyped` map,
+    /// without routing through a slot.
     ///
     /// **RPython parity** — upstream `rtyper.setconcretetype(v)`
     /// (`rpython/rtyper/rmodel.py:160`) performs `v.concretetype = T`
@@ -3361,7 +3353,7 @@ impl FunctionGraph {
     /// it here — that would advance the allocator cursor in a way
     /// downstream codegen does not expect and surface as a slot
     /// mismatch in cranelift / dynasm output.  Such Variables are
-    /// TODOs of the AST frontend's `last_exception`
+    /// TODOs of the frontend's `last_exception`
     /// flow and are left to their unregistered state; the future Z4
     /// walker is responsible for registering them at their actual
     /// definition site.
@@ -3539,8 +3531,8 @@ impl FunctionGraph {
     /// The Variable-direct counterpart to `iter_variable_slots()` for
     /// passes that enumerate the graph's values and discard the dense
     /// slot index (regalloc coloring, `Variable.annotation` reset /
-    /// commit).  Reads the value set straight off the IR instead of the
-    /// slot registry, so those passes no longer depend on
+    /// commit).  Reads the value set straight off the IR rather than the
+    /// slot registry, so those passes are independent of
     /// `value_variables`.  Values minted but never referenced are
     /// naturally absent — every consumer filters such values out anyway
     /// (`getcolor` returns `None`, `annotation` is empty).

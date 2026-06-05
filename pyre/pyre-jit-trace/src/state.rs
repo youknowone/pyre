@@ -542,7 +542,7 @@ pub fn setup_indirectcalltargets(targets: Vec<std::sync::Arc<majit_metainterp::j
 /// RPython calls this from `MIFrame.do_residual_or_indirect_call`
 /// (`pyjitpl.py:2174-2186`) to check whether a `funcbox.getaddr()`
 /// Const corresponds to a known indirect-call target.  pyre's tracer
-/// consumer will route through here once Step 3 lands.
+/// consumer routes through here.
 pub fn bytecode_for_address(
     fnaddress: usize,
 ) -> Option<std::sync::Arc<majit_metainterp::jitcode::JitCode>> {
@@ -838,12 +838,11 @@ pub fn frame_value_count_at(jitcode_index: i32, pc: i32) -> usize {
             return payload.metadata.stack_base + depth;
         }
         // `CallControl.get_jitcode` drain fills pc_map + liveness
-        // before any guard capture (pyjitpl.py:199 parity). Phase X-0
-        // eliminated the out-of-range-pc source by threading
-        // jitcode_index through `Snapshot::single_frame`. Phase X-1(a)
-        // moved the remaining guard/resume tests onto the real
-        // compile/register path in `pyre-jit`. Unconditional panic —
-        // any hit is a bug.
+        // before any guard capture (pyjitpl.py:199 parity). The
+        // out-of-range-pc source is eliminated by threading
+        // jitcode_index through `Snapshot::single_frame`, and the
+        // guard/resume tests run on the real compile/register path in
+        // `pyre-jit`. Unconditional panic — any hit is a bug.
         panic!(
             "frame_value_count_at: fallback hit for jitcode_index={} pc={} \
              (pc_map.len={}, all_liveness.len={}). Phase X-0/X-1 removed \
@@ -1181,8 +1180,8 @@ pub fn portal_red_regs_at(jitcode_index: i32) -> (u16, u16) {
 /// Map a post-regalloc Ref-bank color back to the semantic
 /// `locals_cells_stack_w` slot it denotes at the current PC.
 ///
-/// **Decoder-only after slice 3b-2**: the encoder
-/// (`get_list_of_active_boxes`) now reads `registers_r[color]`
+/// **Decoder-only**: the encoder
+/// (`get_list_of_active_boxes`) reads `registers_r[color]`
 /// directly and derives `semantic_idx` inline.  This function is
 /// still used by `restore_guard_failure_values` (the decoder) which
 /// needs the semantic slot index to call `set_local_at` /
@@ -1474,7 +1473,7 @@ pub struct PyreSym {
     /// canonical PyPy driver descriptor.
     pub(crate) execution_context: OpRef,
     // ── Persistent symbolic frame field tracking ──
-    // Stage 3.4 Phase C: the Python stack (`locals_cells_stack_w[nlocals..]`)
+    // The Python stack (`locals_cells_stack_w[nlocals..]`)
     // lives in the tail of `registers_r`. The macro's `collect_stack`
     // emits `registers_r[nlocals..nlocals + stack_only_depth]` so JUMP /
     // GUARD args carry locals followed by stack in one contiguous window.
@@ -1602,7 +1601,7 @@ pub struct PyreSym {
     // initialised to `CONST_NULL`, `[num_regs_X, ...)` are the constant
     // pool entries copied from `jitcode.constants_X`.
     //
-    // SSA-authoritative live_r epic layout:
+    // SSA-authoritative live_r layout:
     //   - `setup_kind_register_banks` sizes all three banks to
     //     `num_regs_and_consts_X` when the owning JitCode is bound.
     //   - `registers_i` / `registers_f` are indexed by post-regalloc
@@ -2366,7 +2365,7 @@ pub(crate) unsafe fn objspace_compare_floats(
 /// on a `PYFRAME_GC_TYPE_ID`-typed PyFrame, so the read goes through
 /// the GC barrier in RPython's `rclass.py` getfield emission.
 ///
-/// Cranelift backend status (probe 2026-05-04, MAJIT_PROBE_GETFIELD_GC_R=1):
+/// Cranelift backend status (MAJIT_PROBE_GETFIELD_GC_R=1):
 ///   - `OpCode::GetfieldGcR` lowering exists at
 ///     `majit-backend-cranelift/src/compiler.rs:10691`.
 ///   - Direct swap on fib_recursive panics inside
@@ -2378,8 +2377,9 @@ pub(crate) unsafe fn objspace_compare_floats(
 /// The convergence path is to either (a) implement the missing
 /// nursery allocation slow-path for the post-GetfieldGcR remembered
 /// set write, or (b) audit why the GC barrier emits a nursery
-/// allocation here when dynasm doesn't.  Either is a separate
-/// cranelift backend epic.  Until then the emission stays
+/// allocation here when dynasm doesn't.  Both are separate
+/// cranelift backend work that is not yet done.  Until then the
+/// emission stays
 /// `GetfieldRawI` and the runtime descr's `field_type = Type::Ref`
 /// preserves the optimizer's boxed-pointer view.
 pub(crate) fn frame_locals_cells_stack_array(ctx: &mut TraceCtx, frame: OpRef) -> OpRef {
@@ -2904,8 +2904,8 @@ pub(crate) fn fail_arg_types_for_virtualizable_state(len: usize) -> Vec<Type> {
 ///    so the regalloc-color slot writes happen after
 ///    `setup_kind_register_banks`, plus matching opcode-dispatch reads
 ///    against the post-color slots rather than sequential
-///    `[0..nlocals)`. That is a multi-file restructuring outside this
-///    slice's scope.
+///    `[0..nlocals)`. That is a multi-file restructuring outside the
+///    scope of this helper.
 ///
 /// 2. `registers_r` carries both pyre's semantic locals/stack mirror
 ///    AND the post-regalloc-color Ref bank (see the wider doc on
@@ -2990,8 +2990,8 @@ impl PyreSym {
             // i in num_regs. Sized lazily here — `setup_kind_register_banks`
             // resizes `registers_i` / `registers_f` once the owning JitCode is
             // bound. `registers_r` continues to be driven by the existing
-            // semantic-slot logic until the SSA-authoritative live_r epic
-            // rewires the encoder to per-bank reads.
+            // semantic-slot logic; the encoder is not yet rewired to
+            // per-bank reads for `registers_r`.
             registers_i: Vec::new(),
             registers_r: Vec::new(),
             registers_f: Vec::new(),
@@ -3281,7 +3281,7 @@ impl PyreSym {
         } else if self.symbolic_local_types.len() != nlocals {
             self.symbolic_local_types = concrete_slot_types(concrete_frame, nlocals, nlocals);
         }
-        // Stage 3.4 Phase C: seed the stack portion of `registers_r`
+        // Seed the stack portion of `registers_r`
         // directly. `registers_r` is the unified abstract register
         // file — locals occupy `[..nlocals]` and stack slots occupy
         // `[nlocals..nlocals + stack_only_depth]` (RPython
@@ -4233,7 +4233,7 @@ impl BridgeVirtualCache {
 /// Value for shadow slots / continue_tracing. Replaces the separate
 /// `resolve()` + `decode_concrete()` closures so both paths always execute
 /// together — no drift between symbolic and concrete materialization.
-/// Task #64 bug-2: decode one inlined-callee resume frame
+/// Decode one inlined-callee resume frame
 /// (`resume_data.frames[i]`, `i >= 1`) into a [`ReconstructRecipe`] for the
 /// multi-frame bridge carrier. Mirrors the per-bank `consume_boxes` decode
 /// `setup_bridge_sym` runs for the portal frame (resume.py:1054) but writes a
@@ -6060,10 +6060,10 @@ impl JitState for PyreJitState {
         let num_locals = self.local_count();
         let vsd = self.valuestackdepth();
         let slot_types = concrete_slot_types(self.frame, num_locals, vsd);
-        // commit 4 (valuestackdepth → heap array capacity flip) was dropped
+        // The valuestackdepth → heap array capacity flip is not used here
         // because it activates the broken VableExpansion path. The
-        // `capacity` reference here is left over from the dropped change;
-        // restore the pre-flip semantics: array_capacity == self.array_capacity().
+        // `capacity` reference uses the pre-flip semantics:
+        // array_capacity == self.array_capacity().
         let capacity = self.array_capacity();
         PyreMeta {
             num_locals,
@@ -6223,12 +6223,11 @@ impl JitState for PyreJitState {
         //       new `gen_writeback_vable_to_heap` helper (modeled on
         //       `trace_ctx.rs:1702 gen_store_back_in_vable` minus the
         //       force-virtualizable bookkeeping) invoked from
-        //       `close_loop_args_at`. Plan:
-        //       memory/task21_fix_implementation_plan.md.
+        //       `close_loop_args_at`.
         //   (e) dynasm recursive CA frame contract — *blocking*
         //       for dynasm SIGSEGV at fib(24).
         //
-        // Status (2026-04-28): (a)+(b)+(c1)+(c2) and
+        // Status: (a)+(b)+(c1)+(c2) and
         // gen_writeback_vable_to_heap have landed; descriptor is
         // active. (e) dynasm recursive CA frame contract
         // remains as a separate open item driving fib_recursive on
@@ -6536,9 +6535,9 @@ impl JitState for PyreJitState {
         sym.clear_active_vable();
         // `pypy/module/pypyjit/interp_jit.py:67 reds = ['frame', 'ec']`:
         // ec is a portal red arg, hence a JitCode inputarg present in
-        // every `-live-` op's R-bank. After the codewriter Step 1 fix
-        // (jit/codewriter.rs:2364 `filter_liveness_in_place` seeds
-        // `portal_ec_reg` into `lv_live`), bridge resume's liveness-
+        // every `-live-` op's R-bank. Because the codewriter
+        // (jit/codewriter.rs:2364 `filter_liveness_in_place`) seeds
+        // `portal_ec_reg` into `lv_live`, bridge resume's liveness-
         // driven `consume_boxes` fill at lines 4880-4893 has already
         // written the resolved ec OpRef into
         // `bridge_registers_r[portal_ec_reg]` — the same slot
@@ -6743,7 +6742,7 @@ impl JitState for PyreJitState {
         // guard-failure recovery chain BEFORE `setup_bridge_sym`.
         // No additional synchronize call is needed here.
 
-        // Task #64 bug-2: multi-frame bridge. The body above reconstructed
+        // Multi-frame bridge. The body above reconstructed
         // the portal (`frames[0]`) into the caller-visible root `sym`. When
         // the guard fired inside inlined callees, `frames[1..]` (OUTERMOST-
         // FIRST) must also be reconstructed and pushed so the framestack
@@ -6753,13 +6752,14 @@ impl JitState for PyreJitState {
         // recipe here (while `resume_data` / `virtuals_cache` are in scope);
         // `trace_bytecode` assembles+pushes them right before `interpret()`.
         // Any callee that cannot be faithfully rebuilt aborts the whole
-        // multi-frame path back to the single-frame bridge (status quo).
+        // multi-frame path back to the single-frame bridge.
         // The outermost (root) frame resumes at its OWN pc once the
         // reconstructed callees return — NOT at the innermost pc that
         // `decode_and_restore_guard_failure` returns as the trace start.
-        // Thread `frames[0].pc` so `trace_bytecode` can root main@34 while
-        // the carrier callees resume at their frames[i].pc. A negative
-        // (no-snapshot) root pc aborts the multi-frame path.
+        // Thread `frames[0].pc` so `trace_bytecode` can root the outermost
+        // frame at its own pc while the carrier callees resume at their
+        // frames[i].pc. A negative (no-snapshot) root pc aborts the
+        // multi-frame path.
         if resume_data.frames.len() > 1 && resume_data.frames[0].pc >= 0 {
             let root_pc = resume_data.frames[0].pc as usize;
             let mut recipes: Vec<ReconstructRecipe> =
@@ -7154,7 +7154,7 @@ impl JitState for PyreJitState {
             // colors through `metadata.stack_slot_color_map` (forward
             // map: stack slot d → post-rename color). Currently with
             // input-arg pinning the map is `[nlocals, nlocals+1, ...]`
-            // so the lookup is identity; once step C removes the
+            // so the lookup is currently identity; without the
             // pinning, stack colors may differ from `nlocals + d` and
             // the map is the single source of truth for the
             // `color → stack-slot-index` reverse lookup the heap
@@ -7227,11 +7227,11 @@ impl JitState for PyreJitState {
             true
         })();
         if !decoded_via_jitcode {
-            // Phase X-0 eliminated the out-of-range-pc source that
-            // previously reached this branch. Phase X-1(a) migrated the
-            // bridge-resume tests to the real trace-side jitcode
-            // registration path (`ensure_jitcode_index`). Unconditional
-            // panic — any hit is a bug.
+            // The out-of-range-pc source that previously reached this
+            // branch is eliminated, and the bridge-resume tests run on the
+            // real trace-side jitcode registration path
+            // (`ensure_jitcode_index`). Unconditional panic — any hit is a
+            // bug.
             panic!(
                 "bridge resume decode: jitcode path failed — \
                  w_code_ptr={:p} raw_code_ptr={:p} live_pc={} \
@@ -10400,7 +10400,7 @@ pub struct PendingInlineFrame {
     pub caller_result_type: Option<Type>,
 }
 
-/// Task #64 bug-2: a decoded-but-not-yet-built description of one inlined
+/// A decoded-but-not-yet-built description of one inlined
 /// callee frame (`resume_data.frames[i]`, `i >= 1`) for a multi-frame
 /// bridge. `setup_bridge_sym` decodes the resume stream into this recipe
 /// while `resume_data` / the rd_virtuals cache are in scope; `trace_bytecode`
@@ -10431,7 +10431,7 @@ pub struct ReconstructRecipe {
     pub nargs: usize,
 }
 
-/// Task #64 bug-2: the decoded inline-callee recipes for one multi-frame
+/// The decoded inline-callee recipes for one multi-frame
 /// bridge, plus the outermost (`frames[0]`) resume pc. `trace_bytecode`
 /// builds the caller-visible root frame at `root_pc` and pushes each
 /// recipe on top (innermost last), so the framestack matches the inline
@@ -10449,7 +10449,7 @@ pub struct BridgeInlineCarrier {
 }
 
 thread_local! {
-    /// Task #64 bug-2: the multi-frame bridge carrier decoded by
+    /// The multi-frame bridge carrier decoded by
     /// `setup_bridge_sym` and drained once by `trace_bytecode`, which
     /// assembles+pushes each recipe through `push_inline_frame`. `None` for
     /// primary traces and single-frame bridges.
@@ -10496,7 +10496,7 @@ fn recipe_slot_to_pyobj(v: majit_ir::Value) -> PyObjectRef {
     }
 }
 
-/// Task #64 bug-2: assemble one decoded inline-callee [`ReconstructRecipe`]
+/// Assemble one decoded inline-callee [`ReconstructRecipe`]
 /// into a [`PendingInlineFrame`] (concrete `PyFrame` + symbolic `PyreSym`)
 /// for `trace_bytecode` to push onto the bridge framestack.
 ///

@@ -33,7 +33,7 @@ pub fn trace_bytecode(
     let ctx = meta
         .trace_ctx()
         .expect("trace_bytecode invariant: meta.tracing must be Some during merge_point closure");
-    // Task #64 bug-2: a multi-frame bridge carrier overrides the trace-start
+    // A multi-frame bridge carrier overrides the trace-start
     // pc with the OUTERMOST (`frames[0]`) resume pc. The passed `start_pc` is
     // the INNERMOST frame's pc (`decode_and_restore_guard_failure` returns
     // `jit_state.next_instr()`), which belongs to the deepest reconstructed
@@ -109,7 +109,7 @@ pub fn trace_bytecode(
         ctx.add_merge_point(start_key, input_args, start_pc);
     }
 
-    // Task #64 bug-2: assemble + push each reconstructed inline callee onto the
+    // Assemble + push each reconstructed inline callee onto the
     // root, OUTERMOST-FIRST, so the framestack matches the inline depth the
     // guard fired at (`[root@root_pc, frames[1]@pc, .., frames[N]@pc]`).
     // `interpret()` resumes at the innermost (last-pushed) frame, runs it to

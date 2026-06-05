@@ -1,4 +1,4 @@
-//! Phase F: static registry of `Arc<JitCode>`s produced from
+//! Static registry of `Arc<JitCode>`s produced from
 //! pyre-interpreter handler graphs.
 //!
 //! ## Positioning (TODO)
@@ -39,7 +39,7 @@
 //!
 //! ## Audience: TEST FIXTURE (not production)
 //!
-//! As of 2026-04-25, `all_jitcodes()` is consumed **only** by
+//! `all_jitcodes()` is consumed **only** by
 //! majit-translate's own integration tests
 //! (`test_phase_f_all_jitcodes.rs`,
 //! `test_make_jitcodes_produces_graph_keyed_output.rs`). The pyre
@@ -56,12 +56,10 @@
 //! is what the unit tests need to assert (graph discovery, alloc-order
 //! invariants, by-path keying).
 //!
-//! The historical description ("route generated::all_jitcodes
-//! through fnaddr_bindings instead of symbolic fallback") was written
-//! before the build-time bincode path landed in `pyre-jit-trace/build.rs`;
-//! production-side fnaddr resolution is therefore already done by that
-//! script, and `generated::all_jitcodes` keeps its symbolic-fallback
-//! contract as the deliberate test surface. **Do not rewire this module
+//! Production-side fnaddr resolution is done by
+//! `pyre-jit-trace/build.rs`, so `generated::all_jitcodes` keeps its
+//! symbolic-fallback contract as the deliberate test surface. It is not
+//! routed through `fnaddr_bindings`. **Do not rewire this module
 //! to thread `&fnaddr_bindings` — doing so would either (1) introduce a
 //! `majit-translate` ⇒ `pyre-interpreter` dependency that breaks the
 //! `majit/* ⊥ pyre/*` invariant, or (2) require parameterising the
@@ -94,8 +92,8 @@
 //! - NOT a new key schema. The canonical key is `CallPath` (matching
 //!   `CallControl.jitcodes`, which is `rpython/jit/codewriter/call.py:87
 //!   self.jitcodes` keyed by graph identity).
-//! - NOT a variant-keyed map. The plan's Phase E acceptance check
-//!   (`rg "HashMap<Instruction" majit/majit-translate/src/` = 0) holds.
+//! - NOT a variant-keyed map. No `HashMap<Instruction, …>` exists under
+//!   `majit/majit-translate/src/` (`rg "HashMap<Instruction"` = 0).
 //! - NOT a new opname family. Every handler is transformed through the
 //!   existing `CodeWriter::transform_graph_to_jitcode` without per-arm
 //!   special cases.
@@ -140,7 +138,7 @@ pub use crate::codewriter::AllJitCodes;
 ///   called directly from default trait methods (pyopcode.rs:821).
 ///   Before their inclusion, `analyze_multiple_pipeline` would report
 ///   them as unresolved `direct_call` targets.
-/// - `pyre-jit/src/eval.rs` — Phase D0 portal runner `eval_loop_jit`
+/// - `pyre-jit/src/eval.rs` — portal runner `eval_loop_jit`
 ///   (pyre analogue of upstream `warmspot.py::portal_runner`) and
 ///   its resume/allocation helpers (`allocate_struct`,
 ///   `allocate_with_vtable`). Seeding this root lets
