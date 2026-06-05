@@ -9060,6 +9060,154 @@ mod tests {
         drive_int_binop("int_ge/ii>i", majit_ir::OpCode::IntGe);
     }
 
+    /// Drive `int_between/iii>i` and return the recorded ops plus
+    /// the post-handler `dst` slot.  `inputs` describes how the
+    /// three operand slots are populated.
+    enum BetweenOperand {
+        ConstInt(i64),
+        NonConstWithConcrete(i64),
+    }
+
+    fn drive_int_between(
+        b1: BetweenOperand,
+        b2: BetweenOperand,
+        b3: BetweenOperand,
+    ) -> (Vec<majit_ir::OpCode>, OpRef, OpRef) {
+        // `int_between/iii>i` is recorder-side only (decomposed at
+        // record time) and is not currently emitted into pyre's
+        // pipeline.insns table, so `insns_opname_to_byte()` lacks
+        // a byte for it.  Call `int_between_record` directly with a
+        // synthetic `DecodedOp` to exercise the handler.  Operand
+        // layout: `[opcode, src1, src2, src3, dst]` — opcode byte is
+        // unused by the handler (PC offsets into `code` from `op.pc`).
+        let code = [0x00u8, 0x02, 0x04, 0x06, 0x08];
+        let op = crate::jitcode_runtime::DecodedOp {
+            key: "int_between/iii>i",
+            opname: "int_between",
+            argcodes: "iii>i",
+            pc: 0,
+            next_pc: 5,
+        };
+        let mut tc = fresh_trace_ctx();
+        let mut regs_i = distinct_const_refs(&mut tc, 16);
+        let mint = |tc: &mut TraceCtx, op: &BetweenOperand| match op {
+            BetweenOperand::ConstInt(v) => tc.const_int(*v),
+            BetweenOperand::NonConstWithConcrete(v) => {
+                // Materialize a non-Const OpRef by recording a placeholder
+                // op, then stamp its concrete value.  IntAdd with two
+                // ConstInts is a valid stand-in carrier.
+                let lhs = tc.const_int(0);
+                let opref = tc.record_op(majit_ir::OpCode::IntAdd, &[lhs, lhs]);
+                tc.set_opref_concrete(opref, majit_ir::Value::Int(*v));
+                opref
+            }
+        };
+        regs_i[2] = mint(&mut tc, &b1);
+        regs_i[4] = mint(&mut tc, &b2);
+        regs_i[6] = mint(&mut tc, &b3);
+        let arg_b1 = regs_i[2];
+        let descr = done_descr_ref_for_tests();
+        let ops_before = tc.num_ops();
+        let mut wc = WalkContext {
+            registers_r: &mut [],
+            registers_i: &mut regs_i,
+            registers_f: &mut [],
+            concrete_registers_r: &mut [],
+            concrete_registers_i: &mut [],
+            descr_refs: &[],
+            trace_ctx: &mut tc,
+            done_with_this_frame_descr_ref: descr,
+            done_with_this_frame_descr_int: make_fail_descr(101),
+            done_with_this_frame_descr_float: make_fail_descr(102),
+            done_with_this_frame_descr_void: make_fail_descr(103),
+            exit_frame_with_exception_descr_ref: make_fail_descr(2),
+            is_top_level: true,
+            sub_jitcode_lookup: &no_sub_jitcodes,
+            last_exc_value: None,
+            last_exc_value_concrete: ConcreteValue::Null,
+            entry_py_pc: 0,
+            outer_jitcode_index: 0,
+            outer_active_boxes: Vec::new(),
+        };
+        let (outcome, next_pc) = int_between_record(&code, &op, &mut wc)
+            .expect("int_between_record must dispatch");
+        assert_eq!(outcome, DispatchOutcome::Continue);
+        assert_eq!(next_pc, 5, "operand layout `iii>i` consumes 4 bytes");
+        let dst_post = wc.registers_i[8];
+        drop(wc);
+        let new_ops: Vec<majit_ir::OpCode> = tc
+            .ops()
+            .iter()
+            .skip(ops_before)
+            .map(|op| op.opcode)
+            .collect();
+        (new_ops, dst_post, arg_b1)
+    }
+
+    /// pyjitpl.py:588-595: when `b3 - b1 == 1` AND both inputs are
+    /// constants, the fast-path emits `INT_SUB` (for b5) + `INT_EQ`
+    /// — two ops total, no `UINT_LT`.
+    #[test]
+    fn int_between_const_inputs_with_unit_width_takes_inteq_fast_path() {
+        let (ops, _, _) = drive_int_between(
+            BetweenOperand::ConstInt(5),
+            BetweenOperand::ConstInt(7),
+            BetweenOperand::ConstInt(6),
+        );
+        assert_eq!(
+            ops,
+            vec![majit_ir::OpCode::IntSub, majit_ir::OpCode::IntEq],
+            "ConstInt(1) fast path must record [IntSub(b5), IntEq] — got {ops:?}",
+        );
+    }
+
+    /// pyjitpl.py:588-595 generic path: when the gate fails the
+    /// recorder emits `INT_SUB` (b5) + `INT_SUB` (b4) + `UINT_LT` —
+    /// three ops total.
+    #[test]
+    fn int_between_const_inputs_with_wide_range_takes_uintlt_generic_path() {
+        let (ops, _, _) = drive_int_between(
+            BetweenOperand::ConstInt(5),
+            BetweenOperand::ConstInt(7),
+            BetweenOperand::ConstInt(10),
+        );
+        assert_eq!(
+            ops,
+            vec![
+                majit_ir::OpCode::IntSub,
+                majit_ir::OpCode::IntSub,
+                majit_ir::OpCode::UintLt,
+            ],
+            "wide-range generic path must record [IntSub, IntSub, UintLt] — got {ops:?}",
+        );
+    }
+
+    /// Regression for the missing `is_constant` gate: when `b1`/`b3`
+    /// are non-constant OpRefs with observed concrete values
+    /// satisfying `b3-b1==1`, the recorder must still take the
+    /// generic `INT_SUB + UINT_LT` path.  Specializing to `INT_EQ`
+    /// would bake a `b3-b1==1` invariant without a runtime guard
+    /// (`box_value` only reports the observed sample), miscompiling
+    /// any future execution where the same boxes carry different
+    /// live values.
+    #[test]
+    fn int_between_non_const_inputs_observing_unit_width_takes_generic_path() {
+        let (ops, _, _) = drive_int_between(
+            BetweenOperand::NonConstWithConcrete(5),
+            BetweenOperand::NonConstWithConcrete(7),
+            BetweenOperand::NonConstWithConcrete(6),
+        );
+        assert_eq!(
+            ops.last(),
+            Some(&majit_ir::OpCode::UintLt),
+            "non-const inputs must NOT take INT_EQ fast path; expected UintLt tail — got {ops:?}",
+        );
+        assert!(
+            !ops.contains(&majit_ir::OpCode::IntEq),
+            "INT_EQ fast path is unguarded for non-Const inputs — got {ops:?}",
+        );
+    }
+
     /// Drive a single `float_<binop>/ff>f` handler. Same shape as
     /// `drive_int_binop` but on the float bank.
     fn drive_float_binop(opname: &str, expected_opcode: majit_ir::OpCode) {

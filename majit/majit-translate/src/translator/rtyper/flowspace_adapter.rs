@@ -3249,6 +3249,150 @@ mod tests {
     }
 
     #[test]
+    fn translate_op_isinstance_lowers_to_flowspace_isinstance() {
+        // OpKind::IsInstance arrives from the tuple-struct match
+        // cascade (`front/ast.rs:7467`).  Emit a single
+        // `isinstance(obj, cls)` flowspace op so the rtyper dispatches
+        // to `InstanceRepr::rtype_isinstance`.
+        let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
+        let graph = translate_op_test_graph(10);
+        let obj_hl_var = Variable::new();
+        let cls_hl_var = Variable::new();
+        let result_hl_var = Variable::new();
+        value_map.insert(
+            graph.must_variable_at(1),
+            Hlvalue::Variable(obj_hl_var.clone()),
+        );
+        value_map.insert(
+            graph.must_variable_at(2),
+            Hlvalue::Variable(cls_hl_var.clone()),
+        );
+        value_map.insert(
+            graph.must_variable_at(3),
+            Hlvalue::Variable(result_hl_var.clone()),
+        );
+        let op = SpaceOperation {
+            result: Some(graph.must_variable_at(3)),
+            kind: OpKind::IsInstance {
+                obj: graph.must_variable_at(1),
+                class_carrier: graph.must_variable_at(2),
+                result_ty: ValueType::Bool,
+            },
+        };
+        let translated = translate_op(&op, &value_map, &empty_call_registry(), &graph)
+            .expect("OpKind::IsInstance must lower");
+        assert_eq!(translated.len(), 1);
+        assert_eq!(
+            translated[0].opname, "isinstance",
+            "IsInstance must emit the flowspace `isinstance` opname",
+        );
+        assert_eq!(translated[0].args.len(), 2, "isinstance args: [obj, cls]");
+        match &translated[0].args[0] {
+            Hlvalue::Variable(v) => assert_eq!(v, &obj_hl_var, "args[0] must be obj"),
+            other => panic!("args[0] must be Variable, got {other:?}"),
+        }
+        match &translated[0].args[1] {
+            Hlvalue::Variable(v) => {
+                assert_eq!(v, &cls_hl_var, "args[1] must be class_carrier")
+            }
+            other => panic!("args[1] must be Variable, got {other:?}"),
+        }
+        match &translated[0].result {
+            Hlvalue::Variable(v) => {
+                assert_eq!(v, &result_hl_var, "result must follow value_map mapping")
+            }
+            other => panic!("result must be Variable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn translate_op_call_synthetic_transparent_class_with_args_lowers_to_simple_call() {
+        // `SyntheticTransparentClass` with non-empty args falls back to
+        // the same `simple_call(HostObject::Class, args)` shape as
+        // `SyntheticTransparentCtor` — the annotator's
+        // `Bookkeeper::immutablevalue_hostobject` is_class arm absorbs
+        // both spellings.
+        let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
+        let graph = translate_op_test_graph(10);
+        value_map.insert(
+            graph.must_variable_at(1),
+            Hlvalue::Variable(Variable::new()),
+        );
+        value_map.insert(
+            graph.must_variable_at(2),
+            Hlvalue::Variable(Variable::new()),
+        );
+        let op = SpaceOperation {
+            result: Some(graph.must_variable_at(2)),
+            kind: OpKind::Call {
+                target: crate::model::CallTarget::SyntheticTransparentClass {
+                    name: "LoadFast".into(),
+                    owner_path: vec!["Instruction".into()],
+                },
+                args: vec![graph.must_variable_at(1)],
+                result_ty: ValueType::Ref(None),
+            },
+        };
+        let translated = translate_op(&op, &value_map, &empty_call_registry(), &graph)
+            .expect("Call::SyntheticTransparentClass with args must lower");
+        assert_eq!(translated.len(), 1);
+        assert_eq!(translated[0].opname, "simple_call");
+        let Hlvalue::Constant(ref callable) = translated[0].args[0] else {
+            panic!("simple_call callable must be a Constant");
+        };
+        let ConstValue::HostObject(ref host) = callable.value else {
+            panic!("class callable must be ConstValue::HostObject");
+        };
+        assert_eq!(
+            host.qualname(),
+            "Instruction.LoadFast",
+            "owner_path must qualify the class qualname",
+        );
+        assert!(host.is_class(), "callable must be a class HostObject");
+    }
+
+    #[test]
+    fn legacy_const_define_folds_zero_arg_synthetic_transparent_class_to_class_constant() {
+        // Empty-args `SyntheticTransparentClass` is the cascade
+        // tuple-struct *class carrier*.  `legacy_const_define_hlvalue`
+        // folds it directly to a class constant so the rtyper sees
+        // `Hlvalue::Constant(HostObject::Class)` instead of routing
+        // through `simple_call` (which would annotate to a new
+        // SomeInstance, not the class PBC `rtype_isinstance` needs).
+        let dummy = SpaceOperation {
+            result: Some(Variable::new()),
+            kind: OpKind::Call {
+                target: crate::model::CallTarget::SyntheticTransparentClass {
+                    name: "LoadFast".into(),
+                    owner_path: vec!["Instruction".into()],
+                },
+                args: Vec::new(),
+                result_ty: ValueType::Ref(None),
+            },
+        };
+        let hl = legacy_const_define_hlvalue(&dummy)
+            .expect("zero-arg SyntheticTransparentClass must fold to a constant");
+        let Hlvalue::Constant(c) = hl else {
+            panic!("expected Hlvalue::Constant, got {hl:?}");
+        };
+        let ConstValue::HostObject(ref host) = c.value else {
+            panic!("expected ConstValue::HostObject, got {:?}", c.value);
+        };
+        assert!(host.is_class(), "class carrier must be a class HostObject");
+        assert_eq!(
+            host.qualname(),
+            "Instruction.LoadFast",
+            "owner_path must qualify the class qualname",
+        );
+        // `with_concretetype` carries CLASSTYPE so ClassRepr::convert_const
+        // can route through the constant arm.
+        assert!(
+            c.concretetype.is_some(),
+            "class carrier constant must carry CLASSTYPE concretetype",
+        );
+    }
+
+    #[test]
     fn translate_op_call_method_chains_getattr_simple_call() {
         // Call::Method `obj.method(args)` → 2-op chain `[getattr(obj,
         // "method") -> meth, simple_call(meth, args[1..])]`, mirroring
