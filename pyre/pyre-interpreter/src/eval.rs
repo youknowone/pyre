@@ -2847,10 +2847,24 @@ impl OpcodeStepExecutor for PyFrame {
                 // PyPy: LOOKUP_METHOD binds self for builtin type methods,
                 // except staticmethods (str.maketrans) and classmethods
                 // (dict.fromkeys), which getattr already unwrapped above.
+                //
+                // A builtin-storage subclass instance (`class MyInt(int)`,
+                // enum members) is not is_instance-shaped, so it reaches this
+                // branch too; its `w_type` is the subclass with a full MRO.
+                // Mirror the is_instance branch: non-method descriptors
+                // (type / property / member / getset such as `__class__`) do
+                // not prepend self, and an attribute not in the type MRO (a
+                // special attribute like `__class__`/`__dict__`, resolved
+                // directly in getattr, or an instance-dict entry) binds none.
                 match crate::baseobjspace::lookup_in_type(w_type, name) {
                     Some(d) if pyre_object::is_staticmethod(d) => PY_NULL,
                     Some(d) if pyre_object::is_classmethod(d) => w_type,
-                    _ => obj,
+                    Some(d) if pyre_object::is_type(d) => PY_NULL,
+                    Some(d) if pyre_object::is_property(d) => PY_NULL,
+                    Some(d) if pyre_object::is_member(d) => PY_NULL,
+                    Some(d) if pyre_object::getsetproperty::is_getset_property(d) => PY_NULL,
+                    Some(_) => obj,
+                    None => PY_NULL,
                 }
             } else {
                 PY_NULL
