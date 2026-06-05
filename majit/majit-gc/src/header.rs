@@ -134,16 +134,31 @@ pub unsafe fn header_of(obj_addr: usize) -> *mut GcHeader {
     (obj_addr - GcHeader::SIZE) as *mut GcHeader
 }
 
-/// Allocate a value of type `T` behind a leading zeroed [`GcHeader`] and
-/// return the payload pointer (`block + GcHeader::SIZE`).
+/// Allocate a value of type `T` behind a leading [`GcHeader`] tagged with
+/// `type_id` and no flags, returning the payload pointer (`block + SIZE`).
 ///
 /// Mirrors incminimark's `malloc_fixedsize`: reserve `size_gc_header + size`
-/// bytes, initialise the header at the block start
-/// (`init_gc_object(result, typeid, flags=0)`), and return
-/// `obj = result + size_gc_header`. The header is zeroed (`tid = 0`, all
-/// flags clear) so a write barrier reading `*(obj - SIZE)` sees
-/// `TRACK_YOUNG_PTRS = 0` and skips the object: it is immortal (leaked), not
-/// tracked by the nursery or old generation.
+/// bytes, `init_gc_object(result, typeid, flags=0)` at the block start, and
+/// return `obj = result + size_gc_header`. Callers pass the object's real GC
+/// type id (`malloc_typed` threads `GcType::type_id()`; the untyped bridge
+/// and frames pass 0).
+///
+/// The header's flags are all clear, so a write barrier reading `*(obj - SIZE)`
+/// sees `TRACK_YOUNG_PTRS = 0` and skips the object.
+///
+/// SCOPE — this is a barrier-read-safety shim, not full prebuilt-object
+/// parity. incminimark stamps prebuilt/immortal objects with
+/// `NO_HEAP_PTRS | TRACK_YOUNG_PTRS` (incminimark.py:1202-1206) and records
+/// their first young-pointer write in `prebuilt_root_objects` via the barrier
+/// (:1524-1529). Reproducing that here would be unsound without the rest of
+/// the machinery — these objects have no GC-traceable residency yet, and a
+/// non-arena address in `old_objects_pointing_to_young` would be traced with
+/// no valid layout — so the flags are deliberately left clear and the barrier
+/// skips them. The consequence is the pre-existing gap that a young object
+/// reachable *only* through such a leaked object is not kept alive by the
+/// barrier (in practice such pointees stay live via the shadowstack); closing
+/// it is the GC-management migration, not this shim. Matches the existing
+/// `GcFrameSlot` "zeroed, layout parity only" frame shim.
 ///
 /// The allocation is intentionally leaked — these objects outlive every
 /// collection until the managed allocator takes them over. Callers MUST NOT
@@ -152,12 +167,15 @@ pub unsafe fn header_of(obj_addr: usize) -> *mut GcHeader {
 ///
 /// `T` must be word-aligned (`align_of::<T>() <= GcHeader::SIZE`), matching
 /// the fixed one-word header; a wider alignment would move the payload off
-/// the fixed `obj - SIZE` offset the barrier reads.
-pub fn alloc_with_gc_header<T>(value: T) -> *mut T {
-    debug_assert!(
-        std::mem::align_of::<T>() <= GcHeader::SIZE,
-        "object alignment exceeds GcHeader::SIZE; fixed header offset would break the write barrier",
-    );
+/// the fixed `obj - SIZE` offset the barrier reads. The `const` block rejects
+/// over-aligned `T` at monomorphisation rather than faulting at runtime.
+pub fn alloc_with_gc_header<T>(value: T, type_id: u32) -> *mut T {
+    const {
+        assert!(
+            std::mem::align_of::<T>() <= GcHeader::SIZE,
+            "alloc_with_gc_header: align_of::<T>() exceeds GcHeader::SIZE; the fixed obj - SIZE header offset would misalign the payload",
+        )
+    };
     let total = GcHeader::SIZE + std::mem::size_of::<T>();
     let align = std::mem::align_of::<T>().max(GcHeader::SIZE);
     let layout = std::alloc::Layout::from_size_align(total, align)
@@ -167,7 +185,7 @@ pub fn alloc_with_gc_header<T>(value: T) -> *mut T {
         if raw.is_null() {
             std::alloc::handle_alloc_error(layout);
         }
-        (raw as *mut GcHeader).write(GcHeader::new(0));
+        (raw as *mut GcHeader).write(GcHeader::new(type_id));
         let ptr = raw.add(GcHeader::SIZE) as *mut T;
         ptr.write(value);
         ptr
@@ -224,15 +242,16 @@ mod tests {
     }
 
     #[test]
-    fn alloc_with_gc_header_prepends_zeroed_header() {
+    fn alloc_with_gc_header_prepends_header() {
         // Leaked intentionally — the managed/immortal allocation contract
         // forbids freeing the returned payload pointer.
-        let p = alloc_with_gc_header(0xABCD_u64);
+        let p = alloc_with_gc_header(0xABCD_u64, 0x1357);
         unsafe {
             assert_eq!(*p, 0xABCD);
             let hdr = header_of(p as usize);
-            // Zeroed header => barrier reads TRACK_YOUNG_PTRS=0 and skips.
-            assert_eq!((*hdr).tid_and_flags, 0);
+            // type_id is recorded; flags stay clear so the barrier skips it.
+            assert_eq!((*hdr).type_id(), 0x1357);
+            assert_eq!((*hdr).flags(), 0);
             assert!(!(*hdr).has_flag(flags::TRACK_YOUNG_PTRS));
         }
     }

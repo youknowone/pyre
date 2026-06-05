@@ -194,16 +194,20 @@ pub trait PyreClassPyTypeOf {
 /// adaptation of RPython's API to Rust's value-construction model.
 #[inline]
 pub fn malloc<T>(value: T) -> *mut T {
-    majit_gc::header::alloc_with_gc_header(value)
+    // Untyped bridge: no registered GC type id, so the header carries 0.
+    majit_gc::header::alloc_with_gc_header(value, 0)
 }
 
-/// Typed variant of [`malloc`]: requires `T: GcType` so the future
-/// managed allocator can read `T::TYPE_ID` and `T::SIZE` without a
-/// runtime registry lookup. Shares [`malloc`]'s body — the
-/// `alloc_with_gc_header` prepend — and will later route through the
-/// GC-managed allocator with proper `push_roots` / `pop_roots` brackets
-/// (`framework.py:853-856`), writing the real `T::TYPE_ID` into the
-/// header instead of the current zeroed placeholder.
+/// Typed variant of [`malloc`]: requires `T: GcType` so the allocator can
+/// stamp the header with `T::type_id()` and check `T::SIZE` without a runtime
+/// registry lookup. Shares [`malloc`]'s body — the `alloc_with_gc_header`
+/// prepend — but passes the real GC type id (`init_gc_object(result, typeid,
+/// flags=0)` parity, `framework.py:807-811`) instead of the untyped bridge's
+/// 0. Auto-id types still resolving deliver `TypeIdCell::UNASSIGNED` until the
+/// JIT driver registers them, so that value is clamped to 0 — `u32::MAX` would
+/// index the type table out of bounds (`trace.rs` `registry.get`) if such an
+/// object were ever traced. Will later route through the GC-managed allocator
+/// with proper `push_roots` / `pop_roots` brackets (`framework.py:853-856`).
 ///
 /// New call sites should prefer [`malloc_typed`] over [`malloc`]
 /// once their `T` has an assigned GC type id; the untyped variant
@@ -215,7 +219,15 @@ pub fn malloc_typed<T: GcType>(value: T) -> *mut T {
         T::SIZE,
         "GcType::SIZE drift from std::mem::size_of"
     );
-    majit_gc::header::alloc_with_gc_header(value)
+    // Auto-id types resolve to UNASSIGNED (u32::MAX) until the JIT driver
+    // registers them. Clamp that to 0 so a stray GC trace of such an object
+    // indexes the type table in-bounds (get(0)) instead of panicking on
+    // get(u32::MAX); the real id lands once the type is registered.
+    let type_id = match T::type_id() {
+        TypeIdCell::UNASSIGNED => 0,
+        id => id,
+    };
+    majit_gc::header::alloc_with_gc_header(value, type_id)
 }
 
 /// `lltype.malloc(T, flavor='raw')` parity. Non-GC heap allocation;
@@ -299,6 +311,10 @@ mod tests {
         let p = malloc_typed(DummyPayload(7));
         unsafe {
             assert_eq!((*p).0, 7);
+            // The header carries the real GC type id, not a 0 placeholder.
+            let hdr = majit_gc::header::header_of(p as usize);
+            assert_eq!((*hdr).type_id(), 0xDEAD_BEEF);
+            assert_eq!((*hdr).flags(), 0);
         }
     }
 }

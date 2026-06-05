@@ -154,7 +154,11 @@ fn fixed_array_alloc_size(len: usize) -> usize {
 
 #[inline]
 fn fixed_array_layout(len: usize) -> std::alloc::Layout {
-    std::alloc::Layout::from_size_align(fixed_array_alloc_size(len), 8).unwrap()
+    // Track the header alignment (the block leads with a GcHeader the barrier
+    // reads at `obj - SIZE`), not a hardcoded 8.
+    let align = std::mem::align_of::<majit_gc::header::GcHeader>()
+        .max(std::mem::align_of::<FixedObjectArray>());
+    std::alloc::Layout::from_size_align(fixed_array_alloc_size(len), align).unwrap()
 }
 
 /// Allocate a fixed-length GcArray-shaped `FixedObjectArray` with all

@@ -232,14 +232,14 @@ const GC_HEADER_SIZE: usize = majit_gc::header::GcHeader::SIZE;
 /// Arena slot with prepended GcHeader (zeroed, layout parity only).
 #[repr(C)]
 struct GcFrameSlot {
-    gc_header: u64,
+    gc_header: majit_gc::header::GcHeader,
     frame: MaybeUninit<PyFrame>,
 }
 
 impl GcFrameSlot {
     const fn zeroed() -> Self {
         GcFrameSlot {
-            gc_header: 0,
+            gc_header: majit_gc::header::GcHeader { tid_and_flags: 0 },
             frame: MaybeUninit::uninit(),
         }
     }
@@ -248,13 +248,13 @@ impl GcFrameSlot {
 /// Heap-allocated frame with prepended GcHeader.
 #[repr(C)]
 struct GcPyFrame {
-    gc_header: u64,
+    gc_header: majit_gc::header::GcHeader,
     frame: PyFrame,
 }
 
 fn heap_alloc_frame(frame: PyFrame) -> *mut PyFrame {
     let gc_frame = Box::into_raw(Box::new(GcPyFrame {
-        gc_header: 0,
+        gc_header: majit_gc::header::GcHeader { tid_and_flags: 0 },
         frame,
     }));
     unsafe { &mut (*gc_frame).frame as *mut PyFrame }
