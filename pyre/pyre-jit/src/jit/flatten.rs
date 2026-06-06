@@ -2316,6 +2316,50 @@ impl<'a> GraphFlattener<'a> {
         regalloc_color(&*self.regallocs, v)
     }
 
+    /// pyre-only: give a distinct fresh color to every Variable referenced
+    /// as a graph-op argument that the regalloc left uncolored.  No
+    /// upstream counterpart — upstream flowgraphs are always well-formed
+    /// (every operand is a block inputarg or an earlier op's result), so
+    /// `make_dependencies`, which registers interference nodes only for
+    /// inputargs and op results, colors every operand.
+    ///
+    /// pyre's walker emits `abort_permanent` for opcodes the JIT does not
+    /// support (`CONTAINS_OP`, `UNPACK_SEQUENCE`, …) and pushes fresh
+    /// symbolic Refs onto the operand stack so the rest of the block's
+    /// symbolic execution stays stack-balanced.  Those Refs have no graph
+    /// producer, so `make_dependencies` never colors them, and a later op
+    /// that consumes one (`bool`, `setarrayitem_vable_r`) would hit the
+    /// `regalloc_color` missing-color panic when this driver serializes
+    /// it.
+    ///
+    /// `abort_permanent` sets `needs_fallthrough = false`, severing the
+    /// block's CFG successor, so any instruction that consumes such a Ref
+    /// sits in the dead region after the bail-out: the compiled trace
+    /// returns to the interpreter before reaching it.  The instruction is
+    /// still serialized to keep the byte stream well-formed, but never
+    /// executes, so its register operand only has to be a *valid* color —
+    /// never a *value-correct* one.  A distinct fresh color satisfies that
+    /// and cannot alias any live value's color.
+    fn color_leaked_arg_variables(&mut self) {
+        let graph: &super::flow::FunctionGraph = self.graph;
+        for block in graph.iterblocks() {
+            let block_borrow = block.borrow();
+            for op in &block_borrow.operations {
+                for arg in &op.args {
+                    for v in arg.variables() {
+                        let kind = v.kind.unwrap_or(Kind::Ref);
+                        let alloc = &mut self.regallocs[kind.index()];
+                        if !alloc.coloring.contains_key(&v.id) {
+                            let color = alloc.num_colors;
+                            alloc.coloring.insert(v.id, color);
+                            alloc.num_colors += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// Lower a graph `Constant` to the typed `Operand` the assembler
     /// consumes.  Upstream's `getcolor(v)` passes Constants through
     /// unchanged because Python's untyped flowgraph allows it; pyre's
@@ -2765,6 +2809,10 @@ pub fn flatten_graph<'a>(
     flattener.include_all_exc_links = include_all_exc_links;
     // `flatten.py:68 flattener.enforce_input_args()`.
     flattener.enforce_input_args();
+    // pyre-only: color leaked `abort_permanent` operand-stack Refs before
+    // serialization (no upstream counterpart — upstream flowgraphs are
+    // always well-formed).  See `color_leaked_arg_variables`.
+    flattener.color_leaked_arg_variables();
     // `flatten.py:69 flattener.generate_ssa_form()`.
     flattener.generate_ssa_form();
     ssarepr
@@ -5322,6 +5370,148 @@ mod tests {
         }
     }
 
+    /// `setattr` is an `is_pyre_canonical_elidable_hlop`: under
+    /// `lowering_ctx` (the canonical production path) `serialize_op` elides
+    /// it (the `StoreAttr` walker arm pairs it with `abort_permanent`, so a
+    /// literal `setattr` Insn would be unreachable and undispatchable);
+    /// without `lowering_ctx` it passes through as a raw `setattr` Insn.
+    #[test]
+    fn serialize_op_elides_setattr_under_lowering_ctx() {
+        let obj = Variable::new(VariableId(0), Kind::Ref);
+        let attr = Variable::new(VariableId(1), Kind::Ref);
+        let val = Variable::new(VariableId(2), Kind::Ref);
+        let make_op = || {
+            SpaceOperation::new(
+                "setattr",
+                vec![obj.into(), attr.into(), val.into()],
+                None,
+                7,
+            )
+        };
+        let make_regallocs = || {
+            let mut ref_coloring = std::collections::HashMap::new();
+            ref_coloring.insert(obj.id, 0u16);
+            ref_coloring.insert(attr.id, 1u16);
+            ref_coloring.insert(val.id, 2u16);
+            [
+                super::super::regalloc::GraphAllocationResult {
+                    coloring: std::collections::HashMap::new(),
+                    num_colors: 0,
+                },
+                super::super::regalloc::GraphAllocationResult {
+                    coloring: ref_coloring,
+                    num_colors: 3,
+                },
+                super::super::regalloc::GraphAllocationResult {
+                    coloring: std::collections::HashMap::new(),
+                    num_colors: 0,
+                },
+            ]
+        };
+        let graph = stub_graph();
+
+        // Without lowering_ctx: raw `setattr` Insn passes through.
+        let mut off = SSARepr::new("setattr_off");
+        let mut off_regallocs = make_regallocs();
+        let mut off_flat = GraphFlattener::new(&graph, &mut off_regallocs, &mut off);
+        off_flat.serialize_op(&make_op());
+        assert!(
+            off.insns
+                .iter()
+                .any(|insn| matches!(insn, Insn::Op { opname, .. } if opname == "setattr")),
+            "lowering OFF must emit a raw setattr Insn: {:?}",
+            off.insns,
+        );
+
+        // With lowering_ctx: `setattr` is elided (no Insn emitted).
+        let ctx = LoweringContext {
+            binary_op_fn_idx: 11,
+            compare_op_fn_idx: 13,
+            truth_fn_idx: 17,
+            store_subscr_fn_idx: 19,
+            build_list_fn_idx: 0,
+            call_fn_idx_by_nargs: [0; 9],
+        };
+        let mut on = SSARepr::new("setattr_on");
+        let mut on_regallocs = make_regallocs();
+        let mut on_flat =
+            GraphFlattener::new(&graph, &mut on_regallocs, &mut on).with_lowering_ctx(ctx);
+        on_flat.serialize_op(&make_op());
+        assert!(
+            on.insns.is_empty(),
+            "lowering ON must elide setattr (no Insn): {:?}",
+            on.insns,
+        );
+    }
+
+    /// `color_leaked_arg_variables` gives a fresh distinct color to any
+    /// Variable used as a graph-op arg that the regalloc left uncolored —
+    /// the `abort_permanent` operand-stack leak (see the method doc).
+    /// Models a block whose op consumes a Ref Variable that is neither a
+    /// block inputarg nor any op's result, and asserts the pass colors it
+    /// without disturbing an already-colored inputarg.
+    #[test]
+    fn color_leaked_arg_variables_colors_unproduced_ref_arg() {
+        use crate::jit::flow::{Block, FunctionGraph};
+        // `already` (Ref) is a pre-colored inputarg.  `leaked` (Ref) is
+        // referenced by `bool(leaked)` but is never an inputarg nor any
+        // op's result — the shape the walker produces when
+        // `abort_permanent` pushes an operand-stack Ref with no producer.
+        let already = Variable::new(VariableId(0), Kind::Ref);
+        let leaked = Variable::new(VariableId(1), Kind::Ref);
+        let res = Variable::new(VariableId(2), Kind::Int);
+        let start = Block::shared(vec![already.into()]);
+        let graph = FunctionGraph::new("leaked_arg", start.clone(), None);
+        super::super::flow::push_op(
+            &start,
+            SpaceOperation::new("bool", vec![leaked.into()], Some(res.into()), 0),
+        );
+        start.closeblock(vec![
+            super::super::flow::Link::new(
+                vec![already.into()],
+                Some(graph.returnblock.clone()),
+                None,
+            )
+            .into_ref(),
+        ]);
+
+        // Ref bank: `already` colored 0 (1 color); `leaked` uncolored.
+        let mut ref_coloring = std::collections::HashMap::new();
+        ref_coloring.insert(already.id, 0u16);
+        let mut regallocs = [
+            super::super::regalloc::GraphAllocationResult {
+                coloring: std::collections::HashMap::new(),
+                num_colors: 0,
+            },
+            super::super::regalloc::GraphAllocationResult {
+                coloring: ref_coloring,
+                num_colors: 1,
+            },
+            super::super::regalloc::GraphAllocationResult {
+                coloring: std::collections::HashMap::new(),
+                num_colors: 0,
+            },
+        ];
+
+        let mut ssarepr = SSARepr::new("leaked_arg");
+        {
+            let mut flattener = GraphFlattener::new(&graph, &mut regallocs, &mut ssarepr);
+            flattener.color_leaked_arg_variables();
+        }
+
+        let ref_alloc = &regallocs[Kind::Ref.index()];
+        // `leaked` now has a fresh color that does not alias the
+        // pre-colored inputarg's color, and the inputarg is untouched.
+        let leaked_color = ref_alloc
+            .coloring
+            .get(&leaked.id)
+            .copied()
+            .expect("leaked arg must be colored");
+        assert_eq!(ref_alloc.coloring.get(&already.id).copied(), Some(0));
+        assert_ne!(leaked_color, 0);
+        assert_eq!(ref_alloc.num_colors, 2);
+    }
+
     #[test]
     fn flatten_graph_with_lowering_lowers_retired_family_hlops() {
         // a graph carrying one HLOp from each of the four
@@ -5370,7 +5560,8 @@ mod tests {
             truth_fn_idx: 17,
             store_subscr_fn_idx: 19,
             build_list_fn_idx: 0,
-            call_fn_idx_by_nargs: [0; 9],        };
+            call_fn_idx_by_nargs: [0; 9],
+        };
 
         let mut ssarepr = SSARepr::new("retired_families");
         flatten_graph_for_test_with_lowering(&graph, &mut ssarepr, ctx, None);
@@ -5566,7 +5757,8 @@ mod tests {
             truth_fn_idx: 17,
             store_subscr_fn_idx: 19,
             build_list_fn_idx: 0,
-            call_fn_idx_by_nargs: [0; 9],        };
+            call_fn_idx_by_nargs: [0; 9],
+        };
 
         let mut ssarepr = SSARepr::new("multi_block_lowering");
         flatten_graph_for_test_with_lowering(&graph, &mut ssarepr, ctx, None);
@@ -5689,7 +5881,8 @@ mod tests {
             truth_fn_idx: 17,
             store_subscr_fn_idx: 19,
             build_list_fn_idx: 0,
-            call_fn_idx_by_nargs: [0; 9],        };
+            call_fn_idx_by_nargs: [0; 9],
+        };
 
         let mut ssarepr = SSARepr::new("pyre_walker_2exit");
         flatten_graph_for_test_with_lowering(&graph, &mut ssarepr, ctx, None);
@@ -5857,7 +6050,8 @@ mod tests {
             truth_fn_idx: 17,
             store_subscr_fn_idx: 19,
             build_list_fn_idx: 0,
-            call_fn_idx_by_nargs: [0; 9],        });
+            call_fn_idx_by_nargs: [0; 9],
+        });
 
         let mut regallocs = perform_register_allocation_all_kinds(&graph);
         let ssarepr = super::flatten_graph(&graph, &mut regallocs, false, Some(&cpu));
@@ -6074,7 +6268,8 @@ mod tests {
             truth_fn_idx: 0,
             store_subscr_fn_idx: 0,
             build_list_fn_idx: 0,
-            call_fn_idx_by_nargs: [0; 9],        };
+            call_fn_idx_by_nargs: [0; 9],
+        };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
 
@@ -6157,7 +6352,8 @@ mod tests {
             truth_fn_idx: 0,
             store_subscr_fn_idx: 0,
             build_list_fn_idx: 0,
-            call_fn_idx_by_nargs: [0; 9],        };
+            call_fn_idx_by_nargs: [0; 9],
+        };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
         assert!(
@@ -6184,7 +6380,8 @@ mod tests {
             truth_fn_idx: 0,
             store_subscr_fn_idx: 0,
             build_list_fn_idx: 0,
-            call_fn_idx_by_nargs: [0; 9],        };
+            call_fn_idx_by_nargs: [0; 9],
+        };
 
         let hlop = SpaceOperation::new("sub", vec![lhs.into(), rhs.into()], Some(result.into()), 0);
         let mut get_register = identity_register_mapper();
@@ -6279,7 +6476,8 @@ mod tests {
             truth_fn_idx: 0,
             store_subscr_fn_idx: 0,
             build_list_fn_idx: 0,
-            call_fn_idx_by_nargs: [0; 9],        };
+            call_fn_idx_by_nargs: [0; 9],
+        };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
 
@@ -6338,7 +6536,8 @@ mod tests {
             truth_fn_idx: 0,
             store_subscr_fn_idx: 0,
             build_list_fn_idx: 0,
-            call_fn_idx_by_nargs: [0; 9],        };
+            call_fn_idx_by_nargs: [0; 9],
+        };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
         assert!(
@@ -6363,7 +6562,8 @@ mod tests {
             truth_fn_idx: 0,
             store_subscr_fn_idx: 0,
             build_list_fn_idx: 0,
-            call_fn_idx_by_nargs: [0; 9],        };
+            call_fn_idx_by_nargs: [0; 9],
+        };
         let hlop = SpaceOperation::new("eq", vec![lhs.into(), rhs.into()], Some(result.into()), 0);
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -6395,7 +6595,8 @@ mod tests {
             truth_fn_idx: 23,
             store_subscr_fn_idx: 0,
             build_list_fn_idx: 0,
-            call_fn_idx_by_nargs: [0; 9],        };
+            call_fn_idx_by_nargs: [0; 9],
+        };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
 
@@ -6454,7 +6655,8 @@ mod tests {
             truth_fn_idx: 23,
             store_subscr_fn_idx: 0,
             build_list_fn_idx: 0,
-            call_fn_idx_by_nargs: [0; 9],        };
+            call_fn_idx_by_nargs: [0; 9],
+        };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
         assert!(
@@ -6476,7 +6678,8 @@ mod tests {
             truth_fn_idx: 31,
             store_subscr_fn_idx: 0,
             build_list_fn_idx: 0,
-            call_fn_idx_by_nargs: [0; 9],        };
+            call_fn_idx_by_nargs: [0; 9],
+        };
         let hlop = SpaceOperation::new("bool", vec![cond.into()], Some(result.into()), 0);
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -6512,7 +6715,8 @@ mod tests {
             truth_fn_idx: 0,
             store_subscr_fn_idx: 41,
             build_list_fn_idx: 0,
-            call_fn_idx_by_nargs: [0; 9],        };
+            call_fn_idx_by_nargs: [0; 9],
+        };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
 
@@ -6564,7 +6768,8 @@ mod tests {
             truth_fn_idx: 0,
             store_subscr_fn_idx: 41,
             build_list_fn_idx: 0,
-            call_fn_idx_by_nargs: [0; 9],        };
+            call_fn_idx_by_nargs: [0; 9],
+        };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
         assert!(
@@ -6601,7 +6806,8 @@ mod tests {
             truth_fn_idx: 0,
             store_subscr_fn_idx: 53,
             build_list_fn_idx: 0,
-            call_fn_idx_by_nargs: [0; 9],        };
+            call_fn_idx_by_nargs: [0; 9],
+        };
         let hlop = SpaceOperation::new(
             "setitem",
             vec![obj.into(), key.into(), value.into()],
@@ -6633,7 +6839,8 @@ mod tests {
             truth_fn_idx: 31,
             store_subscr_fn_idx: 53,
             build_list_fn_idx: 0,
-            call_fn_idx_by_nargs: [0; 9],        };
+            call_fn_idx_by_nargs: [0; 9],
+        };
         let mut get_register_a = identity_register_mapper();
         let mut get_register_b = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -6661,7 +6868,8 @@ mod tests {
             truth_fn_idx: 31,
             store_subscr_fn_idx: 53,
             build_list_fn_idx: 0,
-            call_fn_idx_by_nargs: [0; 9],        };
+            call_fn_idx_by_nargs: [0; 9],
+        };
         let mut get_register_a = identity_register_mapper();
         let mut get_register_b = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -6689,7 +6897,8 @@ mod tests {
             truth_fn_idx: 31,
             store_subscr_fn_idx: 53,
             build_list_fn_idx: 0,
-            call_fn_idx_by_nargs: [0; 9],        };
+            call_fn_idx_by_nargs: [0; 9],
+        };
         let mut get_register_a = identity_register_mapper();
         let mut get_register_b = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -6722,7 +6931,8 @@ mod tests {
             truth_fn_idx: 31,
             store_subscr_fn_idx: 53,
             build_list_fn_idx: 0,
-            call_fn_idx_by_nargs: [0; 9],        };
+            call_fn_idx_by_nargs: [0; 9],
+        };
         let mut get_register_a = identity_register_mapper();
         let mut get_register_b = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -6769,7 +6979,8 @@ mod tests {
             truth_fn_idx: 31,
             store_subscr_fn_idx: 53,
             build_list_fn_idx: 0,
-            call_fn_idx_by_nargs: [0; 9],        };
+            call_fn_idx_by_nargs: [0; 9],
+        };
         let mut get_register_a = identity_register_mapper();
         let mut get_register_b = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -8127,7 +8338,8 @@ mod tests {
             truth_fn_idx: 0,
             store_subscr_fn_idx: 0,
             build_list_fn_idx: 0,
-            call_fn_idx_by_nargs: [0; 9],        };
+            call_fn_idx_by_nargs: [0; 9],
+        };
         flatten_graph_for_test_with_lowering(&graph, &mut ssarepr, ctx, Some(cpu));
         ssarepr
     }
@@ -8446,9 +8658,9 @@ mod tests {
                                     "leading Ref operand must be the callable, not a frame"
                                 );
                             }
-                            other => panic!(
-                                "callable must be the leading Ref operand, got {other:?}"
-                            ),
+                            other => {
+                                panic!("callable must be the leading Ref operand, got {other:?}")
+                            }
                         }
                     }
                     other => panic!("expected ListOfKind Ref, got {other:?}"),
