@@ -316,6 +316,90 @@ pub fn optimize_vector(
     result
 }
 
+// ── compile.py:302-308: vectorization post-pass entry ──────────────────
+
+/// compile.py:302-308 — apply the SIMD vectorizer to an optimizer-assembled
+/// loop and return the rewritten op list.
+///
+/// `optimized_ops` is the flat loop the unroll optimizer produced:
+/// `[prefix…, loop_label, body…, jump]`. Split off the loop part at the
+/// final LABEL (compile.py:322 `loop_info.label_op`), run `optimize_vector`
+/// on `[label] + body + jump` (compile.py:305), and re-assemble
+/// `prefix + extra_before_label + [label] + loop_ops` (compile.py:327-328).
+///
+/// Bails to `optimized_ops` unchanged when the loop cannot or should not be
+/// vectorized (NotAVectorizeableLoop / NotAProfitableLoop) — the common
+/// case, matching optimize_vector's `return loop_info, loop_ops`.
+///
+/// No re-numbering is needed: the vectorizer assigns every op it creates
+/// (unroll copies via `base_offset = max(body pos) + 1`, packed VEC ops via
+/// `VecScheduleState::next_pos = max(body pos) + 1`) a position strictly
+/// greater than any prefix position, because the loop body is the tail of
+/// `optimized_ops`. Retained scalar body ops keep their original positions,
+/// which are likewise above the prefix. The gso index constants are inline
+/// `OpRef::const_int` (guard.rs:614) carrying their value on the OpRef, so
+/// nothing needs registering in the constant pool.
+pub fn apply_loop_vectorization(
+    optimized_ops: Vec<Op>,
+    vec_size: usize,
+    cost_threshold: i32,
+    user_code: bool,
+) -> Vec<Op> {
+    // compile.py:322 — the loop header the closing JUMP targets is the last
+    // LABEL in the assembled trace.
+    let Some(label_idx) = optimized_ops
+        .iter()
+        .rposition(|op| op.opcode == OpCode::Label)
+    else {
+        return optimized_ops;
+    };
+    // vector.py:147 `assert rop.is_final(loop_ops[e])` — the loop must close
+    // with a JUMP for the vectorizer to model it.
+    if optimized_ops
+        .last()
+        .map(|op| op.opcode != OpCode::Jump)
+        .unwrap_or(true)
+    {
+        return optimized_ops;
+    }
+    // vector.py:146 `assert e > 0` — the body between label and jump must be
+    // non-empty.
+    let jump_idx = optimized_ops.len() - 1;
+    if jump_idx <= label_idx + 1 {
+        return optimized_ops;
+    }
+
+    let prefix: Vec<Op> = optimized_ops[..label_idx].to_vec();
+    let label = optimized_ops[label_idx].clone();
+    let body: Vec<Op> = optimized_ops[label_idx + 1..jump_idx].to_vec();
+    let jump = optimized_ops[jump_idx].clone();
+
+    let mut vloop = VectorLoop::new(label, body, jump);
+    let mut info = crate::optimizeopt::version::LoopVersionInfo::new();
+
+    match optimize_vector(&mut vloop, cost_threshold, vec_size, &mut info, user_code) {
+        // NotAVectorizeableLoop / NotAProfitableLoop — keep the scalar loop.
+        Err(_) => optimized_ops,
+        Ok((loop_ops, _gso_consts)) => {
+            // compile.py:327-328: `… + extra_before_label + [label_op] +
+            // loop_ops`. `optimized_ops[..label_idx]` already carries the
+            // preamble + extra_same_as; `vloop.align_operations`
+            // (vector.py:267) is `extra_before_label`; `vloop.label` is
+            // `loop_info.label_op` (vector.py:153 `info.label_op = loop.label`).
+            // `loop_ops` came from `finaloplist(label=false)` so it is
+            // `body + jump` without the label.
+            let mut assembled = Vec::with_capacity(
+                prefix.len() + vloop.align_operations.len() + 1 + loop_ops.len(),
+            );
+            assembled.extend(prefix);
+            assembled.extend(vloop.align_operations.iter().cloned());
+            assembled.push(vloop.label.clone());
+            assembled.extend(loop_ops);
+            assembled
+        }
+    }
+}
+
 // ── vector.py:175-205: user_loop_bail_fast_path ────────────────────────
 
 /// vector.py:175-205: user_loop_bail_fast_path — quick pre-check.
@@ -2299,6 +2383,204 @@ mod tests {
             !gso_consts.is_empty(),
             "gso must surface its materialized index constants"
         );
+    }
+
+    /// compile.py:302-308 hook: a loop that cannot vectorize (no array
+    /// access → byte_count == 0) is returned unchanged. This is the common
+    /// path on every real loop until adjacent memory refs appear, and the
+    /// invariant that matters for production safety: a bail must not perturb
+    /// the optimizer's assembled trace.
+    #[test]
+    fn test_apply_loop_vectorization_bails_keeps_scalar_loop() {
+        // [start_label, prefix_op, loop_label, body_add, jump].
+        let i = OpRef::input_arg_int(0);
+        let j = OpRef::input_arg_int(1);
+        let mut assembled = vec![
+            Op::new(
+                OpCode::Label,
+                &[BoxRef::from_opref(i), BoxRef::from_opref(j)],
+            ),
+            Op::new(
+                OpCode::IntAdd,
+                &[
+                    BoxRef::from_opref(i),
+                    BoxRef::from_opref(OpRef::const_int(1)),
+                ],
+            ),
+            Op::new(
+                OpCode::Label,
+                &[BoxRef::from_opref(i), BoxRef::from_opref(j)],
+            ),
+            Op::new(
+                OpCode::IntAdd,
+                &[BoxRef::from_opref(i), BoxRef::from_opref(j)],
+            ),
+            Op::new(OpCode::Jump, &[BoxRef::from_opref(OpRef::int_op(3))]),
+        ];
+        assign_positions(&mut assembled, 0);
+
+        let before: Vec<(OpCode, u32)> = assembled
+            .iter()
+            .map(|op| (op.opcode, op.pos.get().raw()))
+            .collect();
+        let out = apply_loop_vectorization(assembled, 16, 0, false);
+        let after: Vec<(OpCode, u32)> = out
+            .iter()
+            .map(|op| (op.opcode, op.pos.get().raw()))
+            .collect();
+
+        // No array access → NotAVectorizeableLoop → trace returned verbatim.
+        assert_eq!(before, after, "non-vectorizable loop must pass through");
+        assert!(!out.iter().any(|op| op.opcode == OpCode::VecLoadI));
+    }
+
+    /// compile.py:302-308 hook end to end: feed `apply_loop_vectorization` an
+    /// optimizer-assembled loop `[start_label, prefix_op, loop_label, body…,
+    /// jump]` whose body holds two adjacent array loads. The helper must
+    /// split at the loop LABEL, vectorize the loop part, and re-assemble
+    /// `prefix + [label] + vectorized` (compile.py:327-328) with the prefix
+    /// untouched and the new VEC ops in a position namespace disjoint from
+    /// the prefix.
+    #[test]
+    fn test_apply_loop_vectorization_splices_vectorized_loop() {
+        use majit_ir::{Type, make_array_descr};
+
+        let i = OpRef::input_arg_int(0);
+        let base1 = OpRef::input_arg_int(1);
+        let base2 = OpRef::input_arg_int(2);
+        let descr = make_array_descr(0, 8, Type::Int);
+
+        //  0: start_label LABEL [i, base1, base2]
+        //  1: prefix_op  IntAdd [i, ConstInt(1)]     (preamble, pos 1)
+        //  2: loop_label LABEL [i, base1, base2]      (last LABEL)
+        //  3: a0 = RawLoadI [base1, i]
+        //  4: i2 = IntAdd   [i, ConstInt(8)]
+        //  5: a1 = RawLoadI [base1, int_op(4)]
+        //  6: b0 = RawLoadI [base2, i]
+        //  7: b1 = RawLoadI [base2, int_op(4)]
+        //  8: s0 = IntAdd   [int_op(3), int_op(6)]
+        //  9: s1 = IntAdd   [int_op(5), int_op(7)]
+        // 10: jump JUMP [i, int_op(8), int_op(9)]
+        let mut assembled = vec![
+            Op::new(
+                OpCode::Label,
+                &[
+                    BoxRef::from_opref(i),
+                    BoxRef::from_opref(base1),
+                    BoxRef::from_opref(base2),
+                ],
+            ),
+            Op::new(
+                OpCode::IntAdd,
+                &[
+                    BoxRef::from_opref(i),
+                    BoxRef::from_opref(OpRef::const_int(1)),
+                ],
+            ),
+            Op::new(
+                OpCode::Label,
+                &[
+                    BoxRef::from_opref(i),
+                    BoxRef::from_opref(base1),
+                    BoxRef::from_opref(base2),
+                ],
+            ),
+            Op::with_descr(
+                OpCode::RawLoadI,
+                &[BoxRef::from_opref(base1), BoxRef::from_opref(i)],
+                descr.clone(),
+            ),
+            Op::new(
+                OpCode::IntAdd,
+                &[
+                    BoxRef::from_opref(i),
+                    BoxRef::from_opref(OpRef::const_int(8)),
+                ],
+            ),
+            Op::with_descr(
+                OpCode::RawLoadI,
+                &[
+                    BoxRef::from_opref(base1),
+                    BoxRef::from_opref(OpRef::int_op(4)),
+                ],
+                descr.clone(),
+            ),
+            Op::with_descr(
+                OpCode::RawLoadI,
+                &[BoxRef::from_opref(base2), BoxRef::from_opref(i)],
+                descr.clone(),
+            ),
+            Op::with_descr(
+                OpCode::RawLoadI,
+                &[
+                    BoxRef::from_opref(base2),
+                    BoxRef::from_opref(OpRef::int_op(4)),
+                ],
+                descr.clone(),
+            ),
+            Op::new(
+                OpCode::IntAdd,
+                &[
+                    BoxRef::from_opref(OpRef::int_op(3)),
+                    BoxRef::from_opref(OpRef::int_op(6)),
+                ],
+            ),
+            Op::new(
+                OpCode::IntAdd,
+                &[
+                    BoxRef::from_opref(OpRef::int_op(5)),
+                    BoxRef::from_opref(OpRef::int_op(7)),
+                ],
+            ),
+            Op::new(
+                OpCode::Jump,
+                &[
+                    BoxRef::from_opref(i),
+                    BoxRef::from_opref(OpRef::int_op(8)),
+                    BoxRef::from_opref(OpRef::int_op(9)),
+                ],
+            ),
+        ];
+        assign_positions(&mut assembled, 0);
+
+        let out = apply_loop_vectorization(assembled, 16, 0, false);
+
+        // Prefix is preserved verbatim: start_label then the pos-1 IntAdd.
+        assert_eq!(out[0].opcode, OpCode::Label);
+        assert_eq!(out[1].opcode, OpCode::IntAdd);
+        assert_eq!(out[1].pos.get().raw(), 1, "prefix op keeps its position");
+        // The loop part vectorized.
+        assert!(
+            out.iter().any(|op| op.opcode == OpCode::VecLoadI),
+            "adjacent loads must pack into VecLoadI"
+        );
+        assert!(
+            out.iter().any(|op| op.opcode == OpCode::VecIntAdd),
+            "paired sums must pack into VecIntAdd"
+        );
+        // The loop LABEL survives and the trace still closes with a JUMP.
+        assert!(out.iter().any(|op| op.opcode == OpCode::Label));
+        assert_eq!(out.last().unwrap().opcode, OpCode::Jump);
+        // Loop entry contract preserved: the loop LABEL and the closing JUMP
+        // keep matching arity (3 args each).
+        let loop_label = out
+            .iter()
+            .rev()
+            .find(|op| op.opcode == OpCode::Label)
+            .unwrap();
+        assert_eq!(loop_label.num_args(), out.last().unwrap().num_args());
+        // Position disjointness: every VEC op the vectorizer created lands
+        // above the prefix's positions {0, 1}, so it cannot alias a prefix
+        // value when the backend reads positions as SSA numbers.
+        for op in &out {
+            if matches!(op.opcode, OpCode::VecLoadI | OpCode::VecIntAdd) {
+                assert!(
+                    op.pos.get().raw() > 1,
+                    "vectorized op position {} must clear the prefix",
+                    op.pos.get().raw()
+                );
+            }
+        }
     }
 
     /// Streaming refactor: a non-loop `Label .. Finish` trace (no trailing Jump)

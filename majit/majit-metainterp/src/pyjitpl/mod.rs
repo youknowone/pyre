@@ -4882,6 +4882,32 @@ impl<M: Clone> MetaInterp<M> {
                 }
             }
         };
+
+        // compile.py:302-308: vectorization post-pass. Condition is
+        // `((warmstate.vec and jitdriver_sd.vec) or warmstate.vec_all) and
+        // cpu.vector_ext and cpu.vector_ext.is_enabled()`. No pyre jitdriver
+        // declares vectorize=True, so `jitdriver_sd.vec` is false and the
+        // gate reduces to `warmstate.vec_all`; `vector_register_size()` is
+        // `cpu.vector_ext` collapsed to a byte width (0 ⇒ absent/disabled,
+        // non-zero ⇒ is_enabled()). The unroll-free retry is the simple-loop
+        // path (compile.py:233 compile_simple_loop), which is not vectorized.
+        let optimized_ops = {
+            let driver_vec = false; // jitdriver_sd.vec
+            let vec_size = self.backend.vector_register_size();
+            let vec_gate = (self.warm_state.vectorize() && driver_vec) || self.warm_state.vec_all();
+            if vec_gate && vec_size != 0 && !retried_without_unroll {
+                // vector.py:124 `user_code = not jitdriver_sd.vec and warmstate.vec_all`.
+                let user_code = !driver_vec && self.warm_state.vec_all();
+                crate::optimizeopt::vector::apply_loop_vectorization(
+                    optimized_ops,
+                    vec_size,
+                    self.warm_state.vec_cost() as i32,
+                    user_code,
+                )
+            } else {
+                optimized_ops
+            }
+        };
         let num_ops_after = optimized_ops.len();
 
         // RPython compile.py keeps the root entry contract on the original
@@ -6449,18 +6475,10 @@ impl<M: Clone> MetaInterp<M> {
         // from optimizer to MetaInterp for post-compile watcher registration.
         self.last_quasi_immutable_deps = std::mem::take(&mut optimizer.quasi_immutable_deps);
 
-        // compile.py:302-308: vectorization post-pass.
-        // RPython condition: ((warmstate.vec and jitdriver_sd.vec) or
-        // warmstate.vec_all) and cpu.vector_ext and
-        // cpu.vector_ext.is_enabled().
-        //
-        // The vectorizer's success path is incomplete: GuardStrengthenOpt,
-        // cleanup SchedulerState.schedule(), and info.extra_before_label
-        // are not yet ported (vector.py:257-269). Wiring the incomplete
-        // pass into compile produces vectorized loops that differ from
-        // RPython's output — weaker guards, no cleanup scheduling, missing
-        // alignment prefix — which is a parity regression vs main (which
-        // never wired this). Gate the call until the full pipeline lands.
+        // compile.py:302-308 vectorization runs in `compile_loop` (the
+        // unrolled-loop path, `compile_loop_body`), not on the FINISH
+        // terminator: this trace ends in FINISH, not a back-edge JUMP, so it
+        // is not a vectorizable loop.
         let optimized_ops = optimized_ops;
 
         if crate::majit_log_enabled() {
