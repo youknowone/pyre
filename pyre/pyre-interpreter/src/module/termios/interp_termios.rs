@@ -102,21 +102,12 @@ pub fn register_module(ns: &mut DictStorage) {
             }
             let fd = (unsafe { pyre_object::w_int_get_value(args[0]) }) as i32;
             let when = (unsafe { pyre_object::w_int_get_value(args[1]) }) as i32;
-            // interp_termios.py:23-29 — arg 3 is a 7-element list or tuple,
+            // interp_termios.py:24-27 — arg 3 must be a 7-element list,
             // unpacked via space.unpackiterable.
             let attrs = args[2];
-            let is_list = unsafe { pyre_object::is_list(attrs) };
-            let is_tuple = unsafe { pyre_object::is_tuple(attrs) };
-            let attr_len = unsafe {
-                if is_list {
-                    pyre_object::w_list_len(attrs)
-                } else if is_tuple {
-                    pyre_object::w_tuple_len(attrs)
-                } else {
-                    0
-                }
-            };
-            if (!is_list && !is_tuple) || attr_len != 7 {
+            if !unsafe { pyre_object::is_list(attrs) }
+                || unsafe { pyre_object::w_list_len(attrs) } != 7
+            {
                 return Err(crate::PyError::type_error(
                     "tcsetattr, arg 3: must be 7 element list",
                 ));
