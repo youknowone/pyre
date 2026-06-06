@@ -14455,6 +14455,16 @@ impl majit_backend::Backend for CraneliftBackend {
         "cranelift"
     }
 
+    /// `cpu.vector_ext.register_size` — the cranelift backend lowers the
+    /// optimizeopt vector ops to native SIMD (I64X2/F64X2), so it advertises
+    /// a 16-byte (128-bit SSE-equivalent) vector unit, matching the
+    /// `vec_size` the vectorizer assumes. Gated by `USE_NATIVE_SIMD`: if the
+    /// native-SIMD lowering is compiled out the width is 0 (no vector_ext),
+    /// which keeps `optimize_vector` from being entered (compile.py:303).
+    fn vector_register_size(&self) -> usize {
+        if USE_NATIVE_SIMD { 16 } else { 0 }
+    }
+
     fn cpu_tracker(&self) -> &Arc<majit_backend::CpuTotalTracker> {
         &self.cpu_tracker
     }

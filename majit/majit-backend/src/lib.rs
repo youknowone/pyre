@@ -2609,11 +2609,23 @@ pub trait Backend: Send {
     /// by `pyjitpl.py:2298-2299
     /// `if self.cpu.vector_ext: self.cpu.vector_ext.setup_once(...)`
     /// inside `MetaInterpStaticData._setup_once`.  Backends with a
-    /// vector extension override this; pyre's x86 / aarch64 / wasm /
-    /// cranelift backends have no vector_ext today (the optimizeopt
-    /// vector pass has no runtime setup hook yet), so the default
-    /// no-op is the honest port.
+    /// vector extension override this; pyre's x86 / aarch64 / wasm
+    /// backends have no vector_ext, so the default no-op is the honest
+    /// port.
     fn vector_ext_setup_once(&mut self) {}
+
+    /// `cpu.vector_ext.register_size` (vector_ext.py): SIMD register width
+    /// in bytes, or 0 when the backend has no (enabled) vector unit.
+    /// compile.py:303 gates `optimize_vector` on `cpu.vector_ext and
+    /// cpu.vector_ext.is_enabled()`; pyre collapses the absent/disabled
+    /// vector_ext to a 0 width, and a non-zero width is `is_enabled()`.
+    /// The cranelift backend lowers the optimizeopt vector ops
+    /// (VecLoad/VecStore/VecIntAdd/VecPack/VecUnpack/VecExpand) to native
+    /// SIMD (I64X2/F64X2) and overrides this to 16; x86/aarch64/wasm
+    /// have no vector lowering and keep the 0 default.
+    fn vector_register_size(&self) -> usize {
+        0
+    }
 
     /// pyjitpl.py:2215-2217 `backendmodule = self.cpu.__module__
     /// .split('.')[-2]` parity — backend identifier used in
