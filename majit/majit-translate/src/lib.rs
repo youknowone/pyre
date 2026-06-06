@@ -752,21 +752,46 @@ fn analyze_pipeline_from_parsed(
     majit_ir::descr::register_struct_origins(program.struct_origins.clone());
     // Tier-3 shadow probe: the syn `pre_register_struct_fields_from_file`
     // pass above is still the active writer of
-    // `FORCE_ATTRIBUTES_INTO_CLASSES`.  Project the LLBC-sourced
-    // `program.struct_field_attrs` through the same
-    // `valuetype_to_someshell` write-time shelling and diff the two maps
-    // over the shared keys: the cutover is safe only when every shared
-    // qualname carries an identical field→someshell map.  `syn_only`
-    // mirrors the struct-set gap already characterised for
-    // `struct_origins` (cfg(test) / jit-crate structs Charon does not
-    // extract); `ull_only` is the benign crate-type superset.  Summary
-    // only, no panic, so it cannot affect the gate.
+    // `FORCE_ATTRIBUTES_INTO_CLASSES`.  The cutover replaces it with the
+    // LLBC-sourced `program.struct_field_attrs`, so the probe measures
+    // whether the LLBC map reproduces the syn map's values under the key
+    // the consumer (`_init_classdef`, `cls.qualname()`) reads back.
+    //
+    // The two sides are keyed differently: the syn writer keys by the
+    // in-file qualname (`bare` for a top-level struct, `mod::Leaf` for an
+    // in-file nested module), whereas `struct_field_attrs` keys by the
+    // crate-stripped Charon item path (`intobject::W_IntObject`).  A raw
+    // key-vs-key diff therefore shares zero keys and reports a vacuous
+    // `mismatch=0`.  Project both sides onto the bare leaf (last `::`
+    // segment) — the key a top-level struct resolves under — so the diff
+    // measures genuine field-map agreement.  `syn_nested` counts the syn
+    // keys that still carry an in-file `::` (a leaf-keyed writer would
+    // mis-key those); `ull_collisions` counts distinct Charon paths that
+    // share a leaf but disagree on the shelled field map (a leaf-keyed
+    // writer would be ambiguous there).  Both must be zero over the syn
+    // key set for the leaf-keyed cutover to be provably equivalent.
+    // `syn_only` is the genuine extraction gap (cfg(test) / jit-crate
+    // structs Charon does not extract); `ull_only` is the benign
+    // crate-type superset.  Summary only, no panic, so it cannot affect
+    // the gate.
     {
+        fn bare_leaf(k: &str) -> &str {
+            k.rsplit("::").next().unwrap_or(k)
+        }
         let syn_map = crate::annotator::classdesc::forced_attributes_snapshot();
-        let mut ull_map: std::collections::HashMap<
+        let syn_nested = syn_map.keys().filter(|k| k.contains("::")).count();
+        let mut syn_bare: std::collections::HashMap<
             String,
             indexmap::IndexMap<String, crate::annotator::model::SomeValue>,
         > = std::collections::HashMap::new();
+        for (qual, attrs) in &syn_map {
+            syn_bare.insert(bare_leaf(qual).to_string(), attrs.clone());
+        }
+        let mut ull_bare: std::collections::HashMap<
+            String,
+            indexmap::IndexMap<String, crate::annotator::model::SomeValue>,
+        > = std::collections::HashMap::new();
+        let mut ull_collisions = 0usize;
         for (qual, rows) in &program.struct_field_attrs {
             let mut shelled = indexmap::IndexMap::new();
             for (name, vt) in rows {
@@ -775,34 +800,43 @@ fn analyze_pipeline_from_parsed(
                     shelled.insert(name.clone(), s);
                 }
             }
-            ull_map.insert(qual.clone(), shelled);
+            let leaf = bare_leaf(qual).to_string();
+            if let Some(prev) = ull_bare.get(&leaf) {
+                if prev != &shelled {
+                    ull_collisions += 1;
+                    if ull_collisions <= 20 {
+                        eprintln!("TIER3 struct_field_attrs ULL-COLLISION {leaf:?} ({qual:?})");
+                    }
+                }
+            }
+            ull_bare.insert(leaf, shelled);
         }
         let mut mismatch = 0usize;
         let mut syn_only = 0usize;
-        for (qual, syn_attrs) in &syn_map {
-            match ull_map.get(qual) {
+        for (leaf, syn_attrs) in &syn_bare {
+            match ull_bare.get(leaf) {
                 Some(u) if u == syn_attrs => {}
                 Some(u) => {
                     mismatch += 1;
                     if mismatch <= 20 {
                         eprintln!(
-                            "TIER3 struct_field_attrs MISMATCH {qual:?}: syn={syn_attrs:?} ull={u:?}"
+                            "TIER3 struct_field_attrs MISMATCH {leaf:?}: syn={syn_attrs:?} ull={u:?}"
                         );
                     }
                 }
                 None => {
                     syn_only += 1;
-                    if syn_only <= 20 {
-                        eprintln!("TIER3 struct_field_attrs SYN-ONLY {qual:?}");
+                    if syn_only <= 40 {
+                        eprintln!("TIER3 struct_field_attrs SYN-ONLY {leaf:?}");
                     }
                 }
             }
         }
-        let ull_only = ull_map.keys().filter(|k| !syn_map.contains_key(*k)).count();
+        let ull_only = ull_bare.keys().filter(|k| !syn_bare.contains_key(*k)).count();
         eprintln!(
-            "TIER3 struct_field_attrs SUMMARY: syn={} ull={} mismatch={mismatch} syn_only={syn_only} ull_only={ull_only}",
-            syn_map.len(),
-            ull_map.len(),
+            "TIER3 struct_field_attrs SUMMARY (bare-leaf): syn={} ull={} syn_nested={syn_nested} ull_collisions={ull_collisions} mismatch={mismatch} syn_only={syn_only} ull_only={ull_only}",
+            syn_bare.len(),
+            ull_bare.len(),
         );
     }
     mark_phase!("build_semantic_program_from_parsed_files");
