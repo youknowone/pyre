@@ -94,8 +94,8 @@ use majit_charon_reader::{
 
 use crate::flowspace::model::{ConstValue, Variable};
 use crate::model::{
-    BlockId, CallTarget, ExitCase, ExitSwitch, FieldDescriptor, FunctionGraph, Link, OpKind,
-    SpaceOperation, ValueType,
+    BlockId, CallTarget, ExitCase, ExitSwitch, FieldDescriptor, FrameState, FunctionGraph, Link,
+    LinkArg, OpKind, SpaceOperation, ValueType,
 };
 
 /// Top-level entry — load `function_name` out of `llbc`, lower it,
@@ -561,6 +561,26 @@ pub fn lower_fun_decl_with_static_addrs(
         ))
     })?;
     let name = fd.item_meta.name_path();
+    // Opt-in framestate-threaded lowering for acyclic bodies (the GAP-B
+    // path that threads locals as block inputargs / phis).  Default
+    // (flag unset) keeps the monotonic lowering so the gate stays green
+    // while the new path is validated.  On a framestate failure the body
+    // falls back to the monotonic path — so flag-on is never worse than
+    // flag-off — unless `PYRE_MIR_FRAMESTATE_STRICT` is set, which
+    // propagates the error for debugging.
+    if std::env::var_os("PYRE_MIR_FRAMESTATE").is_some() {
+        let mut lo = Lowering::new(llbc, name.clone(), &u, static_addrs)?;
+        if lo.mir_model_is_acyclic() {
+            match lo.lower_framestate() {
+                Ok(()) => return Ok(lo.graph),
+                Err(e) => {
+                    if std::env::var_os("PYRE_MIR_FRAMESTATE_STRICT").is_some() {
+                        return Err(e);
+                    }
+                }
+            }
+        }
+    }
     let mut lo = Lowering::new(llbc, name.clone(), &u, static_addrs)?;
     match lo.lower(BlockOrder::Linear) {
         Ok(()) => Ok(lo.graph),
@@ -886,6 +906,451 @@ impl<'a> Lowering<'a> {
             }
         }
         order
+    }
+
+    // -----------------------------------------------------------------------
+    // Framestate-threaded lowering (acyclic GAP-B path)
+    // -----------------------------------------------------------------------
+
+    /// Snapshot the current `local_var` table as a [`FrameState`].  Only
+    /// the locals projection is populated — MIR has no value stack /
+    /// pending exception / block-stack, so those stay at the `Default`
+    /// (empty) shape.  `entries` is indexed by MIR local index; every
+    /// framestate produced in this lowering uses the same indexing, so
+    /// [`FrameState::union`] / [`FrameState::getvariables`] /
+    /// [`FrameState::getoutputargs`] — all purely positional over
+    /// `entries` / `locals_w` — line up across predecessors and merge
+    /// targets without consulting any external slot table.
+    fn getstate(&self) -> FrameState {
+        FrameState {
+            entries: self.local_var.clone(),
+            ..Default::default()
+        }
+    }
+
+    /// Restore `local_var` from a [`FrameState`] produced by
+    /// [`Self::getstate`] or [`FrameState::union`].  Slots are sized to
+    /// the fixed local count; a `None` slot marks a local undefined on at
+    /// least one predecessor path (union None-kill), so a later read
+    /// fails-loud through [`Self::resolve_place`] as "uninitialised
+    /// local" — the same use-before-def signal the monotonic path emits.
+    fn setstate(&mut self, fs: &FrameState) {
+        let n = self.local_var.len();
+        self.local_var = (0..n)
+            .map(|i| fs.entries.get(i).cloned().flatten())
+            .collect();
+    }
+
+    /// Successor MIR blocks along the edges [`Self::lower_terminator`]
+    /// actually materialises in the model graph.  This EXCLUDES
+    /// `on_unwind` (dropped by `lower_call` and the `Assert` / `Drop`
+    /// arms): the reachability / acyclicity / RPO that drive framestate
+    /// threading must follow only the edges that exist in the produced
+    /// `FunctionGraph`, otherwise an orphan cleanup chain would appear as
+    /// a live merge predecessor.
+    fn model_succs(&self, mir_bb: usize) -> Vec<usize> {
+        let n = self.body.body.len();
+        let Ok(term) = self.body.body[mir_bb].term() else {
+            return vec![];
+        };
+        let raw: Vec<u64> = match term {
+            TermKind::Goto { target } => vec![target],
+            TermKind::Call { target, .. }
+            | TermKind::Assert { target, .. }
+            | TermKind::Drop { target, .. } => vec![target],
+            TermKind::Switch { targets, .. } => match targets {
+                SwitchTargets::If(a, b) => vec![a, b],
+                SwitchTargets::SwitchInt(_, arms, default) => {
+                    let mut v: Vec<u64> = arms.iter().map(|(_, bb)| *bb).collect();
+                    v.push(default);
+                    v
+                }
+            },
+            TermKind::Return
+            | TermKind::UnwindResume
+            | TermKind::Abort(_)
+            | TermKind::Unknown => vec![],
+        };
+        raw.into_iter()
+            .map(|t| t as usize)
+            .filter(|&t| t < n)
+            .collect()
+    }
+
+    /// Blocks reachable from bb0 over [`Self::model_succs`].
+    fn mir_model_reachable(&self) -> Vec<bool> {
+        let n = self.body.body.len();
+        let mut reached = vec![false; n];
+        if n == 0 {
+            return reached;
+        }
+        reached[0] = true;
+        let mut stack = vec![0usize];
+        while let Some(bb) = stack.pop() {
+            for s in self.model_succs(bb) {
+                if !reached[s] {
+                    reached[s] = true;
+                    stack.push(s);
+                }
+            }
+        }
+        reached
+    }
+
+    /// `true` iff the model-reachable component (from bb0 over
+    /// [`Self::model_succs`]) contains no back-edge.  The framestate path
+    /// handles only acyclic bodies; cyclic ones fall back to the
+    /// monotonic lowering (they are not in the acyclic GAP-B skip set
+    /// this path drains, and a loop header needs a real fixpoint rather
+    /// than the two-pass acyclic threading).  3-colour DFS: a successor
+    /// still on the DFS stack (grey) is a back-edge.
+    fn mir_model_is_acyclic(&self) -> bool {
+        let n = self.body.body.len();
+        if n == 0 {
+            return true;
+        }
+        // 0 = white, 1 = grey (on stack), 2 = black (done).
+        let mut state = vec![0u8; n];
+        let mut stack: Vec<(usize, usize)> = vec![(0, 0)];
+        state[0] = 1;
+        while let Some(&(node, idx)) = stack.last() {
+            let succs = self.model_succs(node);
+            if idx < succs.len() {
+                stack.last_mut().unwrap().1 += 1;
+                let nxt = succs[idx];
+                match state[nxt] {
+                    0 => {
+                        state[nxt] = 1;
+                        stack.push((nxt, 0));
+                    }
+                    1 => return false, // grey successor ⇒ back-edge ⇒ cyclic
+                    _ => {}
+                }
+            } else {
+                state[node] = 2;
+                stack.pop();
+            }
+        }
+        true
+    }
+
+    /// Reverse-postorder of the model-reachable component over
+    /// [`Self::model_succs`].  Only blocks reachable from bb0 appear;
+    /// unreachable blocks are handled separately as dead stubs.  In an
+    /// acyclic graph RPO visits every predecessor of a block before the
+    /// block itself, which is exactly the order the two-pass framestate
+    /// threading relies on.
+    fn model_rpo(&self) -> Vec<usize> {
+        let n = self.body.body.len();
+        if n == 0 {
+            return vec![];
+        }
+        let mut state = vec![0u8; n];
+        let mut postorder: Vec<usize> = Vec::with_capacity(n);
+        let mut stack: Vec<(usize, usize)> = vec![(0, 0)];
+        state[0] = 1;
+        while let Some(&(node, idx)) = stack.last() {
+            let succs = self.model_succs(node);
+            if idx < succs.len() {
+                stack.last_mut().unwrap().1 += 1;
+                let nxt = succs[idx];
+                if state[nxt] == 0 {
+                    state[nxt] = 1;
+                    stack.push((nxt, 0));
+                }
+            } else {
+                state[node] = 2;
+                postorder.push(node);
+                stack.pop();
+            }
+        }
+        postorder.into_iter().rev().collect()
+    }
+
+    /// Lower the body threading locals as block inputargs / phis via
+    /// per-block [`FrameState`]s, instead of the function-wide monotonic
+    /// `local_var` table.  Restricted to acyclic bodies (the caller gates
+    /// on [`Self::mir_model_is_acyclic`]); this drains the GAP-B
+    /// "undefined operand" census skips where a reassigned local reaches
+    /// a merge with path-dependent values the monotonic single-slot
+    /// scheme cannot represent.
+    ///
+    /// Two passes over the model-reachable blocks in reverse-postorder:
+    ///
+    ///   Pass 1 — for each block, `setstate` to its accumulated entry
+    ///   framestate, set its (non-startblock) inputargs to the entry
+    ///   framestate's variables, lower its statements + terminator
+    ///   (reusing the monotonic per-op lowering, which closes
+    ///   return / raise correctly and emits placeholder empty-args
+    ///   goto / branch links because every successor still has empty
+    ///   inputargs at close time), snapshot the exit framestate, and
+    ///   union that exit into each model successor's entry framestate.
+    ///
+    ///   Pass 2 — re-argument each goto / branch link from the
+    ///   predecessor exit / target entry framestates via `getoutputargs`,
+    ///   preserving the link's target, exitcase, and the block's
+    ///   `exitswitch`.
+    ///
+    /// Model-unreachable blocks (orphan `on_unwind` cleanup chains) are
+    /// stubbed as dead raises so the graph stays complete without
+    /// threading dead state — leaving their original content would
+    /// reference the monotonic carry-on `local_var`.  bb0 (the
+    /// startblock) is never a merge target in an acyclic body, so it
+    /// keeps its `OpKind::Input`-paired parameter inputargs untouched —
+    /// the opcode-dispatch arm extractor depends on that shape.
+    fn lower_framestate(&mut self) -> Result<(), LowerError> {
+        let n = self.body.body.len();
+        if n == 0 {
+            return Ok(());
+        }
+        let reachable = self.mir_model_reachable();
+        let rpo = self.model_rpo();
+        let returnblock = self.graph.returnblock;
+        let exceptblock = self.graph.exceptblock;
+
+        // BlockId → MIR bb inverse.  returnblock / exceptblock (and any
+        // non-MIR block) map to `usize::MAX` — they are merge sinks the
+        // accumulation skips.
+        let mut block_to_mir = vec![usize::MAX; self.graph.blocks.len()];
+        for (mir, bid) in self.block_id.iter().enumerate() {
+            block_to_mir[bid.0] = mir;
+        }
+
+        let mut entry_state: Vec<Option<FrameState>> = vec![None; n];
+        let mut exit_state: Vec<Option<FrameState>> = vec![None; n];
+        // bb0 enters with the parameter bindings established in `new`.
+        entry_state[0] = Some(self.getstate());
+
+        // Pass 1 — RPO walk: setstate, inputargs, lower, snapshot, union.
+        for &bb in &rpo {
+            let st = entry_state[bb].clone().ok_or_else(|| {
+                LowerError::Unsupported(format!(
+                    "framestate: reachable bb{bb} has no entry state (RPO/union bug)"
+                ))
+            })?;
+            self.setstate(&st);
+            let bb_id = self.block_id[bb];
+            // The startblock keeps its parameter inputargs + Input ops;
+            // it is never a merge target in an acyclic body.
+            if bb != 0 {
+                let inputargs = st.getvariables(&self.graph);
+                self.graph.block_mut(bb_id).inputargs = inputargs;
+            }
+            self.lower_block(bb)?;
+            let ex = self.getstate();
+            exit_state[bb] = Some(ex.clone());
+            // Union this exit into each model successor's entry state.
+            // Successors are read off the just-closed exits (the model
+            // edges), skipping the return / except sinks and any
+            // non-MIR target.
+            let succ_targets: Vec<BlockId> = self
+                .graph
+                .block(bb_id)
+                .exits
+                .iter()
+                .map(|l| l.target)
+                .collect();
+            for tgt in succ_targets {
+                if tgt == returnblock || tgt == exceptblock {
+                    continue;
+                }
+                let tmir = block_to_mir[tgt.0];
+                if tmir == usize::MAX {
+                    continue;
+                }
+                let merged = match entry_state[tmir].take() {
+                    None => ex.clone(),
+                    Some(prev) => prev.union(&ex, &mut self.graph).ok_or_else(|| {
+                        LowerError::Unsupported(format!(
+                            "framestate: union of predecessors failed at bb{tmir}"
+                        ))
+                    })?,
+                };
+                entry_state[tmir] = Some(merged);
+            }
+        }
+
+        // Model-unreachable blocks: orphan `on_unwind` cleanup chains that
+        // no lowered exit targets — `lower_terminator` strips every unwind
+        // edge (Goto / Assert / Drop / Call all forward to the success
+        // continuation only), so `model_succs` is exactly the set of
+        // lowered exits and an unreachable block here is genuinely
+        // unreferenced.  Mark them `dead` and stub a bare raise so the
+        // graph stays closed for the legacy fallback path, which consumes
+        // this same `FunctionGraph`.  The real path's
+        // `function_graph_to_flowspace` prunes `dead` blocks outright
+        // (`remove_dead_blocks` parity), so the stub's orphan etype/evalue
+        // never reach the rtyper as undefined operands.
+        for bb in 0..n {
+            if reachable[bb] {
+                continue;
+            }
+            let bb_id = self.block_id[bb];
+            let blk = self.graph.block_mut(bb_id);
+            blk.operations.clear();
+            blk.exits.clear();
+            blk.exitswitch = None;
+            self.graph.set_raise(bb_id, "mir-dead");
+            self.graph.block_mut(bb_id).dead = true;
+        }
+
+        // Pass 2 — re-argument the goto / branch links from framestates.
+        for &bb in &rpo {
+            let bb_id = self.block_id[bb];
+            let ex = exit_state[bb].clone().ok_or_else(|| {
+                LowerError::Unsupported(format!(
+                    "framestate: bb{bb} missing exit state in pass 2"
+                ))
+            })?;
+            let exits_meta: Vec<(usize, BlockId)> = self
+                .graph
+                .block(bb_id)
+                .exits
+                .iter()
+                .enumerate()
+                .map(|(i, l)| (i, l.target))
+                .collect();
+            for (idx, tgt) in exits_meta {
+                if tgt == returnblock || tgt == exceptblock {
+                    continue;
+                }
+                let tmir = block_to_mir[tgt.0];
+                if tmir == usize::MAX {
+                    continue;
+                }
+                let tgt_state = entry_state[tmir].clone().ok_or_else(|| {
+                    LowerError::Unsupported(format!(
+                        "framestate: bb{tmir} missing entry state in pass 2"
+                    ))
+                })?;
+                let outputargs = ex.getoutputargs(&tgt_state, &self.graph);
+                // Self-validation: every output arg is an exit-state cell
+                // of `bb`, hence must be defined in `bb_id` (as an
+                // inputarg or op result).  If the threading would emit a
+                // Link.arg undefined at its source block, bail to the
+                // monotonic path rather than hand a malformed graph to
+                // the downstream rtyper / legacy fallback (which both
+                // consume this same graph and would fault on the
+                // undefined operand).  This is the `flowspace_adapter`
+                // "every referenced operand must be defined as a block
+                // inputarg or op result" invariant, checked at the
+                // threading site.
+                for arg in &outputargs {
+                    if let LinkArg::Value(var) = arg {
+                        if !self.graph.variable_defined_in_block(bb_id, var) {
+                            if std::env::var_os("PYRE_MIR_FRAMESTATE_DEBUG").is_some() {
+                                self.debug_dump_undefined_link_arg(
+                                    bb, bb_id, tgt, tmir, var, &ex, &tgt_state,
+                                );
+                            }
+                            return Err(LowerError::Unsupported(format!(
+                                "framestate: threaded Link.arg (var id={}) undefined in source \
+                                 bb{bb} (BlockId {:?}) for edge -> bb{tmir} (BlockId {:?}) \
+                                 in graph {:?}",
+                                var.id(),
+                                bb_id,
+                                tgt,
+                                self.graph.name,
+                            )));
+                        }
+                    }
+                }
+                self.graph.block_mut(bb_id).exits[idx].args = outputargs;
+            }
+        }
+
+        // Final adapter-rejection guard.  The real-path `flowspace_adapter`
+        // rejects a graph if any non-dead block has a `Link.args` operand
+        // that is not defined in its source block (an inputarg or op
+        // result).  A model-reachable raise lowers to `set_raise`, whose
+        // orphan etype/evalue are exactly such operands, so the graph is a
+        // guaranteed real-path Skip — Pass 2 leaves those exceptblock /
+        // returnblock links untouched, so scan every reachable block's
+        // links here.  Threading framestate phis into a graph that will
+        // Skip buys no census drain (it cannot Match) and hands the phis to
+        // the legacy fallback, which cannot type non-startblock inputargs
+        // and miscolours them `GcRef` (assembler Ref/Int mismatch).
+        // Decline such graphs to the monotonic lowering, which the legacy
+        // path consumes exactly as today; the decline is drain-neutral
+        // because a Match is impossible while the orphan operand stands.
+        for &bb in &rpo {
+            let bb_id = self.block_id[bb];
+            if self.graph.block(bb_id).dead {
+                continue;
+            }
+            let undefined: Option<u64> = self
+                .graph
+                .block(bb_id)
+                .exits
+                .iter()
+                .flat_map(|l| l.args.iter())
+                .find_map(|arg| match arg {
+                    LinkArg::Value(var) if !self.graph.variable_defined_in_block(bb_id, var) => {
+                        Some(var.id())
+                    }
+                    _ => None,
+                });
+            if let Some(id) = undefined {
+                return Err(LowerError::Unsupported(format!(
+                    "framestate: declines graph {:?} — reachable bb{bb} (BlockId {:?}) has a \
+                     Link.args operand (var id={id}) undefined at its source (real-path adapter \
+                     would Skip; monotonic lowering is legacy-safe)",
+                    self.graph.name, bb_id,
+                )));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Diagnostic dump for a framestate threading that would emit a
+    /// `Link.arg` undefined at its source block.  Gated behind
+    /// `PYRE_MIR_FRAMESTATE_DEBUG`.  Prints the source / target block
+    /// shapes and both framestates so the alignment bug can be located.
+    #[allow(clippy::too_many_arguments)]
+    fn debug_dump_undefined_link_arg(
+        &self,
+        bb: usize,
+        bb_id: BlockId,
+        tgt: BlockId,
+        tmir: usize,
+        var: &Variable,
+        ex: &FrameState,
+        tgt_state: &FrameState,
+    ) {
+        let id_list = |entries: &[Option<Variable>]| -> String {
+            entries
+                .iter()
+                .map(|e| match e {
+                    Some(v) => v.id().to_string(),
+                    None => "_".to_string(),
+                })
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        let src = self.graph.block(bb_id);
+        let src_inputargs: Vec<u64> = src.inputargs.iter().map(|v| v.id()).collect();
+        let src_op_results: Vec<u64> = src
+            .operations
+            .iter()
+            .filter_map(|op| op.result.as_ref().map(|v| v.id()))
+            .collect();
+        eprintln!(
+            "[FRAMESTATE undefined-link-arg] graph={:?}\n  edge bb{bb}({:?}) -> bb{tmir}({:?})\n  \
+             undefined var id={}\n  src.inputargs ids=[{:?}]\n  src.op_result ids=[{:?}]\n  \
+             ex.entries ids=[{}]\n  tgt_state.entries ids=[{}]\n  \
+             tgt_state.locals_w.len={} ex.locals_w.len={}",
+            self.graph.name,
+            bb_id,
+            tgt,
+            var.id(),
+            src_inputargs,
+            src_op_results,
+            id_list(&ex.entries),
+            id_list(&tgt_state.entries),
+            tgt_state.locals_w.len(),
+            ex.locals_w.len(),
+        );
     }
 
     fn lower_block(&mut self, mir_bb: usize) -> Result<(), LowerError> {

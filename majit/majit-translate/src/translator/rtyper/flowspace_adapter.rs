@@ -1942,6 +1942,12 @@ pub fn function_graph_to_flowspace(
     let mut constant_concretetypes: HashMap<Variable, LowLevelType> = HashMap::new();
 
     for legacy_block in &legacy.blocks {
+        // Dead blocks are pruned from the flowspace (`remove_dead_blocks`
+        // parity), so their const-defines are never referenced — skip them
+        // here too rather than stamp concretetypes onto orphan cells.
+        if legacy_block.dead {
+            continue;
+        }
         for legacy_op in &legacy_block.operations {
             if let Some(hlvalue) = legacy_const_define_hlvalue(legacy_op) {
                 // `legacy_const_define_hlvalue` only returns `Some` for ops
@@ -1985,7 +1991,15 @@ pub fn function_graph_to_flowspace(
     let mut block_inputarg_vars: HashMap<BlockId, Vec<(Variable, Variable)>> = HashMap::new();
 
     for legacy_block in &legacy.blocks {
-        if legacy_block.id == legacy.returnblock || legacy_block.id == legacy.exceptblock {
+        // `dead` blocks are removed before annotation (`remove_dead_blocks`
+        // parity).  Nothing on the monotonic path marks `dead`, so this is
+        // inert there; the framestate path marks model-unreachable orphan
+        // `on_unwind` blocks dead.  Skipping Pass 1 alloc keeps them out of
+        // `block_map`, which Pass 2 must mirror (it indexes `block_map`).
+        if legacy_block.dead
+            || legacy_block.id == legacy.returnblock
+            || legacy_block.id == legacy.exceptblock
+        {
             continue;
         }
         let mut local_inputs: Vec<(Variable, Variable)> =
@@ -2085,7 +2099,14 @@ pub fn function_graph_to_flowspace(
     // ──────────────────────────────────────────────────────────────
 
     for legacy_block in &legacy.blocks {
-        if legacy_block.id == legacy.returnblock || legacy_block.id == legacy.exceptblock {
+        // Mirror Pass 1's skip set exactly — a `dead` block has no
+        // `block_map` entry, so translating it would panic at the index
+        // below.  See the Pass 1 comment for the `remove_dead_blocks`
+        // rationale.
+        if legacy_block.dead
+            || legacy_block.id == legacy.returnblock
+            || legacy_block.id == legacy.exceptblock
+        {
             continue;
         }
         let block_ref = block_map[&legacy_block.id].clone();
