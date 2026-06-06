@@ -2072,29 +2072,28 @@ impl<'a> Lowering<'a> {
     ) -> Result<(), LowerError> {
         let bb_id = self.block_id[mir_bb];
         let discr_var = self.resolve_operand(mir_bb, discr)?;
-        let mut links: Vec<Link> = Vec::new();
         match targets {
             SwitchTargets::If(then_bb, else_bb) => {
-                links.push(
-                    Link::new_mixed(
-                        vec![],
-                        self.block_id[else_bb as usize],
-                        Some(ExitCase::Bool(false)),
-                    )
-                    .with_prevblock(bb_id)
-                    .with_llexitcase_from_exitcase(),
+                // Route through `set_branch` so the cond gets the
+                // upstream `bool` UnaryOp wrap before becoming the
+                // exitswitch (flowcontext.py:756
+                // `Variable.bool().eval(self)`).  Necessary because the
+                // MIR discriminant for an `If` target can be a Ref
+                // (e.g. a SyntheticTransparentCtor result) whereas
+                // jit_codewriter/assembler.rs::FlatOp::GotoIfNot expects
+                // `cond.kind == RegKind::Int`.
+                self.graph.set_branch(
+                    bb_id,
+                    discr_var,
+                    self.block_id[then_bb as usize],
+                    vec![],
+                    self.block_id[else_bb as usize],
+                    vec![],
                 );
-                links.push(
-                    Link::new_mixed(
-                        vec![],
-                        self.block_id[then_bb as usize],
-                        Some(ExitCase::Bool(true)),
-                    )
-                    .with_prevblock(bb_id)
-                    .with_llexitcase_from_exitcase(),
-                );
+                Ok(())
             }
             SwitchTargets::SwitchInt(_int_ty, arms, default) => {
+                let mut links: Vec<Link> = Vec::new();
                 for (scalar, bb) in arms {
                     let case = scalar_to_const_value(&scalar).ok_or_else(|| {
                         LowerError::Unsupported(format!(
@@ -2119,11 +2118,11 @@ impl<'a> Lowering<'a> {
                     )
                     .with_prevblock(bb_id),
                 );
+                self.graph.block_mut(bb_id).exitswitch = Some(ExitSwitch::Value(discr_var));
+                self.graph.closeblock(bb_id, links);
+                Ok(())
             }
         }
-        self.graph.block_mut(bb_id).exitswitch = Some(ExitSwitch::Value(discr_var));
-        self.graph.closeblock(bb_id, links);
-        Ok(())
     }
 }
 
