@@ -621,10 +621,7 @@ impl OptString {
         {
             if let Some(ch_ref) = self.strgetitem(str_ref, idx, ctx) {
                 let b_old = BoxRef::from_bound_op(op_rc);
-                let b_new = ctx
-                    .get_box_replacement_box(ch_ref)
-                    .or_else(|| ctx.ensure_box(ch_ref))
-                    .expect("body-namespace OpRef must have a BoxRef slot");
+                let b_new = ctx.get_box_replacement(ch_ref);
                 ctx.make_equal_to(&b_old, &b_new);
                 return OptimizationResult::Remove;
             }

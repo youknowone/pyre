@@ -3015,10 +3015,7 @@ impl OptRewrite {
             {
                 if v == 1.0 {
                     let b_old = BoxRef::from_bound_op(op_rc);
-                    let b_v2 = ctx
-                        .get_box_replacement_box(rhs.to_opref())
-                        .or_else(|| ctx.ensure_box(rhs.to_opref()))
-                        .expect("body-namespace OpRef must have a BoxRef slot");
+                    let b_v2 = ctx.get_box_replacement(rhs.to_opref());
                     ctx.make_equal_to(&b_old, &b_v2);
                     return OptimizationResult::Remove;
                 }
@@ -3556,10 +3553,7 @@ impl Optimization for OptRewrite {
                             LoopInvariantEntry::Direct(r) => r,
                         };
                         let b_old = BoxRef::from_bound_op(op_rc);
-                        let b_cached = ctx
-                            .get_box_replacement_box(cached_result)
-                            .or_else(|| ctx.ensure_box(cached_result))
-                            .expect("body-namespace OpRef must have a BoxRef slot");
+                        let b_cached = ctx.get_box_replacement(cached_result);
                         ctx.make_equal_to(&b_old, &b_cached);
                         ctx.last_op_removed = true;
                         return OptimizationResult::Remove;
