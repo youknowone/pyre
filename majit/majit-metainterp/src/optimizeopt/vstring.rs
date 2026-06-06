@@ -829,7 +829,7 @@ impl OptString {
             1u8
         };
         // OpRef → BoxRef shim until this caller migrates (Phase D-2).
-        if let Some(arg0_box) = ctx.ensure_box(op.arg(0).to_opref()) {
+        if let Some(arg0_box) = ctx.get_box_replacement_box(op.arg(0).to_opref()) {
             ctx.make_nonnull_str(&arg0_box, mode);
         }
         let str_ref = ctx.get_box_replacement(op.arg(0).to_opref()).to_opref();
@@ -898,10 +898,10 @@ impl OptString {
             let vleft = ctx.get_box_replacement(op.arg(1).to_opref()).to_opref();
             let vright = ctx.get_box_replacement(op.arg(2).to_opref()).to_opref();
             // OpRef → BoxRef shim until this caller migrates (Phase D-2).
-            if let Some(vleft_box) = ctx.ensure_box(vleft) {
+            if let Some(vleft_box) = ctx.get_box_replacement_box(vleft) {
                 ctx.make_nonnull_str(&vleft_box, mode);
             }
-            if let Some(vright_box) = ctx.ensure_box(vright) {
+            if let Some(vright_box) = ctx.get_box_replacement_box(vright) {
                 ctx.make_nonnull_str(&vright_box, mode);
             }
             let b = BoxRef::from_bound_op(op_rc);
@@ -938,7 +938,7 @@ impl OptString {
         if op.num_args() >= 4 {
             let mut s = ctx.get_box_replacement(op.arg(1).to_opref()).to_opref();
             // OpRef → BoxRef shim until this caller migrates (Phase D-2).
-            if let Some(s_box) = ctx.ensure_box(s) {
+            if let Some(s_box) = ctx.get_box_replacement_box(s) {
                 ctx.make_nonnull_str(&s_box, mode);
             }
             let mut start = ctx.get_box_replacement(op.arg(2).to_opref()).to_opref();
@@ -1080,7 +1080,7 @@ impl OptString {
                 if self.is_known_nonnull(arg1, ctx) {
                     // vstring.py:745: self.make_nonnull_str(arg1, mode)
                     // OpRef → BoxRef shim until this caller migrates (Phase D-2).
-                    if let Some(arg1_box) = ctx.ensure_box(arg1) {
+                    if let Some(arg1_box) = ctx.get_box_replacement_box(arg1) {
                         ctx.make_nonnull_str(&arg1_box, mode);
                     }
                     // vstring.py:747: lengthbox = i1.getstrlen(arg1, self, mode)
@@ -1182,10 +1182,10 @@ impl OptString {
         };
         // vstring.py:795-805: l2info = self.getintbound(l2box)
         if let Some(l2ref) = l2box {
-            let l2info = ctx
-                .ensure_box(l2ref)
-                .map(|b| ctx.getintbound_handle(&b).borrow().clone())
-                .expect("getintbound: operand must resolve to a BoxRef");
+            let l2info = {
+                let b = ctx.get_box_replacement(l2ref);
+                ctx.getintbound_handle(&b).borrow().clone()
+            };
             if l2info.is_constant() && l2info.get_constant_int() == 1 {
                 // vstring.py:799: vchar = self.strgetitem(None, arg2, CONST_0, mode)
                 if let Some(vchar) = self.strgetitem(arg2, 0, ctx) {
@@ -1308,9 +1308,7 @@ impl OptString {
             ) {
                 let result = self.int_sub(char1, char2, ctx);
                 let b_old = BoxRef::from_bound_op(op_rc);
-                let b_result = ctx
-                    .ensure_box(result)
-                    .expect("body-namespace OpRef must have a BoxRef slot");
+                let b_result = ctx.get_box_replacement(result);
                 ctx.make_equal_to(&b_old, &b_result);
                 return OptimizationResult::Remove;
             }
@@ -1360,8 +1358,7 @@ impl OptString {
     ) -> OptimizationResult {
         if op.num_args() >= 3 {
             let arg1_box = ctx
-                .get_box_replacement_box(op.arg(1).to_opref())
-                .or_else(|| ctx.ensure_box(op.arg(1).to_opref()));
+                .get_box_replacement_box(op.arg(1).to_opref());
             let length = ctx
                 .get_box_replacement_box(op.arg(2).to_opref())
                 .and_then(|b| ctx.get_constant_int_box(&b));
