@@ -537,7 +537,7 @@ impl OptString {
     /// length is a small constant; otherwise install a non-virtual StrPtrInfo
     /// and emit the op. `postprocess_NEWSTR` (vstring.py:455-459) registers
     /// `pure(STRLEN, op) = length_arg` for CSE via the pure cache.
-    fn _optimize_newstr(&mut self, op: &Op, mode: u8, ctx: &mut OptContext) -> OptimizationResult {
+    fn _optimize_newstr(&mut self, op: &Op, op_rc: &majit_ir::OpRc, mode: u8, ctx: &mut OptContext) -> OptimizationResult {
         let len_ref = op.arg(0).to_opref();
         if let Some(len) = ctx
             .get_box_replacement_box(len_ref)
@@ -545,9 +545,7 @@ impl OptString {
         {
             if len >= 0 && (len as usize) <= MAX_CONST_LEN {
                 // vstring.py:450: self.make_vstring_plain(op, mode, length)
-                let b = ctx
-                    .ensure_box(op.pos.get())
-                    .expect("body-namespace OpRef must have a BoxRef slot");
+                let b = BoxRef::from_bound_op(op_rc);
                 {
                     ctx.set_ptr_info(
                         &b,
@@ -569,9 +567,8 @@ impl OptString {
         }
         // vstring.py:452: self.make_nonnull_str(op, mode); return self.emit(op)
         // OpRef → BoxRef shim until this caller migrates (Phase D-2).
-        if let Some(op_box) = ctx.ensure_box(op.pos.get()) {
-            ctx.make_nonnull_str(&op_box, mode);
-        }
+        let op_box = BoxRef::from_bound_op(op_rc);
+        ctx.make_nonnull_str(&op_box, mode);
         // vstring.py:455-459 postprocess_NEWSTR / postprocess_NEWUNICODE:
         //   self.pure_from_args1(mode.STRLEN, op, op.getarg(0))
         let strlen_opcode = if mode == 1 {
@@ -614,7 +611,7 @@ impl OptString {
     }
 
     /// Handle STRGETITEM: if source is virtual, resolve the character.
-    fn optimize_strgetitem(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
+    fn optimize_strgetitem(&mut self, op: &Op, op_rc: &majit_ir::OpRc, ctx: &mut OptContext) -> OptimizationResult {
         let str_ref = ctx.get_box_replacement(op.arg(0).to_opref()).to_opref();
         let idx_ref = op.arg(1).to_opref();
 
@@ -623,9 +620,7 @@ impl OptString {
             .and_then(|b_| ctx.get_constant_int_box(&b_))
         {
             if let Some(ch_ref) = self.strgetitem(str_ref, idx, ctx) {
-                let b_old = ctx
-                    .ensure_box(op.pos.get())
-                    .expect("body-namespace OpRef must have a BoxRef slot");
+                let b_old = BoxRef::from_bound_op(op_rc);
                 let b_new = ctx
                     .get_box_replacement_box(ch_ref)
                     .or_else(|| ctx.ensure_box(ch_ref))
@@ -640,7 +635,7 @@ impl OptString {
     }
 
     /// vstring.py:525-533 _optimize_STRLEN
-    fn optimize_strlen(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
+    fn optimize_strlen(&mut self, op: &Op, op_rc: &majit_ir::OpRc, ctx: &mut OptContext) -> OptimizationResult {
         let mode = if op.opcode == OpCode::Unicodelen {
             1u8
         } else {
@@ -656,9 +651,7 @@ impl OptString {
             // vstring.py:529: lgtop = opinfo.getstrlen(arg1, self, mode)
             let lgtop = ctx.getstrlen_opref(op.arg(0).to_opref(), mode);
             // vstring.py:531: self.make_equal_to(op, lgtop)
-            let b_old = ctx
-                .ensure_box(op.pos.get())
-                .expect("body-namespace OpRef must have a BoxRef slot");
+            let b_old = BoxRef::from_bound_op(op_rc);
             let b_lgtop = ctx
                 .ensure_box(lgtop)
                 .expect("body-namespace OpRef must have a BoxRef slot");
@@ -855,19 +848,20 @@ impl OptString {
     fn optimize_oopspec_call(
         &mut self,
         op: &Op,
+        op_rc: &majit_ir::OpRc,
         ei: &EffectInfo,
         ctx: &mut OptContext,
     ) -> OptimizationResult {
         match ei.oopspecindex {
-            OopSpecIndex::StrConcat => self.opt_call_stroruni_str_concat(op, mode_string, ctx),
-            OopSpecIndex::StrSlice => self.opt_call_stroruni_str_slice(op, mode_string, ctx),
+            OopSpecIndex::StrConcat => self.opt_call_stroruni_str_concat(op, op_rc, mode_string, ctx),
+            OopSpecIndex::StrSlice => self.opt_call_stroruni_str_slice(op, op_rc, mode_string, ctx),
             OopSpecIndex::StrEqual => self.opt_call_stroruni_str_equal(op, mode_string, ctx),
-            OopSpecIndex::StrCmp => self.opt_call_stroruni_str_cmp(op, mode_string, ctx),
-            OopSpecIndex::UniConcat => self.opt_call_stroruni_str_concat(op, mode_unicode, ctx),
-            OopSpecIndex::UniSlice => self.opt_call_stroruni_str_slice(op, mode_unicode, ctx),
+            OopSpecIndex::StrCmp => self.opt_call_stroruni_str_cmp(op, op_rc, mode_string, ctx),
+            OopSpecIndex::UniConcat => self.opt_call_stroruni_str_concat(op, op_rc, mode_unicode, ctx),
+            OopSpecIndex::UniSlice => self.opt_call_stroruni_str_slice(op, op_rc, mode_unicode, ctx),
             OopSpecIndex::UniEqual => self.opt_call_stroruni_str_equal(op, mode_unicode, ctx),
-            OopSpecIndex::UniCmp => self.opt_call_stroruni_str_cmp(op, mode_unicode, ctx),
-            OopSpecIndex::ShrinkArray => self.opt_call_shrink_array(op, ctx),
+            OopSpecIndex::UniCmp => self.opt_call_stroruni_str_cmp(op, op_rc, mode_unicode, ctx),
+            OopSpecIndex::ShrinkArray => self.opt_call_shrink_array(op, op_rc, ctx),
             _ => {
                 self.force_args_if_virtual(op, ctx);
                 OptimizationResult::PassOn
@@ -879,6 +873,7 @@ impl OptString {
     fn opt_call_stroruni_str_concat(
         &mut self,
         op: &Op,
+        op_rc: &majit_ir::OpRc,
         mode: u8,
         ctx: &mut OptContext,
     ) -> OptimizationResult {
@@ -892,9 +887,7 @@ impl OptString {
             if let Some(vright_box) = ctx.ensure_box(vright) {
                 ctx.make_nonnull_str(&vright_box, mode);
             }
-            let b = ctx
-                .ensure_box(op.pos.get())
-                .expect("body-namespace OpRef must have a BoxRef slot");
+            let b = BoxRef::from_bound_op(op_rc);
             ctx.set_ptr_info(
                 &b,
                 PtrInfo::Str(StrPtrInfo {
@@ -921,6 +914,7 @@ impl OptString {
     fn opt_call_stroruni_str_slice(
         &mut self,
         op: &Op,
+        op_rc: &majit_ir::OpRc,
         mode: u8,
         ctx: &mut OptContext,
     ) -> OptimizationResult {
@@ -941,9 +935,7 @@ impl OptString {
             }
             // vstring.py:220-225: VStringSliceInfo.__init__ sets
             // self.lgtop = length on the inherited StrPtrInfo field.
-            let b = ctx
-                .ensure_box(op.pos.get())
-                .expect("body-namespace OpRef must have a BoxRef slot");
+            let b = BoxRef::from_bound_op(op_rc);
             ctx.set_ptr_info(
                 &b,
                 PtrInfo::Str(StrPtrInfo {
@@ -1262,6 +1254,7 @@ impl OptString {
     fn opt_call_stroruni_str_cmp(
         &mut self,
         op: &Op,
+        op_rc: &majit_ir::OpRc,
         mode: u8,
         ctx: &mut OptContext,
     ) -> OptimizationResult {
@@ -1297,9 +1290,7 @@ impl OptString {
                 self.strgetitem(op.arg(2).to_opref(), 0, ctx),
             ) {
                 let result = self.int_sub(char1, char2, ctx);
-                let b_old = ctx
-                    .ensure_box(op.pos.get())
-                    .expect("body-namespace OpRef must have a BoxRef slot");
+                let b_old = BoxRef::from_bound_op(op_rc);
                 let b_result = ctx
                     .ensure_box(result)
                     .expect("body-namespace OpRef must have a BoxRef slot");
@@ -1344,7 +1335,7 @@ impl OptString {
     ///         return True
     ///     return False
     /// ```
-    fn opt_call_shrink_array(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
+    fn opt_call_shrink_array(&mut self, op: &Op, op_rc: &majit_ir::OpRc, ctx: &mut OptContext) -> OptimizationResult {
         if op.num_args() >= 3 {
             let arg1_box = ctx
                 .get_box_replacement_box(op.arg(1).to_opref())
@@ -1372,9 +1363,7 @@ impl OptString {
                     .unwrap_or(false);
                 if did_shrink {
                     // vstring.py:849: self.make_equal_to(op, op.getarg(1))
-                    let b_old = ctx
-                        .ensure_box(op.pos.get())
-                        .expect("body-namespace OpRef must have a BoxRef slot");
+                    let b_old = BoxRef::from_bound_op(op_rc);
                     let b_arg1 = arg1_box.expect("body-namespace OpRef must have a BoxRef slot");
                     ctx.make_equal_to(&b_old, &b_arg1);
                     return OptimizationResult::Remove;
@@ -1393,22 +1382,22 @@ impl Default for OptString {
 }
 
 impl Optimization for OptString {
-    fn propagate_forward(&mut self, op: &Op, _op_rc: &majit_ir::OpRc, ctx: &mut OptContext) -> OptimizationResult {
+    fn propagate_forward(&mut self, op: &Op, op_rc: &majit_ir::OpRc, ctx: &mut OptContext) -> OptimizationResult {
         match op.opcode {
             // vstring.py:440-444 optimize_NEWSTR / optimize_NEWUNICODE:
             // both dispatch to _optimize_NEWSTR(op, mode).
-            OpCode::Newstr => self._optimize_newstr(op, mode_string, ctx),
-            OpCode::Newunicode => self._optimize_newstr(op, mode_unicode, ctx),
+            OpCode::Newstr => self._optimize_newstr(op, op_rc, mode_string, ctx),
+            OpCode::Newunicode => self._optimize_newstr(op, op_rc, mode_unicode, ctx),
             OpCode::Strsetitem => self.optimize_strsetitem(op, ctx),
-            OpCode::Strgetitem => self.optimize_strgetitem(op, ctx),
-            OpCode::Strlen => self.optimize_strlen(op, ctx),
+            OpCode::Strgetitem => self.optimize_strgetitem(op, op_rc, ctx),
+            OpCode::Strlen => self.optimize_strlen(op, op_rc, ctx),
             OpCode::Copystrcontent => self.optimize_copystrcontent(op, mode_string, ctx),
 
             // vstring.py: Unicode operations — same logic as string ops
             // but with unicode-specific opcodes.
             OpCode::Unicodesetitem => self.optimize_strsetitem(op, ctx),
-            OpCode::Unicodegetitem => self.optimize_strgetitem(op, ctx),
-            OpCode::Unicodelen => self.optimize_strlen(op, ctx),
+            OpCode::Unicodegetitem => self.optimize_strgetitem(op, op_rc, ctx),
+            OpCode::Unicodelen => self.optimize_strlen(op, op_rc, ctx),
             OpCode::Copyunicodecontent => self.optimize_copystrcontent(op, mode_unicode, ctx),
 
             // vstring.py: STRHASH/UNICODEHASH — force virtual string and emit.
@@ -1445,7 +1434,7 @@ impl Optimization for OptString {
                     if let Some(cd) = descr.as_call_descr() {
                         let ei = cd.get_extra_info();
                         if ei.has_oopspec() {
-                            return self.optimize_oopspec_call(op, &ei, ctx);
+                            return self.optimize_oopspec_call(op, op_rc, &ei, ctx);
                         }
                     }
                 }
@@ -1524,7 +1513,9 @@ mod tests {
             for i in 0..resolved_op.num_args() {
                 resolved_op.setarg(i, ctx.get_box_replacement(resolved_op.arg(i).to_opref()));
             }
-            match pass.propagate_forward(&resolved_op, &std::rc::Rc::new(resolved_op.clone()), &mut ctx) {
+            let resolved_rc = std::rc::Rc::new(resolved_op.clone());
+            ctx.bind_input_resops(std::slice::from_ref(&resolved_rc));
+            match pass.propagate_forward(&resolved_op, &resolved_rc, &mut ctx) {
                 OptimizationResult::Emit(emitted) => {
                     ctx.emit(emitted);
                 }
@@ -2272,7 +2263,9 @@ mod tests {
         ctx.make_constant(OpRef::int_op(200), Value::Int(2));
 
         // Process NEWSTR → creates virtual Plain
-        let _ = pass.propagate_forward(&left_op, &std::rc::Rc::new(left_op.clone()), &mut ctx);
+        let left_op_rc = std::rc::Rc::new(left_op.clone());
+        ctx.bind_input_resops(std::slice::from_ref(&left_op_rc));
+        let _ = pass.propagate_forward(&left_op, &left_op_rc, &mut ctx);
         assert!(pass.is_virtual(left, &ctx));
     }
 
