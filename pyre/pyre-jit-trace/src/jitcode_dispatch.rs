@@ -3470,12 +3470,13 @@ fn try_fold_pure_call_via_executor(
 ///   consume later; walker falls through as if this function did not
 ///   exist.
 ///
-/// **Wire status** (Task #390 sub-slice 2.2): this function is not yet
-/// invoked from any dispatch site.  Sub-slices 2.3+ wire it into the
-/// three dispatch entry points (`dispatch_residual_call_iRd_kind`,
+/// **Wire status** (Task #390 sub-slice 2.3): invoked from all three
+/// dispatch entry points (`dispatch_residual_call_iRd_kind`,
 /// `dispatch_residual_call_iIRd_kind`, `dispatch_residual_call_iIRFd_kind`)
-/// alongside [`try_fold_pure_call_via_executor`].
-#[allow(dead_code)]
+/// alongside [`try_fold_pure_call_via_executor`], gated on
+/// `!can_raise`.  Sub-slice 3 will widen the gate to `can_raise=true`
+/// once BH exception propagation through `WalkContext.last_exc_value`
+/// is in place.
 fn try_execute_residual_call_via_executor(
     ctx: &mut WalkContext<'_, '_>,
     call_opcode: OpCode,
@@ -4456,6 +4457,22 @@ fn dispatch_residual_call_iRd_kind(
         // call opcodes.
         try_fold_pure_call_via_executor(ctx, call_opcode, &allboxes, call_descr, recorded);
 
+        // pyjitpl.py:1346/1349/1354 `_opimpl_residual_call{1,2,3}`
+        // parity for the non-elidable shapes (Task #390 sub-slice 2.3).
+        // Activate only when `can_raise=false`: BH exception propagation
+        // through `WalkContext.last_exc_value` lands in sub-slice 3.
+        // M4 SIGBUS root cause (store_subscr_fn / set_current_exception)
+        // sits on `can_raise=true` paths and is unblocked once 3 lands.
+        if !can_raise {
+            let _ = try_execute_residual_call_via_executor(
+                ctx,
+                call_opcode,
+                &allboxes,
+                call_descr,
+                recorded,
+            );
+        }
+
         // pyjitpl.py:2659 `_record_helper_varargs` parity: every
         // recorded varargs op invalidates the heapcache via
         // `heapcache.invalidate_caches_varargs(opnum, descr,
@@ -4644,6 +4661,18 @@ fn dispatch_residual_call_iIRd_kind(
         // `dispatch_residual_call_iRd_kind` for the upstream walk.
         try_fold_pure_call_via_executor(ctx, call_opcode, &allboxes, call_descr, recorded);
 
+        // Non-elidable concrete-execute parity (Task #390 sub-slice 2.3)
+        // — see `dispatch_residual_call_iRd_kind` for the full citation.
+        if !can_raise {
+            let _ = try_execute_residual_call_via_executor(
+                ctx,
+                call_opcode,
+                &allboxes,
+                call_descr,
+                recorded,
+            );
+        }
+
         // pyjitpl.py:2659 `_record_helper_varargs` parity — see
         // `dispatch_residual_call_iRd_kind` for the upstream-citation
         // walkthrough.  Same invalidation semantics; only the
@@ -4774,6 +4803,18 @@ fn dispatch_residual_call_iIRFd_kind(
         // pyjitpl.py:1346-1400 `_record_helper_pure` parity — see
         // `dispatch_residual_call_iRd_kind` for the upstream walk.
         try_fold_pure_call_via_executor(ctx, call_opcode, &allboxes, call_descr, recorded);
+
+        // Non-elidable concrete-execute parity (Task #390 sub-slice 2.3)
+        // — see `dispatch_residual_call_iRd_kind` for the full citation.
+        if !can_raise {
+            let _ = try_execute_residual_call_via_executor(
+                ctx,
+                call_opcode,
+                &allboxes,
+                call_descr,
+                recorded,
+            );
+        }
 
         ctx.trace_ctx
             .heapcache_invalidate_caches_varargs(call_opcode, Some(ei), &allboxes);
