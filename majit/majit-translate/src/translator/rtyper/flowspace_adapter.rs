@@ -706,7 +706,6 @@ pub fn translate_op(
     // callsites surface a distinct fail-loud message; producers
     // must pre-register every reachable FunctionPath.
     call_registry: &crate::translator::rtyper::pyre_call_registry::PyreCallRegistry,
-    graph: &crate::model::FunctionGraph,
 ) -> Result<Vec<FlowspaceOp>, TyperError> {
     // Unit-variant ctors (`StepResult::Continue`, `LoopResult::Done`, …)
     // pre-fold to `Hlvalue::Constant(HostObject(prebuilt_instance))` in the
@@ -1156,23 +1155,7 @@ pub fn translate_op(
                     // `LOAD_GLOBAL <module>` + `LOAD_ATTR <attr>` chain
                     // (`flowcontext.py:845-866`) consults the caller's
                     // per-function `frame.globals` first, falling back
-                    // to `builtins` if absent.  Pyre's equivalent of
-                    // `frame.globals` is the caller graph's per-file
-                    // `use_imports` map (program-wide aggregate on
-                    // [`PyreCallRegistry::use_imports`], keyed by
-                    // `(source_module, alias)`), populated from
-                    // `ParsedInterpreter.use_imports` at lib.rs
-                    // `analyze_files`.  Resolution order:
-                    //
-                    // 3a. `segments[0]` is an alias the caller graph's
-                    //     source file imported via `use X::Y as alias`
-                    //     or `use X::Y::alias` — `lookup_use_import`
-                    //     returns the canonical dotted module prefix
-                    //     (`rpython.rtyper.lltypesystem.lltype`), then
-                    //     `HOST_ENV.import_module(prefix).module_get(
-                    //     attr)` produces the attribute HostObject.
-                    //     Mirrors upstream's `frame.globals[<alias>]`
-                    //     hit branch.
+                    // to `builtins` if absent.  Resolution order:
                     //
                     // 3b. `segments` already
                     //     spell out the fully-qualified Rust path
@@ -1187,43 +1170,18 @@ pub fn translate_op(
                     //     A production callsite relies on this branch
                     //     (a tracing-time `OpKind::Call::FunctionPath`
                     //     with segments spelling a curated HOST_ENV
-                    //     module without a matching `use_imports`
-                    //     entry), so removing the branch fails the
+                    //     module), so removing the branch fails the
                     //     strict gate (cranelift fib_recursive +
                     //     fannkuch TIMEOUT).
                     //
                     // 3c. Unknown prefix — `TyperError` (caller must
                     //     register the path or import the prefix).
-                    let resolve_via_use_imports =
-                        || -> Option<crate::flowspace::model::HostObject> {
-                            if segments.len() < 2 {
-                                return None;
-                            }
-                            let source_module = graph.source_module.as_deref()?;
-                            let dotted_prefix =
-                                call_registry.lookup_use_import(source_module, &segments[0])?;
-                            let mut full_segments: Vec<String> =
-                                dotted_prefix.split('.').map(str::to_string).collect();
-                            full_segments.extend(segments[1..].iter().cloned());
-                            if full_segments.len() < 2 {
-                                return None;
-                            }
-                            let module = HOST_ENV.import_module(
-                                &full_segments[..full_segments.len() - 1].join("."),
-                            )?;
-                            module.module_get(&full_segments[full_segments.len() - 1])
-                        };
                     let callable_host = if let Some(entry) = call_registry.lookup(&key) {
                         entry.host_object.clone()
                     } else if segments.len() == 1
                         && let Some(builtin) = HOST_ENV.lookup_builtin(&segments[0])
                     {
                         builtin
-                    } else if let Some(attr) = resolve_via_use_imports() {
-                        // Branch 3a — caller imported `segments[0]`;
-                        // upstream-orthodox `frame.globals[<alias>]`
-                        // resolution path.
-                        attr
                     } else if segments.len() >= 2
                         && let Some(module) =
                             HOST_ENV.import_module(&segments[..segments.len() - 1].join("."))
@@ -1267,7 +1225,7 @@ pub fn translate_op(
                         exc_class
                     } else if let Some(entry) = call_registry.lookup_with_leaf_match(&key) {
                         // Fuzzy leaf-match is the last registry fallback.
-                        // Exact registry entries, lexical imports, HOST_ENV
+                        // Exact registry entries, HOST_ENV
                         // module paths, and the `simple_call(<exc class>)`
                         // raise reconstruction must win first so external
                         // stubs such as `BigInt::from`, `Vec::new`, and
@@ -2122,7 +2080,7 @@ pub fn function_graph_to_flowspace(
                         name_to_value.insert(name.to_string(), hlvalue);
                     }
                 }
-                translated_ops.extend(translate_op(legacy_op, &value_map, call_registry, legacy)?);
+                translated_ops.extend(translate_op(legacy_op, &value_map, call_registry)?);
                 continue;
             }
 
@@ -2186,7 +2144,7 @@ pub fn function_graph_to_flowspace(
                         )));
                     }
                 }
-                translated_ops.extend(translate_op(legacy_op, &value_map, call_registry, legacy)?);
+                translated_ops.extend(translate_op(legacy_op, &value_map, call_registry)?);
                 continue;
             }
 
@@ -2209,7 +2167,7 @@ pub fn function_graph_to_flowspace(
                     .or_insert_with(|| var.clone());
                 value_map.insert(result_var.clone(), Hlvalue::Variable(var));
             }
-            translated_ops.extend(translate_op(legacy_op, &value_map, call_registry, legacy)?);
+            translated_ops.extend(translate_op(legacy_op, &value_map, call_registry)?);
             if let Some(result_var) = legacy_op.result.as_ref() {
                 if let Some(name) = legacy.value_name_for(result_var) {
                     if let Some(value) = value_map.get(result_var).cloned() {
@@ -2736,7 +2694,7 @@ mod tests {
                 class_root: None,
             },
         };
-        let result = translate_op(&op, &value_map, &empty_call_registry(), &graph)
+        let result = translate_op(&op, &value_map, &empty_call_registry())
             .expect("Input must translate to skip");
         assert!(
             result.is_empty(),
@@ -2854,7 +2812,7 @@ mod tests {
             result: Some(graph.must_variable_at(1)),
             kind: OpKind::ConstInt(7),
         };
-        let result = translate_op(&op, &value_map, &empty_call_registry(), &graph)
+        let result = translate_op(&op, &value_map, &empty_call_registry())
             .expect("ConstInt must translate to skip");
         assert!(
             result.is_empty(),
@@ -2871,7 +2829,7 @@ mod tests {
             result: Some(graph.must_variable_at(1)),
             kind: OpKind::ConstFloat(0),
         };
-        let result = translate_op(&op, &value_map, &empty_call_registry(), &graph)
+        let result = translate_op(&op, &value_map, &empty_call_registry())
             .expect("ConstFloat must translate to skip");
         assert!(result.is_empty());
     }
@@ -2900,7 +2858,7 @@ mod tests {
                 result_ty: ValueType::Int,
             },
         };
-        let translated = translate_op(&op, &value_map, &empty_call_registry(), &graph)
+        let translated = translate_op(&op, &value_map, &empty_call_registry())
             .expect("BinOp arm must lower");
         assert_eq!(translated.len(), 1, "BinOp lowers to exactly one SpaceOp");
         let lowered = &translated[0];
@@ -2932,7 +2890,7 @@ mod tests {
                 result_ty: ValueType::Int,
             },
         };
-        let err = translate_op(&op, &value_map, &empty_call_registry(), &graph)
+        let err = translate_op(&op, &value_map, &empty_call_registry())
             .expect_err("undefined BinOp operand must surface invariant break");
         let msg = format!("{err}");
         assert!(msg.contains("undefined operand"));
@@ -2973,7 +2931,7 @@ mod tests {
                 result_ty: ValueType::Int,
             },
         };
-        let translated = translate_op(&op, &value_map, &registry, &graph)
+        let translated = translate_op(&op, &value_map, &registry)
             .expect("Call::FunctionPath must lower");
         assert_eq!(translated.len(), 1);
         let lowered = &translated[0];
@@ -3021,7 +2979,7 @@ mod tests {
                 result_ty: ValueType::Int,
             },
         };
-        let translated = translate_op(&op, &value_map, &empty_call_registry(), &graph)
+        let translated = translate_op(&op, &value_map, &empty_call_registry())
             .expect("Call::FunctionPath single-segment must fall back to HOST_ENV");
         assert_eq!(translated.len(), 1);
         let lowered = &translated[0];
@@ -3077,7 +3035,7 @@ mod tests {
                 result_ty: ValueType::Int,
             },
         };
-        let translated = translate_op(&op, &value_map, &empty_call_registry(), &graph)
+        let translated = translate_op(&op, &value_map, &empty_call_registry())
             .expect("Layer 3 host-module attr lookup must resolve lltype.cast_ptr_to_int");
         assert_eq!(translated.len(), 1);
         assert_eq!(translated[0].opname, "simple_call");
@@ -3125,7 +3083,7 @@ mod tests {
                 result_ty: ValueType::Int,
             },
         };
-        let err = translate_op(&op, &value_map, &empty_call_registry(), &graph)
+        let err = translate_op(&op, &value_map, &empty_call_registry())
             .expect_err("Unregistered FunctionPath must surface TyperError, not silently resolve");
         let msg = format!("{err}");
         assert!(
@@ -3160,7 +3118,7 @@ mod tests {
                 result_ty: ValueType::Ref(None),
             },
         };
-        let translated = translate_op(&op, &value_map, &empty_call_registry(), &graph)
+        let translated = translate_op(&op, &value_map, &empty_call_registry())
             .expect("Call::SyntheticTransparentCtor must lower");
         assert_eq!(translated.len(), 1);
         assert_eq!(translated[0].opname, "simple_call");
@@ -3204,7 +3162,7 @@ mod tests {
                 result_ty: ValueType::Bool,
             },
         };
-        let translated = translate_op(&op, &value_map, &empty_call_registry(), &graph)
+        let translated = translate_op(&op, &value_map, &empty_call_registry())
             .expect("OpKind::IsInstance must lower");
         assert_eq!(translated.len(), 1);
         assert_eq!(
@@ -3258,7 +3216,7 @@ mod tests {
                 result_ty: ValueType::Int,
             },
         };
-        let translated = translate_op(&op, &value_map, &empty_call_registry(), &graph)
+        let translated = translate_op(&op, &value_map, &empty_call_registry())
             .expect("Call::Method must lower");
         assert_eq!(translated.len(), 2);
         assert_eq!(translated[0].opname, "getattr");
@@ -3315,7 +3273,7 @@ mod tests {
                 result_ty: ValueType::Int,
             },
         };
-        let err = translate_op(&op, &value_map, &empty_call_registry(), &graph)
+        let err = translate_op(&op, &value_map, &empty_call_registry())
             .expect_err("Call::Indirect must surface rclass invariant break");
         let msg = format!("{err}");
         assert!(
@@ -3357,7 +3315,7 @@ mod tests {
                 result_ty: ValueType::Int,
             },
         };
-        let err = translate_op(&op, &value_map, &empty_call_registry(), &graph)
+        let err = translate_op(&op, &value_map, &empty_call_registry())
             .expect_err("IndirectCall must surface rpbc.rs invariant break");
         let msg = format!("{err}");
         assert!(
@@ -3388,7 +3346,7 @@ mod tests {
                 pure: false,
             },
         };
-        let translated = translate_op(&op, &value_map, &empty_call_registry(), &graph)
+        let translated = translate_op(&op, &value_map, &empty_call_registry())
             .expect("FieldRead arm must lower");
         assert_eq!(translated.len(), 1);
         let lowered = &translated[0];
@@ -3424,7 +3382,7 @@ mod tests {
                 ty: ValueType::Int,
             },
         };
-        let translated = translate_op(&op, &value_map, &empty_call_registry(), &graph)
+        let translated = translate_op(&op, &value_map, &empty_call_registry())
             .expect("FieldWrite arm must lower");
         assert_eq!(translated.len(), 1);
         let lowered = &translated[0];
@@ -3470,7 +3428,7 @@ mod tests {
                 nolength: false,
             },
         };
-        let translated = translate_op(&op, &value_map, &empty_call_registry(), &graph)
+        let translated = translate_op(&op, &value_map, &empty_call_registry())
             .expect("ArrayRead arm must lower");
         assert_eq!(translated.len(), 1);
         let lowered = &translated[0];
@@ -3505,7 +3463,7 @@ mod tests {
                 nolength: false,
             },
         };
-        let translated = translate_op(&op, &value_map, &empty_call_registry(), &graph)
+        let translated = translate_op(&op, &value_map, &empty_call_registry())
             .expect("ArrayWrite arm must lower");
         assert_eq!(translated.len(), 1);
         let lowered = &translated[0];
@@ -3543,7 +3501,7 @@ mod tests {
                 array_type_id: None,
             },
         };
-        let translated = translate_op(&op, &value_map, &empty_call_registry(), &graph)
+        let translated = translate_op(&op, &value_map, &empty_call_registry())
             .expect("InteriorFieldRead arm must lower");
         assert_eq!(translated.len(), 2);
         assert_eq!(translated[0].opname, "getitem");
@@ -3628,7 +3586,7 @@ mod tests {
                 array_type_id: None,
             },
         };
-        let translated = translate_op(&op, &value_map, &empty_call_registry(), &graph)
+        let translated = translate_op(&op, &value_map, &empty_call_registry())
             .expect("InteriorFieldWrite arm must lower");
         assert_eq!(translated.len(), 2);
         assert_eq!(translated[0].opname, "getitem");

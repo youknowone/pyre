@@ -686,19 +686,6 @@ fn analyze_pipeline_from_parsed(
         }};
     }
     mark_phase!("entry");
-    // Install the cross-file type-alias floor before any walker pass
-    // runs.  The floor is the union of every parsed file's top-level
-    // `type T = U;` declarations; it stays visible across the per-file
-    // walker calls that happen later in the pipeline (lazy
-    // `Translation::from_rust_*` creation).  Mirrors PyPy
-    // `Bookkeeper`'s whole-program import-resolution map — a struct
-    // field declared as `field: PyObjectRef` in `pyframe.rs` resolves
-    // through the alias declared in `pyobject.rs` regardless of
-    // walker iteration order.
-    let _walker_alias_floor =
-        crate::flowspace::rust_source::register::WalkerAliasFloorGuard::install(
-            parsed_files.iter().map(|p| &p.file),
-        );
     // `use <path>::*` glob roots are expanded into explicit
     // `use_imports` entries inside
     // `build_semantic_program_*_with_options` so the front-end
@@ -1057,29 +1044,13 @@ fn analyze_pipeline_from_parsed(
     // `arraydescrof_concrete` can fold field-level immutability into the
     // shared per-ARRAY descr's `is_pure` flag.
     call_control.recompute_immutable_array_types();
-    // Thread per-source-file `parsed.module_path` + `use_imports`
-    // into CallControl as data carriers (orthodox PyPy
-    // `bookkeeper.position` + `frame.f_globals` lexical-resolution
-    // entry points).
-    // Today's consumers normalise at the runtime path_hash boundary
-    // via `STRUCT_ORIGIN_REGISTRY` + `canonical_struct_name`; the
-    // carriers here let a future per-graph lexical resolver land
-    // without re-plumbing the parsed-source ingress.
+    // Thread per-source-file `parsed.module_path` into CallControl as a
+    // data carrier (orthodox PyPy `bookkeeper.position` lexical-resolution
+    // entry point).  Today's consumers normalise at the runtime path_hash
+    // boundary via `STRUCT_ORIGIN_REGISTRY` + `canonical_struct_name`; the
+    // carrier here lets a future per-graph lexical resolver land without
+    // re-plumbing the parsed-source ingress.
     call_control.parsed_module_paths = parsed_files.iter().map(|p| p.module_path.clone()).collect();
-    // `use_imports` aggregated across all parsed files —
-    // `parse::collect_use_imports` populates per-file map at
-    // `parse_source_with_module`; here we re-collect from the
-    // `ParsedInterpreter` slice the analyzer entry received.
-    let mut use_imports_agg: std::collections::HashMap<(String, String), String> =
-        std::collections::HashMap::new();
-    for parsed in parsed_files {
-        for (alias, full) in &parsed.use_imports {
-            use_imports_agg
-                .entry((parsed.module_path.clone(), alias.clone()))
-                .or_insert_with(|| full.clone());
-        }
-    }
-    call_control.use_imports = use_imports_agg;
     // Populate the metadata-only `unsafe_fn_stubs` carrier so the
     // codewriter's `dual_gate_registry` can register every `unsafe fn`
     // / unsafe impl-method as a stub-pygraph entry in PyreCallRegistry.

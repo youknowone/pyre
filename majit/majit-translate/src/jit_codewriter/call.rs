@@ -778,16 +778,6 @@ pub struct CallControl {
     /// per-file module path so a future per-graph lexical resolver
     /// (orthodox PyPy `getdesc` parity) can consume it.
     pub parsed_module_paths: Vec<String>,
-    /// Per-source-file `use` import map collected from
-    /// `ParsedInterpreter.use_imports` (`parse.rs::collect_use_imports`).
-    /// Keyed on `(source_module_path, alias)` → `fully_qualified_path`.
-    /// Mirrors PyPy bookkeeper's lexical/import-scope name resolution
-    /// (`annrpython.Bookkeeper.getdesc` + `frame.f_globals` lookups);
-    /// pyre's `qualify_type_name` does not yet consult this table,
-    /// awaiting the per-FunctionGraph use_imports carrier.
-    /// Populated here as the data
-    /// carrier so the future resolver lands without re-plumbing.
-    pub use_imports: HashMap<(String, String), String>,
     /// Metadata-only registration carrier — `(segments,
     /// Signature, return_lltype)` for every `unsafe fn` and unsafe
     /// impl-method discovered in the parsed source set.  These callees
@@ -1136,7 +1126,6 @@ impl CallControl {
             immutable_fields_by_struct: HashMap::new(),
             immutable_array_types: HashSet::new(),
             parsed_module_paths: Vec::new(),
-            use_imports: HashMap::new(),
             unsafe_fn_stubs: Vec::new(),
         }
     }

@@ -126,21 +126,6 @@ impl StructFieldRegistry {
             .map(|(_, ty)| ty.as_str())
     }
 
-    /// Per-scope `field_type` lookup: route `owner` through the call
-    /// site's `use_imports` + `module_prefix` first (PyPy
-    /// `frame.f_globals` analog) so a bare receiver leaf lands at the
-    /// canonical key before the program-wide bookkeeper fallback.
-    pub fn field_type_in_scope(
-        &self,
-        owner: &str,
-        field_name: &str,
-        prefix: &str,
-        use_imports: &HashMap<String, String>,
-    ) -> Option<&str> {
-        let canonical_owner = qualify_type_name_with_imports(owner, prefix, use_imports);
-        self.field_type(&canonical_owner, field_name)
-    }
-
     fn lookup_fields(&self, owner: &str) -> Option<&[(String, String)]> {
         if let Some(fields) = self.fields.get(owner) {
             return Some(fields.as_slice());
@@ -386,47 +371,6 @@ impl<'a> MirGraphLookup<'a> {
             Err(()) => None,
         }
     }
-}
-
-/// Qualify a bare type name with module prefix or, when the resolver
-/// knows the canonical defining module, with the canonical prefix.
-///
-/// Resolves a per-source `use <path> as alias` table first, then the
-/// program-wide `STRUCT_ORIGIN_REGISTRY` canonical-defining-module
-/// table, then falls back to `prefix::bare`.
-///
-/// `bookkeeper.py:353-409 getdesc` resolves a bare identifier first in
-/// the frame's `f_globals` (the file's own imports), then in the
-/// program-wide scope summary; pyre's `STRUCT_ORIGIN_REGISTRY` plays
-/// the role of the program-wide scope, while `use_imports` carries
-/// the per-source `f_globals` slice.
-///
-/// `use_imports` is expected to be `GraphBuildContext.use_imports` —
-/// each entry maps a local alias (`use other_mod::Foo as Q` →
-/// `Q → other_mod::Foo`, plain `use other_mod::Foo` →
-/// `Foo → other_mod::Foo`) to the fully-qualified path.  Pass
-/// `&HashMap::new()` when the call site has no per-source scope
-/// (parse-time registration, test fixtures, `lower_expr_into_graph`);
-/// resolution then reduces to `STRUCT_ORIGIN_REGISTRY` + `prefix::bare`.
-pub fn qualify_type_name_with_imports(
-    bare: &str,
-    prefix: &str,
-    use_imports: &HashMap<String, String>,
-) -> String {
-    if bare.contains("::") {
-        return bare.to_string();
-    }
-    if let Some(full) = use_imports.get(bare) {
-        return full.clone();
-    }
-    let canonical = majit_ir::descr::canonical_struct_name(bare);
-    if canonical != bare {
-        return canonical;
-    }
-    if prefix.is_empty() {
-        return bare.to_string();
-    }
-    format!("{}::{}", prefix, bare)
 }
 
 #[cfg(test)]

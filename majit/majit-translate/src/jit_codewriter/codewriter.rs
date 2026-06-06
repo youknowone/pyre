@@ -140,17 +140,8 @@ impl CodeWriter {
                 crate::annotator::bookkeeper::Bookkeeper::new(),
             )),
         );
-        // Thread the program-wide `use_imports` aggregate (one entry
-        // per `(source_module, alias)` pair across all parsed files,
-        // built in `lib.rs::analyze_files`) into the registry so
-        // `flowspace_adapter::translate_op` can recover the caller's
-        // per-file lexical scope when resolving an
-        // `OpKind::Call::FunctionPath` (mirrors RPython
-        // `flowcontext.py:845-866 LOAD_GLOBAL` consulting
-        // `func.__globals__` before the builtins fallback).
-        registry.set_use_imports(callcontrol.use_imports.clone());
         // Thread the program-wide struct field shapes into the shared
-        // bookkeeper (mirrors the `set_use_imports` threading above) so
+        // bookkeeper so
         // `getuniqueclassdef_for_struct_root` / `project_pyre_field_type`
         // can project a struct's fields onto its classdef when the
         // real-rtyper seed path resolves a `Ref(type_root)` to a class.
