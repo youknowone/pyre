@@ -771,6 +771,11 @@ pub type PyExecutionContext = ExecutionContext;
 /// GETFIELD_GC/SETFIELD_GC lowering of PUSH_EXC_INFO / POP_EXCEPT.
 pub const EC_SYS_EXC_VALUE_OFFSET: usize = std::mem::offset_of!(ExecutionContext, sys_exc_value);
 
+/// Size of `ExecutionContext`, for the JIT's StructPtrInfo SizeDescr
+/// describing the (non-GC) EC struct.  The EC is never JIT-allocated;
+/// this size only backs the field-tracking SizeDescr.
+pub const EC_SIZE: usize = std::mem::size_of::<ExecutionContext>();
+
 impl Default for ExecutionContext {
     fn default() -> Self {
         Self::new()

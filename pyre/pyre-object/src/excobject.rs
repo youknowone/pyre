@@ -905,7 +905,6 @@ pub unsafe fn w_exception_get_kind(obj: PyObjectRef) -> ExcKind {
     unsafe { (*(obj as *const W_ExceptionObject)).kind }
 }
 
-
 /// Get the Python type name string for an ExcKind.
 pub fn exc_kind_name(kind: ExcKind) -> &'static str {
     match kind {
@@ -1064,7 +1063,10 @@ mod tests {
             let args = w_exception_get_args(obj);
             assert_eq!(crate::tupleobject::w_tuple_len(args), 1);
             let arg0 = crate::tupleobject::w_tuple_getitem(args, 0).unwrap();
-            assert_eq!(crate::strobject::w_str_get_wtf8(arg0), Wtf8::new("bad value"));
+            assert_eq!(
+                crate::strobject::w_str_get_wtf8(arg0),
+                Wtf8::new("bad value")
+            );
         }
     }
 

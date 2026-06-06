@@ -9196,35 +9196,30 @@ impl OpcodeStepExecutor for MIFrame {
     fn push_exc_info(&mut self) -> Result<(), PyError> {
         let exc = <Self as SharedOpcodeHandler>::pop_value(self)?;
         let exc_obj = exc.concrete.to_pyobj();
-        // Emit the residual save/restore pair BEFORE mutating concrete
-        // CURRENT_EXCEPTION so the compiled bridge performs the same
-        // `prev = CURRENT_EXCEPTION; CURRENT_EXCEPTION = exc` sequence at
-        // runtime (pyopcode.py:786 / eval.rs:1220-1229). Folding a
-        // trace-time `ctx.const_ref(prev_exc as i64)` into the bridge
-        // silently breaks nested exception state on re-entry.
-        // `trace_get_current_exception_jit` (line 165) is a flat TLS read
-        // of `CURRENT_EXCEPTION` — `EF_CANNOT_RAISE` (`call.py:303 else`
-        // branch). Matches the codewriter-side classification of
-        // `get_current_exception_fn` at
-        // `pyre-jit/src/jit/codewriter.rs:2159-2163 PlainCannotRaise`.
+        // Emit the save/restore pair as GETFIELD_GC_R / SETFIELD_GC on the
+        // per-thread EC's `sys_exc_value` slot (the single source of truth;
+        // see eval::get_current_exception). This performs the same
+        // `prev = ec.sys_exc_value; ec.sys_exc_value = exc` sequence at
+        // runtime (pyopcode.py:786 / eval.rs:1220-1229) as the former
+        // residual TLS helpers, but as heap ops the optimizer can reason
+        // about: a balanced PUSH_EXC_INFO save + POP_EXCEPT restore with no
+        // intervening read is dead-store-eliminated, so a non-escaping
+        // exception stays virtual. `ec_sys_exc_value_descr` is a non-pointer
+        // flagged Ref field, so SETFIELD_GC emits NO write barrier (the EC
+        // is non-GC and its slot is a forwarded GC root — see the descr).
+        let ec = self.with_ctx(|this, ctx| this.ensure_execution_context(ctx));
         let prev_exc_opref = self.with_ctx(|_this, ctx| {
-            ctx.call_ref_typed_with_effect(
-                trace_get_current_exception_jit as *const (),
-                &[],
-                &[],
-                CANNOT_RAISE_NO_HEAP_EFFECT_INFO,
+            ctx.record_op_with_descr(
+                majit_ir::OpCode::GetfieldGcR,
+                &[ec],
+                crate::descr::ec_sys_exc_value_descr(),
             )
         });
-        // `trace_set_current_exception_jit` (line 172) is a flat TLS
-        // write — same `EF_CANNOT_RAISE` rationale, mirroring
-        // `set_current_exception_fn` at `codewriter.rs:2165-2168
-        // PlainCannotRaise`.
         self.with_ctx(|_this, ctx| {
-            ctx.call_void_typed_with_effect(
-                trace_set_current_exception_jit as *const (),
-                &[exc.opref],
-                &[Type::Ref],
-                CANNOT_RAISE_NO_HEAP_EFFECT_INFO,
+            ctx.record_op_with_descr(
+                majit_ir::OpCode::SetfieldGc,
+                &[ec, exc.opref],
+                crate::descr::ec_sys_exc_value_descr(),
             );
         });
         let prev_exc = get_current_exception();
@@ -9249,17 +9244,17 @@ impl OpcodeStepExecutor for MIFrame {
 
     fn pop_except(&mut self) -> Result<(), PyError> {
         let prev_exc = <Self as SharedOpcodeHandler>::pop_value(self)?;
-        // Emit the residual restore so the compiled bridge writes back the
-        // saved sys_exc_info at runtime (pyopcode.py:778 / eval.rs:1243-1249).
-        // Flat TLS write — `EF_CANNOT_RAISE` matching the codewriter-side
-        // `set_current_exception_fn` at `codewriter.rs:2165-2168
-        // PlainCannotRaise`.
+        // Restore the saved sys_exc_info as SETFIELD_GC on the EC's
+        // `sys_exc_value` slot (pyopcode.py:778 / eval.rs:1243-1249).
+        // Paired with the PUSH_EXC_INFO save above on the same EC field,
+        // this lets the heap optimizer dead-store-eliminate a balanced,
+        // never-read save/restore (no write barrier — see the descr).
+        let ec = self.with_ctx(|this, ctx| this.ensure_execution_context(ctx));
         self.with_ctx(|_this, ctx| {
-            ctx.call_void_typed_with_effect(
-                trace_set_current_exception_jit as *const (),
-                &[prev_exc.opref],
-                &[Type::Ref],
-                CANNOT_RAISE_NO_HEAP_EFFECT_INFO,
+            ctx.record_op_with_descr(
+                majit_ir::OpCode::SetfieldGc,
+                &[ec, prev_exc.opref],
+                crate::descr::ec_sys_exc_value_descr(),
             );
         });
         set_current_exception(prev_exc.concrete.to_pyobj());

@@ -1646,12 +1646,12 @@ pub fn make_array_descr_with_full_id(
 // ── Range iterator field descriptors ─────────────────────────────────
 
 use pyre_interpreter::{DICT_STORAGE_VALUES_LEN_OFFSET, DICT_STORAGE_VALUES_OFFSET};
-use pyre_object::floatobject::{FLOAT_FLOATVAL_OFFSET, W_FloatObject};
-use pyre_object::intobject::W_IntObject;
 use pyre_object::excobject::{
     EXC_ARGS_W_OFFSET, EXC_KIND_COUNT, EXC_KIND_OFFSET, ExcKind, W_EXCEPTION_OBJECT_SIZE,
     exc_kind_to_pytype,
 };
+use pyre_object::floatobject::{FLOAT_FLOATVAL_OFFSET, W_FloatObject};
+use pyre_object::intobject::W_IntObject;
 use pyre_object::pyobject::{OB_TYPE_OFFSET, W_CLASS_OFFSET};
 use pyre_object::rangeobject::{
     RANGE_ITER_CURRENT_OFFSET, RANGE_ITER_STEP_OFFSET, RANGE_ITER_STOP_OFFSET,
@@ -2012,6 +2012,51 @@ pub fn w_exception_descrs(kind: ExcKind) -> (DescrRef, DescrRef, DescrRef, Descr
         field_descr_from_group(group, 1),
         field_descr_from_group(group, 2),
     )
+}
+
+/// Field descr for `ExecutionContext::sys_exc_value`, used by the JIT
+/// lowering of PUSH_EXC_INFO / POP_EXCEPT to GETFIELD_GC_R / SETFIELD_GC.
+///
+/// `field_type = Ref` so the optimizer tracks the value as a GC
+/// reference (virtual-defer + correct resume), but the `flag` is
+/// deliberately NON-pointer so `is_pointer_field()` is false and the GC
+/// rewrite emits NO write barrier (`rewrite.rs handle_write_barrier_setfield`
+/// gates the barrier on `is_pointer_field() && val_is_ref`).  That is
+/// correct here: the EC is a non-GC `Rc`-owned struct whose
+/// `sys_exc_value` slot is forwarded directly as a GC root every
+/// collection (`eval::walk_pyframe_roots`), so the generational
+/// remembered-set barrier is unnecessary.  A single cached Arc gives the
+/// PUSH and POP ops the same `descr_identity`, so the heap optimizer
+/// dead-store-eliminates a balanced save/restore (and the stored
+/// exception, if it never otherwise escapes, stays virtual and DCEs).
+pub fn ec_sys_exc_value_descr() -> DescrRef {
+    static EC_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup> = LazyLock::new(|| {
+        use majit_ir::descr::{ArrayFlag, SimpleFieldDescrSpec};
+        // type_id 0 + vtable 0 → SimpleSizeDescr::is_object() == false, so
+        // the optimizer builds a StructPtrInfo for the (non-GC) EC pointer.
+        // The single field is Ref-typed (ref value tracking) but
+        // Unsigned-flagged (is_pointer_field() == false → no write barrier;
+        // the slot is a forwarded GC root, see eval::walk_pyframe_roots).
+        majit_ir::descr::make_simple_descr_group(
+            u32::MAX,
+            pyre_interpreter::EC_SIZE,
+            0,
+            0,
+            &[SimpleFieldDescrSpec {
+                index: 0,
+                name: "ExecutionContext.sys_exc_value".to_string(),
+                offset: pyre_interpreter::EC_SYS_EXC_VALUE_OFFSET,
+                field_size: 8,
+                field_type: Type::Ref,
+                is_immutable: false,
+                is_quasi_immutable: false,
+                flag: ArrayFlag::Unsigned,
+                virtualizable: false,
+                index_in_parent: 0,
+            }],
+        )
+    });
+    EC_DESCR_GROUP.field_descrs[0].clone() as DescrRef
 }
 
 /// Size descriptor for W_SliceObject allocation via NewWithVtable.
