@@ -2275,13 +2275,14 @@ impl Optimizer {
                                 source,
                             )
                         });
-                        let fresh = ctx.alloc_op_position_typed(tp);
+                        // `fresh` is a producer-less resop: mint its bound
+                        // box up front. `source` is a Phase 2 inputarg whose
+                        // slot `ensure_inputarg_bindings` materialized above,
+                        // so it resolves without minting.
+                        let (fresh, b_fresh) = ctx.reserve_virtual_box(tp);
                         let b_source = ctx
-                            .ensure_box(source)
-                            .expect("body-namespace OpRef must have a BoxRef slot");
-                        let b_fresh = ctx
-                            .ensure_box(fresh)
-                            .expect("body-namespace OpRef must have a BoxRef slot");
+                            .get_box_replacement_box(source)
+                            .expect("Phase 2 source inputarg must have a materialized BoxRef slot");
                         ctx.make_equal_to(&b_source, &b_fresh);
                         fresh
                     } else {
@@ -2673,10 +2674,10 @@ impl Optimizer {
                                             orig_field,
                                         )
                                     });
-                                    let ff = ctx.alloc_op_position_typed(tp);
-                                    let b_ff = ctx
-                                        .ensure_box(ff)
-                                        .expect("body-namespace OpRef must have a BoxRef slot");
+                                    // Producer-less alias resop: mint its
+                                    // bound box up front and forward it to the
+                                    // original field box.
+                                    let (ff, b_ff) = ctx.reserve_virtual_box(tp);
                                     let b_orig = ctx.get_box_replacement(orig_field);
                                     ctx.make_equal_to(&b_ff, &b_orig);
                                     field.1 = ff;
