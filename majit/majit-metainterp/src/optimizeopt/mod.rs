@@ -2081,13 +2081,26 @@ impl OptContext {
     /// `alloc_op_position_typed` instead when no forwarded write follows
     /// (e.g. an `Unknown` leaf), to avoid an eager synthetic for a
     /// position that is never written.
+    /// Explicit "create" half of the former find-or-create `ensure_box`:
+    /// mint a `SameAs*` synthetic at `opref` and return a BoxRef bound to it,
+    /// so a subsequent `set_forwarded_*` lands on the canonical `Op._forwarded`
+    /// host. `opref` must be a non-const, non-sentinel resop position whose
+    /// producer is not yet emitted (a virgin alias). Callers reach this only on
+    /// the `None` arm of `get_box_replacement_box`; an already-minted or
+    /// producer-backed opref resolves there. Mirrors `ensure_box`'s resop
+    /// lazy-alloc arm (`mint_synthetic_resop` + bind).
+    pub(crate) fn mint_box_at(&mut self, opref: OpRef) -> crate::r#box::BoxRef {
+        let tp = opref.ty().unwrap_or(majit_ir::Type::Void);
+        let synthetic = self.mint_synthetic_resop(opref, tp);
+        crate::r#box::BoxRef::from_bound_op(&synthetic)
+    }
+
     pub(crate) fn reserve_virtual_box(
         &mut self,
         tp: majit_ir::Type,
     ) -> (OpRef, crate::r#box::BoxRef) {
         let opref = self.reserve_pos_typed(tp);
-        let synthetic = self.mint_synthetic_resop(opref, tp);
-        let b = crate::r#box::BoxRef::from_bound_op(&synthetic);
+        let b = self.mint_box_at(opref);
         (opref, b)
     }
 
@@ -2250,7 +2263,8 @@ impl OptContext {
         // lenbound on the StrPtrInfo is a PtrInfo-internal mutation that
         // RPython performs on the StrPtrInfo instance directly. Route
         // through `ensure_box` so the BoxRef exists for the chain walk.
-        let lenbound = self.get_box_replacement_box(resolved)
+        let lenbound = self
+            .get_box_replacement_box(resolved)
             .as_ref()
             .and_then(|b| self.get_str_lenbound(b));
         if let Some(bound) = lenbound {

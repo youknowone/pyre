@@ -3111,8 +3111,7 @@ impl OptRewrite {
         op_rc: &majit_ir::OpRc,
         ctx: &mut OptContext,
     ) -> OptimizationResult {
-        let v = ctx
-            .get_box_replacement_box(op.arg(0).to_opref());
+        let v = ctx.get_box_replacement_box(op.arg(0).to_opref());
         if let Some(v) = v {
             if let Some(arg_op) = ctx.get_producing_op(&v) {
                 if arg_op.opcode == OpCode::FloatAbs {
@@ -3606,8 +3605,7 @@ impl Optimization for OptRewrite {
             // ── rewrite.py:373-374: optimize_ASSERT_NOT_NONE ──
             OpCode::AssertNotNone => {
                 // RPython: self.make_nonnull(op.getarg(0))
-                let obj_box = ctx
-                    .get_box_replacement_box(op.arg(0).to_opref());
+                let obj_box = ctx.get_box_replacement_box(op.arg(0).to_opref());
                 let has_info = obj_box.as_ref().map_or(false, |b| ctx.has_ptr_info(b));
                 if !has_info {
                     if let Some(b) = obj_box.as_ref() {
@@ -3635,8 +3633,7 @@ impl Optimization for OptRewrite {
                     if let Some(expected_class) = expected_class {
                         // getptrinfo synthesizes ConstPtrInfo for constant
                         // Refs so `get_known_class` reads cls_of_box for them.
-                        let obj_box = ctx
-                            .get_box_replacement_box(op.arg(0).to_opref());
+                        let obj_box = ctx.get_box_replacement_box(op.arg(0).to_opref());
                         if let Some(known) = obj_box
                             .as_ref()
                             .and_then(|b| ctx.getptrinfo(b))

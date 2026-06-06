@@ -575,8 +575,7 @@ impl OptVirtualize {
     }
 
     fn optimize_setfield_gc(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        let struct_box = ctx
-            .get_box_replacement_box(op.arg(0).to_opref());
+        let struct_box = ctx.get_box_replacement_box(op.arg(0).to_opref());
         let value_ref = ctx.get_box_replacement(op.arg(1).to_opref()).to_opref();
         let setfield_descr_arc = op
             .getdescr()
@@ -702,8 +701,7 @@ impl OptVirtualize {
         op_rc: &majit_ir::OpRc,
         ctx: &mut OptContext,
     ) -> OptimizationResult {
-        let struct_box = ctx
-            .get_box_replacement_box(op.arg(0).to_opref());
+        let struct_box = ctx.get_box_replacement_box(op.arg(0).to_opref());
         let field_descr_arc = op
             .getdescr()
             .expect("optimize_getfield_gc: field op without FieldDescr");
@@ -791,8 +789,7 @@ impl OptVirtualize {
     }
 
     fn optimize_setarrayitem_gc(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        let array_box = ctx
-            .get_box_replacement_box(op.arg(0).to_opref());
+        let array_box = ctx.get_box_replacement_box(op.arg(0).to_opref());
         let index_ref = op.arg(1).to_opref();
         let value_ref = ctx.get_box_replacement(op.arg(2).to_opref()).to_opref();
 
@@ -838,8 +835,7 @@ impl OptVirtualize {
         op_rc: &majit_ir::OpRc,
         ctx: &mut OptContext,
     ) -> OptimizationResult {
-        let array_box = ctx
-            .get_box_replacement_box(op.arg(0).to_opref());
+        let array_box = ctx.get_box_replacement_box(op.arg(0).to_opref());
         let index_ref = op.arg(1).to_opref();
 
         if let Some(info) = array_box.as_ref().and_then(|b| ctx.peek_ptr_info(b)) {
@@ -876,8 +872,7 @@ impl OptVirtualize {
 
     /// virtualize.py:268-274 optimize_ARRAYLEN_GC
     fn optimize_arraylen_gc(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        let array_box = ctx
-            .get_box_replacement_box(op.arg(0).to_opref());
+        let array_box = ctx.get_box_replacement_box(op.arg(0).to_opref());
 
         if let Some(PtrInfo::VirtualArray(vinfo)) =
             array_box.as_ref().and_then(|b| ctx.peek_ptr_info(b))
@@ -902,8 +897,7 @@ impl OptVirtualize {
         op_rc: &majit_ir::OpRc,
         ctx: &mut OptContext,
     ) -> OptimizationResult {
-        let array_box = ctx
-            .get_box_replacement_box(op.arg(0).to_opref());
+        let array_box = ctx.get_box_replacement_box(op.arg(0).to_opref());
         let index_ref = op.arg(1).to_opref();
         // `info.py:573-581 getinteriorfield_virtual` indexes the per-element
         // field list by `fielddescr.get_index()`.  Strip the surrounding
@@ -956,8 +950,7 @@ impl OptVirtualize {
         op: &Op,
         ctx: &mut OptContext,
     ) -> OptimizationResult {
-        let array_box = ctx
-            .get_box_replacement_box(op.arg(0).to_opref());
+        let array_box = ctx.get_box_replacement_box(op.arg(0).to_opref());
         let index_ref = op.arg(1).to_opref();
         let value_ref = ctx.get_box_replacement(op.arg(2).to_opref()).to_opref();
         // `info.py:583-594 setinteriorfield_virtual` indexes the per-element

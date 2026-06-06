@@ -1362,8 +1362,7 @@ impl OptString {
         ctx: &mut OptContext,
     ) -> OptimizationResult {
         if op.num_args() >= 3 {
-            let arg1_box = ctx
-                .get_box_replacement_box(op.arg(1).to_opref());
+            let arg1_box = ctx.get_box_replacement_box(op.arg(1).to_opref());
             let length = ctx
                 .get_box_replacement_box(op.arg(2).to_opref())
                 .and_then(|b| ctx.get_constant_int_box(&b));
