@@ -978,6 +978,18 @@ pub enum DispatchError {
     /// interpreter fallback (correct, untraced) instead of compiling a
     /// trace whose guard-failure path corrupts the frame.
     BranchGuardKeptStackUnsupported { pc: usize },
+    /// A callee compiled as its own Finish portal (reached via
+    /// `call_user_function_with_eval`) accessed its frame through a
+    /// `vable_*` op that found it to be a non-standard virtualizable,
+    /// emitting an internal promote `GuardValue` + force store-back. The
+    /// Finish-portal compile path does not yet wire a resume snapshot or a
+    /// `FieldDescr` for those internal ops (only the inline sub-walk path
+    /// does), so compiling the trace trips the optimizer's
+    /// `store_final_boxes_in_guard` / `optimize_setfield_gc` invariants.
+    /// Abort to the trait interpreter; the method runs interpreted until the
+    /// own-portal callee frame is registered as the standard virtualizable
+    /// (a perf follow-up).
+    NonStandardVableFinishPortalUnsupported { pc: usize },
 }
 
 /// Walk one opcode at `pc` and return the dispatch outcome plus the
@@ -5309,8 +5321,7 @@ fn fbw_store_token_in_vable(
     op_pc: usize,
 ) -> Result<(), DispatchError> {
     if ctx.trace_ctx.store_token_in_vable_setfield() {
-        ctx.trace_ctx
-            .record_guard(OpCode::GuardNotForced2, &[], 0);
+        ctx.trace_ctx.record_guard(OpCode::GuardNotForced2, &[], 0);
         walker_capture_snapshot_for_last_guard(ctx, op_pc)?;
     }
     Ok(())
@@ -5492,11 +5503,13 @@ fn walker_capture_snapshot_after_residual_call(
 /// `promote_int` `GuardValue` *internally*, without a resume snapshot.
 /// The walker never sees that guard at its own emit sites, so it would
 /// reach `store_final_boxes_in_guard` with `rd_resume_position == -1`
-/// and panic.  Only an inlined callee's heap frame is non-standard
-/// (the production main frame IS the standard virtualizable, so the
-/// check short-circuits at Step 1 and emits nothing) — gate on the
-/// inline sub-walk so this is a no-op (one cheap `num_guards` read)
-/// outside the inline path.  The non-standard fact is cached per box
+/// and panic.  A callee frame is non-standard whether reached by an
+/// inline sub-walk or compiled as its own Finish portal (via
+/// call_user_function_with_eval); the production main frame IS the
+/// standard virtualizable, so the check short-circuits at Step 1 and
+/// emits nothing — gate on a full-body walk being active so this is a
+/// no-op (one cheap `num_guards` read) outside it.  The non-standard
+/// fact is cached per box
 /// after the first access, so at most one such guard is emitted per
 /// inlined frame and `walker_capture_snapshot_for_last_guard`'s
 /// "last guard" target is unambiguous.
@@ -5505,11 +5518,31 @@ fn walker_capture_inline_nonstandard_vable_guard(
     op_pc: usize,
     guards_before: usize,
 ) -> Result<(), DispatchError> {
-    if !INLINE_SUBWALK_CAPTURE_BOUNDARY.with(|c| c.get()) {
+    // The non-standard virtualizable's internal promote GuardValue is
+    // emitted only inside a full-body walk against a callee frame that is
+    // not the production standard virtualizable: either an inline sub-walk's
+    // callee heap frame, or a callee compiled as its own Finish portal
+    // (reached via call_user_function_with_eval). Outside a full-body walk
+    // the frame is always the standard virtualizable and emits no such
+    // guard.
+    if FULL_BODY_SNAPSHOT_SYM.with(|c| c.get()).is_null() {
         return Ok(());
     }
     if ctx.trace_ctx.num_guards() <= guards_before {
+        // Standard virtualizable (the production main frame): the
+        // `_nonstandard_virtualizable` check short-circuited and emitted no
+        // guard, so there is nothing to capture.
         return Ok(());
+    }
+    if !INLINE_SUBWALK_CAPTURE_BOUNDARY.with(|c| c.get()) {
+        // A callee compiled as its own Finish portal hit the non-standard
+        // virtualizable path. Its internal promote GuardValue + force
+        // store-back are not yet wired with a resume snapshot / FieldDescr
+        // for the own-portal compile (only the inline sub-walk path below
+        // is), so the optimizer's `store_final_boxes_in_guard` /
+        // `optimize_setfield_gc` would trip. Abort to the trait interpreter
+        // rather than compile a trace that cannot be finalized.
+        return Err(DispatchError::NonStandardVableFinishPortalUnsupported { pc: op_pc });
     }
     // Same buildability precondition as `walker_capture_snapshot_for_last_guard`:
     // every virtualizable box must carry `OpRef::ty()` or the snapshot

@@ -380,6 +380,8 @@ fn run_perfn_walk(
     // pointers.  `argboxes_r[i] -> top_regs_r[i]` is the seed channel.
     let ec_box = mi.ctx().const_ref(sym.concrete_execution_context as i64);
     let pycode_box = mi.ctx().const_ref(w_code as i64);
+    let portal_frame_reg = pjc.metadata.portal_frame_reg;
+    let portal_ec_reg = pjc.metadata.portal_ec_reg;
     let argboxes_r: Vec<majit_ir::OpRef> = {
         let mut v = vec![majit_ir::OpRef::NONE; 1];
         let mut seed = |reg: u8, val: majit_ir::OpRef| {
@@ -402,19 +404,36 @@ fn run_perfn_walk(
                 }
             }
             // Straight-line entry, no governing loop header (e.g. a
-            // non-looping recursive function like `fib`): the portal entry
-            // register layout follows `MIFrame.setup_call`'s positional
-            // per-bank fill of the jitdriver args `[pycode, frame, ec]`.
-            // All three are Ref, so the per-bank positional colors are
-            // pycode=r0, frame=r1, ec=r2 — the body reads its vable from r1,
-            // NOT r0.  The earlier r0=frame arm-convention fallback left r1
-            // `OpRef::NONE`, so every `getarrayitem_vable_r` of a local took
-            // the nonstandard `Value::Void` leg and the entry `goto_if_not`
-            // aborted with `GotoIfNotValueNotConcrete`.
+            // non-looping function like `fib` or a leaf method): seed the
+            // portal red args `[frame, ec]` at the AUTHORITATIVE
+            // post-regalloc colors the codewriter recorded
+            // (`metadata.portal_frame_reg` / `portal_ec_reg`), the same
+            // colors the loop-header `jit_merge_point` `rr` list carries.
+            // The earlier positional `[pycode=r0, frame=r1, ec=r2]`
+            // convention only coincided with regalloc for an nlocals==1
+            // function (fib: frame=r1); a 2-local leaf method (`value()`)
+            // places frame at r2 / ec at r3, so the positional seed put
+            // `ec_box` in the frame color and every `getfield/getarrayitem
+            // _vable` of a local took the nonstandard-virtualizable leg
+            // (internal promote `GuardValue` + force store-back, no resume
+            // snapshot → `NonStandardVableFinishPortalUnsupported` abort).
+            // pycode (the jitdriver's green ref) is read from the frame's
+            // `pycode` field via `getfield_vable`, so it needs no register
+            // seed once `frame` resolves to the standard virtualizable; the
+            // r0 seed is retained as a defensive best-effort (overwritten by
+            // the entry prologue's first dst in practice).
             None => {
                 seed(0, pycode_box);
-                seed(1, frame_box);
-                seed(2, ec_box);
+                if portal_frame_reg != u16::MAX {
+                    seed(portal_frame_reg as u8, frame_box);
+                } else {
+                    seed(1, frame_box);
+                }
+                if portal_ec_reg != u16::MAX {
+                    seed(portal_ec_reg as u8, ec_box);
+                } else {
+                    seed(2, ec_box);
+                }
             }
         }
         v
@@ -733,7 +752,8 @@ fn full_body_walk_trace(
                 | DE::GuardSnapshotVableUntyped { .. }
                 | DE::MayForceProtectedByExceptionHandlerUnsupported { .. }
                 | DE::MayForceNullRefArgUnsupported { .. }
-                | DE::BranchGuardKeptStackUnsupported { .. } => TraceAction::AbortPermanent,
+                | DE::BranchGuardKeptStackUnsupported { .. }
+                | DE::NonStandardVableFinishPortalUnsupported { .. } => TraceAction::AbortPermanent,
                 _ => TraceAction::Abort,
             }
         }
