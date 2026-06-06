@@ -1111,6 +1111,7 @@ impl<'a> Lowering<'a> {
         )
     }
 
+
     /// Blocks reachable from bb0 over [`Self::model_succs`].
     fn mir_model_reachable(&self) -> Vec<bool> {
         let n = self.body.body.len();

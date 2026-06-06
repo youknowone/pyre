@@ -1855,8 +1855,7 @@ pub(crate) fn derive_subject_inputcells(
         (&crate::model::ValueType, &Option<String>),
     > = HashMap::new();
     for op in &startblock.operations {
-        if let (Some(result), OpKind::Input { ty, class_root, .. }) =
-            (op.result.as_ref(), &op.kind)
+        if let (Some(result), OpKind::Input { ty, class_root, .. }) = (op.result.as_ref(), &op.kind)
         {
             input_by_result.insert(result.clone(), (ty, class_root));
         }
@@ -2131,9 +2130,6 @@ pub fn function_graph_to_flowspace(
         {
             continue;
         }
-        if !reachable.contains(&legacy_block.id) {
-            continue;
-        }
         let mut local_inputs: Vec<(Variable, Variable)> =
             Vec::with_capacity(legacy_block.inputargs.len());
         let mut inputargs: Vec<Hlvalue> = Vec::with_capacity(legacy_block.inputargs.len());
@@ -2240,9 +2236,6 @@ pub fn function_graph_to_flowspace(
             || legacy_block.id == legacy.returnblock
             || legacy_block.id == legacy.exceptblock
         {
-            continue;
-        }
-        if !reachable.contains(&legacy_block.id) {
             continue;
         }
         let block_ref = block_map[&legacy_block.id].clone();
