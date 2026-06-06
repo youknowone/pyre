@@ -87,7 +87,7 @@ impl W_Kevent {
 
     #[getter]
     fn ident(&self) -> PyObjectRef {
-        pyre_object::w_int_new(self.ident as i64)
+        newint_from_u64(self.ident)
     }
     #[getter]
     fn filter(&self) -> i64 {
@@ -107,7 +107,7 @@ impl W_Kevent {
     }
     #[getter]
     fn udata(&self) -> PyObjectRef {
-        pyre_object::w_int_new(self.udata as i64)
+        newint_from_u64(self.udata)
     }
 
     /// `interp_kqueue.py:352 descr__eq__` and friends — two kevents
@@ -130,6 +130,18 @@ impl W_Kevent {
     }
     fn __ge__(&self, w_other: PyObjectRef) -> PyObjectRef {
         kevent_compare(self, w_other, |o| o != std::cmp::Ordering::Less)
+    }
+}
+
+/// Wrap a 64-bit unsigned word as a Python int, mirroring `space.newint`
+/// of a `UINTPTR_T`: values in `i64` range become a plain int, larger ones
+/// become a positive long instead of wrapping to a negative via `as i64`.
+#[cfg(all(target_os = "macos", feature = "host_env"))]
+fn newint_from_u64(v: u64) -> PyObjectRef {
+    if v <= i64::MAX as u64 {
+        pyre_object::w_int_new(v as i64)
+    } else {
+        pyre_object::w_long_new(malachite_bigint::BigInt::from(v))
     }
 }
 

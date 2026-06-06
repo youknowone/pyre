@@ -114,9 +114,8 @@ impl W_Kqueue {
         // Build the changelist from the supplied kevent objects.
         let mut changelist: Vec<libc::kevent> = Vec::new();
         if !unsafe { pyre_object::is_none(w_changelist) } {
-            let items = sequence_items(w_changelist).ok_or_else(|| {
-                crate::PyError::type_error("changelist must be an iterable of kevent objects")
-            })?;
+            // `interp_kqueue.py:179` — space.listview accepts any iterable.
+            let items = crate::baseobjspace::unpackiterable(w_changelist, -1)?;
             for item in items {
                 let ev = W_Kevent::from_obj(item).ok_or_else(|| {
                     crate::PyError::type_error("arg 1 must be a sequence of kevent objects")
@@ -136,17 +135,9 @@ impl W_Kqueue {
         let mut ts: libc::timespec = unsafe { std::mem::zeroed() };
         let have_timeout = !unsafe { pyre_object::is_none(w_timeout) };
         if have_timeout {
-            let secs = unsafe {
-                if pyre_object::is_float(w_timeout) {
-                    pyre_object::w_float_get_value(w_timeout)
-                } else if pyre_object::is_int(w_timeout) {
-                    pyre_object::w_int_get_value(w_timeout) as f64
-                } else {
-                    return Err(crate::PyError::type_error(
-                        "timeout must be a float or None",
-                    ));
-                }
-            };
+            // `interp_kqueue.py:187` — space.float_w honours __float__.
+            let w_secs = crate::builtins::builtin_float(&[w_timeout])?;
+            let secs = unsafe { pyre_object::w_float_get_value(w_secs) };
             if secs < 0.0 {
                 return Err(crate::PyError::value_error(format!(
                     "Timeout must be None or >= 0, got {secs}"
@@ -230,22 +221,3 @@ impl W_Kqueue {
     }
 }
 
-/// Copy a Python list/tuple's items into a Vec — `space.listview`.
-#[cfg(all(target_os = "macos", feature = "host_env"))]
-fn sequence_items(seq: PyObjectRef) -> Option<Vec<PyObjectRef>> {
-    unsafe {
-        if pyre_object::is_list(seq) {
-            let n = pyre_object::w_list_len(seq);
-            (0..n)
-                .map(|i| pyre_object::w_list_getitem(seq, i as i64))
-                .collect()
-        } else if pyre_object::is_tuple(seq) {
-            let n = pyre_object::w_tuple_len(seq);
-            (0..n)
-                .map(|i| pyre_object::w_tuple_getitem(seq, i as i64))
-                .collect()
-        } else {
-            None
-        }
-    }
-}
