@@ -5389,7 +5389,10 @@ impl OptContext {
         let resolved_box = self.get_box_replacement_box(opref);
         if let Some(mut info) = resolved_box.as_ref().and_then(|b| self.peek_ptr_info(b)) {
             if info.is_virtual() {
-                let forced = info.force_box(resolved, self);
+                let box_ = resolved_box
+                    .clone()
+                    .expect("is_virtual implies resolved_box is Some");
+                let forced = info.force_box(box_, self);
                 return self.get_box_replacement(forced).to_opref();
             }
         }

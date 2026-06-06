@@ -339,7 +339,11 @@ pub trait PtrInfoExt {
 
     /// info.py:137-160 / 222-226: force_box() emits the allocation and
     /// field writes via emit_extra(), recursively forcing child virtuals.
-    fn force_box(&mut self, opref: OpRef, ctx: &mut crate::optimizeopt::OptContext) -> OpRef;
+    /// `box_` is the (bound) BoxRef of the virtual being forced — RPython
+    /// `force_box(self, op, optforce)` passes the box object directly
+    /// (info.py:148-152), so the make_equal_to / set_forwarded receiver
+    /// needs no lookup.
+    fn force_box(&mut self, box_: BoxRef, ctx: &mut crate::optimizeopt::OptContext) -> OpRef;
 
     /// info.py:273-303: `_is_immutable_and_filled_with_constants`
     /// — used by `force_box` to decide whether a virtual can be
@@ -750,8 +754,8 @@ impl PtrInfoExt for PtrInfo {
     ///
     /// Generated ops are routed via emit_extra() (RPython
     /// emit_extra parity) so downstream passes can observe them.
-    fn force_box(&mut self, opref: OpRef, ctx: &mut crate::optimizeopt::OptContext) -> OpRef {
-        force_box_impl(self, opref, ctx)
+    fn force_box(&mut self, box_: BoxRef, ctx: &mut crate::optimizeopt::OptContext) -> OpRef {
+        force_box_impl(self, box_, ctx)
     }
 
     /// info.py:273-303: _is_immutable_and_filled_with_constants
@@ -810,10 +814,17 @@ impl PtrInfoExt for PtrInfo {
 
 fn force_box_impl(
     self_: &mut PtrInfo,
-    opref: OpRef,
+    box_: BoxRef,
     ctx: &mut crate::optimizeopt::OptContext,
 ) -> OpRef {
     use majit_ir::{Op, OpCode};
+
+    // `box_` is the bound BoxRef of the virtual being forced (callers resolve
+    // op -> box before delegating). The OpRef view drives op identity (pos,
+    // logging, alloc-vs-original comparisons); the box drives every
+    // make_equal_to / set_ptr_info receiver, so no `ensure_box` round-trip is
+    // needed for the forwarding writes.
+    let opref = box_.to_opref();
 
     fn force_child(orig_ref: OpRef, ctx: &mut crate::optimizeopt::OptContext) -> OpRef {
         let value_box = ctx.get_box_replacement_box(orig_ref);
@@ -821,7 +832,7 @@ fn force_box_impl(
         if value_box.as_ref().map_or(false, |b| ctx.is_virtual(b)) {
             let value_box = value_box.expect("recorder-populated");
             let mut info = ctx.take_ptr_info(&value_box).unwrap();
-            let forced = force_box_impl(&mut info, value_ref, ctx);
+            let forced = force_box_impl(&mut info, value_box, ctx);
             return ctx
                 .get_box_replacement_box(forced)
                 .map(|b| b.to_opref())
@@ -891,15 +902,12 @@ fn force_box_impl(
                         }
                     }
                     // info.py:142: op.set_forwarded(constptr) — write
-                    // unconditional. Route through `ensure_box` so the
-                    // chain walks to the just-installed Const target
-                    // (where `set_ptr_info` is a no-op per Const-box
-                    // invariant) and never silently drops the write.
+                    // unconditional. `set_ptr_info` on `box_` walks the
+                    // chain to the just-installed Const target (where it
+                    // is a no-op per Const-box invariant).
                     let const_ref = GcRef(ptr.0);
                     ctx.make_constant(opref, Value::Ref(const_ref));
-                    if let Some(b) = ctx.ensure_box(opref) {
-                        ctx.set_ptr_info(&b, PtrInfo::Constant(const_ref));
-                    }
+                    ctx.set_ptr_info(&box_, PtrInfo::Constant(const_ref));
                     return opref;
                 }
             }
@@ -928,8 +936,8 @@ fn force_box_impl(
             new_op.setdescr(vinfo.descr.clone());
             let alloc_ref = emit_op(ctx, new_op);
             // info.py:152 `newop.set_forwarded(self)` — unconditional.
-            // Route through `ensure_box` so the just-emitted alloc op
-            // materializes a BoxRef and the PtrInfo install lands.
+            // The just-emitted alloc op is bound, so its resolved box
+            // carries the PtrInfo install.
             if let Some(b) = ctx.get_box_replacement_box(alloc_ref) {
                 ctx.set_ptr_info(&b, preserved);
             }
@@ -940,11 +948,8 @@ fn force_box_impl(
                 );
             }
             if opref != alloc_ref {
-                let b_opref = ctx
-                    .ensure_box(opref)
-                    .expect("body-namespace OpRef must have a BoxRef slot");
                 let b_alloc = ctx.get_box_replacement(alloc_ref);
-                ctx.make_equal_to(&b_opref, &b_alloc);
+                ctx.make_equal_to(&box_, &b_alloc);
             }
             for (field_idx, value_ref) in std::mem::take(&mut vinfo.fields) {
                 let value_ref = force_child(value_ref, ctx);
@@ -997,11 +1002,8 @@ fn force_box_impl(
                 );
             }
             if opref != alloc_ref {
-                let b_opref = ctx
-                    .ensure_box(opref)
-                    .expect("body-namespace OpRef must have a BoxRef slot");
                 let b_alloc = ctx.get_box_replacement(alloc_ref);
-                ctx.make_equal_to(&b_opref, &b_alloc);
+                ctx.make_equal_to(&box_, &b_alloc);
             }
             for (field_idx, value_ref) in std::mem::take(&mut vinfo.fields) {
                 let value_ref = force_child(value_ref, ctx);
@@ -1021,13 +1023,9 @@ fn force_box_impl(
         PtrInfo::VirtualArray(vinfo) => {
             // info.py:540-558 ArrayPtrInfo._force_elements
             // RPython `op.set_forwarded(self)` (post-force) is
-            // unconditional. `ensure_box` lazy-allocates the backing
-            // BoxRef, matching upstream's implicit "every Box exists"
-            // invariant.
+            // unconditional; the bound `box_` carries the PtrInfo write.
             let len = vinfo.items.len();
-            if let Some(b) = ctx.ensure_box(opref) {
-                ctx.set_ptr_info(&b, PtrInfo::nonnull());
-            }
+            ctx.set_ptr_info(&box_, PtrInfo::nonnull());
 
             let len_ref = ctx.emit_constant_int(len as i64);
             let alloc_opcode = if vinfo.clear {
@@ -1040,11 +1038,8 @@ fn force_box_impl(
             alloc_op.setdescr(vinfo.descr.clone());
             let alloc_ref = emit_op(ctx, alloc_op);
             if opref != alloc_ref {
-                let b_opref = ctx
-                    .ensure_box(opref)
-                    .expect("body-namespace OpRef must have a BoxRef slot");
                 let b_alloc = ctx.get_box_replacement(alloc_ref);
-                ctx.make_equal_to(&b_opref, &b_alloc);
+                ctx.make_equal_to(&box_, &b_alloc);
             }
 
             // info.py:542: const = optforce.optimizer.new_const_item(self.descr)
@@ -1093,11 +1088,9 @@ fn force_box_impl(
             // created with clear=True, so the original op is always
             // NEW_ARRAY_CLEAR.
             // RPython `op.set_forwarded(self)` (post-force) is
-            // unconditional; ensure_box lazy-allocates the BoxRef.
+            // unconditional; the bound `box_` carries the PtrInfo write.
             let num_elements = vinfo.element_fields.len();
-            if let Some(b) = ctx.ensure_box(opref) {
-                ctx.set_ptr_info(&b, PtrInfo::nonnull());
-            }
+            ctx.set_ptr_info(&box_, PtrInfo::nonnull());
 
             let len_ref = ctx.emit_constant_int(num_elements as i64);
             let mut alloc_op = Op::new(OpCode::NewArrayClear, &[BoxRef::from_opref(len_ref)]);
@@ -1105,11 +1098,8 @@ fn force_box_impl(
             alloc_op.setdescr(vinfo.descr.clone());
             let alloc_ref = emit_op(ctx, alloc_op);
             if opref != alloc_ref {
-                let b_opref = ctx
-                    .ensure_box(opref)
-                    .expect("body-namespace OpRef must have a BoxRef slot");
                 let b_alloc = ctx.get_box_replacement(alloc_ref);
-                ctx.make_equal_to(&b_opref, &b_alloc);
+                ctx.make_equal_to(&box_, &b_alloc);
             }
 
             // info.py:672: fielddescrs = op.getdescr().get_all_fielddescrs()
@@ -1179,11 +1169,8 @@ fn force_box_impl(
                 ctx.set_ptr_info(&b, PtrInfo::nonnull());
             }
             if opref != alloc_ref {
-                let b_opref = ctx
-                    .ensure_box(opref)
-                    .expect("body-namespace OpRef must have a BoxRef slot");
                 let b_alloc = ctx.get_box_replacement(alloc_ref);
-                ctx.make_equal_to(&b_opref, &b_alloc);
+                ctx.make_equal_to(&box_, &b_alloc);
             }
 
             // info.py:425: CHECK_MEMORY_ERROR
@@ -1243,8 +1230,8 @@ fn force_box_impl(
             let new_ref = emit_op(ctx, add_op);
             // Preserve raw-slice identity; mark non-virtual via
             // `parent = OpRef::NONE` (RPython `self.parent = None`).
-            // info.py:152 unconditional set_forwarded — route through
-            // `ensure_box` so the emitted IntAdd op carries PtrInfo.
+            // info.py:152 unconditional set_forwarded — the emitted
+            // IntAdd op is bound, so its resolved box carries PtrInfo.
             if let Some(b) = ctx.get_box_replacement_box(new_ref) {
                 ctx.set_ptr_info(
                     &b,
@@ -1257,11 +1244,8 @@ fn force_box_impl(
                 );
             }
             if opref != new_ref {
-                let b_opref = ctx
-                    .ensure_box(opref)
-                    .expect("body-namespace OpRef must have a BoxRef slot");
                 let b_new = ctx.get_box_replacement(new_ref);
-                ctx.make_equal_to(&b_opref, &b_new);
+                ctx.make_equal_to(&box_, &b_new);
             }
             new_ref
         }
@@ -1342,11 +1326,8 @@ fn force_box_impl(
 
             // vstring.py:99-100: op.set_forwarded(newop)
             if opref != newop {
-                let b_opref = ctx
-                    .ensure_box(opref)
-                    .expect("body-namespace OpRef must have a BoxRef slot");
                 let b_newop = ctx.get_box_replacement(newop);
-                ctx.make_equal_to(&b_opref, &b_newop);
+                ctx.make_equal_to(&box_, &b_newop);
             }
 
             // vstring.py:101-102: initialize_forced_string(op, optstring, op, CONST_0, mode)

@@ -329,7 +329,7 @@ fn force_child_for_string(opref: OpRef, ctx: &mut OptContext) -> OpRef {
     if resolved_box.as_ref().map_or(false, |b| ctx.is_virtual(b)) {
         let resolved_box = resolved_box.expect("recorder-populated");
         let mut info = ctx.take_ptr_info(&resolved_box).unwrap();
-        let forced = info.force_box(resolved, ctx);
+        let forced = info.force_box(resolved_box, ctx);
         return ctx.get_box_replacement(forced).to_opref();
     }
     resolved
@@ -434,7 +434,7 @@ impl OptString {
         if resolved_box.as_ref().map_or(false, |b| ctx.is_virtual(b)) {
             let resolved_box = resolved_box.expect("recorder-populated");
             let mut info = ctx.take_ptr_info(&resolved_box).unwrap();
-            let forced = info.force_box(resolved, ctx);
+            let forced = info.force_box(resolved_box, ctx);
             return ctx.get_box_replacement(forced).to_opref();
         }
         resolved

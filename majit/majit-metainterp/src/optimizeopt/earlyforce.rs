@@ -97,7 +97,7 @@ impl Optimization for OptEarlyForce {
                         .get_box_replacement_box(arg)
                         .expect("recorder-populated");
                     let mut info = ctx.take_ptr_info(&arg_box).unwrap();
-                    let _forced = info.force_box(arg, ctx);
+                    let _forced = info.force_box(arg_box, ctx);
                 }
             }
         }
