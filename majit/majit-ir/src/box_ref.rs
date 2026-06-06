@@ -333,7 +333,7 @@ impl BoxRef {
     /// `set_forwarded_*` / `clear_forwarded` calls write through to
     /// `op.forwarded` (the canonical host; there is no Box-side mirror).
     /// Stores a `Weak<Op>` to avoid an Rc cycle. Called when re-binding a
-    /// box to its producer (`ensure_box`'s synthetic-mint path, test
+    /// box to its producer (`materialize_box_at`'s synthetic-mint path, test
     /// fixtures). Panics if called on a non-ResOp Box.
     ///
     /// Late-binding carry-over: when the box is *already bound* (a rebind:
@@ -345,7 +345,7 @@ impl BoxRef {
     /// unbound box is always `Forwarded::None`. Carrying that `None` would
     /// *clobber* an already-populated canonical host's authoritative
     /// `_forwarded` (the bug that `box_pool` memoization used to mask by
-    /// returning the same bound box on a repeat `ensure_box`). So the
+    /// returning the same bound box on a repeat `materialize_box_at`). So the
     /// carry-over fires only when `self` is bound; binding a fresh box leaves
     /// the host's `_forwarded` intact.
     pub fn bind_op(&self, op: &crate::resoperation::OpRc) {

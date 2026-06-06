@@ -314,7 +314,7 @@ pub struct OptPure {
     /// postponement. The OVF op is `Remove`d before emit, so its head box
     /// is never bound by the emit path; capturing it here (where the op
     /// object is live) gives `make_equal_to` a bound receiver without an
-    /// `ensure_box` round-trip through the opref.
+    /// `materialize_box_at` round-trip through the opref.
     postponed_box: Option<crate::r#box::BoxRef>,
     /// Indices into new_operations of emitted CALL_PURE ops.
     /// pure.py: call_pure_positions — tracked for short preamble generation.
@@ -2464,9 +2464,7 @@ mod tests {
         let canonical_arg = OpRef::int_op(8);
         let other_arg = OpRef::int_op(9);
         let result = OpRef::int_op(42);
-        let b_query = ctx
-            .ensure_box(query_arg)
-            .expect("body-namespace OpRef must have a BoxRef slot");
+        let b_query = ctx.materialize_box_at(query_arg);
         let b_canonical = ctx.get_box_replacement(canonical_arg);
         ctx.make_equal_to(&b_query, &b_canonical);
 

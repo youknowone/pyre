@@ -3872,7 +3872,7 @@ mod tests {
                 same_as_source: None,
             }],
         );
-        let object_box = ctx.ensure_box(object).unwrap();
+        let object_box = ctx.materialize_box_at(object);
         ctx.set_ptr_info(&object_box, PtrInfo::instance(None, None));
         ctx.with_ptr_info_mut(&object_box, |info| {
             info.set_preamble_field(
@@ -4322,10 +4322,14 @@ mod tests {
                 let arg = resolved.arg(i);
                 let rb = match ctx.get_box_replacement_box(arg.to_opref()) {
                     Some(b) => b,
-                    None => ctx
-                        .ensure_box(arg.to_opref())
-                        .map(|b| b.get_box_replacement(false))
-                        .unwrap_or_else(|| arg.clone()),
+                    None => {
+                        let __ar = arg.to_opref();
+                        if __ar.is_none() {
+                            arg.clone()
+                        } else {
+                            ctx.materialize_box_at(__ar).get_box_replacement(false)
+                        }
+                    }
                 };
                 resolved.setarg(i, rb);
             }
@@ -4367,9 +4371,7 @@ mod tests {
 
         let mut ctx = OptContext::new(256);
         ctx.make_constant(idx, majit_ir::Value::Int(3));
-        let pos100 = ctx
-            .ensure_box(OpRef::ref_op(100))
-            .expect("body-namespace OpRef must have a BoxRef slot");
+        let pos100 = ctx.materialize_box_at(OpRef::ref_op(100));
         ctx.set_ptr_info(&pos100, PtrInfo::virtual_array(d, 8, false));
 
         let mut pass = OptHeap::new();
@@ -4409,9 +4411,7 @@ mod tests {
 
         let mut ctx = OptContext::new(256);
         ctx.make_constant(idx, majit_ir::Value::Int(3));
-        let pos100 = ctx
-            .ensure_box(OpRef::int_op(100))
-            .expect("body-namespace OpRef must have a BoxRef slot");
+        let pos100 = ctx.materialize_box_at(OpRef::int_op(100));
         ctx.set_ptr_info(&pos100, PtrInfo::virtual_array(d.clone(), 8, false));
 
         let mut pass = OptHeap::new();
@@ -4736,10 +4736,14 @@ mod tests {
                 let arg = resolved.arg(i);
                 let rb = match ctx.get_box_replacement_box(arg.to_opref()) {
                     Some(b) => b,
-                    None => ctx
-                        .ensure_box(arg.to_opref())
-                        .map(|b| b.get_box_replacement(false))
-                        .unwrap_or_else(|| arg.clone()),
+                    None => {
+                        let __ar = arg.to_opref();
+                        if __ar.is_none() {
+                            arg.clone()
+                        } else {
+                            ctx.materialize_box_at(__ar).get_box_replacement(false)
+                        }
+                    }
                 };
                 resolved.setarg(i, rb);
             }
@@ -5070,9 +5074,7 @@ mod tests {
         // Seed PtrInfo._fields[idx] with the cached value so the
         // produce_potential_short_preamble_ops read path can find it.
         use crate::optimizeopt::info::PtrInfo;
-        let pos100 = ctx
-            .ensure_box(OpRef::ref_op(100))
-            .expect("body-namespace OpRef must have a BoxRef slot");
+        let pos100 = ctx.materialize_box_at(OpRef::ref_op(100));
         ctx.set_ptr_info(&pos100, PtrInfo::instance(None, None));
         ctx.with_ptr_info_mut(&pos100, |info| {
             info.setfield(descr.index(), OpRef::ref_op(101));
@@ -5465,10 +5467,14 @@ mod tests {
                 let arg = resolved.arg(i);
                 let rb = match ctx.get_box_replacement_box(arg.to_opref()) {
                     Some(b) => b,
-                    None => ctx
-                        .ensure_box(arg.to_opref())
-                        .map(|b| b.get_box_replacement(false))
-                        .unwrap_or_else(|| arg.clone()),
+                    None => {
+                        let __ar = arg.to_opref();
+                        if __ar.is_none() {
+                            arg.clone()
+                        } else {
+                            ctx.materialize_box_at(__ar).get_box_replacement(false)
+                        }
+                    }
                 };
                 resolved.setarg(i, rb);
             }
@@ -6060,10 +6066,14 @@ mod tests {
                 let arg = resolved.arg(i);
                 let rb = match ctx.get_box_replacement_box(arg.to_opref()) {
                     Some(b) => b,
-                    None => ctx
-                        .ensure_box(arg.to_opref())
-                        .map(|b| b.get_box_replacement(false))
-                        .unwrap_or_else(|| arg.clone()),
+                    None => {
+                        let __ar = arg.to_opref();
+                        if __ar.is_none() {
+                            arg.clone()
+                        } else {
+                            ctx.materialize_box_at(__ar).get_box_replacement(false)
+                        }
+                    }
                 };
                 resolved.setarg(i, rb);
             }
@@ -6151,10 +6161,14 @@ mod tests {
                 let arg = resolved.arg(i);
                 let rb = match ctx.get_box_replacement_box(arg.to_opref()) {
                     Some(b) => b,
-                    None => ctx
-                        .ensure_box(arg.to_opref())
-                        .map(|b| b.get_box_replacement(false))
-                        .unwrap_or_else(|| arg.clone()),
+                    None => {
+                        let __ar = arg.to_opref();
+                        if __ar.is_none() {
+                            arg.clone()
+                        } else {
+                            ctx.materialize_box_at(__ar).get_box_replacement(false)
+                        }
+                    }
                 };
                 resolved.setarg(i, rb);
             }
@@ -6381,10 +6395,14 @@ mod tests {
                 let arg = resolved.arg(i);
                 let rb = match ctx.get_box_replacement_box(arg.to_opref()) {
                     Some(b) => b,
-                    None => ctx
-                        .ensure_box(arg.to_opref())
-                        .map(|b| b.get_box_replacement(false))
-                        .unwrap_or_else(|| arg.clone()),
+                    None => {
+                        let __ar = arg.to_opref();
+                        if __ar.is_none() {
+                            arg.clone()
+                        } else {
+                            ctx.materialize_box_at(__ar).get_box_replacement(false)
+                        }
+                    }
                 };
                 resolved.setarg(i, rb);
             }
@@ -6457,10 +6475,14 @@ mod tests {
                 let arg = resolved.arg(i);
                 let rb = match ctx.get_box_replacement_box(arg.to_opref()) {
                     Some(b) => b,
-                    None => ctx
-                        .ensure_box(arg.to_opref())
-                        .map(|b| b.get_box_replacement(false))
-                        .unwrap_or_else(|| arg.clone()),
+                    None => {
+                        let __ar = arg.to_opref();
+                        if __ar.is_none() {
+                            arg.clone()
+                        } else {
+                            ctx.materialize_box_at(__ar).get_box_replacement(false)
+                        }
+                    }
                 };
                 resolved.setarg(i, rb);
             }
@@ -6530,10 +6552,14 @@ mod tests {
                 let arg = resolved.arg(i);
                 let rb = match ctx.get_box_replacement_box(arg.to_opref()) {
                     Some(b) => b,
-                    None => ctx
-                        .ensure_box(arg.to_opref())
-                        .map(|b| b.get_box_replacement(false))
-                        .unwrap_or_else(|| arg.clone()),
+                    None => {
+                        let __ar = arg.to_opref();
+                        if __ar.is_none() {
+                            arg.clone()
+                        } else {
+                            ctx.materialize_box_at(__ar).get_box_replacement(false)
+                        }
+                    }
                 };
                 resolved.setarg(i, rb);
             }
@@ -6627,12 +6653,8 @@ mod tests {
         let const_20 = ctx.emit_constant_int(20);
         let const_30 = ctx.emit_constant_int(30);
 
-        let op1_box = ctx
-            .ensure_box(op1)
-            .expect("body-namespace OpRef must have a BoxRef slot");
-        let op2_box = ctx
-            .ensure_box(op2)
-            .expect("body-namespace OpRef must have a BoxRef slot");
+        let op1_box = ctx.materialize_box_at(op1);
+        let op2_box = ctx.materialize_box_at(op2);
         ctx.set_ptr_info(
             &op1_box,
             PtrInfo::Array(ArrayPtrInfo {
@@ -6757,11 +6779,9 @@ mod tests {
         op1.pos.set(pos1);
         // Pretend the result is known >= 0.
         // OpRef → BoxRef shim until this caller migrates (Phase D-2).
-        // `reserve_pos_typed` does not pre-mint a canonical host; `ensure_box`
+        // `reserve_pos_typed` does not pre-mint a canonical host; `materialize_box_at`
         // materializes the BoxRef for the reserved position here.
-        let pos1_box = ctx
-            .ensure_box(pos1)
-            .expect("body-namespace OpRef must resolve to a BoxRef");
+        let pos1_box = ctx.materialize_box_at(pos1);
         ctx.setintbound(
             &pos1_box,
             &crate::optimizeopt::intutils::IntBound::from_constant(5),

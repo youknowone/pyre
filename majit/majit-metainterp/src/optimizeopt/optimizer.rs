@@ -401,7 +401,7 @@ impl Optimizer {
         // `Unknown` leaves carry no forwarded write (the
         // `apply_imported_virtual_state` arm is a no-op), so reserve a bare
         // position with no eager synthetic — matching the prior lazy path
-        // where nothing was minted until a later `ensure_box` access.
+        // where nothing was minted until a later `materialize_box_at` access.
         if let VirtualStateInfo::Unknown(_) = info {
             let opref = ctx.alloc_op_position_typed(tp);
             if crate::debug::have_debug_prints() {
@@ -414,7 +414,7 @@ impl Optimizer {
         }
         // Producer-less leaf with a forwarded write: mint the box up front
         // and route the write through it (retires the per-arm
-        // `ensure_box(opref)` materialization inside
+        // `materialize_box_at(opref)` materialization inside
         // `apply_imported_virtual_state`).
         let (opref, box_) = ctx.reserve_virtual_box(tp);
         if crate::debug::have_debug_prints() {
@@ -791,7 +791,7 @@ impl Optimizer {
         // unroll.py:55: if op.get_forwarded() is not None: return
         // Skip heads that already have PtrInfo (duplicate entries from
         // aliased JUMP args sharing the same VirtualState position).
-        // Keyed by the virtual head's Box identity. `ensure_box` is
+        // Keyed by the virtual head's Box identity. `materialize_box_at` is
         // position-stable (a head position resolves to one canonical Box),
         // so two entries sharing a head dedupe by `Rc::ptr_eq`. The head is
         // always a NEW (virtual-alloc) ResOp with a producer, so
@@ -1091,7 +1091,7 @@ impl Optimizer {
                 // label slot and write the imported state through it. An
                 // unresolvable slot (`OpRef::NONE`, e.g. the MISS fallback
                 // above) yields `None` and the write no-ops — matching the
-                // prior `ensure_box(OpRef::NONE) -> None` behavior.
+                // prior `materialize_box_at(OpRef::NONE) -> None` behavior.
                 if let Some(box_) = ctx.get_box_replacement_box(opref) {
                     Self::apply_imported_virtual_state(info, &box_, ctx);
                 }
@@ -1746,7 +1746,7 @@ impl Optimizer {
     pub fn getnullness(ctx: &mut OptContext, opref: OpRef) -> i8 {
         // optimizer.py:127-135 `getnullness` has no missing-Box branch —
         // every `op` has a backing `AbstractValue` per `resoperation.py:
-        // 233-248 _forwarded`. `ensure_box` lazy-allocates the Box (or
+        // 233-248 _forwarded`. `materialize_box_at` lazy-allocates the Box (or
         // returns the const-namespace fresh) so the inlined
         // `getintbound` side effect (`optimizer.py:110-113` unbounded
         // install) materializes on first access, matching upstream's
@@ -2521,8 +2521,8 @@ impl Optimizer {
         //   - Unbound orphan: the pipeline folded/dropped the op so
         //     `ctx.emit` never ran. Synthesize a `SameAs` stand-in
         //     and bind the slot.
-        //   - Synthetic-bound: a forward reference reached `ensure_box`
-        //     first; `ensure_box` minted a `SameAs` stand-in into
+        //   - Synthetic-bound: a forward reference reached `materialize_box_at`
+        //     first; `materialize_box_at` minted a `SameAs` stand-in into
         //     `ctx.resop_refs[idx]` and `bind_op`'ed it. When `emit`
         //     never arrived to upgrade the binding to a real producer,
         //     the stand-in itself is the chain target carrier.
@@ -3648,7 +3648,7 @@ impl Optimizer {
         ctx: &mut OptContext,
     ) {
         // The canonical `OpRc` is threaded in so a later slice can collapse
-        // `ensure_box(op.pos.get())` to `BoxRef::from_bound_op(op_rc)`. For now
+        // `materialize_box_at(op.pos.get())` to `BoxRef::from_bound_op(op_rc)`. For now
         // the body reads through this `&Op` view (Deref), behaviour-identical.
         let op: &Op = op_rc;
         // 5: Box.type lives intrinsically on `OpRef.ty()` (variant
@@ -3681,19 +3681,22 @@ impl Optimizer {
             // producer is registered yet — a short-preamble / bridge operand
             // dispatched mid-pass through `send_extra_operation`, whose
             // producer is neither emitted nor in `resop_refs` —
-            // `get_box_replacement_box` returns None. `ensure_box` then mints
-            // and registers the canonical `_forwarded` host (the "Box always
-            // exists" invariant, resoperation.py:233) and we walk it to its
-            // terminal, so the stored arg is BOUND on every dispatch path.
-            // This lets operand readers resolve through `get_box_replacement`
-            // (the minted host is now in `resop_refs`) instead of needing
-            // their own `ensure_box` mint fallback.
+            // `get_box_replacement_box` returns None. `materialize_box_at`
+            // then mints and registers the canonical `_forwarded` host (the
+            // "Box always exists" invariant, resoperation.py:233) and we walk
+            // it to its terminal, so the stored arg is BOUND on every dispatch
+            // path. A sentinel operand keeps its unbound arg box (const
+            // operands resolve through the `Some` arm above).
             let resolved = match ctx.get_box_replacement_box(arg.to_opref()) {
                 Some(b) => b,
-                None => ctx
-                    .ensure_box(arg.to_opref())
-                    .map(|b| b.get_box_replacement(false))
-                    .unwrap_or_else(|| arg.clone()),
+                None => {
+                    let argref = arg.to_opref();
+                    if argref.is_none() {
+                        arg.clone()
+                    } else {
+                        ctx.materialize_box_at(argref).get_box_replacement(false)
+                    }
+                }
             };
             resolved_op.setarg(i, resolved);
         }
@@ -4041,7 +4044,7 @@ impl Optimizer {
             // `optimizer.py:137-151` where `isinstance(opinfo,
             // InstancePtrInfo)` mutates in place.
             // optimizer.py:137-152 `make_constant_class` always updates
-            // `_forwarded` — `ensure_box` materializes the Box so the
+            // `_forwarded` — `materialize_box_at` materializes the Box so the
             // write is never silently skipped. Same materializer feeds
             // the `last_guard_pos` read; `info.py:91-103
             // get_last_guard_pos` reads the PtrInfo field (None if no
@@ -4588,12 +4591,8 @@ mod tests {
                     // Replace with first arg
                     let old = op.pos.get();
                     let new = op.arg(0).to_opref();
-                    let b_old = ctx
-                        .ensure_box(old)
-                        .expect("body-namespace OpRef must have a BoxRef slot");
-                    let b_new = ctx
-                        .ensure_box(new)
-                        .expect("body-namespace OpRef must have a BoxRef slot");
+                    let b_old = ctx.materialize_box_at(old);
+                    let b_new = ctx.materialize_box_at(new);
                     ctx.make_equal_to(&b_old, &b_new);
                     return OptimizationResult::Remove;
                 }
@@ -6004,9 +6003,7 @@ mod tests {
         // for the test, every slot uses Ref to match the producer-side shape
         // (`inputarg_from_tp` per opencoder.py:259 with all Ref args).
         let mut ctx = OptContext::with_inputarg_types(32, &vec![Type::Ref; 1024]);
-        let b10 = ctx
-            .ensure_box(OpRef::int_op(10))
-            .expect("body-namespace OpRef must have a BoxRef slot");
+        let b10 = ctx.materialize_box_at(OpRef::int_op(10));
         ctx.set_ptr_info(
             &b10,
             PtrInfo::VirtualStruct(VirtualStructInfo {
@@ -6016,16 +6013,10 @@ mod tests {
                 avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
             }),
         );
-        let b11 = ctx
-            .ensure_box(OpRef::int_op(11))
-            .expect("body-namespace OpRef must have a BoxRef slot");
-        let b20 = ctx
-            .ensure_box(OpRef::int_op(20))
-            .expect("body-namespace OpRef must have a BoxRef slot");
+        let b11 = ctx.materialize_box_at(OpRef::int_op(11));
+        let b20 = ctx.materialize_box_at(OpRef::int_op(20));
         ctx.make_equal_to(&b11, &b20);
-        let b20 = ctx
-            .ensure_box(OpRef::int_op(20))
-            .expect("body-namespace OpRef must have a BoxRef slot");
+        let b20 = ctx.materialize_box_at(OpRef::int_op(20));
         ctx.set_ptr_info(
             &b20,
             PtrInfo::VirtualStruct(VirtualStructInfo {
@@ -6075,9 +6066,7 @@ mod tests {
                 .with_all_fielddescrs(vec![field_descr_typed]),
         );
         let mut ctx = OptContext::with_inputarg_types(16, &[Type::Ref]);
-        let b10 = ctx
-            .ensure_box(OpRef::ref_op(10))
-            .expect("body-namespace OpRef must have a BoxRef slot");
+        let b10 = ctx.materialize_box_at(OpRef::ref_op(10));
         ctx.set_ptr_info(
             &b10,
             PtrInfo::VirtualStruct(VirtualStructInfo {

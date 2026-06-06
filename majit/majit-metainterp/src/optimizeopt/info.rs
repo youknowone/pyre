@@ -822,7 +822,7 @@ fn force_box_impl(
     // `box_` is the bound BoxRef of the virtual being forced (callers resolve
     // op -> box before delegating). The OpRef view drives op identity (pos,
     // logging, alloc-vs-original comparisons); the box drives every
-    // make_equal_to / set_ptr_info receiver, so no `ensure_box` round-trip is
+    // make_equal_to / set_ptr_info receiver, so no `materialize_box_at` round-trip is
     // needed for the forwarding writes.
     let opref = box_.to_opref();
 
@@ -1576,9 +1576,7 @@ mod tests {
     fn test_str_ptr_info_plain_constant_string_spec_rejects_intbound_constant_chars() {
         let mut ctx = OptContext::new(16);
         let ch = OpRef::int_op(10);
-        let ch_box = ctx
-            .ensure_box(ch)
-            .expect("body-namespace OpRef must have a BoxRef slot");
+        let ch_box = ctx.materialize_box_at(ch);
         ctx.setintbound(&ch_box, &IntBound::from_constant(97));
 
         assert_eq!(
@@ -1615,9 +1613,7 @@ mod tests {
         ctx.make_constant(OpRef::int_op(21), Value::Int(2));
 
         let source = OpRef::int_op(1);
-        let source_box = ctx
-            .ensure_box(source)
-            .expect("body-namespace OpRef must have a BoxRef slot");
+        let source_box = ctx.materialize_box_at(source);
         ctx.set_ptr_info(
             &source_box,
             PtrInfo::Str(StrPtrInfo {
@@ -1667,9 +1663,7 @@ mod tests {
             last_guard_pos: -1,
             avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
         });
-        let pos2 = ctx
-            .ensure_box(OpRef::int_op(2))
-            .expect("body-namespace OpRef must have a BoxRef slot");
+        let pos2 = ctx.materialize_box_at(OpRef::int_op(2));
         ctx.set_ptr_info(
             &pos2,
             PtrInfo::Str(StrPtrInfo {

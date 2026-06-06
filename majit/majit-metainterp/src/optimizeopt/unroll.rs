@@ -1930,7 +1930,7 @@ pub struct ExportedState {
     pub patchguardop: Option<majit_ir::Op>,
     /// `OptContext::next_pos` at end of Phase 1 — strict upper bound of
     /// every OpRef Phase 1 allocated, including intermediates folded /
-    /// forwarded away. `reserve_pos_typed` skips `ensure_box` on the
+    /// forwarded away. `reserve_pos_typed` skips `materialize_box_at` on the
     /// zero-inputarg / retrace baselines (`optimizeopt/mod.rs:2026`),
     /// so capturing `ctx.next_pos` at export is the only reliable
     /// floor. Phase 2 / retrace seed their TraceIterator namespace
@@ -2923,7 +2923,7 @@ impl OptUnroll {
         // `OptContext::next_pos` is the strict upper bound on raw OpRefs
         // Phase 1 allocated, including intermediates folded / forwarded
         // away before any structure-stored field could observe them.
-        // `reserve_pos_typed` skips `ensure_box` on the zero-inputarg /
+        // `reserve_pos_typed` skips `materialize_box_at` on the zero-inputarg /
         // retrace baselines (`optimizeopt/mod.rs:2026`), so capturing
         // `ctx.next_pos` at export is the only reliable floor for
         // `opref_high_water()` to feed retrace's `start_fresh`.
@@ -2960,7 +2960,7 @@ impl OptUnroll {
                 }
                 // S-0.C: `box_pool[*ia_opref].bound_inputarg()` resolves
                 // to the same `InputArgRc` as `inputarg_refs[idx]` after
-                // `ensure_inputarg_bindings` / `ensure_box`'s InputArg
+                // `ensure_inputarg_bindings` / `materialize_box_at`'s InputArg
                 // placeholder arm have run (both write the canonical
                 // `InputArgRc` matching the OpRef's type). Drop the
                 // box_pool fallback — fall through to a fresh `InputArg`
@@ -4654,9 +4654,7 @@ fn assemble_peeled_trace_with_jump_args(
         );
         if let Some(&jump_source) = filtered_extra_jump_args.get(i) {
             if !jump_source.is_none() && jump_source != source_slot {
-                let b_js = ctx
-                    .ensure_box(jump_source)
-                    .expect("body-namespace OpRef must have a BoxRef slot");
+                let b_js = ctx.materialize_box_at(jump_source);
                 let b_ela = ctx.get_box_replacement(extended_label_arg);
                 ctx.make_equal_to(&b_js, &b_ela);
                 assembly_alias_remap.insert(jump_source, extended_label_arg);
@@ -6249,10 +6247,10 @@ mod tests {
         // directly on the box's _forwarded slot via setintbound.
         // widen() relaxes bounds: lower < MININT/2 → MININT, upper > MAXINT/2 → MAXINT.
         // For [10, 20], both are within MININT/2..MAXINT/2 so widen() preserves them.
-        let imported_bound = ctx2
-            .ensure_box(OpRef::int_op(21))
-            .map(|b| ctx2.getintbound_handle(&b).borrow().clone())
-            .expect("getintbound: operand must resolve to a BoxRef");
+        let imported_bound = {
+            let __mb = ctx2.materialize_box_at(OpRef::int_op(21));
+            ctx2.getintbound_handle(&__mb).borrow().clone()
+        };
         assert_eq!((imported_bound.lower, imported_bound.upper), (10, 20));
     }
 
@@ -6625,9 +6623,7 @@ mod tests {
         // make_equal_to, but the test still walks the get_box_replacement
         // chain inside force_box's add_preamble_op, so install a manual
         // forwarding to the body-visible OpRef to exercise that path.
-        let b_src = ctx
-            .ensure_box(OpRef::ref_op(19))
-            .expect("body-namespace OpRef must have a BoxRef slot");
+        let b_src = ctx.materialize_box_at(OpRef::ref_op(19));
         let b_tgt = ctx.get_box_replacement(OpRef::ref_op(14));
         ctx.make_equal_to(&b_src, &b_tgt);
         let pop = crate::optimizeopt::info::PreambleOp {

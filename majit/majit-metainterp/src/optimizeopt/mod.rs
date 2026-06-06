@@ -742,7 +742,7 @@ pub struct OptContext {
     pub(crate) inputarg_refs: Vec<majit_ir::InputArgRc>,
     /// Synthetic `OpRc` stand-ins for ResOp BoxRef placeholders whose
     /// real producer has not been (and may never be) emitted, indexed
-    /// sparsely by `OpRef::raw()`. `ensure_box` falls back to
+    /// sparsely by `OpRef::raw()`. `materialize_box_at` falls back to
     /// synthesising a `SameAsI/F/R` (or `Jump`) Op with the requested
     /// type and binding the BoxRef to it so `make_equal_to` routes a
     /// chain step that targets such a placeholder through
@@ -1638,8 +1638,8 @@ impl OptContext {
         // `self.inputargs` because Phase 2 walks the body half with the same
         // per-arg types). Pre-populating `inputarg_refs` for both subsets makes
         // every InputArg OpRef resolve through `inputarg_refs` (read path:
-        // `resolve_to_boxref` / `read_forwarded`; write path: `ensure_box`'s
-        // InputArg branch). `ensure_box` type-repairs any position this derive
+        // `resolve_to_boxref` / `read_forwarded`; write path: `materialize_box_at`'s
+        // InputArg branch). `materialize_box_at` type-repairs any position this derive
         // misses. Both loops no-op when `self.inputargs` is empty
         // (`seed_boxes_canonical` fixtures populate `inputarg_refs` directly).
         // Void slots are skipped: `InputArg{Int,Ref,Float}` has no Void
@@ -1667,11 +1667,11 @@ impl OptContext {
 
     /// Ensure `inputarg_refs[pos]` holds a canonical `InputArgRc` of type
     /// `tp` (the `_forwarded` host that `resolve_to_boxref` / `read_forwarded`
-    /// / `clear_forwarded` / `ensure_box` route the matching InputArg OpRef
+    /// / `clear_forwarded` / `materialize_box_at` route the matching InputArg OpRef
     /// through). Idempotent: keeps an existing same-shape host (preserving any
     /// `_forwarded` chain / live `Weak<InputArg>` chain targets on it) and only
     /// (re)allocates when the slot is absent or its type/index mismatch (mirrors
-    /// the `ensure_box` InputArg arm).
+    /// the `materialize_box_at` InputArg arm).
     fn bind_canonical_inputarg(&mut self, pos: usize, tp: majit_ir::Type) {
         if pos >= self.inputarg_refs.len() {
             self.inputarg_refs
@@ -1756,7 +1756,7 @@ impl OptContext {
     /// decorate `newop` directly. In pyre's producer-registry model the
     /// equivalent is to make `restart_op` the SOLE registered producer at
     /// its position: `find_producer_op(pos)` then returns `restart_op`, so
-    /// `ensure_box(pos)` / `from_bound_op(restart_op)` agree on one canonical
+    /// `materialize_box_at(pos)` / `from_bound_op(restart_op)` agree on one canonical
     /// `_forwarded` host, and the bound the re-dispatch accumulates survives
     /// `emit`'s `live_synthetics` catch-up onto the emitted op.
     ///
@@ -1867,7 +1867,7 @@ impl OptContext {
             _ => {}
         }
         // A ResOp position with no producer in any canonical store resolves
-        // to `None`: the caller's `ensure_box` mints a `SameAs*` synthetic
+        // to `None`: the caller's `materialize_box_at` mints a `SameAs*` synthetic
         // into `resop_refs[opref]` and binds it, so the next `find_producer_op`
         // (and hence the next `resolve_to_boxref` / `make_constant` chain)
         // reaches that same `_forwarded` host. Routing a ResOp OpRef to
@@ -1907,7 +1907,7 @@ impl OptContext {
     /// is distributed by its bound identity: InputArg boxes land in
     /// `inputarg_refs[index]`, ResOp boxes in `resop_refs[pos]`. This
     /// replaces the retired `ctx.box_pool = vec![..]` fixture pattern so
-    /// `resolve_to_boxref` / `ensure_box` / `find_producer_op` resolve each
+    /// `resolve_to_boxref` / `materialize_box_at` / `find_producer_op` resolve each
     /// OpRef through the same canonical hosts production uses, returning a
     /// fresh `BoxRef` bound to the seeded `Op` / `InputArg`.
     #[cfg(test)]
@@ -2073,21 +2073,21 @@ impl OptContext {
     /// synthetics: importers that allocate a position purely to carry a
     /// forwarded write (PtrInfo / IntBound / Const for an imported virtual
     /// state leaf) get a bound write target in one step, instead of
-    /// `alloc_op_position_typed` followed by a lazy `ensure_box(opref)`
+    /// `alloc_op_position_typed` followed by a lazy `materialize_box_at(opref)`
     /// re-materialization. The minted synthetic is identical to the one
-    /// `ensure_box`'s producer-less arm mints (`mint_synthetic_resop`), so
+    /// `materialize_box_at`'s producer-less arm mints (`mint_synthetic_resop`), so
     /// a later `emit()` for the same position supersedes it through the
     /// same `live_synthetics` catch-up. Reserve a bare position via
     /// `alloc_op_position_typed` instead when no forwarded write follows
     /// (e.g. an `Unknown` leaf), to avoid an eager synthetic for a
     /// position that is never written.
-    /// Explicit "create" half of the former find-or-create `ensure_box`:
+    /// Explicit "create" half of the find-or-create `materialize_box_at`:
     /// mint a `SameAs*` synthetic at `opref` and return a BoxRef bound to it,
     /// so a subsequent `set_forwarded_*` lands on the canonical `Op._forwarded`
     /// host. `opref` must be a non-const, non-sentinel resop position whose
     /// producer is not yet emitted (a virgin alias). Callers reach this only on
     /// the `None` arm of `get_box_replacement_box`; an already-minted or
-    /// producer-backed opref resolves there. Mirrors `ensure_box`'s resop
+    /// producer-backed opref resolves there. Mirrors `materialize_box_at`'s resop
     /// lazy-alloc arm (`mint_synthetic_resop` + bind).
     pub(crate) fn mint_box_at(&mut self, opref: OpRef) -> crate::r#box::BoxRef {
         let tp = opref.ty().unwrap_or(majit_ir::Type::Void);
@@ -2208,7 +2208,7 @@ impl OptContext {
             .and_then(|info| info.get_known_str_length(self, mode));
         if let Some(len) = known_len {
             let len_opref = self.make_constant_int(len);
-            // BoxRef shim — write path through `ensure_box` per the
+            // BoxRef shim — write path through `materialize_box_at` per the
             // "Box always exists" invariant for set_forwarded mirrors.
             if let Some(b) = self.get_box_replacement_box(resolved) {
                 self.set_str_lgtop(&b, len_opref);
@@ -2257,12 +2257,12 @@ impl OptContext {
         let result = self.emit_extra(self.current_pass_idx, strlen_op);
         // vstring.py:116: lengthop.set_forwarded(self.getlenbound(mode))
         // `set_forwarded` writes the bound unconditionally; route through
-        // `ensure_box` so the new STRLEN/UNICODELEN box materializes for
+        // `materialize_box_at` so the new STRLEN/UNICODELEN box materializes for
         // the IntBound install ("Box always exists" per resoperation.py:233-248).
         // BoxRef shim for `get_str_lenbound(&BoxRef)`; lazy-install of
         // lenbound on the StrPtrInfo is a PtrInfo-internal mutation that
         // RPython performs on the StrPtrInfo instance directly. Route
-        // through `ensure_box` so the BoxRef exists for the chain walk.
+        // through `materialize_box_at` so the BoxRef exists for the chain walk.
         let lenbound = self
             .get_box_replacement_box(resolved)
             .as_ref()
@@ -2349,7 +2349,7 @@ impl OptContext {
     pub(crate) fn reserve_pos_typed(&mut self, tp: majit_ir::Type) -> OpRef {
         let raw = self.allocate_next_pos_raw();
         // The position's canonical host is materialized lazily on first
-        // access (`ensure_box` / `resolve_to_boxref` mint a `SameAs*`
+        // access (`materialize_box_at` / `resolve_to_boxref` mint a `SameAs*`
         // synthetic into `resop_refs[raw]` keyed by the full OpRef). No eager
         // pre-mint here: an eager synthetic for a position that is reserved
         // but never emitted (label / jump positions on an empty trace) would
@@ -2567,13 +2567,13 @@ impl OptContext {
         Self::debug_assert_box_type_invariant(&op);
         let op_pos = op.pos.get();
         let op_rc = std::rc::Rc::new(op);
-        // Catch up any BoxRef placeholder that `ensure_box` created for
+        // Catch up any BoxRef placeholder that `materialize_box_at` created for
         // `op_pos` ahead of this emit (forward-reference path).
         // `resoperation.py:233 _forwarded` lives on the operation
         // object; late binding establishes that connection so
         // subsequent `box.set_forwarded` reaches `op.forwarded`.
         //
-        // The synthetic stand-in registered for `op_pos` by `ensure_box` /
+        // The synthetic stand-in registered for `op_pos` by `materialize_box_at` /
         // `bind_input_resops` is the `live_synthetics` entry at this position.
         // Migrate its `_forwarded` onto the real producer (resoperation.py:233
         // `_forwarded` lives on the op) and drop it from `live_synthetics` so
@@ -2614,7 +2614,7 @@ impl OptContext {
         let op_rc = std::rc::Rc::new(op);
         // Register the queued op as the producer for its position, mirroring
         // `bind_input_resops`: `find_producer_op(pos)` then resolves box lookups
-        // for this position — `ensure_box(pos)` and operand resolution alike —
+        // for this position — `materialize_box_at(pos)` and operand resolution alike —
         // to this `OpRc`'s `_forwarded` host (resoperation.py:233) instead of a
         // freshly-minted stand-in, keeping a single box identity per position.
         // `emit`'s `live_synthetics` catch-up upgrades the binding to the real
@@ -3313,10 +3313,14 @@ impl OptContext {
                 return;
             }
         }
-        // BoxRef-direct write — authoritative.
-        let b = self
-            .ensure_box(source)
-            .expect("body-namespace OpRef must have a BoxRef slot");
+        // shortpreamble.py:425 `preamble_op.set_forwarded(info)`. The replay
+        // OpRef is a short-preamble op whose producer may not be registered
+        // yet (the Pure / Heap / LoopInvariant replay slot is seeded here,
+        // before the short-preamble body that builds the producing op).
+        // `materialize_box_at` returns the canonical host, minting a `SameAs*`
+        // synthetic into `resop_refs` when absent; `emit()` later re-binds it
+        // to the real producer, carrying the forwarded state across.
+        let b = self.materialize_box_at(source);
         match info {
             OpInfo::Unknown => b.clear_forwarded(),
             other => b.set_forwarded_info(other.clone()),
@@ -3439,12 +3443,11 @@ impl OptContext {
         }
         // BoxRef shim for `set_ptr_info` / `make_nonnull` calls below.
         // RPython `unroll.py:54` `op = get_box_replacement(op)` followed
-        // by `op.set_forwarded(...)` writes unconditionally; route through
-        // `ensure_box` so the "Box always exists" invariant holds even
-        // when the BoxRef has not yet been materialized.
-        let Some(op_box) = self.ensure_box(op) else {
-            return;
-        };
+        // by `op.set_forwarded(...)` writes unconditionally; `op` was
+        // chain-resolved and checked non-forwarded / non-constant above, so
+        // `materialize_box_at` returns its canonical `_forwarded` host
+        // (minting one only for an unbound preamble/test slot).
+        let op_box = self.materialize_box_at(op);
 
         // unroll.py:60-64: virtual — set_forwarded + recurse, then return.
         // Identity-preserving install: clone the `Rc` (not the inner
@@ -3590,13 +3593,14 @@ impl OptContext {
                     // unroll.py:49: item.set_forwarded(None)
                     // "let's not inherit stuff we don't know anything about"
                     // Clears `item`'s OWN slot, not the chain terminal —
-                    // `ensure_box` returns the BoxRef at item's pool slot
-                    // directly without `get_box_replacement` walking. For
-                    // a const-namespace OpRef, `ensure_box` returns a
-                    // fresh `BoxRef::new_const` whose `clear_forwarded` is
-                    // a no-op (Const has no `_forwarded`), matching
-                    // RPython where `Const.set_forwarded` raises.
-                    if let Some(b) = self.ensure_box(item) {
+                    // `resolve_to_boxref` returns the BoxRef bound to item's
+                    // canonical `_forwarded` host directly, without
+                    // `get_box_replacement` walking. For a const-namespace
+                    // OpRef it returns a fresh `BoxRef::new_const` whose
+                    // `clear_forwarded` is a no-op (Const has no
+                    // `_forwarded`), matching RPython where
+                    // `Const.set_forwarded` raises.
+                    if let Some(b) = self.resolve_to_boxref(item) {
                         b.clear_forwarded();
                     }
                 }
@@ -3659,9 +3663,7 @@ impl OptContext {
             // unroll.py:93-96 IntBound with widen(): intersect unconditionally.
             OpInfo::IntBound(bound) => {
                 let widened = bound.borrow().widen();
-                let target_box = self
-                    .ensure_box(target)
-                    .expect("body-namespace OpRef must have a BoxRef slot");
+                let target_box = self.materialize_box_at(target);
                 self.with_intbound_mut(&target_box, |bm| {
                     let _ = bm.intersect(&widened);
                 });
@@ -3710,9 +3712,7 @@ impl OptContext {
             }
             OpInfo::IntBound(bound) => {
                 let widened = bound.borrow().widen();
-                let target_box = self
-                    .ensure_box(target)
-                    .expect("body-namespace OpRef must have a BoxRef slot");
+                let target_box = self.materialize_box_at(target);
                 self.with_intbound_mut(&target_box, |bm| {
                     let _ = bm.intersect(&widened);
                 });
@@ -4080,7 +4080,7 @@ impl OptContext {
         if let Some(pos) = terminal.position() {
             let tp = terminal.type_();
             // `Type::Void` targets are lazy-allocated phantom placeholders
-            // (`ensure_box` fallback for OpRef variants with no `ty()`); the
+            // (`materialize_box_at` fallback for OpRef variants with no `ty()`); the
             // placeholder carries no type information, so preserve the source variant via `with_raw`
             // instead of promoting to `void_op` / `input_arg_typed(_, Void)`.
             if matches!(tp, majit_ir::Type::Void) {
@@ -4138,9 +4138,9 @@ impl OptContext {
         // variant-aware canonical-host resolver (producer `Op` for ResOp
         // variants, `inputarg_refs` for InputArg, inline-Const for Const),
         // rather than `box_pool.get` whose position-collapse merges a ResOp
-        // and an InputArg sharing a raw slot index. Production `ensure_box`
+        // and an InputArg sharing a raw slot index. Production `materialize_box_at`
         // binds every resop slot to the same producer `Op`, so reads here
-        // and writes through `ensure_box` agree by hitting the identical
+        // and writes through `materialize_box_at` agree by hitting the identical
         // `Op.forwarded` / `InputArg.forwarded` host. A `None` resolve
         // (sentinel, or a position with no producer / inputarg / const)
         // leaves callers on the OpRef-returning walker fallback.
@@ -4148,44 +4148,32 @@ impl OptContext {
         Some(start.get_box_replacement(false))
     }
 
-    /// RPython "Box always exists" invariant materializer
-    /// (`resoperation.py:233-248 AbstractResOpOrInputArg._forwarded`).
-    ///
-    /// Returns a `BoxRef` for `opref`, materializing the canonical
-    /// `Op`/`InputArg` host for non-const OpRefs if absent. Mirrors PyPy's model
-    /// where every operand in a trace has a backing `AbstractValue`; write
-    /// paths (`setintbound`, `set_ptr_info`, `with_intbound_mut`,
-    /// `with_ptr_info_mut`, `make_constant_class`, …) MUST use this helper
-    /// — `get_box_replacement_box` returns `None` for absent slots which
-    /// would silently lose the forwarded write (parity regression).
-    ///
-    /// For const-namespace OpRefs, constructs a fresh `BoxRef::new_const
-    /// (value)` from `const_pool` per `history.py:220 ConstInt` no-dedup
-    /// parity — Const boxes have no `_forwarded` slot so any write the
-    /// caller attempts is a `BoxRef::set_forwarded_info` no-op (asserts on
-    /// Const internally).
-    ///
-    /// Returns `None` only for:
-    /// - `opref.is_none()` (sentinel — RPython has no equivalent)
-    /// - const OpRef with no `const_pool` entry (test fixture skipped seed)
-    pub fn ensure_box(&mut self, opref: OpRef) -> Option<crate::r#box::BoxRef> {
-        if opref.is_none() {
-            return None;
-        }
+    /// "Box always exists" materializer (`resoperation.py:233-248
+    /// AbstractResOpOrInputArg._forwarded`). Returns the canonical
+    /// `Op` / `InputArg` `_forwarded` host for `opref`, minting a `SameAs*`
+    /// synthetic into `resop_refs` when no producer is registered yet (the
+    /// lazy-alloc arm). For a const-namespace OpRef returns a fresh
+    /// `BoxRef::new_const` (`history.py:220` no-dedup; Const boxes have no
+    /// `_forwarded`, so any write the caller attempts is a no-op). Unlike
+    /// `resolve_to_boxref` it never returns `None` for a value-bearing OpRef
+    /// — the explicit-mint endpoint (#47) at find-or-create write sites whose
+    /// receiver may be unbound (test fixtures, short-preamble replay slots).
+    /// The sentinel `OpRef::none()` has no box (debug-asserted); resolve it
+    /// with `resolve_to_boxref` / `get_box_replacement_box` instead.
+    pub(crate) fn materialize_box_at(&mut self, opref: OpRef) -> crate::r#box::BoxRef {
+        debug_assert!(
+            !opref.is_none(),
+            "materialize_box_at: sentinel OpRef::none() has no box"
+        );
         if opref.is_constant() {
             // history.py:220/261/307: a Const carries its Value on the OpRef.
-            // The strict materializer has no notion of a "Const without a
-            // Value", so a const OpRef that carries none is a caller bug —
-            // fail loud rather than silently drop the forwarded write (the
-            // tolerant `get_box_replacement_box` returns None for the same
-            // input).
             let value = self.get_constant(opref).unwrap_or_else(|| {
                 panic!(
-                    "ensure_box: const OpRef {opref:?} carries no Value — \
+                    "materialize_box_at: const OpRef {opref:?} carries no Value — \
                      a Const carries its Value (history.py:220/261/307)"
                 )
             });
-            return Some(crate::r#box::BoxRef::new_const(value));
+            return crate::r#box::BoxRef::new_const(value);
         }
         // S-8.A.4: align the write-path host with `resolve_to_boxref`
         // (the read path behind `get_box_replacement_box`). For ResOp
@@ -4199,7 +4187,7 @@ impl OptContext {
         // (no producing op), falling through to the InputArg / lazy-alloc
         // paths below unchanged.
         if let Some(op_rc) = self.find_producer_op(opref) {
-            return Some(crate::r#box::BoxRef::from_bound_op(&op_rc));
+            return crate::r#box::BoxRef::from_bound_op(&op_rc);
         }
         // InputArg write path: route through the canonical `inputarg_refs`
         // host (symmetric with `resolve_to_boxref`'s InputArg branch and the
@@ -4234,9 +4222,7 @@ impl OptContext {
                 self.inputarg_refs[idx] =
                     std::rc::Rc::new(majit_ir::InputArg::from_type(tp, idx as u32));
             }
-            return Some(crate::r#box::BoxRef::from_bound_inputarg(
-                &self.inputarg_refs[idx],
-            ));
+            return crate::r#box::BoxRef::from_bound_inputarg(&self.inputarg_refs[idx]);
         }
         // Existing entries keep their construction-time shape (the recorder
         // / `with_inputarg_types` plant authoritative BoxRefs upstream);
@@ -4253,7 +4239,7 @@ impl OptContext {
         // store (else it returned above), so it falls through to the
         // lazy-alloc arm below, which mints a `SameAs*` synthetic into
         // `resop_refs[opref]` and binds a BoxRef to it. A subsequent
-        // `ensure_box` / `find_producer_op` for the same OpRef re-resolves to
+        // `materialize_box_at` / `find_producer_op` for the same OpRef re-resolves to
         // that synthetic (`resop_refs[opref].pos == opref`), so the synthetic is
         // the stable `_forwarded` host across calls; no memoization side-table
         // is needed.
@@ -4326,7 +4312,7 @@ impl OptContext {
         // InputArg arm, only reachable in `#[cfg(test)]` since production
         // InputArgs resolve through the `inputarg_refs` branch above), so it
         // carries the canonical `_forwarded` host.
-        Some(placeholder)
+        placeholder
     }
 
     /// `optimizer.py:1009 getptrinfo + info.is_virtual()` BoxRef-routing
@@ -4569,9 +4555,7 @@ impl OptContext {
             // circuits on `box.is_constant()` before reaching `set_forwarded`;
             // seed_constant is the recorder/bulk-seed entry where the
             // forwarding slot is authoritative when present).
-            let box_at = self
-                .ensure_box(opref)
-                .expect("body-namespace OpRef must have a BoxRef slot");
+            let box_at = self.materialize_box_at(opref);
             if matches!(box_at.get_forwarded(), crate::r#box::Forwarded::None) {
                 box_at.set_forwarded_const(majit_ir::Const::from_value(value));
             }
@@ -4613,7 +4597,7 @@ impl OptContext {
             return None;
         }
         // BoxRef-authoritative reader. IntBound writers populate the
-        // BoxRef via `ensure_box`.
+        // BoxRef via `materialize_box_at`.
         let b = self.get_box_replacement_box(replaced)?;
         b.int_bound().map(|ib| ib.clone())
     }
@@ -4702,7 +4686,7 @@ impl OptContext {
         use crate::optimizeopt::info::OpInfo;
         // optimizer.py:116: assert op.type == 'i' — structural assert,
         // matches RPython's release-build invariant. Type::Void boxes are
-        // pyre-only phantom placeholders surfaced by `ensure_box` when the
+        // pyre-only phantom placeholders surfaced by `materialize_box_at` when the
         // recorder has not yet typed the position; accept them as the pyre
         // equivalent of RPython's "the trace typing hasn't reached this
         // OpRef yet" tolerance (PRE-EXISTING-ADAPTATION on the placeholder
@@ -4762,7 +4746,7 @@ impl OptContext {
         use crate::r#box::Forwarded;
         use crate::optimizeopt::info::OpInfo;
         // optimizer.py:99-100: assert op.type == 'i'. Active in release
-        // builds per upstream. Void-typed phantoms (`ensure_box` lazy-alloc)
+        // builds per upstream. Void-typed phantoms (`materialize_box_at` lazy-alloc)
         // are accepted because they are placeholder boxes pending recorder
         // typing — their chain walk may still terminate at an int-typed
         // Const/InputArg.
@@ -4816,11 +4800,14 @@ impl OptContext {
     /// Mirrors PyPy optimizer.py:432: `box.set_forwarded(constbox)`.
     /// The constant Box carries the fresh Const identity.
     pub fn make_constant(&mut self, opref: OpRef, value: Value) {
-        let b = self
-            .get_box_replacement_box(opref)
-            // `get_box_replacement_box` already returned `None` here, so the
-            // `_forwarded` walk is the identity on `opref`; materialize it.
-            .or_else(|| self.ensure_box(opref));
+        // optimizer.py:415/432 `box = get_box_replacement(box); box.set_forwarded(constbox)`.
+        // Resolve the chain terminal; for a body-namespace operand with no
+        // registered producer yet (preamble / test slot) materialize its
+        // `_forwarded` host so the constant forwarding lands. A sentinel
+        // `opref` has no host to forward.
+        let b = self.get_box_replacement_box(opref).or_else(|| {
+            (!opref.is_none() && !opref.is_constant()).then(|| self.materialize_box_at(opref))
+        });
         if let Some(b) = b {
             self.make_constant_box(&b, value);
         }
@@ -6863,7 +6850,7 @@ impl OptContext {
         // optimizer.py:128: if op.type == 'r' or self.is_raw_ptr(op):
         //
         // `Box.type` is intrinsic in upstream — never Void. In pyre,
-        // `ensure_box` lazy-creates `Type::Void` phantom placeholders
+        // `materialize_box_at` lazy-creates `Type::Void` phantom placeholders
         // for OpRefs the recorder has not yet typed; the chain walker
         // hop into the terminal Box (which carries the proper type via
         // `BoxRef::new_const` for Const targets) recovers the
@@ -6983,9 +6970,7 @@ impl OptContext {
         if terminal.is_constant() {
             return;
         }
-        let b = self
-            .ensure_box(terminal)
-            .expect("body-namespace OpRef must have a BoxRef slot");
+        let b = self.materialize_box_at(terminal);
         let already_set = !matches!(b.get_forwarded(), crate::r#box::Forwarded::None);
         if !already_set {
             b.set_forwarded_info(OpInfo::ptr(info));
@@ -7044,7 +7029,7 @@ impl OptContext {
         opref: OpRef,
     ) -> Option<&mut crate::optimizeopt::info::PtrInfo> {
         use crate::optimizeopt::info::PtrInfo;
-        // Use ensure_box (non-walking, &mut self) so the original
+        // Use materialize_box_at (non-walking, &mut self) so the original
         // BoxRef is materialized — getptrinfo's internal chain
         // walk then advances from the original BoxRef whose position
         // is preserved, allowing the opref_type fallback to read the
@@ -7075,7 +7060,7 @@ impl OptContext {
     ) -> Option<&mut crate::optimizeopt::info::PtrInfo> {
         use crate::optimizeopt::info::PtrInfo;
         // info.py:719: ref = self._const.getref_base()
-        // Use ensure_box (non-walking, &mut self) so the original
+        // Use materialize_box_at (non-walking, &mut self) so the original
         // BoxRef is materialized — getptrinfo's internal chain
         // walk then advances from the original BoxRef whose position
         // is preserved, allowing the opref_type fallback to read the
@@ -7133,7 +7118,7 @@ impl OptContext {
         use crate::optimizeopt::info::PtrInfo;
         // info.py:729: ref = self._const.getref_base() — same dispatch as
         // _get_info; route through getptrinfo for the op.type contract.
-        // Use ensure_box (non-walking, &mut self) so the original
+        // Use materialize_box_at (non-walking, &mut self) so the original
         // BoxRef is materialized — getptrinfo's internal chain
         // walk then advances from the original BoxRef whose position
         // is preserved, allowing the opref_type fallback to read the
@@ -7534,9 +7519,7 @@ impl OptContext {
         // optimizer.py:497: opinfo.last_guard_pos = last_guard_pos
         new_info.set_last_guard_pos(last_guard_pos);
         // optimizer.py:498: arg0.set_forwarded(opinfo)
-        let bx = self
-            .ensure_box(arg0)
-            .expect("body-namespace OpRef must have a BoxRef slot");
+        let bx = self.materialize_box_at(arg0);
         use crate::optimizeopt::info::OpInfo;
         bx.set_forwarded_info(OpInfo::ptr(new_info));
         // optimizer.py:499: return opinfo — hand back the BoxRef so subsequent
@@ -7942,9 +7925,7 @@ mod boxref_forwarding_tests {
         // Forward to an inline-Const target — history.py:227 ConstInt.value
         // carries the value on the Box itself, no const_pool seed needed.
         let const_opref = OpRef::const_int(42);
-        let b_const = ctx
-            .ensure_box(const_opref)
-            .expect("inline-Const carries the value on the Box");
+        let b_const = ctx.materialize_box_at(const_opref);
         ctx.make_equal_to(&b0, &b_const);
         // The IntBound on old is gone (overwritten by Forwarded::Op(const)).
         // Const targets do not carry transferred info — PyPy skips this case.
@@ -8021,14 +8002,12 @@ mod boxref_forwarding_tests {
         ctx.seed_boxes_canonical(&[b0.clone(), b1.clone()]);
         // (a) Const-namespace OpRef terminates at a Const box.
         let const_opref = OpRef::const_int(7);
-        let const_box = ctx.ensure_box(const_opref).expect("const box");
+        let const_box = ctx.materialize_box_at(const_opref);
         assert!(const_box.get_box_replacement(false).is_constant());
         // (b) `Forwarded::Box(constbox)` chain on a non-Const-namespace OpRef.
-        let b0_iarg = ctx
-            .ensure_box(OpRef::input_arg_int(0))
-            .expect("body-namespace OpRef must have a BoxRef slot");
+        let b0_iarg = ctx.materialize_box_at(OpRef::input_arg_int(0));
         ctx.make_equal_to(&b0_iarg, &const_box);
-        let b0_after = ctx.ensure_box(OpRef::input_arg_int(0)).expect("b0");
+        let b0_after = ctx.materialize_box_at(OpRef::input_arg_int(0));
         assert!(b0_after.get_box_replacement(false).is_constant());
         // `Forwarded::Box(constbox)` planted directly via set_forwarded_box.
         b1.set_forwarded_box(BoxRef::new_const(Value::Int(42)));
@@ -8078,9 +8057,7 @@ mod boxref_forwarding_tests {
     fn h3_4_replace_op_const_target_mirrors_value_box() {
         let (mut ctx, b0, _b1, _ia_holder) = ctx_with_two_int_boxes();
         let const_opref = OpRef::const_int(42);
-        let b_const = ctx
-            .ensure_box(const_opref)
-            .expect("inline-Const carries the value on the Box");
+        let b_const = ctx.materialize_box_at(const_opref);
         ctx.make_equal_to(&b0, &b_const);
         match &b0.get_forwarded() {
             BoxForwarded::Const(majit_ir::Const::Int(v)) => {
@@ -8098,9 +8075,7 @@ mod boxref_forwarding_tests {
     fn get_box_replacement_not_const_stops_before_const_target() {
         let (mut ctx, b0, b1, _ia_holder) = ctx_with_two_int_boxes();
         let const_opref = OpRef::const_int(42);
-        let b_const = ctx
-            .ensure_box(const_opref)
-            .expect("inline-Const carries the value on the Box");
+        let b_const = ctx.materialize_box_at(const_opref);
         ctx.make_equal_to(&b0, &b_const);
 
         assert_eq!(
@@ -8176,9 +8151,7 @@ mod boxref_forwarding_tests {
         // then calls `set_ptr_info(target_p1, info)`. Replicate the
         // post-walk write directly.
         let info = PtrInfo::NonNull { last_guard_pos: -1 };
-        let target_p1_box = ctx
-            .ensure_box(target_p1)
-            .expect("body-namespace OpRef must resolve to a BoxRef");
+        let target_p1_box = ctx.materialize_box_at(target_p1);
         ctx.set_ptr_info(&target_p1_box, info.clone());
 
         // Read via BoxRef-routing path: walk source's chain to placeholder.
@@ -8949,7 +8922,7 @@ mod constant_ptr_info_tests {
         let mut ctx = OptContext::new(0);
         let opref = OpRef::ref_op(10_000);
         ctx.seed_constant(opref, Value::Ref(GcRef(0xdead_beef)));
-        let b = ctx.ensure_box(opref).expect("box");
+        let b = ctx.materialize_box_at(opref);
         match ctx.getptrinfo(&b) {
             Some(PtrInfo::Constant(g)) => assert_eq!(g.0, 0xdead_beef),
             other => panic!("expected ConstPtrInfo(0xdeadbeef), got {other:?}"),
@@ -8966,7 +8939,7 @@ mod constant_ptr_info_tests {
         let mut ctx = OptContext::new(0);
         let opref = OpRef::int_op(10_002);
         ctx.seed_constant(opref, Value::Int(42));
-        let b = ctx.ensure_box(opref).expect("box");
+        let b = ctx.materialize_box_at(opref);
         match ctx.getptrinfo(&b) {
             Some(PtrInfo::Constant(g)) => assert_eq!(g.0, 42),
             other => panic!("expected ConstPtrInfo(42), got {other:?}"),
@@ -9058,12 +9031,8 @@ mod constant_ptr_info_tests {
         let parent = OpRef::ref_op(10_010);
         let slice = OpRef::ref_op(10_011);
 
-        let parent_box = ctx
-            .ensure_box(parent)
-            .expect("body-namespace OpRef must have a BoxRef slot");
-        let slice_box = ctx
-            .ensure_box(slice)
-            .expect("body-namespace OpRef must have a BoxRef slot");
+        let parent_box = ctx.materialize_box_at(parent);
+        let slice_box = ctx.materialize_box_at(slice);
         ctx.set_ptr_info(
             &parent_box,
             PtrInfo::VirtualRawBuffer(VirtualRawBufferInfo::new(0, 32, None)),
@@ -9098,9 +9067,7 @@ mod constant_ptr_info_tests {
         // Synthetic-OpRef test fixture: lazy-allocate the BoxRef so the
         // BoxRef-direct `make_nonnull_str` can write through it. Production
         // callers obtain the box via `get_box_replacement_box`.
-        let op_box = ctx
-            .ensure_box(opref)
-            .expect("body-namespace OpRef must have a BoxRef slot");
+        let op_box = ctx.materialize_box_at(opref);
 
         ctx.make_nonnull_str(&op_box, 0);
 
@@ -9450,9 +9417,7 @@ mod ensure_ptr_info_arg0_tests {
     fn ensure_ptr_info_arg0_upgrades_nonnull_to_struct() {
         let mut ctx = OptContext::with_inputarg_types(4, &[Type::Ref]);
         // Pre-install a NonNullPtrInfo with a specific last_guard_pos.
-        let pos0_box = ctx
-            .ensure_box(OpRef::input_arg_ref(0))
-            .expect("body-namespace OpRef must have a BoxRef slot");
+        let pos0_box = ctx.materialize_box_at(OpRef::input_arg_ref(0));
         ctx.set_ptr_info(&pos0_box, PtrInfo::NonNull { last_guard_pos: 7 });
         let _parent = struct_parent_descr();
         let op = field_op_with_parent(_parent.clone());
@@ -9474,9 +9439,7 @@ mod ensure_ptr_info_arg0_tests {
     #[test]
     fn ensure_ptr_info_arg0_does_not_overwrite_existing_instance() {
         let mut ctx = OptContext::with_inputarg_types(4, &[Type::Ref]);
-        let pos0_box = ctx
-            .ensure_box(OpRef::input_arg_ref(0))
-            .expect("body-namespace OpRef must have a BoxRef slot");
+        let pos0_box = ctx.materialize_box_at(OpRef::input_arg_ref(0));
         ctx.set_ptr_info(
             &pos0_box,
             PtrInfo::instance(Some(instance_parent_descr()), Some(0xc0de)),
@@ -9611,10 +9574,10 @@ mod intbound_invariant_tests {
         let mut ctx = OptContext::new(0);
         let opref = OpRef::ref_op(20_000);
         ctx.seed_constant(opref, Value::Ref(GcRef(0xdead_beef)));
-        let _ = ctx
-            .ensure_box(opref)
-            .map(|b| ctx.getintbound_handle(&b).borrow().clone())
-            .expect("getintbound: operand must resolve to a BoxRef");
+        let _ = {
+            let __mb = ctx.materialize_box_at(opref);
+            ctx.getintbound_handle(&__mb).borrow().clone()
+        };
     }
 
     #[test]
@@ -9729,12 +9692,8 @@ mod opt_box_env_tests {
         let mut ctx = OptContext::with_num_inputs(16, 0);
         let source = OpRef::ref_op(12);
         let target = OpRef::ref_op(21);
-        let source_box = ctx
-            .ensure_box(source)
-            .expect("body-namespace OpRef must have a BoxRef slot");
-        let target_box = ctx
-            .ensure_box(target)
-            .expect("body-namespace OpRef must have a BoxRef slot");
+        let source_box = ctx.materialize_box_at(source);
+        let target_box = ctx.materialize_box_at(target);
         ctx.make_equal_to(&source_box, &target_box);
         ctx.set_ptr_info(
             &target_box,
@@ -9756,16 +9715,15 @@ mod opt_box_env_tests {
     }
 
     #[test]
-    fn ensure_box_lazy_materialises_inputarg_for_empty_inputarg_slot() {
+    fn materialize_box_at_lazy_materialises_inputarg_for_empty_inputarg_slot() {
         // `resoperation.py:699 AbstractInputArg` and
         // `resoperation.py:250 AbstractResOp` are distinct classes
         // upstream — a Box materialised against `OpRef::InputArg*`
         // must be `is_inputarg()` so the chain walker reconstructs
         // the same variant on the round-trip through
         // `Forwarded::Box`.  Prior to the per-variant empty-slot
-        // path, `ensure_box` routed through `ensure_box_at_typed`
-        // which always emits `new_resop`, silently demoting the
-        // inputarg.
+        // path, materialisation always emitted `new_resop`,
+        // silently demoting the inputarg.
         // `with_inputarg_types` would seed the inputarg slots
         // eagerly, defeating the lazy-materialisation check.  Use
         // `with_num_inputs(_, 0)` to get an empty pool then hand an
@@ -9774,9 +9732,7 @@ mod opt_box_env_tests {
         // mint a `new_inputarg`.
         let mut ctx = OptContext::with_num_inputs(8, 0);
         let arg = OpRef::input_arg_typed(0, majit_ir::Type::Int);
-        let materialised = ctx
-            .ensure_box(arg)
-            .expect("InputArg OpRef must materialise a BoxRef");
+        let materialised = ctx.materialize_box_at(arg);
         assert!(
             materialised.is_inputarg(),
             "empty InputArg* slot lazy-materialised the wrong BoxKind",
@@ -9787,12 +9743,10 @@ mod opt_box_env_tests {
         // Re-entering must resolve to the same canonical `_forwarded`
         // host (`resoperation.py:700 AbstractInputArg._forwarded`). The
         // `BoxRef` wrapper carries no state post-S-0.C, so two
-        // `ensure_box` calls return distinct wrappers bound to the same
-        // `InputArgRc`; identity lives on that bound host, not the
+        // `materialize_box_at` calls return distinct wrappers bound to the
+        // same `InputArgRc`; identity lives on that bound host, not the
         // wrapper `Rc`.
-        let second = ctx
-            .ensure_box(arg)
-            .expect("InputArg OpRef must continue to resolve");
+        let second = ctx.materialize_box_at(arg);
         assert!(
             std::rc::Rc::ptr_eq(
                 &materialised
@@ -9800,19 +9754,17 @@ mod opt_box_env_tests {
                     .expect("materialised bound to InputArg"),
                 &second.bound_inputarg().expect("second bound to InputArg"),
             ),
-            "second ensure_box must resolve to the same InputArg host",
+            "second materialize_box_at must resolve to the same InputArg host",
         );
     }
 
     #[test]
-    fn ensure_box_lazy_materialises_resop_for_empty_resop_slot() {
+    fn materialize_box_at_lazy_materialises_resop_for_empty_resop_slot() {
         // Companion to the InputArg case — `OpRef::int_op(_)` must
         // continue to produce a `new_resop` Box so `is_resop()` holds.
         let mut ctx = OptContext::with_num_inputs(8, 0);
         let result = OpRef::int_op(3);
-        let materialised = ctx
-            .ensure_box(result)
-            .expect("ResOp OpRef must materialise a BoxRef");
+        let materialised = ctx.materialize_box_at(result);
         assert!(
             materialised.is_resop(),
             "empty ResOp slot lazy-materialised the wrong BoxKind",

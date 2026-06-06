@@ -100,7 +100,7 @@ pub fn copy_str_content(
     // vstring.py:341-347: determine inline threshold M using intbound
     // A producer-less operand has no forwarded bound; getintbound returns
     // unbounded for it, so resolve-or-unbounded matches the prior
-    // ensure_box (mint synthetic → unbounded) behavior without minting.
+    // materialize_box_at (mint synthetic → unbounded) behavior without minting.
     let srcoffset_bound = ctx
         .get_box_replacement_box(srcoffsetbox)
         .map(|b| ctx.getintbound_handle(&b).borrow().clone())
@@ -370,7 +370,7 @@ impl OptString {
         ctx: &mut OptContext,
         f: impl FnOnce(&mut VStringPlainInfo) -> R,
     ) -> Option<R> {
-        // When `opref` does not resolve, `ensure_box` would mint a fresh
+        // When `opref` does not resolve, `materialize_box_at` would mint a fresh
         // box carrying no PtrInfo, so `with_ptr_info_mut` returns `None`
         // either way — the `?` early-out is equivalent without the mint.
         let b = ctx.get_box_replacement_box(opref)?;
@@ -1576,9 +1576,7 @@ mod tests {
 
     fn set_vstring_plain(ctx: &mut OptContext, opref: OpRef, chars: Vec<Option<OpRef>>) {
         let length = chars.len() as i32;
-        let b = ctx
-            .ensure_box(opref)
-            .expect("body-namespace OpRef must have a BoxRef slot");
+        let b = ctx.materialize_box_at(opref);
         ctx.set_ptr_info(
             &b,
             PtrInfo::Str(StrPtrInfo {
@@ -1594,9 +1592,7 @@ mod tests {
     }
 
     fn set_vstring_concat(ctx: &mut OptContext, opref: OpRef, vleft: OpRef, vright: OpRef) {
-        let b = ctx
-            .ensure_box(opref)
-            .expect("body-namespace OpRef must have a BoxRef slot");
+        let b = ctx.materialize_box_at(opref);
         ctx.set_ptr_info(
             &b,
             PtrInfo::Str(StrPtrInfo {
@@ -1616,9 +1612,7 @@ mod tests {
     }
 
     fn set_vstring_slice(ctx: &mut OptContext, opref: OpRef, s: OpRef, start: OpRef, lgtop: OpRef) {
-        let b = ctx
-            .ensure_box(opref)
-            .expect("body-namespace OpRef must have a BoxRef slot");
+        let b = ctx.materialize_box_at(opref);
         ctx.set_ptr_info(
             &b,
             PtrInfo::Str(StrPtrInfo {
@@ -1866,9 +1860,7 @@ mod tests {
 
         // start is not a literal ConstInt box; it is only known via IntBound.
         let start_ref = OpRef::int_op(300);
-        let start_box = ctx
-            .ensure_box(start_ref)
-            .expect("body-namespace OpRef must have a BoxRef slot");
+        let start_box = ctx.materialize_box_at(start_ref);
         ctx.with_intbound_mut(&start_box, |b| {
             *b = IntBound::from_constant(1);
         });
@@ -1922,9 +1914,7 @@ mod tests {
         // non-virtual StrPtrInfo with `mode = 1` so that later getstrlen
         // selects UNICODELEN instead of STRLEN.
         // Synthetic-OpRef test fixture: lazy-allocate BoxRef for the unicode_ref slot.
-        let unicode_box = ctx
-            .ensure_box(unicode_ref)
-            .expect("body-namespace OpRef must have a BoxRef slot");
+        let unicode_box = ctx.materialize_box_at(unicode_ref);
         ctx.make_nonnull_str(&unicode_box, 1);
 
         let len_ref = pass.getstrlen(unicode_ref, &mut ctx);
@@ -2339,9 +2329,7 @@ mod tests {
         let mut ctx = OptContext::with_num_inputs_and_start_pos(4, 0, 0, 50);
         let p0 = OpRef::ref_op(0);
         // Non-virtual Str with unknown length
-        let p0_box = ctx
-            .ensure_box(p0)
-            .expect("body-namespace OpRef must have a BoxRef slot");
+        let p0_box = ctx.materialize_box_at(p0);
         ctx.set_ptr_info(
             &p0_box,
             PtrInfo::Str(StrPtrInfo {
@@ -2430,9 +2418,7 @@ mod tests {
 
         // srcbox (p0): non-null string, not virtual
         let p0 = OpRef::ref_op(0);
-        let p0_box = ctx
-            .ensure_box(p0)
-            .expect("body-namespace OpRef must have a BoxRef slot");
+        let p0_box = ctx.materialize_box_at(p0);
         ctx.set_ptr_info(
             &p0_box,
             PtrInfo::Str(StrPtrInfo {
@@ -2451,9 +2437,7 @@ mod tests {
         // lengthbox (i2): int with constant intbound = 2
         // Use an OpRef with IntBound set (not a literal constant)
         let i2 = OpRef::int_op(2);
-        let i2_box = ctx
-            .ensure_box(i2)
-            .expect("body-namespace OpRef must have a BoxRef slot");
+        let i2_box = ctx.materialize_box_at(i2);
         ctx.with_intbound_mut(&i2_box, |b| {
             *b = IntBound::from_constant(2);
         });
@@ -2498,9 +2482,7 @@ mod tests {
     fn test_getstrlen_opref_on_nonvirtual() {
         let mut ctx = OptContext::with_num_inputs_and_start_pos(10, 0, 0, 50);
         let arg2 = OpRef::ref_op(1);
-        let arg2_box = ctx
-            .ensure_box(arg2)
-            .expect("body-namespace OpRef must have a BoxRef slot");
+        let arg2_box = ctx.materialize_box_at(arg2);
 
         ctx.set_ptr_info(
             &arg2_box,
@@ -2548,9 +2530,7 @@ mod tests {
         let arg2 = OpRef::ref_op(1);
 
         // Attach non-virtual StrPtrInfo to arg2 with lgtop=None.
-        let arg2_box = ctx
-            .ensure_box(arg2)
-            .expect("body-namespace OpRef must have a BoxRef slot");
+        let arg2_box = ctx.materialize_box_at(arg2);
         ctx.set_ptr_info(
             &arg2_box,
             PtrInfo::Str(StrPtrInfo {

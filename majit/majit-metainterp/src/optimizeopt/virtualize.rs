@@ -121,7 +121,8 @@ impl VirtualizableTracker {
                     .as_ref()
                     .map_or(false, |b| ctx.has_ptr_info(b));
                 if !second_check {
-                    if let Some(b) = ctx.ensure_box(OpRef::input_arg_ref(0)) {
+                    {
+                        let b = ctx.materialize_box_at(OpRef::input_arg_ref(0));
                         ctx.set_ptr_info(
                             &b,
                             PtrInfo::Virtualizable(VirtualizableFieldState {
@@ -222,9 +223,8 @@ impl VirtualizableTracker {
             }
         }
 
-        if let Some(b) = ctx.ensure_box(OpRef::input_arg_ref(0)) {
-            ctx.set_ptr_info(&b, PtrInfo::Virtualizable(state));
-        }
+        let b = ctx.materialize_box_at(OpRef::input_arg_ref(0));
+        ctx.set_ptr_info(&b, PtrInfo::Virtualizable(state));
     }
 
     fn is_standard_ref(&self, b: &crate::r#box::BoxRef, ctx: &OptContext) -> bool {
@@ -2737,9 +2737,7 @@ mod tests {
         // without destroying the tracked field state.
         // opencoder.py:259 inputarg_from_tp — vable is the sole Ref inputarg.
         let mut ctx = OptContext::with_inputarg_types(8, &[Type::Ref]);
-        let vable_box = ctx
-            .ensure_box(OpRef::input_arg_ref(0))
-            .expect("body-namespace OpRef must have a BoxRef slot");
+        let vable_box = ctx.materialize_box_at(OpRef::input_arg_ref(0));
         ctx.set_ptr_info(
             &vable_box,
             PtrInfo::Virtualizable(VirtualizableFieldState {
@@ -4508,9 +4506,7 @@ mod tests {
 
         // Pre-populate VirtualRawBuffer info for specified OpRefs
         for &(opref, size) in raw_bufs {
-            let b = ctx
-                .ensure_box(opref)
-                .expect("body-namespace OpRef must have a BoxRef slot");
+            let b = ctx.materialize_box_at(opref);
             ctx.set_ptr_info(
                 &b,
                 PtrInfo::VirtualRawBuffer(VirtualRawBufferInfo::new(0, size, None)),
