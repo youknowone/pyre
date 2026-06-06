@@ -7101,7 +7101,7 @@ mod tests {
         live_locals: &[u32],
         live_stack_depths: &[usize],
         init: impl FnOnce(&mut PyFrame),
-    ) -> (Box<PyFrame>, *const (), usize) {
+    ) -> (pyre_interpreter::pyframe::FrameBox, *const (), usize) {
         use pyre_interpreter::compile_exec;
         use pyre_jit_trace::state as trace_state;
 
@@ -7146,7 +7146,7 @@ mod tests {
         function_name: &str,
         target_depth: u16,
         init: impl FnOnce(&mut PyFrame),
-    ) -> (Box<PyFrame>, *const (), usize) {
+    ) -> (pyre_interpreter::pyframe::FrameBox, *const (), usize) {
         use pyre_interpreter::compile_exec;
         use pyre_jit_trace::state as trace_state;
 

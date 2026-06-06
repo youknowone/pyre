@@ -428,26 +428,27 @@ fn call_user_function_with_eval(
     // PyPy: generator.py GeneratorIterator.__init__ wraps PyFrame.
     // RustPython compiler uses CodeFlags::GENERATOR instead of RETURN_GENERATOR opcode.
     if crate::pyframe::code_flags_make_generator(code_ref.flags) {
-        let mut gen_frame = PyFrame::try_new_for_call_with_closure_and_globals_obj(
+        let gen_frame =
+            crate::pyframe::FrameBox::new(PyFrame::try_new_for_call_with_closure_and_globals_obj(
+                w_code,
+                &final_args,
+                globals,
+                w_globals_obj,
+                frame.execution_context,
+                closure,
+            )?);
+        return gen_frame.into_generator();
+    }
+
+    let mut func_frame =
+        crate::pyframe::FrameBox::new(PyFrame::try_new_for_call_with_closure_and_globals_obj(
             w_code,
             &final_args,
             globals,
             w_globals_obj,
             frame.execution_context,
             closure,
-        )?;
-        gen_frame.fix_array_ptrs();
-        return gen_frame.run();
-    }
-
-    let mut func_frame = PyFrame::try_new_for_call_with_closure_and_globals_obj(
-        w_code,
-        &final_args,
-        globals,
-        w_globals_obj,
-        frame.execution_context,
-        closure,
-    )?;
+        )?);
     func_frame.fix_array_ptrs();
     let _caller_locals_root = FrameLocalsRoot::new(frame);
     let _callee_locals_root = FrameLocalsRoot::new_mut(&mut func_frame);
@@ -476,28 +477,29 @@ pub fn call_user_function_resolved(
 
     // Generator function
     if crate::pyframe::code_flags_make_generator(code_ref.flags) {
-        let mut gen_frame = PyFrame::try_new_for_call_with_closure_and_globals_obj(
+        let gen_frame =
+            crate::pyframe::FrameBox::new(PyFrame::try_new_for_call_with_closure_and_globals_obj(
+                w_code,
+                args,
+                globals,
+                w_globals_obj,
+                frame.execution_context,
+                closure,
+            )?);
+        return gen_frame.into_generator();
+    }
+
+    let eval_fn = get_eval_fn();
+
+    let mut func_frame =
+        crate::pyframe::FrameBox::new(PyFrame::try_new_for_call_with_closure_and_globals_obj(
             w_code,
             args,
             globals,
             w_globals_obj,
             frame.execution_context,
             closure,
-        )?;
-        gen_frame.fix_array_ptrs();
-        return gen_frame.run();
-    }
-
-    let eval_fn = get_eval_fn();
-
-    let mut func_frame = PyFrame::try_new_for_call_with_closure_and_globals_obj(
-        w_code,
-        args,
-        globals,
-        w_globals_obj,
-        frame.execution_context,
-        closure,
-    )?;
+        )?);
     func_frame.fix_array_ptrs();
     let _caller_locals_root = FrameLocalsRoot::new(frame);
     let _callee_locals_root = FrameLocalsRoot::new_mut(&mut func_frame);
@@ -633,26 +635,27 @@ pub fn call_user_function_plain_with_ctx(
     let final_args = fill_user_function_args(callable, code_ref, args)?;
 
     if crate::pyframe::code_flags_make_generator(code_ref.flags) {
-        let mut gen_frame = PyFrame::try_new_for_call_with_closure_and_globals_obj(
+        let gen_frame =
+            crate::pyframe::FrameBox::new(PyFrame::try_new_for_call_with_closure_and_globals_obj(
+                w_code,
+                &final_args,
+                globals,
+                w_globals_obj,
+                execution_context,
+                closure,
+            )?);
+        return gen_frame.into_generator();
+    }
+
+    let mut func_frame =
+        crate::pyframe::FrameBox::new(PyFrame::try_new_for_call_with_closure_and_globals_obj(
             w_code,
             &final_args,
             globals,
             w_globals_obj,
             execution_context,
             closure,
-        )?;
-        gen_frame.fix_array_ptrs();
-        return gen_frame.run();
-    }
-
-    let mut func_frame = PyFrame::try_new_for_call_with_closure_and_globals_obj(
-        w_code,
-        &final_args,
-        globals,
-        w_globals_obj,
-        execution_context,
-        closure,
-    )?;
+        )?);
     func_frame.fix_array_ptrs();
     let _callee_locals_root = FrameLocalsRoot::new_mut(&mut func_frame);
     func_frame.run()
@@ -1346,7 +1349,7 @@ pub fn call_with_kwargs(
             let globals = unsafe { function_get_globals(callable) };
             let w_globals_obj = unsafe { function_get_globals_obj(callable) };
             let closure = unsafe { function_get_closure(callable) };
-            let mut func_frame =
+            let mut func_frame = crate::pyframe::FrameBox::new(
                 crate::pyframe::PyFrame::try_new_for_call_with_closure_and_globals_obj(
                     w_code,
                     &final_args,
@@ -1354,7 +1357,8 @@ pub fn call_with_kwargs(
                     w_globals_obj,
                     frame.execution_context,
                     closure,
-                )?;
+                )?,
+            );
             func_frame.fix_array_ptrs();
             let plain_mode = FORCE_PLAIN_EVAL.with(|c| c.get() > 0);
             let eval_fn = if plain_mode {
@@ -1753,7 +1757,33 @@ fn call_user_function_with_args(func: PyObjectRef, args: &[PyObjectRef]) -> PyOb
 
     // Generator function: wrap frame in generator object
     if crate::pyframe::code_flags_make_generator(code_ref.flags) {
-        let mut gen_frame = match PyFrame::try_new_for_call_with_closure_and_globals_obj(
+        let gen_frame = crate::pyframe::FrameBox::new(
+            match PyFrame::try_new_for_call_with_closure_and_globals_obj(
+                w_code,
+                &final_args,
+                globals,
+                w_globals_obj,
+                exec_ctx,
+                closure,
+            ) {
+                Ok(f) => f,
+                Err(e) => {
+                    set_call_error(e);
+                    return PY_NULL;
+                }
+            },
+        );
+        return match gen_frame.into_generator() {
+            Ok(v) => v,
+            Err(e) => {
+                set_call_error(e);
+                PY_NULL
+            }
+        };
+    }
+
+    let mut frame = crate::pyframe::FrameBox::new(
+        match PyFrame::try_new_for_call_with_closure_and_globals_obj(
             w_code,
             &final_args,
             globals,
@@ -1766,31 +1796,8 @@ fn call_user_function_with_args(func: PyObjectRef, args: &[PyObjectRef]) -> PyOb
                 set_call_error(e);
                 return PY_NULL;
             }
-        };
-        gen_frame.fix_array_ptrs();
-        return match gen_frame.run() {
-            Ok(v) => v,
-            Err(e) => {
-                set_call_error(e);
-                PY_NULL
-            }
-        };
-    }
-
-    let mut frame = match PyFrame::try_new_for_call_with_closure_and_globals_obj(
-        w_code,
-        &final_args,
-        globals,
-        w_globals_obj,
-        exec_ctx,
-        closure,
-    ) {
-        Ok(f) => f,
-        Err(e) => {
-            set_call_error(e);
-            return PY_NULL;
-        }
-    };
+        },
+    );
     frame.fix_array_ptrs();
     match frame.execute_frame(None, None) {
         Ok(v) => v,
@@ -1823,17 +1830,18 @@ fn call_user_function_resolved_frameless(func: PyObjectRef, args: &[PyObjectRef]
     };
     let code_ref = unsafe { &*func_code };
 
-    let mut frame = PyFrame::new_for_call_with_closure_and_globals_obj(
-        w_code,
-        args,
-        globals,
-        w_globals_obj,
-        exec_ctx,
-        closure,
-    );
+    let mut frame =
+        crate::pyframe::FrameBox::new(PyFrame::new_for_call_with_closure_and_globals_obj(
+            w_code,
+            args,
+            globals,
+            w_globals_obj,
+            exec_ctx,
+            closure,
+        ));
     frame.fix_array_ptrs();
     if crate::pyframe::code_flags_make_generator(code_ref.flags) {
-        return match frame.run() {
+        return match frame.into_generator() {
             Ok(v) => v,
             Err(e) => {
                 set_call_error(e);
@@ -2218,14 +2226,15 @@ fn build_class_inner(
         pyre_object::is_instance(w) && !crate::type_methods::resolve_dict_backing(w).is_null()
     });
 
-    let mut frame = PyFrame::try_new_for_call_with_closure_and_globals_obj(
-        w_code,
-        &[],
-        globals,
-        w_globals_obj,
-        exec_ctx,
-        closure,
-    )?;
+    let mut frame =
+        crate::pyframe::FrameBox::new(PyFrame::try_new_for_call_with_closure_and_globals_obj(
+            w_code,
+            &[],
+            globals,
+            w_globals_obj,
+            exec_ctx,
+            closure,
+        )?);
     if let Some(w_ns) = mapping_namespace {
         frame.setdictscope_object(w_ns)?;
     } else {

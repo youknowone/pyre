@@ -142,8 +142,8 @@ pub unsafe fn header_of(obj_addr: usize) -> *mut GcHeader {
 /// (`init_gc_object(result, typeid, flags=0)`), and return
 /// `obj = result + size_gc_header`. The header is zeroed (`tid = 0`, all
 /// flags clear) so a write barrier reading `*(obj - SIZE)` sees
-/// `TRACK_YOUNG_PTRS = 0` / `OLDGEN_TRACKED = 0` and skips the object: it is
-/// immortal (leaked), not tracked by the nursery or old generation.
+/// `TRACK_YOUNG_PTRS = 0` and skips the object: it is immortal (leaked), not
+/// tracked by the nursery or old generation.
 ///
 /// The allocation is intentionally leaked — these objects outlive every
 /// collection until the managed allocator takes them over. Callers MUST NOT
@@ -234,7 +234,6 @@ mod tests {
             // Zeroed header => barrier reads TRACK_YOUNG_PTRS=0 and skips.
             assert_eq!((*hdr).tid_and_flags, 0);
             assert!(!(*hdr).has_flag(flags::TRACK_YOUNG_PTRS));
-            assert!(!(*hdr).has_flag(flags::OLDGEN_TRACKED));
         }
     }
 

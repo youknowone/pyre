@@ -138,9 +138,9 @@ impl OldGen {
 
     /// Check whether `obj_addr` is the payload address of a tracked old-gen object.
     ///
-    /// Linear over `objects`; the write barrier no longer needs this (it reads
-    /// the `OLDGEN_TRACKED` header flag in O(1)), so the remaining callers are
-    /// cold paths (`is_managed_heap_object`, weakref scanning).
+    /// Linear over `objects`; the write barrier does not use this (it gates on
+    /// the `TRACK_YOUNG_PTRS` header flag), so the callers are cold paths
+    /// (`is_managed_heap_object`, weakref scanning).
     pub fn contains(&self, obj_addr: usize) -> bool {
         self.objects
             .iter()

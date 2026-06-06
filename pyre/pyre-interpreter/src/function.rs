@@ -2031,20 +2031,25 @@ fn _flat_pycall(
     let closure = unsafe { function_get_closure(func) };
 
     // function.py:208-209 — createframe(code, w_func_globals, self)
-    let mut new_frame = match crate::pyframe::PyFrame::try_new_for_call_with_closure_and_globals_obj(
-        code,
-        &[], // locals filled below directly from stack
-        globals,
-        w_globals_obj,
-        frame.execution_context,
-        closure,
-    ) {
-        Ok(f) => f,
-        Err(e) => {
-            crate::call::set_call_error(e);
-            return pyre_object::PY_NULL;
-        }
-    };
+    // FrameBox: the callee runs through the JIT, so it must be a
+    // header-bearing heap frame (write barrier reads a valid header at
+    // frame - GC_HEADER_SIZE) rather than a bare interpreter-stack frame.
+    let mut new_frame = crate::pyframe::FrameBox::new(
+        match crate::pyframe::PyFrame::try_new_for_call_with_closure_and_globals_obj(
+            code,
+            &[], // locals filled below directly from stack
+            globals,
+            w_globals_obj,
+            frame.execution_context,
+            closure,
+        ) {
+            Ok(f) => f,
+            Err(e) => {
+                crate::call::set_call_error(e);
+                return pyre_object::PY_NULL;
+            }
+        },
+    );
 
     // function.py:210-211 — copy from stack into locals directly
     // peekvalue(nargs-1-i) gives bottom-to-top order (matching local slot order)
@@ -2053,14 +2058,13 @@ fn _flat_pycall(
     }
     frame.dropvalues(dropvalues);
     new_frame.fix_array_ptrs();
-    let _caller_locals_root = FrameLocalsRoot::new(frame);
-    let _callee_locals_root = FrameLocalsRoot::new(&mut new_frame);
 
     // function.py:214 — return new_frame.run(self.name, self.qualname)
-    // Check generator/coroutine: run() wraps into generator object instead
-    // of executing the body. For normal functions, use the JIT-aware eval.
+    // Generator/coroutine: wrap the frame in a generator object and hand it
+    // ownership (no execution). Normal functions execute through the JIT-aware
+    // eval, which needs the locals roots registered for the duration.
     if new_frame._is_generator_or_coroutine() {
-        match new_frame.run() {
+        match new_frame.into_generator() {
             Ok(v) => v,
             Err(e) => {
                 crate::call::set_call_error(e);
@@ -2068,6 +2072,8 @@ fn _flat_pycall(
             }
         }
     } else {
+        let _caller_locals_root = FrameLocalsRoot::new(frame);
+        let _callee_locals_root = FrameLocalsRoot::new(&mut new_frame);
         let eval_fn = crate::call::get_eval_fn();
         match eval_fn(&mut new_frame) {
             Ok(v) => v,
@@ -2099,20 +2105,23 @@ fn _flat_pycall_defaults(
     let w_globals_obj = unsafe { function_get_globals_obj(func) };
     let closure = unsafe { function_get_closure(func) };
 
-    let mut new_frame = match crate::pyframe::PyFrame::try_new_for_call_with_closure_and_globals_obj(
-        code,
-        &[], // locals filled below
-        globals,
-        w_globals_obj,
-        frame.execution_context,
-        closure,
-    ) {
-        Ok(f) => f,
-        Err(e) => {
-            crate::call::set_call_error(e);
-            return pyre_object::PY_NULL;
-        }
-    };
+    // FrameBox: header-bearing heap frame for the JIT write barrier.
+    let mut new_frame = crate::pyframe::FrameBox::new(
+        match crate::pyframe::PyFrame::try_new_for_call_with_closure_and_globals_obj(
+            code,
+            &[], // locals filled below
+            globals,
+            w_globals_obj,
+            frame.execution_context,
+            closure,
+        ) {
+            Ok(f) => f,
+            Err(e) => {
+                crate::call::set_call_error(e);
+                return pyre_object::PY_NULL;
+            }
+        },
+    );
 
     // function.py:221-222 — copy positional args from stack
     for i in 0..nargs {
@@ -2134,12 +2143,10 @@ fn _flat_pycall_defaults(
 
     frame.dropvalues(dropvalues);
     new_frame.fix_array_ptrs();
-    let _caller_locals_root = FrameLocalsRoot::new(frame);
-    let _callee_locals_root = FrameLocalsRoot::new(&mut new_frame);
 
     // function.py:231 — return new_frame.run(self.name, self.qualname)
     if new_frame._is_generator_or_coroutine() {
-        match new_frame.run() {
+        match new_frame.into_generator() {
             Ok(v) => v,
             Err(e) => {
                 crate::call::set_call_error(e);
@@ -2147,6 +2154,8 @@ fn _flat_pycall_defaults(
             }
         }
     } else {
+        let _caller_locals_root = FrameLocalsRoot::new(frame);
+        let _callee_locals_root = FrameLocalsRoot::new(&mut new_frame);
         let eval_fn = crate::call::get_eval_fn();
         match eval_fn(&mut new_frame) {
             Ok(v) => v,

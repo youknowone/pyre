@@ -223,6 +223,110 @@ pub unsafe fn dealloc_array_with_gc_header(ptr: *mut FixedObjectArray) {
     }
 }
 
+/// Heap layout for a managed `PyFrame`: a leading GC header followed by
+/// the frame body. The header occupies [`GC_HEADER_SIZE`] bytes and stays
+/// zeroed (`type_id = 0`, `flags = 0`) so the write-barrier fast-path reads
+/// `TRACK_YOUNG_PTRS = 0` at `frame - GC_HEADER_SIZE` and skips the slow
+/// path. Mirrors `FixedObjectArray`'s header prefix and the callee-frame
+/// allocation in `pyre-jit::call_jit`, realising the documented invariant
+/// that every heap `PyFrame` is a header-bearing GC object.
+#[repr(C)]
+struct GcFramePrefix {
+    gc_header: u64,
+    frame: PyFrame,
+}
+
+// The frame must sit exactly GC_HEADER_SIZE bytes into the prefix: the write
+// barrier reads the header at `frame - GC_HEADER_SIZE`, and FrameBox::drop
+// reconstructs the owning Box from that same address. A future PyFrame field
+// with alignment greater than the header word would make `#[repr(C)]` pad the
+// frame to a larger offset and silently break both, so pin the offset here.
+const _: () = assert!(std::mem::offset_of!(GcFramePrefix, frame) == GC_HEADER_SIZE);
+
+/// Owning handle to a heap [`PyFrame`] allocated with a leading GC header.
+/// Dereferences to the inner `PyFrame`; the header lives at
+/// `self.ptr - GC_HEADER_SIZE`. Replaces the bare `Box<PyFrame>` so the
+/// frame the JIT treats as the virtualizable is a real GC object with a
+/// valid header at `frame - GC_HEADER_SIZE`.
+pub struct FrameBox {
+    ptr: *mut PyFrame,
+}
+
+impl FrameBox {
+    /// Move `frame` onto the heap behind a zeroed GC header.
+    pub fn new(frame: PyFrame) -> Self {
+        let raw = Box::into_raw(Box::new(GcFramePrefix {
+            gc_header: 0,
+            frame,
+        }));
+        let ptr = unsafe { std::ptr::addr_of_mut!((*raw).frame) };
+        FrameBox { ptr }
+    }
+
+    /// Relinquish ownership, returning the inner-frame pointer. The header
+    /// remains at `ptr - GC_HEADER_SIZE`; reclaim via [`FrameBox::from_raw`].
+    pub fn into_raw(self) -> *mut PyFrame {
+        let ptr = self.ptr;
+        std::mem::forget(self);
+        ptr
+    }
+
+    /// Reconstruct ownership from a pointer previously produced by
+    /// [`FrameBox::into_raw`].
+    ///
+    /// # Safety
+    /// `ptr` must originate from [`FrameBox::into_raw`] / [`FrameBox::new`]
+    /// and must not have been freed.
+    pub unsafe fn from_raw(ptr: *mut PyFrame) -> Self {
+        FrameBox { ptr }
+    }
+
+    /// Raw pointer to the inner frame (header at `ptr - GC_HEADER_SIZE`).
+    pub fn as_mut_ptr(&mut self) -> *mut PyFrame {
+        self.ptr
+    }
+
+    /// pyframe.py:259 initialize_as_generator — wrap this frame in a generator
+    /// object that takes ownership of it. PyPy does `GeneratorIterator(self)`:
+    /// the generator references the same frame, no copy. FrameBox already holds
+    /// the heap, header-bearing frame, so ownership transfers straight through
+    /// `into_raw` without the snapshot copy `PyFrame::initialize_as_generator`
+    /// needs for the borrowed-`&mut self` case.
+    pub fn into_generator(mut self) -> crate::PyResult {
+        self.fix_array_ptrs();
+        let frame_ptr = self.into_raw();
+        let generator = pyre_object::generatorobject::w_generator_new(frame_ptr as *mut u8);
+        unsafe {
+            (*frame_ptr).f_generator_nowref = generator;
+        }
+        Ok(generator)
+    }
+}
+
+impl std::ops::Deref for FrameBox {
+    type Target = PyFrame;
+    #[inline]
+    fn deref(&self) -> &PyFrame {
+        unsafe { &*self.ptr }
+    }
+}
+
+impl std::ops::DerefMut for FrameBox {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut PyFrame {
+        unsafe { &mut *self.ptr }
+    }
+}
+
+impl Drop for FrameBox {
+    fn drop(&mut self) {
+        unsafe {
+            let prefix = (self.ptr as *mut u8).sub(GC_HEADER_SIZE) as *mut GcFramePrefix;
+            drop(Box::from_raw(prefix));
+        }
+    }
+}
+
 unsafe fn clone_debugdata_ptr(ptr: *mut FrameDebugData) -> *mut FrameDebugData {
     unsafe {
         if ptr.is_null() {
@@ -965,7 +1069,7 @@ impl PyFrame {
     /// `pyre-jit-trace` test modules) but routes the body through
     /// `createframe` (PyPy `baseobjspace.py:796`) so every heap-allocated
     /// `PyFrame` flows through the canonical entry point.
-    pub fn new(code: CodeObject) -> Box<Self> {
+    pub fn new(code: CodeObject) -> FrameBox {
         Self::new_with_context(code, Rc::new(PyExecutionContext::default()))
             .expect("PyFrame::new: test entry code must not carry freevars")
     }
@@ -994,7 +1098,7 @@ impl PyFrame {
     pub fn new_with_context(
         code: CodeObject,
         execution_context: Rc<PyExecutionContext>,
-    ) -> Result<Box<Self>, crate::PyError> {
+    ) -> Result<FrameBox, crate::PyError> {
         // `fresh_dict_storage` already seeds `__builtins__ = space
         // .builtin` (PyPy `main.py:45 / Module.__init__` parity).  Just
         // set `__name__` on top.
@@ -1080,8 +1184,8 @@ impl PyFrame {
     /// bytecodes concretely during tracing, so use an owned snapshot when
     /// recording a trace to keep the real frame state unchanged until the
     /// interpreter actually executes the same path.
-    pub fn snapshot_for_tracing(&self) -> Box<Self> {
-        let mut frame = Box::new(PyFrame {
+    pub fn snapshot_for_tracing(&self) -> FrameBox {
+        let mut frame = FrameBox::new(PyFrame {
             execution_context: self.execution_context,
             pycode: self.pycode,
             locals_cells_stack_w: unsafe { alloc_fixed_array_from_vec(self.locals_w().to_vec()) },
@@ -2259,14 +2363,11 @@ impl PyFrame {
     /// the right object.
     #[inline]
     pub fn initialize_as_generator(&mut self) -> crate::PyResult {
-        let mut gen_frame = self.snapshot_for_tracing();
-        gen_frame.fix_array_ptrs();
-        let gen_frame_ptr = Box::into_raw(gen_frame);
-        let generator = pyre_object::generatorobject::w_generator_new(gen_frame_ptr as *mut u8);
-        unsafe {
-            (*gen_frame_ptr).f_generator_nowref = generator;
-        }
-        Ok(generator)
+        // pyframe.py:259 wraps `self` directly. A borrowed `&mut self` cannot
+        // hand ownership to the generator, so snapshot into an owned FrameBox
+        // first. Callers that already own a FrameBox should use
+        // `FrameBox::into_generator` to skip this copy.
+        self.snapshot_for_tracing().into_generator()
     }
 
     #[inline]
@@ -2455,7 +2556,7 @@ pub fn createframe(
     w_globals: *mut DictStorage,
     execution_context: *const PyExecutionContext,
     outer_func: Option<PyObjectRef>,
-) -> Result<Box<PyFrame>, crate::PyError> {
+) -> Result<FrameBox, crate::PyError> {
     // pyframe.py:98-119 PyFrame.__init__ — line-by-line.
     //   self.space = space               (pyre: implicit, no field)
     //   self.pycode = code               (pycode field below)
@@ -2490,7 +2591,7 @@ pub fn createframe(
     } else {
         crate::baseobjspace::dict_storage_to_dict(w_globals)
     };
-    let mut frame = Box::new(PyFrame {
+    let mut frame = FrameBox::new(PyFrame {
         execution_context,
         pycode: code,
         locals_cells_stack_w: unsafe { alloc_fixed_array_with_header(size, PY_NULL) },

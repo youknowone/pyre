@@ -29,8 +29,8 @@ pub struct MetaInterpFrame {
     /// `same_constant` iteration.
     pub greenkey: Option<(usize, usize)>,
     pub concrete_frame: usize,
-    /// Box for heap stability across Vec reallocs.
-    pub owned_concrete_frame: Option<Box<pyre_interpreter::pyframe::PyFrame>>,
+    /// Header-bearing heap frame, stable across Vec reallocs.
+    pub owned_concrete_frame: Option<pyre_interpreter::pyframe::FrameBox>,
     /// opencoder.py:819-834: accumulated parent frame chain.
     pub parent_frames: Vec<ResumeFrameState>,
     pub drop_frame_opref: Option<OpRef>,
@@ -440,7 +440,7 @@ impl PyreMetaInterp {
         let callee_code = pending.concrete_frame.pycode;
         let mut owned_sym = Box::new(pending.sym);
         let sym_ptr = owned_sym.as_mut() as *mut PyreSym;
-        let owned_cf = Box::new(pending.concrete_frame);
+        let owned_cf = pyre_interpreter::pyframe::FrameBox::new(pending.concrete_frame);
         let cf_addr = &*owned_cf as *const pyre_interpreter::pyframe::PyFrame as usize;
 
         // executioncontext.py:76 / pyjitpl.py:1789: virtual_ref for callee frame.

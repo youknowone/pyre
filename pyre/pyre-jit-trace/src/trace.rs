@@ -22,8 +22,8 @@ pub fn trace_bytecode(
     sym: &mut PyreSym,
     _code: &CodeObject,
     start_pc: usize,
-    mut concrete_frame: Box<pyre_interpreter::pyframe::PyFrame>,
-) -> (TraceAction, Box<pyre_interpreter::pyframe::PyFrame>) {
+    mut concrete_frame: pyre_interpreter::pyframe::FrameBox,
+) -> (TraceAction, pyre_interpreter::pyframe::FrameBox) {
     // `llmodel.py:557` parity — install pyre's `Cpu` impl so the
     // optimizer's `protect_speculative_string` / `bh_strlen` /
     // `bh_strgetitem` family routes through `W_StrObject`-shaped

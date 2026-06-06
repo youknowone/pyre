@@ -3490,7 +3490,7 @@ mod tests {
         frame.execute_frame(None, None)
     }
 
-    fn run_exec_frame(source: &str) -> (PyResult, Box<PyFrame>) {
+    fn run_exec_frame(source: &str) -> (PyResult, crate::pyframe::FrameBox) {
         let code = compile_exec(source).expect("compile failed");
         let mut frame = PyFrame::new(code);
         let result = frame.execute_frame(None, None);
