@@ -3116,12 +3116,25 @@ fn dispatch_arm_via_blackhole(
              ContinueRunningNormally — only portal arms should",
         );
     }
-    // LeaveFrame, no exception.  Per-return-type result handling
-    // (Ref/Int/Float push back onto PyFrame stack; Void = no push)
-    // lands in slice 3.7; void-returning arms (STORE_SUBSCR &c.) are
-    // the StoreSubscr activation target and need no push.
-    let _ = return_type;
-    Ok(StepResult::Continue)
+    // LeaveFrame, no exception.  Dispatch on return_type per
+    // RPython `BlackholeInterpreter` (`blackhole.rs:696-701`):
+    //   Void  → arm already mutated heap via vable_setfield /
+    //           residual_call; stack push not needed.
+    //   Int/Ref/Float → result in `tmpreg_*` to push back onto
+    //           PyFrame stack; opcode-shape-specific marshalling
+    //           lands in slice 3.8.
+    match return_type {
+        majit_metainterp::blackhole::BhReturnType::Void => Ok(StepResult::Continue),
+        majit_metainterp::blackhole::BhReturnType::Int
+        | majit_metainterp::blackhole::BhReturnType::Ref
+        | majit_metainterp::blackhole::BhReturnType::Float => {
+            todo!(
+                "dispatch_arm_via_blackhole: non-void return-type \
+                 push lands in slice 3.8 (return_type={:?})",
+                return_type,
+            )
+        }
+    }
 }
 
 /// warmspot.py portal_runner parity: execute a frame through the JIT-enabled
