@@ -2065,6 +2065,32 @@ impl OptContext {
         self.reserve_pos_typed(tp)
     }
 
+    /// Allocate a fresh OpRef position and eagerly mint its canonical
+    /// `_forwarded` host — a `SameAs*`/`Jump` synthetic in `resop_refs` —
+    /// returning both the position and a `BoxRef` bound to that host.
+    ///
+    /// This is the explicit creation primitive for producer-less
+    /// synthetics: importers that allocate a position purely to carry a
+    /// forwarded write (PtrInfo / IntBound / Const for an imported virtual
+    /// state leaf) get a bound write target in one step, instead of
+    /// `alloc_op_position_typed` followed by a lazy `ensure_box(opref)`
+    /// re-materialization. The minted synthetic is identical to the one
+    /// `ensure_box`'s producer-less arm mints (`mint_synthetic_resop`), so
+    /// a later `emit()` for the same position supersedes it through the
+    /// same `live_synthetics` catch-up. Reserve a bare position via
+    /// `alloc_op_position_typed` instead when no forwarded write follows
+    /// (e.g. an `Unknown` leaf), to avoid an eager synthetic for a
+    /// position that is never written.
+    pub(crate) fn reserve_virtual_box(
+        &mut self,
+        tp: majit_ir::Type,
+    ) -> (OpRef, crate::r#box::BoxRef) {
+        let opref = self.reserve_pos_typed(tp);
+        let synthetic = self.mint_synthetic_resop(opref, tp);
+        let b = crate::r#box::BoxRef::from_bound_op(&synthetic);
+        (opref, b)
+    }
+
     /// Dispatch on a `Value`'s type tag and produce a typed `*Op` OpRef
     /// at the given position (resoperation.py:564-638
     /// IntOp/FloatOp/RefOp/VoidOp mixins).

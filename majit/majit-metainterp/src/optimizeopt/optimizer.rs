@@ -398,33 +398,51 @@ impl Optimizer {
             ),
             VirtualStateInfo::Unknown(tp) => *tp,
         };
-        let opref = ctx.alloc_op_position_typed(tp);
+        // `Unknown` leaves carry no forwarded write (the
+        // `apply_imported_virtual_state` arm is a no-op), so reserve a bare
+        // position with no eager synthetic — matching the prior lazy path
+        // where nothing was minted until a later `ensure_box` access.
+        if let VirtualStateInfo::Unknown(_) = info {
+            let opref = ctx.alloc_op_position_typed(tp);
+            if crate::debug::have_debug_prints() {
+                crate::debug::log_one(
+                    "jit-optimizer",
+                    &format!("import_virtual_state_value {opref:?} <= {info:?}"),
+                );
+            }
+            return opref;
+        }
+        // Producer-less leaf with a forwarded write: mint the box up front
+        // and route the write through it (retires the per-arm
+        // `ensure_box(opref)` materialization inside
+        // `apply_imported_virtual_state`).
+        let (opref, box_) = ctx.reserve_virtual_box(tp);
         if crate::debug::have_debug_prints() {
             crate::debug::log_one(
                 "jit-optimizer",
                 &format!("import_virtual_state_value {opref:?} <= {info:?}"),
             );
         }
-        Self::apply_imported_virtual_state(info, opref, ctx);
+        Self::apply_imported_virtual_state(info, &box_, ctx);
         opref
     }
 
     fn apply_imported_virtual_state(
         info: &crate::optimizeopt::virtualstate::VirtualStateInfo,
-        opref: OpRef,
+        box_: &crate::r#box::BoxRef,
         ctx: &mut OptContext,
     ) {
         use crate::optimizeopt::virtualstate::VirtualStateInfo;
 
-        // `op.set_forwarded(info)` per optimizer.py — each arm materializes
-        // the box via `ensure_box(opref)` then writes through
-        // `set_ptr_info(&b, _)`. Constants take the value-only path via
-        // `make_constant`; ensure_box returns `None` for OpRef::NONE /
-        // OpRef::Const* so non-PtrInfo opref values silently no-op,
-        // matching upstream `Const.set_forwarded` assert.
+        // `op.set_forwarded(info)` per optimizer.py — each arm writes the
+        // imported state through the caller-provided bound box: fresh
+        // virtual-state leaves arrive minted via `reserve_virtual_box`,
+        // imported label-arg leaves arrive resolved via
+        // `get_box_replacement_box`. Constants take the value-only path via
+        // `make_constant_box`.
         match info {
             VirtualStateInfo::Constant(value) => {
-                ctx.make_constant(opref, value.clone());
+                ctx.make_constant_box(box_, value.clone());
             }
             VirtualStateInfo::Virtual {
                 descr,
@@ -450,41 +468,37 @@ impl Optimizer {
                     imported_fields.push((*field_idx, field_ref));
                 }
                 let _ = field_descrs; // descr.all_fielddescrs() is authoritative
-                if let Some(b) = ctx.ensure_box(opref) {
-                    ctx.set_ptr_info(
-                        &b,
-                        crate::optimizeopt::info::PtrInfo::Virtual(
-                            crate::optimizeopt::info::VirtualInfo {
-                                descr: descr.clone(),
-                                known_class: *known_class,
-                                ob_type_descr: ob_type_descr.clone(),
-                                fields: imported_fields,
-                                last_guard_pos: -1,
-                                avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
-                            },
-                        ),
-                    );
-                }
+                ctx.set_ptr_info(
+                    box_,
+                    crate::optimizeopt::info::PtrInfo::Virtual(
+                        crate::optimizeopt::info::VirtualInfo {
+                            descr: descr.clone(),
+                            known_class: *known_class,
+                            ob_type_descr: ob_type_descr.clone(),
+                            fields: imported_fields,
+                            last_guard_pos: -1,
+                            avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
+                        },
+                    ),
+                );
             }
             VirtualStateInfo::VArray { descr, items, .. } => {
                 let imported_items = items
                     .iter()
                     .map(|item_info| Self::import_virtual_state_value(item_info, ctx))
                     .collect();
-                if let Some(b) = ctx.ensure_box(opref) {
-                    ctx.set_ptr_info(
-                        &b,
-                        crate::optimizeopt::info::PtrInfo::VirtualArray(
-                            crate::optimizeopt::info::VirtualArrayInfo {
-                                descr: descr.clone(),
-                                clear: false,
-                                items: imported_items,
-                                last_guard_pos: -1,
-                                avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
-                            },
-                        ),
-                    );
-                }
+                ctx.set_ptr_info(
+                    box_,
+                    crate::optimizeopt::info::PtrInfo::VirtualArray(
+                        crate::optimizeopt::info::VirtualArrayInfo {
+                            descr: descr.clone(),
+                            clear: false,
+                            items: imported_items,
+                            last_guard_pos: -1,
+                            avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
+                        },
+                    ),
+                );
             }
             VirtualStateInfo::VStruct {
                 descr,
@@ -497,19 +511,17 @@ impl Optimizer {
                     imported_fields.push((*field_idx, field_ref));
                 }
                 let _ = field_descrs; // descr.all_fielddescrs() is authoritative
-                if let Some(b) = ctx.ensure_box(opref) {
-                    ctx.set_ptr_info(
-                        &b,
-                        crate::optimizeopt::info::PtrInfo::VirtualStruct(
-                            crate::optimizeopt::info::VirtualStructInfo {
-                                descr: descr.clone(),
-                                fields: imported_fields,
-                                last_guard_pos: -1,
-                                avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
-                            },
-                        ),
-                    );
-                }
+                ctx.set_ptr_info(
+                    box_,
+                    crate::optimizeopt::info::PtrInfo::VirtualStruct(
+                        crate::optimizeopt::info::VirtualStructInfo {
+                            descr: descr.clone(),
+                            fields: imported_fields,
+                            last_guard_pos: -1,
+                            avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
+                        },
+                    ),
+                );
             }
             VirtualStateInfo::VArrayStruct {
                 descr,
@@ -530,43 +542,34 @@ impl Optimizer {
                             .collect()
                     })
                     .collect();
-                if let Some(b) = ctx.ensure_box(opref) {
-                    ctx.set_ptr_info(
-                        &b,
-                        crate::optimizeopt::info::PtrInfo::VirtualArrayStruct(
-                            crate::optimizeopt::info::VirtualArrayStructInfo {
-                                descr: descr.clone(),
-                                fielddescrs: fielddescrs.clone(),
-                                element_fields: imported_elements,
-                                last_guard_pos: -1,
-                                avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
-                            },
-                        ),
-                    );
-                }
+                ctx.set_ptr_info(
+                    box_,
+                    crate::optimizeopt::info::PtrInfo::VirtualArrayStruct(
+                        crate::optimizeopt::info::VirtualArrayStructInfo {
+                            descr: descr.clone(),
+                            fielddescrs: fielddescrs.clone(),
+                            element_fields: imported_elements,
+                            last_guard_pos: -1,
+                            avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
+                        },
+                    ),
+                );
             }
             VirtualStateInfo::KnownClass { class_ptr } => {
-                if let Some(b) = ctx.ensure_box(opref) {
-                    ctx.set_ptr_info(
-                        &b,
-                        crate::optimizeopt::info::PtrInfo::known_class(*class_ptr, true),
-                    );
-                }
+                ctx.set_ptr_info(
+                    box_,
+                    crate::optimizeopt::info::PtrInfo::known_class(*class_ptr, true),
+                );
             }
             VirtualStateInfo::NonNull => {
-                if let Some(b) = ctx.ensure_box(opref) {
-                    ctx.set_ptr_info(&b, crate::optimizeopt::info::PtrInfo::nonnull());
-                }
+                ctx.set_ptr_info(box_, crate::optimizeopt::info::PtrInfo::nonnull());
             }
             VirtualStateInfo::IntBounded(bound) => {
                 // RPython parity: imported preamble bounds become the box's
                 // forwarded IntBound directly (optimizer.py:115-125
                 // setintbound). No separate "imported" or "lower-only" maps.
                 let widened = bound.widen();
-                // OpRef → BoxRef shim until this caller migrates (Phase D-2).
-                if let Some(op_box) = ctx.get_box_replacement_box(opref) {
-                    ctx.setintbound(&op_box, &widened);
-                }
+                ctx.setintbound(box_, &widened);
             }
             VirtualStateInfo::Unknown(_tp) => {
                 // virtualstate.py:655-683 make_inputargs parity: each
@@ -1083,7 +1086,15 @@ impl Optimizer {
                         OpRef::NONE
                     });
                 *label_slot += 1;
-                Self::apply_imported_virtual_state(info, opref, ctx);
+                // Imported label-arg leaf (KnownClass / NonNull / IntBounded
+                // / Unknown): resolve the already-materialized box for this
+                // label slot and write the imported state through it. An
+                // unresolvable slot (`OpRef::NONE`, e.g. the MISS fallback
+                // above) yields `None` and the write no-ops — matching the
+                // prior `ensure_box(OpRef::NONE) -> None` behavior.
+                if let Some(box_) = ctx.get_box_replacement_box(opref) {
+                    Self::apply_imported_virtual_state(info, &box_, ctx);
+                }
                 ctx.get_box_replacement(opref).to_opref()
             }
         }
