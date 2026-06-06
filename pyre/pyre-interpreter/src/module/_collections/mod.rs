@@ -234,26 +234,35 @@ mod deque_class {
                 items.reverse();
                 store(self_obj, items);
             }
-            fn rotate(self_obj: PyObjectRef, n: Option<PyObjectRef>) {
-                // Rotate right by n (negative rotates left).
-                let n = n.map(|v| unsafe { w_int_get_value(v) }).unwrap_or(1);
+            fn rotate(self_obj: PyObjectRef, n: Option<PyObjectRef>) -> Result<(), crate::PyError> {
+                // Rotate right by n (negative rotates left).  The count goes
+                // through `__index__` so non-integers raise `TypeError`.
+                let n = match n {
+                    Some(v) => crate::builtins::getindex_w(v)?,
+                    None => 1,
+                };
                 let mut items = snapshot(self_obj);
                 let len = items.len() as i64;
                 if len <= 1 {
-                    return;
+                    return Ok(());
                 }
                 let shift = ((n % len) + len) % len;
                 if shift != 0 {
                     items.rotate_right(shift as usize);
                     store(self_obj, items);
                 }
+                Ok(())
             }
             fn index(self_obj: PyObjectRef, x: PyObjectRef, start: Option<PyObjectRef>, stop: Option<PyObjectRef>) -> Result<i64, crate::PyError> {
                 let items = snapshot(self_obj);
                 let len = items.len() as i64;
                 let clamp = |i: i64| if i < 0 { (i + len).max(0) } else { i.min(len) };
-                let start = clamp(start.map(|v| unsafe { w_int_get_value(v) }).unwrap_or(0));
-                let stop = clamp(stop.map(|v| unsafe { w_int_get_value(v) }).unwrap_or(len));
+                let start = clamp(
+                    start.map(|v| crate::builtins::getindex_w(v)).transpose()?.unwrap_or(0),
+                );
+                let stop = clamp(
+                    stop.map(|v| crate::builtins::getindex_w(v)).transpose()?.unwrap_or(len),
+                );
                 let mut i = start;
                 while i < stop {
                     if crate::baseobjspace::eq_w(items[i as usize], x) {
