@@ -207,7 +207,7 @@ impl CachedField {
         }
         let descr_idx = OptHeap::field_slot_index(descr);
         for &obj in &self.cached_structs {
-            if let Some(b) = ctx.ensure_box(obj) {
+            if let Some(b) = ctx.get_box_replacement_box(obj) {
                 ctx.with_ptr_info_mut(&b, |info| info.clear_field(descr_idx));
             }
             // Clear existing const_infos slot if present; do NOT create.
@@ -531,7 +531,7 @@ impl ArrayCachedItem {
     fn invalidate(&mut self, ctx: &mut OptContext) {
         let index = self.index as usize;
         for &obj in &self.cached_structs {
-            if let Some(b) = ctx.ensure_box(obj) {
+            if let Some(b) = ctx.get_box_replacement_box(obj) {
                 ctx.with_ptr_info_mut(&b, |info| info.clear_item(index));
             }
             // info.py:728 ConstPtrInfo._get_array_info — only clear
