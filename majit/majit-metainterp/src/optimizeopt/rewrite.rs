@@ -223,7 +223,7 @@ impl OptRewrite {
             .and_then(|b| ctx.get_constant_int_box(&b))
         {
             if let Some(inner) = ctx
-                .ensure_box(arg0.to_opref())
+                .get_box_replacement_box(arg0.to_opref())
                 .and_then(|pb| ctx.get_producing_op(&pb))
             {
                 if inner.opcode == OpCode::IntAdd {
@@ -247,7 +247,7 @@ impl OptRewrite {
             .and_then(|b| ctx.get_constant_int_box(&b))
         {
             if let Some(inner) = ctx
-                .ensure_box(arg0.to_opref())
+                .get_box_replacement_box(arg0.to_opref())
                 .and_then(|pb| ctx.get_producing_op(&pb))
             {
                 if inner.opcode == OpCode::IntSub {
@@ -271,7 +271,7 @@ impl OptRewrite {
             .and_then(|b| ctx.get_constant_int_box(&b))
         {
             if let Some(inner) = ctx
-                .ensure_box(arg0.to_opref())
+                .get_box_replacement_box(arg0.to_opref())
                 .and_then(|pb| ctx.get_producing_op(&pb))
             {
                 if inner.opcode == OpCode::IntSub {
@@ -354,7 +354,7 @@ impl OptRewrite {
             .and_then(|b| ctx.get_constant_int_box(&b))
         {
             if let Some(inner) = ctx
-                .ensure_box(arg0.to_opref())
+                .get_box_replacement_box(arg0.to_opref())
                 .and_then(|pb| ctx.get_producing_op(&pb))
             {
                 if inner.opcode == OpCode::IntAdd {
@@ -374,7 +374,7 @@ impl OptRewrite {
 
         // sub_add: int_sub(int_add(x, y), y) => x
         if let Some(inner) = ctx
-            .ensure_box(arg0.to_opref())
+            .get_box_replacement_box(arg0.to_opref())
             .and_then(|pb| ctx.get_producing_op(&pb))
         {
             if inner.opcode == OpCode::IntAdd && inner.arg(1).to_opref() == arg1.to_opref() {
@@ -391,7 +391,7 @@ impl OptRewrite {
 
         // sub_add_neg: int_sub(y, int_add(x, y)) => int_neg(x)
         if let Some(inner) = ctx
-            .ensure_box(arg1.to_opref())
+            .get_box_replacement_box(arg1.to_opref())
             .and_then(|pb| ctx.get_producing_op(&pb))
         {
             if inner.opcode == OpCode::IntAdd && inner.arg(1).to_opref() == arg0.to_opref() {
@@ -407,7 +407,7 @@ impl OptRewrite {
             .and_then(|b| ctx.get_constant_int_box(&b))
         {
             if let Some(inner) = ctx
-                .ensure_box(arg0.to_opref())
+                .get_box_replacement_box(arg0.to_opref())
                 .and_then(|pb| ctx.get_producing_op(&pb))
             {
                 if inner.opcode == OpCode::IntSub {
@@ -442,7 +442,7 @@ impl OptRewrite {
             .and_then(|b| ctx.get_constant_int_box(&b))
         {
             if let Some(inner) = ctx
-                .ensure_box(arg0.to_opref())
+                .get_box_replacement_box(arg0.to_opref())
                 .and_then(|pb| ctx.get_producing_op(&pb))
             {
                 if inner.opcode == OpCode::IntInvert {
@@ -455,7 +455,7 @@ impl OptRewrite {
 
         // sub_xor_x_y_y: int_sub(int_xor(x, y), y) => x (if x & y == 0)
         if let Some(inner) = ctx
-            .ensure_box(arg0.to_opref())
+            .get_box_replacement_box(arg0.to_opref())
             .and_then(|pb| ctx.get_producing_op(&pb))
         {
             if inner.opcode == OpCode::IntXor && inner.arg(1).to_opref() == arg1.to_opref() {
@@ -620,7 +620,7 @@ impl OptRewrite {
 
         // mul_lshift: int_mul(x, int_lshift(1, y)) => int_lshift(x, y)
         if let Some(inner) = ctx
-            .ensure_box(arg1.to_opref())
+            .get_box_replacement_box(arg1.to_opref())
             .and_then(|pb| ctx.get_producing_op(&pb))
         {
             if inner.opcode == OpCode::IntLshift {
@@ -903,7 +903,7 @@ impl OptRewrite {
             .and_then(|b| ctx.get_constant_int_box(&b))
         {
             if let Some(inner) = ctx
-                .ensure_box(arg0.to_opref())
+                .get_box_replacement_box(arg0.to_opref())
                 .and_then(|pb| ctx.get_producing_op(&pb))
             {
                 if inner.opcode == OpCode::IntAnd {
@@ -923,7 +923,7 @@ impl OptRewrite {
 
         // and_absorb: int_and(a, int_and(a, b)) => int_and(a, b)
         if let Some(inner) = ctx
-            .ensure_box(arg1.to_opref())
+            .get_box_replacement_box(arg1.to_opref())
             .and_then(|pb| ctx.get_producing_op(&pb))
         {
             if inner.opcode == OpCode::IntAnd && inner.arg(0).to_opref() == arg0.to_opref() {
@@ -987,7 +987,7 @@ impl OptRewrite {
 
         // and_or: int_and(int_or(x, y), z) => int_and(x, z) (if y & z known 0)
         if let Some(inner) = ctx
-            .ensure_box(arg0.to_opref())
+            .get_box_replacement_box(arg0.to_opref())
             .and_then(|pb| ctx.get_producing_op(&pb))
         {
             if inner.opcode == OpCode::IntOr {
@@ -1088,7 +1088,7 @@ impl OptRewrite {
             .and_then(|b| ctx.get_constant_int_box(&b))
         {
             if let Some(inner) = ctx
-                .ensure_box(arg0.to_opref())
+                .get_box_replacement_box(arg0.to_opref())
                 .and_then(|pb| ctx.get_producing_op(&pb))
             {
                 if inner.opcode == OpCode::IntOr {
@@ -1108,7 +1108,7 @@ impl OptRewrite {
 
         // or_absorb: int_or(a, int_or(a, b)) => int_or(a, b)
         if let Some(inner) = ctx
-            .ensure_box(arg1.to_opref())
+            .get_box_replacement_box(arg1.to_opref())
             .and_then(|pb| ctx.get_producing_op(&pb))
         {
             if inner.opcode == OpCode::IntOr && inner.arg(0).to_opref() == arg0.to_opref() {
@@ -1125,9 +1125,9 @@ impl OptRewrite {
 
         // or_and_two_parts: int_or(int_and(x, C1), int_and(x, C2)) => int_and(x, C1|C2)
         if let (Some(inner0), Some(inner1)) = (
-            ctx.ensure_box(arg0.to_opref())
+            ctx.get_box_replacement_box(arg0.to_opref())
                 .and_then(|pb| ctx.get_producing_op(&pb)),
-            ctx.ensure_box(arg1.to_opref())
+            ctx.get_box_replacement_box(arg1.to_opref())
                 .and_then(|pb| ctx.get_producing_op(&pb)),
         ) {
             if inner0.opcode == OpCode::IntAnd
@@ -1252,7 +1252,7 @@ impl OptRewrite {
             .and_then(|b| ctx.get_constant_int_box(&b))
         {
             if let Some(inner) = ctx
-                .ensure_box(arg0.to_opref())
+                .get_box_replacement_box(arg0.to_opref())
                 .and_then(|pb| ctx.get_producing_op(&pb))
             {
                 if inner.opcode == OpCode::IntXor {
@@ -1272,7 +1272,7 @@ impl OptRewrite {
 
         // xor_absorb: int_xor(int_xor(a, b), b) => a
         if let Some(inner) = ctx
-            .ensure_box(arg0.to_opref())
+            .get_box_replacement_box(arg0.to_opref())
             .and_then(|pb| ctx.get_producing_op(&pb))
         {
             if inner.opcode == OpCode::IntXor && inner.arg(1).to_opref() == arg1.to_opref() {
@@ -1356,7 +1356,7 @@ impl OptRewrite {
         {
             if (0..64).contains(&c1) {
                 if let Some(inner) = ctx
-                    .ensure_box(arg0.to_opref())
+                    .get_box_replacement_box(arg0.to_opref())
                     .and_then(|pb| ctx.get_producing_op(&pb))
                 {
                     if inner.opcode == OpCode::IntRshift {
@@ -1393,7 +1393,7 @@ impl OptRewrite {
                             .and_then(|b| ctx.get_constant_int_box(&b))
                         {
                             if let Some(inner2) = ctx
-                                .ensure_box(inner.arg(0).to_opref())
+                                .get_box_replacement_box(inner.arg(0).to_opref())
                                 .and_then(|pb| ctx.get_producing_op(&pb))
                             {
                                 if inner2.opcode == OpCode::IntRshift
@@ -1440,7 +1440,7 @@ impl OptRewrite {
             .and_then(|b| ctx.get_constant_int_box(&b))
         {
             if let Some(inner) = ctx
-                .ensure_box(arg0.to_opref())
+                .get_box_replacement_box(arg0.to_opref())
                 .and_then(|pb| ctx.get_producing_op(&pb))
             {
                 if inner.opcode == OpCode::IntLshift {
@@ -1526,7 +1526,7 @@ impl OptRewrite {
 
         // rshift_lshift: int_rshift(int_lshift(x, y), y) => x (if no overflow)
         if let Some(inner) = ctx
-            .ensure_box(arg0.to_opref())
+            .get_box_replacement_box(arg0.to_opref())
             .and_then(|pb| ctx.get_producing_op(&pb))
         {
             if inner.opcode == OpCode::IntLshift && inner.arg(1).to_opref() == arg1.to_opref() {
@@ -1556,7 +1556,7 @@ impl OptRewrite {
             .and_then(|b| ctx.get_constant_int_box(&b))
         {
             if let Some(inner) = ctx
-                .ensure_box(arg0.to_opref())
+                .get_box_replacement_box(arg0.to_opref())
                 .and_then(|pb| ctx.get_producing_op(&pb))
             {
                 if inner.opcode == OpCode::IntRshift {
@@ -1643,7 +1643,7 @@ impl OptRewrite {
         {
             if (0..64).contains(&c) {
                 if let Some(inner) = ctx
-                    .ensure_box(arg0.to_opref())
+                    .get_box_replacement_box(arg0.to_opref())
                     .and_then(|pb| ctx.get_producing_op(&pb))
                 {
                     if inner.opcode == OpCode::IntLshift
@@ -1686,7 +1686,7 @@ impl OptRewrite {
 
         // neg_neg: int_neg(int_neg(x)) => x
         if let Some(inner) = ctx
-            .ensure_box(arg0.to_opref())
+            .get_box_replacement_box(arg0.to_opref())
             .and_then(|pb| ctx.get_producing_op(&pb))
         {
             if inner.opcode == OpCode::IntNeg {
@@ -1720,7 +1720,7 @@ impl OptRewrite {
 
         // invert_invert: int_invert(int_invert(x)) => x
         if let Some(inner) = ctx
-            .ensure_box(arg0.to_opref())
+            .get_box_replacement_box(arg0.to_opref())
             .and_then(|pb| ctx.get_producing_op(&pb))
         {
             if inner.opcode == OpCode::IntInvert {
@@ -1791,7 +1791,7 @@ impl OptRewrite {
 
         // is_true_and_minint: int_is_true(int_and(x, MININT)) => int_lt(x, 0)
         if let Some(inner) = ctx
-            .ensure_box(arg0.to_opref())
+            .get_box_replacement_box(arg0.to_opref())
             .and_then(|pb| ctx.get_producing_op(&pb))
         {
             if inner.opcode == OpCode::IntAnd {
@@ -2103,13 +2103,13 @@ impl OptRewrite {
         // eq_sub_eq: int_eq(int_sub(x, int_eq(x, a)), a) => 0
         if op.opcode == OpCode::IntEq {
             if let Some(inner_sub) = ctx
-                .ensure_box(arg0.to_opref())
+                .get_box_replacement_box(arg0.to_opref())
                 .and_then(|pb| ctx.get_producing_op(&pb))
             {
                 if inner_sub.opcode == OpCode::IntSub && inner_sub.arg(0).to_opref() != OpRef::NONE
                 {
                     if let Some(inner_eq) = ctx
-                        .ensure_box(inner_sub.arg(1).to_opref())
+                        .get_box_replacement_box(inner_sub.arg(1).to_opref())
                         .and_then(|pb| ctx.get_producing_op(&pb))
                     {
                         if inner_eq.opcode == OpCode::IntEq
@@ -2641,7 +2641,7 @@ impl OptRewrite {
             // rewrite.py:731-740: x // (1 << y) → x >> y
             // when 0 <= y < LONG_BIT - 1
             if let Some(shift_op) = ctx
-                .ensure_box(arg2.to_opref())
+                .get_box_replacement_box(arg2.to_opref())
                 .and_then(|pb| ctx.get_producing_op(&pb))
             {
                 if shift_op.opcode == OpCode::IntLshift

@@ -3612,7 +3612,12 @@ impl Optimizer {
         }
     }
 
-    fn propagate_from_pass(&mut self, start_pass: usize, op: &majit_ir::OpRc, ctx: &mut OptContext) {
+    fn propagate_from_pass(
+        &mut self,
+        start_pass: usize,
+        op: &majit_ir::OpRc,
+        ctx: &mut OptContext,
+    ) {
         self.propagate_from_pass_range(start_pass, self.passes.len(), op, ctx);
     }
 

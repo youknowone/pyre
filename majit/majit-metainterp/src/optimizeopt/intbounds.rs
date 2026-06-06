@@ -1727,7 +1727,7 @@ impl OptIntBounds {
     /// matches, else None.
     fn as_operation(&self, opref: OpRef, opcode: OpCode, ctx: &mut OptContext) -> Option<Op> {
         let op = ctx
-            .ensure_box(opref)
+            .get_box_replacement_box(opref)
             .and_then(|pb| ctx.get_producing_op(&pb))?;
         if op.opcode == opcode { Some(op) } else { None }
     }
