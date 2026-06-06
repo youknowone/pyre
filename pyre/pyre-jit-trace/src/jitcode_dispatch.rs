@@ -2998,6 +2998,48 @@ fn decode_descr_index(code: &[u8], op: &DecodedOp, operand_offset: usize) -> usi
 /// (`check_can_raise(False)`), and whether the unconditional
 /// `GUARD_NOT_FORCED` from the forces branch (`pyjitpl.py:2079`)
 /// should fire.
+///
+/// ★ Task #390 sub-slice 1 — non-elidable concrete-execute inventory.
+///
+/// PyPy `do_residual_call` (pyjitpl.py:1995-2126) **always** calls
+/// `executor.execute_varargs(opnum, argboxes, descr, exc=can_raise,
+/// pure=is_elidable)` regardless of EI branch.  The recorded opcode
+/// kind selected above is for the IR trace; concrete execution always
+/// happens at trace-record time.  Pyre's walker only concrete-executes
+/// the `CallPure*` branch (via [`try_fold_pure_call_via_executor`]),
+/// so the other three branches surface as the M4 SIGBUS root cause
+/// (memory: M4 walker unactivated taxonomy).
+///
+/// Per-branch concrete-execute status today:
+///
+/// | EI branch | Selected op | PyPy `execute_varargs` | Pyre walker | Reachable via |
+/// |---|---|---|---|---|
+/// | `is_call_release_gil()` | (early-routed to `direct_call_release_gil`) | n/a — separate `do_call_release_gil` path | (release-gil IR only, no concrete exec) | not via this selector |
+/// | `check_forces_virtual_or_virtualizable()` | `CallMayForce*` + `GuardNotForced` | `pure=False, exc=can_raise` — runs the helper, may force virtualizable | **record-only** | dispatcher_iRd/iIRd/iIRFd_kind forces branch |
+/// | `extraeffect == LoopInvariant` | `CallLoopinvariant*` | `pure=False, exc=False` — runs on cache miss | record-only on cache miss, [`loopinvariant_lookup`] reuses cached OpRef on hit (no execute, no record) | same dispatchers |
+/// | `check_is_elidable()` | `CallPure*` | `pure=True, exc=can_raise` — runs the helper, caches result | [`try_fold_pure_call_via_executor`] (elidable_cannot_raise only — see its caveats) | same dispatchers |
+/// | default | `Call*` + (`GuardNoException` iff can_raise) | `pure=False, exc=can_raise` — runs the helper | **record-only** | same dispatchers |
+///
+/// **Walker-record sites for non-elidable concrete-execute gap:**
+///   * [`dispatch_residual_call_iRd_kind`] (`residual_call_r_*/iRd>{v,r,i,f}` ←
+///     pyjitpl.py:1346 `_opimpl_residual_call1` / 1348 / 1350 / 1352)
+///   * [`dispatch_residual_call_iIRd_kind`] (`residual_call_ir_*/iIRd>{v,r,i,f}` ←
+///     pyjitpl.py:1349 `_opimpl_residual_call2` / 1351 / 1353 / 1355)
+///   * [`dispatch_residual_call_iIRFd_kind`] (`residual_call_irf_*/iIRFd>{v,r,i,f}` ←
+///     pyjitpl.py:1354 `_opimpl_residual_call3` / 1355 / 1357 / 1359)
+///
+/// All three call [`select_residual_call_opcode`] then
+/// `record_op_with_descr` then [`try_fold_pure_call_via_executor`].
+/// The orthodox fix replaces the last call with a wider
+/// `try_execute_residual_call_via_executor(call_opcode, ei, ...)`
+/// whose body matches PyPy `executor.execute_varargs` per the
+/// branch table above.
+///
+/// **Priority order for sub-slice 2 (widen):** Call* (default — the
+/// store_subscr_fn / set_current_exception class, smallest blast
+/// radius, root cause of M4 SIGBUS) → CallLoopinvariant* (`pure=False
+/// exc=False` is safest) → CallMayForce* (riskiest — force-virtual
+/// audit precondition).
 fn select_residual_call_opcode(
     ei: &majit_ir::EffectInfo,
     dst_bank: char,
