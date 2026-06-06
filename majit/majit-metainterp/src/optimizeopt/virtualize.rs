@@ -579,8 +579,7 @@ impl OptVirtualize {
 
     fn optimize_setfield_gc(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let struct_box = ctx
-            .get_box_replacement_box(op.arg(0).to_opref())
-            .or_else(|| ctx.ensure_box(op.arg(0).to_opref()));
+            .get_box_replacement_box(op.arg(0).to_opref());
         let value_ref = ctx.get_box_replacement(op.arg(1).to_opref()).to_opref();
         let setfield_descr_arc = op
             .getdescr()
@@ -707,8 +706,7 @@ impl OptVirtualize {
         ctx: &mut OptContext,
     ) -> OptimizationResult {
         let struct_box = ctx
-            .get_box_replacement_box(op.arg(0).to_opref())
-            .or_else(|| ctx.ensure_box(op.arg(0).to_opref()));
+            .get_box_replacement_box(op.arg(0).to_opref());
         let field_descr_arc = op
             .getdescr()
             .expect("optimize_getfield_gc: field op without FieldDescr");
@@ -799,8 +797,7 @@ impl OptVirtualize {
 
     fn optimize_setarrayitem_gc(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let array_box = ctx
-            .get_box_replacement_box(op.arg(0).to_opref())
-            .or_else(|| ctx.ensure_box(op.arg(0).to_opref()));
+            .get_box_replacement_box(op.arg(0).to_opref());
         let index_ref = op.arg(1).to_opref();
         let value_ref = ctx.get_box_replacement(op.arg(2).to_opref()).to_opref();
 
@@ -847,8 +844,7 @@ impl OptVirtualize {
         ctx: &mut OptContext,
     ) -> OptimizationResult {
         let array_box = ctx
-            .get_box_replacement_box(op.arg(0).to_opref())
-            .or_else(|| ctx.ensure_box(op.arg(0).to_opref()));
+            .get_box_replacement_box(op.arg(0).to_opref());
         let index_ref = op.arg(1).to_opref();
 
         if let Some(info) = array_box.as_ref().and_then(|b| ctx.peek_ptr_info(b)) {
@@ -888,8 +884,7 @@ impl OptVirtualize {
     /// virtualize.py:268-274 optimize_ARRAYLEN_GC
     fn optimize_arraylen_gc(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let array_box = ctx
-            .get_box_replacement_box(op.arg(0).to_opref())
-            .or_else(|| ctx.ensure_box(op.arg(0).to_opref()));
+            .get_box_replacement_box(op.arg(0).to_opref());
 
         if let Some(PtrInfo::VirtualArray(vinfo)) =
             array_box.as_ref().and_then(|b| ctx.peek_ptr_info(b))
@@ -915,8 +910,7 @@ impl OptVirtualize {
         ctx: &mut OptContext,
     ) -> OptimizationResult {
         let array_box = ctx
-            .get_box_replacement_box(op.arg(0).to_opref())
-            .or_else(|| ctx.ensure_box(op.arg(0).to_opref()));
+            .get_box_replacement_box(op.arg(0).to_opref());
         let index_ref = op.arg(1).to_opref();
         // `info.py:573-581 getinteriorfield_virtual` indexes the per-element
         // field list by `fielddescr.get_index()`.  Strip the surrounding
@@ -972,8 +966,7 @@ impl OptVirtualize {
         ctx: &mut OptContext,
     ) -> OptimizationResult {
         let array_box = ctx
-            .get_box_replacement_box(op.arg(0).to_opref())
-            .or_else(|| ctx.ensure_box(op.arg(0).to_opref()));
+            .get_box_replacement_box(op.arg(0).to_opref());
         let index_ref = op.arg(1).to_opref();
         let value_ref = ctx.get_box_replacement(op.arg(2).to_opref()).to_opref();
         // `info.py:583-594 setinteriorfield_virtual` indexes the per-element
@@ -1240,7 +1233,7 @@ impl OptVirtualize {
                     // pointer descr would panic at resume time.
                     // Reject pointer descrs at entry instead.
                     if ad.is_array_of_pointers() {
-                        if let Some(array_box) = ctx.ensure_box(array_ref) {
+                        if let Some(array_box) = ctx.get_box_replacement_box(array_ref) {
                             ctx.make_nonnull(&array_box);
                         }
                         return OptimizationResult::PassOn;
@@ -1262,7 +1255,7 @@ impl OptVirtualize {
                     let (Ok(basesize), Ok(itemsize)) =
                         (i64::try_from(basesize_u), i64::try_from(itemsize_u))
                     else {
-                        if let Some(array_box) = ctx.ensure_box(array_ref) {
+                        if let Some(array_box) = ctx.get_box_replacement_box(array_ref) {
                             ctx.make_nonnull(&array_box);
                         }
                         return OptimizationResult::PassOn;
@@ -1271,7 +1264,7 @@ impl OptVirtualize {
                         .checked_mul(index)
                         .and_then(|m| basesize.checked_add(m))
                     else {
-                        if let Some(array_box) = ctx.ensure_box(array_ref) {
+                        if let Some(array_box) = ctx.get_box_replacement_box(array_ref) {
                             ctx.make_nonnull(&array_box);
                         }
                         return OptimizationResult::PassOn;
@@ -1301,7 +1294,7 @@ impl OptVirtualize {
                             // and matches an entry written at the
                             // same negative offset.
                             let Some(lookup_offset) = base_offset.checked_add(item_offset) else {
-                                if let Some(array_box) = ctx.ensure_box(array_ref) {
+                                if let Some(array_box) = ctx.get_box_replacement_box(array_ref) {
                                     ctx.make_nonnull(&array_box);
                                 }
                                 return OptimizationResult::PassOn;
@@ -1329,7 +1322,7 @@ impl OptVirtualize {
         // arrays this is a no-op because the helper skips `op.type == 'i'`
         // (raw pointer); kept literal so the upstream callsite stays
         // 1:1 with the source.
-        if let Some(array_box) = ctx.ensure_box(array_ref) {
+        if let Some(array_box) = ctx.get_box_replacement_box(array_ref) {
             ctx.make_nonnull(&array_box);
         }
         OptimizationResult::PassOn
@@ -1372,7 +1365,7 @@ impl OptVirtualize {
                     // surface guarantees this never reaches the
                     // optimiser.
                     if ad.is_array_of_pointers() {
-                        if let Some(array_box) = ctx.ensure_box(array_ref) {
+                        if let Some(array_box) = ctx.get_box_replacement_box(array_ref) {
                             ctx.make_nonnull(&array_box);
                         }
                         return OptimizationResult::PassOn;
@@ -1390,7 +1383,7 @@ impl OptVirtualize {
                     let (Ok(basesize), Ok(itemsize)) =
                         (i64::try_from(basesize_u), i64::try_from(itemsize_u))
                     else {
-                        if let Some(array_box) = ctx.ensure_box(array_ref) {
+                        if let Some(array_box) = ctx.get_box_replacement_box(array_ref) {
                             ctx.make_nonnull(&array_box);
                         }
                         return OptimizationResult::PassOn;
@@ -1399,7 +1392,7 @@ impl OptVirtualize {
                         .checked_mul(index)
                         .and_then(|m| basesize.checked_add(m))
                     else {
-                        if let Some(array_box) = ctx.ensure_box(array_ref) {
+                        if let Some(array_box) = ctx.get_box_replacement_box(array_ref) {
                             ctx.make_nonnull(&array_box);
                         }
                         return OptimizationResult::PassOn;
@@ -1422,7 +1415,7 @@ impl OptVirtualize {
                         // signed compare; a negative store_offset is
                         // a legitimate write key.
                         let Some(store_offset) = base_offset.checked_add(item_offset) else {
-                            if let Some(array_box) = ctx.ensure_box(array_ref) {
+                            if let Some(array_box) = ctx.get_box_replacement_box(array_ref) {
                                 ctx.make_nonnull(&array_box);
                             }
                             return OptimizationResult::PassOn;
@@ -1459,7 +1452,7 @@ impl OptVirtualize {
         // virtualize.py:348: self.make_nonnull(op.getarg(0)) — no-op for
         // raw pointers via the helper's `op.type == 'i'` skip; kept
         // literal for callsite parity.
-        if let Some(array_box) = ctx.ensure_box(array_ref) {
+        if let Some(array_box) = ctx.get_box_replacement_box(array_ref) {
             ctx.make_nonnull(&array_box);
         }
         OptimizationResult::PassOn
@@ -1489,7 +1482,7 @@ impl OptVirtualize {
         // virtualize.py:127: token = ResOperation(rop.FORCE_TOKEN, [])
         let token_op = Op::new(OpCode::ForceToken, &[]);
         let token_ref = ctx.emit_extra(ctx.current_pass_idx, token_op);
-        if let Some(b) = ctx.ensure_box(token_ref) {
+        if let Some(b) = ctx.get_box_replacement_box(token_ref) {
             ctx.set_ptr_info(&b, PtrInfo::nonnull());
         }
 
@@ -1568,7 +1561,7 @@ impl OptVirtualize {
         // (majit in-place absorption, see doc comment above).
         // virtualize.py:150-153: set 'forced' to point to the real object
         // (skipped when objbox is CONST_NULL).
-        let vref_box = ctx.ensure_box(vref_ref);
+        let vref_box = ctx.get_box_replacement_box(vref_ref);
         let did_forced_write = vref_box
             .as_ref()
             .and_then(|b| {
