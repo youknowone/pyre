@@ -930,7 +930,7 @@ fn force_box_impl(
             // info.py:152 `newop.set_forwarded(self)` — unconditional.
             // Route through `ensure_box` so the just-emitted alloc op
             // materializes a BoxRef and the PtrInfo install lands.
-            if let Some(b) = ctx.ensure_box(alloc_ref) {
+            if let Some(b) = ctx.get_box_replacement_box(alloc_ref) {
                 ctx.set_ptr_info(&b, preserved);
             }
             if crate::optimizeopt::majit_log_enabled() {
@@ -987,7 +987,7 @@ fn force_box_impl(
             new_op.setdescr(vinfo.descr.clone());
             let alloc_ref = emit_op(ctx, new_op);
             // info.py:152 `newop.set_forwarded(self)` — unconditional.
-            if let Some(b) = ctx.ensure_box(alloc_ref) {
+            if let Some(b) = ctx.get_box_replacement_box(alloc_ref) {
                 ctx.set_ptr_info(&b, preserved);
             }
             if crate::optimizeopt::majit_log_enabled() {
@@ -1175,7 +1175,7 @@ fn force_box_impl(
             let alloc_ref = emit_op(ctx, call_op);
 
             // info.py:152 unconditional set_forwarded.
-            if let Some(b) = ctx.ensure_box(alloc_ref) {
+            if let Some(b) = ctx.get_box_replacement_box(alloc_ref) {
                 ctx.set_ptr_info(&b, PtrInfo::nonnull());
             }
             if opref != alloc_ref {
@@ -1245,7 +1245,7 @@ fn force_box_impl(
             // `parent = OpRef::NONE` (RPython `self.parent = None`).
             // info.py:152 unconditional set_forwarded — route through
             // `ensure_box` so the emitted IntAdd op carries PtrInfo.
-            if let Some(b) = ctx.ensure_box(new_ref) {
+            if let Some(b) = ctx.get_box_replacement_box(new_ref) {
                 ctx.set_ptr_info(
                     &b,
                     PtrInfo::VirtualRawSlice(VirtualRawSliceInfo {
@@ -1325,7 +1325,7 @@ fn force_box_impl(
             let newop = emit_op(ctx, newstr_op);
 
             // vstring.py:98: newop.set_forwarded(self) — unconditional.
-            if let Some(b) = ctx.ensure_box(newop) {
+            if let Some(b) = ctx.get_box_replacement_box(newop) {
                 ctx.set_ptr_info(
                     &b,
                     PtrInfo::Str(StrPtrInfo {
