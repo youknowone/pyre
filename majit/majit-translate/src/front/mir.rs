@@ -931,6 +931,10 @@ impl<'a> Lowering<'a> {
         dest: Place,
         rvalue: Rvalue,
     ) -> Result<(), LowerError> {
+        // The destination place's post-projection type is the rvalue's
+        // result type (for both a `Local` slot and a `place.field`
+        // write).  `build_rvalue` reads it to pick a cast's result bank.
+        let dest_ty = clone_tyref(&dest.ty);
         match dest.kind {
             PlaceKind::Local(i) => {
                 // Capture the construction `owner_root` if this binding
@@ -939,7 +943,7 @@ impl<'a> Lowering<'a> {
                 // later emit a symmetric `FieldRead __pos_<N>` carrying
                 // the same owner (see `resolve_place`).
                 let positional_owner = self.positional_aggregate_owner(&rvalue);
-                let (op, result_var) = self.build_rvalue(mir_bb, rvalue)?;
+                let (op, result_var) = self.build_rvalue(mir_bb, rvalue, &dest_ty)?;
                 // The destination local takes on the freshly-minted
                 // result Variable. Subsequent reads of the local
                 // resolve to this Variable until the next Assign
@@ -971,7 +975,7 @@ impl<'a> Lowering<'a> {
                 // projection element. The destination local is NOT
                 // updated — the write goes through indirection, the
                 // base local remains the same Variable.
-                let (_op, value_var) = self.build_rvalue(mir_bb, rvalue)?;
+                let (_op, value_var) = self.build_rvalue(mir_bb, rvalue, &dest_ty)?;
                 // If `build_rvalue` produced an op, emit it first so
                 // `value_var` is bound before the write reads it.
                 if let Some(op) = _op {
@@ -1085,6 +1089,7 @@ impl<'a> Lowering<'a> {
         &mut self,
         mir_bb: usize,
         rvalue: Rvalue,
+        dest_ty: &TyRef,
     ) -> Result<(Option<OpKind>, Variable), LowerError> {
         match rvalue {
             Rvalue::Use(operand) => {
@@ -1112,18 +1117,62 @@ impl<'a> Lowering<'a> {
                     res,
                 ))
             }
-            // `UnaryOp(op, operand)` — `Neg`, `Not`, casts.  Lowered to
-            // `OpKind::UnaryOp` with a canonical snake_case label so the
-            // assembler reaches the wired `int_neg` / `int_invert`
-            // handlers instead of inventing a synthetic `int_unary.*`
-            // opname.  `Cast(...)` carries a JSON sub-payload encoding
-            // the cast kind; map the common JIT-no-op cases (RawPtr,
-            // Scalar Int↔UInt, Unsize) to RPython's canonical cast
-            // opnames so downstream dispatch matches `blackhole.py`'s
-            // `bhimpl_cast_*` handlers.  Genuinely unsupported cast
-            // shapes (e.g. VTable) fall back to a lowercased label that
-            // surfaces as an unwired-opname diagnostic.
+            // `UnaryOp(op, operand)` — `Neg`, `Not`, casts.  Arithmetic
+            // `Neg` / `Not` lower to `OpKind::UnaryOp` with a canonical
+            // snake_case label so the assembler reaches the wired
+            // `int_neg` / `int_invert` handlers instead of inventing a
+            // synthetic `int_unary.*` opname.  `Cast(...)` is handled
+            // separately below: same-bank casts alias the operand, and a
+            // bank-crossing cast lowers to a `simple_call` against the
+            // matching host cast callable (see the in-arm comment).
             Rvalue::UnaryOp(op_json, operand) => {
+                // A `Cast(..)` reinterprets the operand. When the operand
+                // and the destination share a register bank (ptr→ptr,
+                // int→int of any width, float→float, `Unsize`, `FnPtr` —
+                // every cast that keeps the i64/f64 carrier in place) the
+                // JIT models it as `same_as`, so alias the operand without
+                // emitting an op.  A bank-CHANGING cast (`int↔ptr`,
+                // `int↔float`) must move the value into the destination
+                // bank.  The rtyper retired every typed cast opname from
+                // the unary-op path (`normalize_unary_op_name` accepts only
+                // `neg` / `bool` / `invert` / `same_as`), so a bank
+                // crossing lowers to `simple_call(<host_callable>, v)` —
+                // `lltype.cast_int_to_ptr` / `lltype.cast_ptr_to_int` for
+                // `int↔ptr`, the bare `float` / `int` builtins for
+                // `int↔float` — whose rtyper hooks emit the low-level
+                // `cast_*` op.  Pure-aliasing those would leave e.g. an
+                // `as_usize() as *mut T` value in the Int bank where a
+                // later GcRef merge expects a Ref, tripping the assembler's
+                // per-bank cross-check.  The bank decision reads the
+                // operand's place type and the destination type directly,
+                // so it is independent of which Charon `CastKind` tag
+                // encodes the conversion.  Genuine `Neg` / `Not` arithmetic
+                // keeps a real scalar `OpKind::UnaryOp`.
+                if unary_op_is_cast(&op_json) {
+                    let src_kind = self.operand_value_kind(&operand);
+                    let arg = self.resolve_operand(mir_bb, operand)?;
+                    let dst_kind = tyref_to_value_type(dest_ty, self.llbc);
+                    return Ok(
+                        match src_kind.as_ref().and_then(|s| cast_call_segments(s, &dst_kind)) {
+                            Some(segments) => {
+                                let res = self
+                                    .graph
+                                    .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                                (
+                                    Some(OpKind::Call {
+                                        target: CallTarget::FunctionPath { segments },
+                                        args: vec![arg],
+                                        result_ty: dst_kind,
+                                    }),
+                                    res,
+                                )
+                            }
+                            // Same bank (or a bank pair with no host cast
+                            // callable): alias the operand.
+                            None => (None, arg),
+                        },
+                    );
+                }
                 let arg = self.resolve_operand(mir_bb, operand)?;
                 let op_label = unary_op_label(&op_json)?;
                 let res = self
@@ -1383,6 +1432,20 @@ impl<'a> Lowering<'a> {
         match op {
             Operand::Copy(place) | Operand::Move(place) => self.resolve_place(mir_bb, place),
             Operand::Const(value) => self.emit_constant(mir_bb, &value),
+        }
+    }
+
+    /// The [`ValueType`] of a `Copy` / `Move` operand, read from the
+    /// operand place's post-projection type.  Used by the `Cast`
+    /// lowering to decide whether the cast crosses a register bank.
+    /// Returns `None` for `Const` operands (a constant carries no place
+    /// type here; a const-source cast aliases its operand).
+    fn operand_value_kind(&self, op: &Operand) -> Option<ValueType> {
+        match op {
+            Operand::Copy(place) | Operand::Move(place) => {
+                Some(tyref_to_value_type(&place.ty, self.llbc))
+            }
+            Operand::Const(_) => None,
         }
     }
 
@@ -2724,6 +2787,15 @@ fn binop_label(v: &serde_json::Value) -> Result<String, LowerError> {
 /// Scalar Int↔UInt of the same width, Unsize) collapse to `same_as`
 /// so the assembler emits the per-kind copy op instead of an unwired
 /// `int_unary.*` shape.
+/// `true` when a `Rvalue::UnaryOp` op payload is a `Cast` (the JSON
+/// object `{"Cast": ..}`) rather than `Neg` / `Not`. Casts alias the
+/// operand instead of emitting an `OpKind::UnaryOp`.
+fn unary_op_is_cast(v: &serde_json::Value) -> bool {
+    v.as_object()
+        .and_then(|o| o.keys().next())
+        .is_some_and(|k| k == "Cast")
+}
+
 fn unary_op_label(v: &serde_json::Value) -> Result<String, LowerError> {
     if let Some(s) = v.as_str() {
         return Ok(canonical_binop_label(s, None));
@@ -2905,6 +2977,62 @@ fn clone_tyref(ty: &TyRef) -> TyRef {
 /// types serialized as `Deduplicated` (≈92% in `pyre-interpreter.ullbc`)
 /// resolve to `Int` / `Bool` / `Float` instead of falling back to
 /// `Ref`.
+/// The JIT register bank a [`ValueType`] occupies, mirroring
+/// `flatten.py getkind`: the integer family (`Int` / `Unsigned` /
+/// `Bool`) shares the `'int'` bank, `Ref` the `'ref'` bank, `Float` the
+/// `'float'` bank.  Non-value kinds (`Void` / `State` / `Unknown`) get a
+/// distinct discriminant so they never compare equal to a real bank.
+fn value_type_bank(ty: &ValueType) -> u8 {
+    match ty {
+        ValueType::Int | ValueType::Unsigned | ValueType::Bool => 0,
+        ValueType::Ref(_) => 1,
+        ValueType::Float => 2,
+        ValueType::Void => 3,
+        ValueType::State => 4,
+        ValueType::Unknown => 5,
+    }
+}
+
+/// The fully-qualified host-callable path for a bank-crossing cast, or
+/// `None` when `src` and `dst` share a bank (a JIT no-op aliased to the
+/// operand) or the bank pair has no host cast callable.  A bank crossing
+/// lowers to `simple_call(<host_callable>, v)`, never an `OpKind::UnaryOp`:
+/// the rtyper retired every typed cast opname from the unary-op path
+/// (`flowspace_adapter::normalize_unary_op_name` accepts only
+/// `neg` / `bool` / `invert` / `same_as`), so the only surface that reaches
+/// `rtype_cast_int_to_ptr` / `rtype_cast_ptr_to_int` (rbuiltin.py:543-557)
+/// and `rtype_builtin_float` / `rtype_builtin_int` (rbuiltin.py:178-189,
+/// which delegate to `rtype_float` / `rtype_int` and emit the low-level
+/// `cast_int_to_float` / `cast_float_to_int`) is a `simple_call`.  `int →
+/// ptr` / `ptr → int` resolve the `lltype.cast_*` module attr
+/// (`["rpython", "rtyper", "lltypesystem", "lltype", …]` per
+/// `flowspace_adapter` Branch 3b); `int → float` / `float → int` resolve
+/// the bare `float` / `int` builtins (single-segment `HOST_ENV.\
+/// lookup_builtin`).
+fn cast_call_segments(src: &ValueType, dst: &ValueType) -> Option<Vec<String>> {
+    let (s, d) = (value_type_bank(src), value_type_bank(dst));
+    let lltype = |name: &str| -> Vec<String> {
+        ["rpython", "rtyper", "lltypesystem", "lltype", name]
+            .into_iter()
+            .map(str::to_string)
+            .collect()
+    };
+    match (s, d) {
+        _ if s == d => None,
+        // int → ptr / ptr → int — `lltype.cast_int_to_ptr` /
+        // `lltype.cast_ptr_to_int`.
+        (0, 1) => Some(lltype("cast_int_to_ptr")),
+        (1, 0) => Some(lltype("cast_ptr_to_int")),
+        // int → float / float → int — `float(v)` / `int(v)`, whose
+        // rtyper delegates to `rtype_float` / `rtype_int`.
+        (0, 2) => Some(vec!["float".to_string()]),
+        (2, 0) => Some(vec!["int".to_string()]),
+        // No host callable for the remaining pairs (e.g. ref↔float, or any
+        // pair touching Void/State/Unknown): alias the operand.
+        _ => None,
+    }
+}
+
 fn tyref_to_value_type(ty: &TyRef, llbc: &Llbc) -> ValueType {
     // The HashConsedValue arm carries the body inline; primitives
     // typically land here.  The Deduplicated arm carries only an
