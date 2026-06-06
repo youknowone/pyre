@@ -67,7 +67,6 @@ use crate::optimizeopt::{OptContext, Optimization, OptimizationResult};
 fn make_nonnull_opref(ctx: &mut OptContext, opref: OpRef) {
     if let Some(box_ref) = ctx
         .get_box_replacement_box(opref)
-        .or_else(|| ctx.ensure_box(opref))
     {
         ctx.make_nonnull(&box_ref);
     }
@@ -1490,9 +1489,7 @@ impl OptHeap {
             }
             // heap.py:525-527: make_equal_to + last_emitted_operation = REMOVED
             let b_old = BoxRef::from_bound_op(op_rc);
-            let b_res = ctx
-                .ensure_box(res_v)
-                .expect("body-namespace OpRef must have a BoxRef slot");
+            let b_res = ctx.get_box_replacement(res_v);
             ctx.make_equal_to(&b_old, &b_res);
             self.last_emitted_removed = true;
             return true;
@@ -1946,9 +1943,7 @@ impl OptHeap {
                     // MUST_ALIAS: lazy_set targets the same struct → return rhs
                     let cached = lazy_op.arg(1).to_opref();
                     let b_old = BoxRef::from_bound_op(op_rc);
-                    let b_cached = ctx
-                        .ensure_box(cached)
-                        .expect("body-namespace OpRef must have a BoxRef slot");
+                    let b_cached = ctx.get_box_replacement(cached);
                     ctx.make_equal_to(&b_old, &b_cached);
                     return OptimizationResult::Remove;
                 }
@@ -2507,9 +2502,7 @@ impl OptHeap {
                         // MUST_ALIAS: lazy_set targets the same array → return rhs
                         let cached = lazy_op.arg(2).to_opref();
                         let b_old = BoxRef::from_bound_op(op_rc);
-                        let b_cached = ctx
-                            .ensure_box(cached)
-                            .expect("body-namespace OpRef must have a BoxRef slot");
+                        let b_cached = ctx.get_box_replacement(cached);
                         ctx.make_equal_to(&b_old, &b_cached);
                         return OptimizationResult::Remove;
                     }
@@ -2592,7 +2585,7 @@ impl OptHeap {
             // setarrayitem/call invalidates cached_arrayitems, the stale preamble
             // value cannot re-populate the cache on a subsequent getarrayitem.
             let pop = ctx
-                .ensure_box(array)
+                .get_box_replacement_box(array)
                 .and_then(|b| {
                     ctx.with_ptr_info_mut(&b, |info| info.take_preamble_item(const_index as usize))
                 })
@@ -2684,10 +2677,10 @@ impl OptHeap {
         //   cached_result = submap.lookup_cached(arrayinfo, indexop)
         if let Some(descr) = op.getdescr() {
             // heap.py:692-693: force lazy stores for this descr within the index bound
-            let indexb = ctx
-                .ensure_box(op.arg(1).to_opref())
-                .map(|b| ctx.getintbound_handle(&b).borrow().clone())
-                .expect("getintbound: operand must resolve to a BoxRef");
+            let indexb = {
+                let b = ctx.get_box_replacement(op.arg(1).to_opref());
+                ctx.getintbound_handle(&b).borrow().clone()
+            };
             self.force_lazy_setarrayitem(&descr, Some(&indexb), true, ctx);
 
             let descr_idx = descr.index();
@@ -2696,9 +2689,7 @@ impl OptHeap {
             if let Some(submap) = self.get_cached_array_submap(descr_idx) {
                 if let Some(cached) = submap.lookup_cached(arrayinfo, indexbox, ctx) {
                     let b_old = BoxRef::from_bound_op(op_rc);
-                    let b_cached = ctx
-                        .ensure_box(cached)
-                        .expect("body-namespace OpRef must have a BoxRef slot");
+                    let b_cached = ctx.get_box_replacement(cached);
                     ctx.make_equal_to(&b_old, &b_cached);
                     return OptimizationResult::Remove;
                 }
@@ -2726,10 +2717,10 @@ impl OptHeap {
                 //   submap.cache_varindex_write(arrayinfo, ...)
                 //   return self.emit(op)
                 if let Some(descr) = op.getdescr() {
-                    let indexb = ctx
-                        .ensure_box(op.arg(1).to_opref())
-                        .map(|b| ctx.getintbound_handle(&b).borrow().clone())
-                        .expect("getintbound: operand must resolve to a BoxRef");
+                    let indexb = {
+                        let b = ctx.get_box_replacement(op.arg(1).to_opref());
+                        ctx.getintbound_handle(&b).borrow().clone()
+                    };
                     self.force_lazy_setarrayitem(&descr, Some(&indexb), false, ctx);
                     let arrayinfo = ctx.get_box_replacement(op.arg(0).to_opref()).to_opref();
                     let indexbox = ctx.get_box_replacement(op.arg(1).to_opref()).to_opref();
@@ -4330,7 +4321,15 @@ mod tests {
             let mut resolved = op.clone();
             // optimizer.py:651-652 setarg loop parity.
             for i in 0..resolved.num_args() {
-                resolved.setarg(i, ctx.get_box_replacement(resolved.arg(i).to_opref()));
+                let arg = resolved.arg(i);
+                let rb = match ctx.get_box_replacement_box(arg.to_opref()) {
+                    Some(b) => b,
+                    None => ctx
+                        .ensure_box(arg.to_opref())
+                        .map(|b| b.get_box_replacement(false))
+                        .unwrap_or_else(|| arg.clone()),
+                };
+                resolved.setarg(i, rb);
             }
             match pass.propagate_forward(&resolved, &std::rc::Rc::new(resolved.clone()), &mut ctx) {
                 OptimizationResult::Emit(emitted) => {
@@ -4736,7 +4735,15 @@ mod tests {
             let mut resolved = op.clone();
             // optimizer.py:651-652 setarg loop parity.
             for i in 0..resolved.num_args() {
-                resolved.setarg(i, ctx.get_box_replacement(resolved.arg(i).to_opref()));
+                let arg = resolved.arg(i);
+                let rb = match ctx.get_box_replacement_box(arg.to_opref()) {
+                    Some(b) => b,
+                    None => ctx
+                        .ensure_box(arg.to_opref())
+                        .map(|b| b.get_box_replacement(false))
+                        .unwrap_or_else(|| arg.clone()),
+                };
+                resolved.setarg(i, rb);
             }
             match pass.propagate_forward(&resolved, &std::rc::Rc::new(resolved.clone()), &mut ctx) {
                 OptimizationResult::Emit(emitted) => {
@@ -5457,7 +5464,15 @@ mod tests {
             let mut resolved = op.clone();
             // optimizer.py:651-652 setarg loop parity.
             for i in 0..resolved.num_args() {
-                resolved.setarg(i, ctx.get_box_replacement(resolved.arg(i).to_opref()));
+                let arg = resolved.arg(i);
+                let rb = match ctx.get_box_replacement_box(arg.to_opref()) {
+                    Some(b) => b,
+                    None => ctx
+                        .ensure_box(arg.to_opref())
+                        .map(|b| b.get_box_replacement(false))
+                        .unwrap_or_else(|| arg.clone()),
+                };
+                resolved.setarg(i, rb);
             }
             match pass.propagate_forward(&resolved, &std::rc::Rc::new(resolved.clone()), &mut ctx) {
                 OptimizationResult::Emit(emitted) => {
@@ -6044,7 +6059,15 @@ mod tests {
             let mut resolved = op.clone();
             // optimizer.py:651-652 setarg loop parity.
             for i in 0..resolved.num_args() {
-                resolved.setarg(i, ctx.get_box_replacement(resolved.arg(i).to_opref()));
+                let arg = resolved.arg(i);
+                let rb = match ctx.get_box_replacement_box(arg.to_opref()) {
+                    Some(b) => b,
+                    None => ctx
+                        .ensure_box(arg.to_opref())
+                        .map(|b| b.get_box_replacement(false))
+                        .unwrap_or_else(|| arg.clone()),
+                };
+                resolved.setarg(i, rb);
             }
             match pass.propagate_forward(&resolved, &std::rc::Rc::new(resolved.clone()), &mut ctx) {
                 OptimizationResult::Emit(emitted) => {
@@ -6127,7 +6150,15 @@ mod tests {
             let mut resolved = op.clone();
             // optimizer.py:651-652 setarg loop parity.
             for i in 0..resolved.num_args() {
-                resolved.setarg(i, ctx.get_box_replacement(resolved.arg(i).to_opref()));
+                let arg = resolved.arg(i);
+                let rb = match ctx.get_box_replacement_box(arg.to_opref()) {
+                    Some(b) => b,
+                    None => ctx
+                        .ensure_box(arg.to_opref())
+                        .map(|b| b.get_box_replacement(false))
+                        .unwrap_or_else(|| arg.clone()),
+                };
+                resolved.setarg(i, rb);
             }
             match pass.propagate_forward(&resolved, &std::rc::Rc::new(resolved.clone()), &mut ctx) {
                 OptimizationResult::Emit(emitted) => {
@@ -6349,7 +6380,15 @@ mod tests {
             let mut resolved = op.clone();
             // optimizer.py:651-652 setarg loop parity.
             for i in 0..resolved.num_args() {
-                resolved.setarg(i, ctx.get_box_replacement(resolved.arg(i).to_opref()));
+                let arg = resolved.arg(i);
+                let rb = match ctx.get_box_replacement_box(arg.to_opref()) {
+                    Some(b) => b,
+                    None => ctx
+                        .ensure_box(arg.to_opref())
+                        .map(|b| b.get_box_replacement(false))
+                        .unwrap_or_else(|| arg.clone()),
+                };
+                resolved.setarg(i, rb);
             }
             match pass.propagate_forward(&resolved, &std::rc::Rc::new(resolved.clone()), &mut ctx) {
                 OptimizationResult::Emit(emitted) => {
@@ -6417,7 +6456,15 @@ mod tests {
             let mut resolved = op.clone();
             // optimizer.py:651-652 setarg loop parity.
             for i in 0..resolved.num_args() {
-                resolved.setarg(i, ctx.get_box_replacement(resolved.arg(i).to_opref()));
+                let arg = resolved.arg(i);
+                let rb = match ctx.get_box_replacement_box(arg.to_opref()) {
+                    Some(b) => b,
+                    None => ctx
+                        .ensure_box(arg.to_opref())
+                        .map(|b| b.get_box_replacement(false))
+                        .unwrap_or_else(|| arg.clone()),
+                };
+                resolved.setarg(i, rb);
             }
             match pass.propagate_forward(&resolved, &std::rc::Rc::new(resolved.clone()), &mut ctx) {
                 OptimizationResult::Emit(emitted) => {
@@ -6482,7 +6529,15 @@ mod tests {
             let mut resolved = op.clone();
             // optimizer.py:651-652 setarg loop parity.
             for i in 0..resolved.num_args() {
-                resolved.setarg(i, ctx.get_box_replacement(resolved.arg(i).to_opref()));
+                let arg = resolved.arg(i);
+                let rb = match ctx.get_box_replacement_box(arg.to_opref()) {
+                    Some(b) => b,
+                    None => ctx
+                        .ensure_box(arg.to_opref())
+                        .map(|b| b.get_box_replacement(false))
+                        .unwrap_or_else(|| arg.clone()),
+                };
+                resolved.setarg(i, rb);
             }
             match pass.propagate_forward(&resolved, &std::rc::Rc::new(resolved.clone()), &mut ctx) {
                 OptimizationResult::Emit(emitted) => {
