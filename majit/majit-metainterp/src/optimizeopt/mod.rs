@@ -2171,7 +2171,7 @@ impl OptContext {
             let len_opref = self.make_constant_int(len);
             // BoxRef shim — write path through `ensure_box` per the
             // "Box always exists" invariant for set_forwarded mirrors.
-            if let Some(b) = self.ensure_box(resolved) {
+            if let Some(b) = self.get_box_replacement_box(resolved) {
                 self.set_str_lgtop(&b, len_opref);
             }
             return len_opref;
@@ -2197,7 +2197,7 @@ impl OptContext {
             let right_len = self.getstrlen_for(vright, vright, mode);
             let result = crate::optimizeopt::vstring::_int_add(left_len, right_len, self);
             // vstring.py:293: self.lgtop = _int_add(optstring, len1box, len2box)
-            if let Some(b) = self.ensure_box(resolved) {
+            if let Some(b) = self.get_box_replacement_box(resolved) {
                 self.set_str_lgtop(&b, result);
             }
             return result;
@@ -2224,17 +2224,16 @@ impl OptContext {
         // lenbound on the StrPtrInfo is a PtrInfo-internal mutation that
         // RPython performs on the StrPtrInfo instance directly. Route
         // through `ensure_box` so the BoxRef exists for the chain walk.
-        let lenbound = self
-            .ensure_box(resolved)
+        let lenbound = self.get_box_replacement_box(resolved)
             .as_ref()
             .and_then(|b| self.get_str_lenbound(b));
         if let Some(bound) = lenbound {
-            if let Some(result_box) = self.ensure_box(result) {
+            if let Some(result_box) = self.get_box_replacement_box(result) {
                 self.setintbound(&result_box, &bound);
             }
         }
         // vstring.py:117: self.lgtop = lengthop
-        if let Some(b) = self.ensure_box(resolved) {
+        if let Some(b) = self.get_box_replacement_box(resolved) {
             self.set_str_lgtop(&b, result);
         }
         result
@@ -7007,7 +7006,7 @@ impl OptContext {
         // walk then advances from the original BoxRef whose position
         // is preserved, allowing the opref_type fallback to read the
         // seed_constant Ref override (Phase D-5 transitional).
-        let opref_box = self.ensure_box(opref);
+        let opref_box = self.get_box_replacement_box(opref);
         let gcref = match opref_box.as_ref().and_then(|b| self.getptrinfo(b)) {
             Some(PtrInfo::Constant(g)) => g,
             _ => return None,
@@ -7038,7 +7037,7 @@ impl OptContext {
         // walk then advances from the original BoxRef whose position
         // is preserved, allowing the opref_type fallback to read the
         // seed_constant Ref override (Phase D-5 transitional).
-        let opref_box = self.ensure_box(opref);
+        let opref_box = self.get_box_replacement_box(opref);
         let gcref = match opref_box.as_ref().and_then(|b| self.getptrinfo(b)) {
             Some(PtrInfo::Constant(g)) => g,
             _ => return None,
@@ -7096,7 +7095,7 @@ impl OptContext {
         // walk then advances from the original BoxRef whose position
         // is preserved, allowing the opref_type fallback to read the
         // seed_constant Ref override (Phase D-5 transitional).
-        let opref_box = self.ensure_box(opref);
+        let opref_box = self.get_box_replacement_box(opref);
         let gcref = match opref_box.as_ref().and_then(|b| self.getptrinfo(b)) {
             Some(PtrInfo::Constant(g)) => g,
             _ => return None,
@@ -7597,9 +7596,7 @@ impl OptContext {
     /// Replace old opref AND emit the new op.
     pub fn replace_op_with(&mut self, old: OpRef, new_op: Op) -> OpRef {
         let new_ref = self.emit(new_op);
-        let b_old = self
-            .ensure_box(old)
-            .expect("body-namespace OpRef must have a BoxRef slot");
+        let b_old = self.get_box_replacement(old);
         let b_new = self.get_box_replacement(new_ref);
         self.make_equal_to(&b_old, &b_new);
         new_ref
