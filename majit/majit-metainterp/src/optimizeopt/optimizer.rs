@@ -3937,6 +3937,8 @@ impl Optimizer {
         // optimizer.py:598-602:
         //     if rop.returns_bool_result(op.opnum):
         //         self.getintbound(op).make_bool()
+        // The `make_bool` IntBound write runs post-emit (below), once the
+        // op's box is bound; only the type assertion is checked here.
         if op.opcode.returns_bool() {
             assert_eq!(
                 op.result_type(),
@@ -3946,13 +3948,6 @@ impl Optimizer {
                 op.pos.get(),
                 op.getarglist()
             );
-            // 5: returns_bool ops are constructed Int-typed
-            // (asserted above) and `Op.type_ == Int` already provides the
-            // type to `opref_type` via the priority-2 op_at fast path.
-            let op_pos_box = ctx
-                .ensure_box(op.pos.get())
-                .expect("body-namespace OpRef must have a BoxRef slot");
-            ctx.with_intbound_mut(&op_pos_box, |bound| bound.make_bool());
         }
         let emitted = ctx.emit(op.clone());
         // optimizer.py:674 `self._emittedoperations[op] = None` — record
@@ -3966,6 +3961,15 @@ impl Optimizer {
         // flag transition from true (prior Remove) → false (this
         // emit).
         ctx.last_op_removed = false;
+        // optimizer.py:598-602: returns_bool_result → getintbound(op).make_bool().
+        // Run here (post-emit) so the now-bound op box carries the IntBound
+        // write; returns_bool ops are Int-typed (asserted above).
+        if op.opcode.returns_bool() {
+            let bound_box = ctx
+                .get_box_replacement_box(emitted)
+                .expect("just-emitted op resolves to a bound BoxRef");
+            ctx.with_intbound_mut(&bound_box, |bound| bound.make_bool());
+        }
         // optimizer.py:603-611: after emit, promote IntBound→Const.
         //   op = self.get_box_replacement(op)
         //   if op.type == 'i':
