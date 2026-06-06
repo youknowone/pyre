@@ -816,6 +816,67 @@ pub fn execute_pure_call(
     }
 }
 
+/// `executor.execute_varargs` parity for the walker layer, simplified
+/// for callers that do not hold a `MetaInterp` (record-time concrete
+/// execution of residual_calls).
+///
+/// PyPy upstream (`rpython/jit/metainterp/pyjitpl.py:1995-2126`
+/// `do_residual_call`) calls `executor.execute_varargs(opnum,
+/// argboxes, descr, exc=can_raise, pure=is_elidable)` for every
+/// residual_call regardless of EI branch — concrete execution always
+/// runs at trace-record time, only the recorded opcode kind and the
+/// post-call guard emission differ.  See `select_residual_call_opcode`
+/// (`pyre-jit-trace/src/jitcode_dispatch.rs`) for the per-EI-branch
+/// inventory.
+///
+/// The walker has no `MetaInterp` to thread; instead it owns a
+/// `WalkContext.last_exc_value` shadow.  This function therefore
+/// returns the BH_LAST_EXC_VALUE seam value via `Result::Err` so the
+/// caller can write it into the walker's exc shadow + emit
+/// `GUARD_NO_EXCEPTION`, mirroring upstream's
+/// `metainterp.execute_raised(bh_exc, constant=False)` +
+/// `handle_possible_exception` flow.
+///
+/// Differences from `execute_varargs`:
+///   * No `MetaInterp` argument; caller handles exception state.
+///   * No `cond_call` / `cond_call_value` dispatch — residual_call
+///     opcodes are not cond-call variants.
+///   * Returns `Result<i64, i64>` instead of side-effecting
+///     `metainterp.execute_raised`.
+///
+/// Differences from `execute_pure_call`:
+///   * No `is_elidable + cannot_raise` debug_assert.
+///   * Clears BH_LAST_EXC_VALUE before dispatch (`execute_pure_call`
+///     does not because elidable_cannot_raise cannot raise).
+pub fn execute_residual_call(
+    descr: &dyn majit_ir::descr::CallDescr,
+    func_ptr: i64,
+    args: &[i64],
+) -> Result<i64, i64> {
+    crate::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(0));
+    let func_ptr = func_ptr as *const ();
+    let result = match descr.result_type() {
+        majit_ir::Type::Int | majit_ir::Type::Ref => {
+            crate::pyjitpl::call_int_function(func_ptr, args)
+        }
+        majit_ir::Type::Void => {
+            crate::pyjitpl::call_void_function(func_ptr, args);
+            0
+        }
+        // See `execute_varargs`'s Float arm for the i64-bits ABI
+        // rationale: `#[jit_module]` Float helpers expose
+        // `concrete_ptr` as `extern "C" fn(...) -> i64` with the f64
+        // pre-packed via `f64::to_bits`.
+        majit_ir::Type::Float => crate::pyjitpl::call_int_function(func_ptr, args),
+    };
+    let bh_exc = crate::blackhole::BH_LAST_EXC_VALUE.with(|c| {
+        let v = c.get();
+        c.set(0);
+        v
+    });
+    if bh_exc != 0 { Err(bh_exc) } else { Ok(result) }
+}
+
 #[cfg(test)]
 mod execute_pure_call_tests {
     use super::*;
