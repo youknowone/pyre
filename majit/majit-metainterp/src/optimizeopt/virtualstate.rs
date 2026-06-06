@@ -622,8 +622,6 @@ impl VirtualState {
     /// a stop-the-world GC walk we mutate the node payloads in place so all
     /// shared references observe the forwarded address.
     pub fn walk_const_ptr_refs_mut(&mut self, visitor: &mut dyn FnMut(&mut GcRef)) {
-        use std::collections::HashSet;
-
         fn visit_value(value: &mut Value, visitor: &mut dyn FnMut(&mut GcRef)) {
             if let Value::Ref(gcref) = value {
                 visitor(gcref);
@@ -633,12 +631,13 @@ impl VirtualState {
         fn visit_node(
             node: &Rc<VirtualStateInfoNode>,
             visitor: &mut dyn FnMut(&mut GcRef),
-            seen: &mut HashSet<*const VirtualStateInfoNode>,
+            seen: &mut Vec<*const VirtualStateInfoNode>,
         ) {
             let ptr = Rc::as_ptr(node);
-            if !seen.insert(ptr) {
+            if seen.contains(&ptr) {
                 return;
             }
+            seen.push(ptr);
             // SAFETY: GC root walking is stop-the-world in pyre. RPython mutates
             // the same object-graph fields in place; this mirrors that by
             // updating the shared Rc node payload so every alias sees the
@@ -650,7 +649,7 @@ impl VirtualState {
         fn visit_info(
             info: &mut VirtualStateInfo,
             visitor: &mut dyn FnMut(&mut GcRef),
-            seen: &mut HashSet<*const VirtualStateInfoNode>,
+            seen: &mut Vec<*const VirtualStateInfoNode>,
         ) {
             match info {
                 VirtualStateInfo::Constant(value) => visit_value(value, visitor),
@@ -685,7 +684,7 @@ impl VirtualState {
             }
         }
 
-        let mut seen = HashSet::new();
+        let mut seen: Vec<*const VirtualStateInfoNode> = Vec::new();
         for node in &self.state {
             visit_node(node, visitor, &mut seen);
         }

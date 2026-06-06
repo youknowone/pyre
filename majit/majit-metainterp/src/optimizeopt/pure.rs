@@ -336,7 +336,8 @@ pub struct OptPure {
     /// shortpreamble.py:124-126: PureOp.produce_op stores PreambleOp in
     /// optpure's cache. In majit, PreambleOp entries stored here are
     /// searched with forwarding-aware matching (force_preamble_op pattern).
-    /// Body CSE uses the HashMap (unchanged).
+    /// Body CSE uses `RecentPureOpTable` (the `cache` field above) — a
+    /// per-opcode bucket array, not a hashmap.
     preamble_pure_ops: Vec<PreamblePureEntry>,
 }
 
