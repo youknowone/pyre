@@ -4534,15 +4534,16 @@ fn dispatch_residual_call_iRd_kind(
         // path bypasses `execute_opcode_step` → SIGBUS on the next read
         // of the un-mutated container (M4 walker unactivated taxonomy).
         // Task #390 sub-slice 3 activation is gated on `!can_raise`
-        // pending a walker-shadow-vs-live-frame liveness audit (sub-slice
-        // 4).  Empirically, removing the gate SIGBUSes
-        // `synth/bytes_ops` + `synth/closures` on both backends —
-        // suspected stale-Ref shadow on receivers of `can_raise=true`
-        // object helpers (bytes slice / closure call dispatch).  The
-        // Err-arm infrastructure (walker_record_guard_exception, ctx
-        // last_exc_value/_concrete seeding, eval.rs BH_LAST_EXC_VALUE
-        // propagation) is in place so a future widening only needs to
-        // flip the gate once helper-side liveness is proven safe.
+        // pending sub-slice 4's helper-side audit.  Empirical probe
+        // (commit history: sub-slice 4 probe) found the
+        // `can_raise=true` SIGBUS class is NOT walker-shadow staleness
+        // but UNPATCHED build-time fnaddrs in `constants_i` for some
+        // non-elidable helpers.  `runtime_fnaddr_patch` covers all
+        // helpers whose path appears in `pyre_interpreter::
+        // jit_trace_fnaddrs()`; helpers outside that registry retain
+        // garbage build-time values (e.g. `0xacc1d48d7993df7d` for
+        // `synth/bytes_ops`'s CallR).  Sub-slice 4 will extend the
+        // patcher registry or add a fnaddr-sanity gate before lifting.
         let resid_raised = if !can_raise {
             matches!(
                 try_execute_residual_call_via_executor(
@@ -4772,15 +4773,16 @@ fn dispatch_residual_call_iIRd_kind(
         // Non-elidable concrete-execute parity (Task #390 sub-slice 3)
         // — see `dispatch_residual_call_iRd_kind` for the full citation.
         // Task #390 sub-slice 3 activation is gated on `!can_raise`
-        // pending a walker-shadow-vs-live-frame liveness audit (sub-slice
-        // 4).  Empirically, removing the gate SIGBUSes
-        // `synth/bytes_ops` + `synth/closures` on both backends —
-        // suspected stale-Ref shadow on receivers of `can_raise=true`
-        // object helpers (bytes slice / closure call dispatch).  The
-        // Err-arm infrastructure (walker_record_guard_exception, ctx
-        // last_exc_value/_concrete seeding, eval.rs BH_LAST_EXC_VALUE
-        // propagation) is in place so a future widening only needs to
-        // flip the gate once helper-side liveness is proven safe.
+        // pending sub-slice 4's helper-side audit.  Empirical probe
+        // (commit history: sub-slice 4 probe) found the
+        // `can_raise=true` SIGBUS class is NOT walker-shadow staleness
+        // but UNPATCHED build-time fnaddrs in `constants_i` for some
+        // non-elidable helpers.  `runtime_fnaddr_patch` covers all
+        // helpers whose path appears in `pyre_interpreter::
+        // jit_trace_fnaddrs()`; helpers outside that registry retain
+        // garbage build-time values (e.g. `0xacc1d48d7993df7d` for
+        // `synth/bytes_ops`'s CallR).  Sub-slice 4 will extend the
+        // patcher registry or add a fnaddr-sanity gate before lifting.
         let resid_raised = if !can_raise {
             matches!(
                 try_execute_residual_call_via_executor(
@@ -4943,15 +4945,16 @@ fn dispatch_residual_call_iIRFd_kind(
         // Non-elidable concrete-execute parity (Task #390 sub-slice 3)
         // — see `dispatch_residual_call_iRd_kind` for the full citation.
         // Task #390 sub-slice 3 activation is gated on `!can_raise`
-        // pending a walker-shadow-vs-live-frame liveness audit (sub-slice
-        // 4).  Empirically, removing the gate SIGBUSes
-        // `synth/bytes_ops` + `synth/closures` on both backends —
-        // suspected stale-Ref shadow on receivers of `can_raise=true`
-        // object helpers (bytes slice / closure call dispatch).  The
-        // Err-arm infrastructure (walker_record_guard_exception, ctx
-        // last_exc_value/_concrete seeding, eval.rs BH_LAST_EXC_VALUE
-        // propagation) is in place so a future widening only needs to
-        // flip the gate once helper-side liveness is proven safe.
+        // pending sub-slice 4's helper-side audit.  Empirical probe
+        // (commit history: sub-slice 4 probe) found the
+        // `can_raise=true` SIGBUS class is NOT walker-shadow staleness
+        // but UNPATCHED build-time fnaddrs in `constants_i` for some
+        // non-elidable helpers.  `runtime_fnaddr_patch` covers all
+        // helpers whose path appears in `pyre_interpreter::
+        // jit_trace_fnaddrs()`; helpers outside that registry retain
+        // garbage build-time values (e.g. `0xacc1d48d7993df7d` for
+        // `synth/bytes_ops`'s CallR).  Sub-slice 4 will extend the
+        // patcher registry or add a fnaddr-sanity gate before lifting.
         let resid_raised = if !can_raise {
             matches!(
                 try_execute_residual_call_via_executor(
