@@ -141,9 +141,9 @@ pub fn default_int_handler_obj() -> PyObjectRef {
     DEFAULT_INT_HANDLER.with(|cell| {
         let mut h = cell.get();
         if h.is_null() {
-            h = crate::make_builtin_function_with_arity(
+            h = crate::make_builtin_function(
                 "default_int_handler",
-                // issue #2780: accept and ignore any arguments.
+                // issue #2780: accept and ignore any non-keyword arguments.
                 |_| {
                     let cls = crate::builtins::lookup_exc_class("KeyboardInterrupt")
                         .expect("KeyboardInterrupt must be installed");
@@ -151,7 +151,6 @@ pub fn default_int_handler_obj() -> PyObjectRef {
                         .expect("exc_exception_new is infallible for empty args");
                     Err(unsafe { crate::PyError::from_exc_object(exc) })
                 },
-                2,
             );
             pyre_object::gc_roots::pin_root(h);
             cell.set(h);
