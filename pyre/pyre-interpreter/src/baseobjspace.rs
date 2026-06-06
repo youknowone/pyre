@@ -2807,14 +2807,18 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str) -> PyResult {
                     return Ok(w_none());
                 }
             }
-            // `interp_exceptions.py:1300-1316 W_OSError` exposes
+            // `interp_exceptions.py:739-742 W_OSError` exposes
             // `errno` / `strerror` / `filename` / `filename2` as
-            // `readwrite_attrproperty_w` slots, set by the 2..=5-argument
-            // `descr_init` form (`errno = args[0]`, `strerror = args[1]`,
-            // `filename = args[2]`, `filename2 = args[4]`).  pyre keeps
-            // those values in `args_w`, so derive them from there with
-            // the same argument-count gate; fewer than two arguments
-            // leaves all four `None` (the class defaults).
+            // `readwrite_attrproperty_w('w_errno', ...)` slots, populated
+            // by the 2..=5-argument constructor (`errno = args[0]`,
+            // `strerror = args[1]`, `filename = args[2]`,
+            // `filename2 = args[4]`).  Read the writable slot first so a
+            // `e.errno = ...` assignment (`object_setattr`) persists; when
+            // the slot is `PY_NULL` (the internal-constructor path that
+            // never goes through the public setter) fall back to deriving
+            // the value from `args_w` with the same argument-count gate.
+            // Fewer than two arguments leaves all four `None` (the class
+            // defaults).
             "errno" | "strerror" => {
                 let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
                 if matches!(
@@ -2822,6 +2826,14 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str) -> PyResult {
                     pyre_object::excobject::ExcKind::OSError
                         | pyre_object::excobject::ExcKind::FileNotFoundError
                 ) {
+                    let stored = if name == "errno" {
+                        unsafe { pyre_object::excobject::w_exception_get_errno(obj) }
+                    } else {
+                        unsafe { pyre_object::excobject::w_exception_get_strerror(obj) }
+                    };
+                    if !stored.is_null() {
+                        return Ok(stored);
+                    }
                     let args = unsafe { pyre_object::excobject::w_exception_get_args(obj) };
                     let n = unsafe { pyre_object::w_tuple_len(args) };
                     if (2..=5).contains(&n) {
@@ -2840,6 +2852,14 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str) -> PyResult {
                     pyre_object::excobject::ExcKind::OSError
                         | pyre_object::excobject::ExcKind::FileNotFoundError
                 ) {
+                    let stored = if name == "filename" {
+                        unsafe { pyre_object::excobject::w_exception_get_filename(obj) }
+                    } else {
+                        unsafe { pyre_object::excobject::w_exception_get_filename2(obj) }
+                    };
+                    if !stored.is_null() {
+                        return Ok(stored);
+                    }
                     let args = unsafe { pyre_object::excobject::w_exception_get_args(obj) };
                     let n = unsafe { pyre_object::w_tuple_len(args) };
                     let idx: usize = if name == "filename" { 2 } else { 4 };
@@ -4377,6 +4397,36 @@ pub fn object_setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyRes
                         | pyre_object::excobject::ExcKind::UnicodeEncodeError
                 ) {
                     unsafe { pyre_object::excobject::w_exception_set_encoding(obj, value) };
+                    return Ok(w_none());
+                }
+            }
+            // `interp_exceptions.py:739-742` —
+            // `readwrite_attrproperty_w('w_errno' / 'w_strerror' /
+            // 'w_filename' / 'w_filename2', W_OSError)`.  The
+            // `attrproperty_w` writer stores the raw `w_value` into the
+            // slot; the matching getattr arm reads it back ahead of the
+            // `args_w`-derived fallback.  Gated on the OSError family
+            // (OSError / FileNotFoundError) because PyPy installs these
+            // descriptors only on `W_OSError.typedef`.
+            "errno" | "strerror" | "filename" | "filename2" => {
+                let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
+                if matches!(
+                    kind,
+                    pyre_object::excobject::ExcKind::OSError
+                        | pyre_object::excobject::ExcKind::FileNotFoundError
+                ) {
+                    unsafe {
+                        match name {
+                            "errno" => pyre_object::excobject::w_exception_set_errno(obj, value),
+                            "strerror" => {
+                                pyre_object::excobject::w_exception_set_strerror(obj, value)
+                            }
+                            "filename" => {
+                                pyre_object::excobject::w_exception_set_filename(obj, value)
+                            }
+                            _ => pyre_object::excobject::w_exception_set_filename2(obj, value),
+                        }
+                    };
                     return Ok(w_none());
                 }
             }

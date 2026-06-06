@@ -166,17 +166,17 @@ pub enum ExcKind {
     /// `(object, start, end, reason)` `__init__` and custom `__str__`
     /// remain TODO.
     ///
-    /// Pyre's W_BaseException-derived classes are uniformly identity-
-    /// only at present — W_StopIteration (`w_value`), W_ImportError
-    /// (`w_name`/`w_path`/`w_msg`), W_AttributeError (`w_name`/`w_obj`),
-    /// W_OSError (`w_errno`/`w_strerror`/`w_filename`/...),
-    /// W_UnicodeDecodeError / W_UnicodeEncodeError /
-    /// W_UnicodeTranslateError all lack their per-class fields.
-    /// Closure requires either per-subclass `W_<Kind>Object` structs
-    /// (PyPy-orthodox, one GC type id per kind, isolated layouts) or
-    /// extending `W_ExceptionObject` with the union of all per-class
-    /// fields (single GC type id, every instance pays the slot cost).
-    /// Not yet implemented.
+    /// Pyre takes the "union of all per-class fields" route: a single
+    /// GC type id for `W_ExceptionObject`, with every per-subclass slot
+    /// flattened onto it.  W_UnicodeDecodeError / W_UnicodeEncodeError /
+    /// W_UnicodeTranslateError carry `w_object`/`w_start`/`w_end`/
+    /// `w_reason`/`w_encoding`; W_OSError carries `w_errno`/`w_strerror`/
+    /// `w_filename`/`w_filename2`.  Still identity-only (per-class
+    /// fields not yet flattened): W_StopIteration (`w_value`),
+    /// W_ImportError (`w_name`/`w_path`/`w_msg`), W_AttributeError
+    /// (`w_name`/`w_obj`).  The alternative — per-subclass
+    /// `W_<Kind>Object` structs, one GC type id per kind with isolated
+    /// layouts — would be more PyPy-orthodox but is not implemented.
     UnicodeTranslateError = 28,
 }
 
@@ -256,6 +256,22 @@ pub struct W_ExceptionObject {
     /// `:1153 W_UnicodeEncodeError.w_encoding`.  `W_UnicodeTranslateError`
     /// has no `w_encoding` field per PyPy — left `PY_NULL` for Translate.
     pub w_encoding: PyObjectRef,
+    /// `interp_exceptions.py:523 W_OSError.w_errno` — writable
+    /// `readwrite_attrproperty_w('w_errno', W_OSError)` slot (`:739`).
+    /// `PY_NULL` is the class default `None`; the `errno` getattr arm
+    /// falls back to deriving the value from `args_w` when the slot is
+    /// unset (the internal-constructor path that bypasses the public
+    /// setter), so a later `e.errno = x` write persists here.
+    pub w_errno: PyObjectRef,
+    /// `interp_exceptions.py:525 W_OSError.w_strerror` /
+    /// `:740 readwrite_attrproperty_w('w_strerror', W_OSError)`.
+    pub w_strerror: PyObjectRef,
+    /// `interp_exceptions.py:526 W_OSError.w_filename` /
+    /// `:741 readwrite_attrproperty_w('w_filename', W_OSError)`.
+    pub w_filename: PyObjectRef,
+    /// `interp_exceptions.py:527 W_OSError.w_filename2` /
+    /// `:742 readwrite_attrproperty_w('w_filename2', W_OSError)`.
+    pub w_filename2: PyObjectRef,
 }
 
 pub const EXC_KIND_OFFSET: usize = std::mem::offset_of!(W_ExceptionObject, kind);
@@ -269,6 +285,10 @@ pub const EXC_W_START_OFFSET: usize = std::mem::offset_of!(W_ExceptionObject, w_
 pub const EXC_W_END_OFFSET: usize = std::mem::offset_of!(W_ExceptionObject, w_end);
 pub const EXC_W_REASON_OFFSET: usize = std::mem::offset_of!(W_ExceptionObject, w_reason);
 pub const EXC_W_ENCODING_OFFSET: usize = std::mem::offset_of!(W_ExceptionObject, w_encoding);
+pub const EXC_W_ERRNO_OFFSET: usize = std::mem::offset_of!(W_ExceptionObject, w_errno);
+pub const EXC_W_STRERROR_OFFSET: usize = std::mem::offset_of!(W_ExceptionObject, w_strerror);
+pub const EXC_W_FILENAME_OFFSET: usize = std::mem::offset_of!(W_ExceptionObject, w_filename);
+pub const EXC_W_FILENAME2_OFFSET: usize = std::mem::offset_of!(W_ExceptionObject, w_filename2);
 
 /// GC trace offsets for `W_ExceptionObject` — `args_w` plus the three
 /// `PyObjectRef`-shaped chained-exception slots per
@@ -276,10 +296,11 @@ pub const EXC_W_ENCODING_OFFSET: usize = std::mem::offset_of!(W_ExceptionObject,
 /// plus the five Unicode*Error per-class slots (w_object / w_start /
 /// w_end / w_reason / w_encoding) that PyPy distributes across the
 /// W_UnicodeTranslateError / W_UnicodeDecodeError / W_UnicodeEncodeError
-/// subclasses.  `kind` is a `u8` tag, `message` is a `*mut String`
-/// (raw heap), and `suppress_context` is a bool — none of those
-/// are GC-traced.
-pub const W_EXCEPTION_GC_PTR_OFFSETS: [usize; 9] = [
+/// subclasses, plus the four W_OSError per-class slots (w_errno /
+/// w_strerror / w_filename / w_filename2).  `kind` is a `u8` tag,
+/// `message` is a `*mut String` (raw heap), and `suppress_context` is
+/// a bool — none of those are GC-traced.
+pub const W_EXCEPTION_GC_PTR_OFFSETS: [usize; 13] = [
     EXC_ARGS_W_OFFSET,
     EXC_W_CAUSE_OFFSET,
     EXC_W_CONTEXT_OFFSET,
@@ -289,6 +310,10 @@ pub const W_EXCEPTION_GC_PTR_OFFSETS: [usize; 9] = [
     EXC_W_END_OFFSET,
     EXC_W_REASON_OFFSET,
     EXC_W_ENCODING_OFFSET,
+    EXC_W_ERRNO_OFFSET,
+    EXC_W_STRERROR_OFFSET,
+    EXC_W_FILENAME_OFFSET,
+    EXC_W_FILENAME2_OFFSET,
 ];
 
 /// GC type id assigned to `W_ExceptionObject` at JitDriver init time.
@@ -358,6 +383,12 @@ fn w_exception_new_from_message_ptr(kind: ExcKind, message: *mut Wtf8Buf) -> PyO
         w_end: PY_NULL,
         w_reason: PY_NULL,
         w_encoding: PY_NULL,
+        // `interp_exceptions.py:523-527` W_OSError class defaults
+        // `w_errno = w_strerror = w_filename = w_filename2 = None`.
+        w_errno: PY_NULL,
+        w_strerror: PY_NULL,
+        w_filename: PY_NULL,
+        w_filename2: PY_NULL,
     }) as PyObjectRef
 }
 
@@ -709,6 +740,95 @@ pub unsafe fn w_exception_get_encoding(obj: PyObjectRef) -> PyObjectRef {
 pub unsafe fn w_exception_set_encoding(obj: PyObjectRef, value: PyObjectRef) {
     unsafe {
         (*(obj as *mut W_ExceptionObject)).w_encoding = value;
+    }
+}
+
+/// `interp_exceptions.py:739 readwrite_attrproperty_w('w_errno', ...)`
+/// — `e.errno` reader.  `PY_NULL` means the slot was never written
+/// (the `errno` getattr arm then derives the value from `args_w`).
+///
+/// # Safety
+/// `obj` must point to a valid `W_ExceptionObject`.
+#[inline]
+pub unsafe fn w_exception_get_errno(obj: PyObjectRef) -> PyObjectRef {
+    unsafe { (*(obj as *const W_ExceptionObject)).w_errno }
+}
+
+/// `interp_exceptions.py:739 readwrite_attrproperty_w('w_errno', ...)`
+/// — `e.errno = ...` writer.
+///
+/// # Safety
+/// `obj` must point to a valid `W_ExceptionObject`.
+#[inline]
+pub unsafe fn w_exception_set_errno(obj: PyObjectRef, value: PyObjectRef) {
+    unsafe {
+        (*(obj as *mut W_ExceptionObject)).w_errno = value;
+    }
+}
+
+/// `interp_exceptions.py:740 readwrite_attrproperty_w('w_strerror', ...)`
+/// — `e.strerror` reader.
+///
+/// # Safety
+/// `obj` must point to a valid `W_ExceptionObject`.
+#[inline]
+pub unsafe fn w_exception_get_strerror(obj: PyObjectRef) -> PyObjectRef {
+    unsafe { (*(obj as *const W_ExceptionObject)).w_strerror }
+}
+
+/// `interp_exceptions.py:740 readwrite_attrproperty_w('w_strerror', ...)`
+/// — `e.strerror = ...` writer.
+///
+/// # Safety
+/// `obj` must point to a valid `W_ExceptionObject`.
+#[inline]
+pub unsafe fn w_exception_set_strerror(obj: PyObjectRef, value: PyObjectRef) {
+    unsafe {
+        (*(obj as *mut W_ExceptionObject)).w_strerror = value;
+    }
+}
+
+/// `interp_exceptions.py:741 readwrite_attrproperty_w('w_filename', ...)`
+/// — `e.filename` reader.
+///
+/// # Safety
+/// `obj` must point to a valid `W_ExceptionObject`.
+#[inline]
+pub unsafe fn w_exception_get_filename(obj: PyObjectRef) -> PyObjectRef {
+    unsafe { (*(obj as *const W_ExceptionObject)).w_filename }
+}
+
+/// `interp_exceptions.py:741 readwrite_attrproperty_w('w_filename', ...)`
+/// — `e.filename = ...` writer.
+///
+/// # Safety
+/// `obj` must point to a valid `W_ExceptionObject`.
+#[inline]
+pub unsafe fn w_exception_set_filename(obj: PyObjectRef, value: PyObjectRef) {
+    unsafe {
+        (*(obj as *mut W_ExceptionObject)).w_filename = value;
+    }
+}
+
+/// `interp_exceptions.py:742 readwrite_attrproperty_w('w_filename2', ...)`
+/// — `e.filename2` reader.
+///
+/// # Safety
+/// `obj` must point to a valid `W_ExceptionObject`.
+#[inline]
+pub unsafe fn w_exception_get_filename2(obj: PyObjectRef) -> PyObjectRef {
+    unsafe { (*(obj as *const W_ExceptionObject)).w_filename2 }
+}
+
+/// `interp_exceptions.py:742 readwrite_attrproperty_w('w_filename2', ...)`
+/// — `e.filename2 = ...` writer.
+///
+/// # Safety
+/// `obj` must point to a valid `W_ExceptionObject`.
+#[inline]
+pub unsafe fn w_exception_set_filename2(obj: PyObjectRef, value: PyObjectRef) {
+    unsafe {
+        (*(obj as *mut W_ExceptionObject)).w_filename2 = value;
     }
 }
 
