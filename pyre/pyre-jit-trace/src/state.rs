@@ -486,6 +486,87 @@ impl MetaInterpStaticData {
     }
 }
 
+/// Build the runtime-helper `PyJitCode` for issue #143's folded
+/// `list.append` resize fallback.
+///
+/// A JIT-folded `list.append` checks capacity inline and stores the new
+/// element directly; the resize guard fails when the backing store is
+/// full. The blackhole then resumes into this helper jitcode, whose body
+/// re-runs the full append (allocating realloc included) as a residual
+/// call and returns `None` — exactly the value a Python `list.append`
+/// call leaves on the caller's stack.
+///
+/// The helper takes two ref registers — `r0` = the list, `r1` = the
+/// value being appended — matching the snapshot boxes
+/// `build_synthetic_callee_frames` records for the callee frame
+/// (M-core2). Body (identity `pc_map`; a helper frame resumes on a
+/// jitcode byte offset, not a Python PC):
+///
+/// ```text
+///   live              live_r=[r0, r1]
+///   residual_call_r_v jit_list_append(r0, r1)   ; arg_classes "rr", void
+///   ref_return        None
+/// ```
+///
+/// The `residual_call` is void, mirroring the trace-side emission in
+/// `helpers.rs::trace_list_append`: [`jit_list_append`] performs the
+/// append purely for its side effect and returns a sentinel `0`, so the
+/// helper must NOT thread that raw `0` as a ref result. It returns
+/// [`w_none`] (a real boxed `None` pointer) instead.
+#[allow(dead_code)]
+fn build_list_append_resize_helper_payload() -> std::sync::Arc<crate::PyJitCode> {
+    use majit_metainterp::jitcode::{JitCallArg, JitCodeBuilder};
+    use majit_translate::jitcode::BhCallDescr;
+
+    // `live` interns its liveness triple into this throwaway `Assembler`.
+    // The blackhole's `live/` handler only skips the 2-byte offset operand
+    // (it never dereferences it), and `BlackholeInterpreter::run` roots the
+    // whole `registers_r` file via `push_bh_regs` for the duration of the
+    // residual call, so a process-local intern is sufficient: GC roots are
+    // already covered and the offset value is inert at resume time.
+    let mut asm = majit_translate::jit_codewriter::assembler::Assembler::new();
+    let mut builder = JitCodeBuilder::new();
+
+    // live live_r=[r0, r1]
+    builder.live(&mut asm, &[], &[0, 1], &[]);
+    // residual_call_r_v jit_list_append(r0=list, r1=value) -> void
+    builder.residual_call_void_canonical_typed_args(
+        pyre_object::listobject::jit_list_append as *const () as i64,
+        &[JitCallArg::reference(0), JitCallArg::reference(1)],
+        BhCallDescr::from_arg_classes(
+            "rr".to_string(),
+            'v',
+            majit_ir::descr::EffectInfo::MOST_GENERAL,
+        ),
+    );
+    // ref_return None
+    builder.ref_return_const(pyre_object::noneobject::w_none() as i64);
+
+    let runtime = std::sync::Arc::new(builder.finish());
+    let code_len = runtime.body().code.len();
+
+    // Identity pc_map: a helper frame's resume pc IS its jitcode byte
+    // offset, so `resume_jitcode_pc_for(offset)` must map it to itself
+    // (see `register_runtime_helper_jitcode`).
+    let metadata = crate::PyJitCodeMetadata {
+        pc_map: (0..code_len).collect(),
+        depth_at_py_pc: vec![0; code_len],
+        portal_frame_reg: u16::MAX,
+        portal_ec_reg: u16::MAX,
+        stack_base: 0,
+        stack_slot_color_map: Vec::new(),
+        pyre_color_for_semantic_local: Vec::new(),
+    };
+    std::sync::Arc::new(crate::PyJitCode::from_parts(
+        runtime,
+        metadata,
+        std::ptr::null(),
+        std::ptr::null(),
+        false,
+        None,
+    ))
+}
+
 /// RPython assembler.py:234-248 `Assembler._encode_liveness` parity:
 /// intern one `[live_i, live_r, live_f]` triple in the assembler's
 /// `all_liveness` buffer and return its 2-byte offset.
@@ -11342,6 +11423,78 @@ mod indirectcalltargets_tests {
         let resolved = pyjitcode_for_jitcode_index(index)
             .expect("registered runtime helper must resolve by index");
         assert!(Arc::ptr_eq(&resolved, &payload));
+    }
+
+    /// Issue #143 M-core3 increment 1: the folded `list.append` resize
+    /// helper jitcode, driven through the production blackhole, must
+    /// actually perform the append (including the heap realloc that the
+    /// inline guard could not) and return `None` as a
+    /// `DoneWithThisFrameRef`.
+    ///
+    /// This proves the residual-call body executes end-to-end — not just
+    /// that a frame chain can be built (the resume-side seam test only
+    /// covers chain construction). The list starts at the inline-array
+    /// capacity boundary so the helper's append must reallocate, exactly
+    /// the path the runtime guard fails into.
+    ///
+    /// Requires a backend feature: the residual call dispatches through
+    /// `cpu.bh_call_v`, which only performs the real C call when a
+    /// concrete backend is wired (`build_pyre_production_bh_builder` sets
+    /// `builder.cpu` under `dynasm`/`cranelift`). Without one the cpu is
+    /// `None` and the residual handler's `cpu()` would panic.
+    #[cfg(any(feature = "dynasm", feature = "cranelift"))]
+    #[test]
+    fn list_append_resize_helper_appends_and_returns_none_through_blackhole() {
+        use majit_metainterp::blackhole::run_forever;
+        use majit_metainterp::jitexc::JitException;
+        use pyre_object::{
+            w_int_new, w_list_can_append_without_realloc, w_list_len, w_list_new, w_none,
+        };
+
+        let payload = super::build_list_append_resize_helper_payload();
+
+        // Pin the heap objects: `run` roots `registers_r` for the residual
+        // call itself, but the list/value must survive any collection
+        // between construction here and the blackhole entry below.
+        let _roots = pyre_object::gc_roots::push_roots();
+        // listobject `IntArray` inlines up to `INT_ARRAY_INLINE_CAP` (8)
+        // ints; a list filled to exactly that boundary has zero spare
+        // capacity, so the next append must reallocate.
+        let list = w_list_new((0..8).map(w_int_new).collect());
+        let item = w_int_new(99);
+        pyre_object::gc_roots::pin_root(list);
+        pyre_object::gc_roots::pin_root(item);
+
+        let len_before = unsafe { w_list_len(list) };
+        assert_eq!(len_before, 8, "list must start at the inline boundary");
+        assert!(
+            !unsafe { w_list_can_append_without_realloc(list) },
+            "the next append must require a realloc (the guard-failure path)",
+        );
+
+        let mut builder = crate::jitcode_runtime::build_pyre_production_bh_builder();
+        let mut bh = builder.acquire_interp();
+        bh.setposition(payload.jitcode.clone(), 0);
+        // r0 = list, r1 = appended value (the callee-frame snapshot boxes).
+        bh.setarg_r(0, list as i64);
+        bh.setarg_r(1, item as i64);
+
+        let exc = run_forever(&mut builder, bh, 0);
+        match exc {
+            JitException::DoneWithThisFrameRef(r) => assert_eq!(
+                r.0,
+                w_none() as usize,
+                "helper must return None (a real boxed pointer), not the \
+                 raw 0 sentinel jit_list_append returns",
+            ),
+            other => panic!("expected DoneWithThisFrameRef(None), got {other:?}"),
+        }
+
+        assert_eq!(
+            unsafe { w_list_len(list) },
+            len_before + 1,
+            "the residual call must have appended exactly one element",
+        );
     }
 }
 

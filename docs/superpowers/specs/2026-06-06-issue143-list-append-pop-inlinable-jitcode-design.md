@@ -431,13 +431,82 @@ verdict's "index registration UNIMPLEMENTED" was overstated.)
   the box on resume); and method (3)'s vable/vref tail is unit-untested (it would
   SEGV on a skeleton helper's null code — needs a real PyFrame or seeded
   `virtualizable_array_lengths`).
-- **M-core3 — wire + real helper body.** Call the M-core2 builder from
-  `guard_append_without_resize` (codegen.rs:1646). The helper jitcode BODY must
-  contain the generic append incl. realloc so post-guard resume does the right
-  work, and `guard_offset` must land at the resize branch. Option B (CORE seam,
-  hand-built body — what M-core1 registers today, empty) proves the wiring;
-  Option A (codewriter discovery so `make_jitcodes` builds the real body) is the
-  orthodox follow-up. End-to-end gate: `repro143.py`
-  (`while i<5000: xs.append(i)`) stops crashing on dynasm.
+- **M-core3 — wire + real helper body. VERIFIED PLAN (2026-06-06, workflow
+  `wzunyzc9c`: 6 findings + synth `feasible-with-changes` + 3 adversarial
+  verdicts, all source-grounded).** The whole stack exists; no architecture
+  change. Implement in committable increments:
+  - **Helper body (the resumable callee).** The blackhole CAN execute a
+    hand-built runtime-helper jitcode that does a residual call: wired handlers
+    `residual_call_r_v/iRd` … `residual_call_irf_*` (blackhole.rs:6819-6828);
+    `read_descr` reads `bh.jitcode.exec.descrs[idx]` (blackhole.rs:5066, fallback
+    `bh.descrs`); `setup_return_value_r` threads a returning callee's result into
+    `caller.registers_r[caller.code[caller.position-1]]` (blackhole.rs:677-688)
+    and `resume_mainloop`/`run_forever` (blackhole.rs:727,2180) drive the chain.
+    Build the body with the **high-level `JitCodeBuilder`** (majit-metainterp
+    jitcode/assembler.rs), NOT raw bytes: `b.live(...)` (resume-entry liveness
+    marker, live_r=[0,1] = list,value) → `b.residual_call_void_canonical_typed_args(
+    jit_list_append as i64, &[JitCallArg{reg:0,Ref}, JitCallArg{reg:1,Ref}],
+    BhCallDescr::from_arg_classes("rr".into(), 'v', default_effect_info()))`
+    (:2072) → `b.ref_return_const(w_none() as i64)` (:1690) → `b.finish()`.
+    **CORRECTNESS FIX (found vs the draft):** `jit_list_append` returns `0`
+    always (listobject.rs:1107, side-effect-only via `w_list_append`); the
+    existing emit treats it VOID (helpers.rs:524). `None` in pyre is `w_none()`
+    (a real pointer), **NOT** `0`/null — so the helper must do a VOID append then
+    `ref_return_const(w_none())`, never reinterpret the `0` as `GcRef(0)`. Wrap
+    `finish()` in `PyJitCode::from_parts` with IDENTITY pc_map `(0..len)` + null
+    `w_code`, register via M-core1 `register_runtime_helper_jitcode`.
+  - **Increment 1 — LANDED (tested, both backends).** `build_list_append_resize_helper_payload()`
+    (state.rs, after `register_runtime_helper_jitcode`) + a unit test
+    `list_append_resize_helper_appends_and_returns_none_through_blackhole` that
+    drives it through the REAL `build_pyre_production_bh_builder()`
+    (jitcode_runtime.rs:503) blackhole as a single bottommost frame — builds a
+    `W_ListObject` filled to the `IntArray` inline boundary (`INT_ARRAY_INLINE_CAP`=8,
+    spare 0 → next append MUST realloc, asserted via `w_list_can_append_without_realloc`),
+    `setposition(payload,0)`, `setarg_r(0,list)`/`setarg_r(1,value)`,
+    `run_forever(&mut builder, bh, 0)`, asserts `DoneWithThisFrameRef(w_none())` +
+    `w_list_len` grew by 1. Proves the residual call EXECUTES end-to-end (the one
+    gap the resume.rs:4935 test leaves — it proves the chain BUILDS, not that
+    opcodes RUN). check.py-suite unaffected; 233/233 lib tests both backends.
+    **Plan deviations discovered + resolved while grounding:**
+    (a) `default_effect_info()` → used `EffectInfo::MOST_GENERAL` (what
+    `BhCallDescr::default()` carries; conservative, and `bh_call_v` ignores
+    extra_info anyway — only `arg_classes` drives dispatch). (b) The "builder
+    needs the global insns table" note was WRONG: `write_insn` resolves via the
+    STATIC `wellknown_bh_insns()` table (insns.rs), so building needs NO prior
+    init; the production-bh-builder init is only for the blackhole's `op_*` cache
+    + cpu wiring at EXECUTE time. (c) `live(&mut asm,…)` needs an `Assembler` —
+    used a throwaway local `Assembler::new()`; safe because `handler_live` only
+    SKIPS the 2-byte offset (never derefs it) and `run` roots all of `registers_r`
+    via `push_bh_regs`, so the local intern is inert at resume + GC-covered.
+    (d) Test gated `#[cfg(any(feature="dynasm",feature="cranelift"))]`: without a
+    backend `builder.cpu` is `None` and the residual handler's `cpu()` panics.
+  - **Increment 2 (committable):** 2-frame chain test (stub-caller + helper) via
+    `run_forever`, proving `setup_return_value_r` threads `w_none()` into the
+    caller's `code[position-1]` register. Isolates the return convention WITHOUT
+    pyre's real Python CALL layout.
+  - **Increment 3-5 (tracer wiring):** memoized `ensure_list_append_resize_helper_index()`
+    (thread_local Cell, build payload BEFORE the METAINTERP_SD borrow — `intern_liveness`
+    re-borrows it → nested-borrow panic otherwise); `capture_resumedata_with_synthetic_callee`
+    on MIFrame (saves/restores orgpc+vable_last_instr+vable_valuestackdepth like
+    capture_resumedata trace_opcode.rs:3742-3771, sets orgpc=fallthrough before the
+    build); `generate_guard_with_synthetic_callee` (record_guard_typed BEFORE
+    set_last_guard_resume_position; fail_arg_types in snapshot box order
+    [helper,self,parents]); then codegen.rs:1646 — add `value: OpRef` to
+    `guard_append_without_resize`, pass `value` from generated_list_append_by_strategy
+    (:2143), and route to the synthetic guard ONLY when `value_type(value)==Ref`
+    (else single-frame fallback). `result_stack_idx` = COMPUTE from
+    `sym().valuestackdepth`/`nlocals` (do NOT hardcode `Some(0)`); `result_type=Ref`.
+  - **Increment 6 (gate):** `repro143.py` (`while i<5000: xs.append(i)`) stops
+    crashing on dynasm; check.py green both backends.
+  - **LOAD-BEARING UNPROVEN (all 3 verifiers):** the `setup_return_value_r`
+    `code[position-1]` result-register convention is verified for normal inline
+    calls but UNPROVEN for a folded-method-CALL fallthrough in pyre's real Python
+    jitcode. Increment 2 tests the mechanism in isolation; Increment 6 is the real
+    proof. If wrong, set the self-frame resume pc to the exact post-call
+    result-register offset instead of generic `fallthrough_pc`.
+  - **cranelift = M-core4:** if the extra `[list,value]` callee refs regress
+    cranelift x86_64 GC roots, gate the synthetic path to dynasm
+    (`cfg!(feature="cranelift") -> single-frame fallback`, nbody-entry-bridge
+    style) and defer.
 - **M-core4 — cranelift gate** (gap 3). Validate on ubuntu cranelift CI; keep
   cranelift on baseline (re-exec-CALL) until the GC-root path is proven safe.
