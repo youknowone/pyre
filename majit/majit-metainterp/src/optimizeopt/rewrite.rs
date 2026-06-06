@@ -200,9 +200,7 @@ impl OptRewrite {
             .and_then(|b| ctx.get_constant_int_box(&b))
         {
             let b_old = BoxRef::from_bound_op(op_rc);
-            let b_arg = ctx
-                .ensure_box(arg0.to_opref())
-                .expect("body-namespace OpRef must have a BoxRef slot");
+            let b_arg = ctx.get_box_replacement(arg0.to_opref());
             ctx.make_equal_to(&b_old, &b_arg);
             return OptimizationResult::Remove;
         }
@@ -211,9 +209,7 @@ impl OptRewrite {
             .and_then(|b| ctx.get_constant_int_box(&b))
         {
             let b_old = BoxRef::from_bound_op(op_rc);
-            let b_arg = ctx
-                .ensure_box(arg1.to_opref())
-                .expect("body-namespace OpRef must have a BoxRef slot");
+            let b_arg = ctx.get_box_replacement(arg1.to_opref());
             ctx.make_equal_to(&b_old, &b_arg);
             return OptimizationResult::Remove;
         }
@@ -331,9 +327,7 @@ impl OptRewrite {
             .and_then(|b| ctx.get_constant_int_box(&b))
         {
             let b_old = BoxRef::from_bound_op(op_rc);
-            let b_arg = ctx
-                .ensure_box(arg0.to_opref())
-                .expect("body-namespace OpRef must have a BoxRef slot");
+            let b_arg = ctx.get_box_replacement(arg0.to_opref());
             ctx.make_equal_to(&b_old, &b_arg);
             return OptimizationResult::Remove;
         }
@@ -383,9 +377,7 @@ impl OptRewrite {
         {
             if inner.opcode == OpCode::IntAdd && inner.arg(1).to_opref() == arg1.to_opref() {
                 let b_old = BoxRef::from_bound_op(op_rc);
-                let b_inner = ctx
-                    .ensure_box(inner.arg(0).to_opref())
-                    .expect("body-namespace OpRef must have a BoxRef slot");
+                let b_inner = ctx.get_box_replacement(inner.arg(0).to_opref());
                 ctx.make_equal_to(&b_old, &b_inner);
                 return OptimizationResult::Remove;
             }
@@ -469,9 +461,7 @@ impl OptRewrite {
                 ) {
                     if bx.and_bound(&by).known_eq_const(0) {
                         let b_old = BoxRef::from_bound_op(op_rc);
-                        let b_inner = ctx
-                            .ensure_box(inner.arg(0).to_opref())
-                            .expect("body-namespace OpRef must have a BoxRef slot");
+                        let b_inner = ctx.get_box_replacement(inner.arg(0).to_opref());
                         ctx.make_equal_to(&b_old, &b_inner);
                         return OptimizationResult::Remove;
                     }
@@ -487,9 +477,7 @@ impl OptRewrite {
                 ) {
                     if bx.and_bound(&by).known_eq_const(0) {
                         let b_old = BoxRef::from_bound_op(op_rc);
-                        let b_inner = ctx
-                            .ensure_box(inner.arg(0).to_opref())
-                            .expect("body-namespace OpRef must have a BoxRef slot");
+                        let b_inner = ctx.get_box_replacement(inner.arg(0).to_opref());
                         ctx.make_equal_to(&b_old, &b_inner);
                         return OptimizationResult::Remove;
                     }
@@ -546,9 +534,7 @@ impl OptRewrite {
             .and_then(|b| ctx.get_constant_int_box(&b))
         {
             let b_old = BoxRef::from_bound_op(op_rc);
-            let b_arg = ctx
-                .ensure_box(arg0.to_opref())
-                .expect("body-namespace OpRef must have a BoxRef slot");
+            let b_arg = ctx.get_box_replacement(arg0.to_opref());
             ctx.make_equal_to(&b_old, &b_arg);
             return OptimizationResult::Remove;
         }
@@ -558,9 +544,7 @@ impl OptRewrite {
             .and_then(|b| ctx.get_constant_int_box(&b))
         {
             let b_old = BoxRef::from_bound_op(op_rc);
-            let b_arg = ctx
-                .ensure_box(arg1.to_opref())
-                .expect("body-namespace OpRef must have a BoxRef slot");
+            let b_arg = ctx.get_box_replacement(arg1.to_opref());
             ctx.make_equal_to(&b_old, &b_arg);
             return OptimizationResult::Remove;
         }
@@ -667,9 +651,7 @@ impl OptRewrite {
             .and_then(|b| ctx.get_constant_int_box(&b))
         {
             let b_old = BoxRef::from_bound_op(op_rc);
-            let b_arg = ctx
-                .ensure_box(arg0.to_opref())
-                .expect("body-namespace OpRef must have a BoxRef slot");
+            let b_arg = ctx.get_box_replacement(arg0.to_opref());
             ctx.make_equal_to(&b_old, &b_arg);
             return OptimizationResult::Remove;
         }
@@ -714,9 +696,7 @@ impl OptRewrite {
                     &[arg0, BoxRef::from_opref(shift_ref)],
                 ));
                 let b_old = BoxRef::from_bound_op(op_rc);
-                let b_res = ctx
-                    .ensure_box(result_ref)
-                    .expect("body-namespace OpRef must have a BoxRef slot");
+                let b_res = ctx.get_box_replacement(result_ref);
                 ctx.make_equal_to(&b_old, &b_res);
                 return OptimizationResult::Remove;
             }
@@ -731,9 +711,7 @@ impl OptRewrite {
                     ctx,
                 );
                 let b_old = BoxRef::from_bound_op(op_rc);
-                let b_res = ctx
-                    .ensure_box(result)
-                    .expect("body-namespace OpRef must have a BoxRef slot");
+                let b_res = ctx.get_box_replacement(result);
                 ctx.make_equal_to(&b_old, &b_res);
                 return OptimizationResult::Remove;
             }
@@ -814,9 +792,7 @@ impl OptRewrite {
                     ctx,
                 );
                 let b_old = BoxRef::from_bound_op(op_rc);
-                let b_res = ctx
-                    .ensure_box(result)
-                    .expect("body-namespace OpRef must have a BoxRef slot");
+                let b_res = ctx.get_box_replacement(result);
                 ctx.make_equal_to(&b_old, &b_res);
                 return OptimizationResult::Remove;
             }
@@ -870,9 +846,7 @@ impl OptRewrite {
             .and_then(|b| ctx.get_constant_int_box(&b))
         {
             let b_old = BoxRef::from_bound_op(op_rc);
-            let b_arg = ctx
-                .ensure_box(arg0.to_opref())
-                .expect("body-namespace OpRef must have a BoxRef slot");
+            let b_arg = ctx.get_box_replacement(arg0.to_opref());
             ctx.make_equal_to(&b_old, &b_arg);
             return OptimizationResult::Remove;
         }
@@ -881,18 +855,14 @@ impl OptRewrite {
             .and_then(|b| ctx.get_constant_int_box(&b))
         {
             let b_old = BoxRef::from_bound_op(op_rc);
-            let b_arg = ctx
-                .ensure_box(arg1.to_opref())
-                .expect("body-namespace OpRef must have a BoxRef slot");
+            let b_arg = ctx.get_box_replacement(arg1.to_opref());
             ctx.make_equal_to(&b_old, &b_arg);
             return OptimizationResult::Remove;
         }
         // and_x_x: int_and(a, a) => a
         if self.boxes_equal_via_intbound(arg0.to_opref(), arg1.to_opref(), ctx) {
             let b_old = BoxRef::from_bound_op(op_rc);
-            let b_arg = ctx
-                .ensure_box(arg0.to_opref())
-                .expect("body-namespace OpRef must have a BoxRef slot");
+            let b_arg = ctx.get_box_replacement(arg0.to_opref());
             ctx.make_equal_to(&b_old, &b_arg);
             return OptimizationResult::Remove;
         }
@@ -928,9 +898,7 @@ impl OptRewrite {
         {
             if inner.opcode == OpCode::IntAnd && inner.arg(0).to_opref() == arg0.to_opref() {
                 let b_old = BoxRef::from_bound_op(op_rc);
-                let b_arg = ctx
-                    .ensure_box(arg1.to_opref())
-                    .expect("body-namespace OpRef must have a BoxRef slot");
+                let b_arg = ctx.get_box_replacement(arg1.to_opref());
                 ctx.make_equal_to(&b_old, &b_arg);
                 return OptimizationResult::Remove;
             }
@@ -947,9 +915,7 @@ impl OptRewrite {
             {
                 if bound.lower >= 0 && bound.upper <= (c & !(c.wrapping_add(1))) {
                     let b_old = BoxRef::from_bound_op(op_rc);
-                    let b_arg = ctx
-                        .ensure_box(arg0.to_opref())
-                        .expect("body-namespace OpRef must have a BoxRef slot");
+                    let b_arg = ctx.get_box_replacement(arg0.to_opref());
                     ctx.make_equal_to(&b_old, &b_arg);
                     return OptimizationResult::Remove;
                 }
@@ -971,9 +937,7 @@ impl OptRewrite {
             // and_idempotent: int_and(x, y) => x (if y.ones | x.zeros == -1)
             if (bb.tvalue | (!ba.tvalue & !ba.tmask)) == u64::MAX {
                 let b_old = BoxRef::from_bound_op(op_rc);
-                let b_arg = ctx
-                    .ensure_box(arg0.to_opref())
-                    .expect("body-namespace OpRef must have a BoxRef slot");
+                let b_arg = ctx.get_box_replacement(arg0.to_opref());
                 ctx.make_equal_to(&b_old, &b_arg);
                 return OptimizationResult::Remove;
             }
@@ -1033,9 +997,7 @@ impl OptRewrite {
             .and_then(|b| ctx.get_constant_int_box(&b))
         {
             let b_old = BoxRef::from_bound_op(op_rc);
-            let b_arg = ctx
-                .ensure_box(arg0.to_opref())
-                .expect("body-namespace OpRef must have a BoxRef slot");
+            let b_arg = ctx.get_box_replacement(arg0.to_opref());
             ctx.make_equal_to(&b_old, &b_arg);
             return OptimizationResult::Remove;
         }
@@ -1044,9 +1006,7 @@ impl OptRewrite {
             .and_then(|b| ctx.get_constant_int_box(&b))
         {
             let b_old = BoxRef::from_bound_op(op_rc);
-            let b_arg = ctx
-                .ensure_box(arg1.to_opref())
-                .expect("body-namespace OpRef must have a BoxRef slot");
+            let b_arg = ctx.get_box_replacement(arg1.to_opref());
             ctx.make_equal_to(&b_old, &b_arg);
             return OptimizationResult::Remove;
         }
@@ -1068,9 +1028,7 @@ impl OptRewrite {
         // or_x_x: int_or(a, a) => a
         if self.boxes_equal_via_intbound(arg0.to_opref(), arg1.to_opref(), ctx) {
             let b_old = BoxRef::from_bound_op(op_rc);
-            let b_arg = ctx
-                .ensure_box(arg0.to_opref())
-                .expect("body-namespace OpRef must have a BoxRef slot");
+            let b_arg = ctx.get_box_replacement(arg0.to_opref());
             ctx.make_equal_to(&b_old, &b_arg);
             return OptimizationResult::Remove;
         }
@@ -1106,9 +1064,7 @@ impl OptRewrite {
         {
             if inner.opcode == OpCode::IntOr && inner.arg(0).to_opref() == arg0.to_opref() {
                 let b_old = BoxRef::from_bound_op(op_rc);
-                let b_arg = ctx
-                    .ensure_box(arg1.to_opref())
-                    .expect("body-namespace OpRef must have a BoxRef slot");
+                let b_arg = ctx.get_box_replacement(arg1.to_opref());
                 ctx.make_equal_to(&b_old, &b_arg);
                 return OptimizationResult::Remove;
             }
@@ -1155,9 +1111,7 @@ impl OptRewrite {
             // or_idempotent: int_or(x, y) => x (if x.ones | y.zeros == -1)
             if (ba.tvalue | (!bb.tvalue & !bb.tmask)) == u64::MAX {
                 let b_old = BoxRef::from_bound_op(op_rc);
-                let b_arg = ctx
-                    .ensure_box(arg0.to_opref())
-                    .expect("body-namespace OpRef must have a BoxRef slot");
+                let b_arg = ctx.get_box_replacement(arg0.to_opref());
                 ctx.make_equal_to(&b_old, &b_arg);
                 return OptimizationResult::Remove;
             }
@@ -1196,9 +1150,7 @@ impl OptRewrite {
             .and_then(|b| ctx.get_constant_int_box(&b))
         {
             let b_old = BoxRef::from_bound_op(op_rc);
-            let b_arg = ctx
-                .ensure_box(arg0.to_opref())
-                .expect("body-namespace OpRef must have a BoxRef slot");
+            let b_arg = ctx.get_box_replacement(arg0.to_opref());
             ctx.make_equal_to(&b_old, &b_arg);
             return OptimizationResult::Remove;
         }
@@ -1207,9 +1159,7 @@ impl OptRewrite {
             .and_then(|b| ctx.get_constant_int_box(&b))
         {
             let b_old = BoxRef::from_bound_op(op_rc);
-            let b_arg = ctx
-                .ensure_box(arg1.to_opref())
-                .expect("body-namespace OpRef must have a BoxRef slot");
+            let b_arg = ctx.get_box_replacement(arg1.to_opref());
             ctx.make_equal_to(&b_old, &b_arg);
             return OptimizationResult::Remove;
         }
@@ -1267,9 +1217,7 @@ impl OptRewrite {
         {
             if inner.opcode == OpCode::IntXor && inner.arg(1).to_opref() == arg1.to_opref() {
                 let b_old = BoxRef::from_bound_op(op_rc);
-                let b_inner = ctx
-                    .ensure_box(inner.arg(0).to_opref())
-                    .expect("body-namespace OpRef must have a BoxRef slot");
+                let b_inner = ctx.get_box_replacement(inner.arg(0).to_opref());
                 ctx.make_equal_to(&b_old, &b_inner);
                 return OptimizationResult::Remove;
             }
@@ -1325,9 +1273,7 @@ impl OptRewrite {
             .and_then(|b| ctx.get_constant_int_box(&b))
         {
             let b_old = BoxRef::from_bound_op(op_rc);
-            let b_arg = ctx
-                .ensure_box(arg0.to_opref())
-                .expect("body-namespace OpRef must have a BoxRef slot");
+            let b_arg = ctx.get_box_replacement(arg0.to_opref());
             ctx.make_equal_to(&b_old, &b_arg);
             return OptimizationResult::Remove;
         }
@@ -1489,9 +1435,7 @@ impl OptRewrite {
             .and_then(|b| ctx.get_constant_int_box(&b))
         {
             let b_old = BoxRef::from_bound_op(op_rc);
-            let b_arg = ctx
-                .ensure_box(arg0.to_opref())
-                .expect("body-namespace OpRef must have a BoxRef slot");
+            let b_arg = ctx.get_box_replacement(arg0.to_opref());
             ctx.make_equal_to(&b_old, &b_arg);
             return OptimizationResult::Remove;
         }
@@ -1532,9 +1476,7 @@ impl OptRewrite {
                 ) {
                     if bx.lshift_bound_cannot_overflow(&by) {
                         let b_old = BoxRef::from_bound_op(op_rc);
-                        let b_inner = ctx
-                            .ensure_box(inner.arg(0).to_opref())
-                            .expect("body-namespace OpRef must have a BoxRef slot");
+                        let b_inner = ctx.get_box_replacement(inner.arg(0).to_opref());
                         ctx.make_equal_to(&b_old, &b_inner);
                         return OptimizationResult::Remove;
                     }
@@ -1602,9 +1544,7 @@ impl OptRewrite {
             .and_then(|b| ctx.get_constant_int_box(&b))
         {
             let b_old = BoxRef::from_bound_op(op_rc);
-            let b_arg = ctx
-                .ensure_box(arg0.to_opref())
-                .expect("body-namespace OpRef must have a BoxRef slot");
+            let b_arg = ctx.get_box_replacement(arg0.to_opref());
             ctx.make_equal_to(&b_old, &b_arg);
             return OptimizationResult::Remove;
         }
@@ -1691,9 +1631,7 @@ impl OptRewrite {
         {
             if inner.opcode == OpCode::IntNeg {
                 let b_old = BoxRef::from_bound_op(op_rc);
-                let b_inner = ctx
-                    .ensure_box(inner.arg(0).to_opref())
-                    .expect("body-namespace OpRef must have a BoxRef slot");
+                let b_inner = ctx.get_box_replacement(inner.arg(0).to_opref());
                 ctx.make_equal_to(&b_old, &b_inner);
                 return OptimizationResult::Remove;
             }
@@ -1728,9 +1666,7 @@ impl OptRewrite {
         {
             if inner.opcode == OpCode::IntInvert {
                 let b_old = BoxRef::from_bound_op(op_rc);
-                let b_inner = ctx
-                    .ensure_box(inner.arg(0).to_opref())
-                    .expect("body-namespace OpRef must have a BoxRef slot");
+                let b_inner = ctx.get_box_replacement(inner.arg(0).to_opref());
                 ctx.make_equal_to(&b_old, &b_inner);
                 return OptimizationResult::Remove;
             }
@@ -1784,9 +1720,7 @@ impl OptRewrite {
                 if bound.is_bool() {
                     // make_equal_to: replace INT_IS_TRUE result with arg0.
                     let b_old = BoxRef::from_bound_op(op_rc);
-                    let b_arg = ctx
-                        .ensure_box(arg0.to_opref())
-                        .expect("body-namespace OpRef must have a BoxRef slot");
+                    let b_arg = ctx.get_box_replacement(arg0.to_opref());
                     ctx.make_equal_to(&b_old, &b_arg);
                     return OptimizationResult::Remove;
                 }
@@ -1962,9 +1896,7 @@ impl OptRewrite {
         {
             if bound.known_nonnegative() {
                 let b_old = BoxRef::from_bound_op(op_rc);
-                let b_arg = ctx
-                    .ensure_box(arg0.to_opref())
-                    .expect("body-namespace OpRef must have a BoxRef slot");
+                let b_arg = ctx.get_box_replacement(arg0.to_opref());
                 ctx.make_equal_to(&b_old, &b_arg);
                 return OptimizationResult::Remove;
             }
@@ -2100,9 +2032,7 @@ impl OptRewrite {
                 {
                     if bound.is_bool() {
                         let b_old = BoxRef::from_bound_op(op_rc);
-                        let b_arg = ctx
-                            .ensure_box(arg0.to_opref())
-                            .expect("body-namespace OpRef must have a BoxRef slot");
+                        let b_arg = ctx.get_box_replacement(arg0.to_opref());
                         ctx.make_equal_to(&b_old, &b_arg);
                         return OptimizationResult::Remove;
                     }
@@ -2445,7 +2375,7 @@ impl OptRewrite {
                     // parity) rather than snapping it to the tail of
                     // new_operations.
                     if let Some(class_val) = ctx.get_constant_int(op.arg(1).to_opref()) {
-                        if let Some(b) = ctx.ensure_box(obj) {
+                        if let Some(b) = ctx.get_box_replacement_box(obj) {
                             crate::optimizeopt::optimizer::Optimizer::make_constant_class(
                                 ctx, &b, class_val, /* update_last_guard = */ false,
                             );
@@ -2483,12 +2413,11 @@ impl OptRewrite {
     fn getnullness(&self, opref: OpRef, ctx: &mut OptContext) -> Nullness {
         // optimizer.py:127-135 `getnullness` has no missing-Box branch —
         // every `op` has a backing `AbstractValue` per
-        // `resoperation.py:233-248`. `ensure_box` lazy-allocates the
-        // Box (or constructs the const-namespace fresh) so the inlined
-        // `getintbound` side effect (`optimizer.py:110-113` unbounded
-        // install) materializes on first access. `INFO_UNKNOWN` only
-        // for OpRef::NONE sentinels (no upstream equivalent).
-        let info = match ctx.ensure_box(opref) {
+        // `resoperation.py:233-248`. `get_box_replacement_box` resolves
+        // the opref to its bound host; the read-only `getnullness` below
+        // never writes, so an unresolvable opref (OpRef::NONE sentinel,
+        // no upstream equivalent) maps to `INFO_UNKNOWN`.
+        let info = match ctx.get_box_replacement_box(opref) {
             Some(b) => ctx.getnullness(&b),
             None => crate::optimizeopt::INFO_UNKNOWN,
         };
@@ -2541,9 +2470,7 @@ impl OptRewrite {
             .and_then(|b| ctx.get_constant_int_box(&b))
         {
             let b_old = BoxRef::from_bound_op(op_rc);
-            let b_arg = ctx
-                .ensure_box(op.arg(1).to_opref())
-                .expect("body-namespace OpRef must have a BoxRef slot");
+            let b_arg = ctx.get_box_replacement(op.arg(1).to_opref());
             ctx.make_equal_to(&b_old, &b_arg);
             ctx.last_op_removed = true;
             return true;
@@ -2563,14 +2490,14 @@ impl OptRewrite {
         }
         let arg1 = op.arg(1);
         let arg2 = op.arg(2);
-        let b1 = ctx
-            .ensure_box(arg1.to_opref())
-            .map(|b| ctx.getintbound_handle(&b).borrow().clone())
-            .expect("getintbound: operand must resolve to a BoxRef");
-        let b2 = ctx
-            .ensure_box(arg2.to_opref())
-            .map(|b| ctx.getintbound_handle(&b).borrow().clone())
-            .expect("getintbound: operand must resolve to a BoxRef");
+        let b1 = {
+            let b = ctx.get_box_replacement(arg1.to_opref());
+            ctx.getintbound_handle(&b).borrow().clone()
+        };
+        let b2 = {
+            let b = ctx.get_box_replacement(arg2.to_opref());
+            ctx.getintbound_handle(&b).borrow().clone()
+        };
 
         // rewrite.py:774-777: b1.known_eq_const(0) → 0
         if b1.known_eq_const(0) {
@@ -2614,9 +2541,7 @@ impl OptRewrite {
             ctx,
         );
         let b_old = BoxRef::from_bound_op(op_rc);
-        let b_res = ctx
-            .ensure_box(result_ref)
-            .expect("body-namespace OpRef must have a BoxRef slot");
+        let b_res = ctx.get_box_replacement(result_ref);
         ctx.make_equal_to(&b_old, &b_res);
         ctx.last_op_removed = true;
         Some(OptimizationResult::Remove)
@@ -2634,14 +2559,14 @@ impl OptRewrite {
         }
         let arg1 = op.arg(1);
         let arg2 = op.arg(2);
-        let b1 = ctx
-            .ensure_box(arg1.to_opref())
-            .map(|b| ctx.getintbound_handle(&b).borrow().clone())
-            .expect("getintbound: operand must resolve to a BoxRef");
-        let b2 = ctx
-            .ensure_box(arg2.to_opref())
-            .map(|b| ctx.getintbound_handle(&b).borrow().clone())
-            .expect("getintbound: operand must resolve to a BoxRef");
+        let b1 = {
+            let b = ctx.get_box_replacement(arg1.to_opref());
+            ctx.getintbound_handle(&b).borrow().clone()
+        };
+        let b2 = {
+            let b = ctx.get_box_replacement(arg2.to_opref());
+            ctx.getintbound_handle(&b).borrow().clone()
+        };
 
         // rewrite.py:726-729: b1.known_eq_const(0) → 0
         if b1.known_eq_const(0) {
@@ -2667,10 +2592,10 @@ impl OptRewrite {
                     let shiftvar = ctx
                         .get_box_replacement(shift_op.arg(1).to_opref())
                         .to_opref();
-                    let shiftbound = ctx
-                        .ensure_box(shiftvar)
-                        .map(|b| ctx.getintbound_handle(&b).borrow().clone())
-                        .expect("getintbound: operand must resolve to a BoxRef");
+                    let shiftbound = {
+                        let b = ctx.get_box_replacement(shiftvar);
+                        ctx.getintbound_handle(&b).borrow().clone()
+                    };
                     if shiftbound.known_nonnegative() && shiftbound.known_lt_const(63) {
                         let mut rshift_op =
                             Op::new(OpCode::IntRshift, &[arg1, BoxRef::from_opref(shiftvar)]);
@@ -2701,9 +2626,7 @@ impl OptRewrite {
         // rewrite.py:752-755: x // 1 → x
         if val == 1 {
             let b_old = BoxRef::from_bound_op(op_rc);
-            let b_arg = ctx
-                .ensure_box(arg1.to_opref())
-                .expect("body-namespace OpRef must have a BoxRef slot");
+            let b_arg = ctx.get_box_replacement(arg1.to_opref());
             ctx.make_equal_to(&b_old, &b_arg);
             ctx.last_op_removed = true;
             return Some(OptimizationResult::Remove);
@@ -2729,9 +2652,7 @@ impl OptRewrite {
             ctx,
         );
         let b_old = BoxRef::from_bound_op(op_rc);
-        let b_res = ctx
-            .ensure_box(result_ref)
-            .expect("body-namespace OpRef must have a BoxRef slot");
+        let b_res = ctx.get_box_replacement(result_ref);
         ctx.make_equal_to(&b_old, &b_res);
         ctx.last_op_removed = true;
         Some(OptimizationResult::Remove)
@@ -2875,7 +2796,7 @@ impl OptRewrite {
                         });
                     if let Some(val) = val {
                         let idx = (index + dest_start) as usize;
-                        if let Some(b) = ctx.ensure_box(dest_box) {
+                        if let Some(b) = ctx.get_box_replacement_box(dest_box) {
                             ctx.with_ptr_info_mut(&b, |info| {
                                 info.setinteriorfield_virtual(idx, fdescr_idx, val);
                             });
@@ -2945,7 +2866,7 @@ impl OptRewrite {
             if dest_is_virtual {
                 // rewrite.py:662-665: dest_info.setitem(...)
                 let idx = (index + dest_start) as usize;
-                if let Some(b) = ctx.ensure_box(dest_box) {
+                if let Some(b) = ctx.get_box_replacement_box(dest_box) {
                     ctx.with_ptr_info_mut(&b, |info| info.setitem(idx, val));
                 }
             } else {
@@ -2977,9 +2898,7 @@ impl OptRewrite {
         }
         let arg0 = op.arg(0);
         let b_old = BoxRef::from_bound_op(op_rc);
-        let b_arg = ctx
-            .ensure_box(arg0.to_opref())
-            .expect("body-namespace OpRef must have a BoxRef slot");
+        let b_arg = ctx.get_box_replacement(arg0.to_opref());
         ctx.make_equal_to(&b_old, &b_arg);
         OptimizationResult::Remove
     }
@@ -3070,9 +2989,7 @@ impl OptRewrite {
             let key = (reflex_opcode, arg1.to_opref(), arg0.to_opref());
             if let Some(&cached_ref) = self.bool_result_cache.get(&key) {
                 let b_old = BoxRef::from_bound_op(op_rc);
-                let b_cached = ctx
-                    .ensure_box(cached_ref)
-                    .expect("body-namespace OpRef must have a BoxRef slot");
+                let b_cached = ctx.get_box_replacement(cached_ref);
                 ctx.make_equal_to(&b_old, &b_cached);
                 return Some(OptimizationResult::Remove);
             }
@@ -3179,9 +3096,7 @@ impl OptRewrite {
         if let Some(arg_op) = v.and_then(|pb| ctx.get_producing_op(&pb)) {
             if arg_op.opcode == OpCode::FloatNeg {
                 let b_old = BoxRef::from_bound_op(op_rc);
-                let b_inner = ctx
-                    .ensure_box(arg_op.arg(0).to_opref())
-                    .expect("body-namespace OpRef must have a BoxRef slot");
+                let b_inner = ctx.get_box_replacement(arg_op.arg(0).to_opref());
                 ctx.make_equal_to(&b_old, &b_inner);
                 return OptimizationResult::Remove;
             }
@@ -3197,8 +3112,7 @@ impl OptRewrite {
         ctx: &mut OptContext,
     ) -> OptimizationResult {
         let v = ctx
-            .get_box_replacement_box(op.arg(0).to_opref())
-            .or_else(|| ctx.ensure_box(op.arg(0).to_opref()));
+            .get_box_replacement_box(op.arg(0).to_opref());
         if let Some(v) = v {
             if let Some(arg_op) = ctx.get_producing_op(&v) {
                 if arg_op.opcode == OpCode::FloatAbs {
@@ -3312,7 +3226,7 @@ impl Optimization for OptRewrite {
                 // until emit adds the guard to new_operations.
                 let has_info = obj_box.as_ref().map_or(false, |b| ctx.has_ptr_info(b));
                 if !has_info {
-                    if let Some(b) = ctx.ensure_box(obj) {
+                    if let Some(b) = ctx.get_box_replacement_box(obj) {
                         ctx.set_ptr_info(&b, crate::optimizeopt::info::PtrInfo::nonnull());
                     }
                 }
@@ -3440,9 +3354,7 @@ impl Optimization for OptRewrite {
                 // rewrite.py:486-489: INFO_NONNULL → result is arg(0)
                 if nullness == Nullness::Nonnull {
                     let b_old = BoxRef::from_bound_op(op_rc);
-                    let b_arg = ctx
-                        .ensure_box(op.arg(0).to_opref())
-                        .expect("body-namespace OpRef must have a BoxRef slot");
+                    let b_arg = ctx.get_box_replacement(op.arg(0).to_opref());
                     ctx.make_equal_to(&b_old, &b_arg);
                     ctx.last_op_removed = true;
                     return OptimizationResult::Remove;
@@ -3512,9 +3424,7 @@ impl Optimization for OptRewrite {
             // jtransform.py:1264-1266: CAST_OPAQUE_PTR is identity (no-op).
             OpCode::CastOpaquePtr => {
                 let b_old = BoxRef::from_bound_op(op_rc);
-                let b_arg = ctx
-                    .ensure_box(op.arg(0).to_opref())
-                    .expect("body-namespace OpRef must have a BoxRef slot");
+                let b_arg = ctx.get_box_replacement(op.arg(0).to_opref());
                 ctx.make_equal_to(&b_old, &b_arg);
                 OptimizationResult::Remove
             }
@@ -3697,8 +3607,7 @@ impl Optimization for OptRewrite {
             OpCode::AssertNotNone => {
                 // RPython: self.make_nonnull(op.getarg(0))
                 let obj_box = ctx
-                    .get_box_replacement_box(op.arg(0).to_opref())
-                    .or_else(|| ctx.ensure_box(op.arg(0).to_opref()));
+                    .get_box_replacement_box(op.arg(0).to_opref());
                 let has_info = obj_box.as_ref().map_or(false, |b| ctx.has_ptr_info(b));
                 if !has_info {
                     if let Some(b) = obj_box.as_ref() {
@@ -3727,8 +3636,7 @@ impl Optimization for OptRewrite {
                         // getptrinfo synthesizes ConstPtrInfo for constant
                         // Refs so `get_known_class` reads cls_of_box for them.
                         let obj_box = ctx
-                            .get_box_replacement_box(op.arg(0).to_opref())
-                            .or_else(|| ctx.ensure_box(op.arg(0).to_opref()));
+                            .get_box_replacement_box(op.arg(0).to_opref());
                         if let Some(known) = obj_box
                             .as_ref()
                             .and_then(|b| ctx.getptrinfo(b))
