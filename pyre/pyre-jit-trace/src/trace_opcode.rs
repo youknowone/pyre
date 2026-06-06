@@ -3919,6 +3919,55 @@ impl MIFrame {
         types
     }
 
+    /// Append `self.parent_frames` onto an innermost-first `lead` frame
+    /// list and reverse the whole vector to the outermost-first order
+    /// required by `recorder.rs:54` ("Frames in the snapshot, outermost
+    /// first") and `resume.rs:252`.  Extracted so both the ordinary
+    /// `build_framestack_snapshot` (lead = `[top]`) and the issue #143
+    /// synthetic-callee path (lead = `[helper, self-as-parent]`) share one
+    /// parent-collection + reverse seam.
+    fn build_framestack_frames(
+        &mut self,
+        ctx: &mut TraceCtx,
+        mut lead: Vec<majit_metainterp::recorder::SnapshotFrame>,
+    ) -> Vec<majit_metainterp::recorder::SnapshotFrame> {
+        let n = crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
+        // opencoder.py:806: parent frames keep their original pc.
+        // Snapshot boxes = active boxes only (skip scalar inputarg header).
+        for parent in self.parent_frames.clone() {
+            let (parent_types_full, parent_jitcode_index, parent_active) =
+                self.materialize_parent_snapshot_state(ctx, parent);
+            let parent_types: &[Type] = if parent_types_full.len() > n {
+                &parent_types_full[n..]
+            } else {
+                &[]
+            };
+            // Parent frames never carry the after-residual-call marker, so
+            // their raw resume pc must leave bit 14 free or decode would
+            // mis-read it as marked (resumedata.rs:48-62).
+            assert!(
+                (parent.resume_pc as usize)
+                    < majit_ir::resumedata::AFTER_RESIDUAL_CALL_PC_FLAG as usize,
+                "parent resume pc {} >= AFTER_RESIDUAL_CALL_PC_FLAG; \
+                 function too large for bit-14 resume encoding",
+                parent.resume_pc
+            );
+            lead.push(majit_metainterp::recorder::SnapshotFrame {
+                jitcode_index: parent_jitcode_index,
+                pc: parent.resume_pc as u32,
+                boxes: Self::fail_args_to_snapshot_boxes_typed(&parent_active, parent_types, ctx),
+            });
+        }
+        // opencoder.py:217 `SnapshotIterator.__init__` calls
+        // `self.framestack.reverse()` so the numbering loop at
+        // `resume.py:249-253` iterates outermost-first.  pyre builds the
+        // frame list innermost-first (`[top, immediate_caller, ...,
+        // outermost]`); reverse so `Snapshot.frames[0]` is outermost,
+        // matching `recorder.rs:54` / `resume.rs:252`.
+        lead.reverse();
+        lead
+    }
+
     /// Build the full framestack `Snapshot` — top (callee) frame
     /// followed by every parent frame in `self.parent_frames` — plus
     /// virtualizable and virtualref boxes.  Mirrors opencoder.py:819-832
@@ -3941,7 +3990,7 @@ impl MIFrame {
         let n = crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
         let top_snapshot_types = &top_snapshot_types_full[n..];
         let top_jitcode_index = unsafe { (*self.sym().jitcode).index } as u32;
-        let mut frames = vec![majit_metainterp::recorder::SnapshotFrame {
+        let top_frame = majit_metainterp::recorder::SnapshotFrame {
             jitcode_index: top_jitcode_index,
             pc: top_pc as u32,
             boxes: Self::fail_args_to_snapshot_boxes_typed(
@@ -3949,44 +3998,8 @@ impl MIFrame {
                 top_snapshot_types,
                 ctx,
             ),
-        }];
-        // opencoder.py:806: parent frames keep their original pc.
-        // Snapshot boxes = active boxes only (skip scalar inputarg header).
-        for parent in self.parent_frames.clone() {
-            let (parent_types_full, parent_jitcode_index, parent_active) =
-                self.materialize_parent_snapshot_state(ctx, parent);
-            let parent_types: &[Type] = if parent_types_full.len() > n {
-                &parent_types_full[n..]
-            } else {
-                &[]
-            };
-            // Parent frames never carry the after-residual-call marker, so
-            // their raw resume pc must leave bit 14 free or decode would
-            // mis-read it as marked (resumedata.rs:48-62).
-            assert!(
-                (parent.resume_pc as usize)
-                    < majit_ir::resumedata::AFTER_RESIDUAL_CALL_PC_FLAG as usize,
-                "parent resume pc {} >= AFTER_RESIDUAL_CALL_PC_FLAG; \
-                 function too large for bit-14 resume encoding",
-                parent.resume_pc
-            );
-            frames.push(majit_metainterp::recorder::SnapshotFrame {
-                jitcode_index: parent_jitcode_index,
-                pc: parent.resume_pc as u32,
-                boxes: Self::fail_args_to_snapshot_boxes_typed(&parent_active, parent_types, ctx),
-            });
-        }
-        // opencoder.py:217 `SnapshotIterator.__init__` calls
-        // `self.framestack.reverse()` so the numbering loop at
-        // `resume.py:249-253` iterates outermost-first.  Pyre's
-        // encoder builds `frames` innermost-first
-        // (`[top, immediate_caller, ..., outermost]`); reverse here
-        // so `Snapshot.frames[0]` is outermost-first, matching the
-        // documented contract on `recorder.rs:54` "Frames in the
-        // snapshot, outermost first" and `resume.rs:252`
-        // "Input tuples for this factory follow the same caller-first
-        // order".
-        frames.reverse();
+        };
+        let frames = self.build_framestack_frames(ctx, vec![top_frame]);
         let vable_boxes = self.list_of_boxes_virtualizable(ctx);
         let vref_boxes = Self::build_virtualref_boxes(self.sym(), ctx);
         // PHASE 1.4 candidate D probe: detect snapshot-time divergence
@@ -4032,6 +4045,129 @@ impl MIFrame {
                 diverge
             );
         }
+        majit_metainterp::recorder::Snapshot {
+            frames,
+            vable_boxes,
+            vref_boxes,
+        }
+    }
+
+    /// Issue #143 core: synthesize a framestack whose innermost frame is a
+    /// Rust runtime-helper jitcode (the folded `list.append`/`pop` body),
+    /// not a Python frame.  Because `PyreMetaInterp::interpret`
+    /// (metainterp.rs:88) can only decode a `W_CodeObject` jitcode, the
+    /// helper callee can never be *traced*; instead the resize `GuardTrue`
+    /// captures a snapshot in which the helper is the top/callee frame and
+    /// the current Python frame is demoted to its immediate caller.  On
+    /// guard failure the blackhole resumes into the helper at `helper_pc`
+    /// (an identity-`pc_map` byte offset registered by
+    /// `register_runtime_helper_jitcode`, M-core1), runs the generic
+    /// append+realloc, returns its result into the caller's pending slot,
+    /// and the caller resumes at the post-CALL `fallthrough_pc` — instead
+    /// of re-executing the method-shape `CALL` and rebuilding a NULL
+    /// callable.
+    ///
+    /// `boxes` is the hand-built `[list, value]` carried into the helper.
+    /// It has NO scalar-inputarg header (the helper has no virtualizable
+    /// Python frame), so its types are computed 1:1 and passed UNSLICED.
+    /// `result_stack_idx` / `result_type` are the caller's pending call
+    /// result slot (relative to `nlocals`) and kind; they MUST be `Some`
+    /// in production so the demoted caller's `get_list_of_active_boxes`
+    /// (`in_a_call`, trace_opcode.rs:1538) nulls the undefined result slot
+    /// rather than capturing a stale box.  Returns frames outermost-first
+    /// (`[...outer parents, self, helper]`).
+    #[allow(dead_code)]
+    fn build_synthetic_callee_frames(
+        &mut self,
+        ctx: &mut TraceCtx,
+        helper_jitcode_index: u32,
+        helper_pc: usize,
+        boxes: &[OpRef],
+        result_stack_idx: Option<usize>,
+        result_type: Option<Type>,
+    ) -> Vec<majit_metainterp::recorder::SnapshotFrame> {
+        let n = crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
+
+        // Synthetic Rust-helper callee (new innermost/top frame). Its boxes
+        // are hand-built with NO 8-entry scalar-inputarg header, so
+        // `helper_types` matches `boxes` 1:1 and is passed UNSLICED. Each
+        // box keeps its intrinsic kind via `value_type` (list -> Ref, an
+        // unboxed int value -> Int) so resume `_number_boxes` tags it
+        // correctly.
+        let helper_types: Vec<Type> = boxes.iter().map(|&op| self.value_type(op)).collect();
+        let helper_frame = majit_metainterp::recorder::SnapshotFrame {
+            jitcode_index: helper_jitcode_index,
+            pc: helper_pc as u32,
+            boxes: Self::fail_args_to_snapshot_boxes_typed(boxes, &helper_types, ctx),
+        };
+
+        // Demote `self` (the Python frame doing the append) to the helper's
+        // immediate caller, resuming at the post-CALL fallthrough. Routing
+        // self through the SAME parent path as real parents is borrow-safe:
+        // `materialize_parent_snapshot_state` reads nothing from `self`
+        // (trace_opcode.rs:3925) — it rebuilds a fresh MIFrame from the raw
+        // `sym` pointer — so at most one `&mut PyreSym` is ever live, even
+        // when `parent.sym == self.sym`. `self.sym` / `concrete_frame_addr`
+        // / `fallthrough_pc` are Copy and read into the struct literal
+        // before the `&mut self` call. The pending result slot is carried
+        // so the caller's undefined call result is nulled at snapshot time.
+        let self_as_parent = ResumeFrameState {
+            sym: self.sym,
+            concrete_frame_addr: self.concrete_frame_addr,
+            resume_pc: self.fallthrough_pc,
+            pending_result_stack_idx: result_stack_idx,
+            pending_result_type: result_type,
+        };
+        let (self_types_full, self_jitcode_index, self_active) =
+            self.materialize_parent_snapshot_state(ctx, self_as_parent);
+        let self_types: &[Type] = if self_types_full.len() > n {
+            &self_types_full[n..]
+        } else {
+            &[]
+        };
+        let self_frame = majit_metainterp::recorder::SnapshotFrame {
+            jitcode_index: self_jitcode_index,
+            pc: self.fallthrough_pc as u32,
+            boxes: Self::fail_args_to_snapshot_boxes_typed(&self_active, self_types, ctx),
+        };
+
+        // Innermost-first lead = [helper(top), self(first parent)]; append
+        // self.parent_frames and reverse -> outermost-first
+        // [...outer parents, self, helper] (synthetic callee = frames[len-1]).
+        self.build_framestack_frames(ctx, vec![helper_frame, self_frame])
+    }
+
+    /// Full M-core2 `Snapshot` for the issue #143 resize guard: the
+    /// synthetic-callee framestack from `build_synthetic_callee_frames`
+    /// plus the one-shot virtualizable + virtualref boxes, both sourced
+    /// from the REAL Python frame's `sym` (the helper has none) exactly as
+    /// `build_framestack_snapshot` does.
+    ///
+    /// Like `build_framestack_snapshot`, this does NOT swap `self.orgpc`
+    /// or save/restore the vable scalars; the M-core3 caller must do that
+    /// around this call (mirroring `capture_resumedata`,
+    /// trace_opcode.rs:3742-3771) since `list_of_boxes_virtualizable`
+    /// derives the vable `last_instr`/`valuestackdepth` from `self.orgpc`.
+    #[allow(dead_code)]
+    fn build_framestack_snapshot_with_synthetic_callee(
+        &mut self,
+        ctx: &mut TraceCtx,
+        helper_jitcode_index: u32,
+        helper_pc: usize,
+        boxes: &[OpRef],
+        result_stack_idx: Option<usize>,
+        result_type: Option<Type>,
+    ) -> majit_metainterp::recorder::Snapshot {
+        let frames = self.build_synthetic_callee_frames(
+            ctx,
+            helper_jitcode_index,
+            helper_pc,
+            boxes,
+            result_stack_idx,
+            result_type,
+        );
+        let vable_boxes = self.list_of_boxes_virtualizable(ctx);
+        let vref_boxes = Self::build_virtualref_boxes(self.sym(), ctx);
         majit_metainterp::recorder::Snapshot {
             frames,
             vable_boxes,
@@ -10105,6 +10241,119 @@ mod tests {
 
         let active = frame.get_list_of_active_boxes(&mut ctx, false, false);
         assert_eq!(active, vec![stack0]);
+
+        unsafe {
+            let _ = Box::from_raw(inner_jc_ptr as *mut crate::state::JitCode);
+        }
+    }
+
+    /// Issue #143 M-core2: the resize guard synthesizes a 2-frame snapshot
+    /// whose innermost frame is the Rust runtime-helper callee (top) and
+    /// whose outer frame is the demoted Python caller resuming at its
+    /// post-CALL fallthrough.  Frames come back outermost-first
+    /// (`recorder.rs:56`), so `frames[0]` is the caller and `frames[1]` the
+    /// synthetic helper.  Exercises `build_synthetic_callee_frames` (the
+    /// frame-chain novelty) — NOT the full `_with_synthetic_callee` wrapper,
+    /// whose vable/vref tail would deref a skeleton helper's null code.
+    #[test]
+    fn build_synthetic_callee_frames_synthesizes_self_caller_and_helper_top() {
+        use majit_ir::VecAssoc;
+        use majit_metainterp::recorder::SnapshotTagged;
+        use std::sync::Arc;
+
+        // Empty liveness banks at offset 0: the demoted caller resumes at
+        // fallthrough_pc=3 with no live boxes.
+        let all_liveness = vec![0u8, 0, 0];
+        let mut insns: VecAssoc<String, u8> = VecAssoc::new();
+        insns.insert("live/".to_string(), majit_metainterp::jitcode::insns::BC_LIVE);
+        crate::assembler::publish_state(&insns, &all_liveness, all_liveness.len(), 1);
+
+        // Outer (caller) jitcode: BC_LIVE at byte 0 and byte 3.  Identity
+        // pc_map so resume_jitcode_pc_for(fallthrough_pc=3) == Some(3)
+        // (the M-core1 sibling-test pattern); the operand bytes [4],[5]=0,0
+        // select liveness offset 0 -> empty banks.
+        let runtime_jc = {
+            let inner = majit_metainterp::jitcode::JitCode::new("synth_callee_outer");
+            inner.set_body(majit_translate::jitcode::JitCodeBody {
+                code: vec![
+                    majit_metainterp::jitcode::insns::BC_LIVE,
+                    0,
+                    0,
+                    majit_metainterp::jitcode::insns::BC_LIVE,
+                    0,
+                    0,
+                ],
+                c_num_regs_r: 1,
+                startpoints: Some([0_usize, 3_usize].into_iter().collect()),
+                ..Default::default()
+            });
+            inner
+        };
+        let mut pyjit = crate::PyJitCode::skeleton(std::ptr::null(), std::ptr::null(), None);
+        pyjit.jitcode = Arc::new(runtime_jc);
+        pyjit.metadata.pc_map = (0..6).collect();
+        const OUTER_INDEX: i32 = 4;
+        let inner_jc = crate::state::JitCode {
+            code: std::ptr::null(),
+            index: OUTER_INDEX,
+            payload: Arc::new(pyjit),
+        };
+        let inner_jc_ptr = Box::into_raw(Box::new(inner_jc));
+
+        let mut sym = PyreSym::new_uninit(OpRef::NONE);
+        sym.jitcode = inner_jc_ptr;
+        sym.nlocals = 0;
+        sym.valuestackdepth = 0;
+        // registers_r left empty: no live boxes for the caller frame.
+
+        let mut ctx = TraceCtx::for_test(1);
+        let mut frame = MIFrame {
+            ctx: &mut ctx,
+            sym: &mut sym,
+            fallthrough_pc: 3,
+            parent_frames: Vec::new(), // empty -> exactly 2 frames out
+            pending_result_stack_idx: None,
+            pending_result_type: None,
+            pending_inline_frame: None,
+            orgpc: 3,
+            concrete_frame_addr: 0,
+            pre_opcode_registers_r: None,
+            pre_opcode_semantic_depth: None,
+        };
+
+        // Synthetic helper boxes: list = Ref op, value = unboxed Int op.
+        let list = OpRef::ref_op(20);
+        let value = OpRef::int_op(21);
+        const HELPER_INDEX: u32 = 7;
+        const GUARD_PC: usize = 99; // guard byte offset (identity pc_map)
+
+        let frames = frame.build_synthetic_callee_frames(
+            &mut ctx,
+            HELPER_INDEX,
+            GUARD_PC,
+            &[list, value],
+            None,
+            None,
+        );
+
+        // Outermost-first: [caller (demoted self), helper (innermost/top)].
+        assert_eq!(frames.len(), 2);
+
+        // frames[0] = self demoted to caller, resuming at fallthrough_pc.
+        assert_eq!(frames[0].jitcode_index, OUTER_INDEX as u32);
+        assert_eq!(frames[0].pc, 3); // self.fallthrough_pc
+        assert!(frames[0].boxes.is_empty()); // empty liveness, header sliced
+
+        // frames[1] = synthetic Rust-helper callee (new innermost/top frame).
+        assert_eq!(frames[1].jitcode_index, HELPER_INDEX);
+        assert_eq!(frames[1].pc, GUARD_PC as u32); // guard byte offset, raw
+        assert_eq!(
+            frames[1].boxes,
+            vec![
+                SnapshotTagged::Box(list, majit_ir::Type::Ref), // list -> Ref
+                SnapshotTagged::Box(value, majit_ir::Type::Int), // value -> Int (no header)
+            ]
+        );
 
         unsafe {
             let _ = Box::from_raw(inner_jc_ptr as *mut crate::state::JitCode);

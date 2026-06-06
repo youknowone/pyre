@@ -394,15 +394,43 @@ verdict's "index registration UNIMPLEMENTED" was overstated.)
   (indirectcalltargets_tests) proves production `pyjitcode_for_jitcode_index(idx)`
   resolves the helper and `resume_jitcode_pc_for(off)==off`. PASSES under
   `cargo test -p pyre-jit-trace --no-default-features --features dynasm`.
-- **M-core2 — synthesize callee SnapshotFrame.** A `build_framestack_snapshot`
-  variant that prepends a top `SnapshotFrame{jitcode_index=helper, pc=guard_offset,
-  boxes=[list,value]}` (NO `NUM_SCALAR_INPUTARGS` header-skip — a helper has no
-  scalar-inputarg header; verify this), then demotes the current `self`
-  (outer Python frame) to the first parent at `resume_pc=fallthrough_pc` via
-  `materialize_parent_snapshot_state` (trace_opcode.rs:3925), then
-  `self.parent_frames`. MIFrame holds `&mut PyreSym`, so demoting self needs a
-  `ResumeFrameState{sym: self.sym as *mut …}` re-borrow (same raw-ptr pattern
-  the parent path already uses).
+- **M-core2 — LANDED (uncommitted, tested; 2026-06-06, verdict-revised).**
+  Three methods on `impl MIFrame` (trace_opcode.rs), all dead-code until M-core3:
+  (1) `build_framestack_frames(ctx, lead) -> Vec<SnapshotFrame>` extracted from
+  `build_framestack_snapshot` (append `self.parent_frames` to an innermost-first
+  `lead`, then `reverse()` to the outermost-first `recorder.rs:56` contract); the
+  existing `build_framestack_snapshot` now delegates to it (`lead=[top]`). (2)
+  `build_synthetic_callee_frames(ctx, helper_jitcode_index, helper_pc, boxes,
+  result_stack_idx, result_type)` — helper top frame with boxes built UNSLICED
+  (no `NUM_SCALAR_INPUTARGS` header; types via `value_type` per box → list=Ref,
+  unboxed int value=Int), self demoted to first parent at `resume_pc=
+  fallthrough_pc` through `materialize_parent_snapshot_state` (borrow-safe: it
+  reads nothing from `self`, rebuilds an MIFrame from the raw `sym` ptr → ≤1
+  `&mut PyreSym` live), then `self.parent_frames`; returns outermost-first
+  `[...parents, self, helper]`. (3) `build_framestack_snapshot_with_synthetic_callee`
+  wraps (2) + one-shot vable/vref from the REAL Python `sym`. Test
+  `build_synthetic_callee_frames_synthesizes_self_caller_and_helper_top` asserts
+  `frames==[self@fallthrough(empty boxes), helper@guard([Box(list,Ref),
+  Box(value,Int)])]`. Full `pyre-jit-trace` suite green (239 passed).
+  **3-lens adversarial verify resolved into the code:** (a) the demoted self's
+  pending result slot is a SIGNATURE PARAMETER (`result_stack_idx`/`result_type`)
+  — it MUST be `Some` in production so `get_list_of_active_boxes`'s `in_a_call`
+  null-out (trace_opcode.rs:1538) clears the undefined call result instead of
+  capturing a stale box; the unit test passes `None` (valid empty-liveness case).
+  (b) the unit test uses an IDENTITY pc_map `(0..6)` so `resume_jitcode_pc_for(
+  fallthrough_pc=3)` resolves (a partial pc_map would `.expect`-panic at
+  trace_opcode.rs:1231 — the bug all 3 verifiers caught in the draft). (c)
+  frame order is OUTERMOST-FIRST (`frames[0]=self`, `frames[1]=helper`), refuting
+  two finders that claimed `frames[0]=helper`.
+  **Deferred to M-core3 (documented in method (3)'s doc comment):** the
+  `orgpc` swap + vable scalar save/restore that `capture_resumedata`
+  (trace_opcode.rs:3742-3771) performs around the snapshot must wrap the M-core3
+  call site (`list_of_boxes_virtualizable` derives the vable last_instr/vsd from
+  `self.orgpc`); the value box's SnapshotTagged kind must match the kind the
+  M-core1 helper jitcode declares at `guard_pc` (Ref vs Int mismatch mis-numbers
+  the box on resume); and method (3)'s vable/vref tail is unit-untested (it would
+  SEGV on a skeleton helper's null code — needs a real PyFrame or seeded
+  `virtualizable_array_lengths`).
 - **M-core3 — wire + real helper body.** Call the M-core2 builder from
   `guard_append_without_resize` (codegen.rs:1646). The helper jitcode BODY must
   contain the generic append incl. realloc so post-guard resume does the right
