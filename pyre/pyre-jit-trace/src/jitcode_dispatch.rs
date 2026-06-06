@@ -8440,6 +8440,18 @@ fn dispatch_residual_call_iIRFd_kind(
         // pyjitpl.py:1346-1400 `_record_helper_pure` parity — see
         // `dispatch_residual_call_iRd_kind` for the upstream walk.
         try_fold_pure_call_via_executor(ctx, call_opcode, &allboxes, call_descr, recorded);
+        // `boxes3`-shaped may-force residual (`CallMayForce{R,I,F,N}`):
+        // execute concretely under the authoritative walk and stamp the
+        // result, identically to the `iRd` / `iIRd` siblings.
+        // `do_residual_call` (`pyjitpl.py:1342-1346 _opimpl_residual_call3`)
+        // is arglist-shape-independent, so the float-arg shape needs the same
+        // execution path — e.g. a float-returning helper such as `math.sqrt`
+        // records here as `iIRFd>f` (empty i/r lists), and its result must be
+        // made concrete so the downstream float math can specialize.  Void
+        // float-stores (`irf_v`) are caught inside the helper's
+        // `result_type() == Void` arm and deferred (#61), so the compiled
+        // loop's re-run does not double-apply the store.
+        try_execute_residual_call_via_walker(ctx, call_opcode, &allboxes, call_descr, recorded);
 
         // Non-elidable concrete-execute parity (Task #390 sub-slice 3)
         // — see `dispatch_residual_call_iRd_kind` for the full citation.
