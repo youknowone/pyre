@@ -664,12 +664,15 @@ struct Lowering<'a> {
     /// scalar `BinOp` (the [`Rvalue::BinaryOp`] arm), so the destination
     /// local — though MIR-typed `(numeric, bool)` — holds one scalar
     /// Variable, not a tuple.  Its `.0` projection therefore collapses to
-    /// that scalar instead of extracting a tuple element.  A MIR local's
-    /// type is fixed, so a local bound by `BinaryOp` is a scalar at every
-    /// read site (its `(numeric, bool)` type can never alias a genuine
-    /// data tuple); a single function-wide set needs no per-block
-    /// propagation.  Distinguishes the collapse case from a genuine Ref
-    /// tuple `.N` read in [`Lowering::resolve_place`].
+    /// that scalar instead of extracting a tuple element; a `.1` read is
+    /// the Rust overflow bit, which the JIT IR does not model, so it fails
+    /// loud in [`Lowering::resolve_place`] rather than aliasing the
+    /// overflow bool to the arithmetic value.  A MIR local's type is
+    /// fixed, so a local bound by `BinaryOp` is a scalar at every read
+    /// site (its `(numeric, bool)` type can never alias a genuine data
+    /// tuple); a single function-wide set needs no per-block propagation.
+    /// Distinguishes the collapse case from a genuine Ref tuple `.N` read
+    /// in [`Lowering::resolve_place`].
     binop_result_locals: std::collections::HashSet<usize>,
 }
 
@@ -1526,17 +1529,18 @@ impl<'a> Lowering<'a> {
                 // `flowspace/rust_source/build_flow.rs:4770
                 // lower_field`) get a resolvable field/owner_root shape.
                 //
-                // Tuple-container `Field` projections split two ways.
+                // Tuple-container `Field` projections split three ways.
                 // A local bound by a positional `Rvalue::Aggregate`
                 // (`positional_aggregate_locals`) carries a synthetic
                 // ctor base with a `__pos_<N>` `FieldWrite` chain, so
-                // its `.N` reads emit a symmetric `FieldRead
-                // __pos_<N>`.  Every other Tuple-container read still
-                // collapses to the base Variable: the `straight_line_add`
-                // / AddChecked `(value, bool)` shape lowers to a scalar
-                // `BinOp` (not an Aggregate), so its `.0` must fall
-                // through to the underlying Variable and the paired
-                // `.1` Assert is dropped in `lower_statement`.
+                // its `.N` reads emit a symmetric `FieldRead __pos_<N>`.
+                // A genuine Ref tuple (`__pos_<N>` block below) likewise
+                // emits a typed `FieldRead`.  The `straight_line_add` /
+                // AddChecked `(value, bool)` shape is the exception: it
+                // lowers to a scalar `BinOp` (not an Aggregate), so its
+                // `.0` collapses to the base Variable while the paired
+                // `.1` Assert is dropped in `lower_statement` (a live
+                // `.1` read fails loud — the overflow bit is unmodeled).
                 //
                 // Atom projections (`Deref` and others) still
                 // collapse: `Deref` is a no-op for typed refs at the
@@ -1610,35 +1614,54 @@ impl<'a> Lowering<'a> {
                 // `inner` as a Ref while element N may be an `Int`.
                 // Without it, `tuple.1` aliases the whole tuple (Ref) and
                 // a later merge with an `Int`-typed sibling value trips
-                // the assembler's kind cross-check.  The `*Checked
-                // (value, bool)` shape is the exception: it lowered to a
-                // scalar `BinOp` (`binop_result_locals`), so its `.0`
-                // collapses to that scalar Variable below.
+                // the assembler's kind cross-check.
+                //
+                // The `*Checked (value, bool)` local is field-dependent.
+                // It lowered to a scalar `BinOp` (`binop_result_locals`):
+                // field `.0` is that scalar, so it collapses to the base
+                // Variable below.  Field `.1` is the Rust overflow bit,
+                // which the JIT IR does not model — the paired overflow
+                // `Assert` is dropped in `lower_statement`, and ovfcheck
+                // is carried by separate `int_*_ovf` + guard ops, never a
+                // boolean tuple field.  A live read of `.1` therefore has
+                // no lowering: fail loud rather than silently alias the
+                // overflow bool to the arithmetic value.
                 if let ProjectionElem::Tagged(v) = &elem
                     && self.place_is_tuple(&inner)
-                    && !self.place_is_binop_scalar(&inner)
                     && let Some(field_payload) = v.as_object().and_then(|m| m.get("Field"))
                     && let Some(idx) = self.positional_field_index(field_payload)
                 {
-                    let base = self.resolve_place(mir_bb, *inner)?;
-                    let bb_id = self.block_id[mir_bb];
-                    let ty = tyref_to_value_type(&place_ty, self.llbc);
-                    let res = self
-                        .graph
-                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-                        result: Some(res.clone()),
-                        kind: OpKind::FieldRead {
-                            base,
-                            field: FieldDescriptor::new(
-                                format!("__pos_{idx}"),
-                                Some("Adt".to_string()),
-                            ),
-                            ty,
-                            pure: false,
-                        },
-                    });
-                    return Ok(res);
+                    if self.place_is_binop_scalar(&inner) {
+                        if idx != 0 {
+                            return Err(LowerError::Unsupported(format!(
+                                "bb{mir_bb}: live read of field .{idx} of a \
+                                 checked-binop `(value, bool)` local — the \
+                                 overflow bit is not modeled (ovfcheck uses \
+                                 separate guard ops, not a tuple field)"
+                            )));
+                        }
+                        // idx == 0: fall through to the base-collapse below.
+                    } else {
+                        let base = self.resolve_place(mir_bb, *inner)?;
+                        let bb_id = self.block_id[mir_bb];
+                        let ty = tyref_to_value_type(&place_ty, self.llbc);
+                        let res = self
+                            .graph
+                            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                            result: Some(res.clone()),
+                            kind: OpKind::FieldRead {
+                                base,
+                                field: FieldDescriptor::new(
+                                    format!("__pos_{idx}"),
+                                    Some("Adt".to_string()),
+                                ),
+                                ty,
+                                pure: false,
+                            },
+                        });
+                        return Ok(res);
+                    }
                 }
                 match elem {
                     ProjectionElem::Tagged(_) | ProjectionElem::Atom(_) => {
