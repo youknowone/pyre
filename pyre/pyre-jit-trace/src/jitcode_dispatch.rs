@@ -6124,6 +6124,19 @@ fn diagnose_inline_recognition(arg_concretes: &[ConcreteValue], op_pc: usize) {
 /// pre-flight so the call lowers to an ordinary residual call (the orthodox
 /// non-inlinable path, `should_inline` = False → `do_residual_call`,
 /// `pyjitpl.py:1422`) instead of aborting.
+///
+/// Also decline callees that are not *straight-line leaves*.  The inline
+/// convention resumes a guard inside the callee at the caller's CALL boundary
+/// via the inherited single-frame snapshot — sound only when re-executing the
+/// whole call on deopt reproduces the state ([`try_walker_inline_user_call`]
+/// docstring).  A callee with an internal conditional branch (`goto_if_not` /
+/// `switch`) emits a branch guard whose fail snapshot needs to resume *into*
+/// the callee mid-body; the single-frame model then serialises a resume
+/// section whose liveness shape disagrees with the encoded stream (a folded
+/// branch operand is numbered `TAGINT` in a slot the outer liveness reports as
+/// a ref → `resume.rs decode_ref: unexpected tag`).  Until the multi-frame
+/// resume coordinate is ported (#68), only branchless leaves are inlinable;
+/// a branchy callee lowers to an ordinary residual call (correct).
 fn callee_fast_path_inlinable(
     body_code: &[u8],
     callee_descr_refs: &[DescrRef],
@@ -6135,6 +6148,9 @@ fn callee_fast_path_inlinable(
             // Undecodable tail — be conservative and decline the fast path.
             return false;
         };
+        if d.opname.starts_with("goto_if_not") || d.opname.starts_with("switch") {
+            return false;
+        }
         if d.opname.contains("vable")
             && !inline_resolvable_static_vable_read(body_code, &d, callee_descr_refs, ctx)
         {
