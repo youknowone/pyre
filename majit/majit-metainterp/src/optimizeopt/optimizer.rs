@@ -3760,6 +3760,11 @@ impl Optimizer {
                     // 5: Restart's new op carries `Op.type_` from
                     // construction; no side-table refresh needed.
                     let restart_op_rc = std::rc::Rc::new(op);
+                    // replace_op_with parity: the rewrite supersedes the
+                    // original as the producer at its position so the
+                    // re-dispatch reads/writes one canonical `_forwarded` host
+                    // and the bound it accumulates survives emit's catch-up.
+                    ctx.supersede_restart_producer(&restart_op_rc);
                     self.propagate_from_pass_range(0, end_pass, &restart_op_rc, ctx);
                     // Run any postprocess callbacks accumulated in the outer
                     // chain (passes that already returned PassOn for the

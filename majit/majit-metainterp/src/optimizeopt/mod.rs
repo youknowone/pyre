@@ -1748,6 +1748,48 @@ impl OptContext {
         synthetic
     }
 
+    /// `replace_op_with` (optimizer.py:replace_op_with) parity for the
+    /// dispatcher's `Restart` arm: the rewritten op supersedes the original
+    /// as the producer at its (preserved) position. RPython performs
+    /// `original.set_forwarded(newop)`, after which every read of that
+    /// position resolves to `newop` and `setintbound`/`setptrinfo` writes
+    /// decorate `newop` directly. In pyre's producer-registry model the
+    /// equivalent is to make `restart_op` the SOLE registered producer at
+    /// its position: `find_producer_op(pos)` then returns `restart_op`, so
+    /// `ensure_box(pos)` / `from_bound_op(restart_op)` agree on one canonical
+    /// `_forwarded` host, and the bound the re-dispatch accumulates survives
+    /// `emit`'s `live_synthetics` catch-up onto the emitted op.
+    ///
+    /// Without this the re-dispatch runs against a fresh, unregistered
+    /// `Rc<Op>` (`Rc::new(restart_op)`): writes such as `setintbound` land on
+    /// a host absent from `live_synthetics`, the superseded original keeps its
+    /// stale stand-in slot, and the carry-over at emit migrates the wrong
+    /// (empty) `_forwarded` — dropping the rewrite's bound.
+    pub(crate) fn supersede_restart_producer(&mut self, restart_op: &majit_ir::OpRc) {
+        let pos = restart_op.pos.get();
+        if pos.is_none() || pos.is_constant() {
+            return;
+        }
+        // InputArg positions have no producing op (handled by
+        // `ensure_inputarg_bindings`); a rewrite never targets one.
+        if matches!(
+            pos,
+            OpRef::InputArgInt(_) | OpRef::InputArgFloat(_) | OpRef::InputArgRef(_)
+        ) {
+            return;
+        }
+        // Drop the superseded stand-in at this position so the single
+        // `live_synthetics` entry the emit catch-up migrates is `restart_op`'s
+        // accumulated `_forwarded`, not the original's stale slot. At most one
+        // live stand-in exists per position (mod.rs::emit invariant), so a
+        // single removal is sufficient.
+        if let Some(i) = self.live_synthetics.iter().position(|s| s.pos.get() == pos) {
+            self.live_synthetics.swap_remove(i);
+        }
+        self.resop_refs.insert(pos, restart_op.clone());
+        self.live_synthetics.push(restart_op.clone());
+    }
+
     /// S-8.A: read `_forwarded` for `opref` directly off the canonical
     /// host (`op.forwarded` / `inputarg.forwarded`). Mirrors
     /// `BoxRef::get_forwarded` semantics
