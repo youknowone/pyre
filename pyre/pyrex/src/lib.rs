@@ -98,18 +98,27 @@ fn real_main(binary_name: &str) {
     // `main_entry`) so blocking syscalls here are interrupted by Ctrl-C /
     // alarms.
     pyre_interpreter::module::_signal::signalstate::unblock_async_signals_on_interp_thread();
-    // Suppress panic messages for InvalidLoop — these are caught by
-    // catch_unwind in the JIT optimizer but the default panic hook still
-    // prints to stderr, making it look like a crash.
-    // RPython: InvalidLoop is a silent exception, not an error.
+    // Suppress panic messages for the optimizer's silent control-flow panics
+    // (InvalidLoop, SpeculativeError) — these are caught by catch_unwind in
+    // the JIT compile paths but the default panic hook still prints to stderr,
+    // making a graceful trace-abandon look like a crash.
+    // RPython: both are silent exceptions, not errors
+    // (`unroll.py:119-123 except SpeculativeError: raise InvalidLoop`). The
+    // optimizer raises SpeculativeError to decline a speculative heap fold;
+    // compile_loop / compile_bridge catch it and abandon the trace (correct
+    // blackhole fallback), so its message is a false crash signal. A genuinely
+    // uncaught one still aborts with a nonzero exit, so suppressing only the
+    // message does not hide a real failure.
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        // Only print if it's NOT an InvalidLoop (which is caught by catch_unwind)
         let payload = info.payload();
-        if payload
+        let is_silent_control_flow = payload
             .downcast_ref::<majit_metainterp::optimize::InvalidLoop>()
-            .is_none()
-        {
+            .is_some()
+            || payload
+                .downcast_ref::<majit_metainterp::optimize::SpeculativeError>()
+                .is_some();
+        if !is_silent_control_flow {
             default_hook(info);
         }
     }));
