@@ -149,7 +149,7 @@ fn structseq_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
         let item = unsafe { pyre_object::w_tuple_getitem(inst, i as i64) }
             .unwrap_or(pyre_object::w_none());
         let fname = fields.get(i).cloned().unwrap_or_else(|| format!("?{i}"));
-        let r_str = unsafe { crate::py_repr(item) };
+        let r_str = unsafe { crate::py_repr(item)? };
         parts.push(format!("{fname}={r_str}"));
     }
     Ok(pyre_object::w_str_new(&format!(

@@ -518,6 +518,7 @@ impl PyError {
             "<null>".to_string()
         } else {
             unsafe { crate::display::py_repr(key) }
+                .unwrap_or_else(|_| "<unrepresentable>".to_string())
         };
         let exc = pyre_object::excobject::w_exception_new(ExcKind::KeyError, &message);
         if !key.is_null() {
@@ -800,7 +801,10 @@ impl PyError {
         if !self.message.is_empty() || self.exc_object.is_null() {
             return self.message.clone();
         }
+        // Infallible Display-side context: a raising `__str__` degrades to
+        // the placeholder rather than propagating.
         unsafe { crate::display::py_str(self.exc_object) }
+            .unwrap_or_else(|_| "<unprintable>".to_string())
     }
 
     pub fn render_exception(&self) -> String {
@@ -926,7 +930,8 @@ fn write_exception_notes<W: Write>(writer: &mut W, exc: PyObjectRef) -> std::io:
         if item.is_null() {
             continue;
         }
-        let s = unsafe { crate::display::py_str(item) };
+        let s = unsafe { crate::display::py_str(item) }
+            .unwrap_or_else(|_| "<unprintable note>".to_string());
         for line in s.lines() {
             writeln!(writer, "{}", line)?;
         }
@@ -961,13 +966,17 @@ fn render_exc_object(exc: PyObjectRef) -> String {
                     String::new()
                 } else {
                     crate::display::py_str(first)
+                        .unwrap_or_else(|_| "<unprintable>".to_string())
                 }
             } else {
                 // Multi-arg exceptions render as tuple repr — matches
                 // BaseException.__str__ (`interp_exceptions.py:142`).
                 let items: Vec<String> = (0..len as i64)
                     .filter_map(|i| pyre_object::w_tuple_getitem(args, i))
-                    .map(|w| crate::display::py_repr(w))
+                    .map(|w| {
+                        crate::display::py_repr(w)
+                            .unwrap_or_else(|_| "<unprintable>".to_string())
+                    })
                     .collect();
                 format!("({})", items.join(", "))
             }

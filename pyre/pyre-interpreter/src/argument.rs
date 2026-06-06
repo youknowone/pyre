@@ -150,7 +150,7 @@ pub fn check_not_duplicate_kwargs(
                 if pyre_object::is_str(w_key) {
                     pyre_object::w_str_get_value(w_key).to_string()
                 } else {
-                    crate::display::py_str(w_key)
+                    crate::display::py_str(w_key)?
                 }
             };
             return Err(raise_type_error(

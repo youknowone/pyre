@@ -2716,15 +2716,15 @@ fn build_class_inner(
             if w_metaclass.is_some() && unsafe { pyre_object::is_type(w_type) } {
                 let cell_value = unsafe { pyre_object::w_cell_get(classcell) };
                 if cell_value.is_null() {
-                    let class_str = unsafe { crate::py_str(w_type) };
+                    let class_str = unsafe { crate::py_str(w_type) }?;
                     return Err(PyError::runtime_error(format!(
                         "__class__ not set defining {name} as {class_str}. \
                          Was __classcell__ propagated to type.__new__?"
                     )));
                 }
                 if !std::ptr::eq(cell_value, w_type) {
-                    let cell_str = unsafe { crate::py_str(cell_value) };
-                    let class_str = unsafe { crate::py_str(w_type) };
+                    let cell_str = unsafe { crate::py_str(cell_value) }?;
+                    let class_str = unsafe { crate::py_str(w_type) }?;
                     return Err(PyError::type_error(format!(
                         "__class__ set to {cell_str} defining {name} as {class_str}"
                     )));

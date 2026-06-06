@@ -3,8 +3,8 @@ use num_traits::ToPrimitive;
 
 use crate::executioncontext::DictStorage;
 use crate::{
-    PyDisplay, make_builtin_function, make_builtin_function_with_arity,
-    make_module_builtin_function, make_module_builtin_function_with_arity,
+    make_builtin_function, make_builtin_function_with_arity, make_module_builtin_function,
+    make_module_builtin_function_with_arity,
 };
 use pyre_object::*;
 use rustpython_wtf8::{CodePoint, Wtf8Buf};
@@ -1017,9 +1017,11 @@ fn builtin_print(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         let sep_val = unsafe { pyre_object::w_dict_lookup(kwargs, sep_key) };
         let end_str = end_val
             .map(|v| unsafe { crate::py_str(v) })
+            .transpose()?
             .unwrap_or_else(|| "\n".to_string());
         let sep_str = sep_val
             .map(|v| unsafe { crate::py_str(v) })
+            .transpose()?
             .unwrap_or_else(|| " ".to_string());
         (&args[..args.len() - 1], end_str, sep_str)
     } else {
@@ -1028,8 +1030,8 @@ fn builtin_print(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 
     let parts: Vec<String> = positional
         .iter()
-        .map(|&obj| format!("{}", PyDisplay(obj)))
-        .collect();
+        .map(|&obj| unsafe { crate::py_str(obj) })
+        .collect::<Result<Vec<String>, _>>()?;
     crate::print_output(&format!("{}{}", parts.join(&sep), end));
     Ok(w_none())
 }
@@ -1904,11 +1906,15 @@ fn os_error_init(kind: pyre_object::excobject::ExcKind, args: &[PyObjectRef]) ->
         let msg: String = if args.is_empty() {
             String::new()
         } else if args.len() == 1 {
-            unsafe { crate::display::py_str(args[0]) }
+            // os_error_init returns PyObjectRef (exception construction is
+            // non-raising machinery, per the F7 display policy); a raising
+            // __str__/__repr__ on the args degrades to the empty string
+            // rather than propagating.
+            unsafe { crate::display::py_str(args[0]) }.unwrap_or_default()
         } else {
             let parts: Vec<String> = args
                 .iter()
-                .map(|&a| unsafe { crate::display::py_repr(a) })
+                .map(|&a| unsafe { crate::display::py_repr(a) }.unwrap_or_default())
                 .collect();
             format!("({})", parts.join(", "))
         };
@@ -2477,20 +2483,20 @@ pub(crate) fn builtin_str(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
             // Python class in `w_class`; honor its `__str__` override before
             // returning the raw value.
             let tp = (*obj).ob_type;
-            if let Some(s) = crate::display::builtin_subclass_dunder(obj, tp, "__str__") {
+            if let Some(s) = crate::display::builtin_subclass_dunder(obj, tp, "__str__")? {
                 return Ok(w_str_new(&s));
             }
             return Ok(obj);
         }
     }
-    let w = unsafe { crate::py_str_wtf8(obj) };
+    let w = unsafe { crate::py_str_wtf8(obj)? };
     Ok(pyre_object::w_str_from_wtf8(w))
 }
 
 /// `repr(obj)` → string representation
 fn builtin_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(args.len() == 1, "repr() takes exactly one argument");
-    let s = unsafe { crate::py_repr(args[0]) };
+    let s = unsafe { crate::py_repr(args[0])? };
     Ok(w_str_new(&s))
 }
 
@@ -2498,8 +2504,8 @@ fn builtin_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 /// and escape every non-ASCII code point as `\xXX` / `\uXXXX` /
 /// `\UXXXXXXXX`.  Shared by the `ascii()` builtin and the `!a`
 /// `str.format` conversion.
-pub(crate) fn py_ascii(obj: PyObjectRef) -> String {
-    let s = unsafe { crate::py_repr(obj) };
+pub(crate) fn py_ascii(obj: PyObjectRef) -> Result<String, crate::PyError> {
+    let s = unsafe { crate::py_repr(obj)? };
     let mut out = String::with_capacity(s.len());
     for ch in s.chars() {
         let cp = ch as u32;
@@ -2513,14 +2519,14 @@ pub(crate) fn py_ascii(obj: PyObjectRef) -> String {
             out.push_str(&format!("\\U{cp:08x}"));
         }
     }
-    out
+    Ok(out)
 }
 
 /// `bltinmodule.c:builtin_ascii` — like `repr`, but escape every
 /// non-ASCII code point in the repr as `\xXX` / `\uXXXX` / `\UXXXXXXXX`.
 fn builtin_ascii(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(args.len() == 1, "ascii() takes exactly one argument");
-    Ok(w_str_new(&py_ascii(args[0])))
+    Ok(w_str_new(&py_ascii(args[0])?))
 }
 
 /// `int(obj)` → convert to int
@@ -5672,7 +5678,7 @@ fn builtin_complex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
             } else if is_float(a) {
                 w_float_get_value(a)
             } else if is_str(a) {
-                let s = crate::py_str(a);
+                let s = crate::py_str(a)?;
                 s.trim().parse::<f64>().map_err(|_| {
                     crate::PyError::new(
                         crate::PyErrorKind::ValueError,
@@ -5715,7 +5721,7 @@ fn builtin_format(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(!args.is_empty(), "format() takes at least one argument");
     let value = args[0];
     let spec = if args.len() > 1 {
-        unsafe { crate::py_str(args[1]) }
+        unsafe { crate::py_str(args[1])? }
     } else {
         String::new()
     };

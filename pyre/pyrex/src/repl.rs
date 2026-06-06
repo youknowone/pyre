@@ -225,7 +225,7 @@ fn read_prompt(sys_module: pyre_object::PyObjectRef, name: &str) -> Option<Strin
     if prompt.is_null() || unsafe { pyre_object::is_none(prompt) } {
         return None;
     }
-    Some(unsafe { pyre_interpreter::py_str(prompt) })
+    unsafe { pyre_interpreter::py_str(prompt) }.ok()
 }
 
 fn shell_exec(

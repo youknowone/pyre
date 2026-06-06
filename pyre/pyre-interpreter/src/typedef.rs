@@ -2359,7 +2359,7 @@ fn init_dict_type(ns: &mut DictStorage) {
                          doesn't apply to a '{tp_name}' object"
                     )));
                 }
-                unsafe { Ok(pyre_object::w_str_new(&crate::display::dict_repr(dict))) }
+                unsafe { Ok(pyre_object::w_str_new(&crate::display::dict_repr(dict)?)) }
             },
             1,
         ),
@@ -2666,7 +2666,7 @@ fn init_dict_view_common_slots(ns: &mut DictStorage) {
                     return Ok(pyre_object::w_str_new(""));
                 }
                 Ok(pyre_object::w_str_new(&unsafe {
-                    crate::display::py_repr(args[0])
+                    crate::display::py_repr(args[0])?
                 }))
             },
             1,
@@ -3377,7 +3377,7 @@ fn init_mappingproxy_type(ns: &mut DictStorage) {
             if args.is_empty() {
                 return Ok(pyre_object::w_str_new("mappingproxy({})"));
             }
-            unsafe { Ok(pyre_object::w_str_new(&crate::display::py_repr(args[0]))) }
+            unsafe { Ok(pyre_object::w_str_new(&crate::display::py_repr(args[0])?)) }
         }),
     );
     // dictproxyobject.py:44 descr_str → space.str(self.w_mapping)
@@ -3388,7 +3388,7 @@ fn init_mappingproxy_type(ns: &mut DictStorage) {
             if args.is_empty() {
                 return Ok(pyre_object::w_str_new(""));
             }
-            unsafe { Ok(pyre_object::w_str_new(&crate::display::py_str(args[0]))) }
+            unsafe { Ok(pyre_object::w_str_new(&crate::display::py_str(args[0])?)) }
         }),
     );
     // dictproxyobject.py:67 descr_ior → unconditional TypeError; the
@@ -3748,7 +3748,7 @@ fn slice_getter(
 
 /// sliceobject.py `descr_repr` — `"slice(%r, %r, %r)"`.
 fn slice_descr_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    Ok(w_str_new(&unsafe { crate::display::py_repr(args[0]) }))
+    Ok(w_str_new(&unsafe { crate::display::py_repr(args[0])? }))
 }
 
 /// sliceobject.py `descr_eq` / `descr_ne` — compare the three components.
@@ -7174,7 +7174,7 @@ fn init_object_type(ns: &mut DictStorage) {
                 }
                 // Delegate to __repr__ to avoid infinite recursion
                 // PyPy: objectobject.py descr___str__ → space.repr(w_self)
-                Ok(pyre_object::w_str_new(&unsafe { crate::py_repr(args[0]) }))
+                Ok(pyre_object::w_str_new(&unsafe { crate::py_repr(args[0])? }))
             },
             1,
         ),
@@ -7190,14 +7190,14 @@ fn init_object_type(ns: &mut DictStorage) {
                     return Ok(pyre_object::w_str_new(""));
                 }
                 if args.len() > 1 {
-                    let spec = unsafe { crate::py_str(args[1]) };
+                    let spec = unsafe { crate::py_str(args[1])? };
                     if !spec.is_empty() {
                         return Err(crate::PyError::type_error(
                             "unsupported format string passed to object.__format__",
                         ));
                     }
                 }
-                Ok(pyre_object::w_str_new(&unsafe { crate::py_str(args[0]) }))
+                Ok(pyre_object::w_str_new(&unsafe { crate::py_str(args[0])? }))
             },
             2,
         ),

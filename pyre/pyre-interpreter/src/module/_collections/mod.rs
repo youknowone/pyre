@@ -271,7 +271,7 @@ mod deque_class {
                     i += 1;
                 }
                 Err(crate::PyError::value_error(
-                    format!("{} is not in deque", unsafe { crate::py_repr(x) })))
+                    format!("{} is not in deque", unsafe { crate::py_repr(x)? })))
             }
             fn copy(self_obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
                 // `type(self)(self)` or `type(self)(self, maxlen)`.
@@ -364,22 +364,22 @@ mod deque_class {
                 store(self_obj, items);
                 Ok(self_obj)
             }
-            fn __repr__(self_obj: PyObjectRef) -> String {
+            fn __repr__(self_obj: PyObjectRef) -> Result<String, crate::PyError> {
                 // `dequerepr` — a deque reachable from its own items renders
                 // the inner reference as `[...]` instead of recursing.
                 let Some(_guard) = crate::display::ReprGuard::enter(self_obj) else {
-                    return "[...]".to_string();
+                    return Ok("[...]".to_string());
                 };
                 let name = unsafe { w_type_get_name(w_instance_get_type(self_obj)) };
                 let listrepr = snapshot(self_obj)
                     .into_iter()
                     .map(|it| unsafe { crate::py_repr(it) })
-                    .collect::<Vec<_>>()
+                    .collect::<Result<Vec<_>, _>>()?
                     .join(", ");
-                match maxlen_bound(self_obj) {
+                Ok(match maxlen_bound(self_obj) {
                     Some(m) => format!("{name}([{listrepr}], maxlen={m})"),
                     None => format!("{name}([{listrepr}])"),
-                }
+                })
             }
         },
         properties: {

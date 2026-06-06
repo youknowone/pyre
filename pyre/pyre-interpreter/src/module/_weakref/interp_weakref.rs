@@ -1155,7 +1155,7 @@ pub fn proxy_trunc(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
 
 pub fn proxy_str(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     let w_obj0 = force(args[0])?;
-    Ok(pyre_object::w_str_new(&unsafe { crate::py_str(w_obj0) }))
+    Ok(pyre_object::w_str_new(&unsafe { crate::py_str(w_obj0)? }))
 }
 
 pub fn proxy_bool(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {

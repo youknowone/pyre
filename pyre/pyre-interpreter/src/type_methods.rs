@@ -1027,9 +1027,9 @@ fn format_render(
                 // `!s` is `str(self)`, preserved in WTF-8 so a lone
                 // surrogate (a str, or an exception with a str argument)
                 // passes through unchanged.
-                Some('s') => pyre_object::w_str_from_wtf8(unsafe { crate::py_str_wtf8(val) }),
-                Some('r') => pyre_object::w_str_new(&unsafe { crate::py_repr(val) }),
-                Some('a') => pyre_object::w_str_new(&crate::builtins::py_ascii(val)),
+                Some('s') => pyre_object::w_str_from_wtf8(unsafe { crate::py_str_wtf8(val)? }),
+                Some('r') => pyre_object::w_str_new(&unsafe { crate::py_repr(val)? }),
+                Some('a') => pyre_object::w_str_new(&crate::builtins::py_ascii(val)?),
                 Some(c) => {
                     return Err(crate::PyError::new(
                         crate::PyErrorKind::ValueError,
@@ -1353,7 +1353,10 @@ fn pad_to_width(body: String, fill: char, align: char, width: usize) -> String {
 /// Public entry point for the f-string `FormatWithSpec` opcode in
 /// `eval.rs::format_with_spec`. Forwards to the same parser used by
 /// `str.format` so both surfaces share the spec semantics.
-pub fn format_with_spec_public(val: PyObjectRef, spec: &str) -> Wtf8Buf {
+pub fn format_with_spec_public(
+    val: PyObjectRef,
+    spec: &str,
+) -> Result<Wtf8Buf, crate::PyError> {
     format_with_spec(val, spec)
 }
 
@@ -1384,9 +1387,9 @@ pub fn format_value_dispatch(val: PyObjectRef, spec: &str) -> Result<Wtf8Buf, cr
         // Empty spec collapses to `str(value)`, preserved in WTF-8 so a
         // str — or an exception whose single argument is a str — keeps
         // its lone surrogates.
-        Ok(unsafe { crate::py_str_wtf8(val) })
+        Ok(unsafe { crate::py_str_wtf8(val)? })
     } else {
-        Ok(format_with_spec_public(val, spec))
+        Ok(format_with_spec_public(val, spec)?)
     }
 }
 
@@ -1396,7 +1399,7 @@ pub fn format_value_dispatch(val: PyObjectRef, spec: &str) -> Result<Wtf8Buf, cr
 /// risking recursion).  An empty spec collapses to `str(self)`.
 pub fn builtin_value_format(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let spec = if args.len() > 1 {
-        unsafe { crate::py_str(args[1]) }
+        unsafe { crate::py_str(args[1])? }
     } else {
         String::new()
     };
@@ -1407,14 +1410,14 @@ pub fn builtin_value_format(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
                 unsafe { pyre_object::w_str_get_wtf8(args[0]) }.to_wtf8_buf(),
             ));
         }
-        return Ok(pyre_object::w_str_new(&unsafe { crate::py_str(args[0]) }));
+        return Ok(pyre_object::w_str_new(&unsafe { crate::py_str(args[0])? }));
     }
     Ok(pyre_object::w_str_from_wtf8(format_with_spec_public(
         args[0], &spec,
-    )))
+    )?))
 }
 
-fn format_with_spec(val: PyObjectRef, spec: &str) -> Wtf8Buf {
+fn format_with_spec(val: PyObjectRef, spec: &str) -> Result<Wtf8Buf, crate::PyError> {
     let p = parse_spec(spec);
     unsafe {
         if pyre_object::is_int(val) || pyre_object::is_bool(val) {
@@ -1433,19 +1436,19 @@ fn format_with_spec(val: PyObjectRef, spec: &str) -> Wtf8Buf {
                     .map_or_else(|| format!("{v}"), |c| c.to_string());
                 // `c` keeps the integer default alignment (right).
                 let align = p.align.unwrap_or('>');
-                return Wtf8Buf::from_string(pad_to_width(body, p.fill, align, p.width));
+                return Ok(Wtf8Buf::from_string(pad_to_width(body, p.fill, align, p.width)));
             }
             // Float-style spec on int: coerce to f64 (matches CPython
             // `int.__format__('.3f')` behaviour).  `%` is a float-only
             // presentation type, so route ints through it too.
             if matches!(p.ty, 'f' | 'F' | 'e' | 'E' | 'g' | 'G' | '%') {
-                return Wtf8Buf::from_string(format_float(v as f64, &p));
+                return Ok(Wtf8Buf::from_string(format_float(v as f64, &p)));
             }
-            return Wtf8Buf::from_string(format_int(v, &p));
+            return Ok(Wtf8Buf::from_string(format_int(v, &p)));
         }
         if pyre_object::is_float(val) {
             let v = pyre_object::floatobject::w_float_get_value(val);
-            return Wtf8Buf::from_string(format_float(v, &p));
+            return Ok(Wtf8Buf::from_string(format_float(v, &p)));
         }
         if pyre_object::is_str(val) {
             // Read the WTF-8 view so a lone-surrogate body formats and
@@ -1466,14 +1469,14 @@ fn format_with_spec(val: PyObjectRef, spec: &str) -> Wtf8Buf {
                 full.to_wtf8_buf()
             };
             let align = p.align.unwrap_or('<');
-            return pad_wtf8(&body, p.fill, align, p.width);
+            return Ok(pad_wtf8(&body, p.fill, align, p.width));
         }
-        Wtf8Buf::from_string(pad_to_width(
-            crate::py_str(val),
+        Ok(Wtf8Buf::from_string(pad_to_width(
+            crate::py_str(val)?,
             p.fill,
             p.align.unwrap_or('<'),
             p.width,
-        ))
+        )))
     }
 }
 

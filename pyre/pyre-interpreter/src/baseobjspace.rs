@@ -1200,7 +1200,7 @@ fn range_index_method(args: &[PyObjectRef]) -> PyResult {
             }
             return Err(PyError::value_error(format!(
                 "{} is not in range",
-                crate::display::py_repr(needle)
+                crate::display::py_repr(needle)?
             )));
         }
         // `space.sequence_index` — elementwise scan.

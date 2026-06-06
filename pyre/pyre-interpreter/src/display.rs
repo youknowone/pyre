@@ -15,24 +15,35 @@ use crate::{
 ///
 /// PyPy: `ObjSpace.call_function(space.lookup(w_obj, name), w_obj)`
 /// Uses the unified `call_function` instead of a dedicated callback.
-fn try_call_dunder(obj: PyObjectRef, name: &str) -> Option<String> {
+fn try_call_dunder(obj: PyObjectRef, name: &str) -> Result<Option<String>, crate::PyError> {
     unsafe {
         if !pyre_object::is_instance(obj) {
-            return None;
+            return Ok(None);
         }
-        let method = crate::baseobjspace::lookup(obj, name)?;
+        let Some(method) = crate::baseobjspace::lookup(obj, name) else {
+            return Ok(None);
+        };
         if method.is_null() {
-            return None;
+            return Ok(None);
         }
-        let result = crate::call_function(method, &[obj]);
-        if result.is_null() {
-            return None;
-        }
+        // A raising `__repr__`/`__str__` propagates; a non-string return is a
+        // TypeError (`object.c slot_tp_repr` / `slot_tp_str`).
+        let result = crate::builtins::call_and_check(method, &[obj])?;
         if pyre_object::is_str(result) {
-            return Some(pyre_object::w_str_get_value(result).to_string());
+            return Ok(Some(pyre_object::w_str_get_value(result).to_string()));
         }
+        Err(dunder_returned_non_string(name, result))
     }
-    None
+}
+
+/// `TypeError: __repr__ returned non-string (type 'X')` for a dunder whose
+/// override returned a non-`str` (`descroperation.py:918-920`).
+unsafe fn dunder_returned_non_string(name: &str, result: PyObjectRef) -> crate::PyError {
+    let type_name = match unsafe { crate::typedef::r#type(result) } {
+        Some(tp) => unsafe { pyre_object::w_type_get_name(tp) }.to_string(),
+        None => "object".to_string(),
+    };
+    crate::PyError::type_error(format!("{name} returned non-string (type '{type_name}')"))
 }
 
 /// `pypy/objspace/std/floatobject.py W_FloatObject.descr_repr` parity.
@@ -178,16 +189,16 @@ impl Drop for ReprGuard {
 /// # Safety
 /// `obj` must be a real `W_DictObject` (caller resolves any subclass
 /// backing via `resolve_dict_backing` first).
-pub unsafe fn dict_repr(obj: PyObjectRef) -> String {
+pub unsafe fn dict_repr(obj: PyObjectRef) -> Result<String, crate::PyError> {
     let Some(_guard) = ReprGuard::enter(obj) else {
-        return "{...}".to_string();
+        return Ok("{...}".to_string());
     };
     let entries = pyre_object::w_dict_items(obj);
     let mut parts = Vec::with_capacity(entries.len());
     for (k, v) in entries {
-        parts.push(format!("{}: {}", py_repr(k), py_repr(v)));
+        parts.push(format!("{}: {}", py_repr(k)?, py_repr(v)?));
     }
-    format!("{{{}}}", parts.join(", "))
+    Ok(format!("{{{}}}", parts.join(", ")))
 }
 
 /// Format a PyObjectRef for debug display.
@@ -229,7 +240,7 @@ pub(crate) unsafe fn builtin_subclass_dunder(
     obj: PyObjectRef,
     tp: *const PyType,
     name: &str,
-) -> Option<String> {
+) -> Result<Option<String>, crate::PyError> {
     unsafe {
         let is_leaf = std::ptr::eq(tp, &INT_TYPE as *const PyType)
             || std::ptr::eq(tp, &LONG_TYPE as *const PyType)
@@ -237,54 +248,57 @@ pub(crate) unsafe fn builtin_subclass_dunder(
             || std::ptr::eq(tp, &BOOL_TYPE as *const PyType)
             || std::ptr::eq(tp, &STR_TYPE as *const PyType);
         if !is_leaf {
-            return None;
+            return Ok(None);
         }
         let w_class = (*obj).w_class;
         if w_class.is_null() || !pyre_object::is_type(w_class) {
-            return None;
+            return Ok(None);
         }
-        let found = crate::baseobjspace::lookup_in_type_where(w_class, name)?;
+        let Some(found) = crate::baseobjspace::lookup_in_type_where(w_class, name) else {
+            return Ok(None);
+        };
         // `object`'s inherited default is not a leaf override — fall through
         // so the builtin formatting runs (and `object.__repr__` does not
         // re-enter through this path).
         let w_object = crate::typedef::w_object();
         if let Some(default) = crate::baseobjspace::lookup_in_type_where(w_object, name) {
             if std::ptr::eq(found, default) {
-                return None;
+                return Ok(None);
             }
         }
-        let r = crate::call_function(found, &[obj]);
-        if !r.is_null() && pyre_object::is_str(r) {
-            return Some(pyre_object::w_str_get_value(r).to_string());
+        // A raising override propagates; a non-string return is a TypeError.
+        let r = crate::builtins::call_and_check(found, &[obj])?;
+        if pyre_object::is_str(r) {
+            return Ok(Some(pyre_object::w_str_get_value(r).to_string()));
         }
-        None
+        Err(dunder_returned_non_string(name, r))
     }
 }
 
-pub unsafe fn py_repr(obj: PyObjectRef) -> String {
+pub unsafe fn py_repr(obj: PyObjectRef) -> Result<String, crate::PyError> {
     let obj = crate::baseobjspace::unwrap_cell(obj);
     if obj.is_null() {
-        return "NULL".to_string();
+        return Ok("NULL".to_string());
     }
     unsafe {
         let tp = (*obj).ob_type;
         // A builtin leaf subclass keeps `ob_type` at the canonical storage
         // type but carries the Python class in `w_class`; dispatch its
         // `__repr__` override before the `ob_type`-keyed formatting below.
-        if let Some(s) = builtin_subclass_dunder(obj, tp, "__repr__") {
-            return s;
+        if let Some(s) = builtin_subclass_dunder(obj, tp, "__repr__")? {
+            return Ok(s);
         }
-        if let Some(s) = builtin_leaf_repr_string(obj, tp) {
+        let formatted = if let Some(s) = builtin_leaf_repr_string(obj, tp) {
             s
         } else if std::ptr::eq(tp, &pyre_object::pyobject::LIST_TYPE as *const PyType) {
             let Some(_guard) = ReprGuard::enter(obj) else {
-                return "[...]".to_string();
+                return Ok("[...]".to_string());
             };
             let n = pyre_object::w_list_len(obj);
             let mut parts = Vec::with_capacity(n);
             for i in 0..n {
                 if let Some(item) = pyre_object::w_list_getitem(obj, i as i64) {
-                    parts.push(py_repr(item));
+                    parts.push(py_repr(item)?);
                 }
             }
             format!("[{}]", parts.join(", "))
@@ -319,21 +333,24 @@ pub unsafe fn py_repr(obj: PyObjectRef) -> String {
                 if let Some((src, method)) = crate::baseobjspace::lookup_where(w_class, "__repr__")
                 {
                     if !std::ptr::eq(src, crate::typedef::w_object()) && !method.is_null() {
-                        let r = crate::call_function(method, &[obj]);
-                        if !r.is_null() && pyre_object::is_str(r) {
-                            return pyre_object::w_str_get_value(r).to_string();
+                        // A raising override propagates; a non-string return
+                        // falls through to the generic tuple formatting
+                        // (structseq's `__repr__` always returns a str).
+                        let r = crate::builtins::call_and_check(method, &[obj])?;
+                        if pyre_object::is_str(r) {
+                            return Ok(pyre_object::w_str_get_value(r).to_string());
                         }
                     }
                 }
             }
             let Some(_guard) = ReprGuard::enter(obj) else {
-                return "(...)".to_string();
+                return Ok("(...)".to_string());
             };
             let n = pyre_object::w_tuple_len(obj);
             let mut parts = Vec::with_capacity(n);
             for i in 0..n {
                 if let Some(item) = pyre_object::w_tuple_getitem(obj, i as i64) {
-                    parts.push(py_repr(item));
+                    parts.push(py_repr(item)?);
                 }
             }
             if n == 1 {
@@ -342,15 +359,15 @@ pub unsafe fn py_repr(obj: PyObjectRef) -> String {
                 format!("({})", parts.join(", "))
             }
         } else if unsafe { pyre_object::is_dict(obj) } {
-            unsafe { dict_repr(obj) }
+            unsafe { dict_repr(obj)? }
         } else if pyre_object::sliceobject::is_slice(obj) {
             // `pypy/objspace/std/sliceobject.py descr_repr` —
             // `slice(%r, %r, %r)`.
             format!(
                 "slice({}, {}, {})",
-                py_repr(pyre_object::sliceobject::w_slice_get_start(obj)),
-                py_repr(pyre_object::sliceobject::w_slice_get_stop(obj)),
-                py_repr(pyre_object::sliceobject::w_slice_get_step(obj)),
+                py_repr(pyre_object::sliceobject::w_slice_get_start(obj))?,
+                py_repr(pyre_object::sliceobject::w_slice_get_stop(obj))?,
+                py_repr(pyre_object::sliceobject::w_slice_get_step(obj))?,
             )
         } else if pyre_object::is_bytes_like(obj) {
             // `pypy/objspace/std/bytesobject.py W_BytesObject.descr_repr`
@@ -387,14 +404,17 @@ pub unsafe fn py_repr(obj: PyObjectRef) -> String {
             // set keeps the `set()` constructor form.
             let is_frozen = pyre_object::is_frozenset(obj);
             let Some(_guard) = ReprGuard::enter(obj) else {
-                return if is_frozen {
+                return Ok(if is_frozen {
                     "frozenset(...)".to_string()
                 } else {
                     "set(...)".to_string()
-                };
+                });
             };
             let items = pyre_object::w_set_items(obj);
-            let parts: Vec<String> = items.iter().map(|&v| py_repr(v)).collect();
+            let parts: Vec<String> = items
+                .iter()
+                .map(|&v| py_repr(v))
+                .collect::<Result<Vec<String>, _>>()?;
             if items.is_empty() {
                 if is_frozen {
                     "frozenset()".to_string()
@@ -466,12 +486,12 @@ pub unsafe fn py_repr(obj: PyObjectRef) -> String {
                     String::new()
                 } else if n == 1 {
                     let item = pyre_object::w_tuple_getitem(args_obj, 0).unwrap_or(args_obj);
-                    py_repr(item)
+                    py_repr(item)?
                 } else {
                     let mut parts = Vec::with_capacity(n);
                     for i in 0..n {
                         if let Some(item) = pyre_object::w_tuple_getitem(args_obj, i as i64) {
-                            parts.push(py_repr(item));
+                            parts.push(py_repr(item)?);
                         }
                     }
                     parts.join(", ")
@@ -498,7 +518,7 @@ pub unsafe fn py_repr(obj: PyObjectRef) -> String {
                     } else if pyre_object::is_type(item) {
                         parts.push(pyre_object::w_type_get_name(item).to_string());
                     } else {
-                        parts.push(py_repr(item));
+                        parts.push(py_repr(item)?);
                     }
                 }
             }
@@ -513,7 +533,7 @@ pub unsafe fn py_repr(obj: PyObjectRef) -> String {
             // `pypy/objspace/std/dictproxyobject.py:47 descr_repr` →
             // `b"mappingproxy(%s)" % space.utf8_w(space.repr(self.w_mapping))`.
             let inner = pyre_object::w_dict_proxy_get_mapping(obj);
-            format!("mappingproxy({})", py_repr(inner))
+            format!("mappingproxy({})", py_repr(inner)?)
         } else if std::ptr::eq(
             tp,
             &pyre_object::dictviewobject::DICT_KEYS_TYPE as *const PyType,
@@ -537,7 +557,10 @@ pub unsafe fn py_repr(obj: PyObjectRef) -> String {
                 pyre_object::dictviewobject::DictViewKind::Items => "dict_items",
             };
             let snapshot = crate::type_methods::dict_view_snapshot(obj);
-            let parts: Vec<String> = snapshot.iter().map(|&item| py_repr(item)).collect();
+            let parts: Vec<String> = snapshot
+                .iter()
+                .map(|&item| py_repr(item))
+                .collect::<Result<Vec<String>, _>>()?;
             format!("{label}([{}])", parts.join(", "))
         } else if pyre_object::is_w_range(obj) {
             // `rangeobject.py W_AbstractRangeObject.descr_repr` —
@@ -548,53 +571,54 @@ pub unsafe fn py_repr(obj: PyObjectRef) -> String {
             let step_is_one =
                 pyre_object::range_obj_to_bigint(step) == malachite_bigint::BigInt::from(1);
             if step_is_one {
-                format!("range({}, {})", py_repr(start), py_repr(stop))
+                format!("range({}, {})", py_repr(start)?, py_repr(stop)?)
             } else {
                 format!(
                     "range({}, {}, {})",
-                    py_repr(start),
-                    py_repr(stop),
-                    py_repr(step)
+                    py_repr(start)?,
+                    py_repr(stop)?,
+                    py_repr(step)?
                 )
             }
         } else if std::ptr::eq(tp, &INSTANCE_TYPE as *const PyType) {
             // Try __repr__ first, then __str__
-            if let Some(s) = try_call_dunder(obj, "__repr__") {
-                return s;
+            if let Some(s) = try_call_dunder(obj, "__repr__")? {
+                return Ok(s);
             }
-            if let Some(s) = try_call_dunder(obj, "__str__") {
-                return s;
+            if let Some(s) = try_call_dunder(obj, "__str__")? {
+                return Ok(s);
             }
             let w_type = pyre_object::w_instance_get_type(obj);
             let name = pyre_object::w_type_get_name(w_type);
             format!("<{name} object at {obj:?}>")
         } else {
             format!("<{} object at {:?}>", (*tp).name, obj)
-        }
+        };
+        Ok(formatted)
     }
 }
 
 /// Format for str() — tries __str__ first, then __repr__.
-pub unsafe fn py_str(obj: PyObjectRef) -> String {
+pub unsafe fn py_str(obj: PyObjectRef) -> Result<String, crate::PyError> {
     unsafe {
         let obj = crate::baseobjspace::unwrap_cell(obj);
         if obj.is_null() {
-            return "NULL".to_string();
+            return Ok("NULL".to_string());
         }
         let tp = (*obj).ob_type;
         // For strings, return the value directly (no quotes).
         if std::ptr::eq(tp, &STR_TYPE as *const PyType) {
-            if let Some(s) = builtin_subclass_dunder(obj, tp, "__str__") {
-                return s;
+            if let Some(s) = builtin_subclass_dunder(obj, tp, "__str__")? {
+                return Ok(s);
             }
-            return pyre_object::w_str_get_value(obj).to_string();
+            return Ok(pyre_object::w_str_get_value(obj).to_string());
         }
         if std::ptr::eq(tp, &INSTANCE_TYPE as *const PyType) {
-            if let Some(s) = try_call_dunder(obj, "__str__") {
-                return s;
+            if let Some(s) = try_call_dunder(obj, "__str__")? {
+                return Ok(s);
             }
-            if let Some(s) = try_call_dunder(obj, "__repr__") {
-                return s;
+            if let Some(s) = try_call_dunder(obj, "__repr__")? {
+                return Ok(s);
             }
         }
         // `pypy/module/exceptions/interp_exceptions.py:126-133
@@ -628,13 +652,13 @@ pub unsafe fn py_str(obj: PyObjectRef) -> String {
             let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
             match kind {
                 pyre_object::excobject::ExcKind::UnicodeTranslateError => {
-                    return unicode_translate_error_str(obj);
+                    return Ok(unicode_translate_error_str(obj));
                 }
                 pyre_object::excobject::ExcKind::UnicodeDecodeError => {
-                    return unicode_decode_error_str(obj);
+                    return Ok(unicode_decode_error_str(obj));
                 }
                 pyre_object::excobject::ExcKind::UnicodeEncodeError => {
-                    return unicode_encode_error_str(obj);
+                    return Ok(unicode_encode_error_str(obj));
                 }
                 // `interp_exceptions.py:540-548 W_KeyError.descr_str` —
                 // a single-argument KeyError stringifies as `repr(args[0])`
@@ -685,8 +709,8 @@ pub unsafe fn py_str(obj: PyObjectRef) -> String {
                     let w_strerror =
                         slot_or_arg(pyre_object::excobject::w_exception_get_strerror(obj), 1);
                     if let (Some(w_errno), Some(w_strerror)) = (w_errno, w_strerror) {
-                        let errno = py_str(w_errno);
-                        let strerror = py_str(w_strerror);
+                        let errno = py_str(w_errno)?;
+                        let strerror = py_str(w_strerror)?;
                         let w_filename =
                             slot_or_arg(pyre_object::excobject::w_exception_get_filename(obj), 2)
                                 .filter(|&f| !pyre_object::is_none(f));
@@ -697,29 +721,32 @@ pub unsafe fn py_str(obj: PyObjectRef) -> String {
                             )
                             .filter(|&f| !pyre_object::is_none(f));
                             if let Some(fname2) = w_filename2 {
-                                return format!(
+                                return Ok(format!(
                                     "[Errno {errno}] {strerror}: {} -> {}",
-                                    py_repr(fname),
-                                    py_repr(fname2)
-                                );
+                                    py_repr(fname)?,
+                                    py_repr(fname2)?
+                                ));
                             }
-                            return format!("[Errno {errno}] {strerror}: {}", py_repr(fname));
+                            return Ok(format!(
+                                "[Errno {errno}] {strerror}: {}",
+                                py_repr(fname)?
+                            ));
                         }
-                        return format!("[Errno {errno}] {strerror}");
+                        return Ok(format!("[Errno {errno}] {strerror}"));
                     }
                 }
                 _ => {}
             }
             let args = pyre_object::excobject::w_exception_get_args(obj);
             if args.is_null() {
-                return String::new();
+                return Ok(String::new());
             }
             if !pyre_object::is_tuple(args) {
                 return py_str(args);
             }
             let n: usize = pyre_object::w_tuple_len(args);
             if n == 0 {
-                return String::new();
+                return Ok(String::new());
             }
             if n == 1 {
                 let first = pyre_object::w_tuple_getitem(args, 0).unwrap_or(args);
@@ -732,8 +759,8 @@ pub unsafe fn py_str(obj: PyObjectRef) -> String {
         // override or builtin formatting from `py_repr`).  `str` itself
         // has its own `tp_str` and is handled by the `STR_TYPE` branch
         // above, so this fallthrough never reaches a bare-`str` subclass.
-        if let Some(s) = builtin_subclass_dunder(obj, tp, "__str__") {
-            return s;
+        if let Some(s) = builtin_subclass_dunder(obj, tp, "__str__")? {
+            return Ok(s);
         }
         py_repr(obj)
     }
@@ -750,21 +777,21 @@ pub unsafe fn py_str(obj: PyObjectRef) -> String {
 ///
 /// # Safety
 /// `obj` must point to a valid `PyObject`.
-pub unsafe fn py_str_wtf8(obj: PyObjectRef) -> Wtf8Buf {
+pub unsafe fn py_str_wtf8(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> {
     unsafe {
         let obj = crate::baseobjspace::unwrap_cell(obj);
         if !obj.is_null() {
             let tp = (*obj).ob_type;
             if std::ptr::eq(tp, &STR_TYPE as *const PyType) {
-                return pyre_object::w_str_get_wtf8(obj).to_wtf8_buf();
+                return Ok(pyre_object::w_str_get_wtf8(obj).to_wtf8_buf());
             }
             if pyre_object::is_exception(obj) {
                 if let Some(w) = exception_descr_str_wtf8(obj) {
-                    return w;
+                    return Ok(w);
                 }
             }
         }
-        Wtf8Buf::from_string(py_str(obj))
+        Ok(Wtf8Buf::from_string(py_str(obj)?))
     }
 }
 
@@ -837,7 +864,9 @@ unsafe fn unicode_err_int_slot(stored: PyObjectRef) -> Result<i64, String> {
         if let Ok(v) = crate::baseobjspace::int_w(stored) {
             return Ok(v);
         }
-        Err(py_str(stored))
+        // `descr_str` deliberately str-coerces rather than raising; a raising
+        // `__str__` on the mutated slot degrades to empty here.
+        Err(py_str(stored).unwrap_or_default())
     }
 }
 
@@ -856,7 +885,8 @@ unsafe fn unicode_err_str_slot(stored: PyObjectRef) -> String {
         if pyre_object::is_str(stored) {
             return pyre_object::w_str_get_value(stored).to_string();
         }
-        py_str(stored)
+        // `descr_str` deliberately `%s`-coerces rather than raising.
+        py_str(stored).unwrap_or_default()
     }
 }
 
@@ -1095,7 +1125,12 @@ impl fmt::Display for PyDisplay {
         if self.0.is_null() {
             write!(f, "NULL")
         } else {
-            write!(f, "{}", unsafe { py_str(self.0) })
+            // `Display` cannot surface a `PyError`; a raising `__str__` in a
+            // diagnostic output context degrades to a placeholder rather than
+            // propagating (the user-facing `print()`/`str()` paths thread the
+            // error through `py_str`).
+            let s = unsafe { py_str(self.0) }.unwrap_or_else(|_| "<exception in __str__>".to_string());
+            write!(f, "{s}")
         }
     }
 }

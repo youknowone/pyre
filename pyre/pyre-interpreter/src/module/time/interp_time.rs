@@ -96,7 +96,7 @@ pub fn sleep(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         let overflow = || {
             crate::PyError::overflow_error(format!(
                 "timestamp {} too large to convert to C _PyTime_t",
-                crate::py_repr(args[0])
+                crate::py_repr(args[0]).unwrap_or_else(|_| "<unprintable>".to_string())
             ))
         };
         if is_float(args[0]) {

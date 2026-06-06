@@ -651,7 +651,7 @@ fn dict_merge_from_mapping(
             for (k, v) in pyre_object::w_dict_items(source) {
                 if pyre_object::w_dict_lookup(dict, k).is_some() {
                     // pyopcode.py:1987 — %S is str(key)
-                    let key_str = crate::display::py_str(k);
+                    let key_str = crate::display::py_str(k)?;
                     return Err(PyError::type_error(format!(
                         "{prefix}got multiple values for keyword argument '{key_str}'"
                     )));
@@ -679,7 +679,7 @@ fn dict_merge_from_mapping(
         let val = crate::baseobjspace::getitem(source, key)?;
         unsafe {
             if pyre_object::w_dict_lookup(dict, key).is_some() {
-                let key_str = crate::display::py_str(key);
+                let key_str = crate::display::py_str(key)?;
                 return Err(PyError::type_error(format!(
                     "{prefix}got multiple values for keyword argument '{key_str}'"
                 )));
@@ -2619,15 +2619,15 @@ impl OpcodeStepExecutor for PyFrame {
             crate::bytecode::ConvertValueOparg::Str | crate::bytecode::ConvertValueOparg::None
         );
         if is_str_conv {
-            let w = unsafe { crate::py_str_wtf8(val) };
+            let w = unsafe { crate::py_str_wtf8(val)? };
             self.push(pyre_object::w_str_from_wtf8(w));
             return Ok(());
         }
         let s = match conv {
-            crate::bytecode::ConvertValueOparg::Str => unsafe { crate::py_str(val) },
-            crate::bytecode::ConvertValueOparg::Repr => unsafe { crate::py_repr(val) },
-            crate::bytecode::ConvertValueOparg::Ascii => unsafe { crate::py_repr(val) },
-            crate::bytecode::ConvertValueOparg::None => unsafe { crate::py_str(val) },
+            crate::bytecode::ConvertValueOparg::Str => unsafe { crate::py_str(val)? },
+            crate::bytecode::ConvertValueOparg::Repr => unsafe { crate::py_repr(val)? },
+            crate::bytecode::ConvertValueOparg::Ascii => unsafe { crate::py_repr(val)? },
+            crate::bytecode::ConvertValueOparg::None => unsafe { crate::py_str(val)? },
         };
         self.push(pyre_object::w_str_new(&s));
         Ok(())
@@ -2914,7 +2914,7 @@ impl OpcodeStepExecutor for PyFrame {
     // PyPy: PRINT_EXPR → sys.displayhook(value)
     fn print_expr(&mut self, val: PyObjectRef) -> Result<(), PyError> {
         if !unsafe { pyre_object::is_none(val) } {
-            let s = unsafe { crate::py_repr(val) };
+            let s = unsafe { crate::py_repr(val)? };
             println!("{}", s);
         }
         Ok(())

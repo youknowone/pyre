@@ -305,7 +305,9 @@ fn system_exit_code(e: &pyre_interpreter::PyError) -> i32 {
         Ok(w_int) => unsafe { pyre_object::w_int_get_value(w_int) as i32 },
         Err(_) => {
             // app_main.py:124-125 `print(exitcode, file=sys.stderr)`.
-            eprintln!("{}", unsafe { pyre_interpreter::display::py_str(code) });
+            let text = unsafe { pyre_interpreter::display::py_str(code) }
+                .unwrap_or_else(|_| "<unprintable>".to_string());
+            eprintln!("{text}");
             1
         }
     }

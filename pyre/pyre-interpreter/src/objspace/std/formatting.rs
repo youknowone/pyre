@@ -250,7 +250,7 @@ pub(crate) unsafe fn str_format_percent(fmt: PyObjectRef, args: PyObjectRef) -> 
                     // `%s` is `str(self)`, preserved in WTF-8 so a lone
                     // surrogate (a str, or an exception whose single
                     // argument is a str) survives.
-                    let body = crate::py_str_wtf8(arg);
+                    let body = crate::py_str_wtf8(arg)?;
                     let body = match precision {
                         Some(p) => take_code_points(&body, p),
                         None => body,
@@ -258,7 +258,7 @@ pub(crate) unsafe fn str_format_percent(fmt: PyObjectRef, args: PyObjectRef) -> 
                     result.push_wtf8(&pad_wtf8(&body));
                 }
                 'r' => {
-                    let mut body = crate::py_repr(arg);
+                    let mut body = crate::py_repr(arg)?;
                     if let Some(p) = precision {
                         body = body.chars().take(p).collect();
                     }
@@ -269,7 +269,7 @@ pub(crate) unsafe fn str_format_percent(fmt: PyObjectRef, args: PyObjectRef) -> 
                 // ASCII-clean output for the types it covers, so the
                 // result matches PyPy `fmt_a` for the supported subset.
                 'a' => {
-                    let mut body = crate::py_repr(arg);
+                    let mut body = crate::py_repr(arg)?;
                     if let Some(p) = precision {
                         body = body.chars().take(p).collect();
                     }
