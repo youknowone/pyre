@@ -220,4 +220,3 @@ impl W_Kqueue {
         Ok(pyre_object::w_list_new(result))
     }
 }
-

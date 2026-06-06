@@ -198,7 +198,11 @@ fn structseq_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     if items.len() < n_seq {
         return Err(PyError::type_error(format!(
             "expected a sequence with {} {} items. has {}",
-            if n_seq < n_fields { "at least" } else { "exactly" },
+            if n_seq < n_fields {
+                "at least"
+            } else {
+                "exactly"
+            },
             n_seq,
             items.len()
         )));
@@ -206,7 +210,11 @@ fn structseq_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     if items.len() > n_fields {
         return Err(PyError::type_error(format!(
             "expected a sequence with {} {} items. has {}",
-            if n_seq < n_fields { "at most" } else { "exactly" },
+            if n_seq < n_fields {
+                "at most"
+            } else {
+                "exactly"
+            },
             n_fields,
             items.len()
         )));
@@ -219,11 +227,13 @@ fn structseq_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     let body = items;
     let mut extras: Vec<(&str, PyObjectRef)> = Vec::with_capacity(extra_names.len());
     for (i, ename) in extra_names.iter().enumerate() {
-        let in_dict =
-            dict_arg.is_some_and(|d| unsafe { pyre_object::w_dict_getitem_str(d, ename).is_some() });
+        let in_dict = dict_arg
+            .is_some_and(|d| unsafe { pyre_object::w_dict_getitem_str(d, ename).is_some() });
         let value = if i < surplus {
             if in_dict {
-                return Err(PyError::type_error(format!("duplicate value for '{ename}'")));
+                return Err(PyError::type_error(format!(
+                    "duplicate value for '{ename}'"
+                )));
             }
             surplus_vals[i]
         } else if let Some(d) = dict_arg {

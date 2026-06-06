@@ -3235,10 +3235,18 @@ pub fn c_filedescriptor_w(obj: PyObjectRef) -> Result<i32, PyError> {
     let w_fd = if unsafe { pyre_object::pyobject::is_int(obj) } {
         obj
     } else {
-        let fileno = getattr(obj, "fileno").map_err(|_| {
-            PyError::type_error("argument must be an int, or have a fileno() method.")
+        let fileno = getattr(obj, "fileno").map_err(|e| {
+            if e.kind == PyErrorKind::AttributeError {
+                PyError::type_error("argument must be an int, or have a fileno() method.")
+            } else {
+                e
+            }
         })?;
-        crate::builtins::call_and_check(fileno, &[])?
+        let w_fd = crate::builtins::call_and_check(fileno, &[])?;
+        if unsafe { !pyre_object::pyobject::is_int(w_fd) } {
+            return Err(PyError::type_error("fileno() returned a non-integer"));
+        }
+        w_fd
     };
     let fd = c_int_w(w_fd)?;
     if fd < 0 {
