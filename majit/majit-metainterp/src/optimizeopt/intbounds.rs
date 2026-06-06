@@ -107,13 +107,13 @@ impl OptIntBounds {
     }
 
     fn getintbound_box(&self, opref: OpRef, ctx: &mut OptContext) -> IntBound {
-        match ctx.get_box_replacement_box(opref) {
-            Some(b) => ctx.getintbound_handle(&b).borrow().clone(),
-            None => ctx
-                .ensure_box(opref)
-                .map(|b| ctx.getintbound_handle(&b).borrow().clone())
-                .expect("getintbound: operand must resolve to a BoxRef"),
-        }
+        // optimizer.py:99-113 `getintbound`: `op = get_box_replacement(op)`
+        // then read/lazy-install the bound. The dispatch-entry rebind
+        // (propagate_from_pass_range) mints + registers a canonical host for
+        // every operand, so `get_box_replacement` resolves to a BOUND terminal
+        // on which `getintbound_handle`'s lazy install is safe.
+        let b = ctx.get_box_replacement(opref);
+        ctx.getintbound_handle(&b).borrow().clone()
     }
 
     /// `BoxRef`-terminal variant of [`getintbound_box`]: reads the bound off
@@ -125,30 +125,27 @@ impl OptIntBounds {
 
     /// Resolve an operand to its forwarded terminal `BoxRef`, the `op =
     /// get_box_replacement(op)` step shared by every `optimize_INT_*` body
-    /// (intbounds.py / optimizer.py:343). Walks the `_forwarded` chain via
-    /// `get_box_replacement_box`, falling back to `ensure_box` for the
-    /// retrace/test baseline that carries no upstream binding (the same
-    /// fallback `getintbound_box` uses). The returned box is the operand the
-    /// bound and the `arg0 is arg1` identity check both read, so a single
-    /// resolve replaces the prior resolve-for-`==` plus resolve-inside-
-    /// `getintbound_box` pair.
+    /// (intbounds.py / optimizer.py:343). The dispatch-entry rebind
+    /// registers a canonical host for every operand, so `get_box_replacement`
+    /// is total and resolves to a bound terminal. The returned box is the
+    /// operand the bound and the `arg0 is arg1` identity check both read, so
+    /// a single resolve replaces the prior resolve-for-`==` plus
+    /// resolve-inside-`getintbound_box` pair.
     fn resolve_box(&self, opref: OpRef, ctx: &mut OptContext) -> crate::r#box::BoxRef {
-        ctx.get_box_replacement_box(opref)
-            .or_else(|| ctx.ensure_box(opref))
-            .expect("intbounds operand must resolve to a BoxRef")
+        ctx.get_box_replacement(opref)
     }
 
     /// Intersect a bound into the stored bound for opref. RPython:
     /// `self.getintbound(op).intersect(bound)` (mutates the IntBound stored
     /// on `op._forwarded` in place).
     fn intersect_bound(&mut self, opref: OpRef, bound: &IntBound, ctx: &mut OptContext) {
-        // optimizer.py:99-113 `getintbound` lazy-installs unbounded on
-        // first access; `ensure_box` mirrors the materialize-always
-        // invariant. `get_box_replacement_box` would silently skip an
-        // opref it can't resolve, losing the bound write.
-        if let Some(op_box) = ctx.ensure_box(opref) {
-            ctx.setintbound(&op_box, bound);
-        }
+        // optimizer.py:99-113 `getintbound` lazy-installs unbounded on first
+        // access; `setintbound` re-walks via `get_box_replacement` internally
+        // before writing. The dispatch-entry rebind registers a canonical host
+        // for every operand, so `get_box_replacement` resolves to a bound
+        // terminal the bound can install onto.
+        let op_box = ctx.get_box_replacement(opref);
+        ctx.setintbound(&op_box, bound);
     }
 
     /// optimizer.py:434: make_constant_int(box, intvalue) — RPython just
@@ -3444,17 +3441,21 @@ mod tests {
         for op in ops.iter() {
             let mut resolved_op = op.clone();
             // Keep the op.pos as set by the test (not overriding with index)
-            // optimizer.py:651-652 setarg loop parity.
+            // optimizer.py:651-652 setarg loop parity. Mirror
+            // `propagate_from_pass_range`'s dispatch-entry rebind: mint +
+            // register a canonical host for producer-less operands (via
+            // `ensure_box`) so the pass's `get_box_replacement` resolves to a
+            // bound terminal instead of an unbound `from_opref` box.
             for i in 0..resolved_op.num_args() {
-                let a = resolved_op.arg(i).to_opref();
-                resolved_op.setarg(
-                    i,
-                    crate::r#box::BoxRef::from_opref(
-                        ctx.get_box_replacement_box(a)
-                            .map(|b| b.to_opref())
-                            .unwrap_or(a),
-                    ),
-                );
+                let a = resolved_op.arg(i);
+                let resolved = match ctx.get_box_replacement_box(a.to_opref()) {
+                    Some(b) => b,
+                    None => ctx
+                        .ensure_box(a.to_opref())
+                        .map(|b| b.get_box_replacement(false))
+                        .unwrap_or_else(|| a.clone()),
+                };
+                resolved_op.setarg(i, resolved);
             }
             let emitted_op = match pass.propagate_forward(
                 &resolved_op,
