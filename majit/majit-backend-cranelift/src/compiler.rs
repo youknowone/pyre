@@ -8700,26 +8700,43 @@ impl CraneliftBackend {
         // Box Identity Phase E.2b: route the loaded jitframe slot value
         // into the variable indexed by `inputargs[i].index` so bridge
         // entries land in the `[bridge_inputarg_base..)` slot the ops
-        // reference. Slots beyond `num_inputs` (synthesized loop padding
-        // / `entry_mode` flag) keep the dense `var(i)` mapping.
-        for (i, val) in entry_input_vals.iter().copied().enumerate() {
-            let slot = if i < num_inputs {
-                inputargs[i].index
-            } else {
-                i as u32
-            };
+        // reference.
+        //
+        // ONLY real input boxes (oprefs) become located Variables here. The
+        // loads beyond `num_inputs` — the body-direct padding (extra body
+        // LABEL args) and the `entry_mode` flag — are transient frame reads
+        // consumed directly from `entry_input_vals`: the dual-entry `brif`
+        // reads the flag at index `max_entry_inputs`, and the body-direct arm
+        // feeds `entry_input_vals[..body_direct_num_inputs]` straight into the
+        // body block parameters. They are not oprefs, so they must not enter
+        // the Variable namespace. Routing a non-opref index through `var()`
+        // takes its pre-declaration fallback `Variable::from_u32(i)`, whose
+        // raw index space overlaps the sequentially-declared opref Variables
+        // and `jf_ptr_var`. `jf_ptr_var` is declared immediately after the
+        // opref map, so its index equals the opref count; a small frame whose
+        // op set is just its inputs makes `max_entry_inputs` equal that index,
+        // and def_var'ing the flag then overwrites the frame pointer with the
+        // flag value (0 on a normal entry) — every later `use_var(jf_ptr_var)`
+        // reads NULL. This mirrors the RPython box-location discipline: only
+        // boxes have locations; the jitframe pointer register (EBP) is
+        // reserved and never shares a slot with a value.
+        for (i, val) in entry_input_vals
+            .iter()
+            .copied()
+            .take(num_inputs)
+            .enumerate()
+        {
+            let slot = inputargs[i].index;
             builder.def_var(var(slot), val);
-            if i < num_inputs {
-                sync_ref_root_var(
-                    &mut builder,
-                    jf_ptr,
-                    &ref_root_slots,
-                    slot,
-                    val,
-                    ref_root_base_ofs,
-                    &mut synced_ref_vars,
-                );
-            }
+            sync_ref_root_var(
+                &mut builder,
+                jf_ptr,
+                &ref_root_slots,
+                slot,
+                val,
+                ref_root_base_ofs,
+                &mut synced_ref_vars,
+            );
         }
 
         // RPython parity: GC roots are registered by run_compiled_code()
