@@ -305,9 +305,8 @@ pub fn metainterp_jitcode_by_index(
     index: usize,
 ) -> Option<Arc<majit_metainterp::jitcode::JitCode>> {
     METAINTERP_JITCODE_CACHE.with(|outer| {
-        let slots = outer.get_or_init(|| {
-            (0..all_jitcodes().len()).map(|_| OnceCell::new()).collect()
-        });
+        let slots =
+            outer.get_or_init(|| (0..all_jitcodes().len()).map(|_| OnceCell::new()).collect());
         let slot = slots.get(index)?;
         Some(Arc::clone(slot.get_or_init(|| {
             let canonical = all_jitcodes()

@@ -3023,17 +3023,16 @@ fn dispatch_arm_via_blackhole(
     // metainterp-runtime wrapper is the form `BlackholeInterpreter.
     // jitcode` consumes (descr pool stays empty for build-time canonical
     // arms; `majit-metainterp/src/jitcode/mod.rs:400-403`).
-    let jitcode =
-        pyre_jit_trace::jitcode_runtime::metainterp_jitcode_for_instruction(instruction)
-            .ok_or_else(|| {
-                pyre_interpreter::PyError::new(
-                    pyre_interpreter::PyErrorKind::SystemError,
-                    format!(
-                        "dispatch_arm_via_blackhole: production_blackhole_handles \
+    let jitcode = pyre_jit_trace::jitcode_runtime::metainterp_jitcode_for_instruction(instruction)
+        .ok_or_else(|| {
+            pyre_interpreter::PyError::new(
+                pyre_interpreter::PyErrorKind::SystemError,
+                format!(
+                    "dispatch_arm_via_blackhole: production_blackhole_handles \
                          admitted instruction without codewriter arm: {instruction:?}",
-                    ),
-                )
-            })?;
+                ),
+            )
+        })?;
 
     // Thread-local BH pool — mirrors `call_jit.rs::blackhole_resume_via_
     // rd_numb`'s `BH_BUILDER_RD` (call_jit.rs:1300-1315).  Separate
@@ -3069,8 +3068,7 @@ fn dispatch_arm_via_blackhole(
             // Virtualizable wiring — mirrors `call_jit.rs:1400-1423`.
             // Single-arm dispatch has no caller chain so the
             // `nextblackholeinterp` propagation loop reduces to no-op.
-            bh.virtualizable_ptr =
-                frame as *mut pyre_interpreter::pyframe::PyFrame as i64;
+            bh.virtualizable_ptr = frame as *mut pyre_interpreter::pyframe::PyFrame as i64;
             bh.virtualizable_info = get_virtualizable_info();
             // RPython MIFrame.setup parity: r0 = frame (per
             // `trace_opcode.rs:6657-6660` walker-side seed).  Remaining
@@ -3086,12 +3084,7 @@ fn dispatch_arm_via_blackhole(
             let exception_value = bh.exception_last_value;
             let return_type = bh.return_type;
             builder.release_interp(bh);
-            (
-                mergepoint_args,
-                got_exception,
-                exception_value,
-                return_type,
-            )
+            (mergepoint_args, got_exception, exception_value, return_type)
         });
 
     if got_exception {
@@ -3314,12 +3307,11 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
                 // the helper's exception would silently drop, leaving
                 // the interpreter at the post-call PC instead of the
                 // exception-handler PC.
-                let bh_exc = majit_metainterp::blackhole::BH_LAST_EXC_VALUE
-                    .with(|c| {
-                        let v = c.get();
-                        c.set(0);
-                        v
-                    });
+                let bh_exc = majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| {
+                    let v = c.get();
+                    c.set(0);
+                    v
+                });
                 if bh_exc != 0 {
                     Err(unsafe {
                         pyre_interpreter::PyError::from_exc_object(

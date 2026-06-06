@@ -3514,6 +3514,24 @@ fn try_execute_residual_call_via_executor(
         Some(majit_ir::Value::Int(addr)) => addr,
         _ => return None,
     };
+    // Sub-slice 4 safety gate — reject `symbolic_fnaddr_for_path`
+    // placeholder values that escaped runtime patching.  Pyre's
+    // codewriter mints a 64-bit hash of the helper's `CallPath` when
+    // the build-time `pyre_interpreter::jit_trace_fnaddrs()` snapshot
+    // has no entry for it (`majit-translate/src/jit_codewriter/call.rs:
+    // 4926 symbolic_fnaddr_for_path`).  `runtime_fnaddr_patch` rewrites
+    // these to real runtime addresses only when the path appears in
+    // both the build-time and runtime registries; helpers absent from
+    // the runtime registry retain the hash and dereferencing it as a
+    // code address SIGBUSes.  Valid user-space code addresses fit in
+    // 47 bits on macOS/Linux 64-bit (canonical low half); hash values
+    // typically have bits ≥ 47 set.  Reject anything outside that
+    // range — both the symbolic-hash leak class AND any other stray
+    // non-fnptr value (e.g. an int constant mistakenly routed through
+    // the funcbox slot).
+    if (func_ptr as u64) >> 47 != 0 {
+        return None;
+    }
     if allboxes.len() - 1 > majit_translate::jit_codewriter::insns::MAX_HOST_CALL_ARITY {
         return None;
     }
@@ -4167,8 +4185,7 @@ fn walker_record_guard_exception(ctx: &mut WalkContext<'_, '_>, pc: usize) {
     let exc_obj = match ctx.last_exc_value_concrete {
         ConcreteValue::Ref(p) if !p.is_null() => p,
         _ => {
-            ctx.trace_ctx
-                .record_guard(OpCode::GuardNoException, &[], 0);
+            ctx.trace_ctx.record_guard(OpCode::GuardNoException, &[], 0);
             walker_capture_snapshot_for_last_guard(ctx, pc);
             return;
         }
@@ -4533,31 +4550,26 @@ fn dispatch_residual_call_iRd_kind(
         // their heap mutation because `eval.rs:3285-3308`'s walker-skip
         // path bypasses `execute_opcode_step` → SIGBUS on the next read
         // of the un-mutated container (M4 walker unactivated taxonomy).
-        // Task #390 sub-slice 3 activation is gated on `!can_raise`
-        // pending sub-slice 4's helper-side audit.  Empirical probe
-        // (commit history: sub-slice 4 probe) found the
-        // `can_raise=true` SIGBUS class is NOT walker-shadow staleness
-        // but UNPATCHED build-time fnaddrs in `constants_i` for some
-        // non-elidable helpers.  `runtime_fnaddr_patch` covers all
-        // helpers whose path appears in `pyre_interpreter::
-        // jit_trace_fnaddrs()`; helpers outside that registry retain
-        // garbage build-time values (e.g. `0xacc1d48d7993df7d` for
-        // `synth/bytes_ops`'s CallR).  Sub-slice 4 will extend the
-        // patcher registry or add a fnaddr-sanity gate before lifting.
-        let resid_raised = if !can_raise {
-            matches!(
-                try_execute_residual_call_via_executor(
-                    ctx,
-                    call_opcode,
-                    &allboxes,
-                    call_descr,
-                    recorded,
-                ),
-                Some(Err(_))
-            )
-        } else {
-            false
-        };
+        // Task #390 sub-slice 4: PyPy-orthodox activation.  PyPy's
+        // `_opimpl_residual_call*` concrete-executes EVERY residual
+        // call regardless of EI; the `exc` flag only selects the
+        // post-call guard shape (`GUARD_EXCEPTION` vs `GUARD_NO_EXCEPTION`)
+        // in `handle_possible_exception`.  Pyre matches by always
+        // invoking the executor — `try_execute_residual_call_via_executor`
+        // self-gates on a fnaddr-sanity check (rejecting unpatched
+        // `symbolic_fnaddr_for_path` hashes whose bits ≥ 47 are set)
+        // so unregistered helpers degrade gracefully to recording-only
+        // instead of SIGBUSing.
+        let resid_raised = matches!(
+            try_execute_residual_call_via_executor(
+                ctx,
+                call_opcode,
+                &allboxes,
+                call_descr,
+                recorded,
+            ),
+            Some(Err(_))
+        );
         debug_assert!(
             !resid_raised || can_raise,
             "dispatch_residual_call_iRd_kind: helper raised on a \
@@ -4772,31 +4784,26 @@ fn dispatch_residual_call_iIRd_kind(
 
         // Non-elidable concrete-execute parity (Task #390 sub-slice 3)
         // — see `dispatch_residual_call_iRd_kind` for the full citation.
-        // Task #390 sub-slice 3 activation is gated on `!can_raise`
-        // pending sub-slice 4's helper-side audit.  Empirical probe
-        // (commit history: sub-slice 4 probe) found the
-        // `can_raise=true` SIGBUS class is NOT walker-shadow staleness
-        // but UNPATCHED build-time fnaddrs in `constants_i` for some
-        // non-elidable helpers.  `runtime_fnaddr_patch` covers all
-        // helpers whose path appears in `pyre_interpreter::
-        // jit_trace_fnaddrs()`; helpers outside that registry retain
-        // garbage build-time values (e.g. `0xacc1d48d7993df7d` for
-        // `synth/bytes_ops`'s CallR).  Sub-slice 4 will extend the
-        // patcher registry or add a fnaddr-sanity gate before lifting.
-        let resid_raised = if !can_raise {
-            matches!(
-                try_execute_residual_call_via_executor(
-                    ctx,
-                    call_opcode,
-                    &allboxes,
-                    call_descr,
-                    recorded,
-                ),
-                Some(Err(_))
-            )
-        } else {
-            false
-        };
+        // Task #390 sub-slice 4: PyPy-orthodox activation.  PyPy's
+        // `_opimpl_residual_call*` concrete-executes EVERY residual
+        // call regardless of EI; the `exc` flag only selects the
+        // post-call guard shape (`GUARD_EXCEPTION` vs `GUARD_NO_EXCEPTION`)
+        // in `handle_possible_exception`.  Pyre matches by always
+        // invoking the executor — `try_execute_residual_call_via_executor`
+        // self-gates on a fnaddr-sanity check (rejecting unpatched
+        // `symbolic_fnaddr_for_path` hashes whose bits ≥ 47 are set)
+        // so unregistered helpers degrade gracefully to recording-only
+        // instead of SIGBUSing.
+        let resid_raised = matches!(
+            try_execute_residual_call_via_executor(
+                ctx,
+                call_opcode,
+                &allboxes,
+                call_descr,
+                recorded,
+            ),
+            Some(Err(_))
+        );
         debug_assert!(
             !resid_raised || can_raise,
             "dispatch_residual_call_iIRd_kind: helper raised on a \
@@ -4944,31 +4951,26 @@ fn dispatch_residual_call_iIRFd_kind(
 
         // Non-elidable concrete-execute parity (Task #390 sub-slice 3)
         // — see `dispatch_residual_call_iRd_kind` for the full citation.
-        // Task #390 sub-slice 3 activation is gated on `!can_raise`
-        // pending sub-slice 4's helper-side audit.  Empirical probe
-        // (commit history: sub-slice 4 probe) found the
-        // `can_raise=true` SIGBUS class is NOT walker-shadow staleness
-        // but UNPATCHED build-time fnaddrs in `constants_i` for some
-        // non-elidable helpers.  `runtime_fnaddr_patch` covers all
-        // helpers whose path appears in `pyre_interpreter::
-        // jit_trace_fnaddrs()`; helpers outside that registry retain
-        // garbage build-time values (e.g. `0xacc1d48d7993df7d` for
-        // `synth/bytes_ops`'s CallR).  Sub-slice 4 will extend the
-        // patcher registry or add a fnaddr-sanity gate before lifting.
-        let resid_raised = if !can_raise {
-            matches!(
-                try_execute_residual_call_via_executor(
-                    ctx,
-                    call_opcode,
-                    &allboxes,
-                    call_descr,
-                    recorded,
-                ),
-                Some(Err(_))
-            )
-        } else {
-            false
-        };
+        // Task #390 sub-slice 4: PyPy-orthodox activation.  PyPy's
+        // `_opimpl_residual_call*` concrete-executes EVERY residual
+        // call regardless of EI; the `exc` flag only selects the
+        // post-call guard shape (`GUARD_EXCEPTION` vs `GUARD_NO_EXCEPTION`)
+        // in `handle_possible_exception`.  Pyre matches by always
+        // invoking the executor — `try_execute_residual_call_via_executor`
+        // self-gates on a fnaddr-sanity check (rejecting unpatched
+        // `symbolic_fnaddr_for_path` hashes whose bits ≥ 47 are set)
+        // so unregistered helpers degrade gracefully to recording-only
+        // instead of SIGBUSing.
+        let resid_raised = matches!(
+            try_execute_residual_call_via_executor(
+                ctx,
+                call_opcode,
+                &allboxes,
+                call_descr,
+                recorded,
+            ),
+            Some(Err(_))
+        );
         debug_assert!(
             !resid_raised || can_raise,
             "dispatch_residual_call_iIRFd_kind: helper raised on a \
