@@ -3301,7 +3301,34 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
                 // PyFrame.  Running `execute_opcode_step` here would
                 // double-mutate.  pc already advanced above via
                 // `set_last_instr_from_next_instr(opcode_pc + 1)`.
-                Ok(StepResult::Continue)
+                //
+                // Walker-side `try_execute_residual_call_via_executor`
+                // (Task #390 sub-slice 3, `jitcode_dispatch.rs`)
+                // concrete-executes non-elidable residual calls during
+                // walker dispatch and routes raised exceptions through
+                // `BH_LAST_EXC_VALUE` (matches RPython
+                // `pyjitpl.py:2156-2168 handle_possible_exception` →
+                // `metainterp.execute_raised`).  Surface a pending
+                // exception as `Err(PyError)` so the bytecode
+                // interpreter's exception handler runs — without this,
+                // the helper's exception would silently drop, leaving
+                // the interpreter at the post-call PC instead of the
+                // exception-handler PC.
+                let bh_exc = majit_metainterp::blackhole::BH_LAST_EXC_VALUE
+                    .with(|c| {
+                        let v = c.get();
+                        c.set(0);
+                        v
+                    });
+                if bh_exc != 0 {
+                    Err(unsafe {
+                        pyre_interpreter::PyError::from_exc_object(
+                            bh_exc as pyre_object::PyObjectRef,
+                        )
+                    })
+                } else {
+                    Ok(StepResult::Continue)
+                }
             }
         } else {
             execute_opcode_step(frame, code, instruction, op_arg, next_instr)
