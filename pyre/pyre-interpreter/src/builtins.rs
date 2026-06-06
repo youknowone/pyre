@@ -1551,8 +1551,7 @@ fn type_descr_new_with_metaclass(
         // (the check is `PyDict_Check`, not `PyDict_CheckExact`); resolve
         // the dict backing so e.g. an `enum._EnumDict` class body is
         // walked instead of dropped.
-        let w_ns_backing =
-            unsafe { crate::type_methods::resolve_dict_backing(w_namespace_dict) };
+        let w_ns_backing = unsafe { crate::type_methods::resolve_dict_backing(w_namespace_dict) };
         if !w_ns_backing.is_null() {
             for (k, v) in unsafe { pyre_object::w_dict_items(w_ns_backing) } {
                 if unsafe { is_str(k) } {

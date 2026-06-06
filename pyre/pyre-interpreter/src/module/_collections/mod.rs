@@ -115,8 +115,9 @@ mod deque_class {
         let ty = unsafe { w_instance_get_type(self_obj) };
         let list = w_list_new(items);
         match crate::baseobjspace::getattr(self_obj, "__maxlen__") {
-            Ok(m) if !(m.is_null() || unsafe { is_none(m) }) =>
-                crate::call::call_function_impl_result(ty, &[list, m]),
+            Ok(m) if !(m.is_null() || unsafe { is_none(m) }) => {
+                crate::call::call_function_impl_result(ty, &[list, m])
+            }
             _ => crate::call::call_function_impl_result(ty, &[list]),
         }
     }

@@ -1319,7 +1319,8 @@ pub fn truediv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let b = unwrap_cell(b);
     unsafe {
         if binop_dispatch_first(a, b, "__truediv__", "__rtruediv__") {
-            if let Some(result) = try_dispatch_binary_special(a, b, "__truediv__", "__rtruediv__")? {
+            if let Some(result) = try_dispatch_binary_special(a, b, "__truediv__", "__rtruediv__")?
+            {
                 return Ok(result);
             }
         }
