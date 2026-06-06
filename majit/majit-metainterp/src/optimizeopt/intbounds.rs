@@ -1986,12 +1986,12 @@ impl OptIntBounds {
         // the BoxRef's authoritative `_forwarded` slot.
         let bound = ctx.with_ensured_ptr_info_arg0(op, |mut array| array.getlenbound(None));
         if let Some(bound) = bound {
-            // `ensure_box` resolves `op.pos` to its bound `Op`/`InputArg`,
-            // mirroring RPython's "Box always exists" invariant
-            // (`resoperation.py:233-248`).
-            if let Some(pos_box) = ctx.ensure_box(op.pos.get()) {
-                ctx.setintbound(&pos_box, &bound);
-            }
+            // optimizer.py:115 setintbound(op, ...): `op` is the result box.
+            // `get_box_replacement` resolves `op.pos` to its bound host
+            // (always registered post-emit), matching RPython's
+            // unconditional setintbound call.
+            let pos_box = ctx.get_box_replacement(op.pos.get());
+            ctx.setintbound(&pos_box, &bound);
         }
     }
 
@@ -2007,17 +2007,15 @@ impl OptIntBounds {
         // by calling ensure_ptr_info_arg0 (which constructs StrPtrInfo for
         // STRLEN per optimizer.py:490-491) and then invoking getlenbound on
         // the returned handle.
-        if let Some(arg0_box) = ctx.ensure_box(op.arg(0).to_opref()) {
-            ctx.make_nonnull_str(&arg0_box, 0);
-        }
+        let arg0_box = ctx.get_box_replacement(op.arg(0).to_opref());
+        ctx.make_nonnull_str(&arg0_box, 0);
         // `getlenbound` is a lazy-fill mutator on `StrPtrInfo.lenbound`
         // (`vstring.py:62`). Route through `with_ensured_ptr_info_arg0`
         // so the BoxRef-held StrPtrInfo is updated in place.
         let bound = ctx.with_ensured_ptr_info_arg0(op, |mut info| info.getlenbound(Some(0)));
         if let Some(bound) = bound {
-            if let Some(pos_box) = ctx.ensure_box(op.pos.get()) {
-                ctx.setintbound(&pos_box, &bound);
-            }
+            let pos_box = ctx.get_box_replacement(op.pos.get());
+            ctx.setintbound(&pos_box, &bound);
         }
     }
 
@@ -2026,16 +2024,14 @@ impl OptIntBounds {
         //     self.make_nonnull_str(op.getarg(0), vstring.mode_unicode)
         //     array = getptrinfo(op.getarg(0))
         //     self.optimizer.setintbound(op, array.getlenbound(vstring.mode_unicode))
-        if let Some(arg0_box) = ctx.ensure_box(op.arg(0).to_opref()) {
-            ctx.make_nonnull_str(&arg0_box, 1);
-        }
+        let arg0_box = ctx.get_box_replacement(op.arg(0).to_opref());
+        ctx.make_nonnull_str(&arg0_box, 1);
         // Same wrapper rationale as `postprocess_strlen` — lazy-fill
         // mutation on StrPtrInfo.lenbound needs BoxRef mirror.
         let bound = ctx.with_ensured_ptr_info_arg0(op, |mut info| info.getlenbound(Some(1)));
         if let Some(bound) = bound {
-            if let Some(pos_box) = ctx.ensure_box(op.pos.get()) {
-                ctx.setintbound(&pos_box, &bound);
-            }
+            let pos_box = ctx.get_box_replacement(op.pos.get());
+            ctx.setintbound(&pos_box, &bound);
         }
     }
 
@@ -2057,9 +2053,7 @@ impl OptIntBounds {
             if b.is_within_range(start, stop - 1) {
                 // The value already fits; replace with the input.
                 let b_old = BoxRef::from_bound_op(op_rc);
-                let b_arg = ctx
-                    .ensure_box(op.arg(0).to_opref())
-                    .expect("body-namespace OpRef must have a BoxRef slot");
+                let b_arg = ctx.get_box_replacement(op.arg(0).to_opref());
                 ctx.make_equal_to(&b_old, &b_arg);
                 return OptimizationResult::Remove;
             }
@@ -2074,9 +2068,7 @@ impl OptIntBounds {
             let numbits = byte_size * 8;
             let start = -(1i64 << (numbits - 1));
             let stop = 1i64 << (numbits - 1);
-            let op_pos_box = ctx
-                .ensure_box(op.pos.get())
-                .expect("body-namespace OpRef must have a BoxRef slot");
+            let op_pos_box = ctx.get_box_replacement(op.pos.get());
             let _ = ctx.with_intbound_mut(&op_pos_box, |bm| bm.intersect_const(start, stop - 1));
         }
     }
