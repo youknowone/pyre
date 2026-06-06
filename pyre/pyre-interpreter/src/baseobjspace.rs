@@ -6835,12 +6835,12 @@ pub fn contains(haystack: PyObjectRef, needle: PyObjectRef) -> Result<bool, PyEr
         if is_instance(haystack) {
             let w_type = w_instance_get_type(haystack);
             if let Some(method) = lookup_in_type_where(w_type, "__contains__") {
-                let result = crate::call_function(method, &[haystack, needle]);
+                let result = crate::builtins::call_and_check(method, &[haystack, needle])?;
                 return Ok(is_true(result));
             }
             // Also check per-instance attributes (ATTR_TABLE)
             if let Ok(method) = getattr(haystack, "__contains__") {
-                let result = crate::call_function(method, &[haystack, needle]);
+                let result = crate::builtins::call_and_check(method, &[haystack, needle])?;
                 return Ok(is_true(result));
             }
         }
@@ -6855,7 +6855,7 @@ pub fn contains(haystack: PyObjectRef, needle: PyObjectRef) -> Result<bool, PyEr
     unsafe {
         if let Some(w_type) = crate::typedef::r#type(haystack) {
             if let Some(method) = lookup_in_type_where(w_type, "__contains__") {
-                let result = crate::call_function(method, &[haystack, needle]);
+                let result = crate::builtins::call_and_check(method, &[haystack, needle])?;
                 return Ok(is_true(result));
             }
         }
