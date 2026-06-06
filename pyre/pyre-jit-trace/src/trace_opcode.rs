@@ -6435,6 +6435,13 @@ impl MIFrame {
         let new_op = self.with_ctx(|_this, ctx| {
             crate::helpers::emit_exception_new_inline(ctx, kind, callable, args_list)
         });
+        // E1: record the fresh instance keyed by the New op so a following
+        // RAISE_VARARGS can recover the concrete exception (the type-call
+        // result carries concrete=Null) and take the instance fast path —
+        // skip the residual publish + GUARD_EXCEPTION so the exception
+        // stays virtualizable.  Trace-time only; the runtime value is the
+        // per-iteration New op.
+        self.sym_mut().trace_built_exc.insert(new_op, exc);
         Ok(Some(new_op))
     }
 
@@ -9390,6 +9397,15 @@ impl OpcodeStepExecutor for MIFrame {
             (exc_val, None, null_cause)
         };
         let exc = exc_val.concrete.to_pyobj();
+        // E1: a trace-built exception (`try_trace_exception_new`) leaves the
+        // type-call result with concrete=Null; recover the fresh instance
+        // recorded at construction so the raise takes the instance fast path.
+        let trace_built = self.sym().trace_built_exc.get(&exc_val.opref).copied();
+        let exc = if exc.is_null() {
+            trace_built.unwrap_or(exc)
+        } else {
+            exc
+        };
         let emit_runtime_raise = |slf: &mut Self| {
             slf.with_ctx(|this, ctx| {
                 ctx.call_ref_typed_with_effect(
@@ -9407,7 +9423,45 @@ impl OpcodeStepExecutor for MIFrame {
         unsafe {
             if pyre_object::is_exception(exc) {
                 // `eval.rs:1053-1055 / :1096-1098`: already an instance.
-                let _ = emit_runtime_raise(self);
+                //
+                // E1 fast path: a freshly trace-built exception
+                // (`NewWithVtable`) raised with no explicit cause needs
+                // neither the residual `normalize_raise_varargs_jit` publish
+                // nor `GUARD_EXCEPTION`.  `seed_raised_exception` sets
+                // `last_exc_box`, so the dispatch routes through
+                // `handle_raise_varargs` → `finishframe_exception` (a local
+                // handler continues with `last_exc_box`; a root-frame escape
+                // FINISHes with it via `compile_exit_frame_with_exception`).
+                // Skipping the publish leaves the New op with no escape, so the
+                // optimizer can virtualize it.
+                //
+                // `__context__` chaining is emitted as a SetField on the
+                // (virtualizable) exception instead of inside the residual: for
+                // a fresh exception `w_context` is null and the self-cycle is
+                // impossible, so `attach_raise_cause`'s conditional
+                // `w_context = active` reduces to an unconditional
+                // `exc.w_context = ec.sys_exc_value` (storing null when no
+                // exception is active is a no-op that DCEs).
+                if trace_built.is_some() && cause.is_none() {
+                    let kind = pyre_object::excobject::w_exception_get_kind(exc);
+                    let ec = self.with_ctx(|this, ctx| this.ensure_execution_context(ctx));
+                    let active = self.with_ctx(|_this, ctx| {
+                        ctx.record_op_with_descr(
+                            majit_ir::OpCode::GetfieldGcR,
+                            &[ec],
+                            crate::descr::ec_sys_exc_value_descr(),
+                        )
+                    });
+                    self.with_ctx(|_this, ctx| {
+                        ctx.record_op_with_descr(
+                            majit_ir::OpCode::SetfieldGc,
+                            &[exc_val.opref, active],
+                            crate::descr::w_exception_context_descr(kind),
+                        );
+                    });
+                } else {
+                    let _ = emit_runtime_raise(self);
+                }
                 attach_raise_cause(exc, cause)?;
                 self.seed_raised_exception(exc_val.opref, exc);
                 return Err(PyError::from_exc_object(exc));

@@ -1647,8 +1647,8 @@ pub fn make_array_descr_with_full_id(
 
 use pyre_interpreter::{DICT_STORAGE_VALUES_LEN_OFFSET, DICT_STORAGE_VALUES_OFFSET};
 use pyre_object::excobject::{
-    EXC_ARGS_W_OFFSET, EXC_KIND_COUNT, EXC_KIND_OFFSET, ExcKind, W_EXCEPTION_OBJECT_SIZE,
-    exc_kind_to_pytype,
+    EXC_ARGS_W_OFFSET, EXC_KIND_COUNT, EXC_KIND_OFFSET, EXC_W_CONTEXT_OFFSET, ExcKind,
+    W_EXCEPTION_OBJECT_SIZE, exc_kind_to_pytype,
 };
 use pyre_object::floatobject::{FLOAT_FLOATVAL_OFFSET, W_FloatObject};
 use pyre_object::intobject::W_IntObject;
@@ -1984,6 +1984,19 @@ fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
                 false,
                 false,
             ),
+            // `w_context` (`__context__`): a GC pointer slot.  Written by
+            // the RAISE_VARARGS `__context__` chaining lowering
+            // (`exc.w_context = ec.sys_exc_value`) so the optimizer can
+            // track it on the virtual exception; carried at field index 3.
+            (
+                "W_ExceptionObject.w_context",
+                EXC_W_CONTEXT_OFFSET,
+                8,
+                Type::Ref,
+                false,
+                false,
+                false,
+            ),
         ],
         // Empty name: the per-kind vtable means a shared "W_ExceptionObject"
         // name-registry slot would be first-write-wins and lose the other
@@ -2012,6 +2025,21 @@ pub fn w_exception_descrs(kind: ExcKind) -> (DescrRef, DescrRef, DescrRef, Descr
         field_descr_from_group(group, 1),
         field_descr_from_group(group, 2),
     )
+}
+
+/// Field descr for `W_ExceptionObject.w_context` (the `__context__`
+/// slot), index 3 of the per-kind exception descr group.  Used by the
+/// RAISE_VARARGS `__context__` chaining lowering; shares the same parent
+/// `SizeDescr` as the `NewWithVtable` emit so the optimizer recognises
+/// the store as a field of the virtual exception.
+pub fn w_exception_context_descr(kind: ExcKind) -> DescrRef {
+    let idx = kind as u8 as usize;
+    let mut cache = W_EXCEPTION_DESCR_CACHE.lock().unwrap();
+    if cache[idx].is_none() {
+        cache[idx] = Some(build_w_exception_group(kind));
+    }
+    let group = cache[idx].as_ref().unwrap();
+    field_descr_from_group(group, 3)
 }
 
 /// Field descr for `ExecutionContext::sys_exc_value`, used by the JIT

@@ -1624,6 +1624,15 @@ pub struct PyreSym {
     /// by handle_possible_exception after GUARD_EXCEPTION, then consumed
     /// by finishframe_exception for stack push.
     pub(crate) last_exc_box: OpRef,
+    /// E1: maps the OpRef of a trace-built (fresh `NewWithVtable`)
+    /// exception to its trace-time concrete instance.  `RAISE_VARARGS`
+    /// reuses the instance to take the instance fast path — skip the
+    /// residual `normalize_raise_varargs_jit` publish + `GUARD_EXCEPTION`
+    /// round-trip so the exception stays virtualizable — and to apply the
+    /// unconditional `__context__ = ec.sys_exc_value` chaining that is
+    /// valid only for a freshly constructed exception (w_context still
+    /// null, self-cycle impossible).
+    pub(crate) trace_built_exc: majit_ir::VecAssoc<OpRef, pyre_object::PyObjectRef>,
     /// Symbolic mirror of executioncontext.current_exception/sys_exc_info.
     /// Used by PUSH_EXC_INFO / POP_EXCEPT to preserve nested handler state.
     pub(crate) current_exc_value: pyre_object::PyObjectRef,
@@ -3048,6 +3057,7 @@ impl PyreSym {
             last_exc_value: std::ptr::null_mut(),
             class_of_last_exc_is_const: false,
             last_exc_box: OpRef::NONE,
+            trace_built_exc: majit_ir::VecAssoc::new(),
             current_exc_value: pyre_interpreter::eval::get_current_exception(),
             current_exc_box: OpRef::NONE,
             virtualref_boxes: Vec::new(),
