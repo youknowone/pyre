@@ -2699,6 +2699,63 @@ fn getfield_gc_via_heapcache(
     Ok((DispatchOutcome::Continue, op.next_pc))
 }
 
+/// `interp_jit.py:25-31` PyFrame static-field order
+/// `[last_instr, pycode, valuestackdepth, debugdata, lastblock, w_globals]`.
+const VABLE_CODE_FIELD_IDX: usize = 1;
+const VABLE_NAMESPACE_FIELD_IDX: usize = 5;
+
+/// Path-1 (#68): resolve a scalar `getfield_vable_r` read off an inlined
+/// callee's OWN (unseeded) portal frame to the callee's compile-time
+/// constant.  This is the walk-time mirror of the codewriter's non-portal
+/// branch (`codewriter.rs:6720-6732` LOAD_CONST, `:7347-7369` LOAD_GLOBAL):
+/// a non-portal callee's `pycode`/`w_globals` are constants fed as
+/// `ConstRef`, never read off the portal frame reg (which, when inlined,
+/// aliases the caller's frame and would read the wrong field).  Only the
+/// Ref-typed `pycode` (field 1) and `w_globals` (field 5) carry a
+/// compile-time constant; Int frame state (`last_instr`, `valuestackdepth`)
+/// does not.  Returns `None` when not an inline sub-walk, the field is not
+/// resolvable, or the layout is absent — callers fall through to the
+/// `VableBoxNotSeeded` error (such callees are declined up-front by
+/// [`callee_fast_path_inlinable`], so reaching here unresolved is genuine).
+fn try_resolve_inline_callee_static_field(
+    code: &[u8],
+    op: &DecodedOp,
+    ctx: &mut WalkContext<'_, '_>,
+    dst_bank: char,
+) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
+    if dst_bank != 'r' {
+        return Ok(None);
+    }
+    let Some(consts) = fbw_current_inline_callee_consts() else {
+        return Ok(None);
+    };
+    let descr = read_descr(code, op, 1, ctx)?;
+    let field_idx = {
+        let Some(info) = ctx.trace_ctx.virtualizable_info() else {
+            return Ok(None);
+        };
+        match info.static_field_by_descr(&descr) {
+            Some(idx) => idx,
+            None => return Ok(None),
+        }
+    };
+    let const_ptr = match field_idx {
+        VABLE_NAMESPACE_FIELD_IDX => consts.w_globals_obj,
+        VABLE_CODE_FIELD_IDX => consts.w_code,
+        _ => return Ok(None),
+    };
+    let result = ctx.trace_ctx.const_ref(const_ptr as i64);
+    let dst = code[op.pc + 4] as usize;
+    write_ref_reg(
+        ctx,
+        op.pc,
+        dst,
+        result,
+        ConcreteValue::Ref(const_ptr as pyre_object::PyObjectRef),
+    )?;
+    Ok(Some((DispatchOutcome::Continue, op.next_pc)))
+}
+
 /// `getfield_vable_<i|r|f>/rd>X` handler. Operand layout `rd>X`:
 /// 1B r-reg(vable_box) + 2B descr(field) + 1B X-dst.
 ///
@@ -2734,6 +2791,15 @@ fn getfield_vable_via_metainterp(
     // u32::MAX`); feeding it into the metainterp vable path would resize
     // the heapcache flag vector to 16 GiB. Bail to a trace abort instead.
     if obj.is_none() {
+        // Path-1 (#68): an inlined callee reading a scalar field off its
+        // OWN unseeded portal frame.  A resolvable static field (`w_globals`
+        // namespace for a LOAD_GLOBAL, `pycode` promote-to-const) folds to
+        // the callee constant; anything else is declined up-front by
+        // `callee_fast_path_inlinable`, so an unresolved field here is a
+        // genuine unseeded-box error.
+        if let Some(resolved) = try_resolve_inline_callee_static_field(code, op, ctx, dst_bank)? {
+            return Ok(resolved);
+        }
         return Err(DispatchError::VableBoxNotSeeded { pc: op.pc });
     }
     let descr = read_descr(code, op, 1, ctx)?;
@@ -5103,6 +5169,59 @@ impl Drop for InlineRecursionGuard {
     }
 }
 
+thread_local! {
+    /// FBW inline callee constant stack: for each user function currently
+    /// being inlined by [`try_walker_inline_user_call`]'s sub-walk, its
+    /// compile-time-constant frame fields, innermost last.  When the inlined
+    /// body reads a scalar `getfield_vable_r` off its OWN (unseeded) portal
+    /// frame — the namespace (`w_globals`, field 5) for a `LOAD_GLOBAL`, or
+    /// the promote-to-const `pycode` (field 1) — the read resolves to the
+    /// callee constant here instead of aborting `VableBoxNotSeeded`.  This is
+    /// the walk-time equivalent of the codewriter's non-portal branch
+    /// (`codewriter.rs:6720-6732` / `:7347-7369`): a non-portal callee's
+    /// `pycode`/`w_globals` are compile-time constants, fed as `ConstRef`
+    /// rather than a portal `getfield_vable` that would alias the caller's
+    /// frame and read the wrong field.
+    static FBW_INLINE_CALLEE_CONSTS: std::cell::RefCell<Vec<InlineCalleeConsts>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Compile-time-constant frame fields of an inlined callee (see
+/// [`FBW_INLINE_CALLEE_CONSTS`]).
+#[derive(Clone, Copy)]
+struct InlineCalleeConsts {
+    /// `frame.w_globals` object (`VABLE_NAMESPACE_FIELD_IDX` = 5): the
+    /// callee function's `__globals__` as a `PyObjectRef`.
+    w_globals_obj: usize,
+    /// `frame.pycode` (`VABLE_CODE_FIELD_IDX` = 1): the callee's `W_Code`
+    /// pointer.
+    w_code: usize,
+}
+
+/// The innermost inlined callee's constants, if a sub-walk is active.
+fn fbw_current_inline_callee_consts() -> Option<InlineCalleeConsts> {
+    FBW_INLINE_CALLEE_CONSTS.with(|s| s.borrow().last().copied())
+}
+
+/// RAII guard: push the inlined callee's constants for the lifetime of its
+/// sub-walk, pop on drop so nested inlines unwind to their parent.
+struct InlineCalleeConstsGuard;
+
+impl InlineCalleeConstsGuard {
+    fn enter(consts: InlineCalleeConsts) -> Self {
+        FBW_INLINE_CALLEE_CONSTS.with(|s| s.borrow_mut().push(consts));
+        InlineCalleeConstsGuard
+    }
+}
+
+impl Drop for InlineCalleeConstsGuard {
+    fn drop(&mut self) {
+        FBW_INLINE_CALLEE_CONSTS.with(|s| {
+            s.borrow_mut().pop();
+        });
+    }
+}
+
 /// RAII guard: set [`FULL_BODY_SNAPSHOT_SYM`] for the lifetime of a
 /// full-body walk and restore the prior value on drop (so any nesting
 /// restores the parent rather than clearing to null).
@@ -5995,24 +6114,66 @@ fn diagnose_inline_recognition(arg_concretes: &[ConcreteValue], op_pc: usize) {
 /// only the callee's positional-argument registers `r0..nparams`; the
 /// callee's virtualizable frame box is left unseeded.  A callee whose body
 /// reads or writes that frame through a `*_vable_*` op — emitted by the
-/// codewriter when a local must survive a sub-call — cannot be satisfied by
-/// register seeding and would abort the *whole* enclosing trace with
-/// `VableBoxNotSeeded`.  Detect that pre-flight so the call lowers to an
-/// ordinary residual call (the orthodox non-inlinable path, `should_inline`
-/// = False → `do_residual_call`, `pyjitpl.py:1422`) instead of aborting.
-fn callee_fast_path_inlinable(body_code: &[u8]) -> bool {
+/// codewriter when a local must survive a sub-call — generally cannot be
+/// satisfied by register seeding and would abort the *whole* enclosing trace
+/// with `VableBoxNotSeeded`.  The ONE exception is a scalar `getfield_vable_r`
+/// reading a compile-time-constant static field (`pycode` / `w_globals`):
+/// [`try_resolve_inline_callee_static_field`] folds it to the callee constant
+/// (the walk-time mirror of the codewriter non-portal branch,
+/// `codewriter.rs:6720-6732` / `:7347-7369`).  Detect everything else
+/// pre-flight so the call lowers to an ordinary residual call (the orthodox
+/// non-inlinable path, `should_inline` = False → `do_residual_call`,
+/// `pyjitpl.py:1422`) instead of aborting.
+fn callee_fast_path_inlinable(
+    body_code: &[u8],
+    callee_descr_refs: &[DescrRef],
+    ctx: &WalkContext<'_, '_>,
+) -> bool {
     let mut pc = 0usize;
     while pc < body_code.len() {
         let Some(d) = crate::jitcode_runtime::decode_op_at(body_code, pc) else {
             // Undecodable tail — be conservative and decline the fast path.
             return false;
         };
-        if d.opname.contains("vable") {
+        if d.opname.contains("vable")
+            && !inline_resolvable_static_vable_read(body_code, &d, callee_descr_refs, ctx)
+        {
             return false;
         }
         pc = d.next_pc;
     }
     true
+}
+
+/// True iff `d` is a scalar `getfield_vable_r` whose field is a Ref-typed
+/// compile-time constant (`pycode` / `w_globals`) — the only vable op
+/// [`try_resolve_inline_callee_static_field`] can satisfy without a seeded
+/// frame box.  `setfield_vable`, array vable ops, and `getfield_vable_i/f`
+/// (mutable Int/Float frame state) all return false → decline the inline.
+fn inline_resolvable_static_vable_read(
+    body_code: &[u8],
+    d: &DecodedOp,
+    callee_descr_refs: &[DescrRef],
+    ctx: &WalkContext<'_, '_>,
+) -> bool {
+    if !d.opname.starts_with("getfield_vable_r") {
+        return false;
+    }
+    let Some(info) = ctx.trace_ctx.virtualizable_info() else {
+        return false;
+    };
+    // `rd>r` layout: 1B reg + 2B descr-pool index + 1B dst; descr at `pc + 2`.
+    if d.pc + 3 >= body_code.len() {
+        return false;
+    }
+    let descr_index = body_code[d.pc + 2] as usize | ((body_code[d.pc + 3] as usize) << 8);
+    let Some(descr) = callee_descr_refs.get(descr_index) else {
+        return false;
+    };
+    matches!(
+        info.static_field_by_descr(descr),
+        Some(VABLE_CODE_FIELD_IDX) | Some(VABLE_NAMESPACE_FIELD_IDX)
+    )
 }
 
 /// #62 slice (3c): full-body-walk inline of a recognized user-function
@@ -6128,9 +6289,20 @@ fn try_walker_inline_user_call(
     // *whole* enclosing trace with `VableBoxNotSeeded`.  Decline such
     // callees (and the zero-param case) so the call lowers to an ordinary
     // residual call rather than aborting (orthodox non-inlinable path).
-    if nparams == 0 || !callee_fast_path_inlinable(body.code) {
+    if nparams == 0 || !callee_fast_path_inlinable(body.code, callee_descr_refs, ctx) {
         return Ok(None);
     }
+
+    // Path-1 (#68): the inlined callee's compile-time-constant frame fields,
+    // so a scalar `getfield_vable_r` off its own (unseeded) portal frame —
+    // the `w_globals` namespace for a LOAD_GLOBAL, the promote-to-const
+    // `pycode` — resolves to the constant via
+    // `try_resolve_inline_callee_static_field` instead of aborting
+    // `VableBoxNotSeeded`.  Mirror of the codewriter non-portal branch.
+    let inline_consts = InlineCalleeConsts {
+        w_globals_obj: unsafe { pyre_interpreter::function_get_globals_obj(callable) } as usize,
+        w_code: callee_code_key,
+    };
 
     // Specialize the inlined body on this exact callable: a later
     // iteration calling a different function at this site must deopt
@@ -6194,6 +6366,10 @@ fn try_walker_inline_user_call(
         // Track this callee on the FBW inline stack for the lifetime of the
         // sub-walk so a nested self-call sees the correct recursion depth.
         let _recursion_frame = InlineRecursionGuard::enter(callee_code_key);
+        // Path-1: resolve scalar static-field reads off this callee's own
+        // unseeded portal frame to its compile-time constants for the
+        // lifetime of the sub-walk.
+        let _callee_consts = InlineCalleeConstsGuard::enter(inline_consts);
         let (outcome, _end_pc) = match walk(body.code, 0, &mut sub_wc) {
             Ok(v) => v,
             Err(e) => {
@@ -7871,7 +8047,6 @@ fn dispatch_residual_call_iIRd_kind(
     argboxes.extend_from_slice(&r_args);
     argbox_types.extend(std::iter::repeat(Type::Ref).take(r_args.len()));
     let allboxes = build_allboxes(funcptr, &argboxes, &argbox_types, call_descr.arg_types());
-    ensure_residual_call_args_bound(&allboxes, op.pc)?;
 
     let ei = call_descr.get_extra_info();
     // pyjitpl.py:2003-2005 OS_NOT_IN_TRACE guard — see helper docstring
@@ -7960,6 +8135,16 @@ fn dispatch_residual_call_iIRd_kind(
             }
         }
     }
+
+    // Defer the arg-bound check past the short-circuiting LoadConst /
+    // LoadGlobal folds above: each resolves the call to a constant from
+    // `i_args`/`r_args` without recording it, so an unbound *trailing* arg
+    // is irrelevant when the call folds away.  In particular an inlined
+    // callee's `load_global` passes its OWN unseeded `portal_frame_reg`
+    // (Path-1, #68); the fold elides that call, so the frame box never
+    // needs binding.  Only a call that survives to a genuine record
+    // (BoxInt exec, generic residual below) requires every box bound.
+    ensure_residual_call_args_bound(&allboxes, op.pc)?;
 
     // BoxInt fold (#62): `box_int_fn(raw)` allocates a fresh `PyLong`.  The
     // opaque CanRaise residual the generic leg would record blocks the
