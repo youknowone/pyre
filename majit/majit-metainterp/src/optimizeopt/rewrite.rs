@@ -172,7 +172,7 @@ impl OptRewrite {
 
     /// Try algebraic simplification for INT_ADD.
     /// `x + 0 -> x`, `0 + x -> x`, `x + x -> x << 1`
-    fn optimize_int_add(&self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
+    fn optimize_int_add(&self, op: &Op, op_rc: &majit_ir::OpRc, ctx: &mut OptContext) -> OptimizationResult {
         let arg0 = op.arg(0);
         let arg1 = op.arg(1);
 
@@ -194,9 +194,7 @@ impl OptRewrite {
             .get_box_replacement_box(arg1.to_opref())
             .and_then(|b| ctx.get_constant_int_box(&b))
         {
-            let b_old = ctx
-                .ensure_box(op.pos.get())
-                .expect("body-namespace OpRef must have a BoxRef slot");
+            let b_old = BoxRef::from_bound_op(op_rc);
             let b_arg = ctx
                 .ensure_box(arg0.to_opref())
                 .expect("body-namespace OpRef must have a BoxRef slot");
@@ -207,9 +205,7 @@ impl OptRewrite {
             .get_box_replacement_box(arg0.to_opref())
             .and_then(|b| ctx.get_constant_int_box(&b))
         {
-            let b_old = ctx
-                .ensure_box(op.pos.get())
-                .expect("body-namespace OpRef must have a BoxRef slot");
+            let b_old = BoxRef::from_bound_op(op_rc);
             let b_arg = ctx
                 .ensure_box(arg1.to_opref())
                 .expect("body-namespace OpRef must have a BoxRef slot");
@@ -302,7 +298,7 @@ impl OptRewrite {
 
     /// Try algebraic simplification for INT_SUB.
     /// `x - 0 -> x`, `x - x -> 0`
-    fn optimize_int_sub(&self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
+    fn optimize_int_sub(&self, op: &Op, op_rc: &majit_ir::OpRc, ctx: &mut OptContext) -> OptimizationResult {
         let arg0 = op.arg(0);
         let arg1 = op.arg(1);
 
@@ -324,9 +320,7 @@ impl OptRewrite {
             .get_box_replacement_box(arg1.to_opref())
             .and_then(|b| ctx.get_constant_int_box(&b))
         {
-            let b_old = ctx
-                .ensure_box(op.pos.get())
-                .expect("body-namespace OpRef must have a BoxRef slot");
+            let b_old = BoxRef::from_bound_op(op_rc);
             let b_arg = ctx
                 .ensure_box(arg0.to_opref())
                 .expect("body-namespace OpRef must have a BoxRef slot");
@@ -378,9 +372,7 @@ impl OptRewrite {
             .and_then(|pb| ctx.get_producing_op(&pb))
         {
             if inner.opcode == OpCode::IntAdd && inner.arg(1).to_opref() == arg1.to_opref() {
-                let b_old = ctx
-                    .ensure_box(op.pos.get())
-                    .expect("body-namespace OpRef must have a BoxRef slot");
+                let b_old = BoxRef::from_bound_op(op_rc);
                 let b_inner = ctx
                     .ensure_box(inner.arg(0).to_opref())
                     .expect("body-namespace OpRef must have a BoxRef slot");
@@ -466,9 +458,7 @@ impl OptRewrite {
                         .and_then(|b| ctx.peek_intbound_box(&b)),
                 ) {
                     if bx.and_bound(&by).known_eq_const(0) {
-                        let b_old = ctx
-                            .ensure_box(op.pos.get())
-                            .expect("body-namespace OpRef must have a BoxRef slot");
+                        let b_old = BoxRef::from_bound_op(op_rc);
                         let b_inner = ctx
                             .ensure_box(inner.arg(0).to_opref())
                             .expect("body-namespace OpRef must have a BoxRef slot");
@@ -486,9 +476,7 @@ impl OptRewrite {
                         .and_then(|b| ctx.peek_intbound_box(&b)),
                 ) {
                     if bx.and_bound(&by).known_eq_const(0) {
-                        let b_old = ctx
-                            .ensure_box(op.pos.get())
-                            .expect("body-namespace OpRef must have a BoxRef slot");
+                        let b_old = BoxRef::from_bound_op(op_rc);
                         let b_inner = ctx
                             .ensure_box(inner.arg(0).to_opref())
                             .expect("body-namespace OpRef must have a BoxRef slot");
@@ -504,7 +492,7 @@ impl OptRewrite {
 
     /// Try algebraic simplification for INT_MUL.
     /// `x * 0 -> 0`, `x * 1 -> x`, `0 * x -> 0`, `1 * x -> x`
-    fn optimize_int_mul(&self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
+    fn optimize_int_mul(&self, op: &Op, op_rc: &majit_ir::OpRc, ctx: &mut OptContext) -> OptimizationResult {
         let arg0 = op.arg(0);
         let arg1 = op.arg(1);
 
@@ -542,9 +530,7 @@ impl OptRewrite {
             .get_box_replacement_box(arg1.to_opref())
             .and_then(|b| ctx.get_constant_int_box(&b))
         {
-            let b_old = ctx
-                .ensure_box(op.pos.get())
-                .expect("body-namespace OpRef must have a BoxRef slot");
+            let b_old = BoxRef::from_bound_op(op_rc);
             let b_arg = ctx
                 .ensure_box(arg0.to_opref())
                 .expect("body-namespace OpRef must have a BoxRef slot");
@@ -556,9 +542,7 @@ impl OptRewrite {
             .get_box_replacement_box(arg0.to_opref())
             .and_then(|b| ctx.get_constant_int_box(&b))
         {
-            let b_old = ctx
-                .ensure_box(op.pos.get())
-                .expect("body-namespace OpRef must have a BoxRef slot");
+            let b_old = BoxRef::from_bound_op(op_rc);
             let b_arg = ctx
                 .ensure_box(arg1.to_opref())
                 .expect("body-namespace OpRef must have a BoxRef slot");
@@ -640,7 +624,7 @@ impl OptRewrite {
 
     /// Try algebraic simplification for INT_FLOORDIV.
     /// `x // 1 -> x`, constant fold when both operands are known.
-    fn optimize_int_floor_div(&self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
+    fn optimize_int_floor_div(&self, op: &Op, op_rc: &majit_ir::OpRc, ctx: &mut OptContext) -> OptimizationResult {
         let arg0 = op.arg(0);
         let arg1 = op.arg(1);
 
@@ -662,9 +646,7 @@ impl OptRewrite {
             .get_box_replacement_box(arg1.to_opref())
             .and_then(|b| ctx.get_constant_int_box(&b))
         {
-            let b_old = ctx
-                .ensure_box(op.pos.get())
-                .expect("body-namespace OpRef must have a BoxRef slot");
+            let b_old = BoxRef::from_bound_op(op_rc);
             let b_arg = ctx
                 .ensure_box(arg0.to_opref())
                 .expect("body-namespace OpRef must have a BoxRef slot");
@@ -711,9 +693,7 @@ impl OptRewrite {
                     OpCode::IntRshift,
                     &[arg0, BoxRef::from_opref(shift_ref)],
                 ));
-                let b_old = ctx
-                    .ensure_box(op.pos.get())
-                    .expect("body-namespace OpRef must have a BoxRef slot");
+                let b_old = BoxRef::from_bound_op(op_rc);
                 let b_res = ctx
                     .ensure_box(result_ref)
                     .expect("body-namespace OpRef must have a BoxRef slot");
@@ -730,9 +710,7 @@ impl OptRewrite {
                     ctx.current_pass_idx,
                     ctx,
                 );
-                let b_old = ctx
-                    .ensure_box(op.pos.get())
-                    .expect("body-namespace OpRef must have a BoxRef slot");
+                let b_old = BoxRef::from_bound_op(op_rc);
                 let b_res = ctx
                     .ensure_box(result)
                     .expect("body-namespace OpRef must have a BoxRef slot");
@@ -747,7 +725,7 @@ impl OptRewrite {
     /// Try algebraic simplification for INT_MOD.
     ///
     /// Strength reduction from rpython/jit/metainterp/optimizeopt/intdiv.py.
-    fn optimize_int_mod(&self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
+    fn optimize_int_mod(&self, op: &Op, op_rc: &majit_ir::OpRc, ctx: &mut OptContext) -> OptimizationResult {
         let arg0 = op.arg(0);
         let arg1 = op.arg(1);
 
@@ -810,9 +788,7 @@ impl OptRewrite {
                     ctx.current_pass_idx,
                     ctx,
                 );
-                let b_old = ctx
-                    .ensure_box(op.pos.get())
-                    .expect("body-namespace OpRef must have a BoxRef slot");
+                let b_old = BoxRef::from_bound_op(op_rc);
                 let b_res = ctx
                     .ensure_box(result)
                     .expect("body-namespace OpRef must have a BoxRef slot");
@@ -826,7 +802,7 @@ impl OptRewrite {
 
     /// Try algebraic simplification for INT_AND.
     /// `x & 0 -> 0`, `x & -1 -> x`
-    fn optimize_int_and(&self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
+    fn optimize_int_and(&self, op: &Op, op_rc: &majit_ir::OpRc, ctx: &mut OptContext) -> OptimizationResult {
         let arg0 = op.arg(0);
         let arg1 = op.arg(1);
 
@@ -863,9 +839,7 @@ impl OptRewrite {
             .get_box_replacement_box(arg1.to_opref())
             .and_then(|b| ctx.get_constant_int_box(&b))
         {
-            let b_old = ctx
-                .ensure_box(op.pos.get())
-                .expect("body-namespace OpRef must have a BoxRef slot");
+            let b_old = BoxRef::from_bound_op(op_rc);
             let b_arg = ctx
                 .ensure_box(arg0.to_opref())
                 .expect("body-namespace OpRef must have a BoxRef slot");
@@ -876,9 +850,7 @@ impl OptRewrite {
             .get_box_replacement_box(arg0.to_opref())
             .and_then(|b| ctx.get_constant_int_box(&b))
         {
-            let b_old = ctx
-                .ensure_box(op.pos.get())
-                .expect("body-namespace OpRef must have a BoxRef slot");
+            let b_old = BoxRef::from_bound_op(op_rc);
             let b_arg = ctx
                 .ensure_box(arg1.to_opref())
                 .expect("body-namespace OpRef must have a BoxRef slot");
@@ -887,9 +859,7 @@ impl OptRewrite {
         }
         // and_x_x: int_and(a, a) => a
         if self.boxes_equal_via_intbound(arg0.to_opref(), arg1.to_opref(), ctx) {
-            let b_old = ctx
-                .ensure_box(op.pos.get())
-                .expect("body-namespace OpRef must have a BoxRef slot");
+            let b_old = BoxRef::from_bound_op(op_rc);
             let b_arg = ctx
                 .ensure_box(arg0.to_opref())
                 .expect("body-namespace OpRef must have a BoxRef slot");
@@ -927,9 +897,7 @@ impl OptRewrite {
             .and_then(|pb| ctx.get_producing_op(&pb))
         {
             if inner.opcode == OpCode::IntAnd && inner.arg(0).to_opref() == arg0.to_opref() {
-                let b_old = ctx
-                    .ensure_box(op.pos.get())
-                    .expect("body-namespace OpRef must have a BoxRef slot");
+                let b_old = BoxRef::from_bound_op(op_rc);
                 let b_arg = ctx
                     .ensure_box(arg1.to_opref())
                     .expect("body-namespace OpRef must have a BoxRef slot");
@@ -948,9 +916,7 @@ impl OptRewrite {
                 .and_then(|b| ctx.peek_intbound_box(&b))
             {
                 if bound.lower >= 0 && bound.upper <= (c & !(c.wrapping_add(1))) {
-                    let b_old = ctx
-                        .ensure_box(op.pos.get())
-                        .expect("body-namespace OpRef must have a BoxRef slot");
+                    let b_old = BoxRef::from_bound_op(op_rc);
                     let b_arg = ctx
                         .ensure_box(arg0.to_opref())
                         .expect("body-namespace OpRef must have a BoxRef slot");
@@ -974,9 +940,7 @@ impl OptRewrite {
             }
             // and_idempotent: int_and(x, y) => x (if y.ones | x.zeros == -1)
             if (bb.tvalue | (!ba.tvalue & !ba.tmask)) == u64::MAX {
-                let b_old = ctx
-                    .ensure_box(op.pos.get())
-                    .expect("body-namespace OpRef must have a BoxRef slot");
+                let b_old = BoxRef::from_bound_op(op_rc);
                 let b_arg = ctx
                     .ensure_box(arg0.to_opref())
                     .expect("body-namespace OpRef must have a BoxRef slot");
@@ -1011,7 +975,7 @@ impl OptRewrite {
 
     /// Try algebraic simplification for INT_OR.
     /// `x | 0 -> x`, `x | -1 -> -1`
-    fn optimize_int_or(&self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
+    fn optimize_int_or(&self, op: &Op, op_rc: &majit_ir::OpRc, ctx: &mut OptContext) -> OptimizationResult {
         let arg0 = op.arg(0);
         let arg1 = op.arg(1);
 
@@ -1033,9 +997,7 @@ impl OptRewrite {
             .get_box_replacement_box(arg1.to_opref())
             .and_then(|b| ctx.get_constant_int_box(&b))
         {
-            let b_old = ctx
-                .ensure_box(op.pos.get())
-                .expect("body-namespace OpRef must have a BoxRef slot");
+            let b_old = BoxRef::from_bound_op(op_rc);
             let b_arg = ctx
                 .ensure_box(arg0.to_opref())
                 .expect("body-namespace OpRef must have a BoxRef slot");
@@ -1046,9 +1008,7 @@ impl OptRewrite {
             .get_box_replacement_box(arg0.to_opref())
             .and_then(|b| ctx.get_constant_int_box(&b))
         {
-            let b_old = ctx
-                .ensure_box(op.pos.get())
-                .expect("body-namespace OpRef must have a BoxRef slot");
+            let b_old = BoxRef::from_bound_op(op_rc);
             let b_arg = ctx
                 .ensure_box(arg1.to_opref())
                 .expect("body-namespace OpRef must have a BoxRef slot");
@@ -1072,9 +1032,7 @@ impl OptRewrite {
         }
         // or_x_x: int_or(a, a) => a
         if self.boxes_equal_via_intbound(arg0.to_opref(), arg1.to_opref(), ctx) {
-            let b_old = ctx
-                .ensure_box(op.pos.get())
-                .expect("body-namespace OpRef must have a BoxRef slot");
+            let b_old = BoxRef::from_bound_op(op_rc);
             let b_arg = ctx
                 .ensure_box(arg0.to_opref())
                 .expect("body-namespace OpRef must have a BoxRef slot");
@@ -1112,9 +1070,7 @@ impl OptRewrite {
             .and_then(|pb| ctx.get_producing_op(&pb))
         {
             if inner.opcode == OpCode::IntOr && inner.arg(0).to_opref() == arg0.to_opref() {
-                let b_old = ctx
-                    .ensure_box(op.pos.get())
-                    .expect("body-namespace OpRef must have a BoxRef slot");
+                let b_old = BoxRef::from_bound_op(op_rc);
                 let b_arg = ctx
                     .ensure_box(arg1.to_opref())
                     .expect("body-namespace OpRef must have a BoxRef slot");
@@ -1163,9 +1119,7 @@ impl OptRewrite {
             }
             // or_idempotent: int_or(x, y) => x (if x.ones | y.zeros == -1)
             if (ba.tvalue | (!bb.tvalue & !bb.tmask)) == u64::MAX {
-                let b_old = ctx
-                    .ensure_box(op.pos.get())
-                    .expect("body-namespace OpRef must have a BoxRef slot");
+                let b_old = BoxRef::from_bound_op(op_rc);
                 let b_arg = ctx
                     .ensure_box(arg0.to_opref())
                     .expect("body-namespace OpRef must have a BoxRef slot");
@@ -1179,7 +1133,7 @@ impl OptRewrite {
 
     /// Try algebraic simplification for INT_XOR.
     /// `x ^ 0 -> x`, `x ^ x -> 0`
-    fn optimize_int_xor(&self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
+    fn optimize_int_xor(&self, op: &Op, op_rc: &majit_ir::OpRc, ctx: &mut OptContext) -> OptimizationResult {
         let arg0 = op.arg(0);
         let arg1 = op.arg(1);
 
@@ -1201,9 +1155,7 @@ impl OptRewrite {
             .get_box_replacement_box(arg1.to_opref())
             .and_then(|b| ctx.get_constant_int_box(&b))
         {
-            let b_old = ctx
-                .ensure_box(op.pos.get())
-                .expect("body-namespace OpRef must have a BoxRef slot");
+            let b_old = BoxRef::from_bound_op(op_rc);
             let b_arg = ctx
                 .ensure_box(arg0.to_opref())
                 .expect("body-namespace OpRef must have a BoxRef slot");
@@ -1214,9 +1166,7 @@ impl OptRewrite {
             .get_box_replacement_box(arg0.to_opref())
             .and_then(|b| ctx.get_constant_int_box(&b))
         {
-            let b_old = ctx
-                .ensure_box(op.pos.get())
-                .expect("body-namespace OpRef must have a BoxRef slot");
+            let b_old = BoxRef::from_bound_op(op_rc);
             let b_arg = ctx
                 .ensure_box(arg1.to_opref())
                 .expect("body-namespace OpRef must have a BoxRef slot");
@@ -1276,9 +1226,7 @@ impl OptRewrite {
             .and_then(|pb| ctx.get_producing_op(&pb))
         {
             if inner.opcode == OpCode::IntXor && inner.arg(1).to_opref() == arg1.to_opref() {
-                let b_old = ctx
-                    .ensure_box(op.pos.get())
-                    .expect("body-namespace OpRef must have a BoxRef slot");
+                let b_old = BoxRef::from_bound_op(op_rc);
                 let b_inner = ctx
                     .ensure_box(inner.arg(0).to_opref())
                     .expect("body-namespace OpRef must have a BoxRef slot");
@@ -1309,7 +1257,7 @@ impl OptRewrite {
 
     /// Try algebraic simplification for INT_LSHIFT.
     /// `x << 0 -> x`
-    fn optimize_int_lshift(&self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
+    fn optimize_int_lshift(&self, op: &Op, op_rc: &majit_ir::OpRc, ctx: &mut OptContext) -> OptimizationResult {
         let arg0 = op.arg(0);
         let arg1 = op.arg(1);
 
@@ -1331,9 +1279,7 @@ impl OptRewrite {
             .get_box_replacement_box(arg1.to_opref())
             .and_then(|b| ctx.get_constant_int_box(&b))
         {
-            let b_old = ctx
-                .ensure_box(op.pos.get())
-                .expect("body-namespace OpRef must have a BoxRef slot");
+            let b_old = BoxRef::from_bound_op(op_rc);
             let b_arg = ctx
                 .ensure_box(arg0.to_opref())
                 .expect("body-namespace OpRef must have a BoxRef slot");
@@ -1470,7 +1416,7 @@ impl OptRewrite {
 
     /// Try algebraic simplification for INT_RSHIFT.
     /// `x >> 0 -> x`
-    fn optimize_int_rshift(&self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
+    fn optimize_int_rshift(&self, op: &Op, op_rc: &majit_ir::OpRc, ctx: &mut OptContext) -> OptimizationResult {
         let arg0 = op.arg(0);
         let arg1 = op.arg(1);
 
@@ -1492,9 +1438,7 @@ impl OptRewrite {
             .get_box_replacement_box(arg1.to_opref())
             .and_then(|b| ctx.get_constant_int_box(&b))
         {
-            let b_old = ctx
-                .ensure_box(op.pos.get())
-                .expect("body-namespace OpRef must have a BoxRef slot");
+            let b_old = BoxRef::from_bound_op(op_rc);
             let b_arg = ctx
                 .ensure_box(arg0.to_opref())
                 .expect("body-namespace OpRef must have a BoxRef slot");
@@ -1537,9 +1481,7 @@ impl OptRewrite {
                         .and_then(|b| ctx.peek_intbound_box(&b)),
                 ) {
                     if bx.lshift_bound_cannot_overflow(&by) {
-                        let b_old = ctx
-                            .ensure_box(op.pos.get())
-                            .expect("body-namespace OpRef must have a BoxRef slot");
+                        let b_old = BoxRef::from_bound_op(op_rc);
                         let b_inner = ctx
                             .ensure_box(inner.arg(0).to_opref())
                             .expect("body-namespace OpRef must have a BoxRef slot");
@@ -1582,7 +1524,7 @@ impl OptRewrite {
 
     /// Try algebraic simplification for UINT_RSHIFT.
     /// `x >>> 0 -> x`
-    fn optimize_uint_rshift(&self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
+    fn optimize_uint_rshift(&self, op: &Op, op_rc: &majit_ir::OpRc, ctx: &mut OptContext) -> OptimizationResult {
         let arg0 = op.arg(0);
         let arg1 = op.arg(1);
 
@@ -1604,9 +1546,7 @@ impl OptRewrite {
             .get_box_replacement_box(arg1.to_opref())
             .and_then(|b| ctx.get_constant_int_box(&b))
         {
-            let b_old = ctx
-                .ensure_box(op.pos.get())
-                .expect("body-namespace OpRef must have a BoxRef slot");
+            let b_old = BoxRef::from_bound_op(op_rc);
             let b_arg = ctx
                 .ensure_box(arg0.to_opref())
                 .expect("body-namespace OpRef must have a BoxRef slot");
@@ -1671,7 +1611,7 @@ impl OptRewrite {
     // ── Unary operations ──
 
     /// Constant fold or simplify INT_NEG.
-    fn optimize_int_neg(&self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
+    fn optimize_int_neg(&self, op: &Op, op_rc: &majit_ir::OpRc, ctx: &mut OptContext) -> OptimizationResult {
         let arg0 = op.arg(0);
 
         if let Some(a) = ctx
@@ -1690,9 +1630,7 @@ impl OptRewrite {
             .and_then(|pb| ctx.get_producing_op(&pb))
         {
             if inner.opcode == OpCode::IntNeg {
-                let b_old = ctx
-                    .ensure_box(op.pos.get())
-                    .expect("body-namespace OpRef must have a BoxRef slot");
+                let b_old = BoxRef::from_bound_op(op_rc);
                 let b_inner = ctx
                     .ensure_box(inner.arg(0).to_opref())
                     .expect("body-namespace OpRef must have a BoxRef slot");
@@ -1705,7 +1643,7 @@ impl OptRewrite {
     }
 
     /// Constant fold or simplify INT_INVERT.
-    fn optimize_int_invert(&self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
+    fn optimize_int_invert(&self, op: &Op, op_rc: &majit_ir::OpRc, ctx: &mut OptContext) -> OptimizationResult {
         let arg0 = op.arg(0);
 
         if let Some(a) = ctx
@@ -1724,9 +1662,7 @@ impl OptRewrite {
             .and_then(|pb| ctx.get_producing_op(&pb))
         {
             if inner.opcode == OpCode::IntInvert {
-                let b_old = ctx
-                    .ensure_box(op.pos.get())
-                    .expect("body-namespace OpRef must have a BoxRef slot");
+                let b_old = BoxRef::from_bound_op(op_rc);
                 let b_inner = ctx
                     .ensure_box(inner.arg(0).to_opref())
                     .expect("body-namespace OpRef must have a BoxRef slot");
@@ -1751,7 +1687,7 @@ impl OptRewrite {
     ///         self.make_equal_to(op, op.getarg(0))
     ///         return
     ///     return self._optimize_nullness(op, op.getarg(0), True)
-    fn optimize_int_is_true(&self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
+    fn optimize_int_is_true(&self, op: &Op, op_rc: &majit_ir::OpRc, ctx: &mut OptContext) -> OptimizationResult {
         let arg0 = op.arg(0);
 
         // rewrite.py:505-510 optimize_INT_IS_TRUE:
@@ -1777,9 +1713,7 @@ impl OptRewrite {
             {
                 if bound.is_bool() {
                     // make_equal_to: replace INT_IS_TRUE result with arg0.
-                    let b_old = ctx
-                        .ensure_box(op.pos.get())
-                        .expect("body-namespace OpRef must have a BoxRef slot");
+                    let b_old = BoxRef::from_bound_op(op_rc);
                     let b_arg = ctx
                         .ensure_box(arg0.to_opref())
                         .expect("body-namespace OpRef must have a BoxRef slot");
@@ -1935,7 +1869,7 @@ impl OptRewrite {
     }
 
     /// Constant fold INT_FORCE_GE_ZERO.
-    fn optimize_int_force_ge_zero(&self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
+    fn optimize_int_force_ge_zero(&self, op: &Op, op_rc: &majit_ir::OpRc, ctx: &mut OptContext) -> OptimizationResult {
         let arg0 = op.arg(0);
 
         if let Some(a) = ctx
@@ -1952,9 +1886,7 @@ impl OptRewrite {
             .and_then(|b| ctx.peek_intbound_box(&b))
         {
             if bound.known_nonnegative() {
-                let b_old = ctx
-                    .ensure_box(op.pos.get())
-                    .expect("body-namespace OpRef must have a BoxRef slot");
+                let b_old = BoxRef::from_bound_op(op_rc);
                 let b_arg = ctx
                     .ensure_box(arg0.to_opref())
                     .expect("body-namespace OpRef must have a BoxRef slot");
@@ -1996,7 +1928,7 @@ impl OptRewrite {
     // ── Comparisons ──
 
     /// Constant fold binary comparisons.
-    fn optimize_comparison(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
+    fn optimize_comparison(&mut self, op: &Op, op_rc: &majit_ir::OpRc, ctx: &mut OptContext) -> OptimizationResult {
         let arg0 = op.arg(0);
         let arg1 = op.arg(1);
 
@@ -2087,9 +2019,7 @@ impl OptRewrite {
                     .and_then(|b| ctx.peek_intbound_box(&b))
                 {
                     if bound.is_bool() {
-                        let b_old = ctx
-                            .ensure_box(op.pos.get())
-                            .expect("body-namespace OpRef must have a BoxRef slot");
+                        let b_old = BoxRef::from_bound_op(op_rc);
                         let b_arg = ctx
                             .ensure_box(arg0.to_opref())
                             .expect("body-namespace OpRef must have a BoxRef slot");
@@ -2516,7 +2446,7 @@ impl OptRewrite {
 
     /// rewrite.py:95-101: _optimize_CALL_INT_UDIV
     /// x / 1 → x
-    fn optimize_call_int_udiv(&mut self, op: &Op, ctx: &mut OptContext) -> bool {
+    fn optimize_call_int_udiv(&mut self, op: &Op, op_rc: &majit_ir::OpRc, ctx: &mut OptContext) -> bool {
         if op.num_args() < 3 {
             return false;
         }
@@ -2525,9 +2455,7 @@ impl OptRewrite {
             .get_box_replacement_box(arg2.to_opref())
             .and_then(|b| ctx.get_constant_int_box(&b))
         {
-            let b_old = ctx
-                .ensure_box(op.pos.get())
-                .expect("body-namespace OpRef must have a BoxRef slot");
+            let b_old = BoxRef::from_bound_op(op_rc);
             let b_arg = ctx
                 .ensure_box(op.arg(1).to_opref())
                 .expect("body-namespace OpRef must have a BoxRef slot");
@@ -2542,6 +2470,7 @@ impl OptRewrite {
     fn optimize_call_int_py_mod(
         &mut self,
         op: &Op,
+        op_rc: &majit_ir::OpRc,
         ctx: &mut OptContext,
     ) -> Option<OptimizationResult> {
         if op.num_args() < 3 {
@@ -2599,9 +2528,7 @@ impl OptRewrite {
             ctx.current_pass_idx,
             ctx,
         );
-        let b_old = ctx
-            .ensure_box(op.pos.get())
-            .expect("body-namespace OpRef must have a BoxRef slot");
+        let b_old = BoxRef::from_bound_op(op_rc);
         let b_res = ctx
             .ensure_box(result_ref)
             .expect("body-namespace OpRef must have a BoxRef slot");
@@ -2614,6 +2541,7 @@ impl OptRewrite {
     fn optimize_call_int_py_div(
         &mut self,
         op: &Op,
+        op_rc: &majit_ir::OpRc,
         ctx: &mut OptContext,
     ) -> Option<OptimizationResult> {
         if op.num_args() < 3 {
@@ -2687,9 +2615,7 @@ impl OptRewrite {
         }
         // rewrite.py:752-755: x // 1 → x
         if val == 1 {
-            let b_old = ctx
-                .ensure_box(op.pos.get())
-                .expect("body-namespace OpRef must have a BoxRef slot");
+            let b_old = BoxRef::from_bound_op(op_rc);
             let b_arg = ctx
                 .ensure_box(arg1.to_opref())
                 .expect("body-namespace OpRef must have a BoxRef slot");
@@ -2717,9 +2643,7 @@ impl OptRewrite {
             ctx.current_pass_idx,
             ctx,
         );
-        let b_old = ctx
-            .ensure_box(op.pos.get())
-            .expect("body-namespace OpRef must have a BoxRef slot");
+        let b_old = BoxRef::from_bound_op(op_rc);
         let b_res = ctx
             .ensure_box(result_ref)
             .expect("body-namespace OpRef must have a BoxRef slot");
@@ -2957,14 +2881,12 @@ impl OptRewrite {
         true
     }
 
-    fn optimize_same_as(&self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
+    fn optimize_same_as(&self, op: &Op, op_rc: &majit_ir::OpRc, ctx: &mut OptContext) -> OptimizationResult {
         if op.num_args() == 0 {
             return OptimizationResult::PassOn;
         }
         let arg0 = op.arg(0);
-        let b_old = ctx
-            .ensure_box(op.pos.get())
-            .expect("body-namespace OpRef must have a BoxRef slot");
+        let b_old = BoxRef::from_bound_op(op_rc);
         let b_arg = ctx
             .ensure_box(arg0.to_opref())
             .expect("body-namespace OpRef must have a BoxRef slot");
@@ -3032,7 +2954,7 @@ impl OptRewrite {
     /// 1. boolinverse(same args)
     /// 2. boolreflex(swapped args)
     /// 3. boolreflex.boolinverse(swapped args)
-    fn find_rewritable_bool(&self, op: &Op, ctx: &mut OptContext) -> Option<OptimizationResult> {
+    fn find_rewritable_bool(&self, op: &Op, op_rc: &majit_ir::OpRc, ctx: &mut OptContext) -> Option<OptimizationResult> {
         if op.num_args() < 2 {
             return None;
         }
@@ -3052,9 +2974,7 @@ impl OptRewrite {
         if let Some(reflex_opcode) = op.opcode.bool_reflex() {
             let key = (reflex_opcode, arg1.to_opref(), arg0.to_opref());
             if let Some(&cached_ref) = self.bool_result_cache.get(&key) {
-                let b_old = ctx
-                    .ensure_box(op.pos.get())
-                    .expect("body-namespace OpRef must have a BoxRef slot");
+                let b_old = BoxRef::from_bound_op(op_rc);
                 let b_cached = ctx
                     .ensure_box(cached_ref)
                     .expect("body-namespace OpRef must have a BoxRef slot");
@@ -3080,7 +3000,7 @@ impl OptRewrite {
     // Constant folding for all float ops is handled by execute_nonspec_const.
 
     /// rewrite.py:103-120 optimize_FLOAT_MUL
-    fn optimize_float_mul(&self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
+    fn optimize_float_mul(&self, op: &Op, op_rc: &majit_ir::OpRc, ctx: &mut OptContext) -> OptimizationResult {
         let arg0 = op.arg(0);
         let arg1 = op.arg(1);
         // rewrite.py:109: for lhs, rhs in [(arg1, arg2), (arg2, arg1)]:
@@ -3094,9 +3014,7 @@ impl OptRewrite {
                 })
             {
                 if v == 1.0 {
-                    let b_old = ctx
-                        .ensure_box(op.pos.get())
-                        .expect("body-namespace OpRef must have a BoxRef slot");
+                    let b_old = BoxRef::from_bound_op(op_rc);
                     let b_v2 = ctx
                         .get_box_replacement_box(rhs.to_opref())
                         .or_else(|| ctx.ensure_box(rhs.to_opref()))
@@ -3152,15 +3070,13 @@ impl OptRewrite {
     }
 
     /// rewrite.py:147-153 optimize_FLOAT_NEG
-    fn optimize_float_neg(&self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
+    fn optimize_float_neg(&self, op: &Op, op_rc: &majit_ir::OpRc, ctx: &mut OptContext) -> OptimizationResult {
         let v = ctx
             .get_box_replacement_box(op.arg(0).to_opref())
             .or_else(|| ctx.ensure_box(op.arg(0).to_opref()));
         if let Some(arg_op) = v.and_then(|pb| ctx.get_producing_op(&pb)) {
             if arg_op.opcode == OpCode::FloatNeg {
-                let b_old = ctx
-                    .ensure_box(op.pos.get())
-                    .expect("body-namespace OpRef must have a BoxRef slot");
+                let b_old = BoxRef::from_bound_op(op_rc);
                 let b_inner = ctx
                     .ensure_box(arg_op.arg(0).to_opref())
                     .expect("body-namespace OpRef must have a BoxRef slot");
@@ -3172,16 +3088,14 @@ impl OptRewrite {
     }
 
     /// rewrite.py:155-161 optimize_FLOAT_ABS
-    fn optimize_float_abs(&self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
+    fn optimize_float_abs(&self, op: &Op, op_rc: &majit_ir::OpRc, ctx: &mut OptContext) -> OptimizationResult {
         let v = ctx
             .get_box_replacement_box(op.arg(0).to_opref())
             .or_else(|| ctx.ensure_box(op.arg(0).to_opref()));
         if let Some(v) = v {
             if let Some(arg_op) = ctx.get_producing_op(&v) {
                 if arg_op.opcode == OpCode::FloatAbs {
-                    let b_old = ctx
-                        .ensure_box(op.pos.get())
-                        .expect("body-namespace OpRef must have a BoxRef slot");
+                    let b_old = BoxRef::from_bound_op(op_rc);
                     ctx.make_equal_to(&b_old, &v);
                     return OptimizationResult::Remove;
                 }
@@ -3209,7 +3123,7 @@ impl OptRewrite {
 }
 
 impl Optimization for OptRewrite {
-    fn propagate_forward(&mut self, op: &Op, _op_rc: &majit_ir::OpRc, ctx: &mut OptContext) -> OptimizationResult {
+    fn propagate_forward(&mut self, op: &Op, op_rc: &majit_ir::OpRc, ctx: &mut OptContext) -> OptimizationResult {
         // Track last_op_removed for GuardNoException optimization.
         // Reset for non-guard ops (guards don't count as "the last op").
         if !op.opcode.is_guard() {
@@ -3218,31 +3132,31 @@ impl Optimization for OptRewrite {
 
         // Try boolean inverse/reflex rewrites for comparisons
         if op.opcode.bool_inverse().is_some() || op.opcode.bool_reflex().is_some() {
-            if let Some(result) = self.find_rewritable_bool(op, ctx) {
+            if let Some(result) = self.find_rewritable_bool(op, op_rc, ctx) {
                 return result;
             }
         }
 
         match op.opcode {
             // ── Binary integer arithmetic ──
-            OpCode::IntAdd => self.optimize_int_add(op, ctx),
-            OpCode::IntSub => self.optimize_int_sub(op, ctx),
-            OpCode::IntMul => self.optimize_int_mul(op, ctx),
-            OpCode::IntFloorDiv => self.optimize_int_floor_div(op, ctx),
-            OpCode::IntMod => self.optimize_int_mod(op, ctx),
-            OpCode::IntAnd => self.optimize_int_and(op, ctx),
-            OpCode::IntOr => self.optimize_int_or(op, ctx),
-            OpCode::IntXor => self.optimize_int_xor(op, ctx),
-            OpCode::IntLshift => self.optimize_int_lshift(op, ctx),
-            OpCode::IntRshift => self.optimize_int_rshift(op, ctx),
-            OpCode::UintRshift => self.optimize_uint_rshift(op, ctx),
+            OpCode::IntAdd => self.optimize_int_add(op, op_rc, ctx),
+            OpCode::IntSub => self.optimize_int_sub(op, op_rc, ctx),
+            OpCode::IntMul => self.optimize_int_mul(op, op_rc, ctx),
+            OpCode::IntFloorDiv => self.optimize_int_floor_div(op, op_rc, ctx),
+            OpCode::IntMod => self.optimize_int_mod(op, op_rc, ctx),
+            OpCode::IntAnd => self.optimize_int_and(op, op_rc, ctx),
+            OpCode::IntOr => self.optimize_int_or(op, op_rc, ctx),
+            OpCode::IntXor => self.optimize_int_xor(op, op_rc, ctx),
+            OpCode::IntLshift => self.optimize_int_lshift(op, op_rc, ctx),
+            OpCode::IntRshift => self.optimize_int_rshift(op, op_rc, ctx),
+            OpCode::UintRshift => self.optimize_uint_rshift(op, op_rc, ctx),
 
             // ── Unary integer operations ──
-            OpCode::IntNeg => self.optimize_int_neg(op, ctx),
-            OpCode::IntInvert => self.optimize_int_invert(op, ctx),
+            OpCode::IntNeg => self.optimize_int_neg(op, op_rc, ctx),
+            OpCode::IntInvert => self.optimize_int_invert(op, op_rc, ctx),
             OpCode::IntIsZero => self.optimize_int_is_zero(op, ctx),
-            OpCode::IntIsTrue => self.optimize_int_is_true(op, ctx),
-            OpCode::IntForceGeZero => self.optimize_int_force_ge_zero(op, ctx),
+            OpCode::IntIsTrue => self.optimize_int_is_true(op, op_rc, ctx),
+            OpCode::IntForceGeZero => self.optimize_int_force_ge_zero(op, op_rc, ctx),
             OpCode::IntBetween => self.optimize_int_between(op, ctx),
 
             // ── Comparisons ──
@@ -3255,7 +3169,7 @@ impl Optimization for OptRewrite {
             | OpCode::UintLt
             | OpCode::UintLe
             | OpCode::UintGt
-            | OpCode::UintGe => self.optimize_comparison(op, ctx),
+            | OpCode::UintGe => self.optimize_comparison(op, op_rc, ctx),
 
             // ── Guards ──
             OpCode::GuardTrue => self.optimize_guard_true(op, ctx),
@@ -3372,13 +3286,13 @@ impl Optimization for OptRewrite {
             }
 
             // ── Float arithmetic ──
-            OpCode::FloatMul => self.optimize_float_mul(op, ctx),
+            OpCode::FloatMul => self.optimize_float_mul(op, op_rc, ctx),
             OpCode::FloatTrueDiv => self.optimize_float_truediv(op, ctx),
-            OpCode::FloatNeg => self.optimize_float_neg(op, ctx),
-            OpCode::FloatAbs => self.optimize_float_abs(op, ctx),
+            OpCode::FloatNeg => self.optimize_float_neg(op, op_rc, ctx),
+            OpCode::FloatAbs => self.optimize_float_abs(op, op_rc, ctx),
 
             // ── Identity ops ──
-            OpCode::SameAsI | OpCode::SameAsR | OpCode::SameAsF => self.optimize_same_as(op, ctx),
+            OpCode::SameAsI | OpCode::SameAsR | OpCode::SameAsF => self.optimize_same_as(op, op_rc, ctx),
 
             // ── Conditional calls ──
             OpCode::CondCallN => {
@@ -3411,9 +3325,7 @@ impl Optimization for OptRewrite {
                 let nullness = self.getnullness(op.arg(0).to_opref(), ctx);
                 // rewrite.py:486-489: INFO_NONNULL → result is arg(0)
                 if nullness == Nullness::Nonnull {
-                    let b_old = ctx
-                        .ensure_box(op.pos.get())
-                        .expect("body-namespace OpRef must have a BoxRef slot");
+                    let b_old = BoxRef::from_bound_op(op_rc);
                     let b_arg = ctx
                         .ensure_box(op.arg(0).to_opref())
                         .expect("body-namespace OpRef must have a BoxRef slot");
@@ -3485,9 +3397,7 @@ impl Optimization for OptRewrite {
             }
             // jtransform.py:1264-1266: CAST_OPAQUE_PTR is identity (no-op).
             OpCode::CastOpaquePtr => {
-                let b_old = ctx
-                    .ensure_box(op.pos.get())
-                    .expect("body-namespace OpRef must have a BoxRef slot");
+                let b_old = BoxRef::from_bound_op(op_rc);
                 let b_arg = ctx
                     .ensure_box(op.arg(0).to_opref())
                     .expect("body-namespace OpRef must have a BoxRef slot");
@@ -3563,19 +3473,19 @@ impl Optimization for OptRewrite {
                         match ei.oopspecindex {
                             // rewrite.py:688: OS_INT_UDIV
                             majit_ir::OopSpecIndex::IntUdiv => {
-                                if self.optimize_call_int_udiv(op, ctx) {
+                                if self.optimize_call_int_udiv(op, op_rc, ctx) {
                                     return OptimizationResult::Remove;
                                 }
                             }
                             // rewrite.py:689: OS_INT_PY_DIV
                             majit_ir::OopSpecIndex::IntPyDiv => {
-                                if let Some(result) = self.optimize_call_int_py_div(op, ctx) {
+                                if let Some(result) = self.optimize_call_int_py_div(op, op_rc, ctx) {
                                     return result;
                                 }
                             }
                             // rewrite.py:692: OS_INT_PY_MOD
                             majit_ir::OopSpecIndex::IntPyMod => {
-                                if let Some(result) = self.optimize_call_int_py_mod(op, ctx) {
+                                if let Some(result) = self.optimize_call_int_py_mod(op, op_rc, ctx) {
                                     return result;
                                 }
                             }
@@ -3645,9 +3555,7 @@ impl Optimization for OptRewrite {
                             }
                             LoopInvariantEntry::Direct(r) => r,
                         };
-                        let b_old = ctx
-                            .ensure_box(op.pos.get())
-                            .expect("body-namespace OpRef must have a BoxRef slot");
+                        let b_old = BoxRef::from_bound_op(op_rc);
                         let b_cached = ctx
                             .get_box_replacement_box(cached_result)
                             .or_else(|| ctx.ensure_box(cached_result))
@@ -3928,7 +3836,9 @@ mod tests {
                 resolved.setarg(i, ctx.get_box_replacement(resolved.arg(i).to_opref()));
             }
 
-            match pass.propagate_forward(&resolved, &std::rc::Rc::new(resolved.clone()), &mut ctx) {
+            let __pf_rc = std::rc::Rc::new(resolved.clone());
+            ctx.bind_input_resops(std::slice::from_ref(&__pf_rc));
+            match pass.propagate_forward(&resolved, &__pf_rc, &mut ctx) {
                 OptimizationResult::Emit(emitted) => {
                     ctx.emit(emitted);
                 }
@@ -3981,7 +3891,9 @@ mod tests {
         ctx.emit(ops[1].clone());
         ctx.make_constant(OpRef::int_op(const_pos as u32), Value::Int(const_val));
         let mut pass = OptRewrite::new();
-        let result = pass.propagate_forward(&ops[2], &std::rc::Rc::new(ops[2].clone()), &mut ctx);
+        let __pf_rc = std::rc::Rc::new(ops[2].clone());
+        ctx.bind_input_resops(std::slice::from_ref(&__pf_rc));
+        let result = pass.propagate_forward(&ops[2], &__pf_rc, &mut ctx);
         assert!(
             matches!(result, OptimizationResult::Remove),
             "{opcode:?} with const {const_val} at pos {const_pos} should Remove"
@@ -4013,7 +3925,9 @@ mod tests {
         ctx.make_constant(OpRef::int_op(0), Value::Int(a));
         ctx.make_constant(OpRef::int_op(1), Value::Int(b));
         let mut pass = OptRewrite::new();
-        let result = pass.propagate_forward(&ops[2], &std::rc::Rc::new(ops[2].clone()), &mut ctx);
+        let __pf_rc = std::rc::Rc::new(ops[2].clone());
+        ctx.bind_input_resops(std::slice::from_ref(&__pf_rc));
+        let result = pass.propagate_forward(&ops[2], &__pf_rc, &mut ctx);
         assert!(
             matches!(result, OptimizationResult::Remove),
             "{opcode:?}({a}, {b}) should constant-fold"
@@ -4042,7 +3956,9 @@ mod tests {
         let mut ctx = OptContext::new(2);
         ctx.emit(ops[0].clone());
         let mut pass = OptRewrite::new();
-        let result = pass.propagate_forward(&ops[1], &std::rc::Rc::new(ops[1].clone()), &mut ctx);
+        let __pf_rc = std::rc::Rc::new(ops[1].clone());
+        ctx.bind_input_resops(std::slice::from_ref(&__pf_rc));
+        let result = pass.propagate_forward(&ops[1], &__pf_rc, &mut ctx);
         assert!(
             matches!(result, OptimizationResult::Remove),
             "{opcode:?}(x, x) should Remove"
@@ -4084,7 +4000,9 @@ mod tests {
         let mut ctx = OptContext::new(2);
         ctx.emit(ops[0].clone());
         let mut pass = OptRewrite::new();
-        let result = pass.propagate_forward(&ops[1], &std::rc::Rc::new(ops[1].clone()), &mut ctx);
+        let __pf_rc = std::rc::Rc::new(ops[1].clone());
+        ctx.bind_input_resops(std::slice::from_ref(&__pf_rc));
+        let result = pass.propagate_forward(&ops[1], &__pf_rc, &mut ctx);
         // x + x may be rewritten to lshift(x, 1) or kept
         assert!(
             !matches!(result, OptimizationResult::PassOn)
@@ -4123,7 +4041,9 @@ mod tests {
         ctx.emit(ops[1].clone());
         ctx.make_constant(OpRef::int_op(1), Value::Int(0));
         let mut pass = OptRewrite::new();
-        let result = pass.propagate_forward(&ops[2], &std::rc::Rc::new(ops[2].clone()), &mut ctx);
+        let __pf_rc = std::rc::Rc::new(ops[2].clone());
+        ctx.bind_input_resops(std::slice::from_ref(&__pf_rc));
+        let result = pass.propagate_forward(&ops[2], &__pf_rc, &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(
             ctx.get_box_replacement_box(OpRef::int_op(2))
@@ -4157,7 +4077,9 @@ mod tests {
         ctx.emit(ops[1].clone());
         ctx.make_constant(OpRef::int_op(1), Value::Int(8));
         let mut pass = OptRewrite::new();
-        let result = pass.propagate_forward(&ops[2], &std::rc::Rc::new(ops[2].clone()), &mut ctx);
+        let __pf_rc = std::rc::Rc::new(ops[2].clone());
+        ctx.bind_input_resops(std::slice::from_ref(&__pf_rc));
+        let result = pass.propagate_forward(&ops[2], &__pf_rc, &mut ctx);
         match result {
             OptimizationResult::Replace(ref new_op) | OptimizationResult::Emit(ref new_op) => {
                 assert_eq!(new_op.opcode, OpCode::IntLshift);
@@ -4188,7 +4110,9 @@ mod tests {
         ctx.emit(ops[1].clone());
         ctx.make_constant(OpRef::int_op(0), Value::Int(0));
         let mut pass = OptRewrite::new();
-        let result = pass.propagate_forward(&ops[2], &std::rc::Rc::new(ops[2].clone()), &mut ctx);
+        let __pf_rc = std::rc::Rc::new(ops[2].clone());
+        ctx.bind_input_resops(std::slice::from_ref(&__pf_rc));
+        let result = pass.propagate_forward(&ops[2], &__pf_rc, &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(
             ctx.get_box_replacement_box(OpRef::int_op(2))
@@ -4222,7 +4146,9 @@ mod tests {
         ctx.emit(ops[1].clone());
         ctx.make_constant(OpRef::int_op(1), Value::Int(1));
         let mut pass = OptRewrite::new();
-        let result = pass.propagate_forward(&ops[2], &std::rc::Rc::new(ops[2].clone()), &mut ctx);
+        let __pf_rc = std::rc::Rc::new(ops[2].clone());
+        ctx.bind_input_resops(std::slice::from_ref(&__pf_rc));
+        let result = pass.propagate_forward(&ops[2], &__pf_rc, &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(
             ctx.get_box_replacement_box(OpRef::int_op(2))
@@ -4271,7 +4197,9 @@ mod tests {
         ctx.emit(ops[0].clone());
         ctx.make_constant(OpRef::int_op(0), Value::Int(42));
         let mut pass = OptRewrite::new();
-        let result = pass.propagate_forward(&ops[1], &std::rc::Rc::new(ops[1].clone()), &mut ctx);
+        let __pf_rc = std::rc::Rc::new(ops[1].clone());
+        ctx.bind_input_resops(std::slice::from_ref(&__pf_rc));
+        let result = pass.propagate_forward(&ops[1], &__pf_rc, &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(
             ctx.get_box_replacement_box(OpRef::int_op(1))
@@ -4288,7 +4216,9 @@ mod tests {
         let mut ctx2 = OptContext::new(2);
         ctx2.emit(ops2[0].clone());
         ctx2.make_constant(OpRef::int_op(0), Value::Int(0xFF));
-        let result2 = pass.propagate_forward(&ops2[1], &std::rc::Rc::new(ops2[1].clone()), &mut ctx2);
+        let __pf_rc = std::rc::Rc::new(ops2[1].clone());
+        ctx2.bind_input_resops(std::slice::from_ref(&__pf_rc));
+        let result2 = pass.propagate_forward(&ops2[1], &__pf_rc, &mut ctx2);
         assert!(matches!(result2, OptimizationResult::Remove));
         assert_eq!(
             ctx2.get_box_replacement_box(OpRef::int_op(1))
@@ -4309,7 +4239,9 @@ mod tests {
         let mut ctx = OptContext::new(2);
         ctx.emit(ops[0].clone());
         ctx.make_constant(OpRef::int_op(0), Value::Int(0));
-        let result = pass.propagate_forward(&ops[1], &std::rc::Rc::new(ops[1].clone()), &mut ctx);
+        let __pf_rc = std::rc::Rc::new(ops[1].clone());
+        ctx.bind_input_resops(std::slice::from_ref(&__pf_rc));
+        let result = pass.propagate_forward(&ops[1], &__pf_rc, &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(
             ctx.get_box_replacement_box(OpRef::int_op(1))
@@ -4326,7 +4258,9 @@ mod tests {
         let mut ctx2 = OptContext::new(2);
         ctx2.emit(ops2[0].clone());
         ctx2.make_constant(OpRef::int_op(0), Value::Int(5));
-        let result2 = pass.propagate_forward(&ops2[1], &std::rc::Rc::new(ops2[1].clone()), &mut ctx2);
+        let __pf_rc = std::rc::Rc::new(ops2[1].clone());
+        ctx2.bind_input_resops(std::slice::from_ref(&__pf_rc));
+        let result2 = pass.propagate_forward(&ops2[1], &__pf_rc, &mut ctx2);
         assert!(matches!(result2, OptimizationResult::Remove));
         assert_eq!(
             ctx2.get_box_replacement_box(OpRef::int_op(1))
@@ -4358,7 +4292,9 @@ mod tests {
         ctx.make_constant(OpRef::int_op(0), Value::Int(1));
 
         let mut pass = OptRewrite::new();
-        let result = pass.propagate_forward(&ops[1], &std::rc::Rc::new(ops[1].clone()), &mut ctx);
+        let __pf_rc = std::rc::Rc::new(ops[1].clone());
+        ctx.bind_input_resops(std::slice::from_ref(&__pf_rc));
+        let result = pass.propagate_forward(&ops[1], &__pf_rc, &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
     }
 
@@ -4392,7 +4328,9 @@ mod tests {
         ctx.emit(ops[0].clone());
 
         let mut pass = OptRewrite::new();
-        let result = pass.propagate_forward(&ops[1], &std::rc::Rc::new(ops[1].clone()), &mut ctx);
+        let __pf_rc = std::rc::Rc::new(ops[1].clone());
+        ctx.bind_input_resops(std::slice::from_ref(&__pf_rc));
+        let result = pass.propagate_forward(&ops[1], &__pf_rc, &mut ctx);
         assert!(matches!(result, OptimizationResult::PassOn));
     }
 
@@ -4408,7 +4346,9 @@ mod tests {
         ctx.make_constant(OpRef::int_op(0), Value::Int(0));
 
         let mut pass = OptRewrite::new();
-        let result = pass.propagate_forward(&ops[1], &std::rc::Rc::new(ops[1].clone()), &mut ctx);
+        let __pf_rc = std::rc::Rc::new(ops[1].clone());
+        ctx.bind_input_resops(std::slice::from_ref(&__pf_rc));
+        let result = pass.propagate_forward(&ops[1], &__pf_rc, &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
     }
 
@@ -4452,7 +4392,9 @@ mod tests {
         ctx.make_constant(OpRef::int_op(1), Value::Int(42));
 
         let mut pass = OptRewrite::new();
-        let result = pass.propagate_forward(&ops[2], &std::rc::Rc::new(ops[2].clone()), &mut ctx);
+        let __pf_rc = std::rc::Rc::new(ops[2].clone());
+        ctx.bind_input_resops(std::slice::from_ref(&__pf_rc));
+        let result = pass.propagate_forward(&ops[2], &__pf_rc, &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
     }
 
@@ -4469,7 +4411,9 @@ mod tests {
         ctx.emit(ops[0].clone());
 
         let mut pass = OptRewrite::new();
-        let result = pass.propagate_forward(&ops[1], &std::rc::Rc::new(ops[1].clone()), &mut ctx);
+        let __pf_rc = std::rc::Rc::new(ops[1].clone());
+        ctx.bind_input_resops(std::slice::from_ref(&__pf_rc));
+        let result = pass.propagate_forward(&ops[1], &__pf_rc, &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(
             ctx.get_box_replacement(OpRef::int_op(1)).to_opref(),
@@ -4513,7 +4457,9 @@ mod tests {
             for i in 0..resolved.num_args() {
                 resolved.setarg(i, ctx.get_box_replacement(resolved.arg(i).to_opref()));
             }
-            match pass.propagate_forward(&resolved, &std::rc::Rc::new(resolved.clone()), &mut ctx) {
+            let __pf_rc = std::rc::Rc::new(resolved.clone());
+            ctx.bind_input_resops(std::slice::from_ref(&__pf_rc));
+            match pass.propagate_forward(&resolved, &__pf_rc, &mut ctx) {
                 OptimizationResult::Emit(emitted) => {
                     ctx.emit(emitted);
                 }
@@ -4574,7 +4520,9 @@ mod tests {
                 for i in 0..resolved.num_args() {
                     resolved.setarg(i, ctx.get_box_replacement(resolved.arg(i).to_opref()));
                 }
-                match pass.propagate_forward(&resolved, &std::rc::Rc::new(resolved.clone()), &mut ctx) {
+                let __pf_rc = std::rc::Rc::new(resolved.clone());
+                ctx.bind_input_resops(std::slice::from_ref(&__pf_rc));
+                match pass.propagate_forward(&resolved, &__pf_rc, &mut ctx) {
                     OptimizationResult::Emit(emitted) => {
                         ctx.emit(emitted);
                     }
@@ -4621,7 +4569,9 @@ mod tests {
         ctx.make_constant(OpRef::int_op(1), Value::Int(1));
 
         let mut pass = OptRewrite::new();
-        let result = pass.propagate_forward(&ops[2], &std::rc::Rc::new(ops[2].clone()), &mut ctx);
+        let __pf_rc = std::rc::Rc::new(ops[2].clone());
+        ctx.bind_input_resops(std::slice::from_ref(&__pf_rc));
+        let result = pass.propagate_forward(&ops[2], &__pf_rc, &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(
             ctx.get_box_replacement_box(OpRef::int_op(2))
@@ -4652,7 +4602,9 @@ mod tests {
         ctx.make_constant(OpRef::int_op(0), Value::Int(0));
 
         let mut pass = OptRewrite::new();
-        let result = pass.propagate_forward(&ops[2], &std::rc::Rc::new(ops[2].clone()), &mut ctx);
+        let __pf_rc = std::rc::Rc::new(ops[2].clone());
+        ctx.bind_input_resops(std::slice::from_ref(&__pf_rc));
+        let result = pass.propagate_forward(&ops[2], &__pf_rc, &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(
             ctx.get_box_replacement_box(OpRef::int_op(2))
@@ -4681,7 +4633,9 @@ mod tests {
         ctx.make_constant(OpRef::int_op(0), Value::Int(0));
 
         let mut pass = OptRewrite::new();
-        let result = pass.propagate_forward(&ops[2], &std::rc::Rc::new(ops[2].clone()), &mut ctx);
+        let __pf_rc = std::rc::Rc::new(ops[2].clone());
+        ctx.bind_input_resops(std::slice::from_ref(&__pf_rc));
+        let result = pass.propagate_forward(&ops[2], &__pf_rc, &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(
             ctx.get_box_replacement_box(OpRef::int_op(2))
@@ -4711,7 +4665,9 @@ mod tests {
         ctx.emit(ops[1].clone());
 
         let mut pass = OptRewrite::new();
-        let result = pass.propagate_forward(&ops[2], &std::rc::Rc::new(ops[2].clone()), &mut ctx);
+        let __pf_rc = std::rc::Rc::new(ops[2].clone());
+        ctx.bind_input_resops(std::slice::from_ref(&__pf_rc));
+        let result = pass.propagate_forward(&ops[2], &__pf_rc, &mut ctx);
         assert!(matches!(result, OptimizationResult::PassOn));
     }
 
@@ -4728,7 +4684,9 @@ mod tests {
         let mut ctx = OptContext::new(1);
 
         let mut pass = OptRewrite::new();
-        let result = pass.propagate_forward(&ops[0], &std::rc::Rc::new(ops[0].clone()), &mut ctx);
+        let __pf_rc = std::rc::Rc::new(ops[0].clone());
+        ctx.bind_input_resops(std::slice::from_ref(&__pf_rc));
+        let result = pass.propagate_forward(&ops[0], &__pf_rc, &mut ctx);
         assert!(matches!(result, OptimizationResult::PassOn));
     }
 
@@ -4755,7 +4713,9 @@ mod tests {
         ctx.make_constant(OpRef::int_op(1), Value::Int(0x0F));
 
         let mut pass = OptRewrite::new();
-        let result = pass.propagate_forward(&ops[2], &std::rc::Rc::new(ops[2].clone()), &mut ctx);
+        let __pf_rc = std::rc::Rc::new(ops[2].clone());
+        ctx.bind_input_resops(std::slice::from_ref(&__pf_rc));
+        let result = pass.propagate_forward(&ops[2], &__pf_rc, &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(
             ctx.get_box_replacement_box(OpRef::int_op(2))
@@ -4787,7 +4747,9 @@ mod tests {
         ctx.make_constant(OpRef::int_op(1), Value::Int(0x0F));
 
         let mut pass = OptRewrite::new();
-        let result = pass.propagate_forward(&ops[2], &std::rc::Rc::new(ops[2].clone()), &mut ctx);
+        let __pf_rc = std::rc::Rc::new(ops[2].clone());
+        ctx.bind_input_resops(std::slice::from_ref(&__pf_rc));
+        let result = pass.propagate_forward(&ops[2], &__pf_rc, &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(
             ctx.get_box_replacement_box(OpRef::int_op(2))
@@ -4818,7 +4780,9 @@ mod tests {
         ctx.make_constant(OpRef::int_op(1), Value::Int(0));
 
         let mut pass = OptRewrite::new();
-        let result = pass.propagate_forward(&ops[2], &std::rc::Rc::new(ops[2].clone()), &mut ctx);
+        let __pf_rc = std::rc::Rc::new(ops[2].clone());
+        ctx.bind_input_resops(std::slice::from_ref(&__pf_rc));
+        let result = pass.propagate_forward(&ops[2], &__pf_rc, &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(
             ctx.get_box_replacement(OpRef::int_op(2)).to_opref(),
@@ -4847,7 +4811,9 @@ mod tests {
         ctx.make_constant(OpRef::int_op(1), Value::Int(1));
 
         let mut pass = OptRewrite::new();
-        let result = pass.propagate_forward(&ops[2], &std::rc::Rc::new(ops[2].clone()), &mut ctx);
+        let __pf_rc = std::rc::Rc::new(ops[2].clone());
+        ctx.bind_input_resops(std::slice::from_ref(&__pf_rc));
+        let result = pass.propagate_forward(&ops[2], &__pf_rc, &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
         // u64::MAX >> 1 = i64::MAX
         assert_eq!(
@@ -4879,7 +4845,9 @@ mod tests {
         ctx.make_constant(OpRef::float_op(1), Value::Float(1.0));
 
         let mut pass = OptRewrite::new();
-        let result = pass.propagate_forward(&ops[2], &std::rc::Rc::new(ops[2].clone()), &mut ctx);
+        let __pf_rc = std::rc::Rc::new(ops[2].clone());
+        ctx.bind_input_resops(std::slice::from_ref(&__pf_rc));
+        let result = pass.propagate_forward(&ops[2], &__pf_rc, &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(
             ctx.get_box_replacement(OpRef::float_op(2)).to_opref(),
@@ -4907,7 +4875,9 @@ mod tests {
         ctx.make_constant(OpRef::float_op(0), Value::Float(1.0));
 
         let mut pass = OptRewrite::new();
-        let result = pass.propagate_forward(&ops[2], &std::rc::Rc::new(ops[2].clone()), &mut ctx);
+        let __pf_rc = std::rc::Rc::new(ops[2].clone());
+        ctx.bind_input_resops(std::slice::from_ref(&__pf_rc));
+        let result = pass.propagate_forward(&ops[2], &__pf_rc, &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(
             ctx.get_box_replacement(OpRef::float_op(2)).to_opref(),
@@ -4929,12 +4899,16 @@ mod tests {
 
         let mut pass = OptRewrite::new();
         // Process op1 first (pass it through)
-        let result1 = pass.propagate_forward(&ops[1], &std::rc::Rc::new(ops[1].clone()), &mut ctx);
+        let __pf_rc = std::rc::Rc::new(ops[1].clone());
+        ctx.bind_input_resops(std::slice::from_ref(&__pf_rc));
+        let result1 = pass.propagate_forward(&ops[1], &__pf_rc, &mut ctx);
         assert!(matches!(result1, OptimizationResult::PassOn));
         ctx.emit(ops[1].clone());
 
         // Process op2: should detect double negation
-        let result2 = pass.propagate_forward(&ops[2], &std::rc::Rc::new(ops[2].clone()), &mut ctx);
+        let __pf_rc = std::rc::Rc::new(ops[2].clone());
+        ctx.bind_input_resops(std::slice::from_ref(&__pf_rc));
+        let result2 = pass.propagate_forward(&ops[2], &__pf_rc, &mut ctx);
         assert!(matches!(result2, OptimizationResult::Remove));
         assert_eq!(
             ctx.get_box_replacement(OpRef::float_op(2)).to_opref(),
@@ -4963,7 +4937,9 @@ mod tests {
         ctx.make_constant(OpRef::float_op(1), Value::Float(2.0));
 
         let mut pass = OptRewrite::new();
-        let result = pass.propagate_forward(&ops[2], &std::rc::Rc::new(ops[2].clone()), &mut ctx);
+        let __pf_rc = std::rc::Rc::new(ops[2].clone());
+        ctx.bind_input_resops(std::slice::from_ref(&__pf_rc));
+        let result = pass.propagate_forward(&ops[2], &__pf_rc, &mut ctx);
         assert!(matches!(result, OptimizationResult::Emit(_)));
     }
 
@@ -4987,7 +4963,9 @@ mod tests {
         ctx.emit(ops[1].clone());
 
         let mut pass = OptRewrite::new();
-        let result = pass.propagate_forward(&ops[2], &std::rc::Rc::new(ops[2].clone()), &mut ctx);
+        let __pf_rc = std::rc::Rc::new(ops[2].clone());
+        ctx.bind_input_resops(std::slice::from_ref(&__pf_rc));
+        let result = pass.propagate_forward(&ops[2], &__pf_rc, &mut ctx);
         assert!(matches!(result, OptimizationResult::PassOn));
     }
 
@@ -5017,7 +4995,9 @@ mod tests {
         ctx.make_constant(OpRef::int_op(0), Value::Int(0));
 
         let mut pass = OptRewrite::new();
-        let result = pass.propagate_forward(&ops[3], &std::rc::Rc::new(ops[3].clone()), &mut ctx);
+        let __pf_rc = std::rc::Rc::new(ops[3].clone());
+        ctx.bind_input_resops(std::slice::from_ref(&__pf_rc));
+        let result = pass.propagate_forward(&ops[3], &__pf_rc, &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
     }
 
@@ -5045,7 +5025,9 @@ mod tests {
         ctx.make_constant(OpRef::int_op(0), Value::Int(1));
 
         let mut pass = OptRewrite::new();
-        let result = pass.propagate_forward(&ops[3], &std::rc::Rc::new(ops[3].clone()), &mut ctx);
+        let __pf_rc = std::rc::Rc::new(ops[3].clone());
+        ctx.bind_input_resops(std::slice::from_ref(&__pf_rc));
+        let result = pass.propagate_forward(&ops[3], &__pf_rc, &mut ctx);
         match result {
             OptimizationResult::Replace(op) => {
                 assert_eq!(op.opcode, OpCode::CallN);
@@ -5084,7 +5066,9 @@ mod tests {
         ctx.make_constant(OpRef::int_op(0), Value::Int(42));
 
         let mut pass = OptRewrite::new();
-        let result = pass.propagate_forward(&ops[3], &std::rc::Rc::new(ops[3].clone()), &mut ctx);
+        let __pf_rc = std::rc::Rc::new(ops[3].clone());
+        ctx.bind_input_resops(std::slice::from_ref(&__pf_rc));
+        let result = pass.propagate_forward(&ops[3], &__pf_rc, &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
         let resolved = ctx.get_box_replacement(OpRef::int_op(3)).to_opref();
         assert!(resolved.is_constant());
@@ -5119,7 +5103,9 @@ mod tests {
         ctx.make_constant(OpRef::int_op(0), Value::Int(0));
 
         let mut pass = OptRewrite::new();
-        let result = pass.propagate_forward(&ops[3], &std::rc::Rc::new(ops[3].clone()), &mut ctx);
+        let __pf_rc = std::rc::Rc::new(ops[3].clone());
+        ctx.bind_input_resops(std::slice::from_ref(&__pf_rc));
+        let result = pass.propagate_forward(&ops[3], &__pf_rc, &mut ctx);
         match result {
             OptimizationResult::Replace(op) => {
                 assert_eq!(op.opcode, OpCode::CallPureI);
@@ -5153,7 +5139,9 @@ mod tests {
         ctx.emit(ops[0].clone());
 
         let mut pass = OptRewrite::new();
-        let result = pass.propagate_forward(&ops[1], &std::rc::Rc::new(ops[1].clone()), &mut ctx);
+        let __pf_rc = std::rc::Rc::new(ops[1].clone());
+        ctx.bind_input_resops(std::slice::from_ref(&__pf_rc));
+        let result = pass.propagate_forward(&ops[1], &__pf_rc, &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(
             ctx.get_box_replacement_box(OpRef::int_op(1))
@@ -5180,7 +5168,9 @@ mod tests {
         ctx.emit(ops[0].clone());
 
         let mut pass = OptRewrite::new();
-        let result = pass.propagate_forward(&ops[1], &std::rc::Rc::new(ops[1].clone()), &mut ctx);
+        let __pf_rc = std::rc::Rc::new(ops[1].clone());
+        ctx.bind_input_resops(std::slice::from_ref(&__pf_rc));
+        let result = pass.propagate_forward(&ops[1], &__pf_rc, &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(
             ctx.get_box_replacement_box(OpRef::int_op(1))
@@ -5207,7 +5197,9 @@ mod tests {
         ctx.emit(ops[0].clone());
 
         let mut pass = OptRewrite::new();
-        let result = pass.propagate_forward(&ops[1], &std::rc::Rc::new(ops[1].clone()), &mut ctx);
+        let __pf_rc = std::rc::Rc::new(ops[1].clone());
+        ctx.bind_input_resops(std::slice::from_ref(&__pf_rc));
+        let result = pass.propagate_forward(&ops[1], &__pf_rc, &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(
             ctx.get_box_replacement_box(OpRef::int_op(1))
@@ -5234,7 +5226,9 @@ mod tests {
         ctx.emit(ops[0].clone());
 
         let mut pass = OptRewrite::new();
-        let result = pass.propagate_forward(&ops[1], &std::rc::Rc::new(ops[1].clone()), &mut ctx);
+        let __pf_rc = std::rc::Rc::new(ops[1].clone());
+        ctx.bind_input_resops(std::slice::from_ref(&__pf_rc));
+        let result = pass.propagate_forward(&ops[1], &__pf_rc, &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(
             ctx.get_box_replacement_box(OpRef::int_op(1))
@@ -5273,7 +5267,9 @@ mod tests {
         ctx.make_constant(OpRef::ref_op(1), Value::Ref(GcRef(200)));
 
         let mut pass = OptRewrite::new();
-        let result = pass.propagate_forward(&ops[2], &std::rc::Rc::new(ops[2].clone()), &mut ctx);
+        let __pf_rc = std::rc::Rc::new(ops[2].clone());
+        ctx.bind_input_resops(std::slice::from_ref(&__pf_rc));
+        let result = pass.propagate_forward(&ops[2], &__pf_rc, &mut ctx);
         // rewrite.py:564 `return self.emit(op)` — rewrite passes the op on
         // unchanged; it does not fold distinct constants.
         assert!(matches!(result, OptimizationResult::PassOn));
@@ -5302,7 +5298,9 @@ mod tests {
         ctx.emit(ops[0].clone());
 
         let mut pass = OptRewrite::new();
-        let result = pass.propagate_forward(&ops[1], &std::rc::Rc::new(ops[1].clone()), &mut ctx);
+        let __pf_rc = std::rc::Rc::new(ops[1].clone());
+        ctx.bind_input_resops(std::slice::from_ref(&__pf_rc));
+        let result = pass.propagate_forward(&ops[1], &__pf_rc, &mut ctx);
         assert!(matches!(result, OptimizationResult::PassOn));
     }
 
@@ -5321,7 +5319,9 @@ mod tests {
         ctx.emit(ops[0].clone());
 
         let mut pass = OptRewrite::new();
-        let result = pass.propagate_forward(&ops[1], &std::rc::Rc::new(ops[1].clone()), &mut ctx);
+        let __pf_rc = std::rc::Rc::new(ops[1].clone());
+        ctx.bind_input_resops(std::slice::from_ref(&__pf_rc));
+        let result = pass.propagate_forward(&ops[1], &__pf_rc, &mut ctx);
         assert!(matches!(result, OptimizationResult::PassOn));
     }
 
@@ -5340,7 +5340,9 @@ mod tests {
         ctx.emit(ops[0].clone());
 
         let mut pass = OptRewrite::new();
-        let result = pass.propagate_forward(&ops[1], &std::rc::Rc::new(ops[1].clone()), &mut ctx);
+        let __pf_rc = std::rc::Rc::new(ops[1].clone());
+        ctx.bind_input_resops(std::slice::from_ref(&__pf_rc));
+        let result = pass.propagate_forward(&ops[1], &__pf_rc, &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(
             ctx.get_box_replacement(OpRef::ref_op(1)).to_opref(),
@@ -5367,7 +5369,9 @@ mod tests {
         ctx.emit(ops[0].clone());
 
         let mut pass = OptRewrite::new();
-        let result = pass.propagate_forward(&ops[1], &std::rc::Rc::new(ops[1].clone()), &mut ctx);
+        let __pf_rc = std::rc::Rc::new(ops[1].clone());
+        ctx.bind_input_resops(std::slice::from_ref(&__pf_rc));
+        let result = pass.propagate_forward(&ops[1], &__pf_rc, &mut ctx);
         assert!(matches!(result, OptimizationResult::PassOn));
     }
 
@@ -5385,7 +5389,9 @@ mod tests {
         ctx.emit(ops[0].clone());
 
         let mut pass = OptRewrite::new();
-        let result = pass.propagate_forward(&ops[1], &std::rc::Rc::new(ops[1].clone()), &mut ctx);
+        let __pf_rc = std::rc::Rc::new(ops[1].clone());
+        ctx.bind_input_resops(std::slice::from_ref(&__pf_rc));
+        let result = pass.propagate_forward(&ops[1], &__pf_rc, &mut ctx);
         // PassOn: op is emitted, no replacement registered.
         assert!(matches!(result, OptimizationResult::PassOn));
     }
@@ -5415,11 +5421,15 @@ mod tests {
 
         let mut pass = OptRewrite::new();
         // Process CondCallN -> removed
-        let result2 = pass.propagate_forward(&ops[2], &std::rc::Rc::new(ops[2].clone()), &mut ctx);
+        let __pf_rc = std::rc::Rc::new(ops[2].clone());
+        ctx.bind_input_resops(std::slice::from_ref(&__pf_rc));
+        let result2 = pass.propagate_forward(&ops[2], &__pf_rc, &mut ctx);
         assert!(matches!(result2, OptimizationResult::Remove));
 
         // Process GuardNoException -> should also be removed
-        let result3 = pass.propagate_forward(&ops[3], &std::rc::Rc::new(ops[3].clone()), &mut ctx);
+        let __pf_rc = std::rc::Rc::new(ops[3].clone());
+        ctx.bind_input_resops(std::slice::from_ref(&__pf_rc));
+        let result3 = pass.propagate_forward(&ops[3], &__pf_rc, &mut ctx);
         assert!(matches!(result3, OptimizationResult::Remove));
     }
 
@@ -5437,12 +5447,16 @@ mod tests {
 
         let mut pass = OptRewrite::new();
         // Process CallN -> PassOn (not handled by OptRewrite)
-        let result1 = pass.propagate_forward(&ops[1], &std::rc::Rc::new(ops[1].clone()), &mut ctx);
+        let __pf_rc = std::rc::Rc::new(ops[1].clone());
+        ctx.bind_input_resops(std::slice::from_ref(&__pf_rc));
+        let result1 = pass.propagate_forward(&ops[1], &__pf_rc, &mut ctx);
         assert!(matches!(result1, OptimizationResult::PassOn));
         ctx.emit(ops[1].clone());
 
         // Process GuardNoException -> should NOT be removed
-        let result2 = pass.propagate_forward(&ops[2], &std::rc::Rc::new(ops[2].clone()), &mut ctx);
+        let __pf_rc = std::rc::Rc::new(ops[2].clone());
+        ctx.bind_input_resops(std::slice::from_ref(&__pf_rc));
+        let result2 = pass.propagate_forward(&ops[2], &__pf_rc, &mut ctx);
         assert!(matches!(result2, OptimizationResult::PassOn));
     }
 
@@ -5453,7 +5467,9 @@ mod tests {
         op.pos.set(OpRef::void_op(0));
         let mut ctx = OptContext::new(1);
         let mut pass = OptRewrite::new();
-        let result = pass.propagate_forward(&op, &std::rc::Rc::new(op.clone()), &mut ctx);
+        let __pf_rc = std::rc::Rc::new(op.clone());
+        ctx.bind_input_resops(std::slice::from_ref(&__pf_rc));
+        let result = pass.propagate_forward(&op, &__pf_rc, &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
         assert!(ctx.patchguardop.is_some());
         assert_eq!(
