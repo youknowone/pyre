@@ -10265,7 +10265,10 @@ mod tests {
         // fallthrough_pc=3 with no live boxes.
         let all_liveness = vec![0u8, 0, 0];
         let mut insns: VecAssoc<String, u8> = VecAssoc::new();
-        insns.insert("live/".to_string(), majit_metainterp::jitcode::insns::BC_LIVE);
+        insns.insert(
+            "live/".to_string(),
+            majit_metainterp::jitcode::insns::BC_LIVE,
+        );
         crate::assembler::publish_state(&insns, &all_liveness, all_liveness.len(), 1);
 
         // Outer (caller) jitcode: BC_LIVE at byte 0 and byte 3.  Identity

@@ -494,9 +494,22 @@ verdict's "index registration UNIMPLEMENTED" was overstated.)
     (already used by every inline call) — the genuinely unproven part (that the
     real Python jitcode's fallthrough `code[position-1]` IS the append's result
     slot) is still increment 6's job; see LOAD-BEARING UNPROVEN below.
-  - **Increment 3-5 (tracer wiring):** memoized `ensure_list_append_resize_helper_index()`
-    (thread_local Cell, build payload BEFORE the METAINTERP_SD borrow — `intern_liveness`
-    re-borrows it → nested-borrow panic otherwise); `capture_resumedata_with_synthetic_callee`
+  - **Increment 3 — memoized helper index — LANDED (tested, both backends).**
+    `ensure_list_append_resize_helper_index()` (state.rs free fn) →
+    `MetaInterpStaticData::ensure_list_append_resize_helper_jitcode` registers the
+    payload once and caches the index in a NEW SD field
+    `list_append_resize_helper_index: Option<i32>` (NOT a thread_local Cell — the
+    field is reset-safe: it lives/dies with the `jitcodes` table, and the index
+    stays valid because `set_jitcodes_from_make_result` only updates
+    W_CodeObject-keyed entries [helper carries null `w_code`] and appends, never
+    shifting an existing index). The "build BEFORE the METAINTERP_SD borrow /
+    intern_liveness nested-borrow" caveat is MOOT — the inc.1 builder uses a
+    throwaway local `Assembler`, touching no thread-local, so the build is safe
+    even inside `borrow_mut`. Test
+    `ensure_list_append_resize_helper_index_is_stable_and_resolves`: second call
+    returns same index; resolves to a populated non-skeleton null-`w_code` payload
+    with identity pc_map. 235/235 lib tests both backends.
+  - **Increment 4-5 (tracer wiring) — REMAINING:** `capture_resumedata_with_synthetic_callee`
     on MIFrame (saves/restores orgpc+vable_last_instr+vable_valuestackdepth like
     capture_resumedata trace_opcode.rs:3742-3771, sets orgpc=fallthrough before the
     build); `generate_guard_with_synthetic_callee` (record_guard_typed BEFORE

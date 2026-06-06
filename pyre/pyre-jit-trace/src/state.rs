@@ -138,6 +138,15 @@ struct MetaInterpStaticData {
     /// `state::bytecode_for_address`) and from future callers that
     /// hold a `&mut MetaInterpStaticData` directly.
     canonical: majit_metainterp::MetaInterpStaticData,
+    /// Issue #143: memoized index of the folded `list.append` resize
+    /// helper jitcode (`build_list_append_resize_helper_payload`) inside
+    /// `jitcodes`. Registered lazily on the first guard that needs it and
+    /// reused thereafter. Stored ON the SD (not a process-global) so it is
+    /// reset-safe: it lives and dies with this `jitcodes` table. The index
+    /// stays valid because `set_jitcodes_from_make_result` only updates
+    /// W_CodeObject-keyed entries (the helper carries a null `w_code`) and
+    /// appends new ones, never shifting an existing index.
+    list_append_resize_helper_index: Option<i32>,
 }
 
 #[allow(dead_code)]
@@ -156,7 +165,28 @@ impl MetaInterpStaticData {
             op_float_return: u8::MAX,
             op_void_return: u8::MAX,
             canonical: majit_metainterp::MetaInterpStaticData::new(),
+            list_append_resize_helper_index: None,
         }
+    }
+
+    /// Issue #143: return the `jitcodes` index of the folded `list.append`
+    /// resize helper, registering it on first use.
+    ///
+    /// The helper has no backing `W_CodeObject`; it is built by
+    /// [`build_list_append_resize_helper_payload`] and registered through
+    /// [`Self::register_runtime_helper_jitcode`] with an identity
+    /// `pc_map`. The resulting index is cached on the SD and reused, so the
+    /// helper is registered exactly once per `jitcodes` table.
+    fn ensure_list_append_resize_helper_jitcode(&mut self) -> i32 {
+        if let Some(index) = self.list_append_resize_helper_index {
+            return index;
+        }
+        // Built before registration; the builder touches no thread-local
+        // state, so this is safe even while `METAINTERP_SD` is borrowed.
+        let payload = build_list_append_resize_helper_payload();
+        let index = self.register_runtime_helper_jitcode(payload);
+        self.list_append_resize_helper_index = Some(index);
+        index
     }
 
     /// pyjitpl.py:2248-2249 `setup_indirectcalltargets(indirectcalltargets)`.
@@ -897,6 +927,17 @@ pub fn raw_code_for_jitcode_index(jitcode_index: i32) -> Option<*const CodeObjec
         let idx = jitcode_index as usize;
         sd.jitcodes.get(idx).map(|jc| unsafe { jc.raw_code() })
     })
+}
+
+/// Issue #143: register (once) the folded `list.append` resize helper
+/// jitcode in the thread-local `METAINTERP_SD` and return its stable
+/// `jitcodes` index. The synthetic callee-frame snapshot a failing resize
+/// guard records (`build_synthetic_callee_frames`) stores this index so
+/// the blackhole can resume into the helper.
+#[allow(dead_code)]
+pub(crate) fn ensure_list_append_resize_helper_index() -> i32 {
+    ensure_finish_setup();
+    METAINTERP_SD.with(|r| r.borrow_mut().ensure_list_append_resize_helper_jitcode())
 }
 
 /// Resolve `MetaInterpStaticData.jitcodes[jitcode_index]` to the same
@@ -11513,8 +11554,8 @@ mod indirectcalltargets_tests {
     #[test]
     fn list_append_resize_helper_threads_none_into_caller_result_register() {
         use majit_metainterp::blackhole::run_forever;
-        use majit_metainterp::jitcode::insns::BC_REF_RETURN;
         use majit_metainterp::jitcode::JitCodeBuilder;
+        use majit_metainterp::jitcode::insns::BC_REF_RETURN;
         use majit_metainterp::jitexc::JitException;
         use pyre_object::{w_int_new, w_list_len, w_list_new, w_none};
 
@@ -11566,6 +11607,42 @@ mod indirectcalltargets_tests {
             len_before + 1,
             "the callee frame must still have performed the append",
         );
+    }
+
+    /// Issue #143 M-core3 increment 3: the resize helper is registered in
+    /// the production `METAINTERP_SD` exactly once and resolves back by its
+    /// memoized index. A second `ensure` returns the same index (no
+    /// duplicate registration), and the index resolves to a populated,
+    /// non-skeleton runtime-helper payload (null `w_code`) whose identity
+    /// `pc_map` passes a byte offset through unchanged.
+    #[test]
+    fn ensure_list_append_resize_helper_index_is_stable_and_resolves() {
+        use super::{
+            METAINTERP_SD, MetaInterpStaticData, ensure_list_append_resize_helper_index,
+            pyjitcode_for_jitcode_index,
+        };
+
+        // Isolate from any helper a prior test on this thread registered.
+        METAINTERP_SD.with(|slot| *slot.borrow_mut() = MetaInterpStaticData::new());
+
+        let idx = ensure_list_append_resize_helper_index();
+        assert_eq!(
+            ensure_list_append_resize_helper_index(),
+            idx,
+            "ensure must memoize — a second call registers nothing new",
+        );
+
+        let payload =
+            pyjitcode_for_jitcode_index(idx).expect("helper index must resolve to a payload");
+        assert!(
+            payload.w_code.is_null(),
+            "runtime-helper payload carries no W_CodeObject",
+        );
+        assert!(payload.is_populated());
+        assert!(!payload.is_skeleton());
+        assert!(!payload.has_abort_opcode());
+        // Identity pc_map: a helper byte offset maps to itself.
+        assert_eq!(payload.resume_jitcode_pc_for(0), Some(0));
     }
 }
 
