@@ -6363,7 +6363,79 @@ impl MIFrame {
             }
         }
 
+        if let Some(new_op) =
+            self.try_trace_exception_new(callable, args, concrete_callable, concrete_args)?
+        {
+            return Ok(new_op);
+        }
+
         self.trace_call_callable(callable, args)
+    }
+
+    /// `Type(args)` for a *canonical* builtin exception class: emit the
+    /// allocation as traced `NewWithVtable` + `SetfieldGc` (kind /
+    /// w_class / args_w) so the optimizer can virtualize it when the
+    /// exception never escapes, instead of the opaque residual
+    /// `jit_call_callable_N` constructor call
+    /// (`helpers::emit_trace_call_callable`).
+    ///
+    /// The GC rewrite pass lowers the `NewWithVtable` to a nursery
+    /// allocation carrying the `W_EXCEPTION` type id + per-kind vtable
+    /// (`rewrite.rs gen_malloc_nursery` / `gen_initialize_tid` /
+    /// `gen_initialize_vtable`), so the result is a fully GC-managed
+    /// `W_ExceptionObject` identical to the runtime `malloc_typed` +
+    /// `exc_new_wrapper` + `descr_init` path.  `args_w` is built as a
+    /// residual list for now.
+    ///
+    /// Restricted to a callable that is exactly
+    /// `lookup_exc_class_for_kind(kind)`: user subclasses (whose ctor may
+    /// run a Python `__init__`, and whose `w_class` differs from the
+    /// per-kind builtin class) fall through to the generic call path.
+    fn try_trace_exception_new(
+        &mut self,
+        callable: OpRef,
+        args: &[OpRef],
+        concrete_callable: PyObjectRef,
+        concrete_args: &[PyObjectRef],
+    ) -> Result<Option<OpRef>, PyError> {
+        let is_exc_class = unsafe {
+            pyre_interpreter::baseobjspace::exception_is_valid_obj_as_class_w(concrete_callable)
+        };
+        // Concrete positional args only — the residual `args_w` list must
+        // match the runtime `descr_init` list exactly.
+        if !is_exc_class || concrete_args.iter().any(|a| a.is_null()) {
+            return Ok(None);
+        }
+        // Build the exception concretely on the plain eval loop (no tracer
+        // re-entry) to read its kind and confirm a flat builtin instance.
+        // The instance is trace-time only and is discarded after the read.
+        let exc = {
+            let _plain_guard = pyre_interpreter::call::force_plain_eval();
+            pyre_interpreter::call::call_function_impl_result(concrete_callable, concrete_args)
+        };
+        let Ok(exc) = exc else { return Ok(None) };
+        let kind = unsafe {
+            if !pyre_object::is_exception(exc) {
+                return Ok(None);
+            }
+            pyre_object::excobject::w_exception_get_kind(exc)
+        };
+        // Only the canonical per-kind builtin class maps to the flat
+        // NewWithVtable layout; a user subclass resolves to its builtin
+        // parent here and is rejected.
+        if pyre_object::excobject::lookup_exc_class_for_kind(kind) != concrete_callable {
+            return Ok(None);
+        }
+        // Pin the callable identity so the trace-time kind / vtable stay
+        // valid across iterations.
+        self.with_ctx(|this, ctx| {
+            this.implement_guard_value(ctx, callable, concrete_callable as i64);
+        });
+        let args_list = TraceHelperAccess::trace_build_list(self, args)?;
+        let new_op = self.with_ctx(|_this, ctx| {
+            crate::helpers::emit_exception_new_inline(ctx, kind, callable, args_list)
+        });
+        Ok(Some(new_op))
     }
 
     fn build_pending_inline_frame(

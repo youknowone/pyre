@@ -1648,7 +1648,11 @@ pub fn make_array_descr_with_full_id(
 use pyre_interpreter::{DICT_STORAGE_VALUES_LEN_OFFSET, DICT_STORAGE_VALUES_OFFSET};
 use pyre_object::floatobject::{FLOAT_FLOATVAL_OFFSET, W_FloatObject};
 use pyre_object::intobject::W_IntObject;
-use pyre_object::pyobject::OB_TYPE_OFFSET;
+use pyre_object::excobject::{
+    EXC_ARGS_W_OFFSET, EXC_KIND_COUNT, EXC_KIND_OFFSET, ExcKind, W_EXCEPTION_OBJECT_SIZE,
+    exc_kind_to_pytype,
+};
+use pyre_object::pyobject::{OB_TYPE_OFFSET, W_CLASS_OFFSET};
 use pyre_object::rangeobject::{
     RANGE_ITER_CURRENT_OFFSET, RANGE_ITER_STEP_OFFSET, RANGE_ITER_STOP_OFFSET,
 };
@@ -1937,6 +1941,77 @@ pub fn specialised_tuple_ff_size_descr() -> DescrRef {
 /// Size descriptor for `W_SpecialisedTupleObject_oo`.
 pub fn specialised_tuple_oo_size_descr() -> DescrRef {
     SPECIALISED_TUPLE_OO_DESCR_GROUP.size_descr.clone()
+}
+
+/// SizeDescr + field descrs for `W_ExceptionObject` allocation via
+/// NewWithVtable, one set per `ExcKind`.  The vtable (`ob_type`) differs
+/// per kind (`exc_kind_to_pytype`), so each kind owns its group; the
+/// three SetField'd fields — `kind`, `w_class`, `args_w` — share the
+/// same offsets across kinds.  `w_cause`/`w_context`/… stay zeroed by
+/// the `NewWithVtable` memzero (PY_NULL), matching
+/// `w_exception_new_empty`.
+fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
+    build_object_descr_group_with_def_path(
+        W_EXCEPTION_OBJECT_SIZE,
+        W_EXCEPTION_GC_TYPE_ID,
+        exc_kind_to_pytype(kind) as *const _ as usize,
+        &[
+            // `kind` is a `u8` tag (1 byte, unsigned).
+            (
+                "W_ExceptionObject.kind",
+                EXC_KIND_OFFSET,
+                1,
+                Type::Int,
+                false,
+                false,
+                false,
+            ),
+            (
+                "W_ExceptionObject.w_class",
+                W_CLASS_OFFSET,
+                8,
+                Type::Ref,
+                false,
+                false,
+                false,
+            ),
+            (
+                "W_ExceptionObject.args_w",
+                EXC_ARGS_W_OFFSET,
+                8,
+                Type::Ref,
+                false,
+                false,
+                false,
+            ),
+        ],
+        // Empty name: the per-kind vtable means a shared "W_ExceptionObject"
+        // name-registry slot would be first-write-wins and lose the other
+        // kinds' vtables.  NewWithVtable embeds the SizeDescr in the op, so
+        // the name-registry publish is not needed here.
+        "",
+        "",
+    )
+}
+
+static W_EXCEPTION_DESCR_CACHE: LazyLock<Mutex<Vec<Option<PyreObjectDescrGroup>>>> =
+    LazyLock::new(|| Mutex::new((0..EXC_KIND_COUNT).map(|_| None).collect()));
+
+/// Field descrs for the exception construction emit: `(size, kind,
+/// w_class, args_w)`.  Built and cached per `ExcKind` on first use.
+pub fn w_exception_descrs(kind: ExcKind) -> (DescrRef, DescrRef, DescrRef, DescrRef) {
+    let idx = kind as u8 as usize;
+    let mut cache = W_EXCEPTION_DESCR_CACHE.lock().unwrap();
+    if cache[idx].is_none() {
+        cache[idx] = Some(build_w_exception_group(kind));
+    }
+    let group = cache[idx].as_ref().unwrap();
+    (
+        group.size_descr.clone() as DescrRef,
+        field_descr_from_group(group, 0),
+        field_descr_from_group(group, 1),
+        field_descr_from_group(group, 2),
+    )
 }
 
 /// Size descriptor for W_SliceObject allocation via NewWithVtable.

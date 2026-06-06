@@ -671,6 +671,39 @@ pub fn emit_box_int_inline(
     new_op
 }
 
+/// Emit inline `W_ExceptionObject` creation (NewWithVtable + SetfieldGc
+/// for `kind` / `w_class` / `args_w`), so a builtin exception built by a
+/// Python `raise Type(args)` becomes traced New+SetField ops the
+/// optimizer can virtualize when the exception never escapes — instead
+/// of the opaque residual `jit_call_callable_N` constructor call.
+///
+/// Mirrors the runtime construction:
+/// `w_exception_new_empty(kind)` (zeroed slots) + `exc_new_wrapper`
+/// (`w_class = the called type`) + `descr_init` (`args_w = args list`).
+/// `w_cause`/`w_context`/… stay PY_NULL from the NewWithVtable memzero.
+pub fn emit_exception_new_inline(
+    ctx: &mut TraceCtx,
+    kind: pyre_object::excobject::ExcKind,
+    w_class: OpRef,
+    args_w: OpRef,
+) -> OpRef {
+    let (size_descr, kind_descr, w_class_descr, args_w_descr) =
+        crate::descr::w_exception_descrs(kind);
+    let new_op = ctx.record_op_with_descr(OpCode::NewWithVtable, &[], size_descr);
+    ctx.heap_cache_mut().new_object(new_op);
+    let kind_const = ctx.const_int(kind as u8 as i64);
+    let kind_idx = kind_descr.index();
+    ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_op, kind_const], kind_descr);
+    ctx.heapcache_setfield_cached(new_op, kind_idx, kind_const);
+    let w_class_idx = w_class_descr.index();
+    ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_op, w_class], w_class_descr);
+    ctx.heapcache_setfield_cached(new_op, w_class_idx, w_class);
+    let args_w_idx = args_w_descr.index();
+    ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_op, args_w], args_w_descr);
+    ctx.heapcache_setfield_cached(new_op, args_w_idx, args_w);
+    new_op
+}
+
 /// Emit inline `space.newslice(w_start, w_end, w_step)` creation
 /// (NewWithVtable + 3 SetfieldGc).
 ///
