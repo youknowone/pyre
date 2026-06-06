@@ -636,6 +636,10 @@ fn full_body_walk_trace(
     // Clear any deferred void-store events left by a prior aborted walk so
     // they cannot leak into this one (#63).
     crate::jitcode_dispatch::void_defer_reset();
+    // Slice b (PYRE_FBW_CALL_ASSEMBLER): clear any Finish payload a prior
+    // aborted walk's top-level `*_return` arm may have stashed, so a stale
+    // value cannot leak into this walk's `Terminate` handling.
+    crate::jitcode_dispatch::fbw_finish_payload_reset();
     // A bridge resumes mid-loop from a guard failure; its input args are the
     // guard's resumedata, already seeded into the bridge sym by
     // `setup_bridge_sym`.  PyPy's `interpret()` (rebuild_state_after_failure →
@@ -685,6 +689,26 @@ fn full_body_walk_trace(
                 TraceAction::CloseLoopWithArgs {
                     jump_args,
                     loop_header_pc: Some(loop_header_pc),
+                }
+            }
+            crate::jitcode_dispatch::DispatchOutcome::Terminate => {
+                // A loop-free portal exit: the top-level `*_return` reached
+                // `done_with_this_frame` with no back-edge.  Under the
+                // PYRE_FBW_CALL_ASSEMBLER gate the return arm routed through
+                // `fbw_terminate_with_finish`, which re-boxed the result to
+                // Type::Ref, recorded the vable store-back + GUARD_NOT_FORCED_2,
+                // and stashed the finish payload.  Build the portal-exit FINISH
+                // from it so the compile pipeline records FINISH from
+                // `finish_args` (mirror of the trait `StepResult::Return`
+                // path, trace_opcode.rs).  Ungated → no payload → `Abort`
+                // exactly as before the slice.
+                match crate::jitcode_dispatch::fbw_finish_payload_take() {
+                    Some((finish_value, finish_type)) => TraceAction::Finish {
+                        finish_args: vec![finish_value],
+                        finish_arg_types: vec![finish_type],
+                        exit_with_exception: false,
+                    },
+                    None => TraceAction::Abort,
                 }
             }
             _ => TraceAction::Abort,

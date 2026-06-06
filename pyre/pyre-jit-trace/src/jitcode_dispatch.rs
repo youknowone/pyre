@@ -5240,6 +5240,100 @@ impl Drop for FullBodySnapshotSymGuard {
     }
 }
 
+thread_local! {
+    /// Finish payload stashed by a top-level `*_return` arm under the
+    /// `PYRE_FBW_CALL_ASSEMBLER` gate, read back by
+    /// [`crate::trace::full_body_walk_trace`] to build a
+    /// `TraceAction::Finish` for a loop-free (Finish-terminated) portal.
+    ///
+    /// `(finish_value, finish_arg_type)` — the re-boxed return value and
+    /// its `Type::Ref` portal-exit type.  `None` outside the gated path,
+    /// so the default-off walk maps `Terminate -> Abort` exactly as before.
+    /// Reset at the start of every walk (`fbw_finish_payload_reset`) so a
+    /// stale payload from a prior aborted walk cannot leak into this one.
+    static FBW_FINISH_PAYLOAD: std::cell::Cell<Option<(OpRef, Type)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Whether the `PYRE_FBW_CALL_ASSEMBLER` slice-b Finish-portal compile
+/// route is enabled.  Cached so the per-`*_return` read and the
+/// `full_body_walk_trace` read see a single consistent value.  Default
+/// OFF → the return arms and `full_body_walk_trace` behave byte-identically
+/// to the pre-slice-b path (bare `Terminate` -> `Abort`).
+pub(crate) fn fbw_call_assembler_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("PYRE_FBW_CALL_ASSEMBLER").is_ok())
+}
+
+/// Clear any stashed Finish payload before a walk begins (mirrors
+/// [`void_defer_reset`]).
+pub(crate) fn fbw_finish_payload_reset() {
+    FBW_FINISH_PAYLOAD.with(|c| c.set(None));
+}
+
+/// Consume the Finish payload stashed by a top-level `*_return` arm.
+pub(crate) fn fbw_finish_payload_take() -> Option<(OpRef, Type)> {
+    FBW_FINISH_PAYLOAD.with(|c| c.take())
+}
+
+/// FBW-native port of [`crate::state::ensure_boxed_for_ca`] that operates
+/// purely on the [`TraceCtx`] (no borrowed `MIFrame`).  A portal-exit
+/// FINISH must carry `Type::Ref` (`pyjitpl.py:2489-2502` REF result_type);
+/// if the optimizer left the return value unboxed as Int/Float, re-box it
+/// (`wrapint` / `wrapfloat` = `NewWithVtable` + `SetfieldGc`).  `value_type`
+/// here is `ctx.get_opref_type(value).unwrap_or(Type::Ref)`, the exact body
+/// of `MIFrame::value_type` minus the borrow.
+fn fbw_ensure_boxed_for_ca(ctx: &mut TraceCtx, value: OpRef) -> OpRef {
+    let ty = if value.is_none() {
+        Type::Ref
+    } else {
+        ctx.get_opref_type(value).unwrap_or(Type::Ref)
+    };
+    match ty {
+        Type::Int => crate::state::wrapint(ctx, value),
+        Type::Float => crate::state::wrapfloat(ctx, value),
+        Type::Ref | Type::Void => value,
+    }
+}
+
+/// FBW-native port of `MIFrame::store_token_in_vable` (`pyjitpl.py:3222`).
+/// Records `FORCE_TOKEN` + `SETFIELD_GC(vbox, token, vable_token_descr)`
+/// via `store_token_in_vable_setfield` and, when that fires, the
+/// `GUARD_NOT_FORCED_2` with resumedata captured through the walker's own
+/// single-frame snapshot machinery (`walker_capture_snapshot_for_last_guard`)
+/// — the same resume coordinate (`entry_py_pc` / `outer_active_boxes`) every
+/// other FBW guard uses, since pyre's blackhole can only re-enter the outer
+/// Python opcode boundary.  No-op when there is no standard virtualizable.
+fn fbw_store_token_in_vable(
+    ctx: &mut WalkContext<'_, '_>,
+    op_pc: usize,
+) -> Result<(), DispatchError> {
+    if ctx.trace_ctx.store_token_in_vable_setfield() {
+        ctx.trace_ctx
+            .record_guard(OpCode::GuardNotForced2, &[], 0);
+        walker_capture_snapshot_for_last_guard(ctx, op_pc)?;
+    }
+    Ok(())
+}
+
+/// Shared slice-b top-level finish path for the three value-returning arms
+/// (`ref_return` / `int_return` / `float_return`).  Re-boxes `result` to
+/// `Type::Ref`, records the vable store-back + `GUARD_NOT_FORCED_2`, and
+/// stashes the finish payload for `full_body_walk_trace`.  Deliberately
+/// does NOT record the `FINISH` op: under the gate the compile consumer
+/// (`finish_and_compile` -> `recorder.finish`, mod.rs:6427) records it from
+/// `finish_args`, so recording it here too would double it.
+fn fbw_terminate_with_finish(
+    ctx: &mut WalkContext<'_, '_>,
+    result: OpRef,
+    op_pc: usize,
+) -> Result<(), DispatchError> {
+    let finish_value = fbw_ensure_boxed_for_ca(ctx.trace_ctx, result);
+    fbw_store_token_in_vable(ctx, op_pc)?;
+    FBW_FINISH_PAYLOAD.with(|c| c.set(Some((finish_value, Type::Ref))));
+    Ok(())
+}
+
 /// Map a JitCode byte offset back to the Python PC of the opcode whose
 /// JitCode region contains it: the largest `py_pc` with
 /// `pc_map[py_pc] <= jit_pc` (ties → larger `py_pc`).  `pc_map[py_pc]` is
@@ -9774,8 +9868,17 @@ fn handle(
                 }
             }
             if ctx.is_top_level {
-                ctx.trace_ctx
-                    .finish(&[result], ctx.done_with_this_frame_descr_ref.clone());
+                if fbw_call_assembler_enabled() {
+                    // Slice b: route the loop-free portal exit through
+                    // `TraceAction::Finish` so the compile pipeline records
+                    // the FINISH from `finish_args`.  Re-box to Type::Ref +
+                    // store_token_in_vable, then stash the payload; do NOT
+                    // call `ctx.trace_ctx.finish()` here (would double-record).
+                    fbw_terminate_with_finish(ctx, result, op.pc)?;
+                } else {
+                    ctx.trace_ctx
+                        .finish(&[result], ctx.done_with_this_frame_descr_ref.clone());
+                }
                 Ok((DispatchOutcome::Terminate, op.next_pc))
             } else {
                 Ok((
@@ -9804,8 +9907,15 @@ fn handle(
                 }
             }
             if ctx.is_top_level {
-                ctx.trace_ctx
-                    .finish(&[result], ctx.done_with_this_frame_descr_int.clone());
+                if fbw_call_assembler_enabled() {
+                    // Slice b: portal-exit FINISH carries Type::Ref even for
+                    // an int return (the eval_loop_jit result_type is REF),
+                    // so `fbw_ensure_boxed_for_ca` re-boxes via wrapint.
+                    fbw_terminate_with_finish(ctx, result, op.pc)?;
+                } else {
+                    ctx.trace_ctx
+                        .finish(&[result], ctx.done_with_this_frame_descr_int.clone());
+                }
                 Ok((DispatchOutcome::Terminate, op.next_pc))
             } else {
                 Ok((
@@ -9827,8 +9937,15 @@ fn handle(
             // Operand layout `f`: 1B float register at op.pc+1.
             let result = read_float_reg(code, op, 0, ctx)?;
             if ctx.is_top_level {
-                ctx.trace_ctx
-                    .finish(&[result], ctx.done_with_this_frame_descr_float.clone());
+                if fbw_call_assembler_enabled() {
+                    // Slice b: portal-exit FINISH carries Type::Ref;
+                    // `fbw_ensure_boxed_for_ca` re-boxes the float via
+                    // wrapfloat.
+                    fbw_terminate_with_finish(ctx, result, op.pc)?;
+                } else {
+                    ctx.trace_ctx
+                        .finish(&[result], ctx.done_with_this_frame_descr_float.clone());
+                }
                 Ok((DispatchOutcome::Terminate, op.next_pc))
             } else {
                 Ok((
@@ -13514,7 +13631,7 @@ mod tests {
             concrete_registers_i: &mut [],
             descr_refs: &[],
             raw_descrs: RawDescrPool::Global,
-            is_authoritative_executor: true,
+            is_authoritative_executor: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr,
             done_with_this_frame_descr_int: make_fail_descr(101),
