@@ -356,6 +356,33 @@ impl<'a> RegAllocator<'a> {
         }
     }
 
+    /// #304: record an interference edge between two frame-local slot
+    /// representatives so the chordal coloring assigns them DISTINCT
+    /// colors, even when their SSA register live ranges are disjoint.
+    ///
+    /// Complement of [`try_coalesce_pin_ids`]: that merges Variables onto
+    /// one color, this forces them apart.  Used by the splice regalloc to
+    /// reproduce the walker's bijective slot→register assignment so the
+    /// per-slot resume reverse map is injective.  Both endpoints are
+    /// projected through `_unionfind.find_rep`, so a slot whose Variables
+    /// were already coalesced into one rep (by the same-slot coalesce
+    /// pairs) contributes a single node; `add_edge` is a no-op for
+    /// self-edges, so two reps that happen to coincide do not trigger a
+    /// phantom interference.  `add_node` registers each rep in
+    /// `_depgraph.all_nodes` so `find_node_coloring`'s `getnodes` filter
+    /// keeps it (matching `try_coalesce_pin_ids`).
+    fn add_interference_pin_ids(
+        &mut self,
+        v_id: super::flow::VariableId,
+        w_id: super::flow::VariableId,
+    ) {
+        let v0 = self._unionfind.find_rep(v_id);
+        let w0 = self._unionfind.find_rep(w_id);
+        self._depgraph.add_node(v0);
+        self._depgraph.add_node(w0);
+        self._depgraph.add_edge(v0, w0);
+    }
+
     fn find_node_coloring(&mut self) {
         self._coloring = self
             ._depgraph
@@ -437,6 +464,33 @@ pub fn perform_register_allocation_with_pairs(
     kind: Kind,
     extra_coalesce_pairs: &[(super::flow::VariableId, super::flow::VariableId)],
 ) -> GraphAllocationResult {
+    perform_register_allocation_with_pairs_and_interference(graph, kind, extra_coalesce_pairs, &[])
+}
+
+/// #304 ADAPTATION: like [`perform_register_allocation_with_pairs`] but
+/// also records an interference edge between the union-find reps named in
+/// each `interference_pairs` entry, forcing those reps onto DISTINCT
+/// colors.
+///
+/// `interference_pairs` is the complement of `extra_coalesce_pairs`:
+/// where the coalesce pairs merge same-slot Variables onto one color, the
+/// interference pairs separate distinct frame-local slots whose SSA
+/// register live ranges happen to be disjoint (each `LOAD_FAST` re-reads
+/// the local, so a local's SSA value dies between reads).  Without this
+/// the chordal coloring is free to give two frame-live locals one color,
+/// and the splice resume reverse map (`pyre_color_for_semantic_local` →
+/// `semantic_ref_slot_for_reg_color`) collapses them onto one slot (#302).
+/// The edges are added after `make_dependencies` (the base liveness graph
+/// must exist) and before `coalesce_variables` (so a cross-slot coalesce
+/// is blocked by the `try_coalesce` `has_edge` guard) and
+/// `find_node_coloring`.  Splice-only — production callers pass `&[]`,
+/// leaving the coloring byte-identical.
+pub fn perform_register_allocation_with_pairs_and_interference(
+    graph: &FlowGraph,
+    kind: Kind,
+    extra_coalesce_pairs: &[(super::flow::VariableId, super::flow::VariableId)],
+    interference_pairs: &[(super::flow::VariableId, super::flow::VariableId)],
+) -> GraphAllocationResult {
     // `rpython/tool/algo/regalloc.py:11-15`:
     //     regalloc = RegAllocator(graph, consider_var, ListOfKind)
     //     regalloc.make_dependencies()
@@ -462,6 +516,13 @@ pub fn perform_register_allocation_with_pairs(
         }
     }
     allocator.make_dependencies();
+    // #304: record interference between the named slot reps so the
+    // chordal coloring keeps distinct frame-local slots on distinct
+    // colors.  Added after `make_dependencies` so the base graph exists,
+    // before `coalesce_variables`/`find_node_coloring` so both honour it.
+    for &(a_id, b_id) in interference_pairs {
+        allocator.add_interference_pin_ids(a_id, b_id);
+    }
     allocator.coalesce_variables();
     // External pins — re-apply via `try_coalesce_pin_ids` after
     // `make_dependencies` so the surviving rep is explicitly added to
@@ -553,6 +614,27 @@ pub fn perform_register_allocation_all_kinds_with_pairs(
     [
         perform_register_allocation(graph, Kind::Int),
         perform_register_allocation_with_pairs(graph, Kind::Ref, ref_coalesce_pairs),
+        perform_register_allocation(graph, Kind::Float),
+    ]
+}
+
+/// #304 ADAPTATION: like [`perform_register_allocation_all_kinds_with_pairs`]
+/// but threads `ref_interference_pairs` into the `Kind::Ref` allocation so
+/// distinct frame-local slots receive distinct Ref colors.  Int and Float
+/// use the empty path (walker tracks only Ref slots).  Splice-only.
+pub fn perform_register_allocation_all_kinds_with_pairs_and_interference(
+    graph: &FlowGraph,
+    ref_coalesce_pairs: &[(super::flow::VariableId, super::flow::VariableId)],
+    ref_interference_pairs: &[(super::flow::VariableId, super::flow::VariableId)],
+) -> [GraphAllocationResult; 3] {
+    [
+        perform_register_allocation(graph, Kind::Int),
+        perform_register_allocation_with_pairs_and_interference(
+            graph,
+            Kind::Ref,
+            ref_coalesce_pairs,
+            ref_interference_pairs,
+        ),
         perform_register_allocation(graph, Kind::Float),
     ]
 }
