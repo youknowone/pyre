@@ -835,7 +835,7 @@ impl Optimization for OptPure {
         self.cache = RecentPureOpTable::new(limit);
     }
 
-    fn propagate_forward(&mut self, op: &Op, _op_rc: &majit_ir::OpRc, ctx: &mut OptContext) -> OptimizationResult {
+    fn propagate_forward(&mut self, op: &Op, op_rc: &majit_ir::OpRc, ctx: &mut OptContext) -> OptimizationResult {
         // optimizer.py: pure_from_args1 parity — consume pending registrations
         // from rewrite pass (CAST_*, CONVERT_* reverse-pure relationships)
         // and virtualize pass (ARRAYLEN_GC with array descr keying per
@@ -1056,9 +1056,7 @@ impl Optimization for OptPure {
             }
 
             if let Some(cached_ref) = self.force_preamble_op(op, ctx) {
-                let b_old = ctx
-                    .ensure_box(op.pos.get())
-                    .expect("body-namespace OpRef must have a BoxRef slot");
+                let b_old = crate::r#box::BoxRef::from_bound_op(op_rc);
                 let b_cached = ctx
                     .ensure_box(cached_ref)
                     .expect("body-namespace OpRef must have a BoxRef slot");
@@ -1071,9 +1069,7 @@ impl Optimization for OptPure {
 
             // CSE: exact same operation already computed?
             if let Some(cached_ref) = self.lookup_pure(&key, ctx) {
-                let b_old = ctx
-                    .ensure_box(op.pos.get())
-                    .expect("body-namespace OpRef must have a BoxRef slot");
+                let b_old = crate::r#box::BoxRef::from_bound_op(op_rc);
                 let b_cached = ctx
                     .get_box_replacement_box(cached_ref)
                     .or_else(|| ctx.ensure_box(cached_ref))
@@ -1122,9 +1118,7 @@ impl Optimization for OptPure {
                         ctx,
                     ) {
                         let cached_src = old_op.pos.get();
-                        let b_old = ctx
-                            .ensure_box(op.pos.get())
-                            .expect("body-namespace OpRef must have a BoxRef slot");
+                        let b_old = crate::r#box::BoxRef::from_bound_op(op_rc);
                         let b_cached = ctx
                             .get_box_replacement_box(cached_src)
                             .or_else(|| ctx.ensure_box(cached_src))
@@ -1184,9 +1178,7 @@ impl Optimization for OptPure {
                         _ => unreachable!("non-preamble matched index must be Direct"),
                     }
                 };
-                let b_old = ctx
-                    .ensure_box(op.pos.get())
-                    .expect("body-namespace OpRef must have a BoxRef slot");
+                let b_old = crate::r#box::BoxRef::from_bound_op(op_rc);
                 let b_cached = ctx
                     .get_box_replacement_box(entry_result)
                     .or_else(|| ctx.ensure_box(entry_result))
@@ -1197,9 +1189,7 @@ impl Optimization for OptPure {
             }
             // pure.py:211-220: known_result_call_pure.
             if let Some(result_ref) = self.lookup_known_result(op, start_index, ctx) {
-                let b_old = ctx
-                    .ensure_box(op.pos.get())
-                    .expect("body-namespace OpRef must have a BoxRef slot");
+                let b_old = crate::r#box::BoxRef::from_bound_op(op_rc);
                 let b_result = ctx
                     .get_box_replacement_box(result_ref)
                     .or_else(|| ctx.ensure_box(result_ref))
@@ -2714,7 +2704,13 @@ mod tests {
         );
         op.pos.set(OpRef::int_op(2));
         op.setdescr(call_descr);
-        let result = pass.propagate_forward(&op, &std::rc::Rc::new(op.clone()), &mut ctx);
+        // Register the dispatched op as the producer at its position so the
+        // collapsed `from_bound_op(op_rc)` resolves to the same box the test
+        // reads back via `get_box_replacement_box(pos)` (mirrors production
+        // input-op binding).
+        let op_rc = std::rc::Rc::new(op.clone());
+        ctx.bind_input_resops(std::slice::from_ref(&op_rc));
+        let result = pass.propagate_forward(&op, &op_rc, &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(
             ctx.get_box_replacement_box(OpRef::int_op(2))
