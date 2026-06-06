@@ -480,10 +480,20 @@ verdict's "index registration UNIMPLEMENTED" was overstated.)
     via `push_bh_regs`, so the local intern is inert at resume + GC-covered.
     (d) Test gated `#[cfg(any(feature="dynasm",feature="cranelift"))]`: without a
     backend `builder.cpu` is `None` and the residual handler's `cpu()` panics.
-  - **Increment 2 (committable):** 2-frame chain test (stub-caller + helper) via
-    `run_forever`, proving `setup_return_value_r` threads `w_none()` into the
-    caller's `code[position-1]` register. Isolates the return convention WITHOUT
-    pyre's real Python CALL layout.
+  - **Increment 2 — LANDED (tested, both backends).** 2-frame chain test
+    `list_append_resize_helper_threads_none_into_caller_result_register`
+    (stub-caller + real helper) via `run_forever`, proving `setup_return_value_r`
+    threads `w_none()` into the caller's `code[position-1]` register. Stub caller
+    jitcode = `[dest_reg=0, BC_REF_RETURN, r0]` resumed at position 1
+    (`code[0]`=the post-CALL result-register byte); chain linked
+    `helper.nextblackholeinterp = Some(caller)`, helper runs first, threads None
+    into caller r0, caller `ref_return r0` → `DoneWithThisFrameRef(w_none())`.
+    Isolates the return convention WITHOUT pyre's real Python CALL layout (the
+    real fallthrough layout is the increment-6 proof). 234/234 lib tests both
+    backends. NOTE: only re-confirms the GENERIC `setup_return_value_r` mechanism
+    (already used by every inline call) — the genuinely unproven part (that the
+    real Python jitcode's fallthrough `code[position-1]` IS the append's result
+    slot) is still increment 6's job; see LOAD-BEARING UNPROVEN below.
   - **Increment 3-5 (tracer wiring):** memoized `ensure_list_append_resize_helper_index()`
     (thread_local Cell, build payload BEFORE the METAINTERP_SD borrow — `intern_liveness`
     re-borrows it → nested-borrow panic otherwise); `capture_resumedata_with_synthetic_callee`

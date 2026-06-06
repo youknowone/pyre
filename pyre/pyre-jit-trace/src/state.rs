@@ -11496,6 +11496,77 @@ mod indirectcalltargets_tests {
             "the residual call must have appended exactly one element",
         );
     }
+
+    /// Issue #143 M-core3 increment 2: the load-bearing return-threading
+    /// convention. When the folded `list.append` callee frame returns
+    /// through the blackhole, `setup_return_value_r` must write the
+    /// callee's `None` into the CALLER frame's
+    /// `registers_r[code[position-1]]` — the post-CALL result register.
+    ///
+    /// This isolates that convention with a 2-frame chain (a hand-built
+    /// stub caller + the real resize helper) WITHOUT pyre's full Python
+    /// CALL bytecode layout: the caller's `code[position-1]` byte names the
+    /// result register, and resuming the caller at `position` runs
+    /// `ref_return` on it, surfacing the threaded value. The real Python
+    /// fallthrough layout is exercised end-to-end by increment 6.
+    #[cfg(any(feature = "dynasm", feature = "cranelift"))]
+    #[test]
+    fn list_append_resize_helper_threads_none_into_caller_result_register() {
+        use majit_metainterp::blackhole::run_forever;
+        use majit_metainterp::jitcode::insns::BC_REF_RETURN;
+        use majit_metainterp::jitcode::JitCodeBuilder;
+        use majit_metainterp::jitexc::JitException;
+        use pyre_object::{w_int_new, w_list_len, w_list_new, w_none};
+
+        let helper = super::build_list_append_resize_helper_payload();
+
+        let _roots = pyre_object::gc_roots::push_roots();
+        let list = w_list_new((0..8).map(w_int_new).collect());
+        let item = w_int_new(99);
+        pyre_object::gc_roots::pin_root(list);
+        pyre_object::gc_roots::pin_root(item);
+        let len_before = unsafe { w_list_len(list) };
+
+        // Stub caller jitcode. `code[0]` is the post-CALL result-register
+        // index (r0) that `setup_return_value_r` reads from
+        // `code[position-1]`; resuming at position 1 runs `ref_return r0`,
+        // surfacing whatever the callee threaded into r0.
+        let mut caller = JitCodeBuilder::default().finish();
+        caller.body_mut().code = vec![0x00, BC_REF_RETURN, 0x00];
+        caller.body_mut().c_num_regs_r = 1;
+        caller.body_mut().startpoints = Some([1_usize].into_iter().collect());
+        let caller = std::sync::Arc::new(caller);
+
+        let mut builder = crate::jitcode_runtime::build_pyre_production_bh_builder();
+
+        // Chain: helper (callee, runs first) → caller (its
+        // `nextblackholeinterp`, resumed with the threaded return).
+        let mut caller_bh = builder.acquire_interp();
+        caller_bh.setposition(caller, 1);
+
+        let mut helper_bh = builder.acquire_interp();
+        helper_bh.setposition(helper.jitcode.clone(), 0);
+        helper_bh.setarg_r(0, list as i64);
+        helper_bh.setarg_r(1, item as i64);
+        helper_bh.nextblackholeinterp = Some(Box::new(caller_bh));
+
+        let exc = run_forever(&mut builder, helper_bh, 0);
+        match exc {
+            JitException::DoneWithThisFrameRef(r) => assert_eq!(
+                r.0,
+                w_none() as usize,
+                "the caller must surface the None the callee returned, \
+                 threaded via setup_return_value_r into code[position-1]'s \
+                 register",
+            ),
+            other => panic!("expected DoneWithThisFrameRef(None), got {other:?}"),
+        }
+        assert_eq!(
+            unsafe { w_list_len(list) },
+            len_before + 1,
+            "the callee frame must still have performed the append",
+        );
+    }
 }
 
 #[derive(Clone, Copy)]
