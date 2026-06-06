@@ -661,6 +661,18 @@ struct Lowering<'a> {
     /// [`Rvalue::BinaryOp`], never an Aggregate), so their `.0` reads
     /// still fall through.
     positional_aggregate_locals: std::collections::HashMap<usize, String>,
+    /// MIR locals bound by a scalar [`Rvalue::BinaryOp`] anywhere in the
+    /// body.  A `*Checked (value, bool)` operation lowers to a single
+    /// scalar `BinOp` (the [`Rvalue::BinaryOp`] arm), so the destination
+    /// local — though MIR-typed `(numeric, bool)` — holds one scalar
+    /// Variable, not a tuple.  Its `.0` projection therefore collapses to
+    /// that scalar instead of extracting a tuple element.  A MIR local's
+    /// type is fixed, so a local bound by `BinaryOp` is a scalar at every
+    /// read site (its `(numeric, bool)` type can never alias a genuine
+    /// data tuple); a single function-wide set needs no per-block
+    /// propagation.  Distinguishes the collapse case from a genuine Ref
+    /// tuple `.N` read in [`Lowering::resolve_place`].
+    binop_result_locals: std::collections::HashSet<usize>,
 }
 
 impl<'a> Lowering<'a> {
@@ -771,6 +783,7 @@ impl<'a> Lowering<'a> {
             block_positional_seen: vec![vec![false; n_locals]; body.body.len()],
             block_positional_conflict: vec![vec![false; n_locals]; body.body.len()],
             positional_aggregate_locals: std::collections::HashMap::new(),
+            binop_result_locals: compute_binop_result_locals(body),
         })
     }
 
@@ -1583,6 +1596,49 @@ impl<'a> Lowering<'a> {
                     });
                     return Ok(res);
                 }
+                // A `Field` projection whose base is a genuine Ref tuple
+                // (`inner`'s post-projection type is a non-unit
+                // `(A, B, ...)`) extracts element N: emit a typed
+                // `FieldRead __pos_<N>` carrying the element type, the
+                // same shape the positional-aggregate read above
+                // produces.  This covers tuples the lowering does not
+                // build inline — function-return tuples, enum-variant
+                // payloads read through an `Option`/`Result` downcast —
+                // whose base is an opaque Ref rather than a
+                // transparent-ctor aggregate, so the base flows through
+                // `inner` as a Ref while element N may be an `Int`.
+                // Without it, `tuple.1` aliases the whole tuple (Ref) and
+                // a later merge with an `Int`-typed sibling value trips
+                // the assembler's kind cross-check.  The `*Checked
+                // (value, bool)` shape is the exception: it lowered to a
+                // scalar `BinOp` (`binop_result_locals`), so its `.0`
+                // collapses to that scalar Variable below.
+                if let ProjectionElem::Tagged(v) = &elem
+                    && self.place_is_tuple(&inner)
+                    && !self.place_is_binop_scalar(&inner)
+                    && let Some(field_payload) = v.as_object().and_then(|m| m.get("Field"))
+                    && let Some(idx) = self.positional_field_index(field_payload)
+                {
+                    let base = self.resolve_place(mir_bb, *inner)?;
+                    let bb_id = self.block_id[mir_bb];
+                    let ty = tyref_to_value_type(&place_ty, self.llbc);
+                    let res = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(res.clone()),
+                        kind: OpKind::FieldRead {
+                            base,
+                            field: FieldDescriptor::new(
+                                format!("__pos_{idx}"),
+                                Some("Adt".to_string()),
+                            ),
+                            ty,
+                            pure: false,
+                        },
+                    });
+                    return Ok(res);
+                }
                 match elem {
                     ProjectionElem::Tagged(_) | ProjectionElem::Atom(_) => {
                         self.resolve_place(mir_bb, *inner)
@@ -1677,6 +1733,25 @@ impl<'a> Lowering<'a> {
     /// [`Self::resolve_adt_field`]) and malformed payloads, so the
     /// caller only emits a positional `FieldRead` for genuine
     /// tuple/array/closure reads.
+    /// True when `place`'s post-projection type is a non-unit tuple
+    /// `(A, B, ...)` — a genuine Ref tuple whose `.N` reads extract
+    /// element N rather than aliasing the base.
+    fn place_is_tuple(&self, place: &Place) -> bool {
+        tyref_is_tuple(&place.ty, self.llbc)
+    }
+
+    /// True when `place` is a bare local bound by a scalar
+    /// [`Rvalue::BinaryOp`] (a `*Checked (value, bool)` result lowered to
+    /// a single scalar Variable): its `.0` read must collapse to that
+    /// scalar, not extract a tuple element.  See
+    /// [`Lowering::binop_result_locals`].
+    fn place_is_binop_scalar(&self, place: &Place) -> bool {
+        matches!(
+            &place.kind,
+            PlaceKind::Local(i) if self.binop_result_locals.contains(&(*i as usize))
+        )
+    }
+
     fn positional_field_index(&self, payload: &serde_json::Value) -> Option<usize> {
         let arr = payload.as_array()?;
         if arr.len() != 2 {
@@ -2418,6 +2493,27 @@ impl<'a> Lowering<'a> {
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// Collect the MIR locals bound by a scalar [`Rvalue::BinaryOp`]
+/// anywhere in `body`.  See [`Lowering::binop_result_locals`] for why a
+/// single function-wide set is sound (a local's MIR type is fixed, so a
+/// local bound by `BinaryOp` is a `*Checked` scalar at every read site).
+fn compute_binop_result_locals(body: &Unstructured) -> std::collections::HashSet<usize> {
+    let mut set = std::collections::HashSet::new();
+    for bb in &body.body {
+        for stmt in &bb.statements {
+            let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind() else {
+                continue;
+            };
+            if matches!(rvalue, Rvalue::BinaryOp(..))
+                && let PlaceKind::Local(i) = place.kind
+            {
+                set.insert(i as usize);
+            }
+        }
+    }
+    set
+}
+
 fn compute_mir_liveness(body: &Unstructured) -> Vec<Vec<bool>> {
     let n_blocks = body.body.len();
     let n_locals = body.locals.locals.len();
@@ -3144,6 +3240,39 @@ fn tyref_to_attr_value_type(ty: &TyRef, llbc: &Llbc) -> ValueType {
         }
     }
     ValueType::Ref(None)
+}
+
+/// True when `ty` is a non-unit tuple `(A, B, ...)` — Charon's
+/// synthetic `Tuple` Adt with a non-empty type-argument list.  A local
+/// of this type that is not a scalar `*Checked` `BinOp` result is a
+/// genuine Ref tuple whose `.N` reads extract element N via a typed
+/// `FieldRead`.  The inverse-emptiness check of [`is_unit_type`]: a
+/// `()` (empty `types`) is the void unit, never a field-projectable
+/// tuple.
+fn tyref_is_tuple(ty: &TyRef, llbc: &Llbc) -> bool {
+    let value = match ty {
+        TyRef::Inline { value: (_, v) } => v,
+        TyRef::Other(v) => v,
+        TyRef::Dedup { id } => match llbc.dedup_body(*id) {
+            Some(v) => v,
+            None => return false,
+        },
+    };
+    let Some(adt) = value
+        .as_object()
+        .and_then(|m| m.get("Adt"))
+        .and_then(|a| a.as_object())
+    else {
+        return false;
+    };
+    let is_tuple = adt.get("id").and_then(|i| i.as_str()) == Some("Tuple");
+    let non_empty = adt
+        .get("generics")
+        .and_then(|g| g.as_object())
+        .and_then(|g| g.get("types"))
+        .and_then(|t| t.as_array())
+        .is_some_and(|t| !t.is_empty());
+    is_tuple && non_empty
 }
 
 /// True when `ty` is Charon's unit type `()`.
