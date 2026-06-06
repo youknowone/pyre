@@ -33,8 +33,8 @@ use crate::front::opcode_wrapper::{
 };
 use crate::front::semantic::{MirGraphLookup, SemanticProgram};
 use crate::model::{
-    Block, CallTarget, ExitCase, ExitSwitch, FunctionGraph, OpKind, UnsupportedLiteralKind,
-    ValueType,
+    Block, CallTarget, ExitCase, ExitSwitch, FunctionGraph, LinkArg, OpKind,
+    UnsupportedLiteralKind, ValueType,
 };
 use crate::parse::{CallPath, ExtractedOpcodeArm, OpcodeDispatchSelector};
 
@@ -245,11 +245,12 @@ pub fn extract_opcode_dispatch_arms_from_mir(program: &SemanticProgram) -> Vec<E
     let mut arms: Vec<ExtractedOpcodeArm> = Vec::with_capacity(groups.len() + 1);
     for (target, ks) in groups {
         let selector = selector_for(&ks, disc_to_name);
+        let names = arm_input_names(&input_names, start, target, graph);
         let body_graph = build_arm_body_graph(
             &selector.canonical_key(),
             graph.block(target),
             &params,
-            &input_names,
+            &names,
         );
         arms.push(ExtractedOpcodeArm {
             selector,
@@ -259,11 +260,12 @@ pub fn extract_opcode_dispatch_arms_from_mir(program: &SemanticProgram) -> Vec<E
     }
     if let Some(target) = default_target {
         let selector = OpcodeDispatchSelector::Wildcard;
+        let names = arm_input_names(&input_names, start, target, graph);
         let body_graph = build_arm_body_graph(
             &selector.canonical_key(),
             graph.block(target),
             &params,
-            &input_names,
+            &names,
         );
         arms.push(ExtractedOpcodeArm {
             selector,
@@ -272,4 +274,35 @@ pub fn extract_opcode_dispatch_arms_from_mir(program: &SemanticProgram) -> Vec<E
         });
     }
     arms
+}
+
+/// Extend the startblock parameter map with a switch-target block's own
+/// `inputargs`, resolved through the dispatch link that feeds them.
+///
+/// A `Link` renames each source `args[i]` into the target block's
+/// `inputargs[i]` (`flowspace/model.py:114-116`).  An arm whose handler
+/// forwards an arm-local inputarg — e.g. a single-`&mut`-receiver call whose
+/// executor reborrow is threaded as a block parameter rather than referencing
+/// the startblock Input directly — is forwarding the same dispatcher parameter
+/// under a renamed `Variable`.  Resolving the feeding link restores the
+/// parameter name so the wrapper builder forwards the correct slot instead of
+/// rejecting the inputarg as unknown.
+fn arm_input_names(
+    base: &[(Variable, String)],
+    start: &Block,
+    target: crate::model::BlockId,
+    graph: &FunctionGraph,
+) -> Vec<(Variable, String)> {
+    let mut names = base.to_vec();
+    let Some(link) = start.exits.iter().find(|l| l.target == target) else {
+        return names;
+    };
+    for (i, inputarg) in graph.block(target).inputargs.iter().enumerate() {
+        if let Some(LinkArg::Value(src)) = link.args.get(i)
+            && let Some((_, name)) = base.iter().find(|(v, _)| v == src)
+        {
+            names.push((inputarg.clone(), name.clone()));
+        }
+    }
+    names
 }

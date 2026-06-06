@@ -1166,7 +1166,10 @@ impl<'a> Lowering<'a> {
                     let arg = self.resolve_operand(mir_bb, operand)?;
                     let dst_kind = tyref_to_value_type(dest_ty, self.llbc);
                     return Ok(
-                        match src_kind.as_ref().and_then(|s| cast_call_segments(s, &dst_kind)) {
+                        match src_kind
+                            .as_ref()
+                            .and_then(|s| cast_call_segments(s, &dst_kind))
+                        {
                             Some(segments) => {
                                 let res = self
                                     .graph
