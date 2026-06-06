@@ -248,7 +248,7 @@ impl VirtualizableTracker {
         &self,
         array_box: &crate::r#box::BoxRef,
         ctx: &mut OptContext,
-    ) -> Option<(OpRef, u32)> {
+    ) -> Option<(crate::r#box::BoxRef, u32)> {
         let producer = ctx.get_producing_op(array_box)?;
         if !matches!(
             producer.opcode,
@@ -256,9 +256,8 @@ impl VirtualizableTracker {
         ) {
             return None;
         }
-        let frame_ref = ctx
-            .get_box_replacement(producer.arg(0).to_opref())
-            .to_opref();
+        // Terminal box of the GetfieldRaw receiver — the virtualizable frame.
+        let frame_box = ctx.get_box_replacement(producer.arg(0).to_opref());
         let is_standard = ctx
             .get_box_replacement_box(producer.arg(0).to_opref())
             .map_or(false, |b| self.is_standard_ref(&b, ctx));
@@ -271,7 +270,7 @@ impl VirtualizableTracker {
             .getdescr()
             .and_then(|d| d.as_field_descr().map(|fd| fd.offset()))?;
         let array_idx = self.array_idx_for_offset(offset)?;
-        Some((frame_ref, array_idx))
+        Some((frame_box, array_idx))
     }
 
     /// Mirror a setarrayitem write to the virtualizable array state.
@@ -282,15 +281,13 @@ impl VirtualizableTracker {
         value_ref: OpRef,
         ctx: &mut OptContext,
     ) {
-        if let Some((frame_ref, array_idx)) = self.resolve_array_source(array_box, ctx) {
+        if let Some((frame_box, array_idx)) = self.resolve_array_source(array_box, ctx) {
             let elem_idx = index as usize;
-            if let Some(b) = ctx.ensure_box(frame_ref) {
-                ctx.with_ptr_info_mut(&b, |info| {
-                    if let PtrInfo::Virtualizable(vstate) = info {
-                        set_array_element(&mut vstate.arrays, array_idx, elem_idx, value_ref);
-                    }
-                });
-            }
+            ctx.with_ptr_info_mut(&frame_box, |info| {
+                if let PtrInfo::Virtualizable(vstate) = info {
+                    set_array_element(&mut vstate.arrays, array_idx, elem_idx, value_ref);
+                }
+            });
         }
     }
 }
@@ -1153,7 +1150,7 @@ impl OptVirtualize {
             // virtualize.py:374-381: try setitem_raw → return (remove);
             // except InvalidRawOperation → pass → emit(op)
             let item_size = ad.item_size();
-            let outcome = ctx.ensure_box(parent).and_then(|b| {
+            let outcome = ctx.get_box_replacement_box(parent).and_then(|b| {
                 ctx.with_ptr_info_mut(&b, |info| {
                     if let PtrInfo::VirtualRawBuffer(vinfo) = info {
                         Some(
@@ -1410,7 +1407,7 @@ impl OptVirtualize {
                             }
                             return OptimizationResult::PassOn;
                         };
-                        let outcome = ctx.ensure_box(parent).and_then(|b| {
+                        let outcome = ctx.get_box_replacement_box(parent).and_then(|b| {
                             ctx.with_ptr_info_mut(&b, |info| {
                                 if let PtrInfo::VirtualRawBuffer(vinfo) = info {
                                     Some(
@@ -1699,10 +1696,12 @@ impl OptVirtualize {
             return false;
         }
         // self.make_equal_to(op, forcedop)
+        // `forced_resolved` is the chain terminal of a forced virtual, which
+        // is always an emitted producer, so it resolves without minting.
         let b_old = BoxRef::from_bound_op(op_rc);
         let b_forced = ctx
-            .ensure_box(forced_resolved)
-            .expect("body-namespace OpRef must have a BoxRef slot");
+            .get_box_replacement_box(forced_resolved)
+            .expect("forced virtual terminal must resolve to a BoxRef");
         ctx.make_equal_to(&b_old, &b_forced);
         // self.last_emitted_operation = REMOVED
         self.last_emitted_was_removed = true;
