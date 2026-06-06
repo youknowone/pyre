@@ -3780,9 +3780,13 @@ impl OptUnroll {
             // makes this hold by construction in production callers.
             debug_assert!(source != *target, "import_state: source is target");
             // source.set_forwarded(target)
+            // `source` is `targetargs[i]`, produced by the caller's
+            // cross-slot resolution as either a materialized inputarg or a
+            // `reserve_virtual_box`-minted alias — both resolve without
+            // minting here.
             let b_source = ctx
-                .ensure_box(source)
-                .expect("body-namespace OpRef must have a BoxRef slot");
+                .get_box_replacement_box(source)
+                .expect("import_state source must have a materialized BoxRef slot");
             let b_target = ctx.get_box_replacement(*target);
             ctx.make_equal_to(&b_source, &b_target);
             if crate::debug::have_debug_prints() {
