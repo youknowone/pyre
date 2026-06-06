@@ -3058,8 +3058,14 @@ fn dispatch_arm_via_blackhole(
             let builder = &mut *cell.get();
             sync_control_opcodes(builder);
             let mut bh = builder.acquire_interp();
-            bh.jitcode = jitcode;
-            bh.position = 0;
+            // `setposition` (blackhole.py:312) initialises register
+            // banks + copies the constants pool into the upper portion
+            // of each bank.  Setting `jitcode` / `position` directly
+            // would leave the banks sized to the previous interp's
+            // jitcode (or empty on a fresh acquire), with no constants
+            // copied — wild reads at the first `bhimpl_*` that loads a
+            // constant.
+            bh.setposition(jitcode, 0);
             // Virtualizable wiring — mirrors `call_jit.rs:1400-1423`.
             // Single-arm dispatch has no caller chain so the
             // `nextblackholeinterp` propagation loop reduces to no-op.
@@ -3067,10 +3073,11 @@ fn dispatch_arm_via_blackhole(
                 frame as *mut pyre_interpreter::pyframe::PyFrame as i64;
             bh.virtualizable_info = get_virtualizable_info();
             // RPython MIFrame.setup parity: r0 = frame (per
-            // `trace_opcode.rs:6657-6660` walker-side seed).
-            // Remaining registers default to zero/null; per-arm stack
-            // peeks set them up inside the arm body via `bhimpl_*`
-            // operand decoding.
+            // `trace_opcode.rs:6657-6660` walker-side seed).  Remaining
+            // working-bank slots stay zero/null; per-arm stack peeks
+            // are issued inside the arm body via `bhimpl_*` operand
+            // decoding (vable_get/setarrayitem_r against PyFrame's
+            // `locals_cells_stack_w`).
             if !bh.registers_r.is_empty() {
                 bh.registers_r[0] = bh.virtualizable_ptr;
             }
