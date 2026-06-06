@@ -640,7 +640,6 @@ pub fn register_module(ns: &mut DictStorage) {
             w_str_new("atexit"),
             w_str_new("binascii"),
             w_str_new("builtins"),
-            w_str_new("copyreg"),
             w_str_new("errno"),
             w_str_new("fcntl"),
             w_str_new("grp"),

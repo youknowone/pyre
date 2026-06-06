@@ -160,7 +160,6 @@ pub fn install_builtin_modules() {
     pyre_install_module!(_thread);
     pyre_install_module!(itertools);
     pyre_install_module!(_contextvars);
-    pyre_install_module!(copyreg);
     pyre_install_module!(_codecs);
     pyre_install_module!(posix);
     pyre_install_module!(errno);
