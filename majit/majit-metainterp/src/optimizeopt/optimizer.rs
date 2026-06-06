@@ -3665,9 +3665,24 @@ impl Optimizer {
         // Box object itself. A from_opref box is unbound and drops the chain.
         for i in 0..resolved_op.num_args() {
             let arg = resolved_op.arg(i);
-            let resolved = ctx
-                .get_box_replacement_box(arg.to_opref())
-                .unwrap_or_else(|| arg.clone());
+            // Resolve each operand to its canonical bound terminal. When no
+            // producer is registered yet — a short-preamble / bridge operand
+            // dispatched mid-pass through `send_extra_operation`, whose
+            // producer is neither emitted nor in `resop_refs` —
+            // `get_box_replacement_box` returns None. `ensure_box` then mints
+            // and registers the canonical `_forwarded` host (the "Box always
+            // exists" invariant, resoperation.py:233) and we walk it to its
+            // terminal, so the stored arg is BOUND on every dispatch path.
+            // This lets operand readers resolve through `get_box_replacement`
+            // (the minted host is now in `resop_refs`) instead of needing
+            // their own `ensure_box` mint fallback.
+            let resolved = match ctx.get_box_replacement_box(arg.to_opref()) {
+                Some(b) => b,
+                None => ctx
+                    .ensure_box(arg.to_opref())
+                    .map(|b| b.get_box_replacement(false))
+                    .unwrap_or_else(|| arg.clone()),
+            };
             resolved_op.setarg(i, resolved);
         }
 
