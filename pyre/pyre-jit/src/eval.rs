@@ -1715,6 +1715,18 @@ thread_local! {
         // warmspot.py:449 — jd.result_type = getkind(portal.getreturnvar().concretetype)[0]
         // PyPy dispatch() returns W_Root → Ref.
         d.set_result_type(majit_ir::Type::Ref);
+        // rlib/jit.py:842 set_user_param — the translation-time `--jit STR`
+        // option's analog. `PYRE_JIT="vec_all=1"` opts vectorization in the
+        // PyPy way (parameter; the defaults stay off). `PYRE_JIT=0` keeps its
+        // existing disable meaning (handled on the can_enter_jit gate), so it
+        // is skipped here.
+        if let Ok(text) = std::env::var("PYRE_JIT") {
+            let text = text.trim();
+            if !text.is_empty() && text != "0" {
+                let ws = d.meta_interp_mut().warm_state_mut();
+                let _ = apply_jit_param_string(ws, text);
+            }
+        }
         (d, info)
     });
 }
@@ -2318,6 +2330,46 @@ pub fn residual_call(
     pyre_interpreter::baseobjspace::call_function(callable, args)
 }
 
+/// rlib/jit.py:842-862 `set_user_param` — apply a JIT-parameter string
+/// (`"name=value,…"`, `"off"`, or `"default"`) to the warmstate. Shared by
+/// the Python-level `set_param` positional-string branch and the `PYRE_JIT`
+/// env lever (the translation-time `--jit STR` option's analog) so both
+/// parse identically. `Err(())` signals a malformed string (rlib/jit.py:853
+/// ValueError).
+fn apply_jit_param_string(
+    ws: &mut majit_metainterp::warmstate::WarmEnterState,
+    text: &str,
+) -> Result<(), ()> {
+    // rlib/jit.py:842-845
+    if text == "off" {
+        ws.set_param("threshold", -1);
+        ws.set_param("function_threshold", -1);
+    } else if text == "default" {
+        ws.set_default_params();
+    } else {
+        // rlib/jit.py:850-862 — "name=value,name=value"
+        for s in text.split(',') {
+            let s = s.trim();
+            if s.is_empty() {
+                continue;
+            }
+            // rlib/jit.py:853 — len(parts) != 2 → raise ValueError
+            let Some((name, value)) = s.split_once('=') else {
+                return Err(());
+            };
+            let value = value.trim();
+            if name == "enable_opts" {
+                ws.set_param_enable_opts(value);
+            } else if let Ok(parsed) = value.parse::<i64>() {
+                ws.set_param(name, parsed);
+            } else {
+                return Err(());
+            }
+        }
+    }
+    Ok(())
+}
+
 /// interp_jit.py:138-167 — set_param(space, __args__).
 ///
 /// Configure the tunable JIT parameters.
@@ -2350,43 +2402,13 @@ pub fn set_param(
             return Ok(w_none());
         }
         let text = unsafe { pyre_object::w_str_get_value(w_text) };
-        // rlib/jit.py:842-845
-        if text == "off" {
-            let ws = driver.meta_interp_mut().warm_state_mut();
-            ws.set_param("threshold", -1);
-            ws.set_param("function_threshold", -1);
-        } else if text == "default" {
-            driver
-                .meta_interp_mut()
-                .warm_state_mut()
-                .set_default_params();
-        } else {
-            // rlib/jit.py:850-862 — "name=value,name=value"
-            let ws = driver.meta_interp_mut().warm_state_mut();
-            for s in text.split(',') {
-                let s = s.trim();
-                if s.is_empty() {
-                    continue;
-                }
-                // rlib/jit.py:853 — len(parts) != 2 → raise ValueError
-                let Some((name, value)) = s.split_once('=') else {
-                    return Err(pyre_interpreter::PyError::new(
-                        pyre_interpreter::PyErrorKind::ValueError,
-                        "error in JIT parameters string".to_string(),
-                    ));
-                };
-                let value = value.trim();
-                if name == "enable_opts" {
-                    ws.set_param_enable_opts(value);
-                } else if let Ok(parsed) = value.parse::<i64>() {
-                    ws.set_param(name, parsed);
-                } else {
-                    return Err(pyre_interpreter::PyError::new(
-                        pyre_interpreter::PyErrorKind::ValueError,
-                        "error in JIT parameters string".to_string(),
-                    ));
-                }
-            }
+        // rlib/jit.py:842-862 set_user_param.
+        let ws = driver.meta_interp_mut().warm_state_mut();
+        if apply_jit_param_string(ws, &text).is_err() {
+            return Err(pyre_interpreter::PyError::new(
+                pyre_interpreter::PyErrorKind::ValueError,
+                "error in JIT parameters string".to_string(),
+            ));
         }
     }
 
