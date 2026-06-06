@@ -900,9 +900,7 @@ impl Optimization for OptPure {
                     let b_old = ctx
                         .ensure_box(postponed.pos.get())
                         .expect("body-namespace OpRef must have a BoxRef slot");
-                    let b_cached = ctx
-                        .ensure_box(cached_ref)
-                        .expect("body-namespace OpRef must have a BoxRef slot");
+                    let b_cached = ctx.get_box_replacement(cached_ref);
                     ctx.make_equal_to(&b_old, &b_cached);
                     self.last_emitted_was_removed = true;
                     return OptimizationResult::Remove; // guard also removed
@@ -1059,9 +1057,7 @@ impl Optimization for OptPure {
 
             if let Some(cached_ref) = self.force_preamble_op(op, ctx) {
                 let b_old = crate::r#box::BoxRef::from_bound_op(op_rc);
-                let b_cached = ctx
-                    .ensure_box(cached_ref)
-                    .expect("body-namespace OpRef must have a BoxRef slot");
+                let b_cached = ctx.get_box_replacement(cached_ref);
                 ctx.make_equal_to(&b_old, &b_cached);
                 self.last_emitted_was_removed = true;
                 return OptimizationResult::Remove;
