@@ -93,6 +93,12 @@ class itemgetter(object):
         else:
             return tuple([obj[i] for i in self._idx])
 
+    def __reduce__(self):
+        if self._single:
+            return (type(self), (self._idx,))
+        else:
+            return (type(self), tuple(self._idx))
+
     def __repr__(self):
         if self._single:
             a = repr(self._idx)
@@ -114,6 +120,14 @@ class methodcaller(object):
 
     def __call__(self, obj):
         return getattr(obj, self._method_name)(*self._args, **self._kwargs)
+
+    def __reduce__(self):
+        if not self._kwargs:
+            return (type(self), (self._method_name,) + self._args)
+        else:
+            from functools import partial
+            return (partial(type(self), self._method_name, **self._kwargs),
+                    self._args)
 
     def __repr__(self):
         args = [repr(self._method_name)]
