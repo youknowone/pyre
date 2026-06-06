@@ -3019,17 +3019,21 @@ fn dispatch_arm_via_blackhole(
     // `MIFrame::dispatch_via_walker_for_opcode`
     // (pyre-jit-trace/src/trace_opcode.rs:6602) — an entry on
     // `production_blackhole_handles` without a matching codewriter arm
-    // is a build-script wiring bug, not a user-visible error.
-    let _jitcode = pyre_jit_trace::jitcode_runtime::jitcode_for_instruction(instruction)
-        .ok_or_else(|| {
-            pyre_interpreter::PyError::new(
-                pyre_interpreter::PyErrorKind::SystemError,
-                format!(
-                    "dispatch_arm_via_blackhole: production_blackhole_handles \
-                     admitted instruction without codewriter arm: {instruction:?}",
-                ),
-            )
-        })?;
+    // is a build-script wiring bug, not a user-visible error.  The
+    // metainterp-runtime wrapper is the form `BlackholeInterpreter.
+    // jitcode` consumes (descr pool stays empty for build-time canonical
+    // arms; `majit-metainterp/src/jitcode/mod.rs:400-403`).
+    let _jitcode =
+        pyre_jit_trace::jitcode_runtime::metainterp_jitcode_for_instruction(instruction)
+            .ok_or_else(|| {
+                pyre_interpreter::PyError::new(
+                    pyre_interpreter::PyErrorKind::SystemError,
+                    format!(
+                        "dispatch_arm_via_blackhole: production_blackhole_handles \
+                         admitted instruction without codewriter arm: {instruction:?}",
+                    ),
+                )
+            })?;
     let _ = frame;
     unimplemented!(
         "dispatch_arm_via_blackhole: BlackholeInterpreter \
