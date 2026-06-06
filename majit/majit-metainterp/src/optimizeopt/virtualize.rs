@@ -9,6 +9,7 @@
 use std::sync::Arc;
 
 use majit_ir::{Descr, DescrRef, FieldDescr, OopSpecIndex, Op, OpCode, OpRef, Type, Value};
+use crate::r#box::BoxRef;
 
 use crate::optimizeopt::info::{
     PtrInfo, VirtualArrayInfo, VirtualArrayStructInfo, VirtualInfo, VirtualStructInfo,
@@ -383,6 +384,7 @@ impl OptVirtualize {
         offset: i64,
         parent: OpRef,
         source_op: &Op,
+        source_op_rc: &majit_ir::OpRc,
         ctx: &mut OptContext,
     ) {
         let opinfo = crate::optimizeopt::info::VirtualRawSliceInfo {
@@ -391,9 +393,7 @@ impl OptVirtualize {
             last_guard_pos: -1,
             avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
         };
-        let b = ctx
-            .ensure_box(source_op.pos.get())
-            .expect("body-namespace OpRef must have a BoxRef slot");
+        let b = BoxRef::from_bound_op(source_op_rc);
         ctx.set_ptr_info(&b, PtrInfo::VirtualRawSlice(opinfo));
     }
 
@@ -407,13 +407,12 @@ impl OptVirtualize {
         size: usize,
         func: i64,
         source_op: &Op,
+        source_op_rc: &majit_ir::OpRc,
         ctx: &mut OptContext,
     ) {
         let opinfo =
             crate::optimizeopt::info::VirtualRawBufferInfo::new(func, size, source_op.getdescr());
-        let b = ctx
-            .ensure_box(source_op.pos.get())
-            .expect("body-namespace OpRef must have a BoxRef slot");
+        let b = BoxRef::from_bound_op(source_op_rc);
         ctx.set_ptr_info(&b, PtrInfo::VirtualRawBuffer(opinfo));
     }
 
@@ -443,7 +442,7 @@ impl OptVirtualize {
 
     // ── Per-opcode handlers ──
 
-    fn optimize_new_with_vtable(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
+    fn optimize_new_with_vtable(&mut self, op: &Op, op_rc: &majit_ir::OpRc, ctx: &mut OptContext) -> OptimizationResult {
         let descr = op.getdescr().expect("NEW_WITH_VTABLE needs descr");
         // virtualize.py:208 `known_class = ConstInt(op.getdescr().get_vtable())`
         // — no null filter; ConstInt(0) flows downstream as the
@@ -460,14 +459,12 @@ impl OptVirtualize {
             last_guard_pos: -1,
             avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
         };
-        let b = ctx
-            .ensure_box(op.pos.get())
-            .expect("body-namespace OpRef must have a BoxRef slot");
+        let b = BoxRef::from_bound_op(op_rc);
         ctx.set_ptr_info(&b, PtrInfo::Virtual(vinfo));
         OptimizationResult::Remove
     }
 
-    fn optimize_new(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
+    fn optimize_new(&mut self, op: &Op, op_rc: &majit_ir::OpRc, ctx: &mut OptContext) -> OptimizationResult {
         let descr = op.getdescr().expect("NEW needs descr");
         let vinfo = VirtualStructInfo {
             descr,
@@ -475,14 +472,12 @@ impl OptVirtualize {
             last_guard_pos: -1,
             avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
         };
-        let b = ctx
-            .ensure_box(op.pos.get())
-            .expect("body-namespace OpRef must have a BoxRef slot");
+        let b = BoxRef::from_bound_op(op_rc);
         ctx.set_ptr_info(&b, PtrInfo::VirtualStruct(vinfo));
         OptimizationResult::Remove
     }
 
-    fn optimize_new_array(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
+    fn optimize_new_array(&mut self, op: &Op, op_rc: &majit_ir::OpRc, ctx: &mut OptContext) -> OptimizationResult {
         let size_ref = op.arg(0).to_opref();
         if let Some(size) = ctx
             .get_box_replacement_box(size_ref)
@@ -517,9 +512,7 @@ impl OptVirtualize {
                         last_guard_pos: -1,
                         avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
                     };
-                    let b = ctx
-                        .ensure_box(op.pos.get())
-                        .expect("body-namespace OpRef must have a BoxRef slot");
+                    let b = BoxRef::from_bound_op(op_rc);
                     ctx.set_ptr_info(&b, PtrInfo::VirtualArrayStruct(vinfo));
                 } else {
                     let items = vec![OpRef::NONE; size as usize];
@@ -530,9 +523,7 @@ impl OptVirtualize {
                         last_guard_pos: -1,
                         avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
                     };
-                    let b = ctx
-                        .ensure_box(op.pos.get())
-                        .expect("body-namespace OpRef must have a BoxRef slot");
+                    let b = BoxRef::from_bound_op(op_rc);
                     ctx.set_ptr_info(&b, PtrInfo::VirtualArray(vinfo));
                 }
                 return OptimizationResult::Remove;
@@ -562,8 +553,8 @@ impl OptVirtualize {
     /// so this wrapper has no behavioral effect. Kept as a structural
     /// mirror of the upstream dispatch table.
     #[allow(dead_code)]
-    fn optimize_new_array_clear(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        self.optimize_new_array(op, ctx)
+    fn optimize_new_array_clear(&mut self, op: &Op, op_rc: &majit_ir::OpRc, ctx: &mut OptContext) -> OptimizationResult {
+        self.optimize_new_array(op, op_rc, ctx)
     }
 
     fn optimize_setfield_gc(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
@@ -689,7 +680,7 @@ impl OptVirtualize {
         OptimizationResult::PassOn
     }
 
-    fn optimize_getfield_gc(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
+    fn optimize_getfield_gc(&mut self, op: &Op, op_rc: &majit_ir::OpRc, ctx: &mut OptContext) -> OptimizationResult {
         let struct_box = ctx
             .get_box_replacement_box(op.arg(0).to_opref())
             .or_else(|| ctx.ensure_box(op.arg(0).to_opref()));
@@ -732,9 +723,7 @@ impl OptVirtualize {
                 _ => None,
             };
             if let Some(val_ref) = field_val {
-                let b_old = ctx
-                    .ensure_box(op.pos.get())
-                    .expect("body-namespace OpRef must have a BoxRef slot");
+                let b_old = BoxRef::from_bound_op(op_rc);
                 let b_val = ctx
                     .ensure_box(val_ref)
                     .expect("body-namespace OpRef must have a BoxRef slot");
@@ -826,7 +815,7 @@ impl OptVirtualize {
     }
 
     /// virtualize.py:276-296 optimize_GETARRAYITEM_GC_I (aliased to R/F and PURE variants)
-    fn optimize_getarrayitem_gc(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
+    fn optimize_getarrayitem_gc(&mut self, op: &Op, op_rc: &majit_ir::OpRc, ctx: &mut OptContext) -> OptimizationResult {
         let array_box = ctx
             .get_box_replacement_box(op.arg(0).to_opref())
             .or_else(|| ctx.ensure_box(op.arg(0).to_opref()));
@@ -848,9 +837,7 @@ impl OptVirtualize {
                     if item_ref.is_none() {
                         return OptimizationResult::InvalidLoop;
                     }
-                    let b_old = ctx
-                        .ensure_box(op.pos.get())
-                        .expect("body-namespace OpRef must have a BoxRef slot");
+                    let b_old = BoxRef::from_bound_op(op_rc);
                     let b_item = ctx
                         .ensure_box(item_ref)
                         .expect("body-namespace OpRef must have a BoxRef slot");
@@ -894,6 +881,7 @@ impl OptVirtualize {
     fn optimize_getinteriorfield_gc(
         &mut self,
         op: &Op,
+        op_rc: &majit_ir::OpRc,
         ctx: &mut OptContext,
     ) -> OptimizationResult {
         let array_box = ctx
@@ -930,9 +918,7 @@ impl OptVirtualize {
                     return OptimizationResult::InvalidLoop;
                 }
                 let fld = fld.unwrap();
-                let b_old = ctx
-                    .ensure_box(op.pos.get())
-                    .expect("body-namespace OpRef must have a BoxRef slot");
+                let b_old = BoxRef::from_bound_op(op_rc);
                 let b_fld = ctx
                     .ensure_box(fld)
                     .expect("body-namespace OpRef must have a BoxRef slot");
@@ -1028,7 +1014,7 @@ impl OptVirtualize {
     /// raw_load/store walk the chain via `resolve_raw_slice` and
     /// accumulate offsets. This matches `info.RawSlicePtrInfo.getitem_raw`,
     /// which delegates to `self.parent.getitem_raw(self.offset + offset, ...)`.
-    fn optimize_int_add(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
+    fn optimize_int_add(&mut self, op: &Op, op_rc: &majit_ir::OpRc, ctx: &mut OptContext) -> OptimizationResult {
         if op.num_args() < 2 {
             return OptimizationResult::PassOn;
         }
@@ -1043,14 +1029,14 @@ impl OptVirtualize {
         let info = arg0_box.as_ref().and_then(|b| ctx.peek_ptr_info(b));
         match info {
             Some(PtrInfo::VirtualRawBuffer(_)) | Some(PtrInfo::VirtualRawSlice(_)) => {
-                self.make_virtual_raw_slice(offset, arg0, op, ctx);
+                self.make_virtual_raw_slice(offset, arg0, op, op_rc, ctx);
                 OptimizationResult::Remove
             }
             _ => OptimizationResult::PassOn,
         }
     }
 
-    fn optimize_raw_load(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
+    fn optimize_raw_load(&mut self, op: &Op, op_rc: &majit_ir::OpRc, ctx: &mut OptContext) -> OptimizationResult {
         let buf_ref = op.arg(0).to_opref();
         let offset_ref = op.arg(1).to_opref();
 
@@ -1092,9 +1078,7 @@ impl OptVirtualize {
                 };
                 // rawbuffer.py:120: read_value(offset, length, descr)
                 if let Ok(val_ref) = vinfo.read_value(lookup_offset, ad.item_size(), &descr) {
-                    let b_old = ctx
-                        .ensure_box(op.pos.get())
-                        .expect("body-namespace OpRef must have a BoxRef slot");
+                    let b_old = BoxRef::from_bound_op(op_rc);
                     let b_val = ctx
                         .ensure_box(val_ref)
                         .expect("body-namespace OpRef must have a BoxRef slot");
@@ -1192,7 +1176,7 @@ impl OptVirtualize {
     /// Slice walk via `resolve_raw_slice` is the pyre equivalent of
     /// `RawSlicePtrInfo.getitem_raw` (`info.py`) recursing through
     /// `self.parent.getitem_raw(self.offset + offset, ...)`.
-    fn optimize_getarrayitem_raw(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
+    fn optimize_getarrayitem_raw(&mut self, op: &Op, op_rc: &majit_ir::OpRc, ctx: &mut OptContext) -> OptimizationResult {
         let array_ref = ctx.get_box_replacement(op.arg(0).to_opref()).to_opref();
         let index_ref = op.arg(1).to_opref();
 
@@ -1284,9 +1268,7 @@ impl OptVirtualize {
                             // make_nonnull + emit.
                             if let Ok(val_ref) = vinfo.read_value(lookup_offset, itemsize_u, &descr)
                             {
-                                let b_old = ctx
-                                    .ensure_box(op.pos.get())
-                                    .expect("body-namespace OpRef must have a BoxRef slot");
+                                let b_old = BoxRef::from_bound_op(op_rc);
                                 let b_val = ctx
                                     .ensure_box(val_ref)
                                     .expect("body-namespace OpRef must have a BoxRef slot");
@@ -1449,7 +1431,7 @@ impl OptVirtualize {
     /// - forced: set to CONST_NULL
     /// The typeptr/vtable at offset 0 is handled by NEW_WITH_VTABLE when
     /// the vref is forced — not stored as a tracked virtual field.
-    fn optimize_virtual_ref(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
+    fn optimize_virtual_ref(&mut self, op: &Op, op_rc: &majit_ir::OpRc, ctx: &mut OptContext) -> OptimizationResult {
         // `virtualize.py:140` `vrefinfo = ... metainterp_sd.virtualref_info`
         // / `virtualize.py:123` `vrefinfo.descr` parity.
         let vref_descr: DescrRef = self.vrefinfo.descr.clone();
@@ -1481,9 +1463,7 @@ impl OptVirtualize {
             last_guard_pos: -1,
             avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
         };
-        let b = ctx
-            .ensure_box(op.pos.get())
-            .expect("body-namespace OpRef must have a BoxRef slot");
+        let b = BoxRef::from_bound_op(op_rc);
         ctx.set_ptr_info(&b, PtrInfo::Virtual(vinfo));
 
         OptimizationResult::Remove
@@ -1636,7 +1616,7 @@ impl OptVirtualize {
     /// field must hold a constant null (set by VirtualRefFinish on the normal
     /// frame-leave path), and its `forced` field must point at a non-null
     /// object (set by VirtualRefFinish in the forced-during-tracing path).
-    fn optimize_jit_force_virtual(&mut self, op: &Op, ctx: &mut OptContext) -> bool {
+    fn optimize_jit_force_virtual(&mut self, op: &Op, op_rc: &majit_ir::OpRc, ctx: &mut OptContext) -> bool {
         if op.num_args() < 2 {
             return false;
         }
@@ -1685,9 +1665,7 @@ impl OptVirtualize {
             return false;
         }
         // self.make_equal_to(op, forcedop)
-        let b_old = ctx
-            .ensure_box(op.pos.get())
-            .expect("body-namespace OpRef must have a BoxRef slot");
+        let b_old = BoxRef::from_bound_op(op_rc);
         let b_forced = ctx
             .ensure_box(forced_resolved)
             .expect("body-namespace OpRef must have a BoxRef slot");
@@ -1705,7 +1683,7 @@ impl Default for OptVirtualize {
 }
 
 impl Optimization for OptVirtualize {
-    fn propagate_forward(&mut self, op: &Op, _op_rc: &majit_ir::OpRc, ctx: &mut OptContext) -> OptimizationResult {
+    fn propagate_forward(&mut self, op: &Op, op_rc: &majit_ir::OpRc, ctx: &mut OptContext) -> OptimizationResult {
         if let Some(ref mut vt) = self.vable {
             vt.ensure_setup(ctx);
         }
@@ -1722,9 +1700,9 @@ impl Optimization for OptVirtualize {
         match op.opcode {
             // virtualize.py:207-209: optimize_NEW_WITH_VTABLE → make_virtual.
             // InstancePtrInfo(descr, known_class, is_virtual=True)
-            OpCode::NewWithVtable => self.optimize_new_with_vtable(op, ctx),
-            OpCode::New => self.optimize_new(op, ctx),
-            OpCode::NewArray | OpCode::NewArrayClear => self.optimize_new_array(op, ctx),
+            OpCode::NewWithVtable => self.optimize_new_with_vtable(op, op_rc, ctx),
+            OpCode::New => self.optimize_new(op, op_rc, ctx),
+            OpCode::NewArray | OpCode::NewArrayClear => self.optimize_new_array(op, op_rc, ctx),
 
             // Field access on potentially-virtual objects
             OpCode::SetfieldGc | OpCode::SetfieldRaw => self.optimize_setfield_gc(op, ctx),
@@ -1736,7 +1714,7 @@ impl Optimization for OptVirtualize {
             | OpCode::GetfieldGcPureF
             | OpCode::GetfieldRawI
             | OpCode::GetfieldRawR
-            | OpCode::GetfieldRawF => self.optimize_getfield_gc(op, ctx),
+            | OpCode::GetfieldRawF => self.optimize_getfield_gc(op, op_rc, ctx),
 
             // virtualize.py:298 optimize_SETARRAYITEM_GC vs
             // virtualize.py:336 optimize_SETARRAYITEM_RAW — upstream
@@ -1756,7 +1734,7 @@ impl Optimization for OptVirtualize {
             | OpCode::GetarrayitemGcF
             | OpCode::GetarrayitemGcPureI
             | OpCode::GetarrayitemGcPureR
-            | OpCode::GetarrayitemGcPureF => self.optimize_getarrayitem_gc(op, ctx),
+            | OpCode::GetarrayitemGcPureF => self.optimize_getarrayitem_gc(op, op_rc, ctx),
             // virtualize.py:318-334 optimize_GETARRAYITEM_RAW_I (aliased
             // to _F at virtualize.py:334). Upstream's
             // `GETARRAYITEM_RAW` family is `_I/_F` only — RPython
@@ -1773,7 +1751,7 @@ impl Optimization for OptVirtualize {
             // catchall arm to plain emit, mirroring upstream's
             // "no fold for `_R`" surface.
             OpCode::GetarrayitemRawI | OpCode::GetarrayitemRawF => {
-                self.optimize_getarrayitem_raw(op, ctx)
+                self.optimize_getarrayitem_raw(op, op_rc, ctx)
             }
 
             // Array length
@@ -1782,14 +1760,14 @@ impl Optimization for OptVirtualize {
             // Interior field access on potentially-virtual array-of-structs
             OpCode::GetinteriorfieldGcI
             | OpCode::GetinteriorfieldGcR
-            | OpCode::GetinteriorfieldGcF => self.optimize_getinteriorfield_gc(op, ctx),
+            | OpCode::GetinteriorfieldGcF => self.optimize_getinteriorfield_gc(op, op_rc, ctx),
             OpCode::SetinteriorfieldGc => self.optimize_setinteriorfield_gc(op, ctx),
 
             // virtualize.py:255-266 optimize_INT_ADD: rawbuf + const → slice
-            OpCode::IntAdd => self.optimize_int_add(op, ctx),
+            OpCode::IntAdd => self.optimize_int_add(op, op_rc, ctx),
 
             // Raw memory access on potentially-virtual raw buffers (and slices)
-            OpCode::RawLoadI | OpCode::RawLoadF => self.optimize_raw_load(op, ctx),
+            OpCode::RawLoadI | OpCode::RawLoadF => self.optimize_raw_load(op, op_rc, ctx),
             OpCode::RawStore => self.optimize_raw_store(op, ctx),
 
             // RPython virtualize.py does NOT define optimize_GUARD_CLASS,
@@ -1801,7 +1779,7 @@ impl Optimization for OptVirtualize {
             // need to pre-process guard fail_args here.
 
             // VirtualRef: replace with a virtual struct tracking token + forced fields
-            OpCode::VirtualRefR | OpCode::VirtualRefI => self.optimize_virtual_ref(op, ctx),
+            OpCode::VirtualRefR | OpCode::VirtualRefI => self.optimize_virtual_ref(op, op_rc, ctx),
             // VirtualRefFinish: finalize the virtual ref
             OpCode::VirtualRefFinish => self.optimize_virtual_ref_finish(op, ctx),
 
@@ -1850,7 +1828,7 @@ impl Optimization for OptVirtualize {
                     if let Some(cd) = descr.as_call_descr() {
                         let ei = cd.get_extra_info();
                         if ei.oopspecindex == OopSpecIndex::JitForceVirtual {
-                            if self.optimize_jit_force_virtual(op, ctx) {
+                            if self.optimize_jit_force_virtual(op, op_rc, ctx) {
                                 return OptimizationResult::Remove;
                             }
                         }
@@ -1965,7 +1943,7 @@ impl Optimization for OptVirtualize {
                                         .expect(
                                             "virtualize.py:53 source_op.getarg(0) must be ConstInt",
                                         );
-                                    self.make_virtual_raw_memory(size as usize, func, op, ctx);
+                                    self.make_virtual_raw_memory(size as usize, func, op, op_rc, ctx);
                                     self.last_emitted_was_removed = true;
                                     return OptimizationResult::Remove;
                                 }
@@ -2690,7 +2668,9 @@ mod tests {
                 );
             }
 
-            match pass.propagate_forward(&resolved_op, &std::rc::Rc::new(resolved_op.clone()), &mut ctx) {
+            let resolved_rc = std::rc::Rc::new(resolved_op.clone());
+            ctx.bind_input_resops(std::slice::from_ref(&resolved_rc));
+            match pass.propagate_forward(&resolved_op, &resolved_rc, &mut ctx) {
                 OptimizationResult::Emit(emitted) => {
                     ctx.emit(emitted);
                 }
@@ -3224,16 +3204,18 @@ mod tests {
         pass.setup();
 
         let mut new_op = Op::with_descr(OpCode::NewWithVtable, &[], sd);
-        new_op.pos.set(OpRef::input_arg_ref(0));
+        new_op.pos.set(OpRef::ref_op(0));
+        let new_op_rc = std::rc::Rc::new(new_op.clone());
+        ctx.bind_input_resops(std::slice::from_ref(&new_op_rc));
         assert!(matches!(
-            pass.propagate_forward(&new_op, &std::rc::Rc::new(new_op.clone()), &mut ctx),
+            pass.propagate_forward(&new_op, &new_op_rc, &mut ctx),
             OptimizationResult::Remove
         ));
 
         let mut set_op = Op::with_descr(
             OpCode::SetfieldGc,
             &[
-                crate::r#box::BoxRef::from_opref(OpRef::input_arg_ref(0)),
+                crate::r#box::BoxRef::from_opref(OpRef::ref_op(0)),
                 crate::r#box::BoxRef::from_opref(OpRef::int_op(100)),
             ],
             fd,
@@ -3245,7 +3227,7 @@ mod tests {
         ));
 
         let inputarg_box = ctx
-            .get_box_replacement_box(OpRef::input_arg_ref(0))
+            .get_box_replacement_box(OpRef::ref_op(0))
             .expect("inputarg BoxRef populated");
         let info = ctx
             .peek_ptr_info(&inputarg_box)
@@ -4509,7 +4491,9 @@ mod tests {
                 );
             }
 
-            match pass.propagate_forward(&resolved_op, &std::rc::Rc::new(resolved_op.clone()), &mut ctx) {
+            let resolved_rc = std::rc::Rc::new(resolved_op.clone());
+            ctx.bind_input_resops(std::slice::from_ref(&resolved_rc));
+            match pass.propagate_forward(&resolved_op, &resolved_rc, &mut ctx) {
                 OptimizationResult::Emit(emitted) => {
                     ctx.emit(emitted);
                 }
