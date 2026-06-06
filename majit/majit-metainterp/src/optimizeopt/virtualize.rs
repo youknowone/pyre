@@ -747,9 +747,7 @@ impl OptVirtualize {
             };
             if let Some(val_ref) = field_val {
                 let b_old = BoxRef::from_bound_op(op_rc);
-                let b_val = ctx
-                    .ensure_box(val_ref)
-                    .expect("body-namespace OpRef must have a BoxRef slot");
+                let b_val = ctx.get_box_replacement(val_ref);
                 ctx.make_equal_to(&b_old, &b_val);
                 return OptimizationResult::Remove;
             }
@@ -864,9 +862,7 @@ impl OptVirtualize {
                         return OptimizationResult::InvalidLoop;
                     }
                     let b_old = BoxRef::from_bound_op(op_rc);
-                    let b_item = ctx
-                        .ensure_box(item_ref)
-                        .expect("body-namespace OpRef must have a BoxRef slot");
+                    let b_item = ctx.get_box_replacement(item_ref);
                     ctx.make_equal_to(&b_old, &b_item);
                     return OptimizationResult::Remove;
                 }
@@ -943,9 +939,7 @@ impl OptVirtualize {
                 }
                 let fld = fld.unwrap();
                 let b_old = BoxRef::from_bound_op(op_rc);
-                let b_fld = ctx
-                    .ensure_box(fld)
-                    .expect("body-namespace OpRef must have a BoxRef slot");
+                let b_fld = ctx.get_box_replacement(fld);
                 ctx.make_equal_to(&b_old, &b_fld);
                 return OptimizationResult::Remove;
             }
@@ -1112,9 +1106,7 @@ impl OptVirtualize {
                 // rawbuffer.py:120: read_value(offset, length, descr)
                 if let Ok(val_ref) = vinfo.read_value(lookup_offset, ad.item_size(), &descr) {
                     let b_old = BoxRef::from_bound_op(op_rc);
-                    let b_val = ctx
-                        .ensure_box(val_ref)
-                        .expect("body-namespace OpRef must have a BoxRef slot");
+                    let b_val = ctx.get_box_replacement(val_ref);
                     ctx.make_equal_to(&b_old, &b_val);
                     return OptimizationResult::Remove;
                 }
@@ -1307,9 +1299,7 @@ impl OptVirtualize {
                             if let Ok(val_ref) = vinfo.read_value(lookup_offset, itemsize_u, &descr)
                             {
                                 let b_old = BoxRef::from_bound_op(op_rc);
-                                let b_val = ctx
-                                    .ensure_box(val_ref)
-                                    .expect("body-namespace OpRef must have a BoxRef slot");
+                                let b_val = ctx.get_box_replacement(val_ref);
                                 ctx.make_equal_to(&b_old, &b_val);
                                 return OptimizationResult::Remove;
                             }
