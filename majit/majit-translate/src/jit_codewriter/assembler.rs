@@ -526,13 +526,19 @@ impl Assembler {
                 // RPython parity expectation: `cond.kind == RegKind::Int`
                 // because `block.exitswitch.concretetype == lltype.Bool`
                 // is the build-time gate at `flatten.py:248`.  Pyre's
-                // annotator/rtyper coverage gap (TODO #71/#74)
-                // occasionally lets a Ref cond reach this site (e.g.
-                // `eval_loop_jit`'s portal bool branches).  The
+                // `FunctionGraph::set_branch` (model.rs) bool-wraps the
+                // exitswitch at build time (mirroring upstream
+                // `flowcontext.py:756 Variable.bool().eval(self)`), but
+                // some annotator/rtyper paths still let an unwrapped
+                // Ref cond reach this site (empirically verified
+                // 2026-06-06: adding `assert_eq!(cond.kind,
+                // RegKind::Int)` panics during build-script
+                // ullbc-to-jitcode lowering with `got Ref`).  The
                 // `cond.index` byte still encodes the regalloc color
                 // correctly so emission proceeds; the parity gap is
-                // tracked above lookup_coloring_var rather than asserted
-                // here.
+                // tracked above lookup_coloring_var rather than
+                // asserted here pending closure of the set_branch
+                // unwrap residual.
                 let opnum = self.get_opnum("goto_if_not/iL");
                 state.startpoints.insert(state.code.len());
                 state.code.push(opnum);
