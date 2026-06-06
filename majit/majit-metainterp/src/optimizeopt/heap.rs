@@ -3412,7 +3412,7 @@ impl Optimization for OptHeap {
                 && !resolved_is_virtual;
             if needs_install {
                 // info.py:175-188 InstancePtrInfo + init_fields
-                if let Some(b) = ctx.ensure_box(resolved) {
+                if let Some(b) = ctx.get_box_replacement_box(resolved) {
                     ctx.set_ptr_info(&b, PtrInfo::instance(parent_descr.clone(), None));
                 }
             }
@@ -3429,7 +3429,7 @@ impl Optimization for OptHeap {
                 }
             } else {
                 let box2 = *box2;
-                if let Some(b) = ctx.ensure_box(resolved) {
+                if let Some(b) = ctx.get_box_replacement_box(resolved) {
                     ctx.with_ptr_info_mut(&b, |info| info.setfield(field_idx, box2));
                 }
             }
@@ -3534,7 +3534,7 @@ impl Optimization for OptHeap {
                 .is_some()
                 && !resolved_is_virtual;
             if needs_install {
-                if let Some(b) = ctx.ensure_box(resolved) {
+                if let Some(b) = ctx.get_box_replacement_box(resolved) {
                     ctx.set_ptr_info(
                         &b,
                         PtrInfo::array(
@@ -3560,7 +3560,7 @@ impl Optimization for OptHeap {
             } else {
                 let idx = *index as usize;
                 let box2 = *box2;
-                if let Some(b) = ctx.ensure_box(resolved) {
+                if let Some(b) = ctx.get_box_replacement_box(resolved) {
                     ctx.with_ptr_info_mut(&b, |info| info.setitem(idx, box2));
                 }
             }
