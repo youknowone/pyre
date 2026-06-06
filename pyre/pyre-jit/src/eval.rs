@@ -3023,7 +3023,7 @@ fn dispatch_arm_via_blackhole(
     // metainterp-runtime wrapper is the form `BlackholeInterpreter.
     // jitcode` consumes (descr pool stays empty for build-time canonical
     // arms; `majit-metainterp/src/jitcode/mod.rs:400-403`).
-    let _jitcode =
+    let jitcode =
         pyre_jit_trace::jitcode_runtime::metainterp_jitcode_for_instruction(instruction)
             .ok_or_else(|| {
                 pyre_interpreter::PyError::new(
@@ -3034,12 +3034,44 @@ fn dispatch_arm_via_blackhole(
                     ),
                 )
             })?;
+
+    // Thread-local BH pool — mirrors `call_jit.rs::blackhole_resume_via_
+    // rd_numb`'s `BH_BUILDER_RD` (call_jit.rs:1300-1315).  Separate
+    // builder from the resume-data path so the two cannot trip over each
+    // other's mutable borrow on re-entry; single-opcode arms don't go
+    // through `resume::blackhole_from_resumedata`.  Lazy-init on first
+    // dispatch; the predicate stays `false` everywhere today so the
+    // pool is never actually created in production.
+    thread_local! {
+        static BH_BUILDER_ARM: UnsafeCell<majit_metainterp::blackhole::BlackholeInterpBuilder> =
+            UnsafeCell::new(pyre_jit_trace::jitcode_runtime::build_pyre_production_bh_builder());
+    }
+    let sync_control_opcodes =
+        |builder: &mut majit_metainterp::blackhole::BlackholeInterpBuilder| {
+            let (op_live, op_catch_exception, op_rvmprof_code) =
+                pyre_jit_trace::state::blackhole_control_opcodes();
+            builder.setup_cached_control_opcodes(op_live, op_catch_exception, op_rvmprof_code);
+        };
+
+    BH_BUILDER_ARM.with(|cell| unsafe {
+        let builder = &mut *cell.get();
+        sync_control_opcodes(builder);
+        let mut bh = builder.acquire_interp();
+        bh.jitcode = jitcode;
+        bh.position = 0;
+        // Slice 3.4+ lands here: virtualizable_ptr / virtualizable_info
+        // wiring, PyFrame ↔ BH register marshalling, `bh.run()`, and
+        // the reverse marshal back into PyFrame stack.  Until then the
+        // path is unreachable (predicate `false`) so acquire/release is
+        // a no-op round trip.
+        builder.release_interp(bh);
+    });
+
     let _ = frame;
     unimplemented!(
-        "dispatch_arm_via_blackhole: BlackholeInterpreter \
-         acquire/release + register marshalling + `bh.run()` lands in \
-         subsequent Phase 5.B slices.  `production_blackhole_handles` \
-         must remain `false` until the body is complete."
+        "dispatch_arm_via_blackhole: register marshalling + \
+         `bh.run()` lands in slice 3.4+.  \
+         `production_blackhole_handles` must remain `false` until then."
     )
 }
 
