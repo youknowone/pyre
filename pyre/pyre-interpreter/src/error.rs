@@ -733,20 +733,11 @@ impl PyError {
     pub unsafe fn from_exc_object(obj: PyObjectRef) -> Self {
         unsafe {
             let kind = pyre_object::excobject::w_exception_get_kind(obj);
-            let msg = pyre_object::excobject::w_exception_get_message(obj);
-            let message = match msg.as_str() {
-                Ok(s) => s.to_string(),
-                Err(_) => {
-                    // Lone-surrogate message (rare) → lossy UTF-8 for
-                    // the Rust-side error string; `exc_object` keeps the
-                    // exact value for `str(e)` / `repr(e)`.
-                    let mut out = String::new();
-                    for cp in msg.code_points() {
-                        out.push(cp.to_char().unwrap_or('\u{FFFD}'));
-                    }
-                    out
-                }
-            };
+            // `W_BaseException.descr_str` derives the string from
+            // `args_w`; `exc_object` keeps the exact value for
+            // `str(e)` / `repr(e)`, while this Rust-side string is the
+            // lossy-UTF-8 rendering used by `PyError`'s `Display`.
+            let message = crate::display::py_str(obj);
             PyError {
                 kind: Self::kind_from_exc(kind),
                 message,

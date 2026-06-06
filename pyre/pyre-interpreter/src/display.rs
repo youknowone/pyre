@@ -477,17 +477,10 @@ pub unsafe fn py_repr(obj: PyObjectRef) -> String {
                     parts.join(", ")
                 }
             } else {
-                let msg = pyre_object::excobject::w_exception_get_message(obj);
-                match msg.as_str() {
-                    Ok(s) => {
-                        if s.is_empty() {
-                            String::new()
-                        } else {
-                            format!("'{s}'")
-                        }
-                    }
-                    Err(_) => String::new(),
-                }
+                // `w_exception_get_args` always yields a tuple (empty for
+                // an argless exception), so the args branch above covers
+                // every case; nothing left to render here.
+                String::new()
             };
             format!("{class_name}({inner})")
         } else if std::ptr::eq(tp, &TYPE_TYPE as *const PyType) {

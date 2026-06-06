@@ -1774,26 +1774,11 @@ fn builtin_issubclass(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
 macro_rules! exc_constructor {
     ($fn_name:ident, $kind:expr) => {
         fn $fn_name(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-            let exc = if args.len() == 1 && unsafe { pyre_object::is_str(args[0]) } {
-                // Single str argument: store the message in WTF-8 so a
-                // lone surrogate (e.g. `ValueError('\udcff')`) survives
-                // construction.
-                let w = unsafe { pyre_object::w_str_get_wtf8(args[0]) };
-                pyre_object::excobject::w_exception_new_wtf8($kind, w)
-            } else {
-                let msg: String = if args.is_empty() {
-                    String::new()
-                } else if args.len() == 1 {
-                    unsafe { crate::display::py_str(args[0]) }
-                } else {
-                    let parts: Vec<String> = args
-                        .iter()
-                        .map(|&a| unsafe { crate::display::py_repr(a) })
-                        .collect();
-                    format!("({})", parts.join(", "))
-                };
-                pyre_object::excobject::w_exception_new($kind, &msg)
-            };
+            // `interp_exceptions.py:121-124 W_BaseException.descr_init`:
+            // `self.args_w = args_w`.  The string form of the exception
+            // is derived from `args_w` on demand (`descr_str`), so the
+            // constructor only captures the args — no eager message copy.
+            let exc = pyre_object::excobject::w_exception_new_empty($kind);
             let args_list = pyre_object::w_list_new(args.to_vec());
             unsafe {
                 pyre_object::excobject::w_exception_set_args(exc, args_list);

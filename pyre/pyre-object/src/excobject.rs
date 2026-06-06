@@ -12,7 +12,7 @@
 //! it via the assigned `subclassrange_{min,max}`.
 
 use crate::pyobject::*;
-use rustpython_wtf8::{Wtf8, Wtf8Buf};
+use rustpython_wtf8::Wtf8;
 
 pub static EXCEPTION_TYPE: PyType = crate::pyobject::new_pytype("BaseException");
 pub static EXC_EXCEPTION_TYPE: PyType = crate::pyobject::new_pytype("Exception");
@@ -180,7 +180,7 @@ pub enum ExcKind {
     UnicodeTranslateError = 28,
 }
 
-/// Layout: `[ob_header | kind: ExcKind | message: *mut String | args_w: PyObjectRef]`
+/// Layout: `[ob_header | kind: ExcKind | args_w: PyObjectRef | …]`
 ///
 /// `args_w` mirrors `pypy/module/exceptions/interp_exceptions.py:121-124`
 /// `W_BaseException.descr_init`:
@@ -207,9 +207,6 @@ pub enum ExcKind {
 pub struct W_ExceptionObject {
     pub ob_header: PyObject,
     pub kind: ExcKind,
-    /// `WTF-8` so a lone-surrogate message (e.g. `ValueError('\udcff')`)
-    /// survives construction; `&str` cannot represent surrogates.
-    pub message: *mut Wtf8Buf,
     pub args_w: PyObjectRef,
     /// `interp_exceptions.py:114 W_BaseException.w_cause = None` —
     /// `raise X from Y` cause set by `descr_setcause` (line 167-174).
@@ -275,7 +272,6 @@ pub struct W_ExceptionObject {
 }
 
 pub const EXC_KIND_OFFSET: usize = std::mem::offset_of!(W_ExceptionObject, kind);
-pub const EXC_MESSAGE_OFFSET: usize = std::mem::offset_of!(W_ExceptionObject, message);
 pub const EXC_ARGS_W_OFFSET: usize = std::mem::offset_of!(W_ExceptionObject, args_w);
 pub const EXC_W_CAUSE_OFFSET: usize = std::mem::offset_of!(W_ExceptionObject, w_cause);
 pub const EXC_W_CONTEXT_OFFSET: usize = std::mem::offset_of!(W_ExceptionObject, w_context);
@@ -341,18 +337,36 @@ impl crate::lltype::GcType for W_ExceptionObject {
 /// placeholder, matching the legacy "internal `w_exception_new`"
 /// path.
 pub fn w_exception_new(kind: ExcKind, message: &str) -> PyObjectRef {
-    let message = crate::lltype::malloc_raw(Wtf8Buf::from_string(message.to_string()));
-    w_exception_new_from_message_ptr(kind, message)
+    let exc = w_exception_new_empty(kind);
+    // `oefmt(space.w_ValueError, "...")` parity — an internal raise with
+    // a message stores it as the single constructor arg
+    // (`args_w = [space.newtext(msg)]`); `descr_str` then derives the
+    // string lazily.  Empty message → no args (the `args_w` stays
+    // `PY_NULL` so `args` reads as `()`), matching the prebuilt
+    // singletons (`MemoryError`, `StopIteration`).
+    if !message.is_empty() {
+        let arg = crate::strobject::w_str_new(message);
+        unsafe { w_exception_set_args(exc, crate::listobject::w_list_new(vec![arg])) };
+    }
+    exc
 }
 
 /// Like `w_exception_new` but stores an arbitrary WTF-8 message,
 /// preserving lone surrogates that a `&str` message cannot carry.
 pub fn w_exception_new_wtf8(kind: ExcKind, message: &Wtf8) -> PyObjectRef {
-    let message = crate::lltype::malloc_raw(message.to_wtf8_buf());
-    w_exception_new_from_message_ptr(kind, message)
+    let exc = w_exception_new_empty(kind);
+    if !message.is_empty() {
+        let arg = crate::strobject::w_str_from_wtf8(message.to_wtf8_buf());
+        unsafe { w_exception_set_args(exc, crate::listobject::w_list_new(vec![arg])) };
+    }
+    exc
 }
 
-fn w_exception_new_from_message_ptr(kind: ExcKind, message: *mut Wtf8Buf) -> PyObjectRef {
+/// Allocate a `W_ExceptionObject` of `kind` with no constructor args
+/// (`args_w = PY_NULL`).  The public Python `__new__` path
+/// (`exc_constructor`) and the message helpers above attach `args_w`
+/// afterwards via `w_exception_set_args`.
+pub fn w_exception_new_empty(kind: ExcKind) -> PyObjectRef {
     let w_class = lookup_exc_class_for_kind(kind);
     let w_class = if w_class != PY_NULL {
         w_class
@@ -365,7 +379,6 @@ fn w_exception_new_from_message_ptr(kind: ExcKind, message: *mut Wtf8Buf) -> PyO
             w_class,
         },
         kind,
-        message,
         args_w: PY_NULL,
         w_cause: PY_NULL,
         w_context: PY_NULL,
@@ -892,14 +905,6 @@ pub unsafe fn w_exception_get_kind(obj: PyObjectRef) -> ExcKind {
     unsafe { (*(obj as *const W_ExceptionObject)).kind }
 }
 
-/// Get the exception message.
-///
-/// # Safety
-/// `obj` must point to a valid `W_ExceptionObject`.
-#[inline]
-pub unsafe fn w_exception_get_message(obj: PyObjectRef) -> &'static Wtf8 {
-    unsafe { &*(*(obj as *const W_ExceptionObject)).message }
-}
 
 /// Get the Python type name string for an ExcKind.
 pub fn exc_kind_name(kind: ExcKind) -> &'static str {
@@ -1055,7 +1060,11 @@ mod tests {
         unsafe {
             assert!(is_exception(obj));
             assert_eq!(w_exception_get_kind(obj), ExcKind::ValueError);
-            assert_eq!(w_exception_get_message(obj), Wtf8::new("bad value"));
+            // The message is stored as the single constructor arg.
+            let args = w_exception_get_args(obj);
+            assert_eq!(crate::tupleobject::w_tuple_len(args), 1);
+            let arg0 = crate::tupleobject::w_tuple_getitem(args, 0).unwrap();
+            assert_eq!(crate::strobject::w_str_get_wtf8(arg0), Wtf8::new("bad value"));
         }
     }
 
@@ -1136,7 +1145,8 @@ mod tests {
         unsafe {
             assert!(is_exception(a));
             assert_eq!(w_exception_get_kind(a), ExcKind::MemoryError);
-            assert_eq!(w_exception_get_message(a), Wtf8::new(""));
+            // Empty message → no constructor args (`args == ()`).
+            assert_eq!(crate::tupleobject::w_tuple_len(w_exception_get_args(a)), 0);
         }
     }
 
