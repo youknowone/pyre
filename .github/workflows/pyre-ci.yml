@@ -64,7 +64,7 @@ jobs:
       run: scripts/install-charon.sh
     - name: Extract LLBC
       shell: bash
-      run: scripts/extract-llbc.sh pyre-object pyre-interpreter
+      run: scripts/extract-llbc.sh pyre-object pyre-interpreter pyre-jit
     - name: Run cargo test for ${{ matrix.backend }}
       run: cargo test --all --no-default-features --features ${{ matrix.backend }}
 
@@ -99,7 +99,7 @@ jobs:
       run: scripts/install-charon.sh
     - name: Extract LLBC
       shell: bash
-      run: scripts/extract-llbc.sh pyre-object pyre-interpreter
+      run: scripts/extract-llbc.sh pyre-object pyre-interpreter pyre-jit
     - name: Run pyre/check.py
       env:
         PYRE_CHECK_PYTHON3: ${{ steps.cpython.outputs.python-path }}

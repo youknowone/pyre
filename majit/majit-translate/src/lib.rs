@@ -209,9 +209,15 @@ fn build_semantic_program_via_active_frontend(
 ///     production uses `parse::parse_source_with_module`),
 ///   - the caller passed fewer than `PROD_PARSED_FILES_FLOOR`
 ///     parsed_files (single-source diagnostic),
-///   - any expected artefact is missing (contributor without
+///   - a mandatory artefact (`pyre-object.ullbc` /
+///     `pyre-interpreter.ullbc`) is missing (contributor without
 ///     Charon installed), or
 ///   - the workspace anchoring fails.
+///
+/// `pyre-jit.ullbc` is *not* mandatory: when only it is missing the
+/// returned set degrades to the mandatory pair (see the body) so the
+/// `extract-llbc.sh pyre-jit` bootstrap can build `pyre-jit-trace`
+/// before `pyre-jit.ullbc` exists.
 ///
 /// The two gates together match the production fingerprint:
 /// `pyre-jit-trace/build.rs:157` calls
@@ -247,23 +253,40 @@ fn auto_discover_workspace_llbc_paths(
     // `corpus.ullbc` is the Charon fixture, not production.
     //
     // The set is fixed at exactly these crates so the generated
-    // `all_jitcodes` table is environment-invariant: the build consumes
-    // the same `.ullbc` inputs regardless of which artefacts happen to
-    // sit in `build/llbc/`, so a local tree and CI produce byte-identical
-    // codegen.  `pyre-jit.ullbc` is required because it hosts the
-    // `eval_loop_jit` portal and helper bodies referenced by the trace.
-    const REQUIRED: &[&str] = &[
-        "pyre-object.ullbc",
-        "pyre-interpreter.ullbc",
-        "pyre-jit.ullbc",
-    ];
-    let mut paths = Vec::with_capacity(REQUIRED.len());
-    for name in REQUIRED {
+    // `all_jitcodes` table is environment-invariant: every real build
+    // (`cargo test`, `pyre/check.py`) consumes the same three `.ullbc`
+    // inputs, so a local tree and CI produce byte-identical codegen.
+    // `pyre-object.ullbc` and `pyre-interpreter.ullbc` are mandatory.
+    //
+    // `pyre-jit.ullbc` is part of the production set (it hosts the
+    // `eval_loop_jit` portal), but it is itself produced by
+    // `scripts/extract-llbc.sh pyre-jit`, which builds `pyre-jit` — and
+    // `pyre-jit` depends on `pyre-jit-trace`, whose build script re-enters
+    // this analysis.  During that bootstrap `pyre-jit.ullbc` does not yet
+    // exist, so its absence must NOT abort the build: degrade to the
+    // mandatory pair, which makes the portal fall back to
+    // `execute_opcode_step` at the `has_leaf("eval_loop_jit")` site below.
+    // That degraded codegen is throwaway — it only has to compile so
+    // Charon can extract `pyre-jit`'s MIR; the real build that follows has
+    // all three present and stays on the invariant 3-crate path.
+    const MANDATORY: &[&str] = &["pyre-object.ullbc", "pyre-interpreter.ullbc"];
+    let mut paths = Vec::with_capacity(3);
+    for name in MANDATORY {
         let p = llbc_dir.join(name);
         if !p.exists() {
             return None;
         }
         paths.push(p.to_string_lossy().into_owned());
+    }
+    let pyre_jit = llbc_dir.join("pyre-jit.ullbc");
+    if pyre_jit.exists() {
+        paths.push(pyre_jit.to_string_lossy().into_owned());
+    } else {
+        eprintln!(
+            "[majit-translate] pyre-jit.ullbc absent — degrading to the \
+             2-crate front-end (eval_loop_jit portal unavailable). Expected \
+             only while extract-llbc.sh bootstraps pyre-jit.ullbc itself."
+        );
     }
     Some(paths)
 }

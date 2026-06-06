@@ -477,13 +477,11 @@ fn derive_program_metadata(
                 };
                 struct_origins.entry(leaf.clone()).or_insert(module);
                 // Register-class rows for `FORCE_ATTRIBUTES_INTO_CLASSES`,
-                // keyed by the bare leaf name — the same key the syn
-                // pre-pass registers (it walks each file with an empty
-                // module prefix) and the key `_init_classdef` reads via
-                // `pyobj.qualname()`.  Declaration order is preserved so the
-                // pre-filled `ClassDef.attrs` match the struct layout.
-                // Last-writer-wins on the leaf (duplicate leaves collapse,
-                // as in the syn pre-pass).
+                // keyed by the crate-stripped defining path. This is the
+                // closest Rust-side stand-in for RPython's class-object key:
+                // same-leaf structs in distinct modules stay distinct, and
+                // the spelling matches the def-path convention used by
+                // `STRUCT_ORIGIN_REGISTRY`.
                 let attr_rows: Vec<(String, ValueType)> = fields
                     .iter()
                     .enumerate()
@@ -492,7 +490,7 @@ fn derive_program_metadata(
                         (fname, tyref_to_attr_value_type(&f.ty, llbc))
                     })
                     .collect();
-                struct_field_attrs.insert(leaf.clone(), attr_rows);
+                struct_field_attrs.insert(strip_crate_prefix(&name), attr_rows);
                 known_struct_names.insert(name);
                 known_struct_names.insert(leaf);
             }
