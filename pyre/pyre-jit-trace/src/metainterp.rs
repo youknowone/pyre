@@ -369,7 +369,47 @@ impl PyreMetaInterp {
                     .filter(|f| f.jitcode == top_jitcode)
                     .count()
                     >= 2;
-                if !is_recursive_chain {
+                // Skip the catch-up while any frame in the inline chain is
+                // executing inside an active exception-handler (try) range. A
+                // fused-compare catch-up lets an inlined callee proceed in the
+                // trace; if a later op in that callee raises, the exception
+                // unwinds into a CALLER's inlined except handler, and the
+                // blackhole resume of an inlined-callee raise into a caller
+                // catch-landing is malformed (the catch_exception target skips
+                // the landing's last_exc_value op, so the bound exception value
+                // reads NULL). Until that resume path is fixed, keep the prior
+                // graceful-abort behavior for these: the inline trace aborts,
+                // the callee stays a residual call, and the exception path runs
+                // correctly. Hot loops without active try blocks (the catch-up's
+                // intended target) are unaffected.
+                //
+                // TODO: fix the underlying blackhole/codewriter defect so this
+                // gate can be removed and try-protected callees inline too. When
+                // an inlined callee raises into a caller's inlined except, the
+                // resume catch-landing's `catch_exception` target resolves PAST
+                // the landing's `last_exc_value` op (op 90 never executes), so
+                // the bound exception value reads NULL. RPython sidesteps this
+                // because the raising block carries `exitswitch=c_last_exception`
+                // (its exception edges are non-trivial graph links); pyre models
+                // the catch as a byte-level `catch_exception/L`, NOT a graph
+                // link, so the trivial-link / inline-resume passes skip it. The
+                // proper fix emits/positions `last_exc_value` so the inlined
+                // catch target lands on it, restoring inlining for these.
+                let in_exception_handler = self.framestack.iter().any(|f| {
+                    let Some(ref cf) = f.owned_concrete_frame else {
+                        return false;
+                    };
+                    let ccode = unsafe { &*pyre_interpreter::pyframe_get_pycode(&**cf) };
+                    // exceptiontable offsets are byte offsets; the concrete
+                    // frame's next_instr is an instruction-word index (×2).
+                    let byte_off = (cf.next_instr() as u32).saturating_mul(2);
+                    pyre_interpreter::exception_table::lookup_exceptiontable(
+                        &ccode.exceptiontable,
+                        byte_off,
+                    )
+                    .is_some()
+                });
+                if !is_recursive_chain && !in_exception_handler {
                     let mut guard = 0u32;
                     loop {
                         let top = self.framestack.last_mut().unwrap();

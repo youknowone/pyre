@@ -1169,16 +1169,13 @@ impl<S: JitState> JitDriver<S> {
     /// own back-edge, so its iterations would no longer run in compiled code
     /// (the caller then falls back to compile_loop, which aborts cleanly).
     pub fn compile_trace_entry_data(&mut self) -> Option<(u64, S::Meta)> {
-        // The interp-origin entry bridge closes by redirecting the function's
-        // entry into the compiled loop (compile_entry_bridge's
-        // redirect_call_assembler). The cranelift backend's preamble
-        // entry-mode calling convention does not yet accept a function-entry
-        // preamble entry from a redirected call, so the entry bridge is wired
-        // for dynasm only; on cranelift this returns None and the caller falls
-        // back to compile_loop (baseline behavior).
-        if cfg!(feature = "cranelift") {
-            return None;
-        }
+        // Only a function-entry trace (header_pc == 0) closes as an entry
+        // bridge into an already-compiled hot loop. Both backends use this
+        // gate: dynasm jumps directly to the target LABEL via target_arglocs;
+        // cranelift's body-direct dual entry (compiler.rs) reads the LABEL
+        // args from the frame and jumps past the peeled preamble. A
+        // loop-header trace (header_pc != 0) returns None and the caller falls
+        // back to compile_loop, so its back-edge is never dropped.
         let original_green_key = self
             .meta
             .trace_ctx()
