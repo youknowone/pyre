@@ -11,9 +11,11 @@ use pyre_object::PyObjectRef;
 /// `posix.stat_result` — a real structseq (tuple subclass) so `st[0]`,
 /// `len(st)`, iteration and `isinstance(st, tuple)` all work, matching
 /// `posixmodule.c` `stat_result_desc`.  The 10 sequence slots hold the
-/// integer fields (`st_atime`/`st_mtime`/`st_ctime` integer-seconds at
-/// 7..10); the float time fields shadow them as extra named fields, and
-/// `st_*_ns` are extra named integers.
+/// integer fields, with the integer-seconds times at 7..10 under the
+/// hidden `_integer_atime`/`_integer_mtime`/`_integer_ctime` names; the
+/// float `st_atime`/`st_mtime`/`st_ctime`, the `st_*_ns` integers, and the
+/// `st_blksize`/`st_blocks`/`st_rdev` block-device fields are named-only
+/// extras.
 fn stat_result_seq_type() -> PyObjectRef {
     thread_local! {
         static STAT_RESULT_SEQ_TYPE: std::cell::OnceCell<PyObjectRef> = const { std::cell::OnceCell::new() };
@@ -23,9 +25,12 @@ fn stat_result_seq_type() -> PyObjectRef {
             crate::structseq::make_struct_seq_with_extra(
                 // Dotted name → `__name__` "stat_result", repr "os.stat_result(...)".
                 "os.stat_result",
+                // `app_posix.py:20-37` — slots 7..10 are the hidden integer
+                // timestamps; the float `st_atime`/`st_mtime`/`st_ctime` are
+                // named-only extras, never indexable.
                 &[
                     "st_mode", "st_ino", "st_dev", "st_nlink", "st_uid", "st_gid", "st_size",
-                    "st_atime", "st_mtime", "st_ctime",
+                    "_integer_atime", "_integer_mtime", "_integer_ctime",
                 ],
                 &[
                     "st_atime",
@@ -34,6 +39,14 @@ fn stat_result_seq_type() -> PyObjectRef {
                     "st_atime_ns",
                     "st_mtime_ns",
                     "st_ctime_ns",
+                    // `app_posix.py:45-48` — present where the platform's
+                    // `struct stat` carries them (every Unix target).
+                    #[cfg(unix)]
+                    "st_blksize",
+                    #[cfg(unix)]
+                    "st_blocks",
+                    #[cfg(unix)]
+                    "st_rdev",
                 ],
             )
         })
@@ -845,9 +858,15 @@ pub fn register_module(ns: &mut DictStorage) {
             )
         };
 
+        #[cfg(unix)]
+        let (st_blksize, st_blocks, st_rdev) = {
+            use std::os::unix::fs::MetadataExt;
+            (meta.blksize() as i64, meta.blocks() as i64, meta.rdev() as i64)
+        };
+
         // The 10 sequence slots are the integer fields (integer-seconds
-        // times at 7..10); the float times and `st_*_ns` are extra named
-        // fields shadowing / extending them.
+        // times at 7..10, named `_integer_*`); the float times, `st_*_ns`,
+        // and the platform block/device extras are named-only fields.
         let seq = vec![
             pyre_object::w_int_new(st_mode),
             pyre_object::w_int_new(st_ino),
@@ -860,14 +879,27 @@ pub fn register_module(ns: &mut DictStorage) {
             pyre_object::w_int_new(st_mtime),
             pyre_object::w_int_new(st_ctime),
         ];
-        let extras = vec![
-            ("st_atime", pyre_object::w_float_new(st_atime as f64)),
-            ("st_mtime", pyre_object::w_float_new(st_mtime as f64)),
-            ("st_ctime", pyre_object::w_float_new(st_ctime as f64)),
+        // `_ll_get_st_atime` — float times keep sub-second precision:
+        // `float(seconds) + 1e-9 * nanosecond_fraction`, where the
+        // fraction is recovered from the full-nanosecond field.
+        let st_atime_f = st_atime as f64 + 1e-9 * (st_atime_ns - st_atime * 1_000_000_000) as f64;
+        let st_mtime_f = st_mtime as f64 + 1e-9 * (st_mtime_ns - st_mtime * 1_000_000_000) as f64;
+        let st_ctime_f = st_ctime as f64 + 1e-9 * (st_ctime_ns - st_ctime * 1_000_000_000) as f64;
+        #[allow(unused_mut)]
+        let mut extras = vec![
+            ("st_atime", pyre_object::w_float_new(st_atime_f)),
+            ("st_mtime", pyre_object::w_float_new(st_mtime_f)),
+            ("st_ctime", pyre_object::w_float_new(st_ctime_f)),
             ("st_atime_ns", pyre_object::w_int_new(st_atime_ns)),
             ("st_mtime_ns", pyre_object::w_int_new(st_mtime_ns)),
             ("st_ctime_ns", pyre_object::w_int_new(st_ctime_ns)),
         ];
+        #[cfg(unix)]
+        {
+            extras.push(("st_blksize", pyre_object::w_int_new(st_blksize)));
+            extras.push(("st_blocks", pyre_object::w_int_new(st_blocks)));
+            extras.push(("st_rdev", pyre_object::w_int_new(st_rdev)));
+        }
         crate::structseq::new_instance_with_extra(stat_result_seq_type(), seq, extras)
     }
     fn stat_impl(
