@@ -7544,31 +7544,32 @@ unsafe fn trace_check_exc_match_against(
 /// parent-frame chain.  The trait impl will be removed once every opcode
 /// is in this set and the inline-frame snapshot gap is closed.
 ///
-/// Current status: the allow-list is deliberately empty.  The Nop
-/// family (`Nop`, `ExtendedArg`, `Resume`, `Cache`, `NotTaken`) should
-/// be the first zero-op production batch, but the generated arms still
-/// carry the synthetic `Ok(StepResult::Continue)` return wrapper as a
-/// `residual_call_r_r/iRd>r` with a symbolic function address instead
-/// of a real callable.  Enabling those arms in production can therefore
-/// emit an invalid `CallR` before any optimizer/backend choice is
-/// involved.  Re-enable this set only after the arm bytes decode to the
-/// real no-op shape (`ref_return/r ...`) without residual-call wrapper
-/// ops.
+/// The pre-jtransform unit-variant fold
+/// (`translator/rtyper/unit_variant_fold.rs::fold_unit_variant_ctors`)
+/// unblocked the Nop family by rewriting zero-arg
+/// `SyntheticTransparentCtor` calls (`StepResult::Continue`,
+/// `LoopResult::Done`, …) to `OpKind::ConstRef(prebuilt_instance)` on
+/// `model::FunctionGraph` before `Transformer::transform` runs.  Arm
+/// bytes then decode to the real no-op shape (`ref_return/r …`) without
+/// residual-call wrappers, so the Nop batch — plus every entry below —
+/// is safe to dispatch via walker today.
 ///
 /// Subsequent batches grow this set until it covers every Python
-/// opcode, at which point the trait infra is deleted.
+/// opcode.  The remaining wall is execution-side, not recording-side:
+/// `eval.rs:3111` skips `execute_opcode_step` for walker-handled
+/// opcodes, which is correct only when the arm body's heap effects ride
+/// `vable_setfield` / `setarrayitem_vable_r`.  Arms with non-elidable
+/// `residual_call`s (e.g. `store_subscr_fn`,
+/// `set_current_exception`) require the Phase 5.B dispatch-unification
+/// path (`production_blackhole_handles` + `dispatch_arm_via_blackhole`)
+/// before they can join this set.  The trait infra is deleted only
+/// after both predicates cover every opcode.
 ///
 pub fn production_walker_handles(instruction: &Instruction) -> bool {
-    // The pre-jtransform unit-variant fold
-    // (`translator/rtyper/unit_variant_fold.rs::fold_unit_variant_ctors`)
-    // rewrites zero-arg `SyntheticTransparentCtor` calls
-    // (`StepResult::Continue`, `LoopResult::Done`, …) to
-    // `OpKind::ConstRef(prebuilt_instance)` on `model::FunctionGraph`
-    // before `Transformer::transform` runs.  The assembler lowers
-    // `ConstRef` through the existing `ref_copy/r>r` path
-    // (`assembler.rs::emit_const_r`), so arm bytes decode to the real
-    // no-op shape and walker activation no longer encounters
-    // residual-call wrappers around unit variants.
+    // The unit-variant fold rewrites `StepResult::Continue` &c. to
+    // `ConstRef(prebuilt_instance)`; the assembler lowers `ConstRef`
+    // through `ref_copy/r>r` (`assembler.rs::emit_const_r`), so arms
+    // decode without residual-call wrappers around unit variants.
     matches!(
         instruction,
         Instruction::Nop
