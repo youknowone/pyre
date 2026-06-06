@@ -3015,12 +3015,27 @@ fn dispatch_arm_via_blackhole(
     frame: &mut pyre_interpreter::pyframe::PyFrame,
     instruction: &pyre_interpreter::Instruction,
 ) -> Result<StepResult<pyre_object::PyObjectRef>, pyre_interpreter::PyError> {
-    let _ = (frame, instruction);
+    // Mirrors the walker-side fallback in
+    // `MIFrame::dispatch_via_walker_for_opcode`
+    // (pyre-jit-trace/src/trace_opcode.rs:6602) — an entry on
+    // `production_blackhole_handles` without a matching codewriter arm
+    // is a build-script wiring bug, not a user-visible error.
+    let _jitcode = pyre_jit_trace::jitcode_runtime::jitcode_for_instruction(instruction)
+        .ok_or_else(|| {
+            pyre_interpreter::PyError::new(
+                pyre_interpreter::PyErrorKind::SystemError,
+                format!(
+                    "dispatch_arm_via_blackhole: production_blackhole_handles \
+                     admitted instruction without codewriter arm: {instruction:?}",
+                ),
+            )
+        })?;
+    let _ = frame;
     unimplemented!(
-        "dispatch_arm_via_blackhole: arm jitcode lookup + \
-         BlackholeInterpreter wiring lands in subsequent Phase 5.B \
-         slices.  `production_blackhole_handles` must remain `false` \
-         until the body is implemented."
+        "dispatch_arm_via_blackhole: BlackholeInterpreter \
+         acquire/release + register marshalling + `bh.run()` lands in \
+         subsequent Phase 5.B slices.  `production_blackhole_handles` \
+         must remain `false` until the body is complete."
     )
 }
 
