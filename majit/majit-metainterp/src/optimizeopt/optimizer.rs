@@ -1740,7 +1740,7 @@ impl Optimizer {
         // `getintbound` side effect (`optimizer.py:110-113` unbounded
         // install) materializes on first access, matching upstream's
         // Box-always-exists invariant.
-        let Some(b) = ctx.ensure_box(opref) else {
+        let Some(b) = ctx.get_box_replacement_box(opref) else {
             return crate::optimizeopt::INFO_UNKNOWN;
         };
         ctx.getnullness(&b)
@@ -3694,11 +3694,8 @@ impl Optimizer {
             current_op.opcode,
             OpCode::SameAsI | OpCode::SameAsR | OpCode::SameAsF
         ) {
-            let old = current_op.pos.get();
             let new = current_op.arg(0).to_opref();
-            let b_old = ctx
-                .ensure_box(old)
-                .expect("body-namespace OpRef must have a BoxRef slot");
+            let b_old = BoxRef::from_bound_op(op_rc);
             let b_new = ctx.get_box_replacement(new);
             ctx.make_equal_to(&b_old, &b_new);
             return;
@@ -4033,7 +4030,7 @@ impl Optimizer {
             // the `last_guard_pos` read; `info.py:91-103
             // get_last_guard_pos` reads the PtrInfo field (None if no
             // PtrInfo, mapped to -1 = "no guard recorded").
-            let pp_obj_box = ctx.ensure_box(pp.obj);
+            let pp_obj_box = ctx.get_box_replacement_box(pp.obj);
             let old_guard_pos = pp_obj_box
                 .as_ref()
                 .and_then(|b| ctx.last_guard_pos(b))
@@ -4458,10 +4455,10 @@ impl Optimizer {
             return op;
         }
         // optimizer.py:756-757: b = self.getintbound(op.getarg(0)); if b.is_bool()
-        let b = ctx
-            .ensure_box(arg0.to_opref())
-            .map(|b| ctx.getintbound_handle(&b).borrow().clone())
-            .expect("getintbound: operand must resolve to a BoxRef");
+        let b = {
+            let b = ctx.get_box_replacement(arg0.to_opref());
+            ctx.getintbound_handle(&b).borrow().clone()
+        };
         if !b.is_bool() {
             return op;
         }
