@@ -429,37 +429,42 @@ impl MiniMarkGC {
         self.nursery.contains(addr) || self.oldgen.contains(addr)
     }
 
-    /// Whether `addr` is a real old-gen object that may enter the remembered
-    /// set. Callers have already ruled out null and nursery addresses. Every
-    /// pointer that can still reach here carries a GcHeader, so `header_of` is
-    /// always a valid read — incminimark's "barrier only sees header-bearing
-    /// objects" invariant, upheld at allocation rather than by a membership
-    /// gate:
-    ///   - GC objects (nursery/old-gen): header from the GC allocator;
-    ///   - Box-allocated PyFrames: header from `GcPyFrame` / the
-    ///     `alloc_with_gc_header` prepend;
-    ///   - leaked `malloc_typed` host objects (dicts, cells, functions):
-    ///     header from `lltype::malloc_typed` -> `alloc_with_gc_header`.
-    /// Of these, only true old-gen objects are tagged `OLDGEN_TRACKED` (set at
-    /// every old-gen allocation/promotion); the rest carry a zeroed header and
-    /// are excluded. So the test is an O(1) header read, also safe under the
-    /// inline COND_CALL_GC_WB, which loads the flag byte from this same header
-    /// before calling into the barrier.
+    /// Whether `addr` carries a header that names a registered type — the
+    /// minimal proof that a barrier target is a real managed object rather
+    /// than a stale or wild pointer. Every legitimately-allocated object
+    /// (nursery/old-gen, Box-allocated PyFrames, leaked `malloc_typed` host
+    /// objects) carries a header whose `type_id` is `< types.len()`; the same
+    /// `type_id < types.len()` validity guard the rest of collection applies
+    /// before dereferencing a type entry.
     ///
-    /// The leading guard is a cheap defensive filter, not a membership test: a
-    /// real GcRef payload is non-null, word-aligned, and well above the zero
-    /// page, so a malformed barrier target (null, a small integer mistaken for
-    /// a pointer, a misaligned address) returns `false` instead of faulting in
-    /// `header_of`. It deliberately does NOT range-check the old-gen extent —
-    /// that would need a side table maintained in lockstep with
-    /// `OLDGEN_TRACKED`, and a stale entry would silently drop a live old-gen
-    /// object from the remembered set.
+    /// The leading guard is a cheap defensive filter: a real GcRef payload is
+    /// non-null, word-aligned, and well above the zero page, so a malformed
+    /// target (null, a small integer mistaken for a pointer, a misaligned
+    /// address) returns `false` instead of faulting in `header_of`.
     #[inline]
-    fn is_oldgen_write_barrier_object(&self, addr: usize) -> bool {
+    fn has_valid_managed_header(&self, addr: usize) -> bool {
         if addr < 0x1000 || addr & (GcHeader::SIZE - 1) != 0 {
             return false;
         }
-        unsafe { (*header_of(addr)).has_flag(flags::OLDGEN_TRACKED) }
+        (unsafe { (*header_of(addr)).type_id() } as usize) < self.types.len()
+    }
+
+    /// Whether `addr` is a real old-gen object that may enter the remembered
+    /// set. Callers have already ruled out null and nursery addresses.
+    ///
+    /// `OLDGEN_TRACKED` is set at every old-gen allocation/promotion; nursery
+    /// and leaked host objects carry a zeroed header and are excluded. But the
+    /// flag bit alone is not trustworthy: the JIT can present a stale or wild
+    /// barrier target (e.g. a bridge that holds a freed inline-callee frame
+    /// pointer as a SETFIELD base), and the foreign word read as the header may
+    /// happen to have `OLDGEN_TRACKED` set. Admitting such an address pushes
+    /// non-object memory into the remembered set, whose garbage `type_id`
+    /// panics the next minor collection. So validate the header names a real
+    /// type first, then read the flag — an O(1) header read either way.
+    #[inline]
+    fn is_oldgen_write_barrier_object(&self, addr: usize) -> bool {
+        self.has_valid_managed_header(addr)
+            && unsafe { (*header_of(addr)).has_flag(flags::OLDGEN_TRACKED) }
     }
 
     /// incminimark.py:1208 is_in_nursery parity.
@@ -1513,6 +1518,13 @@ impl MiniMarkGC {
     /// but CARDS_SET is not. Tries to set CARDS_SET; otherwise falls
     /// back to remember_young_pointer (generic barrier).
     pub fn jit_remember_young_pointer_from_array(&mut self, obj: GcRef) {
+        // The JIT can present a stale or wild barrier target (e.g. a freed
+        // inline frame the bridge still holds as a SETARRAYITEM base). Reject
+        // it before touching the card byte / CARDS_SET, mirroring the validity
+        // guard `is_oldgen_write_barrier_object` applies on the no-cards path.
+        if !self.has_valid_managed_header(obj.0) {
+            return;
+        }
         let hdr = unsafe { header_of(obj.0) };
         if unsafe { (*hdr).has_flag(flags::HAS_CARDS) } {
             // incminimark.py:1614-1615
