@@ -477,16 +477,13 @@ fn derive_program_metadata(
                 };
                 struct_origins.entry(leaf.clone()).or_insert(module);
                 // Register-class rows for `FORCE_ATTRIBUTES_INTO_CLASSES`,
-                // keyed by the crate-stripped qualified name (drop only the
-                // crate prefix, keep the module path + leaf) the
-                // `_init_classdef` read uses.  Declaration order is
-                // preserved so the pre-filled `ClassDef.attrs` match the
-                // struct layout.  Last-writer-wins on the crate-stripped key.
-                let attr_key = if segs.len() >= 2 {
-                    segs[1..].join("::")
-                } else {
-                    leaf.clone()
-                };
+                // keyed by the bare leaf name — the same key the syn
+                // pre-pass registers (it walks each file with an empty
+                // module prefix) and the key `_init_classdef` reads via
+                // `pyobj.qualname()`.  Declaration order is preserved so the
+                // pre-filled `ClassDef.attrs` match the struct layout.
+                // Last-writer-wins on the leaf (duplicate leaves collapse,
+                // as in the syn pre-pass).
                 let attr_rows: Vec<(String, ValueType)> = fields
                     .iter()
                     .enumerate()
@@ -495,7 +492,7 @@ fn derive_program_metadata(
                         (fname, tyref_to_attr_value_type(&f.ty, llbc))
                     })
                     .collect();
-                struct_field_attrs.insert(attr_key, attr_rows);
+                struct_field_attrs.insert(leaf.clone(), attr_rows);
                 known_struct_names.insert(name);
                 known_struct_names.insert(leaf);
             }
