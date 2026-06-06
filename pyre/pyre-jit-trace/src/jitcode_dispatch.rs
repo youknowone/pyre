@@ -3417,6 +3417,163 @@ fn try_fold_pure_call_via_executor(
     ctx.trace_ctx.set_opref_concrete(recorded, result_value);
 }
 
+/// PyPy `_opimpl_residual_call{1,2,3}` (pyjitpl.py:1346/1349/1354) port
+/// for the **non-elidable** call shapes — companion to
+/// [`try_fold_pure_call_via_executor`] which handles the elidable case.
+///
+/// Upstream calls `executor.execute_varargs(opnum, argboxes, descr,
+/// exc=can_raise, pure=False)` which dispatches through
+/// `cpu.bh_call_*` and clears/records BH exception state via
+/// `metainterp.clear_exception()` + `metainterp.execute_raised(...)`.
+/// This walker-friendly counterpart returns `Result<i64, i64>` directly
+/// (via [`majit_metainterp::executor::execute_residual_call`]) so the
+/// caller can wire the BH exception into `WalkContext.last_exc_value`
+/// without dragging in a `MetaInterp` seam.
+///
+/// **Why this exists** (Task #390 widening): walker's
+/// `production_walker_handles` arm skips `execute_opcode_step` for
+/// `eval.rs:3111` opcodes; for opcodes whose body contains a
+/// non-elidable `residual_call_*` (`store_subscr_fn` /
+/// `set_current_exception` / etc.), the helper is never invoked → heap
+/// mutation never happens → next read derefs stale container → SIGBUS
+/// (M4 walker unactivated taxonomy: 5 STORE_SUBSCR-hot benches).  The
+/// orthodox fix is to widen this function across `Call*` /
+/// `CallLoopinvariant*` shapes, mirroring PyPy's
+/// `_opimpl_residual_call*` which concrete-executes *every* residual
+/// call regardless of EI.
+///
+/// **Caller contract**:
+/// * `call_opcode` must be one of the non-elidable, non-may-force
+///   residual call shapes: `Call{I,R,F,N}` (the default arm) or
+///   `CallLoopinvariant{I,R,F,N}` (the `EF_LOOPINVARIANT` arm).
+///   * `CallPure*` is excluded — that's [`try_fold_pure_call_via_executor`]'s
+///     job.
+///   * `CallMayForce*` / `CallReleaseGil*` / `CallAssembler*` are
+///     intentionally excluded: their trace-recording-time invariants
+///     (force-virtual audit, GIL transitions, jitdriver re-entry)
+///     need a separate audit (Task #390 sub-slice 4).
+/// * `allboxes[0]` is the funcbox (per `build_allboxes` layout); the
+///   remaining slots are user args in `descr.arg_types()` ABI order.
+///
+/// **Return value**:
+/// * `Some(Ok(_))` — helper executed normally, `recorded` OpRef stamped
+///   with the concrete result.
+/// * `Some(Err(bh_exc))` — helper raised; `bh_exc` is the wrapped
+///   `PyError` pointer (from `BH_LAST_EXC_VALUE`).  Caller is
+///   responsible for routing into `WalkContext.last_exc_value` so the
+///   downstream `GuardNoException` walker handler picks it up; the
+///   `recorded` OpRef is NOT stamped (no concrete result).
+/// * `None` — fold declined (preconditions not met: opcode out of set,
+///   funcbox non-const, arity exceeds [`MAX_HOST_CALL_ARITY`], any
+///   operand lacks a concrete `box_value`, or any Ref arg is NULL).
+///   The trace still has the recorded call op for the optimizer to
+///   consume later; walker falls through as if this function did not
+///   exist.
+///
+/// **Wire status** (Task #390 sub-slice 2.2): this function is not yet
+/// invoked from any dispatch site.  Sub-slices 2.3+ wire it into the
+/// three dispatch entry points (`dispatch_residual_call_iRd_kind`,
+/// `dispatch_residual_call_iIRd_kind`, `dispatch_residual_call_iIRFd_kind`)
+/// alongside [`try_fold_pure_call_via_executor`].
+#[allow(dead_code)]
+fn try_execute_residual_call_via_executor(
+    ctx: &mut WalkContext<'_, '_>,
+    call_opcode: OpCode,
+    allboxes: &[OpRef],
+    call_descr: &dyn majit_ir::descr::CallDescr,
+    recorded: OpRef,
+) -> Option<Result<i64, i64>> {
+    if !matches!(
+        call_opcode,
+        OpCode::CallI
+            | OpCode::CallR
+            | OpCode::CallF
+            | OpCode::CallN
+            | OpCode::CallLoopinvariantI
+            | OpCode::CallLoopinvariantR
+            | OpCode::CallLoopinvariantF
+            | OpCode::CallLoopinvariantN
+    ) {
+        return None;
+    }
+    if allboxes.is_empty() {
+        return None;
+    }
+    // Same funcbox-must-be-const invariant as `try_fold_pure_call_via_executor`:
+    // a non-const funcbox carries a stale stamp and dereferencing it as a
+    // code address SEGVs.  pyjitpl.py:1346-1354 forces the funcbox through
+    // the executor's `cpu.bh_call_*` `ConstInt.getint()` path which
+    // implicitly requires constness too (residual_call descrs always
+    // carry a fixed funcptr at translation time).
+    if !allboxes[0].is_constant() {
+        return None;
+    }
+    let funcptr_val = ctx.trace_ctx.box_value(allboxes[0]);
+    let func_ptr = match funcptr_val {
+        Some(majit_ir::Value::Int(addr)) => addr,
+        _ => return None,
+    };
+    if allboxes.len() - 1 > majit_translate::jit_codewriter::insns::MAX_HOST_CALL_ARITY {
+        return None;
+    }
+    let mut args = Vec::with_capacity(allboxes.len() - 1);
+    for &arg in &allboxes[1..] {
+        let v = match ctx.trace_ctx.box_value(arg) {
+            Some(majit_ir::Value::Int(n)) => n,
+            Some(majit_ir::Value::Ref(r)) => {
+                if r == majit_ir::GcRef(usize::MAX) {
+                    return None;
+                }
+                r.as_usize() as i64
+            }
+            Some(majit_ir::Value::Float(f)) => f.to_bits() as i64,
+            Some(majit_ir::Value::Void) => 0,
+            None => return None,
+        };
+        args.push(v);
+    }
+    // NULL-Ref-arg refusal: same SEGV-avoidance contract as the pure
+    // path (see `try_fold_pure_call_via_executor`'s NULL guard).  Pyre's
+    // optimizer emits `guard_nonnull` after this walker fold, so a NULL
+    // receiver dereferences before that guard exists; fall through to
+    // recording the call op and let the optimizer's guard emission
+    // handle it at compile time.
+    for (i, &arg) in args.iter().enumerate() {
+        if matches!(call_descr.arg_types().get(i), Some(majit_ir::Type::Ref)) && arg == 0 {
+            return None;
+        }
+    }
+    let exec_result =
+        majit_metainterp::executor::execute_residual_call(call_descr, func_ptr, &args);
+    if let Ok(result_i64) = exec_result {
+        // pyjitpl.py:1392 `result_box.value = result` analogue — stamp
+        // the recorded OpRef with the executed concrete so downstream
+        // `concrete_of_opref` / `box_value` consumers see the folded
+        // value.  Void callees do not stamp (no result to record); the
+        // heap mutation has already happened via `call_void_function`.
+        match call_descr.result_type() {
+            majit_ir::Type::Int => {
+                ctx.trace_ctx
+                    .set_opref_concrete(recorded, majit_ir::Value::Int(result_i64));
+            }
+            majit_ir::Type::Ref => {
+                ctx.trace_ctx.set_opref_concrete(
+                    recorded,
+                    majit_ir::Value::Ref(majit_ir::GcRef(result_i64 as usize)),
+                );
+            }
+            majit_ir::Type::Float => {
+                ctx.trace_ctx.set_opref_concrete(
+                    recorded,
+                    majit_ir::Value::Float(f64::from_bits(result_i64 as u64)),
+                );
+            }
+            majit_ir::Type::Void => {}
+        }
+    }
+    Some(exec_result)
+}
+
 /// `pyjitpl.py:3671-3681 MetaInterp.direct_call_release_gil` port.
 /// Sub-case of the forces-virtual-or-virtualizable branch
 /// (`pyjitpl.py:2063` `if effectinfo.is_call_release_gil()`): when the
