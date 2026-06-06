@@ -2101,7 +2101,6 @@ impl ClassDesc {
 /// and `see_instance` land with c3 because they depend on the
 /// bookkeeper's update_attr / MethodDesc.bind_self / live-reflection
 /// hooks.
-#[derive(Debug)]
 pub struct ClassDef {
     /// RPython `self.bookkeeper`. Weak to avoid cycles with the bookkeeper's
     /// `classdefs` Vec.
@@ -2168,6 +2167,18 @@ pub struct ClassDef {
     /// `hasattr(classdef, 'my_instantiate_graph')`; the Rust port uses
     /// `Option::is_some` instead.
     pub my_instantiate_graph: Option<crate::flowspace::model::GraphRef>,
+}
+
+impl std::fmt::Debug for ClassDef {
+    /// RPython `ClassDef.__repr__` (classdesc.py:242-243):
+    /// `return "<ClassDef '%s'>" % (self.name,)`. Printing only the name
+    /// is also load-bearing: a derived `Debug` would recurse through
+    /// `attrs[..].s_value` → `SomeInstance.classdef` → back to this
+    /// `ClassDef` on any self-referential class type (e.g. a linked-list
+    /// node), overflowing the stack.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "<ClassDef '{}'>", self.name)
+    }
 }
 
 impl ClassDef {

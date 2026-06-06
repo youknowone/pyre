@@ -2088,7 +2088,7 @@ pub struct Specialization {
         dyn Fn(
             &crate::annotator::annrpython::RPythonAnnotator,
             &HLOperation,
-        ) -> crate::annotator::model::SomeValue,
+        ) -> Option<crate::annotator::model::SomeValue>,
     >,
     /// RPython `specialized.can_only_throw = impl.can_only_throw`
     /// side-band (operation.py:234).
@@ -2123,7 +2123,7 @@ pub(crate) fn apply_specialization(
     spec: &Specialization,
     annotator: &crate::annotator::annrpython::RPythonAnnotator,
     hlop: &HLOperation,
-) -> Result<crate::annotator::model::SomeValue, crate::annotator::model::AnnotatorError> {
+) -> Result<Option<crate::annotator::model::SomeValue>, crate::annotator::model::AnnotatorError> {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         (spec.apply)(annotator, hlop)
     })) {
@@ -2133,6 +2133,28 @@ pub(crate) fn apply_specialization(
             None => std::panic::resume_unwind(payload),
         },
     }
+}
+
+/// Adapt a total annotation handler — one that always yields a concrete
+/// `SomeValue` — into the `Optional[SomeObject]` shape `op.consider`
+/// returns (operation.py:104). This is the common case: most handlers
+/// always produce an annotation. Void handlers (`setattr` / `delattr`,
+/// whose upstream methods `return None`) and explicit-block handlers
+/// register a plain `Box::new` closure that returns `None` or
+/// `Some(s_ImpossibleValue)` directly instead of going through `pure`.
+pub(crate) fn pure(
+    f: impl Fn(
+        &crate::annotator::annrpython::RPythonAnnotator,
+        &HLOperation,
+    ) -> crate::annotator::model::SomeValue
+    + 'static,
+) -> Box<
+    dyn Fn(
+        &crate::annotator::annrpython::RPythonAnnotator,
+        &HLOperation,
+    ) -> Option<crate::annotator::model::SomeValue>,
+> {
+    Box::new(move |ann, hl| Some(f(ann, hl)))
 }
 
 /// RPython `getattr(opimpl, 'can_only_throw', None)` polymorphism
@@ -2320,7 +2342,8 @@ impl HLOperation {
     pub fn consider(
         &self,
         annotator: &crate::annotator::annrpython::RPythonAnnotator,
-    ) -> Result<crate::annotator::model::SomeValue, crate::annotator::model::AnnotatorError> {
+    ) -> Result<Option<crate::annotator::model::SomeValue>, crate::annotator::model::AnnotatorError>
+    {
         use crate::annotator::model::{AnnotatorError, SomeValue};
         // upstream operation.py:101-104 —
         //     args_s = [annotator.annotation(arg) for arg in self.args]
@@ -2364,7 +2387,7 @@ impl HLOperation {
                     })?
                     .tag();
                 let result =
-                    _REGISTRY_SINGLE.with(|cell| -> Result<SomeValue, AnnotatorError> {
+                    _REGISTRY_SINGLE.with(|cell| -> Result<Option<SomeValue>, AnnotatorError> {
                         let reg = cell.borrow();
                         let entries = reg.get(&self.kind).ok_or_else(|| {
                             AnnotatorError::new(format!(
@@ -2407,7 +2430,7 @@ impl HLOperation {
                     })?
                     .tag();
                 let result =
-                    _REGISTRY_DOUBLE.with(|cell| -> Result<SomeValue, AnnotatorError> {
+                    _REGISTRY_DOUBLE.with(|cell| -> Result<Option<SomeValue>, AnnotatorError> {
                         let reg = cell.borrow();
                         let entries = reg.get(&self.kind).ok_or_else(|| {
                             AnnotatorError::new(format!(
@@ -2431,13 +2454,13 @@ impl HLOperation {
                 use crate::annotator::model::SomeTuple as AnSomeTuple;
                 match self.kind {
                     // operation.py:534-539 — NewDict.consider.
-                    OpKind::NewDict => Ok(SomeValue::Dict(annotator.bookkeeper.newdict())),
+                    OpKind::NewDict => Ok(Some(SomeValue::Dict(annotator.bookkeeper.newdict()))),
                     // operation.py:542-548 — NewTuple.consider.
-                    OpKind::NewTuple => Ok(SomeValue::Tuple(AnSomeTuple::new(args_s))),
+                    OpKind::NewTuple => Ok(Some(SomeValue::Tuple(AnSomeTuple::new(args_s)))),
                     // operation.py:551-557 — NewList.consider.
                     OpKind::NewList => {
                         let list = annotator.bookkeeper.newlist(&args_s, None)?;
-                        Ok(SomeValue::List(list))
+                        Ok(Some(SomeValue::List(list)))
                     }
                     // operation.py:560-565 — NewSlice.consider raises
                     // AnnotatorError outright.

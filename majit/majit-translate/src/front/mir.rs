@@ -966,10 +966,9 @@ impl<'a> Lowering<'a> {
                     v
                 }
             },
-            TermKind::Return
-            | TermKind::UnwindResume
-            | TermKind::Abort(_)
-            | TermKind::Unknown => vec![],
+            TermKind::Return | TermKind::UnwindResume | TermKind::Abort(_) | TermKind::Unknown => {
+                vec![]
+            }
         };
         raw.into_iter()
             .map(|t| t as usize)
@@ -1198,9 +1197,7 @@ impl<'a> Lowering<'a> {
         for &bb in &rpo {
             let bb_id = self.block_id[bb];
             let ex = exit_state[bb].clone().ok_or_else(|| {
-                LowerError::Unsupported(format!(
-                    "framestate: bb{bb} missing exit state in pass 2"
-                ))
+                LowerError::Unsupported(format!("framestate: bb{bb} missing exit state in pass 2"))
             })?;
             let exits_meta: Vec<(usize, BlockId)> = self
                 .graph

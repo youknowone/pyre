@@ -33,7 +33,7 @@ use crate::annotator::model::{
     SomeValue, SomeValueTag, s_bool, s_none,
 };
 use crate::flowspace::model::{ConstValue, Constant};
-use crate::flowspace::operation::{CanOnlyThrow, HLOperation, OpKind, Specialization};
+use crate::flowspace::operation::{CanOnlyThrow, HLOperation, OpKind, Specialization, pure};
 use crate::tool::pairtype::DoubleDispatchRegistry;
 
 // =====================================================================
@@ -536,17 +536,19 @@ fn init_ptr_integer_pairtype(
 fn ptr_integer_getitem(
     ann: &crate::annotator::annrpython::RPythonAnnotator,
     hl: &HLOperation,
-) -> SomeValue {
-    use crate::annotator::model::s_impossible_value;
+) -> Option<SomeValue> {
+    // llannotation.py:102-108 — `getitem`: on IndexError (e.g.
+    // FixedSizeArray(0)) returns None (void → result bound to Impossible
+    // without blocking); otherwise returns the item annotation.
     match ann.annotation(&hl.args[0]).unwrap_or(SomeValue::Impossible) {
         SomeValue::Ptr(p) => match p.ll_ptrtype._example().getitem(0) {
-            Ok(v) => ll_to_annotation(v),
-            Err(err) if err.contains("out of bounds") => s_impossible_value(),
+            Ok(v) => Some(ll_to_annotation(v)),
+            Err(err) if err.contains("out of bounds") => None,
             Err(err) => panic!("{err}"),
         },
         SomeValue::InteriorPtr(p) => match p.ll_ptrtype._example().getitem(0) {
-            Ok(v) => ll_to_annotation(v),
-            Err(err) if err.contains("out of bounds") => s_impossible_value(),
+            Ok(v) => Some(ll_to_annotation(v)),
+            Err(err) if err.contains("out of bounds") => None,
             Err(err) => panic!("{err}"),
         },
         _ => panic!("ptr_integer_getitem: arg 0 not ptr-like"),
@@ -556,7 +558,7 @@ fn ptr_integer_getitem(
 fn ptr_integer_setitem(
     ann: &crate::annotator::annrpython::RPythonAnnotator,
     hl: &HLOperation,
-) -> SomeValue {
+) -> Option<SomeValue> {
     let s_value = ann
         .annotation(&hl.args[2])
         .expect("ptr_integer_setitem: missing value arg");
@@ -591,7 +593,8 @@ fn ptr_integer_setitem(
         }
         _ => panic!("ptr_integer_setitem: arg 0 not ptr-like"),
     }
-    SomeValue::Impossible
+    // llannotation.py:111-115 — setitem "just doing checking", returns None.
+    None
 }
 
 fn init_ptr_object_pairtype(
@@ -603,7 +606,7 @@ fn init_ptr_object_pairtype(
         SomeValueTag::Ptr,
         SomeValueTag::Object,
         Specialization {
-            apply: Box::new(|ann, hl| {
+            apply: pure(|ann, hl| {
                 let p = ann.annotation(&hl.args[0]).unwrap_or(SomeValue::Impossible);
                 let obj = ann.annotation(&hl.args[1]).unwrap_or(SomeValue::Impossible);
                 panic!(
@@ -625,7 +628,7 @@ fn init_ptr_object_pairtype(
         SomeValueTag::Ptr,
         SomeValueTag::Object,
         Specialization {
-            apply: Box::new(|ann, hl| {
+            apply: pure(|ann, hl| {
                 let p = ann.annotation(&hl.args[0]).unwrap_or(SomeValue::Impossible);
                 let obj = ann.annotation(&hl.args[1]).unwrap_or(SomeValue::Impossible);
                 panic!(
@@ -660,7 +663,7 @@ fn init_address_pairtypes(
         SomeValueTag::TypedAddressAccess,
         SomeValueTag::Integer,
         Specialization {
-            apply: Box::new(typed_address_access_integer_getitem),
+            apply: pure(typed_address_access_integer_getitem),
             can_only_throw: CanOnlyThrow::List(vec![]),
         },
     );
@@ -682,7 +685,7 @@ fn init_address_pairtypes(
         SomeValueTag::Address,
         SomeValueTag::Integer,
         Specialization {
-            apply: Box::new(|_ann, _hl| SomeValue::Address(SomeAddress::new())),
+            apply: pure(|_ann, _hl| SomeValue::Address(SomeAddress::new())),
             can_only_throw: CanOnlyThrow::Absent,
         },
     );
@@ -693,7 +696,7 @@ fn init_address_pairtypes(
         SomeValueTag::Address,
         SomeValueTag::Integer,
         Specialization {
-            apply: Box::new(|_ann, _hl| SomeValue::Address(SomeAddress::new())),
+            apply: pure(|_ann, _hl| SomeValue::Address(SomeAddress::new())),
             can_only_throw: CanOnlyThrow::Absent,
         },
     );
@@ -704,7 +707,7 @@ fn init_address_pairtypes(
         SomeValueTag::Address,
         SomeValueTag::Address,
         Specialization {
-            apply: Box::new(address_address_sub),
+            apply: pure(address_address_sub),
             can_only_throw: CanOnlyThrow::Absent,
         },
     );
@@ -717,7 +720,7 @@ fn init_address_pairtypes(
         SomeValueTag::Address,
         SomeValueTag::Address,
         Specialization {
-            apply: Box::new(|_ann, _hl| panic!("comparisons with is not supported by addresses")),
+            apply: pure(|_ann, _hl| panic!("comparisons with is not supported by addresses")),
             can_only_throw: CanOnlyThrow::List(vec![]),
         },
     );
@@ -740,7 +743,7 @@ fn typed_address_access_integer_getitem(
 fn typed_address_access_integer_setitem(
     ann: &crate::annotator::annrpython::RPythonAnnotator,
     hl: &HLOperation,
-) -> SomeValue {
+) -> Option<SomeValue> {
     let s_value = ann
         .annotation(&hl.args[2])
         .expect("typed_address_access_integer_setitem: missing value arg");
@@ -755,7 +758,8 @@ fn typed_address_access_integer_setitem(
         }
         _ => panic!("typed_address_access_integer_setitem: arg 0 not TypedAddressAccess"),
     }
-    SomeValue::Impossible
+    // llannotation.py:38-39 — setitem asserts the value type, returns None.
+    None
 }
 
 /// llannotation.py:19-23 — `addr - addr`. Both null-address constants

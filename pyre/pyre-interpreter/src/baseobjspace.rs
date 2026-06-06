@@ -1141,8 +1141,8 @@ fn range_reversed_method(args: &[PyObjectRef]) -> PyResult {
 /// `(type(self), (start, stop, step))`.
 fn range_reduce_method(args: &[PyObjectRef]) -> PyResult {
     let (start, stop, step) = unsafe { pyre_object::w_range_fields(args[0]) };
-    let range_type = crate::typedef::gettypefor(&pyre_object::rangeobject::RANGE_TYPE)
-        .unwrap_or(PY_NULL);
+    let range_type =
+        crate::typedef::gettypefor(&pyre_object::rangeobject::RANGE_TYPE).unwrap_or(PY_NULL);
     let state = w_tuple_new(vec![w_int_new(start), w_int_new(stop), w_int_new(step)]);
     Ok(w_tuple_new(vec![range_type, state]))
 }

@@ -1992,11 +1992,21 @@ impl RPythonAnnotator {
         // upstream `resultcell = op.consider(self)`; AnnotatorError
         // raised inside get_specialization / registered handlers
         // propagates as `FlowinError::Annotator` via the `?`.
-        let resultcell = hlop.consider(self)?;
-        // upstream: None → s_ImpossibleValue; s_ImpossibleValue → block.
-        if matches!(resultcell, SomeValue::Impossible) {
-            return Err(BlockedInference::new(self, hlop.clone(), None).into());
-        }
+        //
+        // upstream annrpython.py:654-657 distinguishes a handler that
+        // returns Python `None` (a void op such as `setattr`) from one
+        // that returns `s_ImpossibleValue`:
+        //   if resultcell is None:                # void → bind impossible, no block
+        //       resultcell = s_ImpossibleValue
+        //   elif resultcell == s_ImpossibleValue: # the operation cannot succeed
+        //       raise BlockedInference(self, op, -1)
+        let resultcell = match hlop.consider(self)? {
+            None => SomeValue::Impossible,
+            Some(SomeValue::Impossible) => {
+                return Err(BlockedInference::new(self, hlop.clone(), None).into());
+            }
+            Some(cell) => cell,
+        };
         Ok(resultcell)
     }
 
@@ -3059,7 +3069,7 @@ mod tests {
         let args = blk.inputargs.clone();
         drop(blk);
         let hlop = HLOperation::new(OpKind::NewTuple, args);
-        let got = hlop.consider(&ann).unwrap();
+        let got = hlop.consider(&ann).unwrap().unwrap();
         if let SomeValue::Tuple(t) = got {
             assert_eq!(t.items.len(), 2);
             assert!(matches!(t.items[0], SomeValue::Integer(_)));
@@ -3086,7 +3096,7 @@ mod tests {
         }
         let args = startblock.borrow().inputargs.clone();
         let hlop = HLOperation::new(OpKind::NewList, args);
-        let got = hlop.consider(&ann).unwrap();
+        let got = hlop.consider(&ann).unwrap().unwrap();
         if let SomeValue::List(list) = got {
             assert!(matches!(list.listdef.s_value(), SomeValue::Integer(_)));
         } else {
@@ -3101,7 +3111,7 @@ mod tests {
         use super::super::super::flowspace::operation::{HLOperation, OpKind};
         let ann = RPythonAnnotator::new(None, None, None, false);
         let hlop = HLOperation::new(OpKind::NewDict, vec![]);
-        let got = hlop.consider(&ann).unwrap();
+        let got = hlop.consider(&ann).unwrap().unwrap();
         assert!(matches!(got, SomeValue::Dict(_)));
     }
 

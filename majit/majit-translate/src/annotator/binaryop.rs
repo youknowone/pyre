@@ -21,7 +21,7 @@ use std::rc::Rc;
 use super::super::flowspace::model::Variable;
 use super::super::flowspace::model::{ConstValue, Constant, Hlvalue};
 use super::super::flowspace::operation::{
-    BuiltinException, CanOnlyThrow, HLOperation, OpKind, Specialization, Transformation,
+    BuiltinException, CanOnlyThrow, HLOperation, OpKind, Specialization, Transformation, pure,
 };
 use super::annrpython::RPythonAnnotator;
 use super::model::{
@@ -180,7 +180,7 @@ fn init_is_default(
         SomeValueTag::Object,
         SomeValueTag::Object,
         Specialization {
-            apply: Box::new(is__default),
+            apply: pure(is__default),
             can_only_throw: CanOnlyThrow::List(vec![]),
         },
     );
@@ -374,7 +374,7 @@ fn init_object_pairtype(
         Object,
         Object,
         Specialization {
-            apply: Box::new(inplace_add),
+            apply: pure(inplace_add),
             can_only_throw: empty(),
         },
     );
@@ -384,7 +384,7 @@ fn init_object_pairtype(
         Object,
         Object,
         Specialization {
-            apply: Box::new(inplace_sub),
+            apply: pure(inplace_sub),
             can_only_throw: empty(),
         },
     );
@@ -394,7 +394,7 @@ fn init_object_pairtype(
         Object,
         Object,
         Specialization {
-            apply: Box::new(inplace_mul),
+            apply: pure(inplace_mul),
             can_only_throw: empty(),
         },
     );
@@ -404,7 +404,7 @@ fn init_object_pairtype(
         Object,
         Object,
         Specialization {
-            apply: Box::new(inplace_truediv),
+            apply: pure(inplace_truediv),
             can_only_throw: zd(),
         },
     );
@@ -414,7 +414,7 @@ fn init_object_pairtype(
         Object,
         Object,
         Specialization {
-            apply: Box::new(inplace_floordiv),
+            apply: pure(inplace_floordiv),
             can_only_throw: zd(),
         },
     );
@@ -424,7 +424,7 @@ fn init_object_pairtype(
         Object,
         Object,
         Specialization {
-            apply: Box::new(inplace_div),
+            apply: pure(inplace_div),
             can_only_throw: zd(),
         },
     );
@@ -434,7 +434,7 @@ fn init_object_pairtype(
         Object,
         Object,
         Specialization {
-            apply: Box::new(inplace_mod),
+            apply: pure(inplace_mod),
             can_only_throw: zd(),
         },
     );
@@ -444,7 +444,7 @@ fn init_object_pairtype(
         Object,
         Object,
         Specialization {
-            apply: Box::new(inplace_lshift),
+            apply: pure(inplace_lshift),
             can_only_throw: empty(),
         },
     );
@@ -454,7 +454,7 @@ fn init_object_pairtype(
         Object,
         Object,
         Specialization {
-            apply: Box::new(inplace_rshift),
+            apply: pure(inplace_rshift),
             can_only_throw: empty(),
         },
     );
@@ -464,7 +464,7 @@ fn init_object_pairtype(
         Object,
         Object,
         Specialization {
-            apply: Box::new(inplace_and_),
+            apply: pure(inplace_and_),
             can_only_throw: empty(),
         },
     );
@@ -474,7 +474,7 @@ fn init_object_pairtype(
         Object,
         Object,
         Specialization {
-            apply: Box::new(inplace_or_),
+            apply: pure(inplace_or_),
             can_only_throw: empty(),
         },
     );
@@ -484,7 +484,7 @@ fn init_object_pairtype(
         Object,
         Object,
         Specialization {
-            apply: Box::new(inplace_xor),
+            apply: pure(inplace_xor),
             can_only_throw: empty(),
         },
     );
@@ -497,7 +497,7 @@ fn init_object_pairtype(
         Object,
         Object,
         Specialization {
-            apply: Box::new(|_ann, _hl| SomeValue::Integer(SomeInteger::default())),
+            apply: pure(|_ann, _hl| SomeValue::Integer(SomeInteger::default())),
             can_only_throw: CanOnlyThrow::Absent,
         },
     );
@@ -509,7 +509,7 @@ fn init_object_pairtype(
         Object,
         Object,
         Specialization {
-            apply: Box::new(|ann, hl| {
+            apply: pure(|ann, hl| {
                 // Upstream: `SomeTuple([pair(obj1, obj2).div(), pair(obj1, obj2).mod()])`.
                 // Use explicit HLOperation dispatches via _REGISTRY_DOUBLE.
                 let s0 = ann.annotation(&hl.args[0]).unwrap_or(SomeValue::Impossible);
@@ -529,7 +529,7 @@ fn init_object_pairtype(
         Object,
         Object,
         Specialization {
-            apply: Box::new(|ann, hl| {
+            apply: pure(|ann, hl| {
                 let s1 = ann.annotation(&hl.args[0]).unwrap_or(SomeValue::Impossible);
                 let s2 = ann.annotation(&hl.args[1]).unwrap_or(SomeValue::Impossible);
                 super::model::union(&s1, &s2).unwrap_or(SomeValue::Impossible)
@@ -549,7 +549,7 @@ fn init_object_pairtype(
             Object,
             Object,
             Specialization {
-                apply: Box::new(|_ann, _hl| SomeValue::Impossible),
+                apply: pure(|_ann, _hl| SomeValue::Impossible),
                 can_only_throw: CanOnlyThrow::Absent,
             },
         );
@@ -562,7 +562,7 @@ fn init_object_pairtype(
         Object,
         Object,
         Specialization {
-            apply: Box::new(|_ann, _hl| SomeValue::Impossible),
+            apply: pure(|_ann, _hl| SomeValue::Impossible),
             can_only_throw: CanOnlyThrow::Absent,
         },
     );
@@ -664,8 +664,12 @@ fn dispatch_pair(
         let reg = cell.borrow();
         let entries = reg.get(&target).expect("target registry missing");
         match entries.get((tag1, tag2), tag1.mro(), tag2.mro()) {
+            // The delegated pair op is always a value-producing arithmetic
+            // spec (never a void `setattr`-style handler), so its
+            // `Optional[SomeObject]` result carries a concrete annotation.
             Some(spec) => crate::flowspace::operation::apply_specialization(spec, ann, hl)
-                .unwrap_or_else(|err| std::panic::panic_any(err)),
+                .unwrap_or_else(|err| std::panic::panic_any(err))
+                .expect("delegated pair op is not a void operation"),
             None => SomeValue::Impossible,
         }
     })
@@ -689,7 +693,7 @@ fn init_integer_pairtype(
             Integer,
             Integer,
             Specialization {
-                apply: Box::new(integer_union),
+                apply: pure(integer_union),
                 can_only_throw: CanOnlyThrow::List(vec![]),
             },
         );
@@ -702,7 +706,7 @@ fn init_integer_pairtype(
             Integer,
             Integer,
             Specialization {
-                apply: Box::new(integer_union),
+                apply: pure(integer_union),
                 can_only_throw: CanOnlyThrow::List(vec![BuiltinException::OverflowError]),
             },
         );
@@ -715,7 +719,7 @@ fn init_integer_pairtype(
             Integer,
             Integer,
             Specialization {
-                apply: Box::new(integer_union),
+                apply: pure(integer_union),
                 can_only_throw: CanOnlyThrow::List(vec![BuiltinException::ZeroDivisionError]),
             },
         );
@@ -729,7 +733,7 @@ fn init_integer_pairtype(
             Integer,
             Integer,
             Specialization {
-                apply: Box::new(integer_union),
+                apply: pure(integer_union),
                 can_only_throw: CanOnlyThrow::List(vec![
                     BuiltinException::ZeroDivisionError,
                     BuiltinException::OverflowError,
@@ -745,7 +749,7 @@ fn init_integer_pairtype(
         Integer,
         Integer,
         Specialization {
-            apply: Box::new(|_ann, _hl| SomeValue::Float(SomeFloat::new())),
+            apply: pure(|_ann, _hl| SomeValue::Float(SomeFloat::new())),
             can_only_throw: CanOnlyThrow::List(vec![BuiltinException::ZeroDivisionError]),
         },
     );
@@ -757,7 +761,7 @@ fn init_integer_pairtype(
         Integer,
         Integer,
         Specialization {
-            apply: Box::new(integer_union),
+            apply: pure(integer_union),
             can_only_throw: CanOnlyThrow::List(vec![BuiltinException::ZeroDivisionError]),
         },
     );
@@ -767,7 +771,7 @@ fn init_integer_pairtype(
         Integer,
         Integer,
         Specialization {
-            apply: Box::new(|_ann, _hl| SomeValue::Float(SomeFloat::new())),
+            apply: pure(|_ann, _hl| SomeValue::Float(SomeFloat::new())),
             can_only_throw: CanOnlyThrow::List(vec![BuiltinException::ZeroDivisionError]),
         },
     );
@@ -779,7 +783,7 @@ fn init_integer_pairtype(
         Integer,
         Integer,
         Specialization {
-            apply: Box::new(integer_sub),
+            apply: pure(integer_sub),
             can_only_throw: CanOnlyThrow::List(vec![]),
         },
     );
@@ -789,7 +793,7 @@ fn init_integer_pairtype(
         Integer,
         Integer,
         Specialization {
-            apply: Box::new(integer_sub),
+            apply: pure(integer_sub),
             can_only_throw: CanOnlyThrow::List(vec![BuiltinException::OverflowError]),
         },
     );
@@ -801,7 +805,7 @@ fn init_integer_pairtype(
         Integer,
         Integer,
         Specialization {
-            apply: Box::new(integer_and),
+            apply: pure(integer_and),
             can_only_throw: CanOnlyThrow::List(vec![]),
         },
     );
@@ -813,7 +817,7 @@ fn init_integer_pairtype(
         Integer,
         Integer,
         Specialization {
-            apply: Box::new(integer_lshift),
+            apply: pure(integer_lshift),
             can_only_throw: CanOnlyThrow::List(vec![]),
         },
     );
@@ -823,7 +827,7 @@ fn init_integer_pairtype(
         Integer,
         Integer,
         Specialization {
-            apply: Box::new(integer_lshift),
+            apply: pure(integer_lshift),
             can_only_throw: CanOnlyThrow::List(vec![BuiltinException::OverflowError]),
         },
     );
@@ -835,7 +839,7 @@ fn init_integer_pairtype(
         Integer,
         Integer,
         Specialization {
-            apply: Box::new(integer_rshift),
+            apply: pure(integer_rshift),
             can_only_throw: CanOnlyThrow::List(vec![]),
         },
     );
@@ -934,7 +938,7 @@ fn init_cmp_default(
             SomeValueTag::Object,
             SomeValueTag::Object,
             Specialization {
-                apply: Box::new(move |ann, hl| cmp_default_annotate(cmp_op, ann, hl)),
+                apply: pure(move |ann, hl| cmp_default_annotate(cmp_op, ann, hl)),
                 can_only_throw: CanOnlyThrow::Absent,
             },
         );
@@ -1000,7 +1004,7 @@ fn init_cmp_integer(
             SomeValueTag::Integer,
             SomeValueTag::Integer,
             Specialization {
-                apply: Box::new(move |ann, hl| cmp_integer(cmp_op, ann, hl)),
+                apply: pure(move |ann, hl| cmp_integer(cmp_op, ann, hl)),
                 can_only_throw: CanOnlyThrow::Absent,
             },
         );
@@ -1111,7 +1115,7 @@ fn init_bool_pairtype(
         Bool,
         Bool,
         Specialization {
-            apply: Box::new(bool_and_),
+            apply: pure(bool_and_),
             can_only_throw: CanOnlyThrow::List(vec![]),
         },
     );
@@ -1121,7 +1125,7 @@ fn init_bool_pairtype(
         Bool,
         Bool,
         Specialization {
-            apply: Box::new(bool_or_),
+            apply: pure(bool_or_),
             can_only_throw: CanOnlyThrow::List(vec![]),
         },
     );
@@ -1131,7 +1135,7 @@ fn init_bool_pairtype(
         Bool,
         Bool,
         Specialization {
-            apply: Box::new(bool_xor),
+            apply: pure(bool_xor),
             can_only_throw: CanOnlyThrow::List(vec![]),
         },
     );
@@ -1219,7 +1223,7 @@ fn init_float_pairtype(
             Float,
             Float,
             Specialization {
-                apply: Box::new(|_ann, _hl| SomeValue::Float(SomeFloat::new())),
+                apply: pure(|_ann, _hl| SomeValue::Float(SomeFloat::new())),
                 can_only_throw: CanOnlyThrow::Absent,
             },
         );
@@ -1231,7 +1235,7 @@ fn init_float_pairtype(
         Float,
         Float,
         Specialization {
-            apply: Box::new(|_ann, _hl| SomeValue::Float(SomeFloat::new())),
+            apply: pure(|_ann, _hl| SomeValue::Float(SomeFloat::new())),
             can_only_throw: CanOnlyThrow::List(vec![]),
         },
     );
@@ -1241,7 +1245,7 @@ fn init_float_pairtype(
         Float,
         Float,
         Specialization {
-            apply: Box::new(|_ann, _hl| SomeValue::Float(SomeFloat::new())),
+            apply: pure(|_ann, _hl| SomeValue::Float(SomeFloat::new())),
             can_only_throw: CanOnlyThrow::List(vec![]),
         },
     );
@@ -1252,7 +1256,7 @@ fn init_float_pairtype(
         Float,
         Float,
         Specialization {
-            apply: Box::new(|_ann, _hl| SomeValue::Float(SomeFloat::new())),
+            apply: pure(|_ann, _hl| SomeValue::Float(SomeFloat::new())),
             can_only_throw: CanOnlyThrow::List(vec![]),
         },
     );
@@ -1262,7 +1266,7 @@ fn init_float_pairtype(
         Float,
         Float,
         Specialization {
-            apply: Box::new(|_ann, _hl| SomeValue::Float(SomeFloat::new())),
+            apply: pure(|_ann, _hl| SomeValue::Float(SomeFloat::new())),
             can_only_throw: CanOnlyThrow::List(vec![]),
         },
     );
@@ -1308,7 +1312,7 @@ fn init_string_pairtype(
         SomeValueTag::String,
         SomeValueTag::String,
         Specialization {
-            apply: Box::new(string_string_add),
+            apply: pure(string_string_add),
             can_only_throw: CanOnlyThrow::Absent,
         },
     );
@@ -1357,7 +1361,7 @@ fn init_bytearray_pairtype(
         SomeValueTag::ByteArray,
         SomeValueTag::ByteArray,
         Specialization {
-            apply: Box::new(|_ann, _hl| SomeValue::ByteArray(SomeByteArray::new(false))),
+            apply: pure(|_ann, _hl| SomeValue::ByteArray(SomeByteArray::new(false))),
             can_only_throw: CanOnlyThrow::Absent,
         },
     );
@@ -1380,7 +1384,7 @@ fn init_bytearray_integer_pairtype(
         SomeValueTag::ByteArray,
         SomeValueTag::Integer,
         Specialization {
-            apply: Box::new(|_ann, _hl| SomeValue::Integer(SomeInteger::default())),
+            apply: pure(|_ann, _hl| SomeValue::Integer(SomeInteger::default())),
             can_only_throw: CanOnlyThrow::Absent,
         },
     );
@@ -1405,7 +1409,7 @@ fn init_bytearray_integer_pairtype(
     );
 }
 
-fn bytearray_integer_setitem(ann: &RPythonAnnotator, hl: &HLOperation) -> SomeValue {
+fn bytearray_integer_setitem(ann: &RPythonAnnotator, hl: &HLOperation) -> Option<SomeValue> {
     // upstream asserts the 3rd arg is a SomeInteger.
     let s_value = ann
         .annotation(&hl.args[2])
@@ -1415,11 +1419,9 @@ fn bytearray_integer_setitem(ann: &RPythonAnnotator, hl: &HLOperation) -> SomeVa
         "bytearray.setitem: assert isinstance(s_i2, SomeInteger): got {:?}",
         s_value
     );
-    // upstream returns None implicitly → SomeImpossibleValue? No, the
-    // specialization return value here is ignored by the annotator for
-    // setitem (it's a void op). We return SomeValue::Impossible to
-    // match upstream's `return None` convention.
-    SomeValue::Impossible
+    // upstream `setitem` returns None (void): consider binds the result
+    // to Impossible without blocking.
+    None
 }
 
 // =====================================================================
@@ -1449,7 +1451,7 @@ fn init_string_bytearray_cross_pairtype(
             *t1,
             *t2,
             Specialization {
-                apply: Box::new(|_ann, _hl| SomeValue::ByteArray(SomeByteArray::new(false))),
+                apply: pure(|_ann, _hl| SomeValue::ByteArray(SomeByteArray::new(false))),
                 can_only_throw: CanOnlyThrow::Absent,
             },
         );
@@ -1499,7 +1501,7 @@ fn init_string_unicodestring_mod(
             *t1,
             *t2,
             Specialization {
-                apply: Box::new(|_ann, _hl| {
+                apply: pure(|_ann, _hl| {
                     panic!(
                         "AnnotatorError: string formatting mixing strings and unicode not supported"
                     )
@@ -1551,7 +1553,7 @@ fn init_string_tuple_mod(
             t1_copy,
             SomeValueTag::Tuple,
             Specialization {
-                apply: Box::new(move |ann, hl| string_tuple_mod(ann, hl, t1_copy)),
+                apply: pure(move |ann, hl| string_tuple_mod(ann, hl, t1_copy)),
                 can_only_throw: CanOnlyThrow::Absent,
             },
         );
@@ -1633,7 +1635,7 @@ fn init_string_object_mod(
             t1_copy,
             SomeValueTag::Object,
             Specialization {
-                apply: Box::new(move |ann, hl| string_object_mod(ann, hl, t1_copy)),
+                apply: pure(move |ann, hl| string_object_mod(ann, hl, t1_copy)),
                 can_only_throw: CanOnlyThrow::Absent,
             },
         );
@@ -1712,7 +1714,7 @@ fn init_list_list_pairtype(
         SomeValueTag::List,
         SomeValueTag::List,
         Specialization {
-            apply: Box::new(list_list_add),
+            apply: pure(list_list_add),
             can_only_throw: CanOnlyThrow::Absent,
         },
     );
@@ -1724,7 +1726,7 @@ fn init_list_list_pairtype(
             SomeValueTag::List,
             SomeValueTag::List,
             Specialization {
-                apply: Box::new(list_list_eq),
+                apply: pure(list_list_eq),
                 can_only_throw: CanOnlyThrow::Absent,
             },
         );
@@ -1778,7 +1780,7 @@ fn init_tuple_tuple_pairtype(
         SomeValueTag::Tuple,
         SomeValueTag::Tuple,
         Specialization {
-            apply: Box::new(tuple_tuple_add),
+            apply: pure(tuple_tuple_add),
             can_only_throw: CanOnlyThrow::Absent,
         },
     );
@@ -1790,7 +1792,7 @@ fn init_tuple_tuple_pairtype(
             SomeValueTag::Tuple,
             SomeValueTag::Tuple,
             Specialization {
-                apply: Box::new(tuple_tuple_eq),
+                apply: pure(tuple_tuple_eq),
                 can_only_throw: CanOnlyThrow::Absent,
             },
         );
@@ -1804,7 +1806,7 @@ fn init_tuple_tuple_pairtype(
             SomeValueTag::Tuple,
             SomeValueTag::Tuple,
             Specialization {
-                apply: Box::new(move |_ann, _hl| {
+                apply: pure(move |_ann, _hl| {
                     let sym = match op_copy {
                         OpKind::Lt => "<",
                         OpKind::Le => "<=",
@@ -1868,7 +1870,7 @@ fn init_tuple_integer_pairtype(
         SomeValueTag::Tuple,
         SomeValueTag::Integer,
         Specialization {
-            apply: Box::new(tuple_integer_getitem),
+            apply: pure(tuple_integer_getitem),
             can_only_throw: CanOnlyThrow::List(vec![BuiltinException::IndexError]),
         },
     );
@@ -1919,7 +1921,7 @@ fn init_list_integer_pairtype(
         SomeValueTag::List,
         SomeValueTag::Integer,
         Specialization {
-            apply: Box::new(list_integer_mul),
+            apply: pure(list_integer_mul),
             can_only_throw: CanOnlyThrow::Absent,
         },
     );
@@ -1930,7 +1932,7 @@ fn init_list_integer_pairtype(
         SomeValueTag::List,
         SomeValueTag::Integer,
         Specialization {
-            apply: Box::new(list_integer_getitem),
+            apply: pure(list_integer_getitem),
             can_only_throw: CanOnlyThrow::List(vec![]),
         },
     );
@@ -1941,7 +1943,7 @@ fn init_list_integer_pairtype(
         SomeValueTag::List,
         SomeValueTag::Integer,
         Specialization {
-            apply: Box::new(list_integer_getitem),
+            apply: pure(list_integer_getitem),
             can_only_throw: CanOnlyThrow::List(vec![BuiltinException::IndexError]),
         },
     );
@@ -1994,7 +1996,7 @@ fn list_integer_getitem(ann: &RPythonAnnotator, hl: &HLOperation) -> SomeValue {
     lst1.listdef.read_item(position)
 }
 
-fn list_integer_setitem(ann: &RPythonAnnotator, hl: &HLOperation) -> SomeValue {
+fn list_integer_setitem(ann: &RPythonAnnotator, hl: &HLOperation) -> Option<SomeValue> {
     let lst1 = match ann.annotation(&hl.args[0]) {
         Some(SomeValue::List(s)) => s,
         _ => panic!("list_integer_setitem: arg 0 not SomeList"),
@@ -2006,10 +2008,11 @@ fn list_integer_setitem(ann: &RPythonAnnotator, hl: &HLOperation) -> SomeValue {
     lst1.listdef
         .generalize(&s_value)
         .expect("listdef.generalize failed");
-    SomeValue::Impossible
+    // upstream `setitem` returns None (void).
+    None
 }
 
-fn list_integer_delitem(ann: &RPythonAnnotator, hl: &HLOperation) -> SomeValue {
+fn list_integer_delitem(ann: &RPythonAnnotator, hl: &HLOperation) -> Option<SomeValue> {
     let lst1 = match ann.annotation(&hl.args[0]) {
         Some(SomeValue::List(s)) => s,
         _ => panic!("list_integer_delitem: arg 0 not SomeList"),
@@ -2018,7 +2021,8 @@ fn list_integer_delitem(ann: &RPythonAnnotator, hl: &HLOperation) -> SomeValue {
     //     def delitem((lst1, int2)):
     //         lst1.listdef.resize()
     lst1.listdef.resize().expect("listdef.resize failed");
-    SomeValue::Impossible
+    // upstream `delitem` returns None (void).
+    None
 }
 
 // =====================================================================
@@ -2035,7 +2039,7 @@ fn init_string_integer_pairtype(
         SomeValueTag::String,
         SomeValueTag::Integer,
         Specialization {
-            apply: Box::new(string_integer_getitem),
+            apply: pure(string_integer_getitem),
             can_only_throw: CanOnlyThrow::List(vec![]),
         },
     );
@@ -2045,7 +2049,7 @@ fn init_string_integer_pairtype(
         SomeValueTag::String,
         SomeValueTag::Integer,
         Specialization {
-            apply: Box::new(string_integer_getitem),
+            apply: pure(string_integer_getitem),
             can_only_throw: CanOnlyThrow::List(vec![BuiltinException::IndexError]),
         },
     );
@@ -2056,7 +2060,7 @@ fn init_string_integer_pairtype(
         SomeValueTag::String,
         SomeValueTag::Integer,
         Specialization {
-            apply: Box::new(string_integer_mul),
+            apply: pure(string_integer_mul),
             can_only_throw: CanOnlyThrow::Absent,
         },
     );
@@ -2091,7 +2095,7 @@ fn init_unicodestring_integer_pairtype(
         SomeValueTag::UnicodeString,
         SomeValueTag::Integer,
         Specialization {
-            apply: Box::new(unicodestring_integer_getitem),
+            apply: pure(unicodestring_integer_getitem),
             can_only_throw: CanOnlyThrow::List(vec![]),
         },
     );
@@ -2101,7 +2105,7 @@ fn init_unicodestring_integer_pairtype(
         SomeValueTag::UnicodeString,
         SomeValueTag::Integer,
         Specialization {
-            apply: Box::new(unicodestring_integer_getitem),
+            apply: pure(unicodestring_integer_getitem),
             can_only_throw: CanOnlyThrow::List(vec![BuiltinException::IndexError]),
         },
     );
@@ -2111,7 +2115,7 @@ fn init_unicodestring_integer_pairtype(
         SomeValueTag::UnicodeString,
         SomeValueTag::Integer,
         Specialization {
-            apply: Box::new(unicodestring_integer_mul),
+            apply: pure(unicodestring_integer_mul),
             can_only_throw: CanOnlyThrow::Absent,
         },
     );
@@ -2150,7 +2154,7 @@ fn init_integer_string_pairtype(
         SomeValueTag::Integer,
         SomeValueTag::String,
         Specialization {
-            apply: Box::new(integer_string_mul),
+            apply: pure(integer_string_mul),
             can_only_throw: CanOnlyThrow::Absent,
         },
     );
@@ -2160,7 +2164,7 @@ fn init_integer_string_pairtype(
         SomeValueTag::Integer,
         SomeValueTag::UnicodeString,
         Specialization {
-            apply: Box::new(integer_unicodestring_mul),
+            apply: pure(integer_unicodestring_mul),
             can_only_throw: CanOnlyThrow::Absent,
         },
     );
@@ -2209,7 +2213,7 @@ fn init_unicode_family_union_add(
             *t1,
             *t2,
             Specialization {
-                apply: Box::new(unicode_family_add),
+                apply: pure(unicode_family_add),
                 can_only_throw: CanOnlyThrow::Absent,
             },
         );
@@ -2308,7 +2312,7 @@ fn init_cmp_str_unicode(
                 *t1,
                 *t2,
                 Specialization {
-                    apply: Box::new(|_ann, _hl| {
+                    apply: pure(|_ann, _hl| {
                         panic!(
                             "AnnotatorError: Comparing byte strings with unicode strings is not RPython"
                         )
@@ -2337,7 +2341,7 @@ fn init_integer_list_pairtype(
         SomeValueTag::Integer,
         SomeValueTag::List,
         Specialization {
-            apply: Box::new(integer_list_mul),
+            apply: pure(integer_list_mul),
             can_only_throw: CanOnlyThrow::Absent,
         },
     );
@@ -2369,7 +2373,7 @@ fn init_dict_dict_pairtype(
         SomeValueTag::Dict,
         SomeValueTag::Dict,
         Specialization {
-            apply: Box::new(|_ann, _hl| panic!("AnnotatorError: dict != dict not implemented")),
+            apply: pure(|_ann, _hl| panic!("AnnotatorError: dict != dict not implemented")),
             can_only_throw: CanOnlyThrow::Absent,
         },
     );
@@ -2434,7 +2438,7 @@ fn init_dict_getitem(
         SomeValueTag::Dict,
         SomeValueTag::Object,
         Specialization {
-            apply: Box::new(dict_object_getitem),
+            apply: pure(dict_object_getitem),
             can_only_throw: CanOnlyThrow::Callable(Box::new(dict_can_only_throw_keyerror)),
         },
     );
@@ -2494,7 +2498,7 @@ fn init_dict_object_pairtype(
     );
 }
 
-fn dict_object_setitem(ann: &RPythonAnnotator, hl: &HLOperation) -> SomeValue {
+fn dict_object_setitem(ann: &RPythonAnnotator, hl: &HLOperation) -> Option<SomeValue> {
     let dic1 = match ann.annotation(&hl.args[0]) {
         Some(SomeValue::Dict(d)) => d,
         _ => panic!("dict_object_setitem: arg 0 not SomeDict"),
@@ -2511,10 +2515,11 @@ fn dict_object_setitem(ann: &RPythonAnnotator, hl: &HLOperation) -> SomeValue {
     dic1.dictdef
         .generalize_value(&s_value)
         .expect("generalize_value failed");
-    SomeValue::Impossible
+    // upstream `setitem` returns None (void).
+    None
 }
 
-fn dict_object_delitem(ann: &RPythonAnnotator, hl: &HLOperation) -> SomeValue {
+fn dict_object_delitem(ann: &RPythonAnnotator, hl: &HLOperation) -> Option<SomeValue> {
     let dic1 = match ann.annotation(&hl.args[0]) {
         Some(SomeValue::Dict(d)) => d,
         _ => panic!("dict_object_delitem: arg 0 not SomeDict"),
@@ -2525,7 +2530,8 @@ fn dict_object_delitem(ann: &RPythonAnnotator, hl: &HLOperation) -> SomeValue {
     dic1.dictdef
         .generalize_key(&s_key)
         .expect("generalize_key failed");
-    SomeValue::Impossible
+    // upstream `delitem` returns None (void).
+    None
 }
 
 // =====================================================================
@@ -2574,7 +2580,7 @@ fn init_pbc_pbc_is_(
         SomeValueTag::PBC,
         SomeValueTag::PBC,
         Specialization {
-            apply: Box::new(pbc_pbc_is_),
+            apply: pure(pbc_pbc_is_),
             can_only_throw: CanOnlyThrow::List(vec![]),
         },
     );
@@ -2642,7 +2648,7 @@ fn init_pbc_object_pairtype(
         SomeValueTag::PBC,
         SomeValueTag::Object,
         Specialization {
-            apply: Box::new(|_ann, hl| panic!("AnnotatorError: getitem on {:?}", hl.args[0])),
+            apply: pure(|_ann, hl| panic!("AnnotatorError: getitem on {:?}", hl.args[0])),
             can_only_throw: CanOnlyThrow::Absent,
         },
     );
@@ -2652,7 +2658,7 @@ fn init_pbc_object_pairtype(
         SomeValueTag::PBC,
         SomeValueTag::Object,
         Specialization {
-            apply: Box::new(|_ann, hl| panic!("AnnotatorError: setitem on {:?}", hl.args[0])),
+            apply: pure(|_ann, hl| panic!("AnnotatorError: setitem on {:?}", hl.args[0])),
             can_only_throw: CanOnlyThrow::Absent,
         },
     );
@@ -2674,18 +2680,18 @@ fn init_none_object_pairtype(
         SomeValueTag::None_,
         SomeValueTag::Object,
         Specialization {
-            apply: Box::new(|_ann, _hl| s_impossible_value()),
+            apply: pure(|_ann, _hl| s_impossible_value()),
             can_only_throw: CanOnlyThrow::List(vec![]),
         },
     );
-    // binaryop.py:827-828 — `setitem((none, o), s_value)`: return None.
+    // binaryop.py:827-828 — `setitem((none, o), s_value)`: return None (void).
     register(
         reg,
         OpKind::SetItem,
         SomeValueTag::None_,
         SomeValueTag::Object,
         Specialization {
-            apply: Box::new(|_ann, _hl| SomeValue::Impossible),
+            apply: Box::new(|_ann, _hl| None),
             can_only_throw: CanOnlyThrow::Absent,
         },
     );
@@ -2705,7 +2711,7 @@ fn init_pbc_string_pairtype(
         SomeValueTag::PBC,
         SomeValueTag::String,
         Specialization {
-            apply: Box::new(|_ann, hl| panic!("AnnotatorError: add on {:?}", hl.args[0])),
+            apply: pure(|_ann, hl| panic!("AnnotatorError: add on {:?}", hl.args[0])),
             can_only_throw: CanOnlyThrow::Absent,
         },
     );
@@ -2716,7 +2722,7 @@ fn init_pbc_string_pairtype(
         SomeValueTag::String,
         SomeValueTag::PBC,
         Specialization {
-            apply: Box::new(|_ann, hl| panic!("AnnotatorError: add on {:?}", hl.args[1])),
+            apply: pure(|_ann, hl| panic!("AnnotatorError: add on {:?}", hl.args[1])),
             can_only_throw: CanOnlyThrow::Absent,
         },
     );
@@ -2807,7 +2813,7 @@ fn init_none_string_pairtype(
         SomeValueTag::None_,
         SomeValueTag::String,
         Specialization {
-            apply: Box::new(|_ann, _hl| s_impossible_value()),
+            apply: pure(|_ann, _hl| s_impossible_value()),
             can_only_throw: CanOnlyThrow::Absent,
         },
     );
@@ -2818,7 +2824,7 @@ fn init_none_string_pairtype(
         SomeValueTag::String,
         SomeValueTag::None_,
         Specialization {
-            apply: Box::new(|_ann, _hl| s_impossible_value()),
+            apply: pure(|_ann, _hl| s_impossible_value()),
             can_only_throw: CanOnlyThrow::Absent,
         },
     );
@@ -3018,14 +3024,14 @@ mod tests {
     #[test]
     fn consider_integer_add_returns_someinteger() {
         let (hl, ann) = hl_int_int(OpKind::Add);
-        let r = hl.consider(&ann).unwrap();
+        let r = hl.consider(&ann).unwrap().unwrap();
         assert!(matches!(r, SomeValue::Integer(_)), "got {:?}", r);
     }
 
     #[test]
     fn consider_integer_truediv_returns_somefloat() {
         let (hl, ann) = hl_int_int(OpKind::TrueDiv);
-        let r = hl.consider(&ann).unwrap();
+        let r = hl.consider(&ann).unwrap().unwrap();
         assert!(matches!(r, SomeValue::Float(_)), "got {:?}", r);
     }
 
@@ -3040,7 +3046,7 @@ mod tests {
     fn consider_integer_lt_returns_somebool() {
         let (base, ann) = hl_int_int(OpKind::Add);
         let hl = HLOperation::new(OpKind::Lt, base.args.clone());
-        let r = hl.consider(&ann).unwrap();
+        let r = hl.consider(&ann).unwrap().unwrap();
         assert!(matches!(r, SomeValue::Bool(_)), "got {:?}", r);
     }
 
@@ -3059,14 +3065,14 @@ mod tests {
     #[test]
     fn consider_bool_and_returns_somebool() {
         let (hl, ann) = hl_bool_bool(OpKind::And);
-        let r = hl.consider(&ann).unwrap();
+        let r = hl.consider(&ann).unwrap().unwrap();
         assert!(matches!(r, SomeValue::Bool(_)), "got {:?}", r);
     }
 
     #[test]
     fn consider_bool_xor_returns_somebool() {
         let (hl, ann) = hl_bool_bool(OpKind::Xor);
-        let r = hl.consider(&ann).unwrap();
+        let r = hl.consider(&ann).unwrap().unwrap();
         assert!(matches!(r, SomeValue::Bool(_)), "got {:?}", r);
     }
 
@@ -3085,14 +3091,14 @@ mod tests {
     #[test]
     fn consider_float_div_returns_somefloat() {
         let (hl, ann) = hl_float_float(OpKind::Div);
-        let r = hl.consider(&ann).unwrap();
+        let r = hl.consider(&ann).unwrap().unwrap();
         assert!(matches!(r, SomeValue::Float(_)), "got {:?}", r);
     }
 
     #[test]
     fn consider_float_add_returns_somefloat() {
         let (hl, ann) = hl_float_float(OpKind::Add);
-        let r = hl.consider(&ann).unwrap();
+        let r = hl.consider(&ann).unwrap().unwrap();
         assert!(matches!(r, SomeValue::Float(_)), "got {:?}", r);
     }
 
@@ -3141,7 +3147,7 @@ mod tests {
     fn consider_string_add_propagates_const() {
         // binaryop.py:345-350 — const+const should yield const=str1+str2.
         let (hl, ann) = hl_string_string_const("foo", "bar");
-        let r = hl.consider(&ann).unwrap();
+        let r = hl.consider(&ann).unwrap().unwrap();
         match r {
             SomeValue::String(s) => {
                 let c = s.inner.base.const_box.expect("const not propagated");
@@ -3162,7 +3168,7 @@ mod tests {
             OpKind::Add,
             vec![Hlvalue::Variable(v0), Hlvalue::Variable(v1)],
         );
-        let r = hl.consider(&ann).unwrap();
+        let r = hl.consider(&ann).unwrap().unwrap();
         assert!(matches!(r, SomeValue::ByteArray(_)), "got {:?}", r);
     }
 
@@ -3178,7 +3184,7 @@ mod tests {
             OpKind::Add,
             vec![Hlvalue::Variable(v0), Hlvalue::Variable(v1)],
         );
-        let r = hl.consider(&ann).unwrap();
+        let r = hl.consider(&ann).unwrap().unwrap();
         assert!(matches!(r, SomeValue::ByteArray(_)), "got {:?}", r);
     }
 
@@ -3193,7 +3199,7 @@ mod tests {
             OpKind::GetItem,
             vec![Hlvalue::Variable(v0), Hlvalue::Variable(v1)],
         );
-        let r = hl.consider(&ann).unwrap();
+        let r = hl.consider(&ann).unwrap().unwrap();
         assert!(matches!(r, SomeValue::Integer(_)), "got {:?}", r);
     }
 
@@ -3220,7 +3226,7 @@ mod tests {
             OpKind::Add,
             vec![Hlvalue::Variable(v0), Hlvalue::Variable(v1)],
         );
-        let r = hl.consider(&ann).unwrap();
+        let r = hl.consider(&ann).unwrap().unwrap();
         match r {
             SomeValue::Tuple(t) => assert_eq!(t.items.len(), 3),
             other => panic!("got {:?}", other),
@@ -3247,7 +3253,7 @@ mod tests {
             OpKind::GetItem,
             vec![Hlvalue::Variable(v0), Hlvalue::Variable(v1)],
         );
-        let r = hl.consider(&ann).unwrap();
+        let r = hl.consider(&ann).unwrap().unwrap();
         assert!(matches!(r, SomeValue::String(_)), "got {:?}", r);
     }
 
@@ -3269,7 +3275,7 @@ mod tests {
             OpKind::GetItem,
             vec![Hlvalue::Variable(v0), Hlvalue::Variable(v1)],
         );
-        let r = hl.consider(&ann).unwrap();
+        let r = hl.consider(&ann).unwrap().unwrap();
         assert!(matches!(r, SomeValue::Integer(_)), "got {:?}", r);
     }
 
@@ -3285,7 +3291,7 @@ mod tests {
             OpKind::GetItem,
             vec![Hlvalue::Variable(v0), Hlvalue::Variable(v1)],
         );
-        let r = hl.consider(&ann).unwrap();
+        let r = hl.consider(&ann).unwrap().unwrap();
         match r {
             SomeValue::Char(c) => assert!(c.inner.no_nul, "no_nul propagated"),
             other => panic!("got {:?}", other),
@@ -3306,7 +3312,7 @@ mod tests {
             OpKind::GetItem,
             vec![Hlvalue::Variable(v0), Hlvalue::Variable(v1)],
         );
-        let r = hl.consider(&ann).unwrap();
+        let r = hl.consider(&ann).unwrap().unwrap();
         assert!(matches!(r, SomeValue::UnicodeCodePoint(_)), "got {:?}", r);
     }
 
@@ -3321,7 +3327,7 @@ mod tests {
             OpKind::Mul,
             vec![Hlvalue::Variable(v0), Hlvalue::Variable(v1)],
         );
-        let r = hl.consider(&ann).unwrap();
+        let r = hl.consider(&ann).unwrap().unwrap();
         assert!(matches!(r, SomeValue::String(_)), "got {:?}", r);
     }
 
@@ -3345,12 +3351,12 @@ mod tests {
             OpKind::GetItem,
             vec![Hlvalue::Variable(v0), Hlvalue::Variable(v1)],
         );
-        let r = hl.consider(&ann).unwrap();
+        let r = hl.consider(&ann).unwrap().unwrap();
         assert!(matches!(r, SomeValue::Integer(_)), "got {:?}", r);
     }
 
     #[test]
-    fn consider_ptr_integer_getitem_zero_length_fixed_array_returns_impossible() {
+    fn consider_ptr_integer_getitem_zero_length_fixed_array_returns_none() {
         use crate::translator::rtyper::lltypesystem::lltype::{
             FixedSizeArrayType, LowLevelType, Ptr, PtrTarget,
         };
@@ -3369,8 +3375,15 @@ mod tests {
             OpKind::GetItem,
             vec![Hlvalue::Variable(v0), Hlvalue::Variable(v1)],
         );
+        // llannotation.py:102-108 — getitem on a zero-length array hits
+        // IndexError and returns None (void); consider binds the result to
+        // Impossible without blocking, so the raw consider yields None.
         let r = hl.consider(&ann).unwrap();
-        assert!(matches!(r, SomeValue::Impossible), "got {:?}", r);
+        assert!(
+            r.is_none(),
+            "void out-of-bounds getitem should be None, got {:?}",
+            r
+        );
     }
 
     #[test]
@@ -3399,8 +3412,15 @@ mod tests {
                 Hlvalue::Variable(v2),
             ],
         );
+        // llannotation.py:111-115 — ptr setitem is a void op: consider
+        // returns None (the result var is bound to Impossible without
+        // blocking).
         let r = hl.consider(&ann).unwrap();
-        assert!(matches!(r, SomeValue::Impossible), "got {:?}", r);
+        assert!(
+            r.is_none(),
+            "void ptr setitem should return None, got {:?}",
+            r
+        );
     }
 
     #[test]
@@ -3433,7 +3453,7 @@ mod tests {
             OpKind::GetItem,
             vec![Hlvalue::Variable(v0), Hlvalue::Variable(v1)],
         );
-        let r = hl.consider(&ann).unwrap();
+        let r = hl.consider(&ann).unwrap().unwrap();
         assert!(matches!(r, SomeValue::Integer(_)), "got {:?}", r);
     }
 
@@ -3490,7 +3510,7 @@ mod tests {
             OpKind::GetItem,
             vec![Hlvalue::Variable(v0), Hlvalue::Variable(v1)],
         );
-        let r = hl.consider(&ann).unwrap();
+        let r = hl.consider(&ann).unwrap().unwrap();
         assert!(
             matches!(r, SomeValue::Impossible | SomeValue::Integer(_)),
             "got {:?}",
@@ -3510,7 +3530,7 @@ mod tests {
             OpKind::GetItem,
             vec![Hlvalue::Variable(v0), Hlvalue::Variable(v1)],
         );
-        let r = hl.consider(&ann).unwrap();
+        let r = hl.consider(&ann).unwrap().unwrap();
         assert!(matches!(r, SomeValue::Impossible), "got {:?}", r);
     }
 
@@ -3526,7 +3546,7 @@ mod tests {
             OpKind::Add,
             vec![Hlvalue::Variable(v0), Hlvalue::Variable(v1)],
         );
-        let r = hl.consider(&ann).unwrap();
+        let r = hl.consider(&ann).unwrap().unwrap();
         assert!(matches!(r, SomeValue::Impossible), "got {:?}", r);
     }
 
@@ -3594,7 +3614,7 @@ mod tests {
             OpKind::GetItem,
             vec![Hlvalue::Variable(v0), Hlvalue::Variable(v1)],
         );
-        let r = hl.consider(&ann).unwrap();
+        let r = hl.consider(&ann).unwrap().unwrap();
         assert!(matches!(r, SomeValue::String(_)), "got {:?}", r);
     }
 }
