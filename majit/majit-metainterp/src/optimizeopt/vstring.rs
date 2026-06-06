@@ -367,9 +367,10 @@ impl OptString {
         ctx: &mut OptContext,
         f: impl FnOnce(&mut VStringPlainInfo) -> R,
     ) -> Option<R> {
-        let b = ctx
-            .get_box_replacement_box(opref)
-            .or_else(|| ctx.ensure_box(opref))?;
+        // When `opref` does not resolve, `ensure_box` would mint a fresh
+        // box carrying no PtrInfo, so `with_ptr_info_mut` returns `None`
+        // either way — the `?` early-out is equivalent without the mint.
+        let b = ctx.get_box_replacement_box(opref)?;
         ctx.with_ptr_info_mut(&b, |info| {
             if let PtrInfo::Str(sinfo) = info {
                 if let VStringVariant::Plain(plain) = &mut sinfo.variant {
