@@ -3175,7 +3175,7 @@ impl OptRewrite {
     ) -> OptimizationResult {
         let v = ctx
             .get_box_replacement_box(op.arg(0).to_opref())
-            .or_else(|| ctx.ensure_box(op.arg(0).to_opref()));
+            .or_else(|| Some(ctx.get_box_replacement(op.arg(0).to_opref())));
         if let Some(arg_op) = v.and_then(|pb| ctx.get_producing_op(&pb)) {
             if arg_op.opcode == OpCode::FloatNeg {
                 let b_old = BoxRef::from_bound_op(op_rc);

@@ -943,9 +943,7 @@ fn force_box_impl(
                 let b_opref = ctx
                     .ensure_box(opref)
                     .expect("body-namespace OpRef must have a BoxRef slot");
-                let b_alloc = ctx
-                    .ensure_box(alloc_ref)
-                    .expect("body-namespace OpRef must have a BoxRef slot");
+                let b_alloc = ctx.get_box_replacement(alloc_ref);
                 ctx.make_equal_to(&b_opref, &b_alloc);
             }
             for (field_idx, value_ref) in std::mem::take(&mut vinfo.fields) {
@@ -1002,9 +1000,7 @@ fn force_box_impl(
                 let b_opref = ctx
                     .ensure_box(opref)
                     .expect("body-namespace OpRef must have a BoxRef slot");
-                let b_alloc = ctx
-                    .ensure_box(alloc_ref)
-                    .expect("body-namespace OpRef must have a BoxRef slot");
+                let b_alloc = ctx.get_box_replacement(alloc_ref);
                 ctx.make_equal_to(&b_opref, &b_alloc);
             }
             for (field_idx, value_ref) in std::mem::take(&mut vinfo.fields) {
@@ -1047,9 +1043,7 @@ fn force_box_impl(
                 let b_opref = ctx
                     .ensure_box(opref)
                     .expect("body-namespace OpRef must have a BoxRef slot");
-                let b_alloc = ctx
-                    .ensure_box(alloc_ref)
-                    .expect("body-namespace OpRef must have a BoxRef slot");
+                let b_alloc = ctx.get_box_replacement(alloc_ref);
                 ctx.make_equal_to(&b_opref, &b_alloc);
             }
 
@@ -1114,9 +1108,7 @@ fn force_box_impl(
                 let b_opref = ctx
                     .ensure_box(opref)
                     .expect("body-namespace OpRef must have a BoxRef slot");
-                let b_alloc = ctx
-                    .ensure_box(alloc_ref)
-                    .expect("body-namespace OpRef must have a BoxRef slot");
+                let b_alloc = ctx.get_box_replacement(alloc_ref);
                 ctx.make_equal_to(&b_opref, &b_alloc);
             }
 
@@ -1190,9 +1182,7 @@ fn force_box_impl(
                 let b_opref = ctx
                     .ensure_box(opref)
                     .expect("body-namespace OpRef must have a BoxRef slot");
-                let b_alloc = ctx
-                    .ensure_box(alloc_ref)
-                    .expect("body-namespace OpRef must have a BoxRef slot");
+                let b_alloc = ctx.get_box_replacement(alloc_ref);
                 ctx.make_equal_to(&b_opref, &b_alloc);
             }
 
@@ -1270,9 +1260,7 @@ fn force_box_impl(
                 let b_opref = ctx
                     .ensure_box(opref)
                     .expect("body-namespace OpRef must have a BoxRef slot");
-                let b_new = ctx
-                    .ensure_box(new_ref)
-                    .expect("body-namespace OpRef must have a BoxRef slot");
+                let b_new = ctx.get_box_replacement(new_ref);
                 ctx.make_equal_to(&b_opref, &b_new);
             }
             new_ref
@@ -1357,9 +1345,7 @@ fn force_box_impl(
                 let b_opref = ctx
                     .ensure_box(opref)
                     .expect("body-namespace OpRef must have a BoxRef slot");
-                let b_newop = ctx
-                    .ensure_box(newop)
-                    .expect("body-namespace OpRef must have a BoxRef slot");
+                let b_newop = ctx.get_box_replacement(newop);
                 ctx.make_equal_to(&b_opref, &b_newop);
             }
 

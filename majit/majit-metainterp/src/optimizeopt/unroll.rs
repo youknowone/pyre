@@ -3783,9 +3783,7 @@ impl OptUnroll {
             let b_source = ctx
                 .ensure_box(source)
                 .expect("body-namespace OpRef must have a BoxRef slot");
-            let b_target = ctx
-                .ensure_box(*target)
-                .expect("body-namespace OpRef must have a BoxRef slot");
+            let b_target = ctx.get_box_replacement(*target);
             ctx.make_equal_to(&b_source, &b_target);
             if crate::debug::have_debug_prints() {
                 crate::debug::log_one(
@@ -4655,9 +4653,7 @@ fn assemble_peeled_trace_with_jump_args(
                 let b_js = ctx
                     .ensure_box(jump_source)
                     .expect("body-namespace OpRef must have a BoxRef slot");
-                let b_ela = ctx
-                    .ensure_box(extended_label_arg)
-                    .expect("body-namespace OpRef must have a BoxRef slot");
+                let b_ela = ctx.get_box_replacement(extended_label_arg);
                 ctx.make_equal_to(&b_js, &b_ela);
                 assembly_alias_remap.insert(jump_source, extended_label_arg);
             }
@@ -6628,9 +6624,7 @@ mod tests {
         let b_src = ctx
             .ensure_box(OpRef::ref_op(19))
             .expect("body-namespace OpRef must have a BoxRef slot");
-        let b_tgt = ctx
-            .ensure_box(OpRef::ref_op(14))
-            .expect("body-namespace OpRef must have a BoxRef slot");
+        let b_tgt = ctx.get_box_replacement(OpRef::ref_op(14));
         ctx.make_equal_to(&b_src, &b_tgt);
         let pop = crate::optimizeopt::info::PreambleOp {
             op: OpRef::ref_op(19),

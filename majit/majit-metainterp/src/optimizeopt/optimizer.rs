@@ -791,18 +791,19 @@ impl Optimizer {
         // Keyed by the virtual head's Box identity. `ensure_box` is
         // position-stable (a head position resolves to one canonical Box),
         // so two entries sharing a head dedupe by `Rc::ptr_eq`. The head is
-        // always a NEW (virtual-alloc) ResOp, so `ensure_box` returns
-        // `Some`; a `None` head is left un-deduped, which only costs a
-        // redundant idempotent `set_ptr_info`.
+        // always a NEW (virtual-alloc) ResOp with a producer, so
+        // `get_box_replacement` returns the memoized bound Box that dedupes;
+        // a producer-less head resolves to a fresh unbound box that never
+        // matches, leaving it un-deduped (only costs a redundant idempotent
+        // `set_ptr_info`).
         let mut installed_heads: majit_ir::vec_set::VecSet<crate::r#box::BoxRef> =
             majit_ir::vec_set::VecSet::new();
         for entry in entries {
-            if let Some(head_key) = ctx.ensure_box(entry.head) {
-                if installed_heads.contains(&head_key) {
-                    continue;
-                }
-                installed_heads.insert(head_key);
+            let head_key = ctx.get_box_replacement(entry.head);
+            if installed_heads.contains(&head_key) {
+                continue;
             }
+            installed_heads.insert(head_key);
             if std::env::var_os("MAJIT_LOG").is_some() {
                 eprintln!(
                     "[jit] install_imported_virtual head={:?} fields={:?}",
@@ -2665,9 +2666,7 @@ impl Optimizer {
                                     let b_ff = ctx
                                         .ensure_box(ff)
                                         .expect("body-namespace OpRef must have a BoxRef slot");
-                                    let b_orig = ctx
-                                        .ensure_box(orig_field)
-                                        .expect("body-namespace OpRef must have a BoxRef slot");
+                                    let b_orig = ctx.get_box_replacement(orig_field);
                                     ctx.make_equal_to(&b_ff, &b_orig);
                                     field.1 = ff;
                                 }
@@ -3685,9 +3684,7 @@ impl Optimizer {
             let b_old = ctx
                 .ensure_box(old)
                 .expect("body-namespace OpRef must have a BoxRef slot");
-            let b_new = ctx
-                .ensure_box(new)
-                .expect("body-namespace OpRef must have a BoxRef slot");
+            let b_new = ctx.get_box_replacement(new);
             ctx.make_equal_to(&b_old, &b_new);
             return;
         }

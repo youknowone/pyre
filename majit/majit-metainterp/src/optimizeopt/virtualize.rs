@@ -1557,16 +1557,12 @@ impl OptVirtualize {
 
         // virtualize.py:151: `CONST_NULL.same_constant(objbox)` — only a
         // Ref-typed null constant matches; a plain ConstInt(0) does not.
-        // Route through `ensure_box` so const-namespace OpRefs (whose
-        // backing const `BoxRef::new_const` is constructed on demand)
-        // materialize from `const_pool` and the null check still fires;
-        // the `unwrap_or(false)` fallback only applies to the
-        // OpRef::NONE sentinel.
-        let obj_box = ctx.ensure_box(obj_ref);
-        let obj_is_null = obj_box
-            .as_ref()
-            .map(|b| ctx.is_const_null(b))
-            .unwrap_or(false);
+        // `get_box_replacement` resolves const-namespace OpRefs to their
+        // on-demand `BoxRef::new_const` and walks the chain terminal;
+        // `is_const_null` reads `const_value()` and tolerates an unbound
+        // terminal (non-const -> false), so the null check is read-only.
+        let obj_box = ctx.get_box_replacement(obj_ref);
+        let obj_is_null = ctx.is_const_null(&obj_box);
 
         // If vref is still virtual, update the virtual struct fields directly
         // (majit in-place absorption, see doc comment above).

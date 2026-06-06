@@ -7600,9 +7600,7 @@ impl OptContext {
         let b_old = self
             .ensure_box(old)
             .expect("body-namespace OpRef must have a BoxRef slot");
-        let b_new = self
-            .ensure_box(new_ref)
-            .expect("body-namespace OpRef must have a BoxRef slot");
+        let b_new = self.get_box_replacement(new_ref);
         self.make_equal_to(&b_old, &b_new);
         new_ref
     }

@@ -2461,9 +2461,7 @@ mod tests {
         let b_query = ctx
             .ensure_box(query_arg)
             .expect("body-namespace OpRef must have a BoxRef slot");
-        let b_canonical = ctx
-            .ensure_box(canonical_arg)
-            .expect("body-namespace OpRef must have a BoxRef slot");
+        let b_canonical = ctx.get_box_replacement(canonical_arg);
         ctx.make_equal_to(&b_query, &b_canonical);
 
         pass.pure_from_args2(OpCode::IntAdd, canonical_arg, other_arg, result);

@@ -665,9 +665,7 @@ impl OptString {
             let lgtop = ctx.getstrlen_opref(op.arg(0).to_opref(), mode);
             // vstring.py:531: self.make_equal_to(op, lgtop)
             let b_old = BoxRef::from_bound_op(op_rc);
-            let b_lgtop = ctx
-                .ensure_box(lgtop)
-                .expect("body-namespace OpRef must have a BoxRef slot");
+            let b_lgtop = ctx.get_box_replacement(lgtop);
             ctx.make_equal_to(&b_old, &b_lgtop);
             return OptimizationResult::Remove;
         }
