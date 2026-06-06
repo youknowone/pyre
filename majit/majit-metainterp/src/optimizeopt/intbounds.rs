@@ -6,6 +6,7 @@
 /// a condition that is already known true from integer bounds, the guard can be
 /// removed. It also narrows bounds after guards and arithmetic operations.
 use majit_ir::{Op, OpCode, OpRef, Value};
+use crate::r#box::BoxRef;
 
 use crate::optimizeopt::intutils::IntBound;
 use crate::optimizeopt::{OptContext, Optimization, OptimizationResult};
@@ -256,7 +257,7 @@ impl OptIntBounds {
 
     /// autogenintrules.py:1220-1320 optimize_INT_EQ — rules:
     /// eq_different_knownbits / eq_same / eq_one / eq_zero / eq_sub_eq.
-    fn optimize_int_eq(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
+    fn optimize_int_eq(&mut self, op: &Op, op_rc: &majit_ir::OpRc, ctx: &mut OptContext) -> OptimizationResult {
         let arg0 = self.resolve_box(op.arg(0).to_opref(), ctx);
         let arg1 = self.resolve_box(op.arg(1).to_opref(), ctx);
         let b0 = self.getintbound_b(&arg0, ctx);
@@ -329,17 +330,13 @@ impl OptIntBounds {
         }
         // eq_one: int_eq(1, x) => x  (when x is bool)
         if b0.is_constant() && b0.get_constant_int() == 1 && b1.is_bool() {
-            let b_old = ctx
-                .ensure_box(op.pos.get())
-                .expect("body-namespace OpRef must have a BoxRef slot");
+            let b_old = BoxRef::from_bound_op(op_rc);
             ctx.make_equal_to(&b_old, &arg1);
             return OptimizationResult::Remove;
         }
         // eq_one: int_eq(x, 1) => x  (when x is bool)
         if b1.is_constant() && b1.get_constant_int() == 1 && b0.is_bool() {
-            let b_old = ctx
-                .ensure_box(op.pos.get())
-                .expect("body-namespace OpRef must have a BoxRef slot");
+            let b_old = BoxRef::from_bound_op(op_rc);
             ctx.make_equal_to(&b_old, &arg0);
             return OptimizationResult::Remove;
         }
@@ -463,24 +460,20 @@ impl OptIntBounds {
 
     /// autogenintrules.py:23-143 optimize_INT_ADD — rules:
     /// add_zero / add_reassoc_consts / add_sub_x_c_c / add_sub_c_x_c.
-    fn optimize_int_add(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
+    fn optimize_int_add(&mut self, op: &Op, op_rc: &majit_ir::OpRc, ctx: &mut OptContext) -> OptimizationResult {
         let arg0 = self.resolve_box(op.arg(0).to_opref(), ctx);
         let arg1 = self.resolve_box(op.arg(1).to_opref(), ctx);
         let b0 = self.getintbound_b(&arg0, ctx);
         let b1 = self.getintbound_b(&arg1, ctx);
         // add_zero: int_add(0, x) => x
         if b0.is_constant() && b0.get_constant_int() == 0 {
-            let b_old = ctx
-                .ensure_box(op.pos.get())
-                .expect("body-namespace OpRef must have a BoxRef slot");
+            let b_old = BoxRef::from_bound_op(op_rc);
             ctx.make_equal_to(&b_old, &arg1);
             return OptimizationResult::Remove;
         }
         // add_zero: int_add(x, 0) => x
         if b1.is_constant() && b1.get_constant_int() == 0 {
-            let b_old = ctx
-                .ensure_box(op.pos.get())
-                .expect("body-namespace OpRef must have a BoxRef slot");
+            let b_old = BoxRef::from_bound_op(op_rc);
             ctx.make_equal_to(&b_old, &arg0);
             return OptimizationResult::Remove;
         }
@@ -573,7 +566,7 @@ impl OptIntBounds {
     /// sub_zero / sub_from_zero / sub_x_x / sub_add_consts / sub_add /
     /// sub_add_neg / sub_sub_left_x_c_c / sub_sub_left_c_x_c /
     /// sub_xor_x_y_y / sub_or_x_y_y / sub_invert_one.
-    fn optimize_int_sub(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
+    fn optimize_int_sub(&mut self, op: &Op, op_rc: &majit_ir::OpRc, ctx: &mut OptContext) -> OptimizationResult {
         let arg0 = self.resolve_box(op.arg(0).to_opref(), ctx);
         let arg1 = self.resolve_box(op.arg(1).to_opref(), ctx);
         let b0 = self.getintbound_b(&arg0, ctx);
@@ -590,16 +583,12 @@ impl OptIntBounds {
             let b0_0 = self.getintbound_b(&arg0_0, ctx);
             let b0_1 = self.getintbound_b(&arg0_1, ctx);
             if autogen_eq_b(&arg1, &b1, &arg0_1, &b0_1) {
-                let b_old = ctx
-                    .ensure_box(op.pos.get())
-                    .expect("body-namespace OpRef must have a BoxRef slot");
+                let b_old = BoxRef::from_bound_op(op_rc);
                 ctx.make_equal_to(&b_old, &arg0_0);
                 return OptimizationResult::Remove;
             }
             if autogen_eq_b(&arg1, &b1, &arg0_0, &b0_0) {
-                let b_old = ctx
-                    .ensure_box(op.pos.get())
-                    .expect("body-namespace OpRef must have a BoxRef slot");
+                let b_old = BoxRef::from_bound_op(op_rc);
                 ctx.make_equal_to(&b_old, &arg0_1);
                 return OptimizationResult::Remove;
             }
@@ -610,16 +599,12 @@ impl OptIntBounds {
             let b0_0 = self.getintbound_b(&arg0_0, ctx);
             let b0_1 = self.getintbound_b(&arg0_1, ctx);
             if autogen_eq_b(&arg1, &b1, &arg0_1, &b0_1) && b0_0.and_bound(&b0_1).known_eq_const(0) {
-                let b_old = ctx
-                    .ensure_box(op.pos.get())
-                    .expect("body-namespace OpRef must have a BoxRef slot");
+                let b_old = BoxRef::from_bound_op(op_rc);
                 ctx.make_equal_to(&b_old, &arg0_0);
                 return OptimizationResult::Remove;
             }
             if autogen_eq_b(&arg1, &b1, &arg0_0, &b0_0) && b0_1.and_bound(&b0_0).known_eq_const(0) {
-                let b_old = ctx
-                    .ensure_box(op.pos.get())
-                    .expect("body-namespace OpRef must have a BoxRef slot");
+                let b_old = BoxRef::from_bound_op(op_rc);
                 ctx.make_equal_to(&b_old, &arg0_1);
                 return OptimizationResult::Remove;
             }
@@ -630,25 +615,19 @@ impl OptIntBounds {
             let b0_0 = self.getintbound_b(&arg0_0, ctx);
             let b0_1 = self.getintbound_b(&arg0_1, ctx);
             if autogen_eq_b(&arg1, &b1, &arg0_1, &b0_1) && b0_0.and_bound(&b0_1).known_eq_const(0) {
-                let b_old = ctx
-                    .ensure_box(op.pos.get())
-                    .expect("body-namespace OpRef must have a BoxRef slot");
+                let b_old = BoxRef::from_bound_op(op_rc);
                 ctx.make_equal_to(&b_old, &arg0_0);
                 return OptimizationResult::Remove;
             }
             if autogen_eq_b(&arg1, &b1, &arg0_0, &b0_0) && b0_1.and_bound(&b0_0).known_eq_const(0) {
-                let b_old = ctx
-                    .ensure_box(op.pos.get())
-                    .expect("body-namespace OpRef must have a BoxRef slot");
+                let b_old = BoxRef::from_bound_op(op_rc);
                 ctx.make_equal_to(&b_old, &arg0_1);
                 return OptimizationResult::Remove;
             }
         }
         // sub_zero: int_sub(x, 0) => x
         if b1.is_constant() && b1.get_constant_int() == 0 {
-            let b_old = ctx
-                .ensure_box(op.pos.get())
-                .expect("body-namespace OpRef must have a BoxRef slot");
+            let b_old = BoxRef::from_bound_op(op_rc);
             ctx.make_equal_to(&b_old, &arg0);
             return OptimizationResult::Remove;
         }
@@ -722,7 +701,7 @@ impl OptIntBounds {
 
     /// autogenintrules.py:315-410 optimize_INT_MUL — rules:
     /// mul_zero / mul_one / mul_minus_one / mul_pow2_const / mul_lshift.
-    fn optimize_int_mul(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
+    fn optimize_int_mul(&mut self, op: &Op, op_rc: &majit_ir::OpRc, ctx: &mut OptContext) -> OptimizationResult {
         let arg0 = self.resolve_box(op.arg(0).to_opref(), ctx);
         let arg1 = self.resolve_box(op.arg(1).to_opref(), ctx);
         let b0 = self.getintbound_b(&arg0, ctx);
@@ -739,17 +718,13 @@ impl OptIntBounds {
         }
         // mul_one: int_mul(1, x) => x
         if b0.is_constant() && b0.get_constant_int() == 1 {
-            let b_old = ctx
-                .ensure_box(op.pos.get())
-                .expect("body-namespace OpRef must have a BoxRef slot");
+            let b_old = BoxRef::from_bound_op(op_rc);
             ctx.make_equal_to(&b_old, &arg1);
             return OptimizationResult::Remove;
         }
         // mul_one: int_mul(x, 1) => x
         if b1.is_constant() && b1.get_constant_int() == 1 {
-            let b_old = ctx
-                .ensure_box(op.pos.get())
-                .expect("body-namespace OpRef must have a BoxRef slot");
+            let b_old = BoxRef::from_bound_op(op_rc);
             ctx.make_equal_to(&b_old, &arg0);
             return OptimizationResult::Remove;
         }
@@ -822,7 +797,7 @@ impl OptIntBounds {
     /// autogenintrules.py:414-581 optimize_INT_AND — rules:
     /// and_known_result / and_x_c_in_range / and_x_x / and_idempotent /
     /// and_reassoc_consts / and_absorb / and_or.
-    fn optimize_int_and(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
+    fn optimize_int_and(&mut self, op: &Op, op_rc: &majit_ir::OpRc, ctx: &mut OptContext) -> OptimizationResult {
         let arg0 = self.resolve_box(op.arg(0).to_opref(), ctx);
         let arg1 = self.resolve_box(op.arg(1).to_opref(), ctx);
         let b0 = self.getintbound_b(&arg0, ctx);
@@ -844,9 +819,7 @@ impl OptIntBounds {
             let c = b0.get_constant_int();
             let mask = !((c as u64).wrapping_add(1)) as i64;
             if b1.lower >= 0 && b1.upper <= c & mask {
-                let b_old = ctx
-                    .ensure_box(op.pos.get())
-                    .expect("body-namespace OpRef must have a BoxRef slot");
+                let b_old = BoxRef::from_bound_op(op_rc);
                 ctx.make_equal_to(&b_old, &arg1);
                 return OptimizationResult::Remove;
             }
@@ -856,35 +829,27 @@ impl OptIntBounds {
             let c = b1.get_constant_int();
             let mask = !((c as u64).wrapping_add(1)) as i64;
             if b0.lower >= 0 && b0.upper <= c & mask {
-                let b_old = ctx
-                    .ensure_box(op.pos.get())
-                    .expect("body-namespace OpRef must have a BoxRef slot");
+                let b_old = BoxRef::from_bound_op(op_rc);
                 ctx.make_equal_to(&b_old, &arg0);
                 return OptimizationResult::Remove;
             }
         }
         // and_x_x: int_and(a, a) => a
         if autogen_eq_b(&arg1, &b1, &arg0, &b0) {
-            let b_old = ctx
-                .ensure_box(op.pos.get())
-                .expect("body-namespace OpRef must have a BoxRef slot");
+            let b_old = BoxRef::from_bound_op(op_rc);
             ctx.make_equal_to(&b_old, &arg0);
             return OptimizationResult::Remove;
         }
         // and_idempotent: int_and(x, y) => x
         // when b1.tvalue | ~(b0.tvalue | b0.tmask) == all-ones
         if b1.tvalue | !(b0.tvalue | b0.tmask) == u64::MAX {
-            let b_old = ctx
-                .ensure_box(op.pos.get())
-                .expect("body-namespace OpRef must have a BoxRef slot");
+            let b_old = BoxRef::from_bound_op(op_rc);
             ctx.make_equal_to(&b_old, &arg0);
             return OptimizationResult::Remove;
         }
         // and_idempotent: int_and(y, x) => x
         if b0.tvalue | !(b1.tvalue | b1.tmask) == u64::MAX {
-            let b_old = ctx
-                .ensure_box(op.pos.get())
-                .expect("body-namespace OpRef must have a BoxRef slot");
+            let b_old = BoxRef::from_bound_op(op_rc);
             ctx.make_equal_to(&b_old, &arg1);
             return OptimizationResult::Remove;
         }
@@ -1000,7 +965,7 @@ impl OptIntBounds {
     /// second of each pair is dead because the first always returns
     /// when its predicate holds. Preserved here to mirror upstream's
     /// auto-generated output line for line.
-    fn optimize_int_or(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
+    fn optimize_int_or(&mut self, op: &Op, op_rc: &majit_ir::OpRc, ctx: &mut OptContext) -> OptimizationResult {
         let arg0 = self.resolve_box(op.arg(0).to_opref(), ctx);
         let arg1 = self.resolve_box(op.arg(1).to_opref(), ctx);
         let b0 = self.getintbound_b(&arg0, ctx);
@@ -1018,26 +983,20 @@ impl OptIntBounds {
         }
         // or_x_x: int_or(a, a) => a
         if autogen_eq_b(&arg1, &b1, &arg0, &b0) {
-            let b_old = ctx
-                .ensure_box(op.pos.get())
-                .expect("body-namespace OpRef must have a BoxRef slot");
+            let b_old = BoxRef::from_bound_op(op_rc);
             ctx.make_equal_to(&b_old, &arg0);
             return OptimizationResult::Remove;
         }
         // or_idempotent: int_or(x, y) => x
         // when b0.tvalue | ~(b1.tvalue | b1.tmask) == all-ones
         if b0.tvalue | !(b1.tvalue | b1.tmask) == u64::MAX {
-            let b_old = ctx
-                .ensure_box(op.pos.get())
-                .expect("body-namespace OpRef must have a BoxRef slot");
+            let b_old = BoxRef::from_bound_op(op_rc);
             ctx.make_equal_to(&b_old, &arg0);
             return OptimizationResult::Remove;
         }
         // or_idempotent: int_or(y, x) => x
         if b1.tvalue | !(b0.tvalue | b0.tmask) == u64::MAX {
-            let b_old = ctx
-                .ensure_box(op.pos.get())
-                .expect("body-namespace OpRef must have a BoxRef slot");
+            let b_old = BoxRef::from_bound_op(op_rc);
             ctx.make_equal_to(&b_old, &arg1);
             return OptimizationResult::Remove;
         }
@@ -1220,7 +1179,7 @@ impl OptIntBounds {
     /// autogenintrules.py:791-942 optimize_INT_XOR — rules:
     /// xor_x_x / xor_reassoc_consts / xor_absorb / xor_zero /
     /// xor_minus_1 / xor_known_result / xor_is_not.
-    fn optimize_int_xor(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
+    fn optimize_int_xor(&mut self, op: &Op, op_rc: &majit_ir::OpRc, ctx: &mut OptContext) -> OptimizationResult {
         let arg0 = self.resolve_box(op.arg(0).to_opref(), ctx);
         let arg1 = self.resolve_box(op.arg(1).to_opref(), ctx);
         let b0 = self.getintbound_b(&arg0, ctx);
@@ -1244,9 +1203,7 @@ impl OptIntBounds {
         // xor_zero: int_xor(0, a) => a   (else: producer-xor absorbs)
         if b0.is_constant() {
             if b0.get_constant_int() == 0 {
-                let b_old = ctx
-                    .ensure_box(op.pos.get())
-                    .expect("body-namespace OpRef must have a BoxRef slot");
+                let b_old = BoxRef::from_bound_op(op_rc);
                 ctx.make_equal_to(&b_old, &arg1);
                 return OptimizationResult::Remove;
             }
@@ -1257,17 +1214,13 @@ impl OptIntBounds {
             let b_inner_1 = self.getintbound_b(&inner_1, ctx);
             // xor_absorb: int_xor(int_xor(a, b), b) => a
             if autogen_eq_b(&arg1, &b1, &inner_1, &b_inner_1) {
-                let b_old = ctx
-                    .ensure_box(op.pos.get())
-                    .expect("body-namespace OpRef must have a BoxRef slot");
+                let b_old = BoxRef::from_bound_op(op_rc);
                 ctx.make_equal_to(&b_old, &inner_0);
                 return OptimizationResult::Remove;
             }
             // xor_absorb: int_xor(int_xor(b, a), b) => a
             if autogen_eq_b(&arg1, &b1, &inner_0, &b_inner_0) {
-                let b_old = ctx
-                    .ensure_box(op.pos.get())
-                    .expect("body-namespace OpRef must have a BoxRef slot");
+                let b_old = BoxRef::from_bound_op(op_rc);
                 ctx.make_equal_to(&b_old, &inner_1);
                 return OptimizationResult::Remove;
             }
@@ -1275,9 +1228,7 @@ impl OptIntBounds {
         // xor_zero: int_xor(a, 0) => a   (else: producer-xor absorbs)
         if b1.is_constant() {
             if b1.get_constant_int() == 0 {
-                let b_old = ctx
-                    .ensure_box(op.pos.get())
-                    .expect("body-namespace OpRef must have a BoxRef slot");
+                let b_old = BoxRef::from_bound_op(op_rc);
                 ctx.make_equal_to(&b_old, &arg0);
                 return OptimizationResult::Remove;
             }
@@ -1288,17 +1239,13 @@ impl OptIntBounds {
             let b_inner_1 = self.getintbound_b(&inner_1, ctx);
             // xor_absorb: int_xor(b, int_xor(a, b)) => a
             if autogen_eq_b(&inner_1, &b_inner_1, &arg0, &b0) {
-                let b_old = ctx
-                    .ensure_box(op.pos.get())
-                    .expect("body-namespace OpRef must have a BoxRef slot");
+                let b_old = BoxRef::from_bound_op(op_rc);
                 ctx.make_equal_to(&b_old, &inner_0);
                 return OptimizationResult::Remove;
             }
             // xor_absorb: int_xor(b, int_xor(b, a)) => a
             if autogen_eq_b(&inner_0, &b_inner_0, &arg0, &b0) {
-                let b_old = ctx
-                    .ensure_box(op.pos.get())
-                    .expect("body-namespace OpRef must have a BoxRef slot");
+                let b_old = BoxRef::from_bound_op(op_rc);
                 ctx.make_equal_to(&b_old, &inner_1);
                 return OptimizationResult::Remove;
             }
@@ -1366,14 +1313,12 @@ impl OptIntBounds {
     }
 
     /// autogenintrules.py:1432-1443 optimize_INT_INVERT — rules: invert_invert.
-    fn optimize_int_invert(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
+    fn optimize_int_invert(&mut self, op: &Op, op_rc: &majit_ir::OpRc, ctx: &mut OptContext) -> OptimizationResult {
         let arg0 = self.resolve_box(op.arg(0).to_opref(), ctx);
         // invert_invert: int_invert(int_invert(x)) => x
         if let Some(inner) = self.as_operation_b(&arg0, OpCode::IntInvert, ctx) {
             let inner_0 = self.resolve_box(inner.arg(0).to_opref(), ctx);
-            let b_old = ctx
-                .ensure_box(op.pos.get())
-                .expect("body-namespace OpRef must have a BoxRef slot");
+            let b_old = BoxRef::from_bound_op(op_rc);
             ctx.make_equal_to(&b_old, &inner_0);
             return OptimizationResult::Remove;
         }
@@ -1381,14 +1326,12 @@ impl OptIntBounds {
     }
 
     /// autogenintrules.py:1447-1458 optimize_INT_NEG — rules: neg_neg.
-    fn optimize_int_neg(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
+    fn optimize_int_neg(&mut self, op: &Op, op_rc: &majit_ir::OpRc, ctx: &mut OptContext) -> OptimizationResult {
         let arg0 = self.resolve_box(op.arg(0).to_opref(), ctx);
         // neg_neg: int_neg(int_neg(x)) => x
         if let Some(inner) = self.as_operation_b(&arg0, OpCode::IntNeg, ctx) {
             let inner_0 = self.resolve_box(inner.arg(0).to_opref(), ctx);
-            let b_old = ctx
-                .ensure_box(op.pos.get())
-                .expect("body-namespace OpRef must have a BoxRef slot");
+            let b_old = BoxRef::from_bound_op(op_rc);
             ctx.make_equal_to(&b_old, &inner_0);
             return OptimizationResult::Remove;
         }
@@ -1399,7 +1342,7 @@ impl OptIntBounds {
     /// lshift_zero_x / lshift_x_zero / lshift_rshift_c_c / lshift_and_rshift /
     /// lshift_urshift_c_c / lshift_and_urshift / lshift_lshift_c_c.
     /// LONG_BIT inlined as 64 (pyre is 64-bit only).
-    fn optimize_int_lshift(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
+    fn optimize_int_lshift(&mut self, op: &Op, op_rc: &majit_ir::OpRc, ctx: &mut OptContext) -> OptimizationResult {
         let arg0 = self.resolve_box(op.arg(0).to_opref(), ctx);
         let arg1 = self.resolve_box(op.arg(1).to_opref(), ctx);
         let b0 = self.getintbound_b(&arg0, ctx);
@@ -1411,9 +1354,7 @@ impl OptIntBounds {
         }
         // lshift_x_zero: int_lshift(x, 0) => x
         if b1.is_constant() && b1.get_constant_int() == 0 {
-            let b_old = ctx
-                .ensure_box(op.pos.get())
-                .expect("body-namespace OpRef must have a BoxRef slot");
+            let b_old = BoxRef::from_bound_op(op_rc);
             ctx.make_equal_to(&b_old, &arg0);
             return OptimizationResult::Remove;
         }
@@ -1540,7 +1481,7 @@ impl OptIntBounds {
     /// autogenintrules.py:1113-1169 optimize_INT_RSHIFT — rules:
     /// rshift_zero_x / rshift_x_zero / rshift_known_result / rshift_lshift /
     /// rshift_rshift_c_c. LONG_BIT inlined as 64.
-    fn optimize_int_rshift(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
+    fn optimize_int_rshift(&mut self, op: &Op, op_rc: &majit_ir::OpRc, ctx: &mut OptContext) -> OptimizationResult {
         let arg0 = self.resolve_box(op.arg(0).to_opref(), ctx);
         let arg1 = self.resolve_box(op.arg(1).to_opref(), ctx);
         let b0 = self.getintbound_b(&arg0, ctx);
@@ -1565,18 +1506,14 @@ impl OptIntBounds {
             if autogen_eq_b(&arg1, &b1, &inner_1, &b_inner_1)
                 && b_inner_0.lshift_bound_cannot_overflow(&b_inner_1)
             {
-                let b_old = ctx
-                    .ensure_box(op.pos.get())
-                    .expect("body-namespace OpRef must have a BoxRef slot");
+                let b_old = BoxRef::from_bound_op(op_rc);
                 ctx.make_equal_to(&b_old, &inner_0);
                 return OptimizationResult::Remove;
             }
         }
         // rshift_x_zero: int_rshift(x, 0) => x
         if b1.is_constant() && b1.get_constant_int() == 0 {
-            let b_old = ctx
-                .ensure_box(op.pos.get())
-                .expect("body-namespace OpRef must have a BoxRef slot");
+            let b_old = BoxRef::from_bound_op(op_rc);
             ctx.make_equal_to(&b_old, &arg0);
             return OptimizationResult::Remove;
         }
@@ -1606,7 +1543,7 @@ impl OptIntBounds {
 
     /// autogenintrules.py:1364-1399 optimize_INT_IS_TRUE — rules:
     /// is_true_bool / is_true_true / is_true_and_minint.
-    fn optimize_int_is_true(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
+    fn optimize_int_is_true(&mut self, op: &Op, op_rc: &majit_ir::OpRc, ctx: &mut OptContext) -> OptimizationResult {
         let arg0 = self.resolve_box(op.arg(0).to_opref(), ctx);
         let b0 = self.getintbound_b(&arg0, ctx);
         // is_true_true: int_is_true(x) => 1
@@ -1617,9 +1554,7 @@ impl OptIntBounds {
         }
         // is_true_bool: int_is_true(x) => x  (when x is bool)
         if b0.is_bool() {
-            let b_old = ctx
-                .ensure_box(op.pos.get())
-                .expect("body-namespace OpRef must have a BoxRef slot");
+            let b_old = BoxRef::from_bound_op(op_rc);
             ctx.make_equal_to(&b_old, &arg0);
             return OptimizationResult::Remove;
         }
@@ -1657,7 +1592,7 @@ impl OptIntBounds {
 
     /// autogenintrules.py:1415-1428 optimize_INT_FORCE_GE_ZERO — rules:
     /// force_ge_zero_pos / force_ge_zero_neg.
-    fn optimize_int_force_ge_zero(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
+    fn optimize_int_force_ge_zero(&mut self, op: &Op, op_rc: &majit_ir::OpRc, ctx: &mut OptContext) -> OptimizationResult {
         let arg0 = self.resolve_box(op.arg(0).to_opref(), ctx);
         let b0 = ctx.getintbound_handle(&arg0).borrow().clone();
         // force_ge_zero_neg: int_force_ge_zero(x) => 0  (when x < 0)
@@ -1667,9 +1602,7 @@ impl OptIntBounds {
         }
         // force_ge_zero_pos: int_force_ge_zero(x) => x  (when x >= 0)
         if b0.known_nonnegative() {
-            let b_old = ctx
-                .ensure_box(op.pos.get())
-                .expect("body-namespace OpRef must have a BoxRef slot");
+            let b_old = BoxRef::from_bound_op(op_rc);
             ctx.make_equal_to(&b_old, &arg0);
             return OptimizationResult::Remove;
         }
@@ -1679,7 +1612,7 @@ impl OptIntBounds {
     /// autogenintrules.py:1173-1216 optimize_UINT_RSHIFT — rules:
     /// urshift_zero_x / urshift_x_zero / urshift_known_result /
     /// urshift_lshift_x_c_c.
-    fn optimize_uint_rshift(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
+    fn optimize_uint_rshift(&mut self, op: &Op, op_rc: &majit_ir::OpRc, ctx: &mut OptContext) -> OptimizationResult {
         let arg0 = self.resolve_box(op.arg(0).to_opref(), ctx);
         let arg1 = self.resolve_box(op.arg(1).to_opref(), ctx);
         let b0 = self.getintbound_b(&arg0, ctx);
@@ -1697,9 +1630,7 @@ impl OptIntBounds {
         }
         // urshift_x_zero: uint_rshift(x, 0) => x
         if b1.is_constant() && b1.get_constant_int() == 0 {
-            let b_old = ctx
-                .ensure_box(op.pos.get())
-                .expect("body-namespace OpRef must have a BoxRef slot");
+            let b_old = BoxRef::from_bound_op(op_rc);
             ctx.make_equal_to(&b_old, &arg0);
             return OptimizationResult::Remove;
         }
@@ -2043,7 +1974,7 @@ impl OptIntBounds {
 
     // ── INT_SIGNEXT optimization ──
 
-    fn optimize_int_signext(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
+    fn optimize_int_signext(&mut self, op: &Op, op_rc: &majit_ir::OpRc, ctx: &mut OptContext) -> OptimizationResult {
         let b = self.getintbound_box(op.arg(0).to_opref(), ctx);
         let b1 = self.getintbound_box(op.arg(1).to_opref(), ctx);
         if b1.is_constant() {
@@ -2053,9 +1984,7 @@ impl OptIntBounds {
             let stop = 1i64 << (numbits - 1);
             if b.is_within_range(start, stop - 1) {
                 // The value already fits; replace with the input.
-                let b_old = ctx
-                    .ensure_box(op.pos.get())
-                    .expect("body-namespace OpRef must have a BoxRef slot");
+                let b_old = BoxRef::from_bound_op(op_rc);
                 let b_arg = ctx
                     .ensure_box(op.arg(0).to_opref())
                     .expect("body-namespace OpRef must have a BoxRef slot");
@@ -3000,14 +2929,14 @@ impl Default for OptIntBounds {
 }
 
 impl Optimization for OptIntBounds {
-    fn propagate_forward(&mut self, op: &Op, _op_rc: &majit_ir::OpRc, ctx: &mut OptContext) -> OptimizationResult {
+    fn propagate_forward(&mut self, op: &Op, op_rc: &majit_ir::OpRc, ctx: &mut OptContext) -> OptimizationResult {
         let result = match op.opcode {
             // ── Comparisons ──
             OpCode::IntLt => self.optimize_int_lt(op, ctx),
             OpCode::IntLe => self.optimize_int_le(op, ctx),
             OpCode::IntGt => self.optimize_int_gt(op, ctx),
             OpCode::IntGe => self.optimize_int_ge(op, ctx),
-            OpCode::IntEq => self.optimize_int_eq(op, ctx),
+            OpCode::IntEq => self.optimize_int_eq(op, op_rc, ctx),
             OpCode::IntNe => self.optimize_int_ne(op, ctx),
             OpCode::UintLt => self.optimize_uint_lt(op, ctx),
             OpCode::UintLe => self.optimize_uint_le(op, ctx),
@@ -3015,23 +2944,23 @@ impl Optimization for OptIntBounds {
             OpCode::UintGe => self.optimize_uint_ge(op, ctx),
 
             // ── Arithmetic folds (autogenintrules.py) ──
-            OpCode::IntAdd => self.optimize_int_add(op, ctx),
-            OpCode::IntSub => self.optimize_int_sub(op, ctx),
-            OpCode::IntMul => self.optimize_int_mul(op, ctx),
-            OpCode::IntAnd => self.optimize_int_and(op, ctx),
-            OpCode::IntOr => self.optimize_int_or(op, ctx),
-            OpCode::IntXor => self.optimize_int_xor(op, ctx),
-            OpCode::IntNeg => self.optimize_int_neg(op, ctx),
-            OpCode::IntInvert => self.optimize_int_invert(op, ctx),
-            OpCode::IntLshift => self.optimize_int_lshift(op, ctx),
-            OpCode::IntRshift => self.optimize_int_rshift(op, ctx),
-            OpCode::UintRshift => self.optimize_uint_rshift(op, ctx),
-            OpCode::IntIsTrue => self.optimize_int_is_true(op, ctx),
+            OpCode::IntAdd => self.optimize_int_add(op, op_rc, ctx),
+            OpCode::IntSub => self.optimize_int_sub(op, op_rc, ctx),
+            OpCode::IntMul => self.optimize_int_mul(op, op_rc, ctx),
+            OpCode::IntAnd => self.optimize_int_and(op, op_rc, ctx),
+            OpCode::IntOr => self.optimize_int_or(op, op_rc, ctx),
+            OpCode::IntXor => self.optimize_int_xor(op, op_rc, ctx),
+            OpCode::IntNeg => self.optimize_int_neg(op, op_rc, ctx),
+            OpCode::IntInvert => self.optimize_int_invert(op, op_rc, ctx),
+            OpCode::IntLshift => self.optimize_int_lshift(op, op_rc, ctx),
+            OpCode::IntRshift => self.optimize_int_rshift(op, op_rc, ctx),
+            OpCode::UintRshift => self.optimize_uint_rshift(op, op_rc, ctx),
+            OpCode::IntIsTrue => self.optimize_int_is_true(op, op_rc, ctx),
             OpCode::IntIsZero => self.optimize_int_is_zero(op, ctx),
-            OpCode::IntForceGeZero => self.optimize_int_force_ge_zero(op, ctx),
+            OpCode::IntForceGeZero => self.optimize_int_force_ge_zero(op, op_rc, ctx),
 
             // ── Signext ──
-            OpCode::IntSignext => self.optimize_int_signext(op, ctx),
+            OpCode::IntSignext => self.optimize_int_signext(op, op_rc, ctx),
 
             // ── Overflow arithmetic ──
             OpCode::IntAddOvf => self.optimize_int_add_ovf(op, ctx),
