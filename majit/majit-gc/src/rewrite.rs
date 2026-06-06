@@ -2939,7 +2939,15 @@ impl GcRewriter for GcRewriterImpl {
                 // can_collect does that (rewrite.py:699-711).
                 _ if op.opcode.is_guard() => {
                     let rewritten = st.rewrite_op(op);
-                    st.emit(rewritten);
+                    // GUARD_EXCEPTION carries a Ref result (the caught
+                    // exception value, pyjitpl.py:3385-3392 `last_exc_box =
+                    // op`). Emit through `emit_rewritten_from` so a non-Void
+                    // guard result keeps its original position and registers
+                    // a forwarding entry — otherwise `emit` would renumber it
+                    // and downstream uses (e.g. a SETFIELD_GC of the caught
+                    // exception) would dangle. Void-result guards are
+                    // unaffected (emit_rewritten_from defers to `emit`).
+                    st.emit_rewritten_from(op, rewritten);
                 }
 
                 // ── Everything else: pass through unchanged. ──
