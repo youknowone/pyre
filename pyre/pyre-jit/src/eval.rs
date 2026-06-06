@@ -3059,18 +3059,28 @@ fn dispatch_arm_via_blackhole(
         let mut bh = builder.acquire_interp();
         bh.jitcode = jitcode;
         bh.position = 0;
-        // Slice 3.4+ lands here: virtualizable_ptr / virtualizable_info
-        // wiring, PyFrame ↔ BH register marshalling, `bh.run()`, and
-        // the reverse marshal back into PyFrame stack.  Until then the
-        // path is unreachable (predicate `false`) so acquire/release is
-        // a no-op round trip.
+        // Virtualizable wiring — mirrors `call_jit.rs:1400-1423`.
+        // Single-arm dispatch has no caller chain so the
+        // `nextblackholeinterp` propagation loop reduces to no-op.
+        bh.virtualizable_ptr = frame as *mut pyre_interpreter::pyframe::PyFrame as i64;
+        bh.virtualizable_info = get_virtualizable_info();
+        // RPython MIFrame.setup parity: r0 = frame (per `trace_opcode.rs
+        // :6657-6660` walker-side seed).  Remaining registers default
+        // to zero/null; per-arm stack peeks set them up inside the arm
+        // body via `bhimpl_*` operand decoding.
+        if !bh.registers_r.is_empty() {
+            bh.registers_r[0] = bh.virtualizable_ptr;
+        }
+        // Slice 3.5+ lands here: per-opcode-family register
+        // marshalling, `bh.run()`, and the reverse marshal back into
+        // PyFrame stack.  Until then the path is unreachable
+        // (predicate `false`) so acquire/release is a no-op round trip.
         builder.release_interp(bh);
     });
 
-    let _ = frame;
     unimplemented!(
-        "dispatch_arm_via_blackhole: register marshalling + \
-         `bh.run()` lands in slice 3.4+.  \
+        "dispatch_arm_via_blackhole: per-opcode register marshalling \
+         + `bh.run()` lands in slice 3.5+.  \
          `production_blackhole_handles` must remain `false` until then."
     )
 }
