@@ -2992,6 +2992,38 @@ fn trace_jit_bytecode(_pc: usize, _instruction_name: &str) {
 ///       jit_merge_point(...)      # thin inline check
 ///       next_instr = handle_bytecode(...)
 ///
+/// Phase 5.B dispatch-unification: run a single walker-handled
+/// opcode's arm jitcode through `BlackholeInterpreter` so its
+/// non-elidable `residual_call`s actually mutate heap, then return so
+/// `eval_loop_jit` advances to the next opcode.
+///
+/// RPython parity: `pyjitpl.py:_interpret` IS the execution loop —
+/// every opcode dispatches through the jitcode-bytecode path.  Pyre
+/// hosts the per-opcode loop in `eval_loop_jit` instead, so this
+/// helper bridges the two halves: walker-handled opcodes whose arms
+/// rely on impure residual_calls (e.g. `store_subscr_fn`,
+/// `set_current_exception`) route through here instead of the
+/// vable-only skip at `eval_loop_jit`'s walker-dispatched branch.
+///
+/// Selection gate: `pyre_jit_trace::production_blackhole_handles`
+/// (returns `false` everywhere today).  Subsequent Phase 5.B slices
+/// implement the body — arm jitcode lookup, BH builder
+/// acquire/release, PyFrame↔BH register marshalling, `interp.run()`
+/// — and grow the predicate per opcode.
+#[cold]
+fn dispatch_arm_via_blackhole(
+    frame: &mut pyre_interpreter::pyframe::PyFrame,
+    instruction: &pyre_interpreter::Instruction,
+) -> Result<StepResult<pyre_object::PyObjectRef>, pyre_interpreter::PyError> {
+    let _ = (frame, instruction);
+    unimplemented!(
+        "dispatch_arm_via_blackhole: arm jitcode lookup + \
+         BlackholeInterpreter wiring lands in subsequent Phase 5.B \
+         slices.  `production_blackhole_handles` must remain `false` \
+         until the body is implemented."
+    )
+}
+
 /// warmspot.py portal_runner parity: execute a frame through the JIT-enabled
 /// interpreter. Used by bhimpl_recursive_call (blackhole.py:1074-1093) for
 /// recursive portal depth. Returns PyObjectRef (NULL on void/exception).
@@ -3140,16 +3172,7 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
                 // arm jitcode through `BlackholeInterpreter` so the
                 // mutation actually happens, matching RPython
                 // `pyjitpl.py:_interpret`'s single-interpreter loop.
-                //
-                // `dispatch_arm_via_blackhole` lands in a follow-up
-                // slice (issue #73 Phase 5.B); the predicate returns
-                // `false` everywhere until then, so this arm is
-                // unreachable today.
-                unreachable!(
-                    "production_blackhole_handles must return false \
-                     until dispatch_arm_via_blackhole lands; \
-                     instruction={instruction:?}",
-                );
+                dispatch_arm_via_blackhole(frame, &instruction)
             } else {
                 // Vable-only fast path: walker arm advanced PyFrame
                 // via `vable_setfield` / `setarrayitem_vable_r` →
