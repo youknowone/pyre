@@ -3053,36 +3053,66 @@ fn dispatch_arm_via_blackhole(
             builder.setup_cached_control_opcodes(op_live, op_catch_exception, op_rvmprof_code);
         };
 
-    BH_BUILDER_ARM.with(|cell| unsafe {
-        let builder = &mut *cell.get();
-        sync_control_opcodes(builder);
-        let mut bh = builder.acquire_interp();
-        bh.jitcode = jitcode;
-        bh.position = 0;
-        // Virtualizable wiring — mirrors `call_jit.rs:1400-1423`.
-        // Single-arm dispatch has no caller chain so the
-        // `nextblackholeinterp` propagation loop reduces to no-op.
-        bh.virtualizable_ptr = frame as *mut pyre_interpreter::pyframe::PyFrame as i64;
-        bh.virtualizable_info = get_virtualizable_info();
-        // RPython MIFrame.setup parity: r0 = frame (per `trace_opcode.rs
-        // :6657-6660` walker-side seed).  Remaining registers default
-        // to zero/null; per-arm stack peeks set them up inside the arm
-        // body via `bhimpl_*` operand decoding.
-        if !bh.registers_r.is_empty() {
-            bh.registers_r[0] = bh.virtualizable_ptr;
-        }
-        // Slice 3.5+ lands here: per-opcode-family register
-        // marshalling, `bh.run()`, and the reverse marshal back into
-        // PyFrame stack.  Until then the path is unreachable
-        // (predicate `false`) so acquire/release is a no-op round trip.
-        builder.release_interp(bh);
-    });
+    let (mergepoint_args, got_exception, exception_value, return_type) =
+        BH_BUILDER_ARM.with(|cell| unsafe {
+            let builder = &mut *cell.get();
+            sync_control_opcodes(builder);
+            let mut bh = builder.acquire_interp();
+            bh.jitcode = jitcode;
+            bh.position = 0;
+            // Virtualizable wiring — mirrors `call_jit.rs:1400-1423`.
+            // Single-arm dispatch has no caller chain so the
+            // `nextblackholeinterp` propagation loop reduces to no-op.
+            bh.virtualizable_ptr =
+                frame as *mut pyre_interpreter::pyframe::PyFrame as i64;
+            bh.virtualizable_info = get_virtualizable_info();
+            // RPython MIFrame.setup parity: r0 = frame (per
+            // `trace_opcode.rs:6657-6660` walker-side seed).
+            // Remaining registers default to zero/null; per-arm stack
+            // peeks set them up inside the arm body via `bhimpl_*`
+            // operand decoding.
+            if !bh.registers_r.is_empty() {
+                bh.registers_r[0] = bh.virtualizable_ptr;
+            }
+            let mergepoint_args = bh.run();
+            let got_exception = bh.got_exception;
+            let exception_value = bh.exception_last_value;
+            let return_type = bh.return_type;
+            builder.release_interp(bh);
+            (
+                mergepoint_args,
+                got_exception,
+                exception_value,
+                return_type,
+            )
+        });
 
-    unimplemented!(
-        "dispatch_arm_via_blackhole: per-opcode register marshalling \
-         + `bh.run()` lands in slice 3.5+.  \
-         `production_blackhole_handles` must remain `false` until then."
-    )
+    if got_exception {
+        // Slice 3.6: BH exception with no handler in the arm body.
+        // Convert `exception_value` (i64 pointer to W_BaseException) to
+        // a `PyError` and propagate up to `eval_loop_jit`.
+        let _ = exception_value;
+        todo!(
+            "dispatch_arm_via_blackhole: BH exception → PyError \
+             propagation lands in slice 3.6"
+        );
+    }
+    if mergepoint_args.is_some() {
+        // `ContinueRunningNormally` is the JIT-exit path: an arm
+        // discovered a jit_merge_point and wants the outer loop to
+        // re-warm.  Opcode arms don't issue merge points, so this is
+        // structurally unreachable for the per-opcode dispatch path.
+        unreachable!(
+            "dispatch_arm_via_blackhole: opcode arm raised \
+             ContinueRunningNormally — only portal arms should",
+        );
+    }
+    // LeaveFrame, no exception.  Per-return-type result handling
+    // (Ref/Int/Float push back onto PyFrame stack; Void = no push)
+    // lands in slice 3.7; void-returning arms (STORE_SUBSCR &c.) are
+    // the StoreSubscr activation target and need no push.
+    let _ = return_type;
+    Ok(StepResult::Continue)
 }
 
 /// warmspot.py portal_runner parity: execute a frame through the JIT-enabled
