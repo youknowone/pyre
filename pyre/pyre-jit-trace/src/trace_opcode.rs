@@ -7875,9 +7875,6 @@ fn apply_walker_stack_effect(state: &mut MIFrame, instruction: &Instruction) {
         | Instruction::LoadAttr { .. }
         | Instruction::StoreAttr { .. }
         | Instruction::StoreFastStoreFast { .. }
-        | Instruction::PopExcept
-        | Instruction::PushExcInfo
-        | Instruction::PopTop
         | Instruction::PushNull => {
             // Non-zero stack delta. The walker arm's
             // `setfield_vable_i(valuestackdepth)` emit routes through

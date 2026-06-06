@@ -3114,6 +3114,26 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
             // execute step to avoid double-mutation.  pc advancement
             // already happened above via `set_last_instr_from_next_instr
             // (opcode_pc + 1)`.
+            //
+            // Correct only when every state-mutating effect of the arm
+            // body rides a `vable_setfield` / `setarrayitem_vable_r`
+            // write whose `synchronize_virtualizable` propagates back to
+            // the heap PyFrame.  For arms calling non-elidable / side-
+            // effecting residual_calls (e.g. `store_subscr_fn`,
+            // `set_current_exception`), the heap mutation never happens
+            // here AND never happens during walker recording (gated by
+            // `check_is_elidable` in
+            // `jitcode_dispatch::execute_residual_call`).  Expanding
+            // `production_walker_handles` past the vable-only set
+            // requires the Phase 5.B dispatch-unification path:
+            // `production_blackhole_handles(instruction)` →
+            // `dispatch_arm_via_blackhole(frame, instruction)` which
+            // runs the arm jitcode through `BlackholeInterpreter` so
+            // non-elidable residual_calls actually execute (see
+            // `project_issue73_phase5b_prereq_2026_05_20.md`).  Neither
+            // function exists yet; the current set is the vable-only
+            // subset, and StoreSubscr et al. are intentionally
+            // excluded until Phase 5.B lands.
             Ok(StepResult::Continue)
         } else {
             execute_opcode_step(frame, code, instruction, op_arg, next_instr)
