@@ -755,9 +755,21 @@ pub struct ExecutionContext {
     /// pointer into the leaked action owned by `module::_signal`
     /// (`install_signal_handling`); `None` until installed.
     pub check_signal_action: Option<*mut dyn AsyncActionOps>,
+    /// `executioncontext.py sys_exc_operror` — the active exception for
+    /// `sys.exc_info()` / bare `raise`, saved/restored across handler
+    /// regions by PUSH_EXC_INFO / POP_EXCEPT.  Single source of truth
+    /// (replaces the former `eval::CURRENT_EXCEPTION` thread-local), so
+    /// the JIT can read/write it as a GETFIELD_GC/SETFIELD_GC slot on the
+    /// per-thread EC pointer and the optimizer can dead-store-eliminate a
+    /// balanced save/restore.  GC-rooted via `walk_pyframe_roots`.
+    pub sys_exc_value: PyObjectRef,
 }
 
 pub type PyExecutionContext = ExecutionContext;
+
+/// Byte offset of `sys_exc_value` within `ExecutionContext`, for the JIT's
+/// GETFIELD_GC/SETFIELD_GC lowering of PUSH_EXC_INFO / POP_EXCEPT.
+pub const EC_SYS_EXC_VALUE_OFFSET: usize = std::mem::offset_of!(ExecutionContext, sys_exc_value);
 
 impl Default for ExecutionContext {
     fn default() -> Self {
@@ -794,6 +806,7 @@ impl ExecutionContext {
             builtins_module,
             builtin_dict_cache: std::cell::Cell::new(pyre_object::PY_NULL),
             check_signal_action: None,
+            sys_exc_value: pyre_object::PY_NULL,
         }
     }
 

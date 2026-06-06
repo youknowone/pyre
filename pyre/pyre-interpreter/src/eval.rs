@@ -39,10 +39,10 @@ impl Code {
     }
 }
 
-// Thread-local current exception for bare `raise` (RAISE_VARARGS 0).
-// PyPy: executioncontext.py sys_exc_info — the current active exception.
+// The current active exception (`sys.exc_info()` / bare `raise`) now lives
+// on the per-thread `ExecutionContext` (`sys_exc_value`), reached via
+// `get_current_exception` / `set_current_exception`; see those.
 thread_local! {
-    static CURRENT_EXCEPTION: Cell<PyObjectRef> = const { Cell::new(PY_NULL) };
     pub(crate) static CURRENT_FRAME: Cell<*mut PyFrame> = const { Cell::new(std::ptr::null_mut()) };
 }
 use crate::pyframe::PyFrame;
@@ -211,6 +211,12 @@ fn walk_pyframe_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
             if !ec.is_null() {
                 let top_slot = unsafe { &mut (*ec).topframeref as *mut *mut PyFrame };
                 visitor(unsafe { &mut *(top_slot as *mut majit_ir::GcRef) });
+                // `sys_exc_value` holds the active handler exception, which
+                // is nursery-allocated and may move; forward it so the EC
+                // slot is updated on a minor collection (the value-stack
+                // copy alone is not authoritative for later EC reads).
+                let exc_slot = unsafe { &mut (*ec).sys_exc_value as *mut PyObjectRef };
+                visitor(unsafe { &mut *(exc_slot as *mut majit_ir::GcRef) });
             }
         }
         while !frame.is_null() {
@@ -349,11 +355,21 @@ pub fn register_pyframe_root_walker() {
 }
 
 pub fn get_current_exception() -> PyObjectRef {
-    CURRENT_EXCEPTION.with(|current| current.get())
+    let ec = crate::call::getexecutioncontext();
+    if ec.is_null() {
+        return PY_NULL;
+    }
+    unsafe { (*ec).sys_exc_value }
 }
 
 pub fn set_current_exception(exc: PyObjectRef) {
-    CURRENT_EXCEPTION.with(|current| current.set(exc));
+    let ec = crate::call::getexecutioncontext() as *mut PyExecutionContext;
+    if ec.is_null() {
+        return;
+    }
+    unsafe {
+        (*ec).sys_exc_value = exc;
+    }
 }
 
 /// `pyopcode.py:1524-1532 DICT_UPDATE` — update `dict` from a mapping
@@ -518,7 +534,7 @@ pub fn attach_raise_cause(exc: PyObjectRef, cause: Option<PyObjectRef>) -> Resul
     // `__context__` and `__cause__`/`__suppress_context__` writes land
     // in the typed slots on `W_ExceptionObject` per
     // `interp_exceptions.py:113-117`.
-    let active = CURRENT_EXCEPTION.with(|c| c.get());
+    let active = get_current_exception();
     if !active.is_null()
         && active != exc
         && unsafe { !pyre_object::is_none(active) }
@@ -2055,7 +2071,7 @@ impl OpcodeStepExecutor for PyFrame {
             0 => {
                 // Bare `raise` — re-raise current exception
                 // PyPy: executioncontext.py sys_exc_info
-                let exc = CURRENT_EXCEPTION.with(|c| c.get());
+                let exc = get_current_exception();
                 if exc.is_null() || unsafe { pyre_object::is_none(exc) } {
                     Err(PyError::runtime_error("No active exception to reraise"))
                 } else if unsafe { pyre_object::is_exception(exc) } {
@@ -2352,8 +2368,8 @@ impl OpcodeStepExecutor for PyFrame {
     fn push_exc_info(&mut self) -> Result<(), PyError> {
         let exc = self.pop();
         // Save previous exception, set current
-        let prev = CURRENT_EXCEPTION.with(|c| c.get());
-        CURRENT_EXCEPTION.with(|c| c.set(exc));
+        let prev = get_current_exception();
+        set_current_exception(exc);
         // Push "previous exception" for later restore
         self.push(prev);
         // Push the exception value back
@@ -2388,7 +2404,7 @@ impl OpcodeStepExecutor for PyFrame {
     fn pop_except(&mut self) -> Result<(), PyError> {
         // Restore previous exc_info from stack
         let prev_exc = self.pop();
-        CURRENT_EXCEPTION.with(|c| c.set(prev_exc));
+        set_current_exception(prev_exc);
         Ok(())
     }
 
