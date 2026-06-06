@@ -1409,7 +1409,7 @@ impl OptHeap {
     /// FLAG_LOOKUP (0): always cache and reuse.
     /// FLAG_STORE  (1): don't cache new; reuse only if cached value ≥ 0.
     /// FLAG_DELETE (2+): never cache, never reuse.
-    fn _optimize_call_dict_lookup(&mut self, op: &Op, ctx: &mut OptContext) -> bool {
+    fn _optimize_call_dict_lookup(&mut self, op: &Op, op_rc: &majit_ir::OpRc, ctx: &mut OptContext) -> bool {
         const FLAG_LOOKUP: i64 = 0;
         const FLAG_STORE: i64 = 1;
 
@@ -1484,9 +1484,7 @@ impl OptHeap {
                 }
             }
             // heap.py:525-527: make_equal_to + last_emitted_operation = REMOVED
-            let b_old = ctx
-                .ensure_box(op.pos.get())
-                .expect("body-namespace OpRef must have a BoxRef slot");
+            let b_old = BoxRef::from_bound_op(op_rc);
             let b_res = ctx
                 .ensure_box(res_v)
                 .expect("body-namespace OpRef must have a BoxRef slot");
@@ -1885,7 +1883,7 @@ impl OptHeap {
 
     // ── Handlers for specific opcodes ──
 
-    fn optimize_getfield(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
+    fn optimize_getfield(&mut self, op: &Op, op_rc: &majit_ir::OpRc, ctx: &mut OptContext) -> OptimizationResult {
         let key = match Self::field_key(op) {
             Some(k) => k,
             None => return OptimizationResult::Emit(op.clone()),
@@ -1937,9 +1935,7 @@ impl OptHeap {
                 if ctx.same_box(*lazy_obj, obj) {
                     // MUST_ALIAS: lazy_set targets the same struct → return rhs
                     let cached = lazy_op.arg(1).to_opref();
-                    let b_old = ctx
-                        .ensure_box(op.pos.get())
-                        .expect("body-namespace OpRef must have a BoxRef slot");
+                    let b_old = BoxRef::from_bound_op(op_rc);
                     let b_cached = ctx
                         .ensure_box(cached)
                         .expect("body-namespace OpRef must have a BoxRef slot");
@@ -1976,9 +1972,7 @@ impl OptHeap {
                             let cached = ctx.force_op_from_preamble_op(&pop);
                             ctx.structinfo_setfield(op, field_idx, cached);
                             self.field_cache(&descr).register_info(obj);
-                            let b_old = ctx
-                                .ensure_box(op.pos.get())
-                                .expect("body-namespace OpRef must have a BoxRef slot");
+                            let b_old = BoxRef::from_bound_op(op_rc);
                             let b_cached = ctx
                                 .get_box_replacement_box(cached)
                                 .or_else(|| ctx.ensure_box(cached))
@@ -1988,9 +1982,7 @@ impl OptHeap {
                         }
                         crate::optimizeopt::info::FieldEntry::Value(cached) => {
                             if !cached.is_none() {
-                                let b_old = ctx
-                                    .ensure_box(op.pos.get())
-                                    .expect("body-namespace OpRef must have a BoxRef slot");
+                                let b_old = BoxRef::from_bound_op(op_rc);
                                 let b_cached = ctx
                                     .get_box_replacement_box(cached)
                                     .or_else(|| ctx.ensure_box(cached))
@@ -2057,9 +2049,7 @@ impl OptHeap {
                         let cached = ctx.force_op_from_preamble_op(&pop);
                         ctx.structinfo_setfield(op, field_idx, cached);
                         self.field_cache(&descr).register_info(obj);
-                        let b_old = ctx
-                            .ensure_box(op.pos.get())
-                            .expect("body-namespace OpRef must have a BoxRef slot");
+                        let b_old = BoxRef::from_bound_op(op_rc);
                         let b_cached = ctx
                             .get_box_replacement_box(cached)
                             .or_else(|| ctx.ensure_box(cached))
@@ -2069,9 +2059,7 @@ impl OptHeap {
                     }
                     crate::optimizeopt::info::FieldEntry::Value(cached) => {
                         if !cached.is_none() {
-                            let b_old = ctx
-                                .ensure_box(op.pos.get())
-                                .expect("body-namespace OpRef must have a BoxRef slot");
+                            let b_old = BoxRef::from_bound_op(op_rc);
                             let b_cached = ctx
                                 .get_box_replacement_box(cached)
                                 .or_else(|| ctx.ensure_box(cached))
@@ -2089,9 +2077,7 @@ impl OptHeap {
         if let Some(qi_cached) = self.quasi_immut_cache.get(&key).copied() {
             if !qi_cached.is_none() {
                 // Subsequent read: reuse the cached value.
-                let b_old = ctx
-                    .ensure_box(op.pos.get())
-                    .expect("body-namespace OpRef must have a BoxRef slot");
+                let b_old = BoxRef::from_bound_op(op_rc);
                 let b_qi = ctx
                     .get_box_replacement_box(qi_cached)
                     .or_else(|| ctx.ensure_box(qi_cached))
@@ -2492,7 +2478,7 @@ impl OptHeap {
         }
     }
 
-    fn optimize_getarrayitem(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
+    fn optimize_getarrayitem(&mut self, op: &Op, op_rc: &majit_ir::OpRc, ctx: &mut OptContext) -> OptimizationResult {
         // Install ArrayPtrInfo via ensure_ptr_info_arg0 (return value
         // unused — we re-borrow further down via a fresh call so the
         // intermediate cache mutations can take &mut ctx without
@@ -2520,9 +2506,7 @@ impl OptHeap {
                     if ctx.same_box(*lazy_obj, array) {
                         // MUST_ALIAS: lazy_set targets the same array → return rhs
                         let cached = lazy_op.arg(2).to_opref();
-                        let b_old = ctx
-                            .ensure_box(op.pos.get())
-                            .expect("body-namespace OpRef must have a BoxRef slot");
+                        let b_old = BoxRef::from_bound_op(op_rc);
                         let b_cached = ctx
                             .ensure_box(cached)
                             .expect("body-namespace OpRef must have a BoxRef slot");
@@ -2557,9 +2541,7 @@ impl OptHeap {
                                 self.arrayitem_cache(&descr, const_index)
                                     .register_info(array);
                                 ctx.arrayinfo_setitem(op, const_index as usize, cached);
-                                let b_old = ctx
-                                    .ensure_box(op.pos.get())
-                                    .expect("body-namespace OpRef must have a BoxRef slot");
+                                let b_old = BoxRef::from_bound_op(op_rc);
                                 let b_cached = ctx
                                     .get_box_replacement_box(cached)
                                     .or_else(|| ctx.ensure_box(cached))
@@ -2569,9 +2551,7 @@ impl OptHeap {
                             }
                             crate::optimizeopt::info::FieldEntry::Value(cached) => {
                                 if !cached.is_none() {
-                                    let b_old = ctx
-                                        .ensure_box(op.pos.get())
-                                        .expect("body-namespace OpRef must have a BoxRef slot");
+                                    let b_old = BoxRef::from_bound_op(op_rc);
                                     let b_cached = ctx
                                         .get_box_replacement_box(cached)
                                         .or_else(|| ctx.ensure_box(cached))
@@ -2633,9 +2613,7 @@ impl OptHeap {
                 self.arrayitem_cache(&descr, const_index)
                     .register_info(array);
                 ctx.arrayinfo_setitem(op, const_index as usize, cached);
-                let b_old = ctx
-                    .ensure_box(op.pos.get())
-                    .expect("body-namespace OpRef must have a BoxRef slot");
+                let b_old = BoxRef::from_bound_op(op_rc);
                 let b_cached = ctx
                     .get_box_replacement_box(cached)
                     .or_else(|| ctx.ensure_box(cached))
@@ -2655,9 +2633,7 @@ impl OptHeap {
                             self.arrayitem_cache(&descr, const_index)
                                 .register_info(array);
                             ctx.arrayinfo_setitem(op, const_index as usize, cached);
-                            let b_old = ctx
-                                .ensure_box(op.pos.get())
-                                .expect("body-namespace OpRef must have a BoxRef slot");
+                            let b_old = BoxRef::from_bound_op(op_rc);
                             let b_cached = ctx
                                 .get_box_replacement_box(cached)
                                 .or_else(|| ctx.ensure_box(cached))
@@ -2667,9 +2643,7 @@ impl OptHeap {
                         }
                         crate::optimizeopt::info::FieldEntry::Value(cached) => {
                             if !cached.is_none() {
-                                let b_old = ctx
-                                    .ensure_box(op.pos.get())
-                                    .expect("body-namespace OpRef must have a BoxRef slot");
+                                let b_old = BoxRef::from_bound_op(op_rc);
                                 let b_cached = ctx
                                     .get_box_replacement_box(cached)
                                     .or_else(|| ctx.ensure_box(cached))
@@ -2736,9 +2710,7 @@ impl OptHeap {
             let indexbox = ctx.get_box_replacement(op.arg(1).to_opref()).to_opref();
             if let Some(submap) = self.get_cached_array_submap(descr_idx) {
                 if let Some(cached) = submap.lookup_cached(arrayinfo, indexbox, ctx) {
-                    let b_old = ctx
-                        .ensure_box(op.pos.get())
-                        .expect("body-namespace OpRef must have a BoxRef slot");
+                    let b_old = BoxRef::from_bound_op(op_rc);
                     let b_cached = ctx
                         .ensure_box(cached)
                         .expect("body-namespace OpRef must have a BoxRef slot");
@@ -2800,7 +2772,7 @@ impl OptHeap {
     /// Handle operations that may have side effects.
     /// Forces lazy sets and invalidates caches as needed.
     /// Tracks allocations for aliasing analysis.
-    fn handle_side_effects(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
+    fn handle_side_effects(&mut self, op: &Op, op_rc: &majit_ir::OpRc, ctx: &mut OptContext) -> OptimizationResult {
         let opcode = op.opcode;
 
         // Track allocations for aliasing analysis.
@@ -2839,7 +2811,7 @@ impl OptHeap {
                 // self.emit(op) → emitting_operation → force_from_effectinfo,
                 // identical to a non-DICT_LOOKUP residual call.
                 OopSpecIndex::DictLookup => {
-                    if self._optimize_call_dict_lookup(op, ctx) {
+                    if self._optimize_call_dict_lookup(op, op_rc, ctx) {
                         return OptimizationResult::Remove;
                     }
                     return self.emit_residual_call(op, ctx);
@@ -2863,7 +2835,7 @@ impl OptHeap {
         OptimizationResult::Emit(op.clone())
     }
 
-    fn dispatch_propagate(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
+    fn dispatch_propagate(&mut self, op: &Op, op_rc: &majit_ir::OpRc, ctx: &mut OptContext) -> OptimizationResult {
         match op.opcode {
             // ── Field reads ──
             OpCode::GetfieldGcI
@@ -2871,7 +2843,7 @@ impl OptHeap {
             | OpCode::GetfieldGcF
             | OpCode::GetfieldGcPureI
             | OpCode::GetfieldGcPureR
-            | OpCode::GetfieldGcPureF => self.optimize_getfield(op, ctx),
+            | OpCode::GetfieldGcPureF => self.optimize_getfield(op, op_rc, ctx),
 
             // ── Raw field reads/writes ──
             // Keep these conservative. The standard heap.py cache/postprocess
@@ -2888,7 +2860,7 @@ impl OptHeap {
 
             // ── Array item reads ──
             OpCode::GetarrayitemGcI | OpCode::GetarrayitemGcR | OpCode::GetarrayitemGcF => {
-                self.optimize_getarrayitem(op, ctx)
+                self.optimize_getarrayitem(op, op_rc, ctx)
             }
 
             // ── Raw array item reads/writes ──
@@ -3138,7 +3110,7 @@ impl OptHeap {
             }
 
             // ── Everything else: check for side effects ──
-            _ => self.handle_side_effects(op, ctx),
+            _ => self.handle_side_effects(op, op_rc, ctx),
         }
     }
 }
@@ -3150,8 +3122,8 @@ impl Default for OptHeap {
 }
 
 impl Optimization for OptHeap {
-    fn propagate_forward(&mut self, op: &Op, _op_rc: &majit_ir::OpRc, ctx: &mut OptContext) -> OptimizationResult {
-        let result = self.dispatch_propagate(op, ctx);
+    fn propagate_forward(&mut self, op: &Op, op_rc: &majit_ir::OpRc, ctx: &mut OptContext) -> OptimizationResult {
+        let result = self.dispatch_propagate(op, op_rc, ctx);
         // heap.py:417-425 emit() override parity:
         // Before emitting any new op, flush the postponed op. Then
         // postpone comparison/ovf ops (call_may_force already handled
@@ -4071,7 +4043,9 @@ mod tests {
         let mut op = Op::with_descr(OpCode::GetfieldGcI, &[BoxRef::from_opref(p0)], d);
         op.pos.set(pos2);
 
-        let result = heap.optimize_getfield(&op, &mut ctx);
+        let op_rc = std::rc::Rc::new(op.clone());
+        ctx.bind_input_resops(std::slice::from_ref(&op_rc));
+        let result = heap.optimize_getfield(&op, &op_rc, &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(ctx.get_box_replacement(pos2).to_opref(), p1);
     }
@@ -4109,7 +4083,9 @@ mod tests {
             d_head.clone(),
         );
         op1.pos.set(pos2);
-        let result1 = heap.optimize_getfield(&op1, &mut ctx);
+        let op1_rc = std::rc::Rc::new(op1.clone());
+        ctx.bind_input_resops(std::slice::from_ref(&op1_rc));
+        let result1 = heap.optimize_getfield(&op1, &op1_rc, &mut ctx);
         assert!(matches!(result1, OptimizationResult::Remove));
         assert_eq!(ctx.get_box_replacement(pos2).to_opref(), p1);
 
@@ -4125,7 +4101,7 @@ mod tests {
             d_head.clone(),
         );
         op2.pos.set(pos3);
-        let result2 = heap.optimize_getfield(&op2, &mut ctx);
+        let result2 = heap.optimize_getfield(&op2, &std::rc::Rc::new(op2.clone()), &mut ctx);
         assert!(
             matches!(result2, OptimizationResult::Emit(_)),
             "getfield after invalidation must emit, not reuse stale import"
@@ -4154,7 +4130,7 @@ mod tests {
         let mut op = Op::with_descr(OpCode::GetfieldGcI, &[BoxRef::from_opref(p0)], d);
         op.pos.set(pos1);
 
-        let _ = heap.optimize_getfield(&op, &mut ctx);
+        let _ = heap.optimize_getfield(&op, &std::rc::Rc::new(op.clone()), &mut ctx);
     }
 
     // ── Test 2: Two GETFIELDs on same object/field → second eliminated ──
@@ -6672,7 +6648,7 @@ mod tests {
         );
         op1.setdescr(descr.clone());
         op1.pos.set(pos1);
-        assert!(!heap._optimize_call_dict_lookup(&op1, &mut ctx));
+        assert!(!heap._optimize_call_dict_lookup(&op1, &std::rc::Rc::new(op1.clone()), &mut ctx));
 
         // Second lookup with same dict+key — should be cached.
         let pos2 = ctx.reserve_pos_typed(Type::Int);
@@ -6688,7 +6664,9 @@ mod tests {
         );
         op2.setdescr(descr.clone());
         op2.pos.set(pos2);
-        assert!(heap._optimize_call_dict_lookup(&op2, &mut ctx));
+        let op2_rc = std::rc::Rc::new(op2.clone());
+        ctx.bind_input_resops(std::slice::from_ref(&op2_rc));
+        assert!(heap._optimize_call_dict_lookup(&op2, &op2_rc, &mut ctx));
         assert_eq!(ctx.get_box_replacement(pos2).to_opref(), pos1);
         assert!(heap.last_emitted_removed);
     }
@@ -6735,7 +6713,7 @@ mod tests {
             &pos1_box,
             &crate::optimizeopt::intutils::IntBound::from_constant(5),
         );
-        assert!(!heap._optimize_call_dict_lookup(&op1, &mut ctx));
+        assert!(!heap._optimize_call_dict_lookup(&op1, &std::rc::Rc::new(op1.clone()), &mut ctx));
 
         // FLAG_STORE with known non-negative cached value → reuse.
         let pos2 = ctx.reserve_pos_typed(Type::Int);
@@ -6751,7 +6729,9 @@ mod tests {
         );
         op2.setdescr(descr.clone());
         op2.pos.set(pos2);
-        assert!(heap._optimize_call_dict_lookup(&op2, &mut ctx));
+        let op2_rc = std::rc::Rc::new(op2.clone());
+        ctx.bind_input_resops(std::slice::from_ref(&op2_rc));
+        assert!(heap._optimize_call_dict_lookup(&op2, &op2_rc, &mut ctx));
         assert_eq!(ctx.get_box_replacement(pos2).to_opref(), pos1);
     }
 
@@ -6785,7 +6765,7 @@ mod tests {
         );
         op1.setdescr(descr.clone());
         op1.pos.set(pos1);
-        heap._optimize_call_dict_lookup(&op1, &mut ctx);
+        heap._optimize_call_dict_lookup(&op1, &std::rc::Rc::new(op1.clone()), &mut ctx);
         assert!(!heap.cached_dict_reads.is_empty());
 
         // clean_caches should clear it.
@@ -6806,7 +6786,7 @@ mod tests {
         );
         op2.setdescr(descr.clone());
         op2.pos.set(pos2);
-        assert!(!heap._optimize_call_dict_lookup(&op2, &mut ctx));
+        assert!(!heap._optimize_call_dict_lookup(&op2, &std::rc::Rc::new(op2.clone()), &mut ctx));
     }
 
     /// util.py:100/127 args_dict() / args_eq parity: same_box treats two
@@ -6855,7 +6835,7 @@ mod tests {
         );
         op1.setdescr(descr.clone());
         op1.pos.set(pos1);
-        assert!(!heap._optimize_call_dict_lookup(&op1, &mut ctx));
+        assert!(!heap._optimize_call_dict_lookup(&op1, &std::rc::Rc::new(op1.clone()), &mut ctx));
 
         // Same value via a different const slot — must hit the cache.
         let pos2 = ctx.reserve_pos_typed(Type::Int);
@@ -6871,7 +6851,9 @@ mod tests {
         );
         op2.setdescr(descr.clone());
         op2.pos.set(pos2);
-        assert!(heap._optimize_call_dict_lookup(&op2, &mut ctx));
+        let op2_rc = std::rc::Rc::new(op2.clone());
+        ctx.bind_input_resops(std::slice::from_ref(&op2_rc));
+        assert!(heap._optimize_call_dict_lookup(&op2, &op2_rc, &mut ctx));
         assert_eq!(ctx.get_box_replacement(pos2).to_opref(), pos1);
     }
 
@@ -6941,7 +6923,7 @@ mod tests {
         );
         op1.setdescr(descr.clone());
         op1.pos.set(pos1);
-        assert!(!heap._optimize_call_dict_lookup(&op1, &mut ctx));
+        assert!(!heap._optimize_call_dict_lookup(&op1, &std::rc::Rc::new(op1.clone()), &mut ctx));
         assert!(heap.cached_dict_reads.is_empty());
     }
 }
