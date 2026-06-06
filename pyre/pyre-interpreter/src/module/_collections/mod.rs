@@ -83,6 +83,44 @@ mod deque_class {
         Ok(idx as usize)
     }
 
+    /// `W_Deque.compare` — element-wise (`compare_by_iteration`) ordering
+    /// against another deque, ignoring `maxlen`; `NotImplemented` when the
+    /// other operand is not a deque.  Delegates to list comparison over
+    /// snapshots of both backings.
+    fn deque_compare(
+        self_obj: PyObjectRef,
+        other: PyObjectRef,
+        op: crate::baseobjspace::CompareOp,
+    ) -> Result<PyObjectRef, crate::PyError> {
+        if !crate::baseobjspace::isinstance(other, type_object())? {
+            return Ok(pyre_object::w_not_implemented());
+        }
+        let la = w_list_new(snapshot(self_obj));
+        let lb = w_list_new(snapshot(other));
+        crate::baseobjspace::compare(la, lb, op)
+    }
+
+    /// `W_Deque.mul` — repeat the elements `num` times, then re-bound by
+    /// `maxlen` by routing through the constructor (which trims).
+    fn deque_repeat(self_obj: PyObjectRef, n: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+        if !unsafe { is_int(n) } {
+            return Ok(pyre_object::w_not_implemented());
+        }
+        let num = unsafe { w_int_get_value(n) }.max(0);
+        let base = snapshot(self_obj);
+        let mut items = Vec::with_capacity(base.len().saturating_mul(num as usize));
+        for _ in 0..num {
+            items.extend_from_slice(&base);
+        }
+        let ty = unsafe { w_instance_get_type(self_obj) };
+        let list = w_list_new(items);
+        match crate::baseobjspace::getattr(self_obj, "__maxlen__") {
+            Ok(m) if !(m.is_null() || unsafe { is_none(m) }) =>
+                crate::call::call_function_impl_result(ty, &[list, m]),
+            _ => crate::call::call_function_impl_result(ty, &[list]),
+        }
+    }
+
     /// `W_Deque.appendleft` + `trimright`: drop from the right once over the bound.
     fn do_appendleft(self_obj: PyObjectRef, item: PyObjectRef) {
         let mut items = snapshot(self_obj);
@@ -264,6 +302,57 @@ mod deque_class {
                 items.remove(idx);
                 store(self_obj, items);
                 Ok(())
+            }
+            fn __eq__(self_obj: PyObjectRef, other: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+                deque_compare(self_obj, other, crate::baseobjspace::CompareOp::Eq)
+            }
+            fn __ne__(self_obj: PyObjectRef, other: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+                deque_compare(self_obj, other, crate::baseobjspace::CompareOp::Ne)
+            }
+            fn __lt__(self_obj: PyObjectRef, other: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+                deque_compare(self_obj, other, crate::baseobjspace::CompareOp::Lt)
+            }
+            fn __le__(self_obj: PyObjectRef, other: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+                deque_compare(self_obj, other, crate::baseobjspace::CompareOp::Le)
+            }
+            fn __gt__(self_obj: PyObjectRef, other: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+                deque_compare(self_obj, other, crate::baseobjspace::CompareOp::Gt)
+            }
+            fn __ge__(self_obj: PyObjectRef, other: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+                deque_compare(self_obj, other, crate::baseobjspace::CompareOp::Ge)
+            }
+            fn __mul__(self_obj: PyObjectRef, n: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+                deque_repeat(self_obj, n)
+            }
+            fn __rmul__(self_obj: PyObjectRef, n: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+                deque_repeat(self_obj, n)
+            }
+            fn __imul__(self_obj: PyObjectRef, n: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+                // `W_Deque.imul` — empty or *1 is self; *<=0 clears; else
+                // repeat in place, trimmed by maxlen.
+                if !unsafe { is_int(n) } {
+                    return Ok(pyre_object::w_not_implemented());
+                }
+                let num = unsafe { w_int_get_value(n) };
+                let base = snapshot(self_obj);
+                if base.is_empty() || num == 1 {
+                    return Ok(self_obj);
+                }
+                if num <= 0 {
+                    store(self_obj, vec![]);
+                    return Ok(self_obj);
+                }
+                let mut items = Vec::with_capacity(base.len().saturating_mul(num as usize));
+                for _ in 0..num {
+                    items.extend_from_slice(&base);
+                }
+                if let Some(m) = maxlen_bound(self_obj) {
+                    if items.len() > m {
+                        items.drain(0..items.len() - m);
+                    }
+                }
+                store(self_obj, items);
+                Ok(self_obj)
             }
             fn __repr__(self_obj: PyObjectRef) -> String {
                 // `dequerepr` — a deque reachable from its own items renders
