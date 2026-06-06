@@ -2241,6 +2241,9 @@ fn build_class_inner(
         let backing = crate::type_methods::resolve_dict_backing(w_ns);
         if !backing.is_null() && unsafe { pyre_object::is_dict(backing) } {
             let class_ns = unsafe { &mut *class_ns_ptr };
+            // Rebuild from the final backing so names `del`eted from the
+            // mapping during body execution don't survive in class_ns.
+            class_ns.clear();
             for (key, value) in unsafe { pyre_object::w_dict_items(backing) } {
                 if !value.is_null() && unsafe { pyre_object::is_str(key) } {
                     crate::dict_storage_store(
@@ -2309,6 +2312,15 @@ fn build_class_inner(
                         // Use setitem to trigger __setitem__ on EnumDict etc.
                         let _ = crate::baseobjspace::setitem(w_prepared_dict, key, v);
                     }
+                }
+            } else {
+                // The body wrote directly into the mapping, so the prepared
+                // dict already holds every store — but `fast2locals` may have
+                // synced the `__class__` / `__classdict__` cellvars into it.
+                // Drop that scaffolding before the metaclass observes it.
+                for scaffold in ["__class__", "__classdict__"] {
+                    let _ =
+                        crate::baseobjspace::delitem(w_prepared_dict, pyre_object::w_str_new(scaffold));
                 }
             }
             w_prepared_dict
@@ -2403,10 +2415,10 @@ fn build_class_inner(
             for (attr_name, value) in entries {
                 if !value.is_null() {
                     if let Ok(set_name) = crate::baseobjspace::getattr(value, "__set_name__") {
-                        let _ = crate::call_function(
+                        crate::builtins::call_and_check(
                             set_name,
                             &[w, pyre_object::w_str_new(&attr_name)],
-                        );
+                        )?;
                     }
                 }
             }

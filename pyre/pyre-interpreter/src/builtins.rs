@@ -1557,6 +1557,15 @@ fn type_descr_new_with_metaclass(
                 if unsafe { is_str(k) } {
                     let key = unsafe { pyre_object::w_str_get_value(k) };
                     if key == "__classcell__" {
+                        if !unsafe { pyre_object::is_cell(v) } {
+                            let tp_name = match unsafe { crate::typedef::r#type(v) } {
+                                Some(tp) => unsafe { pyre_object::w_type_get_name(tp) }.to_string(),
+                                None => "object".to_string(),
+                            };
+                            return Err(crate::PyError::type_error(format!(
+                                "__classcell__ must be a nonlocal cell, not {tp_name}"
+                            )));
+                        }
                         classcell = v;
                         continue;
                     }
@@ -1640,8 +1649,8 @@ fn type_descr_new_with_metaclass(
                 if unsafe { is_str(k) } {
                     if let Ok(set_name) = crate::baseobjspace::getattr(v, "__set_name__") {
                         // getattr returns a bound method, so self is already bound.
-                        // Call: bound_set_name(owner, name)
-                        let _ = crate::call_function(set_name, &[w_type, k]);
+                        // Call: bound_set_name(owner, name); propagate a raise.
+                        call_and_check(set_name, &[w_type, k])?;
                     }
                 }
             }
@@ -2329,6 +2338,13 @@ pub(crate) fn builtin_str(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     let obj = args[0];
     unsafe {
         if is_str(obj) {
+            // A `str` subclass keeps `ob_type` at STR_TYPE but carries the
+            // Python class in `w_class`; honor its `__str__` override before
+            // returning the raw value.
+            let tp = (*obj).ob_type;
+            if let Some(s) = crate::display::builtin_subclass_dunder(obj, tp, "__str__") {
+                return Ok(w_str_new(&s));
+            }
             return Ok(obj);
         }
     }

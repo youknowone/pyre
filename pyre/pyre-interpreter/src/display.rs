@@ -225,7 +225,7 @@ unsafe fn builtin_leaf_repr_string(obj: PyObjectRef, tp: *const PyType) -> Optio
 /// `ob_type`-keyed formatters ignore a subclass override.  Returns `Some`
 /// only when the dunder resolves above `object` (whose inherited default
 /// must fall through to the builtin formatting instead of re-entering).
-unsafe fn builtin_subclass_dunder(
+pub(crate) unsafe fn builtin_subclass_dunder(
     obj: PyObjectRef,
     tp: *const PyType,
     name: &str,
