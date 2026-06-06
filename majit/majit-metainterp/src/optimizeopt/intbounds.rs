@@ -2317,18 +2317,14 @@ impl OptIntBounds {
     /// RPython `if`.
     fn make_int_lt(&mut self, box1: OpRef, box2: OpRef, ctx: &mut OptContext) {
         let b2 = self.getintbound_box(box2, ctx);
-        let changed1 = ctx
-            .ensure_box(box1)
-            .map(|b| ctx.with_intbound_mut(&b, |b1| matches!(b1.make_lt(&b2), Ok(true))))
-            .unwrap_or(false);
+        let box1_h = ctx.get_box_replacement(box1);
+        let changed1 = ctx.with_intbound_mut(&box1_h, |b1| matches!(b1.make_lt(&b2), Ok(true)));
         if changed1 {
             self.propagate_bounds_backward(box1, ctx);
         }
         let b1 = self.getintbound_box(box1, ctx);
-        let changed2 = ctx
-            .ensure_box(box2)
-            .map(|b| ctx.with_intbound_mut(&b, |b2| matches!(b2.make_gt(&b1), Ok(true))))
-            .unwrap_or(false);
+        let box2_h = ctx.get_box_replacement(box2);
+        let changed2 = ctx.with_intbound_mut(&box2_h, |b2| matches!(b2.make_gt(&b1), Ok(true)));
         if changed2 {
             self.propagate_bounds_backward(box2, ctx);
         }
@@ -2337,18 +2333,14 @@ impl OptIntBounds {
     /// intbounds.py:572-578 make_int_le
     fn make_int_le(&mut self, box1: OpRef, box2: OpRef, ctx: &mut OptContext) {
         let b2 = self.getintbound_box(box2, ctx);
-        let changed1 = ctx
-            .ensure_box(box1)
-            .map(|b| ctx.with_intbound_mut(&b, |b1| matches!(b1.make_le(&b2), Ok(true))))
-            .unwrap_or(false);
+        let box1_h = ctx.get_box_replacement(box1);
+        let changed1 = ctx.with_intbound_mut(&box1_h, |b1| matches!(b1.make_le(&b2), Ok(true)));
         if changed1 {
             self.propagate_bounds_backward(box1, ctx);
         }
         let b1 = self.getintbound_box(box1, ctx);
-        let changed2 = ctx
-            .ensure_box(box2)
-            .map(|b| ctx.with_intbound_mut(&b, |b2| matches!(b2.make_ge(&b1), Ok(true))))
-            .unwrap_or(false);
+        let box2_h = ctx.get_box_replacement(box2);
+        let changed2 = ctx.with_intbound_mut(&box2_h, |b2| matches!(b2.make_ge(&b1), Ok(true)));
         if changed2 {
             self.propagate_bounds_backward(box2, ctx);
         }
@@ -2367,18 +2359,16 @@ impl OptIntBounds {
     /// intbounds.py:586-592 make_unsigned_lt
     fn make_unsigned_lt(&mut self, box1: OpRef, box2: OpRef, ctx: &mut OptContext) {
         let b2 = self.getintbound_box(box2, ctx);
-        let changed1 = ctx
-            .ensure_box(box1)
-            .map(|b| ctx.with_intbound_mut(&b, |b1| matches!(b1.make_unsigned_lt(&b2), Ok(true))))
-            .unwrap_or(false);
+        let box1_h = ctx.get_box_replacement(box1);
+        let changed1 =
+            ctx.with_intbound_mut(&box1_h, |b1| matches!(b1.make_unsigned_lt(&b2), Ok(true)));
         if changed1 {
             self.propagate_bounds_backward(box1, ctx);
         }
         let b1 = self.getintbound_box(box1, ctx);
-        let changed2 = ctx
-            .ensure_box(box2)
-            .map(|b| ctx.with_intbound_mut(&b, |b2| matches!(b2.make_unsigned_gt(&b1), Ok(true))))
-            .unwrap_or(false);
+        let box2_h = ctx.get_box_replacement(box2);
+        let changed2 =
+            ctx.with_intbound_mut(&box2_h, |b2| matches!(b2.make_unsigned_gt(&b1), Ok(true)));
         if changed2 {
             self.propagate_bounds_backward(box2, ctx);
         }
@@ -2387,18 +2377,16 @@ impl OptIntBounds {
     /// intbounds.py:594-600 make_unsigned_le
     fn make_unsigned_le(&mut self, box1: OpRef, box2: OpRef, ctx: &mut OptContext) {
         let b2 = self.getintbound_box(box2, ctx);
-        let changed1 = ctx
-            .ensure_box(box1)
-            .map(|b| ctx.with_intbound_mut(&b, |b1| matches!(b1.make_unsigned_le(&b2), Ok(true))))
-            .unwrap_or(false);
+        let box1_h = ctx.get_box_replacement(box1);
+        let changed1 =
+            ctx.with_intbound_mut(&box1_h, |b1| matches!(b1.make_unsigned_le(&b2), Ok(true)));
         if changed1 {
             self.propagate_bounds_backward(box1, ctx);
         }
         let b1 = self.getintbound_box(box1, ctx);
-        let changed2 = ctx
-            .ensure_box(box2)
-            .map(|b| ctx.with_intbound_mut(&b, |b2| matches!(b2.make_unsigned_ge(&b1), Ok(true))))
-            .unwrap_or(false);
+        let box2_h = ctx.get_box_replacement(box2);
+        let changed2 =
+            ctx.with_intbound_mut(&box2_h, |b2| matches!(b2.make_unsigned_ge(&b1), Ok(true)));
         if changed2 {
             self.propagate_bounds_backward(box2, ctx);
         }
@@ -2427,18 +2415,14 @@ impl OptIntBounds {
     /// ```
     fn make_eq(&mut self, arg0: OpRef, arg1: OpRef, ctx: &mut OptContext) {
         let b1 = self.getintbound_box(arg1, ctx);
-        let changed0 = ctx
-            .ensure_box(arg0)
-            .map(|b| ctx.with_intbound_mut(&b, |b0| matches!(b0.intersect(&b1), Ok(true))))
-            .unwrap_or(false);
+        let arg0_h = ctx.get_box_replacement(arg0);
+        let changed0 = ctx.with_intbound_mut(&arg0_h, |b0| matches!(b0.intersect(&b1), Ok(true)));
         if changed0 {
             self.propagate_bounds_backward(arg0, ctx);
         }
         let b0 = self.getintbound_box(arg0, ctx);
-        let changed1 = ctx
-            .ensure_box(arg1)
-            .map(|b| ctx.with_intbound_mut(&b, |b1| matches!(b1.intersect(&b0), Ok(true))))
-            .unwrap_or(false);
+        let arg1_h = ctx.get_box_replacement(arg1);
+        let changed1 = ctx.with_intbound_mut(&arg1_h, |b1| matches!(b1.intersect(&b0), Ok(true)));
         if changed1 {
             self.propagate_bounds_backward(arg1, ctx);
         }
@@ -2463,10 +2447,8 @@ impl OptIntBounds {
         let b1 = self.getintbound_box(arg1, ctx);
         if b1.is_constant() {
             let v1 = b1.get_constant_int();
-            let did = ctx
-                .ensure_box(arg0)
-                .map(|b| ctx.with_intbound_mut(&b, |b0| b0.make_ne_const(v1)))
-                .unwrap_or(false);
+            let arg0_h = ctx.get_box_replacement(arg0);
+            let did = ctx.with_intbound_mut(&arg0_h, |b0| b0.make_ne_const(v1));
             if did {
                 self.propagate_bounds_backward(arg0, ctx);
             }
@@ -2474,10 +2456,8 @@ impl OptIntBounds {
             let b0 = self.getintbound_box(arg0, ctx);
             if b0.is_constant() {
                 let v0 = b0.get_constant_int();
-                let did = ctx
-                    .ensure_box(arg1)
-                    .map(|b| ctx.with_intbound_mut(&b, |b1| b1.make_ne_const(v0)))
-                    .unwrap_or(false);
+                let arg1_h = ctx.get_box_replacement(arg1);
+                let did = ctx.with_intbound_mut(&arg1_h, |b1| b1.make_ne_const(v0));
                 if did {
                     self.propagate_bounds_backward(arg1, ctx);
                 }
