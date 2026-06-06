@@ -2505,11 +2505,11 @@ impl OptIntBounds {
     ) {
         let arg0 = op.arg(0).to_opref();
         // optimizer.py:99-113 `getintbound` lazy-installs unbounded; the
-        // is_raw_ptr read + downstream bound write both materialize via
-        // `ensure_box` so the write path doesn't silently skip an opref
-        // it can't resolve.
-        let arg0_box = ctx.ensure_box(arg0);
-        if arg0_box.as_ref().map_or(false, |b| ctx.is_raw_ptr(b)) {
+        // dispatch-entry rebind registers the operand, so
+        // `get_box_replacement` resolves to the bound host the is_raw_ptr
+        // read and the downstream bound write both use.
+        let arg0_box = ctx.get_box_replacement(arg0);
+        if ctx.is_raw_ptr(&arg0_box) {
             return;
         }
         let r = self.getintbound_box(op.pos.get(), ctx);
@@ -2520,14 +2520,10 @@ impl OptIntBounds {
         if r_const == valnonzero {
             let b1 = self.getintbound_box(arg0, ctx);
             if b1.known_nonnegative() {
-                if let Some(bx) = &arg0_box {
-                    let _ = ctx.with_intbound_mut(bx, |bm| bm.make_gt_const(0));
-                }
+                let _ = ctx.with_intbound_mut(&arg0_box, |bm| bm.make_gt_const(0));
                 self.propagate_bounds_backward(arg0, ctx);
             } else if b1.known_le_const(0) {
-                if let Some(bx) = &arg0_box {
-                    let _ = ctx.with_intbound_mut(bx, |bm| bm.make_lt_const(0));
-                }
+                let _ = ctx.with_intbound_mut(&arg0_box, |bm| bm.make_lt_const(0));
                 self.propagate_bounds_backward(arg0, ctx);
             }
         } else if r_const == valzero {
@@ -2557,31 +2553,23 @@ impl OptIntBounds {
             OpCode::IntAdd | OpCode::IntAddOvf => {
                 let arg0 = op.arg(0).to_opref();
                 let arg1 = op.arg(1).to_opref();
-                // OpRef → BoxRef shim until the propagate_bounds_backward
-                // path migrates to take `&BoxRef` (Phase D-2).
-                let arg0_box = ctx.ensure_box(arg0);
-                let arg1_box = ctx.ensure_box(arg1);
-                let arg0_is_raw = arg0_box.as_ref().map_or(false, |b| ctx.is_raw_ptr(b));
-                let arg1_is_raw = arg1_box.as_ref().map_or(false, |b| ctx.is_raw_ptr(b));
-                if arg0_is_raw || arg1_is_raw {
+                let arg0_box = ctx.get_box_replacement(arg0);
+                let arg1_box = ctx.get_box_replacement(arg1);
+                if ctx.is_raw_ptr(&arg0_box) || ctx.is_raw_ptr(&arg1_box) {
                     return;
                 }
                 let b1 = self.getintbound_box(arg0, ctx);
                 let b2 = self.getintbound_box(arg1, ctx);
                 let r = self.getintbound_box(op.pos.get(), ctx);
                 let b = r.sub_bound(&b2);
-                let changed0 = arg0_box
-                    .as_ref()
-                    .map(|bx| ctx.with_intbound_mut(bx, |bm| matches!(bm.intersect(&b), Ok(true))))
-                    .unwrap_or(false);
+                let changed0 =
+                    ctx.with_intbound_mut(&arg0_box, |bm| matches!(bm.intersect(&b), Ok(true)));
                 if changed0 {
                     self.propagate_bounds_backward(arg0, ctx);
                 }
                 let b = r.sub_bound(&b1);
-                let changed1 = arg1_box
-                    .as_ref()
-                    .map(|bx| ctx.with_intbound_mut(bx, |bm| matches!(bm.intersect(&b), Ok(true))))
-                    .unwrap_or(false);
+                let changed1 =
+                    ctx.with_intbound_mut(&arg1_box, |bm| matches!(bm.intersect(&b), Ok(true)));
                 if changed1 {
                     self.propagate_bounds_backward(arg1, ctx);
                 }
@@ -2594,18 +2582,16 @@ impl OptIntBounds {
                 let b2 = self.getintbound_box(arg1, ctx);
                 let r = self.getintbound_box(op.pos.get(), ctx);
                 let b = r.add_bound(&b2);
-                let changed0 = ctx
-                    .ensure_box(arg0)
-                    .map(|bx| ctx.with_intbound_mut(&bx, |bm| matches!(bm.intersect(&b), Ok(true))))
-                    .unwrap_or(false);
+                let arg0_box = ctx.get_box_replacement(arg0);
+                let changed0 =
+                    ctx.with_intbound_mut(&arg0_box, |bm| matches!(bm.intersect(&b), Ok(true)));
                 if changed0 {
                     self.propagate_bounds_backward(arg0, ctx);
                 }
                 let b = r.sub_bound(&b1).neg_bound();
-                let changed1 = ctx
-                    .ensure_box(arg1)
-                    .map(|bx| ctx.with_intbound_mut(&bx, |bm| matches!(bm.intersect(&b), Ok(true))))
-                    .unwrap_or(false);
+                let arg1_box = ctx.get_box_replacement(arg1);
+                let changed1 =
+                    ctx.with_intbound_mut(&arg1_box, |bm| matches!(bm.intersect(&b), Ok(true)));
                 if changed1 {
                     self.propagate_bounds_backward(arg1, ctx);
                 }
@@ -2621,18 +2607,16 @@ impl OptIntBounds {
                 }
                 let r = self.getintbound_box(op.pos.get(), ctx);
                 let b = r.py_div_bound(&b2);
-                let changed0 = ctx
-                    .ensure_box(arg0)
-                    .map(|bx| ctx.with_intbound_mut(&bx, |bm| matches!(bm.intersect(&b), Ok(true))))
-                    .unwrap_or(false);
+                let arg0_box = ctx.get_box_replacement(arg0);
+                let changed0 =
+                    ctx.with_intbound_mut(&arg0_box, |bm| matches!(bm.intersect(&b), Ok(true)));
                 if changed0 {
                     self.propagate_bounds_backward(arg0, ctx);
                 }
                 let b = r.py_div_bound(&b1);
-                let changed1 = ctx
-                    .ensure_box(arg1)
-                    .map(|bx| ctx.with_intbound_mut(&bx, |bm| matches!(bm.intersect(&b), Ok(true))))
-                    .unwrap_or(false);
+                let arg1_box = ctx.get_box_replacement(arg1);
+                let changed1 =
+                    ctx.with_intbound_mut(&arg1_box, |bm| matches!(bm.intersect(&b), Ok(true)));
                 if changed1 {
                     self.propagate_bounds_backward(arg1, ctx);
                 }
@@ -2648,12 +2632,9 @@ impl OptIntBounds {
                 }
                 let r = self.getintbound_box(op.pos.get(), ctx);
                 if let Ok(b) = r.lshift_bound_backwards(&b2) {
-                    let changed = ctx
-                        .ensure_box(arg0)
-                        .map(|bx| {
-                            ctx.with_intbound_mut(&bx, |bm| matches!(bm.intersect(&b), Ok(true)))
-                        })
-                        .unwrap_or(false);
+                    let arg0_box = ctx.get_box_replacement(arg0);
+                    let changed =
+                        ctx.with_intbound_mut(&arg0_box, |bm| matches!(bm.intersect(&b), Ok(true)));
                     if changed {
                         self.propagate_bounds_backward(arg0, ctx);
                     }
@@ -2668,10 +2649,9 @@ impl OptIntBounds {
                 }
                 let r = self.getintbound_box(op.pos.get(), ctx);
                 let b = r.rshift_bound_backwards(&b2);
-                let changed = ctx
-                    .ensure_box(arg0)
-                    .map(|bx| ctx.with_intbound_mut(&bx, |bm| matches!(bm.intersect(&b), Ok(true))))
-                    .unwrap_or(false);
+                let arg0_box = ctx.get_box_replacement(arg0);
+                let changed =
+                    ctx.with_intbound_mut(&arg0_box, |bm| matches!(bm.intersect(&b), Ok(true)));
                 if changed {
                     self.propagate_bounds_backward(arg0, ctx);
                 }
@@ -2685,10 +2665,9 @@ impl OptIntBounds {
                 }
                 let r = self.getintbound_box(op.pos.get(), ctx);
                 let b = r.urshift_bound_backwards(&b2);
-                let changed = ctx
-                    .ensure_box(arg0)
-                    .map(|bx| ctx.with_intbound_mut(&bx, |bm| matches!(bm.intersect(&b), Ok(true))))
-                    .unwrap_or(false);
+                let arg0_box = ctx.get_box_replacement(arg0);
+                let changed =
+                    ctx.with_intbound_mut(&arg0_box, |bm| matches!(bm.intersect(&b), Ok(true)));
                 if changed {
                     self.propagate_bounds_backward(arg0, ctx);
                 }
@@ -2700,26 +2679,18 @@ impl OptIntBounds {
                 let r = self.getintbound_box(op.pos.get(), ctx);
                 let b0 = self.getintbound_box(arg0, ctx);
                 let b1 = self.getintbound_box(arg1, ctx);
-                let arg0_box = ctx.ensure_box(arg0);
-                let arg1_box = ctx.ensure_box(arg1);
+                let arg0_box = ctx.get_box_replacement(arg0);
+                let arg1_box = ctx.get_box_replacement(arg1);
                 if let Ok(b) = b0.and_bound_backwards(&r) {
-                    let changed = arg1_box
-                        .as_ref()
-                        .map(|bx| {
-                            ctx.with_intbound_mut(bx, |bm| matches!(bm.intersect(&b), Ok(true)))
-                        })
-                        .unwrap_or(false);
+                    let changed =
+                        ctx.with_intbound_mut(&arg1_box, |bm| matches!(bm.intersect(&b), Ok(true)));
                     if changed {
                         self.propagate_bounds_backward(arg1, ctx);
                     }
                 }
                 if let Ok(b) = b1.and_bound_backwards(&r) {
-                    let changed = arg0_box
-                        .as_ref()
-                        .map(|bx| {
-                            ctx.with_intbound_mut(bx, |bm| matches!(bm.intersect(&b), Ok(true)))
-                        })
-                        .unwrap_or(false);
+                    let changed =
+                        ctx.with_intbound_mut(&arg0_box, |bm| matches!(bm.intersect(&b), Ok(true)));
                     if changed {
                         self.propagate_bounds_backward(arg0, ctx);
                     }
@@ -2732,26 +2703,18 @@ impl OptIntBounds {
                 let r = self.getintbound_box(op.pos.get(), ctx);
                 let b0 = self.getintbound_box(arg0, ctx);
                 let b1 = self.getintbound_box(arg1, ctx);
-                let arg0_box = ctx.ensure_box(arg0);
-                let arg1_box = ctx.ensure_box(arg1);
+                let arg0_box = ctx.get_box_replacement(arg0);
+                let arg1_box = ctx.get_box_replacement(arg1);
                 if let Ok(b) = b0.or_bound_backwards(&r) {
-                    let changed = arg1_box
-                        .as_ref()
-                        .map(|bx| {
-                            ctx.with_intbound_mut(bx, |bm| matches!(bm.intersect(&b), Ok(true)))
-                        })
-                        .unwrap_or(false);
+                    let changed =
+                        ctx.with_intbound_mut(&arg1_box, |bm| matches!(bm.intersect(&b), Ok(true)));
                     if changed {
                         self.propagate_bounds_backward(arg1, ctx);
                     }
                 }
                 if let Ok(b) = b1.or_bound_backwards(&r) {
-                    let changed = arg0_box
-                        .as_ref()
-                        .map(|bx| {
-                            ctx.with_intbound_mut(bx, |bm| matches!(bm.intersect(&b), Ok(true)))
-                        })
-                        .unwrap_or(false);
+                    let changed =
+                        ctx.with_intbound_mut(&arg0_box, |bm| matches!(bm.intersect(&b), Ok(true)));
                     if changed {
                         self.propagate_bounds_backward(arg0, ctx);
                     }
@@ -2764,22 +2727,18 @@ impl OptIntBounds {
                 let r = self.getintbound_box(op.pos.get(), ctx);
                 let b0 = self.getintbound_box(arg0, ctx);
                 let b1 = self.getintbound_box(arg1, ctx);
-                let arg0_box = ctx.ensure_box(arg0);
-                let arg1_box = ctx.ensure_box(arg1);
+                let arg0_box = ctx.get_box_replacement(arg0);
+                let arg1_box = ctx.get_box_replacement(arg1);
                 // xor is its own inverse
                 let b = b0.xor_bound(&r);
-                let changed1 = arg1_box
-                    .as_ref()
-                    .map(|bx| ctx.with_intbound_mut(bx, |bm| matches!(bm.intersect(&b), Ok(true))))
-                    .unwrap_or(false);
+                let changed1 =
+                    ctx.with_intbound_mut(&arg1_box, |bm| matches!(bm.intersect(&b), Ok(true)));
                 if changed1 {
                     self.propagate_bounds_backward(arg1, ctx);
                 }
                 let b = b1.xor_bound(&r);
-                let changed0 = arg0_box
-                    .as_ref()
-                    .map(|bx| ctx.with_intbound_mut(bx, |bm| matches!(bm.intersect(&b), Ok(true))))
-                    .unwrap_or(false);
+                let changed0 =
+                    ctx.with_intbound_mut(&arg0_box, |bm| matches!(bm.intersect(&b), Ok(true)));
                 if changed0 {
                     self.propagate_bounds_backward(arg0, ctx);
                 }
@@ -2789,12 +2748,9 @@ impl OptIntBounds {
                 let arg0 = op.arg(0).to_opref();
                 let bres = self.getintbound_box(op.pos.get(), ctx);
                 let bounds = bres.invert_bound();
+                let arg0_box = ctx.get_box_replacement(arg0);
                 let changed = ctx
-                    .ensure_box(arg0)
-                    .map(|bx| {
-                        ctx.with_intbound_mut(&bx, |bm| matches!(bm.intersect(&bounds), Ok(true)))
-                    })
-                    .unwrap_or(false);
+                    .with_intbound_mut(&arg0_box, |bm| matches!(bm.intersect(&bounds), Ok(true)));
                 if changed {
                     self.propagate_bounds_backward(arg0, ctx);
                 }
@@ -2804,12 +2760,9 @@ impl OptIntBounds {
                 let arg0 = op.arg(0).to_opref();
                 let bres = self.getintbound_box(op.pos.get(), ctx);
                 let bounds = bres.neg_bound();
+                let arg0_box = ctx.get_box_replacement(arg0);
                 let changed = ctx
-                    .ensure_box(arg0)
-                    .map(|bx| {
-                        ctx.with_intbound_mut(&bx, |bm| matches!(bm.intersect(&bounds), Ok(true)))
-                    })
-                    .unwrap_or(false);
+                    .with_intbound_mut(&arg0_box, |bm| matches!(bm.intersect(&bounds), Ok(true)));
                 if changed {
                     self.propagate_bounds_backward(arg0, ctx);
                 }
