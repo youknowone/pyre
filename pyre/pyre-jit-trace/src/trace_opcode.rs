@@ -7704,6 +7704,26 @@ pub fn production_walker_handles(instruction: &Instruction) -> bool {
     )
 }
 
+/// Phase 5.B dispatch-unification predicate (companion to
+/// `production_walker_handles`).
+///
+/// Walker-handled opcodes whose arm body contains a non-elidable
+/// `residual_call` (e.g. `store_subscr_fn`, `set_current_exception`)
+/// cannot use the vable-only fast path at `eval.rs:3111`: walker
+/// recording skips concrete execution of impure residual_calls, and
+/// `eval_loop_jit` then skips `execute_opcode_step`, so the heap
+/// mutation never happens.  This predicate names the opcodes for which
+/// `eval_loop_jit` instead runs the arm jitcode through
+/// `BlackholeInterpreter` (`dispatch_arm_via_blackhole`), matching
+/// RPython `pyjitpl.py:_interpret`'s single-interpreter loop.
+///
+/// Returns `false` for every opcode today.  Slice 1 wires the
+/// predicate into `eval.rs` as a structural branch point; subsequent
+/// slices add opcodes once `dispatch_arm_via_blackhole` lands.
+pub fn production_blackhole_handles(_instruction: &Instruction) -> bool {
+    false
+}
+
 /// Apply the symbolic-tracker side effects of a walker-handled opcode.
 ///
 /// The walker arm records IR ops for stack pushes/pops by walking the
