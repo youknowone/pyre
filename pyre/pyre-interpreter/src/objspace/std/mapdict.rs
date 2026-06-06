@@ -1491,6 +1491,35 @@ mod tests {
     }
 
     #[test]
+    fn devolved_terminator_read_write_routes_through_obj_getdict() {
+        // mapdict.py:383-395 — a DevolvedDictTerminator reads and writes the
+        // DICT attrkind through the instance dict (`_obj_getdict`), not the
+        // map storage.  The branch is wired but not yet reachable in
+        // production (no MapDictStrategy devolve), so exercise it directly:
+        // root a MockObj at the paired devolved terminator and confirm both
+        // node_write and node_read go through `_obj_getdict`.
+        unsafe {
+            let dict_term = new_dict_terminator(std::ptr::null_mut());
+            let devolved = (*dict_term).as_terminator().devolved_dict_terminator.get();
+            assert!(!devolved.is_null());
+            let mut obj = MockObj {
+                map: devolved,
+                storage: vec![],
+            };
+            // Write lands in the instance dict, leaving map storage untouched.
+            assert!(node_write(devolved, &mut obj, "dk", DICT, sentinel(0x55)));
+            assert!(obj.storage.is_empty());
+            // The value is in `_obj_getdict`'s dict and node_read reads it back.
+            let w_dict = _obj_getdict(obj._mapdict_self_ref());
+            assert_eq!(pyre_object::w_dict_getitem_str(w_dict, "dk"), Some(sentinel(0x55)));
+            assert_eq!(node_read(devolved, &obj, "dk", DICT), Some(sentinel(0x55)));
+            // Absent key and non-DICT attrkind read nothing.
+            assert_eq!(node_read(devolved, &obj, "absent_dk", DICT), None);
+            assert_eq!(node_read(devolved, &obj, "dk", SPECIAL), None);
+        }
+    }
+
+    #[test]
     fn add_attr_via_write_grows_map_and_storage() {
         unsafe {
             // start empty: a DictTerminator, no storage
