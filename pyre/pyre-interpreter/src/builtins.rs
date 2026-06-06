@@ -1197,6 +1197,83 @@ pub(crate) fn kwarg_reject_unknown(
     Ok(())
 }
 
+/// `true` when the last argument is the `__pyre_kw__`-tagged dict the
+/// CALL_KW builtin dispatch appends — i.e. the call carried keywords.
+pub(crate) fn has_builtin_kwargs(args: &[PyObjectRef]) -> bool {
+    matches!(args.last(), Some(&last) if unsafe {
+        is_dict(last) && pyre_object::w_dict_lookup(last, w_str_new("__pyre_kw__")).is_some()
+    })
+}
+
+/// Bind positional + `__pyre_kw__` keyword arguments into a resolved
+/// scope of length `names.len()`, mirroring the gateway's
+/// `Arguments._match_signature` (`pypy/interpreter/argument.py`). Each
+/// slot is filled by a positional, then by a keyword of the matching
+/// name; an absent optional slot becomes `PY_NULL` (the generated
+/// `#[pyre_function]` unwrap reads that as "argument omitted"). An absent
+/// required slot, an unknown keyword, a keyword duplicating a positional,
+/// or too many positionals raises `TypeError`.
+///
+/// This is the consumer-side counterpart that lets a builtin resolve
+/// keywords by parameter name without a per-function `Signature`; the
+/// `#[pyre_function]` wrapper supplies the name/required tables it knows
+/// at expansion time.
+pub(crate) fn bind_builtin_kwargs(
+    args: &[PyObjectRef],
+    names: &[&str],
+    required: &[bool],
+    fn_name: &str,
+) -> Result<Vec<PyObjectRef>, crate::PyError> {
+    let (positional, kwargs) = split_builtin_kwargs(args);
+    if positional.len() > names.len() {
+        return Err(crate::PyError::type_error(format!(
+            "{fn_name}() takes at most {} positional argument{} ({} given)",
+            names.len(),
+            if names.len() == 1 { "" } else { "s" },
+            positional.len(),
+        )));
+    }
+    let mut scope: Vec<PyObjectRef> = vec![PY_NULL; names.len()];
+    let mut filled: Vec<bool> = vec![false; names.len()];
+    for (i, &v) in positional.iter().enumerate() {
+        scope[i] = v;
+        filled[i] = true;
+    }
+    if let Some(dict) = kwargs {
+        let entries = unsafe { pyre_object::w_dict_str_entries(dict) };
+        for (key, val) in entries.iter() {
+            if key == "__pyre_kw__" {
+                continue;
+            }
+            match names.iter().position(|n| *n == key.as_str()) {
+                Some(idx) => {
+                    if filled[idx] {
+                        return Err(crate::PyError::type_error(format!(
+                            "{fn_name}() got multiple values for argument '{key}'"
+                        )));
+                    }
+                    scope[idx] = *val;
+                    filled[idx] = true;
+                }
+                None => {
+                    return Err(crate::PyError::type_error(format!(
+                        "{fn_name}() got an unexpected keyword argument '{key}'"
+                    )));
+                }
+            }
+        }
+    }
+    for i in 0..names.len() {
+        if !filled[i] && required[i] {
+            return Err(crate::PyError::type_error(format!(
+                "{fn_name}() missing required argument: '{}'",
+                names[i]
+            )));
+        }
+    }
+    Ok(scope)
+}
+
 /// Reject `f(x, name=...)` when `name` already arrived positionally.
 /// The flat builtin ABI leaves this validation to each kw-aware method.
 pub(crate) fn kwarg_reject_duplicate(

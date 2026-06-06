@@ -69,9 +69,14 @@ fn expand_pyre_function(func: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
     let mut inner_sig = user_sig.clone();
     inner_sig.ident = inner_name.clone();
 
-    // Generate unwrap statements for each parameter.
+    // Generate unwrap statements for each parameter, and collect the
+    // parameter-name / required tables so the wrapper can resolve keyword
+    // arguments by name (PyPy gateway `Signature` + `_match_signature`).
     let mut unwrap_stmts = Vec::<proc_macro2::TokenStream>::new();
     let mut call_args = Vec::<proc_macro2::TokenStream>::new();
+    let mut param_names = Vec::<String>::new();
+    let mut param_required = Vec::<bool>::new();
+    let mut has_varargs = false;
     for (idx, arg) in user_sig.inputs.iter().enumerate() {
         let pat_type = match arg {
             FnArg::Typed(pt) => pt,
@@ -82,10 +87,48 @@ fn expand_pyre_function(func: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
                 ));
             }
         };
+        if is_varargs_param(&pat_type.ty) {
+            has_varargs = true;
+        }
+        param_names.push(param_name(idx, pat_type));
+        // Optional iff it has a `#[default(...)]` or is `Option<T>`.
+        param_required
+            .push(arg_default(pat_type)?.is_none() && option_inner(&pat_type.ty).is_none());
         let (unwrap, ident) = unwrap_arg(idx, pat_type)?;
         unwrap_stmts.push(unwrap);
         call_args.push(quote! { #ident });
     }
+
+    // Keyword-binding preamble: when the call carried a `__pyre_kw__`
+    // dict, rebind positional+keyword args into a resolved scope keyed by
+    // parameter name; otherwise the positional fast path runs unchanged.
+    // Skipped for varargs fns — `&[PyObjectRef]` consumes the whole slice
+    // (including any trailing kwargs dict), which the resolved-scope shape
+    // cannot express.
+    let kwargs_preamble = if has_varargs {
+        quote! {}
+    } else {
+        let name_lits = param_names.iter().map(|n| quote! { #n });
+        let req_lits = param_required.iter().map(|b| quote! { #b });
+        let fn_name_str = user_name.to_string();
+        quote! {
+            const __PYRE_PARAM_NAMES: &[&str] = &[ #(#name_lits),* ];
+            const __PYRE_PARAM_REQUIRED: &[bool] = &[ #(#req_lits),* ];
+            let __pyre_bound_args;
+            let args: &[::pyre_object::PyObjectRef] =
+                if crate::builtins::has_builtin_kwargs(args) {
+                    __pyre_bound_args = crate::builtins::bind_builtin_kwargs(
+                        args,
+                        __PYRE_PARAM_NAMES,
+                        __PYRE_PARAM_REQUIRED,
+                        #fn_name_str,
+                    )?;
+                    &__pyre_bound_args
+                } else {
+                    args
+                };
+        }
+    };
 
     let call_inner = quote! { #inner_name( #(#call_args),* ) };
     let body = wrap_return(&user_sig.output, call_inner)?;
@@ -110,6 +153,7 @@ fn expand_pyre_function(func: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
         #vis fn #user_name(
             args: &[::pyre_object::PyObjectRef],
         ) -> ::std::result::Result<::pyre_object::PyObjectRef, crate::PyError> {
+            #kwargs_preamble
             #(#unwrap_stmts)*
             #body
         }
@@ -137,7 +181,7 @@ fn unwrap_arg(idx: usize, pt: &PatType) -> syn::Result<(proc_macro2::TokenStream
     let unwrap = unwrap_expr(ty, idx)?;
     let expr = match arg_default(pt)? {
         Some(default) => quote! {
-            if args.len() > #idx { #unwrap } else { #default }
+            if #idx < args.len() && !args[#idx].is_null() { #unwrap } else { #default }
         },
         None => unwrap,
     };
@@ -328,12 +372,14 @@ fn unwrap_expr(ty: &Type, idx: usize) -> syn::Result<proc_macro2::TokenStream> {
         if type_is_py_object_ref(ty) {
             return Ok(quote! { args[#idx] });
         }
-        // `Option<T>` — `if args.len() > idx { Some(unwrap(args[idx])) } else { None }`.
-        // Mirrors PyPy `@unwrap_spec(s=W_Root)` with `def f(self, space, s=None)`.
+        // `Option<T>` — present when the slot is in range and not the
+        // `PY_NULL` "argument omitted" marker `bind_builtin_kwargs` writes
+        // for an absent optional after keyword resolution.  Mirrors PyPy
+        // `@unwrap_spec(s=W_Root)` with `def f(self, space, s=None)`.
         if let Some(inner) = option_inner(ty) {
             let inner_unwrap = unwrap_expr(inner, idx)?;
             return Ok(quote! {
-                if args.len() > #idx { Some(#inner_unwrap) } else { None }
+                if #idx < args.len() && !args[#idx].is_null() { Some(#inner_unwrap) } else { None }
             });
         }
         if let Some(seg) = p.path.segments.last() {
@@ -370,6 +416,28 @@ fn unwrap_expr(ty: &Type, idx: usize) -> syn::Result<proc_macro2::TokenStream> {
              add a mapping in pyre-macros/src/lib.rs::unwrap_expr"
         ),
     ))
+}
+
+/// The keyword name a parameter binds under — its identifier, or a
+/// synthetic positional-only placeholder for a non-ident pattern (which
+/// no real keyword can match).
+fn param_name(idx: usize, pt: &PatType) -> String {
+    match &*pt.pat {
+        Pat::Ident(pi) => pi.ident.to_string(),
+        _ => format!("__pyre_positional_{idx}"),
+    }
+}
+
+/// `true` for a `&[PyObjectRef]` varargs parameter (binds the whole arg
+/// slice).
+fn is_varargs_param(ty: &Type) -> bool {
+    let ty = unwrap_type_group(ty);
+    if let Type::Reference(r) = ty {
+        if let Type::Slice(s) = &*r.elem {
+            return type_is_py_object_ref(unwrap_type_group(&s.elem));
+        }
+    }
+    false
 }
 
 /// `Option<T>` → `Some(&T)`; anything else → None.
