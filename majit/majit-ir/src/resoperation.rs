@@ -2652,6 +2652,21 @@ impl OpCode {
     /// Maps a scalar op to its vector equivalent, e.g. INT_ADD -> VEC_INT_ADD.
     pub fn to_vector(self) -> Option<OpCode> {
         match self {
+            // resoperation.py:1746-1759 `_opvector`: memory loads/stores map to
+            // VEC_LOAD/VEC_STORE. The `_R` (ref) array loads have no vector
+            // form upstream and are intentionally omitted. There is no `_PURE`
+            // vector op; the pure getarrayitem loads still map to VEC_LOAD_I/F.
+            OpCode::RawLoadI => Some(OpCode::VecLoadI),
+            OpCode::RawLoadF => Some(OpCode::VecLoadF),
+            OpCode::GetarrayitemRawI => Some(OpCode::VecLoadI),
+            OpCode::GetarrayitemRawF => Some(OpCode::VecLoadF),
+            OpCode::GetarrayitemGcI => Some(OpCode::VecLoadI),
+            OpCode::GetarrayitemGcF => Some(OpCode::VecLoadF),
+            OpCode::GetarrayitemGcPureI => Some(OpCode::VecLoadI),
+            OpCode::GetarrayitemGcPureF => Some(OpCode::VecLoadF),
+            OpCode::RawStore => Some(OpCode::VecStore),
+            OpCode::SetarrayitemRaw => Some(OpCode::VecStore),
+            OpCode::SetarrayitemGc => Some(OpCode::VecStore),
             OpCode::IntAdd => Some(OpCode::VecIntAdd),
             OpCode::IntSub => Some(OpCode::VecIntSub),
             OpCode::IntMul => Some(OpCode::VecIntMul),
@@ -4464,6 +4479,18 @@ mod tests {
         assert_eq!(OpCode::FloatAdd.to_vector(), Some(OpCode::VecFloatAdd));
         assert_eq!(OpCode::GuardTrue.to_vector(), Some(OpCode::VecGuardTrue));
         assert_eq!(OpCode::SetfieldGc.to_vector(), None);
+        // resoperation.py:1746-1759 `_opvector`: memory loads/stores.
+        assert_eq!(OpCode::RawLoadI.to_vector(), Some(OpCode::VecLoadI));
+        assert_eq!(OpCode::RawLoadF.to_vector(), Some(OpCode::VecLoadF));
+        assert_eq!(OpCode::GetarrayitemRawI.to_vector(), Some(OpCode::VecLoadI));
+        assert_eq!(
+            OpCode::GetarrayitemGcPureF.to_vector(),
+            Some(OpCode::VecLoadF)
+        );
+        assert_eq!(OpCode::RawStore.to_vector(), Some(OpCode::VecStore));
+        assert_eq!(OpCode::SetarrayitemGc.to_vector(), Some(OpCode::VecStore));
+        // `_R` (ref) array loads have no vector form upstream.
+        assert_eq!(OpCode::GetarrayitemGcR.to_vector(), None);
     }
 
     // ── Name table ──
