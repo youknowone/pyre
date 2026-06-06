@@ -1511,7 +1511,10 @@ mod tests {
             assert!(obj.storage.is_empty());
             // The value is in `_obj_getdict`'s dict and node_read reads it back.
             let w_dict = _obj_getdict(obj._mapdict_self_ref());
-            assert_eq!(pyre_object::w_dict_getitem_str(w_dict, "dk"), Some(sentinel(0x55)));
+            assert_eq!(
+                pyre_object::w_dict_getitem_str(w_dict, "dk"),
+                Some(sentinel(0x55))
+            );
             assert_eq!(node_read(devolved, &obj, "dk", DICT), Some(sentinel(0x55)));
             // Absent key and non-DICT attrkind read nothing.
             assert_eq!(node_read(devolved, &obj, "absent_dk", DICT), None);

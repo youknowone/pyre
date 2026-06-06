@@ -2319,8 +2319,10 @@ fn build_class_inner(
                 // synced the `__class__` / `__classdict__` cellvars into it.
                 // Drop that scaffolding before the metaclass observes it.
                 for scaffold in ["__class__", "__classdict__"] {
-                    let _ =
-                        crate::baseobjspace::delitem(w_prepared_dict, pyre_object::w_str_new(scaffold));
+                    let _ = crate::baseobjspace::delitem(
+                        w_prepared_dict,
+                        pyre_object::w_str_new(scaffold),
+                    );
                 }
             }
             w_prepared_dict
