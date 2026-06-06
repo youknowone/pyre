@@ -193,27 +193,31 @@ pub fn perf_counter_ns(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
 /// Process CPU time (kernel + user) as nanoseconds.
 ///
 /// Prefers `clock_gettime(CLOCK_PROCESS_CPUTIME_ID)`; falls back to
-/// `getrusage(RUSAGE_SELF)` summing `ru_utime` and `ru_stime`.
+/// `getrusage(RUSAGE_SELF)` summing `ru_utime` and `ru_stime`.  With no
+/// usable process clock, `_clock_impl` raises RuntimeError rather than
+/// reporting a bogus zero.
 #[cfg(all(unix, feature = "host_env"))]
-fn process_time_nanos() -> i128 {
+fn process_time_nanos() -> Result<i128, crate::PyError> {
     if let Ok(d) = host_time::clock_gettime(host_time::ClockId::CLOCK_PROCESS_CPUTIME_ID) {
-        return d.as_nanos() as i128;
+        return Ok(d.as_nanos() as i128);
     }
     let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
     if unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) } == 0 {
         let tv_ns = |tv: &libc::timeval| -> i128 {
             tv.tv_sec as i128 * 1_000_000_000 + tv.tv_usec as i128 * 1_000
         };
-        return tv_ns(&usage.ru_utime) + tv_ns(&usage.ru_stime);
+        return Ok(tv_ns(&usage.ru_utime) + tv_ns(&usage.ru_stime));
     }
-    0
+    Err(crate::PyError::runtime_error(
+        "the processor time used is not available or its value cannot be represented",
+    ))
 }
 
 #[cfg(not(all(unix, feature = "host_env")))]
-fn process_time_nanos() -> i128 {
+fn process_time_nanos() -> Result<i128, crate::PyError> {
     // No host clock available; fall back to the monotonic baseline so
     // the value is still non-decreasing.
-    monotonic_baseline().elapsed().as_nanos() as i128
+    Ok(monotonic_baseline().elapsed().as_nanos() as i128)
 }
 
 /// time.process_time() → float
@@ -221,13 +225,13 @@ fn process_time_nanos() -> i128 {
 /// Process time for profiling: sum of the kernel and user-space CPU time.
 pub fn process_time(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let _ = args;
-    Ok(floatobject::w_float_new(process_time_nanos() as f64 * 1e-9))
+    Ok(floatobject::w_float_new(process_time_nanos()? as f64 * 1e-9))
 }
 
 /// time.process_time_ns() → int
 pub fn process_time_ns(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let _ = args;
-    Ok(w_int_new(process_time_nanos() as i64))
+    Ok(w_int_new(process_time_nanos()? as i64))
 }
 
 /// time.clock_gettime(clk_id) → float seconds
@@ -374,8 +378,7 @@ pub fn clock_getres(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
 // shims so the rest of the module stays identical.
 
 /// Portable `struct tm` representation used across platforms.
-#[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 #[allow(non_camel_case_types)]
 struct c_tm {
     pub tm_sec: i32,
@@ -387,6 +390,10 @@ struct c_tm {
     pub tm_wday: i32,
     pub tm_yday: i32,
     pub tm_isdst: i32,
+    /// `tm_gmtoff` / `tm_zone` — the `struct tm` fields exposed when
+    /// `HAS_TM_ZONE` (every Unix target); default elsewhere.
+    pub tm_gmtoff: i64,
+    pub tm_zone: String,
 }
 
 /// Portable time_t alias.
@@ -463,6 +470,20 @@ fn _c_localtime(seconds: time_t) -> Result<c_tm, crate::PyError> {
 // ── Unix helpers ────────────────────────────────────────────────────
 
 fn libc_tm_to_c_tm(tm: &libc::tm) -> c_tm {
+    // `tm_gmtoff` / `tm_zone` only exist on the Unix `struct tm`.
+    #[cfg(unix)]
+    let (tm_gmtoff, tm_zone) = (
+        tm.tm_gmtoff as i64,
+        if tm.tm_zone.is_null() {
+            String::new()
+        } else {
+            unsafe { std::ffi::CStr::from_ptr(tm.tm_zone) }
+                .to_string_lossy()
+                .into_owned()
+        },
+    );
+    #[cfg(not(unix))]
+    let (tm_gmtoff, tm_zone): (i64, String) = (0, String::new());
     c_tm {
         tm_sec: tm.tm_sec,
         tm_min: tm.tm_min,
@@ -473,6 +494,8 @@ fn libc_tm_to_c_tm(tm: &libc::tm) -> c_tm {
         tm_wday: tm.tm_wday,
         tm_yday: tm.tm_yday,
         tm_isdst: tm.tm_isdst,
+        tm_gmtoff,
+        tm_zone,
     }
 }
 
@@ -521,6 +544,9 @@ fn msvc_tm_to_c_tm(tm: &MsvcTm) -> c_tm {
         tm_wday: tm.tm_wday,
         tm_yday: tm.tm_yday,
         tm_isdst: tm.tm_isdst,
+        // The MSVC `struct tm` carries no zone fields (HAS_TM_ZONE false).
+        tm_gmtoff: 0,
+        tm_zone: String::new(),
     }
 }
 
@@ -540,45 +566,63 @@ fn c_tm_to_msvc_tm(tm: &c_tm) -> MsvcTm {
 }
 
 /// `app_time.py:5-23 class struct_time(metaclass=structseqtype)` —
-/// process-wide cached subclass-of-tuple type.  Pyre exposes the
-/// 9-field positional core; `tm_zone` / `tm_gmtoff` (PyPy indices
-/// 10/12 in the metaclass extras table) are not yet wired up because
-/// the structseq factory only handles the positional path today.
+/// process-wide cached subclass-of-tuple type.  The 9-field positional
+/// core; on Unix (`HAS_TM_ZONE`) `tm_zone` / `tm_gmtoff` are named-only
+/// extras so `n_fields == _STRUCT_TM_ITEMS == 11`.
 thread_local! {
     static STRUCT_TIME_TYPE: std::cell::OnceCell<PyObjectRef> =
         const { std::cell::OnceCell::new() };
 }
 
 pub(crate) fn struct_time_type() -> PyObjectRef {
+    const SEQ: &[&str] = &[
+        "tm_year", "tm_mon", "tm_mday", "tm_hour", "tm_min", "tm_sec", "tm_wday", "tm_yday",
+        "tm_isdst",
+    ];
     STRUCT_TIME_TYPE.with(|c| {
         *c.get_or_init(|| {
-            crate::structseq::make_struct_seq(
-                "time.struct_time",
-                &[
-                    "tm_year", "tm_mon", "tm_mday", "tm_hour", "tm_min", "tm_sec", "tm_wday",
-                    "tm_yday", "tm_isdst",
-                ],
-            )
+            #[cfg(unix)]
+            {
+                crate::structseq::make_struct_seq_with_extra(
+                    "time.struct_time",
+                    SEQ,
+                    &["tm_zone", "tm_gmtoff"],
+                )
+            }
+            #[cfg(not(unix))]
+            {
+                crate::structseq::make_struct_seq("time.struct_time", SEQ)
+            }
         })
     })
 }
 
 /// Build a `time.struct_time` from our portable `c_tm`.
 fn _tm_to_tuple(tm: &c_tm) -> PyObjectRef {
-    crate::structseq::new_instance(
-        struct_time_type(),
-        vec![
-            w_int_new((tm.tm_year + 1900) as i64),
-            w_int_new((tm.tm_mon + 1) as i64),
-            w_int_new(tm.tm_mday as i64),
-            w_int_new(tm.tm_hour as i64),
-            w_int_new(tm.tm_min as i64),
-            w_int_new(tm.tm_sec as i64),
-            w_int_new(((tm.tm_wday + 6) % 7) as i64), // Monday=0
-            w_int_new((tm.tm_yday + 1) as i64),
-            w_int_new(tm.tm_isdst as i64),
-        ],
-    )
+    let seq = vec![
+        w_int_new((tm.tm_year + 1900) as i64),
+        w_int_new((tm.tm_mon + 1) as i64),
+        w_int_new(tm.tm_mday as i64),
+        w_int_new(tm.tm_hour as i64),
+        w_int_new(tm.tm_min as i64),
+        w_int_new(tm.tm_sec as i64),
+        w_int_new(((tm.tm_wday + 6) % 7) as i64), // Monday=0
+        w_int_new((tm.tm_yday + 1) as i64),
+        w_int_new(tm.tm_isdst as i64),
+    ];
+    // `_tm_to_tuple` — on Unix the zone fields are exposed as extras.
+    #[cfg(unix)]
+    {
+        let extras = vec![
+            ("tm_zone", pyre_object::w_str_new(&tm.tm_zone)),
+            ("tm_gmtoff", w_int_new(tm.tm_gmtoff)),
+        ];
+        crate::structseq::new_instance_with_extra(struct_time_type(), seq, extras)
+    }
+    #[cfg(not(unix))]
+    {
+        crate::structseq::new_instance(struct_time_type(), seq)
+    }
 }
 
 /// Extract epoch seconds from an optional argument (int, float, or None/absent → now).
@@ -646,6 +690,8 @@ fn _gettmarg(args: &[PyObjectRef], default_now: bool) -> Result<c_tm, crate::PyE
             tm_wday: 0,
             tm_yday: 0,
             tm_isdst: 0,
+            tm_gmtoff: 0,
+            tm_zone: String::new(),
         };
         tm.tm_year = get(0) - 1900;
         tm.tm_mon = get(1) - 1;
