@@ -1409,7 +1409,12 @@ impl OptHeap {
     /// FLAG_LOOKUP (0): always cache and reuse.
     /// FLAG_STORE  (1): don't cache new; reuse only if cached value ≥ 0.
     /// FLAG_DELETE (2+): never cache, never reuse.
-    fn _optimize_call_dict_lookup(&mut self, op: &Op, op_rc: &majit_ir::OpRc, ctx: &mut OptContext) -> bool {
+    fn _optimize_call_dict_lookup(
+        &mut self,
+        op: &Op,
+        op_rc: &majit_ir::OpRc,
+        ctx: &mut OptContext,
+    ) -> bool {
         const FLAG_LOOKUP: i64 = 0;
         const FLAG_STORE: i64 = 1;
 
@@ -1883,7 +1888,12 @@ impl OptHeap {
 
     // ── Handlers for specific opcodes ──
 
-    fn optimize_getfield(&mut self, op: &Op, op_rc: &majit_ir::OpRc, ctx: &mut OptContext) -> OptimizationResult {
+    fn optimize_getfield(
+        &mut self,
+        op: &Op,
+        op_rc: &majit_ir::OpRc,
+        ctx: &mut OptContext,
+    ) -> OptimizationResult {
         let key = match Self::field_key(op) {
             Some(k) => k,
             None => return OptimizationResult::Emit(op.clone()),
@@ -2463,7 +2473,12 @@ impl OptHeap {
         }
     }
 
-    fn optimize_getarrayitem(&mut self, op: &Op, op_rc: &majit_ir::OpRc, ctx: &mut OptContext) -> OptimizationResult {
+    fn optimize_getarrayitem(
+        &mut self,
+        op: &Op,
+        op_rc: &majit_ir::OpRc,
+        ctx: &mut OptContext,
+    ) -> OptimizationResult {
         // Install ArrayPtrInfo via ensure_ptr_info_arg0 (return value
         // unused — we re-borrow further down via a fresh call so the
         // intermediate cache mutations can take &mut ctx without
@@ -2742,7 +2757,12 @@ impl OptHeap {
     /// Handle operations that may have side effects.
     /// Forces lazy sets and invalidates caches as needed.
     /// Tracks allocations for aliasing analysis.
-    fn handle_side_effects(&mut self, op: &Op, op_rc: &majit_ir::OpRc, ctx: &mut OptContext) -> OptimizationResult {
+    fn handle_side_effects(
+        &mut self,
+        op: &Op,
+        op_rc: &majit_ir::OpRc,
+        ctx: &mut OptContext,
+    ) -> OptimizationResult {
         let opcode = op.opcode;
 
         // Track allocations for aliasing analysis.
@@ -2805,7 +2825,12 @@ impl OptHeap {
         OptimizationResult::Emit(op.clone())
     }
 
-    fn dispatch_propagate(&mut self, op: &Op, op_rc: &majit_ir::OpRc, ctx: &mut OptContext) -> OptimizationResult {
+    fn dispatch_propagate(
+        &mut self,
+        op: &Op,
+        op_rc: &majit_ir::OpRc,
+        ctx: &mut OptContext,
+    ) -> OptimizationResult {
         match op.opcode {
             // ── Field reads ──
             OpCode::GetfieldGcI
@@ -3092,7 +3117,12 @@ impl Default for OptHeap {
 }
 
 impl Optimization for OptHeap {
-    fn propagate_forward(&mut self, op: &Op, op_rc: &majit_ir::OpRc, ctx: &mut OptContext) -> OptimizationResult {
+    fn propagate_forward(
+        &mut self,
+        op: &Op,
+        op_rc: &majit_ir::OpRc,
+        ctx: &mut OptContext,
+    ) -> OptimizationResult {
         let result = self.dispatch_propagate(op, op_rc, ctx);
         // heap.py:417-425 emit() override parity:
         // Before emitting any new op, flush the postponed op. Then
@@ -6857,7 +6887,8 @@ mod tests {
         // Now a GUARD_NO_EXCEPTION must be emitted, not removed.
         let mut guard = Op::new(OpCode::GuardNoException, &[]);
         guard.pos.set(ctx.reserve_pos_typed(Type::Void));
-        let guard_result = heap.propagate_forward(&guard, &std::rc::Rc::new(guard.clone()), &mut ctx);
+        let guard_result =
+            heap.propagate_forward(&guard, &std::rc::Rc::new(guard.clone()), &mut ctx);
         assert!(
             matches!(guard_result, OptimizationResult::Emit(_)),
             "GUARD_NO_EXCEPTION after a PassOn-emitted op must NOT be removed"

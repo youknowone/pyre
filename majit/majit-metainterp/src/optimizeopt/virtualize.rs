@@ -8,8 +8,8 @@
 /// it gets "forced" (materialized by emitting the allocation + setfield ops).
 use std::sync::Arc;
 
-use majit_ir::{Descr, DescrRef, FieldDescr, OopSpecIndex, Op, OpCode, OpRef, Type, Value};
 use crate::r#box::BoxRef;
+use majit_ir::{Descr, DescrRef, FieldDescr, OopSpecIndex, Op, OpCode, OpRef, Type, Value};
 
 use crate::optimizeopt::info::{
     PtrInfo, VirtualArrayInfo, VirtualArrayStructInfo, VirtualInfo, VirtualStructInfo,
@@ -442,7 +442,12 @@ impl OptVirtualize {
 
     // ── Per-opcode handlers ──
 
-    fn optimize_new_with_vtable(&mut self, op: &Op, op_rc: &majit_ir::OpRc, ctx: &mut OptContext) -> OptimizationResult {
+    fn optimize_new_with_vtable(
+        &mut self,
+        op: &Op,
+        op_rc: &majit_ir::OpRc,
+        ctx: &mut OptContext,
+    ) -> OptimizationResult {
         let descr = op.getdescr().expect("NEW_WITH_VTABLE needs descr");
         // virtualize.py:208 `known_class = ConstInt(op.getdescr().get_vtable())`
         // — no null filter; ConstInt(0) flows downstream as the
@@ -464,7 +469,12 @@ impl OptVirtualize {
         OptimizationResult::Remove
     }
 
-    fn optimize_new(&mut self, op: &Op, op_rc: &majit_ir::OpRc, ctx: &mut OptContext) -> OptimizationResult {
+    fn optimize_new(
+        &mut self,
+        op: &Op,
+        op_rc: &majit_ir::OpRc,
+        ctx: &mut OptContext,
+    ) -> OptimizationResult {
         let descr = op.getdescr().expect("NEW needs descr");
         let vinfo = VirtualStructInfo {
             descr,
@@ -477,7 +487,12 @@ impl OptVirtualize {
         OptimizationResult::Remove
     }
 
-    fn optimize_new_array(&mut self, op: &Op, op_rc: &majit_ir::OpRc, ctx: &mut OptContext) -> OptimizationResult {
+    fn optimize_new_array(
+        &mut self,
+        op: &Op,
+        op_rc: &majit_ir::OpRc,
+        ctx: &mut OptContext,
+    ) -> OptimizationResult {
         let size_ref = op.arg(0).to_opref();
         if let Some(size) = ctx
             .get_box_replacement_box(size_ref)
@@ -553,7 +568,12 @@ impl OptVirtualize {
     /// so this wrapper has no behavioral effect. Kept as a structural
     /// mirror of the upstream dispatch table.
     #[allow(dead_code)]
-    fn optimize_new_array_clear(&mut self, op: &Op, op_rc: &majit_ir::OpRc, ctx: &mut OptContext) -> OptimizationResult {
+    fn optimize_new_array_clear(
+        &mut self,
+        op: &Op,
+        op_rc: &majit_ir::OpRc,
+        ctx: &mut OptContext,
+    ) -> OptimizationResult {
         self.optimize_new_array(op, op_rc, ctx)
     }
 
@@ -680,7 +700,12 @@ impl OptVirtualize {
         OptimizationResult::PassOn
     }
 
-    fn optimize_getfield_gc(&mut self, op: &Op, op_rc: &majit_ir::OpRc, ctx: &mut OptContext) -> OptimizationResult {
+    fn optimize_getfield_gc(
+        &mut self,
+        op: &Op,
+        op_rc: &majit_ir::OpRc,
+        ctx: &mut OptContext,
+    ) -> OptimizationResult {
         let struct_box = ctx
             .get_box_replacement_box(op.arg(0).to_opref())
             .or_else(|| ctx.ensure_box(op.arg(0).to_opref()));
@@ -815,7 +840,12 @@ impl OptVirtualize {
     }
 
     /// virtualize.py:276-296 optimize_GETARRAYITEM_GC_I (aliased to R/F and PURE variants)
-    fn optimize_getarrayitem_gc(&mut self, op: &Op, op_rc: &majit_ir::OpRc, ctx: &mut OptContext) -> OptimizationResult {
+    fn optimize_getarrayitem_gc(
+        &mut self,
+        op: &Op,
+        op_rc: &majit_ir::OpRc,
+        ctx: &mut OptContext,
+    ) -> OptimizationResult {
         let array_box = ctx
             .get_box_replacement_box(op.arg(0).to_opref())
             .or_else(|| ctx.ensure_box(op.arg(0).to_opref()));
@@ -1014,7 +1044,12 @@ impl OptVirtualize {
     /// raw_load/store walk the chain via `resolve_raw_slice` and
     /// accumulate offsets. This matches `info.RawSlicePtrInfo.getitem_raw`,
     /// which delegates to `self.parent.getitem_raw(self.offset + offset, ...)`.
-    fn optimize_int_add(&mut self, op: &Op, op_rc: &majit_ir::OpRc, ctx: &mut OptContext) -> OptimizationResult {
+    fn optimize_int_add(
+        &mut self,
+        op: &Op,
+        op_rc: &majit_ir::OpRc,
+        ctx: &mut OptContext,
+    ) -> OptimizationResult {
         if op.num_args() < 2 {
             return OptimizationResult::PassOn;
         }
@@ -1036,7 +1071,12 @@ impl OptVirtualize {
         }
     }
 
-    fn optimize_raw_load(&mut self, op: &Op, op_rc: &majit_ir::OpRc, ctx: &mut OptContext) -> OptimizationResult {
+    fn optimize_raw_load(
+        &mut self,
+        op: &Op,
+        op_rc: &majit_ir::OpRc,
+        ctx: &mut OptContext,
+    ) -> OptimizationResult {
         let buf_ref = op.arg(0).to_opref();
         let offset_ref = op.arg(1).to_opref();
 
@@ -1176,7 +1216,12 @@ impl OptVirtualize {
     /// Slice walk via `resolve_raw_slice` is the pyre equivalent of
     /// `RawSlicePtrInfo.getitem_raw` (`info.py`) recursing through
     /// `self.parent.getitem_raw(self.offset + offset, ...)`.
-    fn optimize_getarrayitem_raw(&mut self, op: &Op, op_rc: &majit_ir::OpRc, ctx: &mut OptContext) -> OptimizationResult {
+    fn optimize_getarrayitem_raw(
+        &mut self,
+        op: &Op,
+        op_rc: &majit_ir::OpRc,
+        ctx: &mut OptContext,
+    ) -> OptimizationResult {
         let array_ref = ctx.get_box_replacement(op.arg(0).to_opref()).to_opref();
         let index_ref = op.arg(1).to_opref();
 
@@ -1431,7 +1476,12 @@ impl OptVirtualize {
     /// - forced: set to CONST_NULL
     /// The typeptr/vtable at offset 0 is handled by NEW_WITH_VTABLE when
     /// the vref is forced — not stored as a tracked virtual field.
-    fn optimize_virtual_ref(&mut self, op: &Op, op_rc: &majit_ir::OpRc, ctx: &mut OptContext) -> OptimizationResult {
+    fn optimize_virtual_ref(
+        &mut self,
+        op: &Op,
+        op_rc: &majit_ir::OpRc,
+        ctx: &mut OptContext,
+    ) -> OptimizationResult {
         // `virtualize.py:140` `vrefinfo = ... metainterp_sd.virtualref_info`
         // / `virtualize.py:123` `vrefinfo.descr` parity.
         let vref_descr: DescrRef = self.vrefinfo.descr.clone();
@@ -1616,7 +1666,12 @@ impl OptVirtualize {
     /// field must hold a constant null (set by VirtualRefFinish on the normal
     /// frame-leave path), and its `forced` field must point at a non-null
     /// object (set by VirtualRefFinish in the forced-during-tracing path).
-    fn optimize_jit_force_virtual(&mut self, op: &Op, op_rc: &majit_ir::OpRc, ctx: &mut OptContext) -> bool {
+    fn optimize_jit_force_virtual(
+        &mut self,
+        op: &Op,
+        op_rc: &majit_ir::OpRc,
+        ctx: &mut OptContext,
+    ) -> bool {
         if op.num_args() < 2 {
             return false;
         }
@@ -1683,7 +1738,12 @@ impl Default for OptVirtualize {
 }
 
 impl Optimization for OptVirtualize {
-    fn propagate_forward(&mut self, op: &Op, op_rc: &majit_ir::OpRc, ctx: &mut OptContext) -> OptimizationResult {
+    fn propagate_forward(
+        &mut self,
+        op: &Op,
+        op_rc: &majit_ir::OpRc,
+        ctx: &mut OptContext,
+    ) -> OptimizationResult {
         if let Some(ref mut vt) = self.vable {
             vt.ensure_setup(ctx);
         }
@@ -1943,7 +2003,13 @@ impl Optimization for OptVirtualize {
                                         .expect(
                                             "virtualize.py:53 source_op.getarg(0) must be ConstInt",
                                         );
-                                    self.make_virtual_raw_memory(size as usize, func, op, op_rc, ctx);
+                                    self.make_virtual_raw_memory(
+                                        size as usize,
+                                        func,
+                                        op,
+                                        op_rc,
+                                        ctx,
+                                    );
                                     self.last_emitted_was_removed = true;
                                     return OptimizationResult::Remove;
                                 }
@@ -3025,7 +3091,8 @@ mod tests {
             ],
         );
         get_item.setdescr(array_descr(24));
-        let result = pass.propagate_forward(&get_item, &std::rc::Rc::new(get_item.clone()), &mut ctx);
+        let result =
+            pass.propagate_forward(&get_item, &std::rc::Rc::new(get_item.clone()), &mut ctx);
         assert!(matches!(result, OptimizationResult::PassOn));
     }
 
@@ -3066,7 +3133,8 @@ mod tests {
             ],
         );
         set_item.setdescr(array_descr(24));
-        let result = pass.propagate_forward(&set_item, &std::rc::Rc::new(set_item.clone()), &mut ctx);
+        let result =
+            pass.propagate_forward(&set_item, &std::rc::Rc::new(set_item.clone()), &mut ctx);
         assert!(matches!(result, OptimizationResult::PassOn));
     }
 

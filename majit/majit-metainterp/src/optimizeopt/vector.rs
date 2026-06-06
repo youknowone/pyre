@@ -1661,7 +1661,12 @@ impl Default for VectorizingOptimizer {
 }
 
 impl Optimization for VectorizingOptimizer {
-    fn propagate_forward(&mut self, op: &Op, _op_rc: &majit_ir::OpRc, ctx: &mut OptContext) -> OptimizationResult {
+    fn propagate_forward(
+        &mut self,
+        op: &Op,
+        _op_rc: &majit_ir::OpRc,
+        ctx: &mut OptContext,
+    ) -> OptimizationResult {
         match op.opcode {
             OpCode::Label => {
                 self.in_loop = true;

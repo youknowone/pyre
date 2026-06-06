@@ -1,3 +1,4 @@
+use crate::r#box::BoxRef;
 /// Integer bounds optimization pass.
 ///
 /// Translated from rpython/jit/metainterp/optimizeopt/intbounds.py.
@@ -6,7 +7,6 @@
 /// a condition that is already known true from integer bounds, the guard can be
 /// removed. It also narrows bounds after guards and arithmetic operations.
 use majit_ir::{Op, OpCode, OpRef, Value};
-use crate::r#box::BoxRef;
 
 use crate::optimizeopt::intutils::IntBound;
 use crate::optimizeopt::{OptContext, Optimization, OptimizationResult};
@@ -257,7 +257,12 @@ impl OptIntBounds {
 
     /// autogenintrules.py:1220-1320 optimize_INT_EQ — rules:
     /// eq_different_knownbits / eq_same / eq_one / eq_zero / eq_sub_eq.
-    fn optimize_int_eq(&mut self, op: &Op, op_rc: &majit_ir::OpRc, ctx: &mut OptContext) -> OptimizationResult {
+    fn optimize_int_eq(
+        &mut self,
+        op: &Op,
+        op_rc: &majit_ir::OpRc,
+        ctx: &mut OptContext,
+    ) -> OptimizationResult {
         let arg0 = self.resolve_box(op.arg(0).to_opref(), ctx);
         let arg1 = self.resolve_box(op.arg(1).to_opref(), ctx);
         let b0 = self.getintbound_b(&arg0, ctx);
@@ -460,7 +465,12 @@ impl OptIntBounds {
 
     /// autogenintrules.py:23-143 optimize_INT_ADD — rules:
     /// add_zero / add_reassoc_consts / add_sub_x_c_c / add_sub_c_x_c.
-    fn optimize_int_add(&mut self, op: &Op, op_rc: &majit_ir::OpRc, ctx: &mut OptContext) -> OptimizationResult {
+    fn optimize_int_add(
+        &mut self,
+        op: &Op,
+        op_rc: &majit_ir::OpRc,
+        ctx: &mut OptContext,
+    ) -> OptimizationResult {
         let arg0 = self.resolve_box(op.arg(0).to_opref(), ctx);
         let arg1 = self.resolve_box(op.arg(1).to_opref(), ctx);
         let b0 = self.getintbound_b(&arg0, ctx);
@@ -566,7 +576,12 @@ impl OptIntBounds {
     /// sub_zero / sub_from_zero / sub_x_x / sub_add_consts / sub_add /
     /// sub_add_neg / sub_sub_left_x_c_c / sub_sub_left_c_x_c /
     /// sub_xor_x_y_y / sub_or_x_y_y / sub_invert_one.
-    fn optimize_int_sub(&mut self, op: &Op, op_rc: &majit_ir::OpRc, ctx: &mut OptContext) -> OptimizationResult {
+    fn optimize_int_sub(
+        &mut self,
+        op: &Op,
+        op_rc: &majit_ir::OpRc,
+        ctx: &mut OptContext,
+    ) -> OptimizationResult {
         let arg0 = self.resolve_box(op.arg(0).to_opref(), ctx);
         let arg1 = self.resolve_box(op.arg(1).to_opref(), ctx);
         let b0 = self.getintbound_b(&arg0, ctx);
@@ -701,7 +716,12 @@ impl OptIntBounds {
 
     /// autogenintrules.py:315-410 optimize_INT_MUL — rules:
     /// mul_zero / mul_one / mul_minus_one / mul_pow2_const / mul_lshift.
-    fn optimize_int_mul(&mut self, op: &Op, op_rc: &majit_ir::OpRc, ctx: &mut OptContext) -> OptimizationResult {
+    fn optimize_int_mul(
+        &mut self,
+        op: &Op,
+        op_rc: &majit_ir::OpRc,
+        ctx: &mut OptContext,
+    ) -> OptimizationResult {
         let arg0 = self.resolve_box(op.arg(0).to_opref(), ctx);
         let arg1 = self.resolve_box(op.arg(1).to_opref(), ctx);
         let b0 = self.getintbound_b(&arg0, ctx);
@@ -797,7 +817,12 @@ impl OptIntBounds {
     /// autogenintrules.py:414-581 optimize_INT_AND — rules:
     /// and_known_result / and_x_c_in_range / and_x_x / and_idempotent /
     /// and_reassoc_consts / and_absorb / and_or.
-    fn optimize_int_and(&mut self, op: &Op, op_rc: &majit_ir::OpRc, ctx: &mut OptContext) -> OptimizationResult {
+    fn optimize_int_and(
+        &mut self,
+        op: &Op,
+        op_rc: &majit_ir::OpRc,
+        ctx: &mut OptContext,
+    ) -> OptimizationResult {
         let arg0 = self.resolve_box(op.arg(0).to_opref(), ctx);
         let arg1 = self.resolve_box(op.arg(1).to_opref(), ctx);
         let b0 = self.getintbound_b(&arg0, ctx);
@@ -965,7 +990,12 @@ impl OptIntBounds {
     /// second of each pair is dead because the first always returns
     /// when its predicate holds. Preserved here to mirror upstream's
     /// auto-generated output line for line.
-    fn optimize_int_or(&mut self, op: &Op, op_rc: &majit_ir::OpRc, ctx: &mut OptContext) -> OptimizationResult {
+    fn optimize_int_or(
+        &mut self,
+        op: &Op,
+        op_rc: &majit_ir::OpRc,
+        ctx: &mut OptContext,
+    ) -> OptimizationResult {
         let arg0 = self.resolve_box(op.arg(0).to_opref(), ctx);
         let arg1 = self.resolve_box(op.arg(1).to_opref(), ctx);
         let b0 = self.getintbound_b(&arg0, ctx);
@@ -1179,7 +1209,12 @@ impl OptIntBounds {
     /// autogenintrules.py:791-942 optimize_INT_XOR — rules:
     /// xor_x_x / xor_reassoc_consts / xor_absorb / xor_zero /
     /// xor_minus_1 / xor_known_result / xor_is_not.
-    fn optimize_int_xor(&mut self, op: &Op, op_rc: &majit_ir::OpRc, ctx: &mut OptContext) -> OptimizationResult {
+    fn optimize_int_xor(
+        &mut self,
+        op: &Op,
+        op_rc: &majit_ir::OpRc,
+        ctx: &mut OptContext,
+    ) -> OptimizationResult {
         let arg0 = self.resolve_box(op.arg(0).to_opref(), ctx);
         let arg1 = self.resolve_box(op.arg(1).to_opref(), ctx);
         let b0 = self.getintbound_b(&arg0, ctx);
@@ -1313,7 +1348,12 @@ impl OptIntBounds {
     }
 
     /// autogenintrules.py:1432-1443 optimize_INT_INVERT — rules: invert_invert.
-    fn optimize_int_invert(&mut self, op: &Op, op_rc: &majit_ir::OpRc, ctx: &mut OptContext) -> OptimizationResult {
+    fn optimize_int_invert(
+        &mut self,
+        op: &Op,
+        op_rc: &majit_ir::OpRc,
+        ctx: &mut OptContext,
+    ) -> OptimizationResult {
         let arg0 = self.resolve_box(op.arg(0).to_opref(), ctx);
         // invert_invert: int_invert(int_invert(x)) => x
         if let Some(inner) = self.as_operation_b(&arg0, OpCode::IntInvert, ctx) {
@@ -1326,7 +1366,12 @@ impl OptIntBounds {
     }
 
     /// autogenintrules.py:1447-1458 optimize_INT_NEG — rules: neg_neg.
-    fn optimize_int_neg(&mut self, op: &Op, op_rc: &majit_ir::OpRc, ctx: &mut OptContext) -> OptimizationResult {
+    fn optimize_int_neg(
+        &mut self,
+        op: &Op,
+        op_rc: &majit_ir::OpRc,
+        ctx: &mut OptContext,
+    ) -> OptimizationResult {
         let arg0 = self.resolve_box(op.arg(0).to_opref(), ctx);
         // neg_neg: int_neg(int_neg(x)) => x
         if let Some(inner) = self.as_operation_b(&arg0, OpCode::IntNeg, ctx) {
@@ -1342,7 +1387,12 @@ impl OptIntBounds {
     /// lshift_zero_x / lshift_x_zero / lshift_rshift_c_c / lshift_and_rshift /
     /// lshift_urshift_c_c / lshift_and_urshift / lshift_lshift_c_c.
     /// LONG_BIT inlined as 64 (pyre is 64-bit only).
-    fn optimize_int_lshift(&mut self, op: &Op, op_rc: &majit_ir::OpRc, ctx: &mut OptContext) -> OptimizationResult {
+    fn optimize_int_lshift(
+        &mut self,
+        op: &Op,
+        op_rc: &majit_ir::OpRc,
+        ctx: &mut OptContext,
+    ) -> OptimizationResult {
         let arg0 = self.resolve_box(op.arg(0).to_opref(), ctx);
         let arg1 = self.resolve_box(op.arg(1).to_opref(), ctx);
         let b0 = self.getintbound_b(&arg0, ctx);
@@ -1481,7 +1531,12 @@ impl OptIntBounds {
     /// autogenintrules.py:1113-1169 optimize_INT_RSHIFT — rules:
     /// rshift_zero_x / rshift_x_zero / rshift_known_result / rshift_lshift /
     /// rshift_rshift_c_c. LONG_BIT inlined as 64.
-    fn optimize_int_rshift(&mut self, op: &Op, op_rc: &majit_ir::OpRc, ctx: &mut OptContext) -> OptimizationResult {
+    fn optimize_int_rshift(
+        &mut self,
+        op: &Op,
+        op_rc: &majit_ir::OpRc,
+        ctx: &mut OptContext,
+    ) -> OptimizationResult {
         let arg0 = self.resolve_box(op.arg(0).to_opref(), ctx);
         let arg1 = self.resolve_box(op.arg(1).to_opref(), ctx);
         let b0 = self.getintbound_b(&arg0, ctx);
@@ -1543,7 +1598,12 @@ impl OptIntBounds {
 
     /// autogenintrules.py:1364-1399 optimize_INT_IS_TRUE — rules:
     /// is_true_bool / is_true_true / is_true_and_minint.
-    fn optimize_int_is_true(&mut self, op: &Op, op_rc: &majit_ir::OpRc, ctx: &mut OptContext) -> OptimizationResult {
+    fn optimize_int_is_true(
+        &mut self,
+        op: &Op,
+        op_rc: &majit_ir::OpRc,
+        ctx: &mut OptContext,
+    ) -> OptimizationResult {
         let arg0 = self.resolve_box(op.arg(0).to_opref(), ctx);
         let b0 = self.getintbound_b(&arg0, ctx);
         // is_true_true: int_is_true(x) => 1
@@ -1592,7 +1652,12 @@ impl OptIntBounds {
 
     /// autogenintrules.py:1415-1428 optimize_INT_FORCE_GE_ZERO — rules:
     /// force_ge_zero_pos / force_ge_zero_neg.
-    fn optimize_int_force_ge_zero(&mut self, op: &Op, op_rc: &majit_ir::OpRc, ctx: &mut OptContext) -> OptimizationResult {
+    fn optimize_int_force_ge_zero(
+        &mut self,
+        op: &Op,
+        op_rc: &majit_ir::OpRc,
+        ctx: &mut OptContext,
+    ) -> OptimizationResult {
         let arg0 = self.resolve_box(op.arg(0).to_opref(), ctx);
         let b0 = ctx.getintbound_handle(&arg0).borrow().clone();
         // force_ge_zero_neg: int_force_ge_zero(x) => 0  (when x < 0)
@@ -1612,7 +1677,12 @@ impl OptIntBounds {
     /// autogenintrules.py:1173-1216 optimize_UINT_RSHIFT — rules:
     /// urshift_zero_x / urshift_x_zero / urshift_known_result /
     /// urshift_lshift_x_c_c.
-    fn optimize_uint_rshift(&mut self, op: &Op, op_rc: &majit_ir::OpRc, ctx: &mut OptContext) -> OptimizationResult {
+    fn optimize_uint_rshift(
+        &mut self,
+        op: &Op,
+        op_rc: &majit_ir::OpRc,
+        ctx: &mut OptContext,
+    ) -> OptimizationResult {
         let arg0 = self.resolve_box(op.arg(0).to_opref(), ctx);
         let arg1 = self.resolve_box(op.arg(1).to_opref(), ctx);
         let b0 = self.getintbound_b(&arg0, ctx);
@@ -1974,7 +2044,12 @@ impl OptIntBounds {
 
     // ── INT_SIGNEXT optimization ──
 
-    fn optimize_int_signext(&mut self, op: &Op, op_rc: &majit_ir::OpRc, ctx: &mut OptContext) -> OptimizationResult {
+    fn optimize_int_signext(
+        &mut self,
+        op: &Op,
+        op_rc: &majit_ir::OpRc,
+        ctx: &mut OptContext,
+    ) -> OptimizationResult {
         let b = self.getintbound_box(op.arg(0).to_opref(), ctx);
         let b1 = self.getintbound_box(op.arg(1).to_opref(), ctx);
         if b1.is_constant() {
@@ -2929,7 +3004,12 @@ impl Default for OptIntBounds {
 }
 
 impl Optimization for OptIntBounds {
-    fn propagate_forward(&mut self, op: &Op, op_rc: &majit_ir::OpRc, ctx: &mut OptContext) -> OptimizationResult {
+    fn propagate_forward(
+        &mut self,
+        op: &Op,
+        op_rc: &majit_ir::OpRc,
+        ctx: &mut OptContext,
+    ) -> OptimizationResult {
         let result = match op.opcode {
             // ── Comparisons ──
             OpCode::IntLt => self.optimize_int_lt(op, ctx),
@@ -3376,7 +3456,11 @@ mod tests {
                     ),
                 );
             }
-            let emitted_op = match pass.propagate_forward(&resolved_op, &std::rc::Rc::new(resolved_op.clone()), &mut ctx) {
+            let emitted_op = match pass.propagate_forward(
+                &resolved_op,
+                &std::rc::Rc::new(resolved_op.clone()),
+                &mut ctx,
+            ) {
                 OptimizationResult::Emit(emit_op) => {
                     ctx.emit(emit_op.clone());
                     Some(emit_op)

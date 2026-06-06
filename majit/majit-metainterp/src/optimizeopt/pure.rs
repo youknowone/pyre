@@ -835,7 +835,12 @@ impl Optimization for OptPure {
         self.cache = RecentPureOpTable::new(limit);
     }
 
-    fn propagate_forward(&mut self, op: &Op, op_rc: &majit_ir::OpRc, ctx: &mut OptContext) -> OptimizationResult {
+    fn propagate_forward(
+        &mut self,
+        op: &Op,
+        op_rc: &majit_ir::OpRc,
+        ctx: &mut OptContext,
+    ) -> OptimizationResult {
         // optimizer.py: pure_from_args1 parity — consume pending registrations
         // from rewrite pass (CAST_*, CONVERT_* reverse-pure relationships)
         // and virtualize pass (ARRAYLEN_GC with array descr keying per
@@ -2812,7 +2817,8 @@ mod tests {
             ),
         ));
         // OptRewrite demotes CallLoopinvariantI → CallI
-        let rewrite_result = rewrite.propagate_forward(&op, &std::rc::Rc::new(op.clone()), &mut ctx);
+        let rewrite_result =
+            rewrite.propagate_forward(&op, &std::rc::Rc::new(op.clone()), &mut ctx);
         let demoted = match rewrite_result {
             OptimizationResult::Emit(emitted) => emitted,
             other => panic!("expected OptRewrite to emit demoted call, got {other:?}"),

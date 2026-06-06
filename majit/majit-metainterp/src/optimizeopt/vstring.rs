@@ -537,7 +537,13 @@ impl OptString {
     /// length is a small constant; otherwise install a non-virtual StrPtrInfo
     /// and emit the op. `postprocess_NEWSTR` (vstring.py:455-459) registers
     /// `pure(STRLEN, op) = length_arg` for CSE via the pure cache.
-    fn _optimize_newstr(&mut self, op: &Op, op_rc: &majit_ir::OpRc, mode: u8, ctx: &mut OptContext) -> OptimizationResult {
+    fn _optimize_newstr(
+        &mut self,
+        op: &Op,
+        op_rc: &majit_ir::OpRc,
+        mode: u8,
+        ctx: &mut OptContext,
+    ) -> OptimizationResult {
         let len_ref = op.arg(0).to_opref();
         if let Some(len) = ctx
             .get_box_replacement_box(len_ref)
@@ -611,7 +617,12 @@ impl OptString {
     }
 
     /// Handle STRGETITEM: if source is virtual, resolve the character.
-    fn optimize_strgetitem(&mut self, op: &Op, op_rc: &majit_ir::OpRc, ctx: &mut OptContext) -> OptimizationResult {
+    fn optimize_strgetitem(
+        &mut self,
+        op: &Op,
+        op_rc: &majit_ir::OpRc,
+        ctx: &mut OptContext,
+    ) -> OptimizationResult {
         let str_ref = ctx.get_box_replacement(op.arg(0).to_opref()).to_opref();
         let idx_ref = op.arg(1).to_opref();
 
@@ -632,7 +643,12 @@ impl OptString {
     }
 
     /// vstring.py:525-533 _optimize_STRLEN
-    fn optimize_strlen(&mut self, op: &Op, op_rc: &majit_ir::OpRc, ctx: &mut OptContext) -> OptimizationResult {
+    fn optimize_strlen(
+        &mut self,
+        op: &Op,
+        op_rc: &majit_ir::OpRc,
+        ctx: &mut OptContext,
+    ) -> OptimizationResult {
         let mode = if op.opcode == OpCode::Unicodelen {
             1u8
         } else {
@@ -850,12 +866,18 @@ impl OptString {
         ctx: &mut OptContext,
     ) -> OptimizationResult {
         match ei.oopspecindex {
-            OopSpecIndex::StrConcat => self.opt_call_stroruni_str_concat(op, op_rc, mode_string, ctx),
+            OopSpecIndex::StrConcat => {
+                self.opt_call_stroruni_str_concat(op, op_rc, mode_string, ctx)
+            }
             OopSpecIndex::StrSlice => self.opt_call_stroruni_str_slice(op, op_rc, mode_string, ctx),
             OopSpecIndex::StrEqual => self.opt_call_stroruni_str_equal(op, mode_string, ctx),
             OopSpecIndex::StrCmp => self.opt_call_stroruni_str_cmp(op, op_rc, mode_string, ctx),
-            OopSpecIndex::UniConcat => self.opt_call_stroruni_str_concat(op, op_rc, mode_unicode, ctx),
-            OopSpecIndex::UniSlice => self.opt_call_stroruni_str_slice(op, op_rc, mode_unicode, ctx),
+            OopSpecIndex::UniConcat => {
+                self.opt_call_stroruni_str_concat(op, op_rc, mode_unicode, ctx)
+            }
+            OopSpecIndex::UniSlice => {
+                self.opt_call_stroruni_str_slice(op, op_rc, mode_unicode, ctx)
+            }
             OopSpecIndex::UniEqual => self.opt_call_stroruni_str_equal(op, mode_unicode, ctx),
             OopSpecIndex::UniCmp => self.opt_call_stroruni_str_cmp(op, op_rc, mode_unicode, ctx),
             OopSpecIndex::ShrinkArray => self.opt_call_shrink_array(op, op_rc, ctx),
@@ -1332,7 +1354,12 @@ impl OptString {
     ///         return True
     ///     return False
     /// ```
-    fn opt_call_shrink_array(&mut self, op: &Op, op_rc: &majit_ir::OpRc, ctx: &mut OptContext) -> OptimizationResult {
+    fn opt_call_shrink_array(
+        &mut self,
+        op: &Op,
+        op_rc: &majit_ir::OpRc,
+        ctx: &mut OptContext,
+    ) -> OptimizationResult {
         if op.num_args() >= 3 {
             let arg1_box = ctx
                 .get_box_replacement_box(op.arg(1).to_opref())
@@ -1379,7 +1406,12 @@ impl Default for OptString {
 }
 
 impl Optimization for OptString {
-    fn propagate_forward(&mut self, op: &Op, op_rc: &majit_ir::OpRc, ctx: &mut OptContext) -> OptimizationResult {
+    fn propagate_forward(
+        &mut self,
+        op: &Op,
+        op_rc: &majit_ir::OpRc,
+        ctx: &mut OptContext,
+    ) -> OptimizationResult {
         match op.opcode {
             // vstring.py:440-444 optimize_NEWSTR / optimize_NEWUNICODE:
             // both dispatch to _optimize_NEWSTR(op, mode).

@@ -1006,7 +1006,12 @@ impl Default for OptGuard {
 }
 
 impl Optimization for OptGuard {
-    fn propagate_forward(&mut self, op: &Op, _op_rc: &majit_ir::OpRc, ctx: &mut OptContext) -> OptimizationResult {
+    fn propagate_forward(
+        &mut self,
+        op: &Op,
+        _op_rc: &majit_ir::OpRc,
+        ctx: &mut OptContext,
+    ) -> OptimizationResult {
         if !op.opcode.is_guard() {
             // Non-guard operations invalidate the last-guard descriptor
             // tracking (no longer consecutive).

@@ -5223,7 +5223,12 @@ impl Default for OptUnroll {
 }
 
 impl Optimization for OptUnroll {
-    fn propagate_forward(&mut self, op: &Op, _op_rc: &majit_ir::OpRc, ctx: &mut OptContext) -> OptimizationResult {
+    fn propagate_forward(
+        &mut self,
+        op: &Op,
+        _op_rc: &majit_ir::OpRc,
+        ctx: &mut OptContext,
+    ) -> OptimizationResult {
         // Only peel once per trace, and only for Jump (back-edge).
         if op.opcode == OpCode::Jump && !self.seen_jump {
             self.seen_jump = true;

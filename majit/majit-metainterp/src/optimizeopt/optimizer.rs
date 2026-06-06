@@ -4548,7 +4548,12 @@ mod tests {
     struct AddZeroElimination;
 
     impl Optimization for AddZeroElimination {
-        fn propagate_forward(&mut self, op: &Op, _op_rc: &majit_ir::OpRc, ctx: &mut OptContext) -> OptimizationResult {
+        fn propagate_forward(
+            &mut self,
+            op: &Op,
+            _op_rc: &majit_ir::OpRc,
+            ctx: &mut OptContext,
+        ) -> OptimizationResult {
             if op.opcode == OpCode::IntAdd {
                 // Check if second arg is constant 0
                 if let Some(0) = ctx
@@ -4586,7 +4591,12 @@ mod tests {
     }
 
     impl Optimization for AddVirtualInputsOnce {
-        fn propagate_forward(&mut self, _op: &Op, _op_rc: &majit_ir::OpRc, ctx: &mut OptContext) -> OptimizationResult {
+        fn propagate_forward(
+            &mut self,
+            _op: &Op,
+            _op_rc: &majit_ir::OpRc,
+            ctx: &mut OptContext,
+        ) -> OptimizationResult {
             if !self.added {
                 ctx.num_inputs += 2;
                 self.added = true;
@@ -4600,7 +4610,12 @@ mod tests {
     }
 
     impl Optimization for RemoveAsConstant {
-        fn propagate_forward(&mut self, op: &Op, _op_rc: &majit_ir::OpRc, ctx: &mut OptContext) -> OptimizationResult {
+        fn propagate_forward(
+            &mut self,
+            op: &Op,
+            _op_rc: &majit_ir::OpRc,
+            ctx: &mut OptContext,
+        ) -> OptimizationResult {
             if op.pos.get() == self.target {
                 ctx.make_constant(op.pos.get(), majit_ir::Value::Int(self.value));
                 return OptimizationResult::Remove;
@@ -4618,7 +4633,12 @@ mod tests {
     }
 
     impl Optimization for FlushCounter {
-        fn propagate_forward(&mut self, _op: &Op, _op_rc: &majit_ir::OpRc, _ctx: &mut OptContext) -> OptimizationResult {
+        fn propagate_forward(
+            &mut self,
+            _op: &Op,
+            _op_rc: &majit_ir::OpRc,
+            _ctx: &mut OptContext,
+        ) -> OptimizationResult {
             OptimizationResult::PassOn
         }
 
@@ -4637,7 +4657,12 @@ mod tests {
     }
 
     impl Optimization for RemoveAsTypedConstant {
-        fn propagate_forward(&mut self, op: &Op, _op_rc: &majit_ir::OpRc, ctx: &mut OptContext) -> OptimizationResult {
+        fn propagate_forward(
+            &mut self,
+            op: &Op,
+            _op_rc: &majit_ir::OpRc,
+            ctx: &mut OptContext,
+        ) -> OptimizationResult {
             if op.pos.get() == self.target {
                 ctx.make_constant(op.pos.get(), self.value.clone());
                 return OptimizationResult::Remove;
@@ -4656,7 +4681,12 @@ mod tests {
     }
 
     impl Optimization for MarkAsTypedConstantButKeep {
-        fn propagate_forward(&mut self, op: &Op, _op_rc: &majit_ir::OpRc, ctx: &mut OptContext) -> OptimizationResult {
+        fn propagate_forward(
+            &mut self,
+            op: &Op,
+            _op_rc: &majit_ir::OpRc,
+            ctx: &mut OptContext,
+        ) -> OptimizationResult {
             if op.pos.get() == self.target {
                 ctx.make_constant(op.pos.get(), self.value.clone());
             }
@@ -4778,7 +4808,12 @@ mod tests {
     }
 
     impl Optimization for QueueForceLikeExtraOps {
-        fn propagate_forward(&mut self, op: &Op, _op_rc: &majit_ir::OpRc, ctx: &mut OptContext) -> OptimizationResult {
+        fn propagate_forward(
+            &mut self,
+            op: &Op,
+            _op_rc: &majit_ir::OpRc,
+            ctx: &mut OptContext,
+        ) -> OptimizationResult {
             if !self.queued && op.opcode == OpCode::IntAdd {
                 self.queued = true;
 
@@ -4806,7 +4841,12 @@ mod tests {
     }
 
     impl Optimization for QueueRestartCandidate {
-        fn propagate_forward(&mut self, op: &Op, _op_rc: &majit_ir::OpRc, ctx: &mut OptContext) -> OptimizationResult {
+        fn propagate_forward(
+            &mut self,
+            op: &Op,
+            _op_rc: &majit_ir::OpRc,
+            ctx: &mut OptContext,
+        ) -> OptimizationResult {
             if !self.queued && op.opcode == OpCode::IntMul {
                 self.queued = true;
                 ctx.emit_extra(
@@ -4827,7 +4867,12 @@ mod tests {
     }
 
     impl Optimization for CountRestartedIntSub {
-        fn propagate_forward(&mut self, op: &Op, _op_rc: &majit_ir::OpRc, _ctx: &mut OptContext) -> OptimizationResult {
+        fn propagate_forward(
+            &mut self,
+            op: &Op,
+            _op_rc: &majit_ir::OpRc,
+            _ctx: &mut OptContext,
+        ) -> OptimizationResult {
             if op.opcode == OpCode::IntSub {
                 self.hits.set(self.hits.get() + 1);
             }
@@ -4842,7 +4887,12 @@ mod tests {
     struct RestartIntAddAsSub;
 
     impl Optimization for RestartIntAddAsSub {
-        fn propagate_forward(&mut self, op: &Op, _op_rc: &majit_ir::OpRc, _ctx: &mut OptContext) -> OptimizationResult {
+        fn propagate_forward(
+            &mut self,
+            op: &Op,
+            _op_rc: &majit_ir::OpRc,
+            _ctx: &mut OptContext,
+        ) -> OptimizationResult {
             if op.opcode == OpCode::IntAdd {
                 let mut restarted = Op::new(OpCode::IntSub, &[op.arg(0), op.arg(1)]);
                 restarted.pos.set(op.pos.get());
@@ -5498,7 +5548,12 @@ mod tests {
     }
 
     impl Optimization for QueueTwoForceLikePairs {
-        fn propagate_forward(&mut self, op: &Op, _op_rc: &majit_ir::OpRc, ctx: &mut OptContext) -> OptimizationResult {
+        fn propagate_forward(
+            &mut self,
+            op: &Op,
+            _op_rc: &majit_ir::OpRc,
+            ctx: &mut OptContext,
+        ) -> OptimizationResult {
             if !self.queued && op.opcode == OpCode::IntAdd {
                 self.queued = true;
 
