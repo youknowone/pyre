@@ -98,14 +98,17 @@ pub fn copy_str_content(
     };
 
     // vstring.py:341-347: determine inline threshold M using intbound
+    // A producer-less operand has no forwarded bound; getintbound returns
+    // unbounded for it, so resolve-or-unbounded matches the prior
+    // ensure_box (mint synthetic → unbounded) behavior without minting.
     let srcoffset_bound = ctx
-        .ensure_box(srcoffsetbox)
+        .get_box_replacement_box(srcoffsetbox)
         .map(|b| ctx.getintbound_handle(&b).borrow().clone())
-        .expect("getintbound: operand must resolve to a BoxRef");
+        .unwrap_or_else(crate::optimizeopt::intutils::IntBound::unbounded);
     let lgt_bound = ctx
-        .ensure_box(lengthbox)
+        .get_box_replacement_box(lengthbox)
         .map(|b| ctx.getintbound_handle(&b).borrow().clone())
-        .expect("getintbound: operand must resolve to a BoxRef");
+        .unwrap_or_else(crate::optimizeopt::intutils::IntBound::unbounded);
     // vstring.py:343: isinstance(srcbox, ConstPtr)
     let src_is_const = ctx
         .get_box_replacement_box(srcbox)
@@ -135,9 +138,9 @@ pub fn copy_str_content(
                     //     None, srcbox, srcoffsetbox, mode)
                     // vstring.py:495: vindex = self.getintbound(index)
                     let vindex = ctx
-                        .ensure_box(src_offset)
+                        .get_box_replacement_box(src_offset)
                         .map(|b| ctx.getintbound_handle(&b).borrow().clone())
-                        .expect("getintbound: operand must resolve to a BoxRef");
+                        .unwrap_or_else(crate::optimizeopt::intutils::IntBound::unbounded);
                     let resolved_idx = if vindex.is_constant() {
                         Some(vindex.get_constant_int())
                     } else {
@@ -483,11 +486,12 @@ impl OptString {
             });
         if let Some(len) = known_len {
             let len_opref = ctx.make_constant_int(len);
-            // Cache in lgtop for identity reuse.
-            // BoxRef shim — set_str_lgtop takes &BoxRef per
+            // Cache in lgtop for identity reuse. `resolved_box` is Some here
+            // (known_len required its ptr_info), so reuse it instead of
+            // re-resolving. set_str_lgtop takes &BoxRef per
             // vstring.py:117/174/293.
-            if let Some(b) = ctx.ensure_box(opref) {
-                ctx.set_str_lgtop(&b, len_opref);
+            if let Some(b) = &resolved_box {
+                ctx.set_str_lgtop(b, len_opref);
             }
             return Some(len_opref);
         }
