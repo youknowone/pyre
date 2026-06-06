@@ -39,7 +39,7 @@ impl Default for OptSimplify {
 }
 
 impl Optimization for OptSimplify {
-    fn propagate_forward(&mut self, op: &Op, _ctx: &mut OptContext) -> OptimizationResult {
+    fn propagate_forward(&mut self, op: &Op, _op_rc: &majit_ir::OpRc, _ctx: &mut OptContext) -> OptimizationResult {
         match op.opcode {
             // CALL_PURE_* -> CALL_*
             OpCode::CallPureI | OpCode::CallPureR | OpCode::CallPureF | OpCode::CallPureN => {

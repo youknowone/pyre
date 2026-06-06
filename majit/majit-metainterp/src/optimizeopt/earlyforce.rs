@@ -63,7 +63,7 @@ impl Default for OptEarlyForce {
 impl Optimization for OptEarlyForce {
     /// earlyforce.py:15-29: propagate_forward.
     /// Force all virtual args of non-exempt operations, then emit.
-    fn propagate_forward(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
+    fn propagate_forward(&mut self, op: &Op, _op_rc: &majit_ir::OpRc, ctx: &mut OptContext) -> OptimizationResult {
         if Self::should_force_args(op) {
             // earlyforce.py:28: self.optimizer.force_box(arg, self)
             // In Rust, we can't call Optimizer.force_box (borrow conflict).

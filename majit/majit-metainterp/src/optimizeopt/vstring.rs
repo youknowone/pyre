@@ -1393,7 +1393,7 @@ impl Default for OptString {
 }
 
 impl Optimization for OptString {
-    fn propagate_forward(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
+    fn propagate_forward(&mut self, op: &Op, _op_rc: &majit_ir::OpRc, ctx: &mut OptContext) -> OptimizationResult {
         match op.opcode {
             // vstring.py:440-444 optimize_NEWSTR / optimize_NEWUNICODE:
             // both dispatch to _optimize_NEWSTR(op, mode).
@@ -1524,7 +1524,7 @@ mod tests {
             for i in 0..resolved_op.num_args() {
                 resolved_op.setarg(i, ctx.get_box_replacement(resolved_op.arg(i).to_opref()));
             }
-            match pass.propagate_forward(&resolved_op, &mut ctx) {
+            match pass.propagate_forward(&resolved_op, &std::rc::Rc::new(resolved_op.clone()), &mut ctx) {
                 OptimizationResult::Emit(emitted) => {
                     ctx.emit(emitted);
                 }
@@ -2272,7 +2272,7 @@ mod tests {
         ctx.make_constant(OpRef::int_op(200), Value::Int(2));
 
         // Process NEWSTR → creates virtual Plain
-        let _ = pass.propagate_forward(&left_op, &mut ctx);
+        let _ = pass.propagate_forward(&left_op, &std::rc::Rc::new(left_op.clone()), &mut ctx);
         assert!(pass.is_virtual(left, &ctx));
     }
 

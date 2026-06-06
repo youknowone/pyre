@@ -835,7 +835,7 @@ impl Optimization for OptPure {
         self.cache = RecentPureOpTable::new(limit);
     }
 
-    fn propagate_forward(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
+    fn propagate_forward(&mut self, op: &Op, _op_rc: &majit_ir::OpRc, ctx: &mut OptContext) -> OptimizationResult {
         // optimizer.py: pure_from_args1 parity — consume pending registrations
         // from rewrite pass (CAST_*, CONVERT_* reverse-pure relationships)
         // and virtualize pass (ARRAYLEN_GC with array descr keying per
@@ -1753,7 +1753,7 @@ mod tests {
         );
         let mut op0 = op0;
         op0.pos.set(OpRef::int_op(2));
-        let result0 = pass.propagate_forward(&op0, &mut ctx);
+        let result0 = pass.propagate_forward(&op0, &std::rc::Rc::new(op0.clone()), &mut ctx);
         assert!(matches!(result0, OptimizationResult::PassOn));
 
         // Simulate: op1 = int_add(a, b) with same args
@@ -1766,7 +1766,7 @@ mod tests {
         );
         let mut op1 = op1;
         op1.pos.set(OpRef::int_op(3));
-        let result1 = pass.propagate_forward(&op1, &mut ctx);
+        let result1 = pass.propagate_forward(&op1, &std::rc::Rc::new(op1.clone()), &mut ctx);
         assert!(matches!(result1, OptimizationResult::Remove));
     }
 
@@ -2274,7 +2274,7 @@ mod tests {
         pass.setup();
 
         assert_eq!(ctx.constant_fold(&op), Some(Value::Int(123)));
-        let result = pass.propagate_forward(&op, &mut ctx);
+        let result = pass.propagate_forward(&op, &std::rc::Rc::new(op.clone()), &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(
             ctx.get_box_replacement_box(OpRef::int_op(0))
@@ -2306,7 +2306,7 @@ mod tests {
         pass.setup();
 
         assert_eq!(ctx.constant_fold(&op), Some(Value::Float(3.5)));
-        let result = pass.propagate_forward(&op, &mut ctx);
+        let result = pass.propagate_forward(&op, &std::rc::Rc::new(op.clone()), &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(
             ctx.get_box_replacement_box(OpRef::float_op(0))
@@ -2343,7 +2343,7 @@ mod tests {
             ctx.constant_fold(&op),
             Some(Value::Ref(GcRef(0x1234_5678usize)))
         );
-        let result = pass.propagate_forward(&op, &mut ctx);
+        let result = pass.propagate_forward(&op, &std::rc::Rc::new(op.clone()), &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(
             ctx.get_box_replacement_box(OpRef::ref_op(0))
@@ -2714,7 +2714,7 @@ mod tests {
         );
         op.pos.set(OpRef::int_op(2));
         op.setdescr(call_descr);
-        let result = pass.propagate_forward(&op, &mut ctx);
+        let result = pass.propagate_forward(&op, &std::rc::Rc::new(op.clone()), &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(
             ctx.get_box_replacement_box(OpRef::int_op(2))
@@ -2737,7 +2737,7 @@ mod tests {
             ],
         );
         op.pos.set(OpRef::int_op(2));
-        let result = pass.propagate_forward(&op, &mut ctx);
+        let result = pass.propagate_forward(&op, &std::rc::Rc::new(op.clone()), &mut ctx);
         assert!(matches!(result, OptimizationResult::PassOn));
 
         let mut sb = crate::optimizeopt::shortpreamble::ShortBoxes::with_label_args(&[
@@ -2782,7 +2782,7 @@ mod tests {
                 majit_ir::OopSpecIndex::None,
             ),
         ));
-        let result = pass.propagate_forward(&op, &mut ctx);
+        let result = pass.propagate_forward(&op, &std::rc::Rc::new(op.clone()), &mut ctx);
         match result {
             OptimizationResult::Emit(emitted) => assert_eq!(emitted.opcode, OpCode::CallI),
             other => panic!("expected emitted demoted call, got {other:?}"),
@@ -2831,14 +2831,14 @@ mod tests {
             ),
         ));
         // OptRewrite demotes CallLoopinvariantI → CallI
-        let rewrite_result = rewrite.propagate_forward(&op, &mut ctx);
+        let rewrite_result = rewrite.propagate_forward(&op, &std::rc::Rc::new(op.clone()), &mut ctx);
         let demoted = match rewrite_result {
             OptimizationResult::Emit(emitted) => emitted,
             other => panic!("expected OptRewrite to emit demoted call, got {other:?}"),
         };
         assert_eq!(demoted.opcode, OpCode::CallI);
         // OptPure sees the demoted CallI
-        let result = pass.propagate_forward(&demoted, &mut ctx);
+        let result = pass.propagate_forward(&demoted, &std::rc::Rc::new(demoted.clone()), &mut ctx);
         match result {
             OptimizationResult::Emit(emitted) => assert_eq!(emitted.opcode, OpCode::CallI),
             OptimizationResult::PassOn => {} // PassOn is also acceptable

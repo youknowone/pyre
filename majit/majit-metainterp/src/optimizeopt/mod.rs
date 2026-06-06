@@ -7571,7 +7571,7 @@ impl OptContext {
 /// optimizer.py: Optimization base class.
 pub trait Optimization {
     /// Process an operation. Called for each operation in the trace.
-    fn propagate_forward(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult;
+    fn propagate_forward(&mut self, op: &Op, _op_rc: &majit_ir::OpRc, ctx: &mut OptContext) -> OptimizationResult;
 
     /// optimizer.py:71 propagate_postprocess — called AFTER the op has been
     /// emitted through all passes and added to new_operations. Runs in

@@ -3209,7 +3209,7 @@ impl OptRewrite {
 }
 
 impl Optimization for OptRewrite {
-    fn propagate_forward(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
+    fn propagate_forward(&mut self, op: &Op, _op_rc: &majit_ir::OpRc, ctx: &mut OptContext) -> OptimizationResult {
         // Track last_op_removed for GuardNoException optimization.
         // Reset for non-guard ops (guards don't count as "the last op").
         if !op.opcode.is_guard() {
@@ -3928,7 +3928,7 @@ mod tests {
                 resolved.setarg(i, ctx.get_box_replacement(resolved.arg(i).to_opref()));
             }
 
-            match pass.propagate_forward(&resolved, &mut ctx) {
+            match pass.propagate_forward(&resolved, &std::rc::Rc::new(resolved.clone()), &mut ctx) {
                 OptimizationResult::Emit(emitted) => {
                     ctx.emit(emitted);
                 }
@@ -3981,7 +3981,7 @@ mod tests {
         ctx.emit(ops[1].clone());
         ctx.make_constant(OpRef::int_op(const_pos as u32), Value::Int(const_val));
         let mut pass = OptRewrite::new();
-        let result = pass.propagate_forward(&ops[2], &mut ctx);
+        let result = pass.propagate_forward(&ops[2], &std::rc::Rc::new(ops[2].clone()), &mut ctx);
         assert!(
             matches!(result, OptimizationResult::Remove),
             "{opcode:?} with const {const_val} at pos {const_pos} should Remove"
@@ -4013,7 +4013,7 @@ mod tests {
         ctx.make_constant(OpRef::int_op(0), Value::Int(a));
         ctx.make_constant(OpRef::int_op(1), Value::Int(b));
         let mut pass = OptRewrite::new();
-        let result = pass.propagate_forward(&ops[2], &mut ctx);
+        let result = pass.propagate_forward(&ops[2], &std::rc::Rc::new(ops[2].clone()), &mut ctx);
         assert!(
             matches!(result, OptimizationResult::Remove),
             "{opcode:?}({a}, {b}) should constant-fold"
@@ -4042,7 +4042,7 @@ mod tests {
         let mut ctx = OptContext::new(2);
         ctx.emit(ops[0].clone());
         let mut pass = OptRewrite::new();
-        let result = pass.propagate_forward(&ops[1], &mut ctx);
+        let result = pass.propagate_forward(&ops[1], &std::rc::Rc::new(ops[1].clone()), &mut ctx);
         assert!(
             matches!(result, OptimizationResult::Remove),
             "{opcode:?}(x, x) should Remove"
@@ -4084,7 +4084,7 @@ mod tests {
         let mut ctx = OptContext::new(2);
         ctx.emit(ops[0].clone());
         let mut pass = OptRewrite::new();
-        let result = pass.propagate_forward(&ops[1], &mut ctx);
+        let result = pass.propagate_forward(&ops[1], &std::rc::Rc::new(ops[1].clone()), &mut ctx);
         // x + x may be rewritten to lshift(x, 1) or kept
         assert!(
             !matches!(result, OptimizationResult::PassOn)
@@ -4123,7 +4123,7 @@ mod tests {
         ctx.emit(ops[1].clone());
         ctx.make_constant(OpRef::int_op(1), Value::Int(0));
         let mut pass = OptRewrite::new();
-        let result = pass.propagate_forward(&ops[2], &mut ctx);
+        let result = pass.propagate_forward(&ops[2], &std::rc::Rc::new(ops[2].clone()), &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(
             ctx.get_box_replacement_box(OpRef::int_op(2))
@@ -4157,7 +4157,7 @@ mod tests {
         ctx.emit(ops[1].clone());
         ctx.make_constant(OpRef::int_op(1), Value::Int(8));
         let mut pass = OptRewrite::new();
-        let result = pass.propagate_forward(&ops[2], &mut ctx);
+        let result = pass.propagate_forward(&ops[2], &std::rc::Rc::new(ops[2].clone()), &mut ctx);
         match result {
             OptimizationResult::Replace(ref new_op) | OptimizationResult::Emit(ref new_op) => {
                 assert_eq!(new_op.opcode, OpCode::IntLshift);
@@ -4188,7 +4188,7 @@ mod tests {
         ctx.emit(ops[1].clone());
         ctx.make_constant(OpRef::int_op(0), Value::Int(0));
         let mut pass = OptRewrite::new();
-        let result = pass.propagate_forward(&ops[2], &mut ctx);
+        let result = pass.propagate_forward(&ops[2], &std::rc::Rc::new(ops[2].clone()), &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(
             ctx.get_box_replacement_box(OpRef::int_op(2))
@@ -4222,7 +4222,7 @@ mod tests {
         ctx.emit(ops[1].clone());
         ctx.make_constant(OpRef::int_op(1), Value::Int(1));
         let mut pass = OptRewrite::new();
-        let result = pass.propagate_forward(&ops[2], &mut ctx);
+        let result = pass.propagate_forward(&ops[2], &std::rc::Rc::new(ops[2].clone()), &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(
             ctx.get_box_replacement_box(OpRef::int_op(2))
@@ -4271,7 +4271,7 @@ mod tests {
         ctx.emit(ops[0].clone());
         ctx.make_constant(OpRef::int_op(0), Value::Int(42));
         let mut pass = OptRewrite::new();
-        let result = pass.propagate_forward(&ops[1], &mut ctx);
+        let result = pass.propagate_forward(&ops[1], &std::rc::Rc::new(ops[1].clone()), &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(
             ctx.get_box_replacement_box(OpRef::int_op(1))
@@ -4288,7 +4288,7 @@ mod tests {
         let mut ctx2 = OptContext::new(2);
         ctx2.emit(ops2[0].clone());
         ctx2.make_constant(OpRef::int_op(0), Value::Int(0xFF));
-        let result2 = pass.propagate_forward(&ops2[1], &mut ctx2);
+        let result2 = pass.propagate_forward(&ops2[1], &std::rc::Rc::new(ops2[1].clone()), &mut ctx2);
         assert!(matches!(result2, OptimizationResult::Remove));
         assert_eq!(
             ctx2.get_box_replacement_box(OpRef::int_op(1))
@@ -4309,7 +4309,7 @@ mod tests {
         let mut ctx = OptContext::new(2);
         ctx.emit(ops[0].clone());
         ctx.make_constant(OpRef::int_op(0), Value::Int(0));
-        let result = pass.propagate_forward(&ops[1], &mut ctx);
+        let result = pass.propagate_forward(&ops[1], &std::rc::Rc::new(ops[1].clone()), &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(
             ctx.get_box_replacement_box(OpRef::int_op(1))
@@ -4326,7 +4326,7 @@ mod tests {
         let mut ctx2 = OptContext::new(2);
         ctx2.emit(ops2[0].clone());
         ctx2.make_constant(OpRef::int_op(0), Value::Int(5));
-        let result2 = pass.propagate_forward(&ops2[1], &mut ctx2);
+        let result2 = pass.propagate_forward(&ops2[1], &std::rc::Rc::new(ops2[1].clone()), &mut ctx2);
         assert!(matches!(result2, OptimizationResult::Remove));
         assert_eq!(
             ctx2.get_box_replacement_box(OpRef::int_op(1))
@@ -4358,7 +4358,7 @@ mod tests {
         ctx.make_constant(OpRef::int_op(0), Value::Int(1));
 
         let mut pass = OptRewrite::new();
-        let result = pass.propagate_forward(&ops[1], &mut ctx);
+        let result = pass.propagate_forward(&ops[1], &std::rc::Rc::new(ops[1].clone()), &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
     }
 
@@ -4375,7 +4375,7 @@ mod tests {
 
         let mut pass = OptRewrite::new();
         let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            pass.propagate_forward(&ops[1], &mut ctx)
+            pass.propagate_forward(&ops[1], &std::rc::Rc::new(ops[1].clone()), &mut ctx)
         }))
         .expect_err("guard_true(0) should abort as InvalidLoop");
         assert!(err.downcast_ref::<crate::optimize::InvalidLoop>().is_some());
@@ -4392,7 +4392,7 @@ mod tests {
         ctx.emit(ops[0].clone());
 
         let mut pass = OptRewrite::new();
-        let result = pass.propagate_forward(&ops[1], &mut ctx);
+        let result = pass.propagate_forward(&ops[1], &std::rc::Rc::new(ops[1].clone()), &mut ctx);
         assert!(matches!(result, OptimizationResult::PassOn));
     }
 
@@ -4408,7 +4408,7 @@ mod tests {
         ctx.make_constant(OpRef::int_op(0), Value::Int(0));
 
         let mut pass = OptRewrite::new();
-        let result = pass.propagate_forward(&ops[1], &mut ctx);
+        let result = pass.propagate_forward(&ops[1], &std::rc::Rc::new(ops[1].clone()), &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
     }
 
@@ -4425,7 +4425,7 @@ mod tests {
 
         let mut pass = OptRewrite::new();
         let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            pass.propagate_forward(&ops[1], &mut ctx)
+            pass.propagate_forward(&ops[1], &std::rc::Rc::new(ops[1].clone()), &mut ctx)
         }))
         .expect_err("guard_false(1) should abort as InvalidLoop");
         assert!(err.downcast_ref::<crate::optimize::InvalidLoop>().is_some());
@@ -4452,7 +4452,7 @@ mod tests {
         ctx.make_constant(OpRef::int_op(1), Value::Int(42));
 
         let mut pass = OptRewrite::new();
-        let result = pass.propagate_forward(&ops[2], &mut ctx);
+        let result = pass.propagate_forward(&ops[2], &std::rc::Rc::new(ops[2].clone()), &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
     }
 
@@ -4469,7 +4469,7 @@ mod tests {
         ctx.emit(ops[0].clone());
 
         let mut pass = OptRewrite::new();
-        let result = pass.propagate_forward(&ops[1], &mut ctx);
+        let result = pass.propagate_forward(&ops[1], &std::rc::Rc::new(ops[1].clone()), &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(
             ctx.get_box_replacement(OpRef::int_op(1)).to_opref(),
@@ -4513,7 +4513,7 @@ mod tests {
             for i in 0..resolved.num_args() {
                 resolved.setarg(i, ctx.get_box_replacement(resolved.arg(i).to_opref()));
             }
-            match pass.propagate_forward(&resolved, &mut ctx) {
+            match pass.propagate_forward(&resolved, &std::rc::Rc::new(resolved.clone()), &mut ctx) {
                 OptimizationResult::Emit(emitted) => {
                     ctx.emit(emitted);
                 }
@@ -4574,7 +4574,7 @@ mod tests {
                 for i in 0..resolved.num_args() {
                     resolved.setarg(i, ctx.get_box_replacement(resolved.arg(i).to_opref()));
                 }
-                match pass.propagate_forward(&resolved, &mut ctx) {
+                match pass.propagate_forward(&resolved, &std::rc::Rc::new(resolved.clone()), &mut ctx) {
                     OptimizationResult::Emit(emitted) => {
                         ctx.emit(emitted);
                     }
@@ -4621,7 +4621,7 @@ mod tests {
         ctx.make_constant(OpRef::int_op(1), Value::Int(1));
 
         let mut pass = OptRewrite::new();
-        let result = pass.propagate_forward(&ops[2], &mut ctx);
+        let result = pass.propagate_forward(&ops[2], &std::rc::Rc::new(ops[2].clone()), &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(
             ctx.get_box_replacement_box(OpRef::int_op(2))
@@ -4652,7 +4652,7 @@ mod tests {
         ctx.make_constant(OpRef::int_op(0), Value::Int(0));
 
         let mut pass = OptRewrite::new();
-        let result = pass.propagate_forward(&ops[2], &mut ctx);
+        let result = pass.propagate_forward(&ops[2], &std::rc::Rc::new(ops[2].clone()), &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(
             ctx.get_box_replacement_box(OpRef::int_op(2))
@@ -4681,7 +4681,7 @@ mod tests {
         ctx.make_constant(OpRef::int_op(0), Value::Int(0));
 
         let mut pass = OptRewrite::new();
-        let result = pass.propagate_forward(&ops[2], &mut ctx);
+        let result = pass.propagate_forward(&ops[2], &std::rc::Rc::new(ops[2].clone()), &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(
             ctx.get_box_replacement_box(OpRef::int_op(2))
@@ -4711,7 +4711,7 @@ mod tests {
         ctx.emit(ops[1].clone());
 
         let mut pass = OptRewrite::new();
-        let result = pass.propagate_forward(&ops[2], &mut ctx);
+        let result = pass.propagate_forward(&ops[2], &std::rc::Rc::new(ops[2].clone()), &mut ctx);
         assert!(matches!(result, OptimizationResult::PassOn));
     }
 
@@ -4728,7 +4728,7 @@ mod tests {
         let mut ctx = OptContext::new(1);
 
         let mut pass = OptRewrite::new();
-        let result = pass.propagate_forward(&ops[0], &mut ctx);
+        let result = pass.propagate_forward(&ops[0], &std::rc::Rc::new(ops[0].clone()), &mut ctx);
         assert!(matches!(result, OptimizationResult::PassOn));
     }
 
@@ -4755,7 +4755,7 @@ mod tests {
         ctx.make_constant(OpRef::int_op(1), Value::Int(0x0F));
 
         let mut pass = OptRewrite::new();
-        let result = pass.propagate_forward(&ops[2], &mut ctx);
+        let result = pass.propagate_forward(&ops[2], &std::rc::Rc::new(ops[2].clone()), &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(
             ctx.get_box_replacement_box(OpRef::int_op(2))
@@ -4787,7 +4787,7 @@ mod tests {
         ctx.make_constant(OpRef::int_op(1), Value::Int(0x0F));
 
         let mut pass = OptRewrite::new();
-        let result = pass.propagate_forward(&ops[2], &mut ctx);
+        let result = pass.propagate_forward(&ops[2], &std::rc::Rc::new(ops[2].clone()), &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(
             ctx.get_box_replacement_box(OpRef::int_op(2))
@@ -4818,7 +4818,7 @@ mod tests {
         ctx.make_constant(OpRef::int_op(1), Value::Int(0));
 
         let mut pass = OptRewrite::new();
-        let result = pass.propagate_forward(&ops[2], &mut ctx);
+        let result = pass.propagate_forward(&ops[2], &std::rc::Rc::new(ops[2].clone()), &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(
             ctx.get_box_replacement(OpRef::int_op(2)).to_opref(),
@@ -4847,7 +4847,7 @@ mod tests {
         ctx.make_constant(OpRef::int_op(1), Value::Int(1));
 
         let mut pass = OptRewrite::new();
-        let result = pass.propagate_forward(&ops[2], &mut ctx);
+        let result = pass.propagate_forward(&ops[2], &std::rc::Rc::new(ops[2].clone()), &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
         // u64::MAX >> 1 = i64::MAX
         assert_eq!(
@@ -4879,7 +4879,7 @@ mod tests {
         ctx.make_constant(OpRef::float_op(1), Value::Float(1.0));
 
         let mut pass = OptRewrite::new();
-        let result = pass.propagate_forward(&ops[2], &mut ctx);
+        let result = pass.propagate_forward(&ops[2], &std::rc::Rc::new(ops[2].clone()), &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(
             ctx.get_box_replacement(OpRef::float_op(2)).to_opref(),
@@ -4907,7 +4907,7 @@ mod tests {
         ctx.make_constant(OpRef::float_op(0), Value::Float(1.0));
 
         let mut pass = OptRewrite::new();
-        let result = pass.propagate_forward(&ops[2], &mut ctx);
+        let result = pass.propagate_forward(&ops[2], &std::rc::Rc::new(ops[2].clone()), &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(
             ctx.get_box_replacement(OpRef::float_op(2)).to_opref(),
@@ -4929,12 +4929,12 @@ mod tests {
 
         let mut pass = OptRewrite::new();
         // Process op1 first (pass it through)
-        let result1 = pass.propagate_forward(&ops[1], &mut ctx);
+        let result1 = pass.propagate_forward(&ops[1], &std::rc::Rc::new(ops[1].clone()), &mut ctx);
         assert!(matches!(result1, OptimizationResult::PassOn));
         ctx.emit(ops[1].clone());
 
         // Process op2: should detect double negation
-        let result2 = pass.propagate_forward(&ops[2], &mut ctx);
+        let result2 = pass.propagate_forward(&ops[2], &std::rc::Rc::new(ops[2].clone()), &mut ctx);
         assert!(matches!(result2, OptimizationResult::Remove));
         assert_eq!(
             ctx.get_box_replacement(OpRef::float_op(2)).to_opref(),
@@ -4963,7 +4963,7 @@ mod tests {
         ctx.make_constant(OpRef::float_op(1), Value::Float(2.0));
 
         let mut pass = OptRewrite::new();
-        let result = pass.propagate_forward(&ops[2], &mut ctx);
+        let result = pass.propagate_forward(&ops[2], &std::rc::Rc::new(ops[2].clone()), &mut ctx);
         assert!(matches!(result, OptimizationResult::Emit(_)));
     }
 
@@ -4987,7 +4987,7 @@ mod tests {
         ctx.emit(ops[1].clone());
 
         let mut pass = OptRewrite::new();
-        let result = pass.propagate_forward(&ops[2], &mut ctx);
+        let result = pass.propagate_forward(&ops[2], &std::rc::Rc::new(ops[2].clone()), &mut ctx);
         assert!(matches!(result, OptimizationResult::PassOn));
     }
 
@@ -5017,7 +5017,7 @@ mod tests {
         ctx.make_constant(OpRef::int_op(0), Value::Int(0));
 
         let mut pass = OptRewrite::new();
-        let result = pass.propagate_forward(&ops[3], &mut ctx);
+        let result = pass.propagate_forward(&ops[3], &std::rc::Rc::new(ops[3].clone()), &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
     }
 
@@ -5045,7 +5045,7 @@ mod tests {
         ctx.make_constant(OpRef::int_op(0), Value::Int(1));
 
         let mut pass = OptRewrite::new();
-        let result = pass.propagate_forward(&ops[3], &mut ctx);
+        let result = pass.propagate_forward(&ops[3], &std::rc::Rc::new(ops[3].clone()), &mut ctx);
         match result {
             OptimizationResult::Replace(op) => {
                 assert_eq!(op.opcode, OpCode::CallN);
@@ -5084,7 +5084,7 @@ mod tests {
         ctx.make_constant(OpRef::int_op(0), Value::Int(42));
 
         let mut pass = OptRewrite::new();
-        let result = pass.propagate_forward(&ops[3], &mut ctx);
+        let result = pass.propagate_forward(&ops[3], &std::rc::Rc::new(ops[3].clone()), &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
         let resolved = ctx.get_box_replacement(OpRef::int_op(3)).to_opref();
         assert!(resolved.is_constant());
@@ -5119,7 +5119,7 @@ mod tests {
         ctx.make_constant(OpRef::int_op(0), Value::Int(0));
 
         let mut pass = OptRewrite::new();
-        let result = pass.propagate_forward(&ops[3], &mut ctx);
+        let result = pass.propagate_forward(&ops[3], &std::rc::Rc::new(ops[3].clone()), &mut ctx);
         match result {
             OptimizationResult::Replace(op) => {
                 assert_eq!(op.opcode, OpCode::CallPureI);
@@ -5153,7 +5153,7 @@ mod tests {
         ctx.emit(ops[0].clone());
 
         let mut pass = OptRewrite::new();
-        let result = pass.propagate_forward(&ops[1], &mut ctx);
+        let result = pass.propagate_forward(&ops[1], &std::rc::Rc::new(ops[1].clone()), &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(
             ctx.get_box_replacement_box(OpRef::int_op(1))
@@ -5180,7 +5180,7 @@ mod tests {
         ctx.emit(ops[0].clone());
 
         let mut pass = OptRewrite::new();
-        let result = pass.propagate_forward(&ops[1], &mut ctx);
+        let result = pass.propagate_forward(&ops[1], &std::rc::Rc::new(ops[1].clone()), &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(
             ctx.get_box_replacement_box(OpRef::int_op(1))
@@ -5207,7 +5207,7 @@ mod tests {
         ctx.emit(ops[0].clone());
 
         let mut pass = OptRewrite::new();
-        let result = pass.propagate_forward(&ops[1], &mut ctx);
+        let result = pass.propagate_forward(&ops[1], &std::rc::Rc::new(ops[1].clone()), &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(
             ctx.get_box_replacement_box(OpRef::int_op(1))
@@ -5234,7 +5234,7 @@ mod tests {
         ctx.emit(ops[0].clone());
 
         let mut pass = OptRewrite::new();
-        let result = pass.propagate_forward(&ops[1], &mut ctx);
+        let result = pass.propagate_forward(&ops[1], &std::rc::Rc::new(ops[1].clone()), &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(
             ctx.get_box_replacement_box(OpRef::int_op(1))
@@ -5273,7 +5273,7 @@ mod tests {
         ctx.make_constant(OpRef::ref_op(1), Value::Ref(GcRef(200)));
 
         let mut pass = OptRewrite::new();
-        let result = pass.propagate_forward(&ops[2], &mut ctx);
+        let result = pass.propagate_forward(&ops[2], &std::rc::Rc::new(ops[2].clone()), &mut ctx);
         // rewrite.py:564 `return self.emit(op)` — rewrite passes the op on
         // unchanged; it does not fold distinct constants.
         assert!(matches!(result, OptimizationResult::PassOn));
@@ -5302,7 +5302,7 @@ mod tests {
         ctx.emit(ops[0].clone());
 
         let mut pass = OptRewrite::new();
-        let result = pass.propagate_forward(&ops[1], &mut ctx);
+        let result = pass.propagate_forward(&ops[1], &std::rc::Rc::new(ops[1].clone()), &mut ctx);
         assert!(matches!(result, OptimizationResult::PassOn));
     }
 
@@ -5321,7 +5321,7 @@ mod tests {
         ctx.emit(ops[0].clone());
 
         let mut pass = OptRewrite::new();
-        let result = pass.propagate_forward(&ops[1], &mut ctx);
+        let result = pass.propagate_forward(&ops[1], &std::rc::Rc::new(ops[1].clone()), &mut ctx);
         assert!(matches!(result, OptimizationResult::PassOn));
     }
 
@@ -5340,7 +5340,7 @@ mod tests {
         ctx.emit(ops[0].clone());
 
         let mut pass = OptRewrite::new();
-        let result = pass.propagate_forward(&ops[1], &mut ctx);
+        let result = pass.propagate_forward(&ops[1], &std::rc::Rc::new(ops[1].clone()), &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(
             ctx.get_box_replacement(OpRef::ref_op(1)).to_opref(),
@@ -5367,7 +5367,7 @@ mod tests {
         ctx.emit(ops[0].clone());
 
         let mut pass = OptRewrite::new();
-        let result = pass.propagate_forward(&ops[1], &mut ctx);
+        let result = pass.propagate_forward(&ops[1], &std::rc::Rc::new(ops[1].clone()), &mut ctx);
         assert!(matches!(result, OptimizationResult::PassOn));
     }
 
@@ -5385,7 +5385,7 @@ mod tests {
         ctx.emit(ops[0].clone());
 
         let mut pass = OptRewrite::new();
-        let result = pass.propagate_forward(&ops[1], &mut ctx);
+        let result = pass.propagate_forward(&ops[1], &std::rc::Rc::new(ops[1].clone()), &mut ctx);
         // PassOn: op is emitted, no replacement registered.
         assert!(matches!(result, OptimizationResult::PassOn));
     }
@@ -5415,11 +5415,11 @@ mod tests {
 
         let mut pass = OptRewrite::new();
         // Process CondCallN -> removed
-        let result2 = pass.propagate_forward(&ops[2], &mut ctx);
+        let result2 = pass.propagate_forward(&ops[2], &std::rc::Rc::new(ops[2].clone()), &mut ctx);
         assert!(matches!(result2, OptimizationResult::Remove));
 
         // Process GuardNoException -> should also be removed
-        let result3 = pass.propagate_forward(&ops[3], &mut ctx);
+        let result3 = pass.propagate_forward(&ops[3], &std::rc::Rc::new(ops[3].clone()), &mut ctx);
         assert!(matches!(result3, OptimizationResult::Remove));
     }
 
@@ -5437,12 +5437,12 @@ mod tests {
 
         let mut pass = OptRewrite::new();
         // Process CallN -> PassOn (not handled by OptRewrite)
-        let result1 = pass.propagate_forward(&ops[1], &mut ctx);
+        let result1 = pass.propagate_forward(&ops[1], &std::rc::Rc::new(ops[1].clone()), &mut ctx);
         assert!(matches!(result1, OptimizationResult::PassOn));
         ctx.emit(ops[1].clone());
 
         // Process GuardNoException -> should NOT be removed
-        let result2 = pass.propagate_forward(&ops[2], &mut ctx);
+        let result2 = pass.propagate_forward(&ops[2], &std::rc::Rc::new(ops[2].clone()), &mut ctx);
         assert!(matches!(result2, OptimizationResult::PassOn));
     }
 
@@ -5453,7 +5453,7 @@ mod tests {
         op.pos.set(OpRef::void_op(0));
         let mut ctx = OptContext::new(1);
         let mut pass = OptRewrite::new();
-        let result = pass.propagate_forward(&op, &mut ctx);
+        let result = pass.propagate_forward(&op, &std::rc::Rc::new(op.clone()), &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
         assert!(ctx.patchguardop.is_some());
         assert_eq!(

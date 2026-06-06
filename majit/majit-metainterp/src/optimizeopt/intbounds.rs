@@ -3000,7 +3000,7 @@ impl Default for OptIntBounds {
 }
 
 impl Optimization for OptIntBounds {
-    fn propagate_forward(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
+    fn propagate_forward(&mut self, op: &Op, _op_rc: &majit_ir::OpRc, ctx: &mut OptContext) -> OptimizationResult {
         let result = match op.opcode {
             // ── Comparisons ──
             OpCode::IntLt => self.optimize_int_lt(op, ctx),
@@ -3447,7 +3447,7 @@ mod tests {
                     ),
                 );
             }
-            let emitted_op = match pass.propagate_forward(&resolved_op, &mut ctx) {
+            let emitted_op = match pass.propagate_forward(&resolved_op, &std::rc::Rc::new(resolved_op.clone()), &mut ctx) {
                 OptimizationResult::Emit(emit_op) => {
                     ctx.emit(emit_op.clone());
                     Some(emit_op)

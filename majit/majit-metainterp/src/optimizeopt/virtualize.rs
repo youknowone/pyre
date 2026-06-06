@@ -1705,7 +1705,7 @@ impl Default for OptVirtualize {
 }
 
 impl Optimization for OptVirtualize {
-    fn propagate_forward(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
+    fn propagate_forward(&mut self, op: &Op, _op_rc: &majit_ir::OpRc, ctx: &mut OptContext) -> OptimizationResult {
         if let Some(ref mut vt) = self.vable {
             vt.ensure_setup(ctx);
         }
@@ -2690,7 +2690,7 @@ mod tests {
                 );
             }
 
-            match pass.propagate_forward(&resolved_op, &mut ctx) {
+            match pass.propagate_forward(&resolved_op, &std::rc::Rc::new(resolved_op.clone()), &mut ctx) {
                 OptimizationResult::Emit(emitted) => {
                     ctx.emit(emitted);
                 }
@@ -2828,7 +2828,7 @@ mod tests {
                     ),
                 );
             }
-            match pass.propagate_forward(&resolved, &mut ctx) {
+            match pass.propagate_forward(&resolved, &std::rc::Rc::new(resolved.clone()), &mut ctx) {
                 OptimizationResult::Emit(emitted) => {
                     ctx.emit(emitted);
                 }
@@ -2890,7 +2890,7 @@ mod tests {
         // RPython parity: virtualize.py's default for calls is emit(op)
         // which forwards to the next pass without forcing. Forcing happens
         // in _emit_operation (Optimizer level). OptVirtualize returns PassOn.
-        let result = pass.propagate_forward(&call, &mut ctx);
+        let result = pass.propagate_forward(&call, &std::rc::Rc::new(call.clone()), &mut ctx);
         assert!(
             matches!(result, OptimizationResult::PassOn),
             "call should PassOn (forcing happens at Optimizer::emit_operation level)"
@@ -2928,7 +2928,7 @@ mod tests {
         get.setdescr(test_vable_field_descr(8, Type::Int, 1));
         get.pos.set(OpRef::int_op(10));
 
-        let result = pass.propagate_forward(&get, &mut ctx);
+        let result = pass.propagate_forward(&get, &std::rc::Rc::new(get.clone()), &mut ctx);
         assert!(matches!(result, OptimizationResult::PassOn));
     }
 
@@ -2957,7 +2957,7 @@ mod tests {
         );
         set.setdescr(test_vable_field_descr(8, Type::Int, 1));
 
-        let result = pass.propagate_forward(&set, &mut ctx);
+        let result = pass.propagate_forward(&set, &std::rc::Rc::new(set.clone()), &mut ctx);
         assert!(matches!(result, OptimizationResult::PassOn));
     }
 
@@ -3032,7 +3032,7 @@ mod tests {
         get_field.setdescr(test_vable_field_descr(24, Type::Int, 1));
         get_field.pos.set(OpRef::int_op(10));
         assert!(matches!(
-            pass.propagate_forward(&get_field, &mut ctx),
+            pass.propagate_forward(&get_field, &std::rc::Rc::new(get_field.clone()), &mut ctx),
             OptimizationResult::PassOn
         ));
         ctx.emit(get_field);
@@ -3045,7 +3045,7 @@ mod tests {
             ],
         );
         get_item.setdescr(array_descr(24));
-        let result = pass.propagate_forward(&get_item, &mut ctx);
+        let result = pass.propagate_forward(&get_item, &std::rc::Rc::new(get_item.clone()), &mut ctx);
         assert!(matches!(result, OptimizationResult::PassOn));
     }
 
@@ -3072,7 +3072,7 @@ mod tests {
         get_field.setdescr(test_vable_field_descr(24, Type::Int, 1));
         get_field.pos.set(OpRef::int_op(10));
         assert!(matches!(
-            pass.propagate_forward(&get_field, &mut ctx),
+            pass.propagate_forward(&get_field, &std::rc::Rc::new(get_field.clone()), &mut ctx),
             OptimizationResult::PassOn
         ));
         ctx.emit(get_field);
@@ -3086,7 +3086,7 @@ mod tests {
             ],
         );
         set_item.setdescr(array_descr(24));
-        let result = pass.propagate_forward(&set_item, &mut ctx);
+        let result = pass.propagate_forward(&set_item, &std::rc::Rc::new(set_item.clone()), &mut ctx);
         assert!(matches!(result, OptimizationResult::PassOn));
     }
 
@@ -3226,7 +3226,7 @@ mod tests {
         let mut new_op = Op::with_descr(OpCode::NewWithVtable, &[], sd);
         new_op.pos.set(OpRef::input_arg_ref(0));
         assert!(matches!(
-            pass.propagate_forward(&new_op, &mut ctx),
+            pass.propagate_forward(&new_op, &std::rc::Rc::new(new_op.clone()), &mut ctx),
             OptimizationResult::Remove
         ));
 
@@ -3240,7 +3240,7 @@ mod tests {
         );
         set_op.pos.set(OpRef::int_op(1));
         assert!(matches!(
-            pass.propagate_forward(&set_op, &mut ctx),
+            pass.propagate_forward(&set_op, &std::rc::Rc::new(set_op.clone()), &mut ctx),
             OptimizationResult::Remove
         ));
 
@@ -4509,7 +4509,7 @@ mod tests {
                 );
             }
 
-            match pass.propagate_forward(&resolved_op, &mut ctx) {
+            match pass.propagate_forward(&resolved_op, &std::rc::Rc::new(resolved_op.clone()), &mut ctx) {
                 OptimizationResult::Emit(emitted) => {
                     ctx.emit(emitted);
                 }

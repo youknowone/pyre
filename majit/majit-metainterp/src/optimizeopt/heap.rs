@@ -3150,7 +3150,7 @@ impl Default for OptHeap {
 }
 
 impl Optimization for OptHeap {
-    fn propagate_forward(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
+    fn propagate_forward(&mut self, op: &Op, _op_rc: &majit_ir::OpRc, ctx: &mut OptContext) -> OptimizationResult {
         let result = self.dispatch_propagate(op, ctx);
         // heap.py:417-425 emit() override parity:
         // Before emitting any new op, flush the postponed op. Then
@@ -4356,7 +4356,7 @@ mod tests {
             for i in 0..resolved.num_args() {
                 resolved.setarg(i, ctx.get_box_replacement(resolved.arg(i).to_opref()));
             }
-            match pass.propagate_forward(&resolved, &mut ctx) {
+            match pass.propagate_forward(&resolved, &std::rc::Rc::new(resolved.clone()), &mut ctx) {
                 OptimizationResult::Emit(emitted) => {
                     ctx.emit(emitted);
                 }
@@ -4402,7 +4402,7 @@ mod tests {
         let mut pass = OptHeap::new();
         pass.setup();
 
-        let result = pass.propagate_forward(&op, &mut ctx);
+        let result = pass.propagate_forward(&op, &std::rc::Rc::new(op.clone()), &mut ctx);
         assert!(matches!(result, OptimizationResult::Emit(_)));
         let arr_box = ctx
             .get_box_replacement_box(OpRef::ref_op(100))
@@ -4444,7 +4444,7 @@ mod tests {
         let mut pass = OptHeap::new();
         pass.setup();
 
-        let result = pass.propagate_forward(&op, &mut ctx);
+        let result = pass.propagate_forward(&op, &std::rc::Rc::new(op.clone()), &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
         // _lazy_set holds the pending op; PtrInfo is NOT yet written.
         let cai = pass
@@ -4762,7 +4762,7 @@ mod tests {
             for i in 0..resolved.num_args() {
                 resolved.setarg(i, ctx.get_box_replacement(resolved.arg(i).to_opref()));
             }
-            match pass.propagate_forward(&resolved, &mut ctx) {
+            match pass.propagate_forward(&resolved, &std::rc::Rc::new(resolved.clone()), &mut ctx) {
                 OptimizationResult::Emit(emitted) => {
                     ctx.emit(emitted);
                 }
@@ -5483,7 +5483,7 @@ mod tests {
             for i in 0..resolved.num_args() {
                 resolved.setarg(i, ctx.get_box_replacement(resolved.arg(i).to_opref()));
             }
-            match pass.propagate_forward(&resolved, &mut ctx) {
+            match pass.propagate_forward(&resolved, &std::rc::Rc::new(resolved.clone()), &mut ctx) {
                 OptimizationResult::Emit(emitted) => {
                     ctx.emit(emitted);
                 }
@@ -6070,7 +6070,7 @@ mod tests {
             for i in 0..resolved.num_args() {
                 resolved.setarg(i, ctx.get_box_replacement(resolved.arg(i).to_opref()));
             }
-            match pass.propagate_forward(&resolved, &mut ctx) {
+            match pass.propagate_forward(&resolved, &std::rc::Rc::new(resolved.clone()), &mut ctx) {
                 OptimizationResult::Emit(emitted) => {
                     ctx.emit(emitted);
                 }
@@ -6153,7 +6153,7 @@ mod tests {
             for i in 0..resolved.num_args() {
                 resolved.setarg(i, ctx.get_box_replacement(resolved.arg(i).to_opref()));
             }
-            match pass.propagate_forward(&resolved, &mut ctx) {
+            match pass.propagate_forward(&resolved, &std::rc::Rc::new(resolved.clone()), &mut ctx) {
                 OptimizationResult::Emit(emitted) => {
                     ctx.emit(emitted);
                 }
@@ -6375,7 +6375,7 @@ mod tests {
             for i in 0..resolved.num_args() {
                 resolved.setarg(i, ctx.get_box_replacement(resolved.arg(i).to_opref()));
             }
-            match pass.propagate_forward(&resolved, &mut ctx) {
+            match pass.propagate_forward(&resolved, &std::rc::Rc::new(resolved.clone()), &mut ctx) {
                 OptimizationResult::Emit(emitted) => {
                     ctx.emit(emitted);
                 }
@@ -6443,7 +6443,7 @@ mod tests {
             for i in 0..resolved.num_args() {
                 resolved.setarg(i, ctx.get_box_replacement(resolved.arg(i).to_opref()));
             }
-            match pass.propagate_forward(&resolved, &mut ctx) {
+            match pass.propagate_forward(&resolved, &std::rc::Rc::new(resolved.clone()), &mut ctx) {
                 OptimizationResult::Emit(emitted) => {
                     ctx.emit(emitted);
                 }
@@ -6508,7 +6508,7 @@ mod tests {
             for i in 0..resolved.num_args() {
                 resolved.setarg(i, ctx.get_box_replacement(resolved.arg(i).to_opref()));
             }
-            match pass.propagate_forward(&resolved, &mut ctx) {
+            match pass.propagate_forward(&resolved, &std::rc::Rc::new(resolved.clone()), &mut ctx) {
                 OptimizationResult::Emit(emitted) => {
                     ctx.emit(emitted);
                 }
@@ -6895,7 +6895,7 @@ mod tests {
         let new_pos = ctx.reserve_pos_typed(Type::Ref);
         let mut new_op = Op::new(OpCode::New, &[]);
         new_op.pos.set(new_pos);
-        let result = heap.propagate_forward(&new_op, &mut ctx);
+        let result = heap.propagate_forward(&new_op, &std::rc::Rc::new(new_op.clone()), &mut ctx);
         assert!(matches!(result, OptimizationResult::PassOn));
         assert!(
             !heap.last_emitted_removed,
@@ -6905,7 +6905,7 @@ mod tests {
         // Now a GUARD_NO_EXCEPTION must be emitted, not removed.
         let mut guard = Op::new(OpCode::GuardNoException, &[]);
         guard.pos.set(ctx.reserve_pos_typed(Type::Void));
-        let guard_result = heap.propagate_forward(&guard, &mut ctx);
+        let guard_result = heap.propagate_forward(&guard, &std::rc::Rc::new(guard.clone()), &mut ctx);
         assert!(
             matches!(guard_result, OptimizationResult::Emit(_)),
             "GUARD_NO_EXCEPTION after a PassOn-emitted op must NOT be removed"
