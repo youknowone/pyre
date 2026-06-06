@@ -7400,12 +7400,10 @@ impl OptContext {
                     | PtrInfo::Str(_)
             )
         ) {
-            // optimizer.py:469: return opinfo. `ensure_box` guarantees a
-            // BoxRef even for positions whose pool slot was skipped by the
-            // recorder.
-            let bx = self
-                .ensure_box(arg0)
-                .expect("body-namespace OpRef must have a BoxRef slot");
+            // optimizer.py:469: return opinfo. The matches! above required
+            // arg0_box to carry a virtual/known PtrInfo, so the terminal
+            // BoxRef is already resolved — reuse it instead of re-minting.
+            let bx = arg0_box.expect("matched PtrInfo implies a resolved arg0 BoxRef");
             return EnsuredPtrInfo::ForwardedBox(bx);
         }
         let last_guard_pos = if let Some(opinfo) =
