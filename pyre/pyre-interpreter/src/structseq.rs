@@ -19,9 +19,9 @@
 //!   `make_builtin_type_with_base(name, init, tuple_type)` call inside
 //!   [`make_struct_seq`].
 //! * `lib_pypy/_structseq.py:95-144 structseq_new` — the
-//!   `cls(sequence[, dict])` constructor.  Pyre implements the
-//!   positional-only subset (the `extra_fields` dict-overlay arm is not
-//!   yet wired up; pwd / grp / resource don't use it).
+//!   `cls(sequence[, dict])` constructor, including the surplus-positional
+//!   / dict / `None`-default fill of the named-only extra fields and the
+//!   single-field scalar-wrap path.
 //! * `lib_pypy/_structseq.py:156-163 structseq_repr` — `"name(f0=v0,
 //!   f1=v1, ...)"` rendering.
 
@@ -153,28 +153,52 @@ fn structseq_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     )))
 }
 
-/// `lib_pypy/_structseq.py:95-144 structseq_new` — the
-/// `cls(sequence)` constructor.  Pyre supports the all-positional
-/// arity-exact case (`len(sequence) == n_sequence_fields`); the
-/// `extra_fields` overlay arm raises TypeError until pwd/grp/resource
-/// actually need it.
+/// `lib_pypy/_structseq.py:95-144 structseq_new` — the `cls(sequence[,
+/// dict])` constructor.  The first `n_sequence_fields` items fill the
+/// tuple body; any surplus positional items, then the optional dict, then
+/// `None` defaults, fill the named-only extra fields.
 fn structseq_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     if args.len() < 2 {
         return Err(PyError::type_error("structseq() requires class + sequence"));
     }
     let cls = args[0];
-    let sequence = args[1];
     let n_seq = read_class_int(cls, "n_sequence_fields").unwrap_or(0) as usize;
     let n_fields = read_class_int(cls, "n_fields").unwrap_or(n_seq as i64) as usize;
-    let items = crate::builtins::collect_iterable(sequence)?;
+    let (name, extra_names) = STRUCTSEQ_REGISTRY.with(|r| {
+        let map = r.borrow();
+        map.get(&(cls as usize))
+            .map(|d| (d.name.clone(), d.extra_fields.clone()))
+            .unwrap_or_else(|| ("structseq".to_string(), Vec::new()))
+    });
+
+    // `_structseq.py:95-101` — the optional second arg is a dict supplying
+    // values for the named-only extra fields.
+    if args.len() > 3 {
+        return Err(PyError::type_error(format!(
+            "{name}() takes at most 2 arguments ({} given)",
+            args.len() - 1
+        )));
+    }
+    let dict_arg = args.get(2).copied();
+    if let Some(d) = dict_arg {
+        if !unsafe { pyre_object::is_dict(d) } {
+            return Err(PyError::type_error(format!(
+                "{name} takes a dict as second arg, if any"
+            )));
+        }
+    }
+
+    // `_structseq.py:102-107` — a 1-field structseq wraps its scalar arg;
+    // otherwise the arg is iterated into the field values.
+    let mut items = if n_seq == 1 {
+        vec![args[1]]
+    } else {
+        crate::builtins::collect_iterable(args[1])?
+    };
     if items.len() < n_seq {
         return Err(PyError::type_error(format!(
             "expected a sequence with {} {} items. has {}",
-            if n_seq < n_fields {
-                "at least"
-            } else {
-                "exactly"
-            },
+            if n_seq < n_fields { "at least" } else { "exactly" },
             n_seq,
             items.len()
         )));
@@ -182,17 +206,35 @@ fn structseq_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     if items.len() > n_fields {
         return Err(PyError::type_error(format!(
             "expected a sequence with {} {} items. has {}",
-            if n_seq < n_fields {
-                "at most"
-            } else {
-                "exactly"
-            },
+            if n_seq < n_fields { "at most" } else { "exactly" },
             n_fields,
             items.len()
         )));
     }
-    let trimmed: Vec<PyObjectRef> = items.into_iter().take(n_seq).collect();
-    Ok(new_instance(cls, trimmed))
+
+    // `_structseq.py:115-143` — first `n_seq` items form the tuple body;
+    // surplus items fill leading extras, then the dict, then `None`.
+    let surplus = items.len() - n_seq;
+    let surplus_vals: Vec<PyObjectRef> = items.split_off(n_seq);
+    let body = items;
+    let mut extras: Vec<(&str, PyObjectRef)> = Vec::with_capacity(extra_names.len());
+    for (i, ename) in extra_names.iter().enumerate() {
+        let in_dict =
+            dict_arg.is_some_and(|d| unsafe { pyre_object::w_dict_getitem_str(d, ename).is_some() });
+        let value = if i < surplus {
+            if in_dict {
+                return Err(PyError::type_error(format!("duplicate value for '{ename}'")));
+            }
+            surplus_vals[i]
+        } else if let Some(d) = dict_arg {
+            unsafe { pyre_object::w_dict_getitem_str(d, ename) }.unwrap_or_else(pyre_object::w_none)
+        } else {
+            pyre_object::w_none()
+        };
+        extras.push((ename.as_str(), value));
+    }
+
+    Ok(new_instance_with_extra(cls, body, extras))
 }
 
 fn read_class_int(cls: PyObjectRef, attr: &str) -> Option<i64> {
