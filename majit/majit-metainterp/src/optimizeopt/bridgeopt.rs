@@ -251,11 +251,13 @@ pub fn deserialize_optimizer_knowledge(
                     majit_ir::GcRef(raw_ref as usize),
                 ));
                 let cls = cpu.cls_of_box(&const_box);
-                // optimizer.py:137-152 `make_constant_class` always
-                // updates `_forwarded` after `get_box_replacement` —
-                // `ensure_box` materializes a Box so the class info
-                // install is never silently skipped.
-                if let Some(b) = ctx.ensure_box(livebox) {
+                // optimizer.py:137-152 `make_constant_class` updates
+                // `_forwarded` after `get_box_replacement`. `livebox` is a
+                // bridge livebox (= inputarg materialized by
+                // `ensure_inputarg_bindings`, which runs before
+                // `deserialize_optimizer_knowledge`), so it always resolves
+                // and the class info install is never skipped.
+                if let Some(b) = ctx.get_box_replacement_box(livebox) {
                     super::optimizer::Optimizer::make_constant_class(ctx, &b, cls, true);
                 }
             }
