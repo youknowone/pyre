@@ -2747,57 +2747,40 @@ fn bh_call_self_recursive_portal(
 /// blackhole.py bhimpl_residual_call parity: variable-arity call helper.
 ///
 /// Convention: residual_call_r_r dispatches with
-/// args=[frame_ptr, callable, arg0, ..., argN].  The frame pointer is
-/// always the FIRST ref argument.  The number of Python args =
-/// total_args - 2 (subtract frame_ptr and callable).
+/// args=[callable, arg0, ..., argN].  RPython `bhimpl_residual_call_r_r`
+/// (blackhole.py:1227) carries no frame — `cpu.bh_call_r(func, None,
+/// args_r, ...)`; `bh_call_fn_impl` resolves the parent frame from the
+/// execution context's top frame instead of a threaded operand.
 ///
-/// For nargs=0: fn(frame_ptr, callable) → 2 args
-/// For nargs=1: fn(frame_ptr, callable, arg0) → 3 args
-/// For nargs=2: fn(frame_ptr, callable, arg0, arg1) → 4 args
-/// For nargs=3: fn(frame_ptr, callable, arg0, arg1, arg2) → 5 args
+/// For nargs=0: fn(callable) → 1 arg
+/// For nargs=1: fn(callable, arg0) → 2 args
+/// For nargs=2: fn(callable, arg0, arg1) → 3 args
+/// For nargs=3: fn(callable, arg0, arg1, arg2) → 4 args
 /// etc.
-///
-/// bhimpl_residual_call: parent frame received explicitly as the
-/// leading argument and forwarded to `bh_call_fn_impl_with_frame`.
-/// `call_int_function` in machine.rs transmutes to the correct arity.
-pub extern "C" fn bh_call_fn(frame_ptr: i64, callable: i64, arg0: i64) -> i64 {
-    bh_call_fn_impl_with_frame(
-        frame_ptr as *const PyFrame,
-        callable as PyObjectRef,
-        &[arg0 as PyObjectRef],
-    )
+pub extern "C" fn bh_call_fn(callable: i64, arg0: i64) -> i64 {
+    bh_call_fn_impl(callable as PyObjectRef, &[arg0 as PyObjectRef])
 }
 
-pub extern "C" fn bh_call_fn_0(frame_ptr: i64, callable: i64) -> i64 {
-    bh_call_fn_impl_with_frame(frame_ptr as *const PyFrame, callable as PyObjectRef, &[])
+pub extern "C" fn bh_call_fn_0(callable: i64) -> i64 {
+    bh_call_fn_impl(callable as PyObjectRef, &[])
 }
 
-pub extern "C" fn bh_call_fn_2(frame_ptr: i64, callable: i64, arg0: i64, arg1: i64) -> i64 {
-    bh_call_fn_impl_with_frame(
-        frame_ptr as *const PyFrame,
+pub extern "C" fn bh_call_fn_2(callable: i64, arg0: i64, arg1: i64) -> i64 {
+    bh_call_fn_impl(
         callable as PyObjectRef,
         &[arg0 as PyObjectRef, arg1 as PyObjectRef],
     )
 }
 
-pub extern "C" fn bh_call_fn_3(frame_ptr: i64, callable: i64, a0: i64, a1: i64, a2: i64) -> i64 {
-    bh_call_fn_impl_with_frame(
-        frame_ptr as *const PyFrame,
+pub extern "C" fn bh_call_fn_3(callable: i64, a0: i64, a1: i64, a2: i64) -> i64 {
+    bh_call_fn_impl(
         callable as PyObjectRef,
         &[a0 as PyObjectRef, a1 as PyObjectRef, a2 as PyObjectRef],
     )
 }
 
-pub extern "C" fn bh_call_fn_4(
-    frame_ptr: i64,
-    callable: i64,
-    a0: i64,
-    a1: i64,
-    a2: i64,
-    a3: i64,
-) -> i64 {
-    bh_call_fn_impl_with_frame(
-        frame_ptr as *const PyFrame,
+pub extern "C" fn bh_call_fn_4(callable: i64, a0: i64, a1: i64, a2: i64, a3: i64) -> i64 {
+    bh_call_fn_impl(
         callable as PyObjectRef,
         &[
             a0 as PyObjectRef,
@@ -2808,17 +2791,8 @@ pub extern "C" fn bh_call_fn_4(
     )
 }
 
-pub extern "C" fn bh_call_fn_5(
-    frame_ptr: i64,
-    callable: i64,
-    a0: i64,
-    a1: i64,
-    a2: i64,
-    a3: i64,
-    a4: i64,
-) -> i64 {
-    bh_call_fn_impl_with_frame(
-        frame_ptr as *const PyFrame,
+pub extern "C" fn bh_call_fn_5(callable: i64, a0: i64, a1: i64, a2: i64, a3: i64, a4: i64) -> i64 {
+    bh_call_fn_impl(
         callable as PyObjectRef,
         &[
             a0 as PyObjectRef,
@@ -2831,7 +2805,6 @@ pub extern "C" fn bh_call_fn_5(
 }
 
 pub extern "C" fn bh_call_fn_6(
-    frame_ptr: i64,
     callable: i64,
     a0: i64,
     a1: i64,
@@ -2840,8 +2813,7 @@ pub extern "C" fn bh_call_fn_6(
     a4: i64,
     a5: i64,
 ) -> i64 {
-    bh_call_fn_impl_with_frame(
-        frame_ptr as *const PyFrame,
+    bh_call_fn_impl(
         callable as PyObjectRef,
         &[
             a0 as PyObjectRef,
@@ -2855,7 +2827,6 @@ pub extern "C" fn bh_call_fn_6(
 }
 
 pub extern "C" fn bh_call_fn_7(
-    frame_ptr: i64,
     callable: i64,
     a0: i64,
     a1: i64,
@@ -2865,8 +2836,7 @@ pub extern "C" fn bh_call_fn_7(
     a5: i64,
     a6: i64,
 ) -> i64 {
-    bh_call_fn_impl_with_frame(
-        frame_ptr as *const PyFrame,
+    bh_call_fn_impl(
         callable as PyObjectRef,
         &[
             a0 as PyObjectRef,
@@ -2881,7 +2851,6 @@ pub extern "C" fn bh_call_fn_7(
 }
 
 pub extern "C" fn bh_call_fn_8(
-    frame_ptr: i64,
     callable: i64,
     a0: i64,
     a1: i64,
@@ -2892,8 +2861,7 @@ pub extern "C" fn bh_call_fn_8(
     a6: i64,
     a7: i64,
 ) -> i64 {
-    bh_call_fn_impl_with_frame(
-        frame_ptr as *const PyFrame,
+    bh_call_fn_impl(
         callable as PyObjectRef,
         &[
             a0 as PyObjectRef,
@@ -2914,29 +2882,30 @@ pub extern "C" fn bh_call_fn_8(
 /// Only bhimpl_recursive_call_* (blackhole.py:1095) uses the portal
 /// runner to re-enter JIT.
 ///
-/// Receives the parent `PyFrame*` directly from every `bh_call_fn_N`
-/// wrapper, which in turn gets it from the residual_call_r_r ListR's
-/// leading frame operand emitted by `Instruction::Call` in codewriter.rs.
-fn bh_call_fn_impl_with_frame(
-    parent_frame_ptr: *const PyFrame,
-    callable: PyObjectRef,
-    args: &[PyObjectRef],
-) -> i64 {
-    // Pyre adaptation invariant: every bh_call_fn_N wrapper receives
-    // the active portal `PyFrame*` from the residual_call_r_r ListR's
-    // leading ref operand (codewriter.rs:6784-6788 inline walker +
-    // flatten.rs:`lower_simple_call_hlop_to_insn` graph lower).  RPython
-    // `bhimpl_residual_call_r_r` (blackhole.py:1227) does not depend on
-    // a parent frame; pyre threads it because the user-function dispatch
-    // below reads `execution_context` and the recursive-portal probe
-    // walks the caller chain.  A null pointer here signals a wiring
-    // bug, so fail-fast rather than silently corrupting the `&*frame`
-    // deref below.
+/// RPython `bhimpl_residual_call_r_r` (blackhole.py:1227) carries no
+/// frame: `cpu.bh_call_r(func, None, args_r, ...)`.  The user-function
+/// dispatch below reads `execution_context` and the recursive-portal probe
+/// walks the caller chain, so the parent frame is resolved here from the
+/// execution context's top frame (`space.getexecutioncontext()
+/// .gettopframe()`), matching the upstream frame-less ABI.
+fn bh_call_fn_impl(callable: PyObjectRef, args: &[PyObjectRef]) -> i64 {
+    // `space.getexecutioncontext()` (call.rs:198 → TLS-pinned EC the eval
+    // loop stamps on entry) `.gettopframe()` is the active caller frame —
+    // `executioncontext.py:85-89 enter` / `:91-109 leave` keep
+    // `topframeref` pointing at the running frame.  A null here means the
+    // EC was never pinned before a residual call, which is a wiring bug, so
+    // fail-fast rather than corrupting the `&*frame` deref below.
+    let ec = pyre_interpreter::call::getexecutioncontext();
+    let parent_frame_ptr: *const PyFrame = if ec.is_null() {
+        std::ptr::null()
+    } else {
+        unsafe { (*ec).gettopframe() as *const PyFrame }
+    };
     assert!(
         !parent_frame_ptr.is_null(),
-        "bh_call_fn_impl_with_frame requires a non-null parent PyFrame; \
-         every CALL emit site must thread portal_frame_reg as the leading \
-         ref operand"
+        "bh_call_fn_impl requires a live parent PyFrame from \
+         getexecutioncontext().gettopframe(); the eval loop must pin the \
+         execution context before any residual call"
     );
     if callable.is_null() {
         let err = pyre_interpreter::PyError::new(
@@ -3127,8 +3096,7 @@ pub extern "C" fn bh_box_int_fn(value: i64) -> i64 {
 /// ABI.  `pyopcode.py:704-722 RAISE_VARARGS` runs inside an opcode
 /// dispatch where `frame` and `frame.execution_context` are always
 /// valid, so `frame_ptr == 0` here signals a wiring bug — fail fast
-/// at entry to match `bh_call_fn_impl_with_frame`'s strict ABI rather
-/// than degrade silently to a `RuntimeError`.
+/// at entry rather than degrade silently to a `RuntimeError`.
 pub extern "C" fn bh_normalize_raise_varargs_with_frame(
     frame_ptr: i64,
     exc: i64,

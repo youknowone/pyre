@@ -26,20 +26,20 @@
 #[derive(Debug)]
 pub struct Cpu {
     /// `bhimpl_residual_call` general entry point.
-    /// `(frame, callable, arg0) → result`.
-    pub call_fn: extern "C" fn(i64, i64, i64) -> i64,
+    /// `(callable, arg0) → result`.
+    pub call_fn: extern "C" fn(i64, i64) -> i64,
     /// Per-arity `bhimpl_residual_call_<n>` helpers
-    /// (`call_fn_0(frame, callable)` ... `call_fn_8(frame, callable,
-    /// a0..a7)`).  The leading `frame` slot carries the active portal
-    /// `PyFrame*` so the body receives it explicitly.
-    pub call_fn_0: extern "C" fn(i64, i64) -> i64,
-    pub call_fn_2: extern "C" fn(i64, i64, i64, i64) -> i64,
-    pub call_fn_3: extern "C" fn(i64, i64, i64, i64, i64) -> i64,
-    pub call_fn_4: extern "C" fn(i64, i64, i64, i64, i64, i64) -> i64,
-    pub call_fn_5: extern "C" fn(i64, i64, i64, i64, i64, i64, i64) -> i64,
-    pub call_fn_6: extern "C" fn(i64, i64, i64, i64, i64, i64, i64, i64) -> i64,
-    pub call_fn_7: extern "C" fn(i64, i64, i64, i64, i64, i64, i64, i64, i64) -> i64,
-    pub call_fn_8: extern "C" fn(i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) -> i64,
+    /// (`call_fn_0(callable)` ... `call_fn_8(callable, a0..a7)`).  RPython
+    /// `bhimpl_residual_call_r_r` carries no frame; the parent frame is
+    /// resolved from the execution context inside `bh_call_fn_impl`.
+    pub call_fn_0: extern "C" fn(i64) -> i64,
+    pub call_fn_2: extern "C" fn(i64, i64, i64) -> i64,
+    pub call_fn_3: extern "C" fn(i64, i64, i64, i64) -> i64,
+    pub call_fn_4: extern "C" fn(i64, i64, i64, i64, i64) -> i64,
+    pub call_fn_5: extern "C" fn(i64, i64, i64, i64, i64, i64) -> i64,
+    pub call_fn_6: extern "C" fn(i64, i64, i64, i64, i64, i64, i64) -> i64,
+    pub call_fn_7: extern "C" fn(i64, i64, i64, i64, i64, i64, i64, i64) -> i64,
+    pub call_fn_8: extern "C" fn(i64, i64, i64, i64, i64, i64, i64, i64, i64) -> i64,
     /// `bhimpl_load_global` — namespace/code from getfield_vable_r plus live frame.
     pub load_global_fn: extern "C" fn(i64, i64, i64, i64) -> i64,
     /// `bhimpl_compare_op` — RPython compare_op opcodes.

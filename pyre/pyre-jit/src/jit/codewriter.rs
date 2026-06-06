@@ -5121,19 +5121,6 @@ impl CodeWriter {
                     call_fn_7_idx,
                     call_fn_8_idx,
                 ],
-                // Both portal and non-portal graphs now include
-                // `frame_var` as a real startblock inputarg
-                // (`graph_entry_inputargs(code, FrameInputs::Frame |
-                // Portal)`), so `frame_var.id` (= `entry_arg_slots`) no
-                // longer collides with the synthesised `return_var.id`
-                // (= `start_inputargs.len()` = `entry_arg_slots + 1`).
-                // `portal_frame_var` nonetheless stays `None` for
-                // non-portal in this slice: it drives
-                // `lower_simple_call_hlop_to_insn` (flatten.rs), and the
-                // non-portal call/LOAD_GLOBAL readers still source the
-                // frame from the shared `portal_frame_reg` slot.  Routing
-                // them to the per-callee `frame_var` is a later slice.
-                portal_frame_var: if is_portal { Some(frame_var) } else { None },
             });
         }
 
@@ -8021,12 +8008,12 @@ impl CodeWriter {
                                 fresh_ref_value(&mut graph)
                             } else {
                                 // Graph-side `simple_call(callable, args...)`
-                                // carries only the RPython rewrite_call shape
-                                // (jtransform.py:414 — no hidden frame arg).
-                                // `lower_simple_call_hlop_to_insn` prepends
-                                // `ctx.portal_frame_reg` to the ListR at flatten
-                                // time so the lowered Insn matches the inline
-                                // walker emit at codewriter.rs:6784-6788.
+                                // carries the RPython rewrite_call shape
+                                // (jtransform.py:414 — no frame arg).  The
+                                // residual call ABI matches upstream
+                                // `bhimpl_residual_call_r_r` (no frame); the
+                                // parent frame is resolved at runtime from the
+                                // execution context inside `bh_call_fn_impl`.
                                 let graph_call_args: Vec<super::flow::FlowValue> =
                                     graph_arg_values_rev.iter().rev().cloned().collect();
                                 let result = emit_frontend_simple_call(
@@ -8104,13 +8091,7 @@ impl CodeWriter {
                                     )
                                 };
                                 let mut ref_operands: Vec<super::flatten::Operand> =
-                                    Vec::with_capacity(2 + arg_regs.len());
-                                ref_operands.push(super::flatten::Operand::Register(
-                                    super::flatten::Register::new(
-                                        super::flatten::Kind::Ref,
-                                        portal_frame_reg,
-                                    ),
-                                ));
+                                    Vec::with_capacity(1 + arg_regs.len());
                                 ref_operands.push(to_operand(&callable_value, callable_reg));
                                 for (value, reg) in arg_values.iter().zip(arg_regs.iter()) {
                                     ref_operands.push(to_operand(value, *reg));
@@ -11468,15 +11449,14 @@ pub fn register_portal_jitdriver(
 ///     does not surface.  Fully retiring the register-form `ns`/`frame`
 ///     reads requires separating the walker path from the blackhole
 ///     path — a structural prerequisite not yet in place.
-///   * `bh_call_fn` / `bh_call_fn_N(frame_ptr, callable, args...)` —
-///     `frame_ptr` non-null asserted at runtime entry; used for
+///   * `bh_call_fn` / `bh_call_fn_N(callable, args...)` — frame-less
+///     residual call ABI matching RPython `bhimpl_residual_call_r_r`
+///     (`cpu.bh_call_r(func, None, args_r, ...)`).  The parent frame for
 ///     `bh_call_self_recursive_portal`, `set_last_exec_ctx`, and
-///     `call_user_function_plain(parent_frame, ...)`.  Pyre's
-///     `bh_call_fn_*` ABI threads `parent_frame` as the first ref argument
-///     — RPython equivalent has no such argument.  Non-portal callees do
-///     not have a self/caller frame on the graph as a startblock
-///     inputarg, so the migration requires either an entry-arg restructure
-///     or a ConstRef-null + adapter-side guard.  Not yet migrated.
+///     `call_user_function_plain(parent_frame, ...)` is resolved at runtime
+///     from `getexecutioncontext().gettopframe()` inside `bh_call_fn_impl`,
+///     so the CALL ListR carries no frame operand (portal and non-portal
+///     callees share the same shape).
 ///   * `bh_normalize_raise_varargs_with_frame(frame_ptr, exc, cause)` —
 ///     `frame_ptr` non-null asserted; pins
 ///     `(*parent_frame_ptr).execution_context` for the normalization
