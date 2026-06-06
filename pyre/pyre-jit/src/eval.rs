@@ -3088,14 +3088,23 @@ fn dispatch_arm_via_blackhole(
         });
 
     if got_exception {
-        // Slice 3.6: BH exception with no handler in the arm body.
-        // Convert `exception_value` (i64 pointer to W_BaseException) to
-        // a `PyError` and propagate up to `eval_loop_jit`.
-        let _ = exception_value;
-        todo!(
-            "dispatch_arm_via_blackhole: BH exception → PyError \
-             propagation lands in slice 3.6"
-        );
+        // Mirrors `call_jit.rs:1486-1506` (BH chain-exit propagation):
+        // null `exception_value` means the arm raised without a
+        // payload (defensive RuntimeError); otherwise the value is a
+        // GC ref to a `W_BaseException` instance to re-wrap.
+        let err = if exception_value != 0 {
+            unsafe {
+                pyre_interpreter::PyError::from_exc_object(
+                    exception_value as pyre_object::PyObjectRef,
+                )
+            }
+        } else {
+            pyre_interpreter::PyError::new(
+                pyre_interpreter::PyErrorKind::RuntimeError,
+                "dispatch_arm_via_blackhole: arm raised exception with null exc_value",
+            )
+        };
+        return Err(err);
     }
     if mergepoint_args.is_some() {
         // `ContinueRunningNormally` is the JIT-exit path: an arm
