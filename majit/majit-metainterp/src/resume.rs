@@ -1350,7 +1350,12 @@ pub fn rd_virtual_to_virtual_info(
             let fields = fielddescrs
                 .iter()
                 .zip(fieldnums.iter())
-                .map(|(fd, &tagged)| (fd.index, tagged_to_source(tagged, consts, count, num_virtuals)))
+                .map(|(fd, &tagged)| {
+                    (
+                        fd.index,
+                        tagged_to_source(tagged, consts, count, num_virtuals),
+                    )
+                })
                 .collect();
             VirtualInfo::VirtualObj {
                 descr: descr.clone(),
@@ -1371,7 +1376,12 @@ pub fn rd_virtual_to_virtual_info(
             let fields = fielddescrs
                 .iter()
                 .zip(fieldnums.iter())
-                .map(|(fd, &tagged)| (fd.index, tagged_to_source(tagged, consts, count, num_virtuals)))
+                .map(|(fd, &tagged)| {
+                    (
+                        fd.index,
+                        tagged_to_source(tagged, consts, count, num_virtuals),
+                    )
+                })
                 .collect();
             VirtualInfo::VStruct {
                 typedescr: typedescr.clone(),
@@ -1427,7 +1437,12 @@ pub fn rd_virtual_to_virtual_info(
                 let elem: Vec<(u32, VirtualFieldSource)> = chunk
                     .iter()
                     .enumerate()
-                    .map(|(j, &tagged)| (j as u32, tagged_to_source(tagged, consts, count, num_virtuals)))
+                    .map(|(j, &tagged)| {
+                        (
+                            j as u32,
+                            tagged_to_source(tagged, consts, count, num_virtuals),
+                        )
+                    })
                     .collect();
                 element_fields.push(elem);
             }
