@@ -73,13 +73,21 @@ impl LiveVars {
         // into every PC in the range.
         // `decode_exceptiontable` yields byte offsets; liveness operates
         // in code-unit indices (offset/2).
-        let exc_handlers: Vec<(usize, usize, usize)> =
+        let exc_handlers: Vec<(usize, usize, usize, usize)> =
             pyre_interpreter::exception_table::decode_exceptiontable(&code.exceptiontable)
                 .map(|e| {
+                    // Handler entry stack depth: on raise the unwinder pops the
+                    // value stack to `depth`, pushes lasti when flagged, then
+                    // pushes the exception, so the handler's first instruction
+                    // sees `depth + lasti + 1` values. Matches the
+                    // `handler_depth_at` computation in the codewriter's
+                    // `decode_exception_catch_sites`.
+                    let handler_depth = e.depth as usize + usize::from(e.lasti) + 1;
                     (
                         e.start as usize / 2,
                         e.end as usize / 2,
                         e.target as usize / 2,
+                        handler_depth,
                     )
                 })
                 .collect();
@@ -258,6 +266,21 @@ impl LiveVars {
                         sd_changed = true;
                     }
                 }
+                // Exception-table edges: any instruction in [s, e) may, on
+                // raise, transfer control to the handler at `tgt`, where the
+                // value stack has been unwound to the fixed handler entry
+                // depth. RPython flow graphs carry these as explicit exception
+                // links; pyre re-derives them from the packed table. Without
+                // this edge the handler PCs keep the `usize::MAX` sentinel and
+                // are treated as unreachable, so the codewriter empties their
+                // resume `-live-` markers (dropping the portal frame register
+                // among others).
+                for &(s, e, tgt, hdepth) in &exc_handlers {
+                    if pc >= s && pc < e && tgt <= n && hdepth < stack_depth_at[tgt] {
+                        stack_depth_at[tgt] = hdepth;
+                        sd_changed = true;
+                    }
+                }
             }
         }
 
@@ -379,7 +402,7 @@ impl LiveVars {
             // Exception handlers: on exception, control jumps to tgt.
             // The handler sees the caller's current `post` (locals
             // defined up to this point) — intersect into handler entry.
-            for (s, e, tgt) in &exc_handlers {
+            for (s, e, tgt, _) in &exc_handlers {
                 if pc >= *s && pc < *e && *tgt <= n {
                     propagate_defined(
                         &post,
