@@ -1,5 +1,5 @@
 //! Front-end shared types — the data shapes `front::mir` produces, and
-//! that the rest of the pipeline (`analyze_pipeline_from_parsed`,
+//! that the rest of the pipeline (`analyze_pipeline_from_module_paths`,
 //! `jit_codewriter::*`, `parse::*`) consumes.
 //!
 //! These types do not depend on any graph builder, so they live in
@@ -117,7 +117,7 @@ impl StructFieldRegistry {
     /// suffix-match shim absorbs `pyre_object::rangeobject::W_X` vs
     /// `rangeobject::W_X` divergence — orthogonal to lexical scope
     /// resolution, kept for test entries (`parse::parse_source`)
-    /// that bypass `analyze_pipeline_from_parsed`'s
+    /// that bypass `analyze_pipeline_from_module_paths`'s
     /// `register_struct_origins`.
     pub fn field_type(&self, owner: &str, field_name: &str) -> Option<&str> {
         self.lookup_fields(owner)?

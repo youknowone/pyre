@@ -59,9 +59,7 @@ pub use jtransform::{
 pub use layout::{HeuristicLayoutProvider, LayoutProvider};
 pub use model::{Block, BlockId, CallTarget, FunctionGraph, OpKind, SpaceOperation, ValueType};
 pub use opcode_dispatch::PipelineOpcodeArm;
-pub use parse::{
-    CallPath, ExtractedOpcodeArm, OpcodeDispatchSelector, ParsedInterpreter, parse_source,
-};
+pub use parse::{CallPath, ExtractedOpcodeArm, OpcodeDispatchSelector};
 pub use pipeline::{PipelineConfig, PipelineResult, PortalSpec, ProgramPipelineResult};
 
 use serde::{Deserialize, Serialize};
@@ -127,7 +125,7 @@ pub fn analyze_pipeline(source: &str) -> pipeline::ProgramPipelineResult {
 /// `scripts/extract-llbc.sh` not run) is a fatal misconfiguration
 /// rather than a fallback to another path.
 fn build_semantic_program_via_active_frontend(
-    parsed_files: &[parse::ParsedInterpreter],
+    module_paths: &[&str],
     static_addrs: HostStaticAddrs<'_>,
 ) -> front::SemanticProgram {
     #[cfg(feature = "mir-frontend")]
@@ -148,7 +146,7 @@ fn build_semantic_program_via_active_frontend(
                     .map(|p| p.to_string_lossy().into_owned())
                     .collect()
             })
-            .or_else(|| auto_discover_workspace_llbc_paths(parsed_files));
+            .or_else(|| auto_discover_workspace_llbc_paths(module_paths));
         if let Some(paths) = resolved_paths {
             let llbcs: Vec<majit_charon_reader::Llbc> = paths
                 .iter()
@@ -176,10 +174,8 @@ fn build_semantic_program_via_active_frontend(
             merge_hints_from_llbcs(&mut program, &llbcs);
             // Re-source the unsafe-fn stub carrier from Charon: walk the
             // full LLBC set for every local `unsafe fn` / unsafe
-            // impl-method projecting to a unit/bool return.  Replaces the
-            // syn `extract_unsafe_fn_stubs` pass the consumer at
-            // `call_control.unsafe_fn_stubs` (lib.rs) used to read; the
-            // shadow probe below confirms this reproduces every syn stub.
+            // impl-method projecting to a unit/bool return.  The consumer
+            // at `call_control.unsafe_fn_stubs` (lib.rs) reads this carrier.
             program.unsafe_fn_stubs = llbcs
                 .iter()
                 .flat_map(front::mir::collect_unsafe_fn_stubs_from_llbc)
@@ -191,88 +187,10 @@ fn build_semantic_program_via_active_frontend(
             // resolved by `tyref_to_ast_string` (Charon-resolved types,
             // e.g. `*mut PyObject`, `Vec<u8>`, `i64`) rather than the syn
             // re-parse.
-            //
-            // Tier-4 (4c) regression probe: compare the syn-sourced
-            // unsafe-fn stub set (`extract_unsafe_fn_stubs` over
-            // `parsed_files`) against the Charon-sourced
-            // `program.unsafe_fn_stubs` populated just above (now the
-            // production carrier).  Read-only over both sets, keyed on
-            // the path segments with value `(argname-count,
-            // lltype-label)`; flags any future divergence between the
-            // retired syn extractor and the Charon re-source.
-            {
-                use std::collections::BTreeMap;
-                fn lltype_label(
-                    t: &crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
-                ) -> &'static str {
-                    use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
-                    match t {
-                        LowLevelType::Void => "Void",
-                        LowLevelType::Bool => "Bool",
-                        _ => "Other",
-                    }
-                }
-                let mut syn_map: BTreeMap<Vec<String>, (usize, &'static str)> = BTreeMap::new();
-                for p in parsed_files {
-                    for (segs, sig, ll) in
-                        crate::flowspace::rust_source::register::extract_unsafe_fn_stubs(
-                            &p.file,
-                            &p.module_path,
-                        )
-                    {
-                        syn_map
-                            .entry(segs)
-                            .or_insert((sig.argnames.len(), lltype_label(&ll)));
-                    }
-                }
-                let mut ull_map: BTreeMap<Vec<String>, (usize, &'static str)> = BTreeMap::new();
-                for (segs, sig, ll) in &program.unsafe_fn_stubs {
-                    ull_map
-                        .entry(segs.clone())
-                        .or_insert((sig.argnames.len(), lltype_label(ll)));
-                }
-                let syn_only = syn_map.keys().filter(|k| !ull_map.contains_key(*k)).count();
-                let ull_only = ull_map.keys().filter(|k| !syn_map.contains_key(*k)).count();
-                let mut exact = 0usize;
-                let mut attr_mismatch = 0usize;
-                for (k, sv) in &syn_map {
-                    if let Some(uv) = ull_map.get(k) {
-                        if sv == uv {
-                            exact += 1;
-                        } else {
-                            attr_mismatch += 1;
-                        }
-                    }
-                }
-                eprintln!(
-                    "UNSAFE_STUB SHADOW: syn={} ull={} exact={exact} attr_mismatch={attr_mismatch} syn_only={syn_only} ull_only={ull_only}",
-                    syn_map.len(),
-                    ull_map.len(),
-                );
-                // List every parity-critical gap (syn entries the Charon
-                // set fails to reproduce); cap the harmless ull-only
-                // overflow listing.
-                for (k, sv) in &syn_map {
-                    match ull_map.get(k) {
-                        None => eprintln!("  UNSAFE_STUB syn_only {k:?} {sv:?}"),
-                        Some(uv) if uv != sv => {
-                            eprintln!("  UNSAFE_STUB attr {k:?} syn={sv:?} ull={uv:?}")
-                        }
-                        _ => {}
-                    }
-                }
-                for (k, uv) in ull_map
-                    .iter()
-                    .filter(|(k, _)| !syn_map.contains_key(*k))
-                    .take(40)
-                {
-                    eprintln!("  UNSAFE_STUB ull_only {k:?} {uv:?}");
-                }
-            }
             return program;
         }
     }
-    let _ = parsed_files; // silence unused warning when the feature is off
+    let _ = module_paths; // silence unused warning when the feature is off
     // The MIR front-end is the only graph builder.  Reaching this
     // point means neither `PYRE_MIR_FRONTEND_LLBC` nor the workspace
     // auto-discover located an LLBC source — surface the
@@ -292,11 +210,10 @@ fn build_semantic_program_via_active_frontend(
 /// fixture).
 ///
 /// Returns `None` when:
-///   - no parsed_file carries a `module_path` (test fixtures use
-///     `parse::parse_source` which leaves `module_path` empty;
-///     production uses `parse::parse_source_with_module`),
-///   - the caller passed fewer than `PROD_PARSED_FILES_FLOOR`
-///     parsed_files (single-source diagnostic),
+///   - no source carries a `module_path` (test fixtures pass empty
+///     module paths; production passes per-file crate-stripped paths),
+///   - the caller passed fewer than `PROD_SOURCE_FILES_FLOOR`
+///     module paths (single-source diagnostic),
 ///   - a mandatory artefact (`pyre-object.ullbc` /
 ///     `pyre-interpreter.ullbc`) is missing (contributor without
 ///     Charon installed), or
@@ -308,10 +225,10 @@ fn build_semantic_program_via_active_frontend(
 /// before `pyre-jit.ullbc` exists.
 ///
 /// The two gates together match the production fingerprint:
-/// `pyre-jit-trace/build.rs:157` calls
+/// `pyre-jit-trace/build.rs` calls
 /// `analyze_multiple_pipeline_with_modules` with ≈100 files and a
 /// per-file `module_path`.  Tests via
-/// `analyze_multiple_pipeline_with_config` parse without module
+/// `analyze_multiple_pipeline_with_config` pass empty module
 /// paths and stay below the floor, so auto-discovery does not
 /// silently swap their front-end.
 ///
@@ -322,14 +239,12 @@ fn build_semantic_program_via_active_frontend(
 /// `<workspace>/build/llbc/` directory by convention, so the two
 /// halves stay in sync.
 #[cfg(feature = "mir-frontend")]
-fn auto_discover_workspace_llbc_paths(
-    parsed_files: &[parse::ParsedInterpreter],
-) -> Option<Vec<String>> {
-    const PROD_PARSED_FILES_FLOOR: usize = 50;
-    if parsed_files.len() < PROD_PARSED_FILES_FLOOR {
+fn auto_discover_workspace_llbc_paths(module_paths: &[&str]) -> Option<Vec<String>> {
+    const PROD_SOURCE_FILES_FLOOR: usize = 50;
+    if module_paths.len() < PROD_SOURCE_FILES_FLOOR {
         return None;
     }
-    if !parsed_files.iter().any(|p| !p.module_path.is_empty()) {
+    if !module_paths.iter().any(|mp| !mp.is_empty()) {
         return None;
     }
     let workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -431,9 +346,9 @@ pub fn analyze_multiple_pipeline_with_config(
     sources: &[&str],
     config: &AnalyzeConfig,
 ) -> pipeline::ProgramPipelineResult {
-    let parsed_files: Vec<_> = sources.iter().map(|s| parse::parse_source(s)).collect();
-    analyze_pipeline_from_parsed(
-        &parsed_files,
+    let module_paths: Vec<&str> = vec![""; sources.len()];
+    analyze_pipeline_from_module_paths(
+        &module_paths,
         config,
         None,
         &|_, _| None,
@@ -453,9 +368,9 @@ pub fn analyze_multiple_pipeline_with_layout(
     config: &AnalyzeConfig,
     layout_provider: &dyn layout::LayoutProvider,
 ) -> pipeline::ProgramPipelineResult {
-    let parsed_files: Vec<_> = sources.iter().map(|s| parse::parse_source(s)).collect();
-    analyze_pipeline_from_parsed(
-        &parsed_files,
+    let module_paths: Vec<&str> = vec![""; sources.len()];
+    analyze_pipeline_from_module_paths(
+        &module_paths,
         config,
         Some(layout_provider),
         &|_, _| None,
@@ -476,7 +391,7 @@ pub type VirtualizableInfoFactory<'a> =
 /// (`module_path!()::helper_name`) to the compiled trace-call address.
 ///
 /// `#[jit_module]::__majit_helper_trace_fnaddrs()` produces this shape.
-/// `analyze_pipeline_from_parsed` strips the crate-name prefix and binds
+/// `analyze_pipeline_from_module_paths` strips the crate-name prefix and binds
 /// both canonical aliases (`helpers::foo` and `crate::helpers::foo`) on
 /// `CallControl` before `get_jitcode()` / `jtransform` query fnaddrs.
 pub type FnAddrBindings<'a> = [(&'a str, i64)];
@@ -489,7 +404,7 @@ pub type FnAddrBindings<'a> = [(&'a str, i64)];
 /// the canonical `[impl_type_joined, method]` 2-segment CallPath.
 ///
 /// `#[jit_module]::__majit_helper_impl_trace_fnaddrs()` produces this
-/// shape and `analyze_pipeline_from_parsed` feeds it through
+/// shape and `analyze_pipeline_from_module_paths` feeds it through
 /// `CallControl::register_macro_impl_helper_trace_fnaddr`.
 pub type ImplFnAddrBindings<'a> = [(&'a str, &'a str, &'a str, i64)];
 
@@ -527,9 +442,9 @@ pub fn analyze_multiple_pipeline_with_vinfo_factory(
     layout_provider: Option<&dyn layout::LayoutProvider>,
     vinfo_factory: &VirtualizableInfoFactory<'_>,
 ) -> pipeline::ProgramPipelineResult {
-    let parsed_files: Vec<_> = sources.iter().map(|s| parse::parse_source(s)).collect();
-    analyze_pipeline_from_parsed(
-        &parsed_files,
+    let module_paths: Vec<&str> = vec![""; sources.len()];
+    analyze_pipeline_from_module_paths(
+        &module_paths,
         config,
         layout_provider,
         vinfo_factory,
@@ -569,12 +484,12 @@ pub fn analyze_multiple_pipeline_with_vinfo_and_fnaddr_bindings(
 ///
 /// `sources` and `module_paths` are parallel slices of equal length:
 /// `module_paths[i]` is the crate-stripped module path of `sources[i]`
-/// (e.g. `"intobject"` for `pyre_object/src/intobject.rs`).  Each file
-/// is parsed via [`parse::parse_source_with_module`], populating
-/// `ParsedInterpreter.{module_path, use_imports}` so the metadata
-/// collectors can record `struct_origins[bare_name] = module_path`
-/// and `qualify_to_canonical_struct` resolves cross-module references
-/// through the use-import table.
+/// (e.g. `"intobject"` for `pyre_object/src/intobject.rs`).  The graph
+/// surface itself comes from the Charon-extracted LLBC set; the
+/// `module_paths` slice drives the workspace LLBC auto-discovery
+/// production fingerprint and stays available for per-file lexical
+/// resolution.  `sources` is retained for the parallel-slice length
+/// contract.
 ///
 /// An empty `module_paths[i]` keeps the simple-name registration of
 /// the bare `analyze_multiple_pipeline_with_vinfo_and_fnaddr_bindings`
@@ -594,13 +509,8 @@ pub fn analyze_multiple_pipeline_with_modules(
         module_paths.len(),
         "analyze_multiple_pipeline_with_modules: parallel slices must have equal length",
     );
-    let parsed_files: Vec<_> = sources
-        .iter()
-        .zip(module_paths.iter())
-        .map(|(s, mp)| parse::parse_source_with_module(s, mp))
-        .collect();
-    analyze_pipeline_from_parsed(
-        &parsed_files,
+    analyze_pipeline_from_module_paths(
+        module_paths,
         config,
         layout_provider,
         vinfo_factory,
@@ -624,9 +534,9 @@ pub fn analyze_multiple_pipeline_with_vinfo_and_all_fnaddr_bindings(
     fnaddr_bindings: &FnAddrBindings<'_>,
     impl_fnaddr_bindings: &ImplFnAddrBindings<'_>,
 ) -> pipeline::ProgramPipelineResult {
-    let parsed_files: Vec<_> = sources.iter().map(|s| parse::parse_source(s)).collect();
-    analyze_pipeline_from_parsed(
-        &parsed_files,
+    let module_paths: Vec<&str> = vec![""; sources.len()];
+    analyze_pipeline_from_module_paths(
+        &module_paths,
         config,
         layout_provider,
         vinfo_factory,
@@ -680,7 +590,7 @@ fn register_function_graph_alias(
 
 /// Compute the full alias spelling set for a free function lifted
 /// from a Rust source.  Mirrors the graph-alias loop in
-/// [`analyze_pipeline_from_parsed`] so call-site lookups that key on
+/// [`analyze_pipeline_from_module_paths`] so call-site lookups that key on
 /// these spellings (function_graphs,
 /// elidable/loopinvariant/cannot_collect/oopspec targets) all see
 /// the same FunctionPath set.  Without this, a module-qualified call
@@ -746,8 +656,8 @@ fn free_function_alias_paths(name: &str, source_module: &str) -> Vec<crate::pars
     paths
 }
 
-fn analyze_pipeline_from_parsed(
-    parsed_files: &[parse::ParsedInterpreter],
+fn analyze_pipeline_from_module_paths(
+    module_paths: &[&str],
     config: &AnalyzeConfig,
     layout_provider: Option<&dyn layout::LayoutProvider>,
     vinfo_factory: &VirtualizableInfoFactory<'_>,
@@ -796,7 +706,7 @@ fn analyze_pipeline_from_parsed(
     // `scripts/extract-llbc.sh`), located via `PYRE_MIR_FRONTEND_LLBC`
     // or workspace auto-discovery.
     mark_phase!("known_statics + struct_field_attrs populated");
-    let program = build_semantic_program_via_active_frontend(parsed_files, static_addrs);
+    let program = build_semantic_program_via_active_frontend(module_paths, static_addrs);
     // Publish the `(bare struct leaf → defining crate-relative module
     // path)` map into the process-global `STRUCT_ORIGIN_REGISTRY` so the
     // later `jit_codewriter` `canonical_struct_name` `path_hash` sites
@@ -990,13 +900,6 @@ fn analyze_pipeline_from_parsed(
     // `arraydescrof_concrete` can fold field-level immutability into the
     // shared per-ARRAY descr's `is_pure` flag.
     call_control.recompute_immutable_array_types();
-    // Thread per-source-file `parsed.module_path` into CallControl as a
-    // data carrier (orthodox PyPy `bookkeeper.position` lexical-resolution
-    // entry point).  Today's consumers normalise at the runtime path_hash
-    // boundary via `STRUCT_ORIGIN_REGISTRY` + `canonical_struct_name`; the
-    // carrier here lets a future per-graph lexical resolver land without
-    // re-plumbing the parsed-source ingress.
-    call_control.parsed_module_paths = parsed_files.iter().map(|p| p.module_path.clone()).collect();
     // The `unsafe_fn_stubs` carrier lets the codewriter's
     // `dual_gate_registry` register every `unsafe fn` / unsafe
     // impl-method as a stub-pygraph entry in PyreCallRegistry, covering

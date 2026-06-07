@@ -1,7 +1,7 @@
 //! Pipeline result types.
 //!
 //! Data carriers consumed by codegen + downstream tooling. The
-//! production producer is `lib::analyze_pipeline_from_parsed` (which
+//! production producer is `lib::analyze_pipeline_from_module_paths` (which
 //! drives `build_canonical_opcode_dispatch` to fill `opcode_dispatch`,
 //! `jitcodes`, `insns`, `descrs`).
 

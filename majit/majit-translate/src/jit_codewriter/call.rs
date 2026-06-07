@@ -764,20 +764,6 @@ pub struct CallControl {
     /// itself carries the immutability.  Pyre annotates per-field; the
     /// summary collapses field-level marks to type-level lookup keys.
     pub immutable_array_types: HashSet<String>,
-    /// Per-source-file module path collected from
-    /// `ParsedInterpreter.module_path` (`parse.rs:parse_source_with_module`).
-    /// Indexed by file order at `analyze_pipeline_from_parsed` invocation
-    /// time.  Each entry is the crate-stripped module path
-    /// (`build.rs::module_path_from_source_file`).
-    ///
-    /// PyPy bookkeeper resolves names lexically per source-file scope
-    /// (`bookkeeper.getdesc(value)` + `annrpython.Bookkeeper.position`).
-    /// Pyre's analyzer currently routes the canonicalisation through
-    /// the process-global `STRUCT_ORIGIN_REGISTRY` + `canonical_struct_name`
-    /// (`majit-ir/src/descr.rs:148-225`); this carrier records the
-    /// per-file module path so a future per-graph lexical resolver
-    /// (orthodox PyPy `getdesc` parity) can consume it.
-    pub parsed_module_paths: Vec<String>,
     /// Metadata-only registration carrier — `(segments,
     /// Signature, return_lltype)` for every `unsafe fn` and unsafe
     /// impl-method discovered in the parsed source set.  These callees
@@ -785,7 +771,7 @@ pub struct CallControl {
     /// `sig.unsafety.is_some()` because raw-pointer ops are not
     /// modelled), but `OpKind::Call::FunctionPath` sites still need
     /// the path registered in `PyreCallRegistry`.  Populated by
-    /// `lib.rs::analyze_pipeline_from_parsed` via
+    /// `lib.rs::analyze_pipeline_from_module_paths` via
     /// `flowspace::rust_source::register::extract_unsafe_fn_stubs`;
     /// consumed by
     /// `translator::rtyper::cutover::register_unsafe_fn_stubs` from
@@ -1125,7 +1111,6 @@ impl CallControl {
             oopspec_argnames: HashMap::new(),
             immutable_fields_by_struct: HashMap::new(),
             immutable_array_types: HashSet::new(),
-            parsed_module_paths: Vec::new(),
             unsafe_fn_stubs: Vec::new(),
         }
     }
@@ -1136,7 +1121,7 @@ impl CallControl {
     /// `ImmutableArray` (or `QuasiImmutableArray` for the future quasi-
     /// array path), records the field's type string into the set.
     /// Called after both `immutable_fields_by_struct` and `struct_fields`
-    /// have been populated (`lib.rs::analyze_pipeline_from_parsed`).
+    /// have been populated (`lib.rs::analyze_pipeline_from_module_paths`).
     pub fn recompute_immutable_array_types(&mut self) {
         self.immutable_array_types.clear();
         for (struct_name, fields) in self.immutable_fields_by_struct.iter() {

@@ -3203,7 +3203,7 @@ thread_local! {
 /// through `func_globals` which spans the imported namespace).
 ///
 /// Cross-file aliases are seeded by the top-level pipeline entry
-/// (`analyze_pipeline_from_parsed`) which constructs the union of
+/// (`analyze_pipeline_from_module_paths`) which constructs the union of
 /// every parsed file's top-level `type T = U;` declarations and
 /// installs them via [`Self::enter`] before any per-file walker
 /// runs.
@@ -3249,7 +3249,7 @@ fn walker_type_alias_lookup(name: &str) -> Option<syn::Type> {
 /// type aliases stay visible to every other module's walker pass,
 /// regardless of source-file iteration order.
 ///
-/// Construct one at the top of `analyze_pipeline_from_parsed` (or
+/// Construct one at the top of `analyze_pipeline_from_module_paths` (or
 /// any caller that walks multiple parsed files in sequence) and bind
 /// it as `let _floor = ...;` so it lives across the per-file calls;
 /// drop restores the prior thread-local content.
@@ -3288,7 +3288,7 @@ thread_local! {
     ///
     /// Cross-file struct ptrs are seeded by
     /// [`WalkerStructPtrsFloorGuard::install`] at the top of
-    /// `analyze_pipeline_from_parsed`, so a struct declared in one
+    /// `analyze_pipeline_from_module_paths`, so a struct declared in one
     /// file resolves through this map when a sibling file embeds it
     /// by bare ident.  Per-file / per-mod walker guards merge into
     /// the same map (clone-on-enter, restore-on-drop) so the floor
@@ -3331,7 +3331,7 @@ impl Drop for WalkerStructPtrsGuard {
 /// PyObject` in `bytesobject.rs` resolves through the `PyObject`
 /// minted from `pyobject.rs` regardless of walker iteration order.
 ///
-/// Construct one at the top of `analyze_pipeline_from_parsed` (or
+/// Construct one at the top of `analyze_pipeline_from_module_paths` (or
 /// any caller that walks multiple parsed files in sequence) and bind
 /// it as `let _floor = ...;` so it lives across the per-file calls.
 pub struct WalkerStructPtrsFloorGuard {
@@ -3726,7 +3726,7 @@ fn syn_primitive_to_lltype(ty: &syn::Type) -> Option<LowLevelType> {
 
 /// Pre-pass that mirrors [`build_host_class_from_struct`]'s field
 /// projection but runs on a parsed `syn::File` without driving the
-/// full walker.  The production pipeline (`analyze_pipeline_from_parsed`)
+/// full walker.  The production pipeline (`analyze_pipeline_from_module_paths`)
 /// does not call [`register_rust_module_at_with_source`], which means
 /// [`build_host_class_from_struct`] never fires there and the
 /// `FORCE_ATTRIBUTES_INTO_CLASSES` dict stays unpopulated for parsed-

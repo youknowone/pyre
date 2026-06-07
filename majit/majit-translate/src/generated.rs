@@ -76,7 +76,7 @@
 //!
 //! - Inherent impl methods (e.g. `PyFrame::push`, `PyFrame::pop`) are
 //!   registered via `extract_inherent_impl_methods` in
-//!   `analyze_pipeline_from_parsed`; without them, direct_call targets
+//!   `analyze_pipeline_from_module_paths`; without them, direct_call targets
 //!   like `self.pop()` cannot resolve to a concrete graph.
 //! - `struct_fields` / `known_struct_names` carry array-type identity
 //!   that `extract_trait_impls` consults; an empty context silently
