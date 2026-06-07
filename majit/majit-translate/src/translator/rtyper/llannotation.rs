@@ -463,7 +463,13 @@ impl SomeLLADTMeth {
     /// RPython `SomeLLADTMeth.call(self, args)` (llannotation.py:82-87).
     pub fn call(&self, args: &ArgumentsForTranslation) -> Result<SomeValue, AnnotatorError> {
         let s_func = bookkeeper::immutablevalue(&self.func)?;
-        s_func.call(&args.prepend(lltype_to_annotation(self.ll_ptrtype.clone())))
+        // A low-level adt-method callee always yields a concrete annotation
+        // (`ll_to_annotation(FUNCTYPE.RESULT)` / a function-result PBC), never
+        // the void `None` that a builtin method analyser produces, so the
+        // collapse is a guard rather than a behaviour change.
+        Ok(s_func
+            .call(&args.prepend(lltype_to_annotation(self.ll_ptrtype.clone())))?
+            .unwrap_or(SomeValue::Impossible))
     }
 }
 

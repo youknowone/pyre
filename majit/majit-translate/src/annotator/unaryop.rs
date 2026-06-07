@@ -551,7 +551,7 @@ fn init_someobject_defaults(
         OpKind::SimpleCall,
         SomeValueTag::Object,
         Specialization {
-            apply: pure(|ann, hl| {
+            apply: Box::new(|ann, hl| {
                 // Mirror RPython `unaryop.py:114-118`:
                 //
                 //     s_func = annotator.annotation(func)
@@ -569,13 +569,17 @@ fn init_someobject_defaults(
                 // round re-fires once the callable's annotation
                 // populates).
                 let Some(s_func) = ann.annotation(&hl.args[0]) else {
-                    return super::model::s_impossible_value();
+                    return Some(super::model::s_impossible_value());
                 };
                 let args_s: Vec<Option<SomeValue>> =
                     hl.args[1..].iter().map(|a| ann.annotation(a)).collect();
                 let argspec = super::argument::simple_args_opt(args_s);
+                // `s_func.call` returns `Ok(None)` for a void analyser
+                // (a builtin method body that falls off the end); the
+                // None threads straight through to `consider_op`, which
+                // binds Impossible without blocking.
                 match s_func.call(&argspec) {
-                    Ok(s) => s,
+                    Ok(cell) => cell,
                     // Match upstream's substring so the dual-gate
                     // `is_known_unported` Skip classification matches
                     // RPython's `compute_at_fixpoint` failures
@@ -1200,11 +1204,12 @@ pub fn list_method_append(
     _ann: &RPythonAnnotator,
     s_self: &super::model::SomeList,
     s_value: &SomeValue,
-) -> SomeValue {
-    // unaryop.py:359-361
+) -> Option<SomeValue> {
+    // unaryop.py:357-359 — method_append falls off the end (returns None
+    // = void op), so the call binds Impossible without blocking.
     s_self.listdef.resize().expect("resize");
     s_self.listdef.generalize(s_value).expect("generalize");
-    SomeValue::Impossible
+    None
 }
 
 #[allow(dead_code)]
@@ -1212,8 +1217,8 @@ pub fn list_method_extend(
     ann: &RPythonAnnotator,
     s_self: &super::model::SomeList,
     s_iterable: &SomeValue,
-) -> SomeValue {
-    // unaryop.py:363-369
+) -> Option<SomeValue> {
+    // unaryop.py:361-367 — falls off the end (void op).
     s_self.listdef.resize().expect("resize");
     if let SomeValue::List(other) = s_iterable {
         s_self
@@ -1234,13 +1239,17 @@ pub fn list_method_extend(
         let s_item = someiterator_next(ann, &s_iter);
         list_method_append(ann, s_self, &s_item);
     }
-    SomeValue::Impossible
+    None
 }
 
 #[allow(dead_code)]
-pub fn list_method_reverse(_ann: &RPythonAnnotator, s_self: &super::model::SomeList) -> SomeValue {
+pub fn list_method_reverse(
+    _ann: &RPythonAnnotator,
+    s_self: &super::model::SomeList,
+) -> Option<SomeValue> {
+    // unaryop.py:369-370 — falls off the end (void op).
     s_self.listdef.mutate().expect("listdef.mutate");
-    SomeValue::Impossible
+    None
 }
 
 #[allow(dead_code)]
@@ -1249,8 +1258,8 @@ pub fn list_method_insert(
     s_self: &super::model::SomeList,
     _s_index: &SomeValue,
     s_value: &SomeValue,
-) -> SomeValue {
-    // unaryop.py:374-375 — delegates to method_append.
+) -> Option<SomeValue> {
+    // unaryop.py:372-373 — delegates to method_append (also void).
     list_method_append(ann, s_self, s_value)
 }
 
@@ -1259,11 +1268,11 @@ pub fn list_method_remove(
     _ann: &RPythonAnnotator,
     s_self: &super::model::SomeList,
     s_value: &SomeValue,
-) -> SomeValue {
-    // unaryop.py:377-379 — resize + generalize.
+) -> Option<SomeValue> {
+    // unaryop.py:375-377 — resize + generalize, falls off the end (void).
     s_self.listdef.resize().expect("resize");
     s_self.listdef.generalize(s_value).expect("generalize");
-    SomeValue::Impossible
+    None
 }
 
 #[allow(dead_code)]
@@ -1442,12 +1451,14 @@ pub fn dict_method_update(
     _ann: &RPythonAnnotator,
     s_self: &super::model::SomeDict,
     s_other: &SomeValue,
-) -> SomeValue {
-    // unaryop.py:513-516
+) -> Option<SomeValue> {
+    // unaryop.py:512-515
     //     if s_None.contains(dct2): return SomeImpossibleValue()
     //     dct1.dictdef.union(dct2.dictdef)
+    // The explicit `return SomeImpossibleValue()` blocks; the union path
+    // falls off the end (void op).
     if let SomeValue::None_(_) = s_other {
-        return s_impossible_value();
+        return Some(s_impossible_value());
     }
     let other = match s_other {
         SomeValue::Dict(d) => d,
@@ -1457,7 +1468,7 @@ pub fn dict_method_update(
         .dictdef
         .union_with(&other.dictdef)
         .expect("dictdef.union failed");
-    SomeValue::Impossible
+    None
 }
 
 #[allow(dead_code)]
@@ -1465,9 +1476,9 @@ pub fn dict_method_prepare_dict_update(
     _ann: &RPythonAnnotator,
     _s_self: &super::model::SomeDict,
     _s_num: &SomeValue,
-) -> SomeValue {
-    // unaryop.py:518-519 — pass.
-    SomeValue::Impossible
+) -> Option<SomeValue> {
+    // unaryop.py:517-518 — pass (void op).
+    None
 }
 
 #[allow(dead_code)]
@@ -1560,9 +1571,12 @@ pub fn dict_method_iteritems_with_hash(
 }
 
 #[allow(dead_code)]
-pub fn dict_method_clear(_ann: &RPythonAnnotator, _s_self: &super::model::SomeDict) -> SomeValue {
-    // unaryop.py:548-549 — pass.
-    SomeValue::Impossible
+pub fn dict_method_clear(
+    _ann: &RPythonAnnotator,
+    _s_self: &super::model::SomeDict,
+) -> Option<SomeValue> {
+    // unaryop.py:547-548 — pass (void op).
+    None
 }
 
 #[allow(dead_code)]
@@ -1613,8 +1627,9 @@ pub fn dict_method_setitem_with_hash(
     s_key: &SomeValue,
     _s_hash: &SomeValue,
     s_value: &SomeValue,
-) -> SomeValue {
-    // unaryop.py:567-568.
+) -> Option<SomeValue> {
+    // unaryop.py:566-567 — pair(self, s_key).setitem(s_value), falls off
+    // the end (void op).
     s_self
         .dictdef
         .generalize_key(s_key)
@@ -1623,7 +1638,7 @@ pub fn dict_method_setitem_with_hash(
         .dictdef
         .generalize_value(s_value)
         .expect("generalize_value failed");
-    SomeValue::Impossible
+    None
 }
 
 #[allow(dead_code)]
@@ -1648,13 +1663,14 @@ pub fn dict_method_delitem_with_hash(
     s_self: &super::model::SomeDict,
     s_key: &SomeValue,
     _s_hash: &SomeValue,
-) -> SomeValue {
-    // unaryop.py:576-577.
+) -> Option<SomeValue> {
+    // unaryop.py:575-576 — pair(self, s_key).delitem(), falls off the end
+    // (void op).
     s_self
         .dictdef
         .generalize_key(s_key)
         .expect("generalize_key failed");
-    SomeValue::Impossible
+    None
 }
 
 #[allow(dead_code)]
@@ -1663,8 +1679,8 @@ pub fn dict_method_delitem_if_value_is(
     s_self: &super::model::SomeDict,
     s_key: &SomeValue,
     s_value: &SomeValue,
-) -> SomeValue {
-    // unaryop.py:579-581.
+) -> Option<SomeValue> {
+    // unaryop.py:578-580 — setitem + delitem, falls off the end (void op).
     let _ = dict_method_setitem_with_hash(ann, s_self, s_key, &s_impossible_value(), s_value);
     dict_method_delitem_with_hash(ann, s_self, s_key, &s_impossible_value())
 }
@@ -1675,9 +1691,10 @@ pub fn dict_method_move_to_end(
     s_self: &super::model::SomeDict,
     s_key: &SomeValue,
     s_last: &SomeValue,
-) -> SomeValue {
-    // unaryop.py:588-591 on SomeOrderedDict. Rust collapses SomeDict =
-    // SomeOrderedDict (model.py:416), so the same analyzer lives on SomeDict.
+) -> Option<SomeValue> {
+    // unaryop.py:585-588 on SomeOrderedDict. Rust collapses SomeDict =
+    // SomeOrderedDict (model.py:416), so the same analyzer lives on
+    // SomeDict. assert + delitem, falls off the end (void op).
     assert!(
         s_bool().contains(s_last),
         "AnnotatorError: move_to_end(last) expects SomeBool"
@@ -2504,7 +2521,7 @@ pub fn call_builtin_method(
     ann: &RPythonAnnotator,
     method: &SomeBuiltinMethod,
     args: &super::argument::ArgumentsForTranslation,
-) -> Result<SomeValue, AnnotatorError> {
+) -> Result<Option<SomeValue>, AnnotatorError> {
     let (args_s, kwds) = args
         .unpack()
         .map_err(|err| AnnotatorError::new(err.getmsg()))?;
@@ -2528,7 +2545,9 @@ pub fn call_builtin_method(
             let [s_value] = scope.as_slice() else {
                 unreachable!();
             };
-            list_method_append(ann, s_self, s_value)
+            // Void analyser (None = no result): early-return the threaded
+            // Option so the simple_call binds Impossible without blocking.
+            return Ok(list_method_append(ann, s_self, s_value));
         }
         "list_method_extend" => {
             let SomeValue::List(s_self) = &*method.s_self else {
@@ -2544,7 +2563,7 @@ pub fn call_builtin_method(
             let [s_iterable] = scope.as_slice() else {
                 unreachable!();
             };
-            list_method_extend(ann, s_self, s_iterable)
+            return Ok(list_method_extend(ann, s_self, s_iterable));
         }
         "list_method_reverse" => {
             let SomeValue::List(s_self) = &*method.s_self else {
@@ -2554,7 +2573,7 @@ pub fn call_builtin_method(
             let [] = scope.as_slice() else {
                 unreachable!();
             };
-            list_method_reverse(ann, s_self)
+            return Ok(list_method_reverse(ann, s_self));
         }
         "list_method_insert" => {
             let SomeValue::List(s_self) = &*method.s_self else {
@@ -2570,7 +2589,7 @@ pub fn call_builtin_method(
             let [s_index, s_value] = scope.as_slice() else {
                 unreachable!();
             };
-            list_method_insert(ann, s_self, s_index, s_value)
+            return Ok(list_method_insert(ann, s_self, s_index, s_value));
         }
         "list_method_remove" => {
             let SomeValue::List(s_self) = &*method.s_self else {
@@ -2581,7 +2600,7 @@ pub fn call_builtin_method(
             let [s_value] = scope.as_slice() else {
                 unreachable!();
             };
-            list_method_remove(ann, s_self, s_value)
+            return Ok(list_method_remove(ann, s_self, s_value));
         }
         "list_method_pop" => {
             let SomeValue::List(s_self) = &*method.s_self else {
@@ -2649,7 +2668,9 @@ pub fn call_builtin_method(
             let [s_other] = scope.as_slice() else {
                 unreachable!();
             };
-            dict_method_update(ann, s_self, s_other)
+            // Void on the union path, blocks (Some(Impossible)) on the
+            // s_None receiver path — see dict_method_update.
+            return Ok(dict_method_update(ann, s_self, s_other));
         }
         "dict_method_prepare_dict_update" => {
             let SomeValue::Dict(s_self) = &*method.s_self else {
@@ -2660,7 +2681,7 @@ pub fn call_builtin_method(
             let [s_num] = scope.as_slice() else {
                 unreachable!();
             };
-            dict_method_prepare_dict_update(ann, s_self, s_num)
+            return Ok(dict_method_prepare_dict_update(ann, s_self, s_num));
         }
         "dict_method_keys" => {
             let SomeValue::Dict(s_self) = &*method.s_self else {
@@ -2750,7 +2771,7 @@ pub fn call_builtin_method(
             let [] = scope.as_slice() else {
                 unreachable!();
             };
-            dict_method_clear(ann, s_self)
+            return Ok(dict_method_clear(ann, s_self));
         }
         "dict_method_popitem" => {
             let SomeValue::Dict(s_self) = &*method.s_self else {
@@ -2812,7 +2833,9 @@ pub fn call_builtin_method(
             let [s_key, s_hash, s_value] = scope.as_slice() else {
                 unreachable!();
             };
-            dict_method_setitem_with_hash(ann, s_self, s_key, s_hash, s_value)
+            return Ok(dict_method_setitem_with_hash(
+                ann, s_self, s_key, s_hash, s_value,
+            ));
         }
         "dict_method_getitem_with_hash" => {
             let SomeValue::Dict(s_self) = &*method.s_self else {
@@ -2844,7 +2867,7 @@ pub fn call_builtin_method(
             let [s_key, s_hash] = scope.as_slice() else {
                 unreachable!();
             };
-            dict_method_delitem_with_hash(ann, s_self, s_key, s_hash)
+            return Ok(dict_method_delitem_with_hash(ann, s_self, s_key, s_hash));
         }
         "dict_method_delitem_if_value_is" => {
             let SomeValue::Dict(s_self) = &*method.s_self else {
@@ -2860,7 +2883,7 @@ pub fn call_builtin_method(
             let [s_key, s_value] = scope.as_slice() else {
                 unreachable!();
             };
-            dict_method_delitem_if_value_is(ann, s_self, s_key, s_value)
+            return Ok(dict_method_delitem_if_value_is(ann, s_self, s_key, s_value));
         }
         "dict_method_move_to_end" => {
             let SomeValue::Dict(s_self) = &*method.s_self else {
@@ -2876,7 +2899,7 @@ pub fn call_builtin_method(
             let [s_key, s_last] = scope.as_slice() else {
                 unreachable!();
             };
-            dict_method_move_to_end(ann, s_self, s_key, s_last)
+            return Ok(dict_method_move_to_end(ann, s_self, s_key, s_last));
         }
         "str_method_startswith" => {
             let scope =
@@ -3180,7 +3203,10 @@ pub fn call_builtin_method(
             )));
         }
     };
-    Ok(result)
+    // Value analysers return a concrete annotation (possibly Bottom =
+    // SomeImpossibleValue when reading an empty container, which blocks);
+    // the void analysers above already early-returned their `None`.
+    Ok(Some(result))
 }
 
 // =====================================================================
@@ -5333,7 +5359,7 @@ mod tests {
             SomeInteger::default(),
         )]));
         let result = list_method_extend(&ann, &s_list, &s_iterable);
-        assert!(matches!(result, SomeValue::Impossible));
+        assert!(result.is_none(), "method_extend is a void analyser → None");
         assert!(matches!(
             s_list.listdef.read_item(None),
             SomeValue::Integer(_)
@@ -5357,7 +5383,7 @@ mod tests {
             None,
         );
         let result = call_builtin_method(&ann, &method, &args).expect("builtin call must bind");
-        assert!(matches!(result, SomeValue::Integer(_)));
+        assert!(matches!(result, Some(SomeValue::Integer(_))));
     }
 
     #[test]
@@ -5402,7 +5428,7 @@ mod tests {
         let args = super::super::argument::ArgumentsForTranslation::new(vec![], None, None);
         let result =
             call_builtin_method(&ann, &method, &args).expect("is_null bound method must call");
-        assert!(matches!(result, SomeValue::Bool(_)));
+        assert!(matches!(result, Some(SomeValue::Bool(_))));
     }
 
     #[test]
@@ -5533,6 +5559,6 @@ mod tests {
             None,
         );
         let result = call_builtin_method(&ann, &method, &args).expect("builtin call must bind");
-        assert!(matches!(result, SomeValue::Bool(_)));
+        assert!(matches!(result, Some(SomeValue::Bool(_))));
     }
 }

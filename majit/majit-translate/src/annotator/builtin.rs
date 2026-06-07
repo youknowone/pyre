@@ -1981,7 +1981,7 @@ mod tests {
         let s_result = s_callee
             .call(&args)
             .expect("SomeBuiltin.call should dispatch");
-        assert!(matches!(s_result, SomeValue::List(_)));
+        assert!(matches!(s_result, Some(SomeValue::List(_))));
 
         bk.leave();
     }

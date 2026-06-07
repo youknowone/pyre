@@ -1674,11 +1674,12 @@ impl SomeBuiltinMethod {
     }
 
     /// RPython `SomeBuiltinMethod.call(self, args, implicit_init=False)`
-    /// (unaryop.py:961-967).
+    /// (unaryop.py:961-967). Returns `None` for a void analyser (a method
+    /// body that falls off the end), `Some(_)` otherwise.
     pub fn call(
         &self,
         args: &super::argument::ArgumentsForTranslation,
-    ) -> Result<SomeValue, AnnotatorError> {
+    ) -> Result<Option<SomeValue>, AnnotatorError> {
         let bk = super::bookkeeper::getbookkeeper().ok_or_else(|| {
             AnnotatorError::new("SomeBuiltinMethod.call() called without an active bookkeeper")
         })?;
@@ -2190,21 +2191,29 @@ impl SomeValue {
     /// RPython `SomeObject.call(self, args, implicit_init=False)` and the
     /// `SomeBuiltinMethod` / `SomePBC` / `SomeNone` overrides
     /// (unaryop.py:237-238, 961-967, 985-987, 1011-1012).
+    ///
+    /// Returns `Ok(None)` for a void result — a builtin method analyser
+    /// whose body falls off the end (`unaryop.py:114-118 simple_call`
+    /// returns `s_func.call(argspec)`, which may be Python `None`). All
+    /// other callable kinds yield a concrete annotation wrapped in
+    /// `Some(_)`; an unrefined/None receiver still blocks via
+    /// `Some(SomeImpossibleValue())`.
     pub fn call(
         &self,
         args: &super::argument::ArgumentsForTranslation,
-    ) -> Result<SomeValue, AnnotatorError> {
+    ) -> Result<Option<SomeValue>, AnnotatorError> {
         match self {
             SomeValue::PBC(pbc) => {
                 let bk = super::bookkeeper::getbookkeeper().ok_or_else(|| {
                     AnnotatorError::new("SomePBC.call() called without an active bookkeeper")
                 })?;
                 bk.pbc_call(pbc, args, super::bookkeeper::PbcCallEmulated::None)
+                    .map(Some)
             }
-            SomeValue::Ptr(ptr) => ptr.call(args),
-            SomeValue::InteriorPtr(ptr) => ptr.call(args),
-            SomeValue::LLADTMeth(adtmeth) => adtmeth.call(args),
-            SomeValue::None_(_) => Ok(s_impossible_value()),
+            SomeValue::Ptr(ptr) => ptr.call(args).map(Some),
+            SomeValue::InteriorPtr(ptr) => ptr.call(args).map(Some),
+            SomeValue::LLADTMeth(adtmeth) => adtmeth.call(args).map(Some),
+            SomeValue::None_(_) => Ok(Some(s_impossible_value())),
             SomeValue::BuiltinMethod(method) => method.call(args),
             SomeValue::Builtin(sb) => {
                 // upstream `SomeBuiltin.call(args)` (unaryop.py:940-946):
@@ -2264,9 +2273,9 @@ impl SomeValue {
                             | crate::translator::rtyper::extregistry::ExtRegistryEntry::ForType { .. }
                     )
                 {
-                    return entry.compute_annotation_with_kwds(&bk, &kwds_s);
+                    return entry.compute_annotation_with_kwds(&bk, &kwds_s).map(Some);
                 }
-                super::builtin::call_builtin(&bk, &sb.analyser_name, &args_s_opt, &kwds_s)
+                super::builtin::call_builtin(&bk, &sb.analyser_name, &args_s_opt, &kwds_s).map(Some)
             }
             _ => Err(AnnotatorError::new(
                 "Cannot prove that the object is callable",
@@ -3990,7 +3999,7 @@ mod tests {
         let result = s
             .call(&args)
             .expect("SomeValue::call must route SomePtr through SomePtr.call");
-        assert!(matches!(result, SomeValue::Bool(_)));
+        assert!(matches!(result, Some(SomeValue::Bool(_))));
     }
 
     #[test]
@@ -4235,7 +4244,7 @@ mod tests {
 
         let result = method.call(&args).expect("append call must succeed");
 
-        assert!(matches!(result, SomeValue::Impossible));
+        assert!(result.is_none(), "method_append is a void analyser → None");
         let SomeValue::Integer(item) = list.listdef.s_value() else {
             panic!("expected SomeInteger list item");
         };
