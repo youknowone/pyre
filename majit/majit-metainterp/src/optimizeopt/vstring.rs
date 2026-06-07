@@ -842,6 +842,15 @@ impl OptString {
     }
 
     fn force_args_if_virtual(&mut self, op: &Op, ctx: &mut OptContext) {
+        // earlyforce.py exempt set: SETFIELD_GC, SETARRAYITEM_GC, SAME_AS_*,
+        // QUASIIMMUT_FIELD, raw_free do NOT force their args (the value of a
+        // store can stay virtual). OptString is not RPython's forcing pass —
+        // earlyforce is — so it must honor the same exemptions, else a virtual
+        // stored into a non-virtual object (e.g. the exc published to the EC)
+        // gets materialized here at pass 3 instead of routed to pendingfields.
+        if !crate::optimizeopt::earlyforce::OptEarlyForce::should_force_args(op) {
+            return;
+        }
         // Collect refs first to avoid borrow issues.
         let args: Vec<OpRef> = op
             .getarglist()

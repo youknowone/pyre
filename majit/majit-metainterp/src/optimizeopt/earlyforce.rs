@@ -40,7 +40,7 @@ impl OptEarlyForce {
     /// RPython exempt set: SETFIELD_GC, SETARRAYITEM_GC, SETARRAYITEM_RAW,
     /// QUASIIMMUT_FIELD, SAME_AS_I/R/F, and raw_free. Note that
     /// SETFIELD_RAW is NOT exempt in RPython.
-    fn should_force_args(op: &Op) -> bool {
+    pub(crate) fn should_force_args(op: &Op) -> bool {
         !matches!(
             op.opcode,
             OpCode::SetfieldGc
