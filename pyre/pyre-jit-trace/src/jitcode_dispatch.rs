@@ -4155,7 +4155,7 @@ fn collect_outer_active_boxes(
 /// `store_final_boxes_in_guard` (`optimizeopt/mod.rs:5033`) finds
 /// `rd_resume_position >= 0` and can derive `op.fail_args` from the
 /// snapshot via `op.store_final_boxes(liveboxes)` instead of panicking.
-fn walker_capture_snapshot_for_last_guard(ctx: &mut WalkContext<'_, '_>, op_pc: usize) {
+pub(crate) fn walker_capture_snapshot_for_last_guard(ctx: &mut WalkContext<'_, '_>, op_pc: usize) {
     // Snapshot semantics for walker-emitted guards
     // (`pyjitpl.py:2582-2603 generate_guard` + `capture_resumedata`):
     //
