@@ -2255,38 +2255,41 @@ pub(crate) fn opimpl_getfield_gc_r(ctx: &mut TraceCtx, obj: OpRef, descr: DescrR
 // the GC op without folding. The optimizer's `optimize_GETFIELD_GC_F`
 // (= `optimize_GETFIELD_GC_I` via RPython's alias) handles folding.
 
-/// Unbox int with proper GuardClass resume data via MIFrame::generate_guard.
-pub(crate) fn trace_unbox_int_with_resume(
-    frame: &mut MIFrame,
-    ctx: &mut TraceCtx,
+/// Unbox int with proper GuardClass resume data via the frame impl's
+/// `generate_guard`.  Generic over `WalkerFrameOps` so both `MIFrame`
+/// (trait dispatch) and `WalkContext` (walker dispatch) can invoke the
+/// same lowering.
+pub(crate) fn trace_unbox_int_with_resume<F: crate::walker_frame_ops::WalkerFrameOps>(
+    frame: &mut F,
     obj: OpRef,
     int_type_addr: i64,
 ) -> OpRef {
     trace_unbox_int_with_resume_descr(
         frame,
-        ctx,
         obj,
         int_type_addr,
         crate::descr::int_intval_descr(),
     )
 }
 
-pub(crate) fn trace_unbox_int_with_resume_descr(
-    frame: &mut MIFrame,
-    ctx: &mut TraceCtx,
+pub(crate) fn trace_unbox_int_with_resume_descr<F: crate::walker_frame_ops::WalkerFrameOps>(
+    frame: &mut F,
     obj: OpRef,
     type_addr: i64,
     intval_descr: majit_ir::DescrRef,
 ) -> OpRef {
     // pyjitpl.py GUARD_CLASS(box, cls): guard takes object box directly,
     // backend loads typeptr at offset 0.
-    if !ctx.heap_cache().is_class_known(obj) {
-        let type_const = ctx.const_int(type_addr);
-        frame.generate_guard(ctx, OpCode::GuardClass, &[obj, type_const]);
-        ctx.heap_cache_mut().class_now_known(obj, type_addr);
+    if !frame.ctx().heap_cache().is_class_known(obj) {
+        let type_const = frame.ctx_mut().const_int(type_addr);
+        frame.generate_guard(OpCode::GuardClass, &[obj, type_const]);
+        frame
+            .ctx_mut()
+            .heap_cache_mut()
+            .class_now_known(obj, type_addr);
     }
     crate::generated::trace_unbox_int(
-        ctx,
+        frame.ctx_mut(),
         obj,
         type_addr,
         crate::descr::ob_type_descr(),
@@ -2311,42 +2314,54 @@ pub(crate) fn trace_unbox_int_with_resume_descr(
 ///    `W_LongObject.toint()` (`longobject.py:138`) → `rbigint.toint()`
 ///    (`rbigint.py:465`, elidable). OverflowError is statically
 ///    unreachable post-fits-int GUARD_TRUE.
-pub(crate) fn trace_unbox_long_with_resume(
-    frame: &mut MIFrame,
-    ctx: &mut TraceCtx,
+pub(crate) fn trace_unbox_long_with_resume<F: crate::walker_frame_ops::WalkerFrameOps>(
+    frame: &mut F,
     obj: OpRef,
     long_type_addr: i64,
 ) -> OpRef {
-    if !ctx.heap_cache().is_class_known(obj) {
-        let type_const = ctx.const_int(long_type_addr);
-        frame.generate_guard(ctx, OpCode::GuardClass, &[obj, type_const]);
-        ctx.heap_cache_mut().class_now_known(obj, long_type_addr);
+    if !frame.ctx().heap_cache().is_class_known(obj) {
+        let type_const = frame.ctx_mut().const_int(long_type_addr);
+        frame.generate_guard(OpCode::GuardClass, &[obj, type_const]);
+        frame
+            .ctx_mut()
+            .heap_cache_mut()
+            .class_now_known(obj, long_type_addr);
     }
-    let fits_fn =
-        ctx.const_int(pyre_object::longobject::jit_w_long_fits_int as *const () as usize as i64);
+    let fits_fn = frame
+        .ctx_mut()
+        .const_int(pyre_object::longobject::jit_w_long_fits_int as *const () as usize as i64);
     let fits_descr = crate::descr::make_jit_w_long_fits_int_calldescr();
-    let fits_result = ctx.record_op_with_descr(OpCode::CallI, &[fits_fn, obj], fits_descr);
-    frame.generate_guard(ctx, OpCode::GuardTrue, &[fits_result]);
-    let unbox_fn =
-        ctx.const_int(pyre_object::longobject::jit_w_long_toint as *const () as usize as i64);
+    let fits_result =
+        frame
+            .ctx_mut()
+            .record_op_with_descr(OpCode::CallI, &[fits_fn, obj], fits_descr);
+    frame.generate_guard(OpCode::GuardTrue, &[fits_result]);
+    let unbox_fn = frame
+        .ctx_mut()
+        .const_int(pyre_object::longobject::jit_w_long_toint as *const () as usize as i64);
     let unbox_descr = crate::descr::make_jit_w_long_toint_calldescr();
-    ctx.record_op_with_descr(OpCode::CallI, &[unbox_fn, obj], unbox_descr)
+    frame
+        .ctx_mut()
+        .record_op_with_descr(OpCode::CallI, &[unbox_fn, obj], unbox_descr)
 }
 
-/// Unbox float with proper GuardClass resume data via MIFrame::generate_guard.
-pub(crate) fn trace_unbox_float_with_resume(
-    frame: &mut MIFrame,
-    ctx: &mut TraceCtx,
+/// Unbox float with proper GuardClass resume data via the frame impl's
+/// `generate_guard`.  Generic over `WalkerFrameOps`.
+pub(crate) fn trace_unbox_float_with_resume<F: crate::walker_frame_ops::WalkerFrameOps>(
+    frame: &mut F,
     obj: OpRef,
     float_type_addr: i64,
 ) -> OpRef {
-    if !ctx.heap_cache().is_class_known(obj) {
-        let type_const = ctx.const_int(float_type_addr);
-        frame.generate_guard(ctx, OpCode::GuardClass, &[obj, type_const]);
-        ctx.heap_cache_mut().class_now_known(obj, float_type_addr);
+    if !frame.ctx().heap_cache().is_class_known(obj) {
+        let type_const = frame.ctx_mut().const_int(float_type_addr);
+        frame.generate_guard(OpCode::GuardClass, &[obj, type_const]);
+        frame
+            .ctx_mut()
+            .heap_cache_mut()
+            .class_now_known(obj, float_type_addr);
     }
     crate::generated::trace_unbox_float(
-        ctx,
+        frame.ctx_mut(),
         obj,
         float_type_addr,
         crate::descr::ob_type_descr(),
@@ -9160,7 +9175,6 @@ mod tests {
             };
             trace_unbox_int_with_resume(
                 &mut state,
-                &mut ctx,
                 int_obj,
                 &INT_TYPE as *const PyType as i64,
             )

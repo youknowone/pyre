@@ -1077,12 +1077,12 @@ pub fn generated_binary_int_value(
     let lhs_raw = if frame.value_type(a) == majit_ir::Type::Int {
         a
     } else {
-        crate::state::trace_unbox_int_with_resume(frame, ctx, a, int_type_addr)
+        crate::state::trace_unbox_int_with_resume(frame, a, int_type_addr)
     };
     let rhs_raw = if frame.value_type(b) == majit_ir::Type::Int {
         b
     } else {
-        crate::state::trace_unbox_int_with_resume(frame, ctx, b, int_type_addr)
+        crate::state::trace_unbox_int_with_resume(frame, b, int_type_addr)
     };
 
     // The inlined `_ovf_zer` wrapper (`rint.py:429 ll_int_py_div_
@@ -1309,7 +1309,7 @@ pub fn generated_binary_float_value(
             let raw_int = if frame.value_type(obj) == majit_ir::Type::Int {
                 obj
             } else {
-                crate::state::trace_unbox_int_with_resume(frame, ctx, obj, int_type_addr)
+                crate::state::trace_unbox_int_with_resume(frame, obj, int_type_addr)
             };
             let r = ctx.record_op(OpCode::CastIntToFloat, &[raw_int]);
             // Box(value) parity: derive concrete float from the int's
@@ -1405,14 +1405,14 @@ pub fn generated_compare_value_direct(
             } else if let Some(raw) = crate::state::try_trace_const_boxed_int(ctx, a, concrete_lhs) {
                 raw
             } else {
-                crate::state::trace_unbox_int_with_resume(frame, ctx, a, int_type_addr)
+                crate::state::trace_unbox_int_with_resume(frame, a, int_type_addr)
             };
             let rhs_raw = if frame.value_type(b) == majit_ir::Type::Int {
                 b
             } else if let Some(raw) = crate::state::try_trace_const_boxed_int(ctx, b, concrete_rhs) {
                 raw
             } else {
-                crate::state::trace_unbox_int_with_resume(frame, ctx, b, int_type_addr)
+                crate::state::trace_unbox_int_with_resume(frame, b, int_type_addr)
             };
             let truth = ctx.record_op(cmp, &[lhs_raw, rhs_raw]);
             // Box(value) parity: stamp the bool result from the operands'
@@ -1463,7 +1463,7 @@ pub fn generated_compare_value_direct(
                 let raw_int = if frame.value_type(a) == majit_ir::Type::Int {
                     a
                 } else {
-                    crate::state::trace_unbox_int_with_resume(frame, ctx, a, int_type_addr)
+                    crate::state::trace_unbox_int_with_resume(frame, a, int_type_addr)
                 };
                 let cast = ctx.record_op(majit_ir::OpCode::CastIntToFloat, &[raw_int]);
                 // Box(value) parity: derive concrete float from the int's
@@ -1473,7 +1473,7 @@ pub fn generated_compare_value_direct(
                 }
                 cast
             } else {
-                crate::state::trace_unbox_float_with_resume(frame, ctx, a, float_type_addr)
+                crate::state::trace_unbox_float_with_resume(frame, a, float_type_addr)
             };
             // Unbox rhs: same pattern
             let rhs_raw = if frame.value_type(b) == majit_ir::Type::Float {
@@ -1482,7 +1482,7 @@ pub fn generated_compare_value_direct(
                 let raw_int = if frame.value_type(b) == majit_ir::Type::Int {
                     b
                 } else {
-                    crate::state::trace_unbox_int_with_resume(frame, ctx, b, int_type_addr)
+                    crate::state::trace_unbox_int_with_resume(frame, b, int_type_addr)
                 };
                 let cast = ctx.record_op(majit_ir::OpCode::CastIntToFloat, &[raw_int]);
                 if let Some(majit_ir::Value::Int(n)) = ctx.box_value(raw_int) {
@@ -1490,7 +1490,7 @@ pub fn generated_compare_value_direct(
                 }
                 cast
             } else {
-                crate::state::trace_unbox_float_with_resume(frame, ctx, b, float_type_addr)
+                crate::state::trace_unbox_float_with_resume(frame, b, float_type_addr)
             };
             let truth = ctx.record_op(cmp, &[lhs_raw, rhs_raw]);
             // Box(value) parity: stamp the float-compare bool result.
@@ -1542,7 +1542,7 @@ pub fn generated_unary_int_value(
         value
     } else {
         let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
-        crate::state::trace_unbox_int_with_resume(frame, ctx, value, int_type_addr)
+        crate::state::trace_unbox_int_with_resume(frame, value, int_type_addr)
     };
     // intobject.py int_neg: guard against INT_MIN (overflow to long).
     if matches!(opcode, OpCode::IntNeg) {
@@ -1766,7 +1766,7 @@ pub fn generated_list_setitem_by_strategy(
                 value
             } else {
                 let float_type_addr = &pyre_object::pyobject::FLOAT_TYPE as *const _ as i64;
-                crate::state::trace_unbox_float_with_resume(frame, ctx, value, float_type_addr)
+                crate::state::trace_unbox_float_with_resume(frame, value, float_type_addr)
             };
             crate::state::trace_raw_float_array_setitem_value(ctx, items_ptr, index, raw);
         }
@@ -1899,10 +1899,10 @@ fn unbox_int_or_long_for_int_strategy(
     }
     if unbox_long {
         let long_type_addr = &pyre_object::pyobject::LONG_TYPE as *const _ as i64;
-        crate::state::trace_unbox_long_with_resume(frame, ctx, value, long_type_addr)
+        crate::state::trace_unbox_long_with_resume(frame, value, long_type_addr)
     } else {
         let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
-        crate::state::trace_unbox_int_with_resume(frame, ctx, value, int_type_addr)
+        crate::state::trace_unbox_int_with_resume(frame, value, int_type_addr)
     }
 }
 
@@ -1964,7 +1964,7 @@ pub fn generated_truth_value_direct(
             {
                 raw
             } else {
-                crate::state::trace_unbox_int_with_resume(frame, ctx, value, int_type_addr)
+                crate::state::trace_unbox_int_with_resume(frame, value, int_type_addr)
             };
             let zero = ctx.const_int(0);
             let truth = ctx.record_op(OpCode::IntNe, &[int_value, zero]);
@@ -1982,7 +1982,7 @@ pub fn generated_truth_value_direct(
                 raw
             } else {
                 crate::state::trace_unbox_int_with_resume_descr(
-                    frame, ctx, value, bool_type_addr,
+                    frame, value, bool_type_addr,
                     crate::descr::bool_boolval_descr(),
                 )
             };
@@ -2002,7 +2002,7 @@ pub fn generated_truth_value_direct(
         if pyre_object::is_float(concrete_val) {
             let float_type_addr = &pyre_object::pyobject::FLOAT_TYPE as *const _ as i64;
             let float_value = crate::state::trace_unbox_float_with_resume(
-                frame, ctx, value, float_type_addr,
+                frame, value, float_type_addr,
             );
             let zero = ctx.const_int(0);
             let zero_float = ctx.record_op(OpCode::CastIntToFloat, &[zero]);
@@ -2167,7 +2167,7 @@ pub fn generated_list_append_by_strategy(
                 value
             } else {
                 let float_type_addr = &pyre_object::pyobject::FLOAT_TYPE as *const _ as i64;
-                crate::state::trace_unbox_float_with_resume(frame, ctx, value, float_type_addr)
+                crate::state::trace_unbox_float_with_resume(frame, value, float_type_addr)
             };
             crate::state::trace_raw_float_array_setitem_value(ctx, items_ptr, len, raw);
         }
@@ -2672,7 +2672,7 @@ pub fn generated_tuple_getitem(
             key
         } else {
             let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
-            crate::state::trace_unbox_int_with_resume(frame, ctx, key, int_type_addr)
+            crate::state::trace_unbox_int_with_resume(frame, key, int_type_addr)
         };
         frame.implement_guard_value(ctx, key_unboxed, concrete_key);
         let descr = if normalised == 0 {
@@ -2703,7 +2703,7 @@ pub fn generated_tuple_getitem(
             key
         } else {
             let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
-            crate::state::trace_unbox_int_with_resume(frame, ctx, key, int_type_addr)
+            crate::state::trace_unbox_int_with_resume(frame, key, int_type_addr)
         };
         frame.implement_guard_value(ctx, key_unboxed, concrete_key);
         let descr = if normalised == 0 {
@@ -2732,7 +2732,7 @@ pub fn generated_tuple_getitem(
             key
         } else {
             let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
-            crate::state::trace_unbox_int_with_resume(frame, ctx, key, int_type_addr)
+            crate::state::trace_unbox_int_with_resume(frame, key, int_type_addr)
         };
         frame.implement_guard_value(ctx, key_unboxed, concrete_key);
         let descr = if normalised == 0 {
@@ -2803,7 +2803,7 @@ pub fn opimpl_check_neg_index(
     let raw_index = if frame.value_type(indexbox) == majit_ir::Type::Int {
         indexbox
     } else {
-        crate::state::trace_unbox_int_with_resume(frame, ctx, indexbox, int_type_addr)
+        crate::state::trace_unbox_int_with_resume(frame, indexbox, int_type_addr)
     };
     // Box(value) parity: stamp the unboxed index with its concrete.
     ctx.set_opref_concrete(raw_index, majit_ir::Value::Int(concrete_key));
@@ -2868,7 +2868,7 @@ pub fn opimpl_check_resizable_neg_index(
     let raw_index = if frame.value_type(indexbox) == majit_ir::Type::Int {
         indexbox
     } else {
-        crate::state::trace_unbox_int_with_resume(frame, ctx, indexbox, int_type_addr)
+        crate::state::trace_unbox_int_with_resume(frame, indexbox, int_type_addr)
     };
     ctx.set_opref_concrete(raw_index, majit_ir::Value::Int(concrete_key));
     let zero = ctx.const_int(0);
@@ -2924,7 +2924,7 @@ pub fn generated_dynamic_list_index(
     let raw_index = if frame.value_type(key) == majit_ir::Type::Int {
         key
     } else {
-        crate::state::trace_unbox_int_with_resume(frame, ctx, key, int_type_addr)
+        crate::state::trace_unbox_int_with_resume(frame, key, int_type_addr)
     };
     ctx.set_opref_concrete(raw_index, majit_ir::Value::Int(concrete_key));
     let zero = ctx.const_int(0);
