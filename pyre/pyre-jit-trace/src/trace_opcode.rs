@@ -4175,6 +4175,123 @@ impl MIFrame {
         }
     }
 
+    /// Issue #143 M-core3: emit the `list.append`/`list.pop` resize
+    /// `GuardTrue` whose resume captures a synthetic-callee framestack —
+    /// the runtime-helper jitcode (folded `jit_list_append`) as the
+    /// innermost/top frame, the current Python frame demoted to its
+    /// immediate caller resuming at the post-CALL `fallthrough_pc`.
+    ///
+    /// On guard failure the blackhole runs the helper (a residual
+    /// `jit_list_append(list, value)` that performs the generic
+    /// append+realloc and returns `w_none()`), threads the result into the
+    /// caller's pending slot via `setup_return_value_r`, and the Python
+    /// frame continues *after* the method-shape `CALL` — never
+    /// re-executing it and rebuilding a NULL callable (the issue #143 bug).
+    ///
+    /// Mirrors `generate_guard` / `generate_guard_core` (const-skip →
+    /// flush_guard_not_invalidated → record_guard_typed → capture) but
+    /// swaps the snapshot builder for
+    /// `build_framestack_snapshot_with_synthetic_callee` and the resume pc
+    /// for `fallthrough_pc`.  The orgpc swap + vable scalar save/restore
+    /// around the build mirrors `capture_resumedata` (trace_opcode.rs:
+    /// 3742-3771): `list_of_boxes_virtualizable` re-derives
+    /// `last_instr`/`valuestackdepth` from `self.orgpc`
+    /// (trace_opcode.rs:4256-4264), so it must read `fallthrough_pc` to
+    /// encode the demoted caller's post-CALL state.
+    ///
+    /// `list` / `value` are the helper boxes (`[list, value]`).  The gate
+    /// at the call site (`guard_append_without_resize`) routes here only
+    /// when `value` is a `Ref` (a real `PyObjectRef`), matching the
+    /// helper's `live live_r=[0,1]` declaration — an unboxed `Int` value
+    /// would mis-number on resume.
+    pub(crate) fn generate_guard_with_synthetic_callee(
+        &mut self,
+        ctx: &mut TraceCtx,
+        opcode: OpCode,
+        args: &[OpRef],
+        list: OpRef,
+        value: OpRef,
+    ) {
+        // pyjitpl.py:2558-2560: a const guard operand needs no guard.
+        if let Some(&first) = args.first() {
+            if first.is_constant() {
+                return;
+            }
+        }
+        // pyjitpl.py:1087: flush a pending guard_not_invalidated first.
+        if opcode != OpCode::GuardNotInvalidated {
+            self.flush_guard_not_invalidated(ctx);
+        }
+
+        let helper_index = crate::state::ensure_list_append_resize_helper_index() as u32;
+        // helper resumes at byte 0: `live` → `residual_call jit_list_append`
+        // → `ref_return w_none()` (identity pc_map, M-core1).
+        let helper_pc = 0usize;
+        let boxes = [list, value];
+        let result_type = Type::Ref;
+
+        // The CALL handler already popped the callable + args, so the
+        // append result (None) lands at the current top of self's value
+        // stack: `result_stack_idx` is that slot relative to nlocals. The
+        // demoted-caller snapshot nulls it (get_list_of_active_boxes
+        // in_a_call, trace_opcode.rs:1538) so no stale box is captured
+        // where `setup_return_value_r` will write the helper's return.
+        let result_stack_idx = {
+            let s = self.sym();
+            s.valuestackdepth.saturating_sub(s.nlocals)
+        };
+
+        // fail_arg_types in snapshot box order [helper(1:1, no header),
+        // self(sliced), ...parents(sliced)] — mirrors generate_guard's
+        // extend_types_with_parents.  These are an overwritten fallback:
+        // store_final_boxes_in_guard (optimizeopt/mod.rs:3200) repopulates
+        // op.fail_args from the snapshot below.
+        let n = crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
+        let helper_types: Vec<Type> = boxes.iter().map(|&op| self.value_type(op)).collect();
+        let mut types = helper_types;
+        let self_as_parent = crate::state::ResumeFrameState {
+            sym: self.sym,
+            concrete_frame_addr: self.concrete_frame_addr,
+            resume_pc: self.fallthrough_pc,
+            pending_result_stack_idx: Some(result_stack_idx),
+            pending_result_type: Some(result_type),
+        };
+        let (self_types_full, _) = self.materialize_parent_frame_state(ctx, self_as_parent);
+        if self_types_full.len() > n {
+            types.extend_from_slice(&self_types_full[n..]);
+        }
+        let types = self.extend_types_with_parents(ctx, types);
+        ctx.record_guard_typed(opcode, args, types);
+
+        // capture_resumedata parity (trace_opcode.rs:3742-3771): swap orgpc
+        // to the post-CALL fallthrough so the demoted caller's vable
+        // scalars encode the resume state, then restore.
+        let saved_orgpc = self.orgpc;
+        let saved_ni = self.sym().vable_last_instr;
+        let saved_vsd = self.sym().vable_valuestackdepth;
+        self.orgpc = self.fallthrough_pc;
+
+        let snapshot = self.build_framestack_snapshot_with_synthetic_callee(
+            ctx,
+            helper_index,
+            helper_pc,
+            &boxes,
+            Some(result_stack_idx),
+            Some(result_type),
+        );
+        let snapshot_id = ctx.capture_resumedata(snapshot);
+        ctx.set_last_guard_resume_position(snapshot_id);
+
+        self.orgpc = saved_orgpc;
+        let s = self.sym_mut();
+        s.vable_last_instr = saved_ni;
+        s.vable_valuestackdepth = saved_vsd;
+
+        // pyjitpl.py:2581 profiler.count_ops parity.
+        ctx.profiler()
+            .count_ops(opcode, majit_metainterp::counters::GUARDS);
+    }
+
     fn materialize_parent_frame_state(
         &mut self,
         ctx: &mut TraceCtx,
@@ -5976,21 +6093,16 @@ impl MIFrame {
                     })
                 };
                 if args.len() == 1 && canonical_list_method("append") == Some(inner_func) {
-                    // The folded fast path emits guards (resize-guard,
-                    // strategy guard, ...) that resume at the CALL pc. Replay
-                    // the `[callable, null, value]` operand stack the CALL
-                    // handler already popped so those guards capture the real
-                    // operands; otherwise blackhole re-execution of CALL on a
-                    // resize-guard failure reads a null callable.
-                    let call_pc = self.fallthrough_pc.saturating_sub(1);
-                    self.with_ctx(|this, ctx| {
-                        this.push_call_replay_stack(ctx, callable, args, call_pc)
-                    });
+                    // Issue #143: the folded fast path's resize guard routes
+                    // through a synthetic-callee snapshot
+                    // (`generate_guard_with_synthetic_callee`) so a
+                    // realloc-driven failure resumes into the `jit_list_append`
+                    // helper jitcode and the Python frame continues *after* the
+                    // CALL. No CALL re-execution, so the prior
+                    // `push_call_replay_stack` workaround (which reconstructed a
+                    // NULL method callable on resume) is removed.
                     let self_ref = recover_self(self);
-                    let res =
-                        self.list_append_value(self_ref, args[0], inner_self, concrete_args[0]);
-                    self.with_ctx(|this, ctx| this.pop_call_replay_stack(ctx, args.len()))?;
-                    res?;
+                    self.list_append_value(self_ref, args[0], inner_self, concrete_args[0])?;
                     let none_ref =
                         self.with_ctx(|_this, ctx| ctx.const_ref(pyre_object::w_none() as i64));
                     return Ok(none_ref);
@@ -6047,31 +6159,22 @@ impl MIFrame {
                     && !concrete_args.first().copied().unwrap_or(PY_NULL).is_null()
                     && is_list(concrete_args[0])
                 {
-                    // The folded fast path emits guards (resize-guard,
-                    // strategy guard, ...) that resume at the CALL pc. Replay
-                    // the `[callable, self, value]` operand stack the CALL
-                    // handler already popped so those guards capture the real
-                    // operands for blackhole re-execution on guard failure.
-                    let call_pc = self.fallthrough_pc.saturating_sub(1);
-                    self.with_ctx(|this, ctx| {
-                        this.push_call_replay_stack_self_in_args(
-                            ctx,
-                            callable,
-                            ConcreteValue::Ref(concrete_callable),
-                            args,
-                            call_pc,
-                        )
-                    });
-                    let res = self.list_append_value(
+                    // Issue #143: the folded fast path's resize guard routes
+                    // through a synthetic-callee snapshot
+                    // (`generate_guard_with_synthetic_callee`), so a
+                    // realloc-driven failure resumes into the `jit_list_append`
+                    // helper jitcode and the Python frame continues *after* the
+                    // CALL. No CALL re-execution, so the prior
+                    // `push_call_replay_stack` workaround — which reconstructed a
+                    // NULL callable on resume and inflated `valuestackdepth`,
+                    // skewing the synthetic guard's `result_stack_idx` — is
+                    // removed.
+                    self.list_append_value(
                         args[0],
                         args[1],
                         concrete_args[0],
                         concrete_args[1],
-                    );
-                    self.with_ctx(|this, ctx| {
-                        this.pop_call_replay_stack_self_in_args(ctx, args.len())
-                    })?;
-                    res?;
+                    )?;
                     let none_ref =
                         self.with_ctx(|_this, ctx| ctx.const_ref(pyre_object::w_none() as i64));
                     return Ok(none_ref);

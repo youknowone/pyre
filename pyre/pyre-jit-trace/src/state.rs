@@ -177,13 +177,18 @@ impl MetaInterpStaticData {
     /// [`Self::register_runtime_helper_jitcode`] with an identity
     /// `pc_map`. The resulting index is cached on the SD and reused, so the
     /// helper is registered exactly once per `jitcodes` table.
-    fn ensure_list_append_resize_helper_jitcode(&mut self) -> i32 {
+    /// Register a pre-built `list.append` resize helper payload and cache
+    /// its index. The payload is built by the caller OUTSIDE the
+    /// `METAINTERP_SD` borrow because `build_list_append_resize_helper_payload`
+    /// interns the helper's liveness via `intern_liveness`, which itself
+    /// borrows `METAINTERP_SD` (a nested borrow would panic).
+    fn register_list_append_resize_helper(
+        &mut self,
+        payload: std::sync::Arc<crate::PyJitCode>,
+    ) -> i32 {
         if let Some(index) = self.list_append_resize_helper_index {
             return index;
         }
-        // Built before registration; the builder touches no thread-local
-        // state, so this is safe even while `METAINTERP_SD` is borrowed.
-        let payload = build_list_append_resize_helper_payload();
         let index = self.register_runtime_helper_jitcode(payload);
         self.list_append_resize_helper_index = Some(index);
         index
@@ -548,17 +553,18 @@ fn build_list_append_resize_helper_payload() -> std::sync::Arc<crate::PyJitCode>
     use majit_metainterp::jitcode::{JitCallArg, JitCodeBuilder};
     use majit_translate::jitcode::BhCallDescr;
 
-    // `live` interns its liveness triple into this throwaway `Assembler`.
-    // The blackhole's `live/` handler only skips the 2-byte offset operand
-    // (it never dereferences it), and `BlackholeInterpreter::run` roots the
-    // whole `registers_r` file via `push_bh_regs` for the duration of the
-    // residual call, so a process-local intern is sufficient: GC roots are
-    // already covered and the offset value is inert at resume time.
-    let mut asm = majit_translate::jit_codewriter::assembler::Assembler::new();
     let mut builder = JitCodeBuilder::new();
 
-    // live live_r=[r0, r1]
-    builder.live(&mut asm, &[], &[0, 1], &[]);
+    // live live_r=[r0, r1] — emit `live/` + a placeholder 2-byte offset,
+    // patched below to the GLOBAL `all_liveness` position. The resume path
+    // (`consume_one_section` → `get_live_vars_info`) decodes this offset
+    // against `liveness_info_snapshot()` (the global table), so the helper's
+    // liveness MUST be interned there via `intern_liveness`. Interning into a
+    // throwaway local `Assembler` (as `builder.live(asm, ..)` would) leaves
+    // the offset pointing into a table the resume reader never sees, so the
+    // helper frame mis-decodes its live register set and writes the snapshot
+    // boxes to the wrong registers.
+    let live_patch = builder.live_placeholder_with_triple(&[], &[0, 1], &[]);
     // residual_call_r_v jit_list_append(r0=list, r1=value) -> void
     builder.residual_call_void_canonical_typed_args(
         pyre_object::listobject::jit_list_append as *const () as i64,
@@ -571,6 +577,11 @@ fn build_list_append_resize_helper_payload() -> std::sync::Arc<crate::PyJitCode>
     );
     // ref_return None
     builder.ref_return_const(pyre_object::noneobject::w_none() as i64);
+
+    // Patch the `live/` offset to the global `all_liveness` position.
+    let live_off = intern_liveness(&[], &[0, 1], &[])
+        .expect("list.append resize helper liveness offset fits in u16");
+    builder.patch_live_offset(live_patch, live_off);
 
     let runtime = std::sync::Arc::new(builder.finish());
     let code_len = runtime.body().code.len();
@@ -937,7 +948,18 @@ pub fn raw_code_for_jitcode_index(jitcode_index: i32) -> Option<*const CodeObjec
 #[allow(dead_code)]
 pub(crate) fn ensure_list_append_resize_helper_index() -> i32 {
     ensure_finish_setup();
-    METAINTERP_SD.with(|r| r.borrow_mut().ensure_list_append_resize_helper_jitcode())
+    // Fast path: already registered. The borrow is released before any
+    // build so the slow path below can intern liveness (which re-borrows
+    // METAINTERP_SD).
+    if let Some(index) = METAINTERP_SD.with(|r| r.borrow().list_append_resize_helper_index) {
+        return index;
+    }
+    // Build OUTSIDE the SD borrow: `build_list_append_resize_helper_payload`
+    // interns the helper's liveness triple into the global `all_liveness`
+    // via `intern_liveness`, which borrows METAINTERP_SD — building inside
+    // a held borrow would panic with a nested borrow_mut.
+    let payload = build_list_append_resize_helper_payload();
+    METAINTERP_SD.with(|r| r.borrow_mut().register_list_append_resize_helper(payload))
 }
 
 /// Resolve `MetaInterpStaticData.jitcodes[jitcode_index]` to the same
