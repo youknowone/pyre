@@ -819,7 +819,10 @@ fn analyze_pipeline_from_parsed(
                 }
             }
         }
-        let ull_only = ull_bare.keys().filter(|k| !syn_bare.contains_key(*k)).count();
+        let ull_only = ull_bare
+            .keys()
+            .filter(|k| !syn_bare.contains_key(*k))
+            .count();
         eprintln!(
             "TIER3 struct_field_attrs SUMMARY (bare-leaf): syn={} ull={} syn_nested={syn_nested} ull_collisions={ull_collisions} mismatch={mismatch} syn_only={syn_only} ull_only={ull_only}",
             syn_bare.len(),

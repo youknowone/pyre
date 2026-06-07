@@ -2858,8 +2858,8 @@ mod tests {
                 result_ty: ValueType::Int,
             },
         };
-        let translated = translate_op(&op, &value_map, &empty_call_registry())
-            .expect("BinOp arm must lower");
+        let translated =
+            translate_op(&op, &value_map, &empty_call_registry()).expect("BinOp arm must lower");
         assert_eq!(translated.len(), 1, "BinOp lowers to exactly one SpaceOp");
         let lowered = &translated[0];
         assert_eq!(lowered.opname, "add", "opname passes through unchanged");
@@ -2931,8 +2931,8 @@ mod tests {
                 result_ty: ValueType::Int,
             },
         };
-        let translated = translate_op(&op, &value_map, &registry)
-            .expect("Call::FunctionPath must lower");
+        let translated =
+            translate_op(&op, &value_map, &registry).expect("Call::FunctionPath must lower");
         assert_eq!(translated.len(), 1);
         let lowered = &translated[0];
         assert_eq!(lowered.opname, "simple_call");
@@ -3216,8 +3216,8 @@ mod tests {
                 result_ty: ValueType::Int,
             },
         };
-        let translated = translate_op(&op, &value_map, &empty_call_registry())
-            .expect("Call::Method must lower");
+        let translated =
+            translate_op(&op, &value_map, &empty_call_registry()).expect("Call::Method must lower");
         assert_eq!(translated.len(), 2);
         assert_eq!(translated[0].opname, "getattr");
         assert_eq!(translated[1].opname, "simple_call");
