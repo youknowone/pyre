@@ -28,6 +28,7 @@ pub use trace_opcode::{production_blackhole_handles, production_walker_handles};
 pub mod trace;
 pub mod virtualizable_gen;
 pub mod virtualizable_spec;
+pub mod walker_frame_ops;
 
 // pyre-jit-trace local invariant: PyFrame's `_virtualizable_` declares
 // exactly one extra red (ec, see `virtualizable_gen.rs:29-31` and
