@@ -3840,6 +3840,94 @@ mod tests {
         }
     }
 
+    fn i(pos: u32) -> BoxRef {
+        BoxRef::from_opref(OpRef::int_op(pos))
+    }
+
+    fn f(pos: u32) -> BoxRef {
+        BoxRef::from_opref(OpRef::float_op(pos))
+    }
+
+    fn r(pos: u32) -> BoxRef {
+        BoxRef::from_opref(OpRef::ref_op(pos))
+    }
+
+    fn same_i() -> Op {
+        Op::new(OpCode::SameAsI, &[])
+    }
+
+    fn same_f() -> Op {
+        Op::new(OpCode::SameAsF, &[])
+    }
+
+    fn same_r() -> Op {
+        Op::new(OpCode::SameAsR, &[])
+    }
+
+    fn bin_i(opcode: OpCode, left: u32, right: u32) -> Op {
+        Op::new(opcode, &[i(left), i(right)])
+    }
+
+    fn bin_f(opcode: OpCode, left: u32, right: u32) -> Op {
+        Op::new(opcode, &[f(left), f(right)])
+    }
+
+    fn bin_r(opcode: OpCode, left: u32, right: u32) -> Op {
+        Op::new(opcode, &[r(left), r(right)])
+    }
+
+    fn unary_i(opcode: OpCode, arg: u32) -> Op {
+        Op::new(opcode, &[i(arg)])
+    }
+
+    fn unary_f(opcode: OpCode, arg: u32) -> Op {
+        Op::new(opcode, &[f(arg)])
+    }
+
+    fn unary_r(opcode: OpCode, arg: u32) -> Op {
+        Op::new(opcode, &[r(arg)])
+    }
+
+    fn run_one(
+        mut ops: Vec<Op>,
+        target: usize,
+        constants: &[(OpRef, Value)],
+    ) -> (OptimizationResult, OptContext) {
+        with_positions(&mut ops);
+        let mut ctx = OptContext::new(ops.len());
+        for op in &ops[..target] {
+            ctx.emit(op.clone());
+        }
+        for &(opref, value) in constants {
+            ctx.make_constant(opref, value);
+        }
+        let mut pass = OptRewrite::new();
+        let op_rc = std::rc::Rc::new(ops[target].clone());
+        ctx.bind_input_resops(std::slice::from_ref(&op_rc));
+        let result = pass.propagate_forward(&ops[target], &op_rc, &mut ctx);
+        (result, ctx)
+    }
+
+    fn assert_remove(result: &OptimizationResult) {
+        assert!(matches!(result, OptimizationResult::Remove));
+    }
+
+    fn assert_pass_on(result: &OptimizationResult) {
+        assert!(matches!(result, OptimizationResult::PassOn));
+    }
+
+    fn assert_int_const(ctx: &OptContext, opref: OpRef, expected: i64) {
+        assert_eq!(
+            ctx.get_box_replacement_box(opref)
+                .and_then(|cb| cb.const_int()),
+            Some(expected)
+        );
+    }
+
+    fn assert_forward(ctx: &OptContext, from: OpRef, to: OpRef) {
+        assert_eq!(ctx.get_box_replacement(from).to_opref(), to);
+    }
+
     /// Run the rewrite pass on a sequence of ops and return the optimized ops.
     fn run_rewrite(ops: &mut [Op]) -> (Vec<Op>, OptContext) {
         with_positions(ops);
@@ -3892,102 +3980,35 @@ mod tests {
         const_val: i64,
         expected_forward_to: u32,
     ) {
-        let mut ops = vec![
-            Op::new(OpCode::SameAsI, &[]),
-            Op::new(OpCode::SameAsI, &[]),
-            Op::new(
-                opcode,
-                &[
-                    BoxRef::from_opref(OpRef::int_op(0)),
-                    BoxRef::from_opref(OpRef::int_op(1)),
-                ],
-            ),
-        ];
-        with_positions(&mut ops);
-        let mut ctx = OptContext::new(3);
-        ctx.emit(ops[0].clone());
-        ctx.emit(ops[1].clone());
-        ctx.make_constant(OpRef::int_op(const_pos as u32), Value::Int(const_val));
-        let mut pass = OptRewrite::new();
-        let __pf_rc = std::rc::Rc::new(ops[2].clone());
-        ctx.bind_input_resops(std::slice::from_ref(&__pf_rc));
-        let result = pass.propagate_forward(&ops[2], &__pf_rc, &mut ctx);
-        assert!(
-            matches!(result, OptimizationResult::Remove),
-            "{opcode:?} with const {const_val} at pos {const_pos} should Remove"
+        let (result, ctx) = run_one(
+            vec![same_i(), same_i(), bin_i(opcode, 0, 1)],
+            2,
+            &[(OpRef::int_op(const_pos as u32), Value::Int(const_val))],
         );
-        assert_eq!(
-            ctx.get_box_replacement(OpRef::int_op(2)).to_opref(),
-            OpRef::int_op(expected_forward_to),
-            "{opcode:?} should forward to {expected_forward_to}"
-        );
+        assert_remove(&result);
+        assert_forward(&ctx, OpRef::int_op(2), OpRef::int_op(expected_forward_to));
     }
 
     /// Helper: test constant fold → expect Remove + constant result.
     fn assert_binop_const_fold(opcode: OpCode, a: i64, b: i64, expected: i64) {
-        let mut ops = vec![
-            Op::new(OpCode::SameAsI, &[]),
-            Op::new(OpCode::SameAsI, &[]),
-            Op::new(
-                opcode,
-                &[
-                    BoxRef::from_opref(OpRef::int_op(0)),
-                    BoxRef::from_opref(OpRef::int_op(1)),
-                ],
-            ),
-        ];
-        with_positions(&mut ops);
-        let mut ctx = OptContext::new(3);
-        ctx.emit(ops[0].clone());
-        ctx.emit(ops[1].clone());
-        ctx.make_constant(OpRef::int_op(0), Value::Int(a));
-        ctx.make_constant(OpRef::int_op(1), Value::Int(b));
-        let mut pass = OptRewrite::new();
-        let __pf_rc = std::rc::Rc::new(ops[2].clone());
-        ctx.bind_input_resops(std::slice::from_ref(&__pf_rc));
-        let result = pass.propagate_forward(&ops[2], &__pf_rc, &mut ctx);
-        assert!(
-            matches!(result, OptimizationResult::Remove),
-            "{opcode:?}({a}, {b}) should constant-fold"
+        let (result, ctx) = run_one(
+            vec![same_i(), same_i(), bin_i(opcode, 0, 1)],
+            2,
+            &[
+                (OpRef::int_op(0), Value::Int(a)),
+                (OpRef::int_op(1), Value::Int(b)),
+            ],
         );
-        assert_eq!(
-            ctx.get_box_replacement_box(OpRef::int_op(2))
-                .and_then(|cb| cb.const_int()),
-            Some(expected),
-            "{opcode:?}({a}, {b}) = {expected}"
-        );
+        assert_remove(&result);
+        assert_int_const(&ctx, OpRef::int_op(2), expected);
     }
 
     /// Helper: test same-arg binop → expect Remove.
     fn assert_binop_self(opcode: OpCode, expected_const: Option<i64>) {
-        let mut ops = vec![
-            Op::new(OpCode::SameAsI, &[]),
-            Op::new(
-                opcode,
-                &[
-                    BoxRef::from_opref(OpRef::int_op(0)),
-                    BoxRef::from_opref(OpRef::int_op(0)),
-                ],
-            ),
-        ];
-        with_positions(&mut ops);
-        let mut ctx = OptContext::new(2);
-        ctx.emit(ops[0].clone());
-        let mut pass = OptRewrite::new();
-        let __pf_rc = std::rc::Rc::new(ops[1].clone());
-        ctx.bind_input_resops(std::slice::from_ref(&__pf_rc));
-        let result = pass.propagate_forward(&ops[1], &__pf_rc, &mut ctx);
-        assert!(
-            matches!(result, OptimizationResult::Remove),
-            "{opcode:?}(x, x) should Remove"
-        );
+        let (result, ctx) = run_one(vec![same_i(), bin_i(opcode, 0, 0)], 1, &[]);
+        assert_remove(&result);
         if let Some(val) = expected_const {
-            assert_eq!(
-                ctx.get_box_replacement_box(OpRef::int_op(1))
-                    .and_then(|cb| cb.const_int()),
-                Some(val),
-                "{opcode:?}(x, x) = {val}"
-            );
+            assert_int_const(&ctx, OpRef::int_op(1), val);
         }
     }
 
@@ -4004,23 +4025,7 @@ mod tests {
     #[test]
     fn test_int_add_x_plus_x() {
         // x + x → lshift(x, 1) — keep as separate test (rewrite, not identity)
-        let mut ops = vec![
-            Op::new(OpCode::SameAsI, &[]),
-            Op::new(
-                OpCode::IntAdd,
-                &[
-                    BoxRef::from_opref(OpRef::int_op(0)),
-                    BoxRef::from_opref(OpRef::int_op(0)),
-                ],
-            ),
-        ];
-        with_positions(&mut ops);
-        let mut ctx = OptContext::new(2);
-        ctx.emit(ops[0].clone());
-        let mut pass = OptRewrite::new();
-        let __pf_rc = std::rc::Rc::new(ops[1].clone());
-        ctx.bind_input_resops(std::slice::from_ref(&__pf_rc));
-        let result = pass.propagate_forward(&ops[1], &__pf_rc, &mut ctx);
+        let (result, _) = run_one(vec![same_i(), bin_i(OpCode::IntAdd, 0, 0)], 1, &[]);
         // x + x may be rewritten to lshift(x, 1) or kept
         assert!(
             !matches!(result, OptimizationResult::PassOn)
@@ -4042,32 +4047,13 @@ mod tests {
     #[test]
     fn test_int_mul_identities() {
         // x * 0 = 0
-        let mut ops = vec![
-            Op::new(OpCode::SameAsI, &[]),
-            Op::new(OpCode::SameAsI, &[]),
-            Op::new(
-                OpCode::IntMul,
-                &[
-                    BoxRef::from_opref(OpRef::int_op(0)),
-                    BoxRef::from_opref(OpRef::int_op(1)),
-                ],
-            ),
-        ];
-        with_positions(&mut ops);
-        let mut ctx = OptContext::new(3);
-        ctx.emit(ops[0].clone());
-        ctx.emit(ops[1].clone());
-        ctx.make_constant(OpRef::int_op(1), Value::Int(0));
-        let mut pass = OptRewrite::new();
-        let __pf_rc = std::rc::Rc::new(ops[2].clone());
-        ctx.bind_input_resops(std::slice::from_ref(&__pf_rc));
-        let result = pass.propagate_forward(&ops[2], &__pf_rc, &mut ctx);
-        assert!(matches!(result, OptimizationResult::Remove));
-        assert_eq!(
-            ctx.get_box_replacement_box(OpRef::int_op(2))
-                .and_then(|cb| cb.const_int()),
-            Some(0)
+        let (result, ctx) = run_one(
+            vec![same_i(), same_i(), bin_i(OpCode::IntMul, 0, 1)],
+            2,
+            &[(OpRef::int_op(1), Value::Int(0))],
         );
+        assert_remove(&result);
+        assert_int_const(&ctx, OpRef::int_op(2), 0);
 
         // x * 1 = x
         assert_binop_identity(OpCode::IntMul, 1, 1, 0);
@@ -4078,26 +4064,11 @@ mod tests {
     #[test]
     fn test_int_mul_power_of_two() {
         // x * 8 → lshift(x, 3)
-        let mut ops = vec![
-            Op::new(OpCode::SameAsI, &[]),
-            Op::new(OpCode::SameAsI, &[]),
-            Op::new(
-                OpCode::IntMul,
-                &[
-                    BoxRef::from_opref(OpRef::int_op(0)),
-                    BoxRef::from_opref(OpRef::int_op(1)),
-                ],
-            ),
-        ];
-        with_positions(&mut ops);
-        let mut ctx = OptContext::new(3);
-        ctx.emit(ops[0].clone());
-        ctx.emit(ops[1].clone());
-        ctx.make_constant(OpRef::int_op(1), Value::Int(8));
-        let mut pass = OptRewrite::new();
-        let __pf_rc = std::rc::Rc::new(ops[2].clone());
-        ctx.bind_input_resops(std::slice::from_ref(&__pf_rc));
-        let result = pass.propagate_forward(&ops[2], &__pf_rc, &mut ctx);
+        let (result, _) = run_one(
+            vec![same_i(), same_i(), bin_i(OpCode::IntMul, 0, 1)],
+            2,
+            &[(OpRef::int_op(1), Value::Int(8))],
+        );
         match result {
             OptimizationResult::Replace(ref new_op) | OptimizationResult::Emit(ref new_op) => {
                 assert_eq!(new_op.opcode, OpCode::IntLshift);
@@ -4111,32 +4082,13 @@ mod tests {
         // x / 1 = x
         assert_binop_identity(OpCode::IntFloorDiv, 1, 1, 0);
         // 0 / x = 0
-        let mut ops = vec![
-            Op::new(OpCode::SameAsI, &[]),
-            Op::new(OpCode::SameAsI, &[]),
-            Op::new(
-                OpCode::IntFloorDiv,
-                &[
-                    BoxRef::from_opref(OpRef::int_op(0)),
-                    BoxRef::from_opref(OpRef::int_op(1)),
-                ],
-            ),
-        ];
-        with_positions(&mut ops);
-        let mut ctx = OptContext::new(3);
-        ctx.emit(ops[0].clone());
-        ctx.emit(ops[1].clone());
-        ctx.make_constant(OpRef::int_op(0), Value::Int(0));
-        let mut pass = OptRewrite::new();
-        let __pf_rc = std::rc::Rc::new(ops[2].clone());
-        ctx.bind_input_resops(std::slice::from_ref(&__pf_rc));
-        let result = pass.propagate_forward(&ops[2], &__pf_rc, &mut ctx);
-        assert!(matches!(result, OptimizationResult::Remove));
-        assert_eq!(
-            ctx.get_box_replacement_box(OpRef::int_op(2))
-                .and_then(|cb| cb.const_int()),
-            Some(0)
+        let (result, ctx) = run_one(
+            vec![same_i(), same_i(), bin_i(OpCode::IntFloorDiv, 0, 1)],
+            2,
+            &[(OpRef::int_op(0), Value::Int(0))],
         );
+        assert_remove(&result);
+        assert_int_const(&ctx, OpRef::int_op(2), 0);
         // x / x = 1
         assert_binop_self(OpCode::IntFloorDiv, Some(1));
         // x / -1 = neg(x)
@@ -4147,32 +4099,13 @@ mod tests {
     #[test]
     fn test_int_mod_identities() {
         // x % 1 = 0
-        let mut ops = vec![
-            Op::new(OpCode::SameAsI, &[]),
-            Op::new(OpCode::SameAsI, &[]),
-            Op::new(
-                OpCode::IntMod,
-                &[
-                    BoxRef::from_opref(OpRef::int_op(0)),
-                    BoxRef::from_opref(OpRef::int_op(1)),
-                ],
-            ),
-        ];
-        with_positions(&mut ops);
-        let mut ctx = OptContext::new(3);
-        ctx.emit(ops[0].clone());
-        ctx.emit(ops[1].clone());
-        ctx.make_constant(OpRef::int_op(1), Value::Int(1));
-        let mut pass = OptRewrite::new();
-        let __pf_rc = std::rc::Rc::new(ops[2].clone());
-        ctx.bind_input_resops(std::slice::from_ref(&__pf_rc));
-        let result = pass.propagate_forward(&ops[2], &__pf_rc, &mut ctx);
-        assert!(matches!(result, OptimizationResult::Remove));
-        assert_eq!(
-            ctx.get_box_replacement_box(OpRef::int_op(2))
-                .and_then(|cb| cb.const_int()),
-            Some(0)
+        let (result, ctx) = run_one(
+            vec![same_i(), same_i(), bin_i(OpCode::IntMod, 0, 1)],
+            2,
+            &[(OpRef::int_op(1), Value::Int(1))],
         );
+        assert_remove(&result);
+        assert_int_const(&ctx, OpRef::int_op(2), 0);
         // x % x = 0
         assert_binop_self(OpCode::IntMod, Some(0));
     }
@@ -4206,85 +4139,43 @@ mod tests {
     #[test]
     fn test_unary_constant_fold() {
         // neg constant
-        let mut ops = vec![
-            Op::new(OpCode::SameAsI, &[]),
-            Op::new(OpCode::IntNeg, &[BoxRef::from_opref(OpRef::int_op(0))]),
-        ];
-        with_positions(&mut ops);
-        let mut ctx = OptContext::new(2);
-        ctx.emit(ops[0].clone());
-        ctx.make_constant(OpRef::int_op(0), Value::Int(42));
-        let mut pass = OptRewrite::new();
-        let __pf_rc = std::rc::Rc::new(ops[1].clone());
-        ctx.bind_input_resops(std::slice::from_ref(&__pf_rc));
-        let result = pass.propagate_forward(&ops[1], &__pf_rc, &mut ctx);
-        assert!(matches!(result, OptimizationResult::Remove));
-        assert_eq!(
-            ctx.get_box_replacement_box(OpRef::int_op(1))
-                .and_then(|cb| cb.const_int()),
-            Some(-42)
+        let (result, ctx) = run_one(
+            vec![same_i(), unary_i(OpCode::IntNeg, 0)],
+            1,
+            &[(OpRef::int_op(0), Value::Int(42))],
         );
+        assert_remove(&result);
+        assert_int_const(&ctx, OpRef::int_op(1), -42);
 
         // invert constant
-        let mut ops2 = vec![
-            Op::new(OpCode::SameAsI, &[]),
-            Op::new(OpCode::IntInvert, &[BoxRef::from_opref(OpRef::int_op(0))]),
-        ];
-        with_positions(&mut ops2);
-        let mut ctx2 = OptContext::new(2);
-        ctx2.emit(ops2[0].clone());
-        ctx2.make_constant(OpRef::int_op(0), Value::Int(0xFF));
-        let __pf_rc = std::rc::Rc::new(ops2[1].clone());
-        ctx2.bind_input_resops(std::slice::from_ref(&__pf_rc));
-        let result2 = pass.propagate_forward(&ops2[1], &__pf_rc, &mut ctx2);
-        assert!(matches!(result2, OptimizationResult::Remove));
-        assert_eq!(
-            ctx2.get_box_replacement_box(OpRef::int_op(1))
-                .and_then(|cb| cb.const_int()),
-            Some(!0xFF)
+        let (result, ctx) = run_one(
+            vec![same_i(), unary_i(OpCode::IntInvert, 0)],
+            1,
+            &[(OpRef::int_op(0), Value::Int(0xFF))],
         );
+        assert_remove(&result);
+        assert_int_const(&ctx, OpRef::int_op(1), !0xFF);
     }
 
     #[test]
     fn test_int_is_zero_and_is_true() {
-        let mut pass = OptRewrite::new();
         // is_zero(0) = 1
-        let mut ops = vec![
-            Op::new(OpCode::SameAsI, &[]),
-            Op::new(OpCode::IntIsZero, &[BoxRef::from_opref(OpRef::int_op(0))]),
-        ];
-        with_positions(&mut ops);
-        let mut ctx = OptContext::new(2);
-        ctx.emit(ops[0].clone());
-        ctx.make_constant(OpRef::int_op(0), Value::Int(0));
-        let __pf_rc = std::rc::Rc::new(ops[1].clone());
-        ctx.bind_input_resops(std::slice::from_ref(&__pf_rc));
-        let result = pass.propagate_forward(&ops[1], &__pf_rc, &mut ctx);
-        assert!(matches!(result, OptimizationResult::Remove));
-        assert_eq!(
-            ctx.get_box_replacement_box(OpRef::int_op(1))
-                .and_then(|cb| cb.const_int()),
-            Some(1)
+        let (result, ctx) = run_one(
+            vec![same_i(), unary_i(OpCode::IntIsZero, 0)],
+            1,
+            &[(OpRef::int_op(0), Value::Int(0))],
         );
+        assert_remove(&result);
+        assert_int_const(&ctx, OpRef::int_op(1), 1);
 
         // is_zero(5) = 0
-        let mut ops2 = vec![
-            Op::new(OpCode::SameAsI, &[]),
-            Op::new(OpCode::IntIsZero, &[BoxRef::from_opref(OpRef::int_op(0))]),
-        ];
-        with_positions(&mut ops2);
-        let mut ctx2 = OptContext::new(2);
-        ctx2.emit(ops2[0].clone());
-        ctx2.make_constant(OpRef::int_op(0), Value::Int(5));
-        let __pf_rc = std::rc::Rc::new(ops2[1].clone());
-        ctx2.bind_input_resops(std::slice::from_ref(&__pf_rc));
-        let result2 = pass.propagate_forward(&ops2[1], &__pf_rc, &mut ctx2);
-        assert!(matches!(result2, OptimizationResult::Remove));
-        assert_eq!(
-            ctx2.get_box_replacement_box(OpRef::int_op(1))
-                .and_then(|cb| cb.const_int()),
-            Some(0)
+        let (result, ctx) = run_one(
+            vec![same_i(), unary_i(OpCode::IntIsZero, 0)],
+            1,
+            &[(OpRef::int_op(0), Value::Int(5))],
         );
+        assert_remove(&result);
+        assert_int_const(&ctx, OpRef::int_op(1), 0);
     }
 
     #[test]
@@ -4300,143 +4191,80 @@ mod tests {
 
     #[test]
     fn test_guard_true_known_true() {
-        let mut ops = vec![
-            Op::new(OpCode::SameAsI, &[]),
-            Op::new(OpCode::GuardTrue, &[BoxRef::from_opref(OpRef::int_op(0))]),
-        ];
-        with_positions(&mut ops);
-        let mut ctx = OptContext::new(2);
-        ctx.emit(ops[0].clone());
-        ctx.make_constant(OpRef::int_op(0), Value::Int(1));
-
-        let mut pass = OptRewrite::new();
-        let __pf_rc = std::rc::Rc::new(ops[1].clone());
-        ctx.bind_input_resops(std::slice::from_ref(&__pf_rc));
-        let result = pass.propagate_forward(&ops[1], &__pf_rc, &mut ctx);
-        assert!(matches!(result, OptimizationResult::Remove));
+        let (result, _) = run_one(
+            vec![same_i(), Op::new(OpCode::GuardTrue, &[i(0)])],
+            1,
+            &[(OpRef::int_op(0), Value::Int(1))],
+        );
+        assert_remove(&result);
     }
 
     #[test]
     fn test_guard_true_known_false() {
-        let mut ops = vec![
-            Op::new(OpCode::SameAsI, &[]),
-            Op::new(OpCode::GuardTrue, &[BoxRef::from_opref(OpRef::int_op(0))]),
-        ];
-        with_positions(&mut ops);
-        let mut ctx = OptContext::new(2);
-        ctx.emit(ops[0].clone());
-        ctx.make_constant(OpRef::int_op(0), Value::Int(0));
-
-        let mut pass = OptRewrite::new();
-        let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            pass.propagate_forward(&ops[1], &std::rc::Rc::new(ops[1].clone()), &mut ctx)
-        }))
-        .expect_err("guard_true(0) should abort as InvalidLoop");
+        let err = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_one(
+                vec![same_i(), Op::new(OpCode::GuardTrue, &[i(0)])],
+                1,
+                &[(OpRef::int_op(0), Value::Int(0))],
+            )
+        })) {
+            Ok(_) => panic!("guard_true(0) should abort as InvalidLoop"),
+            Err(err) => err,
+        };
         assert!(err.downcast_ref::<crate::optimize::InvalidLoop>().is_some());
     }
 
     #[test]
     fn test_guard_true_unknown() {
-        let mut ops = vec![
-            Op::new(OpCode::SameAsI, &[]),
-            Op::new(OpCode::GuardTrue, &[BoxRef::from_opref(OpRef::int_op(0))]),
-        ];
-        with_positions(&mut ops);
-        let mut ctx = OptContext::new(2);
-        ctx.emit(ops[0].clone());
-
-        let mut pass = OptRewrite::new();
-        let __pf_rc = std::rc::Rc::new(ops[1].clone());
-        ctx.bind_input_resops(std::slice::from_ref(&__pf_rc));
-        let result = pass.propagate_forward(&ops[1], &__pf_rc, &mut ctx);
-        assert!(matches!(result, OptimizationResult::PassOn));
+        let (result, _) = run_one(vec![same_i(), Op::new(OpCode::GuardTrue, &[i(0)])], 1, &[]);
+        assert_pass_on(&result);
     }
 
     #[test]
     fn test_guard_false_known_false() {
-        let mut ops = vec![
-            Op::new(OpCode::SameAsI, &[]),
-            Op::new(OpCode::GuardFalse, &[BoxRef::from_opref(OpRef::int_op(0))]),
-        ];
-        with_positions(&mut ops);
-        let mut ctx = OptContext::new(2);
-        ctx.emit(ops[0].clone());
-        ctx.make_constant(OpRef::int_op(0), Value::Int(0));
-
-        let mut pass = OptRewrite::new();
-        let __pf_rc = std::rc::Rc::new(ops[1].clone());
-        ctx.bind_input_resops(std::slice::from_ref(&__pf_rc));
-        let result = pass.propagate_forward(&ops[1], &__pf_rc, &mut ctx);
-        assert!(matches!(result, OptimizationResult::Remove));
+        let (result, _) = run_one(
+            vec![same_i(), Op::new(OpCode::GuardFalse, &[i(0)])],
+            1,
+            &[(OpRef::int_op(0), Value::Int(0))],
+        );
+        assert_remove(&result);
     }
 
     #[test]
     fn test_guard_false_known_true() {
-        let mut ops = vec![
-            Op::new(OpCode::SameAsI, &[]),
-            Op::new(OpCode::GuardFalse, &[BoxRef::from_opref(OpRef::int_op(0))]),
-        ];
-        with_positions(&mut ops);
-        let mut ctx = OptContext::new(2);
-        ctx.emit(ops[0].clone());
-        ctx.make_constant(OpRef::int_op(0), Value::Int(1));
-
-        let mut pass = OptRewrite::new();
-        let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            pass.propagate_forward(&ops[1], &std::rc::Rc::new(ops[1].clone()), &mut ctx)
-        }))
-        .expect_err("guard_false(1) should abort as InvalidLoop");
+        let err = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_one(
+                vec![same_i(), Op::new(OpCode::GuardFalse, &[i(0)])],
+                1,
+                &[(OpRef::int_op(0), Value::Int(1))],
+            )
+        })) {
+            Ok(_) => panic!("guard_false(1) should abort as InvalidLoop"),
+            Err(err) => err,
+        };
         assert!(err.downcast_ref::<crate::optimize::InvalidLoop>().is_some());
     }
 
     #[test]
     fn test_guard_value_match() {
-        let mut ops = vec![
-            Op::new(OpCode::SameAsI, &[]),
-            Op::new(OpCode::SameAsI, &[]),
-            Op::new(
-                OpCode::GuardValue,
-                &[
-                    BoxRef::from_opref(OpRef::int_op(0)),
-                    BoxRef::from_opref(OpRef::int_op(1)),
-                ],
-            ),
-        ];
-        with_positions(&mut ops);
-        let mut ctx = OptContext::new(3);
-        ctx.emit(ops[0].clone());
-        ctx.emit(ops[1].clone());
-        ctx.make_constant(OpRef::int_op(0), Value::Int(42));
-        ctx.make_constant(OpRef::int_op(1), Value::Int(42));
-
-        let mut pass = OptRewrite::new();
-        let __pf_rc = std::rc::Rc::new(ops[2].clone());
-        ctx.bind_input_resops(std::slice::from_ref(&__pf_rc));
-        let result = pass.propagate_forward(&ops[2], &__pf_rc, &mut ctx);
-        assert!(matches!(result, OptimizationResult::Remove));
+        let (result, _) = run_one(
+            vec![same_i(), same_i(), bin_i(OpCode::GuardValue, 0, 1)],
+            2,
+            &[
+                (OpRef::int_op(0), Value::Int(42)),
+                (OpRef::int_op(1), Value::Int(42)),
+            ],
+        );
+        assert_remove(&result);
     }
 
     // ── SAME_AS tests ──
 
     #[test]
     fn test_same_as_i() {
-        let mut ops = vec![
-            Op::new(OpCode::SameAsI, &[]),
-            Op::new(OpCode::SameAsI, &[BoxRef::from_opref(OpRef::int_op(0))]),
-        ];
-        with_positions(&mut ops);
-        let mut ctx = OptContext::new(2);
-        ctx.emit(ops[0].clone());
-
-        let mut pass = OptRewrite::new();
-        let __pf_rc = std::rc::Rc::new(ops[1].clone());
-        ctx.bind_input_resops(std::slice::from_ref(&__pf_rc));
-        let result = pass.propagate_forward(&ops[1], &__pf_rc, &mut ctx);
-        assert!(matches!(result, OptimizationResult::Remove));
-        assert_eq!(
-            ctx.get_box_replacement(OpRef::int_op(1)).to_opref(),
-            OpRef::int_op(0)
-        );
+        let (result, ctx) = run_one(vec![same_i(), Op::new(OpCode::SameAsI, &[i(0)])], 1, &[]);
+        assert_remove(&result);
+        assert_forward(&ctx, OpRef::int_op(1), OpRef::int_op(0));
     }
 
     // ── Integration test: full optimizer with OptRewrite ──
@@ -4568,339 +4396,150 @@ mod tests {
 
     #[test]
     fn test_int_add_wrapping() {
-        let mut ops = vec![
-            Op::new(OpCode::SameAsI, &[]),
-            Op::new(OpCode::SameAsI, &[]),
-            Op::new(
-                OpCode::IntAdd,
-                &[
-                    BoxRef::from_opref(OpRef::int_op(0)),
-                    BoxRef::from_opref(OpRef::int_op(1)),
-                ],
-            ),
-        ];
-        with_positions(&mut ops);
-        let mut ctx = OptContext::new(3);
-        ctx.emit(ops[0].clone());
-        ctx.emit(ops[1].clone());
-        ctx.make_constant(OpRef::int_op(0), Value::Int(i64::MAX));
-        ctx.make_constant(OpRef::int_op(1), Value::Int(1));
-
-        let mut pass = OptRewrite::new();
-        let __pf_rc = std::rc::Rc::new(ops[2].clone());
-        ctx.bind_input_resops(std::slice::from_ref(&__pf_rc));
-        let result = pass.propagate_forward(&ops[2], &__pf_rc, &mut ctx);
-        assert!(matches!(result, OptimizationResult::Remove));
-        assert_eq!(
-            ctx.get_box_replacement_box(OpRef::int_op(2))
-                .and_then(|cb| cb.const_int()),
-            Some(i64::MIN)
-        ); // wrapping
+        // wrapping
+        let (result, ctx) = run_one(
+            vec![same_i(), same_i(), bin_i(OpCode::IntAdd, 0, 1)],
+            2,
+            &[
+                (OpRef::int_op(0), Value::Int(i64::MAX)),
+                (OpRef::int_op(1), Value::Int(1)),
+            ],
+        );
+        assert_remove(&result);
+        assert_int_const(&ctx, OpRef::int_op(2), i64::MIN);
     }
 
     // ── Shift of zero constant tests ──
 
     #[test]
     fn test_zero_lshift_anything() {
-        let mut ops = vec![
-            Op::new(OpCode::SameAsI, &[]),
-            Op::new(OpCode::SameAsI, &[]),
-            Op::new(
-                OpCode::IntLshift,
-                &[
-                    BoxRef::from_opref(OpRef::int_op(0)),
-                    BoxRef::from_opref(OpRef::int_op(1)),
-                ],
-            ),
-        ];
-        with_positions(&mut ops);
-        let mut ctx = OptContext::new(3);
-        ctx.emit(ops[0].clone());
-        ctx.emit(ops[1].clone());
-        ctx.make_constant(OpRef::int_op(0), Value::Int(0));
-
-        let mut pass = OptRewrite::new();
-        let __pf_rc = std::rc::Rc::new(ops[2].clone());
-        ctx.bind_input_resops(std::slice::from_ref(&__pf_rc));
-        let result = pass.propagate_forward(&ops[2], &__pf_rc, &mut ctx);
-        assert!(matches!(result, OptimizationResult::Remove));
-        assert_eq!(
-            ctx.get_box_replacement_box(OpRef::int_op(2))
-                .and_then(|cb| cb.const_int()),
-            Some(0)
+        let (result, ctx) = run_one(
+            vec![same_i(), same_i(), bin_i(OpCode::IntLshift, 0, 1)],
+            2,
+            &[(OpRef::int_op(0), Value::Int(0))],
         );
+        assert_remove(&result);
+        assert_int_const(&ctx, OpRef::int_op(2), 0);
     }
 
     #[test]
     fn test_zero_rshift_anything() {
-        let mut ops = vec![
-            Op::new(OpCode::SameAsI, &[]),
-            Op::new(OpCode::SameAsI, &[]),
-            Op::new(
-                OpCode::IntRshift,
-                &[
-                    BoxRef::from_opref(OpRef::int_op(0)),
-                    BoxRef::from_opref(OpRef::int_op(1)),
-                ],
-            ),
-        ];
-        with_positions(&mut ops);
-        let mut ctx = OptContext::new(3);
-        ctx.emit(ops[0].clone());
-        ctx.emit(ops[1].clone());
-        ctx.make_constant(OpRef::int_op(0), Value::Int(0));
-
-        let mut pass = OptRewrite::new();
-        let __pf_rc = std::rc::Rc::new(ops[2].clone());
-        ctx.bind_input_resops(std::slice::from_ref(&__pf_rc));
-        let result = pass.propagate_forward(&ops[2], &__pf_rc, &mut ctx);
-        assert!(matches!(result, OptimizationResult::Remove));
-        assert_eq!(
-            ctx.get_box_replacement_box(OpRef::int_op(2))
-                .and_then(|cb| cb.const_int()),
-            Some(0)
+        let (result, ctx) = run_one(
+            vec![same_i(), same_i(), bin_i(OpCode::IntRshift, 0, 1)],
+            2,
+            &[(OpRef::int_op(0), Value::Int(0))],
         );
+        assert_remove(&result);
+        assert_int_const(&ctx, OpRef::int_op(2), 0);
     }
 
     // ── Non-optimizable cases (should PassOn) ──
 
     #[test]
     fn test_int_add_no_constants() {
-        let mut ops = vec![
-            Op::new(OpCode::SameAsI, &[]),
-            Op::new(OpCode::SameAsI, &[]),
-            Op::new(
-                OpCode::IntAdd,
-                &[
-                    BoxRef::from_opref(OpRef::int_op(0)),
-                    BoxRef::from_opref(OpRef::int_op(1)),
-                ],
-            ),
-        ];
-        with_positions(&mut ops);
-        let mut ctx = OptContext::new(3);
-        ctx.emit(ops[0].clone());
-        ctx.emit(ops[1].clone());
-
-        let mut pass = OptRewrite::new();
-        let __pf_rc = std::rc::Rc::new(ops[2].clone());
-        ctx.bind_input_resops(std::slice::from_ref(&__pf_rc));
-        let result = pass.propagate_forward(&ops[2], &__pf_rc, &mut ctx);
-        assert!(matches!(result, OptimizationResult::PassOn));
+        let (result, _) = run_one(
+            vec![same_i(), same_i(), bin_i(OpCode::IntAdd, 0, 1)],
+            2,
+            &[],
+        );
+        assert_pass_on(&result);
     }
 
     #[test]
     fn test_unknown_opcode_passthrough() {
-        let mut ops = vec![Op::new(
-            OpCode::SetfieldGc,
-            &[
-                BoxRef::from_opref(OpRef::void_op(0)),
-                BoxRef::from_opref(OpRef::int_op(1)),
-            ],
-        )];
-        with_positions(&mut ops);
-        let mut ctx = OptContext::new(1);
-
-        let mut pass = OptRewrite::new();
-        let __pf_rc = std::rc::Rc::new(ops[0].clone());
-        ctx.bind_input_resops(std::slice::from_ref(&__pf_rc));
-        let result = pass.propagate_forward(&ops[0], &__pf_rc, &mut ctx);
-        assert!(matches!(result, OptimizationResult::PassOn));
+        let (result, _) = run_one(
+            vec![Op::new(
+                OpCode::SetfieldGc,
+                &[BoxRef::from_opref(OpRef::void_op(0)), i(1)],
+            )],
+            0,
+            &[],
+        );
+        assert_pass_on(&result);
     }
 
     // ── INT_AND constant fold ──
 
     #[test]
     fn test_int_and_constant_fold() {
-        let mut ops = vec![
-            Op::new(OpCode::SameAsI, &[]),
-            Op::new(OpCode::SameAsI, &[]),
-            Op::new(
-                OpCode::IntAnd,
-                &[
-                    BoxRef::from_opref(OpRef::int_op(0)),
-                    BoxRef::from_opref(OpRef::int_op(1)),
-                ],
-            ),
-        ];
-        with_positions(&mut ops);
-        let mut ctx = OptContext::new(3);
-        ctx.emit(ops[0].clone());
-        ctx.emit(ops[1].clone());
-        ctx.make_constant(OpRef::int_op(0), Value::Int(0xFF));
-        ctx.make_constant(OpRef::int_op(1), Value::Int(0x0F));
-
-        let mut pass = OptRewrite::new();
-        let __pf_rc = std::rc::Rc::new(ops[2].clone());
-        ctx.bind_input_resops(std::slice::from_ref(&__pf_rc));
-        let result = pass.propagate_forward(&ops[2], &__pf_rc, &mut ctx);
-        assert!(matches!(result, OptimizationResult::Remove));
-        assert_eq!(
-            ctx.get_box_replacement_box(OpRef::int_op(2))
-                .and_then(|cb| cb.const_int()),
-            Some(0x0F)
+        let (result, ctx) = run_one(
+            vec![same_i(), same_i(), bin_i(OpCode::IntAnd, 0, 1)],
+            2,
+            &[
+                (OpRef::int_op(0), Value::Int(0xFF)),
+                (OpRef::int_op(1), Value::Int(0x0F)),
+            ],
         );
+        assert_remove(&result);
+        assert_int_const(&ctx, OpRef::int_op(2), 0x0F);
     }
 
     // ── INT_OR constant fold ──
 
     #[test]
     fn test_int_or_constant_fold() {
-        let mut ops = vec![
-            Op::new(OpCode::SameAsI, &[]),
-            Op::new(OpCode::SameAsI, &[]),
-            Op::new(
-                OpCode::IntOr,
-                &[
-                    BoxRef::from_opref(OpRef::int_op(0)),
-                    BoxRef::from_opref(OpRef::int_op(1)),
-                ],
-            ),
-        ];
-        with_positions(&mut ops);
-        let mut ctx = OptContext::new(3);
-        ctx.emit(ops[0].clone());
-        ctx.emit(ops[1].clone());
-        ctx.make_constant(OpRef::int_op(0), Value::Int(0xF0));
-        ctx.make_constant(OpRef::int_op(1), Value::Int(0x0F));
-
-        let mut pass = OptRewrite::new();
-        let __pf_rc = std::rc::Rc::new(ops[2].clone());
-        ctx.bind_input_resops(std::slice::from_ref(&__pf_rc));
-        let result = pass.propagate_forward(&ops[2], &__pf_rc, &mut ctx);
-        assert!(matches!(result, OptimizationResult::Remove));
-        assert_eq!(
-            ctx.get_box_replacement_box(OpRef::int_op(2))
-                .and_then(|cb| cb.const_int()),
-            Some(0xFF)
+        let (result, ctx) = run_one(
+            vec![same_i(), same_i(), bin_i(OpCode::IntOr, 0, 1)],
+            2,
+            &[
+                (OpRef::int_op(0), Value::Int(0xF0)),
+                (OpRef::int_op(1), Value::Int(0x0F)),
+            ],
         );
+        assert_remove(&result);
+        assert_int_const(&ctx, OpRef::int_op(2), 0xFF);
     }
 
     // ── UINT_RSHIFT tests ──
 
     #[test]
     fn test_uint_rshift_zero() {
-        let mut ops = vec![
-            Op::new(OpCode::SameAsI, &[]),
-            Op::new(OpCode::SameAsI, &[]),
-            Op::new(
-                OpCode::UintRshift,
-                &[
-                    BoxRef::from_opref(OpRef::int_op(0)),
-                    BoxRef::from_opref(OpRef::int_op(1)),
-                ],
-            ),
-        ];
-        with_positions(&mut ops);
-        let mut ctx = OptContext::new(3);
-        ctx.emit(ops[0].clone());
-        ctx.emit(ops[1].clone());
-        ctx.make_constant(OpRef::int_op(1), Value::Int(0));
-
-        let mut pass = OptRewrite::new();
-        let __pf_rc = std::rc::Rc::new(ops[2].clone());
-        ctx.bind_input_resops(std::slice::from_ref(&__pf_rc));
-        let result = pass.propagate_forward(&ops[2], &__pf_rc, &mut ctx);
-        assert!(matches!(result, OptimizationResult::Remove));
-        assert_eq!(
-            ctx.get_box_replacement(OpRef::int_op(2)).to_opref(),
-            OpRef::int_op(0)
+        let (result, ctx) = run_one(
+            vec![same_i(), same_i(), bin_i(OpCode::UintRshift, 0, 1)],
+            2,
+            &[(OpRef::int_op(1), Value::Int(0))],
         );
+        assert_remove(&result);
+        assert_forward(&ctx, OpRef::int_op(2), OpRef::int_op(0));
     }
 
     #[test]
     fn test_uint_rshift_constant_fold() {
-        let mut ops = vec![
-            Op::new(OpCode::SameAsI, &[]),
-            Op::new(OpCode::SameAsI, &[]),
-            Op::new(
-                OpCode::UintRshift,
-                &[
-                    BoxRef::from_opref(OpRef::int_op(0)),
-                    BoxRef::from_opref(OpRef::int_op(1)),
-                ],
-            ),
-        ];
-        with_positions(&mut ops);
-        let mut ctx = OptContext::new(3);
-        ctx.emit(ops[0].clone());
-        ctx.emit(ops[1].clone());
-        ctx.make_constant(OpRef::int_op(0), Value::Int(-1)); // all ones
-        ctx.make_constant(OpRef::int_op(1), Value::Int(1));
-
-        let mut pass = OptRewrite::new();
-        let __pf_rc = std::rc::Rc::new(ops[2].clone());
-        ctx.bind_input_resops(std::slice::from_ref(&__pf_rc));
-        let result = pass.propagate_forward(&ops[2], &__pf_rc, &mut ctx);
-        assert!(matches!(result, OptimizationResult::Remove));
-        // u64::MAX >> 1 = i64::MAX
-        assert_eq!(
-            ctx.get_box_replacement_box(OpRef::int_op(2))
-                .and_then(|cb| cb.const_int()),
-            Some(i64::MAX)
+        let (result, ctx) = run_one(
+            vec![same_i(), same_i(), bin_i(OpCode::UintRshift, 0, 1)],
+            2,
+            &[
+                (OpRef::int_op(0), Value::Int(-1)), // all ones
+                (OpRef::int_op(1), Value::Int(1)),
+            ],
         );
+        assert_remove(&result);
+        // u64::MAX >> 1 = i64::MAX
+        assert_int_const(&ctx, OpRef::int_op(2), i64::MAX);
     }
 
     // ── Float optimization tests ──
 
     #[test]
     fn test_float_mul_one_right() {
-        let mut ops = vec![
-            Op::new(OpCode::SameAsF, &[]),
-            Op::new(OpCode::SameAsF, &[]),
-            Op::new(
-                OpCode::FloatMul,
-                &[
-                    BoxRef::from_opref(OpRef::float_op(0)),
-                    BoxRef::from_opref(OpRef::float_op(1)),
-                ],
-            ),
-        ];
-        with_positions(&mut ops);
-        let mut ctx = OptContext::new(3);
-        ctx.emit(ops[0].clone());
-        ctx.emit(ops[1].clone());
-        ctx.make_constant(OpRef::float_op(1), Value::Float(1.0));
-
-        let mut pass = OptRewrite::new();
-        let __pf_rc = std::rc::Rc::new(ops[2].clone());
-        ctx.bind_input_resops(std::slice::from_ref(&__pf_rc));
-        let result = pass.propagate_forward(&ops[2], &__pf_rc, &mut ctx);
-        assert!(matches!(result, OptimizationResult::Remove));
-        assert_eq!(
-            ctx.get_box_replacement(OpRef::float_op(2)).to_opref(),
-            OpRef::float_op(0)
+        let (result, ctx) = run_one(
+            vec![same_f(), same_f(), bin_f(OpCode::FloatMul, 0, 1)],
+            2,
+            &[(OpRef::float_op(1), Value::Float(1.0))],
         );
+        assert_remove(&result);
+        assert_forward(&ctx, OpRef::float_op(2), OpRef::float_op(0));
     }
 
     #[test]
     fn test_float_mul_one_left() {
-        let mut ops = vec![
-            Op::new(OpCode::SameAsF, &[]),
-            Op::new(OpCode::SameAsF, &[]),
-            Op::new(
-                OpCode::FloatMul,
-                &[
-                    BoxRef::from_opref(OpRef::float_op(0)),
-                    BoxRef::from_opref(OpRef::float_op(1)),
-                ],
-            ),
-        ];
-        with_positions(&mut ops);
-        let mut ctx = OptContext::new(3);
-        ctx.emit(ops[0].clone());
-        ctx.emit(ops[1].clone());
-        ctx.make_constant(OpRef::float_op(0), Value::Float(1.0));
-
-        let mut pass = OptRewrite::new();
-        let __pf_rc = std::rc::Rc::new(ops[2].clone());
-        ctx.bind_input_resops(std::slice::from_ref(&__pf_rc));
-        let result = pass.propagate_forward(&ops[2], &__pf_rc, &mut ctx);
-        assert!(matches!(result, OptimizationResult::Remove));
-        assert_eq!(
-            ctx.get_box_replacement(OpRef::float_op(2)).to_opref(),
-            OpRef::float_op(1)
+        let (result, ctx) = run_one(
+            vec![same_f(), same_f(), bin_f(OpCode::FloatMul, 0, 1)],
+            2,
+            &[(OpRef::float_op(0), Value::Float(1.0))],
         );
+        assert_remove(&result);
+        assert_forward(&ctx, OpRef::float_op(2), OpRef::float_op(1));
     }
 
     #[test]
@@ -4937,54 +4576,23 @@ mod tests {
     #[test]
     fn test_float_truediv_power_of_two() {
         // x / 2.0 → x * 0.5
-        let mut ops = vec![
-            Op::new(OpCode::SameAsF, &[]),
-            Op::new(OpCode::SameAsF, &[]),
-            Op::new(
-                OpCode::FloatTrueDiv,
-                &[
-                    BoxRef::from_opref(OpRef::float_op(0)),
-                    BoxRef::from_opref(OpRef::float_op(1)),
-                ],
-            ),
-        ];
-        with_positions(&mut ops);
-        let mut ctx = OptContext::new(3);
-        ctx.emit(ops[0].clone());
-        ctx.emit(ops[1].clone());
-        ctx.make_constant(OpRef::float_op(1), Value::Float(2.0));
-
-        let mut pass = OptRewrite::new();
-        let __pf_rc = std::rc::Rc::new(ops[2].clone());
-        ctx.bind_input_resops(std::slice::from_ref(&__pf_rc));
-        let result = pass.propagate_forward(&ops[2], &__pf_rc, &mut ctx);
+        let (result, _) = run_one(
+            vec![same_f(), same_f(), bin_f(OpCode::FloatTrueDiv, 0, 1)],
+            2,
+            &[(OpRef::float_op(1), Value::Float(2.0))],
+        );
         assert!(matches!(result, OptimizationResult::Emit(_)));
     }
 
     #[test]
     fn test_float_no_opt_passthrough() {
         // FloatAdd with no constants: no RPython rewrite → PassOn
-        let mut ops = vec![
-            Op::new(OpCode::SameAsF, &[]),
-            Op::new(OpCode::SameAsF, &[]),
-            Op::new(
-                OpCode::FloatAdd,
-                &[
-                    BoxRef::from_opref(OpRef::float_op(0)),
-                    BoxRef::from_opref(OpRef::float_op(1)),
-                ],
-            ),
-        ];
-        with_positions(&mut ops);
-        let mut ctx = OptContext::new(3);
-        ctx.emit(ops[0].clone());
-        ctx.emit(ops[1].clone());
-
-        let mut pass = OptRewrite::new();
-        let __pf_rc = std::rc::Rc::new(ops[2].clone());
-        ctx.bind_input_resops(std::slice::from_ref(&__pf_rc));
-        let result = pass.propagate_forward(&ops[2], &__pf_rc, &mut ctx);
-        assert!(matches!(result, OptimizationResult::PassOn));
+        let (result, _) = run_one(
+            vec![same_f(), same_f(), bin_f(OpCode::FloatAdd, 0, 1)],
+            2,
+            &[],
+        );
+        assert_pass_on(&result);
     }
 
     // ── COND_CALL tests ──
@@ -4992,60 +4600,32 @@ mod tests {
     #[test]
     fn test_cond_call_constant_false_removed() {
         // CondCallN(condition=0, func, arg1) -> removed (dead call)
-        let mut ops = vec![
-            Op::new(OpCode::SameAsI, &[]), // op0: condition (const 0)
-            Op::new(OpCode::SameAsI, &[]), // op1: func
-            Op::new(OpCode::SameAsI, &[]), // op2: arg1
-            Op::new(
-                OpCode::CondCallN,
-                &[
-                    BoxRef::from_opref(OpRef::int_op(0)),
-                    BoxRef::from_opref(OpRef::int_op(1)),
-                    BoxRef::from_opref(OpRef::int_op(2)),
-                ],
-            ), // op3
-        ];
-        with_positions(&mut ops);
-        let mut ctx = OptContext::new(4);
-        ctx.emit(ops[0].clone());
-        ctx.emit(ops[1].clone());
-        ctx.emit(ops[2].clone());
-        ctx.make_constant(OpRef::int_op(0), Value::Int(0));
-
-        let mut pass = OptRewrite::new();
-        let __pf_rc = std::rc::Rc::new(ops[3].clone());
-        ctx.bind_input_resops(std::slice::from_ref(&__pf_rc));
-        let result = pass.propagate_forward(&ops[3], &__pf_rc, &mut ctx);
-        assert!(matches!(result, OptimizationResult::Remove));
+        let (result, _) = run_one(
+            vec![
+                same_i(),
+                same_i(),
+                same_i(),
+                Op::new(OpCode::CondCallN, &[i(0), i(1), i(2)]),
+            ],
+            3,
+            &[(OpRef::int_op(0), Value::Int(0))],
+        );
+        assert_remove(&result);
     }
 
     #[test]
     fn test_cond_call_constant_true_to_direct_call() {
         // CondCallN(condition=1, func, arg1) -> CallN(func, arg1)
-        let mut ops = vec![
-            Op::new(OpCode::SameAsI, &[]), // op0: condition (const 1)
-            Op::new(OpCode::SameAsI, &[]), // op1: func
-            Op::new(OpCode::SameAsI, &[]), // op2: arg1
-            Op::new(
-                OpCode::CondCallN,
-                &[
-                    BoxRef::from_opref(OpRef::int_op(0)),
-                    BoxRef::from_opref(OpRef::int_op(1)),
-                    BoxRef::from_opref(OpRef::int_op(2)),
-                ],
-            ), // op3
-        ];
-        with_positions(&mut ops);
-        let mut ctx = OptContext::new(4);
-        ctx.emit(ops[0].clone());
-        ctx.emit(ops[1].clone());
-        ctx.emit(ops[2].clone());
-        ctx.make_constant(OpRef::int_op(0), Value::Int(1));
-
-        let mut pass = OptRewrite::new();
-        let __pf_rc = std::rc::Rc::new(ops[3].clone());
-        ctx.bind_input_resops(std::slice::from_ref(&__pf_rc));
-        let result = pass.propagate_forward(&ops[3], &__pf_rc, &mut ctx);
+        let (result, _) = run_one(
+            vec![
+                same_i(),
+                same_i(),
+                same_i(),
+                Op::new(OpCode::CondCallN, &[i(0), i(1), i(2)]),
+            ],
+            3,
+            &[(OpRef::int_op(0), Value::Int(1))],
+        );
         match result {
             OptimizationResult::Replace(op) => {
                 assert_eq!(op.opcode, OpCode::CallN);
@@ -5063,31 +4643,17 @@ mod tests {
     #[test]
     fn test_cond_call_value_nonnull_returns_value() {
         // CondCallValueI(value=42, func, arg1) -> value itself (no call needed)
-        let mut ops = vec![
-            Op::new(OpCode::SameAsI, &[]), // op0: value (const 42)
-            Op::new(OpCode::SameAsI, &[]), // op1: func
-            Op::new(OpCode::SameAsI, &[]), // op2: arg1
-            Op::new(
-                OpCode::CondCallValueI,
-                &[
-                    BoxRef::from_opref(OpRef::int_op(0)),
-                    BoxRef::from_opref(OpRef::int_op(1)),
-                    BoxRef::from_opref(OpRef::int_op(2)),
-                ],
-            ), // op3
-        ];
-        with_positions(&mut ops);
-        let mut ctx = OptContext::new(4);
-        ctx.emit(ops[0].clone());
-        ctx.emit(ops[1].clone());
-        ctx.emit(ops[2].clone());
-        ctx.make_constant(OpRef::int_op(0), Value::Int(42));
-
-        let mut pass = OptRewrite::new();
-        let __pf_rc = std::rc::Rc::new(ops[3].clone());
-        ctx.bind_input_resops(std::slice::from_ref(&__pf_rc));
-        let result = pass.propagate_forward(&ops[3], &__pf_rc, &mut ctx);
-        assert!(matches!(result, OptimizationResult::Remove));
+        let (result, ctx) = run_one(
+            vec![
+                same_i(),
+                same_i(),
+                same_i(),
+                Op::new(OpCode::CondCallValueI, &[i(0), i(1), i(2)]),
+            ],
+            3,
+            &[(OpRef::int_op(0), Value::Int(42))],
+        );
+        assert_remove(&result);
         let resolved = ctx.get_box_replacement(OpRef::int_op(3)).to_opref();
         assert!(resolved.is_constant());
         assert_eq!(
@@ -5100,30 +4666,16 @@ mod tests {
     #[test]
     fn test_cond_call_value_null_to_direct_call() {
         // CondCallValueI(value=0, func, arg1) -> CallPureI(func, arg1)
-        let mut ops = vec![
-            Op::new(OpCode::SameAsI, &[]), // op0: value (const 0)
-            Op::new(OpCode::SameAsI, &[]), // op1: func
-            Op::new(OpCode::SameAsI, &[]), // op2: arg1
-            Op::new(
-                OpCode::CondCallValueI,
-                &[
-                    BoxRef::from_opref(OpRef::int_op(0)),
-                    BoxRef::from_opref(OpRef::int_op(1)),
-                    BoxRef::from_opref(OpRef::int_op(2)),
-                ],
-            ), // op3
-        ];
-        with_positions(&mut ops);
-        let mut ctx = OptContext::new(4);
-        ctx.emit(ops[0].clone());
-        ctx.emit(ops[1].clone());
-        ctx.emit(ops[2].clone());
-        ctx.make_constant(OpRef::int_op(0), Value::Int(0));
-
-        let mut pass = OptRewrite::new();
-        let __pf_rc = std::rc::Rc::new(ops[3].clone());
-        ctx.bind_input_resops(std::slice::from_ref(&__pf_rc));
-        let result = pass.propagate_forward(&ops[3], &__pf_rc, &mut ctx);
+        let (result, _) = run_one(
+            vec![
+                same_i(),
+                same_i(),
+                same_i(),
+                Op::new(OpCode::CondCallValueI, &[i(0), i(1), i(2)]),
+            ],
+            3,
+            &[(OpRef::int_op(0), Value::Int(0))],
+        );
         match result {
             OptimizationResult::Replace(op) => {
                 assert_eq!(op.opcode, OpCode::CallPureI);
@@ -5142,117 +4694,33 @@ mod tests {
         // PtrEq(x, x) -> 1
         // resoperation.py:739 InputArgRef / 615 RefOp `type = 'r'`: ptr
         // boxes carry the Ref variant tag, not Int.
-        let mut ops = vec![
-            Op::new(OpCode::SameAsR, &[]), // op0: x
-            Op::new(
-                OpCode::PtrEq,
-                &[
-                    BoxRef::from_opref(OpRef::ref_op(0)),
-                    BoxRef::from_opref(OpRef::ref_op(0)),
-                ],
-            ), // op1
-        ];
-        with_positions(&mut ops);
-        let mut ctx = OptContext::new(2);
-        ctx.emit(ops[0].clone());
-
-        let mut pass = OptRewrite::new();
-        let __pf_rc = std::rc::Rc::new(ops[1].clone());
-        ctx.bind_input_resops(std::slice::from_ref(&__pf_rc));
-        let result = pass.propagate_forward(&ops[1], &__pf_rc, &mut ctx);
-        assert!(matches!(result, OptimizationResult::Remove));
-        assert_eq!(
-            ctx.get_box_replacement_box(OpRef::int_op(1))
-                .and_then(|cb| cb.const_int()),
-            Some(1)
-        );
+        let (result, ctx) = run_one(vec![same_r(), bin_r(OpCode::PtrEq, 0, 0)], 1, &[]);
+        assert_remove(&result);
+        assert_int_const(&ctx, OpRef::int_op(1), 1);
     }
 
     #[test]
     fn test_ptr_ne_same_opref() {
         // PtrNe(x, x) -> 0
-        let mut ops = vec![
-            Op::new(OpCode::SameAsR, &[]), // op0: x
-            Op::new(
-                OpCode::PtrNe,
-                &[
-                    BoxRef::from_opref(OpRef::ref_op(0)),
-                    BoxRef::from_opref(OpRef::ref_op(0)),
-                ],
-            ), // op1
-        ];
-        with_positions(&mut ops);
-        let mut ctx = OptContext::new(2);
-        ctx.emit(ops[0].clone());
-
-        let mut pass = OptRewrite::new();
-        let __pf_rc = std::rc::Rc::new(ops[1].clone());
-        ctx.bind_input_resops(std::slice::from_ref(&__pf_rc));
-        let result = pass.propagate_forward(&ops[1], &__pf_rc, &mut ctx);
-        assert!(matches!(result, OptimizationResult::Remove));
-        assert_eq!(
-            ctx.get_box_replacement_box(OpRef::int_op(1))
-                .and_then(|cb| cb.const_int()),
-            Some(0)
-        );
+        let (result, ctx) = run_one(vec![same_r(), bin_r(OpCode::PtrNe, 0, 0)], 1, &[]);
+        assert_remove(&result);
+        assert_int_const(&ctx, OpRef::int_op(1), 0);
     }
 
     #[test]
     fn test_instance_ptr_eq_same_opref() {
         // InstancePtrEq(x, x) -> 1
-        let mut ops = vec![
-            Op::new(OpCode::SameAsR, &[]), // op0: x
-            Op::new(
-                OpCode::InstancePtrEq,
-                &[
-                    BoxRef::from_opref(OpRef::ref_op(0)),
-                    BoxRef::from_opref(OpRef::ref_op(0)),
-                ],
-            ), // op1
-        ];
-        with_positions(&mut ops);
-        let mut ctx = OptContext::new(2);
-        ctx.emit(ops[0].clone());
-
-        let mut pass = OptRewrite::new();
-        let __pf_rc = std::rc::Rc::new(ops[1].clone());
-        ctx.bind_input_resops(std::slice::from_ref(&__pf_rc));
-        let result = pass.propagate_forward(&ops[1], &__pf_rc, &mut ctx);
-        assert!(matches!(result, OptimizationResult::Remove));
-        assert_eq!(
-            ctx.get_box_replacement_box(OpRef::int_op(1))
-                .and_then(|cb| cb.const_int()),
-            Some(1)
-        );
+        let (result, ctx) = run_one(vec![same_r(), bin_r(OpCode::InstancePtrEq, 0, 0)], 1, &[]);
+        assert_remove(&result);
+        assert_int_const(&ctx, OpRef::int_op(1), 1);
     }
 
     #[test]
     fn test_instance_ptr_ne_same_opref() {
         // InstancePtrNe(x, x) -> 0
-        let mut ops = vec![
-            Op::new(OpCode::SameAsR, &[]), // op0: x
-            Op::new(
-                OpCode::InstancePtrNe,
-                &[
-                    BoxRef::from_opref(OpRef::ref_op(0)),
-                    BoxRef::from_opref(OpRef::ref_op(0)),
-                ],
-            ), // op1
-        ];
-        with_positions(&mut ops);
-        let mut ctx = OptContext::new(2);
-        ctx.emit(ops[0].clone());
-
-        let mut pass = OptRewrite::new();
-        let __pf_rc = std::rc::Rc::new(ops[1].clone());
-        ctx.bind_input_resops(std::slice::from_ref(&__pf_rc));
-        let result = pass.propagate_forward(&ops[1], &__pf_rc, &mut ctx);
-        assert!(matches!(result, OptimizationResult::Remove));
-        assert_eq!(
-            ctx.get_box_replacement_box(OpRef::int_op(1))
-                .and_then(|cb| cb.const_int()),
-            Some(0)
-        );
+        let (result, ctx) = run_one(vec![same_r(), bin_r(OpCode::InstancePtrNe, 0, 0)], 1, &[]);
+        assert_remove(&result);
+        assert_int_const(&ctx, OpRef::int_op(1), 0);
     }
 
     #[test]
@@ -5263,34 +4731,20 @@ mod tests {
         // False for distinct ConstPtr, so it falls through to `emit(op)`
         // (line 564). The actual constant fold lives in the pure pass
         // (pure.py:126-136 → execute_ptr_compare_const), not rewrite.
-        let mut ops = vec![
-            Op::new(OpCode::SameAsR, &[]), // op0: const 100
-            Op::new(OpCode::SameAsR, &[]), // op1: const 200
-            Op::new(
-                OpCode::PtrEq,
-                &[
-                    BoxRef::from_opref(OpRef::ref_op(0)),
-                    BoxRef::from_opref(OpRef::ref_op(1)),
-                ],
-            ), // op2
-        ];
-        with_positions(&mut ops);
-        let mut ctx = OptContext::new(3);
-        ctx.emit(ops[0].clone());
-        ctx.emit(ops[1].clone());
         // history.py:307 ConstPtr — Value::Ref must land on a Ref-tagged
         // OpRef so the box class identity matches the resoperation.py:615
         // RefOp mixin of the producer SameAsR.
-        ctx.make_constant(OpRef::ref_op(0), Value::Ref(GcRef(100)));
-        ctx.make_constant(OpRef::ref_op(1), Value::Ref(GcRef(200)));
-
-        let mut pass = OptRewrite::new();
-        let __pf_rc = std::rc::Rc::new(ops[2].clone());
-        ctx.bind_input_resops(std::slice::from_ref(&__pf_rc));
-        let result = pass.propagate_forward(&ops[2], &__pf_rc, &mut ctx);
+        let (result, ctx) = run_one(
+            vec![same_r(), same_r(), bin_r(OpCode::PtrEq, 0, 1)],
+            2,
+            &[
+                (OpRef::ref_op(0), Value::Ref(GcRef(100))),
+                (OpRef::ref_op(1), Value::Ref(GcRef(200))),
+            ],
+        );
         // rewrite.py:564 `return self.emit(op)` — rewrite passes the op on
         // unchanged; it does not fold distinct constants.
-        assert!(matches!(result, OptimizationResult::PassOn));
+        assert_pass_on(&result);
         assert_eq!(
             ctx.get_box_replacement_box(OpRef::int_op(2))
                 .and_then(|cb| cb.const_int()),
@@ -5304,68 +4758,23 @@ mod tests {
     fn test_cast_ptr_to_int_passes_through() {
         // rewrite.py:807-809: CastPtrToInt registers pure inverse, emits.
         // arg0 is a Ref box (resoperation.py:615 RefOp `type = 'r'`).
-        let mut ops = vec![
-            Op::new(OpCode::SameAsR, &[]), // op0: x
-            Op::new(
-                OpCode::CastPtrToInt,
-                &[BoxRef::from_opref(OpRef::ref_op(0))],
-            ), // op1
-        ];
-        with_positions(&mut ops);
-        let mut ctx = OptContext::new(2);
-        ctx.emit(ops[0].clone());
-
-        let mut pass = OptRewrite::new();
-        let __pf_rc = std::rc::Rc::new(ops[1].clone());
-        ctx.bind_input_resops(std::slice::from_ref(&__pf_rc));
-        let result = pass.propagate_forward(&ops[1], &__pf_rc, &mut ctx);
-        assert!(matches!(result, OptimizationResult::PassOn));
+        let (result, _) = run_one(vec![same_r(), unary_r(OpCode::CastPtrToInt, 0)], 1, &[]);
+        assert_pass_on(&result);
     }
 
     #[test]
     fn test_cast_int_to_ptr_passes_through() {
         // rewrite.py:811-813: CastIntToPtr registers pure inverse, emits.
-        let mut ops = vec![
-            Op::new(OpCode::SameAsI, &[]), // op0: x
-            Op::new(
-                OpCode::CastIntToPtr,
-                &[BoxRef::from_opref(OpRef::int_op(0))],
-            ), // op1
-        ];
-        with_positions(&mut ops);
-        let mut ctx = OptContext::new(2);
-        ctx.emit(ops[0].clone());
-
-        let mut pass = OptRewrite::new();
-        let __pf_rc = std::rc::Rc::new(ops[1].clone());
-        ctx.bind_input_resops(std::slice::from_ref(&__pf_rc));
-        let result = pass.propagate_forward(&ops[1], &__pf_rc, &mut ctx);
-        assert!(matches!(result, OptimizationResult::PassOn));
+        let (result, _) = run_one(vec![same_i(), unary_i(OpCode::CastIntToPtr, 0)], 1, &[]);
+        assert_pass_on(&result);
     }
 
     #[test]
     fn test_cast_opaque_ptr_eliminated() {
         // CastOpaquePtr(x) -> x
-        let mut ops = vec![
-            Op::new(OpCode::SameAsR, &[]), // op0: x
-            Op::new(
-                OpCode::CastOpaquePtr,
-                &[BoxRef::from_opref(OpRef::ref_op(0))],
-            ), // op1
-        ];
-        with_positions(&mut ops);
-        let mut ctx = OptContext::new(2);
-        ctx.emit(ops[0].clone());
-
-        let mut pass = OptRewrite::new();
-        let __pf_rc = std::rc::Rc::new(ops[1].clone());
-        ctx.bind_input_resops(std::slice::from_ref(&__pf_rc));
-        let result = pass.propagate_forward(&ops[1], &__pf_rc, &mut ctx);
-        assert!(matches!(result, OptimizationResult::Remove));
-        assert_eq!(
-            ctx.get_box_replacement(OpRef::ref_op(1)).to_opref(),
-            OpRef::ref_op(0)
-        );
+        let (result, ctx) = run_one(vec![same_r(), unary_r(OpCode::CastOpaquePtr, 0)], 1, &[]);
+        assert_remove(&result);
+        assert_forward(&ctx, OpRef::ref_op(1), OpRef::ref_op(0));
     }
 
     // ── CONVERT_FLOAT_BYTES tests ──
@@ -5375,43 +4784,23 @@ mod tests {
 
     #[test]
     fn test_convert_float_bytes_to_longlong_passes_through() {
-        let mut ops = vec![
-            Op::new(OpCode::SameAsF, &[]), // op0: x
-            Op::new(
-                OpCode::ConvertFloatBytesToLonglong,
-                &[BoxRef::from_opref(OpRef::float_op(0))],
-            ), // op1
-        ];
-        with_positions(&mut ops);
-        let mut ctx = OptContext::new(2);
-        ctx.emit(ops[0].clone());
-
-        let mut pass = OptRewrite::new();
-        let __pf_rc = std::rc::Rc::new(ops[1].clone());
-        ctx.bind_input_resops(std::slice::from_ref(&__pf_rc));
-        let result = pass.propagate_forward(&ops[1], &__pf_rc, &mut ctx);
-        assert!(matches!(result, OptimizationResult::PassOn));
+        let (result, _) = run_one(
+            vec![same_f(), unary_f(OpCode::ConvertFloatBytesToLonglong, 0)],
+            1,
+            &[],
+        );
+        assert_pass_on(&result);
     }
 
     #[test]
     fn test_convert_longlong_bytes_to_float_passes_through() {
-        let mut ops = vec![
-            Op::new(OpCode::SameAsI, &[]), // op0: x
-            Op::new(
-                OpCode::ConvertLonglongBytesToFloat,
-                &[BoxRef::from_opref(OpRef::int_op(0))],
-            ), // op1
-        ];
-        with_positions(&mut ops);
-        let mut ctx = OptContext::new(2);
-        ctx.emit(ops[0].clone());
-
-        let mut pass = OptRewrite::new();
-        let __pf_rc = std::rc::Rc::new(ops[1].clone());
-        ctx.bind_input_resops(std::slice::from_ref(&__pf_rc));
-        let result = pass.propagate_forward(&ops[1], &__pf_rc, &mut ctx);
+        let (result, _) = run_one(
+            vec![same_i(), unary_i(OpCode::ConvertLonglongBytesToFloat, 0)],
+            1,
+            &[],
+        );
         // PassOn: op is emitted, no replacement registered.
-        assert!(matches!(result, OptimizationResult::PassOn));
+        assert_pass_on(&result);
     }
 
     // ── GUARD_NO_EXCEPTION tests ──
@@ -5481,14 +4870,8 @@ mod tests {
     #[test]
     fn test_guard_future_condition_records_and_removes() {
         // rewrite.py: GUARD_FUTURE_CONDITION → record in patchguardop + remove
-        let mut op = Op::new(OpCode::GuardFutureCondition, &[]);
-        op.pos.set(OpRef::void_op(0));
-        let mut ctx = OptContext::new(1);
-        let mut pass = OptRewrite::new();
-        let __pf_rc = std::rc::Rc::new(op.clone());
-        ctx.bind_input_resops(std::slice::from_ref(&__pf_rc));
-        let result = pass.propagate_forward(&op, &__pf_rc, &mut ctx);
-        assert!(matches!(result, OptimizationResult::Remove));
+        let (result, ctx) = run_one(vec![Op::new(OpCode::GuardFutureCondition, &[])], 0, &[]);
+        assert_remove(&result);
         assert!(ctx.patchguardop.is_some());
         assert_eq!(
             ctx.patchguardop.unwrap().opcode,
