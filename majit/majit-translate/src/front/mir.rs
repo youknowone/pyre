@@ -2760,14 +2760,20 @@ fn impl_method_owner_for_fundecl(llbc: &Llbc, fd: &FunDecl) -> Option<(String, S
 /// registered so the dual gate does not Skip with "not registered in
 /// PyreCallRegistry".
 ///
-/// Mirrors the syn extractor's segment convention so the registration
-/// key matches the call-site lookup: a free fn keys as `[module,
-/// ident]` (the crate-stripped `name_path` stem kept as one segment,
-/// matching the syn `prefix` push); an impl method keys as
+/// The single registration key must equal the call-site lookup. A free
+/// fn keys as the crate-included `name_path()` split on every `::`
+/// (`["pyre_interpreter", "objspace", "std", "mapdict", "fn"]`) — the
+/// exact segment vector the Call terminator and `FnDef`-constant
+/// call-sites emit (`call_target_segments` / `decode_constant` both
+/// `name_path().split("::")` without stripping the crate).
+/// `register_unsafe_fn_stubs` registers a single verbatim key with no
+/// alias fan-out (unlike `free_function_alias_paths`), and three-plus-
+/// segment paths are excluded from the `lookup_with_leaf_match`
+/// fallback, so a crate-stripped or module-collapsed key would miss the
+/// nested call site.  An impl method keys as
 /// `[owner-module-segments..., Owner, method]` (the
-/// `impl_method_owner_for_fundecl` qualified owner split on `::`, the
-/// same `[module, Owner, method]` shape `register_function_graph`
-/// uses).  Argument names are synthesised `arg{N}` by
+/// `impl_method_owner_for_fundecl` qualified owner split on `::`).
+/// Argument names are synthesised `arg{N}` by
 /// `signature.inputs.len()`; the receiver is counted on both sides
 /// (Charon includes `self` in `inputs`, the syn
 /// `extract_argnames_from_sig` emits a `self` entry), so the count
@@ -2793,6 +2799,14 @@ pub(crate) fn collect_unsafe_fn_stubs_from_llbc(
         if fd.is_global_initializer.is_some() {
             continue;
         }
+        // Reference returns (`&bool`, `&()`, …) are not plain unit/bool
+        // stubs: `tyref_to_ast_string` strips the reference to its
+        // referent, which would misclassify `&bool` as `bool`.  The syn
+        // extractor's `simple_return_type_to_lltype` rejects
+        // `syn::Type::Reference`, so skip references here to match it.
+        if output_type_is_ref(&fd.signature.output, llbc) {
+            continue;
+        }
         let lltype = match tyref_to_ast_string(&fd.signature.output, llbc).as_str() {
             "()" => LowLevelType::Void,
             "bool" => LowLevelType::Bool,
@@ -2804,19 +2818,12 @@ pub(crate) fn collect_unsafe_fn_stubs_from_llbc(
                 segs.push(leaf);
                 segs
             }
-            None => {
-                let stripped = strip_crate_prefix(&fd.item_meta.name_path());
-                let (module_path, name) = match stripped.rsplit_once("::") {
-                    Some((module, leaf)) => (module.to_string(), leaf.to_string()),
-                    None => (String::new(), stripped),
-                };
-                let mut segs = Vec::new();
-                if !module_path.is_empty() {
-                    segs.push(module_path);
-                }
-                segs.push(name);
-                segs
-            }
+            None => fd
+                .item_meta
+                .name_path()
+                .split("::")
+                .map(String::from)
+                .collect(),
         };
         let argnames: Vec<String> = (0..fd.signature.inputs.len())
             .map(|i| format!("arg{i}"))
@@ -3418,6 +3425,50 @@ fn is_unit_type(ty: &TyRef, llbc: &Llbc) -> bool {
         .and_then(|t| t.as_array())
         .is_some_and(|t| t.is_empty());
     is_tuple && empty_types
+}
+
+/// True when `ty`'s top-level constructor — after the dedup /
+/// hash-cons indirections [`charon_type_value_to_ast_string`] itself
+/// follows — is a reference (`&T` / `&mut T`).
+///
+/// `tyref_to_ast_string` strips references to their referent, so a
+/// `-> &bool` return would otherwise classify as a plain `bool` stub.
+/// `simple_return_type_to_lltype` rejects `syn::Type::Reference` (only
+/// a bare `bool` / unit projects), so the unsafe-stub collector skips
+/// reference returns to keep the stub set parity-exact.
+fn output_type_is_ref(ty: &TyRef, llbc: &Llbc) -> bool {
+    let mut node = match ty {
+        TyRef::Inline { value: (_, v) } => v,
+        TyRef::Other(v) => v,
+        TyRef::Dedup { id } => match llbc.dedup_body(*id) {
+            Some(v) => v,
+            None => return false,
+        },
+    };
+    for _ in 0..24 {
+        let Some(obj) = node.as_object() else {
+            return false;
+        };
+        if let Some(id) = obj.get("Deduplicated").and_then(serde_json::Value::as_u64) {
+            match llbc.dedup_body(id) {
+                Some(body) => {
+                    node = body;
+                    continue;
+                }
+                None => return false,
+            }
+        }
+        if let Some(arr) = obj
+            .get("HashConsedValue")
+            .and_then(serde_json::Value::as_array)
+            && arr.len() == 2
+        {
+            node = &arr[1];
+            continue;
+        }
+        return obj.contains_key("Ref");
+    }
+    false
 }
 
 /// Resolve a Charon [`TyRef`] to the Rust type STRING the
