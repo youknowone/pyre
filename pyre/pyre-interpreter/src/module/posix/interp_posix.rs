@@ -39,6 +39,13 @@ fn stat_result_seq_type() -> PyObjectRef {
                     "st_atime_ns",
                     "st_mtime_ns",
                     "st_ctime_ns",
+                    // `build_stat_result` (interp_posix.py:554-557) +
+                    // `rposix_stat.py STAT_FIELDS += ALL_STAT_FIELDS[-3:]`
+                    // — the sub-second nanosecond remainders, exposed on
+                    // every platform.
+                    "nsec_atime",
+                    "nsec_mtime",
+                    "nsec_ctime",
                     // `app_posix.py:45-48` — present where the platform's
                     // `struct stat` carries them (every Unix target).
                     #[cfg(unix)]
@@ -47,6 +54,10 @@ fn stat_result_seq_type() -> PyObjectRef {
                     "st_blocks",
                     #[cfg(unix)]
                     "st_rdev",
+                    // `rposix_stat.py` exposes `st_flags` where the C
+                    // `struct stat` carries it (BSD family / macOS).
+                    #[cfg(target_os = "macos")]
+                    "st_flags",
                 ],
             )
         })
@@ -770,7 +781,46 @@ pub fn register_module(ns: &mut DictStorage) {
     // (st_mode, st_ino, ...). We expose it as a plain instance with
     // attributes so that both `os.stat(p).st_mode` and
     // `os.stat(p)[0]` work.
-    fn make_stat_result(meta: &std::fs::Metadata) -> pyre_object::PyObjectRef {
+    // `st_flags` lives in the BSD/macOS `struct stat` but `std`'s
+    // `Metadata`/`MetadataExt` does not surface it, so read it with a raw
+    // `stat`/`lstat`/`fstat`; on failure default to 0 (the primary
+    // metadata read already succeeded).
+    #[cfg(target_os = "macos")]
+    fn macos_path_st_flags(path: &str, follow: bool) -> u32 {
+        let Ok(c) = std::ffi::CString::new(path) else {
+            return 0;
+        };
+        unsafe {
+            let mut st: libc::stat = std::mem::zeroed();
+            let rc = if follow {
+                libc::stat(c.as_ptr(), &mut st)
+            } else {
+                libc::lstat(c.as_ptr(), &mut st)
+            };
+            if rc == 0 {
+                st.st_flags
+            } else {
+                0
+            }
+        }
+    }
+    #[cfg(target_os = "macos")]
+    fn macos_fd_st_flags(fd: i32) -> u32 {
+        unsafe {
+            let mut st: libc::stat = std::mem::zeroed();
+            if libc::fstat(fd, &mut st) == 0 {
+                st.st_flags
+            } else {
+                0
+            }
+        }
+    }
+
+    /// `st_flags` (macOS/BSD) is not surfaced by `std::fs::Metadata`, so
+    /// the caller obtains it via a raw `stat`/`lstat`/`fstat` and passes
+    /// it in; it is ignored (and unread) on platforms whose `struct stat`
+    /// lacks the field.
+    fn make_stat_result(meta: &std::fs::Metadata, st_flags: u32) -> pyre_object::PyObjectRef {
         // Extract stat fields in a cross-platform way.
         #[cfg(unix)]
         let (
@@ -893,6 +943,21 @@ pub fn register_module(ns: &mut DictStorage) {
             ("st_atime_ns", pyre_object::w_int_new(st_atime_ns)),
             ("st_mtime_ns", pyre_object::w_int_new(st_mtime_ns)),
             ("st_ctime_ns", pyre_object::w_int_new(st_ctime_ns)),
+            // `build_stat_result` (interp_posix.py:554-557): the
+            // sub-second remainder of each full-nanosecond timestamp,
+            // `value % 1_000_000_000` (non-negative for pre-1970 times).
+            (
+                "nsec_atime",
+                pyre_object::w_int_new(st_atime_ns.rem_euclid(1_000_000_000)),
+            ),
+            (
+                "nsec_mtime",
+                pyre_object::w_int_new(st_mtime_ns.rem_euclid(1_000_000_000)),
+            ),
+            (
+                "nsec_ctime",
+                pyre_object::w_int_new(st_ctime_ns.rem_euclid(1_000_000_000)),
+            ),
         ];
         #[cfg(unix)]
         {
@@ -900,6 +965,10 @@ pub fn register_module(ns: &mut DictStorage) {
             extras.push(("st_blocks", pyre_object::w_int_new(st_blocks)));
             extras.push(("st_rdev", pyre_object::w_int_new(st_rdev)));
         }
+        #[cfg(target_os = "macos")]
+        extras.push(("st_flags", pyre_object::w_int_new(st_flags as i64)));
+        #[cfg(not(target_os = "macos"))]
+        let _ = st_flags;
         crate::structseq::new_instance_with_extra(stat_result_seq_type(), seq, extras)
     }
     fn stat_impl(
@@ -937,7 +1006,13 @@ pub fn register_module(ns: &mut DictStorage) {
             host_fs::symlink_metadata(&path_str)
         };
         match meta {
-            Ok(m) => Ok(make_stat_result(&m)),
+            Ok(m) => {
+                #[cfg(target_os = "macos")]
+                let st_flags = macos_path_st_flags(&path_str, follow_symlinks);
+                #[cfg(not(target_os = "macos"))]
+                let st_flags = 0u32;
+                Ok(make_stat_result(&m, st_flags))
+            }
             Err(e) => {
                 let kind = e.raw_os_error().unwrap_or(2);
                 Err(crate::PyError::os_error_with_errno(
@@ -1026,7 +1101,13 @@ pub fn register_module(ns: &mut DictStorage) {
                     let meta = f.metadata();
                     let _ = std::mem::ManuallyDrop::new(f); // don't close
                     match meta {
-                        Ok(m) => Ok(make_stat_result(&m)),
+                        Ok(m) => {
+                            #[cfg(target_os = "macos")]
+                            let st_flags = macos_fd_st_flags(fd);
+                            #[cfg(not(target_os = "macos"))]
+                            let st_flags = 0u32;
+                            Ok(make_stat_result(&m, st_flags))
+                        }
                         Err(e) => Err(crate::PyError::os_error_with_errno(
                             e.raw_os_error().unwrap_or(9),
                             format!("{}", e),
