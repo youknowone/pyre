@@ -18,6 +18,96 @@ fn locale_error(message: &str) -> crate::PyError {
     err
 }
 
+/// Numeric/monetary locale parameters decoded into owned buffers, the
+/// `lconv` fields `localeconv` exposes (`interp_locale.py:48`).
+struct LocaleConvData {
+    decimal_point: Vec<u8>,
+    thousands_sep: Vec<u8>,
+    grouping: Vec<i64>,
+    int_curr_symbol: Vec<u8>,
+    currency_symbol: Vec<u8>,
+    mon_decimal_point: Vec<u8>,
+    mon_thousands_sep: Vec<u8>,
+    mon_grouping: Vec<i64>,
+    positive_sign: Vec<u8>,
+    negative_sign: Vec<u8>,
+    int_frac_digits: i64,
+    frac_digits: i64,
+    p_cs_precedes: i64,
+    p_sep_by_space: i64,
+    n_cs_precedes: i64,
+    n_sep_by_space: i64,
+    p_sign_posn: i64,
+    n_sign_posn: i64,
+}
+
+/// Build the `localeconv()` result dict.  String fields decode the host
+/// bytes as UTF-8; grouping lists already carry the trailing 0 that
+/// `_w_copy_grouping` appends to a non-empty grouping
+/// (`interp_locale.py:36-40`).
+fn localeconv_to_dict(c: &LocaleConvData) -> pyre_object::PyObjectRef {
+    let d = pyre_object::w_dict_new();
+    let put_str = |k: &str, b: &[u8]| unsafe {
+        pyre_object::w_dict_setitem_str(d, k, pyre_object::w_str_new(&String::from_utf8_lossy(b)));
+    };
+    let put_int = |k: &str, v: i64| unsafe {
+        pyre_object::w_dict_setitem_str(d, k, pyre_object::w_int_new(v));
+    };
+    let put_grouping = |k: &str, v: &[i64]| unsafe {
+        pyre_object::w_dict_setitem_str(
+            d,
+            k,
+            pyre_object::w_list_new(v.iter().map(|&x| pyre_object::w_int_new(x)).collect()),
+        );
+    };
+    put_str("decimal_point", &c.decimal_point);
+    put_str("thousands_sep", &c.thousands_sep);
+    put_grouping("grouping", &c.grouping);
+    put_str("int_curr_symbol", &c.int_curr_symbol);
+    put_str("currency_symbol", &c.currency_symbol);
+    put_str("mon_decimal_point", &c.mon_decimal_point);
+    put_str("mon_thousands_sep", &c.mon_thousands_sep);
+    put_grouping("mon_grouping", &c.mon_grouping);
+    put_str("positive_sign", &c.positive_sign);
+    put_str("negative_sign", &c.negative_sign);
+    put_int("int_frac_digits", c.int_frac_digits);
+    put_int("frac_digits", c.frac_digits);
+    put_int("p_cs_precedes", c.p_cs_precedes);
+    put_int("p_sep_by_space", c.p_sep_by_space);
+    put_int("n_cs_precedes", c.n_cs_precedes);
+    put_int("n_sep_by_space", c.n_sep_by_space);
+    put_int("p_sign_posn", c.p_sign_posn);
+    put_int("n_sign_posn", c.n_sign_posn);
+    d
+}
+
+/// POSIX "C" locale `localeconv` defaults for builds without libc; the
+/// char-typed fields default to `CHAR_MAX` (no value provided).
+#[cfg(not(all(unix, feature = "host_env")))]
+fn c_locale_conv() -> LocaleConvData {
+    const CHAR_MAX: i64 = 127;
+    LocaleConvData {
+        decimal_point: b".".to_vec(),
+        thousands_sep: Vec::new(),
+        grouping: Vec::new(),
+        int_curr_symbol: Vec::new(),
+        currency_symbol: Vec::new(),
+        mon_decimal_point: Vec::new(),
+        mon_thousands_sep: Vec::new(),
+        mon_grouping: Vec::new(),
+        positive_sign: Vec::new(),
+        negative_sign: Vec::new(),
+        int_frac_digits: CHAR_MAX,
+        frac_digits: CHAR_MAX,
+        p_cs_precedes: CHAR_MAX,
+        p_sep_by_space: CHAR_MAX,
+        n_cs_precedes: CHAR_MAX,
+        n_sep_by_space: CHAR_MAX,
+        p_sign_posn: CHAR_MAX,
+        n_sign_posn: CHAR_MAX,
+    }
+}
+
 /// `_locale` C-extension stub — PyPy: pypy/module/_locale/.
 ///
 /// Provides the 'C' locale defaults so locale.py's `from _locale import *`
@@ -86,83 +176,52 @@ pub fn register_module(ns: &mut DictStorage) {
     );
     crate::dict_storage_store(ns, "Error", w_error);
 
-    // localeconv() — returns the 'C' locale parameters as a dict.
+    // localeconv() — numeric/monetary parameters of the current locale.
     crate::dict_storage_store(
         ns,
         "localeconv",
         crate::make_builtin_function_with_arity(
             "localeconv",
             |_| {
-                let d = pyre_object::w_dict_new();
-                unsafe {
-                    pyre_object::w_dict_setitem_str(
-                        d,
-                        "grouping",
-                        pyre_object::w_list_new(vec![pyre_object::w_int_new(127)]),
-                    );
-                    pyre_object::w_dict_setitem_str(
-                        d,
-                        "currency_symbol",
-                        pyre_object::w_str_new(""),
-                    );
-                    pyre_object::w_dict_setitem_str(d, "n_sign_posn", pyre_object::w_int_new(127));
-                    pyre_object::w_dict_setitem_str(
-                        d,
-                        "p_cs_precedes",
-                        pyre_object::w_int_new(127),
-                    );
-                    pyre_object::w_dict_setitem_str(
-                        d,
-                        "n_cs_precedes",
-                        pyre_object::w_int_new(127),
-                    );
-                    pyre_object::w_dict_setitem_str(
-                        d,
-                        "mon_grouping",
-                        pyre_object::w_list_new(vec![]),
-                    );
-                    pyre_object::w_dict_setitem_str(
-                        d,
-                        "n_sep_by_space",
-                        pyre_object::w_int_new(127),
-                    );
-                    pyre_object::w_dict_setitem_str(
-                        d,
-                        "decimal_point",
-                        pyre_object::w_str_new("."),
-                    );
-                    pyre_object::w_dict_setitem_str(d, "negative_sign", pyre_object::w_str_new(""));
-                    pyre_object::w_dict_setitem_str(d, "positive_sign", pyre_object::w_str_new(""));
-                    pyre_object::w_dict_setitem_str(
-                        d,
-                        "p_sep_by_space",
-                        pyre_object::w_int_new(127),
-                    );
-                    pyre_object::w_dict_setitem_str(
-                        d,
-                        "int_curr_symbol",
-                        pyre_object::w_str_new(""),
-                    );
-                    pyre_object::w_dict_setitem_str(d, "p_sign_posn", pyre_object::w_int_new(127));
-                    pyre_object::w_dict_setitem_str(d, "thousands_sep", pyre_object::w_str_new(""));
-                    pyre_object::w_dict_setitem_str(
-                        d,
-                        "mon_thousands_sep",
-                        pyre_object::w_str_new(""),
-                    );
-                    pyre_object::w_dict_setitem_str(d, "frac_digits", pyre_object::w_int_new(127));
-                    pyre_object::w_dict_setitem_str(
-                        d,
-                        "mon_decimal_point",
-                        pyre_object::w_str_new(""),
-                    );
-                    pyre_object::w_dict_setitem_str(
-                        d,
-                        "int_frac_digits",
-                        pyre_object::w_int_new(127),
-                    );
+                #[cfg(all(unix, feature = "host_env"))]
+                {
+                    let lc = rustpython_host_env::locale::localeconv_data();
+                    // `_w_copy_grouping` appends a trailing 0 to a non-empty
+                    // grouping; the host helper already strips the C
+                    // terminator (`interp_locale.py:36-40`).
+                    let grouping_of = |g: &[libc::c_char]| -> Vec<i64> {
+                        let mut v: Vec<i64> = g.iter().map(|&x| x as i64).collect();
+                        if !v.is_empty() {
+                            v.push(0);
+                        }
+                        v
+                    };
+                    let data = LocaleConvData {
+                        decimal_point: lc.decimal_point.clone(),
+                        thousands_sep: lc.thousands_sep.clone(),
+                        grouping: grouping_of(&lc.grouping),
+                        int_curr_symbol: lc.int_curr_symbol.clone(),
+                        currency_symbol: lc.currency_symbol.clone(),
+                        mon_decimal_point: lc.mon_decimal_point.clone(),
+                        mon_thousands_sep: lc.mon_thousands_sep.clone(),
+                        mon_grouping: grouping_of(&lc.mon_grouping),
+                        positive_sign: lc.positive_sign.clone(),
+                        negative_sign: lc.negative_sign.clone(),
+                        int_frac_digits: lc.int_frac_digits as i64,
+                        frac_digits: lc.frac_digits as i64,
+                        p_cs_precedes: lc.p_cs_precedes as i64,
+                        p_sep_by_space: lc.p_sep_by_space as i64,
+                        n_cs_precedes: lc.n_cs_precedes as i64,
+                        n_sep_by_space: lc.n_sep_by_space as i64,
+                        p_sign_posn: lc.p_sign_posn as i64,
+                        n_sign_posn: lc.n_sign_posn as i64,
+                    };
+                    Ok(localeconv_to_dict(&data))
                 }
-                Ok(d)
+                #[cfg(not(all(unix, feature = "host_env")))]
+                {
+                    Ok(localeconv_to_dict(&c_locale_conv()))
+                }
             },
             0,
         ),
@@ -335,7 +394,19 @@ pub fn register_module(ns: &mut DictStorage) {
                         "strxfrm() argument must be str",
                     ));
                 }
-                Ok(s)
+                #[cfg(all(unix, feature = "host_env"))]
+                {
+                    let sv = unsafe { pyre_object::w_str_get_value(s).to_string() };
+                    let c = std::ffi::CString::new(sv.as_bytes())
+                        .map_err(|_| crate::PyError::value_error("embedded null character"))?;
+                    let out = rustpython_host_env::locale::strxfrm(&c, sv.len() + 1);
+                    Ok(pyre_object::w_str_new(&String::from_utf8_lossy(&out)))
+                }
+                #[cfg(not(all(unix, feature = "host_env")))]
+                {
+                    // No libc collation available — the transform is identity.
+                    Ok(s)
+                }
             },
             1,
         ),
