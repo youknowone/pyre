@@ -4522,6 +4522,39 @@ fn dispatch_residual_call_iRd_kind(
     let allboxes = build_allboxes(funcptr, &r_args, &argbox_types, call_descr.arg_types());
     ensure_residual_call_args_bound(&allboxes, op.pc)?;
 
+    // Sub-slice 5c step 2 probe — surfaces funcptr + r-bank arg raw addrs for
+    // every iRd-shape residual_call.  The eventual STORE_SUBSCR specialization
+    // hook (steps 3-5) keys on a fn-pointer match against `bh_store_subscr_fn`
+    // and on `r_args.len() == 3` with `dst_bank == 'v'`.  Probe is env-gated so
+    // production paths see zero overhead.  PyObjectRef construction from the
+    // GcRef payload is deferred to step 4 (FrameOps lift), which lands
+    // alongside the specialization branch; this probe stays at the raw-usize
+    // layer to keep the conversion seam single-sourced.
+    if std::env::var_os("PYRE_PROBE_SUBSCR").is_some() {
+        let funcptr_addr =
+            ctx.trace_ctx
+                .box_value(funcptr)
+                .and_then(|v| match v {
+                    majit_ir::Value::Int(n) => Some(n as u64),
+                    _ => None,
+                });
+        let arg_addrs: Vec<Option<u64>> = r_args
+            .iter()
+            .map(|&op| ctx.trace_ctx.box_value(op).and_then(|v| match v {
+                majit_ir::Value::Ref(r) => Some(r.as_usize() as u64),
+                _ => None,
+            }))
+            .collect();
+        eprintln!(
+            "[PYRE_PROBE_SUBSCR] dispatch_residual_call_iRd_kind pc={} dst_bank={} r_args.len={} funcptr_addr={:?} arg_addrs={:?}",
+            op.pc,
+            dst_bank,
+            r_args.len(),
+            funcptr_addr.map(|a| format!("{:#x}", a)),
+            arg_addrs.iter().map(|o| o.map(|a| format!("{:#x}", a))).collect::<Vec<_>>(),
+        );
+    }
+
     let ei = call_descr.get_extra_info();
     // pyjitpl.py:2003-2005 OS_NOT_IN_TRACE guard — see helper docstring
     // for the convergence rationale.
