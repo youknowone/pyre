@@ -200,10 +200,12 @@ impl Trace {
     /// Resolve one operand `OpRef` to its canonical `BoxRef`. Const operands
     /// carry their `Value` inline on the `OpRef` (history.py:227/268/314) and
     /// are minted via `from_opref`; InputArg / ResOp operands resolve to the
-    /// producing `InputArg` / `Op` already held in `self.inputargs` / `self.ops`.
-    /// Falls back to the position-only `from_opref` view for any operand that
-    /// does not resolve to a recorded producer (preserving the prior behavior
-    /// rather than introducing a new index panic).
+    /// producing `InputArg` / `Op` already held in `self.inputargs` / `self.ops`,
+    /// which are dense by construction. A non-const operand that does not resolve
+    /// to a recorded producer is a recorder invariant violation and panics
+    /// (opencoder.py:635/640 assert position rather than mint); the S0/#121 probe
+    /// measured 0 hits across the corpus. `#[cfg(test)]` fixtures that build
+    /// position-only synthetic operands keep the `from_opref` view.
     fn box_for_operand(&self, r: OpRef) -> BoxRef {
         if r.is_none() || r.is_constant() {
             return BoxRef::from_opref(r);
@@ -212,6 +214,15 @@ impl Trace {
             if let Some(ia) = self.inputargs.get(r.raw() as usize) {
                 return BoxRef::from_bound_inputarg(ia);
             }
+            // S3/#124: inputargs are dense `[0, n)`, so an InputArg operand
+            // always resolves above (opencoder.py:635 asserts).
+            #[cfg(not(test))]
+            panic!(
+                "box_for_operand: InputArg operand {r:?} outside dense \
+                 inputargs[0,{}) (opencoder.py:635)",
+                self.inputargs.len()
+            );
+            #[cfg(test)]
             return BoxRef::from_opref(r);
         }
         // ResOp operand: positions are dense in op_count order — inputargs
@@ -226,6 +237,15 @@ impl Trace {
                 }
             }
         }
+        // S3/#124: a ResOp operand always has a dense producer in `ops`
+        // (positions are op_count order; opencoder.py:640 asserts).
+        #[cfg(not(test))]
+        panic!(
+            "box_for_operand: ResOp operand {r:?} has no dense producer in \
+             ops[0,{}) (opencoder.py:640)",
+            self.ops.len()
+        );
+        #[cfg(test)]
         BoxRef::from_opref(r)
     }
 

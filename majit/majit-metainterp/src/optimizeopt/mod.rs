@@ -4135,10 +4135,21 @@ impl OptContext {
     /// still need an integer handle bridge back with `.to_opref()` (the
     /// remaining `Op.args` / fail-args boundary, retired at S-12).
     ///
-    /// Total over `opref`: an unresolvable root (sentinel / test baseline,
-    /// where `get_box_replacement_box` is `None`) falls back to a
-    /// position-only `BoxRef::from_opref`, so `get_box_replacement(o)
-    /// .to_opref() == o` there — preserving the prior `OpRef`-walker contract.
+    /// Total over `opref`: an unresolvable root falls back to a position-only
+    /// `BoxRef::from_opref`, so `get_box_replacement(o).to_opref() == o` there,
+    /// preserving the `OpRef`-walker contract. This fallback is **load-bearing**
+    /// (S0/#121 probe measured 530 hits over the corpus, all value-bearing): on
+    /// top of the sentinel / test-baseline roots, the peel-boundary
+    /// `get_box_replacement(x).to_opref()` idiom — `unroll.rs` `_expand_info` /
+    /// `import_state`, `optimizer.rs` short-preamble export, `virtualstate.rs`,
+    /// `opref_type` — resolves Phase-1 `OpRef`s whose producer `Op` is absent
+    /// from this rebuilt Phase-2 `OptContext`'s live stores (`find_producer_op`
+    /// misses). Those callers immediately re-`to_opref()` the result and only
+    /// need the round-tripped `OpRef`, so the position-only box suffices.
+    /// Converging this to the orthodox "never fabricate a box"
+    /// (resoperation.py:57-68) is blocked on the cross-phase resolution gap
+    /// (S9/#115): the Phase-1 producer must be reachable from the Phase-2
+    /// context before this can assert instead of mint.
     pub fn get_box_replacement(&self, opref: OpRef) -> crate::r#box::BoxRef {
         self.get_box_replacement_box(opref)
             .unwrap_or_else(|| crate::r#box::BoxRef::from_opref(opref))
