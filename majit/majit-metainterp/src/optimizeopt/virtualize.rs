@@ -298,13 +298,11 @@ impl VirtualizableTracker {
     /// a later read could fold against must be dropped before the write.
     fn invalidate_array(&self, array_box: &crate::r#box::BoxRef, ctx: &mut OptContext) {
         if let Some((frame_ref, array_idx)) = self.resolve_array_source(array_box, ctx) {
-            if let Some(b) = ctx.ensure_box(frame_ref) {
-                ctx.with_ptr_info_mut(&b, |info| {
-                    if let PtrInfo::Virtualizable(vstate) = info {
-                        vstate.arrays.retain(|(i, _)| *i != array_idx);
-                    }
-                });
-            }
+            ctx.with_ptr_info_mut(&frame_ref, |info| {
+                if let PtrInfo::Virtualizable(vstate) = info {
+                    vstate.arrays.retain(|(i, _)| *i != array_idx);
+                }
+            });
         }
     }
 

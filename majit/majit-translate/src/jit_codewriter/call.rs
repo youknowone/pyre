@@ -5100,6 +5100,7 @@ fn effectinfo_from_writeanalyze(
         return EffectInfo {
             extraeffect: ExtraEffect::RandomEffects,
             oopspecindex,
+            pyre_helper: majit_ir::PyreHelperKind::None,
             _readonly_descrs_fields: None,
             _write_descrs_fields: None,
             _readonly_descrs_arrays: None,
@@ -5288,6 +5289,7 @@ fn effectinfo_from_writeanalyze(
     EffectInfo {
         extraeffect,
         oopspecindex,
+        pyre_helper: majit_ir::PyreHelperKind::None,
         _readonly_descrs_fields: Some(read_descrs_fields_arcs),
         _write_descrs_fields: Some(write_descrs_fields_arcs),
         _readonly_descrs_arrays: Some(read_descrs_arrays_arcs),

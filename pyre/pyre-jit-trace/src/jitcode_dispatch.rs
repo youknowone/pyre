@@ -894,7 +894,7 @@ pub enum DispatchError {
     /// function-entry call) was recorded with a concrete-NULL Ref
     /// argument. This is the specialized direct-call shape: the callee
     /// was folded to its entry address and the `PUSH_NULL` self-slot is
-    /// baked as `ptr(0x0)`. `try_execute_residual_call_via_walker` skips
+    /// baked as `ptr(0x0)`. `try_execute_residual_call_via_executor` skips
     /// such a call (its NULL-receiver SEGV guard), so the result stays
     /// unresolved, and the baked NULL arg makes the compiled call pass
     /// NULL where the entry needs the callee's globals/closure — yielding
@@ -4183,6 +4183,20 @@ thread_local! {
 /// residual's Ref arg is a mapped boxed bool we fold its result to the raw
 /// truth Int (bool→int is value-preserving), eliding the may-force unbox; the
 /// now-dead box + stack store are then DCE'd by the optimizer.
+///
+/// pyre-only side table, NOT an upstream structure: `jtransform.py:196-234`
+/// `optimize_goto_if_not` fuses compare+branch at codewriter (graph-rewrite)
+/// time — it removes the compare op (`block.operations.remove(op)`) and folds
+/// it into `block.exitswitch`, so PyPy never materializes a boxed bool or an
+/// `is_true` unbox and needs no runtime side table.  The full-body walker
+/// consumes a JitCode that did NOT receive that fusion (the `COMPARE_OP`
+/// specialization boxes the result; `POP_JUMP_IF_*` lowers to a separate
+/// `is_true` residual), so this is a RUNTIME reconstruction of that STATIC
+/// fusion.  Read+write are both gated on `WalkContext::is_authoritative_executor`
+/// (true only inside the two FBW walk entry points) and the map is cleared at
+/// every walk boundary by `void_defer_reset` — see there — so it cannot leak
+/// across traces; OpRef SSA-uniqueness (`recorder.rs`) keeps a key from ever
+/// re-binding within one walk.
 thread_local! {
     static BOOL_BOX_TRUTH: std::cell::RefCell<Vec<(OpRef, OpRef)>> =
         const { std::cell::RefCell::new(Vec::new()) };
@@ -4203,8 +4217,12 @@ fn bool_box_truth_lookup(boxed: OpRef) -> Option<OpRef> {
     })
 }
 
-/// Clear the deferred-void-store log at the start of an authoritative walk so a
-/// prior aborted walk's events never leak into the next one.
+/// Clear the deferred-void-store log AND the [`BOOL_BOX_TRUTH`] map at the
+/// start of an authoritative walk so a prior aborted walk's events never leak
+/// into the next one.  This is the reset boundary for both thread-locals; it is
+/// called at the two FBW walk entry points (`trace.rs` `full_body_walk_trace`
+/// at walk start, and after `probe_walk_perfn_jitcode` discards its throwaway
+/// trace), which are the only sites that set `is_authoritative_executor`.
 pub fn void_defer_reset() {
     VOID_DEFER_LOG.with(|log| log.borrow_mut().clear());
     BOOL_BOX_TRUTH.with(|m| m.borrow_mut().clear());
@@ -4395,7 +4413,7 @@ fn try_execute_residual_call_via_executor(
     // code pointer to `bh_load_const_fn`, which dereferences it via
     // `w_code_get_ptr` and faults.  Leave it symbolic, mirroring the fold's
     // "falls through to the generic record" contract.
-    if call_descr.get_extra_info().oopspecindex == majit_ir::OopSpecIndex::LoadConst {
+    if call_descr.get_extra_info().pyre_helper == majit_ir::PyreHelperKind::LoadConst {
         return None;
     }
     let funcptr_val = ctx.trace_ctx.box_value(allboxes[0]);
@@ -6359,7 +6377,7 @@ fn try_walker_inline_user_call(
     op: &DecodedOp,
     code: &[u8],
     r_args: &[OpRef],
-    oopspec: majit_ir::OopSpecIndex,
+    pyre_helper: majit_ir::PyreHelperKind,
     dst_bank: char,
     dst: usize,
 ) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
@@ -6368,19 +6386,20 @@ fn try_walker_inline_user_call(
     }
     // Only a genuine Python call helper (`call_fn` / `call_fn_N`) is an
     // inline target.  It is the only `dispatch_residual_call_iRd_kind`
-    // helper that carries no oopspec — every container/builtin helper
-    // routed here (`store_subscr_fn` -> StoreSubscr, `set_current_exception`,
-    // ...) sets a distinct `oopspecindex` (flatten.rs builders, e.g.
-    // `build_store_subscr_fn_residual_call_r_v_insn` -> StoreSubscr).
-    // Without this guard `d[f] = v` with a 1-arg function key `f` lowers to
-    // `residual_call_r_v(store_subscr_fn, [d, f, v])`, whose r_args[1] passes
-    // the function sniff below and is mis-inlined as `f(v)`, skipping the
-    // store.  `normalize_raise_varargs_fn` also has oopspec None but its
-    // r_args[1] is the raised exception object, never a callable on any
-    // non-erroring path.  Upstream never inlines a Python call at a
-    // residual_call site (inlinable calls get their own inline_call jitcodes);
-    // this restores that invariant for the pyre FBW inline-at-residual lever.
-    if oopspec != majit_ir::OopSpecIndex::None {
+    // helper that carries no `pyre_helper` tag — every container/builtin
+    // helper routed here (`store_subscr_fn` -> StoreSubscr,
+    // `set_current_exception`, ...) sets a distinct `pyre_helper`
+    // (flatten.rs builders, e.g. `build_residual_call_r_v_insn_from_operands`
+    // -> StoreSubscr).  Without this guard `d[f] = v` with a 1-arg function
+    // key `f` lowers to `residual_call_r_v(store_subscr_fn, [d, f, v])`, whose
+    // r_args[1] passes the function sniff below and is mis-inlined as `f(v)`,
+    // skipping the store.  `normalize_raise_varargs_fn` carries no
+    // `pyre_helper` either, but its r_args[1] is the raised exception object,
+    // never a callable on any non-erroring path.  Upstream never inlines a
+    // Python call at a residual_call site (inlinable calls get their own
+    // inline_call jitcodes); this restores that invariant for the pyre FBW
+    // inline-at-residual lever.
+    if pyre_helper != majit_ir::PyreHelperKind::None {
         return Ok(None);
     }
     if r_args.len() < 2 {
@@ -6642,10 +6661,10 @@ fn dispatch_residual_call_iRd_kind(
     // #62 slice (3c): attempt full-body-walk inline of a user-function call
     // (dev-gated PYRE_FBW_INLINE).  Eligible exact-positional closure-free
     // calls sub-walk the callee body in place of the residual; ineligible
-    // calls (including every non-`call_fn` helper, gated on `oopspecindex`)
+    // calls (including every non-`call_fn` helper, gated on `pyre_helper`)
     // fall through with no IR emitted.
     if let Some(inlined) =
-        try_walker_inline_user_call(ctx, op, code, &r_args, ei.oopspecindex, dst_bank, dst)?
+        try_walker_inline_user_call(ctx, op, code, &r_args, ei.pyre_helper, dst_bank, dst)?
     {
         return Ok(inlined);
     }
@@ -6724,8 +6743,10 @@ fn dispatch_residual_call_iRd_kind(
     // is the boxed bool a preceding COMPARE specialization produced.  Folding
     // it to the raw truth Int elides the may-force unbox (and lets the dead box
     // + value-stack store DCE), matching the trait path's branch-on-raw-compare
-    // behaviour.  bool->int is value-preserving so the fold is sound.  Consume
-    // the map entry so a later genuine use of the same box is not mis-folded.
+    // behaviour.  bool->int is value-preserving so the fold is sound.  The
+    // lookup is read-only (it does not remove the entry); OpRef SSA-uniqueness
+    // (`recorder.rs`) guarantees the box opref never re-binds within one walk,
+    // so a stale mis-fold is impossible and physical removal is unnecessary.
     if ctx.is_authoritative_executor && dst_bank == 'i' && r_args.len() == 1 {
         if let Some(truth) = bool_box_truth_lookup(r_args[0]) {
             write_residual_call_result_to_dst(ctx, op.pc, dst, dst_bank, truth)?;
@@ -6739,7 +6760,7 @@ fn dispatch_residual_call_iRd_kind(
     // iteration.  Falls through to the generic residual otherwise (SAFE).
     if ctx.is_authoritative_executor
         && dst_bank == 'v'
-        && ei.oopspecindex == majit_ir::OopSpecIndex::StoreSubscr
+        && ei.pyre_helper == majit_ir::PyreHelperKind::StoreSubscr
         && try_walker_specialize_store_subscr(ctx, op.pc, &r_args)?.is_some()
     {
         return Ok((DispatchOutcome::Continue, op.next_pc));
@@ -7886,7 +7907,7 @@ fn try_walker_specialize_subscr(
 ///
 /// No concrete execution: the recorded `setarrayitem_raw` performs the
 /// mutation at runtime (the void residual was likewise not walk-executed —
-/// `try_execute_residual_call_via_walker` skips Void results), so the walk's
+/// `try_execute_residual_call_via_executor` skips Void results), so the walk's
 /// concrete state is unchanged relative to the generic leg.  Object-storage
 /// lists, long values, strategy mismatches, negative indices, and
 /// non-`list[int]` operands fall through to the generic `CALL_MAY_FORCE`
@@ -8249,7 +8270,7 @@ fn dispatch_residual_call_iIRd_kind(
     // have produced — the indexed entry is loop-invariant — and suppress the
     // residual.  Falls through to the generic record when either operand is
     // not concrete (the residual stays correct in that case).
-    if ei.oopspecindex == majit_ir::OopSpecIndex::LoadConst {
+    if ei.pyre_helper == majit_ir::PyreHelperKind::LoadConst {
         if let (Some(&idx_opref), Some(&code_opref)) = (i_args.first(), r_args.first()) {
             if let (
                 Some(majit_ir::Value::Int(consti)),
@@ -8293,7 +8314,7 @@ fn dispatch_residual_call_iIRd_kind(
     // gate stays until the Phase-5 production flip validates the full FBW
     // bench suite with the fold on.
     if ctx.is_authoritative_executor
-        && ei.oopspecindex == majit_ir::OopSpecIndex::LoadGlobal
+        && ei.pyre_helper == majit_ir::PyreHelperKind::LoadGlobal
         && !jitcode_has_exception_handler(code)
         && std::env::var("PYRE_FBW_LOADGLOBAL_FOLD").is_ok()
     {
@@ -8336,7 +8357,7 @@ fn dispatch_residual_call_iIRd_kind(
     // (`getfield_gc_pure`) forwards through the setfield and the box DCEs
     // when it never escapes.  The concrete shadow carries the authentic
     // boxed pointer so downstream specializations still see a concrete int.
-    if ei.oopspecindex == majit_ir::OopSpecIndex::BoxInt && dst_bank == 'r' {
+    if ei.pyre_helper == majit_ir::PyreHelperKind::BoxInt && dst_bank == 'r' {
         if let Some(&raw_arg) = i_args.first() {
             if let Some(boxed_ptr) = walker_execute_may_force_boxed(ctx, &allboxes, call_descr) {
                 let boxed = crate::state::wrapint(ctx.trace_ctx, raw_arg);
@@ -8359,12 +8380,12 @@ fn dispatch_residual_call_iIRd_kind(
     // `compare_value_direct`.  Falls through to the generic record for
     // non-int operands / deferred operators.
     if matches!(
-        ei.oopspecindex,
-        majit_ir::OopSpecIndex::BinaryOp | majit_ir::OopSpecIndex::CompareOp
+        ei.pyre_helper,
+        majit_ir::PyreHelperKind::BinaryOp | majit_ir::PyreHelperKind::CompareOp
     ) {
         if let Some(&tag_opref) = i_args.first() {
             if let Some(majit_ir::Value::Int(op_tag)) = ctx.trace_ctx.box_value(tag_opref) {
-                let specialized = if ei.oopspecindex == majit_ir::OopSpecIndex::BinaryOp {
+                let specialized = if ei.pyre_helper == majit_ir::PyreHelperKind::BinaryOp {
                     let is_subscr = matches!(
                         pyre_interpreter::runtime_ops::binary_op_from_tag(op_tag),
                         Some(pyre_interpreter::bytecode::BinaryOperator::Subscr)
@@ -8633,7 +8654,6 @@ fn dispatch_residual_call_iIRFd_kind(
         // float-stores (`irf_v`) are caught inside the helper's
         // `result_type() == Void` arm and deferred (#61), so the compiled
         // loop's re-run does not double-apply the store.
-        try_execute_residual_call_via_walker(ctx, call_opcode, &allboxes, call_descr, recorded);
 
         // Non-elidable concrete-execute parity (Task #390 sub-slice 3)
         // — see `dispatch_residual_call_iRd_kind` for the full citation.

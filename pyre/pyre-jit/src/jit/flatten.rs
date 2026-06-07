@@ -3192,7 +3192,7 @@ where
         lhs_operand,
         rhs_operand,
         CallFlavor::MayForce,
-        majit_ir::OopSpecIndex::BinaryOp,
+        majit_ir::PyreHelperKind::BinaryOp,
         result_reg,
     ))
 }
@@ -3225,7 +3225,7 @@ pub fn build_binary_op_residual_call_ir_r_insn(
         Operand::Register(Register::new(Kind::Ref, lhs_reg)),
         Operand::Register(Register::new(Kind::Ref, rhs_reg)),
         CallFlavor::MayForce,
-        majit_ir::OopSpecIndex::BinaryOp,
+        majit_ir::PyreHelperKind::BinaryOp,
         Register::new(Kind::Ref, dst_reg),
     )
 }
@@ -3260,7 +3260,7 @@ fn build_residual_call_ir_r_insn_from_operands(
     lhs_operand: Operand,
     rhs_operand: Operand,
     flavor: CallFlavor,
-    oopspec: majit_ir::OopSpecIndex,
+    pyre_helper: majit_ir::PyreHelperKind,
     dst_reg: Register,
 ) -> Insn {
     let mut effect_info = effect_info_for_call_flavor(flavor);
@@ -3269,10 +3269,11 @@ fn build_residual_call_ir_r_insn_from_operands(
     // specialization (guard_class + getfield_gc + int/float_OP +
     // new_with_vtable) instead of recording an opaque CALL_MAY_FORCE.
     // The walker cannot match the helper by fnaddr (pyre-jit-trace does
-    // not depend on pyre-jit), so the oopspec on the descr's EffectInfo
-    // is the recognition vehicle. `OopSpecIndex::None` for callers that
-    // are not a recognized specialization.
-    effect_info.oopspecindex = oopspec;
+    // not depend on pyre-jit), so the `pyre_helper` tag on the descr's
+    // EffectInfo is the recognition vehicle (kept off `oopspecindex` so
+    // `has_oopspec()` stays false for ordinary calls). `PyreHelperKind::None`
+    // for callers that are not a recognized specialization.
+    effect_info.pyre_helper = pyre_helper;
     let descr_operand = Operand::descr(DescrOperand::CallDescrStub(CallDescrStub {
         effect_info,
         arg_kinds: vec![Kind::Ref, Kind::Ref, Kind::Int],
@@ -3349,7 +3350,7 @@ where
         lhs_operand,
         rhs_operand,
         CallFlavor::MayForce,
-        majit_ir::OopSpecIndex::CompareOp,
+        majit_ir::PyreHelperKind::CompareOp,
         result_reg,
     ))
 }
@@ -3378,7 +3379,7 @@ pub fn build_compare_op_residual_call_ir_r_insn(
         Operand::Register(Register::new(Kind::Ref, lhs_reg)),
         Operand::Register(Register::new(Kind::Ref, rhs_reg)),
         CallFlavor::MayForce,
-        majit_ir::OopSpecIndex::CompareOp,
+        majit_ir::PyreHelperKind::CompareOp,
         Register::new(Kind::Ref, dst_reg),
     )
 }
@@ -3490,9 +3491,9 @@ fn build_load_global_fn_insn_from_operands(
     let mut effect_info = effect_info_for_call_flavor(CallFlavor::Plain);
     // Tag the calldescr so the full-body walker can recognize this as the
     // `LOAD_GLOBAL` module-dict read and emit the cell-cache fold; the
-    // recognition reader is dev-gated and default-off (see OopSpecIndex::
-    // LoadGlobal).
-    effect_info.oopspecindex = majit_ir::OopSpecIndex::LoadGlobal;
+    // recognition reader is dev-gated and default-off (see
+    // PyreHelperKind::LoadGlobal).
+    effect_info.pyre_helper = majit_ir::PyreHelperKind::LoadGlobal;
     let descr_operand = Operand::descr(DescrOperand::CallDescrStub(CallDescrStub {
         effect_info,
         arg_kinds: vec![Kind::Ref, Kind::Ref, Kind::Ref, Kind::Int],
@@ -3775,7 +3776,7 @@ fn build_residual_call_ir_r_insn_from_int_only_operands(
     // `box_int_fn` boxes a raw Int into a fresh `PyLong`; tag it so the
     // full-body walker emits the virtualizable `new_with_vtable` +
     // `setfield_gc` form instead of an opaque CanRaise residual.
-    effect_info.oopspecindex = majit_ir::OopSpecIndex::BoxInt;
+    effect_info.pyre_helper = majit_ir::PyreHelperKind::BoxInt;
     let descr_operand = Operand::descr(DescrOperand::CallDescrStub(CallDescrStub {
         effect_info,
         arg_kinds: vec![Kind::Int],
@@ -4150,7 +4151,7 @@ where
         ctx.store_subscr_fn_idx,
         vec![obj_operand, key_operand, value_operand],
         CallFlavor::MayForce,
-        majit_ir::OopSpecIndex::StoreSubscr,
+        majit_ir::PyreHelperKind::StoreSubscr,
     ))
 }
 
@@ -4405,7 +4406,7 @@ pub fn build_store_subscr_fn_residual_call_r_v_insn(
             Operand::Register(Register::new(Kind::Ref, value_reg)),
         ],
         CallFlavor::MayForce,
-        majit_ir::OopSpecIndex::StoreSubscr,
+        majit_ir::PyreHelperKind::StoreSubscr,
     )
 }
 
@@ -4431,7 +4432,7 @@ pub fn build_set_current_exception_fn_residual_call_r_v_insn(
         set_current_exception_fn_idx,
         vec![Operand::Register(Register::new(Kind::Ref, exc_reg))],
         CallFlavor::PlainCannotRaiseNoHeap,
-        majit_ir::OopSpecIndex::None,
+        majit_ir::PyreHelperKind::None,
     )
 }
 
@@ -4448,11 +4449,11 @@ fn build_residual_call_r_v_insn_from_operands(
     fn_idx: u16,
     ref_operands: Vec<Operand>,
     flavor: CallFlavor,
-    oopspec: majit_ir::OopSpecIndex,
+    pyre_helper: majit_ir::PyreHelperKind,
 ) -> Insn {
     let arg_kinds = vec![Kind::Ref; ref_operands.len()];
     let mut effect_info = effect_info_for_call_flavor(flavor);
-    effect_info.oopspecindex = oopspec;
+    effect_info.pyre_helper = pyre_helper;
     let descr_operand = Operand::descr(DescrOperand::CallDescrStub(CallDescrStub {
         effect_info,
         arg_kinds,
@@ -4557,7 +4558,7 @@ fn build_residual_call_ir_r_single_ref_plain_insn_from_operands(
     dst_reg: Register,
 ) -> Insn {
     let mut effect_info = effect_info_for_call_flavor(CallFlavor::Plain);
-    effect_info.oopspecindex = majit_ir::OopSpecIndex::LoadConst;
+    effect_info.pyre_helper = majit_ir::PyreHelperKind::LoadConst;
     let descr_operand = Operand::descr(DescrOperand::CallDescrStub(CallDescrStub {
         effect_info,
         arg_kinds: vec![Kind::Ref, Kind::Int],
@@ -6571,7 +6572,7 @@ mod tests {
         // full-body walker can recognize + specialize it (#57); the
         // hand-built dual-write descr must mirror that tag.
         let mut may_force_ei = effect_info_for_call_flavor(CallFlavor::MayForce);
-        may_force_ei.oopspecindex = majit_ir::OopSpecIndex::BinaryOp;
+        may_force_ei.pyre_helper = majit_ir::PyreHelperKind::BinaryOp;
         let descr = intern_call_descr_stub(
             may_force_ei,
             vec![Kind::Ref, Kind::Ref, Kind::Int],
@@ -7257,7 +7258,7 @@ mod tests {
                         DescrOperand::CallDescrStub(stub) => {
                             assert_eq!(stub.arg_kinds, vec![Kind::Ref, Kind::Int]);
                             let mut expected_ei = effect_info_for_call_flavor(CallFlavor::Plain);
-                            expected_ei.oopspecindex = majit_ir::OopSpecIndex::LoadConst;
+                            expected_ei.pyre_helper = majit_ir::PyreHelperKind::LoadConst;
                             assert_eq!(stub.effect_info, expected_ei);
                         }
                         other => panic!("expected CallDescrStub, got {other:?}"),
@@ -7323,7 +7324,7 @@ mod tests {
                         DescrOperand::CallDescrStub(stub) => {
                             assert_eq!(stub.arg_kinds, vec![Kind::Ref, Kind::Int]);
                             let mut expected_ei = effect_info_for_call_flavor(CallFlavor::Plain);
-                            expected_ei.oopspecindex = majit_ir::OopSpecIndex::LoadConst;
+                            expected_ei.pyre_helper = majit_ir::PyreHelperKind::LoadConst;
                             assert_eq!(stub.effect_info, expected_ei);
                         }
                         other => panic!("expected CallDescrStub, got {other:?}"),
@@ -7356,7 +7357,7 @@ mod tests {
         let descr = intern_call_descr_stub(
             {
                 let mut ei = effect_info_for_call_flavor(CallFlavor::Plain);
-                ei.oopspecindex = majit_ir::OopSpecIndex::LoadConst;
+                ei.pyre_helper = majit_ir::PyreHelperKind::LoadConst;
                 ei
             },
             vec![Kind::Ref, Kind::Int],
@@ -7462,7 +7463,7 @@ mod tests {
                             );
                             assert_eq!(stub.effect_info, {
                                 let mut ei = effect_info_for_call_flavor(CallFlavor::Plain);
-                                ei.oopspecindex = majit_ir::OopSpecIndex::LoadGlobal;
+                                ei.pyre_helper = majit_ir::PyreHelperKind::LoadGlobal;
                                 ei
                             });
                         }
@@ -7596,7 +7597,7 @@ mod tests {
                             );
                             assert_eq!(stub.effect_info, {
                                 let mut ei = effect_info_for_call_flavor(CallFlavor::Plain);
-                                ei.oopspecindex = majit_ir::OopSpecIndex::LoadGlobal;
+                                ei.pyre_helper = majit_ir::PyreHelperKind::LoadGlobal;
                                 ei
                             });
                         }
@@ -7626,7 +7627,7 @@ mod tests {
         let descr = intern_call_descr_stub(
             {
                 let mut ei = effect_info_for_call_flavor(CallFlavor::Plain);
-                ei.oopspecindex = majit_ir::OopSpecIndex::LoadGlobal;
+                ei.pyre_helper = majit_ir::PyreHelperKind::LoadGlobal;
                 ei
             },
             vec![Kind::Ref, Kind::Ref, Kind::Ref, Kind::Int],
@@ -7965,7 +7966,7 @@ mod tests {
                         DescrOperand::CallDescrStub(stub) => {
                             assert_eq!(stub.arg_kinds, vec![Kind::Int]);
                             let mut expected_ei = effect_info_for_call_flavor(CallFlavor::Plain);
-                            expected_ei.oopspecindex = majit_ir::OopSpecIndex::BoxInt;
+                            expected_ei.pyre_helper = majit_ir::PyreHelperKind::BoxInt;
                             assert_eq!(stub.effect_info, expected_ei);
                         }
                         other => panic!("expected CallDescrStub, got {other:?}"),
@@ -8016,7 +8017,7 @@ mod tests {
         let descr = intern_call_descr_stub(
             {
                 let mut ei = effect_info_for_call_flavor(CallFlavor::Plain);
-                ei.oopspecindex = majit_ir::OopSpecIndex::BoxInt;
+                ei.pyre_helper = majit_ir::PyreHelperKind::BoxInt;
                 ei
             },
             vec![Kind::Int],
