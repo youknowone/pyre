@@ -3051,6 +3051,13 @@ fn getarrayitem_vable_via_metainterp(
     dst_bank: char,
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
     let vable = read_ref_reg(code, op, 0, ctx)?;
+    // An unseeded walker Ref register holds `OpRef::None` (`raw() ==
+    // u32::MAX`); feeding it into the metainterp vable path would resize
+    // the heapcache flag vector to 16 GiB. Bail to a trace abort, mirroring
+    // the scalar `getfield_vable_via_metainterp` guard.
+    if vable.is_none() {
+        return Err(DispatchError::VableBoxNotSeeded { pc: op.pc });
+    }
     let index = read_int_reg(code, op, 1, ctx)?;
     // pyjitpl.py:1206 `indexbox.getint()` — the array slot is chosen from
     // the concrete index. Fail loud if the walker can't resolve it.
@@ -3134,6 +3141,11 @@ fn setarrayitem_vable_via_metainterp(
     value_bank: char,
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
     let vable = read_ref_reg(code, op, 0, ctx)?;
+    // See `getarrayitem_vable_via_metainterp`: an unseeded `OpRef::None`
+    // vable would resize the heapcache flag vector to 16 GiB; bail instead.
+    if vable.is_none() {
+        return Err(DispatchError::VableBoxNotSeeded { pc: op.pc });
+    }
     let index = read_int_reg(code, op, 1, ctx)?;
     let index_value = match ctx.trace_ctx.concrete_of_opref(index) {
         Some(Value::Int(v)) => v,
@@ -3177,6 +3189,11 @@ fn arraylen_vable_via_metainterp(
     ctx: &mut WalkContext<'_, '_>,
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
     let vable = read_ref_reg(code, op, 0, ctx)?;
+    // See `getarrayitem_vable_via_metainterp`: an unseeded `OpRef::None`
+    // vable would resize the heapcache flag vector to 16 GiB; bail instead.
+    if vable.is_none() {
+        return Err(DispatchError::VableBoxNotSeeded { pc: op.pc });
+    }
     let vable_struct_ptr = match read_ref_reg_concrete(code, op, 0, ctx) {
         ConcreteValue::Ref(ptr) => ptr as i64,
         ConcreteValue::Null | ConcreteValue::Int(_) | ConcreteValue::Float(_) => 0,
@@ -6342,10 +6359,28 @@ fn try_walker_inline_user_call(
     op: &DecodedOp,
     code: &[u8],
     r_args: &[OpRef],
+    oopspec: majit_ir::OopSpecIndex,
     dst_bank: char,
     dst: usize,
 ) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
     if !ctx.is_authoritative_executor || std::env::var("PYRE_FBW_INLINE").is_err() {
+        return Ok(None);
+    }
+    // Only a genuine Python call helper (`call_fn` / `call_fn_N`) is an
+    // inline target.  It is the only `dispatch_residual_call_iRd_kind`
+    // helper that carries no oopspec — every container/builtin helper
+    // routed here (`store_subscr_fn` -> StoreSubscr, `set_current_exception`,
+    // ...) sets a distinct `oopspecindex` (flatten.rs builders, e.g.
+    // `build_store_subscr_fn_residual_call_r_v_insn` -> StoreSubscr).
+    // Without this guard `d[f] = v` with a 1-arg function key `f` lowers to
+    // `residual_call_r_v(store_subscr_fn, [d, f, v])`, whose r_args[1] passes
+    // the function sniff below and is mis-inlined as `f(v)`, skipping the
+    // store.  `normalize_raise_varargs_fn` also has oopspec None but its
+    // r_args[1] is the raised exception object, never a callable on any
+    // non-erroring path.  Upstream never inlines a Python call at a
+    // residual_call site (inlinable calls get their own inline_call jitcodes);
+    // this restores that invariant for the pyre FBW inline-at-residual lever.
+    if oopspec != majit_ir::OopSpecIndex::None {
         return Ok(None);
     }
     if r_args.len() < 2 {
@@ -6602,11 +6637,16 @@ fn dispatch_residual_call_iRd_kind(
         code[op.pc + 1 + descr_offset + 2] as usize
     };
 
+    let ei = call_descr.get_extra_info();
+
     // #62 slice (3c): attempt full-body-walk inline of a user-function call
     // (dev-gated PYRE_FBW_INLINE).  Eligible exact-positional closure-free
     // calls sub-walk the callee body in place of the residual; ineligible
-    // calls fall through with no IR emitted.
-    if let Some(inlined) = try_walker_inline_user_call(ctx, op, code, &r_args, dst_bank, dst)? {
+    // calls (including every non-`call_fn` helper, gated on `oopspecindex`)
+    // fall through with no IR emitted.
+    if let Some(inlined) =
+        try_walker_inline_user_call(ctx, op, code, &r_args, ei.oopspecindex, dst_bank, dst)?
+    {
         return Ok(inlined);
     }
 
@@ -6668,7 +6708,6 @@ fn dispatch_residual_call_iRd_kind(
         return Ok((outcome, op.next_pc));
     }
 
-    let ei = call_descr.get_extra_info();
     // pyjitpl.py:2003-2005 OS_NOT_IN_TRACE guard — see helper docstring
     // for the convergence rationale.
     if let Some(outcome) = do_not_in_trace_call_result(ei, op.pc)? {
@@ -10610,6 +10649,71 @@ mod tests {
             setfield_vable_via_metainterp(&code, &op, &mut wc, 'i'),
             Err(DispatchError::VableBoxNotSeeded { pc: 0 })
         );
+    }
+
+    /// `getarrayitem_vable_*` / `setarrayitem_vable_*` / `arraylen_vable`
+    /// carry the same unseeded-box guard as the scalar field handlers:
+    /// an `OpRef::NONE` vable must abort to `VableBoxNotSeeded` rather than
+    /// resize the heapcache flag vector to 16 GiB.
+    #[test]
+    fn array_vable_handlers_with_none_obj_surface_vable_box_not_seeded() {
+        // operand 0 (the box) sits at code[pc+1] for all three argcodes.
+        let code = [0u8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+        for (key, opname, argcodes) in [
+            ("getarrayitem_vable_i/riXdd>i", "getarrayitem_vable_i", "riXdd>i"),
+            ("setarrayitem_vable_i/riXdd", "setarrayitem_vable_i", "riXdd"),
+            ("arraylen_vable/rdd>i", "arraylen_vable", "rdd>i"),
+        ] {
+            let descr_pool: Vec<DescrRef> = Vec::new();
+            let mut tc = fresh_trace_ctx();
+            let mut regs_r = vec![OpRef::NONE];
+            let mut regs_i = vec![OpRef::NONE];
+            let mut wc = WalkContext {
+                registers_r: &mut regs_r,
+                registers_i: &mut regs_i,
+                registers_f: &mut [],
+                concrete_registers_r: &mut [],
+                concrete_registers_i: &mut [],
+                descr_refs: &descr_pool,
+                trace_ctx: &mut tc,
+                done_with_this_frame_descr_ref: make_fail_descr(1),
+                done_with_this_frame_descr_int: make_fail_descr(101),
+                done_with_this_frame_descr_float: make_fail_descr(102),
+                done_with_this_frame_descr_void: make_fail_descr(103),
+                exit_frame_with_exception_descr_ref: make_fail_descr(2),
+                is_top_level: true,
+                sub_jitcode_lookup: &no_sub_jitcodes,
+                last_exc_value: None,
+                last_exc_value_concrete: ConcreteValue::Null,
+                entry_py_pc: 0,
+                outer_jitcode_index: 0,
+                raw_descrs: RawDescrPool::Global,
+                is_authoritative_executor: false,
+                outer_active_boxes: Vec::new(),
+            };
+            let op = DecodedOp {
+                key,
+                opname,
+                argcodes,
+                pc: 0,
+                next_pc: code.len(),
+            };
+            let result = match opname {
+                "getarrayitem_vable_i" => {
+                    getarrayitem_vable_via_metainterp(&code, &op, &mut wc, 'i')
+                }
+                "setarrayitem_vable_i" => {
+                    setarrayitem_vable_via_metainterp(&code, &op, &mut wc, 'i')
+                }
+                "arraylen_vable" => arraylen_vable_via_metainterp(&code, &op, &mut wc),
+                _ => unreachable!(),
+            };
+            assert_eq!(
+                result,
+                Err(DispatchError::VableBoxNotSeeded { pc: 0 }),
+                "{opname} must abort VableBoxNotSeeded on an unseeded vable register",
+            );
+        }
     }
 
     #[test]
