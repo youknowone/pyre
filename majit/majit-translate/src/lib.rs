@@ -181,6 +181,87 @@ fn build_semantic_program_via_active_frontend(
             // resolved by `tyref_to_ast_string` (Charon-resolved types,
             // e.g. `*mut PyObject`, `Vec<u8>`, `i64`) rather than the syn
             // re-parse.
+            //
+            // Tier-4 (4c) shadow probe: compare the syn-sourced
+            // unsafe-fn stub set (`extract_unsafe_fn_stubs` over
+            // `parsed_files`) against the Charon-sourced
+            // `collect_unsafe_fn_stubs_from_llbc` over `llbcs`, to
+            // validate the re-source before cutting over the production
+            // `call_control.unsafe_fn_stubs` carrier (lib.rs:1080).
+            // Summary-only — does not mutate `program`, so jit_trace_gen
+            // stays byte-identical.  Keyed on the path segments; the
+            // value is `(argname-count, lltype-label)`.
+            {
+                use std::collections::BTreeMap;
+                fn lltype_label(
+                    t: &crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
+                ) -> &'static str {
+                    use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+                    match t {
+                        LowLevelType::Void => "Void",
+                        LowLevelType::Bool => "Bool",
+                        _ => "Other",
+                    }
+                }
+                let mut syn_map: BTreeMap<Vec<String>, (usize, &'static str)> = BTreeMap::new();
+                for p in parsed_files {
+                    for (segs, sig, ll) in
+                        crate::flowspace::rust_source::register::extract_unsafe_fn_stubs(
+                            &p.file,
+                            &p.module_path,
+                        )
+                    {
+                        syn_map
+                            .entry(segs)
+                            .or_insert((sig.argnames.len(), lltype_label(&ll)));
+                    }
+                }
+                let mut ull_map: BTreeMap<Vec<String>, (usize, &'static str)> = BTreeMap::new();
+                for llbc in &llbcs {
+                    for (segs, sig, ll) in front::mir::collect_unsafe_fn_stubs_from_llbc(llbc) {
+                        ull_map
+                            .entry(segs)
+                            .or_insert((sig.argnames.len(), lltype_label(&ll)));
+                    }
+                }
+                let syn_only = syn_map.keys().filter(|k| !ull_map.contains_key(*k)).count();
+                let ull_only = ull_map.keys().filter(|k| !syn_map.contains_key(*k)).count();
+                let mut exact = 0usize;
+                let mut attr_mismatch = 0usize;
+                for (k, sv) in &syn_map {
+                    if let Some(uv) = ull_map.get(k) {
+                        if sv == uv {
+                            exact += 1;
+                        } else {
+                            attr_mismatch += 1;
+                        }
+                    }
+                }
+                eprintln!(
+                    "UNSAFE_STUB SHADOW: syn={} ull={} exact={exact} attr_mismatch={attr_mismatch} syn_only={syn_only} ull_only={ull_only}",
+                    syn_map.len(),
+                    ull_map.len(),
+                );
+                // List every parity-critical gap (syn entries the Charon
+                // set fails to reproduce); cap the harmless ull-only
+                // overflow listing.
+                for (k, sv) in &syn_map {
+                    match ull_map.get(k) {
+                        None => eprintln!("  UNSAFE_STUB syn_only {k:?} {sv:?}"),
+                        Some(uv) if uv != sv => {
+                            eprintln!("  UNSAFE_STUB attr {k:?} syn={sv:?} ull={uv:?}")
+                        }
+                        _ => {}
+                    }
+                }
+                for (k, uv) in ull_map
+                    .iter()
+                    .filter(|(k, _)| !syn_map.contains_key(*k))
+                    .take(40)
+                {
+                    eprintln!("  UNSAFE_STUB ull_only {k:?} {uv:?}");
+                }
+            }
             return program;
         }
     }

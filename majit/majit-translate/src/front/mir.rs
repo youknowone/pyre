@@ -2746,6 +2746,82 @@ fn impl_method_owner_for_fundecl(llbc: &Llbc, fd: &FunDecl) -> Option<(String, S
     Some((owner_qualified, leaf))
 }
 
+/// Charon-sourced equivalent of the syn
+/// `flowspace::rust_source::register::extract_unsafe_fn_stubs`: collect
+/// `(path-segments, Signature, return-lltype)` for every local `unsafe
+/// fn` / unsafe impl-method whose return type projects to `Void` (unit)
+/// or `Bool`.  These callees cannot lower their bodies (raw-pointer
+/// access the flowspace adapter does not model), but downstream
+/// `OpKind::Call::FunctionPath` sites still need their signature
+/// registered so the dual gate does not Skip with "not registered in
+/// PyreCallRegistry".
+///
+/// Mirrors the syn extractor's segment convention so the registration
+/// key matches the call-site lookup: a free fn keys as `[module,
+/// ident]` (the crate-stripped `name_path` stem kept as one segment,
+/// matching the syn `prefix` push); an impl method keys as
+/// `[owner-module-segments..., Owner, method]` (the
+/// `impl_method_owner_for_fundecl` qualified owner split on `::`, the
+/// same `[module, Owner, method]` shape `register_function_graph`
+/// uses).  Argument names are synthesised `arg{N}` by
+/// `signature.inputs.len()`; the receiver is counted on both sides
+/// (Charon includes `self` in `inputs`, the syn
+/// `extract_argnames_from_sig` emits a `self` entry), so the count
+/// matches.  Return types other than unit / bool surface no entry,
+/// preserving the original "not registered" Skip for those fns —
+/// matches `simple_return_type_to_lltype`'s Void/Bool-only projection.
+pub(crate) fn collect_unsafe_fn_stubs_from_llbc(
+    llbc: &Llbc,
+) -> Vec<(
+    Vec<String>,
+    crate::flowspace::argument::Signature,
+    crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
+)> {
+    use crate::flowspace::argument::Signature;
+    use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+    let mut out = Vec::new();
+    for fd in llbc.iter_local_fns() {
+        if !fd.signature.is_unsafe {
+            continue;
+        }
+        // Global initializers are synthetic, not user-callable fns; the
+        // MIR-driver lowering loop skips them too.
+        if fd.is_global_initializer.is_some() {
+            continue;
+        }
+        let lltype = match tyref_to_ast_string(&fd.signature.output, llbc).as_str() {
+            "()" => LowLevelType::Void,
+            "bool" => LowLevelType::Bool,
+            _ => continue,
+        };
+        let segments = match impl_method_owner_for_fundecl(llbc, fd) {
+            Some((owner_qualified, leaf)) => {
+                let mut segs: Vec<String> = owner_qualified.split("::").map(String::from).collect();
+                segs.push(leaf);
+                segs
+            }
+            None => {
+                let stripped = strip_crate_prefix(&fd.item_meta.name_path());
+                let (module_path, name) = match stripped.rsplit_once("::") {
+                    Some((module, leaf)) => (module.to_string(), leaf.to_string()),
+                    None => (String::new(), stripped),
+                };
+                let mut segs = Vec::new();
+                if !module_path.is_empty() {
+                    segs.push(module_path);
+                }
+                segs.push(name);
+                segs
+            }
+        };
+        let argnames: Vec<String> = (0..fd.signature.inputs.len())
+            .map(|i| format!("arg{i}"))
+            .collect();
+        out.push((segments, Signature::new(argnames, None, None), lltype));
+    }
+    out
+}
+
 /// Free-function version of [`Lowering::resolve_impl_owner_adt_def_id`].
 fn resolve_impl_owner_adt_def_id_free(
     llbc: &Llbc,
