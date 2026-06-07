@@ -868,20 +868,12 @@ pub fn install_default_builtins(namespace: &mut DictStorage) {
     crate::dict_storage_store(
         namespace,
         "ConnectionAbortedError",
-        make_exc_type(
-            "ConnectionAbortedError",
-            exc_os_error_new,
-            connection_error,
-        ),
+        make_exc_type("ConnectionAbortedError", exc_os_error_new, connection_error),
     );
     crate::dict_storage_store(
         namespace,
         "ConnectionRefusedError",
-        make_exc_type(
-            "ConnectionRefusedError",
-            exc_os_error_new,
-            connection_error,
-        ),
+        make_exc_type("ConnectionRefusedError", exc_os_error_new, connection_error),
     );
     crate::dict_storage_store(
         namespace,
@@ -1886,7 +1878,10 @@ fn os_error_init(kind: pyre_object::excobject::ExcKind, args: &[PyObjectRef]) ->
 }
 
 fn exc_os_error(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    Ok(os_error_init(pyre_object::excobject::ExcKind::OSError, args))
+    Ok(os_error_init(
+        pyre_object::excobject::ExcKind::OSError,
+        args,
+    ))
 }
 
 fn exc_file_not_found_error(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {

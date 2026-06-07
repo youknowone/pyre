@@ -1581,6 +1581,7 @@ dependencies = [
  "malachite-bigint",
  "num-integer",
  "num-traits",
+ "paste",
  "pymath",
  "pyre-macros",
  "pyre-object",

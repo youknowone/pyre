@@ -26,6 +26,58 @@ pub fn checksignals_now() -> Result<(), crate::PyError> {
     unsafe { (*ec).checksignals() }
 }
 
+/// interp_signal.py:485-497 `SignalMask.__enter__` — unpack a list / tuple
+/// / set of signal numbers, the argument shape `sigwait` / `sigpending`
+/// share with `pthread_sigmask`.
+#[cfg(feature = "host_env")]
+fn signal_set_items(arg: PyObjectRef) -> Result<Vec<PyObjectRef>, crate::PyError> {
+    unsafe {
+        if pyre_object::is_list(arg) {
+            let n = pyre_object::w_list_len(arg);
+            Ok((0..n)
+                .filter_map(|i| pyre_object::w_list_getitem(arg, i as i64))
+                .collect())
+        } else if pyre_object::is_tuple(arg) {
+            let n = pyre_object::w_tuple_len(arg);
+            Ok((0..n)
+                .filter_map(|i| pyre_object::w_tuple_getitem(arg, i as i64))
+                .collect())
+        } else if pyre_object::is_set_or_frozenset(arg) {
+            Ok(pyre_object::w_set_items(arg))
+        } else {
+            Err(crate::PyError::type_error(
+                "argument must be an iterable of signal numbers",
+            ))
+        }
+    }
+}
+
+/// error.py `exception_from_saved_errno(space, w_type)` — build an instance
+/// of `class_name` (an `OSError` or subclass) carrying the errno and its
+/// strerror, so `.errno` / `str()` behave like any `OSError`.  Falls back
+/// to `OSError` if `class_name` is not registered.
+#[cfg(feature = "host_env")]
+fn errno_exception(class_name: &str, errno: i32) -> crate::PyError {
+    let strerror = unsafe {
+        std::ffi::CStr::from_ptr(libc::strerror(errno))
+            .to_string_lossy()
+            .into_owned()
+    };
+    let cls = crate::builtins::lookup_exc_class(class_name)
+        .or_else(|| crate::builtins::lookup_exc_class("OSError"))
+        .expect("OSError must be installed");
+    let args = vec![
+        cls,
+        pyre_object::w_int_new(errno as i64),
+        pyre_object::w_str_new(&strerror),
+    ];
+    let exc = crate::builtins::exc_os_error_new(&args)
+        .expect("exc_os_error_new is infallible for int/str args");
+    let mut err = crate::PyError::os_error(&strerror);
+    err.exc_object = exc;
+    err
+}
+
 thread_local! {
     /// interp_signal.py:157-167 `Handlers.handlers_w` — signum → handler
     /// (a callable, or the SIG_DFL/SIG_IGN ints).  A real Python dict so
@@ -534,6 +586,21 @@ pub fn register_module(ns: &mut DictStorage) {
             0,
         ),
     );
+    // moduledef.py:17 `'ItimerError': 'interp_signal.get_itimer_error(space)'`
+    // — `signal.new_exception_class("signal.ItimerError", space.w_IOError)`.
+    // An OSError subclass so `setitimer`'s `exception_from_saved_errno`
+    // instance carries errno / strerror.
+    let w_os_error = crate::builtins::lookup_exc_class("OSError")
+        .expect("OSError must be installed before _signal init");
+    crate::dict_storage_store(
+        ns,
+        "ItimerError",
+        crate::builtins::make_exc_type(
+            "signal.ItimerError",
+            crate::builtins::exc_os_error_new,
+            w_os_error,
+        ),
+    );
     #[cfg(unix)]
     {
         crate::dict_storage_store(
@@ -615,12 +682,9 @@ pub fn register_module(ns: &mut DictStorage) {
                             rustpython_host_env::signal::double_to_timeval(0.0)
                         },
                     };
-                    let old =
-                        rustpython_host_env::signal::setitimer(which, &new_value).map_err(|e| {
-                            crate::PyError::os_error_with_errno(
-                                e.raw_os_error().unwrap_or(0),
-                                format!("setitimer: {e}"),
-                            )
+                    let old = rustpython_host_env::signal::setitimer(which, &new_value)
+                        .map_err(|e| {
+                            errno_exception("signal.ItimerError", e.raw_os_error().unwrap_or(0))
                         })?;
                     let (delay, interval) = rustpython_host_env::signal::itimerval_to_tuple(&old);
                     return Ok(pyre_object::w_tuple_new(vec![
@@ -726,6 +790,134 @@ pub fn register_module(ns: &mut DictStorage) {
             ns,
             "ITIMER_PROF",
             pyre_object::w_int_new(libc::ITIMER_PROF as i64),
+        );
+        // sigwait(sigset) -> signum — interp_signal.py:515-524
+        crate::dict_storage_store(
+            ns,
+            "sigwait",
+            crate::make_builtin_function_with_arity(
+                "sigwait",
+                |args| {
+                    #[cfg(feature = "host_env")]
+                    {
+                        if args.is_empty() {
+                            return Err(crate::PyError::type_error(
+                                "sigwait() takes exactly one argument (0 given)",
+                            ));
+                        }
+                        let mut set =
+                            rustpython_host_env::signal::sigemptyset().map_err(|e| {
+                                crate::PyError::os_error_with_errno(
+                                    e.raw_os_error().unwrap_or(0),
+                                    format!("sigemptyset: {e}"),
+                                )
+                            })?;
+                        for it in signal_set_items(args[0])? {
+                            let signum = (unsafe { pyre_object::w_int_get_value(it) }) as i32;
+                            // interp_signal.py:285-288 check_signum_in_range
+                            if !(1..signalstate::NSIG).contains(&signum) {
+                                return Err(crate::PyError::value_error(
+                                    "signal number out of range",
+                                ));
+                            }
+                            rustpython_host_env::signal::sigaddset(&mut set, signum).map_err(
+                                |e| {
+                                    crate::PyError::os_error_with_errno(
+                                        e.raw_os_error().unwrap_or(0),
+                                        format!("sigaddset: {e}"),
+                                    )
+                                },
+                            )?;
+                        }
+                        let mut signum: libc::c_int = 0;
+                        // sigwait returns the error number directly, not via errno.
+                        let ret = unsafe { libc::sigwait(&set, &mut signum) };
+                        if ret != 0 {
+                            return Err(errno_exception("OSError", ret));
+                        }
+                        return Ok(pyre_object::w_int_new(signum as i64));
+                    }
+                    #[cfg(not(feature = "host_env"))]
+                    {
+                        let _ = args;
+                        Err(crate::PyError::not_implemented(
+                            "signal.sigwait requires host_env feature",
+                        ))
+                    }
+                },
+                1,
+            ),
+        );
+        // sigpending() -> set of pending signals — interp_signal.py:526-535
+        crate::dict_storage_store(
+            ns,
+            "sigpending",
+            crate::make_builtin_function_with_arity(
+                "sigpending",
+                |_args| {
+                    #[cfg(feature = "host_env")]
+                    {
+                        let mut mask: libc::sigset_t = unsafe { std::mem::zeroed() };
+                        let ret = unsafe { libc::sigpending(&mut mask) };
+                        if ret != 0 {
+                            let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+                            return Err(errno_exception("OSError", errno));
+                        }
+                        // interp_signal.py:502-513 _sigset_to_signals
+                        let items: Vec<pyre_object::PyObjectRef> = (1..signalstate::NSIG)
+                            .filter(|s| {
+                                rustpython_host_env::signal::sigset_contains(&mask, *s)
+                            })
+                            .map(|s| pyre_object::w_int_new(s as i64))
+                            .collect();
+                        return Ok(pyre_object::w_set_from_items(&items));
+                    }
+                    #[cfg(not(feature = "host_env"))]
+                    Err(crate::PyError::not_implemented(
+                        "signal.sigpending requires host_env feature",
+                    ))
+                },
+                0,
+            ),
+        );
+        // pthread_kill(tid, signum) -> None — interp_signal.py:466-474
+        crate::dict_storage_store(
+            ns,
+            "pthread_kill",
+            crate::make_builtin_function_with_arity(
+                "pthread_kill",
+                |args| {
+                    #[cfg(feature = "host_env")]
+                    {
+                        if args.len() < 2 {
+                            return Err(crate::PyError::type_error(
+                                "pthread_kill() takes exactly 2 arguments",
+                            ));
+                        }
+                        let tid =
+                            (unsafe { pyre_object::w_int_get_value(args[0]) }) as u64;
+                        let signum =
+                            (unsafe { pyre_object::w_int_get_value(args[1]) }) as i32;
+                        let ret =
+                            unsafe { libc::pthread_kill(tid as libc::pthread_t, signum) };
+                        if ret != 0 {
+                            return Err(errno_exception("OSError", ret));
+                        }
+                        // interp_signal.py:473-474 — the signal may have been
+                        // sent to the current thread.
+                        checksignals_now()?;
+                        return Ok(pyre_object::w_none());
+                    }
+                    #[cfg(not(feature = "host_env"))]
+                    {
+                        let _ = args;
+                        Err(crate::PyError::not_implemented(
+                            "signal.pthread_kill requires host_env feature",
+                        ))
+                    }
+                },
+                2,
+            ),
         );
         // pthread_sigmask(how, mask) -> previous mask (set of signums)
         crate::dict_storage_store(

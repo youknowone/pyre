@@ -172,6 +172,30 @@ fn socket_converted_error(
     err
 }
 
+/// baseobjspace.py `writebuf_w` — the writable byte slice backing a
+/// scatter/gather buffer argument.  PyPy accepts any object exporting a
+/// writable buffer; pyre's writable byte stores are `bytearray` and a
+/// `memoryview` over one, so those are resolved here and anything else is
+/// rejected as `writebuf_w` does.
+#[cfg(unix)]
+fn socket_writebuf(obj: pyre_object::PyObjectRef) -> Result<&'static mut [u8], crate::PyError> {
+    if unsafe { pyre_object::bytearrayobject::is_bytearray(obj) } {
+        return Ok(unsafe { pyre_object::bytearrayobject::w_bytearray_data_mut(obj) });
+    }
+    if let Some(t) = crate::typedef::r#type(obj) {
+        if unsafe { pyre_object::w_type_get_name(t) } == "memoryview" {
+            let buf = crate::baseobjspace::getattr(obj, "__pyre_buf__")?;
+            if unsafe { pyre_object::bytearrayobject::is_bytearray(buf) } {
+                return Ok(unsafe { pyre_object::bytearrayobject::w_bytearray_data_mut(buf) });
+            }
+            return Err(crate::PyError::type_error("cannot modify read-only memory"));
+        }
+    }
+    Err(crate::PyError::type_error(
+        "a writable bytes-like object is required",
+    ))
+}
+
 pub fn register_module(ns: &mut DictStorage) {
     // `_rsocket_rffi.py:140-220 constant_names` + `:234-262
     // constants_w_defaults` — populated through the libc crate where
@@ -2940,12 +2964,8 @@ fn init_socket_type(ns: &mut DictStorage) {
             }
             let obj = args[0];
             let buf_obj = args[1];
-            if !unsafe { pyre_object::bytearrayobject::is_bytearray(buf_obj) } {
-                return Err(crate::PyError::type_error(
-                    "recv_into: buffer must be a bytearray",
-                ));
-            }
-            let buf_len = unsafe { pyre_object::bytearrayobject::w_bytearray_len(buf_obj) };
+            let slot = socket_writebuf(buf_obj)?;
+            let buf_len = slot.len();
             let nbytes = if args.len() >= 3 {
                 if !unsafe { pyre_object::is_int(args[2]) } {
                     return Err(crate::PyError::type_error(
@@ -2979,7 +2999,6 @@ fn init_socket_type(ns: &mut DictStorage) {
                 0
             };
             let fd = socket_fd(obj)?;
-            let slot = unsafe { pyre_object::bytearrayobject::w_bytearray_data_mut(buf_obj) };
             let got = loop {
                 let r = unsafe {
                     libc::recv(fd, slot.as_mut_ptr() as *mut libc::c_void, nbytes, flags)
@@ -3011,12 +3030,8 @@ fn init_socket_type(ns: &mut DictStorage) {
             }
             let obj = args[0];
             let buf_obj = args[1];
-            if !unsafe { pyre_object::bytearrayobject::is_bytearray(buf_obj) } {
-                return Err(crate::PyError::type_error(
-                    "recvfrom_into: buffer must be a bytearray",
-                ));
-            }
-            let buf_len = unsafe { pyre_object::bytearrayobject::w_bytearray_len(buf_obj) };
+            let slot = socket_writebuf(buf_obj)?;
+            let buf_len = slot.len();
             let nbytes = if args.len() >= 3 {
                 if !unsafe { pyre_object::is_int(args[2]) } {
                     return Err(crate::PyError::type_error(
@@ -3050,7 +3065,6 @@ fn init_socket_type(ns: &mut DictStorage) {
                 0
             };
             let fd = socket_fd(obj)?;
-            let slot = unsafe { pyre_object::bytearrayobject::w_bytearray_data_mut(buf_obj) };
             let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
             let mut slen = core::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
             let got = loop {
@@ -3213,9 +3227,7 @@ fn init_socket_type(ns: &mut DictStorage) {
     // recvmsg_into(buffers, [ancbufsize, [flags]]) ->
     //   (nbytes, ancdata, msg_flags, address)
     // `interp_socket.py:572-652 recvmsg_into_w` — scatter-receive into
-    // a sequence of writable buffers.  Pyre only accepts a list/tuple
-    // of bytearray objects (PyPy's writebuf_w + buffer-protocol path
-    // is not yet wired for arbitrary writable objects); each bytearray
+    // a list/tuple of writable buffers; each `writebuf_w` slice
     // contributes one iovec entry.
     crate::dict_storage_store(
         ns,
@@ -3229,7 +3241,7 @@ fn init_socket_type(ns: &mut DictStorage) {
                 unsafe { (pyre_object::is_list(seq), pyre_object::is_tuple(seq)) };
             if !is_list && !is_tuple {
                 return Err(crate::PyError::type_error(
-                    "recvmsg_into: buffers must be a list or tuple of bytearray",
+                    "recvmsg_into: buffers must be a list or tuple of writable buffers",
                 ));
             }
             let nbufs = unsafe {
@@ -3239,7 +3251,7 @@ fn init_socket_type(ns: &mut DictStorage) {
                     pyre_object::w_tuple_len(seq)
                 }
             };
-            let mut bytearrays: Vec<pyre_object::PyObjectRef> = Vec::with_capacity(nbufs);
+            let mut buffers: Vec<&'static mut [u8]> = Vec::with_capacity(nbufs);
             for i in 0..nbufs {
                 let item = unsafe {
                     if is_list {
@@ -3249,12 +3261,7 @@ fn init_socket_type(ns: &mut DictStorage) {
                     }
                 }
                 .ok_or_else(|| crate::PyError::type_error("recvmsg_into: buffer item missing"))?;
-                if !unsafe { pyre_object::bytearrayobject::is_bytearray(item) } {
-                    return Err(crate::PyError::type_error(
-                        "recvmsg_into: each buffer must be a bytearray",
-                    ));
-                }
-                bytearrays.push(item);
+                buffers.push(socket_writebuf(item)?);
             }
             let ancbufsize = if args.len() >= 3 {
                 if !unsafe { pyre_object::is_int(args[2]) } {
@@ -3284,14 +3291,11 @@ fn init_socket_type(ns: &mut DictStorage) {
             };
             let fd = socket_fd(args[0])?;
 
-            let mut iovs: Vec<libc::iovec> = bytearrays
-                .iter()
-                .map(|&ba| {
-                    let slice = unsafe { pyre_object::bytearrayobject::w_bytearray_data_mut(ba) };
-                    libc::iovec {
-                        iov_base: slice.as_mut_ptr() as *mut libc::c_void,
-                        iov_len: slice.len(),
-                    }
+            let mut iovs: Vec<libc::iovec> = buffers
+                .into_iter()
+                .map(|slice| libc::iovec {
+                    iov_base: slice.as_mut_ptr() as *mut libc::c_void,
+                    iov_len: slice.len(),
                 })
                 .collect();
             let mut control = vec![0u8; ancbufsize];
