@@ -400,9 +400,14 @@ impl PyreMetaInterp {
                         return false;
                     };
                     let ccode = unsafe { &*pyre_interpreter::pyframe_get_pycode(&**cf) };
-                    // exceptiontable offsets are byte offsets; the concrete
-                    // frame's next_instr is an instruction-word index (×2).
-                    let byte_off = (cf.next_instr() as u32).saturating_mul(2);
+                    // A suspended caller's concrete `next_instr` was advanced
+                    // past the CALL before its callee was pushed, so probe the
+                    // saved CALL site (`call_site_pc`) — mirroring
+                    // `finishframe_exception`. Frames with no outstanding inline
+                    // call fall back to `next_instr`. exceptiontable offsets are
+                    // byte offsets; the pc is an instruction-word index (×2).
+                    let lookup_pc = f.call_site_pc.unwrap_or_else(|| cf.next_instr());
+                    let byte_off = (lookup_pc as u32).saturating_mul(2);
                     pyre_interpreter::exception_table::lookup_exceptiontable(
                         &ccode.exceptiontable,
                         byte_off,
