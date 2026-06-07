@@ -3291,11 +3291,12 @@ mod tests {
                 resolved.setarg(
                     i,
                     crate::r#box::BoxRef::from_opref(
-                        ctx.get_box_replacement(resolved.arg(i).to_opref()),
+                        ctx.get_box_replacement(resolved.arg(i).to_opref())
+                            .to_opref(),
                     ),
                 );
             }
-            match pass.propagate_forward(&resolved, &mut ctx) {
+            match pass.propagate_forward(&resolved, &std::rc::Rc::new(resolved.clone()), &mut ctx) {
                 OptimizationResult::Emit(emitted) => {
                     ctx.emit(emitted);
                 }
@@ -3406,11 +3407,12 @@ mod tests {
                 resolved.setarg(
                     i,
                     crate::r#box::BoxRef::from_opref(
-                        ctx.get_box_replacement(resolved.arg(i).to_opref()),
+                        ctx.get_box_replacement(resolved.arg(i).to_opref())
+                            .to_opref(),
                     ),
                 );
             }
-            match pass.propagate_forward(&resolved, &mut ctx) {
+            match pass.propagate_forward(&resolved, &std::rc::Rc::new(resolved.clone()), &mut ctx) {
                 OptimizationResult::Emit(emitted) => {
                     ctx.emit(emitted);
                 }
