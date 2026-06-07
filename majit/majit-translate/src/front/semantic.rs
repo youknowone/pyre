@@ -213,6 +213,21 @@ pub struct SemanticProgram {
     /// match the qualname `_init_classdef` reads; primitive fields carry
     /// `Int`/`Unsigned`/`Bool`/`Float`, every other shape `Ref(None)`.
     pub struct_field_attrs: HashMap<String, Vec<(String, crate::model::ValueType)>>,
+    /// `(path-segments, Signature, return-lltype)` for every local
+    /// `unsafe fn` / unsafe impl-method whose return type resolves to
+    /// unit or bool, harvested from the LLBC by
+    /// `front::mir::collect_unsafe_fn_stubs_from_llbc`.  Feeds
+    /// `CallControl.unsafe_fn_stubs` →
+    /// `cutover::register_unsafe_fn_stubs` so the dual gate registers a
+    /// stub PyGraph for each, covering the "not registered in
+    /// PyreCallRegistry" Skip cluster dominated by `pyre_object::is_*`.
+    /// These callees' bodies access raw pointers the flowspace adapter
+    /// does not model, so only a typed signature stub is registered.
+    pub unsafe_fn_stubs: Vec<(
+        Vec<String>,
+        crate::flowspace::argument::Signature,
+        crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
+    )>,
 }
 
 /// Graph lookup table built from a `SemanticProgram` so the

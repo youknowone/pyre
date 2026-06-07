@@ -209,6 +209,7 @@ pub fn build_semantic_program_from_llbcs_with_static_addrs(
             enum_variant_by_discriminant: std::collections::HashMap::new(),
             struct_origins: std::collections::HashMap::new(),
             struct_field_attrs: std::collections::HashMap::new(),
+            unsafe_fn_stubs: Vec::new(),
         }),
     )
 }
@@ -406,6 +407,9 @@ pub fn build_semantic_program_from_llbc_with_static_addrs(
         enum_variant_by_discriminant,
         struct_origins,
         struct_field_attrs,
+        // Populated post-build in `build_semantic_program_via_active_frontend`
+        // (it iterates the full LLBC set), mirroring `merge_hints_from_llbcs`.
+        unsafe_fn_stubs: Vec::new(),
     })
 }
 

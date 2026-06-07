@@ -174,6 +174,16 @@ fn build_semantic_program_via_active_frontend(
             // RPython's translator reading `func._elidable_function_` off
             // the function object.
             merge_hints_from_llbcs(&mut program, &llbcs);
+            // Re-source the unsafe-fn stub carrier from Charon: walk the
+            // full LLBC set for every local `unsafe fn` / unsafe
+            // impl-method projecting to a unit/bool return.  Replaces the
+            // syn `extract_unsafe_fn_stubs` pass the consumer at
+            // `call_control.unsafe_fn_stubs` (lib.rs) used to read; the
+            // shadow probe below confirms this reproduces every syn stub.
+            program.unsafe_fn_stubs = llbcs
+                .iter()
+                .flat_map(front::mir::collect_unsafe_fn_stubs_from_llbc)
+                .collect();
             // Whole-program type metadata (`known_struct_names`,
             // `known_trait_names`, `struct_fields`) comes from the MIR
             // builder's `derive_program_metadata` walk over Charon's
@@ -182,15 +192,14 @@ fn build_semantic_program_via_active_frontend(
             // e.g. `*mut PyObject`, `Vec<u8>`, `i64`) rather than the syn
             // re-parse.
             //
-            // Tier-4 (4c) shadow probe: compare the syn-sourced
+            // Tier-4 (4c) regression probe: compare the syn-sourced
             // unsafe-fn stub set (`extract_unsafe_fn_stubs` over
             // `parsed_files`) against the Charon-sourced
-            // `collect_unsafe_fn_stubs_from_llbc` over `llbcs`, to
-            // validate the re-source before cutting over the production
-            // `call_control.unsafe_fn_stubs` carrier (lib.rs:1080).
-            // Summary-only — does not mutate `program`, so jit_trace_gen
-            // stays byte-identical.  Keyed on the path segments; the
-            // value is `(argname-count, lltype-label)`.
+            // `program.unsafe_fn_stubs` populated just above (now the
+            // production carrier).  Read-only over both sets, keyed on
+            // the path segments with value `(argname-count,
+            // lltype-label)`; flags any future divergence between the
+            // retired syn extractor and the Charon re-source.
             {
                 use std::collections::BTreeMap;
                 fn lltype_label(
@@ -217,12 +226,10 @@ fn build_semantic_program_via_active_frontend(
                     }
                 }
                 let mut ull_map: BTreeMap<Vec<String>, (usize, &'static str)> = BTreeMap::new();
-                for llbc in &llbcs {
-                    for (segs, sig, ll) in front::mir::collect_unsafe_fn_stubs_from_llbc(llbc) {
-                        ull_map
-                            .entry(segs)
-                            .or_insert((sig.argnames.len(), lltype_label(&ll)));
-                    }
+                for (segs, sig, ll) in &program.unsafe_fn_stubs {
+                    ull_map
+                        .entry(segs.clone())
+                        .or_insert((sig.argnames.len(), lltype_label(ll)));
                 }
                 let syn_only = syn_map.keys().filter(|k| !ull_map.contains_key(*k)).count();
                 let ull_only = ull_map.keys().filter(|k| !syn_map.contains_key(*k)).count();
@@ -1135,30 +1142,17 @@ fn analyze_pipeline_from_parsed(
     // carrier here lets a future per-graph lexical resolver land without
     // re-plumbing the parsed-source ingress.
     call_control.parsed_module_paths = parsed_files.iter().map(|p| p.module_path.clone()).collect();
-    // Populate the metadata-only `unsafe_fn_stubs` carrier so the
-    // codewriter's `dual_gate_registry` can register every `unsafe fn`
-    // / unsafe impl-method as a stub-pygraph entry in PyreCallRegistry.
-    // Walks each parsed source file under its crate-stripped
-    // `module_path` prefix, dropping unsafe fns whose return type the
-    // projection cannot represent (see
-    // `flowspace::rust_source::register::simple_return_type_to_lltype`).
-    // Covers the bulk of the "not registered in PyreCallRegistry" Skip
-    // cluster dominated by `pyre_object::is_*` predicates whose body
-    // lowering is intentionally rejected at `build_flow.rs:215`.
-    let mut unsafe_stubs: Vec<(
-        Vec<String>,
-        crate::flowspace::argument::Signature,
-        crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
-    )> = Vec::new();
-    for parsed in parsed_files {
-        unsafe_stubs.extend(
-            crate::flowspace::rust_source::register::extract_unsafe_fn_stubs(
-                &parsed.file,
-                &parsed.module_path,
-            ),
-        );
-    }
-    call_control.unsafe_fn_stubs = unsafe_stubs;
+    // The `unsafe_fn_stubs` carrier lets the codewriter's
+    // `dual_gate_registry` register every `unsafe fn` / unsafe
+    // impl-method as a stub-pygraph entry in PyreCallRegistry, covering
+    // the bulk of the "not registered in PyreCallRegistry" Skip cluster
+    // dominated by `pyre_object::is_*` predicates whose body lowering is
+    // intentionally rejected (raw-pointer access the flowspace adapter
+    // does not model — only a typed signature stub is registered).
+    // Sourced from Charon via
+    // `front::mir::collect_unsafe_fn_stubs_from_llbc`, populated on the
+    // SemanticProgram in `build_semantic_program_via_active_frontend`.
+    call_control.unsafe_fn_stubs = program.unsafe_fn_stubs.clone();
     // Populate CallControl with layouts from the provider.
     for struct_name in program.struct_fields.fields.keys() {
         if let Some(layout) = provider.get_struct_layout(struct_name) {
