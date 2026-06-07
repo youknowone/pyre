@@ -3046,6 +3046,8 @@ struct FnPtrIndices {
     call_fn_8: HelperHandle,
     get_current_exception_fn: HelperHandle,
     set_current_exception_fn: HelperHandle,
+    load_attr_fn: HelperHandle,
+    load_method_self_fn: HelperHandle,
 }
 
 /// Register every blackhole helper fn pointer with the assembler in
@@ -3238,6 +3240,17 @@ fn register_helper_fn_pointers(
     // `load_global_fn`.  Bound after the existing fn_ptrs to preserve
     // their indices.
     let getattr_fn = bind(assembler, cpu.getattr_fn as *const (), CallFlavor::Plain);
+    // LOOKUP_METHOD lowering (appended last to preserve fn_ptr indices).
+    // `bh_load_attr_fn` calls `baseobjspace::getattr`, which can run user
+    // `__getattribute__` (forces virtualizables) and raise `AttributeError`
+    // → `MayForce`.  `bh_load_method_self_fn` is the pure binding decision —
+    // reads the type MRO (touches heap) but never raises → `PlainCannotRaise`.
+    let load_attr_fn = bind(assembler, cpu.load_attr_fn as *const (), CallFlavor::MayForce);
+    let load_method_self_fn = bind(
+        assembler,
+        cpu.load_method_self_fn as *const (),
+        CallFlavor::PlainCannotRaise,
+    );
     FnPtrIndices {
         call_fn,
         load_global_fn,
@@ -3264,6 +3277,8 @@ fn register_helper_fn_pointers(
         call_fn_8,
         get_current_exception_fn,
         set_current_exception_fn,
+        load_attr_fn,
+        load_method_self_fn,
     }
 }
 
@@ -4148,6 +4163,16 @@ impl CodeWriter {
                 HelperHandle {
                     idx: set_current_exception_fn_idx,
                     flavor: _set_current_exception_fn_flavor,
+                },
+            load_attr_fn:
+                HelperHandle {
+                    idx: load_attr_fn_idx,
+                    flavor: _load_attr_fn_flavor,
+                },
+            load_method_self_fn:
+                HelperHandle {
+                    idx: load_method_self_fn_idx,
+                    flavor: _load_method_self_fn_flavor,
                 },
         } = register_helper_fn_pointers(&mut assembler, self.cpu());
 

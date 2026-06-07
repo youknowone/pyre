@@ -45,6 +45,12 @@ pub struct Cpu {
     pub call_fn_8: extern "C" fn(i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) -> i64,
     /// `bhimpl_load_global` — namespace/code from getfield_vable_r plus live frame.
     pub load_global_fn: extern "C" fn(i64, i64, i64, i64) -> i64,
+    /// LOOKUP_METHOD attribute half — `(obj, code, name_idx) → attr`.
+    /// Reproduces `PyFrame::load_method`'s `getattr` for blackhole resume.
+    pub load_attr_fn: extern "C" fn(i64, i64, i64) -> i64,
+    /// LOOKUP_METHOD `null_or_self` half — `(obj, attr, code, name_idx) →
+    /// bound`. Pure binding decision shared with the interpreter.
+    pub load_method_self_fn: extern "C" fn(i64, i64, i64, i64) -> i64,
     /// `bhimpl_compare_op` — RPython compare_op opcodes.
     pub compare_fn: extern "C" fn(i64, i64, i64) -> i64,
     /// `bhimpl_binary_op` — RPython binary_op opcodes.
@@ -157,6 +163,8 @@ impl Cpu {
             call_fn_7: crate::call_jit::bh_call_fn_7,
             call_fn_8: crate::call_jit::bh_call_fn_8,
             load_global_fn: crate::call_jit::bh_load_global_fn,
+            load_attr_fn: crate::call_jit::bh_load_attr_fn,
+            load_method_self_fn: crate::call_jit::bh_load_method_self_fn,
             compare_fn: crate::call_jit::bh_compare_fn,
             binary_op_fn: crate::call_jit::bh_binary_op_fn,
             box_int_fn: crate::call_jit::bh_box_int_fn,

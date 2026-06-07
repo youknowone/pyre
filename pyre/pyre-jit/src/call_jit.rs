@@ -3193,6 +3193,61 @@ pub extern "C" fn bh_getattr_fn(obj: i64, w_name: i64) -> i64 {
     }
 }
 
+/// Resolve `getattr(obj, code.names[name_idx])` for blackhole LOAD_ATTR
+/// resume — the attribute / unbound-method half of LOOKUP_METHOD.  Mirrors
+/// `PyFrame::load_method`'s `getattr` call so the blackhole reproduces the
+/// interpreter's attribute lookup exactly (descriptor `__get__`, super
+/// proxies, weakref forcing).  On error stashes the exception in
+/// `BH_LAST_EXC_VALUE` and returns 0 (the trailing `-live-` lets the
+/// blackhole route it through the except handler), matching
+/// [`bh_load_global_fn`].
+pub extern "C" fn bh_load_attr_fn(obj: i64, w_code_ptr: i64, name_idx: i64) -> i64 {
+    let code = unsafe {
+        &*(pyre_interpreter::w_code_get_ptr(w_code_ptr as pyre_object::PyObjectRef)
+            as *const pyre_interpreter::CodeObject)
+    };
+    let idx = name_idx as usize;
+    if idx >= code.names.len() {
+        return 0;
+    }
+    let name = code.names[idx].as_ref();
+    match pyre_interpreter::baseobjspace::getattr(obj as pyre_object::PyObjectRef, name) {
+        Ok(attr) => attr as i64,
+        Err(err) => {
+            let exc_obj = err.to_exc_object();
+            majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc_obj as i64));
+            0
+        }
+    }
+}
+
+/// Compute the LOOKUP_METHOD `null_or_self` for blackhole LOAD_ATTR resume,
+/// given the already-resolved `attr` from [`bh_load_attr_fn`].  Delegates to
+/// the shared `compute_load_method_bound`, a pure MRO inspection that never
+/// re-invokes a descriptor, so it cannot raise (returns `PY_NULL` when no
+/// receiver should be prepended).
+pub extern "C" fn bh_load_method_self_fn(
+    obj: i64,
+    attr: i64,
+    w_code_ptr: i64,
+    name_idx: i64,
+) -> i64 {
+    let code = unsafe {
+        &*(pyre_interpreter::w_code_get_ptr(w_code_ptr as pyre_object::PyObjectRef)
+            as *const pyre_interpreter::CodeObject)
+    };
+    let idx = name_idx as usize;
+    if idx >= code.names.len() {
+        return pyre_object::PY_NULL as i64;
+    }
+    let name = code.names[idx].as_ref();
+    pyre_interpreter::eval::compute_load_method_bound(
+        obj as pyre_object::PyObjectRef,
+        attr as pyre_object::PyObjectRef,
+        name,
+    ) as i64
+}
+
 /// Load a constant from the code object.
 /// jtransform.py parity: code comes from getfield_vable_r(frame, pycode).
 pub extern "C" fn bh_load_const_fn(w_code_ptr: i64, consti: i64) -> i64 {

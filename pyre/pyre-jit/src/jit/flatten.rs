@@ -3559,6 +3559,81 @@ where
     ))
 }
 
+/// LOOKUP_METHOD attribute half — `bh_load_attr_fn(obj, code, name_idx)
+/// → attr` (`(obj: Ref, code: Ref, name_idx: Int) → Ref`,
+/// `CallFlavor::MayForce`).  Reproduces `PyFrame::load_method`'s `getattr`
+/// for blackhole LOAD_ATTR resume; the getattr can run user
+/// `__getattribute__` and raise `AttributeError`, so the trailing `-live-`
+/// lets the blackhole route the exception through the except handler.
+pub fn build_load_attr_fn_residual_call_ir_r_insn(
+    load_attr_fn_idx: u16,
+    name_idx: i64,
+    obj_reg: u16,
+    code_operand: Operand,
+    dst_reg: u16,
+) -> Insn {
+    let effect_info = effect_info_for_call_flavor(CallFlavor::MayForce);
+    let descr_operand = Operand::descr(DescrOperand::CallDescrStub(CallDescrStub {
+        effect_info,
+        arg_kinds: vec![Kind::Ref, Kind::Ref, Kind::Int],
+        result_kind: Some(Kind::Ref),
+    }));
+    Insn::op_with_result(
+        "residual_call_ir_r",
+        vec![
+            Operand::ConstInt(load_attr_fn_idx as i64),
+            Operand::ListOfKind(ListOfKind::new(Kind::Int, vec![Operand::ConstInt(name_idx)])),
+            Operand::ListOfKind(ListOfKind::new(
+                Kind::Ref,
+                vec![
+                    Operand::Register(Register::new(Kind::Ref, obj_reg)),
+                    code_operand,
+                ],
+            )),
+            descr_operand,
+        ],
+        Register::new(Kind::Ref, dst_reg),
+    )
+}
+
+/// LOOKUP_METHOD `null_or_self` half — `bh_load_method_self_fn(obj, attr,
+/// code, name_idx) → bound` (`(obj: Ref, attr: Ref, code: Ref, name_idx:
+/// Int) → Ref`, `CallFlavor::PlainCannotRaise`).  `attr` is the
+/// [`build_load_attr_fn_residual_call_ir_r_insn`] result; the binding
+/// decision is a pure MRO inspection (reads heap, never raises).
+pub fn build_load_method_self_fn_residual_call_ir_r_insn(
+    load_method_self_fn_idx: u16,
+    name_idx: i64,
+    obj_reg: u16,
+    attr_reg: u16,
+    code_operand: Operand,
+    dst_reg: u16,
+) -> Insn {
+    let effect_info = effect_info_for_call_flavor(CallFlavor::PlainCannotRaise);
+    let descr_operand = Operand::descr(DescrOperand::CallDescrStub(CallDescrStub {
+        effect_info,
+        arg_kinds: vec![Kind::Ref, Kind::Ref, Kind::Ref, Kind::Int],
+        result_kind: Some(Kind::Ref),
+    }));
+    Insn::op_with_result(
+        "residual_call_ir_r",
+        vec![
+            Operand::ConstInt(load_method_self_fn_idx as i64),
+            Operand::ListOfKind(ListOfKind::new(Kind::Int, vec![Operand::ConstInt(name_idx)])),
+            Operand::ListOfKind(ListOfKind::new(
+                Kind::Ref,
+                vec![
+                    Operand::Register(Register::new(Kind::Ref, obj_reg)),
+                    Operand::Register(Register::new(Kind::Ref, attr_reg)),
+                    code_operand,
+                ],
+            )),
+            descr_operand,
+        ],
+        Register::new(Kind::Ref, dst_reg),
+    )
+}
+
 /// Construct the CALL-family `residual_call_r_r` Insn from raw
 /// register indices.  Production codewriter callsite replaces the prior `emit_residual_call(
 /// call_fn_N_idx, ...)` SSARepr emit at codewriter.rs:5747-5754
