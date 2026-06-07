@@ -1766,7 +1766,25 @@ impl OptContext {
     /// stale stand-in slot, and the carry-over at emit migrates the wrong
     /// (empty) `_forwarded` — dropping the rewrite's bound.
     pub(crate) fn supersede_restart_producer(&mut self, restart_op: &majit_ir::OpRc) {
-        let pos = restart_op.pos.get();
+        self.install_canonical_producer(restart_op);
+    }
+
+    /// Make `op` the sole registered producer at its result position,
+    /// inheriting any superseded stand-in's accumulated `_forwarded`.
+    ///
+    /// optimizer.py:403-411 `replace_op_with`: after `newop =
+    /// op.copy_and_change(..)` it carries the prior host's info forward —
+    /// `opinfo = get_box_replacement(op).get_forwarded(); if opinfo is not
+    /// None: newop.set_forwarded(opinfo)` — and only then `op.set_forwarded(
+    /// newop)` makes `newop` the single box at that position. In pyre's
+    /// producer registry the equivalent is to drop the stand-in
+    /// `live_synthetics` entry, migrate its `_forwarded` onto `op` (so the
+    /// `IntBound`/`PtrInfo`/const facts accumulated before the rewrite survive),
+    /// then register `op` as the lone producer. The blind `_forwarded` clone
+    /// mirrors `emit`'s live_synthetics catch-up: a producer-less stand-in only
+    /// ever holds `None`/`Info`, never a redirect.
+    fn install_canonical_producer(&mut self, op: &majit_ir::OpRc) {
+        let pos = op.pos.get();
         if pos.is_none() || pos.is_constant() {
             return;
         }
@@ -1778,16 +1796,21 @@ impl OptContext {
         ) {
             return;
         }
-        // Drop the superseded stand-in at this position so the single
-        // `live_synthetics` entry the emit catch-up migrates is `restart_op`'s
-        // accumulated `_forwarded`, not the original's stale slot. At most one
-        // live stand-in exists per position (mod.rs::emit invariant), so a
-        // single removal is sufficient.
+        // Drop the superseded stand-in at this position and carry its
+        // accumulated `_forwarded` onto `op` (replace_op_with's `opinfo`
+        // hand-off). At most one live stand-in exists per position
+        // (mod.rs::emit invariant), so a single removal is sufficient. The
+        // `ptr_eq` guard skips the self-clone — and its `RefCell` double-borrow
+        // — when `op` is already the registered stand-in.
         if let Some(i) = self.live_synthetics.iter().position(|s| s.pos.get() == pos) {
-            self.live_synthetics.swap_remove(i);
+            let superseded = self.live_synthetics.swap_remove(i);
+            if !std::rc::Rc::ptr_eq(&superseded, op) {
+                let carried = superseded.forwarded.borrow().clone();
+                *op.forwarded.borrow_mut() = carried;
+            }
         }
-        self.resop_refs.insert(pos, restart_op.clone());
-        self.live_synthetics.push(restart_op.clone());
+        self.resop_refs.insert(pos, op.clone());
+        self.live_synthetics.push(op.clone());
     }
 
     /// S-8.A: read `_forwarded` for `opref` directly off the canonical
@@ -2594,6 +2617,30 @@ impl OptContext {
         pos_ref
     }
 
+    /// Register an op dispatched through the passes (`emit_extra` /
+    /// `send_extra_operation`) as the producer for its result position,
+    /// mirroring `bind_input_resops`. `find_producer_op(pos)` then resolves
+    /// box lookups for this position — `materialize_box_at(pos)` and operand
+    /// resolution alike — to this `OpRc`'s `_forwarded` host
+    /// (resoperation.py:233) instead of a freshly-minted stand-in, keeping a
+    /// single box identity per position. Without this, a pass that folds the
+    /// dispatched op via `make_equal_to(from_bound_op(op_rc), ..)` writes the
+    /// forwarding onto a private `Rc<Op>` that `find_producer_op` cannot
+    /// reach, so the replacement is silently dropped (RPython needs no analog:
+    /// the op IS its box, resoperation.py:233-248).
+    ///
+    /// `emit`'s `live_synthetics` catch-up upgrades the binding to the real
+    /// producer once the op is emitted; a folded op stays as the chain host.
+    /// When `materialize_box_at` already minted a stand-in for this position,
+    /// `op_rc` supersedes it (carrying its `_forwarded`) rather than skipping
+    /// registration — otherwise queued-pass reads resolve to the stale stand-in
+    /// while writes land on the unregistered `op_rc`, and emit's blind catch-up
+    /// then clobbers those writes with the stand-in's slot. (InputArg / const /
+    /// sentinel positions are excluded.)
+    pub(crate) fn register_extra_producer(&mut self, op_rc: &majit_ir::OpRc) {
+        self.install_canonical_producer(op_rc);
+    }
+
     /// RPython emit_extra(op, emit=False) parity: queue an operation to
     /// be processed through passes AFTER the calling pass. Skips earlier
     /// passes (including the caller) to avoid re-absorption loops.
@@ -2612,24 +2659,10 @@ impl OptContext {
         // its type without the side-table detour.
         Self::debug_assert_box_type_invariant(&op);
         let op_rc = std::rc::Rc::new(op);
-        // Register the queued op as the producer for its position, mirroring
-        // `bind_input_resops`: `find_producer_op(pos)` then resolves box lookups
-        // for this position — `materialize_box_at(pos)` and operand resolution alike —
-        // to this `OpRc`'s `_forwarded` host (resoperation.py:233) instead of a
-        // freshly-minted stand-in, keeping a single box identity per position.
-        // `emit`'s `live_synthetics` catch-up upgrades the binding to the real
-        // producer once the op is emitted; a folded op stays as the chain host.
-        if !pos_ref.is_none()
-            && !pos_ref.is_constant()
-            && !matches!(
-                pos_ref,
-                OpRef::InputArgInt(_) | OpRef::InputArgFloat(_) | OpRef::InputArgRef(_)
-            )
-            && !self.resop_refs.contains_key(&pos_ref)
-        {
-            self.resop_refs.insert(pos_ref, op_rc.clone());
-            self.live_synthetics.push(op_rc.clone());
-        }
+        // Register the queued op as the producer for its position so a fold
+        // through `make_equal_to(from_bound_op(op_rc), ..)` reaches a host
+        // `find_producer_op` resolves to.
+        self.register_extra_producer(&op_rc);
         self.extra_operations_after
             .push_back((after_pass_idx + 1, op_rc));
         pos_ref

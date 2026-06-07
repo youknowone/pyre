@@ -1461,6 +1461,11 @@ impl Optimizer {
     /// inject additional operations.
     pub fn send_extra_operation(&mut self, op: &Op, ctx: &mut OptContext) {
         let op_rc = std::rc::Rc::new(op.clone());
+        // Register the producer for op_rc.pos before dispatch so a pass that
+        // folds it via make_equal_to(from_bound_op(op_rc), ..) writes the
+        // forwarding onto a host find_producer_op can reach (the normal trace
+        // path registers via bind_input_resops; emit_extra does the same).
+        ctx.register_extra_producer(&op_rc);
         self.propagate_from_pass(0, &op_rc, ctx);
     }
 
@@ -1474,6 +1479,7 @@ impl Optimizer {
         ctx: &mut OptContext,
     ) {
         let op_rc = std::rc::Rc::new(op.clone());
+        ctx.register_extra_producer(&op_rc);
         self.propagate_from_pass(after_pass_idx + 1, &op_rc, ctx);
     }
 
@@ -1741,13 +1747,14 @@ impl Optimizer {
     /// Takes `&mut OptContext` to mirror the upstream `getintbound`
     /// lazy-install side effect (optimizer.py:102-112).
     pub fn getnullness(ctx: &mut OptContext, opref: OpRef) -> i8 {
-        // optimizer.py:127-135 `getnullness` has no missing-Box branch —
-        // every `op` has a backing `AbstractValue` per `resoperation.py:
-        // 233-248 _forwarded`. `materialize_box_at` lazy-allocates the Box (or
-        // returns the const-namespace fresh) so the inlined
-        // `getintbound` side effect (`optimizer.py:110-113` unbounded
-        // install) materializes on first access, matching upstream's
-        // Box-always-exists invariant.
+        // optimizer.py:127-135 `getnullness` reads `getptrinfo` /
+        // `getintbound` of an existing box; the `'r'` arm uses
+        // `getptrinfo(create=False)`, so an absent info yields `INFO_UNKNOWN`
+        // without minting. Resolve the producer box and delegate — a
+        // producer-less position has no info and returns `INFO_UNKNOWN`, never
+        // a fresh stand-in (a nullness query must not pollute the producer
+        // registry). `ctx.getnullness` performs the per-type `getintbound`
+        // lazy-install on the resolved box.
         let Some(b) = ctx.get_box_replacement_box(opref) else {
             return crate::optimizeopt::INFO_UNKNOWN;
         };
