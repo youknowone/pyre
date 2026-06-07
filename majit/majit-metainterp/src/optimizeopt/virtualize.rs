@@ -291,6 +291,23 @@ impl VirtualizableTracker {
         }
     }
 
+    /// Invalidate every tracked slot of the standard-virtualizable array
+    /// `array_box` resolves to.  Mirrors `force_lazy_setarrayitem(descr,
+    /// indexb, can_cache=False)` (heap.py:580-586): a variable-index
+    /// SETARRAYITEM_GC may overwrite any element, so every const-index slot
+    /// a later read could fold against must be dropped before the write.
+    fn invalidate_array(&self, array_box: &crate::r#box::BoxRef, ctx: &mut OptContext) {
+        if let Some((frame_ref, array_idx)) = self.resolve_array_source(array_box, ctx) {
+            if let Some(b) = ctx.ensure_box(frame_ref) {
+                ctx.with_ptr_info_mut(&b, |info| {
+                    if let PtrInfo::Virtualizable(vstate) = info {
+                        vstate.arrays.retain(|(i, _)| *i != array_idx);
+                    }
+                });
+            }
+        }
+    }
+
     /// Read counterpart to [`mirror_setarrayitem`]: returns the tracked
     /// value box for `array_box[index]` on the standard virtualizable
     /// array state (seeded from the inputarg layout, updated by
@@ -888,6 +905,13 @@ impl OptVirtualize {
             if let (Some(vt), Some(ab)) = (self.vable.as_ref(), array_box.as_ref()) {
                 vt.mirror_setarrayitem(ab, index, value_ref, ctx);
             }
+        } else if let (Some(vt), Some(ab)) = (self.vable.as_ref(), array_box.as_ref()) {
+            // Non-constant index: a variable-index write may overwrite any
+            // const-index slot, so invalidate the whole tracked array before
+            // a later const-index read in `optimize_getarrayitem_gc` can fold
+            // to a now-stale value.  `force_lazy_setarrayitem(can_cache=False)`
+            // (heap.py:751 variable-index branch -> heap.py:580-586).
+            vt.invalidate_array(ab, ctx);
         }
         // virtualize.py:307: self.make_nonnull(op.getarg(0))
         if !array_box.as_ref().map_or(false, |b| ctx.has_ptr_info(b)) {
@@ -3306,6 +3330,119 @@ mod tests {
             set_count, 1,
             "the heap write must be preserved (read-only fold)"
         );
+    }
+
+    #[test]
+    fn test_standard_virtualizable_variable_index_setarrayitem_invalidates_array_fold() {
+        // A SETARRAYITEM_GC with a NON-constant index may overwrite any slot,
+        // so a subsequent const-index GETARRAYITEM_GC must NOT fold to a value
+        // a prior const-index write tracked.  The variable-index write
+        // invalidates the tracked array (force_lazy_setarrayitem,
+        // can_cache=False).  Companion of the read-after-write fold test above.
+        let mut ctx = OptContext::with_inputarg_types(8, &[Type::Ref]);
+        let mut pass = OptVirtualize::with_virtualizable(VirtualizableConfig {
+            static_field_offsets: vec![],
+            static_field_types: vec![],
+            static_field_descrs: vec![],
+            array_field_offsets: vec![8],
+            array_item_types: vec![Type::Int],
+            array_field_descrs: vec![],
+            array_lengths: vec![1],
+            vable_input_offset: 0,
+        });
+        pass.setup();
+
+        let field_descr = test_vable_field_descr(8, Type::Int, 1);
+        let arr_descr = array_descr(20);
+        // const index 0 + two stored values; int_op(60) is a NON-constant
+        // index (never made constant) for the variable-index write.
+        ctx.make_constant(OpRef::int_op(50), Value::Int(0));
+        ctx.make_constant(OpRef::int_op(51), Value::Int(42));
+        ctx.make_constant(OpRef::int_op(52), Value::Int(99));
+
+        let get_array_ptr = Op::with_descr(
+            OpCode::GetfieldRawI,
+            &[crate::r#box::BoxRef::from_opref(OpRef::input_arg_ref(0))],
+            field_descr,
+        );
+        // stack[0] = 42 (const index → tracked)
+        let set_item_const = Op::with_descr(
+            OpCode::SetarrayitemGc,
+            &[
+                crate::r#box::BoxRef::from_opref(OpRef::input_arg_ref(0)),
+                crate::r#box::BoxRef::from_opref(OpRef::int_op(50)),
+                crate::r#box::BoxRef::from_opref(OpRef::int_op(51)),
+            ],
+            arr_descr.clone(),
+        );
+        // stack[i] = 99 (variable index → must invalidate the tracked array)
+        let set_item_var = Op::with_descr(
+            OpCode::SetarrayitemGc,
+            &[
+                crate::r#box::BoxRef::from_opref(OpRef::input_arg_ref(0)),
+                crate::r#box::BoxRef::from_opref(OpRef::int_op(60)),
+                crate::r#box::BoxRef::from_opref(OpRef::int_op(52)),
+            ],
+            arr_descr.clone(),
+        );
+        // stack[0] (const index read — must NOT fold after the variable write)
+        let get_item = Op::with_descr(
+            OpCode::GetarrayitemGcI,
+            &[
+                crate::r#box::BoxRef::from_opref(OpRef::input_arg_ref(0)),
+                crate::r#box::BoxRef::from_opref(OpRef::int_op(50)),
+            ],
+            arr_descr,
+        );
+
+        let mut ops = vec![get_array_ptr, set_item_const, set_item_var, get_item];
+        assign_positions(&mut ops);
+        let array_ptr_ref = ops[0].pos.get();
+        ops[1].setarg(0, crate::r#box::BoxRef::from_opref(array_ptr_ref));
+        ops[2].setarg(0, crate::r#box::BoxRef::from_opref(array_ptr_ref));
+        ops[3].setarg(0, crate::r#box::BoxRef::from_opref(array_ptr_ref));
+
+        for op in &ops {
+            let mut resolved = op.clone();
+            for i in 0..resolved.num_args() {
+                resolved.setarg(
+                    i,
+                    crate::r#box::BoxRef::from_opref(
+                        ctx.get_box_replacement(resolved.arg(i).to_opref()),
+                    ),
+                );
+            }
+            match pass.propagate_forward(&resolved, &mut ctx) {
+                OptimizationResult::Emit(emitted) => {
+                    ctx.emit(emitted);
+                }
+                OptimizationResult::Replace(replaced) | OptimizationResult::Restart(replaced) => {
+                    ctx.emit(replaced);
+                }
+                OptimizationResult::Remove => {}
+                OptimizationResult::PassOn => {
+                    ctx.emit(resolved);
+                }
+                OptimizationResult::InvalidLoop => panic!("unexpected InvalidLoop in test"),
+            }
+        }
+
+        let get_count = ctx
+            .new_operations
+            .iter()
+            .filter(|op| op.opcode == OpCode::GetarrayitemGcI)
+            .count();
+        assert_eq!(
+            get_count, 1,
+            "GETARRAYITEM_GC must NOT fold after a variable-index SETARRAYITEM_GC \
+             invalidated the tracked array"
+        );
+        let set_count = ctx
+            .new_operations
+            .iter()
+            .filter(|op| op.opcode == OpCode::SetarrayitemGc)
+            .count();
+        assert_eq!(set_count, 2, "both heap writes must be preserved");
     }
 
     #[test]
