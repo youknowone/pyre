@@ -1720,9 +1720,8 @@ fn guard_pop_without_resize_le(
 /// strategy_id: 0 = object, 1 = int, 2 = float.
 /// For int/float strategies, the value is unboxed before writing.
 #[inline]
-pub fn generated_list_setitem_by_strategy(
-    frame: &mut crate::state::MIFrame,
-    ctx: &mut majit_metainterp::TraceCtx,
+pub fn generated_list_setitem_by_strategy<F: pyre_jit_trace::walker_frame_ops::WalkerFrameOps>(
+    frame: &mut F,
     obj: majit_ir::OpRef,
     key: majit_ir::OpRef,
     value: majit_ir::OpRef,
@@ -1730,8 +1729,11 @@ pub fn generated_list_setitem_by_strategy(
     strategy_id: i64,
     unbox_long: bool,
 ) {
-    frame.guard_class(ctx, obj, &pyre_object::pyobject::LIST_TYPE as *const _ as *const pyre_object::PyType);
-    frame.guard_list_strategy(ctx, obj, strategy_id);
+    frame.guard_class(
+        obj,
+        &pyre_object::pyobject::LIST_TYPE as *const _ as *const pyre_object::PyType,
+    );
+    frame.guard_list_strategy(obj, strategy_id);
     let len_descr = match strategy_id {
         0 => crate::descr::list_length_descr(),
         1 => crate::descr::list_int_items_len_descr(),
@@ -1739,26 +1741,37 @@ pub fn generated_list_setitem_by_strategy(
         _ => unreachable!(),
     };
     // pyjitpl.py:841: opimpl_check_resizable_neg_index for index normalization
-    let index = opimpl_check_resizable_neg_index(frame, ctx, obj, key, len_descr, concrete_key);
+    let index = opimpl_check_resizable_neg_index(frame, obj, key, len_descr, concrete_key);
     match strategy_id {
         0 => {
             // pyjitpl.py:832: arraybox = opimpl_getfield_gc_r(listbox, itemsdescr)
             // followed by setarrayitem_gc(arraybox, index, value, arraydescr).
-            let items_block = load_items_block(ctx, obj, crate::descr::list_items_descr());
-            crate::state::trace_items_block_setitem_value(ctx, items_block, index, value);
+            let items_block =
+                load_items_block(frame.ctx_mut(), obj, crate::descr::list_items_descr());
+            crate::state::trace_items_block_setitem_value(
+                frame.ctx_mut(),
+                items_block,
+                index,
+                value,
+            );
         }
         1 => {
             let items_ptr = crate::state::opimpl_getfield_gc_i(
-                ctx,
+                frame.ctx_mut(),
                 obj,
                 crate::descr::list_int_items_ptr_descr(),
             );
-            let raw = unbox_int_or_long_for_int_strategy(frame, ctx, value, unbox_long);
-            crate::state::trace_raw_int_array_setitem_value(ctx, items_ptr, index, raw);
+            let raw = unbox_int_or_long_for_int_strategy(frame, value, unbox_long);
+            crate::state::trace_raw_int_array_setitem_value(
+                frame.ctx_mut(),
+                items_ptr,
+                index,
+                raw,
+            );
         }
         2 => {
             let items_ptr = crate::state::opimpl_getfield_gc_i(
-                ctx,
+                frame.ctx_mut(),
                 obj,
                 crate::descr::list_float_items_ptr_descr(),
             );
@@ -1768,7 +1781,12 @@ pub fn generated_list_setitem_by_strategy(
                 let float_type_addr = &pyre_object::pyobject::FLOAT_TYPE as *const _ as i64;
                 crate::state::trace_unbox_float_with_resume(frame, value, float_type_addr)
             };
-            crate::state::trace_raw_float_array_setitem_value(ctx, items_ptr, index, raw);
+            crate::state::trace_raw_float_array_setitem_value(
+                frame.ctx_mut(),
+                items_ptr,
+                index,
+                raw,
+            );
         }
         _ => unreachable!(),
     }
@@ -1787,9 +1805,10 @@ pub fn generated_list_setitem_by_strategy(
 /// rather than risking an incorrect partial port of listobject.py's resizing
 /// and overlap rules.
 #[inline]
-pub fn generated_list_setslice_same_len_by_strategy(
-    frame: &mut crate::state::MIFrame,
-    ctx: &mut majit_metainterp::TraceCtx,
+pub fn generated_list_setslice_same_len_by_strategy<
+    F: pyre_jit_trace::walker_frame_ops::WalkerFrameOps,
+>(
+    frame: &mut F,
     obj: majit_ir::OpRef,
     value: majit_ir::OpRef,
     raw_start: i64,
@@ -1801,80 +1820,112 @@ pub fn generated_list_setslice_same_len_by_strategy(
     value_len: usize,
 ) {
     frame.guard_class(
-        ctx,
         obj,
         &pyre_object::pyobject::LIST_TYPE as *const _ as *const pyre_object::PyType,
     );
     frame.guard_class(
-        ctx,
         value,
         &pyre_object::pyobject::LIST_TYPE as *const _ as *const pyre_object::PyType,
     );
-    frame.guard_list_strategy(ctx, obj, strategy_id);
-    frame.guard_list_strategy(ctx, value, strategy_id);
+    frame.guard_list_strategy(obj, strategy_id);
+    frame.guard_list_strategy(value, strategy_id);
 
     let len_descr = list_len_descr_for_strategy(strategy_id);
-    let obj_len_box = crate::state::opimpl_getfield_gc_i(ctx, obj, len_descr.clone());
+    let obj_len_box =
+        crate::state::opimpl_getfield_gc_i(frame.ctx_mut(), obj, len_descr.clone());
     if raw_start == start && raw_stop == stop {
-        let raw_stop_box = ctx.const_int(raw_stop);
-        let lower_bound_ok =
-            ctx.record_op(majit_ir::OpCode::IntGe, &[obj_len_box, raw_stop_box]);
-        if let Some(majit_ir::Value::Int(ol)) = ctx.box_value(obj_len_box) {
-            ctx.set_opref_concrete(
+        let raw_stop_box = frame.ctx_mut().const_int(raw_stop);
+        let lower_bound_ok = frame
+            .ctx_mut()
+            .record_op(majit_ir::OpCode::IntGe, &[obj_len_box, raw_stop_box]);
+        let ol_opt = frame.ctx_mut().box_value(obj_len_box);
+        if let Some(majit_ir::Value::Int(ol)) = ol_opt {
+            frame.ctx_mut().set_opref_concrete(
                 lower_bound_ok,
                 majit_ir::Value::Int((ol >= raw_stop) as i64),
             );
         }
-        frame.generate_guard(ctx, majit_ir::OpCode::GuardTrue, &[lower_bound_ok]);
+        frame.generate_guard(majit_ir::OpCode::GuardTrue, &[lower_bound_ok]);
     } else {
-        frame.implement_guard_value(ctx, obj_len_box, obj_len as i64);
+        frame.implement_guard_value(obj_len_box, obj_len as i64);
     }
-    let value_len_box = crate::state::opimpl_getfield_gc_i(ctx, value, len_descr);
-    frame.implement_guard_value(ctx, value_len_box, value_len as i64);
+    let value_len_box = crate::state::opimpl_getfield_gc_i(frame.ctx_mut(), value, len_descr);
+    frame.implement_guard_value(value_len_box, value_len as i64);
 
     match strategy_id {
         0 => {
-            let dst_items = load_items_block(ctx, obj, crate::descr::list_items_descr());
-            let src_items = load_items_block(ctx, value, crate::descr::list_items_descr());
+            let dst_items =
+                load_items_block(frame.ctx_mut(), obj, crate::descr::list_items_descr());
+            let src_items =
+                load_items_block(frame.ctx_mut(), value, crate::descr::list_items_descr());
             for i in 0..value_len {
-                let src_idx = ctx.const_int(i as i64);
-                let dst_idx = ctx.const_int(start + i as i64);
-                let item = crate::state::trace_items_block_getitem_value(ctx, src_items, src_idx);
-                crate::state::trace_items_block_setitem_value(ctx, dst_items, dst_idx, item);
+                let src_idx = frame.ctx_mut().const_int(i as i64);
+                let dst_idx = frame.ctx_mut().const_int(start + i as i64);
+                let item = crate::state::trace_items_block_getitem_value(
+                    frame.ctx_mut(),
+                    src_items,
+                    src_idx,
+                );
+                crate::state::trace_items_block_setitem_value(
+                    frame.ctx_mut(),
+                    dst_items,
+                    dst_idx,
+                    item,
+                );
             }
         }
         1 => {
-            let dst_items =
-                crate::state::opimpl_getfield_gc_i(ctx, obj, crate::descr::list_int_items_ptr_descr());
+            let dst_items = crate::state::opimpl_getfield_gc_i(
+                frame.ctx_mut(),
+                obj,
+                crate::descr::list_int_items_ptr_descr(),
+            );
             let src_items = crate::state::opimpl_getfield_gc_i(
-                ctx,
+                frame.ctx_mut(),
                 value,
                 crate::descr::list_int_items_ptr_descr(),
             );
             for i in 0..value_len {
-                let src_idx = ctx.const_int(i as i64);
-                let dst_idx = ctx.const_int(start + i as i64);
-                let item = crate::state::trace_raw_int_array_getitem_value(ctx, src_items, src_idx);
-                crate::state::trace_raw_int_array_setitem_value(ctx, dst_items, dst_idx, item);
+                let src_idx = frame.ctx_mut().const_int(i as i64);
+                let dst_idx = frame.ctx_mut().const_int(start + i as i64);
+                let item = crate::state::trace_raw_int_array_getitem_value(
+                    frame.ctx_mut(),
+                    src_items,
+                    src_idx,
+                );
+                crate::state::trace_raw_int_array_setitem_value(
+                    frame.ctx_mut(),
+                    dst_items,
+                    dst_idx,
+                    item,
+                );
             }
         }
         2 => {
             let dst_items = crate::state::opimpl_getfield_gc_i(
-                ctx,
+                frame.ctx_mut(),
                 obj,
                 crate::descr::list_float_items_ptr_descr(),
             );
             let src_items = crate::state::opimpl_getfield_gc_i(
-                ctx,
+                frame.ctx_mut(),
                 value,
                 crate::descr::list_float_items_ptr_descr(),
             );
             for i in 0..value_len {
-                let src_idx = ctx.const_int(i as i64);
-                let dst_idx = ctx.const_int(start + i as i64);
-                let item =
-                    crate::state::trace_raw_float_array_getitem_value(ctx, src_items, src_idx);
-                crate::state::trace_raw_float_array_setitem_value(ctx, dst_items, dst_idx, item);
+                let src_idx = frame.ctx_mut().const_int(i as i64);
+                let dst_idx = frame.ctx_mut().const_int(start + i as i64);
+                let item = crate::state::trace_raw_float_array_getitem_value(
+                    frame.ctx_mut(),
+                    src_items,
+                    src_idx,
+                );
+                crate::state::trace_raw_float_array_setitem_value(
+                    frame.ctx_mut(),
+                    dst_items,
+                    dst_idx,
+                    item,
+                );
             }
         }
         _ => unreachable!(),
@@ -1888,9 +1939,8 @@ pub fn generated_list_setslice_same_len_by_strategy(
 /// accept fits_int W_LongObject (`listobject.py:1957-1958 IntegerListStrategy
 /// .is_correct_type` parity); `false` selects the default W_IntObject unbox.
 #[inline]
-fn unbox_int_or_long_for_int_strategy(
-    frame: &mut crate::state::MIFrame,
-    ctx: &mut majit_metainterp::TraceCtx,
+fn unbox_int_or_long_for_int_strategy<F: pyre_jit_trace::walker_frame_ops::WalkerFrameOps>(
+    frame: &mut F,
     value: majit_ir::OpRef,
     unbox_long: bool,
 ) -> majit_ir::OpRef {
@@ -2154,7 +2204,7 @@ pub fn generated_list_append_by_strategy(
                 list,
                 crate::descr::list_int_items_ptr_descr(),
             );
-            let raw = unbox_int_or_long_for_int_strategy(frame, ctx, value, unbox_long);
+            let raw = unbox_int_or_long_for_int_strategy(frame, value, unbox_long);
             crate::state::trace_raw_int_array_setitem_value(ctx, items_ptr, len, raw);
         }
         2 => {
@@ -2854,9 +2904,8 @@ pub fn opimpl_check_neg_index(
 /// For resizable lists. Uses GETFIELD_GC for length (not ARRAYLEN_GC).
 /// Bounds guards added for raw-pointer safety.
 #[inline]
-pub fn opimpl_check_resizable_neg_index(
-    frame: &mut crate::state::MIFrame,
-    ctx: &mut majit_metainterp::TraceCtx,
+pub fn opimpl_check_resizable_neg_index<F: pyre_jit_trace::walker_frame_ops::WalkerFrameOps>(
+    frame: &mut F,
     listbox: majit_ir::OpRef,
     indexbox: majit_ir::OpRef,
     lengthdescr: majit_ir::DescrRef,
@@ -2870,39 +2919,54 @@ pub fn opimpl_check_resizable_neg_index(
     } else {
         crate::state::trace_unbox_int_with_resume(frame, indexbox, int_type_addr)
     };
-    ctx.set_opref_concrete(raw_index, majit_ir::Value::Int(concrete_key));
-    let zero = ctx.const_int(0);
+    frame
+        .ctx_mut()
+        .set_opref_concrete(raw_index, majit_ir::Value::Int(concrete_key));
+    let zero = frame.ctx_mut().const_int(0);
     // pyjitpl.py:843-845
-    let negbox = ctx.record_op(OpCode::IntLt, &[raw_index, zero]);
-    ctx.set_opref_concrete(negbox, majit_ir::Value::Int((concrete_key < 0) as i64));
-    frame.implement_guard_value(ctx, negbox, if concrete_key < 0 { 1 } else { 0 });
+    let negbox = frame.ctx_mut().record_op(OpCode::IntLt, &[raw_index, zero]);
+    frame
+        .ctx_mut()
+        .set_opref_concrete(negbox, majit_ir::Value::Int((concrete_key < 0) as i64));
+    frame.implement_guard_value(negbox, if concrete_key < 0 { 1 } else { 0 });
     if concrete_key < 0 {
         // pyjitpl.py:848: lenbox = execute_and_record(GETFIELD_GC, lengthdescr, listbox)
-        let lenbox = crate::state::opimpl_getfield_gc_i(ctx, listbox, lengthdescr);
+        let lenbox = crate::state::opimpl_getfield_gc_i(frame.ctx_mut(), listbox, lengthdescr);
         // pyjitpl.py:850-851: indexbox = INT_ADD(indexbox, lenbox)
-        let indexbox = ctx.record_op(OpCode::IntAdd, &[raw_index, lenbox]);
-        if let Some(majit_ir::Value::Int(len)) = ctx.box_value(lenbox) {
-            ctx.set_opref_concrete(
+        let indexbox = frame
+            .ctx_mut()
+            .record_op(OpCode::IntAdd, &[raw_index, lenbox]);
+        let len_opt = frame.ctx_mut().box_value(lenbox);
+        if let Some(majit_ir::Value::Int(len)) = len_opt {
+            frame.ctx_mut().set_opref_concrete(
                 indexbox,
                 majit_ir::Value::Int(concrete_key.wrapping_add(len)),
             );
         }
         // bounds guard (raw-pointer safety)
-        let in_bounds = ctx.record_op(OpCode::IntGe, &[indexbox, zero]);
-        if let Some(majit_ir::Value::Int(idx)) = ctx.box_value(indexbox) {
-            ctx.set_opref_concrete(in_bounds, majit_ir::Value::Int((idx >= 0) as i64));
+        let in_bounds = frame.ctx_mut().record_op(OpCode::IntGe, &[indexbox, zero]);
+        let idx_opt = frame.ctx_mut().box_value(indexbox);
+        if let Some(majit_ir::Value::Int(idx)) = idx_opt {
+            frame
+                .ctx_mut()
+                .set_opref_concrete(in_bounds, majit_ir::Value::Int((idx >= 0) as i64));
         }
-        frame.generate_guard(ctx, OpCode::GuardTrue, &[in_bounds]);
+        frame.generate_guard(OpCode::GuardTrue, &[in_bounds]);
         indexbox
     } else {
         // RPython: no bounds check for positive index.
         // We add one for raw-pointer safety.
-        let lenbox = crate::state::opimpl_getfield_gc_i(ctx, listbox, lengthdescr);
-        let in_bounds = ctx.record_op(OpCode::IntLt, &[raw_index, lenbox]);
-        if let Some(majit_ir::Value::Int(len)) = ctx.box_value(lenbox) {
-            ctx.set_opref_concrete(in_bounds, majit_ir::Value::Int((concrete_key < len) as i64));
+        let lenbox = crate::state::opimpl_getfield_gc_i(frame.ctx_mut(), listbox, lengthdescr);
+        let in_bounds = frame
+            .ctx_mut()
+            .record_op(OpCode::IntLt, &[raw_index, lenbox]);
+        let len_opt = frame.ctx_mut().box_value(lenbox);
+        if let Some(majit_ir::Value::Int(len)) = len_opt {
+            frame
+                .ctx_mut()
+                .set_opref_concrete(in_bounds, majit_ir::Value::Int((concrete_key < len) as i64));
         }
-        frame.generate_guard(ctx, OpCode::GuardTrue, &[in_bounds]);
+        frame.generate_guard(OpCode::GuardTrue, &[in_bounds]);
         raw_index
     }
 }
@@ -2982,7 +3046,7 @@ pub fn generated_list_getitem_by_strategy(
         2 => crate::descr::list_float_items_len_descr(),
         _ => unreachable!(),
     };
-    let index = opimpl_check_resizable_neg_index(frame, ctx, obj, key, len_descr, concrete_key);
+    let index = opimpl_check_resizable_neg_index(frame, obj, key, len_descr, concrete_key);
     match strategy_id {
         0 => {
             let items_block = load_items_block(ctx, obj, crate::descr::list_items_descr());
@@ -3069,9 +3133,8 @@ pub fn generated_binary_subscr_value(
 ///
 /// Returns true if handled, false if caller should fall back to residual.
 #[inline]
-pub fn generated_store_subscr_value(
-    frame: &mut crate::state::MIFrame,
-    ctx: &mut majit_metainterp::TraceCtx,
+pub fn generated_store_subscr_value<F: pyre_jit_trace::walker_frame_ops::WalkerFrameOps>(
+    frame: &mut F,
     obj: majit_ir::OpRef,
     key: majit_ir::OpRef,
     value: majit_ir::OpRef,
@@ -3093,7 +3156,7 @@ pub fn generated_store_subscr_value(
                 let concrete_len = pyre_object::w_list_len(concrete_obj);
                 if check_index_in_bounds(index, concrete_len) {
                     generated_list_setitem_by_strategy(
-                        frame, ctx, obj, key, value, index, sid, unbox_long,
+                        frame, obj, key, value, index, sid, unbox_long,
                     );
                     return true;
                 }

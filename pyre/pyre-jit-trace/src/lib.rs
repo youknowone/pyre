@@ -5,6 +5,13 @@
 //! from pyre-jit's eval_loop_jit to prevent MIFrame's monomorphization
 //! of `execute_opcode_step<E>` from bloating the eval loop's codegen.
 
+// Self-alias so include!()'d codegen written for `majit-translate`'s
+// crate name keeps compiling when its source is also `include!`d into
+// this crate's `generated*` modules (jit_trace_gen.rs).  Allows generic
+// bounds like `F: pyre_jit_trace::walker_frame_ops::WalkerFrameOps` to
+// resolve from both sides.
+extern crate self as pyre_jit_trace;
+
 pub mod assembler;
 pub mod callbacks;
 pub mod canonical_bridge;

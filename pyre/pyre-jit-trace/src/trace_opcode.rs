@@ -5432,7 +5432,6 @@ impl MIFrame {
                     }
                     crate::generated_list_setslice_same_len_by_strategy(
                         this,
-                        ctx,
                         obj,
                         value,
                         raw_start,
@@ -5449,10 +5448,9 @@ impl MIFrame {
             }
         }
         // jtransform do_resizable_list_setitem dispatch.
-        let handled: bool = self.with_ctx(|this, ctx| {
+        let handled: bool = self.with_ctx(|this, _ctx| {
             Ok::<_, PyError>(crate::generated_store_subscr_value(
                 this,
-                ctx,
                 obj,
                 key,
                 value,
