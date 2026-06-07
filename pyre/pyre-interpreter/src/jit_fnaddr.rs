@@ -339,6 +339,27 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         crate::opcode_ops::jit_setattr as *const (),
     );
 
+    // Production walker's `Instruction::StoreSubscr` arm emits a
+    // `residual_call_r_r` whose funcptr resolves at codewriter time
+    // through the bare path `["execute_store_subscr"]` (the dispatch-
+    // table entry at `pyopcode.rs:2909`).  Without a runtime fnaddr
+    // entry the codewriter mints a `symbolic_fnaddr_for_path` hash
+    // that the `runtime_fnaddr_patch` cannot rewrite and sub-slice 4's
+    // 47-bit sanity gate rejects, causing the walker to skip the heap
+    // mutation and SIGBUS on the next read.  `bh_execute_store_subscr`
+    // is the C-ABI bridge over the generic
+    // `execute_store_subscr::<PyFrame>` whose `Result<StepResult<_>,
+    // PyError>` cannot ride the residual_call's single-register Ref
+    // result slot.  Registering the bare path here lets the codewriter
+    // bake the wrapper address directly into `JitCode.constants_i`,
+    // mirroring PyPy's `cpu.bh_call_*` -> linker-resolved C symbol
+    // contract (`pyjitpl.py:1346 _opimpl_residual_call*`).
+    push_fnaddr(
+        &mut entries,
+        "execute_store_subscr",
+        crate::opcode_ops::bh_execute_store_subscr as *const (),
+    );
+
     for (nargs, (module_path, root_path)) in CALLABLE_HELPER_PATHS.iter().enumerate() {
         if let Some(fnptr) = crate::runtime_ops::callable_call_helper(nargs) {
             push_alias_pair(&mut entries, module_path, root_path, fnptr);

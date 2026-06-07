@@ -253,6 +253,27 @@ pub extern "C" fn jit_setattr(obj: i64, name_ptr: i64, name_len: i64, value: i64
     }
 }
 
+/// C-ABI bridge for the `execute_store_subscr` arm helper consumed by the
+/// production walker.  Mirrors RPython's `bh_call_*` calling convention:
+/// a single `*mut PyFrame` arg widened to `i64`, success encoded as a
+/// non-zero `i64`, errors propagated via
+/// `majit_metainterp::blackhole::BH_LAST_EXC_VALUE`.  Required because
+/// `crate::execute_store_subscr` itself returns `Result<StepResult<_>,
+/// PyError>` whose fat-enum payload does not fit the residual_call's
+/// single-register Ref-result slot.
+#[allow(improper_ctypes_definitions)]
+pub extern "C" fn bh_execute_store_subscr(executor_ptr: i64) -> i64 {
+    let executor = unsafe { &mut *(executor_ptr as *mut crate::pyframe::PyFrame) };
+    match crate::pyopcode::execute_store_subscr(executor) {
+        Ok(_step_result) => 1,
+        Err(err) => {
+            let exc_obj = err.to_exc_object();
+            majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc_obj as i64));
+            0
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
