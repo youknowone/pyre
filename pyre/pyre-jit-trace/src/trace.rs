@@ -621,6 +621,12 @@ fn probe_walk_perfn_jitcode(
 
     // Roll the recorder back so the aborted trace leaves no partial ops.
     ctx.cut_trace(pre_pos);
+    // The probe discards its trace; clear any deferred void-store events and
+    // stashed Finish payload an authoritative probe walk may have recorded so
+    // they cannot leak into the next walk (the production tracer clears these
+    // at entry, but the probe never runs through that path).
+    crate::jitcode_dispatch::void_defer_reset();
+    crate::jitcode_dispatch::fbw_finish_payload_reset();
 }
 
 /// Issue #73 production full-body tracer (Phase 5 flip, gated).

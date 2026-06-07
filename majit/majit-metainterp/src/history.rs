@@ -2134,7 +2134,7 @@ impl TraceCtx {
 
     /// Set rd_resume_position on the most-recently recorded *guard* op,
     /// skipping any non-guard ops recorded after it (see
-    /// [`crate::recorder::Recorder::set_last_guard_op_resume_position`]).
+    /// [`crate::recorder::Trace::set_last_guard_op_resume_position`]).
     pub fn set_last_guard_op_resume_position(&mut self, snapshot_id: i32) {
         self.recorder.set_last_guard_op_resume_position(snapshot_id);
     }

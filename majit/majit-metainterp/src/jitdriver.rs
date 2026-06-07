@@ -22,6 +22,8 @@ pub fn trace_continuation_suspended() -> bool {
 
 /// RAII guard that suspends re-entrant trace continuation for its lifetime,
 /// restoring the previous state on drop (nesting-safe).
+#[must_use = "the guard suspends trace continuation only while held; a bare \
+              `TraceContinuationSuspendGuard::enter();` drops it immediately"]
 pub struct TraceContinuationSuspendGuard(bool);
 
 impl TraceContinuationSuspendGuard {
