@@ -443,6 +443,14 @@ impl PyFrame {
     /// at the exact guard state instead of mid-body / past a stepped loop
     /// counter.  `src` is a `snapshot_for_tracing` of this same frame, so the
     /// arrays share length; the `min` is defensive.
+    ///
+    /// These three are exactly the mutable virtualizable fields the walk can
+    /// touch (may-force residual calls advance `last_instr` and the value
+    /// stack).  The remaining `_virtualizable_` fields — `pycode`, `w_globals`,
+    /// `debugdata` — are deliberately NOT restored: `pycode`/`w_globals` are
+    /// frame-invariant and `debugdata` is debug-only; none are written on the
+    /// live frame during tracing (the walk writes only the symbolic `PyreSym`
+    /// shadow), so restoring them would be dead.
     pub fn restore_resume_state_from(&mut self, src: &PyFrame) {
         self.last_instr = src.last_instr;
         self.valuestackdepth = src.valuestackdepth;
