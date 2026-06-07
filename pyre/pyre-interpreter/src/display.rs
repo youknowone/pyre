@@ -649,33 +649,62 @@ pub unsafe fn py_str(obj: PyObjectRef) -> String {
                         return py_repr(first);
                     }
                 }
-                // `interp_exceptions.py:1330-1345 W_OSError.descr_str` —
-                // the 2-argument `(errno, strerror)` form renders as
-                // `"[Errno N] strerror"`, extended with `": 'filename'"`
-                // when a third argument is present.  Fewer than two args
-                // falls back to `W_BaseException.descr_str` below.
+                // `interp_exceptions.py:667-703 W_OSError.descr_str` reads
+                // the `errno`/`strerror`/`filename`/`filename2` slots:
+                // the 2-argument form renders as `"[Errno N] strerror"`,
+                // extended with `": 'filename'"` and `" -> 'filename2'"`
+                // when those are present.  `_init_error` drops filename
+                // from `args`, so prefer the slot and fall back to the
+                // positional arg (same 2..=5 gate as the getters) for the
+                // internal-constructor path that leaves the slots `PY_NULL`.
+                // Both errno and strerror absent falls back to
+                // `W_BaseException.descr_str` below.
                 pyre_object::excobject::ExcKind::OSError
                 | pyre_object::excobject::ExcKind::FileNotFoundError => {
                     let args = pyre_object::excobject::w_exception_get_args(obj);
-                    if !args.is_null() && pyre_object::is_tuple(args) {
-                        let n = pyre_object::w_tuple_len(args);
-                        if n >= 2 {
-                            let a0 = pyre_object::w_tuple_getitem(args, 0).unwrap_or(args);
-                            let a1 = pyre_object::w_tuple_getitem(args, 1).unwrap_or(args);
-                            let errno = py_str(a0);
-                            let strerror = py_str(a1);
-                            if n >= 3 {
-                                if let Some(fname) = pyre_object::w_tuple_getitem(args, 2) {
-                                    if !pyre_object::is_none(fname) {
-                                        return format!(
-                                            "[Errno {errno}] {strerror}: {}",
-                                            py_repr(fname)
-                                        );
-                                    }
-                                }
-                            }
-                            return format!("[Errno {errno}] {strerror}");
+                    let n = if !args.is_null() && pyre_object::is_tuple(args) {
+                        pyre_object::w_tuple_len(args)
+                    } else {
+                        0
+                    };
+                    let slot_or_arg = |slot: pyre_object::PyObjectRef,
+                                       idx: usize|
+                     -> Option<pyre_object::PyObjectRef> {
+                        if !slot.is_null() {
+                            return Some(slot);
                         }
+                        if (2..=5).contains(&n) && idx < n {
+                            unsafe { pyre_object::w_tuple_getitem(args, idx as i64) }
+                        } else {
+                            None
+                        }
+                    };
+                    let w_errno =
+                        slot_or_arg(pyre_object::excobject::w_exception_get_errno(obj), 0);
+                    let w_strerror =
+                        slot_or_arg(pyre_object::excobject::w_exception_get_strerror(obj), 1);
+                    if let (Some(w_errno), Some(w_strerror)) = (w_errno, w_strerror) {
+                        let errno = py_str(w_errno);
+                        let strerror = py_str(w_strerror);
+                        let w_filename =
+                            slot_or_arg(pyre_object::excobject::w_exception_get_filename(obj), 2)
+                                .filter(|&f| !pyre_object::is_none(f));
+                        if let Some(fname) = w_filename {
+                            let w_filename2 = slot_or_arg(
+                                pyre_object::excobject::w_exception_get_filename2(obj),
+                                4,
+                            )
+                            .filter(|&f| !pyre_object::is_none(f));
+                            if let Some(fname2) = w_filename2 {
+                                return format!(
+                                    "[Errno {errno}] {strerror}: {} -> {}",
+                                    py_repr(fname),
+                                    py_repr(fname2)
+                                );
+                            }
+                            return format!("[Errno {errno}] {strerror}: {}", py_repr(fname));
+                        }
+                        return format!("[Errno {errno}] {strerror}");
                     }
                 }
                 _ => {}
