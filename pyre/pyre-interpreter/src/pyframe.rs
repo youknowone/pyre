@@ -295,6 +295,13 @@ impl FrameBox {
     pub fn into_generator(mut self) -> crate::PyResult {
         self.fix_array_ptrs();
         let frame_ptr = self.into_raw();
+        // `w_generator_new` allocates and may trigger a collection. Until the
+        // generator owns `frame_ptr`, the frame's locals/args live only in its
+        // `locals_cells_stack_w` — the caller has already dropped them from its
+        // own stack — so root that slot across the allocation. The frame struct
+        // itself is a plain heap allocation (not a nursery object), so only the
+        // locals array needs protecting.
+        let _root = LocalsRoot::new(frame_ptr);
         let generator = pyre_object::generatorobject::w_generator_new(frame_ptr as *mut u8);
         unsafe {
             (*frame_ptr).f_generator_nowref = generator;
@@ -323,6 +330,33 @@ impl Drop for FrameBox {
         unsafe {
             let prefix = (self.ptr as *mut u8).sub(GC_HEADER_SIZE) as *mut GcFramePrefix;
             drop(Box::from_raw(prefix));
+        }
+    }
+}
+
+/// RAII guard registering a frame's `locals_cells_stack_w` slot as a GC root
+/// for the duration of an allocating frame-setup step. Mirrors the callee-locals
+/// root the eval path holds in `call.rs`: during setup the freshly-installed
+/// locals/cells live only in that array, so an intervening collection would
+/// drop or mis-forward them unless the slot is rooted.
+struct LocalsRoot {
+    slot: *mut *mut u8,
+    registered: bool,
+}
+
+impl LocalsRoot {
+    fn new(frame_ptr: *mut PyFrame) -> Self {
+        let slot =
+            unsafe { std::ptr::addr_of_mut!((*frame_ptr).locals_cells_stack_w) as *mut *mut u8 };
+        let registered = unsafe { pyre_object::gc_hook::try_gc_add_root(slot) };
+        Self { slot, registered }
+    }
+}
+
+impl Drop for LocalsRoot {
+    fn drop(&mut self) {
+        if self.registered {
+            pyre_object::gc_hook::try_gc_remove_root(self.slot);
         }
     }
 }
@@ -2619,7 +2653,13 @@ pub fn createframe(
     // so initialize_frame_scopes selects the `!OPTIMIZED && !NEWLOCALS`
     // arm and binds `w_locals = w_globals` per pyframe.py:233-235.
     let outer_ref = outer_func.unwrap_or(PY_NULL);
-    frame.initialize_frame_scopes(outer_ref, code)?;
+    // initialize_frame_scopes allocates (the locals dict and `w_cell_new`
+    // cells) and stores the cells into `locals_cells_stack_w`; root the slot so
+    // a collection mid-init can't drop the cells already written there.
+    {
+        let _root = LocalsRoot::new(frame.as_mut_ptr());
+        frame.initialize_frame_scopes(outer_ref, code)?;
+    }
 
     Ok(frame)
 }

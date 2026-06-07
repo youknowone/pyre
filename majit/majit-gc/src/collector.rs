@@ -1417,6 +1417,13 @@ impl MiniMarkGC {
     /// objects never have TRACK_YOUNG_PTRS, so the flag test alone selects the
     /// old-gen objects that may now point to young.
     pub fn do_write_barrier(&mut self, obj: GcRef) {
+        // incminimark's write_barrier receives a typed, non-null struct pointer.
+        // pyre's GcRef is nullable (GcRef::NULL is the sentinel) and reaches the
+        // safe `write_barrier`/`gc_write_barrier` entry points, so guard null
+        // before reading `header_of(obj)`; the card variant guards it likewise.
+        if obj.is_null() {
+            return;
+        }
         let hdr = unsafe { header_of(obj.0) };
         if unsafe { (*hdr).has_flag(flags::TRACK_YOUNG_PTRS) } {
             self.remember_young_pointer(obj);
@@ -2547,6 +2554,15 @@ mod tests {
         gc.do_write_barrier(GcRef(payload));
         assert_eq!(gc.remembered_set.len(), 0);
         drop(buf);
+    }
+
+    #[test]
+    fn write_barrier_null_is_noop() {
+        // GcRef::NULL reaches the safe write_barrier entry; it must not read a
+        // header at `0 - GcHeader::SIZE`.
+        let mut gc = test_gc(1024);
+        gc.do_write_barrier(GcRef(0));
+        assert_eq!(gc.remembered_set.len(), 0);
     }
 
     #[test]
