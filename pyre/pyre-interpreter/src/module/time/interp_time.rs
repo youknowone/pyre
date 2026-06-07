@@ -667,10 +667,10 @@ fn _gettmarg(args: &[PyObjectRef], default_now: bool) -> Result<c_tm, crate::PyE
 
     unsafe {
         let len = w_tuple_len(tup);
-        if len != 9 {
-            return Err(crate::PyError::type_error(
-                "time.struct_time() takes a sequence of length 9",
-            ));
+        if len < 9 {
+            return Err(crate::PyError::type_error(format!(
+                "argument must be sequence of at least length 9, not {len}"
+            )));
         }
         let get = |i: usize| -> i32 {
             let item = w_tuple_getitem(tup, i as i64).unwrap();
@@ -704,6 +704,17 @@ fn _gettmarg(args: &[PyObjectRef], default_now: bool) -> Result<c_tm, crate::PyE
         tm.tm_wday = (get(6) + 1) % 7; // Python Monday=0 → C Sunday=0
         tm.tm_yday = get(7) - 1;
         tm.tm_isdst = get(8);
+        // interp_time.py:830-841 — a sequence of length >=10 supplies
+        // `tm_zone` (idx 9) and length >=11 supplies `tm_gmtoff` (idx 10).
+        if len >= 10 {
+            let item = w_tuple_getitem(tup, 9).unwrap();
+            if is_str(item) {
+                tm.tm_zone = w_str_get_value(item).to_string();
+            }
+        }
+        if len >= 11 {
+            tm.tm_gmtoff = get(10) as i64;
+        }
         Ok(tm)
     }
 }
