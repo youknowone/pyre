@@ -73,6 +73,11 @@ fn structseq_field_get(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     }
     let desc = args[0];
     let inst = args[1];
+    // `_structseq.py:31` — `structseqfield.__get__` returns the descriptor
+    // itself for class-level access (`if obj is None: return self`).
+    if inst.is_null() || unsafe { pyre_object::pyobject::is_none(inst) } {
+        return Ok(desc);
+    }
     let name_obj = unsafe { pyre_object::getsetproperty::w_getset_get_name(desc) };
     if name_obj.is_null() || !unsafe { pyre_object::is_str(name_obj) } {
         return Err(PyError::type_error(
@@ -151,6 +156,72 @@ fn structseq_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
         "{name}({})",
         parts.join(", ")
     )))
+}
+
+/// `lib_pypy/_structseq.py structseq_reduce` — `return type(self),
+/// (tuple(self), self.__dict__)`.  The reconstruction call routes back
+/// through [`structseq_descr_new`] (`cls(sequence, dict)`), with the
+/// instance `__dict__` supplying the named-only extra fields.
+fn structseq_reduce(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
+    let inst = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+    if inst.is_null() {
+        return Err(PyError::type_error("structseq __reduce__ missing self"));
+    }
+    let cls = unsafe { (*inst).w_class };
+    // `tuple(self)` — the positional body as a plain tuple.
+    let n = unsafe { pyre_object::w_tuple_len(inst) };
+    let mut items: Vec<PyObjectRef> = Vec::with_capacity(n);
+    for i in 0..n {
+        items.push(
+            unsafe { pyre_object::w_tuple_getitem(inst, i as i64) }
+                .unwrap_or_else(pyre_object::w_none),
+        );
+    }
+    let body_tuple = pyre_object::w_tuple_new(items);
+    // `self.__dict__` carries the named-only extras for reconstruction.
+    let w_dict = crate::baseobjspace::getdict(inst);
+    let dict = if w_dict.is_null() {
+        pyre_object::w_dict_new()
+    } else {
+        w_dict
+    };
+    let inner = pyre_object::w_tuple_new(vec![body_tuple, dict]);
+    Ok(pyre_object::w_tuple_new(vec![cls, inner]))
+}
+
+/// `lib_pypy/_structseq.py structseq_setattr` — structseq instances are
+/// read-only.  Setting a known field raises `"readonly attribute"`;
+/// setting any other name raises the standard missing-attribute error.
+fn structseq_setattr(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
+    if args.len() < 3 {
+        return Err(PyError::type_error(
+            "structseq __setattr__ requires name and value",
+        ));
+    }
+    let inst = args[0];
+    let attr_obj = args[1];
+    if !unsafe { pyre_object::is_str(attr_obj) } {
+        return Err(PyError::type_error("attribute name must be string"));
+    }
+    let attr = unsafe { pyre_object::w_str_get_value(attr_obj) };
+    let cls = unsafe { (*inst).w_class };
+    // `attr not in type(self).__dict__` — own-dict membership, not MRO.
+    let in_type_dict = {
+        let dict_ptr = unsafe { pyre_object::typeobject::w_type_get_dict_ptr(cls) }
+            as *const crate::DictStorage;
+        if dict_ptr.is_null() {
+            false
+        } else {
+            crate::dict_storage_get(unsafe { &*dict_ptr }, &attr).is_some()
+        }
+    };
+    if !in_type_dict {
+        let cls_name = unsafe { pyre_object::w_type_get_name(cls) };
+        return Err(PyError::attribute_error(format!(
+            "'{cls_name}' object has no attribute '{attr}'"
+        )));
+    }
+    Err(PyError::attribute_error("readonly attribute"))
 }
 
 /// `lib_pypy/_structseq.py:95-144 structseq_new` — the `cls(sequence[,
@@ -342,9 +413,7 @@ fn make_struct_seq_impl(
         move |ns| {
             // `_structseq.py:79-80` — `__new__` / `__reduce__` /
             // `__setattr__` / `__repr__` / `__str__` are wired by the
-            // metaclass.  Pyre installs `__new__` + `__repr__` only;
-            // `__reduce__` and `__setattr__` are TBD when pickle and
-            // user-side mutation are exercised by the test suite.
+            // metaclass.
             crate::dict_storage_store(
                 ns,
                 "__new__",
@@ -359,6 +428,16 @@ fn make_struct_seq_impl(
                 ns,
                 "__str__",
                 crate::make_builtin_function_with_arity("__str__", structseq_repr, 1),
+            );
+            crate::dict_storage_store(
+                ns,
+                "__reduce__",
+                crate::make_builtin_function_with_arity("__reduce__", structseq_reduce, 1),
+            );
+            crate::dict_storage_store(
+                ns,
+                "__setattr__",
+                crate::make_builtin_function_with_arity("__setattr__", structseq_setattr, 3),
             );
 
             crate::dict_storage_store(

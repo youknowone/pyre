@@ -4131,6 +4131,21 @@ pub fn setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyResult {
                 return crate::call::call_function_impl_result(sa, &[obj, w_name, value])
                     .map(|_| w_none());
             }
+        } else if let Some(w_type) = crate::typedef::r#type(obj) {
+            // descroperation.py:247 looks up __setattr__ on the receiver
+            // type regardless of receiver kind.  Non-instance receivers
+            // (e.g. structseq tuple subclasses) may install a non-default
+            // __setattr__; only a real override (≠ object.__setattr__)
+            // needs invoking — the default terminal path is object_setattr.
+            if let Some(sa) = lookup_in_type(w_type, "__setattr__") {
+                let is_default = lookup_in_type(crate::typedef::w_object(), "__setattr__")
+                    .is_some_and(|d| std::ptr::eq(sa, d));
+                if !is_default {
+                    let w_name = w_str_new(name);
+                    return crate::call::call_function_impl_result(sa, &[obj, w_name, value])
+                        .map(|_| w_none());
+                }
+            }
         }
     }
     object_setattr(obj, name, value)
