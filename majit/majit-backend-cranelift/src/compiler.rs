@@ -6318,19 +6318,30 @@ fn emit_guard_exit(
             // Body-direct entry (nbody entry-bridge fix): set the target's
             // entry_mode discriminator so its block0 reads the first LABEL's
             // args from the frame and jumps straight to that LABEL block,
-            // bypassing the peeled preamble. The discriminator slot is just
-            // past this JUMP's fail_args; for an entry-bridge JUMP the source
-            // arg count equals the target's first-LABEL arity, which is the
-            // slot the target reads entry_mode from (= max_entry_inputs). A
-            // normal execute_token entry leaves that slot zero-filled
-            // (entry_mode == 0 -> preamble). When the target loop has no
-            // body-direct entry compiled, this store lands in an unused slot
-            // it never reads.
-            let one = builder.ins().iconst(cl_types::I64, 1);
-            let disc_ofs = JF_FRAME_ITEM0_OFS + (info.fail_arg_refs.len() as i32) * 8;
-            builder
-                .ins()
-                .store(MemFlags::trusted(), one, jf_ptr, disc_ofs);
+            // bypassing the peeled preamble. A normal execute_token entry leaves
+            // the slot zero-filled (entry_mode == 0 -> preamble).
+            //
+            // The discriminator lives at slot `fail_arg_refs.len()` (= the
+            // target's `max_entry_inputs` for an entry-bridge JUMP, the slot its
+            // body-direct prologue reads the flag from). A loop only has a
+            // body-direct entry when it carries loop-body ops past its LABEL, so
+            // that slot always sits strictly below `max_output_slots` — a genuine
+            // output slot, in bounds and below the ref-root region at
+            // `[max_output_slots, max_output_slots + num_ref_roots)`. When the
+            // slot reaches `max_output_slots` the target has no body-direct entry
+            // to read it; storing there would overrun the frame (no ref roots) or
+            // clobber a GC ref root, so skip the write. `max_output_slots` is
+            // recovered from `ref_root_base_ofs = JF_FRAME_ITEM0_OFS +
+            // max_output_slots * 8`.
+            let disc_slot = info.fail_arg_refs.len();
+            let max_output_slots = ((ref_root_base_ofs - JF_FRAME_ITEM0_OFS) / 8) as usize;
+            if disc_slot < max_output_slots {
+                let one = builder.ins().iconst(cl_types::I64, 1);
+                let disc_ofs = JF_FRAME_ITEM0_OFS + (disc_slot as i32) * 8;
+                builder
+                    .ins()
+                    .store(MemFlags::trusted(), one, jf_ptr, disc_ofs);
+            }
             emit_attached_loop_dispatch(
                 builder,
                 jf_ptr,
