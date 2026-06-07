@@ -9992,9 +9992,17 @@ impl<M: Clone> MetaInterp<M> {
             fail_values.len() as i32
         };
         let rd_virtuals = storage.map(|s| {
+            let num_virtuals = s.rd_virtuals.len();
             s.rd_virtuals
                 .iter()
-                .map(|rd| crate::resume::rd_virtual_to_virtual_info(rd.as_ref(), rd_consts, count))
+                .map(|rd| {
+                    crate::resume::rd_virtual_to_virtual_info(
+                        rd.as_ref(),
+                        rd_consts,
+                        count,
+                        num_virtuals,
+                    )
+                })
                 .collect::<Vec<_>>()
         });
         let deadframe_types = self.get_recovery_slot_types(green_key, norm_tid, fail_index);

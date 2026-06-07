@@ -1274,7 +1274,12 @@ pub use majit_backend::VirtualFieldSource;
 /// `consts` is the rd_consts array. `count` is the number of fail_args
 /// (used for negative TAGBOX indices). Both come from the containing
 /// ResumeGuardDescr / EncodedResumeData.
-pub fn tagged_to_source(tagged: i16, consts: &[majit_ir::Const], count: i32) -> VirtualFieldSource {
+pub fn tagged_to_source(
+    tagged: i16,
+    consts: &[majit_ir::Const],
+    count: i32,
+    num_virtuals: usize,
+) -> VirtualFieldSource {
     if tagged_eq(tagged, UNASSIGNED) {
         return ResumeValueSource::Unavailable;
     }
@@ -1306,7 +1311,18 @@ pub fn tagged_to_source(tagged: i16, consts: &[majit_ir::Const], count: i32) -> 
             }
             ResumeValueSource::FailArg(idx as usize)
         }
-        TAGVIRTUAL => ResumeValueSource::Virtual(num as usize),
+        TAGVIRTUAL => {
+            // Negative nums (cached/nested virtuals from
+            // assign_number_to_virtual) index rd_virtuals from the end, as in
+            // RPython's Python list negative indexing. Mirror the serialization
+            // remap in _number_virtuals (rd_virtuals.len() + num).
+            let idx = if num >= 0 {
+                num as usize
+            } else {
+                (num_virtuals as i32 + num) as usize
+            };
+            ResumeValueSource::Virtual(idx)
+        }
         _ => ResumeValueSource::Unavailable,
     }
 }
@@ -1314,11 +1330,13 @@ pub fn tagged_to_source(tagged: i16, consts: &[majit_ir::Const], count: i32) -> 
 /// Convert an `RdVirtualInfo` (IR-level, from compile.rs/pyjitpl.rs)
 /// to a `VirtualInfo` (resume-level, used by ResumeDataDirectReader).
 ///
-/// `consts` and `count` are needed to decode tagged fieldnums.
+/// `consts` and `count` are needed to decode tagged fieldnums; `num_virtuals`
+/// (the total rd_virtuals count) remaps negative TAGVIRTUAL field references.
 pub fn rd_virtual_to_virtual_info(
     rd: &majit_ir::RdVirtualInfo,
     consts: &[majit_ir::Const],
     count: i32,
+    num_virtuals: usize,
 ) -> VirtualInfo {
     match rd {
         majit_ir::RdVirtualInfo::VirtualInfo {
@@ -1332,7 +1350,7 @@ pub fn rd_virtual_to_virtual_info(
             let fields = fielddescrs
                 .iter()
                 .zip(fieldnums.iter())
-                .map(|(fd, &tagged)| (fd.index, tagged_to_source(tagged, consts, count)))
+                .map(|(fd, &tagged)| (fd.index, tagged_to_source(tagged, consts, count, num_virtuals)))
                 .collect();
             VirtualInfo::VirtualObj {
                 descr: descr.clone(),
@@ -1353,7 +1371,7 @@ pub fn rd_virtual_to_virtual_info(
             let fields = fielddescrs
                 .iter()
                 .zip(fieldnums.iter())
-                .map(|(fd, &tagged)| (fd.index, tagged_to_source(tagged, consts, count)))
+                .map(|(fd, &tagged)| (fd.index, tagged_to_source(tagged, consts, count, num_virtuals)))
                 .collect();
             VirtualInfo::VStruct {
                 typedescr: typedescr.clone(),
@@ -1370,7 +1388,7 @@ pub fn rd_virtual_to_virtual_info(
         } => {
             let items = fieldnums
                 .iter()
-                .map(|&tagged| tagged_to_source(tagged, consts, count))
+                .map(|&tagged| tagged_to_source(tagged, consts, count, num_virtuals))
                 .collect();
             VirtualInfo::VArray {
                 arraydescr: arraydescr.clone(),
@@ -1385,7 +1403,7 @@ pub fn rd_virtual_to_virtual_info(
         } => {
             let items = fieldnums
                 .iter()
-                .map(|&tagged| tagged_to_source(tagged, consts, count))
+                .map(|&tagged| tagged_to_source(tagged, consts, count, num_virtuals))
                 .collect();
             VirtualInfo::VArray {
                 arraydescr: arraydescr.clone(),
@@ -1409,7 +1427,7 @@ pub fn rd_virtual_to_virtual_info(
                 let elem: Vec<(u32, VirtualFieldSource)> = chunk
                     .iter()
                     .enumerate()
-                    .map(|(j, &tagged)| (j as u32, tagged_to_source(tagged, consts, count)))
+                    .map(|(j, &tagged)| (j as u32, tagged_to_source(tagged, consts, count, num_virtuals)))
                     .collect();
                 element_fields.push(elem);
             }
@@ -1433,7 +1451,7 @@ pub fn rd_virtual_to_virtual_info(
             assert_eq!(offsets.len(), fieldnums.len());
             let values = fieldnums
                 .iter()
-                .map(|&tagged| tagged_to_source(tagged, consts, count))
+                .map(|&tagged| tagged_to_source(tagged, consts, count, num_virtuals))
                 .collect();
             VirtualInfo::VRawBuffer {
                 func: *func,
@@ -1446,7 +1464,7 @@ pub fn rd_virtual_to_virtual_info(
         majit_ir::RdVirtualInfo::VRawSliceInfo { offset, fieldnums } => {
             let parent = fieldnums
                 .first()
-                .map(|&tagged| tagged_to_source(tagged, consts, count))
+                .map(|&tagged| tagged_to_source(tagged, consts, count, num_virtuals))
                 .unwrap_or(ResumeValueSource::Unavailable);
             VirtualInfo::VRawSlice {
                 offset: *offset as i64,
@@ -1456,19 +1474,19 @@ pub fn rd_virtual_to_virtual_info(
         majit_ir::RdVirtualInfo::VStrPlainInfo { fieldnums } => {
             let chars = fieldnums
                 .iter()
-                .map(|&tagged| tagged_to_source(tagged, consts, count))
+                .map(|&tagged| tagged_to_source(tagged, consts, count, num_virtuals))
                 .collect();
             VirtualInfo::VStrPlain { chars }
         }
         majit_ir::RdVirtualInfo::VStrConcatInfo { fieldnums } => {
-            let left = Box::new(tagged_to_source(fieldnums[0], consts, count));
-            let right = Box::new(tagged_to_source(fieldnums[1], consts, count));
+            let left = Box::new(tagged_to_source(fieldnums[0], consts, count, num_virtuals));
+            let right = Box::new(tagged_to_source(fieldnums[1], consts, count, num_virtuals));
             VirtualInfo::VStrConcat { left, right }
         }
         majit_ir::RdVirtualInfo::VStrSliceInfo { fieldnums } => {
-            let source = Box::new(tagged_to_source(fieldnums[0], consts, count));
-            let start = Box::new(tagged_to_source(fieldnums[1], consts, count));
-            let length = Box::new(tagged_to_source(fieldnums[2], consts, count));
+            let source = Box::new(tagged_to_source(fieldnums[0], consts, count, num_virtuals));
+            let start = Box::new(tagged_to_source(fieldnums[1], consts, count, num_virtuals));
+            let length = Box::new(tagged_to_source(fieldnums[2], consts, count, num_virtuals));
             VirtualInfo::VStrSlice {
                 source,
                 start,
@@ -1478,19 +1496,19 @@ pub fn rd_virtual_to_virtual_info(
         majit_ir::RdVirtualInfo::VUniPlainInfo { fieldnums } => {
             let chars = fieldnums
                 .iter()
-                .map(|&tagged| tagged_to_source(tagged, consts, count))
+                .map(|&tagged| tagged_to_source(tagged, consts, count, num_virtuals))
                 .collect();
             VirtualInfo::VUniPlain { chars }
         }
         majit_ir::RdVirtualInfo::VUniConcatInfo { fieldnums } => {
-            let left = Box::new(tagged_to_source(fieldnums[0], consts, count));
-            let right = Box::new(tagged_to_source(fieldnums[1], consts, count));
+            let left = Box::new(tagged_to_source(fieldnums[0], consts, count, num_virtuals));
+            let right = Box::new(tagged_to_source(fieldnums[1], consts, count, num_virtuals));
             VirtualInfo::VUniConcat { left, right }
         }
         majit_ir::RdVirtualInfo::VUniSliceInfo { fieldnums } => {
-            let source = Box::new(tagged_to_source(fieldnums[0], consts, count));
-            let start = Box::new(tagged_to_source(fieldnums[1], consts, count));
-            let length = Box::new(tagged_to_source(fieldnums[2], consts, count));
+            let source = Box::new(tagged_to_source(fieldnums[0], consts, count, num_virtuals));
+            let start = Box::new(tagged_to_source(fieldnums[1], consts, count, num_virtuals));
+            let length = Box::new(tagged_to_source(fieldnums[2], consts, count, num_virtuals));
             VirtualInfo::VUniSlice {
                 source,
                 start,
@@ -3973,6 +3991,11 @@ impl ResumeDataLoopMemo {
                     fieldbox, box_opref
                 )
             });
+            // resume.py:359 register_virtual_fields: stamp the virtual fieldbox
+            // UNASSIGNEDVIRTUAL (overwriting the UNASSIGNED that register_box
+            // installed above) so _number_virtuals numbers it as a virtual
+            // rather than a livebox — otherwise it would be force-boxed.
+            self.register_virtual_box(fieldbox, &numb_state.liveboxes, &mut new_liveboxes);
             for &field_opref in &vf.field_oprefs {
                 self.register_box(field_opref, env, &numb_state.liveboxes, &mut new_liveboxes);
                 let resolved = env.get_box_replacement(field_opref);
@@ -6559,6 +6582,22 @@ impl<'a> ResumeDataDirectReader<'a> {
         }
     }
 
+    /// resume.py: TAGVIRTUAL num → rd_virtuals/virtuals_cache index.
+    ///
+    /// RPython indexes `self.rd_virtuals[num]` / `virtuals_cache.get_*(num)`
+    /// directly with a possibly-negative `num` and relies on Python list
+    /// negative indexing (cached/nested virtuals get negative nums from
+    /// `assign_number_to_virtual`). Rust's getvirtual_* take a `usize`, so
+    /// remap here, mirroring `_number_virtuals` (`rd_virtuals.len() + num`).
+    fn virtual_index(&self, num: i32) -> usize {
+        if num >= 0 {
+            num as usize
+        } else {
+            let len = self.rd_virtuals.map_or(0, |v| v.len()) as i32;
+            (len + num) as usize
+        }
+    }
+
     /// resume.py:1552 decode_int
     pub fn decode_int(&mut self, tagged: i16) -> i64 {
         let (num, tag) = untag(tagged);
@@ -6574,7 +6613,8 @@ impl<'a> ResumeDataDirectReader<'a> {
             }
             TAGVIRTUAL => {
                 // resume.py:1559
-                self.getvirtual_int(num as usize)
+                let idx = self.virtual_index(num);
+                self.getvirtual_int(idx)
             }
             TAGBOX => {
                 // resume.py:1561-1564
@@ -6604,7 +6644,8 @@ impl<'a> ResumeDataDirectReader<'a> {
             }
             TAGVIRTUAL => {
                 // resume.py:1573
-                self.getvirtual_ptr(num as usize)
+                let idx = self.virtual_index(num);
+                self.getvirtual_ptr(idx)
             }
             TAGBOX => {
                 // resume.py:1575-1578

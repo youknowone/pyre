@@ -1366,9 +1366,10 @@ pub fn blackhole_resume_via_rd_numb(
     // for lazy materialization in getvirtual_ptr/getvirtual_int.
     let count = deadframe.len() as i32;
     let rd_virtuals_converted: Option<Vec<resume::VirtualInfo>> = rd_virtuals.map(|rd_virts| {
+        let num_virtuals = rd_virts.len();
         rd_virts
             .iter()
-            .map(|rd| resume::rd_virtual_to_virtual_info(rd, rd_consts, count))
+            .map(|rd| resume::rd_virtual_to_virtual_info(rd, rd_consts, count, num_virtuals))
             .collect()
     });
     let rd_virtuals_slice = rd_virtuals_converted.as_deref();
@@ -3483,8 +3484,9 @@ pub fn cranelift_resumedata_deopt(
     //    VirtualInfo so the decoder can materialise lazily.
     let count = outputs.len() as i32;
     let rd_virtuals_converted: Option<Vec<resume::VirtualInfo>> = rd_virtuals_rcs.map(|rcs| {
+        let num_virtuals = rcs.len();
         rcs.iter()
-            .map(|rd| resume::rd_virtual_to_virtual_info(rd, rd_consts, count))
+            .map(|rd| resume::rd_virtual_to_virtual_info(rd, rd_consts, count, num_virtuals))
             .collect()
     });
     let rd_virtuals_slice = rd_virtuals_converted.as_deref();
