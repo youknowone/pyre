@@ -1800,7 +1800,11 @@ impl RPythonAnnotator {
     /// `PositionKey` now carries `Weak<FunctionGraph>` + `Weak<Block>`;
     /// if either has been dropped since the position was recorded the
     /// reflow is silently skipped (the block's owner graph is already
-    /// gone).
+    /// gone). The reflow is likewise skipped when the block upgrades but
+    /// is no longer in `annotated`: `raise_if_subject_blocked` (q.v.)
+    /// evicts a Skipped subject's blocks from `annotated` without pruning
+    /// the shared `notify` map, leaving a position whose `Weak<Block>`
+    /// still upgrades against a session-retained `Rc`.
     pub fn reflowfromposition(&self, position_key: &PositionKey) {
         // upstream: `graph, block, index = position_key`
         let Some(graph) = position_key.graph() else {
@@ -1809,6 +1813,16 @@ impl RPythonAnnotator {
         let Some(block) = position_key.block() else {
             return;
         };
+        // A `notify` position may target a block that left `annotated`
+        // via the `raise_if_subject_blocked` rollback. Such a target is
+        // no longer scheduled, so skip the reflow — restoring the
+        // invariant (annrpython.py:392/418) that a reflow target is
+        // present in `annotated`. `reflowpendingblock`'s assert is
+        // intentionally left intact for genuine in-session ordering
+        // violations.
+        if !self.annotated.borrow().contains_key(&BlockKey::of(&block)) {
+            return;
+        }
         self.reflowpendingblock(&graph, &block);
     }
 
@@ -3040,6 +3054,55 @@ mod tests {
         drop(pending);
         let blocked = ann.blocked_blocks.borrow();
         assert!(blocked.contains_key(&bkey));
+    }
+
+    #[test]
+    fn reflowfromposition_skips_block_evicted_from_annotated() {
+        // `raise_if_subject_blocked` evicts a Skipped subject's blocks
+        // from `annotated` but leaves the shared `notify` map untouched;
+        // the block's session-retained `Rc` keeps the position's
+        // `Weak<Block>` upgradeable. A later notify reflow must silently
+        // skip such a dangling position instead of asserting in
+        // `reflowpendingblock`.
+        let translator = super::super::super::translator::translator::TranslationContext::new();
+        let ann = RPythonAnnotator::new(Some(translator), None, None, false);
+        let caller = mk_graph("caller", 0);
+        let callee = mk_graph("callee", 1);
+        let caller_startblock = caller.borrow().startblock.clone();
+        let whence = Some((Rc::clone(&caller), Rc::clone(&caller_startblock), 0));
+        ann.recursivecall(
+            &callee,
+            whence,
+            &[Some(SomeValue::Integer(SomeInteger::default()))],
+        );
+
+        // Annotate the caller block, then evict it (mirroring the
+        // rollback in `raise_if_subject_blocked`) while notify still
+        // points at it.
+        let bkey = BlockKey::of(&caller_startblock);
+        ann.annotated
+            .borrow_mut()
+            .insert(bkey.clone(), Some(Rc::clone(&caller)));
+        ann.annotated.borrow_mut().shift_remove(&bkey);
+        assert!(!ann.annotated.borrow().contains_key(&bkey));
+
+        // Fire the stale notify position — must not panic.
+        let returnblock = callee.borrow().returnblock.clone();
+        let positions: Vec<_> = ann
+            .notify
+            .borrow()
+            .get(&BlockKey::of(&returnblock))
+            .cloned()
+            .map(|set| set.into_iter().collect())
+            .unwrap_or_default();
+        assert_eq!(positions.len(), 1);
+        for position in &positions {
+            ann.reflowfromposition(position);
+        }
+
+        // The evicted block was neither re-scheduled nor re-blocked.
+        assert!(!ann.annotated.borrow().contains_key(&bkey));
+        assert!(!ann.blocked_blocks.borrow().contains_key(&bkey));
     }
 
     // ------------------------------------------------------------------
