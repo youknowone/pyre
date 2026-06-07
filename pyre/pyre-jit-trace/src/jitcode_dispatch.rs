@@ -5312,6 +5312,18 @@ pub(crate) fn fbw_call_assembler_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var("PYRE_FBW_CALL_ASSEMBLER").is_ok())
 }
 
+/// Whether `PYRE_FBW_DEBUG_ABORT` is set.  When on, `full_body_walk_trace`
+/// prints the structured reason (the `DispatchError` variant or the
+/// non-loop-closing `DispatchOutcome`) for every walk that maps to
+/// `TraceAction::Abort` / `AbortPermanent`.  The metainterp's own
+/// "abort trace at key={} (permanent={})" log (`pyjitpl/mod.rs:6348`) only
+/// reports the key and permanence; the walker-side reason is otherwise
+/// swallowed.  Default OFF → no output, zero production effect.
+pub(crate) fn fbw_debug_abort_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("PYRE_FBW_DEBUG_ABORT").is_some())
+}
+
 /// Clear any stashed Finish payload before a walk begins (mirrors
 /// [`void_defer_reset`]).
 pub(crate) fn fbw_finish_payload_reset() {

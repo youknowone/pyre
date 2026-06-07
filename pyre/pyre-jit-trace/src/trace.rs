@@ -733,10 +733,22 @@ fn full_body_walk_trace(
                         finish_arg_types: vec![finish_type],
                         exit_with_exception: false,
                     },
-                    None => TraceAction::Abort,
+                    None => {
+                        if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+                            eprintln!(
+                                "[fbw-abort] start_pc={start_pc} Terminate without finish payload (ungated portal exit)"
+                            );
+                        }
+                        TraceAction::Abort
+                    }
                 }
             }
-            _ => TraceAction::Abort,
+            other => {
+                if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+                    eprintln!("[fbw-abort] start_pc={start_pc} outcome={other:?}");
+                }
+                TraceAction::Abort
+            }
         },
         Some((_entry, _code_len, Err(e))) => {
             // Structural walker limitations recur identically on every
@@ -753,6 +765,9 @@ fn full_body_walk_trace(
             // raise marker); other errors retain the soft `Abort` so a
             // capability that lands mid-run can still pick the location up.
             use crate::jitcode_dispatch::DispatchError as DE;
+            if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+                eprintln!("[fbw-abort] start_pc={start_pc} Err={e:?}");
+            }
             match e {
                 DE::AbortPermanentMarkerReached { .. }
                 | DE::GuardSnapshotVableUntyped { .. }
@@ -763,7 +778,12 @@ fn full_body_walk_trace(
                 _ => TraceAction::Abort,
             }
         }
-        None => TraceAction::Abort,
+        None => {
+            if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+                eprintln!("[fbw-abort] start_pc={start_pc} run_perfn_walk returned None");
+            }
+            TraceAction::Abort
+        }
     }
 }
 
