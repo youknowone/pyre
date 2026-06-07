@@ -779,28 +779,9 @@ fn analyze_pipeline_from_parsed(
     // `build_semantic_program_*_with_options` so the front-end
     // `Expr::Path` arm resolves glob-imported bare names through the
     // primary `use_imports` lookup without a separate fallback.
-    // Diagnostic pre-pass — populate
-    // `FORCE_ATTRIBUTES_INTO_CLASSES` (classdesc.py:957-961) from each
-    // `parsed_files` entry's top-level structs so
-    // `ClassDesc::_init_classdef` can pre-fill `ClassDef.attrs` *before*
-    // the annotator's narrowing gate at
-    // `flowspace_adapter.rs::derive_subject_inputcells` checks
-    // `attrs_populated`.  Production never drives the walker (only
-    // `extract_unsafe_fn_stubs` is called from `register`), which left
-    // the dict empty for parsed-only structs and forced every
-    // impl-method `self` to carry
-    // `SomeInstance(classdef=None)`.  Empty `module_path` files (test
-    // fixtures) skip; their structs are registered through the bare-
-    // leaf walker path when the fixture explicitly calls
-    // `register_rust_module_at_with_source`.
-    for parsed in parsed_files {
-        if !parsed.module_path.is_empty() {
-            crate::flowspace::rust_source::register::pre_register_struct_fields_from_file(
-                &parsed.file,
-                "",
-            );
-        }
-    }
+    // `FORCE_ATTRIBUTES_INTO_CLASSES` is seeded from the LLBC-sourced
+    // `program.struct_field_attrs` further below, once `program` is
+    // built.
     // RPython `translator/translator.py:55 buildflowgraph` — FlowingError
     // propagates out and translation halts.  Pyre's top-level analyzer
     // requires a complete program; a FlowingError here means a user-
@@ -825,97 +806,30 @@ fn analyze_pipeline_from_parsed(
     // `front::mir::derive_program_metadata`; any leaf absent from the map
     // still resolves through the runtime's simple-name dual-publish slot.
     majit_ir::descr::register_struct_origins(program.struct_origins.clone());
-    // Tier-3 shadow probe: the syn `pre_register_struct_fields_from_file`
-    // pass above is still the active writer of
-    // `FORCE_ATTRIBUTES_INTO_CLASSES`.  The cutover replaces it with the
-    // LLBC-sourced `program.struct_field_attrs`, so the probe measures
-    // whether the LLBC map reproduces the syn map's values under the key
-    // the consumer (`_init_classdef`, `cls.qualname()`) reads back.
-    //
-    // The two sides are keyed differently: the syn writer keys by the
-    // in-file qualname (`bare` for a top-level struct, `mod::Leaf` for an
-    // in-file nested module), whereas `struct_field_attrs` keys by the
-    // crate-stripped Charon item path (`intobject::W_IntObject`).  A raw
-    // key-vs-key diff therefore shares zero keys and reports a vacuous
-    // `mismatch=0`.  Project both sides onto the bare leaf (last `::`
-    // segment) — the key a top-level struct resolves under — so the diff
-    // measures genuine field-map agreement.  `syn_nested` counts the syn
-    // keys that still carry an in-file `::` (a leaf-keyed writer would
-    // mis-key those); `ull_collisions` counts distinct Charon paths that
-    // share a leaf but disagree on the shelled field map (a leaf-keyed
-    // writer would be ambiguous there).  Both must be zero over the syn
-    // key set for the leaf-keyed cutover to be provably equivalent.
-    // `syn_only` is the genuine extraction gap (cfg(test) / jit-crate
-    // structs Charon does not extract); `ull_only` is the benign
-    // crate-type superset.  Summary only, no panic, so it cannot affect
-    // the gate.
+    // Tier-3: seed `FORCE_ATTRIBUTES_INTO_CLASSES` (classdesc.py:957-961)
+    // from the LLBC-sourced `program.struct_field_attrs` so
+    // `ClassDesc::_init_classdef` pre-fills `ClassDef.attrs` before the
+    // annotator's `attrs_populated` narrowing gate
+    // (`flowspace_adapter.rs::derive_subject_inputcells`).  Replaces the
+    // syn `pre_register_struct_fields_from_file` walk.
+    // `struct_field_attrs` is the Charon `derive_program_metadata`
+    // projection, keyed by the crate-stripped qualified item path
+    // (`intobject::W_IntObject`).  The consumer reads by `cls.qualname()`
+    // (the bare struct leaf), so register each entry under both the
+    // qualified path and the bare leaf.  Iterate in sorted qualified-key
+    // order so a bare leaf shared by distinct modules (e.g. two
+    // `FrameBlock`s) resolves deterministically across builds —
+    // `register_struct_fields` is last-writer-wins per key.
     {
-        fn bare_leaf(k: &str) -> &str {
-            k.rsplit("::").next().unwrap_or(k)
-        }
-        let syn_map = crate::annotator::classdesc::forced_attributes_snapshot();
-        let syn_nested = syn_map.keys().filter(|k| k.contains("::")).count();
-        let mut syn_bare: std::collections::HashMap<
-            String,
-            indexmap::IndexMap<String, crate::annotator::model::SomeValue>,
-        > = std::collections::HashMap::new();
-        for (qual, attrs) in &syn_map {
-            syn_bare.insert(bare_leaf(qual).to_string(), attrs.clone());
-        }
-        let mut ull_bare: std::collections::HashMap<
-            String,
-            indexmap::IndexMap<String, crate::annotator::model::SomeValue>,
-        > = std::collections::HashMap::new();
-        let mut ull_collisions = 0usize;
-        for (qual, rows) in &program.struct_field_attrs {
-            let mut shelled = indexmap::IndexMap::new();
-            for (name, vt) in rows {
-                if let Some(s) = crate::jit_codewriter::annotation_state::valuetype_to_someshell(vt)
-                {
-                    shelled.insert(name.clone(), s);
-                }
-            }
-            let leaf = bare_leaf(qual).to_string();
-            if let Some(prev) = ull_bare.get(&leaf) {
-                if prev != &shelled {
-                    ull_collisions += 1;
-                    if ull_collisions <= 20 {
-                        eprintln!("TIER3 struct_field_attrs ULL-COLLISION {leaf:?} ({qual:?})");
-                    }
-                }
-            }
-            ull_bare.insert(leaf, shelled);
-        }
-        let mut mismatch = 0usize;
-        let mut syn_only = 0usize;
-        for (leaf, syn_attrs) in &syn_bare {
-            match ull_bare.get(leaf) {
-                Some(u) if u == syn_attrs => {}
-                Some(u) => {
-                    mismatch += 1;
-                    if mismatch <= 20 {
-                        eprintln!(
-                            "TIER3 struct_field_attrs MISMATCH {leaf:?}: syn={syn_attrs:?} ull={u:?}"
-                        );
-                    }
-                }
-                None => {
-                    syn_only += 1;
-                    if syn_only <= 40 {
-                        eprintln!("TIER3 struct_field_attrs SYN-ONLY {leaf:?}");
-                    }
-                }
+        let mut entries: Vec<_> = program.struct_field_attrs.iter().collect();
+        entries.sort_by(|a, b| a.0.cmp(b.0));
+        for (qualified, fields) in entries {
+            crate::annotator::classdesc::register_struct_fields(qualified, fields);
+            let bare = qualified.rsplit("::").next().unwrap_or(qualified.as_str());
+            if bare != qualified.as_str() {
+                crate::annotator::classdesc::register_struct_fields(bare, fields);
             }
         }
-        let ull_only = ull_bare
-            .keys()
-            .filter(|k| !syn_bare.contains_key(*k))
-            .count();
-        eprintln!(
-            "TIER3 struct_field_attrs SUMMARY (bare-leaf): syn={} ull={} syn_nested={syn_nested} ull_collisions={ull_collisions} mismatch={mismatch} syn_only={syn_only} ull_only={ull_only}",
-            syn_bare.len(),
-            ull_bare.len(),
-        );
     }
     mark_phase!("build_semantic_program_from_parsed_files");
     let mut canonical_trait_impls = Vec::new();
