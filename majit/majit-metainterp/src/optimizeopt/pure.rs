@@ -1725,6 +1725,12 @@ mod tests {
         let mut ctx = OptContext::new(10);
         let mut pass = OptPure::new();
 
+        // Production binds the input operands a, b before the int_add is
+        // processed; bind them canonically here so same_box resolves both
+        // ops' args to one shared box.
+        ctx.materialize_box_at(OpRef::int_op(0));
+        ctx.materialize_box_at(OpRef::int_op(1));
+
         // Simulate: op0 = int_add(a, b)
         let op0 = Op::new(
             OpCode::IntAdd,
@@ -2452,6 +2458,7 @@ mod tests {
 
         // Cache `IntAdd(c5_a, x)` and look up `IntAdd(c5_b, x)`.
         let x = OpRef::int_op(7);
+        ctx.materialize_box_at(x);
         pass.pure_from_args2(OpCode::IntAdd, c5_a, x, OpRef::int_op(42));
 
         let mut q = Op::new(
@@ -2489,8 +2496,9 @@ mod tests {
         let other_arg = OpRef::int_op(9);
         let result = OpRef::int_op(42);
         let b_query = ctx.materialize_box_at(query_arg);
-        let b_canonical = ctx.get_box_replacement(canonical_arg);
+        let b_canonical = ctx.materialize_box_at(canonical_arg);
         ctx.make_equal_to(&b_query, &b_canonical);
+        ctx.materialize_box_at(other_arg);
 
         pass.pure_from_args2(OpCode::IntAdd, canonical_arg, other_arg, result);
 
@@ -2521,7 +2529,12 @@ mod tests {
         op.pos.set(OpRef::int_op(0));
         pass.pure(&op);
 
-        let ctx = OptContext::new(0);
+        let mut ctx = OptContext::new(0);
+        // Bind the operand positions canonically so same_box resolves the
+        // looked-up op's args to the same boxes the cache recorded.
+        for p in [10, 20, 30, 40] {
+            ctx.materialize_box_at(OpRef::int_op(p));
+        }
 
         // Should find it via get_pure_result
         let lookup_op = Op::new(
@@ -2580,7 +2593,10 @@ mod tests {
     #[test]
     fn test_known_result_call_pure_lookup() {
         let mut pass = OptPure::new();
-        let ctx = OptContext::with_num_inputs(4, 0);
+        let mut ctx = OptContext::with_num_inputs(4, 0);
+        // Bind the matched call args canonically so same_box resolves them.
+        ctx.materialize_box_at(OpRef::int_op(100));
+        ctx.materialize_box_at(OpRef::int_op(101));
 
         // pure.py:214: self.known_result_call_pure.append(op)
         pass.known_result_call_pure.push(super::KnownResultEntry {
@@ -2679,6 +2695,9 @@ mod tests {
     fn test_imported_short_call_pure_result_replays_into_pure_cache() {
         let mut pass = OptPure::new();
         let mut ctx = OptContext::with_num_inputs(8, 0);
+        // Bind the non-const call arg position so same_box resolves the
+        // dispatched op's arg to the same box the imported op recorded.
+        ctx.materialize_box_at(OpRef::int_op(0));
         let const_opref = OpRef::const_int(0x1234);
         let call_descr = majit_ir::descr::make_call_descr_full(
             77,

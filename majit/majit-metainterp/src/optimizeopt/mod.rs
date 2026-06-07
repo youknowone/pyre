@@ -5220,32 +5220,15 @@ impl OptContext {
     /// resoperation.py:38 `same_box` (non-Const: `self is other`) +
     /// history.py:211 `Const.same_box` (value comparison via
     /// `same_constant`). Resolves both operands through
-    /// `get_box_replacement` then delegates to `BoxRef::same_box`. Falls
-    /// back to resolved-`OpRef` identity plus constant-value comparison
-    /// when either box is absent (test fixtures without populated canonical
-    /// stores).
+    /// `get_box_replacement_box` then delegates to `BoxRef::same_box`;
+    /// operands that do not resolve to a canonical box are not the same box.
     pub fn same_box(&self, query: OpRef, stored: OpRef) -> bool {
         match (
             self.get_box_replacement_box(query),
             self.get_box_replacement_box(stored),
         ) {
             (Some(ref a), Some(ref b)) => a.same_box(b),
-            _ => {
-                let query = self.get_box_replacement(query).to_opref();
-                let stored = self.get_box_replacement(stored).to_opref();
-                if query == stored {
-                    return true;
-                }
-                match (
-                    self.get_box_replacement_box(query)
-                        .and_then(|cb| cb.const_value()),
-                    self.get_box_replacement_box(stored)
-                        .and_then(|cb| cb.const_value()),
-                ) {
-                    (Some(a), Some(b)) => a == b,
-                    _ => false,
-                }
-            }
+            _ => false,
         }
     }
 
