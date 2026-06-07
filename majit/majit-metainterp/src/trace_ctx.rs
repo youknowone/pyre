@@ -854,6 +854,24 @@ impl TraceCtx {
         effectinfo: Option<&majit_ir::EffectInfo>,
         argboxes: &[OpRef],
     ) {
+        if std::env::var_os("PYRE_PROBE_SUBSCR").is_some() {
+            let ei_summary = effectinfo.map(|ei| {
+                format!(
+                    "extraeffect={:?} forces_vorv={} can_raise={} plain_call={} oopspec={:?}",
+                    ei.extraeffect,
+                    ei.check_forces_virtual_or_virtualizable(),
+                    ei.check_can_raise(false),
+                    opnum.is_plain_call(),
+                    ei.oopspecindex,
+                )
+            });
+            eprintln!(
+                "[PYRE_PROBE_SUBSCR] invalidate_caches_varargs opnum={:?} argboxes.len={} ei={:?}",
+                opnum,
+                argboxes.len(),
+                ei_summary
+            );
+        }
         let oracle: &dyn majit_trace::heapcache::SameConstantOracle =
             &crate::history::ConstOprefOracle;
         let const_value = |opref: OpRef| match opref.inline_const_to_value() {
