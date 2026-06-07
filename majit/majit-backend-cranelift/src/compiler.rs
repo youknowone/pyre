@@ -8690,7 +8690,20 @@ impl CraneliftBackend {
         });
 
         let max_entry_inputs = num_inputs.max(body_direct_num_inputs);
-        let load_count = if body_direct_num_inputs > 0 {
+        // The dual-entry prologue loads the body LABEL args from frame slots
+        // `[0, body_direct_num_inputs)` and an `entry_mode` discriminator from
+        // slot `max_entry_inputs`. Those reads are in-bounds only while the
+        // highest one stays inside the frame payload `[0, max_output_slots +
+        // num_ref_roots)` (output slots followed by ref roots; see
+        // run_compiled_code_inner). A peeled loop whose first-LABEL arity
+        // exceeds the payload (large loop-carried set, few guard fail-args /
+        // ref roots) would read past the frame. Emit the body-direct entry
+        // only when the discriminator slot is in-bounds; otherwise fall back to
+        // the single preamble entry (entry_mode == 0). For typical loops the
+        // discriminator lands in the ref-root region, well within the payload.
+        let body_direct_entry = body_direct_num_inputs > 0
+            && max_entry_inputs < max_output_slots + ref_root_slots.len();
+        let load_count = if body_direct_entry {
             max_entry_inputs + 1 // extra slot for entry_mode flag
         } else {
             num_inputs
@@ -8830,7 +8843,7 @@ impl CraneliftBackend {
 
         let mut first_label_entered_at_entry = false;
         if let Some(&(entry_label_idx, entry_label_block)) = label_blocks.first() {
-            if body_direct_num_inputs > 0 && label_blocks.len() >= 2 {
+            if body_direct_entry && label_blocks.len() >= 2 {
                 // Dual entry: branch on entry_mode (last input slot).
                 // entry_mode == 0 → preamble, entry_mode != 0 → body-direct.
                 // brif directly targets label blocks with their params.
