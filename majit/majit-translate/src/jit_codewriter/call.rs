@@ -766,14 +766,13 @@ pub struct CallControl {
     pub immutable_array_types: HashSet<String>,
     /// Metadata-only registration carrier — `(segments,
     /// Signature, return_lltype)` for every `unsafe fn` and unsafe
-    /// impl-method discovered in the parsed source set.  These callees
-    /// cannot lower their bodies (`build_flow.rs:215` rejects
+    /// impl-method discovered by the LLBC/module-path pipeline.  These
+    /// callees cannot lower their bodies (`build_flow.rs:215` rejects
     /// `sig.unsafety.is_some()` because raw-pointer ops are not
     /// modelled), but `OpKind::Call::FunctionPath` sites still need
-    /// the path registered in `PyreCallRegistry`.  Populated by
-    /// `lib.rs::analyze_pipeline_from_module_paths` via
-    /// `flowspace::rust_source::register::extract_unsafe_fn_stubs`;
-    /// consumed by
+    /// the path registered in `PyreCallRegistry`.  Populated by `lib.rs`
+    /// from `program.unsafe_fn_stubs` via
+    /// `front::mir::collect_unsafe_fn_stubs_from_llbc`; consumed by
     /// `translator::rtyper::cutover::register_unsafe_fn_stubs` from
     /// `dual_gate_registry` after the function-graph populate pass.
     pub unsafe_fn_stubs: Vec<(
