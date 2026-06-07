@@ -60,6 +60,15 @@ pub(crate) fn filedescriptor_w(w_fd: PyObjectRef) -> Result<i32, crate::PyError>
     unhashable
 )]
 impl W_Poll {
+    /// `interp_select.py:115-117 descr_new` — the type is not directly
+    /// instantiable; `select.poll()` is the module-level factory.
+    #[staticmethod]
+    fn __new__(_cls: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+        Err(crate::PyError::type_error(
+            "cannot create 'select.poll' instances",
+        ))
+    }
+
     /// `interp_select.py:32 Poll.register` — `events` defaults to
     /// `POLLIN | POLLOUT | POLLPRI`.
     fn register(
@@ -415,8 +424,10 @@ pub fn register_module(ns: &mut DictStorage) {
     #[cfg(all(unix, feature = "host_env"))]
     {
         // Force the `select.poll` type to register so instances carry a
-        // valid `ob_type`.
+        // valid `ob_type`.  `interp_select.py:123
+        // Poll.typedef.acceptable_as_base_class = False`.
         let _ = type_object();
+        unsafe { pyre_object::w_type_set_acceptable_as_base_class(type_object(), false) };
         crate::dict_storage_store(
             ns,
             "poll",
@@ -451,6 +462,19 @@ pub fn register_module(ns: &mut DictStorage) {
     {
         crate::dict_storage_store(ns, "kqueue", super::interp_kqueue::type_object());
         crate::dict_storage_store(ns, "kevent", super::interp_kevent::type_object());
+        // `interp_kqueue.py:262 W_Kqueue.typedef.acceptable_as_base_class
+        // = False` / `:406 W_Kevent.typedef.acceptable_as_base_class =
+        // False`.
+        unsafe {
+            pyre_object::w_type_set_acceptable_as_base_class(
+                super::interp_kqueue::type_object(),
+                false,
+            );
+            pyre_object::w_type_set_acceptable_as_base_class(
+                super::interp_kevent::type_object(),
+                false,
+            );
+        }
         macro_rules! kq {
             ($name:literal, $val:expr) => {
                 crate::dict_storage_store(ns, $name, pyre_object::w_int_new($val as i64));
