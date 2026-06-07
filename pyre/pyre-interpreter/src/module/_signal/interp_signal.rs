@@ -65,17 +65,12 @@ pub fn set_handler(signum: i32, handler: PyObjectRef) {
 }
 
 /// `@unwrap_spec(signum=int)` — coerce the signal-number argument to an
-/// `i32`, rejecting non-integers with a `TypeError`.
+/// `i32`.  The gateway `int` converter is `space.gateway_int_w`
+/// (`gateway.py:646-665` → `int_w(allow_conversion=True)`), which runs
+/// `__index__`/`__int__` and accepts `int` subclasses, so route through
+/// the matching helper rather than an exact-tag check.
 fn signum_arg(w_signum: PyObjectRef) -> Result<i32, crate::PyError> {
-    unsafe {
-        if pyre_object::is_int(w_signum) {
-            Ok(pyre_object::w_int_get_value(w_signum) as i32)
-        } else if pyre_object::is_bool(w_signum) {
-            Ok(pyre_object::w_bool_get_value(w_signum) as i32)
-        } else {
-            Err(crate::PyError::type_error("an integer is required"))
-        }
-    }
+    Ok(crate::baseobjspace::gateway_int_w(w_signum)? as i32)
 }
 
 /// interp_signal.py:285-288 `check_signum_in_range`.
@@ -95,9 +90,12 @@ fn signal_signal(w_signum: PyObjectRef, w_handler: PyObjectRef) -> Result<PyObje
     check_signum_in_range(signum)?;
 
     // interp_signal.py:313-321 — SIG_DFL / SIG_IGN are the ints 0 / 1;
-    // anything else must be callable.
-    let is_dfl = unsafe { pyre_object::is_int(w_handler) && pyre_object::w_int_get_value(w_handler) == 0 };
-    let is_ign = unsafe { pyre_object::is_int(w_handler) && pyre_object::w_int_get_value(w_handler) == 1 };
+    // anything else must be callable.  PyPy compares with
+    // `space.eq_w(w_handler, space.newint(SIG_DFL/SIG_IGN))`, so any
+    // equality-compatible object (int subclass, bool, custom `__eq__`)
+    // is accepted — use `eq_w` rather than an exact-int read.
+    let is_dfl = crate::baseobjspace::eq_w(w_handler, pyre_object::w_int_new(0));
+    let is_ign = crate::baseobjspace::eq_w(w_handler, pyre_object::w_int_new(1));
     if is_dfl {
         signalstate::pypysig_default(signum);
     } else if is_ign {
