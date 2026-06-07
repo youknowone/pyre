@@ -11,7 +11,7 @@
 //! `ActionFlag` ticker methods (`SignalActionFlag` in upstream) read and
 //! write it directly so the handler and the eval loop share one cell.
 
-use std::sync::atomic::{AtomicI32, AtomicI64, AtomicPtr, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicPtr, Ordering};
 
 /// `signals.c:34` — reasonable default cap; the libc crate does not
 /// surface `NSIG` portably.  64 fits a single `i64` bitmask.
@@ -32,6 +32,12 @@ static SIG_PENDING: AtomicI64 = AtomicI64::new(0);
 /// `signals.c:52 wakeup_fd` — fd to write a byte to on each signal, or
 /// -1 when disabled (`signal.set_wakeup_fd`).
 static WAKEUP_FD: AtomicI32 = AtomicI32::new(-1);
+
+/// `signals.c:53 wakeup.warn_on_full_buffer` — when false the handler
+/// silently drops a wakeup-fd write that fails with `EAGAIN`/`EWOULDBLOCK`
+/// (a full pipe) instead of stashing its errno.  Set by
+/// `signal.set_wakeup_fd(fd, warn_on_full_buffer=...)`; defaults to true.
+static WAKEUP_WARN_ON_FULL: AtomicBool = AtomicBool::new(true);
 
 /// `signals.c:132 pypysig_wakeup_fd_write_errno` — errno of a failed
 /// wakeup-fd write, stashed by the async handler (which cannot report it)
@@ -95,7 +101,10 @@ pub fn signal_poll() -> i32 {
 /// previous one.  pyre always writes the signal-number byte (the
 /// `PYPYSIG_WITH_NUL_BYTE` default only matters before any fd is set,
 /// during which `WAKEUP_FD` is -1 and nothing is written anyway).
-pub fn set_wakeup_fd(fd: i32) -> i32 {
+/// `warn_on_full` records whether a later full-pipe write should stash
+/// its errno (`PYPYSIG_NO_WARN_FULL` cleared) or be dropped silently.
+pub fn set_wakeup_fd(fd: i32, warn_on_full: bool) -> i32 {
+    WAKEUP_WARN_ON_FULL.store(warn_on_full, Ordering::SeqCst);
     WAKEUP_FD.swap(fd, Ordering::SeqCst)
 }
 
@@ -160,7 +169,14 @@ extern "C" fn signal_setflag_handler(signum: libc::c_int) {
                     if e == libc::EINTR {
                         continue;
                     }
-                    WAKEUP_FD_WRITE_ERRNO.store(e, Ordering::SeqCst);
+                    // `signals.c:160-166` — a full-pipe write
+                    // (EAGAIN/EWOULDBLOCK) is dropped silently when
+                    // warn_on_full_buffer is false; any other error is
+                    // always stashed for the next checkpoint to report.
+                    let warn = WAKEUP_WARN_ON_FULL.load(Ordering::SeqCst);
+                    if warn || (e != libc::EAGAIN && e != libc::EWOULDBLOCK) {
+                        WAKEUP_FD_WRITE_ERRNO.store(e, Ordering::SeqCst);
+                    }
                 }
                 break;
             }

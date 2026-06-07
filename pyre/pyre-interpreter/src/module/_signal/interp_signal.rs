@@ -364,7 +364,25 @@ pub fn register_module(ns: &mut DictStorage) {
         ns,
         "set_wakeup_fd",
         crate::make_builtin_function("set_wakeup_fd", |args| {
-            let fd = if let Some(&a) = args.first() {
+            // interp_signal.py:330-331 — `set_wakeup_fd(fd, *,
+            // warn_on_full_buffer=True)`: the flag is keyword-only, so a
+            // second positional argument is rejected.
+            let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
+            crate::builtins::kwarg_reject_unknown(
+                kwargs,
+                &["warn_on_full_buffer"],
+                "set_wakeup_fd",
+            )?;
+            if positional.len() > 1 {
+                return Err(crate::PyError::type_error(format!(
+                    "set_wakeup_fd() takes 1 positional argument but {} were given",
+                    positional.len()
+                )));
+            }
+            let warn_on_full_buffer = crate::builtins::kwarg_get(kwargs, "warn_on_full_buffer")
+                .map(crate::baseobjspace::is_true)
+                .unwrap_or(true);
+            let fd = if let Some(&a) = positional.first() {
                 if !unsafe { pyre_object::is_int(a) } {
                     return Err(crate::PyError::type_error(
                         "set_wakeup_fd() argument must be an int",
@@ -415,7 +433,7 @@ pub fn register_module(ns: &mut DictStorage) {
             // interp_signal.py:376 — `pypysig_set_wakeup_fd`.  The OS
             // handler writes the signal-number byte to this fd so a
             // select/poll loop blocked elsewhere wakes up.
-            let prev = signalstate::set_wakeup_fd(fd);
+            let prev = signalstate::set_wakeup_fd(fd, warn_on_full_buffer);
             Ok(pyre_object::w_int_new(prev as i64))
         }),
     );
