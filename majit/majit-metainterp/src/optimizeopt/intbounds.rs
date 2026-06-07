@@ -33,20 +33,13 @@ fn autogen_eq(box1: OpRef, bound1: &IntBound, box2: OpRef, bound2: &IntBound) ->
 /// comparison) instead of the OpRef-flat `==`, plus the same
 /// constant-bound equality fallback. Used by the `optimize_INT_*` bodies
 /// that resolve operands to their `_forwarded` terminal via `resolve_box`.
-///
-/// The `to_opref()` equality mirrors `OptContext::same_box`'s fallback for
-/// operands whose canonical box store is absent (test fixtures with dangling
-/// position refs): two fresh `materialize_box_at` materializations of the same
-/// position are not `Rc::ptr_eq` but denote the same operand. In production
-/// both operands resolve to one shared canonical box, so `same_box` already
-/// short-circuits.
 fn autogen_eq_b(
     box1: &crate::r#box::BoxRef,
     bound1: &IntBound,
     box2: &crate::r#box::BoxRef,
     bound2: &IntBound,
 ) -> bool {
-    if box1.same_box(box2) || box1.to_opref() == box2.to_opref() {
+    if box1.same_box(box2) {
         return true;
     }
     if bound1.is_constant()
@@ -1759,7 +1752,7 @@ impl OptIntBounds {
         let arg1 = self.resolve_box(op.arg(1), ctx);
         let b0 = self.getintbound_b(&arg0, ctx);
         // intbounds.py:119-123: if arg0 is arg1: b = b0.lshift_bound(1) (x+x is even)
-        let b = if arg0.same_box(&arg1) || arg0.to_opref() == arg1.to_opref() {
+        let b = if arg0.same_box(&arg1) {
             b0.lshift_bound(&IntBound::from_constant(1))
         } else {
             let b1 = self.getintbound_b(&arg1, ctx);
@@ -2102,7 +2095,7 @@ impl OptIntBounds {
         let arg0 = self.resolve_box(op.arg(0), ctx);
         let arg1 = self.resolve_box(op.arg(1), ctx);
         let b0 = self.getintbound_b(&arg0, ctx);
-        let b = if arg0.same_box(&arg1) || arg0.to_opref() == arg1.to_opref() {
+        let b = if arg0.same_box(&arg1) {
             b0.mul2_bound_no_overflow()
         } else {
             let b1 = self.getintbound_b(&arg1, ctx);
@@ -2118,7 +2111,7 @@ impl OptIntBounds {
         // intbounds.py:278-279: b0/b1 are computed before the same_box check.
         let b0 = self.getintbound_b(&arg0, ctx);
         let b1 = self.getintbound_b(&arg1, ctx);
-        if arg0.same_box(&arg1) || arg0.to_opref() == arg1.to_opref() {
+        if arg0.same_box(&arg1) {
             // intbounds.py:280: arg0.same_box(arg1) → x - x = 0
             self.make_constant_int(op, 0, ctx);
             return OptimizationResult::Remove;
@@ -2158,7 +2151,7 @@ impl OptIntBounds {
         let arg0 = self.resolve_box(op.arg(0), ctx);
         let arg1 = self.resolve_box(op.arg(1), ctx);
         let b0 = self.getintbound_b(&arg0, ctx);
-        let b = if arg0.same_box(&arg1) || arg0.to_opref() == arg1.to_opref() {
+        let b = if arg0.same_box(&arg1) {
             b0.square_bound_no_overflow()
         } else {
             let b1 = self.getintbound_b(&arg1, ctx);
