@@ -1889,6 +1889,36 @@ pub(crate) fn derive_subject_inputcells(
     Ok(cells)
 }
 
+/// `remove_dead_blocks` (`translator/simplify.py`) — the set of blocks
+/// reachable from `startblock` by following `Block.exits`.  The rtyper
+/// only annotates reachable blocks, so the flowspace adapter must drop
+/// everything else.  The monotonic front-end leaves model-unreachable
+/// `on_unwind` cleanup blocks in the graph: `lower_call` / `Drop` /
+/// `Assert` forward past the Rust panic-table unwind edge
+/// (`front::mir`), and the orphan cleanup block is closed by `set_raise`
+/// with fresh, never-defined `etype`/`evalue` placeholders
+/// (`model.rs::set_raise`).  Without this prune those orphan operands
+/// reach [`link_arg_to_hlvalue`] and trip the "undefined operand slot"
+/// invariant even though the block can never execute.  The `Block.dead`
+/// flag covers only the framestate path's explicit marking
+/// (`mir.rs::lower_framestate`); startblock reachability is the general
+/// case the `dead` skip sites below also honour.
+fn reachable_block_ids(legacy: &FunctionGraph) -> std::collections::HashSet<BlockId> {
+    let mut seen = std::collections::HashSet::new();
+    let mut stack = vec![legacy.startblock];
+    while let Some(bid) = stack.pop() {
+        if !seen.insert(bid) {
+            continue;
+        }
+        if let Some(block) = legacy.blocks.get(bid.0) {
+            for link in &block.exits {
+                stack.push(link.target);
+            }
+        }
+    }
+    seen
+}
+
 /// One-way conversion from the legacy `crate::model::FunctionGraph`
 /// into a `flowspace::FunctionGraph` whose blocks carry `Hlvalue`
 /// operands and per-value `SomeValue` annotations on its `Variable`s.
@@ -1940,11 +1970,17 @@ pub fn function_graph_to_flowspace(
     let mut constant_hlvalues: HashMap<Variable, Hlvalue> = HashMap::new();
     let mut constant_concretetypes: HashMap<Variable, LowLevelType> = HashMap::new();
 
+    // `remove_dead_blocks` reachable set — blocks not reachable from
+    // `startblock` are dropped from every pass below alongside the
+    // explicit `dead` flag.  See [`reachable_block_ids`].
+    let reachable = reachable_block_ids(legacy);
+
     for legacy_block in &legacy.blocks {
-        // Dead blocks are pruned from the flowspace (`remove_dead_blocks`
-        // parity), so their const-defines are never referenced — skip them
-        // here too rather than stamp concretetypes onto orphan cells.
-        if legacy_block.dead {
+        // Dead / unreachable blocks are pruned from the flowspace
+        // (`remove_dead_blocks` parity), so their const-defines are never
+        // referenced — skip them here too rather than stamp concretetypes
+        // onto orphan cells.
+        if legacy_block.dead || !reachable.contains(&legacy_block.id) {
             continue;
         }
         for legacy_op in &legacy_block.operations {
@@ -1990,12 +2026,17 @@ pub fn function_graph_to_flowspace(
     let mut block_inputarg_vars: HashMap<BlockId, Vec<(Variable, Variable)>> = HashMap::new();
 
     for legacy_block in &legacy.blocks {
-        // `dead` blocks are removed before annotation (`remove_dead_blocks`
-        // parity).  Nothing on the monotonic path marks `dead`, so this is
-        // inert there; the framestate path marks model-unreachable orphan
-        // `on_unwind` blocks dead.  Skipping Pass 1 alloc keeps them out of
-        // `block_map`, which Pass 2 must mirror (it indexes `block_map`).
+        // `dead` / unreachable blocks are removed before annotation
+        // (`remove_dead_blocks` parity).  The framestate path marks
+        // model-unreachable orphan `on_unwind` blocks `dead`; the
+        // monotonic path leaves them unmarked but startblock-unreachable,
+        // so `reachable` is what prunes them there.  Skipping Pass 1 alloc
+        // keeps them out of `block_map`, which Pass 2 must mirror (it
+        // indexes `block_map`).  No reachable block can target a pruned
+        // block — a target is reachable by construction — so the mirror
+        // stays consistent.
         if legacy_block.dead
+            || !reachable.contains(&legacy_block.id)
             || legacy_block.id == legacy.returnblock
             || legacy_block.id == legacy.exceptblock
         {
@@ -2098,11 +2139,12 @@ pub fn function_graph_to_flowspace(
     // ──────────────────────────────────────────────────────────────
 
     for legacy_block in &legacy.blocks {
-        // Mirror Pass 1's skip set exactly — a `dead` block has no
-        // `block_map` entry, so translating it would panic at the index
-        // below.  See the Pass 1 comment for the `remove_dead_blocks`
+        // Mirror Pass 1's skip set exactly — a `dead` / unreachable block
+        // has no `block_map` entry, so translating it would panic at the
+        // index below.  See the Pass 1 comment for the `remove_dead_blocks`
         // rationale.
         if legacy_block.dead
+            || !reachable.contains(&legacy_block.id)
             || legacy_block.id == legacy.returnblock
             || legacy_block.id == legacy.exceptblock
         {
