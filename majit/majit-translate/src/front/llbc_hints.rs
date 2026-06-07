@@ -47,7 +47,21 @@ pub fn harvest_hints_from_llbcs(llbcs: &[Llbc]) -> HashMap<String, Vec<String>> 
                 if should_skip_generated_elidable_helper(fn_leaf) {
                     continue;
                 }
-                let hint = if global_marker_bool(llbc, gd).unwrap_or(false) {
+                // The marker const exists (its name routed control here),
+                // so its bool initializer must decode.  Mirror policy.py:56
+                // honouring the exact `_jit_look_inside_` value rather than
+                // silently coercing an undecodable marker to
+                // `dont_look_inside`: a `None` here means the marker is
+                // present but its literal bool could not be read, which is a
+                // decoder/encoding fault, not a `False`.
+                let look_inside = global_marker_bool(llbc, gd).unwrap_or_else(|| {
+                    panic!(
+                        "_jit_look_inside_ marker `{path}` has an undecodable bool \
+                         initializer; the macro emits a literal bool, so this signals \
+                         a Charon encoding change"
+                    )
+                });
+                let hint = if look_inside {
                     "jit_look_inside"
                 } else {
                     "dont_look_inside"
@@ -162,6 +176,13 @@ fn decode_bool_const(value: &serde_json::Value) -> Option<bool> {
     }
     if let Some(scalar) = obj.get("Scalar").or_else(|| obj.get("scalar")) {
         return decode_bool_const(scalar);
+    }
+    // A `ConstantExpr` nests the literal under `kind`
+    // (`{"kind": {"Literal": {"Bool": b}}, "ty": …}`).  The marker init
+    // assigns exactly this shape (`Local(0) = Const(ConstantExpr)`), so
+    // descend through `kind` to reach the literal instead of missing it.
+    if let Some(kind) = obj.get("kind") {
+        return decode_bool_const(kind);
     }
     None
 }
