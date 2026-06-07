@@ -3010,6 +3010,65 @@ fn trace_jit_bytecode(_pc: usize, _instruction_name: &str) {
 /// implement the body — arm jitcode lookup, BH builder
 /// acquire/release, PyFrame↔BH register marshalling, `interp.run()`
 /// — and grow the predicate per opcode.
+///
+/// ## Latent gaps before this path can be activated
+///
+/// The body below is reachable only when the predicate flips on for
+/// a given opcode, which is gated behind Task #390 sub-slice 6
+/// (retire Phase 5.B body wire once orthodox concrete-execute
+/// covers the same opcodes).  These items MUST close before any
+/// activation flip — they are tracked here so the predicate change
+/// surfaces them rather than crashing in production:
+///
+/// 1. **Non-void return-type push not implemented.** Below at the
+///    `todo!()` arm: `BhReturnType::Int|Ref|Float` panics.  Normal
+///    opcode arms typically end in `ref_return/r` →
+///    `DispatchOutcome::SubReturn { result: Some(opref) }` on the
+///    walker side; the blackhole equivalent surfaces via
+///    `bh.tmpreg_r`/`tmpreg_i`/`tmpreg_f` after
+///    `_final_result_anytype` / `_done_with_this_frame`
+///    (`rpython/jit/metainterp/blackhole.py:377, :1664`).  Slice
+///    3.8 ports the PyFrame stack push.
+///
+/// 2. **`bh.aborted` ignored.** Pyre's `BlackholeInterpreter` adds
+///    a pyre-only `aborted` flag for the `abort/` and
+///    `abort_permanent/` bhimpl opcodes
+///    (`majit/majit-metainterp/src/blackhole.rs:237`) which the
+///    resume path treats as failure
+///    (`pyre/pyre-jit/src/call_jit.rs:1478`).  This dispatcher
+///    currently reads only `mergepoint_args` / `got_exception` /
+///    `exception_value` / `return_type`, so an aborted arm would be
+///    misclassified as a normal completion.  Activation must check
+///    `bh.aborted` and raise — RPython has no "successful abort"
+///    path; bad/unwired blackhole bytecode fails loudly
+///    (`rpython/jit/metainterp/blackhole.py:97`).
+///
+/// 3. **`jitdrivers_sd` not seeded.** RPython blackhole recursive
+///    calls reach `builder.metainterp_sd.jitdrivers_sd[jdindex]`
+///    (`rpython/jit/metainterp/blackhole.py:1095`).  Pyre's
+///    existing resume path explicitly seeds `bh.jitdrivers_sd` at
+///    `pyre/pyre-jit/src/call_jit.rs:1424`; this helper only sets
+///    `virtualizable_ptr` and `virtualizable_info`.  Any future
+///    blackhole-handled opcode arm that reaches `recursive_call_*`
+///    would not match RPython.
+///
+/// 4. **`BH_LAST_EXC_VALUE` not drained.** The residual-call
+///    executor reports raised Python exceptions via
+///    `majit_metainterp::blackhole::BH_LAST_EXC_VALUE` (a
+///    thread-local seeded by `execute_residual_call`'s Err arm).
+///    This helper consults only `bh.got_exception` /
+///    `bh.exception_last_value`; a raised residual call could
+///    therefore fall through as `StepResult::Continue` and leave
+///    the TLS exception latched for a later opcode.  Activation
+///    must drain and clear `BH_LAST_EXC_VALUE` after `bh.run()`
+///    and map a non-zero value into `PyError`.
+///
+/// 5. **Hot-path lookup cost.** `metainterp_jitcode_for_instruction`
+///    (`pyre/pyre-jit-trace/src/jitcode_runtime.rs:337`) currently
+///    formats `Instruction` with `Debug` then linear-scans
+///    `ALL_OPCODE_ARMS`; before this path becomes default-on for
+///    any opcode, the arm/jitcode index needs threading through
+///    the dispatch site so the lookup is O(1).
 #[cold]
 fn dispatch_arm_via_blackhole(
     frame: &mut pyre_interpreter::pyframe::PyFrame,

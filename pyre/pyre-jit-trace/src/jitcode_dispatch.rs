@@ -3022,14 +3022,27 @@ fn decode_descr_index(code: &[u8], op: &DecodedOp, operand_offset: usize) -> usi
 ///
 /// ★ Task #390 sub-slice 1 — non-elidable concrete-execute inventory.
 ///
-/// PyPy `do_residual_call` (pyjitpl.py:1995-2126) **always** calls
-/// `executor.execute_varargs(opnum, argboxes, descr, exc=can_raise,
-/// pure=is_elidable)` regardless of EI branch.  The recorded opcode
-/// kind selected above is for the IR trace; concrete execution always
-/// happens at trace-record time.  Pyre's walker only concrete-executes
+/// PyPy `do_residual_call` (pyjitpl.py:1995-2126) concrete-executes
+/// the helper at trace-record time across the **forces** /
+/// **loopinvariant** (cache miss) / **elidable** / **default**
+/// branches via `executor.execute_varargs(opnum, argboxes, descr,
+/// exc=can_raise, pure=is_elidable)`.  Two narrower branches sit
+/// outside this uniform call:
+///   * `OS_NOT_IN_TRACE` short-circuits through
+///     `do_not_in_trace_call` (`pyjitpl.py:2003-2006`) and never
+///     reaches `executor.execute_varargs`.
+///   * `is_call_release_gil()` runs the helper through
+///     `do_call_release_gil` (`pyjitpl.py:3671-3681`), invoking
+///     `executor.execute_varargs` directly **before** the recorded
+///     `CALL_RELEASE_GIL_*` op is emitted.
+/// The recorded opcode kind selected above is for the IR trace
+/// only; concrete execution either fired (or was intentionally
+/// skipped via the two narrow branches above) before the trace op
+/// hits the recorder.  Pyre's walker today concrete-executes only
 /// the `CallPure*` branch (via [`try_fold_pure_call_via_executor`]),
-/// so the other three branches surface as the M4 SIGBUS root cause
-/// (memory: M4 walker unactivated taxonomy).
+/// so the forces / loopinvariant-miss / default branches surface
+/// as the M4 SIGBUS root cause (memory: M4 walker unactivated
+/// taxonomy).
 ///
 /// Per-branch concrete-execute status today:
 ///
@@ -3587,6 +3600,20 @@ fn try_execute_residual_call_via_executor(
         majit_metainterp::executor::execute_residual_call(call_descr, func_ptr, &args);
     match exec_result {
         Ok(result_i64) => {
+            // `pyjitpl.py:1685-1690 _opimpl_residual_call*` finishes its
+            // success arm with `metainterp.clear_exception()` (called
+            // implicitly through `do_residual_call`'s no-raise tail).
+            // Pyre's `ctx.last_exc_value` carries a sticky `OpRef` /
+            // concrete pointer from any prior raising helper in the
+            // same walk; if a later non-raising residual call did not
+            // clear it, downstream consumers (`last_exc_value/>r`,
+            // `reraise/`, `catch_exception/L`) would read the stale
+            // value as if a fresh exception had just landed.  Mirror
+            // `clear_exception()` here so the success arm only
+            // surfaces an active exception when the *current* call
+            // raised.
+            ctx.last_exc_value = None;
+            ctx.last_exc_value_concrete = ConcreteValue::Null;
             // pyjitpl.py:1392 `result_box.value = result` analogue — stamp
             // the recorded OpRef with the executed concrete so downstream
             // `concrete_of_opref` / `box_value` consumers see the folded
@@ -4647,6 +4674,25 @@ fn dispatch_residual_call_iRd_kind(
         if can_raise {
             if resid_raised {
                 walker_record_guard_exception(ctx, op.pc);
+                // `pyjitpl.py:2156-2168 handle_possible_exception` routes
+                // the raising branch through `finishframe_exception()`
+                // immediately after emitting `GUARD_EXCEPTION`, so the
+                // remaining bytes of the arm never run.  Surface the
+                // outcome to `walk_loop` as `SubRaise`: at top-level it
+                // emits the outer `FINISH(exc)` and Terminates the trace;
+                // at sub-walk depth it propagates up to the caller's
+                // `inline_call_*` handler.  Continuing past this point
+                // would record dead arm IR (e.g. the arm's tail
+                // `*_return`) onto an exception path and confuse the
+                // optimizer's guard-fail snapshot.
+                let exc = ctx
+                    .last_exc_value
+                    .expect("resid_raised implies last_exc_value seeded by the Err branch");
+                let exc_concrete = ctx.last_exc_value_concrete;
+                return Ok((
+                    DispatchOutcome::SubRaise { exc, exc_concrete },
+                    op.next_pc,
+                ));
             } else {
                 ctx.trace_ctx.record_guard(OpCode::GuardNoException, &[], 0);
                 walker_capture_snapshot_for_last_guard(ctx, op.pc);
@@ -4850,6 +4896,18 @@ fn dispatch_residual_call_iIRd_kind(
         if can_raise {
             if resid_raised {
                 walker_record_guard_exception(ctx, op.pc);
+                // pyjitpl.py:2156-2168 `handle_possible_exception`
+                // routes the raising branch through
+                // `finishframe_exception()` immediately after emitting
+                // GUARD_EXCEPTION — see iRd_kind for the full rationale.
+                let exc = ctx
+                    .last_exc_value
+                    .expect("resid_raised implies last_exc_value seeded by the Err branch");
+                let exc_concrete = ctx.last_exc_value_concrete;
+                return Ok((
+                    DispatchOutcome::SubRaise { exc, exc_concrete },
+                    op.next_pc,
+                ));
             } else {
                 ctx.trace_ctx.record_guard(OpCode::GuardNoException, &[], 0);
                 walker_capture_snapshot_for_last_guard(ctx, op.pc);
@@ -5010,6 +5068,18 @@ fn dispatch_residual_call_iIRFd_kind(
         if can_raise {
             if resid_raised {
                 walker_record_guard_exception(ctx, op.pc);
+                // pyjitpl.py:2156-2168 `handle_possible_exception`
+                // routes the raising branch through
+                // `finishframe_exception()` immediately after emitting
+                // GUARD_EXCEPTION — see iRd_kind for the full rationale.
+                let exc = ctx
+                    .last_exc_value
+                    .expect("resid_raised implies last_exc_value seeded by the Err branch");
+                let exc_concrete = ctx.last_exc_value_concrete;
+                return Ok((
+                    DispatchOutcome::SubRaise { exc, exc_concrete },
+                    op.next_pc,
+                ));
             } else {
                 ctx.trace_ctx.record_guard(OpCode::GuardNoException, &[], 0);
                 walker_capture_snapshot_for_last_guard(ctx, op.pc);
