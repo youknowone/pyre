@@ -1014,31 +1014,6 @@ fn analyze_pipeline_from_parsed(
     // RPython: use the rtyped graphs (with concretetype info) for all analysis.
     // Use program.functions' graphs which were built with full struct_fields
     // context, NOT re-parsed graphs (which lose array_type_id etc.).
-    // Build the `pub use <src>::*` re-export index:
-    // `globbed_source_path -> [importing_module_path, ...]`.  For each
-    // file that does `pub use crate::M::*;`, M (as `::`-joined string)
-    // maps to that file's `module_path`, so a function defined in M
-    // also becomes callable under the importing module's namespace
-    // (and through the full set of crate-alias spellings the alias
-    // generator emits).  Mirrors Rust's resolution of `crate::
-    // ImportingMod::name` through the re-export; without this fan-out
-    // the registry would only carry the original `M::name` aliases
-    // and `crate::ImportingMod::name` would fail to resolve.
-    let mut glob_reexports: std::collections::HashMap<String, Vec<String>> =
-        std::collections::HashMap::new();
-    for parsed in parsed_files {
-        if parsed.module_path.is_empty() || parsed.pub_use_globs.is_empty() {
-            continue;
-        }
-        for source_segments in &parsed.pub_use_globs {
-            let source_key = source_segments.join("::");
-            glob_reexports
-                .entry(source_key)
-                .or_default()
-                .push(parsed.module_path.clone());
-        }
-    }
-
     for func in &program.functions {
         if func.self_ty_root.is_none() {
             // Stamp the source return type onto the graph so the JIT
@@ -1065,40 +1040,6 @@ fn analyze_pipeline_from_parsed(
                     &func.name,
                     &graph,
                 );
-            }
-            // Additional alias spellings for `pub use crate::<func
-            // module>::*;` re-exports — without this, a caller that
-            // writes `crate::ImportingMod::func` (resolved through the
-            // Rust-side glob re-export) finds no registered graph
-            // because `free_function_alias_paths` only fans out under
-            // the function's own module.
-            if let Some(importing_modules) = glob_reexports.get(&func.module_path) {
-                // Use just the function's leaf name (without module
-                // prefix) so the re-export aliases mirror what the
-                // alias generator would emit for a function natively
-                // defined in `importing_module`.
-                let leaf = func
-                    .name
-                    .rsplit("::")
-                    .next()
-                    .unwrap_or(&func.name)
-                    .to_string();
-                for importing_module in importing_modules {
-                    let synthetic_name = if importing_module.is_empty() {
-                        leaf.clone()
-                    } else {
-                        format!("{importing_module}::{leaf}")
-                    };
-                    for path in free_function_alias_paths(&synthetic_name, importing_module) {
-                        register_function_graph_alias(
-                            &mut canonical_function_graphs,
-                            &mut canonical_function_alias_source,
-                            path,
-                            &func.name,
-                            &graph,
-                        );
-                    }
-                }
             }
         }
     }
