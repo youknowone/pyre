@@ -4139,6 +4139,36 @@ impl OptContext {
         }
     }
 
+    /// `Option`-returning sibling of [`OptContext::resolve_box_box`], the
+    /// box-native form of `get_box_replacement_box`. A bound operand (or
+    /// Const) walks its own `_forwarded` chain; an unbound operand resolves
+    /// through the `OpRef` store, surfacing `None` when the root does not
+    /// resolve (sentinel / unbound baseline) so callers can branch on it.
+    pub fn resolve_box_box_opt(
+        &self,
+        arg: &crate::r#box::BoxRef,
+    ) -> Option<crate::r#box::BoxRef> {
+        if arg.bound_op().is_some() || arg.is_constant() {
+            let resolved = arg.get_box_replacement(false);
+            #[cfg(debug_assertions)]
+            {
+                let legacy = self.get_box_replacement_box(arg.to_opref());
+                let agrees = match &legacy {
+                    Some(l) => resolved.same_box(l) || resolved.to_opref() == l.to_opref(),
+                    None => false,
+                };
+                debug_assert!(
+                    agrees,
+                    "resolve_box_box_opt: box-native walk diverged from OpRef path for {:?}",
+                    arg.to_opref()
+                );
+            }
+            Some(resolved)
+        } else {
+            self.get_box_replacement_box(arg.to_opref())
+        }
+    }
+
     /// resoperation.py:58 get_box_replacement(not_const=True). This is used
     /// for guard fail args / backend liveboxes where RPython stops before a
     /// Const target, preserving the runtime box while resume numbering carries
@@ -4834,6 +4864,20 @@ impl OptContext {
         // `_forwarded` host so the constant forwarding lands. A sentinel
         // `opref` has no host to forward.
         let b = self.get_box_replacement_box(opref).or_else(|| {
+            (!opref.is_none() && !opref.is_constant()).then(|| self.materialize_box_at(opref))
+        });
+        if let Some(b) = b {
+            self.make_constant_box(&b, value);
+        }
+    }
+
+    /// `BoxRef`-operand form of [`OptContext::make_constant`]: resolves the
+    /// operand Box to its terminal via `resolve_box_box_opt` (the box-native
+    /// `get_box_replacement_box`) rather than collapsing to an `OpRef` first,
+    /// then forwards the constant onto that terminal.
+    pub fn make_constant_arg(&mut self, arg: &crate::r#box::BoxRef, value: Value) {
+        let b = self.resolve_box_box_opt(arg).or_else(|| {
+            let opref = arg.to_opref();
             (!opref.is_none() && !opref.is_constant()).then(|| self.materialize_box_at(opref))
         });
         if let Some(b) = b {
