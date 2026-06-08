@@ -9164,6 +9164,42 @@ pub(crate) fn trace_step_result_to_action(
 ) -> TraceAction {
     match result {
         Ok(pyre_interpreter::StepResult::Continue) => {
+            // opimpl_jit_merge_point portal_call_depth>0 safe subset: a
+            // back-edge reached inside an inline callee frame was flagged in
+            // close_loop_args (it cannot be unrolled — its JUMP arg-set is
+            // built from the callee frame shape, diverging from the root
+            // LABEL). Abort this trace and stop tracing the root loop so the
+            // callee compiles standalone instead of being re-inlined. Reuses
+            // the trace-too-long recovery primitive (disable_noninlinable_-
+            // function, below) but targets the root key, not the callee.
+            if state.ctx().take_inline_loop_abort() {
+                let root_green_key = state.with_ctx(|_, ctx| ctx.root_green_key());
+                let callee_key = biggest_inline_trace_key(state);
+                let (driver, _) = crate::driver::driver_pair();
+                let warm_state = driver.meta_interp_mut().warm_state_mut();
+                // Stop tracing the root loop that inlined this callee, so the
+                // callee compiles as its own LOOP and runs in JIT code while
+                // the (trivial) root loop stays interpreted.
+                //
+                // The orthodox endpoint is a residual CALL_ASSEMBLER from the
+                // root into the callee's compiled loop (do_recursive_call,
+                // assembler_call=True). This safe subset stops short of
+                // emitting that call. Marking the *callee* non-inlinable
+                // instead would route it through a function-entry PROCEDURE
+                // compile, which is broken for a callee first reached by an
+                // aborted inline trace (guard-failure storm → crash); marking
+                // the *root* lets the callee's hot loop compile exactly as it
+                // does when the driver lives at module scope and never inlines
+                // it (the working baseline).
+                warm_state.disable_noninlinable_function(root_green_key);
+                if majit_metainterp::majit_log_enabled() {
+                    eprintln!(
+                        "[jit][inline-loop-abort] disable root={} (callee={:?})",
+                        root_green_key, callee_key
+                    );
+                }
+                return majit_metainterp::TraceAction::Abort;
+            }
             let compile_trace_succeeded = {
                 let (driver, _) = crate::driver::driver_pair();
                 driver.compile_trace_success_pending()
