@@ -594,14 +594,6 @@ fn infer_concrete_from_op(kind: &OpKind) -> ConcreteType {
                 c
             }
         }
-        OpKind::InteriorFieldRead { item_ty, .. } => {
-            let c = valuetype_to_concrete(item_ty);
-            if c == ConcreteType::Unknown {
-                ConcreteType::GcRef
-            } else {
-                c
-            }
-        }
         OpKind::Call { result_ty, .. } => valuetype_to_concrete(result_ty),
         OpKind::CallElidable { result_kind, .. }
         | OpKind::CallResidual { result_kind, .. }

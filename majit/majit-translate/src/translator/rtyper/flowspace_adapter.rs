@@ -624,12 +624,6 @@ pub(crate) fn op_canraise(kind: &OpKind) -> bool {
         // getitem / setitem -> `[IndexError, KeyError, Exception]`
         // (operation.py:727-730).
         OpKind::ArrayRead { .. } | OpKind::ArrayWrite { .. } => true,
-        // `InteriorField*` unfolds in `translate_op` into a chained
-        // `getitem(base, index)` followed by `getattr` / `setattr`, so it
-        // carries the getitem's `[IndexError, KeyError, Exception]`
-        // (operation.py:727-730).  The getattr / setattr step is itself
-        // non-raising, but the getitem makes the op raise.
-        OpKind::InteriorFieldRead { .. } | OpKind::InteriorFieldWrite { .. } => true,
         // A transparent `Ok(x)` / `Some(x)` / `Err(e)` ctor lowers to
         // `simple_call(HostClass(qualname), x…)` (the
         // `SyntheticTransparentCtor` arm in `translate_op`).  The `?` /
@@ -982,61 +976,6 @@ pub fn translate_op(
                 vec![base_hl, index_hl, value_hl],
                 result,
             )])
-        }
-
-        // ─── InteriorFieldRead / InteriorFieldWrite ports ───
-        // RPython `effectinfo.py:313-340` notes that `getinteriorfield_gc`
-        // implicitly carries both a `readarray` and a `readinteriorfield`
-        // effect — the array-of-structs pattern is fundamentally a
-        // chained `getitem(base, index) -> elem` followed by
-        // `getattr(elem, field_name)` (or `setattr` for writes). Pyre's
-        // legacy IR collapses these into a single `InteriorField*` op
-        // for direct lowering convenience, but the rtyper sees the
-        // chained form, so unfold here into two flowspace ops with an
-        // intermediate `Variable` carrying the array element.
-        OpKind::InteriorFieldRead {
-            base, index, field, ..
-        } => {
-            let base_hl = lookup_operand(value_map, base, op, "base")?;
-            let index_hl = lookup_operand(value_map, index, op, "index")?;
-            let result = resolve_result_hlvalue(op, value_map)?;
-            let elem_var = Hlvalue::Variable(Variable::new());
-            Ok(vec![
-                FlowspaceOp::new("getitem", vec![base_hl, index_hl], elem_var.clone()),
-                FlowspaceOp::new(
-                    "getattr",
-                    vec![
-                        elem_var,
-                        Hlvalue::Constant(Constant::new(ConstValue::byte_str(&field.name))),
-                    ],
-                    result,
-                ),
-            ])
-        }
-        OpKind::InteriorFieldWrite {
-            base,
-            index,
-            field,
-            value,
-            ..
-        } => {
-            let base_hl = lookup_operand(value_map, base, op, "base")?;
-            let index_hl = lookup_operand(value_map, index, op, "index")?;
-            let value_hl = lookup_operand(value_map, value, op, "value")?;
-            let result = resolve_result_hlvalue(op, value_map)?;
-            let elem_var = Hlvalue::Variable(Variable::new());
-            Ok(vec![
-                FlowspaceOp::new("getitem", vec![base_hl, index_hl], elem_var.clone()),
-                FlowspaceOp::new(
-                    "setattr",
-                    vec![
-                        elem_var,
-                        Hlvalue::Constant(Constant::new(ConstValue::byte_str(&field.name))),
-                        value_hl,
-                    ],
-                    result,
-                ),
-            ])
         }
 
         // ─── Call port (CallTarget per variant) ───
@@ -1436,8 +1375,6 @@ fn opkind_variant_name(kind: &OpKind) -> &'static str {
         OpKind::FieldWrite { .. } => "FieldWrite",
         OpKind::ArrayRead { .. } => "ArrayRead",
         OpKind::ArrayWrite { .. } => "ArrayWrite",
-        OpKind::InteriorFieldRead { .. } => "InteriorFieldRead",
-        OpKind::InteriorFieldWrite { .. } => "InteriorFieldWrite",
         OpKind::Call { .. } => "Call",
         OpKind::GuardTrue { .. } => "GuardTrue",
         OpKind::GuardFalse { .. } => "GuardFalse",
@@ -3472,72 +3409,20 @@ mod tests {
     }
 
     #[test]
-    fn translate_op_interior_field_read_unfolds_to_getitem_getattr_chain() {
-        // InteriorFieldRead → `getitem(base, index)` chained into
-        // `getattr(elem, field_name)`, mirroring `effectinfo.py:313-340`'s
-        // implicit `readarray + readinteriorfield` effects. Two flowspace
-        // ops surface from one legacy op; the rtyper sees the chain.
-        let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
-        let graph = translate_op_test_graph(10);
-        value_map.insert(
-            graph.must_variable_at(1),
-            Hlvalue::Variable(Variable::new()),
-        );
-        value_map.insert(
-            graph.must_variable_at(2),
-            Hlvalue::Variable(Variable::new()),
-        );
-        value_map.insert(
-            graph.must_variable_at(3),
-            Hlvalue::Variable(Variable::new()),
-        );
-        let op = SpaceOperation {
-            result: Some(graph.must_variable_at(3)),
-            kind: OpKind::InteriorFieldRead {
-                base: graph.must_variable_at(1),
-                index: graph.must_variable_at(2),
-                field: crate::model::FieldDescriptor::new("x", Some("Point".into())),
-                item_ty: ValueType::Int,
-                array_type_id: None,
-            },
-        };
-        let translated = translate_op(&op, &value_map, &empty_call_registry())
-            .expect("InteriorFieldRead arm must lower");
-        assert_eq!(translated.len(), 2);
-        assert_eq!(translated[0].opname, "getitem");
-        assert_eq!(translated[0].args.len(), 2);
-        assert_eq!(translated[1].opname, "getattr");
-        assert_eq!(translated[1].args.len(), 2);
-        // The second op's first arg must be the element variable
-        // produced by the first op.
-        let Hlvalue::Variable(ref elem_v1) = translated[0].result else {
-            panic!("getitem result must be a Variable");
-        };
-        let Hlvalue::Variable(ref elem_v2) = translated[1].args[0] else {
-            panic!("getattr base arg must be the chained element Variable");
-        };
-        assert_eq!(
-            elem_v1.id(),
-            elem_v2.id(),
-            "elem Variable identity must thread"
-        );
-    }
-
-    #[test]
     fn op_canraise_covers_getitem_bearing_and_inplace_binops() {
-        // `InteriorField*` unfolds to a getitem (raising) + getattr/setattr,
-        // so as a `?` tail it carries the getitem's `[IndexError, KeyError,
-        // Exception]` (operation.py:727-730).
-        let interior = OpKind::InteriorFieldRead {
+        // `ArrayRead` lowers to a `getitem`, so as a `?` tail it carries
+        // the getitem's `[IndexError, KeyError, Exception]`
+        // (operation.py:727-730).
+        let array_read = OpKind::ArrayRead {
             base: Variable::new(),
             index: Variable::new(),
-            field: crate::model::FieldDescriptor::new("x", Some("Point".into())),
             item_ty: ValueType::Int,
             array_type_id: None,
+            nolength: false,
         };
         assert!(
-            op_canraise(&interior),
-            "InteriorFieldRead carries the unfolded getitem's canraise"
+            op_canraise(&array_read),
+            "ArrayRead carries getitem's canraise"
         );
 
         // Compound-assign names reach `op_canraise` BEFORE
@@ -3557,41 +3442,6 @@ mod tests {
         assert!(op_canraise(&binop("div")));
         assert!(!op_canraise(&binop("bitand_assign")));
         assert!(!op_canraise(&binop("add")));
-    }
-
-    #[test]
-    fn translate_op_interior_field_write_unfolds_to_getitem_setattr_chain() {
-        let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
-        let graph = translate_op_test_graph(10);
-        value_map.insert(
-            graph.must_variable_at(1),
-            Hlvalue::Variable(Variable::new()),
-        );
-        value_map.insert(
-            graph.must_variable_at(2),
-            Hlvalue::Variable(Variable::new()),
-        );
-        value_map.insert(
-            graph.must_variable_at(3),
-            Hlvalue::Variable(Variable::new()),
-        );
-        let op = SpaceOperation {
-            result: None,
-            kind: OpKind::InteriorFieldWrite {
-                base: graph.must_variable_at(1),
-                index: graph.must_variable_at(2),
-                field: crate::model::FieldDescriptor::new("y", Some("Point".into())),
-                value: graph.must_variable_at(3),
-                item_ty: ValueType::Int,
-                array_type_id: None,
-            },
-        };
-        let translated = translate_op(&op, &value_map, &empty_call_registry())
-            .expect("InteriorFieldWrite arm must lower");
-        assert_eq!(translated.len(), 2);
-        assert_eq!(translated[0].opname, "getitem");
-        assert_eq!(translated[1].opname, "setattr");
-        assert_eq!(translated[1].args.len(), 3);
     }
 
     #[test]

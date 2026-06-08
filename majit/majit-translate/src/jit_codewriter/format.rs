@@ -725,9 +725,9 @@ fn op_result_kind(kind: &crate::model::OpKind) -> RegKind {
         OpKind::Input { ty, .. }
         | OpKind::FieldRead { ty, .. }
         | OpKind::VableFieldRead { ty, .. } => value_type_kind(ty),
-        OpKind::ArrayRead { item_ty, .. }
-        | OpKind::InteriorFieldRead { item_ty, .. }
-        | OpKind::VableArrayRead { item_ty, .. } => value_type_kind(item_ty),
+        OpKind::ArrayRead { item_ty, .. } | OpKind::VableArrayRead { item_ty, .. } => {
+            value_type_kind(item_ty)
+        }
         OpKind::IsConstant { .. } | OpKind::IsVirtual { .. } => RegKind::Int,
         // Result-less or pyre-only debug variants — `op_args_repr`
         // only reaches this fall-through when `op.result.is_some()`,

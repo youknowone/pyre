@@ -474,34 +474,6 @@ fn remap_op_kind(
             array_type_id: array_type_id.clone(),
             nolength: *nolength,
         },
-        OpKind::InteriorFieldRead {
-            base,
-            index,
-            field,
-            item_ty,
-            array_type_id,
-        } => OpKind::InteriorFieldRead {
-            base: remap_var(base),
-            index: remap_var(index),
-            field: field.clone(),
-            item_ty: item_ty.clone(),
-            array_type_id: array_type_id.clone(),
-        },
-        OpKind::InteriorFieldWrite {
-            base,
-            index,
-            field,
-            value,
-            item_ty,
-            array_type_id,
-        } => OpKind::InteriorFieldWrite {
-            base: remap_var(base),
-            index: remap_var(index),
-            field: field.clone(),
-            value: remap_var(value),
-            item_ty: item_ty.clone(),
-            array_type_id: array_type_id.clone(),
-        },
         OpKind::Call {
             target,
             args,
@@ -873,10 +845,6 @@ pub fn op_variable_refs(kind: &OpKind) -> Vec<crate::flowspace::model::Variable>
         OpKind::ArrayWrite {
             base, index, value, ..
         } => vec![clone_var(base), clone_var(index), clone_var(value)],
-        OpKind::InteriorFieldRead { base, index, .. } => vec![clone_var(base), clone_var(index)],
-        OpKind::InteriorFieldWrite {
-            base, index, value, ..
-        } => vec![clone_var(base), clone_var(index), clone_var(value)],
         OpKind::Call { args, .. } => args.iter().map(&clone_var).collect(),
         OpKind::GuardTrue { cond } | OpKind::GuardFalse { cond } => vec![clone_var(cond)],
         OpKind::GuardValue { value, .. } => vec![clone_var(value)],
@@ -1071,11 +1039,10 @@ pub fn is_pure_op(kind: &OpKind) -> bool {
         | OpKind::ConstRef(_)
         | OpKind::ConstRefNull
         | OpKind::ConstRefAddr(_)
-        // Pure reads — `getfield(_pure) getarrayitem(_pure)
-        // getinteriorfield` in `enum_ops_without_sideeffects`.
+        // Pure reads — `getfield(_pure) getarrayitem(_pure)` in
+        // `enum_ops_without_sideeffects`.
         | OpKind::FieldRead { .. }
         | OpKind::ArrayRead { .. }
-        | OpKind::InteriorFieldRead { .. }
         // Pure virtualizable reads — no heap mutation.
         | OpKind::VableFieldRead { .. }
         | OpKind::VableArrayRead { .. }
@@ -1125,7 +1092,6 @@ pub fn is_pure_op(kind: &OpKind) -> bool {
         // current pipeline ordering.
         OpKind::FieldWrite { .. }
         | OpKind::ArrayWrite { .. }
-        | OpKind::InteriorFieldWrite { .. }
         | OpKind::VableFieldWrite { .. }
         | OpKind::VableArrayWrite { .. }
         | OpKind::Call { .. }

@@ -5173,10 +5173,10 @@ fn effectinfo_from_writeanalyze(
     //     `_write_descrs_arrays` directly drives heap optimizer array
     //     cache invalidation (`heap.py:537-571 force_from_effectinfo`).
     //   - `_readonly_descrs_interiorfields`,
-    //     `_write_descrs_interiorfields`: via `cc.interiorfielddescrof(
-    //     idx, array_type_id, name)` from InteriorFieldRead /
-    //     InteriorFieldWrite ops (PyPy `effectinfo.py:313-325
-    //     add_interiorfield → cpu.interiorfielddescrof(T, fieldname)`).
+    //     `_write_descrs_interiorfields`: retained for EffectInfo shape
+    //     parity (PyPy `effectinfo.py:313-325 add_interiorfield →
+    //     cpu.interiorfielddescrof(T, fieldname)`); currently unpopulated
+    //     since the IR carries no dedicated interior-field op.
     //
     // All `cc.*descrof()` helpers silently skip when struct layout is
     // not registered with `cc.struct_fields`, mirroring PyPy's
@@ -5686,149 +5686,6 @@ fn collect_readwrite_effects(
                         ));
                     }
                 }
-                // RPython: ("readinteriorfield", T, fieldname)
-                // effectinfo.py:351-354: records interiorfield descriptor.
-                // effectinfo.py:327-340: ALSO implicitly records array read.
-                OpKind::InteriorFieldRead {
-                    base,
-                    field,
-                    array_type_id,
-                    ..
-                } => {
-                    // See the matching `ArrayRead` arm above.
-                    let resolved_id = resolve_array_identity(
-                        base,
-                        array_type_id,
-                        &value_producers,
-                        &phi_sources,
-                        cc,
-                    )
-                    .or_else(|| array_type_id.clone());
-                    // Interior field bit — keyed on (ARRAY, fieldname),
-                    // matching cpu.interiorfielddescrof(ARRAY, fieldname).
-                    let ifield_idx = descr_indices.interiorfield_index(&resolved_id, &field.name);
-                    read_interiorfields.push(ifield_idx);
-                    // RPython: effectinfo.py:313-325 `add_interiorfield →
-                    // cpu.interiorfielddescrof(ARRAY, fieldname)`. Dedup
-                    // by descriptor index. Silently skipped when the
-                    // array's element struct is unknown to
-                    // `cc.struct_fields` or the field is absent
-                    // (PyPy `effectinfo.py:316-324 consider_array` /
-                    // `Void` / `UnsupportedFieldExc` filters).
-                    if !interior_read_descrs.iter().any(|d| d.index() == ifield_idx) {
-                        if let Some(descr) =
-                            cc.interiorfielddescrof(ifield_idx, &resolved_id, &field.name)
-                        {
-                            interior_read_descrs.push(descr);
-                        }
-                    }
-                    // effectinfo.py:327-340: synthesizes `("readarray", T)`
-                    // for every `("readinteriorfield", T, _)` so the
-                    // implicit array read is recorded; effectinfo.py:355-360
-                    // then walks `add_array → cpu.arraydescrof(ARRAY)` →
-                    // `readonly_descrs_arrays.append(descr)`. Interior fields
-                    // only exist in struct arrays → element type is Ref.
-                    // `len_offset` honours `ARRAY_INSIDE._hints.get('nolength',
-                    // False)` (`descr.py:359`) so headerless array-of-structs
-                    // shapes hash to a different bitstring slot than
-                    // length-prefixed shapes of the same item type.
-                    let len_offset = if crate::front::typestr::nolength_from_array_type_id(
-                        resolved_id.as_deref(),
-                    ) {
-                        None
-                    } else {
-                        Some(0)
-                    };
-                    let arr_idx = descr_indices.array_index(
-                        value_type_discriminant(&crate::model::ValueType::Ref(None)),
-                        &resolved_id,
-                        len_offset,
-                    );
-                    read_arrays.push(arr_idx);
-                    // RPython: effectinfo.py:355-360 — cpu.arraydescrof(ARRAY)
-                    // appended to readonly_descrs_arrays via the synthesized
-                    // ("readarray", T) tuple. Dedup by descriptor index
-                    // (frozenset semantics).
-                    if !array_read_descrs.iter().any(|d| d.index() == arr_idx) {
-                        array_read_descrs.push(cc.arraydescrof(
-                            arr_idx,
-                            &resolved_id,
-                            majit_ir::value::Type::Ref,
-                            len_offset,
-                        ));
-                    }
-                }
-                // RPython: ("interiorfield", T, fieldname)
-                // effectinfo.py:349-350: records interiorfield descriptor.
-                // effectinfo.py:327-340: ALSO implicitly records array write.
-                OpKind::InteriorFieldWrite {
-                    base,
-                    field,
-                    array_type_id,
-                    ..
-                } => {
-                    // See the matching `ArrayRead` arm above.
-                    let resolved_id = resolve_array_identity(
-                        base,
-                        array_type_id,
-                        &value_producers,
-                        &phi_sources,
-                        cc,
-                    )
-                    .or_else(|| array_type_id.clone());
-                    // Interior field bit — keyed on (ARRAY, fieldname),
-                    // matching cpu.interiorfielddescrof(ARRAY, fieldname).
-                    let ifield_idx = descr_indices.interiorfield_index(&resolved_id, &field.name);
-                    write_interiorfields.push(ifield_idx);
-                    // RPython: effectinfo.py:313-325 — same as
-                    // InteriorFieldRead's `add_interiorfield` walk,
-                    // routed into `write_descrs_interiorfields`.
-                    if !interior_write_descrs
-                        .iter()
-                        .any(|d| d.index() == ifield_idx)
-                    {
-                        if let Some(descr) =
-                            cc.interiorfielddescrof(ifield_idx, &resolved_id, &field.name)
-                        {
-                            interior_write_descrs.push(descr);
-                        }
-                    }
-                    // effectinfo.py:327-340: synthesizes `("array", T)`
-                    // for every `("interiorfield", T, _)` so the implicit
-                    // array write is recorded; effectinfo.py:355-356
-                    // then walks `add_array → cpu.arraydescrof(ARRAY)` →
-                    // `write_descrs_arrays.append(descr)`. Interior fields
-                    // only exist in struct arrays → element type is Ref;
-                    // `len_offset` reflects `ARRAY_INSIDE._hints['nolength']`
-                    // (`descr.py:359`) so headerless array-of-structs shapes
-                    // do not alias length-prefixed ones at the EffectInfo
-                    // bitset.
-                    let len_offset = if crate::front::typestr::nolength_from_array_type_id(
-                        resolved_id.as_deref(),
-                    ) {
-                        None
-                    } else {
-                        Some(0)
-                    };
-                    let arr_idx = descr_indices.array_index(
-                        value_type_discriminant(&crate::model::ValueType::Ref(None)),
-                        &resolved_id,
-                        len_offset,
-                    );
-                    write_arrays.push(arr_idx);
-                    // RPython: effectinfo.py:355-356 — cpu.arraydescrof(ARRAY)
-                    // appended to write_descrs_arrays via the synthesized
-                    // ("array", T) tuple. Dedup by descriptor index
-                    // (frozenset semantics, matching ArrayWrite handler).
-                    if !array_write_descrs.iter().any(|d| d.index() == arr_idx) {
-                        array_write_descrs.push(cc.arraydescrof(
-                            arr_idx,
-                            &resolved_id,
-                            majit_ir::value::Type::Ref,
-                            len_offset,
-                        ));
-                    }
-                }
                 // Recursive: follow calls.
                 OpKind::Call { target, .. } => {
                     if let Some(callee_path) = cc.target_to_path(target) {
@@ -6302,8 +6159,6 @@ fn op_can_raise(op: &OpKind) -> RaiseClass {
         OpKind::FieldRead { .. } | OpKind::FieldWrite { .. } => RaiseClass::No,
         // RPython LL: getarrayitem_gc, setarrayitem_gc → cannot raise
         OpKind::ArrayRead { .. } | OpKind::ArrayWrite { .. } => RaiseClass::No,
-        // RPython LL: getinteriorfield_gc, setinteriorfield_gc → cannot raise
-        OpKind::InteriorFieldRead { .. } | OpKind::InteriorFieldWrite { .. } => RaiseClass::No,
         // RPython LL: int_add, int_sub, int_lt, int_and, etc → cannot raise
         // (non-ovf, non-div arithmetic)
         OpKind::BinOp { op, .. }
