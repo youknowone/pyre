@@ -6034,11 +6034,15 @@ fn emit_attached_bridge_dispatch(
     emit_call_footer_shadowstack(builder, ptr_type);
     let mut bridge_sig = Signature::new(cranelift_codegen::isa::CallConv::Tail);
     bridge_sig.params.push(AbiParam::new(ptr_type));
+    bridge_sig.params.push(AbiParam::new(cl_types::I32)); // dispatch_key (LABEL id)
     bridge_sig.returns.push(AbiParam::new(ptr_type));
     let bridge_sig_ref = builder.import_signature(bridge_sig);
+    // A bridge is linear (no LABELs): it always enters at its start, so the
+    // dispatch_key is 0.
+    let bridge_dispatch_key = builder.ins().iconst(cl_types::I32, 0);
     builder
         .ins()
-        .return_call_indirect(bridge_sig_ref, bridge_body, &[jf_ptr]);
+        .return_call_indirect(bridge_sig_ref, bridge_body, &[jf_ptr, bridge_dispatch_key]);
 
     builder.switch_to_block(miss_block);
     builder.seal_block(miss_block);
@@ -6099,32 +6103,24 @@ fn emit_attached_loop_dispatch(
     builder.switch_to_block(check_block_id);
     builder.seal_block(check_block_id);
     let target_code_ptr = builder.block_params(check_block_id)[0];
-    // `assembler.py:990-993` per-LABEL `_ll_loop_code` parity gate:
-    // pyre's body function shares one entry across all LABELs in the
-    // trace, so the function entry's preamble decodes inputargs in the
-    // FIRST LABEL's layout.  Tail-calling into the entry is correct
-    // only when the JUMP targets the first LABEL (label_block_id == 0).
-    // For non-first LABELs, the target's inputarg count/layout
-    // differs (verified for nbody: trace_id=1 has labels with 24 and
-    // 15 inputargs), so we fall back to the deadframe exit and let
-    // the host loop re-enter the right wrapper via `execute_token`.
-    // Once cranelift's body-entry `br_table` per-LABEL dispatch lands,
-    // this gate can be relaxed.
+    // `assembler.py:990-993` per-LABEL `_ll_loop_code` parity: PyPy exposes
+    // one code address per LABEL and a JUMP branches straight to the target
+    // LABEL's address.  Cranelift exposes a single function entry, so the
+    // target LABEL is selected by the `dispatch_key` argument the body's
+    // entry `br_table`s on.  Load the target descr's `label_block_id` and
+    // pass it as `dispatch_key` (return_call below); the target re-enters at
+    // exactly that LABEL with its carried values read from the jitframe slots
+    // this JUMP's `emit_guard_exit` populated, instead of always re-running
+    // the first LABEL's preamble.
     let lbid_ptr = builder.ins().iconst(ptr_type, label_block_id_addr as i64);
     let lbid = builder
         .ins()
         .load(cl_types::I32, MemFlags::trusted(), lbid_ptr, 0);
-    let zero_i32 = builder.ins().iconst(cl_types::I32, 0);
-    let is_first_label = builder.ins().icmp(IntCC::Equal, lbid, zero_i32);
     let check_depth_block = builder.create_block();
     builder.append_block_param(check_depth_block, ptr_type);
-    builder.ins().brif(
-        is_first_label,
-        check_depth_block,
-        &[BlockArg::from(target_code_ptr)],
-        miss_block,
-        &[],
-    );
+    builder
+        .ins()
+        .jump(check_depth_block, &[BlockArg::from(target_code_ptr)]);
 
     builder.switch_to_block(check_depth_block);
     builder.seal_block(check_depth_block);
@@ -6190,11 +6186,17 @@ fn emit_attached_loop_dispatch(
     // received for its non-tail helper calls.
     let mut target_sig = Signature::new(cranelift_codegen::isa::CallConv::Tail);
     target_sig.params.push(AbiParam::new(ptr_type));
+    target_sig.params.push(AbiParam::new(cl_types::I32)); // dispatch_key (LABEL id)
     target_sig.returns.push(AbiParam::new(ptr_type));
     let target_sig_ref = builder.import_signature(target_sig);
+    // x86/regalloc.py:1397 per-TargetToken `_ll_loop_code` parity: re-enter the
+    // target at the LABEL the JUMP names, not always the first.  The target
+    // body's entry `br_table` reserves dispatch_key 0 for its preamble, so a
+    // re-entry at LABEL L passes `label_block_id + 1`.
+    let dispatch_key = builder.ins().iadd_imm(lbid, 1);
     builder
         .ins()
-        .return_call_indirect(target_sig_ref, target_code_ptr, &[jf_ptr]);
+        .return_call_indirect(target_sig_ref, target_code_ptr, &[jf_ptr, dispatch_key]);
 
     builder.switch_to_block(miss_block);
     builder.seal_block(miss_block);
@@ -8181,6 +8183,14 @@ impl CraneliftBackend {
 
         let mut sig = Signature::new(body_call_conv);
         sig.params.push(AbiParam::new(ptr_type)); // jf_ptr (read inputs, write outputs)
+        // x86/regalloc.py:1397 per-TargetToken `_ll_loop_code` parity: a JUMP
+        // re-enters the target at a SPECIFIC LABEL, not always the first.
+        // PyPy exposes one code address per LABEL; cranelift has a single
+        // function entry, so the target LABEL is selected by a `dispatch_key`
+        // argument (the LABEL's `label_block_id`) that the entry block
+        // `br_table`s on.  The host wrapper passes 0 (first LABEL); an
+        // in-code closing-jump passes the target descr's `label_block_id`.
+        sig.params.push(AbiParam::new(cl_types::I32)); // dispatch_key (LABEL id)
         // RPython _call_footer (assembler.py:1097): mov eax, ebp; ret
         sig.returns.push(AbiParam::new(ptr_type)); // returned jf_ptr
 
@@ -8841,291 +8851,69 @@ impl CraneliftBackend {
             }
         }
 
-        let mut first_label_entered_at_entry = false;
-        if let Some(&(entry_label_idx, entry_label_block)) = label_blocks.first() {
-            if body_direct_entry && label_blocks.len() >= 2 {
-                // Dual entry: branch on entry_mode (last input slot).
-                // entry_mode == 0 → preamble, entry_mode != 0 → body-direct.
-                // brif directly targets label blocks with their params.
-                let entry_mode = entry_input_vals[max_entry_inputs];
-                // Target the FIRST LABEL block: the entry bridge supplies that
-                // LABEL's args (slots 0..arity) and writes entry_mode just past
-                // them, so a body-direct entry jumps there and lets the loop
-                // run forward (peeled preamble bypassed). plan_body_direct keys
-                // on label_indices[0], so body_direct_num_inputs == this
-                // block's IR arity and the entry_mode read slot == the bridge's
-                // write slot (fail_arg_refs.len()).
-                let body_block = entry_label_block;
-
-                // Dual entry: branch on entry_mode. The invariant replay below
-                // dereferences the body LABEL args carried in entry_input_vals
-                // (frame slots), which only hold live values on a body-direct
-                // (entry_mode != 0) entry — on a normal execute_token entry
-                // those slots are zero, so the replay loads would NULL-deref.
-                // Emit the replay in a dedicated body-direct block reached only
-                // when entry_mode != 0; the preamble arm branches to a
-                // continuation the main op loop fills. entry_input_vals are
-                // defined in the dominating entry block, so both successors can
-                // use them directly. Seal each (single predecessor = this
-                // brif) so their use_var resolves through the entry block
-                // instead of promoting block params.
-                let body_direct_block = builder.create_block();
-                let preamble_cont = builder.create_block();
-                builder
-                    .ins()
-                    .brif(entry_mode, body_direct_block, &[], preamble_cont, &[]);
-                builder.switch_to_block(body_direct_block);
-                builder.seal_block(body_direct_block);
-
-                // Reconstruct the loop invariants Cranelift auto-promotes into
-                // body-block params (a preamble op-result use_var'd in the
-                // body, or a preamble ref-root spilled there). REPLAYED here
-                // from the body LABEL args via a local value map; def_var so
-                // FunctionBuilder fills body_block's promoted params from this
-                // predecessor. plan_body_direct guaranteed every replay op is a
-                // pure load / address arithmetic whose operands are body LABEL
-                // args, inputs, constants, or earlier replays.
-                let plan = body_direct_plan
-                    .as_ref()
-                    .expect("body_direct plan present when body_direct_num_inputs > 0");
-                let mut bd_slot: VecAssoc<u32, usize> = VecAssoc::new();
-                for (i, ia) in inputargs.iter().enumerate() {
-                    bd_slot.insert(ia.index, i);
-                }
-                for (slot, &raw) in plan.body_arg_oprefs.iter().enumerate() {
-                    bd_slot.insert(raw, slot);
-                }
-                let mut bd_mat: VecAssoc<u32, CValue> = VecAssoc::new();
-                for &rop_idx in &plan.replay_ops {
-                    let rop = &ops[rop_idx];
-                    let rvi = op_var_index(rop, rop_idx, num_inputs) as u32;
-                    let resolve = |builder: &mut FunctionBuilder,
-                                   bd_mat: &VecAssoc<u32, CValue>,
-                                   opref: OpRef|
-                     -> CValue {
-                        if let Some(c) = lookup_const_i64(&constants, opref) {
-                            return builder.ins().iconst(cl_types::I64, c);
-                        }
-                        if let Some(&v) = bd_mat.get(&opref.raw()) {
-                            return v;
-                        }
-                        if let Some(&slot) = bd_slot.get(&opref.raw()) {
-                            return entry_input_vals[slot];
-                        }
-                        panic!(
-                            "body-direct replay: unresolved opref {} (op {:?})",
-                            opref.raw(),
-                            rop.opcode
-                        );
-                    };
-                    let value = match rop.opcode {
-                        OpCode::GetfieldGcI
-                        | OpCode::GetfieldGcR
-                        | OpCode::GetfieldGcF
-                        | OpCode::GetfieldGcPureI
-                        | OpCode::GetfieldGcPureR
-                        | OpCode::GetfieldGcPureF
-                        | OpCode::GetfieldRawI
-                        | OpCode::GetfieldRawR
-                        | OpCode::GetfieldRawF => {
-                            let descr = rop.getdescr().expect("getfield op must have a descriptor");
-                            let fd = descr
-                                .as_field_descr()
-                                .expect("getfield descriptor must be a FieldDescr");
-                            let base = resolve(&mut builder, &bd_mat, rop.arg(0).to_opref());
-                            let addr = builder.ins().iadd_imm(base, fd.offset() as i64);
-                            emit_load_from_addr(
-                                &mut builder,
-                                addr,
-                                fd.field_type(),
-                                fd.field_size(),
-                                fd.is_field_signed(),
-                                rop.opcode,
-                            )?
-                        }
-                        OpCode::GetarrayitemGcI
-                        | OpCode::GetarrayitemGcR
-                        | OpCode::GetarrayitemGcF
-                        | OpCode::GetarrayitemGcPureI
-                        | OpCode::GetarrayitemGcPureR
-                        | OpCode::GetarrayitemGcPureF
-                        | OpCode::GetarrayitemRawI
-                        | OpCode::GetarrayitemRawF => {
-                            let descr = rop
-                                .getdescr()
-                                .expect("getarrayitem op must have a descriptor");
-                            let ad = descr
-                                .as_array_descr()
-                                .expect("getarrayitem descriptor must be an ArrayDescr");
-                            let base = resolve(&mut builder, &bd_mat, rop.arg(0).to_opref());
-                            let index = resolve(&mut builder, &bd_mat, rop.arg(1).to_opref());
-                            let scale = ad.item_size() as i64;
-                            let scaled = match scale {
-                                0 => builder.ins().iconst(cl_types::I64, 0),
-                                1 => index,
-                                _ => {
-                                    let s = builder.ins().iconst(cl_types::I64, scale);
-                                    builder.ins().imul(index, s)
-                                }
-                            };
-                            let bo = ad.base_size() as i64;
-                            let off = if bo == 0 {
-                                scaled
-                            } else {
-                                builder.ins().iadd_imm(scaled, bo)
-                            };
-                            let addr = builder.ins().iadd(base, off);
-                            let signed = ad.item_type() == Type::Int && ad.is_item_signed();
-                            emit_load_from_addr(
-                                &mut builder,
-                                addr,
-                                ad.item_type(),
-                                ad.item_size(),
-                                signed,
-                                rop.opcode,
-                            )?
-                        }
-                        OpCode::GcLoadI | OpCode::GcLoadR | OpCode::GcLoadF => {
-                            let item_size = resolve_constant_i64(
-                                &constants,
-                                &known_values,
-                                rop.opcode,
-                                rop.arg(2).to_opref(),
-                                "GC_LOAD itemsize",
-                            )?;
-                            let value_type = match rop.opcode {
-                                OpCode::GcLoadI => Type::Int,
-                                OpCode::GcLoadR => Type::Ref,
-                                _ => Type::Float,
-                            };
-                            let base = resolve(&mut builder, &bd_mat, rop.arg(0).to_opref());
-                            let offset = resolve(&mut builder, &bd_mat, rop.arg(1).to_opref());
-                            let addr = builder.ins().iadd(base, offset);
-                            emit_load_from_addr(
-                                &mut builder,
-                                addr,
-                                value_type,
-                                item_size.unsigned_abs() as usize,
-                                item_size < 0,
-                                rop.opcode,
-                            )?
-                        }
-                        OpCode::GcLoadIndexedI
-                        | OpCode::GcLoadIndexedR
-                        | OpCode::GcLoadIndexedF => {
-                            let scale = resolve_constant_i64(
-                                &constants,
-                                &known_values,
-                                rop.opcode,
-                                rop.arg(2).to_opref(),
-                                "GC_LOAD_INDEXED scale",
-                            )?;
-                            let base_offset = resolve_constant_i64(
-                                &constants,
-                                &known_values,
-                                rop.opcode,
-                                rop.arg(3).to_opref(),
-                                "GC_LOAD_INDEXED base offset",
-                            )?;
-                            let item_size = resolve_constant_i64(
-                                &constants,
-                                &known_values,
-                                rop.opcode,
-                                rop.arg(4).to_opref(),
-                                "GC_LOAD_INDEXED itemsize",
-                            )?;
-                            let value_type = match rop.opcode {
-                                OpCode::GcLoadIndexedI => Type::Int,
-                                OpCode::GcLoadIndexedR => Type::Ref,
-                                _ => Type::Float,
-                            };
-                            let base = resolve(&mut builder, &bd_mat, rop.arg(0).to_opref());
-                            let index = resolve(&mut builder, &bd_mat, rop.arg(1).to_opref());
-                            let scaled = match scale {
-                                0 => builder.ins().iconst(cl_types::I64, 0),
-                                1 => index,
-                                _ => {
-                                    let s = builder.ins().iconst(cl_types::I64, scale);
-                                    builder.ins().imul(index, s)
-                                }
-                            };
-                            let off = if base_offset == 0 {
-                                scaled
-                            } else {
-                                builder.ins().iadd_imm(scaled, base_offset)
-                            };
-                            let addr = builder.ins().iadd(base, off);
-                            emit_load_from_addr(
-                                &mut builder,
-                                addr,
-                                value_type,
-                                item_size.unsigned_abs() as usize,
-                                item_size < 0,
-                                rop.opcode,
-                            )?
-                        }
-                        OpCode::IntAdd => {
-                            let a = resolve(&mut builder, &bd_mat, rop.arg(0).to_opref());
-                            let b = resolve(&mut builder, &bd_mat, rop.arg(1).to_opref());
-                            builder.ins().iadd(a, b)
-                        }
-                        OpCode::IntSub => {
-                            let a = resolve(&mut builder, &bd_mat, rop.arg(0).to_opref());
-                            let b = resolve(&mut builder, &bd_mat, rop.arg(1).to_opref());
-                            builder.ins().isub(a, b)
-                        }
-                        OpCode::IntMul => {
-                            let a = resolve(&mut builder, &bd_mat, rop.arg(0).to_opref());
-                            let b = resolve(&mut builder, &bd_mat, rop.arg(1).to_opref());
-                            builder.ins().imul(a, b)
-                        }
-                        other => {
-                            unreachable!("plan_body_direct admitted non-replayable op {other:?}")
-                        }
-                    };
-                    bd_mat.insert(rvi, value);
-                    builder.def_var(var(rvi), value);
-                }
-
-                let body_args = block_args_to(
-                    &mut builder,
-                    body_block,
-                    &entry_input_vals[..body_direct_num_inputs],
-                );
-                builder.ins().jump(body_block, &body_args);
-
-                // Preamble arm (entry_mode == 0): the first LABEL is NOT the
-                // function entry — its params are the peeled-preamble results
-                // computed by the ops preceding the LABEL. The main op-emission
-                // loop emits the preamble in preamble_cont and jumps to the
-                // first LABEL with all resolved args when it reaches the LABEL
-                // op. first_label_entered_at_entry stays false so the main loop
-                // owns that jump + binding.
-                builder.switch_to_block(preamble_cont);
-                builder.seal_block(preamble_cont);
-            } else if has_entry_label {
-                let vals: Vec<CValue> = entry_input_vals.clone();
-                let args = block_args_to(&mut builder, entry_label_block, &vals);
-                builder.ins().jump(entry_label_block, &args);
-                builder.switch_to_block(entry_label_block);
-                for (i, arg_ref) in ops[entry_label_idx].getarglist().iter().enumerate() {
-                    let param = builder.block_params(entry_label_block)[i];
-                    if !arg_ref.is_none() {
-                        builder.def_var(var(arg_ref.to_opref().raw()), param);
-                        let cur_jf = builder.use_var(jf_ptr_var);
-                        sync_ref_root_var(
-                            &mut builder,
-                            cur_jf,
-                            &ref_root_slots,
-                            arg_ref.to_opref().raw(),
-                            param,
-                            ref_root_base_ofs,
-                            &mut synced_ref_vars,
-                        );
-                    }
-                }
-                first_label_entered_at_entry = true;
+        let first_label_entered_at_entry = false;
+        if !label_blocks.is_empty() {
+            // x86/regalloc.py:1303-1409 per-TargetToken `_ll_loop_code` parity.
+            // RPython gives each LABEL its own code address and a JUMP branches
+            // straight to the target LABEL.  Cranelift exposes a single
+            // function entry, so the entry `br_table`s on `dispatch_key`:
+            //   key 0   → run the preamble linearly (host entry, the peeled
+            //             `start_label` path), falling into the first LABEL as
+            //             usual;
+            //   key L+1 → re-enter directly at LABEL L (a closing-jump from a
+            //             bridge or another loop), loading LABEL L's carried
+            //             values from the jitframe slots the incoming JUMP
+            //             populated (emit_guard_exit writes JUMP arg i → slot i,
+            //             the frame-slot subset of `remap_frame_layout_mixed`'s
+            //             arglocs) and skipping the preamble — which would
+            //             otherwise re-derive loop state from the now-elided
+            //             fastlocals writeback and read stale values.
+            // The closing-jump passes `label_block_id + 1`; key 0 is reserved
+            // for the preamble so it never collides with LABEL 0's re-entry.
+            let dispatch_key = builder.block_params(entry_block)[1];
+            let preamble_block = builder.create_block();
+            let loaders: Vec<cranelift_codegen::ir::Block> = label_blocks
+                .iter()
+                .map(|_| builder.create_block())
+                .collect();
+            // table = [preamble, loader_0, loader_1, ...]; default = preamble.
+            let mut targets: Vec<cranelift_codegen::ir::BlockCall> =
+                Vec::with_capacity(loaders.len() + 1);
+            targets.push(builder.func.dfg.block_call(preamble_block, &[]));
+            for &b in &loaders {
+                targets.push(builder.func.dfg.block_call(b, &[]));
             }
+            let default_call = builder.func.dfg.block_call(preamble_block, &[]);
+            let jt = builder.create_jump_table(cranelift_codegen::ir::JumpTableData::new(
+                default_call,
+                &targets,
+            ));
+            builder.ins().br_table(dispatch_key, jt);
+
+            // Each loader: load LABEL L's carried values from the jitframe
+            // slots and jump to LABEL L's block, skipping the preamble.
+            for (&(label_idx, label_block), &loader) in label_blocks.iter().zip(loaders.iter()) {
+                builder.switch_to_block(loader);
+                builder.seal_block(loader);
+                let arity = ops[label_idx].num_args();
+                let cur_jf = builder.use_var(jf_ptr_var);
+                let vals: Vec<CValue> = (0..arity)
+                    .map(|i| {
+                        let offset = JF_FRAME_ITEM0_OFS + (i as i32) * 8;
+                        builder
+                            .ins()
+                            .load(cl_types::I64, MemFlags::trusted(), cur_jf, offset)
+                    })
+                    .collect();
+                let args = block_args_to(&mut builder, label_block, &vals);
+                builder.ins().jump(label_block, &args);
+            }
+
+            // Host-entry / preamble path: the op loop starts at op 0 and emits
+            // the preamble (and every LABEL's arg binding + fall-through jump)
+            // in this block; first_label_entered_at_entry stays false.
+            builder.switch_to_block(preamble_block);
+            builder.seal_block(preamble_block);
         } else if has_jump && loop_block != entry_block {
             let zero = builder.ins().iconst(cl_types::I64, 0);
             let vals: Vec<CValue> = (0..loop_param_count)
@@ -13799,7 +13587,10 @@ impl CraneliftBackend {
             wb.seal_block(eb);
             let jf_ptr_in = wb.block_params(eb)[0];
             let body_ref = self.module.declare_func_in_func(func_id, wb.func);
-            let call_inst = wb.ins().call(body_ref, &[jf_ptr_in]);
+            // Host entry always enters at the FIRST LABEL (dispatch_key 0):
+            // run_compiled_code loaded the inputs into the first LABEL's slots.
+            let entry_dispatch_key = wb.ins().iconst(cl_types::I32, 0);
+            let call_inst = wb.ins().call(body_ref, &[jf_ptr_in, entry_dispatch_key]);
             let ret = wb.inst_results(call_inst)[0];
             wb.ins().return_(&[ret]);
             wb.finalize();
