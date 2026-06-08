@@ -6384,8 +6384,10 @@ impl MIFrame {
     /// (`rewrite.rs gen_malloc_nursery` / `gen_initialize_tid` /
     /// `gen_initialize_vtable`), so the result is a fully GC-managed
     /// `W_ExceptionObject` identical to the runtime `malloc_typed` +
-    /// `exc_new_wrapper` + `descr_init` path.  `args_w` is built as a
-    /// residual list for now.
+    /// `exc_new_wrapper` + `descr_init` path.  `args_w` is built inline
+    /// (`emit_exception_args_list_inline`) when `w_list_new` would pick
+    /// the Object strategy, so the args list virtualizes too; Empty /
+    /// Integer / Float strategies fall back to a residual list.
     ///
     /// Restricted to a callable that is exactly
     /// `lookup_exc_class_for_kind(kind)`: user subclasses (whose ctor may
@@ -6431,7 +6433,18 @@ impl MIFrame {
         self.with_ctx(|this, ctx| {
             this.implement_guard_value(ctx, callable, concrete_callable as i64);
         });
-        let args_list = TraceHelperAccess::trace_build_list(self, args)?;
+        // Build `args_w` inline when `w_list_new` would pick the Object
+        // strategy (non-empty, mixed/non-numeric) — then the whole list
+        // (W_ListObject + ItemsBlock) virtualizes alongside the exception.
+        // Empty / Integer / Float strategies fall back to the residual
+        // `trace_build_list`, which builds the matching typed storage.
+        let args_list = if pyre_object::listobject::list_strategy_for(concrete_args)
+            == pyre_object::listobject::ListStrategy::Object
+        {
+            self.with_ctx(|_this, ctx| crate::helpers::emit_exception_args_list_inline(ctx, args))
+        } else {
+            TraceHelperAccess::trace_build_list(self, args)?
+        };
         let new_op = self.with_ctx(|_this, ctx| {
             crate::helpers::emit_exception_new_inline(ctx, kind, callable, args_list)
         });

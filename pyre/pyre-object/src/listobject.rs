@@ -347,6 +347,22 @@ unsafe fn switch_to_correct_strategy(list: &mut W_ListObject, w_item: PyObjectRe
     }
 }
 
+/// The strategy `w_list_new` picks for a given item set.
+///
+/// listobject.py:1092 EmptyListStrategy: a freshly created list with no
+/// items uses Empty until first append picks a typed strategy.
+pub fn list_strategy_for(items: &[PyObjectRef]) -> ListStrategy {
+    if items.is_empty() {
+        ListStrategy::Empty
+    } else if all_ints(items) {
+        ListStrategy::Integer
+    } else if all_floats(items) {
+        ListStrategy::Float
+    } else {
+        ListStrategy::Object
+    }
+}
+
 /// Allocate a new W_ListObject from a Vec of items.
 pub fn w_list_new(items: Vec<PyObjectRef>) -> PyObjectRef {
     // `gct_fv_gc_malloc` bracket pattern (`framework.py:853-856`):
@@ -362,17 +378,7 @@ pub fn w_list_new(items: Vec<PyObjectRef>) -> PyObjectRef {
         crate::gc_roots::pin_root(item);
     }
 
-    // listobject.py:1092 EmptyListStrategy: a freshly created list with no
-    // items uses Empty until first append picks a typed strategy.
-    let strategy = if items.is_empty() {
-        ListStrategy::Empty
-    } else if all_ints(&items) {
-        ListStrategy::Integer
-    } else if all_floats(&items) {
-        ListStrategy::Float
-    } else {
-        ListStrategy::Object
-    };
+    let strategy = list_strategy_for(&items);
     let (length, items_block, int_items, float_items) = match strategy {
         ListStrategy::Empty | ListStrategy::Integer | ListStrategy::Float => {
             let int_items = if let ListStrategy::Integer = strategy {

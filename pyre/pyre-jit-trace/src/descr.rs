@@ -1743,6 +1743,14 @@ pub fn object_mutable_cell_value_descr() -> DescrRef {
     field_descr_from_group(&W_OBJECT_MUTABLE_CELL_DESCR_GROUP, 0)
 }
 
+/// Size descriptor for `W_ListObject` allocation via NewWithVtable.
+/// vtable = &LIST_TYPE; the Object-strategy fields `length` / `items` /
+/// `strategy` are SetField'd after; `int_items` / `float_items` stay at the
+/// NewWithVtable memzero (== empty, never read under the Object strategy).
+pub fn w_list_size_descr() -> DescrRef {
+    W_LIST_DESCR_GROUP.size_descr.clone()
+}
+
 /// rlist.py:116 `l.length` — live length of a list under the Object
 /// strategy. Under Integer/Float strategies this field is 0 and
 /// consumers must dispatch on `list.strategy` first.

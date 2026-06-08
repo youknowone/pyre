@@ -704,6 +704,77 @@ pub fn emit_exception_new_inline(
     new_op
 }
 
+/// Emit inline Object-strategy `W_ListObject` creation for the exception
+/// `args_w` list, so a `raise Type(a, b, ...)` builds its argument list
+/// as traced `NewArrayClear` + `SetarrayitemGc` + `NewWithVtable` +
+/// `SetfieldGc` ops the optimizer can virtualize when the exception (and
+/// therefore its args list) never escapes — instead of the opaque
+/// residual `jit_build_list` CallR.
+///
+/// Mirrors `listobject.rs::w_list_new` for the Object strategy:
+///   - `items` points at an `ItemsBlock` GcArray (capacity == `len`);
+///     `pyobject_gcarray_descr` is byte-compatible with the runtime
+///     `ItemsBlock` (`base_size = ITEMS_BLOCK_ITEMS_OFFSET = 8`).
+///   - `length` = `items.len()`.
+///   - `strategy` = `Object` (0). `NewWithVtable` already zero-fills the
+///     payload (`int_items` / `float_items` stay empty, never read under
+///     the Object strategy); the explicit store keeps the heap cache and
+///     optimizer field model in agreement.
+///
+/// Caller must restrict to Object-strategy-eligible args (non-empty AND
+/// not all-int AND not all-float); the typed Integer / Float strategies
+/// use `int_items` / `float_items` with `items` null and are NOT emitted
+/// here.
+pub fn emit_exception_args_list_inline(ctx: &mut TraceCtx, items: &[OpRef]) -> OpRef {
+    use crate::descr::{
+        list_items_descr, list_length_descr, list_strategy_descr, w_list_size_descr,
+    };
+    use crate::state::pyobject_gcarray_descr;
+
+    let len = items.len();
+    // Step 1 — allocate the ItemsBlock GcArray (capacity == len). Clear
+    // so the GcArray walker sees valid refs in every slot.
+    let len_ref = ctx.const_int(len as i64);
+    let array_descr = pyobject_gcarray_descr();
+    let items_block =
+        ctx.record_op_with_descr(OpCode::NewArrayClear, &[len_ref], array_descr.clone());
+    ctx.heap_cache_mut().new_object(items_block);
+
+    // Step 2 — items_block[i] = items[i].
+    for (i, &item) in items.iter().enumerate() {
+        let idx = ctx.const_int(i as i64);
+        ctx.record_op_with_descr(
+            OpCode::SetarrayitemGc,
+            &[items_block, idx, item],
+            array_descr.clone(),
+        );
+    }
+
+    // Step 3 — allocate the W_ListObject wrapper.
+    let list = ctx.record_op_with_descr(OpCode::NewWithVtable, &[], w_list_size_descr());
+    ctx.heap_cache_mut().new_object(list);
+
+    // Step 4 — length / items / strategy SetfieldGc, mirroring the
+    // Object-strategy arm of `w_list_new`.
+    let length_descr = list_length_descr();
+    let length_idx = length_descr.index();
+    ctx.record_op_with_descr(OpCode::SetfieldGc, &[list, len_ref], length_descr);
+    ctx.heapcache_setfield_cached(list, length_idx, len_ref);
+
+    let items_descr = list_items_descr();
+    let items_idx = items_descr.index();
+    ctx.record_op_with_descr(OpCode::SetfieldGc, &[list, items_block], items_descr);
+    ctx.heapcache_setfield_cached(list, items_idx, items_block);
+
+    let strategy_const = ctx.const_int(pyre_object::listobject::ListStrategy::Object as i64);
+    let strategy_descr = list_strategy_descr();
+    let strategy_idx = strategy_descr.index();
+    ctx.record_op_with_descr(OpCode::SetfieldGc, &[list, strategy_const], strategy_descr);
+    ctx.heapcache_setfield_cached(list, strategy_idx, strategy_const);
+
+    list
+}
+
 /// Emit inline `space.newslice(w_start, w_end, w_step)` creation
 /// (NewWithVtable + 3 SetfieldGc).
 ///
