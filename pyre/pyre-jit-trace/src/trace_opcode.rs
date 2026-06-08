@@ -8003,14 +8003,13 @@ unsafe fn trace_check_exc_match_against(
 ///
 /// Subsequent batches grow this set until it covers every Python
 /// opcode.  The remaining wall is execution-side, not recording-side:
-/// `eval.rs:3111` skips `execute_opcode_step` for walker-handled
+/// `eval_loop_jit` skips `execute_opcode_step` for walker-handled
 /// opcodes, which is correct only when the arm body's heap effects ride
-/// `vable_setfield` / `setarrayitem_vable_r`.  Arms with non-elidable
-/// `residual_call`s (e.g. `store_subscr_fn`,
-/// `set_current_exception`) require the Phase 5.B dispatch-unification
-/// path (`production_blackhole_handles` + `dispatch_arm_via_blackhole`)
-/// before they can join this set.  The trait infra is deleted only
-/// after both predicates cover every opcode.
+/// `vable_setfield` / `setarrayitem_vable_r`, or when walker dispatch
+/// concrete-executes any non-elidable `residual_call` through
+/// `try_execute_residual_call_via_executor` (Task #390 sub-slice 3).
+/// The trait infra is deleted only after this predicate covers every
+/// opcode.
 ///
 pub fn production_walker_handles(instruction: &Instruction) -> bool {
     // The unit-variant fold rewrites `StepResult::Continue` &c. to
@@ -8168,26 +8167,6 @@ pub fn production_walker_handles(instruction: &Instruction) -> bool {
             // the other pure pushes.
             | Instruction::PushNull
     )
-}
-
-/// Phase 5.B dispatch-unification predicate (companion to
-/// `production_walker_handles`).
-///
-/// Walker-handled opcodes whose arm body contains a non-elidable
-/// `residual_call` (e.g. `store_subscr_fn`, `set_current_exception`)
-/// cannot use the vable-only fast path at `eval.rs:3111`: walker
-/// recording skips concrete execution of impure residual_calls, and
-/// `eval_loop_jit` then skips `execute_opcode_step`, so the heap
-/// mutation never happens.  This predicate names the opcodes for which
-/// `eval_loop_jit` instead runs the arm jitcode through
-/// `BlackholeInterpreter` (`dispatch_arm_via_blackhole`), matching
-/// RPython `pyjitpl.py:_interpret`'s single-interpreter loop.
-///
-/// Returns `false` for every opcode today.  Slice 1 wires the
-/// predicate into `eval.rs` as a structural branch point; subsequent
-/// slices add opcodes once `dispatch_arm_via_blackhole` lands.
-pub fn production_blackhole_handles(_instruction: &Instruction) -> bool {
-    false
 }
 
 /// Apply the symbolic-tracker side effects of a walker-handled opcode.

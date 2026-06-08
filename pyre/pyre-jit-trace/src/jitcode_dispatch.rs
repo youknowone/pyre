@@ -3304,42 +3304,16 @@ fn funcptr_concrete_int(ctx: &WalkContext<'_, '_>, funcptr: OpRef) -> Option<i64
 /// time via [`majit_metainterp::executor::execute_pure_call`] and stamp
 /// `recorded` with the result.
 ///
-/// ★ PyPy parity gap (Phase 5.B replacement candidate):
 /// PyPy `_opimpl_*` methods (e.g. `_opimpl_setitem`,
 /// `_opimpl_setfield_*`) concrete-execute every `do_residual_call`
 /// regardless of `check_is_elidable()` — the EI flag only selects the
 /// recorded opcode kind (`CALL_PURE_*` vs `CALL_*`), not whether the
-/// helper runs.  The result is that `synchronize_virtualizable`'s
-/// in-place PyFrame write at the end of `_opimpl_setfield_vable`
-/// coincides with the side-effecting heap mutation of the
-/// `store_subscr_fn` / `set_current_exception` helper — both happen
-/// at trace-record time on the live frame.
-///
-/// Pyre's walker concrete-executes only the elidable path (this
-/// function); non-elidable helpers like `store_subscr_fn` route
-/// through `select_residual_call_opcode`'s default arm and are
-/// recorded but never executed.  `eval_loop_jit`'s
-/// `walker_dispatched_this_opcode` skip of `execute_opcode_step`
-/// (eval.rs:3111) then leaves the non-vable heap unchanged → SIGBUS
-/// on the next read (memory: M4 walker unactivated taxonomy, 5
-/// STORE_SUBSCR-hot benches).
-///
-/// The Phase 5.B `dispatch_arm_via_blackhole` path is a workaround
-/// that runs the arm jitcode through `BlackholeInterpreter` to
-/// concrete-execute those helpers; the orthodox PyPy alignment is
-/// instead to widen this function (or its successor) to
-/// concrete-execute *every* residual_call with concrete-known args,
-/// mirroring upstream's `executor.execute_varargs(opnum, argboxes,
-/// descr, exc=can_raise, pure=is_elidable)`.  That removes the need
-/// for `production_blackhole_handles` entirely and brings
-/// `_opimpl_setfield_vable` shape into structural parity.
-///
-/// Out-of-scope here (multi-session epic): widening requires can-raise
-/// exception propagation through the walker, a GuardNoException
-/// emission policy that matches PyPy's `do_residual_call(..., exc=
-/// can_raise)`, and audit of every non-elidable helper for trace-
-/// recording-time invariants (no jitdriver re-entry, no thread state
-/// mutation).  See Task #390.
+/// helper runs.  This function covers the elidable arm; the
+/// non-elidable arms (`CallMayForce*`, `CallLoopinvariant*`, `Call*`)
+/// are concrete-executed by [`try_execute_residual_call_via_executor`]
+/// (Task #390 sub-slice 3), with raised exceptions surfaced through
+/// `BH_LAST_EXC_VALUE` so `eval_loop_jit` can route them into the
+/// bytecode exception handler.
 ///
 /// RPython upstream `_record_helper_pure` invokes
 /// `executor.execute_varargs(opnum, argboxes, descr, exc=False, pure=True)`

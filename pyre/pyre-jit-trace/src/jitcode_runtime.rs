@@ -276,67 +276,6 @@ pub fn jitcode_for_instruction(instruction: &Instruction) -> Option<Arc<JitCode>
     jitcode_for_arm(arm_id_for_instruction(instruction)?)
 }
 
-thread_local! {
-    /// Per-thread cache of metainterp-runtime wrappers around build-time
-    /// canonical arm jitcodes.  The walker path consumes
-    /// `Arc<majit_translate::jitcode::JitCode>` (canonical core)
-    /// directly because recording only reads `.code` / `.constants`;
-    /// the production-blackhole path needs
-    /// `Arc<majit_metainterp::jitcode::JitCode>` because
-    /// `BlackholeInterpreter.jitcode` carries a per-jitcode descr pool
-    /// (`majit-metainterp/src/jitcode/mod.rs:394`).  Build-time
-    /// canonical arm jitcodes have no per-jitcode descrs (mod.rs:400-403
-    /// — they resolve through the global `ALL_DESCRS` table), so each
-    /// wrapper's `exec` field stays empty.
-    ///
-    /// `thread_local!` mirrors `ALL_JITCODES` above: `JitCode` payloads
-    /// transitively hold `!Sync` `Variable` cells.  Outer `OnceCell`
-    /// lazy-sizes the slot vector; per-slot `OnceCell` wraps the core
-    /// on first lookup, then hands out `Arc::clone`s.
-    static METAINTERP_JITCODE_CACHE: OnceCell<Vec<OnceCell<Arc<majit_metainterp::jitcode::JitCode>>>> =
-        const { OnceCell::new() };
-}
-
-/// Phase 5.B counterpart of `get_jitcode_by_index`: returns the
-/// metainterp-runtime `JitCode` wrapper for the canonical arm jitcode
-/// at `index`, suitable for installing on
-/// `BlackholeInterpreter.jitcode`.
-pub fn metainterp_jitcode_by_index(
-    index: usize,
-) -> Option<Arc<majit_metainterp::jitcode::JitCode>> {
-    METAINTERP_JITCODE_CACHE.with(|outer| {
-        let slots =
-            outer.get_or_init(|| (0..all_jitcodes().len()).map(|_| OnceCell::new()).collect());
-        let slot = slots.get(index)?;
-        Some(Arc::clone(slot.get_or_init(|| {
-            let canonical = all_jitcodes()
-                .get(index)
-                .expect("index validated by slot lookup");
-            Arc::new(majit_metainterp::jitcode::JitCode::from_canonical(
-                (**canonical).clone(),
-            ))
-        })))
-    })
-}
-
-/// Phase 5.B counterpart of `jitcode_for_arm`.
-pub fn metainterp_jitcode_for_arm(
-    arm_id: usize,
-) -> Option<Arc<majit_metainterp::jitcode::JitCode>> {
-    let arm = get_arm(arm_id)?;
-    let idx = arm.entry_jitcode_index?;
-    metainterp_jitcode_by_index(idx)
-}
-
-/// Phase 5.B counterpart of `jitcode_for_instruction`.  The
-/// BlackholeInterpreter-side entry for production dispatch
-/// (`dispatch_arm_via_blackhole`).
-pub fn metainterp_jitcode_for_instruction(
-    instruction: &Instruction,
-) -> Option<Arc<majit_metainterp::jitcode::JitCode>> {
-    metainterp_jitcode_for_arm(arm_id_for_instruction(instruction)?)
-}
-
 /// Deserialized `pipeline.insns` overlaid with `pyre_extension_insns()`
 /// — the build-observed `Assembler::write_insn` emit set plus the
 /// `_pyre/P` adapter keys that pyre's production blackhole builder

@@ -2981,221 +2981,6 @@ fn trace_jit_bytecode(_pc: usize, _instruction_name: &str) {
     // Debug logging disabled — per-bytecode eprintln causes O(n) slowdown.
 }
 
-/// JIT-enabled evaluation loop (PyPy interp_jit.py dispatch()).
-///
-/// Calls merge_point on EVERY iteration (PyPy line 85-87), not just
-/// when tracing. This matches PyPy's jit_merge_point placement.
-/// RPython interp_jit.py dispatch() parity.
-///
-/// The hot loop mirrors RPython's structure exactly:
-///   while True:
-///       jit_merge_point(...)      # thin inline check
-///       next_instr = handle_bytecode(...)
-///
-/// Phase 5.B dispatch-unification: run a single walker-handled
-/// opcode's arm jitcode through `BlackholeInterpreter` so its
-/// non-elidable `residual_call`s actually mutate heap, then return so
-/// `eval_loop_jit` advances to the next opcode.
-///
-/// RPython parity: `pyjitpl.py:_interpret` IS the execution loop —
-/// every opcode dispatches through the jitcode-bytecode path.  Pyre
-/// hosts the per-opcode loop in `eval_loop_jit` instead, so this
-/// helper bridges the two halves: walker-handled opcodes whose arms
-/// rely on impure residual_calls (e.g. `store_subscr_fn`,
-/// `set_current_exception`) route through here instead of the
-/// vable-only skip at `eval_loop_jit`'s walker-dispatched branch.
-///
-/// Selection gate: `pyre_jit_trace::production_blackhole_handles`
-/// (returns `false` everywhere today).  Subsequent Phase 5.B slices
-/// implement the body — arm jitcode lookup, BH builder
-/// acquire/release, PyFrame↔BH register marshalling, `interp.run()`
-/// — and grow the predicate per opcode.
-///
-/// ## Latent gaps before this path can be activated
-///
-/// The body below is reachable only when the predicate flips on for
-/// a given opcode, which is gated behind Task #390 sub-slice 6
-/// (retire Phase 5.B body wire once orthodox concrete-execute
-/// covers the same opcodes).  These items MUST close before any
-/// activation flip — they are tracked here so the predicate change
-/// surfaces them rather than crashing in production:
-///
-/// 1. **Non-void return-type push not implemented.** Below at the
-///    `todo!()` arm: `BhReturnType::Int|Ref|Float` panics.  Normal
-///    opcode arms typically end in `ref_return/r` →
-///    `DispatchOutcome::SubReturn { result: Some(opref) }` on the
-///    walker side; the blackhole equivalent surfaces via
-///    `bh.tmpreg_r`/`tmpreg_i`/`tmpreg_f` after
-///    `_final_result_anytype` / `_done_with_this_frame`
-///    (`rpython/jit/metainterp/blackhole.py:377, :1664`).  Slice
-///    3.8 ports the PyFrame stack push.
-///
-/// 2. **`bh.aborted` ignored.** Pyre's `BlackholeInterpreter` adds
-///    a pyre-only `aborted` flag for the `abort/` and
-///    `abort_permanent/` bhimpl opcodes
-///    (`majit/majit-metainterp/src/blackhole.rs:237`) which the
-///    resume path treats as failure
-///    (`pyre/pyre-jit/src/call_jit.rs:1478`).  This dispatcher
-///    currently reads only `mergepoint_args` / `got_exception` /
-///    `exception_value` / `return_type`, so an aborted arm would be
-///    misclassified as a normal completion.  Activation must check
-///    `bh.aborted` and raise — RPython has no "successful abort"
-///    path; bad/unwired blackhole bytecode fails loudly
-///    (`rpython/jit/metainterp/blackhole.py:97`).
-///
-/// 3. **`jitdrivers_sd` not seeded.** RPython blackhole recursive
-///    calls reach `builder.metainterp_sd.jitdrivers_sd[jdindex]`
-///    (`rpython/jit/metainterp/blackhole.py:1095`).  Pyre's
-///    existing resume path explicitly seeds `bh.jitdrivers_sd` at
-///    `pyre/pyre-jit/src/call_jit.rs:1424`; this helper only sets
-///    `virtualizable_ptr` and `virtualizable_info`.  Any future
-///    blackhole-handled opcode arm that reaches `recursive_call_*`
-///    would not match RPython.
-///
-/// 4. **`BH_LAST_EXC_VALUE` not drained.** The residual-call
-///    executor reports raised Python exceptions via
-///    `majit_metainterp::blackhole::BH_LAST_EXC_VALUE` (a
-///    thread-local seeded by `execute_residual_call`'s Err arm).
-///    This helper consults only `bh.got_exception` /
-///    `bh.exception_last_value`; a raised residual call could
-///    therefore fall through as `StepResult::Continue` and leave
-///    the TLS exception latched for a later opcode.  Activation
-///    must drain and clear `BH_LAST_EXC_VALUE` after `bh.run()`
-///    and map a non-zero value into `PyError`.
-///
-/// 5. **Hot-path lookup cost.** `metainterp_jitcode_for_instruction`
-///    (`pyre/pyre-jit-trace/src/jitcode_runtime.rs:337`) currently
-///    formats `Instruction` with `Debug` then linear-scans
-///    `ALL_OPCODE_ARMS`; before this path becomes default-on for
-///    any opcode, the arm/jitcode index needs threading through
-///    the dispatch site so the lookup is O(1).
-#[cold]
-fn dispatch_arm_via_blackhole(
-    frame: &mut pyre_interpreter::pyframe::PyFrame,
-    instruction: &pyre_interpreter::Instruction,
-) -> Result<StepResult<pyre_object::PyObjectRef>, pyre_interpreter::PyError> {
-    // Mirrors the walker-side fallback in
-    // `MIFrame::dispatch_via_walker_for_opcode`
-    // (pyre-jit-trace/src/trace_opcode.rs:6602) — an entry on
-    // `production_blackhole_handles` without a matching codewriter arm
-    // is a build-script wiring bug, not a user-visible error.  The
-    // metainterp-runtime wrapper is the form `BlackholeInterpreter.
-    // jitcode` consumes (descr pool stays empty for build-time canonical
-    // arms; `majit-metainterp/src/jitcode/mod.rs:400-403`).
-    let jitcode = pyre_jit_trace::jitcode_runtime::metainterp_jitcode_for_instruction(instruction)
-        .ok_or_else(|| {
-            pyre_interpreter::PyError::new(
-                pyre_interpreter::PyErrorKind::SystemError,
-                format!(
-                    "dispatch_arm_via_blackhole: production_blackhole_handles \
-                         admitted instruction without codewriter arm: {instruction:?}",
-                ),
-            )
-        })?;
-
-    // Thread-local BH pool — mirrors `call_jit.rs::blackhole_resume_via_
-    // rd_numb`'s `BH_BUILDER_RD` (call_jit.rs:1300-1315).  Separate
-    // builder from the resume-data path so the two cannot trip over each
-    // other's mutable borrow on re-entry; single-opcode arms don't go
-    // through `resume::blackhole_from_resumedata`.  Lazy-init on first
-    // dispatch; the predicate stays `false` everywhere today so the
-    // pool is never actually created in production.
-    thread_local! {
-        static BH_BUILDER_ARM: UnsafeCell<majit_metainterp::blackhole::BlackholeInterpBuilder> =
-            UnsafeCell::new(pyre_jit_trace::jitcode_runtime::build_pyre_production_bh_builder());
-    }
-    let sync_control_opcodes =
-        |builder: &mut majit_metainterp::blackhole::BlackholeInterpBuilder| {
-            let (op_live, op_catch_exception, op_rvmprof_code) =
-                pyre_jit_trace::state::blackhole_control_opcodes();
-            builder.setup_cached_control_opcodes(op_live, op_catch_exception, op_rvmprof_code);
-        };
-
-    let (mergepoint_args, got_exception, exception_value, return_type) =
-        BH_BUILDER_ARM.with(|cell| unsafe {
-            let builder = &mut *cell.get();
-            sync_control_opcodes(builder);
-            let mut bh = builder.acquire_interp();
-            // `setposition` (blackhole.py:312) initialises register
-            // banks + copies the constants pool into the upper portion
-            // of each bank.  Setting `jitcode` / `position` directly
-            // would leave the banks sized to the previous interp's
-            // jitcode (or empty on a fresh acquire), with no constants
-            // copied — wild reads at the first `bhimpl_*` that loads a
-            // constant.
-            bh.setposition(jitcode, 0);
-            // Virtualizable wiring — mirrors `call_jit.rs:1400-1423`.
-            // Single-arm dispatch has no caller chain so the
-            // `nextblackholeinterp` propagation loop reduces to no-op.
-            bh.virtualizable_ptr = frame as *mut pyre_interpreter::pyframe::PyFrame as i64;
-            bh.virtualizable_info = get_virtualizable_info();
-            // RPython MIFrame.setup parity: r0 = frame (per
-            // `trace_opcode.rs:6657-6660` walker-side seed).  Remaining
-            // working-bank slots stay zero/null; per-arm stack peeks
-            // are issued inside the arm body via `bhimpl_*` operand
-            // decoding (vable_get/setarrayitem_r against PyFrame's
-            // `locals_cells_stack_w`).
-            if !bh.registers_r.is_empty() {
-                bh.registers_r[0] = bh.virtualizable_ptr;
-            }
-            let mergepoint_args = bh.run();
-            let got_exception = bh.got_exception;
-            let exception_value = bh.exception_last_value;
-            let return_type = bh.return_type;
-            builder.release_interp(bh);
-            (mergepoint_args, got_exception, exception_value, return_type)
-        });
-
-    if got_exception {
-        // Mirrors `call_jit.rs:1486-1506` (BH chain-exit propagation):
-        // null `exception_value` means the arm raised without a
-        // payload (defensive RuntimeError); otherwise the value is a
-        // GC ref to a `W_BaseException` instance to re-wrap.
-        let err = if exception_value != 0 {
-            unsafe {
-                pyre_interpreter::PyError::from_exc_object(
-                    exception_value as pyre_object::PyObjectRef,
-                )
-            }
-        } else {
-            pyre_interpreter::PyError::new(
-                pyre_interpreter::PyErrorKind::RuntimeError,
-                "dispatch_arm_via_blackhole: arm raised exception with null exc_value",
-            )
-        };
-        return Err(err);
-    }
-    if mergepoint_args.is_some() {
-        // `ContinueRunningNormally` is the JIT-exit path: an arm
-        // discovered a jit_merge_point and wants the outer loop to
-        // re-warm.  Opcode arms don't issue merge points, so this is
-        // structurally unreachable for the per-opcode dispatch path.
-        unreachable!(
-            "dispatch_arm_via_blackhole: opcode arm raised \
-             ContinueRunningNormally — only portal arms should",
-        );
-    }
-    // LeaveFrame, no exception.  Dispatch on return_type per
-    // RPython `BlackholeInterpreter` (`blackhole.rs:696-701`):
-    //   Void  → arm already mutated heap via vable_setfield /
-    //           residual_call; stack push not needed.
-    //   Int/Ref/Float → result in `tmpreg_*` to push back onto
-    //           PyFrame stack; opcode-shape-specific marshalling
-    //           lands in slice 3.8.
-    match return_type {
-        majit_metainterp::blackhole::BhReturnType::Void => Ok(StepResult::Continue),
-        majit_metainterp::blackhole::BhReturnType::Int
-        | majit_metainterp::blackhole::BhReturnType::Ref
-        | majit_metainterp::blackhole::BhReturnType::Float => {
-            todo!(
-                "dispatch_arm_via_blackhole: non-void return-type \
-                 push lands in slice 3.8 (return_type={:?})",
-                return_type,
-            )
-        }
-    }
-}
-
 /// warmspot.py portal_runner parity: execute a frame through the JIT-enabled
 /// interpreter. Used by bhimpl_recursive_call (blackhole.py:1074-1093) for
 /// recursive portal depth. Returns PyObjectRef (NULL on void/exception).
@@ -3362,51 +3147,39 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
         }
         let mut next_instr = frame.next_instr();
         let step_result = if walker_dispatched_this_opcode {
-            if pyre_jit_trace::production_blackhole_handles(&instruction) {
-                // Phase 5.B path: arm body contains a non-elidable
-                // `residual_call` (e.g. `store_subscr_fn`,
-                // `set_current_exception`) whose heap mutation walker
-                // recording skipped (`check_is_elidable` gate in
-                // `jitcode_dispatch::execute_residual_call`).  Run the
-                // arm jitcode through `BlackholeInterpreter` so the
-                // mutation actually happens, matching RPython
-                // `pyjitpl.py:_interpret`'s single-interpreter loop.
-                dispatch_arm_via_blackhole(frame, &instruction)
+            // Vable-only path: walker arm advanced PyFrame via
+            // `vable_setfield` / `setarrayitem_vable_r` →
+            // `synchronize_virtualizable` (trace_ctx.rs:1224-1265),
+            // which propagates the shadow back to the heap PyFrame.
+            // Running `execute_opcode_step` here would double-mutate.
+            // pc already advanced above via
+            // `set_last_instr_from_next_instr(opcode_pc + 1)`.
+            //
+            // Walker-side `try_execute_residual_call_via_executor`
+            // (Task #390 sub-slice 3, `jitcode_dispatch.rs`)
+            // concrete-executes non-elidable residual calls during
+            // walker dispatch and routes raised exceptions through
+            // `BH_LAST_EXC_VALUE` (matches RPython
+            // `pyjitpl.py:2156-2168 handle_possible_exception` →
+            // `metainterp.execute_raised`).  Surface a pending
+            // exception as `Err(PyError)` so the bytecode
+            // interpreter's exception handler runs — without this,
+            // the helper's exception would silently drop, leaving
+            // the interpreter at the post-call PC instead of the
+            // exception-handler PC.
+            let bh_exc = majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| {
+                let v = c.get();
+                c.set(0);
+                v
+            });
+            if bh_exc != 0 {
+                Err(unsafe {
+                    pyre_interpreter::PyError::from_exc_object(
+                        bh_exc as pyre_object::PyObjectRef,
+                    )
+                })
             } else {
-                // Vable-only fast path: walker arm advanced PyFrame
-                // via `vable_setfield` / `setarrayitem_vable_r` →
-                // `synchronize_virtualizable` (trace_ctx.rs:1224-1265),
-                // which propagates the shadow back to the heap
-                // PyFrame.  Running `execute_opcode_step` here would
-                // double-mutate.  pc already advanced above via
-                // `set_last_instr_from_next_instr(opcode_pc + 1)`.
-                //
-                // Walker-side `try_execute_residual_call_via_executor`
-                // (Task #390 sub-slice 3, `jitcode_dispatch.rs`)
-                // concrete-executes non-elidable residual calls during
-                // walker dispatch and routes raised exceptions through
-                // `BH_LAST_EXC_VALUE` (matches RPython
-                // `pyjitpl.py:2156-2168 handle_possible_exception` →
-                // `metainterp.execute_raised`).  Surface a pending
-                // exception as `Err(PyError)` so the bytecode
-                // interpreter's exception handler runs — without this,
-                // the helper's exception would silently drop, leaving
-                // the interpreter at the post-call PC instead of the
-                // exception-handler PC.
-                let bh_exc = majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| {
-                    let v = c.get();
-                    c.set(0);
-                    v
-                });
-                if bh_exc != 0 {
-                    Err(unsafe {
-                        pyre_interpreter::PyError::from_exc_object(
-                            bh_exc as pyre_object::PyObjectRef,
-                        )
-                    })
-                } else {
-                    Ok(StepResult::Continue)
-                }
+                Ok(StepResult::Continue)
             }
         } else {
             execute_opcode_step(frame, code, instruction, op_arg, next_instr)
