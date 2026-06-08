@@ -6370,6 +6370,240 @@ fn inline_resolvable_static_vable_read(
     )
 }
 
+/// #62: full-body-walk direct `CALL_ASSEMBLER` for a self-recursive call
+/// at the inline recursion-bound boundary (dev-gated `PYRE_FBW_REC_CA`).
+///
+/// When the FBW inline depth for a callee reaches `FBW_MAX_INLINE_RECURSION`
+/// the call would otherwise degrade to a generic may-force residual, which
+/// re-enters the callee through the func-entry residency door — one
+/// heavyweight frame build + entry-bridge per recursive call (the
+/// `fib_recursive` ~30x slowdown).  This emits instead the direct
+/// assembler->assembler jump the trait tracer uses: `CALL_ASSEMBLER_R` to
+/// the callee's own loop/pending token (mirror of `_opimpl_recursive_call`
+/// `recursion_exceeded -> assembler_call`, `pyjitpl.py:1404-1422`, and
+/// `do_residual_call`'s assembler branch, `pyjitpl.py:2053-2082`;
+/// trait reference `trace_opcode.rs:6138-6204`).
+///
+/// First cut — the `fib` shape only: a single positional INT argument to a
+/// self-recursive (`callee code == portal code`) callee whose frame is
+/// `ncells == 0`, non-global-storing, and inline-buildable via
+/// [`crate::helpers::emit_new_pyframe_inline_self_recursive`]
+/// (Branch A of the trait's `emit_call_assembler_callee_frame`).  Any unmet
+/// precondition returns `Ok(None)` *before* recording any IR, so the call
+/// falls back to the proven (slow) residual path.  No callable-identity
+/// guard is emitted: matching the trait's self-recursive arm, the function
+/// identity is pinned upstream by the same `LOAD_GLOBAL` machinery the
+/// residual path already relies on.
+fn try_walker_call_assembler_self_recursive(
+    ctx: &mut WalkContext<'_, '_>,
+    op: &DecodedOp,
+    code: &[u8],
+    r_args: &[OpRef],
+    pyre_helper: majit_ir::PyreHelperKind,
+    dst_bank: char,
+    dst: usize,
+) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
+    // ---- non-emitting eligibility checks (free to bail with Ok(None)) ----
+    if !ctx.is_authoritative_executor || std::env::var_os("PYRE_FBW_REC_CA").is_none() {
+        return Ok(None);
+    }
+    // Only a genuine `call_fn` residual (no `pyre_helper` tag) is a
+    // candidate — every container/builtin helper carries a distinct tag.
+    if pyre_helper != majit_ir::PyreHelperKind::None {
+        return Ok(None);
+    }
+    // Single positional argument.  The boxed return value lands in either
+    // the Ref dst (`residual_call_r_r`, the boxed PyObject consumed by a
+    // following BINARY_OP) or the Int dst (`residual_call_r_i`).
+    if (dst_bank != 'r' && dst_bank != 'i') || r_args.len() != 3 {
+        return Ok(None);
+    }
+    let arg_concretes = read_ref_var_list_concrete(code, op, 1, ctx);
+    let ConcreteValue::Ref(callable) = arg_concretes[1] else {
+        return Ok(None);
+    };
+    if callable.is_null() {
+        return Ok(None);
+    }
+    // The callable must be a plain Python function with exactly one
+    // positional parameter and no closure.  Unlike the inline path this
+    // does NOT require a leaf body: the callee runs as its own compiled
+    // loop reached through `CALL_ASSEMBLER`, not traced through — so a
+    // branchy self-recursive body (`fib`'s `if n < 2`) is eligible here
+    // even though `callee_fast_path_inlinable` declines it for inlining.
+    let function_type_addr = &pyre_interpreter::FUNCTION_TYPE as *const _ as usize;
+    let (w_code, nparams, has_closure) = unsafe {
+        if !pyre_interpreter::is_function(callable)
+            || (*callable).ob_type as *const () as usize != function_type_addr
+        {
+            return Ok(None);
+        }
+        let w_code = pyre_interpreter::function_get_code(callable);
+        let raw = pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
+            as *const pyre_interpreter::CodeObject;
+        if raw.is_null() {
+            return Ok(None);
+        }
+        let closure = pyre_interpreter::function_get_closure(callable);
+        (w_code, (*raw).arg_count as usize, !closure.is_null())
+    };
+    if has_closure || nparams != 1 {
+        return Ok(None);
+    }
+    // The single positional argument must be a boxed int at trace time
+    // (`concrete_arg0 is_int`, `trace_opcode.rs:6148`).
+    let ConcreteValue::Ref(arg_obj) = arg_concretes[2] else {
+        return Ok(None);
+    };
+    if arg_obj.is_null() || !unsafe { pyre_object::is_int(arg_obj) } {
+        return Ok(None);
+    }
+    // The outer portal sym (the only materialized frame across sub-walks)
+    // via the FBW thread-local — the same read mechanism
+    // `walker_capture_snapshot_for_last_guard` uses.  Null outside a
+    // production full-body walk (arm/shadow/diagnostic), in which case the
+    // sym.frame / sym.execution_context reds are unavailable: bail.
+    let sym_ptr = FULL_BODY_SNAPSHOT_SYM.with(|c| c.get());
+    if sym_ptr.is_null() {
+        return Ok(None);
+    }
+    let sym = unsafe { &*sym_ptr };
+    let caller_frame = sym.frame;
+    let sym_execution_context = sym.execution_context;
+    // `is_self_recursive = callee code == portal code`
+    // (`trace_opcode.rs:5959-5960`: `callee_raw == caller_raw`).  During
+    // recording `we_are_jitted()` is false, so `function_get_code` (the
+    // `w_code` already in hand) equals `getcode` — the pointer the
+    // jit_merge_point green key and the portal jitcode were registered
+    // under.
+    let caller_code = unsafe { (*sym.jitcode).code };
+    if w_code as usize != caller_code as usize {
+        return Ok(None);
+    }
+    // Branch A frame shape only: `ncells == 0`, non-global-storing callee.
+    let raw = unsafe { pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef) }
+        as *const pyre_interpreter::CodeObject;
+    if raw.is_null() {
+        return Ok(None);
+    }
+    let callee_code = unsafe { &*raw };
+    if pyre_interpreter::ncells(callee_code) != 0 {
+        return Ok(None);
+    }
+    let callee_globals = unsafe { pyre_interpreter::function_get_globals(callable) };
+    let callee_globals_obj = unsafe { pyre_interpreter::function_get_globals_obj(callable) };
+    if unsafe {
+        pyre_interpreter::w_code_frame_stores_global(
+            w_code as pyre_object::PyObjectRef,
+            callee_globals,
+        )
+    } {
+        return Ok(None);
+    }
+    // Resolve the callee's own loop / pending assembler token
+    // (`trace_opcode.rs:5954` + `6138`: `make_green_key(w_callee_code, 0)`,
+    // `pc = 0` = function entry).  `get_loop_token_number` first, else the
+    // pending token `fib` hits before its loop finishes compiling
+    // (`trace_opcode.rs:6035-6036`).  A key miss returns `None` here =
+    // safe bail to residual.
+    let (driver, _) = crate::driver::driver_pair();
+    let callee_key = crate::driver::make_green_key(w_code, 0);
+    let Some(token_number) = driver
+        .get_loop_token_number(callee_key)
+        .or_else(|| driver.get_pending_token_number(callee_key))
+    else {
+        return Ok(None);
+    };
+
+    // ---- emission (mirror of `trace_opcode.rs:6146-6204`) ----
+    // Past this point every step records IR; `?` propagation aborts the
+    // whole walk (the trace is discarded), the correct failure mode for a
+    // recording error.
+    let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
+    let nlocals = callee_code.varnames.len();
+    let max_stack = callee_code.max_stackdepth as usize;
+
+    // Unbox the boxed int argument -> raw payload, re-boxed inside the new
+    // callee frame.  Mirror of `trace_guarded_int_payload(args[0])`.
+    let raw_arg = walker_unbox_int(ctx, op.pc, r_args[2], int_type_addr)?;
+
+    // Execution-context red (`ensure_execution_context`,
+    // `trace_opcode.rs:1078-1090`): the seeded `sym.execution_context`,
+    // else recovered off the portal frame via `GETFIELD_GC_R`.
+    let ec = if !sym_execution_context.is_none() {
+        sym_execution_context
+    } else {
+        ctx.trace_ctx.record_op_with_descr(
+            OpCode::GetfieldGcR,
+            &[caller_frame],
+            crate::descr::pyframe_execution_context_descr(),
+        )
+    };
+
+    // Build the callee PyFrame inline (Branch A): a single positional
+    // local, no cells, constant code / globals.
+    let pycode_const = ctx.trace_ctx.const_ref(w_code as i64);
+    let w_globals_const = ctx.trace_ctx.const_ref(callee_globals as i64);
+    let w_globals_obj_const = ctx.trace_ctx.const_ref(callee_globals_obj as i64);
+    let callee_frame = crate::helpers::emit_new_pyframe_inline_self_recursive(
+        ctx.trace_ctx,
+        raw_arg,
+        nlocals + max_stack,
+        nlocals,
+        pycode_const,
+        w_globals_const,
+        w_globals_obj_const,
+        ec,
+    );
+
+    // do_residual_call step 1 (`pyjitpl.py:2017`): FORCE_TOKEN +
+    // SETFIELD_GC(vable_token) before the assembler call.
+    maybe_walker_vable_and_vrefs_before_residual_call(ctx);
+
+    let ca_result = ctx.trace_ctx.call_assembler_red_only_ref(
+        token_number,
+        &[callee_frame, ec],
+        &[Type::Ref, Type::Ref],
+    );
+    // pyjitpl.py:2080-2081: KEEPALIVE on the callee virtualizable so it
+    // survives until the result is consumed.
+    ctx.trace_ctx.record_op(OpCode::Keepalive, &[callee_frame]);
+    // pyjitpl.py:2072: heapcache invalidation for the escaped frame.
+    ctx.trace_ctx
+        .heap_cache_mut()
+        .invalidate_caches_for_escaped();
+
+    // pyjitpl.py:2077 `make_result_of_lastop`: the result lands in
+    // `registers_*[reg_index]` BEFORE GUARD_NOT_FORCED (2079) and
+    // `handle_possible_exception` (2082).  The writeback MUST precede the
+    // two guards so their after-call resume snapshots read the recorded
+    // OpRef in the dst slot the resume position points at — deferring it
+    // past the guards surfaces a stale box (Ref dst) or NONE (Int dst) in
+    // the fail_args for the `>X` slot on a raising/forcing deopt.  Mirror
+    // of the sibling residual path (jitcode_dispatch.rs:6856-6857, contract
+    // at 6844-6849) and `do_residual_call_walker_emit`.  `CALL_ASSEMBLER_R`
+    // yields the boxed PyObject return value: a Ref dst takes it as-is (the
+    // consuming BINARY_OP unboxes); an Int dst unboxes here via the
+    // `trace_guarded_int_payload` analogue.
+    let result = if dst_bank == 'i' {
+        walker_unbox_int(ctx, op.pc, ca_result, int_type_addr)?
+    } else {
+        ca_result
+    };
+    write_residual_call_result_to_dst(ctx, op.pc, dst, dst_bank, result)?;
+
+    // pyjitpl.py:2079: GUARD_NOT_FORCED + resume snapshot advanced past
+    // the call (`capture_resumedata(after_residual_call=True)`).
+    ctx.trace_ctx.record_guard(OpCode::GuardNotForced, &[], 0);
+    walker_capture_snapshot_after_residual_call(ctx, op.pc)?;
+    // pyjitpl.py:2082 handle_possible_exception -> GUARD_NO_EXCEPTION on
+    // the non-raising recording path.
+    ctx.trace_ctx.record_guard(OpCode::GuardNoException, &[], 0);
+    walker_capture_snapshot_after_residual_call(ctx, op.pc)?;
+
+    Ok(Some((DispatchOutcome::Continue, op.next_pc)))
+}
+
 /// #62 slice (3c): full-body-walk inline of a recognized user-function
 /// `call_fn`.  Dev-gated by `PYRE_FBW_INLINE` (default OFF — the production
 /// flag-on path is unchanged until this is validated and the gate retired).
@@ -6683,6 +6917,23 @@ fn dispatch_residual_call_iRd_kind(
         try_walker_inline_user_call(ctx, op, code, &r_args, ei.pyre_helper, dst_bank, dst)?
     {
         return Ok(inlined);
+    }
+
+    // #62: a self-recursive call the inline path declined (e.g. the
+    // branchy `fib`) gets a direct `CALL_ASSEMBLER` to its own loop token
+    // (dev-gated PYRE_FBW_REC_CA) instead of the heavyweight func-entry
+    // residency residual.  Independent of inline eligibility, matching the
+    // trait's pending-token assembler branch (`trace_opcode.rs:6138`).
+    if let Some(ca) = try_walker_call_assembler_self_recursive(
+        ctx,
+        op,
+        code,
+        &r_args,
+        ei.pyre_helper,
+        dst_bank,
+        dst,
+    )? {
+        return Ok(ca);
     }
 
     // `_r_*` shape: argboxes = R-list only; argbox_types = [Ref; n].
