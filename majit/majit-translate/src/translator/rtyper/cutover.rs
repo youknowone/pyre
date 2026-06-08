@@ -1092,8 +1092,8 @@ pub(crate) fn default_someshell_for_lltype(
 /// PyreCallRegistry" for these paths.
 ///
 /// `specs` is typically the output of
-/// `register::extract_unsafe_fn_stubs(file, prefix)` run over every
-/// parsed source file.  Per-fn failures (stub-pygraph builder returns
+/// `front::mir::collect_unsafe_fn_stubs_from_llbc` (the Charon/LLBC-
+/// sourced stub-spec list).  Per-fn failures (stub-pygraph builder returns
 /// `None` for compound lltypes, or registry already has the same key
 /// at a conflicting signature) propagate as silent skips — the
 /// upstream "not registered" Skip path then absorbs that specific fn
@@ -1101,7 +1101,8 @@ pub(crate) fn default_someshell_for_lltype(
 ///
 /// Mirrors `populate_call_registry_from_call_graphs`'s
 /// "register and prefill" contract (`cutover.rs:856-875`) but feeds
-/// from the syn-AST stub-spec list instead of pyre's
+/// from the LLBC-sourced stub-spec list (`collect_unsafe_fn_stubs_from_llbc`)
+/// instead of pyre's
 /// `function_graphs: HashMap<CallPath, LegacyGraph>` (which excludes
 /// unsafe fns by validate_signature rejection).
 ///

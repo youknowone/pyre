@@ -1510,7 +1510,7 @@ impl CallControl {
     ///      runtime-published `PyreSizeDescr` (publish key = same
     ///      `path_hash(strip_crate(module_path!())::Name)` analyzer
     ///      builds for `owner_root` via `qualify_type_name` +
-    ///      `ParsedInterpreter.module_path`).
+    ///      `SemanticFunction.module_path`).
     ///   2. Walk `size_descr.all_fielddescrs()` matching the bare
     ///      `field_name` against each entry's `fd.field_name()` —
     ///      PyreFieldDescr names follow `"STRUCT.field"` per
