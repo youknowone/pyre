@@ -123,6 +123,15 @@ impl OptIntBounds {
         ctx.getintbound_handle(b).borrow().clone()
     }
 
+    /// `BoxRef`-operand variant of [`getintbound_box`]: resolves the operand
+    /// Box to its `_forwarded` terminal via `resolve_box_box` (the box-native
+    /// `get_box_replacement` step) and reads the bound, without collapsing the
+    /// operand to an `OpRef` first.
+    fn getintbound_arg(&self, arg: BoxRef, ctx: &mut OptContext) -> IntBound {
+        let b = ctx.resolve_box_box(&arg);
+        ctx.getintbound_handle(&b).borrow().clone()
+    }
+
     /// Resolve an operand to its forwarded terminal `BoxRef`, the `op =
     /// get_box_replacement(op)` step shared by every `optimize_INT_*` body
     /// (intbounds.py / optimizer.py:343). The dispatch-entry rebind
@@ -1839,15 +1848,15 @@ impl OptIntBounds {
     }
 
     fn postprocess_int_mul(&mut self, op: &Op, ctx: &mut OptContext) {
-        let b0 = self.getintbound_box(op.arg(0).to_opref(), ctx);
-        let b1 = self.getintbound_box(op.arg(1).to_opref(), ctx);
+        let b0 = self.getintbound_arg(op.arg(0), ctx);
+        let b1 = self.getintbound_arg(op.arg(1), ctx);
         let b = b0.mul_bound(&b1);
         self.intersect_bound(op.pos.get(), &b, ctx);
     }
 
     fn postprocess_int_and(&mut self, op: &Op, ctx: &mut OptContext) {
-        let b0 = self.getintbound_box(op.arg(0).to_opref(), ctx);
-        let b1 = self.getintbound_box(op.arg(1).to_opref(), ctx);
+        let b0 = self.getintbound_arg(op.arg(0), ctx);
+        let b1 = self.getintbound_arg(op.arg(1), ctx);
         let b = b0.and_bound(&b1);
         self.intersect_bound(op.pos.get(), &b, ctx);
     }
@@ -1929,47 +1938,47 @@ impl OptIntBounds {
     }
 
     fn postprocess_int_rshift(&mut self, op: &Op, ctx: &mut OptContext) {
-        let b0 = self.getintbound_box(op.arg(0).to_opref(), ctx);
-        let b1 = self.getintbound_box(op.arg(1).to_opref(), ctx);
+        let b0 = self.getintbound_arg(op.arg(0), ctx);
+        let b1 = self.getintbound_arg(op.arg(1), ctx);
         let b = b0.rshift_bound(&b1);
         self.intersect_bound(op.pos.get(), &b, ctx);
     }
 
     fn postprocess_uint_rshift(&mut self, op: &Op, ctx: &mut OptContext) {
-        let b0 = self.getintbound_box(op.arg(0).to_opref(), ctx);
-        let b1 = self.getintbound_box(op.arg(1).to_opref(), ctx);
+        let b0 = self.getintbound_arg(op.arg(0), ctx);
+        let b1 = self.getintbound_arg(op.arg(1), ctx);
         let b = b0.urshift_bound(&b1);
         self.intersect_bound(op.pos.get(), &b, ctx);
     }
 
     fn postprocess_int_floordiv(&mut self, op: &Op, ctx: &mut OptContext) {
-        let b0 = self.getintbound_box(op.arg(0).to_opref(), ctx);
-        let b1 = self.getintbound_box(op.arg(1).to_opref(), ctx);
+        let b0 = self.getintbound_arg(op.arg(0), ctx);
+        let b1 = self.getintbound_arg(op.arg(1), ctx);
         let b = b0.py_div_bound(&b1);
         self.intersect_bound(op.pos.get(), &b, ctx);
     }
 
     fn postprocess_int_mod(&mut self, op: &Op, ctx: &mut OptContext) {
-        let b0 = self.getintbound_box(op.arg(0).to_opref(), ctx);
-        let b1 = self.getintbound_box(op.arg(1).to_opref(), ctx);
+        let b0 = self.getintbound_arg(op.arg(0), ctx);
+        let b1 = self.getintbound_arg(op.arg(1), ctx);
         let b = b0.mod_bound(&b1);
         self.intersect_bound(op.pos.get(), &b, ctx);
     }
 
     fn postprocess_int_neg(&mut self, op: &Op, ctx: &mut OptContext) {
-        let b = self.getintbound_box(op.arg(0).to_opref(), ctx);
+        let b = self.getintbound_arg(op.arg(0), ctx);
         let result = b.neg_bound();
         self.intersect_bound(op.pos.get(), &result, ctx);
     }
 
     fn postprocess_int_invert(&mut self, op: &Op, ctx: &mut OptContext) {
-        let b = self.getintbound_box(op.arg(0).to_opref(), ctx);
+        let b = self.getintbound_arg(op.arg(0), ctx);
         let result = b.invert_bound();
         self.intersect_bound(op.pos.get(), &result, ctx);
     }
 
     fn postprocess_int_force_ge_zero(&mut self, op: &Op, ctx: &mut OptContext) {
-        let b_arg = self.getintbound_box(op.arg(0).to_opref(), ctx);
+        let b_arg = self.getintbound_arg(op.arg(0), ctx);
         let mut result = IntBound::nonnegative();
         if b_arg.upper >= 0 {
             let _ = result.make_le(&b_arg);
@@ -2007,7 +2016,7 @@ impl OptIntBounds {
         // by calling ensure_ptr_info_arg0 (which constructs StrPtrInfo for
         // STRLEN per optimizer.py:490-491) and then invoking getlenbound on
         // the returned handle.
-        let arg0_box = ctx.get_box_replacement(op.arg(0).to_opref());
+        let arg0_box = ctx.resolve_box_box(&op.arg(0));
         ctx.make_nonnull_str(&arg0_box, 0);
         // `getlenbound` is a lazy-fill mutator on `StrPtrInfo.lenbound`
         // (`vstring.py:62`). Route through `with_ensured_ptr_info_arg0`
@@ -2024,7 +2033,7 @@ impl OptIntBounds {
         //     self.make_nonnull_str(op.getarg(0), vstring.mode_unicode)
         //     array = getptrinfo(op.getarg(0))
         //     self.optimizer.setintbound(op, array.getlenbound(vstring.mode_unicode))
-        let arg0_box = ctx.get_box_replacement(op.arg(0).to_opref());
+        let arg0_box = ctx.resolve_box_box(&op.arg(0));
         ctx.make_nonnull_str(&arg0_box, 1);
         // Same wrapper rationale as `postprocess_strlen` — lazy-fill
         // mutation on StrPtrInfo.lenbound needs BoxRef mirror.
@@ -2043,8 +2052,8 @@ impl OptIntBounds {
         op_rc: &majit_ir::OpRc,
         ctx: &mut OptContext,
     ) -> OptimizationResult {
-        let b = self.getintbound_box(op.arg(0).to_opref(), ctx);
-        let b1 = self.getintbound_box(op.arg(1).to_opref(), ctx);
+        let b = self.getintbound_arg(op.arg(0), ctx);
+        let b1 = self.getintbound_arg(op.arg(1), ctx);
         if b1.is_constant() {
             let byte_size = b1.get_constant_int();
             let numbits = byte_size * 8;
@@ -2053,7 +2062,7 @@ impl OptIntBounds {
             if b.is_within_range(start, stop - 1) {
                 // The value already fits; replace with the input.
                 let b_old = BoxRef::from_bound_op(op_rc);
-                let b_arg = ctx.get_box_replacement(op.arg(0).to_opref());
+                let b_arg = ctx.resolve_box_box(&op.arg(0));
                 ctx.make_equal_to(&b_old, &b_arg);
                 return OptimizationResult::Remove;
             }
@@ -2062,7 +2071,7 @@ impl OptIntBounds {
     }
 
     fn postprocess_int_signext(&mut self, op: &Op, ctx: &mut OptContext) {
-        let b1 = self.getintbound_box(op.arg(1).to_opref(), ctx);
+        let b1 = self.getintbound_arg(op.arg(1), ctx);
         if b1.is_constant() {
             let byte_size = b1.get_constant_int();
             let numbits = byte_size * 8;
@@ -2077,8 +2086,8 @@ impl OptIntBounds {
 
     /// intbounds.py:244-256 optimize_INT_ADD_OVF
     fn optimize_int_add_ovf(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        let b0 = self.getintbound_box(op.arg(0).to_opref(), ctx);
-        let b1 = self.getintbound_box(op.arg(1).to_opref(), ctx);
+        let b0 = self.getintbound_arg(op.arg(0), ctx);
+        let b1 = self.getintbound_arg(op.arg(1), ctx);
         if b0.add_bound_cannot_overflow(&b1) {
             // replace_op_with(op, INT_ADD) + send_extra_operation
             let new_op = op.copy_and_change(OpCode::IntAdd, None, None);
@@ -2125,16 +2134,16 @@ impl OptIntBounds {
     }
 
     fn postprocess_int_sub_ovf(&mut self, op: &Op, ctx: &mut OptContext) {
-        let b0 = self.getintbound_box(op.arg(0).to_opref(), ctx);
-        let b1 = self.getintbound_box(op.arg(1).to_opref(), ctx);
+        let b0 = self.getintbound_arg(op.arg(0), ctx);
+        let b1 = self.getintbound_arg(op.arg(1), ctx);
         let b = b0.sub_bound_no_overflow(&b1);
         self.intersect_bound(op.pos.get(), &b, ctx);
     }
 
     /// intbounds.py:298-305 optimize_INT_MUL_OVF
     fn optimize_int_mul_ovf(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        let b0 = self.getintbound_box(op.arg(0).to_opref(), ctx);
-        let b1 = self.getintbound_box(op.arg(1).to_opref(), ctx);
+        let b0 = self.getintbound_arg(op.arg(0), ctx);
+        let b1 = self.getintbound_arg(op.arg(1), ctx);
         if b0.mul_bound_cannot_overflow(&b1) {
             // replace_op_with(op, INT_MUL) + send_extra_operation
             let new_op = op.copy_and_change(OpCode::IntMul, None, None);
@@ -2642,7 +2651,7 @@ impl OptIntBounds {
             // intbounds.py:759-767 propagate_bounds_INT_RSHIFT
             OpCode::IntRshift => {
                 let arg0 = op.arg(0).to_opref();
-                let b2 = self.getintbound_box(op.arg(1).to_opref(), ctx);
+                let b2 = self.getintbound_arg(op.arg(1), ctx);
                 if !b2.is_constant() {
                     return;
                 }
@@ -2658,7 +2667,7 @@ impl OptIntBounds {
             // intbounds.py:749-757 propagate_bounds_UINT_RSHIFT
             OpCode::UintRshift => {
                 let arg0 = op.arg(0).to_opref();
-                let b2 = self.getintbound_box(op.arg(1).to_opref(), ctx);
+                let b2 = self.getintbound_arg(op.arg(1), ctx);
                 if !b2.is_constant() {
                     return;
                 }
@@ -3184,8 +3193,8 @@ impl Optimization for OptIntBounds {
                             majit_ir::OopSpecIndex::IntPyDiv => {
                                 if op.num_args() >= 3 {
                                     // intbounds.py:165-169 post_call_INT_PY_DIV.
-                                    let b1 = self.getintbound_box(op.arg(1).to_opref(), ctx);
-                                    let b2 = self.getintbound_box(op.arg(2).to_opref(), ctx);
+                                    let b1 = self.getintbound_arg(op.arg(1), ctx);
+                                    let b2 = self.getintbound_arg(op.arg(2), ctx);
                                     let result_bound = b1.py_div_bound(&b2);
                                     self.intersect_bound(op.pos.get(), &result_bound, ctx);
                                 }
@@ -3193,8 +3202,8 @@ impl Optimization for OptIntBounds {
                             majit_ir::OopSpecIndex::IntPyMod => {
                                 if op.num_args() >= 3 {
                                     // intbounds.py:171-175 post_call_INT_PY_MOD.
-                                    let b1 = self.getintbound_box(op.arg(1).to_opref(), ctx);
-                                    let b2 = self.getintbound_box(op.arg(2).to_opref(), ctx);
+                                    let b1 = self.getintbound_arg(op.arg(1), ctx);
+                                    let b2 = self.getintbound_arg(op.arg(2), ctx);
                                     let result_bound = b1.mod_bound(&b2);
                                     self.intersect_bound(op.pos.get(), &result_bound, ctx);
                                 }
