@@ -3196,7 +3196,10 @@ fn arraylen_vable_via_metainterp(
     }
     let vable_struct_ptr = match read_ref_reg_concrete(code, op, 0, ctx) {
         ConcreteValue::Ref(ptr) => ptr as i64,
-        ConcreteValue::Null | ConcreteValue::Int(_) | ConcreteValue::Float(_) => 0,
+        ConcreteValue::Null
+        | ConcreteValue::Int(_)
+        | ConcreteValue::Float(_)
+        | ConcreteValue::Bool(_) => 0,
     };
     let (fdescr, adescr) = vable_array_descrs_from_jitcode(code, op, 1, 3, ctx)?;
     let guards_before = ctx.trace_ctx.num_guards();
@@ -6240,6 +6243,7 @@ fn diagnose_inline_recognition(arg_concretes: &[ConcreteValue], op_pc: usize) {
         .map(|cv| match cv {
             ConcreteValue::Int(_) => 'i',
             ConcreteValue::Float(_) => 'f',
+            ConcreteValue::Bool(_) => 'b',
             ConcreteValue::Ref(_) => 'r',
             ConcreteValue::Null => '_',
         })
