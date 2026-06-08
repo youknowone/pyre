@@ -4880,18 +4880,23 @@ pub fn object_delattr(obj: PyObjectRef, name: &str) -> PyResult {
             }
         }
     }
-    // Type objects: set to PY_NULL in class dict
-    // (DictStorage doesn't support removal, null slot acts as deleted)
+    // Type objects: remove the key from the class namespace.  Real
+    // removal (not a PY_NULL tombstone) keeps `cls.__dict__` membership,
+    // iteration, and length correct and back-mirrors the deletion into a
+    // materialized `__dict__`.  A missing key raises AttributeError, the
+    // same as the surrogate sibling `object_delattr_surrogate`.
     unsafe {
         if is_type(obj) {
             let dict_ptr = w_type_get_dict_ptr(obj) as *mut crate::DictStorage;
             if !dict_ptr.is_null() {
-                crate::dict_storage_store(&mut *dict_ptr, name, PY_NULL);
-                // typeobject.py:445 — `self.mutated(key)` mirrors the
-                // setattr branch's invalidation across the subclass
-                // tree.
-                mutated(obj, Some(name));
-                return Ok(w_none());
+                if crate::dict_storage_delete(&mut *dict_ptr, name) {
+                    // typeobject.py:445 — `self.mutated(key)` mirrors the
+                    // setattr branch's invalidation across the subclass
+                    // tree.
+                    mutated(obj, Some(name));
+                    return Ok(w_none());
+                }
+                return Err(raiseattrerror(obj, name));
             }
         }
     }

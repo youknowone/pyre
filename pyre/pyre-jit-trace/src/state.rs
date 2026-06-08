@@ -2264,12 +2264,7 @@ pub(crate) fn trace_unbox_int_with_resume<F: crate::walker_frame_ops::WalkerFram
     obj: OpRef,
     int_type_addr: i64,
 ) -> OpRef {
-    trace_unbox_int_with_resume_descr(
-        frame,
-        obj,
-        int_type_addr,
-        crate::descr::int_intval_descr(),
-    )
+    trace_unbox_int_with_resume_descr(frame, obj, int_type_addr, crate::descr::int_intval_descr())
 }
 
 pub(crate) fn trace_unbox_int_with_resume_descr<F: crate::walker_frame_ops::WalkerFrameOps>(
@@ -9173,11 +9168,7 @@ mod tests {
                 pre_opcode_registers_r: None,
                 pre_opcode_semantic_depth: None,
             };
-            trace_unbox_int_with_resume(
-                &mut state,
-                int_obj,
-                &INT_TYPE as *const PyType as i64,
-            )
+            trace_unbox_int_with_resume(&mut state, int_obj, &INT_TYPE as *const PyType as i64)
         };
 
         let recorder = ctx.into_recorder();

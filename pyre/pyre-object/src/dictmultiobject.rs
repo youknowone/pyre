@@ -2225,10 +2225,8 @@ pub unsafe fn w_dict_is_regular_empty_no_proxy(obj: PyObjectRef) -> bool {
         return false;
     }
     let dict = &*(obj as *const W_DictObject);
-    std::ptr::eq(
-        dict.dstrategy as *const _ as *const u8,
-        &crate::dictstrategy::EMPTY_DICT_STRATEGY as *const _ as *const u8,
-    ) && dict.dict_storage_proxy.is_null()
+    dict.dstrategy.strategy_kind() == crate::dictstrategy::StrategyKind::Empty
+        && dict.dict_storage_proxy.is_null()
 }
 
 /// Adopt a freshly copied regular-dict storage into an empty regular
@@ -2352,29 +2350,23 @@ pub unsafe fn w_dict_setitem_str_no_proxy(obj: PyObjectRef, key: &str, value: Py
     // UnicodeDictStrategy stores `Vec<(PyObjectRef, PyObjectRef)>`
     // (same shape as ObjectDictStrategy), so the existing raw Vec
     // walk below is correct once the strategy slot points at it.
-    let s = dict.dstrategy as *const _ as *const u8;
-    let is_empty = std::ptr::eq(
-        s,
-        &crate::dictstrategy::EMPTY_DICT_STRATEGY as *const _ as *const u8,
-    );
-    let is_unicode = std::ptr::eq(
-        s,
-        &crate::dictstrategy::UNICODE_DICT_STRATEGY as *const _ as *const u8,
-    );
-    let is_object = std::ptr::eq(
-        s,
-        &crate::dictstrategy::OBJECT_DICT_STRATEGY as *const _ as *const u8,
-    );
-    if is_empty {
-        dict.dstrategy = &crate::dictstrategy::UNICODE_DICT_STRATEGY;
-    } else if !is_unicode && !is_object {
+    // Discriminate by `strategy_kind()`, never by `std::ptr::eq` on the
+    // strategy address: the strategy singletons are zero-sized statics
+    // whose addresses the compiler is free to coalesce, so pointer
+    // identity cannot tell `Empty`/`Unicode`/`Object` apart.
+    use crate::dictstrategy::StrategyKind;
+    match dict.dstrategy.strategy_kind() {
+        StrategyKind::Empty => {
+            dict.dstrategy = &crate::dictstrategy::UNICODE_DICT_STRATEGY;
+        }
+        StrategyKind::Unicode | StrategyKind::Object => {}
         // Int / Bytes / Identity / Kwargs typed storage: PyPy's
         // `AbstractTypedStrategy.setitem_str` (`dictmultiobject.py:1069`)
         // promotes to ObjectDictStrategy before the str-key insert.
         // Polymorphic dispatch through the trait converts the typed
         // backing to `Vec<(PyObjectRef, PyObjectRef)>` so the walk
         // below sees the correct layout.
-        dict.dstrategy.switch_to_object_strategy(obj);
+        _ => dict.dstrategy.switch_to_object_strategy(obj),
     }
     let entries = &mut *(dict.dstorage as *mut indexmap::IndexMap<ObjectKey, PyObjectRef>);
     let w_key = crate::w_str_new(key);
@@ -2399,29 +2391,17 @@ pub unsafe fn w_dict_delitem_str_no_proxy(obj: PyObjectRef, key: &str) -> bool {
     // sees the right layout.  PyPy's typed `delitem` (`dictmultiobject.py:1081-1087`)
     // promotes on key-type mismatch; we promote on the str-keyed
     // back-mirror path for the same reason.
-    let s = dict.dstrategy as *const _ as *const u8;
-    let is_empty = std::ptr::eq(
-        s,
-        &crate::dictstrategy::EMPTY_DICT_STRATEGY as *const _ as *const u8,
-    );
-    let is_unicode = std::ptr::eq(
-        s,
-        &crate::dictstrategy::UNICODE_DICT_STRATEGY as *const _ as *const u8,
-    );
-    let is_object = std::ptr::eq(
-        s,
-        &crate::dictstrategy::OBJECT_DICT_STRATEGY as *const _ as *const u8,
-    );
-    if !is_empty && !is_unicode && !is_object {
-        dict.dstrategy.switch_to_object_strategy(obj);
+    // Discriminate by `strategy_kind()`; the strategy singletons are
+    // zero-sized statics whose addresses can coalesce, so `std::ptr::eq`
+    // on them is unreliable.
+    use crate::dictstrategy::StrategyKind;
+    match dict.dstrategy.strategy_kind() {
+        StrategyKind::Empty | StrategyKind::Unicode | StrategyKind::Object => {}
+        _ => dict.dstrategy.switch_to_object_strategy(obj),
     }
     let entries = &mut *(dict.dstorage as *mut indexmap::IndexMap<ObjectKey, PyObjectRef>);
     let w_key = crate::w_str_new(key);
-    if entries.shift_remove(&object_key_for(w_key)).is_some() {
-        true
-    } else {
-        false
-    }
+    entries.shift_remove(&object_key_for(w_key)).is_some()
 }
 
 /// WTF-8 keyed sibling of `w_dict_setitem_str_no_proxy` — lets a
@@ -2443,12 +2423,10 @@ pub unsafe fn w_dict_setitem_wtf8_no_proxy(
         return;
     }
     let dict = &mut *(obj as *mut W_DictObject);
-    let s = dict.dstrategy as *const _ as *const u8;
-    let is_object = std::ptr::eq(
-        s,
-        &crate::dictstrategy::OBJECT_DICT_STRATEGY as *const _ as *const u8,
-    );
-    if !is_object {
+    // A lone-surrogate key can only live on `ObjectDictStrategy`; force
+    // the switch unless already there.  Detect via `strategy_kind()` —
+    // `std::ptr::eq` on the zero-sized strategy statics is unreliable.
+    if dict.dstrategy.strategy_kind() != crate::dictstrategy::StrategyKind::Object {
         dict.dstrategy.switch_to_object_strategy(obj);
     }
     let entries = &mut *(dict.dstorage as *mut indexmap::IndexMap<ObjectKey, PyObjectRef>);
@@ -2466,20 +2444,15 @@ pub unsafe fn w_dict_delitem_wtf8_no_proxy(obj: PyObjectRef, key: &rustpython_wt
         return false;
     }
     let dict = &mut *(obj as *mut W_DictObject);
-    let s = dict.dstrategy as *const _ as *const u8;
-    let is_empty = std::ptr::eq(
-        s,
-        &crate::dictstrategy::EMPTY_DICT_STRATEGY as *const _ as *const u8,
-    );
-    if is_empty {
-        return false;
-    }
-    let is_object = std::ptr::eq(
-        s,
-        &crate::dictstrategy::OBJECT_DICT_STRATEGY as *const _ as *const u8,
-    );
-    if !is_object {
-        dict.dstrategy.switch_to_object_strategy(obj);
+    // Detect via `strategy_kind()`; the strategy singletons are
+    // zero-sized statics whose addresses can coalesce, so `std::ptr::eq`
+    // on them is unreliable (an `Object`-strategy dict could otherwise
+    // be misread as `Empty` and skip the removal entirely).
+    use crate::dictstrategy::StrategyKind;
+    match dict.dstrategy.strategy_kind() {
+        StrategyKind::Empty => return false,
+        StrategyKind::Object => {}
+        _ => dict.dstrategy.switch_to_object_strategy(obj),
     }
     let entries = &mut *(dict.dstorage as *mut indexmap::IndexMap<ObjectKey, PyObjectRef>);
     let w_key = crate::w_str_from_wtf8(key.to_wtf8_buf());

@@ -3405,7 +3405,6 @@ pub extern "C" fn bh_unpack_item_fn(index: i64, seq: i64) -> i64 {
     }
 }
 
-
 /// Read the current (per-thread) exception saved in
 /// `pyre_interpreter::eval::CURRENT_EXCEPTION`. Matches the read at
 /// `pyopcode.py:786 PUSH_EXC_INFO` (implicit via `executioncontext.sys_exc_info`).

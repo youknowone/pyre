@@ -4552,13 +4552,10 @@ fn try_walker_store_subscr_specialization(
         let s = s.to_str()?;
         parse_hex_or_decimal_usize(s)?
     };
-    let funcptr_addr = ctx
-        .trace_ctx
-        .box_value(funcptr)
-        .and_then(|v| match v {
-            majit_ir::Value::Int(n) => Some(n as usize),
-            _ => None,
-        })?;
+    let funcptr_addr = ctx.trace_ctx.box_value(funcptr).and_then(|v| match v {
+        majit_ir::Value::Int(n) => Some(n as usize),
+        _ => None,
+    })?;
     if funcptr_addr != expected_fn_addr {
         return None;
     }
@@ -4701,19 +4698,18 @@ fn dispatch_residual_call_iRd_kind(
     // alongside the specialization branch; this probe stays at the raw-usize
     // layer to keep the conversion seam single-sourced.
     if std::env::var_os("PYRE_PROBE_SUBSCR").is_some() {
-        let funcptr_addr =
-            ctx.trace_ctx
-                .box_value(funcptr)
-                .and_then(|v| match v {
-                    majit_ir::Value::Int(n) => Some(n as u64),
-                    _ => None,
-                });
+        let funcptr_addr = ctx.trace_ctx.box_value(funcptr).and_then(|v| match v {
+            majit_ir::Value::Int(n) => Some(n as u64),
+            _ => None,
+        });
         let arg_addrs: Vec<Option<u64>> = r_args
             .iter()
-            .map(|&op| ctx.trace_ctx.box_value(op).and_then(|v| match v {
-                majit_ir::Value::Ref(r) => Some(r.as_usize() as u64),
-                _ => None,
-            }))
+            .map(|&op| {
+                ctx.trace_ctx.box_value(op).and_then(|v| match v {
+                    majit_ir::Value::Ref(r) => Some(r.as_usize() as u64),
+                    _ => None,
+                })
+            })
             .collect();
         eprintln!(
             "[PYRE_PROBE_SUBSCR] dispatch_residual_call_iRd_kind pc={} dst_bank={} r_args.len={} funcptr_addr={:?} arg_addrs={:?}",
@@ -4721,7 +4717,10 @@ fn dispatch_residual_call_iRd_kind(
             dst_bank,
             r_args.len(),
             funcptr_addr.map(|a| format!("{:#x}", a)),
-            arg_addrs.iter().map(|o| o.map(|a| format!("{:#x}", a))).collect::<Vec<_>>(),
+            arg_addrs
+                .iter()
+                .map(|o| o.map(|a| format!("{:#x}", a)))
+                .collect::<Vec<_>>(),
         );
     }
 
@@ -4742,9 +4741,9 @@ fn dispatch_residual_call_iRd_kind(
     // deferred to 5.5b — `WalkContext.store_subscr_fn_addr`).  Without
     // the env var, gate decays to no-op and dispatcher falls through to
     // the existing blackbox CallN path.
-    if let Some(outcome) = try_walker_store_subscr_specialization(
-        ctx, code, op, funcptr, &r_args, dst_bank,
-    ) {
+    if let Some(outcome) =
+        try_walker_store_subscr_specialization(ctx, code, op, funcptr, &r_args, dst_bank)
+    {
         return Ok((outcome, op.next_pc));
     }
 
@@ -4915,10 +4914,7 @@ fn dispatch_residual_call_iRd_kind(
                     .last_exc_value
                     .expect("resid_raised implies last_exc_value seeded by the Err branch");
                 let exc_concrete = ctx.last_exc_value_concrete;
-                return Ok((
-                    DispatchOutcome::SubRaise { exc, exc_concrete },
-                    op.next_pc,
-                ));
+                return Ok((DispatchOutcome::SubRaise { exc, exc_concrete }, op.next_pc));
             } else {
                 ctx.trace_ctx.record_guard(OpCode::GuardNoException, &[], 0);
                 walker_capture_snapshot_for_last_guard(ctx, op.pc);
@@ -5130,10 +5126,7 @@ fn dispatch_residual_call_iIRd_kind(
                     .last_exc_value
                     .expect("resid_raised implies last_exc_value seeded by the Err branch");
                 let exc_concrete = ctx.last_exc_value_concrete;
-                return Ok((
-                    DispatchOutcome::SubRaise { exc, exc_concrete },
-                    op.next_pc,
-                ));
+                return Ok((DispatchOutcome::SubRaise { exc, exc_concrete }, op.next_pc));
             } else {
                 ctx.trace_ctx.record_guard(OpCode::GuardNoException, &[], 0);
                 walker_capture_snapshot_for_last_guard(ctx, op.pc);
@@ -5302,10 +5295,7 @@ fn dispatch_residual_call_iIRFd_kind(
                     .last_exc_value
                     .expect("resid_raised implies last_exc_value seeded by the Err branch");
                 let exc_concrete = ctx.last_exc_value_concrete;
-                return Ok((
-                    DispatchOutcome::SubRaise { exc, exc_concrete },
-                    op.next_pc,
-                ));
+                return Ok((DispatchOutcome::SubRaise { exc, exc_concrete }, op.next_pc));
             } else {
                 ctx.trace_ctx.record_guard(OpCode::GuardNoException, &[], 0);
                 walker_capture_snapshot_for_last_guard(ctx, op.pc);

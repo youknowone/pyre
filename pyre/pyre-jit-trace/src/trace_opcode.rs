@@ -6988,16 +6988,37 @@ impl MIFrame {
     /// on the trait path until walker snapshot capture can represent the
     /// full parent-frame chain.
     ///
-    /// `is_top_level=false` so the arm's `ref_return/r` terminator
-    /// surfaces as `DispatchOutcome::SubReturn` rather than emitting a
-    /// `Finish` (the outer Python frame's `Finish` is owned by the
-    /// trace_opcode dispatch's higher-level Return/Yield/CloseLoop
-    /// handling, not the per-opcode arm).
-    pub(crate) fn dispatch_via_walker_for_opcode(
+    /// PyPy `_opimpl_*` direct-record entry point for opcodes that emit
+    /// IR and produce concrete effects directly from the tracer, bypassing
+    /// the auto-gen arm-jitcode walk.  Mirrors `MetaInterp.interpret`'s
+    /// upstream dispatch shape where `pyjitpl.py:1346+ _opimpl_*` methods
+    /// invoke `metainterp.history.record*` and concrete-execute helpers
+    /// inline rather than walking an intermediate jitcode representation.
+    ///
+    /// Returns `Ok(Some(step_result))` when the opcode was handled here.
+    /// `Ok(None)` falls through to the arm-jitcode walker in
+    /// [`MIFrame::dispatch_via_walker_for_opcode`].  `Err(_)` propagates a
+    /// dispatch-time exception (e.g. `MIFrame::reraise` raising with
+    /// `reraise_lasti` populated).
+    ///
+    /// Each direct-dispatch handler must:
+    ///   1. Update the symbolic stack via `SharedOpcodeHandler::pop_value`
+    ///      / `peek_at` so subsequent walker opcodes see consistent vsd.
+    ///   2. Record any IR for the opcode (via a trait method like
+    ///      `MIFrame::store_subscr_value` or a `_opimpl_*`-style direct
+    ///      `record_op_*` call against `WalkContext`).
+    ///   3. Produce concrete heap effects when the upstream `_opimpl_*`
+    ///      counterpart does (e.g. `bh_execute_store_subscr`-style helper
+    ///      invocation).
+    ///
+    /// This entry point is the natural home for future `_opimpl_*` ports
+    /// — adding a new opcode here is the structural equivalent of writing
+    /// a new `pyjitpl.py:_opimpl_<name>` method.
+    fn try_walker_direct_opcode_dispatch(
         &mut self,
         instruction: &Instruction,
         op_arg: pyre_interpreter::OpArg,
-    ) -> Result<pyre_interpreter::StepResult<FrontendOp>, PyError> {
+    ) -> Result<Option<pyre_interpreter::StepResult<FrontendOp>>, PyError> {
         // Sub-slice 5c step 5.6b — STORE_SUBSCR walker activation via
         // trait-path delegation.
         //
@@ -7045,7 +7066,7 @@ impl MIFrame {
                 key.concrete.to_pyobj(),
                 value.concrete.to_pyobj(),
             )?;
-            return Ok(pyre_interpreter::StepResult::Continue);
+            return Ok(Some(pyre_interpreter::StepResult::Continue));
         }
 
         // `pyopcode.py:1348-1376 RERAISE` parity for the walker leg.
@@ -7063,7 +7084,31 @@ impl MIFrame {
         if let Instruction::Reraise { depth } = instruction {
             use pyre_interpreter::OpcodeStepExecutor;
             OpcodeStepExecutor::reraise(self, depth.get(op_arg))?;
-            return Ok(pyre_interpreter::StepResult::Continue);
+            return Ok(Some(pyre_interpreter::StepResult::Continue));
+        }
+
+        Ok(None)
+    }
+
+    /// `is_top_level=false` so the arm's `ref_return/r` terminator
+    /// surfaces as `DispatchOutcome::SubReturn` rather than emitting a
+    /// `Finish` (the outer Python frame's `Finish` is owned by the
+    /// trace_opcode dispatch's higher-level Return/Yield/CloseLoop
+    /// handling, not the per-opcode arm).
+    pub(crate) fn dispatch_via_walker_for_opcode(
+        &mut self,
+        instruction: &Instruction,
+        op_arg: pyre_interpreter::OpArg,
+    ) -> Result<pyre_interpreter::StepResult<FrontendOp>, PyError> {
+        // PyPy `_opimpl_*` direct-record entry point — opcodes that bypass
+        // the auto-gen arm-jitcode walk and emit IR / produce concrete
+        // effects directly, matching `MetaInterp.interpret`'s upstream
+        // dispatch shape (`pyjitpl.py:1346+ _opimpl_*`).
+        //
+        // Returns `Some(step_result)` when the opcode was handled here.
+        // The arm-jitcode walker below runs only when this returns `None`.
+        if let Some(step_result) = self.try_walker_direct_opcode_dispatch(instruction, op_arg)? {
+            return Ok(step_result);
         }
 
         let jitcode = match crate::jitcode_runtime::jitcode_for_instruction(instruction) {

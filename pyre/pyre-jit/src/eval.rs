@@ -3174,9 +3174,7 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
             });
             if bh_exc != 0 {
                 Err(unsafe {
-                    pyre_interpreter::PyError::from_exc_object(
-                        bh_exc as pyre_object::PyObjectRef,
-                    )
+                    pyre_interpreter::PyError::from_exc_object(bh_exc as pyre_object::PyObjectRef)
                 })
             } else {
                 Ok(StepResult::Continue)
