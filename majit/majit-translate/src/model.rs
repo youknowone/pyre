@@ -2858,26 +2858,6 @@ pub struct FunctionGraph {
     /// `with_return_type(rt)` after construction (parse.rs + lib.rs
     /// free-function, trait-method, and inherent-method registration).
     pub return_type: Option<String>,
-    /// Source-file module path the function was lifted from (e.g.
-    /// `pyre_jit::jit::trace`).  RPython equivalent: every
-    /// `FunctionDesc` carries `pyobj.__globals__` via its source
-    /// module, which `flowspace/flowcontext.py:845-866 LOAD_GLOBAL`
-    /// consults for per-function name resolution.  Pyre's analogue:
-    /// the source-file's `module_prefix` plus the file's
-    /// `use_imports` (aggregated in `CallControl::use_imports` keyed
-    /// by `(module_path, alias)`); this field carries the
-    /// `module_path` so downstream typer passes can recover the
-    /// caller's per-file import scope without threading the entire
-    /// program context through `translate_op`.
-    ///
-    /// `None` for synthetic test-fixture graphs constructed via
-    /// `FunctionGraph::new("name")`; production paths populate via
-    /// `with_source_module(mp)` from `lib.rs` (where
-    /// `parsed.module_path` is available).  Downstream consumers
-    /// treat `None` as "no per-file scope known" and fall through to
-    /// the unrestricted HOST_ENV-curated path resolution that pyre
-    /// uses today.
-    pub source_module: Option<String>,
     /// Per-graph JIT hints — the `_jit_*_` / `_elidable_function_`
     /// attributes RPython `policy.py:48-62 look_inside_graph` reads off
     /// `graph.func`. Pyre carries them on the graph itself so
@@ -2956,7 +2936,6 @@ impl FunctionGraph {
             value_variables: vec![Some(var_returnvar), Some(var_etype), Some(var_evalue)],
             variable_to_vid,
             return_type: None,
-            source_module: None,
             owner_root: None,
             hints: Vec::new(),
         }
@@ -2979,17 +2958,6 @@ impl FunctionGraph {
     /// graph; test fixtures may skip and leave the list empty.
     pub fn with_hints(mut self, hints: Vec<String>) -> Self {
         self.hints = hints;
-        self
-    }
-
-    /// Builder-style setter for `source_module`. Production
-    /// registration paths populate from `ParsedInterpreter.module_path`
-    /// at lib.rs graph-construction sites; test fixtures may skip and
-    /// leave `None`.  Used by downstream typer passes to recover the
-    /// caller's per-file `use_imports` for import-scope-aware
-    /// resolution (`flowspace_adapter.rs::translate_op` Layer 3).
-    pub fn with_source_module(mut self, mp: impl Into<String>) -> Self {
-        self.source_module = Some(mp.into());
         self
     }
 

@@ -684,11 +684,6 @@ fn analyze_pipeline_from_module_paths(
         }};
     }
     mark_phase!("entry");
-    // `use <path>::*` glob roots are expanded into explicit
-    // `use_imports` entries inside
-    // `build_semantic_program_*_with_options` so the front-end
-    // `Expr::Path` arm resolves glob-imported bare names through the
-    // primary `use_imports` lookup without a separate fallback.
     // `FORCE_ATTRIBUTES_INTO_CLASSES` is seeded from the LLBC-sourced
     // `program.struct_field_attrs` further below, once `program` is
     // built.
