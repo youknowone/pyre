@@ -4113,11 +4113,30 @@ impl OptContext {
 
     /// `BoxRef`-addressed operand resolution seam. Callers holding the
     /// operand Box (`op.arg(i)`) resolve it here instead of collapsing to
-    /// an `OpRef` and re-resolving. Bridges through
-    /// `get_box_replacement(arg.to_opref())`; the box-native chain walk
-    /// that retires the `to_opref` round-trip is layered in behind it.
+    /// an `OpRef` and re-resolving.
+    ///
+    /// resoperation.py:57-68: a bound operand carries its producer op (or
+    /// is a Const) and walks its own `_forwarded` chain directly — the Box
+    /// object IS the reference. An unbound operand (no producer handle:
+    /// short-preamble replay / test baseline position-only box, or an
+    /// InputArg) has no producer chain to walk from the Box alone, so it
+    /// resolves through the `OpRef` position store as before.
     pub fn resolve_box_box(&self, arg: &crate::r#box::BoxRef) -> crate::r#box::BoxRef {
-        self.get_box_replacement(arg.to_opref())
+        if arg.bound_op().is_some() || arg.is_constant() {
+            let resolved = arg.get_box_replacement(false);
+            #[cfg(debug_assertions)]
+            {
+                let legacy = self.get_box_replacement(arg.to_opref());
+                debug_assert!(
+                    resolved.same_box(&legacy) || resolved.to_opref() == legacy.to_opref(),
+                    "resolve_box_box: box-native walk diverged from OpRef path for {:?}",
+                    arg.to_opref()
+                );
+            }
+            resolved
+        } else {
+            self.get_box_replacement(arg.to_opref())
+        }
     }
 
     /// resoperation.py:58 get_box_replacement(not_const=True). This is used
