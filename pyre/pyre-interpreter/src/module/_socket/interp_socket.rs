@@ -2259,27 +2259,20 @@ fn init_socket_type(ns: &mut DictStorage) {
                 .get(3)
                 .copied()
                 .or_else(|| crate::builtins::kwarg_get(kwargs, "fileno"));
-            for (obj, label) in [(family_obj, "family"), (type_obj, "type"), (proto_obj, "proto")] {
-                if let Some(o) = obj {
-                    if !unsafe { pyre_object::is_int(o) } {
-                        return Err(crate::PyError::type_error(format!(
-                            "socket: {label} must be an integer"
-                        )));
-                    }
+            // `@unwrap_spec(family=int, type=int, proto=int)` — a present
+            // argument goes through the gateway int converter (`__index__` /
+            // `__int__`, OverflowError if it does not fit), defaulting to the
+            // -1 sentinel when omitted.
+            let int_arg =
+                |obj: Option<pyre_object::PyObjectRef>| -> Result<libc::c_int, crate::PyError> {
+                match obj {
+                    Some(o) => Ok(crate::baseobjspace::int_w(o)? as libc::c_int),
+                    None => Ok(-1),
                 }
-            }
-            let mut family = match family_obj {
-                Some(o) => unsafe { pyre_object::w_int_get_value(o) as libc::c_int },
-                None => -1,
             };
-            let mut ty = match type_obj {
-                Some(o) => unsafe { pyre_object::w_int_get_value(o) as libc::c_int },
-                None => -1,
-            };
-            let mut proto = match proto_obj {
-                Some(o) => unsafe { pyre_object::w_int_get_value(o) as libc::c_int },
-                None => -1,
-            };
+            let mut family = int_arg(family_obj)?;
+            let mut ty = int_arg(type_obj)?;
+            let mut proto = int_arg(proto_obj)?;
             let has_fileno = match fileno_obj {
                 Some(o) => !unsafe { pyre_object::is_none(o) },
                 None => false,

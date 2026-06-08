@@ -115,12 +115,8 @@ pub fn register_module(ns: &mut DictStorage) {
                 ));
             }
             let fd = crate::baseobjspace::c_filedescriptor_w(args[0])?;
-            if !unsafe { pyre_object::is_int(args[1]) } {
-                return Err(crate::PyError::type_error(
-                    "tcsetattr: when must be an integer",
-                ));
-            }
-            let when = (unsafe { pyre_object::w_int_get_value(args[1]) }) as i32;
+            // `@unwrap_spec(when=int)`.
+            let when = crate::baseobjspace::int_w(args[1])? as i32;
             // interp_termios.py:24-27 — arg 3 must be a 7-element list,
             // unpacked via space.unpackiterable.
             let attrs = args[2];
@@ -219,12 +215,8 @@ pub fn register_module(ns: &mut DictStorage) {
                     ));
                 }
                 let fd = crate::baseobjspace::c_filedescriptor_w(args[0])?;
-                if !unsafe { pyre_object::is_int(args[1]) } {
-                    return Err(crate::PyError::type_error(
-                        "tcsendbreak: duration must be an integer",
-                    ));
-                }
-                let dur = (unsafe { pyre_object::w_int_get_value(args[1]) }) as i32;
+                // `@unwrap_spec(duration=int)`.
+                let dur = crate::baseobjspace::int_w(args[1])? as i32;
                 host_termios::tcsendbreak(fd, dur).map_err(|e| {
                     termios_converted_error(
                         e.raw_os_error().unwrap_or(0),
@@ -269,12 +261,8 @@ pub fn register_module(ns: &mut DictStorage) {
                     return Err(crate::PyError::type_error("tcflush() requires 2 arguments"));
                 }
                 let fd = crate::baseobjspace::c_filedescriptor_w(args[0])?;
-                if !unsafe { pyre_object::is_int(args[1]) } {
-                    return Err(crate::PyError::type_error(
-                        "tcflush: queue must be an integer",
-                    ));
-                }
-                let q = (unsafe { pyre_object::w_int_get_value(args[1]) }) as i32;
+                // `@unwrap_spec(queue=int)`.
+                let q = crate::baseobjspace::int_w(args[1])? as i32;
                 host_termios::tcflush(fd, q).map_err(|e| {
                     termios_converted_error(
                         e.raw_os_error().unwrap_or(0),
@@ -297,12 +285,8 @@ pub fn register_module(ns: &mut DictStorage) {
                     return Err(crate::PyError::type_error("tcflow() requires 2 arguments"));
                 }
                 let fd = crate::baseobjspace::c_filedescriptor_w(args[0])?;
-                if !unsafe { pyre_object::is_int(args[1]) } {
-                    return Err(crate::PyError::type_error(
-                        "tcflow: action must be an integer",
-                    ));
-                }
-                let action = (unsafe { pyre_object::w_int_get_value(args[1]) }) as i32;
+                // `@unwrap_spec(action=int)`.
+                let action = crate::baseobjspace::int_w(args[1])? as i32;
                 host_termios::tcflow(fd, action).map_err(|e| {
                     termios_converted_error(
                         e.raw_os_error().unwrap_or(0),
