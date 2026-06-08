@@ -3211,24 +3211,32 @@ impl<'a> Transformer<'a> {
     /// to separate greens from reds) so the caller can fall through to the
     /// regular direct-call handling.
     ///
-    /// Upstream also honours `jitdriver.active` (jtransform.py:1661-1662);
-    /// when `active=False` the marker is dropped. pyre has no `active` flag
-    /// yet — once annotator-level JitDriver config lands it can emit
-    /// `Some(Vec::new())` from this hook to match the `return []` shape.
+    /// Upstream also honours `jitdriver.active` (jtransform.py:1661-1662):
+    /// when `active=False` the marker is dropped (`return []`). The portal
+    /// driver's `active` flag is consulted below before any marker lowering;
+    /// pyre seeds it `true` at `setup_jitdriver`, so the drop branch is
+    /// inert today but matches the upstream shape.
     fn try_handle_jit_marker(
         &mut self,
         key: JitMarkerKey,
         args: &[crate::flowspace::model::Variable],
     ) -> Option<Vec<SpaceOperation>> {
+        let jitdriver_index = self.portal_jd_index?;
+        // jtransform.py:1661-1662 `if not jitdriver.active: return []` — a
+        // deactivated portal driver drops its markers before dispatch.
+        if let Some(cc) = self.callcontrol.as_deref()
+            && let Some(jd) = cc.jitdriver_sd_from_jitdriver(jitdriver_index)
+            && !jd.active
+        {
+            return Some(Vec::new());
+        }
         match key {
             JitMarkerKey::LoopHeader | JitMarkerKey::CanEnterJit => {
                 // jtransform.py:1723 `handle_jit_marker__can_enter_jit =
                 // handle_jit_marker__loop_header`.
-                let jitdriver_index = self.portal_jd_index?;
                 Some(self.handle_jit_marker__loop_header(jitdriver_index))
             }
             JitMarkerKey::JitMergePoint => {
-                let jitdriver_index = self.portal_jd_index?;
                 let cc = self.callcontrol.as_deref()?;
                 let jd = cc.jitdriver_sd_from_jitdriver(jitdriver_index)?;
                 let num_greens = jd.greens.len();

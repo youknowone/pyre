@@ -410,6 +410,12 @@ impl GreenFieldInfoHandle for StaticGreenFieldInfoHandle {
 pub struct JitDriverStaticData {
     /// RPython: `jitdriver_sd.index`
     pub index: usize,
+    /// RPython: `jitdriver.active` (jtransform.py:1661-1662). `True` by
+    /// default; a deactivated jitdriver drops its `jit_marker` ops at
+    /// rewrite time. pyre has no mechanism to deactivate a driver yet, so
+    /// this is seeded `true` at `setup_jitdriver`, but the gate is honoured
+    /// in `try_handle_jit_marker` to match the upstream `return []` shape.
+    pub active: bool,
     /// RPython: `jitdriver.greens` — loop-invariant variable names.
     pub greens: Vec<String>,
     /// RPython: `jitdriver.reds` — loop-variant variable names.
@@ -2163,6 +2169,7 @@ impl CallControl {
         );
         self.jitdrivers_sd.push(JitDriverStaticData {
             index,
+            active: true,
             greens,
             reds,
             virtualizables,
