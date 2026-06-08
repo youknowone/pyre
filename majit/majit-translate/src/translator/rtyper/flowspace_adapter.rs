@@ -2887,6 +2887,71 @@ mod tests {
     }
 
     #[test]
+    fn translate_op_call_function_path_exact_registry_wins_over_leaf_collision() {
+        // Two user fns share the bare leaf `shared_leaf` under different
+        // module paths, so `lookup_with_leaf_match` is ambiguous (distinct
+        // HostObjects → it returns None).  The exact `call_registry.lookup`
+        // runs first in the resolution order, so a FunctionPath spelling
+        // the full `othermod::shared_leaf` path resolves to that exact
+        // entry; were resolution to fall through to the leaf-match
+        // fallback it would error instead.  Locks in the
+        // exact-before-leaf-match precedence the resolver depends on.
+        use crate::flowspace::argument::Signature;
+        use crate::translator::rtyper::pyre_call_registry::FunctionPathKey;
+        let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
+        let graph = translate_op_test_graph(10);
+        value_map.insert(
+            graph.must_variable_at(1),
+            Hlvalue::Variable(Variable::new()),
+        );
+        value_map.insert(
+            graph.must_variable_at(2),
+            Hlvalue::Variable(Variable::new()),
+        );
+        let registry = empty_call_registry();
+        let other_entry = registry.get_or_register(
+            FunctionPathKey::from_segments(["othermod", "shared_leaf"]),
+            Signature::new(vec!["x".into()], None, None),
+        );
+        let mymod_entry = registry.get_or_register(
+            FunctionPathKey::from_segments(["mymod", "shared_leaf"]),
+            Signature::new(vec!["x".into()], None, None),
+        );
+        assert_ne!(
+            other_entry.host_object, mymod_entry.host_object,
+            "colliding-leaf entries must be distinct HostObjects"
+        );
+        let op = SpaceOperation {
+            result: Some(graph.must_variable_at(2)),
+            kind: OpKind::Call {
+                target: crate::model::CallTarget::FunctionPath {
+                    segments: vec!["othermod".into(), "shared_leaf".into()],
+                },
+                args: vec![graph.must_variable_at(1)],
+                result_ty: ValueType::Int,
+            },
+        };
+        let translated =
+            translate_op(&op, &value_map, &registry).expect("exact FunctionPath must lower");
+        let lowered = &translated[0];
+        assert_eq!(lowered.opname, "simple_call");
+        let Hlvalue::Constant(ref callable) = lowered.args[0] else {
+            panic!("simple_call callable must be a Constant");
+        };
+        let ConstValue::HostObject(ref host) = callable.value else {
+            panic!("FunctionPath callable must be ConstValue::HostObject");
+        };
+        assert_eq!(
+            host, &other_entry.host_object,
+            "exact registry lookup must win over the leaf-match fallback"
+        );
+        assert_ne!(
+            host, &mymod_entry.host_object,
+            "must not resolve to the colliding-leaf sibling"
+        );
+    }
+
+    #[test]
     fn translate_op_call_function_path_falls_back_to_host_env_builtin() {
         // Single-segment FunctionPath unregistered in PyreCallRegistry
         // falls back to HOST_ENV.lookup_builtin(name), letting frontend
