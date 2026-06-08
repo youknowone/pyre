@@ -3472,15 +3472,28 @@ fn try_fold_pure_call_via_executor(
 /// call regardless of EI.
 ///
 /// **Caller contract**:
-/// * `call_opcode` must be one of the non-elidable, non-may-force
-///   residual call shapes: `Call{I,R,F,N}` (the default arm) or
-///   `CallLoopinvariant{I,R,F,N}` (the `EF_LOOPINVARIANT` arm).
+/// * `call_opcode` must be one of the non-elidable residual call shapes:
+///   `Call{I,R,F,N}` (the default arm), `CallLoopinvariant{I,R,F,N}`
+///   (the `EF_LOOPINVARIANT` arm), or `CallMayForce{I,R,F,N}` (the
+///   `forces_virtual_or_virtualizable` arm — only when no active
+///   virtualizable is present, see force-virtual gate below).
 ///   * `CallPure*` is excluded — that's [`try_fold_pure_call_via_executor`]'s
 ///     job.
-///   * `CallMayForce*` / `CallReleaseGil*` / `CallAssembler*` are
-///     intentionally excluded: their trace-recording-time invariants
-///     (force-virtual audit, GIL transitions, jitdriver re-entry)
-///     need a separate audit (Task #390 sub-slice 4).
+///   * `CallReleaseGil*` / `CallAssembler*` are intentionally excluded:
+///     their trace-recording-time invariants (GIL transitions, jitdriver
+///     re-entry) need a separate audit (Task #390 sub-slice 4).
+///   * **`CallMayForce*` force-virtual gate**: PyPy `do_residual_call`
+///     (`pyjitpl.py:2017-2082`) concrete-executes every `CallMayForce*`
+///     via `executor.execute_varargs` and detects vable escape via the
+///     post-call `vinfo.tracing_after_residual_call(vbox)` heap probe.
+///     Pyre's walker leg lacks the post-call probe today (only the
+///     trait-driven leg has it at `state.rs MIFrame::vable_after_residual_call`,
+///     `trace_opcode.rs:2646`).  Until the walker counterpart lands,
+///     this function only admits `CallMayForce*` when the jitdriver has
+///     no active `standard_virtualizable_box()` — in that case there's
+///     no vable to force, so the after-check would be a no-op.  Active-
+///     vable `CallMayForce*` continues to decline (record-only), matching
+///     the current production behaviour.
 /// * `allboxes[0]` is the funcbox (per `build_allboxes` layout); the
 ///   remaining slots are user args in `descr.arg_types()` ABI order.
 ///
@@ -3513,7 +3526,7 @@ fn try_execute_residual_call_via_executor(
     call_descr: &dyn majit_ir::descr::CallDescr,
     recorded: OpRef,
 ) -> Option<Result<i64, i64>> {
-    if !matches!(
+    let plain_or_loopinvariant = matches!(
         call_opcode,
         OpCode::CallI
             | OpCode::CallR
@@ -3523,7 +3536,22 @@ fn try_execute_residual_call_via_executor(
             | OpCode::CallLoopinvariantR
             | OpCode::CallLoopinvariantF
             | OpCode::CallLoopinvariantN
-    ) {
+    );
+    // `CallMayForce*` is admitted only when no active virtualizable
+    // exists — otherwise the walker would need to call the missing
+    // `walker_vable_after_residual_call` post-check (see doc above).
+    // Mirrors `pyjitpl.py:2017-2082 do_residual_call`'s outer
+    // `forces_virtual_or_virtualizable` branch: with no vinfo box,
+    // `vable_after_residual_call` early-returns, so executing the
+    // helper here is safe.
+    let may_force_safe = matches!(
+        call_opcode,
+        OpCode::CallMayForceI
+            | OpCode::CallMayForceR
+            | OpCode::CallMayForceF
+            | OpCode::CallMayForceN
+    ) && ctx.trace_ctx.standard_virtualizable_box().is_none();
+    if !plain_or_loopinvariant && !may_force_safe {
         return None;
     }
     if allboxes.is_empty() {
