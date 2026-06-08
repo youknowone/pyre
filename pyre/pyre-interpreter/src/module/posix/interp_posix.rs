@@ -32,22 +32,19 @@ fn stat_result_seq_type() -> PyObjectRef {
                     "st_mode", "st_ino", "st_dev", "st_nlink", "st_uid", "st_gid", "st_size",
                     "_integer_atime", "_integer_mtime", "_integer_ctime",
                 ],
+                // `app_posix.py:38-69` — named-only extras ordered by their
+                // `structseqfield` index (11..13, 20..23, 40..42, 50..52).
+                // `structseq_descr_new` fills surplus sequence items into
+                // this list in order, so the list order must match PyPy's
+                // index sort, not the build-time population order.
                 &[
+                    // float times, indices 11..13.
                     "st_atime",
                     "st_mtime",
                     "st_ctime",
-                    "st_atime_ns",
-                    "st_mtime_ns",
-                    "st_ctime_ns",
-                    // `build_stat_result` (interp_posix.py:554-557) +
-                    // `rposix_stat.py STAT_FIELDS += ALL_STAT_FIELDS[-3:]`
-                    // — the sub-second nanosecond remainders, exposed on
-                    // every platform.
-                    "nsec_atime",
-                    "nsec_mtime",
-                    "nsec_ctime",
-                    // `app_posix.py:45-48` — present where the platform's
-                    // `struct stat` carries them (every Unix target).
+                    // `app_posix.py:45-52` — present where the platform's
+                    // `struct stat` carries them (every Unix target),
+                    // indices 20..23.
                     #[cfg(unix)]
                     "st_blksize",
                     #[cfg(unix)]
@@ -58,6 +55,16 @@ fn stat_result_seq_type() -> PyObjectRef {
                     // `struct stat` carries it (BSD family / macOS).
                     #[cfg(target_os = "macos")]
                     "st_flags",
+                    // `build_stat_result` (interp_posix.py:554-557) +
+                    // `rposix_stat.py STAT_FIELDS += ALL_STAT_FIELDS[-3:]`
+                    // — the sub-second nanosecond remainders, indices 40..42.
+                    "nsec_atime",
+                    "nsec_mtime",
+                    "nsec_ctime",
+                    // full nanosecond timestamps, indices 50..52.
+                    "st_atime_ns",
+                    "st_mtime_ns",
+                    "st_ctime_ns",
                 ],
             )
         })

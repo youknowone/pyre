@@ -315,6 +315,19 @@ fn structseq_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
         extras.push((ename.as_str(), value));
     }
 
+    // `app_posix.py:71-80 stat_result.__init__` — a tuple-constructed
+    // stat_result leaves the float `st_atime`/`st_mtime`/`st_ctime` extras
+    // as None; fall back to the integer timestamps at body slots 7..9.
+    if name == "os.stat_result" && body.len() > 9 {
+        for (slot, ename) in [(7usize, "st_atime"), (8, "st_mtime"), (9, "st_ctime")] {
+            if let Some(entry) = extras.iter_mut().find(|(n, _)| *n == ename) {
+                if unsafe { pyre_object::is_none(entry.1) } {
+                    entry.1 = body[slot];
+                }
+            }
+        }
+    }
+
     Ok(new_instance_with_extra(cls, body, extras))
 }
 
