@@ -2824,8 +2824,18 @@ pub(crate) fn collect_unsafe_fn_stubs_from_llbc(
             .split("::")
             .map(String::from)
             .collect();
+        // Prefer the Charon body's declared parameter names
+        // (`locals[1..=argc]`, the same source the regular lowering reads
+        // at `local.name`); fall back to positional `arg{N}` when the body
+        // is opaque or a local is unnamed.
+        let body = fd.unstructured();
         let argnames: Vec<String> = (0..fd.signature.inputs.len())
-            .map(|i| format!("arg{i}"))
+            .map(|i| {
+                body.as_ref()
+                    .and_then(|u| u.locals.locals.get(i + 1))
+                    .and_then(|l| l.name.clone())
+                    .unwrap_or_else(|| format!("arg{i}"))
+            })
             .collect();
         out.push((segments, Signature::new(argnames, None, None), lltype));
     }
