@@ -31,7 +31,7 @@ use std::rc::Rc;
 /// strong `Rc` instead of a flat position: `Op` ⇆ `OpRef::*Op`, `InputArg`
 /// ⇆ `OpRef::InputArg*`, `Const` ⇆ the inline `OpRef::Const*`, and `None` ⇆
 /// `OpRef::None` (an absent `fail_args` slot).
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum Operand {
     /// Absent slot — the mirror of `OpRef::None`.
     None,
@@ -201,26 +201,22 @@ impl Operand {
         }
     }
 
-    /// Classify a [`BoxRef`] into an [`Operand`] for the storage flip. Cleanly
-    /// bound producers shed the wrapper — a live `bound_op`/`bound_inputarg`
-    /// becomes a pure `Op`/`InputArg` (the `#9` win); the `None` sentinel
-    /// becomes `Operand::None`. Everything else — `Const` (kept `Cell`-backed
-    /// for the GC walk) and position-only boxes minted by `from_opref` with no
-    /// live producer to bind — is preserved verbatim as `Operand::Box`, so
-    /// `to_boxref` returns the same `Rc<Box>` and the flip is byte-identical.
-    /// Later slices grind the `Box` residue to zero.
+    /// Classify a [`BoxRef`] into an [`Operand`] for the storage flip.
+    ///
+    /// This slice is strictly behavior-preserving, so it sheds only the
+    /// identity-free `None` sentinel; every value-carrying box is kept verbatim
+    /// as `Operand::Box`, whose `to_boxref` returns the same `Rc<Box>` —
+    /// preserving box identity, the `Cell`-backed GC walk, AND the box's
+    /// snapshot `position` field. The last point matters: a bound `ResOp`
+    /// box's `to_opref` reads its own frozen `BoxKind::ResOp.position` Cell,
+    /// NOT the producer's live `op.pos`, and the optimizer's position-remap
+    /// (`optimizer.rs`) deliberately mutates `op.pos` before reading operand
+    /// positions — so shedding a bound `ResOp` to a live-tracking
+    /// `Operand::Op` here would double-remap. Shedding `Box` → `Op`/`InputArg`/
+    /// `Const` (and adapting those remap consumers) is a later slice.
     pub fn from_boxref(b: &BoxRef) -> Operand {
         if b.is_none() {
             return Operand::None;
-        }
-        if !b.is_constant() {
-            if b.is_inputarg() {
-                if let Some(ia) = b.bound_inputarg() {
-                    return Operand::InputArg(ia);
-                }
-            } else if let Some(op) = b.bound_op() {
-                return Operand::Op(op);
-            }
         }
         Operand::Box(b.clone())
     }
@@ -328,20 +324,26 @@ mod tests {
     }
 
     #[test]
-    fn from_boxref_sheds_wrapper_for_bound_keeps_box_for_rest() {
-        // Bound op -> pure Op, round-trips to the SAME memoized Rc<Box>.
+    fn from_boxref_is_byte_identical_keeps_every_value_box() {
+        // Behavior-preserving storage flip: every value-carrying box is kept
+        // verbatim as Operand::Box, returning the identical Rc<Box> on read so
+        // identity, type, position, and const value all round-trip exactly.
+
+        // Bound op -> kept as Box (its frozen `position` snapshot is preserved,
+        // not replaced by the producer's live op.pos).
         let op = op_at(8, Type::Int);
         let bound = BoxRef::from_bound_op(&op);
         let o = Operand::from_boxref(&bound);
+        assert!(matches!(o, Operand::Box(_)));
         assert!(o.is_resop());
-        assert!(matches!(o, Operand::Op(_)));
         assert_eq!(o.to_boxref().as_ptr(), bound.as_ptr());
 
-        // Bound input arg -> pure InputArg.
+        // Bound input arg -> kept as Box.
         let ia = Rc::new(InputArg::from_type(Type::Ref, 2));
         let bia = BoxRef::from_bound_inputarg(&ia);
         let o = Operand::from_boxref(&bia);
-        assert!(matches!(o, Operand::InputArg(_)));
+        assert!(matches!(o, Operand::Box(_)));
+        assert!(o.is_inputarg());
         assert_eq!(o.to_boxref().as_ptr(), bia.as_ptr());
 
         // Const -> kept as Box (Cell-backed), round-trips to the same box.
@@ -360,7 +362,7 @@ mod tests {
         assert_eq!(o.position(), Some(4));
         assert_eq!(o.to_boxref().as_ptr(), pos_only.as_ptr());
 
-        // None sentinel -> Operand::None.
+        // None sentinel -> Operand::None (identity-free, byte-identical).
         assert!(matches!(Operand::from_boxref(&BoxRef::none()), Operand::None));
     }
 }

@@ -7,6 +7,7 @@
 use smallvec::SmallVec;
 
 use crate::box_ref::{BoxRef, Forwarded};
+use crate::operand::Operand;
 use crate::descr::DescrRef;
 use crate::value::{GcRef, Type, Value};
 
@@ -1252,7 +1253,14 @@ pub struct Op {
     /// via `Rc<Op>` — RPython writes
     /// `op._args[i] = ...` on the same Python object the trace list,
     /// optimizer state, and backend input lists all observe.
-    pub args: std::cell::RefCell<SmallVec<[BoxRef; 3]>>,
+    ///
+    /// `#9` operand-union flip: each slot is an [`Operand`] (a bound
+    /// producer carried by `Rc`, an inline `Const`, or — during the
+    /// migration window — a `Operand::Box` wrapping a not-yet-converted
+    /// `BoxRef`). The `BoxRef`-keyed accessors (`arg`, `getarglist`, ...)
+    /// convert on read/write via `Operand::to_boxref` / `from_boxref`, so
+    /// the flip is behavior-preserving while callers migrate.
+    pub args: std::cell::RefCell<SmallVec<[Operand; 3]>>,
     /// `resoperation.py:460 ResOpWithDescr._descr` parity.  `RefCell`
     /// so the optimizer can stamp a descr onto a shared `Op` reached
     /// through `Rc<Op>`: RPython's
@@ -1468,7 +1476,7 @@ impl Op {
     pub fn new(opcode: OpCode, args: &[BoxRef]) -> Self {
         Op {
             opcode,
-            args: std::cell::RefCell::new(args.iter().cloned().collect()),
+            args: std::cell::RefCell::new(args.iter().map(Operand::from_boxref).collect()),
             descr: std::cell::RefCell::new(None),
             pos: std::cell::Cell::new(OpRef::NONE),
             type_: opcode.result_type(),
@@ -1485,7 +1493,7 @@ impl Op {
     pub fn with_descr(opcode: OpCode, args: &[BoxRef], descr: DescrRef) -> Self {
         Op {
             opcode,
-            args: std::cell::RefCell::new(args.iter().cloned().collect()),
+            args: std::cell::RefCell::new(args.iter().map(Operand::from_boxref).collect()),
             descr: std::cell::RefCell::new(Some(descr)),
             pos: std::cell::Cell::new(OpRef::NONE),
             type_: opcode.result_type(),
@@ -1500,7 +1508,7 @@ impl Op {
     }
 
     pub fn arg(&self, idx: usize) -> BoxRef {
-        self.args.borrow()[idx].clone()
+        self.args.borrow()[idx].to_boxref()
     }
 
     pub fn num_args(&self) -> usize {
@@ -1542,8 +1550,8 @@ impl Op {
         args: Option<&[BoxRef]>,
         descr: Option<Option<DescrRef>>,
     ) -> Op {
-        let new_args: SmallVec<[BoxRef; 3]> = match args {
-            Some(a) => a.iter().cloned().collect(),
+        let new_args: SmallVec<[Operand; 3]> = match args {
+            Some(a) => a.iter().map(Operand::from_boxref).collect(),
             None => self.args.borrow().clone(),
         };
         let new_descr = match descr {
@@ -4750,7 +4758,7 @@ mod tests {
         let ops = vec![
             op! {
                 opcode: OpCode::IntAdd,
-                args: std::cell::RefCell::new(smallvec::smallvec![BoxRef::from_opref(OpRef::int_op(1)), BoxRef::from_opref(OpRef::int_op(2))]),
+                args: std::cell::RefCell::new(smallvec::smallvec![Operand::Box(BoxRef::from_opref(OpRef::int_op(1))), Operand::Box(BoxRef::from_opref(OpRef::int_op(2)))]),
                 descr: std::cell::RefCell::new(None),
                 pos: std::cell::Cell::new(OpRef::int_op(3)),
                 fail_args: std::cell::RefCell::new(None),
@@ -4761,7 +4769,7 @@ mod tests {
             },
             op! {
                 opcode: OpCode::IntAdd,
-                args: std::cell::RefCell::new(smallvec::smallvec![BoxRef::from_opref(OpRef::int_op(3)), BoxRef::from_opref(OpRef::int_op(10_000))]),
+                args: std::cell::RefCell::new(smallvec::smallvec![Operand::Box(BoxRef::from_opref(OpRef::int_op(3))), Operand::Box(BoxRef::from_opref(OpRef::int_op(10_000)))]),
                 descr: std::cell::RefCell::new(None),
                 pos: std::cell::Cell::new(OpRef::int_op(4)),
                 fail_args: std::cell::RefCell::new(None),
@@ -4772,7 +4780,7 @@ mod tests {
             },
             op! {
                 opcode: OpCode::Jump,
-                args: std::cell::RefCell::new(smallvec::smallvec![BoxRef::from_opref(OpRef::int_op(0)), BoxRef::from_opref(OpRef::int_op(4)), BoxRef::from_opref(OpRef::int_op(3))]),
+                args: std::cell::RefCell::new(smallvec::smallvec![Operand::Box(BoxRef::from_opref(OpRef::int_op(0))), Operand::Box(BoxRef::from_opref(OpRef::int_op(4))), Operand::Box(BoxRef::from_opref(OpRef::int_op(3)))]),
                 descr: std::cell::RefCell::new(None),
                 pos: std::cell::Cell::new(OpRef::NONE),
                 fail_args: std::cell::RefCell::new(None),
@@ -4795,7 +4803,7 @@ mod tests {
     fn test_op_display_int_result() {
         let op = op! {
             opcode: OpCode::IntAdd,
-            args: std::cell::RefCell::new(smallvec::smallvec![BoxRef::from_opref(OpRef::int_op(1)), BoxRef::from_opref(OpRef::int_op(2))]),
+            args: std::cell::RefCell::new(smallvec::smallvec![Operand::Box(BoxRef::from_opref(OpRef::int_op(1))), Operand::Box(BoxRef::from_opref(OpRef::int_op(2)))]),
             descr: std::cell::RefCell::new(None),
             pos: std::cell::Cell::new(OpRef::int_op(6)),
             fail_args: std::cell::RefCell::new(None),
@@ -4812,7 +4820,7 @@ mod tests {
     fn test_op_display_void() {
         let op = op! {
             opcode: OpCode::SetfieldGc,
-            args: std::cell::RefCell::new(smallvec::smallvec![BoxRef::from_opref(OpRef::int_op(0)), BoxRef::from_opref(OpRef::int_op(1))]),
+            args: std::cell::RefCell::new(smallvec::smallvec![Operand::Box(BoxRef::from_opref(OpRef::int_op(0))), Operand::Box(BoxRef::from_opref(OpRef::int_op(1)))]),
             descr: std::cell::RefCell::new(None),
             pos: std::cell::Cell::new(OpRef::NONE),
             fail_args: std::cell::RefCell::new(None),
@@ -4829,7 +4837,7 @@ mod tests {
     fn test_op_display_guard_with_fail_args() {
         let op = op! {
             opcode: OpCode::GuardTrue,
-            args: std::cell::RefCell::new(smallvec::smallvec![BoxRef::from_opref(OpRef::int_op(0))]),
+            args: std::cell::RefCell::new(smallvec::smallvec![Operand::Box(BoxRef::from_opref(OpRef::int_op(0)))]),
             descr: std::cell::RefCell::new(None),
             pos: std::cell::Cell::new(OpRef::NONE),
             fail_args: std::cell::RefCell::new(Some(smallvec::smallvec![BoxRef::from_opref(OpRef::int_op(0)), BoxRef::from_opref(OpRef::int_op(1))])),
@@ -4847,7 +4855,7 @@ mod tests {
     fn test_op_display_guard_without_fail_args() {
         let op = op! {
             opcode: OpCode::GuardTrue,
-            args: std::cell::RefCell::new(smallvec::smallvec![BoxRef::from_opref(OpRef::int_op(0))]),
+            args: std::cell::RefCell::new(smallvec::smallvec![Operand::Box(BoxRef::from_opref(OpRef::int_op(0)))]),
             descr: std::cell::RefCell::new(None),
             pos: std::cell::Cell::new(OpRef::NONE),
             fail_args: std::cell::RefCell::new(None),
@@ -4864,7 +4872,7 @@ mod tests {
     fn test_format_trace_constants_rendered_with_values() {
         let ops = vec![op! {
             opcode: OpCode::IntAdd,
-            args: std::cell::RefCell::new(smallvec::smallvec![BoxRef::from_opref(OpRef::int_op(0)), BoxRef::from_opref(OpRef::int_op(10_000))]),
+            args: std::cell::RefCell::new(smallvec::smallvec![Operand::Box(BoxRef::from_opref(OpRef::int_op(0))), Operand::Box(BoxRef::from_opref(OpRef::int_op(10_000)))]),
             descr: std::cell::RefCell::new(None),
             pos: std::cell::Cell::new(OpRef::int_op(1)),
             fail_args: std::cell::RefCell::new(None),
@@ -4885,7 +4893,7 @@ mod tests {
         let ops = vec![
             op! {
                 opcode: OpCode::IntAdd,
-                args: std::cell::RefCell::new(smallvec::smallvec![BoxRef::from_opref(OpRef::int_op(0)), BoxRef::from_opref(OpRef::int_op(10_000))]),
+                args: std::cell::RefCell::new(smallvec::smallvec![Operand::Box(BoxRef::from_opref(OpRef::int_op(0))), Operand::Box(BoxRef::from_opref(OpRef::int_op(10_000)))]),
                 descr: std::cell::RefCell::new(None),
                 pos: std::cell::Cell::new(OpRef::int_op(1)),
                 fail_args: std::cell::RefCell::new(None),
@@ -4896,7 +4904,7 @@ mod tests {
             },
             op! {
                 opcode: OpCode::GuardTrue,
-                args: std::cell::RefCell::new(smallvec::smallvec![BoxRef::from_opref(OpRef::int_op(0))]),
+                args: std::cell::RefCell::new(smallvec::smallvec![Operand::Box(BoxRef::from_opref(OpRef::int_op(0)))]),
                 descr: std::cell::RefCell::new(None),
                 pos: std::cell::Cell::new(OpRef::NONE),
                 fail_args: std::cell::RefCell::new(Some(smallvec::smallvec![BoxRef::from_opref(OpRef::int_op(0)), BoxRef::from_opref(OpRef::int_op(1))])),
@@ -4907,7 +4915,7 @@ mod tests {
             },
             op! {
                 opcode: OpCode::Finish,
-                args: std::cell::RefCell::new(smallvec::smallvec![BoxRef::from_opref(OpRef::int_op(1))]),
+                args: std::cell::RefCell::new(smallvec::smallvec![Operand::Box(BoxRef::from_opref(OpRef::int_op(1)))]),
                 descr: std::cell::RefCell::new(None),
                 pos: std::cell::Cell::new(OpRef::NONE),
                 fail_args: std::cell::RefCell::new(None),
@@ -4928,7 +4936,7 @@ mod tests {
     fn test_format_trace_constants_in_fail_args() {
         let ops = vec![op! {
             opcode: OpCode::GuardTrue,
-            args: std::cell::RefCell::new(smallvec::smallvec![BoxRef::from_opref(OpRef::int_op(0))]),
+            args: std::cell::RefCell::new(smallvec::smallvec![Operand::Box(BoxRef::from_opref(OpRef::int_op(0)))]),
             descr: std::cell::RefCell::new(None),
             pos: std::cell::Cell::new(OpRef::NONE),
             fail_args: std::cell::RefCell::new(Some(smallvec::smallvec![BoxRef::from_opref(OpRef::int_op(0)), BoxRef::from_opref(OpRef::int_op(10_000))])),
@@ -4961,7 +4969,7 @@ mod tests {
         let ops = vec![
             op! {
                 opcode: OpCode::Label,
-                args: std::cell::RefCell::new(smallvec::smallvec![BoxRef::from_opref(OpRef::int_op(0)), BoxRef::from_opref(OpRef::int_op(1)), BoxRef::from_opref(OpRef::int_op(2))]),
+                args: std::cell::RefCell::new(smallvec::smallvec![Operand::Box(BoxRef::from_opref(OpRef::int_op(0))), Operand::Box(BoxRef::from_opref(OpRef::int_op(1))), Operand::Box(BoxRef::from_opref(OpRef::int_op(2)))]),
                 descr: std::cell::RefCell::new(None),
                 pos: std::cell::Cell::new(OpRef::NONE),
                 fail_args: std::cell::RefCell::new(None),
@@ -4972,7 +4980,7 @@ mod tests {
             },
             op! {
                 opcode: OpCode::IntAdd,
-                args: std::cell::RefCell::new(smallvec::smallvec![BoxRef::from_opref(OpRef::int_op(1)), BoxRef::from_opref(OpRef::int_op(2))]),
+                args: std::cell::RefCell::new(smallvec::smallvec![Operand::Box(BoxRef::from_opref(OpRef::int_op(1))), Operand::Box(BoxRef::from_opref(OpRef::int_op(2)))]),
                 descr: std::cell::RefCell::new(None),
                 pos: std::cell::Cell::new(OpRef::int_op(3)),
                 fail_args: std::cell::RefCell::new(None),
@@ -4983,7 +4991,7 @@ mod tests {
             },
             op! {
                 opcode: OpCode::IntAdd,
-                args: std::cell::RefCell::new(smallvec::smallvec![BoxRef::from_opref(OpRef::int_op(3)), BoxRef::from_opref(OpRef::int_op(10_000))]),
+                args: std::cell::RefCell::new(smallvec::smallvec![Operand::Box(BoxRef::from_opref(OpRef::int_op(3))), Operand::Box(BoxRef::from_opref(OpRef::int_op(10_000)))]),
                 descr: std::cell::RefCell::new(None),
                 pos: std::cell::Cell::new(OpRef::int_op(4)),
                 fail_args: std::cell::RefCell::new(None),
@@ -4994,7 +5002,7 @@ mod tests {
             },
             op! {
                 opcode: OpCode::Jump,
-                args: std::cell::RefCell::new(smallvec::smallvec![BoxRef::from_opref(OpRef::int_op(0)), BoxRef::from_opref(OpRef::int_op(4)), BoxRef::from_opref(OpRef::int_op(3))]),
+                args: std::cell::RefCell::new(smallvec::smallvec![Operand::Box(BoxRef::from_opref(OpRef::int_op(0))), Operand::Box(BoxRef::from_opref(OpRef::int_op(4))), Operand::Box(BoxRef::from_opref(OpRef::int_op(3)))]),
                 descr: std::cell::RefCell::new(None),
                 pos: std::cell::Cell::new(OpRef::NONE),
                 fail_args: std::cell::RefCell::new(None),
@@ -5028,7 +5036,7 @@ mod tests {
         let ops = vec![
             op! {
                 opcode: OpCode::IntSub,
-                args: std::cell::RefCell::new(smallvec::smallvec![BoxRef::from_opref(OpRef::int_op(0)), BoxRef::from_opref(OpRef::int_op(10_000))]),
+                args: std::cell::RefCell::new(smallvec::smallvec![Operand::Box(BoxRef::from_opref(OpRef::int_op(0))), Operand::Box(BoxRef::from_opref(OpRef::int_op(10_000)))]),
                 descr: std::cell::RefCell::new(None),
                 pos: std::cell::Cell::new(OpRef::int_op(1)),
                 fail_args: std::cell::RefCell::new(None),
@@ -5039,7 +5047,7 @@ mod tests {
             },
             op! {
                 opcode: OpCode::IntGt,
-                args: std::cell::RefCell::new(smallvec::smallvec![BoxRef::from_opref(OpRef::int_op(1)), BoxRef::from_opref(OpRef::int_op(10_001))]),
+                args: std::cell::RefCell::new(smallvec::smallvec![Operand::Box(BoxRef::from_opref(OpRef::int_op(1))), Operand::Box(BoxRef::from_opref(OpRef::int_op(10_001)))]),
                 descr: std::cell::RefCell::new(None),
                 pos: std::cell::Cell::new(OpRef::int_op(2)),
                 fail_args: std::cell::RefCell::new(None),
@@ -5050,7 +5058,7 @@ mod tests {
             },
             op! {
                 opcode: OpCode::GuardTrue,
-                args: std::cell::RefCell::new(smallvec::smallvec![BoxRef::from_opref(OpRef::int_op(2))]),
+                args: std::cell::RefCell::new(smallvec::smallvec![Operand::Box(BoxRef::from_opref(OpRef::int_op(2)))]),
                 descr: std::cell::RefCell::new(None),
                 pos: std::cell::Cell::new(OpRef::NONE),
                 fail_args: std::cell::RefCell::new(Some(smallvec::smallvec![BoxRef::from_opref(OpRef::int_op(0)), BoxRef::from_opref(OpRef::int_op(1))])),
@@ -5061,7 +5069,7 @@ mod tests {
             },
             op! {
                 opcode: OpCode::Finish,
-                args: std::cell::RefCell::new(smallvec::smallvec![BoxRef::from_opref(OpRef::int_op(1))]),
+                args: std::cell::RefCell::new(smallvec::smallvec![Operand::Box(BoxRef::from_opref(OpRef::int_op(1)))]),
                 descr: std::cell::RefCell::new(None),
                 pos: std::cell::Cell::new(OpRef::NONE),
                 fail_args: std::cell::RefCell::new(None),
@@ -5124,7 +5132,7 @@ mod tests {
         let ops = vec![
             op! {
                 opcode: OpCode::Label,
-                args: std::cell::RefCell::new(smallvec::smallvec![BoxRef::from_opref(OpRef::int_op(0)), BoxRef::from_opref(OpRef::int_op(1))]),
+                args: std::cell::RefCell::new(smallvec::smallvec![Operand::Box(BoxRef::from_opref(OpRef::int_op(0))), Operand::Box(BoxRef::from_opref(OpRef::int_op(1)))]),
                 descr: std::cell::RefCell::new(None),
                 pos: std::cell::Cell::new(OpRef::NONE),
                 fail_args: std::cell::RefCell::new(None),
@@ -5135,7 +5143,7 @@ mod tests {
             },
             op! {
                 opcode: OpCode::IntAdd,
-                args: std::cell::RefCell::new(smallvec::smallvec![BoxRef::from_opref(OpRef::int_op(0)), BoxRef::from_opref(OpRef::int_op(1))]),
+                args: std::cell::RefCell::new(smallvec::smallvec![Operand::Box(BoxRef::from_opref(OpRef::int_op(0))), Operand::Box(BoxRef::from_opref(OpRef::int_op(1)))]),
                 descr: std::cell::RefCell::new(None),
                 pos: std::cell::Cell::new(OpRef::int_op(2)),
                 fail_args: std::cell::RefCell::new(None),
@@ -5146,7 +5154,7 @@ mod tests {
             },
             op! {
                 opcode: OpCode::IntLt,
-                args: std::cell::RefCell::new(smallvec::smallvec![BoxRef::from_opref(OpRef::int_op(2)), BoxRef::from_opref(OpRef::int_op(10_000))]),
+                args: std::cell::RefCell::new(smallvec::smallvec![Operand::Box(BoxRef::from_opref(OpRef::int_op(2))), Operand::Box(BoxRef::from_opref(OpRef::int_op(10_000)))]),
                 descr: std::cell::RefCell::new(None),
                 pos: std::cell::Cell::new(OpRef::int_op(3)),
                 fail_args: std::cell::RefCell::new(None),
@@ -5157,7 +5165,7 @@ mod tests {
             },
             op! {
                 opcode: OpCode::GuardTrue,
-                args: std::cell::RefCell::new(smallvec::smallvec![BoxRef::from_opref(OpRef::int_op(3))]),
+                args: std::cell::RefCell::new(smallvec::smallvec![Operand::Box(BoxRef::from_opref(OpRef::int_op(3)))]),
                 descr: std::cell::RefCell::new(None),
                 pos: std::cell::Cell::new(OpRef::NONE),
                 fail_args: std::cell::RefCell::new(Some(smallvec::smallvec![BoxRef::from_opref(OpRef::int_op(0)), BoxRef::from_opref(OpRef::int_op(2))])),
@@ -5168,7 +5176,7 @@ mod tests {
             },
             op! {
                 opcode: OpCode::IntSub,
-                args: std::cell::RefCell::new(smallvec::smallvec![BoxRef::from_opref(OpRef::int_op(0)), BoxRef::from_opref(OpRef::int_op(10_001))]),
+                args: std::cell::RefCell::new(smallvec::smallvec![Operand::Box(BoxRef::from_opref(OpRef::int_op(0))), Operand::Box(BoxRef::from_opref(OpRef::int_op(10_001)))]),
                 descr: std::cell::RefCell::new(None),
                 pos: std::cell::Cell::new(OpRef::int_op(4)),
                 fail_args: std::cell::RefCell::new(None),
@@ -5179,7 +5187,7 @@ mod tests {
             },
             op! {
                 opcode: OpCode::Jump,
-                args: std::cell::RefCell::new(smallvec::smallvec![BoxRef::from_opref(OpRef::int_op(4)), BoxRef::from_opref(OpRef::int_op(2))]),
+                args: std::cell::RefCell::new(smallvec::smallvec![Operand::Box(BoxRef::from_opref(OpRef::int_op(4))), Operand::Box(BoxRef::from_opref(OpRef::int_op(2)))]),
                 descr: std::cell::RefCell::new(None),
                 pos: std::cell::Cell::new(OpRef::NONE),
                 fail_args: std::cell::RefCell::new(None),
@@ -5213,7 +5221,7 @@ mod tests {
         let ops = vec![
             op! {
                 opcode: OpCode::GuardTrue,
-                args: std::cell::RefCell::new(smallvec::smallvec![BoxRef::from_opref(OpRef::int_op(0))]),
+                args: std::cell::RefCell::new(smallvec::smallvec![Operand::Box(BoxRef::from_opref(OpRef::int_op(0)))]),
                 descr: std::cell::RefCell::new(None),
                 pos: std::cell::Cell::new(OpRef::NONE),
                 fail_args: std::cell::RefCell::new(Some(smallvec::smallvec![BoxRef::from_opref(OpRef::int_op(0))])),
@@ -5224,7 +5232,7 @@ mod tests {
             },
             op! {
                 opcode: OpCode::GuardFalse,
-                args: std::cell::RefCell::new(smallvec::smallvec![BoxRef::from_opref(OpRef::int_op(1))]),
+                args: std::cell::RefCell::new(smallvec::smallvec![Operand::Box(BoxRef::from_opref(OpRef::int_op(1)))]),
                 descr: std::cell::RefCell::new(None),
                 pos: std::cell::Cell::new(OpRef::NONE),
                 fail_args: std::cell::RefCell::new(Some(smallvec::smallvec![BoxRef::from_opref(OpRef::int_op(0)), BoxRef::from_opref(OpRef::int_op(1)), BoxRef::from_opref(OpRef::int_op(2))])),
