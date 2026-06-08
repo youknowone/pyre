@@ -3023,10 +3023,11 @@ pub struct LoweringContext {
     /// `call_fn_N` descrs-pool indices for nargs ∈ 0..=8 — see
     /// codewriter.rs:3206-3245 for the production source.  CALL
     /// (single HLOp opname `simple_call`) lowers to
-    /// `residual_call_r_r(call_fn_N_idx, [frame, callable, arg0, ...],
-    /// Descr) → reg`; `simple_call` itself carries only
-    /// `(callable, args...)` and the lowering arm prepends the pyre
-    /// explicit-frame ABI operand.
+    /// `residual_call_r_r(call_fn_N_idx, [callable, arg0, ...],
+    /// Descr) → reg`; the lowered ListR is frame-less
+    /// (`jtransform.py:414 rewrite_call`) — the parent frame is
+    /// resolved at runtime inside the call helper, not threaded as a
+    /// leading operand.
     /// Indexed by nargs (`call_fn_idx_by_nargs[nargs]`) per
     /// [[feedback-no-hashmap-ever]] — `[u16; 9]` keeps the
     /// statically-known 0..=8 arity range position-indexed.
@@ -4107,9 +4108,10 @@ where
 
 /// Lower a CALL-family pre-rtype HLOp `simple_call(callable, arg0,
 /// arg1, ..., argN-1)` → `result: Ref` to the equivalent post-rtype
-/// `residual_call_r_r(ConstInt(call_fn_N_idx), ListR([frame, callable,
-/// arg0, ...]), Descr) → reg` Insn.  Mirrors the inline emit at
-/// codewriter.rs:6171-6179 (`build_call_fn_residual_call_r_r_insn`).
+/// `residual_call_r_r(ConstInt(call_fn_N_idx), ListR([callable,
+/// arg0, ...]), Descr) → reg` Insn — frame-less, matching RPython
+/// `jtransform.py:414 rewrite_call` (the lowered ListR shape is
+/// detailed in the body comment below).
 ///
 /// Arity dispatch: nargs = op.args.len() - 1 selects
 /// `ctx.call_fn_idx_by_nargs[nargs]`.  Walker contract: CALL with
