@@ -146,6 +146,11 @@ fn build_semantic_program_via_active_frontend(
                     .map(|p| p.to_string_lossy().into_owned())
                     .collect()
             })
+            // A present-but-blank override (`PYRE_MIR_FRONTEND_LLBC=`)
+            // collects to an empty vec; treat it as unset so workspace
+            // auto-discovery still runs instead of feeding an empty LLBC
+            // set into the frontend.
+            .filter(|paths: &Vec<String>| !paths.is_empty())
             .or_else(|| auto_discover_workspace_llbc_paths(module_paths));
         if let Some(paths) = resolved_paths {
             let llbcs: Vec<majit_charon_reader::Llbc> = paths
