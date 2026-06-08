@@ -5654,7 +5654,7 @@ pub fn space_index(obj: PyObjectRef) -> Result<PyObjectRef, PyError> {
     let Some(method) = (unsafe { lookup(obj, "__index__") }) else {
         return Err(PyError::type_error(format!(
             "'{}' object cannot be interpreted as an integer",
-            unsafe { (*(*obj).ob_type).name },
+            object_functionstr_type_name(obj),
         )));
     };
     let w_result = crate::builtins::call_and_check(method, &[obj])?;
@@ -5663,7 +5663,7 @@ pub fn space_index(obj: PyObjectRef) -> Result<PyObjectRef, PyError> {
     }
     Err(PyError::type_error(format!(
         "__index__ returned non-int (type {})",
-        unsafe { (*(*w_result).ob_type).name },
+        object_functionstr_type_name(w_result),
     )))
 }
 
