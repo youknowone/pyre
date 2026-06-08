@@ -1415,7 +1415,7 @@ impl Bookkeeper {
     /// `bookkeeper.py:339-345`, `uid.py:24-48`); there is no
     /// name->classdef path.  Pyre mirrors this by resolving the
     /// type-root string to a host class OBJECT exactly once
-    /// ([`Self::intern_struct_root_class`]), then routing through the
+    /// ([`Self::intern_class_by_qualname`]), then routing through the
     /// existing [`Self::getuniqueclassdef`] so the `ClassDef` lands in
     /// `descs`/`classdefs` keyed by identity.
     ///
@@ -1441,7 +1441,7 @@ impl Bookkeeper {
     ) -> Result<Rc<RefCell<ClassDef>>, AnnotatorError> {
         // Pass 1 — traverse the registry's struct-field graph from `root`,
         // registering an identity-keyed `ClassDef` in `descs` for every
-        // reachable struct (via `intern_struct_root_class` ->
+        // reachable struct (via `intern_class_by_qualname` ->
         // `getuniqueclassdef`).  `project_pyre_field_type`'s bare-name arm
         // resolves inner struct references through the same identity path,
         // so it sees the registered classdef.  Registration is idempotent
@@ -1463,12 +1463,12 @@ impl Bookkeeper {
             }
             // Register the node's identity ClassDef in `descs` (RPython's
             // HostObject-identity cache, bookkeeper.py:361) via
-            // `intern_struct_root_class` -> `getuniqueclassdef`.  Idempotent:
+            // `intern_class_by_qualname` -> `getuniqueclassdef`.  Idempotent:
             // interning resolves the type-root name to one stable
             // `HostObject`, so `getuniqueclassdef` returns the same
             // `ClassDef` on every call — the identity cache is the memo, no
             // name-keyed side table needed.
-            let host = self.intern_struct_root_class(&n);
+            let host = self.intern_class_by_qualname(&n);
             self.getuniqueclassdef(&host)?;
             let referenced: Vec<String> = {
                 let guard = self.pyre_struct_fields.borrow();
@@ -1514,7 +1514,7 @@ impl Bookkeeper {
             let Some(fields) = fields else {
                 continue;
             };
-            let host = self.intern_struct_root_class(n);
+            let host = self.intern_class_by_qualname(n);
             let classdef = self.getuniqueclassdef(&host)?;
             for (field_name, field_ty) in &fields {
                 if field_name == "__class__" {
@@ -1531,7 +1531,7 @@ impl Bookkeeper {
                 }
             }
         }
-        let host = self.intern_struct_root_class(root);
+        let host = self.intern_class_by_qualname(root);
         self.getuniqueclassdef(&host)
     }
 
@@ -1542,7 +1542,7 @@ impl Bookkeeper {
     /// `getuniqueclassdef` return the SAME `ClassDef` for repeated
     /// lookups of one type-root — the pyre analog of resolving a type
     /// name to one class object before `getuniqueclassdef(cls)`.
-    fn intern_struct_root_class(self: &Rc<Self>, name: &str) -> HostObject {
+    pub fn intern_class_by_qualname(self: &Rc<Self>, name: &str) -> HostObject {
         if let Some(existing) = self.pyre_struct_root_classes.borrow().get(name) {
             return existing.clone();
         }
@@ -1692,12 +1692,12 @@ impl Bookkeeper {
             return SomeValue::Impossible;
         }
         // Resolve the struct-typed field to its identity-registered
-        // `ClassDef` through `descs` (`intern_struct_root_class` ->
+        // `ClassDef` through `descs` (`intern_class_by_qualname` ->
         // `getuniqueclassdef`), the same identity path
         // `getuniqueclassdef_for_struct_root` registers it on.  Pass-1 of
         // that method has already registered every reachable struct, so this
         // returns the same `ClassDef` Rc whose `attrs` pass-2 fills in place.
-        let host = self.intern_struct_root_class(stripped);
+        let host = self.intern_class_by_qualname(stripped);
         match self.getuniqueclassdef(&host) {
             Ok(classdef) => SomeValue::Instance(super::model::SomeInstance::new(
                 Some(classdef),

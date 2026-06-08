@@ -1287,14 +1287,27 @@ pub fn translate_op(
                     // `StepResult::Continue` vs `JitAction::Continue`)
                     // produce different ClassDescs.  Falls back to the
                     // bare leaf when no owner was recorded (Ok/Err/Some).
-                    let qualname = if owner_path.is_empty() {
-                        name.clone()
+                    // Intern the ctor class by its qualified qualname so
+                    // every site shares one `HostObject` Arc — the
+                    // singleton-class identity `getdesc` dedups on
+                    // (`bookkeeper.rs:1040`, keyed by `Arc::ptr_eq`).
+                    // Without interning each site mints a fresh Arc → a
+                    // fresh `ClassDesc` per occurrence, so a class can
+                    // never be numbered once (its `minid` would differ per
+                    // site) nor instantiated consistently across graphs.
+                    // The bare-leaf fallback (`owner_path` empty, only
+                    // reached when the type failed to resolve) is NOT
+                    // interned: a bare variant name like `Ok` is ambiguous
+                    // across enums, so interning it would conflate distinct
+                    // classes onto one `ClassDesc`.
+                    let host = if owner_path.is_empty() {
+                        HostObject::new_class(name.clone(), Vec::new())
                     } else {
-                        format!("{}.{}", owner_path.join("."), name)
+                        let qualname = format!("{}.{}", owner_path.join("."), name);
+                        call_registry.bookkeeper().intern_class_by_qualname(&qualname)
                     };
-                    let callable = Hlvalue::Constant(Constant::new(ConstValue::HostObject(
-                        HostObject::new_class(qualname, Vec::new()),
-                    )));
+                    let callable =
+                        Hlvalue::Constant(Constant::new(ConstValue::HostObject(host)));
                     let mut call_args = Vec::with_capacity(arg_hls.len() + 1);
                     call_args.push(callable);
                     call_args.extend(arg_hls);
