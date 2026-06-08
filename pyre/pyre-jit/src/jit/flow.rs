@@ -789,6 +789,19 @@ pub struct Link {
     /// Exception-passing variables attached to the edge.
     pub last_exception: Option<Variable>,
     pub last_exc_value: Option<Variable>,
+    /// Raised-value Variable for an explicit-raise edge (pyre adaptation).
+    ///
+    /// pyre's `attach_catch_exception_edge` wires an explicit `raise X`
+    /// inside a try block directly to its catch landing rather than to
+    /// `graph.exceptblock` (where RPython's `make_exception_link` would
+    /// read `link.args[1]` as the raised value).  The landing's
+    /// `last_exception` / `last_exc_value` are fresh read-back Variables,
+    /// not the value that was raised, so the canonical flatten cannot
+    /// recover the `raise` operand from the link args.  This field carries
+    /// the normalized raised value so `insert_exits` can emit
+    /// `raise <getcolor(value)>` on the single-exit explicit-raise arm.
+    /// `None` for ordinary (op-canraise) exception edges.
+    pub explicit_raise_value: Option<Variable>,
 }
 
 impl Link {
@@ -816,6 +829,7 @@ impl Link {
             prevblock: None,
             last_exception: None,
             last_exc_value: None,
+            explicit_raise_value: None,
         }
     }
 
@@ -867,6 +881,7 @@ impl Link {
         newlink.prevblock = self.prevblock.clone();
         newlink.last_exception = self.last_exception.map(&mut rename);
         newlink.last_exc_value = self.last_exc_value.map(&mut rename);
+        newlink.explicit_raise_value = self.explicit_raise_value.map(&mut rename);
         newlink.llexitcase = self.llexitcase.clone();
         newlink
     }

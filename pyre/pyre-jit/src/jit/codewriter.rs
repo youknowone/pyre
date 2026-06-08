@@ -984,7 +984,12 @@ fn genuine_opname_tally(
 /// leading `-live-` marker (flatten.rs:1868-69 / 1971-72), so first-insn
 /// keying resolves to an earlier marker, whereas the runtime resumes a
 /// branch at orgpc = the guard's own pc (#285) and needs the guard's own
-/// leading marker.  Can-raise / normal PCs keep first-insn keying.
+/// leading marker.  Can-raise calls (#286) are re-keyed off their
+/// FALLTHROUGH pc (`semantic_fallthrough_pc(code, call_pc)`) to the call's
+/// TRAILING `-live-` marker, since the runtime records `fallthrough_pc` (not
+/// the call's own pc) in an `after_residual_call` guard's resume data and a
+/// stack-only fallthrough would otherwise be `stranded`.  Normal PCs keep
+/// first-insn keying.
 ///
 /// Returns one entry per Python PC `0..n_pcs`: `Some(idx)` = the resolved
 /// pre-merge marker insn index; `None` = either the PC carries no insn of
@@ -997,6 +1002,7 @@ fn genuine_opname_tally(
 fn derive_pc_live_indices_from_sparse(
     ssarepr: &super::flatten::SSARepr,
     n_pcs: usize,
+    code: &CodeObject,
 ) -> Vec<Option<usize>> {
     // py_pc -> the stream position whose nearest-`-live-`-at-or-before is
     // the PC's resume marker.  Default = the PC's own first insn position
@@ -1007,15 +1013,11 @@ fn derive_pc_live_indices_from_sparse(
             pos_for_pc[py_pc as usize] = Some(pos);
         }
     }
-    // Branch-guard re-key (#281): for a PC whose block ends in
-    // `goto_if_not` / `goto_if_not_*` / `switch` with a leading `-live-`
-    // at q-1, key off the guard-op position `q` instead of the PC's first
-    // insn so the resolution lands on the guard's own leading marker (the
-    // runtime resumes the branch at orgpc = the guard's pc, #285).  The
-    // guard is the block terminator, so `q` >= the owner PC's first insn;
-    // the override only moves the key forward.  `owner_pc(q)` = the py_pc
-    // whose first-insn position is the greatest at-or-before `q`, computed
-    // over the position-ascending `pc_first_insn_pos`, matching
+    // `owner_pc(q)` = the py_pc whose first-insn position is the greatest
+    // at-or-before `q`, computed over the position-ascending
+    // `pc_first_insn_pos` (built first-wins as the stream grows, so already
+    // ascending; sort defensively).  Shared by the can-raise (#286) and
+    // branch-guard (#281) re-keys below and matches
     // `resume_target_resolver_coverage`.
     let mut pc_pos: Vec<(usize, usize)> = ssarepr
         .pc_first_insn_pos
@@ -1024,22 +1026,66 @@ fn derive_pc_live_indices_from_sparse(
         .map(|&(pc, pos)| (pos, pc as usize))
         .collect();
     pc_pos.sort_unstable();
+    let owner_pc = |q: usize| -> Option<usize> {
+        pc_pos
+            .partition_point(|&(pos, _)| pos <= q)
+            .checked_sub(1)
+            .map(|k| pc_pos[k].1)
+    };
+    // Branch guards (`goto_if_not` / `goto_if_not_*` / `switch`) resume at
+    // orgpc = the guard's OWN bytecode pc (#285) — i.e. the opcode START,
+    // which is exactly the PC's first-insn keying (the default above).  The
+    // guard's leading `-live-` (immediately before the terminator) is NOT a
+    // valid resume target under pyre's Ref-only resume contract: the
+    // condition is an unboxed `Int` produced mid-opcode by the `truth`
+    // call, and `clear_unboxed_banks` strips it at that marker.  Resuming
+    // there reads a cleared condition and takes the wrong arm.  Resuming at
+    // the opcode-start marker instead keeps the boxed operand (the compare
+    // result the `truth` consumes) live, so re-executing the opcode
+    // forward re-derives the condition correctly — mirroring the blackhole
+    // re-running the bytecode opcode from orgpc.  So leave `pos_for_pc` at
+    // the PC's first insn; no branch-guard re-key.
+    // Can-raise fallthrough re-key (#286): a can-raise `residual_call` at
+    // stream position `q` carries a TRAILING `-live-` at `q+1`
+    // (jtransform.py:467-482, flatten.rs:1373).  When the call raises the
+    // runtime resumes at the call's FALLTHROUGH py_pc — not the call's own
+    // pc — reading `pc_map[fallthrough_pc]` (trace_opcode.rs:3634
+    // `resume_pc = self.fallthrough_pc` for `after_residual_call` guards).
+    // So the fallthrough PC's resume marker must be the call's trailing
+    // marker.  When that PC is stack-only (emits no pc-carrying op, hence
+    // absent from `pc_first_insn_pos`) the default resolution leaves it
+    // `None` and the dense-map carry-forward hands it the WRONG preceding
+    // marker — the `stranded` decline.  Key it to `q+1` here, using the same
+    // `semantic_fallthrough_pc` the runtime uses to set
+    // `MIFrame::fallthrough_pc`, so the resolver's fallthrough matches the
+    // runtime's recorded resume pc exactly.  Applied AFTER the branch re-key
+    // so it WINS when a fallthrough PC is also the owner-rounded target of a
+    // branch re-key (#281 keys `owner_pc(guard)`, which rounds back to this
+    // canraise's fallthrough PC when the guard's own pc is stack-only — e.g.
+    // `i % 7 == 0`: the `%` fallthrough is the `==` PC, whose block ends in
+    // the branch; the branch's real resume pc is the `==` fallthrough, served
+    // by THIS canraise re-key on the `==` call.  The canraise trailing and
+    // the branch leading marker are adjacent there and fold under
+    // `remove_repeated_live`, so the branch resume reads a fed fold-partner —
+    // `resume_target_resolver_coverage` accounts for that fold).
     for (q, insn) in ssarepr.insns.iter().enumerate() {
         let super::flatten::Insn::Op { opname, .. } = insn else {
             continue;
         };
-        let is_branch_guard =
-            opname == "goto_if_not" || opname.starts_with("goto_if_not_") || opname == "switch";
-        if !is_branch_guard || !q.checked_sub(1).is_some_and(|i| ssarepr.insns[i].is_live()) {
+        if !opname.starts_with("residual_call")
+            || !ssarepr.insns.get(q + 1).is_some_and(|n| n.is_live())
+        {
             continue;
         }
-        if let Some(owner) = pc_pos
-            .partition_point(|&(pos, _)| pos <= q)
-            .checked_sub(1)
-            .map(|k| pc_pos[k].1)
-        {
-            if owner < n_pcs {
-                pos_for_pc[owner] = Some(q);
+        if let Some(call_pc) = owner_pc(q) {
+            let fallthrough = pyre_jit_trace::metainterp::semantic_fallthrough_pc(code, call_pc);
+            // Only re-key STACK-ONLY fallthrough PCs (pos None). A
+            // fallthrough PC with its OWN first-insn marker already resolves
+            // to that marker, which is the branch's not-taken arm entry —
+            // overriding it to the call's trailing marker would strand the
+            // unboxed condition (raise_catch goto_if_not).
+            if fallthrough < n_pcs && pos_for_pc[fallthrough].is_none() {
+                pos_for_pc[fallthrough] = Some(q + 1);
             }
         }
     }
@@ -1114,13 +1160,6 @@ fn resume_target_resolver_coverage(
             .checked_sub(1)
             .map(|k| pc_pos[k].1)
     };
-    // Fed marker set: every marker index the resolver hands to some pc.
-    // `HashSet` has no upstream counterpart (this is a pyre-only
-    // measurement helper, not a port; gate-off-inert, retired with the
-    // survey at #287/Phase 5); it is used purely for the O(1) membership
-    // test below.
-    let fed: std::collections::HashSet<usize> = live_indices.iter().filter_map(|&x| x).collect();
-
     let n_pcs = live_indices.len();
     let (mut branch, mut branch_keyed, mut branch_fed) = (0usize, 0usize, 0usize);
     let (mut canraise, mut canraise_fed) = (0usize, 0usize);
@@ -1134,7 +1173,16 @@ fn resume_target_resolver_coverage(
                 continue;
             };
             branch += 1;
-            if fed.contains(&leading) {
+            // A branch guard resumes at orgpc = its owner PC's opcode-start
+            // marker (the first-insn keying in
+            // `derive_pc_live_indices_from_sparse`), NOT its leading
+            // `-live-`: pyre's Ref-only resume re-derives the unboxed
+            // condition by re-executing the opcode from its boxed-operand
+            // boundary.  So the guard is covered iff its owner PC has a
+            // resume marker, which the sparse first-insn feed always
+            // supplies.  (`branch_keyed` retains the leading-marker check
+            // for the survey only.)
+            if owner_pc(q).is_some_and(|p| p < n_pcs && live_indices[p].is_some()) {
                 branch_fed += 1;
             }
             if let Some(p) = owner_pc(q) {
@@ -1147,26 +1195,31 @@ fn resume_target_resolver_coverage(
             // `Insn::Op` carries its result inline, so the marker is q+1);
             // non-raising residual_calls have none.
             if ssarepr.insns.get(q + 1).is_some_and(|n| n.is_live()) {
-                // A can-raise whose semantic fallthrough PC is out of range
-                // — the owner op is an unconditional-raise terminator
+                // L1: a can-raise whose semantic fallthrough PC is out of
+                // range — the owner op is an unconditional-raise terminator
                 // (`reraise` / `raise` at the function's exception-cleanup
                 // tail, e.g. a `Reraise` at the last PC) — has no
                 // in-function no-exception continuation: when it fires the
                 // exception unwinds out of the frame and the blackhole
-                // resumes in the CALLER, never at a PC of this function
-                // (its semantic fallthrough is `>= num_instrs`).  So it is
-                // not a structural resume target; exclude it from the count
+                // resumes in the CALLER, never at a PC of this function (its
+                // semantic fallthrough is `>= num_instrs`).  So it is not a
+                // structural resume target; exclude it from the count
                 // (otherwise its unfeedable trailing marker reads as a
-                // permanent `stranded` decline and blocks the splice).  The
-                // runtime keys a can-raise resume on `fallthrough_pc` (#285,
-                // trace_opcode.rs:3634), so this matches the runtime: a
-                // terminator-raise never records an `after_residual_call`
-                // resume into a PC of its own frame.
+                // permanent `stranded` decline and blocks the splice).
                 let ft = owner_pc(q)
                     .map(|p| pyre_jit_trace::metainterp::semantic_fallthrough_pc(code, p));
-                if ft.is_some_and(|f| f < n_pcs) {
+                if let Some(f) = ft.filter(|&f| f < n_pcs) {
                     canraise += 1;
-                    if fed.contains(&(q + 1)) {
+                    // #286: the runtime keys a can-raise exception resume on
+                    // `fallthrough_pc` (#285, trace_opcode.rs:3634
+                    // `resume_pc = self.fallthrough_pc`), NOT on the call's
+                    // own trailing marker.  Covered iff
+                    // `derived[fallthrough_pc]` is set — by that PC's own
+                    // first-insn marker (a real opcode follows the call) or
+                    // by the #286 trailing re-key when the fallthrough PC is
+                    // stack-only.  The trailing marker `q+1` is itself never
+                    // a runtime resume target.
+                    if live_indices[f].is_some() {
                         canraise_fed += 1;
                     }
                 }
@@ -1478,6 +1531,88 @@ fn collect_distinct_slot_interference_pairs(
         }
     }
     pairs
+}
+
+/// #281 splice-only: reserve Ref colors `[0, nlocals)` for semantic
+/// locals, matching the register layout the runtime bridge-resume
+/// (`state.rs::setup_bridge_sym`) assumes.
+///
+/// The runtime decodes a live Ref register whose color is `c < nlocals`
+/// as "Python fast local `c`; fill it from the virtualizable array when
+/// the resume register is NONE / null". That contract is the walker's:
+/// the walker colors every Python fast local into `[0, nlocals)`. The
+/// splice only colors the locals that survive as graph Variables
+/// (function args plus #304 frame-live body locals); the remaining fast
+/// locals are vable-only and leave their colors free, so
+/// `enforce_input_args` (`flatten.py:88-100`) pins the portal
+/// `(frame, ec)` red args — and the chordal coloring can land temps —
+/// inside `[0, nlocals)`. A portal red at color `c < nlocals` then
+/// decodes at bridge resume as fast local `c`, and because the slot
+/// holds a non-null pointer the vable override is skipped, so `LOAD_FAST`
+/// reads the frame pointer as a local (#281 high-N raise_catch
+/// corruption: the loop-carried accumulator reads garbage after an
+/// exception-handler bridge resume).
+///
+/// Vacate every Ref color `< nlocals` that is NOT owned by a semantic
+/// local (a Variable pinned to a walker slot `< nlocals`) up to a fresh
+/// color `>= num_colors`, applying the same remap to the emitted SSARepr
+/// register operands so they stay consistent with the recolored
+/// `coloring` map. Semantic-local colors stay put (#304 body-local
+/// coloring is preserved); vable-only local slots keep their reserved
+/// holes unused. Splice-only — gate-off never calls this, so its coloring
+/// stays byte-identical.
+fn reserve_local_ref_colors_in_place(
+    ssarepr: &mut super::flatten::SSARepr,
+    splice_regallocs: &mut [super::regalloc::GraphAllocationResult; 3],
+    walker_slot_for_variable: &[Option<u16>],
+    nlocals: u16,
+) {
+    if nlocals == 0 {
+        return;
+    }
+    let ref_alloc = &mut splice_regallocs[Kind::Ref.index()];
+    // Colors owned by a semantic local (a Variable pinned to walker slot
+    // `< nlocals`); these are allowed to stay inside `[0, nlocals)`.
+    let mut local_color: std::collections::HashSet<u16> = std::collections::HashSet::new();
+    for (vid, slot) in walker_slot_for_variable.iter().enumerate() {
+        let Some(slot) = *slot else { continue };
+        if slot >= nlocals {
+            continue;
+        }
+        if let Some(&color) = ref_alloc
+            .coloring
+            .get(&super::flow::VariableId(vid as u32))
+        {
+            local_color.insert(color);
+        }
+    }
+    // Colors actually in use by some Variable.
+    let used: std::collections::HashSet<u16> = ref_alloc.coloring.values().copied().collect();
+    // Build a color remap (identity outside the vacated colors). Each
+    // non-local color `< nlocals` that is in use moves to a brand-new
+    // color `>= num_colors`, so it never collides with a kept color.
+    let size = (ref_alloc.num_colors as usize).max(nlocals as usize);
+    let mut remap: Vec<u16> = (0..size as u16).collect();
+    let mut next_fresh = ref_alloc.num_colors;
+    for c in 0..nlocals {
+        if local_color.contains(&c) || !used.contains(&c) {
+            continue;
+        }
+        remap[c as usize] = next_fresh;
+        next_fresh += 1;
+    }
+    if next_fresh == ref_alloc.num_colors {
+        // Nothing moved: `[0, nlocals)` already reserved (e.g. functions
+        // whose args already span the local prefix). Byte-identical.
+        return;
+    }
+    for color in ref_alloc.coloring.values_mut() {
+        *color = remap[*color as usize];
+    }
+    ref_alloc.num_colors = next_fresh;
+    let mut rename: [Vec<u16>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+    rename[Kind::Ref.index()] = remap;
+    super::regalloc::apply_rename(ssarepr, &rename);
 }
 
 /// #304/PR#145①: drop coalesce pairs that would TRANSITIVELY merge a
@@ -5824,6 +5959,24 @@ impl CodeWriter {
                     // AND calls `attach_catch_exception_edge` (the
                     // exception Link onto `current_block.exits`).
                     emit_catch_exception!(catch_label);
+                    // Carry the normalized raised value on the
+                    // just-attached exception edge.  Unlike the
+                    // `graph.exceptblock` arm below (whose
+                    // `explicit_raise_state` puts the raised value in
+                    // `link.args[1]`), `attach_catch_exception_edge`
+                    // links directly to the catch landing and seeds
+                    // `extravars` with a FRESH (type, value) read-back
+                    // pair — so the canonical flatten cannot recover the
+                    // `raise` operand from the link.  Record it here so
+                    // `insert_exits`' single-exit explicit-raise arm
+                    // emits `raise <getcolor(value)>`.
+                    if let Some(raised) = evalue_fv.as_variable() {
+                        if let Some(exc_link) =
+                            current_block.block().borrow().exits.last()
+                        {
+                            exc_link.borrow_mut().explicit_raise_value = Some(raised);
+                        }
+                    }
                 } else {
                     // `flowcontext.py:1246-1261 Raise.nomoreblocks` shape:
                     //   link = Link([w_exc.w_type, w_exc.w_value],
@@ -8618,6 +8771,37 @@ impl CodeWriter {
                             // previous sys_exc_info so `POP_EXCEPT` can restore it).
                             let exc_reg = emit_popvalue_ref!(current_depth, py_pc);
                             let exc_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            // PUSH_EXC_INFO is pyre-specific (rustpython 3.11+;
+                            // no PyPy counterpart).  In the canonical splice the
+                            // popped exc `Variable` has no graph producer: the
+                            // walker threads the caught exception through runtime
+                            // registers + a walker-stream-only `ref_copy`
+                            // (`emit_ref_copy`, which `insert_renamings` owns and
+                            // never mirrors into the graph).  Without a graph
+                            // producer the register allocator treats `exc_value`
+                            // as dead-until-first-use (its first use trails the
+                            // `get_current_exception` call below), so it never
+                            // interferes with that call's result and the two
+                            // coalesce onto one colour — the handler's
+                            // CHECK_EXC_MATCH then reads the cleared current
+                            // exception (NULL) instead of the caught one.  Give
+                            // `exc_value` a resume-safe producer by re-reading the
+                            // last-exception value slot: it still holds the caught
+                            // exception (no `catch_exception` intervenes between
+                            // the landing and PUSH_EXC_INFO), the read is
+                            // graph-only so the walker stream is unchanged, and
+                            // the producer forces `exc_value` to interfere with
+                            // the `get_current_exception` result so regalloc
+                            // gives them distinct colours.  The slot pin below
+                            // must stay: dropping it perturbs the canonical-
+                            // derived gate-off resume liveness.
+                            record_graph_op(
+                                &current_block.block(),
+                                "last_exc_value",
+                                Vec::new(),
+                                Some(exc_value.clone()),
+                                py_pc as i64,
+                            );
                             // pyopcode.py:786 keeps `exc` in a local after
                             // `popvalue()`.  Mirror that with a scratch register:
                             // the following `push(prev)` writes to the popped
@@ -10210,7 +10394,7 @@ impl CodeWriter {
                 // emits no graph op — a stack-only instruction — so it has
                 // no `pc_first_insn_pos` entry) / uncovered (the PC emits a
                 // graph op but no `-live-` marker precedes it).
-                let live_indices = derive_pc_live_indices_from_sparse(&canonical, num_instrs);
+                let live_indices = derive_pc_live_indices_from_sparse(&canonical, num_instrs, code);
                 let live_vars = pyre_jit_trace::state::liveness_for(code as *const _);
                 let mut present = vec![false; num_instrs];
                 for &(pc, _) in &canonical.pc_first_insn_pos {
@@ -10328,11 +10512,25 @@ impl CodeWriter {
                         &splice_pairs,
                         &distinct_slot_interference,
                     );
-                let ssarepr = super::flatten::flatten_graph(
+                let mut ssarepr = super::flatten::flatten_graph(
                     &graph,
                     &mut splice_regallocs,
                     false,
                     Some(self.cpu()),
+                );
+                // #281: reserve Ref colors [0, nlocals) for the semantic
+                // local prefix the runtime bridge-resume assumes, bumping
+                // the portal (frame, ec) reds (and any temp) that
+                // `enforce_input_args` landed in that range up to fresh
+                // colors >= num_colors. Recolors the emitted stream and
+                // the canonical `splice_regallocs` together so the
+                // downstream resume-map rebuild reads the post-reserve
+                // colors.
+                reserve_local_ref_colors_in_place(
+                    &mut ssarepr,
+                    &mut splice_regallocs,
+                    &walker_slot_for_variable,
+                    code.varnames.len() as u16,
                 );
                 (ssarepr, splice_regallocs)
             }))
@@ -10640,8 +10838,8 @@ impl CodeWriter {
                     spliced.insns = new_insns;
                 }
                 let first_live = spliced.insns.iter().position(|i| i.is_live());
-                let derived =
-                    first_live.map(|_| derive_pc_live_indices_from_sparse(&spliced, num_instrs));
+                let derived = first_live
+                    .map(|_| derive_pc_live_indices_from_sparse(&spliced, num_instrs, code));
                 // #281 splice precondition: the dense pc_map fill above
                 // forward-carries the nearest resolved `-live-` marker for a
                 // `nopc` (stack-only) PC, which is only sound when no
