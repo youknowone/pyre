@@ -4168,8 +4168,106 @@ impl OptContext {
     /// (S9/#115): the Phase-1 producer must be reachable from the Phase-2
     /// context before this can assert instead of mint.
     pub fn get_box_replacement(&self, opref: OpRef) -> crate::r#box::BoxRef {
-        self.get_box_replacement_box(opref)
-            .unwrap_or_else(|| crate::r#box::BoxRef::from_opref(opref))
+        if let Some(b) = self.get_box_replacement_box(opref) {
+            return b;
+        }
+        // S9 scoping (env-gated, zero-impact when `PYRE_S9_PROBE` is unset):
+        // classify each `from_opref` fallback fire as category-a (producer-less
+        // by construction, resolve-to-self is correct) vs category-b
+        // (cross-phase: a producer Op survives but `find_producer_op`'s stores
+        // are not keyed to reach it) to size the S9 cross-phase resolution gap
+        // before deciding whether it has real registry work or redirects to the
+        // operand-union producer-less-arm design.
+        self.s9_probe_fire(opref);
+        crate::r#box::BoxRef::from_opref(opref)
+    }
+
+    /// S9 probe classifier for a `from_opref` fallback fire (see
+    /// [`OptContext::get_box_replacement`]). `&self`-only, no mutation.
+    ///
+    /// Precondition: `find_producer_op` already missed (full type-tagged
+    /// `OpRef` match across `new_operations` / `phase1_emit_ops` / `resop_refs`
+    /// / `input_ops`) and `resolve_to_boxref` returned `None`; `opref` is
+    /// non-`none`, non-`Const`.
+    ///
+    /// - `b-inputarg`: an InputArg position whose `inputarg_refs` slot is unbound.
+    /// - `b-typetag`: a producer Op exists at the same RAW position under a
+    ///   different type tag (the #97 type-tag divergence signal).
+    /// - `b-rekey-*`: the OpRef is named by a carried Phase-1 registry
+    ///   (`inputargs` / `imported_label_args` / `imported_virtual_args`), so a
+    ///   producer exists in Phase 1 but is not in a `find_producer_op` store.
+    /// - `b-shortpure`: the OpRef is the `result` of a carried
+    ///   `imported_short_pure_ops` entry — a short-preamble producer survives
+    ///   but `find_producer_op` does not consult that table.
+    /// - `a-producerless`: no producer Op for this position is reachable in any
+    ///   OptContext-local registry — correct-as-is (an unforwarded box returns
+    ///   itself, `resoperation.py:57-68`).
+    fn classify_s9_fallback(&self, opref: OpRef) -> &'static str {
+        match opref {
+            OpRef::InputArgInt(_) | OpRef::InputArgFloat(_) | OpRef::InputArgRef(_) => {
+                return "b-inputarg";
+            }
+            _ => {}
+        }
+        let raw = opref.raw();
+        let raw_hit = self
+            .new_operations
+            .iter()
+            .chain(self.phase1_emit_ops.iter())
+            .chain(self.input_ops.iter())
+            .any(|op| op.pos.get().raw() == raw);
+        if raw_hit {
+            return "b-typetag";
+        }
+        if self.inputargs.iter().any(|o| *o == opref) {
+            return "b-rekey-inputargs";
+        }
+        if let Some(label_args) = self.imported_label_args.as_ref() {
+            if label_args.iter().any(|o| *o == opref) {
+                return "b-rekey-label";
+            }
+        }
+        if let Some((_, vargs)) = self.imported_virtual_args.as_ref() {
+            if vargs.iter().any(|o| *o == opref) {
+                return "b-rekey-vargs";
+            }
+        }
+        if self
+            .imported_short_pure_ops
+            .iter()
+            .any(|sp| sp.result == opref)
+        {
+            return "b-shortpure";
+        }
+        "a-producerless"
+    }
+
+    /// S9 probe sink (env-gated). No-op unless `PYRE_S9_PROBE` is set; appends
+    /// one classified line per `from_opref` fallback fire to
+    /// `/tmp/pyre_s9_probe.log`. Process-global file sink because the caller is
+    /// `&self` (no context-local counter). When the flag is unset, only a
+    /// cached bool is read and the sink is never opened.
+    fn s9_probe_fire(&self, opref: OpRef) {
+        use std::sync::{LazyLock, Mutex};
+        static ENABLED: LazyLock<bool> =
+            LazyLock::new(|| std::env::var_os("PYRE_S9_PROBE").is_some());
+        if !*ENABLED {
+            return;
+        }
+        static SINK: LazyLock<Mutex<std::fs::File>> = LazyLock::new(|| {
+            Mutex::new(
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open("/tmp/pyre_s9_probe.log")
+                    .expect("open /tmp/pyre_s9_probe.log"),
+            )
+        });
+        let cat = self.classify_s9_fallback(opref);
+        if let Ok(mut f) = SINK.lock() {
+            use std::io::Write;
+            let _ = writeln!(f, "cat={} opref={:?} raw={}", cat, opref, opref.raw());
+        }
     }
 
     /// `BoxRef`-addressed operand resolution seam. Callers holding the
