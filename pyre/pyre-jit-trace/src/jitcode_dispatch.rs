@@ -4568,7 +4568,9 @@ fn try_walker_store_subscr_specialization(
     // the dispatcher's `walker_record_guard_exception` + `SubRaise`
     // flow.  For 5.5a's env-gated rollout, decline on raise so the
     // blackbox path handles it end-to-end.
-    let raised = unsafe {
+    // `bh_store_subscr_fn` returns 1 on success, 0 on raise
+    // (with the exception object stashed in `BH_LAST_EXC_VALUE`).
+    let success = unsafe {
         let store_subscr_fn: extern "C" fn(i64, i64, i64) -> i64 =
             std::mem::transmute(expected_fn_addr as *const ());
         store_subscr_fn(
@@ -4577,7 +4579,7 @@ fn try_walker_store_subscr_specialization(
             concrete_value as usize as i64,
         )
     };
-    if raised != 0 {
+    if success == 0 {
         return None;
     }
     // pyjitpl.py:2659 `_record_helper_varargs`: STORE_SUBSCR mutates the
