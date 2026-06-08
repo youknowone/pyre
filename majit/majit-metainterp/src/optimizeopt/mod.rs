@@ -3941,7 +3941,27 @@ impl OptContext {
             ) => Some(opinfo.clone()),
             _ => None,
         };
-        // optimizer.py:394 op.set_forwarded(newop)
+        // optimizer.py:394 op.set_forwarded(newop). RPython's `newop` is
+        // always a real box object. A position-only unbound BoxRef — the
+        // flat-OpRef artifact where a Phase-1 producer was not carried into
+        // this rebuilt Phase-2 OptContext (`find_producer_op` miss, the
+        // cross-phase resolution gap; e.g. `import_state`'s next-iteration
+        // target, a heap/virtual cache entry) — is materialized to its
+        // canonical `SameAs*` stand-in (`resoperation.py:233-248` "the box
+        // always exists"). The forward then targets a bound `Op`/`InputArg`
+        // and never a position-only `Forwarded::Box` redirect. An unbound
+        // `newop` has no producer at its position, so it cannot alias the
+        // bound chain head `op` (no self-cycle).
+        let materialized_newop;
+        let newop: &crate::r#box::BoxRef = if newop.is_constant()
+            || newop.bound_op().is_some()
+            || newop.bound_inputarg().is_some()
+        {
+            newop
+        } else {
+            materialized_newop = self.materialize_box_at(newop.to_opref());
+            &materialized_newop
+        };
         if newop.is_constant() {
             let value = newop
                 .const_value()
@@ -3982,19 +4002,16 @@ impl OptContext {
             }
             op.set_forwarded_inputarg(&target_ia);
         } else {
-            // Orphan unbound non-Const BoxRef target. Phase 1's per-iter
-            // `TraceIterator::next()` (opencoder.rs:500) plants
-            // `BoxRef::new_resop` slots in the pool *without* binding to
-            // an `OpRc`; when Phase 1 folds/drops the op before it lands
-            // in `new_operations` / `phase1_emit_ops`, the pool slot stays
-            // unbound. Chain walks via `Forwarded::Box(...)` can still
-            // reach it through `Box.forwarded` (the mirror is canonical
-            // for unbound slots), so the chain step terminates safely on
-            // a `Forwarded::Box(newop)` write — `get_box_replacement` will
-            // continue reading Phase 1's forwarded state off the same
-            // `Box`. Test fixtures that build `BoxRef::new_resop` /
-            // `new_inputarg` without binding also rely on this path.
-            op.set_forwarded_box(newop.clone());
+            // Unreachable: `newop` was normalized above to a constant or a
+            // bound `Op`/`InputArg`, so the dispatch always resolves through
+            // `set_forwarded_const` / `set_forwarded_op` / `set_forwarded_inputarg`.
+            // The orphan `Forwarded::Box` redirect — the last production writer
+            // of the `Forwarded::Box` variant — is retired.
+            unreachable!(
+                "make_equal_to: newop must be constant or bound after \
+                 materialize_box_at normalization (Forwarded::Box production \
+                 writer retired)"
+            );
         }
         // optimizer.py:395-396
         //   if opinfo is not None and not newop.is_constant():
