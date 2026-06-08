@@ -8754,6 +8754,20 @@ impl CraneliftBackend {
         // reads NULL. This mirrors the RPython box-location discipline: only
         // boxes have locations; the jitframe pointer register (EBP) is
         // reserved and never shares a slot with a value.
+        //
+        // The inputarg→ref-root sync must NOT run in this pre-dispatch entry
+        // block when the trace has LABELs: the per-LABEL loaders (the
+        // dispatch_key re-entry path) read each LABEL's carried values from
+        // the dense jitframe slots `JF_FRAME_ITEM0_OFS + i*8`, and when
+        // `max_output_slots < arity` those slots overlap the ref-root region
+        // (`ref_root_base_ofs + slot*8`). Syncing an inputarg to its root slot
+        // here would clobber a carried value before the loader reads it. Defer
+        // the sync to the preamble (key-0 host-entry) path, which is the only
+        // path that needs roots established before the preamble's own ops; the
+        // loader paths reach a LABEL block that re-syncs its carried roots with
+        // no GC in between.
+        let mut deferred_entry_root_syncs: Vec<(u32, CValue)> = Vec::new();
+        let has_labels = !label_indices.is_empty();
         for (i, val) in entry_input_vals
             .iter()
             .copied()
@@ -8762,15 +8776,19 @@ impl CraneliftBackend {
         {
             let slot = inputargs[i].index;
             builder.def_var(var(slot), val);
-            sync_ref_root_var(
-                &mut builder,
-                jf_ptr,
-                &ref_root_slots,
-                slot,
-                val,
-                ref_root_base_ofs,
-                &mut synced_ref_vars,
-            );
+            if has_labels {
+                deferred_entry_root_syncs.push((slot, val));
+            } else {
+                sync_ref_root_var(
+                    &mut builder,
+                    jf_ptr,
+                    &ref_root_slots,
+                    slot,
+                    val,
+                    ref_root_base_ofs,
+                    &mut synced_ref_vars,
+                );
+            }
         }
 
         // RPython parity: GC roots are registered by run_compiled_code()
@@ -8914,6 +8932,22 @@ impl CraneliftBackend {
             // in this block; first_label_entered_at_entry stays false.
             builder.switch_to_block(preamble_block);
             builder.seal_block(preamble_block);
+            // Establish the inputarg ref roots here (preamble path only), after
+            // the br_table — see the deferral note at the entry-block sync. The
+            // loaders read the dense carried-value slots, which can overlap this
+            // root region, so the sync must not precede the dispatch.
+            let cur_jf = builder.use_var(jf_ptr_var);
+            for &(slot, val) in &deferred_entry_root_syncs {
+                sync_ref_root_var(
+                    &mut builder,
+                    cur_jf,
+                    &ref_root_slots,
+                    slot,
+                    val,
+                    ref_root_base_ofs,
+                    &mut synced_ref_vars,
+                );
+            }
         } else if has_jump && loop_block != entry_block {
             let zero = builder.ins().iconst(cl_types::I64, 0);
             let vals: Vec<CValue> = (0..loop_param_count)
