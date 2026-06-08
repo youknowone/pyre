@@ -2412,7 +2412,7 @@ impl Optimizer {
             let resolved_args: Vec<OpRef> = terminal_op
                 .getarglist()
                 .iter()
-                .map(|arg| ctx.get_box_replacement(arg.to_opref()).to_opref())
+                .map(|arg| ctx.resolve_box_box(&arg).to_opref())
                 .collect();
             for &resolved in &resolved_args {
                 self.force_box_for_end_of_preamble(resolved, &mut ctx);
@@ -2424,7 +2424,7 @@ impl Optimizer {
             //   for i in range(op.numargs()): op.setarg(i, force_box(...))
             for i in 0..terminal_op.num_args() {
                 let arg = terminal_op.arg(i);
-                let resolved = ctx.get_box_replacement(arg.to_opref()).to_opref();
+                let resolved = ctx.resolve_box_box(&arg).to_opref();
                 let expected_ref =
                     i < inputargs.len() && inputargs[i].ty() == Some(majit_ir::Type::Ref);
                 // setup_optimizations seeds `trace_inputargs` into
@@ -2433,7 +2433,7 @@ impl Optimizer {
                 // op/value_types chain. PtrInfo presence is an additional
                 // Ref-only side channel for inputargs not in `new_operations`.
                 let resolved_has_ptr_info = ctx
-                    .get_box_replacement_box(arg.to_opref())
+                    .resolve_box_box_opt(&arg)
                     .as_ref()
                     .map_or(false, |b| ctx.has_ptr_info(b));
                 let resolved_is_ref =
@@ -2446,7 +2446,7 @@ impl Optimizer {
                         .is_some()
                 {
                     let arg_is_virtual = ctx
-                        .get_box_replacement_box(arg.to_opref())
+                        .resolve_box_box_opt(&arg)
                         .as_ref()
                         .map_or(false, |b| ctx.is_virtual(b));
                     if arg_is_virtual {
@@ -2576,7 +2576,7 @@ impl Optimizer {
                 .map(|v| v.iter().map(|b| b.to_opref()).collect())
                 .unwrap_or_else(|| {
                     jump.getarglist().iter()
-                        .map(|a| ctx.get_box_replacement(a.to_opref()).to_opref())
+                        .map(|a| ctx.resolve_box_box(&a).to_opref())
                         .collect()
                 });
             let mut resolved_args = original_jump_args.clone();
@@ -2790,12 +2790,12 @@ impl Optimizer {
                     for i in 0..preamble_op.num_args() {
                         preamble_op.setarg(
                             i,
-                            ctx.get_box_replacement(preamble_op.arg(i).to_opref()),
+                            ctx.resolve_box_box(&preamble_op.arg(i)),
                         );
                     }
                     if let Some(fail_args) = preamble_op.fail_args_mut() {
                         for arg in fail_args {
-                            *arg = ctx.get_box_replacement(arg.to_opref());
+                            *arg = ctx.resolve_box_box(&arg);
                         }
                     }
                     crate::optimizeopt::shortpreamble::PreambleOp {
@@ -3684,7 +3684,7 @@ impl Optimizer {
             // it to its terminal, so the stored arg is BOUND on every dispatch
             // path. A sentinel operand keeps its unbound arg box (const
             // operands resolve through the `Some` arm above).
-            let resolved = match ctx.get_box_replacement_box(arg.to_opref()) {
+            let resolved = match ctx.resolve_box_box_opt(&arg) {
                 Some(b) => b,
                 None => {
                     let argref = arg.to_opref();
@@ -4165,7 +4165,7 @@ impl Optimizer {
                             // either invariant violation rather
                             // than silently coercing to 0.
                             let boxindex =
-                                ctx.get_box_replacement(pf_op.arg(1).to_opref()).to_opref();
+                                ctx.resolve_box_box(&pf_op.arg(1)).to_opref();
                             let idx = match ctx
                                 .get_box_replacement_box(boxindex)
                                 .and_then(|cb| cb.const_int())
@@ -4485,7 +4485,7 @@ impl Optimizer {
         }
         // optimizer.py:756-757: b = self.getintbound(op.getarg(0)); if b.is_bool()
         let b = {
-            let b = ctx.get_box_replacement(arg0.to_opref());
+            let b = ctx.resolve_box_box(&arg0);
             ctx.getintbound_handle(&b).borrow().clone()
         };
         if !b.is_bool() {

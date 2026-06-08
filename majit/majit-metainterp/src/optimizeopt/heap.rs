@@ -341,8 +341,8 @@ impl CachedField {
             .as_ref()
             .map(OptHeap::field_slot_index)
             .unwrap_or(0);
-        let arg = ctx.get_box_replacement(op.arg(1).to_opref()).to_opref();
-        let struct_opref = ctx.get_box_replacement(op.arg(0).to_opref()).to_opref();
+        let arg = ctx.resolve_box_box(&op.arg(1)).to_opref();
+        let struct_opref = ctx.resolve_box_box(&op.arg(0)).to_opref();
         self.register_info(struct_opref);
         ctx.structinfo_setfield(op, descr_idx, arg);
     }
@@ -591,8 +591,8 @@ impl ArrayCachedItem {
 
     /// heap.py:252-255 ArrayCachedItem.put_field_back_to_info
     fn put_field_back_to_info(&mut self, op: &Op, ctx: &mut OptContext) {
-        let arg = ctx.get_box_replacement(op.arg(2).to_opref()).to_opref();
-        let struct_opref = ctx.get_box_replacement(op.arg(0).to_opref()).to_opref();
+        let arg = ctx.resolve_box_box(&op.arg(2)).to_opref();
+        let struct_opref = ctx.resolve_box_box(&op.arg(0)).to_opref();
         self.register_info(struct_opref);
         ctx.arrayinfo_setitem(op, self.index as usize, arg);
     }
@@ -949,9 +949,9 @@ impl OptHeap {
     /// Canonicalizes array and index through get_box_replacement.
     fn arrayitem_key(op: &Op, ctx: &mut OptContext) -> Option<ArrayItemKey> {
         let descr = op.getdescr()?;
-        let array = ctx.get_box_replacement(op.arg(0).to_opref()).to_opref();
+        let array = ctx.resolve_box_box(&op.arg(0)).to_opref();
         let index_val = ctx
-            .get_box_replacement_box(op.arg(1).to_opref())
+            .resolve_box_box_opt(&op.arg(1))
             .and_then(|b| ctx.get_constant_int_box(&b))?;
         Some((array, descr.index(), index_val))
     }
@@ -1116,7 +1116,7 @@ impl OptHeap {
         // Non-virtual path: resolve forwarding and route after heap
         // optimizer.py:651-652 setarg loop parity.
         for i in 0..op.num_args() {
-            op.setarg(i, ctx.get_box_replacement(op.arg(i).to_opref()));
+            op.setarg(i, ctx.resolve_box_box(&op.arg(i)));
         }
         // heap.py:136: emit_extra(op, emit=False) → next_optimization
         ctx.emit_extra(ctx.current_pass_idx, op.clone());
@@ -1257,7 +1257,7 @@ impl OptHeap {
             // then put_field_back_to_info restores the cache.
             // optimizer.py:651-652 setarg loop parity.
             for i in 0..op.num_args() {
-                op.setarg(i, ctx.get_box_replacement(op.arg(i).to_opref()));
+                op.setarg(i, ctx.resolve_box_box(&op.arg(i)));
             }
             let final_value = op.arg(1);
             // heap.py:129,189-191: invalidate(descr) — purity self-gate
@@ -1307,7 +1307,7 @@ impl OptHeap {
 
             // optimizer.py:651-652 setarg loop parity.
             for i in 0..op.num_args() {
-                op.setarg(i, ctx.get_box_replacement(op.arg(i).to_opref()));
+                op.setarg(i, ctx.resolve_box_box(&op.arg(i)));
             }
             let final_value = op.arg(2);
             let array_ref = op.arg(0);
@@ -1569,7 +1569,7 @@ impl OptHeap {
         let mut stack: Vec<OpRef> = op
             .getarglist()
             .iter()
-            .map(|arg| ctx.get_box_replacement(arg.to_opref()).to_opref())
+            .map(|arg| ctx.resolve_box_box(&arg).to_opref())
             .collect();
         while let Some(owner) = stack.pop() {
             if owners.contains(&owner) {
@@ -1651,7 +1651,7 @@ impl OptHeap {
             }
             // optimizer.py:651-652 setarg loop parity.
             for i in 0..pending_op.num_args() {
-                pending_op.setarg(i, ctx.get_box_replacement(pending_op.arg(i).to_opref()));
+                pending_op.setarg(i, ctx.resolve_box_box(&pending_op.arg(i)));
             }
             self.emit_postponed_if_referenced(&pending_op, heap_pass_idx, ctx);
             let final_value = pending_op.arg(1);
@@ -1688,7 +1688,7 @@ impl OptHeap {
         for (descr_idx, index, _obj, mut pending_op) in pending_arrays {
             // optimizer.py:651-652 setarg loop parity.
             for i in 0..pending_op.num_args() {
-                pending_op.setarg(i, ctx.get_box_replacement(pending_op.arg(i).to_opref()));
+                pending_op.setarg(i, ctx.resolve_box_box(&pending_op.arg(i)));
             }
             self.invalidate_arrayitem_cache(descr_idx, index, ctx);
             self.emit_postponed_if_referenced(&pending_op, heap_pass_idx, ctx);
@@ -2447,7 +2447,7 @@ impl OptHeap {
         // intermediate cache mutations can take &mut ctx without
         // tripping the borrow checker).
         let _ = ctx.ensure_ptr_info_arg0(op);
-        let array_ref = ctx.get_box_replacement(op.arg(0).to_opref()).to_opref();
+        let array_ref = ctx.resolve_box_box(&op.arg(0)).to_opref();
 
         // Try constant-index cache first.
         if let Some(key) = Self::arrayitem_key(op, ctx) {
@@ -2542,7 +2542,7 @@ impl OptHeap {
                     let final_value = lazy_op.arg(2);
                     let descr = lazy_op.getdescr();
                     let lazy_obj = ctx
-                        .get_box_replacement(lazy_op.arg(0).to_opref())
+                        .resolve_box_box(&lazy_op.arg(0))
                         .to_opref();
                     self.cache_arrayitem(lazy_obj, descr_idx, const_index, descr.as_ref());
                     ctx.arrayinfo_setitem(&lazy_op, const_index as usize, final_value.to_opref());
@@ -2646,14 +2646,14 @@ impl OptHeap {
         if let Some(descr) = op.getdescr() {
             // heap.py:692-693: force lazy stores for this descr within the index bound
             let indexb = {
-                let b = ctx.get_box_replacement(op.arg(1).to_opref());
+                let b = ctx.resolve_box_box(&op.arg(1));
                 ctx.getintbound_handle(&b).borrow().clone()
             };
             self.force_lazy_setarrayitem(&descr, Some(&indexb), true, ctx);
 
             let descr_idx = descr.index();
             let arrayinfo = array_ref;
-            let indexbox = ctx.get_box_replacement(op.arg(1).to_opref()).to_opref();
+            let indexbox = ctx.resolve_box_box(&op.arg(1)).to_opref();
             if let Some(submap) = self.get_cached_array_submap(descr_idx) {
                 if let Some(cached) = submap.lookup_cached(arrayinfo, indexbox, ctx) {
                     let b_old = BoxRef::from_bound_op(op_rc);
@@ -2673,7 +2673,7 @@ impl OptHeap {
 
     fn optimize_setarrayitem(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         // heapcache.py:224-230 _escape_from_write parity:
-        let array_obj = ctx.get_box_replacement(op.arg(0).to_opref()).to_opref();
+        let array_obj = ctx.resolve_box_box(&op.arg(0)).to_opref();
         let stored_value = op.arg(2).to_opref();
         self.escape_from_write(array_obj, stored_value);
 
@@ -2686,13 +2686,13 @@ impl OptHeap {
                 //   return self.emit(op)
                 if let Some(descr) = op.getdescr() {
                     let indexb = {
-                        let b = ctx.get_box_replacement(op.arg(1).to_opref());
+                        let b = ctx.resolve_box_box(&op.arg(1));
                         ctx.getintbound_handle(&b).borrow().clone()
                     };
                     self.force_lazy_setarrayitem(&descr, Some(&indexb), false, ctx);
-                    let arrayinfo = ctx.get_box_replacement(op.arg(0).to_opref()).to_opref();
-                    let indexbox = ctx.get_box_replacement(op.arg(1).to_opref()).to_opref();
-                    let resbox = ctx.get_box_replacement(op.arg(2).to_opref()).to_opref();
+                    let arrayinfo = ctx.resolve_box_box(&op.arg(0)).to_opref();
+                    let indexbox = ctx.resolve_box_box(&op.arg(1)).to_opref();
+                    let resbox = ctx.resolve_box_box(&op.arg(2)).to_opref();
                     self.arrayitem_submap(&descr)
                         .cache_varindex_write(arrayinfo, indexbox, resbox);
                 }
@@ -2946,7 +2946,7 @@ impl OptHeap {
                             ctx.get_constant_int_box(&pending_op.arg(1).get_box_replacement(false))
                         {
                             let array = ctx
-                                .get_box_replacement(pending_op.arg(0).to_opref())
+                                .resolve_box_box(&pending_op.arg(0))
                                 .to_opref();
                             let cai = self.arrayitem_cache(&descr, index);
                             cai.lazy_set = Some((array, pending_op));
@@ -2956,7 +2956,7 @@ impl OptHeap {
                     } else {
                         let descr = pending_op.getdescr().unwrap().clone();
                         let obj = ctx
-                            .get_box_replacement(pending_op.arg(0).to_opref())
+                            .resolve_box_box(&pending_op.arg(0))
                             .to_opref();
                         let cf = self.field_cache(&descr);
                         cf.lazy_set = Some((obj, pending_op));
@@ -4088,7 +4088,7 @@ mod tests {
         op.pos.set(pos1);
         op.setarg(
             0,
-            ctx.get_box_replacement_box(op.arg(0).to_opref())
+            ctx.resolve_box_box_opt(&op.arg(0))
                 .expect("constant receiver resolves to a BoxRef"),
         );
 
@@ -4293,7 +4293,7 @@ mod tests {
             // optimizer.py:651-652 setarg loop parity.
             for i in 0..resolved.num_args() {
                 let arg = resolved.arg(i);
-                let rb = match ctx.get_box_replacement_box(arg.to_opref()) {
+                let rb = match ctx.resolve_box_box_opt(&arg) {
                     Some(b) => b,
                     None => {
                         let __ar = arg.to_opref();
@@ -4707,7 +4707,7 @@ mod tests {
             // optimizer.py:651-652 setarg loop parity.
             for i in 0..resolved.num_args() {
                 let arg = resolved.arg(i);
-                let rb = match ctx.get_box_replacement_box(arg.to_opref()) {
+                let rb = match ctx.resolve_box_box_opt(&arg) {
                     Some(b) => b,
                     None => {
                         let __ar = arg.to_opref();
@@ -5438,7 +5438,7 @@ mod tests {
             // optimizer.py:651-652 setarg loop parity.
             for i in 0..resolved.num_args() {
                 let arg = resolved.arg(i);
-                let rb = match ctx.get_box_replacement_box(arg.to_opref()) {
+                let rb = match ctx.resolve_box_box_opt(&arg) {
                     Some(b) => b,
                     None => {
                         let __ar = arg.to_opref();
@@ -6041,7 +6041,7 @@ mod tests {
             // optimizer.py:651-652 setarg loop parity.
             for i in 0..resolved.num_args() {
                 let arg = resolved.arg(i);
-                let rb = match ctx.get_box_replacement_box(arg.to_opref()) {
+                let rb = match ctx.resolve_box_box_opt(&arg) {
                     Some(b) => b,
                     None => {
                         let __ar = arg.to_opref();
@@ -6140,7 +6140,7 @@ mod tests {
             // optimizer.py:651-652 setarg loop parity.
             for i in 0..resolved.num_args() {
                 let arg = resolved.arg(i);
-                let rb = match ctx.get_box_replacement_box(arg.to_opref()) {
+                let rb = match ctx.resolve_box_box_opt(&arg) {
                     Some(b) => b,
                     None => {
                         let __ar = arg.to_opref();
@@ -6374,7 +6374,7 @@ mod tests {
             // optimizer.py:651-652 setarg loop parity.
             for i in 0..resolved.num_args() {
                 let arg = resolved.arg(i);
-                let rb = match ctx.get_box_replacement_box(arg.to_opref()) {
+                let rb = match ctx.resolve_box_box_opt(&arg) {
                     Some(b) => b,
                     None => {
                         let __ar = arg.to_opref();
@@ -6454,7 +6454,7 @@ mod tests {
             // optimizer.py:651-652 setarg loop parity.
             for i in 0..resolved.num_args() {
                 let arg = resolved.arg(i);
-                let rb = match ctx.get_box_replacement_box(arg.to_opref()) {
+                let rb = match ctx.resolve_box_box_opt(&arg) {
                     Some(b) => b,
                     None => {
                         let __ar = arg.to_opref();
@@ -6531,7 +6531,7 @@ mod tests {
             // optimizer.py:651-652 setarg loop parity.
             for i in 0..resolved.num_args() {
                 let arg = resolved.arg(i);
-                let rb = match ctx.get_box_replacement_box(arg.to_opref()) {
+                let rb = match ctx.resolve_box_box_opt(&arg) {
                     Some(b) => b,
                     None => {
                         let __ar = arg.to_opref();

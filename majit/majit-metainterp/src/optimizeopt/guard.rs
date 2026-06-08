@@ -1048,7 +1048,7 @@ impl Optimization for OptGuard {
         // optimizer context, enabling export to Phase 2.
         if op.opcode == OpCode::GuardValue {
             if let Some(c) = op.arg(1).get_box_replacement(false).const_int() {
-                ctx.make_constant(op.arg(0).to_opref(), majit_ir::Value::Int(c));
+                ctx.make_constant_arg(&op.arg(0), majit_ir::Value::Int(c));
             }
         }
 

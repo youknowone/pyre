@@ -593,7 +593,7 @@ impl OptString {
 
     /// Handle STRSETITEM: if target is virtual Plain and index is constant, track.
     fn optimize_strsetitem(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        let str_ref = ctx.get_box_replacement(op.arg(0).to_opref()).to_opref();
+        let str_ref = ctx.resolve_box_box(&op.arg(0)).to_opref();
         let idx_ref = op.arg(1).to_opref();
         let char_ref = op.arg(2).to_opref();
         let char_resolved = ctx.get_box_replacement(char_ref).to_opref();
@@ -628,7 +628,7 @@ impl OptString {
         op_rc: &majit_ir::OpRc,
         ctx: &mut OptContext,
     ) -> OptimizationResult {
-        let str_ref = ctx.get_box_replacement(op.arg(0).to_opref()).to_opref();
+        let str_ref = ctx.resolve_box_box(&op.arg(0)).to_opref();
         let idx_ref = op.arg(1).to_opref();
 
         if let Some(idx) = ctx
@@ -693,8 +693,8 @@ impl OptString {
         ctx: &mut OptContext,
     ) -> OptimizationResult {
         // copystrcontent(src, dst, src_start, dst_start, length)
-        let src_ref = ctx.get_box_replacement(op.arg(0).to_opref()).to_opref();
-        let dst_ref = ctx.get_box_replacement(op.arg(1).to_opref()).to_opref();
+        let src_ref = ctx.resolve_box_box(&op.arg(0)).to_opref();
+        let dst_ref = ctx.resolve_box_box(&op.arg(1)).to_opref();
         let src_start_ref = op.arg(2).to_opref();
         let dst_start_ref = op.arg(3).to_opref();
         let length_ref = op.arg(4).to_opref();
@@ -832,10 +832,10 @@ impl OptString {
             1u8
         };
         // OpRef → BoxRef shim until this caller migrates (Phase D-2).
-        if let Some(arg0_box) = ctx.get_box_replacement_box(op.arg(0).to_opref()) {
+        if let Some(arg0_box) = ctx.resolve_box_box_opt(&op.arg(0)) {
             ctx.make_nonnull_str(&arg0_box, mode);
         }
-        let str_ref = ctx.get_box_replacement(op.arg(0).to_opref()).to_opref();
+        let str_ref = ctx.resolve_box_box(&op.arg(0)).to_opref();
         if let Some(len) = self.get_known_length(str_ref, ctx) {
             let _ = len;
         }
@@ -846,7 +846,7 @@ impl OptString {
         let args: Vec<OpRef> = op
             .getarglist()
             .iter()
-            .map(|a| ctx.get_box_replacement(a.to_opref()).to_opref())
+            .map(|a| ctx.resolve_box_box(&a).to_opref())
             .collect();
         for arg in args {
             if self.is_virtual(arg, ctx) {
@@ -898,8 +898,8 @@ impl OptString {
         ctx: &mut OptContext,
     ) -> OptimizationResult {
         if op.num_args() >= 3 {
-            let vleft = ctx.get_box_replacement(op.arg(1).to_opref()).to_opref();
-            let vright = ctx.get_box_replacement(op.arg(2).to_opref()).to_opref();
+            let vleft = ctx.resolve_box_box(&op.arg(1)).to_opref();
+            let vright = ctx.resolve_box_box(&op.arg(2)).to_opref();
             // OpRef → BoxRef shim until this caller migrates (Phase D-2).
             if let Some(vleft_box) = ctx.get_box_replacement_box(vleft) {
                 ctx.make_nonnull_str(&vleft_box, mode);
@@ -939,13 +939,13 @@ impl OptString {
         ctx: &mut OptContext,
     ) -> OptimizationResult {
         if op.num_args() >= 4 {
-            let mut s = ctx.get_box_replacement(op.arg(1).to_opref()).to_opref();
+            let mut s = ctx.resolve_box_box(&op.arg(1)).to_opref();
             // OpRef → BoxRef shim until this caller migrates (Phase D-2).
             if let Some(s_box) = ctx.get_box_replacement_box(s) {
                 ctx.make_nonnull_str(&s_box, mode);
             }
-            let mut start = ctx.get_box_replacement(op.arg(2).to_opref()).to_opref();
-            let stop = ctx.get_box_replacement(op.arg(3).to_opref()).to_opref();
+            let mut start = ctx.resolve_box_box(&op.arg(2)).to_opref();
+            let stop = ctx.resolve_box_box(&op.arg(3)).to_opref();
             let lgtop = self.int_sub(stop, start, ctx);
             if let Some(info) = self.get_slice_info(s, ctx) {
                 let source = info.s;
@@ -986,8 +986,8 @@ impl OptString {
             return OptimizationResult::PassOn;
         }
         // vstring.py:693-696
-        let arg1 = ctx.get_box_replacement(op.arg(1).to_opref()).to_opref();
-        let arg2 = ctx.get_box_replacement(op.arg(2).to_opref()).to_opref();
+        let arg1 = ctx.resolve_box_box(&op.arg(1)).to_opref();
+        let arg2 = ctx.resolve_box_box(&op.arg(2)).to_opref();
         let i1 = ctx
             .getptrinfo(&op.arg(1).get_box_replacement(false))
             .is_some();
@@ -1352,9 +1352,9 @@ impl OptString {
         ctx: &mut OptContext,
     ) -> OptimizationResult {
         if op.num_args() >= 3 {
-            let arg1_box = ctx.get_box_replacement_box(op.arg(1).to_opref());
+            let arg1_box = ctx.resolve_box_box_opt(&op.arg(1));
             let length = ctx
-                .get_box_replacement_box(op.arg(2).to_opref())
+                .resolve_box_box_opt(&op.arg(2))
                 .and_then(|b| ctx.get_constant_int_box(&b));
             // vstring.py:844-845: i2.is_constant() && i1.is_virtual() &&
             // isinstance(i1, VStringPlainInfo)
@@ -1420,7 +1420,7 @@ impl Optimization for OptString {
 
             // vstring.py: STRHASH/UNICODEHASH — force virtual string and emit.
             OpCode::Strhash | OpCode::Unicodehash => {
-                let src = ctx.get_box_replacement(op.arg(0).to_opref()).to_opref();
+                let src = ctx.resolve_box_box(&op.arg(0)).to_opref();
                 self.force_if_virtual(src, ctx);
                 OptimizationResult::PassOn
             }
@@ -1532,7 +1532,7 @@ mod tests {
             // propagate_from_pass_range, so the pass reads PtrInfo/IntBound
             // directly off resolved_op.arg(i) instead of a fresh unbound box.
             for i in 0..resolved_op.num_args() {
-                resolved_op.setarg(i, ctx.get_box_replacement(resolved_op.arg(i).to_opref()));
+                resolved_op.setarg(i, ctx.resolve_box_box(&resolved_op.arg(i)));
             }
             let resolved_rc = std::rc::Rc::new(resolved_op.clone());
             ctx.bind_input_resops(std::slice::from_ref(&resolved_rc));

@@ -2258,7 +2258,7 @@ mod tests {
         // Resolve forwarded args (mirrors propagate_from_pass_range) so the op
         // carries the canonical const box the pass reads via get_constant_box.
         let resolved = ctx
-            .get_box_replacement_box(op.arg(0).to_opref())
+            .resolve_box_box_opt(&op.arg(0))
             .expect("constant arg resolves");
         op.setarg(0, resolved);
 
@@ -2297,7 +2297,7 @@ mod tests {
         // Resolve forwarded args (mirrors propagate_from_pass_range) so the op
         // carries the canonical const box the pass reads via get_constant_box.
         let resolved = ctx
-            .get_box_replacement_box(op.arg(0).to_opref())
+            .resolve_box_box_opt(&op.arg(0))
             .expect("constant arg resolves");
         op.setarg(0, resolved);
 
@@ -2338,7 +2338,7 @@ mod tests {
         // Resolve forwarded args (mirrors propagate_from_pass_range) so the op
         // carries the canonical const box the pass reads via get_constant_box.
         let resolved = ctx
-            .get_box_replacement_box(op.arg(0).to_opref())
+            .resolve_box_box_opt(&op.arg(0))
             .expect("constant arg resolves");
         op.setarg(0, resolved);
 
@@ -2382,7 +2382,7 @@ mod tests {
         // Resolve forwarded args (mirrors propagate_from_pass_range) so the op
         // carries the canonical const box the pass reads via get_constant_box.
         let resolved = ctx
-            .get_box_replacement_box(op.arg(0).to_opref())
+            .resolve_box_box_opt(&op.arg(0))
             .expect("constant arg resolves");
         op.setarg(0, resolved);
 
@@ -2847,7 +2847,7 @@ mod tests {
         for i in 0..op.num_args() {
             op.setarg(
                 i,
-                ctx.get_box_replacement_box(op.arg(i).to_opref())
+                ctx.resolve_box_box_opt(&op.arg(i))
                     .unwrap_or_else(|| op.arg(i).clone()),
             );
         }
