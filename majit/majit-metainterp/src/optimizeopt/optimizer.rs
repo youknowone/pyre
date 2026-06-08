@@ -4164,8 +4164,7 @@ impl Optimizer {
                             // (caught at pyjitpl/mod.rs:3454) on
                             // either invariant violation rather
                             // than silently coercing to 0.
-                            let boxindex =
-                                ctx.resolve_box_box(&pf_op.arg(1)).to_opref();
+                            let boxindex = ctx.resolve_box_box(&pf_op.arg(1)).to_opref();
                             let idx = match ctx
                                 .get_box_replacement_box(boxindex)
                                 .and_then(|cb| cb.const_int())

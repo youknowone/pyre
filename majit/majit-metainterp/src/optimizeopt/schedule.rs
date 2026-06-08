@@ -773,23 +773,29 @@ pub struct VecScheduleState {
     pub accumulation: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, AccumEntry>,
     /// Next OpRef counter for newly created vector ops.
     next_pos: u32,
-    /// `schedule.py:20-28 forwarded_vecinfo(op)` cache, keyed by full
-    /// `OpRef` (InputArg and op namespaces never collide).
+    /// `schedule.py:20-28 forwarded_vecinfo(op)` scratch, keyed by full `OpRef`
+    /// (InputArg and op namespaces never collide). PRE-EXISTING-ADAPTATION.
     ///
-    /// PyPy carries this scheduling scratch in `op._forwarded`. pyre cannot
-    /// store it there: `Op::clone` resets `forwarded` to `None`
-    /// (resoperation.rs:1352) while preserving `pos` (resoperation.rs:1344),
-    /// and the scheduler reads vecinfo off CLONED ops — the dependency graph
-    /// clones every op into its nodes (dependency.rs:221) and the
-    /// unroll/schedule paths clone `loop_.operations`. A clone-reset
-    /// `forwarded` would drop the stamp, and recompute-on-miss is NOT safe
-    /// for `INT_SIGNEXT`: its bytesize is the dynamic value of `arg1`
-    /// (`cast_to_bytesize_static` returns `None`, resoperation.rs:2310),
-    /// recoverable only through `int_signext_vecinfo`'s setup-time
-    /// box-replacement/const-pool resolver, which needs the optimizer
-    /// context that `vectorization_info_for_op(&Op)` does not hold. So a
-    /// `pos`-keyed cache — clone-stable because `OpRef`/`pos` survives a
-    /// clone — is required for correctness; it is not a stylistic split.
+    /// PyPy carries this scheduling scratch in `op._forwarded`
+    /// (`vector.py:54-56 setup_vectorization`) and re-propagates it across its
+    /// SINGLE clone path, `copy_resop` (`vector.py:35-40`), which COPIES the
+    /// already-resolved `VectorizationInfo` — INT_SIGNEXT's bytesize is the
+    /// dynamic value of `arg1`, resolved ONCE at setup time
+    /// (`resoperation.py:181-186`) and thereafter only copied, never recomputed.
+    /// pyre cannot store it on `op._forwarded` yet because it has no `copy_resop`
+    /// analog: `Op::clone` resets `forwarded` to `None` (resoperation.rs) while
+    /// preserving `pos`, and the scheduler reads vecinfo off CLONED ops — the
+    /// dependency graph clones every op into its nodes (dependency.rs) and the
+    /// unroll/schedule paths clone `loop_.operations`. A clone-reset `forwarded`
+    /// would drop the stamp with nothing to re-attach it. The `pos`-keyed cache
+    /// is clone-stable (`OpRef`/`pos` survives a clone) and stands in until a
+    /// `copy_resop`-equivalent exists.
+    ///
+    /// Convergence path: a `Forwarded::VectorInfo` variant + a `copy_resop`
+    /// analog that re-attaches the resolved struct at every vectorizer clone
+    /// site, keeping the const-pool resolver only at the single setup-time
+    /// INT_SIGNEXT stamp (`int_signext_vecinfo`). GC-adjacent (touches the
+    /// shared `_forwarded` core); needs x86_64 + vectorizer-on validation.
     ///
     /// `Op.vecinfo` is the SEPARATE permanent carrier: the
     /// `resoperation.py:111-127 VecOperationNew` datatype/bytesize/signed/count

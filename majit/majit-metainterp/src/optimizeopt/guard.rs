@@ -12,9 +12,9 @@
 //! `make_constant` — `rewrite.py` `optimize_GUARD_*`.
 use majit_ir::{Op, OpCode, OpRef};
 
-use crate::optimizeopt::dependency::IndexVar;
-use crate::optimizeopt::OptContext;
 use crate::r#box::BoxRef;
+use crate::optimizeopt::OptContext;
+use crate::optimizeopt::dependency::IndexVar;
 
 /// guard.py:16-163: Guard — wraps a guard op with its comparison op for
 /// implication analysis (vector optimizer).

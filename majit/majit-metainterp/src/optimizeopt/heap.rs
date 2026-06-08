@@ -2541,9 +2541,7 @@ impl OptHeap {
                     // can_cache=True: put_field_back_to_info
                     let final_value = lazy_op.arg(2);
                     let descr = lazy_op.getdescr();
-                    let lazy_obj = ctx
-                        .resolve_box_box(&lazy_op.arg(0))
-                        .to_opref();
+                    let lazy_obj = ctx.resolve_box_box(&lazy_op.arg(0)).to_opref();
                     self.cache_arrayitem(lazy_obj, descr_idx, const_index, descr.as_ref());
                     ctx.arrayinfo_setitem(&lazy_op, const_index as usize, final_value.to_opref());
                 }
@@ -2945,9 +2943,7 @@ impl OptHeap {
                         if let Some(index) =
                             ctx.get_constant_int_box(&pending_op.arg(1).get_box_replacement(false))
                         {
-                            let array = ctx
-                                .resolve_box_box(&pending_op.arg(0))
-                                .to_opref();
+                            let array = ctx.resolve_box_box(&pending_op.arg(0)).to_opref();
                             let cai = self.arrayitem_cache(&descr, index);
                             cai.lazy_set = Some((array, pending_op));
                         } else {
@@ -2955,9 +2951,7 @@ impl OptHeap {
                         }
                     } else {
                         let descr = pending_op.getdescr().unwrap().clone();
-                        let obj = ctx
-                            .resolve_box_box(&pending_op.arg(0))
-                            .to_opref();
+                        let obj = ctx.resolve_box_box(&pending_op.arg(0)).to_opref();
                         let cf = self.field_cache(&descr);
                         cf.lazy_set = Some((obj, pending_op));
                     }

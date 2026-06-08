@@ -4146,10 +4146,7 @@ impl OptContext {
     /// unbound-operand adaptation (RPython has no unbound boxes): an unbound
     /// operand resolves through the `OpRef` store and surfaces `None` when the
     /// root does not resolve (sentinel / baseline) so callers can branch on it.
-    pub fn resolve_box_box_opt(
-        &self,
-        arg: &crate::r#box::BoxRef,
-    ) -> Option<crate::r#box::BoxRef> {
+    pub fn resolve_box_box_opt(&self, arg: &crate::r#box::BoxRef) -> Option<crate::r#box::BoxRef> {
         if arg.bound_op().is_some() || arg.is_constant() {
             let resolved = arg.get_box_replacement(false);
             #[cfg(debug_assertions)]

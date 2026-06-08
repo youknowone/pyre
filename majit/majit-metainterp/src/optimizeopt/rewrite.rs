@@ -2160,9 +2160,7 @@ impl OptRewrite {
                 // previous gating on get_constant_int dropped the Ref
                 // case entirely so prior GUARD_NONNULL/GUARD_CLASS were
                 // never strengthened to GUARD_VALUE for Ref-typed args.
-                if let Some(c_value) = ctx
-                    .resolve_box_box_opt(&arg1)
-                    .and_then(|b| b.const_value())
+                if let Some(c_value) = ctx.resolve_box_box_opt(&arg1).and_then(|b| b.const_value())
                 {
                     // rewrite.py:321-323: c_value.nonnull(). ConstInt.nonnull
                     // == (value != 0); ConstPtr.nonnull == (gcref != null).
@@ -2548,9 +2546,7 @@ impl OptRewrite {
                     && shift_op.num_args() >= 2
                     && shift_op.arg(0).get_box_replacement(false).const_int() == Some(1)
                 {
-                    let shiftvar = ctx
-                        .resolve_box_box(&shift_op.arg(1))
-                        .to_opref();
+                    let shiftvar = ctx.resolve_box_box(&shift_op.arg(1)).to_opref();
                     let shiftbound = {
                         let b = ctx.get_box_replacement(shiftvar);
                         ctx.getintbound_handle(&b).borrow().clone()

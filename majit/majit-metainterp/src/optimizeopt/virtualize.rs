@@ -2757,8 +2757,7 @@ mod tests {
                 resolved_op.setarg(
                     i,
                     crate::r#box::BoxRef::from_opref(
-                        ctx.resolve_box_box(&resolved_op.arg(i))
-                            .to_opref(),
+                        ctx.resolve_box_box(&resolved_op.arg(i)).to_opref(),
                     ),
                 );
             }
@@ -2896,8 +2895,7 @@ mod tests {
                 resolved.setarg(
                     i,
                     crate::r#box::BoxRef::from_opref(
-                        ctx.resolve_box_box(&resolved.arg(i))
-                            .to_opref(),
+                        ctx.resolve_box_box(&resolved.arg(i)).to_opref(),
                     ),
                 );
             }
@@ -4584,8 +4582,7 @@ mod tests {
                 resolved_op.setarg(
                     i,
                     crate::r#box::BoxRef::from_opref(
-                        ctx.resolve_box_box(&resolved_op.arg(i))
-                            .to_opref(),
+                        ctx.resolve_box_box(&resolved_op.arg(i)).to_opref(),
                     ),
                 );
             }
