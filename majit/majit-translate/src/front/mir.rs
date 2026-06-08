@@ -962,7 +962,9 @@ impl<'a> Lowering<'a> {
                 SwitchTargets::If(a, b) => vec![a, b],
                 SwitchTargets::SwitchInt(_, arms, default) => {
                     let mut v: Vec<u64> = arms.iter().map(|(_, bb)| *bb).collect();
-                    v.push(default);
+                    if !self.switch_default_targets_panic_abort(default) {
+                        v.push(default);
+                    }
                     v
                 }
             },
@@ -974,6 +976,20 @@ impl<'a> Lowering<'a> {
             .map(|t| t as usize)
             .filter(|&t| t < n)
             .collect()
+    }
+
+    /// True when MIR block `bb`'s terminator is a panic/abort stub
+    /// (`Abort` / `UnwindResume`).  rustc lowers the out-of-range
+    /// `default` arm of an enum-discriminant `SwitchInt` to such a block
+    /// — an unreachable UB stub with no flowgraph analogue.  Excluding it
+    /// from the switch's successors keeps the orphan `set_raise`
+    /// cleanup chain (with its undefined etype/evalue) out of the produced
+    /// graph instead of leaving it as a live, undefined-operand block.
+    fn switch_default_targets_panic_abort(&self, bb: u64) -> bool {
+        matches!(
+            self.body.body.get(bb as usize).and_then(|b| b.term().ok()),
+            Some(TermKind::Abort(_)) | Some(TermKind::UnwindResume)
+        )
     }
 
     /// Blocks reachable from bb0 over [`Self::model_succs`].
@@ -2891,16 +2907,18 @@ impl<'a> Lowering<'a> {
                         .with_llexitcase_from_exitcase(),
                     );
                 }
-                let default_args = self.edge_args(mir_bb, default as usize)?;
-                links.push(
-                    Link::from_variables(
-                        &self.graph,
-                        default_args,
-                        self.block_id[default as usize],
-                        Some(ExitCase::Const(ConstValue::UniStr("default".into()))),
-                    )
-                    .with_prevblock(bb_id),
-                );
+                if !self.switch_default_targets_panic_abort(default) {
+                    let default_args = self.edge_args(mir_bb, default as usize)?;
+                    links.push(
+                        Link::from_variables(
+                            &self.graph,
+                            default_args,
+                            self.block_id[default as usize],
+                            Some(ExitCase::Const(ConstValue::UniStr("default".into()))),
+                        )
+                        .with_prevblock(bb_id),
+                    );
+                }
                 self.graph.block_mut(bb_id).exitswitch = Some(ExitSwitch::Value(discr_var));
                 self.graph.closeblock(bb_id, links);
                 Ok(())
