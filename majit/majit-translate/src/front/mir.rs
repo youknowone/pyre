@@ -1134,6 +1134,22 @@ impl<'a> Lowering<'a> {
             if bb != 0 {
                 let inputargs = st.getvariables(&self.graph);
                 self.graph.block_mut(bb_id).inputargs = inputargs;
+                // Anchor the block body to the framestate locals.
+                // `lower_block` reloads `self.local_var` from
+                // `block_entry_local_var[bb]` (the construction-time
+                // per-block-entry Variables), so without this the body
+                // would bind locals to those construction identities
+                // while the inputargs above (and the `getoutputargs`
+                // link args in Pass 2) carry the union-minted framestate
+                // identities.  The mismatch leaves the body's operand
+                // Variables defined as neither an inputarg nor an op
+                // result, so `perform_register_allocation` assigns them
+                // no colour and `assembler::lookup_coloring` aborts.
+                // `self.local_var` here is exactly `setstate(&st)`'s
+                // positional projection of the framestate entries, whose
+                // Variable cells are the same identities `getvariables`
+                // threaded into `inputargs`.
+                self.block_entry_local_var[bb] = self.local_var.clone();
             }
             self.lower_block(bb)?;
             let ex = self.getstate();
