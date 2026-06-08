@@ -3405,25 +3405,6 @@ pub extern "C" fn bh_unpack_item_fn(index: i64, seq: i64) -> i64 {
     }
 }
 
-pub extern "C" fn bh_store_subscr_fn(obj: i64, key: i64, value: i64) -> i64 {
-    let obj = obj as pyre_object::PyObjectRef;
-    let key = key as pyre_object::PyObjectRef;
-    let value = value as pyre_object::PyObjectRef;
-    if obj.is_null() || key.is_null() {
-        let err = pyre_interpreter::PyError::new(
-            pyre_interpreter::PyErrorKind::TypeError,
-            "store subscript on null operand".to_string(),
-        );
-        majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(err.to_exc_object() as i64));
-        return 0;
-    }
-    if let Err(err) = pyre_interpreter::baseobjspace::setitem(obj, key, value) {
-        let exc_obj = err.to_exc_object();
-        majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc_obj as i64));
-        return 0;
-    }
-    1 // success (non-zero)
-}
 
 /// Read the current (per-thread) exception saved in
 /// `pyre_interpreter::eval::CURRENT_EXCEPTION`. Matches the read at

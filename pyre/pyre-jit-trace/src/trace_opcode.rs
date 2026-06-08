@@ -238,7 +238,6 @@ fn trace_plain_int_payload(
         if is_long(concrete_item) {
             return crate::state::trace_unbox_long_with_resume(
                 frame,
-                ctx,
                 item,
                 &LONG_TYPE as *const _ as i64,
             );
@@ -4959,7 +4958,6 @@ impl MIFrame {
                     } else {
                         crate::state::trace_unbox_float_with_resume(
                             this,
-                            ctx,
                             items[0],
                             &FLOAT_TYPE as *const _ as i64,
                         )
@@ -4969,7 +4967,6 @@ impl MIFrame {
                     } else {
                         crate::state::trace_unbox_float_with_resume(
                             this,
-                            ctx,
                             items[1],
                             &FLOAT_TYPE as *const _ as i64,
                         )

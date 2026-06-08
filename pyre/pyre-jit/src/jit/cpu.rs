@@ -154,7 +154,7 @@ impl Cpu {
             box_int_fn: crate::call_jit::bh_box_int_fn,
             truth_fn: crate::call_jit::bh_truth_fn,
             load_const_fn: crate::call_jit::bh_load_const_fn,
-            store_subscr_fn: crate::call_jit::bh_store_subscr_fn,
+            store_subscr_fn: pyre_interpreter::opcode_ops::bh_store_subscr_fn,
             build_list_fn: crate::call_jit::bh_build_list_fn,
             build_tuple_fn: crate::call_jit::bh_build_tuple_fn,
             unpack_sequence_fn: crate::call_jit::bh_unpack_sequence_fn,
