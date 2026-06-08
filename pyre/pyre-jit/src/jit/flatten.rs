@@ -1711,7 +1711,7 @@ impl<'a> GraphFlattener<'a> {
         }
     }
 
-    fn insert_exits(&mut self, block: &BlockRef, handling_ovf: bool) {
+    fn insert_exits(&mut self, block: &BlockRef, handling_ovf: bool, block_emit_start: usize) {
         let exits = block.borrow().exits.clone();
         if exits.len() == 1 {
             // `flatten.py:181 assert link.exitcase in (None, False, True)`
@@ -1814,12 +1814,45 @@ impl<'a> GraphFlattener<'a> {
             // return path that upstream takes for canraise blocks
             // that survived metainterp policy but lack a real
             // raising-op-with-trailing-`-live-` pattern.
-            let last_op_is_live = block
-                .borrow()
-                .operations
-                .last()
-                .map_or(false, |op| op.opname == OPNAME_LIVE);
-            if !self.include_all_exc_links && !last_op_is_live {
+            //
+            // PRE-EXISTING-ADAPTATION (vable-ops-baked-into-graph): upstream
+            // blocks end at `[raising_op, -live-]` because flowspace's
+            // `guessexception` (flowcontext.py:130-156) closes the block at
+            // each can-raise op.  Pyre's walker does NOT split there, so the
+            // raising op's vable-mirror stores (setfield_vable_i /
+            // setarrayitem_vable_r for the post-op frame state) follow the
+            // `-live-` in the SAME block — the block's last op is a vable
+            // store, never `-live-`.  The graph-tail `last_op_is_live` scan
+            // therefore reports `index == -1` for EVERY pyre canraise block
+            // (verified raise_catch_loop: 50/50 blocks), dropping all
+            // `catch_exception` emission and stranding the exception edge.
+            // On the canonical (lowering_ctx) path detect the raising op off
+            // the EMITTED stream instead: `serialize_op` lowers HLOps
+            // (mod/eq/add/simple_call) and residual calls to
+            // `residual_call_*` and appends a trailing `-live-` exactly when
+            // `insn_needs_trailing_live` (calldescr_canraise), so the same
+            // predicate over the block's emitted insns recognises a real
+            // raising op regardless of the trailing vable stores.  Spurious
+            // canraise blocks (empty joinpoints, vable-only, non-raising
+            // residual_call_r_r/r_v) carry no such insn and keep the
+            // early-return.  The block has at most one raising op (verified
+            // raise_catch_loop), so one `catch_exception` at block end —
+            // after the raising op's vable stores, matching the production
+            // walker's per-PC `emit_catch_exception!` placement — is
+            // correct.  Graph CFG is untouched, so regalloc / gate-off
+            // bytes are unchanged.
+            let block_can_raise = if self.lowering_ctx.is_some() {
+                self.ssarepr.insns[block_emit_start..]
+                    .iter()
+                    .any(insn_needs_trailing_live)
+            } else {
+                block
+                    .borrow()
+                    .operations
+                    .last()
+                    .map_or(false, |op| op.opname == OPNAME_LIVE)
+            };
+            if !self.include_all_exc_links && !block_can_raise {
                 self.make_link(&normal_link, false);
                 return;
             }
@@ -2187,6 +2220,12 @@ impl<'a> GraphFlattener<'a> {
         let operations = block.borrow().operations.clone();
         let exits_len = block.borrow().exits.len();
         let exitswitch_is_last_exception = block.borrow().canraise();
+        // First emitted-insn index of this block's serialized ops, so
+        // `insert_exits` can detect a real raising op off the lowered
+        // stream (a `residual_call_*` whose calldescr can raise) rather
+        // than the graph tail, which pyre's vable-mirror stores push past
+        // the `-live-`.  See the canraise PRE-EXISTING-ADAPTATION there.
+        let block_emit_start = self.ssarepr.insns.len();
         for op in &operations {
             // `flatten.py:120-125` `_ovf` validity check: an overflow-
             // checked op must live in a canraise block with 2 or 3
@@ -2207,7 +2246,7 @@ impl<'a> GraphFlattener<'a> {
             }
             self.serialize_op(op);
         }
-        self.insert_exits(&block, handling_ovf);
+        self.insert_exits(&block, handling_ovf, block_emit_start);
     }
 
     fn flatten_space_operation(&mut self, op: &SpaceOperation) -> Insn {
