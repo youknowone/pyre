@@ -85,42 +85,60 @@ pub fn monotonic(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 /// `std::thread::sleep` otherwise.
 pub fn sleep(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(args.len() == 1, "sleep() takes exactly one argument");
-    // `timeutils.py:20-38 timestamp_w` — a float rejects NaN; everything
-    // else goes through `space.bigint_w`, so bools are accepted (int
-    // subclass) and any other type raises TypeError.
-    let secs = unsafe {
+    // `timeutils.py:20-38 timestamp_w` — reduce the argument to an integer
+    // number of nanoseconds. A float scales then `math.ceil`s, with an
+    // `ovfcheck_float_to_longlong` overflow guard and a NaN ValueError; an
+    // int (or bool, an int subclass) takes `bigint_w().tolonglong()` and
+    // multiplies by 10**9 under the same overflow guard; anything else is a
+    // TypeError.
+    const SECS_TO_NS: i64 = 1_000_000_000;
+    let timeout_ns: i64 = unsafe {
+        let overflow = || {
+            crate::PyError::overflow_error(format!(
+                "timestamp {} too large to convert to C _PyTime_t",
+                crate::py_repr(args[0])
+            ))
+        };
         if is_float(args[0]) {
-            let s = floatobject::w_float_get_value(args[0]);
-            if s.is_nan() {
+            let secs = floatobject::w_float_get_value(args[0]);
+            if secs.is_nan() {
                 return Err(crate::PyError::value_error("timestamp is nan"));
             }
-            s
-        } else if is_int(args[0]) {
-            w_int_get_value(args[0]) as f64
-        } else if is_bool(args[0]) {
-            if boolobject::w_bool_get_value(args[0]) {
-                1.0
-            } else {
-                0.0
+            // `rarithmetic.ovfcheck_float_to_longlong` bounds.
+            let result_float = (secs * SECS_TO_NS as f64).ceil();
+            if !(-9223372036854776832.0..9223372036854775296.0).contains(&result_float) {
+                return Err(overflow());
             }
+            result_float as i64
         } else {
-            let name = crate::typedef::r#type(args[0])
-                .map(|tp| w_type_get_name(tp).to_string())
-                .unwrap_or_else(|| "object".to_string());
-            return Err(crate::PyError::type_error(format!(
-                "'{name}' object cannot be interpreted as an integer"
-            )));
+            let sec = if is_int(args[0]) {
+                w_int_get_value(args[0])
+            } else if pyre_object::pyobject::is_long(args[0]) {
+                let big = pyre_object::longobject::w_long_get_value(args[0]);
+                i64::try_from(big).map_err(|_| overflow())?
+            } else if is_bool(args[0]) {
+                boolobject::w_bool_get_value(args[0]) as i64
+            } else {
+                let name = crate::typedef::r#type(args[0])
+                    .map(|tp| w_type_get_name(tp).to_string())
+                    .unwrap_or_else(|| "object".to_string());
+                return Err(crate::PyError::type_error(format!(
+                    "'{name}' object cannot be interpreted as an integer"
+                )));
+            };
+            sec.checked_mul(SECS_TO_NS).ok_or_else(|| overflow())?
         }
     };
-    if secs < 0.0 {
+    // `interp_time.py:624` — `if not (timeout >= 0)`.
+    if timeout_ns < 0 {
         return Err(crate::PyError::value_error(
             "sleep length must be non-negative",
         ));
     }
-    if secs == 0.0 {
+    if timeout_ns == 0 {
         return Ok(w_none());
     }
-    let dur = std::time::Duration::from_secs_f64(secs);
+    let dur = std::time::Duration::from_nanos(timeout_ns as u64);
     #[cfg(all(unix, feature = "host_env"))]
     {
         // `interp_time.py:622-710 time_sleep` — sleep toward a monotonic
