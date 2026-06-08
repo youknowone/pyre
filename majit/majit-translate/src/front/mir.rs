@@ -3569,10 +3569,15 @@ fn canonical_binop_label(tag: &str, subkind: Option<&str>) -> String {
         ("Mul" | "MulChecked" | "MulWrap", _) => "mul".into(),
         ("Div", _) => "floordiv".into(),
         ("Rem", _) => "mod".into(),
-        // Bitwise.
-        ("BitAnd", _) => "and".into(),
-        ("BitOr", _) => "or".into(),
-        ("BitXor", _) => "xor".into(),
+        // Bitwise.  The canonical pyre labels carry the `bit` prefix so
+        // `jit_codewriter::jtransform` (`bitand`/`bitor`/`bitxor` arm) and
+        // the rtyper adapter `normalize_binop_name` (`bitand`->`and_`,
+        // `bitor`->`or_`, `bitxor`->`xor`) recognise them.  Bare `and`/`or`
+        // are reserved for short-circuit control flow, which never reaches
+        // here: rustc lowers `&&`/`||` to branches before charon.
+        ("BitAnd", _) => "bitand".into(),
+        ("BitOr", _) => "bitor".into(),
+        ("BitXor", _) => "bitxor".into(),
         // Shifts.
         ("Shl" | "ShlChecked" | "ShlWrap", _) => "lshift".into(),
         ("Shr" | "ShrChecked" | "ShrWrap", _) => "rshift".into(),
