@@ -2290,7 +2290,18 @@ impl<'a> Lowering<'a> {
         kind: &serde_json::Value,
     ) -> Option<(Vec<String>, String, Vec<String>)> {
         let adt = kind.as_object()?.get("Adt")?.as_array()?;
-        let type_id = adt.first()?.as_u64()?;
+        // The first element is a Charon type body
+        // `{"id": {"Adt": <def_id>} | "Tuple" | {"Builtin": …}, "generics": …}`.
+        // The ADT `def_id` is nested at `[0]["id"]["Adt"]`; a `"Tuple"`
+        // / builtin atom `id` has no user-defined class and falls
+        // through to `None` (the Tuple/Array placeholder).
+        let type_id = adt
+            .first()?
+            .as_object()?
+            .get("id")?
+            .as_object()?
+            .get("Adt")?
+            .as_u64()?;
         let variant_idx = adt.get(1).and_then(serde_json::Value::as_u64);
         let td = self.llbc.type_by_id(type_id)?;
         let name_path = td.item_meta.name_path();
