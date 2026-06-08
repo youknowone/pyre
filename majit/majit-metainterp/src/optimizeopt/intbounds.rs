@@ -123,10 +123,10 @@ impl OptIntBounds {
         ctx.getintbound_handle(b).borrow().clone()
     }
 
-    /// `BoxRef`-operand variant of [`getintbound_box`]: resolves the operand
-    /// Box to its `_forwarded` terminal via `resolve_box_box` (the box-native
-    /// `get_box_replacement` step) and reads the bound, without collapsing the
-    /// operand to an `OpRef` first.
+    /// `BoxRef`-operand variant of [`getintbound_box`]. optimizer.py:99
+    /// `getintbound(self, op)` does `op = get_box_replacement(op)` then reads
+    /// the bound; this takes that resolve box-native via `resolve_box_box`,
+    /// without collapsing the operand to an `OpRef` first.
     fn getintbound_arg(&self, arg: BoxRef, ctx: &mut OptContext) -> IntBound {
         let b = ctx.resolve_box_box(&arg);
         ctx.getintbound_handle(&b).borrow().clone()

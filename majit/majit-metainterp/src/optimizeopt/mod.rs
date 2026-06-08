@@ -4140,10 +4140,12 @@ impl OptContext {
     }
 
     /// `Option`-returning sibling of [`OptContext::resolve_box_box`], the
-    /// box-native form of `get_box_replacement_box`. A bound operand (or
-    /// Const) walks its own `_forwarded` chain; an unbound operand resolves
-    /// through the `OpRef` store, surfacing `None` when the root does not
-    /// resolve (sentinel / unbound baseline) so callers can branch on it.
+    /// box-native form of `get_box_replacement_box`. resoperation.py:58
+    /// `get_box_replacement(op)` walks the box's `_forwarded` chain; a bound
+    /// operand (or Const) walks it directly here. The `None` arm is pyre's
+    /// unbound-operand adaptation (RPython has no unbound boxes): an unbound
+    /// operand resolves through the `OpRef` store and surfaces `None` when the
+    /// root does not resolve (sentinel / baseline) so callers can branch on it.
     pub fn resolve_box_box_opt(
         &self,
         arg: &crate::r#box::BoxRef,
@@ -4871,10 +4873,10 @@ impl OptContext {
         }
     }
 
-    /// `BoxRef`-operand form of [`OptContext::make_constant`]: resolves the
-    /// operand Box to its terminal via `resolve_box_box_opt` (the box-native
-    /// `get_box_replacement_box`) rather than collapsing to an `OpRef` first,
-    /// then forwards the constant onto that terminal.
+    /// `BoxRef`-operand form of [`OptContext::make_constant`]. optimizer.py:413
+    /// `make_constant(box, constbox)` does `box = get_box_replacement(box)` then
+    /// forwards the constant; this takes that first resolve box-native via
+    /// `resolve_box_box_opt` instead of collapsing the operand to an `OpRef`.
     pub fn make_constant_arg(&mut self, arg: &crate::r#box::BoxRef, value: Value) {
         let b = self.resolve_box_box_opt(arg).or_else(|| {
             let opref = arg.to_opref();
