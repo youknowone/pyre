@@ -1095,6 +1095,7 @@ fn derive_pc_live_indices_from_sparse(
 fn resume_target_resolver_coverage(
     ssarepr: &super::flatten::SSARepr,
     live_indices: &[Option<usize>],
+    code: &CodeObject,
 ) -> (usize, usize, usize, usize, usize) {
     // Owner-pc lookup keyed on stream position: `pc_first_insn_pos` is built
     // first-wins as the stream grows, so its positions are already ascending;
@@ -1146,9 +1147,28 @@ fn resume_target_resolver_coverage(
             // `Insn::Op` carries its result inline, so the marker is q+1);
             // non-raising residual_calls have none.
             if ssarepr.insns.get(q + 1).is_some_and(|n| n.is_live()) {
-                canraise += 1;
-                if fed.contains(&(q + 1)) {
-                    canraise_fed += 1;
+                // A can-raise whose semantic fallthrough PC is out of range
+                // — the owner op is an unconditional-raise terminator
+                // (`reraise` / `raise` at the function's exception-cleanup
+                // tail, e.g. a `Reraise` at the last PC) — has no
+                // in-function no-exception continuation: when it fires the
+                // exception unwinds out of the frame and the blackhole
+                // resumes in the CALLER, never at a PC of this function
+                // (its semantic fallthrough is `>= num_instrs`).  So it is
+                // not a structural resume target; exclude it from the count
+                // (otherwise its unfeedable trailing marker reads as a
+                // permanent `stranded` decline and blocks the splice).  The
+                // runtime keys a can-raise resume on `fallthrough_pc` (#285,
+                // trace_opcode.rs:3634), so this matches the runtime: a
+                // terminator-raise never records an `after_residual_call`
+                // resume into a PC of its own frame.
+                let ft = owner_pc(q)
+                    .map(|p| pyre_jit_trace::metainterp::semantic_fallthrough_pc(code, p));
+                if ft.is_some_and(|f| f < n_pcs) {
+                    canraise += 1;
+                    if fed.contains(&(q + 1)) {
+                        canraise_fed += 1;
+                    }
                 }
             }
         }
@@ -10216,7 +10236,7 @@ impl CodeWriter {
                 // to the runtime's structural resume targets (branch guards
                 // + can-raise calls, #285) and report how the resolver feeds
                 // / keys each.
-                let resume = resume_target_resolver_coverage(&canonical, &live_indices);
+                let resume = resume_target_resolver_coverage(&canonical, &live_indices, code);
                 (
                     bucket_measure_insns(&canonical.insns),
                     genuine_opname_tally(&canonical.insns),
@@ -10637,7 +10657,7 @@ impl CodeWriter {
                 // correct per-PC marker for every resume target.  Gate-on
                 // only — gate-off never enters this block.
                 let stranded = derived.as_ref().map_or(0, |d| {
-                    let (rb, _rbk, rbf, rc, rcf) = resume_target_resolver_coverage(&spliced, d);
+                    let (rb, _rbk, rbf, rc, rcf) = resume_target_resolver_coverage(&spliced, d, code);
                     (rb - rbf) + (rc - rcf)
                 });
                 // #302/PR#145① splice precondition: the per-slot resume

@@ -1045,7 +1045,13 @@ enum LoopAction {
     Return(TraceAction),
 }
 
-pub(crate) fn semantic_fallthrough_pc(code: &CodeObject, pc: usize) -> usize {
+/// The PC the tracer auto-advances to after `pc` (skipping
+/// `ExtendedArg` / `Resume` / `Nop` / `Cache` / `NotTaken`), i.e. the
+/// value the tracer stores in `MIFrame::fallthrough_pc`.  `pub` so the
+/// codewriter's splice resume-coverage gate can compute a can-raise op's
+/// `after_residual_call` resume PC the same way the runtime does
+/// (trace_opcode.rs:3634 `resume_pc = self.fallthrough_pc`).
+pub fn semantic_fallthrough_pc(code: &CodeObject, pc: usize) -> usize {
     let mut next_pc = pc.saturating_add(1);
     loop {
         match pyre_interpreter::decode_instruction_at(code, next_pc) {
