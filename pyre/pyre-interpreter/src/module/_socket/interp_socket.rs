@@ -2309,12 +2309,9 @@ fn init_socket_type(ns: &mut DictStorage) {
                     "integer argument expected, got float",
                 ));
             }
-            if !unsafe { pyre_object::is_int(fileno_obj) } {
-                return Err(crate::PyError::type_error(
-                    "socket: fileno must be an integer or None",
-                ));
-            }
-            let fd = unsafe { pyre_object::w_int_get_value(fileno_obj) };
+            // `interp_socket.py:255` — `space.int_w(w_fileno)` accepts ints,
+            // longs, and objects with `__int__` / `__index__`.
+            let fd = crate::baseobjspace::int_w(fileno_obj)?;
             if fd < 0 {
                 return Err(crate::PyError::value_error("negative file descriptor"));
             }

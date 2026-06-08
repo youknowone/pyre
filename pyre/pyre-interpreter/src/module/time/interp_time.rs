@@ -683,8 +683,11 @@ fn _gettmarg(args: &[PyObjectRef], default_now: bool) -> Result<c_tm, crate::PyE
         ));
     };
 
+    // `interp_time.py:801` — `space.fixedview(w_tup)` accepts any sequence
+    // (tuple, list, struct_time), not only an exact tuple.
+    let tup_w = crate::baseobjspace::fixedview(tup, -1)?;
+    let len = tup_w.len();
     unsafe {
-        let len = w_tuple_len(tup);
         if len < 9 {
             return Err(crate::PyError::type_error(format!(
                 "argument must be sequence of at least length 9, not {len}"
@@ -693,7 +696,7 @@ fn _gettmarg(args: &[PyObjectRef], default_now: bool) -> Result<c_tm, crate::PyE
         // `baseobjspace.py:1976 c_int_w` — int_w with a 32-bit range check;
         // floats and non-integers raise rather than being truncated.
         let c_int_w = |i: usize| -> Result<i32, crate::PyError> {
-            crate::baseobjspace::c_int_w(w_tuple_getitem(tup, i as i64).unwrap())
+            crate::baseobjspace::c_int_w(tup_w[i])
         };
         let y = c_int_w(0)?;
         // A zero month / day / yday is normalized to 1 before the C-struct
@@ -732,7 +735,7 @@ fn _gettmarg(args: &[PyObjectRef], default_now: bool) -> Result<c_tm, crate::PyE
         // `tm_zone` (idx 9, via `utf8_w`) and length >=11 supplies
         // `tm_gmtoff` (idx 10).
         if len >= 10 {
-            tm.tm_zone = crate::baseobjspace::utf8_w(w_tuple_getitem(tup, 9).unwrap())?.to_string();
+            tm.tm_zone = crate::baseobjspace::utf8_w(tup_w[9])?.to_string();
         }
         if len >= 11 {
             tm.tm_gmtoff = c_int_w(10)? as i64;

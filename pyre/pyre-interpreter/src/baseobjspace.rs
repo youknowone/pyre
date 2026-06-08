@@ -5692,9 +5692,18 @@ pub fn float_w(obj: PyObjectRef) -> Result<f64, PyError> {
         }
         if pyre_object::pyobject::is_long(obj) {
             use num_traits::ToPrimitive;
-            return Ok(pyre_object::longobject::w_long_get_value(obj)
+            // longobject.py:131-135 `tofloat` — `rbigint.tofloat()` raises
+            // OverflowError "int too large to convert to float" when the
+            // value does not fit a C double.
+            let f = pyre_object::longobject::w_long_get_value(obj)
                 .to_f64()
-                .unwrap_or(f64::NAN));
+                .unwrap_or(f64::INFINITY);
+            if !f.is_finite() {
+                return Err(PyError::overflow_error(
+                    "int too large to convert to float",
+                ));
+            }
+            return Ok(f);
         }
     }
     let Some(method) = (unsafe { lookup(obj, "__float__") }) else {
