@@ -9,6 +9,7 @@ pub mod intbound;
 pub mod op_descr;
 pub mod op_info;
 pub mod op_type_index;
+pub mod operand;
 pub mod optimize;
 pub mod ptr_info;
 pub mod rawbuffer;
