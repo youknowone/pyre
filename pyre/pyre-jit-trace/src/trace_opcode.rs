@@ -1066,6 +1066,19 @@ impl MIFrame {
         unsafe { &mut *self.sym }
     }
 
+    /// #143 frame-advance gate: mark this trace as having performed a concrete
+    /// heap mutation. Called from the precise list/dict mutation recorders
+    /// (`list_append_value`/`list_pop_value`/`list_reverse_value` and the
+    /// concrete `store_subscr_value` store). Non-mutating method calls
+    /// (`x in s`, `len(xs)`) never reach these, so a mutation-free loop's root
+    /// sym stays unmarked and `dm143_advance_live_locals` skips its advance.
+    #[inline]
+    pub(crate) fn dm143_mark_heap_mutated(&mut self) {
+        if dm143_concrete_stores_enabled() {
+            self.sym_mut().dm143_heap_mutated = true;
+        }
+    }
+
     pub(crate) fn frame(&self) -> OpRef {
         self.sym().frame
     }
@@ -5672,6 +5685,33 @@ impl MIFrame {
         concrete_key: PyObjectRef,
         concrete_value: PyObjectRef,
     ) -> Result<(), PyError> {
+        // Emit the (deferred) STORE_SUBSCR IR first; its strategy guards read
+        // the PRE-mutation concrete object, matching the state the compiled
+        // loop guards check at entry.
+        self.store_subscr_value_emit(obj, key, value, concrete_obj, concrete_key, concrete_value)?;
+        if dm143_concrete_stores_enabled() {
+            // #143 Part 2: the IR above performs NO heap write during trace.
+            // Paired with dm143_advance_live_locals (which advances the live
+            // frame past this iteration so the compiled loop does not re-run
+            // it), the deferred write would be LOST. Execute it concretely now
+            // — the same concrete-during-trace behavior method-call mutations
+            // (xs.append()) already have. Covers every STORE_SUBSCR strategy
+            // (list int/float/object, dict, slice) through one objspace call.
+            pyre_interpreter::setitem(concrete_obj, concrete_key, concrete_value)?;
+            self.dm143_mark_heap_mutated();
+        }
+        Ok(())
+    }
+
+    fn store_subscr_value_emit(
+        &mut self,
+        obj: OpRef,
+        key: OpRef,
+        value: OpRef,
+        concrete_obj: PyObjectRef,
+        concrete_key: PyObjectRef,
+        concrete_value: PyObjectRef,
+    ) -> Result<(), PyError> {
         if let Some((raw_start, raw_stop, start, stop, step_is_none)) =
             const_step_one_slice_bounds(concrete_obj, concrete_key, concrete_value)
         {
@@ -5758,6 +5798,7 @@ impl MIFrame {
         concrete_list: PyObjectRef,
         concrete_value: PyObjectRef,
     ) -> Result<(), PyError> {
+        self.dm143_mark_heap_mutated();
         if concrete_list.is_null() {
             return self.trace_list_append(list, value);
         }
@@ -5823,6 +5864,7 @@ impl MIFrame {
         concrete_list: PyObjectRef,
         concrete_len: usize,
     ) -> Result<OpRef, PyError> {
+        self.dm143_mark_heap_mutated();
         if concrete_list.is_null() || concrete_len == 0 {
             // Caller's guard ensures concrete_len > 0; defensive fallback.
             return self.trace_call_callable(callable, &[]);
@@ -5861,6 +5903,7 @@ impl MIFrame {
         list: OpRef,
         concrete_list: PyObjectRef,
     ) -> Result<OpRef, PyError> {
+        self.dm143_mark_heap_mutated();
         if concrete_list.is_null() || unsafe { !is_list(concrete_list) } {
             return self.trace_call_callable(callable, &[]);
         }
@@ -8476,6 +8519,17 @@ unsafe fn trace_check_exc_match_against(
         return false;
     };
     pyre_interpreter::baseobjspace::exception_match(w_exc_class, exc_type)
+}
+
+/// #143 frame-advance gate (mirrors `dm143_advance_enabled` in pyre-jit
+/// eval.rs). The live-frame locals advance and the concrete-during-trace
+/// execution of otherwise-DEFERRED heap mutations (STORE_SUBSCR) are two
+/// halves of one fix and MUST be enabled together: advance without concrete
+/// stores loses the deferred write; concrete stores without advance applies
+/// it twice (trace + compiled re-run). Both read the same `PYRE_DM_ADVANCE`.
+pub(crate) fn dm143_concrete_stores_enabled() -> bool {
+    static EN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *EN.get_or_init(|| std::env::var_os("PYRE_DM_ADVANCE").is_some())
 }
 
 /// Production-walker allow-list for the walker cutover.

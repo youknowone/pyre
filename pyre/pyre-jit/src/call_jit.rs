@@ -3211,7 +3211,7 @@ pub extern "C" fn bh_load_attr_fn(obj: i64, w_code_ptr: i64, name_idx: i64) -> i
         return 0;
     }
     let name = code.names[idx].as_ref();
-    match pyre_interpreter::baseobjspace::getattr(obj as pyre_object::PyObjectRef, name) {
+    match pyre_interpreter::baseobjspace::getattr_str(obj as pyre_object::PyObjectRef, name) {
         Ok(attr) => attr as i64,
         Err(err) => {
             let exc_obj = err.to_exc_object();

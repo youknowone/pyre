@@ -591,9 +591,15 @@ fn build_list_append_resize_helper_payload() -> std::sync::Arc<crate::PyJitCode>
     // (see `register_runtime_helper_jitcode`).
     let metadata = crate::PyJitCodeMetadata {
         pc_map: (0..code_len).collect(),
+        // Identity pc_map ⇒ identity inverse: each jitcode byte offset is
+        // its own containing-opcode coordinate for a helper frame.
+        first_jit_pc_by_py_pc: (0..code_len).collect(),
         depth_at_py_pc: vec![0; code_len],
+        after_residual_call_resume_pc: vec![None; code_len],
         portal_frame_reg: u16::MAX,
         portal_ec_reg: u16::MAX,
+        // Runtime helper, not a portal body.
+        built_as_portal: false,
         stack_base: 0,
         stack_slot_color_map: Vec::new(),
         pyre_color_for_semantic_local: Vec::new(),
@@ -1945,6 +1951,13 @@ pub struct PyreSym {
     // instead of reading from an external PyFrame snapshot.
     pub(crate) concrete_locals: Vec<ConcreteValue>,
     pub concrete_stack: Vec<ConcreteValue>,
+    /// #143 frame-advance gate: set true when a concrete heap mutation
+    /// (a concrete STORE_SUBSCR store or any concrete CALL) runs during this
+    /// trace. `dm143_advance_live_locals` advances the live frame only when
+    /// this is set — a mutation-free loop never needs the advance (re-running
+    /// its traced iteration has no heap side effect), and advancing it would
+    /// desync the guard-failure resume path (`set_membership`).
+    pub(crate) dm143_heap_mutated: bool,
     /// pyjitpl.py:74: frame.jitcode — JitCode reference.
     /// Provides both .code (CodeObject*) and .index (snapshot encoding).
     pub(crate) jitcode: *const JitCode,
@@ -3534,6 +3547,7 @@ impl PyreSym {
             is_active_vable_owner: false,
             concrete_locals: Vec::new(),
             concrete_stack: Vec::new(),
+            dm143_heap_mutated: false,
             // jitcode and concrete_namespace initialized below
             jitcode: null_jitcode() as *const JitCode,
             concrete_namespace: std::ptr::null_mut(),
@@ -3728,6 +3742,8 @@ impl PyreSym {
     /// frames set symbolic state manually in perform_call
     /// (trace_opcode.rs:3323-3424) and do NOT call this.
     pub(crate) fn init_symbolic(&mut self, ctx: &mut TraceCtx, concrete_frame: usize) {
+        // #143: reset the per-trace heap-mutation gate at root-frame setup.
+        self.dm143_heap_mutated = false;
         self.is_function_entry_trace = ctx.header_pc == 0;
         let nlocals = concrete_nlocals(concrete_frame).unwrap_or(0);
         if majit_metainterp::majit_log_enabled() {
@@ -3997,6 +4013,31 @@ impl PyreSym {
     pub(crate) fn concrete_value_at(&self, abs_idx: usize) -> ConcreteValue {
         self.concrete_value_at_opt(abs_idx)
             .unwrap_or(ConcreteValue::Null)
+    }
+
+    /// #143 frame-advance: number of local slots whose post-trace concrete
+    /// state is tracked (`min(concrete_locals.len(), nlocals)`).
+    pub fn tracked_local_count(&self) -> usize {
+        self.concrete_locals.len().min(self.nlocals)
+    }
+
+    /// #143 frame-advance: materialize local slot `i`'s post-trace concrete
+    /// value as a boxed `PyObjectRef` (lazy `Int`/`Float` allocated via
+    /// `w_int_new`/`w_float_new`; `Ref` returned as-is). `None` for a `Null`
+    /// (dead/uninitialized) slot. The caller must root the returned box
+    /// before the next allocation.
+    pub fn materialize_local(&self, i: usize) -> Option<PyObjectRef> {
+        let cv = *self.concrete_locals.get(i)?;
+        if cv.is_null() {
+            None
+        } else {
+            Some(cv.to_pyobj())
+        }
+    }
+
+    /// #143 frame-advance gate predicate — see the `dm143_heap_mutated` field.
+    pub fn dm143_heap_mutated(&self) -> bool {
+        self.dm143_heap_mutated
     }
 }
 

@@ -3361,6 +3361,51 @@ pub(crate) fn eval_loop_jit_bridge(frame: &mut PyFrame) -> LoopResult {
     }
 }
 
+/// #143 frame-advance spike gate. While the deferred-store asymmetry
+/// (`STORE_SUBSCR`/`STORE_ATTR` defer their heap write; `list.append`
+/// mutates during trace) is being characterized, the live-frame advance
+/// is opt-in via `PYRE_DM_ADVANCE` so check.py can A/B it.
+fn dm143_advance_enabled() -> bool {
+    static EN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *EN.get_or_init(|| std::env::var_os("PYRE_DM_ADVANCE").is_some())
+}
+
+/// #143: at a successful loop close, advance the LIVE frame's locals to the
+/// post-traced-iteration concrete state captured during tracing
+/// (`PyreSym.concrete_locals`). Without this the live frame's locals stay at
+/// the pre-trace iteration, so the compiled loop RE-RUNS the traced iteration
+/// — re-applying any during-trace heap mutation (`list.append`) and producing
+/// an off-by-one result (#143).
+pub(crate) fn dm143_advance_live_locals(
+    frame: &mut PyFrame,
+    sym: &pyre_jit_trace::state::PyreSym,
+    action: &majit_metainterp::TraceAction,
+) {
+    if !dm143_advance_enabled()
+        || !matches!(
+            action,
+            majit_metainterp::TraceAction::CloseLoop
+                | majit_metainterp::TraceAction::CloseLoopWithArgs { .. }
+        )
+        // Only advance loops whose traced iteration concretely mutated the heap.
+        // A mutation-free loop's compiled re-run of the traced iteration has no
+        // heap side effect, so the advance is unnecessary; advancing it would
+        // also desync the guard-failure resume (`set_membership`).
+        || !sym.dm143_heap_mutated()
+    {
+        return;
+    }
+    let n = sym.tracked_local_count().min(frame.locals_w().len());
+    for i in 0..n {
+        // Materialize + root one box at a time: w_int_new/w_float_new
+        // allocate, so each box must reach the frame (a GC root) before the
+        // next materialize_local call can trigger a nursery collection.
+        if let Some(obj) = sym.materialize_local(i) {
+            frame.locals_w_mut()[i] = obj;
+        }
+    }
+}
+
 /// RPython jit_merge_point slow path — only called when tracing is active.
 #[cold]
 #[inline(never)]
@@ -3478,6 +3523,13 @@ fn jit_merge_point_hook(
             if pyre_jit_trace::trace::take_walk_end_flush_committed() {
                 frame.restore_resume_state_from(&executed_frame);
             }
+            // Heap-mutation fallback (issue #143): when the trace took the
+            // trait leg and committed no walk-end flush, advance the live
+            // locals to the traced iteration's end so the post-abort
+            // interpreter re-run does not replay an append/pop that already
+            // mutated the heap concretely.  Idempotent with the flush above
+            // (both are absolute writes to the same iteration-end locals).
+            dm143_advance_live_locals(frame, sym, &action);
             action
         },
     ) {
@@ -4155,6 +4207,9 @@ fn bound_reached(
                     if pyre_jit_trace::trace::take_walk_end_flush_committed() {
                         frame.restore_resume_state_from(&executed_frame);
                     }
+                    // issue #143 heap-mutation fallback — see the
+                    // jit_merge_point_hook tracing site for the contract.
+                    dm143_advance_live_locals(frame, sym, &action);
                     action
                 },
             );
