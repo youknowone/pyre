@@ -3174,7 +3174,7 @@ mod tests {
                 result_ty: ValueType::Ref(None),
             },
         };
-        let translated = translate_op(&op, &value_map, &registry, &graph)
+        let translated = translate_op(&op, &value_map, &registry)
             .expect("simple_call(<exc class>) must lower");
         assert_eq!(translated.len(), 1);
         let Hlvalue::Constant(ref callable) = translated[0].args[0] else {
