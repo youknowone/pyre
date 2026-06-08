@@ -1810,7 +1810,7 @@ pub fn dispatch_via_miframe(
             entry_py_pc,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
-            store_subscr_fn_addr: None,
+            store_subscr_fn_addr: bh_store_subscr_fn_addr_cached(),
         };
         let outcome = walk(jitcode_code, position, &mut wc);
         // Read final last_exc_value before wc drops so the borrow
@@ -2025,7 +2025,7 @@ pub fn dispatch_via_miframe_at_opcode_entry<'a>(
             entry_py_pc,
             outer_jitcode_index,
             outer_active_boxes,
-            store_subscr_fn_addr: None,
+            store_subscr_fn_addr: bh_store_subscr_fn_addr_cached(),
         };
         let outcome = walk(entry_jitcode.code.as_slice(), 0, &mut wc);
         let final_last_exc = wc.last_exc_value;
@@ -4627,6 +4627,28 @@ fn parse_hex_or_decimal_usize(s: &str) -> Option<usize> {
     } else {
         s.parse::<usize>().ok()
     }
+}
+
+/// Sub-slice 5c step 5.5c — runtime resolution of
+/// `bh_store_subscr_fn` address via `pyre_interpreter::
+/// jit_trace_fnaddrs()` linear scan (cached in a `OnceLock`).  Returns
+/// `None` if the symbol is unregistered (which would indicate a
+/// jit_fnaddr.rs regression — the path is registered at
+/// `pyre-interpreter/src/jit_fnaddr.rs:362-371`).
+///
+/// Cached on first call.  Linear scan is acceptable because the table
+/// has ~150 entries and the cache miss happens once per process.
+pub(crate) fn bh_store_subscr_fn_addr_cached() -> Option<usize> {
+    static CACHE: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| {
+        const PATH: &str = "pyre_interpreter::opcode_ops::bh_store_subscr_fn";
+        for (name, addr) in pyre_interpreter::jit_trace_fnaddrs() {
+            if name == PATH {
+                return Some(addr as usize);
+            }
+        }
+        None
+    })
 }
 
 #[allow(non_snake_case)]
