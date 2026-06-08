@@ -116,7 +116,9 @@ pub(crate) fn authoritative_result_type_from_op(kind: &OpKind) -> Option<Concret
         OpKind::FieldRead { ty, .. } | OpKind::VableFieldRead { ty, .. } => {
             concrete_if_known(valuetype_to_concrete(ty))
         }
-        OpKind::ArrayRead { item_ty, .. } | OpKind::VableArrayRead { item_ty, .. } => {
+        OpKind::ArrayRead { item_ty, .. }
+        | OpKind::InteriorFieldRead { item_ty, .. }
+        | OpKind::VableArrayRead { item_ty, .. } => {
             concrete_if_known(valuetype_to_concrete(item_ty))
         }
         OpKind::Call { result_ty, .. }

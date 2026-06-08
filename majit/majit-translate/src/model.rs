@@ -541,6 +541,27 @@ pub enum OpKind {
         /// (descr.py:359). See `ArrayRead::nolength`.
         nolength: bool,
     },
+    /// RPython: getinteriorfield_gc_i/r/f — read a field of an array-of-structs element.
+    /// effectinfo.py:313-325: generates "readinteriorfield" effect.
+    /// effectinfo.py:327-340: also implicitly generates "readarray" effect.
+    InteriorFieldRead {
+        base: crate::flowspace::model::Variable,
+        index: crate::flowspace::model::Variable,
+        field: FieldDescriptor,
+        item_ty: ValueType,
+        array_type_id: Option<String>,
+    },
+    /// RPython: setinteriorfield_gc — write a field of an array-of-structs element.
+    /// effectinfo.py:349-350: generates "interiorfield" effect.
+    /// effectinfo.py:327-340: also implicitly generates "array" effect.
+    InteriorFieldWrite {
+        base: crate::flowspace::model::Variable,
+        index: crate::flowspace::model::Variable,
+        field: FieldDescriptor,
+        value: crate::flowspace::model::Variable,
+        item_ty: ValueType,
+        array_type_id: Option<String>,
+    },
     Call {
         target: CallTarget,
         args: Vec<crate::flowspace::model::Variable>,

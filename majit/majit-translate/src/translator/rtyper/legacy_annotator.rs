@@ -274,6 +274,8 @@ fn infer_op_type(kind: &OpKind) -> ValueType {
         OpKind::FieldWrite { .. } => ValueType::Void,
         OpKind::ArrayRead { item_ty, .. } => item_ty.clone(),
         OpKind::ArrayWrite { .. } => ValueType::Void,
+        OpKind::InteriorFieldRead { item_ty, .. } => item_ty.clone(),
+        OpKind::InteriorFieldWrite { .. } => ValueType::Void,
         OpKind::Call {
             result_ty,
             target,

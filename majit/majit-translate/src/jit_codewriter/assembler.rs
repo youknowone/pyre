@@ -2101,6 +2101,8 @@ impl Assembler {
                 OpKind::FieldWrite { .. } => "FieldWrite",
                 OpKind::ArrayRead { .. } => "ArrayRead",
                 OpKind::ArrayWrite { .. } => "ArrayWrite",
+                OpKind::InteriorFieldRead { .. } => "InteriorFieldRead",
+                OpKind::InteriorFieldWrite { .. } => "InteriorFieldWrite",
                 OpKind::Call { .. } => "Call",
                 OpKind::GuardTrue { .. } => "GuardTrue",
                 OpKind::GuardFalse { .. } => "GuardFalse",
@@ -3186,6 +3188,13 @@ fn op_kind_to_opname(kind: &crate::model::OpKind) -> String {
         }
         OpKind::ArrayWrite { item_ty, .. } => {
             format!("setarrayitem_gc_{}", value_type_to_kind(item_ty))
+        }
+        // RPython: getinteriorfield_gc_i etc.
+        OpKind::InteriorFieldRead { item_ty, .. } => {
+            format!("getinteriorfield_gc_{}", value_type_to_kind(item_ty))
+        }
+        OpKind::InteriorFieldWrite { item_ty, .. } => {
+            format!("setinteriorfield_gc_{}", value_type_to_kind(item_ty))
         }
         OpKind::Call { result_ty, .. } => {
             format!("direct_call_{}", value_type_to_kind(result_ty))

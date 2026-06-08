@@ -46,3 +46,44 @@ pub fn first_top_level_generic_arg(args: &str) -> Option<&str> {
     }
     if args.is_empty() { None } else { Some(args) }
 }
+
+/// Decide whether a registered `array_type_id` describes a
+/// headerless item-run pointee or a length-prefixed wrapper.  Bare
+/// pointers to identifier types address `items[0]` (no length word);
+/// `Vec<T>` / `GcArray<T>` / `Ptr(GcArray(T))` shapes carry a length
+/// header at offset 0 and therefore keep the PyPy default `False`.
+///
+/// Only `jit_codewriter::call` consumes it.
+pub fn nolength_from_array_type_id(array_type_id: Option<&str>) -> bool {
+    let Some(s) = array_type_id else {
+        return false;
+    };
+    let mut inner = s.trim();
+    loop {
+        let stripped = inner
+            .strip_prefix("*const ")
+            .or_else(|| inner.strip_prefix("*mut "))
+            .or_else(|| inner.strip_prefix("&mut "))
+            .or_else(|| inner.strip_prefix('&'));
+        match stripped {
+            Some(rest) => inner = rest.trim_start(),
+            None => break,
+        }
+    }
+    if inner.starts_with('[') && inner.ends_with(']') {
+        return true;
+    }
+    // Length-prefixed wrappers carry `<` (generic) or `(` (paren-style
+    // lltype spelling such as `Ptr(GcArray(...))`).  Keep the PyPy
+    // default `False` for those — a pointer to a wrapper still
+    // dereferences a length header.
+    if inner.contains('<') || inner.contains('(') {
+        return false;
+    }
+    // Bare identifier pointee (`*const i64`, `*const Point`) means the
+    // pointer addresses items[0] of a primitive / struct item type.
+    // A bare identifier with NO pointer prefix is a value-type binding
+    // (e.g. an `array_type_id` directly naming a struct that contains
+    // an embedded array); preserve the PyPy default `False` for that.
+    s.trim() != inner
+}
