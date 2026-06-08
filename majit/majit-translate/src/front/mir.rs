@@ -2770,16 +2770,16 @@ fn impl_method_owner_for_fundecl(llbc: &Llbc, fd: &FunDecl) -> Option<(String, S
 /// alias fan-out (unlike `free_function_alias_paths`), and three-plus-
 /// segment paths are excluded from the `lookup_with_leaf_match`
 /// fallback, so a crate-stripped or module-collapsed key would miss the
-/// nested call site.  Only free functions are collected: an impl method
-/// is lowered as `CallTarget::Method`, which resolves through the
-/// receiver classdef / leaf-index and never consults this
-/// `FunctionPathKey` registry, so an impl-method key would be dead
-/// weight (its 3+-segment shape is also excluded from
-/// `lookup_with_leaf_match`).  Argument names are synthesised `arg{N}`
-/// by `signature.inputs.len()`.  Return types other than unit / bool
-/// surface no entry, preserving the original "not registered" Skip for
-/// those fns — matches `simple_return_type_to_lltype`'s Void/Bool-only
-/// projection.
+/// nested call site.  Free functions and impl-owned functions are both
+/// collected and keyed on `name_path()`: an impl method usually lowers
+/// to `CallTarget::Method` (resolved through the receiver classdef), but
+/// a receiver-less associated function and any impl method reached
+/// through an `FnDef` constant fall back to `CallTarget::FunctionPath {
+/// name_path }`, whose lookup is served only by this registry.  Argument
+/// names come from the Charon body locals, falling back to `arg{N}`.
+/// Return types other than unit / bool surface no entry, preserving the
+/// original "not registered" Skip for those fns — matches
+/// `simple_return_type_to_lltype`'s Void/Bool-only projection.
 pub(crate) fn collect_unsafe_fn_stubs_from_llbc(
     llbc: &Llbc,
 ) -> Vec<(
@@ -2812,12 +2812,16 @@ pub(crate) fn collect_unsafe_fn_stubs_from_llbc(
             "bool" => LowLevelType::Bool,
             _ => continue,
         };
-        // Impl methods are lowered as `CallTarget::Method` and never
-        // looked up in the `FunctionPathKey` registry; skip them so the
-        // collector registers only the live free-function stubs.
-        if impl_method_owner_for_fundecl(llbc, fd).is_some() {
-            continue;
-        }
+        // Both free functions and impl-owned functions are collected,
+        // keyed on `name_path()` — the segment vector
+        // `call_target_segments` emits for a `CallKind::Fun(Regular)`
+        // (mir.rs:2186).  An impl method usually lowers to
+        // `CallTarget::Method` (resolved via the receiver classdef), but a
+        // receiver-less associated function (`Owner::new() -> ()/bool`) and
+        // any impl method reached through an `FnDef` constant fall back to
+        // `CallTarget::FunctionPath { name_path }` (mir.rs:2082, 3995),
+        // whose lookup is served only by this registry — skipping impl
+        // owners would leave those call sites "not registered".
         let segments: Vec<String> = fd
             .item_meta
             .name_path()
