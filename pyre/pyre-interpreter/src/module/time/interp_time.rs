@@ -690,49 +690,65 @@ fn _gettmarg(args: &[PyObjectRef], default_now: bool) -> Result<c_tm, crate::PyE
                 "argument must be sequence of at least length 9, not {len}"
             )));
         }
-        let get = |i: usize| -> i32 {
-            let item = w_tuple_getitem(tup, i as i64).unwrap();
-            if is_int(item) {
-                w_int_get_value(item) as i32
-            } else if is_float(item) {
-                floatobject::w_float_get_value(item) as i32
-            } else {
-                0
-            }
+        // `baseobjspace.py:1976 c_int_w` — int_w with a 32-bit range check;
+        // floats and non-integers raise rather than being truncated.
+        let c_int_w = |i: usize| -> Result<i32, crate::PyError> {
+            crate::baseobjspace::c_int_w(w_tuple_getitem(tup, i as i64).unwrap())
         };
+        let y = c_int_w(0)?;
+        // A zero month / day / yday is normalized to 1 before the C-struct
+        // adjustment below.
+        let mut tm_mon = c_int_w(1)?;
+        if tm_mon == 0 {
+            tm_mon = 1;
+        }
+        let mut tm_mday = c_int_w(2)?;
+        if tm_mday == 0 {
+            tm_mday = 1;
+        }
+        let mut tm_yday = c_int_w(7)?;
+        if tm_yday == 0 {
+            tm_yday = 1;
+        }
+        let tm_hour = c_int_w(3)?;
+        let tm_min = c_int_w(4)?;
+        let tm_sec = c_int_w(5)?;
+        let tm_wday = c_int_w(6)?;
+        let tm_isdst = c_int_w(8)?;
         let mut tm = c_tm {
-            tm_sec: 0,
-            tm_min: 0,
-            tm_hour: 0,
-            tm_mday: 0,
-            tm_mon: 0,
+            tm_sec,
+            tm_min,
+            tm_hour,
+            tm_mday,
+            tm_mon,
             tm_year: 0,
-            tm_wday: 0,
-            tm_yday: 0,
-            tm_isdst: 0,
+            tm_wday,
+            tm_yday,
+            tm_isdst,
             tm_gmtoff: 0,
             tm_zone: String::new(),
         };
-        tm.tm_year = get(0) - 1900;
-        tm.tm_mon = get(1) - 1;
-        tm.tm_mday = get(2);
-        tm.tm_hour = get(3);
-        tm.tm_min = get(4);
-        tm.tm_sec = get(5);
-        tm.tm_wday = (get(6) + 1) % 7; // Python Monday=0 → C Sunday=0
-        tm.tm_yday = get(7) - 1;
-        tm.tm_isdst = get(8);
         // interp_time.py:830-841 — a sequence of length >=10 supplies
-        // `tm_zone` (idx 9) and length >=11 supplies `tm_gmtoff` (idx 10).
+        // `tm_zone` (idx 9, via `utf8_w`) and length >=11 supplies
+        // `tm_gmtoff` (idx 10).
         if len >= 10 {
-            let item = w_tuple_getitem(tup, 9).unwrap();
-            if is_str(item) {
-                tm.tm_zone = w_str_get_value(item).to_string();
-            }
+            tm.tm_zone =
+                crate::baseobjspace::utf8_w(w_tuple_getitem(tup, 9).unwrap())?.to_string();
         }
         if len >= 11 {
-            tm.tm_gmtoff = get(10) as i64;
+            tm.tm_gmtoff = c_int_w(10)? as i64;
         }
+        // Bounds checked before the final field adjustments.
+        if (y as i64) < i32::MIN as i64 + 1900 {
+            return Err(crate::PyError::overflow_error("year out of range"));
+        }
+        if tm_wday < -1 {
+            return Err(crate::PyError::value_error("day of week out of range"));
+        }
+        tm.tm_year = y - 1900;
+        tm.tm_mon = tm_mon - 1;
+        tm.tm_wday = (tm_wday + 1) % 7; // Python Monday=0 → C Sunday=0
+        tm.tm_yday = tm_yday - 1;
         Ok(tm)
     }
 }
