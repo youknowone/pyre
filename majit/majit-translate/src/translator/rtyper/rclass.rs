@@ -2248,6 +2248,184 @@ impl InstanceRepr {
         rbase.getfield(vinst, attr, llops, true, flags)
     }
 
+    /// RPython `InstanceRepr.setfield(self, vinst, attr, vvalue, llops,
+    /// force_cast=False, flags={})` (rclass.py:1002-1017):
+    ///
+    /// ```python
+    /// def setfield(self, vinst, attr, vvalue, llops, force_cast=False, flags={}):
+    ///     """Write the given attribute (or __class__ for the type) of 'vinst'."""
+    ///     if attr in self.fields:
+    ///         mangled_name, r = self.fields[attr]
+    ///         cname = inputconst(Void, mangled_name)
+    ///         if force_cast:
+    ///             vinst = llops.genop('cast_pointer', [vinst], resulttype=self)
+    ///         self.hook_access_field(vinst, cname, llops, flags)
+    ///         llops.genop('setfield', [vinst, cname, vvalue])
+    ///     else:
+    ///         if self.classdef is None:
+    ///             raise MissingRTypeAttribute(attr)
+    ///         self.rbase.setfield(vinst, attr, vvalue, llops, force_cast=True,
+    ///                             flags=flags)
+    /// ```
+    ///
+    /// Mirror of [`Self::getfield`] for the write side. `__class__`
+    /// resolves through the `rbase` fall-through to the root instance's
+    /// `typeptr` slot (`force_cast=True` on each step).
+    pub fn setfield(
+        self: &Arc<Self>,
+        vinst: Hlvalue,
+        attr: &str,
+        vvalue: Hlvalue,
+        llops: &mut LowLevelOpList,
+        force_cast: bool,
+        flags: &Flags,
+    ) -> Result<(), TyperError> {
+        if let Some((mangled_name, _r)) = self.fields.borrow().get(attr).cloned() {
+            // upstream: `cname = inputconst(Void, mangled_name)`.
+            let cname = Hlvalue::Constant(Constant::with_concretetype(
+                ConstValue::byte_str(mangled_name.clone()),
+                LowLevelType::Void,
+            ));
+            // upstream: `if force_cast: vinst = llops.genop('cast_pointer',
+            //                                              [vinst], resulttype=self)`.
+            let vinst = if force_cast {
+                let v_cast = llops
+                    .genop(
+                        "cast_pointer",
+                        vec![vinst],
+                        GenopResult::LLType(self.lowleveltype.clone()),
+                    )
+                    .expect("cast_pointer with non-Void resulttype yields a Variable");
+                Hlvalue::Variable(v_cast)
+            } else {
+                vinst
+            };
+            // upstream: `self.hook_access_field(vinst, cname, llops, flags)`.
+            self.hook_access_field(&vinst, &cname, llops, flags);
+            // upstream: `llops.genop('setfield', [vinst, cname, vvalue])`.
+            llops.genop("setfield", vec![vinst, cname, vvalue], GenopResult::Void);
+            return Ok(());
+        }
+        // upstream: `if self.classdef is None: raise MissingRTypeAttribute(attr)`.
+        if self.classdef.is_none() {
+            return Err(TyperError::message(format!(
+                "InstanceRepr.setfield: MissingRTypeAttribute({attr:?})"
+            )));
+        }
+        let rbase = self.rbase.borrow().clone().ok_or_else(|| {
+            TyperError::message("InstanceRepr.setfield: rbase missing — call setup() first")
+        })?;
+        // upstream: `self.rbase.setfield(vinst, attr, vvalue, llops,
+        //                               force_cast=True, flags=flags)`.
+        rbase.setfield(vinst, attr, vvalue, llops, true, flags)
+    }
+
+    /// RPython `InstanceRepr.new_instance(self, llops,
+    /// classcallhop=None, nonmovable=False)` (rclass.py:731-770):
+    ///
+    /// ```python
+    /// def new_instance(self, llops, classcallhop=None, nonmovable=False):
+    ///     """Build a new instance, without calling __init__."""
+    ///     flavor = self.gcflavor
+    ///     flags = {'flavor': flavor}
+    ///     ctype = inputconst(Void, self.object_type)
+    ///     cflags = inputconst(Void, flags)
+    ///     vlist = [ctype, cflags]
+    ///     vptr = llops.genop('malloc', vlist, resulttype=Ptr(self.object_type))
+    ///     ctypeptr = inputconst(CLASSTYPE, self.rclass.getvtable())
+    ///     self.setfield(vptr, '__class__', ctypeptr, llops)
+    ///     ...                # initialize instance attributes from defaults
+    ///     return vptr
+    /// ```
+    ///
+    /// Emits the runtime `malloc` op (vs the host-side immortal
+    /// allocation [`Self::create_instance`] used for prebuilt data) plus
+    /// the `__class__` `setfield`. The class-level defaults loop
+    /// (rclass.py:752-769) is a no-op for fieldless classes — every
+    /// `allinstancefields` entry but `__class__` is skipped; a field
+    /// that survives the skips needs default-value conversion that is
+    /// deferred to a follow-up and surfaces here as an explicit error.
+    pub fn new_instance(self: &Arc<Self>, llops: &mut LowLevelOpList) -> Result<Hlvalue, TyperError> {
+        // upstream: `ctype = inputconst(Void, self.object_type)` — the
+        // Void-typed type tag carrying the resolved object Struct lltype,
+        // exactly as `TupleRepr::newtuple` encodes its malloc type arg.
+        let object_lltype = match self.object_type.clone() {
+            LowLevelType::ForwardReference(fwd) => fwd.resolved().ok_or_else(|| {
+                TyperError::message(
+                    "InstanceRepr.new_instance: object_type ForwardReference not \
+                     resolved (call setup() first)",
+                )
+            })?,
+            other => other,
+        };
+        let ctype = Constant::with_concretetype(
+            ConstValue::LowLevelType(Box::new(object_lltype)),
+            LowLevelType::Void,
+        );
+        // upstream: `cflags = inputconst(Void, {'flavor': flavor})`. The
+        // flavor sentinel matches the `newtuple` emitter's encoding; the
+        // lowering pass reads the type from `ctype` and the flavor here.
+        let flavor_sentinel = match self.gcflavor {
+            Flavor::Gc => "flavor=gc",
+            Flavor::Raw => "flavor=raw",
+        };
+        let cflags = Constant::with_concretetype(
+            ConstValue::byte_str(flavor_sentinel),
+            LowLevelType::Void,
+        );
+        // upstream: `vptr = llops.genop('malloc', vlist,
+        //                              resulttype=Ptr(self.object_type))`.
+        let vptr = llops
+            .genop(
+                "malloc",
+                vec![Hlvalue::Constant(ctype), Hlvalue::Constant(cflags)],
+                GenopResult::LLType(self.lowleveltype.clone()),
+            )
+            .expect("malloc with non-Void result yields a Variable");
+        let vptr = Hlvalue::Variable(vptr);
+        // upstream: `ctypeptr = inputconst(CLASSTYPE, self.rclass.getvtable())`.
+        let rclass = self.rclass().ok_or_else(|| {
+            TyperError::message(
+                "InstanceRepr.new_instance: rclass not populated — call setup() first",
+            )
+        })?;
+        // upstream `self.rclass.getvtable()` — `getruntime(CLASSTYPE)` is
+        // the `ClassReprArc`-polymorphic accessor that asserts the
+        // expected type then returns the vtable pointer.
+        let vtable = rclass.getruntime(&CLASSTYPE)?;
+        let ctypeptr = Hlvalue::Constant(Constant::with_concretetype(
+            ConstValue::LLPtr(Box::new(vtable)),
+            CLASSTYPE.clone(),
+        ));
+        // upstream: `self.setfield(vptr, '__class__', ctypeptr, llops)`.
+        self.setfield(
+            vptr.clone(),
+            "__class__",
+            ctypeptr,
+            llops,
+            false,
+            &Flags::default(),
+        )?;
+        // upstream rclass.py:752-769 — initialize instance attributes
+        // from their class-level defaults. Fieldless classes have only
+        // `__class__` in `allinstancefields`, so the body never runs.
+        for (name, (_mangled, r)) in self.allinstancefields().iter() {
+            if name == "__class__" {
+                continue;
+            }
+            // upstream `if r.lowleveltype is Void: continue` (the default
+            // is carried in the repr, no slot to write).
+            if matches!(r.lowleveltype(), LowLevelType::Void) {
+                continue;
+            }
+            return Err(TyperError::message(format!(
+                "InstanceRepr.new_instance: class-default initialisation for \
+                 non-Void field {name:?} (rclass.py:752-769) not yet ported",
+            )));
+        }
+        Ok(vptr)
+    }
+
     /// RPython `InstanceRepr.null_instance(self)` (rclass.py:938-939):
     ///
     /// ```python
@@ -3400,6 +3578,25 @@ pub fn getinstancerepr(
         .insert(key, result.clone());
     rtyper.add_pendingsetup(result.clone());
     Ok(result)
+}
+
+/// RPython `rtype_new_instance(rtyper, classdef, llops,
+/// classcallhop=None, nonmovable=False)` (rclass.py:1078-1081):
+///
+/// ```python
+/// def rtype_new_instance(rtyper, classdef, llops, classcallhop=None,
+///                        nonmovable=False):
+///     rinstance = getinstancerepr(rtyper, classdef)
+///     return rinstance.new_instance(llops, classcallhop, nonmovable=nonmovable)
+/// ```
+pub fn rtype_new_instance(
+    rtyper: &Rc<RPythonTyper>,
+    classdef: Option<&Rc<RefCell<ClassDef>>>,
+    llops: &mut LowLevelOpList,
+) -> Result<Hlvalue, TyperError> {
+    let rinstance = getinstancerepr(rtyper, classdef, Flavor::Gc)?;
+    Repr::setup(rinstance.as_ref() as &dyn Repr)?;
+    rinstance.new_instance(llops)
 }
 
 /// RPython `buildinstancerepr(rtyper, classdef, gcflavor='gc')`

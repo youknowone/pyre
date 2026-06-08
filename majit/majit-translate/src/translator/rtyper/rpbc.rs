@@ -5609,6 +5609,160 @@ impl ClassesPBCRepr {
         let _ = annotator; // silence unused after future-proofing the upgrade() guard.
         Ok((access, class_repr))
     }
+
+    /// RPython `ClassesPBCRepr.redispatch_call(self, hop, call_args)`
+    /// (rpbc.py:1006-1061):
+    ///
+    /// ```python
+    /// def redispatch_call(self, hop, call_args):
+    ///     s_instance = hop.s_result
+    ///     r_instance = hop.r_result
+    ///     if len(self.s_pbc.descriptions) == 1:
+    ///         if self.lowleveltype is not Void:
+    ///             assert 0, "XXX None-or-1-class instantation not implemented"
+    ///         assert isinstance(s_instance, annmodel.SomeInstance)
+    ///         classdef = s_instance.classdef
+    ///         s_init = classdef.classdesc.s_read_attribute('__init__')
+    ///         v_init = Constant("init-func-dummy")   # this value not really used
+    ///         if (isinstance(s_init, annmodel.SomeImpossibleValue) and
+    ///             classdef.classdesc.is_exception_class() and
+    ///             classdef.has_no_attrs()):
+    ///             r_instance = rclass.getinstancerepr(hop.rtyper, classdef)
+    ///             example = r_instance.get_reusable_prebuilt_instance()
+    ///             hop.exception_cannot_occur()
+    ///             return hop.inputconst(r_instance.lowleveltype, example)
+    ///         v_instance = rclass.rtype_new_instance(hop.rtyper, classdef,
+    ///                                                hop.llops, hop)
+    ///         if isinstance(v_instance, tuple):
+    ///             v_instance, must_call_init = v_instance
+    ///             if not must_call_init:
+    ///                 return v_instance
+    ///     else:
+    ///         ...                         # multiple possible classes
+    ///     if isinstance(s_init, annmodel.SomeImpossibleValue):
+    ///         assert hop.nb_args == 1, "arguments passed to __init__, but no __init__!"
+    ///         hop.exception_cannot_occur()
+    ///     else:
+    ///         ...                         # dispatch to __init__
+    ///     return v_instance
+    /// ```
+    ///
+    /// Only the single-class, `Void`-lowleveltype arm with no `__init__`
+    /// is ported (the shape produced by transparent-ctor instantiation).
+    /// The multi-class arm, the non-`Void` single-class arm (upstream
+    /// `assert 0`), and the `__init__` dispatch arm raise a descriptive
+    /// error citing the upstream lines they cover.
+    pub fn redispatch_call(
+        &self,
+        hop: &crate::translator::rtyper::rtyper::HighLevelOp,
+        _call_args: bool,
+    ) -> crate::translator::rtyper::rmodel::RTypeResult {
+        use crate::annotator::classdesc::{ClassDef, ClassDesc};
+        use crate::annotator::model::SomeValue;
+
+        // Shapes outside the ported single-class / Void / no-`__init__` /
+        // fieldless / numbered / unit-ctor envelope return an
+        // "unimplemented operation" error so the dual-gate classifies
+        // them as known-unported (`cutover.rs:577 is_known_unported`) and
+        // falls back to the legacy walker — exactly the graceful skip the
+        // base `Repr::rtype_simple_call` produced before this override.
+        let unported = |reason: &str| -> TyperError {
+            TyperError::missing_rtype_operation(format!(
+                "unimplemented operation: 'simple_call' on <ClassesPBCRepr Void> — {reason}",
+            ))
+        };
+
+        // upstream `if len(self.s_pbc.descriptions) == 1:`.
+        if self.s_pbc.descriptions.len() != 1 {
+            return Err(unported("multi-class instantiation (rpbc.py:1043-1056)"));
+        }
+        // upstream `if self.lowleveltype is not Void: assert 0, "XXX
+        // None-or-1-class instantation not implemented"`.
+        if !matches!(self.lltype, LowLevelType::Void) {
+            return Err(unported(
+                "single non-Void class instantiation (rpbc.py:1037-1038)",
+            ));
+        }
+        // upstream `assert isinstance(s_instance, annmodel.SomeInstance);
+        // classdef = s_instance.classdef`.
+        let s_result = hop.s_result.borrow().clone();
+        let classdef = match s_result {
+            Some(SomeValue::Instance(si)) => match si.classdef {
+                Some(cd) => cd,
+                None => return Err(unported("object-only instance (classdef=None)")),
+            },
+            _ => return Err(unported("s_result is not a SomeInstance")),
+        };
+        // upstream `s_init = classdef.classdesc.s_read_attribute('__init__')`.
+        let classdesc = classdef.borrow().classdesc.clone();
+        let s_init = ClassDesc::s_read_attribute(&classdesc, "__init__")
+            .map_err(|e| TyperError::message(e.to_string()))?;
+        let init_is_impossible = matches!(s_init, SomeValue::Impossible);
+
+        let rtyper = self.rtyper.upgrade().ok_or_else(|| {
+            TyperError::message("ClassesPBCRepr.redispatch_call: rtyper weak ref dropped")
+        })?;
+
+        // Ported envelope gates (each a graceful known-unported skip):
+        //  - has `__init__` ⇒ the rpbc.py:1060-1067 dispatch arm is not
+        //    ported (would need `replace_class_with_inst_arg`);
+        //  - has instance attributes ⇒ `new_instance`'s class-default
+        //    initialisation loop (rclass.py:752-769) is not ported;
+        //  - constructor args present (`nb_args != 1`) ⇒ rpbc.py:1058-1059
+        //    asserts an argument-free call when there is no `__init__`;
+        //  - `classdef.minid` unset ⇒ `assign_inheritance_ids` has not
+        //    numbered this class, so `getvtable` (rclass.py:338-339) cannot
+        //    bake the subclass range. Enum-variant numbering lands in a
+        //    follow-up; until then these skip.
+        if !init_is_impossible {
+            return Err(unported("class has __init__ (rpbc.py:1060-1067)"));
+        }
+        if !ClassDef::has_no_attrs(&classdef) {
+            return Err(unported(
+                "field-bearing class default init (rclass.py:752-769)",
+            ));
+        }
+        if hop.nb_args() != 1 {
+            return Err(unported("constructor arguments with no __init__"));
+        }
+        if classdef.borrow().minid.is_none() {
+            return Err(unported("class not numbered (assign_inheritance_ids)"));
+        }
+
+        // upstream rpbc.py:1024-1035 — simple built-in exception special
+        // case: no `__init__`, an exception class, no attrs ⇒ return the
+        // same prebuilt instance and ignore any constructor arguments.
+        if classdesc.borrow().is_exception_class() {
+            let r_instance = crate::translator::rtyper::rclass::getinstancerepr(
+                &rtyper,
+                Some(&classdef),
+                crate::translator::rtyper::rclass::Flavor::Gc,
+            )?;
+            let example = r_instance.get_reusable_prebuilt_instance()?;
+            hop.exception_cannot_occur()?;
+            let cst = Constant::with_concretetype(
+                ConstValue::LLPtr(Box::new(example)),
+                r_instance.lowleveltype().clone(),
+            );
+            return Ok(Some(Hlvalue::Constant(cst)));
+        }
+
+        // upstream `v_instance = rclass.rtype_new_instance(hop.rtyper,
+        // classdef, hop.llops, hop)`.
+        let v_instance = {
+            let mut llops = hop.llops.borrow_mut();
+            crate::translator::rtyper::rclass::rtype_new_instance(
+                &rtyper,
+                Some(&classdef),
+                &mut llops,
+            )?
+        };
+        // upstream rpbc.py:1058-1059 — no `__init__` ⇒ the malloc cannot
+        // raise.
+        hop.exception_cannot_occur()?;
+        // upstream `return v_instance`.
+        Ok(Some(v_instance))
+    }
 }
 
 impl Repr for ClassesPBCRepr {
@@ -5860,6 +6014,34 @@ impl Repr for ClassesPBCRepr {
             llops.convertvar(Hlvalue::Variable(v_res), r_res.as_ref(), r_result.as_ref())?
         };
         Ok(Some(result))
+    }
+
+    /// RPython `ClassesPBCRepr.rtype_simple_call(self, hop)`
+    /// (rpbc.py:1000-1001):
+    ///
+    /// ```python
+    /// def rtype_simple_call(self, hop):
+    ///     return self.redispatch_call(hop, call_args=False)
+    /// ```
+    fn rtype_simple_call(
+        &self,
+        hop: &crate::translator::rtyper::rtyper::HighLevelOp,
+    ) -> crate::translator::rtyper::rmodel::RTypeResult {
+        self.redispatch_call(hop, false)
+    }
+
+    /// RPython `ClassesPBCRepr.rtype_call_args(self, hop)`
+    /// (rpbc.py:1003-1004):
+    ///
+    /// ```python
+    /// def rtype_call_args(self, hop):
+    ///     return self.redispatch_call(hop, call_args=True)
+    /// ```
+    fn rtype_call_args(
+        &self,
+        hop: &crate::translator::rtyper::rtyper::HighLevelOp,
+    ) -> crate::translator::rtyper::rmodel::RTypeResult {
+        self.redispatch_call(hop, true)
     }
 
     fn convert_const(&self, value: &ConstValue) -> Result<Constant, TyperError> {
