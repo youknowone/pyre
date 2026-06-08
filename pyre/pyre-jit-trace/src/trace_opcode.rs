@@ -6997,6 +6997,55 @@ impl MIFrame {
         &mut self,
         instruction: &Instruction,
     ) -> Result<pyre_interpreter::StepResult<FrontendOp>, PyError> {
+        // Sub-slice 5c step 5.6b — STORE_SUBSCR walker activation via
+        // trait-path delegation.
+        //
+        // The auto-gen arm jitcode for `StoreSubscr` is
+        // `int_copy, residual_call_r_r(bh_execute_store_subscr, frame),
+        // live, ref_return`.  `try_execute_residual_call_via_executor`
+        // matches the `CallR` shape and concrete-executes
+        // `bh_execute_store_subscr(frame)`, which casts the arg to
+        // `*mut PyFrame` and pops 3 values from
+        // `PyFrame.locals_cells_stack_w`.  Walker `LOAD_FAST` /
+        // `LOAD_CONST` / etc. populate only MIFrame's symbolic +
+        // concrete-shadow stacks — not the concrete `PyFrame`'s slots
+        // (`setfield_vable_i(vsd)` advances depth without writing the
+        // slot) — so the pop reads NULL and the helper raises every
+        // iteration, surfacing as `DispatchOutcome::SubRaise`.
+        //
+        // Trait dispatch documents `MIFrame::store_subscr` as
+        // "trace-only, no concrete mutation" (compiled trace handles
+        // real mutations later).  Mirror that here by short-circuiting
+        // the arm walk: pop 3 via `SharedOpcodeHandler::pop_value`
+        // (updates symbolic + concrete-shadow stacks + vsd shadow)
+        // and delegate to the existing `MIFrame::store_subscr_value`
+        // which records the same specialized IR shape
+        // (`guard_class + SETARRAYITEM_GC` family via
+        // `generated_store_subscr_value`, or `Call(jit_setitem, ...)`
+        // fallback via `trace_store_subscr`).  Bypasses the
+        // `apply_walker_stack_effect` post-walk step because
+        // `pop_value` already handles vsd.
+        //
+        // This delegation reuses the trait method intentionally; the
+        // 141 cutover can later replace it with a pure-walker variant
+        // once the walker grows symbolic-stack-aware specialization
+        // primitives.
+        if matches!(instruction, Instruction::StoreSubscr) {
+            use pyre_interpreter::SharedOpcodeHandler;
+            let key = SharedOpcodeHandler::pop_value(self)?;
+            let obj = SharedOpcodeHandler::pop_value(self)?;
+            let value = SharedOpcodeHandler::pop_value(self)?;
+            self.store_subscr_value(
+                obj.opref,
+                key.opref,
+                value.opref,
+                obj.concrete.to_pyobj(),
+                key.concrete.to_pyobj(),
+                value.concrete.to_pyobj(),
+            )?;
+            return Ok(pyre_interpreter::StepResult::Continue);
+        }
+
         let jitcode = match crate::jitcode_runtime::jitcode_for_instruction(instruction) {
             Some(jc) => jc,
             None => {
@@ -8082,7 +8131,7 @@ pub fn production_walker_handles(instruction: &Instruction) -> bool {
             // Instruction::StoreFastStoreFast excluded: routed off the
             // walker JIT path (kept on trait dispatch) until the SFSF
             // walker re-enable is unblocked.
-            // | Instruction::StoreSubscr { .. } // sub-slice 5c step 5.6 attempted 2026-06-08 + reverted: nbody+fannkuch regress; 5.6b diagnosis 2026-06-08: arm jitcode `residual_call_r_r(bh_execute_store_subscr, frame)` requires concrete PyFrame stack to be populated by prior walker LOAD_FAST/CONST handlers, but walker handlers only populate MIFrame symbolic/concrete-shadow stacks — concrete frame pops null operands → SubRaise every trace
+            | Instruction::StoreSubscr // 5.6b: handled by dispatch_via_walker_for_opcode entry hook
             // Instruction::PopExcept excluded: same bridge-tracing
             // rationale as PushExcInfo below — its arm manages the
             // exception-info stack via impure helper jitcodes the walker
