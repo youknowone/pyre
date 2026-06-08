@@ -4483,6 +4483,121 @@ fn direct_call_release_gil(
 ///     callee body slice.  Over-capture is correctness-preserving:
 ///     `store_final_boxes_in_guard` filters dead boxes from the
 ///     snapshot via the optimizer's liveness pass.
+/// Sub-slice 5c step 5.5a — STORE_SUBSCR strategy-aware walker
+/// specialization gate.  Returns `Some(DispatchOutcome::Continue)` if
+/// the residual_call was specialized into the trait-equivalent
+/// `guard_class + guard_list_strategy + setarrayitem-family` shape;
+/// `None` to fall through to the existing blackbox CallN path.
+///
+/// Gates (all must hold):
+/// 1. `dst_bank == 'v'` (STORE_SUBSCR returns void; trait emit is `Void`).
+/// 2. `r_args.len() == 3` (codewriter emits `[obj_reg, key_reg, value_reg]`).
+/// 3. `PYRE_WALKER_STORE_SUBSCR_FNADDR` env var present and parses as
+///    `0x<hex>` matching the runtime funcptr.  Step 5.5b will replace
+///    this with `WalkContext.store_subscr_fn_addr` populated from
+///    `cpu.store_subscr_fn` at dispatch entry.
+/// 4. All 3 concrete shadow slots (`concrete_registers_r[r_args[0..3]]`)
+///    are `ConcreteValue::Ref(_)`.
+/// 5. `generated_store_subscr_value` returns `true` (object is a list
+///    with int key, strategy-detectable value, in-bounds index — see
+///    `codegen.rs:3146-3168 generated_store_subscr_value` for the
+///    detail criteria mirroring `jtransform do_resizable_list_setitem`).
+///
+/// Decline (any gate `false`) → `None` → dispatcher falls through to
+/// `try_execute_residual_call_via_executor` which concrete-executes the
+/// helper and records the blackbox `CallMayForce*` IR.  No-op for
+/// non-STORE_SUBSCR residual calls.
+fn try_walker_store_subscr_specialization(
+    ctx: &mut WalkContext<'_, '_>,
+    code: &[u8],
+    op: &DecodedOp,
+    funcptr: OpRef,
+    r_args: &[OpRef],
+    dst_bank: char,
+) -> Option<DispatchOutcome> {
+    if dst_bank != 'v' || r_args.len() != 3 {
+        return None;
+    }
+    let expected_fn_addr_str = std::env::var_os("PYRE_WALKER_STORE_SUBSCR_FNADDR")?;
+    let expected_fn_addr_str = expected_fn_addr_str.to_str()?;
+    let expected_fn_addr = parse_hex_or_decimal_usize(expected_fn_addr_str)?;
+    let funcptr_addr = ctx
+        .trace_ctx
+        .box_value(funcptr)
+        .and_then(|v| match v {
+            majit_ir::Value::Int(n) => Some(n as usize),
+            _ => None,
+        })?;
+    if funcptr_addr != expected_fn_addr {
+        return None;
+    }
+    let r_args_concrete = read_ref_var_list_concrete(code, op, 1, ctx);
+    let concrete_obj = match r_args_concrete.first()? {
+        crate::state::ConcreteValue::Ref(p) => *p,
+        _ => return None,
+    };
+    let concrete_key = match r_args_concrete.get(1)? {
+        crate::state::ConcreteValue::Ref(p) => *p,
+        _ => return None,
+    };
+    let concrete_value = match r_args_concrete.get(2)? {
+        crate::state::ConcreteValue::Ref(p) => *p,
+        _ => return None,
+    };
+    let handled = crate::generated_store_subscr_value(
+        ctx,
+        r_args[0],
+        r_args[1],
+        r_args[2],
+        concrete_obj,
+        concrete_key,
+        concrete_value,
+    );
+    if !handled {
+        return None;
+    }
+    // Specialized IR recorded.  Heap mutation: invoke the helper
+    // concretely so the next read of the container sees the updated
+    // value.  `bh_store_subscr_fn(obj, key, value) -> i64` returns 0 on
+    // success, non-zero on raise.  STORE_SUBSCR's effect-info is
+    // `MayForce + CanRaise`; on raise the specialization gate is wrong
+    // (recorded IR assumes success), so abort the specialization by
+    // returning `None` to surface a SubRaise via the standard path.
+    //
+    // Step 5.5b will refactor the post-mutation raise handling to share
+    // the dispatcher's `walker_record_guard_exception` + `SubRaise`
+    // flow.  For 5.5a's env-gated rollout, decline on raise so the
+    // blackbox path handles it end-to-end.
+    let raised = unsafe {
+        let store_subscr_fn: extern "C" fn(i64, i64, i64) -> i64 =
+            std::mem::transmute(expected_fn_addr as *const ());
+        store_subscr_fn(
+            concrete_obj as usize as i64,
+            concrete_key as usize as i64,
+            concrete_value as usize as i64,
+        )
+    };
+    if raised != 0 {
+        return None;
+    }
+    // pyjitpl.py:2659 `_record_helper_varargs`: STORE_SUBSCR mutates the
+    // heap; the specialized IR shape's setarrayitem_gc ops already
+    // invalidate per-descr via the recorder, so no further explicit
+    // heap-cache invalidation is needed here.
+    Some(DispatchOutcome::Continue)
+}
+
+/// Parse `"0x<hex>"` or `"<decimal>"` into a `usize` address.  Helper
+/// for env-var-driven function-pointer gates (step 5.5a).
+fn parse_hex_or_decimal_usize(s: &str) -> Option<usize> {
+    let s = s.trim();
+    if let Some(rest) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        usize::from_str_radix(rest, 16).ok()
+    } else {
+        s.parse::<usize>().ok()
+    }
+}
+
 #[allow(non_snake_case)]
 fn dispatch_residual_call_iRd_kind(
     code: &[u8],
@@ -4553,6 +4668,29 @@ fn dispatch_residual_call_iRd_kind(
             funcptr_addr.map(|a| format!("{:#x}", a)),
             arg_addrs.iter().map(|o| o.map(|a| format!("{:#x}", a))).collect::<Vec<_>>(),
         );
+    }
+
+    // Sub-slice 5c step 5.5a: STORE_SUBSCR strategy-aware specialization.
+    // Fires when funcptr matches the registered `store_subscr_fn` address
+    // (= `pyre-jit::call_jit::bh_store_subscr_fn`), r_args carries the
+    // 3-arg `[obj_reg, key_reg, value_reg]` shape codewriter emits
+    // (`codewriter.rs:7042 build_store_subscr_fn_residual_call_r_v_insn`),
+    // dst_bank is `'v'` (STORE_SUBSCR returns void), and all 3 concrete
+    // shadow slots are populated.  On success, records the specialized
+    // IR shape (guard_class + guard_strategy + setarrayitem-family) via
+    // the trait-equivalent `generated_store_subscr_value` helper (now
+    // generic over `WalkerFrameOps`, with `WalkContext` impl).
+    //
+    // Activation env-gated for the rollout: `PYRE_WALKER_STORE_SUBSCR_FNADDR=<hex>`
+    // supplies the expected funcptr address (cross-crate plumbing of the
+    // `bh_store_subscr_fn` symbol from pyre-jit into pyre-jit-trace is
+    // deferred to 5.5b — `WalkContext.store_subscr_fn_addr`).  Without
+    // the env var, gate decays to no-op and dispatcher falls through to
+    // the existing blackbox CallN path.
+    if let Some(outcome) = try_walker_store_subscr_specialization(
+        ctx, code, op, funcptr, &r_args, dst_bank,
+    ) {
+        return Ok((outcome, op.next_pc));
     }
 
     let ei = call_descr.get_extra_info();
