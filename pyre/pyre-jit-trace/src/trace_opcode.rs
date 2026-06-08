@@ -8082,7 +8082,7 @@ pub fn production_walker_handles(instruction: &Instruction) -> bool {
             // Instruction::StoreFastStoreFast excluded: routed off the
             // walker JIT path (kept on trait dispatch) until the SFSF
             // walker re-enable is unblocked.
-            // | Instruction::StoreSubscr // sub-slice 5c step 5.6 attempted 2026-06-08 + reverted: nbody+fannkuch regress (timeout / 31× slowdown); walker emits specialized IR but execution diverges from trait — investigation deferred (likely vable/heapcache + WalkerFrameOps::generate_guard snapshot delta vs trait `with_ctx + MIFrame.generate_guard`)
+            // | Instruction::StoreSubscr { .. } // sub-slice 5c step 5.6 attempted 2026-06-08 + reverted: nbody+fannkuch regress; 5.6b diagnosis 2026-06-08: arm jitcode `residual_call_r_r(bh_execute_store_subscr, frame)` requires concrete PyFrame stack to be populated by prior walker LOAD_FAST/CONST handlers, but walker handlers only populate MIFrame symbolic/concrete-shadow stacks — concrete frame pops null operands → SubRaise every trace
             // Instruction::PopExcept excluded: same bridge-tracing
             // rationale as PushExcInfo below — its arm manages the
             // exception-info stack via impure helper jitcodes the walker
@@ -8312,7 +8312,7 @@ fn apply_walker_stack_effect(state: &mut MIFrame, instruction: &Instruction) {
         | Instruction::CallFunctionEx
         | Instruction::LoadAttr { .. }
         | Instruction::StoreAttr { .. }
-        // | Instruction::StoreSubscr // see production_walker_handles for revert note
+        // | Instruction::StoreSubscr { .. } // see production_walker_handles for 5.6b root-cause note
         | Instruction::StoreFastStoreFast { .. }
         | Instruction::PushNull => {
             // Non-zero stack delta. The walker arm's
