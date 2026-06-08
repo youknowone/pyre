@@ -1552,6 +1552,9 @@ impl Bookkeeper {
     /// `harden_duplicate_leaf_metadata` passes through unresolved; its
     /// classdef stays attrs-empty because the field registry withdrew
     /// the bare alias, so no struct's fields can be misattributed.
+    /// Dotted qualnames (transparent-ctor classes) pass through
+    /// `canonical_struct_name` unchanged, so qualname callers intern
+    /// by their full spelling.
     pub fn intern_class_by_qualname(self: &Rc<Self>, name: &str) -> HostObject {
         let key = majit_ir::descr::canonical_struct_name(name);
         if let Some(existing) = self.pyre_struct_root_classes.borrow().get(&key) {
