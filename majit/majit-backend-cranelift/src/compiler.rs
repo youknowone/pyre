@@ -6073,6 +6073,7 @@ fn emit_attached_loop_dispatch(
     label_block_id_addr: usize,
     target_frame_depth_addr: usize,
     ptr_type: cranelift_codegen::ir::Type,
+    call_conv: cranelift_codegen::isa::CallConv,
 ) {
     // `LoopTargetDescr::set_dispatch_target` (descr.rs:1308-1318)
     // releases `target_frame_depth` and `label_block_id` BEFORE
@@ -6154,19 +6155,60 @@ fn emit_attached_loop_dispatch(
     let frame_fits = builder
         .ins()
         .icmp(IntCC::SignedGreaterThanOrEqual, frame_len, target_depth);
+    // `take_block` carries `(target_code_ptr, frame_ptr)`: `frame_ptr` is the
+    // original `jf_ptr` when it already fits, or the reallocated wider frame.
     let take_block = builder.create_block();
-    builder.append_block_param(take_block, ptr_type);
+    builder.append_block_param(take_block, ptr_type); // target_code_ptr
+    builder.append_block_param(take_block, ptr_type); // frame to dispatch with
+    let realloc_block = builder.create_block();
+    builder.append_block_param(realloc_block, ptr_type); // target_code_ptr
     builder.ins().brif(
         frame_fits,
         take_block,
+        &[BlockArg::from(target_code_ptr), BlockArg::from(jf_ptr)],
+        realloc_block,
         &[BlockArg::from(target_code_ptr)],
-        miss_block,
-        &[],
+    );
+
+    // `assembler.py:910 _check_frame_depth` slow path (`IncreaseStackSlowPath`
+    // -> `_frame_realloc_slowpath`, assembler.py:143): the current frame is
+    // narrower than the target loop needs, so reallocate a wider JITFRAME in
+    // place — header and live slots copied, `jf_forward` threaded — and
+    // dispatch into the target with the new frame.  This is the bridge
+    // prologue's `_check_frame_depth` (compiler.rs:8371) applied to the
+    // closing-jump path: the loaders read the target LABEL's carried values
+    // from the new frame's slots `cranelift_realloc_frame` just copied.
+    // Falling back to the host `execute_token` instead would re-enter the
+    // target at the preamble (dispatch_key 0) and re-derive loop state from
+    // the elided fastlocals writeback (stale -> frozen counter).
+    builder.switch_to_block(realloc_block);
+    builder.seal_block(realloc_block);
+    let realloc_target_code_ptr = builder.block_params(realloc_block)[0];
+    let realloc_addr = builder
+        .ins()
+        .iconst(ptr_type, cranelift_realloc_frame as *const () as i64);
+    let mut realloc_sig = Signature::new(call_conv);
+    realloc_sig.params.push(AbiParam::new(ptr_type));
+    realloc_sig.params.push(AbiParam::new(cl_types::I64));
+    realloc_sig.returns.push(AbiParam::new(ptr_type));
+    let realloc_sig_ref = builder.import_signature(realloc_sig);
+    let realloc_call =
+        builder
+            .ins()
+            .call_indirect(realloc_sig_ref, realloc_addr, &[jf_ptr, target_depth]);
+    let new_jf = builder.inst_results(realloc_call)[0];
+    builder.ins().jump(
+        take_block,
+        &[
+            BlockArg::from(realloc_target_code_ptr),
+            BlockArg::from(new_jf),
+        ],
     );
 
     builder.switch_to_block(take_block);
     builder.seal_block(take_block);
     let target_code_ptr = builder.block_params(take_block)[0];
+    let dispatch_jf_ptr = builder.block_params(take_block)[1];
     // The earlier nbody_50k corruption (-0.03513214049650899 vs. the
     // reference -0.035132020348426815) and the per-dispatch SP growth were
     // both consequences of `emit_attached_bridge_dispatch` doing a nested
@@ -6194,9 +6236,11 @@ fn emit_attached_loop_dispatch(
     // body's entry `br_table` reserves dispatch_key 0 for its preamble, so a
     // re-entry at LABEL L passes `label_block_id + 1`.
     let dispatch_key = builder.ins().iadd_imm(lbid, 1);
-    builder
-        .ins()
-        .return_call_indirect(target_sig_ref, target_code_ptr, &[jf_ptr, dispatch_key]);
+    builder.ins().return_call_indirect(
+        target_sig_ref,
+        target_code_ptr,
+        &[dispatch_jf_ptr, dispatch_key],
+    );
 
     builder.switch_to_block(miss_block);
     builder.seal_block(miss_block);
@@ -6351,6 +6395,7 @@ fn emit_guard_exit(
                 label_block_id_addr,
                 target_frame_depth_addr,
                 ptr_type,
+                call_conv,
             );
         }
     }
