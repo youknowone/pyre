@@ -1171,6 +1171,17 @@ pub fn translate_op(
                         // `Box::new` — and exception classes sharing a leaf —
                         // cannot be captured by an unrelated user function
                         // with the same leaf.
+                        //
+                        // This is the resting point for the former
+                        // caller-scoped `use`-import resolution: MIR callsites
+                        // carry the fully-qualified crate-relative path, so the
+                        // exact `lookup(&key)` above is the primary binder and
+                        // no per-caller import scope is needed to disambiguate.
+                        // The leaf-scan itself is wrong-bind-safe —
+                        // `lookup_with_leaf_match` returns `Some` only when the
+                        // same-leaf matches converge on a single `host_object`
+                        // identity, otherwise `None` falls through to the hard
+                        // error below.
                         entry.host_object.clone()
                     } else {
                         return Err(TyperError::message(format!(
