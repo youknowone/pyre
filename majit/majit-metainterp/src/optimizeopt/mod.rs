@@ -469,7 +469,7 @@ impl ImportedShortPureOp {
         //     the alt. In pyre, `produce_pure` calls
         //     `make_equal_to(source, canonical)` (shortpreamble.rs:1279) which
         //     overwrites the source box's `_forwarded` slot with
-        //     `Forwarded::Box(canonical_box)`.
+        //     a forwarding redirect to `canonical_box`.
         //     If `replay.pos` also pointed at `source`, the alt's
         //     replacement chain and the replay's info would share one slot
         //     and the info would be lost. We move `replay.pos` to the
@@ -738,7 +738,7 @@ pub struct OptContext {
     /// inside each `BoxRef.inputarg_handle` upgradable. `make_equal_to`
     /// then routes the chain step through `Forwarded::InputArg(_)`
     /// (`optimizer.py:394 op.set_forwarded(newop)`) instead of the
-    /// deprecated `Forwarded::Box(_)` fallback.
+    /// retired orphan-box forwarding fallback.
     pub(crate) inputarg_refs: Vec<majit_ir::InputArgRc>,
     /// Synthetic `OpRc` stand-ins for ResOp BoxRef placeholders whose
     /// real producer has not been (and may never be) emitted, indexed
@@ -2487,15 +2487,15 @@ impl OptContext {
             //     is monotonic, so fresh positions are always above any
             //     raw trace op.pos the trace carries.
             //
-            // (c) `import_state` only creates `Forwarded::Box` chains on
-            //     inputarg slots (in `[inputarg_base..inputarg_base +
+            // (c) `import_state` only creates op/inputarg forwarding chains
+            //     on inputarg slots (in `[inputarg_base..inputarg_base +
             //     num_inputs)`) — never on op-result positions that a
             //     later `emit` would try to use.
             //
             // Together these guarantee that:
             //   - `new_operations` never contains two ops at the same pos
             //   - an op being emitted whose pos is a non-void result does
-            //     not already have a `Forwarded::Box` redirect set
+            //     not already have an op-forwarding redirect set
             //
             // Earlier majit revisions compensated for the broken invariant
             // with two reactive branches in `emit()` (a collision reassign
@@ -2522,7 +2522,7 @@ impl OptContext {
                 .map_or(false, |b| self.has_op_forwarding(&b));
             debug_assert!(
                 !(has_op_fwd && op.result_type() != majit_ir::Type::Void),
-                "emit: Forwarded::Box redirect set on non-void result position {:?} — \
+                "emit: op-forwarding redirect set on non-void result position {:?} — \
                  import_state should only forward inputarg slots in \
                  [inputarg_base..inputarg_base + num_inputs), and Phase 2 op results \
                  live in a disjoint range [p2_high_water..) (Commit D1).",
@@ -2775,7 +2775,7 @@ impl OptContext {
         // pyre's flat-OpRef model collapses the two onto one slot per OpRef,
         // so when `make_equal_to` is installed at `source`, the replay's
         // `_forwarded` slot must be moved to `result_opref` to avoid the
-        // `Forwarded::Box(target)` chain clobbering the seeded info.
+        // op-forwarding chain clobbering the seeded info.
         //
         //   * invented Pure → result_opref. `produce_pure` installs
         //     `make_equal_to(source, result_opref)` (Fix #3).
@@ -3379,9 +3379,9 @@ impl OptContext {
     ///
     /// `set_forwarded(None)` clears the slot so a second `use_box` for the
     /// same preamble op never re-fires `info.make_guards`. In majit's flat
-    /// OpRef model the slot is shared with the Box→Box replacement chain
-    /// (`Forwarded::Box`), which other code follows via
-    /// `get_box_replacement`; clearing that variant would silently break
+    /// OpRef model the slot is shared with the box replacement chain
+    /// (`Forwarded::Op` / `Forwarded::InputArg`), which other code follows
+    /// via `get_box_replacement`; clearing that variant would silently break
     /// downstream replacement, so only the info-bearing variants
     /// (Info / IntBound / Const) take + clear, matching PyPy's clear
     /// semantics on the info-bearing branches.
@@ -3393,7 +3393,7 @@ impl OptContext {
         // BoxRef-authoritative read. PyPy stores the replay op's forwarded
         // info directly on `preamble_op._forwarded`; pyre stores the same
         // state in the BoxRef slot keyed by `source`. Non-constant
-        // `Forwarded::Box(target)` is a replacement chain and is excluded.
+        // `Forwarded::Op`/`InputArg` is a replacement chain and is excluded.
         // Const targets can still appear from legacy bridge/fixture replay
         // paths; normalize them to the OpInfo shape consumed by
         // `setinfo_from_preamble_item_option`.
@@ -3949,7 +3949,7 @@ impl OptContext {
         // target, a heap/virtual cache entry) — is materialized to its
         // canonical `SameAs*` stand-in (`resoperation.py:233-248` "the box
         // always exists"). The forward then targets a bound `Op`/`InputArg`
-        // and never a position-only `Forwarded::Box` redirect. An unbound
+        // and never a position-only unbound-box redirect. An unbound
         // `newop` has no producer at its position, so it cannot alias the
         // bound chain head `op` (no self-cycle).
         let materialized_newop;
@@ -4005,12 +4005,12 @@ impl OptContext {
             // Unreachable: `newop` was normalized above to a constant or a
             // bound `Op`/`InputArg`, so the dispatch always resolves through
             // `set_forwarded_const` / `set_forwarded_op` / `set_forwarded_inputarg`.
-            // The orphan `Forwarded::Box` redirect — the last production writer
-            // of the `Forwarded::Box` variant — is retired.
+            // The orphan unbound-box redirect that the deleted `Forwarded::Box`
+            // variant once encoded no longer exists.
             unreachable!(
                 "make_equal_to: newop must be constant or bound after \
-                 materialize_box_at normalization (Forwarded::Box production \
-                 writer retired)"
+                 materialize_box_at normalization (orphan unbound-box \
+                 redirect retired)"
             );
         }
         // optimizer.py:395-396
@@ -4089,7 +4089,7 @@ impl OptContext {
     ///
     /// `_forwarded` is a single slot per `BoxRef` (matching RPython's
     /// single Python slot per box). The walker advances through
-    /// `Forwarded::Box(target)` and terminates at `None` /
+    /// `Forwarded::Op`/`Forwarded::InputArg` and terminates at `None` /
     /// `Forwarded::Info(_)` / a Const target's reconstructed
     /// `OpRef::const_int/float/ptr`.
     fn get_box_replacement_impl(&self, opref: OpRef, not_const: bool) -> OpRef {
@@ -4614,9 +4614,7 @@ impl OptContext {
         }
         matches!(
             &op.get_forwarded(),
-            crate::r#box::Forwarded::Op(_)
-                | crate::r#box::Forwarded::InputArg(_)
-                | crate::r#box::Forwarded::Box(_)
+            crate::r#box::Forwarded::Op(_) | crate::r#box::Forwarded::InputArg(_)
         )
     }
 
@@ -5310,7 +5308,7 @@ impl OptContext {
     /// ConstPtr(ConstPtr.value)`). True iff `op` resolves to a Ref-typed
     /// null constant. Walks the chain and reads the terminal's
     /// `const_value()` directly — Const-namespace OpRefs whose
-    /// `Forwarded::Box(target)` chain terminates at a `BoxKind::Const`
+    /// forwarding chain terminates at a `Forwarded::Const`
     /// with `Value::Ref(GcRef(0))` are detected here.
     pub fn is_const_null(&self, op: &crate::r#box::BoxRef) -> bool {
         matches!(
@@ -6546,9 +6544,9 @@ impl OptContext {
             // or `Info(_)` per the chain walker (box.rs:295-322); a
             // `Forwarded::Const` terminal is materialized inline by the
             // walker into a fresh BoxRef whose own slot is None.
-            Forwarded::Box(_) | Forwarded::Const(_) | Forwarded::Op(_) | Forwarded::InputArg(_) => {
+            Forwarded::Const(_) | Forwarded::Op(_) | Forwarded::InputArg(_) => {
                 unreachable!(
-                    "getrawptrinfo: chain terminal must not carry Forwarded::Box / Const \
+                    "getrawptrinfo: chain terminal must not carry Forwarded::Const \
                  (box.rs:295 get_box_replacement walker invariant)",
                 )
             }
@@ -6634,9 +6632,9 @@ impl OptContext {
             // or `Info(_)` per the chain walker (box.rs:295-322); a
             // `Forwarded::Const` terminal is materialized inline by the
             // walker into a fresh BoxRef whose own slot is None.
-            Forwarded::Box(_) | Forwarded::Const(_) | Forwarded::Op(_) | Forwarded::InputArg(_) => {
+            Forwarded::Const(_) | Forwarded::Op(_) | Forwarded::InputArg(_) => {
                 unreachable!(
-                    "getptrinfo: chain terminal must not carry Forwarded::Box / Const \
+                    "getptrinfo: chain terminal must not carry Forwarded::Const \
                  (box.rs:295 get_box_replacement walker invariant)",
                 )
             }
@@ -7002,10 +7000,7 @@ impl OptContext {
                     Forwarded::Info(_) => {
                         return crate::optimizeopt::intutils::IntBound::unbounded().getnullness();
                     }
-                    Forwarded::Box(_)
-                    | Forwarded::Const(_)
-                    | Forwarded::Op(_)
-                    | Forwarded::InputArg(_) => {
+                    Forwarded::Const(_) | Forwarded::Op(_) | Forwarded::InputArg(_) => {
                         unreachable!("chain walker terminal")
                     }
                     Forwarded::None => {}
@@ -8085,14 +8080,14 @@ mod boxref_forwarding_tests {
 
     /// `resoperation.py:57-68 get_box_replacement` + `history.py:188
     /// Const.is_constant()` parity: after the chain walker advances into
-    /// a `Forwarded::Box(constbox)` target, `is_constant()` on the
+    /// a `Forwarded::Const(constval)` target, `is_constant()` on the
     /// terminal box reports True. Covers both encodings of "this slot is
     /// a known constant": (a) Const-namespace OpRef terminus, and (b)
-    /// `Forwarded::Box(constbox)` produced by `optimizer.py:432
+    /// `Forwarded::Const(constval)` produced by `optimizer.py:432
     /// set_forwarded(constbox)` — equivalent to RPython's single
     /// `is_constant()` predicate after `get_box_replacement`.
     #[test]
-    fn audit_a_chain_walker_reaches_constant_through_forwarded_box() {
+    fn audit_a_chain_walker_reaches_constant_through_forwarded_const() {
         let mut ctx = OptContext::with_num_inputs_and_start_pos(0, 2, 0, 2);
         let (b0, _ia0) = bound_inputarg_box(Type::Int, 0);
         let (b1, _ia1) = bound_inputarg_box(Type::Int, 1);
@@ -8101,13 +8096,13 @@ mod boxref_forwarding_tests {
         let const_opref = OpRef::const_int(7);
         let const_box = ctx.materialize_box_at(const_opref);
         assert!(const_box.get_box_replacement(false).is_constant());
-        // (b) `Forwarded::Box(constbox)` chain on a non-Const-namespace OpRef.
+        // (b) `Forwarded::Const(constval)` chain on a non-Const-namespace OpRef.
         let b0_iarg = ctx.materialize_box_at(OpRef::input_arg_int(0));
         ctx.make_equal_to(&b0_iarg, &const_box);
         let b0_after = ctx.materialize_box_at(OpRef::input_arg_int(0));
         assert!(b0_after.get_box_replacement(false).is_constant());
-        // `Forwarded::Box(constbox)` planted directly via set_forwarded_box.
-        b1.set_forwarded_box(BoxRef::new_const(Value::Int(42)));
+        // `Forwarded::Const(constval)` planted directly via set_forwarded_const.
+        b1.set_forwarded_const(majit_ir::Const::Int(42));
         assert!(b1.get_box_replacement(false).is_constant());
         // Negative case: BoxRef with no constant forwarding.
         let (nb, _ia_nb) = bound_inputarg_box(Type::Int, 0);
@@ -8144,12 +8139,12 @@ mod boxref_forwarding_tests {
         }
     }
 
-    /// `make_equal_to(old, ConstX)` mirrors onto `old_box.set_forwarded_box(
-    /// fresh_const_box)`. Per RPython parity (`optimizer.py:393`,
+    /// `make_equal_to(old, ConstX)` mirrors onto `old_box.set_forwarded_const(
+    /// const_value)`. Per RPython parity (`optimizer.py:393`,
     /// `history.py:220` ConstInt construction), the const target is built
     /// fresh from `const_pool[const_index]` per call site — no dedup, value
-    /// equality via `same_constant`. The mirror must produce a Const-kind
-    /// BoxRef carrying the same Value as the seeded constant.
+    /// equality via `same_constant`. The mirror must record the same Value
+    /// as the seeded constant via `Forwarded::Const`.
     #[test]
     fn h3_4_replace_op_const_target_mirrors_value_box() {
         let (mut ctx, b0, _b1, _ia_holder) = ctx_with_two_int_boxes();
@@ -9529,7 +9524,7 @@ mod ensure_ptr_info_arg0_tests {
     }
 
     /// optimizer.py:474 assertion: an unexpected forwarded info shape (e.g.
-    /// a `Forwarded::Box` redirect that resolved to a non-PtrInfo state)
+    /// an op-forwarding redirect that resolved to a non-PtrInfo state)
     /// must NOT silently overwrite. We seed an `Instance` PtrInfo, then
     /// hand it a field op with a different parent — the early-return path
     /// hits, and the existing Instance is returned without overwrite.
@@ -9817,8 +9812,8 @@ mod opt_box_env_tests {
         // `resoperation.py:250 AbstractResOp` are distinct classes
         // upstream — a Box materialised against `OpRef::InputArg*`
         // must be `is_inputarg()` so the chain walker reconstructs
-        // the same variant on the round-trip through
-        // `Forwarded::Box`.  Prior to the per-variant empty-slot
+        // the same variant on the round-trip through the
+        // forwarding chain.  Prior to the per-variant empty-slot
         // path, materialisation always emitted `new_resop`,
         // silently demoting the inputarg.
         // `with_inputarg_types` would seed the inputarg slots

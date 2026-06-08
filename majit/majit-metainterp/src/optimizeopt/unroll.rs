@@ -4016,7 +4016,7 @@ impl OptUnroll {
                 return synthesize_const_info(value);
             }
         }
-        // make_constant mirrors optimizer.py:432 as `Forwarded::Box(constbox)`.
+        // make_constant mirrors optimizer.py:432 as `Forwarded::Const(constval)`.
         // The walker has advanced to the constbox terminal — surface RPython's
         // ConstPtrInfo / FloatConstInfo / IntBound dispatch via const_value().
         let resolved_box = ctx.get_box_replacement_box(opref);

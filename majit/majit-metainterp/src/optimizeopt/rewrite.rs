@@ -3487,7 +3487,7 @@ impl Optimization for OptRewrite {
                             // `produce_loop_invariant` installs
                             // `make_equal_to(source, result_opref)`, so the source
                             // box's `_forwarded` slot now holds
-                            // `Forwarded::Box(result_box)`.
+                            // `Forwarded::Op(result_op)`.
                             // Build the synthetic SameAsI replay at
                             // `result_opref` (= get_box_replacement(source))
                             // so `take_preamble_forwarded_opinfo` reads the

@@ -19,11 +19,10 @@
 //!   the borrow scope immediately after reading.
 //! - `BoxRef`'s `Eq` / `Hash` use `Rc::ptr_eq` / `Rc::as_ptr` — equivalent
 //!   to RPython's use of object identity as a dict key.
-//! - When `Forwarded::Box(BoxRef)` carries a BoxRef whose kind is
-//!   `BoxKind::Const(...)`, that mirrors RPython's
-//!   `box.set_forwarded(constbox)`. Constants are split into
-//!   `Forwarded::Const(Const)` separately so chain walkers terminate on
-//!   the inline value without needing a `BoxKind::Const` carrier.
+//! - A constant forwarding target mirrors RPython's
+//!   `box.set_forwarded(constbox)` via the `Forwarded::Const(Const)`
+//!   variant, so chain walkers terminate on the inline value without
+//!   needing a `BoxKind::Const` carrier.
 
 use std::cell::{Cell, RefCell};
 use std::rc::{Rc, Weak};
@@ -88,7 +87,7 @@ pub enum BoxKind {
     /// RPython counterpart on `AbstractResOpOrInputArg` (which carries
     /// only `_forwarded`); it stores the index where the box lands in the
     /// pool so the chain walker can reconstruct an `OpRef::op_typed(pos,
-    /// type)` when advancing through `Forwarded::Box(target)`. Set by
+    /// type)` when advancing through a `Forwarded::Op` chain step. Set by
     /// `opencoder.py Trace.record()` (and the recorder's `record_op_*`
     /// family in pyre) at construction; updated by `optimizer.rs:2783`
     /// const-pool compaction via `BoxRef::set_position`. RPython has no
@@ -134,11 +133,6 @@ pub enum BoxKind {
 #[derive(Clone, Debug)]
 pub enum Forwarded {
     None,
-
-    /// Forwarding to another `AbstractResOpOrInputArg`. Const targets
-    /// route through [`Forwarded::Const`] instead; `ResOp` targets route
-    /// through [`Forwarded::Op`] once C.5 retires this variant.
-    Box(BoxRef),
 
     /// `resoperation.py:250 AbstractResOp` forwarding — direct
     /// `Weak<Op>` reference, no `BoxRef`/`BoxKind::ResOp` carrier.
@@ -614,45 +608,6 @@ impl BoxRef {
         Forwarded::None
     }
 
-    /// `resoperation.py:53 set_forwarded(forwarded_to)` — Box variant.
-    pub fn set_forwarded_box(&self, target: BoxRef) {
-        // `assert forwarded_to is not self` (resoperation.py:241).
-        // Always-on assert so a release build can't accept a one-node
-        // forwarding cycle that would make `get_box_replacement()` spin.
-        // After `bind_op` / `bind_inputarg` two distinct `Rc<Box>`
-        // wrappers can share the same canonical bound `OpRc`/`InputArgRc`;
-        // the `Rc::ptr_eq` on `self.0` alone misses that case, so also
-        // compare the bound handles when both sides carry one.
-        assert!(!Rc::ptr_eq(&self.0, &target.0));
-        if let (Some(self_op), Some(target_op)) = (self.bound_op(), target.bound_op()) {
-            assert!(
-                !Rc::ptr_eq(&self_op, &target_op),
-                "set_forwarded_box on a BoxRef that wraps the same bound \
-                 Op as the target creates a one-node chain cycle"
-            );
-        }
-        if let (Some(self_ia), Some(target_ia)) = (self.bound_inputarg(), target.bound_inputarg()) {
-            assert!(
-                !Rc::ptr_eq(&self_ia, &target_ia),
-                "set_forwarded_box on a BoxRef that wraps the same bound \
-                 InputArg as the target creates a one-node chain cycle"
-            );
-        }
-        // RPython AbstractValue invariant: `Const` is not a subclass of
-        // `AbstractResOpOrInputArg` (history.py:182), so `set_forwarded`
-        // is undefined on Const objects (resoperation.py:50 default
-        // raises). The Rust port unifies the layout into a single struct
-        // shape; this assertion preserves the invariant. PyPy raises
-        // unconditionally, so the check is always-on (not `debug_assert!`).
-        assert!(
-            !matches!(self.0.kind, BoxKind::Const { .. }),
-            "set_forwarded_box on Const violates RPython AbstractValue \
-             invariant (Const has no _forwarded slot)"
-        );
-        let next = Forwarded::Box(target);
-        self.write_forwarded(next);
-    }
-
     /// `optimizer.py:394 op.set_forwarded(newop)` — InputArg variant.
     /// Targets an `AbstractInputArg` identity directly via
     /// `Weak<InputArg>`. Mirror of `set_forwarded_op` for the InputArg
@@ -841,12 +796,6 @@ impl BoxRef {
         loop {
             match cur.get_forwarded() {
                 Forwarded::None | Forwarded::Info(_) => return cur,
-                Forwarded::Box(b) => {
-                    if not_const && b.is_constant() {
-                        return cur;
-                    }
-                    cur = b;
-                }
                 Forwarded::Op(weak) => {
                     let Some(op_rc) = weak.upgrade() else {
                         // Dropped target: PyPy has no analog (Python
@@ -1151,7 +1100,6 @@ mod tests {
     /// `_forwarded` host per resoperation.py:233). The OpRc must outlive
     /// every write through the returned BoxRef.
     fn bound_resop(tp: Type, position: u32) -> (BoxRef, OpRc) {
-        let b = BoxRef::new_resop(tp, position);
         let opcode = match tp {
             Type::Int => OpCode::SameAsI,
             Type::Float => OpCode::SameAsF,
@@ -1160,7 +1108,12 @@ mod tests {
         };
         let op = std::rc::Rc::new(Op::new(opcode, &[]));
         op.pos.set(OpRef::op_typed(position, tp));
-        b.bind_op(&op);
+        // Canonical resolver: binds the box AND memoizes it on
+        // `op.box_cache`, so the chain walker's `from_bound_op`
+        // re-resolution of a `Forwarded::Op` step returns this same
+        // `Rc<Box>` (matches production, where every box comes from
+        // `from_bound_op`).
+        let b = BoxRef::from_bound_op(&op);
         (b, op)
     }
 
@@ -1268,10 +1221,10 @@ mod tests {
     #[test]
     fn forwarded_chain_walk_returns_terminal() {
         let (a, _ao) = bound_resop(Type::Int, 0);
-        let (b, _bo) = bound_resop(Type::Int, 1);
-        let (c, _co) = bound_resop(Type::Int, 2);
-        a.set_forwarded_box(b.clone());
-        b.set_forwarded_box(c.clone());
+        let (b, bo) = bound_resop(Type::Int, 1);
+        let (c, co) = bound_resop(Type::Int, 2);
+        a.set_forwarded_op(&bo);
+        b.set_forwarded_op(&co);
         assert_eq!(a.get_box_replacement(false), c);
         assert_eq!(b.get_box_replacement(false), c);
         assert_eq!(c.get_box_replacement(false), c);
@@ -1280,8 +1233,8 @@ mod tests {
     #[test]
     fn forwarded_chain_stops_at_info() {
         let (a, _ao) = bound_resop(Type::Int, 0);
-        let (b, _bo) = bound_resop(Type::Int, 1);
-        a.set_forwarded_box(b.clone());
+        let (b, bo) = bound_resop(Type::Int, 1);
+        a.set_forwarded_op(&bo);
         b.set_forwarded_info(OpInfo::Unknown);
         assert_eq!(a.get_box_replacement(false), b);
     }
@@ -1289,12 +1242,15 @@ mod tests {
     #[test]
     fn forwarded_chain_not_const_stops_before_const() {
         let (a, _ao) = bound_resop(Type::Int, 0);
-        let (b, _bo) = bound_resop(Type::Int, 1);
-        let c = BoxRef::new_const(Value::Int(42));
-        a.set_forwarded_box(b.clone());
-        b.set_forwarded_box(c.clone());
+        let (b, bo) = bound_resop(Type::Int, 1);
+        a.set_forwarded_op(&bo);
+        b.set_forwarded_const(Const::Int(42));
+        // not_const=true stops at the box before stepping into the Const;
+        // not_const=false materializes the terminal Const box.
         assert_eq!(a.get_box_replacement(true), b);
-        assert_eq!(a.get_box_replacement(false), c);
+        let term = a.get_box_replacement(false);
+        assert!(term.is_constant());
+        assert_eq!(term.const_value(), Some(Value::Int(42)));
     }
 
     #[test]
@@ -1346,8 +1302,8 @@ mod tests {
     #[test]
     fn clear_forwarded_resets_slot() {
         let (a, _ao) = bound_resop(Type::Int, 0);
-        let (b, _bo) = bound_resop(Type::Int, 0);
-        a.set_forwarded_box(b.clone());
+        let (_b, bo) = bound_resop(Type::Int, 0);
+        a.set_forwarded_op(&bo);
         a.clear_forwarded();
         assert_eq!(a.get_box_replacement(false), a);
         assert!(matches!(a.get_forwarded(), Forwarded::None));
@@ -1387,8 +1343,8 @@ mod tests {
     #[test]
     #[should_panic]
     fn set_forwarded_to_self_panics() {
-        let a = BoxRef::new_resop(Type::Int, 0);
-        a.set_forwarded_box(a.clone());
+        let (a, ao) = bound_resop(Type::Int, 0);
+        a.set_forwarded_op(&ao);
     }
 
     #[test]
@@ -1406,10 +1362,10 @@ mod tests {
     }
 
     #[test]
-    fn ptr_info_returns_none_for_box_forwarded() {
+    fn ptr_info_returns_none_for_op_forwarded() {
         let (a, _ao) = bound_resop(Type::Ref, 0);
-        let (b, _bo) = bound_resop(Type::Ref, 0);
-        a.set_forwarded_box(b.clone());
+        let (_b, bo) = bound_resop(Type::Ref, 0);
+        a.set_forwarded_op(&bo);
         assert!(a.ptr_info().is_none());
     }
 
@@ -1436,10 +1392,10 @@ mod tests {
     }
 
     #[test]
-    fn int_bound_returns_none_for_box_forwarded() {
+    fn int_bound_returns_none_for_op_forwarded() {
         let (a, _ao) = bound_resop(Type::Int, 0);
-        let (b, _bo) = bound_resop(Type::Int, 0);
-        a.set_forwarded_box(b.clone());
+        let (_b, bo) = bound_resop(Type::Int, 0);
+        a.set_forwarded_op(&bo);
         assert!(a.int_bound().is_none());
     }
 
@@ -1516,16 +1472,6 @@ mod tests {
         b.clear_forwarded();
         assert!(matches!(b.get_forwarded(), Forwarded::None));
         assert!(matches!(*op.forwarded.borrow(), Forwarded::None));
-
-        // set_forwarded_box → both slots carry the target.
-        let target = BoxRef::new_resop(Type::Int, 1);
-        b.set_forwarded_box(target.clone());
-        match (&b.get_forwarded(), &*op.forwarded.borrow()) {
-            (Forwarded::Box(box_target), Forwarded::Box(op_target)) => {
-                assert_eq!(box_target, op_target);
-            }
-            _ => panic!("expected Forwarded::Box on both slots"),
-        }
     }
 
     /// `bind_inputarg` panics on a non-InputArg box (same contract as
@@ -1568,14 +1514,6 @@ mod tests {
         b.set_forwarded_info(OpInfo::int_bound(IntBound::from_constant(99)));
         assert!(matches!(b.get_forwarded(), Forwarded::Info(_)));
         assert!(matches!(*ia.forwarded.borrow(), Forwarded::Info(_)));
-
-        // Box write should also reach the InputArg slot.
-        let target = BoxRef::new_resop(Type::Int, 5);
-        b.set_forwarded_box(target.clone());
-        match (&b.get_forwarded(), &*ia.forwarded.borrow()) {
-            (Forwarded::Box(bt), Forwarded::Box(iat)) => assert_eq!(bt, iat),
-            _ => panic!("expected Forwarded::Box on both slots"),
-        }
 
         // Clear reaches the InputArg slot.
         b.clear_forwarded();

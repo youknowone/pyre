@@ -923,10 +923,9 @@ impl Optimizer {
                         );
                         // ob_type (offset 0) class pointers are already Ref-typed
                         // by `import_virtual_state_value` (typed `RefOp` variant
-                        // tag) + Ref-typed `Forwarded::Box(BoxRef::new_const(
-                        // Value::Ref(class_gcref)))` from `make_constant`. The
-                        // BoxRef Ref-typed const forwarding is the
-                        // authoritative shape.
+                        // tag) + a Ref-typed `Forwarded::Const`
+                        // (`Value::Ref(class_gcref)`) from `make_constant`. The
+                        // Ref-typed const forwarding is the authoritative shape.
                         let _ = (field_descrs, known_class, field_idx);
                         (*field_idx, field_ref)
                     })
@@ -2081,8 +2080,8 @@ impl Optimizer {
         // optimizer.py:34 `self.inputargs = inputargs` parity.
         ctx.inputargs = self.trace_inputargs.clone();
         // Bind inputarg hosts so `make_equal_to` routes InputArg-targeted
-        // chain steps through `Forwarded::InputArg(_)` rather than the
-        // deprecated `Forwarded::Box(_)` fallback. Phase 2 enters with a
+        // chain steps through `Forwarded::InputArg(_)` (the orphan-box
+        // forwarding fallback has been retired). Phase 2 enters with a
         // fresh per-iteration inputarg set whose TreeLoop-owned strong
         // `InputArgRc`s were dropped, so re-bind them here.
         ctx.ensure_inputarg_bindings();

@@ -4106,7 +4106,7 @@ impl ResumeDataLoopMemo {
         // The numbering pass that produced this `liveboxes` list already
         // satisfied that invariant. The re-walk below exists for boxes that
         // were further forwarded between numbering and finish (e.g.
-        // `make_equal_to` writing `Forwarded::Box(next_box)`), so the
+        // `make_equal_to` writing a `Forwarded::Op`/`Const` redirect), so the
         // backend sees the final concrete position. It uses
         // get_box_replacement(not_const=True) parity and stops before a Const
         // target; Consts are represented by rd_numb TAGCONST, not backend
