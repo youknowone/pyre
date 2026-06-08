@@ -1368,29 +1368,17 @@ impl VirtualState {
                 _ => Ok(()),
             };
         }
-        // virtualstate.py:520-530: _generate_virtual_guards —
-        // force_boxes + expected virtual, incoming non-virtual (forced box).
-        // The forced box's known class must match the virtual's class.
-        if state.force_boxes && expected_info.is_virtual() && !incoming_info.is_virtual() {
-            if let VirtualStateInfo::KnownClass { class_ptr } = incoming_info {
-                let expected_class = match expected_info {
-                    VirtualStateInfo::Virtual { known_class, .. } => known_class.as_ref(),
-                    _ => None,
-                };
-                return if expected_class == Some(class_ptr) || expected_class.is_none() {
-                    Ok(())
-                } else {
-                    Err(())
-                };
-            }
-            if matches!(
-                incoming_info,
-                VirtualStateInfo::NonNull | VirtualStateInfo::Unknown(_)
-            ) {
-                return Ok(());
-            }
-            return Err(());
-        }
+        // There is no force_boxes relaxation for an expected (target)
+        // Virtual against a non-virtual incoming. When `self` is a
+        // VirtualStateInfo the dispatch is
+        // `AbstractVirtualStructStateInfo._generate_guards`
+        // (virtualstate.py:141), which has no force-box branch and requires
+        // the incoming to be a matching virtual struct. The sole force_boxes
+        // relaxation lives in `NotVirtualStateInfoPtr._generate_guards`
+        // (virtualstate.py:522-524) — the expected-non-virtual, incoming-
+        // virtual branch handled directly above. A Virtual target with a
+        // non-virtual incoming therefore falls through to the structural
+        // match below and is rejected by its `_ => Err(())` arm.
 
         // virtualstate.py:392-394 NotVirtualStateInfo._generate_guards:
         //
