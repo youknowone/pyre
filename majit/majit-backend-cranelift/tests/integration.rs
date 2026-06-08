@@ -1103,7 +1103,7 @@ fn assign_positions(ops: &mut [Op], base: u32) {
 //
 // Expected after optimization:
 //   - cmp2 eliminated by CSE (OptPure)
-//   - second guard_true eliminated (duplicate by OptGuard)
+//   - second guard_true eliminated (duplicate folded by OptRewrite)
 //   - sq2 eliminated by CSE (OptPure), forwarded to sq
 // ---------------------------------------------------------------------------
 
