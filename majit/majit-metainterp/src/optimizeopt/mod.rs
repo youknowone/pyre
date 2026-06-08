@@ -4111,6 +4111,15 @@ impl OptContext {
             .unwrap_or_else(|| crate::r#box::BoxRef::from_opref(opref))
     }
 
+    /// `BoxRef`-addressed operand resolution seam. Callers holding the
+    /// operand Box (`op.arg(i)`) resolve it here instead of collapsing to
+    /// an `OpRef` and re-resolving. Bridges through
+    /// `get_box_replacement(arg.to_opref())`; the box-native chain walk
+    /// that retires the `to_opref` round-trip is layered in behind it.
+    pub fn resolve_box_box(&self, arg: &crate::r#box::BoxRef) -> crate::r#box::BoxRef {
+        self.get_box_replacement(arg.to_opref())
+    }
+
     /// resoperation.py:58 get_box_replacement(not_const=True). This is used
     /// for guard fail args / backend liveboxes where RPython stops before a
     /// Const target, preserving the runtime box while resume numbering carries
