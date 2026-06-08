@@ -22,7 +22,7 @@
 
 use crate::box_ref::BoxRef;
 use crate::resoperation::{OpRc, OpRef};
-use crate::value::{Const, InputArgRc, Type, Value};
+use crate::value::{Const, GcRef, InputArgRc, Type, Value};
 use std::rc::Rc;
 
 /// An operand stored in `Op.args` / `Op.fail_args`.
@@ -42,6 +42,15 @@ pub enum Operand {
     /// An inline constant (`history.py` `Const*`); value identity, never
     /// `Rc::ptr_eq`.
     Const(Const),
+    /// MIGRATION-ONLY catch-all (`#9` operand-union flip): a not-yet-converted
+    /// [`BoxRef`] for the operands `from_boxref` cannot yet lower to a pure
+    /// `Op`/`InputArg`/`Const` — const operands (kept `Cell`-backed for the GC
+    /// walk) and position-only operands minted by `BoxRef::from_opref` (no live
+    /// producer to bind). Holding the original `BoxRef` makes the storage flip
+    /// byte-identical: `to_boxref` clones the same `Rc<Box>` back, preserving
+    /// box identity and GC-walkability verbatim. Ground down to zero
+    /// (then deleted) as later slices bind/inline these.
+    Box(BoxRef),
 }
 
 impl Operand {
@@ -85,6 +94,7 @@ impl Operand {
                 Const::Float(v) => OpRef::const_float(v),
                 Const::Ref(v) => OpRef::const_ptr(v),
             },
+            Operand::Box(b) => b.to_opref(),
         }
     }
 
@@ -94,6 +104,7 @@ impl Operand {
         match self {
             Operand::Op(op) => Some(op.pos.get().raw()),
             Operand::InputArg(ia) => Some(ia.index),
+            Operand::Box(b) => b.position(),
             Operand::Const(_) | Operand::None => None,
         }
     }
@@ -104,6 +115,7 @@ impl Operand {
             Operand::Op(op) => op.pos.get().ty().unwrap_or(Type::Void),
             Operand::InputArg(ia) => ia.tp,
             Operand::Const(c) => c.get_type(),
+            Operand::Box(b) => b.type_(),
             Operand::None => Type::Void,
         }
     }
@@ -113,6 +125,7 @@ impl Operand {
     pub fn const_value(&self) -> Option<Value> {
         match self {
             Operand::Const(c) => Some(c.to_value()),
+            Operand::Box(b) => b.const_value(),
             _ => None,
         }
     }
@@ -122,40 +135,54 @@ impl Operand {
     pub fn const_int(&self) -> Option<i64> {
         match self {
             Operand::Const(Const::Int(v)) => Some(*v),
+            Operand::Box(b) => b.const_int(),
             _ => None,
         }
     }
 
     /// `resoperation.py:47 is_constant`.
     pub fn is_constant(&self) -> bool {
-        matches!(self, Operand::Const(_))
+        match self {
+            Operand::Const(_) => true,
+            Operand::Box(b) => b.is_constant(),
+            _ => false,
+        }
     }
 
     pub fn is_inputarg(&self) -> bool {
-        matches!(self, Operand::InputArg(_))
+        match self {
+            Operand::InputArg(_) => true,
+            Operand::Box(b) => b.is_inputarg(),
+            _ => false,
+        }
     }
 
     pub fn is_resop(&self) -> bool {
-        matches!(self, Operand::Op(_))
+        match self {
+            Operand::Op(_) => true,
+            Operand::Box(b) => b.is_resop(),
+            _ => false,
+        }
     }
 
     /// True for the absent-slot sentinel — the mirror of `OpRef::is_none`.
     pub fn is_none(&self) -> bool {
-        matches!(self, Operand::None)
+        match self {
+            Operand::None => true,
+            Operand::Box(b) => b.is_none(),
+            _ => false,
+        }
     }
 
     /// `resoperation.py:38 AbstractValue.same_box`: pointer identity
     /// (`Rc::ptr_eq`) for `Op` / `InputArg`, value comparison for `Const`
     /// (`history.py:211 same_constant`), and the `None` sentinel matches only
-    /// itself.
+    /// itself. Routed through [`BoxRef::same_box`] (the canonical predicate) so
+    /// the migration `Box` variant compares uniformly against pure variants —
+    /// the `from_bound_*` view is memoized, so two operands holding the same op
+    /// still resolve to the same `Rc<Box>` and stay `ptr_eq`.
     pub fn same_box(&self, other: &Operand) -> bool {
-        match (self, other) {
-            (Operand::None, Operand::None) => true,
-            (Operand::Op(a), Operand::Op(b)) => Rc::ptr_eq(a, b),
-            (Operand::InputArg(a), Operand::InputArg(b)) => Rc::ptr_eq(a, b),
-            (Operand::Const(a), Operand::Const(b)) => a == b,
-            _ => false,
-        }
+        self.to_boxref().same_box(&other.to_boxref())
     }
 
     /// Faithful [`BoxRef`] view of this operand, for the migration window
@@ -170,6 +197,44 @@ impl Operand {
             Operand::Op(op) => BoxRef::from_bound_op(op),
             Operand::InputArg(ia) => BoxRef::from_bound_inputarg(ia),
             Operand::Const(c) => BoxRef::new_const(c.to_value()),
+            Operand::Box(b) => b.clone(),
+        }
+    }
+
+    /// Classify a [`BoxRef`] into an [`Operand`] for the storage flip. Cleanly
+    /// bound producers shed the wrapper — a live `bound_op`/`bound_inputarg`
+    /// becomes a pure `Op`/`InputArg` (the `#9` win); the `None` sentinel
+    /// becomes `Operand::None`. Everything else — `Const` (kept `Cell`-backed
+    /// for the GC walk) and position-only boxes minted by `from_opref` with no
+    /// live producer to bind — is preserved verbatim as `Operand::Box`, so
+    /// `to_boxref` returns the same `Rc<Box>` and the flip is byte-identical.
+    /// Later slices grind the `Box` residue to zero.
+    pub fn from_boxref(b: &BoxRef) -> Operand {
+        if b.is_none() {
+            return Operand::None;
+        }
+        if !b.is_constant() {
+            if b.is_inputarg() {
+                if let Some(ia) = b.bound_inputarg() {
+                    return Operand::InputArg(ia);
+                }
+            } else if let Some(op) = b.bound_op() {
+                return Operand::Op(op);
+            }
+        }
+        Operand::Box(b.clone())
+    }
+
+    /// GC walk over any inline `ConstPtr` reachable from this operand
+    /// (`resoperation.py` `walk_const_ptr_refs`). Const / position-only
+    /// operands are held `Cell`-backed via `Operand::Box`, so their `GcRef`
+    /// updates in place; pure `Op` / `InputArg` carry no inline const (their
+    /// own `value` slot is walked at the producer); pure `Operand::Const`
+    /// is value-typed with no in-place slot and is not produced by
+    /// `from_boxref` during the migration window.
+    pub fn walk_const_ptr_refs(&self, visitor: &mut dyn FnMut(&mut GcRef)) {
+        if let Operand::Box(b) = self {
+            b.walk_const_ptr_refs(visitor);
         }
     }
 }
@@ -260,5 +325,42 @@ mod tests {
         assert_eq!(c.const_int(), Some(11));
 
         assert!(Operand::none().to_boxref().is_none());
+    }
+
+    #[test]
+    fn from_boxref_sheds_wrapper_for_bound_keeps_box_for_rest() {
+        // Bound op -> pure Op, round-trips to the SAME memoized Rc<Box>.
+        let op = op_at(8, Type::Int);
+        let bound = BoxRef::from_bound_op(&op);
+        let o = Operand::from_boxref(&bound);
+        assert!(o.is_resop());
+        assert!(matches!(o, Operand::Op(_)));
+        assert_eq!(o.to_boxref().as_ptr(), bound.as_ptr());
+
+        // Bound input arg -> pure InputArg.
+        let ia = Rc::new(InputArg::from_type(Type::Ref, 2));
+        let bia = BoxRef::from_bound_inputarg(&ia);
+        let o = Operand::from_boxref(&bia);
+        assert!(matches!(o, Operand::InputArg(_)));
+        assert_eq!(o.to_boxref().as_ptr(), bia.as_ptr());
+
+        // Const -> kept as Box (Cell-backed), round-trips to the same box.
+        let cbox = BoxRef::new_const(Value::Int(11));
+        let o = Operand::from_boxref(&cbox);
+        assert!(matches!(o, Operand::Box(_)));
+        assert!(o.is_constant());
+        assert_eq!(o.const_int(), Some(11));
+        assert_eq!(o.to_boxref().as_ptr(), cbox.as_ptr());
+
+        // Position-only box (from_opref, no live producer) -> kept as Box,
+        // returns the identical Rc<Box> on read.
+        let pos_only = BoxRef::from_opref(OpRef::op_typed(4, Type::Int));
+        let o = Operand::from_boxref(&pos_only);
+        assert!(matches!(o, Operand::Box(_)));
+        assert_eq!(o.position(), Some(4));
+        assert_eq!(o.to_boxref().as_ptr(), pos_only.as_ptr());
+
+        // None sentinel -> Operand::None.
+        assert!(matches!(Operand::from_boxref(&BoxRef::none()), Operand::None));
     }
 }
