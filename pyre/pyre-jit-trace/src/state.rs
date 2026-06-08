@@ -595,6 +595,8 @@ fn build_list_append_resize_helper_payload() -> std::sync::Arc<crate::PyJitCode>
         // its own containing-opcode coordinate for a helper frame.
         first_jit_pc_by_py_pc: (0..code_len).collect(),
         depth_at_py_pc: vec![0; code_len],
+        // The helper's residual_call (jit_list_append) sits outside any
+        // try-block, so no pc lands on an after-residual-call catch.
         after_residual_call_resume_pc: vec![None; code_len],
         portal_frame_reg: u16::MAX,
         portal_ec_reg: u16::MAX,
