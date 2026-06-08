@@ -6996,6 +6996,7 @@ impl MIFrame {
     pub(crate) fn dispatch_via_walker_for_opcode(
         &mut self,
         instruction: &Instruction,
+        op_arg: pyre_interpreter::OpArg,
     ) -> Result<pyre_interpreter::StepResult<FrontendOp>, PyError> {
         // Sub-slice 5c step 5.6b — STORE_SUBSCR walker activation via
         // trait-path delegation.
@@ -7032,6 +7033,7 @@ impl MIFrame {
         // primitives.
         if matches!(instruction, Instruction::StoreSubscr) {
             use pyre_interpreter::SharedOpcodeHandler;
+            let _ = op_arg;
             let key = SharedOpcodeHandler::pop_value(self)?;
             let obj = SharedOpcodeHandler::pop_value(self)?;
             let value = SharedOpcodeHandler::pop_value(self)?;
@@ -7043,6 +7045,24 @@ impl MIFrame {
                 key.concrete.to_pyobj(),
                 value.concrete.to_pyobj(),
             )?;
+            return Ok(pyre_interpreter::StepResult::Continue);
+        }
+
+        // `pyopcode.py:1348-1376 RERAISE` parity for the walker leg.
+        //
+        // Production walker excluded `Reraise` because the trait path
+        // returns `Err(PyError)` with `reraise_lasti` populated for
+        // `oparg > 0`, while a walker hook returning `StepResult::Continue`
+        // (`Ok`) loses that channel and `trace_code_step` aborts on
+        // `oparg > 0 && reraise_lasti < 0`.  Delegate to the existing
+        // `MIFrame::reraise` impl (which mirrors `pyopcode.py:1357-1376`
+        // verbatim, reading the lasti from `concrete_stack[stack_idx]`
+        // and seeding `err.reraise_lasti`) and propagate its `Err` so
+        // `trace_code_step`'s `step_result.err().map(|e| e.reraise_lasti)`
+        // extraction works the same on either dispatch leg.
+        if let Instruction::Reraise { depth } = instruction {
+            use pyre_interpreter::OpcodeStepExecutor;
+            OpcodeStepExecutor::reraise(self, depth.get(op_arg))?;
             return Ok(pyre_interpreter::StepResult::Continue);
         }
 
@@ -7288,7 +7308,7 @@ impl MIFrame {
                 // dispatch in inline frames.
                 let in_inline_frame = !self.parent_frames.is_empty();
                 if production_walker_handles(&instruction) && !in_inline_frame {
-                    self.dispatch_via_walker_for_opcode(&instruction)
+                    self.dispatch_via_walker_for_opcode(&instruction, op_arg)
                 } else {
                     let shadow_outcome =
                         crate::shadow_walker::shadow_validate_pre(self, &instruction, op_arg);
@@ -8113,13 +8133,7 @@ pub fn production_walker_handles(instruction: &Instruction) -> bool {
             | Instruction::CopyFreeVars { .. }
             | Instruction::MakeCell { .. }
             | Instruction::ConvertValue { .. }
-            // Instruction::Reraise excluded: `trace_code_step` reads
-            // `reraise_lasti` only from `step_result.err()`
-            // (trace_opcode.rs:6839-6843).  A walker-handled Reraise
-            // returns `StepResult::Continue` (Ok), so reraise_lasti is
-            // always -1 and `Reraise { depth > 0 }` aborts the trace.
-            // Keep on trait dispatch until the walker can propagate the
-            // saved lasti.
+            | Instruction::Reraise { .. } // walker hook in dispatch_via_walker_for_opcode delegates to MIFrame::reraise which returns Err(PyError) with reraise_lasti seeded — `step_result.err().map(|e| e.reraise_lasti)` extraction works the same on either leg
             | Instruction::PopJumpIfNone { .. }
             | Instruction::PopJumpIfNotNone { .. }
             | Instruction::ForIter { .. }
