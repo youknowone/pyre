@@ -493,6 +493,25 @@ impl Bookkeeper {
         *self.pyre_struct_fields.borrow_mut() = Some(registry);
     }
 
+    /// TODO: no upstream equivalent.  The full set of struct type-root
+    /// keys in the snapshot registry (`StructFieldRegistry.fields`).
+    /// The session-prologue inheritance-id pass
+    /// (`PyreCallRegistry::ensure_session`) iterates these to eagerly
+    /// pre-register the build-time-closed `W_*` struct hierarchy before
+    /// running [`crate::translator::rtyper::normalizecalls::assign_inheritance_ids`].
+    /// Returns owned `String`s (not an iterator) so the registry borrow
+    /// is released before the caller re-borrows it through
+    /// [`Self::getuniqueclassdef_for_struct_root`].  Empty when no
+    /// registry is set (unit-test fixtures), degrading the pass to a
+    /// no-op over whatever classdefs already exist.
+    pub fn pyre_struct_root_names(&self) -> Vec<String> {
+        self.pyre_struct_fields
+            .borrow()
+            .as_ref()
+            .map(|reg| reg.fields.keys().cloned().collect())
+            .unwrap_or_default()
+    }
+
     /// Push a classdef into [`Self::needs_generic_instantiate`] unless
     /// it is already present (upstream `dict[cdef] = True` idempotence).
     pub fn push_needs_generic_instantiate(&self, classdef: &Rc<RefCell<ClassDef>>) {

@@ -281,6 +281,42 @@ impl PyreCallRegistry {
         // the first per-subject specialize so exception types are
         // resolvable when block specialize hits a `raise` op.
         rtyper.finish_exceptiondata()?;
+        // Session-prologue inheritance-id pass (rtyper.py:182 hoist,
+        // analogue of the `rtype` task's `perform_normalizations` before
+        // `specialize`).  Eagerly pre-register every registered
+        // struct-root `ClassDef` — each call runs the full transitive
+        // struct closure plus idempotent `Impossible`-guarded attr
+        // projection, the same work the per-graph adapter front-runs via
+        // `derive_subject_inputcells` — then run `assign_inheritance_ids`
+        // ONCE so `classdef.minid`/`maxid` get a stable bracket BEFORE
+        // any vtable materialises.  `ClassRepr.fill_vtable_root` bakes
+        // `minid`/`maxid` as eager `Signed` constants into the
+        // cross-graph-cached vtable, so the ids must never shift after
+        // the first bake; a single pre-vtable pass over the complete
+        // struct-root + standard-exception prefix (exceptions registered
+        // by `finish_exceptiondata` just above) guarantees that for this
+        // prefix.
+        //
+        // SCOPE LIMIT: this numbers ONLY the struct-root +
+        // standard-exception prefix.  Classdefs minted mid-session
+        // (`ClassDesc::pycall` instantiation, transitive base/call-family
+        // `getuniqueclassdef`, exception exit-case classes,
+        // `immutablevalue_hostobject`) are NOT numbered here and would
+        // hit `fill_vtable_root`'s `minid==None` error if a vtable were
+        // materialised for them — which is why class instantiation
+        // through `ClassesPBCRepr` stays disabled until a later slice
+        // extends this to cover mid-session classdefs.  Do NOT resolve a
+        // future `minid==None` by re-running `assign_inheritance_ids`
+        // mid-session: the current body re-sorts and SHIFTS the
+        // already-baked prefix ids, which the value-blind dual-gate
+        // cannot detect, silently miscompiling isinstance.
+        for root in self.bookkeeper.pyre_struct_root_names() {
+            // A malformed root must not abort the whole session — the
+            // per-graph path Skip-classifies it later, mirroring the
+            // populate path's `is_known_unported` tolerance.
+            let _ = self.bookkeeper.getuniqueclassdef_for_struct_root(&root);
+        }
+        crate::translator::rtyper::normalizecalls::assign_inheritance_ids(&annotator);
         translator.set_rtyper(rtyper.clone());
         *self.session.borrow_mut() = Some((annotator.clone(), rtyper.clone()));
         Ok((annotator, rtyper))
