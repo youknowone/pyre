@@ -1361,7 +1361,8 @@ pub fn floordiv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let b = unwrap_cell(b);
     unsafe {
         if needs_numeric_binop_dispatch(a, b, "__floordiv__", "__rfloordiv__") {
-            if let Some(result) = try_dispatch_binary_special(a, b, "__floordiv__", "__rfloordiv__")?
+            if let Some(result) =
+                try_dispatch_binary_special(a, b, "__floordiv__", "__rfloordiv__")?
             {
                 return Ok(result);
             }
@@ -1438,7 +1439,8 @@ pub fn truediv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let b = unwrap_cell(b);
     unsafe {
         if needs_numeric_binop_dispatch(a, b, "__truediv__", "__rtruediv__") {
-            if let Some(result) = try_dispatch_binary_special(a, b, "__truediv__", "__rtruediv__")? {
+            if let Some(result) = try_dispatch_binary_special(a, b, "__truediv__", "__rtruediv__")?
+            {
                 return Ok(result);
             }
         }

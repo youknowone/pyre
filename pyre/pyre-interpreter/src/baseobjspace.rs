@@ -5667,6 +5667,52 @@ pub fn space_index(obj: PyObjectRef) -> Result<PyObjectRef, PyError> {
     )))
 }
 
+/// baseobjspace.py:1847 `float_w` — the `space.float` coercion
+/// (descroperation.py:870), i.e. apply `__float__` and unwrap to an
+/// interp-level f64. Unlike the `float()` constructor it neither parses
+/// strings nor consults `__index__`; a non-float operand raises
+/// TypeError "must be real number, not %T".
+pub fn float_w(obj: PyObjectRef) -> Result<f64, PyError> {
+    if obj.is_null() {
+        return Err(PyError::type_error("float_w: null object"));
+    }
+    unsafe {
+        if pyre_object::is_float(obj) {
+            return Ok(pyre_object::w_float_get_value(obj));
+        }
+        if pyre_object::pyobject::is_int(obj) {
+            return Ok(pyre_object::intobject::w_int_get_value(obj) as f64);
+        }
+        if pyre_object::pyobject::is_bool(obj) {
+            return Ok(if pyre_object::boolobject::w_bool_get_value(obj) {
+                1.0
+            } else {
+                0.0
+            });
+        }
+        if pyre_object::pyobject::is_long(obj) {
+            use num_traits::ToPrimitive;
+            return Ok(pyre_object::longobject::w_long_get_value(obj)
+                .to_f64()
+                .unwrap_or(f64::NAN));
+        }
+    }
+    let Some(method) = (unsafe { lookup(obj, "__float__") }) else {
+        return Err(PyError::type_error(format!(
+            "must be real number, not {}",
+            object_functionstr_type_name(obj)
+        )));
+    };
+    let w_result = crate::builtins::call_and_check(method, &[obj])?;
+    if unsafe { pyre_object::is_float(w_result) } {
+        return Ok(unsafe { pyre_object::w_float_get_value(w_result) });
+    }
+    Err(PyError::type_error(format!(
+        "__float__ returned non-float (type '{}')",
+        object_functionstr_type_name(w_result)
+    )))
+}
+
 /// baseobjspace.py:1564 `getindex_w` with `w_exception=None` — apply
 /// `space.index` (`__index__`) then convert to an i64, silently clamping
 /// to `i64::MAX` / `i64::MIN` on overflow rather than raising.

@@ -278,23 +278,14 @@ pub fn register_module(ns: &mut DictStorage) {
                     }
                 }
 
-                // `interp_select.py:227-235` — `None` blocks forever, else a
-                // non-negative float second count.
+                // `interp_select.py:230-235` — `None` blocks forever, else
+                // `space.float_w` (applies `__float__`); a negative count is
+                // a ValueError.
                 let timeout_secs: Option<f64> = match args.get(3) {
                     None => None,
                     Some(&t) if unsafe { pyre_object::is_none(t) } => None,
                     Some(&t) => {
-                        let secs = unsafe {
-                            if pyre_object::is_float(t) {
-                                pyre_object::w_float_get_value(t)
-                            } else if pyre_object::is_int(t) {
-                                pyre_object::w_int_get_value(t) as f64
-                            } else {
-                                return Err(crate::PyError::type_error(
-                                    "timeout must be a float or None",
-                                ));
-                            }
-                        };
+                        let secs = crate::baseobjspace::float_w(t)?;
                         if secs < 0.0 {
                             return Err(crate::PyError::value_error(
                                 "timeout must be non-negative",

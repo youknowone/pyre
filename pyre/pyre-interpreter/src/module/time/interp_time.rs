@@ -732,8 +732,7 @@ fn _gettmarg(args: &[PyObjectRef], default_now: bool) -> Result<c_tm, crate::PyE
         // `tm_zone` (idx 9, via `utf8_w`) and length >=11 supplies
         // `tm_gmtoff` (idx 10).
         if len >= 10 {
-            tm.tm_zone =
-                crate::baseobjspace::utf8_w(w_tuple_getitem(tup, 9).unwrap())?.to_string();
+            tm.tm_zone = crate::baseobjspace::utf8_w(w_tuple_getitem(tup, 9).unwrap())?.to_string();
         }
         if len >= 11 {
             tm.tm_gmtoff = c_int_w(10)? as i64;
