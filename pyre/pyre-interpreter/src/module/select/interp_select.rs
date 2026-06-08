@@ -30,27 +30,28 @@ fn default_poll_events() -> i16 {
 #[cfg(all(unix, feature = "host_env"))]
 pub(crate) fn filedescriptor_w(w_fd: PyObjectRef) -> Result<i32, crate::PyError> {
     unsafe {
-        let fd_val = if pyre_object::is_int(w_fd) {
-            pyre_object::w_int_get_value(w_fd)
+        // A real int (or int subclass / bignum) is taken directly; otherwise
+        // `fileno()` is called.  An object with only `__int__` is rejected.
+        let w_int = if pyre_object::is_int_or_long(w_fd) {
+            w_fd
         } else {
             let fileno = crate::baseobjspace::getattr_str(w_fd, "fileno").map_err(|_| {
-                crate::PyError::type_error("argument must be an int, or have a fileno() method")
+                crate::PyError::type_error("argument must be an int, or have a fileno() method.")
             })?;
             let res = crate::call::call_function_impl_result(fileno, &[])?;
-            if !pyre_object::is_int(res) {
-                return Err(crate::PyError::type_error("fileno() must return an integer"));
+            if !pyre_object::is_int_or_long(res) {
+                return Err(crate::PyError::type_error("fileno() returned a non-integer"));
             }
-            pyre_object::w_int_get_value(res)
+            res
         };
-        if fd_val < 0 {
-            return Err(crate::PyError::value_error(
-                "file descriptor cannot be a negative integer",
-            ));
+        // `c_int_w` — OverflowError if it does not fit a 32-bit int.
+        let fd = crate::baseobjspace::c_int_w(w_int)?;
+        if fd < 0 {
+            return Err(crate::PyError::value_error(format!(
+                "file descriptor cannot be a negative integer ({fd})"
+            )));
         }
-        if fd_val > i32::MAX as i64 {
-            return Err(crate::PyError::overflow_error("file descriptor out of range"));
-        }
-        Ok(fd_val as i32)
+        Ok(fd)
     }
 }
 
@@ -256,36 +257,10 @@ pub fn register_module(ns: &mut DictStorage) {
                     let items = crate::baseobjspace::unpackiterable(seq, -1)?;
                     let mut out = Vec::with_capacity(items.len());
                     for item in items {
-                        let fd_val = unsafe {
-                            if pyre_object::is_int(item) {
-                                pyre_object::w_int_get_value(item)
-                            } else {
-                                let fileno =
-                                    crate::baseobjspace::getattr_str(item, "fileno").map_err(|_| {
-                                        crate::PyError::type_error(
-                                            "argument must be an int, or have a fileno() method",
-                                        )
-                                    })?;
-                                let res = crate::call::call_function_impl_result(fileno, &[])?;
-                                if !pyre_object::is_int(res) {
-                                    return Err(crate::PyError::type_error(
-                                        "fileno() must return an integer",
-                                    ));
-                                }
-                                pyre_object::w_int_get_value(res)
-                            }
-                        };
-                        if fd_val < 0 {
-                            return Err(crate::PyError::value_error(
-                                "file descriptor cannot be a negative integer",
-                            ));
-                        }
-                        if fd_val > i32::MAX as i64 {
-                            return Err(crate::PyError::overflow_error(
-                                "file descriptor out of range",
-                            ));
-                        }
-                        out.push((item, fd_val as i32));
+                        // `interp_select.py:132 _build_fd_set` — each item is
+                        // resolved through `space.c_filedescriptor_w`.
+                        let fd = filedescriptor_w(item)?;
+                        out.push((item, fd));
                     }
                     Ok(out)
                 }
