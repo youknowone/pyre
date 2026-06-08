@@ -2024,9 +2024,9 @@ fn jit_attr_name(attr: &syn::Attribute) -> Option<String> {
 /// exactly as written at the `impl` header (e.g. `[a, Foo]` for
 /// `impl a::Foo { ... }`). Segments are extracted from the type path
 /// (`syn::Type::Path`) so that downstream code can render the
-/// `impl_type` as a joined string matching the
-/// `self_ty_root` canonicalization done by
-/// `front::semantic::qualify_type_name_with_imports`. RPython parity:
+/// `impl_type` as a joined string matching the canonical spelling
+/// `CallControl::register_macro_impl_helper_trace_fnaddr` qualifies.
+/// RPython parity:
 /// `getfunctionptr(graph)`
 /// (call.py:174-187) does not distinguish free fns from methods; pyre
 /// keys methods by the `[impl_type_joined, method]` 2-segment CallPath
@@ -2204,9 +2204,8 @@ pub fn jit_module(_attr: TokenStream, item: TokenStream) -> TokenStream {
     // `stringify!` on individual idents produces clean
     // whitespace-free identifier strings (unlike `stringify!(a::Foo)`
     // which expands with spaces around `::`).  The resulting joined
-    // form matches the `self_ty_root` canonicalization done by
-    // `front::syn_metadata::type_root_ident` +
-    // `front::semantic::qualify_type_name_with_imports`.
+    // form is what `CallControl::register_macro_impl_helper_trace_fnaddr`
+    // qualifies into the canonical `[impl_type_joined, method]` CallPath.
     let helper_name_lits: Vec<proc_macro2::TokenStream> = discovered
         .iter()
         .map(|h| {
@@ -2245,10 +2244,9 @@ pub fn jit_module(_attr: TokenStream, item: TokenStream) -> TokenStream {
     //   `(module_path_with_crate, impl_type_as_written, method, fnaddr)`.
     // The codewriter consumes this through
     // `CallControl::register_macro_impl_helper_trace_fnaddr` which applies
-    // the `qualify_type_name_with_imports` rule
-    // (`front::semantic`) to decide whether to prepend the module prefix
-    // before registering the canonical 2-segment CallPath
-    // `[impl_type_joined, method]` (lib.rs:406-433).
+    // its module-prefix-qualification rule to decide whether to prepend
+    // the module prefix before registering the canonical 2-segment
+    // CallPath `[impl_type_joined, method]` (lib.rs:406-433).
     let impl_entries: Vec<proc_macro2::TokenStream> = discovered
         .iter()
         .filter_map(|h| {
@@ -2303,11 +2301,10 @@ pub fn jit_module(_attr: TokenStream, item: TokenStream) -> TokenStream {
         /// its `(module_path_with_crate, impl_type_as_written, method_name, fnaddr)`
         /// 4-tuple. The codewriter consumes this through
         /// `CallControl::register_macro_impl_helper_trace_fnaddr`, which
-        /// applies the `qualify_type_name_with_imports` rule
-        /// (`front::semantic`) to decide whether to prepend the module
-        /// prefix before storing the canonical 2-segment CallPath
-        /// `[impl_type_joined, method]` — same shape used for
-        /// `self_ty_root`-keyed methods (lib.rs:406-433).
+        /// applies its module-prefix-qualification rule to decide whether
+        /// to prepend the module prefix before storing the canonical
+        /// 2-segment CallPath `[impl_type_joined, method]` — same shape
+        /// used for `self_ty_root`-keyed methods (lib.rs:406-433).
         #[doc(hidden)]
         #[allow(dead_code)]
         pub fn __majit_helper_impl_trace_fnaddrs()

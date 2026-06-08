@@ -1155,8 +1155,8 @@ pub(crate) fn register_unsafe_fn_stubs(
 ///
 /// Both `func.name` (e.g. `"a::helper"`, module-qualified by `front::mir`
 /// from Charon's `name_path()`) and
-/// `func.self_ty_root` (e.g. `"a::Foo"`, qualified by `front::semantic`'s
-/// `qualify_type_name_with_imports`) carry `::`-joined module-qualified
+/// `func.self_ty_root` (e.g. `"a::Foo"`, the impl owner `front::mir`
+/// records from Charon's `name_path()`) carry `::`-joined module-qualified
 /// strings.  Each
 /// `::`-separated component is one `FunctionPathKey` segment — the
 /// `OpKind::Call::FunctionPath` callsite produces `["a", "helper"]`

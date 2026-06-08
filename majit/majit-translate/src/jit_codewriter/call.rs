@@ -1582,7 +1582,7 @@ impl CallControl {
                 // the mutable default.
                 // `descr.py:108-118 cache[STRUCT]` 단일 identity 와
                 // 정렬: 분석기측 `owner_root` 가 use-site 모듈 qualifier
-                // (`front::semantic::qualify_type_name_with_imports`) 인
+                // (`front::mir` 이 Charon `name_path()` 에서 기록) 인
                 // 동안 런타임 publish 는
                 // `path_hash(strip_crate(module_path!())::Name)` (def-path).
                 // `canonical_struct_name` 가 `STRUCT_ORIGIN_REGISTRY`
@@ -2015,8 +2015,8 @@ impl CallControl {
     /// Structured binding for an impl-method helper. `impl_type_joined`
     /// is the `::`-joined type path exactly as written at the `impl`
     /// header (e.g. `"a::Foo"` for `impl a::Foo { fn bar() }`), matching
-    /// the parser's `self_ty_root` canonicalization (parse.rs:702 +
-    /// `front::semantic::qualify_type_name_with_imports`).  Registers
+    /// the `self_ty_root` impl-owner spelling `front::mir` records from
+    /// Charon's `name_path()`.  Registers
     /// `[impl_type_joined, method]` as a 2-segment CallPath where
     /// `impl_type_joined` is stored verbatim as a single segment — same
     /// shape `register_trait_method` / inherent method graphs use at
@@ -2034,9 +2034,9 @@ impl CallControl {
         if fnaddr == 0 || impl_type_as_written.is_empty() || method.is_empty() {
             return;
         }
-        // `front::semantic::qualify_type_name_with_imports`: bare types
-        // take the current module prefix; already-qualified types keep
-        // their exact written form.  Module prefix is everything after the
+        // Bare types take the current module prefix; already-qualified
+        // types keep their exact written form.  Module prefix is
+        // everything after the
         // first `::`-separated segment (the crate name) of
         // `module_path_with_crate`, matching the parser's `prefix`
         // argument which starts empty at crate root and accumulates
@@ -3172,16 +3172,15 @@ impl CallControl {
                 if self.function_graphs.contains_key(&path) {
                     return Some(path);
                 }
-                // Cross-module reference fallback.  `front::mir`'s
-                // call-target resolution expands single-ident callsites
-                // through the caller's
-                // `use_imports` *first*, so `use foo::bar; bar();`
-                // resolves verbatim to `["foo", "bar"]` against the
-                // registry.  The remaining case the leaf-match needs to
-                // cover is the bare callsite the caller's
-                // `use_imports` could not resolve directly — typically
-                // a same-file declaration whose registration spelling
-                // diverges from the `module_prefix` qualification (e.g.
+                // Cross-module reference fallback.  `front::mir` resolves
+                // each callee through Charon to its fully-qualified
+                // `name_path()`, so a `use foo::bar; bar();` callsite
+                // arrives already spelled with its full crate-included
+                // path and hits the registry verbatim above.  The
+                // remaining case the leaf-match needs to cover is the
+                // bare callsite whose registration spelling diverges from
+                // the call-target qualification — typically a same-file
+                // declaration (e.g.
                 // `lib.rs::register_function_graph_alias` chains).
                 //
                 // PyPy parity: `flowcontext.py:845-866 LOAD_GLOBAL`
@@ -3326,13 +3325,12 @@ impl CallControl {
                     }
                 }
                 // `call.py:97` direct_call → `funcobj.graph` — inherent
-                // method receivers carry a canonical `module::Type` spelling
-                // (`parse::extract_inherent_impl_methods` registration and
-                // `front::semantic::qualify_type_name_with_imports` callsite
-                // both route bare names through `STRUCT_ORIGIN_REGISTRY`, and
-                // `joined_use_path` strips the syntactic `crate::` prefix
-                // off `use_imports` entries), so the single qualified
-                // lookup hits the same `CallPath` registered above.
+                // method receivers carry a canonical `module::Type`
+                // spelling (`front::mir` records the impl owner from
+                // Charon's `name_path()`, and `canonical_struct_name`
+                // normalizes bare names through `STRUCT_ORIGIN_REGISTRY`),
+                // so the single qualified lookup hits the same `CallPath`
+                // registered above.
                 if let Some(receiver) = receiver_root.as_deref() {
                     let qualified = CallPath::for_impl_method(receiver, name.as_str());
                     if self.function_graphs.contains_key(&qualified) {
@@ -6923,9 +6921,9 @@ mod tests {
         // `impl_type_as_written = "Adder"` (bare), and
         // `module_path_with_crate = "testcrate::impl_module"`.  The
         // codewriter must prepend the module prefix so the canonical
-        // CallPath matches the parser's
-        // `front::semantic::qualify_type_name_with_imports("Adder",
-        // "impl_module", &{}) = "impl_module::Adder"` result.
+        // CallPath becomes `["impl_module", "Adder", "add"]`
+        // (`register_macro_impl_helper_trace_fnaddr` qualifies the bare
+        // `"Adder"` to `"impl_module::Adder"`).
         let mut cc = CallControl::new();
         cc.register_macro_impl_helper_trace_fnaddr(
             "testcrate::impl_module",
@@ -6944,8 +6942,8 @@ mod tests {
     fn register_macro_impl_helper_keeps_qualified_type_unchanged() {
         // `impl a::Foo { fn bar() }` — already-qualified type must not
         // get the module prefix prepended
-        // (`front::semantic::qualify_type_name_with_imports` returns
-        // bare-as-is when it contains `::`).  The canonical path
+        // (`register_macro_impl_helper_trace_fnaddr` keeps the type
+        // verbatim when it already contains `::`).  The canonical path
         // matches `CallPath::for_impl_method("a::Foo", "bar")`.
         let mut cc = CallControl::new();
         cc.register_macro_impl_helper_trace_fnaddr(

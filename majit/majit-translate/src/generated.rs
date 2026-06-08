@@ -151,7 +151,7 @@ pub use crate::codewriter::AllJitCodes;
 /// `(source_text, crate-stripped module_path)` pairs.  The module path
 /// matches the form `pyre-jit-trace/build.rs::module_path_from_source_file`
 /// emits, so analyzer-side `struct_origins[bare_name] = module_path` and
-/// `qualify_type_name_with_imports` produce the same canonical spelling
+/// `canonical_struct_name` produce the same canonical spelling
 /// the runtime + production analyser pipeline produce.  Empty module
 /// path (test fixtures that bypass module wiring) is reserved for
 /// `parse_source`; here every entry carries its real module path.

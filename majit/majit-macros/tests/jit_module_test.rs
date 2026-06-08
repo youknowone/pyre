@@ -208,10 +208,10 @@ fn test_jit_module_emits_structured_impl_trace_fnaddrs() {
     let entries = impl_walk_module::__majit_helper_impl_trace_fnaddrs();
     // Entries are
     //   `(module_path_with_crate, impl_type_as_written, method, fnaddr)`
-    // 4-tuples. The codewriter applies the
-    // `front::semantic::qualify_type_name_with_imports` rule using
-    // `module_path_with_crate` to decide whether to prepend the module
-    // prefix.
+    // 4-tuples. The codewriter applies
+    // `CallControl::register_macro_impl_helper_trace_fnaddr`'s
+    // module-prefix-qualification rule using `module_path_with_crate` to
+    // decide whether to prepend the module prefix.
     assert_eq!(entries.len(), 2);
 
     let expected_module_path = concat!(module_path!(), "::impl_walk_module");

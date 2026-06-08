@@ -398,7 +398,8 @@ pub type FnAddrBindings<'a> = [(&'a str, i64)];
 
 /// Structured binding table for impl-method helpers.  Each entry is
 /// `(module_path_with_crate, impl_type_as_written, method_name, fnaddr)`.
-/// The codewriter applies the `front::semantic::qualify_type_name_with_imports`
+/// The codewriter applies the
+/// `CallControl::register_macro_impl_helper_trace_fnaddr` qualification
 /// rule — bare types get the module prefix (minus crate
 /// name) prepended, qualified types are kept verbatim — before storing
 /// the canonical `[impl_type_joined, method]` 2-segment CallPath.
