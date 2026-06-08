@@ -2030,6 +2030,19 @@ impl CallControl {
     /// helper address instead of the symbolic hash fallback.  RPython
     /// `call.py:174-187 getfunctionptr(graph)` parity for `<Type>::method`
     /// and `<Type as Trait>::method`.
+    ///
+    /// NOTE: this `ImplFnAddrBindings` channel is test-only.  Every
+    /// production entry point passes `&[]` for `impl_fnaddr_bindings`, so
+    /// this runs only under the macro tests
+    /// (`majit-macros/tests/jit_module_test.rs`).  Production impl-method
+    /// helpers are registered as flat full-path keys via
+    /// `register_macro_helper_trace_fnaddr`, and `CallTarget::Method`
+    /// lookups resolve through `resolved_path` / the impl-method
+    /// leaf-index — neither consults `impl_type_as_written`.  The macro
+    /// only sees the surface `impl`-header spelling, so this key is
+    /// non-canonical by design (it cannot recover a `use`-aliased owner's
+    /// defining module); do not wire it into a production caller without
+    /// canonicalising the owner root against `front::mir`'s `self_ty_root`.
     pub fn register_macro_impl_helper_trace_fnaddr(
         &mut self,
         module_path_with_crate: &str,
