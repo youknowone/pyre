@@ -832,6 +832,7 @@ impl MiniMarkGC {
     fn allocate_shadow(&mut self, obj_addr: usize) -> usize {
         let hdr_ptr = (obj_addr - GcHeader::SIZE) as *const GcHeader;
         let type_id = unsafe { (*hdr_ptr).type_id() };
+        self.validate_type_id(type_id, obj_addr, "allocate_shadow");
         let type_info = self.types.get(type_id);
         let payload_size = if type_info.item_size > 0 {
             let length = unsafe { *((obj_addr + type_info.length_offset) as *const usize) };
@@ -896,6 +897,25 @@ impl MiniMarkGC {
     /// Copy a single nursery object to old gen.
     /// If already forwarded, returns the forwarding address.
     /// Pinned objects are left in place and returned as-is.
+    /// Abort with a diagnostic if `type_id` is out of range for the
+    /// registered type table. The raw header read that produces it is
+    /// layout/ASLR-dependent, so an out-of-range id must fail
+    /// deterministically at the trace site with context rather than as
+    /// a bare `entries[..]` index panic deep inside `types.get`.
+    #[inline]
+    fn validate_type_id(&self, type_id: u32, obj_addr: usize, site: &str) {
+        if type_id as usize >= self.types.len() {
+            panic!(
+                "GC BUG: invalid type_id={} at obj_addr={:#x} (header_addr={:#x}, nursery_start={:#x}, site={})",
+                type_id,
+                obj_addr,
+                obj_addr - GcHeader::SIZE,
+                self.nursery.start_ptr() as usize,
+                site,
+            );
+        }
+    }
+
     fn copy_nursery_object(&mut self, obj_addr: usize) -> GcRef {
         // Pinned objects must stay in the nursery.
         if self.pinned_objects.contains(&obj_addr) {
@@ -916,16 +936,7 @@ impl MiniMarkGC {
         }
 
         let type_id = unsafe { (*hdr_ptr).type_id() };
-        if type_id as usize >= self.types.len() {
-            panic!(
-                "GC BUG: invalid type_id={} at obj_addr={:#x} (header_addr={:#x}, nursery_start={:#x}, forwarded={})",
-                type_id,
-                obj_addr,
-                obj_addr - GcHeader::SIZE,
-                self.nursery.start_ptr() as usize,
-                unsafe { (*hdr_ptr).is_forwarded() },
-            );
-        }
+        self.validate_type_id(type_id, obj_addr, "copy_nursery_object");
         let type_info = self.types.get(type_id);
 
         // Compute the actual payload size (for varsize objects, read the length).
@@ -1009,6 +1020,7 @@ impl MiniMarkGC {
     /// into the nursery by copying the target.
     fn trace_and_update_object(&mut self, obj_addr: usize) {
         let type_id = unsafe { (*header_of(obj_addr)).type_id() };
+        self.validate_type_id(type_id, obj_addr, "trace_and_update_object");
         let type_info = self.types.get(type_id);
 
         // custom_trace_hook parity: use custom trace function if registered.
