@@ -1085,7 +1085,41 @@ fn derive_pc_live_indices_from_sparse(
             // overriding it to the call's trailing marker would strand the
             // unboxed condition (raise_catch goto_if_not).
             if fallthrough < n_pcs && pos_for_pc[fallthrough].is_none() {
-                pos_for_pc[fallthrough] = Some(q + 1);
+                // Branch-condition re-key (#306): a `truth`/`to_bool`
+                // `residual_call` that produces a `goto_if_not` / `switch`
+                // condition is immediately followed (past any adjacent
+                // `-live-` markers) by that branch op.  Its `semantic_
+                // fallthrough_pc` is then the branch's FALL-THROUGH arm — the
+                // arm taken when the branch guard fails (`goto_if_not`'s true
+                // path, `flatten.py:264 make_link(linktrue)`).  Keying it to
+                // the call's trailing marker `q+1` (which precedes the
+                // `goto_if_not`) makes the resume re-read the unboxed
+                // condition the `truth` left stale and re-branch the wrong
+                // way; keying it to the arm's own post-branch `-live-` skips
+                // the fall-through link renamings (`flatten.py:319 insert_
+                // renamings`) between `goto_if_not` and the arm label, leaving
+                // the arm inputargs null.  Resume it instead at the branch
+                // opcode's OWN start marker (same resolution as `call_pc`): the
+                // blackhole re-runs the `truth` call, re-derives the condition
+                // from the still-live BOXED operand, then forward-executes the
+                // `goto_if_not` + renamings + arm correctly (the opcode-start
+                // resume documented above for non-rekeyed branch guards).
+                // Non-branch can-raise calls keep the `q+1` keying.
+                let mut after = q + 1;
+                while ssarepr.insns.get(after).is_some_and(|n| n.is_live()) {
+                    after += 1;
+                }
+                let is_branch_cond = ssarepr.insns.get(after).is_some_and(|n| {
+                    matches!(n, super::flatten::Insn::Op { opname, .. }
+                        if opname == "goto_if_not"
+                            || opname.starts_with("goto_if_not_")
+                            || opname == "switch")
+                });
+                if is_branch_cond {
+                    pos_for_pc[fallthrough] = pos_for_pc[call_pc];
+                } else {
+                    pos_for_pc[fallthrough] = Some(q + 1);
+                }
             }
         }
     }
@@ -1107,6 +1141,58 @@ fn derive_pc_live_indices_from_sparse(
                 .map(|i| live_positions[i])
         })
         .collect()
+}
+
+/// Per-`py_pc` pre-merge index of the post-`residual_call` `-live-` that
+/// immediately precedes a `catch_exception`, derived from a SPLICED
+/// (canonical) SSARepr.  The splice path replaces the walker stream with
+/// this one, so the walker's `walker_pc_after_call_live_pos` indices (keyed
+/// to the walker stream) no longer address it; this re-derives the same
+/// after-residual-call resume anchors against the spliced stream so
+/// `compute_liveness_with_pc_anchors` can remap them (`liveness.rs:78-81`)
+/// and the runtime's `after_residual_call_resume_pc` table (the bit-14
+/// flagged resume path, `pyjitcode.rs:408 resolve_resume_pc`) points into
+/// the spliced bytes.  Mirrors the walker recording site
+/// (`emit_catch_exception!` post-call `-live-`): for each `catch_exception`,
+/// the bare `-live-` directly before it is the anchor, keyed to the canraise
+/// opcode that owns the call (the py_pc whose `pc_first_insn_pos` range
+/// contains the marker).
+fn derive_after_call_indices_from_sparse(
+    ssarepr: &super::flatten::SSARepr,
+    n_pcs: usize,
+) -> Vec<Option<usize>> {
+    let mut out: Vec<Option<usize>> = vec![None; n_pcs];
+    let mut pc_pos: Vec<(usize, usize)> = ssarepr
+        .pc_first_insn_pos
+        .iter()
+        .filter(|&&(pc, _)| pc >= 0)
+        .map(|&(pc, pos)| (pos, pc as usize))
+        .collect();
+    pc_pos.sort_unstable();
+    let owner_pc = |q: usize| -> Option<usize> {
+        pc_pos
+            .partition_point(|&(pos, _)| pos <= q)
+            .checked_sub(1)
+            .map(|k| pc_pos[k].1)
+    };
+    for (q, insn) in ssarepr.insns.iter().enumerate() {
+        let is_catch = matches!(
+            insn,
+            super::flatten::Insn::Op { opname, .. } if opname == "catch_exception"
+        );
+        if !is_catch {
+            continue;
+        }
+        let Some(live_pos) = q.checked_sub(1).filter(|&i| ssarepr.insns[i].is_live()) else {
+            continue;
+        };
+        if let Some(pc) = owner_pc(live_pos) {
+            if pc < n_pcs {
+                out[pc] = Some(live_pos);
+            }
+        }
+    }
+    out
 }
 
 /// #281 verify: of the runtime's structural resume targets in a canonical
@@ -10907,6 +10993,16 @@ impl CodeWriter {
                     ssarepr.insns = spliced.insns;
                     ssarepr.pc_first_insn_pos = spliced.pc_first_insn_pos;
                     walker_tracked_pc_live_indices_out = Some(dense);
+                    // The walker's `walker_after_call_pc_indices_out` indexes
+                    // the (now-replaced) walker stream; re-derive the
+                    // after-residual-call resume anchors against the spliced
+                    // stream so `filter_liveness_in_place`'s remap addresses
+                    // valid spliced positions (else out-of-bounds in
+                    // `compute_liveness_with_pc_anchors`) and the runtime's
+                    // `after_residual_call_resume_pc` table points into the
+                    // spliced bytes.
+                    walker_after_call_pc_indices_out =
+                        Some(derive_after_call_indices_from_sparse(&ssarepr, num_instrs));
                     did_splice = true;
                     eprintln!(
                         "[flatten-splice] {} spliced insns={} pc_first={} live_feed={} entry_live={}",
@@ -13042,7 +13138,7 @@ mod tests {
         let depth_at_pc: Vec<u16> = vec![0; code.instructions.len()];
         let local_color_map: Vec<u16> = (0..code.varnames.len() as u16).collect();
         let stack_slot_color_map: Vec<u16> = Vec::new();
-        let post_remove_live_indices = filter_liveness_in_place(
+        let (post_remove_live_indices, _after_call_post_merge) = filter_liveness_in_place(
             &mut ssarepr,
             &code,
             &depth_at_pc,
@@ -13051,6 +13147,7 @@ mod tests {
             u16::MAX,
             u16::MAX,
             Some(&walker_tracked_pc_live_indices),
+            None,
             true,
         );
 
