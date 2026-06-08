@@ -591,7 +591,7 @@ class Check:
             for backend in ("dynasm", "cranelift"):
                 if self.enabled(backend):
                     self._record(backend, False, name, "pypy crash")
-                    self._append_comparison(backend, name, fmt_time(t_cpython), "-", "FAIL")
+                    self._append_comparison(backend, name, t_cpython, "-", "FAIL")
             return
         print(f"{dim('done')}  {t_pypy}s")
 
@@ -605,14 +605,14 @@ class Check:
                 sys.stdout.write(f"    {backend:<10s}")
                 print(dim("skip"))
                 self._append_comparison(
-                    backend, name, fmt_time(t_cpython), fmt_time(t_pypy), "skip",
+                    backend, name, t_cpython, t_pypy, "skip",
                 )
                 continue
             if vs_cpython and cpython_code != 0:
                 sys.stdout.write(f"    {backend:<10s}")
                 print(f"{red('FAIL')}  missing cpython baseline")
                 self._record(backend, False, name, "cpython crash")
-                self._append_comparison(backend, name, "-", fmt_time(t_pypy), "FAIL")
+                self._append_comparison(backend, name, "-", t_pypy, "FAIL")
                 continue
             self._run_backend_bench(
                 backend, name, script, timeout,
@@ -655,7 +655,7 @@ class Check:
             for backend in ("dynasm", "cranelift"):
                 if self.enabled(backend):
                     self._record(backend, False, name, "pypy crash")
-                    self._append_comparison(backend, name, fmt_time(t_cpython), "-", "FAIL")
+                    self._append_comparison(backend, name, t_cpython, "-", "FAIL")
             return
         t_pypy = f"{pypy_time:.2f}"
         print(f"{dim('done')}  {t_pypy}s")
@@ -666,7 +666,7 @@ class Check:
                 if self.enabled(backend):
                     self._record(backend, False, name, "cpython/pypy output mismatch")
                     self._append_comparison(
-                        backend, name, fmt_time(t_cpython), fmt_time(t_pypy), "BASEFAIL",
+                        backend, name, t_cpython, t_pypy, "BASEFAIL",
                     )
             return
 
