@@ -2786,15 +2786,43 @@ impl<'a> Lowering<'a> {
             NameSeg::Other(v) => v.as_object()?.get("Impl")?,
             _ => return None,
         };
-        let adt_def_id = self.resolve_impl_owner_adt_def_id(impl_payload)?;
-        let td = self.llbc.type_by_id(adt_def_id)?;
-        let owner_leaf = td
-            .item_meta
-            .name_path()
-            .rsplit("::")
-            .next()
-            .unwrap_or("")
-            .to_string();
+        let owner_leaf = match self.resolve_impl_owner_adt_def_id(impl_payload) {
+            Some(adt_def_id) => {
+                let td = self.llbc.type_by_id(adt_def_id)?;
+                td.item_meta
+                    .name_path()
+                    .rsplit("::")
+                    .next()
+                    .unwrap_or("")
+                    .to_string()
+            }
+            // Non-ADT `Self` (primitive / raw pointer / slice): Charon leaves
+            // the impl owner type unresolved, so the ADT table has no entry.
+            // Fall back to the module Ident immediately preceding the `Impl`
+            // NameSeg, which Charon names after the primitive's impl module
+            // (`core::ptr::mut_ptr::<Impl>::is_null` → `mut_ptr`).  Restricted
+            // to `(module, method)` pairs that have a classdef-less analyzer
+            // reachable through the `getattr` → bound-method path
+            // (`unaryop.rs::ptr_method_is_null`); analyzer-less primitive
+            // methods stay on the `FunctionPath` form so they do not surface a
+            // new panicking `SomeInstance.getattr`.
+            None => {
+                if last_idx < 2 {
+                    return None;
+                }
+                let module_leaf = match &segs[last_idx - 2] {
+                    NameSeg::Ident { ident: (s, _) } => s.as_str(),
+                    _ => return None,
+                };
+                if !NON_ADT_OWNER_METHOD_ALLOWLIST
+                    .iter()
+                    .any(|&(m, f)| m == module_leaf && f == leaf)
+                {
+                    return None;
+                }
+                module_leaf.to_string()
+            }
+        };
         if owner_leaf.is_empty() {
             return None;
         }
@@ -4346,6 +4374,16 @@ fn field_label_from_payload(payload: &serde_json::Value) -> String {
     }
     "field".into()
 }
+
+/// `(module_leaf, method_leaf)` pairs whose primitive/raw-pointer impl
+/// method has a classdef-less analyzer reachable through the `getattr` →
+/// bound-method path, so [`Lowering::impl_method_owner`] may route them as
+/// `CallTarget::Method` even though Charon leaves the `Self` type unresolved
+/// (non-ADT, no entry in the type table).  `mut_ptr::is_null` resolves to
+/// `unaryop.rs::ptr_method_is_null` (yielding `SomeBool`).  Pairs absent
+/// here keep the `FunctionPath` form rather than surface a new panicking
+/// `SomeInstance.getattr`.
+const NON_ADT_OWNER_METHOD_ALLOWLIST: &[(&str, &str)] = &[("mut_ptr", "is_null")];
 
 /// Return `(trait_leaf_ident, method_leaf_ident)` when the FunDecl's
 /// raw `NameSeg` vec ends in two consecutive `Ident` segments — the

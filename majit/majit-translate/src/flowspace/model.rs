@@ -2063,6 +2063,12 @@ impl HostEnv {
             HostObject::new_builtin_callable("core.ptr.null_mut"),
         );
         core_ptr.module_set("null", HostObject::new_builtin_callable("core.ptr.null"));
+        // `std::ptr::eq` re-exports `core::ptr::eq`; MIR lowering normalises
+        // the call to the canonical `["core", "ptr", "eq"]` FunctionPath
+        // (e.g. `py_type_check`'s `std::ptr::eq((*obj).ob_type, …)`).  Bind
+        // the `core.ptr` spelling to the same `std.ptr.eq` callable so it
+        // reuses the existing `std_ptr_eq` analyzer.
+        core_ptr.module_set("eq", HostObject::new_builtin_callable("std.ptr.eq"));
         // `std.ptr` was already created above with `null_mut` / `eq` /
         // `copy_nonoverlapping`; extend that same module with `null`
         // instead of re-creating it.  A fresh `new_module` here would
