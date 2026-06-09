@@ -6967,6 +6967,29 @@ mod tests {
             .collect()
     }
 
+    /// Translate semantic local SLOT indices into the post-regalloc
+    /// Ref-bank colors the dispatcher touches. The canonical splice
+    /// coloring no longer keeps the `color == slot` identity for locals
+    /// (chordal coloring assigns each slot a distinct color that need not
+    /// equal the slot number), so callers must consult
+    /// `metadata.pyre_color_for_semantic_local` before checking liveness.
+    /// Under the walker layout the map is the identity, so this is a no-op
+    /// there.
+    fn local_slot_colors_for_slots(jitcode_index: i32, slots: &[u32]) -> Vec<u32> {
+        let map = pyre_jit_trace::state::local_slot_color_map_at(jitcode_index);
+        slots
+            .iter()
+            .map(|&slot| {
+                u32::from(*map.get(slot as usize).unwrap_or_else(|| {
+                    panic!(
+                        "local_slot_color_map for jitcode_index={jitcode_index} \
+                         lacks entry for slot {slot}; got {map:?}"
+                    )
+                }))
+            })
+            .collect()
+    }
+
     fn live_pc_containing_all(
         jitcode_index: i32,
         code: &pyre_interpreter::CodeObject,
@@ -7016,11 +7039,12 @@ mod tests {
             .expect("real trace-side jitcode registration must succeed");
         let jitcode_index = trace_state::ensure_jitcode_index(frame.pycode as *const ())
             .expect("real trace-side jitcode index must exist");
-        // The `register_color = nlocals + depth` identity was removed:
-        // stack-slot colors come from `stack_slot_color_map_at`. Locals
-        // remain at colors `0..nlocals` (input-arg pinning kept that
-        // half).
-        let mut live_regs: Vec<u32> = live_locals.to_vec();
+        // Both the `register_color = nlocals + depth` (stack) and the
+        // `color == slot` (locals) identities were removed: stack-slot
+        // colors come from `stack_slot_color_map_at` and local-slot
+        // colors from `local_slot_color_map_at`. `live_locals` are
+        // semantic local SLOT indices, translated to colors here.
+        let mut live_regs: Vec<u32> = local_slot_colors_for_slots(jitcode_index, live_locals);
         if !live_stack_depths.is_empty() {
             live_regs.extend_from_slice(&stack_slot_colors_for_depths(
                 jitcode_index,
@@ -8072,7 +8096,7 @@ mod tests {
         use pyre_object::w_int_new;
 
         let (frame, jitcode_ptr, resume_pc) =
-            compiled_trace_fixture("def f(b):\n    return b\nf(1)\n", "f", &[0], &[], |frame| {
+            compiled_trace_fixture("def f(b):\n    return b\nf(1)\n", "f", &[], &[], |frame| {
                 frame.locals_w_mut()[0] = w_int_new(2);
             });
         let frame_ptr = (&*frame) as *const PyFrame as usize;
@@ -8128,7 +8152,7 @@ mod tests {
         let (frame, jitcode_ptr, resume_pc) = compiled_trace_fixture(
             "def f(x):\n    return len(x)\nf([1, 2, 3])\n",
             "f",
-            &[0],
+            &[],
             &[],
             |frame| {
                 frame.locals_w_mut()[0] = list;
@@ -8200,7 +8224,7 @@ mod tests {
         let (frame, jitcode_ptr, resume_pc) = compiled_trace_fixture(
             "def f(x):\n    return x[2]\nf([1.5, 2.5, 3.5])\n",
             "f",
-            &[0],
+            &[],
             &[],
             |frame| {
                 frame.locals_w_mut()[0] = float_list;
@@ -8267,7 +8291,7 @@ mod tests {
             let (frame, jitcode_ptr, resume_pc) = compiled_trace_fixture(
                 "def f(x):\n    return x\nf([1])\n",
                 "f",
-                &[0],
+                &[],
                 &[],
                 |frame| {
                     frame.locals_w_mut()[0] = concrete_list;
@@ -8377,7 +8401,7 @@ mod tests {
         let (frame, jitcode_ptr, resume_pc) = compiled_trace_fixture(
             "def f(it):\n    return it\nf(range(2))\n",
             "f",
-            &[0],
+            &[],
             &[],
             |frame| {
                 frame.locals_w_mut()[0] = range_iter;
