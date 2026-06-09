@@ -1529,9 +1529,8 @@ impl<'a> Lowering<'a> {
                 // `OpKind::FieldRead` carrying the field name and
                 // `owner_root` so downstream consumers (codewriter
                 // inlining + annotator GetAttr dispatch on
-                // cross-procedural callers like
-                // `flowspace/rust_source/build_flow.rs:4770
-                // lower_field`) get a resolvable field/owner_root shape.
+                // cross-procedural callers) get a resolvable
+                // field/owner_root shape.
                 //
                 // Tuple-container `Field` projections split three ways.
                 // A local bound by a positional `Rvalue::Aggregate`
@@ -2750,8 +2749,7 @@ fn impl_method_owner_for_fundecl(llbc: &Llbc, fd: &FunDecl) -> Option<(String, S
     Some((owner_qualified, leaf))
 }
 
-/// Charon-sourced equivalent of the syn
-/// `flowspace::rust_source::register::extract_unsafe_fn_stubs`: collect
+/// Collect, from the lowered MIR,
 /// `(path-segments, Signature, return-lltype)` for every local `unsafe
 /// fn` / unsafe impl-method whose return type projects to `Void` (unit)
 /// or `Bool`.  These callees cannot lower their bodies (raw-pointer

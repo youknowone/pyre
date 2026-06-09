@@ -583,10 +583,9 @@ pub(crate) fn is_known_unported(msg: &str) -> bool {
         // `normalize_unary_op_name: pyre UnaryOp` and
         // `normalize_binop_name: pyre BinOp` are not Skip-classified:
         // the `not` / `deref` / `same_as` / `and` / `or` / `invert`
-        // surfaces are desugared upstream — `UnOp::Not`/`Deref` at
-        // `flowspace/rust_source/build_flow.rs`'s `Expr::Unary` arm +
-        // `lower_unary_not`,
-        // `&&`/`||` at the matching `Expr::Binary` arms.  Synthetic
+        // surfaces are desugared by the MIR front-end — rustc lowers
+        // `!`/`*` and the `&&`/`||` short-circuits into MIR
+        // branches/calls before lowering.  Synthetic
         // graphs that inject these ops (anchor tests in
         // `cutover.rs::tests::anchor_unary_*_surfaces_*`) call
         // `specialize_legacy_graph` directly and never reach
@@ -1111,8 +1110,8 @@ pub(crate) fn default_someshell_for_lltype(
 /// suitable for `RPythonAnnotator` return-type inference via
 /// `cachedgraph` (see `pyre_call_registry::prefill_default_cache`).
 /// Because `CallControl::function_graphs` is populated exclusively
-/// by safe-fn `build_flow` output (unsafe fns are rejected at
-/// `flowspace/rust_source/build_flow.rs:215`), the unsafe stub key
+/// by lowered safe-fn bodies (unsafe fns never produce a flow graph —
+/// they only get a metadata-only stub key), the unsafe stub key
 /// is never present in `function_graphs`.  `CallControl::
 /// find_all_graphs` walks `function_graphs.keys()` only and resolves
 /// each call target via `target_to_path_and_graph`

@@ -1718,12 +1718,8 @@ impl FlowContext {
         // snapshot. The lookup at `flowcontext.py:847
         // w_globals.value[varname]` therefore observes any module-
         // import-time write performed after FlowContext construction.
-        // Mirror by routing through `GraphFunc::live_globals()` so the
-        // rust-source path's `module_globals_id` partition is read at
-        // lookup time, not at FlowContext::new time. Non-rust-source
-        // callers (no `module_globals_id`) fall through to the
-        // statically-attached `globals` Constant — `live_globals()`
-        // already returns that as the fallback.
+        // Mirror by routing through `GraphFunc::live_globals()`, which
+        // returns the func's statically-attached `globals` Constant.
         let live = self
             .graph
             .func

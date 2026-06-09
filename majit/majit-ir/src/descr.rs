@@ -295,7 +295,8 @@ pub fn path_hash_stripped_crate(module_path: &str, struct_name: &str) -> u64 {
 /// Use-import resolver / module-aware canonicalisation table.
 ///
 /// Maps `bare_struct_name → defining_module_path` as discovered by
-/// `majit_translate::front::syn_metadata::collect_struct_origins`.  Once the
+/// the MIR front-end (`majit_translate::front::mir`) `struct_origins`
+/// collection.  Once the
 /// analyzer pipeline populates this registry, `canonical_struct_name`
 /// can transform a bare token like `"W_IntObject"` into the canonical
 /// `"intobject::W_IntObject"` that the runtime's

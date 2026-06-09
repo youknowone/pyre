@@ -23,7 +23,7 @@ pub enum ValueType {
     /// valuetype_to_someshell) treat `Unsigned` identically to `Int`
     /// via `Int | Unsigned` arms.
     ///
-    /// Produced by `front::syn_metadata::classify_fn_arg_ty` for Rust
+    /// Produced by the MIR front-end (`front::mir`) for Rust
     /// `u8`/`u16`/`u32`/`u64`/`usize` typed args.  Cast routing
     /// through `simple_call(__builtin__.float/bool, v_uint)`,
     /// `simple_call(rarithmetic.intmask, v_uint)`, and
@@ -64,8 +64,9 @@ pub enum ValueType {
     Bool,
     /// `lltype.Ptr(<inner>)` — pointer / GC reference family.  The
     /// optional `String` carries the Rust type-root identifier
-    /// (mirrors `front::syn_metadata::type_root_ident`) for the pointee when
-    /// the producer knows it; `None` is the un-narrowed / opaque case
+    /// (the leading path segment with generic arguments stripped) for
+    /// the pointee when the producer knows it; `None` is the
+    /// un-narrowed / opaque case
     /// (mirrors `lltype.Ptr(<unspecified>)` upstream where the rtyper
     /// resolves through `getinstancerepr(rtyper, None, Gc)` to the
     /// abstract `object`-root `InstanceRepr`).

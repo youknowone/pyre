@@ -39,12 +39,12 @@ use crate::model::{
 use crate::parse::{CallPath, ExtractedOpcodeArm, OpcodeDispatchSelector};
 
 /// The dispatcher prologue `(name, ValueType)` for `execute_opcode_step`,
-/// matching `classify_fn_arg_ty` on its signature
+/// matching its signature
 /// `(executor: &mut E, code: &CodeObject, instruction: Instruction,
 ///   op_arg: OpArg, next_instr: usize)`.  Hard-coded rather than read
 /// from the lowered Input ops because Charon erases the generic `E` and
 /// the concrete reference targets to `Ref(None)` / `Int`, which would
-/// not match the syn-built wrapper prologue.
+/// not match the expected wrapper prologue.
 fn dispatcher_params() -> Vec<(String, ValueType)> {
     vec![
         (

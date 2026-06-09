@@ -2901,12 +2901,11 @@ pub fn rtype_cast_ptr_to_int(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>
     // typer as a `PtrRepr`.  This block relabels a late-arriving
     // `InstanceRepr` operand to `PtrRepr` via its `concretetype`
     // (`InstanceRepr.lowleveltype` IS `Ptr(GcStruct(OBJECT))`,
-    // rclass.py:166/477).  A low-level struct param that is in the
-    // walker catalog already lands as `PtrRepr` because the producer
-    // (`build_flow::annotate_typed_ptr_inputs`) wrote `SomeValue::Ptr`
-    // onto its `Variable.annotation` (`rmodel.rs:2545
-    // SomeValue::Ptr → PtrRepr`); the swap is load-bearing for
-    // uncataloged low-level operands.
+    // rclass.py:166/477).  A low-level struct param whose annotation
+    // already carries a `SomeValue::Ptr` lands as `PtrRepr` directly
+    // (`rmodel.rs:2545 SomeValue::Ptr → PtrRepr`); the swap is
+    // load-bearing for low-level operands that reach the typer as
+    // `InstanceRepr` instead.
     //
     // Scope caveat (do NOT mis-read this as "drive every struct to
     // SomePtr"): RPython sets the annotation node by ORIGIN, not by

@@ -3385,16 +3385,16 @@ mod tests {
             None,
         );
         let err = fd.buildgraph(None, None).unwrap_err();
-        // Strict-parity (2026-05-10): an empty `co_code` indicates either
-        // a Rust-source-adapter placeholder (body lowering failed at
-        // walker time) or a synthetic test fixture as in this case.
-        // `translator.buildflowgraph` now fails loud at this boundary
-        // rather than handing the metadata-only carrier to upstream
-        // `build_flow`, which previously surfaced the much-deeper
-        // `BytecodeCorruption` from parsing the empty stream.
+        // An empty `co_code` indicates a metadata-only carrier (the MIR
+        // front-end registered a host whose body it could not lower) or
+        // a synthetic test fixture as in this case.
+        // `translator.buildflowgraph` fails loud at this boundary rather
+        // than handing the carrier to upstream `build_flow`, which
+        // previously surfaced the much-deeper `BytecodeCorruption` from
+        // parsing the empty stream.
         let msg = err.msg.unwrap_or_default();
         assert!(
-            msg.contains("Rust-source adapter has no PyGraph for this host"),
+            msg.contains("`HostCode.co_code` is empty"),
             "expected fail-loud guard message, got {msg:?}",
         );
     }

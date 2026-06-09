@@ -1440,8 +1440,8 @@ impl<'a> Transformer<'a> {
             // `cast_float_to_uint` opnames in practice, so these
             // const-fold + residual-helper arms stay dormant.  The
             // wiring is staged for the eventual producer flip;
-            // unsigned parameter classification lives in
-            // `front::syn_metadata::classify_fn_arg_ty`.
+            // unsigned parameter classification lives in the MIR
+            // front-end (`front::mir`).
             OpKind::UnaryOp {
                 op: unop_name,
                 operand,

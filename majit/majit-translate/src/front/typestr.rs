@@ -2,8 +2,7 @@
 //!
 //! These helpers inspect type identities as plain strings (the
 //! `array_type_id` / declared-signature strings the codewriter already
-//! carries); they parse no `syn` tree and depend on nothing in
-//! [`crate::front::syn_metadata`].  Their only consumers live in
+//! carries); they parse no `syn` tree.  Their only consumers live in
 //! `jit_codewriter::call`.
 
 /// Detect the canonical `Result<T, …>` wrapper and project the inner

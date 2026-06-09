@@ -73,7 +73,6 @@ pub mod mir_dispatch;
 pub mod opcode_wrapper;
 pub mod raise;
 pub mod semantic;
-pub mod syn_metadata;
 pub mod typestr;
 
 pub use semantic::{AstGraphOptions, SemanticFunction, SemanticProgram, StructFieldRegistry};

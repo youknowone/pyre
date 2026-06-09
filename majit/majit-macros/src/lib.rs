@@ -1263,9 +1263,9 @@ fn parse_release_gil_save_err(attr: proc_macro2::TokenStream) -> syn::Result<i32
 ///
 /// The proc-macro is a pass-through: it leaves the struct definition
 /// untouched and exists solely so `rustc` accepts the attribute. The
-/// codewriter front-end (`majit-translate::front::syn_metadata`) reads
-/// the attribute directly from the parsed source via `syn` and feeds
-/// the field list into the struct layout / descr pipeline.
+/// codewriter front-end reads the struct's field list from the lowered
+/// MIR type metadata (`majit-translate::front::mir` `struct_field_attrs`)
+/// and feeds it into the struct layout / descr pipeline.
 #[proc_macro_attribute]
 pub fn jit_immutable_fields(_attr: TokenStream, item: TokenStream) -> TokenStream {
     item
@@ -2056,9 +2056,9 @@ fn impl_type_path_segments(ty: &syn::Type) -> Option<Vec<Ident>> {
     if type_path.qself.is_some() {
         return None;
     }
-    // Parser's `type_root_ident` strips generic arguments from each
-    // segment and joins the identifiers. Match that shape here by
-    // taking `ident` only.
+    // Strip generic arguments from each segment and join the
+    // identifiers — the canonical `self_ty_root` shape. Match it here
+    // by taking `ident` only.
     Some(
         type_path
             .path

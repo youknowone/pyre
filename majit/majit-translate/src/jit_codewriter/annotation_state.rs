@@ -63,20 +63,14 @@ pub fn valuetype_to_someshell(vt: &ValueType) -> Option<SomeValue> {
             // from a process-global root-string lookup here.  A global
             // bare-name index conflates cross-module same-name structs
             // and bypasses RPython's object-identity-based lltype cache.
-            // That faithful producer already exists:
-            // `build_flow::annotate_typed_ptr_inputs` resolves a `&Foo`
-            // parameter through the *module-scoped* host catalog to the
-            // class object's identity-held `lltype_ptr` (port of
-            // `lltype.py:1513-1518 _ptrEntry.compute_annotation`) and
-            // writes `SomeValue::Ptr(SomePtr)` onto `Variable.annotation`,
-            // which `derive_subject_inputcells` consumes ahead of this
-            // fallback.  This arm is therefore the post-producer-miss
-            // resting point: it fires only when that producer declines
-            // (multi-segment paths `&a::Foo`, generic / raw-pointer
-            // inners, and struct *fields* it does not yet walk), keeping
-            // those Ref variants classdef-less rather than fabricating a
-            // Ptr from a name.  Routing a host-registry lookup back into
-            // *this* shell projector would be the rejected bare-name path.
+            // The MIR front-end does not attach a per-`&Foo`-input
+            // lltype `Ptr` to `Variable.annotation` (the faithful
+            // counterpart of `lltype.py:1513-1518
+            // _ptrEntry.compute_annotation`), so every `Ref` input
+            // shells to the classdef-less `SomeInstance` here rather
+            // than fabricating a `Ptr` from a bare name.  Routing a
+            // host-registry lookup back into *this* shell projector
+            // would be the rejected bare-name path.
             Some(ref_fallback_instance())
         }
         ValueType::State => {

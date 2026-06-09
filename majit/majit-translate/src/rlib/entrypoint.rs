@@ -138,12 +138,11 @@ mod tests {
 
     #[test]
     fn export_symbol_propagates_through_independent_graphfunc_clones() {
-        // The constructor at `interactive.rs` builds a `pygraph.func`
-        // clone of the GraphFunc separately from the HostObject's
-        // wrapped one. Upstream Python's in-place mutation flips the
-        // flag on every reference to the same function object;
-        // `Arc<AtomicBool>` mirrors that — even an independently
-        // cloned GraphFunc observes the flip.
+        // A `pygraph.func` clone of the GraphFunc can exist separately
+        // from the HostObject's wrapped one. Upstream Python's in-place
+        // mutation flips the flag on every reference to the same
+        // function object; `Arc<AtomicBool>` mirrors that — even an
+        // independently cloned GraphFunc observes the flip.
         let host = sample_user_function("pkg.demo");
         let detached_clone = host.user_function().expect("uf").clone();
         assert!(!detached_clone.exported_symbol.load(Ordering::Relaxed));

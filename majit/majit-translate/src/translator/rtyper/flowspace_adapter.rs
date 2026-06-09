@@ -520,10 +520,9 @@ fn normalize_unary_op_name(pyre_name: &str) -> Result<String, TyperError> {
 ///
 /// The frontend desugars `&&` / `||` into
 /// `JUMP_IF_FALSE_OR_POP` / `JUMP_IF_TRUE_OR_POP`-shaped control flow
-/// before the graph reaches this adapter, mirroring the RPython-parity
-/// `flowspace/rust_source/build_flow.rs:1191 lower_short_circuit`: emit
-/// `bool(lhs)` + `set_branch` fork + 1-arg join carrying `lhs_raw`
-/// (short-circuit) or `rhs_raw` (full eval).
+/// before the graph reaches this adapter: in MIR the short-circuit is
+/// already lowered to a `bool(lhs)` test + branch fork + join over the
+/// boolean operands, so no binary `and`/`or` op survives to here.
 ///
 /// The fail-loud arm below survives for synthetic graphs (test
 /// fixtures, future ad-hoc producers) that inject `OpKind::BinOp {

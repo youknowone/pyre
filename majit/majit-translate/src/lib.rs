@@ -1197,7 +1197,7 @@ fn analyze_pipeline_from_module_paths(
                     continue;
                 }
                 // `support.py:705 argnames = ll_func.__code__.co_varnames[:nb_args]`
-                // — companion hint emitted by `front::syn_metadata::collect_jit_hints`
+                // — companion hint emitted by `front::llbc_hints::harvest_hints_from_llbcs`
                 // when `#[oopspec(...)]` is paired with a function signature.
                 // Threads the declaration-order parameter names into
                 // `CallControl::oopspec_argnames` so `parse_oopspec`

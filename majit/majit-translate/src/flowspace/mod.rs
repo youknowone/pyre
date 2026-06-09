@@ -35,5 +35,4 @@ pub mod model;
 pub mod objspace;
 pub mod operation;
 pub mod pygraph;
-pub mod rust_source;
 pub mod specialcase;

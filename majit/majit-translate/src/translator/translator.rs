@@ -255,44 +255,15 @@ pub struct TranslationContext {
     pub callgraph: RefCell<HashMap<CallGraphKey, CallGraphEdge>>,
     /// RPython `self._prebuilt_graphs = {}` (translator.py:39).
     pub _prebuilt_graphs: RefCell<HashMap<HostObject, Rc<PyGraph>>>,
-    /// Walker-built sibling-fn / impl-method pygraphs drained from
-    /// the thread-local
-    /// `flowspace::rust_source::host_env::HOST_RUST_PYGRAPHS` at
-    /// `Translation::from_rust_*` construction time. Keyed on
-    /// `HostObject` identity, read-not-pop semantic — multiple
-    /// `buildflowgraph(host)` calls return the same `Rc<PyGraph>`
-    /// (the Rust-source adapter cannot rebuild from `HostCode.co_code`,
-    /// so the pop semantic of `_prebuilt_graphs` is unsafe here).
-    /// Strict-parity (2026-05-11): retires the walker registry's
-    /// thread-local cross-context bleed by anchoring walker output to
-    /// a context-owned dict per `Translation`. Pyre adaptation: there
-    /// is no upstream counterpart because RPython's
-    /// `build_flow(func)` rebuilds from `func.__code__.co_code` on
-    /// demand, eliminating the need for a separate walker output cache;
-    /// the Rust-source adapter has no `co_code` so a per-context cache
-    /// is required.
-    pub _walker_pygraphs: RefCell<HashMap<HostObject, Rc<PyGraph>>>,
-    /// Strict-parity round-4 (2026-05-11): walker-recorded
-    /// `AdapterError` strings keyed on `HostObject` identity. The
-    /// failure-path counterpart of `_walker_pygraphs`. Drained from
-    /// `host_env::HOST_RUST_WALKER_ERRORS` at Translation
-    /// construction; consumed by `buildflowgraph` when the
-    /// host's `co_code` is empty and `_walker_pygraphs` has no entry,
-    /// so the lazy-failure boundary surfaces the original walker
-    /// rejection instead of a generic "no PyGraph" string. Plays the
-    /// role of upstream `flowcontext.py:847 FlowingError.value`'s
-    /// preserved cause channel.
-    pub _walker_errors: RefCell<HashMap<HostObject, String>>,
     /// Per-`HostObject` lift-failure record drained from
     /// `cutover::populate_call_registry_from_call_graphs`'s Pass 2
     /// failure arm.  When the eager pre-pass cannot lift a callee
     /// into a `PyGraph`, the error is stashed here (keyed by the
     /// callee's `HostObject` identity) so a later `buildflowgraph`
     /// fallback surfaces the actual lift error instead of the
-    /// generic "missing code object" message.  Mirrors
-    /// [`Self::_walker_errors`]'s role for the rust-source walker —
-    /// preserves the producer-side failure point analogous to
-    /// upstream's lazy `getdesc → newfuncdesc → buildgraph` chain
+    /// generic "missing code object" message.  Preserves the
+    /// producer-side failure point analogous to upstream's lazy
+    /// `getdesc → newfuncdesc → buildgraph` chain
     /// (`rpython/annotator/bookkeeper.py:353-409`) where the
     /// original exception propagates.
     pub _pyre_lift_errors: RefCell<HashMap<HostObject, String>>,
@@ -334,46 +305,8 @@ impl TranslationContext {
             graphs: RefCell::new(Vec::new()),
             callgraph: RefCell::new(HashMap::new()),
             _prebuilt_graphs: RefCell::new(HashMap::new()),
-            _walker_pygraphs: RefCell::new(HashMap::new()),
-            _walker_errors: RefCell::new(HashMap::new()),
             _pyre_lift_errors: RefCell::new(HashMap::new()),
             entry_point_graph: RefCell::new(None),
-        }
-    }
-
-    /// Drain the walker pass's thread-local pygraph registry into
-    /// this context's `_walker_pygraphs`. Production
-    /// `Translation::from_rust_*` entry points call this once per
-    /// construction, immediately after the walker pass writes its
-    /// `(host, pygraph)` pairs and before the context becomes the
-    /// `buildflowgraph` reader of record.
-    ///
-    /// Last-writer-wins on `HostObject` identity collisions (no
-    /// expected collisions today; orphans from a prior re-walk get
-    /// overwritten). Mirrors upstream `_prebuilt_graphs` ownership
-    /// semantic: each `TranslationContext` carries its own snapshot.
-    pub fn drain_walker_pygraphs(&self) {
-        let drained = crate::flowspace::rust_source::drain_walker_pygraphs();
-        if !drained.is_empty() {
-            let mut sink = self._walker_pygraphs.borrow_mut();
-            for (host, pygraph) in drained {
-                sink.insert(host, pygraph);
-            }
-        }
-        // Strict-parity round-4 (2026-05-11): drain the walker error
-        // registry alongside the pygraph registry. The two share a
-        // ownership semantic — both are walker-pass output, both
-        // become per-context state once the walker hands off to the
-        // Translation. Drained even when empty-pygraph drain was a
-        // no-op (e.g. fully-successful walker pass left no errors;
-        // also handles the test-fixture path that exercises the
-        // walker without going through `Translation::from_rust_*`).
-        let drained_errors = crate::flowspace::rust_source::drain_walker_errors();
-        if !drained_errors.is_empty() {
-            let mut sink = self._walker_errors.borrow_mut();
-            for (host, message) in drained_errors {
-                sink.insert(host, message);
-            }
         }
     }
 
@@ -417,41 +350,6 @@ impl TranslationContext {
             return Ok(pygraph);
         }
 
-        // Strict-parity (2026-05-11): walker-built sibling-fn /
-        // impl-method pygraphs land in this context's
-        // `_walker_pygraphs` dict (drained from the thread-local at
-        // construction time — see `drain_walker_pygraphs` /
-        // `host_env::HOST_RUST_PYGRAPHS`). Upstream Python's
-        // analogue is `module.__dict__[name] = <function with
-        // __code__.co_code>` populated by import-time `def`;
-        // downstream `buildflowgraph(callee)` then re-flows from
-        // that function's intrinsic `__code__`. The Rust-source
-        // adapter has no `co_code`, so the per-context walker
-        // registry plays the role of the intrinsic source — a hit
-        // here is the parity-correct second-fallback after the
-        // explicit per-instance `_prebuilt_graphs` seed.
-        //
-        // Strict-parity Issue 2 (2026-05-08): the walker registry
-        // is the analogue of `build_flow(func)` (translator.py:55)
-        // for rust-source, so a hit here must append the underlying
-        // FunctionGraph into `self.graphs` exactly like the regular
-        // `build_flow` branch below (translator.py:61
-        // `self.graphs.append(graph)`). Identity check via
-        // `Rc::ptr_eq` prevents double-append when the same fn is
-        // looked up multiple times — upstream's `_prebuilt_graphs.pop()`
-        // semantic guarantees single-fire there, but the walker
-        // registry is read-not-pop so we de-dup explicitly.
-        let walker_hit = self._walker_pygraphs.borrow().get(&func).cloned();
-        if let Some(pygraph) = walker_hit {
-            let mut graphs = self.graphs.borrow_mut();
-            let already_listed = graphs.iter().any(|g| Rc::ptr_eq(g, &pygraph.graph));
-            if !already_listed {
-                graphs.push(pygraph.graph.clone());
-            }
-            drop(graphs);
-            return Ok(pygraph);
-        }
-
         // If the eager pre-pass at
         // `cutover::populate_call_registry_from_call_graphs` recorded
         // a lift failure for this host, surface that error instead of
@@ -474,47 +372,21 @@ impl TranslationContext {
             .as_ref()
             .ok_or_else(|| format!("buildflowgraph({}): missing code object", graph_func.name))?;
 
-        // Strict-parity fail-loud (2026-05-10): a Rust-source-adapter
-        // GraphFunc carries an empty `HostCode.co_code` (the adapter has
-        // no Python bytecode — see `flowspace/rust_source/register.rs:26`).
-        // A walker miss on such a graph_func means the body lowering
-        // failed at walker time and the placeholder host stayed in
-        // module dict (the import-time `def f` parity choice). Falling
-        // through to upstream `build_flow` would silently produce an
-        // empty / wrong graph from the metadata-only carrier.  Surface
-        // the lazy failure here instead — `buildflowgraph(callee)` is
-        // exactly the call site upstream raises FlowingError when the
+        // Fail-loud: a GraphFunc whose `HostCode.co_code` is empty carries
+        // no lowered bytecode, so `build_flow` below would silently produce
+        // an empty / wrong graph. This occurs when the MIR front-end
+        // registered a metadata-only carrier for a host whose body it could
+        // not lower. Surface the failure here — `buildflowgraph(callee)` is
+        // exactly the call site upstream raises FlowingError when a
         // function's analysis cannot proceed (`flowcontext.py:847`).
-        //
-        // Strict-parity round-4 (2026-05-11): the walker now records
-        // each `lower_body_into_pygraph` rejection in
-        // `host_env::HOST_RUST_WALKER_ERRORS`, drained into
-        // `self._walker_errors` at Translation construction. The
-        // fail-loud branch consults that map first and re-surfaces the
-        // original `AdapterError` Display rendering, restoring the
-        // error-cause channel that upstream `FlowingError` carries via
-        // its captured `value`. The textual `body lowering failed —
-        // re-run the walker` fallback remains for the test-fixture
-        // path that exercises `buildflowgraph` without first running
-        // the walker (no captured error to surface).
         if code.co_code.is_empty() {
-            let stored_walker_error = self._walker_errors.borrow().get(&func).cloned();
-            return match stored_walker_error {
-                Some(adapter_err) => Err(format!(
-                    "buildflowgraph({}): Rust-source adapter rejected this host's \
-                     body at walker time. Original AdapterError: {}",
-                    graph_func.name, adapter_err
-                )),
-                None => Err(format!(
-                    "buildflowgraph({}): Rust-source adapter has no PyGraph for this \
-                     host (`HostCode.co_code` is empty, the walker pygraph registry \
-                     returned None, and the walker error registry has no entry for \
-                     this host). The host either was never seen by the walker, or \
-                     the walker pass terminated before recording an error — re-run \
-                     the walker on the source to reproduce the rejection.",
-                    graph_func.name
-                )),
-            };
+            return Err(format!(
+                "buildflowgraph({}): `HostCode.co_code` is empty — the MIR \
+                 front-end produced a metadata-only carrier with no lowered \
+                 body for this host, so build_flow would yield an empty / \
+                 wrong graph.",
+                graph_func.name
+            ));
         }
 
         let graph = build_flow(graph_func.clone()).map_err(|err| format!("{err:?}"))?;

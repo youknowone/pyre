@@ -1365,13 +1365,12 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
 }
 
 /// Widen a `u32`-typed oparg to `i64`. Adapter-friendly stand-in for
-/// the bare `x as i64` cast that
-/// `majit/majit-translate/src/flowspace/rust_source/build_flow.rs:lower_cast`
-/// rejects. Upstream parity: RPython source uses `r_longlong(x)` /
-/// `widen(x)` (`rlib/rarithmetic.py:303`) — class/function calls,
-/// never `as` syntax. The body uses `i64::from(x)` (lossless
-/// `From<u32>` impl) so the flowspace walker lowers it line-by-line
-/// as `simple_call(getattr(<i64>, "from"), x)` matching upstream's
+/// a bare `x as i64` cast. Upstream parity: RPython source uses
+/// `r_longlong(x)` / `widen(x)` (`rlib/rarithmetic.py:303`) —
+/// class/function calls, never `as` syntax. The body uses
+/// `i64::from(x)` (lossless `From<u32>` impl) so the front-end lowers
+/// it as a function call (`<i64 as From<u32>>::from`) rather than a
+/// primitive cast, matching upstream's
 /// `LOAD_GLOBAL r_longlong; LOAD_FAST x; CALL_FUNCTION 1` shape.
 /// The helper is no longer `const fn` because `<i64 as From<u32>>::from`
 /// is not yet stable as const (see Rust issue #143874); none of the
