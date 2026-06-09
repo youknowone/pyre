@@ -950,9 +950,14 @@ impl ClassDesc {
         if need_force_empty {
             let qualname = cls.qualname().to_string();
             let canonical = majit_ir::descr::canonical_struct_name(&qualname);
+            // Prefer the bare `qualname` (the hand-coded exception entries
+            // are registered bare) and consult the canonical struct path
+            // only when it actually differs, so an exception class is not
+            // shadowed by a struct that happens to share its leaf.
             let in_force_map = FORCE_ATTRIBUTES_INTO_CLASSES.with(|cell| {
                 let table = cell.borrow();
-                table.contains_key(canonical.as_str()) || table.contains_key(&qualname)
+                table.contains_key(&qualname)
+                    || (canonical != qualname && table.contains_key(canonical.as_str()))
             });
             if !in_force_map {
                 me.borrow_mut().all_enforced_attrs = Some(HashSet::new());
@@ -1215,19 +1220,27 @@ impl ClassDesc {
         // entries written by [`register_struct_fields`] from each
         // `ItemStruct.fields` projection at parse time.
         // The struct-derived entries are keyed on the canonical
-        // crate-stripped qualified path (`module::Type`); `qualname()` is
-        // the bare struct leaf, so canonicalise it through the
-        // `STRUCT_ORIGIN_REGISTRY` before lookup.  Fall back to the bare
-        // key for the hand-coded exception entries (e.g. `EnvironmentError`)
-        // that are registered bare and carry no struct origin.
+        // crate-stripped qualified path (`module::Type`); the hand-coded
+        // exception entries (e.g. `EnvironmentError`) are registered bare
+        // and carry no struct origin.  `qualname()` is the bare leaf, so
+        // look it up directly first — that lets a bare exception entry win
+        // over a struct that happens to share its leaf — and only fall
+        // back to the `STRUCT_ORIGIN_REGISTRY`-canonicalised key when it
+        // actually differs.
         let qualname = this.borrow().pyobj.qualname().to_string();
         let canonical = majit_ir::descr::canonical_struct_name(&qualname);
         let overrides: Option<indexmap::IndexMap<String, SomeValue>> =
             FORCE_ATTRIBUTES_INTO_CLASSES.with(|cell| {
                 let table = cell.borrow();
                 table
-                    .get(canonical.as_str())
-                    .or_else(|| table.get(qualname.as_str()))
+                    .get(qualname.as_str())
+                    .or_else(|| {
+                        if canonical != qualname {
+                            table.get(canonical.as_str())
+                        } else {
+                            None
+                        }
+                    })
                     .cloned()
             });
         if let Some(overrides) = overrides {
