@@ -2754,11 +2754,11 @@ impl FlowContext {
                     //     w_obj = self.import_name(modulename, glob, None, fromlist, level)
                     //     self.pushvalue(w_obj)
                     //
-                    // `self.w_globals.value` upstream is the live
-                    // `func.__globals__` dict reference. Route through
-                    // `live_globals()` so the rust-source registry's
-                    // post-construction module-import writes are
-                    // visible at IMPORT_NAME time.
+                    // `self.w_globals.value` upstream is the
+                    // `func.__globals__` dict, read (never written) during
+                    // flow analysis. Route through `live_globals()` for the
+                    // function's own frozen globals snapshot
+                    // (`flowcontext.py:284`).
                     let w_fromlist = self.pop_hlvalue()?;
                     let w_level = self.pop_hlvalue()?;
                     let w_modulename = self.getname_w(oparg as usize)?;

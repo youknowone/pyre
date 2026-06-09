@@ -967,11 +967,12 @@ fn host_object_own_getattr(pyobj: &HostObject, name: &str) -> Option<ConstValue>
             _ => None,
         },
         "__globals__" => match &pyobj.inner.kind {
-            // Re-snapshot via `live_globals` so `func.__globals__`
-            // mirrors upstream's *live* module dict reference
-            // (`flowcontext.py:284`). For
-            // rust-source-built funcs this picks up any registry
-            // entries that landed after the GraphFunc was built.
+            // `live_globals()` returns the static `self.globals.value`
+            // snapshot frozen at construction (`flowcontext.py:284
+            // self.w_globals = Constant(func.__globals__)`). Upstream only
+            // reads the globals dict during flow analysis (`flowcontext.py:847`)
+            // and never mutates it, so the snapshot is observationally
+            // identical to upstream's live dict reference.
             HostObjectKind::UserFunction { graph_func } => Some(graph_func.live_globals()),
             _ => None,
         },
