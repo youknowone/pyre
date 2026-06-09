@@ -6933,11 +6933,6 @@ mod tests {
     /// `w_code_get_ptr`), not an arbitrary copy of the same source —
     /// `CallControl.jitcodes` is keyed by raw pointer identity.
     fn register_test_portal(_unused: &pyre_interpreter::CodeObject, w_code: *const ()) {
-        // Recorder fixtures now place values at the splice color/liveness
-        // layout, so they run under the production splice default. `None`
-        // leaves the gate unforced; the test-only override is retired with
-        // the gate itself.
-        crate::jit::codewriter::force_flatten_splice_for_tests(None);
         let raw_code = unsafe {
             pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
                 as *const pyre_interpreter::CodeObject
