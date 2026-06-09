@@ -902,71 +902,7 @@ fn emit_vable_getfield_ref_walker_only(
     push_walker_emit(current_block, insn);
 }
 
-/// #230.M2 measurement helper: bucket an SSARepr insn stream into
-/// `(genuine, live, copy, structural)` so the `PYRE_FLATTEN_MEASURE`
-/// survey can attribute the canonical-vs-walker length gap to a
-/// specific category.  `live` = `-live-` markers (per-PC, retired by
-/// #287), `copy` = `*_copy`/`*_push`/`*_pop` renamings (the three
-/// shapes `build_renaming_insns` emits per `insert_renamings`; walker
-/// emits them inline where upstream defers them, #289/#290),
-/// `structural` = `Label`/`---`, `genuine` = everything else.  Used on
-/// both the canonical and walker streams so the comparison is
-/// category-to-category.  Measurement-only; no production caller when
-/// the gate is unset.
-fn bucket_measure_insns(insns: &[super::flatten::Insn]) -> (usize, usize, usize, usize) {
-    let (mut genuine, mut live, mut copy, mut structural) = (0usize, 0usize, 0usize, 0usize);
-    for insn in insns {
-        if insn.is_live() {
-            live += 1;
-        } else {
-            match insn {
-                super::flatten::Insn::Label(_) | super::flatten::Insn::Unreachable => {
-                    structural += 1
-                }
-                super::flatten::Insn::Op { opname, .. }
-                    if opname.ends_with("_copy")
-                        || opname.ends_with("_push")
-                        || opname.ends_with("_pop") =>
-                {
-                    copy += 1
-                }
-                super::flatten::Insn::Op { .. } => genuine += 1,
-            }
-        }
-    }
-    (genuine, live, copy, structural)
-}
-
-/// #230.M3 measurement helper: tally the `genuine`-category opnames of an
-/// SSARepr insn stream — the same classification `bucket_measure_insns`
-/// counts as `genuine` (non-`-live-`, non-renaming `*_copy`/`*_push`/
-/// `*_pop` `Insn::Op`; `Label`/`Unreachable` are not `Op` so they fall
-/// out of the `if let`).  Run on both the canonical and walker streams so
-/// the per-graph `genuine` count residual #230.M2 left unattributed
-/// (int +7, fannkuch +5) is named opname-by-opname.  `BTreeMap` has no
-/// upstream counterpart (this is a pyre-only measurement helper, not a
-/// port; gate-off-inert, retired with the survey at #287/Phase 5); it is
-/// used purely to keep the logged diff keys deterministically ordered.
-/// Measurement-only; no production caller when the gate is unset.
-fn genuine_opname_tally(
-    insns: &[super::flatten::Insn],
-) -> std::collections::BTreeMap<String, usize> {
-    let mut tally = std::collections::BTreeMap::new();
-    for insn in insns {
-        if insn.is_live() {
-            continue;
-        }
-        if let super::flatten::Insn::Op { opname, .. } = insn {
-            if opname.ends_with("_copy") || opname.ends_with("_push") || opname.ends_with("_pop") {
-                continue;
-            }
-            *tally.entry(opname.clone()).or_insert(0) += 1;
-        }
-    }
-    tally
-}
-
-/// #288 build-side liveness resolver: derive, from an SSARepr's OWN
+/// Build-side liveness resolver: derive, from an SSARepr's OWN
 /// `-live-` markers + `pc_first_insn_pos`, the per-Python-PC PRE-MERGE
 /// `-live-` marker index that `compute_liveness_with_pc_anchors` consumes
 /// — the role today filled by the walker's dense per-PC
@@ -1016,9 +952,8 @@ fn derive_pc_live_indices_from_sparse(
     // `owner_pc(q)` = the py_pc whose first-insn position is the greatest
     // at-or-before `q`, computed over the position-ascending
     // `pc_first_insn_pos` (built first-wins as the stream grows, so already
-    // ascending; sort defensively).  Shared by the can-raise (#286) and
-    // branch-guard (#281) re-keys below and matches
-    // `resume_target_resolver_coverage`.
+    // ascending; sort defensively).  Shared by the can-raise and
+    // branch-guard re-keys below.
     let mut pc_pos: Vec<(usize, usize)> = ssarepr
         .pc_first_insn_pos
         .iter()
@@ -1088,8 +1023,7 @@ fn derive_pc_live_indices_from_sparse(
     // the branch; the branch's real resume pc is the `==` fallthrough, served
     // by THIS canraise re-key on the `==` call.  The canraise trailing and
     // the branch leading marker are adjacent there and fold under
-    // `remove_repeated_live`, so the branch resume reads a fed fold-partner —
-    // `resume_target_resolver_coverage` accounts for that fold).
+    // `remove_repeated_live`, so the branch resume reads a fed fold-partner).
     for (q, insn) in ssarepr.insns.iter().enumerate() {
         let super::flatten::Insn::Op { opname, .. } = insn else {
             continue;
@@ -1321,97 +1255,6 @@ fn derive_after_call_indices_from_sparse(
 ///   reported for it here; the precise fallthrough-pc keying is #286
 ///   runtime work.  Measurement-only; no production caller when the gate is
 ///   unset.
-fn resume_target_resolver_coverage(
-    ssarepr: &super::flatten::SSARepr,
-    live_indices: &[Option<usize>],
-    code: &CodeObject,
-) -> (usize, usize, usize, usize, usize) {
-    // Owner-pc lookup keyed on stream position: `pc_first_insn_pos` is built
-    // first-wins as the stream grows, so its positions are already ascending;
-    // re-key by position and sort defensively.  `owner_pc(q)` = the py_pc
-    // whose first-insn position is the greatest at-or-before `q`.
-    let mut pc_pos: Vec<(usize, usize)> = ssarepr
-        .pc_first_insn_pos
-        .iter()
-        .filter(|&&(pc, _)| pc >= 0)
-        .map(|&(pc, pos)| (pos, pc as usize))
-        .collect();
-    pc_pos.sort_unstable();
-    let owner_pc = |q: usize| -> Option<usize> {
-        pc_pos
-            .partition_point(|&(pos, _)| pos <= q)
-            .checked_sub(1)
-            .map(|k| pc_pos[k].1)
-    };
-    let n_pcs = live_indices.len();
-    let (mut branch, mut branch_keyed, mut branch_fed) = (0usize, 0usize, 0usize);
-    let (mut canraise, mut canraise_fed) = (0usize, 0usize);
-    for (q, insn) in ssarepr.insns.iter().enumerate() {
-        let super::flatten::Insn::Op { opname, .. } = insn else {
-            continue;
-        };
-        if opname == "goto_if_not" || opname.starts_with("goto_if_not_") || opname == "switch" {
-            // Leading `-live-` immediately precedes the guard.
-            let Some(leading) = q.checked_sub(1).filter(|&i| ssarepr.insns[i].is_live()) else {
-                continue;
-            };
-            branch += 1;
-            // A branch guard resumes at orgpc = its owner PC's opcode-start
-            // marker (the first-insn keying in
-            // `derive_pc_live_indices_from_sparse`), NOT its leading
-            // `-live-`: pyre's Ref-only resume re-derives the unboxed
-            // condition by re-executing the opcode from its boxed-operand
-            // boundary.  So the guard is covered iff its owner PC has a
-            // resume marker, which the sparse first-insn feed always
-            // supplies.  (`branch_keyed` retains the leading-marker check
-            // for the survey only.)
-            if owner_pc(q).is_some_and(|p| p < n_pcs && live_indices[p].is_some()) {
-                branch_fed += 1;
-            }
-            if let Some(p) = owner_pc(q) {
-                if p < n_pcs && live_indices[p] == Some(leading) {
-                    branch_keyed += 1;
-                }
-            }
-        } else if opname.starts_with("residual_call") {
-            // Can-raise iff a trailing `-live-` immediately follows (the
-            // `Insn::Op` carries its result inline, so the marker is q+1);
-            // non-raising residual_calls have none.
-            if ssarepr.insns.get(q + 1).is_some_and(|n| n.is_live()) {
-                // L1: a can-raise whose semantic fallthrough PC is out of
-                // range — the owner op is an unconditional-raise terminator
-                // (`reraise` / `raise` at the function's exception-cleanup
-                // tail, e.g. a `Reraise` at the last PC) — has no
-                // in-function no-exception continuation: when it fires the
-                // exception unwinds out of the frame and the blackhole
-                // resumes in the CALLER, never at a PC of this function (its
-                // semantic fallthrough is `>= num_instrs`).  So it is not a
-                // structural resume target; exclude it from the count
-                // (otherwise its unfeedable trailing marker reads as a
-                // permanent `stranded` decline and blocks the splice).
-                let ft = owner_pc(q)
-                    .map(|p| pyre_jit_trace::metainterp::semantic_fallthrough_pc(code, p));
-                if let Some(f) = ft.filter(|&f| f < n_pcs) {
-                    canraise += 1;
-                    // #286: the runtime keys a can-raise exception resume on
-                    // `fallthrough_pc` (#285, trace_opcode.rs:3634
-                    // `resume_pc = self.fallthrough_pc`), NOT on the call's
-                    // own trailing marker.  Covered iff
-                    // `derived[fallthrough_pc]` is set — by that PC's own
-                    // first-insn marker (a real opcode follows the call) or
-                    // by the #286 trailing re-key when the fallthrough PC is
-                    // stack-only.  The trailing marker `q+1` is itself never
-                    // a runtime resume target.
-                    if live_indices[f].is_some() {
-                        canraise_fed += 1;
-                    }
-                }
-            }
-        }
-    }
-    (branch, branch_keyed, branch_fed, canraise, canraise_fed)
-}
-
 /// color-budget Step A probe helper: per-Register color-budget violation
 /// record `(insn_idx, opname, role, kind_str, color, num_colors)`.
 /// Role distinguishes argument operand vs result register vs nested
@@ -10425,93 +10268,6 @@ impl CodeWriter {
             &cfg_variable_pairs,
         );
         super::regalloc::enforce_input_args(&graph, &mut graph_regallocs);
-        // Default-off measurement: run the post-walk canonical driver on
-        // the production graph (`flatten.py:63-70`) and record its insn
-        // category buckets for the post-drain DIFF survey below.  This is
-        // the first production-reachable caller of `flatten_graph`; until
-        // now only `*_for_test` and `#[cfg(test)]` reached it.  Survey, not
-        // abort: graph shapes the canonical driver can't yet flatten
-        // panic inside `flatten_graph` (the Phase-1 SCAFFOLD panics —
-        // uncolored exception-edge vars, non-portal `simple_call` frame),
-        // so catch the unwind and record `None`, letting one
-        // `PYRE_FLATTEN_MEASURE=1` pass survey every production graph
-        // instead of aborting on the first bad one.  `flatten_graph` only
-        // reads `graph`/`cpu` (no `.borrow_mut`, `next_variable_id`
-        // untouched), so discarding the result leaves the post-measurement
-        // production path byte-identical; gate unset => skipped entirely.
-        // `(genuine, live, copy, structural)` buckets paired with the
-        // canonical driver's genuine-category opname tally (#230.M3) and
-        // the #288 sparse-liveness coverage report
-        // `(reachable, resolved, absent, uncovered)`, or `None` when the
-        // driver panicked.  All three derive from the single canonical
-        // `flatten_graph` stream so the per-graph genuine residual can be
-        // named and the sparse `-live-` resolver verified at the log site.
-        let measure_canonical: Option<(
-            (usize, usize, usize, usize),
-            std::collections::BTreeMap<String, usize>,
-            (usize, usize, usize, usize),
-            (usize, usize, usize, usize, usize),
-        )> = if std::env::var("PYRE_FLATTEN_MEASURE").is_ok() {
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let mut measure_regallocs = graph_regallocs.clone();
-                // `_include_all_exc_links = false` matches the production
-                // canonical caller `codewriter.py:53 flatten_graph(graph,
-                // regallocs, cpu=...)` (the flag keeps its `flatten.py:63`
-                // default `False`).  Passing `true` would emit exception
-                // links the production driver skips, giving the bucket /
-                // resume-coverage survey a non-canonical stream to compare
-                // against.
-                let canonical = super::flatten::flatten_graph(
-                    &graph,
-                    &mut measure_regallocs,
-                    false,
-                    Some(self.cpu()),
-                );
-                // #288: resolve each reachable Python PC to its
-                // nearest-at-or-before `-live-` marker from the canonical
-                // stream's OWN sparse markers + `pc_first_insn_pos`, then
-                // bucket the reachable PCs into resolved / absent (the PC
-                // emits no graph op — a stack-only instruction — so it has
-                // no `pc_first_insn_pos` entry) / uncovered (the PC emits a
-                // graph op but no `-live-` marker precedes it).
-                let live_indices = derive_pc_live_indices_from_sparse(&canonical, num_instrs, code);
-                let live_vars = pyre_jit_trace::state::liveness_for(code as *const _);
-                let mut present = vec![false; num_instrs];
-                for &(pc, _) in &canonical.pc_first_insn_pos {
-                    if (0..num_instrs as i64).contains(&pc) {
-                        present[pc as usize] = true;
-                    }
-                }
-                let (mut reachable, mut resolved, mut absent, mut uncovered) = (0, 0, 0, 0);
-                for pc in 0..num_instrs {
-                    if !live_vars.is_reachable(pc) {
-                        continue;
-                    }
-                    reachable += 1;
-                    if live_indices[pc].is_some() {
-                        resolved += 1;
-                    } else if !present[pc] {
-                        absent += 1;
-                    } else {
-                        uncovered += 1;
-                    }
-                }
-                // #281 verify: restrict the sparse-resolver coverage check
-                // to the runtime's structural resume targets (branch guards
-                // + can-raise calls, #285) and report how the resolver feeds
-                // / keys each.
-                let resume = resume_target_resolver_coverage(&canonical, &live_indices, code);
-                (
-                    bucket_measure_insns(&canonical.insns),
-                    genuine_opname_tally(&canonical.insns),
-                    (reachable, resolved, absent, uncovered),
-                    resume,
-                )
-            }))
-            .ok()
-        } else {
-            None
-        };
         // #229 / #279 / #230 path-(b) — canonical-as-production splice.
         // Build the SAME canonical `flatten_graph(graph, regallocs,
         // false, cpu)` stream the survey measures and capture it so the
@@ -10979,121 +10735,6 @@ impl CodeWriter {
                         Some(derive_after_call_indices_from_sparse(&ssarepr, num_instrs));
                     did_splice = true;
                 }
-            }
-            // #230.M2 DIFF bucketing survey: under PYRE_FLATTEN_MEASURE,
-            // bucket both the canonical driver's insn stream (captured
-            // pre-drain above) and the walker's drained `ssarepr.insns`
-            // into `(genuine, live, copy, struct)` and log them
-            // category-to-category, so the ~40% excess (M1: canonical is
-            // consistently ~60-65% of walker length) is attributed to a
-            // specific retirement.  `live` = per-PC `-live-` markers
-            // (retired by #287), `copy` = `*_copy` renamings the walker
-            // emits inline where upstream defers them to
-            // `insert_renamings` (#289/#290), `struct` = `Label`/`---`,
-            // `genuine` = everything else.  When walker `genuine` equals
-            // canonical `genuine` the entire gap is `live`+`copy` (both
-            // already-tracked retirements) and the flip is purely a
-            // filtering problem; a residual walker `genuine` excess is a
-            // NEW-DEVIATION needing its own retirement.  `Some` when the
-            // canonical driver completed, `None` when it panicked
-            // (Phase-1 SCAFFOLD shape).  Log-only — never affects codegen.
-            if let Some((
-                (cg, cl, cc, cs),
-                canonical_genuine,
-                (lreach, lres, labs, lunc),
-                (rb, rbk, rbf, rc, rcf),
-            )) = measure_canonical
-            {
-                let (wg, wl, wc, ws) = bucket_measure_insns(&ssarepr.insns);
-                eprintln!(
-                    "[flatten-measure] {} canon[g={} l={} c={} s={} tot={}] walker[g={} l={} c={} s={} tot={}] {} {}",
-                    ssarepr.name,
-                    cg,
-                    cl,
-                    cc,
-                    cs,
-                    cg + cl + cc + cs,
-                    wg,
-                    wl,
-                    wc,
-                    ws,
-                    wg + wl + wc + ws,
-                    if wg == cg {
-                        "GENUINE_MATCH"
-                    } else {
-                        "GENUINE_DIFF"
-                    },
-                    if cg + cl + cc + cs == wg + wl + wc + ws {
-                        "MATCH"
-                    } else {
-                        "DIFF"
-                    },
-                );
-                // #230.M3: name the residual `genuine` deviation
-                // opname-by-opname.  M2 collapses `genuine` to a single
-                // count (e.g. int +7, fannkuch +5) but does not say which
-                // opnames the walker over- or under-emits.  Diff the two
-                // per-opname tallies and log each opname whose walker count
-                // differs from canonical, so the residual NEW-DEVIATION has
-                // a name before #287/#281 close the `-live-`/`copy` bulk.
-                let walker_genuine = genuine_opname_tally(&ssarepr.insns);
-                let mut opnames: Vec<&String> = canonical_genuine
-                    .keys()
-                    .chain(walker_genuine.keys())
-                    .collect();
-                opnames.sort();
-                opnames.dedup();
-                let diffs: Vec<String> = opnames
-                    .into_iter()
-                    .filter_map(|opname| {
-                        let c = canonical_genuine.get(opname).copied().unwrap_or(0);
-                        let w = walker_genuine.get(opname).copied().unwrap_or(0);
-                        (c != w).then(|| {
-                            format!("{}:w{}/c{}({:+})", opname, w, c, w as isize - c as isize)
-                        })
-                    })
-                    .collect();
-                if diffs.is_empty() {
-                    eprintln!("[flatten-measure-genuine] {} MATCH", ssarepr.name);
-                } else {
-                    eprintln!(
-                        "[flatten-measure-genuine] {} DIFF {}",
-                        ssarepr.name,
-                        diffs.join(" "),
-                    );
-                }
-                // #288: survey the canonical sparse `-live-` resolver's
-                // coverage over reachable instruction PCs.  `resolved` =
-                // PC emits a graph op (has a `pc_first_insn_pos` entry)
-                // AND a `-live-` marker precedes it.  `nopc` = PC emits no
-                // graph op (stack-only instruction: LOAD_FAST/POP_TOP/…),
-                // so it has no `pc_first_insn_pos` entry — only a resume
-                // target if the runtime deopts into a stack-only PC, which
-                // #281 must confirm it never does.  `unmarked` = PC emits
-                // a graph op but no `-live-` precedes it (≈ the entry PC
-                // before the first marker).  Survey-only, like the other
-                // `[flatten-measure]` lines; no PASS/GAP verdict because
-                // the meaningful gate (resume-target coverage, not
-                // all-PC) is #281's, which restricts to deopt targets.
-                eprintln!(
-                    "[flatten-measure-liveness] {} reachable={} resolved={} nopc={} unmarked={}",
-                    ssarepr.name, lreach, lres, labs, lunc,
-                );
-                // #281 verify: resume-target-restricted resolver coverage.
-                // `branch`/`canraise` = structural resume targets (#285);
-                // `keyed` = branch guards whose OWN owner-pc resolver entry
-                // is the guard's leading marker (the strict runtime
-                // `pc_map[orgpc]` invariant); `fed` = markers the resolver
-                // hands to some pc; `stranded` = resume markers in NO entry
-                // (the (b) nopc-fallthrough safety number).  Survey-only,
-                // verdict-less like the other `[flatten-measure]` lines.
-                let stranded = (rb - rbf) + (rc - rcf);
-                eprintln!(
-                    "[flatten-measure-resume] {} branch={} keyed={} branch_fed={} canraise={} canraise_fed={} stranded={}",
-                    ssarepr.name, rb, rbk, rbf, rc, rcf, stranded,
-                );
-            } else if std::env::var("PYRE_FLATTEN_MEASURE").is_ok() {
-                eprintln!("[flatten-measure] {} canonical=PANIC", ssarepr.name);
             }
         }
 
