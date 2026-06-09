@@ -42,13 +42,13 @@ struct LocaleConvData {
 }
 
 /// Build the `localeconv()` result dict.  String fields decode the host
-/// bytes as UTF-8; grouping lists already carry the trailing 0 that
-/// `_w_copy_grouping` appends to a non-empty grouping
-/// (`interp_locale.py:36-40`).
+/// bytes via `charp2uni` (utf-8 + surrogateescape, `interp_locale.py:42`);
+/// grouping lists already carry the trailing 0 that `_w_copy_grouping`
+/// appends to a non-empty grouping (`interp_locale.py:36-40`).
 fn localeconv_to_dict(c: &LocaleConvData) -> pyre_object::PyObjectRef {
     let d = pyre_object::w_dict_new();
     let put_str = |k: &str, b: &[u8]| unsafe {
-        pyre_object::w_dict_setitem_str(d, k, pyre_object::w_str_new(&String::from_utf8_lossy(b)));
+        pyre_object::w_dict_setitem_str(d, k, crate::typedef::charp2uni(b));
     };
     let put_int = |k: &str, v: i64| unsafe {
         pyre_object::w_dict_setitem_str(d, k, pyre_object::w_int_new(v));
@@ -303,7 +303,7 @@ pub fn register_module(ns: &mut DictStorage) {
                     };
                     if item == libc::CODESET {
                         if let Some(bytes) = rustpython_host_env::locale::nl_langinfo_codeset() {
-                            return Ok(pyre_object::w_str_new(&String::from_utf8_lossy(&bytes)));
+                            return Ok(crate::typedef::charp2uni(&bytes));
                         }
                     }
                     // `interp_locale.py:151-154` — unknown items raise
@@ -314,8 +314,9 @@ pub fn register_module(ns: &mut DictStorage) {
                     if p.is_null() {
                         return Err(crate::PyError::value_error("unsupported langinfo constant"));
                     }
+                    // `interp_locale.py:153` decodes via utf-8 + surrogateescape.
                     let s = unsafe { std::ffi::CStr::from_ptr(p) };
-                    return Ok(pyre_object::w_str_new(&s.to_string_lossy()));
+                    return Ok(crate::typedef::charp2uni(s.to_bytes()));
                 }
                 #[cfg(not(all(
                     unix,

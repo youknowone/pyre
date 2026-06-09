@@ -119,12 +119,26 @@ pub fn sleep(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             } else if is_bool(args[0]) {
                 boolobject::w_bool_get_value(args[0]) as i64
             } else {
-                let name = crate::typedef::r#type(args[0])
-                    .map(|tp| w_type_get_name(tp).to_string())
-                    .unwrap_or_else(|| "object".to_string());
-                return Err(crate::PyError::type_error(format!(
-                    "'{name}' object cannot be interpreted as an integer"
-                )));
+                // `timeutils.py:31` — `space.bigint_w(w_secs)` applies
+                // `space.int`, so an object with `__int__` / `__index__` is
+                // accepted and reduced to a longlong.
+                let has_int = crate::baseobjspace::lookup(args[0], "__int__").is_some()
+                    || crate::baseobjspace::lookup(args[0], "__index__").is_some();
+                if !has_int {
+                    let name = crate::typedef::r#type(args[0])
+                        .map(|tp| w_type_get_name(tp).to_string())
+                        .unwrap_or_else(|| "object".to_string());
+                    return Err(crate::PyError::type_error(format!(
+                        "'{name}' object cannot be interpreted as an integer"
+                    )));
+                }
+                let w_int = crate::baseobjspace::space_int(args[0])?;
+                if is_int(w_int) {
+                    w_int_get_value(w_int)
+                } else {
+                    i64::try_from(pyre_object::longobject::w_long_get_value(w_int))
+                        .map_err(|_| overflow())?
+                }
             };
             sec.checked_mul(SECS_TO_NS).ok_or_else(|| overflow())?
         }
@@ -695,9 +709,8 @@ fn _gettmarg(args: &[PyObjectRef], default_now: bool) -> Result<c_tm, crate::PyE
         }
         // `baseobjspace.py:1976 c_int_w` — int_w with a 32-bit range check;
         // floats and non-integers raise rather than being truncated.
-        let c_int_w = |i: usize| -> Result<i32, crate::PyError> {
-            crate::baseobjspace::c_int_w(tup_w[i])
-        };
+        let c_int_w =
+            |i: usize| -> Result<i32, crate::PyError> { crate::baseobjspace::c_int_w(tup_w[i]) };
         let y = c_int_w(0)?;
         // A zero month / day / yday is normalized to 1 before the C-struct
         // adjustment below.

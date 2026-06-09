@@ -9310,6 +9310,16 @@ fn invalid_byte_2_of_4(ch1: u8, ch2: u8) -> bool {
     invalid_cont_byte(ch2) || (ch1 == 0xF0 && ch2 < 0x90) || (ch1 == 0xF4 && ch2 > 0x8F)
 }
 
+/// interp_locale.py:42-46 `charp2uni` — decode a C string the way
+/// `str(bytes, 'utf-8', 'surrogateescape')` does: valid UTF-8 passes
+/// through and any other byte becomes a lone `0xDC00 + byte` surrogate.
+/// `surrogateescape` rescues every byte, so the decode never fails.
+pub(crate) fn charp2uni(data: &[u8]) -> PyObjectRef {
+    let decoded =
+        decode_utf8_with_errors(data, "surrogateescape").unwrap_or_else(|_| Wtf8Buf::new());
+    pyre_object::w_str_from_wtf8(decoded)
+}
+
 /// unicodehelper.py:377-537 _str_decode_utf8_slowpath
 /// Structural port of PyPy's _utf8_code_length state machine.
 /// PyPy appends raw UTF-8 bytes to a StringBuilder; Rust reconstructs

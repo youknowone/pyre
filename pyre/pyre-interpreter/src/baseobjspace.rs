@@ -3349,7 +3349,7 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str) -> PyResult {
 /// Note: `__trunc__` is NOT consulted here. `__trunc__` belongs to the
 /// `int(...)` builtin path (`intobject.py:989 _new_baseint`), not to
 /// `space.int()` / `space.int_w()`.
-fn space_int(obj: PyObjectRef) -> Result<PyObjectRef, PyError> {
+pub(crate) fn space_int(obj: PyObjectRef) -> Result<PyObjectRef, PyError> {
     // baseobjspace.py:319 `w_impl = space.lookup(self, '__int__')`
     let w_impl = unsafe { lookup(obj, "__int__") }
         // baseobjspace.py:321-323 `w_impl = space.lookup(self, '__index__')`
@@ -5699,9 +5699,7 @@ pub fn float_w(obj: PyObjectRef) -> Result<f64, PyError> {
                 .to_f64()
                 .unwrap_or(f64::INFINITY);
             if !f.is_finite() {
-                return Err(PyError::overflow_error(
-                    "int too large to convert to float",
-                ));
+                return Err(PyError::overflow_error("int too large to convert to float"));
             }
             return Ok(f);
         }
