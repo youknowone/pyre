@@ -110,11 +110,9 @@ pub struct SSARepr {
     /// Pyre-only side-table populated by canonical's
     /// `serialize_op`: for each non-negative `op.offset` (Python PC)
     /// encountered, the FIRST `insns` index where an op with that
-    /// PC was emitted.  Walker maintains the analogous mapping via
-    /// `walker_pc_live_marker_pos` (codewriter.rs:4125) — both
-    /// drive `pc_map` construction at exit-recovery time
-    /// (call_jit.rs:3939).  Empty when filled by the walker path.
-    /// Sparse `Vec<(py_pc, first_insn_pos)>` keyed by py_pc.
+    /// PC was emitted.  Drives `pc_map` construction at exit-recovery
+    /// time (call_jit.rs:3939).  Sparse `Vec<(py_pc, first_insn_pos)>`
+    /// keyed by py_pc.
     pub pc_first_insn_pos: Vec<(i64, usize)>,
     /// Per-kind fresh-Variable counter. RPython has no analog
     /// because RPython's `Variable()` constructor produces objects with
@@ -1325,13 +1323,11 @@ impl<'a> GraphFlattener<'a> {
         }
         // Record FIRST insn position per
         // non-negative `op.offset` (Python PC) into
-        // `ssarepr.pc_first_insn_pos`.  Walker tracks the same mapping
-        // via `walker_pc_live_marker_pos` (codewriter.rs:4125); both
-        // drive `pc_map` construction at exit recovery
-        // (call_jit.rs:3939).  Synthetic ops with `offset = -1`
-        // (insert_renamings ref_copy / overflow trampolines /
-        // catch-landing entries) are skipped — they have no Python
-        // PC counterpart.  Sparse `Vec<(py_pc, first_insn_pos)>`.
+        // `ssarepr.pc_first_insn_pos`.  Drives `pc_map` construction at
+        // exit recovery (call_jit.rs:3939).  Synthetic ops with
+        // `offset = -1` (insert_renamings ref_copy / overflow
+        // trampolines / catch-landing entries) are skipped — they have
+        // no Python PC counterpart.  Sparse `Vec<(py_pc, first_insn_pos)>`.
         if op.offset >= 0 {
             let py_pc = op.offset;
             let already_seen = self
