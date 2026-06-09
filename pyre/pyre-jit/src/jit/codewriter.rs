@@ -29,7 +29,7 @@ use pyre_interpreter::runtime_ops::{binary_op_tag, compare_op_tag};
 
 use super::flatten::{
     CallDescrStub, CallFlavor, GraphFlattener, Insn, Kind, Operand, Register, ResKind, SSARepr,
-    TLabel, slot_for_call_flavor,
+    slot_for_call_flavor,
 };
 
 // ---------------------------------------------------------------------------
@@ -4449,13 +4449,7 @@ impl CodeWriter {
         // `link.args` mentions `link.last_exception`.
         macro_rules! emit_last_exception {
             ($dst:expr) => {{
-                let dst = $dst;
-                let insn = Insn::op_with_result(
-                    "last_exception",
-                    Vec::new(),
-                    Register::new(Kind::Int, dst),
-                );
-                push_walker_emit(&current_block, insn);
+                let _dst = $dst;
             }};
         }
 
@@ -4467,13 +4461,7 @@ impl CodeWriter {
         // register.
         macro_rules! emit_last_exc_value {
             ($dst:expr) => {{
-                let dst = $dst;
-                let insn = Insn::op_with_result(
-                    "last_exc_value",
-                    Vec::new(),
-                    Register::new(Kind::Ref, dst),
-                );
-                push_walker_emit(&current_block, insn);
+                let _dst = $dst;
             }};
         }
 
@@ -4544,14 +4532,8 @@ impl CodeWriter {
         // bytecode key.
         macro_rules! emit_ref_return {
             ($src:expr, $retval:expr) => {{
-                let src = $src;
+                let _src = $src;
                 let retval = $retval;
-                let insn = Insn::op("ref_return", vec![Operand::reg(Kind::Ref, src)]);
-                push_walker_emit(&current_block, insn);
-                // `rpython/jit/codewriter/flatten.py:144-146`: terminators
-                // emit `('---',)` so the backward liveness pass clears its
-                // alive set.
-                push_walker_emit(&current_block, Insn::Unreachable);
                 // attach the return edge to
                 // `graph.returnblock` (`model.py:18`). The return value
                 // now comes from the symbolic `FrameState` stack,
@@ -4574,15 +4556,12 @@ impl CodeWriter {
         macro_rules! emit_goto {
             ($target_py_pc:expr) => {{
                 let target_py_pc = $target_py_pc;
-                // mergeblock support: mergeblock first to learn the target
-                // SpamBlock, then emit `goto` against its block-identity
-                // `TLabel("block{addr}")`.  Mirrors upstream
+                // mergeblock establishes the target SpamBlock and the
+                // graph exit edge (`append_exit`).  Mirrors upstream
                 // `flatten.py:161 self.emitline('goto',
                 // TLabel(link.target))` where `link.target` is a Block
-                // identity, not a PC.  The per-PC `Label("pcN")` at the
-                // target's first PC remains a valid branch target until
-                // per-PC labels are retired.
-                let target_block = mergeblock(
+                // identity, not a PC.
+                let _target_block = mergeblock(
                     code,
                     &mut graph,
                     &mut joinpoints,
@@ -4597,18 +4576,6 @@ impl CodeWriter {
                     &mut pendingblocks,
                     &mut all_walker_blocks,
                 );
-                let insn = Insn::op(
-                    "goto",
-                    vec![Operand::TLabel(super::flatten::block_tlabel(
-                        &target_block.block(),
-                    ))],
-                );
-                push_walker_emit(&current_block, insn);
-                // `rpython/jit/codewriter/flatten.py:111-112`: an
-                // unconditional goto implicitly ends a block so the
-                // liveness pass (`liveness.py:68-69`) can reset the alive
-                // set.
-                push_walker_emit(&current_block, Insn::Unreachable);
                 needs_fallthrough = false;
             }};
         }
@@ -4629,8 +4596,6 @@ impl CodeWriter {
         // an exact mirror of the pre-existing internal behavior.
         macro_rules! emit_abort_permanent {
             () => {{
-                let insn = Insn::op("abort_permanent", Vec::new());
-                push_walker_emit(&current_block, insn);
                 // Graph-side dual-write so the canonical `flatten_graph`
                 // driver sees the same `abort_permanent` SpaceOp via
                 // passthrough.  Without this dual-write, canonical
@@ -4681,12 +4646,10 @@ impl CodeWriter {
         // expects.
         macro_rules! emit_raise {
             ($src:expr, $evalue:expr, $offset:expr, $try_catch_adjacency:expr) => {{
-                let src = $src;
+                let _src = $src;
                 let evalue_fv: super::flow::FlowValue = $evalue;
                 let offset = $offset;
                 let try_catch_adjacency: bool = $try_catch_adjacency;
-                let insn = Insn::op("raise", vec![Operand::reg(Kind::Ref, src)]);
-                push_walker_emit(&current_block, insn);
                 let py_pc_for_catch = offset as usize;
                 let catch_label_opt = if try_catch_adjacency {
                     catch_for_pc.get(py_pc_for_catch).copied().flatten()
@@ -4761,8 +4724,6 @@ impl CodeWriter {
         // `reraise/`. pyre emits this for RAISE_VARARGS with argc == 0.
         macro_rules! emit_reraise {
             () => {{
-                let insn = Insn::op("reraise", Vec::new());
-                push_walker_emit(&current_block, insn);
                 // same edge as `emit_raise!` — the
                 // re-raise opname shares the `Block.exits` topology
                 // (`flatten.py` emits the two as alternative codings
@@ -4810,14 +4771,6 @@ impl CodeWriter {
         macro_rules! emit_catch_exception {
             ($catch_label:expr) => {{
                 let catch_label = $catch_label;
-                let insn = Insn::op(
-                    "catch_exception",
-                    vec![Operand::TLabel(TLabel::new(format!(
-                        "catch_landing_{}",
-                        catch_label
-                    )))],
-                );
-                push_walker_emit(&current_block, insn);
                 // attach the exception edge to the
                 // current PC's block. In RPython this is the
                 // `Constant(last_exception)` exit added by
@@ -5053,20 +5006,12 @@ impl CodeWriter {
                     // routes via explicit goto rather than implicit
                     // fallthrough to whichever block lands next in
                     // walker-pop order.
-                    if needs_fallthrough {
-                        // mergeblock support: emit goto against the new
-                        // block's identity TLabel, matching upstream
-                        // `flatten.py:161` `TLabel(link.target)` where
-                        // `link.target` is a Block, not a PC.
-                        let goto_insn = Insn::op(
-                            "goto",
-                            vec![Operand::TLabel(super::flatten::block_tlabel(
-                                &new_block.block(),
-                            ))],
-                        );
-                        push_walker_emit(&current_block, goto_insn);
-                        push_walker_emit(&current_block, Insn::Unreachable);
-                    }
+                    // The graph edge from `current_block` to `new_block`
+                    // is established by the `mergeblock` above
+                    // (`append_exit`); the canonical splice emits the
+                    // `goto` from that link.  Mirrors upstream
+                    // `flatten.py:161` `TLabel(link.target)` where
+                    // `link.target` is a Block, not a PC.
                     block_switch_pending = true;
                 } else {
                     // No switch — same block continues at py_pc.
@@ -5113,16 +5058,6 @@ impl CodeWriter {
                 if !all_walker_blocks.iter().any(|b| b == &current_block) {
                     all_walker_blocks.push(current_block.clone());
                 }
-                // Per-block accumulator entry Label — drain swap
-                // (line ~7319) reproduces it into ssarepr.insns in
-                // walker-block-creation order.
-                push_walker_emit(
-                    &current_block,
-                    Insn::Label(super::flatten::Label::new(format!(
-                        "catch_landing_{}",
-                        landing_label
-                    ))),
-                );
             }};
         }
 
@@ -5423,19 +5358,11 @@ impl CodeWriter {
                         pushvalue_const_py_pc,
                     );
                 } else {
-                    // Non-portal frames have no vable mirror; the runtime
-                    // expects the pushed PY_NULL to be visible in the
-                    // stack slot register for any downstream consumer.
-                    // `flatten.py:333-334` parity: ref_copy with ConstRef
-                    // source.  The walker MUST NOT record a graph-side
-                    // `ref_copy` op; `insert_renamings` (flatten.py:320)
-                    // owns ref_copy emission.
-                    let const_copy_insn = Insn::op_with_result(
-                        "ref_copy",
-                        vec![Operand::ConstRef(value)],
-                        Register::new(Kind::Ref, stack_base + $depth),
-                    );
-                    push_walker_emit(&current_block, const_copy_insn);
+                    // Non-portal frames have no vable mirror.  The
+                    // pushed PY_NULL becomes visible in the stack-slot
+                    // register via `insert_renamings` (flatten.py:320),
+                    // which owns `ref_copy` emission; the walker MUST
+                    // NOT record a graph-side `ref_copy` op.
                 }
                 $depth += 1;
                 emit_vsd!($depth, pushvalue_const_py_pc);
