@@ -60,10 +60,9 @@ pub fn _int_add(box1: OpRef, box2: OpRef, ctx: &mut OptContext) -> OpRef {
     {
         return box1;
     }
-    let op = Op::new(
-        OpCode::IntAdd,
-        &[BoxRef::from_opref(box1), BoxRef::from_opref(box2)],
-    );
+    let arg1 = ctx.materialize_box_at(box1);
+    let arg2 = ctx.materialize_box_at(box2);
+    let op = Op::new(OpCode::IntAdd, &[arg1, arg2]);
     ctx.emit_for_force(op)
 }
 
@@ -171,29 +170,23 @@ pub fn copy_str_content(
                         if let Some(ch_val) = from_const {
                             ctx.emit_constant_int(ch_val)
                         } else {
-                            let getitem_op = Op::new(
-                                get_opcode,
-                                &[BoxRef::from_opref(srcbox), BoxRef::from_opref(src_offset)],
-                            );
+                            let arg_src = ctx.materialize_box_at(srcbox);
+                            let arg_off = ctx.materialize_box_at(src_offset);
+                            let getitem_op = Op::new(get_opcode, &[arg_src, arg_off]);
                             ctx.emit_for_force(getitem_op)
                         }
                     } else {
-                        let getitem_op = Op::new(
-                            get_opcode,
-                            &[BoxRef::from_opref(srcbox), BoxRef::from_opref(src_offset)],
-                        );
+                        let arg_src = ctx.materialize_box_at(srcbox);
+                        let arg_off = ctx.materialize_box_at(src_offset);
+                        let getitem_op = Op::new(get_opcode, &[arg_src, arg_off]);
                         ctx.emit_for_force(getitem_op)
                     }
                 };
                 src_offset = _int_add(src_offset, one, ctx);
-                let setitem_op = Op::new(
-                    set_opcode,
-                    &[
-                        BoxRef::from_opref(targetbox),
-                        BoxRef::from_opref(dst_offset),
-                        BoxRef::from_opref(charbox),
-                    ],
-                );
+                let arg_target = ctx.materialize_box_at(targetbox);
+                let arg_dst_off = ctx.materialize_box_at(dst_offset);
+                let arg_char = ctx.materialize_box_at(charbox);
+                let setitem_op = Op::new(set_opcode, &[arg_target, arg_dst_off, arg_char]);
                 ctx.emit_for_force(setitem_op);
                 dst_offset = _int_add(dst_offset, one, ctx);
             }
@@ -207,15 +200,14 @@ pub fn copy_str_content(
     } else {
         offsetbox // caller doesn't need it
     };
+    let arg_src = ctx.materialize_box_at(srcbox);
+    let arg_target = ctx.materialize_box_at(targetbox);
+    let arg_srcoff = ctx.materialize_box_at(srcoffsetbox);
+    let arg_off = ctx.materialize_box_at(offsetbox);
+    let arg_len = ctx.materialize_box_at(lengthbox);
     let copy_op = Op::new(
         copy_opcode,
-        &[
-            BoxRef::from_opref(srcbox),
-            BoxRef::from_opref(targetbox),
-            BoxRef::from_opref(srcoffsetbox),
-            BoxRef::from_opref(offsetbox),
-            BoxRef::from_opref(lengthbox),
-        ],
+        &[arg_src, arg_target, arg_srcoff, arg_off, arg_len],
     );
     ctx.emit_for_force(copy_op);
     next_offset
@@ -287,14 +279,10 @@ pub fn string_copy_parts(
             for ch in &chars {
                 if let Some(ch_ref) = ch {
                     let ch_resolved = ctx.get_box_replacement(*ch_ref).to_opref();
-                    let setitem_op = Op::new(
-                        set_opcode,
-                        &[
-                            BoxRef::from_opref(targetbox),
-                            BoxRef::from_opref(offset),
-                            BoxRef::from_opref(ch_resolved),
-                        ],
-                    );
+                    let arg_target = ctx.materialize_box_at(targetbox);
+                    let arg_offset = ctx.materialize_box_at(offset);
+                    let arg_char = ctx.materialize_box_at(ch_resolved);
+                    let setitem_op = Op::new(set_opcode, &[arg_target, arg_offset, arg_char]);
                     ctx.emit_for_force(setitem_op);
                 }
                 offset = _int_add(offset, one, ctx);
@@ -734,12 +722,12 @@ impl OptString {
                         } else {
                             // vstring.py:580-581 → _strgetitem → emit_extra
                             let index_ref = ctx.make_constant_int(src_start + index);
+                            let pass_idx = ctx.current_pass_idx;
+                            let arg_src = ctx.materialize_box_at(src_ref);
+                            let arg_index = ctx.materialize_box_at(index_ref);
                             ctx.emit_extra(
-                                ctx.current_pass_idx,
-                                Op::new(
-                                    getitem_opcode,
-                                    &[BoxRef::from_opref(src_ref), BoxRef::from_opref(index_ref)],
-                                ),
+                                pass_idx,
+                                Op::new(getitem_opcode, &[arg_src, arg_index]),
                             )
                         };
                     if dst_virtual {
@@ -747,16 +735,13 @@ impl OptString {
                     } else {
                         // vstring.py:585-589: self.emit_extra(new_op)
                         let dst_index_ref = ctx.make_constant_int(dst_start + index);
+                        let pass_idx = ctx.current_pass_idx;
+                        let arg_dst = ctx.materialize_box_at(dst_ref);
+                        let arg_dst_index = ctx.materialize_box_at(dst_index_ref);
+                        let arg_char = ctx.materialize_box_at(char_ref);
                         ctx.emit_extra(
-                            ctx.current_pass_idx,
-                            Op::new(
-                                setitem_opcode,
-                                &[
-                                    BoxRef::from_opref(dst_ref),
-                                    BoxRef::from_opref(dst_index_ref),
-                                    BoxRef::from_opref(char_ref),
-                                ],
-                            ),
+                            pass_idx,
+                            Op::new(setitem_opcode, &[arg_dst, arg_dst_index, arg_char]),
                         );
                     }
                 }
@@ -815,10 +800,9 @@ impl OptString {
                 return self.emit_constant_int(va - vb, ctx);
             }
         }
-        let op = Op::new(
-            OpCode::IntSub,
-            &[BoxRef::from_opref(a), BoxRef::from_opref(b)],
-        );
+        let arg_a = ctx.materialize_box_at(a);
+        let arg_b = ctx.materialize_box_at(b);
+        let op = Op::new(OpCode::IntSub, &[arg_a, arg_b]);
         ctx.emit(op)
     }
 
@@ -1094,10 +1078,9 @@ impl OptString {
                     // vstring.py:747: lengthbox = i1.getstrlen(arg1, self, mode)
                     let lengthbox = ctx.getstrlen_opref(arg1, mode);
                     let zero = ctx.emit_constant_int(0);
-                    let mut eq_op = Op::new(
-                        OpCode::IntEq,
-                        &[BoxRef::from_opref(lengthbox), BoxRef::from_opref(zero)],
-                    );
+                    let arg_len = ctx.materialize_box_at(lengthbox);
+                    let arg_zero = ctx.materialize_box_at(zero);
+                    let mut eq_op = Op::new(OpCode::IntEq, &[arg_len, arg_zero]);
                     eq_op.pos.set(op.pos.get());
                     return Some(OptimizationResult::Emit(eq_op));
                 }
@@ -1120,10 +1103,9 @@ impl OptString {
                     let c1 = self.strgetitem(arg1, 0, ctx);
                     let c2 = self.strgetitem(arg2, 0, ctx);
                     if let (Some(ch1), Some(ch2)) = (c1, c2) {
-                        let mut eq_op = Op::new(
-                            OpCode::IntEq,
-                            &[BoxRef::from_opref(ch1), BoxRef::from_opref(ch2)],
-                        );
+                        let arg_ch1 = ctx.materialize_box_at(ch1);
+                        let arg_ch2 = ctx.materialize_box_at(ch2);
+                        let mut eq_op = Op::new(OpCode::IntEq, &[arg_ch1, arg_ch2]);
                         eq_op.pos.set(op.pos.get());
                         return Some(OptimizationResult::Emit(eq_op));
                     }
@@ -1157,10 +1139,9 @@ impl OptString {
             }
             // vstring.py:784: PTR_EQ against CONST_NULL (ref-null, not int-zero)
             let null_const = ctx.emit_constant_ref(majit_ir::GcRef::NULL);
-            let mut eq_op = Op::new(
-                OpCode::PtrEq,
-                &[BoxRef::from_opref(arg1), BoxRef::from_opref(null_const)],
-            );
+            let arg_a = ctx.materialize_box_at(arg1);
+            let arg_null = ctx.materialize_box_at(null_const);
+            let mut eq_op = Op::new(OpCode::PtrEq, &[arg_a, arg_null]);
             eq_op.pos.set(op.pos.get());
             return Some(OptimizationResult::Emit(eq_op));
         }
@@ -1265,7 +1246,10 @@ impl OptString {
         ctx.make_constant(func_const, Value::Int(func_addr as i64));
         let mut call_args = vec![func_const];
         call_args.extend_from_slice(args);
-        let call_args_box: Vec<BoxRef> = call_args.iter().map(|a| BoxRef::from_opref(*a)).collect();
+        let mut call_args_box: Vec<BoxRef> = Vec::with_capacity(call_args.len());
+        for a in &call_args {
+            call_args_box.push(ctx.materialize_box_at(*a));
+        }
         // vstring.py:854: replace_op_with(result, rop.CALL_I, [...], descr=calldescr)
         let mut call_op = match calldescr {
             Some(d) => Op::with_descr(OpCode::CallI, &call_args_box, d.clone()),

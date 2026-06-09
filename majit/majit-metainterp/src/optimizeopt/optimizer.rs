@@ -775,7 +775,8 @@ impl Optimizer {
                 .opref_type(*label_arg)
                 .expect("imported virtual leaf missing box.type");
             let same_as_op = majit_ir::OpCode::same_as_for_type(tp);
-            let mut op = majit_ir::Op::new(same_as_op, &[BoxRef::from_opref(*label_arg)]);
+            let arg0 = ctx.materialize_box_at(*label_arg);
+            let mut op = majit_ir::Op::new(same_as_op, &[arg0]);
             op.pos.set(ctx.reserve_pos_typed(tp));
             let fresh = op.pos.get();
             // Op.type_ carries `tp` intrinsically (resoperation.py:1693
@@ -2649,7 +2650,8 @@ impl Optimizer {
                         .expect("propagate_from_pass_range SameAs: source OpRef missing Box.type");
                     let same_as = OpCode::same_as_for_type(arg_type);
                     let fresh = ctx.alloc_op_position_typed(arg_type);
-                    let mut op = Op::new(same_as, &[BoxRef::from_opref(orig)]);
+                    let arg0 = ctx.materialize_box_at(orig);
+                    let mut op = Op::new(same_as, &[arg0]);
                     op.pos.set(fresh);
                     // unroll.py:146 + compile.py:327 parity: accumulate the
                     // alias op in `extra_same_as` and splice it between the

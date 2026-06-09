@@ -3453,8 +3453,10 @@ impl OptUnroll {
             // unroll.py:357-359: emit JUMP to target
             let mut jump_args = target_args;
             jump_args.extend(extra);
-            let jump_args_box: Vec<BoxRef> =
-                jump_args.iter().map(|a| BoxRef::from_opref(*a)).collect();
+            let mut jump_args_box: Vec<BoxRef> = Vec::with_capacity(jump_args.len());
+            for a in &jump_args {
+                jump_args_box.push(ctx.materialize_box_at(*a));
+            }
             let mut jump = Op::new(OpCode::Jump, &jump_args_box);
             jump.setdescr(target_token.as_jump_target_descr());
             optimizer.send_extra_operation(&jump, ctx);
@@ -4358,10 +4360,10 @@ fn assemble_peeled_trace_with_jump_args(
     };
 
     if let Some(start_label_descr) = start_label_descr {
-        let start_label_args_box: Vec<BoxRef> = start_label_args
-            .iter()
-            .map(|a| BoxRef::from_opref(*a))
-            .collect();
+        let mut start_label_args_box: Vec<BoxRef> = Vec::with_capacity(start_label_args.len());
+        for a in start_label_args {
+            start_label_args_box.push(ctx.materialize_box_at(*a));
+        }
         let mut start_label = Op::new(OpCode::Label, &start_label_args_box);
         start_label.pos.set(OpRef::NONE);
         start_label.setdescr(start_label_descr);
@@ -4551,8 +4553,9 @@ fn assemble_peeled_trace_with_jump_args(
                             )
                         });
                     if tp != Type::Void {
+                        let arg_source = ctx.materialize_box_at(source);
                         let mut same_as =
-                            Op::new(OpCode::same_as_for_type(tp), &[BoxRef::from_opref(source)]);
+                            Op::new(OpCode::same_as_for_type(tp), &[arg_source]);
                         same_as.pos.set(arg);
                         fallthrough_aliases.push(same_as);
                     }
@@ -4566,10 +4569,10 @@ fn assemble_peeled_trace_with_jump_args(
         }
     }
 
-    let full_label_args_box: Vec<BoxRef> = full_label_args
-        .iter()
-        .map(|a| BoxRef::from_opref(*a))
-        .collect();
+    let mut full_label_args_box: Vec<BoxRef> = Vec::with_capacity(full_label_args.len());
+    for a in &full_label_args {
+        full_label_args_box.push(ctx.materialize_box_at(*a));
+    }
     let mut label_op = Op::new(OpCode::Label, &full_label_args_box);
     // resoperation.py:260 AbstractResOp.type = 'v' default — Label has no
     // result Box, so its OpRef position carries the Void tag rather than
@@ -4812,10 +4815,11 @@ fn assemble_peeled_trace_with_jump_args(
                 extended_args.push(mapped_arg);
                 original_args.push(BoxRef::from_opref(source_arg));
             }
-            let extended_args_box: smallvec::SmallVec<[BoxRef; 3]> = extended_args
-                .iter()
-                .map(|a| BoxRef::from_opref(*a))
-                .collect();
+            let mut extended_args_box: smallvec::SmallVec<[BoxRef; 3]> =
+                smallvec::SmallVec::with_capacity(extended_args.len());
+            for a in &extended_args {
+                extended_args_box.push(ctx.materialize_box_at(*a));
+            }
             new_op.initarglist(extended_args_box);
         }
         if new_op.opcode == OpCode::Jump {
@@ -4891,8 +4895,11 @@ fn assemble_peeled_trace_with_jump_args(
                 }
             }
             // unroll.py-style bulk replace: jump arity is finalized here.
-            let jump_args_box: smallvec::SmallVec<[BoxRef; 3]> =
-                jump_args.iter().map(|a| BoxRef::from_opref(*a)).collect();
+            let mut jump_args_box: smallvec::SmallVec<[BoxRef; 3]> =
+                smallvec::SmallVec::with_capacity(jump_args.len());
+            for a in &jump_args {
+                jump_args_box.push(ctx.materialize_box_at(*a));
+            }
             new_op.initarglist(jump_args_box);
         }
         // RPython resume.py parity: fail_args capture guard-point state

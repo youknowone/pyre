@@ -2273,10 +2273,8 @@ impl OptContext {
         } else {
             majit_ir::OpCode::Strlen
         };
-        let strlen_op = majit_ir::Op::new(
-            strlen_opcode,
-            &[crate::r#box::BoxRef::from_opref(op_resolved)],
-        );
+        let arg1 = self.materialize_box_at(op_resolved);
+        let strlen_op = majit_ir::Op::new(strlen_opcode, &[arg1]);
         let result = self.emit_extra(self.current_pass_idx, strlen_op);
         // vstring.py:116: lengthop.set_forwarded(self.getlenbound(mode))
         // `set_forwarded` writes the bound unconditionally; route through

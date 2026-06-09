@@ -1625,13 +1625,9 @@ impl OptVirtualize {
         // `vrefinfo.descr_forced` (the cached `cpu.fielddescrof(...)`
         // Arc from `virtualref.py:42`).
         if !obj_is_null {
-            let mut set_forced = Op::new(
-                OpCode::SetfieldGc,
-                &[
-                    crate::r#box::BoxRef::from_opref(vref_ref),
-                    crate::r#box::BoxRef::from_opref(obj_ref),
-                ],
-            );
+            let arg_vref = ctx.materialize_box_at(vref_ref);
+            let arg_obj = ctx.materialize_box_at(obj_ref);
+            let mut set_forced = Op::new(OpCode::SetfieldGc, &[arg_vref, arg_obj]);
             set_forced.setdescr(self.vrefinfo.descr_forced.clone());
             ctx.emit_extra(ctx.current_pass_idx, set_forced);
         }
@@ -1639,13 +1635,9 @@ impl OptVirtualize {
         // virtualize.py:155-158: set 'virtual_token' to CONST_NULL via
         // `vrefinfo.descr_virtual_token` (`virtualref.py:40-41`).
         let null_ref = ctx.emit_constant_ref(majit_ir::GcRef(0));
-        let mut set_token = Op::new(
-            OpCode::SetfieldGc,
-            &[
-                crate::r#box::BoxRef::from_opref(vref_ref),
-                crate::r#box::BoxRef::from_opref(null_ref),
-            ],
-        );
+        let arg_vref = ctx.materialize_box_at(vref_ref);
+        let arg_null = ctx.materialize_box_at(null_ref);
+        let mut set_token = Op::new(OpCode::SetfieldGc, &[arg_vref, arg_null]);
         set_token.setdescr(self.vrefinfo.descr_virtual_token.clone());
         ctx.emit_extra(ctx.current_pass_idx, set_token);
 

@@ -2079,13 +2079,9 @@ impl OptHeap {
             ctx.emit(op.clone());
             let zero_ref = ctx.make_constant_int(0);
             let cmp_pos = ctx.alloc_op_position_typed(OpCode::IntNe.result_type());
-            let mut cmp_op = Op::new(
-                OpCode::IntNe,
-                &[
-                    BoxRef::from_opref(op.pos.get()),
-                    BoxRef::from_opref(zero_ref),
-                ],
-            );
+            let cmp_arg0 = ctx.materialize_box_at(op.pos.get());
+            let cmp_arg1 = ctx.materialize_box_at(zero_ref);
+            let mut cmp_op = Op::new(OpCode::IntNe, &[cmp_arg0, cmp_arg1]);
             cmp_op.pos.set(cmp_pos);
             ctx.emit(cmp_op);
             // unroll.py:409 parity: synthetic guards inherit
@@ -2093,7 +2089,8 @@ impl OptHeap {
             // running GUARD_FUTURE_CONDITION). Without this, the guard
             // arrives at store_final_boxes_in_guard with -1 and would
             // be silently dropped under the patchguardop-only fallback.
-            let guard_op = Op::new(OpCode::GuardTrue, &[BoxRef::from_opref(cmp_pos)]);
+            let guard_arg = ctx.materialize_box_at(cmp_pos);
+            let guard_op = Op::new(OpCode::GuardTrue, &[guard_arg]);
             if let Some(ref patch) = ctx.patchguardop {
                 guard_op
                     .rd_resume_position

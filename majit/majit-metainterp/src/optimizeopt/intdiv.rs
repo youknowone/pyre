@@ -6,7 +6,6 @@
 /// UINT_MUL_HIGH + shift operations, avoiding the expensive `idiv` instruction.
 use majit_ir::{Op, OpCode, OpRef};
 
-use crate::r#box::BoxRef;
 use crate::optimizeopt::OptContext;
 
 /// Compute magic numbers for division by constant `m`.
@@ -110,73 +109,58 @@ pub fn division_operations(
     if !known_nonneg {
         // t = n >> 63
         let shift63_ref = emit_constant_int(ctx, 63);
+        let arg_n = ctx.materialize_box_at(n_ref);
+        let arg_shift63 = ctx.materialize_box_at(shift63_ref);
         let t_ref = emit_op(
             ctx,
             pass_idx,
-            Op::new(
-                OpCode::IntRshift,
-                &[BoxRef::from_opref(n_ref), BoxRef::from_opref(shift63_ref)],
-            ),
+            Op::new(OpCode::IntRshift, &[arg_n, arg_shift63]),
         );
 
         // nt = n ^ t
-        let nt_ref = emit_op(
-            ctx,
-            pass_idx,
-            Op::new(
-                OpCode::IntXor,
-                &[BoxRef::from_opref(n_ref), BoxRef::from_opref(t_ref)],
-            ),
-        );
+        let arg_n = ctx.materialize_box_at(n_ref);
+        let arg_t = ctx.materialize_box_at(t_ref);
+        let nt_ref = emit_op(ctx, pass_idx, Op::new(OpCode::IntXor, &[arg_n, arg_t]));
 
         // mul = UINT_MUL_HIGH(nt, k)
+        let arg_nt = ctx.materialize_box_at(nt_ref);
+        let arg_k = ctx.materialize_box_at(k_ref);
         let mul_ref = emit_op(
             ctx,
             pass_idx,
-            Op::new(
-                OpCode::UintMulHigh,
-                &[BoxRef::from_opref(nt_ref), BoxRef::from_opref(k_ref)],
-            ),
+            Op::new(OpCode::UintMulHigh, &[arg_nt, arg_k]),
         );
 
         // sh = UINT_RSHIFT(mul, i)
+        let arg_mul = ctx.materialize_box_at(mul_ref);
+        let arg_i = ctx.materialize_box_at(i_ref);
         let sh_ref = emit_op(
             ctx,
             pass_idx,
-            Op::new(
-                OpCode::UintRshift,
-                &[BoxRef::from_opref(mul_ref), BoxRef::from_opref(i_ref)],
-            ),
+            Op::new(OpCode::UintRshift, &[arg_mul, arg_i]),
         );
 
         // result = sh ^ t
-        emit_op(
-            ctx,
-            pass_idx,
-            Op::new(
-                OpCode::IntXor,
-                &[BoxRef::from_opref(sh_ref), BoxRef::from_opref(t_ref)],
-            ),
-        )
+        let arg_sh = ctx.materialize_box_at(sh_ref);
+        let arg_t = ctx.materialize_box_at(t_ref);
+        emit_op(ctx, pass_idx, Op::new(OpCode::IntXor, &[arg_sh, arg_t]))
     } else {
         // mul = UINT_MUL_HIGH(n, k)
+        let arg_n = ctx.materialize_box_at(n_ref);
+        let arg_k = ctx.materialize_box_at(k_ref);
         let mul_ref = emit_op(
             ctx,
             pass_idx,
-            Op::new(
-                OpCode::UintMulHigh,
-                &[BoxRef::from_opref(n_ref), BoxRef::from_opref(k_ref)],
-            ),
+            Op::new(OpCode::UintMulHigh, &[arg_n, arg_k]),
         );
 
         // result = UINT_RSHIFT(mul, i)
+        let arg_mul = ctx.materialize_box_at(mul_ref);
+        let arg_i = ctx.materialize_box_at(i_ref);
         emit_op(
             ctx,
             pass_idx,
-            Op::new(
-                OpCode::UintRshift,
-                &[BoxRef::from_opref(mul_ref), BoxRef::from_opref(i_ref)],
-            ),
+            Op::new(OpCode::UintRshift, &[arg_mul, arg_i]),
         )
     }
 }
@@ -195,23 +179,17 @@ pub fn modulo_operations(
 
     // product = div_result * m
     let m_ref = emit_constant_int(ctx, m);
-    let product_ref = emit_op(
-        ctx,
-        pass_idx,
-        Op::new(
-            OpCode::IntMul,
-            &[BoxRef::from_opref(div_ref), BoxRef::from_opref(m_ref)],
-        ),
-    );
+    let arg_div = ctx.materialize_box_at(div_ref);
+    let arg_m = ctx.materialize_box_at(m_ref);
+    let product_ref = emit_op(ctx, pass_idx, Op::new(OpCode::IntMul, &[arg_div, arg_m]));
 
     // remainder = n - product
+    let arg_n = ctx.materialize_box_at(n_ref);
+    let arg_product = ctx.materialize_box_at(product_ref);
     emit_op(
         ctx,
         pass_idx,
-        Op::new(
-            OpCode::IntSub,
-            &[BoxRef::from_opref(n_ref), BoxRef::from_opref(product_ref)],
-        ),
+        Op::new(OpCode::IntSub, &[arg_n, arg_product]),
     )
 }
 
