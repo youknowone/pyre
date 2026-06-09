@@ -3555,9 +3555,10 @@ pub fn c_uid_t_w(obj: PyObjectRef) -> Result<u32, PyError> {
 
 /// baseobjspace.py:2063 c_filedescriptor_w — an int or an object exposing
 /// a `fileno()` method (deliberately NOT an `__int__`), coerced to a
-/// non-negative C int.
+/// non-negative C int.  `isinstance_w(w_fd, w_int)` accepts a long or an
+/// int subclass as well, so the membership test is `is_int_or_long`.
 pub fn c_filedescriptor_w(obj: PyObjectRef) -> Result<i32, PyError> {
-    let w_fd = if unsafe { pyre_object::pyobject::is_int(obj) } {
+    let w_fd = if unsafe { pyre_object::pyobject::is_int_or_long(obj) } {
         obj
     } else {
         let fileno = getattr_str(obj, "fileno").map_err(|e| {
@@ -3568,7 +3569,7 @@ pub fn c_filedescriptor_w(obj: PyObjectRef) -> Result<i32, PyError> {
             }
         })?;
         let w_fd = crate::builtins::call_and_check(fileno, &[])?;
-        if unsafe { !pyre_object::pyobject::is_int(w_fd) } {
+        if unsafe { !pyre_object::pyobject::is_int_or_long(w_fd) } {
             return Err(PyError::type_error("fileno() returned a non-integer"));
         }
         w_fd

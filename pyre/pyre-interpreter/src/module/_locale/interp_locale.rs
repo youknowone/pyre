@@ -401,7 +401,11 @@ pub fn register_module(ns: &mut DictStorage) {
                     let c = std::ffi::CString::new(sv.as_bytes())
                         .map_err(|_| crate::PyError::value_error("embedded null character"))?;
                     let out = rustpython_host_env::locale::strxfrm(&c, sv.len() + 1);
-                    Ok(pyre_object::w_str_new(&String::from_utf8_lossy(&out)))
+                    // `interp_locale.py:143` returns `space.newtext(val)`; on
+                    // pyre's WTF-8 strings `charp2uni` preserves every libc
+                    // byte (surrogateescape) instead of replacing invalid
+                    // sequences with U+FFFD.
+                    Ok(crate::typedef::charp2uni(&out))
                 }
                 #[cfg(not(all(unix, feature = "host_env")))]
                 {

@@ -1041,13 +1041,18 @@ unsafe fn range_arg_to_i64(obj: PyObjectRef) -> Result<i64, crate::PyError> {
     if is_int(w_index) {
         return Ok(w_int_get_value(w_index));
     }
-    let val = w_long_get_value(w_index);
-    // `W_Range` carries `i64` bounds, so a value that overflows is
-    // clamped toward the matching extreme — a negative bound must not
-    // flip to a huge positive one (`range(-10**30)` stays empty).
-    Ok(val.to_i64().unwrap_or_else(|| match val.sign() {
-        malachite_bigint::Sign::Minus => i64::MIN,
-        _ => i64::MAX,
+    // pyre's range is i64-backed (`W_Range` keeps `start`/`stop`/`step` as
+    // i64 so the JIT can specialize `for i in range(n)` to register
+    // arithmetic), unlike PyPy's wrapped-int range.  A bound that does not
+    // fit a machine word saturates toward its own sign so a huge negative
+    // bound stays negative instead of flipping to a huge positive stop;
+    // raising here would break `range(1 << 1000)` constructions that the
+    // stdlib (`_collections_abc`) performs without ever materializing the
+    // value.
+    let big = w_long_get_value(w_index);
+    Ok(big.to_i64().unwrap_or_else(|| {
+        use num_traits::Signed;
+        if big.is_negative() { i64::MIN } else { i64::MAX }
     }))
 }
 

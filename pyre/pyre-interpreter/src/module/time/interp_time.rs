@@ -782,6 +782,32 @@ pub fn gmtime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     Ok(_tm_to_tuple(&tm))
 }
 
+/// interp_time.py:861-879 `_checktm` — guard the C-adjusted `struct tm`
+/// fields that strftime()/asctime() index, so a bad value raises a
+/// ValueError instead of letting libc index out of bounds.  Year and
+/// wday are already handled in `_gettmarg`.
+fn _checktm(tm: &c_tm) -> Result<(), crate::PyError> {
+    if !(0..=11).contains(&tm.tm_mon) {
+        return Err(crate::PyError::value_error("month out of range"));
+    }
+    if !(1..=31).contains(&tm.tm_mday) {
+        return Err(crate::PyError::value_error("day of month out of range"));
+    }
+    if !(0..=23).contains(&tm.tm_hour) {
+        return Err(crate::PyError::value_error("hour out of range"));
+    }
+    if !(0..=59).contains(&tm.tm_min) {
+        return Err(crate::PyError::value_error("minute out of range"));
+    }
+    if !(0..=61).contains(&tm.tm_sec) {
+        return Err(crate::PyError::value_error("seconds out of range"));
+    }
+    if !(0..=365).contains(&tm.tm_yday) {
+        return Err(crate::PyError::value_error("day of year out of range"));
+    }
+    Ok(())
+}
+
 /// time.strftime(format[, tuple]) — interp_time.strftime
 pub fn strftime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let fmt = args
@@ -790,6 +816,7 @@ pub fn strftime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         .ok_or_else(|| crate::PyError::type_error("strftime() requires at least one argument"))?;
 
     let tm = _gettmarg(&args[1..], true)?;
+    _checktm(&tm)?;
 
     let fmt_str = unsafe {
         if !is_str(fmt) {
@@ -907,6 +934,7 @@ pub fn mktime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 /// time.asctime([tuple]) — interp_time.asctime
 pub fn asctime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let tm = _gettmarg(args, true)?;
+    _checktm(&tm)?;
     _asctime_from_tm(&tm)
 }
 
