@@ -4414,7 +4414,7 @@ impl CodeWriter {
         // `link.args` mentions `link.last_exception`.
         macro_rules! emit_last_exception {
             ($dst:expr) => {{
-                let _dst = $dst;
+                let _ = $dst;
             }};
         }
 
@@ -4426,7 +4426,7 @@ impl CodeWriter {
         // register.
         macro_rules! emit_last_exc_value {
             ($dst:expr) => {{
-                let _dst = $dst;
+                let _ = $dst;
             }};
         }
 
@@ -4497,7 +4497,7 @@ impl CodeWriter {
         // bytecode key.
         macro_rules! emit_ref_return {
             ($src:expr, $retval:expr) => {{
-                let _src = $src;
+                let _ = $src;
                 let retval = $retval;
                 // attach the return edge to
                 // `graph.returnblock` (`model.py:18`). The return value
@@ -4526,7 +4526,7 @@ impl CodeWriter {
                 // `flatten.py:161 self.emitline('goto',
                 // TLabel(link.target))` where `link.target` is a Block
                 // identity, not a PC.
-                let _target_block = mergeblock(
+                let _ = mergeblock(
                     code,
                     &mut graph,
                     &mut joinpoints,
@@ -4611,7 +4611,7 @@ impl CodeWriter {
         // expects.
         macro_rules! emit_raise {
             ($src:expr, $evalue:expr, $offset:expr, $try_catch_adjacency:expr) => {{
-                let _src = $src;
+                let _ = $src;
                 let evalue_fv: super::flow::FlowValue = $evalue;
                 let offset = $offset;
                 let try_catch_adjacency: bool = $try_catch_adjacency;
@@ -5055,14 +5055,14 @@ impl CodeWriter {
         // arranged as `linkfalse`, not by changing the opcode.
         macro_rules! emit_goto_if_not {
             ($cond:expr, $py_pc:expr) => {{
-                let _cond = $cond;
+                let _ = $cond;
                 let py_pc = $py_pc;
                 // mergeblock establishes the linkfalse edge (`append_exit`)
                 // and queues the target block.  `flatten.py:240-267`
                 // linkfalse mergeblock.  The bare `-live-` before the guard
                 // and the `goto_if_not` op itself are produced by the
                 // canonical splice (`flatten.rs:1888`) from the graph.
-                let _target_block = mergeblock(
+                let _ = mergeblock(
                     code,
                     &mut graph,
                     &mut joinpoints,
@@ -5081,14 +5081,14 @@ impl CodeWriter {
         }
         macro_rules! emit_goto_if_not_int_is_zero {
             ($cond:expr, $py_pc:expr) => {{
-                let _cond = $cond;
+                let _ = $cond;
                 let py_pc = $py_pc;
                 // mergeblock establishes the linkfalse edge (`append_exit`).
                 // `flatten.py:247` `goto_if_not_int_is_zero` shape is
                 // identical to `goto_if_not` save for the opname.  The bare
                 // `-live-` and the guard op are produced by the canonical
                 // splice from the graph.
-                let _target_block = mergeblock(
+                let _ = mergeblock(
                     code,
                     &mut graph,
                     &mut joinpoints,
@@ -5201,7 +5201,7 @@ impl CodeWriter {
         // optimizer port progresses.
         macro_rules! emit_pushvalue_ref {
             ($depth:ident, $src:expr, $src_value:expr, $py_pc:expr) => {{
-                let _src_reg = $src;
+                let _ = $src;
                 let src_value: super::flow::FlowValue = $src_value;
                 let pushvalue_ref_py_pc: i64 = ($py_pc) as i64;
                 if is_portal {
@@ -5903,15 +5903,12 @@ impl CodeWriter {
                             current_depth -= 1;
                             emit_vsd!(current_depth, py_pc);
                             let key_value = pop_ref_or_fresh(&mut current_state, &mut graph);
-                            let _key_reg = stack_base + current_depth;
                             current_depth -= 1;
                             emit_vsd!(current_depth, py_pc);
                             let obj_value = pop_ref_or_fresh(&mut current_state, &mut graph);
-                            let _obj_reg = stack_base + current_depth;
                             current_depth -= 1;
                             emit_vsd!(current_depth, py_pc);
                             let stored_value = pop_ref_or_fresh(&mut current_state, &mut graph);
-                            let _value_reg = stack_base + current_depth;
                             emit_frontend_setitem(
                                 &mut graph,
                                 &current_block.block(),
@@ -5949,14 +5946,14 @@ impl CodeWriter {
                         // `memory/pyre_trace_temp_reg_tracking_gap_2026_04_19.md`.
                         Instruction::BinaryOp { op } => {
                             let op_kind = op.get(op_arg);
-                            let _op_val = binary_op_tag(op_kind)
+                            let _ = binary_op_tag(op_kind)
                                 .expect("unsupported binary op tag in jitcode lowering")
                                 as i64;
                             // Pop rhs (blackhole will see vsd reflect this pop).
-                            let _rhs_reg = emit_popvalue_ref!(current_depth, py_pc);
+                            let _ = emit_popvalue_ref!(current_depth, py_pc);
                             let rhs_value = pop_ref_or_fresh(&mut current_state, &mut graph);
                             // Pop lhs.
-                            let _lhs_reg = emit_popvalue_ref!(current_depth, py_pc);
+                            let _ = emit_popvalue_ref!(current_depth, py_pc);
                             let lhs_value = pop_ref_or_fresh(&mut current_state, &mut graph);
                             let result_value = emit_frontend_binary(
                                 &mut graph,
@@ -5974,10 +5971,10 @@ impl CodeWriter {
                         Instruction::CompareOp { opname } => {
                             // Same stack-direct pattern as BinaryOp — see its comment.
                             let op_kind = opname.get(op_arg);
-                            let _op_val = compare_op_tag(op_kind);
-                            let _rhs_reg = emit_popvalue_ref!(current_depth, py_pc);
+                            let _ = compare_op_tag(op_kind);
+                            let _ = emit_popvalue_ref!(current_depth, py_pc);
                             let rhs_value = pop_ref_or_fresh(&mut current_state, &mut graph);
-                            let _lhs_reg = emit_popvalue_ref!(current_depth, py_pc);
+                            let _ = emit_popvalue_ref!(current_depth, py_pc);
                             let lhs_value = pop_ref_or_fresh(&mut current_state, &mut graph);
                             let result_value = emit_frontend_compare(
                                 &mut graph,
@@ -6211,11 +6208,11 @@ impl CodeWriter {
                             // `SpaceOperation('load_global', ...)` at the graph
                             // level. Keep that graph shape; the residual helper
                             // below is walker/backend adaptation only.
-                            let _scratch_ns = ssarepr.fresh_var(Kind::Ref, scratch_ref_base).0;
+                            let _ = ssarepr.fresh_var(Kind::Ref, scratch_ref_base).0;
                             let null_offset: u16 = if raw_namei & 1 != 0 { 1 } else { 0 };
                             let loaded_dst_reg = stack_base + current_depth + null_offset;
                             if is_portal {
-                                let _scratch_code = ssarepr.fresh_var(Kind::Ref, scratch_ref_base).0;
+                                let _ = ssarepr.fresh_var(Kind::Ref, scratch_ref_base).0;
                             }
                             let name_idx = raw_namei as usize >> 1;
                             let result_value = code
@@ -6320,7 +6317,7 @@ impl CodeWriter {
                             if nargs > 8 {
                                 emit_abort_permanent!();
                             } else {
-                                let _fn_idx = match nargs {
+                                let _ = match nargs {
                                     0 => call_fn_0_idx,
                                     1 => call_fn_idx,
                                     2 => call_fn_2_idx,
@@ -6408,7 +6405,7 @@ impl CodeWriter {
 
                         // RPython bhimpl_int_neg: -obj via binary_op(0, obj, NB_SUBTRACT)
                         Instruction::UnaryNegative => {
-                            let _operand_reg = emit_popvalue_ref!(current_depth, py_pc);
+                            let _ = emit_popvalue_ref!(current_depth, py_pc);
                             let operand_value = pop_ref_or_fresh(&mut current_state, &mut graph);
                             let operand_value_for_dual = operand_value.clone();
                             let negated = emit_frontend_neg(
@@ -6507,7 +6504,7 @@ impl CodeWriter {
                                 arg_regs_rev.push(item_reg);
                                 item_values_rev.push(item_value);
                             }
-                            let _arg_regs: Vec<u16> = arg_regs_rev.iter().rev().copied().collect();
+                            let _: Vec<u16> = arg_regs_rev.iter().rev().copied().collect();
                             // build_list_fn(argc, item0, item1, item2) → list. The C ABI is
                             // `extern "C" fn(i64, i64, i64, i64)`; the helper dispatches
                             // internally by `argc`, so unused item slots may be any
@@ -6561,11 +6558,10 @@ impl CodeWriter {
                             } else {
                                 None
                             };
-                            let _stop_reg = emit_popvalue_ref!(current_depth, py_pc);
+                            let _ = emit_popvalue_ref!(current_depth, py_pc);
                             let stop_value = pop_ref_or_fresh(&mut current_state, &mut graph);
-                            let _start_reg = emit_popvalue_ref!(current_depth, py_pc);
+                            let _ = emit_popvalue_ref!(current_depth, py_pc);
                             let start_value = pop_ref_or_fresh(&mut current_state, &mut graph);
-                            let _step_reg = step_info.as_ref().map(|(reg, _)| *reg);
                             let result_value = emit_frontend_buildslice_shadow_graph(
                                 &mut graph,
                                 &current_block.block(),
@@ -6706,7 +6702,7 @@ impl CodeWriter {
                             // the interpreter; pushing `None` for `prev` breaks
                             // nested exception state (pyopcode.py:786 saves the
                             // previous sys_exc_info so `POP_EXCEPT` can restore it).
-                            let _exc_reg = emit_popvalue_ref!(current_depth, py_pc);
+                            let _ = emit_popvalue_ref!(current_depth, py_pc);
                             let exc_value = pop_ref_or_fresh(&mut current_state, &mut graph);
                             // PUSH_EXC_INFO is pyre-specific (rustpython 3.11+;
                             // no PyPy counterpart).  In the canonical splice the
@@ -6840,9 +6836,8 @@ impl CodeWriter {
                             // time, but pyre's shadow graph cannot observe the
                             // runtime exception type; the residual helper owns
                             // the check.
-                            let _match_type_reg = emit_popvalue_ref!(current_depth, py_pc);
+                            let _ = emit_popvalue_ref!(current_depth, py_pc);
                             let match_type_value = pop_ref_or_fresh(&mut current_state, &mut graph);
-                            let _exc_reg = stack_base + current_depth - 1;
                             // Peek (don't pop) the exception value for the graph
                             // dual-write — net stack effect is zero (pop match
                             // type, peek exception, push bool result).
@@ -6896,7 +6891,7 @@ impl CodeWriter {
                             // `POP_EXCEPT` the outer handler's exception must be
                             // reinstated as the "current" one so a bare `raise`
                             // re-propagates it.
-                            let _prev_reg = emit_popvalue_ref!(current_depth, py_pc);
+                            let _ = emit_popvalue_ref!(current_depth, py_pc);
                             let prev_value = pop_ref_or_fresh(&mut current_state, &mut graph);
                             // set_current_exception is a TLS write — EF_CANNOT_RAISE.
                             // PopExcept
@@ -7136,13 +7131,13 @@ impl CodeWriter {
                             // reuse the popped stack slots) cannot clobber it; this
                             // residual threading is walker-stream-only — the canonical
                             // splice owns the production lowering via `insert_renamings`.
-                            let _seq_reg = emit_popvalue_ref!(current_depth, py_pc);
-                            let _seq_value = pop_ref_or_fresh(&mut current_state, &mut graph);
-                            let _seq_scratch = ssarepr.fresh_var(Kind::Ref, scratch_ref_base).0;
+                            let _ = emit_popvalue_ref!(current_depth, py_pc);
+                            let _ = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            let _ = ssarepr.fresh_var(Kind::Ref, scratch_ref_base).0;
                             // unpack_sequence_fn(n, seq) → tuple of exactly n items;
                             // raises ValueError/TypeError on length mismatch or a
                             // non-sequence, matching opcode_unpack_sequence.
-                            let _tuple_scratch = ssarepr.fresh_var(Kind::Ref, scratch_ref_base).0;
+                            let _ = ssarepr.fresh_var(Kind::Ref, scratch_ref_base).0;
                             // Push the items in reverse so the stack top is item[0]
                             // (opcode_unpack_sequence pushes `items.into_iter().rev()`).
                             for _k in (0..n).rev() {
@@ -7318,7 +7313,7 @@ impl CodeWriter {
                                 arg_regs_rev.push(item_reg);
                                 item_values_rev.push(item_value);
                             }
-                            let _arg_regs: Vec<u16> = arg_regs_rev.iter().rev().copied().collect();
+                            let _: Vec<u16> = arg_regs_rev.iter().rev().copied().collect();
                             let result_value = emit_frontend_newtuple(
                                 &mut graph,
                                 &current_block.block(),
