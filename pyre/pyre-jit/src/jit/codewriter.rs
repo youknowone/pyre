@@ -5456,6 +5456,7 @@ impl CodeWriter {
                 truth_fn_idx,
                 store_subscr_fn_idx,
                 build_list_fn_idx,
+                build_tuple_fn_idx,
                 // `[u16; 9]` indexed by nargs (0..=8) per
                 // [[feedback-no-hashmap-ever]].  `call_fn_idx` (nargs=1)
                 // is the unsuffixed binding from line 3153; the suffixed

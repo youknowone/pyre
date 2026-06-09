@@ -3089,6 +3089,14 @@ pub struct LoweringContext {
     /// `abort_permanent` instead, so the canonical lowering arm
     /// returns `None` (passthrough) on argc > 3.
     pub build_list_fn_idx: u16,
+    /// `bind(assembler, cpu.build_tuple_fn as *const (),
+    /// CallFlavor::Plain)` descrs-pool index for the production source.
+    /// BUILD_TUPLE (single HLOp opname `newtuple`) lowers to the SAME
+    /// `residual_call_ir_r` shape as `newlist` (the IR builder is
+    /// fn-index agnostic, codewriter.rs:9518-9537), so
+    /// [`lower_new_sequence_hlop_to_insn`] selects this index by opname.
+    /// Same argc ≤ 3 walker contract as `newlist`.
+    pub build_tuple_fn_idx: u16,
     /// `call_fn_N` descrs-pool indices for nargs ∈ 0..=8 — see
     /// codewriter.rs:3206-3245 for the production source.  CALL
     /// (single HLOp opname `simple_call`) lowers to
@@ -3828,8 +3836,8 @@ pub fn build_build_list_fn_residual_call_ir_r_insn(
 /// Operand-flexible variant of `build_build_list_fn_residual_call_ir_r_insn`.
 /// Each item slot can be a `Register` (resolved Variable) OR a `Const*`
 /// (lowered Constant via `flatten_arg`'s Constant arm).  Used by the
-/// canonical driver's `lower_newlist_hlop_to_insn` to handle graph
-/// `newlist` HLOps whose items are Constants — upstream RPython's
+/// canonical driver's `lower_new_sequence_hlop_to_insn` to handle graph
+/// `newlist`/`newtuple` HLOps whose items are Constants — upstream RPython's
 /// rtype pass would have pre-loaded these into Variables, but pyre's
 /// graph carries the un-rewritten Constants per
 /// [[project-flatten-graph-canonical-driver-2026-05-17]].
@@ -4166,7 +4174,7 @@ where
     if let Some(insn) = lower_setitem_hlop_to_insn(op, ctx, get_register, lower_constant) {
         return Some(insn);
     }
-    if let Some(insn) = lower_newlist_hlop_to_insn(op, ctx, get_register, lower_constant) {
+    if let Some(insn) = lower_new_sequence_hlop_to_insn(op, ctx, get_register, lower_constant) {
         return Some(insn);
     }
     if let Some(insn) = lower_simple_call_hlop_to_insn(op, ctx, get_register, lower_constant) {
@@ -4245,24 +4253,31 @@ where
     ))
 }
 
-/// Lower a BUILD_LIST-family pre-rtype HLOp `newlist(items)` →
-/// `result: Ref` to the equivalent post-rtype `residual_call_ir_r(
-/// ConstInt(build_list_fn_idx), ListI([argc, dummies]),
-/// ListR([item_regs]), Descr) → reg` Insn.  Mirrors the inline
-/// emit at codewriter.rs:6390-6398
+/// Lower a BUILD_LIST / BUILD_TUPLE-family pre-rtype HLOp
+/// `newlist(items)` / `newtuple(items)` → `result: Ref` to the
+/// equivalent post-rtype `residual_call_ir_r(ConstInt(fn_idx),
+/// ListI([argc, dummies]), ListR([item_regs]), Descr) → reg` Insn.
+/// Mirrors the inline emit at codewriter.rs:6390-6398
 /// (`push_walker_emit(build_build_list_fn_residual_call_ir_r_insn)`)
-/// which pads unused item slots with `ConstInt(0)`.
+/// which pads unused item slots with `ConstInt(0)`.  The fn-pool index
+/// is selected by opname: `newlist` → `build_list_fn_idx`, `newtuple`
+/// → `build_tuple_fn_idx`.  BUILD_TUPLE lowers to the SAME
+/// `residual_call_ir_r` shape as BUILD_LIST — the IR builder is
+/// fn-index agnostic, so the BuildTuple walker arm reuses
+/// `build_build_list_fn_residual_call_ir_r_insn` — differing only in
+/// the helper fn pointer.
 ///
-/// Walker contract: `emit_frontend_newlist` only fires for argc ≤ 3
-/// (codewriter.rs:6332-6346 — argc > 3 takes the `abort_permanent`
-/// branch which does NOT record a `newlist` HLOp on the graph), so a
-/// graph-side `newlist` with argc > 3 indicates a walker non-orthodoxy;
-/// return `None` (passthrough) rather than asserting, matching the
-/// other lowering arms' "no match → passthrough" pattern.
+/// Walker contract: `emit_frontend_newlist` / `emit_frontend_newtuple`
+/// only fire for argc ≤ 3 (codewriter.rs:6332-6346 / the BuildTuple
+/// arm — argc > 3 takes the `abort_permanent` branch which does NOT
+/// record the HLOp on the graph), so a graph-side `newlist`/`newtuple`
+/// with argc > 3 indicates a walker non-orthodoxy; return `None`
+/// (passthrough) rather than asserting, matching the other lowering
+/// arms' "no match → passthrough" pattern.
 ///
-/// Returns `None` for non-`newlist` opnames so the caller can fall
-/// through to other lowering arms.
-pub fn lower_newlist_hlop_to_insn<F, LC>(
+/// Returns `None` for opnames other than `newlist`/`newtuple` so the
+/// caller can fall through to other lowering arms.
+pub fn lower_new_sequence_hlop_to_insn<F, LC>(
     op: &super::flow::SpaceOperation,
     ctx: &LoweringContext,
     get_register: &mut F,
@@ -4272,9 +4287,11 @@ where
     F: FnMut(super::flow::Variable) -> Register,
     LC: FnMut(&Constant) -> Operand,
 {
-    if op.opname != "newlist" {
-        return None;
-    }
+    let fn_idx = match op.opname.as_str() {
+        "newlist" => ctx.build_list_fn_idx,
+        "newtuple" => ctx.build_tuple_fn_idx,
+        _ => return None,
+    };
     let argc = op.args.len();
     if argc > 3 {
         return None;
@@ -4304,7 +4321,7 @@ where
         _ => return None,
     };
     Some(build_build_list_fn_residual_call_ir_r_insn_from_operands(
-        ctx.build_list_fn_idx,
+        fn_idx,
         argc,
         item_operands,
         dst_reg,
@@ -5501,6 +5518,7 @@ mod tests {
             truth_fn_idx: 17,
             store_subscr_fn_idx: 19,
             build_list_fn_idx: 0,
+            build_tuple_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
         };
         let mut on = SSARepr::new("setattr_on");
@@ -5631,6 +5649,7 @@ mod tests {
             truth_fn_idx: 17,
             store_subscr_fn_idx: 19,
             build_list_fn_idx: 0,
+            build_tuple_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
         };
 
@@ -5748,6 +5767,7 @@ mod tests {
             truth_fn_idx: 17,
             store_subscr_fn_idx: 19,
             build_list_fn_idx: 0,
+            build_tuple_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
         };
 
@@ -5828,6 +5848,7 @@ mod tests {
             truth_fn_idx: 17,
             store_subscr_fn_idx: 19,
             build_list_fn_idx: 0,
+            build_tuple_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
         };
 
@@ -5952,6 +5973,7 @@ mod tests {
             truth_fn_idx: 17,
             store_subscr_fn_idx: 19,
             build_list_fn_idx: 0,
+            build_tuple_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
         };
 
@@ -6121,6 +6143,7 @@ mod tests {
             truth_fn_idx: 17,
             store_subscr_fn_idx: 19,
             build_list_fn_idx: 0,
+            build_tuple_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
         });
 
@@ -6339,6 +6362,7 @@ mod tests {
             truth_fn_idx: 0,
             store_subscr_fn_idx: 0,
             build_list_fn_idx: 0,
+            build_tuple_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
         };
         let mut get_register = identity_register_mapper();
@@ -6423,6 +6447,7 @@ mod tests {
             truth_fn_idx: 0,
             store_subscr_fn_idx: 0,
             build_list_fn_idx: 0,
+            build_tuple_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
         };
         let mut get_register = identity_register_mapper();
@@ -6451,6 +6476,7 @@ mod tests {
             truth_fn_idx: 0,
             store_subscr_fn_idx: 0,
             build_list_fn_idx: 0,
+            build_tuple_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
         };
 
@@ -6547,6 +6573,7 @@ mod tests {
             truth_fn_idx: 0,
             store_subscr_fn_idx: 0,
             build_list_fn_idx: 0,
+            build_tuple_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
         };
         let mut get_register = identity_register_mapper();
@@ -6607,6 +6634,7 @@ mod tests {
             truth_fn_idx: 0,
             store_subscr_fn_idx: 0,
             build_list_fn_idx: 0,
+            build_tuple_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
         };
         let mut get_register = identity_register_mapper();
@@ -6633,6 +6661,7 @@ mod tests {
             truth_fn_idx: 0,
             store_subscr_fn_idx: 0,
             build_list_fn_idx: 0,
+            build_tuple_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
         };
         let hlop = SpaceOperation::new("eq", vec![lhs.into(), rhs.into()], Some(result.into()), 0);
@@ -6666,6 +6695,7 @@ mod tests {
             truth_fn_idx: 23,
             store_subscr_fn_idx: 0,
             build_list_fn_idx: 0,
+            build_tuple_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
         };
         let mut get_register = identity_register_mapper();
@@ -6726,6 +6756,7 @@ mod tests {
             truth_fn_idx: 23,
             store_subscr_fn_idx: 0,
             build_list_fn_idx: 0,
+            build_tuple_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
         };
         let mut get_register = identity_register_mapper();
@@ -6749,6 +6780,7 @@ mod tests {
             truth_fn_idx: 31,
             store_subscr_fn_idx: 0,
             build_list_fn_idx: 0,
+            build_tuple_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
         };
         let hlop = SpaceOperation::new("bool", vec![cond.into()], Some(result.into()), 0);
@@ -6786,6 +6818,7 @@ mod tests {
             truth_fn_idx: 0,
             store_subscr_fn_idx: 41,
             build_list_fn_idx: 0,
+            build_tuple_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
         };
         let mut get_register = identity_register_mapper();
@@ -6839,6 +6872,7 @@ mod tests {
             truth_fn_idx: 0,
             store_subscr_fn_idx: 41,
             build_list_fn_idx: 0,
+            build_tuple_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
         };
         let mut get_register = identity_register_mapper();
@@ -6877,6 +6911,7 @@ mod tests {
             truth_fn_idx: 0,
             store_subscr_fn_idx: 53,
             build_list_fn_idx: 0,
+            build_tuple_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
         };
         let hlop = SpaceOperation::new(
@@ -6910,6 +6945,7 @@ mod tests {
             truth_fn_idx: 31,
             store_subscr_fn_idx: 53,
             build_list_fn_idx: 0,
+            build_tuple_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
         };
         let mut get_register_a = identity_register_mapper();
@@ -6939,6 +6975,7 @@ mod tests {
             truth_fn_idx: 31,
             store_subscr_fn_idx: 53,
             build_list_fn_idx: 0,
+            build_tuple_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
         };
         let mut get_register_a = identity_register_mapper();
@@ -6968,6 +7005,7 @@ mod tests {
             truth_fn_idx: 31,
             store_subscr_fn_idx: 53,
             build_list_fn_idx: 0,
+            build_tuple_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
         };
         let mut get_register_a = identity_register_mapper();
@@ -7002,6 +7040,7 @@ mod tests {
             truth_fn_idx: 31,
             store_subscr_fn_idx: 53,
             build_list_fn_idx: 0,
+            build_tuple_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
         };
         let mut get_register_a = identity_register_mapper();
@@ -7050,6 +7089,7 @@ mod tests {
             truth_fn_idx: 31,
             store_subscr_fn_idx: 53,
             build_list_fn_idx: 0,
+            build_tuple_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
         };
         let mut get_register_a = identity_register_mapper();
@@ -8409,6 +8449,7 @@ mod tests {
             truth_fn_idx: 0,
             store_subscr_fn_idx: 0,
             build_list_fn_idx: 0,
+            build_tuple_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
         };
         flatten_graph_for_test_with_lowering(&graph, &mut ssarepr, ctx, Some(cpu));
@@ -8679,6 +8720,7 @@ mod tests {
             truth_fn_idx: 0,
             store_subscr_fn_idx: 0,
             build_list_fn_idx: 0,
+            build_tuple_fn_idx: 0,
             call_fn_idx_by_nargs,
         };
         let op = super::super::flow::SpaceOperation::new(
