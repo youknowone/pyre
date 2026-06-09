@@ -860,7 +860,7 @@ impl VirtualState {
                             .as_ref()
                             .and_then(|info| info.getfield(*field_idx))
                             .and_then(|e| e.as_opref())
-                            .map(|f| ctx.get_box_replacement(f).to_opref())
+                            .map(|f| ctx.get_replacement_opref(f))
                             .unwrap_or(OpRef::NONE)
                     })
                     .collect();
@@ -1011,7 +1011,7 @@ impl VirtualState {
                 //             else:
                 //                 raise VirtualStatesCantMatch
                 //     boxes[self.position_in_notvirtuals] = box
-                let resolved = ctx.get_box_replacement(opref).to_opref();
+                let resolved = ctx.get_replacement_opref(opref);
                 let forced = match ctx
                     .get_box_replacement_box(opref)
                     .as_ref()
@@ -1039,7 +1039,7 @@ impl VirtualState {
                      assigned by enum_top_level"
                 );
                 let slot = slot_i32 as usize;
-                let resolved_for_store = ctx.get_box_replacement(forced).to_opref();
+                let resolved_for_store = ctx.get_replacement_opref(forced);
                 // virtualstate.py:417 NotVirtualStateInfo{Int,Ptr}: Box.type
                 // immutability. RPython dispatches `isinstance(self,
                 // NotVirtualStateInfoInt)` vs `NotVirtualStateInfoPtr` on a
@@ -2493,7 +2493,7 @@ fn export_single_value(
     // distinct field-side OpRefs that resolve to the same forwarded box
     // would each receive their own Rc, breaking the dedup invariant
     // `enum_forced_boxes` and RPython matching rely on.
-    let opref = ctx.get_box_replacement(opref).to_opref();
+    let opref = ctx.get_replacement_opref(opref);
     // virtualstate.py:714-716: cache hit returns the cached state directly.
     if let Some(cached) = cache.finished.get(&opref) {
         return Rc::clone(cached);
