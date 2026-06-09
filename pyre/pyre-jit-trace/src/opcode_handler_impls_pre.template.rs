@@ -85,8 +85,19 @@ impl pyre_interpreter::SharedOpcodeHandler for crate::state::MIFrame {
         let concrete_callable = callable.concrete.to_pyobj();
         let concrete_args: Vec<pyre_object::PyObjectRef> =
             args.iter().map(|a| a.concrete.to_pyobj()).collect();
+        let args_available =
+            !concrete_callable.is_null() && concrete_args.iter().all(|v| !v.is_null());
         let mut result_concrete = crate::state::ConcreteValue::Null;
-        if !concrete_callable.is_null() && concrete_args.iter().all(|v| !v.is_null()) {
+        // Builtin callees cannot be inlined; compute their concrete result up
+        // front (no trace-through path exists for them).
+        let is_user_fn = args_available
+            && unsafe {
+                pyre_interpreter::is_function(concrete_callable)
+                    && !pyre_interpreter::is_builtin_code(
+                        pyre_interpreter::getcode(concrete_callable) as pyre_object::PyObjectRef,
+                    )
+            };
+        if args_available && !is_user_fn {
             unsafe {
                 if pyre_interpreter::is_function(concrete_callable)
                     && pyre_interpreter::is_builtin_code(
@@ -100,27 +111,6 @@ impl pyre_interpreter::SharedOpcodeHandler for crate::state::MIFrame {
                     );
                     let result = func(&concrete_args).unwrap_or(pyre_object::PY_NULL);
                     result_concrete = crate::state::ConcreteValue::from_pyobj(result);
-                } else if pyre_interpreter::is_function(concrete_callable) {
-                    // pyjitpl.py:2025 concrete execution only.
-                    use std::cell::Cell;
-                    thread_local! {
-                        static CONCRETE_CALL_DEPTH: Cell<u32> = Cell::new(0);
-                    }
-                    let depth = CONCRETE_CALL_DEPTH.with(|d| d.get());
-                    if depth < 32 {
-                        CONCRETE_CALL_DEPTH.with(|d| d.set(depth + 1));
-                        let exec_ctx = self.sym().concrete_execution_context;
-                        let result =
-                            pyre_interpreter::call::call_user_function_plain_with_ctx(
-                                exec_ctx,
-                                concrete_callable,
-                                &concrete_args,
-                            );
-                        CONCRETE_CALL_DEPTH.with(|d| d.set(depth));
-                        if let Ok(result) = result {
-                            result_concrete = crate::state::ConcreteValue::from_pyobj(result);
-                        }
-                    }
                 }
             }
         }
@@ -131,6 +121,40 @@ impl pyre_interpreter::SharedOpcodeHandler for crate::state::MIFrame {
             concrete_callable,
             &concrete_args,
         )?;
+        // pyjitpl.py:2025 concrete execution only — for residual calls.
+        //
+        // RPython decides perform_call (inline) vs do_residual_call BEFORE
+        // executing, and only residual calls run the callee as a whole; an
+        // inlined callee is traced through and its concrete values come from
+        // the inline framestack. Pyre's snapshot trace shares the heap with
+        // the interpreter that re-runs this iteration, so executing a callee
+        // here commits its heap side effects, and the re-run repeats them
+        // (issue #143). Mirror RPython: skip the whole-callee execution when
+        // `call_callable_value` chose to inline (pending_inline_frame set) —
+        // the inline frame's per-opcode concrete steps defer stores like the
+        // root tracer does.
+        if is_user_fn && self.pending_inline_frame.is_none() {
+            unsafe {
+                use std::cell::Cell;
+                thread_local! {
+                    static CONCRETE_CALL_DEPTH: Cell<u32> = Cell::new(0);
+                }
+                let depth = CONCRETE_CALL_DEPTH.with(|d| d.get());
+                if depth < 32 {
+                    CONCRETE_CALL_DEPTH.with(|d| d.set(depth + 1));
+                    let exec_ctx = self.sym().concrete_execution_context;
+                    let result = pyre_interpreter::call::call_user_function_plain_with_ctx(
+                        exec_ctx,
+                        concrete_callable,
+                        &concrete_args,
+                    );
+                    CONCRETE_CALL_DEPTH.with(|d| d.set(depth));
+                    if let Ok(result) = result {
+                        result_concrete = crate::state::ConcreteValue::from_pyobj(result);
+                    }
+                }
+            }
+        }
         Ok(crate::state::FrontendOp::new(opref, result_concrete))
     }
 
