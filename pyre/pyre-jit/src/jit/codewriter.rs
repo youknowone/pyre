@@ -789,23 +789,6 @@ fn emit_ref_copy(current_block: &SpamBlockRef, dst: u16, src: u16) {
     }
 }
 
-fn emit_vable_getfield_ref_walker_only(
-    current_block: &SpamBlockRef,
-    vable_reg: u16,
-    dst: u16,
-    field_idx: u16,
-) {
-    let insn = Insn::op_with_result(
-        "getfield_vable_r",
-        vec![
-            Operand::reg(Kind::Ref, vable_reg),
-            Operand::descr_vable_static_field(field_idx),
-        ],
-        Register::new(Kind::Ref, dst),
-    );
-    push_walker_emit(current_block, insn);
-}
-
 /// Build-side liveness resolver: derive, from an SSARepr's OWN
 /// `-live-` markers + `pc_first_insn_pos`, the per-Python-PC PRE-MERGE
 /// `-live-` marker index that `compute_liveness_with_pc_anchors` consumes
@@ -5336,7 +5319,6 @@ impl CodeWriter {
         // canonical `[v_inst, ... descr]` operand shape.
         macro_rules! emit_vable_getfield_ref {
             ($vable_reg:expr, $dst:expr, $field_idx:expr) => {{
-                let vable_reg: u16 = $vable_reg;
                 let dst = $dst;
                 let field_idx: u16 = $field_idx;
                 // `jtransform.py:846-847` getfield: `[v_inst, descr]` → result.
@@ -5345,7 +5327,6 @@ impl CodeWriter {
                 // `BlackholeInterpreter::fill_portal_registers` at portal
                 // entry and encoded by the assembler as the canonical
                 // leading `r` operand.
-                emit_vable_getfield_ref_walker_only(&current_block, vable_reg, dst, field_idx);
                 // Graph dual-write threads `frame_var.into()`.  `frame_var`
                 // is a startblock inputarg for both portal and non-portal
                 // graphs
@@ -6315,14 +6296,6 @@ impl CodeWriter {
                             // portal `portal_frame_reg` would otherwise alias
                             // the caller's frame and read the wrong pycode.
                             if is_portal {
-                                emit_vable_getfield_ref_walker_only(
-                                    &current_block,
-                                    portal_frame_reg,
-                                    dst_slot,
-                                    VABLE_CODE_FIELD_IDX,
-                                );
-                            }
-                            if is_portal {
                                 push_walker_emit(
                                     &current_block,
                                     super::flatten::build_load_const_fn_residual_call_ir_r_insn(
@@ -6887,21 +6860,6 @@ impl CodeWriter {
                             // level. Keep that graph shape; the residual helper
                             // below is walker/backend adaptation only.
                             let scratch_ns = ssarepr.fresh_var(Kind::Ref, scratch_ref_base).0;
-                            // Walker-side getfield_vable_r for w_globals
-                            // (field 5) — the namespace for the lookup.  Do not
-                            // dual-write into the graph: RPython flowspace's
-                            // LOAD_GLOBAL path has already folded the value to a
-                            // Constant.  `w_globals` stays a register read: its
-                            // traced GetfieldVableR form is what the optimizer
-                            // matches in the known-result cache, so a ConstRef
-                            // would break that fold (see
-                            // `compile_jitcode_for_callee` doc block).
-                            emit_vable_getfield_ref_walker_only(
-                                &current_block,
-                                portal_frame_reg,
-                                scratch_ns,
-                                VABLE_NAMESPACE_FIELD_IDX,
-                            );
                             // Write the load_global result directly to the
                             // stack slot it will occupy after the push (and
                             // after the optional NULL push for the
@@ -6930,12 +6888,6 @@ impl CodeWriter {
                             // feeds `w_code` directly as `Operand::ConstRef`.
                             if is_portal {
                                 let scratch_code = ssarepr.fresh_var(Kind::Ref, scratch_ref_base).0;
-                                emit_vable_getfield_ref_walker_only(
-                                    &current_block,
-                                    portal_frame_reg,
-                                    scratch_code,
-                                    VABLE_CODE_FIELD_IDX,
-                                );
                                 push_walker_emit(
                                     &current_block,
                                     super::flatten::build_load_global_fn_residual_call_ir_r_insn(
