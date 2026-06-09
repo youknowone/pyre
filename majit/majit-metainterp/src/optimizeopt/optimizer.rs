@@ -3067,6 +3067,14 @@ impl Optimizer {
             // applies only to body-namespace OpRefs (InputArg* / *Op).
             for op in &ctx.new_operations {
                 for i in 0..op.num_args() {
+                    // A bound operand (`Operand::Op` / `InputArg`) live-tracks
+                    // its producer's `op.pos`, already mutated to the new dense
+                    // slot above, so it needs no snapshot rewrite. Only
+                    // position-only `Operand::Box` operands carry a stale
+                    // pre-remap position the table must rewrite.
+                    if op.arg_is_bound(i) {
+                        continue;
+                    }
                     let arg = op.arg(i).to_opref();
                     if arg.is_constant() {
                         continue;
@@ -3150,6 +3158,13 @@ impl Optimizer {
                     remap_opref(&mut new_pos);
                     entry.op.pos.set(new_pos);
                     for i in 0..entry.op.num_args() {
+                        // Bound operands live-track their producer's already
+                        // remapped `op.pos` (the main loop set it above); only
+                        // position-only `Operand::Box` snapshots need the table
+                        // rewrite. Re-remapping a bound operand would double-map.
+                        if entry.op.arg_is_bound(i) {
+                            continue;
+                        }
                         let mut arg = entry.op.arg(i).to_opref();
                         remap_opref(&mut arg);
                         entry.op.setarg(i, BoxRef::from_opref(arg));

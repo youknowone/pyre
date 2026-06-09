@@ -7,8 +7,8 @@
 use smallvec::SmallVec;
 
 use crate::box_ref::{BoxRef, Forwarded};
-use crate::operand::Operand;
 use crate::descr::DescrRef;
+use crate::operand::Operand;
 use crate::value::{GcRef, Type, Value};
 
 /// Index into an operation list, used as a reference to an operation's
@@ -1509,6 +1509,15 @@ impl Op {
 
     pub fn arg(&self, idx: usize) -> BoxRef {
         self.args.borrow()[idx].to_boxref()
+    }
+
+    /// True iff argument `idx` is a live-tracking bound operand
+    /// (`Operand::Op` / `Operand::InputArg`) that reads its producer's
+    /// current `op.pos`, rather than a frozen `Operand::Box` snapshot. The
+    /// position-remap passes skip these — they auto-track a renumbered
+    /// producer and need no snapshot rewrite.
+    pub fn arg_is_bound(&self, idx: usize) -> bool {
+        self.args.borrow()[idx].is_bound()
     }
 
     pub fn num_args(&self) -> usize {

@@ -295,7 +295,10 @@ impl Op {
     /// peel pass.  pyre's matching call lives in `unroll.rs` and
     /// rebuilds the SmallVec rather than pushing onto `args`.
     pub fn initarglist(&self, args: smallvec::SmallVec<[crate::box_ref::BoxRef; 3]>) {
-        *self.args.borrow_mut() = args.iter().map(crate::operand::Operand::from_boxref).collect();
+        *self.args.borrow_mut() = args
+            .iter()
+            .map(crate::operand::Operand::from_boxref)
+            .collect();
     }
 
     /// `resoperation.py:290 AbstractResOp.setarg` parity — position-wise

@@ -201,24 +201,57 @@ impl Operand {
         }
     }
 
-    /// Classify a [`BoxRef`] into an [`Operand`] for the storage flip.
+    /// Classify a [`BoxRef`] into an [`Operand`] for storage.
     ///
-    /// This slice is strictly behavior-preserving, so it sheds only the
-    /// identity-free `None` sentinel; every value-carrying box is kept verbatim
-    /// as `Operand::Box`, whose `to_boxref` returns the same `Rc<Box>` —
-    /// preserving box identity, the `Cell`-backed GC walk, AND the box's
-    /// snapshot `position` field. The last point matters: a bound `ResOp`
-    /// box's `to_opref` reads its own frozen `BoxKind::ResOp.position` Cell,
-    /// NOT the producer's live `op.pos`, and the optimizer's position-remap
-    /// (`optimizer.rs`) deliberately mutates `op.pos` before reading operand
-    /// positions — so shedding a bound `ResOp` to a live-tracking
-    /// `Operand::Op` here would double-remap. Shedding `Box` → `Op`/`InputArg`/
-    /// `Const` (and adapting those remap consumers) is a later slice.
+    /// A genuinely-bound box sheds to its live-tracking producer `Rc`
+    /// (`Operand::Op` / `Operand::InputArg`) — the operand IS the producer
+    /// (`resoperation.py` `N_aryOp._args` holds the `AbstractResOp` /
+    /// `AbstractInputArg` directly). Its `to_opref` then reads the producer's
+    /// live `op.pos`, so renumbering the producer auto-propagates without a
+    /// snapshot rewrite. The two position-remap passes
+    /// (`optimizer.rs` `new_operations` / `exported_short_boxes`) mutate
+    /// `op.pos` and must therefore SKIP bound operands
+    /// ([`Operand::is_bound`]) and rewrite only position-only snapshots —
+    /// otherwise a bound operand reading the already-remapped live pos would
+    /// double-remap.
+    ///
+    /// A position-only box (no bound handle — e.g. `from_opref`) and a Const
+    /// box (value-typed, GC-walked in place through its `Cell`) carry no
+    /// producer to track and stay `Operand::Box`, whose `to_boxref` returns
+    /// the same `Rc<Box>` (identity, `Cell`-backed GC walk, frozen position
+    /// snapshot all preserved).
     pub fn from_boxref(b: &BoxRef) -> Operand {
         if b.is_none() {
             return Operand::None;
         }
+        // Shed a genuinely-bound box to its live-tracking producer `Rc`: the
+        // operand IS the producer (resoperation.py `N_aryOp._args` holds the
+        // `AbstractResOp`/`AbstractInputArg` directly), so its position
+        // auto-tracks the producer's `op.pos` and its forwarding resolves
+        // through the canonical `Op`/`InputArg`. The strong `Rc` keeps the
+        // producer alive (acyclic on the SSA use-before-def DAG). A
+        // position-only box (no bound handle) and a Const box (value-typed,
+        // GC-walked in place via its `Cell`) have no producer to carry and
+        // stay `Operand::Box`.
+        if let Some(op) = b.bound_op() {
+            return Operand::Op(op);
+        }
+        if let Some(ia) = b.bound_inputarg() {
+            return Operand::InputArg(ia);
+        }
         Operand::Box(b.clone())
+    }
+
+    /// True only for the live-tracking bound variants (`Op` / `InputArg`),
+    /// whose `to_opref()` reads the producer's CURRENT `op.pos`. Excludes the
+    /// frozen `Operand::Box` snapshot even when it wraps a ResOp / InputArg
+    /// box — unlike [`Operand::is_resop`] / [`Operand::is_inputarg`], which
+    /// fold the snapshot case in. The position-remap passes use this to skip
+    /// operands that auto-track a renumbered producer (no snapshot rewrite
+    /// needed); only position-only `Operand::Box` operands carry a stale
+    /// position the remap table must rewrite.
+    pub fn is_bound(&self) -> bool {
+        matches!(self, Operand::Op(_) | Operand::InputArg(_))
     }
 
     /// GC walk over any inline `ConstPtr` reachable from this operand
@@ -250,7 +283,10 @@ mod tests {
     #[test]
     fn to_opref_round_trips_each_variant() {
         let op = op_at(3, Type::Int);
-        assert_eq!(Operand::from_bound_op(&op).to_opref(), OpRef::op_typed(3, Type::Int));
+        assert_eq!(
+            Operand::from_bound_op(&op).to_opref(),
+            OpRef::op_typed(3, Type::Int)
+        );
 
         let ia = Rc::new(InputArg::from_type(Type::Ref, 2));
         assert_eq!(
@@ -258,7 +294,10 @@ mod tests {
             OpRef::input_arg_typed(2, Type::Ref),
         );
 
-        assert_eq!(Operand::const_(Const::Int(7)).to_opref(), OpRef::const_int(7));
+        assert_eq!(
+            Operand::const_(Const::Int(7)).to_opref(),
+            OpRef::const_int(7)
+        );
         assert_eq!(Operand::none().to_opref(), OpRef::NONE);
     }
 
@@ -324,45 +363,49 @@ mod tests {
     }
 
     #[test]
-    fn from_boxref_is_byte_identical_keeps_every_value_box() {
-        // Behavior-preserving storage flip: every value-carrying box is kept
-        // verbatim as Operand::Box, returning the identical Rc<Box> on read so
-        // identity, type, position, and const value all round-trip exactly.
-
-        // Bound op -> kept as Box (its frozen `position` snapshot is preserved,
-        // not replaced by the producer's live op.pos).
+    fn from_boxref_sheds_bound_keeps_const_and_position_only() {
+        // Bound op -> Operand::Op (live-tracking). is_resop stays true;
+        // is_bound is true. to_boxref re-resolves through the memoized
+        // from_bound_op, so the canonical box is ptr-equal to the original.
         let op = op_at(8, Type::Int);
         let bound = BoxRef::from_bound_op(&op);
         let o = Operand::from_boxref(&bound);
-        assert!(matches!(o, Operand::Box(_)));
+        assert!(matches!(o, Operand::Op(_)));
         assert!(o.is_resop());
+        assert!(o.is_bound());
         assert_eq!(o.to_boxref().as_ptr(), bound.as_ptr());
 
-        // Bound input arg -> kept as Box.
+        // Bound input arg -> Operand::InputArg (live-tracking, bound).
         let ia = Rc::new(InputArg::from_type(Type::Ref, 2));
         let bia = BoxRef::from_bound_inputarg(&ia);
         let o = Operand::from_boxref(&bia);
-        assert!(matches!(o, Operand::Box(_)));
+        assert!(matches!(o, Operand::InputArg(_)));
         assert!(o.is_inputarg());
+        assert!(o.is_bound());
         assert_eq!(o.to_boxref().as_ptr(), bia.as_ptr());
 
-        // Const -> kept as Box (Cell-backed), round-trips to the same box.
+        // Const -> kept as Box (Cell-backed, value-typed); NOT bound.
         let cbox = BoxRef::new_const(Value::Int(11));
         let o = Operand::from_boxref(&cbox);
         assert!(matches!(o, Operand::Box(_)));
         assert!(o.is_constant());
+        assert!(!o.is_bound());
         assert_eq!(o.const_int(), Some(11));
         assert_eq!(o.to_boxref().as_ptr(), cbox.as_ptr());
 
-        // Position-only box (from_opref, no live producer) -> kept as Box,
-        // returns the identical Rc<Box> on read.
+        // Position-only box (from_opref, no live producer) -> kept as Box
+        // (no bound handle to shed onto); NOT bound, frozen position survives.
         let pos_only = BoxRef::from_opref(OpRef::op_typed(4, Type::Int));
         let o = Operand::from_boxref(&pos_only);
         assert!(matches!(o, Operand::Box(_)));
+        assert!(!o.is_bound());
         assert_eq!(o.position(), Some(4));
         assert_eq!(o.to_boxref().as_ptr(), pos_only.as_ptr());
 
-        // None sentinel -> Operand::None (identity-free, byte-identical).
-        assert!(matches!(Operand::from_boxref(&BoxRef::none()), Operand::None));
+        // None sentinel -> Operand::None.
+        assert!(matches!(
+            Operand::from_boxref(&BoxRef::none()),
+            Operand::None
+        ));
     }
 }
