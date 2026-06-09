@@ -1089,6 +1089,25 @@ mod tests {
         assert_eq!(bindings["pyre_interpreter::jit_build_tuple_2"], tuple2);
     }
 
+    #[test]
+    fn jit_trace_fnaddrs_covers_store_subscr_helpers() {
+        let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
+
+        let execute_store_subscr =
+            crate::opcode_ops::bh_execute_store_subscr as *const () as usize as i64;
+        assert_eq!(bindings["execute_store_subscr"], execute_store_subscr);
+
+        let store_subscr_fn = crate::opcode_ops::bh_store_subscr_fn as *const () as usize as i64;
+        assert_eq!(
+            bindings["pyre_interpreter::opcode_ops::bh_store_subscr_fn"],
+            store_subscr_fn
+        );
+        assert_eq!(
+            bindings["pyre_interpreter::bh_store_subscr_fn"],
+            store_subscr_fn
+        );
+    }
+
     /// Negative parity guard: pyre intentionally does NOT publish a
     /// host fnaddr for `_ll_2_str_eq_nonnull` (see the comment block
     /// at `jit_trace_fnaddrs` next to the `cast_float_to_uint`

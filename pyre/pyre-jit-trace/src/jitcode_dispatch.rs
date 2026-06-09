@@ -4621,8 +4621,7 @@ fn try_walker_store_subscr_specialization(
         });
         if bh_exc != 0 {
             let exc = ctx.trace_ctx.const_ref(bh_exc);
-            let exc_concrete =
-                ConcreteValue::Ref(bh_exc as usize as pyre_object::PyObjectRef);
+            let exc_concrete = ConcreteValue::Ref(bh_exc as usize as pyre_object::PyObjectRef);
             ctx.last_exc_value = Some(exc);
             ctx.last_exc_value_concrete = exc_concrete;
             walker_record_guard_exception(ctx, op.pc);
