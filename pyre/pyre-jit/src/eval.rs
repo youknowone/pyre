@@ -6933,6 +6933,12 @@ mod tests {
     /// `w_code_get_ptr`), not an arbitrary copy of the same source —
     /// `CallControl.jitcodes` is keyed by raw pointer identity.
     fn register_test_portal(_unused: &pyre_interpreter::CodeObject, w_code: *const ()) {
+        // These recorder fixtures place register values at the walker
+        // Ref-bank color + liveness layout; pin the jitcode build (lazy at
+        // `ensure_jitcode_ptr`) to the walker stream so the default-on
+        // splice flip does not shift the layout out from under them.  See
+        // `force_flatten_splice_for_tests`.
+        crate::jit::codewriter::force_flatten_splice_for_tests(Some(false));
         let raw_code = unsafe {
             pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
                 as *const pyre_interpreter::CodeObject

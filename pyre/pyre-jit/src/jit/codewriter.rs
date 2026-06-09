@@ -2024,6 +2024,57 @@ fn splice_slot_color_conflict(
     false
 }
 
+/// Test-only per-thread override of [`flatten_splice_enabled`].  The
+/// `_with_compiled_trace_jitcode` recorder unit tests build a real
+/// jitcode purely as a fixture and hand-construct a `PyreSym` whose
+/// register placement mirrors the **walker** Ref-bank color + liveness
+/// layout (e.g. they require a dead local's color to be live at a
+/// resume PC — an over-approximation the precise canonical liveness
+/// drops).  `register_test_portal` forces the walker stream for those
+/// fixtures so the default-on splice flip does not change the layout
+/// they assert against; the splice recorder path is exercised
+/// end-to-end by `pyre/check.py` instead.  Migrating these fixtures to
+/// the splice layout belongs with the walker-drain retirement (#287).
+#[cfg(any(test, feature = "test-support"))]
+thread_local! {
+    static FORCE_FLATTEN_SPLICE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Pin [`flatten_splice_enabled`] for the current thread (test fixtures
+/// only).  `Some(false)` forces the walker stream, `Some(true)` forces
+/// the splice, `None` restores the env-driven default.
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn force_flatten_splice_for_tests(forced: Option<bool>) {
+    FORCE_FLATTEN_SPLICE.with(|c| c.set(forced));
+}
+
+/// #230: whether the canonical-flatten splice replaces the walker's
+/// inline SSARepr.  Default-ON: the splice is the production path for
+/// every graph that passes the per-graph resume-safety guards, and
+/// falls back to the walker stream otherwise.  `PYRE_FLATTEN_SPLICE=0`
+/// forces the walker stream for every graph — the gate-off regression
+/// baseline (`codewriter.py:53` single-driver shape vs the per-PC
+/// walker emission).  Any other value (or unset) enables the splice.
+fn flatten_splice_enabled() -> bool {
+    #[cfg(any(test, feature = "test-support"))]
+    if let Some(forced) = FORCE_FLATTEN_SPLICE.with(|c| c.get()) {
+        return forced;
+    }
+    match std::env::var("PYRE_FLATTEN_SPLICE") {
+        Ok(v) => v != "0",
+        Err(_) => true,
+    }
+}
+
+/// #230: whether to print the per-graph `[flatten-splice]` /
+/// `[flatten-splice-color]` decision diagnostics.  Off by default so
+/// the default-on splice does not log on every production JIT compile;
+/// `PYRE_FLATTEN_SPLICE_DEBUG` re-enables them.
+fn flatten_splice_debug() -> bool {
+    std::env::var("PYRE_FLATTEN_SPLICE_DEBUG").is_ok()
+}
+
 /// Walker post-walk `insert_renamings` — port of
 /// `rpython/jit/codewriter/flatten.py:306-334`.
 ///
@@ -10617,11 +10668,13 @@ impl CodeWriter {
             None
         };
         // #229 / #279 / #230 path-(b) — canonical-as-production splice.
-        // Under `PYRE_FLATTEN_SPLICE` (default off → entire scaffold below
-        // is skipped → production byte-identical), build the SAME canonical
+        // DEFAULT-ON (`flatten_splice_enabled`): build the SAME canonical
         // `flatten_graph(graph, regallocs, false, cpu)` stream the survey
         // measures and capture it so the drain can REPLACE the walker's
-        // SSARepr with it (`codewriter.py:53` single-driver shape).  Built
+        // SSARepr with it (`codewriter.py:53` single-driver shape).
+        // `PYRE_FLATTEN_SPLICE=0` skips the entire scaffold below →
+        // production byte-identical walker stream (the gate-off regression
+        // baseline).  Built
         // under `catch_unwind` like the survey: a graph the Phase-1
         // SCAFFOLD canonical driver cannot yet flatten (uncolored
         // exception-edge vars, non-portal `simple_call`) yields `None`,
@@ -10668,7 +10721,7 @@ impl CodeWriter {
         let canonical_for_splice: Option<(
             super::flatten::SSARepr,
             [super::regalloc::GraphAllocationResult; 3],
-        )> = if std::env::var("PYRE_FLATTEN_SPLICE").is_ok() {
+        )> = if flatten_splice_enabled() {
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 // #254: build the splice regalloc FRESH with same-slot
                 // coalescing so each frame slot maps to exactly one
@@ -11131,34 +11184,27 @@ impl CodeWriter {
                     walker_after_call_pc_indices_out =
                         Some(derive_after_call_indices_from_sparse(&ssarepr, num_instrs));
                     did_splice = true;
-                    eprintln!(
-                        "[flatten-splice] {} spliced insns={} pc_first={} live_feed={} entry_live={}",
-                        ssarepr.name,
-                        ssarepr.insns.len(),
-                        ssarepr.pc_first_insn_pos.len(),
-                        num_instrs,
-                        first_live,
-                    );
-                } else if first_live.is_none() {
-                    eprintln!(
-                        "[flatten-splice] {} skipped (canonical stream has no -live- marker)",
-                        ssarepr.name,
-                    );
-                } else if slot_color_collision {
-                    eprintln!(
-                        "[flatten-splice] {} skipped (frame-slot Ref color collision)",
-                        ssarepr.name,
-                    );
-                } else if slot_color_conflict {
-                    eprintln!(
-                        "[flatten-splice] {} skipped (frame-slot Ref color conflict)",
-                        ssarepr.name,
-                    );
-                } else {
-                    eprintln!(
-                        "[flatten-splice] {} skipped (stranded resume markers={})",
-                        ssarepr.name, stranded,
-                    );
+                    if flatten_splice_debug() {
+                        eprintln!(
+                            "[flatten-splice] {} spliced insns={} pc_first={} live_feed={} entry_live={}",
+                            ssarepr.name,
+                            ssarepr.insns.len(),
+                            ssarepr.pc_first_insn_pos.len(),
+                            num_instrs,
+                            first_live,
+                        );
+                    }
+                } else if flatten_splice_debug() {
+                    let reason = if first_live.is_none() {
+                        "canonical stream has no -live- marker".to_string()
+                    } else if slot_color_collision {
+                        "frame-slot Ref color collision".to_string()
+                    } else if slot_color_conflict {
+                        "frame-slot Ref color conflict".to_string()
+                    } else {
+                        format!("stranded resume markers={stranded}")
+                    };
+                    eprintln!("[flatten-splice] {} skipped ({})", ssarepr.name, reason);
                 }
             }
             // #230.M2 DIFF bucketing survey: under PYRE_FLATTEN_MEASURE,
@@ -11410,12 +11456,14 @@ impl CodeWriter {
                         Some(_) => {}
                     }
                 }
-                eprintln!(
-                    "[flatten-splice-color] {} mapped_slots={} conflicts={}",
-                    ssarepr.name,
-                    inverse.iter().filter(|c| c.is_some()).count(),
-                    conflicts,
-                );
+                if flatten_splice_debug() {
+                    eprintln!(
+                        "[flatten-splice-color] {} mapped_slots={} conflicts={}",
+                        ssarepr.name,
+                        inverse.iter().filter(|c| c.is_some()).count(),
+                        conflicts,
+                    );
+                }
                 inverse
             })
         } else {
