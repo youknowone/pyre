@@ -10636,6 +10636,35 @@ impl CodeWriter {
         // The post-recolor resume maps below are rebuilt in this canonical
         // color space — the spliced body carries graph-lifetime colors,
         // not walker stack-slot register numbers.
+        //
+        // #319: live-Variable mask for the splice resume-color machinery.
+        // `color_leaked_arg_variables` (flatten.rs) mints a fresh color for
+        // every dead operand-stack Ref the walker pushed after an
+        // `abort_permanent` (CONTAINS_OP / UNPACK_SEQUENCE …) so the
+        // canonical stream stays serializable; those Variables sit in the
+        // severed dead region and never restore at a resume, but they share
+        // a walker slot with live Variables. The dense `slot → color`
+        // resume inverse (`splice_slot_pre_color`) and its conflict /
+        // collision guards therefore see a spurious second color for the
+        // slot and decline the splice (set_membership / tuple_unpacking).
+        // A Variable is live iff the graph regalloc — the gate-off coloring,
+        // which never sees the leaked Refs — colored it; mask the rest out
+        // of the resume-color consumers below. This is the same membership
+        // oracle `collect_same_slot_coalesce_pairs` already filters on.
+        let walker_slot_for_variable_live: Vec<Option<u16>> = walker_slot_for_variable
+            .iter()
+            .enumerate()
+            .map(|(vid, slot)| {
+                if graph_regallocs[Kind::Ref.index()]
+                    .coloring
+                    .contains_key(&super::flow::VariableId(vid as u32))
+                {
+                    *slot
+                } else {
+                    None
+                }
+            })
+            .collect();
         let canonical_for_splice: Option<(
             super::flatten::SSARepr,
             [super::regalloc::GraphAllocationResult; 3],
@@ -11058,7 +11087,7 @@ impl CodeWriter {
                     canonical_for_splice.as_ref().map_or(false, |(_, sr)| {
                         splice_slot_color_collision(
                             &sr[Kind::Ref.index()].coloring,
-                            &walker_slot_for_variable,
+                            &walker_slot_for_variable_live,
                             code.varnames.len(),
                         )
                     });
@@ -11070,7 +11099,7 @@ impl CodeWriter {
                 let slot_color_conflict = canonical_for_splice.as_ref().map_or(false, |(_, sr)| {
                     splice_slot_color_conflict(
                         &sr[Kind::Ref.index()].coloring,
-                        &walker_slot_for_variable,
+                        &walker_slot_for_variable_live,
                     )
                 });
                 if let (Some(first_live), Some(derived), 0, false, false) = (
@@ -11357,7 +11386,11 @@ impl CodeWriter {
         let splice_slot_pre_color: Option<Vec<Option<u16>>> = if did_splice {
             canonical_for_splice.as_ref().map(|(_, splice_regallocs)| {
                 let ref_coloring = &splice_regallocs[Kind::Ref.index()].coloring;
-                let max_slot = walker_slot_for_variable
+                // #319: build the inverse over the live-masked slot map so a
+                // dead leaked Ref (color minted by `color_leaked_arg_variables`)
+                // sharing a slot with live Variables never displaces the slot's
+                // live color.
+                let max_slot = walker_slot_for_variable_live
                     .iter()
                     .flatten()
                     .copied()
@@ -11365,7 +11398,7 @@ impl CodeWriter {
                     .unwrap_or(0);
                 let mut inverse: Vec<Option<u16>> = vec![None; max_slot as usize + 1];
                 let mut conflicts = 0usize;
-                for (vid, slot) in walker_slot_for_variable.iter().enumerate() {
+                for (vid, slot) in walker_slot_for_variable_live.iter().enumerate() {
                     let Some(slot) = *slot else { continue };
                     let Some(&color) = ref_coloring.get(&super::flow::VariableId(vid as u32))
                     else {
