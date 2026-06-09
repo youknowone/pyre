@@ -300,7 +300,7 @@ pub extern "C" fn bh_store_subscr_fn(obj: i64, key: i64, value: i64) -> i64 {
     let obj = obj as pyre_object::PyObjectRef;
     let key = key as pyre_object::PyObjectRef;
     let value = value as pyre_object::PyObjectRef;
-    if obj.is_null() || key.is_null() {
+    if obj.is_null() || key.is_null() || value.is_null() {
         let err = crate::PyError::new(
             crate::PyErrorKind::TypeError,
             "store subscript on null operand".to_string(),
