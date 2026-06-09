@@ -422,9 +422,11 @@ pub fn register_module(ns: &mut DictStorage) {
             2,
         ),
     );
-    // takewhile(predicate, iterable) — W_TakeWhile.  Yields elements
-    // while `predicate(item)` is true, then stops.  Pulled lazily so an
-    // infinite source (`takewhile(p, count())`) terminates.
+    // takewhile(predicate, iterable) — W_TakeWhile.  Collects elements
+    // while `predicate(item)` is true, then returns a seq_iter over the
+    // collected results.  This implementation is eager (it drains the
+    // source until the predicate fails), so an infinite source does not
+    // terminate; lazy `__next__`-driven iteration is a follow-up.
     crate::dict_storage_store(
         ns,
         "takewhile",

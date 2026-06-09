@@ -2283,14 +2283,26 @@ fn build_class_inner(
         // namespace.
         match crate::baseobjspace::getattr_str(w_metaclass, "__prepare__") {
             Ok(prepare) => {
+                clear_call_error();
                 let ns_obj = crate::call_function(prepare, &[pyre_object::w_str_new(name), bases]);
-                if !ns_obj.is_null() && unsafe { !pyre_object::is_none(ns_obj) } {
+                if ns_obj.is_null() {
+                    // __prepare__ was found but raised during execution —
+                    // propagate that exception rather than silently using a
+                    // fresh namespace.
+                    if let Some(err) = take_call_error() {
+                        return Err(err);
+                    }
+                    None
+                } else if unsafe { !pyre_object::is_none(ns_obj) } {
                     Some(ns_obj)
                 } else {
                     None
                 }
             }
-            Err(_) => None,
+            // Only a missing __prepare__ (AttributeError) falls back to a
+            // fresh namespace; any other lookup error propagates.
+            Err(e) if e.kind == crate::PyErrorKind::AttributeError => None,
+            Err(e) => return Err(e),
         }
     } else {
         None
