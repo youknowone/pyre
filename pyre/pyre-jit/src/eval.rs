@@ -6933,12 +6933,11 @@ mod tests {
     /// `w_code_get_ptr`), not an arbitrary copy of the same source —
     /// `CallControl.jitcodes` is keyed by raw pointer identity.
     fn register_test_portal(_unused: &pyre_interpreter::CodeObject, w_code: *const ()) {
-        // These recorder fixtures place register values at the walker
-        // Ref-bank color + liveness layout; pin the jitcode build (lazy at
-        // `ensure_jitcode_ptr`) to the walker stream so the default-on
-        // splice flip does not shift the layout out from under them.  See
-        // `force_flatten_splice_for_tests`.
-        crate::jit::codewriter::force_flatten_splice_for_tests(Some(false));
+        // Recorder fixtures now place values at the splice color/liveness
+        // layout, so they run under the production splice default. `None`
+        // leaves the gate unforced; the test-only override is retired with
+        // the gate itself.
+        crate::jit::codewriter::force_flatten_splice_for_tests(None);
         let raw_code = unsafe {
             pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
                 as *const pyre_interpreter::CodeObject
@@ -7307,6 +7306,7 @@ mod tests {
             &code,
             &stack_slot_colors_for_depths(jitcode_index, &[0, 1]),
         );
+        let max_color = live_regs.iter().copied().max().unwrap_or(0) as usize;
 
         let mut ctx = TraceCtx::for_test(2);
         let frame_ref = ctx.const_ref(frame_ptr as i64);
@@ -7319,7 +7319,7 @@ mod tests {
             locals_cells_stack_array_ref: locals_array,
             symbolic_local_types: vec![Type::Ref, Type::Int],
             symbolic_stack_types: vec![Type::Ref, Type::Int],
-            registers_r: vec![OpRef::NONE; 4],
+            registers_r: vec![OpRef::NONE; max_color + 1],
             concrete_stack: vec![],
             concrete_namespace: frame.w_globals_obj,
             vable_last_instr: ctx.const_int(999),
@@ -7414,6 +7414,18 @@ mod tests {
         let locals_array = trace_state::frame_locals_cells_stack_array_ref(&mut ctx, frame_ref);
         let stack0 = ctx.const_ref(0xb0);
         let stack1 = ctx.const_ref(0xb1);
+        // Materialized fail args must carry no holes: fill every live Ref
+        // color with a non-NONE placeholder. The semantic mirror keeps the
+        // two stack temps at `nlocals + depth` (2, 3); the encoder reads the
+        // live colors (placeholders are fine there — the test asserts only
+        // count + no-holes + the semantic mirror, not per-color identity).
+        let max_idx = live_regs.iter().copied().max().unwrap_or(0).max(3) as usize;
+        let mut registers_r = vec![OpRef::NONE; max_idx + 1];
+        for &c in &live_regs {
+            registers_r[c as usize] = ctx.const_ref(0xfa11_0000 + i64::from(c));
+        }
+        registers_r[2] = stack0;
+        registers_r[3] = stack1;
         let mut sym = PyreSym::from_test_state(TestSymState {
             frame: frame_ref,
             jitcode: jitcode_ptr,
@@ -7422,7 +7434,7 @@ mod tests {
             locals_cells_stack_array_ref: locals_array,
             symbolic_local_types: vec![Type::Ref, Type::Int],
             symbolic_stack_types: vec![Type::Ref, Type::Int],
-            registers_r: vec![OpRef::NONE, OpRef::NONE, stack0, stack1],
+            registers_r,
             concrete_stack: vec![],
             concrete_namespace: frame.w_globals_obj,
             vable_last_instr: ctx.const_int(0),
@@ -7510,7 +7522,12 @@ mod tests {
             .get(0)
             .expect("regalloc must assign a color to local `b`"))
         .into();
-        let (resume_pc, _) = live_pc_containing_all(jitcode_index, &code, &[color_b]);
+        // `b`'s Ref color is not in any `-live-` set under precise liveness
+        // (a local restores from the virtualizable, not a register), so the
+        // resume PC is picked for validity only; the load reads local slot 0
+        // from the symbolic state, and `registers_r` carries `b` at its color.
+        let (resume_pc, live_regs) = live_pc_containing_all(jitcode_index, &code, &[]);
+        let max_color = live_regs.iter().copied().max().unwrap_or(0).max(color_b) as usize;
 
         let run_case = |symbolic_type: Type, name: &str, expected_guard: Option<OpCode>| {
             let mut ctx = TraceCtx::for_test_types(&[symbolic_type]);
@@ -7527,7 +7544,11 @@ mod tests {
                 locals_cells_stack_array_ref: locals_array,
                 symbolic_local_types: vec![symbolic_type],
                 symbolic_stack_types: vec![],
-                registers_r: vec![local],
+                registers_r: {
+                    let mut r = vec![OpRef::NONE; max_color + 1];
+                    r[color_b as usize] = local;
+                    r
+                },
                 concrete_stack: vec![],
                 concrete_namespace: frame.w_globals_obj,
                 vable_last_instr: ctx.const_int(resume_pc as i64 - 1),
@@ -7589,11 +7610,12 @@ mod tests {
             .expect("real trace-side jitcode registration must succeed");
         let jitcode_index = trace_state::ensure_jitcode_index(frame.pycode as *const ())
             .expect("real trace-side jitcode index must exist");
-        let (resume_pc, _) = live_pc_containing_all(
+        let (resume_pc, live_regs) = live_pc_containing_all(
             jitcode_index,
             &code,
             &stack_slot_colors_for_depths(jitcode_index, &[0, 1]),
         );
+        let max_color = live_regs.iter().copied().max().unwrap_or(0) as usize;
 
         let mut ctx = TraceCtx::for_test_types(&[Type::Ref]);
         let obj = OpRef::input_arg_ref(0);
@@ -7607,7 +7629,7 @@ mod tests {
             locals_cells_stack_array_ref: locals_array,
             symbolic_local_types: vec![Type::Ref, Type::Int],
             symbolic_stack_types: vec![Type::Ref, Type::Int],
-            registers_r: vec![OpRef::NONE; 4],
+            registers_r: vec![OpRef::NONE; max_color + 1],
             concrete_stack: vec![],
             concrete_namespace: frame.w_globals_obj,
             vable_last_instr: ctx.const_int(0),
@@ -7656,11 +7678,12 @@ mod tests {
             .expect("real trace-side jitcode registration must succeed");
         let jitcode_index = trace_state::ensure_jitcode_index(frame.pycode as *const ())
             .expect("real trace-side jitcode index must exist");
-        let (resume_pc, _) = live_pc_containing_all(
+        let (resume_pc, live_regs) = live_pc_containing_all(
             jitcode_index,
             &code,
             &stack_slot_colors_for_depths(jitcode_index, &[0, 1]),
         );
+        let max_color = live_regs.iter().copied().max().unwrap_or(0) as usize;
 
         let mut ctx = TraceCtx::for_test_types(&[Type::Ref]);
         let int_obj = OpRef::input_arg_ref(0);
@@ -7674,7 +7697,7 @@ mod tests {
             locals_cells_stack_array_ref: locals_array,
             symbolic_local_types: vec![Type::Ref, Type::Int],
             symbolic_stack_types: vec![Type::Ref, Type::Int],
-            registers_r: vec![OpRef::NONE; 4],
+            registers_r: vec![OpRef::NONE; max_color + 1],
             concrete_stack: vec![],
             concrete_namespace: frame.w_globals_obj,
             vable_last_instr: ctx.const_int(0),
@@ -7739,16 +7762,24 @@ mod tests {
         use pyre_object::{w_int_new, w_list_new};
 
         ensure_test_jit_callbacks();
-        let module = compile_exec("def f(x):\n    i = 7\n    return x[i - 7]\nf([1])\n")
+        // Splice's precise canonical coloring coalesces the DEEPEST live
+        // operand-stack Ref slot with the portal `ec` red (ec is dead in
+        // a call-free body), and the encoder substitutes ec unconditionally
+        // at that color — so the depth-0 slot is not separately observable.
+        // Use a nested-subscript expression whose `-live-` resume marker
+        // (the inner BINARY_SUBSCR) keeps four operand slots live: the
+        // deepest coalesces with ec, but depths 1 and 2 above it retain
+        // distinct, portal-disjoint colors that ARE observable in the
+        // snapshot.
+        let module = compile_exec("def f(a, b, c):\n    return [a, b, c[0]]\nf(1,2,[3])\n")
             .expect("test code should compile");
         let code = function_code_from_module(&module, "f");
 
         let mut frame = PyFrame::new(code.clone());
-        frame.locals_w_mut()[0] = w_list_new(vec![w_int_new(11)]);
+        frame.locals_w_mut()[0] = w_int_new(11);
         frame.locals_w_mut()[1] = w_int_new(7);
         frame.locals_w_mut()[2] = w_list_new(vec![w_int_new(21)]);
-        frame.locals_w_mut()[3] = w_int_new(1);
-        frame.valuestackdepth = 4;
+        frame.valuestackdepth = 7;
         frame.fix_array_ptrs();
         let frame_ptr = (&mut *frame) as *mut PyFrame as usize;
 
@@ -7757,32 +7788,41 @@ mod tests {
             .expect("real trace-side jitcode registration must succeed");
         let jitcode_index = trace_state::ensure_jitcode_index(frame.pycode as *const ())
             .expect("real trace-side jitcode index must exist");
+        // Operand stack depths 1 and 2 carry the two observable slots.
         let (resume_pc, live_regs) = live_pc_containing_all(
             jitcode_index,
             &code,
-            &stack_slot_colors_for_depths(jitcode_index, &[0, 1]),
+            &stack_slot_colors_for_depths(jitcode_index, &[1, 2]),
         );
 
         let run_case = |record_branch_guard: bool| {
-            let mut ctx = TraceCtx::for_test_types(&[Type::Ref, Type::Int]);
+            let mut ctx = TraceCtx::for_test_types(&[Type::Ref, Type::Int, Type::Ref, Type::Ref]);
             let lower_stack = OpRef::input_arg_ref(0);
             let truth = OpRef::input_arg_int(1);
+            // Pre-seed the deepest (ec-coalesced) slot and the topmost slot
+            // too: every live operand-stack slot must carry a value so the
+            // snapshot reads the seeded mirror rather than lazy-filling from
+            // the heap. Under splice's distinct color/semantic indices a
+            // lazy stack-fill writes `registers_r[color_idx]`, which can
+            // alias a sibling slot's seeded semantic index and clobber it.
+            let deep_slot = OpRef::input_arg_ref(2);
+            let top_slot = OpRef::input_arg_ref(3);
             let frame_ref = ctx.const_ref(frame_ptr as i64);
             let locals_array = trace_state::frame_locals_cells_stack_array_ref(&mut ctx, frame_ref);
             let mut sym = PyreSym::from_test_state(TestSymState {
                 frame: frame_ref,
                 jitcode: jitcode_ptr,
-                nlocals: 2,
-                valuestackdepth: 4,
+                nlocals: 3,
+                valuestackdepth: 7,
                 locals_cells_stack_array_ref: locals_array,
-                symbolic_local_types: vec![Type::Ref, Type::Int],
-                symbolic_stack_types: vec![Type::Ref, Type::Int],
-                registers_r: vec![OpRef::NONE, OpRef::NONE, lower_stack, truth],
+                symbolic_local_types: vec![Type::Ref, Type::Ref, Type::Ref],
+                symbolic_stack_types: vec![Type::Ref, Type::Ref, Type::Ref, Type::Ref],
+                registers_r: vec![OpRef::NONE; 8],
                 concrete_stack: vec![],
                 concrete_namespace: frame.w_globals_obj,
                 vable_last_instr: ctx.const_int(resume_pc as i64 - 1),
                 vable_pycode: ctx.const_ref(frame.pycode as usize as i64),
-                vable_valuestackdepth: ctx.const_int(4),
+                vable_valuestackdepth: ctx.const_int(7),
                 vable_debugdata: ctx.const_ref(frame.debugdata as usize as i64),
                 vable_lastblock: ctx.const_ref(frame.lastblock as usize as i64),
                 vable_w_globals: ctx.const_ref(frame.w_globals_obj as usize as i64),
@@ -7792,7 +7832,7 @@ mod tests {
                 &mut ctx,
                 jitcode_index,
                 resume_pc as i32,
-                &[(0, lower_stack), (1, truth)],
+                &[(0, deep_slot), (1, lower_stack), (2, truth), (3, top_slot)],
             );
             let mut state = MIFrame::from_sym(&mut ctx, &mut sym, frame_ptr, resume_pc, resume_pc);
             if record_branch_guard {
@@ -7884,16 +7924,21 @@ mod tests {
         use pyre_object::{w_int_new, w_list_new};
 
         ensure_test_jit_callbacks();
-        let module = compile_exec("def f(x):\n    i = 7\n    return x[i - 7]\nf([1])\n")
+        // Splice's precise coloring coalesces the deepest live operand-stack
+        // Ref slot with the portal `ec` red, so the depth-0 slot is not
+        // separately observable. Use a nested-subscript expression whose
+        // inner-BINARY_SUBSCR `-live-` marker keeps four operand slots live;
+        // depths 1 and 2 above the coalesced bottom retain distinct,
+        // portal-disjoint colors that ARE observable in the snapshot.
+        let module = compile_exec("def f(a, b, c):\n    return [a, b, c[0]]\nf(1,2,[3])\n")
             .expect("test code should compile");
         let code = function_code_from_module(&module, "f");
 
         let mut frame = PyFrame::new(code.clone());
-        frame.locals_w_mut()[0] = w_list_new(vec![w_int_new(11)]);
+        frame.locals_w_mut()[0] = w_int_new(11);
         frame.locals_w_mut()[1] = w_int_new(7);
         frame.locals_w_mut()[2] = w_list_new(vec![w_int_new(21)]);
-        frame.locals_w_mut()[3] = w_int_new(1);
-        frame.valuestackdepth = 4;
+        frame.valuestackdepth = 7;
         frame.fix_array_ptrs();
         let frame_ptr = (&mut *frame) as *mut PyFrame as usize;
 
@@ -7902,31 +7947,38 @@ mod tests {
             .expect("real trace-side jitcode registration must succeed");
         let jitcode_index = trace_state::ensure_jitcode_index(frame.pycode as *const ())
             .expect("real trace-side jitcode index must exist");
+        // Operand stack depths 1 and 2 carry the two observable slots.
         let (resume_pc, live_regs) = live_pc_containing_all(
             jitcode_index,
             &code,
-            &stack_slot_colors_for_depths(jitcode_index, &[0, 1]),
+            &stack_slot_colors_for_depths(jitcode_index, &[1, 2]),
         );
 
-        let mut ctx = TraceCtx::for_test_types(&[Type::Ref, Type::Int]);
+        let mut ctx = TraceCtx::for_test_types(&[Type::Ref, Type::Int, Type::Ref, Type::Ref]);
         let lower_stack = OpRef::input_arg_ref(0);
         let truth = OpRef::input_arg_int(1);
+        // Pre-seed every live operand-stack slot so the snapshot reads the
+        // seeded mirror instead of lazy-filling from the heap; under splice
+        // a lazy stack-fill writes `registers_r[color_idx]`, which can alias
+        // a sibling slot's seeded semantic index and clobber it.
+        let deep_slot = OpRef::input_arg_ref(2);
+        let top_slot = OpRef::input_arg_ref(3);
         let frame_ref = ctx.const_ref(frame_ptr as i64);
         let locals_array = trace_state::frame_locals_cells_stack_array_ref(&mut ctx, frame_ref);
         let mut sym = PyreSym::from_test_state(TestSymState {
             frame: frame_ref,
             jitcode: jitcode_ptr,
-            nlocals: 2,
-            valuestackdepth: 4,
+            nlocals: 3,
+            valuestackdepth: 7,
             locals_cells_stack_array_ref: locals_array,
-            symbolic_local_types: vec![Type::Ref, Type::Int],
-            symbolic_stack_types: vec![Type::Ref, Type::Int],
-            registers_r: vec![OpRef::NONE, OpRef::NONE, lower_stack, truth],
+            symbolic_local_types: vec![Type::Ref, Type::Ref, Type::Ref],
+            symbolic_stack_types: vec![Type::Ref, Type::Ref, Type::Ref, Type::Ref],
+            registers_r: vec![OpRef::NONE; 8],
             concrete_stack: vec![],
             concrete_namespace: frame.w_globals_obj,
             vable_last_instr: ctx.const_int(resume_pc as i64 - 1),
             vable_pycode: ctx.const_ref(frame.pycode as usize as i64),
-            vable_valuestackdepth: ctx.const_int(4),
+            vable_valuestackdepth: ctx.const_int(7),
             vable_debugdata: ctx.const_ref(frame.debugdata as usize as i64),
             vable_lastblock: ctx.const_ref(frame.lastblock as usize as i64),
             vable_w_globals: ctx.const_ref(frame.w_globals_obj as usize as i64),
@@ -7936,7 +7988,7 @@ mod tests {
             &mut ctx,
             jitcode_index,
             resume_pc as i32,
-            &[(0, lower_stack), (1, truth)],
+            &[(0, deep_slot), (1, lower_stack), (2, truth), (3, top_slot)],
         );
         let mut state = MIFrame::from_sym(&mut ctx, &mut sym, frame_ptr, resume_pc, resume_pc);
 
