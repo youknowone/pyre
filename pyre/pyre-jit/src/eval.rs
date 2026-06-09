@@ -3235,9 +3235,13 @@ pub(crate) fn eval_loop_jit_bridge(frame: &mut PyFrame) -> LoopResult {
         };
 
         // pyjitpl.py:1892-1914 run_one_step: trace + execute.
+        let mut walker_dispatched_this_opcode = false;
         if driver.is_tracing() {
             if let Some(loop_result) = jit_merge_point_hook(frame, code, pc, driver, info, &env) {
                 return loop_result;
+            }
+            if pyre_jit_trace::production_walker_handles(&instruction) {
+                walker_dispatched_this_opcode = true;
             }
         } else {
             // Tracing ended (bridge compiled or aborted).
@@ -3247,7 +3251,31 @@ pub(crate) fn eval_loop_jit_bridge(frame: &mut PyFrame) -> LoopResult {
         // handle_bytecode: execute the bytecode on the concrete frame.
         let next_instr = opcode_pc + 1;
         frame.set_last_instr_from_next_instr(next_instr);
-        match execute_opcode_step(frame, code, instruction, op_arg, next_instr) {
+        let step_result = if walker_dispatched_this_opcode {
+            // Mirror `eval_loop_jit`'s walker-dispatched bypass — the
+            // walker arm already mutated the live PyFrame via
+            // `vable_setfield` → `synchronize_virtualizable`, and the
+            // compiled trace owns the rest of the bytecode's heap
+            // effects on replay.  Running `execute_opcode_step` here
+            // would double-mutate `valuestackdepth` for the same opcode.
+            // Drain any pending raise from `BH_LAST_EXC_VALUE` so the
+            // exception handler runs against the bridge frame.
+            let bh_exc = majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| {
+                let v = c.get();
+                c.set(0);
+                v
+            });
+            if bh_exc != 0 {
+                Err(unsafe {
+                    pyre_interpreter::PyError::from_exc_object(bh_exc as pyre_object::PyObjectRef)
+                })
+            } else {
+                Ok(StepResult::Continue)
+            }
+        } else {
+            execute_opcode_step(frame, code, instruction, op_arg, next_instr)
+        };
+        match step_result {
             Ok(StepResult::Continue) => {}
             Ok(StepResult::CloseLoop { .. }) => {}
             Ok(StepResult::Return(result)) => return LoopResult::Done(Ok(result)),
