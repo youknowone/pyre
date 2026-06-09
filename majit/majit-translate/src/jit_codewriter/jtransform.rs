@@ -3307,6 +3307,28 @@ impl<'a> Transformer<'a> {
         let jitdriver_index = self
             .portal_jd_index
             .expect("'jit_merge_point' in non-portal graph!");
+        // jtransform.py:1698-1703 — for each red kind-list: every operand
+        // must be a `Variable` and no `Variable` may repeat.  The
+        // `isinstance(v, Variable)` guard (py:1700) is structurally
+        // satisfied here: `OpKind::Call.args` is `Vec<Variable>` and
+        // `front::mir`'s `emit_constant` materialises every Const operand
+        // to a fresh `Variable` before the marker call, so a Constant red
+        // cannot reach this point.  Only the duplicate-red guard (py:1702
+        // `len(dict.fromkeys(redlist)) == len(list(redlist))`) carries
+        // information — a repeated red would alias two live frame slots
+        // onto one resume location at the merge point.  (The py:1693
+        // `jitdriver is self.portal_jd.jitdriver` mix-up assert is omitted:
+        // pyre derives the driver from `portal_jd_index` and does not yet
+        // carry a per-marker JitDriver identity to compare against.)
+        for redlist in [&reds_i, &reds_r, &reds_f] {
+            let mut seen = std::collections::HashSet::with_capacity(redlist.len());
+            for v in redlist {
+                assert!(
+                    seen.insert(v.id()),
+                    "duplicate red variable on jit_merge_point()"
+                );
+            }
+        }
         let merge = SpaceOperation {
             result: None,
             kind: OpKind::JitMergePoint {
@@ -6262,6 +6284,28 @@ mod tests {
             vec![],
             vec![],
             vec![],
+            vec![],
+            vec![],
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "duplicate red variable on jit_merge_point()")]
+    fn handle_jit_marker_jit_merge_point_rejects_duplicate_red() {
+        // jtransform.py:1702 `assert len(dict.fromkeys(redlist)) ==
+        // len(list(redlist))` — a red Variable repeated within its
+        // kind-list is rejected. `Variable::clone` aliases the same
+        // identity, so passing one Variable twice is an exact duplicate.
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config).with_portal_jd(Some(0));
+        let mut graph = crate::model::FunctionGraph::new("dup_red_fixture");
+        graph.set_next_value(3);
+        let r = graph.must_variable_at(0);
+        transformer.handle_jit_marker__jit_merge_point(
+            vec![],
+            vec![],
+            vec![],
+            vec![r.clone(), r],
             vec![],
             vec![],
         );
