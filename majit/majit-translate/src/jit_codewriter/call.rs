@@ -2195,6 +2195,16 @@ impl CallControl {
         });
     }
 
+    /// Toggle `jitdrivers_sd[index].active` (`jtransform.py:1661-1662`
+    /// `jitdriver.active`).  `setup_jitdriver` seeds drivers `active`; a
+    /// deactivated portal driver makes `try_handle_jit_marker` drop its
+    /// markers (`return []`).  No-op when `index` is out of range.
+    pub fn set_jitdriver_active(&mut self, index: usize, active: bool) {
+        if let Some(jd) = self.jitdrivers_sd.get_mut(index) {
+            jd.active = active;
+        }
+    }
+
     /// warmspot.py:528-545 `jd.virtualizable_info = vinfos[VTYPEPTR]`.
     ///
     /// Attach the host-built [`VirtualizableInfoHandle`] to the
