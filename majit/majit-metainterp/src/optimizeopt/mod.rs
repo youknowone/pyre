@@ -2629,6 +2629,19 @@ impl OptContext {
         {
             let synth = self.live_synthetics.swap_remove(i);
             *op_rc.forwarded.borrow_mut() = synth.forwarded.borrow().clone();
+            // replace_op_with parity (optimizer.py): forward the superseded
+            // stand-in to the emitted producer. A consumer dispatched BEFORE
+            // this producer emitted (forward reference) bound its operand to
+            // `synth`; without this link its box-native walk freezes on the
+            // orphaned stand-in while the OpRef path resolves `op_rc`, so a
+            // later fold (e.g. GUARD_TRUE constant-folding the operand) lands
+            // on a different host and `resolve_box_box`'s witness diverges.
+            // `synth` stays alive in `resop_refs` (seeded there alongside
+            // `live_synthetics`), so its `Weak` upgrades and the chain reaches
+            // `op_rc`.
+            if !std::rc::Rc::ptr_eq(&synth, &op_rc) {
+                crate::r#box::BoxRef::from_bound_op(&synth).set_forwarded_op(&op_rc);
+            }
         }
         self.new_operations.push(op_rc);
         pos_ref
@@ -8137,6 +8150,54 @@ mod boxref_forwarding_tests {
                 .expect("walked terminal carries bound InputArg"),
             &ia_holder[1],
         ));
+    }
+
+    /// Forward-reference dup-materialization regression (keystone S2): a
+    /// consumer that binds its operand to a position's stand-in BEFORE the
+    /// producer at that position is emitted must, after the producer emits,
+    /// resolve through to the emitted producer — not freeze on the orphaned
+    /// stand-in. This is the `test_guard_true_int_lt_enables_add_ovf_removal`
+    /// shape reduced to OptContext primitives: GUARD_TRUE (consumer) is
+    /// dispatched and arg-bound to the pos-2 stand-in before INT_LT (producer)
+    /// emits its `new_operations` clone. Without the `emit` `set_forwarded_op`
+    /// link the box-native walk of the consumer arg terminates on the stand-in
+    /// while the OpRef path resolves the producer, tripping `resolve_box_box`'s
+    /// divergence witness (panic under `cfg(debug_assertions)`).
+    #[test]
+    fn s2_forward_reference_consumer_follows_emitted_producer() {
+        use majit_ir::resoperation::{Op, OpCode};
+        let mut ctx = OptContext::with_num_inputs_and_start_pos(0, 2, 0, 2);
+        let (b0, _ia0) = bound_inputarg_box(Type::Int, 0);
+        let (b1, _ia1) = bound_inputarg_box(Type::Int, 1);
+        ctx.seed_boxes_canonical(&[b0.clone(), b1.clone()]);
+
+        // pos 2 = an INT_LT result not yet emitted; mint the stand-in the
+        // recorder / `bind_input_resops` seeds into resop_refs + live_synthetics.
+        let pos2 = OpRef::int_op(2);
+        let _standin = ctx.mint_synthetic_resop(pos2, Type::Int);
+
+        // A consumer (GUARD_TRUE) dispatched before the producer binds its
+        // operand to the stand-in — the forward reference.
+        let consumer_arg = ctx.materialize_box_at(pos2);
+
+        // The producer emits at pos 2.
+        let mut producer = Op::new(OpCode::IntLt, &[b0.clone(), b1.clone()]);
+        producer.pos.set(pos2);
+        ctx.emit(producer);
+
+        // The frozen consumer arg must resolve to the emitted producer; the
+        // call also exercises resolve_box_box's witness, which would fire on
+        // the box-native-vs-OpRef divergence without the emit rebind.
+        let resolved = ctx.resolve_box_box(&consumer_arg);
+        let producer_b = ctx
+            .find_producer_op(pos2)
+            .expect("producer emitted at pos 2");
+        assert!(
+            resolved
+                .bound_op()
+                .is_some_and(|op| std::rc::Rc::ptr_eq(&op, &producer_b)),
+            "consumer must resolve to the emitted producer, not the orphaned stand-in"
+        );
     }
 
     /// `box.clear_forwarded()` resets a previously-set forwarding slot
