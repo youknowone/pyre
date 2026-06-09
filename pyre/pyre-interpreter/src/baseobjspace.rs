@@ -639,7 +639,7 @@ pub fn is_true(obj: PyObjectRef) -> bool {
             return pyre_object::w_set_len(obj) > 0;
         }
         if pyre_object::is_w_range(obj) {
-            return pyre_object::w_range_len(obj) > 0;
+            return pyre_object::w_range_bool(obj);
         }
         if is_none(obj) {
             return false;
@@ -1045,43 +1045,139 @@ unsafe fn getitem_instance(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
     )))
 }
 
-/// Read the `i64` value of an `int` or `bool` object.  `is_int` reports
-/// `True` for `bool` (a subtype of `int`), but `bool` stores its payload
-/// in a distinct struct layout, so the value must be read through the
-/// matching accessor rather than `w_int_get_value`.
-#[inline]
-unsafe fn int_or_bool_value(obj: PyObjectRef) -> i64 {
-    if is_bool(obj) {
-        w_bool_get_value(obj) as i64
-    } else {
-        w_int_get_value(obj)
-    }
-}
-
 #[inline(never)]
 /// `rangeobject.py W_RangeObject.descr_getitem` — integer index returns
 /// the member `start + i*step` (negative folded, bounds-checked); a slice
-/// returns a NEW `range` object, not a list.
+/// returns a NEW `range` object, not a list.  Indices and members are
+/// kept in bignum so a range past a machine word is still subscriptable.
 unsafe fn getitem_range(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
-    let (rstart, _rstop, rstep) = pyre_object::w_range_fields(obj);
-    let len = pyre_object::w_range_len(obj);
-    if is_int(index) {
-        return match pyre_object::w_range_getitem(obj, int_or_bool_value(index)) {
-            Some(v) => Ok(w_int_new(v)),
-            None => Err(PyError::new(
-                PyErrorKind::IndexError,
-                "range object index out of range",
-            )),
-        };
-    }
     if is_slice(index) {
-        let (sstart, sstop, sstep) = normalize_slice(index, len)?;
-        let new_start = rstart + sstart * rstep;
-        let new_stop = rstart + sstop * rstep;
-        let new_step = rstep * sstep;
-        return Ok(pyre_object::w_range_new(new_start, new_stop, new_step));
+        return range_compute_slice(obj, index);
     }
-    Err(index_type_error("range", index))
+    // `_compute_item` — `space.index(w_index)` then bounds-check.
+    let w_index = space_index(index)?;
+    let idx = pyre_object::range_obj_to_bigint(w_index);
+    match pyre_object::w_range_compute_item(obj, &idx) {
+        Some(v) => Ok(v),
+        None => Err(PyError::new(
+            PyErrorKind::IndexError,
+            "range object index out of range",
+        )),
+    }
+}
+
+/// `rangeobject.py compute_slice_indices3` — resolve a slice's
+/// (start, stop, step) against a wrapped `length`, in bignum.
+unsafe fn compute_slice_indices3_big(
+    slice: PyObjectRef,
+    length: &BigInt,
+) -> Result<(BigInt, BigInt, BigInt), PyError> {
+    use num_traits::{One, Zero};
+    let zero = BigInt::zero();
+    let one = BigInt::one();
+    let w_step = w_slice_get_step(slice);
+    let step = if is_none(w_step) {
+        one.clone()
+    } else {
+        let s = pyre_object::range_obj_to_bigint(space_index(w_step)?);
+        if s.is_zero() {
+            return Err(PyError::new(
+                PyErrorKind::ValueError,
+                "slice step cannot be zero",
+            ));
+        }
+        s
+    };
+    let negative_step = step < zero;
+    let w_start = w_slice_get_start(slice);
+    let start = if is_none(w_start) {
+        if negative_step {
+            length - &one
+        } else {
+            zero.clone()
+        }
+    } else {
+        let st = pyre_object::range_obj_to_bigint(space_index(w_start)?);
+        if st < zero {
+            let st = st + length;
+            if st < zero {
+                if negative_step {
+                    -one.clone()
+                } else {
+                    zero.clone()
+                }
+            } else {
+                st
+            }
+        } else if st >= *length {
+            if negative_step {
+                length - &one
+            } else {
+                length.clone()
+            }
+        } else {
+            st
+        }
+    };
+    let w_stop = w_slice_get_stop(slice);
+    let stop = if is_none(w_stop) {
+        if negative_step {
+            -one.clone()
+        } else {
+            length.clone()
+        }
+    } else {
+        let sp = pyre_object::range_obj_to_bigint(space_index(w_stop)?);
+        if sp < zero {
+            let sp = sp + length;
+            if sp < zero {
+                if negative_step {
+                    -one.clone()
+                } else {
+                    zero.clone()
+                }
+            } else {
+                sp
+            }
+        } else if sp >= *length {
+            if negative_step {
+                length - &one
+            } else {
+                length.clone()
+            }
+        } else {
+            sp
+        }
+    };
+    Ok((start, stop, step))
+}
+
+/// `rangeobject.py W_RangeObject._compute_slice` — build the NEW `range`
+/// a slice of `obj` denotes.
+unsafe fn range_compute_slice(obj: PyObjectRef, slice: PyObjectRef) -> PyResult {
+    use num_traits::Zero;
+    let len_b = pyre_object::range_obj_to_bigint(pyre_object::w_range_length(obj));
+    let (sl_start, sl_stop, sl_step) = compute_slice_indices3_big(slice, &len_b)?;
+    let (rstart, _rstop, rstep) = pyre_object::w_range_fields(obj);
+    let rstart_b = pyre_object::range_obj_to_bigint(rstart);
+    let rstep_b = pyre_object::range_obj_to_bigint(rstep);
+    let stop_is_zero = sl_stop.is_zero();
+    let substart = &rstart_b + &sl_start * &rstep_b;
+    let substep = &rstep_b * &sl_step;
+    let _roots = pyre_object::gc_roots::push_roots();
+    let w_substart = pyre_object::range_bigint_to_obj(substart);
+    pyre_object::gc_roots::pin_root(w_substart);
+    let w_substep = pyre_object::range_bigint_to_obj(substep);
+    pyre_object::gc_roots::pin_root(w_substep);
+    let w_substop = if stop_is_zero {
+        w_substart
+    } else {
+        let substop = &rstart_b + &sl_stop * &rstep_b;
+        let o = pyre_object::range_bigint_to_obj(substop);
+        pyre_object::gc_roots::pin_root(o);
+        o
+    };
+    Ok(pyre_object::w_range_new(w_substart, w_substop, w_substep))
 }
 
 /// `range.count(value)` — `rangeobject.py W_RangeObject.descr_count`.
@@ -1096,45 +1192,47 @@ fn range_index_method(args: &[PyObjectRef]) -> PyResult {
     let obj = args[0];
     let needle = args.get(1).copied().unwrap_or(PY_NULL);
     unsafe {
-        let (start, _stop, step) = pyre_object::w_range_fields(obj);
-        let len = pyre_object::w_range_len(obj);
-        if is_int(needle) {
-            let v = int_or_bool_value(needle);
-            if pyre_object::w_range_contains_int(obj, v) {
-                return Ok(w_int_new((v - start) / step));
+        // int / bool / long needle → O(1) `(value - start) // step`.
+        if is_int(needle) || is_long(needle) {
+            let item = pyre_object::range_obj_to_bigint(needle);
+            if pyre_object::w_range_contains_bigint(obj, &item) {
+                return Ok(pyre_object::w_range_index_of(obj, &item));
             }
             return Err(PyError::value_error(format!(
                 "{} is not in range",
                 crate::display::py_repr(needle)
             )));
         }
-        for i in 0..len {
-            if is_true(compare(w_int_new(start + i * step), needle, CompareOp::Eq)?) {
-                return Ok(w_int_new(i));
+        // `space.sequence_index` — elementwise scan.
+        let it = iter(obj)?;
+        let mut i: i64 = 0;
+        loop {
+            match next(it) {
+                Ok(item) => {
+                    if is_true(compare(item, needle, CompareOp::Eq)?) {
+                        return Ok(w_int_new(i));
+                    }
+                    i += 1;
+                }
+                Err(e) if e.kind == PyErrorKind::StopIteration => break,
+                Err(e) => return Err(e),
             }
         }
     }
-    Err(PyError::value_error(
-        "sequence.index(x): x not in sequence".to_string(),
-    ))
+    Err(PyError::value_error(format!(
+        "{} is not in range",
+        unsafe { crate::display::py_repr(needle) }
+    )))
 }
 
-/// `range.__iter__()` — fresh `W_RangeIterator` cursor.
+/// `range.__iter__()` — fresh `rangeiterator` / `longrange_iterator`.
 fn range_iter_method(args: &[PyObjectRef]) -> PyResult {
     iter(args[0])
 }
 
 /// `range.__reversed__()` — `rangeobject.py W_RangeObject.descr_reversed`.
 fn range_reversed_method(args: &[PyObjectRef]) -> PyResult {
-    unsafe {
-        let (start, _stop, step) = pyre_object::w_range_fields(args[0]);
-        let len = pyre_object::w_range_len(args[0]);
-        if len == 0 {
-            return Ok(pyre_object::w_range_iter_new(0, 0, 1));
-        }
-        let last = start + (len - 1) * step;
-        Ok(pyre_object::w_range_iter_new(last, start - step, -step))
-    }
+    unsafe { Ok(pyre_object::w_range_reversed(args[0])) }
 }
 
 /// `range.__reduce__()` — `functional.py W_Range.descr_reduce`:
@@ -1143,7 +1241,7 @@ fn range_reduce_method(args: &[PyObjectRef]) -> PyResult {
     let (start, stop, step) = unsafe { pyre_object::w_range_fields(args[0]) };
     let range_type =
         crate::typedef::gettypefor(&pyre_object::rangeobject::RANGE_TYPE).unwrap_or(PY_NULL);
-    let state = w_tuple_new(vec![w_int_new(start), w_int_new(stop), w_int_new(step)]);
+    let state = w_tuple_new(vec![start, stop, step]);
     Ok(w_tuple_new(vec![range_type, state]))
 }
 
@@ -1152,14 +1250,16 @@ fn range_reduce_method(args: &[PyObjectRef]) -> PyResult {
 /// for empty (`(len, None, None)`) and single-element (`(len, start,
 /// None)`) ranges so equal ranges hash equal.
 fn range_hash_method(args: &[PyObjectRef]) -> PyResult {
+    use num_traits::Zero;
     let (start, _stop, step) = unsafe { pyre_object::w_range_fields(args[0]) };
-    let len = unsafe { pyre_object::w_range_len(args[0]) };
-    let items = if len == 0 {
-        vec![w_int_new(0), w_none(), w_none()]
-    } else if len == 1 {
-        vec![w_int_new(1), w_int_new(start), w_none()]
+    let len_obj = unsafe { pyre_object::w_range_length(args[0]) };
+    let len = unsafe { pyre_object::range_obj_to_bigint(len_obj) };
+    let items = if len.is_zero() {
+        vec![len_obj, w_none(), w_none()]
+    } else if len == BigInt::from(1) {
+        vec![len_obj, start, w_none()]
     } else {
-        vec![w_int_new(len), w_int_new(start), w_int_new(step)]
+        vec![len_obj, start, step]
     };
     Ok(w_int_new(hash_w_strict(w_tuple_new(items))?))
 }
@@ -1522,8 +1622,20 @@ pub fn len(obj: PyObjectRef) -> PyResult {
                 pyre_object::bytesobject::bytes_like_len(obj) as i64
             ))
         } else if pyre_object::is_w_range(obj) {
-            // `rangeobject.py W_RangeObject.descr_len → self.w_length`.
-            Ok(w_int_new(pyre_object::w_range_len(obj)))
+            // `descr_len → self.w_length`, then `_check_len_result` →
+            // `getindex_w(w_int, w_OverflowError)`: `len()` must fit a
+            // machine word, so a bignum-length range raises OverflowError.
+            match pyre_object::w_range_length_i64(obj) {
+                Some(n) => Ok(w_int_new(n)),
+                None => Err(PyError::overflow_error(
+                    "cannot fit 'int' into an index-sized integer",
+                )),
+            }
+        } else if pyre_object::is_long_range_iter(obj) {
+            // `iterobject.py W_LongRangeIterator.descr_len → w_len - w_index`.
+            Ok(pyre_object::range_bigint_to_obj(
+                pyre_object::w_long_range_iter_len(obj),
+            ))
         } else if is_range_iter(obj) {
             // `iterobject.py W_AbstractSeqIterObject.descr_length_hint`
             // — the iterator reports its REMAINING count, derived from
@@ -1987,12 +2099,11 @@ pub fn getattr_str(obj: PyObjectRef, name: &str) -> PyResult {
             match name {
                 "start" | "stop" | "step" => {
                     let (start, stop, step) = pyre_object::w_range_fields(obj);
-                    let v = match name {
+                    return Ok(match name {
                         "start" => start,
                         "stop" => stop,
                         _ => step,
-                    };
-                    return Ok(w_int_new(v));
+                    });
                 }
                 _ => {}
             }
@@ -2024,6 +2135,7 @@ pub fn getattr_str(obj: PyObjectRef, name: &str) -> PyResult {
     unsafe {
         if is_seq_iter(obj)
             || is_range_iter(obj)
+            || pyre_object::is_long_range_iter(obj)
             || pyre_object::dictviewobject::is_dict_view_iterator(obj)
             || pyre_object::enumerateobject::is_enumerate(obj)
             || pyre_object::callableiteratorobject::is_callable_iterator(obj)
@@ -6326,6 +6438,7 @@ pub fn is_iterable(w_obj: PyObjectRef) -> bool {
             || is_dict(obj)
             || pyre_object::is_set_or_frozenset(obj)
             || is_range_iter(obj)
+            || pyre_object::is_long_range_iter(obj)
             || is_seq_iter(obj)
             || pyre_object::generatorobject::is_generator(obj)
             || pyre_object::itertoolsmodule::is_count(obj)
@@ -6467,13 +6580,16 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
             let key_list = pyre_object::w_list_new(items);
             return Ok(pyre_object::w_seq_iter_new(key_list, len));
         }
-        // `range` sequence → fresh `W_RangeIterator` cursor.
+        // `range` sequence → a `rangeiterator` (machine-int, JIT) when the
+        // bounds fit a word, else a `longrange_iterator`.
         if pyre_object::is_w_range(obj) {
-            let (start, stop, step) = pyre_object::w_range_fields(obj);
-            return Ok(pyre_object::w_range_iter_new(start, stop, step));
+            return Ok(pyre_object::w_range_iter(obj));
         }
         // Already an iterator
-        if is_range_iter(obj) || is_seq_iter(obj) || pyre_object::generatorobject::is_generator(obj)
+        if is_range_iter(obj)
+            || pyre_object::is_long_range_iter(obj)
+            || is_seq_iter(obj)
+            || pyre_object::generatorobject::is_generator(obj)
         {
             return Ok(obj);
         }
@@ -6663,6 +6779,20 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                 attach_tb: true,
                 reraise_lasti: -1,
             });
+        }
+        // `iterobject.py W_LongRangeIterator.descr_next` — bignum-bound
+        // range cursor (`start + index*step`).
+        if pyre_object::is_long_range_iter(obj) {
+            return match pyre_object::w_long_range_iter_next(obj) {
+                Some(v) => Ok(v),
+                None => Err(PyError {
+                    kind: PyErrorKind::StopIteration,
+                    message: "".to_string(),
+                    exc_object: std::ptr::null_mut(),
+                    attach_tb: true,
+                    reraise_lasti: -1,
+                }),
+            };
         }
         // Generator __next__ — PyPy: generator.py GeneratorIterator.next
         if pyre_object::generatorobject::is_generator(obj) {
@@ -7700,20 +7830,24 @@ pub fn contains(haystack: PyObjectRef, needle: PyObjectRef) -> Result<bool, PyEr
         }
     }
     // `rangeobject.py W_RangeObject.descr_contains` — O(1) membership for
-    // an int needle; any other type falls back to an elementwise scan.
+    // an int/long needle; any other type falls back to an elementwise scan.
     unsafe {
         if pyre_object::is_w_range(haystack) {
-            if is_int(needle) {
-                return Ok(pyre_object::w_range_contains_int(
-                    haystack,
-                    int_or_bool_value(needle),
-                ));
+            if is_int(needle) || is_long(needle) {
+                let item = pyre_object::range_obj_to_bigint(needle);
+                return Ok(pyre_object::w_range_contains_bigint(haystack, &item));
             }
-            let (start, _stop, step) = pyre_object::w_range_fields(haystack);
-            let len = pyre_object::w_range_len(haystack);
-            for i in 0..len {
-                if is_true(compare(w_int_new(start + i * step), needle, CompareOp::Eq)?) {
-                    return Ok(true);
+            // `space.sequence_contains` — elementwise scan.
+            let it = iter(haystack)?;
+            loop {
+                match next(it) {
+                    Ok(item) => {
+                        if is_true(compare(item, needle, CompareOp::Eq)?) {
+                            return Ok(true);
+                        }
+                    }
+                    Err(e) if e.kind == PyErrorKind::StopIteration => break,
+                    Err(e) => return Err(e),
                 }
             }
             return Ok(false);

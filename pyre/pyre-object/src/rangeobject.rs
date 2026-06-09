@@ -1,10 +1,15 @@
-//! W_RangeIterator -- simplified range iterator.
+//! Range objects and their iterators.
 //!
-//! `range()` returns an iterator directly (no separate range object).
-//! The JIT specializes `for i in range(N)` to pure integer arithmetic
-//! by reading/writing `current`, `stop`, `step` via field descriptors.
+//! `range()` builds a `W_Range` sequence carrying wrapped `(start, stop,
+//! step, length)` bounds; `iter()` produces a `W_RangeIterator` (machine
+//! int, JIT-specializable) when every bound fits a word, else a
+//! `W_LongRangeIterator` (bignum), mirroring `rangeiterator` /
+//! `longrange_iterator`.  The JIT specializes `for i in range(N)` to pure
+//! integer arithmetic by reading/writing the iterator's `current`,
+//! `stop`, `step` via field descriptors.
 
 use crate::pyobject::*;
+use malachite_bigint::BigInt;
 use pyre_macros::pyre_class;
 
 /// Range iterator object.
@@ -189,21 +194,45 @@ mod tests {
 // ── Range sequence object ──
 //
 // `objspace/std/rangeobject.py W_AbstractRangeObject` / `W_RangeObject`:
-// an immutable arithmetic sequence carrying `(start, stop, step)`.
-// Distinct from `W_RangeIterator` (the cursor produced by `iter()`), so a
-// range is reusable, sized, indexable and comparable.
+// an immutable arithmetic sequence carrying `(start, stop, step)`.  PyPy
+// stores the three bounds as wrapped ints, so a range can describe values
+// beyond a machine word; pyre keeps the same three wrapped fields.
+//
+// The hot `for i in range(n)` loop never reads these fields — `iter()`
+// produces a `W_RangeIterator` (i64, JIT-specialized) when every bound
+// fits a machine word, and a `W_LongRangeIterator` otherwise, mirroring
+// PyPy's `rangeiterator` / `longrange_iterator` split.
 
 /// `range(start, stop, step)` sequence object.
+///
+/// `w_length` is precomputed once at construction (`descr_new` →
+/// `compute_range_length`) and read back by `descr_len` / `descr_bool`.
 #[pyre_class("range", type_id = 7, static_name = "RANGE")]
 pub struct W_Range {
-    pub start: i64,
-    pub stop: i64,
-    pub step: i64,
+    pub start: PyObjectRef,
+    pub stop: PyObjectRef,
+    pub step: PyObjectRef,
+    pub length: PyObjectRef,
 }
 
-/// Allocate a `W_Range`.  `step` must already be non-zero (the caller
-/// raises `ValueError` for a zero step before reaching here).
-pub fn w_range_new(start: i64, stop: i64, step: i64) -> PyObjectRef {
+/// Allocate a `W_Range` from three wrapped int/long bounds.  `step` must
+/// already be non-zero (the caller raises `ValueError` for a zero step
+/// before reaching here).  The element count is computed once here and
+/// stored, mirroring `descr_new`'s `compute_range_length`.
+pub fn w_range_new(start: PyObjectRef, stop: PyObjectRef, step: PyObjectRef) -> PyObjectRef {
+    let _roots = crate::gc_roots::push_roots();
+    crate::gc_roots::pin_root(start);
+    crate::gc_roots::pin_root(stop);
+    crate::gc_roots::pin_root(step);
+    let length = unsafe {
+        let len_big = range_length_big(
+            &range_obj_to_bigint(start),
+            &range_obj_to_bigint(stop),
+            &range_obj_to_bigint(step),
+        );
+        range_bigint_to_obj(len_big)
+    };
+    crate::gc_roots::pin_root(length);
     W_Range::allocate(W_Range {
         ob: PyObject {
             ob_type: std::ptr::null(),
@@ -212,7 +241,17 @@ pub fn w_range_new(start: i64, stop: i64, step: i64) -> PyObjectRef {
         start,
         stop,
         step,
+        length,
     })
+}
+
+/// Convenience constructor wrapping three machine-int bounds.
+pub fn w_range_new_i64(start: i64, stop: i64, step: i64) -> PyObjectRef {
+    w_range_new(
+        crate::intobject::w_int_new(start),
+        crate::intobject::w_int_new(stop),
+        crate::intobject::w_int_new(step),
+    )
 }
 
 /// # Safety
@@ -222,14 +261,246 @@ pub unsafe fn is_w_range(obj: PyObjectRef) -> bool {
     unsafe { py_type_check(obj, &RANGE_TYPE) }
 }
 
-/// Read the `(start, stop, step)` triple of a range object.
+/// Read the wrapped `(start, stop, step)` triple of a range object.
 ///
 /// # Safety
 /// `obj` must point to a valid `W_Range`.
 #[inline]
-pub unsafe fn w_range_fields(obj: PyObjectRef) -> (i64, i64, i64) {
+pub unsafe fn w_range_fields(obj: PyObjectRef) -> (PyObjectRef, PyObjectRef, PyObjectRef) {
     let r = obj as *const W_Range;
     unsafe { ((*r).start, (*r).stop, (*r).step) }
+}
+
+/// Read an int/long/bool operand as a `BigInt`.
+///
+/// # Safety
+/// `obj` must be a valid int, long, or bool object.
+pub unsafe fn range_obj_to_bigint(obj: PyObjectRef) -> BigInt {
+    unsafe {
+        if is_int(obj) {
+            BigInt::from(crate::intobject::w_int_get_value(obj))
+        } else if is_bool(obj) {
+            BigInt::from(crate::boolobject::w_bool_get_value(obj) as i64)
+        } else {
+            crate::longobject::w_long_get_value(obj).clone()
+        }
+    }
+}
+
+/// Wrap a `BigInt` as a machine int when it fits, otherwise a long.
+pub fn range_bigint_to_obj(value: BigInt) -> PyObjectRef {
+    use num_traits::ToPrimitive;
+    match value.to_i64() {
+        Some(v) => crate::intobject::w_int_new(v),
+        None => crate::longobject::w_long_new(value),
+    }
+}
+
+/// A single int/long/bool bound as an i64 when it fits, else `None`.
+///
+/// # Safety
+/// `obj` must be a valid int/long/bool object.
+pub unsafe fn range_obj_as_i64(obj: PyObjectRef) -> Option<i64> {
+    unsafe {
+        if is_int(obj) {
+            Some(crate::intobject::w_int_get_value(obj))
+        } else if is_bool(obj) {
+            Some(crate::boolobject::w_bool_get_value(obj) as i64)
+        } else {
+            use num_traits::ToPrimitive;
+            crate::longobject::w_long_get_value(obj).to_i64()
+        }
+    }
+}
+
+/// The `(start, stop, step)` triple as machine ints when all three fit a
+/// machine word (the common case); `None` if any bound is a bignum.
+///
+/// # Safety
+/// `obj` must point to a valid `W_Range`.
+pub unsafe fn w_range_fields_i64(obj: PyObjectRef) -> Option<(i64, i64, i64)> {
+    unsafe {
+        let (s, e, t) = w_range_fields(obj);
+        Some((
+            range_obj_as_i64(s)?,
+            range_obj_as_i64(e)?,
+            range_obj_as_i64(t)?,
+        ))
+    }
+}
+
+/// The precomputed wrapped element count — `descr_len → self.w_length`.
+///
+/// # Safety
+/// `obj` must point to a valid `W_Range`.
+#[inline]
+pub unsafe fn w_range_length(obj: PyObjectRef) -> PyObjectRef {
+    let r = obj as *const W_Range;
+    unsafe { (*r).length }
+}
+
+/// The element count as a machine int when it fits, else `None`.
+///
+/// # Safety
+/// `obj` must point to a valid `W_Range`.
+#[inline]
+pub unsafe fn w_range_length_i64(obj: PyObjectRef) -> Option<i64> {
+    unsafe { range_obj_as_i64(w_range_length(obj)) }
+}
+
+/// `descr_bool → space.nonzero(self.w_length)` — a range is truthy iff it
+/// has at least one element.
+///
+/// # Safety
+/// `obj` must point to a valid `W_Range`.
+pub unsafe fn w_range_bool(obj: PyObjectRef) -> bool {
+    use num_traits::Zero;
+    unsafe { !range_obj_to_bigint(w_range_length(obj)).is_zero() }
+}
+
+/// `descr_iter` — a `rangeiterator` (`W_RangeIterator`, machine-int and
+/// JIT-specializable) when every bound fits a machine word, otherwise a
+/// `longrange_iterator` (`W_LongRangeIterator`).
+///
+/// # Safety
+/// `obj` must point to a valid `W_Range`.
+pub unsafe fn w_range_iter(obj: PyObjectRef) -> PyObjectRef {
+    unsafe {
+        if let Some((start, stop, step)) = w_range_fields_i64(obj) {
+            w_range_iter_new(start, stop, step)
+        } else {
+            let (start, _stop, step) = w_range_fields(obj);
+            let len = w_range_length(obj);
+            w_long_range_iter_new(start, step, len)
+        }
+    }
+}
+
+/// `descr_reversed` — walk the span backwards.  The fast path keeps a
+/// machine-int `W_RangeIterator` so `for i in reversed(range(n))` stays
+/// JIT-specializable; otherwise a `W_LongRangeIterator` from
+/// `(start + (length-1)*step, -step, length)`.
+///
+/// # Safety
+/// `obj` must point to a valid `W_Range`.
+pub unsafe fn w_range_reversed(obj: PyObjectRef) -> PyObjectRef {
+    use num_traits::One;
+    unsafe {
+        if let Some((start, stop, step)) = w_range_fields_i64(obj) {
+            let len = range_length(start, stop, step);
+            if len == 0 {
+                return w_range_iter_new(0, 0, 1);
+            }
+            let last = start + (len - 1) * step;
+            return w_range_iter_new(last, start - step, -step);
+        }
+        let (start, _stop, step) = w_range_fields(obj);
+        let len_obj = w_range_length(obj);
+        let start_b = range_obj_to_bigint(start);
+        let step_b = range_obj_to_bigint(step);
+        let len_b = range_obj_to_bigint(len_obj);
+        let lastitem = &start_b + (&len_b - BigInt::one()) * &step_b;
+        let _roots = crate::gc_roots::push_roots();
+        crate::gc_roots::pin_root(len_obj);
+        let w_lastitem = range_bigint_to_obj(lastitem);
+        crate::gc_roots::pin_root(w_lastitem);
+        let w_negstep = range_bigint_to_obj(-step_b);
+        crate::gc_roots::pin_root(w_negstep);
+        w_long_range_iter_new(w_lastitem, w_negstep, len_obj)
+    }
+}
+
+/// `_compute_item` — the member at `index` (negative folded against the
+/// length), or `None` when out of bounds (`IndexError` at the call site).
+/// `index` is the already-`__index__`'d operand as a `BigInt`.
+///
+/// # Safety
+/// `obj` must point to a valid `W_Range`.
+pub unsafe fn w_range_compute_item(obj: PyObjectRef, index: &BigInt) -> Option<PyObjectRef> {
+    use num_traits::Zero;
+    unsafe {
+        let (start, _stop, step) = w_range_fields(obj);
+        let len_b = range_obj_to_bigint(w_range_length(obj));
+        let mut idx = index.clone();
+        if idx < BigInt::zero() {
+            idx += &len_b;
+        }
+        if idx >= len_b || idx < BigInt::zero() {
+            return None;
+        }
+        let value = range_obj_to_bigint(start) + idx * range_obj_to_bigint(step);
+        Some(range_bigint_to_obj(value))
+    }
+}
+
+/// `_contains_long` — O(1) membership test for an integer `item`.
+///
+/// # Safety
+/// `obj` must point to a valid `W_Range`.
+pub unsafe fn w_range_contains_bigint(obj: PyObjectRef, item: &BigInt) -> bool {
+    use num_traits::Zero;
+    unsafe {
+        let (start, stop, step) = w_range_fields(obj);
+        let start_b = range_obj_to_bigint(start);
+        let stop_b = range_obj_to_bigint(stop);
+        let step_b = range_obj_to_bigint(step);
+        if step_b > BigInt::zero() {
+            // positive steps: start <= ob < stop
+            if !(start_b <= *item && *item < stop_b) {
+                return false;
+            }
+        } else {
+            // negative steps: stop < ob <= start
+            if !(stop_b < *item && *item <= start_b) {
+                return false;
+            }
+        }
+        // The stride must not invalidate membership.
+        ((item - &start_b) % &step_b).is_zero()
+    }
+}
+
+/// `descr_index` — the position of `item` (known to be in range), i.e.
+/// `(item - start) // step`.
+///
+/// # Safety
+/// `obj` must point to a valid `W_Range`.
+pub unsafe fn w_range_index_of(obj: PyObjectRef, item: &BigInt) -> PyObjectRef {
+    unsafe {
+        let (start, _stop, step) = w_range_fields(obj);
+        let value = (item - range_obj_to_bigint(start)) / range_obj_to_bigint(step);
+        range_bigint_to_obj(value)
+    }
+}
+
+/// `descr_eq` — two ranges are equal iff they generate the same sequence:
+/// equal lengths, and for a non-empty range equal start and (for length
+/// > 1) equal step.  The caller has already established both operands are
+/// ranges.
+///
+/// # Safety
+/// `a` and `b` must point to valid `W_Range` objects.
+pub unsafe fn w_range_eq(a: PyObjectRef, b: PyObjectRef) -> bool {
+    use num_traits::One;
+    unsafe {
+        let la = range_obj_to_bigint(w_range_length(a));
+        let lb = range_obj_to_bigint(w_range_length(b));
+        if la != lb {
+            return false;
+        }
+        let (astart, _astop, astep) = w_range_fields(a);
+        let (bstart, _bstop, bstep) = w_range_fields(b);
+        if la == BigInt::from(0) {
+            return true;
+        }
+        if range_obj_to_bigint(astart) != range_obj_to_bigint(bstart) {
+            return false;
+        }
+        if la == BigInt::one() {
+            return true;
+        }
+        range_obj_to_bigint(astep) == range_obj_to_bigint(bstep)
+    }
 }
 
 /// Number of elements in a `(start, stop, step)` range —
@@ -248,47 +519,105 @@ pub fn range_length(start: i64, stop: i64, step: i64) -> i64 {
     }
 }
 
-/// Length of a `W_Range`.
-///
-/// # Safety
-/// `obj` must point to a valid `W_Range`.
-pub unsafe fn w_range_len(obj: PyObjectRef) -> i64 {
-    let (start, stop, step) = unsafe { w_range_fields(obj) };
-    range_length(start, stop, step)
-}
-
-/// `start + index * step` for an already-normalised, in-bounds `index`
-/// (`0 <= index < len`).  Returns `None` when out of range so the caller
-/// can raise `IndexError`; negative indices are folded by adding `len`.
-///
-/// # Safety
-/// `obj` must point to a valid `W_Range`.
-pub unsafe fn w_range_getitem(obj: PyObjectRef, index: i64) -> Option<i64> {
-    let (start, _stop, step) = unsafe { w_range_fields(obj) };
-    let len = unsafe { w_range_len(obj) };
-    let i = if index < 0 { index + len } else { index };
-    if i < 0 || i >= len {
-        None
-    } else {
-        Some(start + i * step)
-    }
-}
-
-/// Whether integer `value` is a member of the range —
-/// `rangeobject.py W_RangeObject.descr_contains` integer fast path.
-///
-/// # Safety
-/// `obj` must point to a valid `W_Range`.
-pub unsafe fn w_range_contains_int(obj: PyObjectRef, value: i64) -> bool {
-    let (start, stop, step) = unsafe { w_range_fields(obj) };
-    if step > 0 {
-        if value < start || value >= stop {
-            return false;
+/// Bignum `compute_range_length` — always non-negative.
+pub fn range_length_big(start: &BigInt, stop: &BigInt, step: &BigInt) -> BigInt {
+    use num_traits::{One, Zero};
+    let zero = BigInt::zero();
+    if *step > zero {
+        if *start < *stop {
+            (stop - start - BigInt::one()) / step + BigInt::one()
+        } else {
+            BigInt::zero()
         }
-    } else if value > start || value <= stop {
-        return false;
+    } else if *start > *stop {
+        (start - stop - BigInt::one()) / (-step) + BigInt::one()
+    } else {
+        BigInt::zero()
     }
-    (value - start) % step == 0
+}
+
+// ── Long range iterator ──
+//
+// `objspace/std/iterobject.py W_LongRangeIterator` — the cursor `iter()`
+// produces for a range whose bounds exceed a machine word.  `start`,
+// `step` and `len` stay wrapped (set once at construction); only the
+// machine-int `index` advances, so no GC pointer field is ever mutated.
+
+#[pyre_class("longrange_iterator", type_id = 8, static_name = "LONG_RANGE_ITER")]
+pub struct W_LongRangeIterator {
+    pub start: PyObjectRef,
+    pub step: PyObjectRef,
+    pub len: PyObjectRef,
+    pub index: i64,
+}
+
+/// Allocate a `W_LongRangeIterator`.
+pub fn w_long_range_iter_new(
+    start: PyObjectRef,
+    step: PyObjectRef,
+    len: PyObjectRef,
+) -> PyObjectRef {
+    let _roots = crate::gc_roots::push_roots();
+    crate::gc_roots::pin_root(start);
+    crate::gc_roots::pin_root(step);
+    crate::gc_roots::pin_root(len);
+    W_LongRangeIterator::allocate(W_LongRangeIterator {
+        ob: PyObject {
+            ob_type: std::ptr::null(),
+            w_class: std::ptr::null_mut(),
+        },
+        start,
+        step,
+        len,
+        index: 0,
+    })
+}
+
+/// # Safety
+/// `obj` must be a valid, non-null pointer to a `PyObject`.
+#[inline]
+pub unsafe fn is_long_range_iter(obj: PyObjectRef) -> bool {
+    unsafe { py_type_check(obj, &LONG_RANGE_ITER_TYPE) }
+}
+
+/// Number of elements not yet produced — `__length_hint__`.
+///
+/// # Safety
+/// `obj` must point to a valid `W_LongRangeIterator`.
+pub unsafe fn w_long_range_iter_len(obj: PyObjectRef) -> BigInt {
+    unsafe {
+        let it = obj as *const W_LongRangeIterator;
+        let len = range_obj_to_bigint((*it).len);
+        let rem = len - BigInt::from((*it).index);
+        if rem < BigInt::from(0) {
+            BigInt::from(0)
+        } else {
+            rem
+        }
+    }
+}
+
+/// Advance the long-range iterator and return the next value, or `None`
+/// once exhausted — `start + index * step`.
+///
+/// # Safety
+/// `obj` must point to a valid `W_LongRangeIterator`.
+pub unsafe fn w_long_range_iter_next(obj: PyObjectRef) -> Option<PyObjectRef> {
+    unsafe {
+        let it = obj as *mut W_LongRangeIterator;
+        let index = (*it).index;
+        let len = range_obj_to_bigint((*it).len);
+        if BigInt::from(index) >= len {
+            return None;
+        }
+        let start = range_obj_to_bigint((*it).start);
+        let step = range_obj_to_bigint((*it).step);
+        let value = start + BigInt::from(index) * step;
+        // Only the machine-int index is mutated; the wrapped fields stay
+        // immutable, so no GC pointer field is overwritten.
+        (*it).index = index + 1;
+        Some(range_bigint_to_obj(value))
+    }
 }
 
 #[cfg(test)]
@@ -319,16 +648,29 @@ mod range_obj_tests {
     }
 
     #[test]
-    fn w_range_getitem_and_contains() {
-        let r = w_range_new(0, 10, 2);
+    fn w_range_fields_i64_roundtrip() {
+        let r = w_range_new_i64(0, 10, 2);
         unsafe {
-            assert_eq!(w_range_len(r), 5);
-            assert_eq!(w_range_getitem(r, 0), Some(0));
-            assert_eq!(w_range_getitem(r, 4), Some(8));
-            assert_eq!(w_range_getitem(r, -1), Some(8));
-            assert_eq!(w_range_getitem(r, 5), None);
-            assert!(w_range_contains_int(r, 4));
-            assert!(!w_range_contains_int(r, 5));
+            assert_eq!(w_range_fields_i64(r), Some((0, 10, 2)));
+        }
+    }
+
+    #[test]
+    fn long_range_iter_yields_values() {
+        let it = w_long_range_iter_new(
+            crate::intobject::w_int_new(5),
+            crate::intobject::w_int_new(2),
+            crate::intobject::w_int_new(3),
+        );
+        unsafe {
+            assert!(is_long_range_iter(it));
+            let v0 = w_long_range_iter_next(it).unwrap();
+            assert_eq!(crate::intobject::w_int_get_value(v0), 5);
+            let v1 = w_long_range_iter_next(it).unwrap();
+            assert_eq!(crate::intobject::w_int_get_value(v1), 7);
+            let v2 = w_long_range_iter_next(it).unwrap();
+            assert_eq!(crate::intobject::w_int_get_value(v2), 9);
+            assert!(w_long_range_iter_next(it).is_none());
         }
     }
 }

@@ -1034,61 +1034,50 @@ fn builtin_print(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     Ok(w_none())
 }
 
-/// functional.py:464-475 — `space.index` applies `__index__`, then the
-/// result is taken as a machine int (`space.int_w`).
-unsafe fn range_arg_to_i64(obj: PyObjectRef) -> Result<i64, crate::PyError> {
-    let w_index = crate::baseobjspace::space_index(obj)?;
-    if is_int(w_index) {
-        return Ok(w_int_get_value(w_index));
-    }
-    // pyre's range is i64-backed (`W_Range` keeps `start`/`stop`/`step` as
-    // i64 so the JIT can specialize `for i in range(n)` to register
-    // arithmetic), unlike PyPy's wrapped-int range.  A bound that does not
-    // fit a machine word saturates toward its own sign so a huge negative
-    // bound stays negative instead of flipping to a huge positive stop;
-    // raising here would break `range(1 << 1000)` constructions that the
-    // stdlib (`_collections_abc`) performs without ever materializing the
-    // value.
-    let big = w_long_get_value(w_index);
-    Ok(big.to_i64().unwrap_or_else(|| {
-        use num_traits::Signed;
-        if big.is_negative() { i64::MIN } else { i64::MAX }
-    }))
-}
-
-/// `range(stop)` or `range(start, stop)` or `range(start, stop, step)`.
-///
-/// Returns a `W_Range` sequence object; `iter()` produces a fresh
-/// `W_RangeIterator` cursor.
+/// `range(stop)` / `range(start, stop[, step])` — `functional.py
+/// W_Range.descr_new`.  Each bound passes through `space.index`
+/// (`__index__`) and is stored wrapped, so a range may span past a
+/// machine word; `iter()` then produces a `rangeiterator` (machine-int,
+/// JIT-specializable) or a `longrange_iterator` accordingly.
 fn builtin_range(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    match args.len() {
-        0 => Err(crate::PyError::type_error(
+    let n = args.len();
+    if n == 0 {
+        return Err(crate::PyError::type_error(
             "range expected at least 1 argument, got 0",
-        )),
-        1 => {
-            let stop = unsafe { range_arg_to_i64(args[0]) }?;
-            Ok(pyre_object::w_range_new(0, stop, 1))
-        }
-        2 => {
-            let start = unsafe { range_arg_to_i64(args[0]) }?;
-            let stop = unsafe { range_arg_to_i64(args[1]) }?;
-            Ok(pyre_object::w_range_new(start, stop, 1))
-        }
-        3 => {
-            let start = unsafe { range_arg_to_i64(args[0]) }?;
-            let stop = unsafe { range_arg_to_i64(args[1]) }?;
-            let step = unsafe { range_arg_to_i64(args[2]) }?;
-            if step == 0 {
-                return Err(crate::PyError::value_error(
-                    "step argument must not be zero",
-                ));
+        ));
+    }
+    if n > 3 {
+        return Err(crate::PyError::type_error(format!(
+            "range expected at most 3 arguments, got {n}"
+        )));
+    }
+    unsafe {
+        let _roots = pyre_object::gc_roots::push_roots();
+        let mut w_start = crate::baseobjspace::space_index(args[0])?;
+        pyre_object::gc_roots::pin_root(w_start);
+        let w_stop;
+        let w_step;
+        if n == 1 {
+            // Only `stop` given — `w_start, w_stop = 0, w_start`.
+            w_stop = w_start;
+            w_start = w_int_new(0);
+            w_step = w_int_new(1);
+        } else {
+            w_stop = crate::baseobjspace::space_index(args[1])?;
+            pyre_object::gc_roots::pin_root(w_stop);
+            if n == 3 {
+                w_step = crate::baseobjspace::space_index(args[2])?;
+                pyre_object::gc_roots::pin_root(w_step);
+                if pyre_object::range_obj_to_bigint(w_step) == BigInt::from(0) {
+                    return Err(crate::PyError::value_error(
+                        "step argument must not be zero",
+                    ));
+                }
+            } else {
+                w_step = w_int_new(1);
             }
-            Ok(pyre_object::w_range_new(start, stop, step))
         }
-        _ => Err(crate::PyError::type_error(format!(
-            "range expected at most 3 arguments, got {}",
-            args.len()
-        ))),
+        Ok(pyre_object::w_range_new(w_start, w_stop, w_step))
     }
 }
 
@@ -4841,13 +4830,7 @@ fn builtin_reversed(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
         // range: rangeobject.py W_RangeObject.descr_reversed — reflect
         // the span and hand back a fresh reverse-walking iterator.
         if pyre_object::is_w_range(obj) {
-            let (start, _stop, step) = pyre_object::w_range_fields(obj);
-            let len = pyre_object::w_range_len(obj);
-            if len == 0 {
-                return Ok(pyre_object::w_range_iter_new(0, 0, 1));
-            }
-            let last = start + (len - 1) * step;
-            return Ok(pyre_object::w_range_iter_new(last, start - step, -step));
+            return Ok(pyre_object::w_range_reversed(obj));
         }
         // range_iterator: a bare iterator (e.g. from `iter(range(n))`)
         // can also be reversed. rangeobject.py

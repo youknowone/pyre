@@ -1435,14 +1435,14 @@ impl IterOpcodeHandler for PyFrame {
             // loop body, so the JIT's `for i in range(N)` fast path is
             // unaffected.
             if pyre_object::is_w_range(iter) {
-                let (start, stop, step) = pyre_object::w_range_fields(iter);
-                let it = pyre_object::w_range_iter_new(start, stop, step);
+                let it = pyre_object::w_range_iter(iter);
                 let tos = self.valuestackdepth - 1;
                 self.locals_w_mut()[tos] = it;
                 return Ok(());
             }
             // Already an iterator
             if pyre_object::is_range_iter(iter)
+                || pyre_object::is_long_range_iter(iter)
                 || pyre_object::is_seq_iter(iter)
                 || pyre_object::generatorobject::is_generator(iter)
                 || pyre_object::itertoolsmodule::is_repeat(iter)

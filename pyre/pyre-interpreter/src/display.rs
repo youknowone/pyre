@@ -542,12 +542,20 @@ pub unsafe fn py_repr(obj: PyObjectRef) -> String {
         } else if pyre_object::is_w_range(obj) {
             // `rangeobject.py W_AbstractRangeObject.descr_repr` —
             // `range(start, stop)`, with the step appended only when
-            // it is not 1.
+            // it is not 1.  Bounds may be bignum, so render each wrapped
+            // int rather than a machine word.
             let (start, stop, step) = pyre_object::w_range_fields(obj);
-            if step == 1 {
-                format!("range({start}, {stop})")
+            let step_is_one =
+                pyre_object::range_obj_to_bigint(step) == malachite_bigint::BigInt::from(1);
+            if step_is_one {
+                format!("range({}, {})", py_repr(start), py_repr(stop))
             } else {
-                format!("range({start}, {stop}, {step})")
+                format!(
+                    "range({}, {}, {})",
+                    py_repr(start),
+                    py_repr(stop),
+                    py_repr(step)
+                )
             }
         } else if std::ptr::eq(tp, &INSTANCE_TYPE as *const PyType) {
             // Try __repr__ first, then __str__
