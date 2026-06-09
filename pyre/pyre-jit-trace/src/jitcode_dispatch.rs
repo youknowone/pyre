@@ -7972,13 +7972,16 @@ fn try_walker_specialize_binary_op_float(
 /// #62: walker-native speculative specialization for the `BINARY_SUBSCR`
 /// helper residual_call (oopspec `BinaryOp`, op_tag `Subscr`).  Ports
 /// `generated_binary_subscr_value` → `generated_list_getitem_by_strategy`
-/// for the int- and float-storage list strategies with a non-negative
-/// concrete index: `guard_class LIST` + `guard_value(strategy)` + unbox
-/// index + `IntLt` bounds guard + raw-array getitem, then `wrapint` /
-/// `wrapfloat` to rebox for the Ref dst.  The authentic boxed result is
-/// taken from the same `execute_may_force_call` path the generic leg uses.
+/// for the object-, int-, and float-storage list strategies with a
+/// non-negative concrete index: `guard_class LIST` + `guard_value(strategy)`
+/// + unbox index + `IntLt` bounds guard, then the strategy-specific element
+/// load — `getarrayitem_gc_r` against the `Ptr(GcArray(OBJECTPTR))` items
+/// block for object storage (the element is a boxed Ref read directly), or a
+/// raw-array getitem + `wrapint` / `wrapfloat` rebox for int/float storage.
+/// The authentic boxed result is taken from the same `execute_may_force_call`
+/// path the generic leg uses.
 ///
-/// Object-storage lists, tuples, negative indices, and non-`list[int]`
+/// Tuples, empty-strategy lists, negative indices, and non-`list[int]`
 /// operands fall through to the generic `CallMayForce` record (`Ok(None)`),
 /// preserving Python `__getitem__` semantics.
 fn try_walker_specialize_subscr(
@@ -8024,7 +8027,10 @@ fn try_walker_specialize_subscr(
             1i64
         } else if pyre_object::w_list_uses_float_storage(list_obj) {
             2i64
+        } else if pyre_object::w_list_uses_object_storage(list_obj) {
+            0i64
         } else {
+            // Empty-strategy list: no concrete element to read.
             return Ok(None);
         };
         (sid, index, concrete_len)
@@ -8069,16 +8075,12 @@ fn try_walker_specialize_subscr(
         .set_opref_concrete(raw_index, majit_ir::Value::Int(index));
 
     // Bounds guard (non-negative index path): IntLt(raw_index, len).
-    let (len_descr, items_ptr_descr) = if sid == 1 {
-        (
-            crate::descr::list_int_items_len_descr(),
-            crate::descr::list_int_items_ptr_descr(),
-        )
-    } else {
-        (
-            crate::descr::list_float_items_len_descr(),
-            crate::descr::list_float_items_ptr_descr(),
-        )
+    // Object storage keeps the inline `length` field (rlist.py:116); int/float
+    // storage read the typed items-array length field.
+    let len_descr = match sid {
+        0 => crate::descr::list_length_descr(),
+        1 => crate::descr::list_int_items_len_descr(),
+        _ => crate::descr::list_float_items_len_descr(),
     };
     let lenbox = crate::state::opimpl_getfield_gc_i(ctx.trace_ctx, list_op, len_descr);
     let in_bounds = ctx.trace_ctx.record_op(OpCode::IntLt, &[raw_index, lenbox]);
@@ -8088,26 +8090,54 @@ fn try_walker_specialize_subscr(
     );
     walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardTrue, &[in_bounds])?;
 
-    // Raw-array getitem + rebox for the Ref dst.  Stamp the raw element with
-    // the true value read from the authentic may-force result (the in-array
-    // sanity load is skipped when `items_ptr` is not trace-time concrete), so
+    // Element load.  Object storage reads the boxed Ref directly from the
+    // `Ptr(GcArray(OBJECTPTR))` items block (no unbox/rebox).  Int/float
+    // storage read the raw typed array and rebox; the raw element is stamped
+    // with the true value from the authentic may-force result (the in-array
+    // sanity load is skipped when `items_ptr` is not trace-time concrete) so
     // the `wrapint` / `wrapfloat` box's cached field matches a later unbox.
-    let items_ptr = crate::state::opimpl_getfield_gc_i(ctx.trace_ctx, list_op, items_ptr_descr);
     let result_obj = boxed_result_i64 as pyre_object::PyObjectRef;
-    let boxed = if sid == 1 {
-        let raw =
-            crate::state::trace_raw_int_array_getitem_value(ctx.trace_ctx, items_ptr, raw_index);
-        let elem = unsafe { pyre_object::w_int_get_value(result_obj) };
-        ctx.trace_ctx
-            .set_opref_concrete(raw, majit_ir::Value::Int(elem));
-        crate::state::wrapint(ctx.trace_ctx, raw)
-    } else {
-        let raw =
-            crate::state::trace_raw_float_array_getitem_value(ctx.trace_ctx, items_ptr, raw_index);
-        let elem = unsafe { pyre_object::w_float_get_value(result_obj) };
-        ctx.trace_ctx
-            .set_opref_concrete(raw, majit_ir::Value::Float(elem));
-        crate::state::wrapfloat(ctx.trace_ctx, raw)
+    let boxed = match sid {
+        0 => {
+            let items_block = crate::state::opimpl_getfield_gc_r(
+                ctx.trace_ctx,
+                list_op,
+                crate::descr::list_items_descr(),
+            );
+            crate::state::trace_items_block_getitem_value(ctx.trace_ctx, items_block, raw_index)
+        }
+        1 => {
+            let items_ptr = crate::state::opimpl_getfield_gc_i(
+                ctx.trace_ctx,
+                list_op,
+                crate::descr::list_int_items_ptr_descr(),
+            );
+            let raw = crate::state::trace_raw_int_array_getitem_value(
+                ctx.trace_ctx,
+                items_ptr,
+                raw_index,
+            );
+            let elem = unsafe { pyre_object::w_int_get_value(result_obj) };
+            ctx.trace_ctx
+                .set_opref_concrete(raw, majit_ir::Value::Int(elem));
+            crate::state::wrapint(ctx.trace_ctx, raw)
+        }
+        _ => {
+            let items_ptr = crate::state::opimpl_getfield_gc_i(
+                ctx.trace_ctx,
+                list_op,
+                crate::descr::list_float_items_ptr_descr(),
+            );
+            let raw = crate::state::trace_raw_float_array_getitem_value(
+                ctx.trace_ctx,
+                items_ptr,
+                raw_index,
+            );
+            let elem = unsafe { pyre_object::w_float_get_value(result_obj) };
+            ctx.trace_ctx
+                .set_opref_concrete(raw, majit_ir::Value::Float(elem));
+            crate::state::wrapfloat(ctx.trace_ctx, raw)
+        }
     };
     ctx.trace_ctx.set_opref_concrete(
         boxed,
