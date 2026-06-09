@@ -771,24 +771,6 @@ fn push_walker_emit(current_block: &SpamBlockRef, insn: super::flatten::Insn) {
     current_block.push_insn(insn);
 }
 
-/// `flatten.py:333` `self.emitline('%s_copy' % kind, v, "->", w)` emits a
-/// register-to-register move as `ref_copy/r>r`.  Identity copies are
-/// dropped — same reg on both sides is a no-op at runtime and at regalloc
-/// time, so callers freely route a producer directly into its stack-slot
-/// register without inserting a redundant byte.  Walker MUST NOT record a
-/// graph-side `ref_copy` op; `insert_renamings` (flatten.py:320) owns
-/// emission.
-fn emit_ref_copy(current_block: &SpamBlockRef, dst: u16, src: u16) {
-    if dst != src {
-        let insn = Insn::op_with_result(
-            "ref_copy",
-            vec![Operand::reg(Kind::Ref, src)],
-            Register::new(Kind::Ref, dst),
-        );
-        push_walker_emit(current_block, insn);
-    }
-}
-
 /// Build-side liveness resolver: derive, from an SSARepr's OWN
 /// `-live-` markers + `pc_first_insn_pos`, the per-Python-PC PRE-MERGE
 /// `-live-` marker index that `compute_liveness_with_pc_anchors` consumes
@@ -5611,7 +5593,6 @@ impl CodeWriter {
                 let src_reg = $src;
                 let src_value: super::flow::FlowValue = $src_value;
                 let pushvalue_ref_py_pc: i64 = ($py_pc) as i64;
-                emit_ref_copy(&current_block, stack_base + $depth, src_reg);
                 if is_portal {
                     let depth_value = (stack_base_absolute + $depth as usize) as i64;
                     // `pyframe.py:389 pushvalue` lowers to
@@ -5700,8 +5681,9 @@ impl CodeWriter {
                     // expects the pushed PY_NULL to be visible in the
                     // stack slot register for any downstream consumer.
                     // `flatten.py:333-334` parity: ref_copy with ConstRef
-                    // source.  Walker MUST NOT record a graph-side
-                    // `ref_copy` op (matching `emit_ref_copy`).
+                    // source.  The walker MUST NOT record a graph-side
+                    // `ref_copy` op; `insert_renamings` (flatten.py:320)
+                    // owns ref_copy emission.
                     let const_copy_insn = Insn::op_with_result(
                         "ref_copy",
                         vec![Operand::ConstRef(value)],
@@ -5867,10 +5849,11 @@ impl CodeWriter {
         // mirror is redundant on portal frames where push/pop
         // routes through the array.
         //
-        // Non-portal frames have no vable; the inline `ref_copy`
-        // is their only stack-maintenance mechanism and LOAD_FAST
-        // (`codewriter.rs:5094-5101 else branch`) reads
-        // Reg(Ref, reg) directly.  Keep the mirror for those.
+        // Non-portal frames have no vable; their local model lives
+        // entirely in the graph `FrameState` (`store_local_value` at
+        // each callsite), which the canonical splice lowers to the
+        // register movements via `insert_renamings`.  The walker no
+        // longer emits a per-block `ref_copy` for them.
         macro_rules! emit_store_local_with_mirror {
             ($reg:expr, $stored_reg:expr) => {{
                 let reg = $reg;
@@ -5882,8 +5865,6 @@ impl CodeWriter {
                         local_to_vable_slot(reg as usize) as i64,
                         stored_reg
                     );
-                } else {
-                    emit_ref_copy(&current_block, reg, stored_reg);
                 }
             }};
         }
@@ -6863,13 +6844,11 @@ impl CodeWriter {
                             // Write the load_global result directly to the
                             // stack slot it will occupy after the push (and
                             // after the optional NULL push for the
-                            // `raw_namei & 1` LOAD_GLOBAL(push_null) variant).
-                            // The trailing `emit_pushvalue_ref!` then sees
-                            // `src == dst` and elides its `ref_copy` per the
-                            // identity-elide guard in `emit_ref_copy`,
-                            // matching upstream RPython where pushvalue is
-                            // symbolic and the residual_call writes directly
-                            // to the consumer slot.
+                            // `raw_namei & 1` LOAD_GLOBAL(push_null) variant),
+                            // so the trailing `emit_pushvalue_ref!` needs no
+                            // separate stack move — matching upstream RPython
+                            // where pushvalue is symbolic and the residual_call
+                            // writes directly to the consumer slot.
                             let null_offset: u16 = if raw_namei & 1 != 0 { 1 } else { 0 };
                             let loaded_dst_reg = stack_base + current_depth + null_offset;
                             // pyframe.py:509-510 `getcode(): hint(self.pycode,
@@ -6938,10 +6917,9 @@ impl CodeWriter {
                             current_state.stack.push(result_value.clone());
                             // `loaded_dst_reg == stack_base + current_depth` here
                             // (computed before the optional NULL push that bumps
-                            // current_depth by `null_offset`), so the trailing
-                            // `emit_ref_copy(stack_base + current_depth, loaded_dst_reg)`
-                            // inside `emit_pushvalue_ref!` is the identity copy
-                            // elided by `emit_ref_copy`'s `dst != src` guard.
+                            // current_depth by `null_offset`), so the residual
+                            // already wrote the result into the slot the trailing
+                            // `emit_pushvalue_ref!` pushes — no stack move needed.
                             emit_pushvalue_ref!(current_depth, loaded_dst_reg, result_value, py_pc);
                         }
 
@@ -7474,16 +7452,17 @@ impl CodeWriter {
                             // the interpreter; pushing `None` for `prev` breaks
                             // nested exception state (pyopcode.py:786 saves the
                             // previous sys_exc_info so `POP_EXCEPT` can restore it).
-                            let exc_reg = emit_popvalue_ref!(current_depth, py_pc);
+                            let _exc_reg = emit_popvalue_ref!(current_depth, py_pc);
                             let exc_value = pop_ref_or_fresh(&mut current_state, &mut graph);
                             // PUSH_EXC_INFO is pyre-specific (rustpython 3.11+;
                             // no PyPy counterpart).  In the canonical splice the
                             // popped exc `Variable` has no graph producer: the
                             // walker threads the caught exception through runtime
-                            // registers + a walker-stream-only `ref_copy`
-                            // (`emit_ref_copy`, which `insert_renamings` owns and
-                            // never mirrors into the graph).  Without a graph
-                            // producer the register allocator treats `exc_value`
+                            // registers; the ref_copy that moves it is owned by
+                            // the canonical splice's `insert_renamings`
+                            // (flatten.py:320) and never mirrors into the graph.
+                            // Without a graph producer the register allocator
+                            // treats `exc_value`
                             // as dead-until-first-use (its first use trails the
                             // `get_current_exception` call below), so it never
                             // interferes with that call's result and the two
@@ -7508,13 +7487,13 @@ impl CodeWriter {
                                 py_pc as i64,
                             );
                             // pyopcode.py:786 keeps `exc` in a local after
-                            // `popvalue()`.  Mirror that with a scratch register:
-                            // the following `push(prev)` writes to the popped
-                            // stack slot, so reusing `exc_reg` for the trailing
-                            // `push(exc)` would read back `prev` instead of the
-                            // caught exception.
+                            // `popvalue()`.  The trailing `push(exc)` targets a
+                            // stable scratch register so the intervening
+                            // `push(prev)` (which overwrites the popped slot)
+                            // cannot clobber it.  The graph models the push via
+                            // `exc_value` (setarrayitem_vable_r); this register
+                            // threading is walker-stream-only.
                             let scratch_exc = ssarepr.fresh_var(Kind::Ref, scratch_ref_base).0;
-                            emit_ref_copy(&current_block, scratch_exc, exc_reg);
                             let scratch_prev = ssarepr.fresh_var(Kind::Ref, scratch_ref_base).0;
                             // get_current_exception / set_current_exception are TLS read/write —
                             // EF_CANNOT_RAISE per `effectinfo.py:19` (matching call.py:296
@@ -7930,12 +7909,14 @@ impl CodeWriter {
                         // underflow.
                         Instruction::UnpackSequence { count } => {
                             let n = count.get(op_arg) as usize;
-                            // Pop the sequence; preserve it in a stable scratch reg
-                            // because the item pushes below reuse the stack slots.
-                            let seq_reg = emit_popvalue_ref!(current_depth, py_pc);
+                            // Pop the sequence. The unpack residual reads it from a
+                            // stable scratch register so the item pushes below (which
+                            // reuse the popped stack slots) cannot clobber it; this
+                            // residual threading is walker-stream-only — the canonical
+                            // splice owns the production lowering via `insert_renamings`.
+                            let _seq_reg = emit_popvalue_ref!(current_depth, py_pc);
                             let _seq_value = pop_ref_or_fresh(&mut current_state, &mut graph);
                             let seq_scratch = ssarepr.fresh_var(Kind::Ref, scratch_ref_base).0;
-                            emit_ref_copy(&current_block, seq_scratch, seq_reg);
                             // unpack_sequence_fn(n, seq) → tuple of exactly n items;
                             // raises ValueError/TypeError on length mismatch or a
                             // non-sequence, matching opcode_unpack_sequence.
