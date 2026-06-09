@@ -4697,7 +4697,7 @@ fn dispatch_residual_call_iRd_kind(
     // GcRef payload is deferred to step 4 (FrameOps lift), which lands
     // alongside the specialization branch; this probe stays at the raw-usize
     // layer to keep the conversion seam single-sourced.
-    if std::env::var_os("PYRE_PROBE_SUBSCR").is_some() {
+    if crate::probe_subscr_enabled() {
         let funcptr_addr = ctx.trace_ctx.box_value(funcptr).and_then(|v| match v {
             majit_ir::Value::Int(n) => Some(n as u64),
             _ => None,

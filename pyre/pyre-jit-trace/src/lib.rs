@@ -50,6 +50,15 @@ const _: () = assert!(
     "pyre's PyFrame virtualizable layout requires exactly one extra red (ec)",
 );
 
+/// `PYRE_PROBE_SUBSCR` env-var gate cached once on first read. The
+/// state.rs/jitcode_dispatch.rs probe sites are on hot paths; sampling
+/// `std::env::var_os` on every cache hit would dominate the cost when
+/// the probe is off.
+pub(crate) fn probe_subscr_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("PYRE_PROBE_SUBSCR").is_some())
+}
+
 /// Auto-generated trace functions from majit-translate.
 #[allow(dead_code, unsafe_op_in_unsafe_fn, unused_imports, unused_variables)]
 pub mod generated {

@@ -2078,7 +2078,7 @@ pub(crate) fn opimpl_getfield_gc_i(ctx: &mut TraceCtx, obj: OpRef, descr: DescrR
                     if let Some(majit_ir::Value::Int(loaded)) =
                         ctx.field_sanity_load(struct_ptr, &descr, majit_ir::Type::Int)
                     {
-                        if std::env::var_os("PYRE_PROBE_SUBSCR").is_some() && loaded != cached_int {
+                        if loaded != cached_int && crate::probe_subscr_enabled() {
                             eprintln!(
                                 "[PYRE_PROBE_SUBSCR] sanity-int-mismatch obj={:?} field_index={} struct_ptr={:#x} descr_pure={} cached={} loaded={}",
                                 obj,
