@@ -4379,11 +4379,6 @@ impl CodeWriter {
                         None,
                         ($py_pc) as i64,
                     );
-                    emit_vable_setfield_int_const!(
-                        portal_frame_reg,
-                        VABLE_VALUESTACKDEPTH_FIELD_IDX,
-                        depth_value
-                    );
                 }
             };
         }
@@ -5263,23 +5258,23 @@ impl CodeWriter {
         // `jtransform.py:846-847` emits `getfield_vable_<kind>` with
         // **2 args + result**: `[v_inst, descr]` → `op.result`;
         // `jtransform.py:927-928` emits `setfield_vable_<kind>` with
-        // **3 args**: `[v_inst, v_value, descr]`. Pyre matches that shape
-        // end-to-end across all three layers:
+        // **3 args**: `[v_inst, v_value, descr]`. Pyre records that shape
+        // on the graph and lets the canonical splice lower it to SSARepr:
         //
-        // - **GRAPH layer** (`record_graph_op("setfield_vable_i", …)`):
+        // - **GRAPH layer** (`record_graph_op("setfield_vable_i", …)` /
+        //   `emit_graph_op_with_result("getfield_vable_r", …)`):
         //   `vable_setfield_int_graph_args(v_inst, v_value, idx)` carries
         //   the portal frame Variable (`portal_graph_inputvars(code).0`,
         //   per `jtransform.py:840`) as `v_inst`, threaded by the call
         //   sites via `frame_var.into()` (Stage 3 Issue 2.3 —
         //   graph-shadow `v_inst/v_base` parity landed).
-        // - **SSARepr layer** (`emit_vable_setfield_int!` /
-        //   `emit_vable_getfield_ref!`): setfield = `[reg(Ref, frame),
-        //   reg(Int, src), descr_vable_static_field(idx)]`; getfield =
-        //   `[reg(Ref, frame), descr_vable_static_field(idx)]` with a
-        //   Ref result.  `flatten_arg` lowers graph-side
-        //   `SpaceOperationArg::Descr` to the matching `Operand::Descr`
-        //   via `flatten_descr_by_ptr` (Arc::ptr_eq against the
-        //   singleton) — same shape end-to-end.
+        // - **SSARepr layer** is produced by the canonical splice from the
+        //   graph op: setfield = `[reg(Ref, frame), reg(Int, src),
+        //   descr_vable_static_field(idx)]`; getfield = `[reg(Ref, frame),
+        //   descr_vable_static_field(idx)]` with a Ref result.  `flatten_arg`
+        //   lowers graph-side `SpaceOperationArg::Descr` to the matching
+        //   `Operand::Descr` via `flatten_descr_by_ptr` (Arc::ptr_eq against
+        //   the singleton) — same shape end-to-end.
         // - **Assembler dispatch** lowers that exact `[r, d]` / `[r, X, d]`
         //   shape to the canonical `JitCodeBuilder::*_with_base` emitters:
         //   one-byte vable/value registers plus a two-byte descriptor-pool
@@ -5338,243 +5333,6 @@ impl CodeWriter {
                 }
             }};
         }
-        macro_rules! emit_vable_setfield_int {
-            ($vable_reg:expr, $field_idx:expr, $src:expr) => {{
-                let vable_reg: u16 = $vable_reg;
-                let field_idx: u16 = $field_idx;
-                let src = $src;
-                // `jtransform.py:927-928` setfield: `[v_inst, v_value, descr]`.
-                // `args[0]` is the vable register — see
-                // `emit_vable_getfield_ref!` for rationale.
-                let insn = Insn::op(
-                    "setfield_vable_i",
-                    vec![
-                        Operand::reg(Kind::Ref, vable_reg),
-                        Operand::reg(Kind::Int, src),
-                        Operand::descr_vable_static_field(field_idx),
-                    ],
-                );
-                push_walker_emit(&current_block, insn);
-            }};
-        }
-        macro_rules! emit_vable_setfield_int_const {
-            ($vable_reg:expr, $field_idx:expr, $value:expr) => {{
-                let vable_reg: u16 = $vable_reg;
-                let field_idx: u16 = $field_idx;
-                let value: i64 = $value;
-                // ConstInt-source setfield_vable_i: assembler dispatch
-                // (assembler.rs:907-911) routes `Operand::ConstInt` to
-                // `vable_setfield_int_const_value_with_base`.  Matches
-                // upstream's flatten output for jtransform.py:927-928
-                // when the value is a folded ConstInt.
-                let insn = Insn::op(
-                    "setfield_vable_i",
-                    vec![
-                        Operand::reg(Kind::Ref, vable_reg),
-                        Operand::ConstInt(value),
-                        Operand::descr_vable_static_field(field_idx),
-                    ],
-                );
-                push_walker_emit(&current_block, insn);
-            }};
-        }
-        // RPython-orthodox vable arrayitem shapes for
-        // `setarrayitem_vable_r` and
-        // `getarrayitem_vable_r`.  Upstream
-        // `jtransform.py:1880-1885 do_fixed_list_getitem` emits
-        // `getarrayitem_vable_X` with **4 args**: `[v_base, v_index,
-        // arrayfielddescr, arraydescr]`; `jtransform.py:1898-1906
-        // do_fixed_list_setitem` emits `setarrayitem_vable_X` with
-        // **5 args**: `[v_base, v_index, v_value, arrayfielddescr,
-        // arraydescr]`.  Pyre matches that shape end-to-end across all
-        // three layers:
-        //
-        // - **GRAPH layer** (`record_graph_op("setarrayitem_vable_r",
-        //   …)`): `vable_setarrayitem_ref_graph_args(v_base, v_idx,
-        //   v_value)` carries the portal frame Variable
-        //   (`portal_graph_inputvars(code).0`, per `jtransform.py:840`)
-        //   as `v_base`, threaded by the call sites via
-        //   `frame_var.into()` (Stage 3 Issue 2.3 — graph-shadow
-        //   `v_base/v_inst` parity landed).  When the value being stored
-        //   is a true `ConstPtr` lifted to the bytecode const-pool,
-        //   `v_value` is recorded as a `Constant::none()` placeholder
-        //   (the live SSA register is patched at bytecode-finish time
-        //   via `vable_setarrayitem_ref_const_value_with_base`); the
-        //   bytecode shape stays identical.  The two trailing descrs
-        //   are singleton `Arc<dyn Descr>`s in `majit_ir::descr`
-        //   mirroring `rpython/jit/metainterp/virtualizable.py:73,58`.
-        // - **SSARepr layer** (`emit_vable_setarrayitem_ref!` /
-        //   `emit_vable_setarrayitem_ref_const!`):
-        //   `[reg(Ref, frame), reg(Int, idx), reg(Ref, src) |
-        //   ConstRef(value), descr_vable_array_field(idx),
-        //   descr_vable_array(idx)]`.  `flatten_arg` lowers
-        //   graph-side `SpaceOperationArg::Descr` to the matching
-        //   `Operand::Descr` via `flatten_descr_by_ptr` (Arc::ptr_eq
-        //   against the singletons) — same shape end-to-end.
-        // - **Assembler dispatch** extracts and validates the two trailing
-        //   descrs, then emits canonical `[r, i, d, d, >r]` /
-        //   `[r, i, r, d, d]` bytecode through `JitCodeBuilder::*_with_base`.
-        //
-        // The remaining vable op family variants
-        // (`getarrayitem_vable_i/f`, `setarrayitem_vable_i/f`,
-        // `arraylen_vable`) have assembler dispatch arms but no
-        // production emit site today (pyre's `PyFrame
-        // .locals_cells_stack_w` carries Ref items only and its
-        // length is constant).  The arms already require the canonical
-        // `[v_base, ... arrayfielddescr, arraydescr]` operand shape.
-        macro_rules! emit_vable_getarrayitem_ref {
-            ($vable_reg:expr, $dst:expr, $field_idx:expr, $index:expr) => {{
-                let vable_reg: u16 = $vable_reg;
-                let dst = $dst;
-                let field_idx: u16 = $field_idx;
-                let index = $index;
-                // `jtransform.py:1882-1885 do_fixed_list_getitem` (vable
-                // branch): `[v_base, v_index, arrayfielddescr,
-                // arraydescr]` with a Ref result.  See
-                // `emit_vable_setarrayitem_ref!` for v_base register
-                // rationale and the descr-pair parity citations.
-                let insn = Insn::op_with_result(
-                    "getarrayitem_vable_r",
-                    vec![
-                        Operand::reg(Kind::Ref, vable_reg),
-                        Operand::reg(Kind::Int, index),
-                        Operand::descr_vable_array_field(field_idx),
-                        Operand::descr_vable_array(field_idx),
-                    ],
-                    Register::new(Kind::Ref, dst),
-                );
-                push_walker_emit(&current_block, insn);
-            }};
-        }
-        macro_rules! emit_vable_setarrayitem_ref {
-            ($vable_reg:expr, $field_idx:expr, $index:expr, $src:expr) => {{
-                let vable_reg: u16 = $vable_reg;
-                let field_idx: u16 = $field_idx;
-                let index = $index;
-                let src = $src;
-                // `jtransform.py:1898-1906 do_fixed_list_setitem` (vable
-                // branch): `[v_base, v_index, v_value, arrayfielddescr,
-                // arraydescr]`. `args[0]` is the vable register holding
-                // the live frame pointer (`portal_frame_reg` filled by
-                // `fill_portal_registers`).  Trailing two descrs are
-                // `array_field_descrs[i]` / `array_descrs[i]` per
-                // `rpython/jit/metainterp/virtualizable.py:73,58`.
-                let insn = Insn::op(
-                    "setarrayitem_vable_r",
-                    vec![
-                        Operand::reg(Kind::Ref, vable_reg),
-                        Operand::reg(Kind::Int, index),
-                        Operand::reg(Kind::Ref, src),
-                        Operand::descr_vable_array_field(field_idx),
-                        Operand::descr_vable_array(field_idx),
-                    ],
-                );
-                push_walker_emit(&current_block, insn);
-            }};
-        }
-
-        // `setarrayitem_vable_r(vable, idx, ConstPtr(value))` — the
-        // ConstPtr-source variant produced by jtransform.py:1898 when
-        // the value operand is a Const. Carries `Operand::ConstRef`
-        // through to the assembler dispatch, which routes it to
-        // `JitCodeBuilder::vable_setarrayitem_ref_const_value_with_base`.
-        // No separate bytecode: the canonical `setarrayitem_vable_r/rirdd`
-        // form can address const sources through the unified ref register
-        // space after `const_patches_u8` resolution.
-        macro_rules! emit_vable_setarrayitem_ref_const {
-            ($vable_reg:expr, $field_idx:expr, $index:expr, $value:expr) => {{
-                let vable_reg: u16 = $vable_reg;
-                let field_idx: u16 = $field_idx;
-                let index = $index;
-                let value: i64 = $value;
-                // ConstPtr-source variant of the 5-arg SSA shape (see
-                // `emit_vable_setarrayitem_ref!` for the parity
-                // citation). The third operand carries
-                // `Operand::ConstRef(value)` instead of a register.
-                let insn = Insn::op(
-                    "setarrayitem_vable_r",
-                    vec![
-                        Operand::reg(Kind::Ref, vable_reg),
-                        Operand::reg(Kind::Int, index),
-                        Operand::ConstRef(value),
-                        Operand::descr_vable_array_field(field_idx),
-                        Operand::descr_vable_array(field_idx),
-                    ],
-                );
-                push_walker_emit(&current_block, insn);
-            }};
-        }
-
-        // `setarrayitem_vable_r(vable, ConstInt(idx), value_reg)` —
-        // ConstInt-INDEX variant matching upstream's `jtransform.py:1898`
-        // shape when the index is folded to a Const.  Assembler dispatch
-        // routes to `vable_setarrayitem_ref_const_idx_with_base`.
-        macro_rules! emit_vable_setarrayitem_ref_const_idx {
-            ($vable_reg:expr, $field_idx:expr, $index_value:expr, $src:expr) => {{
-                let vable_reg: u16 = $vable_reg;
-                let field_idx: u16 = $field_idx;
-                let index_value: i64 = $index_value;
-                let src = $src;
-                let insn = Insn::op(
-                    "setarrayitem_vable_r",
-                    vec![
-                        Operand::reg(Kind::Ref, vable_reg),
-                        Operand::ConstInt(index_value),
-                        Operand::reg(Kind::Ref, src),
-                        Operand::descr_vable_array_field(field_idx),
-                        Operand::descr_vable_array(field_idx),
-                    ],
-                );
-                push_walker_emit(&current_block, insn);
-            }};
-        }
-
-        // `setarrayitem_vable_r(vable, ConstInt(idx), ConstRef(value))`
-        // — both index and value as constants.  Assembler routes to
-        // `vable_setarrayitem_ref_const_idx_const_value_with_base`.
-        macro_rules! emit_vable_setarrayitem_ref_const_idx_const_value {
-            ($vable_reg:expr, $field_idx:expr, $index_value:expr, $src_value:expr) => {{
-                let vable_reg: u16 = $vable_reg;
-                let field_idx: u16 = $field_idx;
-                let index_value: i64 = $index_value;
-                let src_value: i64 = $src_value;
-                let insn = Insn::op(
-                    "setarrayitem_vable_r",
-                    vec![
-                        Operand::reg(Kind::Ref, vable_reg),
-                        Operand::ConstInt(index_value),
-                        Operand::ConstRef(src_value),
-                        Operand::descr_vable_array_field(field_idx),
-                        Operand::descr_vable_array(field_idx),
-                    ],
-                );
-                push_walker_emit(&current_block, insn);
-            }};
-        }
-
-        // `getarrayitem_vable_r(vable, ConstInt(idx)) → dst` — ConstInt-
-        // INDEX variant matching upstream's `jtransform.py:1882-1885`
-        // shape when the index is folded.  Assembler dispatch routes to
-        // `vable_getarrayitem_ref_const_idx_with_base`.
-        macro_rules! emit_vable_getarrayitem_ref_const_idx {
-            ($vable_reg:expr, $dst:expr, $field_idx:expr, $index_value:expr) => {{
-                let vable_reg: u16 = $vable_reg;
-                let dst = $dst;
-                let field_idx: u16 = $field_idx;
-                let index_value: i64 = $index_value;
-                let insn = Insn::op_with_result(
-                    "getarrayitem_vable_r",
-                    vec![
-                        Operand::reg(Kind::Ref, vable_reg),
-                        Operand::ConstInt(index_value),
-                        Operand::descr_vable_array_field(field_idx),
-                        Operand::descr_vable_array(field_idx),
-                    ],
-                    Register::new(Kind::Ref, dst),
-                );
-                push_walker_emit(&current_block, insn);
-            }};
-        }
 
         // pyframe.py:378-381 `pushvalue` lowers to
         // `setarrayitem_vable_r(locals_cells_stack_w, depth, w_object)`
@@ -5590,7 +5348,7 @@ impl CodeWriter {
         // optimizer port progresses.
         macro_rules! emit_pushvalue_ref {
             ($depth:ident, $src:expr, $src_value:expr, $py_pc:expr) => {{
-                let src_reg = $src;
+                let _src_reg = $src;
                 let src_value: super::flow::FlowValue = $src_value;
                 let pushvalue_ref_py_pc: i64 = ($py_pc) as i64;
                 if is_portal {
@@ -5616,12 +5374,6 @@ impl CodeWriter {
                         ),
                         None,
                         pushvalue_ref_py_pc,
-                    );
-                    emit_vable_setarrayitem_ref_const_idx!(
-                        portal_frame_reg,
-                        0_u16,
-                        depth_value,
-                        src_reg
                     );
                 }
                 $depth += 1;
@@ -5669,12 +5421,6 @@ impl CodeWriter {
                         ),
                         None,
                         pushvalue_const_py_pc,
-                    );
-                    emit_vable_setarrayitem_ref_const_idx_const_value!(
-                        portal_frame_reg,
-                        0_u16,
-                        depth_value,
-                        value
                     );
                 } else {
                     // Non-portal frames have no vable mirror; the runtime
@@ -5738,12 +5484,6 @@ impl CodeWriter {
                         None,
                         popvalue_ref_py_pc,
                     );
-                    emit_vable_setarrayitem_ref_const_idx_const_value!(
-                        portal_frame_reg,
-                        0_u16,
-                        depth_value,
-                        pyre_object::PY_NULL as i64
-                    );
                 }
                 emit_vsd!($depth, popvalue_ref_py_pc);
                 popped_reg
@@ -5764,12 +5504,6 @@ impl CodeWriter {
                 if is_portal {
                     let local_slot = local_to_vable_slot(reg as usize) as i64;
                     let stack_slot = (stack_base_absolute + $depth as usize) as i64;
-                    emit_vable_getarrayitem_ref_const_idx!(
-                        portal_frame_reg,
-                        stack_base + $depth,
-                        0_u16,
-                        local_slot
-                    );
                     // Graph-side dual-write of BOTH halves of the
                     // LOAD_FAST lowering:
                     //   - local read: jtransform.py:1877
@@ -5819,12 +5553,6 @@ impl CodeWriter {
                         None,
                         load_fast_py_pc,
                     );
-                    emit_vable_setarrayitem_ref_const_idx!(
-                        portal_frame_reg,
-                        0_u16,
-                        stack_slot,
-                        stack_base + $depth
-                    );
                     current_state.stack.push(loaded);
                     $depth += 1;
                     emit_vsd!($depth, load_fast_py_pc);
@@ -5834,37 +5562,6 @@ impl CodeWriter {
                         .unwrap_or_else(|| fresh_ref_value(&mut graph));
                     current_state.stack.push(loaded.clone());
                     emit_pushvalue_ref!($depth, reg, loaded, load_fast_py_pc);
-                }
-            }};
-        }
-
-        // `pypy/interpreter/pyframe.py:?? STORE_FAST` lowers
-        // `self.locals_cells_stack_w[varindex] = w_newvalue` to a
-        // single `setarrayitem_vable_r` via `jtransform.py:1898
-        // do_fixed_list_setitem` (vable branch).  Upstream's local
-        // model is the virtualizable array — there is NO separate
-        // local register that mirrors the array slot.  LOAD_FAST
-        // reads via `getarrayitem_vable_r` from the same array
-        // (`jtransform.py:1877 do_fixed_list_getitem`), so the
-        // mirror is redundant on portal frames where push/pop
-        // routes through the array.
-        //
-        // Non-portal frames have no vable; their local model lives
-        // entirely in the graph `FrameState` (`store_local_value` at
-        // each callsite), which the canonical splice lowers to the
-        // register movements via `insert_renamings`.  The walker no
-        // longer emits a per-block `ref_copy` for them.
-        macro_rules! emit_store_local_with_mirror {
-            ($reg:expr, $stored_reg:expr) => {{
-                let reg = $reg;
-                let stored_reg = $stored_reg;
-                if is_portal {
-                    emit_vable_setarrayitem_ref_const_idx!(
-                        portal_frame_reg,
-                        0_u16,
-                        local_to_vable_slot(reg as usize) as i64,
-                        stored_reg
-                    );
                 }
             }};
         }
@@ -6163,7 +5860,7 @@ impl CodeWriter {
                         // in scope).
                         Instruction::StoreFast { var_num } => {
                             let reg = var_num.get(op_arg).as_usize() as u16;
-                            let stored_reg = emit_popvalue_ref!(current_depth, py_pc);
+                            emit_popvalue_ref!(current_depth, py_pc);
                             let stored = pop_ref_or_fresh(&mut current_state, &mut graph);
                             if is_portal {
                                 // Graph dual-write of jtransform.py:1898
@@ -6190,7 +5887,6 @@ impl CodeWriter {
                                     -1,
                                 );
                             }
-                            emit_store_local_with_mirror!(reg, stored_reg);
                             current_state.store_local_value(reg as usize, stored);
                         }
 
@@ -6330,7 +6026,7 @@ impl CodeWriter {
                             let pair = var_nums.get(op_arg);
                             let store_reg = u32::from(pair.idx_1()) as u16;
                             let load_reg = u32::from(pair.idx_2()) as u16;
-                            let stored_reg = emit_popvalue_ref!(current_depth, py_pc);
+                            emit_popvalue_ref!(current_depth, py_pc);
                             let stored = pop_ref_or_fresh(&mut current_state, &mut graph);
                             if is_portal {
                                 // STORE_FAST half graph dual-write
@@ -6351,24 +6047,13 @@ impl CodeWriter {
                                 );
                             }
                             // STORE_FAST half: same dual-write as Instruction::StoreFast.
-                            // Non-portal popvalue places `stored_reg` at
-                            // `stack_base + current_depth` post-decrement, so the
-                            // macro's `ref_copy(store_reg, stored_reg)` is
-                            // equivalent to the prior explicit
-                            // `ref_copy(store_reg, stack_base + current_depth)`.
-                            emit_store_local_with_mirror!(store_reg, stored_reg);
+                            // The local binding is carried by the graph `FrameState`
+                            // (`store_local_value` below), which the canonical splice
+                            // lowers to the register movements via `insert_renamings`.
                             if is_portal {
                                 let load_slot = local_to_vable_slot(load_reg as usize) as i64;
                                 let stack_slot =
                                     (stack_base_absolute + current_depth as usize) as i64;
-                                // LOAD_FAST half: read local, then pyframe.py:378-381
-                                // pushvalue parity — mirror to the value-stack slot.
-                                emit_vable_getarrayitem_ref_const_idx!(
-                                    portal_frame_reg,
-                                    stack_base + current_depth,
-                                    0_u16,
-                                    load_slot
-                                );
                                 // CPython 3.13 super-instruction semantics: STORE
                                 // is observable to the immediately-following LOAD
                                 // when store_reg == load_reg. Apply the locals_w
@@ -6430,12 +6115,6 @@ impl CodeWriter {
                                     ),
                                     None,
                                     -1,
-                                );
-                                emit_vable_setarrayitem_ref_const_idx!(
-                                    portal_frame_reg,
-                                    0_u16,
-                                    stack_slot,
-                                    stack_base + current_depth
                                 );
                                 push_and_bump!(loaded, py_pc);
                             } else {
@@ -7876,13 +7555,13 @@ impl CodeWriter {
                             let reg_a = u32::from(pair.idx_1()) as u16;
                             let reg_b = u32::from(pair.idx_2()) as u16;
                             for reg in [reg_a, reg_b] {
-                                let stored_reg = emit_popvalue_ref!(current_depth, py_pc);
+                                emit_popvalue_ref!(current_depth, py_pc);
                                 let stored = pop_ref_or_fresh(&mut current_state, &mut graph);
                                 if is_portal {
                                     // Graph-side dual-write — same shape as
-                                    // the StoreFast handler.  SSA emission
-                                    // is delegated to
-                                    // `emit_store_local_with_mirror!` below.
+                                    // the StoreFast handler.  The SSARepr is
+                                    // produced by the canonical splice from
+                                    // this graph op.
                                     let local_slot = local_to_vable_slot(reg as usize) as i64;
                                     let v_idx: super::flow::FlowValue =
                                         super::flow::Constant::signed(local_slot).into();
@@ -7898,7 +7577,6 @@ impl CodeWriter {
                                         -1,
                                     );
                                 }
-                                emit_store_local_with_mirror!(reg, stored_reg);
                                 current_state.store_local_value(reg as usize, stored);
                             }
                         }
@@ -8656,12 +8334,6 @@ impl CodeWriter {
                             None,
                             -1,
                         );
-                        emit_vable_setarrayitem_ref_const_idx_const_value!(
-                            portal_frame_reg,
-                            0_u16,
-                            depth_value,
-                            pyre_object::PY_NULL as i64
-                        );
                     }
                 }
                 // pyframe.py:378-387 `pushvalue` semantics — each push writes
@@ -8726,12 +8398,6 @@ impl CodeWriter {
                                 -1,
                             );
                         }
-                        emit_vable_setarrayitem_ref_const_idx!(
-                            portal_frame_reg,
-                            0_u16,
-                            (stack_base_absolute + depth as usize) as i64,
-                            exc_slot
-                        );
                     }
                     depth += 1;
                     emit_vsd!(depth, site.handler_py_pc);
@@ -8781,12 +8447,6 @@ impl CodeWriter {
                         ),
                         None,
                         -1,
-                    );
-                    emit_vable_setarrayitem_ref_const_idx!(
-                        portal_frame_reg,
-                        0_u16,
-                        depth_value,
-                        exc_slot
                     );
                 }
                 // CATCH-LANDING dual-write follow-up.
