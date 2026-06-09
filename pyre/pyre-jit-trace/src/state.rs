@@ -11485,6 +11485,7 @@ mod indirectcalltargets_tests {
         let metadata = crate::PyJitCodeMetadata {
             pc_map: (0..code_len).collect(),
             depth_at_py_pc: vec![0; code_len],
+            after_residual_call_resume_pc: vec![None; code_len],
             portal_frame_reg: u16::MAX,
             portal_ec_reg: u16::MAX,
             stack_base: 0,
