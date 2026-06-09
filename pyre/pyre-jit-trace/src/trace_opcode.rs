@@ -6428,6 +6428,15 @@ impl MIFrame {
         if pyre_object::excobject::lookup_exc_class_for_kind(kind) != concrete_callable {
             return Ok(None);
         }
+        // The inline constructor reproduces only kind / w_class / args_w.
+        // Kinds whose descr_init stores extra fields (OSError errno /
+        // strerror / filename; the Unicode errors' object / start / end /
+        // reason / encoding — and OSError's args_w rewrite) cannot be
+        // rebuilt from those three alone, so defer them to the full
+        // runtime constructor via the residual call path.
+        if !kind.has_trivial_args_constructor() {
+            return Ok(None);
+        }
         // Pin the callable identity so the trace-time kind / vtable stay
         // valid across iterations.
         self.with_ctx(|this, ctx| {

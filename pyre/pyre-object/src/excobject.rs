@@ -180,6 +180,37 @@ pub enum ExcKind {
     UnicodeTranslateError = 28,
 }
 
+impl ExcKind {
+    /// True when this kind's constructor is the trivial
+    /// `W_BaseException.descr_init` (`self.args_w = args_w`) — i.e. it
+    /// stores nothing beyond `args_w`.
+    ///
+    /// False for the kinds whose `descr_init` parses arguments and stores
+    /// extra flattened fields (and, for `OSError`, rewrites `args_w`):
+    /// `OSError` / `FileNotFoundError` set `errno` / `strerror` /
+    /// `filename` / `filename2` (`builtins.rs::os_error_init`,
+    /// interp_exceptions.py:552/629); `UnicodeDecodeError` /
+    /// `UnicodeEncodeError` / `UnicodeTranslateError` set `w_object` /
+    /// `start` / `end` / `reason` (and `encoding` for the codec errors)
+    /// (`builtins.rs::exc_unicode_*_error_init`,
+    /// interp_exceptions.py:433/1041/1159).
+    ///
+    /// A caller that reconstructs an exception from only
+    /// `kind` / `w_class` / `args_w` (e.g. the traced inline
+    /// constructor) must reject the non-trivial kinds and defer to the
+    /// full runtime constructor, which initializes those fields.
+    pub fn has_trivial_args_constructor(self) -> bool {
+        !matches!(
+            self,
+            ExcKind::OSError
+                | ExcKind::FileNotFoundError
+                | ExcKind::UnicodeDecodeError
+                | ExcKind::UnicodeEncodeError
+                | ExcKind::UnicodeTranslateError
+        )
+    }
+}
+
 /// Layout: `[ob_header | kind: ExcKind | args_w: PyObjectRef | …]`
 ///
 /// `args_w` mirrors `pypy/module/exceptions/interp_exceptions.py:121-124`
