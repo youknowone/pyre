@@ -708,6 +708,31 @@ impl PyreMetaInterp {
         cf.set_last_instr_from_next_instr(opcode_pc + 1);
         let next = cf.next_instr();
 
+        // issue #143 (inline-frame double-mutation): defer subscript/attribute
+        // stores instead of committing them to the shared heap here. This
+        // speculative concrete step runs inside an inline callee frame whose
+        // loop back-edge is aborted (close_loop_args inline gate); a store
+        // committed here persists past the abort and is re-applied when the
+        // interpreter re-runs the callee → wrong result. The root tracer
+        // already defers these stores (trace_store_subscr emits IR only,
+        // leaving its snapshot frame's concrete view stale until re-execution),
+        // so mirroring that here keeps the two paths consistent — only pop the
+        // operands to preserve the frame's stack.
+        match instruction {
+            Instruction::StoreSubscr => {
+                cf.pop();
+                cf.pop();
+                cf.pop();
+                return;
+            }
+            Instruction::StoreAttr { .. } => {
+                cf.pop();
+                cf.pop();
+                return;
+            }
+            _ => {}
+        }
+
         if let Instruction::Call { argc } = instruction {
             let nargs = argc.get(op_arg) as usize;
             let _ = super::state::execute_inline_residual_call(cf, nargs);
