@@ -199,6 +199,14 @@ pub fn build_semantic_program_from_llbcs_with_static_addrs(
             }
         }
     }
+    // The per-file builder hardened each program individually, but the
+    // `or_insert` merges above can re-introduce a bare-leaf alias that
+    // is unique within one crate yet collides across crates (e.g. the
+    // pyre-interpreter and pyre-jit `FrameBlock`s).  Re-derive the
+    // verdict from the merged qualified keys.
+    if let Some(acc) = &mut merged {
+        harden_duplicate_leaf_metadata(&mut acc.struct_fields, &mut acc.struct_origins);
+    }
     Ok(
         merged.unwrap_or_else(|| crate::front::semantic::SemanticProgram {
             functions: Vec::new(),
@@ -263,11 +271,12 @@ pub fn build_semantic_program_from_llbc_with_static_addrs(
     let (
         known_struct_names,
         known_trait_names,
-        struct_fields,
+        mut struct_fields,
         enum_variant_by_discriminant,
-        struct_origins,
+        mut struct_origins,
         struct_field_attrs,
     ) = derive_program_metadata(llbc);
+    harden_duplicate_leaf_metadata(&mut struct_fields, &mut struct_origins);
 
     // ── Pass 2: lower every function body and build SemanticFunctions ─
     let mut functions = Vec::new();
@@ -567,6 +576,83 @@ fn derive_program_metadata(
         struct_origins,
         struct_field_attrs,
     )
+}
+
+/// Withdraw the bare-leaf convenience aliases for struct leaves shared
+/// by two or more distinct type declarations.
+///
+/// The dual-publish in [`derive_program_metadata`] makes the bare-leaf
+/// channels silent-winner maps on a duplicate leaf — and the two
+/// winners disagree (`struct_fields.fields` insert = last-decl-wins,
+/// `struct_origins` `or_insert` = first-decl-wins), so a bare lookup
+/// could denote one struct while `canonical_struct_name` names another.
+/// RPython cannot express this state at all: every classdef and
+/// `FORCE_ATTRIBUTES_INTO_CLASSES` key is a live class OBJECT
+/// (bookkeeper.py:361, classdesc.py:957), so a name is never an
+/// identity.  The string-carrier stand-in therefore keeps leaf
+/// resolution only while it is injective:
+///
+/// - `struct_fields.fields`: the bare alias is removed when the
+///   colliding declarations disagree on field shape (equal-shape
+///   duplicates keep the alias — any winner answers field-type lookups
+///   identically).  Lookups then miss and fall to the qualified key or
+///   fail conservatively (`SomeValue::Impossible` / residual call),
+///   mirroring `MirGraphLookup::insert_or_mark_ambiguous`.
+/// - `struct_origins`: the entry is emptied when the colliding
+///   declarations live in different crate-stripped modules, which
+///   `canonical_struct_name` (descr.rs:342) already treats as
+///   unresolvable — the bare spelling passes through unchanged instead
+///   of canonicalising to whichever module registered first.
+///
+/// Derived purely from the current qualified (`::`-containing) keys, so
+/// the pass is idempotent and safe to re-run after the cross-LLBC
+/// merge re-introduces a per-crate-unique alias.
+fn harden_duplicate_leaf_metadata(
+    struct_fields: &mut crate::front::semantic::StructFieldRegistry,
+    struct_origins: &mut std::collections::HashMap<String, String>,
+) {
+    let mut by_leaf: std::collections::HashMap<&str, Vec<&str>> = std::collections::HashMap::new();
+    for key in struct_fields.fields.keys() {
+        if let Some((_, leaf)) = key.rsplit_once("::") {
+            by_leaf.entry(leaf).or_default().push(key);
+        }
+    }
+    let mut drop_field_aliases: Vec<String> = Vec::new();
+    let mut tombstone_origins: Vec<String> = Vec::new();
+    for (leaf, quals) in &by_leaf {
+        if quals.len() < 2 {
+            continue;
+        }
+        let first_rows = &struct_fields.fields[quals[0]];
+        if quals[1..]
+            .iter()
+            .any(|q| &struct_fields.fields[*q] != first_rows)
+        {
+            drop_field_aliases.push((*leaf).to_string());
+        }
+        let first_module = strip_crate_prefix(quals[0])
+            .rsplit_once("::")
+            .map(|(m, _)| m.to_string())
+            .unwrap_or_default();
+        if quals[1..].iter().any(|q| {
+            strip_crate_prefix(q)
+                .rsplit_once("::")
+                .map(|(m, _)| m)
+                .unwrap_or_default()
+                != first_module
+        }) {
+            tombstone_origins.push((*leaf).to_string());
+        }
+    }
+    drop(by_leaf);
+    for leaf in drop_field_aliases {
+        struct_fields.fields.remove(&leaf);
+    }
+    for leaf in tombstone_origins {
+        if let Some(module) = struct_origins.get_mut(&leaf) {
+            module.clear();
+        }
+    }
 }
 
 /// Lower a single Charon [`FunDecl`] to a [`FunctionGraph`].
@@ -4802,4 +4888,82 @@ fn scalar_value_to_i64(v: &serde_json::Value) -> Option<i64> {
         return Some(n as i64);
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::harden_duplicate_leaf_metadata;
+
+    fn rows(spec: &[(&str, &str)]) -> Vec<(String, String)> {
+        spec.iter()
+            .map(|(n, t)| (n.to_string(), t.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn harden_withdraws_shape_divergent_bare_alias_and_tombstones_origin() {
+        let mut reg = crate::front::semantic::StructFieldRegistry::default();
+        let a = rows(&[("handlerposition", "usize")]);
+        let b = rows(&[("valuestackdepth", "usize"), ("previous", "*mut FrameBlock")]);
+        reg.fields
+            .insert("pyre_interpreter::pyopcode::FrameBlock".to_string(), a.clone());
+        reg.fields
+            .insert("pyre_interpreter::pyframe::FrameBlock".to_string(), b);
+        // last-decl-wins bare alias as the dual-publish would leave it
+        reg.fields.insert("FrameBlock".to_string(), a);
+        let mut origins = std::collections::HashMap::new();
+        // first-decl-wins origin as `or_insert` would leave it
+        origins.insert("FrameBlock".to_string(), "pyopcode".to_string());
+
+        harden_duplicate_leaf_metadata(&mut reg, &mut origins);
+
+        assert!(
+            !reg.fields.contains_key("FrameBlock"),
+            "shape-divergent duplicate leaf must lose its bare alias"
+        );
+        assert!(reg.fields.contains_key("pyre_interpreter::pyopcode::FrameBlock"));
+        assert!(reg.fields.contains_key("pyre_interpreter::pyframe::FrameBlock"));
+        assert_eq!(
+            origins.get("FrameBlock").map(String::as_str),
+            Some(""),
+            "module-divergent duplicate leaf origin must be tombstoned"
+        );
+    }
+
+    #[test]
+    fn harden_keeps_alias_for_equal_shape_same_module_duplicates() {
+        let mut reg = crate::front::semantic::StructFieldRegistry::default();
+        let shape = rows(&[("x", "i64")]);
+        reg.fields
+            .insert("pyre_object::eval::Point".to_string(), shape.clone());
+        reg.fields
+            .insert("pyre_jit::eval::Point".to_string(), shape.clone());
+        reg.fields.insert("Point".to_string(), shape.clone());
+        let mut origins = std::collections::HashMap::new();
+        origins.insert("Point".to_string(), "eval".to_string());
+
+        harden_duplicate_leaf_metadata(&mut reg, &mut origins);
+
+        assert_eq!(reg.fields.get("Point"), Some(&shape));
+        assert_eq!(origins.get("Point").map(String::as_str), Some("eval"));
+    }
+
+    #[test]
+    fn harden_leaves_unique_leaves_untouched() {
+        let mut reg = crate::front::semantic::StructFieldRegistry::default();
+        let shape = rows(&[("ob_value", "i64")]);
+        reg.fields
+            .insert("pyre_object::intobject::W_IntObject".to_string(), shape.clone());
+        reg.fields.insert("W_IntObject".to_string(), shape.clone());
+        let mut origins = std::collections::HashMap::new();
+        origins.insert("W_IntObject".to_string(), "intobject".to_string());
+
+        harden_duplicate_leaf_metadata(&mut reg, &mut origins);
+
+        assert_eq!(reg.fields.get("W_IntObject"), Some(&shape));
+        assert_eq!(
+            origins.get("W_IntObject").map(String::as_str),
+            Some("intobject")
+        );
+    }
 }

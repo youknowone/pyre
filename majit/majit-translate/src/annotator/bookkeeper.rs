@@ -1542,14 +1542,25 @@ impl Bookkeeper {
     /// `getuniqueclassdef` return the SAME `ClassDef` for repeated
     /// lookups of one type-root — the pyre analog of resolving a type
     /// name to one class object before `getuniqueclassdef(cls)`.
+    ///
+    /// A bare leaf is first resolved to its canonical `module::Leaf`
+    /// spelling through `canonical_struct_name`, so the bare and
+    /// qualified spellings of one struct intern to one `HostObject` —
+    /// name strings are a resolution input, never the identity itself
+    /// (`getuniqueclassdef(cls)` keys by class object, bookkeeper.py:339).
+    /// A duplicate leaf whose origin was tombstoned by
+    /// `harden_duplicate_leaf_metadata` passes through unresolved; its
+    /// classdef stays attrs-empty because the field registry withdrew
+    /// the bare alias, so no struct's fields can be misattributed.
     pub fn intern_class_by_qualname(self: &Rc<Self>, name: &str) -> HostObject {
-        if let Some(existing) = self.pyre_struct_root_classes.borrow().get(name) {
+        let key = majit_ir::descr::canonical_struct_name(name);
+        if let Some(existing) = self.pyre_struct_root_classes.borrow().get(&key) {
             return existing.clone();
         }
-        let host = crate::flowspace::model::HostObject::new_class(name.to_string(), Vec::new());
+        let host = crate::flowspace::model::HostObject::new_class(key.clone(), Vec::new());
         self.pyre_struct_root_classes
             .borrow_mut()
-            .insert(name.to_string(), host.clone());
+            .insert(key, host.clone());
         host
     }
 
