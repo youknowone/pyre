@@ -6,9 +6,9 @@
 //! (`perform_register_allocation → flatten_graph → compute_liveness →
 //! assemble`) is already normalized.  pyre-jit's walker fuses graph-build and
 //! flatten and historically skipped this normalization, which forced
-//! pyre-only repairs (the `rewrite_dead_forwarder_gotos` TLabel bridge, the
-//! regalloc walker-pin pre-merge, the per-PC `-live-` remap) and surfaced as
-//! the `jitcode label was never marked` assembler panic.  This module brings
+//! pyre-only repairs (byte-stream TLabel rewrites, regalloc walker pins, the
+//! per-PC `-live-` remap, since retired) and surfaced as the
+//! `jitcode label was never marked` assembler panic.  This module brings
 //! the orthodox pass list onto pyre-jit's `flow::FunctionGraph` so the graph
 //! that reaches coalescing/flatten matches what PyPy produces.
 //!
@@ -170,24 +170,6 @@ pub fn eliminate_empty_blocks(graph: &FunctionGraph) {
 /// single predecessor and is not the returnblock (`target.exits` non-empty).
 /// Such a link is removed by folding `target` into `source`.
 pub fn remove_trivial_links(graph: &FunctionGraph) {
-    let mut merges = Vec::new();
-    remove_trivial_links_recording_into(graph, &mut merges);
-}
-
-/// Like [`remove_trivial_links`] but returns each `(source, target)` merge in
-/// absorption order so the walker drain can move the merged target block's
-/// inline `per_block_ssarepr` into the surviving source (issue #73).  `source`
-/// absorbs `target`; a chain `s <- t1 <- t2` records `(s, t1), (s, t2)`.
-pub fn remove_trivial_links_recording(graph: &FunctionGraph) -> Vec<(BlockRef, BlockRef)> {
-    let mut merges = Vec::new();
-    remove_trivial_links_recording_into(graph, &mut merges);
-    merges
-}
-
-fn remove_trivial_links_recording_into(
-    graph: &FunctionGraph,
-    merges: &mut Vec<(BlockRef, BlockRef)>,
-) {
     let entrymap = mkentrymap(graph);
     let startblock = graph.startblock.clone();
     // `seen = set([block])` — faithful port of a Python set; BlockRef hashes
@@ -250,9 +232,6 @@ fn remove_trivial_links_recording_into(
                 source_b.exitswitch = target_exitswitch;
             }
             source.recloseblock(target_exits);
-            // Record the merge so the walker drain can relocate `target`'s
-            // inline `per_block_ssarepr` into `source` (issue #73).
-            merges.push((source.clone(), target.clone()));
             // `stack.extend(source.exits)` — keep collapsing through source.
             stack.extend(source.borrow().exits.clone());
         } else {

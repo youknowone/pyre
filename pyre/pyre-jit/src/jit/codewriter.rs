@@ -775,51 +775,6 @@ impl SpamBlockRef {
             .last()
             .map_or(false, |insn| insn.is_live())
     }
-
-    /// Move `other`'s per-block accumulator onto the end of `self`'s and clear
-    /// `other`, for the `remove_trivial_links` merge bridge.  Returns the
-    /// index in `self` where `other`'s insns now begin so callers can re-point
-    /// any `-live-` marker offsets recorded against `other`.  `self` and
-    /// `other` must be distinct blocks.
-    fn absorb_per_block_ssarepr(&self, other: &SpamBlockRef) -> usize {
-        let base = self.0.borrow().per_block_ssarepr.len();
-        let moved = std::mem::take(&mut other.0.borrow_mut().per_block_ssarepr);
-        self.0.borrow_mut().per_block_ssarepr.extend(moved);
-        base
-    }
-
-    /// Strip a trailing block-boundary `goto TLabel(<label>) + Unreachable`
-    /// pair from this block's `per_block_ssarepr`, if the goto targets `label`.
-    /// Returns whether a pair was removed.
-    ///
-    /// Used by the `remove_trivial_links` merge bridge: after absorbing
-    /// `target`'s bytecode, the source's old boundary goto would otherwise sit
-    /// in the middle of the merged stream, before the absorbed opcodes.
-    /// Removing it keeps the merged block's byte stream contiguous.
-    fn strip_trailing_boundary_goto(&self, label: &str) -> bool {
-        let mut b = self.0.borrow_mut();
-        let n = b.per_block_ssarepr.len();
-        if n < 2 {
-            return false;
-        }
-        let tail_unreachable = matches!(
-            b.per_block_ssarepr[n - 1],
-            super::flatten::Insn::Unreachable
-        );
-        let tail_goto = matches!(
-            &b.per_block_ssarepr[n - 2],
-            super::flatten::Insn::Op { opname, args, .. }
-                if opname == "goto"
-                    && args.len() == 1
-                    && matches!(&args[0], super::flatten::Operand::TLabel(tl) if tl.name == label)
-        );
-        if tail_unreachable && tail_goto {
-            b.per_block_ssarepr.truncate(n - 2);
-            true
-        } else {
-            false
-        }
-    }
 }
 
 impl PartialEq for SpamBlockRef {
@@ -1658,16 +1613,12 @@ fn filter_cross_slot_coalesce_pairs(
 /// ```
 ///
 /// Pyre's walker fuses graph-build and flatten and never calls
-/// `simplify_graph`, so these forwarders survive and predecessors keep
-/// emitting `goto TLabel(block<dead>)`; this pass restores the orthodox
-/// collapse so predecessors point straight at the generalization (the
-/// byte-stream `TLabel`s are caught by
-/// [`rewrite_dead_forwarder_gotos`]).
+/// `simplify_graph`, so these forwarders survive; this pass restores the
+/// orthodox collapse so predecessors point straight at the generalization
+/// before the canonical splice reads the graph.
 ///
-/// Predicate parity: upstream tests `not link.target.operations`.  The
-/// walker emits SSARepr into `per_block_ssarepr`, NOT `block.operations`
-/// (which stays empty for every walker block), so `operations` cannot be
-/// the predicate.  `mark_dead` (the supersede `operations=()` +
+/// Predicate parity: upstream tests `not link.target.operations` to spot
+/// an empty forwarder.  `mark_dead` (the supersede `operations=()` +
 /// `recloseblock` step) sets `block.dead`, and supersede is the only
 /// producer of the empty-forwarding shape, so `dead` is the faithful
 /// pyre predicate.  The `exitswitch.is_none()` / `!exits.is_empty()`
@@ -1765,134 +1716,6 @@ pub(crate) fn eliminate_empty_blocks(graph: &super::flow::FunctionGraph) {
             link.args = new_args;
             link.target = Some(exit_target);
         }
-    }
-}
-
-/// Companion to [`eliminate_empty_blocks`] for pyre's inline-emit
-/// walker: rewrite the already-emitted terminator `TLabel`s that name a
-/// collapsed dead forwarder so they target the surviving generalization.
-///
-/// The walker emits `goto` / `goto_if_not_*` / `switch` `TLabel`s by
-/// block identity (`block<addr>`) inline DURING the walk — before the
-/// `mergeblock` supersede that turns the target into a dead forwarder.
-/// `eliminate_empty_blocks` only rewrites graph links, so the byte
-/// stream still names the now-empty dead block.  This brings the emitted
-/// SSARepr in line with the collapsed graph: each `TLabel(block<dead>)`
-/// is retargeted to `block<live>` by following the same forwarder chain
-/// `eliminate_empty_blocks` walked, so the renamings the post-walk pass
-/// splices for the (collapsed) `predecessor -> generalization` link and
-/// the emitted goto agree.
-fn rewrite_dead_forwarder_gotos(all_walker_blocks: &[SpamBlockRef]) {
-    // Follow a dead forwarder's single-exit chain to its surviving
-    // (non-dead) target — mirrors the inner `while` of
-    // `eliminate_empty_blocks`.
-    fn resolve_forward(start: &super::flow::BlockRef) -> super::flow::BlockRef {
-        let mut cur = start.clone();
-        loop {
-            let next = {
-                let b = cur.borrow();
-                if !b.dead || b.exitswitch.is_some() || b.exits.is_empty() {
-                    None
-                } else {
-                    b.exits[0].borrow().target.clone()
-                }
-            };
-            match next {
-                Some(target) if target != cur => cur = target,
-                _ => break,
-            }
-        }
-        cur
-    }
-
-    // Dead forwarders number a handful per graph, so a flat
-    // `Vec<(from, to)>` with linear lookup is the right shape — no
-    // RPython dict stands behind this pyre-only byte-rewrite bridge.
-    let mut remap: Vec<(String, String)> = Vec::new();
-    for spam in all_walker_blocks {
-        let block = spam.block();
-        if !block.borrow().dead {
-            continue;
-        }
-        let from = super::flatten::block_label_name(&block);
-        let to = super::flatten::block_label_name(&resolve_forward(&block));
-        if from != to {
-            remap.push((from, to));
-        }
-    }
-    if remap.is_empty() {
-        return;
-    }
-
-    let retarget = |tl: &mut super::flatten::TLabel| {
-        if let Some((_, to)) = remap.iter().find(|(from, _)| *from == tl.name) {
-            tl.name = to.clone();
-        }
-    };
-    for spam in all_walker_blocks {
-        let mut borrow = spam.0.borrow_mut();
-        for insn in borrow.per_block_ssarepr.iter_mut() {
-            let super::flatten::Insn::Op { args, .. } = insn else {
-                continue;
-            };
-            for arg in args.iter_mut() {
-                match arg {
-                    super::flatten::Operand::TLabel(tl) => retarget(tl),
-                    super::flatten::Operand::Descr(descr_rc) => {
-                        if let super::flatten::DescrOperand::SwitchDict(_) = descr_rc.as_ref() {
-                            let descr_mut = std::rc::Rc::make_mut(descr_rc);
-                            if let super::flatten::DescrOperand::SwitchDict(sw) = descr_mut {
-                                for (_key, tl) in sw.labels.iter_mut() {
-                                    retarget(tl);
-                                }
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-    }
-}
-
-/// The `remove_trivial_links` merge bridge.
-///
-/// When `remove_trivial_links` merges `target` into `source`
-/// (`source.recloseblock(*target.exits)`), `target` becomes unreachable in
-/// `graph.iterblocks()`, but the walker has already emitted `target`'s Python
-/// opcodes inline into its `per_block_ssarepr`.  The drain appends unreachable
-/// blocks AFTER the DFS-ordered prefix, so without this bridge `target`'s insns
-/// would emit at the wrong position behind `source`'s now-dangling
-/// `goto TLabel(target)`.
-///
-/// Relocate each merged `target`'s accumulator to the end of its `source`'s, in
-/// the merge (absorption) order.  The surviving stream keeps `source`'s
-/// block-boundary `goto TLabel(target) + ---` immediately followed by
-/// `target`'s `Label` — a runtime-correct (redundant) fall-through branch that
-/// the assembler patches normally (`target`'s label is single-entry, so it is
-/// marked exactly once and never left unmarked).
-fn rewrite_trivial_link_merges(
-    merges: &[(super::flow::BlockRef, super::flow::BlockRef)],
-    all_walker_blocks: &[SpamBlockRef],
-) {
-    let find = |b: &super::flow::BlockRef| -> Option<SpamBlockRef> {
-        all_walker_blocks
-            .iter()
-            .find(|spam| &spam.block() == b)
-            .cloned()
-    };
-    for (source, target) in merges {
-        let (Some(src_spam), Some(tgt_spam)) = (find(source), find(target)) else {
-            continue;
-        };
-        if src_spam == tgt_spam {
-            continue;
-        }
-        // Drop source's old boundary `goto target + ---` before appending, so
-        // target's own terminator is the first terminator in the merged block
-        // and the single-exit renaming splice lands after target's opcodes
-        src_spam.strip_trailing_boundary_goto(&super::flatten::block_label_name(target));
-        src_spam.absorb_per_block_ssarepr(&tgt_spam);
     }
 }
 
@@ -9137,11 +8960,10 @@ impl CodeWriter {
         // `simplify_graph` (`translator.py:55-56`) parity: collapse the
         // empty forwarding blocks `mergeblock` supersede left behind
         // (`flowcontext.py:455-463`) before regalloc coalescing and the
-        // drain read the graph.  Runs BEFORE `collect_cfg_coalesce_pairs`
-        // so the coalesce pairs (and therefore the colors the renamings
-        // use) reflect the collapsed `predecessor -> generalization`
-        // links; `rewrite_dead_forwarder_gotos` then retargets the
-        // walker's inline-emitted `TLabel`s to match.
+        // canonical splice reads the graph.  Runs BEFORE
+        // `collect_cfg_coalesce_pairs` so the coalesce pairs (and therefore
+        // the colors the renamings use) reflect the collapsed
+        // `predecessor -> generalization` links.
         //
         // The full orthodox pass list lives in
         // [`super::simplify::simplify_graph`] / `all_passes`.  Here we run
@@ -9192,24 +9014,9 @@ impl CodeWriter {
                 );
             }
         }
-        // Byte-stream companions to the two graph passes, retained for the
-        // walker per-block accumulator pending its retirement; the canonical
-        // splice already reads the simplified graph directly.
-        //
-        // Retarget the walker's inline-emitted gotos that still name a
-        // collapsed dead forwarder to the surviving generalization.  MUST run
-        // before the merge bridge below: for a `source -> dead_forwarder ->
-        // target` shape `remove_trivial_links` records the merge `(source,
-        // target)`, but the source block's boundary terminator still reads
-        // `goto TLabel(dead_forwarder)` until this rewrite — so the merge
-        // strip (which looks for `block_label_name(target)`) would miss it and
-        // leave the stale terminator in front of the absorbed opcodes.
-        rewrite_dead_forwarder_gotos(&all_walker_blocks);
         // remove_trivial_links merges single-entry/single-exit chains; the
-        // merge bridge relocates each merged target's per_block_ssarepr into
-        // its surviving source so the byte stream stays contiguous.
-        let trivial_link_merges = super::simplify::remove_trivial_links_recording(&graph);
-        rewrite_trivial_link_merges(&trivial_link_merges, &all_walker_blocks);
+        // canonical splice reads the simplified graph directly.
+        super::simplify::remove_trivial_links(&graph);
 
         // Seed `walker_slot_for_variable` with each block's inputarg
         // slots before the splice regalloc coalescing reads it.  The
