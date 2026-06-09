@@ -10316,11 +10316,8 @@ impl CodeWriter {
                 }
             })
             .collect();
-        let canonical_for_splice: Option<(
-            super::flatten::SSARepr,
-            [super::regalloc::GraphAllocationResult; 3],
-        )> =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let (canonical, splice_regallocs) =
+            (|| {
                 // #254: build the splice regalloc FRESH with same-slot
                 // coalescing so each frame slot maps to exactly one
                 // canonical color (the dense per-slot resume map below
@@ -10397,489 +10394,179 @@ impl CodeWriter {
                     code.varnames.len() as u16,
                 );
                 (ssarepr, splice_regallocs)
-            }))
-            .ok();
-        // Walker-tracked per-PC `-live-` marker positions exposed to
-        // the post-drain `pc_map` computation.  Populated inside the
-        // drain block below; consumed by `filter_liveness_in_place`
-        // (translated through the `remove_repeated_live` remap) as the
-        // sole source for `pc_map`.
-        let mut walker_tracked_pc_live_indices_out: Option<Vec<usize>> = None;
-        // Per-PC pre-merge SSARepr index of the post-`residual_call`
-        // `-live-` (sparse: `Some` only for canraise PCs).  Resolved in
-        // the drain block alongside `walker_tracked_pc_live_indices_out`
-        // and threaded through `filter_liveness_in_place`'s remap.
-        let mut walker_after_call_pc_indices_out: Option<Vec<Option<usize>>> = None;
-        // #280: set when the canonical stream actually replaced the walker
-        // drain below.  Gates the canonical-color-space resume-map rebuild
-        // (`stack_slot_color_map` / `pyre_color_for_semantic_local` / portal
-        // regs) so spliced graphs decode resume registers via the canonical
-        // coloring, not the walker stack-slot register numbering.
-        let mut did_splice = false;
-        {
-            // Walker post-walk insert_renamings.
-            // Run BEFORE the per-block drain so the splice positions
-            // land in the per_block_ssarepr accumulators.  Mirrors
-            // `flatten.py:154 self.insert_renamings(link)` for the
-            // simple unconditional single-exit case (loop back-edges,
-            // straight-line forward jumps).  Multi-exit blocks
-            // (POP_JUMP_IF_*, canraise) require per-link positional
-            // injection between source-block terminator and each
-            // target-block Label, which is not yet implemented here.
-            walker_post_walk_insert_renamings(
-                &mut graph,
-                &walker_slot_for_variable,
-                &graph_regallocs,
-                &mut all_walker_blocks,
-                &mut walker_pc_live_marker_pos,
-            );
-            // Reorder all_walker_blocks per `graph.iterblocks()` DFS
-            // pre-order so the drain matches canonical `make_bytecode_block`
-            // (`flatten.py:107-156`) emission order.  Canonical recurses
-            // into each link's target immediately after emitting the
-            // source's body; iterblocks (`flowspace/model.py:55-77`)
-            // produces the same pre-order via explicit reversed-stack
-            // DFS.  Walker emits per-PC into pendingblocks queue order
-            // which diverges from DFS — block-boundary `goto pcX` ops
-            // whose target isn't the immediately-next walker block
-            // survive `strip_walker_block_boundary_goto` and produce
-            // walker_unmatched against canonical.  Post-walk reorder
-            // by DFS aligns the drain so the strip catches them.
-            //
-            // Dead supersede blocks have empty `per_block_ssarepr`
-            // (cleared by `mark_dead`), so their position in the order
-            // doesn't contribute insns.  Synthetic walker blocks
-            // (catch-landings, blocks not reachable in graph DFS)
-            // append in their original creation order after the
-            // DFS-matched prefix.
-            let dfs_blocks = graph.iterblocks();
-            let mut reordered: Vec<SpamBlockRef> = Vec::with_capacity(all_walker_blocks.len());
-            let mut placed: Vec<bool> = vec![false; all_walker_blocks.len()];
-            for gb in &dfs_blocks {
-                for (idx, spam) in all_walker_blocks.iter().enumerate() {
-                    if !placed[idx] && spam.block() == *gb {
-                        reordered.push(spam.clone());
-                        placed[idx] = true;
-                    }
-                }
-            }
-            for (idx, spam) in all_walker_blocks.iter().enumerate() {
-                if !placed[idx] {
-                    reordered.push(spam.clone());
-                }
-            }
-            let mut blocks: Vec<Vec<super::flatten::Insn>> = reordered
-                .iter()
-                .map(|block| block.per_block_ssarepr())
-                .collect();
-            // Resolve walker-tracked PC live-marker positions to
-            // absolute SSARepr indices using POST-STRIP prefix lengths.
-            // Captured BEFORE strip mutates `blocks` so per-block
-            // offsets stay aligned — strip only truncates the trailing
-            // `goto + Unreachable` pair from a block tail, so the
-            // `-live-` marker positions (which never live in the tail)
-            // are invariant.  Picks the FIRST entry per PC whose block
-            // contributes non-empty content to the final SSARepr.
-            let walker_tracked_pc_indices: Option<Vec<usize>> = {
-                // Compute each block's post-strip length without invoking
-                // `strip_walker_block_boundary_goto` directly: that helper
-                // moves block insns into its return value (via
-                // `Vec::append`), which would zero-out the source blocks
-                // and corrupt the resolver's offset math.  Mirror the
-                // helper's strip-detection rule (goto+Unreachable tail
-                // whose target matches a leading label in any subsequent
-                // block) but only measure the resulting length here.
-                let post_strip_lens: Vec<usize> = (0..blocks.len())
-                    .map(|i| {
-                        // Mirror `strip_walker_block_boundary_goto`'s
-                        // IMMEDIATE-next-non-empty-block rule per
-                        // `flatten.py:106-155 make_link` recursive
-                        // descent — fall-through never hops over an
-                        // intervening non-empty block.
-                        let next_label_names: Vec<String> = (i + 1..blocks.len())
-                            .find(|&j| !blocks[j].is_empty())
-                            .map(|j| {
-                                blocks[j]
-                                    .iter()
-                                    .take_while(|insn| {
-                                        matches!(insn, super::flatten::Insn::Label(_))
-                                    })
-                                    .filter_map(|insn| match insn {
-                                        super::flatten::Insn::Label(l) => Some(l.name.clone()),
-                                        _ => None,
-                                    })
-                                    .collect::<Vec<_>>()
-                            })
-                            .unwrap_or_default();
-                        let len = blocks[i].len();
-                        let strip_tail = if len >= 2 {
-                            match (&blocks[i][len - 2], &blocks[i][len - 1]) {
-                                (
-                                    super::flatten::Insn::Op { opname, args, .. },
-                                    super::flatten::Insn::Unreachable,
-                                ) if opname == "goto"
-                                    && args.len() == 1
-                                    && matches!(&args[0], Operand::TLabel(target)
-                                        if next_label_names.iter().any(|n| n == &target.name)) =>
-                                {
-                                    2
-                                }
-                                _ => 0,
-                            }
-                        } else {
-                            0
-                        };
-                        len - strip_tail
-                    })
-                    .collect();
-                let mut post_strip_block_starts: Vec<usize> = Vec::with_capacity(blocks.len());
-                let mut running = 0usize;
-                for &len in &post_strip_lens {
-                    post_strip_block_starts.push(running);
-                    running += len;
-                }
-                let resolve_walker_pc =
-                    |records: &Vec<Vec<(SpamBlockRef, usize)>>| -> Option<Vec<usize>> {
-                        let mut translated: Vec<usize> = Vec::with_capacity(records.len());
-                        for py_pc_entries in records {
-                            let resolved = py_pc_entries.iter().find_map(|(block_ref, offset)| {
-                                let block_pos = reordered.iter().position(|b| b == block_ref)?;
-                                if post_strip_lens[block_pos] == 0 {
-                                    return None;
-                                }
-                                if *offset >= post_strip_lens[block_pos] {
-                                    return None;
-                                }
-                                Some(post_strip_block_starts[block_pos] + offset)
-                            });
-                            match resolved {
-                                Some(idx) => translated.push(idx),
-                                None => return None,
-                            }
-                        }
-                        Some(translated)
-                    };
-                // Resolve the sparse after-residual-call anchors with the
-                // same post-strip block math, but per-entry: a PC without
-                // a recorded post-call `-live-` stays `None` instead of
-                // collapsing the whole map (unlike `resolve_walker_pc`'s
-                // all-or-nothing contract for the dense start markers).
-                let after_call_indices: Vec<Option<usize>> = walker_pc_after_call_live_pos
-                    .iter()
-                    .map(|py_pc_entries| {
-                        py_pc_entries.iter().find_map(|(block_ref, offset)| {
-                            let block_pos = reordered.iter().position(|b| b == block_ref)?;
-                            if post_strip_lens[block_pos] == 0 {
-                                return None;
-                            }
-                            if *offset >= post_strip_lens[block_pos] {
-                                return None;
-                            }
-                            Some(post_strip_block_starts[block_pos] + offset)
-                        })
-                    })
-                    .collect();
-                walker_after_call_pc_indices_out = Some(after_call_indices);
-                resolve_walker_pc(&walker_pc_live_marker_pos)
-            };
-            ssarepr.insns = strip_walker_block_boundary_goto(&mut blocks);
-            // Walker-tracked per-PC `-live-` positions are the sole
-            // source of truth for `pc_map`; downstream consumers
-            // (`filter_liveness_in_place`, `pc_map`) translate them
-            // through the `remove_repeated_live` remap.
-            walker_tracked_pc_live_indices_out = walker_tracked_pc_indices;
-            // #229 / #279 / #230 path-(b) splice (gate-staged, default off).
-            // When `canonical_for_splice` built, REPLACE the walker's
-            // drained SSARepr with the canonical `flatten_graph` stream so
-            // the rest of `transform_graph_to_jitcode` (regalloc, liveness,
-            // assemble) runs over the single-driver output rather than the
-            // per-block walker drain.  The canonical stream is SPARSE in
-            // `-live-` markers (one per canraise / before each guard, not
-            // one per PC), so the runtime's dense per-PC `pc_map` feed is
-            // reconstructed from its OWN `pc_first_insn_pos` + sparse
-            // markers via `derive_pc_live_indices_from_sparse` (#281/#287
-            // resolver — its first GATED PRODUCTION wiring).  Absent PCs
-            // (stack-only `nopc`, never a runtime resume target per
-            // #285/#296 `stranded==0`) carry the nearest preceding resolved
-            // marker; a leading run before the first marker falls back to
-            // index 0.  This path is NOT yet correct end-to-end — the
-            // SSA-side `allocate_registers` below re-colors the spliced
-            // stream against walker stack-slot colors while the canonical
-            // body carries graph-lifetime colors (#254/#280), so gate-ON is
-            // a measurement of the next cascade blocker, NOT a green flip;
-            // gate-OFF skips the entire block and stays byte-identical.
-            if let Some((canonical, _)) = &canonical_for_splice {
-                // The dense `pc_map` feed `filter_liveness_in_place` consumes
-                // must reference ONLY `-live-` markers (it asserts the target
-                // insn `is_live()`).  The canonical stream's FIRST marker is a
-                // leading guard / trailing-canraise marker INTERIOR to a block,
-                // whose backward-liveness includes block-interior stack temps.
-                // But the runtime snapshots the outer frame at EVERY opcode
-                // entry — `dispatch_via_miframe_at_opcode_entry` takes
-                // `entry_py_pc = miframe.orgpc`, so the entry PC (pc=0) and the
-                // leading run before that interior marker ARE runtime resume
-                // targets (#281, contra the earlier "entry PCs never resume"
-                // assumption).  Forward-carrying the interior marker for them
-                // hands `collect_outer_active_boxes` a stack-temp ref color
-                // that is `OpRef::NONE` at entry → panic.
-                //
-                // #281 entry-marker: insert a bare `-live-` immediately before
-                // the first pc-carrying op (after the startblock Label).
-                // `compute_liveness` (run inside `filter_liveness_in_place`)
-                // RECOMPUTES its args via backward analysis (liveness.rs:167),
-                // so the empty marker fills to the entry-live set = inputargs
-                // only — block-interior temps are written-before-read past
-                // this point, hence not yet alive.  The leading run then
-                // resolves to ENTRY liveness instead of the forward interior
-                // marker.  Pyre-specific: the per-opcode tracer needs entry
-                // liveness that upstream RPython's guard-only resume does not.
-                // A canonical stream with no markers at all (degenerate
-                // straight-line graph, no resume target) cannot feed the dense
-                // table, so fall back to the walker stream rather than splice.
-                let mut spliced = (*canonical).clone();
-                if let Some(first_op_pos) =
-                    spliced.pc_first_insn_pos.iter().map(|&(_, pos)| pos).min()
-                {
-                    spliced
-                        .insns
-                        .insert(first_op_pos, super::flatten::Insn::live(Vec::new()));
-                    for (_, pos) in spliced.pc_first_insn_pos.iter_mut() {
-                        if *pos >= first_op_pos {
-                            *pos += 1;
-                        }
-                    }
-                }
-                // #305 block-entry resume markers.  A branch-target block's
-                // head PC (e.g. a goto_if_not / switch target block's first
-                // op) has no `-live-` of its own in the sparse canonical
-                // stream — the only markers near it are the branch's leading
-                // marker (BEFORE the branch decision) and the head op's own
-                // trailing canraise marker (AFTER it).  `derive_pc_live_
-                // indices_from_sparse` resolves a PC to the nearest `-live-`
-                // AT-OR-BEFORE its first insn, so the head PC resolves
-                // BACKWARD across the preceding goto_if_not to the branch's
-                // leading marker.  Resuming there re-runs the branch with the
-                // un-restorable scratch cond (pyre snapshots only PyFrame
-                // locals, not arm-local boxes) and takes the wrong arm — the
-                // taken-branch head returns the other branch's value (#305
-                // min305: f's `return 7` head resumes at the `goto_if_not`,
-                // returns 3).  The walker emits a per-PC leading marker before
-                // every PC's ops, so its head-PC resolution lands inside the
-                // block; mirror that by inserting a bare `-live-` after each
-                // Label whose body starts with a non-marker op.
-                // `compute_liveness` (run in `filter_liveness_in_place`)
-                // recomputes the marker's args via backward analysis, so the
-                // empty marker fills to the block-entry-live set.
-                {
-                    let mut new_insns: Vec<super::flatten::Insn> =
-                        Vec::with_capacity(spliced.insns.len() + 4);
-                    // `shift[old_pos]` = number of markers inserted strictly
-                    // before `old_pos`; a block-head op at `label_pos + 1`
-                    // gets the just-inserted marker counted, so it remaps
-                    // past its own block-entry marker.
-                    let mut shift: Vec<usize> = Vec::with_capacity(spliced.insns.len() + 1);
-                    let mut inserted = 0usize;
-                    for (i, insn) in spliced.insns.iter().enumerate() {
-                        shift.push(inserted);
-                        new_insns.push(insn.clone());
-                        if matches!(insn, super::flatten::Insn::Label(_)) {
-                            let next_blocks_marker = spliced.insns.get(i + 1).map_or(true, |n| {
-                                n.is_live() || matches!(n, super::flatten::Insn::Label(_))
-                            });
-                            if !next_blocks_marker {
-                                new_insns.push(super::flatten::Insn::live(Vec::new()));
-                                inserted += 1;
-                            }
-                        }
-                    }
-                    shift.push(inserted);
-                    for (_, pos) in spliced.pc_first_insn_pos.iter_mut() {
-                        *pos += shift[*pos];
-                    }
-                    spliced.insns = new_insns;
-                }
-                let first_live = spliced.insns.iter().position(|i| i.is_live());
-                let derived = first_live
-                    .map(|_| derive_pc_live_indices_from_sparse(&spliced, num_instrs, code));
-                // Splice precondition: the canonical stream carries at least
-                // one `-live-` marker (so a resume liveness map exists) and
-                // `derive_pc_live_indices_from_sparse` produced the dense
-                // per-PC fill.  The earlier per-graph resume-safety gates
-                // (stranded fallthrough markers / frame-slot Ref color
-                // collision / conflict) declined NOTHING across the bench
-                // suite once #286/#308 re-keyed the sparse resolver and #304/
-                // #319 made the splice coloring injective, so they are gone:
-                // the splice coloring is trusted to produce a valid resume
-                // inverse for every graph that reaches here.
-                if let (Some(first_live), Some(derived)) = (first_live, derived) {
-                    let mut dense: Vec<usize> = Vec::with_capacity(num_instrs);
-                    let mut last = first_live;
-                    for entry in &derived {
-                        if let Some(idx) = entry {
-                            last = *idx;
-                        }
-                        dense.push(last);
-                    }
-                    ssarepr.insns = spliced.insns;
-                    ssarepr.pc_first_insn_pos = spliced.pc_first_insn_pos;
-                    walker_tracked_pc_live_indices_out = Some(dense);
-                    // The walker's `walker_after_call_pc_indices_out` indexes
-                    // the (now-replaced) walker stream; re-derive the
-                    // after-residual-call resume anchors against the spliced
-                    // stream so `filter_liveness_in_place`'s remap addresses
-                    // valid spliced positions (else out-of-bounds in
-                    // `compute_liveness_with_pc_anchors`) and the runtime's
-                    // `after_residual_call_resume_pc` table points into the
-                    // spliced bytes.
-                    walker_after_call_pc_indices_out =
-                        Some(derive_after_call_indices_from_sparse(&ssarepr, num_instrs));
-                    did_splice = true;
+            })();
+        // Splice the canonical `flatten_graph` stream in as the production
+        // SSARepr: the walker built the FunctionGraph, the canonical driver
+        // above produced the single-driver SSARepr from it, and that stream
+        // is the sole source of `ssarepr.insns`.
+        //
+        // The canonical stream is SPARSE in `-live-` markers (one per canraise
+        // and before each guard, not one per PC), so reconstruct the dense
+        // per-PC liveness feed `filter_liveness_in_place` consumes from the
+        // stream's own `pc_first_insn_pos` plus its sparse markers
+        // (`derive_pc_live_indices_from_sparse`): absent PCs (stack-only,
+        // never a runtime resume target) carry the nearest preceding resolved
+        // marker; a leading run before the first marker falls back to index 0.
+        //
+        // The dense feed must reference ONLY `-live-` markers
+        // (`filter_liveness_in_place` asserts the target insn `is_live()`).
+        // The stream's first marker is a leading-guard / trailing-canraise
+        // marker INTERIOR to a block, whose backward-liveness includes
+        // block-interior stack temps; but the runtime snapshots the outer
+        // frame at EVERY opcode entry (`dispatch_via_miframe_at_opcode_entry`
+        // resumes at `entry_py_pc = miframe.orgpc`), so the entry PC and the
+        // leading run before that interior marker ARE runtime resume targets.
+        // Forward-carrying the interior marker for them would hand
+        // `collect_outer_active_boxes` a stack-temp ref color that is
+        // `OpRef::NONE` at entry.  Insert a bare `-live-` immediately before
+        // the first pc-carrying op (after the startblock Label);
+        // `compute_liveness` (run inside `filter_liveness_in_place`) recomputes
+        // its args via backward analysis, so the empty marker fills to the
+        // entry-live set = inputargs only.
+        let mut spliced = canonical;
+        if let Some(first_op_pos) = spliced.pc_first_insn_pos.iter().map(|&(_, pos)| pos).min() {
+            spliced
+                .insns
+                .insert(first_op_pos, super::flatten::Insn::live(Vec::new()));
+            for (_, pos) in spliced.pc_first_insn_pos.iter_mut() {
+                if *pos >= first_op_pos {
+                    *pos += 1;
                 }
             }
         }
-
-        // codewriter.py:45-47 `for kind in KINDS:
-        //   regallocs[kind] = perform_register_allocation(graph, kind)`
-        //
-        // RPython runs regalloc on the CFG before flatten emits the
-        // SSARepr (`codewriter.py:44` vs `:53-56`). Regalloc uses
-        // `block.operations` + `link.args` for interference; `-live-`
-        // markers don't exist yet. pyre dispatches directly to the
-        // SSARepr — at regalloc time the `-live-` markers are present
-        // but still hold empty args (`filter_liveness_in_place` runs
-        // post-rename), so the allocator's generic `Insn::Op` walk is
-        // a no-op on them, matching the upstream pre-liveness ordering.
-        let inputs = super::regalloc::ExternalInputs {
-            portal_frame_reg,
-            portal_ec_reg,
-            // Portal frames carry a virtualizable + ec red argument
-            // pair (interp_jit.py:64-69). Non-portal callees pass red
-            // args via the call assembler edge; the dispatch loop
-            // does not pre-load them into Ref registers.
-            portal_inputs: portal_frame_reg != u16::MAX,
-        };
-        // `flow.rs` now models `Block.operations` as upstream
-        // `SpaceOperation`, not flattened `Insn`. The direct-dispatch
-        // walker still emits only SSA/flatten-level data, so the shadow
-        // graph remains topology-only until a pre-regalloc Variable
-        // environment is introduced.
-
-        // `regalloc.py:79-96 coalesce_variables` CFG-level coalescing:
-        // preserve every Link's `(link.args[i], link.target.inputargs[i])`
-        // pair for the SSARepr-side allocator too.  Graph-side regalloc
-        // uses the Variable-keyed `cfg_variable_pairs`; the walker allocator
-        // is slot-keyed, so project through `walker_slot_for_variable`.
-        // Without this, `walker_post_walk_insert_renamings` can skip a copy
-        // because graph colors already match while SSARepr regalloc later
-        // assigns different colors to the same edge.
-        let cfg_coalesce_pairs: Vec<(u16, u16)> = cfg_variable_pairs
-            .iter()
-            .filter_map(|(src, dst)| {
-                let s = walker_slot_for_variable
-                    .get(src.0 as usize)
-                    .copied()
-                    .flatten()?;
-                let d = walker_slot_for_variable
-                    .get(dst.0 as usize)
-                    .copied()
-                    .flatten()?;
-                Some((s, d))
-            })
-            .collect();
-        // #254/#280: a spliced body is ALREADY final-colored by
-        // `splice_regallocs` (canonical graph-lifetime colors, post
-        // `enforce_input_args`).  Re-running the SSA-side
-        // `allocate_registers` would impose a SECOND coloring whose
-        // `enforce_ssarepr_input_args` color-monotonicity invariant
-        // (regalloc.rs:824) the canonical coloring need not satisfy, and
-        // whose recolor would desync the body from the resume maps and
-        // the live-marker kind split (`materialize_virtual_int`
-        // mismatch).  For spliced graphs adopt `splice_regallocs` as the
-        // SOLE authority: identity rename (so `apply_rename` is skipped
-        // and `rename_lookup` below returns each slot's canonical color
-        // unchanged) and `num_regs` from `splice_regallocs.num_colors`.
-        // The #254 same-slot coalescing guarantees the dense per-slot
-        // resume maps built from these colors are unambiguous.
-        //
-        // The walker (non-spliced) path keeps `codewriter.py:44-46`'s
-        // post-walk `allocate_registers` + `apply_rename`; the
-        // `graph_regallocs` it shares with `walker_post_walk_insert_
-        // renamings` are computed pre-drain so colors agree.
-        let alloc_result = if let (true, Some((_, splice_regallocs))) =
-            (did_splice, canonical_for_splice.as_ref())
+        // Block-entry resume markers.  A branch-target block's head PC (a
+        // `goto_if_not` / `switch` target block's first op) has no `-live-`
+        // of its own in the sparse stream — the only nearby markers are the
+        // branch's leading marker (BEFORE the branch decision) and the head
+        // op's own trailing canraise marker (AFTER it).
+        // `derive_pc_live_indices_from_sparse` resolves a PC to the nearest
+        // `-live-` AT-OR-BEFORE its first insn, so the head PC would resolve
+        // BACKWARD across the preceding `goto_if_not` to the branch's leading
+        // marker; resuming there re-runs the branch with an un-restorable
+        // scratch condition (only PyFrame locals are snapshotted, not
+        // arm-local boxes) and takes the wrong arm.  Insert a bare `-live-`
+        // after each Label whose body starts with a non-marker op so the
+        // head-PC resolution lands inside the block; `compute_liveness` fills
+        // it to the block-entry-live set.
         {
-            super::regalloc::AllocationResult {
-                rename: [Vec::new(), Vec::new(), Vec::new()],
-                num_regs: [
-                    splice_regallocs[super::flatten::Kind::Int.index()].num_colors,
-                    splice_regallocs[super::flatten::Kind::Ref.index()].num_colors,
-                    splice_regallocs[super::flatten::Kind::Float.index()].num_colors,
-                ],
-            }
-        } else {
-            let alloc = super::regalloc::allocate_registers(
-                &ssarepr,
-                code.varnames.len(),
-                inputs,
-                &cfg_coalesce_pairs,
-            );
-            super::regalloc::apply_rename(&mut ssarepr, &alloc.rename);
-            alloc
-        };
-
-        // #280: pre-rename Ref color for a walker frame slot.  The walker
-        // numbers each frame slot's register by the slot itself, so its
-        // pre-rename color IS the slot index — that is the identity branch
-        // used on every non-spliced graph.  The spliced canonical body
-        // instead colors each frame value by its graph-lifetime Variable
-        // (`splice_regallocs[Ref].getcolor(v)`), so a slot's pre-rename
-        // color is the canonical color of the Variable the walker pinned to
-        // that slot.  Build the inverse `walker_slot → canonical Ref color`
-        // from `walker_slot_for_variable` (Variable → slot) once, then the
-        // `slot_pre_color` closure feeds every resume-map lookup below
-        // through the same `apply_rename` the body went through, so the maps
-        // land in the post-recolor canonical color space the live markers
-        // carry.  A slot keeps the first canonical color seen; #304/#319 made
-        // the splice coloring injective per frame slot, so the dense map
-        // represents every slot without loss.
-        let splice_slot_pre_color: Option<Vec<Option<u16>>> = if did_splice {
-            canonical_for_splice.as_ref().map(|(_, splice_regallocs)| {
-                let ref_coloring = &splice_regallocs[Kind::Ref.index()].coloring;
-                // #319: build the inverse over the live-masked slot map so a
-                // dead leaked Ref (color minted by `color_leaked_arg_variables`)
-                // sharing a slot with live Variables never displaces the slot's
-                // live color.
-                let max_slot = walker_slot_for_variable_live
-                    .iter()
-                    .flatten()
-                    .copied()
-                    .max()
-                    .unwrap_or(0);
-                let mut inverse: Vec<Option<u16>> = vec![None; max_slot as usize + 1];
-                for (vid, slot) in walker_slot_for_variable_live.iter().enumerate() {
-                    let Some(slot) = *slot else { continue };
-                    let Some(&color) = ref_coloring.get(&super::flow::VariableId(vid as u32))
-                    else {
-                        continue;
-                    };
-                    if inverse[slot as usize].is_none() {
-                        inverse[slot as usize] = Some(color);
+            let mut new_insns: Vec<super::flatten::Insn> =
+                Vec::with_capacity(spliced.insns.len() + 4);
+            // `shift[old_pos]` = number of markers inserted strictly before
+            // `old_pos`; a block-head op at `label_pos + 1` counts the
+            // just-inserted marker, so it remaps past its own block-entry
+            // marker.
+            let mut shift: Vec<usize> = Vec::with_capacity(spliced.insns.len() + 1);
+            let mut inserted = 0usize;
+            for (i, insn) in spliced.insns.iter().enumerate() {
+                shift.push(inserted);
+                new_insns.push(insn.clone());
+                if matches!(insn, super::flatten::Insn::Label(_)) {
+                    let next_blocks_marker = spliced.insns.get(i + 1).map_or(true, |n| {
+                        n.is_live() || matches!(n, super::flatten::Insn::Label(_))
+                    });
+                    if !next_blocks_marker {
+                        new_insns.push(super::flatten::Insn::live(Vec::new()));
+                        inserted += 1;
                     }
                 }
-                inverse
-            })
-        } else {
-            None
+            }
+            shift.push(inserted);
+            for (_, pos) in spliced.pc_first_insn_pos.iter_mut() {
+                *pos += shift[*pos];
+            }
+            spliced.insns = new_insns;
+        }
+        // Every graph reaching here carries at least one `-live-` marker (the
+        // entry marker inserted above whenever any pc-carrying op exists), so
+        // a stream with no marker cannot produce a resume map and is a build
+        // error.
+        let first_live = spliced
+            .insns
+            .iter()
+            .position(|i| i.is_live())
+            .expect("canonical splice stream carries no -live- marker");
+        let derived = derive_pc_live_indices_from_sparse(&spliced, num_instrs, code);
+        let mut dense: Vec<usize> = Vec::with_capacity(num_instrs);
+        let mut last = first_live;
+        for entry in &derived {
+            if let Some(idx) = entry {
+                last = *idx;
+            }
+            dense.push(last);
+        }
+        ssarepr.insns = spliced.insns;
+        ssarepr.pc_first_insn_pos = spliced.pc_first_insn_pos;
+        // Per-PC `-live-` marker indices feeding `filter_liveness_in_place`
+        // (translated through its `remove_repeated_live` remap), and the
+        // sparse after-residual-call resume anchors — both derived from the
+        // spliced stream so the remap addresses valid positions and the
+        // runtime's `after_residual_call_resume_pc` table points into the
+        // spliced bytes.
+        let walker_tracked_pc_live_indices_out: Option<Vec<usize>> = Some(dense);
+        let walker_after_call_pc_indices_out: Option<Vec<Option<usize>>> =
+            Some(derive_after_call_indices_from_sparse(&ssarepr, num_instrs));
+
+        // The spliced body is ALREADY final-colored by `splice_regallocs`
+        // (canonical graph-lifetime colors, post `enforce_input_args`).  A
+        // second SSA-side `allocate_registers` would impose a coloring whose
+        // `enforce_ssarepr_input_args` color-monotonicity invariant the
+        // canonical coloring need not satisfy, and whose recolor would desync
+        // the body from the resume maps and the live-marker kind split
+        // (`materialize_virtual_int` mismatch).  Adopt `splice_regallocs` as
+        // the sole authority: an identity rename (so `rename_lookup` below
+        // returns each slot's canonical color unchanged) and `num_regs` from
+        // `splice_regallocs.num_colors`.  The same-slot coalescing in the
+        // splice regalloc guarantees the dense per-slot resume maps built from
+        // these colors are unambiguous.
+        let alloc_result = super::regalloc::AllocationResult {
+            rename: [Vec::new(), Vec::new(), Vec::new()],
+            num_regs: [
+                splice_regallocs[super::flatten::Kind::Int.index()].num_colors,
+                splice_regallocs[super::flatten::Kind::Ref.index()].num_colors,
+                splice_regallocs[super::flatten::Kind::Float.index()].num_colors,
+            ],
+        };
+
+        // Pre-rename Ref color for a walker frame slot.  The spliced canonical
+        // body colors each frame value by its graph-lifetime Variable
+        // (`splice_regallocs[Ref].getcolor(v)`), so a slot's pre-rename color
+        // is the canonical color of the Variable the walker pinned to that
+        // slot.  Build the inverse `walker_slot → canonical Ref color` from
+        // `walker_slot_for_variable` (Variable → slot) once; the
+        // `slot_pre_color` closure then maps every resume-map lookup below into
+        // the canonical color space the live markers carry.  A slot keeps the
+        // first canonical color seen; the splice coloring is injective per
+        // frame slot, so the dense map represents every slot without loss.
+        //
+        // Build the inverse over the live-masked slot map so a dead leaked Ref
+        // (color minted by `color_leaked_arg_variables`) sharing a slot with
+        // live Variables never displaces the slot's live color.
+        let splice_slot_pre_color: Vec<Option<u16>> = {
+            let ref_coloring = &splice_regallocs[Kind::Ref.index()].coloring;
+            let max_slot = walker_slot_for_variable_live
+                .iter()
+                .flatten()
+                .copied()
+                .max()
+                .unwrap_or(0);
+            let mut inverse: Vec<Option<u16>> = vec![None; max_slot as usize + 1];
+            for (vid, slot) in walker_slot_for_variable_live.iter().enumerate() {
+                let Some(slot) = *slot else { continue };
+                let Some(&color) = ref_coloring.get(&super::flow::VariableId(vid as u32)) else {
+                    continue;
+                };
+                if inverse[slot as usize].is_none() {
+                    inverse[slot as usize] = Some(color);
+                }
+            }
+            inverse
         };
         let slot_pre_color = |walker_slot: u16| -> u16 {
-            match &splice_slot_pre_color {
-                Some(inverse) => inverse
-                    .get(walker_slot as usize)
-                    .copied()
-                    .flatten()
-                    .unwrap_or(walker_slot),
-                None => walker_slot,
-            }
+            splice_slot_pre_color
+                .get(walker_slot as usize)
+                .copied()
+                .flatten()
+                .unwrap_or(walker_slot)
         };
 
         // `flatten.py:88-100` `enforce_input_args` may rotate the
@@ -10964,7 +10651,7 @@ impl CodeWriter {
             portal_ec_reg,
             walker_tracked_pc_live_indices_out.as_deref(),
             walker_after_call_pc_indices_out.as_deref(),
-            did_splice,
+            true,
         );
         // Runtime entry/liveness lookups expect the byte offset of the
         // surviving `-live-` marker for each Python PC
