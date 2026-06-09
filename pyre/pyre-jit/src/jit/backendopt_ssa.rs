@@ -316,16 +316,16 @@ pub fn ssa_to_ssi(graph: &FunctionGraph) {
             // Add `v` to every incoming link and the block's inputargs.
             //
             // pyre walker adaptation (#73): a block with no graph predecessors
-            // (the startblock) is reached when `v` is defined by the walker's
-            // INLINE emission in that entry block — `block.operations` is empty
-            // because the walker records ops into `per_block_ssarepr`, not the
-            // graph, so `variables_created_in` cannot see the definition.  The
-            // value really exists (in the walker's register/slot model), so the
+            // (the startblock) is reached when `v` is defined in the walker's
+            // register/slot model without a matching graph SpaceOp —
+            // `block.operations` lacks the definition, so
+            // `variables_created_in` cannot see it.  The value really exists
+            // (in the walker's register/slot model), so the
             // link.args/inputargs threaded so far flow correctly from it; stop
             // threading instead of panicking.  RPython panics here because its
-            // flow graphs are complete; pyre's walker dual-write is not (until
-            // the walker threads every value through the graph — the rest of
-            // #73).
+            // flow graphs are complete; pyre's walker graph recording is not
+            // (until the walker threads every value through the graph — the
+            // rest of #73).
             let Some(links) = entrymap.get(&block).cloned() else {
                 continue;
             };

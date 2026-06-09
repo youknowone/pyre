@@ -4226,8 +4226,8 @@ impl CodeWriter {
         // close the block (`emit_goto!` / `emit_ref_return!` /
         // `emit_raise!` / `emit_reraise!` / `emit_abort_permanent!`)
         // clear it. Terminators that leave fallthrough open —
-        // `emit_goto_if_not!`, `emit_goto_if_not_int_is_zero!`,
-        // `emit_catch_exception!` — keep it set. Mirrors RPython
+        // `emit_goto_if_not!`, `emit_catch_exception!` — keep it set.
+        // Mirrors RPython
         // `flatten.py:240-267` where a conditional / exception exit
         // always coexists with the straight-line successor on
         // `Block.exits`.
@@ -4246,7 +4246,7 @@ impl CodeWriter {
         // (flowcontext.py:408-409).
         //
         // Declared here so `emit_mark_label_pc!`, `emit_goto!`,
-        // `emit_goto_if_not!`, `emit_goto_if_not_int_is_zero!` (macro
+        // `emit_goto_if_not!` (macro
         // definitions below) resolve it at expansion — macro_rules
         // hygiene requires captured identifiers be in scope at the
         // macro DEFINITION site.
@@ -4403,32 +4403,6 @@ impl CodeWriter {
         // the RPython-parity SSARepr layer — `flatten.py:106` uses plain
         // `Label` for loop headers and `assembler.py:159` does not encode
         // unsupported bytecodes as named opnames.
-
-        // RPython parity:
-        // `flatten.py:344` `self.emitline("last_exception", "->",
-        // self.getcolor(w))` — `assembler.py:220` turns it into
-        // `last_exception/>i`. Loads the thread-local exception class
-        // pointer into a Signed register. Canonical
-        // `generate_last_exc` emits this immediately before
-        // `last_exc_value` at every exception link landing whose
-        // `link.args` mentions `link.last_exception`.
-        macro_rules! emit_last_exception {
-            ($dst:expr) => {{
-                let _ = $dst;
-            }};
-        }
-
-        // RPython parity:
-        // `flatten.py:347` `self.emitline("last_exc_value", "->",
-        // self.getcolor(w))` — `assembler.py:220` turns it into
-        // `last_exc_value/>r`. pyre emits this once per catch site to
-        // load the thread-local exception into the handler's input
-        // register.
-        macro_rules! emit_last_exc_value {
-            ($dst:expr) => {{
-                let _ = $dst;
-            }};
-        }
 
         // Note: the `BC_JUMP_TARGET` runtime opcode
         // does not appear in `rpython/jit/codewriter/`. RPython marks
@@ -5062,32 +5036,6 @@ impl CodeWriter {
                 // linkfalse mergeblock.  The bare `-live-` before the guard
                 // and the `goto_if_not` op itself are produced by the
                 // canonical splice (`flatten.rs:1888`) from the graph.
-                let _ = mergeblock(
-                    code,
-                    &mut graph,
-                    &mut joinpoints,
-                    &current_block,
-                    &{
-                        let mut branch_state = current_state.clone();
-                        branch_state.next_offset = py_pc;
-                        branch_state.blocklist = frame_blocks_for_offset(code, py_pc);
-                        branch_state
-                    },
-                    py_pc,
-                    &mut pendingblocks,
-                    &mut all_walker_blocks,
-                );
-            }};
-        }
-        macro_rules! emit_goto_if_not_int_is_zero {
-            ($cond:expr, $py_pc:expr) => {{
-                let _ = $cond;
-                let py_pc = $py_pc;
-                // mergeblock establishes the linkfalse edge (`append_exit`).
-                // `flatten.py:247` `goto_if_not_int_is_zero` shape is
-                // identical to `goto_if_not` save for the opname.  The bare
-                // `-live-` and the guard op are produced by the canonical
-                // splice from the graph.
                 let _ = mergeblock(
                     code,
                     &mut graph,
@@ -7903,15 +7851,12 @@ impl CodeWriter {
                 // every exception link landing where
                 // `link.last_exception` is in `link.args`.  pyre's walker
                 // synthesises both Variables (exception_edge_vars,
-                // codewriter.rs:944-951), so both must land in the
-                // SSARepr.  Use a fresh Int scratch slot — pyre's
-                // catch-handler bytecode does not currently read the
-                // exception-class register (per-kind PyType makes
-                // type-discrimination implicit), so the write is
-                // structural parity rather than a live consumer.
-                let exc_type_slot = ssarepr.fresh_var(Kind::Int, scratch_int_base).0;
-                emit_last_exception!(exc_type_slot);
-                emit_last_exc_value!(exc_slot);
+                // codewriter.rs:944-951); the canonical splice produces
+                // both insns from the graph.  The fresh Int scratch var
+                // stays: it advances the Variable-ID counter the splice
+                // output depends on (the slot itself has no live consumer
+                // — per-kind PyType makes type-discrimination implicit).
+                let _ = ssarepr.fresh_var(Kind::Int, scratch_int_base).0;
                 // `flatten.py:336-347 generate_last_exc` writes
                 // `last_exc_value` straight into `getcolor(handler_inputarg)`,
                 // and `insert_renamings` (flatten.py:311) excludes the exc
@@ -7924,7 +7869,7 @@ impl CodeWriter {
                 // colour the runtime never wrote — leaving the handler's
                 // CHECK_EXC_MATCH / PUSH_EXC_INFO with a NULL exception.  Pin
                 // `exc_value` to `exc_slot` so `get_color(exc_value)` matches
-                // the slot `emit_last_exc_value!` wrote.
+                // the slot the canonical `last_exc_value` insn writes.
                 pin!(exc_value.as_variable(), exc_slot);
                 if is_portal {
                     let depth_value = (stack_base_absolute + depth as usize) as i64;

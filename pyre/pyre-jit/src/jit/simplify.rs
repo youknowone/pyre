@@ -920,16 +920,15 @@ pub fn transform_dead_op_vars(graph: &FunctionGraph) {
     }
 }
 
-// ── op-scanning passes: structural-adaptation no-ops (empty walker ops) ──
+// ── op-scanning passes: structural-adaptation no-ops (absent walker shapes) ──
 //
 // `coalesce_bool`, `transform_xxxitem`, and `transform_ovfcheck` all key on a
 // block's *operations* (`bool` / `getitem` raising-op / `ovfcheck` simple_call).
-// At pyre-jit's post-walk / pre-regalloc point every walker block has empty
-// `operations` (the SSARepr is emitted inline into `per_block_ssarepr`, not
-// `block.operations`; see `codewriter.rs::eliminate_empty_blocks`), so none of
-// these shapes is ever present.  Each is a documented no-op with a tripwire that
-// panics if the target shape appears (e.g. once #73 materialises ops on the
-// graph), signalling that the full pass must then be ported.
+// pyre's walker records post-rtype shapes (`residual_call_*`, vable field ops)
+// on `block.operations` directly; the pre-rtype `bool` / raising `getitem` /
+// `ovfcheck` simple_call shapes these passes key on never appear.  Each is a
+// documented no-op with a tripwire that panics if the target shape appears,
+// signalling that the full pass must then be ported.
 
 /// `rpython/translator/simplify.py:656-699` `coalesce_bool`.
 /// Classification (scope #4): structural adaptation (no `bool` op present).

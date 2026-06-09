@@ -2452,9 +2452,8 @@ fn regalloc_color(
     let kind = v.kind.unwrap_or(Kind::Ref);
     let alloc = &regallocs[kind.index()];
     let color = alloc.coloring.get(&v.id).copied().unwrap_or_else(|| {
-        // Surface kind + per-kind coloring size so the
-        // probe (codewriter.rs PYRE_PHASE4_BUILD_CANONICAL) can name
-        // the specific dual-coloring gap without dumping the entire
+        // Surface kind + per-kind coloring size so the panic names
+        // the specific coloring gap without dumping the entire
         // graph.  Sample up to 8 known IDs to make "is the Variable
         // simply skipped or is the kind allocator empty?" obvious at
         // a glance.
@@ -4248,15 +4247,12 @@ where
 /// `newlist(items)` / `newtuple(items)` → `result: Ref` to the
 /// equivalent post-rtype `residual_call_ir_r(ConstInt(fn_idx),
 /// ListI([argc, dummies]), ListR([item_regs]), Descr) → reg` Insn.
-/// Mirrors the inline emit at codewriter.rs:6390-6398
-/// (`push_walker_emit(build_build_list_fn_residual_call_ir_r_insn)`)
-/// which pads unused item slots with `ConstInt(0)`.  The fn-pool index
-/// is selected by opname: `newlist` → `build_list_fn_idx`, `newtuple`
-/// → `build_tuple_fn_idx`.  BUILD_TUPLE lowers to the SAME
+/// Pads unused item slots with `ConstInt(0)` (the
+/// `build_build_list_fn_residual_call_ir_r_insn` shape).  The fn-pool
+/// index is selected by opname: `newlist` → `build_list_fn_idx`,
+/// `newtuple` → `build_tuple_fn_idx`.  BUILD_TUPLE lowers to the SAME
 /// `residual_call_ir_r` shape as BUILD_LIST — the IR builder is
-/// fn-index agnostic, so the BuildTuple walker arm reuses
-/// `build_build_list_fn_residual_call_ir_r_insn` — differing only in
-/// the helper fn pointer.
+/// fn-index agnostic — differing only in the helper fn pointer.
 ///
 /// Walker contract: `emit_frontend_newlist` / `emit_frontend_newtuple`
 /// only fire for argc ≤ 3 (codewriter.rs:6332-6346 / the BuildTuple
