@@ -224,6 +224,15 @@ impl<'frame, 'static_a: 'frame> WalkerFrameOps
         // narrow enough that `walker_capture_snapshot_for_last_guard`'s
         // `&mut WalkContext` arg sees a fresh exclusive borrow.
         self.trace_ctx.record_guard(opcode, args, 0);
-        crate::jitcode_dispatch::walker_capture_snapshot_for_last_guard(self, 0);
+        // `walker_capture_snapshot_for_last_guard` returns a typed abort
+        // (`GuardSnapshotVableUntyped`) for the multi-frame vable case the
+        // full-body walk routes through `DispatchError`.  This
+        // `WalkerFrameOps` path — the env-gated STORE_SUBSCR specialization,
+        // dead in production (the `_r_v` arm shape is unreachable in arm
+        // jitcode) — has no abort channel through the `()` trait signature,
+        // so the snapshot is best-effort here.  If the specialization is
+        // ever activated, the abort must be threaded through
+        // `WalkerFrameOps::generate_guard`'s return type.
+        let _ = crate::jitcode_dispatch::walker_capture_snapshot_for_last_guard(self, 0);
     }
 }

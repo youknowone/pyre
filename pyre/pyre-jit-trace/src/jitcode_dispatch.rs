@@ -6789,6 +6789,7 @@ fn try_walker_inline_user_call(
             descr_refs: callee_descr_refs,
             raw_descrs: RawDescrPool::PerFn(callee_perfn_descrs),
             is_authoritative_executor: ctx.is_authoritative_executor,
+            store_subscr_fn_addr: ctx.store_subscr_fn_addr,
             trace_ctx: ctx.trace_ctx,
             done_with_this_frame_descr_ref: ctx.done_with_this_frame_descr_ref.clone(),
             done_with_this_frame_descr_int: ctx.done_with_this_frame_descr_int.clone(),
@@ -10977,6 +10978,7 @@ mod tests {
                 raw_descrs: RawDescrPool::Global,
                 is_authoritative_executor: false,
                 outer_active_boxes: Vec::new(),
+                store_subscr_fn_addr: None,
             };
             let op = DecodedOp {
                 key,
@@ -15188,6 +15190,7 @@ mod tests {
             entry_py_pc: 0,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
+            store_subscr_fn_addr: None,
         };
         let _ = try_execute_residual_call_via_executor(
             &mut wc,
@@ -15233,6 +15236,7 @@ mod tests {
             entry_py_pc: 0,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
+            store_subscr_fn_addr: None,
         };
         let _ = try_execute_residual_call_via_executor(
             &mut wc,
@@ -15293,6 +15297,7 @@ mod tests {
             entry_py_pc: 0,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
+            store_subscr_fn_addr: None,
         };
         let _ = try_execute_residual_call_via_executor(
             &mut wc,
@@ -18336,6 +18341,7 @@ mod tests {
             entry_py_pc: 0,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
+            store_subscr_fn_addr: None,
         };
 
         // First visit: registers (key, [red0, red1]) and continues.
@@ -18399,6 +18405,7 @@ mod tests {
             entry_py_pc: 0,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
+            store_subscr_fn_addr: None,
         };
         assert_eq!(
             step(&code, 0, &mut wc),
