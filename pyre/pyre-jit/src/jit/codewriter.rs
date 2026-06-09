@@ -28,8 +28,7 @@ use pyre_interpreter::bytecode::{CodeFlags, CodeObject, Instruction, OpArgState}
 use pyre_interpreter::runtime_ops::{binary_op_tag, compare_op_tag};
 
 use super::flatten::{
-    CallDescrStub, CallFlavor, GraphFlattener, Insn, Kind, Operand, Register, ResKind, SSARepr,
-    slot_for_call_flavor,
+    CallDescrStub, CallFlavor, GraphFlattener, Kind, ResKind, SSARepr, slot_for_call_flavor,
 };
 
 // ---------------------------------------------------------------------------
@@ -5084,25 +5083,11 @@ impl CodeWriter {
         // never holds.
         macro_rules! emit_live_placeholder {
             () => {{
-                // RPython force-alive mechanism (`liveness.py:11-12`):
-                //
-                //   You can also force extra variables to be alive by putting
-                //   them as args of the '-live-' operation in the first place.
-                //
-                // Use it to keep the portal red args (`pypy/module/pypyjit/
-                // interp_jit.py:67 reds = ['frame', 'ec']`) alive across every
-                // PC.
-                let mut force_alive: Vec<Operand> = Vec::new();
-                if portal_frame_reg != u16::MAX {
-                    force_alive.push(Operand::Register(Register::new(
-                        Kind::Ref,
-                        portal_frame_reg,
-                    )));
-                }
-                if portal_ec_reg != u16::MAX {
-                    force_alive.push(Operand::Register(Register::new(Kind::Ref, portal_ec_reg)));
-                }
-                push_walker_emit(&current_block, Insn::live(force_alive));
+                // Per-PC `-live-` is produced by the canonical splice from
+                // the graph; the portal red args (`pypy/module/pypyjit/
+                // interp_jit.py:67 reds = ['frame', 'ec']`) are kept alive by
+                // the splice's force-alive mechanism (`liveness.py:11-12`).
+                // The walker no longer emits a per-block copy.
             }};
         }
 
@@ -5114,20 +5099,14 @@ impl CodeWriter {
         // arranged as `linkfalse`, not by changing the opcode.
         macro_rules! emit_goto_if_not {
             ($cond:expr, $py_pc:expr) => {{
-                let cond = $cond;
+                let _cond = $cond;
                 let py_pc = $py_pc;
-                // `flatten.py:259` — emit bare `-live-` (empty
-                // force_alive) IMMEDIATELY before the guard.  Canonical
-                // (`flatten.rs:1888`) does the same; the bare marker
-                // seeds the guard's liveness snapshot for blackhole
-                // reconstruction.  The per-PC `-live-` with portal red
-                // args lives at the START of each PC's emission, not
-                // here.
-                push_walker_emit(&current_block, Insn::live(Vec::new()));
-                // mergeblock support: mergeblock first to learn target block
-                // identity, then emit the guard with block-identity
-                // `TLabel`.  `flatten.py:240-267` linkfalse mergeblock.
-                let target_block = mergeblock(
+                // mergeblock establishes the linkfalse edge (`append_exit`)
+                // and queues the target block.  `flatten.py:240-267`
+                // linkfalse mergeblock.  The bare `-live-` before the guard
+                // and the `goto_if_not` op itself are produced by the
+                // canonical splice (`flatten.rs:1888`) from the graph.
+                let _target_block = mergeblock(
                     code,
                     &mut graph,
                     &mut joinpoints,
@@ -5142,27 +5121,18 @@ impl CodeWriter {
                     &mut pendingblocks,
                     &mut all_walker_blocks,
                 );
-                let insn = Insn::op(
-                    "goto_if_not",
-                    vec![
-                        Operand::reg(Kind::Int, cond),
-                        Operand::TLabel(super::flatten::block_tlabel(&target_block.block())),
-                    ],
-                );
-                push_walker_emit(&current_block, insn);
             }};
         }
         macro_rules! emit_goto_if_not_int_is_zero {
             ($cond:expr, $py_pc:expr) => {{
-                let cond = $cond;
+                let _cond = $cond;
                 let py_pc = $py_pc;
-                // `flatten.py:259` bare `-live-` precedes the guard.
-                push_walker_emit(&current_block, Insn::live(Vec::new()));
-                // mergeblock support: mergeblock first to learn target block,
-                // then emit guard with block-identity `TLabel`.
+                // mergeblock establishes the linkfalse edge (`append_exit`).
                 // `flatten.py:247` `goto_if_not_int_is_zero` shape is
-                // identical to `goto_if_not` save for the opname.
-                let target_block = mergeblock(
+                // identical to `goto_if_not` save for the opname.  The bare
+                // `-live-` and the guard op are produced by the canonical
+                // splice from the graph.
+                let _target_block = mergeblock(
                     code,
                     &mut graph,
                     &mut joinpoints,
@@ -5177,14 +5147,6 @@ impl CodeWriter {
                     &mut pendingblocks,
                     &mut all_walker_blocks,
                 );
-                let insn = Insn::op(
-                    "goto_if_not_int_is_zero",
-                    vec![
-                        Operand::reg(Kind::Int, cond),
-                        Operand::TLabel(super::flatten::block_tlabel(&target_block.block())),
-                    ],
-                );
-                push_walker_emit(&current_block, insn);
             }};
         }
 
