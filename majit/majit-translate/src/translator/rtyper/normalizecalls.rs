@@ -184,18 +184,32 @@ pub fn perform_normalizations(annotator: &RPythonAnnotator) -> Result<(), Annota
 ///             classdef.maxid = TotalOrderSymbolic(witness + [MAX], lst)
 /// ```
 ///
-/// Upstream stores `TotalOrderSymbolic` objects, not eager integers. A
-/// later numeric comparison sorts all start/end markers by the reversed
-/// MRO witness `([root_id, ..., self_id], [root_id, ..., self_id, MAX])`.
+/// Upstream stores `TotalOrderSymbolic` objects, not eager integers, and
+/// only numbers classdefs that are not yet numbered (`if not
+/// hasattr(classdef, 'minid')`). A later numeric comparison sorts all
+/// start/end markers by the reversed MRO witness `([root_id, ...,
+/// self_id], [root_id, ..., self_id, MAX])`. Because the integers are
+/// resolved lazily — after every symbolic exists — upstream can number a
+/// fresh subclass of an already-numbered parent and the comparison still
+/// nests it inside the parent's range.
 ///
-/// The Rust port still stores plain `i64`s on `ClassDef`, but it keeps
-/// the upstream ordering rule: assign a stable per-classdef unique id,
-/// build the reversed-MRO witness for every classdef in the current
-/// snapshot, sort all start/end markers lexicographically, then write
-/// the resulting integer positions back to `minid` / `maxid`. This
-/// preserves the bracket invariant `c.minid <= d.minid <= d.maxid <=
-/// c.maxid` for every descendant `d` of `c`, including when a later run
-/// adds a new subclass under an already-seen parent.
+/// The Rust port stores plain `i64`s and bakes them eagerly into the
+/// cross-graph-cached vtable (`fill_vtable_root`), so an id must never
+/// shift after its first bake. The port keeps the upstream ordering rule
+/// (reversed-MRO witness, lexicographic marker sort) and the
+/// skip-if-numbered guard, but is **append-only**: already-numbered
+/// classdefs keep their bracket, and freshly-discovered classdefs are
+/// numbered after the current maximum position. Appending preserves the
+/// bracket invariant `c.minid <= d.minid <= d.maxid <= c.maxid` ONLY when
+/// none of a fresh classdef's MRO ancestors is already numbered (a fresh
+/// subclass of an already-baked parent would need its range nested inside
+/// the parent's baked range, which an append cannot do without shifting).
+/// Such a classdef is left unnumbered — the per-graph rtyper path
+/// `Skip`-classifies it (`ClassesPBCRepr.redispatch_call`). Baseless leaf
+/// classdefs (`getmro() == [self]`, e.g. the enum-variant transparent-ctor
+/// classes) are always append-safe. This makes the pass safely
+/// re-runnable mid-session, so `ClassesPBCRepr.redispatch_call` can number
+/// a leaf on demand without disturbing the prefix.
 /// RPython `merge_classpbc_getattr_into_classdef(annotator)`
 /// (normalizecalls.py:208-235).
 ///
@@ -396,8 +410,38 @@ pub fn assign_inheritance_ids(annotator: &RPythonAnnotator) {
         return;
     }
 
-    let mut markers: Vec<InheritanceMarker> = Vec::with_capacity(snapshot.len() * 2);
-    for classdef in &snapshot {
+    // Append-only base: never shift an already-numbered (and possibly
+    // already-vtable-baked) classdef.  Fresh markers are positioned after
+    // the current maximum id; on the first (session-prologue) run no
+    // classdef is numbered so `base == 0` and the result is identical to
+    // numbering the whole snapshot from zero.
+    let base = snapshot
+        .iter()
+        .filter_map(|cd| cd.borrow().maxid)
+        .max()
+        .map_or(0, |m| m + 1);
+
+    // Skip-if-numbered (`normalizecalls.py:380`) + append-safety: number a
+    // fresh classdef only when its entire MRO is unnumbered, so the
+    // appended bracket cannot fall outside an already-numbered ancestor's
+    // baked range.  Baseless leaves (`getmro() == [self]`) always qualify.
+    let fresh: Vec<Rc<RefCell<ClassDef>>> = snapshot
+        .iter()
+        .filter(|cd| cd.borrow().minid.is_none())
+        .filter(|cd| {
+            ClassDef::getmro(cd)
+                .iter()
+                .all(|ancestor| ancestor.borrow().minid.is_none())
+        })
+        .cloned()
+        .collect();
+
+    if fresh.is_empty() {
+        return;
+    }
+
+    let mut markers: Vec<InheritanceMarker> = Vec::with_capacity(fresh.len() * 2);
+    for classdef in &fresh {
         let mut witness = classdef_order_witness(classdef);
         markers.push(InheritanceMarker {
             orderwitness: witness.clone(),
@@ -415,10 +459,11 @@ pub fn assign_inheritance_ids(annotator: &RPythonAnnotator) {
 
     for (index, marker) in markers.into_iter().enumerate() {
         let mut classdef = marker.classdef.borrow_mut();
+        let pos = base + index as i64;
         if marker.is_max {
-            classdef.maxid = Some(index as i64);
+            classdef.maxid = Some(pos);
         } else {
-            classdef.minid = Some(index as i64);
+            classdef.minid = Some(pos);
         }
     }
 }
@@ -1417,21 +1462,34 @@ mod tests {
     }
 
     #[test]
-    fn assign_inheritance_ids_later_subclass_stays_inside_existing_parent_range() {
+    fn assign_inheritance_ids_later_subclass_of_numbered_parent_stays_unnumbered() {
+        // Eager-baking deviation from `normalizecalls.py`: upstream stores
+        // `TotalOrderSymbolic` and resolves the integers lazily, so a
+        // subclass discovered after its parent was numbered still nests
+        // inside the parent's range.  Pyre bakes plain `i64`s into the
+        // cross-graph-cached vtable, so nesting `child` inside `root`'s
+        // bracket would require widening `root.maxid` — shifting an id
+        // that may already be baked.  The append-stable pass therefore
+        // leaves such a subclass UNNUMBERED (the per-graph rtyper path
+        // `Skip`-classifies its instantiation) rather than shift the
+        // parent's range.  Critically, `root`'s bracket must be untouched.
         let ann = RPythonAnnotator::new(None, None, None, false);
         let root = register_classdef(&ann, "pkg.Root", None);
 
         assign_inheritance_ids(&ann);
+        let root_min_before = root.borrow().minid.unwrap();
+        let root_max_before = root.borrow().maxid.unwrap();
 
         let child = register_classdef(&ann, "pkg.Child", Some(&root));
         assign_inheritance_ids(&ann);
 
-        let root_min = root.borrow().minid.unwrap();
-        let root_max = root.borrow().maxid.unwrap();
-        let child_min = child.borrow().minid.unwrap();
-        let child_max = child.borrow().maxid.unwrap();
-
-        assert!(root_min <= child_min && child_max <= root_max);
+        // `root` keeps its original bracket — no shift of a possibly-baked id.
+        assert_eq!(root.borrow().minid.unwrap(), root_min_before);
+        assert_eq!(root.borrow().maxid.unwrap(), root_max_before);
+        // `child` has a numbered ancestor, so it is not append-safe and
+        // stays unnumbered.
+        assert!(child.borrow().minid.is_none());
+        assert!(child.borrow().maxid.is_none());
     }
 
     #[test]

@@ -5712,8 +5712,12 @@ impl ClassesPBCRepr {
         //    asserts an argument-free call when there is no `__init__`;
         //  - `classdef.minid` unset ⇒ `assign_inheritance_ids` has not
         //    numbered this class, so `getvtable` (rclass.py:338-339) cannot
-        //    bake the subclass range. Enum-variant numbering lands in a
-        //    follow-up; until then these skip.
+        //    bake the subclass range.  The session prologue numbers only
+        //    the struct-root + standard-exception prefix; enum-variant
+        //    transparent-ctor classes are interned lazily by the flowspace
+        //    adapter AFTER that pass, so they reach here unnumbered.  Since
+        //    `assign_inheritance_ids` is now append-stable (skip-if-numbered
+        //    + append-only), number such a class on demand below.
         if !init_is_impossible {
             return Err(unported("class has __init__ (rpbc.py:1060-1067)"));
         }
@@ -5726,7 +5730,21 @@ impl ClassesPBCRepr {
             return Err(unported("constructor arguments with no __init__"));
         }
         if classdef.borrow().minid.is_none() {
-            return Err(unported("class not numbered (assign_inheritance_ids)"));
+            // Number this mid-session-minted classdef on demand.
+            // `assign_inheritance_ids` is append-stable, so re-running it
+            // appends this leaf's bracket after the existing maximum
+            // without shifting any already-baked prefix id.  A classdef
+            // that is not append-safe (a fresh subclass of an
+            // already-numbered class) stays unnumbered and skips below.
+            let annotator = rtyper.annotator.upgrade().ok_or_else(|| {
+                TyperError::message(
+                    "ClassesPBCRepr.redispatch_call: annotator weak ref dropped",
+                )
+            })?;
+            crate::translator::rtyper::normalizecalls::assign_inheritance_ids(&annotator);
+            if classdef.borrow().minid.is_none() {
+                return Err(unported("class not numbered (assign_inheritance_ids)"));
+            }
         }
 
         // upstream rpbc.py:1024-1035 — simple built-in exception special

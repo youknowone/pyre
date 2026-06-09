@@ -301,15 +301,16 @@ impl PyreCallRegistry {
         // standard-exception prefix.  Classdefs minted mid-session
         // (`ClassDesc::pycall` instantiation, transitive base/call-family
         // `getuniqueclassdef`, exception exit-case classes,
-        // `immutablevalue_hostobject`) are NOT numbered here and would
-        // hit `fill_vtable_root`'s `minid==None` error if a vtable were
-        // materialised for them — which is why class instantiation
-        // through `ClassesPBCRepr` stays disabled until a later slice
-        // extends this to cover mid-session classdefs.  Do NOT resolve a
-        // future `minid==None` by re-running `assign_inheritance_ids`
-        // mid-session: the current body re-sorts and SHIFTS the
-        // already-baked prefix ids, which the value-blind dual-gate
-        // cannot detect, silently miscompiling isinstance.
+        // `immutablevalue_hostobject`) are NOT numbered here.  An
+        // append-safe such classdef (a baseless leaf — e.g. an
+        // enum-variant transparent-ctor class) is numbered ON DEMAND by
+        // `ClassesPBCRepr.redispatch_call` re-running
+        // `assign_inheritance_ids`: that pass is now append-stable
+        // (skip-if-numbered + append-only), so re-running it never re-sorts
+        // or shifts an already-baked prefix id.  A fresh subclass of an
+        // already-baked class is NOT append-safe (its bracket would need to
+        // nest inside the parent's baked range); it stays unnumbered and
+        // the per-graph path Skip-classifies it, exactly as before.
         for root in self.bookkeeper.pyre_struct_root_names() {
             // A malformed root must not abort the whole session — the
             // per-graph path Skip-classifies it later, mirroring the
