@@ -50,9 +50,3 @@ pub(crate) fn pyre_pipeline_config() -> crate::PipelineConfig {
         portal: None,
     }
 }
-
-pub(crate) fn pyre_analyze_config() -> crate::AnalyzeConfig {
-    crate::AnalyzeConfig {
-        pipeline: pyre_pipeline_config(),
-    }
-}

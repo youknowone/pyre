@@ -59,8 +59,6 @@ use crate::flowspace::model::{
     Block, BlockRefExt, ConstValue, Constant, GraphFunc, Hlvalue, Link, Variable,
 };
 use crate::flowspace::pygraph::PyGraph;
-#[cfg(test)]
-use crate::front;
 use crate::jit_codewriter::type_state::ConcreteType;
 use crate::model::FunctionGraph as LegacyGraph;
 use crate::translator::rtyper::error::TyperError;
@@ -1191,123 +1189,6 @@ pub(crate) fn register_unsafe_fn_stubs(
         }
         registry.register_callee(key, signature.clone(), stub_pygraph);
     }
-}
-
-/// Derive the canonical `FunctionPathKey` for a `SemanticFunction`.
-///
-/// Inverts the front-end's call-target canonicalisation: what an
-/// `OpKind::Call::FunctionPath`
-/// callsite emits is what we register the callee under.
-///
-/// Both `func.name` (e.g. `"a::helper"`, module-qualified by `front::mir`
-/// from Charon's `name_path()`) and
-/// `func.self_ty_root` (e.g. `"a::Foo"`, the impl owner `front::mir`
-/// records from Charon's `name_path()`) carry `::`-joined module-qualified
-/// strings.  Each
-/// `::`-separated component is one `FunctionPathKey` segment — the
-/// `OpKind::Call::FunctionPath` callsite produces `["a", "helper"]`
-/// (multi-segment, no `::` in any segment), so the registered key
-/// must split each `::` boundary too.  Without the split, registry
-/// entry `["a::helper"]` (single segment containing `::`) would never
-/// match callsite lookup `["a", "helper"]`.
-///
-/// PyPy's `Bookkeeper.getdesc(<function object>)` (`bookkeeper.py:353-409`)
-/// keys on Python function-object identity rather than path strings,
-/// so the upstream chain has no segment-shape divergence to worry
-/// about.  Pyre's segment-key approach is a stand-in for that
-/// identity until host callable identity is available; aligning the
-/// segment shape both sides of the registry is a prerequisite for
-/// that stand-in to function correctly.
-#[cfg(test)]
-fn function_path_key_for(func: &front::SemanticFunction) -> FunctionPathKey {
-    let mut segments: Vec<String> = Vec::new();
-    if let Some(t) = &func.self_ty_root {
-        segments.extend(t.split("::").map(str::to_string));
-    }
-    segments.extend(func.name.split("::").map(str::to_string));
-    FunctionPathKey::from_segments(segments)
-}
-
-/// Derive the parameter `Signature` for a `SemanticFunction` from
-/// the startblock's input arg names.
-///
-/// Mirrors upstream `bookkeeper.py:418
-/// cpython_code_signature(pyfunc.__code__)`: the parameter names
-/// come from the function's declared parameter list.  Pyre carries
-/// these as `value_name(inputarg)` on the startblock; missing names
-/// fall back to `arg{N}` to keep the `FunctionDesc.signature.argnames`
-/// length matched to the actual parameter count.
-#[cfg(test)]
-fn signature_for(func: &front::SemanticFunction) -> Signature {
-    let graph = &func.graph;
-    let startblock = graph.block(graph.startblock);
-    let argnames: Vec<String> = startblock
-        .inputargs
-        .iter()
-        .enumerate()
-        .map(|(idx, var)| {
-            graph
-                .value_name_for(var)
-                .unwrap_or_else(|| format!("arg{idx}"))
-        })
-        .collect();
-    Signature::new(argnames, None, None)
-}
-
-/// Walk a `SemanticProgram` and pre-register every
-/// reachable `SemanticFunction` in the call registry.
-///
-/// Production callers
-/// with `OpKind::Call::FunctionPath` ops cannot proceed through the
-/// real-rtyper path without the registry pre-populated, because
-/// pyre's surface DSL has no Python callable object for the
-/// upstream `Constant(<function>) -> getdesc -> FunctionDesc` chain
-/// (`bookkeeper.py:353-409`).  This walker registers each
-/// `SemanticFunction` so any `simple_call` the adapter emits later
-/// finds a matching entry.
-///
-/// Two passes are required because the per-function lift
-/// (`lift_callee_to_pygraph`) calls
-/// `function_graph_to_flowspace`, which runs the
-/// `OpKind::Call::FunctionPath` arm in `translate_op` and expects
-/// every callee path the body references to already be registered.
-/// Pass 1 installs `(HostObject, FunctionDesc)` for every program
-/// function (signature only, no PyGraph cache).  Pass 2 lifts each
-/// function's body and prefills its `FunctionDesc.cache` so the
-/// rtyper's `cachedgraph` (`description.rs:1037-1039`) hits at
-/// `direct_call` time.
-///
-/// Annotation seeding lives inside [`function_graph_to_flowspace`]
-/// inside `function_graph_to_flowspace`; this walker plumbs only the program + registry.
-#[cfg(test)]
-pub(crate) fn populate_call_registry_from_program(
-    program: &front::SemanticProgram,
-    registry: &PyreCallRegistry,
-) -> Result<(), TyperError> {
-    // Pass 1 — register every function with its signature; the
-    // FunctionDesc.cache stays cold until Pass 2.
-    let mut pending: Vec<(
-        FunctionPathKey,
-        &front::SemanticFunction,
-        Rc<PyreFunctionEntry>,
-    )> = Vec::with_capacity(program.functions.len());
-    for func in &program.functions {
-        let key = function_path_key_for(func);
-        let signature = signature_for(func);
-        let entry = registry.get_or_register(key.clone(), signature);
-        pending.push((key, func, entry));
-    }
-    // Pass 2 — lift each function's body using the now-populated
-    // registry, then prefill its FunctionDesc.cache.  Lift order is
-    // independent of function topology: every callsite's
-    // `simple_call` resolves through `registry.lookup` against the
-    // Pass-1-installed HostObjects, regardless of whether the
-    // callee's own body has been lifted yet.
-    for (_key, func, entry) in pending {
-        let pygraph = lift_callee_to_pygraph(&func.graph, signature_for(func), registry)?;
-        entry.prefill_default_cache(pygraph);
-    }
-    Ok(())
 }
 
 /// Restricted entry: only graphs without `OpKind::Call::FunctionPath`

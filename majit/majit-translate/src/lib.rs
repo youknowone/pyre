@@ -64,11 +64,6 @@ pub use pipeline::{PipelineConfig, PipelineResult, PortalSpec, ProgramPipelineRe
 
 use serde::{Deserialize, Serialize};
 
-#[cfg(test)]
-use crate::translator::rtyper::legacy_annotator as annotate;
-#[cfg(test)]
-use crate::translator::rtyper::legacy_resolve as rtype;
-
 /// Configuration for the canonical graph/pipeline analyzer.
 ///
 /// Consumers supply graph-rewrite metadata such as virtualizable
@@ -100,11 +95,6 @@ pub struct MethodInfo {
     /// RPython: function-level JIT hints (elidable, close_stack, etc.).
     #[serde(default)]
     pub hints: Vec<String>,
-}
-
-/// Canonical single-file analysis entry point.
-pub fn analyze_pipeline(source: &str) -> pipeline::ProgramPipelineResult {
-    analyze_pipeline_with_config(source, &AnalyzeConfig::default())
 }
 
 /// Feature-gated SemanticProgram builder.
@@ -327,64 +317,6 @@ fn merge_hints_from_llbcs(
     }
 }
 
-/// Configurable canonical single-file analysis entry point.
-pub fn analyze_pipeline_with_config(
-    source: &str,
-    config: &AnalyzeConfig,
-) -> pipeline::ProgramPipelineResult {
-    analyze_multiple_pipeline_with_config(&[source], config)
-}
-
-/// Canonical multi-file analysis entry point.
-///
-/// This returns only the graph/pipeline result and is the preferred API for
-/// RPython-like translator consumers.
-pub fn analyze_multiple_pipeline(sources: &[&str]) -> pipeline::ProgramPipelineResult {
-    analyze_multiple_pipeline_with_config(sources, &AnalyzeConfig::default())
-}
-
-/// Configurable canonical multi-file analysis entry point.
-///
-/// This is the canonical graph/pipeline translator entry point.
-/// Uses `HeuristicLayoutProvider` for struct layouts (type-string approximation).
-pub fn analyze_multiple_pipeline_with_config(
-    sources: &[&str],
-    config: &AnalyzeConfig,
-) -> pipeline::ProgramPipelineResult {
-    let module_paths: Vec<&str> = vec![""; sources.len()];
-    analyze_pipeline_from_module_paths(
-        &module_paths,
-        config,
-        None,
-        &|_, _| None,
-        &[],
-        &[],
-        HostStaticAddrs::default(),
-    )
-}
-
-/// Multi-file analysis with explicit layout provider.
-///
-/// RPython equivalent: the translator resolves struct layouts via
-/// `symbolic.get_field_token()` / `symbolic.get_size()`. The layout
-/// provider supplies these values. Pass `None` to use the heuristic default.
-pub fn analyze_multiple_pipeline_with_layout(
-    sources: &[&str],
-    config: &AnalyzeConfig,
-    layout_provider: &dyn layout::LayoutProvider,
-) -> pipeline::ProgramPipelineResult {
-    let module_paths: Vec<&str> = vec![""; sources.len()];
-    analyze_pipeline_from_module_paths(
-        &module_paths,
-        config,
-        Some(layout_provider),
-        &|_, _| None,
-        &[],
-        &[],
-        HostStaticAddrs::default(),
-    )
-}
-
 /// `make_virtualizable_infos` constructor closure type — mirrors the
 /// upstream `VirtualizableInfo(self, VTYPEPTR)` call (warmspot.py:543).
 /// `(jd_idx, vtypeptr_token) -> Option<handle>`.  Hosts that own a
@@ -437,55 +369,6 @@ pub struct HostStaticAddrs<'a> {
     pub refs: &'a [(&'a str, i64)],
 }
 
-/// Multi-file analysis with explicit layout provider AND a
-/// `VirtualizableInfo` factory wired into
-/// `CallControl::make_virtualizable_infos` (warmspot.py:516).  The
-/// factory delegates the runtime constructor call from the codewriter
-/// (which sits below metainterp in the crate graph) back to the host.
-pub fn analyze_multiple_pipeline_with_vinfo_factory(
-    sources: &[&str],
-    config: &AnalyzeConfig,
-    layout_provider: Option<&dyn layout::LayoutProvider>,
-    vinfo_factory: &VirtualizableInfoFactory<'_>,
-) -> pipeline::ProgramPipelineResult {
-    let module_paths: Vec<&str> = vec![""; sources.len()];
-    analyze_pipeline_from_module_paths(
-        &module_paths,
-        config,
-        layout_provider,
-        vinfo_factory,
-        &[],
-        &[],
-        HostStaticAddrs::default(),
-    )
-}
-
-/// Multi-file analysis with explicit layout provider, optional
-/// `VirtualizableInfo` factory, and host-supplied compiled helper
-/// addresses.
-///
-/// This is the line-by-line `getfunctionptr(graph)` adapter for source-only
-/// codewriter consumers: pass the output of
-/// `#[jit_module]::__majit_helper_trace_fnaddrs()` here so `JitCode.fnaddr`
-/// and residual-call lowering use the real helper surface instead of the
-/// symbolic fallback.
-pub fn analyze_multiple_pipeline_with_vinfo_and_fnaddr_bindings(
-    sources: &[&str],
-    config: &AnalyzeConfig,
-    layout_provider: Option<&dyn layout::LayoutProvider>,
-    vinfo_factory: &VirtualizableInfoFactory<'_>,
-    fnaddr_bindings: &FnAddrBindings<'_>,
-) -> pipeline::ProgramPipelineResult {
-    analyze_multiple_pipeline_with_vinfo_and_all_fnaddr_bindings(
-        sources,
-        config,
-        layout_provider,
-        vinfo_factory,
-        fnaddr_bindings,
-        &[],
-    )
-}
-
 /// Multi-file analysis with explicit per-source module paths.
 ///
 /// `sources` and `module_paths` are parallel slices of equal length:
@@ -497,9 +380,8 @@ pub fn analyze_multiple_pipeline_with_vinfo_and_fnaddr_bindings(
 /// resolution.  `sources` is retained for the parallel-slice length
 /// contract.
 ///
-/// An empty `module_paths[i]` keeps the simple-name registration of
-/// the bare `analyze_multiple_pipeline_with_vinfo_and_fnaddr_bindings`
-/// entry — runtime convergence is then handled solely by the
+/// An empty `module_paths[i]` keeps simple-name registration only —
+/// runtime convergence is then handled solely by the
 /// `build_object_descr_group_with_def_path` dual-publish.
 pub fn analyze_multiple_pipeline_with_modules(
     sources: &[&str],
@@ -523,49 +405,6 @@ pub fn analyze_multiple_pipeline_with_modules(
         fnaddr_bindings,
         &[],
         static_addrs,
-    )
-}
-
-/// Like `analyze_multiple_pipeline_with_vinfo_and_fnaddr_bindings` but
-/// additionally accepts an `impl_fnaddr_bindings` table produced by the
-/// macro's `__majit_helper_impl_trace_fnaddrs()` registry. Entries bind
-/// impl-method helpers via `register_macro_impl_helper_trace_fnaddr`,
-/// resolving the structural `[impl_type_joined, method]` CallPath that
-/// the string-split helper entry point cannot express.
-pub fn analyze_multiple_pipeline_with_vinfo_and_all_fnaddr_bindings(
-    sources: &[&str],
-    config: &AnalyzeConfig,
-    layout_provider: Option<&dyn layout::LayoutProvider>,
-    vinfo_factory: &VirtualizableInfoFactory<'_>,
-    fnaddr_bindings: &FnAddrBindings<'_>,
-    impl_fnaddr_bindings: &ImplFnAddrBindings<'_>,
-) -> pipeline::ProgramPipelineResult {
-    let module_paths: Vec<&str> = vec![""; sources.len()];
-    analyze_pipeline_from_module_paths(
-        &module_paths,
-        config,
-        layout_provider,
-        vinfo_factory,
-        fnaddr_bindings,
-        impl_fnaddr_bindings,
-        HostStaticAddrs::default(),
-    )
-}
-
-/// Multi-file analysis with compiled helper fnaddr bindings but without a
-/// virtualizable-info factory.
-pub fn analyze_multiple_pipeline_with_fnaddr_bindings(
-    sources: &[&str],
-    config: &AnalyzeConfig,
-    layout_provider: Option<&dyn layout::LayoutProvider>,
-    fnaddr_bindings: &FnAddrBindings<'_>,
-) -> pipeline::ProgramPipelineResult {
-    analyze_multiple_pipeline_with_vinfo_and_fnaddr_bindings(
-        sources,
-        config,
-        layout_provider,
-        &|_, _| None,
-        fnaddr_bindings,
     )
 }
 

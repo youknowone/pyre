@@ -51,7 +51,7 @@
 //!
 //! The build-time portal jitcode (`eval_loop_jit`) is produced by the
 //! source-only translator
-//! (`analyze_multiple_pipeline_with_vinfo_and_fnaddr_bindings`), so
+//! (`analyze_multiple_pipeline_with_modules`), so
 //! 100% of its `'d'`/`'j'` operand sites resolve through the **global
 //! pool**. The per-jitcode `exec.descrs` is dead weight for portal
 //! execution and stays empty.

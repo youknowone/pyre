@@ -17,7 +17,7 @@
 //! the parity layer (`jit_codewriter/`) untouched: no new opnames, no new
 //! `OpKind`, no new jitcode-keying schemas. The pipeline this module
 //! drives is exactly the canonical
-//! `analyze_multiple_pipeline` (`crate::analyze_multiple_pipeline`) —
+//! `analyze_multiple_pipeline_with_modules` (`crate::analyze_multiple_pipeline_with_modules`) —
 //! i.e. the same entry point `rpython/jit/codewriter/codewriter.py:33
 //! transform_func_to_jitcode` is wrapped by in the tests.
 //!
@@ -25,7 +25,7 @@
 //!
 //! `with_all_jitcodes(|reg| …)` → closure access to the per-thread
 //! pyre-interpreter JitCode registry keyed by `CallPath`. First call on
-//! a thread performs the full pipeline via `analyze_multiple_pipeline`;
+//! a thread performs the full pipeline via `analyze_multiple_pipeline_with_modules`;
 //! subsequent calls are O(1) reads of a `thread_local!` `OnceCell`.
 //! The closure form (rather than `&'static`) avoids forcing
 //! `AllJitCodes: Sync`, which would in turn force the interior cells of
@@ -46,7 +46,7 @@
 //! runtime never imports this function.
 //!
 //! Production builds run a parallel pipeline at `pyre-jit-trace/build.rs`
-//! that calls `analyze_multiple_pipeline_with_vinfo_and_fnaddr_bindings`
+//! that calls `analyze_multiple_pipeline_with_modules`
 //! with `pyre_interpreter::jit_trace_fnaddrs()` and then bincode-embeds
 //! the resulting `pipeline.jitcodes` into the `pyre-jit-trace` binary
 //! (`$OUT_DIR/opcode_jitcodes.bin`). That separate path is what supplies
@@ -83,7 +83,7 @@
 //!   collapses those identities and the rtyped graph becomes
 //!   syntax-only.
 //!
-//! Re-using `analyze_multiple_pipeline` eliminates both gaps: the same
+//! Re-using `analyze_multiple_pipeline_with_modules` eliminates both gaps: the same
 //! full-context registry the canonical analyzer consumes becomes this
 //! module's input.
 //!
@@ -116,7 +116,7 @@ pub use crate::codewriter::AllJitCodes;
 /// consumed by `rpython/jit/codewriter/codewriter.py:74 make_jitcodes`.
 /// The manifest must cover every Rust source file that defines a
 /// function reachable by `direct_call` from a handler graph. pyre's
-/// `analyze_multiple_pipeline` resolves cross-file `direct_call`s
+/// `analyze_multiple_pipeline_with_modules` resolves cross-file `direct_call`s
 /// against the union of `function_graphs` from every source in this
 /// list; a callee defined in a file absent from the manifest would be
 /// emitted as a residual call (or panic during drain) even though
@@ -136,7 +136,7 @@ pub use crate::codewriter::AllJitCodes;
 ///   `opcode_list_append`, `opcode_unpack_sequence`, `opcode_load_attr`,
 ///   `opcode_store_attr`. These are imported at `pyopcode.rs:6` and
 ///   called directly from default trait methods (pyopcode.rs:821).
-///   Before their inclusion, `analyze_multiple_pipeline` would report
+///   Before their inclusion, `analyze_multiple_pipeline_with_modules` would report
 ///   them as unresolved `direct_call` targets.
 /// - `pyre-jit/src/eval.rs` — portal runner `eval_loop_jit`
 ///   (pyre analogue of upstream `warmspot.py::portal_runner`) and
