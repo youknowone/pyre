@@ -1810,7 +1810,16 @@ pub fn dispatch_via_miframe(
             entry_py_pc,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
-            store_subscr_fn_addr: bh_store_subscr_fn_addr_cached(),
+            // This entry (test/fixture / shadow_walker) hard-codes
+            // `outer_jitcode_index = 0` and an empty `outer_active_boxes`
+            // rather than seeding them from `sym.jitcode` /
+            // `collect_outer_active_boxes` like
+            // `dispatch_via_miframe_at_opcode_entry` does.  A specialized
+            // `generated_store_subscr_value` guard captured via
+            // `walker_capture_snapshot_for_last_guard` would attach
+            // resume data pointing at the wrong frame, so keep
+            // STORE_SUBSCR specialization off on this entry.
+            store_subscr_fn_addr: None,
         };
         let outcome = walk(jitcode_code, position, &mut wc);
         // Read final last_exc_value before wc drops so the borrow
