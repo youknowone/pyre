@@ -2081,11 +2081,7 @@ impl ConstantOpcodeHandler for PyFrame {
 ///  - classmethod → bind class (w_type)
 ///  - staticmethod / property / member / type / getset → no binding (NULL)
 ///  - builtin type method (list.append etc.) → bind instance
-pub fn compute_load_method_bound(
-    obj: PyObjectRef,
-    attr: PyObjectRef,
-    name: &str,
-) -> PyObjectRef {
+pub fn compute_load_method_bound(obj: PyObjectRef, attr: PyObjectRef, name: &str) -> PyObjectRef {
     unsafe {
         if pyre_object::is_method(attr) {
             return PY_NULL;

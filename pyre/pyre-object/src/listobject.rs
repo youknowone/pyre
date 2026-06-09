@@ -1152,6 +1152,16 @@ pub extern "C" fn jit_list_reverse(list: i64) -> i64 {
     0
 }
 
+#[majit_macros::dont_look_inside]
+pub extern "C" fn jit_list_pop_at(list: i64, index: i64) -> i64 {
+    unsafe {
+        match w_list_pop(list as PyObjectRef, index) {
+            Some(value) => value as i64,
+            None => panic!("pop index out of range in JIT"),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

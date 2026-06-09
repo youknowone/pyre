@@ -1067,16 +1067,20 @@ impl MIFrame {
     }
 
     /// #143 frame-advance gate: mark this trace as having performed a concrete
-    /// heap mutation. Called from the precise list/dict mutation recorders
-    /// (`list_append_value`/`list_pop_value`/`list_reverse_value` and the
-    /// concrete `store_subscr_value` store). Non-mutating method calls
-    /// (`x in s`, `len(xs)`) never reach these, so a mutation-free loop's root
-    /// sym stays unmarked and `dm143_advance_live_locals` skips its advance.
+    /// heap mutation during tracing. Called only from the precise list mutation
+    /// recorders (`list_append_value`/`list_pop_value`/`list_pop_at_value`/
+    /// `list_reverse_value`). Non-mutating method calls (`x in s`, `len(xs)`)
+    /// and deferred stores (`STORE_SUBSCR`) never reach this, so their loops
+    /// stay unmarked and `dm143_advance_live_locals` skips their advance.
     #[inline]
     pub(crate) fn dm143_mark_heap_mutated(&mut self) {
-        if dm143_concrete_stores_enabled() {
-            self.sym_mut().dm143_heap_mutated = true;
-        }
+        // Set by the concrete-during-trace mutation recorders only
+        // (list append / pop / pop-at / reverse — method-call mutations that
+        // run at `call_callable` line ~101 during tracing). STORE_SUBSCR is
+        // deferred (no concrete write during trace) so it deliberately does
+        // NOT mark: a pure-STORE_SUBSCR loop (nbody / fannkuch) must keep its
+        // deferred write, which the compiled loop performs exactly once.
+        self.sym_mut().dm143_heap_mutated = true;
     }
 
     pub(crate) fn frame(&self) -> OpRef {
@@ -5685,21 +5689,13 @@ impl MIFrame {
         concrete_key: PyObjectRef,
         concrete_value: PyObjectRef,
     ) -> Result<(), PyError> {
-        // Emit the (deferred) STORE_SUBSCR IR first; its strategy guards read
-        // the PRE-mutation concrete object, matching the state the compiled
-        // loop guards check at entry.
+        // STORE_SUBSCR is deferred: the emitted IR performs the heap write in
+        // the compiled loop (exactly once), and no concrete write happens
+        // during trace. So it must NOT mark the loop as heap-mutated — a
+        // pure-STORE_SUBSCR loop (nbody / fannkuch) is not advanced, keeping
+        // its single deferred write. Only the concrete-during-trace method
+        // mutations (append / pop / reverse) drive `dm143_advance_live_locals`.
         self.store_subscr_value_emit(obj, key, value, concrete_obj, concrete_key, concrete_value)?;
-        if dm143_concrete_stores_enabled() {
-            // #143 Part 2: the IR above performs NO heap write during trace.
-            // Paired with dm143_advance_live_locals (which advances the live
-            // frame past this iteration so the compiled loop does not re-run
-            // it), the deferred write would be LOST. Execute it concretely now
-            // — the same concrete-during-trace behavior method-call mutations
-            // (xs.append()) already have. Covers every STORE_SUBSCR strategy
-            // (list int/float/object, dict, slice) through one objspace call.
-            pyre_interpreter::setitem(concrete_obj, concrete_key, concrete_value)?;
-            self.dm143_mark_heap_mutated();
-        }
         Ok(())
     }
 
@@ -5916,6 +5912,89 @@ impl MIFrame {
                 &[Type::Ref],
             );
             ctx.const_ref(pyre_object::w_none() as i64)
+        });
+        self.trace_record_no_exception_guard();
+        Ok(result)
+    }
+
+    /// Direct trace path for `list.pop(index)` (front / indexed pop).
+    ///
+    /// `ll_pop_zero` (`oopspec = 'list.pop(l, 0)'`) / `ll_pop_nonneg`
+    /// (`'list.pop(l, index)'`). The O(n) element shift is performed by the
+    /// `jit_list_pop_at` residual (an escaped, non-virtual list lowers the
+    /// oopspec to a residual call upstream too), but the residual is opaque:
+    /// `default_effect_info` only invalidates the list's cached length, so
+    /// the compiled loop would track a stale length and a later `append`
+    /// would write past the live elements (issue #143, the dominant len
+    /// error). Mirror the already-correct end-pop
+    /// (`generated_list_pop_by_strategy`): overlay an inline
+    /// `SetfieldGc(new_len)` so the post-pop length is a known,
+    /// resume-reconstructible value. The inline write is idempotent with the
+    /// residual's own decrement (both leave `length == len - 1`).
+    pub(crate) fn list_pop_at_value(
+        &mut self,
+        callable: OpRef,
+        list: OpRef,
+        index: OpRef,
+        concrete_list: PyObjectRef,
+    ) -> Result<OpRef, PyError> {
+        self.dm143_mark_heap_mutated();
+        // Pick the strategy-specific length field so the inline length update
+        // mirrors `generated_list_pop_by_strategy`. A null / non-list / mixed
+        // receiver has no known length field, so fall back to the generic
+        // residual on the method object.
+        let strategy = unsafe {
+            if concrete_list.is_null() || !is_list(concrete_list) {
+                None
+            } else if w_list_uses_object_storage(concrete_list) {
+                Some((0i64, crate::descr::list_length_descr()))
+            } else if w_list_uses_int_storage(concrete_list) {
+                Some((1i64, crate::descr::list_int_items_len_descr()))
+            } else if w_list_uses_float_storage(concrete_list) {
+                Some((2i64, crate::descr::list_float_items_len_descr()))
+            } else {
+                None
+            }
+        };
+        let Some((strategy_id, len_descr)) = strategy else {
+            // The method-form generic call shape is `callable(index)`.
+            return self.trace_call_callable(callable, &[index]);
+        };
+        let len_descr_idx = len_descr.index();
+        let result = self.with_ctx(|this, ctx| {
+            this.guard_class(ctx, list, &LIST_TYPE as *const PyType);
+            this.guard_list_strategy(ctx, list, strategy_id);
+            // Pre-pop length (cached); `new_len = len - 1` is the
+            // reconstructible post-pop length.
+            let len = opimpl_getfield_gc_i(ctx, list, len_descr.clone());
+            let idx_int = this.trace_guarded_int_payload(ctx, index);
+            // The residual does the real heap mutation (read + O(n) shift +
+            // length decrement + tail clear) in compiled code.
+            let res = crate::helpers::emit_trace_call_ref_typed(
+                ctx,
+                pyre_object::listobject::jit_list_pop_at as *const (),
+                &[list, idx_int],
+                &[Type::Ref, Type::Int],
+            );
+            // Load-bearing #143 fix: publish the post-pop length as a known
+            // value the optimizer/heapcache can carry forward and resume can
+            // replay (SetfieldGc lands in pending_fields).
+            let one = ctx.const_int(1);
+            let new_len = ctx.record_op(OpCode::IntSub, &[len, one]);
+            let new_len_value = ctx
+                .heapcache_getfield_cached(list, len_descr_idx)
+                .and_then(|b| match ctx.box_value(b)? {
+                    Value::Int(n) => Some(n),
+                    _ => None,
+                })
+                .map(|n| Value::Int(n.wrapping_sub(1)))
+                .unwrap_or(Value::Void);
+            if !matches!(new_len_value, Value::Void) {
+                ctx.set_opref_concrete(new_len, new_len_value);
+            }
+            ctx.record_op_with_descr(OpCode::SetfieldGc, &[list, new_len], len_descr.clone());
+            ctx.heapcache_setfield_cached(list, len_descr_idx, new_len);
+            res
         });
         self.trace_record_no_exception_guard();
         Ok(result)
@@ -6150,6 +6229,14 @@ impl MIFrame {
                         self.with_ctx(|_this, ctx| ctx.const_ref(pyre_object::w_none() as i64));
                     return Ok(none_ref);
                 }
+                if args.len() == 1 && canonical_list_method("pop") == Some(inner_func) {
+                    // Indexed pop `xs.pop(i)`: recorded inline by
+                    // `list_pop_at_value` (residual shift + reconstructible
+                    // length overlay). Called directly like the append arm — no
+                    // replay scaffolding.
+                    let self_ref = recover_self(self);
+                    return self.list_pop_at_value(callable, self_ref, args[0], inner_self);
+                }
                 if args.len() == 0 && canonical_list_method("pop") == Some(inner_func) {
                     let call_pc = self.fallthrough_pc.saturating_sub(1);
                     self.with_ctx(|this, ctx| {
@@ -6212,15 +6299,21 @@ impl MIFrame {
                     // NULL callable on resume and inflated `valuestackdepth`,
                     // skewing the synthetic guard's `result_stack_idx` — is
                     // removed.
-                    self.list_append_value(
-                        args[0],
-                        args[1],
-                        concrete_args[0],
-                        concrete_args[1],
-                    )?;
+                    self.list_append_value(args[0], args[1], concrete_args[0], concrete_args[1])?;
                     let none_ref =
                         self.with_ctx(|_this, ctx| ctx.const_ref(pyre_object::w_none() as i64));
                     return Ok(none_ref);
+                }
+                if args.len() == 2
+                    && canonical_list_method("pop") == Some(concrete_callable)
+                    && !concrete_args.first().copied().unwrap_or(PY_NULL).is_null()
+                    && is_list(concrete_args[0])
+                {
+                    // Builtin-form indexed pop `list.pop(xs, i)`: recorded
+                    // inline by `list_pop_at_value` (residual shift +
+                    // reconstructible length overlay), called directly like the
+                    // append arm — no replay scaffolding.
+                    return self.list_pop_at_value(callable, args[0], args[1], concrete_args[0]);
                 }
                 if args.len() == 1
                     && canonical_list_method("pop") == Some(concrete_callable)
@@ -8519,17 +8612,6 @@ unsafe fn trace_check_exc_match_against(
         return false;
     };
     pyre_interpreter::baseobjspace::exception_match(w_exc_class, exc_type)
-}
-
-/// #143 frame-advance gate (mirrors `dm143_advance_enabled` in pyre-jit
-/// eval.rs). The live-frame locals advance and the concrete-during-trace
-/// execution of otherwise-DEFERRED heap mutations (STORE_SUBSCR) are two
-/// halves of one fix and MUST be enabled together: advance without concrete
-/// stores loses the deferred write; concrete stores without advance applies
-/// it twice (trace + compiled re-run). Both read the same `PYRE_DM_ADVANCE`.
-pub(crate) fn dm143_concrete_stores_enabled() -> bool {
-    static EN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *EN.get_or_init(|| std::env::var_os("PYRE_DM_ADVANCE").is_some())
 }
 
 /// Production-walker allow-list for the walker cutover.

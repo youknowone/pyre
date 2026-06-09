@@ -3582,7 +3582,10 @@ pub fn build_load_attr_fn_residual_call_ir_r_insn(
         "residual_call_ir_r",
         vec![
             Operand::ConstInt(load_attr_fn_idx as i64),
-            Operand::ListOfKind(ListOfKind::new(Kind::Int, vec![Operand::ConstInt(name_idx)])),
+            Operand::ListOfKind(ListOfKind::new(
+                Kind::Int,
+                vec![Operand::ConstInt(name_idx)],
+            )),
             Operand::ListOfKind(ListOfKind::new(
                 Kind::Ref,
                 vec![
@@ -3619,7 +3622,10 @@ pub fn build_load_method_self_fn_residual_call_ir_r_insn(
         "residual_call_ir_r",
         vec![
             Operand::ConstInt(load_method_self_fn_idx as i64),
-            Operand::ListOfKind(ListOfKind::new(Kind::Int, vec![Operand::ConstInt(name_idx)])),
+            Operand::ListOfKind(ListOfKind::new(
+                Kind::Int,
+                vec![Operand::ConstInt(name_idx)],
+            )),
             Operand::ListOfKind(ListOfKind::new(
                 Kind::Ref,
                 vec![

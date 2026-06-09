@@ -3361,13 +3361,15 @@ pub(crate) fn eval_loop_jit_bridge(frame: &mut PyFrame) -> LoopResult {
     }
 }
 
-/// #143 frame-advance spike gate. While the deferred-store asymmetry
-/// (`STORE_SUBSCR`/`STORE_ATTR` defer their heap write; `list.append`
-/// mutates during trace) is being characterized, the live-frame advance
-/// is opt-in via `PYRE_DM_ADVANCE` so check.py can A/B it.
+/// #143 live-frame advance master switch. The precise gate is the
+/// per-loop `dm143_heap_mutated` marker (set only by concrete-during-trace
+/// mutation recorders: `list.append`/`pop`/`pop(i)`/`reverse`).
+/// `STORE_SUBSCR`/`STORE_ATTR` defer their heap write and never set the
+/// marker, so their loops are not advanced. `PYRE_DM_NO_ADVANCE` forces
+/// the advance off for A/B debugging.
 fn dm143_advance_enabled() -> bool {
     static EN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *EN.get_or_init(|| std::env::var_os("PYRE_DM_ADVANCE").is_some())
+    *EN.get_or_init(|| std::env::var_os("PYRE_DM_NO_ADVANCE").is_none())
 }
 
 /// #143: at a successful loop close, advance the LIVE frame's locals to the

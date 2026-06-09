@@ -3245,7 +3245,11 @@ fn register_helper_fn_pointers(
     // `__getattribute__` (forces virtualizables) and raise `AttributeError`
     // → `MayForce`.  `bh_load_method_self_fn` is the pure binding decision —
     // reads the type MRO (touches heap) but never raises → `PlainCannotRaise`.
-    let load_attr_fn = bind(assembler, cpu.load_attr_fn as *const (), CallFlavor::MayForce);
+    let load_attr_fn = bind(
+        assembler,
+        cpu.load_attr_fn as *const (),
+        CallFlavor::MayForce,
+    );
     let load_method_self_fn = bind(
         assembler,
         cpu.load_method_self_fn as *const (),
