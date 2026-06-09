@@ -621,11 +621,11 @@ fn probe_walk_perfn_jitcode(
 
     // Roll the recorder back so the aborted trace leaves no partial ops.
     ctx.cut_trace(pre_pos);
-    // The probe discards its trace; clear any deferred void-store events and
+    // The probe discards its trace; clear the walk-local bool-box-truth map and
     // stashed Finish payload an authoritative probe walk may have recorded so
     // they cannot leak into the next walk (the production tracer clears these
     // at entry, but the probe never runs through that path).
-    crate::jitcode_dispatch::void_defer_reset();
+    crate::jitcode_dispatch::bool_box_truth_reset();
     crate::jitcode_dispatch::fbw_finish_payload_reset();
 }
 
@@ -658,9 +658,9 @@ fn full_body_walk_trace(
     // it the compiled loop's entry args don't match what the portal
     // supplies, so the portal cannot enter the compiled loop and re-traces
     // every iteration (the observed spin).
-    // Clear any deferred void-store events left by a prior aborted walk so
-    // they cannot leak into this one (#63).
-    crate::jitcode_dispatch::void_defer_reset();
+    // Clear the walk-local bool-box-truth map left by a prior aborted walk so
+    // it cannot leak into this one.
+    crate::jitcode_dispatch::bool_box_truth_reset();
     // Slice b (PYRE_FBW_CALL_ASSEMBLER): clear any Finish payload a prior
     // aborted walk's top-level `*_return` arm may have stashed, so a stale
     // value cannot leak into this walk's `Terminate` handling.
@@ -705,12 +705,6 @@ fn full_body_walk_trace(
                     ctx.set_green_key(key, (w_code as usize, start_pc));
                     ctx.header_pc = start_pc;
                 }
-                // Commit deferred void-residual stores whose iteration the
-                // compiled loop will not re-run (those in an enclosing scope
-                // relative to the closing loop `loop_header_pc`); stores inside
-                // the closing loop's body are dropped here and re-run by the
-                // compiled loop (#61 / #63).
-                crate::jitcode_dispatch::void_defer_commit_at_close(loop_header_pc);
                 TraceAction::CloseLoopWithArgs {
                     jump_args,
                     loop_header_pc: Some(loop_header_pc),

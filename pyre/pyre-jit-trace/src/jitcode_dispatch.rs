@@ -3063,7 +3063,12 @@ fn getarrayitem_vable_via_metainterp(
     // the concrete index. Fail loud if the walker can't resolve it.
     let index_value = match ctx.trace_ctx.concrete_of_opref(index) {
         Some(Value::Int(v)) => v,
-        _ => return Err(DispatchError::VableArrayIndexNotConcrete { pc: op.pc, value: index }),
+        _ => {
+            return Err(DispatchError::VableArrayIndexNotConcrete {
+                pc: op.pc,
+                value: index,
+            });
+        }
     };
     let (fdescr, adescr) = vable_array_descrs_from_jitcode(code, op, 2, 4, ctx)?;
     let guards_before = ctx.trace_ctx.num_guards();
@@ -3149,7 +3154,12 @@ fn setarrayitem_vable_via_metainterp(
     let index = read_int_reg(code, op, 1, ctx)?;
     let index_value = match ctx.trace_ctx.concrete_of_opref(index) {
         Some(Value::Int(v)) => v,
-        _ => return Err(DispatchError::VableArrayIndexNotConcrete { pc: op.pc, value: index }),
+        _ => {
+            return Err(DispatchError::VableArrayIndexNotConcrete {
+                pc: op.pc,
+                value: index,
+            });
+        }
     };
     let value = match value_bank {
         'i' => read_int_reg(code, op, 2, ctx)?,
@@ -3158,7 +3168,10 @@ fn setarrayitem_vable_via_metainterp(
         _ => unreachable!("value_bank must be 'i', 'r' or 'f'"),
     };
     let (fdescr, adescr) = vable_array_descrs_from_jitcode(code, op, 3, 5, ctx)?;
-    let concrete = ctx.trace_ctx.concrete_of_opref(value).unwrap_or(Value::Void);
+    let concrete = ctx
+        .trace_ctx
+        .concrete_of_opref(value)
+        .unwrap_or(Value::Void);
     let guards_before = ctx.trace_ctx.num_guards();
     ctx.trace_ctx.vable_setarrayitem_indexed(
         op.pc,
@@ -4144,37 +4157,6 @@ fn jitcode_has_exception_handler(code: &[u8]) -> bool {
     crate::jitcode_runtime::decoded_ops(code).any(|op| op.opname == "catch_exception")
 }
 
-/// Deferred void-residual-store accounting for the authoritative full-body
-/// walk (#63 / #124 loop-close boundary).
-///
-/// A void may-force call (`STORE_SUBSCR` / `list.__setitem__` etc.) is not
-/// executed eagerly during the walk: the compiled loop re-runs the traced
-/// iteration's body, so eager execution double-applies the side effect to the
-/// live heap (#61).  But that re-run only covers stores that live in the body
-/// of the loop that actually *closes*.  When a store lives in an *enclosing*
-/// scope relative to the closing loop — e.g. the outer `result[i] = s` of a
-/// nested loop whose inner loop is the hot one — the compiled (inner) loop
-/// starts at the next outer iteration and never re-runs that store, so leaving
-/// it to the loop drops it exactly once at the trace-compilation transition.
-///
-/// To commit such a store exactly once (not 0×, not 2×) the walk records an
-/// ordered event log: each skipped void store, and each `jit_merge_point` that
-/// *registers* a loop (does not close) with its loop-header Python pc.  At the
-/// primary loop close (header pc `H`) the log is drained back-to-front: a store
-/// is committed iff a later-in-time merge registered an *enclosing* loop
-/// (`header_py_pc < H`, i.e. textually-earlier / outer), which proves the
-/// closing loop's body does not contain the store.  Stores with no intervening
-/// enclosing register are dropped (the compiled loop re-runs them, #61).
-enum VoidDeferEvent {
-    Store { func_ptr: i64, args: Vec<i64> },
-    Register { loop_header_py_pc: usize },
-}
-
-thread_local! {
-    static VOID_DEFER_LOG: std::cell::RefCell<Vec<VoidDeferEvent>> =
-        const { std::cell::RefCell::new(Vec::new()) };
-}
-
 /// Maps a freshly-boxed `W_Bool` opref (the `jit_bool_value_from_truth(t)`
 /// result a compare specialization writes to the value-stack slot) back to its
 /// raw truth Int opref `t` (#62).  The `COMPARE_OP` specialization boxes the
@@ -4197,7 +4179,7 @@ thread_local! {
 /// `is_true` residual), so this is a RUNTIME reconstruction of that STATIC
 /// fusion.  Read+write are both gated on `WalkContext::is_authoritative_executor`
 /// (true only inside the two FBW walk entry points) and the map is cleared at
-/// every walk boundary by `void_defer_reset` — see there — so it cannot leak
+/// every walk boundary by `bool_box_truth_reset` — see there — so it cannot leak
 /// across traces; OpRef SSA-uniqueness (`recorder.rs`) keeps a key from ever
 /// re-binding within one walk.
 thread_local! {
@@ -4220,53 +4202,14 @@ fn bool_box_truth_lookup(boxed: OpRef) -> Option<OpRef> {
     })
 }
 
-/// Clear the deferred-void-store log AND the [`BOOL_BOX_TRUTH`] map at the
-/// start of an authoritative walk so a prior aborted walk's events never leak
-/// into the next one.  This is the reset boundary for both thread-locals; it is
-/// called at the two FBW walk entry points (`trace.rs` `full_body_walk_trace`
-/// at walk start, and after `probe_walk_perfn_jitcode` discards its throwaway
-/// trace), which are the only sites that set `is_authoritative_executor`.
-pub fn void_defer_reset() {
-    VOID_DEFER_LOG.with(|log| log.borrow_mut().clear());
+/// Clear the [`BOOL_BOX_TRUTH`] map at the start of an authoritative walk so a
+/// prior aborted walk's entries never leak into the next one.  This is the
+/// reset boundary for the walk-local thread-local; it is called at the two FBW
+/// walk entry points (`trace.rs` `full_body_walk_trace` at walk start, and
+/// after `probe_walk_perfn_jitcode` discards its throwaway trace), which are
+/// the only sites that set `is_authoritative_executor`.
+pub fn bool_box_truth_reset() {
     BOOL_BOX_TRUTH.with(|m| m.borrow_mut().clear());
-}
-
-fn void_defer_push_store(func_ptr: i64, args: Vec<i64>) {
-    VOID_DEFER_LOG.with(|log| {
-        log.borrow_mut()
-            .push(VoidDeferEvent::Store { func_ptr, args })
-    });
-}
-
-fn void_defer_push_register(loop_header_py_pc: usize) {
-    VOID_DEFER_LOG.with(|log| {
-        log.borrow_mut()
-            .push(VoidDeferEvent::Register { loop_header_py_pc })
-    });
-}
-
-/// Drain the log at the primary loop close with closing-loop header pc
-/// `closing_header_py_pc`, committing exactly the stores whose iteration the
-/// compiled loop will not re-run (see [`VoidDeferEvent`]).  Clears the log.
-pub fn void_defer_commit_at_close(closing_header_py_pc: usize) {
-    VOID_DEFER_LOG.with(|log| {
-        let events = std::mem::take(&mut *log.borrow_mut());
-        let mut enclosing_register_seen = false;
-        for event in events.into_iter().rev() {
-            match event {
-                VoidDeferEvent::Register { loop_header_py_pc } => {
-                    if loop_header_py_pc < closing_header_py_pc {
-                        enclosing_register_seen = true;
-                    }
-                }
-                VoidDeferEvent::Store { func_ptr, args } => {
-                    if enclosing_register_seen {
-                        majit_metainterp::call_void_function(func_ptr as *const (), &args);
-                    }
-                }
-            }
-        }
-    });
 }
 
 /// PyPy `_opimpl_residual_call{1,2,3}` (pyjitpl.py:1346/1349/1354) port
@@ -4340,10 +4283,10 @@ pub fn void_defer_commit_at_close(closing_header_py_pc: usize) {
 ///   authoritative executor, opcode out of set, funcbox non-const, arity
 ///   exceeds [`MAX_HOST_CALL_ARITY`], any operand lacks a concrete
 ///   `box_value`, or any Ref arg is NULL), or the call's result is void
-///   and was routed into the deferred-store log ([`VoidDeferEvent`]).
-///   The trace still has the recorded call op for the optimizer to
-///   consume later; walker falls through as if this function did not
-///   exist.
+///   (recorded symbolically; the compiled loop applies the side effect —
+///   see the void branch below).  The trace still has the recorded call
+///   op for the optimizer to consume later; walker falls through as if
+///   this function did not exist.
 ///
 /// **Wire status** (Task #390 sub-slice 2.3): invoked from all three
 /// dispatch entry points (`dispatch_residual_call_iRd_kind`,
@@ -4473,16 +4416,25 @@ fn try_execute_residual_call_via_executor(
         }
     }
     // Void-result calls (STORE_SUBSCR / list.append / dict.__setitem__ etc.)
-    // carry no value the walk specializes on — only their side effect.  Do not
-    // execute eagerly: the compiled loop re-runs the traced iteration's body,
-    // so eager execution double-applies the heap mutation (#61, `xs[j] = …`
-    // landing twice).  Instead record the store in the deferred log; at the
-    // primary loop close it is committed exactly once if-and-only-if the
-    // closing loop's body does not contain it (an enclosing scope, e.g. the
-    // outer `result[i] = s` of a nested loop), and dropped otherwise (the
-    // compiled loop re-runs it).  See [`VoidDeferEvent`] / #63.
+    // carry no value the walk specializes on — only their side effect.
+    //
+    // `do_residual_call` (pyjitpl.py:2040/2104/2123 for CALL_MAY_FORCE_N /
+    // CALL_LOOPINVARIANT_N / CALL_N) still runs `executor.execute_varargs` for a
+    // void call, applying the side effect once during tracing, and then resumes
+    // the compiled loop at the *next* iteration (`raise_continue_running_normally`,
+    // pyjitpl.py:3072-3091, hands back the end-of-iteration-N state).  The
+    // full-body walk cannot mirror that eager step: it is a SYMBOLIC walk that
+    // does not advance the interpreter, so the compiled loop re-enters at the
+    // traced iteration N (entry = loop header) and re-runs the body.  Executing
+    // the helper here would land the heap mutation twice — once now, once when
+    // the compiled loop re-runs iteration N.  Record the call symbolically
+    // instead: falling through with `None` leaves the recorded residual op in
+    // the trace, so the compiled loop applies the side effect exactly once.
+    // That is the FBW-correct equivalent of the eager step — the same
+    // record-only treatment the active-vable `CallMayForce*` subset
+    // (STORE_SUBSCR) already takes at the force-virtual gate above, and the net
+    // once-per-iteration effect matches the trait path.
     if call_descr.result_type() == majit_ir::Type::Void {
-        void_defer_push_store(func_ptr, args);
         return None;
     }
     // A Python-level callee (e.g. a recursive `fib`) re-enters the
@@ -4516,7 +4468,7 @@ fn try_execute_residual_call_via_executor(
             // pyjitpl.py:1392 `result_box.value = result` analogue — stamp
             // the recorded OpRef with the executed concrete so downstream
             // `concrete_of_opref` / `box_value` consumers see the folded
-            // value.  Void results were deferred above (`void_defer_push_store`)
+            // value.  Void results returned `None` above (recorded symbolically)
             // and never reach this arm; the case is kept for exhaustiveness.
             match call_descr.result_type() {
                 majit_ir::Type::Int => {
@@ -5328,7 +5280,7 @@ pub(crate) fn fbw_debug_abort_enabled() -> bool {
 }
 
 /// Clear any stashed Finish payload before a walk begins (mirrors
-/// [`void_defer_reset`]).
+/// [`bool_box_truth_reset`]).
 pub(crate) fn fbw_finish_payload_reset() {
     FBW_FINISH_PAYLOAD.with(|c| c.set(None));
 }
@@ -10653,9 +10605,7 @@ fn handle(
                 // This merge point registers (does not close) — the walk
                 // crossed a loop-boundary that did not match the primary
                 // loop's green key, i.e. an enclosing or sibling loop whose
-                // header is `next_instr`.  Record it so the deferred void-store
-                // drain can tell whether a buffered store sits in an enclosing
-                // scope relative to the loop that ultimately closes (#63).
+                // header is `next_instr`.
                 //
                 // Emit the intermediate merge-point vable→heap writeback the
                 // trait runs unconditionally via `close_loop_args_at` before
@@ -10664,7 +10614,6 @@ fn handle(
                 // `PyFrame` `last_instr`/array at the trace seed, so a later
                 // guard-fail resume mis-reads it (#62 / #67-remaining).
                 emit_intermediate_merge_point_writeback(ctx.trace_ctx, next_instr);
-                void_defer_push_register(next_instr);
                 let green_boxes: Vec<majit_metainterp::GreenBox> = live_args
                     .iter()
                     .map(|opref| {
@@ -10948,8 +10897,16 @@ mod tests {
         // operand 0 (the box) sits at code[pc+1] for all three argcodes.
         let code = [0u8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
         for (key, opname, argcodes) in [
-            ("getarrayitem_vable_i/riXdd>i", "getarrayitem_vable_i", "riXdd>i"),
-            ("setarrayitem_vable_i/riXdd", "setarrayitem_vable_i", "riXdd"),
+            (
+                "getarrayitem_vable_i/riXdd>i",
+                "getarrayitem_vable_i",
+                "riXdd>i",
+            ),
+            (
+                "setarrayitem_vable_i/riXdd",
+                "setarrayitem_vable_i",
+                "riXdd",
+            ),
             ("arraylen_vable/rdd>i", "arraylen_vable", "rdd>i"),
         ] {
             let descr_pool: Vec<DescrRef> = Vec::new();
