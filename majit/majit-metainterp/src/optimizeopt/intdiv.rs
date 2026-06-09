@@ -148,11 +148,7 @@ pub fn division_operations(
         // mul = UINT_MUL_HIGH(n, k)
         let arg_n = ctx.materialize_box_at(n_ref);
         let arg_k = ctx.materialize_box_at(k_ref);
-        let mul_ref = emit_op(
-            ctx,
-            pass_idx,
-            Op::new(OpCode::UintMulHigh, &[arg_n, arg_k]),
-        );
+        let mul_ref = emit_op(ctx, pass_idx, Op::new(OpCode::UintMulHigh, &[arg_n, arg_k]));
 
         // result = UINT_RSHIFT(mul, i)
         let arg_mul = ctx.materialize_box_at(mul_ref);

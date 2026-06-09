@@ -1296,8 +1296,7 @@ impl OptRewrite {
                         {
                             let mask = self.emit_constant_int(ctx, (-1i64).wrapping_shl(c1 as u32));
                             let arg_mask = ctx.materialize_box_at(mask);
-                            let mut new_op =
-                                Op::new(OpCode::IntAnd, &[inner.arg(0), arg_mask]);
+                            let mut new_op = Op::new(OpCode::IntAnd, &[inner.arg(0), arg_mask]);
                             new_op.pos.set(op.pos.get());
                             return OptimizationResult::Emit(new_op);
                         }
@@ -1309,8 +1308,7 @@ impl OptRewrite {
                         {
                             let mask = self.emit_constant_int(ctx, (-1i64).wrapping_shl(c1 as u32));
                             let arg_mask = ctx.materialize_box_at(mask);
-                            let mut new_op =
-                                Op::new(OpCode::IntAnd, &[inner.arg(0), arg_mask]);
+                            let mut new_op = Op::new(OpCode::IntAnd, &[inner.arg(0), arg_mask]);
                             new_op.pos.set(op.pos.get());
                             return OptimizationResult::Emit(new_op);
                         }
@@ -1332,10 +1330,8 @@ impl OptRewrite {
                                     let mask =
                                         self.emit_constant_int(ctx, c2.wrapping_shl(c1 as u32));
                                     let arg_mask = ctx.materialize_box_at(mask);
-                                    let mut new_op = Op::new(
-                                        OpCode::IntAnd,
-                                        &[inner2.arg(0), arg_mask],
-                                    );
+                                    let mut new_op =
+                                        Op::new(OpCode::IntAnd, &[inner2.arg(0), arg_mask]);
                                     new_op.pos.set(op.pos.get());
                                     return OptimizationResult::Emit(new_op);
                                 }
@@ -1348,10 +1344,8 @@ impl OptRewrite {
                                     let mask =
                                         self.emit_constant_int(ctx, c2.wrapping_shl(c1 as u32));
                                     let arg_mask = ctx.materialize_box_at(mask);
-                                    let mut new_op = Op::new(
-                                        OpCode::IntAnd,
-                                        &[inner2.arg(0), arg_mask],
-                                    );
+                                    let mut new_op =
+                                        Op::new(OpCode::IntAnd, &[inner2.arg(0), arg_mask]);
                                     new_op.pos.set(op.pos.get());
                                     return OptimizationResult::Emit(new_op);
                                 }
@@ -1380,10 +1374,8 @@ impl OptRewrite {
                             if c < 64 {
                                 let cv = self.emit_constant_int(ctx, c);
                                 let arg_cv = ctx.materialize_box_at(cv);
-                                let mut new_op = Op::new(
-                                    OpCode::IntLshift,
-                                    &[inner.arg(0), arg_cv],
-                                );
+                                let mut new_op =
+                                    Op::new(OpCode::IntLshift, &[inner.arg(0), arg_cv]);
                                 new_op.pos.set(op.pos.get());
                                 return OptimizationResult::Emit(new_op);
                             }
@@ -1491,8 +1483,7 @@ impl OptRewrite {
                             let c = (c1 + c2).min(63);
                             let cv = self.emit_constant_int(ctx, c);
                             let arg_cv = ctx.materialize_box_at(cv);
-                            let mut new_op =
-                                Op::new(OpCode::IntRshift, &[inner.arg(0), arg_cv]);
+                            let mut new_op = Op::new(OpCode::IntRshift, &[inner.arg(0), arg_cv]);
                             new_op.pos.set(op.pos.get());
                             return OptimizationResult::Emit(new_op);
                         }
@@ -1578,10 +1569,7 @@ impl OptRewrite {
                         let mask = ((-1i64 as u64).wrapping_shl(c as u32) >> (c as u32)) as i64;
                         let mask_ref = self.emit_constant_int(ctx, mask);
                         let arg_mask = ctx.materialize_box_at(mask_ref);
-                        let mut new_op = Op::new(
-                            OpCode::IntAnd,
-                            &[inner.arg(0), arg_mask],
-                        );
+                        let mut new_op = Op::new(OpCode::IntAnd, &[inner.arg(0), arg_mask]);
                         new_op.pos.set(op.pos.get());
                         return OptimizationResult::Emit(new_op);
                     }
@@ -1725,8 +1713,7 @@ impl OptRewrite {
                 {
                     let zero = self.emit_constant_int(ctx, 0);
                     let arg_zero = ctx.materialize_box_at(zero);
-                    let mut new_op =
-                        Op::new(OpCode::IntLt, &[inner.arg(0), arg_zero]);
+                    let mut new_op = Op::new(OpCode::IntLt, &[inner.arg(0), arg_zero]);
                     new_op.pos.set(op.pos.get());
                     return OptimizationResult::Emit(new_op);
                 }
@@ -2572,8 +2559,7 @@ impl OptRewrite {
                     };
                     if shiftbound.known_nonnegative() && shiftbound.known_lt_const(63) {
                         let arg_shift = ctx.materialize_box_at(shiftvar);
-                        let mut rshift_op =
-                            Op::new(OpCode::IntRshift, &[arg1, arg_shift]);
+                        let mut rshift_op = Op::new(OpCode::IntRshift, &[arg1, arg_shift]);
                         rshift_op.pos.set(op.pos.get());
                         ctx.emit_extra(ctx.current_pass_idx, rshift_op);
                         ctx.last_op_removed = true;
@@ -2611,8 +2597,7 @@ impl OptRewrite {
             let shift = val.trailing_zeros() as i64;
             let shift_const = ctx.make_constant_int(shift);
             let arg_shift = ctx.materialize_box_at(shift_const);
-            let mut rshift_op =
-                Op::new(OpCode::IntRshift, &[arg1, arg_shift]);
+            let mut rshift_op = Op::new(OpCode::IntRshift, &[arg1, arg_shift]);
             rshift_op.pos.set(op.pos.get());
             ctx.emit_extra(ctx.current_pass_idx, rshift_op);
             ctx.last_op_removed = true;
@@ -2847,10 +2832,7 @@ impl OptRewrite {
                 let arg_dest = ctx.materialize_box_at(dest_box);
                 let arg_idx = ctx.materialize_box_at(idx_const);
                 let arg_val = ctx.materialize_box_at(val);
-                let mut setop = Op::new(
-                    OpCode::SetarrayitemGc,
-                    &[arg_dest, arg_idx, arg_val],
-                );
+                let mut setop = Op::new(OpCode::SetarrayitemGc, &[arg_dest, arg_idx, arg_val]);
                 setop.setdescr(arraydescr.clone());
                 ctx.emit_extra(pass_idx, setop);
             }
@@ -3037,8 +3019,7 @@ impl OptRewrite {
                 if Self::is_exact_power_of_two(reciprocal) {
                     let recip_ref = self.emit_constant_float(ctx, reciprocal);
                     let arg_recip = ctx.materialize_box_at(recip_ref);
-                    let mut new_op =
-                        Op::new(OpCode::FloatMul, &[arg0, arg_recip]);
+                    let mut new_op = Op::new(OpCode::FloatMul, &[arg0, arg_recip]);
                     new_op.pos.set(op.pos.get());
                     return OptimizationResult::Emit(new_op);
                 }

@@ -2471,7 +2471,8 @@ impl Optimizer {
                         // allowing Ref -> Float/Int type substitution at the JUMP.
                     }
                 } else {
-                    terminal_op.setarg(i, BoxRef::from_opref(resolved));
+                    let arg = ctx.materialize_box_at(resolved);
+                    terminal_op.setarg(i, arg);
                 }
             }
             for i in force_needed {

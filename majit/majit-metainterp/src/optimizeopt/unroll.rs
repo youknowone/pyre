@@ -4554,8 +4554,7 @@ fn assemble_peeled_trace_with_jump_args(
                         });
                     if tp != Type::Void {
                         let arg_source = ctx.materialize_box_at(source);
-                        let mut same_as =
-                            Op::new(OpCode::same_as_for_type(tp), &[arg_source]);
+                        let mut same_as = Op::new(OpCode::same_as_for_type(tp), &[arg_source]);
                         same_as.pos.set(arg);
                         fallthrough_aliases.push(same_as);
                     }

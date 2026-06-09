@@ -1126,10 +1126,8 @@ fn force_box_impl(
                     let arg_alloc = ctx.materialize_box_at(alloc_ref);
                     let arg_idx = ctx.materialize_box_at(idx_ref);
                     let arg_sub = ctx.materialize_box_at(subbox);
-                    let mut set_op = Op::new(
-                        OpCode::SetinteriorfieldGc,
-                        &[arg_alloc, arg_idx, arg_sub],
-                    );
+                    let mut set_op =
+                        Op::new(OpCode::SetinteriorfieldGc, &[arg_alloc, arg_idx, arg_sub]);
                     if let Some(d) = fielddescrs.get(field_idx as usize).cloned() {
                         set_op.setdescr(d);
                     }
@@ -1340,8 +1338,7 @@ fn force_box_impl(
                             let arg_newop = ctx.materialize_box_at(newop);
                             let arg_offset = ctx.materialize_box_at(offset);
                             let arg_ch = ctx.materialize_box_at(ch_resolved);
-                            let setitem_op =
-                                Op::new(set_opcode, &[arg_newop, arg_offset, arg_ch]);
+                            let setitem_op = Op::new(set_opcode, &[arg_newop, arg_offset, arg_ch]);
                             emit_op(ctx, setitem_op);
                         }
                         offset = crate::optimizeopt::vstring::_int_add(offset, one, ctx);

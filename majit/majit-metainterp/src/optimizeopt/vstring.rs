@@ -725,10 +725,7 @@ impl OptString {
                             let pass_idx = ctx.current_pass_idx;
                             let arg_src = ctx.materialize_box_at(src_ref);
                             let arg_index = ctx.materialize_box_at(index_ref);
-                            ctx.emit_extra(
-                                pass_idx,
-                                Op::new(getitem_opcode, &[arg_src, arg_index]),
-                            )
+                            ctx.emit_extra(pass_idx, Op::new(getitem_opcode, &[arg_src, arg_index]))
                         };
                     if dst_virtual {
                         dst_chars.push(Some(char_ref));
