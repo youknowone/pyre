@@ -1032,6 +1032,28 @@ fn derive_pc_live_indices_from_sparse(
             .checked_sub(1)
             .map(|k| pc_pos[k].1)
     };
+    // Unconditional control-transfer target of `pc` (`JUMP_FORWARD` /
+    // `JUMP_BACKWARD` / `JUMP_BACKWARD_NO_INTERRUPT`), or `None` for any
+    // other opcode.  An unconditional jump emits no resume-relevant jitcode
+    // of its own: the blackhole steps it and lands at the target, so its
+    // resume liveness IS the target block's.  Used by the #308 break-arm
+    // re-key below (matches the target computation in
+    // `trace_opcode.rs::record_branch_guard` and `liveness.rs`).
+    let uncond_jump_target = |pc: usize| -> Option<usize> {
+        let (instr, op_arg) = pyre_interpreter::decode_instruction_at(code, pc)?;
+        match instr {
+            Instruction::JumpForward { delta } => Some(pyre_interpreter::jump_target_forward(
+                &code.instructions,
+                pc + 1,
+                delta.get(op_arg).as_usize(),
+            )),
+            Instruction::JumpBackward { delta } | Instruction::JumpBackwardNoInterrupt { delta } => {
+                let next = pyre_interpreter::skip_caches(&code.instructions, pc + 1);
+                Some(next.saturating_sub(delta.get(op_arg).as_usize()))
+            }
+            _ => None,
+        }
+    };
     // Branch guards (`goto_if_not` / `goto_if_not_*` / `switch`) resume at
     // orgpc = the guard's OWN bytecode pc (#285) — i.e. the opcode START,
     // which is exactly the PC's first-insn keying (the default above).  The
@@ -1116,10 +1138,85 @@ fn derive_pc_live_indices_from_sparse(
                             || opname == "switch")
                 });
                 if is_branch_cond {
-                    pos_for_pc[fallthrough] = pos_for_pc[call_pc];
+                    // #308: when the branch's semantic fallthrough is itself
+                    // an unconditional jump — a `break` / loop-exit arm, e.g.
+                    // fannkuch's flip loop `if qq == 0: break` whose not-taken
+                    // arm head is a `JUMP_FORWARD` — DON'T re-run the branch.
+                    // Re-running re-reads the BOXED condition the guard already
+                    // resolved and re-takes the recorded (looping) arm,
+                    // double-counting one iteration.  Leave it `None` so the
+                    // unconditional-jump forward-carry below keys it to the
+                    // jump TARGET's marker (the arm's own post-jump block
+                    // entry), matching the per-PC walker resume table.
+                    if uncond_jump_target(fallthrough).is_none() {
+                        pos_for_pc[fallthrough] = pos_for_pc[call_pc];
+                    }
                 } else {
                     pos_for_pc[fallthrough] = Some(q + 1);
                 }
+            }
+        }
+    }
+    // Unconditional-jump forward-carry (#308): a `JUMP_FORWARD` /
+    // `JUMP_BACKWARD` PC that is a branch's not-taken arm head (a `break` /
+    // loop-exit / loop back-edge) emits no resume-relevant jitcode — the
+    // blackhole steps it straight to the jump target.  So its resume liveness
+    // is the TARGET block's.  The #306 branch re-key above deliberately
+    // leaves such fallthrough PCs `None`; key them here to the target's
+    // position so the resolver lands at the target block's `-live-` (the same
+    // place the per-PC walker resumes), not the preceding branch marker the
+    // dense carry-forward would otherwise hand them.  Runs BEFORE the trivia
+    // carry so a `Cache` / `NotTaken` between the branch and the jump
+    // (`semantic_fallthrough_pc` skips them onto the jump) inherits the
+    // jump's resolved target.
+    for pc in 0..n_pcs {
+        if pos_for_pc[pc].is_some() {
+            continue;
+        }
+        if let Some(target) = uncond_jump_target(pc) {
+            if target < n_pcs {
+                pos_for_pc[pc] = pos_for_pc[target];
+            }
+        }
+    }
+    // Trivia-PC forward-carry (#308): a stack-only PC that decodes to a
+    // no-op opcode (`Cache` / `NotTaken` / `Nop` / `ExtendedArg` / `Resume`)
+    // emits no jitcode, so it is absent from `pc_first_insn_pos` and resolves
+    // `None` above.  The runtime resumes a branch guard at the not-taken
+    // arm's RAW head PC (`opcode_pop_jump_if`'s `other_target = target`);
+    // when that arm head's first byte is trivia — a `NotTaken` marker right
+    // after the branch, a `Cache` after a can-raise op — the recorded
+    // `resume_pos` IS that trivia PC (e.g. fannkuch's flip loop resumes at
+    // the `NotTaken` at the head of the restore arm and the `Cache` after a
+    // `STORE_SUBSCR`).  The blackhole steps a trivia opcode as a no-op and
+    // advances to the next real opcode, so the resume liveness AT the trivia
+    // PC equals the liveness at `semantic_fallthrough_pc(pc)` (the next
+    // non-trivia PC's entry).  The dense pc_map carry-forward instead hands a
+    // stack-only PC the PRECEDING marker, which for a branch arm head is the
+    // marker BEFORE the `goto_if_not`; resuming there re-runs the branch and
+    // double-counts the arm.  Key trivia PCs to the next real PC's position
+    // so the resolver picks the arm-body `-live-`, matching the per-PC walker
+    // resume table.  Only fires for still-`None` PCs (the canraise/branch
+    // re-key above keys REAL fallthrough PCs, never trivia).
+    for pc in 0..n_pcs {
+        if pos_for_pc[pc].is_some() {
+            continue;
+        }
+        let is_trivia = matches!(
+            pyre_interpreter::decode_instruction_at(code, pc),
+            Some((
+                Instruction::Cache
+                    | Instruction::NotTaken
+                    | Instruction::Nop
+                    | Instruction::ExtendedArg
+                    | Instruction::Resume { .. },
+                _,
+            ))
+        );
+        if is_trivia {
+            let next = pyre_jit_trace::metainterp::semantic_fallthrough_pc(code, pc);
+            if next < n_pcs {
+                pos_for_pc[pc] = pos_for_pc[next];
             }
         }
     }
