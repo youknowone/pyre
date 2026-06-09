@@ -624,6 +624,18 @@ pub(crate) fn is_known_unported(msg: &str) -> bool {
         // the remaining producer is the rtyper-side `bindingrepr`
         // gap on synthesized `current_sp`-like graphs.
         || msg.contains("KeyError: no binding for arg")
+        // `cast_ptr_to_int` reached the typer with a non-`Ptr`
+        // operand — the front-end could not lower a real pointer for
+        // the source of an `expr as i64` cast.  The canonical hitter
+        // is `stack_check::current_sp` (`&probe as *const usize as
+        // usize`): taking the address of a stack local is a
+        // target-specific raw-SP read that `front::mir` lowers with
+        // the local's *value* (`Int(0)`) rather than its address, so
+        // `rtype_cast_ptr_to_int`'s late `InstanceRepr→PtrRepr` swap
+        // fallback finds `Signed` where it needs `Ptr(...)`.  The
+        // legacy walker handles these graphs; skip until the
+        // address-of-local lowering lands a typed pointer operand.
+        || msg.contains("rtype_cast_ptr_to_int: operand concretetype must be Ptr")
         // TODO(annotator-fixpoint-fail-loud) — STRICT-PARITY REGRESSION
         // vs main / PyPy.  `bookkeeper.py:108-127` propagates fixpoint
         // exceptions uncaught and `annrpython.py:643` lets
@@ -1546,6 +1558,12 @@ pub fn specialize_legacy_graph_with_registry_returning_value_to_var(
         lowleveltype_to_concrete(lltype)?;
     }
 
+    // The subject specialized cleanly — keep its blocks in the shared
+    // annotator (they are now `already_seen`). Every earlier `?` exit
+    // above leaves `_subject_block_scope` uncommitted, so a Skipped
+    // subject's partially-annotated blocks are evicted on drop and never
+    // poison a later subject's session-global `specialize_more_blocks`.
+    _subject_block_scope.commit();
     Ok((value_to_var, constant_concretetypes))
 }
 

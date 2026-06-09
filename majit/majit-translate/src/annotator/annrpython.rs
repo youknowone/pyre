@@ -291,13 +291,99 @@ impl<'a> Drop for PolicyGuard<'a> {
 
 /// RAII guard for `self.added_blocks = {}; ...; finally:
 /// self.added_blocks = saved` in `complete_helpers()`.
+///
+/// In the dual-gate per-subject driver the guard additionally enforces
+/// session isolation: a subject that fails (and is Skipped to the legacy
+/// walker) must leave the shared annotator exactly as it found it.
+/// `annotated_at_entry` snapshots the `annotated` keyset at scope open;
+/// unless [`commit`](Self::commit) marks the drive successful, the drop
+/// evicts every block this subject added from `annotated` / `all_blocks`
+/// / `blocked_blocks` and prunes the matching `genpendingblocks` entries.
+/// Without this, a half-annotated leftover poisons every later subject's
+/// session-global `specialize_more_blocks` walk: a `None` (False)
+/// sentinel crashes `specialize_block` (rtyper.rs:1656), and a processed
+/// block carrying an unbound op result raises `KeyError: no binding for
+/// arg`.  `raise_if_subject_blocked` only covers the blocked-on-drain
+/// path; this covers the `compute_at_fixpoint` / late-step / panic-unwind
+/// failure paths that bypass it.
 pub(crate) struct AddedBlocksGuard<'a> {
     ann: &'a RPythonAnnotator,
     saved: Option<Option<IndexMap<BlockKey, BlockRef>>>,
+    annotated_at_entry: std::collections::HashSet<BlockKey>,
+    committed: std::cell::Cell<bool>,
+}
+
+impl<'a> AddedBlocksGuard<'a> {
+    /// Mark this subject's annotator drive successful so its blocks
+    /// persist (they are `already_seen` after specialize and may back
+    /// later subjects' cross-graph calls). Call right before returning a
+    /// successful result; any earlier `?`/panic exit leaves the guard
+    /// uncommitted and rolls the subject's blocks back out.
+    pub(crate) fn commit(&self) {
+        self.committed.set(true);
+    }
 }
 
 impl<'a> Drop for AddedBlocksGuard<'a> {
     fn drop(&mut self) {
+        if !self.committed.get() {
+            // Best-effort eviction under `try_borrow_mut`: a panic that
+            // unwinds while one of these maps is borrowed degrades to a
+            // leak rather than an abort-during-unwind double-borrow.
+            if let (Ok(mut annotated), Ok(mut all_blocks), Ok(mut blocked_blocks)) = (
+                self.ann.annotated.try_borrow_mut(),
+                self.ann.all_blocks.try_borrow_mut(),
+                self.ann.blocked_blocks.try_borrow_mut(),
+            ) {
+                let new_keys: Vec<BlockKey> = annotated
+                    .keys()
+                    .filter(|k| !self.annotated_at_entry.contains(*k))
+                    .cloned()
+                    .collect();
+                for k in &new_keys {
+                    annotated.shift_remove(k);
+                    blocked_blocks.shift_remove(k);
+                    // Revert each evicted block to a pristine
+                    // "never annotated" state by clearing the
+                    // annotation on every Variable it DEFINES
+                    // (inputargs + operation results).  Dropping the
+                    // block from `annotated` without this leaves a
+                    // half-state: a later subject reaching the same
+                    // (session-shared) block sees `seen_before ==
+                    // false` in `addpendingblock`, takes the
+                    // `bindinputargs` initial-seed path, and calls
+                    // `setbinding` with the caller's (possibly
+                    // narrower) cell over the Variable's retained
+                    // annotation — tripping the monotonicity assert
+                    // `setbinding: new value does not contain old`.
+                    // Mirrors the dual-gate Skip arm's graph-wide
+                    // `var.annotation = None` reset
+                    // (codewriter.rs::dual_gate_type_state).
+                    if let Some(block) = all_blocks.shift_remove(k) {
+                        if let Ok(blk) = block.try_borrow() {
+                            let vars = blk
+                                .inputargs
+                                .iter()
+                                .chain(blk.operations.iter().map(|op| &op.result));
+                            for v in vars {
+                                if let Hlvalue::Variable(var) = v {
+                                    if let Ok(mut slot) = var.annotation.try_borrow_mut() {
+                                        *slot = None;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                if !new_keys.is_empty() {
+                    if let Ok(mut pending) = self.ann.genpendingblocks.try_borrow_mut() {
+                        for g in pending.iter_mut() {
+                            g.retain(|k, _| self.annotated_at_entry.contains(k));
+                        }
+                    }
+                }
+            }
+        }
         if let Some(saved) = self.saved.take() {
             *self.ann.added_blocks.borrow_mut() = saved;
         }
@@ -716,9 +802,16 @@ impl RPythonAnnotator {
     /// ```
     pub fn complete_helpers(&self) -> Result<(), crate::annotator::model::AnnotatorError> {
         let saved = self.added_blocks.borrow_mut().replace(IndexMap::new());
+        // `complete_helpers` is the RPython helper-graph drive: its
+        // `finally` only restores `added_blocks` (annrpython.py:113-119),
+        // never evicting blocks.  Pre-commit so the guard's
+        // subject-isolation eviction (used by the dual-gate driver) stays
+        // inert here.
         let _guard = AddedBlocksGuard {
             ann: self,
             saved: Some(saved),
+            annotated_at_entry: std::collections::HashSet::new(),
+            committed: std::cell::Cell::new(true),
         };
         self.complete()?;
         // upstream annrpython.py:118 passes `block_subset=self.added_blocks`
@@ -1247,9 +1340,13 @@ impl RPythonAnnotator {
     /// directly rather than through `complete()`.
     pub(crate) fn enter_added_blocks_scope(&self) -> AddedBlocksGuard<'_> {
         let saved = self.added_blocks.borrow_mut().replace(IndexMap::new());
+        let annotated_at_entry: std::collections::HashSet<BlockKey> =
+            self.annotated.borrow().keys().cloned().collect();
         AddedBlocksGuard {
             ann: self,
             saved: Some(saved),
+            annotated_at_entry,
+            committed: std::cell::Cell::new(false),
         }
     }
 
