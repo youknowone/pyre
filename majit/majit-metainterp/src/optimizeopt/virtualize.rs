@@ -4933,13 +4933,19 @@ mod tests {
         let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 1024);
 
-        // force_all_lazy_setfields emits the lazy SetfieldGc at JUMP,
-        // which forces the virtual New to be materialized.
+        // force_all_lazy_setfields re-sends the lazy SetfieldGc through the
+        // chain with emit=False (heap.py:136 force_lazy_set). SETFIELD_GC is
+        // in the earlyforce exempt set, so its virtual value is NOT forced —
+        // the New stays virtual and the store is re-absorbed (dropped). Only
+        // the Jump survives; the field relationship is carried across the JUMP
+        // via the imported heap cache.
         let new_count = result.iter().filter(|op| op.opcode == OpCode::New).count();
         assert_eq!(
-            new_count, 1,
-            "virtual New should be materialized when lazy SetfieldGc is emitted at Jump; got {result:?}"
+            new_count, 0,
+            "virtual New stored via lazy SetfieldGc stays virtual at Jump (SETFIELD_GC is earlyforce-exempt); got {result:?}"
         );
+        let opcodes: Vec<_> = result.iter().map(|op| op.opcode).collect();
+        assert_eq!(opcodes, vec![OpCode::Jump]);
     }
 
     // OptHeap's `force_from_effectinfo` path (heap.rs:2584) selectively
