@@ -221,11 +221,11 @@ fn build_semantic_program_via_active_frontend(
 ///
 /// The two gates together match the production fingerprint:
 /// `pyre-jit-trace/build.rs` calls
-/// `analyze_multiple_pipeline_with_modules` with ≈100 files and a
-/// per-file `module_path`.  Tests via
-/// `analyze_multiple_pipeline_with_config` pass empty module
-/// paths and stay below the floor, so auto-discovery does not
-/// silently swap their front-end.
+/// `analyze_multiple_pipeline_with_modules` with ≈100 per-file
+/// `module_path`s.  Non-production callers (test fixtures and the
+/// 5-module `generated::PYRE_JIT_GRAPH_MODULES` manifest) stay below
+/// the floor, so auto-discovery does not silently swap their
+/// front-end.
 ///
 /// The workspace root is anchored at compile time via
 /// `env!("CARGO_MANIFEST_DIR")` — `<workspace>/majit/majit-translate`
@@ -371,20 +371,18 @@ pub struct HostStaticAddrs<'a> {
 
 /// Multi-file analysis with explicit per-source module paths.
 ///
-/// `sources` and `module_paths` are parallel slices of equal length:
-/// `module_paths[i]` is the crate-stripped module path of `sources[i]`
-/// (e.g. `"intobject"` for `pyre_object/src/intobject.rs`).  The graph
-/// surface itself comes from the Charon-extracted LLBC set; the
-/// `module_paths` slice drives the workspace LLBC auto-discovery
-/// production fingerprint and stays available for per-file lexical
-/// resolution.  `sources` is retained for the parallel-slice length
-/// contract.
+/// `module_paths[i]` is the crate-stripped module path of the i-th
+/// analyzed source file (e.g. `"intobject"` for
+/// `pyre_object/src/intobject.rs`).  The graph surface itself comes
+/// from the Charon-extracted LLBC set; the `module_paths` slice drives
+/// the workspace LLBC auto-discovery production fingerprint and stays
+/// available for per-file lexical resolution.  Source text is not
+/// consumed — callers pass paths only.
 ///
 /// An empty `module_paths[i]` keeps simple-name registration only —
 /// runtime convergence is then handled solely by the
 /// `build_object_descr_group_with_def_path` dual-publish.
 pub fn analyze_multiple_pipeline_with_modules(
-    sources: &[&str],
     module_paths: &[&str],
     config: &AnalyzeConfig,
     layout_provider: Option<&dyn layout::LayoutProvider>,
@@ -392,11 +390,6 @@ pub fn analyze_multiple_pipeline_with_modules(
     fnaddr_bindings: &FnAddrBindings<'_>,
     static_addrs: HostStaticAddrs<'_>,
 ) -> pipeline::ProgramPipelineResult {
-    assert_eq!(
-        sources.len(),
-        module_paths.len(),
-        "analyze_multiple_pipeline_with_modules: parallel slices must have equal length",
-    );
     analyze_pipeline_from_module_paths(
         module_paths,
         config,
@@ -1175,7 +1168,7 @@ fn analyze_pipeline_from_module_paths(
     // `warmspot.py::portal_runner` and the single graph seeded into
     // `find_all_graphs(portal, policy)` at `call.py:57`. When the graph
     // set does not include pyre-jit/src/eval.rs (e.g. compact test
-    // inputs whose PYRE_JIT_GRAPH_SOURCES stops at pyre-interpreter),
+    // inputs whose PYRE_JIT_GRAPH_MODULES stops at pyre-interpreter),
     // fall back to `execute_opcode_step` so those tests retain a portal
     // target. `execute_opcode_step` itself is a handler reached from the
     // real portal's match arm, so seeding BFS from it treats a handler

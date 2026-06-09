@@ -53,11 +53,11 @@ pub struct SemanticFunction {
     /// Owner type for impl methods (e.g. "MyStruct" for `impl MyStruct { fn foo() }`).
     /// Used to construct the full CallPath for return_type registration.
     pub self_ty_root: Option<String>,
-    /// Module path of the defining file, as supplied to
-    /// `parse_source_with_module` (e.g. `"pyframe"` for
-    /// `pyre-interpreter/src/pyframe.rs`).  Empty when the caller did not
-    /// supply a module path — top-level items remain at simple-name
-    /// registration.
+    /// Module path of the defining file, crate-stripped (e.g.
+    /// `"pyframe"` for `pyre-interpreter/src/pyframe.rs`), populated by
+    /// `front::mir` from the module portion of Charon's `name_path()`.
+    /// Empty when the producer did not supply a module path — top-level
+    /// items remain at simple-name registration.
     ///
     /// Used by `lib.rs` registration so a free function's call sites that
     /// were qualified by `canonical_call_target:7494-7502` (single-segment

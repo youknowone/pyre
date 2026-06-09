@@ -149,7 +149,7 @@ fn test_make_jitcodes_produces_graph_keyed_output() {
 }
 
 /// Resolve workspace LLBC artefacts and export `PYRE_MIR_FRONTEND_LLBC`
-/// when they exist. The 5-source `PYRE_JIT_GRAPH_SOURCES` fixture used
+/// when they exist. The 5-module `PYRE_JIT_GRAPH_MODULES` fixture used
 /// by `generated::with_all_jitcodes` falls below the production
 /// auto-discovery floor (>=50 parsed_files), so test invocations must
 /// opt in explicitly. Returns `false` when the artefacts are absent so

@@ -47,10 +47,10 @@
 //! verbatim; the per-CodeObject delta is only the `PyJitCodeMetadata`
 //! sidecar.
 //!
-//! ## Source-only descr resolution
+//! ## Build-time descr resolution
 //!
 //! The build-time portal jitcode (`eval_loop_jit`) is produced by the
-//! source-only translator
+//! build-time translator pipeline
 //! (`analyze_multiple_pipeline_with_modules`), so
 //! 100% of its `'d'`/`'j'` operand sites resolve through the **global
 //! pool**. The per-jitcode `exec.descrs` is dead weight for portal

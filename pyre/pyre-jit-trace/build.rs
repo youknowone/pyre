@@ -141,17 +141,19 @@ fn real_main() {
     let pyre_base = format!("{manifest_dir}/..");
     let repo_root = format!("{manifest_dir}/../..");
 
-    // Collect ALL source files from the active interpreter crates.
+    // Collect ALL source file paths from the active interpreter crates.
+    // Only the paths are consumed — module-path derivation below plus
+    // `cargo::rerun-if-changed` tracking; the graph bodies come from the
+    // Charon-extracted LLBC set, so the file contents are never read.
     let source_dirs = [
         format!("{pyre_base}/pyre-object/src"),
         format!("{pyre_base}/pyre-interpreter/src"),
     ];
 
-    let mut sources = Vec::new();
     let mut source_paths = Vec::new();
 
     for dir in &source_dirs {
-        collect_rs_files(dir, &mut sources, &mut source_paths);
+        collect_rs_files(dir, &mut source_paths);
     }
 
     // Include the portal canonical source so
@@ -175,7 +177,7 @@ fn real_main() {
     // would inflate analysis time and risk pulling unrelated
     // helpers into `find_all_graphs(portal)` BFS.
     let eval_path = format!("{pyre_base}/pyre-jit/src/eval.rs");
-    collect_single_file(&eval_path, &mut sources, &mut source_paths);
+    collect_single_file(&eval_path, &mut source_paths);
 
     // `materialize_virtual_from_rd` (`pyre-jit/src/eval.rs`) destructures
     // `majit_ir::RdVirtualInfo` enum variants whose named fields carry
@@ -190,11 +192,11 @@ fn real_main() {
     // majit-ir which would inflate analysis time and pull JIT
     // infrastructure into the user-code BFS.
     let resoperation_path = format!("{repo_root}/majit/majit-ir/src/resoperation.rs");
-    collect_single_file(&resoperation_path, &mut sources, &mut source_paths);
+    collect_single_file(&resoperation_path, &mut source_paths);
 
     eprintln!(
-        "[pyre-jit-trace build.rs] reading {} source files from {} dirs (+ pyre-jit/src/eval.rs): {:?}",
-        sources.len(),
+        "[pyre-jit-trace build.rs] collected {} source paths from {} dirs (+ pyre-jit/src/eval.rs): {:?}",
+        source_paths.len(),
         source_dirs.len(),
         source_paths,
     );
@@ -205,7 +207,6 @@ fn real_main() {
     // graph rewrite can recognize `next_instr`, `valuestackdepth`, and
     // `locals_cells_stack_w[*]` as virtualizable accesses before legacy
     // TracePattern classification runs.
-    let source_refs: Vec<&str> = sources.iter().map(|s| s.as_str()).collect();
     let analyze_config = majit_translate::AnalyzeConfig {
         pipeline: majit_translate::PipelineConfig {
             transform: majit_translate::GraphTransformConfig {
@@ -265,9 +266,9 @@ fn real_main() {
         pytypes: &static_pytype_addrs,
         refs: &static_ref_addrs,
     };
-    // Per-source crate-stripped module paths — feeds
-    // `parse::parse_source_with_module` so analyzer-side metadata
-    // records `struct_origins[bare_name] = module_path`.  Aligns with
+    // Per-source crate-stripped module paths — the analyzer-side
+    // metadata (`front::mir`) records
+    // `struct_origins[bare_name] = module_path`.  Aligns with
     // the runtime's `build_object_descr_group_with_def_path` qualified
     // def-path slot in `gc_cache._cache_size` so a future
     // `path_hash(canonical_struct_name)` analyzer hash lands on the
@@ -279,7 +280,6 @@ fn real_main() {
         .collect();
     let module_path_refs: Vec<&str> = module_paths.iter().map(|s| s.as_str()).collect();
     let pipeline = majit_translate::analyze_multiple_pipeline_with_modules(
-        &source_refs,
         &module_path_refs,
         &analyze_config,
         None,
@@ -443,10 +443,6 @@ fn real_main() {
         println!("cargo::rerun-if-changed={path}");
     }
     emit_rerun_if_changed_recursive(&format!("{repo_root}/majit/majit-translate/src"));
-    println!(
-        "cargo::rerun-if-changed={}",
-        format!("{repo_root}/majit/majit-translate/build.rs")
-    );
     println!("cargo::rerun-if-changed=src/virtualizable_spec.rs");
     println!("cargo::rerun-if-changed=src/call_spec.rs");
     // The mir-frontend analysis derives `jit_trace_gen.rs` from
@@ -547,12 +543,9 @@ fn module_path_from_source_file(path: &str) -> String {
     normalized.replace('/', "::")
 }
 
-fn collect_single_file(path: &str, sources: &mut Vec<String>, paths: &mut Vec<String>) {
-    match std::fs::read_to_string(path) {
-        Ok(content) => {
-            paths.push(path.to_string());
-            sources.push(content);
-        }
+fn collect_single_file(path: &str, paths: &mut Vec<String>) {
+    match std::fs::metadata(path) {
+        Ok(_) => paths.push(path.to_string()),
         Err(e) => {
             eprintln!("[pyre-jit-trace build.rs] warning: cannot read {path}: {e}");
         }
@@ -572,23 +565,13 @@ fn collect_single_file(path: &str, sources: &mut Vec<String>, paths: &mut Vec<St
 /// and `SomeInstance.getattr on classdef-less instance` while macOS
 /// passes).  Stable lexicographic order makes the build reproducible
 /// and lets one fix cover every platform.
-fn collect_rs_files(dir: &str, sources: &mut Vec<String>, paths: &mut Vec<String>) {
+fn collect_rs_files(dir: &str, paths: &mut Vec<String>) {
     for entry in WalkDir::new(dir).sort_by_file_name() {
         let Ok(entry) = entry else { continue };
         if !entry.file_type().is_file() || entry.path().extension().is_none_or(|ext| ext != "rs") {
             continue;
         }
-        let path = entry.path();
-        let path_str = path.to_string_lossy().to_string();
-        match std::fs::read_to_string(path) {
-            Ok(content) => {
-                paths.push(path_str);
-                sources.push(content);
-            }
-            Err(e) => {
-                eprintln!("[pyre-jit-trace build.rs] warning: cannot read {path_str}: {e}");
-            }
-        }
+        paths.push(entry.path().to_string_lossy().to_string());
     }
 }
 

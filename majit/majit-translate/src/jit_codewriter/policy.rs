@@ -19,7 +19,7 @@
 //! boundary.
 //!
 //! Pyre converges on the same observable behaviour through a different
-//! mechanism: the `PYRE_JIT_GRAPH_SOURCES` whitelist in
+//! mechanism: the `PYRE_JIT_GRAPH_MODULES` whitelist in
 //! `generated.rs` plus `CallControl::register_function_graph` plays the
 //! role of the allowed-module set. A callee whose `CallPath` is not
 //! present in `CallControl::function_graphs` is treated as residual at

@@ -98,47 +98,39 @@
 //!   existing `CodeWriter::transform_graph_to_jitcode` without per-arm
 //!   special cases.
 //!
-//! ## Source embedding
-//!
-//! pyre-interpreter source is pulled in with `include_str!`. `build.rs`
-//! additionally emits `cargo:rerun-if-changed=...` on the same paths so
-//! cargo rebuilds this crate when either source file changes.
-
 use std::cell::OnceCell;
 
 pub use crate::codewriter::AllJitCodes;
 
-/// TODO: Rust source → FunctionGraph bridge. RPython's
-/// rtyper has already produced `translator.graphs` before codewriter runs;
-/// pyre lacks that pre-processing and must embed the source here.
-///
 /// This is the pyre-side equivalent of upstream's "reachable graph set"
 /// consumed by `rpython/jit/codewriter/codewriter.py:74 make_jitcodes`.
-/// The manifest must cover every Rust source file that defines a
+/// The manifest must cover every source module that defines a
 /// function reachable by `direct_call` from a handler graph. pyre's
 /// `analyze_multiple_pipeline_with_modules` resolves cross-file `direct_call`s
-/// against the union of `function_graphs` from every source in this
-/// list; a callee defined in a file absent from the manifest would be
+/// against the union of `function_graphs` from every module in this
+/// list; a callee defined in a module absent from the manifest would be
 /// emitted as a residual call (or panic during drain) even though
-/// upstream treats it as inlinable graph.
+/// upstream treats it as inlinable graph.  The graph bodies themselves
+/// come from the Charon-extracted workspace LLBC set, resolved at
+/// pipeline run time — no source text is embedded.
 ///
 /// Current roots:
-/// - `pyre-interpreter/src/pyopcode.rs` — freestanding `opcode_*`
-///   handlers.
-/// - `pyre-interpreter/src/eval.rs` — `PyFrame` trait impls
+/// - `pyopcode` (`pyre-interpreter/src/pyopcode.rs`) — freestanding
+///   `opcode_*` handlers.
+/// - `eval` (`pyre-interpreter/src/eval.rs`) — `PyFrame` trait impls
 ///   (LocalOpcodeHandler / SharedOpcodeHandler / ControlOpcodeHandler
 ///   / …).
-/// - `pyre-interpreter/src/pyframe.rs` — inherent `impl PyFrame`
-///   helpers (push / pop / peek / check_exc_match).
-/// - `pyre-interpreter/src/shared_opcode.rs` — freestanding
-///   `opcode_make_function`, `opcode_call`,
+/// - `pyframe` (`pyre-interpreter/src/pyframe.rs`) — inherent
+///   `impl PyFrame` helpers (push / pop / peek / check_exc_match).
+/// - `shared_opcode` (`pyre-interpreter/src/shared_opcode.rs`) —
+///   freestanding `opcode_make_function`, `opcode_call`,
 ///   `opcode_build_{list,tuple,map}`, `opcode_store_subscr`,
 ///   `opcode_list_append`, `opcode_unpack_sequence`, `opcode_load_attr`,
 ///   `opcode_store_attr`. These are imported at `pyopcode.rs:6` and
 ///   called directly from default trait methods (pyopcode.rs:821).
 ///   Before their inclusion, `analyze_multiple_pipeline_with_modules` would report
 ///   them as unresolved `direct_call` targets.
-/// - `pyre-jit/src/eval.rs` — portal runner `eval_loop_jit`
+/// - `eval` (`pyre-jit/src/eval.rs`) — portal runner `eval_loop_jit`
 ///   (pyre analogue of upstream `warmspot.py::portal_runner`) and
 ///   its resume/allocation helpers (`allocate_struct`,
 ///   `allocate_with_vtable`). Seeding this root lets
@@ -146,34 +138,14 @@ pub use crate::codewriter::AllJitCodes;
 ///   `setup_jitdriver`; opcode handlers become BFS callees, not
 ///   entry points.
 ///
-/// `build.rs` carries a parallel `cargo:rerun-if-changed=...` entry for
-/// every string in this manifest; keep the two lists in lock-step.
-/// `(source_text, crate-stripped module_path)` pairs.  The module path
-/// matches the form `pyre-jit-trace/build.rs::module_path_from_source_file`
-/// emits, so analyzer-side `struct_origins[bare_name] = module_path` and
+/// Crate-stripped module paths, matching the form
+/// `pyre-jit-trace/build.rs::module_path_from_source_file` emits, so
+/// analyzer-side `struct_origins[bare_name] = module_path` and
 /// `canonical_struct_name` produce the same canonical spelling
 /// the runtime + production analyser pipeline produce.  Empty module
 /// path (test fixtures that bypass module wiring) is reserved for
 /// `parse_source`; here every entry carries its real module path.
-const PYRE_JIT_GRAPH_SOURCES: &[(&str, &str)] = &[
-    (
-        include_str!("../../../pyre/pyre-interpreter/src/pyopcode.rs"),
-        "pyopcode",
-    ),
-    (
-        include_str!("../../../pyre/pyre-interpreter/src/eval.rs"),
-        "eval",
-    ),
-    (
-        include_str!("../../../pyre/pyre-interpreter/src/pyframe.rs"),
-        "pyframe",
-    ),
-    (
-        include_str!("../../../pyre/pyre-interpreter/src/shared_opcode.rs"),
-        "shared_opcode",
-    ),
-    (include_str!("../../../pyre/pyre-jit/src/eval.rs"), "eval"),
-];
+const PYRE_JIT_GRAPH_MODULES: &[&str] = &["pyopcode", "eval", "pyframe", "shared_opcode", "eval"];
 
 thread_local! {
     /// Per-thread cache for the pyre-interpreter JitCode registry.
@@ -207,8 +179,8 @@ pub fn with_all_jitcodes<R>(f: impl FnOnce(&AllJitCodes) -> R) -> R {
 fn build() -> AllJitCodes {
     // Full canonical pipeline — the same entry point the
     // `test_analyze_pipeline_runs_canonical_graph_path` integration test
-    // exercises. Builds a `SemanticProgram` from the embedded sources
-    // listed in `PYRE_JIT_GRAPH_SOURCES`, runs `analyze_program`,
+    // exercises. Builds a `SemanticProgram` from the LLBC modules
+    // listed in `PYRE_JIT_GRAPH_MODULES`, runs `analyze_program`,
     // collects trait impls + inherent impl methods with full
     // struct-field / return-type / known-struct context, wires up
     // jitdriver / portal / oopspec metadata, then calls
@@ -225,7 +197,7 @@ fn build() -> AllJitCodes {
     //
     // The blocker is wider than "need a binding table":
     //
-    // - Many graphs in `PYRE_JIT_GRAPH_SOURCES` are generic source-level
+    // - Many graphs in `PYRE_JIT_GRAPH_MODULES` are generic source-level
     //   functions, e.g. `pyopcode.rs` / `shared_opcode.rs`
     //   `opcode_*<H: ...>` helpers and trait default methods on
     //   `OpcodeStepExecutor`. A source graph like
@@ -244,11 +216,8 @@ fn build() -> AllJitCodes {
     // JitCode bodies, but intentionally not for `fnaddr`. The symbolic
     // fallback is therefore part of the current API contract and is locked
     // down by the unit tests below.
-    let sources: Vec<&str> = PYRE_JIT_GRAPH_SOURCES.iter().map(|(s, _)| *s).collect();
-    let module_paths: Vec<&str> = PYRE_JIT_GRAPH_SOURCES.iter().map(|(_, m)| *m).collect();
     let result = crate::analyze_multiple_pipeline_with_modules(
-        &sources,
-        &module_paths,
+        PYRE_JIT_GRAPH_MODULES,
         &crate::AnalyzeConfig::default(),
         None,
         &|_, _| None,
