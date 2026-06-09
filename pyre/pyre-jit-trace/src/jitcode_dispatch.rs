@@ -4595,18 +4595,9 @@ fn try_walker_store_subscr_specialization(
     }
     // Specialized IR recorded.  Heap mutation: invoke the helper
     // concretely so the next read of the container sees the updated
-    // value.  `bh_store_subscr_fn(obj, key, value) -> i64` returns 0 on
-    // success, non-zero on raise.  STORE_SUBSCR's effect-info is
-    // `MayForce + CanRaise`; on raise the specialization gate is wrong
-    // (recorded IR assumes success), so abort the specialization by
-    // returning `None` to surface a SubRaise via the standard path.
-    //
-    // Step 5.5b will refactor the post-mutation raise handling to share
-    // the dispatcher's `walker_record_guard_exception` + `SubRaise`
-    // flow.  For 5.5a's env-gated rollout, decline on raise so the
-    // blackbox path handles it end-to-end.
-    // `bh_store_subscr_fn` returns 1 on success, 0 on raise
-    // (with the exception object stashed in `BH_LAST_EXC_VALUE`).
+    // value.  `bh_store_subscr_fn(obj, key, value) -> i64` returns 1 on
+    // success, 0 on raise (with the exception object stashed in
+    // `BH_LAST_EXC_VALUE`).
     let success = unsafe {
         let store_subscr_fn: extern "C" fn(i64, i64, i64) -> i64 =
             std::mem::transmute(expected_fn_addr as *const ());
@@ -4617,6 +4608,29 @@ fn try_walker_store_subscr_specialization(
         )
     };
     if success == 0 {
+        // `pyjitpl.py:2156-2168 handle_possible_exception` parity: drain
+        // the helper's stashed exception into `ctx.last_exc_value*`,
+        // record `GuardException` against the specialized IR, and
+        // surface `SubRaise` so the caller doesn't fall through to the
+        // generic residual-call path (which would re-record a second IR
+        // call against the same opcode position).
+        let bh_exc = majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| {
+            let v = c.get();
+            c.set(0);
+            v
+        });
+        if bh_exc != 0 {
+            let exc = ctx.trace_ctx.const_ref(bh_exc);
+            let exc_concrete =
+                ConcreteValue::Ref(bh_exc as usize as pyre_object::PyObjectRef);
+            ctx.last_exc_value = Some(exc);
+            ctx.last_exc_value_concrete = exc_concrete;
+            walker_record_guard_exception(ctx, op.pc);
+            return Some(DispatchOutcome::SubRaise { exc, exc_concrete });
+        }
+        // Defensive: helper returned 0 but did not stash an exception.
+        // Decline specialization so the generic path's
+        // `execute_residual_call` decides the dispatch.
         return None;
     }
     // pyjitpl.py:2659 `_record_helper_varargs`: STORE_SUBSCR mutates the
