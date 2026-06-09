@@ -670,14 +670,6 @@ struct SpamBlock {
     framestate: Option<FrameState>,
     /// `flowcontext.py:41` `block.dead`.
     dead: bool,
-    /// Per-block ssarepr accumulator — pyre-side mirror of upstream
-    /// `block.operations` recorded inside `record_block`
-    /// (`flowcontext.py:407-416`).  Populated alongside the program-
-    /// wide `ssarepr.insns` push so a post-walk `flatten_graph` can
-    /// iterate `graph.iterblocks()` and consume the per-block emit
-    /// sequence in graph-DFS order, matching
-    /// `codewriter.py:53 flatten_graph(graph, regallocs, cpu=...)`.
-    per_block_ssarepr: Vec<super::flatten::Insn>,
 }
 
 #[derive(Debug, Clone)]
@@ -689,7 +681,6 @@ impl SpamBlockRef {
             block,
             framestate,
             dead: false,
-            per_block_ssarepr: Vec::new(),
         })))
     }
 
@@ -716,12 +707,9 @@ impl SpamBlockRef {
         // forwarding stubs (predecessors that already named this
         // block as target follow the single recloseblock link
         // through it), but their `operations` is the empty tuple so
-        // serialization yields nothing.  Pyre's per-block SSA
-        // accumulator is the moral equivalent of `block.operations`
-        // for the walker emit path, so clearing it here matches
-        // upstream: dead blocks stay in `all_walker_blocks` and the
-        // drain still enumerates them, but they yield no insns.
-        spam.per_block_ssarepr.clear();
+        // serialization yields nothing.  The canonical splice reads
+        // `block.dead` and skips dead blocks, so the empty-operations
+        // semantics is satisfied by the flow::Block flag alone.
         // Mirror onto the underlying flow::Block so flatten_graph and
         // any post-walker graph traversal can see the dead status
         // without needing the SpamBlockRef wrapper (matching upstream
@@ -732,16 +720,6 @@ impl SpamBlockRef {
 
     fn dead(&self) -> bool {
         self.0.borrow().dead
-    }
-
-    /// Push an `Insn` into the per-block accumulator.  Mirrors the
-    /// per-op `block.operations.append(op)` line that
-    /// `flowcontext.py:407-416 record_block` runs inside the recorder
-    /// loop.  Walker emit macros call this alongside their program-
-    /// wide `ssarepr.insns.push(...)` so the per-block shadow stays
-    /// in sync with the production stream.
-    fn push_insn(&self, insn: super::flatten::Insn) {
-        self.0.borrow_mut().per_block_ssarepr.push(insn);
     }
 }
 
@@ -757,17 +735,6 @@ impl std::hash::Hash for SpamBlockRef {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         Rc::as_ptr(&self.0).hash(state);
     }
-}
-
-/// Walker emit helper — pushes `insn` into `current_block`'s
-/// per-block accumulator.  The program-wide `ssarepr.insns` is
-/// populated post-walk via the drain swap at
-/// `transform_graph_to_jitcode`'s end (matching `codewriter.py:53
-/// flatten_graph(graph, regallocs, cpu)`).  Every walker emit site
-/// uniformly routes through this helper — no direct
-/// `ssarepr.insns.push` calls remain in production.
-fn push_walker_emit(current_block: &SpamBlockRef, insn: super::flatten::Insn) {
-    current_block.push_insn(insn);
 }
 
 /// Build-side liveness resolver: derive, from an SSARepr's OWN
@@ -1935,8 +1902,8 @@ fn make_next_block(
     newstate.next_offset = next_offset;
     let newblock = SpamBlockRef::new(graph.new_block(Vec::new()), Some(newstate.clone()));
     // Track every walker-created block in walker-visit order so the
-    // post-walk drain can iterate per-block accumulators in the same
-    // order their emits reached the program-wide `ssarepr.insns`.
+    // post-walk slot-pairing seed and the canonical splice iterate
+    // blocks deterministically.
     all_walker_blocks.push(newblock.clone());
     newblock.block().borrow_mut().inputargs = newstate.getvariables();
     append_exit(
@@ -3928,10 +3895,9 @@ impl CodeWriter {
         // __init__ argument; majit's JitCodeBuilder::set_name mirrors that).
         let mut assembler = SSAReprEmitter::new();
         assembler.set_name(code.obj_name.to_string());
-        // Grow an `SSARepr` per-block via `push_walker_emit`; at drain
-        // time the per-block accumulators concatenate into
-        // `ssarepr.insns` which feeds
-        // `jit::assembler::Assembler::assemble`.
+        // `ssarepr.insns` is produced post-walk by the canonical splice
+        // (`flatten_graph`) from the graph's `block.operations`; it then
+        // feeds `jit::assembler::Assembler::assemble`.
         let mut ssarepr = SSARepr::new(code.obj_name.to_string());
 
         // Walker slot bridge: each entry maps a graph `Variable.id`
@@ -4206,10 +4172,9 @@ impl CodeWriter {
         let mut joinpoints: VecMap<usize, Vec<SpamBlockRef>> = VecMap::new();
         let start_state = entry_frame_state(code, frame_inputs);
         // Collect every walker-created block in walker-visit order so the
-        // post-walk drain can iterate per-block accumulators in the same
-        // order their pushes reached `ssarepr.insns`.  Each block's
-        // accumulator receives emits contiguously between the block's
-        // first `emit_mark_label_pc!` and its terminator.
+        // post-walk slot-pairing seed and the canonical splice iterate
+        // blocks deterministically (HashMap iteration order would
+        // otherwise diverge bridge-fallback Variable colors).
         let mut all_walker_blocks: Vec<SpamBlockRef> = Vec::new();
         if num_instrs > 0 {
             let start_block =
@@ -4220,9 +4185,10 @@ impl CodeWriter {
         // Catch landings live on `ExceptionCatchSite::landing` (decode-
         // time SpamBlockRef::new with framestate=None) and are NOT pushed
         // to `all_walker_blocks` at creation — they're queued at emission
-        // time inside `emit_mark_label_catch_landing!` so the drain order
-        // reflects walker emission order (catch landings emit AFTER the
-        // main walker loop completes per `codewriter.rs::6907+`).
+        // time inside `emit_mark_label_catch_landing!` so their position
+        // in `all_walker_blocks` reflects walker emission order (catch
+        // landings emit AFTER the main walker loop completes per
+        // `codewriter.rs::6907+`).
         // The walker emits into `current_block`; `emit_mark_label_pc!` and
         // `emit_mark_label_catch_landing!` reassign it as the walker enters
         // each block. Initialised to the first PC block so the
@@ -4803,13 +4769,10 @@ impl CodeWriter {
         macro_rules! emit_mark_label_pc {
             ($py_pc:expr) => {{
                 let py_pc = $py_pc;
-                // NOTE: the program-wide `ssarepr.insns` Label push is
-                // DEFERRED until the switch check below.  When the
-                // gate is on and a switch is detected, both ssarepr
-                // and per_block_ssarepr stay un-pushed at this PC —
-                // the new block's outer iter will emit its own Label
-                // at PC=py_pc.  When no switch (gate off or same
-                // block), push Label to ssarepr + per_block.
+                // Block boundaries (`Label`) are produced by the
+                // canonical splice from the graph, not emitted here.
+                // This macro only manages the walker's block
+                // transition at `py_pc`:
                 // if the previous block still needs
                 // a fallthrough edge AND we're not already standing in
                 // the block for `py_pc`, attach one before switching
@@ -4998,13 +4961,6 @@ impl CodeWriter {
                     // joinpoints[py_pc] now points at new_block ==
                     // current_block at that point).
                     //
-                    // Emit `goto Label("pcN")` + `Unreachable` into
-                    // the previous block's per-block accumulator
-                    // (mirrors `flatten.py:177-258 insert_exits`)
-                    // before yielding, so the per-block stream
-                    // routes via explicit goto rather than implicit
-                    // fallthrough to whichever block lands next in
-                    // walker-pop order.
                     // The graph edge from `current_block` to `new_block`
                     // is established by the `mergeblock` above
                     // (`append_exit`); the canonical splice emits the
@@ -5046,10 +5002,10 @@ impl CodeWriter {
                 needs_fallthrough = true;
                 // Emission-order tracking: push the catch landing
                 // block to `all_walker_blocks` AT FIRST EMIT (not at
-                // creation) so the drain order reflects walker
-                // emission order — catch landings emit after the
-                // main walker loop, so creation-order tracking would
-                // misalign with ssarepr.insns ordering.  Guard against
+                // creation) so its position reflects walker emission
+                // order — catch landings emit after the main walker
+                // loop, so creation-order tracking would misalign.
+                // Guard against
                 // double-push: a single catch landing may be entered
                 // multiple times if multiple catch sites share a
                 // landing label (unusual but possible per the
@@ -5483,7 +5439,7 @@ impl CodeWriter {
                 // block.dead: record_block(block)` identity-only check.
                 // Supersede re-walks under widened framestate may
                 // produce duplicate `-live-` markers for a Python PC;
-                // the drain keeps the original dead block's marker as
+                // first-wins keeps the original block's marker as
                 // canonical for `pc_map`.
                 current_block = pending_block;
                 current_state = pending_state;
@@ -5497,8 +5453,9 @@ impl CodeWriter {
                 // drives per-block op accumulation via `while True:
                 // handle_bytecode(...)` until a terminator, then
                 // `record_block` assigns `block.operations` from the
-                // recorder.  Pyre iterates PCs linearly because the walker
-                // emits directly into program-wide `ssarepr.insns`.
+                // recorder.  Pyre iterates PCs linearly; the canonical
+                // splice produces `ssarepr.insns` post-walk from the
+                // graph's `block.operations`.
                 for py_pc in start_pc..num_instrs {
                     // Exception handler entry: Python resets stack depth to the
                     // handler's specified depth and arrives only from
@@ -5596,7 +5553,6 @@ impl CodeWriter {
                                 graph_args,
                                 py_pc as i64,
                             );
-                            let pre_len = ssarepr.insns.len();
                             // Build a Ref-only regallocs that maps the
                             // 3 portal Variables (frame / ec / pycode)
                             // to their pre-assigned register indices.
@@ -5624,9 +5580,6 @@ impl CodeWriter {
                             ];
                             GraphFlattener::new(&graph, &mut portal_regallocs, &mut ssarepr)
                                 .serialize_op(&graph_op);
-                            for insn in ssarepr.insns[pre_len..].iter().cloned() {
-                                current_block.push_insn(insn);
-                            }
                         }
                     }
 
