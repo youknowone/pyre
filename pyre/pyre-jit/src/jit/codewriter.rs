@@ -679,15 +679,6 @@ struct SpamBlock {
     /// sequence in graph-DFS order, matching
     /// `codewriter.py:53 flatten_graph(graph, regallocs, cpu=...)`.
     per_block_ssarepr: Vec<super::flatten::Insn>,
-    /// Length of `per_block_ssarepr` at the moment the multi-pred
-    /// trampoline fallthrough fallback first appended `goto + ---`
-    /// (`emit_trampoline_for_multi_pred_link`).  Insns beyond this
-    /// index are trampoline-tail synthetic, not walker-emitted block
-    /// terminators.  Used by `rewrite_direct_terminator_tlabel` to
-    /// cap its reverse scan so a sibling link's explicit-jump rewrite
-    /// targets the original branch terminator instead of a previously
-    /// appended fallthrough `goto TLabel(target)`.
-    original_terminator_end: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -700,7 +691,6 @@ impl SpamBlockRef {
             framestate,
             dead: false,
             per_block_ssarepr: Vec::new(),
-            original_terminator_end: None,
         })))
     }
 
@@ -787,7 +777,7 @@ impl SpamBlockRef {
     }
 
     /// Move `other`'s per-block accumulator onto the end of `self`'s and clear
-    /// `other` (issue #73 `remove_trivial_links` merge bridge).  Returns the
+    /// `other`, for the `remove_trivial_links` merge bridge.  Returns the
     /// index in `self` where `other`'s insns now begin so callers can re-point
     /// any `-live-` marker offsets recorded against `other`.  `self` and
     /// `other` must be distinct blocks.
@@ -803,13 +793,9 @@ impl SpamBlockRef {
     /// Returns whether a pair was removed.
     ///
     /// Used by the `remove_trivial_links` merge bridge: after absorbing
-    /// `target`'s bytecode, the source's OLD boundary goto would otherwise sit
+    /// `target`'s bytecode, the source's old boundary goto would otherwise sit
     /// in the middle of the merged stream, before the absorbed opcodes.
-    /// `emit_link_renamings_into_block`'s `SourceBeforeTerminator` splice
-    /// forward-scans for the FIRST terminator, so the absorbed link's renamings
-    /// would land before `target`'s opcodes and read stale slots (codex P1,
-    /// PR #127).  Removing the old boundary goto makes `target`'s own
-    /// terminator the first one, so renamings splice after its opcodes.
+    /// Removing it keeps the merged block's byte stream contiguous.
     fn strip_trailing_boundary_goto(&self, label: &str) -> bool {
         let mut b = self.0.borrow_mut();
         let n = b.per_block_ssarepr.len();
@@ -829,12 +815,6 @@ impl SpamBlockRef {
         );
         if tail_unreachable && tail_goto {
             b.per_block_ssarepr.truncate(n - 2);
-            // Keep the original-terminator anchor within bounds.
-            if let Some(end) = b.original_terminator_end {
-                if end > b.per_block_ssarepr.len() {
-                    b.original_terminator_end = Some(b.per_block_ssarepr.len());
-                }
-            }
             true
         } else {
             false
@@ -909,18 +889,18 @@ fn emit_vable_getfield_ref_walker_only(
 /// `walker_tracked_pc_live_indices`.  Resolution is nearest-`-live-`-at-
 /// or-before keyed by each PC's first insn position, so a stream with
 /// SPARSE markers (canonical: one `-live-` per canraise / before
-/// `goto_if_not`+`switch`, not one per PC — see #282/#116) reconstructs
-/// the same dense feed.  This is the prerequisite resolver for #287 to
-/// stop emitting a per-PC `-live-` while the runtime keeps its dense
-/// `pc_map`; #287 will wire it as the `None` branch of
+/// `goto_if_not`+`switch`, not one per PC) reconstructs
+/// the same dense feed.  This is the prerequisite resolver for dropping
+/// the per-PC `-live-` emission while the runtime keeps its dense
+/// `pc_map`; it backs the `None` branch of
 /// `filter_liveness_in_place`.
 ///
-/// Branch-guard PCs (#281) are re-keyed off their guard-op position, not
+/// Branch-guard PCs are re-keyed off their guard-op position, not
 /// their first insn: a branch guard emits its condition ops BEFORE its
 /// leading `-live-` marker (flatten.rs:1868-69 / 1971-72), so first-insn
 /// keying resolves to an earlier marker, whereas the runtime resumes a
-/// branch at orgpc = the guard's own pc (#285) and needs the guard's own
-/// leading marker.  Can-raise calls (#286) are re-keyed off their
+/// branch at orgpc = the guard's own pc and needs the guard's own
+/// leading marker.  Can-raise calls are re-keyed off their
 /// FALLTHROUGH pc (`semantic_fallthrough_pc(code, call_pc)`) to the call's
 /// TRAILING `-live-` marker, since the runtime records `fallthrough_pc` (not
 /// the call's own pc) in an `after_residual_call` guard's resume data and a
@@ -932,9 +912,9 @@ fn emit_vable_getfield_ref_walker_only(
 /// its own (absent from `pc_first_insn_pos`) or no `-live-` marker
 /// precedes its position.  Absent PCs are deliberately NOT forward-filled
 /// from the preceding PC: a `jit_merge_point` loop-header PC is not
-/// structurally enumerable from the stream (the #286 gap), and masking it
-/// behind a neighbour's marker would hide exactly the resume target #286
-/// must still resolve separately.
+/// structurally enumerable from the stream, and masking it behind a
+/// neighbour's marker would hide a resume target that the can-raise
+/// fallthrough keying must still resolve separately.
 fn derive_pc_live_indices_from_sparse(
     ssarepr: &super::flatten::SSARepr,
     n_pcs: usize,
@@ -971,7 +951,7 @@ fn derive_pc_live_indices_from_sparse(
     // `JUMP_BACKWARD` / `JUMP_BACKWARD_NO_INTERRUPT`), or `None` for any
     // other opcode.  An unconditional jump emits no resume-relevant jitcode
     // of its own: the blackhole steps it and lands at the target, so its
-    // resume liveness IS the target block's.  Used by the #308 break-arm
+    // resume liveness IS the target block's.  Used by the break-arm
     // re-key below (matches the target computation in
     // `trace_opcode.rs::record_branch_guard` and `liveness.rs`).
     let uncond_jump_target = |pc: usize| -> Option<usize> {
@@ -990,7 +970,7 @@ fn derive_pc_live_indices_from_sparse(
         }
     };
     // Branch guards (`goto_if_not` / `goto_if_not_*` / `switch`) resume at
-    // orgpc = the guard's OWN bytecode pc (#285) — i.e. the opcode START,
+    // orgpc = the guard's OWN bytecode pc — i.e. the opcode START,
     // which is exactly the PC's first-insn keying (the default above).  The
     // guard's leading `-live-` (immediately before the terminator) is NOT a
     // valid resume target under pyre's Ref-only resume contract: the
@@ -1002,7 +982,7 @@ fn derive_pc_live_indices_from_sparse(
     // forward re-derives the condition correctly — mirroring the blackhole
     // re-running the bytecode opcode from orgpc.  So leave `pos_for_pc` at
     // the PC's first insn; no branch-guard re-key.
-    // Can-raise fallthrough re-key (#286): a can-raise `residual_call` at
+    // Can-raise fallthrough re-key: a can-raise `residual_call` at
     // stream position `q` carries a TRAILING `-live-` at `q+1`
     // (jtransform.py:467-482, flatten.rs:1373).  When the call raises the
     // runtime resumes at the call's FALLTHROUGH py_pc — not the call's own
@@ -1017,7 +997,7 @@ fn derive_pc_live_indices_from_sparse(
     // `MIFrame::fallthrough_pc`, so the resolver's fallthrough matches the
     // runtime's recorded resume pc exactly.  Applied AFTER the branch re-key
     // so it WINS when a fallthrough PC is also the owner-rounded target of a
-    // branch re-key (#281 keys `owner_pc(guard)`, which rounds back to this
+    // branch re-key (keys `owner_pc(guard)`, which rounds back to this
     // canraise's fallthrough PC when the guard's own pc is stack-only — e.g.
     // `i % 7 == 0`: the `%` fallthrough is the `==` PC, whose block ends in
     // the branch; the branch's real resume pc is the `==` fallthrough, served
@@ -1041,7 +1021,7 @@ fn derive_pc_live_indices_from_sparse(
             // overriding it to the call's trailing marker would strand the
             // unboxed condition (raise_catch goto_if_not).
             if fallthrough < n_pcs && pos_for_pc[fallthrough].is_none() {
-                // Branch-condition re-key (#306): a `truth`/`to_bool`
+                // Branch-condition re-key: a `truth`/`to_bool`
                 // `residual_call` that produces a `goto_if_not` / `switch`
                 // condition is immediately followed (past any adjacent
                 // `-live-` markers) by that branch op.  Its `semantic_
@@ -1072,7 +1052,7 @@ fn derive_pc_live_indices_from_sparse(
                             || opname == "switch")
                 });
                 if is_branch_cond {
-                    // #308: when the branch's semantic fallthrough is itself
+                    // When the branch's semantic fallthrough is itself
                     // an unconditional jump — a `break` / loop-exit arm, e.g.
                     // fannkuch's flip loop `if qq == 0: break` whose not-taken
                     // arm head is a `JUMP_FORWARD` — DON'T re-run the branch.
@@ -1091,11 +1071,11 @@ fn derive_pc_live_indices_from_sparse(
             }
         }
     }
-    // Unconditional-jump forward-carry (#308): a `JUMP_FORWARD` /
+    // Unconditional-jump forward-carry: a `JUMP_FORWARD` /
     // `JUMP_BACKWARD` PC that is a branch's not-taken arm head (a `break` /
     // loop-exit / loop back-edge) emits no resume-relevant jitcode — the
     // blackhole steps it straight to the jump target.  So its resume liveness
-    // is the TARGET block's.  The #306 branch re-key above deliberately
+    // is the TARGET block's.  The branch-condition re-key above deliberately
     // leaves such fallthrough PCs `None`; key them here to the target's
     // position so the resolver lands at the target block's `-live-` (the same
     // place the per-PC walker resumes), not the preceding branch marker the
@@ -1113,7 +1093,7 @@ fn derive_pc_live_indices_from_sparse(
             }
         }
     }
-    // Trivia-PC forward-carry (#308): a stack-only PC that decodes to a
+    // Trivia-PC forward-carry: a stack-only PC that decodes to a
     // no-op opcode (`Cache` / `NotTaken` / `Nop` / `ExtendedArg` / `Resume`)
     // emits no jitcode, so it is absent from `pc_first_insn_pos` and resolves
     // `None` above.  The runtime resumes a branch guard at the not-taken
@@ -1226,42 +1206,6 @@ fn derive_after_call_indices_from_sparse(
     out
 }
 
-/// #281 verify: of the runtime's structural resume targets in a canonical
-/// SSARepr — branch guards (`goto_if_not` / `goto_if_not_*` / `switch`,
-/// each with a LEADING `-live-`, flatten.rs:1868-69 / 1971-72) and
-/// can-raise calls (`residual_call_*` with a TRAILING `-live-`,
-/// flatten.py:206-217) per #285 — measure how
-/// `derive_pc_live_indices_from_sparse` covers them.  Returns
-/// `(branch, branch_keyed, branch_fed, canraise, canraise_fed)`:
-/// - `branch_keyed`: the resolver entry for the guard's OWN owner PC (the
-///   py_pc whose `pc_first_insn_pos` range contains the guard op) equals
-///   the guard's leading marker.  This is the strict invariant the runtime
-///   branch resume needs — it queries `pc_map[orgpc]` = the guard's own pc
-///   (#285: `resume_pc = orgpc` for a non-call guard), so when
-///   `branch_keyed < branch` the pc_first_insn_pos keying picks the wrong
-///   (earlier) marker for those guards and #281 must re-key the resolver to
-///   the guard-op position.
-/// - `branch_fed` / `canraise_fed`: the guard/raise marker appears in the
-///   fed set (the resolver hands it to SOME pc).  Necessary (the marker
-///   reaches the runtime table) but, for branches, weaker than `keyed` (it
-///   may be keyed to the fallthrough pc instead of the guard pc).
-/// - `(branch - branch_fed) + (canraise - canraise_fed)` = stranded resume
-///   markers in NO resolver entry — the (b) safety number.  A stranded
-///   marker is a structural resume point the sparse feed cannot surface
-///   (e.g. a can-raise whose fallthrough pc is stack-only / `nopc`), so a
-///   nonzero count names exactly the resume targets #281 must re-key or
-///   #286 must resolve in the runtime.  Can-raise resume keys on
-///   `fallthrough_pc` not the call's own pc (#285), so only `fed` is
-///   reported for it here; the precise fallthrough-pc keying is #286
-///   runtime work.  Measurement-only; no production caller when the gate is
-///   unset.
-/// color-budget Step A probe helper: per-Register color-budget violation
-/// record `(insn_idx, opname, role, kind_str, color, num_colors)`.
-/// Role distinguishes argument operand vs result register vs nested
-/// `ListOfKind` element so downstream analysis can correlate the
-/// violation with the canonical emit site responsible.
-type Phase4ColorBudgetViolation = (usize, String, &'static str, &'static str, u16, u16);
-
 fn fresh_variable_for_state(
     graph: &mut super::flow::FunctionGraph,
     kind: Option<Kind>,
@@ -1347,7 +1291,7 @@ fn collect_cfg_coalesce_pairs(
     pairs
 }
 
-/// #254: coalesce pairs that force every Variable the walker pinned to
+/// Coalesce pairs that force every Variable the walker pinned to
 /// one frame slot onto a single canonical color.
 ///
 /// `walker_slot_for_variable[v.id]` records the frame slot the walker
@@ -1357,8 +1301,8 @@ fn collect_cfg_coalesce_pairs(
 /// loop) receive distinct colors.  The dense per-slot resume map
 /// (`stack_slot_color_map` / `pyre_color_for_semantic_local`) holds only
 /// ONE color per slot, so a multi-color slot yields an ambiguous
-/// `slot → color` inverse — the `[flatten-splice-color] conflicts` the
-/// #280 splice surfaced.
+/// `slot → color` inverse — the slot-to-color conflict the splice
+/// would otherwise surface.
 ///
 /// Emitting `(first, other)` pairs per slot group requests the regalloc
 /// pre-merge them in `perform_register_allocation_with_pairs`, so each
@@ -1398,7 +1342,7 @@ fn collect_same_slot_coalesce_pairs(
     pairs
 }
 
-/// #304/PR#145①: force every DISTINCT frame-local slot onto a DISTINCT Ref
+/// Force every DISTINCT frame-local slot onto a DISTINCT Ref
 /// color, AND force every frame-local color apart from every stack-slot
 /// color, so the per-slot resume reverse map
 /// (`pyre_color_for_semantic_local` / `stack_slot_color_map` →
@@ -1412,14 +1356,14 @@ fn collect_same_slot_coalesce_pairs(
 /// even though their SSA register live ranges are disjoint (each
 /// `LOAD_FAST` re-reads the local from the virtualizable, so the local's
 /// SSA value dies between reads — mult/spectral_norm's `i`/`s`/`j`
-/// otherwise land on one color, #302).
+/// otherwise land on one color).
 ///
 /// Two failure modes, both the same shape — a frame-live local whose value
 /// lives only in a register is shadowed by another frame slot that shares
 /// its color at resume:
-///   * **local ↔ local** (#302): two frame-live locals collapse onto one
+///   * **local ↔ local**: two frame-live locals collapse onto one
 ///     color; the resume reverse map restores one and the other goes stale.
-///   * **local ↔ stack** (PR#145①): a frame-live local shares a color with
+///   * **local ↔ stack**: a frame-live local shares a color with
 ///     a live stack slot; `semantic_ref_slot_for_reg_color` scans the live
 ///     stack prefix first, so the color resolves to the stack slot and the
 ///     local is never restored.
@@ -1485,7 +1429,7 @@ fn collect_distinct_slot_interference_pairs(
     pairs
 }
 
-/// #281 splice-only: reserve Ref colors `[0, nlocals)` for semantic
+/// Splice-only: reserve Ref colors `[0, nlocals)` for semantic
 /// locals, matching the register layout the runtime bridge-resume
 /// (`state.rs::setup_bridge_sym`) assumes.
 ///
@@ -1494,14 +1438,14 @@ fn collect_distinct_slot_interference_pairs(
 /// the resume register is NONE / null". That contract is the walker's:
 /// the walker colors every Python fast local into `[0, nlocals)`. The
 /// splice only colors the locals that survive as graph Variables
-/// (function args plus #304 frame-live body locals); the remaining fast
+/// (function args plus frame-live body locals); the remaining fast
 /// locals are vable-only and leave their colors free, so
 /// `enforce_input_args` (`flatten.py:88-100`) pins the portal
 /// `(frame, ec)` red args — and the chordal coloring can land temps —
 /// inside `[0, nlocals)`. A portal red at color `c < nlocals` then
 /// decodes at bridge resume as fast local `c`, and because the slot
 /// holds a non-null pointer the vable override is skipped, so `LOAD_FAST`
-/// reads the frame pointer as a local (#281 high-N raise_catch
+/// reads the frame pointer as a local (high-N raise_catch
 /// corruption: the loop-carried accumulator reads garbage after an
 /// exception-handler bridge resume).
 ///
@@ -1509,7 +1453,7 @@ fn collect_distinct_slot_interference_pairs(
 /// local (a Variable pinned to a walker slot `< nlocals`) up to a fresh
 /// color `>= num_colors`, applying the same remap to the emitted SSARepr
 /// register operands so they stay consistent with the recolored
-/// `coloring` map. Semantic-local colors stay put (#304 body-local
+/// `coloring` map. Semantic-local colors stay put (body-local
 /// coloring is preserved); vable-only local slots keep their reserved
 /// holes unused. Splice-only — gate-off never calls this, so its coloring
 /// stays byte-identical.
@@ -1567,7 +1511,7 @@ fn reserve_local_ref_colors_in_place(
     super::regalloc::apply_rename(ssarepr, &rename);
 }
 
-/// #304/PR#145①: drop coalesce pairs that would TRANSITIVELY merge a
+/// Drop coalesce pairs that would TRANSITIVELY merge a
 /// frame-local slot with another DISTINCT frame-local slot, or with any
 /// stack slot, into one regalloc group.
 ///
@@ -1579,7 +1523,7 @@ fn reserve_local_ref_colors_in_place(
 /// (mult/m12: `cfg_cross == 0` yet 3 slots collapse to one rep).  Once the
 /// slots share a union-find rep, [`collect_distinct_slot_interference_pairs`]
 /// degenerates to a self-edge no-op and the slots can no longer be
-/// re-separated, so the resume reverse map stays non-injective (#302/①).
+/// re-separated, so the resume reverse map stays non-injective.
 ///
 /// This simulates the same in-order union-find merge the regalloc applies
 /// and skips any pair whose union would place two different frame-local
@@ -1868,8 +1812,7 @@ fn rewrite_dead_forwarder_gotos(all_walker_blocks: &[SpamBlockRef]) {
 
     // Dead forwarders number a handful per graph, so a flat
     // `Vec<(from, to)>` with linear lookup is the right shape — no
-    // RPython dict stands behind this pyre-only byte-rewrite bridge, so
-    // [[feedback-no-hashmap-ever]] applies.
+    // RPython dict stands behind this pyre-only byte-rewrite bridge.
     let mut remap: Vec<(String, String)> = Vec::new();
     for spam in all_walker_blocks {
         let block = spam.block();
@@ -1917,7 +1860,7 @@ fn rewrite_dead_forwarder_gotos(all_walker_blocks: &[SpamBlockRef]) {
     }
 }
 
-/// Issue #73 `remove_trivial_links` merge bridge.
+/// The `remove_trivial_links` merge bridge.
 ///
 /// When `remove_trivial_links` merges `target` into `source`
 /// (`source.recloseblock(*target.exits)`), `target` becomes unreachable in
@@ -1955,7 +1898,6 @@ fn rewrite_trivial_link_merges(
         // Drop source's old boundary `goto target + ---` before appending, so
         // target's own terminator is the first terminator in the merged block
         // and the single-exit renaming splice lands after target's opcodes
-        // (codex P1, PR #127).
         src_spam.strip_trailing_boundary_goto(&super::flatten::block_label_name(target));
         let base = src_spam.absorb_per_block_ssarepr(&tgt_spam);
         // Re-point `-live-` markers: (tgt_spam, off) -> (src_spam, base + off).
@@ -4253,14 +4195,12 @@ impl CodeWriter {
         let mut ssarepr = SSARepr::new(code.obj_name.to_string());
 
         // Walker slot bridge: each entry maps a graph `Variable.id`
-        // to the SSARepr slot the walker assigned when emitting the
-        // dual-write.  `walker_post_walk_insert_renamings`
-        // consults it so post-walk `insert_renamings` emits `<kind>_copy`
-        // ops against the same walker slots the surrounding inline emits
-        // wrote, matching `flatten.py:306-334` color-resolution semantics
-        // under shared regalloc.  Synthetic graph-only Variables (no
-        // walker counterpart) leave their entry as `None` and fall back
-        // to graph regalloc.
+        // to the frame slot the walker assigned that Variable.  The
+        // splice regalloc coalescing consults it to force every Variable
+        // sharing a frame slot onto one canonical Ref color and to keep
+        // distinct slots on distinct colors, so the dense per-slot resume
+        // reverse map stays injective.  Synthetic graph-only Variables
+        // (no walker counterpart) leave their entry as `None`.
         let mut walker_slot_for_variable: Vec<Option<u16>> = Vec::new();
         macro_rules! pin {
             ($var:expr, $slot:expr $(,)?) => {
@@ -4467,8 +4407,7 @@ impl CodeWriter {
                 store_subscr_fn_idx,
                 build_list_fn_idx,
                 build_tuple_fn_idx,
-                // `[u16; 9]` indexed by nargs (0..=8) per
-                // [[feedback-no-hashmap-ever]].  `call_fn_idx` (nargs=1)
+                // `[u16; 9]` indexed by nargs (0..=8).  `call_fn_idx` (nargs=1)
                 // is the unsuffixed binding from line 3153; the suffixed
                 // 0/2..=8 fill the surrounding slots.
                 call_fn_idx_by_nargs: [
@@ -5660,9 +5599,9 @@ impl CodeWriter {
                 // entry and encoded by the assembler as the canonical
                 // leading `r` operand.
                 emit_vable_getfield_ref_walker_only(&current_block, vable_reg, dst, field_idx);
-                // Graph dual-write threads `frame_var.into()`.  As of
-                // Epic #245 Slice 1 `frame_var` is a startblock inputarg
-                // for both portal and non-portal graphs
+                // Graph dual-write threads `frame_var.into()`.  `frame_var`
+                // is a startblock inputarg for both portal and non-portal
+                // graphs
                 // (`graph_entry_inputargs(code, frame_inputs)`), so the
                 // Variable always has a producer.  The dual-write stays
                 // portal-gated here because the non-portal vable readers
@@ -6545,7 +6484,7 @@ impl CodeWriter {
                                 // `setarrayitem_vable_r(locals_cells_stack_w,
                                 // local_slot, w_value)`.  `frame_var` is a
                                 // startblock inputarg for both portal and
-                                // non-portal graphs (Epic #245 Slice 1);
+                                // non-portal graphs;
                                 // the dual-write stays portal-gated until
                                 // the non-portal readers move off the
                                 // shared `portal_frame_reg` slot.
@@ -7047,15 +6986,9 @@ impl CodeWriter {
                                 // body is physically next after
                                 // `goto_if_not`, leaving `linkfalse` to
                                 // reach its `Label(linkfalse)` via
-                                // explicit dispatch.  Walker must match
-                                // this order so the boundary
-                                // `goto pc{TRUE_arm}` emitted by the next
-                                // PC's `emit_mark_label_pc!` strips
-                                // cleanly against the immediately-following
-                                // TRUE arm block (see
-                                // `strip_walker_block_boundary_goto`).
-                                // Mergeblock the fallthrough (TRUE arm)
-                                // FIRST so it pops first from
+                                // explicit dispatch.  Mergeblock the
+                                // fallthrough (TRUE arm) FIRST so it pops
+                                // first from
                                 // `pendingblocks`; `emit_goto_if_not!`
                                 // then appends the FALSE link.  Canonical
                                 // `flatten.rs:1875-1880 insert_exits`
@@ -7153,13 +7086,11 @@ impl CodeWriter {
                                 // and queues fallthrough second.  Unlike
                                 // POP_JUMP_IF_FALSE (whose linktrue IS the
                                 // PC-sequential next block), POP_JUMP_IF_TRUE's
-                                // linktrue is the jump target — the PC-
+                                // linktrue is the jump target, so the PC-
                                 // sequential walker's auto-switch at PC+1
-                                // would inject a `goto pc{PC+1}` boundary
-                                // routing through `emit_mark_label_pc!` that
-                                // `strip_walker_block_boundary_goto` cannot
-                                // elide (next block in walker order is
-                                // target_block, not fallthrough_block).
+                                // would queue a spurious fallthrough link to
+                                // the wrong block (target_block leads in walker
+                                // order, not fallthrough_block).
                                 // Setting `needs_fallthrough = false` here
                                 // suppresses that boundary injection — the
                                 // exits are already laid out via the two
@@ -7974,10 +7905,10 @@ impl CodeWriter {
                             // arbitrarily.  For the exception value that flows
                             // from PUSH_EXC_INFO into the handler's CHECK_EXC_MATCH
                             // across a block boundary, the colour/slot mismatch
-                            // makes `walker_post_walk_insert_renamings` emit a
-                            // parallel copy that clobbers the slot the exc
-                            // actually lives in (raise_catch: exc lost before
-                            // CHECK_EXC_MATCH -> NULL operand).  Pin both pushed
+                            // would let graph regalloc colour the exc into a
+                            // slot the runtime never wrote (raise_catch: exc
+                            // lost before CHECK_EXC_MATCH -> NULL operand).
+                            // Pin both pushed
                             // values to the slot the walker wrote, mirroring the
                             // catch-landing `last_exc_value` pin, so
                             // `get_color` agrees with the runtime register.
@@ -9188,17 +9119,13 @@ impl CodeWriter {
                 // value from the copy list.  pyre's walker materialises the
                 // exception into the positional `exc_slot` above; that slot
                 // equals `getcolor(handler_inputarg)` (both are
-                // `stack_base + depth`).  But `exc_value` reaches graph
-                // regalloc uncoloured-to-slot and gets an arbitrary colour,
-                // so `walker_post_walk_insert_renamings` emits a spurious
-                // `ref_copy[get_color(exc_value) -> get_color(handler_inputarg)]`
-                // that reads the never-written colour and overwrites the exc
-                // at the catch-landing -> handler boundary — leaving the
-                // handler's CHECK_EXC_MATCH / PUSH_EXC_INFO with a NULL
-                // exception.  Pin `exc_value` to `exc_slot` so
-                // `get_color(exc_value)` matches the slot `emit_last_exc_value!`
-                // wrote; the renaming then collapses to a `src == dst` no-op
-                // (skipped) or a correct `exc_slot -> handler_color` copy.
+                // `stack_base + depth`).  But without a pin `exc_value` reaches
+                // graph regalloc uncoloured-to-slot and gets an arbitrary
+                // colour, so the canonical stream would resume the exc from a
+                // colour the runtime never wrote — leaving the handler's
+                // CHECK_EXC_MATCH / PUSH_EXC_INFO with a NULL exception.  Pin
+                // `exc_value` to `exc_slot` so `get_color(exc_value)` matches
+                // the slot `emit_last_exc_value!` wrote.
                 pin!(exc_value.as_variable(), exc_slot);
                 if is_portal {
                     let depth_value = (stack_base_absolute + depth as usize) as i64;
@@ -9289,39 +9216,26 @@ impl CodeWriter {
         // walker's inline-emitted `TLabel`s to match.
         //
         // The full orthodox pass list lives in
-        // [`super::simplify::simplify_graph`] / `all_passes` (issue #112).
-        // Here we run the **walker-safe subset** of the orthodox pass list,
-        // each either keeping every SpamBlock's `per_block_ssarepr` in the
-        // block-by-block drain, or reconciling the inline byte stream with a
-        // bridge, in the upstream `all_passes` relative order:
+        // [`super::simplify::simplify_graph`] / `all_passes`.  Here we run
+        // the subset that simplifies the walker-built graph before the
+        // canonical `flatten_graph` reads it, in the upstream `all_passes`
+        // relative order:
         //
-        //   eliminate_empty_blocks   (+ rewrite_dead_forwarder_gotos bridge;
-        //                             dead blocks have cleared per_block_ssarepr)
+        //   eliminate_empty_blocks   (collapse the empty forwarding blocks
+        //                             `mergeblock` supersede left behind)
         //   constfold_exitswitch     (no-op today — the walker folds constant
         //                             branch conditions before emitting an
-        //                             exitswitch — but kept for all_passes
-        //                             parity and to fold any that do appear)
-        //   remove_trivial_links     (merges single-entry/exit chains; the
-        //                             merge bridge below relocates each merged
-        //                             target's per_block_ssarepr into source)
-        //
-        // EMPIRICALLY VALIDATED (#73): this subset passes the full check.py
-        // gate (dynasm 39/39, correctness + 8-benchmark performance).
+        //                             exitswitch — but kept for parity and to
+        //                             fold any that do appear)
+        //   remove_trivial_links     (merge single-entry/single-exit chains)
         //
         // The remaining active `all_passes` entries are deliberately NOT wired
-        // here (all pay off only once codegen is driven from the graph, #73):
+        // here:
         //
-        //   - `transform_dead_op_vars` and `remove_identical_vars_SSA` both
-        //     drop a graph inputarg + its predecessor link arg (one PRUNES dead
-        //     ones, the other DEDUPS a duplicate phi and renames it to its
-        //     twin).  But the walker's real bytecode uses live in each
-        //     SpamBlock's `per_block_ssarepr` and read the dropped variable's
-        //     walker SLOT, which the graph rename does not touch.  Since
-        //     `walker_post_walk_insert_renamings` only sees the pruned graph it
-        //     emits no copy into that slot, so the inline insns can read a
-        //     stale slot — a lost / wrong edge value (codex review P1 x2,
-        //     PR #127).  They need a walker-side liveness/renaming bridge, or
-        //     the graph-driven drain, before they can be wired.
+        //   - `transform_dead_op_vars` and `remove_identical_vars_SSA` prune a
+        //     dead graph inputarg / dedup a duplicate phi.  They need the
+        //     splice resume-liveness machinery validated against the pruned
+        //     graph before they can be wired.
         //   - `ssa_to_ssi` runs CORRECTLY on walker graphs (the
         //     `backendopt_ssa.rs` stop-at-startblock adaptation), but is
         //     overhead-only: it threads values the walker already routes
@@ -9329,20 +9243,17 @@ impl CodeWriter {
         //     / `ref_copy` that measurably regress exception-heavy code
         //     (raise_catch ~4.2x -> ~10.9x).
         //
-        // The other `all_passes` entries are structural no-ops on today's
-        // empty-`operations` walker blocks (see their classification in
+        // The other `all_passes` entries are structural no-ops on the walker's
+        // empty-`operations` blocks (see their classification in
         // `simplify.rs`).
         eliminate_empty_blocks(&graph);
         super::simplify::constfold_exitswitch(&graph);
         // Port-boundary guard: after the collapse, no link reachable from
-        // the startblock may still target a dead forwarder.  RPython has
-        // no equivalent check (its graph is simplified before flatten),
-        // but pyre's `walker_post_walk_insert_renamings` reachability DFS
-        // skips dead targets, so a surviving reachable link -> dead edge
-        // would silently drop that edge's renamings while
-        // `rewrite_dead_forwarder_gotos` still retargets the byte goto —
-        // the exact renaming/goto divergence this guard prevents.  Fail loud
-        // instead.
+        // the startblock may still target a dead forwarder.  RPython has no
+        // equivalent check (its graph is simplified before flatten), but a
+        // surviving reachable link -> dead edge would leave the canonical
+        // `flatten_graph` flattening a forwarder with no operations.  Fail
+        // loud instead.
         for link_ref in graph.iterlinks() {
             if let Some(target) = link_ref.borrow().target.clone() {
                 assert!(
@@ -9353,21 +9264,22 @@ impl CodeWriter {
                 );
             }
         }
-        // Byte-stream companion to `eliminate_empty_blocks`: retarget the
-        // walker's inline-emitted gotos that still name a collapsed dead
-        // forwarder to the surviving generalization.  MUST run before the
-        // merge bridge below: for a `source -> dead_forwarder -> target`
-        // shape `remove_trivial_links` records the merge `(source, target)`,
-        // but the source block's boundary terminator still reads
+        // Byte-stream companions to the two graph passes, retained for the
+        // walker per-block accumulator pending its retirement; the canonical
+        // splice already reads the simplified graph directly.
+        //
+        // Retarget the walker's inline-emitted gotos that still name a
+        // collapsed dead forwarder to the surviving generalization.  MUST run
+        // before the merge bridge below: for a `source -> dead_forwarder ->
+        // target` shape `remove_trivial_links` records the merge `(source,
+        // target)`, but the source block's boundary terminator still reads
         // `goto TLabel(dead_forwarder)` until this rewrite — so the merge
-        // strip (which looks for `block_label_name(target)`) would miss it
-        // and leave the stale terminator in front of the absorbed target
-        // opcodes, letting the single-exit renaming splice land before
-        // them (codex P2, PR #130).
+        // strip (which looks for `block_label_name(target)`) would miss it and
+        // leave the stale terminator in front of the absorbed opcodes.
         rewrite_dead_forwarder_gotos(&all_walker_blocks);
         // remove_trivial_links merges single-entry/single-exit chains; the
-        // merge bridge relocates each merged target's inline per_block_ssarepr
-        // into its surviving source so the drain keeps the opcodes (issue #73).
+        // merge bridge relocates each merged target's per_block_ssarepr into
+        // its surviving source so the byte stream stays contiguous.
         let trivial_link_merges = super::simplify::remove_trivial_links_recording(&graph);
         rewrite_trivial_link_merges(
             &trivial_link_merges,
@@ -9375,25 +9287,9 @@ impl CodeWriter {
             &mut walker_pc_live_marker_pos,
         );
 
-        // Drain per-block accumulators into ssarepr.insns in
-        // walker-block-creation order.  Mirrors `codewriter.py:53
-        // flatten_graph(graph, regallocs, cpu)` shape — block-by-block
-        // emit, no PC interleaving.
-        //
-        // Peel-off optimisation: at every block-switch boundary the
-        // walker emits a defensive `goto TLabel(block) + Unreachable`
-        // pair (the eventual drain order is not known at yield time
-        // since `pendingblocks` is mixed push_front / push_back).  This
-        // pass strips the pair when the next block actually opens with
-        // a `Label` matching the goto target — turning a runtime no-op
-        // branch into implicit fall-through.  Upstream `flatten.py:106-155
-        // make_link` skips the goto outright via recursive descent +
-        // `seen_blocks` (`flatten.py:110-113`); pyre's two-phase
-        // emit-then-strip approach converges to the same byte stream.
-        //
-        // Seed `walker_slot_for_variable` with block inputarg slots
-        // BEFORE `walker_post_walk_insert_renamings` reads it.  The same
-        // pairing pass also runs downstream (idempotent via
+        // Seed `walker_slot_for_variable` with each block's inputarg
+        // slots before the splice regalloc coalescing reads it.  The
+        // same pairing also runs at emit time (idempotent via
         // `pair_walker_slot_if_absent`).
         for spam in &all_walker_blocks {
             let Some(state) = spam.framestate() else {
@@ -9414,55 +9310,40 @@ impl CodeWriter {
         // fallback Variables' colors).
         //
         // PyPy `regalloc.py` runs the CFG coalesce sweep BEFORE
-        // `flatten.py:154 insert_renamings` mutates the graph.  Collect
-        // once here so both the canonical pass and the SSARepr-side
-        // `allocate_registers` observe the same pre-renaming graph.  The
-        // walker scratch↔inputarg pins (#248) used to be chained in
-        // alongside these CFG pairs, but P4SUB proved them subsumed:
-        // `cfg_variable_pairs` alone reproduces the combined Ref coloring
-        // (per-Variable + num_colors) on every production graph, so they
-        // are dropped (#238).
+        // `flatten.py:154 insert_renamings` mutates the graph.  Collect the
+        // `link.args ↔ target.inputargs` pairs once here so the canonical
+        // pass observes the pre-renaming graph.
         //
-        // PRE-EXISTING-ADAPTATION (parity regression vs PyPy): these CFG
-        // `link.args ↔ target.inputargs` pairs are pre-merged into the
-        // union-find BEFORE `make_dependencies`.  PyPy `regalloc.py:79-96
+        // Parity note (regression vs PyPy): these pairs are pre-merged into
+        // the union-find BEFORE `make_dependencies`.  PyPy `regalloc.py:79-96
         // coalesce_variables` + `:98-112 _try_coalesce` coalesce post-
         // `make_dependencies` with the `v0 not in dg.neighbours[w0]`
-        // interference check; the pre-merge bypasses that check and
-        // silently merges pairs PyPy would reject.  Honouring the check
-        // measurably regresses cranelift (fib_recursive/raise_catch/
-        // fannkuch TIMEOUT) — see #260.  Root cause
-        // is walker's color-aggressive emit diverging from canonical's
-        // interference-respecting coloring; `walker_post_walk_insert_
-        // renamings` emits bridge ref_copy ops, pending retirement of
-        // `walker_slot_for_variable` (#238).
+        // interference check; the pre-merge bypasses that check and silently
+        // merges pairs PyPy would reject.  Honouring the check measurably
+        // regresses cranelift (fib_recursive/raise_catch/fannkuch TIMEOUT),
+        // because the walker's colour-aggressive emit diverges from the
+        // canonical interference-respecting coloring.
         let cfg_variable_pairs = collect_cfg_coalesce_pairs(&graph);
         let mut graph_regallocs = super::regalloc::perform_register_allocation_all_kinds_with_pairs(
             &graph,
             &cfg_variable_pairs,
         );
         super::regalloc::enforce_input_args(&graph, &mut graph_regallocs);
-        // #229 / #279 / #230 path-(b) — canonical-as-production splice.
-        // Build the SAME canonical `flatten_graph(graph, regallocs,
-        // false, cpu)` stream the survey measures and capture it so the
-        // drain REPLACES the walker's SSARepr with it (`codewriter.py:53`
-        // single-driver shape).  Built
-        // under `catch_unwind` like the survey: a graph the Phase-1
-        // SCAFFOLD canonical driver cannot yet flatten (uncolored
-        // exception-edge vars, non-portal `simple_call`) yields `None`,
-        // so the splice falls back to the walker stream for that graph
-        // instead of aborting.  Built from a private clone of
-        // `graph_regallocs` so the production allocator state is untouched.
+        // Build the canonical `flatten_graph(graph, regallocs, false,
+        // cpu)` stream and make it the production SSARepr — the single
+        // graph-driven producer (`codewriter.py:53`).  Built from a
+        // private clone of `graph_regallocs` so the base allocator state
+        // used for the live-Variable mask below is untouched.
         //
-        // #280: capture the canonical `splice_regallocs` alongside the
-        // stream.  `flatten_graph` mutates it via `enforce_input_args`
+        // Capture the canonical `splice_regallocs` alongside the stream.
+        // `flatten_graph` mutates it via `enforce_input_args`
         // (swapcolors), so the returned copy holds the FINAL colors that
         // match the emitted stream's register indices (`getcolor(v)`).
         // The post-recolor resume maps below are rebuilt in this canonical
         // color space — the spliced body carries graph-lifetime colors,
         // not walker stack-slot register numbers.
         //
-        // #319: live-Variable mask for the splice resume-color machinery.
+        // Live-Variable mask for the splice resume-color machinery.
         // `color_leaked_arg_variables` (flatten.rs) mints a fresh color for
         // every dead operand-stack Ref the walker pushed after an
         // `abort_permanent` (CONTAINS_OP / UNPACK_SEQUENCE …) so the
@@ -9492,7 +9373,7 @@ impl CodeWriter {
             .collect();
         let (canonical, splice_regallocs) =
             (|| {
-                // #254: build the splice regalloc FRESH with same-slot
+                // Build the splice regalloc FRESH with same-slot
                 // coalescing so each frame slot maps to exactly one
                 // canonical color (the dense per-slot resume map below
                 // cannot address multi-color slots).  Re-running regalloc
@@ -9507,7 +9388,7 @@ impl CodeWriter {
                     &walker_slot_for_variable,
                     &graph_regallocs[Kind::Ref.index()].coloring,
                 );
-                // #304: order `same_slot` BEFORE `cfg` so each walker slot's
+                // Order `same_slot` BEFORE `cfg` so each walker slot's
                 // Variables first cohere into one union-find group; the cfg
                 // pairs then fold those whole groups into the frame-local
                 // groups consistently.  With the reverse order, a cfg chain
@@ -9519,18 +9400,18 @@ impl CodeWriter {
                 // order-independent, so this reorder is a no-op there.
                 let mut splice_pairs = same_slot_pairs.clone();
                 splice_pairs.extend_from_slice(&cfg_variable_pairs);
-                // #304: drop coalesce pairs whose union would transitively
+                // Drop coalesce pairs whose union would transitively
                 // merge two distinct frame-local slots into one regalloc
                 // group — otherwise the slots share a union-find rep and the
-                // interference below is a self-edge no-op (#302).
+                // interference below is a self-edge no-op.
                 let splice_pairs = filter_cross_slot_coalesce_pairs(
                     &splice_pairs,
                     &walker_slot_for_variable,
                     code.varnames.len(),
                 );
-                // #304: force every distinct frame-local slot onto a distinct
+                // Force every distinct frame-local slot onto a distinct
                 // Ref color so the per-slot resume reverse map stays injective
-                // (#302).  `same_slot_pairs` merges each slot's Variables onto
+                // `same_slot_pairs` merges each slot's Variables onto
                 // one color; these interference pairs keep DIFFERENT slots
                 // apart, which the chordal coloring would otherwise collapse
                 // because their SSA register live ranges are disjoint (each
@@ -9553,7 +9434,7 @@ impl CodeWriter {
                     false,
                     Some(self.cpu()),
                 );
-                // #281: reserve Ref colors [0, nlocals) for the semantic
+                // Reserve Ref colors [0, nlocals) for the semantic
                 // local prefix the runtime bridge-resume assumes, bumping
                 // the portal (frame, ec) reds (and any temp) that
                 // `enforce_input_args` landed in that range up to fresh
@@ -10355,7 +10236,7 @@ pub fn register_portal_jitdriver(
 /// `pypy/interpreter/pyopcode.py` opcode_implementations, not via
 /// `residual_call_*` to a Rust-side helper. The pyre helper-fn pattern is
 /// a translation shortcut; collapsing it onto the inline JitCode-op shape
-/// remains the longer-term endgame. The per-helper ConstRef pycode
+/// remains the longer-term goal. The per-helper ConstRef pycode
 /// migration here is the conservative first step that recovers the
 /// `hint(promote=True)` semantics for the part of the helper ABI that
 /// upstream actually treats as a JIT-time constant.
@@ -10560,7 +10441,7 @@ mod tests {
     use pyre_interpreter::compile_exec;
     use std::sync::Arc;
 
-    /// #304: distinct frame-local slots yield the pairwise cross-product
+    /// Distinct frame-local slots yield the pairwise cross-product
     /// of one representative Variable each (the first Variable seen per
     /// slot); additional Variables of the same slot do not add pairs.
     #[test]
@@ -10584,7 +10465,7 @@ mod tests {
         );
     }
 
-    /// PR#145①: stack slots (slot >= nlocals) participate as local↔stack
+    /// Stack slots (slot >= nlocals) participate as local↔stack
     /// interference edges (so no frame-local color aliases a stack color),
     /// but two stack slots are never forced apart.  Uncolored Variables are
     /// excluded.
@@ -10611,7 +10492,7 @@ mod tests {
         );
     }
 
-    /// PR#145①: two stack slots sharing a color are NOT forced apart — only
+    /// Two stack slots sharing a color are NOT forced apart — only
     /// local↔local and local↔stack pairs are emitted.
     #[test]
     fn collect_distinct_slot_interference_allows_two_stack_slots() {
@@ -10625,7 +10506,7 @@ mod tests {
         assert!(pairs.is_empty());
     }
 
-    /// PR#145①: the coalesce filter drops a pair that would merge a frame
+    /// The coalesce filter drops a pair that would merge a frame
     /// local with a stack slot (keeping the local↔stack interference edge
     /// effective), but keeps a pair that merges two stack slots.
     #[test]
@@ -11613,7 +11494,7 @@ mod tests {
 
     #[test]
     fn nonportal_shadow_graph_appends_frame_inputarg_only() {
-        // Epic #245 Slice 1 keystone: a non-portal callee jitcode carries
+        // Keystone: a non-portal callee jitcode carries
         // the universal `self` red frame as a real startblock inputarg
         // (`FrameInputs::Frame`) — one extra slot, NOT the portal's
         // `(frame, ec)` pair — and `return_var` shifts past it so it no

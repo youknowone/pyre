@@ -80,8 +80,8 @@ impl Kind {
     }
 
     /// Dense slot index `0..3` for indexing `[T; 3]` arrays keyed by
-    /// `Kind`.  Pyre uses `[T; 3]` rather than `HashMap<Kind, T>` per
-    /// [[feedback-no-hashmap-ever]] — the RPython `regallocs` dict has
+    /// `Kind`.  Pyre uses `[T; 3]` rather than `HashMap<Kind, T>`: the
+    /// RPython `regallocs` dict has
     /// statically-known keys (`KINDS = ['int', 'ref', 'float']`) so the
     /// Rust analog is position-indexed not hash-keyed.
     pub fn index(self) -> usize {
@@ -114,8 +114,7 @@ pub struct SSARepr {
     /// `walker_pc_live_marker_pos` (codewriter.rs:4125) — both
     /// drive `pc_map` construction at exit-recovery time
     /// (call_jit.rs:3939).  Empty when filled by the walker path.
-    /// Sparse `Vec<(py_pc, first_insn_pos)>` keyed by py_pc per
-    /// [[feedback-no-hashmap-ever]].
+    /// Sparse `Vec<(py_pc, first_insn_pos)>` keyed by py_pc.
     pub pc_first_insn_pos: Vec<(i64, usize)>,
     /// Per-kind fresh-Variable counter. RPython has no analog
     /// because RPython's `Variable()` constructor produces objects with
@@ -677,7 +676,7 @@ pub fn slot_for_call_flavor(flavor: CallFlavor) -> majit_metainterp::EffectInfoS
 /// `last_exception` at the catch landing).  Upstream `rclass.py:828
 /// rtype_type` rewrites this to `getfield_gc_r(v, '__class__')` —
 /// pyre's runtime exception model bakes type into per-subclass
-/// `W_TypeObject` (see [[project-exception-per-kind-pytype]]) so the
+/// `W_TypeObject`, so the
 /// `getfield_gc_r` shape is not required.
 ///
 /// `getattr` — emitted by `codewriter.rs::emit_frontend_getattr`
@@ -1223,7 +1222,7 @@ pub struct GraphFlattener<'a> {
     /// `rpython/jit/codewriter/flatten.py:103 self.seen_blocks = {}` —
     /// the recursive `make_bytecode_block` DFS tracks which blocks have
     /// been emitted to short-circuit back-edges into `goto TLabel(block)`.
-    /// Per [[feedback-no-hashmap-ever]] pyre uses `Vec<BlockRef>` with
+    /// Pyre uses `Vec<BlockRef>` with
     /// linear scan: graph block counts stay in the dozens for production
     /// workloads, so O(N) `.contains()` is acceptable and matches the
     /// upstream dict's "identity membership" semantics without a hash.
@@ -1320,7 +1319,7 @@ impl<'a> GraphFlattener<'a> {
         // under `lowering_ctx` (canonical production path); the
         // non-lowering path keeps upstream passthrough behavior
         // (preserves `graph_flattener_emits_generic_result_op` test
-        // semantics).  See [[project-flatten-graph-canonical-driver-2026-05-17]].
+        // semantics).
         if self.lowering_ctx.is_some() && is_pyre_canonical_elidable_hlop(&op.opname) {
             return;
         }
@@ -1332,8 +1331,7 @@ impl<'a> GraphFlattener<'a> {
         // (call_jit.rs:3939).  Synthetic ops with `offset = -1`
         // (insert_renamings ref_copy / overflow trampolines /
         // catch-landing entries) are skipped — they have no Python
-        // PC counterpart.  Sparse `Vec<(py_pc, first_insn_pos)>` per
-        // [[feedback-no-hashmap-ever]].
+        // PC counterpart.  Sparse `Vec<(py_pc, first_insn_pos)>`.
         if op.offset >= 0 {
             let py_pc = op.offset;
             let already_seen = self
@@ -1845,7 +1843,7 @@ impl<'a> GraphFlattener<'a> {
             // that survived metainterp policy but lack a real
             // raising-op-with-trailing-`-live-` pattern.
             //
-            // PRE-EXISTING-ADAPTATION (vable-ops-baked-into-graph): upstream
+            // Vable ops are baked into the graph here: upstream
             // blocks end at `[raising_op, -live-]` because flowspace's
             // `guessexception` (flowcontext.py:130-156) closes the block at
             // each can-raise op.  Pyre's walker does NOT split there, so the
@@ -2128,7 +2126,7 @@ impl<'a> GraphFlattener<'a> {
         }
         pairs.sort_by_key(|(_, dst)| dst.index);
 
-        // `[T; 3]` indexed by `Kind::index()` per [[feedback-no-hashmap-ever]].
+        // `[T; 3]` indexed by `Kind::index()`.
         // Mirrors `rpython/jit/codewriter/flatten.py:306-334 insert_renamings`
         // which keys by kind string in a Python dict.
         let mut renamings: [(Vec<RenameOperand>, Vec<RenameOperand>); 3] = [
@@ -2244,9 +2242,8 @@ impl<'a> GraphFlattener<'a> {
         // (`liveness.py:11-12`).  Pyre's earlier per-PC PA + `-live-`
         // interleaving here was a pyre-only adaptation for runtime
         // PC dispatch via per-PC `Insn::Label("pc{N}")`; that runtime
-        // mechanism remains on the walker side until the T6 epic
-        // retires it, but canonical now matches upstream's structure
-        // exactly.
+        // mechanism remains on the walker side for now, but canonical
+        // now matches upstream's structure exactly.
         let operations = block.borrow().operations.clone();
         let exits_len = block.borrow().exits.len();
         let exitswitch_is_last_exception = block.borrow().canraise();
@@ -2254,7 +2251,7 @@ impl<'a> GraphFlattener<'a> {
         // `insert_exits` can detect a real raising op off the lowered
         // stream (a `residual_call_*` whose calldescr can raise) rather
         // than the graph tail, which pyre's vable-mirror stores push past
-        // the `-live-`.  See the canraise PRE-EXISTING-ADAPTATION there.
+        // the `-live-`.  See the raising-op detection in `insert_exits`.
         let block_emit_start = self.ssarepr.insns.len();
         for op in &operations {
             // `flatten.py:120-125` `_ovf` validity check: an overflow-
@@ -3105,8 +3102,7 @@ pub struct LoweringContext {
     /// (`jtransform.py:414 rewrite_call`) — the parent frame is
     /// resolved at runtime inside the call helper, not threaded as a
     /// leading operand.
-    /// Indexed by nargs (`call_fn_idx_by_nargs[nargs]`) per
-    /// [[feedback-no-hashmap-ever]] — `[u16; 9]` keeps the
+    /// Indexed by nargs (`call_fn_idx_by_nargs[nargs]`): `[u16; 9]` keeps the
     /// statically-known 0..=8 arity range position-indexed.
     /// `simple_call` HLOps with nargs > 8 are walker non-orthodox
     /// (the walker emits `abort_permanent` instead and skips the
@@ -3383,8 +3379,8 @@ pub fn build_compare_op_residual_call_ir_r_insn(
 }
 
 /// Construct the LOAD_GLOBAL-family `residual_call_ir_r` Insn from
-/// raw register indices.  Production codewriter callsite (Slice
-/// #48.8 factor refactor) replaces the prior `emit_residual_call(
+/// raw register indices.  The production codewriter callsite
+/// replaces the prior `emit_residual_call(
 /// load_global_fn_idx, ...)` SSARepr emit at codewriter.rs:5598-5615
 /// with a single direct push of this helper's output.  The matching
 /// graph dual-write at codewriter.rs:5622-5635 stays in place — this
@@ -3613,8 +3609,8 @@ pub fn build_residual_call_r_r_insn_from_operands(
 }
 
 /// Construct the RaiseVarargs-family `residual_call_r_r` Insn from
-/// raw register indices.  Production codewriter callsite (Slice
-/// #48.14 factor refactor) replaces the prior `emit_residual_call(
+/// raw register indices.  The production codewriter callsite
+/// replaces the prior `emit_residual_call(
 /// normalize_raise_varargs_fn_idx, ...)` SSARepr emit at
 /// codewriter.rs:6068-6082 with a single direct push of this
 /// helper's output.  No graph dual-write exists for
@@ -3772,8 +3768,8 @@ pub fn build_one_int_one_ref_fn_residual_call_ir_r_insn(
 }
 
 /// Construct the BuildList-family `residual_call_ir_r` Insn from
-/// raw register indices.  Production codewriter callsite (Slice
-/// #48.13 factor refactor) replaces the prior `emit_residual_call(
+/// raw register indices.  The production codewriter callsite
+/// replaces the prior `emit_residual_call(
 /// build_list_fn_idx, ...)` SSARepr emit at codewriter.rs:6002-6009
 /// with a single direct push of this helper's output.  No graph
 /// dual-write exists for `build_list_fn` (the graph carries
@@ -3839,8 +3835,7 @@ pub fn build_build_list_fn_residual_call_ir_r_insn(
 /// canonical driver's `lower_new_sequence_hlop_to_insn` to handle graph
 /// `newlist`/`newtuple` HLOps whose items are Constants — upstream RPython's
 /// rtype pass would have pre-loaded these into Variables, but pyre's
-/// graph carries the un-rewritten Constants per
-/// [[project-flatten-graph-canonical-driver-2026-05-17]].
+/// graph carries the un-rewritten Constants.
 pub fn build_build_list_fn_residual_call_ir_r_insn_from_operands(
     build_list_fn_idx: u16,
     argc: usize,
@@ -8379,7 +8374,7 @@ mod tests {
     }
 
     // ----------------------------------------------------------------
-    // Phase 1 — `_ovf` popline rewrite + handling_ovf=true reraise.
+    // `_ovf` popline rewrite + handling_ovf=true reraise.
     //
     // Tests for `rpython/jit/codewriter/flatten.py:120-204`:
     //   * `make_bytecode_block` `_ovf` validity check (lines 120-125)
@@ -8602,7 +8597,7 @@ mod tests {
 
     #[test]
     fn flatten_graph_canonical_four_arg_entry_works_without_lowering_ctx() {
-        // Phase 4 — `flatten.py:63-70` orthodox 4-arg entry.  No
+        // `flatten.py:63-70` orthodox 4-arg entry.  No
         // `lowering_ctx` parameter; `cpu=None` so dispatcher is
         // disabled and pre-rtype HLOp opnames passthrough.
         use crate::jit::flow::{Block, FunctionGraph};
@@ -8634,7 +8629,7 @@ mod tests {
 
     #[test]
     fn flatten_graph_with_regallocs_canonical_entry_returns_ssarepr() {
-        // Phase 4 — `flatten.py:63-70` orthodox entry.
+        // `flatten.py:63-70` orthodox entry.
         // Build a trivial portal-like graph with a single
         // `loop_header` op (passthrough family — no LoweringContext
         // arm needs to fire) and verify the canonical entry returns a
