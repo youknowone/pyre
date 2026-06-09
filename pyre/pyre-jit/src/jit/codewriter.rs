@@ -744,37 +744,6 @@ impl SpamBlockRef {
     fn push_insn(&self, insn: super::flatten::Insn) {
         self.0.borrow_mut().per_block_ssarepr.push(insn);
     }
-
-    /// Snapshot the per-block accumulator — used by verification
-    /// probes and by the post-walk flatten driver to drain the
-    /// per-block emit sequence in graph-DFS order.
-    fn per_block_ssarepr(&self) -> Vec<super::flatten::Insn> {
-        self.0.borrow().per_block_ssarepr.clone()
-    }
-
-    /// Length of the per-block accumulator without cloning.  Used by
-    /// the walker-time PC dispatch tracker to record per-PC `-live-`
-    /// marker positions at emit time.
-    fn per_block_ssarepr_len(&self) -> usize {
-        self.0.borrow().per_block_ssarepr.len()
-    }
-
-    /// `True` iff the last op currently in the per-block accumulator is a
-    /// `-live-` marker.  Mirrors `flatten.py:206-217`'s "is the block's
-    /// last operation a `-live-`?" scan, which decides whether a
-    /// canraise block already carries the resume marker the
-    /// `catch_exception` needs.  Used before `emit_catch_exception!` to
-    /// emit the post-residual-call `-live-` only when the opcode body
-    /// left a non-`-live-` op (e.g. the `setfield_vable_i` valuestackdepth
-    /// bump after a `residual_call`) between the per-PC start marker and
-    /// the catch.
-    fn per_block_last_is_live(&self) -> bool {
-        self.0
-            .borrow()
-            .per_block_ssarepr
-            .last()
-            .map_or(false, |insn| insn.is_live())
-    }
 }
 
 impl PartialEq for SpamBlockRef {
@@ -5980,17 +5949,13 @@ impl CodeWriter {
                 // self.emitline(Label(block))`.  Emitted at the moment
                 // a freshly-popped block becomes `current_block`,
                 // mirroring upstream's recursive `make_bytecode_block`
-                // top.  Skipped when the per-block accumulator already
-                // contains content (mergeblock candidate joins emit
-                // into the block before the pop in some flows).
-                if current_block.per_block_ssarepr_len() == 0 {
-                    push_walker_emit(
-                        &current_block,
-                        super::flatten::Insn::Label(super::flatten::Label::new(
-                            super::flatten::block_label_name(&current_block.block()),
-                        )),
-                    );
-                }
+                // top.
+                push_walker_emit(
+                    &current_block,
+                    super::flatten::Insn::Label(super::flatten::Label::new(
+                        super::flatten::block_label_name(&current_block.block()),
+                    )),
+                );
                 // Note — upstream `flowcontext.py:407-416`
                 // drives per-block op accumulation via `while True:
                 // handle_bytecode(...)` until a terminator, then
@@ -8654,20 +8619,9 @@ impl CodeWriter {
                             // `resumepc=-1`) lands on a marker it can
                             // decode (`blackhole.py:396-410
                             // handle_exception_in_frame` skips one
-                            // `-live-` then reads the catch).  When the
-                            // opcode body ended with a non-`-live-` op
-                            // (e.g. a `residual_call` followed by the
-                            // `setfield_vable_i` valuestackdepth bump),
-                            // the per-PC start marker is no longer
-                            // adjacent to the catch, so emit the
-                            // post-call `-live-` here.  Trivial in-try
-                            // opcodes whose body emitted nothing already
-                            // end with the per-PC start marker, so skip
-                            // the redundant emit (it would only fold in
-                            // `remove_repeated_live`).
-                            if !current_block.per_block_last_is_live() {
-                                emit_live_placeholder!();
-                            }
+                            // `-live-` then reads the catch).  A repeated
+                            // `-live-` here folds in `remove_repeated_live`.
+                            emit_live_placeholder!();
                             emit_catch_exception!(catch_label);
                         }
                     }
