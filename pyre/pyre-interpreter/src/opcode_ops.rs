@@ -312,7 +312,8 @@ pub extern "C" fn bh_execute_store_subscr(executor_ptr: i64) -> i64 {
 /// key, value)` (`codewriter.rs:7042
 /// build_store_subscr_fn_residual_call_r_v_insn`); the runtime
 /// dispatcher calls this thin wrapper to mutate the heap via
-/// `baseobjspace::setitem`.
+/// `baseobjspace::setitem` — `baseobjspace.py` parity for
+/// `ObjSpace.setitem(w_obj, w_key, w_value) → space.descr_setitem(...)`.
 ///
 /// Lives in `pyre-interpreter` so `pyre-jit-trace` can reach the address
 /// through `pyre_interpreter::jit_trace_fnaddrs()` without adding a
@@ -321,23 +322,18 @@ pub extern "C" fn bh_execute_store_subscr(executor_ptr: i64) -> i64 {
 /// helpers (`jit_setitem`, `jit_getitem`, ...).
 ///
 /// Returns 1 on success, 0 on raise (exception object stashed in
-/// `BH_LAST_EXC_VALUE`).  The return-code polarity differs from the
-/// trait-side `jit_setitem` which returns 0 on success and panics on
-/// error — `bh_store_subscr_fn` is fail-soft because residual_call
-/// execution is not a panic site.
+/// `BH_LAST_EXC_VALUE`); the polarity matches the executor's
+/// raise-vs-success ABI for void residual_calls and parallels
+/// `bh_execute_store_subscr` above.  `jit_setitem` upstream of this
+/// (called by `setarrayitem_gc` arms) panics on raise because the
+/// strategy guard upstream proves the raise cannot happen; this
+/// helper covers the residual-call leg where the raise is
+/// observable.
 #[allow(improper_ctypes_definitions)]
 pub extern "C" fn bh_store_subscr_fn(obj: i64, key: i64, value: i64) -> i64 {
     let obj = obj as pyre_object::PyObjectRef;
     let key = key as pyre_object::PyObjectRef;
     let value = value as pyre_object::PyObjectRef;
-    if obj.is_null() || key.is_null() || value.is_null() {
-        let err = crate::PyError::new(
-            crate::PyErrorKind::TypeError,
-            "store subscript on null operand".to_string(),
-        );
-        majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(err.to_exc_object() as i64));
-        return 0;
-    }
     if let Err(err) = crate::baseobjspace::setitem(obj, key, value) {
         let exc_obj = err.to_exc_object();
         majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc_obj as i64));
