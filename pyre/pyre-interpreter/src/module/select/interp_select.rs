@@ -298,8 +298,20 @@ pub fn register_module(ns: &mut DictStorage) {
                 // `interp_select.py:166` — EINTR retry, recomputing the
                 // remaining timeout each pass and rebuilding the fd sets
                 // (select() clobbers them on every call).
-                let deadline = timeout_secs
-                    .map(|s| std::time::Instant::now() + std::time::Duration::from_secs_f64(s));
+                // `Duration::from_secs_f64` panics on a NaN/inf/overflowing
+                // timeout; `float_w` lets such a value through, so convert it
+                // into a `ValueError` instead of aborting the host process.
+                let deadline = match timeout_secs {
+                    None => None,
+                    Some(s) => Some(
+                        std::time::Duration::try_from_secs_f64(s)
+                            .ok()
+                            .and_then(|d| std::time::Instant::now().checked_add(d))
+                            .ok_or_else(|| {
+                                crate::PyError::value_error("timeout is too large")
+                            })?,
+                    ),
+                };
                 let mut rset = host_select::FdSet::new();
                 let mut wset = host_select::FdSet::new();
                 let mut xset = host_select::FdSet::new();

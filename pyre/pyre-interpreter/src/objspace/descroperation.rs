@@ -1036,6 +1036,18 @@ unsafe fn bytes_operand_overrides(obj: PyObjectRef, fwd: &str, rev: &str) -> boo
     dunder_overridden(obj, fwd, t) || dunder_overridden(obj, rev, t)
 }
 
+/// The builtin numeric base type backing `obj`'s storage — `int` for
+/// int/long, `float` for float, `None` for a non-numeric operand.
+unsafe fn numeric_base_type(obj: PyObjectRef) -> Option<*const pyre_object::PyType> {
+    if is_int(obj) || is_long(obj) {
+        Some(&pyre_object::INT_TYPE)
+    } else if is_float(obj) {
+        Some(&pyre_object::FLOAT_TYPE)
+    } else {
+        None
+    }
+}
+
 /// True when numeric operand `obj` (int/long/float storage) has a Python
 /// class that overrides `dunder` relative to its builtin base — int/long
 /// against `int`, float against `float`.  Mirrors [`dunder_overridden`]
@@ -1044,11 +1056,7 @@ unsafe fn bytes_operand_overrides(obj: PyObjectRef, fwd: &str, rev: &str) -> boo
 /// Rust fast path, which both matches the builtin result and avoids
 /// re-entering the inherited slot (it would recurse back into this op).
 unsafe fn numeric_operand_overrides(obj: PyObjectRef, dunder: &str, rdunder: &str) -> bool {
-    let base: *const pyre_object::PyType = if is_int(obj) || is_long(obj) {
-        &pyre_object::INT_TYPE
-    } else if is_float(obj) {
-        &pyre_object::FLOAT_TYPE
-    } else {
+    let Some(base) = numeric_base_type(obj) else {
         return false;
     };
     let Some(t) = crate::typedef::gettypefor(base) else {
@@ -1080,11 +1088,7 @@ unsafe fn needs_numeric_binop_dispatch(
 /// special `dunder` relative to its builtin base.
 #[majit_macros::dont_look_inside]
 unsafe fn needs_numeric_unaryop_dispatch(a: PyObjectRef, dunder: &str) -> bool {
-    let base: *const pyre_object::PyType = if is_int(a) || is_long(a) {
-        &pyre_object::INT_TYPE
-    } else if is_float(a) {
-        &pyre_object::FLOAT_TYPE
-    } else {
+    let Some(base) = numeric_base_type(a) else {
         return false;
     };
     let Some(t) = crate::typedef::gettypefor(base) else {

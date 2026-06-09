@@ -260,7 +260,7 @@ pub fn register_module(ns: &mut DictStorage) {
                 let c_locale = match locale_str.as_ref() {
                     Some(s) => Some(
                         std::ffi::CString::new(s.as_bytes())
-                            .map_err(|_| crate::PyError::value_error("embedded null"))?,
+                            .map_err(|_| crate::PyError::value_error("embedded null character"))?,
                     ),
                     None => None,
                 };
@@ -351,9 +351,9 @@ pub fn register_module(ns: &mut DictStorage) {
                     let s1 = unsafe { pyre_object::w_str_get_value(args[0]).to_string() };
                     let s2 = unsafe { pyre_object::w_str_get_value(args[1]).to_string() };
                     let c1 = std::ffi::CString::new(s1.as_bytes())
-                        .map_err(|_| crate::PyError::value_error("embedded null"))?;
+                        .map_err(|_| crate::PyError::value_error("embedded null character"))?;
                     let c2 = std::ffi::CString::new(s2.as_bytes())
-                        .map_err(|_| crate::PyError::value_error("embedded null"))?;
+                        .map_err(|_| crate::PyError::value_error("embedded null character"))?;
                     return Ok(pyre_object::w_int_new(
                         rustpython_host_env::locale::strcoll(&c1, &c2) as i64,
                     ));
