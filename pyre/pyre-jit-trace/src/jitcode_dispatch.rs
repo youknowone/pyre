@@ -7944,11 +7944,17 @@ fn try_walker_specialize_binary_op_float(
         return Ok(None);
     };
     use pyre_interpreter::bytecode::BinaryOperator;
+    // Power has no FLOAT_* opcode — it lowers to the raw-float
+    // `float_pow_jit` call (floatobject.py:561 descr_pow → _pow), same
+    // as the trait's `is_power` arm.
     let op_code = match bin_op {
-        BinaryOperator::Add | BinaryOperator::InplaceAdd => OpCode::FloatAdd,
-        BinaryOperator::Subtract | BinaryOperator::InplaceSubtract => OpCode::FloatSub,
-        BinaryOperator::Multiply | BinaryOperator::InplaceMultiply => OpCode::FloatMul,
-        BinaryOperator::TrueDivide | BinaryOperator::InplaceTrueDivide => OpCode::FloatTrueDiv,
+        BinaryOperator::Add | BinaryOperator::InplaceAdd => Some(OpCode::FloatAdd),
+        BinaryOperator::Subtract | BinaryOperator::InplaceSubtract => Some(OpCode::FloatSub),
+        BinaryOperator::Multiply | BinaryOperator::InplaceMultiply => Some(OpCode::FloatMul),
+        BinaryOperator::TrueDivide | BinaryOperator::InplaceTrueDivide => {
+            Some(OpCode::FloatTrueDiv)
+        }
+        BinaryOperator::Power | BinaryOperator::InplacePower => None,
         _ => return Ok(None),
     };
 
@@ -7957,17 +7963,55 @@ fn try_walker_specialize_binary_op_float(
     else {
         return Ok(None);
     };
+    if op_code.is_none() {
+        // The generic helper already executed concretely (it produced
+        // `boxed_result_i64`), so a non-float result here would mean
+        // `float ** x` returned a non-W_FloatObject — decline rather
+        // than mis-unbox the concrete stamp.
+        let boxed_obj = boxed_result_i64 as pyre_object::PyObjectRef;
+        if unsafe { !pyre_object::pyobject::is_float(boxed_obj) } {
+            return Ok(None);
+        }
+    }
 
     // --- emit the specialized IR (walker-native) ---
     let lhs_raw = walker_coerce_operand_to_float(ctx, op_pc, lhs, lhs_is_int, lhs_f64)?;
     let rhs_raw = walker_coerce_operand_to_float(ctx, op_pc, rhs, rhs_is_int, rhs_f64)?;
-    let raw_result = ctx.trace_ctx.record_op(op_code, &[lhs_raw, rhs_raw]);
-    let bits =
-        majit_metainterp::eval_binop_f(op_code, lhs_f64.to_bits() as i64, rhs_f64.to_bits() as i64);
-    ctx.trace_ctx.set_opref_concrete(
-        raw_result,
-        majit_ir::Value::Float(f64::from_bits(bits as u64)),
-    );
+    let raw_result = match op_code {
+        Some(op_code) => {
+            let r = ctx.trace_ctx.record_op(op_code, &[lhs_raw, rhs_raw]);
+            let bits = majit_metainterp::eval_binop_f(
+                op_code,
+                lhs_f64.to_bits() as i64,
+                rhs_f64.to_bits() as i64,
+            );
+            ctx.trace_ctx
+                .set_opref_concrete(r, majit_ir::Value::Float(f64::from_bits(bits as u64)));
+            r
+        }
+        None => {
+            // ll_math_pow (ll_math.py:260) is EF_CAN_RAISE, NOT
+            // force_virtual: pyjitpl.py:2084-2121 execute_varargs(
+            // rop.CALL_F, ..., exc=True, pure=False) records CALL_F and
+            // handle_possible_exception → GUARD_NO_EXCEPTION
+            // (pyjitpl.py:3395).  The raising case never reaches here:
+            // `walker_float_specialization_operands` already executed
+            // the helper concretely and returns `None` on a raise,
+            // falling back to the generic residual leg.
+            let r = ctx.trace_ctx.call_float_typed_with_effect(
+                crate::trace_opcode::float_pow_jit as *const (),
+                &[lhs_raw, rhs_raw],
+                &[majit_ir::Type::Float, majit_ir::Type::Float],
+                majit_metainterp::default_effect_info(),
+            );
+            walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardNoException, &[])?;
+            let result_val =
+                unsafe { pyre_object::w_float_get_value(boxed_result_i64 as _) };
+            ctx.trace_ctx
+                .set_opref_concrete(r, majit_ir::Value::Float(result_val));
+            r
+        }
+    };
     let boxed = crate::state::wrapfloat(ctx.trace_ctx, raw_result);
     ctx.trace_ctx.set_opref_concrete(
         boxed,
