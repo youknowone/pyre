@@ -1034,6 +1034,20 @@ fn builtin_print(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     Ok(w_none())
 }
 
+/// `space.index` re-wraps a result whose type is not exactly `int` (a
+/// bool, or a strict int subclass) as a plain int (descroperation.py:622
+/// `index`).  A range stores its bounds wrapped, so normalize each here —
+/// otherwise `range(True).stop` would expose `True` instead of `1`.
+///
+/// # Safety
+/// `obj` must be a valid object.
+unsafe fn range_index_bound(obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+    let w = crate::baseobjspace::space_index(obj)?;
+    Ok(pyre_object::range_bigint_to_obj(
+        pyre_object::range_obj_to_bigint(w),
+    ))
+}
+
 /// `range(stop)` / `range(start, stop[, step])` — `functional.py
 /// W_Range.descr_new`.  Each bound passes through `space.index`
 /// (`__index__`) and is stored wrapped, so a range may span past a
@@ -1053,7 +1067,7 @@ fn builtin_range(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     }
     unsafe {
         let _roots = pyre_object::gc_roots::push_roots();
-        let mut w_start = crate::baseobjspace::space_index(args[0])?;
+        let mut w_start = range_index_bound(args[0])?;
         pyre_object::gc_roots::pin_root(w_start);
         let w_stop;
         let w_step;
@@ -1063,10 +1077,10 @@ fn builtin_range(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             w_start = w_int_new(0);
             w_step = w_int_new(1);
         } else {
-            w_stop = crate::baseobjspace::space_index(args[1])?;
+            w_stop = range_index_bound(args[1])?;
             pyre_object::gc_roots::pin_root(w_stop);
             if n == 3 {
-                w_step = crate::baseobjspace::space_index(args[2])?;
+                w_step = range_index_bound(args[2])?;
                 pyre_object::gc_roots::pin_root(w_step);
                 if pyre_object::range_obj_to_bigint(w_step) == BigInt::from(0) {
                     return Err(crate::PyError::value_error(

@@ -366,7 +366,12 @@ pub unsafe fn w_range_bool(obj: PyObjectRef) -> bool {
 /// `obj` must point to a valid `W_Range`.
 pub unsafe fn w_range_iter(obj: PyObjectRef) -> PyObjectRef {
     unsafe {
-        if let Some((start, stop, step)) = w_range_fields_i64(obj) {
+        // `descr_iter` takes the machine-int iterator only when start, stop,
+        // step AND length all fit a machine word; a span whose length exceeds
+        // a word (e.g. `range(-2**63, 2**63-1)`) needs the bignum iterator.
+        if let (Some((start, stop, step)), Some(_length)) =
+            (w_range_fields_i64(obj), w_range_length_i64(obj))
+        {
             w_range_iter_new(start, stop, step)
         } else {
             let (start, _stop, step) = w_range_fields(obj);
