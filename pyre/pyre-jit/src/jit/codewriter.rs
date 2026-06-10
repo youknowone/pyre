@@ -817,12 +817,10 @@ fn derive_pc_live_indices_from_sparse(
                 pc + 1,
                 delta.get(op_arg).as_usize(),
             )),
-            Instruction::JumpBackward { delta }
-            | Instruction::JumpBackwardNoInterrupt { delta } => {
-                let next = pyre_interpreter::skip_caches(&code.instructions, pc + 1);
-                Some(next.saturating_sub(delta.get(op_arg).as_usize()))
-            }
-            _ => None,
+            // `backward_jump_target` keeps the JumpBackward (skip_caches)
+            // vs JumpBackwardNoInterrupt (direct `pc + 1`) base distinction
+            // in one place, matching the interpreter's dispatch.
+            _ => backward_jump_target(code, pc, instr, op_arg),
         }
     };
     // Branch guards (`goto_if_not` / `goto_if_not_*` / `switch`) resume at
