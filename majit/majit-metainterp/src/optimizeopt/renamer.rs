@@ -64,7 +64,11 @@ impl Renamer {
                     })
                     .collect();
                 fail_args.clear();
-                fail_args.extend(cloned.into_iter().map(BoxRef::from_opref));
+                fail_args.extend(
+                    cloned
+                        .into_iter()
+                        .map(|r| majit_ir::operand::Operand::Box(BoxRef::from_opref(r))),
+                );
             }
         }
 

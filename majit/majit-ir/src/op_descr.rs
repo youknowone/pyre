@@ -173,7 +173,10 @@ impl Op {
     /// avoids the `Ref<[T]>` ergonomics tax for callers that chain through
     /// `.into_iter().flatten()` or `.iter()` patterns.
     pub fn getfailargs(&self) -> Option<smallvec::SmallVec<[crate::box_ref::BoxRef; 3]>> {
-        self.fail_args.borrow().clone()
+        self.fail_args
+            .borrow()
+            .as_ref()
+            .map(|fa| fa.iter().map(|o| o.to_boxref()).collect())
     }
 
     /// `resoperation.py:492 GuardResOp.getfailargs_copy` parity.
@@ -192,7 +195,7 @@ impl Op {
                  fail-loud shape (resoperation.py:492)"
             )
         });
-        fa.iter().cloned().collect()
+        fa.iter().map(|o| o.to_boxref()).collect()
     }
 
     /// `resoperation.py:495 GuardResOp.setfailargs` parity — overwrite
@@ -200,7 +203,15 @@ impl Op {
     /// optimizer can stamp fail_args onto a shared `Op` reached through
     /// `Rc<Op>`.
     pub fn setfailargs(&self, fail_args: smallvec::SmallVec<[crate::box_ref::BoxRef; 3]>) {
-        *self.fail_args.borrow_mut() = Some(fail_args);
+        // MIGRATION (#9): freeze to `Operand::Box` (position snapshot,
+        // byte-identical to the previous `BoxRef` storage); the bound
+        // shed follows the `args` sequence in a later slice.
+        *self.fail_args.borrow_mut() = Some(
+            fail_args
+                .into_iter()
+                .map(crate::operand::Operand::Box)
+                .collect(),
+        );
     }
 
     /// In-place mutable view of the fail_args slot.  Lets callers iterate
@@ -211,7 +222,7 @@ impl Op {
     /// the copy, and call `setfailargs`.
     pub fn fail_args_mut(
         &mut self,
-    ) -> Option<&mut smallvec::SmallVec<[crate::box_ref::BoxRef; 3]>> {
+    ) -> Option<&mut smallvec::SmallVec<[crate::operand::Operand; 3]>> {
         self.fail_args.get_mut().as_mut()
     }
 

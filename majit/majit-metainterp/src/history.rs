@@ -559,7 +559,9 @@ impl TreeLoop {
             }
             if let Some(fa) = new_op.fail_args_mut() {
                 for arg in fa.iter_mut() {
-                    *arg = BoxRef::from_opref(remap_ref(&arg.to_opref()));
+                    *arg = majit_ir::operand::Operand::Box(BoxRef::from_opref(remap_ref(
+                        &arg.to_opref(),
+                    )));
                 }
             }
             new_ops.push(new_op);

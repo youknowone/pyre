@@ -187,7 +187,8 @@ impl ShortPreamble {
                 for (fail_arg_pos, label_idx) in &entry.fail_arg_mapping {
                     if let Some(bridge_ref) = bridge_args.get(*label_idx) {
                         if *fail_arg_pos < fail_args.len() {
-                            fail_args[*fail_arg_pos] = BoxRef::from_opref(*bridge_ref);
+                            fail_args[*fail_arg_pos] =
+                                majit_ir::operand::Operand::Box(BoxRef::from_opref(*bridge_ref));
                         }
                     }
                 }
@@ -2883,7 +2884,7 @@ pub fn produced_short_boxes_from_exported_boxes(
             if let Some(fail_args) = preamble_op.fail_args_mut() {
                 for arg in fail_args {
                     if let Some(renamed) = inputarg_rename(arg.to_opref()) {
-                        *arg = BoxRef::from_opref(renamed);
+                        *arg = majit_ir::operand::Operand::Box(BoxRef::from_opref(renamed));
                     }
                 }
             }

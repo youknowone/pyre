@@ -12,6 +12,7 @@
 use majit_ir::Type;
 use majit_ir::box_ref::BoxRef;
 use majit_ir::descr::{DescrRef, FieldDescr, SizeDescr};
+use majit_ir::operand::Operand;
 use majit_ir::resoperation::{Op, OpCode, OpRef};
 use majit_ir::{Value, VecAssoc, VecSet};
 
@@ -731,7 +732,7 @@ impl RewriteState {
         }
         if let Some(fail_args) = rewritten.fail_args_mut() {
             for arg in fail_args.iter_mut() {
-                *arg = self.resolve(arg.clone());
+                *arg = Operand::Box(self.resolve(arg.to_boxref()));
             }
         }
         rewritten.pos.set(OpRef::NONE);
@@ -954,7 +955,7 @@ impl GcRewriterImpl {
         // guard for the next iteration to pick up.
         let mut new_guard = op.clone();
         if let Some(fa) = new_guard.fail_args_mut() {
-            fa[idx] = same_pos;
+            fa[idx] = Operand::Box(same_pos);
         }
         // pos is reassigned when emit/emit_result runs on the substituted op.
         new_guard.pos.set(OpRef::NONE);

@@ -3669,7 +3669,7 @@ impl OptUnroll {
                 } else if let Some(fail_args) = new_op.fail_args_mut() {
                     for arg in fail_args.iter_mut() {
                         if let Some(&mapped) = mapping.get(&arg.to_opref()) {
-                            *arg = BoxRef::from_opref(mapped);
+                            *arg = majit_ir::operand::Operand::Box(BoxRef::from_opref(mapped));
                         }
                     }
                 }
@@ -4938,7 +4938,7 @@ fn assemble_peeled_trace_with_jump_args(
                     if seen_body_defs.contains(&a.to_opref())
                         && !visible_before_label.contains(&a.to_opref())
                     {
-                        *a = BoxRef::from_opref(mapped);
+                        *a = majit_ir::operand::Operand::Box(BoxRef::from_opref(mapped));
                     }
                 }
             }
@@ -5127,7 +5127,7 @@ impl OptUnroll {
             if let Some(fa) = peeled.fail_args_mut() {
                 for arg in fa.iter_mut() {
                     if let Some(&new_ref) = ref_map.get(&arg.to_opref()) {
-                        *arg = BoxRef::from_opref(new_ref);
+                        *arg = majit_ir::operand::Operand::Box(BoxRef::from_opref(new_ref));
                     }
                 }
             }
@@ -5174,7 +5174,7 @@ impl OptUnroll {
             if let Some(fa) = body_op.fail_args_mut() {
                 for arg in fa.iter_mut() {
                     if let Some(&new_ref) = orig_ref_map.get(&arg.to_opref()) {
-                        *arg = BoxRef::from_opref(new_ref);
+                        *arg = majit_ir::operand::Operand::Box(BoxRef::from_opref(new_ref));
                     }
                 }
             }

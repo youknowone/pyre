@@ -2804,7 +2804,8 @@ impl Optimizer {
                     }
                     if let Some(fail_args) = preamble_op.fail_args_mut() {
                         for arg in fail_args {
-                            *arg = ctx.resolve_box_box(&arg);
+                            *arg =
+                                majit_ir::operand::Operand::Box(ctx.resolve_box_box(&arg.to_boxref()));
                         }
                     }
                     crate::optimizeopt::shortpreamble::PreambleOp {
@@ -3176,7 +3177,7 @@ impl Optimizer {
                         for arg in fa.iter_mut() {
                             let mut arg_opref = arg.to_opref();
                             remap_opref(&mut arg_opref);
-                            *arg = BoxRef::from_opref(arg_opref);
+                            *arg = majit_ir::operand::Operand::Box(BoxRef::from_opref(arg_opref));
                         }
                     }
                     if let Some(ref mut src) = entry.same_as_source {
@@ -4389,7 +4390,8 @@ impl Optimizer {
             for fa_idx in 0..fail_args.len() {
                 if !fail_args[fa_idx].is_none() {
                     let resolved = ctx.get_box_replacement_not_const(fail_args[fa_idx].to_opref());
-                    fail_args[fa_idx] = BoxRef::from_opref(resolved);
+                    fail_args[fa_idx] =
+                        majit_ir::operand::Operand::Box(BoxRef::from_opref(resolved));
                 }
             }
         }

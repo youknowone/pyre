@@ -405,7 +405,9 @@ impl<'a> TraceIterator<'a> {
         }
         if let Some(fa) = res.fail_args_mut() {
             for arg in fa.iter_mut() {
-                *arg = BoxRef::from_opref(self._untag(arg.to_opref()));
+                *arg = majit_ir::operand::Operand::Box(BoxRef::from_opref(
+                    self._untag(arg.to_opref()),
+                ));
             }
         }
         // RPython opencoder.py:399-401:

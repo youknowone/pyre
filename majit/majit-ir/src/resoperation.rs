@@ -1284,7 +1284,14 @@ pub struct Op {
     /// through `Rc<Op>`: RPython writes
     /// `op._fail_args = [...]` on the same Python object the trace list,
     /// optimizer state, and backend input list all see.
-    pub fail_args: std::cell::RefCell<Option<SmallVec<[BoxRef; 3]>>>,
+    ///
+    /// Stored as [`Operand`] (the same union as `args` — `GuardResOp.
+    /// _fail_args` holds the Box objects themselves, resoperation.py:483).
+    /// MIGRATION (#9): every write currently freezes to `Operand::Box`
+    /// (position snapshot, byte-identical to the previous `BoxRef`
+    /// storage); the bound-shed + skip-bound-in-remap follow-up mirrors
+    /// the `args` sequence.
+    pub fail_args: std::cell::RefCell<Option<SmallVec<[Operand; 3]>>>,
     /// Types of fail_args, set by the optimizer from constant_types.
     /// When present, the backend uses these instead of inferring types.
     /// `RefCell` so the optimizer can stamp types onto a shared `Op`
@@ -1647,7 +1654,7 @@ impl Op {
                 }
             }
         }
-        *self.fail_args.borrow_mut() = Some(boxes.into());
+        *self.fail_args.borrow_mut() = Some(boxes.into_iter().map(Operand::Box).collect());
     }
 }
 
@@ -4849,7 +4856,7 @@ mod tests {
             args: std::cell::RefCell::new(smallvec::smallvec![Operand::Box(BoxRef::from_opref(OpRef::int_op(0)))]),
             descr: std::cell::RefCell::new(None),
             pos: std::cell::Cell::new(OpRef::NONE),
-            fail_args: std::cell::RefCell::new(Some(smallvec::smallvec![BoxRef::from_opref(OpRef::int_op(0)), BoxRef::from_opref(OpRef::int_op(1))])),
+            fail_args: std::cell::RefCell::new(Some(smallvec::smallvec![Operand::Box(BoxRef::from_opref(OpRef::int_op(0))), Operand::Box(BoxRef::from_opref(OpRef::int_op(1)))])),
 
 
             fail_arg_types: std::cell::RefCell::new(None),
@@ -4916,7 +4923,7 @@ mod tests {
                 args: std::cell::RefCell::new(smallvec::smallvec![Operand::Box(BoxRef::from_opref(OpRef::int_op(0)))]),
                 descr: std::cell::RefCell::new(None),
                 pos: std::cell::Cell::new(OpRef::NONE),
-                fail_args: std::cell::RefCell::new(Some(smallvec::smallvec![BoxRef::from_opref(OpRef::int_op(0)), BoxRef::from_opref(OpRef::int_op(1))])),
+                fail_args: std::cell::RefCell::new(Some(smallvec::smallvec![Operand::Box(BoxRef::from_opref(OpRef::int_op(0))), Operand::Box(BoxRef::from_opref(OpRef::int_op(1)))])),
 
                 fail_arg_types: std::cell::RefCell::new(None),
                 rd_resume_position: std::cell::Cell::new(-1),
@@ -4948,7 +4955,7 @@ mod tests {
             args: std::cell::RefCell::new(smallvec::smallvec![Operand::Box(BoxRef::from_opref(OpRef::int_op(0)))]),
             descr: std::cell::RefCell::new(None),
             pos: std::cell::Cell::new(OpRef::NONE),
-            fail_args: std::cell::RefCell::new(Some(smallvec::smallvec![BoxRef::from_opref(OpRef::int_op(0)), BoxRef::from_opref(OpRef::int_op(10_000))])),
+            fail_args: std::cell::RefCell::new(Some(smallvec::smallvec![Operand::Box(BoxRef::from_opref(OpRef::int_op(0))), Operand::Box(BoxRef::from_opref(OpRef::int_op(10_000)))])),
 
 
             fail_arg_types: std::cell::RefCell::new(None),
@@ -5070,7 +5077,7 @@ mod tests {
                 args: std::cell::RefCell::new(smallvec::smallvec![Operand::Box(BoxRef::from_opref(OpRef::int_op(2)))]),
                 descr: std::cell::RefCell::new(None),
                 pos: std::cell::Cell::new(OpRef::NONE),
-                fail_args: std::cell::RefCell::new(Some(smallvec::smallvec![BoxRef::from_opref(OpRef::int_op(0)), BoxRef::from_opref(OpRef::int_op(1))])),
+                fail_args: std::cell::RefCell::new(Some(smallvec::smallvec![Operand::Box(BoxRef::from_opref(OpRef::int_op(0))), Operand::Box(BoxRef::from_opref(OpRef::int_op(1)))])),
 
                 fail_arg_types: std::cell::RefCell::new(None),
                 rd_resume_position: std::cell::Cell::new(-1),
@@ -5177,7 +5184,7 @@ mod tests {
                 args: std::cell::RefCell::new(smallvec::smallvec![Operand::Box(BoxRef::from_opref(OpRef::int_op(3)))]),
                 descr: std::cell::RefCell::new(None),
                 pos: std::cell::Cell::new(OpRef::NONE),
-                fail_args: std::cell::RefCell::new(Some(smallvec::smallvec![BoxRef::from_opref(OpRef::int_op(0)), BoxRef::from_opref(OpRef::int_op(2))])),
+                fail_args: std::cell::RefCell::new(Some(smallvec::smallvec![Operand::Box(BoxRef::from_opref(OpRef::int_op(0))), Operand::Box(BoxRef::from_opref(OpRef::int_op(2)))])),
 
                 fail_arg_types: std::cell::RefCell::new(None),
                 rd_resume_position: std::cell::Cell::new(-1),
@@ -5233,7 +5240,7 @@ mod tests {
                 args: std::cell::RefCell::new(smallvec::smallvec![Operand::Box(BoxRef::from_opref(OpRef::int_op(0)))]),
                 descr: std::cell::RefCell::new(None),
                 pos: std::cell::Cell::new(OpRef::NONE),
-                fail_args: std::cell::RefCell::new(Some(smallvec::smallvec![BoxRef::from_opref(OpRef::int_op(0))])),
+                fail_args: std::cell::RefCell::new(Some(smallvec::smallvec![Operand::Box(BoxRef::from_opref(OpRef::int_op(0)))])),
 
                 fail_arg_types: std::cell::RefCell::new(None),
                 rd_resume_position: std::cell::Cell::new(-1),
@@ -5244,7 +5251,7 @@ mod tests {
                 args: std::cell::RefCell::new(smallvec::smallvec![Operand::Box(BoxRef::from_opref(OpRef::int_op(1)))]),
                 descr: std::cell::RefCell::new(None),
                 pos: std::cell::Cell::new(OpRef::NONE),
-                fail_args: std::cell::RefCell::new(Some(smallvec::smallvec![BoxRef::from_opref(OpRef::int_op(0)), BoxRef::from_opref(OpRef::int_op(1)), BoxRef::from_opref(OpRef::int_op(2))])),
+                fail_args: std::cell::RefCell::new(Some(smallvec::smallvec![Operand::Box(BoxRef::from_opref(OpRef::int_op(0))), Operand::Box(BoxRef::from_opref(OpRef::int_op(1))), Operand::Box(BoxRef::from_opref(OpRef::int_op(2)))])),
 
 
                 fail_arg_types: std::cell::RefCell::new(None),
