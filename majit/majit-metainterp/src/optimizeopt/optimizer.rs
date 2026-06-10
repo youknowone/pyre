@@ -3896,9 +3896,10 @@ impl Optimizer {
         // the same canonicalization the pass-entry resolver applies.
         for i in 0..op.num_args() {
             let forced = self.force_box(op.arg(i).to_opref(), ctx);
-            let resolved = ctx
-                .get_box_replacement_box(forced)
-                .unwrap_or_else(|| BoxRef::from_opref(forced));
+            let resolved = match ctx.get_box_replacement_box(forced) {
+                Some(b) => b,
+                None => ctx.materialize_box_at(forced),
+            };
             // The forced value is a chain terminal, so its canonical box's
             // OpRef identity equals `forced`; OpRef-keyed consumers (backend,
             // box_pool) see the same key, only the _forwarded info is added.
