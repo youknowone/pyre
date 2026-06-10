@@ -1405,15 +1405,16 @@ impl ProducedShortOp {
         // single-table `imported_short_pure_ops` covers both because
         // `pure.rs` consults it for both arms during `optimize_pure_op` and
         // `optimize_call_pure_*`.
-        ctx.imported_short_pure_ops
-            .push(crate::optimizeopt::ImportedShortPureOp::new(
-                opcode,
-                self.preamble_op.getdescr(),
-                args,
-                result_opref,
-                source,
-                self.invented_name,
-            ));
+        let imported = crate::optimizeopt::ImportedShortPureOp::new(
+            ctx,
+            opcode,
+            self.preamble_op.getdescr(),
+            args,
+            result_opref,
+            source,
+            self.invented_name,
+        );
+        ctx.imported_short_pure_ops.push(imported);
         // shortpreamble.py:432-440 add_preamble_op + 437-438 extra_same_as:
         // RPython collects the SameAs op into `short_preamble_producer.extra_same_as`
         // lazily at use-box time (force_op_from_preamble path).  majit's

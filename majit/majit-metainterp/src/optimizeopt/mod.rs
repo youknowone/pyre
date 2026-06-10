@@ -422,7 +422,13 @@ pub struct ImportedShortPureOp {
 
 impl ImportedShortPureOp {
     /// Construct with auto-generated PreambleOp from fields.
+    ///
+    /// `ctx` binds the replay op's operands to their canonical producers
+    /// (`materialize_box_at`) — shortpreamble.py:425 seeds the replay
+    /// `preamble_op` with the SAME Box objects the body sees, so the
+    /// operands must carry producer identity, not a position-only echo.
     pub fn new(
+        ctx: &mut OptContext,
         opcode: OpCode,
         descr: Option<DescrRef>,
         args: Vec<ImportedShortPureArg>,
@@ -439,7 +445,7 @@ impl ImportedShortPureOp {
             .collect();
         let replay_arg_boxes: Vec<crate::r#box::BoxRef> = replay_args
             .iter()
-            .map(|a| crate::r#box::BoxRef::from_opref(*a))
+            .map(|a| ctx.materialize_box_at(*a))
             .collect();
         let mut replay = majit_ir::Op::new(opcode, &replay_arg_boxes);
         // shortpreamble.py:112-126 PureOp.produce_op constructs TWO distinct

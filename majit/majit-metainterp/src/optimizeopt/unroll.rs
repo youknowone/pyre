@@ -6416,20 +6416,19 @@ mod tests {
         // directly.
         let fresh_const = OpRef::const_ptr(ptr);
         assert_eq!(ctx2.get_constant(fresh_const), Some(Value::Ref(ptr)));
-        assert_eq!(
-            ctx2.imported_short_pure_ops,
-            vec![crate::optimizeopt::ImportedShortPureOp::new(
-                OpCode::GetfieldGcPureI,
-                Some(field_descr.clone()),
-                vec![crate::optimizeopt::ImportedShortPureArg::Const(
-                    Value::Ref(ptr),
-                    fresh_const,
-                )],
-                OpRef::int_op(11),
-                OpRef::int_op(11),
-                false
-            )]
+        let expected = crate::optimizeopt::ImportedShortPureOp::new(
+            &mut ctx2,
+            OpCode::GetfieldGcPureI,
+            Some(field_descr.clone()),
+            vec![crate::optimizeopt::ImportedShortPureArg::Const(
+                Value::Ref(ptr),
+                fresh_const,
+            )],
+            OpRef::int_op(11),
+            OpRef::int_op(11),
+            false,
         );
+        assert_eq!(ctx2.imported_short_pure_ops, vec![expected]);
     }
 
     #[test]
