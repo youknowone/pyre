@@ -391,7 +391,8 @@ impl CachedField {
                 .as_field_descr()
                 .map(|fd| OpCode::getfield_for_type(fd.field_type()))
                 .unwrap_or(OpCode::GetfieldGcI);
-            let mut op = Op::with_descr(opcode, &[BoxRef::from_opref(structbox)], descr.clone());
+            let mut op =
+                Op::with_descr(opcode, &[ctx.materialize_box_at(structbox)], descr.clone());
             op.pos.set(cached_val);
             sb.add_heap_op(op);
         }
@@ -630,11 +631,9 @@ impl ArrayCachedItem {
                 .as_array_descr()
                 .map(|array_descr| OpCode::getarrayitem_for_type(array_descr.item_type()))
                 .unwrap_or(OpCode::GetarrayitemGcI);
-            let mut op = Op::with_descr(
-                opcode,
-                &[BoxRef::from_opref(arraybox), BoxRef::from_opref(idx_ref)],
-                descr.clone(),
-            );
+            let arraybox_b = ctx.materialize_box_at(arraybox);
+            let idx_b = ctx.materialize_box_at(idx_ref);
+            let mut op = Op::with_descr(opcode, &[arraybox_b, idx_b], descr.clone());
             op.pos.set(cached_val);
             sb.add_heap_op(op);
         }

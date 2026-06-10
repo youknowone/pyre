@@ -2895,7 +2895,7 @@ impl OptContext {
                     }
                     let resolved_arg_boxes: Vec<crate::r#box::BoxRef> = resolved_args
                         .iter()
-                        .map(|a| crate::r#box::BoxRef::from_opref(*a))
+                        .map(|a| self.materialize_box_at(*a))
                         .collect();
                     let mut op = Op::new(
                         pure_call_opcode(produced_op.preamble_op.opcode),
@@ -2940,7 +2940,7 @@ impl OptContext {
                                 majit_ir::Type::Float => OpCode::GetfieldGcF,
                                 majit_ir::Type::Void => return false,
                             };
-                            let mut op = Op::new(opcode, &[crate::r#box::BoxRef::from_opref(obj)]);
+                            let mut op = Op::new(opcode, &[self.materialize_box_at(obj)]);
                             op.pos.set(replay_pos(*source, produced_op));
                             op.setdescr(descr);
                             ProducedShortOp {
@@ -2976,13 +2976,9 @@ impl OptContext {
                                 Some(r) => r,
                                 None => return false,
                             };
-                            let mut op = Op::new(
-                                opcode,
-                                &[
-                                    crate::r#box::BoxRef::from_opref(obj),
-                                    crate::r#box::BoxRef::from_opref(index_opref),
-                                ],
-                            );
+                            let obj_b = self.materialize_box_at(obj);
+                            let index_b = self.materialize_box_at(index_opref);
+                            let mut op = Op::new(opcode, &[obj_b, index_b]);
                             op.pos.set(replay_pos(*source, produced_op));
                             op.setdescr(descr);
                             ProducedShortOp {
@@ -3019,7 +3015,7 @@ impl OptContext {
                     }
                     let mut op = Op::new(
                         loop_invariant_opcode(result_type),
-                        &[crate::r#box::BoxRef::from_opref(func_opref)],
+                        &[self.materialize_box_at(func_opref)],
                     );
                     op.pos.set(replay_pos(*source, produced_op));
                     let new_pop = ProducedShortOp {
@@ -3302,13 +3298,9 @@ impl OptContext {
                 Value::Void => panic!("emit_const_guard: ConstVoid not allowed"),
             };
             ctx.seed_constant(c, value.clone());
-            guards.push(Op::new(
-                OpCode::GuardValue,
-                &[
-                    crate::r#box::BoxRef::from_opref(arg),
-                    crate::r#box::BoxRef::from_opref(c),
-                ],
-            ));
+            let arg_b = ctx.materialize_box_at(arg);
+            let c_b = ctx.materialize_box_at(c);
+            guards.push(Op::new(OpCode::GuardValue, &[arg_b, c_b]));
         };
         for entry in &arg_entries {
             match &entry.info {

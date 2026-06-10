@@ -60,12 +60,12 @@ fn autogen_eq_b(
 /// chained OptIntBounds rules (add_zero, int_is_zero, further reassoc)
 /// fire on the rewritten op. RPython's `send_extra_operation(opt=None)`
 /// (optimizer.py:567-589) is what the dispatcher's `Restart` arm models.
-fn replace_with(original: &Op, opcode: OpCode, args: &[OpRef]) -> OptimizationResult {
-    let ba: Vec<crate::r#box::BoxRef> = args
-        .iter()
-        .map(|a| crate::r#box::BoxRef::from_opref(*a))
-        .collect();
-    let mut new_op = Op::new(opcode, &ba);
+fn replace_with(
+    original: &Op,
+    opcode: OpCode,
+    args: &[crate::r#box::BoxRef],
+) -> OptimizationResult {
+    let mut new_op = Op::new(opcode, args);
     new_op.pos.set(original.pos.get());
     OptimizationResult::Restart(new_op)
 }
@@ -346,11 +346,11 @@ impl OptIntBounds {
         }
         // eq_zero: int_eq(0, x) => int_is_zero(x)
         if b0.is_constant() && b0.get_constant_int() == 0 {
-            return replace_with(op, OpCode::IntIsZero, &[arg1.to_opref()]);
+            return replace_with(op, OpCode::IntIsZero, &[arg1.clone()]);
         }
         // eq_zero: int_eq(x, 0) => int_is_zero(x)
         if b1.is_constant() && b1.get_constant_int() == 0 {
-            return replace_with(op, OpCode::IntIsZero, &[arg0.to_opref()]);
+            return replace_with(op, OpCode::IntIsZero, &[arg0.clone()]);
         }
         OptimizationResult::PassOn
     }
@@ -379,11 +379,11 @@ impl OptIntBounds {
         }
         // ne_zero: int_ne(0, x) => int_is_true(x)
         if b0.is_constant() && b0.get_constant_int() == 0 {
-            return replace_with(op, OpCode::IntIsTrue, &[arg1.to_opref()]);
+            return replace_with(op, OpCode::IntIsTrue, &[arg1.clone()]);
         }
         // ne_zero: int_ne(x, 0) => int_is_true(x)
         if b1.is_constant() && b1.get_constant_int() == 0 {
-            return replace_with(op, OpCode::IntIsTrue, &[arg0.to_opref()]);
+            return replace_with(op, OpCode::IntIsTrue, &[arg0.clone()]);
         }
         OptimizationResult::PassOn
     }
@@ -498,13 +498,21 @@ impl OptIntBounds {
                 if b_inner_0.is_constant() {
                     let folded = c_outer.wrapping_add(b_inner_0.get_constant_int());
                     let const_ref = ctx.make_constant_int(folded);
-                    return replace_with(op, OpCode::IntAdd, &[inner_1.to_opref(), const_ref]);
+                    return replace_with(
+                        op,
+                        OpCode::IntAdd,
+                        &[inner_1.clone(), ctx.materialize_box_at(const_ref)],
+                    );
                 }
                 // add_reassoc_consts: int_add(C2, int_add(x, C1)) => int_add(x, C1+C2)
                 if b_inner_1.is_constant() {
                     let folded = c_outer.wrapping_add(b_inner_1.get_constant_int());
                     let const_ref = ctx.make_constant_int(folded);
-                    return replace_with(op, OpCode::IntAdd, &[inner_0.to_opref(), const_ref]);
+                    return replace_with(
+                        op,
+                        OpCode::IntAdd,
+                        &[inner_0.clone(), ctx.materialize_box_at(const_ref)],
+                    );
                 }
             } else if let Some(arg1_sub) = self.as_operation_b(&arg1, OpCode::IntSub, ctx) {
                 let inner_0 = self.resolve_box(arg1_sub.arg(0), ctx);
@@ -515,13 +523,21 @@ impl OptIntBounds {
                 if b_inner_0.is_constant() {
                     let folded = c_outer.wrapping_add(b_inner_0.get_constant_int());
                     let const_ref = ctx.make_constant_int(folded);
-                    return replace_with(op, OpCode::IntSub, &[const_ref, inner_1.to_opref()]);
+                    return replace_with(
+                        op,
+                        OpCode::IntSub,
+                        &[ctx.materialize_box_at(const_ref), inner_1.clone()],
+                    );
                 }
                 // add_sub_x_c_c: int_add(C2, int_sub(x, C1)) => int_add(x, C2-C1)
                 if b_inner_1.is_constant() {
                     let folded = c_outer.wrapping_sub(b_inner_1.get_constant_int());
                     let const_ref = ctx.make_constant_int(folded);
-                    return replace_with(op, OpCode::IntAdd, &[inner_0.to_opref(), const_ref]);
+                    return replace_with(
+                        op,
+                        OpCode::IntAdd,
+                        &[inner_0.clone(), ctx.materialize_box_at(const_ref)],
+                    );
                 }
             }
         } else {
@@ -537,13 +553,21 @@ impl OptIntBounds {
                     if b_inner_0.is_constant() {
                         let folded = b_inner_0.get_constant_int().wrapping_add(c_outer);
                         let const_ref = ctx.make_constant_int(folded);
-                        return replace_with(op, OpCode::IntAdd, &[inner_1.to_opref(), const_ref]);
+                        return replace_with(
+                            op,
+                            OpCode::IntAdd,
+                            &[inner_1.clone(), ctx.materialize_box_at(const_ref)],
+                        );
                     }
                     // add_reassoc_consts: int_add(int_add(x, C1), C2) => int_add(x, C1+C2)
                     if b_inner_1.is_constant() {
                         let folded = b_inner_1.get_constant_int().wrapping_add(c_outer);
                         let const_ref = ctx.make_constant_int(folded);
-                        return replace_with(op, OpCode::IntAdd, &[inner_0.to_opref(), const_ref]);
+                        return replace_with(
+                            op,
+                            OpCode::IntAdd,
+                            &[inner_0.clone(), ctx.materialize_box_at(const_ref)],
+                        );
                     }
                 }
             } else if let Some(arg0_sub) = self.as_operation_b(&arg0, OpCode::IntSub, ctx) {
@@ -557,13 +581,21 @@ impl OptIntBounds {
                     if b_inner_0.is_constant() {
                         let folded = b_inner_0.get_constant_int().wrapping_add(c_outer);
                         let const_ref = ctx.make_constant_int(folded);
-                        return replace_with(op, OpCode::IntSub, &[const_ref, inner_1.to_opref()]);
+                        return replace_with(
+                            op,
+                            OpCode::IntSub,
+                            &[ctx.materialize_box_at(const_ref), inner_1.clone()],
+                        );
                     }
                     // add_sub_x_c_c: int_add(int_sub(x, C1), C2) => int_add(x, C2-C1)
                     if b_inner_1.is_constant() {
                         let folded = c_outer.wrapping_sub(b_inner_1.get_constant_int());
                         let const_ref = ctx.make_constant_int(folded);
-                        return replace_with(op, OpCode::IntAdd, &[inner_0.to_opref(), const_ref]);
+                        return replace_with(
+                            op,
+                            OpCode::IntAdd,
+                            &[inner_0.clone(), ctx.materialize_box_at(const_ref)],
+                        );
                     }
                 }
             }
@@ -647,13 +679,13 @@ impl OptIntBounds {
         }
         // sub_from_zero: int_sub(0, x) => int_neg(x)
         if b0.is_constant() && b0.get_constant_int() == 0 {
-            return replace_with(op, OpCode::IntNeg, &[arg1.to_opref()]);
+            return replace_with(op, OpCode::IntNeg, &[arg1.clone()]);
         }
         if let Some(arg0_int_invert) = self.as_operation_b(&arg0, OpCode::IntInvert, ctx) {
             let arg0_0 = self.resolve_box(arg0_int_invert.arg(0), ctx);
             // sub_invert_one: int_sub(int_invert(x), -1) => int_neg(x)
             if b1.is_constant() && b1.get_constant_int() == -1 {
-                return replace_with(op, OpCode::IntNeg, &[arg0_0.to_opref()]);
+                return replace_with(op, OpCode::IntNeg, &[arg0_0.clone()]);
             }
         } else if let Some(arg0_int_add) = self.as_operation_b(&arg0, OpCode::IntAdd, ctx) {
             let arg0_0 = self.resolve_box(arg0_int_add.arg(0), ctx);
@@ -666,13 +698,21 @@ impl OptIntBounds {
                 if b0_0.is_constant() {
                     let folded = c_outer.wrapping_sub(b0_0.get_constant_int());
                     let const_ref = ctx.make_constant_int(folded);
-                    return replace_with(op, OpCode::IntSub, &[arg0_1.to_opref(), const_ref]);
+                    return replace_with(
+                        op,
+                        OpCode::IntSub,
+                        &[arg0_1.clone(), ctx.materialize_box_at(const_ref)],
+                    );
                 }
                 // sub_add_consts: int_sub(int_add(x, C1), C2) => int_sub(x, C-C1)
                 if b0_1.is_constant() {
                     let folded = c_outer.wrapping_sub(b0_1.get_constant_int());
                     let const_ref = ctx.make_constant_int(folded);
-                    return replace_with(op, OpCode::IntSub, &[arg0_0.to_opref(), const_ref]);
+                    return replace_with(
+                        op,
+                        OpCode::IntSub,
+                        &[arg0_0.clone(), ctx.materialize_box_at(const_ref)],
+                    );
                 }
             }
         } else if let Some(arg0_int_sub) = self.as_operation_b(&arg0, OpCode::IntSub, ctx) {
@@ -686,13 +726,21 @@ impl OptIntBounds {
                 if b0_0.is_constant() {
                     let folded = b0_0.get_constant_int().wrapping_sub(c_outer);
                     let const_ref = ctx.make_constant_int(folded);
-                    return replace_with(op, OpCode::IntSub, &[const_ref, arg0_1.to_opref()]);
+                    return replace_with(
+                        op,
+                        OpCode::IntSub,
+                        &[ctx.materialize_box_at(const_ref), arg0_1.clone()],
+                    );
                 }
                 // sub_sub_left_x_c_c: int_sub(int_sub(x, C1), C2) => int_sub(x, C1+C2)
                 if b0_1.is_constant() {
                     let folded = b0_1.get_constant_int().wrapping_add(c_outer);
                     let const_ref = ctx.make_constant_int(folded);
-                    return replace_with(op, OpCode::IntSub, &[arg0_0.to_opref(), const_ref]);
+                    return replace_with(
+                        op,
+                        OpCode::IntSub,
+                        &[arg0_0.clone(), ctx.materialize_box_at(const_ref)],
+                    );
                 }
             }
         }
@@ -703,11 +751,11 @@ impl OptIntBounds {
             let b1_1 = self.getintbound_b(&arg1_1, ctx);
             // sub_add_neg: int_sub(y, int_add(x, y)) => int_neg(x)
             if autogen_eq_b(&arg1_1, &b1_1, &arg0, &b0) {
-                return replace_with(op, OpCode::IntNeg, &[arg1_0.to_opref()]);
+                return replace_with(op, OpCode::IntNeg, &[arg1_0.clone()]);
             }
             // sub_add_neg: int_sub(y, int_add(y, x)) => int_neg(x)
             if autogen_eq_b(&arg1_0, &b1_0, &arg0, &b0) {
-                return replace_with(op, OpCode::IntNeg, &[arg1_1.to_opref()]);
+                return replace_with(op, OpCode::IntNeg, &[arg1_1.clone()]);
             }
         }
         OptimizationResult::PassOn
@@ -752,14 +800,18 @@ impl OptIntBounds {
             let c = b0.get_constant_int();
             // mul_minus_one: int_mul(-1, x) => int_neg(x)
             if c == -1 {
-                return replace_with(op, OpCode::IntNeg, &[arg1.to_opref()]);
+                return replace_with(op, OpCode::IntNeg, &[arg1.clone()]);
             }
             // mul_pow2_const: int_mul(C, x) where C > 0 && (C & (C-1)) == 0
             // => int_lshift(x, highest_bit(C))
             if c > 0 && (c & c.wrapping_sub(1)) == 0 {
                 let shift = c.trailing_zeros() as i64;
                 let shift_ref = ctx.make_constant_int(shift);
-                return replace_with(op, OpCode::IntLshift, &[arg1.to_opref(), shift_ref]);
+                return replace_with(
+                    op,
+                    OpCode::IntLshift,
+                    &[arg1.clone(), ctx.materialize_box_at(shift_ref)],
+                );
             }
         } else if let Some(arg0_lshift) = self.as_operation_b(&arg0, OpCode::IntLshift, ctx) {
             // mul_lshift: int_mul(int_lshift(1, y), x) => int_lshift(x, y)
@@ -772,11 +824,7 @@ impl OptIntBounds {
                 && b_inner_1.known_ge_const(0)
                 && b_inner_1.known_le_const(64)
             {
-                return replace_with(
-                    op,
-                    OpCode::IntLshift,
-                    &[arg1.to_opref(), inner_1.to_opref()],
-                );
+                return replace_with(op, OpCode::IntLshift, &[arg1.clone(), inner_1.clone()]);
             }
         }
         // Outer const on arg1: mul_minus_one / mul_pow2_const
@@ -784,13 +832,17 @@ impl OptIntBounds {
             let c = b1.get_constant_int();
             // mul_minus_one: int_mul(x, -1) => int_neg(x)
             if c == -1 {
-                return replace_with(op, OpCode::IntNeg, &[arg0.to_opref()]);
+                return replace_with(op, OpCode::IntNeg, &[arg0.clone()]);
             }
             // mul_pow2_const: int_mul(x, C) where C > 0 && pow2
             if c > 0 && (c & c.wrapping_sub(1)) == 0 {
                 let shift = c.trailing_zeros() as i64;
                 let shift_ref = ctx.make_constant_int(shift);
-                return replace_with(op, OpCode::IntLshift, &[arg0.to_opref(), shift_ref]);
+                return replace_with(
+                    op,
+                    OpCode::IntLshift,
+                    &[arg0.clone(), ctx.materialize_box_at(shift_ref)],
+                );
             }
         } else if let Some(arg1_lshift) = self.as_operation_b(&arg1, OpCode::IntLshift, ctx) {
             // mul_lshift: int_mul(x, int_lshift(1, y)) => int_lshift(x, y)
@@ -803,11 +855,7 @@ impl OptIntBounds {
                 && b_inner_1.known_ge_const(0)
                 && b_inner_1.known_le_const(64)
             {
-                return replace_with(
-                    op,
-                    OpCode::IntLshift,
-                    &[arg0.to_opref(), inner_1.to_opref()],
-                );
+                return replace_with(op, OpCode::IntLshift, &[arg0.clone(), inner_1.clone()]);
             }
         }
         OptimizationResult::PassOn
@@ -888,13 +936,21 @@ impl OptIntBounds {
                 if b_inner_0.is_constant() {
                     let folded = b_inner_0.get_constant_int() & c_outer;
                     let const_ref = ctx.make_constant_int(folded);
-                    return replace_with(op, OpCode::IntAnd, &[inner_1.to_opref(), const_ref]);
+                    return replace_with(
+                        op,
+                        OpCode::IntAnd,
+                        &[inner_1.clone(), ctx.materialize_box_at(const_ref)],
+                    );
                 }
                 // and_reassoc_consts: int_and(C2, int_and(x, C1)) => int_and(x, C1&C2)
                 if b_inner_1.is_constant() {
                     let folded = b_inner_1.get_constant_int() & c_outer;
                     let const_ref = ctx.make_constant_int(folded);
-                    return replace_with(op, OpCode::IntAnd, &[inner_0.to_opref(), const_ref]);
+                    return replace_with(
+                        op,
+                        OpCode::IntAnd,
+                        &[inner_0.clone(), ctx.materialize_box_at(const_ref)],
+                    );
                 }
             }
         } else if let Some(arg0_and) = self.as_operation_b(&arg0, OpCode::IntAnd, ctx) {
@@ -907,7 +963,11 @@ impl OptIntBounds {
                     // and_reassoc_consts: int_and(int_and(C1, x), C2) => int_and(x, C1&C2)
                     let folded = b_inner_0.get_constant_int() & b1.get_constant_int();
                     let const_ref = ctx.make_constant_int(folded);
-                    return replace_with(op, OpCode::IntAnd, &[inner_1.to_opref(), const_ref]);
+                    return replace_with(
+                        op,
+                        OpCode::IntAnd,
+                        &[inner_1.clone(), ctx.materialize_box_at(const_ref)],
+                    );
                 }
             }
             if b_inner_1.is_constant() {
@@ -915,24 +975,20 @@ impl OptIntBounds {
                     // and_reassoc_consts: int_and(int_and(x, C1), C2) => int_and(x, C1&C2)
                     let folded = b_inner_1.get_constant_int() & b1.get_constant_int();
                     let const_ref = ctx.make_constant_int(folded);
-                    return replace_with(op, OpCode::IntAnd, &[inner_0.to_opref(), const_ref]);
+                    return replace_with(
+                        op,
+                        OpCode::IntAnd,
+                        &[inner_0.clone(), ctx.materialize_box_at(const_ref)],
+                    );
                 }
             }
             // and_absorb: int_and(int_and(a, b), a) => int_and(a, b)
             if autogen_eq_b(&arg1, &b1, &inner_0, &b_inner_0) {
-                return replace_with(
-                    op,
-                    OpCode::IntAnd,
-                    &[inner_0.to_opref(), inner_1.to_opref()],
-                );
+                return replace_with(op, OpCode::IntAnd, &[inner_0.clone(), inner_1.clone()]);
             }
             // and_absorb: int_and(int_and(b, a), a) => int_and(a, b)
             if autogen_eq_b(&arg1, &b1, &inner_1, &b_inner_1) {
-                return replace_with(
-                    op,
-                    OpCode::IntAnd,
-                    &[inner_1.to_opref(), inner_0.to_opref()],
-                );
+                return replace_with(op, OpCode::IntAnd, &[inner_1.clone(), inner_0.clone()]);
             }
         } else if let Some(arg0_or) = self.as_operation_b(&arg0, OpCode::IntOr, ctx) {
             let inner_0 = self.resolve_box(arg0_or.arg(0), ctx);
@@ -941,11 +997,11 @@ impl OptIntBounds {
             let b_inner_1 = self.getintbound_b(&inner_1, ctx);
             // and_or: int_and(int_or(x, y), z) => int_and(x, z)
             if b_inner_1.and_bound(&b1).known_eq_const(0) {
-                return replace_with(op, OpCode::IntAnd, &[inner_0.to_opref(), arg1.to_opref()]);
+                return replace_with(op, OpCode::IntAnd, &[inner_0.clone(), arg1.clone()]);
             }
             // and_or: int_and(int_or(y, x), z) => int_and(x, z)
             if b_inner_0.and_bound(&b1).known_eq_const(0) {
-                return replace_with(op, OpCode::IntAnd, &[inner_1.to_opref(), arg1.to_opref()]);
+                return replace_with(op, OpCode::IntAnd, &[inner_1.clone(), arg1.clone()]);
             }
         }
         // Symmetric arm: producer on arg1.
@@ -956,11 +1012,11 @@ impl OptIntBounds {
             let b_inner_1 = self.getintbound_b(&inner_1, ctx);
             // and_absorb: int_and(a, int_and(a, b)) => int_and(a, b)
             if autogen_eq_b(&inner_0, &b_inner_0, &arg0, &b0) {
-                return replace_with(op, OpCode::IntAnd, &[arg0.to_opref(), inner_1.to_opref()]);
+                return replace_with(op, OpCode::IntAnd, &[arg0.clone(), inner_1.clone()]);
             }
             // and_absorb: int_and(a, int_and(b, a)) => int_and(a, b)
             if autogen_eq_b(&inner_1, &b_inner_1, &arg0, &b0) {
-                return replace_with(op, OpCode::IntAnd, &[arg0.to_opref(), inner_0.to_opref()]);
+                return replace_with(op, OpCode::IntAnd, &[arg0.clone(), inner_0.clone()]);
             }
         } else if let Some(arg1_or) = self.as_operation_b(&arg1, OpCode::IntOr, ctx) {
             let inner_0 = self.resolve_box(arg1_or.arg(0), ctx);
@@ -969,11 +1025,11 @@ impl OptIntBounds {
             let b_inner_1 = self.getintbound_b(&inner_1, ctx);
             // and_or: int_and(z, int_or(x, y)) => int_and(x, z)
             if b_inner_1.and_bound(&b0).known_eq_const(0) {
-                return replace_with(op, OpCode::IntAnd, &[inner_0.to_opref(), arg0.to_opref()]);
+                return replace_with(op, OpCode::IntAnd, &[inner_0.clone(), arg0.clone()]);
             }
             // and_or: int_and(z, int_or(y, x)) => int_and(x, z)
             if b_inner_0.and_bound(&b0).known_eq_const(0) {
-                return replace_with(op, OpCode::IntAnd, &[inner_1.to_opref(), arg0.to_opref()]);
+                return replace_with(op, OpCode::IntAnd, &[inner_1.clone(), arg0.clone()]);
             }
         }
         OptimizationResult::PassOn
@@ -1040,13 +1096,21 @@ impl OptIntBounds {
                 if b_inner_0.is_constant() {
                     let folded = b_inner_0.get_constant_int() | c_outer;
                     let const_ref = ctx.make_constant_int(folded);
-                    return replace_with(op, OpCode::IntOr, &[inner_1.to_opref(), const_ref]);
+                    return replace_with(
+                        op,
+                        OpCode::IntOr,
+                        &[inner_1.clone(), ctx.materialize_box_at(const_ref)],
+                    );
                 }
                 // or_reassoc_consts: int_or(C2, int_or(x, C1)) => int_or(x, C1|C2)
                 if b_inner_1.is_constant() {
                     let folded = b_inner_1.get_constant_int() | c_outer;
                     let const_ref = ctx.make_constant_int(folded);
-                    return replace_with(op, OpCode::IntOr, &[inner_0.to_opref(), const_ref]);
+                    return replace_with(
+                        op,
+                        OpCode::IntOr,
+                        &[inner_0.clone(), ctx.materialize_box_at(const_ref)],
+                    );
                 }
             }
         } else if let Some(arg0_and) = self.as_operation_b(&arg0, OpCode::IntAnd, ctx) {
@@ -1070,7 +1134,7 @@ impl OptIntBounds {
                             return replace_with(
                                 op,
                                 OpCode::IntAnd,
-                                &[arg0_1.to_opref(), const_ref],
+                                &[arg0_1.clone(), ctx.materialize_box_at(const_ref)],
                             );
                         }
                         // dead twin per autogenintrules.py:668-673
@@ -1080,7 +1144,7 @@ impl OptIntBounds {
                             return replace_with(
                                 op,
                                 OpCode::IntAnd,
-                                &[arg0_1.to_opref(), const_ref],
+                                &[arg0_1.clone(), ctx.materialize_box_at(const_ref)],
                             );
                         }
                     }
@@ -1092,7 +1156,7 @@ impl OptIntBounds {
                             return replace_with(
                                 op,
                                 OpCode::IntAnd,
-                                &[arg0_1.to_opref(), const_ref],
+                                &[arg0_1.clone(), ctx.materialize_box_at(const_ref)],
                             );
                         }
                         // dead twin per autogenintrules.py:684-689
@@ -1102,7 +1166,7 @@ impl OptIntBounds {
                             return replace_with(
                                 op,
                                 OpCode::IntAnd,
-                                &[arg0_1.to_opref(), const_ref],
+                                &[arg0_1.clone(), ctx.materialize_box_at(const_ref)],
                             );
                         }
                     }
@@ -1123,7 +1187,7 @@ impl OptIntBounds {
                             return replace_with(
                                 op,
                                 OpCode::IntAnd,
-                                &[arg0_0.to_opref(), const_ref],
+                                &[arg0_0.clone(), ctx.materialize_box_at(const_ref)],
                             );
                         }
                         // dead twin per autogenintrules.py:708-713
@@ -1133,7 +1197,7 @@ impl OptIntBounds {
                             return replace_with(
                                 op,
                                 OpCode::IntAnd,
-                                &[arg0_0.to_opref(), const_ref],
+                                &[arg0_0.clone(), ctx.materialize_box_at(const_ref)],
                             );
                         }
                     }
@@ -1145,7 +1209,7 @@ impl OptIntBounds {
                             return replace_with(
                                 op,
                                 OpCode::IntAnd,
-                                &[arg0_0.to_opref(), const_ref],
+                                &[arg0_0.clone(), ctx.materialize_box_at(const_ref)],
                             );
                         }
                         // dead twin per autogenintrules.py:724-729
@@ -1155,7 +1219,7 @@ impl OptIntBounds {
                             return replace_with(
                                 op,
                                 OpCode::IntAnd,
-                                &[arg0_0.to_opref(), const_ref],
+                                &[arg0_0.clone(), ctx.materialize_box_at(const_ref)],
                             );
                         }
                     }
@@ -1170,21 +1234,29 @@ impl OptIntBounds {
                 // or_reassoc_consts: int_or(int_or(C1, x), C2) => int_or(x, C1|C2)
                 let folded = b_arg0_0.get_constant_int() | b1.get_constant_int();
                 let const_ref = ctx.make_constant_int(folded);
-                return replace_with(op, OpCode::IntOr, &[arg0_1.to_opref(), const_ref]);
+                return replace_with(
+                    op,
+                    OpCode::IntOr,
+                    &[arg0_1.clone(), ctx.materialize_box_at(const_ref)],
+                );
             }
             if b_arg0_1.is_constant() && b1.is_constant() {
                 // or_reassoc_consts: int_or(int_or(x, C1), C2) => int_or(x, C1|C2)
                 let folded = b_arg0_1.get_constant_int() | b1.get_constant_int();
                 let const_ref = ctx.make_constant_int(folded);
-                return replace_with(op, OpCode::IntOr, &[arg0_0.to_opref(), const_ref]);
+                return replace_with(
+                    op,
+                    OpCode::IntOr,
+                    &[arg0_0.clone(), ctx.materialize_box_at(const_ref)],
+                );
             }
             // or_absorb: int_or(int_or(a, b), a) => int_or(a, b)
             if autogen_eq_b(&arg1, &b1, &arg0_0, &b_arg0_0) {
-                return replace_with(op, OpCode::IntOr, &[arg0_0.to_opref(), arg0_1.to_opref()]);
+                return replace_with(op, OpCode::IntOr, &[arg0_0.clone(), arg0_1.clone()]);
             }
             // or_absorb: int_or(int_or(b, a), a) => int_or(a, b)
             if autogen_eq_b(&arg1, &b1, &arg0_1, &b_arg0_1) {
-                return replace_with(op, OpCode::IntOr, &[arg0_1.to_opref(), arg0_0.to_opref()]);
+                return replace_with(op, OpCode::IntOr, &[arg0_1.clone(), arg0_0.clone()]);
             }
         }
         // Symmetric arm: producer on arg1.
@@ -1195,11 +1267,11 @@ impl OptIntBounds {
             let b_arg1_1 = self.getintbound_b(&arg1_1, ctx);
             // or_absorb: int_or(a, int_or(a, b)) => int_or(a, b)
             if autogen_eq_b(&arg1_0, &b_arg1_0, &arg0, &b0) {
-                return replace_with(op, OpCode::IntOr, &[arg0.to_opref(), arg1_1.to_opref()]);
+                return replace_with(op, OpCode::IntOr, &[arg0.clone(), arg1_1.clone()]);
             }
             // or_absorb: int_or(a, int_or(b, a)) => int_or(a, b)
             if autogen_eq_b(&arg1_1, &b_arg1_1, &arg0, &b0) {
-                return replace_with(op, OpCode::IntOr, &[arg0.to_opref(), arg1_0.to_opref()]);
+                return replace_with(op, OpCode::IntOr, &[arg0.clone(), arg1_0.clone()]);
             }
         }
         OptimizationResult::PassOn
@@ -1296,22 +1368,30 @@ impl OptIntBounds {
                 if b_inner_0.is_constant() {
                     let folded = b_inner_0.get_constant_int() ^ c_outer;
                     let const_ref = ctx.make_constant_int(folded);
-                    return replace_with(op, OpCode::IntXor, &[inner_1.to_opref(), const_ref]);
+                    return replace_with(
+                        op,
+                        OpCode::IntXor,
+                        &[inner_1.clone(), ctx.materialize_box_at(const_ref)],
+                    );
                 }
                 // xor_reassoc_consts: int_xor(C2, int_xor(x, C1)) => int_xor(x, C1^C2)
                 if b_inner_1.is_constant() {
                     let folded = b_inner_1.get_constant_int() ^ c_outer;
                     let const_ref = ctx.make_constant_int(folded);
-                    return replace_with(op, OpCode::IntXor, &[inner_0.to_opref(), const_ref]);
+                    return replace_with(
+                        op,
+                        OpCode::IntXor,
+                        &[inner_0.clone(), ctx.materialize_box_at(const_ref)],
+                    );
                 }
             }
             // xor_minus_1: int_xor(-1, x) => int_invert(x)
             if c_outer == -1 {
-                return replace_with(op, OpCode::IntInvert, &[arg1.to_opref()]);
+                return replace_with(op, OpCode::IntInvert, &[arg1.clone()]);
             }
             // xor_is_not: int_xor(1, x) => int_is_zero(x)  (when x is bool)
             if c_outer == 1 && b1.is_bool() {
-                return replace_with(op, OpCode::IntIsZero, &[arg1.to_opref()]);
+                return replace_with(op, OpCode::IntIsZero, &[arg1.clone()]);
             }
         } else if let Some(arg0_xor) = self.as_operation_b(&arg0, OpCode::IntXor, ctx) {
             let inner_0 = self.resolve_box(arg0_xor.arg(0), ctx);
@@ -1322,13 +1402,21 @@ impl OptIntBounds {
                 // xor_reassoc_consts: int_xor(int_xor(C1, x), C2) => int_xor(x, C1^C2)
                 let folded = b_inner_0.get_constant_int() ^ b1.get_constant_int();
                 let const_ref = ctx.make_constant_int(folded);
-                return replace_with(op, OpCode::IntXor, &[inner_1.to_opref(), const_ref]);
+                return replace_with(
+                    op,
+                    OpCode::IntXor,
+                    &[inner_1.clone(), ctx.materialize_box_at(const_ref)],
+                );
             }
             if b_inner_1.is_constant() && b1.is_constant() {
                 // xor_reassoc_consts: int_xor(int_xor(x, C1), C2) => int_xor(x, C1^C2)
                 let folded = b_inner_1.get_constant_int() ^ b1.get_constant_int();
                 let const_ref = ctx.make_constant_int(folded);
-                return replace_with(op, OpCode::IntXor, &[inner_0.to_opref(), const_ref]);
+                return replace_with(
+                    op,
+                    OpCode::IntXor,
+                    &[inner_0.clone(), ctx.materialize_box_at(const_ref)],
+                );
             }
         }
         // Constant-on-right arm (b_arg_1 constant): minus_1/is_not
@@ -1336,11 +1424,11 @@ impl OptIntBounds {
             let c = b1.get_constant_int();
             // xor_minus_1: int_xor(x, -1) => int_invert(x)
             if c == -1 {
-                return replace_with(op, OpCode::IntInvert, &[arg0.to_opref()]);
+                return replace_with(op, OpCode::IntInvert, &[arg0.clone()]);
             }
             // xor_is_not: int_xor(x, 1) => int_is_zero(x)  (when x is bool)
             if c == 1 && b0.is_bool() {
-                return replace_with(op, OpCode::IntIsZero, &[arg0.to_opref()]);
+                return replace_with(op, OpCode::IntIsZero, &[arg0.clone()]);
             }
         }
         OptimizationResult::PassOn
@@ -1425,7 +1513,11 @@ impl OptIntBounds {
                         if c_arg1 == c_r1 && (0..64).contains(&c_r1) {
                             let folded = c_arg0_0.wrapping_shl(c_r1 as u32);
                             let const_ref = ctx.make_constant_int(folded);
-                            return replace_with(op, OpCode::IntAnd, &[r0.to_opref(), const_ref]);
+                            return replace_with(
+                                op,
+                                OpCode::IntAnd,
+                                &[r0.clone(), ctx.materialize_box_at(const_ref)],
+                            );
                         }
                     }
                 } else if let Some(urshift) = self.as_operation_b(&inner_1, OpCode::UintRshift, ctx)
@@ -1440,7 +1532,11 @@ impl OptIntBounds {
                         if c_arg1 == c_r1 && (0..64).contains(&c_r1) {
                             let folded = c_arg0_0.wrapping_shl(c_r1 as u32);
                             let const_ref = ctx.make_constant_int(folded);
-                            return replace_with(op, OpCode::IntAnd, &[r0.to_opref(), const_ref]);
+                            return replace_with(
+                                op,
+                                OpCode::IntAnd,
+                                &[r0.clone(), ctx.materialize_box_at(const_ref)],
+                            );
                         }
                     }
                 }
@@ -1456,7 +1552,11 @@ impl OptIntBounds {
                     if c_arg1 == c_r1 && (0..64).contains(&c_r1) {
                         let folded = c_arg0_1.wrapping_shl(c_r1 as u32);
                         let const_ref = ctx.make_constant_int(folded);
-                        return replace_with(op, OpCode::IntAnd, &[r0.to_opref(), const_ref]);
+                        return replace_with(
+                            op,
+                            OpCode::IntAnd,
+                            &[r0.clone(), ctx.materialize_box_at(const_ref)],
+                        );
                     }
                 }
             } else if let Some(urshift) = self.as_operation_b(&inner_0, OpCode::UintRshift, ctx) {
@@ -1471,7 +1571,11 @@ impl OptIntBounds {
                     if c_arg1 == c_r1 && (0..64).contains(&c_r1) {
                         let folded = c_arg0_1.wrapping_shl(c_r1 as u32);
                         let const_ref = ctx.make_constant_int(folded);
-                        return replace_with(op, OpCode::IntAnd, &[r0.to_opref(), const_ref]);
+                        return replace_with(
+                            op,
+                            OpCode::IntAnd,
+                            &[r0.clone(), ctx.materialize_box_at(const_ref)],
+                        );
                     }
                 }
             }
@@ -1490,7 +1594,7 @@ impl OptIntBounds {
                         return replace_with(
                             op,
                             OpCode::IntLshift,
-                            &[inner_0.to_opref(), const_ref],
+                            &[inner_0.clone(), ctx.materialize_box_at(const_ref)],
                         );
                     }
                 }
@@ -1506,7 +1610,11 @@ impl OptIntBounds {
                 if c2 == c1 && (0..64).contains(&c1) {
                     let mask = (-1i64).wrapping_shl(c1 as u32);
                     let const_ref = ctx.make_constant_int(mask);
-                    return replace_with(op, OpCode::IntAnd, &[inner_0.to_opref(), const_ref]);
+                    return replace_with(
+                        op,
+                        OpCode::IntAnd,
+                        &[inner_0.clone(), ctx.materialize_box_at(const_ref)],
+                    );
                 }
             }
         } else if let Some(arg0_urshift) = self.as_operation_b(&arg0, OpCode::UintRshift, ctx) {
@@ -1520,7 +1628,11 @@ impl OptIntBounds {
                 if c2 == c1 && (0..64).contains(&c1) {
                     let mask = (-1i64).wrapping_shl(c1 as u32);
                     let const_ref = ctx.make_constant_int(mask);
-                    return replace_with(op, OpCode::IntAnd, &[inner_0.to_opref(), const_ref]);
+                    return replace_with(
+                        op,
+                        OpCode::IntAnd,
+                        &[inner_0.clone(), ctx.materialize_box_at(const_ref)],
+                    );
                 }
             }
         }
@@ -1586,7 +1698,7 @@ impl OptIntBounds {
                         return replace_with(
                             op,
                             OpCode::IntRshift,
-                            &[inner_0.to_opref(), const_ref],
+                            &[inner_0.clone(), ctx.materialize_box_at(const_ref)],
                         );
                     }
                 }
@@ -1625,12 +1737,20 @@ impl OptIntBounds {
             // is_true_and_minint: int_is_true(int_and(MININT, x)) => int_lt(x, 0)
             if b_inner_0.is_constant() && b_inner_0.get_constant_int() == i64::MIN {
                 let zero_ref = ctx.make_constant_int(0);
-                return replace_with(op, OpCode::IntLt, &[inner_1.to_opref(), zero_ref]);
+                return replace_with(
+                    op,
+                    OpCode::IntLt,
+                    &[inner_1.clone(), ctx.materialize_box_at(zero_ref)],
+                );
             }
             // is_true_and_minint: int_is_true(int_and(x, MININT)) => int_lt(x, 0)
             if b_inner_1.is_constant() && b_inner_1.get_constant_int() == i64::MIN {
                 let zero_ref = ctx.make_constant_int(0);
-                return replace_with(op, OpCode::IntLt, &[inner_0.to_opref(), zero_ref]);
+                return replace_with(
+                    op,
+                    OpCode::IntLt,
+                    &[inner_0.clone(), ctx.materialize_box_at(zero_ref)],
+                );
             }
         }
         OptimizationResult::PassOn
@@ -1715,7 +1835,11 @@ impl OptIntBounds {
                 if c2 == c1 && (0..64).contains(&c1) {
                     let mask = ((((-1i64) as u64) << c1) >> c1) as i64;
                     let const_ref = ctx.make_constant_int(mask);
-                    return replace_with(op, OpCode::IntAnd, &[inner_0.to_opref(), const_ref]);
+                    return replace_with(
+                        op,
+                        OpCode::IntAnd,
+                        &[inner_0.clone(), ctx.materialize_box_at(const_ref)],
+                    );
                 }
             }
         }

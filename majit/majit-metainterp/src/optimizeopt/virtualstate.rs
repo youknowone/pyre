@@ -2291,10 +2291,9 @@ impl GuardRequirement {
                 // `ConstInt(ptr2int(obj.typeptr))`, and backend regalloc
                 // reads `op.getarg(1).getint()`.
                 let class_const = ctx.make_constant_int(*expected_class);
-                let mut op = Op::new(
-                    OpCode::GuardClass,
-                    &[BoxRef::from_opref(arg), BoxRef::from_opref(class_const)],
-                );
+                let arg_b = ctx.materialize_box_at(arg);
+                let class_b = ctx.materialize_box_at(class_const);
+                let mut op = Op::new(OpCode::GuardClass, &[arg_b, class_b]);
                 op.setfailargs(Default::default());
                 vec![op]
             }
@@ -2315,10 +2314,9 @@ impl GuardRequirement {
                 // The class operand is the same ConstInt vtable address used
                 // by GUARD_CLASS.
                 let class_const = ctx.make_constant_int(*expected_class);
-                let mut op = Op::new(
-                    OpCode::GuardNonnullClass,
-                    &[BoxRef::from_opref(arg), BoxRef::from_opref(class_const)],
-                );
+                let arg_b = ctx.materialize_box_at(arg);
+                let class_b = ctx.materialize_box_at(class_const);
+                let mut op = Op::new(OpCode::GuardNonnullClass, &[arg_b, class_b]);
                 op.setfailargs(Default::default());
                 vec![op]
             }
@@ -2334,7 +2332,7 @@ impl GuardRequirement {
                         None => return Vec::new(),
                     }
                 };
-                let mut op = Op::new(OpCode::GuardNonnull, &[BoxRef::from_opref(arg)]);
+                let mut op = Op::new(OpCode::GuardNonnull, &[ctx.materialize_box_at(arg)]);
                 op.setfailargs(Default::default());
                 vec![op]
             }
@@ -2363,10 +2361,9 @@ impl GuardRequirement {
                     Value::Ref(r) => ctx.make_constant_ref(*r),
                     Value::Void => unreachable!("LEVEL_CONSTANT cannot be Void"),
                 };
-                let mut op = Op::new(
-                    OpCode::GuardValue,
-                    &[BoxRef::from_opref(arg), BoxRef::from_opref(val_const)],
-                );
+                let arg_b = ctx.materialize_box_at(arg);
+                let val_b = ctx.materialize_box_at(val_const);
+                let mut op = Op::new(OpCode::GuardValue, &[arg_b, val_b]);
                 op.setfailargs(Default::default());
                 vec![op]
             }
