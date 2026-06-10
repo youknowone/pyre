@@ -2440,15 +2440,15 @@ impl OptIntBounds {
     /// `make_lt` returns truthy ("the bound was actually tightened"), so
     /// `matches!(.., Ok(true))` is the line-by-line equivalent of the
     /// RPython `if`.
-    fn make_int_lt(&mut self, box1: OpRef, box2: OpRef, ctx: &mut OptContext) {
-        let b2 = self.getintbound_box(box2, ctx);
-        let box1_h = ctx.get_box_replacement(box1);
+    fn make_int_lt(&mut self, box1: &BoxRef, box2: &BoxRef, ctx: &mut OptContext) {
+        let b2 = self.getintbound_arg(box2.clone(), ctx);
+        let box1_h = self.resolve_box(box1.clone(), ctx);
         let changed1 = ctx.with_intbound_mut(&box1_h, |b1| matches!(b1.make_lt(&b2), Ok(true)));
         if changed1 {
             self.propagate_bounds_backward(box1, ctx);
         }
-        let b1 = self.getintbound_box(box1, ctx);
-        let box2_h = ctx.get_box_replacement(box2);
+        let b1 = self.getintbound_arg(box1.clone(), ctx);
+        let box2_h = self.resolve_box(box2.clone(), ctx);
         let changed2 = ctx.with_intbound_mut(&box2_h, |b2| matches!(b2.make_gt(&b1), Ok(true)));
         if changed2 {
             self.propagate_bounds_backward(box2, ctx);
@@ -2456,15 +2456,15 @@ impl OptIntBounds {
     }
 
     /// intbounds.py:572-578 make_int_le
-    fn make_int_le(&mut self, box1: OpRef, box2: OpRef, ctx: &mut OptContext) {
-        let b2 = self.getintbound_box(box2, ctx);
-        let box1_h = ctx.get_box_replacement(box1);
+    fn make_int_le(&mut self, box1: &BoxRef, box2: &BoxRef, ctx: &mut OptContext) {
+        let b2 = self.getintbound_arg(box2.clone(), ctx);
+        let box1_h = self.resolve_box(box1.clone(), ctx);
         let changed1 = ctx.with_intbound_mut(&box1_h, |b1| matches!(b1.make_le(&b2), Ok(true)));
         if changed1 {
             self.propagate_bounds_backward(box1, ctx);
         }
-        let b1 = self.getintbound_box(box1, ctx);
-        let box2_h = ctx.get_box_replacement(box2);
+        let b1 = self.getintbound_arg(box1.clone(), ctx);
+        let box2_h = self.resolve_box(box2.clone(), ctx);
         let changed2 = ctx.with_intbound_mut(&box2_h, |b2| matches!(b2.make_ge(&b1), Ok(true)));
         if changed2 {
             self.propagate_bounds_backward(box2, ctx);
@@ -2472,26 +2472,26 @@ impl OptIntBounds {
     }
 
     /// intbounds.py:580-581 make_int_gt
-    fn make_int_gt(&mut self, box1: OpRef, box2: OpRef, ctx: &mut OptContext) {
+    fn make_int_gt(&mut self, box1: &BoxRef, box2: &BoxRef, ctx: &mut OptContext) {
         self.make_int_lt(box2, box1, ctx);
     }
 
     /// intbounds.py:583-584 make_int_ge
-    fn make_int_ge(&mut self, box1: OpRef, box2: OpRef, ctx: &mut OptContext) {
+    fn make_int_ge(&mut self, box1: &BoxRef, box2: &BoxRef, ctx: &mut OptContext) {
         self.make_int_le(box2, box1, ctx);
     }
 
     /// intbounds.py:586-592 make_unsigned_lt
-    fn make_unsigned_lt(&mut self, box1: OpRef, box2: OpRef, ctx: &mut OptContext) {
-        let b2 = self.getintbound_box(box2, ctx);
-        let box1_h = ctx.get_box_replacement(box1);
+    fn make_unsigned_lt(&mut self, box1: &BoxRef, box2: &BoxRef, ctx: &mut OptContext) {
+        let b2 = self.getintbound_arg(box2.clone(), ctx);
+        let box1_h = self.resolve_box(box1.clone(), ctx);
         let changed1 =
             ctx.with_intbound_mut(&box1_h, |b1| matches!(b1.make_unsigned_lt(&b2), Ok(true)));
         if changed1 {
             self.propagate_bounds_backward(box1, ctx);
         }
-        let b1 = self.getintbound_box(box1, ctx);
-        let box2_h = ctx.get_box_replacement(box2);
+        let b1 = self.getintbound_arg(box1.clone(), ctx);
+        let box2_h = self.resolve_box(box2.clone(), ctx);
         let changed2 =
             ctx.with_intbound_mut(&box2_h, |b2| matches!(b2.make_unsigned_gt(&b1), Ok(true)));
         if changed2 {
@@ -2500,16 +2500,16 @@ impl OptIntBounds {
     }
 
     /// intbounds.py:594-600 make_unsigned_le
-    fn make_unsigned_le(&mut self, box1: OpRef, box2: OpRef, ctx: &mut OptContext) {
-        let b2 = self.getintbound_box(box2, ctx);
-        let box1_h = ctx.get_box_replacement(box1);
+    fn make_unsigned_le(&mut self, box1: &BoxRef, box2: &BoxRef, ctx: &mut OptContext) {
+        let b2 = self.getintbound_arg(box2.clone(), ctx);
+        let box1_h = self.resolve_box(box1.clone(), ctx);
         let changed1 =
             ctx.with_intbound_mut(&box1_h, |b1| matches!(b1.make_unsigned_le(&b2), Ok(true)));
         if changed1 {
             self.propagate_bounds_backward(box1, ctx);
         }
-        let b1 = self.getintbound_box(box1, ctx);
-        let box2_h = ctx.get_box_replacement(box2);
+        let b1 = self.getintbound_arg(box1.clone(), ctx);
+        let box2_h = self.resolve_box(box2.clone(), ctx);
         let changed2 =
             ctx.with_intbound_mut(&box2_h, |b2| matches!(b2.make_unsigned_ge(&b1), Ok(true)));
         if changed2 {
@@ -2518,12 +2518,12 @@ impl OptIntBounds {
     }
 
     /// intbounds.py:602-603 make_unsigned_gt
-    fn make_unsigned_gt(&mut self, box1: OpRef, box2: OpRef, ctx: &mut OptContext) {
+    fn make_unsigned_gt(&mut self, box1: &BoxRef, box2: &BoxRef, ctx: &mut OptContext) {
         self.make_unsigned_lt(box2, box1, ctx);
     }
 
     /// intbounds.py:605-606 make_unsigned_ge
-    fn make_unsigned_ge(&mut self, box1: OpRef, box2: OpRef, ctx: &mut OptContext) {
+    fn make_unsigned_ge(&mut self, box1: &BoxRef, box2: &BoxRef, ctx: &mut OptContext) {
         self.make_unsigned_le(box2, box1, ctx);
     }
 
@@ -2538,15 +2538,15 @@ impl OptIntBounds {
     ///     if b1.intersect(b0):
     ///         self.propagate_bounds_backward(arg1)
     /// ```
-    fn make_eq(&mut self, arg0: OpRef, arg1: OpRef, ctx: &mut OptContext) {
-        let b1 = self.getintbound_box(arg1, ctx);
-        let arg0_h = ctx.get_box_replacement(arg0);
+    fn make_eq(&mut self, arg0: &BoxRef, arg1: &BoxRef, ctx: &mut OptContext) {
+        let b1 = self.getintbound_arg(arg1.clone(), ctx);
+        let arg0_h = self.resolve_box(arg0.clone(), ctx);
         let changed0 = ctx.with_intbound_mut(&arg0_h, |b0| matches!(b0.intersect(&b1), Ok(true)));
         if changed0 {
             self.propagate_bounds_backward(arg0, ctx);
         }
-        let b0 = self.getintbound_box(arg0, ctx);
-        let arg1_h = ctx.get_box_replacement(arg1);
+        let b0 = self.getintbound_arg(arg0.clone(), ctx);
+        let arg1_h = self.resolve_box(arg1.clone(), ctx);
         let changed1 = ctx.with_intbound_mut(&arg1_h, |b1| matches!(b1.intersect(&b0), Ok(true)));
         if changed1 {
             self.propagate_bounds_backward(arg1, ctx);
@@ -2568,20 +2568,20 @@ impl OptIntBounds {
     ///         if b1.make_ne_const(v0):
     ///             self.propagate_bounds_backward(arg1)
     /// ```
-    fn make_ne(&mut self, arg0: OpRef, arg1: OpRef, ctx: &mut OptContext) {
-        let b1 = self.getintbound_box(arg1, ctx);
+    fn make_ne(&mut self, arg0: &BoxRef, arg1: &BoxRef, ctx: &mut OptContext) {
+        let b1 = self.getintbound_arg(arg1.clone(), ctx);
         if b1.is_constant() {
             let v1 = b1.get_constant_int();
-            let arg0_h = ctx.get_box_replacement(arg0);
+            let arg0_h = self.resolve_box(arg0.clone(), ctx);
             let did = ctx.with_intbound_mut(&arg0_h, |b0| b0.make_ne_const(v1));
             if did {
                 self.propagate_bounds_backward(arg0, ctx);
             }
         } else {
-            let b0 = self.getintbound_box(arg0, ctx);
+            let b0 = self.getintbound_arg(arg0.clone(), ctx);
             if b0.is_constant() {
                 let v0 = b0.get_constant_int();
-                let arg1_h = ctx.get_box_replacement(arg1);
+                let arg1_h = self.resolve_box(arg1.clone(), ctx);
                 let did = ctx.with_intbound_mut(&arg1_h, |b1| b1.make_ne_const(v0));
                 if did {
                     self.propagate_bounds_backward(arg1, ctx);
@@ -2608,12 +2608,16 @@ impl OptIntBounds {
     /// constant fold) — RPython falls through into the `dispatch_bounds_ops`
     /// call so the producing op of a now-constant value also gets a chance
     /// to tighten its other arguments.
-    fn propagate_bounds_backward(&mut self, opref: OpRef, ctx: &mut OptContext) {
-        let b = self.getintbound_box(opref, ctx);
+    /// Reads the operand bound box-native through `getintbound_arg`
+    /// (→ `resolve_box_box`); the const-fold (`make_constant`) and the
+    /// `as_operation` producer lookup (`find_producing_op`) stay OpRef-keyed
+    /// (the legitimate `as_operation`/`make_constant` residuals).
+    fn propagate_bounds_backward(&mut self, box_: &crate::r#box::BoxRef, ctx: &mut OptContext) {
+        let b = self.getintbound_arg(box_.clone(), ctx);
         if b.is_constant() {
-            self.make_constant_int_ref(opref, b.get_constant_int(), ctx);
+            self.make_constant_int_ref(box_.to_opref(), b.get_constant_int(), ctx);
         }
-        if let Some(producing_op) = self.find_producing_op(opref, ctx) {
+        if let Some(producing_op) = self.find_producing_op(box_.to_opref(), ctx) {
             let producing_op = producing_op.clone();
             self.propagate_bounds_backward_op(&producing_op, ctx);
         }
@@ -2628,12 +2632,12 @@ impl OptIntBounds {
         valzero: i64,
         ctx: &mut OptContext,
     ) {
-        let arg0 = op.arg(0).to_opref();
+        let arg0 = op.arg(0);
         // optimizer.py:99-113 `getintbound` lazy-installs unbounded; the
-        // dispatch-entry rebind registers the operand, so
-        // `get_box_replacement` resolves to the bound host the is_raw_ptr
-        // read and the downstream bound write both use.
-        let arg0_box = ctx.get_box_replacement(arg0);
+        // dispatch-entry rebind registers the operand, so `resolve_box_box`
+        // resolves to the bound host the is_raw_ptr read and the downstream
+        // bound write both use.
+        let arg0_box = self.resolve_box(arg0.clone(), ctx);
         if ctx.is_raw_ptr(&arg0_box) {
             return;
         }
@@ -2643,17 +2647,17 @@ impl OptIntBounds {
         }
         let r_const = r.get_constant_int();
         if r_const == valnonzero {
-            let b1 = self.getintbound_box(arg0, ctx);
+            let b1 = self.getintbound_arg(arg0.clone(), ctx);
             if b1.known_nonnegative() {
                 let _ = ctx.with_intbound_mut(&arg0_box, |bm| bm.make_gt_const(0));
-                self.propagate_bounds_backward(arg0, ctx);
+                self.propagate_bounds_backward(&arg0, ctx);
             } else if b1.known_le_const(0) {
                 let _ = ctx.with_intbound_mut(&arg0_box, |bm| bm.make_lt_const(0));
-                self.propagate_bounds_backward(arg0, ctx);
+                self.propagate_bounds_backward(&arg0, ctx);
             }
         } else if r_const == valzero {
-            self.make_constant_int_ref(arg0, 0, ctx);
-            self.propagate_bounds_backward(arg0, ctx);
+            self.make_constant_int_ref(arg0.to_opref(), 0, ctx);
+            self.propagate_bounds_backward(&arg0, ctx);
         }
     }
 
@@ -2676,220 +2680,220 @@ impl OptIntBounds {
             //         self.propagate_bounds_backward(op.getarg(1))
             // ```
             OpCode::IntAdd | OpCode::IntAddOvf => {
-                let arg0 = op.arg(0).to_opref();
-                let arg1 = op.arg(1).to_opref();
-                let arg0_box = ctx.get_box_replacement(arg0);
-                let arg1_box = ctx.get_box_replacement(arg1);
+                let arg0 = op.arg(0);
+                let arg1 = op.arg(1);
+                let arg0_box = self.resolve_box(arg0.clone(), ctx);
+                let arg1_box = self.resolve_box(arg1.clone(), ctx);
                 if ctx.is_raw_ptr(&arg0_box) || ctx.is_raw_ptr(&arg1_box) {
                     return;
                 }
-                let b1 = self.getintbound_box(arg0, ctx);
-                let b2 = self.getintbound_box(arg1, ctx);
+                let b1 = self.getintbound_arg(arg0.clone(), ctx);
+                let b2 = self.getintbound_arg(arg1.clone(), ctx);
                 let r = self.getintbound_box(op.pos.get(), ctx);
                 let b = r.sub_bound(&b2);
                 let changed0 =
                     ctx.with_intbound_mut(&arg0_box, |bm| matches!(bm.intersect(&b), Ok(true)));
                 if changed0 {
-                    self.propagate_bounds_backward(arg0, ctx);
+                    self.propagate_bounds_backward(&arg0, ctx);
                 }
                 let b = r.sub_bound(&b1);
                 let changed1 =
                     ctx.with_intbound_mut(&arg1_box, |bm| matches!(bm.intersect(&b), Ok(true)));
                 if changed1 {
-                    self.propagate_bounds_backward(arg1, ctx);
+                    self.propagate_bounds_backward(&arg1, ctx);
                 }
             }
             // intbounds.py:714-723 propagate_bounds_INT_SUB
             OpCode::IntSub | OpCode::IntSubOvf => {
-                let arg0 = op.arg(0).to_opref();
-                let arg1 = op.arg(1).to_opref();
-                let b1 = self.getintbound_box(arg0, ctx);
-                let b2 = self.getintbound_box(arg1, ctx);
+                let arg0 = op.arg(0);
+                let arg1 = op.arg(1);
+                let b1 = self.getintbound_arg(arg0.clone(), ctx);
+                let b2 = self.getintbound_arg(arg1.clone(), ctx);
                 let r = self.getintbound_box(op.pos.get(), ctx);
                 let b = r.add_bound(&b2);
-                let arg0_box = ctx.get_box_replacement(arg0);
+                let arg0_box = self.resolve_box(arg0.clone(), ctx);
                 let changed0 =
                     ctx.with_intbound_mut(&arg0_box, |bm| matches!(bm.intersect(&b), Ok(true)));
                 if changed0 {
-                    self.propagate_bounds_backward(arg0, ctx);
+                    self.propagate_bounds_backward(&arg0, ctx);
                 }
                 let b = r.sub_bound(&b1).neg_bound();
-                let arg1_box = ctx.get_box_replacement(arg1);
+                let arg1_box = self.resolve_box(arg1.clone(), ctx);
                 let changed1 =
                     ctx.with_intbound_mut(&arg1_box, |bm| matches!(bm.intersect(&b), Ok(true)));
                 if changed1 {
-                    self.propagate_bounds_backward(arg1, ctx);
+                    self.propagate_bounds_backward(&arg1, ctx);
                 }
             }
             // intbounds.py:725-737 propagate_bounds_INT_MUL
             OpCode::IntMul | OpCode::IntMulOvf => {
-                let arg0 = op.arg(0).to_opref();
-                let arg1 = op.arg(1).to_opref();
-                let b1 = self.getintbound_box(arg0, ctx);
-                let b2 = self.getintbound_box(arg1, ctx);
+                let arg0 = op.arg(0);
+                let arg1 = op.arg(1);
+                let b1 = self.getintbound_arg(arg0.clone(), ctx);
+                let b2 = self.getintbound_arg(arg1.clone(), ctx);
                 if op.opcode != OpCode::IntMulOvf && !b1.mul_bound_cannot_overflow(&b2) {
                     return;
                 }
                 let r = self.getintbound_box(op.pos.get(), ctx);
                 let b = r.py_div_bound(&b2);
-                let arg0_box = ctx.get_box_replacement(arg0);
+                let arg0_box = self.resolve_box(arg0.clone(), ctx);
                 let changed0 =
                     ctx.with_intbound_mut(&arg0_box, |bm| matches!(bm.intersect(&b), Ok(true)));
                 if changed0 {
-                    self.propagate_bounds_backward(arg0, ctx);
+                    self.propagate_bounds_backward(&arg0, ctx);
                 }
                 let b = r.py_div_bound(&b1);
-                let arg1_box = ctx.get_box_replacement(arg1);
+                let arg1_box = self.resolve_box(arg1.clone(), ctx);
                 let changed1 =
                     ctx.with_intbound_mut(&arg1_box, |bm| matches!(bm.intersect(&b), Ok(true)));
                 if changed1 {
-                    self.propagate_bounds_backward(arg1, ctx);
+                    self.propagate_bounds_backward(&arg1, ctx);
                 }
             }
             // intbounds.py:739-747 propagate_bounds_INT_LSHIFT
             OpCode::IntLshift => {
-                let arg0 = op.arg(0).to_opref();
-                let arg1 = op.arg(1).to_opref();
-                let b1 = self.getintbound_box(arg0, ctx);
-                let b2 = self.getintbound_box(arg1, ctx);
+                let arg0 = op.arg(0);
+                let arg1 = op.arg(1);
+                let b1 = self.getintbound_arg(arg0.clone(), ctx);
+                let b2 = self.getintbound_arg(arg1.clone(), ctx);
                 if !b1.lshift_bound_cannot_overflow(&b2) {
                     return;
                 }
                 let r = self.getintbound_box(op.pos.get(), ctx);
                 if let Ok(b) = r.lshift_bound_backwards(&b2) {
-                    let arg0_box = ctx.get_box_replacement(arg0);
+                    let arg0_box = self.resolve_box(arg0.clone(), ctx);
                     let changed =
                         ctx.with_intbound_mut(&arg0_box, |bm| matches!(bm.intersect(&b), Ok(true)));
                     if changed {
-                        self.propagate_bounds_backward(arg0, ctx);
+                        self.propagate_bounds_backward(&arg0, ctx);
                     }
                 }
             }
             // intbounds.py:759-767 propagate_bounds_INT_RSHIFT
             OpCode::IntRshift => {
-                let arg0 = op.arg(0).to_opref();
+                let arg0 = op.arg(0);
                 let b2 = self.getintbound_arg(op.arg(1), ctx);
                 if !b2.is_constant() {
                     return;
                 }
                 let r = self.getintbound_box(op.pos.get(), ctx);
                 let b = r.rshift_bound_backwards(&b2);
-                let arg0_box = ctx.get_box_replacement(arg0);
+                let arg0_box = self.resolve_box(arg0.clone(), ctx);
                 let changed =
                     ctx.with_intbound_mut(&arg0_box, |bm| matches!(bm.intersect(&b), Ok(true)));
                 if changed {
-                    self.propagate_bounds_backward(arg0, ctx);
+                    self.propagate_bounds_backward(&arg0, ctx);
                 }
             }
             // intbounds.py:749-757 propagate_bounds_UINT_RSHIFT
             OpCode::UintRshift => {
-                let arg0 = op.arg(0).to_opref();
+                let arg0 = op.arg(0);
                 let b2 = self.getintbound_arg(op.arg(1), ctx);
                 if !b2.is_constant() {
                     return;
                 }
                 let r = self.getintbound_box(op.pos.get(), ctx);
                 let b = r.urshift_bound_backwards(&b2);
-                let arg0_box = ctx.get_box_replacement(arg0);
+                let arg0_box = self.resolve_box(arg0.clone(), ctx);
                 let changed =
                     ctx.with_intbound_mut(&arg0_box, |bm| matches!(bm.intersect(&b), Ok(true)));
                 if changed {
-                    self.propagate_bounds_backward(arg0, ctx);
+                    self.propagate_bounds_backward(&arg0, ctx);
                 }
             }
             // intbounds.py:773-782 propagate_bounds_INT_AND
             OpCode::IntAnd => {
-                let arg0 = op.arg(0).to_opref();
-                let arg1 = op.arg(1).to_opref();
+                let arg0 = op.arg(0);
+                let arg1 = op.arg(1);
                 let r = self.getintbound_box(op.pos.get(), ctx);
-                let b0 = self.getintbound_box(arg0, ctx);
-                let b1 = self.getintbound_box(arg1, ctx);
-                let arg0_box = ctx.get_box_replacement(arg0);
-                let arg1_box = ctx.get_box_replacement(arg1);
+                let b0 = self.getintbound_arg(arg0.clone(), ctx);
+                let b1 = self.getintbound_arg(arg1.clone(), ctx);
+                let arg0_box = self.resolve_box(arg0.clone(), ctx);
+                let arg1_box = self.resolve_box(arg1.clone(), ctx);
                 if let Ok(b) = b0.and_bound_backwards(&r) {
                     let changed =
                         ctx.with_intbound_mut(&arg1_box, |bm| matches!(bm.intersect(&b), Ok(true)));
                     if changed {
-                        self.propagate_bounds_backward(arg1, ctx);
+                        self.propagate_bounds_backward(&arg1, ctx);
                     }
                 }
                 if let Ok(b) = b1.and_bound_backwards(&r) {
                     let changed =
                         ctx.with_intbound_mut(&arg0_box, |bm| matches!(bm.intersect(&b), Ok(true)));
                     if changed {
-                        self.propagate_bounds_backward(arg0, ctx);
+                        self.propagate_bounds_backward(&arg0, ctx);
                     }
                 }
             }
             // intbounds.py:784-793 propagate_bounds_INT_OR
             OpCode::IntOr => {
-                let arg0 = op.arg(0).to_opref();
-                let arg1 = op.arg(1).to_opref();
+                let arg0 = op.arg(0);
+                let arg1 = op.arg(1);
                 let r = self.getintbound_box(op.pos.get(), ctx);
-                let b0 = self.getintbound_box(arg0, ctx);
-                let b1 = self.getintbound_box(arg1, ctx);
-                let arg0_box = ctx.get_box_replacement(arg0);
-                let arg1_box = ctx.get_box_replacement(arg1);
+                let b0 = self.getintbound_arg(arg0.clone(), ctx);
+                let b1 = self.getintbound_arg(arg1.clone(), ctx);
+                let arg0_box = self.resolve_box(arg0.clone(), ctx);
+                let arg1_box = self.resolve_box(arg1.clone(), ctx);
                 if let Ok(b) = b0.or_bound_backwards(&r) {
                     let changed =
                         ctx.with_intbound_mut(&arg1_box, |bm| matches!(bm.intersect(&b), Ok(true)));
                     if changed {
-                        self.propagate_bounds_backward(arg1, ctx);
+                        self.propagate_bounds_backward(&arg1, ctx);
                     }
                 }
                 if let Ok(b) = b1.or_bound_backwards(&r) {
                     let changed =
                         ctx.with_intbound_mut(&arg0_box, |bm| matches!(bm.intersect(&b), Ok(true)));
                     if changed {
-                        self.propagate_bounds_backward(arg0, ctx);
+                        self.propagate_bounds_backward(&arg0, ctx);
                     }
                 }
             }
             // intbounds.py:795-804 propagate_bounds_INT_XOR
             OpCode::IntXor => {
-                let arg0 = op.arg(0).to_opref();
-                let arg1 = op.arg(1).to_opref();
+                let arg0 = op.arg(0);
+                let arg1 = op.arg(1);
                 let r = self.getintbound_box(op.pos.get(), ctx);
-                let b0 = self.getintbound_box(arg0, ctx);
-                let b1 = self.getintbound_box(arg1, ctx);
-                let arg0_box = ctx.get_box_replacement(arg0);
-                let arg1_box = ctx.get_box_replacement(arg1);
+                let b0 = self.getintbound_arg(arg0.clone(), ctx);
+                let b1 = self.getintbound_arg(arg1.clone(), ctx);
+                let arg0_box = self.resolve_box(arg0.clone(), ctx);
+                let arg1_box = self.resolve_box(arg1.clone(), ctx);
                 // xor is its own inverse
                 let b = b0.xor_bound(&r);
                 let changed1 =
                     ctx.with_intbound_mut(&arg1_box, |bm| matches!(bm.intersect(&b), Ok(true)));
                 if changed1 {
-                    self.propagate_bounds_backward(arg1, ctx);
+                    self.propagate_bounds_backward(&arg1, ctx);
                 }
                 let b = b1.xor_bound(&r);
                 let changed0 =
                     ctx.with_intbound_mut(&arg0_box, |bm| matches!(bm.intersect(&b), Ok(true)));
                 if changed0 {
-                    self.propagate_bounds_backward(arg0, ctx);
+                    self.propagate_bounds_backward(&arg0, ctx);
                 }
             }
             // intbounds.py:481-487 propagate_bounds_INT_INVERT
             OpCode::IntInvert => {
-                let arg0 = op.arg(0).to_opref();
+                let arg0 = op.arg(0);
                 let bres = self.getintbound_box(op.pos.get(), ctx);
                 let bounds = bres.invert_bound();
-                let arg0_box = ctx.get_box_replacement(arg0);
+                let arg0_box = self.resolve_box(arg0.clone(), ctx);
                 let changed = ctx
                     .with_intbound_mut(&arg0_box, |bm| matches!(bm.intersect(&bounds), Ok(true)));
                 if changed {
-                    self.propagate_bounds_backward(arg0, ctx);
+                    self.propagate_bounds_backward(&arg0, ctx);
                 }
             }
             // intbounds.py:489-495 propagate_bounds_INT_NEG
             OpCode::IntNeg => {
-                let arg0 = op.arg(0).to_opref();
+                let arg0 = op.arg(0);
                 let bres = self.getintbound_box(op.pos.get(), ctx);
                 let bounds = bres.neg_bound();
-                let arg0_box = ctx.get_box_replacement(arg0);
+                let arg0_box = self.resolve_box(arg0.clone(), ctx);
                 let changed = ctx
                     .with_intbound_mut(&arg0_box, |bm| matches!(bm.intersect(&bounds), Ok(true)));
                 if changed {
-                    self.propagate_bounds_backward(arg0, ctx);
+                    self.propagate_bounds_backward(&arg0, ctx);
                 }
             }
             // intbounds.py:608-615 propagate_bounds_INT_LT
@@ -2897,10 +2901,10 @@ impl OptIntBounds {
                 let r = self.getintbound_box(op.pos.get(), ctx);
                 if r.is_constant() {
                     if r.lower == 1 {
-                        self.make_int_lt(op.arg(0).to_opref(), op.arg(1).to_opref(), ctx);
+                        self.make_int_lt(&op.arg(0), &op.arg(1), ctx);
                     } else {
                         debug_assert_eq!(r.lower, 0);
-                        self.make_int_ge(op.arg(0).to_opref(), op.arg(1).to_opref(), ctx);
+                        self.make_int_ge(&op.arg(0), &op.arg(1), ctx);
                     }
                 }
             }
@@ -2909,10 +2913,10 @@ impl OptIntBounds {
                 let r = self.getintbound_box(op.pos.get(), ctx);
                 if r.is_constant() {
                     if r.lower == 1 {
-                        self.make_int_gt(op.arg(0).to_opref(), op.arg(1).to_opref(), ctx);
+                        self.make_int_gt(&op.arg(0), &op.arg(1), ctx);
                     } else {
                         debug_assert_eq!(r.lower, 0);
-                        self.make_int_le(op.arg(0).to_opref(), op.arg(1).to_opref(), ctx);
+                        self.make_int_le(&op.arg(0), &op.arg(1), ctx);
                     }
                 }
             }
@@ -2921,10 +2925,10 @@ impl OptIntBounds {
                 let r = self.getintbound_box(op.pos.get(), ctx);
                 if r.is_constant() {
                     if r.lower == 1 {
-                        self.make_int_le(op.arg(0).to_opref(), op.arg(1).to_opref(), ctx);
+                        self.make_int_le(&op.arg(0), &op.arg(1), ctx);
                     } else {
                         debug_assert_eq!(r.lower, 0);
-                        self.make_int_gt(op.arg(0).to_opref(), op.arg(1).to_opref(), ctx);
+                        self.make_int_gt(&op.arg(0), &op.arg(1), ctx);
                     }
                 }
             }
@@ -2933,10 +2937,10 @@ impl OptIntBounds {
                 let r = self.getintbound_box(op.pos.get(), ctx);
                 if r.is_constant() {
                     if r.lower == 1 {
-                        self.make_int_ge(op.arg(0).to_opref(), op.arg(1).to_opref(), ctx);
+                        self.make_int_ge(&op.arg(0), &op.arg(1), ctx);
                     } else {
                         debug_assert_eq!(r.lower, 0);
-                        self.make_int_lt(op.arg(0).to_opref(), op.arg(1).to_opref(), ctx);
+                        self.make_int_lt(&op.arg(0), &op.arg(1), ctx);
                     }
                 }
             }
@@ -2944,18 +2948,18 @@ impl OptIntBounds {
             OpCode::IntEq => {
                 let r = self.getintbound_box(op.pos.get(), ctx);
                 if r.is_constant() && r.lower == 1 {
-                    self.make_eq(op.arg(0).to_opref(), op.arg(1).to_opref(), ctx);
+                    self.make_eq(&op.arg(0), &op.arg(1), ctx);
                 } else if r.is_constant() && r.lower == 0 {
-                    self.make_ne(op.arg(0).to_opref(), op.arg(1).to_opref(), ctx);
+                    self.make_ne(&op.arg(0), &op.arg(1), ctx);
                 }
             }
             // intbounds.py:653-656 propagate_bounds_INT_NE
             OpCode::IntNe => {
                 let r = self.getintbound_box(op.pos.get(), ctx);
                 if r.is_constant() && r.lower == 0 {
-                    self.make_eq(op.arg(0).to_opref(), op.arg(1).to_opref(), ctx);
+                    self.make_eq(&op.arg(0), &op.arg(1), ctx);
                 } else if r.is_constant() && r.lower == 1 {
-                    self.make_ne(op.arg(0).to_opref(), op.arg(1).to_opref(), ctx);
+                    self.make_ne(&op.arg(0), &op.arg(1), ctx);
                 }
             }
             // intbounds.py:379-386 propagate_bounds_UINT_LT
@@ -2963,10 +2967,10 @@ impl OptIntBounds {
                 let r = self.getintbound_box(op.pos.get(), ctx);
                 if r.is_constant() {
                     if r.lower == 1 {
-                        self.make_unsigned_lt(op.arg(0).to_opref(), op.arg(1).to_opref(), ctx);
+                        self.make_unsigned_lt(&op.arg(0), &op.arg(1), ctx);
                     } else {
                         debug_assert_eq!(r.lower, 0);
-                        self.make_unsigned_ge(op.arg(0).to_opref(), op.arg(1).to_opref(), ctx);
+                        self.make_unsigned_ge(&op.arg(0), &op.arg(1), ctx);
                     }
                 }
             }
@@ -2975,10 +2979,10 @@ impl OptIntBounds {
                 let r = self.getintbound_box(op.pos.get(), ctx);
                 if r.is_constant() {
                     if r.lower == 1 {
-                        self.make_unsigned_gt(op.arg(0).to_opref(), op.arg(1).to_opref(), ctx);
+                        self.make_unsigned_gt(&op.arg(0), &op.arg(1), ctx);
                     } else {
                         debug_assert_eq!(r.lower, 0);
-                        self.make_unsigned_le(op.arg(0).to_opref(), op.arg(1).to_opref(), ctx);
+                        self.make_unsigned_le(&op.arg(0), &op.arg(1), ctx);
                     }
                 }
             }
@@ -2987,10 +2991,10 @@ impl OptIntBounds {
                 let r = self.getintbound_box(op.pos.get(), ctx);
                 if r.is_constant() {
                     if r.lower == 1 {
-                        self.make_unsigned_le(op.arg(0).to_opref(), op.arg(1).to_opref(), ctx);
+                        self.make_unsigned_le(&op.arg(0), &op.arg(1), ctx);
                     } else {
                         debug_assert_eq!(r.lower, 0);
-                        self.make_unsigned_gt(op.arg(0).to_opref(), op.arg(1).to_opref(), ctx);
+                        self.make_unsigned_gt(&op.arg(0), &op.arg(1), ctx);
                     }
                 }
             }
@@ -2999,10 +3003,10 @@ impl OptIntBounds {
                 let r = self.getintbound_box(op.pos.get(), ctx);
                 if r.is_constant() {
                     if r.lower == 1 {
-                        self.make_unsigned_ge(op.arg(0).to_opref(), op.arg(1).to_opref(), ctx);
+                        self.make_unsigned_ge(&op.arg(0), &op.arg(1), ctx);
                     } else {
                         debug_assert_eq!(r.lower, 0);
-                        self.make_unsigned_lt(op.arg(0).to_opref(), op.arg(1).to_opref(), ctx);
+                        self.make_unsigned_lt(&op.arg(0), &op.arg(1), ctx);
                     }
                 }
             }
@@ -3217,7 +3221,7 @@ impl Optimization for OptIntBounds {
                 if !is_int {
                     return;
                 }
-                self.propagate_bounds_backward(arg0, ctx);
+                self.propagate_bounds_backward(&op.arg(0), ctx);
             }
 
             // ── Arithmetic postprocess ──
@@ -4584,10 +4588,9 @@ mod tests {
         // (everything else lives on `box._forwarded`), so we can spin up a
         // fresh one to drive the backward propagation step.
         let mut pass = OptIntBounds::new();
-        // OpRef → BoxRef shim until this caller migrates (Phase D-2).
         let i1_box = ctx.materialize_box_at(OpRef::int_op(1));
         ctx.setintbound(&i1_box, &IntBound::bounded(-5, -1));
-        pass.propagate_bounds_backward(OpRef::int_op(1), &mut ctx);
+        pass.propagate_bounds_backward(&i1_box, &mut ctx);
         let b0 = {
             let __mb = ctx.materialize_box_at(OpRef::int_op(0));
             ctx.getintbound_handle(&__mb).borrow().clone()
