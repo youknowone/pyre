@@ -737,6 +737,16 @@ fn full_body_walk_trace(
                     }
                 }
             }
+            crate::jitcode_dispatch::DispatchOutcome::CompileTracePending => {
+                // pyjitpl.py:3095 raise_if_successful parity: the walker's
+                // in-walk `compile_trace` already compiled+installed the
+                // trace as a (entry) bridge jumping into an existing loop;
+                // hand the dedicated action back so the driver neither
+                // compiles nor aborts this session again — the trait-leg
+                // equivalent is `trace_step_result_to_action`'s
+                // `compile_trace_success_pending()` branch.
+                TraceAction::CompileTrace
+            }
             other => {
                 if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
                     eprintln!("[fbw-abort] start_pc={start_pc} outcome={other:?}");

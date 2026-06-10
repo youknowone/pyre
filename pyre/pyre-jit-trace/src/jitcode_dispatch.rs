@@ -645,6 +645,19 @@ pub enum DispatchOutcome {
         jump_args: Vec<OpRef>,
         loop_header_pc: usize,
     },
+    /// `jit_merge_point/cIRFIRF` reached a loop header that already has
+    /// compiled targets, and the in-walk `compile_trace` attempt
+    /// succeeded: the trace-so-far was compiled as a bridge / entry
+    /// bridge ending in a JUMP into the existing loop
+    /// (pyjitpl.py:3003-3007 `reached_loop_header` →
+    /// `self.compile_trace(live_arg_boxes, ptoken)`; "raises in case it
+    /// works"). The tracing session was consumed by `compile_trace`;
+    /// the walk must stop without compiling or aborting again. The
+    /// driver maps this to `TraceAction::CompileTrace` — the same
+    /// action the trait leg produces via
+    /// `driver.compile_trace_success_pending()`
+    /// (`trace_opcode.rs trace_step_result_to_action`).
+    CompileTracePending,
 }
 
 /// Errors surfaced by the trace-side walker.
@@ -918,6 +931,16 @@ pub enum DispatchError {
     /// a handler (e.g. `math.sqrt` in nbody) never deopt into a handler
     /// and are unaffected.
     MayForceProtectedByExceptionHandlerUnsupported { pc: usize },
+    /// The virtualizable escaped during a concrete-executed may-force
+    /// residual call: `vinfo.tracing_after_residual_call(virtualizable)`
+    /// found the token cleared by the callee's force path
+    /// (pyjitpl.py:3349-3366 `vable_after_residual_call` →
+    /// `SwitchToBlackhole(Counters.ABORT_ESCAPE, raising_exception=True)`).
+    /// The trace can no longer treat the frame as a virtualizable, so the
+    /// walk aborts and the interpreter resumes from the (now heap-
+    /// authoritative) frame. Soft abort — escape is data-dependent, the
+    /// same location may trace cleanly later.
+    VableEscapedDuringResidualCall { pc: usize },
     /// A walker-emitted guard needs a resume snapshot, but the live
     /// virtualizable box list carries an untyped entry (typically the
     /// identity box `[-1]` of a deeper inlined / recursive frame). Building
@@ -1050,7 +1073,8 @@ pub fn walk(
             DispatchOutcome::Terminate
             | DispatchOutcome::SubReturn { .. }
             | DispatchOutcome::SwitchToBlackhole { .. }
-            | DispatchOutcome::CloseLoop { .. } => {
+            | DispatchOutcome::CloseLoop { .. }
+            | DispatchOutcome::CompileTracePending => {
                 return Ok((outcome, pc));
             }
             DispatchOutcome::SubRaise { exc, exc_concrete } => {
@@ -4255,19 +4279,26 @@ pub fn bool_box_truth_reset() {
 ///     job.
 ///   * `CallReleaseGil*` / `CallAssembler*` are intentionally excluded:
 ///     their trace-recording-time invariants (GIL transitions, jitdriver
-///     re-entry) need separate concrete-execution support.
-///   * **`CallMayForce*` force-virtual gate**: PyPy `do_residual_call`
+///     re-entry) need a separate audit (Task #390 sub-slice 4).
+///   * **`CallMayForce*` vable token protocol**: PyPy `do_residual_call`
 ///     (`pyjitpl.py:2017-2082`) concrete-executes every `CallMayForce*`
-///     via `executor.execute_varargs` and detects vable escape via the
-///     post-call `vinfo.tracing_after_residual_call(vbox)` heap probe.
-///     Pyre's walker leg lacks the post-call probe today (only the
-///     trait-driven leg has it at `state.rs MIFrame::vable_after_residual_call`,
-///     `trace_opcode.rs:2646`).  Until the walker counterpart lands,
-///     this function only admits `CallMayForce*` when the jitdriver has
-///     no active `standard_virtualizable_box()` — in that case there's
-///     no vable to force, so the after-check would be a no-op.  Active-
-///     vable `CallMayForce*` continues to decline (record-only), matching
-///     the current production behaviour.
+///     via `executor.execute_varargs`, bracketed by the heap halves of
+///     the token protocol: `vinfo.tracing_before_residual_call(virtualizable)`
+///     (pyjitpl.py:3329-3330, sets `TOKEN_TRACING_RESCALL`) before the
+///     call and `vinfo.tracing_after_residual_call(virtualizable)`
+///     (pyjitpl.py:3349-3353) after it.  This function mirrors both
+///     halves around `execute_residual_call` whenever the jitdriver has
+///     an active `standard_virtualizable_box()` with a live heap pointer
+///     — the same bracket the trait-driven leg performs at
+///     `state.rs MIFrame::vable_and_vrefs_before_residual_call` /
+///     `vable_after_residual_call` (`trace_opcode.rs:2602/2646`).  A
+///     cleared token after the call means the callee forced the
+///     virtualizable: surface [`DispatchError::VableEscapedDuringResidualCall`]
+///     (`SwitchToBlackhole(ABORT_ESCAPE)` parity, pyjitpl.py:3365).
+///     With no active vable the bracket is skipped — nothing to force.
+///     The IR half (`FORCE_TOKEN` + `SETFIELD_GC(vable_token_descr)`)
+///     stays at the dispatcher's
+///     [`maybe_walker_vable_and_vrefs_before_residual_call`] call site.
 /// * `allboxes[0]` is the funcbox (per `build_allboxes` layout); the
 ///   remaining slots are user args in `descr.arg_types()` ABI order.
 ///
@@ -4280,14 +4311,14 @@ pub fn bool_box_truth_reset() {
 /// under the discard-the-trace probe.
 ///
 /// **Return value**:
-/// * `Some(Ok(_))` — helper executed normally, `recorded` OpRef stamped
-///   with the concrete result.
-/// * `Some(Err(bh_exc))` — helper raised; `bh_exc` is the wrapped
+/// * `Ok(Some(Ok(_)))` — helper executed normally, `recorded` OpRef
+///   stamped with the concrete result.
+/// * `Ok(Some(Err(bh_exc)))` — helper raised; `bh_exc` is the wrapped
 ///   `PyError` pointer (from `BH_LAST_EXC_VALUE`).  Caller is
 ///   responsible for routing into `WalkContext.last_exc_value` so the
 ///   downstream `GuardNoException` walker handler picks it up; the
 ///   `recorded` OpRef is NOT stamped (no concrete result).
-/// * `None` — fold declined (preconditions not met: not the
+/// * `Ok(None)` — fold declined (preconditions not met: not the
 ///   authoritative executor, opcode out of set, funcbox non-const, arity
 ///   exceeds [`MAX_HOST_CALL_ARITY`], any operand lacks a concrete
 ///   `box_value`, or any Ref arg is NULL), or the call's result is void
@@ -4295,6 +4326,10 @@ pub fn bool_box_truth_reset() {
 ///   see the void branch below).  The trace still has the recorded call
 ///   op for the optimizer to consume later; walker falls through as if
 ///   this function did not exist.
+/// * `Err(VableEscapedDuringResidualCall)` — the callee forced the
+///   active virtualizable during a `CallMayForce*`; the walk must abort
+///   (pyjitpl.py:3365 ABORT_ESCAPE parity, see the token-protocol bullet
+///   above).
 ///
 /// **Wire status** (Task #390 sub-slice 2.3): invoked from all three
 /// dispatch entry points (`dispatch_residual_call_iRd_kind`,
@@ -4308,13 +4343,14 @@ fn try_execute_residual_call_via_executor(
     allboxes: &[OpRef],
     call_descr: &dyn majit_ir::descr::CallDescr,
     recorded: OpRef,
-) -> Option<Result<i64, i64>> {
+    op_pc: usize,
+) -> Result<Option<Result<i64, i64>>, DispatchError> {
     // Authoritative-executor gate (#51b/#54): fire ONLY when the
     // full-body walk is the sole concrete-execution leg.  Arm-walk /
     // shadow / diagnostic-probe runs leave the flag `false` so the call
     // is recorded symbolically without re-running its side effects.
     if !ctx.is_authoritative_executor {
-        return None;
+        return Ok(None);
     }
     let plain_or_loopinvariant = matches!(
         call_opcode,
@@ -4327,25 +4363,23 @@ fn try_execute_residual_call_via_executor(
             | OpCode::CallLoopinvariantF
             | OpCode::CallLoopinvariantN
     );
-    // `CallMayForce*` is admitted only when no active virtualizable
-    // exists — otherwise the walker would need to call the missing
-    // `walker_vable_after_residual_call` post-check (see doc above).
-    // Mirrors `pyjitpl.py:2017-2082 do_residual_call`'s outer
-    // `forces_virtual_or_virtualizable` branch: with no vinfo box,
-    // `vable_after_residual_call` early-returns, so executing the
-    // helper here is safe.
-    let may_force_safe = matches!(
+    // `pyjitpl.py:2017-2082 do_residual_call` forces branch: every
+    // `CallMayForce*` is concrete-executed, with the active
+    // virtualizable bracketed by the token protocol (set
+    // TOKEN_TRACING_RESCALL before the call, probe-and-clear after —
+    // see the doc bullet above).
+    let is_may_force = matches!(
         call_opcode,
         OpCode::CallMayForceI
             | OpCode::CallMayForceR
             | OpCode::CallMayForceF
             | OpCode::CallMayForceN
-    ) && ctx.trace_ctx.standard_virtualizable_box().is_none();
-    if !plain_or_loopinvariant && !may_force_safe {
-        return None;
+    );
+    if !plain_or_loopinvariant && !is_may_force {
+        return Ok(None);
     }
     if allboxes.is_empty() {
-        return None;
+        return Ok(None);
     }
     // Same funcbox-must-be-const invariant as `try_fold_pure_call_via_executor`:
     // a non-const funcbox carries a stale stamp and dereferencing it as a
@@ -4354,7 +4388,7 @@ fn try_execute_residual_call_via_executor(
     // implicitly requires constness too (residual_call descrs always
     // carry a fixed funcptr at translation time).
     if !allboxes[0].is_constant() {
-        return None;
+        return Ok(None);
     }
     // The LOAD_CONST helper (oopspec `LoadConst`) has a dedicated fold in the
     // residual_call dispatchers: when the const index AND the code pointer
@@ -4368,12 +4402,12 @@ fn try_execute_residual_call_via_executor(
     // `w_code_get_ptr` and faults.  Leave it symbolic, mirroring the fold's
     // "falls through to the generic record" contract.
     if call_descr.get_extra_info().pyre_helper == majit_ir::PyreHelperKind::LoadConst {
-        return None;
+        return Ok(None);
     }
     let funcptr_val = ctx.trace_ctx.box_value(allboxes[0]);
     let func_ptr = match funcptr_val {
         Some(majit_ir::Value::Int(addr)) => addr,
-        _ => return None,
+        _ => return Ok(None),
     };
     // Sub-slice 4 safety gate — reject `symbolic_fnaddr_for_path`
     // placeholder values that escaped runtime patching.  Pyre's
@@ -4391,10 +4425,10 @@ fn try_execute_residual_call_via_executor(
     // non-fnptr value (e.g. an int constant mistakenly routed through
     // the funcbox slot).
     if (func_ptr as u64) >> 47 != 0 {
-        return None;
+        return Ok(None);
     }
     if allboxes.len() - 1 > majit_translate::jit_codewriter::insns::MAX_HOST_CALL_ARITY {
-        return None;
+        return Ok(None);
     }
     let mut args = Vec::with_capacity(allboxes.len() - 1);
     for &arg in &allboxes[1..] {
@@ -4402,13 +4436,13 @@ fn try_execute_residual_call_via_executor(
             Some(majit_ir::Value::Int(n)) => n,
             Some(majit_ir::Value::Ref(r)) => {
                 if r == majit_ir::GcRef(usize::MAX) {
-                    return None;
+                    return Ok(None);
                 }
                 r.as_usize() as i64
             }
             Some(majit_ir::Value::Float(f)) => f.to_bits() as i64,
             Some(majit_ir::Value::Void) => 0,
-            None => return None,
+            None => return Ok(None),
         };
         args.push(v);
     }
@@ -4420,7 +4454,7 @@ fn try_execute_residual_call_via_executor(
     // handle it at compile time.
     for (i, &arg) in args.iter().enumerate() {
         if matches!(call_descr.arg_types().get(i), Some(majit_ir::Type::Ref)) && arg == 0 {
-            return None;
+            return Ok(None);
         }
     }
     // Void-result calls (STORE_SUBSCR / list.append / dict.__setitem__ etc.)
@@ -4438,12 +4472,31 @@ fn try_execute_residual_call_via_executor(
     // the compiled loop re-runs iteration N.  Record the call symbolically
     // instead: falling through with `None` leaves the recorded residual op in
     // the trace, so the compiled loop applies the side effect exactly once.
-    // That is the FBW-correct equivalent of the eager step — the same
-    // record-only treatment the active-vable `CallMayForce*` subset
-    // (STORE_SUBSCR) already takes at the force-virtual gate above, and the net
+    // That is the FBW-correct equivalent of the eager step, and the net
     // once-per-iteration effect matches the trait path.
     if call_descr.result_type() == majit_ir::Type::Void {
-        return None;
+        return Ok(None);
+    }
+    // pyjitpl.py:3329-3330 `vinfo.tracing_before_residual_call(virtualizable)`
+    // heap half: every decline gate has passed, so the helper WILL execute —
+    // set TOKEN_TRACING_RESCALL on the active virtualizable so a force
+    // inside the callee is observable afterwards.  Trait mirror:
+    // `MIFrame::vable_and_vrefs_before_residual_call` (trace_opcode.rs:2602).
+    // Skipped for non-forces opcodes and when no live vable exists (the
+    // jitdriver has no standard virtualizable, or unit-test init disabled
+    // the heap pointer) — nothing the callee could force.
+    let vable_obj_ptr = if is_may_force {
+        ctx.trace_ctx
+            .standard_virtualizable_box()
+            .and_then(|_| ctx.trace_ctx.virtualizable_heap_ptr())
+            .filter(|p| !p.is_null())
+            .map(|p| p as *mut u8)
+    } else {
+        None
+    };
+    if let Some(obj_ptr) = vable_obj_ptr {
+        let info = crate::frame_layout::build_pyframe_virtualizable_info();
+        unsafe { info.tracing_before_residual_call(obj_ptr) };
     }
     // A Python-level callee (e.g. a recursive `fib`) re-enters the
     // interpreter (`eval_loop_jit` → `jit_merge_point`) while this walk still
@@ -4457,6 +4510,23 @@ fn try_execute_residual_call_via_executor(
         let _suspend = majit_metainterp::TraceContinuationSuspendGuard::enter();
         majit_metainterp::executor::execute_residual_call(call_descr, func_ptr, &args)
     };
+    // pyjitpl.py:3349-3353 `vinfo.tracing_after_residual_call(virtualizable)`
+    // heap half: a cleared token means the callee forced the virtualizable —
+    // the frame escaped, the trace must abort (pyjitpl.py:3365
+    // `SwitchToBlackhole(Counters.ABORT_ESCAPE, raising_exception=True)`;
+    // trait mirror `MIFrame::vable_after_residual_call`,
+    // trace_opcode.rs:2646).  The interpreter resumes from the live frame,
+    // which the callee's force path made heap-authoritative — no
+    // `load_fields_from_virtualizable` analogue is needed because the FBW
+    // abort discards the walk shadow instead of handing it to a blackhole
+    // leg.  An intact token is cleared back to TOKEN_NONE.
+    if let Some(obj_ptr) = vable_obj_ptr {
+        let info = crate::frame_layout::build_pyframe_virtualizable_info();
+        let forced = unsafe { info.tracing_after_residual_call(obj_ptr) };
+        if forced {
+            return Err(DispatchError::VableEscapedDuringResidualCall { pc: op_pc });
+        }
+    }
     match exec_result {
         Ok(result_i64) => {
             // `pyjitpl.py:1685-1690 _opimpl_residual_call*` finishes its
@@ -4520,7 +4590,7 @@ fn try_execute_residual_call_via_executor(
             majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(bh_exc));
         }
     }
-    Some(exec_result)
+    Ok(Some(exec_result))
 }
 
 /// `pyjitpl.py:3671-3681 MetaInterp.direct_call_release_gil` port.
@@ -4711,36 +4781,35 @@ fn do_jit_force_virtual_guard(ei: &majit_ir::EffectInfo, pc: usize) -> Result<()
 ///         self.history.record2(rop.SETFIELD_GC, ..., descr=...)     # IR
 /// ```
 ///
-/// TODO: in pyre, the IR-recording role and the
-/// runtime heap-mutation role are split.  The trait-driven path
-/// (`state.rs MIFrame::vable_and_vrefs_before_residual_call`,
-/// `trace_opcode.rs:2193-2229`) ALREADY performs the heap mutations
-/// (`vinfo.tracing_before_residual_call(virtualizable)`,
-/// `vrefinfo.tracing_before_residual_call(vref)`) at the live call
-/// site — that's where the callee actually executes and observes the
-/// token.  Walker is the symbolic shadow validator under
-/// `MAJIT_SHADOW_WALKER=1`: it runs ahead of the trait dispatch, its
-/// IR is rolled back via `cut_trace`, and then the trait dispatch
-/// runs and emits the "real" IR.  Walker therefore records ONLY the
-/// IR portion that the trait dispatch will record on the no-force
-/// path; the heap-mutation portion stays on the trait side so the
-/// `*token_ptr == 0` assertion in `tracing_before_residual_call`
-/// holds when the trait path runs.
+/// In pyre, the IR-recording role and the runtime heap-mutation role
+/// are split.  This helper carries the IR portion only; the heap
+/// halves of the vable token protocol
+/// (`vinfo.tracing_before_residual_call(virtualizable)` /
+/// `vinfo.tracing_after_residual_call(virtualizable)`) live with
+/// whichever leg actually executes the callee:
 ///
-/// `vrefs_before_residual_call` (`pyjitpl.py:3317-3326`) is omitted
-/// entirely — it has zero IR ops, only heap mutations on
-/// `vrefinfo.tracing_before_residual_call`.
+/// * trait-driven leg — `state.rs
+///   MIFrame::vable_and_vrefs_before_residual_call` /
+///   `vable_after_residual_call` (`trace_opcode.rs:2602/2646`);
+/// * authoritative full-body walk —
+///   [`try_execute_residual_call_via_executor`], which brackets the
+///   concrete `execute_residual_call` with both halves and surfaces
+///   [`DispatchError::VableEscapedDuringResidualCall`] on a detected
+///   force (pyjitpl.py:3365 ABORT_ESCAPE parity).
 ///
-/// `vrefs_after_residual_call` and `vable_after_residual_call`
-/// (`pyjitpl.py:3337-3366`) are omitted entirely — they observe
-/// whether the callee forced a vref/vable by reading the heap token,
-/// and only emit IR on detected forces (`VIRTUAL_REF_FINISH`,
-/// `SwitchToBlackhole(ABORT_ESCAPE)`).  The walker never executes
-/// the callee, so it cannot observe a force; pretending to run the
-/// after-helpers would be a no-op heap set/clear pair masquerading
-/// as parity.  On forced calls the trait-dispatch leg aborts via
-/// `PyError::runtime_error("ABORT_ESCAPE: ...")` before its IR diff
-/// runs, so walker under-recording on those paths is harmless.
+/// Under `MAJIT_SHADOW_WALKER=1` the walker is a symbolic shadow
+/// validator: it runs ahead of the trait dispatch, its IR is rolled
+/// back via `cut_trace`, and the trait dispatch then emits the "real"
+/// IR — so the shadow walk records ONLY the IR portion here and never
+/// touches the token, keeping the `*token_ptr == 0` assertion in
+/// `tracing_before_residual_call` intact for the trait leg.
+///
+/// `vrefs_before_residual_call` / `vrefs_after_residual_call`
+/// (`pyjitpl.py:3317-3326, 3337-3347`) are omitted — they have zero
+/// IR ops on the no-force path, and the walker tracks no
+/// `virtualref_boxes` (production producers of `jit.virtual_ref` are
+/// absent; the trait leg carries the vref halves at
+/// `trace_opcode.rs:2730/2752`).
 fn walker_vable_and_vrefs_before_residual_call(ctx: &mut TraceCtx) {
     // pyjitpl.py:3326-3327: vinfo = self.jitdriver_sd.virtualizable_info;
     //                       if vinfo is not None:
@@ -7076,7 +7145,8 @@ fn dispatch_residual_call_iRd_kind(
                 &allboxes,
                 call_descr,
                 recorded,
-            ),
+                op.pc,
+            )?,
             Some(Err(_))
         );
         debug_assert!(
@@ -8787,7 +8857,8 @@ fn dispatch_residual_call_iIRd_kind(
                 &allboxes,
                 call_descr,
                 recorded,
-            ),
+                op.pc,
+            )?,
             Some(Err(_))
         );
         debug_assert!(
@@ -8976,7 +9047,8 @@ fn dispatch_residual_call_iIRFd_kind(
                 &allboxes,
                 call_descr,
                 recorded,
-            ),
+                op.pc,
+            )?,
             Some(Err(_))
         );
         debug_assert!(
@@ -9239,6 +9311,13 @@ fn dispatch_inline_call_dr_kind(
             // `SubWalkClosedLoop`.
             Err(DispatchError::SubWalkClosedLoop { pc: op.pc })
         }
+        DispatchOutcome::CompileTracePending => {
+            // The compile_trace attempt is gated on `is_top_level`
+            // (sub-walks run with `is_top_level == false`), so a callee
+            // body can never surface it; fail loud like the CloseLoop
+            // arm if that invariant ever breaks.
+            Err(DispatchError::SubWalkClosedLoop { pc: op.pc })
+        }
         DispatchOutcome::Continue => {
             unreachable!(
                 "walk() only exits on Terminate / SubReturn / SubRaise / SwitchToBlackhole"
@@ -9412,6 +9491,13 @@ fn dispatch_inline_call_dir_kind(
         DispatchOutcome::CloseLoop { .. } => {
             // An inlined callee body must not close a loop — see
             // `SubWalkClosedLoop`.
+            Err(DispatchError::SubWalkClosedLoop { pc: op.pc })
+        }
+        DispatchOutcome::CompileTracePending => {
+            // The compile_trace attempt is gated on `is_top_level`
+            // (sub-walks run with `is_top_level == false`), so a callee
+            // body can never surface it; fail loud like the CloseLoop
+            // arm if that invariant ever breaks.
             Err(DispatchError::SubWalkClosedLoop { pc: op.pc })
         }
         DispatchOutcome::Continue => {
@@ -9609,6 +9695,13 @@ fn dispatch_inline_call_dirf_kind(
         DispatchOutcome::CloseLoop { .. } => {
             // An inlined callee body must not close a loop — see
             // `SubWalkClosedLoop`.
+            Err(DispatchError::SubWalkClosedLoop { pc: op.pc })
+        }
+        DispatchOutcome::CompileTracePending => {
+            // The compile_trace attempt is gated on `is_top_level`
+            // (sub-walks run with `is_top_level == false`), so a callee
+            // body can never surface it; fail loud like the CloseLoop
+            // arm if that invariant ever breaks.
             Err(DispatchError::SubWalkClosedLoop { pc: op.pc })
         }
         DispatchOutcome::Continue => {
@@ -10757,17 +10850,78 @@ fn handle(
                 }
             }
 
+            // pyjitpl.py:3003-3007 compile_trace attempt (trait mirror
+            // `opcode_handler_impls_post.template.rs:40-110`): when the
+            // crossed green key already has compiled targets and no
+            // retrace is in progress, close the trace-so-far as a bridge
+            // (guard origin) / entry bridge (interp origin,
+            // `compile_trace_from_interp`) ending in a JUMP into the
+            // existing loop.  Without this a func-entry trace that walks
+            // the prologue and reaches the already-hot inner loop header
+            // falls through to compile_loop → has_compiled_targets →
+            // SwitchToBlackhole(ABORT_BAD_LOOP), so every portal call
+            // re-runs the prologue interpreted and re-aborts a trace —
+            // overhead scaling with call count.
+            if ctx.is_top_level && ctx.is_authoritative_executor {
+                let (driver, _) = crate::driver::driver_pair();
+                let has_partial = driver.meta_interp().partial_trace().is_some();
+                let bridge_origin = driver
+                    .meta_interp()
+                    .bridge_info()
+                    .map(|b| (b.trace_id, b.fail_index));
+                let has_targets = driver.meta_interp().has_compiled_targets(key);
+                if !has_partial && has_targets {
+                    let outcome = match bridge_origin {
+                        // Guard-origin: existing bridge path.
+                        Some(_) => driver.meta_interp_mut().compile_trace(
+                            key,
+                            &live_args,
+                            bridge_origin,
+                        ),
+                        // pyjitpl.py:3003-3007 interp-origin: a
+                        // function-entry trace (ResumeFromInterpDescr)
+                        // closes as an entry bridge jumping into the
+                        // already-compiled hot loop (compile.py:1002-1021);
+                        // a trace rooted at a *loop header* falls back to
+                        // the plain bridge shape.
+                        None => match driver.compile_trace_entry_data() {
+                            Some((original_green_key, entry_meta)) => {
+                                driver.meta_interp_mut().compile_trace_from_interp(
+                                    key,
+                                    &live_args,
+                                    original_green_key,
+                                    entry_meta,
+                                )
+                            }
+                            None => driver.meta_interp_mut().compile_trace(
+                                key,
+                                &live_args,
+                                None,
+                            ),
+                        },
+                    };
+                    if matches!(outcome, majit_metainterp::CompileOutcome::Compiled { .. }) {
+                        if majit_metainterp::majit_log_enabled() {
+                            eprintln!(
+                                "[jit][walker-reached-loop-header] compile_trace success: \
+                                 key={} pc={} bridge={:?}",
+                                key, next_instr, bridge_origin
+                            );
+                        }
+                        // pyjitpl.py:3095 raise_if_successful() — the
+                        // successful compile_trace ends tracing; surface
+                        // the dedicated outcome so the driver maps it to
+                        // `TraceAction::CompileTrace` (no further compile
+                        // or abort on this session).
+                        driver.note_compile_trace_success();
+                        return Ok((DispatchOutcome::CompileTracePending, op.next_pc));
+                    }
+                }
+            }
+
             // pyjitpl.py:2994-3036: a matching merge point (same green key
             // + red-bank shape) closes the loop; first visit registers and
             // continues to unroll.
-            //
-            // SCOPE: the `compile_trace` / `has_compiled_targets` bridge
-            // attempt (`pyjitpl.py:2978-2983`, trait mirror
-            // `opcode_handler_impls_post.template.rs:40-72`) is omitted —
-            // this is primary-trace close only. The bridge close needs
-            // `driver.compile_trace` access and is a follow-up; reaching it
-            // is gated behind the Phase 5 full-body walk anyway (per-opcode
-            // arms never contain `jit_merge_point`).
             if ctx
                 .trace_ctx
                 .has_merge_point_with_shape_assert(key, live_args.len())
@@ -15333,6 +15487,7 @@ mod tests {
             &allboxes,
             call_descr,
             recorded,
+            0,
         );
         drop(wc);
         assert_eq!(
@@ -15379,6 +15534,7 @@ mod tests {
             &allboxes,
             call_descr,
             recorded,
+            0,
         );
         drop(wc);
         assert_eq!(
@@ -15440,6 +15596,7 @@ mod tests {
             &allboxes,
             call_descr,
             recorded,
+            0,
         );
         let captured_exc = wc.last_exc_value;
         let captured_concrete = wc.last_exc_value_concrete;
@@ -15457,6 +15614,170 @@ mod tests {
             None,
             "the raising path does not stamp `recorded`; the exception routes \
              via last_exc_value (only the normal-return path stamps a result)",
+        );
+    }
+
+    // pyjitpl.py:3329-3330 / 3349-3353 vable token protocol around a
+    // concrete-executed may-force call: with an active standard
+    // virtualizable the executor sets TOKEN_TRACING_RESCALL before the
+    // call and probes-and-clears after it.  A token still intact means
+    // no force — execute + stamp as usual, token back to TOKEN_NONE.  A
+    // cleared token means the callee forced the virtualizable —
+    // `DispatchError::VableEscapedDuringResidualCall` (ABORT_ESCAPE,
+    // pyjitpl.py:3365).
+    fn bind_fake_vable(tc: &mut TraceCtx, buf: &mut [u8]) {
+        let info = crate::frame_layout::build_pyframe_virtualizable_info();
+        assert!(
+            info.token_offset + 8 <= buf.len(),
+            "fake vable buffer must cover token_offset",
+        );
+        let vable_ref = tc.const_ref(buf.as_ptr() as i64);
+        tc.init_virtualizable_boxes(
+            &info,
+            vable_ref,
+            majit_ir::Value::Ref(majit_ir::GcRef(buf.as_ptr() as usize)),
+            &[],
+            &[],
+            &[0],
+        );
+        tc.set_virtualizable_heap_ptr(buf.as_ptr());
+    }
+
+    #[test]
+    fn may_force_with_active_vable_executes_and_clears_token() {
+        let mut tc = fresh_trace_ctx();
+        let mut vable_buf = vec![0u8; 65536];
+        bind_fake_vable(&mut tc, &mut vable_buf);
+        let (allboxes, descr, recorded) = may_force_call_i_fixture(&mut tc);
+        let mut regs_i: Vec<OpRef> = Vec::new();
+        let mut regs_r: Vec<OpRef> = Vec::new();
+        let call_descr = descr.as_call_descr().expect("CallI descr");
+        let mut wc = WalkContext {
+            registers_r: &mut regs_r,
+            registers_i: &mut regs_i,
+            registers_f: &mut [],
+            concrete_registers_r: &mut [],
+            concrete_registers_i: &mut [],
+            descr_refs: &[],
+            raw_descrs: RawDescrPool::Global,
+            is_authoritative_executor: true,
+            trace_ctx: &mut tc,
+            done_with_this_frame_descr_ref: make_fail_descr(1),
+            done_with_this_frame_descr_int: make_fail_descr(101),
+            done_with_this_frame_descr_float: make_fail_descr(102),
+            done_with_this_frame_descr_void: make_fail_descr(103),
+            exit_frame_with_exception_descr_ref: make_fail_descr(2),
+            is_top_level: true,
+            sub_jitcode_lookup: &no_sub_jitcodes,
+            last_exc_value: None,
+            last_exc_value_concrete: ConcreteValue::Null,
+            entry_py_pc: 0,
+            outer_jitcode_index: 0,
+            outer_active_boxes: Vec::new(),
+            store_subscr_fn_addr: None,
+        };
+        let result = try_execute_residual_call_via_executor(
+            &mut wc,
+            majit_ir::OpCode::CallMayForceI,
+            &allboxes,
+            call_descr,
+            recorded,
+            0,
+        );
+        drop(wc);
+        assert!(
+            matches!(result, Ok(Some(Ok(_)))),
+            "non-forcing may-force call with active vable must execute normally",
+        );
+        assert_eq!(
+            tc.box_value(recorded),
+            Some(majit_ir::Value::Int(42)),
+            "active-vable may-force call must execute and stamp the result",
+        );
+        let info = crate::frame_layout::build_pyframe_virtualizable_info();
+        let token = u64::from_le_bytes(
+            vable_buf[info.token_offset..info.token_offset + 8]
+                .try_into()
+                .unwrap(),
+        );
+        assert_eq!(token, 0, "token must be cleared back to TOKEN_NONE after the call");
+    }
+
+    static FORCING_CALLEE_TOKEN_ADDR: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+
+    extern "C" fn forces_vable_for_walker_test(a: i64, b: i64) -> i64 {
+        // A force path clears the vable token (virtualizable.rs:543
+        // force_now on TOKEN_TRACING_RESCALL).
+        let addr = FORCING_CALLEE_TOKEN_ADDR.load(std::sync::atomic::Ordering::SeqCst);
+        unsafe { *(addr as *mut u64) = 0 };
+        a.wrapping_add(b)
+    }
+
+    #[test]
+    fn may_force_vable_escape_surfaces_typed_abort() {
+        let mut tc = fresh_trace_ctx();
+        let mut vable_buf = vec![0u8; 65536];
+        bind_fake_vable(&mut tc, &mut vable_buf);
+        let info = crate::frame_layout::build_pyframe_virtualizable_info();
+        FORCING_CALLEE_TOKEN_ADDR.store(
+            vable_buf.as_ptr() as usize + info.token_offset,
+            std::sync::atomic::Ordering::SeqCst,
+        );
+        let funcbox = tc.const_int(forces_vable_for_walker_test as *const () as i64);
+        let arg0 = tc.const_int(40);
+        let arg1 = tc.const_int(2);
+        let allboxes = [funcbox, arg0, arg1];
+        let descr = make_call_descr(
+            5,
+            vec![Type::Int, Type::Int],
+            Type::Int,
+            majit_ir::ExtraEffect::CanRaise,
+        );
+        let recorded =
+            tc.record_op_with_descr(majit_ir::OpCode::CallMayForceI, &allboxes, descr.clone());
+        let mut regs_i: Vec<OpRef> = Vec::new();
+        let mut regs_r: Vec<OpRef> = Vec::new();
+        let call_descr = descr.as_call_descr().expect("CallI descr");
+        let mut wc = WalkContext {
+            registers_r: &mut regs_r,
+            registers_i: &mut regs_i,
+            registers_f: &mut [],
+            concrete_registers_r: &mut [],
+            concrete_registers_i: &mut [],
+            descr_refs: &[],
+            raw_descrs: RawDescrPool::Global,
+            is_authoritative_executor: true,
+            trace_ctx: &mut tc,
+            done_with_this_frame_descr_ref: make_fail_descr(1),
+            done_with_this_frame_descr_int: make_fail_descr(101),
+            done_with_this_frame_descr_float: make_fail_descr(102),
+            done_with_this_frame_descr_void: make_fail_descr(103),
+            exit_frame_with_exception_descr_ref: make_fail_descr(2),
+            is_top_level: true,
+            sub_jitcode_lookup: &no_sub_jitcodes,
+            last_exc_value: None,
+            last_exc_value_concrete: ConcreteValue::Null,
+            entry_py_pc: 0,
+            outer_jitcode_index: 0,
+            outer_active_boxes: Vec::new(),
+            store_subscr_fn_addr: None,
+        };
+        let result = try_execute_residual_call_via_executor(
+            &mut wc,
+            majit_ir::OpCode::CallMayForceI,
+            &allboxes,
+            call_descr,
+            recorded,
+            7,
+        );
+        drop(wc);
+        assert!(
+            matches!(
+                result,
+                Err(DispatchError::VableEscapedDuringResidualCall { pc: 7 })
+            ),
+            "a callee that forces the vable must surface VableEscapedDuringResidualCall, got {result:?}",
         );
     }
 

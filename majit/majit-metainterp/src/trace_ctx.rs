@@ -2048,6 +2048,17 @@ impl TraceCtx {
         self.virtualizable_array_lengths.as_deref()
     }
 
+    /// Live virtualizable heap pointer (`MetaInterp::vable_ptr` mirror).
+    /// `vinfo.unwrap_virtualizable_box(virtualizable_box)` analogue for
+    /// callers that need the concrete object behind
+    /// `standard_virtualizable_box()` — e.g. the
+    /// `tracing_before_residual_call` / `tracing_after_residual_call`
+    /// token protocol around a concrete-executed residual call
+    /// (pyjitpl.py:3329-3330, 3349-3353).
+    pub fn virtualizable_heap_ptr(&self) -> Option<*const u8> {
+        self.virtualizable_heap_ptr
+    }
+
     /// pyjitpl.py:2394 `forced_virtualizable` accessor.
     pub fn forced_virtualizable(&self) -> Option<OpRef> {
         self.forced_virtualizable
