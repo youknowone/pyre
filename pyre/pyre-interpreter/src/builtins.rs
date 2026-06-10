@@ -4522,19 +4522,21 @@ pub fn hash_value(obj: PyObjectRef) -> i64 {
             return _hash_frozenset(&hashes);
         }
         if pyre_object::is_w_range(obj) {
-            // functional.py W_Range.descr_hash — hash of the
-            // (length, start, step) tuple, with trailing fields set to
-            // None (hash 0) for empty and single-element ranges.
+            // `descr_hash` — `hash((length, start|None, step|None))` so two
+            // ranges denoting the same sequence hash equally.
+            let w_len = pyre_object::w_range_length(obj);
             let (start, _stop, step) = pyre_object::w_range_fields(obj);
-            let len = pyre_object::w_range_len(obj);
-            let hashes = if len == 0 {
-                [_hash_int(0), 0, 0]
-            } else if len == 1 {
-                [_hash_int(1), _hash_int(start), 0]
+            let len_b = pyre_object::range_obj_to_bigint(w_len);
+            let none = w_none();
+            let (a, b) = if len_b == BigInt::from(0) {
+                (none, none)
+            } else if len_b == BigInt::from(1) {
+                (start, none)
             } else {
-                [_hash_int(len), _hash_int(start), _hash_int(step)]
+                (start, step)
             };
-            return _hash_tuple_xx(&hashes);
+            let tup = pyre_object::w_tuple_new(vec![w_len, a, b]);
+            return hash_value(tup);
         }
         if pyre_object::is_instance(obj) {
             let w_type = pyre_object::w_instance_get_type(obj);

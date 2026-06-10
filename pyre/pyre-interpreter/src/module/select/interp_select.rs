@@ -260,6 +260,13 @@ pub fn register_module(ns: &mut DictStorage) {
                         // `interp_select.py:132 _build_fd_set` — each item is
                         // resolved through `space.c_filedescriptor_w`.
                         let fd = filedescriptor_w(item)?;
+                        // `fd >= FD_SETSIZE` is rejected: `FD_SET` on such an
+                        // fd writes outside the `fd_set` bitmap.
+                        if fd >= libc::FD_SETSIZE as i32 {
+                            return Err(crate::PyError::value_error(
+                                "file descriptor out of range in select()",
+                            ));
+                        }
                         out.push((item, fd));
                     }
                     Ok(out)

@@ -367,17 +367,25 @@ pub unsafe fn w_range_bool(obj: PyObjectRef) -> bool {
 pub unsafe fn w_range_iter(obj: PyObjectRef) -> PyObjectRef {
     unsafe {
         // `descr_iter` takes the machine-int iterator only when start, stop,
-        // step AND length all fit a machine word; a span whose length exceeds
-        // a word (e.g. `range(-2**63, 2**63-1)`) needs the bignum iterator.
-        if let (Some((start, stop, step)), Some(_length)) =
+        // step AND length all fit a machine word.  `W_RangeIterator` stops
+        // when `current` crosses `stop`, advancing `current += step` after
+        // each element; the post-final `start + length*step` must therefore
+        // also fit a word, or the wrapped `current` would never reach `stop`
+        // (an infinite loop).  When it would overflow — or any bound/length
+        // exceeds a word — the bignum iterator is used instead, which stops
+        // on the wrapped length the way `W_IntRangeIterator` counts down its
+        // remaining.
+        if let (Some((start, stop, step)), Some(length)) =
             (w_range_fields_i64(obj), w_range_length_i64(obj))
         {
-            w_range_iter_new(start, stop, step)
-        } else {
-            let (start, _stop, step) = w_range_fields(obj);
-            let len = w_range_length(obj);
-            w_long_range_iter_new(start, step, len)
+            let one_past = start as i128 + length as i128 * step as i128;
+            if i64::try_from(one_past).is_ok() {
+                return w_range_iter_new(start, stop, step);
+            }
         }
+        let (start, _stop, step) = w_range_fields(obj);
+        let len = w_range_length(obj);
+        w_long_range_iter_new(start, step, len)
     }
 }
 
@@ -391,13 +399,26 @@ pub unsafe fn w_range_iter(obj: PyObjectRef) -> PyObjectRef {
 pub unsafe fn w_range_reversed(obj: PyObjectRef) -> PyObjectRef {
     use num_traits::One;
     unsafe {
-        if let Some((start, stop, step)) = w_range_fields_i64(obj) {
-            let len = range_length(start, stop, step);
+        if let (Some((start, _stop, step)), Some(len)) =
+            (w_range_fields_i64(obj), w_range_length_i64(obj))
+        {
             if len == 0 {
                 return w_range_iter_new(0, 0, 1);
             }
-            let last = start + (len - 1) * step;
-            return w_range_iter_new(last, start - step, -step);
+            // The reversed machine-int iterator walks `last` down to `start`
+            // by `-step`, stopping past `start - step`; that one-past value,
+            // the negated step, and `last` must all fit a word or the
+            // wrapped `current` would loop forever — fall back to bignum.
+            let last = start as i128 + (len as i128 - 1) * step as i128;
+            let one_past = start as i128 - step as i128;
+            let neg_step = -(step as i128);
+            if let (Ok(last), Ok(stop_rev), Ok(neg_step)) = (
+                i64::try_from(last),
+                i64::try_from(one_past),
+                i64::try_from(neg_step),
+            ) {
+                return w_range_iter_new(last, stop_rev, neg_step);
+            }
         }
         let (start, _stop, step) = w_range_fields(obj);
         let len_obj = w_range_length(obj);
@@ -676,6 +697,25 @@ mod range_obj_tests {
             let v2 = w_long_range_iter_next(it).unwrap();
             assert_eq!(crate::intobject::w_int_get_value(v2), 9);
             assert!(w_long_range_iter_next(it).is_none());
+        }
+    }
+
+    #[test]
+    fn iter_routes_increment_overflow_to_longrange() {
+        unsafe {
+            // Word-fit bounds, but the forward `start + length*step` overflows
+            // i64, so a machine-int iterator would loop forever — must use the
+            // bignum iterator instead.
+            let fwd = w_range_new_i64(i64::MAX - 5, i64::MAX, 10);
+            assert!(is_long_range_iter(w_range_iter(fwd)));
+            // The reversed walk's one-past `start - step` underflows i64 here,
+            // so `reversed()` must likewise use the bignum iterator.
+            let rev = w_range_new_i64(i64::MIN, i64::MIN + 50, 10);
+            assert!(is_long_range_iter(w_range_reversed(rev)));
+            // A plain range stays on the machine-int (JIT) iterator both ways.
+            let n = w_range_new_i64(0, 10, 2);
+            assert!(is_range_iter(w_range_iter(n)));
+            assert!(is_range_iter(w_range_reversed(n)));
         }
     }
 }
