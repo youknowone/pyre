@@ -4230,6 +4230,15 @@ impl FunctionGraph {
     /// Used only where no concrete exception payload is available at
     /// the raise site — the evaluated arguments path should call
     /// `set_raise_values` instead.
+    ///
+    /// The two minted Variables are defined by no block inputarg and
+    /// no op result, so the shape is checkgraph-illegal in flowspace
+    /// terms.  The flowspace adapter converts only the reachable block
+    /// closure, which makes the common producer (a predecessor-less
+    /// MIR unwind block whose inbound `on_unwind` edges were all
+    /// dropped at lowering) invisible downstream; a *reachable*
+    /// `set_raise` block still fails the adapter's operand-definedness
+    /// check and stays Skip-classified.
     pub fn set_raise(&mut self, block: BlockId, _reason: &str) {
         let exceptblock = self.exceptblock;
         let etype_var = self.alloc_value_var();

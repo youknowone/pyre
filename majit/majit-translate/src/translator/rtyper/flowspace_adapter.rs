@@ -2028,12 +2028,45 @@ pub fn function_graph_to_flowspace(
         }
     }
 
+    // A flowspace graph contains only blocks reachable from
+    // `startblock`: upstream builds graphs by abstract interpretation,
+    // so an unreachable block cannot exist, and every downstream
+    // consumer (checkgraph / annotator / rtyper) walks `iterblocks()`
+    // — a reachability DFS (`flowspace/model.rs:4011`, model.py).  The
+    // legacy MIR graph, by contrast, keeps lowered-but-unreachable
+    // blocks: every `on_unwind` edge is dropped at lowering while the
+    // `UnwindResume`/`Abort` terminator still lowers via `set_raise`,
+    // leaving a predecessor-less block whose orphan `[etype, evalue]`
+    // Link.args are defined by no inputarg and no op result.  Convert
+    // only the reachable closure, mirroring `iterblocks`'
+    // `exits[::-1]` stack order.  A *reachable* block with the same
+    // orphan shape still fails the operand-definedness check in
+    // `link_arg_to_hlvalue` — SSA-definedness is not relaxed.
+    let reachable: std::collections::HashSet<BlockId> = {
+        // Index lookup instead of `FunctionGraph::block` (a dense
+        // `blocks[id.0]` projection): final blocks reached as link
+        // targets need no `Block` entry of their own (test fixtures
+        // omit them), and a final block contributes no exits anyway.
+        let by_id: HashMap<BlockId, &crate::model::Block> =
+            legacy.blocks.iter().map(|b| (b.id, b)).collect();
+        let mut seen = std::collections::HashSet::new();
+        let mut stack: Vec<BlockId> = vec![legacy.startblock];
+        while let Some(id) = stack.pop() {
+            if seen.insert(id) {
+                if let Some(block) = by_id.get(&id) {
+                    stack.extend(block.exits.iter().rev().map(|e| e.target));
+                }
+            }
+        }
+        seen
+    };
+
     // ──────────────────────────────────────────────────────────────
     // Pass 1 — allocate fresh `flowspace::BlockRef` for every legacy
-    // non-final block. The legacy `returnblock` and `exceptblock` are
-    // skipped here; `FunctionGraph::with_return_var` allocates the
-    // canonical flowspace finals, and the block_map is populated with
-    // those after graph construction.
+    // reachable non-final block. The legacy `returnblock` and
+    // `exceptblock` are skipped here; `FunctionGraph::with_return_var`
+    // allocates the canonical flowspace finals, and the block_map is
+    // populated with those after graph construction.
     // ──────────────────────────────────────────────────────────────
 
     let mut block_map: HashMap<BlockId, BlockRef> = HashMap::new();
@@ -2054,6 +2087,9 @@ pub fn function_graph_to_flowspace(
             || legacy_block.id == legacy.returnblock
             || legacy_block.id == legacy.exceptblock
         {
+            continue;
+        }
+        if !reachable.contains(&legacy_block.id) {
             continue;
         }
         let mut local_inputs: Vec<(Variable, Variable)> =
@@ -2146,9 +2182,9 @@ pub fn function_graph_to_flowspace(
     block_map.insert(legacy.exceptblock, exceptblock_ref);
 
     // ──────────────────────────────────────────────────────────────
-    // Pass 2 — fill operations + exits + exitswitch for each non-final
-    // legacy block. Final blocks (returnblock / exceptblock) are
-    // already terminal in flowspace — `mark_final()` was set by
+    // Pass 2 — fill operations + exits + exitswitch for each reachable
+    // non-final legacy block. Final blocks (returnblock / exceptblock)
+    // are already terminal in flowspace — `mark_final()` was set by
     // `FunctionGraph::with_return_var`.
     // ──────────────────────────────────────────────────────────────
 
@@ -2162,6 +2198,9 @@ pub fn function_graph_to_flowspace(
             || legacy_block.id == legacy.returnblock
             || legacy_block.id == legacy.exceptblock
         {
+            continue;
+        }
+        if !reachable.contains(&legacy_block.id) {
             continue;
         }
         let block_ref = block_map[&legacy_block.id].clone();
@@ -4216,6 +4255,92 @@ mod tests {
         assert!(
             msg.contains("Indirect") && msg.contains("rclass"),
             "unported-op error must propagate translate_op's fail-loud message, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn function_graph_to_flowspace_skips_unreachable_raise_block() {
+        // A predecessor-less unwind block carrying `set_raise`'s orphan
+        // `[etype, evalue]` Link.args — the MIR lowering shape left
+        // behind when every inbound `on_unwind` edge is dropped — must
+        // not reject the graph: only the reachable closure is
+        // converted, mirroring upstream `iterblocks` (a flowspace
+        // graph cannot contain unreachable blocks at all).
+        let mut legacy = legacy_minimal_identity_return_graph();
+        legacy.set_next_value(9);
+        let orphan_etype = legacy.must_variable_at(7);
+        let orphan_evalue = legacy.must_variable_at(8);
+        let exceptblock = legacy.exceptblock;
+        legacy.blocks.push(Block {
+            id: BlockId(3),
+            inputargs: vec![],
+            operations: vec![],
+            exitswitch: None,
+            exits: vec![crate::model::Link::new_mixed(
+                vec![
+                    LinkArg::Value(orphan_etype),
+                    LinkArg::Value(orphan_evalue),
+                ],
+                exceptblock,
+                None,
+            )],
+            framestate: None,
+            dead: false,
+        });
+
+        let output = function_graph_to_flowspace(&legacy, &empty_call_registry())
+            .expect("unreachable raise block must not reject the graph");
+        // start → return only; the orphan block was never converted.
+        assert_eq!(
+            output.graph.borrow().iterblocks().len(),
+            2,
+            "converted graph must contain exactly the reachable closure"
+        );
+    }
+
+    #[test]
+    fn function_graph_to_flowspace_rejects_reachable_orphan_raise_args() {
+        // A *reachable* block whose exception-link args are defined by
+        // no inputarg and no op result must still fail loud — the
+        // reachable-closure conversion does not relax SSA-definedness.
+        let mut legacy = LegacyGraph::new("reachable_orphan_raise");
+        legacy.set_next_value(9);
+        let orphan_etype = legacy.must_variable_at(7);
+        let orphan_evalue = legacy.must_variable_at(8);
+        let exceptblock = legacy.exceptblock;
+        let startblock = Block {
+            id: legacy.startblock,
+            inputargs: block_inputargs(&mut legacy, &[1]),
+            operations: vec![],
+            exitswitch: None,
+            exits: vec![crate::model::Link::new_mixed(
+                vec![
+                    LinkArg::Value(orphan_etype),
+                    LinkArg::Value(orphan_evalue),
+                ],
+                exceptblock,
+                None,
+            )],
+            framestate: None,
+            dead: false,
+        };
+        let returnblock = Block {
+            id: legacy.returnblock,
+            inputargs: block_inputargs(&mut legacy, &[1]),
+            operations: vec![],
+            exitswitch: None,
+            exits: vec![],
+            framestate: None,
+            dead: false,
+        };
+        legacy.blocks = vec![startblock, returnblock];
+
+        let err = function_graph_to_flowspace(&legacy, &empty_call_registry())
+            .expect_err("reachable orphan raise args must stay fail-loud");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("undefined operand slot"),
+            "reachable orphan must keep the operand-definedness error, got: {msg}"
         );
     }
 

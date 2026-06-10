@@ -289,12 +289,13 @@ pub fn build_semantic_program_from_llbc_with_static_addrs(
         // body that builds `static NONE_SINGLETON`) as ordinary
         // `FunDecl` entries with `is_global_initializer` set to the
         // backing `GlobalDecl` id.  These bodies are not call targets
-        // at the JIT level, and their unwind paths use `set_raise`
-        // (`model.rs:3873`) — which mints orphan etype/evalue slots
-        // the flowspace adapter then rejects with the "undefined
-        // operand slot N as Link.args[0]" invariant break.  Skip them
-        // so they never surface as call-registry entries the rest of
-        // the pipeline does not model.
+        // at the JIT level — skip them so they never surface as
+        // call-registry entries the rest of the pipeline does not
+        // model.  (Their unwind paths lower via `set_raise`,
+        // `model.rs:4149`; the flowspace adapter converts only the
+        // reachable block closure, so an unreachable unwind block's
+        // orphan etype/evalue slots no longer reject the graph — this
+        // skip is about call-target modelling, not adapter safety.)
         if fd.is_global_initializer.is_some() {
             continue;
         }
