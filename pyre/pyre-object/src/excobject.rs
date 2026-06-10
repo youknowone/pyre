@@ -476,6 +476,13 @@ pub fn lookup_exc_class_for_kind(kind: ExcKind) -> PyObjectRef {
     EXC_CLASS_BY_KIND.with(|cell| cell.get()[kind as u8 as usize])
 }
 
+/// True when `cls` is one of the canonical per-kind builtin exception
+/// classes registered via `register_exc_class_for_kind` — i.e. its
+/// constructor is the Rust `descr_init` (no Python `__init__`).
+pub fn is_canonical_exc_class(cls: PyObjectRef) -> bool {
+    !cls.is_null() && EXC_CLASS_BY_KIND.with(|cell| cell.get().contains(&cls))
+}
+
 /// `interp_exceptions.py:153 W_BaseException.descr_getargs` parity —
 ///
 /// ```python

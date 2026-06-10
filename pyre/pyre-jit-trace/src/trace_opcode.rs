@@ -6408,6 +6408,14 @@ impl MIFrame {
         if !is_exc_class || concrete_args.iter().any(|a| a.is_null()) {
             return Ok(None);
         }
+        // Reject user subclasses before the probe construction below:
+        // their Python `__init__` would run concretely an extra time per
+        // trace attempt (a user-visible side effect on top of the real
+        // execution).  Canonical per-kind classes have a pure Rust
+        // `descr_init`, so probing them is unobservable.
+        if !pyre_object::excobject::is_canonical_exc_class(concrete_callable) {
+            return Ok(None);
+        }
         // Build the exception concretely on the plain eval loop (no tracer
         // re-entry) to read its kind and confirm a flat builtin instance.
         // The instance is trace-time only and is discarded after the read.
