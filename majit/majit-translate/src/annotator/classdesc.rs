@@ -286,6 +286,25 @@ pub fn register_struct_fields(qualname: &str, fields: &[(String, crate::model::V
     });
 }
 
+/// Project a constructor-minted host-class qualname — dot-joined and
+/// crate-included, e.g. `"pyre_interpreter.pyframe.FrameBlock"`
+/// (flowspace_adapter `SyntheticTransparentCtor` arm) — onto the
+/// crate-stripped `module::Type` convention the struct-derived
+/// [`FORCE_ATTRIBUTES_INTO_CLASSES`] keys use (mir.rs
+/// `strip_crate_prefix`).  Returns `None` for undotted qualnames (bare
+/// exception entries, test fixtures), which already match the table
+/// keys directly.  Duplicate leaves stay distinct here: the projection
+/// keeps the defining module, so each `FrameBlock` reaches its own row.
+fn struct_force_key_from_dotted_qualname(qualname: &str) -> Option<String> {
+    let mut segments = qualname.split('.');
+    let _crate_segment = segments.next()?;
+    let rest: Vec<&str> = segments.collect();
+    if rest.is_empty() {
+        return None;
+    }
+    Some(rest.join("::"))
+}
+
 /// Snapshot the forced-attribute map for `qualname`, cloned out of
 /// [`FORCE_ATTRIBUTES_INTO_CLASSES`].  Returns `None` when no entry is
 /// registered.  Used by tests and walker-side assertions; production
@@ -1222,13 +1241,21 @@ impl ClassDesc {
         // The struct-derived entries are keyed on the canonical
         // crate-stripped qualified path (`module::Type`); the hand-coded
         // exception entries (e.g. `EnvironmentError`) are registered bare
-        // and carry no struct origin.  `qualname()` is the bare leaf, so
-        // look it up directly first — that lets a bare exception entry win
-        // over a struct that happens to share its leaf — and only fall
-        // back to the `STRUCT_ORIGIN_REGISTRY`-canonicalised key when it
-        // actually differs.
+        // and carry no struct origin.  `qualname()` arrives in one of
+        // two spellings: bare (hand-coded exception classes, test
+        // fixtures) or dot-joined crate-included (constructor-minted
+        // struct classes, flowspace_adapter `SyntheticTransparentCtor`
+        // qualname `"pyre_interpreter.pyframe.FrameBlock"`).  Look the
+        // raw qualname up first — a bare exception entry wins over a
+        // struct that happens to share its leaf — then the
+        // `STRUCT_ORIGIN_REGISTRY`-canonicalised key when it differs,
+        // then the dotted ctor spelling projected onto the
+        // crate-stripped `module::Type` key convention (dotted strings
+        // contain no `::`, so `canonical_struct_name` passes them
+        // through and only this projection can reach the struct rows).
         let qualname = this.borrow().pyobj.qualname().to_string();
         let canonical = majit_ir::descr::canonical_struct_name(&qualname);
+        let dotted_key = struct_force_key_from_dotted_qualname(&qualname);
         let overrides: Option<indexmap::IndexMap<String, SomeValue>> =
             FORCE_ATTRIBUTES_INTO_CLASSES.with(|cell| {
                 let table = cell.borrow();
@@ -1241,6 +1268,7 @@ impl ClassDesc {
                             None
                         }
                     })
+                    .or_else(|| dotted_key.as_deref().and_then(|k| table.get(k)))
                     .cloned()
             });
         if let Some(overrides) = overrides {
@@ -3733,6 +3761,25 @@ mod tests {
         assert!(b.contains_key("valuestackdepth"));
         // No lossy bare-leaf alias is registered.
         assert!(forced_attributes_for("FrameBlock").is_none());
+    }
+
+    #[test]
+    fn struct_force_key_projects_dotted_ctor_qualname() {
+        // Constructor-minted spelling: dot-joined, crate-included.
+        assert_eq!(
+            struct_force_key_from_dotted_qualname("pyre_interpreter.pyframe.FrameBlock").as_deref(),
+            Some("pyframe::FrameBlock")
+        );
+        // Crate-root struct: projection lands on the bare convention.
+        assert_eq!(
+            struct_force_key_from_dotted_qualname("pyre_object.W_IntObject").as_deref(),
+            Some("W_IntObject")
+        );
+        // Bare names (exception entries, test fixtures) do not project.
+        assert_eq!(
+            struct_force_key_from_dotted_qualname("EnvironmentError"),
+            None
+        );
     }
 
     #[test]

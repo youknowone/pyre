@@ -4904,9 +4904,14 @@ mod tests {
     fn harden_withdraws_shape_divergent_bare_alias_and_tombstones_origin() {
         let mut reg = crate::front::semantic::StructFieldRegistry::default();
         let a = rows(&[("handlerposition", "usize")]);
-        let b = rows(&[("valuestackdepth", "usize"), ("previous", "*mut FrameBlock")]);
-        reg.fields
-            .insert("pyre_interpreter::pyopcode::FrameBlock".to_string(), a.clone());
+        let b = rows(&[
+            ("valuestackdepth", "usize"),
+            ("previous", "*mut FrameBlock"),
+        ]);
+        reg.fields.insert(
+            "pyre_interpreter::pyopcode::FrameBlock".to_string(),
+            a.clone(),
+        );
         reg.fields
             .insert("pyre_interpreter::pyframe::FrameBlock".to_string(), b);
         // last-decl-wins bare alias as the dual-publish would leave it
@@ -4921,8 +4926,14 @@ mod tests {
             !reg.fields.contains_key("FrameBlock"),
             "shape-divergent duplicate leaf must lose its bare alias"
         );
-        assert!(reg.fields.contains_key("pyre_interpreter::pyopcode::FrameBlock"));
-        assert!(reg.fields.contains_key("pyre_interpreter::pyframe::FrameBlock"));
+        assert!(
+            reg.fields
+                .contains_key("pyre_interpreter::pyopcode::FrameBlock")
+        );
+        assert!(
+            reg.fields
+                .contains_key("pyre_interpreter::pyframe::FrameBlock")
+        );
         assert_eq!(
             origins.get("FrameBlock").map(String::as_str),
             Some(""),
@@ -4952,8 +4963,10 @@ mod tests {
     fn harden_leaves_unique_leaves_untouched() {
         let mut reg = crate::front::semantic::StructFieldRegistry::default();
         let shape = rows(&[("ob_value", "i64")]);
-        reg.fields
-            .insert("pyre_object::intobject::W_IntObject".to_string(), shape.clone());
+        reg.fields.insert(
+            "pyre_object::intobject::W_IntObject".to_string(),
+            shape.clone(),
+        );
         reg.fields.insert("W_IntObject".to_string(), shape.clone());
         let mut origins = std::collections::HashMap::new();
         origins.insert("W_IntObject".to_string(), "intobject".to_string());
