@@ -422,124 +422,72 @@ pub fn register_module(ns: &mut DictStorage) {
             2,
         ),
     );
-    // takewhile(predicate, iterable) — W_TakeWhile.  Collects elements
-    // while `predicate(item)` is true, then returns a seq_iter over the
-    // collected results.  This implementation is eager (it drains the
-    // source until the predicate fails), so an infinite source does not
-    // terminate; lazy `__next__`-driven iteration is a follow-up.
+    // takewhile(predicate, iterable) — W_TakeWhile.__init__: store the
+    // predicate and `space.iter(w_iterable)`; elements are pulled lazily
+    // by W_TakeWhile.next_w (baseobjspace::next).
     crate::dict_storage_store(
         ns,
         "takewhile",
         crate::make_builtin_function_with_arity(
             "takewhile",
             |args| {
-                let predicate = args[0];
                 let iterator = crate::baseobjspace::iter(args[1])?;
-                let mut out = Vec::new();
-                loop {
-                    match crate::baseobjspace::next(iterator) {
-                        Ok(v) => {
-                            let r = crate::call::call_function_impl_result(predicate, &[v])?;
-                            if !crate::baseobjspace::is_true(r) {
-                                break;
-                            }
-                            out.push(v);
-                        }
-                        Err(e) if e.kind == crate::PyErrorKind::StopIteration => break,
-                        Err(e) => return Err(e),
-                    }
-                }
-                let n = out.len();
-                Ok(pyre_object::w_seq_iter_new(pyre_object::w_list_new(out), n))
+                Ok(pyre_object::itertoolsmodule::w_takewhile_new(
+                    args[0], iterator,
+                ))
             },
             2,
         ),
     );
-    // dropwhile(predicate, iterable) — W_DropWhile.  Drops elements
-    // while `predicate(item)` is true, then yields that element and
-    // every element after it.
+    // dropwhile(predicate, iterable) — W_DropWhile.__init__: store the
+    // predicate and `space.iter(w_iterable)`; the drop phase runs lazily
+    // inside W_DropWhile.next_w (baseobjspace::next).
     crate::dict_storage_store(
         ns,
         "dropwhile",
         crate::make_builtin_function_with_arity(
             "dropwhile",
             |args| {
-                let predicate = args[0];
                 let iterator = crate::baseobjspace::iter(args[1])?;
-                let mut out = Vec::new();
-                let mut dropping = true;
-                loop {
-                    match crate::baseobjspace::next(iterator) {
-                        Ok(v) => {
-                            if dropping {
-                                let r = crate::call::call_function_impl_result(predicate, &[v])?;
-                                if crate::baseobjspace::is_true(r) {
-                                    continue;
-                                }
-                                dropping = false;
-                            }
-                            out.push(v);
-                        }
-                        Err(e) if e.kind == crate::PyErrorKind::StopIteration => break,
-                        Err(e) => return Err(e),
-                    }
-                }
-                let n = out.len();
-                Ok(pyre_object::w_seq_iter_new(pyre_object::w_list_new(out), n))
+                Ok(pyre_object::itertoolsmodule::w_dropwhile_new(
+                    args[0], iterator,
+                ))
             },
             2,
         ),
     );
-    // filterfalse(predicate, iterable) — W_FilterFalse.  Keeps elements
-    // where `predicate(item)` is false; a None predicate keeps the
-    // falsy elements.
+    // filterfalse(predicate, iterable) — W_FilterFalse (W_Filter with
+    // reverse=True).  W_Filter.__init__ normalizes a None predicate to
+    // null; elements are filtered lazily in next_w (baseobjspace::next).
     crate::dict_storage_store(
         ns,
         "filterfalse",
         crate::make_builtin_function_with_arity(
             "filterfalse",
             |args| {
-                let predicate = args[0];
-                let predicate_is_none = unsafe { pyre_object::is_none(predicate) };
+                let predicate = if unsafe { pyre_object::is_none(args[0]) } {
+                    pyre_object::PY_NULL
+                } else {
+                    args[0]
+                };
                 let iterator = crate::baseobjspace::iter(args[1])?;
-                let mut out = Vec::new();
-                loop {
-                    match crate::baseobjspace::next(iterator) {
-                        Ok(v) => {
-                            let truth = if predicate_is_none {
-                                crate::baseobjspace::is_true(v)
-                            } else {
-                                let r = crate::call::call_function_impl_result(predicate, &[v])?;
-                                crate::baseobjspace::is_true(r)
-                            };
-                            if !truth {
-                                out.push(v);
-                            }
-                        }
-                        Err(e) if e.kind == crate::PyErrorKind::StopIteration => break,
-                        Err(e) => return Err(e),
-                    }
-                }
-                let n = out.len();
-                Ok(pyre_object::w_seq_iter_new(pyre_object::w_list_new(out), n))
+                Ok(pyre_object::itertoolsmodule::w_filterfalse_new(
+                    predicate, iterator,
+                ))
             },
             2,
         ),
     );
-    // pairwise(iterable) — W_Pairwise.  s -> (s0,s1),(s1,s2),(s2,s3),...
+    // pairwise(iterable) — W_Pairwise__new__: store `space.iter(w_iterable)`;
+    // pairs are produced lazily by W_Pairwise.next_w (baseobjspace::next).
     crate::dict_storage_store(
         ns,
         "pairwise",
         crate::make_builtin_function_with_arity(
             "pairwise",
             |args| {
-                let items = crate::builtins::collect_iterable(args[0])?;
-                let mut out = Vec::new();
-                for pair in items.windows(2) {
-                    out.push(pyre_object::w_tuple_new(vec![pair[0], pair[1]]));
-                }
-                let n = out.len();
-                Ok(pyre_object::w_seq_iter_new(pyre_object::w_list_new(out), n))
+                let iterator = crate::baseobjspace::iter(args[0])?;
+                Ok(pyre_object::itertoolsmodule::w_pairwise_new(iterator))
             },
             1,
         ),

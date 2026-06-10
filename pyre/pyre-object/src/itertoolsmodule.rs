@@ -176,6 +176,195 @@ pub unsafe fn w_repeat_dec_count(obj: PyObjectRef) {
     }
 }
 
+// ── W_TakeWhile — pypy/module/itertools/interp_itertools.py:class W_TakeWhile ──
+//
+// ```python
+// class W_TakeWhile(W_Root):
+//     def __init__(self, space, w_predicate, w_iterable):
+//         self.space = space
+//         self.w_predicate = w_predicate
+//         self.w_iterable = space.iter(w_iterable)
+//         self.stopped = False
+// ```
+//
+// `next_w` lives in the interpreter (`baseobjspace::next`) because it
+// calls the predicate.
+
+#[pyre_class("itertools.takewhile", type_id = 54, static_name = "TAKEWHILE")]
+pub struct W_TakeWhile {
+    pub w_predicate: PyObjectRef,
+    pub w_iterable: PyObjectRef,
+    pub stopped: bool,
+}
+
+/// `w_iterable` must already be an iterator (`space.iter` applied by the
+/// caller, matching `W_TakeWhile.__init__`).
+pub fn w_takewhile_new(w_predicate: PyObjectRef, w_iterable: PyObjectRef) -> PyObjectRef {
+    // `gct_fv_gc_malloc` bracket pattern (`framework.py:853-856`).
+    let _roots = crate::gc_roots::push_roots();
+    crate::gc_roots::pin_root(w_predicate);
+    crate::gc_roots::pin_root(w_iterable);
+    W_TakeWhile::allocate(W_TakeWhile {
+        ob: PyObject {
+            ob_type: std::ptr::null(),
+            w_class: std::ptr::null_mut(),
+        },
+        w_predicate,
+        w_iterable,
+        stopped: false,
+    })
+}
+
+/// Check if an object is a `W_TakeWhile`.
+///
+/// # Safety
+/// `obj` must be a valid, non-null pointer to a `PyObject`.
+#[inline]
+pub unsafe fn is_takewhile(obj: PyObjectRef) -> bool {
+    unsafe { py_type_check(obj, &TAKEWHILE_TYPE) }
+}
+
+// ── W_DropWhile — pypy/module/itertools/interp_itertools.py:class W_DropWhile ──
+//
+// ```python
+// class W_DropWhile(W_Root):
+//     def __init__(self, space, w_predicate, w_iterable):
+//         self.space = space
+//         self.w_predicate = w_predicate
+//         self.w_iterable = space.iter(w_iterable)
+//         self.started = False
+// ```
+
+#[pyre_class("itertools.dropwhile", type_id = 55, static_name = "DROPWHILE")]
+pub struct W_DropWhile {
+    pub w_predicate: PyObjectRef,
+    pub w_iterable: PyObjectRef,
+    pub started: bool,
+}
+
+/// `w_iterable` must already be an iterator (`space.iter` applied by the
+/// caller, matching `W_DropWhile.__init__`).
+pub fn w_dropwhile_new(w_predicate: PyObjectRef, w_iterable: PyObjectRef) -> PyObjectRef {
+    // `gct_fv_gc_malloc` bracket pattern (`framework.py:853-856`).
+    let _roots = crate::gc_roots::push_roots();
+    crate::gc_roots::pin_root(w_predicate);
+    crate::gc_roots::pin_root(w_iterable);
+    W_DropWhile::allocate(W_DropWhile {
+        ob: PyObject {
+            ob_type: std::ptr::null(),
+            w_class: std::ptr::null_mut(),
+        },
+        w_predicate,
+        w_iterable,
+        started: false,
+    })
+}
+
+/// Check if an object is a `W_DropWhile`.
+///
+/// # Safety
+/// `obj` must be a valid, non-null pointer to a `PyObject`.
+#[inline]
+pub unsafe fn is_dropwhile(obj: PyObjectRef) -> bool {
+    unsafe { py_type_check(obj, &DROPWHILE_TYPE) }
+}
+
+// ── W_FilterFalse — pypy/module/itertools/interp_itertools.py:class W_FilterFalse ──
+//
+// Subclass of `W_Filter` (`pypy/module/__builtin__/functional.py:916`)
+// with `reverse = True`:
+//
+// ```python
+// class W_Filter(W_Root):
+//     reverse = False # set to True in itertools
+//     def __init__(self, space, w_predicate, w_iterable):
+//         self.space = space
+//         if space.is_w(w_predicate, space.w_None):
+//             self.w_predicate = None
+//         else:
+//             self.w_predicate = w_predicate
+//         self.w_iterable = space.iter(w_iterable)
+// ```
+//
+// `w_predicate` is PY_NULL when the Python-level predicate was None.
+
+#[pyre_class("itertools.filterfalse", type_id = 56, static_name = "FILTERFALSE")]
+pub struct W_FilterFalse {
+    pub w_predicate: PyObjectRef,
+    pub w_iterable: PyObjectRef,
+}
+
+/// `w_iterable` must already be an iterator; `w_predicate` is PY_NULL
+/// for a None predicate (`W_Filter.__init__`).
+pub fn w_filterfalse_new(w_predicate: PyObjectRef, w_iterable: PyObjectRef) -> PyObjectRef {
+    // `gct_fv_gc_malloc` bracket pattern (`framework.py:853-856`).
+    let _roots = crate::gc_roots::push_roots();
+    if !w_predicate.is_null() {
+        crate::gc_roots::pin_root(w_predicate);
+    }
+    crate::gc_roots::pin_root(w_iterable);
+    W_FilterFalse::allocate(W_FilterFalse {
+        ob: PyObject {
+            ob_type: std::ptr::null(),
+            w_class: std::ptr::null_mut(),
+        },
+        w_predicate,
+        w_iterable,
+    })
+}
+
+/// Check if an object is a `W_FilterFalse`.
+///
+/// # Safety
+/// `obj` must be a valid, non-null pointer to a `PyObject`.
+#[inline]
+pub unsafe fn is_filterfalse(obj: PyObjectRef) -> bool {
+    unsafe { py_type_check(obj, &FILTERFALSE_TYPE) }
+}
+
+// ── W_Pairwise — pypy/module/itertools/interp_itertools.py:class W_Pairwise ──
+//
+// ```python
+// class W_Pairwise(W_Root):
+//     def __init__(self, space, w_iterator):
+//         self.space = space
+//         self.w_iterator = w_iterator
+//         self.w_prev = None
+// ```
+//
+// `w_prev` is PY_NULL until the first `next_w`.
+
+#[pyre_class("itertools.pairwise", type_id = 57, static_name = "PAIRWISE")]
+pub struct W_Pairwise {
+    pub w_iterator: PyObjectRef,
+    pub w_prev: PyObjectRef,
+}
+
+/// `w_iterator` must already be an iterator (`W_Pairwise__new__` applies
+/// `space.iter`).
+pub fn w_pairwise_new(w_iterator: PyObjectRef) -> PyObjectRef {
+    // `gct_fv_gc_malloc` bracket pattern (`framework.py:853-856`).
+    let _roots = crate::gc_roots::push_roots();
+    crate::gc_roots::pin_root(w_iterator);
+    W_Pairwise::allocate(W_Pairwise {
+        ob: PyObject {
+            ob_type: std::ptr::null(),
+            w_class: std::ptr::null_mut(),
+        },
+        w_iterator,
+        w_prev: std::ptr::null_mut(),
+    })
+}
+
+/// Check if an object is a `W_Pairwise`.
+///
+/// # Safety
+/// `obj` must be a valid, non-null pointer to a `PyObject`.
+#[inline]
+pub unsafe fn is_pairwise(obj: PyObjectRef) -> bool {
+    unsafe { py_type_check(obj, &PAIRWISE_TYPE) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -203,6 +392,58 @@ mod tests {
         assert_eq!(
             <W_Repeat as crate::lltype::GcType>::SIZE,
             W_REPEAT_OBJECT_SIZE
+        );
+    }
+
+    #[test]
+    fn w_takewhile_gc_type_id_matches_descr() {
+        assert_eq!(W_TAKEWHILE_GC_TYPE_ID, 54);
+        assert_eq!(
+            <W_TakeWhile as crate::lltype::GcType>::type_id(),
+            W_TAKEWHILE_GC_TYPE_ID
+        );
+        assert_eq!(
+            <W_TakeWhile as crate::lltype::GcType>::SIZE,
+            W_TAKEWHILE_OBJECT_SIZE
+        );
+    }
+
+    #[test]
+    fn w_dropwhile_gc_type_id_matches_descr() {
+        assert_eq!(W_DROPWHILE_GC_TYPE_ID, 55);
+        assert_eq!(
+            <W_DropWhile as crate::lltype::GcType>::type_id(),
+            W_DROPWHILE_GC_TYPE_ID
+        );
+        assert_eq!(
+            <W_DropWhile as crate::lltype::GcType>::SIZE,
+            W_DROPWHILE_OBJECT_SIZE
+        );
+    }
+
+    #[test]
+    fn w_filterfalse_gc_type_id_matches_descr() {
+        assert_eq!(W_FILTERFALSE_GC_TYPE_ID, 56);
+        assert_eq!(
+            <W_FilterFalse as crate::lltype::GcType>::type_id(),
+            W_FILTERFALSE_GC_TYPE_ID
+        );
+        assert_eq!(
+            <W_FilterFalse as crate::lltype::GcType>::SIZE,
+            W_FILTERFALSE_OBJECT_SIZE
+        );
+    }
+
+    #[test]
+    fn w_pairwise_gc_type_id_matches_descr() {
+        assert_eq!(W_PAIRWISE_GC_TYPE_ID, 57);
+        assert_eq!(
+            <W_Pairwise as crate::lltype::GcType>::type_id(),
+            W_PAIRWISE_GC_TYPE_ID
+        );
+        assert_eq!(
+            <W_Pairwise as crate::lltype::GcType>::SIZE,
+            W_PAIRWISE_OBJECT_SIZE
         );
     }
 }

@@ -1958,6 +1958,10 @@ pub fn getattr_str(obj: PyObjectRef, name: &str) -> PyResult {
     unsafe {
         if pyre_object::itertoolsmodule::is_count(obj)
             || pyre_object::itertoolsmodule::is_repeat(obj)
+            || pyre_object::itertoolsmodule::is_takewhile(obj)
+            || pyre_object::itertoolsmodule::is_dropwhile(obj)
+            || pyre_object::itertoolsmodule::is_filterfalse(obj)
+            || pyre_object::itertoolsmodule::is_pairwise(obj)
         {
             let entry: Option<(fn(&[PyObjectRef]) -> PyResult, &str)> = match name {
                 "__next__" => Some((iter_next_method, "__next__")),
@@ -6274,6 +6278,10 @@ pub fn is_iterable(w_obj: PyObjectRef) -> bool {
             || pyre_object::generatorobject::is_generator(obj)
             || pyre_object::itertoolsmodule::is_count(obj)
             || pyre_object::itertoolsmodule::is_repeat(obj)
+            || pyre_object::itertoolsmodule::is_takewhile(obj)
+            || pyre_object::itertoolsmodule::is_dropwhile(obj)
+            || pyre_object::itertoolsmodule::is_filterfalse(obj)
+            || pyre_object::itertoolsmodule::is_pairwise(obj)
         {
             return true;
         }
@@ -6417,10 +6425,15 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
         {
             return Ok(obj);
         }
-        // itertools.count / itertools.repeat — iter_w returns self.
-        // PyPy: W_Count.iter_w / W_Repeat.iter_w
+        // itertools native iterators — iter_w returns self.
+        // PyPy: W_Count.iter_w / W_Repeat.iter_w / W_TakeWhile.iter_w /
+        // W_DropWhile.iter_w / W_Filter.iter_w / W_Pairwise.iter_w
         if pyre_object::itertoolsmodule::is_count(obj)
             || pyre_object::itertoolsmodule::is_repeat(obj)
+            || pyre_object::itertoolsmodule::is_takewhile(obj)
+            || pyre_object::itertoolsmodule::is_dropwhile(obj)
+            || pyre_object::itertoolsmodule::is_filterfalse(obj)
+            || pyre_object::itertoolsmodule::is_pairwise(obj)
         {
             return Ok(obj);
         }
@@ -6632,6 +6645,110 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                 pyre_object::itertoolsmodule::w_repeat_dec_count(obj);
             }
             return Ok(pyre_object::itertoolsmodule::w_repeat_get_obj(obj));
+        }
+        // itertools.takewhile — interp_itertools.py W_TakeWhile.next_w
+        //
+        //     def next_w(self):
+        //         if self.stopped:
+        //             raise OperationError(self.space.w_StopIteration, self.space.w_None)
+        //         w_obj = self.space.next(self.w_iterable)  # may raise a w_StopIteration
+        //         w_bool = self.space.call_function(self.w_predicate, w_obj)
+        //         if not self.space.is_true(w_bool):
+        //             self.stopped = True
+        //             raise OperationError(self.space.w_StopIteration, self.space.w_None)
+        //         return w_obj
+        if pyre_object::itertoolsmodule::is_takewhile(obj) {
+            let it = &mut *(obj as *mut pyre_object::itertoolsmodule::W_TakeWhile);
+            if it.stopped {
+                return Err(PyError::stop_iteration());
+            }
+            let w_obj = next(it.w_iterable)?;
+            let w_bool = crate::call::call_function_impl_result(it.w_predicate, &[w_obj])?;
+            if !is_true(w_bool) {
+                it.stopped = true;
+                return Err(PyError::stop_iteration());
+            }
+            return Ok(w_obj);
+        }
+        // itertools.dropwhile — interp_itertools.py W_DropWhile.next_w
+        //
+        //     def next_w(self):
+        //         if self.started:
+        //             w_obj = self.space.next(self.w_iterable)  # may raise w_StopIter
+        //         else:
+        //             while True:
+        //                 w_obj = self.space.next(self.w_iterable)  # may raise w_StopIter
+        //                 w_bool = self.space.call_function(self.w_predicate, w_obj)
+        //                 if not self.space.is_true(w_bool):
+        //                     self.started = True
+        //                     break
+        //         return w_obj
+        if pyre_object::itertoolsmodule::is_dropwhile(obj) {
+            let it = &mut *(obj as *mut pyre_object::itertoolsmodule::W_DropWhile);
+            let w_obj = if it.started {
+                next(it.w_iterable)?
+            } else {
+                loop {
+                    let w_obj = next(it.w_iterable)?;
+                    let w_bool = crate::call::call_function_impl_result(it.w_predicate, &[w_obj])?;
+                    if !is_true(w_bool) {
+                        it.started = true;
+                        break w_obj;
+                    }
+                }
+            };
+            return Ok(w_obj);
+        }
+        // itertools.filterfalse — W_Filter.next_w (functional.py:930) with
+        // reverse=True; the trailing _filter_jitdriver loop applies the
+        // same predicate test until an element passes.
+        //
+        //     def next_w(self):
+        //         w_obj = self.space.next(self.w_iterable)  # may raise w_StopIteration
+        //         if self.w_predicate is None:
+        //             pred = self.space.is_true(w_obj)
+        //         else:
+        //             w_pred = self.space.call_function(self.w_predicate, w_obj)
+        //             pred = self.space.is_true(w_pred)
+        //         if pred ^ self.reverse:
+        //             return w_obj
+        if pyre_object::itertoolsmodule::is_filterfalse(obj) {
+            let it = &mut *(obj as *mut pyre_object::itertoolsmodule::W_FilterFalse);
+            loop {
+                let w_obj = next(it.w_iterable)?;
+                let pred = if it.w_predicate.is_null() {
+                    is_true(w_obj)
+                } else {
+                    let w_pred = crate::call::call_function_impl_result(it.w_predicate, &[w_obj])?;
+                    is_true(w_pred)
+                };
+                if !pred {
+                    return Ok(w_obj);
+                }
+            }
+        }
+        // itertools.pairwise — interp_itertools.py W_Pairwise.next_w
+        //
+        //     def next_w(self):
+        //         space = self.space
+        //         w_prev = self.w_prev
+        //         if w_prev is None:
+        //             w_prev = space.next(self.w_iterator)
+        //             self.w_prev = w_prev  # set before fetching w_next to handle reentrancy
+        //         w_next = space.next(self.w_iterator)
+        //         self.w_prev = w_next
+        //         return space.newtuple2(w_prev, w_next)
+        if pyre_object::itertoolsmodule::is_pairwise(obj) {
+            let it = &mut *(obj as *mut pyre_object::itertoolsmodule::W_Pairwise);
+            let mut w_prev = it.w_prev;
+            if w_prev.is_null() {
+                w_prev = next(it.w_iterator)?;
+                // set before fetching w_next to handle reentrancy
+                it.w_prev = w_prev;
+            }
+            let w_next = next(it.w_iterator)?;
+            it.w_prev = w_next;
+            return Ok(pyre_object::w_tuple_new(vec![w_prev, w_next]));
         }
         // `pypy/objspace/std/dictmultiobject.py:809-845 _new_next`
         // line-by-line — two parity-mandated checks:

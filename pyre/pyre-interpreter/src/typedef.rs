@@ -594,6 +594,22 @@ pub fn init_typeobjects() {
             &pyre_object::itertoolsmodule::REPEAT_TYPE as *const PyType as usize,
             new_typeobject_with_base("itertools.repeat", |_| {}, object_type) as usize,
         );
+        reg.insert(
+            &pyre_object::itertoolsmodule::TAKEWHILE_TYPE as *const PyType as usize,
+            new_typeobject_with_base("itertools.takewhile", |_| {}, object_type) as usize,
+        );
+        reg.insert(
+            &pyre_object::itertoolsmodule::DROPWHILE_TYPE as *const PyType as usize,
+            new_typeobject_with_base("itertools.dropwhile", |_| {}, object_type) as usize,
+        );
+        reg.insert(
+            &pyre_object::itertoolsmodule::FILTERFALSE_TYPE as *const PyType as usize,
+            new_typeobject_with_base("itertools.filterfalse", |_| {}, object_type) as usize,
+        );
+        reg.insert(
+            &pyre_object::itertoolsmodule::PAIRWISE_TYPE as *const PyType as usize,
+            new_typeobject_with_base("itertools.pairwise", |_| {}, object_type) as usize,
+        );
         // `pypy/objspace/std/specialisedtupleobject.py` — three SpecialisedTuple
         // variants share the public `tuple` PyType name, so all three
         // foreign statics map to a "tuple" typedef.  `gettypefor` keys
