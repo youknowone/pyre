@@ -1654,7 +1654,7 @@ impl Op {
                 }
             }
         }
-        *self.fail_args.borrow_mut() = Some(boxes.into_iter().map(Operand::Box).collect());
+        *self.fail_args.borrow_mut() = Some(boxes.iter().map(Operand::from_boxref).collect());
     }
 }
 

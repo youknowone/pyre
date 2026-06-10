@@ -203,13 +203,15 @@ impl Op {
     /// optimizer can stamp fail_args onto a shared `Op` reached through
     /// `Rc<Op>`.
     pub fn setfailargs(&self, fail_args: smallvec::SmallVec<[crate::box_ref::BoxRef; 3]>) {
-        // MIGRATION (#9): freeze to `Operand::Box` (position snapshot,
-        // byte-identical to the previous `BoxRef` storage); the bound
-        // shed follows the `args` sequence in a later slice.
+        // `GuardResOp._fail_args` holds the Box objects themselves
+        // (resoperation.py:483); shed genuinely-bound boxes to their
+        // live-tracking producer operand, exactly like `Op.args`
+        // (`Operand::from_boxref`). Position-only / Const boxes stay
+        // `Operand::Box` until their writers bind producers.
         *self.fail_args.borrow_mut() = Some(
             fail_args
-                .into_iter()
-                .map(crate::operand::Operand::Box)
+                .iter()
+                .map(crate::operand::Operand::from_boxref)
                 .collect(),
         );
     }

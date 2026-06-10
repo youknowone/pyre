@@ -3087,19 +3087,24 @@ impl Optimizer {
                         op.setarg(i, BoxRef::from_opref(arg.with_raw(new_pos)));
                     }
                 }
-                if let Some(mut fail_args) = op.getfailargs() {
-                    let mut changed = false;
+                if let Some(fail_args) = op.fail_args.borrow_mut().as_mut() {
                     for arg in fail_args.iter_mut() {
+                        // Same rule as the args loop above: a bound failarg
+                        // live-tracks its producer's already-remapped
+                        // `op.pos`; re-remapping would double-map. Only
+                        // position-only `Operand::Box` snapshots carry a
+                        // stale pre-remap position.
+                        if arg.is_bound() {
+                            continue;
+                        }
                         let arg_opref = arg.to_opref();
                         if !arg_opref.is_constant() {
                             if let Some(&new_pos) = remap.get(&arg_opref.raw()) {
-                                *arg = BoxRef::from_opref(arg_opref.with_raw(new_pos));
-                                changed = true;
+                                *arg = majit_ir::operand::Operand::Box(BoxRef::from_opref(
+                                    arg_opref.with_raw(new_pos),
+                                ));
                             }
                         }
-                    }
-                    if changed {
-                        op.setfailargs(fail_args);
                     }
                 }
             }
@@ -3175,6 +3180,12 @@ impl Optimizer {
                     }
                     if let Some(fa) = entry.op.fail_args_mut() {
                         for arg in fa.iter_mut() {
+                            // Bound failargs live-track the producer's
+                            // already-remapped pos (same rule as the args
+                            // loop above); re-remapping would double-map.
+                            if arg.is_bound() {
+                                continue;
+                            }
                             let mut arg_opref = arg.to_opref();
                             remap_opref(&mut arg_opref);
                             *arg = majit_ir::operand::Operand::Box(BoxRef::from_opref(arg_opref));
