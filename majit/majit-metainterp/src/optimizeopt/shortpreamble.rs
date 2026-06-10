@@ -393,7 +393,10 @@ pub struct PreambleOp {
     /// invented SameAs name because another producer won the original slot.
     pub invented_name: bool,
     /// Original result box this invented name aliases, if any.
-    pub same_as_source: Option<OpRef>,
+    /// MIGRATION (#9): carried as a [`BoxRef`] so the canonical
+    /// (possibly producer-bound) box travels with the struct instead
+    /// of being re-minted positionally at each use site.
+    pub same_as_source: Option<crate::r#box::BoxRef>,
 }
 
 impl PreambleOp {
@@ -483,7 +486,7 @@ impl PreambleOp {
             kind: self.kind.clone(),
             preamble_op,
             invented_name: self.invented_name,
-            same_as_source: self.same_as_source,
+            same_as_source: self.same_as_source.clone(),
         })
     }
 }
@@ -558,7 +561,7 @@ impl PotentialShortOp {
                         let alias = ctx.alloc_op_position_typed(tp);
                         alt.preamble_op.pos.set(alias);
                         alt.invented_name = true;
-                        alt.same_as_source = Some(compound.res);
+                        alt.same_as_source = Some(BoxRef::from_opref(compound.res));
                         sb.produced_short_boxes.insert(alias, alt.clone());
                     }
                     Some(chosen)
@@ -1163,7 +1166,8 @@ pub struct ProducedShortOp {
     /// Whether this short op uses an invented SameAs result.
     pub invented_name: bool,
     /// Original result this invented name aliases.
-    pub same_as_source: Option<OpRef>,
+    /// MIGRATION (#9): carried as a [`BoxRef`]; see [`PreambleOp::same_as_source`].
+    pub same_as_source: Option<crate::r#box::BoxRef>,
 }
 
 /// Phase B B.1: helper used by `ProducedShortOp::produce_op` to seed a
@@ -1796,17 +1800,14 @@ impl AbstractShortPreambleBuilderState {
         op: OpRef,
         replay_op: &Op,
         invented_name: bool,
-        same_as_source: Option<OpRef>,
+        same_as_source: Option<crate::r#box::BoxRef>,
     ) {
         if !self.recorded_canonical_results.insert(replay_op.pos.get()) {
             return;
         }
         if invented_name {
-            let source = same_as_source.unwrap_or(op);
-            let mut same_as = Op::new(
-                OpCode::same_as_for_type(replay_op.result_type()),
-                &[BoxRef::from_opref(source)],
-            );
+            let source = same_as_source.unwrap_or_else(|| BoxRef::from_opref(op));
+            let mut same_as = Op::new(OpCode::same_as_for_type(replay_op.result_type()), &[source]);
             same_as.pos.set(op);
             self.extra_same_as.push(same_as);
         }
@@ -1819,7 +1820,7 @@ impl AbstractShortPreambleBuilderState {
             result,
             &produced.preamble_op,
             produced.invented_name,
-            produced.same_as_source,
+            produced.same_as_source.clone(),
         );
     }
 
@@ -2120,7 +2121,7 @@ impl ShortPreambleBuilder {
                 resolved_op,
                 replay_op,
                 preamble_op.invented_name,
-                Some(preamble_op.op),
+                Some(BoxRef::from_opref(preamble_op.op)),
             );
         }
     }
@@ -2233,8 +2234,8 @@ impl ExtendedShortPreambleBuilder {
 
         fn visit_produced(produced: &mut ProducedShortOp, visitor: &mut dyn FnMut(&mut GcRef)) {
             produced.preamble_op.walk_const_ptr_refs_mut(visitor);
-            if let Some(source) = produced.same_as_source.as_mut() {
-                visit_opref(source, visitor);
+            if let Some(source) = produced.same_as_source.as_ref() {
+                source.walk_const_ptr_refs(visitor);
             }
         }
 
@@ -2523,11 +2524,9 @@ impl ExtendedShortPreambleBuilder {
             }
             let op = resolved_op;
             if preamble_op.invented_name {
-                let source = preamble_op.op;
-                let mut same_as = Op::new(
-                    OpCode::same_as_for_type(replay_op.result_type()),
-                    &[BoxRef::from_opref(source)],
-                );
+                let source = BoxRef::from_opref(preamble_op.op);
+                let mut same_as =
+                    Op::new(OpCode::same_as_for_type(replay_op.result_type()), &[source]);
                 same_as.pos.set(op);
                 self.extra_same_as.push(same_as);
             }
@@ -2544,10 +2543,13 @@ impl ExtendedShortPreambleBuilder {
             return;
         }
         if produced.invented_name {
-            let source = produced.same_as_source.unwrap_or(result);
+            let source = produced
+                .same_as_source
+                .clone()
+                .unwrap_or_else(|| BoxRef::from_opref(result));
             let mut op = Op::new(
                 OpCode::same_as_for_type(produced.preamble_op.result_type()),
-                &[BoxRef::from_opref(source)],
+                &[source],
             );
             op.pos.set(current_result);
             self.extra_same_as.push(op);
@@ -2894,7 +2896,7 @@ pub fn produced_short_boxes_from_exported_boxes(
                     kind: entry.kind.clone(),
                     preamble_op,
                     invented_name: entry.invented_name,
-                    same_as_source: entry.same_as_source,
+                    same_as_source: entry.same_as_source.clone(),
                 },
             )
         })
@@ -3612,7 +3614,10 @@ mod tests {
             .unwrap();
         assert_eq!(alias.1.kind, PreambleOpKind::Heap);
         assert!(alias.1.invented_name);
-        assert_eq!(alias.1.same_as_source, Some(OpRef::int_op(10)));
+        assert_eq!(
+            alias.1.same_as_source.as_ref().map(|b| b.to_opref()),
+            Some(OpRef::int_op(10))
+        );
     }
 
     #[test]
@@ -3659,11 +3664,9 @@ mod tests {
             .collect();
         assert_eq!(aliases.len(), 2);
         assert!(aliases.iter().all(|(_, produced)| produced.invented_name));
-        assert!(
-            aliases
-                .iter()
-                .all(|(_, produced)| produced.same_as_source == Some(OpRef::int_op(20)))
-        );
+        assert!(aliases.iter().all(|(_, produced)| {
+            produced.same_as_source.as_ref().map(|b| b.to_opref()) == Some(OpRef::int_op(20))
+        }));
     }
 
     #[test]
@@ -3697,7 +3700,10 @@ mod tests {
             .unwrap();
         assert_eq!(alias.1.kind, PreambleOpKind::Heap);
         assert!(alias.1.invented_name);
-        assert_eq!(alias.1.same_as_source, Some(OpRef::int_op(10)));
+        assert_eq!(
+            alias.1.same_as_source.as_ref().map(|b| b.to_opref()),
+            Some(OpRef::int_op(10))
+        );
     }
 
     #[test]

@@ -2104,8 +2104,8 @@ impl ExportedState {
             visitor: &mut dyn FnMut(&mut GcRef),
         ) {
             visit_op(&entry.op, visitor);
-            if let Some(source) = entry.same_as_source.as_mut() {
-                visit_opref(source, visitor);
+            if let Some(source) = entry.same_as_source.as_ref() {
+                source.walk_const_ptr_refs(visitor);
             }
         }
 
@@ -2114,8 +2114,8 @@ impl ExportedState {
             visitor: &mut dyn FnMut(&mut GcRef),
         ) {
             visit_op(&produced.preamble_op, visitor);
-            if let Some(source) = produced.same_as_source.as_mut() {
-                visit_opref(source, visitor);
+            if let Some(source) = produced.same_as_source.as_ref() {
+                source.walk_const_ptr_refs(visitor);
             }
         }
 
@@ -2212,8 +2212,8 @@ impl ExportedState {
 
         for preamble_op in &self.exported_short_boxes {
             visit_op(&preamble_op.op, &mut visit);
-            if let Some(source) = preamble_op.same_as_source {
-                visit(source);
+            if let Some(source) = preamble_op.same_as_source.as_ref() {
+                visit(source.to_opref());
             }
         }
 
@@ -4305,10 +4305,7 @@ fn emit_alias_same_as_for_imports(
     imported_short_aliases: &[crate::optimizeopt::ImportedShortAlias],
 ) {
     for alias in imported_short_aliases {
-        let mut op = Op::new(
-            alias.same_as_opcode,
-            &[BoxRef::from_opref(alias.same_as_source)],
-        );
+        let mut op = Op::new(alias.same_as_opcode, &[alias.same_as_source.clone()]);
         op.pos.set(alias.result);
         result.push(op);
     }
@@ -5578,7 +5575,7 @@ mod tests {
                 kind: PreambleOpKind::Pure,
                 label_arg_idx: None,
                 invented_name: false,
-                same_as_source: Some(old_ref),
+                same_as_source: Some(BoxRef::from_opref(old_ref)),
             }],
             vec![old_ref],
             vec![old_ref],
@@ -5589,7 +5586,7 @@ mod tests {
                 kind: PreambleOpKind::Pure,
                 preamble_op: Op::new(OpCode::SameAsR, &[BoxRef::from_opref(old_ref)]),
                 invented_name: false,
-                same_as_source: Some(old_ref),
+                same_as_source: Some(BoxRef::from_opref(old_ref)),
             },
         ));
         state.short_box_const_values = short_box_const_values;
@@ -5628,14 +5625,23 @@ mod tests {
         assert_eq!(state.runtime_boxes[0], new_ref);
         assert!(state.exported_infos.get(&new_ref).is_some());
         assert_eq!(state.exported_short_boxes[0].op.arg(0).to_opref(), new_ref);
-        assert_eq!(state.exported_short_boxes[0].same_as_source, Some(new_ref));
+        assert_eq!(
+            state.exported_short_boxes[0]
+                .same_as_source
+                .as_ref()
+                .map(|b| b.to_opref()),
+            Some(new_ref)
+        );
         let produced = state
             .short_boxes
             .iter()
             .find_map(|(key, produced)| (*key == new_ref).then_some(produced))
             .expect("short_boxes key must be forwarded");
         assert_eq!(produced.preamble_op.arg(0).to_opref(), new_ref);
-        assert_eq!(produced.same_as_source, Some(new_ref));
+        assert_eq!(
+            produced.same_as_source.as_ref().map(|b| b.to_opref()),
+            Some(new_ref)
+        );
         assert_eq!(
             state.short_box_const_values.get(&new_ref),
             Some(&Value::Ref(new))
@@ -6725,7 +6731,7 @@ mod tests {
                 kind: crate::optimizeopt::shortpreamble::PreambleOpKind::Pure,
                 label_arg_idx: None,
                 invented_name: true,
-                same_as_source: Some(OpRef::int_op(14)),
+                same_as_source: Some(BoxRef::from_opref(OpRef::int_op(14))),
             });
 
         let exported = export_state(
@@ -6762,7 +6768,7 @@ mod tests {
         let _ = optimizer.force_box(forced, &mut ctx2);
         let aliases = ctx2.used_imported_short_aliases();
         assert_eq!(aliases.len(), 1);
-        assert_eq!(aliases[0].same_as_source, OpRef::int_op(14));
+        assert_eq!(aliases[0].same_as_source.to_opref(), OpRef::int_op(14));
         assert_eq!(aliases[0].same_as_opcode, OpCode::SameAsI);
     }
 
@@ -6804,7 +6810,7 @@ mod tests {
             true,
             &[crate::optimizeopt::ImportedShortAlias {
                 result: OpRef::int_op(50),
-                same_as_source: OpRef::int_op(10),
+                same_as_source: BoxRef::from_opref(OpRef::int_op(10)),
                 same_as_opcode: OpCode::SameAsI,
             }],
             &majit_ir::VecAssoc::new(),
@@ -7022,7 +7028,7 @@ mod tests {
             true,
             &[crate::optimizeopt::ImportedShortAlias {
                 result: OpRef::int_op(50),
-                same_as_source: OpRef::int_op(10),
+                same_as_source: BoxRef::from_opref(OpRef::int_op(10)),
                 same_as_opcode: OpCode::SameAsI,
             }],
             &majit_ir::VecAssoc::new(),
@@ -7183,7 +7189,7 @@ mod tests {
             true,
             &[crate::optimizeopt::ImportedShortAlias {
                 result: OpRef::int_op(50),
-                same_as_source: OpRef::int_op(10),
+                same_as_source: BoxRef::from_opref(OpRef::int_op(10)),
                 same_as_opcode: OpCode::SameAsI,
             }],
             &majit_ir::VecAssoc::new(),

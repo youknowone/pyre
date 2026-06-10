@@ -2814,7 +2814,7 @@ impl Optimizer {
                         kind: produced.kind,
                         label_arg_idx: short_boxes.lookup_label_arg(canonical_result),
                         invented_name: produced.invented_name,
-                        same_as_source: produced.same_as_source,
+                        same_as_source: produced.same_as_source.clone(),
                     }
                 })
                 .collect();
@@ -3193,7 +3193,9 @@ impl Optimizer {
                         }
                     }
                     if let Some(ref mut src) = entry.same_as_source {
-                        remap_opref(src);
+                        let mut src_opref = src.to_opref();
+                        remap_opref(&mut src_opref);
+                        *src = BoxRef::from_opref(src_opref);
                     }
                 }
             }

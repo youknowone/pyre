@@ -517,7 +517,10 @@ impl PartialEq for ImportedShortPureOp {
 #[derive(Clone, Debug, PartialEq)]
 pub struct ImportedShortAlias {
     pub result: OpRef,
-    pub same_as_source: OpRef,
+    /// MIGRATION (#9): the canonical box of the SameAs source operand,
+    /// carried directly off `extra_same_as` instead of a positional
+    /// round-trip.
+    pub same_as_source: crate::r#box::BoxRef,
     pub same_as_opcode: OpCode,
 }
 
@@ -2688,7 +2691,7 @@ impl OptContext {
                             kind: entry.kind.clone(),
                             preamble_op: entry.op.clone(),
                             invented_name: entry.invented_name,
-                            same_as_source: entry.same_as_source,
+                            same_as_source: entry.same_as_source.clone(),
                         },
                     )
                 })
@@ -2909,7 +2912,7 @@ impl OptContext {
                         kind: PreambleOpKind::Pure,
                         preamble_op: op,
                         invented_name: produced_op.invented_name,
-                        same_as_source: produced_op.same_as_source,
+                        same_as_source: produced_op.same_as_source.clone(),
                     };
                     produced.push((*source, new_pop.clone()));
                     if *source != result_opref {
@@ -2947,7 +2950,7 @@ impl OptContext {
                                 kind: PreambleOpKind::Heap,
                                 preamble_op: op,
                                 invented_name: produced_op.invented_name,
-                                same_as_source: produced_op.same_as_source,
+                                same_as_source: produced_op.same_as_source.clone(),
                             }
                         }
                         OpCode::GetarrayitemGcI
@@ -2985,7 +2988,7 @@ impl OptContext {
                                 kind: PreambleOpKind::Heap,
                                 preamble_op: op,
                                 invented_name: produced_op.invented_name,
-                                same_as_source: produced_op.same_as_source,
+                                same_as_source: produced_op.same_as_source.clone(),
                             }
                         }
                         _ => continue,
@@ -3022,7 +3025,7 @@ impl OptContext {
                         kind: PreambleOpKind::LoopInvariant,
                         preamble_op: op,
                         invented_name: produced_op.invented_name,
-                        same_as_source: produced_op.same_as_source,
+                        same_as_source: produced_op.same_as_source.clone(),
                     };
                     produced.push((*source, new_pop.clone()));
                     if *source != result_opref {
@@ -3841,7 +3844,7 @@ impl OptContext {
                     .iter()
                     .map(|op| ImportedShortAlias {
                         result: op.pos.get(),
-                        same_as_source: op.arg(0).to_opref(),
+                        same_as_source: op.arg(0),
                         same_as_opcode: op.opcode,
                     })
                     .collect()
