@@ -694,7 +694,7 @@ impl Optimizer {
                 let pos = ctx.inputarg_base + iv.inputarg_index as u32;
                 let raw =
                     OpRef::input_arg_typed(pos, ctx.inputarg_type_at_strict(iv.inputarg_index));
-                let virtual_head = ctx.get_box_replacement(raw).to_opref();
+                let virtual_head = ctx.get_replacement_opref(raw);
                 walk_visited.insert(top_key, virtual_head);
                 let mut fields = Vec::new();
                 for (descr, field_info) in &iv.fields {
@@ -1095,7 +1095,7 @@ impl Optimizer {
                 if let Some(box_) = ctx.get_box_replacement_box(opref) {
                     Self::apply_imported_virtual_state(info, &box_, ctx);
                 }
-                ctx.get_box_replacement(opref).to_opref()
+                ctx.get_replacement_opref(opref)
             }
         }
     }
@@ -1491,14 +1491,18 @@ impl Optimizer {
     /// longer needed. Mirrors force_box_inline (mod.rs) contract.
     pub fn force_box(&mut self, opref: OpRef, ctx: &mut OptContext) -> OpRef {
         // optimizer.py:346: op = get_box_replacement(op)
-        let resolved = ctx.get_box_replacement(opref).to_opref();
+        let resolved = ctx.get_replacement_opref(opref);
         // optimizer.py:351-359: potential_extra_ops.pop(op)
         // → sb.add_preamble_op(preamble_op)
         let tracked = ctx
             .take_potential_extra_op(resolved)
             .or_else(|| ctx.take_potential_extra_op(opref));
         if let Some(preamble_op) = tracked {
-            let resolved_for_pop = ctx.get_box_replacement(preamble_op.op).to_opref();
+            // shortpreamble.py:434 `op = preamble_op.op.get_box_replacement()`
+            // — the resolved Box itself is handed to the builder.
+            let resolved_for_pop = ctx
+                .get_box_replacement_box(preamble_op.op)
+                .unwrap_or_else(|| BoxRef::from_opref(preamble_op.op));
             if let Some(builder) = ctx.active_short_preamble_producer_mut() {
                 builder.add_preamble_op_from_pop(&preamble_op, resolved_for_pop);
             } else if let Some(builder) = ctx.imported_short_preamble_builder.as_mut() {
@@ -1525,7 +1529,7 @@ impl Optimizer {
             let resolved_box = resolved_box.expect("recorder-populated");
             let mut info = ctx.take_ptr_info(&resolved_box).unwrap();
             let forced = info.force_box(resolved_box, ctx);
-            return ctx.get_box_replacement(forced).to_opref();
+            return ctx.get_replacement_opref(forced);
         }
         resolved
     }
@@ -1556,7 +1560,7 @@ impl Optimizer {
     /// `force_at_the_end_of_preamble` directly should route through
     /// this wrapper for RPython structural parity (unroll.py:126-127).
     pub fn force_box_for_end_of_preamble(&mut self, opref: OpRef, ctx: &mut OptContext) -> OpRef {
-        let resolved = ctx.get_box_replacement(opref).to_opref();
+        let resolved = ctx.get_replacement_opref(opref);
         match ctx.opref_type(resolved) {
             // optimizer.py:307-313 — `box.type == 'r'` path.
             Some(majit_ir::Type::Ref) => {
@@ -1606,7 +1610,7 @@ impl Optimizer {
         ctx: &mut OptContext,
         rec: &mut majit_ir::vec_set::VecSet<OpRef>,
     ) -> OpRef {
-        let resolved = ctx.get_box_replacement(opref).to_opref();
+        let resolved = ctx.get_replacement_opref(opref);
         let resolved_box = ctx.get_box_replacement_box(opref);
         let Some(mut info) = resolved_box.as_ref().and_then(|b| ctx.peek_ptr_info(b)) else {
             return resolved;
@@ -2323,7 +2327,7 @@ impl Optimizer {
                         let raw = OpRef::input_arg_typed(raw_pos, tp);
                         eprintln!(
                             "[jit] import_state_resolved: raw={raw:?} resolved={:?}",
-                            ctx.get_box_replacement(raw).to_opref()
+                            ctx.get_replacement_opref(raw)
                         );
                     }
                 }
@@ -2419,7 +2423,7 @@ impl Optimizer {
             let resolved_args: Vec<OpRef> = terminal_op
                 .getarglist()
                 .iter()
-                .map(|arg| ctx.resolve_box_box(&arg).to_opref())
+                .map(|arg| ctx.get_replacement_opref(arg.to_opref()))
                 .collect();
             for &resolved in &resolved_args {
                 self.force_box_for_end_of_preamble(resolved, &mut ctx);
@@ -2431,7 +2435,7 @@ impl Optimizer {
             //   for i in range(op.numargs()): op.setarg(i, force_box(...))
             for i in 0..terminal_op.num_args() {
                 let arg = terminal_op.arg(i);
-                let resolved = ctx.resolve_box_box(&arg).to_opref();
+                let resolved = ctx.get_replacement_opref(arg.to_opref());
                 let expected_ref =
                     i < inputargs.len() && inputargs[i].ty() == Some(majit_ir::Type::Ref);
                 // setup_optimizations seeds `trace_inputargs` into
@@ -2440,7 +2444,7 @@ impl Optimizer {
                 // op/value_types chain. PtrInfo presence is an additional
                 // Ref-only side channel for inputargs not in `new_operations`.
                 let resolved_has_ptr_info = ctx
-                    .resolve_box_box_opt(&arg)
+                    .get_box_replacement_box(arg.to_opref())
                     .as_ref()
                     .map_or(false, |b| ctx.has_ptr_info(b));
                 let resolved_is_ref =
@@ -2453,7 +2457,7 @@ impl Optimizer {
                         .is_some()
                 {
                     let arg_is_virtual = ctx
-                        .resolve_box_box_opt(&arg)
+                        .get_box_replacement_box(arg.to_opref())
                         .as_ref()
                         .map_or(false, |b| ctx.is_virtual(b));
                     if arg_is_virtual {
@@ -2478,7 +2482,15 @@ impl Optimizer {
             for i in force_needed {
                 let original = terminal_op.arg(i);
                 let forced = self.force_box(original.to_opref(), &mut ctx);
-                terminal_op.setarg(i, ctx.get_box_replacement(forced));
+                // Operand writes carry the canonical box: resolve the chain
+                // terminal, materializing the host when the forced position
+                // has no producer yet (mirrors the materialize_box_at arm
+                // above; never a position-only fabrication).
+                let b_forced = match ctx.get_box_replacement_box(forced) {
+                    Some(b) => b,
+                    None => ctx.materialize_box_at(forced),
+                };
+                terminal_op.setarg(i, b_forced);
             }
             if self.skip_flush {
                 // flush=False: store for caller to consume.
@@ -2584,7 +2596,7 @@ impl Optimizer {
                 .map(|v| v.iter().map(|b| b.to_opref()).collect())
                 .unwrap_or_else(|| {
                     jump.getarglist().iter()
-                        .map(|a| ctx.resolve_box_box(&a).to_opref())
+                        .map(|a| ctx.get_replacement_opref(a.to_opref()))
                         .collect()
                 });
             let mut resolved_args = original_jump_args.clone();
@@ -2728,7 +2740,7 @@ impl Optimizer {
             // do in RPython.
             let post_force_args: Vec<OpRef> = resolved_args
                 .iter()
-                .map(|&a| ctx.get_box_replacement(a).to_opref())
+                .map(|&a| ctx.get_replacement_opref(a))
                 .collect();
             let preview_virtual_state =
                 crate::optimizeopt::virtualstate::export_state(&post_force_args, &ctx);
@@ -2788,7 +2800,7 @@ impl Optimizer {
             ctx.exported_short_boxes = produced
                 .into_iter()
                 .map(|(result, produced)| {
-                    let canonical_result = ctx.get_box_replacement(result).to_opref();
+                    let canonical_result = ctx.get_replacement_opref(result);
                     let mut preamble_op = produced.preamble_op;
                     // RPython parity: key and preamble_op.pos must be the
                     // same resolved value. Independent get_box_replacement
@@ -2797,15 +2809,12 @@ impl Optimizer {
                     preamble_op.pos.set(canonical_result);
                     // optimizer.py:651-652 force_box loop parity.
                     for i in 0..preamble_op.num_args() {
-                        preamble_op.setarg(
-                            i,
-                            ctx.resolve_box_box(&preamble_op.arg(i)),
-                        );
+                        preamble_op.setarg(i, ctx.replacement_for_operand(&preamble_op.arg(i)));
                     }
                     if let Some(fail_args) = preamble_op.fail_args_mut() {
                         for arg in fail_args {
                             *arg = majit_ir::operand::Operand::from_boxref(
-                                &ctx.resolve_box_box(&arg.to_boxref()),
+                                &ctx.get_box_replacement(arg.to_opref()),
                             );
                         }
                     }
@@ -3723,7 +3732,7 @@ impl Optimizer {
             // it to its terminal, so the stored arg is BOUND on every dispatch
             // path. A sentinel operand keeps its unbound arg box (const
             // operands resolve through the `Some` arm above).
-            let resolved = match ctx.resolve_box_box_opt(&arg) {
+            let resolved = match ctx.get_box_replacement_box(arg.to_opref()) {
                 Some(b) => b,
                 None => {
                     let argref = arg.to_opref();
@@ -4042,7 +4051,7 @@ impl Optimizer {
         //       if opinfo is not None and opinfo.is_constant():
         //           op.set_forwarded(ConstInt(opinfo.get_constant_int()))
         if op.result_type() == majit_ir::Type::Int {
-            let replaced = ctx.get_box_replacement(emitted).to_opref();
+            let replaced = ctx.get_replacement_opref(emitted);
             // BoxRef shim — peek_intbound_box takes &BoxRef per optimizer.py:99-113.
             let bound = ctx
                 .get_box_replacement_box(emitted)
@@ -4204,7 +4213,7 @@ impl Optimizer {
                             // (caught at pyjitpl/mod.rs:3454) on
                             // either invariant violation rather
                             // than silently coercing to 0.
-                            let boxindex = ctx.resolve_box_box(&pf_op.arg(1)).to_opref();
+                            let boxindex = ctx.get_replacement_opref(pf_op.arg(1).to_opref());
                             let idx = match ctx
                                 .get_box_replacement_box(boxindex)
                                 .and_then(|cb| cb.const_int())
@@ -4222,8 +4231,8 @@ impl Optimizer {
                         majit_ir::GuardPendingFieldEntry {
                             descr: pf_op.getdescr(),
                             item_index,
-                            target: ctx.get_box_replacement(target).to_opref(),
-                            value: ctx.get_box_replacement(value).to_opref(),
+                            target: ctx.get_replacement_opref(target),
+                            value: ctx.get_replacement_opref(value),
                             target_tagged: majit_ir::resumedata::UNASSIGNED,
                             value_tagged: majit_ir::resumedata::UNASSIGNED,
                         }
@@ -4463,7 +4472,7 @@ impl Optimizer {
         let mut loopinvariant_results = Vec::new();
         for pass in &self.passes {
             for (func_ptr, result) in pass.serialize_optrewrite() {
-                let replaced = ctx.get_box_replacement(result).to_opref();
+                let replaced = ctx.get_replacement_opref(result);
                 loopinvariant_results.push((func_ptr, replaced));
             }
         }
@@ -4527,7 +4536,7 @@ impl Optimizer {
         }
         // optimizer.py:756-757: b = self.getintbound(op.getarg(0)); if b.is_bool()
         let b = {
-            let b = ctx.resolve_box_box(&arg0);
+            let b = ctx.get_box_replacement(arg0.to_opref());
             ctx.getintbound_handle(&b).borrow().clone()
         };
         if !b.is_bool() {
@@ -6079,10 +6088,7 @@ mod tests {
         // The virtual is forced to a concrete allocation; the returned ref
         // is the allocation's position, which ctx.get_box_replacement(OpRef::int_op(10))
         // should resolve to.
-        assert_eq!(
-            result,
-            ctx.get_box_replacement(OpRef::int_op(10)).to_opref()
-        );
+        assert_eq!(result, ctx.get_replacement_opref(OpRef::int_op(10)));
         // After forcing, the struct's ptr_info reflects that field 1
         // (originally OpRef::int_op(11), forwarded to OpRef::int_op(20)) has been recursively forced.
         let result_box = ctx.get_box_replacement_box(result);

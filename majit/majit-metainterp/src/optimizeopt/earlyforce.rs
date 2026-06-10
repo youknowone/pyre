@@ -87,10 +87,13 @@ impl Optimization for OptEarlyForce {
                     // potential_extra_ops are handled by Optimizer.force_box,
                     // but earlyforce only needs the virtual materialization.
                     if let Some(tracked) = ctx.take_potential_extra_op(arg) {
+                        // shortpreamble.py:434: the resolved Box is handed
+                        // to the builder; fall back to the operand's own box.
+                        let arg_b = arg_box.clone().unwrap_or_else(|| op.arg(i));
                         if let Some(builder) = ctx.active_short_preamble_producer_mut() {
-                            builder.add_preamble_op_from_pop(&tracked, arg);
+                            builder.add_preamble_op_from_pop(&tracked, arg_b);
                         } else if let Some(builder) = ctx.imported_short_preamble_builder.as_mut() {
-                            builder.add_preamble_op_from_pop(&tracked, arg);
+                            builder.add_preamble_op_from_pop(&tracked, arg_b);
                         }
                     }
                     let arg_box = ctx

@@ -1797,7 +1797,7 @@ impl AbstractShortPreambleBuilderState {
     /// `same_as_source`: the original OpRef this invented name aliases.
     fn record_imported_preamble_use(
         &mut self,
-        op: OpRef,
+        op: crate::r#box::BoxRef,
         replay_op: &Op,
         invented_name: bool,
         same_as_source: Option<crate::r#box::BoxRef>,
@@ -1806,16 +1806,18 @@ impl AbstractShortPreambleBuilderState {
             return;
         }
         if invented_name {
-            let source = same_as_source.unwrap_or_else(|| BoxRef::from_opref(op));
+            // shortpreamble.py:436-437: extra_same_as carries the resolved
+            // box itself; a producer-bound box sheds to a live operand.
+            let source = same_as_source.unwrap_or_else(|| op.clone());
             let mut same_as = Op::new(OpCode::same_as_for_type(replay_op.result_type()), &[source]);
-            same_as.pos.set(op);
+            same_as.pos.set(op.to_opref());
             self.extra_same_as.push(same_as);
         }
-        self.used_boxes.push(op);
+        self.used_boxes.push(op.to_opref());
         self.short_preamble_jump.push(replay_op.clone());
     }
 
-    fn record_preamble_use(&mut self, result: OpRef, produced: &ProducedShortOp) {
+    fn record_preamble_use(&mut self, result: crate::r#box::BoxRef, produced: &ProducedShortOp) {
         self.record_imported_preamble_use(
             result,
             &produced.preamble_op,
@@ -2110,7 +2112,7 @@ impl ShortPreambleBuilder {
     pub fn add_preamble_op_from_pop(
         &mut self,
         preamble_op: &crate::optimizeopt::info::PreambleOp,
-        resolved_op: OpRef,
+        resolved_op: crate::r#box::BoxRef,
     ) {
         if let Some(produced) = self.produced_short_boxes.get(&preamble_op.op) {
             self.state.record_preamble_use(resolved_op, produced);
@@ -2130,7 +2132,8 @@ impl ShortPreambleBuilder {
         let Some(produced) = self.produced_short_boxes.get(&result).cloned() else {
             return false;
         };
-        self.state.record_preamble_use(result, &produced);
+        self.state
+            .record_preamble_use(BoxRef::from_opref(result), &produced);
         true
     }
 
@@ -2503,14 +2506,15 @@ impl ExtendedShortPreambleBuilder {
     pub fn add_preamble_op_from_pop(
         &mut self,
         preamble_op: &crate::optimizeopt::info::PreambleOp,
-        resolved_op: OpRef,
+        resolved_op: crate::r#box::BoxRef,
     ) {
+        let resolved_key = resolved_op.to_opref();
         let lookup_key = if self
             .produced_short_boxes
             .iter()
-            .any(|(k, _)| *k == resolved_op)
+            .any(|(k, _)| *k == resolved_key)
         {
-            resolved_op
+            resolved_key
         } else {
             preamble_op.op
         };
@@ -2522,7 +2526,7 @@ impl ExtendedShortPreambleBuilder {
             if !self.recorded_canonical_results.insert(replay_op.pos.get()) {
                 return;
             }
-            let op = resolved_op;
+            let op = resolved_key;
             if preamble_op.invented_name {
                 let source = BoxRef::from_opref(preamble_op.op);
                 let mut same_as =
@@ -2537,16 +2541,22 @@ impl ExtendedShortPreambleBuilder {
     }
 
     /// shortpreamble.py:471-477: add_preamble_op (internal)
-    pub fn add_tracked_preamble_op(&mut self, result: OpRef, produced: &ProducedShortOp) {
+    pub fn add_tracked_preamble_op(
+        &mut self,
+        result: crate::r#box::BoxRef,
+        produced: &ProducedShortOp,
+    ) {
         let current_result = produced.preamble_op.pos.get();
         if !self.recorded_canonical_results.insert(current_result) {
             return;
         }
         if produced.invented_name {
+            // shortpreamble.py:436-437: the resolved box itself is the
+            // SameAs source; a producer-bound box sheds to a live operand.
             let source = produced
                 .same_as_source
                 .clone()
-                .unwrap_or_else(|| BoxRef::from_opref(result));
+                .unwrap_or_else(|| result.clone());
             let mut op = Op::new(
                 OpCode::same_as_for_type(produced.preamble_op.result_type()),
                 &[source],
@@ -2554,7 +2564,7 @@ impl ExtendedShortPreambleBuilder {
             op.pos.set(current_result);
             self.extra_same_as.push(op);
         }
-        self.label_args.push(result);
+        self.label_args.push(result.to_opref());
         self.used_boxes.push(current_result);
         self.short_jump_args.push(produced.preamble_op.pos.get());
         self.short_preamble_jump.push(produced.preamble_op.clone());
@@ -2564,7 +2574,7 @@ impl ExtendedShortPreambleBuilder {
         let Some(produced) = self.produced_short_boxes.get(&result).cloned() else {
             return false;
         };
-        self.add_tracked_preamble_op(result, &produced);
+        self.add_tracked_preamble_op(BoxRef::from_opref(result), &produced);
         true
     }
 
@@ -3808,7 +3818,7 @@ mod tests {
             preamble_op: replay_op,
         };
 
-        builder.add_preamble_op_from_pop(&pop, OpRef::int_op(41));
+        builder.add_preamble_op_from_pop(&pop, BoxRef::from_opref(OpRef::int_op(41)));
 
         assert_eq!(builder.used_boxes(), &[OpRef::int_op(41)]);
         assert_eq!(builder.short_preamble_jump().len(), 1);
@@ -3845,7 +3855,7 @@ mod tests {
             preamble_op: replay_op,
         };
 
-        builder.add_preamble_op_from_pop(&pop, OpRef::int_op(41));
+        builder.add_preamble_op_from_pop(&pop, BoxRef::from_opref(OpRef::int_op(41)));
 
         assert_eq!(builder.label_args(), &[OpRef::int_op(41)]);
         assert_eq!(builder.jump_args(), &[OpRef::int_op(14)]);

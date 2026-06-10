@@ -5672,7 +5672,11 @@ impl OptContext {
             .take_potential_extra_op(resolved)
             .or_else(|| self.take_potential_extra_op(opref));
         if let Some(preamble_op) = tracked {
-            let resolved_for_pop = self.get_replacement_opref(preamble_op.op);
+            // shortpreamble.py:434 `op = preamble_op.op.get_box_replacement()`
+            // — the resolved Box itself is handed to the builder.
+            let resolved_for_pop = self
+                .get_box_replacement_box(preamble_op.op)
+                .unwrap_or_else(|| crate::r#box::BoxRef::from_opref(preamble_op.op));
             if let Some(builder) = self.active_short_preamble_producer_mut() {
                 builder.add_preamble_op_from_pop(&preamble_op, resolved_for_pop);
             } else if let Some(builder) = self.imported_short_preamble_builder.as_mut() {
