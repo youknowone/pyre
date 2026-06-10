@@ -271,6 +271,15 @@ pub struct TraceCtx {
     /// the cross-component flow at dispatch time) can sample the
     /// metainterp's depth counter without holding a back-reference.
     pub portal_call_depth_fn: Option<Box<dyn Fn() -> i32>>,
+    /// pyjitpl.py:1527 `MetaInterp.seen_loop_header_for_jdindex` parity for
+    /// walkers that drive dispatch through `TraceCtx` (the pyre full-body
+    /// walker has no dispatcher struct of its own, so the per-trace flag
+    /// lives here; majit's own `pyjitpl::dispatch` keeps an equivalent
+    /// field on the dispatcher).  Stamped by a `loop_header` op
+    /// (pyjitpl.py:1527-1528, the lowered `can_enter_jit` at a backward
+    /// jump), consumed and reset by the following `jit_merge_point`
+    /// (pyjitpl.py:1559-1562).  `-1` = not seen.
+    pub seen_loop_header_for_jdindex: i32,
     /// pyjitpl.py: `metainterp.staticdata.callinfocollection`. Needed by
     /// `ResumeDataBoxReader.concat_strings` / `slice_string` / `concat_unicodes`
     /// / `slice_unicode` (resume.py:1143-1188) which look up the
@@ -1091,6 +1100,7 @@ impl TraceCtx {
             has_compiled_targets_fn: None,
             is_bridge_trace: false,
             portal_call_depth_fn: None,
+            seen_loop_header_for_jdindex: -1,
             callinfocollection: None,
             call_pure_results: crate::optimizeopt::vec_assoc::VecAssoc::new(),
             trace_limit: DEFAULT_TRACE_LIMIT,
@@ -1156,6 +1166,7 @@ impl TraceCtx {
             has_compiled_targets_fn: None,
             is_bridge_trace: false,
             portal_call_depth_fn: None,
+            seen_loop_header_for_jdindex: -1,
             callinfocollection: None,
             call_pure_results: crate::optimizeopt::vec_assoc::VecAssoc::new(),
             trace_limit: DEFAULT_TRACE_LIMIT,

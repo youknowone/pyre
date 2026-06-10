@@ -952,6 +952,14 @@ pub enum DispatchError {
     /// `pyjitpl.py:2979 get_procedure_token(greenboxes)` always receives
     /// concrete greens at a reached merge point.
     JitMergePointGreenKeyUnresolved { pc: usize },
+    /// `loop_header/i` could not resolve its jdindex operand to a
+    /// concrete Int. The assembler always encodes the jdindex as a
+    /// populated int-constant-pool slot (`assembler.rs loop_header`:
+    /// `add_const_i` + patch at `finish()`), so an unresolved slot is a
+    /// structural encoding bug, mirroring the `expect` on
+    /// `frame.int_values[slot]` in majit's `BC_LOOP_HEADER` arm
+    /// (`pyjitpl/dispatch.rs`).
+    LoopHeaderJdIndexUnresolved { pc: usize },
     /// An `inline_call_*` sub-walk surfaced `DispatchOutcome::CloseLoop`.
     /// `jit_merge_point` is the portal loop header; an inlined (non-portal)
     /// callee body should never reach one and close a loop. RPython parity:
@@ -9590,6 +9598,22 @@ fn handle(
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
     match op.key {
         "live/" => Ok((DispatchOutcome::Continue, op.next_pc)),
+        "loop_header/i" => {
+            // pyjitpl.py:1527-1528 `opimpl_loop_header(jdindex, orgpc)`:
+            // pure flag setter — stamps `seen_loop_header_for_jdindex` so
+            // the following `jit_merge_point` treats the arrival as a
+            // loop crossing (the lowered `can_enter_jit` at a backward
+            // jump, jtransform.py:1714-1723). The close/register decision
+            // happens at the merge point (pyjitpl.py:1559-1573). Mirrors
+            // majit's `BC_LOOP_HEADER` arm (`pyjitpl/dispatch.rs`).
+            let jd_opref = read_int_reg(code, op, 0, ctx)?;
+            let jdindex = match ctx.trace_ctx.concrete_of_opref(jd_opref) {
+                Some(Value::Int(v)) => v,
+                _ => return Err(DispatchError::LoopHeaderJdIndexUnresolved { pc: op.pc }),
+            };
+            ctx.trace_ctx.seen_loop_header_for_jdindex = jdindex as i32;
+            Ok((DispatchOutcome::Continue, op.next_pc))
+        }
         // RPython parity: `pyjitpl.py:1266-1324 _opimpl_inline_call*`
         // pushes a fresh `MIFrame(jitcode)` populated with caller args,
         // raises `ChangeFrame()` so the metainterp loop dispatches the
@@ -10580,6 +10604,64 @@ fn handle(
                 _ => return Err(DispatchError::JitMergePointGreenKeyUnresolved { pc: op.pc }),
             };
             let key = crate::driver::make_green_key(code_ptr, next_instr);
+
+            // pyjitpl.py:1547-1562: a jit_merge_point is a loop CROSSING
+            // only when a `loop_header` op (the lowered `can_enter_jit`
+            // at a backward-jump site) stamped the per-trace flag just
+            // before — arrival by straight-line fall-through (e.g. the
+            // first check of a fresh inner `while`) records nothing and
+            // walks on. Without this gate the walker closes a degenerate
+            // "outer-iteration" loop at the inner header (exhausted-check
+            // → outer increment → new-iterator → re-arrival), occupying
+            // the inner loop's green key so its specialized retrace can
+            // never compile. Mirrors majit's `BC_JIT_MERGE_POINT` auto
+            // loop-header + close protocol (`pyjitpl/dispatch.rs`).
+            if ctx.trace_ctx.seen_loop_header_for_jdindex < 0 {
+                // pyjitpl.py:1548 `if not any_operation: return`.
+                if ctx.trace_ctx.num_ops() == 0 {
+                    return Ok((DispatchOutcome::Continue, op.next_pc));
+                }
+                // pyjitpl.py:1550 `if not jitdriver_sd.no_loop_header:` —
+                // jdindex is the op's leading `c` byte.
+                let jdindex = code[op.pc + 1] as i8 as usize;
+                let no_loop_header = ctx
+                    .trace_ctx
+                    .metainterp_sd()
+                    .jitdrivers_sd
+                    .get(jdindex)
+                    .map(|jd| jd.no_loop_header)
+                    .unwrap_or(false);
+                if !no_loop_header {
+                    // pyjitpl.py:1551 `if self.metainterp.portal_call_depth:
+                    // return` — nested portal call waits for an explicit
+                    // loop_header.
+                    let depth_zero = ctx
+                        .trace_ctx
+                        .portal_call_depth_fn
+                        .as_ref()
+                        .map(|f| f() == 0)
+                        .unwrap_or(false);
+                    if !depth_zero || !ctx.is_top_level {
+                        return Ok((DispatchOutcome::Continue, op.next_pc));
+                    }
+                    // pyjitpl.py:1553-1555: fall-through arrival counts as
+                    // an automatic loop_header only when compiled targets
+                    // already exist for the crossed green key.
+                    let has_targets = ctx
+                        .trace_ctx
+                        .has_compiled_targets_fn
+                        .as_ref()
+                        .map(|f| f(key))
+                        .unwrap_or(false);
+                    if !has_targets {
+                        return Ok((DispatchOutcome::Continue, op.next_pc));
+                    }
+                }
+                // pyjitpl.py:1557: automatically add a loop_header.
+            }
+            // pyjitpl.py:1562 reset; the assert at :1559 is vacuous for
+            // pyre's single portal jitdriver.
+            ctx.trace_ctx.seen_loop_header_for_jdindex = -1;
 
             // pyjitpl.py:2951 self.heapcache.reset()
             ctx.trace_ctx.heap_cache_mut().reset();
@@ -18353,13 +18435,27 @@ mod tests {
             store_subscr_fn_addr: None,
         };
 
-        // First visit: registers (key, [red0, red1]) and continues.
+        // Arrival without a preceding `loop_header` stamp and with no
+        // recorded ops is a plain pass-through (pyjitpl.py:1547-1548):
+        // nothing registers, nothing closes.
+        let (gated, gated_next) =
+            step(&code, 0, &mut wc).expect("gated jit_merge_point must dispatch");
+        assert_eq!(gated, DispatchOutcome::Continue);
+        assert_eq!(gated_next, code.len());
+
+        // First crossing via a backward jump: `loop_header` stamped the
+        // per-trace flag (pyjitpl.py:1527-1528) — registers
+        // (key, [red0, red1]) and continues.
+        wc.trace_ctx.seen_loop_header_for_jdindex = 0;
         let (first, first_next) =
             step(&code, 0, &mut wc).expect("first jit_merge_point must dispatch");
         assert_eq!(first, DispatchOutcome::Continue);
         assert_eq!(first_next, code.len());
+        // The stamp is consumed (pyjitpl.py:1562).
+        assert_eq!(wc.trace_ctx.seen_loop_header_for_jdindex, -1);
 
-        // Second visit (same key + red shape): closes the loop.
+        // Second stamped crossing (same key + red shape): closes the loop.
+        wc.trace_ctx.seen_loop_header_for_jdindex = 0;
         let (second, _) = step(&code, 0, &mut wc).expect("second jit_merge_point must dispatch");
         assert_eq!(
             second,
@@ -18368,6 +18464,50 @@ mod tests {
                 loop_header_pc: 42,
             }
         );
+    }
+
+    /// `loop_header/i` stamps `seen_loop_header_for_jdindex` from its
+    /// int-constant operand and records nothing (pyjitpl.py:1527-1528).
+    #[test]
+    fn loop_header_stamps_seen_flag() {
+        let lh_byte = *insns_opname_to_byte()
+            .get("loop_header/i")
+            .expect("`loop_header/i` must be in insns table");
+        let code = [lh_byte, 0x00]; // i: register slot 0 holds the jdindex
+        let mut tc = fresh_trace_ctx();
+        let jdindex = tc.const_int(0);
+        let mut regs_i = vec![jdindex];
+        let descr = done_descr_ref_for_tests();
+        let mut wc = WalkContext {
+            registers_r: &mut [],
+            registers_i: &mut regs_i,
+            registers_f: &mut [],
+            concrete_registers_r: &mut [],
+            concrete_registers_i: &mut [],
+            descr_refs: &[],
+            raw_descrs: RawDescrPool::Global,
+            is_authoritative_executor: false,
+            trace_ctx: &mut tc,
+            done_with_this_frame_descr_ref: descr.clone(),
+            done_with_this_frame_descr_int: make_fail_descr(101),
+            done_with_this_frame_descr_float: make_fail_descr(102),
+            done_with_this_frame_descr_void: make_fail_descr(103),
+            exit_frame_with_exception_descr_ref: make_fail_descr(2),
+            is_top_level: true,
+            sub_jitcode_lookup: &no_sub_jitcodes,
+            last_exc_value: None,
+            last_exc_value_concrete: ConcreteValue::Null,
+            entry_py_pc: 0,
+            outer_jitcode_index: 0,
+            outer_active_boxes: Vec::new(),
+            store_subscr_fn_addr: None,
+        };
+        assert_eq!(wc.trace_ctx.seen_loop_header_for_jdindex, -1);
+        let (outcome, next) = step(&code, 0, &mut wc).expect("loop_header must dispatch");
+        assert_eq!(outcome, DispatchOutcome::Continue);
+        assert_eq!(next, code.len());
+        assert_eq!(wc.trace_ctx.seen_loop_header_for_jdindex, 0);
+        assert_eq!(wc.trace_ctx.num_ops(), 0, "loop_header records nothing");
     }
 
     /// A green list with no concrete leading element cannot form the

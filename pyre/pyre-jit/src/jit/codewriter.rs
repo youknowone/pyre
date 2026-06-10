@@ -2386,6 +2386,46 @@ fn emit_graph_op_with_result(
     result
 }
 
+/// Record a `loop_header` graph op (jtransform.py:1714-1723, the lowered
+/// `can_enter_jit` at a backward-jump site) into `block` and serialize it
+/// into the SSARepr stream the assembler consumes.  The op carries a
+/// single `Constant(jdindex)` — no Variables — so the flattener needs no
+/// register coloring.  Same record-then-serialize idiom as the portal
+/// `jit_merge_point` emission.
+fn emit_loop_header(
+    graph: &super::flow::FunctionGraph,
+    block: &SpamBlockRef,
+    ssarepr: &mut SSARepr,
+    jdindex: usize,
+    py_pc: usize,
+) {
+    let graph_op = emit_graph_op_void(
+        &block.block(),
+        "loop_header",
+        vec![super::flow::Constant::signed(jdindex as i64).into()],
+        py_pc as i64,
+    );
+    let pre_len = ssarepr.insns.len();
+    let mut empty_regallocs = [
+        super::regalloc::GraphAllocationResult {
+            coloring: std::collections::HashMap::new(),
+            num_colors: 0,
+        },
+        super::regalloc::GraphAllocationResult {
+            coloring: std::collections::HashMap::new(),
+            num_colors: 0,
+        },
+        super::regalloc::GraphAllocationResult {
+            coloring: std::collections::HashMap::new(),
+            num_colors: 0,
+        },
+    ];
+    GraphFlattener::new(graph, &mut empty_regallocs, ssarepr).serialize_op(&graph_op);
+    for insn in ssarepr.insns[pre_len..].to_vec() {
+        block.push_insn(insn);
+    }
+}
+
 fn emit_frontend_neg(
     graph: &mut super::flow::FunctionGraph,
     block: &super::flow::BlockRef,
@@ -6145,6 +6185,23 @@ impl CodeWriter {
                                 backward_jump_target(code, py_pc, instr, op_arg)
                             {
                                 if target_py_pc < num_instrs {
+                                    // interp_jit.py:118 `can_enter_jit` at each
+                                    // backward jump → jtransform.py:1714-1723
+                                    // lowers it to a `loop_header` op in the
+                                    // jumping block, before the goto. The op
+                                    // stamps `seen_loop_header_for_jdindex` so
+                                    // the target's `jit_merge_point` treats
+                                    // this arrival as a loop crossing
+                                    // (pyjitpl.py:1527-1562).
+                                    if let Some(jdindex) = portal_jd_index {
+                                        emit_loop_header(
+                                            &graph,
+                                            &current_block,
+                                            &mut ssarepr,
+                                            jdindex,
+                                            py_pc,
+                                        );
+                                    }
                                     emit_goto!(target_py_pc);
                                 }
                             }
@@ -6379,6 +6436,18 @@ impl CodeWriter {
                                 backward_jump_target(code, py_pc, instr, op_arg)
                             {
                                 if target_py_pc < num_instrs {
+                                    // Same `can_enter_jit` → `loop_header`
+                                    // lowering as the JumpBackward arm above
+                                    // (jtransform.py:1714-1723).
+                                    if let Some(jdindex) = portal_jd_index {
+                                        emit_loop_header(
+                                            &graph,
+                                            &current_block,
+                                            &mut ssarepr,
+                                            jdindex,
+                                            py_pc,
+                                        );
+                                    }
                                     emit_goto!(target_py_pc);
                                 }
                             }
