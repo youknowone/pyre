@@ -561,7 +561,10 @@ impl PotentialShortOp {
                         let alias = ctx.alloc_op_position_typed(tp);
                         alt.preamble_op.pos.set(alias);
                         alt.invented_name = true;
-                        alt.same_as_source = Some(BoxRef::from_opref(compound.res));
+                        // shortpreamble.py:328 `ResOperation(opnum, [shortop.res])`
+                        // — the alias source is the Box itself; resolve to
+                        // the canonical (possibly producer-bound) box.
+                        alt.same_as_source = Some(ctx.materialize_box_at(compound.res));
                         sb.produced_short_boxes.insert(alias, alt.clone());
                     }
                     Some(chosen)
