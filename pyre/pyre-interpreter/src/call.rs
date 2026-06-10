@@ -2027,6 +2027,42 @@ fn call_metaclass_with_kwargs(
     kwargs: PyObjectRef,
 ) -> PyObjectRef {
     if unsafe { !pyre_object::is_type(w_metaclass) } {
+        // compiling.py:213-219 — `space.call_args(w_meta, Arguments(name,
+        // bases, ns, **kwds))`; a non-type metaclass receives the
+        // class-definition keywords too.
+        let kwds: Vec<(String, PyObjectRef)> = if unsafe { pyre_object::is_dict(kwargs) } {
+            unsafe {
+                pyre_object::w_dict_items(kwargs)
+                    .into_iter()
+                    .filter(|(k, _)| pyre_object::is_str(*k))
+                    .map(|(k, v)| (pyre_object::w_str_get_value(k).to_string(), v))
+                    .collect()
+            }
+        } else {
+            Vec::new()
+        };
+        let frame = {
+            let stored = BUILD_CLASS_EXEC_CTX.with(|c| c.get());
+            if stored.is_null() {
+                std::ptr::null_mut()
+            } else {
+                unsafe { (*stored).gettopframe() }
+            }
+        };
+        if !kwds.is_empty() && !frame.is_null() {
+            return match call_with_kwargs(
+                unsafe { &mut *frame },
+                w_metaclass,
+                &[name, bases, w_namespace_dict],
+                &kwds,
+            ) {
+                Ok(v) => v,
+                Err(e) => {
+                    set_call_error(e);
+                    PY_NULL
+                }
+            };
+        }
         return crate::call_function(w_metaclass, &[name, bases, w_namespace_dict]);
     }
     let kw_items: Vec<(PyObjectRef, PyObjectRef)> = if unsafe { pyre_object::is_dict(kwargs) } {
@@ -2283,21 +2319,67 @@ fn build_class_inner(
         // namespace.
         match crate::baseobjspace::getattr_str(w_metaclass, "__prepare__") {
             Ok(prepare) => {
-                clear_call_error();
-                let ns_obj = crate::call_function(prepare, &[pyre_object::w_str_new(name), bases]);
-                if ns_obj.is_null() {
-                    // __prepare__ was found but raised during execution —
-                    // propagate that exception rather than silently using a
-                    // fresh namespace.
-                    if let Some(err) = take_call_error() {
-                        return Err(err);
+                // compiling.py:190-196 — call __prepare__ with the
+                // class-definition keywords ('metaclass' already popped by
+                // the caller).
+                let prepare_kwds: Vec<(String, PyObjectRef)> = match extra_kwargs {
+                    Some(kw) if unsafe { pyre_object::is_dict(kw) } => unsafe {
+                        pyre_object::w_dict_items(kw)
+                            .into_iter()
+                            .filter(|(k, _)| pyre_object::is_str(*k))
+                            .map(|(k, v)| (pyre_object::w_str_get_value(k).to_string(), v))
+                            .collect()
+                    },
+                    _ => Vec::new(),
+                };
+                let prepare_frame = {
+                    let stored = BUILD_CLASS_EXEC_CTX.with(|c| c.get());
+                    if stored.is_null() {
+                        std::ptr::null_mut()
+                    } else {
+                        unsafe { (*stored).gettopframe() }
                     }
-                    None
-                } else if unsafe { !pyre_object::is_none(ns_obj) } {
-                    Some(ns_obj)
+                };
+                let ns_obj = if !prepare_kwds.is_empty() && !prepare_frame.is_null() {
+                    call_with_kwargs(
+                        unsafe { &mut *prepare_frame },
+                        prepare,
+                        &[pyre_object::w_str_new(name), bases],
+                        &prepare_kwds,
+                    )?
                 } else {
-                    None
+                    clear_call_error();
+                    let r =
+                        crate::call_function(prepare, &[pyre_object::w_str_new(name), bases]);
+                    if r.is_null() {
+                        // __prepare__ was found but raised during execution —
+                        // propagate that exception rather than silently using
+                        // a fresh namespace.
+                        if let Some(err) = take_call_error() {
+                            return Err(err);
+                        }
+                    }
+                    r
+                };
+                // compiling.py:197-204 — a found __prepare__ must return a
+                // mapping; None or any sequence is rejected.
+                if !ns_obj.is_null() && !crate::baseobjspace::ismapping_w(ns_obj) {
+                    let meta_name = if unsafe { pyre_object::is_type(w_metaclass) } {
+                        unsafe { pyre_object::w_type_get_name(w_metaclass).to_string() }
+                    } else {
+                        "<metaclass>".to_string()
+                    };
+                    let result_type = unsafe {
+                        match crate::typedef::r#type(ns_obj) {
+                            Some(tp) => pyre_object::w_type_get_name(tp).to_string(),
+                            None => (*(*ns_obj).ob_type).name.to_string(),
+                        }
+                    };
+                    return Err(crate::PyError::type_error(format!(
+                        "{meta_name}.__prepare__() must return a mapping, not {result_type}"
+                    )));
                 }
+                if ns_obj.is_null() { None } else { Some(ns_obj) }
             }
             // Only a missing __prepare__ (AttributeError) falls back to a
             // fresh namespace; any other lookup error propagates.
@@ -2604,13 +2686,43 @@ fn build_class_inner(
         w
     };
 
-    // type_new_classcell — set the captured `__classcell__` cell's content
-    // to the newly created class so `__class__` / zero-arg `super()`
-    // references in the methods resolve.  The namespace key was already
-    // removed above.
+    // `_store_type_in_classcell` runs inside type.__new__, which the
+    // metaclass path reaches; the default path builds via raw
+    // `w_type_new`, so bind the cell here in its stead.  After a
+    // metaclass call, compiling.py:232-246 validates that the cell was
+    // propagated to type.__new__ and holds the class that came back:
+    //
+    //     if isinstance(w_cell, Cell) and isinstance(w_class, W_TypeObject):
+    //         if w_cell.empty():
+    //             raise oefmt(space.w_RuntimeError,
+    //                 "__class__ not set defining %S as %S. "
+    //                 "Was __classcell__ propagated to type.__new__?", ...)
+    //         else:
+    //             w_class_from_cell = w_cell.get()
+    //             if not space.is_w(w_class, w_class_from_cell):
+    //                 raise oefmt(space.w_TypeError,
+    //                     "__class__ set to %S defining %S as %S", ...)
     if let Some(classcell) = classcell {
         if !classcell.is_null() && unsafe { pyre_object::is_cell(classcell) } {
-            unsafe { pyre_object::w_cell_set(classcell, w_type) };
+            if w_metaclass.is_some() && unsafe { pyre_object::is_type(w_type) } {
+                let cell_value = unsafe { pyre_object::w_cell_get(classcell) };
+                if cell_value.is_null() {
+                    let class_str = unsafe { crate::py_str(w_type) };
+                    return Err(PyError::runtime_error(format!(
+                        "__class__ not set defining {name} as {class_str}. \
+                         Was __classcell__ propagated to type.__new__?"
+                    )));
+                }
+                if !std::ptr::eq(cell_value, w_type) {
+                    let cell_str = unsafe { crate::py_str(cell_value) };
+                    let class_str = unsafe { crate::py_str(w_type) };
+                    return Err(PyError::type_error(format!(
+                        "__class__ set to {cell_str} defining {name} as {class_str}"
+                    )));
+                }
+            } else {
+                unsafe { pyre_object::w_cell_set(classcell, w_type) };
+            }
         }
     }
 
@@ -2656,11 +2768,23 @@ fn pack_pyre_kwargs(kw_items: &[(PyObjectRef, PyObjectRef)]) -> PyObjectRef {
     kw_dict
 }
 
-/// `typeobject.c type_new_init_subclass` — after a class is created, call
-/// `super(w_type, w_type).__init_subclass__(**kwds)` exactly once.  The
-/// nearest `__init_subclass__` after `w_type` itself in the MRO is
-/// responsible for chaining to its own `super()`.  `init_subclass_kwargs`
-/// must already exclude the `__pyre_kw__` marker and the `metaclass` key.
+/// typeobject.py:1020-1026 `_init_subclass` — after a class is created,
+/// call `super(w_type, w_type).__init_subclass__(**kwds)` exactly once.
+///
+/// ```python
+/// def _init_subclass(space, w_type, __args__):
+///     w_super = space.getattr(space.builtin, space.newtext("super"))
+///     w_func = space.getattr(space.call_function(w_super, w_type, w_type),
+///                            space.newtext("__init_subclass__"))
+///     args = __args__.replace_arguments([])
+///     space.call_args(w_func, args)
+/// ```
+///
+/// The super-proxy getattr performs descriptor binding (a classmethod
+/// binds `w_type` as cls; a plain function binds `w_type` as the super
+/// obj), and the call forwards only the class-definition keywords.
+/// `init_subclass_kwargs` must already exclude the `__pyre_kw__` marker
+/// and the `metaclass` key.
 ///
 /// `w_effective_bases` is unused now that resolution follows the MRO, but
 /// is kept in the signature so the call sites need not change.
@@ -2669,44 +2793,35 @@ pub(crate) fn call_init_subclass_on_bases(
     _w_effective_bases: PyObjectRef,
     init_subclass_kwargs: &[(PyObjectRef, PyObjectRef)],
 ) -> Result<(), crate::PyError> {
-    let Some(init_sub) =
-        (unsafe { crate::baseobjspace::lookup_in_mro_after_self(w_type, "__init_subclass__") })
-    else {
-        return Ok(());
+    let w_super = pyre_object::superobject::w_super_new(w_type, w_type);
+    let w_func = crate::baseobjspace::getattr_str(w_super, "__init_subclass__")?;
+    // `__args__.replace_arguments([])` — keywords only, no positionals.
+    let kwds: Vec<(String, PyObjectRef)> = init_subclass_kwargs
+        .iter()
+        .filter(|(k, _)| unsafe { pyre_object::is_str(*k) })
+        .map(|(k, v)| (unsafe { pyre_object::w_str_get_value(*k) }.to_string(), *v))
+        .collect();
+    let frame = {
+        let stored = BUILD_CLASS_EXEC_CTX.with(|c| c.get());
+        if stored.is_null() {
+            std::ptr::null_mut()
+        } else {
+            unsafe { (*stored).gettopframe() }
+        }
     };
-    // Forward kwargs only to a user-defined __init_subclass__ with a
-    // real Python code object; object's builtin default has no code
-    // object, so resolve_kwargs would deref a bogus code pointer.
-    let is_user_fn = unsafe { crate::is_function(init_sub) }
-        && unsafe { !crate::is_builtin_code(crate::getcode(init_sub) as pyre_object::PyObjectRef) };
-    if !init_subclass_kwargs.is_empty() && is_user_fn {
-        let mut call_args = Vec::with_capacity(1 + init_subclass_kwargs.len());
-        call_args.push(w_type);
-        let mut names = Vec::with_capacity(init_subclass_kwargs.len());
-        for (k, v) in init_subclass_kwargs {
-            call_args.push(*v);
-            names.push(*k);
-        }
-        let kwarg_names = pyre_object::w_tuple_new(names);
-        let resolved = resolve_kwargs(init_sub, &call_args, kwarg_names)?;
+    if !frame.is_null() {
+        call_with_kwargs(unsafe { &mut *frame }, w_func, &[], &kwds)?;
+    } else if kwds.is_empty() {
+        // No live frame to thread through call_with_kwargs (direct
+        // embedding entry); the bound method carries the receiver.
         clear_call_error();
-        let res = call_user_function_resolved_frameless(init_sub, &resolved);
-        if res.is_null() {
-            if let Some(err) = take_call_error() {
-                return Err(err);
-            }
-        }
-    } else if init_subclass_kwargs.is_empty() {
-        clear_call_error();
-        let res = crate::call_function(init_sub, &[w_type]);
+        let res = crate::call_function(w_func, &[]);
         if res.is_null() {
             if let Some(err) = take_call_error() {
                 return Err(err);
             }
         }
     } else {
-        // The default __init_subclass__ consumes no keywords; leftover
-        // keywords are an error rather than silently dropped.
         return Err(crate::PyError::type_error(
             "__init_subclass__() takes no keyword arguments",
         ));

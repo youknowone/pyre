@@ -3873,42 +3873,6 @@ pub(crate) unsafe fn lookup_in_type_wtf8(w_type: PyObjectRef, name: &Wtf8) -> Op
     None
 }
 
-/// Resolve `name` the way `super(w_type, w_type).name` would: walk the
-/// MRO starting *after* `w_type` itself and return the first own-dict
-/// definition.  Used by `type_new_init_subclass` to invoke
-/// `__init_subclass__` exactly once on the nearest ancestor.
-pub(crate) unsafe fn lookup_in_mro_after_self(
-    w_type: PyObjectRef,
-    name: &str,
-) -> Option<PyObjectRef> {
-    if w_type.is_null() || !is_type(w_type) {
-        return None;
-    }
-    let cached = w_type_get_mro(w_type);
-    let mro_owned;
-    let mro: &[PyObjectRef] = if !cached.is_null() {
-        &*cached
-    } else {
-        mro_owned = compute_mro(w_type);
-        &mro_owned
-    };
-    for cls in mro.iter().skip(1) {
-        if (*cls).is_null() || !is_type(*cls) {
-            continue;
-        }
-        let ns_ptr = w_type_get_dict_ptr(*cls) as *mut crate::DictStorage;
-        if !ns_ptr.is_null() {
-            let ns = &*ns_ptr;
-            if let Some(&value) = ns.get(name) {
-                if !value.is_null() {
-                    return Some(value);
-                }
-            }
-        }
-    }
-    None
-}
-
 /// Determine what `self` value to bind for a super-resolved attribute.
 ///
 /// Walks the MRO of `self_obj` starting after `super_type`, finds the
@@ -6261,6 +6225,40 @@ pub(crate) fn object_functionstr_type_name(w_obj: PyObjectRef) -> String {
 /// the same checks `iter()` uses (null-check, type-tag check) and
 /// never reads through a dangling pointer beyond what existing pyre
 /// type-tag helpers guarantee.
+/// baseobjspace.py:1316-1323 `ismapping_w`.
+///
+/// ```python
+/// def ismapping_w(self, w_obj):
+///     flag = self.type(w_obj).flag_map_or_seq
+///     if flag == 'M':
+///         return True
+///     elif flag == 'S':
+///         return False
+///     else:
+///         return self.lookup(w_obj, '__getitem__') is not None
+/// ```
+///
+/// The `is_dict` arm short-circuits the builtin mapping whose
+/// `W_TypeObject` flag may not be reachable through `typedef::r#type`;
+/// heap types (dict subclasses included) carry the inherited flag via
+/// `inherit_flag_map_or_seq`.
+pub fn ismapping_w(w_obj: PyObjectRef) -> bool {
+    unsafe {
+        if is_dict(w_obj) {
+            return true;
+        }
+        let w_type = crate::typedef::r#type(w_obj).unwrap_or(std::ptr::null_mut());
+        let flag = pyre_object::typeobject::w_type_get_flag_map_or_seq(w_type);
+        if flag == b'M' {
+            return true;
+        }
+        if flag == b'S' {
+            return false;
+        }
+        lookup(w_obj, "__getitem__").is_some()
+    }
+}
+
 pub fn is_iterable(w_obj: PyObjectRef) -> bool {
     let obj = unwrap_cell(w_obj);
     if obj.is_null() {
