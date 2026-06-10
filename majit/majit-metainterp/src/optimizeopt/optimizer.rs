@@ -2781,7 +2781,7 @@ impl Optimizer {
                          (shortpreamble.py:255-259)"
                     );
                 }
-                short_boxes.add_short_input_arg(arg, raw_type);
+                short_boxes.add_short_input_arg(&mut ctx, arg, raw_type);
             }
             self.produce_potential_short_preamble_ops(&mut short_boxes, &mut ctx);
             let produced = short_boxes.produced_ops(&mut ctx);

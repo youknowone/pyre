@@ -416,10 +416,11 @@ impl PreambleOp {
                 //   else:
                 //       preamble_op = ResOperation(sop.getopnum(), [preamble_arg, sop.getarg(1)], descr=sop.getdescr())
                 let preamble_arg = sb.produce_arg(ctx, self.op.arg(0).to_opref())?;
+                let preamble_arg = ctx.materialize_box_at(preamble_arg);
                 let args: smallvec::SmallVec<[BoxRef; 3]> = if self.op.opcode.is_getfield() {
-                    smallvec::smallvec![BoxRef::from_opref(preamble_arg)]
+                    smallvec::smallvec![preamble_arg]
                 } else {
-                    smallvec::smallvec![BoxRef::from_opref(preamble_arg), self.op.arg(1)]
+                    smallvec::smallvec![preamble_arg, self.op.arg(1)]
                 };
                 self.op.copy_and_change(self.op.opcode, Some(&args), None)
             }
@@ -435,7 +436,10 @@ impl PreambleOp {
                     .op
                     .getarglist()
                     .iter()
-                    .map(|arg| sb.produce_arg(ctx, arg.to_opref()).map(BoxRef::from_opref))
+                    .map(|arg| {
+                        sb.produce_arg(ctx, arg.to_opref())
+                            .map(|r| ctx.materialize_box_at(r))
+                    })
                     .collect::<Option<smallvec::SmallVec<[BoxRef; 3]>>>()?;
                 let opnum = if self.op.opcode.is_call() {
                     match self.op.opcode {
@@ -459,7 +463,10 @@ impl PreambleOp {
                     .op
                     .getarglist()
                     .iter()
-                    .map(|arg| sb.produce_arg(ctx, arg.to_opref()).map(BoxRef::from_opref))
+                    .map(|arg| {
+                        sb.produce_arg(ctx, arg.to_opref())
+                            .map(|r| ctx.materialize_box_at(r))
+                    })
                     .collect::<Option<smallvec::SmallVec<[BoxRef; 3]>>>()?;
                 let opnum = match self.op.opcode {
                     OpCode::CallI => OpCode::CallLoopinvariantI,
@@ -644,7 +651,12 @@ impl ShortBoxes {
         );
     }
 
-    pub(crate) fn add_short_input_arg(&mut self, arg: OpRef, arg_type: majit_ir::Type) {
+    pub(crate) fn add_short_input_arg(
+        &mut self,
+        ctx: &mut crate::optimizeopt::OptContext,
+        arg: OpRef,
+        arg_type: majit_ir::Type,
+    ) {
         // shortpreamble.py:255-259 parity: ShortInputArg's BoxType is the
         // intrinsic `box.type` (BoxInt → same_as_i, BoxRef → same_as_r,
         // BoxFloat → same_as_f). A `Void` reaching here is a parity
@@ -657,9 +669,11 @@ impl ShortBoxes {
             );
         }
         let label_arg_idx = self.lookup_label_arg(arg);
+        // shortpreamble.py:257 `ShortInputArg(box, renamed)` — the SAME_AS
+        // replay arg is the label-arg Box itself; bind its producer.
         let mut same_as = Op::new(
             OpCode::same_as_for_type(arg_type),
-            &[BoxRef::from_opref(arg)],
+            &[ctx.materialize_box_at(arg)],
         );
         same_as.pos.set(arg);
         self.potential_ops.insert(
@@ -795,7 +809,7 @@ impl ShortBoxes {
                     label_args.len()
                 )
             });
-            self.add_short_input_arg(arg, arg_type);
+            self.add_short_input_arg(ctx, arg, arg_type);
         }
 
         // shortpreamble.py:261: optimizer.produce_potential_short_preamble_ops(self)
@@ -822,7 +836,7 @@ impl ShortBoxes {
                 continue;
             };
             // shortpreamble.py:277-278: copy_and_change(opnum, [preamble_arg] + args[1:])
-            let mut new_args = vec![BoxRef::from_opref(preamble_arg)];
+            let mut new_args = vec![ctx.materialize_box_at(preamble_arg)];
             new_args.extend_from_slice(&getfield_op.getarglist()[1..]);
             let mut new_op = Op::with_descr(
                 getfield_op.opcode,
@@ -1492,7 +1506,7 @@ impl ProducedShortOp {
         }
         let mut getfield_op = Op::new(
             OpCode::getfield_for_type(result_type),
-            &[BoxRef::from_opref(obj_resolved)],
+            &[ctx.materialize_box_at(obj_resolved)],
         );
         getfield_op.setdescr(descr.clone());
         // Cat-2.2 dual-slot rule (mod.rs:1817 replay_pos): replay.pos =
@@ -1614,8 +1628,8 @@ impl ProducedShortOp {
         let mut getarrayitem_op = Op::new(
             OpCode::getarrayitem_for_type(result_type),
             &[
-                BoxRef::from_opref(obj_resolved),
-                BoxRef::from_opref(index_const),
+                ctx.materialize_box_at(obj_resolved),
+                ctx.materialize_box_at(index_const),
             ],
         );
         getarrayitem_op.setdescr(descr.clone());
@@ -3653,8 +3667,9 @@ mod tests {
 
     #[test]
     fn test_rpython_create_short_boxes_prefers_short_inputarg_over_heap_result() {
+        let mut ctx = crate::optimizeopt::OptContext::new(256);
         let mut sb = ShortBoxes::with_label_args(&[OpRef::int_op(10), OpRef::int_op(30)]);
-        sb.add_short_input_arg(OpRef::int_op(10), majit_ir::Type::Int);
+        sb.add_short_input_arg(&mut ctx, OpRef::int_op(10), majit_ir::Type::Int);
 
         let mut heap = Op::with_descr(
             OpCode::GetfieldGcI,

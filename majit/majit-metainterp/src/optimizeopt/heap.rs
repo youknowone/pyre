@@ -5031,10 +5031,10 @@ mod tests {
             OpRef::ref_op(100),
             OpRef::ref_op(101),
         ]);
-        // Register input args so produce_arg can resolve them.
-        sb.add_short_input_arg(OpRef::ref_op(100), majit_ir::Type::Ref);
-        sb.add_short_input_arg(OpRef::ref_op(101), majit_ir::Type::Ref);
         let mut ctx = crate::optimizeopt::OptContext::new(256);
+        // Register input args so produce_arg can resolve them.
+        sb.add_short_input_arg(&mut ctx, OpRef::ref_op(100), majit_ir::Type::Ref);
+        sb.add_short_input_arg(&mut ctx, OpRef::ref_op(101), majit_ir::Type::Ref);
         // Seed PtrInfo._fields[idx] with the cached value so the
         // produce_potential_short_preamble_ops read path can find it.
         use crate::optimizeopt::info::PtrInfo;

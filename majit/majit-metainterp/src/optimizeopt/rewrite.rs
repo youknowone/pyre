@@ -3493,7 +3493,7 @@ impl Optimization for OptRewrite {
                             // dual-slot rule (mod.rs:1817 replay_pos).
                             let replay_pos = ctx.get_box_replacement(source).to_opref();
                             let mut replay =
-                                Op::new(OpCode::SameAsI, &[BoxRef::from_opref(source)]);
+                                Op::new(OpCode::SameAsI, &[ctx.materialize_box_at(source)]);
                             replay.pos.set(replay_pos);
                             self.loop_invariant_results.insert(
                                 func_val,
