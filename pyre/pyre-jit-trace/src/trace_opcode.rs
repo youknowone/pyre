@@ -1072,6 +1072,18 @@ impl MIFrame {
     /// `list_reverse_value`). Non-mutating method calls (`x in s`, `len(xs)`)
     /// and deferred stores (`STORE_SUBSCR`) never reach this, so their loops
     /// stay unmarked and `dm143_advance_live_locals` skips their advance.
+    ///
+    /// Precision caveat: for the dominant callers — the builtin-form dispatch
+    /// arms and the LIST_APPEND opcode hook — the concrete mutation is
+    /// guaranteed (the trait impl's `call_callable` executes builtin/user
+    /// functions concretely before dispatch; non-walker opcodes run
+    /// `execute_opcode_step`). The rare method-form arms (a `W_MethodObject`
+    /// flowing as a value, e.g. `m = xs.pop; m(0)`) get NO concrete execution
+    /// (the trait impl only executes `is_function` callables), so they
+    /// over-mark; such traces also carry a Null concrete result and degrade
+    /// before a clean CloseLoop. The precise fix is a `W_MethodObject` unwrap
+    /// in the trait impl's concrete-execution block (executor parity), not a
+    /// recorder-side gate.
     #[inline]
     pub(crate) fn dm143_mark_heap_mutated(&mut self) {
         // Set by the concrete-during-trace mutation recorders only
