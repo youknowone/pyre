@@ -1,7 +1,7 @@
 def main():
     s = 0
     i = 0
-    while i < 1000000:
+    while i < 10000000:
         try:
             if i % 7 == 0:
                 raise ValueError("v")
