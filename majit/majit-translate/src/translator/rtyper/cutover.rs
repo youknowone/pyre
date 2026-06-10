@@ -580,11 +580,12 @@ pub(crate) fn is_known_unported(msg: &str) -> bool {
             && msg.contains(" used before definition")
         // `normalize_unary_op_name: pyre UnaryOp` and
         // `normalize_binop_name: pyre BinOp` are not Skip-classified:
-        // the `not` / `deref` / `same_as` / `and` / `or` / `invert`
-        // surfaces are desugared by the MIR front-end — rustc lowers
-        // `!`/`*` and the `&&`/`||` short-circuits into MIR
-        // branches/calls before lowering.  Synthetic
-        // graphs that inject these ops (anchor tests in
+        // the `not` / `deref` / `same_as` / `invert` surfaces are
+        // desugared by the MIR front-end (rustc lowers `!`/`*` and the
+        // `&&`/`||` short-circuits into MIR branches/calls before
+        // lowering), and the bitwise `and` / `or` labels normalize to
+        // the flowspace `and_` / `or_` registrations.  Synthetic
+        // graphs that inject unported ops (anchor tests in
         // `cutover.rs::tests::anchor_unary_*_surfaces_*`) call
         // `specialize_legacy_graph` directly and never reach
         // `is_known_unported`, so the absence of these substring

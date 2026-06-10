@@ -2122,9 +2122,10 @@ impl<'a> Lowering<'a> {
                 args: vec![],
                 // A `&str` / `&[u8]` literal lowers to `Ptr(STR)` (getkind
                 // `r`), so the synthetic call's result kind is a Ref, not an
-                // Int.  The `__str_const` path is never registered, so this
-                // call always residualises; correcting `result_ty` fixes the
-                // residual result kind without changing behaviour today.
+                // Int.  The `__str_const` path is never registered: on the
+                // trace pipeline the call residualises, and the flowspace
+                // adapter pre-folds it to the upstream `Constant('text')`
+                // shape (`flowspace_adapter.rs::is_str_const_define`).
                 result_ty: ValueType::Ref(None),
             },
             DecodedConst::FnPath(segments) => OpKind::Call {
@@ -2582,15 +2583,38 @@ impl<'a> Lowering<'a> {
                 self.graph.set_return(bb_id, Some(ret));
                 Ok(())
             }
-            TermKind::UnwindResume | TermKind::Abort(_) => {
-                // Rust panic propagation (unwind-table cleanup / abort).
-                // No RPython analogue — RPython models neither destructors
-                // nor a Rust-panic catch — so close the block as a bare
-                // exception propagation into the canonical exceptblock.
-                // Python-level exceptions never reach here: they ride the
-                // `Result<_, PyError>` Switch/Return edges as ordinary
-                // control flow.
+            TermKind::UnwindResume => {
+                // Unwind-table cleanup resume.  Its only inbound edges
+                // are `on_unwind` edges, all of which this lowering
+                // drops, so the block is unreachable — close it as a
+                // bare exception propagation; the flowspace adapter
+                // converts only the reachable closure and never sees
+                // it.  Python-level exceptions never reach here: they
+                // ride the `Result<_, PyError>` Switch/Return edges as
+                // ordinary control flow.
                 self.graph.set_raise(bb_id, "mir-unwind");
+                Ok(())
+            }
+            TermKind::Abort(_) => {
+                // A panic site reached by ordinary control flow
+                // (explicit `panic!` / `unreachable!` / a diverging
+                // match arm), not unwind cleanup.  The RPython
+                // analogue of a host-level invariant failure is an
+                // `assert` raise, so lower the canonical
+                // `exc_from_raise` op sequence
+                // (`op.simple_call(const(AssertionError))` +
+                // `op.type(evalue)`) and close the block with the
+                // `(etype, evalue)` exception Link.  Message operands
+                // are not threaded through: the MIR panic payload is a
+                // host-formatting call chain with no Python-level
+                // meaning, matching the bare-`panic!()` shape of
+                // `lower_exc_from_raise`.
+                crate::front::raise::lower_exc_from_raise(
+                    &mut self.graph,
+                    bb_id,
+                    "AssertionError",
+                    vec![],
+                );
                 Ok(())
             }
             TermKind::Goto { target } => {

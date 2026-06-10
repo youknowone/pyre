@@ -514,25 +514,19 @@ fn normalize_unary_op_name(pyre_name: &str) -> Result<String, TyperError> {
 /// RPython (`add`, `sub`, `mul`, `mod`, `lshift`, `rshift`, `lt`, ...)
 /// pass through unchanged.
 ///
-/// Pyre's short-circuit `and` / `or` (Rust `&&` / `||`) are NOT
-/// flowspace operations — Python's `and`/`or` are control flow and
-/// `operation.py:475-510` does not register them as binary operators.
-///
-/// The frontend desugars `&&` / `||` into
-/// `JUMP_IF_FALSE_OR_POP` / `JUMP_IF_TRUE_OR_POP`-shaped control flow
-/// before the graph reaches this adapter: in MIR the short-circuit is
-/// already lowered to a `bool(lhs)` test + branch fork + join over the
-/// boolean operands, so no binary `and`/`or` op survives to here.
-///
-/// The fail-loud arm below survives for synthetic graphs (test
-/// fixtures, future ad-hoc producers) that inject `OpKind::BinOp {
-/// op: "and"/"or", .. }` directly without going through the
-/// frontend, plus any future RPython binop opnames that have not yet
-/// been ported.
+/// A bare `and` / `or` arriving here is always the *bitwise* operator:
+/// `front::mir::binop_label` maps Charon `BitAnd` / `BitOr` to
+/// `"and"` / `"or"` (matching the trace pipeline's blackhole handler
+/// vocabulary), and rustc lowers the short-circuit `&&` / `||` forms
+/// into MIR branch forks before Charon ever sees them — Python's
+/// short-circuit `and`/`or` are likewise control flow upstream
+/// (`operation.py:475-510` registers no such binary operator), so the
+/// keyword-suffixed `and_` / `or_` names below are unambiguously the
+/// bitwise registrations.
 fn normalize_binop_name(pyre_name: &str) -> Result<String, TyperError> {
     let normalized = match pyre_name {
-        "bitand" => "and_",
-        "bitor" => "or_",
+        "and" | "bitand" => "and_",
+        "or" | "bitor" => "or_",
         "bitxor" => "xor",
         "add_assign" => "inplace_add",
         "sub_assign" => "inplace_sub",
@@ -606,6 +600,25 @@ fn is_elided_unit_variant_ctor(kind: &OpKind) -> bool {
     false
 }
 
+/// `true` iff `kind` is `front::mir`'s synthetic string-literal
+/// define-op (`Call(["__str_const", <text>])`, `mir.rs:1576`).
+/// Upstream flowspace carries a string literal as a bare
+/// `Constant('text')` SSA value, so the pre-pass
+/// ([`legacy_const_define_hlvalue`]) folds the op to that Constant and
+/// [`translate_op`] emits nothing; a Constant is not an operation and
+/// raises nothing, so [`op_canraise`] is false — same contract as the
+/// unit-variant ctor elision above.
+fn is_str_const_define(kind: &OpKind) -> bool {
+    matches!(
+        kind,
+        OpKind::Call {
+            target: crate::model::CallTarget::FunctionPath { segments },
+            args,
+            ..
+        } if args.is_empty() && segments.len() == 2 && segments[0] == "__str_const"
+    )
+}
+
 /// `true` iff the flowspace op(s) this `OpKind` lowers to carry a
 /// non-empty `canraise` (`operation.py`).
 ///
@@ -645,6 +658,10 @@ pub(crate) fn op_canraise(kind: &OpKind) -> bool {
             target: crate::model::CallTarget::SyntheticTransparentCtor { .. },
             ..
         } => !is_elided_unit_variant_ctor(kind),
+        // A string-literal define-op pre-folds to `Constant('text')`
+        // and emits no op — a Constant raises nothing.  Matched before
+        // the general `Call` arm, same as the unit-variant elision.
+        kind if is_str_const_define(kind) => false,
         // simple_call -> `CallOp.canraise` is `[Exception]` for a
         // non-builtin callable (operation.py:648-661).  Constant builtin
         // callables (int / float / chr / unicode) carry the narrower
@@ -715,6 +732,12 @@ pub fn translate_op(
     // FlowspaceOp).  `op_canraise` consults the same predicate, so it
     // reports these — and only these — transparent ctors as non-raising.
     if is_elided_unit_variant_ctor(&op.kind) {
+        return Ok(Vec::new());
+    }
+    // String-literal define-ops pre-fold to `Constant('text')` the same
+    // way (see `is_str_const_define`); the pre-pass owns the slot's
+    // `Hlvalue::Constant`, translate_op emits no FlowspaceOp.
+    if is_str_const_define(&op.kind) {
         return Ok(Vec::new());
     }
     match &op.kind {
@@ -1630,6 +1653,24 @@ fn legacy_const_define_hlvalue(op: &SpaceOperation) -> Option<Hlvalue> {
             ),
             LowLevelType::Address,
         ))),
+        // String-literal constant.  Upstream flowspace carries a string
+        // literal as a bare `Constant('text')` SSA value (annotated
+        // `SomeString` by `immutablevalue`); `front::mir` has no
+        // ConstStr opkind and synthesises a 0-arg
+        // `Call(["__str_const", <text>])` instead (`mir.rs:1576`).
+        // Re-fold that define-op to the upstream Constant shape here.
+        // No concretetype is stamped: string constants get their
+        // `Ptr(STR)` repr from the annotation at rtyping, unlike the
+        // primitive arms above whose lltype is fixed by the opkind.
+        OpKind::Call {
+            target: crate::model::CallTarget::FunctionPath { segments },
+            args,
+            ..
+        } if args.is_empty() && segments.len() == 2 && segments[0] == "__str_const" => {
+            Some(Hlvalue::Constant(Constant::new(ConstValue::ByteStr(
+                segments[1].clone().into_bytes(),
+            ))))
+        }
         // RPython parity: unit-variant ctors (`StepResult::Continue`,
         // `LoopResult::Done`, …) are pre-built singleton instances at
         // the rtyper layer (`rclass.InstanceRepr.
