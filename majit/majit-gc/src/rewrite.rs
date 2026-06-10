@@ -732,7 +732,9 @@ impl RewriteState {
         }
         if let Some(fail_args) = rewritten.fail_args_mut() {
             for arg in fail_args.iter_mut() {
-                *arg = Operand::Box(self.resolve(arg.to_boxref()));
+                // Same shed as `setarg` above: a forwarding target bound to
+                // its producer stays a live-tracking operand.
+                *arg = Operand::from_boxref(&self.resolve(arg.to_boxref()));
             }
         }
         rewritten.pos.set(OpRef::NONE);

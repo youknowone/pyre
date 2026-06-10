@@ -4342,6 +4342,20 @@ impl OptContext {
         self.get_box_replacement_impl(opref, true)
     }
 
+    /// Box-returning sibling of [`OptContext::get_box_replacement_not_const`]
+    /// — the RPython shape: `get_box_replacement(op, not_const=True)` hands
+    /// the caller the terminal Box object itself (resoperation.py:57-68),
+    /// not a position. `None` when the source is a Const / NONE or the
+    /// position resolves to no canonical box; callers keep their element
+    /// unchanged then, matching the `OpRef` variant's identity return.
+    pub fn get_box_replacement_not_const_box(&self, opref: OpRef) -> Option<crate::r#box::BoxRef> {
+        if opref.is_constant() || opref.is_none() {
+            return None;
+        }
+        let start = self.resolve_to_boxref(opref)?;
+        Some(start.get_box_replacement(true))
+    }
+
     /// `OpRef` round-trip view of [`OptContext::get_box_replacement`] for
     /// the remaining flat-`OpRef` bridge callers (the
     /// `get_box_replacement(o).to_opref()` idiom — RPython callers hold the
@@ -5921,9 +5935,17 @@ impl OptContext {
             })
             .collect();
 
+        // optimizer.py:712 liveboxes are the canonical Box objects returned
+        // by `resumedata.finish()`; resolve each numbering position to its
+        // canonical (possibly producer-bound) box so `store_final_boxes`
+        // can shed to a live-tracking operand. NONE holes and positions
+        // with no canonical box stay position-only.
         let liveboxes_b: Vec<crate::r#box::BoxRef> = liveboxes
             .iter()
-            .map(|a| crate::r#box::BoxRef::from_opref(*a))
+            .map(|a| {
+                self.resolve_to_boxref(*a)
+                    .unwrap_or_else(|| crate::r#box::BoxRef::from_opref(*a))
+            })
             .collect();
         op.store_final_boxes(liveboxes_b);
         op.set_fail_arg_types(new_types.clone());
