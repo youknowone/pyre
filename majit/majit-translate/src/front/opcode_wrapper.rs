@@ -62,12 +62,21 @@ fn push_dispatcher_inputargs(
     let block = graph.startblock;
     let mut param_vars: Vec<(String, Variable)> = Vec::with_capacity(params.len());
     for (pname, pty) in params {
+        // The dispatcher param list types each `Ref` param with its
+        // ADT leaf (`Ref(Some("Instruction"))` etc.); carry that leaf
+        // as `class_root` so `derive_subject_inputcells` seeds the
+        // param's `ClassDef`.  Roots unknown to the struct-field
+        // registry (the erased generic `E`) are ignored there.
+        let class_root = match pty {
+            ValueType::Ref(root) => root.clone(),
+            _ => None,
+        };
         if let Some(var) = graph.push_op_var(
             block,
             OpKind::Input {
                 name: pname.clone(),
                 ty: pty.clone(),
-                class_root: None,
+                class_root,
             },
             true,
         ) {

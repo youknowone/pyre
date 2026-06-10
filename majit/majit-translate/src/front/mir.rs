@@ -506,6 +506,32 @@ fn derive_program_metadata(
                 let leaf = name.rsplit("::").next().unwrap_or(&name).to_string();
                 known_struct_names.insert(name.clone());
                 known_struct_names.insert(leaf.clone());
+                // Register the enum as a flat class in `struct_fields`:
+                // the synthetic `__discriminant` tag plus the union of
+                // all variant payload fields.  `Rvalue::Discriminant`
+                // lowers to `FieldRead("__discriminant")` and payload
+                // projections emit `owner_root` = the enum LEAF (not the
+                // variant — `resolve_adt_field`), so every enum attr
+                // read lands on this one class.  First-writer-wins on a
+                // field name shared by several variants; the row only
+                // feeds the annotation-stage attr shell
+                // (`getuniqueclassdef_for_struct_root` pass 2), which
+                // RPython grows by generalization anyway.
+                let mut seen: std::collections::HashSet<String> =
+                    std::collections::HashSet::new();
+                seen.insert("__discriminant".to_string());
+                let mut rows: Vec<(String, String)> =
+                    vec![("__discriminant".to_string(), "i64".to_string())];
+                for v in variants {
+                    for (i, f) in v.fields.iter().enumerate() {
+                        let fname = f.name.clone().unwrap_or_else(|| format!("__pos_{i}"));
+                        if seen.insert(fname.clone()) {
+                            rows.push((fname, tyref_to_ast_string(&f.ty, llbc)));
+                        }
+                    }
+                }
+                struct_fields.fields.insert(name.clone(), rows.clone());
+                struct_fields.fields.insert(leaf.clone(), rows);
                 // discriminant → variant name, published under both the
                 // qualified path and the bare leaf so the opcode-dispatch
                 // extractor can resolve by either spelling.
@@ -739,12 +765,19 @@ impl<'a> Lowering<'a> {
             graph.name_value_var(&var, name.clone());
             local_var[i] = Some(var.clone());
             let ty = tyref_to_value_type(&local.ty, llbc);
+            // `class_root` carries the param's named-ADT leaf so
+            // `derive_subject_inputcells` can seed the receiver's
+            // `ClassDef`; only `Ref`-typed params consume it there.
+            let class_root = match &ty {
+                ValueType::Ref(_) => tyref_class_root(&local.ty, llbc),
+                _ => None,
+            };
             input_ops.push(SpaceOperation {
                 result: Some(var.clone()),
                 kind: OpKind::Input {
                     name,
                     ty,
-                    class_root: None,
+                    class_root,
                 },
             });
             startblock_args.push(var);
@@ -3902,6 +3935,64 @@ fn tyref_to_attr_value_type(ty: &TyRef, llbc: &Llbc) -> ValueType {
         }
     }
     ValueType::Ref(None)
+}
+
+/// The bare leaf name of `ty`'s named-ADT root, after stripping
+/// reference wrappers (`&T` / `&mut T` → `T`, the same contract as
+/// [`tyref_to_ast_string`]).  This is the value `OpKind::Input.class_root`
+/// carries so `derive_subject_inputcells`
+/// (`flowspace_adapter.rs:1860-1885`) can seed a `Ref` parameter with
+/// its cached struct-root `ClassDef` instead of the classdef-less
+/// `SomeInstance` shell.
+///
+/// Returns `None` for:
+///   - primitives / tuples / builtin containers (no class root);
+///   - raw pointers (`*const T` / `*mut T`) — a raw-pointer receiver
+///     answers `is_null` through the classdef-less bound-method arm
+///     (`unaryop.rs:3683`), which a seeded classdef would bypass;
+///   - generic ADT instantiations (`Arg<u32>`) — the registry rows for
+///     a generic decl carry unresolved type-variable field strings, so
+///     a seeded classdef would project bogus attr shells.
+fn tyref_class_root(ty: &TyRef, llbc: &Llbc) -> Option<String> {
+    let mut node = match ty {
+        TyRef::Inline { value: (_, v) } => v,
+        TyRef::Other(v) => v,
+        TyRef::Dedup { id } => llbc.dedup_body(*id)?,
+    };
+    for _ in 0..24 {
+        let obj = node.as_object()?;
+        if let Some(id) = obj.get("Deduplicated").and_then(serde_json::Value::as_u64) {
+            node = llbc.dedup_body(id)?;
+            continue;
+        }
+        if let Some(arr) = obj
+            .get("HashConsedValue")
+            .and_then(serde_json::Value::as_array)
+            && arr.len() == 2
+        {
+            node = &arr[1];
+            continue;
+        }
+        // `{"Ref": [region, ty, kind]}` — strip the reference.
+        if let Some(arr) = obj.get("Ref").and_then(serde_json::Value::as_array) {
+            node = arr.get(1)?;
+            continue;
+        }
+        let adt = obj.get("Adt")?.as_object()?;
+        let def_id = adt.get("id")?.as_object()?.get("Adt")?.as_u64()?;
+        let has_type_args = adt
+            .get("generics")
+            .and_then(|g| g.as_object())
+            .and_then(|g| g.get("types"))
+            .and_then(|t| t.as_array())
+            .is_some_and(|t| !t.is_empty());
+        if has_type_args {
+            return None;
+        }
+        let name = llbc.type_by_id(def_id)?.item_meta.name_path();
+        return Some(name.rsplit("::").next().unwrap_or(&name).to_string());
+    }
+    None
 }
 
 /// True when `ty` is a non-unit tuple `(A, B, ...)` — Charon's
