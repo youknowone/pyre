@@ -471,8 +471,8 @@ pub struct WalkContext<'frame, 'static_a: 'frame> {
     /// nesting depth is shallow (2–3 levels), so the per-sub-walk
     /// clone cost is negligible.
     pub outer_active_boxes: Vec<OpRef>,
-    /// Sub-slice 5c step 5.5b — runtime address of `bh_store_subscr_fn`
-    /// (pyre-jit's `cpu.store_subscr_fn` binding) used by
+    /// Runtime address of `bh_store_subscr_fn` (pyre-jit's
+    /// `cpu.store_subscr_fn` binding) used by
     /// `try_walker_store_subscr_specialization` to recognise the
     /// 3-arg `residual_call_r_v(store_subscr_fn, obj, key, value)`
     /// emitted by `codewriter.rs:7042
@@ -486,9 +486,9 @@ pub struct WalkContext<'frame, 'static_a: 'frame> {
     /// specialization gate (test fixtures, default-test entries, or
     /// production paths where the address hasn't been plumbed yet).
     ///
-    /// `PYRE_WALKER_STORE_SUBSCR_FNADDR` env var (step 5.5a) is read
-    /// as the fallback when this field is `None` — the env var keeps
-    /// working for test fixtures and runtime override.
+    /// `PYRE_WALKER_STORE_SUBSCR_FNADDR` is read as the fallback when this
+    /// field is `None`, keeping test fixtures and runtime overrides from
+    /// needing a full production `MIFrame` entry.
     pub store_subscr_fn_addr: Option<usize>,
 }
 
@@ -3070,9 +3070,8 @@ fn decode_descr_index(code: &[u8], op: &DecodedOp, operand_offset: usize) -> usi
 /// skipped via the two narrow branches above) before the trace op
 /// hits the recorder.  Pyre's walker today concrete-executes only
 /// the `CallPure*` branch (via [`try_fold_pure_call_via_executor`]),
-/// so the forces / loopinvariant-miss / default branches surface
-/// as the M4 SIGBUS root cause (memory: M4 walker unactivated
-/// taxonomy).
+/// so the forces / loopinvariant-miss / default branches can miss the
+/// concrete heap effect that the next read depends on.
 ///
 /// Per-branch concrete-execute status today:
 ///
@@ -3320,9 +3319,8 @@ fn funcptr_concrete_int(ctx: &WalkContext<'_, '_>, funcptr: OpRef) -> Option<i64
 /// helper runs.  This function covers the elidable arm; the
 /// non-elidable arms (`CallMayForce*`, `CallLoopinvariant*`, `Call*`)
 /// are concrete-executed by [`try_execute_residual_call_via_executor`]
-/// (Task #390 sub-slice 3), with raised exceptions surfaced through
-/// `BH_LAST_EXC_VALUE` so `eval_loop_jit` can route them into the
-/// bytecode exception handler.
+/// with raised exceptions surfaced through `BH_LAST_EXC_VALUE` so
+/// `eval_loop_jit` can route them into the bytecode exception handler.
 ///
 /// RPython upstream `_record_helper_pure` invokes
 /// `executor.execute_varargs(opnum, argboxes, descr, exc=False, pure=True)`
@@ -3468,8 +3466,8 @@ fn try_fold_pure_call_via_executor(
 /// caller can wire the BH exception into `WalkContext.last_exc_value`
 /// without dragging in a `MetaInterp` seam.
 ///
-/// **Why this exists** (Task #390 widening): walker's
-/// `production_walker_handles` arm skips `execute_opcode_step` for
+/// **Why this exists**: walker's `production_walker_handles` arm skips
+/// `execute_opcode_step` for
 /// `eval.rs:3111` opcodes; for opcodes whose body contains a
 /// non-elidable `residual_call_*` (`store_subscr_fn` /
 /// `set_current_exception` / etc.), the helper is never invoked → heap
@@ -3490,7 +3488,7 @@ fn try_fold_pure_call_via_executor(
 ///     job.
 ///   * `CallReleaseGil*` / `CallAssembler*` are intentionally excluded:
 ///     their trace-recording-time invariants (GIL transitions, jitdriver
-///     re-entry) need a separate audit (Task #390 sub-slice 4).
+///     re-entry) need separate concrete-execution support.
 ///   * **`CallMayForce*` force-virtual gate**: PyPy `do_residual_call`
 ///     (`pyjitpl.py:2017-2082`) concrete-executes every `CallMayForce*`
 ///     via `executor.execute_varargs` and detects vable escape via the
@@ -3521,13 +3519,9 @@ fn try_fold_pure_call_via_executor(
 ///   consume later; walker falls through as if this function did not
 ///   exist.
 ///
-/// **Wire status** (Task #390 sub-slice 2.3): invoked from all three
-/// dispatch entry points (`dispatch_residual_call_iRd_kind`,
-/// `dispatch_residual_call_iIRd_kind`, `dispatch_residual_call_iIRFd_kind`)
-/// alongside [`try_fold_pure_call_via_executor`], gated on
-/// `!can_raise`.  Sub-slice 3 will widen the gate to `can_raise=true`
-/// once BH exception propagation through `WalkContext.last_exc_value`
-/// is in place.
+/// Invoked from all three residual-call dispatch entry points alongside
+/// [`try_fold_pure_call_via_executor`].  Raised exceptions are propagated
+/// through `WalkContext.last_exc_value`.
 fn try_execute_residual_call_via_executor(
     ctx: &mut WalkContext<'_, '_>,
     call_opcode: OpCode,
@@ -4156,8 +4150,8 @@ fn collect_outer_active_boxes(
                         .virtualizable_box_at(nvs + s_idx)
                         .unwrap_or_else(fallback)
                 }
-                // Under the canonical splice (#281/#300) a single `-live-`
-                // marker is SHARED across a range of Python PCs at different
+                // Under the canonical splice a single `-live-` marker is
+                // SHARED across a range of Python PCs at different
                 // stack depths, and its liveness banks carry the UNION of
                 // those PCs' live frame colors.  Resuming at a shallower
                 // PC therefore sees a Ref color that names a stack slot
@@ -4541,8 +4535,8 @@ fn direct_call_release_gil(
 ///     callee body slice.  Over-capture is correctness-preserving:
 ///     `store_final_boxes_in_guard` filters dead boxes from the
 ///     snapshot via the optimizer's liveness pass.
-/// Sub-slice 5c step 5.5a — STORE_SUBSCR strategy-aware walker
-/// specialization gate.  Returns `Some(DispatchOutcome::Continue)` if
+/// STORE_SUBSCR strategy-aware walker specialization gate.  Returns
+/// `Some(DispatchOutcome::Continue)` if
 /// the residual_call was specialized into the trait-equivalent
 /// `guard_class + guard_list_strategy + setarrayitem-family` shape;
 /// `None` to fall through to the existing blackbox CallN path.
@@ -4550,10 +4544,9 @@ fn direct_call_release_gil(
 /// Gates (all must hold):
 /// 1. `dst_bank == 'v'` (STORE_SUBSCR returns void; trait emit is `Void`).
 /// 2. `r_args.len() == 3` (codewriter emits `[obj_reg, key_reg, value_reg]`).
-/// 3. `PYRE_WALKER_STORE_SUBSCR_FNADDR` env var present and parses as
-///    `0x<hex>` matching the runtime funcptr.  Step 5.5b will replace
-///    this with `WalkContext.store_subscr_fn_addr` populated from
-///    `cpu.store_subscr_fn` at dispatch entry.
+/// 3. Runtime funcptr matches `WalkContext.store_subscr_fn_addr`, or the
+///    `PYRE_WALKER_STORE_SUBSCR_FNADDR` fallback when no entry address was
+///    threaded through the production dispatch path.
 /// 4. All 3 concrete shadow slots (`concrete_registers_r[r_args[0..3]]`)
 ///    are `ConcreteValue::Ref(_)`.
 /// 5. `generated_store_subscr_value` returns `true` (object is a list
@@ -4576,10 +4569,10 @@ fn try_walker_store_subscr_specialization(
     if dst_bank != 'v' || r_args.len() != 3 {
         return None;
     }
-    // Prefer `WalkContext.store_subscr_fn_addr` (step 5.5b — populated
-    // from `cpu.store_subscr_fn` at the production entry); fall back to
-    // `PYRE_WALKER_STORE_SUBSCR_FNADDR` env var (step 5.5a) for test
-    // fixtures and runtime overrides.
+    // Prefer `WalkContext.store_subscr_fn_addr`, populated from
+    // `cpu.store_subscr_fn` at production entry; fall back to
+    // `PYRE_WALKER_STORE_SUBSCR_FNADDR` for test fixtures and runtime
+    // overrides.
     let expected_fn_addr = if let Some(addr) = ctx.store_subscr_fn_addr {
         addr
     } else {
@@ -4665,8 +4658,8 @@ fn try_walker_store_subscr_specialization(
     Some(DispatchOutcome::Continue)
 }
 
-/// Parse `"0x<hex>"` or `"<decimal>"` into a `usize` address.  Helper
-/// for env-var-driven function-pointer gates (step 5.5a).
+/// Parse `"0x<hex>"` or `"<decimal>"` into a `usize` address for
+/// env-var-driven function-pointer gates.
 fn parse_hex_or_decimal_usize(s: &str) -> Option<usize> {
     let s = s.trim();
     if let Some(rest) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
@@ -4676,9 +4669,9 @@ fn parse_hex_or_decimal_usize(s: &str) -> Option<usize> {
     }
 }
 
-/// Sub-slice 5c step 5.5c — runtime resolution of
-/// `bh_store_subscr_fn` address via `pyre_interpreter::
-/// jit_trace_fnaddrs()` linear scan (cached in a `OnceLock`).  Returns
+/// Runtime resolution of the `bh_store_subscr_fn` address via
+/// `pyre_interpreter::jit_trace_fnaddrs()` linear scan (cached in a
+/// `OnceLock`).  Returns
 /// `None` if the symbol is unregistered (which would indicate a
 /// jit_fnaddr.rs regression — the path is registered at
 /// `pyre-interpreter/src/jit_fnaddr.rs:362-371`).
@@ -4737,14 +4730,11 @@ fn dispatch_residual_call_iRd_kind(
     let allboxes = build_allboxes(funcptr, &r_args, &argbox_types, call_descr.arg_types());
     ensure_residual_call_args_bound(&allboxes, op.pc)?;
 
-    // Sub-slice 5c step 2 probe — surfaces funcptr + r-bank arg raw addrs for
-    // every iRd-shape residual_call.  The eventual STORE_SUBSCR specialization
-    // hook (steps 3-5) keys on a fn-pointer match against `bh_store_subscr_fn`
-    // and on `r_args.len() == 3` with `dst_bank == 'v'`.  Probe is env-gated so
-    // production paths see zero overhead.  PyObjectRef construction from the
-    // GcRef payload is deferred to step 4 (FrameOps lift), which lands
-    // alongside the specialization branch; this probe stays at the raw-usize
-    // layer to keep the conversion seam single-sourced.
+    // Optional diagnostic for iRd-shape residual calls.  The STORE_SUBSCR
+    // specialization keys on a fn-pointer match against `bh_store_subscr_fn`
+    // plus `r_args.len() == 3` with `dst_bank == 'v'`; logging raw addresses
+    // here makes mismatches visible without affecting production when the
+    // env var is unset.
     if crate::probe_subscr_enabled() {
         let funcptr_addr = ctx.trace_ctx.box_value(funcptr).and_then(|v| match v {
             majit_ir::Value::Int(n) => Some(n as u64),
@@ -4772,9 +4762,8 @@ fn dispatch_residual_call_iRd_kind(
         );
     }
 
-    // Sub-slice 5c step 5.5a: STORE_SUBSCR strategy-aware specialization.
-    // Fires when funcptr matches the registered `store_subscr_fn` address
-    // (= `pyre-jit::call_jit::bh_store_subscr_fn`), r_args carries the
+    // STORE_SUBSCR strategy-aware specialization.  Fires when funcptr
+    // matches the registered `store_subscr_fn` address, r_args carries the
     // 3-arg `[obj_reg, key_reg, value_reg]` shape codewriter emits
     // (`codewriter.rs:7042 build_store_subscr_fn_residual_call_r_v_insn`),
     // dst_bank is `'v'` (STORE_SUBSCR returns void), and all 3 concrete
@@ -4783,12 +4772,11 @@ fn dispatch_residual_call_iRd_kind(
     // the trait-equivalent `generated_store_subscr_value` helper (now
     // generic over `WalkerFrameOps`, with `WalkContext` impl).
     //
-    // Activation env-gated for the rollout: `PYRE_WALKER_STORE_SUBSCR_FNADDR=<hex>`
-    // supplies the expected funcptr address (cross-crate plumbing of the
-    // `bh_store_subscr_fn` symbol from pyre-jit into pyre-jit-trace is
-    // deferred to 5.5b — `WalkContext.store_subscr_fn_addr`).  Without
-    // the env var, gate decays to no-op and dispatcher falls through to
-    // the existing blackbox CallN path.
+    // Production dispatch supplies the expected address via
+    // `WalkContext.store_subscr_fn_addr`; tests and diagnostics may use
+    // `PYRE_WALKER_STORE_SUBSCR_FNADDR=<hex>`.  Without either address,
+    // the gate decays to no-op and dispatcher falls through to the generic
+    // residual-call path.
     if let Some(outcome) =
         try_walker_store_subscr_specialization(ctx, code, op, funcptr, &r_args, dst_bank)
     {

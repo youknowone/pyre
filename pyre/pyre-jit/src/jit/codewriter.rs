@@ -817,7 +817,8 @@ fn derive_pc_live_indices_from_sparse(
                 pc + 1,
                 delta.get(op_arg).as_usize(),
             )),
-            Instruction::JumpBackward { delta } | Instruction::JumpBackwardNoInterrupt { delta } => {
+            Instruction::JumpBackward { delta }
+            | Instruction::JumpBackwardNoInterrupt { delta } => {
                 let next = pyre_interpreter::skip_caches(&code.instructions, pc + 1);
                 Some(next.saturating_sub(delta.get(op_arg).as_usize()))
             }
@@ -1325,10 +1326,7 @@ fn reserve_local_ref_colors_in_place(
         if slot >= nlocals {
             continue;
         }
-        if let Some(&color) = ref_alloc
-            .coloring
-            .get(&super::flow::VariableId(vid as u32))
-        {
+        if let Some(&color) = ref_alloc.coloring.get(&super::flow::VariableId(vid as u32)) {
             local_color.insert(color);
         }
     }
@@ -4616,9 +4614,7 @@ impl CodeWriter {
                     // `insert_exits`' single-exit explicit-raise arm
                     // emits `raise <getcolor(value)>`.
                     if let Some(raised) = evalue_fv.as_variable() {
-                        if let Some(exc_link) =
-                            current_block.block().borrow().exits.last()
-                        {
+                        if let Some(exc_link) = current_block.block().borrow().exits.last() {
                             exc_link.borrow_mut().explicit_raise_value = Some(raised);
                         }
                     }
@@ -8089,85 +8085,84 @@ impl CodeWriter {
                 }
             })
             .collect();
-        let (canonical, splice_regallocs) =
-            (|| {
-                // Build the splice regalloc FRESH with same-slot
-                // coalescing so each frame slot maps to exactly one
-                // canonical color (the dense per-slot resume map below
-                // cannot address multi-color slots).  Re-running regalloc
-                // with the merged pairs lets the chordal coloring
-                // re-optimize the surrounding Variables around the forced
-                // merges — a naive post-hoc color rewrite would not, and
-                // could collide a merged slot's color with an interfering
-                // neighbour.  Kept separate from production
-                // `graph_regallocs` (the gate-off path) so gate-off stays
-                // byte-identical.
-                let same_slot_pairs = collect_same_slot_coalesce_pairs(
-                    &walker_slot_for_variable,
-                    &graph_regallocs[Kind::Ref.index()].coloring,
-                );
-                // Order `same_slot` BEFORE `cfg` so each walker slot's
-                // Variables first cohere into one union-find group; the cfg
-                // pairs then fold those whole groups into the frame-local
-                // groups consistently.  With the reverse order, a cfg chain
-                // can split one slot's Variables across two different
-                // frame-local groups and the later same_slot pair that would
-                // reunite them is dropped by the filter — leaving that slot
-                // with two colors.  When the filter drops nothing (graphs with
-                // no cross-slot merge) the union-find partition is
-                // order-independent, so this reorder is a no-op there.
-                let mut splice_pairs = same_slot_pairs.clone();
-                splice_pairs.extend_from_slice(&cfg_variable_pairs);
-                // Drop coalesce pairs whose union would transitively
-                // merge two distinct frame-local slots into one regalloc
-                // group — otherwise the slots share a union-find rep and the
-                // interference below is a self-edge no-op.
-                let splice_pairs = filter_cross_slot_coalesce_pairs(
-                    &splice_pairs,
-                    &walker_slot_for_variable,
-                    code.varnames.len(),
-                );
-                // Force every distinct frame-local slot onto a distinct
-                // Ref color so the per-slot resume reverse map stays injective
-                // `same_slot_pairs` merges each slot's Variables onto
-                // one color; these interference pairs keep DIFFERENT slots
-                // apart, which the chordal coloring would otherwise collapse
-                // because their SSA register live ranges are disjoint (each
-                // `LOAD_FAST` re-reads the local, so its SSA value dies between
-                // reads).  Combined, the slot→color map becomes bijective.
-                let distinct_slot_interference = collect_distinct_slot_interference_pairs(
-                    &walker_slot_for_variable,
-                    &graph_regallocs[Kind::Ref.index()].coloring,
-                    code.varnames.len(),
-                );
-                let mut splice_regallocs =
-                    super::regalloc::perform_register_allocation_all_kinds_with_pairs_and_interference(
-                        &graph,
-                        &splice_pairs,
-                        &distinct_slot_interference,
-                    );
-                let mut ssarepr = super::flatten::flatten_graph(
+        let (canonical, splice_regallocs) = (|| {
+            // Build the splice regalloc FRESH with same-slot
+            // coalescing so each frame slot maps to exactly one
+            // canonical color (the dense per-slot resume map below
+            // cannot address multi-color slots).  Re-running regalloc
+            // with the merged pairs lets the chordal coloring
+            // re-optimize the surrounding Variables around the forced
+            // merges — a naive post-hoc color rewrite would not, and
+            // could collide a merged slot's color with an interfering
+            // neighbour.  Kept separate from production
+            // `graph_regallocs` (the gate-off path) so gate-off stays
+            // byte-identical.
+            let same_slot_pairs = collect_same_slot_coalesce_pairs(
+                &walker_slot_for_variable,
+                &graph_regallocs[Kind::Ref.index()].coloring,
+            );
+            // Order `same_slot` BEFORE `cfg` so each walker slot's
+            // Variables first cohere into one union-find group; the cfg
+            // pairs then fold those whole groups into the frame-local
+            // groups consistently.  With the reverse order, a cfg chain
+            // can split one slot's Variables across two different
+            // frame-local groups and the later same_slot pair that would
+            // reunite them is dropped by the filter — leaving that slot
+            // with two colors.  When the filter drops nothing (graphs with
+            // no cross-slot merge) the union-find partition is
+            // order-independent, so this reorder is a no-op there.
+            let mut splice_pairs = same_slot_pairs.clone();
+            splice_pairs.extend_from_slice(&cfg_variable_pairs);
+            // Drop coalesce pairs whose union would transitively
+            // merge two distinct frame-local slots into one regalloc
+            // group — otherwise the slots share a union-find rep and the
+            // interference below is a self-edge no-op.
+            let splice_pairs = filter_cross_slot_coalesce_pairs(
+                &splice_pairs,
+                &walker_slot_for_variable,
+                code.varnames.len(),
+            );
+            // Force every distinct frame-local slot onto a distinct
+            // Ref color so the per-slot resume reverse map stays injective
+            // `same_slot_pairs` merges each slot's Variables onto
+            // one color; these interference pairs keep DIFFERENT slots
+            // apart, which the chordal coloring would otherwise collapse
+            // because their SSA register live ranges are disjoint (each
+            // `LOAD_FAST` re-reads the local, so its SSA value dies between
+            // reads).  Combined, the slot→color map becomes bijective.
+            let distinct_slot_interference = collect_distinct_slot_interference_pairs(
+                &walker_slot_for_variable,
+                &graph_regallocs[Kind::Ref.index()].coloring,
+                code.varnames.len(),
+            );
+            let mut splice_regallocs =
+                super::regalloc::perform_register_allocation_all_kinds_with_pairs_and_interference(
                     &graph,
-                    &mut splice_regallocs,
-                    false,
-                    Some(self.cpu()),
+                    &splice_pairs,
+                    &distinct_slot_interference,
                 );
-                // Reserve Ref colors [0, nlocals) for the semantic
-                // local prefix the runtime bridge-resume assumes, bumping
-                // the portal (frame, ec) reds (and any temp) that
-                // `enforce_input_args` landed in that range up to fresh
-                // colors >= num_colors. Recolors the emitted stream and
-                // the canonical `splice_regallocs` together so the
-                // downstream resume-map rebuild reads the post-reserve
-                // colors.
-                reserve_local_ref_colors_in_place(
-                    &mut ssarepr,
-                    &mut splice_regallocs,
-                    &walker_slot_for_variable,
-                    code.varnames.len() as u16,
-                );
-                (ssarepr, splice_regallocs)
-            })();
+            let mut ssarepr = super::flatten::flatten_graph(
+                &graph,
+                &mut splice_regallocs,
+                false,
+                Some(self.cpu()),
+            );
+            // Reserve Ref colors [0, nlocals) for the semantic
+            // local prefix the runtime bridge-resume assumes, bumping
+            // the portal (frame, ec) reds (and any temp) that
+            // `enforce_input_args` landed in that range up to fresh
+            // colors >= num_colors. Recolors the emitted stream and
+            // the canonical `splice_regallocs` together so the
+            // downstream resume-map rebuild reads the post-reserve
+            // colors.
+            reserve_local_ref_colors_in_place(
+                &mut ssarepr,
+                &mut splice_regallocs,
+                &walker_slot_for_variable,
+                code.varnames.len() as u16,
+            );
+            (ssarepr, splice_regallocs)
+        })();
         // Splice the canonical `flatten_graph` stream in as the production
         // SSARepr: the walker built the FunctionGraph, the canonical driver
         // above produced the single-driver SSARepr from it, and that stream
@@ -10212,8 +10207,8 @@ mod tests {
 
     #[test]
     fn nonportal_shadow_graph_appends_frame_inputarg_only() {
-        // Keystone: a non-portal callee jitcode carries
-        // the universal `self` red frame as a real startblock inputarg
+        // A non-portal callee jitcode carries the universal `self` red
+        // frame as a real startblock inputarg
         // (`FrameInputs::Frame`) — one extra slot, NOT the portal's
         // `(frame, ec)` pair — and `return_var` shifts past it so it no
         // longer aliases `frame_var` (the prior collision that forced
@@ -10950,5 +10945,4 @@ mod tests {
         assert!(mainjitcode.is_populated());
         assert_eq!(mainjitcode.jitcode.jitdriver_sd(), Some(0));
     }
-
 }

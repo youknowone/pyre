@@ -1051,9 +1051,8 @@ enum LoopAction {
 /// codewriter's splice resume-coverage gate can compute a can-raise op's
 /// `after_residual_call` resume PC the same way the runtime does
 /// (trace_opcode.rs:3634 `resume_pc = self.fallthrough_pc`); the sparse
-/// resume resolver reuses it (#286) so the can-raise fallthrough resume
-/// marker keys off the SAME pc the runtime records in the guard's resume
-/// data.
+/// resume resolver reuses it so the can-raise fallthrough resume marker
+/// keys off the SAME pc the runtime records in the guard's resume data.
 pub fn semantic_fallthrough_pc(code: &CodeObject, pc: usize) -> usize {
     let mut next_pc = pc.saturating_add(1);
     loop {

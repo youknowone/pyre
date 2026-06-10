@@ -315,7 +315,7 @@ pub fn ssa_to_ssi(graph: &FunctionGraph) {
         } else {
             // Add `v` to every incoming link and the block's inputargs.
             //
-            // pyre walker adaptation (#73): a block with no graph predecessors
+            // Pyre walker adaptation: a block with no graph predecessors
             // (the startblock) is reached when `v` is defined in the walker's
             // register/slot model without a matching graph SpaceOp —
             // `block.operations` lacks the definition, so
@@ -324,8 +324,7 @@ pub fn ssa_to_ssi(graph: &FunctionGraph) {
             // link.args/inputargs threaded so far flow correctly from it; stop
             // threading instead of panicking.  RPython panics here because its
             // flow graphs are complete; pyre's walker graph recording is not
-            // (until the walker threads every value through the graph — the
-            // rest of #73).
+            // until the walker threads every value through the graph.
             let Some(links) = entrymap.get(&block).cloned() else {
                 continue;
             };

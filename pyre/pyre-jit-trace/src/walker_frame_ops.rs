@@ -1,12 +1,12 @@
 //! `WalkerFrameOps` trait — abstraction over the small surface of
 //! `MIFrame` methods that the strategy-aware STORE_SUBSCR specialization
-//! emits.  Sub-slice 5c lifts the trait-dispatch helpers
+//! emits.  The trait lets the shared strategy helpers
 //! (`generated_list_setitem_by_strategy`,
 //! `generated_list_setslice_same_len_by_strategy`,
 //! `generated_store_subscr_value`, and the `store_subscr_value` body in
-//! `trace_opcode.rs`) onto this trait so the walker dispatch path can
-//! emit the same `guard_class`+`SETARRAYITEM_GC`-family shape that
-//! today only the trait path produces.
+//! `trace_opcode.rs`) run against either `MIFrame` or the walker
+//! `WalkContext`, so both dispatch paths emit the same
+//! `guard_class`+`SETARRAYITEM_GC`-family shape.
 //!
 //! ## Trait shape — `self`-only signatures, `ctx` reached via accessor
 //!
@@ -43,20 +43,15 @@
 //!
 //! Only the methods reached by the STORE_SUBSCR specialization closure
 //! are members.  Other `MIFrame` methods (`guard_nonnull`,
-//! `trace_dynamic_list_index`, …) stay where they are; they'll join
-//! this trait only when a future sub-slice needs them on the walker
-//! side.
+//! `trace_dynamic_list_index`, ...) stay where they are until a walker
+//! specialization needs the same surface.
 //!
-//! ## Step 4 (this commit)
-//!
-//! Adds `WalkContext` impl alongside the `MIFrame` impl.  Both delegate
-//! `generate_guard` to their existing infrastructure (`MIFrame`'s
-//! `generate_guard` method / walker's
-//! `walker_capture_snapshot_for_last_guard` pair).  The `generated_*`
-//! helpers in `majit-translate/src/codegen.rs` are not yet generic over
-//! `WalkerFrameOps` — that lift happens in step 5 together with the
-//! `dispatch_store_subscr_via_specialization` hook that wires the
-//! walker impl into the residual_call dispatcher.
+//! `MIFrame` and `WalkContext` both delegate `generate_guard` to their
+//! existing infrastructure (`MIFrame::generate_guard` and
+//! `walker_capture_snapshot_for_last_guard`, respectively).  The
+//! generated strategy helpers are generic over this trait, so the
+//! residual-call walker specialization can reuse the same IR shape as the
+//! trait-dispatch path.
 
 use majit_ir::{OpCode, OpRef, Type};
 use majit_metainterp::TraceCtx;

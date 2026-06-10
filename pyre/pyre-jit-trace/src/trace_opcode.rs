@@ -7019,8 +7019,7 @@ impl MIFrame {
         instruction: &Instruction,
         op_arg: pyre_interpreter::OpArg,
     ) -> Result<Option<pyre_interpreter::StepResult<FrontendOp>>, PyError> {
-        // Sub-slice 5c step 5.6b — STORE_SUBSCR walker activation via
-        // trait-path delegation.
+        // STORE_SUBSCR walker activation via trait-path delegation.
         //
         // The auto-gen arm jitcode for `StoreSubscr` is
         // `int_copy, residual_call_r_r(bh_execute_store_subscr, frame),
@@ -8072,7 +8071,7 @@ unsafe fn trace_check_exc_match_against(
 /// opcodes, which is correct only when the arm body's heap effects ride
 /// `vable_setfield` / `setarrayitem_vable_r`, or when walker dispatch
 /// concrete-executes any non-elidable `residual_call` through
-/// `try_execute_residual_call_via_executor` (Task #390 sub-slice 3).
+/// `try_execute_residual_call_via_executor`.
 /// The trait infra is deleted only after this predicate covers every
 /// opcode.
 ///
@@ -8189,7 +8188,7 @@ pub fn production_walker_handles(instruction: &Instruction) -> bool {
             // Instruction::StoreFastStoreFast excluded: routed off the
             // walker JIT path (kept on trait dispatch) until the SFSF
             // walker re-enable is unblocked.
-            | Instruction::StoreSubscr // 5.6b: handled by dispatch_via_walker_for_opcode entry hook
+            | Instruction::StoreSubscr // handled by dispatch_via_walker_for_opcode entry hook
             // Instruction::PopExcept excluded: same bridge-tracing
             // rationale as PushExcInfo below — its arm manages the
             // exception-info stack via impure helper jitcodes the walker
@@ -8399,7 +8398,7 @@ fn apply_walker_stack_effect(state: &mut MIFrame, instruction: &Instruction) {
         | Instruction::CallFunctionEx
         | Instruction::LoadAttr { .. }
         | Instruction::StoreAttr { .. }
-        // | Instruction::StoreSubscr { .. } // see production_walker_handles for 5.6b root-cause note
+        // | Instruction::StoreSubscr { .. } // see production_walker_handles for the walker hook rationale
         | Instruction::StoreFastStoreFast { .. }
         | Instruction::PushNull => {
             // Non-zero stack delta. The walker arm's

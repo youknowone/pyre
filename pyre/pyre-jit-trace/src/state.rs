@@ -8000,8 +8000,8 @@ mod tests {
 
     #[test]
     fn semantic_ref_slot_none_for_beyond_window_stack_color() {
-        // list_setslice #300: at BUILD_LIST entry (pc=40) the runtime stack
-        // is 3 deep (stack_only=3) but the SHARED canonical `-live-` marker
+        // At BUILD_LIST entry (pc=40) the runtime stack is 3 deep
+        // (stack_only=3), but the SHARED canonical `-live-` marker
         // also carries stack color 5 = stack_color_map[3], live only at the
         // depth-4 sibling PC that shares the marker.  The reverse map must
         // classify color 5 as dead-here (None) — it sits past the live

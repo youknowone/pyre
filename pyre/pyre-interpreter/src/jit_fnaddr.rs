@@ -344,9 +344,9 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     // through the bare path `["execute_store_subscr"]` (the dispatch-
     // table entry at `pyopcode.rs:2909`).  Without a runtime fnaddr
     // entry the codewriter mints a `symbolic_fnaddr_for_path` hash
-    // that the `runtime_fnaddr_patch` cannot rewrite and sub-slice 4's
-    // 47-bit sanity gate rejects, causing the walker to skip the heap
-    // mutation and SIGBUS on the next read.  `bh_execute_store_subscr`
+    // that the `runtime_fnaddr_patch` cannot rewrite; the walker rejects
+    // the unresolved address and skips the heap mutation, leaving the next
+    // read to observe stale container state.  `bh_execute_store_subscr`
     // is the C-ABI bridge over the generic
     // `execute_store_subscr::<PyFrame>` whose `Result<StepResult<_>,
     // PyError>` cannot ride the residual_call's single-register Ref
@@ -361,8 +361,7 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     );
 
     // `cpu.store_subscr_fn` binding (`pyre-jit/src/jit/cpu.rs:151`)
-    // bound via `pyre_interpreter::opcode_ops::bh_store_subscr_fn`
-    // (relocated from `pyre-jit/src/call_jit.rs` in 5.5c).
+    // bound via `pyre_interpreter::opcode_ops::bh_store_subscr_fn`.
     // Registered here so `pyre-jit-trace`'s walker specialization gate
     // (`try_walker_store_subscr_specialization`) can recover the
     // runtime address via `jit_trace_fnaddrs()` lookup without a

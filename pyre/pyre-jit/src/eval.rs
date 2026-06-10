@@ -3156,8 +3156,8 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
             // `set_last_instr_from_next_instr(opcode_pc + 1)`.
             //
             // Walker-side `try_execute_residual_call_via_executor`
-            // (Task #390 sub-slice 3, `jitcode_dispatch.rs`)
-            // concrete-executes non-elidable residual calls during
+            // (`jitcode_dispatch.rs`) concrete-executes non-elidable
+            // residual calls during
             // walker dispatch and routes raised exceptions through
             // `BH_LAST_EXC_VALUE` (matches RPython
             // `pyjitpl.py:2156-2168 handle_possible_exception` →

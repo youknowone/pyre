@@ -282,13 +282,11 @@ pub extern "C" fn bh_execute_store_subscr(executor_ptr: i64) -> i64 {
 /// dispatcher calls this thin wrapper to mutate the heap via
 /// `baseobjspace::setitem`.
 ///
-/// Sub-slice 5c step 5.5c relocation: previously lived in
-/// `pyre-jit/src/call_jit.rs` as `bh_store_subscr_fn`.  Moved here so
-/// the address can be reached from `pyre-jit-trace` (via
-/// `pyre_interpreter::jit_trace_fnaddrs()`'s build-time registry)
-/// without a cross-crate `pyre-jit-trace → pyre-jit` dep edge — pyre-
-/// jit-trace already depends on pyre-interpreter for the orthodox
-/// recording-time helpers (`jit_setitem`, `jit_getitem`, …).
+/// Lives in `pyre-interpreter` so `pyre-jit-trace` can reach the address
+/// through `pyre_interpreter::jit_trace_fnaddrs()` without adding a
+/// `pyre-jit-trace -> pyre-jit` dependency edge.  `pyre-jit-trace`
+/// already depends on pyre-interpreter for the normal recording-time
+/// helpers (`jit_setitem`, `jit_getitem`, ...).
 ///
 /// Returns 1 on success, 0 on raise (exception object stashed in
 /// `BH_LAST_EXC_VALUE`).  The return-code polarity differs from the
