@@ -743,6 +743,11 @@ fn analyze_pipeline_from_module_paths(
     mark_phase!("build_semantic_program_from_parsed_files");
     let mut canonical_trait_impls = Vec::new();
     let mut canonical_inherent_methods = Vec::new();
+    // `(trait_leaf, method_name, owner, return_type, hints)` for every
+    // concrete trait-impl method — input to the single-impl
+    // devirtualization pass below.
+    let mut concrete_trait_methods: Vec<(String, String, String, Option<String>, Vec<String>)> =
+        Vec::new();
     let mut canonical_function_graphs = std::collections::HashMap::new();
     // `bookkeeper.py:353-409 getdesc` / `newfuncdesc` keys on the host
     // function-object identity, so two unrelated `crate_a::helper` and
@@ -789,17 +794,28 @@ fn analyze_pipeline_from_module_paths(
     for func in &program.functions {
         match (&func.self_ty_root, &func.trait_root) {
             // Concrete trait-impl method: `impl Trait for Type { fn m }`.
+            // Registration-wise it behaves exactly like an inherent
+            // method (`[Owner, method]` graph + hints below); routing it
+            // through `register_trait_method` instead would also seed
+            // `method_to_impl_types`, flipping `resolve_method`'s
+            // name-based lookup for every same-named method.  The trait
+            // identity feeds only the single-impl direct-path binding
+            // (`concrete_trait_methods` consumer below).
             (Some(owner), Some(trait_leaf)) => {
-                canonical_trait_impls.push(TraitImplInfo {
-                    trait_name: trait_leaf.clone(),
+                concrete_trait_methods.push((
+                    trait_leaf.clone(),
+                    func.name.clone(),
+                    owner.clone(),
+                    func.return_type.clone(),
+                    func.hints.clone(),
+                ));
+                canonical_inherent_methods.push(parse::InherentMethodInfo {
                     for_type: owner.clone(),
                     self_ty_root: Some(owner.clone()),
-                    methods: vec![MethodInfo {
-                        name: func.name.clone(),
-                        graph: Some(func.graph.clone()),
-                        return_type: func.return_type.clone(),
-                        hints: func.hints.clone(),
-                    }],
+                    name: func.name.clone(),
+                    graph: func.graph.clone(),
+                    return_type: func.return_type.clone(),
+                    hints: func.hints.clone(),
                 });
             }
             // Trait default-body: `trait T { fn m { … } }`.  The pseudo
@@ -1093,6 +1109,86 @@ fn analyze_pipeline_from_module_paths(
                     "gc_effects" => call_control.mark_external_gc_effects(path.clone()),
                     _ => {}
                 }
+            }
+        }
+    }
+    // Single-impl devirtualization for REQUIRED trait methods.  A call
+    // site `<Trait>::<method>(receiver, …)` lowers to
+    // `CallTarget::FunctionPath { segments: [<Trait>, <method>] }`
+    // (`front/mir.rs` `call_target_segments` `CallKind::Trait` arm).
+    // Default bodies registered that direct path in the loop above; a
+    // required method (declaration only, no default body) left it
+    // unregistered, so the registry lift failed with "not registered
+    // in PyreCallRegistry" and poisoned every caller.  RPython
+    // resolves the call on the receiver's class
+    // (`classdesc.py:749 lookup` MRO walk); when exactly one class
+    // implements the method in the closed LLBC world, that walk has a
+    // single possible answer — bind the direct path to it.  Two or
+    // more impls (or a default body, already covered) stay off this
+    // path so ambiguous dispatch keeps failing loud until
+    // receiver-driven resolution lands.
+    let mut default_trait_methods: std::collections::HashSet<(String, String)> =
+        std::collections::HashSet::new();
+    for impl_info in &canonical_trait_impls {
+        if impl_info.trait_name.is_empty()
+            || !impl_info.for_type.starts_with("<default methods of ")
+        {
+            continue;
+        }
+        for method in &impl_info.methods {
+            default_trait_methods.insert((impl_info.trait_name.clone(), method.name.clone()));
+        }
+    }
+    let mut concrete_impl_counts: std::collections::HashMap<(String, String), usize> =
+        std::collections::HashMap::new();
+    for (trait_leaf, method_name, _, _, _) in &concrete_trait_methods {
+        *concrete_impl_counts
+            .entry((trait_leaf.clone(), method_name.clone()))
+            .or_insert(0) += 1;
+    }
+    // Activation is gated off by default: registering these direct
+    // paths pulls the (currently census-failing) opcode-handler graph
+    // bodies into every caller's annotation, which today dies
+    // non-deterministically downstream (assembler operand-kind assert /
+    // dual-gate worker stack overflow).  `PYRE_TRAIT_DEVIRT=1` enables
+    // the registration for census experiments while those blockers are
+    // drained; the gate is removed once activation is green.
+    let trait_devirt_enabled = std::env::var_os("PYRE_TRAIT_DEVIRT").is_some();
+    for (trait_leaf, method_name, owner, return_type, hints) in &concrete_trait_methods {
+        if !trait_devirt_enabled {
+            break;
+        }
+        let key = (trait_leaf.clone(), method_name.clone());
+        if concrete_impl_counts.get(&key) != Some(&1) || default_trait_methods.contains(&key) {
+            continue;
+        }
+        let Some(graph) = mir_graph_lookup.lookup_impl_method(owner, method_name).cloned() else {
+            continue;
+        };
+        let graph = match return_type {
+            Some(rt) => graph.with_return_type(rt),
+            None => graph,
+        };
+        let direct_path =
+            crate::parse::CallPath::from_segments([trait_leaf.as_str(), method_name.as_str()]);
+        call_control.register_function_graph(direct_path.clone(), graph);
+        // Mirror the default-direct hint registration above so the
+        // BFS reaches the same `_reject_function` verdict on this
+        // path as on `[impl_type, method]`.
+        if !hints.is_empty() {
+            call_control.register_function_hints_for(direct_path.clone(), hints.clone());
+        }
+        for hint in hints {
+            match hint.as_str() {
+                "elidable" => call_control.mark_elidable(direct_path.clone()),
+                "elidable_cannot_raise" => {
+                    call_control.mark_cannot_raise_assertion(direct_path.clone())
+                }
+                "elidable_or_memerror" => {
+                    call_control.mark_memerror_only_assertion(direct_path.clone())
+                }
+                "loopinvariant" => call_control.mark_loopinvariant(direct_path.clone()),
+                _ => {}
             }
         }
     }

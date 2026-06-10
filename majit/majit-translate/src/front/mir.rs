@@ -3469,13 +3469,21 @@ fn trait_impl_trait_root_for_fundecl(llbc: &Llbc, fd: &FunDecl) -> Option<String
         .and_then(serde_json::Value::as_u64)?;
     let trait_impls = llbc.file.translated.rest.get("trait_impls")?.as_array()?;
     let ti = trait_impls.get(trait_impl_id as usize)?;
+    // `impl_trait` is a TraitDeclRef; its trait-decl id field is `id`.
     let trait_id = ti
         .as_object()?
         .get("impl_trait")?
         .as_object()?
-        .get("trait_id")?
+        .get("id")?
         .as_u64()?;
     let td = llbc.trait_by_id(trait_id)?;
+    // Only source-local traits participate: std/core trait impls
+    // (`FnOnce` closure shims, `Destruct`/`Drop` glue, `PartialEq`, …)
+    // are host machinery, not translated-program classes, and keep
+    // their inherent classification.
+    if !td.item_meta.is_local {
+        return None;
+    }
     let trait_leaf = td
         .item_meta
         .name_path()
