@@ -10594,6 +10594,28 @@ fn handle(
             live_args.extend(ri.iter().copied());
             live_args.extend(rr.iter().copied());
             live_args.extend(rf.iter().copied());
+            // The loop-close path (`run_perfn_walk` CloseLoop post-processing,
+            // trace.rs) rebuilds the jump args via `close_loop_args_at`, which
+            // sources the reds from `sym.frame` / `sym.execution_context` — not
+            // from the walk register file read above (the register slot may
+            // hold a const-folded alias of the same value). The merge-point
+            // registration must use the SAME box identities: `history.cut`
+            // (cross-loop cut, pyjitpl.py:2994-3030) takes the registered
+            // green_boxes as the new loop's inputargs, and a close-side red
+            // absent from them escapes into an extra appended inputarg —
+            // producing an entry layout `patch_new_loop_to_load_virtualizable_
+            // fields` cannot reduce, so every interpreter entry aborts
+            // (`extend_compiled_live_values` count mismatch).
+            {
+                let sym_ptr = FULL_BODY_SNAPSHOT_SYM.with(|c| c.get());
+                if !sym_ptr.is_null() && ri.is_empty() && rf.is_empty() && rr.len() == 2 {
+                    let sym = unsafe { &*sym_ptr };
+                    live_args[0] = sym.frame;
+                    if !sym.execution_context.is_none() {
+                        live_args[1] = sym.execution_context;
+                    }
+                }
+            }
             live_args = append_virtualizable_boxes(ctx.trace_ctx, live_args);
 
             if std::env::var("PYRE_DIAG_51C").is_ok() {

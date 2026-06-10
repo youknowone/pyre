@@ -469,6 +469,16 @@ impl TreeLoop {
             } else {
                 // No pool constant available: fall back to new inputarg.
                 let tp = self.inputargs[r.raw() as usize].tp;
+                if crate::majit_log_enabled() {
+                    eprintln!(
+                        "[jit][cut-escape] original inputarg {:?} (tp={:?}) not in \
+                         original_boxes and no pool constant — appended as extra \
+                         inputarg #{}",
+                        r,
+                        tp,
+                        new_ia_boxes.len(),
+                    );
+                }
                 remap.insert(r, OpRef::input_arg_typed(new_ia_boxes.len() as u32, tp));
                 new_ia_boxes.push(r);
                 new_ia_types.push(tp);
