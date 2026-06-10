@@ -2076,6 +2076,20 @@ impl HostEnv {
         // `copy_nonoverlapping` members before the `mods.insert` below.
         std_ptr.module_set("null", HostObject::new_builtin_callable("std.ptr.null"));
 
+        // `pub const PY_NULL: PyObjectRef = std::ptr::null_mut()`
+        // (`pyre_object::pyobject::PY_NULL`).  Charon emits the const
+        // read as a Global place; `front::mir` lowers an unknown global
+        // to a 0-arg `Call FunctionPath ["pyre_object", "pyobject",
+        // "PY_NULL"]`, which Branch 3b resolves through this module.
+        // Bind the attr to the canonical `core.ptr.null_mut` callable so
+        // the read shares the null-pointer analyzer with spelled-out
+        // `null_mut()` callsites.
+        let pyre_object_pyobject = HostObject::new_module("pyre_object.pyobject");
+        pyre_object_pyobject.module_set(
+            "PY_NULL",
+            HostObject::new_builtin_callable("core.ptr.null_mut"),
+        );
+
         let mut mods = self.modules.lock().unwrap();
         mods.insert("__builtin__".into(), self.builtin_module.clone());
         mods.insert("os".into(), os);
@@ -2106,6 +2120,7 @@ impl HostEnv {
         mods.insert("FrameDebugData".into(), frame_debug_data);
         mods.insert("RootScope".into(), root_scope);
         mods.insert("IntArray".into(), int_array);
+        mods.insert("pyre_object.pyobject".into(), pyre_object_pyobject);
     }
 
     /// upstream `getattr(__builtin__, name)` — `flowcontext.py:851`.

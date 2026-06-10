@@ -311,6 +311,16 @@ fn register_builtins() -> HashMap<String, BuiltinAnalyzer> {
     // (`flowspace/model.rs:1910`).  Lowers identity checks in
     // `baseobjspace::is_w` / `baseobjspace::is_`.
     analyzer_for(&mut reg, "std.ptr.eq", std_ptr_eq);
+    // Rust `std::ptr::null_mut::<T>()` / `null::<T>()` — the null
+    // pointer constant (also the value of
+    // `pyre_object::pyobject::PY_NULL`, whose HOST_ENV attr binds to
+    // the `core.ptr.null_mut` callable).  All four spellings share one
+    // analyzer; `core.*` is the canonical form MIR lowering emits and
+    // `std.*` the re-export spelling.
+    analyzer_for(&mut reg, "core.ptr.null_mut", ptr_null_constant);
+    analyzer_for(&mut reg, "std.ptr.null_mut", ptr_null_constant);
+    analyzer_for(&mut reg, "core.ptr.null", ptr_null_constant);
+    analyzer_for(&mut reg, "std.ptr.null", ptr_null_constant);
     // Rust `std::mem::size_of::<T>() -> usize` — compile-time type-size
     // constant called by `lltype::malloc_typed` /
     // `object_array::items_block_layout`.  Returns `SomeInteger`.
@@ -1217,6 +1227,27 @@ pub fn std_ptr_eq(
     _kwds: &HashMap<String, Option<SomeValue>>,
 ) -> Result<SomeValue, AnnotatorError> {
     Ok(SomeValue::Bool(super::model::SomeBool::new()))
+}
+
+/// Analyzer for `std::ptr::null_mut::<T>()` / `std::ptr::null::<T>()`
+/// — the null pointer constant (`lltype.nullptr(T)` analogue;
+/// `rbuiltin.py` typer folds it to a null `Ptr` constant).  Pyre's
+/// erased-pointer projection keeps pointee classes off the annotation
+/// (`annotation_state.rs` `Ref` table row), so the shell is the
+/// classdef-less `SomeInstance` with `can_be_none=true`: the
+/// `Instance(None) ∪ Instance(cd)` union arm (`model.rs:2863`) keeps
+/// it joinable with any typed receiver while preserving the
+/// nullability bit.
+pub fn ptr_null_constant(
+    _bk: &Rc<Bookkeeper>,
+    _args_s: &[Option<SomeValue>],
+    _kwds: &HashMap<String, Option<SomeValue>>,
+) -> Result<SomeValue, AnnotatorError> {
+    Ok(SomeValue::Instance(super::model::SomeInstance::new(
+        None,
+        true,
+        std::collections::BTreeMap::new(),
+    )))
 }
 
 /// Analyzer for `std::mem::size_of::<T>() -> usize` — compile-time
