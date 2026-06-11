@@ -1731,7 +1731,7 @@ mod tests {
         let pop = PreambleOp {
             op: BoxRef::from_opref(OpRef::int_op(88)),
             invented_name: false,
-            preamble_op: replay,
+            preamble_op: std::rc::Rc::new(replay),
         };
         info.set_preamble_item(1, pop.clone());
 
@@ -1760,7 +1760,7 @@ mod tests {
         let pop = PreambleOp {
             op: BoxRef::from_opref(OpRef::int_op(88)),
             invented_name: false,
-            preamble_op: replay,
+            preamble_op: std::rc::Rc::new(replay),
         };
         info.set_preamble_field(3, pop);
 

@@ -3838,7 +3838,7 @@ mod tests {
                 PreambleOp {
                     op: BoxRef::from_opref(source),
                     invented_name: false,
-                    preamble_op,
+                    preamble_op: std::rc::Rc::new(preamble_op),
                 },
             );
         })

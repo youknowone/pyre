@@ -1335,7 +1335,7 @@ mod tests {
                 preamble_op: {
                     let mut same_as = Op::new(OpCode::SameAsI, &[source_box]);
                     same_as.pos.set(source);
-                    same_as
+                    std::rc::Rc::new(same_as)
                 },
             };
             ctx.set_potential_extra_op(source, pop);
@@ -2718,7 +2718,11 @@ mod tests {
             OpRef::int_op(1),
             false,
         );
-        initialize_imported_short_pure_builder(&mut ctx, imported.pop.preamble_op.clone(), Some(1));
+        initialize_imported_short_pure_builder(
+            &mut ctx,
+            (*imported.pop.preamble_op).clone(),
+            Some(1),
+        );
         ctx.imported_short_pure_ops.push(imported);
 
         pass.setup();

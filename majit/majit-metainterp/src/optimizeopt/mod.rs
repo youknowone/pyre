@@ -499,7 +499,7 @@ impl ImportedShortPureOp {
             pop: crate::optimizeopt::info::PreambleOp {
                 op: pop_op,
                 invented_name,
-                preamble_op: replay,
+                preamble_op: std::rc::Rc::new(replay),
             },
         }
     }
@@ -2689,7 +2689,7 @@ impl OptContext {
                         entry.op.pos.get(),
                         crate::optimizeopt::shortpreamble::ProducedShortOp {
                             kind: entry.kind.clone(),
-                            preamble_op: entry.op.clone(),
+                            preamble_op: std::rc::Rc::new(entry.op.clone()),
                             invented_name: entry.invented_name,
                             same_as_source: entry.same_as_source.clone(),
                         },
@@ -2910,7 +2910,7 @@ impl OptContext {
                     }
                     let new_pop = ProducedShortOp {
                         kind: PreambleOpKind::Pure,
-                        preamble_op: op,
+                        preamble_op: std::rc::Rc::new(op),
                         invented_name: produced_op.invented_name,
                         same_as_source: produced_op.same_as_source.clone(),
                     };
@@ -2948,7 +2948,7 @@ impl OptContext {
                             op.setdescr(descr);
                             ProducedShortOp {
                                 kind: PreambleOpKind::Heap,
-                                preamble_op: op,
+                                preamble_op: std::rc::Rc::new(op),
                                 invented_name: produced_op.invented_name,
                                 same_as_source: produced_op.same_as_source.clone(),
                             }
@@ -2986,7 +2986,7 @@ impl OptContext {
                             op.setdescr(descr);
                             ProducedShortOp {
                                 kind: PreambleOpKind::Heap,
-                                preamble_op: op,
+                                preamble_op: std::rc::Rc::new(op),
                                 invented_name: produced_op.invented_name,
                                 same_as_source: produced_op.same_as_source.clone(),
                             }
@@ -3023,7 +3023,7 @@ impl OptContext {
                     op.pos.set(replay_pos(*source, produced_op));
                     let new_pop = ProducedShortOp {
                         kind: PreambleOpKind::LoopInvariant,
-                        preamble_op: op,
+                        preamble_op: std::rc::Rc::new(op),
                         invented_name: produced_op.invented_name,
                         same_as_source: produced_op.same_as_source.clone(),
                     };
@@ -9857,7 +9857,7 @@ mod imported_short_preamble_fallback_tests {
         let pop = crate::optimizeopt::info::PreambleOp {
             op: crate::r#box::BoxRef::from_opref(OpRef::int_op(41)),
             invented_name: false,
-            preamble_op: replay_op,
+            preamble_op: std::rc::Rc::new(replay_op),
         };
 
         let forced = ctx.force_op_from_preamble_op(&pop);

@@ -3500,7 +3500,7 @@ impl Optimization for OptRewrite {
                                 LoopInvariantEntry::Preamble(PreambleOp {
                                     op: source_box,
                                     invented_name: false,
-                                    preamble_op: replay,
+                                    preamble_op: std::rc::Rc::new(replay),
                                 }),
                             );
                         }

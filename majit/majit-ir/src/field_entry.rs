@@ -35,7 +35,7 @@ pub struct PreambleOp {
     pub invented_name: bool,
     /// RPython: PreambleOp.preamble_op — the actual replay operation
     /// for the short preamble. Always present (RPython parity).
-    pub preamble_op: Op,
+    pub preamble_op: crate::resoperation::OpRc,
 }
 
 /// RPython _fields[] element — either a concrete value or a PreambleOp sentinel.

@@ -2799,7 +2799,9 @@ impl Optimizer {
                 .into_iter()
                 .map(|(result, produced)| {
                     let canonical_result = ctx.get_replacement_opref(result);
-                    let mut preamble_op = produced.preamble_op;
+                    // Deep-clone: dual map entries share the replay OpRc;
+                    // the pos/arg rewrites below must stay per-entry.
+                    let mut preamble_op = (*produced.preamble_op).clone();
                     // RPython parity: key and preamble_op.pos must be the
                     // same resolved value. Independent get_box_replacement
                     // calls can diverge when forwarding chains differ.
@@ -6215,7 +6217,7 @@ mod tests {
                         &[BoxRef::from_opref(OpRef::int_op(14))],
                     );
                     op.pos.set(OpRef::op_typed(14, op.result_type()));
-                    op
+                    std::rc::Rc::new(op)
                 },
             },
         );

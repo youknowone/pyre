@@ -5596,7 +5596,10 @@ mod tests {
             old_ref,
             ProducedShortOp {
                 kind: PreambleOpKind::Pure,
-                preamble_op: Op::new(OpCode::SameAsR, &[BoxRef::from_opref(old_ref)]),
+                preamble_op: std::rc::Rc::new(Op::new(
+                    OpCode::SameAsR,
+                    &[BoxRef::from_opref(old_ref)],
+                )),
                 invented_name: false,
                 same_as_source: Some(BoxRef::from_opref(old_ref)),
             },
