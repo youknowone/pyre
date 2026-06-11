@@ -39,17 +39,24 @@ pub enum Operand {
     Op(OpRc),
     /// An input-arg producer (`resoperation.py` `AbstractInputArg`).
     InputArg(InputArgRc),
-    /// An inline constant (`history.py` `Const*`); value identity, never
-    /// `Rc::ptr_eq`.
-    Const(Const),
+    /// A constant (`history.py:227/268/314` `ConstInt`/`ConstFloat`/
+    /// `ConstPtr`). Upstream `Const` is a heap object — `_args[i]` returns
+    /// the stored object, `==` is Python `is`, and value equality is the
+    /// explicit `same_constant` (history.py:211) — so the operand carries
+    /// the const box by `Rc` (object identity across reads of one slot,
+    /// `Cell`-backed GC walk of an inline `ConstPtr`), NOT a bare value.
+    /// The carrier is the const-kind [`BoxRef`] for the migration window;
+    /// it type-narrows to a dedicated const-box `Rc` when the `BoxRef`
+    /// wrapper is deleted (#9 endgame).
+    Const(BoxRef),
     /// MIGRATION-ONLY catch-all (`#9` operand-union flip): a not-yet-converted
     /// [`BoxRef`] for the operands `from_boxref` cannot yet lower to a pure
-    /// `Op`/`InputArg`/`Const` — const operands (kept `Cell`-backed for the GC
-    /// walk) and position-only operands minted by `BoxRef::from_opref` (no live
-    /// producer to bind). Holding the original `BoxRef` makes the storage flip
-    /// byte-identical: `to_boxref` clones the same `Rc<Box>` back, preserving
-    /// box identity and GC-walkability verbatim. Ground down to zero
-    /// (then deleted) as later slices bind/inline these.
+    /// `Op`/`InputArg`/`Const` — position-only operands minted by
+    /// `BoxRef::from_opref` (no live producer to bind). Holding the original
+    /// `BoxRef` makes the storage flip byte-identical: `to_boxref` clones the
+    /// same `Rc<Box>` back, preserving box identity and GC-walkability
+    /// verbatim. Ground down to zero (then deleted) as later slices bind
+    /// these.
     Box(BoxRef),
 }
 
@@ -67,9 +74,11 @@ impl Operand {
         Operand::InputArg(Rc::clone(ia))
     }
 
-    /// An inline-constant operand.
+    /// A constant operand — mints a fresh const box (`history.py:227`
+    /// `ConstInt(value)` object construction; identity starts here and is
+    /// shared by every read of the slot).
     pub fn const_(value: Const) -> Operand {
-        Operand::Const(value)
+        Operand::Const(BoxRef::new_const(value.to_value()))
     }
 
     /// The absent-slot sentinel.
@@ -89,11 +98,9 @@ impl Operand {
             Operand::None => OpRef::NONE,
             Operand::Op(op) => op.pos.get(),
             Operand::InputArg(ia) => OpRef::input_arg_typed(ia.index, ia.tp),
-            Operand::Const(c) => match *c {
-                Const::Int(v) => OpRef::const_int(v),
-                Const::Float(v) => OpRef::const_float(v),
-                Const::Ref(v) => OpRef::const_ptr(v),
-            },
+            // Re-encodes from the box's live `Cell` value, so a GC-moved
+            // `ConstPtr` reads back at its post-move address.
+            Operand::Const(b) => b.to_opref(),
             Operand::Box(b) => b.to_opref(),
         }
     }
@@ -114,7 +121,7 @@ impl Operand {
         match self {
             Operand::Op(op) => op.pos.get().ty().unwrap_or(Type::Void),
             Operand::InputArg(ia) => ia.tp,
-            Operand::Const(c) => c.get_type(),
+            Operand::Const(b) => b.type_(),
             Operand::Box(b) => b.type_(),
             Operand::None => Type::Void,
         }
@@ -124,7 +131,7 @@ impl Operand {
     /// `None` for non-`Const`.
     pub fn const_value(&self) -> Option<Value> {
         match self {
-            Operand::Const(c) => Some(c.to_value()),
+            Operand::Const(b) => b.const_value(),
             Operand::Box(b) => b.const_value(),
             _ => None,
         }
@@ -134,7 +141,7 @@ impl Operand {
     /// parity).
     pub fn const_int(&self) -> Option<i64> {
         match self {
-            Operand::Const(Const::Int(v)) => Some(*v),
+            Operand::Const(b) => b.const_int(),
             Operand::Box(b) => b.const_int(),
             _ => None,
         }
@@ -196,7 +203,9 @@ impl Operand {
             Operand::None => BoxRef::none(),
             Operand::Op(op) => BoxRef::from_bound_op(op),
             Operand::InputArg(ia) => BoxRef::from_bound_inputarg(ia),
-            Operand::Const(c) => BoxRef::new_const(c.to_value()),
+            // The SAME `Rc<Box>` back — `_args[i]` returns the stored
+            // Const object, never a fresh equal-valued one.
+            Operand::Const(b) => b.clone(),
             Operand::Box(b) => b.clone(),
         }
     }
@@ -239,6 +248,12 @@ impl Operand {
         if let Some(ia) = b.bound_inputarg() {
             return Operand::InputArg(ia);
         }
+        // A Const box lowers to the terminal `Operand::Const` carrying the
+        // same `Rc<Box>` (history.py Const object identity + `Cell`-backed
+        // GC walk preserved). Only position-only boxes remain `Operand::Box`.
+        if b.is_constant() {
+            return Operand::Const(b.clone());
+        }
         Operand::Box(b.clone())
     }
 
@@ -256,14 +271,13 @@ impl Operand {
 
     /// GC walk over any inline `ConstPtr` reachable from this operand
     /// (`resoperation.py` `walk_const_ptr_refs`). Const / position-only
-    /// operands are held `Cell`-backed via `Operand::Box`, so their `GcRef`
+    /// operands are held `Cell`-backed in their box, so their `GcRef`
     /// updates in place; pure `Op` / `InputArg` carry no inline const (their
-    /// own `value` slot is walked at the producer); pure `Operand::Const`
-    /// is value-typed with no in-place slot and is not produced by
-    /// `from_boxref` during the migration window.
+    /// own `value` slot is walked at the producer).
     pub fn walk_const_ptr_refs(&self, visitor: &mut dyn FnMut(&mut GcRef)) {
-        if let Operand::Box(b) = self {
-            b.walk_const_ptr_refs(visitor);
+        match self {
+            Operand::Const(b) | Operand::Box(b) => b.walk_const_ptr_refs(visitor),
+            Operand::None | Operand::Op(_) | Operand::InputArg(_) => {}
         }
     }
 }
@@ -384,10 +398,11 @@ mod tests {
         assert!(o.is_bound());
         assert_eq!(o.to_boxref().as_ptr(), bia.as_ptr());
 
-        // Const -> kept as Box (Cell-backed, value-typed); NOT bound.
+        // Const -> Operand::Const carrying the SAME const box (history.py
+        // Const object identity; Cell-backed GC walk); NOT bound.
         let cbox = BoxRef::new_const(Value::Int(11));
         let o = Operand::from_boxref(&cbox);
-        assert!(matches!(o, Operand::Box(_)));
+        assert!(matches!(o, Operand::Const(_)));
         assert!(o.is_constant());
         assert!(!o.is_bound());
         assert_eq!(o.const_int(), Some(11));
