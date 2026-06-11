@@ -781,6 +781,19 @@ pub(crate) fn is_known_unported(msg: &str) -> bool {
         || msg.contains("complete_pending_blocks failed")
         || msg.contains("Cannot find attribute ")
         || msg.contains("AnnotatorError:")
+        // `rtyper.py:810-823 convertvar` — no conversion path between
+        // the two reprs.  The production hitter is the generic-ADT
+        // payload attribute (`core.result.Result.Ok.__pos_0` etc.):
+        // pyre collapses every `Result<T, E>` instantiation onto ONE
+        // classdef, so the attribute's merged annotation unions
+        // unrelated payload classes (unit-tuple placeholder `Adt`,
+        // `core.option.Option.None`, …) and `pairtype(InstanceRepr,
+        // InstanceRepr).convert_from_to` (rclass.py:1035-1055)
+        // correctly finds no common base.  Upstream never faces this
+        // shape — RPython has no generics, so each class attribute
+        // carries a single annotated type.  Skip until
+        // per-instantiation classdef specialization lands.
+        || msg.contains("don't know how to convert from")
         // `dyn Trait` dispatch still enters the real-rtyper flowspace
         // adapter as pyre's pre-rtyper `CallTarget::Indirect` shape in
         // some registry-prefill paths.  The production codewriter's
