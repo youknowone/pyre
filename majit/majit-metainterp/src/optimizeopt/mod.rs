@@ -490,7 +490,7 @@ impl ImportedShortPureOp {
         // pyre's `source` IS the alt identifier for invented (the synthetic
         // alias allocated by the compound-dedup pass at
         // shortpreamble.rs:478-491) and IS self.res for non-invented.
-        let pop_op = source;
+        let pop_op = ctx.materialize_box_at(source);
         ImportedShortPureOp {
             opcode,
             descr,
@@ -3054,7 +3054,7 @@ impl OptContext {
         &mut self,
         preamble_op: &crate::optimizeopt::info::PreambleOp,
     ) -> OpRef {
-        let preamble_source = preamble_op.op;
+        let preamble_source = preamble_op.op.to_opref();
         // RPython `return preamble_op.op` returns the carried Box. In majit,
         // `pop.op` stores the Phase 1 source position; `make_equal_to(source,
         // body_visible)` is called by the producer for invented Pure / Heap /
@@ -3062,7 +3062,7 @@ impl OptContext {
         // body-visible OpRef. Non-invented Pure has no forwarding installed,
         // so `get_box_replacement(source) == source` and the body references
         // source directly (RPython parity for non-invented `op = self.res`).
-        let result = self.get_replacement_opref(preamble_op.op);
+        let result = self.get_replacement_opref(preamble_source);
         let result_type = preamble_op.preamble_op.result_type();
         let is_constant = self
             .get_box_replacement_box(preamble_source)
@@ -5674,9 +5674,7 @@ impl OptContext {
         if let Some(preamble_op) = tracked {
             // shortpreamble.py:434 `op = preamble_op.op.get_box_replacement()`
             // — the resolved Box itself is handed to the builder.
-            let resolved_for_pop = self
-                .get_box_replacement_box(preamble_op.op)
-                .unwrap_or_else(|| crate::r#box::BoxRef::from_opref(preamble_op.op));
+            let resolved_for_pop = self.resolve_box_box(&preamble_op.op);
             if let Some(builder) = self.active_short_preamble_producer_mut() {
                 builder.add_preamble_op_from_pop(&preamble_op, resolved_for_pop);
             } else if let Some(builder) = self.imported_short_preamble_builder.as_mut() {
@@ -9876,7 +9874,7 @@ mod imported_short_preamble_fallback_tests {
         // pop.op carries the body-visible OpRef directly (no forwarding chain
         // installed for non-invented Pure).
         let pop = crate::optimizeopt::info::PreambleOp {
-            op: OpRef::int_op(41),
+            op: crate::r#box::BoxRef::from_opref(OpRef::int_op(41)),
             invented_name: false,
             preamble_op: replay_op,
         };

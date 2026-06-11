@@ -2184,7 +2184,7 @@ impl OptHeap {
         {
             match entry {
                 crate::optimizeopt::info::FieldEntry::Preamble(pop) => {
-                    let cached_seen = ctx.get_box_replacement(pop.op).to_opref();
+                    let cached_seen = ctx.resolve_box_box(&pop.op).to_opref();
                     // heap.py:88 not cached_field.same_box(arg1)
                     if ctx.same_box(cached_seen, arg1) {
                         let cached = ctx.force_op_from_preamble_op(&pop);
@@ -2325,7 +2325,7 @@ impl OptHeap {
         {
             match entry {
                 crate::optimizeopt::info::FieldEntry::Preamble(pop) => {
-                    let cached_seen = ctx.get_box_replacement(pop.op).to_opref();
+                    let cached_seen = ctx.resolve_box_box(&pop.op).to_opref();
                     // heap.py:88 not cached_field.same_box(arg1)
                     if ctx.same_box(cached_seen, arg1) {
                         let cached = ctx.force_op_from_preamble_op(&pop);
@@ -3836,7 +3836,7 @@ mod tests {
             info.set_preamble_field(
                 OptHeap::field_slot_index(descr),
                 PreambleOp {
-                    op: source,
+                    op: BoxRef::from_opref(source),
                     invented_name: false,
                     preamble_op,
                 },

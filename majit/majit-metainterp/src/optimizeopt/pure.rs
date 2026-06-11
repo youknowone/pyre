@@ -1327,18 +1327,18 @@ mod tests {
         // Keep the source result available to use_box() exactly like the
         // imported short preamble path does after unroll import.
         if source != OpRef::NONE {
-            ctx.set_potential_extra_op(
-                source,
-                crate::optimizeopt::info::PreambleOp {
-                    op: source,
-                    invented_name: false,
-                    preamble_op: {
-                        let mut same_as = Op::new(OpCode::SameAsI, &[BoxRef::from_opref(source)]);
-                        same_as.pos.set(source);
-                        same_as
-                    },
+            // PreambleOp.op carries the Box itself (shortpreamble.py:12).
+            let source_box = ctx.materialize_box_at(source);
+            let pop = crate::optimizeopt::info::PreambleOp {
+                op: source_box.clone(),
+                invented_name: false,
+                preamble_op: {
+                    let mut same_as = Op::new(OpCode::SameAsI, &[source_box]);
+                    same_as.pos.set(source);
+                    same_as
                 },
-            );
+            };
+            ctx.set_potential_extra_op(source, pop);
         }
     }
     use crate::optimizeopt::optimizer::Optimizer;

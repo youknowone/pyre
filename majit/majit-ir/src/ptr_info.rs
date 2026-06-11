@@ -490,7 +490,7 @@ impl PtrInfo {
             match entry {
                 FieldEntry::Value(opref) => visit_opref(opref, visitor),
                 FieldEntry::Preamble(pop) => {
-                    visit_opref(&mut pop.op, visitor);
+                    pop.op.walk_const_ptr_refs(visitor);
                     pop.preamble_op.walk_const_ptr_refs_mut(visitor);
                 }
             }

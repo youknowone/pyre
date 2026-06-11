@@ -3492,13 +3492,13 @@ impl Optimization for OptRewrite {
                             // info seeded at result_opref's slot per the
                             // dual-slot rule (mod.rs:1817 replay_pos).
                             let replay_pos = ctx.get_box_replacement(source).to_opref();
-                            let mut replay =
-                                Op::new(OpCode::SameAsI, &[ctx.materialize_box_at(source)]);
+                            let source_box = ctx.materialize_box_at(source);
+                            let mut replay = Op::new(OpCode::SameAsI, &[source_box.clone()]);
                             replay.pos.set(replay_pos);
                             self.loop_invariant_results.insert(
                                 func_val,
                                 LoopInvariantEntry::Preamble(PreambleOp {
-                                    op: source,
+                                    op: source_box,
                                     invented_name: false,
                                     preamble_op: replay,
                                 }),
@@ -3733,7 +3733,7 @@ impl Optimization for OptRewrite {
             .iter()
             .filter_map(|(func_ptr, entry)| match entry {
                 LoopInvariantEntry::Direct(r) => Some((*func_ptr, *r)),
-                LoopInvariantEntry::Preamble(pop) => Some((*func_ptr, pop.op)),
+                LoopInvariantEntry::Preamble(pop) => Some((*func_ptr, pop.op.to_opref())),
             })
             .collect()
     }

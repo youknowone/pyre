@@ -1729,7 +1729,7 @@ mod tests {
         );
         replay.pos.set(OpRef::int_op(88));
         let pop = PreambleOp {
-            op: OpRef::int_op(88),
+            op: BoxRef::from_opref(OpRef::int_op(88)),
             invented_name: false,
             preamble_op: replay,
         };
@@ -1741,7 +1741,7 @@ mod tests {
         let recovered = info
             .take_preamble_item(1)
             .expect("preamble item should be recoverable");
-        assert_eq!(recovered.op, OpRef::int_op(88));
+        assert_eq!(recovered.op.to_opref(), OpRef::int_op(88));
         // After take_preamble_item, slot is Value(NONE)
         assert_eq!(
             info.getitem(1).and_then(|e| e.as_opref()),
@@ -1758,7 +1758,7 @@ mod tests {
             &[BoxRef::from_opref(OpRef::int_op(10))],
         );
         let pop = PreambleOp {
-            op: OpRef::int_op(88),
+            op: BoxRef::from_opref(OpRef::int_op(88)),
             invented_name: false,
             preamble_op: replay,
         };

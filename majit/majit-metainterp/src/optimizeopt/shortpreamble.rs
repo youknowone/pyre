@@ -1527,7 +1527,8 @@ impl ProducedShortOp {
         // of that Box-identity invariant.
         getfield_op.pos.set(result_opref);
         let pop = crate::optimizeopt::info::PreambleOp {
-            op: source,
+            // PreambleOp.op carries the Box itself (shortpreamble.py:12).
+            op: ctx.materialize_box_at(source),
             invented_name: self.invented_name,
             preamble_op: getfield_op.clone(),
         };
@@ -1646,7 +1647,8 @@ impl ProducedShortOp {
         // adaptation rationale.
         getarrayitem_op.pos.set(result_opref);
         let pop = crate::optimizeopt::info::PreambleOp {
-            op: source,
+            // PreambleOp.op carries the Box itself (shortpreamble.py:12).
+            op: ctx.materialize_box_at(source),
             invented_name: self.invented_name,
             preamble_op: getarrayitem_op.clone(),
         };
@@ -2117,7 +2119,7 @@ impl ShortPreambleBuilder {
         preamble_op: &crate::optimizeopt::info::PreambleOp,
         resolved_op: crate::r#box::BoxRef,
     ) {
-        if let Some(produced) = self.produced_short_boxes.get(&preamble_op.op) {
+        if let Some(produced) = self.produced_short_boxes.get(&preamble_op.op.to_opref()) {
             self.state.record_preamble_use(resolved_op, produced);
         } else {
             // shortpreamble.py:432-440: same 4-line pattern via common helper.
@@ -2126,7 +2128,7 @@ impl ShortPreambleBuilder {
                 resolved_op,
                 replay_op,
                 preamble_op.invented_name,
-                Some(BoxRef::from_opref(preamble_op.op)),
+                Some(preamble_op.op.clone()),
             );
         }
     }
@@ -2519,7 +2521,7 @@ impl ExtendedShortPreambleBuilder {
         {
             resolved_key
         } else {
-            preamble_op.op
+            preamble_op.op.to_opref()
         };
         if let Some(produced) = self.produced_short_boxes.get(&lookup_key).cloned() {
             self.add_tracked_preamble_op(resolved_op, &produced);
@@ -2531,7 +2533,7 @@ impl ExtendedShortPreambleBuilder {
             }
             let op = resolved_key;
             if preamble_op.invented_name {
-                let source = BoxRef::from_opref(preamble_op.op);
+                let source = preamble_op.op.clone();
                 let mut same_as =
                     Op::new(OpCode::same_as_for_type(replay_op.result_type()), &[source]);
                 same_as.pos.set(op);
@@ -3816,7 +3818,7 @@ mod tests {
         );
         replay_op.pos.set(OpRef::int_op(14));
         let pop = crate::optimizeopt::info::PreambleOp {
-            op: OpRef::int_op(14),
+            op: BoxRef::from_opref(OpRef::int_op(14)),
             invented_name: true,
             preamble_op: replay_op,
         };
@@ -3853,7 +3855,7 @@ mod tests {
         );
         replay_op.pos.set(OpRef::int_op(14));
         let pop = crate::optimizeopt::info::PreambleOp {
-            op: OpRef::int_op(14),
+            op: BoxRef::from_opref(OpRef::int_op(14)),
             invented_name: true,
             preamble_op: replay_op,
         };

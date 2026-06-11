@@ -6371,7 +6371,7 @@ mod tests {
             .flatten();
         assert!(pop.is_some(), "PreambleOp must be in PtrInfo._fields");
         let pop = pop.unwrap();
-        assert_eq!(pop.op, OpRef::int_op(11)); // Phase 1 source — pop.op
+        assert_eq!(pop.op.to_opref(), OpRef::int_op(11)); // Phase 1 source — pop.op
         // forwards via make_equal_to to the body-visible OpRef.
         drop(parent);
     }
@@ -6580,7 +6580,7 @@ mod tests {
             .produced_short_op(OpRef::int_op(20))
             .unwrap();
         let pop = crate::optimizeopt::info::PreambleOp {
-            op: OpRef::int_op(20),
+            op: BoxRef::from_opref(OpRef::int_op(20)),
             invented_name: produced.invented_name,
             preamble_op: produced.preamble_op,
         };
@@ -6673,7 +6673,7 @@ mod tests {
         let b_tgt = ctx.get_box_replacement(OpRef::ref_op(14));
         ctx.make_equal_to(&b_src, &b_tgt);
         let pop = crate::optimizeopt::info::PreambleOp {
-            op: OpRef::ref_op(19),
+            op: b_src.clone(),
             invented_name: produced.invented_name,
             preamble_op: produced.preamble_op,
         };

@@ -1500,9 +1500,7 @@ impl Optimizer {
         if let Some(preamble_op) = tracked {
             // shortpreamble.py:434 `op = preamble_op.op.get_box_replacement()`
             // — the resolved Box itself is handed to the builder.
-            let resolved_for_pop = ctx
-                .get_box_replacement_box(preamble_op.op)
-                .unwrap_or_else(|| BoxRef::from_opref(preamble_op.op));
+            let resolved_for_pop = ctx.resolve_box_box(&preamble_op.op);
             if let Some(builder) = ctx.active_short_preamble_producer_mut() {
                 builder.add_preamble_op_from_pop(&preamble_op, resolved_for_pop);
             } else if let Some(builder) = ctx.imported_short_preamble_builder.as_mut() {
@@ -6182,7 +6180,7 @@ mod tests {
         ctx.set_potential_extra_op(
             OpRef::int_op(14),
             crate::optimizeopt::info::PreambleOp {
-                op: OpRef::int_op(14),
+                op: BoxRef::from_opref(OpRef::int_op(14)),
                 invented_name: false,
                 preamble_op: {
                     let mut op = majit_ir::Op::new(
