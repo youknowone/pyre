@@ -2499,7 +2499,12 @@ impl ClassDef {
                 // upstream: if attrdef.s_value != s_prev_value:
                 //     self.bookkeeper.update_attr(cdef, attrdef)
                 if s_new != s_prev {
-                    if let Some(bk) = cdef.borrow().bookkeeper.upgrade() {
+                    // Hoist the upgrade so the `cdef.borrow()` guard is
+                    // dropped before `update_attr` re-borrows the same
+                    // classdef mutably (an if-let scrutinee temporary
+                    // lives for the whole body).
+                    let bk = cdef.borrow().bookkeeper.upgrade();
+                    if let Some(bk) = bk {
                         bk.update_attr(&cdef, attr)?;
                     }
                 }
@@ -2534,7 +2539,9 @@ impl ClassDef {
                         s_ref.attrs.get(attr).unwrap().s_value.clone()
                     };
                     if s_new != s_prev {
-                        if let Some(bk) = subdef.borrow().bookkeeper.upgrade() {
+                        // Same borrow-hoist as the getmro arm above.
+                        let bk = subdef.borrow().bookkeeper.upgrade();
+                        if let Some(bk) = bk {
                             bk.update_attr(&subdef, attr)?;
                         }
                     }
