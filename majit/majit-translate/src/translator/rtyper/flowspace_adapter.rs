@@ -340,25 +340,13 @@ pub fn build_value_to_hlvalue_map(
                 OpKind::ConstRefNull => {
                     map.insert(
                         result,
-                        Hlvalue::Constant(Constant::with_concretetype(
-                            ConstValue::LLAddress(
-                                crate::translator::rtyper::lltypesystem::lltype::_address::Null,
-                            ),
-                            LowLevelType::Address,
-                        )),
+                        Hlvalue::Constant(const_ref_gcref_constant(None)),
                     );
                 }
                 OpKind::ConstRefAddr(addr) => {
                     map.insert(
                         result,
-                        Hlvalue::Constant(Constant::with_concretetype(
-                            ConstValue::LLAddress(
-                                crate::translator::rtyper::lltypesystem::lltype::_address::IntCast(
-                                    *addr,
-                                ),
-                            ),
-                            LowLevelType::Address,
-                        )),
+                        Hlvalue::Constant(const_ref_gcref_constant(Some(*addr))),
                     );
                 }
                 _ => {}
@@ -366,6 +354,32 @@ pub fn build_value_to_hlvalue_map(
         }
     }
     map
+}
+
+/// Fold a `ConstRefAddr` / `ConstRefNull` opkind to its constant.
+///
+/// Both opkinds carry a `PyObjectRef` (object-space singleton address
+/// from `static_addrs.refs`, or the `PY_NULL` null reference) — a GC
+/// reference in the walker's kind system.  The constant is a
+/// `GCREF`-typed `_ptr` (`Ptr(GcOpaque("GCREF"))`, the lltype of
+/// erased GC references) carrying the raw address as
+/// `_ptr_obj::IntCast`, so `SomePtr(GCREF)` annotation and `PtrRepr`
+/// rtyping give the slot its GcRef kind.  Folding to
+/// `LLAddress`/`Address` instead made every graph returning such a
+/// constant diverge at the dual-gate (`legacy=GcRef, real=Signed`):
+/// `llmemory.Address` is int-kinded.  `cast_int_to_ptr` is not usable
+/// here — it asserts odd (tagged) integers (lltype.py:2372-2377) and
+/// host addresses are even — so the `_ptr` is built directly.
+fn const_ref_gcref_constant(addr: Option<i64>) -> Constant {
+    use crate::translator::rtyper::lltypesystem::lltype::{GCREF, _ptr, _ptr_obj, LowLevelType};
+    let LowLevelType::Ptr(gcref_t) = GCREF.clone() else {
+        panic!("GCREF must be a Ptr lowleveltype");
+    };
+    let p = match addr {
+        None | Some(0) => _ptr::new(*gcref_t, Ok(None)),
+        Some(a) => _ptr::new_with_solid(*gcref_t, Ok(Some(_ptr_obj::IntCast(a))), true),
+    };
+    Constant::with_concretetype(ConstValue::LLPtr(Box::new(p)), GCREF.clone())
 }
 
 /// Look up the `Hlvalue` for a slot operand. Surfaces a
@@ -1700,16 +1714,10 @@ fn legacy_const_define_hlvalue(op: &SpaceOperation) -> Option<Hlvalue> {
             ConstValue::Float(*bits),
             LowLevelType::Float,
         ))),
-        OpKind::ConstRefNull => Some(Hlvalue::Constant(Constant::with_concretetype(
-            ConstValue::LLAddress(crate::translator::rtyper::lltypesystem::lltype::_address::Null),
-            LowLevelType::Address,
-        ))),
-        OpKind::ConstRefAddr(addr) => Some(Hlvalue::Constant(Constant::with_concretetype(
-            ConstValue::LLAddress(
-                crate::translator::rtyper::lltypesystem::lltype::_address::IntCast(*addr),
-            ),
-            LowLevelType::Address,
-        ))),
+        OpKind::ConstRefNull => Some(Hlvalue::Constant(const_ref_gcref_constant(None))),
+        OpKind::ConstRefAddr(addr) => {
+            Some(Hlvalue::Constant(const_ref_gcref_constant(Some(*addr))))
+        }
         // String-literal constant.  Upstream flowspace carries a string
         // literal as a bare `Constant('text')` SSA value (annotated
         // `SomeString` by `immutablevalue`); `front::mir` has no
