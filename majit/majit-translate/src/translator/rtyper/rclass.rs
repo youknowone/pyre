@@ -2408,21 +2408,83 @@ impl InstanceRepr {
             &Flags::default(),
         )?;
         // upstream rclass.py:752-769 — initialize instance attributes
-        // from their class-level defaults. Fieldless classes have only
-        // `__class__` in `allinstancefields`, so the body never runs.
-        for (name, (_mangled, r)) in self.allinstancefields().iter() {
-            if name == "__class__" {
-                continue;
+        // from their class-level defaults:
+        //
+        //     if self.classdef is not None:
+        //         flds = self.allinstancefields.keys()
+        //         flds.sort()
+        //         for fldname in flds:
+        //             if fldname == '__class__':
+        //                 continue
+        //             mangled_name, r = self.allinstancefields[fldname]
+        //             if r.lowleveltype is Void:
+        //                 continue
+        //             value = self.classdef.classdesc.read_attribute(fldname, None)
+        //             if value is not None:
+        //                 ll_value = r.convert_desc_or_const(value)
+        //                 # don't write NULL GC pointers: we know that the malloc
+        //                 # done above initialized at least the GC Ptr fields to
+        //                 # NULL already, and that's true for all our GCs
+        //                 if (isinstance(r.lowleveltype, Ptr) and
+        //                         r.lowleveltype.TO._gckind == 'gc' and
+        //                         not ll_value):
+        //                     continue
+        //                 cvalue = inputconst(r.lowleveltype, ll_value)
+        //                 self.setfield(vptr, fldname, cvalue, llops,
+        //                               flags={'access_directly': True})
+        if let Some(classdef) = &self.classdef {
+            let classdesc = classdef.borrow().classdesc.clone();
+            // upstream `flds.sort()` — deterministic field order.
+            let mut flds: Vec<(String, (String, Arc<dyn Repr>))> = self
+                .allinstancefields()
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            flds.sort_by(|a, b| a.0.cmp(&b.0));
+            for (fldname, (_mangled_name, r)) in &flds {
+                if fldname == "__class__" {
+                    continue;
+                }
+                if matches!(r.lowleveltype(), LowLevelType::Void) {
+                    continue;
+                }
+                let Some(value) =
+                    crate::annotator::classdesc::ClassDesc::read_attribute(&classdesc, fldname)
+                else {
+                    continue;
+                };
+                let entry = match value {
+                    crate::annotator::classdesc::ClassDictEntry::Constant(c) => {
+                        DescOrConst::Const(c)
+                    }
+                    crate::annotator::classdesc::ClassDictEntry::Desc(d) => DescOrConst::Desc(d),
+                };
+                let converted = r.convert_desc_or_const(&entry)?;
+                // upstream: don't write NULL GC pointers — malloc already
+                // zero-initialized the GC Ptr fields.
+                if let LowLevelType::Ptr(p) = r.lowleveltype()
+                    && p._gckind() == crate::translator::rtyper::lltypesystem::lltype::GcKind::Gc
+                    && matches!(
+                        &converted.value,
+                        ConstValue::LLPtr(llp) if matches!(llp._obj0, Ok(None))
+                    )
+                {
+                    continue;
+                }
+                // upstream `cvalue = inputconst(r.lowleveltype, ll_value)` —
+                // `convert_desc_or_const` already returned the Constant
+                // with `r.lowleveltype` stamped.
+                let mut flags = Flags::default();
+                flags.insert("access_directly".to_string(), ConstValue::Bool(true));
+                self.setfield(
+                    vptr.clone(),
+                    fldname,
+                    Hlvalue::Constant(converted),
+                    llops,
+                    false,
+                    &flags,
+                )?;
             }
-            // upstream `if r.lowleveltype is Void: continue` (the default
-            // is carried in the repr, no slot to write).
-            if matches!(r.lowleveltype(), LowLevelType::Void) {
-                continue;
-            }
-            return Err(TyperError::message(format!(
-                "InstanceRepr.new_instance: class-default initialisation for \
-                 non-Void field {name:?} (rclass.py:752-769) not yet ported",
-            )));
         }
         Ok(vptr)
     }
