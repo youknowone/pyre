@@ -1657,6 +1657,12 @@ pub struct PyreSym {
     /// unconditional `__context__ = ec.sys_exc_value` chaining that is
     /// valid only for a freshly constructed exception (w_context still
     /// null, self-cycle impossible).
+    ///
+    /// The entry is dropped as soon as freshness can no longer be proven:
+    /// `RAISE_VARARGS` consumes it (a re-raise of the same object must
+    /// take the residual path — its `w_context` is set by then), and
+    /// `box_value_for_python_helper` removes any value escaping into a
+    /// python-helper residual call (which may mutate the exception).
     pub(crate) trace_built_exc: majit_ir::VecAssoc<OpRef, pyre_object::PyObjectRef>,
     /// Symbolic mirror of executioncontext.current_exception/sys_exc_info.
     /// Used by PUSH_EXC_INFO / POP_EXCEPT to preserve nested handler state.
@@ -1979,7 +1985,15 @@ pub(crate) fn box_value_for_python_helper(
     match state.value_type(value) {
         Type::Int => wrapint(ctx, value),
         Type::Float => wrapfloat(ctx, value),
-        Type::Ref | Type::Void => value,
+        Type::Ref | Type::Void => {
+            // A trace-built exception escaping into a python-helper
+            // residual is no longer provably fresh (the callee may set
+            // `__context__` or other state); drop it so a later
+            // RAISE_VARARGS takes the residual path, whose runtime
+            // `attach_raise_cause` chaining is conditional.
+            state.sym_mut().trace_built_exc.remove(&value);
+            value
+        }
     }
 }
 

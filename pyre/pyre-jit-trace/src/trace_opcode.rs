@@ -9556,7 +9556,12 @@ impl OpcodeStepExecutor for MIFrame {
         // E1: a trace-built exception (`try_trace_exception_new`) leaves the
         // type-call result with concrete=Null; recover the fresh instance
         // recorded at construction so the raise takes the instance fast path.
-        let trace_built = self.sym().trace_built_exc.get(&exc_val.opref).copied();
+        // Consumed (not just read): after this raise the instance is no
+        // longer fresh — its `w_context` is stamped below — so a second
+        // raise of the same object must take the residual path, whose
+        // runtime `attach_raise_cause` keeps an existing `__context__`
+        // and avoids the self-cycle.
+        let trace_built = self.sym_mut().trace_built_exc.remove(&exc_val.opref);
         let exc = if exc.is_null() {
             trace_built.unwrap_or(exc)
         } else {
