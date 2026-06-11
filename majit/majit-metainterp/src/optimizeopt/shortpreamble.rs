@@ -1723,7 +1723,7 @@ struct AbstractShortPreambleBuilderState {
     short: Vec<majit_ir::OpRc>,
     short_results: VecSet<OpRef>,
     used_boxes: Vec<OpRef>,
-    short_preamble_jump: Vec<Op>,
+    short_preamble_jump: Vec<majit_ir::OpRc>,
     extra_same_as: Vec<Op>,
     short_inputargs: Vec<OpRef>,
     /// Known constant OpRefs. In RPython, isinstance(box, Const) is a type
@@ -1755,7 +1755,7 @@ impl AbstractShortPreambleBuilderState {
     fn record_imported_preamble_use(
         &mut self,
         op: crate::r#box::BoxRef,
-        replay_op: &Op,
+        replay_op: &majit_ir::OpRc,
         invented_name: bool,
         same_as_source: Option<crate::r#box::BoxRef>,
     ) {
@@ -2122,7 +2122,7 @@ impl ShortPreambleBuilder {
             .state
             .short_preamble_jump
             .iter()
-            .map(|op| BoxRef::from_opref(op.pos.get()))
+            .map(BoxRef::from_bound_op)
             .collect();
         result.push(Op::new(OpCode::Jump, &jump_args));
         result
@@ -2147,7 +2147,7 @@ impl ShortPreambleBuilder {
         &self.state.used_boxes
     }
 
-    pub fn short_preamble_jump(&self) -> &[Op] {
+    pub fn short_preamble_jump(&self) -> &[majit_ir::OpRc] {
         &self.state.short_preamble_jump
     }
 
@@ -2175,7 +2175,7 @@ pub struct ExtendedShortPreambleBuilder {
     /// Constants tracked for RPython isinstance(arg, Const) checks.
     known_constants: VecSet<OpRef>,
     extra_same_as: Vec<Op>,
-    short_preamble_jump: Vec<Op>,
+    short_preamble_jump: Vec<majit_ir::OpRc>,
     base_extra_same_as: Vec<Op>,
     label_args: Vec<OpRef>,
     used_boxes: Vec<OpRef>,
@@ -2507,7 +2507,7 @@ impl ExtendedShortPreambleBuilder {
             }
             self.label_args.push(op);
             self.short_jump_args.push(replay_op.pos.get());
-            self.short_preamble_jump.push((**replay_op).clone());
+            self.short_preamble_jump.push(replay_op.clone());
         }
     }
 
@@ -2538,8 +2538,7 @@ impl ExtendedShortPreambleBuilder {
         self.label_args.push(result.to_opref());
         self.used_boxes.push(current_result);
         self.short_jump_args.push(produced.preamble_op.pos.get());
-        self.short_preamble_jump
-            .push((*produced.preamble_op).clone());
+        self.short_preamble_jump.push(produced.preamble_op.clone());
     }
 
     pub fn add_preamble_op(&mut self, result: OpRef) -> bool {
