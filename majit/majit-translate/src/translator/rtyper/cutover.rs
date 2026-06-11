@@ -901,6 +901,26 @@ pub(crate) fn is_known_unported(msg: &str) -> bool {
         // threading misses a name in the predecessor link; the
         // annotator cannot merge `None` annotations.
         || msg.contains("inputarg lacks annotation")
+        // Unported `rtyper_makerepr` arms (`rmodel.rs:2895-2965`
+        // SomeList / SomeDict / SomeIterator / SomeByteArray /
+        // SomeObject) surface bare `MissingRTypeOperation` messages of
+        // the form "<Some*>.rtyper_makerepr — port rpython/rtyper/…"
+        // WITHOUT the trait helper's "unimplemented operation:" prefix
+        // (`rmodel.rs:817-822`), so the substring above does not
+        // absorb them.  Container reprs (rlist.py ListRepr, rdict.py
+        // DictRepr, rrange.py iterator reprs, …) are not ported yet;
+        // the legacy walker handles such graphs until each repr lands.
+        || msg.contains("rtyper_makerepr — port rpython/rtyper/")
+        // `BrokenReprTyperError` (`rmodel.py:42-44`, ported at
+        // `rmodel.rs:449-456`): a Repr whose `setup()` failed earlier
+        // is re-requested and refuses to half-initialize.  In the
+        // per-graph census a Skipped subject can leave a shared
+        // session `ClassRepr` in the BROKEN state; the next graph
+        // touching the same repr then surfaces this message.  It is a
+        // secondary echo of the root failure (itself Skip-classified
+        // above), not an independent cause — absorb it so one broken
+        // repr does not fatal every later graph in the session.
+        || msg.contains("cannot setup already failed Repr")
         // `AnnotatorError: immutablevalue(HostObject` is not
         // Skip-classified for `SyntheticTransparentCtor` (Ok/Err/Some/
         // None).  The adapter emits `HostObject::new_class(name, [])`
