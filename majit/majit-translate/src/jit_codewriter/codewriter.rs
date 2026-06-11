@@ -146,6 +146,10 @@ impl CodeWriter {
         // can project a struct's fields onto its classdef when the
         // real-rtyper seed path resolves a `Ref(type_root)` to a class.
         registry.set_pyre_struct_fields(std::rc::Rc::new(callcontrol.struct_fields().clone()));
+        // Trait → unique-impl owner map for the generic-receiver seed
+        // path (`derive_subject_inputcells` resolves a bound-trait
+        // `class_root` through it before the struct-root lookup).
+        registry.set_pyre_trait_unique_impls(callcontrol.trait_unique_impls().clone());
         // PyPy's `Bookkeeper.compute_at_fixpoint` raises through to
         // the caller (`bookkeeper.py:108-127`); pyre's dual-gate
         // mirrors that propagation by routing the populate `TyperError`

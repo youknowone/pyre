@@ -302,6 +302,16 @@ pub struct Bookkeeper {
     /// where `t` is the already-resolved class object.  Used by
     /// [`Self::getuniqueclassdef_for_struct_root`].
     pub pyre_struct_root_classes: RefCell<HashMap<String, HostObject>>,
+    /// TODO: no upstream equivalent.  Trait leaf → owner root of its
+    /// only concrete impl in the analyzed LLBC world (computed in
+    /// `lib.rs` from `concrete_trait_methods`; multi-impl traits are
+    /// absent).  `derive_subject_inputcells` consults this when a `Ref`
+    /// parameter's `class_root` is a trait leaf (generic receiver) —
+    /// the unique impl's struct root then seeds the receiver's
+    /// `ClassDef` through [`Self::getuniqueclassdef_for_struct_root`].
+    /// RPython's annotator never needs this: it sees the concrete
+    /// receiver class at every call site (`classdesc.py:749 lookup`).
+    pub pyre_trait_unique_impls: RefCell<HashMap<String, String>>,
 }
 
 impl std::fmt::Debug for Bookkeeper {
@@ -475,6 +485,7 @@ impl Bookkeeper {
             needs_generic_instantiate: RefCell::new(std::collections::BTreeMap::new()),
             pyre_struct_fields: RefCell::new(None),
             pyre_struct_root_classes: RefCell::new(HashMap::new()),
+            pyre_trait_unique_impls: RefCell::new(HashMap::new()),
         }
     }
 
@@ -491,6 +502,14 @@ impl Bookkeeper {
     /// overwrites the previous registry.
     pub fn set_pyre_struct_fields(&self, registry: Rc<crate::front::StructFieldRegistry>) {
         *self.pyre_struct_fields.borrow_mut() = Some(registry);
+    }
+
+    /// TODO: no upstream equivalent.  Wire the trait →
+    /// unique-concrete-impl-owner map (see
+    /// [`Self::pyre_trait_unique_impls`]).  Idempotent: a second call
+    /// overwrites the previous map.
+    pub fn set_pyre_trait_unique_impls(&self, map: HashMap<String, String>) {
+        *self.pyre_trait_unique_impls.borrow_mut() = map;
     }
 
     /// TODO: no upstream equivalent.  The full set of struct type-root

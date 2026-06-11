@@ -978,6 +978,36 @@ fn analyze_pipeline_from_module_paths(
             .entry((trait_leaf.clone(), method_name.clone()))
             .or_insert(0) += 1;
     }
+    // Trait → owner of its only concrete impl, for the dual-gate
+    // bookkeeper's generic-receiver classdef seeding
+    // (`derive_subject_inputcells` resolves a bound-trait `class_root`
+    // through this map).  Unlike the direct-path registration below,
+    // this is annotation-only metadata — it pulls no graph bodies into
+    // callers.
+    let mut trait_impl_owners: std::collections::HashMap<
+        String,
+        std::collections::BTreeSet<String>,
+    > = std::collections::HashMap::new();
+    for (trait_leaf, _, owner, _, _) in &concrete_trait_methods {
+        trait_impl_owners
+            .entry(trait_leaf.clone())
+            .or_default()
+            .insert(owner.clone());
+    }
+    let trait_unique_impls: std::collections::HashMap<String, String> = trait_impl_owners
+        .into_iter()
+        .filter_map(|(trait_leaf, owners)| {
+            (owners.len() == 1).then(|| {
+                let owner = owners.into_iter().next().unwrap();
+                // `self_ty_root` may be module-qualified
+                // (`pyframe::PyFrame`); the struct-field registry and
+                // `getuniqueclassdef_for_struct_root` key on the leaf.
+                let leaf = owner.rsplit("::").next().unwrap_or(&owner).to_string();
+                (trait_leaf, leaf)
+            })
+        })
+        .collect();
+    call_control.set_trait_unique_impls(trait_unique_impls);
     for (trait_leaf, method_name, owner, return_type, hints) in &concrete_trait_methods {
         let key = (trait_leaf.clone(), method_name.clone());
         if concrete_impl_counts.get(&key) != Some(&1) || default_trait_methods.contains(&key) {

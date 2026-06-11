@@ -28,6 +28,15 @@ pub struct FunDecl {
     pub def_id: u64,
     pub item_meta: ItemMeta,
     pub signature: Signature,
+    /// Generic-parameter context of the declaration: `types` lists the
+    /// type params (`{"index": N, "name": "H"|"Self"}`) and
+    /// `trait_clauses` their bounds
+    /// (`trait_.skip_binder.{id, generics.types[0]}` = bound trait id +
+    /// subject TypeVar).  Kept as raw `Value`; only
+    /// `front::mir::tyref_generic_trait_bound_root` projects it, to map
+    /// a `&T`-where-`T: Trait` parameter to its bound trait's name leaf.
+    #[serde(default)]
+    pub generics: Option<Value>,
     /// Charon stamps this with the `GlobalDecl` id when the function
     /// is a compiler-synthesised static / const initialiser body
     /// (e.g. the body that constructs `static NONE_SINGLETON`'s

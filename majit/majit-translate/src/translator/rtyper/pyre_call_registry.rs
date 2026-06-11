@@ -219,6 +219,15 @@ impl PyreCallRegistry {
         self.bookkeeper.set_pyre_struct_fields(registry);
     }
 
+    /// Thread the trait → unique-concrete-impl-owner map into the
+    /// shared bookkeeper so `derive_subject_inputcells` can resolve a
+    /// generic receiver's bound-trait `class_root` to the impl type's
+    /// `ClassDef`.  Called once from `dual_gate_registry` with
+    /// `CallControl::trait_unique_impls().clone()`.
+    pub fn set_pyre_trait_unique_impls(&self, map: HashMap<String, String>) {
+        self.bookkeeper.set_pyre_trait_unique_impls(map);
+    }
+
     /// Get-or-construct the shared `(annotator, rtyper)` pair.
     ///
     /// First call constructs both from `self.bookkeeper`; subsequent

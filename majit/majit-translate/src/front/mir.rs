@@ -681,7 +681,7 @@ pub fn lower_fun_decl_with_static_addrs(
     // flag-off — unless `PYRE_MIR_FRAMESTATE_STRICT` is set, which
     // propagates the error for debugging.
     if std::env::var_os("PYRE_MIR_FRAMESTATE").is_some() {
-        let mut lo = Lowering::new(llbc, name.clone(), &u, static_addrs)?;
+        let mut lo = Lowering::new(llbc, name.clone(), &u, static_addrs, fd.generics.as_ref())?;
         if lo.mir_model_is_acyclic() {
             match lo.lower_framestate() {
                 Ok(()) => return Ok(lo.graph),
@@ -693,7 +693,7 @@ pub fn lower_fun_decl_with_static_addrs(
             }
         }
     }
-    let mut lo = Lowering::new(llbc, name.clone(), &u, static_addrs)?;
+    let mut lo = Lowering::new(llbc, name.clone(), &u, static_addrs, fd.generics.as_ref())?;
     match lo.lower(BlockOrder::Linear) {
         Ok(()) => Ok(lo.graph),
         // A forward-referenced definition — typically a `TermKind::Call`
@@ -706,7 +706,7 @@ pub fn lower_fun_decl_with_static_addrs(
         // (`classify_uninitialised_local_rpo_vs_loop_carried`: 0
         // loop-carried, so no phi / block-inputarg threading is needed).
         Err(LowerError::Unsupported(msg)) if is_known_lowering_gap(&msg) => {
-            let mut lo = Lowering::new(llbc, name, &u, static_addrs)?;
+            let mut lo = Lowering::new(llbc, name, &u, static_addrs, fd.generics.as_ref())?;
             lo.lower(BlockOrder::ReversePostorder)?;
             Ok(lo.graph)
         }
@@ -818,6 +818,7 @@ impl<'a> Lowering<'a> {
         name: String,
         body: &'a Unstructured,
         static_addrs: crate::HostStaticAddrs<'a>,
+        generics: Option<&serde_json::Value>,
     ) -> Result<Self, LowerError> {
         let mut graph = FunctionGraph::new(name);
         let n_locals = body.locals.locals.len();
@@ -853,9 +854,14 @@ impl<'a> Lowering<'a> {
             let ty = tyref_to_value_type(&local.ty, llbc);
             // `class_root` carries the param's named-ADT leaf so
             // `derive_subject_inputcells` can seed the receiver's
-            // `ClassDef`; only `Ref`-typed params consume it there.
+            // `ClassDef`; only `Ref`-typed params consume it there.  A
+            // generic param (`&T` where `T: Trait`, incl. trait default
+            // bodies' `&Self`) has no ADT leaf — carry the bound
+            // trait's leaf instead, which the adapter resolves through
+            // the unique-impl map (`pyre_trait_unique_impls`).
             let class_root = match &ty {
-                ValueType::Ref(_) => tyref_class_root(&local.ty, llbc),
+                ValueType::Ref(_) => tyref_class_root(&local.ty, llbc)
+                    .or_else(|| tyref_generic_trait_bound_root(&local.ty, llbc, generics)),
                 _ => None,
             };
             input_ops.push(SpaceOperation {
@@ -4094,11 +4100,35 @@ fn tyref_to_attr_value_type(ty: &TyRef, llbc: &Llbc) -> ValueType {
 ///     a generic decl carry unresolved type-variable field strings, so
 ///     a seeded classdef would project bogus attr shells.
 fn tyref_class_root(ty: &TyRef, llbc: &Llbc) -> Option<String> {
-    let mut node = match ty {
+    let node = match ty {
         TyRef::Inline { value: (_, v) } => v,
         TyRef::Other(v) => v,
         TyRef::Dedup { id } => llbc.dedup_body(*id)?,
     };
+    let obj = strip_ty_wrappers(node, llbc)?.as_object()?;
+    let adt = obj.get("Adt")?.as_object()?;
+    let def_id = adt.get("id")?.as_object()?.get("Adt")?.as_u64()?;
+    let has_type_args = adt
+        .get("generics")
+        .and_then(|g| g.as_object())
+        .and_then(|g| g.get("types"))
+        .and_then(|t| t.as_array())
+        .is_some_and(|t| !t.is_empty());
+    if has_type_args {
+        return None;
+    }
+    let name = llbc.type_by_id(def_id)?.item_meta.name_path();
+    Some(name.rsplit("::").next().unwrap_or(&name).to_string())
+}
+
+/// Strip the indirection wrappers a Charon type node can carry —
+/// `{"Deduplicated": id}` / `{"HashConsedValue": [id, ty]}` /
+/// `{"Ref": [region, ty, kind]}` — and return the underlying type node
+/// (`Adt`, `TypeVar`, `Literal`, …).
+fn strip_ty_wrappers<'l>(
+    mut node: &'l serde_json::Value,
+    llbc: &'l Llbc,
+) -> Option<&'l serde_json::Value> {
     for _ in 0..24 {
         let obj = node.as_object()?;
         if let Some(id) = obj.get("Deduplicated").and_then(serde_json::Value::as_u64) {
@@ -4113,23 +4143,81 @@ fn tyref_class_root(ty: &TyRef, llbc: &Llbc) -> Option<String> {
             node = &arr[1];
             continue;
         }
-        // `{"Ref": [region, ty, kind]}` — strip the reference.
         if let Some(arr) = obj.get("Ref").and_then(serde_json::Value::as_array) {
             node = arr.get(1)?;
             continue;
         }
-        let adt = obj.get("Adt")?.as_object()?;
-        let def_id = adt.get("id")?.as_object()?.get("Adt")?.as_u64()?;
-        let has_type_args = adt
+        return Some(node);
+    }
+    None
+}
+
+/// De Bruijn *index* of a `{"TypeVar": {"Bound": [depth, index]}}` node.
+/// The binder depth differs between a parameter-type position and a
+/// trait-clause subject position (the clause subject sits one binder
+/// deeper), so only the index participates in matching the two.
+fn typevar_bound_index(node: &serde_json::Value) -> Option<u64> {
+    node.get("TypeVar")?
+        .get("Bound")?
+        .as_array()?
+        .get(1)?
+        .as_u64()
+}
+
+/// Resolve a generic parameter type (`&T` where `T: Trait`, including a
+/// trait default body's `&Self`) to the bound trait's name leaf.
+///
+/// [`tyref_class_root`] answers `None` for such a parameter — a
+/// `TypeVar` has no ADT decl — so `OpKind::Input.class_root` stayed
+/// empty and the subject graph annotated the receiver as the
+/// classdef-less `SomeInstance(None)` shell, which fails on the first
+/// `getattr`.  The bound trait names the receiver's only possible shape
+/// when the analyzed world has exactly one concrete impl;
+/// `derive_subject_inputcells` resolves the returned trait leaf through
+/// `Bookkeeper::pyre_trait_unique_impls` and only seeds a classdef on a
+/// unique hit, so carrying a multi-impl (or foreign) trait leaf here is
+/// inert.
+///
+/// Bounds declared in `core`/`std`/`alloc` (`MetaSized`, `Sized`, …)
+/// are skipped: marker/stdlib traits never name a project struct, and
+/// they precede the user bound in `trait_clauses` order.
+fn tyref_generic_trait_bound_root(
+    ty: &TyRef,
+    llbc: &Llbc,
+    generics: Option<&serde_json::Value>,
+) -> Option<String> {
+    let generics = generics?;
+    let node = match ty {
+        TyRef::Inline { value: (_, v) } => v,
+        TyRef::Other(v) => v,
+        TyRef::Dedup { id } => llbc.dedup_body(*id)?,
+    };
+    let param_index = typevar_bound_index(strip_ty_wrappers(node, llbc)?)?;
+    for clause in generics.get("trait_clauses")?.as_array()? {
+        let Some(pred) = clause.get("trait_").and_then(|t| t.get("skip_binder")) else {
+            continue;
+        };
+        let subject_index = pred
             .get("generics")
-            .and_then(|g| g.as_object())
             .and_then(|g| g.get("types"))
-            .and_then(|t| t.as_array())
-            .is_some_and(|t| !t.is_empty());
-        if has_type_args {
-            return None;
+            .and_then(serde_json::Value::as_array)
+            .and_then(|t| t.first())
+            .and_then(|s| strip_ty_wrappers(s, llbc))
+            .and_then(typevar_bound_index);
+        if subject_index != Some(param_index) {
+            continue;
         }
-        let name = llbc.type_by_id(def_id)?.item_meta.name_path();
+        let Some(trait_id) = pred.get("id").and_then(serde_json::Value::as_u64) else {
+            continue;
+        };
+        let Some(td) = llbc.trait_by_id(trait_id) else {
+            continue;
+        };
+        let name = td.item_meta.name_path();
+        let crate_root = name.split("::").next().unwrap_or(&name);
+        if matches!(crate_root, "core" | "std" | "alloc") {
+            continue;
+        }
         return Some(name.rsplit("::").next().unwrap_or(&name).to_string());
     }
     None

@@ -768,6 +768,19 @@ pub struct CallControl {
     /// Equivalent to `op.args[0].concretetype.TO` in RPython's rtyped graph.
     struct_fields: crate::front::StructFieldRegistry,
 
+    /// Trait leaf → owner root of its only concrete impl in the
+    /// analyzed LLBC world (traits with two or more impl owners are
+    /// absent).  Computed in `lib.rs` from `concrete_trait_methods` and
+    /// forwarded to the dual-gate bookkeeper
+    /// (`Bookkeeper::pyre_trait_unique_impls`) so
+    /// `derive_subject_inputcells` can resolve a generic receiver's
+    /// bound-trait `class_root` to the impl type's `ClassDef`.
+    /// RPython has no analogue: its annotator sees the concrete
+    /// receiver class at every call site (`classdesc.py:749 lookup`),
+    /// while a subject graph annotated standalone only knows the
+    /// trait bound.
+    trait_unique_impls: HashMap<String, String>,
+
     /// RPython: `symbolic.get_array_token(ARRAY, tsc)[0]` — array base size.
     /// Offset from the array object pointer to the first element.
     /// RPython GcArray layout: `[length (WORD)] [items...]`, so
@@ -1129,6 +1142,7 @@ impl CallControl {
             descr_indices: DescrIndexRegistry::default(),
             known_struct_names: HashSet::new(),
             struct_fields: crate::front::StructFieldRegistry::default(),
+            trait_unique_impls: HashMap::new(),
             // RPython: symbolic.get_array_token(GcArray(T))[0] = carray.items.offset
             // = sizeof(Signed) = WORD. Standard GcArray has a length field before items.
             //
@@ -1198,6 +1212,18 @@ impl CallControl {
     /// project a struct's fields onto its classdef.
     pub fn struct_fields(&self) -> &crate::front::StructFieldRegistry {
         &self.struct_fields
+    }
+
+    /// Register the trait → unique-concrete-impl-owner map (see the
+    /// `trait_unique_impls` field doc).
+    pub fn set_trait_unique_impls(&mut self, map: HashMap<String, String>) {
+        self.trait_unique_impls = map;
+    }
+
+    /// Trait leaf → unique impl owner root, threaded into the dual-gate
+    /// bookkeeper alongside [`Self::struct_fields`].
+    pub fn trait_unique_impls(&self) -> &HashMap<String, String> {
+        &self.trait_unique_impls
     }
 
     /// RPython: isinstance(TYPE, lltype.Struct) check.
