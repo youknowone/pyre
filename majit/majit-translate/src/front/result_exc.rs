@@ -67,9 +67,9 @@ use crate::flowspace::model::Variable;
 use crate::model::{CallTarget, ExitSwitch, FunctionGraph, Link, LinkArg, OpKind, ValueType};
 
 /// Callees whose `Result<T, PyError>` surface lowers to raise links.
-/// Grown deliberately (same staging discipline as
-/// `REQUIRED_METHOD_DEVIRT_SCOPE` in `lib.rs`); replaced by a
-/// whole-program conformance scan once every caller shape is covered.
+/// Grown deliberately, one fail-loud pipeline convergence at a time;
+/// replaced by a whole-program conformance scan once every caller
+/// shape is covered.
 const RESULT_EXC_LOWERING_SCOPE: &[&str] = &[
     "pop_value",
     "store_local_value",
