@@ -752,7 +752,10 @@ pub fn lower_fun_decl_with_static_addrs(
     }
     let mut lo = Lowering::new(llbc, name.clone(), &u, static_addrs, fd.generics.as_ref())?;
     match lo.lower(BlockOrder::Linear) {
-        Ok(()) => Ok(lo.graph),
+        Ok(()) => {
+            simplify_lowered_graph(&mut lo.graph);
+            Ok(lo.graph)
+        }
         // A forward-referenced definition — typically a `TermKind::Call`
         // dest at a higher MIR index than the block that reads it — reads
         // as an uninitialised local under MIR-index order.  Re-lower the
@@ -765,9 +768,37 @@ pub fn lower_fun_decl_with_static_addrs(
         Err(LowerError::Unsupported(msg)) if is_known_lowering_gap(&msg) => {
             let mut lo = Lowering::new(llbc, name, &u, static_addrs, fd.generics.as_ref())?;
             lo.lower(BlockOrder::ReversePostorder)?;
+            simplify_lowered_graph(&mut lo.graph);
             Ok(lo.graph)
         }
         Err(e) => Err(e),
+    }
+}
+
+/// Per-graph simplification after lowering — the model-layer slice of
+/// RPython `simplify_graph(graph)` (`simplify.py:1075-1081`), which
+/// upstream runs on every freshly built flow graph.  Only the passes
+/// the Abort → `RaiseImplicit` fold needs are wired:
+///
+/// - `eliminate_empty_blocks` (simplify.py:52-69) collapses the empty
+///   raise block between a discriminant switch's `else
+///   unreachable!()` exit and `exceptblock`, exposing the
+///   `[Constant(AssertionError), …]` link to the next pass.
+/// - `remove_assertion_errors` (simplify.py:321-346) prunes the
+///   shouldn't-occur branch and promotes the surviving exit to an
+///   unconditional link.
+/// - `prune_dead_phis` (`transform_dead_op_vars`, simplify.py:422-524)
+///   melts the now-dead condition ops — the `__discriminant`
+///   FieldRead feeding the dropped exitswitch
+///   (`removeassert.py:35-37` "now melt away the (hopefully) dead
+///   operation that compute the condition").  Upstream leaves this to
+///   the later backendopt sweep (`backendopt/all.py`); the model
+///   layer has no later sweep, so it runs here, gated on an actual
+///   removal to keep untouched graphs byte-identical.
+fn simplify_lowered_graph(graph: &mut FunctionGraph) {
+    crate::model::eliminate_empty_blocks(graph);
+    if crate::model::remove_assertion_errors(graph) > 0 {
+        crate::model::prune_dead_phis(graph);
     }
 }
 
@@ -2865,6 +2896,25 @@ impl<'a> Lowering<'a> {
                 self.graph.set_return(bb_id, Some(ret));
                 Ok(())
             }
+            TermKind::Abort(_) => {
+                // A Rust panic-abort (`unreachable!()`, `panic!`,
+                // failed `unwrap`).  Python-level exceptions never
+                // reach here — they ride the `Result<_, PyError>`
+                // Switch/Return edges as ordinary control flow — so
+                // an Abort marks a "shouldn't occur at run-time"
+                // path, exactly the implicit-exception raise of
+                // `RaiseImplicit.nomoreblocks`
+                // (`flowcontext.py:1271-1284`).  Closing the block
+                // with `[Constant(AssertionError),
+                // Constant(AssertionError(msg))]` lets
+                // `remove_assertion_errors` (simplify.py:321-346)
+                // prune the branch — e.g. the `else unreachable!()`
+                // arm of a per-variant `let Instruction::X {..} =`
+                // re-match folds away together with its discriminant
+                // switch.
+                self.graph.set_raise_implicit(bb_id, "AssertionError");
+                Ok(())
+            }
             TermKind::UnwindResume => {
                 // Unwind-table cleanup resume.  Its only inbound edges
                 // are `on_unwind` edges, all of which this lowering
@@ -2875,28 +2925,6 @@ impl<'a> Lowering<'a> {
                 // ride the `Result<_, PyError>` Switch/Return edges as
                 // ordinary control flow.
                 self.graph.set_raise(bb_id, "mir-unwind");
-                Ok(())
-            }
-            TermKind::Abort(_) => {
-                // A panic site reached by ordinary control flow
-                // (explicit `panic!` / `unreachable!` / a diverging
-                // match arm), not unwind cleanup.  The RPython
-                // analogue of a host-level invariant failure is an
-                // `assert` raise, so lower the canonical
-                // `exc_from_raise` op sequence
-                // (`op.simple_call(const(AssertionError))` +
-                // `op.type(evalue)`) and close the block with the
-                // `(etype, evalue)` exception Link.  Message operands
-                // are not threaded through: the MIR panic payload is a
-                // host-formatting call chain with no Python-level
-                // meaning, matching the bare-`panic!()` shape of
-                // `lower_exc_from_raise`.
-                crate::front::raise::lower_exc_from_raise(
-                    &mut self.graph,
-                    bb_id,
-                    "AssertionError",
-                    vec![],
-                );
                 Ok(())
             }
             TermKind::Goto { target } => {
