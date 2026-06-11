@@ -294,7 +294,12 @@ pub fn compute_subclass_ranges_from(
 /// values for the object subtree (harmless redundancy).
 static SUBCLASS_RANGES_INIT: OnceLock<()> = OnceLock::new();
 
-pub fn ensure_object_subclass_ranges_initialized() {
+// `dont_look_inside`: one-time host initialization (`OnceLock` +
+// global type-table walk) stays opaque to the JIT — production
+// entry points have run the full init before any trace executes,
+// so the residual call is a no-op there.
+#[majit_macros::dont_look_inside]
+pub extern "C" fn ensure_object_subclass_ranges_initialized() {
     SUBCLASS_RANGES_INIT.get_or_init(|| {
         compute_subclass_ranges_from(&[all_foreign_pytypes()], &[&INSTANCE_TYPE]);
     });

@@ -476,6 +476,12 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_object::jit_range_iter_new",
         pyre_object::jit_range_iter_new as *const (),
     );
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::pyobject::ensure_object_subclass_ranges_initialized",
+        "pyre_object::ensure_object_subclass_ranges_initialized",
+        pyre_object::pyobject::ensure_object_subclass_ranges_initialized as *const (),
+    );
 
     // `@jit.elidable`-decorated inherent methods that show up as
     // `residual_call_*` in the codewriter (`call.py:181-187

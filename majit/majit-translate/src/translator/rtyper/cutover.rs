@@ -873,6 +873,40 @@ pub(crate) fn populate_call_registry_from_call_graphs(
         if !lifted.insert(entry_ptr) {
             continue;
         }
+        // `@jit.dont_look_inside` (`rlib/jit.py:142`) callees: the JIT
+        // pipeline never builds a jitcode for the body
+        // (`policy.py:48-84 look_inside_graph` returns False, so
+        // `codewriter.py find_all_graphs` excludes the graph and the
+        // callsite residualizes).  Pyre's annotator exists solely to
+        // feed that jitcode pipeline, so lifting the body here is
+        // upstream-dead work — and bodies marked opaque are typically
+        // unliftable host plumbing (`OnceLock` init walks etc.) whose
+        // lift failure would poison every caller.  Prefill the same
+        // signature-only stub pygraph `register_unsafe_fn_stubs` uses
+        // (the `ExtRegistryEntry.compute_result_annotation` shape) so
+        // callers annotate the declared unit/bool result and the
+        // codewriter emits the residual call via the fn's registered
+        // C ABI address (`pyre/jit_fnaddr.rs`).  Non-unit/bool returns
+        // fall through to the normal lift — no current marker needs
+        // them, and the stub builder's scalar coverage is unaudited
+        // for that case.
+        if graph.hints.iter().any(|h| h == "dont_look_inside") {
+            let return_lltype = match graph.return_type.as_deref() {
+                None | Some("()") => Some(LowLevelType::Void),
+                Some("bool") => Some(LowLevelType::Bool),
+                _ => None,
+            };
+            if let Some(return_lltype) = return_lltype
+                && let Some(stub) = build_stub_pygraph_for_unsafe_fn(
+                    graph.name.clone(),
+                    signature_for_graph(graph),
+                    return_lltype,
+                )
+            {
+                entry.prefill_default_cache(stub);
+                continue;
+            }
+        }
         match lift_callee_to_pygraph(graph, signature_for_graph(graph), registry) {
             Ok(pygraph) => entry.prefill_default_cache(pygraph),
             Err(e) => {
