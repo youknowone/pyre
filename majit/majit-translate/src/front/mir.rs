@@ -3370,6 +3370,16 @@ impl<'a> Lowering<'a> {
                 // `unaryop.rs:3587` (lib test
                 // `generic_handler_graphs_keep_symbolic_fnaddr_surface`).
                 let (segments, method_hint) = self.call_target_segments(mir_bb, &reg)?;
+                if self.try_lower_checked_neg(
+                    mir_bb,
+                    &segments,
+                    &args,
+                    dest_local,
+                    &call.dest.ty,
+                    target,
+                )? {
+                    return Ok(());
+                }
                 if let Some(field_read) = self.oparg_from_field_read(&reg.kind, &segments, &args) {
                     field_read
                 } else {
@@ -3993,6 +4003,126 @@ impl<'a> Lowering<'a> {
             TyRef::Inline { value: (_, v) } | TyRef::Other(v) => inline_adt_def_id(v),
             TyRef::Dedup { id } => self.llbc.dedup_to_adt_def_id(*id),
         }
+    }
+
+    /// Lower `i64::checked_neg()` (`core::num::<Impl>::checked_neg` —
+    /// core fn bodies are Opaque in the LLBC, so the `Call` form is
+    /// permanently unliftable) to a decomposed ovfcheck shape.
+    /// Upstream `translator/simplify.py:70-108 transform_ovfcheck`
+    /// rewrites `ovfcheck(-x)` into the op's `_ovf` variant
+    /// (`flowspace/operation.py:195-200 ovfchecked`, registered by
+    /// `operation.py:466 add_operator('neg', ..., ovf=True)`), whose
+    /// OverflowError edge the caller branches on.  Rust spells that
+    /// ovfcheck as `checked_neg()` + a `Some`/`None` match, so the
+    /// equivalent decomposition writes the destination `Option<i64>`
+    /// as a synthetic aggregate (the same transparent-ctor +
+    /// `FieldWrite` chain `Rvalue::Aggregate` emits):
+    /// `__discriminant = ne(v, i64::MIN)` — negation overflows only
+    /// at `i64::MIN`, and `Option`'s `None`/`Some` tags are 0/1 — and
+    /// payload `__pos_0 = neg(v)` (wrapping; the `None` arm never
+    /// reads it).  The downstream discriminant switch and payload
+    /// downcast then lower through the ordinary enum FieldRead paths.
+    /// Returns `Ok(false)` when the call is not `checked_neg` (or the
+    /// destination's `Option` decl cannot be resolved) so the generic
+    /// `Call` lowering proceeds.
+    fn try_lower_checked_neg(
+        &mut self,
+        mir_bb: usize,
+        segments: &[String],
+        args: &[Variable],
+        dest_local: usize,
+        dest_ty: &TyRef,
+        target: usize,
+    ) -> Result<bool, LowerError> {
+        let [first, .., module, impl_seg, leaf] = segments else {
+            return Ok(false);
+        };
+        if first.as_str() != "core"
+            || module.as_str() != "num"
+            || impl_seg.as_str() != "<Impl>"
+            || leaf.as_str() != "checked_neg"
+        {
+            return Ok(false);
+        }
+        let [arg] = args else {
+            return Ok(false);
+        };
+        // Resolve the destination `Option` decl so the FieldWrite owner
+        // matches what `resolve_aggregate_adt` would record for a real
+        // `Some(..)` construction site of the same type.
+        let Some(def_id) = self.tyref_adt_def_id(dest_ty) else {
+            return Ok(false);
+        };
+        let Some(td) = self.llbc.type_by_id(def_id) else {
+            return Ok(false);
+        };
+        // Same owner-path / ctor-leaf split `resolve_aggregate_adt`
+        // performs, so the ctor target and FieldWrite owner carry the
+        // spellings the rest of the aggregate machinery expects.
+        let owner = td.item_meta.name_path();
+        let mut owner_path: Vec<String> = owner.split("::").map(str::to_string).collect();
+        let ctor_name = owner_path.pop().unwrap_or_default();
+        let arg = arg.clone();
+        let bb_id = self.block_id[mir_bb];
+
+        let mut push_op = |graph: &mut FunctionGraph, kind: OpKind| {
+            let res = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+            graph.block_mut(bb_id).operations.push(SpaceOperation {
+                result: Some(res.clone()),
+                kind,
+            });
+            res
+        };
+        let payload = push_op(
+            &mut self.graph,
+            OpKind::UnaryOp {
+                op: "neg".to_string(),
+                operand: arg.clone(),
+                result_ty: ValueType::Int,
+            },
+        );
+        let min = push_op(&mut self.graph, OpKind::ConstInt(i64::MIN));
+        let disc = push_op(
+            &mut self.graph,
+            OpKind::BinOp {
+                op: "ne".to_string(),
+                lhs: arg,
+                rhs: min,
+                result_ty: ValueType::Int,
+            },
+        );
+        let ctor_target = if owner_path.is_empty() {
+            CallTarget::synthetic_transparent_ctor(ctor_name.clone())
+        } else {
+            CallTarget::synthetic_transparent_ctor_with_owner(owner_path, ctor_name)
+        };
+        let res = push_op(
+            &mut self.graph,
+            OpKind::Call {
+                target: ctor_target,
+                args: Vec::new(),
+                result_ty: ValueType::Ref(Some(owner.to_string())),
+            },
+        );
+        for (name, value) in [("__discriminant", disc), ("__pos_0", payload)] {
+            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                result: None,
+                kind: OpKind::FieldWrite {
+                    base: res.clone(),
+                    field: crate::model::FieldDescriptor {
+                        name: name.to_string(),
+                        owner_root: Some(owner.to_string()),
+                    },
+                    value,
+                    ty: ValueType::Ref(None),
+                },
+            });
+        }
+        self.local_var[dest_local] = Some(res);
+        let target_bb = self.block_id[target];
+        let link_args = self.edge_args(mir_bb, target)?;
+        self.graph.set_goto(bb_id, target_bb, link_args);
+        Ok(true)
     }
 
     fn lower_switch(
