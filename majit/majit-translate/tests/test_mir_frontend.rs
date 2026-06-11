@@ -192,8 +192,8 @@ fn lowers_tuple_roundtrip_with_symmetric_positional_field_reads() {
     assert_eq!(
         field_writes,
         vec![
-            ("__pos_0".to_string(), Some("Adt".to_string())),
-            ("__pos_1".to_string(), Some("Adt".to_string())),
+            ("__pos_0".to_string(), Some("Tuple".to_string())),
+            ("__pos_1".to_string(), Some("Tuple".to_string())),
         ],
         "tuple construction must emit a __pos_0 / __pos_1 FieldWrite chain"
     );
@@ -205,8 +205,8 @@ fn lowers_tuple_roundtrip_with_symmetric_positional_field_reads() {
     assert_eq!(
         field_reads,
         vec![
-            ("__pos_0".to_string(), Some("Adt".to_string())),
-            ("__pos_1".to_string(), Some("Adt".to_string())),
+            ("__pos_0".to_string(), Some("Tuple".to_string())),
+            ("__pos_1".to_string(), Some("Tuple".to_string())),
         ],
         "tuple reads must emit __pos_0 / __pos_1 FieldReads (owner_root \
          matching the FieldWrite chain) and *Checked .0 reads must collapse"

@@ -1410,22 +1410,23 @@ pub fn translate_op(
                     // interned: a bare variant name like `Ok` is ambiguous
                     // across enums, so interning it would conflate distinct
                     // classes onto one `ClassDesc`.  Exception: the fixed
-                    // aggregate-kind placeholder tags (`Adt` for tuples /
-                    // unresolved ADTs, `Array`, `Closure` — see
-                    // `front::mir::aggregate_ctor_name`) are not variant
-                    // names, and the construction-side FieldWrite chain
-                    // shares the same tag as `owner_root` with the
-                    // field-projection side (which resolves it through
-                    // `getuniqueclassdef_for_struct_root` →
-                    // `intern_class_by_qualname`).  Minting a fresh Arc
-                    // per site here splits the placeholder into one
-                    // `ClassDef` per occurrence, so the value's classdef
-                    // can never match the field repr's interned classdef
-                    // (rtyper convert_from_to has no common base → typer
-                    // error).
+                    // aggregate-kind placeholder tags named by id atom
+                    // (`Tuple` for tuples / unresolved ADTs, `Array`,
+                    // `Closure` — see `front::mir::aggregate_ctor_name`) are
+                    // not variant names; they name ONE universal placeholder
+                    // each (no enum ambiguity), and the construction-side
+                    // FieldWrite chain shares the same tag as `owner_root`
+                    // with the field-projection side (which resolves it
+                    // through `getuniqueclassdef_for_struct_root` →
+                    // `intern_class_by_qualname`).  Minting a fresh Arc per
+                    // site here splits the placeholder into one `ClassDef`
+                    // per occurrence, so the value's classdef can never match
+                    // the field repr's interned classdef (rtyper
+                    // convert_from_to has no common base → typer error), and
+                    // two `()` values meeting at a join can never union.
                     let host = if owner_path.is_empty() {
-                        if matches!(name.as_str(), "Adt" | "Array" | "Closure") {
-                            call_registry.bookkeeper().intern_class_by_qualname(name)
+                        if matches!(name.as_str(), "Tuple" | "Array" | "Closure") {
+                            call_registry.bookkeeper().intern_class_by_qualname(&name)
                         } else {
                             HostObject::new_class(name.clone(), Vec::new())
                         }

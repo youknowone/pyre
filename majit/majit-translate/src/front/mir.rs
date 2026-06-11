@@ -2680,7 +2680,12 @@ impl<'a> Lowering<'a> {
                                 base,
                                 field: FieldDescriptor::new(
                                     format!("__pos_{idx}"),
-                                    Some("Adt".to_string()),
+                                    // Same spelling the construction-side
+                                    // FieldWrite chain records for builtin
+                                    // tuple aggregates (`aggregate_ctor_name`
+                                    // id atom), so read and write attrs key
+                                    // under one owner.
+                                    Some("Tuple".to_string()),
                                 ),
                                 ty,
                                 pure: false,
@@ -4850,6 +4855,32 @@ fn aggregate_ctor_name(kind: &serde_json::Value) -> String {
         return s.to_string();
     }
     if let Some(obj) = kind.as_object() {
+        // `{"Adt": [{"id": "Tuple" | {"Builtin": "Array"}}, ...]}` — an
+        // aggregate whose type id is a builtin container atom rather
+        // than a resolvable ADT def_id.  Name the placeholder after the
+        // id atom so every tuple/array site shares one spelling; the
+        // wrapper key "Adt" would mint a fresh same-named class per
+        // site (the adapter's bare-leaf arm does not intern), and two
+        // `()` values meeting at a join then fail to union ("RPython
+        // cannot unify instances with no common base class").
+        if let Some(id) = obj
+            .get("Adt")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|arr| arr.first())
+            .and_then(serde_json::Value::as_object)
+            .and_then(|m| m.get("id"))
+        {
+            if let Some(atom) = id.as_str() {
+                return atom.to_string();
+            }
+            if let Some(builtin) = id
+                .as_object()
+                .and_then(|m| m.get("Builtin"))
+                .and_then(serde_json::Value::as_str)
+            {
+                return builtin.to_string();
+            }
+        }
         if let Some(k) = obj.keys().next() {
             return k.clone();
         }
