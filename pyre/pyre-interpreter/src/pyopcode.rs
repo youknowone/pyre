@@ -1452,6 +1452,33 @@ pub fn load_fast_var_num_to_index(
     var_num.get(op_arg).as_usize()
 }
 
+/// Walker-fold helpers for the paired-local opcode family
+/// (`LoadFastLoadFast` / `StoreFastLoadFast` / `StoreFastStoreFast` /
+/// `LoadFastBorrowLoadFastBorrow`) — same rationale as
+/// [`load_fast_var_num_to_index`]: collapse the third-party
+/// `Arg::get` + `VarNumPair::idx_*` + `VarNum::as_usize` chain under
+/// a first-party `#[elidable_cannot_raise]` wrapper so the walker's
+/// pure-call fold resolves the local index at trace time.
+#[inline]
+#[majit_macros::elidable_cannot_raise]
+pub fn var_nums_to_first_index(
+    var_nums: crate::bytecode::Arg<crate::bytecode::oparg::VarNums>,
+    op_arg: OpArg,
+) -> usize {
+    var_nums.get(op_arg).idx_1().as_usize()
+}
+
+/// Second half of the paired-local index decode — see
+/// [`var_nums_to_first_index`].
+#[inline]
+#[majit_macros::elidable_cannot_raise]
+pub fn var_nums_to_second_index(
+    var_nums: crate::bytecode::Arg<crate::bytecode::oparg::VarNums>,
+    op_arg: OpArg,
+) -> usize {
+    var_nums.get(op_arg).idx_2().as_usize()
+}
+
 /// Walker-fold helper for `code.varnames.len()` — `Vec::len` is a std
 /// method the analyzer cannot tag elidable from its definition site,
 /// so the bounds-check upper bound reaches the walker as an unfolded
@@ -2077,9 +2104,8 @@ where
     let Instruction::LoadFastBorrowLoadFastBorrow { var_nums } = instruction else {
         unreachable!()
     };
-    let pair = var_nums.get(op_arg);
-    let idx1 = pair.idx_1().as_usize();
-    let idx2 = pair.idx_2().as_usize();
+    let idx1 = var_nums_to_first_index(var_nums, op_arg);
+    let idx2 = var_nums_to_second_index(var_nums, op_arg);
     let name1 = if idx1 < code_varnames_len(code) {
         code.varnames[idx1].as_ref()
     } else {
@@ -2105,8 +2131,10 @@ where
     let Instruction::LoadFastLoadFast { var_nums } = instruction else {
         unreachable!()
     };
-    let pair = var_nums.get(op_arg);
-    executor.load_fast_load_fast(pair.idx_1().as_usize(), pair.idx_2().as_usize())?;
+    executor.load_fast_load_fast(
+        var_nums_to_first_index(var_nums, op_arg),
+        var_nums_to_second_index(var_nums, op_arg),
+    )?;
     Ok(StepResult::Continue)
 }
 
@@ -2121,8 +2149,10 @@ where
     let Instruction::StoreFastLoadFast { var_nums } = instruction else {
         unreachable!()
     };
-    let pair = var_nums.get(op_arg);
-    executor.store_fast_load_fast(pair.idx_1().as_usize(), pair.idx_2().as_usize())?;
+    executor.store_fast_load_fast(
+        var_nums_to_first_index(var_nums, op_arg),
+        var_nums_to_second_index(var_nums, op_arg),
+    )?;
     Ok(StepResult::Continue)
 }
 
@@ -2137,8 +2167,10 @@ where
     let Instruction::StoreFastStoreFast { var_nums } = instruction else {
         unreachable!()
     };
-    let pair = var_nums.get(op_arg);
-    executor.store_fast_store_fast(pair.idx_1().as_usize(), pair.idx_2().as_usize())?;
+    executor.store_fast_store_fast(
+        var_nums_to_first_index(var_nums, op_arg),
+        var_nums_to_second_index(var_nums, op_arg),
+    )?;
     Ok(StepResult::Continue)
 }
 

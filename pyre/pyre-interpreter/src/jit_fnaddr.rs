@@ -675,6 +675,32 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         code_varnames_len as *const (),
     );
 
+    // Paired-local index decode helpers for the LoadFastLoadFast /
+    // StoreFastLoadFast / StoreFastStoreFast /
+    // LoadFastBorrowLoadFastBorrow arms — same `push_alias_pair`
+    // rationale as `load_fast_var_num_to_index` above.
+    let var_nums_to_first_index: fn(
+        crate::bytecode::Arg<crate::bytecode::oparg::VarNums>,
+        crate::bytecode::OpArg,
+    ) -> usize = crate::pyopcode::var_nums_to_first_index;
+    push_alias_pair(
+        &mut entries,
+        "pyre_interpreter::pyopcode::var_nums_to_first_index",
+        "pyre_interpreter::var_nums_to_first_index",
+        var_nums_to_first_index as *const (),
+    );
+
+    let var_nums_to_second_index: fn(
+        crate::bytecode::Arg<crate::bytecode::oparg::VarNums>,
+        crate::bytecode::OpArg,
+    ) -> usize = crate::pyopcode::var_nums_to_second_index;
+    push_alias_pair(
+        &mut entries,
+        "pyre_interpreter::pyopcode::var_nums_to_second_index",
+        "pyre_interpreter::var_nums_to_second_index",
+        var_nums_to_second_index as *const (),
+    );
+
     // `PyError::type_error` — invoked by `stack_underflow_error`'s body
     // (`shared_opcode.rs:181-183`). The codewriter resolves it to the
     // 2-segment CallPath `["PyError", "type_error"]` (impl-method shape:
