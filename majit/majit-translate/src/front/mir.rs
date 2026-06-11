@@ -2629,6 +2629,7 @@ impl<'a> Lowering<'a> {
                 let segments = self.global_segments(mir_bb, id)?;
                 let op = self
                     .static_addr_op(&segments)
+                    .or_else(|| self.const_eval_global(id))
                     .unwrap_or_else(|| OpKind::Call {
                         target: CallTarget::FunctionPath { segments },
                         args: vec![],
@@ -2931,6 +2932,48 @@ impl<'a> Lowering<'a> {
             }
         }
         None
+    }
+
+    /// Evaluate a global's initializer to its literal when the body is
+    /// the trivial `_0 = <literal>; return` shape.  The read then
+    /// lowers to the same `Const*` op an inline literal produces —
+    /// flow graphs carry module-level constants as `Constant(value)`,
+    /// so config bools like `WITHPREBUILTINT` constant-fold their
+    /// guarded branches instead of minting a synthetic 0-arg call no
+    /// registry can resolve.  Non-trivial initializers (multi-block,
+    /// calls, aggregates) return `None` and keep the Call fallback.
+    fn const_eval_global(&self, def_id: u64) -> Option<OpKind> {
+        let g = self.llbc.global_by_id(def_id)?;
+        let init_id = g.rest.get("init")?.as_u64()?;
+        let fd = self.llbc.fn_by_id(init_id)?;
+        let u = fd.unstructured()?;
+        let [block] = u.body.as_slice() else {
+            return None;
+        };
+        if !matches!(block.term(), Ok(TermKind::Return)) {
+            return None;
+        }
+        let mut assigned: Option<serde_json::Value> = None;
+        for stmt in &block.statements {
+            match stmt.stmt_kind() {
+                Ok(StmtKind::StorageLive(_)) | Ok(StmtKind::StorageDead(_)) => {}
+                Ok(StmtKind::Assign(place, Rvalue::Use(Operand::Const(value))))
+                    if matches!(place.kind, PlaceKind::Local(0)) && assigned.is_none() =>
+                {
+                    assigned = Some(value);
+                }
+                _ => return None,
+            }
+        }
+        match decode_constant(self.llbc, &assigned?).ok()? {
+            DecodedConst::Int(n) => Some(OpKind::ConstInt(n)),
+            DecodedConst::Bool(b) => Some(OpKind::ConstBool(b)),
+            DecodedConst::Float(bits) => Some(OpKind::ConstFloat(bits)),
+            // Strings / fn pointers keep the existing Call shapes the
+            // operand-constant lowering uses; folding them here would
+            // diverge from the `Rvalue::Use(Const)` treatment.
+            DecodedConst::Str(_) | DecodedConst::FnPath(_) => None,
+        }
     }
 
     // -----------------------------------------------------------------------

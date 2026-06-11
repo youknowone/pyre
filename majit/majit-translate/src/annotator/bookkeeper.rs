@@ -1643,11 +1643,25 @@ impl Bookkeeper {
     /// `canonical_struct_name` unchanged, so qualname callers intern
     /// by their full spelling.
     pub fn intern_class_by_qualname(self: &Rc<Self>, name: &str) -> HostObject {
+        self.intern_class_by_qualname_with_bases(name, Vec::new())
+    }
+
+    /// [`Self::intern_class_by_qualname`] with explicit `__bases__` for
+    /// the first mint.  First-mint wins: a cache hit returns the
+    /// existing class regardless of `bases`, so every site minting a
+    /// given qualname must derive the same bases (the variant-ctor arm
+    /// in `flowspace_adapter::translate_op` derives them from the
+    /// ctor's own `owner_path`, which is identical at every site).
+    pub fn intern_class_by_qualname_with_bases(
+        self: &Rc<Self>,
+        name: &str,
+        bases: Vec<HostObject>,
+    ) -> HostObject {
         let key = majit_ir::descr::canonical_struct_name(name);
         if let Some(existing) = self.pyre_struct_root_classes.borrow().get(&key) {
             return existing.clone();
         }
-        let host = crate::flowspace::model::HostObject::new_class(key.clone(), Vec::new());
+        let host = crate::flowspace::model::HostObject::new_class(key.clone(), bases);
         self.pyre_struct_root_classes
             .borrow_mut()
             .insert(key, host.clone());

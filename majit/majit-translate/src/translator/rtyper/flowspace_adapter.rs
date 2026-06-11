@@ -1435,10 +1435,45 @@ pub fn translate_op(
                             HostObject::new_class(name.clone(), Vec::new())
                         }
                     } else {
+                        let bk = call_registry.bookkeeper();
                         let qualname = format!("{}.{}", owner_path.join("."), name);
-                        call_registry
-                            .bookkeeper()
-                            .intern_class_by_qualname(&qualname)
+                        // A variant ctor's owner tail is the enum type
+                        // itself (`resolve_aggregate_adt` pushes the
+                        // enum leaf onto the variant's owner path); a
+                        // struct ctor's owner tail is its module.  The
+                        // enum registers as a flat class whose first
+                        // row is the synthetic `__discriminant` tag
+                        // (`front::mir` metadata collection) — no
+                        // struct carries one — so that row
+                        // discriminates the two.  Mint the variant
+                        // class as a subclass of the flat enum class:
+                        // sibling variants then union to
+                        // `SomeInstance(enum)` through
+                        // `ClassDef::commonbase` (classdesc.py:251-254)
+                        // exactly as upstream sibling subclasses do in
+                        // `SomeInstance` union (binaryop.py), instead
+                        // of failing `mergeinputargs` with "no common
+                        // base class" (e.g. the per-variant arms of a
+                        // derived `PyErrorKind::clone`).  The flat
+                        // class is interned by the same leaf spelling
+                        // the field-read side uses
+                        // (`getuniqueclassdef_for_struct_root`), so
+                        // ctor base and attr reads share one
+                        // `HostObject` Arc.
+                        let enum_base = owner_path.last().and_then(|owner_tail| {
+                            let registry = bk.pyre_struct_fields.borrow();
+                            let is_enum = registry.as_ref().is_some_and(|reg| {
+                                reg.field_type(owner_tail, "__discriminant").is_some()
+                            });
+                            drop(registry);
+                            is_enum.then(|| bk.intern_class_by_qualname(owner_tail))
+                        });
+                        match enum_base {
+                            Some(base) => {
+                                bk.intern_class_by_qualname_with_bases(&qualname, vec![base])
+                            }
+                            None => bk.intern_class_by_qualname(&qualname),
+                        }
                     };
                     let callable = Hlvalue::Constant(Constant::new(ConstValue::HostObject(host)));
                     let mut call_args = Vec::with_capacity(arg_hls.len() + 1);
