@@ -2683,18 +2683,21 @@ impl<'a> Lowering<'a> {
         kind: &serde_json::Value,
     ) -> Option<(Vec<String>, String, Vec<String>)> {
         let adt = kind.as_object()?.get("Adt")?.as_array()?;
-        // The first element is a Charon type body
-        // `{"id": {"Adt": <def_id>} | "Tuple" | {"Builtin": …}, "generics": …}`.
-        // The ADT `def_id` is nested at `[0]["id"]["Adt"]`; a `"Tuple"`
-        // / builtin atom `id` has no user-defined class and falls
-        // through to `None` (the Tuple/Array placeholder).
-        let type_id = adt
-            .first()?
-            .as_object()?
-            .get("id")?
-            .as_object()?
-            .get("Adt")?
-            .as_u64()?;
+        // `AggregateKind::Adt` head: either a bare `type_id` u64 or a
+        // full `TypeDeclRef` object `{"generics": …, "id": {"Adt":
+        // <type_id>} | "Tuple" | {"Builtin": …}}` (the object shape is
+        // what Charon emits for generic-instantiated types such as
+        // `Result<T, E>`).  The bare-u64 read alone made every generic
+        // aggregate fall through to the `"Adt"` ctor-name fallback,
+        // collapsing all such constructors onto one identity (variant +
+        // owner lost).  A `"Tuple"` / builtin atom `id` has no
+        // user-defined class and falls through to `None` (the
+        // Tuple/Array placeholder).
+        let head = adt.first()?;
+        let type_id = match head.as_u64() {
+            Some(id) => id,
+            None => head.get("id")?.get("Adt")?.as_u64()?,
+        };
         let variant_idx = adt.get(1).and_then(serde_json::Value::as_u64);
         let td = self.llbc.type_by_id(type_id)?;
         let name_path = td.item_meta.name_path();
