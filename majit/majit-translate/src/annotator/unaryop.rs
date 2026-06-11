@@ -5432,6 +5432,44 @@ mod tests {
     }
 
     #[test]
+    fn classdef_less_instance_getattr_is_null_returns_bound_method() {
+        // Drive the registered `SomeInstance.getattr` specialization (not
+        // a hand-built `SomeBuiltinMethod`) so the classdef-less
+        // `is_null` arm at the GetAttr/Instance entry stays pinned: the
+        // getattr must return the callable bound method, never a bare
+        // `SomeBool` in the simple_call callee slot.
+        let ann = mk_ann();
+        let mut v = Variable::named("p");
+        ann.setbinding(
+            &mut v,
+            SomeValue::Instance(super::super::model::SomeInstance::new(
+                None,
+                false,
+                std::collections::BTreeMap::new(),
+            )),
+        );
+        let hl = HLOperation::new(
+            OpKind::GetAttr,
+            vec![
+                Hlvalue::Variable(v),
+                Hlvalue::Constant(Constant::new(ConstValue::byte_str("is_null"))),
+            ],
+        );
+
+        let result = hl.consider(&ann).expect("getattr must succeed").unwrap();
+
+        let SomeValue::BuiltinMethod(method) = result else {
+            panic!("expected SomeBuiltinMethod, got a non-callable");
+        };
+        assert_eq!(method.analyser_name, "ptr_method_is_null");
+        assert_eq!(method.methodname, "is_null");
+        assert!(
+            matches!(*method.s_self, SomeValue::Instance(_)),
+            "bound method must carry the erased receiver"
+        );
+    }
+
+    #[test]
     fn str_method_upper_preserves_unicode_family() {
         let ann = mk_ann();
         let unicode = SomeValue::UnicodeString(SomeUnicodeString::new(false, false));
