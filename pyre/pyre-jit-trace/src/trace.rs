@@ -81,14 +81,13 @@ pub fn trace_bytecode(
         probe_walk_perfn_jitcode(ctx, sym, w_code, start_pc, cf_addr);
         return (TraceAction::Abort, concrete_frame);
     }
-    // Issue #73 Phase 5 production flip (gated, default-off).
-    // `PYRE_FULL_BODY_WALK=1` traces the per-CodeObject JitCode body via the
-    // authoritative full-body walk INSTEAD of the trait `metainterp.interpret`
-    // loop below — the walker-as-tracer path that makes `miframe.pc ==
-    // jitcode_pc` and lets `pc_map` retire.  Default-off → the trait path is
-    // unchanged (check.py 39/39).  The harness for validating
-    // guard-snapshot/resume correctness over a compiled full-body trace.
-    if std::env::var_os("PYRE_FULL_BODY_WALK").is_some() {
+    // Issue #73 Phase 5 production flip: the per-CodeObject JitCode body is
+    // traced via the authoritative full-body walk — the walker-as-tracer
+    // path that makes `miframe.pc == jitcode_pc` and lets `pc_map` retire.
+    // `PYRE_FULL_BODY_WALK=0` opts back into the trait
+    // `metainterp.interpret` loop below (transition escape hatch; the trait
+    // tracer is deleted in Phase 6).
+    if std::env::var_os("PYRE_FULL_BODY_WALK").as_deref() != Some(std::ffi::OsStr::new("0")) {
         let action = full_body_walk_trace(ctx, sym, w_code, start_pc, cf_addr);
         return (action, concrete_frame);
     }

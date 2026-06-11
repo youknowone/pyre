@@ -5334,14 +5334,14 @@ thread_local! {
         const { std::cell::Cell::new(None) };
 }
 
-/// Whether the `PYRE_FBW_CALL_ASSEMBLER` slice-b Finish-portal compile
-/// route is enabled.  Cached so the per-`*_return` read and the
-/// `full_body_walk_trace` read see a single consistent value.  Default
-/// OFF → the return arms and `full_body_walk_trace` behave byte-identically
-/// to the pre-slice-b path (bare `Terminate` -> `Abort`).
+/// Whether the slice-b Finish-portal compile route is enabled.  Cached so
+/// the per-`*_return` read and the `full_body_walk_trace` read see a
+/// single consistent value.  Default ON since the Phase 5 production flip;
+/// `PYRE_FBW_CALL_ASSEMBLER=0` opts back into the pre-slice-b path (bare
+/// `Terminate` -> `Abort`) as a transition escape hatch.
 pub(crate) fn fbw_call_assembler_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var("PYRE_FBW_CALL_ASSEMBLER").is_ok())
+    *ENABLED.get_or_init(|| std::env::var("PYRE_FBW_CALL_ASSEMBLER").as_deref() != Ok("0"))
 }
 
 /// Whether `PYRE_FBW_DEBUG_ABORT` is set.  When on, `full_body_walk_trace`
@@ -6433,7 +6433,10 @@ fn try_walker_call_assembler_self_recursive(
     dst: usize,
 ) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
     // ---- non-emitting eligibility checks (free to bail with Ok(None)) ----
-    if !ctx.is_authoritative_executor || std::env::var_os("PYRE_FBW_REC_CA").is_none() {
+    // Default ON since the Phase 5 flip; `PYRE_FBW_REC_CA=0` opts out.
+    if !ctx.is_authoritative_executor
+        || std::env::var_os("PYRE_FBW_REC_CA").as_deref() == Some(std::ffi::OsStr::new("0"))
+    {
         return Ok(None);
     }
     // Only a genuine `call_fn` residual (no `pyre_helper` tag) is a
@@ -6660,7 +6663,8 @@ fn try_walker_inline_user_call(
     dst_bank: char,
     dst: usize,
 ) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
-    if !ctx.is_authoritative_executor || std::env::var("PYRE_FBW_INLINE").is_err() {
+    // Default ON since the Phase 5 flip; `PYRE_FBW_INLINE=0` opts out.
+    if !ctx.is_authoritative_executor || std::env::var("PYRE_FBW_INLINE").as_deref() == Ok("0") {
         return Ok(None);
     }
     // Only a genuine Python call helper (`call_fn` / `call_fn_N`) is an
@@ -8679,16 +8683,15 @@ fn dispatch_residual_call_iIRd_kind(
     // would suppress that abort and let the walk compile a try/except body it
     // cannot yet resume.
     //
-    // DEV-GATED `PYRE_FBW_LOADGLOBAL_FOLD` (default off): the fold is correct
-    // (`try_walker_load_global_cell_fold` resolves the `co_names` index the
-    // same way `bh_load_global_fn` does) and reaches production parity for
-    // global-function-call loops when combined with `PYRE_FBW_INLINE`.  The
-    // gate stays until the Phase-5 production flip validates the full FBW
-    // bench suite with the fold on.
+    // Default ON since the Phase 5 flip (`PYRE_FBW_LOADGLOBAL_FOLD=0` opts
+    // out): the fold is correct (`try_walker_load_global_cell_fold`
+    // resolves the `co_names` index the same way `bh_load_global_fn` does)
+    // and reaches production parity for global-function-call loops when
+    // combined with the user-call inlining path.
     if ctx.is_authoritative_executor
         && ei.pyre_helper == majit_ir::PyreHelperKind::LoadGlobal
         && !jitcode_has_exception_handler(code)
-        && std::env::var("PYRE_FBW_LOADGLOBAL_FOLD").is_ok()
+        && std::env::var("PYRE_FBW_LOADGLOBAL_FOLD").as_deref() != Ok("0")
     {
         if let (Some(&namei_opref), Some(&ns_opref), Some(&code_opref)) =
             (i_args.first(), r_args.first(), r_args.get(1))
@@ -11826,6 +11829,7 @@ mod tests {
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
         };
+        fbw_finish_payload_reset();
         let (outcome, end_pc) =
             walk(&caller_code, 0, &mut wc).expect("caller must walk to terminator");
         assert_eq!(outcome, DispatchOutcome::Terminate);
@@ -11838,23 +11842,19 @@ mod tests {
             regs_r[5], arg_value,
             "inline_call_r_r dst writeback must propagate callee's SubReturn",
         );
-        // Outermost FINISH carries the same value.
+        // The outermost finish payload carries the same value (callee's
+        // ref_return surfaced as SubReturn and recorded nothing; the
+        // caller's top-level ref_return stashed the payload).
         assert_eq!(
             tc.num_ops(),
-            ops_before + 1,
-            "exactly one Finish must be recorded (callee's ref_return surfaced as \
-             SubReturn, did not record a Finish)",
+            ops_before,
+            "no op recorded: the compile consumer records the FINISH from the payload",
         );
-        let last = tc.ops().last().expect("Finish must exist");
-        assert_eq!(last.opcode, majit_ir::OpCode::Finish);
         assert_eq!(
-            last.getarglist()
-                .iter()
-                .map(|a| a.to_opref())
-                .collect::<Vec<_>>(),
-            vec![arg_value],
-            "outermost Finish must carry the arg value the caller threaded through \
-             inline_call_r_r",
+            fbw_finish_payload_take(),
+            Some((arg_value, Type::Ref)),
+            "outermost finish payload must carry the arg value the caller threaded \
+             through inline_call_r_r",
         );
     }
 
@@ -12542,9 +12542,10 @@ mod tests {
 
     #[test]
     fn step_through_ref_return_records_finish_with_descr_and_correct_arg() {
-        // `ref_return/r` records `rop.FINISH(reg)` to the
-        // TraceCtx with `done_with_this_frame_descr_ref` attached, and
-        // the `reg` byte selects the correct OpRef from `registers_r`.
+        // Top-level `ref_return/r` stashes the Finish payload for
+        // `full_body_walk_trace` (the compile consumer records the FINISH
+        // from `finish_args`), and the `reg` byte selects the correct
+        // OpRef from `registers_r`.
         // RPython `pyjitpl.py:opimpl_ref_return → finishframe →
         // compile_done_with_this_frame → record1(FINISH, descr=token)`.
         let ret_byte = *insns_opname_to_byte()
@@ -12582,31 +12583,21 @@ mod tests {
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
         };
+        fbw_finish_payload_reset();
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("ref_return/r must dispatch");
         assert_eq!(outcome, DispatchOutcome::Terminate);
         assert_eq!(next_pc, 2, "ref_return/r consumes 1 register byte");
         drop(wc);
         assert_eq!(
             tc.num_ops(),
-            ops_before + 1,
-            "exactly one Finish op must be recorded",
+            ops_before,
+            "ref_return must not record the FINISH itself: the compile consumer \
+             records it from the stashed finish payload",
         );
-        let last = tc.ops().last().expect("recorded op must exist");
-        assert_eq!(last.opcode, majit_ir::OpCode::Finish);
         assert_eq!(
-            last.getarglist()
-                .iter()
-                .map(|a| a.to_opref())
-                .collect::<Vec<_>>(),
-            vec![expected_arg],
-            "Finish args must select registers_r[3], not registers_r[0]",
-        );
-        let recorded_descr = last
-            .getdescr()
-            .expect("Finish must carry done_with_this_frame_descr_ref");
-        assert!(
-            std::sync::Arc::ptr_eq(&recorded_descr, &descr),
-            "Finish descr must be the exact instance the dispatcher was handed",
+            fbw_finish_payload_take(),
+            Some((expected_arg, Type::Ref)),
+            "finish payload must select registers_r[3], not registers_r[0]",
         );
     }
 
@@ -12656,10 +12647,11 @@ mod tests {
 
     #[test]
     fn step_through_int_return_records_finish_with_int_descr() {
-        // `int_return/i` mirrors `ref_return/r` on the int
-        // bank. Top-level records `FINISH(int_value)` with
-        // `done_with_this_frame_descr_int` (RPython `pyjitpl.py:3206-3208
-        // compile_done_with_this_frame: token = sd.done_with_this_frame_descr_int`).
+        // `int_return/i` mirrors `ref_return/r` on the int bank.
+        // Top-level re-boxes the int for the Type::Ref portal exit
+        // (`wrapint` = NEW_WITH_VTABLE + SETFIELD_GC) and stashes the
+        // boxed value as the finish payload (RPython `pyjitpl.py:3206-3208
+        // compile_done_with_this_frame`).
         let ret_byte = *insns_opname_to_byte()
             .get("int_return/i")
             .expect("`int_return/i` must be in insns table");
@@ -12695,26 +12687,32 @@ mod tests {
             store_subscr_fn_addr: None,
         };
         let ops_before = wc.trace_ctx.num_ops();
+        fbw_finish_payload_reset();
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("int_return/i must dispatch");
         assert_eq!(outcome, DispatchOutcome::Terminate);
         assert_eq!(next_pc, 2);
         drop(wc);
-        assert_eq!(tc.num_ops(), ops_before + 1);
-        let last = tc.ops().last().expect("recorded op must exist");
-        assert_eq!(last.opcode, majit_ir::OpCode::Finish);
         assert_eq!(
-            last.getarglist()
+            tc.num_ops(),
+            ops_before + 2,
+            "wrapint must record NEW_WITH_VTABLE + SETFIELD_GC for the boxed payload",
+        );
+        let (finish_value, finish_ty) =
+            fbw_finish_payload_take().expect("finish payload must be stashed");
+        assert_eq!(finish_ty, Type::Ref, "portal-exit FINISH carries Type::Ref");
+        let ops = tc.ops();
+        let new_box = &ops[ops.len() - 2];
+        assert_eq!(new_box.opcode, majit_ir::OpCode::NewWithVtable);
+        let setfield = ops.last().expect("recorded op must exist");
+        assert_eq!(setfield.opcode, majit_ir::OpCode::SetfieldGc);
+        assert_eq!(
+            setfield
+                .getarglist()
                 .iter()
                 .map(|a| a.to_opref())
                 .collect::<Vec<_>>(),
-            vec![expected_arg]
-        );
-        let recorded_descr = last
-            .getdescr()
-            .expect("Finish must carry done_with_this_frame_descr_int");
-        assert!(
-            std::sync::Arc::ptr_eq(&recorded_descr, &descr_int),
-            "int_return/i must use done_with_this_frame_descr_int, not _ref",
+            vec![finish_value, expected_arg],
+            "the re-boxed payload must store int_return's register into the new box",
         );
     }
 
@@ -13567,6 +13565,7 @@ mod tests {
         let mut tc = fresh_trace_ctx();
         let mut regs_r = distinct_const_refs(&mut tc, 8);
         let exc_arg = regs_r[3];
+        let handler_ret = regs_r[5];
         let descr_done = done_descr_ref_for_tests();
         let descr_exc = make_fail_descr(99);
         let mut descr_pool: Vec<DescrRef> = (0..16).map(|i| make_fail_descr(1 + i)).collect();
@@ -13595,6 +13594,7 @@ mod tests {
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
         };
+        fbw_finish_payload_reset();
         let (outcome, end_pc) =
             walk(&caller_code, 0, &mut wc).expect("caller must walk to terminator");
         assert_eq!(
@@ -13612,12 +13612,15 @@ mod tests {
             "caller's last_exc_value must be set to the exc OpRef from callee SubRaise",
         );
         drop(wc);
-        // Outermost FINISH must carry the handler's ref_return arg —
-        // r5, which still holds its pre-call distinct_const_refs OpRef
-        // (caller's inline_call dst write happens *only* on
-        // SubReturn, not SubRaise-then-catch).
-        let last = tc.ops().last().expect("FINISH must exist");
-        assert_eq!(last.opcode, majit_ir::OpCode::Finish);
+        // The outermost finish payload must carry the handler's
+        // ref_return arg — r5, which still holds its pre-call
+        // distinct_const_refs OpRef (caller's inline_call dst write
+        // happens *only* on SubReturn, not SubRaise-then-catch).
+        assert_eq!(
+            fbw_finish_payload_take(),
+            Some((handler_ret, Type::Ref)),
+            "finish payload must exist and carry the handler's ref_return arg",
+        );
     }
 
     #[test]
@@ -18503,6 +18506,7 @@ mod tests {
         // from the fresh top-level register file.  Slots 0/1 stay
         // `OpRef::NONE` since this fixture exercises only slot 2.
         let argboxes_r = [OpRef::NONE, OpRef::NONE, expected_arg];
+        fbw_finish_payload_reset();
         let (outcome, end_pc) = dispatch_via_miframe(
             &mut miframe,
             &code,
@@ -18533,22 +18537,10 @@ mod tests {
 
         // Drop miframe so we can inspect tc directly.
         drop(miframe);
-        let last = tc.ops().last().expect("FINISH must exist");
-        assert_eq!(last.opcode, majit_ir::OpCode::Finish);
         assert_eq!(
-            last.getarglist()
-                .iter()
-                .map(|a| a.to_opref())
-                .collect::<Vec<_>>(),
-            vec![expected_arg],
-            "FINISH args must be sym.registers_r[2] threaded through the MIFrame bridge",
-        );
-        let recorded_descr = last
-            .getdescr()
-            .expect("FINISH must carry done_with_this_frame_descr_ref");
-        assert!(
-            std::sync::Arc::ptr_eq(&recorded_descr, &descr),
-            "FINISH descr must be the descr passed through dispatch_via_miframe",
+            fbw_finish_payload_take(),
+            Some((expected_arg, Type::Ref)),
+            "finish payload must be sym.registers_r[2] threaded through the MIFrame bridge",
         );
     }
 
