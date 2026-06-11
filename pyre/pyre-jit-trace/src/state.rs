@@ -833,6 +833,20 @@ pub(crate) fn sub_jitcode_body_for_code(
     })
 }
 
+/// Post-regalloc Ref-bank colors of the callee's Python-semantic local
+/// slots (`metadata.pyre_color_for_semantic_local`).  Used by full-body-walk
+/// call inlining to seed positional args at the registers the callee body
+/// actually reads its params from — the canonical splice regalloc does not
+/// pin local-i inputargs to identity colors, so `r0..nparams` seeding reads
+/// the wrong bank slots.  `None` when no payload is installed for `code`.
+pub(crate) fn sub_jitcode_param_colors_for_code(code: *const ()) -> Option<Vec<u16>> {
+    if code.is_null() {
+        return None;
+    }
+    let pjc = pyjitcode_for_code(code)?;
+    Some(pjc.metadata.pyre_color_for_semantic_local.clone())
+}
+
 type SubDescrPool = (
     &'static [DescrRef],
     &'static [majit_metainterp::jitcode::RuntimeBhDescr],
@@ -10399,6 +10413,7 @@ mod tests {
             crate::PyJitCodeMetadata {
                 pc_map: vec![0],
                 after_residual_call_resume_pc: vec![None],
+                first_jit_pc_by_py_pc: vec![0],
                 depth_at_py_pc: vec![2],
                 portal_frame_reg: 0,
                 portal_ec_reg: 0,

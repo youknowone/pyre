@@ -2272,6 +2272,7 @@ fn record_residual_call_graph_op(
     block: &super::flow::BlockRef,
     fn_idx: u16,
     flavor: CallFlavor,
+    pyre_helper: majit_ir::PyreHelperKind,
     args_i: Vec<super::flow::FlowValue>,
     args_r: Vec<super::flow::FlowValue>,
     args_f: Vec<super::flow::FlowValue>,
@@ -2308,7 +2309,12 @@ fn record_residual_call_graph_op(
             args_f,
         )));
     }
-    let effect_info = super::flatten::effect_info_for_call_flavor(flavor);
+    let mut effect_info = super::flatten::effect_info_for_call_flavor(flavor);
+    // Helper-recognition tag for the full-body walker's specialization
+    // folds (BoxInt / BinaryOp / CompareOp dispatch in
+    // `jitcode_dispatch.rs`); mirrors the tag the dedicated walker-emit
+    // builders (`flatten.rs build_*_insn`) attach to the same helpers.
+    effect_info.pyre_helper = pyre_helper;
     let can_raise = effect_info.check_can_raise(false);
     op_args.push(
         super::flatten::intern_call_descr_stub(effect_info, arg_kinds, reskind.to_kind()).into(),
@@ -3308,7 +3314,7 @@ fn filter_liveness_in_place(
     walker_tracked_pc_live_indices: Option<&[usize]>,
     walker_after_call_pc_indices: Option<&[Option<usize>]>,
     clear_unboxed_banks: bool,
-) -> (Vec<usize>, Vec<Option<usize>>) {
+) -> (Vec<usize>, Vec<Option<usize>>, Vec<Option<usize>>) {
     use super::flatten::{Kind as SsaKind, Operand as SsaOperand};
     // Per-PC `-live-` positions are required: the post-merge
     // `live_markers` vector is built by translating each per-PC
@@ -3337,11 +3343,29 @@ fn filter_liveness_in_place(
     let after_call_anchors: Vec<Option<usize>> = walker_after_call_pc_indices
         .map(|s| s.to_vec())
         .unwrap_or_else(|| vec![None; walker_tracked.len()]);
-    let (live_markers, after_call_post_merge) = super::liveness::compute_liveness_with_pc_anchors(
-        ssarepr,
-        walker_tracked,
-        &after_call_anchors,
-    );
+    // Per-PC first-insn positions (pre-merge), captured before
+    // `compute_liveness` rewrites the stream; remapped through the same
+    // `remove_repeated_live` remap below.  This is the exact
+    // jitcode-pc → Python-opcode inverse the full-body walk consumes
+    // (`PyJitCodeMetadata::first_jit_pc_by_py_pc`) — `pc_map`'s
+    // nearest-marker carry-forward shares positions across PCs and is
+    // not invertible.
+    let mut first_insn_pre_merge: Vec<Option<usize>> = vec![None; walker_tracked.len()];
+    for &(py_pc, pos) in &ssarepr.pc_first_insn_pos {
+        if (0..walker_tracked.len() as i64).contains(&py_pc) {
+            first_insn_pre_merge[py_pc as usize] = Some(pos);
+        }
+    }
+    let (live_markers, after_call_post_merge, remap) =
+        super::liveness::compute_liveness_with_pc_anchors(
+            ssarepr,
+            walker_tracked,
+            &after_call_anchors,
+        );
+    let first_insn_post_merge: Vec<Option<usize>> = first_insn_pre_merge
+        .iter()
+        .map(|entry| entry.map(|old| remap[old]))
+        .collect();
     let live_vars = pyre_jit_trace::state::liveness_for(code as *const _);
     let nlocals = code.varnames.len();
     let live_markers_out = live_markers.clone();
@@ -3563,7 +3587,7 @@ fn filter_liveness_in_place(
         }
         existing.extend(non_register);
     }
-    (live_markers_out, after_call_post_merge)
+    (live_markers_out, after_call_post_merge, first_insn_post_merge)
 }
 
 /// Decode `code.exceptiontable` into the structures the dispatch loop
@@ -4427,11 +4451,35 @@ impl CodeWriter {
                 $reskind:expr,
                 $offset:expr $(,)?
             ) => {
+                residual_call!(
+                    $fn_idx,
+                    $flavor,
+                    majit_ir::PyreHelperKind::None,
+                    $args_i,
+                    $args_r,
+                    $args_f,
+                    $arg_kinds,
+                    $reskind,
+                    $offset,
+                )
+            };
+            (
+                $fn_idx:expr,
+                $flavor:expr,
+                $pyre_helper:expr,
+                $args_i:expr,
+                $args_r:expr,
+                $args_f:expr,
+                $arg_kinds:expr,
+                $reskind:expr,
+                $offset:expr $(,)?
+            ) => {
                 record_residual_call_graph_op(
                     &mut graph,
                     &current_block.block(),
                     $fn_idx,
                     $flavor,
+                    $pyre_helper,
                     $args_i,
                     $args_r,
                     $args_f,
@@ -5740,6 +5788,7 @@ impl CodeWriter {
                             let boxed = residual_call!(
                                 box_int_fn_idx,
                                 CallFlavor::Plain,
+                                majit_ir::PyreHelperKind::BoxInt,
                                 vec![super::flow::Constant::signed(val).into()],
                                 vec![],
                                 vec![],
@@ -6397,6 +6446,7 @@ impl CodeWriter {
                             let zero_graph_var = residual_call!(
                                 box_int_fn_idx,
                                 CallFlavor::Plain,
+                                majit_ir::PyreHelperKind::BoxInt,
                                 vec![super::flow::Constant::signed(0).into()],
                                 vec![],
                                 vec![],
@@ -6410,6 +6460,7 @@ impl CodeWriter {
                                 let binary_result = residual_call!(
                                     binary_op_fn_idx,
                                     CallFlavor::MayForce,
+                                    majit_ir::PyreHelperKind::BinaryOp,
                                     vec![super::flow::Constant::signed(subtract_tag as i64).into()],
                                     vec![zero_var.clone().into(), operand_value_for_dual.into()],
                                     vec![],
@@ -6844,6 +6895,7 @@ impl CodeWriter {
                             let cmp_result = residual_call!(
                                 compare_fn_idx,
                                 CallFlavor::MayForce,
+                                majit_ir::PyreHelperKind::CompareOp,
                                 vec![super::flow::Constant::signed(10).into()],
                                 vec![exc_value, match_type_value],
                                 vec![],
@@ -7882,6 +7934,7 @@ impl CodeWriter {
                         let boxed_lasti = residual_call!(
                             box_int_fn_idx,
                             CallFlavor::Plain,
+                            majit_ir::PyreHelperKind::BoxInt,
                             vec![super::flow::Constant::signed(site.lasti_py_pc as i64).into()],
                             vec![],
                             vec![],
@@ -8464,6 +8517,27 @@ impl CodeWriter {
                 super::regalloc::rename_lookup(&alloc_result.rename, Kind::Ref, slot_pre_color(i));
             pyre_color_for_semantic_local.push(post);
         }
+        // Function-arg locals: the body reads param `i` from the startblock
+        // inputarg's splice color, not from a walker-slot pairing — a param
+        // that is never STOREd has no surviving slot pairing ("most recent
+        // pairing wins" re-pins its Variable to the operand-stack slot it
+        // is pushed to), so `slot_pre_color` falls back to identity while
+        // `reserve_local_ref_colors_in_place` may have moved the inputarg
+        // off its `enforce_input_args` color.  Read the color straight off
+        // the inputarg Variable so the map matches the emitted body.
+        {
+            let startblock = graph.startblock.borrow();
+            let nargs = entry_arg_slots(code).min(nlocals as usize);
+            for (i, arg) in startblock.inputargs.iter().take(nargs).enumerate() {
+                let super::flow::FlowValue::Variable(v) = arg else {
+                    continue;
+                };
+                if let Some(&color) = splice_regallocs[Kind::Ref.index()].coloring.get(&v.id) {
+                    pyre_color_for_semantic_local[i] =
+                        super::regalloc::rename_lookup(&alloc_result.rename, Kind::Ref, color);
+                }
+            }
+        }
         // After step C the chordal coloring is free to coalesce
         // disjointly-live stack slots into the same color, so the full
         // map may legitimately repeat colors (e.g. `[1, 1, 2, 3, 4, 0,
@@ -8478,7 +8552,8 @@ impl CodeWriter {
         // pass writes into each `-live-` marker are already the
         // post-rename colors. `filter_liveness_in_place` then splits
         // them into live_i/live_r/live_f per assembler.py:150-152.
-        let (post_remove_live_indices, after_call_post_merge) = filter_liveness_in_place(
+        let (post_remove_live_indices, after_call_post_merge, first_insn_post_merge) =
+            filter_liveness_in_place(
             &mut ssarepr,
             code,
             &depth_at_pc,
@@ -8525,6 +8600,7 @@ impl CodeWriter {
             w_code,
             pc_map,
             after_call_post_merge,
+            first_insn_post_merge,
             depth_at_pc,
             portal_frame_reg,
             portal_ec_reg,
@@ -8564,6 +8640,7 @@ impl CodeWriter {
         w_code: *const (),
         pc_map: Vec<usize>,
         after_call_post_merge: Vec<Option<usize>>,
+        first_insn_post_merge: Vec<Option<usize>>,
         depth_at_pc: Vec<u16>,
         portal_frame_reg: u16,
         portal_ec_reg: u16,
@@ -8606,8 +8683,14 @@ impl CodeWriter {
             .enumerate()
             .filter_map(|(py_pc, entry)| entry.map(|idx| (py_pc, idx)))
             .collect();
+        let first_insn_some: Vec<(usize, usize)> = first_insn_post_merge
+            .iter()
+            .enumerate()
+            .filter_map(|(py_pc, entry)| entry.map(|idx| (py_pc, idx)))
+            .collect();
         let mut combined_indices = pc_map.clone();
         combined_indices.extend(after_call_some.iter().map(|(_, idx)| *idx));
+        combined_indices.extend(first_insn_some.iter().map(|(_, idx)| *idx));
         let (jitcode, combined_bytes) = {
             let mut asm = self.assembler.borrow_mut();
             assembler.finish_with_positions_from(&mut *asm, ssarepr, &combined_indices, num_regs)
@@ -8616,6 +8699,13 @@ impl CodeWriter {
         let mut after_residual_call_resume_pc: Vec<Option<usize>> = vec![None; pc_map.len()];
         for (k, (py_pc, _)) in after_call_some.iter().enumerate() {
             after_residual_call_resume_pc[*py_pc] = Some(combined_bytes[pc_map.len() + k]);
+        }
+        // `usize::MAX` = the PC emitted no jitcode of its own (trivia /
+        // folded); see `PyJitCodeMetadata::first_jit_pc_by_py_pc`.
+        let mut first_jit_pc_by_py_pc: Vec<usize> = vec![usize::MAX; pc_map.len()];
+        let first_insn_base = pc_map.len() + after_call_some.len();
+        for (k, (py_pc, _)) in first_insn_some.iter().enumerate() {
+            first_jit_pc_by_py_pc[*py_pc] = combined_bytes[first_insn_base + k];
         }
 
         // call.py:148 `jd.mainjitcode.jitdriver_sd = jd`. RPython mutates
@@ -8642,6 +8732,7 @@ impl CodeWriter {
         let metadata = PyJitCodeMetadata {
             pc_map: pc_map_bytes,
             after_residual_call_resume_pc,
+            first_jit_pc_by_py_pc,
             depth_at_py_pc: depth_at_pc,
             portal_frame_reg,
             portal_ec_reg,
@@ -9947,7 +10038,8 @@ mod tests {
         let depth_at_pc: Vec<u16> = vec![0; code.instructions.len()];
         let local_color_map: Vec<u16> = (0..code.varnames.len() as u16).collect();
         let stack_slot_color_map: Vec<u16> = Vec::new();
-        let (post_remove_live_indices, _after_call_post_merge) = filter_liveness_in_place(
+        let (post_remove_live_indices, _after_call_post_merge, _first_insn_post_merge) =
+            filter_liveness_in_place(
             &mut ssarepr,
             &code,
             &depth_at_pc,
@@ -10018,7 +10110,8 @@ mod tests {
         let depth_at_pc: Vec<u16> = vec![0; code.instructions.len()];
         let local_color_map: Vec<u16> = (0..code.varnames.len() as u16).collect();
         let stack_slot_color_map: Vec<u16> = Vec::new();
-        let (post_remove_live_indices, _after_call_post_merge) = filter_liveness_in_place(
+        let (post_remove_live_indices, _after_call_post_merge, _first_insn_post_merge) =
+            filter_liveness_in_place(
             &mut ssarepr,
             &code,
             &depth_at_pc,

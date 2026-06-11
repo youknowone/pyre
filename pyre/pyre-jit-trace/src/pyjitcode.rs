@@ -90,6 +90,15 @@ pub struct PyJitCodeMetadata {
     /// the next opcode's start marker (`blackhole.py:396-410
     /// handle_exception_in_frame`).  Same length as `pc_map`.
     pub after_residual_call_resume_pc: Vec<Option<usize>>,
+    /// py_pc → jitcode byte offset of the FIRST instruction the opcode
+    /// emitted (`usize::MAX` for PCs that emit no jitcode of their own:
+    /// trivia, folded ops).  `pc_map` resolves each PC to its nearest
+    /// `-live-` marker at-or-before, so adjacent PCs share marker
+    /// positions and the map is not invertible; the full-body walk needs
+    /// the exact inverse (jitcode pc → containing Python opcode) for
+    /// guard resume coordinates, which this table provides.  Same length
+    /// as `pc_map`.
+    pub first_jit_pc_by_py_pc: Vec<usize>,
     /// Value-stack depth at each Python PC, in slots above stack_base.
     pub depth_at_py_pc: Vec<u16>,
     /// Post-regalloc Ref-bank color of the portal jitdriver's first red
@@ -480,6 +489,7 @@ impl PyJitCode {
             PyJitCodeMetadata {
                 pc_map: Vec::new(),
                 after_residual_call_resume_pc: Vec::new(),
+                first_jit_pc_by_py_pc: Vec::new(),
                 depth_at_py_pc: Vec::new(),
                 // u16::MAX sentinel mirrors `canonical_bridge::install_portal_for`
                 // (canonical_bridge.rs:165-166). Encoder/decoder readers in

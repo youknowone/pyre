@@ -56,7 +56,7 @@ pub(super) fn compute_liveness_with_pc_anchors(
     ssarepr: &mut SSARepr,
     walker_tracked_pc_live_indices: &[usize],
     after_call_anchors: &[Option<usize>],
-) -> (Vec<usize>, Vec<Option<usize>>) {
+) -> (Vec<usize>, Vec<Option<usize>>, Vec<usize>) {
     // `remove_repeated_live` folds adjacent `-live-` markers freely,
     // matching upstream `liveness.py` semantics.  Multiple Python PCs
     // may share a post-merge marker index; `filter_liveness_in_place`
@@ -79,7 +79,10 @@ pub(super) fn compute_liveness_with_pc_anchors(
         .iter()
         .map(|entry| entry.map(|old| remap[old]))
         .collect();
-    (live_markers, after_call)
+    // The remap is returned so the caller can translate further pre-merge
+    // stream positions (e.g. `pc_first_insn_pos`) through the same
+    // `remove_repeated_live` rewrite.
+    (live_markers, after_call, remap)
 }
 
 fn compute_liveness_with_remap_internal(ssarepr: &mut SSARepr) -> Vec<usize> {
