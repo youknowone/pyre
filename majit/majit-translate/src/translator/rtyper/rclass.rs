@@ -3786,13 +3786,12 @@ pub(super) fn pair_instance_instance_convert_from_to(
         (Some(c1), Some(c2)) => ClassDef::commonbase(c1, c2),
         _ => None,
     };
-    let classdef_eq = |a: &Option<Rc<RefCell<ClassDef>>>, b: &Option<Rc<RefCell<ClassDef>>>| {
-        match (a, b) {
+    let classdef_eq =
+        |a: &Option<Rc<RefCell<ClassDef>>>, b: &Option<Rc<RefCell<ClassDef>>>| match (a, b) {
             (Some(a), Some(b)) => Rc::ptr_eq(a, b),
             (None, None) => true,
             _ => false,
-        }
-    };
+        };
     // Upstream's two arms (upcast to parent / downcast after a
     // successful isinstance check) both emit the same cast_pointer.
     if classdef_eq(&basedef, &r_ins2.classdef) || classdef_eq(&basedef, &r_ins1.classdef) {

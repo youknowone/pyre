@@ -47,7 +47,6 @@ use crate::translator::rtyper::error::TyperError;
 use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
 use crate::translator::rtyper::lltypesystem::rstr::{
     STRPTR, UNICODEPTR, build_ll_chr2str_helper_graph, build_ll_count_char_helper_graph,
-    const_str_cache_llstr, null_str_ptr,
     build_ll_endswith_char_helper_graph, build_ll_endswith_helper_graph,
     build_ll_find_char_helper_graph, build_ll_int_helper_graph,
     build_ll_replace_chr_chr_helper_graph, build_ll_rfind_char_helper_graph,
@@ -58,7 +57,8 @@ use crate::translator::rtyper::lltypesystem::rstr::{
     build_ll_string_casefold_helper_graph, build_ll_string_isxxx_helper_graph,
     build_ll_stritem_checked_helper_graph, build_ll_stritem_helper_graph,
     build_ll_stritem_nonneg_checked_helper_graph, build_ll_stritem_nonneg_helper_graph,
-    build_ll_strlen_helper_graph, build_ll_unichr2str_helper_graph,
+    build_ll_strlen_helper_graph, build_ll_unichr2str_helper_graph, const_str_cache_llstr,
+    null_str_ptr,
 };
 use crate::translator::rtyper::rmodel::{RTypeResult, Repr, ReprState};
 use crate::translator::rtyper::rtyper::{

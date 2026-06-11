@@ -338,10 +338,7 @@ pub fn build_value_to_hlvalue_map(
                     );
                 }
                 OpKind::ConstRefNull => {
-                    map.insert(
-                        result,
-                        Hlvalue::Constant(const_ref_gcref_constant(None)),
-                    );
+                    map.insert(result, Hlvalue::Constant(const_ref_gcref_constant(None)));
                 }
                 OpKind::ConstRefAddr(addr) => {
                     map.insert(
@@ -371,7 +368,7 @@ pub fn build_value_to_hlvalue_map(
 /// here — it asserts odd (tagged) integers (lltype.py:2372-2377) and
 /// host addresses are even — so the `_ptr` is built directly.
 fn const_ref_gcref_constant(addr: Option<i64>) -> Constant {
-    use crate::translator::rtyper::lltypesystem::lltype::{GCREF, _ptr, _ptr_obj, LowLevelType};
+    use crate::translator::rtyper::lltypesystem::lltype::{_ptr, _ptr_obj, GCREF, LowLevelType};
     let LowLevelType::Ptr(gcref_t) = GCREF.clone() else {
         panic!("GCREF must be a Ptr lowleveltype");
     };
@@ -1193,12 +1190,11 @@ pub fn translate_op(
                                 return Ok(vec![FlowspaceOp::new("mul", arg_hls, result)]);
                             }
                             ("cmp", "min" | "max") if arg_hls.len() == 2 => {
-                                let builtin =
-                                    HOST_ENV.lookup_builtin(leaf).ok_or_else(|| {
-                                        TyperError::message(format!(
-                                            "builtin `{leaf}` missing from HOST_ENV"
-                                        ))
-                                    })?;
+                                let builtin = HOST_ENV.lookup_builtin(leaf).ok_or_else(|| {
+                                    TyperError::message(format!(
+                                        "builtin `{leaf}` missing from HOST_ENV"
+                                    ))
+                                })?;
                                 let callable = Hlvalue::Constant(Constant::new(
                                     ConstValue::HostObject(builtin),
                                 ));
@@ -4416,10 +4412,7 @@ mod tests {
             operations: vec![],
             exitswitch: None,
             exits: vec![crate::model::Link::new_mixed(
-                vec![
-                    LinkArg::Value(orphan_etype),
-                    LinkArg::Value(orphan_evalue),
-                ],
+                vec![LinkArg::Value(orphan_etype), LinkArg::Value(orphan_evalue)],
                 exceptblock,
                 None,
             )],
@@ -4453,10 +4446,7 @@ mod tests {
             operations: vec![],
             exitswitch: None,
             exits: vec![crate::model::Link::new_mixed(
-                vec![
-                    LinkArg::Value(orphan_etype),
-                    LinkArg::Value(orphan_evalue),
-                ],
+                vec![LinkArg::Value(orphan_etype), LinkArg::Value(orphan_evalue)],
                 exceptblock,
                 None,
             )],

@@ -1292,9 +1292,7 @@ impl ClassDesc {
                         // unrelated constructor-minted class.
                         dotted_key
                             .as_deref()
-                            .filter(|k| {
-                                STRUCT_FORCE_KEYS.with(|s| s.borrow().contains(*k))
-                            })
+                            .filter(|k| STRUCT_FORCE_KEYS.with(|s| s.borrow().contains(*k)))
                             .and_then(|k| table.get(k))
                     })
                     .cloned()

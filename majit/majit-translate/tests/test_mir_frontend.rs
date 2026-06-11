@@ -79,8 +79,10 @@ fn lowers_branch_loop_sum_with_calls_and_discriminant() {
                 OpKind::Call {
                     target: CallTarget::FunctionPath { segments },
                     ..
-                } if matches!(segments.first().map(String::as_str), Some("simple_call" | "type")) => {
-                }
+                } if matches!(
+                    segments.first().map(String::as_str),
+                    Some("simple_call" | "type")
+                ) => {}
                 OpKind::Call { .. } => call_count += 1,
                 OpKind::FieldRead { field, .. } if field.name == "__discriminant" => {
                     discr_count += 1

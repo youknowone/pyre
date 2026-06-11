@@ -1298,9 +1298,9 @@ fn rtype_builtin_min_max(hop: &HighLevelOp, helper_name: &str) -> RTypeResult {
     ])?;
     hop.exception_cannot_occur()?;
     let llt = r_result.lowleveltype().clone();
-    let llfunc = hop
-        .rtyper
-        .lowlevel_helper_function(helper_name, vec![llt.clone(), llt.clone()], llt)?;
+    let llfunc =
+        hop.rtyper
+            .lowlevel_helper_function(helper_name, vec![llt.clone(), llt.clone()], llt)?;
     hop.gendirectcall(&llfunc, vlist)
 }
 
