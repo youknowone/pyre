@@ -193,6 +193,13 @@ impl CodeWriter {
             &registry,
             &callcontrol.unsafe_fn_stubs,
         );
+        // Mirror classdesc.py:606-618 — methods live in the class
+        // `__dict__`.  Install each registered `[.., Owner, method]`
+        // entry's function host on the interned `Owner` class object so
+        // `SomeInstance.getattr(method)` resolves to a bound MethodDesc
+        // instead of blocking.  AFTER populate + unsafe stubs so the
+        // entry set is complete.
+        registry.seed_struct_root_method_members();
         // RPython parity: `Translator.buildannotator()` /
         // `Translator.buildrtyper()` (`translator.py:69-83`) construct
         // exactly one annotator and one rtyper per Translator and assert

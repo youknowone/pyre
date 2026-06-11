@@ -228,6 +228,49 @@ impl PyreCallRegistry {
         self.bookkeeper.set_pyre_trait_unique_impls(map);
     }
 
+    /// Seed each struct-root class `HostObject`'s dict with its
+    /// registered impl-method function hosts.
+    ///
+    /// classdesc.py:606-618 — a class's methods live in its class
+    /// `__dict__`, so `SomeInstance.getattr(method)` resolves through
+    /// `check_missing_attribute_update` → `find_source_for` →
+    /// `s_get_value` (Constant function arm) → `bind_callables_under`
+    /// to a bound-`MethodDesc` `SomePBC`.  Pyre's struct-root classes
+    /// are interned from the field registry with an empty dict, so a
+    /// method getattr found no source and the block stayed blocked
+    /// forever.  Walk the registered entries: every path
+    /// `[.., Owner, method]` whose `Owner` is a struct-field-registry
+    /// root names a method of that class — install the entry's
+    /// function `HostObject` (Arc-identical to the one
+    /// `bookkeeper.descs` already keys, so `getdesc` resolves to the
+    /// same `FunctionDesc`/cachedgraph) under the method name on the
+    /// interned class object.  Free functions register as
+    /// `[module, fn]` with a lowercase module segment that is never a
+    /// registry root, so the membership gate filters them out.
+    ///
+    /// Called once from `dual_gate_registry` after
+    /// `populate_call_registry_from_call_graphs`.
+    pub fn seed_struct_root_method_members(&self) {
+        let guard = self.bookkeeper.pyre_struct_fields.borrow();
+        let Some(reg) = guard.as_ref() else {
+            return;
+        };
+        for (key, entry) in self.entries.borrow().iter() {
+            let segs = key.segments();
+            let [.., owner, method] = segs else {
+                continue;
+            };
+            if !reg.fields.contains_key(owner) {
+                continue;
+            }
+            let class_host = self.bookkeeper.intern_class_by_qualname(owner);
+            class_host.class_set(
+                method.clone(),
+                ConstValue::HostObject(entry.host_object.clone()),
+            );
+        }
+    }
+
     /// Get-or-construct the shared `(annotator, rtyper)` pair.
     ///
     /// First call constructs both from `self.bookkeeper`; subsequent
