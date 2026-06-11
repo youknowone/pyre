@@ -2405,7 +2405,6 @@ fn emit_loop_header(
         vec![super::flow::Constant::signed(jdindex as i64).into()],
         py_pc as i64,
     );
-    let pre_len = ssarepr.insns.len();
     let mut empty_regallocs = [
         super::regalloc::GraphAllocationResult {
             coloring: std::collections::HashMap::new(),
@@ -2421,9 +2420,6 @@ fn emit_loop_header(
         },
     ];
     GraphFlattener::new(graph, &mut empty_regallocs, ssarepr).serialize_op(&graph_op);
-    for insn in ssarepr.insns[pre_len..].to_vec() {
-        block.push_insn(insn);
-    }
 }
 
 fn emit_frontend_neg(
