@@ -2341,18 +2341,24 @@ impl<'a> Lowering<'a> {
                 // typed analogue today.
                 if let ProjectionElem::Tagged(v) = &elem
                     && let Some(field_payload) = v.as_object().and_then(|m| m.get("Field"))
-                    && let Some((owner_root, field_name, _field_ty)) =
+                    && let Some((owner_root, field_name, field_ty)) =
                         self.resolve_adt_field(field_payload)
                 {
                     let base = self.resolve_place(mir_bb, *inner)?;
                     let bb_id = self.block_id[mir_bb];
-                    // The projected place's own `ty` is the field type
-                    // AFTER generic substitution; the TypeDecl's field ty
-                    // (`_field_ty`) is the declaration-side generic param
-                    // for generic ADTs (`Result<i64, E>`'s Ok payload
-                    // declares `T`), which `tyref_to_value_type` can only
-                    // degrade to `Ref(None)` — mistyping scalar payloads.
-                    let ty = tyref_to_value_type(&place_ty, self.llbc);
+                    // The field's DECLARED ty is the polymorphic decl's
+                    // (monomorphize=false): for a generic container
+                    // (`ControlFlow<B, C>`, `Result<T, E>`) it is a bare
+                    // type variable, which projects to the `Ref`
+                    // fallback even when the instantiated payload is an
+                    // `i64`.  The place's post-projection type carries
+                    // the substituted use-site type, so prefer it; keep
+                    // the decl ty for the rare place shapes whose
+                    // post-projection type the reader cannot resolve.
+                    let ty = match tyref_to_value_type(&place_ty, self.llbc) {
+                        ValueType::Ref(None) => tyref_to_value_type(&field_ty, self.llbc),
+                        resolved => resolved,
+                    };
                     let res = self
                         .graph
                         .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
