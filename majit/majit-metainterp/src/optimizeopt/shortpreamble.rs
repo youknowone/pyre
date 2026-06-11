@@ -163,60 +163,9 @@ impl ShortPreamble {
         }
     }
 
-    /// Generate the operations to prepend when a bridge enters the loop.
-    ///
-    /// `bridge_args` are the OpRefs that the bridge provides as values
-    /// for each label arg. The short preamble ops are instantiated with
-    /// these concrete references.
-    pub fn instantiate(&self, bridge_args: &[OpRef]) -> Vec<Op> {
-        let mut result: Vec<Op> = Vec::with_capacity(self.ops.len());
-
-        for entry in &self.ops {
-            let mut op = entry.op.clone();
-
-            // Remap arguments: replace label arg indices with bridge's concrete refs
-            for (arg_pos, label_idx) in &entry.arg_mapping {
-                if let Some(bridge_ref) = bridge_args.get(*label_idx) {
-                    if *arg_pos < op.num_args() {
-                        op.setarg(*arg_pos, BoxRef::from_opref(*bridge_ref));
-                    }
-                }
-            }
-
-            if let Some(fail_args) = op.fail_args_mut() {
-                for (fail_arg_pos, label_idx) in &entry.fail_arg_mapping {
-                    if let Some(bridge_ref) = bridge_args.get(*label_idx) {
-                        if *fail_arg_pos < fail_args.len() {
-                            fail_args[*fail_arg_pos] =
-                                majit_ir::operand::Operand::Box(BoxRef::from_opref(*bridge_ref));
-                        }
-                    }
-                }
-            }
-
-            if op.opcode.is_guard_overflow()
-                && !matches!(result.last(), Some(prev) if prev.opcode.is_ovf())
-            {
-                continue;
-            }
-
-            result.push(op);
-        }
-
-        result
-    }
 }
 
 impl ShortPreamble {
-    /// shortpreamble.py: apply to bridge — prepend instantiated short preamble
-    /// ops to a bridge trace, creating a complete trace that the optimizer
-    /// can process with full preamble context.
-    pub fn apply_to_bridge(&self, bridge_args: &[OpRef], bridge_ops: &[Op]) -> Vec<Op> {
-        let mut result = self.instantiate(bridge_args);
-        result.extend_from_slice(bridge_ops);
-        result
-    }
-
     /// Count guards in the short preamble.
     pub fn num_guards(&self) -> usize {
         self.ops.iter().filter(|e| e.op.opcode.is_guard()).count()
@@ -2901,6 +2850,15 @@ pub fn produced_short_boxes_from_exported_boxes(
             if let Some(fail_args) = preamble_op.fail_args_mut() {
                 for arg in fail_args {
                     if let Some(renamed) = inputarg_rename(arg.to_opref()) {
+                        // Measured dead (PYRE_REMAP_PROBE 2026-06-11: 0 fires
+                        // across check.py corpus + lib tests) — exported short
+                        // boxes carry pure ops/guards without fail_args
+                        // referencing label args. Rewrite kept as a release
+                        // safety net.
+                        debug_assert!(
+                            false,
+                            "imported short-box fail_arg hit inputarg rename: {arg:?}"
+                        );
                         *arg = majit_ir::operand::Operand::Box(BoxRef::from_opref(renamed));
                     }
                 }
@@ -3245,71 +3203,6 @@ mod tests {
         assert_eq!(sp.ops[1].op.opcode, OpCode::GuardNonnull);
         assert_eq!(sp.ops[2].op.opcode, OpCode::GuardClass);
         assert_eq!(sp.ops[3].op.opcode, OpCode::IntAdd);
-    }
-
-    #[test]
-    fn test_roundtrip_extract_and_instantiate() {
-        // Full round-trip: peel → extract short preamble → instantiate for bridge
-        let mut ops = vec![
-            Op::new(OpCode::GuardTrue, &[BoxRef::from_opref(OpRef::int_op(100))]),
-            Op::new(
-                OpCode::GuardClass,
-                &[
-                    BoxRef::from_opref(OpRef::int_op(101)),
-                    BoxRef::from_opref(OpRef::int_op(200)),
-                ],
-            ),
-            Op::new(
-                OpCode::IntAdd,
-                &[
-                    BoxRef::from_opref(OpRef::int_op(100)),
-                    BoxRef::from_opref(OpRef::int_op(101)),
-                ],
-            ),
-            Op::new(
-                OpCode::Label,
-                &[
-                    BoxRef::from_opref(OpRef::int_op(100)),
-                    BoxRef::from_opref(OpRef::int_op(101)),
-                ],
-            ),
-            Op::new(
-                OpCode::IntAdd,
-                &[
-                    BoxRef::from_opref(OpRef::int_op(100)),
-                    BoxRef::from_opref(OpRef::int_op(101)),
-                ],
-            ),
-            Op::new(
-                OpCode::Jump,
-                &[
-                    BoxRef::from_opref(OpRef::int_op(4)),
-                    BoxRef::from_opref(OpRef::int_op(101)),
-                ],
-            ),
-        ];
-        assign_positions(&mut ops, 0);
-
-        let sp = extract_short_preamble(&ops);
-
-        // Instantiate for bridge with new values
-        let bridge_args = &[OpRef::int_op(500), OpRef::int_op(501)];
-        let instantiated = sp.instantiate(bridge_args);
-
-        // 2 guards + 1 pure IntAdd
-        assert_eq!(instantiated.len(), 3);
-
-        // Guard_true now checks bridge's v500 (was v100 → label arg 0)
-        assert_eq!(instantiated[0].opcode, OpCode::GuardTrue);
-        assert_eq!(instantiated[0].arg(0).to_opref(), OpRef::int_op(500));
-
-        // Guard_class now checks bridge's v501 against constant v200
-        assert_eq!(instantiated[1].opcode, OpCode::GuardClass);
-        assert_eq!(instantiated[1].arg(0).to_opref(), OpRef::int_op(501)); // remapped
-        assert_eq!(instantiated[1].arg(1).to_opref(), OpRef::int_op(200)); // constant, unchanged
-
-        // IntAdd with remapped args
-        assert_eq!(instantiated[2].opcode, OpCode::IntAdd);
     }
 
     #[test]

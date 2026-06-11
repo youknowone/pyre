@@ -559,6 +559,12 @@ impl TreeLoop {
             }
             if let Some(fa) = new_op.fail_args_mut() {
                 for arg in fa.iter_mut() {
+                    // Measured dead (PYRE_REMAP_PROBE 2026-06-11: 0 fires
+                    // across check.py corpus + lib tests) — post-cut ops
+                    // never carry fail_args at cut time; they are attached
+                    // later by store_final_boxes_in_guard. Rewrite kept as
+                    // a release safety net.
+                    debug_assert!(false, "cut-trace op carried fail_args: {:?}", new_op.opcode);
                     *arg = majit_ir::operand::Operand::Box(BoxRef::from_opref(remap_ref(
                         &arg.to_opref(),
                     )));

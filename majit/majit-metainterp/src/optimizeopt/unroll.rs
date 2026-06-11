@@ -3669,6 +3669,18 @@ impl OptUnroll {
                 } else if let Some(fail_args) = new_op.fail_args_mut() {
                     for arg in fail_args.iter_mut() {
                         if let Some(&mapped) = mapping.get(&arg.to_opref()) {
+                            // Measured dead (PYRE_REMAP_PROBE 2026-06-11: 0
+                            // fires across check.py corpus + lib tests) —
+                            // only guards carry fail_args and guards take the
+                            // clearfailargs arm above, matching unroll.py:
+                            // 405-414 which has no fail_args handling on the
+                            // non-guard path. Rewrite kept as a release
+                            // safety net.
+                            debug_assert!(
+                                false,
+                                "non-guard short-preamble op carried fail_args: {:?}",
+                                new_op.opcode
+                            );
                             *arg = majit_ir::operand::Operand::Box(BoxRef::from_opref(mapped));
                         }
                     }
