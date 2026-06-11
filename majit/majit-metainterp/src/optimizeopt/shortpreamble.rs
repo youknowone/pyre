@@ -162,7 +162,6 @@ impl ShortPreamble {
             info.walk_const_ptr_refs_mut(visitor);
         }
     }
-
 }
 
 impl ShortPreamble {
@@ -457,7 +456,14 @@ pub struct ShortBoxes {
     /// so we track which OpRefs correspond to constants here.
     known_constants: VecSet<OpRef>,
     /// shortpreamble.py: short_inputargs
-    short_inputargs: Vec<OpRef>,
+    ///
+    /// shortpreamble.py:256 `renamed = OpHelpers.inputarg_from_tp(box.type)`
+    /// mints a fresh producer-less InputArg box per label slot; the stored
+    /// boxes ARE the short preamble's Label args (shortpreamble.py:443).
+    /// pyre keeps the renamed box on the label arg's position (the rename
+    /// is positional), so each entry is a fresh position-only box minted
+    /// once here and compared by position.
+    short_inputargs: Vec<BoxRef>,
     /// shortpreamble.py: boxes_in_production — cycle-detection set
     /// for `materialize_one` recursion. Active set is bounded by
     /// recursion depth (linear scan suffices).
@@ -539,18 +545,20 @@ impl ShortBoxes {
     pub fn with_label_args(label_args: &[OpRef]) -> Self {
         let mut boxes = Self::new(label_args.len());
         for &arg in label_args.iter() {
-            boxes.short_inputargs.push(arg);
+            boxes.short_inputargs.push(BoxRef::from_opref(arg));
         }
         boxes
     }
 
     pub fn lookup_label_arg(&self, opref: OpRef) -> Option<usize> {
-        self.short_inputargs.iter().position(|&a| a == opref)
+        self.short_inputargs
+            .iter()
+            .position(|a| a.to_opref() == opref)
     }
 
     /// RPython parity: check if opref is reachable in the short preamble.
     pub fn is_reachable(&self, opref: OpRef) -> bool {
-        self.short_inputargs.contains(&opref)
+        self.short_inputargs.iter().any(|a| a.to_opref() == opref)
             || opref.is_constant()
             || self.potential_ops.iter().any(|(k, _)| *k == opref)
     }
@@ -668,7 +676,7 @@ impl ShortBoxes {
                 .map(|produced| produced.preamble_op.pos.get());
         }
         // Label args are always available as inputs (RPython: isinstance(op, InputArgIntOp))
-        if self.short_inputargs.contains(&opref) {
+        if self.short_inputargs.iter().any(|a| a.to_opref() == opref) {
             return Some(opref);
         }
         None
@@ -824,7 +832,7 @@ impl ShortBoxes {
     /// Unconditionally returns `self.short_inputargs`. The pyre fallback
     /// to `label_args.to_vec()` on empty was a TODO — empty
     /// short_inputargs is the legitimate empty-loop case in upstream.
-    pub fn create_short_inputargs(&self, _label_args: &[OpRef]) -> Vec<OpRef> {
+    pub fn create_short_inputargs(&self, _label_args: &[OpRef]) -> Vec<BoxRef> {
         self.short_inputargs.clone()
     }
 
@@ -1725,7 +1733,10 @@ struct AbstractShortPreambleBuilderState {
     used_boxes: Vec<OpRef>,
     short_preamble_jump: Vec<majit_ir::OpRc>,
     extra_same_as: Vec<Op>,
-    short_inputargs: Vec<OpRef>,
+    /// shortpreamble.py:430 `self.short_inputargs = short_inputargs` —
+    /// the renamed InputArg boxes; reused verbatim as the Label args
+    /// (shortpreamble.py:443 `ResOperation(rop.LABEL, self.short_inputargs[:])`).
+    short_inputargs: Vec<BoxRef>,
     /// Known constant OpRefs. In RPython, isinstance(box, Const) is a type
     /// check. In majit, constant OpRefs must be explicitly tracked.
     known_constants: VecSet<OpRef>,
@@ -1785,11 +1796,7 @@ impl AbstractShortPreambleBuilderState {
 
     /// Internal: append preamble_op to short (with ovf guard).
     /// Used by add_op_to_short (recursive export-time path).
-    fn append_to_short(
-        &mut self,
-        _result: OpRef,
-        produced: &ProducedShortOp,
-    ) -> majit_ir::OpRc {
+    fn append_to_short(&mut self, _result: OpRef, produced: &ProducedShortOp) -> majit_ir::OpRc {
         let canonical_result = produced.preamble_op.pos.get();
         if self.short_results.contains(&canonical_result) {
             return produced.preamble_op.clone();
@@ -1832,7 +1839,7 @@ impl AbstractShortPreambleBuilderState {
             let arg = arg.to_opref();
             if self.short_results.contains(&arg)
                 || already_in_short.contains(&arg)
-                || self.short_inputargs.contains(&arg)
+                || self.short_inputargs.iter().any(|a| a.to_opref() == arg)
                 || self.known_constants.contains(&arg)
             {
                 continue;
@@ -1975,13 +1982,21 @@ impl ShortPreambleBuilder {
         for (k, v) in short_boxes {
             produced_short_boxes.insert(*k, v.clone());
         }
+        // shortpreamble.py:430 stores the renamed InputArg box objects.
+        // The OpRef slice arrives from exported (position-domain) data, so
+        // mint the position-only boxes once here; every later read (Label
+        // args, membership) shares these box objects.
+        let inputarg_oprefs = if short_inputargs.is_empty() {
+            label_args
+        } else {
+            short_inputargs
+        };
         ShortPreambleBuilder {
             state: AbstractShortPreambleBuilderState {
-                short_inputargs: if short_inputargs.is_empty() {
-                    label_args.to_vec()
-                } else {
-                    short_inputargs.to_vec()
-                },
+                short_inputargs: inputarg_oprefs
+                    .iter()
+                    .map(|&a| BoxRef::from_opref(a))
+                    .collect(),
                 ..AbstractShortPreambleBuilderState::default()
             },
             produced_short_boxes,
@@ -2110,13 +2125,10 @@ impl ShortPreambleBuilder {
 
     pub fn build_short_preamble(&self) -> Vec<Op> {
         let mut result = Vec::with_capacity(self.state.short.len() + 2);
-        let label_args: Vec<BoxRef> = self
-            .state
-            .short_inputargs
-            .iter()
-            .map(|a| BoxRef::from_opref(*a))
-            .collect();
-        result.push(Op::new(OpCode::Label, &label_args));
+        // shortpreamble.py:443 `ResOperation(rop.LABEL,
+        // self.short_inputargs[:])` — the Label args are the stored
+        // renamed-inputarg boxes themselves, not fresh mints.
+        result.push(Op::new(OpCode::Label, &self.state.short_inputargs));
         result.extend(self.state.short.iter().map(|op| (**op).clone()));
         let jump_args: Vec<BoxRef> = self
             .state
@@ -2135,8 +2147,16 @@ impl ShortPreambleBuilder {
             .iter()
             .map(|op| op.pos.get())
             .collect();
+        // ShortPreamble is the cross-phase (position-domain) export;
+        // shed the boxes to their positions at this boundary.
+        let short_inputargs: Vec<OpRef> = self
+            .state
+            .short_inputargs
+            .iter()
+            .map(|a| a.to_opref())
+            .collect();
         build_short_preamble_struct_from_ops(
-            &self.state.short_inputargs,
+            &short_inputargs,
             &self.state.short,
             &self.state.used_boxes,
             &jump_args,
@@ -2155,7 +2175,7 @@ impl ShortPreambleBuilder {
         &self.state.extra_same_as
     }
 
-    pub fn short_inputargs(&self) -> &[OpRef] {
+    pub fn short_inputargs(&self) -> &[BoxRef] {
         &self.state.short_inputargs
     }
 }
@@ -2167,7 +2187,7 @@ impl ShortPreambleBuilder {
 #[derive(Clone, Debug)]
 pub struct ExtendedShortPreambleBuilder {
     produced_short_boxes: VecAssoc<OpRef, ProducedShortOp>,
-    short_inputargs: Vec<OpRef>,
+    short_inputargs: Vec<BoxRef>,
     /// shortpreamble.py:460: self.short = short — single ops list (base + JUMP sentinel)
     short: Vec<Op>,
     /// Tracks which OpRefs are already in `short` (for dedup).
@@ -2216,7 +2236,9 @@ impl ExtendedShortPreambleBuilder {
         for (_, produced) in self.produced_short_boxes.iter_mut() {
             visit_produced(produced, visitor);
         }
-        visit_oprefs(&mut self.short_inputargs, visitor);
+        for arg in &self.short_inputargs {
+            arg.walk_const_ptr_refs(visitor);
+        }
         for op in &mut self.short {
             op.walk_const_ptr_refs_mut(visitor);
         }
@@ -2605,7 +2627,7 @@ impl ExtendedShortPreambleBuilder {
             for arg in preamble_op.getarglist().iter() {
                 let arg = arg.to_opref();
                 if self.short_results.contains(&arg)
-                    || self.short_inputargs.contains(&arg)
+                    || self.short_inputargs.iter().any(|a| a.to_opref() == arg)
                     || self.known_constants.contains(&arg)
                 {
                     continue;
@@ -2644,7 +2666,7 @@ impl ExtendedShortPreambleBuilder {
         self.produced_short_boxes.get(&result).cloned()
     }
 
-    pub fn short_inputargs(&self) -> &[OpRef] {
+    pub fn short_inputargs(&self) -> &[BoxRef] {
         &self.short_inputargs
     }
 
@@ -2654,8 +2676,12 @@ impl ExtendedShortPreambleBuilder {
             .iter()
             .map(|op| std::rc::Rc::new(op.clone()))
             .collect();
+        // ShortPreamble is the cross-phase (position-domain) export;
+        // shed the boxes to their positions at this boundary.
+        let short_inputargs: Vec<OpRef> =
+            self.short_inputargs.iter().map(|a| a.to_opref()).collect();
         let inputargs = if self.label_args.is_empty() {
-            &self.short_inputargs
+            &short_inputargs
         } else {
             &self.label_args
         };
@@ -2665,8 +2691,8 @@ impl ExtendedShortPreambleBuilder {
             &self.used_boxes,
             &self.short_jump_args,
         );
-        if inputargs != &self.short_inputargs {
-            sp.phase1_inputargs = Some(self.short_inputargs.clone());
+        if inputargs != &short_inputargs {
+            sp.phase1_inputargs = Some(short_inputargs);
         }
         sp
     }

@@ -3163,7 +3163,7 @@ impl OptContext {
     /// `info.make_guards(...)` uniformly.
     fn collect_use_box_guards(&mut self, preamble_op: &Op) -> (Vec<Op>, Vec<Op>) {
         // shortpreamble.py:383-396: guards for InputArg args only
-        let short_inputargs: Vec<OpRef> = self
+        let short_inputargs: Vec<crate::r#box::BoxRef> = self
             .imported_short_preamble_builder
             .as_ref()
             .map(|b| b.short_inputargs().to_vec())
@@ -3256,7 +3256,7 @@ impl OptContext {
             if arg.is_constant() || arg.is_none() {
                 continue;
             }
-            let is_input = short_inputargs.contains(&arg);
+            let is_input = short_inputargs.iter().any(|a| a.to_opref() == arg);
             if let Some(info) = snapshot_forwarded(self, arg) {
                 arg_entries.push(ArgEntry {
                     arg,
