@@ -2901,7 +2901,7 @@ impl Repr for InstanceRepr {
     }
 
     fn repr_class_id(&self) -> ReprClassId {
-        ReprClassId::Repr
+        ReprClassId::InstanceRepr
     }
 
     /// RPython `InstanceRepr.rtype_getattr(self, hop)` (rclass.py:838-857):
@@ -3115,6 +3115,76 @@ impl Repr for InstanceRepr {
             ClassReprArc::Root(r) => r.getclsfield(Hlvalue::Variable(v_cls), &attr, &mut llops)?,
         };
         Ok(Some(Hlvalue::Variable(var)))
+    }
+
+    /// RPython `InstanceRepr.rtype_setattr(self, hop)` (rclass.py:859-864):
+    ///
+    /// ```python
+    /// def rtype_setattr(self, hop):
+    ///     attr = hop.args_s[1].const
+    ///     r_value = self.getfieldrepr(attr)
+    ///     vinst, vattr, vvalue = hop.inputargs(self, Void, r_value)
+    ///     self.setfield(vinst, attr, vvalue, hop.llops,
+    ///                   flags=hop.args_s[0].flags)
+    /// ```
+    fn rtype_setattr(&self, hop: &HighLevelOp) -> RTypeResult {
+        use crate::annotator::model::SomeValue;
+        use crate::translator::rtyper::rtyper::ConvertedTo;
+
+        // upstream: `attr = hop.args_s[1].const`.
+        let (attr, flags) = {
+            let args_s = hop.args_s.borrow();
+            let s_attr = args_s.get(1).ok_or_else(|| {
+                TyperError::message("InstanceRepr.rtype_setattr: hop.args_s[1] missing")
+            })?;
+            let attr = s_attr
+                .const_()
+                .and_then(ConstValue::as_pystr)
+                .ok_or_else(|| {
+                    TyperError::message(
+                        "InstanceRepr.rtype_setattr: attribute name must be a constant string",
+                    )
+                })?
+                .to_string();
+            // upstream: `flags=hop.args_s[0].flags`.
+            let flags = match args_s.first() {
+                Some(SomeValue::Instance(inst)) => inst
+                    .flags
+                    .iter()
+                    .map(|(k, v)| (k.clone(), ConstValue::Bool(*v)))
+                    .collect::<Flags>(),
+                _ => Flags::default(),
+            };
+            (attr, flags)
+        };
+
+        // Recover `Arc<Self>` for the `&Arc<Self>`-receiver helpers
+        // (`getfieldrepr` / `setfield`), same as `rtype_getattr`.
+        let rtyper = self.rtyper.upgrade().ok_or_else(|| {
+            TyperError::message("InstanceRepr.rtype_setattr: rtyper weak ref expired")
+        })?;
+        let self_arc = getinstancerepr(&rtyper, self.classdef.as_ref(), self.gcflavor)?;
+
+        // upstream: `r_value = self.getfieldrepr(attr)`.
+        let r_value = self_arc.getfieldrepr(&attr)?;
+        // upstream: `vinst, vattr, vvalue = hop.inputargs(self, Void, r_value)`.
+        let void = LowLevelType::Void;
+        let vlist = hop.inputargs(vec![
+            ConvertedTo::Repr(self),
+            ConvertedTo::from(&void),
+            ConvertedTo::Repr(r_value.as_ref()),
+        ])?;
+        // upstream: `self.setfield(vinst, attr, vvalue, hop.llops, flags=...)`.
+        let mut llops = hop.llops.borrow_mut();
+        self_arc.setfield(
+            vlist[0].clone(),
+            &attr,
+            vlist[2].clone(),
+            &mut llops,
+            false,
+            &flags,
+        )?;
+        Ok(None)
     }
 
     /// RPython `InstanceRepr.rtype_bool(self, hop)` (rclass.py:866-868):
@@ -3660,6 +3730,74 @@ pub fn rtype_new_instance(
     let rinstance = getinstancerepr(rtyper, classdef, Flavor::Gc)?;
     Repr::setup(rinstance.as_ref() as &dyn Repr)?;
     rinstance.new_instance(llops)
+}
+
+/// RPython `pairtype(InstanceRepr, InstanceRepr).convert_from_to((r_ins1,
+/// r_ins2), v, llops)` (rclass.py:1035-1055):
+///
+/// ```python
+/// def convert_from_to((r_ins1, r_ins2), v, llops):
+///     # which is a subclass of which?
+///     if r_ins1.classdef is None or r_ins2.classdef is None:
+///         basedef = None
+///     else:
+///         basedef = r_ins1.classdef.commonbase(r_ins2.classdef)
+///     if basedef == r_ins2.classdef:
+///         # r_ins1 is an instance of the subclass: converting to parent
+///         v = llops.genop('cast_pointer', [v],
+///                         resulttype=r_ins2.lowleveltype)
+///         return v
+///     elif basedef == r_ins1.classdef:
+///         # r_ins2 is an instance of the subclass: potentially unsafe
+///         # casting, but we do it anyway (e.g. the annotator produces
+///         # such casts after a successful isinstance() check)
+///         v = llops.genop('cast_pointer', [v],
+///                         resulttype=r_ins2.lowleveltype)
+///         return v
+///     else:
+///         return NotImplemented
+/// ```
+pub(super) fn pair_instance_instance_convert_from_to(
+    r_from: &dyn Repr,
+    r_to: &dyn Repr,
+    v: &Hlvalue,
+    llops: &mut LowLevelOpList,
+) -> Result<Option<Hlvalue>, TyperError> {
+    let r_ins1 = (r_from as &dyn std::any::Any)
+        .downcast_ref::<InstanceRepr>()
+        .ok_or_else(|| {
+            TyperError::message(
+                "pair_instance_instance_convert_from_to: r_from is not InstanceRepr",
+            )
+        })?;
+    let r_ins2 = (r_to as &dyn std::any::Any)
+        .downcast_ref::<InstanceRepr>()
+        .ok_or_else(|| {
+            TyperError::message("pair_instance_instance_convert_from_to: r_to is not InstanceRepr")
+        })?;
+    let basedef = match (&r_ins1.classdef, &r_ins2.classdef) {
+        (Some(c1), Some(c2)) => ClassDef::commonbase(c1, c2),
+        _ => None,
+    };
+    let classdef_eq = |a: &Option<Rc<RefCell<ClassDef>>>, b: &Option<Rc<RefCell<ClassDef>>>| {
+        match (a, b) {
+            (Some(a), Some(b)) => Rc::ptr_eq(a, b),
+            (None, None) => true,
+            _ => false,
+        }
+    };
+    // Upstream's two arms (upcast to parent / downcast after a
+    // successful isinstance check) both emit the same cast_pointer.
+    if classdef_eq(&basedef, &r_ins2.classdef) || classdef_eq(&basedef, &r_ins1.classdef) {
+        return Ok(llops
+            .genop(
+                "cast_pointer",
+                vec![v.clone()],
+                GenopResult::LLType(r_ins2.lowleveltype.clone()),
+            )
+            .map(Hlvalue::Variable));
+    }
+    Ok(None)
 }
 
 /// RPython `buildinstancerepr(rtyper, classdef, gcflavor='gc')`
