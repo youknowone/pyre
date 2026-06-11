@@ -2807,7 +2807,7 @@ impl Optimizer {
                     preamble_op.pos.set(canonical_result);
                     // optimizer.py:651-652 force_box loop parity.
                     for i in 0..preamble_op.num_args() {
-                        preamble_op.setarg(i, ctx.replacement_for_operand(&preamble_op.arg(i)));
+                        preamble_op.setarg(i, ctx.resolve_box_box(&preamble_op.arg(i)));
                     }
                     if let Some(fail_args) = preamble_op.fail_args_mut() {
                         for arg in fail_args {

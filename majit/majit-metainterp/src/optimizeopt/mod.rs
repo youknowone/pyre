@@ -4155,7 +4155,7 @@ impl OptContext {
     /// fallback is production-dead (#123/S2, probe-verified 0 fires over
     /// the corpus): the round-trip callers that used to reach it moved to
     /// [`OptContext::get_replacement_opref`] /
-    /// [`OptContext::replacement_for_operand`], and the import paths
+    /// [`OptContext::resolve_box_box`], and the import paths
     /// materialize their carried refs (`import_state` targets, imported
     /// short-pure results). What remains of the fallback serves unit
     /// fixtures probing forwarding on unregistered baseline positions;
@@ -4370,23 +4370,6 @@ impl OptContext {
         match self.get_box_replacement_box(opref) {
             Some(b) => b.to_opref(),
             None => opref,
-        }
-    }
-
-    /// `op.setarg(i, self.get_box_replacement(op.getarg(i)))`
-    /// (optimizer.py:346-348 emit-side operand refresh) — resolve an
-    /// operand to its chain terminal for writing back. Registry-first so a
-    /// legacy position-only operand upgrades to its bound producer; when
-    /// the position resolves nowhere, walk the operand's own bound chain
-    /// (RPython's direct `op.getarg(i).get_box_replacement()`) instead of
-    /// fabricating a position-only box.
-    pub(crate) fn replacement_for_operand(
-        &self,
-        arg: &crate::r#box::BoxRef,
-    ) -> crate::r#box::BoxRef {
-        match self.get_box_replacement_box(arg.to_opref()) {
-            Some(b) => b,
-            None => arg.get_box_replacement(false),
         }
     }
 
