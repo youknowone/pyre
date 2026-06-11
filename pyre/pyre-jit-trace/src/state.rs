@@ -3037,8 +3037,7 @@ pub(crate) fn flush_walk_end_state_to_frame(
     let Some((_opref, shadow_lastblock)) = ctx.virtualizable_entry_at(lastblock_idx) else {
         return false;
     };
-    let frame_lastblock =
-        unsafe { *(frame_ptr.add(PYFRAME_LASTBLOCK_OFFSET) as *const usize) };
+    let frame_lastblock = unsafe { *(frame_ptr.add(PYFRAME_LASTBLOCK_OFFSET) as *const usize) };
     match shadow_lastblock {
         Value::Ref(r) => {
             if r.0 != frame_lastblock {

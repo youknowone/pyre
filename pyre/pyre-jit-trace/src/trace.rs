@@ -28,6 +28,32 @@ pub fn take_walk_end_flush_committed() -> bool {
     WALK_END_FLUSH_COMMITTED.with(|c| c.replace(false))
 }
 
+thread_local! {
+    /// Green keys whose full-body walk failed on a structural walker
+    /// limitation (the recurring `DispatchError` classes listed in
+    /// `full_body_walk_trace`).  A retrace of such a key takes the trait
+    /// tracer leg of `trace_bytecode` so the location still compiles;
+    /// permanently marking it `DONT_TRACE_HERE` instead leaves every
+    /// guard failure / back-edge at that location interpreting forever
+    /// (a try-protected raise in a hot loop deopt-storms past any
+    /// timeout).  Upstream never marks a location untraceable on an
+    /// abort (pyjitpl.py:2392 aborted_tracing); this set is the
+    /// transitional FBW equivalent and is deleted with the trait tracer
+    /// in Phase 6.
+    static FBW_DECLINED_KEYS: std::cell::RefCell<std::collections::HashSet<u64>> =
+        std::cell::RefCell::new(std::collections::HashSet::new());
+}
+
+fn fbw_declined(key: u64) -> bool {
+    FBW_DECLINED_KEYS.with(|s| s.borrow().contains(&key))
+}
+
+fn fbw_decline(key: u64) {
+    FBW_DECLINED_KEYS.with(|s| {
+        s.borrow_mut().insert(key);
+    });
+}
+
 /// Trace an entire loop body starting at `start_pc`.
 ///
 /// RPython MetaInterp._interpret() parity: creates a PyreMetaInterp
@@ -115,8 +141,20 @@ pub fn trace_bytecode(
     // `PYRE_FULL_BODY_WALK=0` opts back into the trait
     // `metainterp.interpret` loop below (transition escape hatch; the trait
     // tracer is deleted in Phase 6).
+    //
+    // A green key in `FBW_DECLINED_KEYS` had a prior walk fail on a
+    // structural walker limitation (the recurring error classes in
+    // `full_body_walk_trace`); the retrace routes through the trait
+    // tracer below instead of permanently blacklisting the location
+    // (`DONT_TRACE_HERE`).  Tracing aborts must not mark a location
+    // untraceable — upstream aborts or switches to the blackhole and the
+    // location stays eligible (pyjitpl.py:2392 aborted_tracing /
+    // blackhole switch); the trait leg is pyre's transitional stand-in
+    // until the walker covers those shapes (deleted with the trait in
+    // Phase 6).
     if carrier.is_none()
         && std::env::var_os("PYRE_FULL_BODY_WALK").as_deref() != Some(std::ffi::OsStr::new("0"))
+        && !fbw_declined(crate::driver::make_green_key(w_code, start_pc))
     {
         let action = full_body_walk_trace(ctx, sym, w_code, start_pc, cf_addr);
         return (action, concrete_frame);
@@ -827,17 +865,21 @@ fn full_body_walk_trace(
         Some((_entry, _code_len, Err(e))) => {
             // Structural walker limitations recur identically on every
             // retrace of this location (the same jitcode walked from the same
-            // entry produces the same error), so blacklist it permanently
-            // (`AbortPermanent` → `DONT_TRACE_HERE`) instead of thrashing
-            // `MAX_TRACE_ABORT_COUNT` futile deep re-traces — each of which
-            // executes the body's residual calls concretely before failing at
-            // the unsupported resume / exception / closure shape.  The
-            // location stays correct via the trait-interpreted fallback; the
-            // permanent mark only stops the wasted walk attempts.  These four
-            // are the multi-session-blocked shapes (resume snapshot #124,
-            // exception-handler resume #51c, closure NULL-self #60, unported
-            // raise marker); other errors retain the soft `Abort` so a
-            // capability that lands mid-run can still pick the location up.
+            // entry produces the same error), so route the key's retraces to
+            // the trait tracer (`FBW_DECLINED_KEYS` → the trait leg of
+            // `trace_bytecode`) instead of thrashing futile deep re-walks —
+            // each of which executes the body's residual calls concretely
+            // before failing at the unsupported resume / exception / closure
+            // shape.  Permanently blacklisting (`AbortPermanent` →
+            // `DONT_TRACE_HERE`) is wrong here: it leaves the location
+            // interpreting forever (a try-protected raise in a hot loop
+            // deopt-storms past any timeout), and upstream never marks a
+            // location untraceable on an abort (pyjitpl.py:2392
+            // aborted_tracing).  These five are the multi-session-blocked
+            // shapes (resume snapshot #124, exception-handler resume #51c,
+            // closure NULL-self #60, unported raise marker); other errors
+            // retain the plain `Abort` without declining so a capability
+            // that lands mid-run can still pick the location up.
             use crate::jitcode_dispatch::DispatchError as DE;
             if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
                 eprintln!("[fbw-abort] start_pc={start_pc} Err={e:?}");
@@ -848,7 +890,10 @@ fn full_body_walk_trace(
                 | DE::MayForceProtectedByExceptionHandlerUnsupported { .. }
                 | DE::MayForceNullRefArgUnsupported { .. }
                 | DE::BranchGuardKeptStackUnsupported { .. }
-                | DE::NonStandardVableFinishPortalUnsupported { .. } => TraceAction::AbortPermanent,
+                | DE::NonStandardVableFinishPortalUnsupported { .. } => {
+                    fbw_decline(crate::driver::make_green_key(w_code, start_pc));
+                    TraceAction::Abort
+                }
                 _ => TraceAction::Abort,
             }
         }
