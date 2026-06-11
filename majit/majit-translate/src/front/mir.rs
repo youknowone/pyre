@@ -1652,12 +1652,20 @@ impl<'a> Lowering<'a> {
                 let res = self
                     .graph
                     .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                // f64 arithmetic stays in the Float bank (`float_add`/
+                // `float_mod`...); everything else — comparisons (bool),
+                // integer math, and checked-arithmetic `(int, bool)`
+                // tuple destinations — is Int.
+                let result_ty = match tyref_to_value_type(dest_ty, self.llbc) {
+                    ValueType::Float => ValueType::Float,
+                    _ => ValueType::Int,
+                };
                 Ok((
                     Some(OpKind::BinOp {
                         op: op_label,
                         lhs: lhs_v,
                         rhs: rhs_v,
-                        result_ty: ValueType::Int,
+                        result_ty,
                     }),
                     res,
                 ))
@@ -1726,11 +1734,19 @@ impl<'a> Lowering<'a> {
                 let res = self
                     .graph
                     .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                // `Neg` on f64 stays in the Float bank (`float_neg`);
+                // everything else is Int.  A hardcoded Int here mistyped
+                // float negation and produced cross-bank link renamings
+                // downstream.
+                let result_ty = match tyref_to_value_type(dest_ty, self.llbc) {
+                    ValueType::Float => ValueType::Float,
+                    _ => ValueType::Int,
+                };
                 Ok((
                     Some(OpKind::UnaryOp {
                         op: op_label,
                         operand: arg,
-                        result_ty: ValueType::Int,
+                        result_ty,
                     }),
                     res,
                 ))
@@ -2078,12 +2094,18 @@ impl<'a> Lowering<'a> {
                 // typed analogue today.
                 if let ProjectionElem::Tagged(v) = &elem
                     && let Some(field_payload) = v.as_object().and_then(|m| m.get("Field"))
-                    && let Some((owner_root, field_name, field_ty)) =
+                    && let Some((owner_root, field_name, _field_ty)) =
                         self.resolve_adt_field(field_payload)
                 {
                     let base = self.resolve_place(mir_bb, *inner)?;
                     let bb_id = self.block_id[mir_bb];
-                    let ty = tyref_to_value_type(&field_ty, self.llbc);
+                    // The projected place's own `ty` is the field type
+                    // AFTER generic substitution; the TypeDecl's field ty
+                    // (`_field_ty`) is the declaration-side generic param
+                    // for generic ADTs (`Result<i64, E>`'s Ok payload
+                    // declares `T`), which `tyref_to_value_type` can only
+                    // degrade to `Ref(None)` — mistyping scalar payloads.
+                    let ty = tyref_to_value_type(&place_ty, self.llbc);
                     let res = self
                         .graph
                         .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
