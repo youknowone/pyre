@@ -5657,7 +5657,8 @@ impl ClassesPBCRepr {
         hop: &crate::translator::rtyper::rtyper::HighLevelOp,
         _call_args: bool,
     ) -> crate::translator::rtyper::rmodel::RTypeResult {
-        use crate::annotator::classdesc::{ClassDef, ClassDesc};
+        use crate::annotator::classdesc::ClassDef;
+        use crate::annotator::classdesc::ClassDesc;
         use crate::annotator::model::SomeValue;
 
         // Shapes outside the ported single-class / Void / no-`__init__` /
@@ -5714,6 +5715,10 @@ impl ClassesPBCRepr {
         //    adapter AFTER that pass, so they reach here unnumbered.  Since
         //    `assign_inheritance_ids` is now append-stable (skip-if-numbered
         //    + append-only), number such a class on demand below.
+        // Field-bearing classes route through `new_instance`'s
+        // class-default initialisation loop (rclass.py:752-769) like
+        // any other; a field without a class-level default keeps the
+        // malloc zero-init.
         if !init_is_impossible {
             return Err(unported("class has __init__ (rpbc.py:1060-1067)"));
         }
@@ -5771,6 +5776,8 @@ impl ClassesPBCRepr {
                 &rtyper,
                 Some(&classdef),
                 &mut llops,
+                Some(hop),
+                false,
             )?
         };
         // upstream rpbc.py:1058-1059 — no `__init__` ⇒ the malloc cannot

@@ -2175,6 +2175,69 @@ impl InstanceRepr {
         // upstream: `pass`.
     }
 
+    /// RPython `InstanceRepr.hook_setfield(self, vinst, fieldname,
+    /// llops)` (rclass.py:715-718):
+    ///
+    /// ```python
+    /// def hook_setfield(self, vinst, fieldname, llops):
+    ///     if self.is_quasi_immutable(fieldname):
+    ///         c_fieldname = inputconst(Void, 'mutate_' + fieldname)
+    ///         llops.genop('jit_force_quasi_immutable', [vinst, c_fieldname])
+    /// ```
+    pub fn hook_setfield(
+        self: &Arc<Self>,
+        vinst: &Hlvalue,
+        fieldname: &str,
+        llops: &mut LowLevelOpList,
+    ) {
+        if self.is_quasi_immutable(fieldname) {
+            let c_fieldname = Hlvalue::Constant(Constant::with_concretetype(
+                ConstValue::byte_str(format!("mutate_{fieldname}")),
+                LowLevelType::Void,
+            ));
+            llops.genop(
+                "jit_force_quasi_immutable",
+                vec![vinst.clone(), c_fieldname],
+                GenopResult::Void,
+            );
+        }
+    }
+
+    /// RPython `InstanceRepr.is_quasi_immutable(self, fieldname)`
+    /// (rclass.py:720-729):
+    ///
+    /// ```python
+    /// def is_quasi_immutable(self, fieldname):
+    ///     search1 = fieldname + '?'
+    ///     search2 = fieldname + '?[*]'
+    ///     rbase = self
+    ///     while rbase.classdef is not None:
+    ///         if (search1 in rbase.immutable_field_set or
+    ///                 search2 in rbase.immutable_field_set):
+    ///             return True
+    ///         rbase = rbase.rbase
+    ///     return False
+    /// ```
+    pub fn is_quasi_immutable(self: &Arc<Self>, fieldname: &str) -> bool {
+        let search1 = format!("{fieldname}?");
+        let search2 = format!("{fieldname}?[*]");
+        let mut rbase = self.clone();
+        while rbase.classdef.is_some() {
+            {
+                let set = rbase.immutable_field_set.borrow();
+                if set.contains(&search1) || set.contains(&search2) {
+                    return true;
+                }
+            }
+            let next = rbase.rbase.borrow().clone();
+            match next {
+                Some(n) => rbase = n,
+                None => break,
+            }
+        }
+        false
+    }
+
     /// RPython `InstanceRepr.getfield(self, vinst, attr, llops,
     /// force_cast=False, flags={})` (rclass.py:987-1000):
     ///
@@ -2302,6 +2365,8 @@ impl InstanceRepr {
             };
             // upstream: `self.hook_access_field(vinst, cname, llops, flags)`.
             self.hook_access_field(&vinst, &cname, llops, flags);
+            // upstream: `self.hook_setfield(vinst, attr, llops)`.
+            self.hook_setfield(&vinst, attr, llops);
             // upstream: `llops.genop('setfield', [vinst, cname, vvalue])`.
             llops.genop("setfield", vec![vinst, cname, vvalue], GenopResult::Void);
             return Ok(());
@@ -2328,26 +2393,32 @@ impl InstanceRepr {
     ///     """Build a new instance, without calling __init__."""
     ///     flavor = self.gcflavor
     ///     flags = {'flavor': flavor}
+    ///     if nonmovable:
+    ///         flags['nonmovable'] = True
     ///     ctype = inputconst(Void, self.object_type)
     ///     cflags = inputconst(Void, flags)
     ///     vlist = [ctype, cflags]
     ///     vptr = llops.genop('malloc', vlist, resulttype=Ptr(self.object_type))
     ///     ctypeptr = inputconst(CLASSTYPE, self.rclass.getvtable())
     ///     self.setfield(vptr, '__class__', ctypeptr, llops)
+    ///     if self.has_special_memory_pressure(self.object_type):
+    ///         self.setfield(vptr, 'special_memory_pressure',
+    ///             inputconst(lltype.Signed, 0), llops)
     ///     ...                # initialize instance attributes from defaults
     ///     return vptr
     /// ```
     ///
     /// Emits the runtime `malloc` op (vs the host-side immortal
     /// allocation [`Self::create_instance`] used for prebuilt data) plus
-    /// the `__class__` `setfield`. The class-level defaults loop
-    /// (rclass.py:752-769) is a no-op for fieldless classes — every
-    /// `allinstancefields` entry but `__class__` is skipped; a field
-    /// that survives the skips needs default-value conversion that is
-    /// deferred to a follow-up and surfaces here as an explicit error.
+    /// the `__class__` `setfield` and the class-level defaults loop.
+    /// `classcallhop` is unused in this base body, exactly as upstream —
+    /// its only consumer is the `TaggedInstanceRepr` override
+    /// (`lltypesystem/rtagged.py:30-38`), unported.
     pub fn new_instance(
         self: &Arc<Self>,
         llops: &mut LowLevelOpList,
+        _classcallhop: Option<&crate::translator::rtyper::rtyper::HighLevelOp>,
+        nonmovable: bool,
     ) -> Result<Hlvalue, TyperError> {
         // upstream: `ctype = inputconst(Void, self.object_type)` — the
         // Void-typed type tag carrying the resolved object Struct lltype,
@@ -2362,15 +2433,18 @@ impl InstanceRepr {
             other => other,
         };
         let ctype = Constant::with_concretetype(
-            ConstValue::LowLevelType(Box::new(object_lltype)),
+            ConstValue::LowLevelType(Box::new(object_lltype.clone())),
             LowLevelType::Void,
         );
-        // upstream: `cflags = inputconst(Void, {'flavor': flavor})`. The
-        // flavor sentinel matches the `newtuple` emitter's encoding; the
+        // upstream: `cflags = inputconst(Void, {'flavor': flavor})` plus
+        // `flags['nonmovable'] = True` when requested. The flavor
+        // sentinel matches the `newtuple` emitter's encoding; the
         // lowering pass reads the type from `ctype` and the flavor here.
-        let flavor_sentinel = match self.gcflavor {
-            Flavor::Gc => "flavor=gc",
-            Flavor::Raw => "flavor=raw",
+        let flavor_sentinel = match (self.gcflavor, nonmovable) {
+            (Flavor::Gc, false) => "flavor=gc",
+            (Flavor::Gc, true) => "flavor=gc;nonmovable",
+            (Flavor::Raw, false) => "flavor=raw",
+            (Flavor::Raw, true) => "flavor=raw;nonmovable",
         };
         let cflags =
             Constant::with_concretetype(ConstValue::byte_str(flavor_sentinel), LowLevelType::Void);
@@ -2414,6 +2488,24 @@ impl InstanceRepr {
             false,
             &Flags::default(),
         )?;
+        // upstream rclass.py:745-748 — zero the
+        // `special_memory_pressure` counter slot when the object struct
+        // carries one.  The slot is minted by the
+        // `_special_memory_pressure_` class hint (rclass.py:541-544,
+        // unported), so this arm stays dormant until that hint lands.
+        if has_special_memory_pressure(&object_lltype) {
+            self.setfield(
+                vptr.clone(),
+                "special_memory_pressure",
+                Hlvalue::Constant(Constant::with_concretetype(
+                    ConstValue::Int(0),
+                    LowLevelType::Signed,
+                )),
+                llops,
+                false,
+                &Flags::default(),
+            )?;
+        }
         // upstream rclass.py:752-769 — initialize instance attributes
         // from their class-level defaults:
         //
@@ -3770,10 +3862,36 @@ pub fn rtype_new_instance(
     rtyper: &Rc<RPythonTyper>,
     classdef: Option<&Rc<RefCell<ClassDef>>>,
     llops: &mut LowLevelOpList,
+    classcallhop: Option<&crate::translator::rtyper::rtyper::HighLevelOp>,
+    nonmovable: bool,
 ) -> Result<Hlvalue, TyperError> {
     let rinstance = getinstancerepr(rtyper, classdef, Flavor::Gc)?;
     Repr::setup(rinstance.as_ref() as &dyn Repr)?;
-    rinstance.new_instance(llops)
+    rinstance.new_instance(llops, classcallhop, nonmovable)
+}
+
+/// RPython `InstanceRepr.has_special_memory_pressure(self, tp)`
+/// (rclass.py:480-485):
+///
+/// ```python
+/// def has_special_memory_pressure(self, tp):
+///     if 'special_memory_pressure' in tp._flds:
+///         return True
+///     if 'super' in tp._flds:
+///         return self.has_special_memory_pressure(tp._flds['super'])
+///     return False
+/// ```
+fn has_special_memory_pressure(tp: &LowLevelType) -> bool {
+    let LowLevelType::Struct(s) = tp else {
+        return false;
+    };
+    if s._flds.get("special_memory_pressure").is_some() {
+        return true;
+    }
+    match s._flds.get("super") {
+        Some(sup) => has_special_memory_pressure(sup),
+        None => false,
+    }
 }
 
 /// RPython `pairtype(InstanceRepr, InstanceRepr).convert_from_to((r_ins1,
