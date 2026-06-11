@@ -8872,9 +8872,16 @@ mod tests {
         // get/set_current_exception read/write `(*ec).sys_exc_value` on the
         // thread's current EC; production establishes it via
         // `set_last_exec_ctx(frame.execution_context)` (eval.rs:841). Mirror
-        // that here so the save/restore round-trips like a real frame, and
-        // restore the prior ctx at the end to avoid leaking into sibling tests.
-        let saved_ctx = pyre_interpreter::call::take_last_exec_ctx();
+        // that here so the save/restore round-trips like a real frame.  The
+        // prior ctx is restored on Drop so an assert failure mid-test still
+        // unwinds without leaking the frame's EC into sibling tests.
+        struct ExecCtxRestore(*const pyre_interpreter::PyExecutionContext);
+        impl Drop for ExecCtxRestore {
+            fn drop(&mut self) {
+                pyre_interpreter::call::set_last_exec_ctx(self.0);
+            }
+        }
+        let _saved_ctx = ExecCtxRestore(pyre_interpreter::call::take_last_exec_ctx());
         pyre_interpreter::call::set_last_exec_ctx(frame.execution_context);
 
         let mut ctx = TraceCtx::for_test(1);
@@ -8929,7 +8936,6 @@ mod tests {
         assert_eq!(state.sym().current_exc_box, restored_prev.opref);
         assert_eq!(pyre_interpreter::eval::get_current_exception(), prev_exc);
         pyre_interpreter::eval::set_current_exception(PY_NULL);
-        pyre_interpreter::call::set_last_exec_ctx(saved_ctx);
     }
 
     #[test]
