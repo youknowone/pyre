@@ -5938,6 +5938,7 @@ impl MIFrame {
         list: OpRef,
         index: OpRef,
         concrete_list: PyObjectRef,
+        concrete_index: PyObjectRef,
     ) -> Result<OpRef, PyError> {
         // Pick the strategy-specific length field so the inline length update
         // mirrors `generated_list_pop_by_strategy`. A null / non-list / mixed
@@ -5960,6 +5961,31 @@ impl MIFrame {
             // The method-form generic call shape is `callable(index)`.
             return self.trace_call_callable(callable, &[index]);
         };
+        // The `jit_list_pop_at` residual panics on an out-of-range index
+        // instead of raising IndexError, so the fast path may only be taken
+        // with a trace-time in-range proof plus matching runtime guards
+        // (emitted by `trace_dynamic_list_index` below). A non-W_IntObject
+        // index or an out-of-range concrete index (IndexError at runtime)
+        // falls back to the generic call.
+        let concrete_key = unsafe {
+            if pyre_object::pyobject::py_type_check(concrete_index, &INT_TYPE) {
+                Some(pyre_object::w_int_get_value(concrete_index))
+            } else {
+                None
+            }
+        };
+        let Some(concrete_key) = concrete_key else {
+            return self.trace_call_callable(callable, &[index]);
+        };
+        let concrete_len = unsafe { w_list_len(concrete_list) } as i64;
+        let normalized_key = if concrete_key < 0 {
+            concrete_key + concrete_len
+        } else {
+            concrete_key
+        };
+        if normalized_key < 0 || normalized_key >= concrete_len {
+            return self.trace_call_callable(callable, &[index]);
+        }
         let len_descr_idx = len_descr.index();
         let result = self.with_ctx(|this, ctx| {
             this.guard_class(ctx, list, &LIST_TYPE as *const PyType);
@@ -5967,7 +5993,10 @@ impl MIFrame {
             // Pre-pop length (cached); `new_len = len - 1` is the
             // reconstructible post-pop length.
             let len = opimpl_getfield_gc_i(ctx, list, len_descr.clone());
-            let idx_int = this.trace_guarded_int_payload(ctx, index);
+            // `descr_pop` shape: unbox the index, normalize a negative one
+            // against `len`, and guard `0 <= idx < len`, so the residual's
+            // out-of-range panic is unreachable from compiled code.
+            let idx_int = this.trace_dynamic_list_index(ctx, index, len, concrete_key);
             // The residual does the real heap mutation (read + O(n) shift +
             // length decrement + tail clear) in compiled code.
             let res = crate::helpers::emit_trace_call_ref_typed(
@@ -6194,11 +6223,13 @@ impl MIFrame {
                     unsafe { pyre_interpreter::lookup_in_type(list_type, name) }
                 };
                 let recover_self = |this: &mut Self| {
-                    if let Some(existing) =
-                        this.with_ctx(|this, ctx| this.existing_ref_for_concrete(ctx, inner_self))
-                    {
-                        return existing;
-                    }
+                    // Pin the callable identity before any specialization:
+                    // the receiver opref alone does not tie the trace to the
+                    // builtin method — the bound method (or the local it was
+                    // stored in) can be rebound between loop entries while
+                    // the receiver still passes its class/strategy guards.
+                    // The method object is freshly allocated per iteration
+                    // but its `w_function` slot is stable, so guard on that.
                     this.with_ctx(|this, ctx| {
                         this.guard_class(ctx, callable, &METHOD_TYPE as *const PyType);
                         let func_ref = ctx.record_op_with_descr(
@@ -6207,6 +6238,13 @@ impl MIFrame {
                             crate::descr::method_w_function_descr(),
                         );
                         this.implement_guard_value(ctx, func_ref, inner_func as i64);
+                    });
+                    if let Some(existing) =
+                        this.with_ctx(|this, ctx| this.existing_ref_for_concrete(ctx, inner_self))
+                    {
+                        return existing;
+                    }
+                    this.with_ctx(|this, ctx| {
                         ctx.record_op_with_descr(
                             majit_ir::OpCode::GetfieldGcR,
                             &[callable],
@@ -6235,7 +6273,13 @@ impl MIFrame {
                     // length overlay). Called directly like the append arm — no
                     // replay scaffolding.
                     let self_ref = recover_self(self);
-                    return self.list_pop_at_value(callable, self_ref, args[0], inner_self);
+                    return self.list_pop_at_value(
+                        callable,
+                        self_ref,
+                        args[0],
+                        inner_self,
+                        concrete_args[0],
+                    );
                 }
                 if args.len() == 0 && canonical_list_method("pop") == Some(inner_func) {
                     let call_pc = self.fallthrough_pc.saturating_sub(1);
@@ -6306,6 +6350,13 @@ impl MIFrame {
                     // certainty. The W_Method method-form arms above do NOT
                     // mark — no concrete execution happens on that path.
                     self.dm143_mark_heap_mutated();
+                    // Pin the callable identity (as the reverse arm below):
+                    // the receiver's class/strategy guards alone do not keep
+                    // the trace from running the builtin append after the
+                    // callable has been rebound.
+                    self.with_ctx(|this, ctx| {
+                        this.implement_guard_value(ctx, callable, concrete_callable as i64)
+                    });
                     self.list_append_value(args[0], args[1], concrete_args[0], concrete_args[1])?;
                     let none_ref =
                         self.with_ctx(|_this, ctx| ctx.const_ref(pyre_object::w_none() as i64));
@@ -6321,7 +6372,16 @@ impl MIFrame {
                     // reconstructible length overlay), called directly like the
                     // append arm — no replay scaffolding.
                     self.dm143_mark_heap_mutated();
-                    return self.list_pop_at_value(callable, args[0], args[1], concrete_args[0]);
+                    self.with_ctx(|this, ctx| {
+                        this.implement_guard_value(ctx, callable, concrete_callable as i64)
+                    });
+                    return self.list_pop_at_value(
+                        callable,
+                        args[0],
+                        args[1],
+                        concrete_args[0],
+                        concrete_args[1],
+                    );
                 }
                 if args.len() == 1
                     && canonical_list_method("pop") == Some(concrete_callable)
@@ -6329,6 +6389,9 @@ impl MIFrame {
                     && is_list(concrete_args[0])
                 {
                     self.dm143_mark_heap_mutated();
+                    self.with_ctx(|this, ctx| {
+                        this.implement_guard_value(ctx, callable, concrete_callable as i64)
+                    });
                     let call_pc = self.fallthrough_pc.saturating_sub(1);
                     self.with_ctx(|this, ctx| {
                         this.push_call_replay_stack_self_in_args(
