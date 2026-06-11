@@ -411,11 +411,10 @@ pub unsafe fn w_range_reversed(obj: PyObjectRef) -> PyObjectRef {
             // wrapped `current` would loop forever — fall back to bignum.
             let last = start as i128 + (len as i128 - 1) * step as i128;
             let one_past = start as i128 - step as i128;
-            let neg_step = -(step as i128);
-            if let (Ok(last), Ok(stop_rev), Ok(neg_step)) = (
+            if let (Ok(last), Ok(stop_rev), Some(neg_step)) = (
                 i64::try_from(last),
                 i64::try_from(one_past),
-                i64::try_from(neg_step),
+                step.checked_neg(),
             ) {
                 return w_range_iter_new(last, stop_rev, neg_step);
             }
