@@ -3092,6 +3092,15 @@ impl Optimizer {
                         continue;
                     }
                     if let Some(&new_pos) = remap.get(&arg.raw()) {
+                        // Measured dead (PYRE_REMAP_PROBE 2026-06-11: 0 fires
+                        // across check.py corpus + lib tests) — every
+                        // non-const operand reaching const-compact is
+                        // producer-bound. The rewrite stays as a safety net
+                        // until the loop retires with OpRef demotion (#9).
+                        debug_assert!(
+                            false,
+                            "position-only non-const operand hit const-compact remap: {arg:?}"
+                        );
                         op.setarg(i, BoxRef::from_opref(arg.with_raw(new_pos)));
                     }
                 }
@@ -3108,6 +3117,12 @@ impl Optimizer {
                         let arg_opref = arg.to_opref();
                         if !arg_opref.is_constant() {
                             if let Some(&new_pos) = remap.get(&arg_opref.raw()) {
+                                // Measured dead, same evidence as the args
+                                // loop above.
+                                debug_assert!(
+                                    false,
+                                    "position-only failarg hit const-compact remap: {arg_opref:?}"
+                                );
                                 *arg = majit_ir::operand::Operand::Box(BoxRef::from_opref(
                                     arg_opref.with_raw(new_pos),
                                 ));
@@ -3183,7 +3198,16 @@ impl Optimizer {
                             continue;
                         }
                         let mut arg = entry.op.arg(i).to_opref();
+                        let pre = arg;
                         remap_opref(&mut arg);
+                        // Measured dead (PYRE_REMAP_PROBE 2026-06-11): no
+                        // position-only exported-short-box operand was ever
+                        // remapped; rewrite kept as a safety net until the
+                        // loop retires with OpRef demotion (#9).
+                        debug_assert!(
+                            arg == pre,
+                            "position-only exported-short-box arg remapped: {pre:?}"
+                        );
                         entry.op.setarg(i, BoxRef::from_opref(arg));
                     }
                     if let Some(fa) = entry.op.fail_args_mut() {
@@ -3195,7 +3219,13 @@ impl Optimizer {
                                 continue;
                             }
                             let mut arg_opref = arg.to_opref();
+                            let pre = arg_opref;
                             remap_opref(&mut arg_opref);
+                            // Measured dead, same evidence as the args loop.
+                            debug_assert!(
+                                arg_opref == pre,
+                                "position-only exported-short-box failarg remapped: {pre:?}"
+                            );
                             *arg = majit_ir::operand::Operand::Box(BoxRef::from_opref(arg_opref));
                         }
                     }
