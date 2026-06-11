@@ -3056,18 +3056,16 @@ impl OptContext {
     ) -> OpRef {
         let preamble_source = preamble_op.op.to_opref();
         // RPython `return preamble_op.op` returns the carried Box. In majit,
-        // `pop.op` stores the Phase 1 source position; `make_equal_to(source,
+        // `pop.op` carries the Phase 1 source box; `make_equal_to(source,
         // body_visible)` is called by the producer for invented Pure / Heap /
         // LoopInvariant, so walking the forwarding chain reaches the
         // body-visible OpRef. Non-invented Pure has no forwarding installed,
         // so `get_box_replacement(source) == source` and the body references
         // source directly (RPython parity for non-invented `op = self.res`).
-        let result = self.get_replacement_opref(preamble_source);
+        let resolved = self.resolve_box_box(&preamble_op.op);
+        let result = resolved.to_opref();
         let result_type = preamble_op.preamble_op.result_type();
-        let is_constant = self
-            .get_box_replacement_box(preamble_source)
-            .and_then(|cb| cb.const_value())
-            .is_some();
+        let is_constant = resolved.const_value().is_some();
         let first_use = !self.imported_short_preamble_used.contains(&preamble_source);
         if first_use {
             self.imported_short_preamble_used.push(preamble_source);
@@ -3125,7 +3123,7 @@ impl OptContext {
             if !is_constant {
                 // unroll.py:35-36: invented_name → get_box_replacement(op)
                 let key = if preamble_op.invented_name {
-                    self.get_replacement_opref(preamble_source)
+                    result
                 } else {
                     preamble_source
                 };

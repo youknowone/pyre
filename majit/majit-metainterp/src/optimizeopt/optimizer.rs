@@ -4241,26 +4241,23 @@ impl Optimizer {
                             // (caught at pyjitpl/mod.rs:3454) on
                             // either invariant violation rather
                             // than silently coercing to 0.
-                            let boxindex = ctx.resolve_box_box(&pf_op.arg(1)).to_opref();
-                            let idx = match ctx
-                                .get_box_replacement_box(boxindex)
-                                .and_then(|cb| cb.const_int())
-                            {
+                            let boxindex = ctx.resolve_box_box(&pf_op.arg(1));
+                            let idx = match boxindex.const_int() {
                                 Some(v) if (0..=i32::MAX as i64).contains(&v) => v,
                                 _ => std::panic::panic_any(crate::optimize::InvalidLoop(
                                     "_add_pending_fields: SETARRAYITEM_GC index \
                                              must be a non-negative Const i32 (TagOverflow)",
                                 )),
                             };
-                            (pf_op.arg(0).to_opref(), pf_op.arg(2).to_opref(), idx as i32)
+                            (pf_op.arg(0), pf_op.arg(2), idx as i32)
                         } else {
-                            (pf_op.arg(0).to_opref(), pf_op.arg(1).to_opref(), -1i32)
+                            (pf_op.arg(0), pf_op.arg(1), -1i32)
                         };
                         majit_ir::GuardPendingFieldEntry {
                             descr: pf_op.getdescr(),
                             item_index,
-                            target: ctx.get_replacement_opref(target),
-                            value: ctx.get_replacement_opref(value),
+                            target: ctx.resolve_box_box(&target).to_opref(),
+                            value: ctx.resolve_box_box(&value).to_opref(),
                             target_tagged: majit_ir::resumedata::UNASSIGNED,
                             value_tagged: majit_ir::resumedata::UNASSIGNED,
                         }
