@@ -5706,8 +5706,6 @@ impl ClassesPBCRepr {
         // Ported envelope gates (each a graceful known-unported skip):
         //  - has `__init__` ⇒ the rpbc.py:1060-1067 dispatch arm is not
         //    ported (would need `replace_class_with_inst_arg`);
-        //  - constructor args present (`nb_args != 1`) ⇒ rpbc.py:1058-1059
-        //    asserts an argument-free call when there is no `__init__`;
         //  - `classdef.minid` unset ⇒ `assign_inheritance_ids` has not
         //    numbered this class, so `getvtable` (rclass.py:338-339) cannot
         //    bake the subclass range.  The session prologue numbers only
@@ -5718,9 +5716,6 @@ impl ClassesPBCRepr {
         //    + append-only), number such a class on demand below.
         if !init_is_impossible {
             return Err(unported("class has __init__ (rpbc.py:1060-1067)"));
-        }
-        if hop.nb_args() != 1 {
-            return Err(unported("constructor arguments with no __init__"));
         }
         if classdef.borrow().minid.is_none() {
             // Number this mid-session-minted classdef on demand.
@@ -5754,6 +5749,18 @@ impl ClassesPBCRepr {
                 r_instance.lowleveltype().clone(),
             );
             return Ok(Some(Hlvalue::Constant(cst)));
+        }
+
+        // upstream rpbc.py:1049-1050 — `assert hop.nb_args == 1,
+        // "arguments passed to __init__, but no __init__!"`.  Upstream
+        // asserts after `rtype_new_instance`; the graceful-skip port
+        // checks before so a skipped shape leaves no ops behind.  The
+        // gate must stay BELOW the exception shortcut above — upstream
+        // returns the prebuilt instance and "ignore[s] any arguments
+        // passed to the constructor" before reaching this assert, so
+        // exception constructors called with arguments are supported.
+        if hop.nb_args() != 1 {
+            return Err(unported("constructor arguments with no __init__"));
         }
 
         // upstream `v_instance = rclass.rtype_new_instance(hop.rtyper,

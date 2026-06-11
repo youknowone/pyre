@@ -2390,6 +2390,13 @@ impl InstanceRepr {
                 "InstanceRepr.new_instance: rclass not populated — call setup() first",
             )
         })?;
+        // A ClassRepr freshly minted by `InstanceRepr._setup_repr` is
+        // still on the rtyper's pending-setup list at this point
+        // (`call_all_setups` only runs between block batches), and
+        // `init_vtable` needs its `vtable_type` ForwardReference
+        // resolved — set it up here, same guard style as
+        // `rtype_new_instance` / `fromtypeptr`.  Idempotent.
+        Repr::setup(rclass.as_repr().as_ref())?;
         // upstream `self.rclass.getvtable()` — `getruntime(CLASSTYPE)` is
         // the `ClassReprArc`-polymorphic accessor that asserts the
         // expected type then returns the vtable pointer.

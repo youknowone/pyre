@@ -3439,16 +3439,42 @@ fn impl_method_owner_for_fundecl(llbc: &Llbc, fd: &FunDecl) -> Option<(String, S
         NameSeg::Other(v) => v.as_object()?.get("Impl")?,
         _ => return None,
     };
-    let adt_def_id = resolve_impl_owner_adt_def_id_free(llbc, impl_payload)?;
-    let td = llbc.type_by_id(adt_def_id)?;
-    // Owner-qualification convention: bare ident qualified by the
-    // type's defining module path (e.g. `gc_roots::RootScope`).  Strip
-    // the crate name from the TypeDecl's full name_path so the
-    // `self_ty_root` keys land on a `[module::Owner, method]` CallPath.
-    // Without this qualification the canonical registration loop at
-    // `lib.rs:864-902` cannot find the graph keyed by
-    // `[qualified_owner, method]`.
-    let owner_qualified = strip_crate_prefix(&td.item_meta.name_path());
+    let owner_qualified = match resolve_impl_owner_adt_def_id_free(llbc, impl_payload) {
+        Some(adt_def_id) => {
+            let td = llbc.type_by_id(adt_def_id)?;
+            // Owner-qualification convention: bare ident qualified by the
+            // type's defining module path (e.g. `gc_roots::RootScope`).  Strip
+            // the crate name from the TypeDecl's full name_path so the
+            // `self_ty_root` keys land on a `[module::Owner, method]` CallPath.
+            // Without this qualification the canonical registration loop at
+            // `lib.rs:864-902` cannot find the graph keyed by
+            // `[qualified_owner, method]`.
+            strip_crate_prefix(&td.item_meta.name_path())
+        }
+        // Non-ADT `Self` allowlist fallback — same arm as the instance
+        // method.  An allowlisted method has no TypeDecl, so the module
+        // Ident is the only owner name available; using the same bare
+        // leaf on both sides keeps the call-target key
+        // (`CallTarget::Method { owner, .. }`) and the registration key
+        // (`self_ty_root`) identical should an allowlisted pair ever
+        // match a local fn with a body.
+        None => {
+            if last_idx < 2 {
+                return None;
+            }
+            let module_leaf = match &segs[last_idx - 2] {
+                NameSeg::Ident { ident: (s, _) } => s.as_str(),
+                _ => return None,
+            };
+            if !NON_ADT_OWNER_METHOD_ALLOWLIST
+                .iter()
+                .any(|&(m, f)| m == module_leaf && f == leaf)
+            {
+                return None;
+            }
+            module_leaf.to_string()
+        }
+    };
     if owner_qualified.is_empty() {
         return None;
     }

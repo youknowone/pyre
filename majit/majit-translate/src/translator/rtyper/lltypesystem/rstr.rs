@@ -157,26 +157,36 @@ pub fn llstr(s: &[u8]) -> Result<_ptr, String> {
     Ok(p)
 }
 
-/// `CONST_STR_CACHE = WeakValueDictionary()` (`rstr.py:1226` /
-/// `StringRepr.CACHE`, `lltypesystem/rstr.py:233`): one host string →
-/// one prebuilt container identity, so repeated `convert_const` calls
-/// on the same literal return the same `_ptr` (prebuilt-constant
-/// `is`-identity upstream relies on).  Translation-lifetime strong
-/// cache; upstream's weak semantics only matter for memory, not
-/// identity.
-static CONST_STR_CACHE: LazyLock<std::sync::Mutex<std::collections::HashMap<Vec<u8>, _ptr>>> =
-    LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+thread_local! {
+    /// `CONST_STR_CACHE = WeakValueDictionary()` (`rstr.py:1226` /
+    /// `StringRepr.CACHE`, `lltypesystem/rstr.py:233`): one host string →
+    /// one prebuilt container identity, so repeated `convert_const` calls
+    /// on the same literal return the same `_ptr` (prebuilt-constant
+    /// `is`-identity upstream relies on).  Translation-lifetime strong
+    /// cache; upstream's weak semantics only matter for memory, not
+    /// identity.  Upstream is module-global because one translation owns
+    /// the process; translation sessions here are single-threaded, so
+    /// thread_local is the per-session scope (the same convention as
+    /// `classdesc::FORCE_ATTRIBUTES_INTO_CLASSES`) — cached `_ptr`s carry
+    /// a mutable `hash` slot written back by
+    /// `build_ll_strhash_internal_helper_graph`, which must not be shared
+    /// across concurrently-running sessions.
+    static CONST_STR_CACHE: std::cell::RefCell<std::collections::HashMap<Vec<u8>, _ptr>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
 
 /// `self.CACHE.get(value)` / `self.ll.llstr(value)` pair from
 /// `BaseLLStringRepr.convert_const` (`lltypesystem/rstr.py:191-206`).
 pub fn const_str_cache_llstr(s: &[u8]) -> Result<_ptr, String> {
-    let mut cache = CONST_STR_CACHE.lock().unwrap();
-    if let Some(p) = cache.get(s) {
-        return Ok(p.clone());
-    }
-    let p = llstr(s)?;
-    cache.insert(s.to_vec(), p.clone());
-    Ok(p)
+    CONST_STR_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if let Some(p) = cache.get(s) {
+            return Ok(p.clone());
+        }
+        let p = llstr(s)?;
+        cache.insert(s.to_vec(), p.clone());
+        Ok(p)
+    })
 }
 
 /// `nullptr(self.lowleveltype.TO)` for the `value is None` arm of
@@ -8624,6 +8634,66 @@ mod tests {
         assert_eq!(chars.getitem(0), Some(LowLevelValue::Char('F')));
         assert_eq!(chars.getitem(1), Some(LowLevelValue::Char('o')));
         assert_eq!(chars.getitem(2), Some(LowLevelValue::Char('o')));
+    }
+
+    /// `llstr` fills `chars[i]` with the Latin-1 embedding of each
+    /// byte (`mallocstr` + per-index store, annlowlevel.py:469-475);
+    /// every byte value must round-trip.
+    #[test]
+    fn llstr_preserves_byte_contents() {
+        let bytes: &[u8] = &[b'a', 0x00, 0xFF, b'z'];
+        let p = llstr(bytes).expect("llstr");
+        assert!(p.nonzero());
+        let Some(obj) = p._obj0.as_ref().unwrap().as_ref() else {
+            panic!("llstr pointer must be live");
+        };
+        let _ptr_obj::Struct(s) = obj else {
+            panic!("llstr pointer must target a Struct");
+        };
+        let LowLevelValue::Array(chars) = s._getattr("chars").expect("chars field") else {
+            panic!("chars field must be an Array");
+        };
+        assert_eq!(chars.getlength(), bytes.len());
+        for (i, b) in bytes.iter().enumerate() {
+            assert_eq!(
+                chars.getitem(i),
+                Some(LowLevelValue::Char(*b as char)),
+                "chars[{i}] must round-trip byte {b:#x}"
+            );
+        }
+    }
+
+    /// `CONST_STR_CACHE` (rstr.py:187 / `StringRepr.CACHE`): repeated
+    /// `convert_const` of the same literal must return the SAME
+    /// prebuilt container (`is`-identity upstream), while distinct
+    /// literals get distinct containers.
+    #[test]
+    fn const_str_cache_llstr_returns_same_container_identity() {
+        let p1 = const_str_cache_llstr(b"cache-identity-probe").expect("first lookup");
+        let p2 = const_str_cache_llstr(b"cache-identity-probe").expect("second lookup");
+        // `_struct` PartialEq keys off `_identity`
+        // (`fresh_low_level_container_identity`), so `==` here is the
+        // upstream `is` check on the container.
+        assert_eq!(p1, p2, "same literal must reuse the cached container");
+        let p3 = const_str_cache_llstr(b"cache-identity-probe-other").expect("other literal");
+        assert_ne!(p1, p3, "distinct literals must not share a container");
+        // An uncached `llstr` of the same bytes mints a fresh container.
+        let fresh = llstr(b"cache-identity-probe").expect("uncached llstr");
+        assert_ne!(p1, fresh, "llstr must not consult the cache");
+    }
+
+    /// `nullptr(self.lowleveltype.TO)` arm of
+    /// `BaseLLStringRepr.convert_const` (lltypesystem/rstr.py:192-193):
+    /// a typed null `Ptr(STR)`.
+    #[test]
+    fn null_str_ptr_is_typed_null_strptr() {
+        let p = null_str_ptr();
+        assert!(!p.nonzero(), "null_str_ptr must be null");
+        assert!(matches!(&p._obj0, Ok(None)));
+        let LowLevelType::Ptr(expected) = STRPTR.clone() else {
+            panic!("STRPTR must be Ptr");
+        };
+        assert_eq!(p._TYPE, *expected, "null must carry the STRPTR type");
     }
 
     /// `UNICODE` resolves to a GcStruct named `rpy_unicode` with
