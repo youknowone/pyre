@@ -549,15 +549,6 @@ fn normalize_binop_name(pyre_name: &str) -> Result<String, TyperError> {
         "bitxor_assign" => "inplace_xor",
         "lshift_assign" => "inplace_lshift",
         "rshift_assign" => "inplace_rshift",
-        "and" | "or" => {
-            return Err(TyperError::missing_rtype_operation(format!(
-                "normalize_binop_name: pyre BinOp `{pyre_name}` has no \
-                 flowspace counterpart (operation.py:475-510 does not \
-                 register short-circuit `and`/`or` as binary operators; \
-                 they are control flow). Frontend must desugar `&&`/`||` \
-                 to short-circuit blocks before reaching the rtyper."
-            )));
-        }
         other => other,
     };
     Ok(normalized.to_string())

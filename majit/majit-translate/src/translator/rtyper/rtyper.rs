@@ -3736,6 +3736,12 @@ fn lowlevel_min_max_helper_graph(
     let cmp_op = match (&llt, is_max) {
         (LowLevelType::Signed, false) => "int_lt",
         (LowLevelType::Signed, true) => "int_gt",
+        // `BoolRepr(IntegerRepr)` compares through `as_int =
+        // signed_repr` (rbool.py:10-16; `_rtype_compare_template`
+        // picks `repr.opprefix + func` via `.as_int`, rint.py:605-614)
+        // — so `min(bool, bool)` lowers to the Signed comparison.
+        (LowLevelType::Bool, false) => "int_lt",
+        (LowLevelType::Bool, true) => "int_gt",
         (LowLevelType::Unsigned, false) => "uint_lt",
         (LowLevelType::Unsigned, true) => "uint_gt",
         (LowLevelType::SignedLongLong, false) => "llong_lt",
@@ -7757,6 +7763,10 @@ mod tests {
         for (llt, is_max, expected_op) in [
             (LowLevelType::Signed, false, "int_lt"),
             (LowLevelType::Signed, true, "int_gt"),
+            // BoolRepr compares via `as_int = signed_repr`
+            // (rbool.py:10-16) — the Signed opnames.
+            (LowLevelType::Bool, false, "int_lt"),
+            (LowLevelType::Bool, true, "int_gt"),
             (LowLevelType::Unsigned, false, "uint_lt"),
             (LowLevelType::Unsigned, true, "uint_gt"),
             (LowLevelType::SignedLongLong, false, "llong_lt"),
@@ -7801,11 +7811,12 @@ mod tests {
 
     #[test]
     fn min_max_helper_graph_rejects_unsupported_and_mismatched_lltypes() {
-        // Bool has no lt/gt arm in the helper.
+        // Char has no lt/gt arm in the helper (no `as_int` route —
+        // upstream compares chars through `cast_primitive` first).
         let err = lowlevel_min_max_helper_graph(
             "ll_min",
-            &[LowLevelType::Bool, LowLevelType::Bool],
-            &LowLevelType::Bool,
+            &[LowLevelType::Char, LowLevelType::Char],
+            &LowLevelType::Char,
             false,
         )
         .unwrap_err();
