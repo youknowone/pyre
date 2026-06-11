@@ -889,8 +889,9 @@ impl Assembler {
                     "encode_regorconst_source: Register kind {:?} does not match \
                      variant-expected kind {expected_kind:?} (PyPy \
                      `assembler.py:164-174` requires the single-byte argcode kind \
-                     and the operand kind to coincide)",
-                    r.kind,
+                     and the operand kind to coincide) — graph {:?}, flatop {:?} \
+                     (set MAJIT_COVERAGE_PANIC=1 to populate the flatop context)",
+                    r.kind, self.current_graph_name, self.current_flatop_debug,
                 );
                 r.index as u8
             }
