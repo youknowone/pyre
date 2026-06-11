@@ -344,18 +344,37 @@ fn walk_pyframe_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
         // and are forwarded by the GC's root walker; no extra visit here.
 
         let mut frame = cf.get();
-        if !frame.is_null() {
-            let ec = unsafe { (*frame).execution_context as *mut PyExecutionContext };
-            if !ec.is_null() {
-                let top_slot = unsafe { &mut (*ec).topframeref as *mut *mut PyFrame };
-                visitor(unsafe { &mut *(top_slot as *mut majit_ir::GcRef) });
-                // `sys_exc_value` holds the active handler exception, which
-                // is nursery-allocated and may move; forward it so the EC
-                // slot is updated on a minor collection (the value-stack
-                // copy alone is not authoritative for later EC reads).
-                let exc_slot = unsafe { &mut (*ec).sys_exc_value as *mut PyObjectRef };
-                visitor(unsafe { &mut *(exc_slot as *mut majit_ir::GcRef) });
+        let frame_ec = if frame.is_null() {
+            std::ptr::null_mut()
+        } else {
+            unsafe { (*frame).execution_context as *mut PyExecutionContext }
+        };
+        // Root the EC slots from the current frame's EC AND the ambient
+        // TLS EC (`getexecutioncontext`).  The ambient visit covers the
+        // spans where no frame is installed in `CURRENT_FRAME` yet the EC
+        // is live — between `ExecutionContext::enter` and `eval_loop`'s
+        // frame install, and around `return_trace`/`leave` after the
+        // frame guard drops — where `sys_exc_value` may already hold a
+        // nursery exception.  PyPy reaches the ExecutionContext
+        // unconditionally through `space.threadlocals`, independent of
+        // any frame.
+        let ambient_ec = crate::call::take_last_exec_ctx() as *mut PyExecutionContext;
+        let mut visit_ec_slots = |ec: *mut PyExecutionContext| {
+            if ec.is_null() {
+                return;
             }
+            let top_slot = unsafe { &mut (*ec).topframeref as *mut *mut PyFrame };
+            visitor(unsafe { &mut *(top_slot as *mut majit_ir::GcRef) });
+            // `sys_exc_value` holds the active handler exception, which
+            // is nursery-allocated and may move; forward it so the EC
+            // slot is updated on a minor collection (the value-stack
+            // copy alone is not authoritative for later EC reads).
+            let exc_slot = unsafe { &mut (*ec).sys_exc_value as *mut PyObjectRef };
+            visitor(unsafe { &mut *(exc_slot as *mut majit_ir::GcRef) });
+        };
+        visit_ec_slots(frame_ec);
+        if ambient_ec != frame_ec {
+            visit_ec_slots(ambient_ec);
         }
         while !frame.is_null() {
             // SAFETY: PyFrame pointers on the f_backref chain are valid
