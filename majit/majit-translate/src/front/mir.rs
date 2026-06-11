@@ -4210,7 +4210,9 @@ fn trait_impl_trait_path_for_fundecl(llbc: &Llbc, fd: &FunDecl) -> Option<String
         .and_then(serde_json::Value::as_u64)?;
     let trait_impls = llbc.trait_impls_raw();
     let ti = trait_impls.get(trait_impl_id as usize)?;
-    // `impl_trait` is a TraitDeclRef; its trait-decl id field is `id`.
+    // `impl_trait` is a TraitDeclRef `{"id": <trait_decl_id>,
+    // "generics": {...}}` — same shape `resolve_impl_owner_adt_def_id`
+    // reads `generics.types[0]` from.
     let trait_id = ti
         .as_object()?
         .get("impl_trait")?
