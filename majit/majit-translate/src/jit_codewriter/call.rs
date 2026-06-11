@@ -2043,6 +2043,20 @@ impl CallControl {
         crate_alias.push("crate");
         crate_alias.extend(canonical.iter().copied());
         self.register_function_fnaddr(CallPath::from_segments(crate_alias), fnaddr);
+        // Charon names call targets crate-qualified (`name_path()` keeps
+        // the crate root), and `target_to_path` returns 3+-segment
+        // `FunctionPath`s verbatim — so `fnaddr_for_target`'s exact-path
+        // lookup needs the unstripped spelling too.  Without it, every
+        // residual call site that reaches the helper through its
+        // crate-qualified path falls back to the symbolic hash, which
+        // `patch_constants_i_fnaddrs` can never rebind to the runtime
+        // address.
+        if segments.len() > 1 {
+            self.register_function_fnaddr(
+                CallPath::from_segments(segments.iter().copied()),
+                fnaddr,
+            );
+        }
     }
 
     /// Structured binding for an impl-method helper. `impl_type_joined`
@@ -6979,6 +6993,17 @@ mod tests {
         assert_eq!(
             cc.fnaddr_for_target(&CallTarget::function_path([
                 "crate",
+                "helpers",
+                "opaque_call"
+            ])),
+            0x1234
+        );
+        // Charon callsites keep the crate root (`name_path()`), and
+        // `target_to_path` returns 3+-segment FunctionPaths verbatim —
+        // the unstripped spelling must bind too.
+        assert_eq!(
+            cc.fnaddr_for_target(&CallTarget::function_path([
+                "testcrate",
                 "helpers",
                 "opaque_call"
             ])),
