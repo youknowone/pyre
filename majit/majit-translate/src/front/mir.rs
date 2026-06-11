@@ -3365,27 +3365,31 @@ impl<'a> Lowering<'a> {
                 // `unaryop.rs:3587` (lib test
                 // `generic_handler_graphs_keep_symbolic_fnaddr_surface`).
                 let (segments, method_hint) = self.call_target_segments(mir_bb, &reg)?;
-                // `CallTarget::Method` requires a receiver in `args[0]`
-                // (the flowspace adapter lowers it to `getattr(recv,
-                // method_leaf) → simple_call(bound_method, …)`).
-                // Charon's `impl_method_owner` matches both inherent
-                // methods (which carry `&self`) *and* associated
-                // functions (e.g. `RootScope::new()` — no `self` arg).
-                // Only the former actually has a receiver in `args[0]`;
-                // routing a 0-arg associated function through `Method`
-                // panics at `flowspace_adapter.rs:1045` ("Call::Method
-                // has empty args").  Fall back to the `FunctionPath`
-                // segments when there is no receiver to thread.
-                let target = match method_hint {
-                    Some((owner_root, leaf)) if !args.is_empty() => {
-                        CallTarget::method(leaf, Some(owner_root))
+                if let Some(field_read) = self.oparg_from_field_read(&reg.kind, &segments, &args) {
+                    field_read
+                } else {
+                    // `CallTarget::Method` requires a receiver in `args[0]`
+                    // (the flowspace adapter lowers it to `getattr(recv,
+                    // method_leaf) → simple_call(bound_method, …)`).
+                    // Charon's `impl_method_owner` matches both inherent
+                    // methods (which carry `&self`) *and* associated
+                    // functions (e.g. `RootScope::new()` — no `self` arg).
+                    // Only the former actually has a receiver in `args[0]`;
+                    // routing a 0-arg associated function through `Method`
+                    // panics at `flowspace_adapter.rs:1045` ("Call::Method
+                    // has empty args").  Fall back to the `FunctionPath`
+                    // segments when there is no receiver to thread.
+                    let target = match method_hint {
+                        Some((owner_root, leaf)) if !args.is_empty() => {
+                            CallTarget::method(leaf, Some(owner_root))
+                        }
+                        _ => CallTarget::FunctionPath { segments },
+                    };
+                    OpKind::Call {
+                        target,
+                        args,
+                        result_ty: result_ty.clone(),
                     }
-                    _ => CallTarget::FunctionPath { segments },
-                };
-                OpKind::Call {
-                    target,
-                    args,
-                    result_ty: result_ty.clone(),
                 }
             }
             (CallClass::Dynamic, CallFunc::Dynamic(dyn_operand)) => {
@@ -3913,6 +3917,77 @@ impl<'a> Lowering<'a> {
             return self.llbc.dedup_to_adt_def_id(id);
         }
         None
+    }
+
+    /// Lower `u32::from(<oparg value>)` — the `From<OpArg> for u32`
+    /// (`rustpython-compiler-core` `bytecode/oparg.rs:95`) and
+    /// `oparg_enum!`-synthesized `From<$Enum> for u32` impls — to the
+    /// extraction their bodies perform.  The dependency crate's bodies
+    /// are never in the local LLBC, so the `Call` form is permanently
+    /// unliftable.  Each impl is a single extraction: `self.0` for the
+    /// transparent newtype, a discriminant cast for the fieldless
+    /// enums — the same reads local code expresses as `FieldRead
+    /// __pos_0` / `FieldRead __discriminant` (the
+    /// `Rvalue::Discriminant` lowering).  Returns `None` for any other
+    /// path or shape so unrelated `from` impls keep the `Call` form.
+    fn oparg_from_field_read(
+        &self,
+        kind: &CallKind,
+        segments: &[String],
+        args: &[Variable],
+    ) -> Option<OpKind> {
+        let [first, .., module, impl_seg, leaf] = segments else {
+            return None;
+        };
+        if first.as_str() != "rustpython_compiler_core"
+            || module.as_str() != "oparg"
+            || impl_seg.as_str() != "<Impl>"
+            || leaf.as_str() != "from"
+        {
+            return None;
+        }
+        let [arg] = args else {
+            return None;
+        };
+        let CallKind::Fun(FunId::Regular { id }) = kind else {
+            return None;
+        };
+        let fd = self.llbc.fn_by_id(*id)?;
+        let src_ty = fd.signature.inputs.first()?;
+        let def_id = self.tyref_adt_def_id(src_ty)?;
+        let td = self.llbc.type_by_id(def_id)?;
+        let owner_root = td
+            .item_meta
+            .name_path()
+            .rsplit("::")
+            .next()
+            .unwrap_or("")
+            .to_string();
+        let field = match &td.kind {
+            TypeDeclKind::Struct(fields) if fields.len() == 1 => fields[0]
+                .name
+                .clone()
+                .unwrap_or_else(|| "__pos_0".to_string()),
+            TypeDeclKind::Enum(variants) if variants.iter().all(|v| v.fields.is_empty()) => {
+                "__discriminant".to_string()
+            }
+            _ => return None,
+        };
+        Some(OpKind::FieldRead {
+            base: arg.clone(),
+            field: FieldDescriptor::new(field, Some(owner_root)),
+            ty: ValueType::Int,
+            pure: false,
+        })
+    }
+
+    /// The ADT `def_id` behind a signature [`TyRef`], whether inline
+    /// or routed through the dedup table.  `None` for non-ADT shapes.
+    fn tyref_adt_def_id(&self, ty: &TyRef) -> Option<u64> {
+        match ty {
+            TyRef::Inline { value: (_, v) } | TyRef::Other(v) => inline_adt_def_id(v),
+            TyRef::Dedup { id } => self.llbc.dedup_to_adt_def_id(*id),
+        }
     }
 
     fn lower_switch(
