@@ -633,6 +633,25 @@ fn analyze_pipeline_from_module_paths(
     // `mir_graph_lookup` is consulted by the registration loops below
     // (trait-default vs concrete-impl graph fetch).
     let mir_graph_lookup = front::semantic::MirGraphLookup::from_program(&program);
+    // `classdesc.py:749 lookup` MRO walk for generic trait dispatch:
+    // a concrete override shadows the trait default.  `front::mir`
+    // lowers `CallKind::Trait` (a call through a generic `<E: Trait>`
+    // receiver) to the direct path `[<Trait>, <method>]`, and the
+    // registration loop below binds that path for BFS discovery and
+    // `get_jitcode` resolution.  Collect each trait's concrete impl
+    // types and per-method overrides so the direct-path registration
+    // can prefer the unique override: with exactly one concrete impl
+    // in the analyzed program the annotator binds the receiver to
+    // that instantiation, so the MRO finds the override before the
+    // default body.  With several concrete impl types the receiver
+    // stays ambiguous and the default-body registration is kept
+    // (indirect-call family territory).
+    let mut trait_concrete_impl_types: std::collections::HashMap<&str, Vec<&str>> =
+        std::collections::HashMap::new();
+    let mut trait_method_overrides: std::collections::HashMap<
+        (&str, &str),
+        (&str, &front::semantic::SemanticFunction),
+    > = std::collections::HashMap::new();
     for func in &program.functions {
         match (&func.self_ty_root, &func.trait_root) {
             // Concrete trait-impl method: `impl Trait for Type { fn m }`.
@@ -641,8 +660,13 @@ fn analyze_pipeline_from_module_paths(
             // through `register_trait_method` instead would also seed
             // `method_to_impl_types`, flipping `resolve_method`'s
             // name-based lookup for every same-named method.  The trait
-            // identity feeds only the single-impl direct-path binding
-            // (`concrete_trait_methods` consumer below).
+            // identity feeds two complementary direct-path consumers:
+            // the `concrete_trait_methods` loop below binds the unique
+            // impl when the trait method has NO default body, and the
+            // `trait_method_overrides` lookup inside the default-body
+            // registration prefers the unique override over the default
+            // (`classdesc.py:749` — a concrete override shadows the
+            // trait default in the MRO walk).
             (Some(owner), Some(trait_leaf)) => {
                 concrete_trait_methods.push((
                     trait_leaf.clone(),
@@ -654,6 +678,16 @@ fn analyze_pipeline_from_module_paths(
                     func.return_type.clone(),
                     func.hints.clone(),
                 ));
+                let types = trait_concrete_impl_types
+                    .entry(trait_leaf.as_str())
+                    .or_default();
+                if !types.contains(&owner.as_str()) {
+                    types.push(owner.as_str());
+                }
+                trait_method_overrides.insert(
+                    (trait_leaf.as_str(), func.name.as_str()),
+                    (owner.as_str(), func),
+                );
                 canonical_inherent_methods.push(parse::InherentMethodInfo {
                     for_type: owner.clone(),
                     self_ty_root: Some(owner.clone()),
@@ -836,6 +870,31 @@ fn analyze_pipeline_from_module_paths(
         };
         let is_default = impl_info.for_type.starts_with("<default methods of ");
         for method in &impl_info.methods {
+            // `classdesc.py:749 lookup` MRO: on the generic-dispatch
+            // direct path `[<Trait>, <method>]`, the unique concrete
+            // override shadows the trait default body (pre-pass
+            // above).  `None` for concrete-impl entries, defaults
+            // without an override, and traits with several concrete
+            // impl types (the receiver stays ambiguous —
+            // indirect-call family territory keeps the default).
+            let devirt: Option<(&str, &front::semantic::SemanticFunction)> = if is_default {
+                trait_method_overrides
+                    .get(&(impl_info.trait_name.as_str(), method.name.as_str()))
+                    .filter(|_| {
+                        trait_concrete_impl_types
+                            .get(impl_info.trait_name.as_str())
+                            .is_some_and(|types| types.len() == 1)
+                    })
+                    .copied()
+            } else {
+                None
+            };
+            // Hints for the direct path follow the graph registered
+            // there (RPython binds hints to graph identity).
+            let direct_hints: &Vec<String> = match devirt {
+                Some((_, override_info)) => &override_info.hints,
+                None => &method.hints,
+            };
             // Read the MIR-built graph from `program.functions`.
             // `method.graph` (`Option`) remains as a residual fallback
             // for the handful of MIR-uncovered entries, though every
@@ -878,12 +937,25 @@ fn analyze_pipeline_from_module_paths(
                         method.name.as_str(),
                     ]);
                     // Prefer the MIR graph for the direct_path
-                    // registration too; fall back to `method.graph`
-                    // when the lookup has no entry.
-                    let direct_source: Option<model::FunctionGraph> =
-                        mir_graph.cloned().or_else(|| method.graph.clone());
+                    // registration too; fall back to the carried
+                    // graph when the lookup has no entry.  `devirt`
+                    // (hoisted above) swaps in the unique concrete
+                    // override's graph and return type.
+                    let (direct_source, direct_return_type) = match devirt {
+                        Some((impl_type, override_info)) => (
+                            mir_graph_lookup
+                                .lookup_impl_method(impl_type, &method.name)
+                                .cloned()
+                                .or_else(|| Some(override_info.graph.clone())),
+                            override_info.return_type.as_ref(),
+                        ),
+                        None => (
+                            mir_graph.cloned().or_else(|| method.graph.clone()),
+                            method.return_type.as_ref(),
+                        ),
+                    };
                     if let Some(g) = direct_source {
-                        let direct_graph = match &method.return_type {
+                        let direct_graph = match direct_return_type {
                             Some(rt) => g.with_return_type(rt),
                             None => g,
                         };
@@ -901,58 +973,55 @@ fn analyze_pipeline_from_module_paths(
             // `[impl_type, method_name]` path the BFS reads.
             if !method.hints.is_empty() {
                 call_control.register_function_hints_for(path.clone(), method.hints.clone());
-                // Default-method bodies also register under `[trait_name,
-                // method_name]` (see the `register_function_graph(direct_path,
-                // direct_graph)` branch above); mirror the hint registration
-                // so the BFS reaches the same `_reject_function("elidable")`
-                // verdict regardless of which path it walks.
-                if impl_info.for_type.starts_with("<default methods of ") {
-                    let direct_path = crate::parse::CallPath::from_segments([
-                        impl_info.trait_name.as_str(),
-                        method.name.as_str(),
-                    ]);
-                    call_control.register_function_hints_for(direct_path, method.hints.clone());
-                }
             }
-            // RPython: hints bound to graph identity.
-            let default_direct_path = if impl_info.for_type.starts_with("<default methods of ") {
-                Some(crate::parse::CallPath::from_segments([
+            // Default-method bodies also register under `[trait_name,
+            // method_name]` (see the `register_function_graph(direct_path,
+            // direct_graph)` branch above); mirror the hint registration
+            // so the BFS reaches the same `_reject_function("elidable")`
+            // verdict regardless of which path it walks.  `direct_hints`
+            // follows the graph registered there — the override's when
+            // the direct path was devirtualized.
+            if is_default && !direct_hints.is_empty() {
+                let direct_path = crate::parse::CallPath::from_segments([
                     impl_info.trait_name.as_str(),
                     method.name.as_str(),
-                ]))
-            } else {
-                None
-            };
+                ]);
+                call_control.register_function_hints_for(direct_path, direct_hints.clone());
+            }
+            // RPython: hints bound to graph identity.
             for hint in &method.hints {
                 match hint.as_str() {
-                    "elidable" => {
-                        call_control.mark_elidable(path.clone());
-                        if let Some(ref dp) = default_direct_path {
-                            call_control.mark_elidable(dp.clone());
-                        }
-                    }
+                    "elidable" => call_control.mark_elidable(path.clone()),
                     "elidable_cannot_raise" => {
-                        call_control.mark_cannot_raise_assertion(path.clone());
-                        if let Some(ref dp) = default_direct_path {
-                            call_control.mark_cannot_raise_assertion(dp.clone());
-                        }
+                        call_control.mark_cannot_raise_assertion(path.clone())
                     }
                     "elidable_or_memerror" => {
-                        call_control.mark_memerror_only_assertion(path.clone());
-                        if let Some(ref dp) = default_direct_path {
-                            call_control.mark_memerror_only_assertion(dp.clone());
-                        }
+                        call_control.mark_memerror_only_assertion(path.clone())
                     }
-                    "loopinvariant" => {
-                        call_control.mark_loopinvariant(path.clone());
-                        if let Some(ref dp) = default_direct_path {
-                            call_control.mark_loopinvariant(dp.clone());
-                        }
-                    }
+                    "loopinvariant" => call_control.mark_loopinvariant(path.clone()),
                     "close_stack" => call_control.mark_close_stack(path.clone()),
                     "cannot_collect" => call_control.mark_cannot_collect(path.clone()),
                     "gc_effects" => call_control.mark_external_gc_effects(path.clone()),
                     _ => {}
+                }
+            }
+            if is_default {
+                let dp = crate::parse::CallPath::from_segments([
+                    impl_info.trait_name.as_str(),
+                    method.name.as_str(),
+                ]);
+                for hint in direct_hints {
+                    match hint.as_str() {
+                        "elidable" => call_control.mark_elidable(dp.clone()),
+                        "elidable_cannot_raise" => {
+                            call_control.mark_cannot_raise_assertion(dp.clone())
+                        }
+                        "elidable_or_memerror" => {
+                            call_control.mark_memerror_only_assertion(dp.clone())
+                        }
+                        "loopinvariant" => call_control.mark_loopinvariant(dp.clone()),
+                        _ => {}
+                    }
                 }
             }
         }
