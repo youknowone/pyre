@@ -843,7 +843,7 @@ impl VectorizingOptimizer {
 
         // vector.py:271: return loop.finaloplist(jitcell_token, reset_label_token=False).
         // post_schedule already set loop_.operations / prefix / prefix_label / jump,
-        // so finaloplist splices [prefix][prefix_label] operations [jump].
+        // so finaloplist concatenates [prefix][prefix_label] operations [jump].
         // TODO: thread jitcell_token through when optimize_vector is wired to the
         // compiler; None here skips the descr/token wiring (faithful for the
         // currently-disconnected compile path). `label=false` matches RPython's
@@ -1187,7 +1187,7 @@ impl VectorizingOptimizer {
         // PyPy's VectorizationInfo(op) constructor.
         loop_.setup_vectorization(&mut sched_state, &constant_of);
 
-        // Phase 1: Schedule operations for ILP before packing.
+        // First schedule operations for ILP before packing.
         let dep_graph = DependencyGraph::build(&loop_.operations, &constant_of);
         let schedule = schedule_operations(&dep_graph);
         if schedule.len() == loop_.operations.len() {
@@ -1199,7 +1199,7 @@ impl VectorizingOptimizer {
             loop_.setup_vectorization(&mut sched_state, &constant_of);
         }
 
-        // Phase 2: Rebuild dependency graph and find packs.
+        // Then rebuild the dependency graph and find packs.
         let dep_graph = DependencyGraph::build(&loop_.operations, &constant_of);
         let seed_packs = dep_graph.find_packable_groups();
         if seed_packs.is_empty() {

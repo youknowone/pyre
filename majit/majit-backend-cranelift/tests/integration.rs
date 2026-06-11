@@ -311,11 +311,10 @@ fn test_bridge_end_to_end() {
     bridge_rec.finish(&[result], make_descr(1));
     let bridge_trace = bridge_rec.get_trace();
 
-    // Mint a `ResumeGuardDescr` that mirrors the source guard's identity
-    // (`CraneliftFailDescr` was retired in Slice 7-Tβ14f; bridge-compile
-    // lookup now uses `FailDescr::{trace_id, fail_index_per_trace}`
-    // directly off the descr the metainterp passes in —
-    // `pyjitpl/mod.rs:9040`).
+    // Mint a `ResumeGuardDescr` that mirrors the source guard's identity.
+    // Bridge compilation looks up the parent guard by
+    // `FailDescr::{trace_id, fail_index_per_trace}` from the descr passed
+    // by the metainterp (`pyjitpl/mod.rs`).
     let bridge_fail_descr =
         majit_backend::make_resume_guard_descr_typed(vec![Type::Int, Type::Int]);
     {
@@ -2227,10 +2226,9 @@ fn test_compiled_bridge_guard_failure_has_frame_stack() {
     let bridge_trace = bridge_rec.get_trace();
 
     // Mint a `ResumeGuardDescr` that mirrors the source guard's identity
-    // (per-trace fail_index = 0, trace_id = 910).  `CraneliftFailDescr`
-    // was retired in Slice 7-Tβ14f; bridge-compile lookup now uses
-    // `FailDescr::{trace_id, fail_index_per_trace}` directly off the
-    // descr the metainterp passes in (`pyjitpl/mod.rs:9040`).
+    // (per-trace fail_index = 0, trace_id = 910). Bridge compilation
+    // looks up the parent guard by `FailDescr::{trace_id,
+    // fail_index_per_trace}` from the descr passed by the metainterp.
     let bridge_fail_descr =
         majit_backend::make_resume_guard_descr_typed(vec![Type::Int, Type::Int]);
     {

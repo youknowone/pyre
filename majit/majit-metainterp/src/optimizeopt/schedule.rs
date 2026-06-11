@@ -774,7 +774,7 @@ pub struct VecScheduleState {
     /// Next OpRef counter for newly created vector ops.
     next_pos: u32,
     /// `schedule.py:20-28 forwarded_vecinfo(op)` scratch, keyed by full `OpRef`
-    /// (InputArg and op namespaces never collide). PRE-EXISTING-ADAPTATION.
+    /// (InputArg and op namespaces never collide).
     ///
     /// PyPy carries this scheduling scratch in `op._forwarded`
     /// (`vector.py:54-56 setup_vectorization`) and re-propagates it across its
@@ -790,12 +790,6 @@ pub struct VecScheduleState {
     /// would drop the stamp with nothing to re-attach it. The `pos`-keyed cache
     /// is clone-stable (`OpRef`/`pos` survives a clone) and stands in until a
     /// `copy_resop`-equivalent exists.
-    ///
-    /// Convergence path: a `Forwarded::VectorInfo` variant + a `copy_resop`
-    /// analog that re-attaches the resolved struct at every vectorizer clone
-    /// site, keeping the const-pool resolver only at the single setup-time
-    /// INT_SIGNEXT stamp (`int_signext_vecinfo`). GC-adjacent (touches the
-    /// shared `_forwarded` core); needs x86_64 + vectorizer-on validation.
     ///
     /// `Op.vecinfo` is the SEPARATE permanent carrier: the
     /// `resoperation.py:111-127 VecOperationNew` datatype/bytesize/signed/count

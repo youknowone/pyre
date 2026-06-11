@@ -348,7 +348,7 @@ pub struct OptPure {
 }
 
 /// shortpreamble.py:124-126: PreambleOp stored in OptPure for always-pure ops.
-/// Searched with forwarding-aware matching during Phase 2 body optimization.
+/// Searched with forwarding-aware matching during body optimization.
 #[derive(Clone, Debug)]
 struct PreamblePureEntry {
     opcode: OpCode,

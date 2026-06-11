@@ -565,7 +565,8 @@ impl OptString {
             }
         }
         // vstring.py:452: self.make_nonnull_str(op, mode); return self.emit(op)
-        // OpRef → BoxRef shim until this caller migrates (Phase D-2).
+        // NEWSTR/NEWUNICODE produce the string object directly; use the
+        // bound result box as the PtrInfo host.
         let op_box = BoxRef::from_bound_op(op_rc);
         ctx.make_nonnull_str(&op_box, mode);
         // vstring.py:455-459 postprocess_NEWSTR / postprocess_NEWUNICODE:
@@ -812,7 +813,7 @@ impl OptString {
         } else {
             1u8
         };
-        // OpRef → BoxRef shim until this caller migrates (Phase D-2).
+        // STRLEN postprocess updates PtrInfo on the resolved receiver box.
         if let Some(arg0_box) = ctx.resolve_box_box_opt(&op.arg(0)) {
             ctx.make_nonnull_str(&arg0_box, mode);
         }
@@ -890,7 +891,7 @@ impl OptString {
         if op.num_args() >= 3 {
             let vleft = ctx.resolve_box_box(&op.arg(1)).to_opref();
             let vright = ctx.resolve_box_box(&op.arg(2)).to_opref();
-            // OpRef → BoxRef shim until this caller migrates (Phase D-2).
+            // The resolved string boxes are the PtrInfo hosts for the concat.
             if let Some(vleft_box) = ctx.get_box_replacement_box(vleft) {
                 ctx.make_nonnull_str(&vleft_box, mode);
             }
@@ -930,7 +931,8 @@ impl OptString {
     ) -> OptimizationResult {
         if op.num_args() >= 4 {
             let mut s = ctx.resolve_box_box(&op.arg(1)).to_opref();
-            // OpRef → BoxRef shim until this caller migrates (Phase D-2).
+            // Mark the resolved source string as non-null before creating
+            // the virtual slice info.
             if let Some(s_box) = ctx.get_box_replacement_box(s) {
                 ctx.make_nonnull_str(&s_box, mode);
             }
@@ -1068,7 +1070,7 @@ impl OptString {
                 // vstring.py:744-755: len-0 check
                 if self.is_known_nonnull(arg1, ctx) {
                     // vstring.py:745: self.make_nonnull_str(arg1, mode)
-                    // OpRef → BoxRef shim until this caller migrates (Phase D-2).
+                    // Preserve the non-null string fact on the resolved box.
                     if let Some(arg1_box) = ctx.get_box_replacement_box(arg1) {
                         ctx.make_nonnull_str(&arg1_box, mode);
                     }

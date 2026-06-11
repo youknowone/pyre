@@ -355,10 +355,9 @@ impl CachedField {
     /// each cached_info, which itself emits a `GETFIELD_GC` /
     /// `GETARRAYITEM_GC` to the short preamble; the Rust port still
     /// inlines the emission here even though
-    /// [`crate::optimizeopt::info::produce_short_preamble_ops`] is now
-    /// ported. Migration is a follow-up cleanup — the inline path
-    /// stays for callers that lack the `OptContext` plumbing the info
-    /// helper expects.
+    /// [`crate::optimizeopt::info::produce_short_preamble_ops`] is available.
+    /// The inline path stays for callers that lack the `OptContext` plumbing
+    /// the info helper expects.
     fn produce_potential_short_preamble_ops(
         &self,
         sb: &mut crate::optimizeopt::shortpreamble::ShortBoxes,
@@ -2796,7 +2795,7 @@ impl OptHeap {
             // ── Raw field reads/writes ──
             // Keep these conservative. The standard heap.py cache/postprocess
             // logic applies to GC field descriptors, while raw field traffic is
-            // used by compatibility seams that intentionally reload state from
+            // used by compatibility paths that intentionally reload state from
             // memory instead of carrying it through loop args.
             OpCode::GetfieldRawI | OpCode::GetfieldRawR | OpCode::GetfieldRawF => {
                 OptimizationResult::Emit(op.clone())
@@ -3538,9 +3537,9 @@ mod tests {
     //! `rpython/jit/metainterp/test/test_tracingopts.py`
     //! (`test_heapcache_interiorfields`, `test_heapcache_from_constant`, ...).
     //!
-    //! Imported-short-field, arraycopy-range, and byte-array cases below are
-    //! original Rust regressions for optimizer-state seams that upstream
-    //! mostly covers only indirectly through larger integration tests.
+    //! Imported-short-field, arraycopy-range, and byte-array cases below cover
+    //! Rust-specific optimizer-state boundaries that upstream mostly exercises
+    //! indirectly through larger integration tests.
 
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -3887,7 +3886,7 @@ mod tests {
     /// on a missing donor.
     fn assign_positions(ops: &mut [Op]) {
         for (i, op) in ops.iter_mut().enumerate() {
-            // Slice P6a: type-tag op.pos via the result-type-aware factory
+            // Type-tag op.pos via the result-type-aware factory
             // so the OpRef variant carries `Box.type` (history.py:220 +
             // resoperation.py:1693) at priority 0 in `opref_type`. The
             // intrinsic `op.type_` field set at `Op::new` is the
@@ -6756,7 +6755,6 @@ mod tests {
         op1.setdescr(descr.clone());
         op1.pos.set(pos1);
         // Pretend the result is known >= 0.
-        // OpRef → BoxRef shim until this caller migrates (Phase D-2).
         // `reserve_pos_typed` does not pre-mint a canonical host; `materialize_box_at`
         // materializes the BoxRef for the reserved position here.
         let pos1_box = ctx.materialize_box_at(pos1);

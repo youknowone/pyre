@@ -293,7 +293,7 @@ pub(crate) fn merge_backend_constants_from_ctx(
     // Iterate every bound ResOp across the canonical `_forwarded` hosts
     // (`new_operations` ∪ `phase1_emit_ops` ∪ `resop_refs`) rather than the
     // `box_pool` side-table. `BoxRef::write_forwarded`'s bound-precondition
-    // (S-0.B.2) forbids a forwarded write to an unbound box, so every
+    // forbids a forwarded write to an unbound box, so every
     // position carrying `Forwarded::Const` has a bound producer `Op`
     // reachable through one of these stores. Body-namespace producers are
     // never `InputArg`, so the original `b.is_inputarg()` skip
@@ -582,9 +582,7 @@ impl Optimizer {
         }
     }
 
-    #[allow(deprecated)] // P1.5 deprecation gate — Phase 2 import_state forwards
-    // synthetic positions for imported virtual fields.
-    // Slice P5 dependency for typed factory plumbing.
+    #[allow(deprecated)] // Phase 2 import_state forwards synthetic positions for imported virtual fields.
     pub(crate) fn install_imported_virtuals(&self, ctx: &mut OptContext) {
         // virtualstate.py:655-670 make_inputargs + 627-634 _enum parity:
         // label_args are laid out by recursive _enum traversal where each
@@ -1486,9 +1484,9 @@ impl Optimizer {
     /// optimizer.py:345-364: force_box — force a virtual to be materialized.
     /// Also pops from potential_extra_ops (optimizer.py:351-359).
     ///
-    /// Path B (B.6.7) routes body refs through Phase 1 source directly, so
-    /// the prior reverse-lookup (`imported_short_source`) 3rd key is no
-    /// longer needed. Mirrors force_box_inline (mod.rs) contract.
+    /// Body refs route through the preamble source directly, so the prior
+    /// reverse-lookup (`imported_short_source`) 3rd key is no longer needed.
+    /// Mirrors force_box_inline (mod.rs) contract.
     pub fn force_box(&mut self, opref: OpRef, ctx: &mut OptContext) -> OpRef {
         // optimizer.py:346: op = get_box_replacement(op)
         let resolved = ctx.get_replacement_opref(opref);
@@ -2088,7 +2086,7 @@ impl Optimizer {
         // fresh per-iteration inputarg set whose TreeLoop-owned strong
         // `InputArgRc`s were dropped, so re-bind them here.
         ctx.ensure_inputarg_bindings();
-        // S-1: bind every input op's resop BoxRef so chain-walker
+        // Bind every input op's resop BoxRef so chain-walker
         // terminals are guaranteed bound before any `&self` reader
         // (e.g. `OptIntBounds::getintbound_box`) reaches a
         // `set_forwarded_*` write. `TraceIterator::next()`
@@ -2219,8 +2217,8 @@ impl Optimizer {
         // is restored at the end of the block.
         let imported_loop_state_taken = self.imported_loop_state.take();
         if let Some(ref exported_state) = imported_loop_state_taken {
-            // 5: post-Slice-P5 every `end_arg` OpRef from the
-            // exported state is typed via `OpRef::input_arg_typed` /
+            // Every `end_arg` OpRef from the exported state is typed via
+            // `OpRef::input_arg_typed` /
             // `op_typed`, so its variant tag carries Box.type and the
             // side-table refresh is dead.
             // opencoder.py:259 + unroll.py:479-504 parity: RPython's
@@ -2889,8 +2887,8 @@ impl Optimizer {
             // + num_inputs)`: `inputarg_base = 0` for top-level loops
             // (compile_loop / compile_retrace) where the frontend already
             // owns `[0, num_inputs)`, and `inputarg_base = bridge_inputarg_base`
-            // for bridges where Phase E.2b
-            // (`prepare_bridge_trace_for_optimizer` in pyjitpl/mod.rs) shifts
+            // for bridges, where `prepare_bridge_trace_for_optimizer`
+            // in pyjitpl/mod.rs shifts
             // the iteration into a disjoint range.  Use `num_inputs` (the
             // external loop-entry contract count) rather than `ctx.num_inputs`
             // (which may be widened by virtualizable expansion).
@@ -3365,8 +3363,7 @@ impl Optimizer {
         retrace_limit: u32,
         pending_bridge_rd: Option<PendingBridgeRd>,
         _loop_num_inputs: Option<usize>,
-        // Box Identity Phase E.2b: disjoint OpRef namespace for bridge
-        // inputargs. RPython `opencoder.py:249-273
+        // Disjoint OpRef namespace for bridge inputargs. RPython `opencoder.py:249-273
         // TraceIterator.__init__` allocates fresh `InputArg` Python
         // objects per iteration so bridges carry Python `is` identity
         // distinct from the parent loop's boxes. Pyre's flat
@@ -3394,7 +3391,7 @@ impl Optimizer {
             .unwrap_or_default();
 
         // unroll.py:193: info, ops = self.propagate_all_forward(trace, ...)
-        // Box Identity Phase E.2b: bridge ops use a disjoint OpRef
+        // Bridge ops use a disjoint OpRef
         // namespace `[bridge_inputarg_base..)` (set by
         // `prepare_bridge_trace_for_optimizer`). Drive the optimizer
         // through the shifted entry point so `inputarg_base` /
@@ -3759,14 +3756,14 @@ impl Optimizer {
         op_rc: &majit_ir::OpRc,
         ctx: &mut OptContext,
     ) {
-        // The canonical `OpRc` is threaded in so a later slice can collapse
-        // `materialize_box_at(op.pos.get())` to `BoxRef::from_bound_op(op_rc)`. For now
-        // the body reads through this `&Op` view (Deref), behaviour-identical.
+        // The canonical `OpRc` is threaded in so callers can resolve the
+        // producer directly when they need a bound BoxRef. For this pass the
+        // body reads through this `&Op` view (Deref), behaviour-identical.
         let op: &Op = op_rc;
-        // 5: Box.type lives intrinsically on `OpRef.ty()` (variant
+        // Box.type lives intrinsically on `OpRef.ty()` (variant
         // tag, history.py:220 + resoperation.py:1693 parity) and on
-        // `Op.type_` once the op lands in `new_operations`, so the
-        // pre-Slice-0.5 type side-table refresh is fully redundant.
+        // `Op.type_` once the op lands in `new_operations`, so an external
+        // type side-table refresh is redundant.
 
         // Resolve forwarded arguments. PyPy `_emit_operation`
         // (optimizer.py:614-625) walks args via force_box at the entry to

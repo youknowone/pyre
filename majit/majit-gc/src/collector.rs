@@ -2267,7 +2267,7 @@ impl GcAllocator for MiniMarkGC {
     ///     p = rffi.cast(rffi.CCHARP, p)
     ///     return (ord(p[0]) & IS_OBJECT_FLAG) != 0
     ///
-    /// `get_actual_typeid` is the only majit-specific seam: managed
+    /// `get_actual_typeid` is the only majit-specific adaptation: managed
     /// objects carry a `GcHeader` immediately before the payload, while
     /// pyre's host-allocated foreign objects keep their classptr at
     /// offset 0 and rely on the `vtable→type_id` table populated via
@@ -2992,9 +2992,9 @@ mod tests {
 
     #[test]
     fn major_mark_skips_unmanaged_field_target() {
-        // Stepping-stone parity: an old-gen object's `gc_ptr_offsets`
-        // field may transiently point at a `std::alloc`-backed
-        // (non-GC) block during the L1/L2 partial migration window.
+        // An old-gen object's `gc_ptr_offsets` field may point at a
+        // `std::alloc`-backed (non-GC) block while some object fields are
+        // still host allocations rather than managed-GC allocations.
         // The major-mark walker must skip such fields rather than
         // dereferencing memory before the unmanaged block as a
         // `GcHeader`. This test catches regression of the
@@ -3033,9 +3033,9 @@ mod tests {
 
     #[test]
     fn major_mark_skips_unmanaged_varsize_item_target() {
-        // Same stepping-stone scenario, varsize variant: an
-        // `items_have_gc_ptrs = true` array can hold transient
-        // unmanaged pointers during partial migration. The mark
+        // Same scenario, varsize variant: an `items_have_gc_ptrs = true`
+        // array can hold unmanaged pointers while item storage is still
+        // host-allocated. The mark
         // walker's variable-part loop must also guard with
         // `is_managed_heap_object`.
         let ptr_size = std::mem::size_of::<GcRef>();

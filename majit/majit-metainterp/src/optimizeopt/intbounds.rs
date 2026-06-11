@@ -173,7 +173,7 @@ impl OptIntBounds {
     /// existing Box; `same_box` later does the value-aware match on the
     /// pure cache side (history.py:204). An earlier Rust port searched a
     /// flat `OptContext.constants: Vec<Option<Value>>` op-namespace value
-    /// cache (now retired) and returned `OpRef::int_op(idx)` on hit,
+    /// cache and returned `OpRef::int_op(idx)` on hit,
     /// which mints the wrong Box family when the original Box at slot
     /// `idx` was an `InputArgInt(idx)` constant-folded via
     /// `optimizer.py:410`. Under variant-aware OpRef Eq
@@ -3354,21 +3354,11 @@ impl Optimization for OptIntBounds {
         // ctx.getintbound and generate guard ops.
     }
 
-    /// TODO: pyre threads loop-iteration IntBound
-    /// hand-offs through an explicit `HashMap<OpRef, IntBound>` side
-    /// table; RPython's `intbounds.py` lets bounds survive iteration
-    /// boundaries naturally because `box._forwarded`/`OptInfo.IntBound`
-    /// is stable per Box identity.  Pyre's flat-OpRef model breaks that
-    /// stability — `OptContext` is rebuilt per peeling round, so the
-    /// preamble's bounds must be exported to a side table here and
-    /// re-imported via `unroll.rs:setinfo_from_preamble`.
-    ///
-    /// Convergence path: extend the existing `setinfo_from_preamble`
-    /// import surface (`mod.rs:setinfo_from_preamble_item`) to carry
-    /// `IntBound` alongside `PtrInfo`/`IntBoundInfo`, so the next
-    /// iteration's `peek_intbound` finds bounds without a
-    /// dedicated HashMap routed through the optimizer/unroll boundary.
-    /// Multi-session retirement.
+    /// Bounds learned in the preamble must be visible when optimizing the
+    /// loop body. RPython keeps these on stable Box identities via
+    /// `box._forwarded`; pyre rebuilds `OptContext` around flat `OpRef`
+    /// positions, so this export surface has to carry the bound explicitly
+    /// until `setinfo_from_preamble` imports all needed `IntBound` state.
     fn export_arg_int_bounds(
         &self,
         args: &[OpRef],
@@ -3493,7 +3483,7 @@ mod tests {
 
         pass.setup();
         for (opref, bound) in initial_bounds {
-            // OpRef → BoxRef shim until this caller migrates (Phase D-2).
+            // Materialize the BoxRef host before installing the initial bound.
             let op_box = ctx.materialize_box_at(*opref);
             ctx.setintbound(&op_box, bound);
         }

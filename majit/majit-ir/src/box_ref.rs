@@ -341,9 +341,9 @@ impl BoxRef {
     /// `bind → set_forwarded → rebind`, e.g. `emit()` re-pointing a
     /// synthetic placeholder at its real producer), its effective forwarded
     /// state (`self.get_forwarded()`) is transferred into the new `Op` host.
-    /// A freshly minted, still-unbound box has no forwarded state of its own
-    /// — S-0.C removed the Box-side mirror, so `get_forwarded()` on an
-    /// unbound box is always `Forwarded::None`. Carrying that `None` would
+    /// A freshly minted, still-unbound box has no forwarded state of its own:
+    /// forwarded state lives on the bound `Op`/`InputArg`, so `get_forwarded()`
+    /// on an unbound box is always `Forwarded::None`. Carrying that `None` would
     /// *clobber* an already-populated canonical host's authoritative
     /// `_forwarded` (the bug that `box_pool` memoization used to mask by
     /// returning the same bound box on a repeat `materialize_box_at`). So the
@@ -700,9 +700,8 @@ impl BoxRef {
             _ => {
                 // The concrete value's canonical host is the bound
                 // `Op`/`InputArg` (`resoperation.py:566 IntOp._resint`).
-                // Prefer it; fall back to the transitional `Box.value`
-                // slot only for boxes not yet bound to their object
-                // (recorder pool entries).
+                // Prefer it; fall back to the local `Box.value` slot only
+                // for recorder pool entries not yet bound to their object.
                 if let Some(op) = self.bound_op() {
                     if let Some(v) = op.get_value() {
                         return Some(v);
@@ -722,7 +721,7 @@ impl BoxRef {
     /// on `IntOp`, etc.).  All producer sites must type-gate before
     /// calling: `close_loop_args_at` via `collect_kind(opref, cv)`,
     /// bridge-entry via `heap_value_for(tp, raw)`, optimizer
-    /// `setup_optimizations` via Phase 2 remap type filter.
+    /// `setup_optimizations` via the remapped inputarg type filter.
     pub fn set_value(&self, v: Value) {
         match &self.0.kind {
             BoxKind::Const { .. } => {
@@ -738,8 +737,8 @@ impl BoxRef {
                 );
                 // Stamp the concrete value on the canonical host (the bound
                 // `Op`/`InputArg`, `resoperation.py:566 IntOp._resint`).
-                // Dual-write the transitional `Box.value` slot so boxes not
-                // yet bound to their object keep working.
+                // Also write the local `Box.value` slot so boxes not yet
+                // bound to their object keep working.
                 if let Some(op) = self.bound_op() {
                     op.set_value(v);
                 } else if let Some(ia) = self.bound_inputarg() {
@@ -750,11 +749,10 @@ impl BoxRef {
         }
     }
 
-    /// `_forwarded = None` (used during transition / phase reset).
+    /// `_forwarded = None` (used when clearing optimizer state).
     pub fn clear_forwarded(&self) {
         // Const has no _forwarded slot to reset; clearing is a no-op for
-        // Const but should not be called on it. Allow clear (idempotent
-        // None) for transitional safety while migration progresses.
+        // Const but should not be called on it.
         if matches!(self.0.kind, BoxKind::Const { .. }) {
             return;
         }
@@ -817,9 +815,8 @@ impl BoxRef {
                         return cur;
                     }
                     // Materialize a terminal Const-bearing BoxRef so
-                    // callers that expect `.const_value()` / `BoxKind::Const`
-                    // on the walker output keep working until the BoxRef
-                    // return type itself is retired.
+                    // callers can read `.const_value()` / `BoxKind::Const`
+                    // from the walker output.
                     return BoxRef::new_const(c.to_value());
                 }
             }
@@ -1184,8 +1181,8 @@ mod tests {
         assert_ne!(a, c);
     }
 
-    /// After identity memoization (slice 1), `BoxRef::same_box` is object
-    /// identity (`Rc::ptr_eq`) for ResOp / InputArg plus `same_constant`
+    /// `BoxRef::same_box` is object identity (`Rc::ptr_eq`) for
+    /// ResOp / InputArg plus `same_constant`
     /// (value comparison) for Const — resoperation.py:38 / history.py:211.
     /// Two memoized resolutions of the same op/inputarg are `same_box`;
     /// DISTINCT op/inputarg identities are NOT (even at the same position —
@@ -1535,8 +1532,8 @@ mod tests {
         b.bind_op(&op_a);
         b.set_forwarded_info(OpInfo::int_bound(IntBound::from_constant(42)));
 
-        // Simulate a direct write that bypasses BoxRef so the in-Box
-        // mirror could plausibly diverge in a future migration step.
+        // Simulate a direct write that bypasses BoxRef so a stale local
+        // mirror, if one existed, would diverge from the canonical host.
         *op_a.forwarded.borrow_mut() = Forwarded::Info(OpInfo::Unknown);
 
         let op_b = std::rc::Rc::new(Op::new(OpCode::IntAdd, &[]));

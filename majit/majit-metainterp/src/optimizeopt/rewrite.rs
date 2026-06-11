@@ -3689,10 +3689,9 @@ impl Optimization for OptRewrite {
     /// Safety on stable OpRefs: PyPy uses fresh `Box` objects per loop
     /// iteration; majit uses positional `OpRef` slots. The constant lands
     /// on the resolved OpRef of the comparison result (e.g. the position
-    /// of an `int_lt`), which is itself fresh per iteration: each phase
-    /// emits its own comparison op into a disjoint OpRef range (see the
-    /// box-identity Step 2 work that gives Phase 1 and Phase 2 disjoint
-    /// `forwarded[]` ranges). CSE within a single phase is the only way
+    /// of an `int_lt`), which is itself fresh per iteration: preamble and
+    /// body optimization emit comparison ops into disjoint OpRef ranges.
+    /// CSE within a single phase is the only way
     /// for two uses to share the same OpRef, in which case they describe
     /// the same value and the constant is correct for all of them. PyPy's
     /// stable-Box vs majit's stable-OpRef yield the same observable
