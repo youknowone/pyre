@@ -6495,6 +6495,16 @@ fn inline_resolvable_static_vable_read(
 /// guard is emitted: matching the trait's self-recursive arm, the function
 /// identity is pinned upstream by the same `LOAD_GLOBAL` machinery the
 /// residual path already relies on.
+///
+/// Parity note: upstream `_opimpl_recursive_call` (`pyjitpl.py:1376-1423`)
+/// counts same-greenkey portal frames on the framestack and flips to
+/// `assembler_call` only at `count >= memmgr.max_unroll_recursion`,
+/// inlining (`perform_call`) below the bound.  This function fires for
+/// the FIRST self-recursive occurrence the inline path declines — there
+/// is no unroll count.  Value-correct (the callee runs as its own
+/// compiled loop either way), but recursion shallower than
+/// `max_unroll_recursion` that upstream would have unrolled in-trace is
+/// cut over to `CALL_ASSEMBLER` immediately here.
 fn try_walker_call_assembler_self_recursive(
     ctx: &mut WalkContext<'_, '_>,
     op: &DecodedOp,
