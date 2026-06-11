@@ -1622,6 +1622,23 @@ pub fn portal_red_regs_at(jitcode_index: i32) -> (u16, u16) {
 /// `metadata.stack_slot_color_map` first, bounded to the LIVE stack
 /// prefix at the current PC. Only if no live stack slot owns the color
 /// can the color fall back through the local slot -> color map.
+/// `PYRE_VABLE_DECODE_PROBE=1` gate for the #238 decode-equivalence probe
+/// in `restore_guard_failure_values`.  Cached: deopt is a hot-ish path and
+/// `std::env::var_os` per call would distort the measurement.
+fn vable_decode_probe_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("PYRE_VABLE_DECODE_PROBE").is_some())
+}
+
+/// `PYRE_VABLE_DECODE_SKIP_COLOR=1` gate for the #238 flip candidate in
+/// `restore_guard_failure_values`: rely solely on the positional vable
+/// section restore (`consume_vable_info` → `write_from_resume_data_partial`)
+/// and skip the color-inversion overlay.
+fn vable_decode_skip_color_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("PYRE_VABLE_DECODE_SKIP_COLOR").is_some())
+}
+
 pub(crate) fn semantic_ref_slot_for_reg_color(
     nlocals: usize,
     stack_only: usize,
@@ -7864,6 +7881,49 @@ impl JitState for PyreJitState {
             return self.validate_frame();
         }
 
+        // PYRE_VABLE_DECODE_PROBE=1 — #238 equivalence probe.  The rd_numb
+        // deopt path already restores the whole virtualizable positionally
+        // BEFORE this function runs (`resume.rs consume_vable_info` →
+        // `write_from_resume_data_partial`, resume.py:1399-1408).  This
+        // function then overlays the per-frame liveness section through the
+        // `semantic_ref_slot_for_reg_color` color inversion — pyre's
+        // deviation from upstream, where per-frame sections fill blackhole
+        // REGISTERS and never touch the vable (blackhole.py:1376+).  If the
+        // overlay never changes observable frame state, the color-inversion
+        // decode (and the slot↔color machinery feeding it) is retirable.
+        let probe_pre: Option<(Vec<pyre_object::PyObjectRef>, usize, usize)> =
+            if vable_decode_probe_enabled() {
+                self.locals_cells_stack_array().map(|arr| {
+                    (
+                        arr.as_slice().to_vec(),
+                        self.next_instr(),
+                        self.valuestackdepth(),
+                    )
+                })
+            } else {
+                None
+            };
+
+        // PYRE_VABLE_DECODE_SKIP_COLOR=1 — #238 flip candidate.  Trust the
+        // positional `write_from_resume_data_partial` restore exclusively
+        // (upstream shape: per-frame sections never write the vable) and
+        // skip both the static-field re-writes and the color-inversion
+        // liveness loop below.  Keeps the frame validation and the
+        // stale-slot clear (blackhole fresh-frame parity), which the vable
+        // section restore does not perform.
+        if vable_decode_skip_color_enabled() {
+            if !self.validate_frame() {
+                return false;
+            }
+            let vsd = self.valuestackdepth();
+            if let Some(arr) = self.locals_cells_stack_array_mut() {
+                for i in vsd..arr.len() {
+                    arr[i] = pyre_object::PY_NULL;
+                }
+            }
+            return true;
+        }
+
         // virtualizable.py:126-137 write_from_resume_data_partial:
         // ALL static fields in unroll_static_fields order.
         if let Some(last_instr) = values
@@ -8126,6 +8186,43 @@ impl JitState for PyreJitState {
         if let Some(arr) = self.locals_cells_stack_array_mut() {
             for i in vsd..arr.len() {
                 arr[i] = pyre_object::PY_NULL;
+            }
+        }
+
+        if let Some((pre_arr, pre_ni, pre_vsd)) = probe_pre {
+            let post_ni = self.next_instr();
+            let post_vsd = self.valuestackdepth();
+            // Compare only the live prefix [0..vsd]; slots beyond are dead
+            // by definition (and were just NULL-cleared above).
+            let mut changed = 0usize;
+            let mut details = String::new();
+            let cmp_len = post_vsd.min(pre_arr.len());
+            if let Some(arr) = self.locals_cells_stack_array() {
+                let post = arr.as_slice();
+                for (i, &pre) in pre_arr.iter().enumerate().take(cmp_len.min(post.len())) {
+                    if pre != post[i] {
+                        changed += 1;
+                        if changed <= 4 {
+                            details.push_str(&format!(
+                                " slot{}:{:#x}->{:#x}",
+                                i, pre as usize, post[i] as usize
+                            ));
+                        }
+                    }
+                }
+            }
+            if changed > 0 || pre_ni != post_ni || pre_vsd != post_vsd {
+                eprintln!(
+                    "[vable-decode-probe] DIFF frame={:#x} live_pc={} changed={}/{} \
+                     ni {}->{} vsd {}->{}{}",
+                    self.frame, live_pc, changed, cmp_len, pre_ni, post_ni, pre_vsd, post_vsd,
+                    details
+                );
+            } else {
+                eprintln!(
+                    "[vable-decode-probe] clean frame={:#x} live_pc={} slots={}",
+                    self.frame, live_pc, cmp_len
+                );
             }
         }
         true
