@@ -1132,14 +1132,15 @@ pub(crate) fn populate_call_registry_from_call_graphs(
         // (the `ExtRegistryEntry.compute_result_annotation` shape) so
         // callers annotate the declared unit/bool result and the
         // codewriter emits the residual call via the fn's registered
-        // C ABI address (`pyre/jit_fnaddr.rs`).  Non-unit/bool returns
+        // C ABI address (`pyre/jit_fnaddr.rs`).  Non-scalar returns
         // fall through to the normal lift — no current marker needs
-        // them, and the stub builder's scalar coverage is unaudited
-        // for that case.
+        // them, and the stub builder's coverage is unaudited for that
+        // case.
         if graph.hints.iter().any(|h| h == "dont_look_inside") {
             let return_lltype = match graph.return_type.as_deref() {
                 None | Some("()") => Some(LowLevelType::Void),
                 Some("bool") => Some(LowLevelType::Bool),
+                Some("i64") => Some(LowLevelType::Signed),
                 _ => None,
             };
             if let Some(return_lltype) = return_lltype

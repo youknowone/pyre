@@ -127,7 +127,30 @@ pub unsafe fn try_eq_w(a: PyObjectRef, b: PyObjectRef) -> Option<bool> {
 /// `obj` must be a valid PyObjectRef (null tolerated).
 #[inline]
 pub unsafe fn try_hash_w(obj: PyObjectRef) -> Option<i64> {
-    HASH_W_HOOK.with(|cell| cell.get().map(|f| unsafe { f(obj) }))
+    if has_hash_w_hook() {
+        Some(hash_w_hooked(obj))
+    } else {
+        None
+    }
+}
+
+/// True when a `hash_w` hook is installed on this thread.
+/// `dont_look_inside`: the thread-local read has no liftable RPython
+/// shape; calls residualize via the registered fnaddr (same pattern
+/// as `gc_hook::try_gc_write_barrier`).
+#[majit_macros::dont_look_inside]
+pub extern "C" fn has_hash_w_hook() -> bool {
+    HASH_W_HOOK.with(|cell| cell.get().is_some())
+}
+
+/// Invoke the installed `hash_w` hook; returns 0 when no hook is
+/// installed — gate with [`has_hash_w_hook`] (the [`try_hash_w`]
+/// wrapper does).  Not `unsafe` for ABI-surface reasons (residual
+/// calls dispatch through a plain fnaddr); `obj` must nonetheless be
+/// a valid PyObjectRef (null tolerated).
+#[majit_macros::dont_look_inside]
+pub extern "C" fn hash_w_hooked(obj: PyObjectRef) -> i64 {
+    HASH_W_HOOK.with(|cell| cell.get().map(|f| unsafe { f(obj) }).unwrap_or(0))
 }
 
 /// Diagnostic panic for the single-hash contract.  Every dict key is
@@ -170,5 +193,27 @@ pub fn clear_compares_by_identity_hook() {
 /// (null tolerated).
 #[inline]
 pub unsafe fn try_compares_by_identity(w_type: PyObjectRef) -> Option<bool> {
-    COMPARES_BY_IDENTITY_HOOK.with(|cell| cell.get().map(|f| unsafe { f(w_type) }))
+    if has_compares_by_identity_hook() {
+        Some(compares_by_identity_hooked(w_type))
+    } else {
+        None
+    }
+}
+
+/// True when a `compares_by_identity` hook is installed on this
+/// thread.  `dont_look_inside`: thread-local read, residualizes via
+/// the registered fnaddr.
+#[majit_macros::dont_look_inside]
+pub extern "C" fn has_compares_by_identity_hook() -> bool {
+    COMPARES_BY_IDENTITY_HOOK.with(|cell| cell.get().is_some())
+}
+
+/// Invoke the installed `compares_by_identity` hook; returns `false`
+/// when no hook is installed — gate with
+/// [`has_compares_by_identity_hook`] (the
+/// [`try_compares_by_identity`] wrapper does).  `w_type` must be a
+/// valid PyObjectRef pointing at a `W_TypeObject` (null tolerated).
+#[majit_macros::dont_look_inside]
+pub extern "C" fn compares_by_identity_hooked(w_type: PyObjectRef) -> bool {
+    COMPARES_BY_IDENTITY_HOOK.with(|cell| cell.get().map(|f| unsafe { f(w_type) }).unwrap_or(false))
 }

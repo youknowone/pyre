@@ -490,6 +490,30 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     );
     push_alias_pair(
         &mut entries,
+        "pyre_object::dict_eq_hook::has_hash_w_hook",
+        "pyre_object::has_hash_w_hook",
+        pyre_object::dict_eq_hook::has_hash_w_hook as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::dict_eq_hook::hash_w_hooked",
+        "pyre_object::hash_w_hooked",
+        pyre_object::dict_eq_hook::hash_w_hooked as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::dict_eq_hook::has_compares_by_identity_hook",
+        "pyre_object::has_compares_by_identity_hook",
+        pyre_object::dict_eq_hook::has_compares_by_identity_hook as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::dict_eq_hook::compares_by_identity_hooked",
+        "pyre_object::compares_by_identity_hooked",
+        pyre_object::dict_eq_hook::compares_by_identity_hooked as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
         "pyre_interpreter::stack_check::stack_almost_full",
         "pyre_interpreter::stack_almost_full",
         crate::stack_check::stack_almost_full as *const (),
