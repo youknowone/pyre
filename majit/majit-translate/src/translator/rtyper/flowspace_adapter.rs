@@ -1716,17 +1716,24 @@ fn legacy_const_define_hlvalue(op: &SpaceOperation) -> Option<Hlvalue> {
         // ConstStr opkind and synthesises a 0-arg
         // `Call(["__str_const", <text>])` instead (`mir.rs:1576`).
         // Re-fold that define-op to the upstream Constant shape here.
-        // No concretetype is stamped: string constants get their
-        // `Ptr(STR)` repr from the annotation at rtyping, unlike the
-        // primitive arms above whose lltype is fixed by the opkind.
+        // The stamped lltype is `Ptr(STR)` — fixed for every string
+        // constant, same as the primitive arms above (the rtyper's
+        // `StringRepr.convert_const` re-derives the same `Ptr(STR)`
+        // per use; `inputconst` always converts from `c.value`, so
+        // the ByteStr payload is never read through this stamp).
+        // Without the stamp the define-result Variable has no kind,
+        // and the dual-gate projection reports the slot as a
+        // `legacy=GcRef, real=Unknown` divergence on every graph
+        // containing a string literal.
         OpKind::Call {
             target: crate::model::CallTarget::FunctionPath { segments },
             args,
             ..
         } if args.is_empty() && segments.len() == 2 && segments[0] == "__str_const" => {
-            Some(Hlvalue::Constant(Constant::new(ConstValue::ByteStr(
-                segments[1].clone().into_bytes(),
-            ))))
+            Some(Hlvalue::Constant(Constant::with_concretetype(
+                ConstValue::ByteStr(segments[1].clone().into_bytes()),
+                crate::translator::rtyper::lltypesystem::rstr::STRPTR.clone(),
+            )))
         }
         // RPython parity: unit-variant ctors (`StepResult::Continue`,
         // `LoopResult::Done`, …) are pre-built singleton instances at
