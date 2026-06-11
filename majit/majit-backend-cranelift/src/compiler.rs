@@ -8623,6 +8623,10 @@ impl CraneliftBackend {
             }
             label_blocks.push((label_idx, block));
         }
+        // One block per LABEL, unconditionally — the entry-sync deferral
+        // above keyed `has_labels` on `label_indices`, which therefore
+        // agrees with the `label_blocks`-driven dispatch below.
+        debug_assert_eq!(label_blocks.len(), label_indices.len());
 
         // RPython backend: Label ops define loop blocks.
         // Linear traces (no Label, no Jump) stay in the entry block.
