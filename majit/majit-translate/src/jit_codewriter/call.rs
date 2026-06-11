@@ -3431,8 +3431,7 @@ impl CallControl {
                     // branch above so audit sweeps observe both fallback
                     // surfaces consistently.
                     if std::env::var_os("PYRE_STRICT_TARGET_TO_PATH").is_none() {
-                        if let Some(path) = self.suffix_match_impl_method(receiver, name.as_str())
-                        {
+                        if let Some(path) = self.suffix_match_impl_method(receiver, name.as_str()) {
                             return Some(path);
                         }
                     }
@@ -8794,4 +8793,3 @@ mod tests {
         assert_eq!(got[0].index(), 90);
     }
 }
-

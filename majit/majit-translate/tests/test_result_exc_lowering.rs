@@ -28,7 +28,8 @@ fn pop_value_lowers_to_raise_links() {
                     result_ctors += 1;
                 }
                 OpKind::Call {
-                    target: CallTarget::Method { name, .. }, ..
+                    target: CallTarget::Method { name, .. },
+                    ..
                 } if name == "to_exc_object" => to_exc_object_calls += 1,
                 _ => {}
             }
@@ -40,7 +41,10 @@ fn pop_value_lowers_to_raise_links() {
         }
     }
     assert_eq!(result_ctors, 0, "Result shells must be gone");
-    assert_eq!(to_exc_object_calls, 1, "Err arm materialises the exception object");
+    assert_eq!(
+        to_exc_object_calls, 1,
+        "Err arm materialises the exception object"
+    );
     assert!(except_links >= 1, "Err arm raises towards exceptblock");
     eprintln!("pop_value: to_exc_object={to_exc_object_calls} except_links={except_links}");
 }
@@ -50,8 +54,7 @@ fn pop_value_caller_gets_lastexception_exits() {
     let llbc = Llbc::load(INTERP).expect("load pyre-interpreter.ullbc");
     // The SFSF chain's free-fn body pops twice via `?`
     // (pyopcode.rs `opcode_store_fast_store_fast`).
-    let graph =
-        lower_function(&llbc, "opcode_store_fast_store_fast").expect("lower caller");
+    let graph = lower_function(&llbc, "opcode_store_fast_store_fast").expect("lower caller");
     eprintln!("caller graph = {}", graph.name);
     let lastexc_blocks = graph
         .blocks
@@ -67,5 +70,8 @@ fn pop_value_caller_gets_lastexception_exits() {
         })
         .count();
     eprintln!("caller: lastexc_blocks={lastexc_blocks} branch_calls={branch_calls}");
-    assert!(lastexc_blocks >= 1, "pop_value call sites get LastException exits");
+    assert!(
+        lastexc_blocks >= 1,
+        "pop_value call sites get LastException exits"
+    );
 }

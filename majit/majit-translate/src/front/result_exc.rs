@@ -64,15 +64,20 @@ use majit_charon_reader::Llbc;
 use majit_charon_reader::ullbc::TyRef;
 
 use crate::flowspace::model::Variable;
-use crate::model::{
-    CallTarget, ExitSwitch, FunctionGraph, Link, LinkArg, OpKind, ValueType,
-};
+use crate::model::{CallTarget, ExitSwitch, FunctionGraph, Link, LinkArg, OpKind, ValueType};
 
 /// Callees whose `Result<T, PyError>` surface lowers to raise links.
 /// Grown deliberately (same staging discipline as
 /// `REQUIRED_METHOD_DEVIRT_SCOPE` in `lib.rs`); replaced by a
 /// whole-program conformance scan once every caller shape is covered.
-const RESULT_EXC_LOWERING_SCOPE: &[&str] = &["pop_value"];
+const RESULT_EXC_LOWERING_SCOPE: &[&str] = &[
+    "pop_value",
+    "store_local_value",
+    "opcode_store_fast",
+    "store_fast",
+    "opcode_store_fast_store_fast",
+    "store_fast_store_fast",
+];
 
 /// True when `name_path`'s leaf is a scoped callee.
 pub(crate) fn in_result_exc_scope(name_path: &str) -> bool {
@@ -85,9 +90,7 @@ pub(crate) fn in_result_exc_scope(name_path: &str) -> bool {
 pub(crate) fn call_target_in_scope(target: &CallTarget) -> bool {
     let leaf = match target {
         CallTarget::Method { name, .. } => name.as_str(),
-        CallTarget::FunctionPath { segments } => {
-            segments.last().map(String::as_str).unwrap_or("")
-        }
+        CallTarget::FunctionPath { segments } => segments.last().map(String::as_str).unwrap_or(""),
         _ => return false,
     };
     RESULT_EXC_LOWERING_SCOPE.contains(&leaf)
@@ -96,14 +99,14 @@ pub(crate) fn call_target_in_scope(target: &CallTarget) -> bool {
 /// Resolve the JSON body behind a generics slot — `{"Deduplicated":
 /// id}` indirections through the dedup table, `{"HashConsedValue":
 /// [id, body]}` inline pairs, anything else as-is.
-fn ty_json_body<'l>(
-    v: &'l serde_json::Value,
-    llbc: &'l Llbc,
-) -> Option<&'l serde_json::Value> {
+fn ty_json_body<'l>(v: &'l serde_json::Value, llbc: &'l Llbc) -> Option<&'l serde_json::Value> {
     if let Some(id) = v.get("Deduplicated").and_then(serde_json::Value::as_u64) {
         return llbc.dedup_body(id);
     }
-    if let Some(arr) = v.get("HashConsedValue").and_then(serde_json::Value::as_array) {
+    if let Some(arr) = v
+        .get("HashConsedValue")
+        .and_then(serde_json::Value::as_array)
+    {
         return arr.get(1);
     }
     Some(v)
@@ -148,7 +151,13 @@ fn result_ctor_kind(target: &CallTarget) -> Option<bool> {
     let CallTarget::SyntheticTransparentCtor { name, owner_path } = target else {
         return None;
     };
-    if owner_path != &["core".to_string(), "result".to_string(), "Result".to_string()] {
+    if owner_path
+        != &[
+            "core".to_string(),
+            "result".to_string(),
+            "Result".to_string(),
+        ]
+    {
         return None;
     }
     match name.as_str() {
@@ -161,11 +170,18 @@ fn result_ctor_kind(target: &CallTarget) -> Option<bool> {
 /// Callee rule.  Rewrites every `Result::Ok` / `Result::Err` shell
 /// construction that flows into `returnblock` into a plain value
 /// return / a raise link.  Returns the number of rewritten returns.
+/// `tail_forwarded_returns` counts the returns the caller rule already
+/// disposed of (a `return f(...)` of another scoped callee builds no
+/// shell of its own) — a body whose every return is such a forward
+/// legitimately has nothing left to rewrite here.
 ///
 /// Fail-loud on any shape outside the known construction pattern —
 /// a scoped callee with an unrecognised return shape must break the
 /// build, not silently keep its shell.
-pub(crate) fn lower_result_exc_returns(graph: &mut FunctionGraph) -> Result<usize, String> {
+pub(crate) fn lower_result_exc_returns(
+    graph: &mut FunctionGraph,
+    tail_forwarded_returns: usize,
+) -> Result<usize, String> {
     let nblocks = graph.blocks.len();
     let mut rewritten = 0usize;
     for bi in 0..nblocks {
@@ -205,8 +221,15 @@ pub(crate) fn lower_result_exc_returns(graph: &mut FunctionGraph) -> Result<usiz
         // returns a payload-carrying Result (unit payloads would lower
         // with no FieldWrite and need a Void widening).
         let mut fieldwrite_idx: Option<(usize, Variable)> = None;
-        for (i, op) in graph.blocks[bi].operations.iter().enumerate().skip(ctor_idx + 1) {
-            if let OpKind::FieldWrite { base, field, value, .. } = &op.kind
+        for (i, op) in graph.blocks[bi]
+            .operations
+            .iter()
+            .enumerate()
+            .skip(ctor_idx + 1)
+        {
+            if let OpKind::FieldWrite {
+                base, field, value, ..
+            } = &op.kind
                 && *base == ctor_var
             {
                 if field.name != "__pos_0" || fieldwrite_idx.is_some() {
@@ -297,7 +320,7 @@ pub(crate) fn lower_result_exc_returns(graph: &mut FunctionGraph) -> Result<usiz
         }
         rewritten += 1;
     }
-    if rewritten == 0 {
+    if rewritten == 0 && tail_forwarded_returns == 0 {
         return Err(format!(
             "{}: scoped Result-of-PyError callee with no rewritable returns",
             graph.name
@@ -401,24 +424,50 @@ fn verify_forwards_to_returnblock(
     ))
 }
 
+/// What [`rewire_one_call_site`] found at a scoped call site.
+pub(crate) struct RewireOutcome {
+    /// `?`-diamond sites rewired into `LastException` exits.
+    pub diamonds: usize,
+    /// Tail-forwarded sites (`return f(...)` — the callee's `Result`
+    /// IS this graph's return value).  Once the callee is transformed
+    /// the forward already carries `T` and the raise propagates
+    /// implicitly, so no rewrite is needed — but only inside a graph
+    /// that is itself a scoped callee; an unscoped enclosing graph
+    /// would hand `T` to callers still switching on a discriminant.
+    pub tail_forwards: usize,
+}
+
 /// Caller rule.  `results` are the result `Variable`s of calls to
 /// scoped callees (captured during lowering).  Each must sit at the
-/// head of a `Try::branch` diamond, which is rewired into
-/// `ExitSwitch::LastException` exits.  Returns the number of rewired
-/// sites.
+/// head of a `Try::branch` diamond — rewired into
+/// `ExitSwitch::LastException` exits — or tail-forward to
+/// `returnblock` inside a scoped enclosing graph.
 pub(crate) fn rewire_result_exc_call_sites(
     graph: &mut FunctionGraph,
     results: &[Variable],
-) -> Result<usize, String> {
-    let mut rewired = 0usize;
+    enclosing_scoped: bool,
+) -> Result<RewireOutcome, String> {
+    let mut outcome = RewireOutcome {
+        diamonds: 0,
+        tail_forwards: 0,
+    };
     for r in results {
-        rewire_one_call_site(graph, r)?;
-        rewired += 1;
+        if rewire_one_call_site(graph, r, enclosing_scoped)? {
+            outcome.diamonds += 1;
+        } else {
+            outcome.tail_forwards += 1;
+        }
     }
-    Ok(rewired)
+    Ok(outcome)
 }
 
-fn rewire_one_call_site(graph: &mut FunctionGraph, r: &Variable) -> Result<(), String> {
+/// Returns `true` for a rewired diamond, `false` for a (no-op)
+/// tail-forward.
+fn rewire_one_call_site(
+    graph: &mut FunctionGraph,
+    r: &Variable,
+    enclosing_scoped: bool,
+) -> Result<bool, String> {
     let name = graph.name.clone();
     // Block A: contains the call producing `r`; closed by lower_call
     // with a single forwarding exit.
@@ -427,8 +476,19 @@ fn rewire_one_call_site(graph: &mut FunctionGraph, r: &Variable) -> Result<(), S
         .iter()
         .position(|b| b.operations.iter().any(|op| op.result.as_ref() == Some(r)))
         .ok_or_else(|| format!("{name}: scoped call result var has no producer block"))?;
-    let (b, r_b) = follow_single_exit(graph, a, r)
-        .map_err(|e| format!("{name}: call block exit: {e}"))?;
+    // Tail forward: the callee's Result flows straight to returnblock.
+    if forwards_to_returnblock(graph, a, r) {
+        if !enclosing_scoped {
+            return Err(format!(
+                "{name}: tail-forwards a scoped callee's Result out of an \
+                 unscoped graph — add it to RESULT_EXC_LOWERING_SCOPE or \
+                 the callers' discriminant switches read garbage"
+            ));
+        }
+        return Ok(false);
+    }
+    let (b, r_b) =
+        follow_single_exit(graph, a, r).map_err(|e| format!("{name}: call block exit: {e}"))?;
     assert_single_pred(graph, b, &name)?;
     // Block B: `cf = Result::branch(r)`.
     let branch_op_idx = graph.blocks[b]
@@ -452,8 +512,8 @@ fn rewire_one_call_site(graph: &mut FunctionGraph, r: &Variable) -> Result<(), S
         .result
         .clone()
         .ok_or_else(|| format!("{name}: branch() without result var"))?;
-    let (c, cf_c) = follow_single_exit(graph, b, &cf)
-        .map_err(|e| format!("{name}: branch block exit: {e}"))?;
+    let (c, cf_c) =
+        follow_single_exit(graph, b, &cf).map_err(|e| format!("{name}: branch block exit: {e}"))?;
     assert_single_pred(graph, c, &name)?;
     // Block C: `d = cf.__discriminant`; switch d {0 → continue, 1 → break}.
     let disc_var = graph.blocks[c]
@@ -467,9 +527,7 @@ fn rewire_one_call_site(graph: &mut FunctionGraph, r: &Variable) -> Result<(), S
             }
             _ => None,
         })
-        .ok_or_else(|| {
-            format!("{name}: block {c} lacks the ControlFlow __discriminant read")
-        })?;
+        .ok_or_else(|| format!("{name}: block {c} lacks the ControlFlow __discriminant read"))?;
     match &graph.blocks[c].exitswitch {
         Some(ExitSwitch::Value(v)) if *v == disc_var => {}
         other => {
@@ -540,7 +598,39 @@ fn rewire_one_call_site(graph: &mut FunctionGraph, r: &Variable) -> Result<(), S
     ];
     // Blocks B, C and the break arm are now unreachable; the dead-op
     // sweep leaves them to the reachability-walking consumers.
-    Ok(())
+    Ok(true)
+}
+
+/// Probe: does `var` flow from `block`'s exit through pure positional
+/// forwarding into `returnblock`?  The non-erroring twin of
+/// [`verify_forwards_to_returnblock`] — any non-conforming hop means
+/// "not a tail forward" rather than a build failure (the site is then
+/// matched as a diamond, whose own checks fail loud).
+fn forwards_to_returnblock(graph: &FunctionGraph, block: usize, var: &Variable) -> bool {
+    let mut current = block;
+    let mut tracked = var.clone();
+    for _ in 0..graph.blocks.len() {
+        let [link] = graph.blocks[current].exits.as_slice() else {
+            return false;
+        };
+        let Some(pos) = link
+            .args
+            .iter()
+            .position(|a| matches!(a, LinkArg::Value(v) if *v == tracked))
+        else {
+            return false;
+        };
+        if link.target == graph.returnblock {
+            return true;
+        }
+        let target = link.target.0;
+        let Some(next_var) = graph.blocks[target].inputargs.get(pos) else {
+            return false;
+        };
+        tracked = next_var.clone();
+        current = target;
+    }
+    false
 }
 
 /// Map a continue-arm link variable back to its A-scope origin
@@ -603,7 +693,9 @@ fn follow_single_exit(
         .iter()
         .position(|a| matches!(a, LinkArg::Value(v) if v == var))
     else {
-        return Err(format!("block {block}'s exit does not carry the tracked value"));
+        return Err(format!(
+            "block {block}'s exit does not carry the tracked value"
+        ));
     };
     let target = link.target.0;
     let bound = graph.blocks[target]
@@ -667,7 +759,9 @@ fn split_diamond_exits(exits: &[Link], name: &str) -> Result<(Link, Link), Strin
         (Some(c), Some(b), None) => Ok((c, b)),
         (Some(c), None, Some(d)) => Ok((c, d)),
         (None, Some(b), Some(d)) => Ok((d, b)),
-        _ => Err(format!("{name}: ControlFlow switch lacks the 0/1 case pair")),
+        _ => Err(format!(
+            "{name}: ControlFlow switch lacks the 0/1 case pair"
+        )),
     }
 }
 
@@ -705,9 +799,11 @@ fn verify_break_arm_is_reraise(
         ));
     };
     let residual_result = ops.iter().find_map(|op| match &op.kind {
-        OpKind::Call { target: CallTarget::Method { name: m, .. }, args, .. }
-            if m == "from_residual" && args.as_slice() == std::slice::from_ref(&payload_var) =>
-        {
+        OpKind::Call {
+            target: CallTarget::Method { name: m, .. },
+            args,
+            ..
+        } if m == "from_residual" && args.as_slice() == std::slice::from_ref(&payload_var) => {
             op.result.clone()
         }
         _ => None,
@@ -769,14 +865,22 @@ fn collapse_pos0_read(
     // Rename the read's result to the carrier across the block's
     // remaining ops, exitswitch, and exits.
     let rename = |v: &Variable| -> Variable {
-        if *v == read_result { carrier.clone() } else { v.clone() }
+        if *v == read_result {
+            carrier.clone()
+        } else {
+            v.clone()
+        }
     };
     let block = &mut graph.blocks[ti];
     for op in &mut block.operations {
         op.kind = crate::inline::remap_op_kind(&op.kind, &rename);
     }
-    let (sw, exits) =
-        crate::model::remap_control_flow_metadata_var(&block.exitswitch, &block.exits, rename, |b| b);
+    let (sw, exits) = crate::model::remap_control_flow_metadata_var(
+        &block.exitswitch,
+        &block.exits,
+        rename,
+        |b| b,
+    );
     block.exitswitch = sw;
     block.exits = exits;
     Ok(())

@@ -750,16 +750,22 @@ pub fn lower_fun_decl_with_static_addrs(
             // end-of-lowering simplify, byte-identical.
             simplify_lowered_graph(&mut lo.graph);
         }
+        let mut tail_forwarded_returns = 0usize;
         if !lo.result_exc_call_results.is_empty() {
-            crate::front::result_exc::rewire_result_exc_call_sites(
+            let outcome = crate::front::result_exc::rewire_result_exc_call_sites(
                 &mut lo.graph,
                 &lo.result_exc_call_results,
+                result_exc_callee,
             )
             .map_err(LowerError::Unsupported)?;
+            tail_forwarded_returns = outcome.tail_forwards;
         }
         if result_exc_callee {
-            crate::front::result_exc::lower_result_exc_returns(&mut lo.graph)
-                .map_err(LowerError::Unsupported)?;
+            crate::front::result_exc::lower_result_exc_returns(
+                &mut lo.graph,
+                tail_forwarded_returns,
+            )
+            .map_err(LowerError::Unsupported)?;
         }
         simplify_lowered_graph(&mut lo.graph);
         Ok(())
