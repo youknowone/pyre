@@ -2068,6 +2068,35 @@ impl ConstantOpcodeHandler for PyFrame {
     }
 }
 
+/// `callmethod.py:66-78` fast-path discriminator: bind the receiver only
+/// when the MRO descriptor `d` is a method-descriptor-typed function
+/// (`flag_method_descriptor` — set on `function` alone, typedef.py:807)
+/// that `getattr` surfaced unchanged.  The `d == attr` identity check is
+/// the moral equivalent of `w_obj.getdictvalue(space, name) is None` plus
+/// `has_object_getattribute()` (callmethod.py:46/67): an instance-dict
+/// shadow, a descriptor `__get__` result, or a `__getattribute__` override
+/// all hand `getattr` a different object than the raw descriptor.
+/// Everything else takes the slow path (callmethod.py:79-82): the getattr
+/// result is called as-is, with no self binding.
+unsafe fn method_descriptor_bound(
+    d: PyObjectRef,
+    attr: PyObjectRef,
+    obj: PyObjectRef,
+) -> PyObjectRef {
+    unsafe {
+        if d != attr || !crate::is_function(d) {
+            return PY_NULL;
+        }
+        // BuiltinFunction has no `__get__` (its typedef carries no
+        // `method_descriptor` flag, function.py:783).
+        if std::ptr::eq((*d).ob_type, &crate::BUILTIN_FUNCTION_TYPE as *const _) {
+            PY_NULL
+        } else {
+            obj
+        }
+    }
+}
+
 /// Compute the `null_or_self` value LOAD_METHOD pushes alongside the
 /// resolved attribute `attr` (the result of `getattr(obj, name)`).
 ///
@@ -2077,10 +2106,11 @@ impl ConstantOpcodeHandler for PyFrame {
 /// repeated.  Shared by [`PyFrame::load_method`] and the blackhole residual
 /// helper `bh_load_method_self_fn` so both bind self identically.
 ///
-///  - regular method → bind instance (self)
+///  - method-descriptor function surfaced unchanged by getattr → bind
+///    instance (self); see [`method_descriptor_bound`]
 ///  - classmethod → bind class (w_type)
-///  - staticmethod / property / member / type / getset → no binding (NULL)
-///  - builtin type method (list.append etc.) → bind instance
+///  - everything else (staticmethod / non-method descriptors / shadowed
+///    or arbitrary class attrs) → no binding (NULL)
 pub fn compute_load_method_bound(obj: PyObjectRef, attr: PyObjectRef, name: &str) -> PyObjectRef {
     unsafe {
         if pyre_object::is_method(attr) {
@@ -2098,38 +2128,12 @@ pub fn compute_load_method_bound(obj: PyObjectRef, attr: PyObjectRef, name: &str
             let raw = crate::baseobjspace::lookup_in_type(w_type, name);
             match raw {
                 _ if shadowed => PY_NULL,
+                // staticmethod / classmethod wrappers: getattr already
+                // unwrapped them, so the identity fast path below can never
+                // match; classmethod keeps its explicit cls binding.
                 Some(d) if pyre_object::is_staticmethod(d) => PY_NULL,
-                // ClassMethod.__get__ → Method(func, klass)
                 Some(d) if pyre_object::is_classmethod(d) => w_type,
-                // Type / property / member descriptors stored as class
-                // attributes are NOT methods — invoking them must not
-                // prepend self.  e.g. `class L: inner = list; L().inner(x)`
-                // calls list(x), not list(L(), x).
-                Some(d) if pyre_object::is_type(d) => PY_NULL,
-                Some(d) if pyre_object::is_property(d) => PY_NULL,
-                Some(d) if pyre_object::is_member(d) => PY_NULL,
-                // Getset descriptors (`__class__`, `__dict__`, ...) are data
-                // descriptors: getattr already ran `__get__`, so the loaded
-                // value must not prepend self.
-                Some(d) if pyre_object::getsetproperty::is_getset_property(d) => PY_NULL,
-                Some(d) if crate::is_function(d) => {
-                    let ob_type = (*d).ob_type;
-                    if std::ptr::eq(ob_type, &crate::BUILTIN_FUNCTION_TYPE as *const _) {
-                        // BuiltinFunction has no __get__.
-                        PY_NULL
-                    } else if std::ptr::eq(ob_type, &crate::FUNCTION_TYPE as *const _)
-                        && crate::is_builtin_code(
-                            crate::function_get_code(d) as pyre_object::PyObjectRef
-                        )
-                    {
-                        // FunctionWithFixedCode (interp2app) on a builtin
-                        // type — `dict.get` etc. — binds like a method.
-                        obj
-                    } else {
-                        obj
-                    }
-                }
-                Some(_) => obj, // found in type MRO → bind self (method)
+                Some(d) => method_descriptor_bound(d, attr, obj),
                 None => {
                     // Not found in type MRO → found in instance __dict__.
                     // Instance __dict__ attrs bypass descriptor protocol.
@@ -2137,40 +2141,39 @@ pub fn compute_load_method_bound(obj: PyObjectRef, attr: PyObjectRef, name: &str
                 }
             }
         } else if pyre_object::is_type(obj) {
-            // Type object: check for classmethod in type's MRO
+            // Type receiver: PyPy resolves LOAD_METHOD through the
+            // METAclass MRO (`space.type(w_obj)`), so a name found in the
+            // type's own MRO reaches the call as a plain getattr value
+            // with no binding.
             let raw = crate::baseobjspace::lookup_in_type(obj, name);
             match raw {
                 Some(d) if pyre_object::is_classmethod(d) => obj,
                 Some(_) => PY_NULL, // found in own MRO → no binding
                 None => {
-                    // Not found in type's own MRO → check metaclass MRO.
-                    // If found there, bind obj (the type) as self.
-                    obj
+                    // Not in the type's own MRO → resolved via the
+                    // metaclass MRO; bind the type for a method-descriptor
+                    // function getattr surfaced unchanged.
+                    match crate::typedef::r#type(obj)
+                        .and_then(|meta| crate::baseobjspace::lookup_in_type(meta, name))
+                    {
+                        Some(d) => method_descriptor_bound(d, attr, obj),
+                        None => PY_NULL,
+                    }
                 }
             }
         } else if let Some(w_type) =
             crate::typedef::r#type(obj).filter(|_| !pyre_object::is_module(obj))
         {
-            // Builtin type method (list.append, etc.) found via TypeDef.
-            // LOOKUP_METHOD binds self for builtin type methods, except
-            // staticmethods (str.maketrans) and classmethods (dict.fromkeys),
-            // which getattr already unwrapped above.
-            //
-            // A builtin-storage subclass instance (`class MyInt(int)`, enum
-            // members) is not is_instance-shaped, so it reaches this branch
-            // too; its `w_type` is the subclass with a full MRO.  Non-method
-            // descriptors (type / property / member / getset such as
-            // `__class__`) do not prepend self, and an attribute not in the
-            // type MRO (a special attribute resolved directly in getattr, or
-            // an instance-dict entry) binds none.
+            // Builtin-storage receiver (list, str, ... and their
+            // subclasses such as enum members) found via TypeDef; the
+            // same fast-path discriminator applies — `dict.get` etc. are
+            // FunctionWithFixedCode (interp2app) attrs that getattr
+            // returns unchanged, while staticmethods (str.maketrans) and
+            // classmethods (dict.fromkeys) were already unwrapped.
             match crate::baseobjspace::lookup_in_type(w_type, name) {
                 Some(d) if pyre_object::is_staticmethod(d) => PY_NULL,
                 Some(d) if pyre_object::is_classmethod(d) => w_type,
-                Some(d) if pyre_object::is_type(d) => PY_NULL,
-                Some(d) if pyre_object::is_property(d) => PY_NULL,
-                Some(d) if pyre_object::is_member(d) => PY_NULL,
-                Some(d) if pyre_object::getsetproperty::is_getset_property(d) => PY_NULL,
-                Some(_) => obj,
+                Some(d) => method_descriptor_bound(d, attr, obj),
                 None => PY_NULL,
             }
         } else {
