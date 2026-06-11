@@ -6608,7 +6608,13 @@ impl<'a> ResumeDataDirectReader<'a> {
         if num >= 0 {
             num as usize
         } else {
-            let len = self.rd_virtuals.map_or(0, |v| v.len()) as i32;
+            // On the GUARD_NOT_FORCED path (resume.py:1373-1374) the
+            // virtuals arrive preloaded in `virtuals_cache` while
+            // `rd_virtuals` stays None; the cache has one slot per
+            // virtual, so its length is the same wrap base.
+            let len =
+                self.rd_virtuals
+                    .map_or_else(|| self.virtuals_cache.len(), |v| v.len()) as i32;
             (len + num) as usize
         }
     }
