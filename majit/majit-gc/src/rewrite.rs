@@ -5040,4 +5040,49 @@ mod tests {
         assert_eq!(result[7].arg(2).to_opref(), result[2].pos.get()); // src
         assert_eq!(result[7].arg(3).to_opref(), result[6].pos.get());
     }
+
+    /// GUARD_EXCEPTION carries a Ref result (the caught exception).  The
+    /// guard arm emits through `emit_rewritten_from`, which must keep the
+    /// guard's original position and register a forwarding entry; a plain
+    /// `emit` renumbers the result after a preceding NEW expands into
+    /// multiple ops, dangling any downstream consumer of the caught
+    /// exception.
+    #[test]
+    fn test_guard_exception_result_keeps_pos_and_forwards_to_consumer() {
+        let rw = make_rewriter();
+        let exc_box = OpRef::ref_op(1);
+        let ops = vec![
+            // Expands to CallMallocNursery + GcStore(tid), shifting the
+            // rewriter's position counter past the guard's original pos.
+            mk_op_with_descr(OpCode::New, &[], 0, size_descr(16, 7)),
+            mk_op(OpCode::GuardException, &[OpRef::int_op(99)], 1),
+            // Downstream consumer of the caught exception.
+            mk_op_with_descr(
+                OpCode::SetfieldGc,
+                &[OpRef::ref_op(0), exc_box],
+                2,
+                ref_field_descr(),
+            ),
+        ];
+
+        let result = rw.rewrite_for_gc(&ops);
+
+        let guard = result
+            .iter()
+            .find(|o| o.opcode == OpCode::GuardException)
+            .expect("GUARD_EXCEPTION must survive the rewrite");
+        assert_eq!(
+            guard.pos.get(),
+            OpRef::op_typed(1, Type::Ref),
+            "non-void guard result must keep its original position"
+        );
+        // SETFIELD_GC lowers to GcStore(ptr, ofs, value, size); the value
+        // must still reference the guard's result, not a renumbered slot.
+        let store = result
+            .iter()
+            .filter(|o| o.opcode == OpCode::GcStore)
+            .find(|o| o.arg(2).to_opref() == guard.pos.get())
+            .expect("consumer GcStore must reference the guard's result");
+        assert_eq!(store.arg(0).to_opref(), result[0].pos.get());
+    }
 }
