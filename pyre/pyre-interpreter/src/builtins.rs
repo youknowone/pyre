@@ -704,7 +704,7 @@ pub fn install_default_builtins(namespace: &mut DictStorage) {
     crate::dict_storage_store(
         namespace,
         "RecursionError",
-        make_exc_type("RecursionError", exc_runtime_error_new, runtime_error),
+        make_exc_type("RecursionError", exc_recursion_error_new, runtime_error),
     );
 
     crate::dict_storage_store(
@@ -720,12 +720,12 @@ pub fn install_default_builtins(namespace: &mut DictStorage) {
     crate::dict_storage_store(
         namespace,
         "GeneratorExit",
-        make_exc_type("GeneratorExit", exc_base_exception_new, base_exc),
+        make_exc_type("GeneratorExit", exc_generator_exit_new, base_exc),
     );
     crate::dict_storage_store(
         namespace,
         "SystemExit",
-        make_exc_type("SystemExit", exc_base_exception_new, base_exc),
+        make_exc_type("SystemExit", exc_system_exit_new, base_exc),
     );
     crate::dict_storage_store(
         namespace,
@@ -838,17 +838,17 @@ pub fn install_default_builtins(namespace: &mut DictStorage) {
     crate::dict_storage_store(
         namespace,
         "MemoryError",
-        make_exc_type("MemoryError", exc_exception_new, exception),
+        make_exc_type("MemoryError", exc_memory_error_new, exception),
     );
     crate::dict_storage_store(
         namespace,
         "ReferenceError",
-        make_exc_type("ReferenceError", exc_exception_new, exception),
+        make_exc_type("ReferenceError", exc_reference_error_new, exception),
     );
     crate::dict_storage_store(
         namespace,
         "SystemError",
-        make_exc_type("SystemError", exc_exception_new, exception),
+        make_exc_type("SystemError", exc_system_error_new, exception),
     );
     crate::dict_storage_store(
         namespace,
@@ -1864,6 +1864,27 @@ exc_constructor!(
     exc_unicode_error,
     pyre_object::excobject::ExcKind::UnicodeError
 );
+exc_constructor!(
+    exc_generator_exit,
+    pyre_object::excobject::ExcKind::GeneratorExit
+);
+exc_constructor!(exc_system_exit, pyre_object::excobject::ExcKind::SystemExit);
+exc_constructor!(
+    exc_recursion_error,
+    pyre_object::excobject::ExcKind::RecursionError
+);
+exc_constructor!(
+    exc_memory_error,
+    pyre_object::excobject::ExcKind::MemoryError
+);
+exc_constructor!(
+    exc_reference_error,
+    pyre_object::excobject::ExcKind::ReferenceError
+);
+exc_constructor!(
+    exc_system_error,
+    pyre_object::excobject::ExcKind::SystemError
+);
 
 /// `interp_exceptions.py:551-652 W_OSError._parse_init_args` + `_init_error`.
 /// A 2..=5 positional-argument call fills the `errno` / `strerror` /
@@ -2222,6 +2243,12 @@ exc_new_wrapper!(exc_unicode_error_new, exc_unicode_error);
 exc_new_wrapper!(exc_unicode_decode_error_new, exc_unicode_decode_error);
 exc_new_wrapper!(exc_unicode_encode_error_new, exc_unicode_encode_error);
 exc_new_wrapper!(exc_unicode_translate_error_new, exc_unicode_translate_error);
+exc_new_wrapper!(exc_generator_exit_new, exc_generator_exit);
+exc_new_wrapper!(exc_system_exit_new, exc_system_exit);
+exc_new_wrapper!(exc_recursion_error_new, exc_recursion_error);
+exc_new_wrapper!(exc_memory_error_new, exc_memory_error);
+exc_new_wrapper!(exc_reference_error_new, exc_reference_error);
+exc_new_wrapper!(exc_system_error_new, exc_system_error);
 
 /// Build a builtin exception type with the given name, base, and __new__ wrapper.
 pub(crate) fn make_exc_type(

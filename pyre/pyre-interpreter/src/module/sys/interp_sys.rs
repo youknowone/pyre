@@ -554,32 +554,19 @@ pub fn register_module(ns: &mut DictStorage) {
     // sys.platlibdir — typically "lib" on POSIX; used by sysconfig to
     // construct install paths.
     dict_storage_store(ns, "platlibdir", w_str_new("lib"));
-    // sys.exit(code=0) — raise SystemExit
+    // `sys/app.py:114-127 exit(exitcode=None)` — `raise SystemExit(exitcode)`.
+    // Raise a real SystemExit instance so `e.code` / `e.args` carry the
+    // original object; code interpretation (None → 0, int() coercion,
+    // print-non-integral-and-exit-1) is the launcher's job
+    // (`app_main.py:114-129 handle_sys_exit`).
     dict_storage_store(
         ns,
         "exit",
         crate::make_builtin_function("exit", |args| {
-            let code = if args.is_empty() {
-                0i64
-            } else {
-                unsafe {
-                    if pyre_object::is_none(args[0]) {
-                        0
-                    } else if pyre_object::is_int(args[0]) || pyre_object::is_bool(args[0]) {
-                        pyre_object::w_int_get_value(args[0])
-                    } else {
-                        // Non-integer arg: print it to stderr and exit 1
-                        0
-                    }
-                }
-            };
-            Err(crate::PyError {
-                kind: crate::PyErrorKind::SystemExit,
-                message: code.to_string(),
-                exc_object: std::ptr::null_mut(),
-                attach_tb: true,
-                reraise_lasti: -1,
-            })
+            let cls = crate::builtins::lookup_exc_class("SystemExit")
+                .ok_or_else(|| crate::PyError::runtime_error("SystemExit class missing"))?;
+            let exc = crate::call::call_function_impl_result(cls, args)?;
+            Err(unsafe { crate::PyError::from_exc_object(exc) })
         }),
     );
     // sys.abiflags

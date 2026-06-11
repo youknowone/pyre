@@ -262,9 +262,8 @@ fn run_source(source: &str, mode: Mode, filename: &str) {
         }
         Err(e) => {
             if e.kind == PyErrorKind::SystemExit {
-                let code: i32 = e.message_text().parse().unwrap_or(0);
                 maybe_print_jit_stats();
-                std::process::exit(code);
+                std::process::exit(system_exit_code(&e));
             }
             maybe_print_jit_stats();
             pyre_interpreter::eprint_exception(&e, true);
@@ -272,4 +271,41 @@ fn run_source(source: &str, mode: Mode, filename: &str) {
         }
     }
     maybe_print_jit_stats();
+}
+
+/// app_main.py:114-129 `handle_sys_exit` — `SystemExit.code` is None for
+/// a bare exit (exit 0), coerced with `int()` when possible, and anything
+/// non-integral is printed to stderr with exit code 1.  `code` itself is
+/// `args[0]` for a 1-arg raise and the whole args tuple otherwise
+/// (interp_exceptions.py:993-998 `W_SystemExit.descr_init`).
+fn system_exit_code(e: &pyre_interpreter::PyError) -> i32 {
+    let exc = e.exc_object;
+    if exc.is_null() {
+        // Rust-raised SystemExit (sys.exit fast path) carries the code in
+        // the message string.
+        return e.message_text().parse().unwrap_or(0);
+    }
+    unsafe {
+        let args = pyre_object::excobject::w_exception_get_args(exc);
+        let items = pyre_object::w_tuple_items_copy_as_vec(args);
+        let code = match items.len() {
+            0 => return 0,
+            1 => items[0],
+            _ => args,
+        };
+        if code.is_null() || pyre_object::is_none(code) {
+            return 0;
+        }
+        if pyre_object::is_int(code) {
+            return pyre_object::w_int_get_value(code) as i32;
+        }
+        let text = pyre_interpreter::display::py_str(code);
+        match text.parse() {
+            Ok(n) => n,
+            Err(_) => {
+                eprintln!("{text}");
+                1
+            }
+        }
+    }
 }
