@@ -6785,7 +6785,7 @@ impl<M: Clone> MetaInterp<M> {
                 );
                 {
                     let mut previous_tokens: Vec<std::sync::Weak<JitCellToken>> = Vec::new();
-                    let mut ft = self
+                    let ft = self
                         .compiled_loops
                         .get(&green_key)
                         .map(|c| c.front_target_tokens.clone())
@@ -6806,20 +6806,23 @@ impl<M: Clone> MetaInterp<M> {
                             self.retire_compiled_entry(green_key, old_entry, &mut traces);
                     }
                     token.set_retraced_count(rc);
-                    // `compile.py:245` `jitcell_token.target_tokens = [target_token]`
-                    // — every PyPy `compile_*` path emits at least one
-                    // TargetToken before publishing the JCT.  pyre's
-                    // FINISH-only `finish_and_compile` has no body LABEL
-                    // (the trace is `Phi → guard → ... → Finish`), so no
-                    // intrinsic TargetToken exists; synthesise one here so
-                    // `JitCellToken.target_tokens` is non-empty and the
-                    // `has_compiled_targets` (`pyjitpl.py:3898`) signal
-                    // matches PyPy's "any attached JCT is enterable".
-                    if ft.is_empty() {
-                        let synth = crate::optimizeopt::unroll::TargetToken::new_loop(token.number);
-                        synth.set_original_jitcell_token_number(token.number);
-                        ft.push(synth);
-                    }
+                    // `compile.py:1079-1083` — a FINISH trace
+                    // (`compile_done_with_this_frame` → `compile_trace` with
+                    // `info.final()`) sets `target_token =
+                    // new_trace.operations[-1].getdescr()` (the FINISH descr)
+                    // and attaches through `resumekey.compile_and_attach`.  It
+                    // never builds a `TargetToken`/LABEL and never adds to
+                    // `jitcell_token.target_tokens`.  So a FINISH-only trace
+                    // leaves `front_target_tokens` empty: `has_compiled_targets`
+                    // (`pyjitpl.py:3898` = `bool(token.target_tokens)`) is
+                    // false, while the trace stays enterable through
+                    // `has_compiled_loop`
+                    // (`get_procedure_token().has_compiled_code()`, mod.rs:8273
+                    // — `warmstate.py:482-511` gates entry on code presence,
+                    // not on target_tokens).  A jumpable target token must own
+                    // real `ll_loop_code`; synthesising a code-less one here let
+                    // a later guard-failure bridge close with a JUMP whose
+                    // backend target is `ll_loop_code == 0` (`br 0` → PC=0).
                     for target_token in &ft {
                         token.record_target_token(target_token.as_jump_target_descr());
                     }
