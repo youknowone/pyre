@@ -66,12 +66,21 @@ fn lowers_branch_loop_sum_with_calls_and_discriminant() {
     let graph = lower_function(&llbc, "branch_loop_sum").expect("lowering");
     assert_eq!(graph.name, "charon_corpus::branch_loop_sum");
 
-    use majit_translate::model::OpKind;
+    use majit_translate::model::{CallTarget, OpKind};
     let mut call_count = 0usize;
     let mut discr_count = 0usize;
     for b in &graph.blocks {
         for op in &b.operations {
             match &op.kind {
+                // An Abort terminator lowers the `exc_from_raise` op
+                // pair (`simple_call(const(exc_class))` + `type(evalue)`)
+                // into its block; exclude those raise-machinery ops so
+                // the count characterizes the body's own calls.
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments },
+                    ..
+                } if matches!(segments.first().map(String::as_str), Some("simple_call" | "type")) => {
+                }
                 OpKind::Call { .. } => call_count += 1,
                 OpKind::FieldRead { field, .. } if field.name == "__discriminant" => {
                     discr_count += 1
@@ -84,7 +93,7 @@ fn lowers_branch_loop_sum_with_calls_and_discriminant() {
     // `Iterator::next` once per loop iteration; the second call sits
     // inside the loop body so there's exactly one `Call` op for it
     // in the static IR.
-    assert_eq!(call_count, 2, "expected 2 Call ops");
+    assert_eq!(call_count, 2, "expected 2 body Call ops");
     assert_eq!(
         discr_count, 1,
         "expected 1 __discriminant FieldRead for the Option step"
