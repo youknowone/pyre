@@ -1179,22 +1179,22 @@ mod tests {
             .collect();
         assert_eq!(
             jc.code.len(),
-            15,
+            11,
             "PopTop jitcode size shifted — refresh the expected sequence below",
         );
-        // `execute_pop_top` is `pop_value()? ; Ok(StepResult::Continue)`:
-        // one residual call that can raise, then return the prebuilt
-        // `Continue`.  Constants are inlined into the OpRef, so the body is
-        // the `int_copy` arg setup, the `residual_call_r_r` to `pop_value`,
-        // the `live/` jit_merge_point marker, then a direct `ref_return/r`
-        // of the folded `Continue` OpRef.  There is no `catch_exception/L ;
-        // ref_copy/r>r ; reraise/` exception shoulder: the arm has no
-        // exception *handler* (only `?` propagation), so the residual
-        // call's implicit exception edge carries the raise and no explicit
-        // catch/reraise pair is emitted.
+        // The arm wrapper is the single tail-call
+        // `execute_pop_top(executor)`.  `execute_pop_top`'s graph is in
+        // the jitcode closure (`find_all_graphs` BFS discovered it from
+        // the dispatcher callsite), so `guess_call_kind` classifies the
+        // tail-call `Regular` and `handle_regular_call` emits
+        // `inline_call_r_r` with the callee jitcode descr followed by the
+        // mandatory `-live-` marker (jtransform.py:480-481), then the
+        // `ref_return/r` of the callee's result.  The walker recurses into
+        // the `execute_pop_top` jitcode at trace time
+        // (`dispatch_inline_call_dr_kind`) instead of recording a
+        // blackbox residual call.
         let expected: Vec<(String, String)> = [
-            ("int_copy", "i>i"),
-            ("residual_call_r_r", "iRd>r"),
+            ("inline_call_r_r", "dR>r"),
             ("live", ""),
             ("ref_return", "r"),
         ]

@@ -140,11 +140,15 @@ fn build_arm_body_graph(
             .last()
             .is_some_and(|leaf| leaf.starts_with("execute_")) =>
         {
-            Some((segments.last().unwrap().clone(), args.clone()))
+            Some((segments.clone(), args.clone()))
         }
         _ => None,
     });
-    if let Some((handler_leaf, args)) = tail_call {
+    if let Some((handler_segments, args)) = tail_call {
+        let handler_leaf = handler_segments
+            .last()
+            .cloned()
+            .expect("tail-call segments are non-empty (leaf matched above)");
         let forwarded: Vec<String> = args
             .iter()
             .map(|arg| {
@@ -160,7 +164,18 @@ fn build_arm_body_graph(
                     })
             })
             .collect();
-        let handler_path = CallPath::from_segments([handler_leaf]);
+        // Keep the dispatcher callsite's full Charon-qualified segments.
+        // `CallControl::find_all_graphs_bfs` walked this same callsite
+        // (the switch-target block of `execute_opcode_step`) and inserted
+        // the qualified spelling into `candidate_graphs`; truncating to
+        // the bare leaf here made `guess_call_kind` resolve the wrapper's
+        // tail-call through a non-candidate alias spelling and classify it
+        // `Residual` — every arm degenerated to a blackbox
+        // `residual_call_r_r(<symbolic hash>, …)` instead of the
+        // `inline_call` into the already-drained per-opcode jitcode
+        // (`call.py:117-139 guess_call_kind` keys candidacy on graph
+        // identity; pyre's path-keyed set needs the spelling to match).
+        let handler_path = CallPath::from_segments(handler_segments);
         return build_tail_call_wrapper(name, params, &handler_path, &forwarded);
     }
 
