@@ -117,6 +117,77 @@ pub static STRPTR: LazyLock<LowLevelType> = LazyLock::new(|| {
     }))
 });
 
+/// RPython `llstr(s)` (`annlowlevel.py:469-475` via
+/// `rstr.py:1230-1235 mallocstr`): build the prebuilt `Ptr(STR)`
+/// container for a host string constant — `mallocstr(len(s))` plus a
+/// per-index `chars[i] = s[i]` fill.  `hash` keeps malloc's `Signed`
+/// default `0` (upstream computes it lazily through `ll_strhash`).
+/// The container is immortal: prebuilt string constants live for the
+/// whole translation, exactly like upstream's `CONST_STR_CACHE`
+/// entries.
+pub fn llstr(s: &[u8]) -> Result<_ptr, String> {
+    let LowLevelType::ForwardReference(fwd) = STR.clone() else {
+        return Err("STR must be a ForwardReference".to_string());
+    };
+    let str_struct = fwd
+        .resolved()
+        .ok_or_else(|| "STR forward reference unresolved".to_string())?;
+    let p = malloc(str_struct, Some(s.len()), MallocFlavor::Gc, true)?;
+    let obj = p
+        ._obj0
+        .as_ref()
+        .map_err(|_| "llstr: malloc returned a delayed pointer".to_string())?
+        .as_ref()
+        .ok_or_else(|| "llstr: malloc returned a null pointer".to_string())?;
+    let _ptr_obj::Struct(st) = obj else {
+        return Err("llstr: malloc(STR) must produce a struct container".to_string());
+    };
+    let fields = st._fields.lock().unwrap();
+    let Some((_, LowLevelValue::Array(chars))) = fields.iter().find(|(n, _)| n == "chars") else {
+        return Err("llstr: rpy_string container lacks a chars array".to_string());
+    };
+    for (i, b) in s.iter().enumerate() {
+        // Py2 `str` chars are bytes; `u8 as char` is the Latin-1
+        // embedding, which round-trips every byte value.
+        if !chars.setitem(i, LowLevelValue::Char(*b as char)) {
+            return Err(format!("llstr: chars[{i}] write out of bounds"));
+        }
+    }
+    drop(fields);
+    Ok(p)
+}
+
+/// `CONST_STR_CACHE = WeakValueDictionary()` (`rstr.py:1226` /
+/// `StringRepr.CACHE`, `lltypesystem/rstr.py:233`): one host string →
+/// one prebuilt container identity, so repeated `convert_const` calls
+/// on the same literal return the same `_ptr` (prebuilt-constant
+/// `is`-identity upstream relies on).  Translation-lifetime strong
+/// cache; upstream's weak semantics only matter for memory, not
+/// identity.
+static CONST_STR_CACHE: LazyLock<std::sync::Mutex<std::collections::HashMap<Vec<u8>, _ptr>>> =
+    LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// `self.CACHE.get(value)` / `self.ll.llstr(value)` pair from
+/// `BaseLLStringRepr.convert_const` (`lltypesystem/rstr.py:191-206`).
+pub fn const_str_cache_llstr(s: &[u8]) -> Result<_ptr, String> {
+    let mut cache = CONST_STR_CACHE.lock().unwrap();
+    if let Some(p) = cache.get(s) {
+        return Ok(p.clone());
+    }
+    let p = llstr(s)?;
+    cache.insert(s.to_vec(), p.clone());
+    Ok(p)
+}
+
+/// `nullptr(self.lowleveltype.TO)` for the `value is None` arm of
+/// `BaseLLStringRepr.convert_const` (`lltypesystem/rstr.py:192-193`).
+pub fn null_str_ptr() -> _ptr {
+    let LowLevelType::Ptr(ptr_t) = STRPTR.clone() else {
+        panic!("STRPTR must be a Ptr lowleveltype");
+    };
+    _ptr::new(*ptr_t, Ok(None))
+}
+
 /// RPython `UNICODE = GcForwardReference()` resolved via
 /// `UNICODE.become(GcStruct('rpy_unicode', ('hash', Signed), ('chars',
 /// Array(UniChar, hints={'immutable': True})), hints={'remove_hash':

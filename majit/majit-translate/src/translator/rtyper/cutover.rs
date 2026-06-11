@@ -635,6 +635,15 @@ pub(crate) fn is_known_unported(msg: &str) -> bool {
         // legacy walker handles these graphs; skip until the
         // address-of-local lowering lands a typed pointer operand.
         || msg.contains("rtype_cast_ptr_to_int: operand concretetype must be Ptr")
+        // Unported per-annotation Repr families.  `rmodel.rs`
+        // `rtyper_makerepr` fail-louds with this message shape for the
+        // SomeValue kinds whose upstream Repr port has not landed
+        // (rlist.py ListRepr, rdict.py DictRepr, rrange.py iterator
+        // reprs, rbytearray.py, robject.py, rproperty.py).  Reached
+        // once a graph annotates a list/dict-typed value past the
+        // exc-edge and classdef walls; the legacy walker keeps
+        // handling these graphs until each Repr is ported.
+        || msg.contains("rtyper_makerepr — port")
         // TODO(annotator-fixpoint-fail-loud) — STRICT-PARITY REGRESSION
         // vs main / PyPy.  `bookkeeper.py:108-127` propagates fixpoint
         // exceptions uncaught and `annrpython.py:643` lets

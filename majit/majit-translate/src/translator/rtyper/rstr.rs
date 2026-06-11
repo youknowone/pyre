@@ -47,6 +47,7 @@ use crate::translator::rtyper::error::TyperError;
 use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
 use crate::translator::rtyper::lltypesystem::rstr::{
     STRPTR, UNICODEPTR, build_ll_chr2str_helper_graph, build_ll_count_char_helper_graph,
+    const_str_cache_llstr, null_str_ptr,
     build_ll_endswith_char_helper_graph, build_ll_endswith_helper_graph,
     build_ll_find_char_helper_graph, build_ll_int_helper_graph,
     build_ll_replace_chr_chr_helper_graph, build_ll_rfind_char_helper_graph,
@@ -144,6 +145,30 @@ impl Repr for StringRepr {
 
     fn repr_class_id(&self) -> super::pairtype::ReprClassId {
         super::pairtype::ReprClassId::StringRepr
+    }
+
+    /// `BaseLLStringRepr.convert_const` (`lltypesystem/rstr.py:191-206`):
+    /// `None` → `nullptr(self.lowleveltype.TO)`, a `str` value → the
+    /// prebuilt ll string (`self.ll.llstr(value)`, cached in
+    /// `CONST_STR_CACHE`).  The cache exists upstream so one host
+    /// string maps to one prebuilt container identity; pyre's
+    /// `CONST_STR_CACHE` mirror keys the interned `_ptr` by the byte
+    /// payload.
+    fn convert_const(&self, value: &ConstValue) -> Result<Constant, TyperError> {
+        match value {
+            ConstValue::None => Ok(Constant::with_concretetype(
+                ConstValue::LLPtr(Box::new(null_str_ptr())),
+                self.lltype.clone(),
+            )),
+            ConstValue::ByteStr(s) => {
+                let p = const_str_cache_llstr(s).map_err(TyperError::message)?;
+                Ok(Constant::with_concretetype(
+                    ConstValue::LLPtr(Box::new(p)),
+                    self.lltype.clone(),
+                ))
+            }
+            other => Err(TyperError::message(format!("not a str: {other:?}"))),
+        }
     }
 
     /// RPython `AbstractStringRepr.rtype_len(self, hop)` (`rstr.py:119-122`).
