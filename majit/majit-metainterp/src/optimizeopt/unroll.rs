@@ -1916,8 +1916,10 @@ pub struct ExportedState {
     /// (history.py:220), so consumers read the type via `OpRef::ty()` —
     /// RPython `info.renamed_inputargs` Box parity, no parallel type array.
     pub renamed_inputargs: Vec<OpRef>,
-    /// Short inputargs for the short preamble.
-    pub short_inputargs: Vec<OpRef>,
+    /// Short inputargs for the short preamble — the renamed inputarg box
+    /// objects themselves (shortpreamble.py:430 / unroll.py:480), shared
+    /// with the renamed operands inside `short_boxes`.
+    pub short_inputargs: Vec<crate::r#box::BoxRef>,
     /// unroll.py: runtime_boxes — live values at the original jump point.
     /// Threaded into Phase 2 import as `runtime_boxes` for guard generation.
     /// Default `Vec::new()` until the export site populates it; callers
@@ -2006,7 +2008,7 @@ impl ExportedState {
         >,
         exported_short_boxes: Vec<crate::optimizeopt::shortpreamble::PreambleOp>,
         renamed_inputargs: Vec<OpRef>,
-        short_inputargs: Vec<OpRef>,
+        short_inputargs: Vec<crate::r#box::BoxRef>,
     ) -> Self {
         // unroll.py:466-477 `sb.create_short_boxes(...)` parity: pyre
         // pre-derives the per-OpRef ProducedShortOp view (with label-arg
@@ -2141,7 +2143,9 @@ impl ExportedState {
             short_preamble.walk_const_ptr_refs_mut(visitor);
         }
         visit_oprefs(&mut self.renamed_inputargs, visitor);
-        visit_oprefs(&mut self.short_inputargs, visitor);
+        for arg in &self.short_inputargs {
+            arg.walk_const_ptr_refs(visitor);
+        }
         visit_oprefs(&mut self.runtime_boxes, visitor);
         if let Some(patchguardop) = self.patchguardop.as_ref() {
             visit_op(patchguardop, visitor);
@@ -2193,8 +2197,8 @@ impl ExportedState {
         for &opref in &self.renamed_inputargs {
             visit(opref);
         }
-        for &opref in &self.short_inputargs {
-            visit(opref);
+        for arg in &self.short_inputargs {
+            visit(arg.to_opref());
         }
         for &opref in &self.runtime_boxes {
             visit(opref);
@@ -2857,13 +2861,21 @@ impl OptUnroll {
         // `label_args + virtuals` (measured identical across the corpus);
         // paths that never ran the preview (test ExportedState setups) fall
         // back to the local recompute.
-        let short_inputargs = if ctx.exported_short_inputargs.is_empty() {
-            short_args.clone()
+        let short_inputargs: Vec<crate::r#box::BoxRef> = if ctx.exported_short_inputargs.is_empty()
+        {
+            short_args
+                .iter()
+                .map(|&a| crate::r#box::BoxRef::from_opref(a))
+                .collect()
         } else {
             debug_assert_eq!(
-                ctx.exported_short_inputargs, short_args,
+                ctx.exported_short_inputargs
+                    .iter()
+                    .map(|b| b.to_opref())
+                    .collect::<Vec<_>>(),
+                short_args,
                 "preview-pass create_short_inputargs diverged from the \
-                 export-site label_args + virtuals recompute"
+                     export-site label_args + virtuals recompute"
             );
             ctx.exported_short_inputargs.clone()
         };
@@ -3915,7 +3927,7 @@ impl OptUnroll {
                     if let Some(slot) = exported_state
                         .short_inputargs
                         .iter()
-                        .position(|&arg| arg == *source)
+                        .position(|arg| arg.to_opref() == *source)
                     {
                         short_args.get(slot).copied()
                     } else {
@@ -5364,7 +5376,7 @@ mod tests {
             crate::optimizeopt::vec_assoc::VecAssoc::new(),
             Vec::new(),
             vec![OpRef::int_op(14)],
-            vec![OpRef::int_op(23)],
+            vec![BoxRef::from_opref(OpRef::int_op(23))],
         );
 
         assert_eq!(exported.opref_high_water(), 110);
@@ -5606,7 +5618,7 @@ mod tests {
                 same_as_source: Some(BoxRef::from_opref(old_ref)),
             }],
             vec![old_ref],
-            vec![old_ref],
+            vec![BoxRef::from_opref(old_ref)],
         );
         state.short_boxes.push((
             old_ref,
@@ -5652,7 +5664,7 @@ mod tests {
         assert_eq!(state.end_args[0], new_ref);
         assert_eq!(state.next_iteration_args[0], new_ref);
         assert_eq!(state.renamed_inputargs[0], new_ref);
-        assert_eq!(state.short_inputargs[0], new_ref);
+        assert_eq!(state.short_inputargs[0].to_opref(), new_ref);
         assert_eq!(state.runtime_boxes[0], new_ref);
         assert!(state.exported_infos.get(&new_ref).is_some());
         assert_eq!(state.exported_short_boxes[0].op.arg(0).to_opref(), new_ref);
@@ -6548,7 +6560,7 @@ mod tests {
                 same_as_source: None,
             }],
             Vec::new(),
-            vec![source],
+            vec![BoxRef::from_opref(source)],
         );
         let mut ctx = crate::optimizeopt::OptContext::with_inputarg_types(
             8,
@@ -6584,7 +6596,11 @@ mod tests {
         );
         ctx.initialize_imported_short_preamble_builder(
             &[OpRef::int_op(0), OpRef::int_op(1), OpRef::int_op(2)],
-            &[OpRef::int_op(10), OpRef::int_op(11), OpRef::int_op(12)],
+            &[
+                BoxRef::from_opref(OpRef::int_op(10)),
+                BoxRef::from_opref(OpRef::int_op(11)),
+                BoxRef::from_opref(OpRef::int_op(12)),
+            ],
             &[crate::optimizeopt::shortpreamble::PreambleOp {
                 op: {
                     let mut op = Op::new(
@@ -6669,10 +6685,10 @@ mod tests {
                 OpRef::ref_op(3),
             ],
             &[
-                OpRef::ref_op(10),
-                OpRef::ref_op(11),
-                OpRef::ref_op(12),
-                OpRef::ref_op(13),
+                BoxRef::from_opref(OpRef::ref_op(10)),
+                BoxRef::from_opref(OpRef::ref_op(11)),
+                BoxRef::from_opref(OpRef::ref_op(12)),
+                BoxRef::from_opref(OpRef::ref_op(13)),
             ],
             &[crate::optimizeopt::shortpreamble::PreambleOp {
                 op: {

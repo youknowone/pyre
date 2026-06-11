@@ -2825,11 +2825,8 @@ impl Optimizer {
             // label_args + virtuals)` — read off the ShortBoxes object and
             // carry to export_state through the ctx channel (sibling of
             // `exported_short_boxes` below).
-            ctx.exported_short_inputargs = short_boxes
-                .create_short_inputargs(&preview_short_args)
-                .iter()
-                .map(|b| b.to_opref())
-                .collect();
+            ctx.exported_short_inputargs =
+                short_boxes.create_short_inputargs(&preview_short_args);
             ctx.exported_short_boxes = produced
                 .into_iter()
                 .map(|(result, produced)| {
@@ -3200,8 +3197,14 @@ impl Optimizer {
                 for arg in &mut state.renamed_inputargs {
                     remap_opref(arg);
                 }
-                for arg in &mut state.short_inputargs {
-                    remap_opref(arg);
+                for arg in &state.short_inputargs {
+                    // Renamed-box positions track op compaction through the
+                    // shared `set_position` Cell (no-op for InputArg/Const
+                    // kinds, whose positions are not subject to compaction);
+                    // every holder of the same box object sees the update.
+                    let mut opref = arg.to_opref();
+                    remap_opref(&mut opref);
+                    arg.set_position(opref.raw());
                 }
                 // Remap exported_infos keys (Const keys pass through)
                 let old_infos = std::mem::take(&mut state.exported_infos);
@@ -6231,7 +6234,7 @@ mod tests {
         ctx.make_constant(OpRef::int_op(10_000), majit_ir::Value::Int(0));
         ctx.initialize_imported_short_preamble_builder(
             &[OpRef::int_op(0)],
-            &[OpRef::int_op(0)],
+            &[BoxRef::from_opref(OpRef::int_op(0))],
             &[crate::optimizeopt::shortpreamble::PreambleOp {
                 op: preamble_op.clone(),
                 kind: crate::optimizeopt::shortpreamble::PreambleOpKind::Pure,

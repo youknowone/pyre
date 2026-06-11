@@ -3822,7 +3822,7 @@ mod tests {
         preamble_op.pos.set(source);
         ctx.initialize_imported_short_preamble_builder(
             &[object, resolved],
-            &[object, resolved],
+            &[BoxRef::from_opref(object), BoxRef::from_opref(resolved)],
             &[crate::optimizeopt::shortpreamble::PreambleOp {
                 op: preamble_op.clone(),
                 kind: crate::optimizeopt::shortpreamble::PreambleOpKind::Heap,

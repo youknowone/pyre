@@ -655,13 +655,13 @@ pub struct OptContext {
     /// the exported loop-header inputargs.
     pub exported_short_boxes: Vec<crate::optimizeopt::shortpreamble::PreambleOp>,
     /// unroll.py:480 `short_inputargs = sb.create_short_inputargs(label_args
-    /// + virtuals)` — the ShortBoxes-derived short-preamble inputargs,
-    /// carried from the preview pass (optimizer.rs, where the ShortBoxes
-    /// object lives) to `export_state_with_bounds` through the same channel
-    /// as `exported_short_boxes`. Position projection of the renamed
-    /// inputarg boxes; equals the export-site `label_args + virtuals`
-    /// recompute (measured identical across the corpus, 2026-06-11).
-    pub exported_short_inputargs: Vec<OpRef>,
+    /// + virtuals)` — the ShortBoxes-stored renamed inputarg boxes
+    /// themselves, carried from the preview pass (optimizer.rs, where the
+    /// ShortBoxes object lives) to `export_state_with_bounds` through the
+    /// same channel as `exported_short_boxes`. Position projection equals
+    /// the export-site `label_args + virtuals` recompute (measured
+    /// identical across the corpus, 2026-06-11).
+    pub exported_short_inputargs: Vec<crate::r#box::BoxRef>,
     /// optimizer.py: `can_replace_guards` — disable guard replacement during
     /// bridge compilation. Defaults to true for preamble.
     pub can_replace_guards: bool,
@@ -2709,7 +2709,7 @@ impl OptContext {
     pub fn initialize_imported_short_preamble_builder(
         &mut self,
         label_args: &[OpRef],
-        short_inputargs: &[OpRef],
+        short_inputargs: &[crate::r#box::BoxRef],
         exported_short_boxes: &[crate::optimizeopt::shortpreamble::PreambleOp],
     ) {
         let produced: Vec<(OpRef, crate::optimizeopt::shortpreamble::ProducedShortOp)> =
@@ -2758,7 +2758,7 @@ impl OptContext {
     pub fn initialize_imported_short_preamble_builder_from_short_boxes(
         &mut self,
         short_args: &[OpRef],
-        short_inputargs: &[OpRef],
+        short_inputargs: &[crate::r#box::BoxRef],
         short_boxes: &[(OpRef, crate::optimizeopt::shortpreamble::ProducedShortOp)],
         short_box_const_values: &crate::optimizeopt::vec_assoc::VecAssoc<OpRef, majit_ir::Value>,
         result_map: &crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef>,
@@ -9943,7 +9943,10 @@ mod imported_short_preamble_fallback_tests {
             OptContext::with_inputarg_types(16, &[majit_ir::Type::Ref, majit_ir::Type::Ref]);
         ctx.initialize_imported_short_preamble_builder(
             &[OpRef::input_arg_ref(0), OpRef::input_arg_ref(1)],
-            &[OpRef::int_op(7), OpRef::int_op(8)],
+            &[
+                crate::r#box::BoxRef::from_opref(OpRef::int_op(7)),
+                crate::r#box::BoxRef::from_opref(OpRef::int_op(8)),
+            ],
             &[],
         );
 

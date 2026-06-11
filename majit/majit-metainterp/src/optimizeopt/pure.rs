@@ -1313,9 +1313,13 @@ mod tests {
             Some(idx) => (0..=idx as u32).map(OpRef::int_op).collect(),
             None => vec![OpRef::int_op(0)],
         };
+        let short_inputarg_boxes: Vec<crate::r#box::BoxRef> = short_inputargs
+            .iter()
+            .map(|&a| crate::r#box::BoxRef::from_opref(a))
+            .collect();
         ctx.initialize_imported_short_preamble_builder(
             &short_inputargs,
-            &short_inputargs,
+            &short_inputarg_boxes,
             &[crate::optimizeopt::shortpreamble::PreambleOp {
                 op: preamble_op,
                 kind: crate::optimizeopt::shortpreamble::PreambleOpKind::Pure,
