@@ -46,32 +46,37 @@ thread_local! {
     static HASH_W_HOOK: Cell<Option<HashWHookFn>> = const { Cell::new(None) };
     static COMPARES_BY_IDENTITY_HOOK: Cell<Option<ComparesByIdentityHookFn>> = const { Cell::new(None) };
     /// Error flag set by the hash hook when `space.hash_w` encounters
-    /// an unhashable type or a user `__hash__` raises.  The object
-    /// reference is stored so the caller can reconstruct the error
-    /// message.  Null means no error.
+    /// an unhashable type or a user `__hash__` raises.  Only presence
+    /// is observed (the error payload itself travels through the
+    /// interpreter-side pending-error slot the trampoline fills before
+    /// signalling).  Null means no error.
     static HASH_W_ERROR: Cell<PyObjectRef> = const { Cell::new(std::ptr::null_mut()) };
 }
 
 /// Signal that the most recent `hash_w` call failed.  Called by the
 /// hash hook trampoline when `try_hash_value` returns `Err`.  The
-/// caller retrieves the error via [`take_hash_error`].
-#[inline]
-pub fn signal_hash_error(obj: PyObjectRef) {
+/// caller observes the flag via [`take_hash_error`].
+/// `dont_look_inside`: thread-local write, residualizes via the
+/// registered fnaddr.  `obj` must be a valid PyObjectRef.
+#[majit_macros::dont_look_inside]
+pub extern "C" fn signal_hash_error(obj: PyObjectRef) {
     HASH_W_ERROR.with(|cell| cell.set(obj));
 }
 
-/// Consume the pending hash error flag, returning the unhashable
-/// object if an error was signalled since the last `take`.  Returns
-/// `None` when no error is pending.
-#[inline]
-pub fn take_hash_error() -> Option<PyObjectRef> {
+/// Consume the pending hash error flag, returning `true` if an error
+/// was signalled since the last `take`.  Callers only branch on
+/// presence; the error payload is retrieved from the interpreter-side
+/// pending-error slot.  `dont_look_inside`: thread-local read,
+/// residualizes via the registered fnaddr.
+#[majit_macros::dont_look_inside]
+pub extern "C" fn take_hash_error() -> bool {
     HASH_W_ERROR.with(|cell| {
         let obj = cell.get();
         if obj.is_null() {
-            None
+            false
         } else {
             cell.set(std::ptr::null_mut());
-            Some(obj)
+            true
         }
     })
 }

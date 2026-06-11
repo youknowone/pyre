@@ -115,7 +115,7 @@ unsafe fn key_as_utf8(key: PyObjectRef) -> Option<&'static str> {
 pub unsafe fn object_key_for(obj: PyObjectRef) -> ObjectKey {
     let hash = crate::dict_eq_hook::try_hash_w(obj)
         .unwrap_or_else(|| crate::dict_eq_hook::missing_hash_hook());
-    if crate::dict_eq_hook::take_hash_error().is_some() {
+    if crate::dict_eq_hook::take_hash_error() {
         // Infallible path: swallow the error and use structural hash.
         // Checked callers should use `object_key_for_checked` instead.
     }
@@ -130,7 +130,7 @@ pub unsafe fn object_key_for(obj: PyObjectRef) -> ObjectKey {
 pub unsafe fn object_key_for_checked(obj: PyObjectRef) -> Result<ObjectKey, DictKeyError> {
     let hash = crate::dict_eq_hook::try_hash_w(obj)
         .unwrap_or_else(|| crate::dict_eq_hook::missing_hash_hook());
-    if crate::dict_eq_hook::take_hash_error().is_some() {
+    if crate::dict_eq_hook::take_hash_error() {
         return Err(DictKeyError);
     }
     Ok(ObjectKey { hash, obj })
@@ -139,7 +139,7 @@ pub unsafe fn object_key_for_checked(obj: PyObjectRef) -> Result<ObjectKey, Dict
 #[inline]
 pub unsafe fn hash_key_checked(obj: PyObjectRef) -> Result<(), DictKeyError> {
     let _ = crate::dict_eq_hook::try_hash_w(obj);
-    if crate::dict_eq_hook::take_hash_error().is_some() {
+    if crate::dict_eq_hook::take_hash_error() {
         return Err(DictKeyError);
     }
     Ok(())
@@ -1615,7 +1615,7 @@ pub unsafe fn w_dict_lookup_checked(
         return w_dict_lookup_object_strategy_checked(obj, key);
     }
     let result = strategy.getitem(obj, key);
-    if crate::dict_eq_hook::take_hash_error().is_some() {
+    if crate::dict_eq_hook::take_hash_error() {
         return Err(DictKeyError);
     }
     Ok(result)
@@ -1838,7 +1838,7 @@ pub unsafe fn w_dict_store_checked(
         return w_dict_store_object_strategy_checked(obj, key, value);
     }
     strategy.setitem(obj, key, value);
-    if crate::dict_eq_hook::take_hash_error().is_some() {
+    if crate::dict_eq_hook::take_hash_error() {
         return Err(DictKeyError);
     }
     Ok(())
@@ -1891,7 +1891,7 @@ pub unsafe fn w_dict_setdefault_checked(
     // empty-dict setitem rejecting unhashable).  Route through
     // `w_dict_store_checked` and propagate its `Result` directly:
     // `object_key_for_checked` consumes the hook error slot, so a
-    // post-hoc `take_hash_error()` would observe `None`.
+    // post-hoc `take_hash_error()` would observe no pending error.
     if strategy_is(strategy, &crate::dictstrategy::EMPTY_DICT_STRATEGY) {
         crate::dictstrategy::EMPTY_DICT_STRATEGY.switch_to_correct_strategy(obj, key);
         w_dict_store_checked(obj, key, value)?;
@@ -1903,7 +1903,7 @@ pub unsafe fn w_dict_setdefault_checked(
         return Ok(value);
     }
     let result = strategy.setdefault(obj, key, value);
-    if crate::dict_eq_hook::take_hash_error().is_some() {
+    if crate::dict_eq_hook::take_hash_error() {
         return Err(DictKeyError);
     }
     Ok(result)
@@ -1941,13 +1941,13 @@ pub unsafe fn w_dict_pop_checked(
         let strategy = (*(obj as *const W_DictObject)).dstrategy;
         match strategy.pop(obj, key, None) {
             Ok(val) => {
-                if crate::dict_eq_hook::take_hash_error().is_some() {
+                if crate::dict_eq_hook::take_hash_error() {
                     return Err(DictKeyError);
                 }
                 Ok(Some(val))
             }
             Err(()) => {
-                if crate::dict_eq_hook::take_hash_error().is_some() {
+                if crate::dict_eq_hook::take_hash_error() {
                     return Err(DictKeyError);
                 }
                 Ok(None)
@@ -2603,7 +2603,7 @@ pub unsafe fn w_dict_delitem_checked(
         return w_dict_delitem_object_strategy_checked(obj, key);
     }
     let removed = strategy.delitem(obj, key);
-    if crate::dict_eq_hook::take_hash_error().is_some() {
+    if crate::dict_eq_hook::take_hash_error() {
         return Err(DictKeyError);
     }
     Ok(removed)
