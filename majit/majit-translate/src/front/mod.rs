@@ -72,6 +72,7 @@ pub mod mir;
 pub mod mir_dispatch;
 pub mod opcode_wrapper;
 pub mod raise;
+pub(crate) mod result_exc;
 pub mod semantic;
 pub mod typestr;
 

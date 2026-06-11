@@ -404,7 +404,7 @@ fn remap_op(
     SpaceOperation { result, kind }
 }
 
-fn remap_op_kind(
+pub(crate) fn remap_op_kind(
     kind: &OpKind,
     remap_var: &impl Fn(&crate::flowspace::model::Variable) -> crate::flowspace::model::Variable,
 ) -> OpKind {

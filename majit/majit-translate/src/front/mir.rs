@@ -730,6 +730,40 @@ pub fn lower_fun_decl_with_static_addrs(
         ))
     })?;
     let name = fd.item_meta.name_path();
+    // The Result-of-PyError exception-link lowering's callee rule
+    // applies when this body is a scoped callee (see
+    // `front::result_exc`); the caller rule applies to the diamond
+    // sites the body lowering captured.  Both run before
+    // `simplify_lowered_graph` so the freed shell ops feed the same
+    // dead-op sweep the Abort → RaiseImplicit fold uses.
+    let result_exc_callee = crate::front::result_exc::in_result_exc_scope(&name)
+        && crate::front::result_exc::tyref_is_result_of_pyerror(&fd.signature.output, llbc);
+    let finish = |lo: &mut Lowering<'_>| -> Result<(), LowerError> {
+        if !lo.result_exc_call_results.is_empty() || result_exc_callee {
+            // The exception-link transforms run on a simplified graph,
+            // as exceptiontransform.py does (graphs reach it after
+            // `simplify_graph`, simplify.py:1075): the discriminant
+            // switch's `default → Abort` else-unreachable arm must be
+            // pruned by `remove_assertion_errors` before the diamond
+            // matcher sees the switch, leaving the plain 0/1 pair.
+            // Untouched graphs skip this and keep their single
+            // end-of-lowering simplify, byte-identical.
+            simplify_lowered_graph(&mut lo.graph);
+        }
+        if !lo.result_exc_call_results.is_empty() {
+            crate::front::result_exc::rewire_result_exc_call_sites(
+                &mut lo.graph,
+                &lo.result_exc_call_results,
+            )
+            .map_err(LowerError::Unsupported)?;
+        }
+        if result_exc_callee {
+            crate::front::result_exc::lower_result_exc_returns(&mut lo.graph)
+                .map_err(LowerError::Unsupported)?;
+        }
+        simplify_lowered_graph(&mut lo.graph);
+        Ok(())
+    };
     // Opt-in framestate-threaded lowering for acyclic bodies (the GAP-B
     // path that threads locals as block inputargs / phis).  Default
     // (flag unset) keeps the monotonic lowering so the gate stays green
@@ -741,7 +775,20 @@ pub fn lower_fun_decl_with_static_addrs(
         let mut lo = Lowering::new(llbc, name.clone(), &u, static_addrs, fd.generics.as_ref())?;
         if lo.mir_model_is_acyclic() {
             match lo.lower_framestate() {
-                Ok(()) => return Ok(lo.graph),
+                Ok(()) => {
+                    // The exception-link ABI (raise-through vs Result
+                    // return) must be uniform across lowering
+                    // strategies — a framestate-lowered scoped callee
+                    // that kept its Result returns would break a
+                    // monotonic-lowered caller whose call site was
+                    // rewired to LastException exits.  Bodies the
+                    // transforms don't touch skip this, keeping the
+                    // framestate output unchanged.
+                    if !lo.result_exc_call_results.is_empty() || result_exc_callee {
+                        finish(&mut lo)?;
+                    }
+                    return Ok(lo.graph);
+                }
                 Err(e) => {
                     if std::env::var_os("PYRE_MIR_FRAMESTATE_STRICT").is_some() {
                         return Err(e);
@@ -753,7 +800,7 @@ pub fn lower_fun_decl_with_static_addrs(
     let mut lo = Lowering::new(llbc, name.clone(), &u, static_addrs, fd.generics.as_ref())?;
     match lo.lower(BlockOrder::Linear) {
         Ok(()) => {
-            simplify_lowered_graph(&mut lo.graph);
+            finish(&mut lo)?;
             Ok(lo.graph)
         }
         // A forward-referenced definition — typically a `TermKind::Call`
@@ -768,7 +815,7 @@ pub fn lower_fun_decl_with_static_addrs(
         Err(LowerError::Unsupported(msg)) if is_known_lowering_gap(&msg) => {
             let mut lo = Lowering::new(llbc, name, &u, static_addrs, fd.generics.as_ref())?;
             lo.lower(BlockOrder::ReversePostorder)?;
-            simplify_lowered_graph(&mut lo.graph);
+            finish(&mut lo)?;
             Ok(lo.graph)
         }
         Err(e) => Err(e),
@@ -914,6 +961,13 @@ struct Lowering<'a> {
     /// so the paired `Result::expect` on such a local also aliases it
     /// — see [`Lowering::is_infallible_widening_try_from`].
     infallible_result_locals: std::collections::HashSet<usize>,
+    /// Result `Variable`s of calls to `RESULT_EXC_LOWERING_SCOPE`
+    /// callees whose declared result is `Result<T, PyError>`.  Each
+    /// heads a `Try::branch` diamond that
+    /// [`crate::front::result_exc::rewire_result_exc_call_sites`]
+    /// rewires into `ExitSwitch::LastException` exits after the body
+    /// lowering completes.
+    result_exc_call_results: Vec<Variable>,
 }
 
 impl<'a> Lowering<'a> {
@@ -1041,6 +1095,7 @@ impl<'a> Lowering<'a> {
             binop_result_locals: compute_binop_result_locals(body),
             index_elem_alias: std::collections::HashMap::new(),
             infallible_result_locals: std::collections::HashSet::new(),
+            result_exc_call_results: Vec::new(),
         })
     }
 
@@ -3214,6 +3269,15 @@ impl<'a> Lowering<'a> {
             .graph
             .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
         self.local_var[dest_local] = Some(result_var.clone());
+        // Capture scoped `Result<T, PyError>` call results for the
+        // `?`-diamond rewiring pass (`front::result_exc`) that runs
+        // after the body lowering completes.
+        if let OpKind::Call { target, .. } = &op_kind
+            && crate::front::result_exc::call_target_in_scope(target)
+            && crate::front::result_exc::tyref_is_result_of_pyerror(&call.dest.ty, self.llbc)
+        {
+            self.result_exc_call_results.push(result_var.clone());
+        }
         self.graph.block_mut(bb_id).operations.push(SpaceOperation {
             result: Some(result_var),
             kind: op_kind,
