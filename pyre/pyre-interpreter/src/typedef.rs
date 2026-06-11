@@ -584,7 +584,10 @@ pub fn init_typeobjects() {
         );
         reg.insert(
             &pyre_object::rangeobject::LONG_RANGE_ITER_TYPE as *const PyType as usize,
-            new_typeobject_with_base("longrange_iterator", |_| {}, object_type) as usize,
+            // `W_AbstractRangeIterator.typedef` names every range-iterator
+            // class `range_iterator` (`functional.py`); the word-fit and bignum
+            // iterators share that public name though they are distinct types.
+            new_typeobject_with_base("range_iterator", |_| {}, object_type) as usize,
         );
         reg.insert(
             &pyre_object::cellobject::CELL_TYPE as *const PyType as usize,

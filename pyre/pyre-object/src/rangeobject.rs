@@ -277,10 +277,12 @@ pub unsafe fn w_range_fields(obj: PyObjectRef) -> (PyObjectRef, PyObjectRef, PyO
 /// `obj` must be a valid int, long, or bool object.
 pub unsafe fn range_obj_to_bigint(obj: PyObjectRef) -> BigInt {
     unsafe {
-        if is_int(obj) {
-            BigInt::from(crate::intobject::w_int_get_value(obj))
-        } else if is_bool(obj) {
+        // `is_int` is true for a bool (`BOOL_TYPE`), so test `is_bool` first;
+        // a bool reads through `w_bool_get_value`, not the int accessor.
+        if is_bool(obj) {
             BigInt::from(crate::boolobject::w_bool_get_value(obj) as i64)
+        } else if is_int(obj) {
+            BigInt::from(crate::intobject::w_int_get_value(obj))
         } else {
             crate::longobject::w_long_get_value(obj).clone()
         }
@@ -302,10 +304,11 @@ pub fn range_bigint_to_obj(value: BigInt) -> PyObjectRef {
 /// `obj` must be a valid int/long/bool object.
 pub unsafe fn range_obj_as_i64(obj: PyObjectRef) -> Option<i64> {
     unsafe {
-        if is_int(obj) {
-            Some(crate::intobject::w_int_get_value(obj))
-        } else if is_bool(obj) {
+        // `is_int` is true for a bool (`BOOL_TYPE`), so test `is_bool` first.
+        if is_bool(obj) {
             Some(crate::boolobject::w_bool_get_value(obj) as i64)
+        } else if is_int(obj) {
+            Some(crate::intobject::w_int_get_value(obj))
         } else {
             use num_traits::ToPrimitive;
             crate::longobject::w_long_get_value(obj).to_i64()
@@ -568,7 +571,7 @@ pub fn range_length_big(start: &BigInt, stop: &BigInt, step: &BigInt) -> BigInt 
 // `step` and `len` stay wrapped (set once at construction); only the
 // machine-int `index` advances, so no GC pointer field is ever mutated.
 
-#[pyre_class("longrange_iterator", type_id = 8, static_name = "LONG_RANGE_ITER")]
+#[pyre_class("range_iterator", type_id = 8, static_name = "LONG_RANGE_ITER")]
 pub struct W_LongRangeIterator {
     pub start: PyObjectRef,
     pub step: PyObjectRef,

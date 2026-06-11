@@ -4481,15 +4481,16 @@ fn _hash_frozenset(items: &[i64]) -> i64 {
 /// siphash24 from a workspace dep.
 pub fn hash_value(obj: PyObjectRef) -> i64 {
     unsafe {
-        if is_int(obj) {
-            return _hash_int(w_int_get_value(obj));
-        }
+        // `is_int` is true for a bool (`BOOL_TYPE`), so test `is_bool` first.
         if is_bool(obj) {
             return if pyre_object::w_bool_get_value(obj) {
                 1
             } else {
                 0
             };
+        }
+        if is_int(obj) {
+            return _hash_int(w_int_get_value(obj));
         }
         if is_long(obj) {
             return _hash_long(pyre_object::w_long_get_value(obj));

@@ -1219,13 +1219,13 @@ fn range_index_method(args: &[PyObjectRef]) -> PyResult {
             }
         }
     }
-    Err(PyError::value_error(format!(
-        "{} is not in range",
-        unsafe { crate::display::py_repr(needle) }
-    )))
+    // `space.sequence_index` miss (`descroperation.py` `sequence_index`).
+    Err(PyError::value_error(
+        "sequence.index(x): x not in sequence".to_string(),
+    ))
 }
 
-/// `range.__iter__()` — fresh `rangeiterator` / `longrange_iterator`.
+/// `range.__iter__()` — fresh `range_iterator` (word-fit or bignum cursor).
 fn range_iter_method(args: &[PyObjectRef]) -> PyResult {
     iter(args[0])
 }
@@ -3489,6 +3489,11 @@ pub fn int_w(obj: PyObjectRef) -> Result<i64, PyError> {
         return Err(PyError::type_error(
             "an integer is required (got type float)",
         ));
+    }
+    // `is_int` is true for a bool (`BOOL_TYPE`); a bool reads through
+    // `w_bool_get_value`, not the int accessor, so test `is_bool` first.
+    if unsafe { pyre_object::pyobject::is_bool(obj) } {
+        return Ok(unsafe { pyre_object::boolobject::w_bool_get_value(obj) } as i64);
     }
     // intobject.py:558 `W_IntObject._int_w` — self.intval. Fast path.
     if unsafe { pyre_object::pyobject::is_int(obj) } {
@@ -6136,15 +6141,16 @@ pub fn float_w(obj: PyObjectRef) -> Result<f64, PyError> {
         if pyre_object::is_float(obj) {
             return Ok(pyre_object::w_float_get_value(obj));
         }
-        if pyre_object::pyobject::is_int(obj) {
-            return Ok(pyre_object::intobject::w_int_get_value(obj) as f64);
-        }
+        // `is_int` is true for a bool (`BOOL_TYPE`), so test `is_bool` first.
         if pyre_object::pyobject::is_bool(obj) {
             return Ok(if pyre_object::boolobject::w_bool_get_value(obj) {
                 1.0
             } else {
                 0.0
             });
+        }
+        if pyre_object::pyobject::is_int(obj) {
+            return Ok(pyre_object::intobject::w_int_get_value(obj) as f64);
         }
         if pyre_object::pyobject::is_long(obj) {
             use num_traits::ToPrimitive;

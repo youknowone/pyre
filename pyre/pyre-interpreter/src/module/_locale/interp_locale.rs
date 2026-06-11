@@ -186,25 +186,48 @@ pub fn register_module(ns: &mut DictStorage) {
                 #[cfg(all(unix, feature = "host_env"))]
                 {
                     let lc = rustpython_host_env::locale::localeconv_data();
-                    // `_w_copy_grouping` appends a trailing 0 to a non-empty
-                    // grouping; the host helper already strips the C
-                    // terminator (`interp_locale.py:36-40`).
-                    let grouping_of = |g: &[libc::c_char]| -> Vec<i64> {
-                        let mut v: Vec<i64> = g.iter().map(|&x| x as i64).collect();
+                    // `_w_copy_grouping` (`interp_locale.py:36-40`): every byte
+                    // of the C grouping string up to its NUL is one group size
+                    // (a `CHAR_MAX` element stays `127`), then a trailing `0`
+                    // is appended to a non-empty list. Read the grouping
+                    // straight from `localeconv()` because the host helper
+                    // stops at the first `CHAR_MAX`, dropping it.
+                    let grouping_of = |ptr: *const libc::c_char| -> Vec<i64> {
+                        let mut v: Vec<i64> = Vec::new();
+                        if !ptr.is_null() {
+                            let mut cur = ptr;
+                            unsafe {
+                                while *cur != 0 {
+                                    v.push(*cur as u8 as i64);
+                                    cur = cur.add(1);
+                                }
+                            }
+                        }
                         if !v.is_empty() {
                             v.push(0);
                         }
                         v
                     };
+                    let raw = unsafe { libc::localeconv() };
+                    let (grouping, mon_grouping) = if raw.is_null() {
+                        (Vec::new(), Vec::new())
+                    } else {
+                        unsafe {
+                            (
+                                grouping_of((*raw).grouping),
+                                grouping_of((*raw).mon_grouping),
+                            )
+                        }
+                    };
                     let data = LocaleConvData {
                         decimal_point: lc.decimal_point.clone(),
                         thousands_sep: lc.thousands_sep.clone(),
-                        grouping: grouping_of(&lc.grouping),
+                        grouping,
                         int_curr_symbol: lc.int_curr_symbol.clone(),
                         currency_symbol: lc.currency_symbol.clone(),
                         mon_decimal_point: lc.mon_decimal_point.clone(),
                         mon_thousands_sep: lc.mon_thousands_sep.clone(),
-                        mon_grouping: grouping_of(&lc.mon_grouping),
+                        mon_grouping,
                         positive_sign: lc.positive_sign.clone(),
                         negative_sign: lc.negative_sign.clone(),
                         int_frac_digits: lc.int_frac_digits as i64,
