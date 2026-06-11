@@ -3925,6 +3925,36 @@ impl<'a> Lowering<'a> {
         let discr_var = self.resolve_operand(mir_bb, discr)?;
         match targets {
             SwitchTargets::If(then_bb, else_bb) => {
+                // Constant-bool discriminant: take the known arm
+                // unconditionally.  `flowcontext.py:364-367
+                // FlowContext.guessbool` returns a Constant condition's
+                // value directly instead of forking the recorder, so a
+                // translation-time `const` gate like
+                // `if WITHPREBUILTINT { ... }` leaves no branch in the
+                // upstream graph.  The discriminant here is a fresh var
+                // whose defining op sits in this same block when the
+                // read folded to a constant (`static_addr_op` /
+                // `global_literal_init_op` chain); the untaken target
+                // stays in `block_id` but drops out via the adapter's
+                // reachability prune.
+                let const_cond = self
+                    .graph
+                    .block(bb_id)
+                    .operations
+                    .iter()
+                    .rev()
+                    .find(|op| op.result.as_ref() == Some(&discr_var))
+                    .and_then(|op| match op.kind {
+                        OpKind::ConstBool(b) => Some(b),
+                        _ => None,
+                    });
+                if let Some(cond) = const_cond {
+                    let taken = if cond { then_bb } else { else_bb };
+                    let args = self.edge_args(mir_bb, taken as usize)?;
+                    self.graph
+                        .set_goto(bb_id, self.block_id[taken as usize], args);
+                    return Ok(());
+                }
                 // Route through `set_branch` so the cond gets the
                 // upstream `bool` UnaryOp wrap before becoming the
                 // exitswitch (flowcontext.py:756
