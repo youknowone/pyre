@@ -262,7 +262,7 @@ fn run_source(source: &str, mode: Mode, filename: &str) {
         }
         Err(e) => {
             if e.kind == PyErrorKind::SystemExit {
-                let code: i32 = e.message.parse().unwrap_or(0);
+                let code: i32 = e.message_text().parse().unwrap_or(0);
                 maybe_print_jit_stats();
                 std::process::exit(code);
             }

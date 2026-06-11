@@ -3677,6 +3677,9 @@ mod tests_bh_normalize_raise {
         );
         let err = unsafe { pyre_interpreter::PyError::from_exc_object(result as PyObjectRef) };
         assert_eq!(err.kind, PyErrorKind::TypeError);
-        assert_eq!(err.message, "exceptions must derive from BaseException");
+        assert_eq!(
+            err.message_text(),
+            "exceptions must derive from BaseException"
+        );
     }
 }

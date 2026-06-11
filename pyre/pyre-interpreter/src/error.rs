@@ -733,14 +733,14 @@ impl PyError {
     pub unsafe fn from_exc_object(obj: PyObjectRef) -> Self {
         unsafe {
             let kind = pyre_object::excobject::w_exception_get_kind(obj);
-            // `W_BaseException.descr_str` derives the string from
-            // `args_w`; `exc_object` keeps the exact value for
-            // `str(e)` / `repr(e)`, while this Rust-side string is the
-            // lossy-UTF-8 rendering used by `PyError`'s `Display`.
-            let message = crate::display::py_str(obj);
+            // The display string is derived lazily from `exc_object`
+            // (`message_text`), never here: conversion runs on every
+            // raise propagation, and stringifying the args eagerly would
+            // execute their `__str__` at raise time instead of at
+            // display time.
             PyError {
                 kind: Self::kind_from_exc(kind),
-                message,
+                message: String::new(),
                 exc_object: obj,
                 attach_tb: true,
                 reraise_lasti: -1,
@@ -791,13 +791,26 @@ impl PyError {
         }
     }
 
+    /// The exception text without the class name.  Rust-constructed
+    /// errors carry it in `message`; object-backed errors
+    /// (`from_exc_object`) derive it from `exc_object` on demand —
+    /// `W_BaseException.descr_str` formats `args_w`, so the args'
+    /// `__str__` runs at display time, not at raise time.
+    pub fn message_text(&self) -> String {
+        if !self.message.is_empty() || self.exc_object.is_null() {
+            return self.message.clone();
+        }
+        unsafe { crate::display::py_str(self.exc_object) }
+    }
+
     pub fn render_exception(&self) -> String {
         let name = exc_object_class_name(self.exc_object)
             .unwrap_or_else(|| exc_kind_name(self.to_exc_kind()).to_string());
-        if self.message.is_empty() {
+        let message = self.message_text();
+        if message.is_empty() {
             name
         } else {
-            format!("{name}: {}", self.message)
+            format!("{name}: {message}")
         }
     }
 }

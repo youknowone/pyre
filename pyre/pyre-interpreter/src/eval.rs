@@ -5342,12 +5342,14 @@ except 42:
                     matches!(e.kind, crate::PyErrorKind::TypeError),
                     "expected TypeError, got {:?}: {}",
                     e.kind,
-                    e.message,
+                    e.message_text(),
                 );
+                // The error round-trips through the raised exception
+                // object, so the text lives behind `message_text()`.
                 assert!(
-                    e.message.contains("BaseException"),
+                    e.message_text().contains("BaseException"),
                     "expected CANNOT_CATCH_MSG, got: {}",
-                    e.message,
+                    e.message_text(),
                 );
             }
             Ok(_) => panic!("expected TypeError for `except 42:`"),

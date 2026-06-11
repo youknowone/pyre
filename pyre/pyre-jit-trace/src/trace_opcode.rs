@@ -9830,7 +9830,7 @@ mod tests {
         assert_eq!(result, pending_jit_exception_raw());
         let err = unsafe { pyre_interpreter::PyError::from_exc_object(result as PyObjectRef) };
         assert_eq!(err.kind, pyre_interpreter::PyErrorKind::RuntimeError);
-        assert_eq!(err.message, "raise helper missing current frame");
+        assert_eq!(err.message_text(), "raise helper missing current frame");
         clear_pending_jit_exception();
     }
 
