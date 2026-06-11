@@ -1153,10 +1153,21 @@ fn analyze_pipeline_from_module_paths(
     // dual-gate worker stack overflow).  `PYRE_TRAIT_DEVIRT=1` enables
     // the registration for census experiments while those blockers are
     // drained; the gate is removed once activation is green.
-    let trait_devirt_enabled = std::env::var_os("PYRE_TRAIT_DEVIRT").is_some();
+    // The variable's value narrows the experiment: `1`/`all` activates
+    // every single-impl method; a comma-separated list of trait leaf
+    // names activates only those traits.
+    let trait_devirt_filter: Option<Vec<String>> = std::env::var("PYRE_TRAIT_DEVIRT")
+        .ok()
+        .map(|v| match v.as_str() {
+            "1" | "all" => Vec::new(),
+            _ => v.split(',').map(|s| s.trim().to_string()).collect(),
+        });
     for (trait_leaf, method_name, owner, return_type, hints) in &concrete_trait_methods {
-        if !trait_devirt_enabled {
+        let Some(ref filter) = trait_devirt_filter else {
             break;
+        };
+        if !filter.is_empty() && !filter.iter().any(|t| t == trait_leaf) {
+            continue;
         }
         let key = (trait_leaf.clone(), method_name.clone());
         if concrete_impl_counts.get(&key) != Some(&1) || default_trait_methods.contains(&key) {
