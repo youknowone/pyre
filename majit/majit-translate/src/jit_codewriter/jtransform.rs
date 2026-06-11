@@ -2433,7 +2433,7 @@ impl<'a> Transformer<'a> {
         // pyre keys on the direct_call callee identity since the front-end
         // lowers `driver.jit_merge_point(...)` etc. to `CallTarget::Method`.
         if let Some(key) = jit_marker_key_from_target(target) {
-            if let Some(ops) = self.try_handle_jit_marker(key, args) {
+            if let Some(ops) = self.try_handle_jit_marker(key, args, graph) {
                 return RewriteResult::Replace(ops);
             }
         }
@@ -3231,6 +3231,7 @@ impl<'a> Transformer<'a> {
         &mut self,
         key: JitMarkerKey,
         args: &[crate::flowspace::model::Variable],
+        graph: &crate::model::FunctionGraph,
     ) -> Option<Vec<SpaceOperation>> {
         let jitdriver_index = self.portal_jd_index?;
         // jtransform.py:1661-1662 `if not jitdriver.active: return []` — a
@@ -3267,9 +3268,45 @@ impl<'a> Transformer<'a> {
                 // jtransform.py:1695 `ops = self.promote_greens(...)` —
                 // prepends per-green `-live-` + `{kind}_guard_value` pairs.
                 let greens_raw = &user_args[..num_greens];
+                let reds_raw = &user_args[num_greens..];
+                // jtransform.py:1699-1701 `assert isinstance(v,
+                // Variable), "Constant specified red in
+                // jit_merge_point()"` — a Constant passed as red is
+                // rejected.  front::mir materialises every Const
+                // operand into a fresh Variable (`emit_constant`), so
+                // the Constant-vs-Variable operand distinction is
+                // recovered by provenance: a red whose defining op is
+                // `Const*` (or the `__str_const` synthetic call) is
+                // the image of a source-level Constant red.  Const
+                // defining ops pass through jtransform unrewritten
+                // (`rewrite_operation` keeps them), so the scan is
+                // sound on the in-progress graph.  Loop-carried reds
+                // arrive as block inputargs, never as Const-defined
+                // temporaries, so real reds cannot false-positive.
+                let red_ids: std::collections::HashSet<_> =
+                    reds_raw.iter().map(|v| v.id()).collect();
+                for block in &graph.blocks {
+                    for def in &block.operations {
+                        let Some(result) = &def.result else { continue };
+                        if !red_ids.contains(&result.id()) {
+                            continue;
+                        }
+                        let is_const_def = match &def.kind {
+                            OpKind::ConstInt(_) | OpKind::ConstBool(_) | OpKind::ConstFloat(_) => {
+                                true
+                            }
+                            OpKind::Call {
+                                target: CallTarget::FunctionPath { segments },
+                                ..
+                            } => segments.first().is_some_and(|s| s == "__str_const"),
+                            _ => false,
+                        };
+                        assert!(!is_const_def, "Constant specified red in jit_merge_point()");
+                    }
+                }
                 let mut ops = self.promote_greens(greens_raw);
                 let (greens_i, greens_r, greens_f) = split_args_by_kind(greens_raw);
-                let (reds_i, reds_r, reds_f) = split_args_by_kind(&user_args[num_greens..]);
+                let (reds_i, reds_r, reds_f) = split_args_by_kind(reds_raw);
                 // jtransform.py:1712 final shape is `ops + [op3, op1, op2]`.
                 ops.extend(self.handle_jit_marker__jit_merge_point(
                     greens_i, greens_r, greens_f, reds_i, reds_r, reds_f,
@@ -3309,17 +3346,22 @@ impl<'a> Transformer<'a> {
             .expect("'jit_merge_point' in non-portal graph!");
         // jtransform.py:1698-1703 — for each red kind-list: every operand
         // must be a `Variable` and no `Variable` may repeat.  The
-        // `isinstance(v, Variable)` guard (py:1700) is structurally
-        // satisfied here: `OpKind::Call.args` is `Vec<Variable>` and
-        // `front::mir`'s `emit_constant` materialises every Const operand
-        // to a fresh `Variable` before the marker call, so a Constant red
-        // cannot reach this point.  Only the duplicate-red guard (py:1702
-        // `len(dict.fromkeys(redlist)) == len(list(redlist))`) carries
-        // information — a repeated red would alias two live frame slots
-        // onto one resume location at the merge point.  (The py:1693
-        // `jitdriver is self.portal_jd.jitdriver` mix-up assert is omitted:
-        // pyre derives the driver from `portal_jd_index` and does not yet
-        // carry a per-marker JitDriver identity to compare against.)
+        // `isinstance(v, Variable)` guard (py:1700) is enforced by
+        // provenance in `try_handle_jit_marker` (a Const-defined red is
+        // the front-end image of a Constant operand); here only the
+        // duplicate-red guard (py:1702 `len(dict.fromkeys(redlist)) ==
+        // len(list(redlist))`) remains — a repeated red would alias two
+        // live frame slots onto one resume location at the merge point.
+        // (The py:1693 `jitdriver is self.portal_jd.jitdriver` mix-up
+        // assert is omitted: upstream reads the marker's own driver
+        // instance from `op.args[1]`, but pyre's marker is a
+        // `CallTarget::Method` on a receiver Variable that carries only
+        // the `PyPyJitDriver` *type* — no per-marker driver identity
+        // exists to compare against `portal_jd_index`, which is itself
+        // derived from the enclosing graph (codewriter.rs
+        // `jitdriver_sd_from_portal_graph`).  Portable only once
+        // front::mir threads the driver static's identity onto the
+        // marker call.)
         for redlist in [&reds_i, &reds_r, &reds_f] {
             let mut seen = std::collections::HashSet::with_capacity(redlist.len());
             for v in redlist {
@@ -6171,7 +6213,11 @@ mod tests {
         let config = GraphTransformConfig::default();
         let mut transformer = Transformer::new(&config).with_portal_jd(Some(2));
         let ops = transformer
-            .try_handle_jit_marker(JitMarkerKey::CanEnterJit, &[])
+            .try_handle_jit_marker(
+                JitMarkerKey::CanEnterJit,
+                &[],
+                &crate::model::FunctionGraph::new("fixture"),
+            )
             .expect("can_enter_jit should dispatch when portal_jd is set");
         assert_eq!(ops.len(), 1);
         match &ops[0].kind {
@@ -6201,7 +6247,11 @@ mod tests {
                 .with_callcontrol(&mut cc)
                 .with_portal_jd(Some(0));
             let ops = transformer
-                .try_handle_jit_marker(JitMarkerKey::LoopHeader, &[])
+                .try_handle_jit_marker(
+                    JitMarkerKey::LoopHeader,
+                    &[],
+                    &crate::model::FunctionGraph::new("fixture"),
+                )
                 .expect("inactive driver still dispatches (then drops)");
             assert!(
                 ops.is_empty(),
@@ -6214,7 +6264,11 @@ mod tests {
             .with_callcontrol(&mut cc)
             .with_portal_jd(Some(0));
         let ops = transformer
-            .try_handle_jit_marker(JitMarkerKey::LoopHeader, &[])
+            .try_handle_jit_marker(
+                JitMarkerKey::LoopHeader,
+                &[],
+                &crate::model::FunctionGraph::new("fixture"),
+            )
             .expect("active driver dispatches");
         assert_eq!(ops.len(), 1);
         assert!(
@@ -6268,7 +6322,11 @@ mod tests {
         // No portal_jd set → dispatch is a no-op (caller falls through).
         assert!(
             transformer
-                .try_handle_jit_marker(JitMarkerKey::LoopHeader, &[])
+                .try_handle_jit_marker(
+                    JitMarkerKey::LoopHeader,
+                    &[],
+                    &crate::model::FunctionGraph::new("fixture")
+                )
                 .is_none()
         );
     }
@@ -6376,7 +6434,7 @@ mod tests {
         FunctionGraph::set_concretetype_of_inline(&r1_var, ConcreteType::Signed);
         let args_vars = vec![receiver_var, g1_var.clone(), g2_var.clone(), r1_var.clone()];
         let ops = transformer
-            .try_handle_jit_marker(JitMarkerKey::JitMergePoint, &args_vars)
+            .try_handle_jit_marker(JitMarkerKey::JitMergePoint, &args_vars, &graph)
             .expect("portal_jd + cc + 2-greens + 1-red satisfies dispatch preconditions");
 
         assert_eq!(ops.len(), 7, "promote_greens(2 greens)*2 + merge*3 = 7");
@@ -6429,6 +6487,49 @@ mod tests {
             ops[5].result.is_none(),
             "jit_merge_point produces no result"
         );
+    }
+
+    /// jtransform.py:1699-1701 — `assert isinstance(v, Variable),
+    /// "Constant specified red in jit_merge_point()"`.  front::mir
+    /// materialises a Constant red into a Const-defined Variable, so
+    /// the provenance scan must reject a red whose defining op is
+    /// `ConstInt`.
+    #[test]
+    #[should_panic(expected = "Constant specified red in jit_merge_point()")]
+    fn try_handle_jit_marker_rejects_constant_red() {
+        use crate::jit_codewriter::call::CallControl;
+        use crate::jit_codewriter::type_state::ConcreteType;
+        use crate::parse::CallPath;
+
+        let mut cc = CallControl::new();
+        cc.setup_jitdriver(
+            CallPath::from_segments(["test", "portal"]),
+            vec!["green1".into()],
+            vec!["red1".into()],
+            Vec::new(),
+            Vec::new(),
+        );
+
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config)
+            .with_callcontrol(&mut cc)
+            .with_portal_jd(Some(0));
+
+        let mut graph = crate::model::FunctionGraph::new("constant_red_fixture");
+        graph.set_next_value(100);
+        let receiver_var = graph.must_variable_at(99);
+        let g1_var = graph.must_variable_at(10);
+        let red_var = graph.must_variable_at(11);
+        FunctionGraph::set_concretetype_of_inline(&g1_var, ConcreteType::Signed);
+        FunctionGraph::set_concretetype_of_inline(&red_var, ConcreteType::Signed);
+        // The red is the image of a source-level Constant: its
+        // defining op in the graph is `ConstInt`.
+        graph.blocks[0].operations.push(SpaceOperation {
+            result: Some(red_var.clone()),
+            kind: OpKind::ConstInt(7),
+        });
+        let args_vars = vec![receiver_var, g1_var, red_var];
+        let _ = transformer.try_handle_jit_marker(JitMarkerKey::JitMergePoint, &args_vars, &graph);
     }
 
     /// Synthetic Rust-wrapper elision must accept a single-arg `Ok(_)`
