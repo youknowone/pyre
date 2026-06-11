@@ -2116,6 +2116,7 @@ impl ExportedState {
             visitor: &mut dyn FnMut(&mut GcRef),
         ) {
             visit_op(&produced.preamble_op, visitor);
+            produced.res.walk_const_ptr_refs(visitor);
             if let Some(source) = produced.same_as_source.as_ref() {
                 source.walk_const_ptr_refs(visitor);
             }
@@ -5624,6 +5625,7 @@ mod tests {
             old_ref,
             ProducedShortOp {
                 kind: PreambleOpKind::Pure,
+                res: BoxRef::from_opref(old_ref),
                 preamble_op: std::rc::Rc::new(Op::new(
                     OpCode::SameAsR,
                     &[BoxRef::from_opref(old_ref)],

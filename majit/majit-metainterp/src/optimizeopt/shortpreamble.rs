@@ -432,6 +432,9 @@ impl PreambleOp {
         };
         Some(ProducedShortOp {
             kind: self.kind.clone(),
+            // shortpreamble.py:120/85/170 `ProducedShortOp(self, ...)` —
+            // short_op.res is the original result box; resolve canonical.
+            res: ctx.materialize_box_at(self.op.pos.get()),
             preamble_op: std::rc::Rc::new(preamble_op),
             invented_name: self.invented_name,
             same_as_source: self.same_as_source.clone(),
@@ -515,6 +518,10 @@ impl PotentialShortOp {
                         });
                         let alias = ctx.alloc_op_position_typed(tp);
                         alt.preamble_op.pos.set(alias);
+                        // shortpreamble.py:329 `lst[i].short_op.res =
+                        // new_name` — the alias entry's res becomes the
+                        // freshly invented name.
+                        alt.res = ctx.materialize_box_at(alias);
                         alt.invented_name = true;
                         // shortpreamble.py:328 `ResOperation(opnum, [shortop.res])`
                         // — the alias source is the Box itself; resolve to
@@ -812,6 +819,7 @@ impl ShortBoxes {
             new_op.pos.set(getfield_op.pos.get());
             // shortpreamble.py:279: ProducedShortOp(short_op, preamble_op)
             short_boxes.push(ProducedShortOp {
+                res: ctx.materialize_box_at(getfield_op.pos.get()),
                 preamble_op: std::rc::Rc::new(new_op),
                 kind: PreambleOpKind::Heap,
                 invented_name: false,
@@ -1081,49 +1089,20 @@ impl CompoundOp {
     }
 }
 
-/// shortpreamble.py: ShortInputArg — a short op that represents
-/// a label input argument (no actual operation needed, just maps
-/// a preamble value to a label arg position).
-#[derive(Clone, Debug)]
-pub struct ShortInputArg {
-    /// The result OpRef.
-    pub res: OpRef,
-    /// The preamble operation that produces this value.
-    pub preamble_op: majit_ir::OpRc,
-}
-
-impl ShortInputArg {
-    /// shortpreamble.py: ShortInputArg.add_op_to_short(sb)
-    ///
-    /// Returns a ProducedShortOp wrapping the preamble_op.
-    /// For input args, the preamble_op is just forwarded.
-    pub fn add_op_to_short(&self) -> ProducedShortOp {
-        ProducedShortOp {
-            kind: PreambleOpKind::InputArg,
-            // Deep-clone: the compound-alias path retags the produced
-            // entry's pos (alt.preamble_op.pos.set) and must not reach
-            // back into this ShortInputArg's stored op.
-            preamble_op: std::rc::Rc::new((*self.preamble_op).clone()),
-            invented_name: false,
-            same_as_source: None,
-        }
-    }
-
-    /// shortpreamble.py: ShortInputArg.produce_op(opt, ...)
-    ///
-    /// For input args, produce_op is a no-op — the value is
-    /// already available as a label argument.
-    pub fn produce_op(&self) {
-        // No-op: the value is directly available from label args
-    }
-}
-
 /// shortpreamble.py: ProducedShortOp — wraps a short op with its
 /// preamble counterpart for emission during bridge compilation.
+///
+/// The upstream `ShortInputArg` role (shortpreamble.py:223-240) is
+/// played by `PreambleOp { kind: InputArg }` entries; the separate
+/// caller-less struct mirror was removed.
 #[derive(Clone, Debug)]
 pub struct ProducedShortOp {
     /// The short op classification.
     pub kind: PreambleOpKind,
+    /// `short_op.res` (shortpreamble.py:58/110/151/224) — the result box
+    /// this short op produces. `add_preamble_op` reads it back as the
+    /// `PreambleOp.op` box (upstream `produce_op` passes `self.res`).
+    pub res: crate::r#box::BoxRef,
     /// The preamble operation to replay.
     pub preamble_op: majit_ir::OpRc,
     /// Whether this short op uses an invented SameAs result.
@@ -2128,8 +2107,10 @@ impl ShortPreambleBuilder {
         let Some(produced) = self.produced_short_boxes.get(&result).cloned() else {
             return false;
         };
-        self.state
-            .record_preamble_use(BoxRef::from_opref(result), &produced);
+        // shortpreamble.py:435 `op = preamble_op.op.get_box_replacement()`
+        // — the stored res box, not a fresh equal-positioned mint.
+        let res = produced.res.clone();
+        self.state.record_preamble_use(res, &produced);
         true
     }
 
@@ -2596,7 +2577,10 @@ impl ExtendedShortPreambleBuilder {
         let Some(produced) = self.produced_short_boxes.get(&result).cloned() else {
             return false;
         };
-        self.add_tracked_preamble_op(BoxRef::from_opref(result), &produced);
+        // shortpreamble.py:466 `op = preamble_op.op.get_box_replacement()`
+        // — the stored res box, not a fresh equal-positioned mint.
+        let res = produced.res.clone();
+        self.add_tracked_preamble_op(res, &produced);
         true
     }
 
@@ -2945,6 +2929,11 @@ pub fn produced_short_boxes_from_exported_boxes(
                 preamble_op.pos.get(),
                 ProducedShortOp {
                     kind: entry.kind.clone(),
+                    // Position-only mint at the export boundary: the
+                    // exported `PreambleOp` entries do not carry the
+                    // Phase-1 res box (re-homes with
+                    // `ExportedState.exported_short_boxes`).
+                    res: BoxRef::from_opref(preamble_op.pos.get()),
                     preamble_op: std::rc::Rc::new(preamble_op),
                     invented_name: entry.invented_name,
                     same_as_source: entry.same_as_source.clone(),
@@ -3384,6 +3373,7 @@ mod tests {
                 OpRef::int_op(7),
                 ProducedShortOp {
                     kind: PreambleOpKind::Pure,
+                    res: BoxRef::from_opref(OpRef::int_op(7)),
                     preamble_op: {
                         let mut op = Op::new(
                             OpCode::IntAdd,
@@ -3403,6 +3393,7 @@ mod tests {
                 OpRef::int_op(8),
                 ProducedShortOp {
                     kind: PreambleOpKind::Pure,
+                    res: BoxRef::from_opref(OpRef::int_op(8)),
                     preamble_op: {
                         let mut op = Op::new(
                             OpCode::IntMul,

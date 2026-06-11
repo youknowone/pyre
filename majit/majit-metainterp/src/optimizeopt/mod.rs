@@ -2716,10 +2716,15 @@ impl OptContext {
             exported_short_boxes
                 .iter()
                 .map(|entry| {
+                    // `materialize_box_at`, not `from_bound_op`: a
+                    // const-folded entry carries an inline-Const pos,
+                    // which resolves to its Const box.
+                    let res = self.materialize_box_at(entry.op.pos.get());
                     (
                         entry.op.pos.get(),
                         crate::optimizeopt::shortpreamble::ProducedShortOp {
                             kind: entry.kind.clone(),
+                            res,
                             preamble_op: std::rc::Rc::new(entry.op.clone()),
                             invented_name: entry.invented_name,
                             same_as_source: entry.same_as_source.clone(),
@@ -2939,8 +2944,10 @@ impl OptContext {
                     if let Some(d) = produced_op.preamble_op.getdescr() {
                         op.setdescr(d);
                     }
+                    let res = self.materialize_box_at(op.pos.get());
                     let new_pop = ProducedShortOp {
                         kind: PreambleOpKind::Pure,
+                        res,
                         preamble_op: std::rc::Rc::new(op),
                         invented_name: produced_op.invented_name,
                         same_as_source: produced_op.same_as_source.clone(),
@@ -2977,8 +2984,10 @@ impl OptContext {
                             let mut op = Op::new(opcode, &[self.materialize_box_at(obj)]);
                             op.pos.set(replay_pos(*source, produced_op));
                             op.setdescr(descr);
+                            let res = self.materialize_box_at(op.pos.get());
                             ProducedShortOp {
                                 kind: PreambleOpKind::Heap,
+                                res,
                                 preamble_op: std::rc::Rc::new(op),
                                 invented_name: produced_op.invented_name,
                                 same_as_source: produced_op.same_as_source.clone(),
@@ -3015,8 +3024,10 @@ impl OptContext {
                             let mut op = Op::new(opcode, &[obj_b, index_b]);
                             op.pos.set(replay_pos(*source, produced_op));
                             op.setdescr(descr);
+                            let res = self.materialize_box_at(op.pos.get());
                             ProducedShortOp {
                                 kind: PreambleOpKind::Heap,
+                                res,
                                 preamble_op: std::rc::Rc::new(op),
                                 invented_name: produced_op.invented_name,
                                 same_as_source: produced_op.same_as_source.clone(),
@@ -3052,8 +3063,10 @@ impl OptContext {
                         &[self.materialize_box_at(func_opref)],
                     );
                     op.pos.set(replay_pos(*source, produced_op));
+                    let res = self.materialize_box_at(op.pos.get());
                     let new_pop = ProducedShortOp {
                         kind: PreambleOpKind::LoopInvariant,
+                        res,
                         preamble_op: std::rc::Rc::new(op),
                         invented_name: produced_op.invented_name,
                         same_as_source: produced_op.same_as_source.clone(),
