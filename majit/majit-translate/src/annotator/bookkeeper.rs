@@ -2344,10 +2344,19 @@ impl Bookkeeper {
                 s.base.const_box = Some(Constant::new(x.clone()));
                 Ok(SomeValue::Integer(s))
             }
+            ConstValue::LLAddress(_) => {
+                // `isinstance(x, llmemory.fakeaddress)` arm of
+                // `bookkeeper.py immutablevalue` — a prebuilt address
+                // constant annotates as `SomeAddress()`; the const_box
+                // keeps the concrete address so `is_null_address` and
+                // constant folding can read it back.
+                let mut s = super::model::SomeAddress::new();
+                s.base.const_box = Some(Constant::new(x.clone()));
+                Ok(SomeValue::Address(s))
+            }
             ConstValue::Code(_)
             | ConstValue::Graphs(_)
             | ConstValue::LowLevelType(_)
-            | ConstValue::LLAddress(_)
             | ConstValue::SpecTag(_)
             | ConstValue::Atom(_)
             | ConstValue::Placeholder => {
