@@ -180,8 +180,8 @@ pub(crate) fn jit_threadlocalref_base() -> *const i64 {
 
 use std::sync::OnceLock;
 
-/// Blackhole resume: (descr_addr, raw_values, len, typed_outputs, typed_len)
-/// → Option<result>.
+/// Blackhole resume: (descr_addr, raw_values, len, typed_outputs,
+/// typed_len, guard_exc) → Option<result>.
 ///
 /// The receiving handler recovers the failed descr from `descr_addr`
 /// via `Backend::fail_descr_arc_from_addr` (`history.py:125`
@@ -191,7 +191,15 @@ use std::sync::OnceLock;
 /// `compile.py:710-716 resume_in_blackhole(descr, deadframe)` where
 /// the descr is the sole identity carrier.  No surrogate triple
 /// crosses the C-ABI.
-pub type BlackholeFn = fn(usize, *const i64, usize, *const i64, usize) -> Option<i64>;
+///
+/// `guard_exc` is `cpu.grab_exc_value(deadframe)` (`llmodel.py:240`):
+/// the pending exception the `must_save_exception` failure-recovery
+/// stub staged into `jf_guard_exc`, grabbed (read + clear) off the
+/// jitframe before it is freed.  `blackhole.py:1794
+/// _prepare_resume_from_failure` hands it to the resumed frame so an
+/// exception guard unwinds into its handler instead of resuming the
+/// no-exception continuation.  `0` = no pending exception.
+pub type BlackholeFn = fn(usize, *const i64, usize, *const i64, usize, i64) -> Option<i64>;
 
 /// Bridge compilation: (raw_values, len, descr_addr) → compiled?
 ///
@@ -647,6 +655,18 @@ fn handle_fail_resume_guard(
     // `debug_assert_eq!(source_jct.green_key, green_key)` (pyjitpl/mod.rs:8297-8301).
     let owning_jct = majit_backend::descr_owning_jct(descr);
 
+    // llmodel.py:240 `grab_exc_value(deadframe)`: read + clear
+    // `jf_guard_exc` while the jitframe is still alive.  The
+    // `must_save_exception` failure-recovery stub (GUARD_EXCEPTION /
+    // GUARD_NO_EXCEPTION / GUARD_NOT_FORCED) staged `pos_exc_value`
+    // here; non-exception guards leave it null.
+    let guard_exc = unsafe {
+        let slot = &mut (*frame_ptr).jf_guard_exc;
+        let v = *slot as i64;
+        *slot = 0;
+        v
+    };
+
     // compile.py:704-709 `_trace_and_compile_from_bridge`.
     // The hook compiles+attaches; it does NOT re-enter the bridge.
     // Skipped on giveup (None).
@@ -665,6 +685,7 @@ fn handle_fail_resume_guard(
             raw_values.len(),
             raw_values.as_ptr(),
             raw_values.len(),
+            guard_exc,
         ) {
             if majit_log_enabled() {
                 eprintln!(

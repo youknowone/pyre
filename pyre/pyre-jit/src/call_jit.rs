@@ -1162,6 +1162,7 @@ fn jit_blackhole_resume_from_guard(
     num_fail_values: usize,
     raw_deadframe_ptr: *const i64,
     num_raw_deadframe: usize,
+    guard_exc: i64,
 ) -> Option<i64> {
     // rstack.stack_check_slowpath → _StackOverflow parity: drain the
     // pending JIT-prologue overflow exception when the backend probe
@@ -1274,14 +1275,14 @@ fn jit_blackhole_resume_from_guard(
         // resume.py:924 _prepare_pendingfields(storage.rd_pendingfields):
         // deferred field writes must be replayed before consume_vref_and_vable.
         // blackhole.py:1794 `current_exc = _prepare_resume_from_failure(
-        // guard_opnum, deadframe)`. The CALL_ASSEMBLER resume reaches here
-        // through the C-ABI with raw fail-value pointers, not a `DeadFrame`,
-        // so `cpu.grab_exc_value(deadframe)` (which reads the JITFRAME
-        // `jf_guard_exc` field set by `emit_guard_exit`) is not yet wired in
-        // on this path. Pass 0 (no pending exception) — unchanged from the
-        // prior behavior — until the JITFRAME exc field is threaded through
-        // the CALL_ASSEMBLER guard-exit ABI.
-        let guard_exc = 0;
+        // guard_opnum, deadframe)`. The backend trampoline grabbed
+        // `jf_guard_exc` off the jitframe (`cpu.grab_exc_value`,
+        // llmodel.py:240) and threaded it through the C-ABI `guard_exc`
+        // parameter, so a GUARD_NO_EXCEPTION / GUARD_EXCEPTION /
+        // GUARD_NOT_FORCED failure inside a CALL_ASSEMBLER-entered
+        // callee delivers its pending exception to the blackhole resume
+        // instead of resuming the no-exception continuation with a NULL
+        // result.
         let result = blackhole_resume_via_rd_numb(
             &storage.rd_numb,
             storage.rd_consts(),

@@ -1615,19 +1615,25 @@ static CALL_ASSEMBLER_FORCE_FN: OnceLock<extern "C" fn(i64) -> i64> = OnceLock::
 /// `compile.py:710-716 resume_in_blackhole(descr, deadframe)` parity:
 /// callback to resume execution from the guard failure point using the
 /// blackhole interpreter.  Args: `(descr_addr, rebuilt_values_ptr,
-/// num_rebuilt, raw_deadframe_ptr, num_raw)` → `Option<result>`.  The
-/// receiver recovers the failed descr from `descr_addr` via
-/// `Backend::fail_descr_arc_from_addr` (`history.py:125`
-/// `cpu.get_latest_descr` parity) and derives green_key / trace_id /
-/// fail_index from the descr identity (`descr_owning_jct`).  No
-/// surrogate triple crosses the C-ABI.
+/// num_rebuilt, raw_deadframe_ptr, num_raw, guard_exc)` →
+/// `Option<result>`.  The receiver recovers the failed descr from
+/// `descr_addr` via `Backend::fail_descr_arc_from_addr`
+/// (`history.py:125` `cpu.get_latest_descr` parity) and derives
+/// green_key / trace_id / fail_index from the descr identity
+/// (`descr_owning_jct`).  No surrogate triple crosses the C-ABI.
+///
+/// `guard_exc` is `cpu.grab_exc_value(deadframe)` (`llmodel.py:240`):
+/// the pending exception the `must_save_exception` failure-recovery
+/// stub staged into `jf_guard_exc`, handed to the blackhole resume per
+/// `blackhole.py:1794 _prepare_resume_from_failure`.  `0` = no pending
+/// exception.
 static CALL_ASSEMBLER_BLACKHOLE_FN: OnceLock<
-    fn(usize, *const i64, usize, *const i64, usize) -> Option<i64>,
+    fn(usize, *const i64, usize, *const i64, usize, i64) -> Option<i64>,
 > = OnceLock::new();
 
 /// Register a blackhole callback for call_assembler guard failure resume.
 pub fn register_call_assembler_blackhole(
-    f: fn(usize, *const i64, usize, *const i64, usize) -> Option<i64>,
+    f: fn(usize, *const i64, usize, *const i64, usize, i64) -> Option<i64>,
 ) {
     let _ = CALL_ASSEMBLER_BLACKHOLE_FN.set(f);
 }
@@ -2630,6 +2636,12 @@ fn call_assembler_finish_or_blackhole_deadframe(mut frame: DeadFrame) -> Option<
     }
 
     let raw_values = raw_values_from_deadframe_typed(&frame, &fail_arg_types).ok()?;
+    // llmodel.py:240 grab_exc_value: the must_save_exception recovery
+    // stub staged the pending exception into jf_guard_exc.
+    let guard_exc = frame
+        .data
+        .downcast_ref::<JitFrameDeadFrame>()
+        .map_or(0, |jf| jf.grab_exc_value().0 as i64);
     let blackhole = CALL_ASSEMBLER_BLACKHOLE_FN.get()?;
     let cell = majit_ir::FailDescrCell::wrap(fail_descr_arc);
     let descr_addr = Arc::as_ptr(&cell) as *const () as usize;
@@ -2639,6 +2651,7 @@ fn call_assembler_finish_or_blackhole_deadframe(mut frame: DeadFrame) -> Option<
         raw_values.len(),
         raw_values.as_ptr(),
         raw_values.len(),
+        guard_exc,
     );
     drop(cell);
     result
@@ -3163,6 +3176,10 @@ fn call_assembler_guard_failure_inner(
             raw_num,
             outputs_ptr,
             raw_num,
+            // This leg exits through the CLIF outputs array, not a
+            // jitframe deadframe, so there is no `jf_guard_exc` slot to
+            // grab (`llmodel.py:240`) — no pending exception crosses.
+            0,
         ) {
             // warmspot.py:988-996: DoneWithThisFrame{Int,Ref,Float} returns
             // e.result as-is. warmspot.py:982: ContinueRunningNormally
@@ -3328,6 +3345,10 @@ fn call_assembler_fast_path_heap(
             num_outputs,
             raw_outputs.as_ptr(),
             raw_num,
+            // This leg exits through the CLIF outputs array, not a
+            // jitframe deadframe, so there is no `jf_guard_exc` slot to
+            // grab (`llmodel.py:240`) — no pending exception crosses.
+            0,
         );
         drop(bh_cell);
         if let Some(result) = bh_result {
@@ -3486,12 +3507,19 @@ fn call_assembler_shim_inner(
                 target.fail_descrs.len()
             );
         };
+        // llmodel.py:240 grab_exc_value: the must_save_exception
+        // recovery stub staged the pending exception into jf_guard_exc.
+        let guard_exc = frame
+            .data
+            .downcast_ref::<JitFrameDeadFrame>()
+            .map_or(0, |jf| jf.grab_exc_value().0 as i64);
         if let Some(result) = bh_fn(
             descr_addr,
             bh_outputs.as_ptr(),
             num_outputs,
             raw_outputs.as_ptr(),
             raw_num,
+            guard_exc,
         ) {
             unsafe {
                 *outcome.add(0) = CALL_ASSEMBLER_OUTCOME_FINISH;
