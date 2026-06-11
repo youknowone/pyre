@@ -11,6 +11,23 @@ use pyre_interpreter::CodeObject;
 use crate::metainterp::{MetaInterpFrame, PyreMetaInterp};
 use crate::state::{PyreMeta, PyreSym};
 
+thread_local! {
+    /// pyjitpl.py:3048-3091 `raise_continue_running_normally` seam: set
+    /// when the authoritative full-body walk committed its end-of-walk
+    /// frame state into the trace's concrete frame snapshot
+    /// (`flush_walk_end_state_to_frame`).  The portal call sites consume
+    /// it via [`take_walk_end_flush_committed`] to decide whether the
+    /// returned `FrameBox` carries adoptable end state for the LIVE
+    /// frame (no-replay) or still holds the entry state (legacy replay).
+    static WALK_END_FLUSH_COMMITTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Take-and-reset the walk-end flush flag for the trace that just
+/// returned from [`trace_bytecode`].
+pub fn take_walk_end_flush_committed() -> bool {
+    WALK_END_FLUSH_COMMITTED.with(|c| c.replace(false))
+}
+
 /// Trace an entire loop body starting at `start_pc`.
 ///
 /// RPython MetaInterp._interpret() parity: creates a PyreMetaInterp
@@ -29,6 +46,10 @@ pub fn trace_bytecode(
     // `bh_strgetitem` family routes through `W_StrObject`-shaped
     // `str_descr` / `unicode_descr` (`pyre_cpu` module).
     meta.set_cpu(crate::pyre_cpu::shared());
+
+    // A stale flag from a prior trace on this thread must not leak into
+    // this trace's adoption decision.
+    WALK_END_FLUSH_COMMITTED.with(|c| c.set(false));
 
     let ctx = meta
         .trace_ctx()
@@ -587,6 +608,47 @@ fn run_perfn_walk(
             mi.orgpc = loop_header_pc;
             *jump_args = mi.close_loop_args_at(ctx, Some(loop_header_pc));
         }
+        // pyjitpl.py:3048-3091 raise_continue_running_normally parity: a
+        // walk that ends at a merge point hands the interpreter (and the
+        // compiled loop's heap-reloading preamble) the END-of-walk frame
+        // state, so the walked iteration — whose residual calls executed
+        // concretely — is not re-run.  After `close_loop_args_at` (whose
+        // jump-arg derivation reads the pre-walk frame) is the one safe
+        // commit point.  All-or-nothing inside the helper; a `false`
+        // return keeps the legacy replay.
+        //
+        // `PYRE_FBW_END_FLUSH=1` dev gate (default OFF): adoption is only
+        // sound once every walked side effect is concretely applied at
+        // walk end; the walker's StoreSubscr interception still records
+        // list/dict stores without executing them
+        // (`try_walker_direct_opcode_dispatch` "trace-only, no concrete
+        // mutation"), so adopting today loses those writes (fannkuch
+        // flips diverge).  The store-journal slice flips this on.
+        if std::env::var_os("PYRE_FBW_END_FLUSH").as_deref() == Some(std::ffi::OsStr::new("1")) {
+            if let Ok((outcome, _end_pc)) = &walk_result {
+                let header_pc = match outcome {
+                    crate::jitcode_dispatch::DispatchOutcome::CloseLoop {
+                        loop_header_pc, ..
+                    } => Some(*loop_header_pc),
+                    crate::jitcode_dispatch::DispatchOutcome::CompileTracePending {
+                        loop_header_pc,
+                    } => Some(*loop_header_pc),
+                    _ => None,
+                };
+                if let Some(header_pc) = header_pc {
+                    let flushed =
+                        crate::state::flush_walk_end_state_to_frame(ctx, cf_addr, header_pc);
+                    if flushed {
+                        WALK_END_FLUSH_COMMITTED.with(|c| c.set(true));
+                    } else if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+                        eprintln!(
+                            "[fbw-end-flush] declined at header_pc={header_pc} (shadow slot \
+                             without concrete / depth / lastblock) — legacy replay kept"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     Some((entry, code_len, walk_result))
@@ -745,7 +807,7 @@ fn full_body_walk_trace(
                     }
                 }
             }
-            crate::jitcode_dispatch::DispatchOutcome::CompileTracePending => {
+            crate::jitcode_dispatch::DispatchOutcome::CompileTracePending { .. } => {
                 // pyjitpl.py:3095 raise_if_successful parity: the walker's
                 // in-walk `compile_trace` already compiled+installed the
                 // trace as a (entry) bridge jumping into an existing loop;

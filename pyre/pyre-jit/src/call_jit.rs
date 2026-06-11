@@ -1978,6 +1978,7 @@ pub fn trace_and_compile_from_bridge(
     // value-stack underflow / off-by-one-iteration result otherwise).
     let resume_state = frame.snapshot_for_tracing();
     let trace_frame = frame.snapshot_for_tracing();
+    let mut adopted_walk_end_state = false;
     let outcome = {
         let (driver, _) = crate::eval::driver_pair();
         driver.jit_merge_point_keyed(
@@ -1987,12 +1988,26 @@ pub fn trace_and_compile_from_bridge(
             &env,
             || {},
             |meta, sym| {
-                let (action, _executed) = trace_bytecode(meta, sym, code, resume_pc, trace_frame);
+                let (action, executed) = trace_bytecode(meta, sym, code, resume_pc, trace_frame);
+                // pyjitpl.py:3048-3091 raise_continue_running_normally:
+                // a bridge walk that closed at a merge point and committed
+                // its end-of-walk state into the trace snapshot
+                // (`flush_walk_end_state_to_frame`) hands the LIVE frame
+                // that end state — the walked region's residual calls
+                // executed concretely, so resuming at the guard would
+                // re-apply every side effect.  Uncommitted → fall through
+                // to the guard-state restore below (legacy replay).
+                if pyre_jit_trace::trace::take_walk_end_flush_committed() {
+                    frame.restore_resume_state_from(&executed);
+                    adopted_walk_end_state = true;
+                }
                 action
             },
         )
     };
-    frame.restore_resume_state_from(&resume_state);
+    if !adopted_walk_end_state {
+        frame.restore_resume_state_from(&resume_state);
+    }
 
     // merge_point handles Finish/CloseLoop via bridge_info.
     if outcome.is_some() {

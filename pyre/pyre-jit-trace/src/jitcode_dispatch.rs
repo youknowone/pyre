@@ -657,7 +657,13 @@ pub enum DispatchOutcome {
     /// action the trait leg produces via
     /// `driver.compile_trace_success_pending()`
     /// (`trace_opcode.rs trace_step_result_to_action`).
-    CompileTracePending,
+    ///
+    /// `loop_header_pc` is the merge point's python pc (the
+    /// `jit_merge_point` `next_instr`), carried so the walk driver can
+    /// flush the walk-end frame state and resume the interpreter AT the
+    /// header instead of replaying the walked region
+    /// (`flush_walk_end_state_to_frame`).
+    CompileTracePending { loop_header_pc: usize },
 }
 
 /// Errors surfaced by the trace-side walker.
@@ -1074,7 +1080,7 @@ pub fn walk(
             | DispatchOutcome::SubReturn { .. }
             | DispatchOutcome::SwitchToBlackhole { .. }
             | DispatchOutcome::CloseLoop { .. }
-            | DispatchOutcome::CompileTracePending => {
+            | DispatchOutcome::CompileTracePending { .. } => {
                 return Ok((outcome, pc));
             }
             DispatchOutcome::SubRaise { exc, exc_concrete } => {
@@ -9429,7 +9435,7 @@ fn dispatch_inline_call_dr_kind(
             // `SubWalkClosedLoop`.
             Err(DispatchError::SubWalkClosedLoop { pc: op.pc })
         }
-        DispatchOutcome::CompileTracePending => {
+        DispatchOutcome::CompileTracePending { .. } => {
             // The compile_trace attempt is gated on `is_top_level`
             // (sub-walks run with `is_top_level == false`), so a callee
             // body can never surface it; fail loud like the CloseLoop
@@ -9611,7 +9617,7 @@ fn dispatch_inline_call_dir_kind(
             // `SubWalkClosedLoop`.
             Err(DispatchError::SubWalkClosedLoop { pc: op.pc })
         }
-        DispatchOutcome::CompileTracePending => {
+        DispatchOutcome::CompileTracePending { .. } => {
             // The compile_trace attempt is gated on `is_top_level`
             // (sub-walks run with `is_top_level == false`), so a callee
             // body can never surface it; fail loud like the CloseLoop
@@ -9815,7 +9821,7 @@ fn dispatch_inline_call_dirf_kind(
             // `SubWalkClosedLoop`.
             Err(DispatchError::SubWalkClosedLoop { pc: op.pc })
         }
-        DispatchOutcome::CompileTracePending => {
+        DispatchOutcome::CompileTracePending { .. } => {
             // The compile_trace attempt is gated on `is_top_level`
             // (sub-walks run with `is_top_level == false`), so a callee
             // body can never surface it; fail loud like the CloseLoop
@@ -11082,7 +11088,12 @@ fn handle(
                         // `TraceAction::CompileTrace` (no further compile
                         // or abort on this session).
                         driver.note_compile_trace_success();
-                        return Ok((DispatchOutcome::CompileTracePending, op.next_pc));
+                        return Ok((
+                            DispatchOutcome::CompileTracePending {
+                                loop_header_pc: next_instr,
+                            },
+                            op.next_pc,
+                        ));
                     }
                 }
             }

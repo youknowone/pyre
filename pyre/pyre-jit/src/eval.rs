@@ -3456,7 +3456,18 @@ fn jit_merge_point_hook(
             crate::jit::codewriter::register_portal_jitdriver(code, frame.pycode, Some(pc));
             let snapshot = frame.snapshot_for_tracing();
             let _ = concrete_frame;
-            let (action, _executed_frame) = trace_bytecode(meta, sym, code, pc, snapshot);
+            let (action, executed_frame) = trace_bytecode(meta, sym, code, pc, snapshot);
+            // pyjitpl.py:3048-3091 raise_continue_running_normally: tracing
+            // IS execution — a walk that committed its end-of-walk state
+            // into the snapshot (CloseLoop / CompileTracePending flush)
+            // hands that state to the LIVE frame, so the
+            // ContinueRunningNormally re-entry continues from the walked
+            // iteration's end instead of replaying it (re-applying every
+            // concretely executed side effect).  An uncommitted flush
+            // leaves the snapshot at entry state — adopting it is a no-op.
+            if pyre_jit_trace::trace::take_walk_end_flush_committed() {
+                frame.restore_resume_state_from(&executed_frame);
+            }
             action
         },
     ) {
@@ -4127,8 +4138,13 @@ fn bound_reached(
                         Some(loop_header_pc),
                     );
                     let concrete_frame = frame.snapshot_for_tracing();
-                    let (action, _) =
+                    let (action, executed_frame) =
                         trace_bytecode(meta, sym, code, loop_header_pc, concrete_frame);
+                    // raise_continue_running_normally seam — see the
+                    // jit_merge_point_hook tracing site for the contract.
+                    if pyre_jit_trace::trace::take_walk_end_flush_committed() {
+                        frame.restore_resume_state_from(&executed_frame);
+                    }
                     action
                 },
             );

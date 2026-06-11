@@ -2956,6 +2956,134 @@ pub(crate) fn concrete_virtualizable_slot_type(_value: PyObjectRef) -> Type {
     Type::Ref
 }
 
+/// pyjitpl.py:3048-3091 `raise_continue_running_normally` parity for the
+/// authoritative full-body walk.  The walk concretely executed the traced
+/// region's residual calls, so a walk end that returns control to the
+/// interpreter must hand back the END-of-walk frame state — the same
+/// contract the guard-failure blackhole writeback satisfies
+/// (`handle_jitexception` re-enters `eval_loop_jit` from the frame's own
+/// `last_instr`).  Without this the interpreter (or a freshly entered
+/// compiled loop, whose preamble reloads vable fields from the heap)
+/// re-runs the walked region from its START state, re-applying every
+/// concretely executed side effect.
+///
+/// Writes every live `locals_cells_stack_w` slot from the virtualizable
+/// shadow's concrete half (`virtualizable_entry_at` — the value half of
+/// the Box pair the authoritative walk maintains), `valuestackdepth` =
+/// the `LiveVars` forward-stack-analysis depth at the merge point (the
+/// same `depth_at_py_pc` derivation the portal-bridge encoder/decoder
+/// pair consumes — the symbolic vsd mirror can go stale, see
+/// `portal_bridge_vable_vsd`), and `last_instr = resume_py_pc - 1` so
+/// `next_instr()` re-enters at the merge point.  A bridge walk enters at
+/// a guard pc whose stack depth differs from the merge point's, so the
+/// depth must come from the analysis, not from the frame's entry value.
+///
+/// All-or-nothing: returns false (frame untouched) when any live slot
+/// lacks a shadow entry, when the depth analysis has no entry for the
+/// merge pc, or when the walked region net-changed the frame's block
+/// chain (`lastblock` — the flush writes only locals/stack/vsd/
+/// last_instr, so a block push/pop inside the walked region would leave
+/// the adopted frame's chain inconsistent with its pc).  The caller then
+/// keeps the legacy replay-from-start behavior.
+pub(crate) fn flush_walk_end_state_to_frame(
+    ctx: &TraceCtx,
+    frame: usize,
+    resume_py_pc: usize,
+) -> bool {
+    if frame == 0 {
+        return false;
+    }
+    let Some(nlocals) = concrete_nlocals(frame) else {
+        return false;
+    };
+    let Some(info) = ctx.virtualizable_info() else {
+        return false;
+    };
+    // Stack depth at the merge point from the cached forward analysis
+    // (mirror of `canonical_bridge::install_portal_for`'s derivation:
+    // absolute vsd = stack_base + depth, stack_base = nlocals + ncells
+    // = `concrete_nlocals`).
+    let frame_ptr = frame as *const u8;
+    let w_code =
+        unsafe { *(frame_ptr.add(crate::frame_layout::PYFRAME_PYCODE_OFFSET) as *const *const ()) };
+    if w_code.is_null() {
+        return false;
+    }
+    let raw_code = unsafe {
+        pyre_interpreter::w_code_get_ptr(w_code as PyObjectRef)
+            as *const pyre_interpreter::CodeObject
+    };
+    let Some(depth) = crate::liveness::liveness_for(raw_code)
+        .depth_at_py_pc()
+        .get(resume_py_pc)
+        .copied()
+    else {
+        return false;
+    };
+    let end_vsd = nlocals + depth as usize;
+    let live = end_vsd.max(nlocals);
+    let base = info.num_static_extra_boxes;
+    // Block-chain net-change check: the shadow's `lastblock` static box
+    // still holds the entry chain head iff the walk pushed/popped no
+    // blocks (a balanced push+pop allocates a fresh head and also
+    // declines — conservative).
+    let lastblock_static = info
+        .static_fields
+        .iter()
+        .position(|f| f.name == "lastblock");
+    let Some(lastblock_idx) = lastblock_static else {
+        return false;
+    };
+    let Some((_opref, shadow_lastblock)) = ctx.virtualizable_entry_at(lastblock_idx) else {
+        return false;
+    };
+    let frame_lastblock =
+        unsafe { *(frame_ptr.add(PYFRAME_LASTBLOCK_OFFSET) as *const usize) };
+    match shadow_lastblock {
+        Value::Ref(r) => {
+            if r.0 != frame_lastblock {
+                return false;
+            }
+        }
+        _ => return false,
+    }
+    // Validation pass first: it allocates nothing, so entry presence
+    // cannot change under it.  Commit only when every live slot resolves.
+    for abs in 0..live {
+        if ctx.virtualizable_entry_at(base + abs).is_none() {
+            return false;
+        }
+    }
+    let arr_ptr = unsafe {
+        *(frame_ptr.add(PYFRAME_LOCALS_CELLS_STACK_OFFSET)
+            as *const *mut pyre_object::FixedObjectArray)
+    };
+    if arr_ptr.is_null() || unsafe { &*arr_ptr }.as_slice().len() < live {
+        return false;
+    }
+    // Commit one slot at a time, re-reading the shadow entry per slot:
+    // boxing an Int/Float slot allocates and may trigger a minor
+    // collection, which moves nursery objects — the trace-ctx forwarding
+    // hook keeps the shadow entries current, and each already-written
+    // slot is reachable from the (rooted) frame, so neither side goes
+    // stale across the loop.
+    for abs in 0..live {
+        let Some((_opref, value)) = ctx.virtualizable_entry_at(base + abs) else {
+            return false;
+        };
+        let boxed = boxed_slot_value_for_type(Type::Ref, &value);
+        unsafe {
+            (*arr_ptr).as_mut_slice()[abs] = boxed;
+        }
+    }
+    unsafe {
+        let pf = &mut *(frame as *mut PyFrame);
+        pf.valuestackdepth = end_vsd;
+        pf.last_instr = resume_py_pc as isize - 1;
+    }
+    true
+}
+
 pub(crate) fn looks_like_heap_ref(value: PyObjectRef) -> bool {
     let addr = value as usize;
     let word_align = std::mem::align_of::<usize>() - 1;
