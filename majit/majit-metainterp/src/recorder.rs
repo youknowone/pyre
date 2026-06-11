@@ -366,6 +366,17 @@ impl Trace {
         }
     }
 
+    /// Opcode of the most recently recorded guard, if any.  Snapshot
+    /// capture keys `after_residual_call` on the guard opcode itself
+    /// (`pyjitpl.py:2599-2603 generate_guard`).
+    pub fn last_guard_opcode(&self) -> Option<OpCode> {
+        self.ops
+            .iter()
+            .rev()
+            .find(|op| op.opcode.is_guard())
+            .map(|op| op.opcode)
+    }
+
     /// Set fail_args on a recorded op identified by `opref`.
     ///
     /// Mirrors RPython's `Op.setfailargs([...])` (`resoperation.py`)

@@ -1489,6 +1489,13 @@ impl TraceCtx {
         self.recorder.num_guards()
     }
 
+    /// Opcode of the most recently recorded guard, if any
+    /// (`pyjitpl.py:2599-2603` — snapshot capture keys
+    /// `after_residual_call` on the guard opcode).
+    pub fn last_guard_opcode(&self) -> Option<OpCode> {
+        self.recorder.last_guard_opcode()
+    }
+
     /// The structured green key values, if provided.
     pub fn green_key_values(&self) -> Option<&GreenKey> {
         self.green_key_values.as_ref()

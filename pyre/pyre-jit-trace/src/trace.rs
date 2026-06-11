@@ -77,7 +77,14 @@ pub fn trace_bytecode(
     // inventory on a live bench now that walk-capability gaps #1/#2/#3
     // are closed.  See
     // `project_issue73_architecture_walker_as_tracer_2026_05_28`.
-    if std::env::var_os("PYRE_WALK_PERFN_JITCODE").is_some() {
+    // Both walker entries below are gated on `carrier.is_none()`: a
+    // multi-frame bridge resume carries reconstructed inline-callee
+    // recipes that only the trait path assembles+pushes (the carrier
+    // drain before `interpret()` below — `rebuild_from_resumedata`
+    // resume.py:1049-1056).  The walker has no multi-Python-frame
+    // reconstruction yet (#68); entering it would walk the outer root
+    // frame at `root_pc` instead of the deepest resumed callee.
+    if carrier.is_none() && std::env::var_os("PYRE_WALK_PERFN_JITCODE").is_some() {
         probe_walk_perfn_jitcode(ctx, sym, w_code, start_pc, cf_addr);
         return (TraceAction::Abort, concrete_frame);
     }
@@ -87,7 +94,9 @@ pub fn trace_bytecode(
     // `PYRE_FULL_BODY_WALK=0` opts back into the trait
     // `metainterp.interpret` loop below (transition escape hatch; the trait
     // tracer is deleted in Phase 6).
-    if std::env::var_os("PYRE_FULL_BODY_WALK").as_deref() != Some(std::ffi::OsStr::new("0")) {
+    if carrier.is_none()
+        && std::env::var_os("PYRE_FULL_BODY_WALK").as_deref() != Some(std::ffi::OsStr::new("0"))
+    {
         let action = full_body_walk_trace(ctx, sym, w_code, start_pc, cf_addr);
         return (action, concrete_frame);
     }

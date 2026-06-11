@@ -926,6 +926,20 @@ mod execute_residual_call_tests {
     }
 
     #[test]
+    fn clears_published_exception_after_consuming_it() {
+        // The Err return consumes the publication; the TLS slot must not
+        // keep the pointer for the next (unrelated) call to observe.
+        let descr = make_may_force_descr(vec![], Type::Int);
+        let r = execute_residual_call(&descr, raises_stopiteration as *const () as i64, &[]);
+        assert_eq!(r, Err(0xDEAD_BEEF));
+        let stale = crate::blackhole::BH_LAST_EXC_VALUE.with(|c| c.get());
+        assert_eq!(
+            stale, 0,
+            "BH_LAST_EXC_VALUE must be cleared after the exception is consumed"
+        );
+    }
+
+    #[test]
     fn clears_stale_exception_before_dispatch() {
         // A prior call's exception must not bleed into a clean call.
         crate::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(0x1234));

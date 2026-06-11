@@ -7013,6 +7013,26 @@ mod tests {
                 .expect("SETITEM HLOp must lower");
         let prod = build_store_subscr_fn_residual_call_r_v_insn(53, 0, 1, 2);
         assert_eq!(format!("{lowered:?}"), format!("{prod:?}"));
+        // Both paths share `build_residual_call_r_v_insn_from_operands`,
+        // so shape equality alone cannot catch the tag regressing to
+        // `PyreHelperKind::None` — pin the value itself.
+        let Insn::Op { args, .. } = &lowered else {
+            panic!("lowered SETITEM must be an Op insn");
+        };
+        let stub = args
+            .iter()
+            .find_map(|a| match a {
+                Operand::Descr(d) => match &**d {
+                    DescrOperand::CallDescrStub(stub) => Some(stub.clone()),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .expect("lowered SETITEM must carry a CallDescrStub descr");
+        assert_eq!(
+            stub.effect_info.pyre_helper,
+            majit_ir::PyreHelperKind::StoreSubscr
+        );
     }
 
     #[test]
