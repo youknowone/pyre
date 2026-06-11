@@ -2911,27 +2911,15 @@ impl OptHeap {
             // then handle as a guard. RPython uses force_lazy_sets_for_guard
             // (not force_all_lazy) — immutable caches survive.
             OpCode::GuardNotForced | OpCode::GuardNotForced2 => {
-                if let Some(postponed) = self.postponed_op.take() {
-                    if crate::majit_log_enabled() {
-                        eprintln!(
-                            "[opt-heap] emit postponed {:?} pos={:?} before {:?} pos={:?}",
-                            postponed.opcode,
-                            postponed.pos.get(),
-                            op.opcode,
-                            op.pos.get()
-                        );
-                    }
-                    // RPython emit_postponed_op: route through next_optimization
-                    ctx.emit_extra(ctx.current_pass_idx, postponed);
-                } else if crate::majit_log_enabled() {
-                    eprintln!(
-                        "[opt-heap] no postponed op before {:?} pos={:?}",
-                        op.opcode,
-                        op.pos.get()
-                    );
-                }
-                // RPython emitting_operation for guards:
-                //   self.optimizer.pendingfields = self.force_lazy_sets_for_guard()
+                // heap.py emit() runs emitting_operation(op) BEFORE
+                // emit_postponed_op(): the guard's lazy-set flush
+                // (force_lazy_sets_for_guard) emits non-virtual lazy
+                // setfields first, THEN the postponed call_may_force is
+                // emitted, THEN the guard itself.  Flushing after the
+                // call would schedule a SETFIELD_GC between the call and
+                // its paired guard, breaking the backend's strict
+                // guard_not_forced-at-+1 invariant
+                // (x86/assembler.py:2225-2244 _store_force_index).
                 let pending_virtual = self.force_lazy_sets_for_guard(ctx.current_pass_idx, ctx);
                 for pending_op in pending_virtual {
                     if pending_op.opcode == OpCode::SetarrayitemGc {
@@ -2951,6 +2939,25 @@ impl OptHeap {
                         let cf = self.field_cache(&descr);
                         cf.lazy_set = Some((obj, pending_op));
                     }
+                }
+                if let Some(postponed) = self.postponed_op.take() {
+                    if crate::majit_log_enabled() {
+                        eprintln!(
+                            "[opt-heap] emit postponed {:?} pos={:?} before {:?} pos={:?}",
+                            postponed.opcode,
+                            postponed.pos.get(),
+                            op.opcode,
+                            op.pos.get()
+                        );
+                    }
+                    // RPython emit_postponed_op: route through next_optimization
+                    ctx.emit_extra(ctx.current_pass_idx, postponed);
+                } else if crate::majit_log_enabled() {
+                    eprintln!(
+                        "[opt-heap] no postponed op before {:?} pos={:?}",
+                        op.opcode,
+                        op.pos.get()
+                    );
                 }
                 return OptimizationResult::Emit(op.clone());
             }
