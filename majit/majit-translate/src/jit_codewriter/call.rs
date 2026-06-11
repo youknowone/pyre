@@ -3431,39 +3431,9 @@ impl CallControl {
                     // branch above so audit sweeps observe both fallback
                     // surfaces consistently.
                     if std::env::var_os("PYRE_STRICT_TARGET_TO_PATH").is_none() {
-                        let need_tail = name.as_str().to_string();
-                        let receiver_leaf =
-                            receiver.rsplit("::").next().unwrap_or(receiver).to_string();
-                        // `impl_method_leaf_index` pre-filters by
-                        // method-name leaf so only same-leaf
-                        // candidates are scanned for the
-                        // `[..., receiver_leaf, need_tail]` tail.
-                        let empty: Vec<CallPath> = Vec::new();
-                        let leaf_bucket = self
-                            .impl_method_leaf_index
-                            .get(&need_tail)
-                            .unwrap_or(&empty);
-                        let mut matched: Option<&CallPath> = None;
-                        let mut multi = false;
-                        for key in leaf_bucket.iter() {
-                            let segs = &key.segments;
-                            if segs.len() >= 2
-                                && segs
-                                    .get(segs.len() - 2)
-                                    .map(|s| s == &receiver_leaf)
-                                    .unwrap_or(false)
-                            {
-                                if matched.is_some() {
-                                    multi = true;
-                                    break;
-                                }
-                                matched = Some(key);
-                            }
-                        }
-                        if !multi {
-                            if let Some(path) = matched {
-                                return Some(path.clone());
-                            }
+                        if let Some(path) = self.suffix_match_impl_method(receiver, name.as_str())
+                        {
+                            return Some(path);
                         }
                     }
                 }
@@ -3482,6 +3452,61 @@ impl CallControl {
         }
     }
 
+    /// Unique suffix-match of an impl method by bare receiver leaf —
+    /// `[..., receiver_leaf, name]` against `impl_method_leaf_index`.
+    ///
+    /// When the parser walks `impl PyFrame { fn pop(&mut self) {
+    /// self.stack_base() } }`, the inner `self.stack_base()` is
+    /// recorded as `Method { receiver_root: Some("PyFrame") }` — the
+    /// syntactic spelling, not the canonical `pyframe::PyFrame` —
+    /// while `function_graphs` registers the impl method under the
+    /// module-qualified key plus its crate-qualified alias
+    /// publications.  All aliases of one source graph share
+    /// `FunctionGraph.name`, so a multi-alias bucket is deduped by
+    /// graph identity exactly like the FunctionPath leaf-match above
+    /// (`bookkeeper.getdesc(callable)` keys on function-object
+    /// identity); genuinely distinct same-leaf candidates (two types
+    /// sharing a method-name leaf) stay ambiguous and return `None`,
+    /// mirroring Rust's name-resolution ambiguity error rather than
+    /// silently picking one.  The lexicographically smallest alias is
+    /// returned so the resolved `CallPath` is stable across runs and
+    /// lines up with the still-path-keyed registries.
+    fn suffix_match_impl_method(&self, receiver: &str, name: &str) -> Option<CallPath> {
+        let receiver_leaf = receiver.rsplit("::").next().unwrap_or(receiver);
+        let leaf_bucket = self.impl_method_leaf_index.get(name)?;
+        let matches: Vec<&CallPath> = leaf_bucket
+            .iter()
+            .filter(|key| {
+                let segs = &key.segments;
+                segs.len() >= 2 && segs[segs.len() - 2] == receiver_leaf
+            })
+            .collect();
+        if matches.is_empty() {
+            return None;
+        }
+        if matches.len() == 1 {
+            return Some(matches[0].clone());
+        }
+        let first_graph_name = self
+            .function_graphs
+            .get(matches[0])
+            .map(|g| g.name.as_str())?;
+        let all_same = matches.iter().all(|p| {
+            self.function_graphs
+                .get(*p)
+                .map(|g| g.name == first_graph_name)
+                .unwrap_or(false)
+        });
+        if !all_same {
+            return None;
+        }
+        matches
+            .iter()
+            .copied()
+            .min_by(|a, b| a.segments.cmp(&b.segments))
+            .cloned()
+    }
+
     /// RPython `call.py:181-183` uses `getfunctionptr(graph)` to obtain the
     /// integer funcptr identity for a call site. majit prefers a host-bound
     /// trace-call address when one has been registered for the resolved
@@ -3494,6 +3519,29 @@ impl CallControl {
                 .get(&path)
                 .copied()
                 .unwrap_or_else(|| symbolic_fnaddr_for_path(&path));
+        }
+        // Graph-less inherent-method fallback.  `target_to_path`'s
+        // `Method` arm resolves only graph-registered paths (its
+        // suffix-match walks `impl_method_leaf_index`, which is built
+        // from `function_graphs` keys).  Elidable leaf methods
+        // (`PyFrame::nlocals` / `ncells` / …) deliberately register NO
+        // graph — `look_inside_graph` would reject them anyway — and
+        // bind only a host fnaddr (`jit_fnaddr.rs`), so the path
+        // lookup above never fires for the in-impl `self.method()`
+        // spelling.  Try the qualified `[receiver, name]` spelling
+        // against `function_fnaddrs` directly before minting a
+        // symbolic hash, mirroring the FunctionPath arm which returns
+        // 3+-segment paths without a graph-containment check.
+        if let CallTarget::Method {
+            name,
+            receiver_root: Some(receiver),
+            ..
+        } = target
+        {
+            let qualified = CallPath::for_impl_method(receiver, name.as_str());
+            if let Some(&addr) = self.function_fnaddrs.get(&qualified) {
+                return addr;
+            }
         }
         symbolic_fnaddr_for_target(target)
     }
@@ -3652,6 +3700,42 @@ impl CallControl {
             if let Some(g) = self.function_graphs.get(&path) {
                 return Some(g);
             }
+            // Canonicalised spelling — in-impl `self.method()` call
+            // sites carry the bare receiver while registrations use
+            // the defining-module qualifier.
+            let canonical = majit_ir::descr::canonical_struct_name(receiver);
+            if canonical != receiver {
+                let path = CallPath::for_impl_method(&canonical, name);
+                if let Some(g) = self.function_graphs.get(&path) {
+                    return Some(g);
+                }
+            }
+            // Bare-receiver leaf match against the module-qualified
+            // inherent registration (same dedupe as `target_to_path`'s
+            // Method arm).  Must run BEFORE the receiver-agnostic
+            // unique-concrete fallback below: inherent methods
+            // (`PyFrame::pop`) never enter `method_to_impl_types`
+            // (trait-method table), so without this lookup a concrete
+            // receiver whose method exists only as an inherent graph
+            // would fall through and resolve to an unrelated type that
+            // happens to be the table's unique owner of the same
+            // method name (`pop` → dict-strategy pop).
+            if let Some(path) = self.suffix_match_impl_method(receiver, name) {
+                if let Some(g) = self.function_graphs.get(&path) {
+                    return Some(g);
+                }
+            }
+            // Known concrete struct receiver with no matching impl
+            // graph anywhere: do NOT fall through to the
+            // receiver-agnostic unique-concrete fallback — it resolves
+            // to an UNRELATED type that happens to be the table's
+            // unique owner of the method name.  Generic-parameter
+            // receivers (`H` / `handler`) have no
+            // `STRUCT_ORIGIN_REGISTRY` entry (and no `::`), so they
+            // keep the BFS-coverage fallback below.
+            if receiver.contains("::") || canonical != receiver {
+                return None;
+            }
         }
 
         // TODO(parity): retire when annotator wiring publishes
@@ -3715,6 +3799,29 @@ impl CallControl {
         if let Some(receiver) = receiver_root {
             if let Some(impl_name) = impls.iter().copied().find(|t| t.as_str() == receiver) {
                 return Some(impl_name.as_str());
+            }
+            // Bare-receiver leaf match: the table stores canonical
+            // `module::Type` names while in-impl `self.method()` call
+            // sites carry the syntactic bare spelling.  Unique-leaf
+            // only — two canonical types sharing a leaf stay
+            // ambiguous, mirroring [`Self::suffix_match_impl_method`].
+            let receiver_leaf = receiver.rsplit("::").next().unwrap_or(receiver);
+            let leaf_matches: Vec<&String> = impls
+                .iter()
+                .copied()
+                .filter(|t| t.rsplit("::").next().unwrap_or(t) == receiver_leaf)
+                .collect();
+            if leaf_matches.len() == 1 {
+                return Some(leaf_matches[0].as_str());
+            }
+            // Known concrete struct receiver with no matching impl:
+            // suppress the receiver-agnostic fallback (mirrors
+            // [`Self::resolve_method`]) — generic-parameter receivers
+            // keep it.
+            if receiver.contains("::")
+                || majit_ir::descr::canonical_struct_name(receiver) != receiver
+            {
+                return None;
             }
         }
 
@@ -8687,3 +8794,4 @@ mod tests {
         assert_eq!(got[0].index(), 90);
     }
 }
+

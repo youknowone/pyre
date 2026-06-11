@@ -511,11 +511,17 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     //
     // PyFrame::nlocals — invoked by `eval.rs:840 pop_value` and is the
     // funcptr the walker reaches when dispatching `PopTop`'s nested
-    // `pop_value` sub-jitcode.
+    // `pop_value` sub-jitcode.  Same dual-shape binding as
+    // `PyFrame::pop` below: the bare `self.nlocals()` spelling inside
+    // the MIR-lowered `pop_value` graph resolves through
+    // `impl_method_owner` to the 2-segment `["PyFrame", "nlocals"]`,
+    // while the module-qualified form is the 3-segment
+    // `["pyframe", "PyFrame", "nlocals"]` — register both.
     let pyframe_nlocals: fn(&crate::pyframe::PyFrame) -> usize = crate::pyframe::PyFrame::nlocals;
-    push_fnaddr(
+    push_alias_pair(
         &mut entries,
         "pyre_interpreter::pyframe::PyFrame::nlocals",
+        "pyre_interpreter::PyFrame::nlocals",
         pyframe_nlocals as *const (),
     );
 
