@@ -3203,6 +3203,29 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str) -> PyResult {
                     return Ok(w_none());
                 }
             }
+            "code" => {
+                // `interp_exceptions.py:986-1006 W_SystemExit`: `code` is a
+                // `readwrite_attrproperty_w('w_code')` set by `descr_init`
+                // to `args_w[0]` for a single argument, `newtuple(args_w)`
+                // for several, and the `__init__` default `None` when the
+                // instance carries no arguments.  Derived from `args_w`
+                // here, the same way `value` is above; supporting a later
+                // `e.code = x` write-back would need a dedicated `w_code`
+                // slot like OSError's `w_errno`.
+                let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
+                if kind == pyre_object::excobject::ExcKind::SystemExit {
+                    let args = unsafe { pyre_object::excobject::w_exception_get_args(obj) };
+                    let len = unsafe { pyre_object::w_tuple_len(args) };
+                    if len == 1 {
+                        if let Some(v) = unsafe { pyre_object::w_tuple_getitem(args, 0) } {
+                            return Ok(v);
+                        }
+                    } else if len > 1 {
+                        return Ok(args);
+                    }
+                    return Ok(w_none());
+                }
+            }
             // `interp_exceptions.py:739-742 W_OSError` exposes
             // `errno` / `strerror` / `filename` / `filename2` as
             // `readwrite_attrproperty_w('w_errno', ...)` slots, populated

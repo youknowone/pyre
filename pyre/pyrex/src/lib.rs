@@ -273,39 +273,31 @@ fn run_source(source: &str, mode: Mode, filename: &str) {
     maybe_print_jit_stats();
 }
 
-/// app_main.py:114-129 `handle_sys_exit` — `SystemExit.code` is None for
-/// a bare exit (exit 0), coerced with `int()` when possible, and anything
-/// non-integral is printed to stderr with exit code 1.  `code` itself is
-/// `args[0]` for a 1-arg raise and the whole args tuple otherwise
+/// app_main.py:114-129 `handle_sys_exit` — `exitcode = e.code`; None
+/// exits 0; otherwise `int(exitcode)` and a value `int()` rejects is
+/// printed to stderr with exit status 1.  `e.code` itself is `args[0]`
+/// for a 1-arg raise and the whole args tuple otherwise
 /// (interp_exceptions.py:993-998 `W_SystemExit.descr_init`).
 fn system_exit_code(e: &pyre_interpreter::PyError) -> i32 {
     let exc = e.exc_object;
     if exc.is_null() {
-        // Rust-raised SystemExit (sys.exit fast path) carries the code in
-        // the message string.
-        return e.message_text().parse().unwrap_or(0);
+        // No object-backed SystemExit means no `code` attribute (the
+        // class default None), i.e. a success exit.
+        return 0;
     }
-    unsafe {
-        let args = pyre_object::excobject::w_exception_get_args(exc);
-        let items = pyre_object::w_tuple_items_copy_as_vec(args);
-        let code = match items.len() {
-            0 => return 0,
-            1 => items[0],
-            _ => args,
-        };
-        if code.is_null() || pyre_object::is_none(code) {
-            return 0;
-        }
-        if pyre_object::is_int(code) {
-            return pyre_object::w_int_get_value(code) as i32;
-        }
-        let text = pyre_interpreter::display::py_str(code);
-        match text.parse() {
-            Ok(n) => n,
-            Err(_) => {
-                eprintln!("{text}");
-                1
-            }
+    let code = match pyre_interpreter::getattr(exc, pyre_object::w_str_new("code")) {
+        Ok(c) => c,
+        Err(_) => return 1,
+    };
+    if unsafe { pyre_object::is_none(code) } {
+        return 0;
+    }
+    match pyre_interpreter::builtins::builtin_int(&[code]) {
+        Ok(w_int) => unsafe { pyre_object::w_int_get_value(w_int) as i32 },
+        Err(_) => {
+            // app_main.py:124-125 `print(exitcode, file=sys.stderr)`.
+            eprintln!("{}", unsafe { pyre_interpreter::display::py_str(code) });
+            1
         }
     }
 }

@@ -554,18 +554,30 @@ pub fn register_module(ns: &mut DictStorage) {
     // sys.platlibdir — typically "lib" on POSIX; used by sysconfig to
     // construct install paths.
     dict_storage_store(ns, "platlibdir", w_str_new("lib"));
-    // `sys/app.py:114-127 exit(exitcode=None)` — `raise SystemExit(exitcode)`.
-    // Raise a real SystemExit instance so `e.code` / `e.args` carry the
-    // original object; code interpretation (None → 0, int() coercion,
+    // `sys/app.py:114-126 exit(exitcode=None)` — raise SystemExit(exitcode),
+    // de-tupelizing a tuple argument so `exit((a, b))` becomes
+    // `SystemExit(a, b)` (the extra de-tupelizing normalize_exception does
+    // for `raise SystemExit, exitcode`).  A bare `exit()` defaults exitcode
+    // to None, so the instance carries `code = None` / `args = (None,)`.
+    // Interpreting the code (None → 0, int() coercion,
     // print-non-integral-and-exit-1) is the launcher's job
     // (`app_main.py:114-129 handle_sys_exit`).
     dict_storage_store(
         ns,
         "exit",
         crate::make_builtin_function("exit", |args| {
+            if args.len() > 1 {
+                return Err(crate::PyError::type_error("exit() takes at most 1 argument"));
+            }
             let cls = crate::builtins::lookup_exc_class("SystemExit")
                 .ok_or_else(|| crate::PyError::runtime_error("SystemExit class missing"))?;
-            let exc = crate::call::call_function_impl_result(cls, args)?;
+            let exitcode = args.first().copied().unwrap_or_else(w_none);
+            let ctor_args = if unsafe { is_tuple(exitcode) } {
+                unsafe { w_tuple_items_copy_as_vec(exitcode) }
+            } else {
+                vec![exitcode]
+            };
+            let exc = crate::call::call_function_impl_result(cls, &ctor_args)?;
             Err(unsafe { crate::PyError::from_exc_object(exc) })
         }),
     );

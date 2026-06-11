@@ -2543,7 +2543,7 @@ pub(crate) fn call_and_check(
 }
 
 /// intobject.py:989-1050 _new_baseint
-pub(crate) fn builtin_int(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub fn builtin_int(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if args.is_empty() {
         return Ok(w_int_new(0));
     }
