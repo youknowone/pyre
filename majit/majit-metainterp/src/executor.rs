@@ -907,7 +907,11 @@ mod execute_residual_call_tests {
     fn non_raising_call_returns_ok_result() {
         let descr = make_may_force_descr(vec![Type::Int, Type::Int], Type::Int);
         let r = execute_residual_call(&descr, add2_i64 as *const () as i64, &[40, 2]);
-        assert_eq!(r, Ok(42), "a non-raising add2_i64(40, 2) must return Ok(42)");
+        assert_eq!(
+            r,
+            Ok(42),
+            "a non-raising add2_i64(40, 2) must return Ok(42)"
+        );
     }
 
     #[test]
@@ -927,7 +931,11 @@ mod execute_residual_call_tests {
         crate::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(0x1234));
         let descr = make_may_force_descr(vec![Type::Int, Type::Int], Type::Int);
         let r = execute_residual_call(&descr, add2_i64 as *const () as i64, &[1, 2]);
-        assert_eq!(r, Ok(3), "stale BH_LAST_EXC_VALUE must be cleared before dispatch");
+        assert_eq!(
+            r,
+            Ok(3),
+            "stale BH_LAST_EXC_VALUE must be cleared before dispatch"
+        );
     }
 }
 

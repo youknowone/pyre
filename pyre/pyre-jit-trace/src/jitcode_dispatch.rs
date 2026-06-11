@@ -8066,8 +8066,10 @@ fn compare_box_provably_dead(ctx: &WalkContext<'_, '_>, compare_pc: usize, dst_r
     // SAFETY: code_ptr captured non-null above, live for the walk.
     let code_obj = unsafe { &*code_ptr };
     let arm_dst_live = |jc_pc: usize| -> bool {
-        let py =
-            skip_python_trivia_forward(code_obj, python_pc_for_jitcode_pc(metadata, jc_pc) as usize);
+        let py = skip_python_trivia_forward(
+            code_obj,
+            python_pc_for_jitcode_pc(metadata, jc_pc) as usize,
+        );
         let banks = crate::state::frame_liveness_reg_indices_by_bank_at(jitcode_index, py as i32);
         banks.ref_.iter().any(|&c| c as u8 == dst_reg)
     };
@@ -8170,8 +8172,7 @@ fn try_walker_specialize_binary_op_float(
                 majit_metainterp::default_effect_info(),
             );
             walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardNoException, &[])?;
-            let result_val =
-                unsafe { pyre_object::w_float_get_value(boxed_result_i64 as _) };
+            let result_val = unsafe { pyre_object::w_float_get_value(boxed_result_i64 as _) };
             ctx.trace_ctx
                 .set_opref_concrete(r, majit_ir::Value::Float(result_val));
             r
@@ -11023,11 +11024,11 @@ fn handle(
                 if !has_partial && has_targets {
                     let outcome = match bridge_origin {
                         // Guard-origin: existing bridge path.
-                        Some(_) => driver.meta_interp_mut().compile_trace(
-                            key,
-                            &live_args,
-                            bridge_origin,
-                        ),
+                        Some(_) => {
+                            driver
+                                .meta_interp_mut()
+                                .compile_trace(key, &live_args, bridge_origin)
+                        }
                         // pyjitpl.py:3003-3007 interp-origin: a
                         // function-entry trace (ResumeFromInterpDescr)
                         // closes as an entry bridge jumping into the
@@ -11043,11 +11044,9 @@ fn handle(
                                     entry_meta,
                                 )
                             }
-                            None => driver.meta_interp_mut().compile_trace(
-                                key,
-                                &live_args,
-                                None,
-                            ),
+                            None => driver
+                                .meta_interp_mut()
+                                .compile_trace(key, &live_args, None),
                         },
                     };
                     if matches!(outcome, majit_metainterp::CompileOutcome::Compiled { .. }) {
@@ -15845,7 +15844,10 @@ mod tests {
                 .try_into()
                 .unwrap(),
         );
-        assert_eq!(token, 0, "token must be cleared back to TOKEN_NONE after the call");
+        assert_eq!(
+            token, 0,
+            "token must be cleared back to TOKEN_NONE after the call"
+        );
     }
 
     static FORCING_CALLEE_TOKEN_ADDR: std::sync::atomic::AtomicUsize =
@@ -18969,10 +18971,7 @@ mod tests {
                 assert_eq!(jump_args.len(), 2);
                 for arg in &jump_args {
                     assert!(!arg.is_constant(), "const red must be same_as-wrapped");
-                    assert_eq!(
-                        wc.trace_ctx.get_opref_type(*arg),
-                        Some(majit_ir::Type::Ref)
-                    );
+                    assert_eq!(wc.trace_ctx.get_opref_type(*arg), Some(majit_ir::Type::Ref));
                 }
             }
             other => panic!("expected CloseLoop, got {other:?}"),

@@ -3587,7 +3587,11 @@ fn filter_liveness_in_place(
         }
         existing.extend(non_register);
     }
-    (live_markers_out, after_call_post_merge, first_insn_post_merge)
+    (
+        live_markers_out,
+        after_call_post_merge,
+        first_insn_post_merge,
+    )
 }
 
 /// Decode `code.exceptiontable` into the structures the dispatch loop
@@ -8554,17 +8558,17 @@ impl CodeWriter {
         // them into live_i/live_r/live_f per assembler.py:150-152.
         let (post_remove_live_indices, after_call_post_merge, first_insn_post_merge) =
             filter_liveness_in_place(
-            &mut ssarepr,
-            code,
-            &depth_at_pc,
-            &pyre_color_for_semantic_local,
-            &stack_slot_color_map,
-            portal_frame_reg,
-            portal_ec_reg,
-            walker_tracked_pc_live_indices_out.as_deref(),
-            walker_after_call_pc_indices_out.as_deref(),
-            true,
-        );
+                &mut ssarepr,
+                code,
+                &depth_at_pc,
+                &pyre_color_for_semantic_local,
+                &stack_slot_color_map,
+                portal_frame_reg,
+                portal_ec_reg,
+                walker_tracked_pc_live_indices_out.as_deref(),
+                walker_after_call_pc_indices_out.as_deref(),
+                true,
+            );
         // Runtime entry/liveness lookups expect the byte offset of the
         // surviving `-live-` marker for each Python PC
         // (`jitcode.get_live_vars_info` first checks `code[pc] ==
@@ -10040,17 +10044,17 @@ mod tests {
         let stack_slot_color_map: Vec<u16> = Vec::new();
         let (post_remove_live_indices, _after_call_post_merge, _first_insn_post_merge) =
             filter_liveness_in_place(
-            &mut ssarepr,
-            &code,
-            &depth_at_pc,
-            &local_color_map,
-            &stack_slot_color_map,
-            u16::MAX,
-            u16::MAX,
-            Some(&walker_tracked_pc_live_indices),
-            None,
-            false,
-        );
+                &mut ssarepr,
+                &code,
+                &depth_at_pc,
+                &local_color_map,
+                &stack_slot_color_map,
+                u16::MAX,
+                u16::MAX,
+                Some(&walker_tracked_pc_live_indices),
+                None,
+                false,
+            );
 
         let live_idx = post_remove_live_indices[reachable_pc];
         let live_args = ssarepr.insns[live_idx]
@@ -10112,17 +10116,17 @@ mod tests {
         let stack_slot_color_map: Vec<u16> = Vec::new();
         let (post_remove_live_indices, _after_call_post_merge, _first_insn_post_merge) =
             filter_liveness_in_place(
-            &mut ssarepr,
-            &code,
-            &depth_at_pc,
-            &local_color_map,
-            &stack_slot_color_map,
-            u16::MAX,
-            u16::MAX,
-            Some(&walker_tracked_pc_live_indices),
-            None,
-            true,
-        );
+                &mut ssarepr,
+                &code,
+                &depth_at_pc,
+                &local_color_map,
+                &stack_slot_color_map,
+                u16::MAX,
+                u16::MAX,
+                Some(&walker_tracked_pc_live_indices),
+                None,
+                true,
+            );
 
         let live_idx = post_remove_live_indices[reachable_pc];
         let live_args = ssarepr.insns[live_idx]
