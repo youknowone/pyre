@@ -208,7 +208,11 @@ impl pyre_interpreter::SharedOpcodeHandler for crate::state::MIFrame {
         list: Self::Value,
         value: Self::Value,
     ) -> Result<(), pyre_interpreter::PyError> {
-        // MIFrame parity: trace-only, no concrete mutation.
+        // MIFrame parity: the hook itself is trace-only — the concrete
+        // LIST_APPEND mutation is performed by the eval loop
+        // (`execute_opcode_step` / inline-frame `concrete_execute_step`),
+        // which is why this path marks the heap mutation.
+        self.dm143_mark_heap_mutated();
         self.list_append_value(
             list.opref,
             value.opref,

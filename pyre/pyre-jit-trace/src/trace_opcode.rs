@@ -1067,31 +1067,23 @@ impl MIFrame {
     }
 
     /// #143 frame-advance gate: mark this trace as having performed a concrete
-    /// heap mutation during tracing. Called only from the precise list mutation
-    /// recorders (`list_append_value`/`list_pop_value`/`list_pop_at_value`/
-    /// `list_reverse_value`). Non-mutating method calls (`x in s`, `len(xs)`)
-    /// and deferred stores (`STORE_SUBSCR`) never reach this, so their loops
-    /// stay unmarked and `dm143_advance_live_locals` skips their advance.
+    /// heap mutation during tracing. Called exactly where the concrete
+    /// mutation is a certainty: the BUILTIN-form list dispatch arms
+    /// (append/pop/pop-at/reverse — the trait impl's `call_callable` executed
+    /// the builtin concretely before dispatch) and the LIST_APPEND opcode hook
+    /// (the eval loop's `execute_opcode_step` / inline-frame
+    /// `concrete_execute_step` performs the write).
     ///
-    /// Precision caveat: for the dominant callers — the builtin-form dispatch
-    /// arms and the LIST_APPEND opcode hook — the concrete mutation is
-    /// guaranteed (the trait impl's `call_callable` executes builtin/user
-    /// functions concretely before dispatch; non-walker opcodes run
-    /// `execute_opcode_step`). The rare method-form arms (a `W_MethodObject`
-    /// flowing as a value, e.g. `m = xs.pop; m(0)`) get NO concrete execution
-    /// (the trait impl only executes `is_function` callables), so they
-    /// over-mark; such traces also carry a Null concrete result and degrade
-    /// before a clean CloseLoop. The precise fix is a `W_MethodObject` unwrap
-    /// in the trait impl's concrete-execution block (executor parity), not a
-    /// recorder-side gate.
+    /// Deliberately NOT marked: deferred stores (`STORE_SUBSCR` — the compiled
+    /// loop performs the write exactly once, nbody/fannkuch), non-mutating
+    /// calls, and the W_MethodObject method-form arms (`m = xs.pop; m(0)`) —
+    /// the trait impl only executes `is_function` callables concretely, so no
+    /// during-trace mutation happens on that path and marking it would
+    /// wrongly advance past an iteration whose mutation only exists as
+    /// deferred IR. (Those traces currently always abort before CloseLoop;
+    /// unmarked-deferred stays correct if they ever close.)
     #[inline]
     pub(crate) fn dm143_mark_heap_mutated(&mut self) {
-        // Set by the concrete-during-trace mutation recorders only
-        // (list append / pop / pop-at / reverse — method-call mutations that
-        // run at `call_callable` line ~101 during tracing). STORE_SUBSCR is
-        // deferred (no concrete write during trace) so it deliberately does
-        // NOT mark: a pure-STORE_SUBSCR loop (nbody / fannkuch) must keep its
-        // deferred write, which the compiled loop performs exactly once.
         self.sym_mut().dm143_heap_mutated = true;
     }
 
@@ -5806,7 +5798,6 @@ impl MIFrame {
         concrete_list: PyObjectRef,
         concrete_value: PyObjectRef,
     ) -> Result<(), PyError> {
-        self.dm143_mark_heap_mutated();
         if concrete_list.is_null() {
             return self.trace_list_append(list, value);
         }
@@ -5872,7 +5863,6 @@ impl MIFrame {
         concrete_list: PyObjectRef,
         concrete_len: usize,
     ) -> Result<OpRef, PyError> {
-        self.dm143_mark_heap_mutated();
         if concrete_list.is_null() || concrete_len == 0 {
             // Caller's guard ensures concrete_len > 0; defensive fallback.
             return self.trace_call_callable(callable, &[]);
@@ -5911,7 +5901,6 @@ impl MIFrame {
         list: OpRef,
         concrete_list: PyObjectRef,
     ) -> Result<OpRef, PyError> {
-        self.dm143_mark_heap_mutated();
         if concrete_list.is_null() || unsafe { !is_list(concrete_list) } {
             return self.trace_call_callable(callable, &[]);
         }
@@ -5950,7 +5939,6 @@ impl MIFrame {
         index: OpRef,
         concrete_list: PyObjectRef,
     ) -> Result<OpRef, PyError> {
-        self.dm143_mark_heap_mutated();
         // Pick the strategy-specific length field so the inline length update
         // mirrors `generated_list_pop_by_strategy`. A null / non-list / mixed
         // receiver has no known length field, so fall back to the generic
@@ -6311,6 +6299,13 @@ impl MIFrame {
                     // NULL callable on resume and inflated `valuestackdepth`,
                     // skewing the synthetic guard's `result_stack_idx` — is
                     // removed.
+                    //
+                    // Builtin-form arms mark the heap mutation here: the trait
+                    // impl's `call_callable` already executed the builtin
+                    // concretely before dispatch, so the mutation is a
+                    // certainty. The W_Method method-form arms above do NOT
+                    // mark — no concrete execution happens on that path.
+                    self.dm143_mark_heap_mutated();
                     self.list_append_value(args[0], args[1], concrete_args[0], concrete_args[1])?;
                     let none_ref =
                         self.with_ctx(|_this, ctx| ctx.const_ref(pyre_object::w_none() as i64));
@@ -6325,6 +6320,7 @@ impl MIFrame {
                     // inline by `list_pop_at_value` (residual shift +
                     // reconstructible length overlay), called directly like the
                     // append arm — no replay scaffolding.
+                    self.dm143_mark_heap_mutated();
                     return self.list_pop_at_value(callable, args[0], args[1], concrete_args[0]);
                 }
                 if args.len() == 1
@@ -6332,6 +6328,7 @@ impl MIFrame {
                     && !concrete_args.first().copied().unwrap_or(PY_NULL).is_null()
                     && is_list(concrete_args[0])
                 {
+                    self.dm143_mark_heap_mutated();
                     let call_pc = self.fallthrough_pc.saturating_sub(1);
                     self.with_ctx(|this, ctx| {
                         this.push_call_replay_stack_self_in_args(
@@ -6355,6 +6352,7 @@ impl MIFrame {
                     && !concrete_args.first().copied().unwrap_or(PY_NULL).is_null()
                     && is_list(concrete_args[0])
                 {
+                    self.dm143_mark_heap_mutated();
                     let call_pc = self.fallthrough_pc.saturating_sub(1);
                     self.with_ctx(|this, ctx| {
                         this.implement_guard_value(ctx, callable, concrete_callable as i64);
