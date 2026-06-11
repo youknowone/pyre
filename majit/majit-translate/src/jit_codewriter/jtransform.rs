@@ -622,9 +622,19 @@ impl<'a> Transformer<'a> {
         result: Option<&crate::flowspace::model::Variable>,
         result_ty: &ValueType,
     ) -> ResolvedCallResult {
-        let kind = self
-            .resolve_call_result_kind(result, result_ty)
-            .unwrap_or_else(|| value_type_to_kind(result_ty));
+        // A result-less call op is Void at the IR level even when the
+        // callee declares a scalar return (the front drops unused
+        // results; RPython would carry a Void-typed result Variable
+        // here, and `getkind(Void)` selects the `_v` opname).  Without
+        // this the assembler emits e.g. `residual_call_r_i/iRd` — an
+        // `_i` opname with no `>i` result slot, a key no blackhole
+        // handler has.
+        let kind = if result.is_none() {
+            'v'
+        } else {
+            self.resolve_call_result_kind(result, result_ty)
+                .unwrap_or_else(|| value_type_to_kind(result_ty))
+        };
         let ir_type = match kind {
             'i' => majit_ir::value::Type::Int,
             'r' => majit_ir::value::Type::Ref,
@@ -3851,7 +3861,12 @@ fn canonical_float_arith_binop(op: &str) -> Option<&'static str> {
         "add" | "add_assign" => Some("add"),
         "sub" | "sub_assign" => Some("sub"),
         "mul" | "mul_assign" => Some("mul"),
-        "div" | "div_assign" => Some("div"),
+        // `front::mir::canonical_binop_label` collapses Rust `/`
+        // (MIR `Div`) to "floordiv"; over floats that operator is
+        // true division, so both labels land on `float_truediv`.
+        // Integer "floordiv" never reaches this arm — the guard
+        // requires a float operand or a Float result.
+        "div" | "div_assign" | "floordiv" => Some("div"),
         _ => None,
     }
 }
