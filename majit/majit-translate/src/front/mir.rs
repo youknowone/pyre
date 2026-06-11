@@ -1751,12 +1751,21 @@ impl<'a> Lowering<'a> {
                     // fits.  Emit a synthetic 2-arg Call so the write
                     // remains visible to the downstream side-effect
                     // tracking.
+                    //
+                    // The write produces no value (`result` below is `None`),
+                    // so the declared result kind must be Void: jtransform's
+                    // `resolve_call_result` reads `result_ty` when the op has
+                    // no result Variable, and a non-void kind there assembles
+                    // a `residual_call_r_<kind>` key with no `>` result tail
+                    // — a malformed opname nothing wires (`getkind(Void)`
+                    // keeps result-less calls on the `residual_call_*_v`
+                    // row).
                     OpKind::Call {
                         target: CallTarget::FunctionPath {
                             segments: vec!["__deref_write".to_string()],
                         },
                         args: vec![base, value],
-                        result_ty: ValueType::Int,
+                        result_ty: ValueType::Void,
                     }
                 }
             }
