@@ -1143,25 +1143,42 @@ pub fn translate_op(
                         })?;
                         return Ok(vec![FlowspaceOp::new("same_as", vec![arg], result)]);
                     }
-                    // `core::cmp` method spellings of upstream
-                    // operations: pyre source writes `a.min(b)` /
-                    // `a != b`-via-`PartialEq::ne` where upstream
-                    // Python writes `min(a, b)` / the flowspace
-                    // binary op `ne` (flowspace/operation.py
-                    // comparison table). front::mir records the
-                    // monomorphized core path when the call survives
-                    // as a trait-method call (primitive BinOps lower
-                    // to `OpKind::BinOp` and never reach here); map
-                    // the path back to the upstream spelling so the
-                    // chain reaches binaryop.py / rbuiltin.py instead
-                    // of failing FunctionPath resolution.
-                    if segments.len() >= 3 && segments[0] == "core" && segments[1] == "cmp" {
+                    // `core` method spellings of upstream operations:
+                    // pyre source writes `a.min(b)` /
+                    // `a != b`-via-`PartialEq::ne` / `v.len()` /
+                    // `x.wrapping_mul(y)` where upstream Python
+                    // writes `min(a, b)` / the flowspace ops `ne` /
+                    // `len` / `mul` (flowspace/operation.py tables;
+                    // lltype `int_mul` wraps, so `wrapping_mul` is
+                    // the Rust spelling of upstream's plain `*` —
+                    // e.g. the `x * 1000003` green-key hash).
+                    // front::mir records the monomorphized core path
+                    // when the call survives as a trait/inherent
+                    // method call (primitive BinOps lower to
+                    // `OpKind::BinOp` and never reach here); map the
+                    // path back to the upstream spelling so the
+                    // chain reaches unaryop.py / binaryop.py /
+                    // rbuiltin.py instead of failing FunctionPath
+                    // resolution.
+                    if segments.len() >= 3 && segments[0] == "core" {
+                        let family = segments[1].as_str();
                         let leaf = segments[segments.len() - 1].as_str();
-                        match leaf {
-                            "eq" | "ne" | "lt" | "le" | "gt" | "ge" if arg_hls.len() == 2 => {
+                        match (family, leaf) {
+                            ("cmp", "eq" | "ne" | "lt" | "le" | "gt" | "ge")
+                                if arg_hls.len() == 2 =>
+                            {
                                 return Ok(vec![FlowspaceOp::new(leaf, arg_hls, result)]);
                             }
-                            "min" | "max" if arg_hls.len() == 2 => {
+                            ("slice", "len") if arg_hls.len() == 1 => {
+                                return Ok(vec![FlowspaceOp::new("len", arg_hls, result)]);
+                            }
+                            ("slice", "iter") if arg_hls.len() == 1 => {
+                                return Ok(vec![FlowspaceOp::new("iter", arg_hls, result)]);
+                            }
+                            ("num", "wrapping_mul") if arg_hls.len() == 2 => {
+                                return Ok(vec![FlowspaceOp::new("mul", arg_hls, result)]);
+                            }
+                            ("cmp", "min" | "max") if arg_hls.len() == 2 => {
                                 let builtin =
                                     HOST_ENV.lookup_builtin(leaf).ok_or_else(|| {
                                         TyperError::message(format!(
