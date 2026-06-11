@@ -3408,7 +3408,7 @@ impl OptUnroll {
                         // add_op_to_short returned None" path: drop the
                         // peeled trace and let the unroll caller raise
                         // InvalidLoop, falling back to jump_to_preamble.
-                        if !builder.setup(&sp, label_args) {
+                        if !builder.setup(&sp, label_args, ctx) {
                             target_token.short_preamble_producer = Some(builder);
                             std::panic::panic_any(crate::optimize::InvalidLoop(
                                 "short preamble has unresolvable Phase 1 args",
