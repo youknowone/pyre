@@ -1776,6 +1776,19 @@ impl AbstractShortPreambleBuilderState {
         if invented_name {
             // shortpreamble.py:436-437: extra_same_as carries the resolved
             // box itself; a producer-bound box sheds to a live operand.
+            //
+            // Measured dead fallback: every `invented_name = true` writer
+            // carries `Some(same_as_source)` — the sole production writer
+            // is the compound-alias path (`alt.invented_name = true` +
+            // `alt.same_as_source = Some(...)`), `add_preamble_op_from_pop`
+            // always passes `Some(pop.op)`, and the export/re-import paths
+            // copy both fields as a pair. Fallback kept as a release
+            // safety net.
+            debug_assert!(
+                same_as_source.is_some(),
+                "invented_name without same_as_source at {:?}",
+                replay_op.pos.get()
+            );
             let source = same_as_source.unwrap_or_else(|| op.clone());
             let mut same_as = Op::new(OpCode::same_as_for_type(replay_op.result_type()), &[source]);
             same_as.pos.set(op.to_opref());
