@@ -568,6 +568,31 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         stack_underflow as *const (),
     );
 
+    // `get_current_exception` / `set_current_exception` — the named TLS
+    // accessors `PyFrame::push_exc_info` / `pop_except` (`eval.rs`) call
+    // for the per-thread `CURRENT_EXCEPTION` slot.  Both carry
+    // `#[dont_look_inside]` (the `LocalKey::with` closure inside has no
+    // extractable graph), so the codewriter classifies the calls
+    // `Residual` and needs these bindings to bake real funcptrs instead
+    // of `symbolic_fnaddr_for_path` hashes.  These are the
+    // interpreter-side twins of the trace-side
+    // `get_current_exception_fn` / `set_current_exception_fn` cpu
+    // helpers — same TLS slot, same flat read/write semantics.
+    let get_current_exc: fn() -> pyre_object::PyObjectRef = crate::eval::get_current_exception;
+    push_alias_pair(
+        &mut entries,
+        "pyre_interpreter::eval::get_current_exception",
+        "pyre_interpreter::get_current_exception",
+        get_current_exc as *const (),
+    );
+    let set_current_exc: fn(pyre_object::PyObjectRef) = crate::eval::set_current_exception;
+    push_alias_pair(
+        &mut entries,
+        "pyre_interpreter::eval::set_current_exception",
+        "pyre_interpreter::set_current_exception",
+        set_current_exc as *const (),
+    );
+
     // `pyframe_get_pycode` / `ncells` / `npure_cellvars` / `PyFrame::ncells`
     // carry `#[elidable_cannot_raise]`.  `call.rs:has_cannot_raise_assertion`
     // only honours the assertion when `function_fnaddrs.contains_key(p)`,

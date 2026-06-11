@@ -583,6 +583,14 @@ pub fn register_pyframe_root_walker() {
     majit_gc::set_active_extra_root_walker(Some(walk_pyframe_roots));
 }
 
+/// Flat TLS read of the per-thread `CURRENT_EXCEPTION` slot.
+///
+/// `dont_look_inside` keeps the codewriter from following into the
+/// `LocalKey::with` closure (no extractable graph); calls classify
+/// `Residual` against the fnaddr registered in `jit_trace_fnaddrs()`,
+/// mirroring the trace-side `get_current_exception_fn` cpu helper
+/// binding (`codewriter.rs PlainCannotRaiseNoHeap`).
+#[majit_macros::dont_look_inside]
 pub fn get_current_exception() -> PyObjectRef {
     let ec = crate::call::getexecutioncontext();
     if ec.is_null() {
@@ -591,6 +599,9 @@ pub fn get_current_exception() -> PyObjectRef {
     unsafe { (*ec).sys_exc_value }
 }
 
+/// Flat TLS write of the per-thread `CURRENT_EXCEPTION` slot — same
+/// residual-leaf contract as [`get_current_exception`].
+#[majit_macros::dont_look_inside]
 pub fn set_current_exception(exc: PyObjectRef) {
     let ec = crate::call::getexecutioncontext() as *mut PyExecutionContext;
     if ec.is_null() {
@@ -2731,7 +2742,13 @@ impl OpcodeStepExecutor for PyFrame {
     // PyPy: executioncontext.py enter_frame / normalize_exception
     fn push_exc_info(&mut self) -> Result<(), PyError> {
         let exc = self.pop();
-        // Save previous exception, set current
+        // Save previous exception, set current.  Routed through the
+        // named TLS accessors (not a raw `CURRENT_EXCEPTION.with`
+        // closure) so the codewriter sees two residual-callable leaves
+        // with registered fnaddrs instead of an unresolvable
+        // `LocalKey::with` monomorphization — the same per-thread slot
+        // the compiled trace reads/writes through
+        // `get_current_exception_fn` / `set_current_exception_fn`.
         let prev = get_current_exception();
         set_current_exception(exc);
         // Push "previous exception" for later restore
@@ -2766,7 +2783,8 @@ impl OpcodeStepExecutor for PyFrame {
 
     // ── PopExcept ──
     fn pop_except(&mut self) -> Result<(), PyError> {
-        // Restore previous exc_info from stack
+        // Restore previous exc_info from stack.  Named TLS accessor for
+        // the same codewriter-resolvability reason as `push_exc_info`.
         let prev_exc = self.pop();
         set_current_exception(prev_exc);
         Ok(())
