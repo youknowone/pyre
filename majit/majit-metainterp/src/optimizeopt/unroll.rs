@@ -2851,6 +2851,22 @@ impl OptUnroll {
         }
         let mut short_args = label_args.to_vec();
         short_args.extend(virtuals);
+        // unroll.py:480 `short_inputargs = sb.create_short_inputargs(
+        // label_args + virtuals)` — read the ShortBoxes-derived list off the
+        // ctx channel. The preview pass computed it from the same
+        // `label_args + virtuals` (measured identical across the corpus);
+        // paths that never ran the preview (test ExportedState setups) fall
+        // back to the local recompute.
+        let short_inputargs = if ctx.exported_short_inputargs.is_empty() {
+            short_args.clone()
+        } else {
+            debug_assert_eq!(
+                ctx.exported_short_inputargs, short_args,
+                "preview-pass create_short_inputargs diverged from the \
+                 export-site label_args + virtuals recompute"
+            );
+            ctx.exported_short_inputargs.clone()
+        };
         let exported_short_boxes = ctx.exported_short_boxes.clone();
         // unroll.py:466-473 line-by-line:
         //
@@ -2873,7 +2889,7 @@ impl OptUnroll {
         let short_boxes_for_info =
             crate::optimizeopt::shortpreamble::produced_short_boxes_from_exported_boxes(
                 &label_args,
-                &short_args,
+                &short_inputargs,
                 &exported_short_boxes,
             );
         for (_, produced_op) in &short_boxes_for_info {
@@ -2917,7 +2933,7 @@ impl OptUnroll {
             infos,
             exported_short_boxes,
             renamed_inputargs.to_vec(),
-            short_args,
+            short_inputargs,
         );
         // `OptContext::next_pos` is the strict upper bound on raw OpRefs
         // Phase 1 allocated, including intermediates folded / forwarded

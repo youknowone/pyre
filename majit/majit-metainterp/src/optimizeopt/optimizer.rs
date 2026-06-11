@@ -2795,6 +2795,15 @@ impl Optimizer {
             }
             self.produce_potential_short_preamble_ops(&mut short_boxes, &mut ctx);
             let produced = short_boxes.produced_ops(&mut ctx);
+            // unroll.py:480 `short_inputargs = sb.create_short_inputargs(
+            // label_args + virtuals)` — read off the ShortBoxes object and
+            // carry to export_state through the ctx channel (sibling of
+            // `exported_short_boxes` below).
+            ctx.exported_short_inputargs = short_boxes
+                .create_short_inputargs(&preview_short_args)
+                .iter()
+                .map(|b| b.to_opref())
+                .collect();
             ctx.exported_short_boxes = produced
                 .into_iter()
                 .map(|(result, produced)| {

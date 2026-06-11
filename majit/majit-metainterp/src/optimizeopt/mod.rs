@@ -654,6 +654,14 @@ pub struct OptContext {
     /// RPython shortpreamble.py: pass-collected preamble producers aligned to
     /// the exported loop-header inputargs.
     pub exported_short_boxes: Vec<crate::optimizeopt::shortpreamble::PreambleOp>,
+    /// unroll.py:480 `short_inputargs = sb.create_short_inputargs(label_args
+    /// + virtuals)` — the ShortBoxes-derived short-preamble inputargs,
+    /// carried from the preview pass (optimizer.rs, where the ShortBoxes
+    /// object lives) to `export_state_with_bounds` through the same channel
+    /// as `exported_short_boxes`. Position projection of the renamed
+    /// inputarg boxes; equals the export-site `label_args + virtuals`
+    /// recompute (measured identical across the corpus, 2026-06-11).
+    pub exported_short_inputargs: Vec<OpRef>,
     /// optimizer.py: `can_replace_guards` — disable guard replacement during
     /// bridge compilation. Defaults to true for preamble.
     pub can_replace_guards: bool,
@@ -1528,6 +1536,7 @@ impl OptContext {
             potential_extra_ops: Vec::new(),
             active_short_preamble_producer: None,
             exported_short_boxes: Vec::new(),
+            exported_short_inputargs: Vec::new(),
 
             imported_virtuals: Vec::new(),
             imported_label_args: None,
@@ -2044,6 +2053,7 @@ impl OptContext {
             potential_extra_ops: Vec::new(),
             active_short_preamble_producer: None,
             exported_short_boxes: Vec::new(),
+            exported_short_inputargs: Vec::new(),
 
             imported_virtuals: Vec::new(),
             imported_label_args: None,
