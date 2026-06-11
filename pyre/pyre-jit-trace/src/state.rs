@@ -497,6 +497,18 @@ impl MetaInterpStaticData {
             !payload.is_skeleton(),
             "runtime-helper jitcode must be populated (identity pc_map) before registration"
         );
+        // Helper frames store jitcode byte offsets, not Python PCs, so
+        // `resume_jitcode_pc_for` must pass every offset through unchanged.
+        assert!(
+            payload.metadata.pc_map.len() == payload.jitcode.body().code.len()
+                && payload
+                    .metadata
+                    .pc_map
+                    .iter()
+                    .enumerate()
+                    .all(|(i, &pc)| pc == i),
+            "runtime-helper jitcode must carry an identity pc_map"
+        );
         let index = self.jitcodes.len() as i32;
         Self::stamp_payload_index(index, &payload);
         self.jitcodes.push(Box::new(JitCode {
@@ -11310,6 +11322,32 @@ pub unsafe fn int_strategy_preserves_identity(value: pyre_object::PyObjectRef) -
     unsafe { pyre_object::is_plain_int1(value) }
 }
 
+/// Test-only RAII guard: swap a `MetaInterpStaticData` into the
+/// thread-local `METAINTERP_SD` and restore the previous value on drop,
+/// so tests sharing a thread (`--test-threads=1`) do not observe each
+/// other's registrations.
+#[cfg(test)]
+pub(crate) struct MetainterpSdGuard {
+    prev: Option<MetaInterpStaticData>,
+}
+
+#[cfg(test)]
+impl MetainterpSdGuard {
+    pub(crate) fn swap(sd: MetaInterpStaticData) -> Self {
+        let prev = METAINTERP_SD.with(|slot| std::mem::replace(&mut *slot.borrow_mut(), sd));
+        Self { prev: Some(prev) }
+    }
+}
+
+#[cfg(test)]
+impl Drop for MetainterpSdGuard {
+    fn drop(&mut self) {
+        if let Some(prev) = self.prev.take() {
+            METAINTERP_SD.with(|slot| *slot.borrow_mut() = prev);
+        }
+    }
+}
+
 #[cfg(test)]
 mod indirectcalltargets_tests {
     //! Line-by-line parity tests for `pyjitpl.py:2248-2249` and
@@ -11318,7 +11356,7 @@ mod indirectcalltargets_tests {
     //! thread-local `METAINTERP_SD` singleton so concurrent callers
     //! (and unrelated tests that use the thread-local) do not alias.
     use super::{
-        METAINTERP_SD, MetaInterpStaticData, pyjitcode_for_jitcode_index,
+        MetaInterpStaticData, MetainterpSdGuard, pyjitcode_for_jitcode_index,
         raw_code_for_jitcode_index,
     };
     use majit_metainterp::jitcode::{JitCode, JitCodeBuilder};
@@ -11447,9 +11485,7 @@ mod indirectcalltargets_tests {
         let mut sd = MetaInterpStaticData::new();
         let (code, expected_raw) = make_code("x = 1\n");
         sd.set_jitcodes_from_make_result(vec![populated_pyjit(expected_raw, code)]);
-        METAINTERP_SD.with(|slot| {
-            *slot.borrow_mut() = sd;
-        });
+        let _sd_guard = MetainterpSdGuard::swap(sd);
 
         let hit = raw_code_for_jitcode_index(0).expect("jitcode index 0 must resolve");
         assert_eq!(hit, expected_raw);
@@ -11524,9 +11560,7 @@ mod indirectcalltargets_tests {
         );
 
         // The production resume lookup resolves the helper by index.
-        METAINTERP_SD.with(|slot| {
-            *slot.borrow_mut() = sd;
-        });
+        let _sd_guard = MetainterpSdGuard::swap(sd);
         let resolved = pyjitcode_for_jitcode_index(index)
             .expect("registered runtime helper must resolve by index");
         assert!(Arc::ptr_eq(&resolved, &payload));
@@ -11684,12 +11718,12 @@ mod indirectcalltargets_tests {
     #[test]
     fn ensure_list_append_resize_helper_index_is_stable_and_resolves() {
         use super::{
-            METAINTERP_SD, MetaInterpStaticData, ensure_list_append_resize_helper_index,
+            MetaInterpStaticData, MetainterpSdGuard, ensure_list_append_resize_helper_index,
             pyjitcode_for_jitcode_index,
         };
 
         // Isolate from any helper a prior test on this thread registered.
-        METAINTERP_SD.with(|slot| *slot.borrow_mut() = MetaInterpStaticData::new());
+        let _sd_guard = MetainterpSdGuard::swap(MetaInterpStaticData::new());
 
         let idx = ensure_list_append_resize_helper_index();
         assert_eq!(
@@ -11727,7 +11761,7 @@ pub struct ResumeFrameState {
 
 #[cfg(test)]
 mod finish_setup_tests {
-    use super::{METAINTERP_SD, MetaInterpStaticData, blackhole_control_opcodes};
+    use super::{MetaInterpStaticData, MetainterpSdGuard, blackhole_control_opcodes};
     use crate::assembler::publish_state;
 
     #[test]
@@ -11769,9 +11803,7 @@ mod finish_setup_tests {
         insns.insert("catch_exception/L".to_string(), 89u8);
         insns.insert("rvmprof_code/ii".to_string(), 91u8);
         sd.finish_setup_if_needed(&insns, Vec::new());
-        METAINTERP_SD.with(|slot| {
-            *slot.borrow_mut() = sd;
-        });
+        let _sd_guard = MetainterpSdGuard::swap(sd);
 
         assert_eq!(blackhole_control_opcodes(), (88, 89, 91));
     }
@@ -11781,9 +11813,7 @@ mod finish_setup_tests {
         let mut sd = MetaInterpStaticData::new();
         let empty: majit_ir::VecAssoc<String, u8> = majit_ir::VecAssoc::new();
         sd.finish_setup_if_needed(&empty, Vec::new());
-        METAINTERP_SD.with(|slot| {
-            *slot.borrow_mut() = sd;
-        });
+        let _sd_guard = MetainterpSdGuard::swap(sd);
 
         let mut insns = majit_ir::VecAssoc::new();
         insns.insert("live/".to_string(), 88u8);
