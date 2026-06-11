@@ -2083,11 +2083,17 @@ impl HostEnv {
         // "PY_NULL"]`, which Branch 3b resolves through this module.
         // Bind the attr to the canonical `core.ptr.null_mut` callable so
         // the read shares the null-pointer analyzer with spelled-out
-        // `null_mut()` callsites.
+        // `null_mut()` callsites.  Reuse the `core.ptr` attr instance —
+        // `BUILTIN_TYPER` is keyed by `HostObject` Arc identity
+        // (`rbuiltin.rs lookup_typer`), so a fresh
+        // `new_builtin_callable` with the same qualname would miss the
+        // registered typer.
         let pyre_object_pyobject = HostObject::new_module("pyre_object.pyobject");
         pyre_object_pyobject.module_set(
             "PY_NULL",
-            HostObject::new_builtin_callable("core.ptr.null_mut"),
+            core_ptr
+                .module_get("null_mut")
+                .expect("core.ptr.null_mut bound above"),
         );
 
         let mut mods = self.modules.lock().unwrap();

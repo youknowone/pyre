@@ -432,6 +432,13 @@ fn install_default_typers(map: &mut HashMap<HostObject, BuiltinTyperFn>) {
         ),
         // rbuiltin.py:744 — `@typer_for(weakref.ref)`
         ("weakref", "ref", rtype_weakref_create),
+        // `lltype.nullptr` analog for the Rust null-pointer builtins;
+        // same four spellings as the `ptr_null_constant` analyzer
+        // (annotator/builtin.rs).
+        ("core.ptr", "null_mut", rtype_ptr_null),
+        ("std.ptr", "null_mut", rtype_ptr_null),
+        ("core.ptr", "null", rtype_ptr_null),
+        ("std.ptr", "null", rtype_ptr_null),
     ];
     for (module_name, attr_name, typer) in module_entries {
         if let Some(host) = HOST_ENV
@@ -2847,6 +2854,27 @@ fn rtype_render_immortal(hop: &HighLevelOp, kwds_i: &HashMap<String, usize>) -> 
 /// Registration below mirrors upstream's
 /// `BUILTIN_TYPER` shape structurally; dispatch flips on once the
 /// M2.5g extern-Rust-helper walker lands.
+/// `std::ptr::null_mut::<T>()` / `null::<T>()` — the `lltype.nullptr`
+/// analog (rbuiltin.py:412-418) for the `{core,std}.ptr.{null_mut,null}`
+/// host builtins.  Upstream routes nullptr through `rtype_const_result`
+/// because its annotation is a constant SomePtr; the pyre analyzer
+/// (`ptr_null_constant`) instead returns a non-constant classdef-less
+/// `SomeInstance(can_be_None=True)` so the value stays joinable with
+/// typed receivers, and the null value is recovered here from the
+/// callable's definition: `convert_const(None)` on the result repr is
+/// `null_instance()` (rclass.py:474 `convert_const` None arm).
+fn rtype_ptr_null(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
+    use crate::flowspace::model::Hlvalue;
+
+    hop.exception_cannot_occur()?;
+    let r_result_borrow = hop.r_result.borrow();
+    let r_result = r_result_borrow
+        .as_ref()
+        .ok_or_else(|| TyperError::message("rtype_ptr_null: r_result missing".to_string()))?;
+    let c = crate::translator::rtyper::rmodel::inputconst(r_result.as_ref(), &ConstValue::None)?;
+    Ok(Some(Hlvalue::Constant(c)))
+}
+
 fn rtype_const_result(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
     use crate::flowspace::model::Hlvalue;
 
