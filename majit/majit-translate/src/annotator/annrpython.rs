@@ -1415,6 +1415,18 @@ impl RPythonAnnotator {
                 bkey,
             );
         }
+        // Prune the evicted blocks' pending rows too (the guard's Drop
+        // sweep can no longer see these keys in its `annotated` diff).
+        // The drain preceding this call normally leaves the queue
+        // empty, so this only matters when a blocked subject re-queued
+        // a block after its generation was processed.
+        {
+            let evicted: std::collections::HashSet<&BlockKey> = added_keys.iter().collect();
+            let mut pending = self.genpendingblocks.borrow_mut();
+            for g in pending.iter_mut() {
+                g.retain(|k, _| !evicted.contains(k));
+            }
+        }
         Err(err)
     }
 
@@ -2246,7 +2258,13 @@ impl RPythonAnnotator {
                 };
                 if is_same_as {
                     let arg = block.borrow().operations[i].args[0].clone();
-                    if let Some(s_arg) = self.annotation(&arg) {
+                    // `binding` (not `annotation`): an unbound operand
+                    // mid-block is upstream's `KeyError` raise
+                    // (`binding(op.args[0])`) — completing the op with
+                    // the result unbound would only move the same
+                    // failure onto the next reader of the result.
+                    let s_arg = self.binding(&arg);
+                    {
                         let mut blk = block.borrow_mut();
                         if let Hlvalue::Variable(v) = &mut blk.operations[i].result {
                             self.setbinding(v, s_arg);

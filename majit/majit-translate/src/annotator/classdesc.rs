@@ -259,6 +259,18 @@ thread_local! {
         map.insert("EnvironmentError".to_string(), env_error);
         map
     });
+
+    /// Keys written by [`register_struct_fields`] — the struct-derived
+    /// subset of [`FORCE_ATTRIBUTES_INTO_CLASSES`].  The dotted-qualname
+    /// projection in `_init_classdef`
+    /// (`struct_force_key_from_dotted_qualname`) may only land on these
+    /// rows: a constructor-minted spelling names a struct, never a
+    /// hand-coded exception entry, so without the gate a dotted
+    /// qualname whose leaf collides with a bare exception key (e.g.
+    /// `pkg.EnvironmentError` → `EnvironmentError`) would force the
+    /// exception attributes onto an unrelated class.
+    static STRUCT_FORCE_KEYS: std::cell::RefCell<std::collections::HashSet<String>> =
+        std::cell::RefCell::new(std::collections::HashSet::new());
 }
 
 /// Walker-time writer to [`FORCE_ATTRIBUTES_INTO_CLASSES`]: project a
@@ -272,6 +284,9 @@ thread_local! {
 /// replaces the prior field set.  Matches PyPy where re-assignment
 /// `FORCE_ATTRIBUTES_INTO_CLASSES[cls] = {...}` overwrites.
 pub fn register_struct_fields(qualname: &str, fields: &[(String, crate::model::ValueType)]) {
+    STRUCT_FORCE_KEYS.with(|cell| {
+        cell.borrow_mut().insert(qualname.to_string());
+    });
     FORCE_ATTRIBUTES_INTO_CLASSES.with(|cell| {
         let mut table = cell.borrow_mut();
         let entry = table.entry(qualname.to_string()).or_default();
@@ -1268,7 +1283,20 @@ impl ClassDesc {
                             None
                         }
                     })
-                    .or_else(|| dotted_key.as_deref().and_then(|k| table.get(k)))
+                    .or_else(|| {
+                        // The dotted projection names a struct row; gate
+                        // it on the struct-derived key set so a leaf
+                        // collision with a hand-coded exception entry
+                        // (`pkg.EnvironmentError` → `EnvironmentError`)
+                        // cannot force exception attributes onto an
+                        // unrelated constructor-minted class.
+                        dotted_key
+                            .as_deref()
+                            .filter(|k| {
+                                STRUCT_FORCE_KEYS.with(|s| s.borrow().contains(*k))
+                            })
+                            .and_then(|k| table.get(k))
+                    })
                     .cloned()
             });
         if let Some(overrides) = overrides {

@@ -1240,9 +1240,16 @@ pub fn std_ptr_eq(
 /// nullability bit.
 pub fn ptr_null_constant(
     _bk: &Rc<Bookkeeper>,
-    _args_s: &[Option<SomeValue>],
-    _kwds: &HashMap<String, Option<SomeValue>>,
+    args_s: &[Option<SomeValue>],
+    kwds: &HashMap<String, Option<SomeValue>>,
 ) -> Result<SomeValue, AnnotatorError> {
+    // `ptr::null()` / `ptr::null_mut()` are zero-arg; a call site
+    // carrying arguments is a malformed lowering, not a null constant.
+    if !args_s.is_empty() || !kwds.is_empty() {
+        return Err(AnnotatorError::new(
+            "ptr::null()/ptr::null_mut() take no arguments",
+        ));
+    }
     Ok(SomeValue::Instance(super::model::SomeInstance::new(
         None,
         true,
