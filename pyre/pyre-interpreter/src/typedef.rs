@@ -9319,8 +9319,8 @@ fn invalid_byte_2_of_4(ch1: u8, ch2: u8) -> bool {
 /// through and any other byte becomes a lone `0xDC00 + byte` surrogate.
 /// `surrogateescape` rescues every byte, so the decode never fails.
 pub(crate) fn charp2uni(data: &[u8]) -> PyObjectRef {
-    let decoded =
-        decode_utf8_with_errors(data, "surrogateescape").unwrap_or_else(|_| Wtf8Buf::new());
+    let decoded = decode_utf8_with_errors(data, "surrogateescape")
+        .expect("surrogateescape rescues every byte, so the decode never fails");
     pyre_object::w_str_from_wtf8(decoded)
 }
 

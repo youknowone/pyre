@@ -1075,7 +1075,9 @@ fn builtin_range(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             // Only `stop` given — `w_start, w_stop = 0, w_start`.
             w_stop = w_start;
             w_start = w_int_new(0);
+            pyre_object::gc_roots::pin_root(w_start);
             w_step = w_int_new(1);
+            pyre_object::gc_roots::pin_root(w_step);
         } else {
             w_stop = range_index_bound(args[1])?;
             pyre_object::gc_roots::pin_root(w_stop);
@@ -1089,6 +1091,7 @@ fn builtin_range(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
                 }
             } else {
                 w_step = w_int_new(1);
+                pyre_object::gc_roots::pin_root(w_step);
             }
         }
         Ok(pyre_object::w_range_new(w_start, w_stop, w_step))

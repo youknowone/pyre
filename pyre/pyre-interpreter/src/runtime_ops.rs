@@ -943,6 +943,9 @@ pub fn range_iter_continues(iter: PyObjectRef) -> Result<bool, PyError> {
         if is_range_iter(iter) {
             return Ok(w_range_iter_has_next(iter));
         }
+        if pyre_object::is_long_range_iter(iter) {
+            return Ok(pyre_object::w_long_range_iter_has_next(iter));
+        }
         if is_seq_iter(iter) {
             let si = &*(iter as *const W_SeqIterator);
             return Ok(si.index < si.length);
@@ -955,6 +958,9 @@ pub fn range_iter_next_or_null(iter: PyObjectRef) -> Result<PyObjectRef, PyError
     unsafe {
         if is_range_iter(iter) {
             return Ok(w_range_iter_next(iter).unwrap_or(PY_NULL));
+        }
+        if pyre_object::is_long_range_iter(iter) {
+            return Ok(pyre_object::w_long_range_iter_next(iter).unwrap_or(PY_NULL));
         }
         if is_seq_iter(iter) {
             let si = &mut *(iter as *mut W_SeqIterator);

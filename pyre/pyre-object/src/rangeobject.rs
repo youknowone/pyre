@@ -622,6 +622,17 @@ pub unsafe fn w_long_range_iter_len(obj: PyObjectRef) -> BigInt {
     }
 }
 
+/// Whether the long-range iterator has elements left — peek, non-mutating.
+///
+/// # Safety
+/// `obj` must point to a valid `W_LongRangeIterator`.
+pub unsafe fn w_long_range_iter_has_next(obj: PyObjectRef) -> bool {
+    unsafe {
+        let it = obj as *const W_LongRangeIterator;
+        BigInt::from((*it).index) < range_obj_to_bigint((*it).len)
+    }
+}
+
 /// Advance the long-range iterator and return the next value, or `None`
 /// once exhausted — `start + index * step`.
 ///
