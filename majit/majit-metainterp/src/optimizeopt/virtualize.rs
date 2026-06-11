@@ -87,8 +87,8 @@ const VREF_SIZE_DESCR_INDEX: u32 = 0x7F10;
 /// `VirtualizableFieldState`. This exists because pyre doesn't yet have
 /// RPython's `virtualizable_boxes` model in the metainterp.
 ///
-/// **Convergence path:** Port RPython's `virtualizable_boxes` model to
-/// pyre's tracing layer (`pyjitpl.rs`), then remove this tracker entirely.
+/// If pyre's tracing layer grows RPython's `virtualizable_boxes` model, this
+/// optimizer-side tracker should no longer be needed.
 pub(crate) struct VirtualizableTracker {
     config: VirtualizableConfig,
     needs_setup: bool,
@@ -2709,7 +2709,7 @@ mod tests {
 
     fn assign_positions(ops: &mut [Op]) {
         for (i, op) in ops.iter_mut().enumerate() {
-            // Slice P6a: type-tag op.pos so `opref_type` priority 0
+            // Type-tag op.pos so `opref_type` priority 0
             // (`opref.ty()`) resolves via the variant tag without
             // falling through to the inputarg-slot fallback (which
             // collides with low op-position raws).
@@ -2742,9 +2742,21 @@ mod tests {
     /// canonicalize explicitly before invoking the handler.
     fn resolve_op_args(op: &mut Op, ctx: &mut OptContext) {
         for i in 0..op.num_args() {
-            let canonical = ctx
-                .resolve_box_box_opt(&op.arg(i))
-                .unwrap_or_else(|| op.arg(i).clone());
+            // Mirror the production driver's `None` arm (optimizer.rs:3687):
+            // an unbound operand whose root is not a sentinel is minted and
+            // registered via `materialize_box_at`, then walked to its
+            // terminal — cloning the orig arg would skip canonicalization.
+            let canonical = match ctx.resolve_box_box_opt(&op.arg(i)) {
+                Some(b) => b,
+                None => {
+                    let argref = op.arg(i).to_opref();
+                    if argref.is_none() {
+                        op.arg(i).clone()
+                    } else {
+                        ctx.materialize_box_at(argref).get_box_replacement(false)
+                    }
+                }
+            };
             op.setarg(i, canonical);
         }
     }
