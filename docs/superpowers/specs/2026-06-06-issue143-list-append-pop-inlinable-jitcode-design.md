@@ -93,7 +93,7 @@ so `callable = NULL` is structurally impossible.
 
 ## Pyre after #121: "RPython" is Rust
 
-#121 replaced the JIT front-end with a **Charon-extracted MIR front-end**. The
+`#121` replaced the JIT front-end with a **Charon-extracted MIR front-end**. The
 build requires `build/llbc/{pyre-object,pyre-interpreter}.ullbc`, i.e. the
 majit-translate pipeline turns **Rust** (via Charon LLBC) into jitcodes. So
 pyre's "RPython" is Rust, and the metainterp inlines Rust helper calls by
@@ -111,6 +111,7 @@ Critically, the Rust list code is favorably structured:
   **not** `dyn`-trait dispatch (avoids the documented "no common base"
   trait-dispatch wall).
 - `object_push` has the exact hot/cold split PyPy traces:
+
   ```rust
   unsafe fn object_push(&mut self, value: PyObjectRef) {
       if self.length == self.object_items_capacity() {   // → resize GUARD
@@ -121,6 +122,7 @@ Critically, the Rust list code is favorably structured:
       self.length += 1;                                   // setfield len+1
   }
   ```
+
 - The IR `generated_list_append_by_strategy` hand-emits today is **byte-for-byte
   the IR real tracing into `w_list_append` would produce** — so the compiled
   fast-path trace is unchanged by going orthodox; only its *provenance* and the
