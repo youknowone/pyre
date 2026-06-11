@@ -2349,8 +2349,7 @@ fn build_class_inner(
                     )?
                 } else {
                     clear_call_error();
-                    let r =
-                        crate::call_function(prepare, &[pyre_object::w_str_new(name), bases]);
+                    let r = crate::call_function(prepare, &[pyre_object::w_str_new(name), bases]);
                     if r.is_null() {
                         // __prepare__ was found but raised during execution —
                         // propagate that exception rather than silently using

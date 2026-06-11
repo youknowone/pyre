@@ -213,7 +213,11 @@ unsafe fn memoryview_operand_values(obj: PyObjectRef) -> Option<Vec<i64>> {
         if unsafe { pyre_object::w_type_get_name(t) } == "memoryview" {
             let (data, itemsize, _) = unsafe { memoryview_data(obj) }.ok()?;
             let n = data.len() / itemsize;
-            return Some((0..n).map(|i| memoryview_unpack(&data, itemsize, i)).collect());
+            return Some(
+                (0..n)
+                    .map(|i| memoryview_unpack(&data, itemsize, i))
+                    .collect(),
+            );
         }
     }
     if unsafe { pyre_object::bytesobject::is_bytes_like(obj) } {

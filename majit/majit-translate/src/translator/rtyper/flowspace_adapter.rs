@@ -1304,10 +1304,11 @@ pub fn translate_op(
                         HostObject::new_class(name.clone(), Vec::new())
                     } else {
                         let qualname = format!("{}.{}", owner_path.join("."), name);
-                        call_registry.bookkeeper().intern_class_by_qualname(&qualname)
+                        call_registry
+                            .bookkeeper()
+                            .intern_class_by_qualname(&qualname)
                     };
-                    let callable =
-                        Hlvalue::Constant(Constant::new(ConstValue::HostObject(host)));
+                    let callable = Hlvalue::Constant(Constant::new(ConstValue::HostObject(host)));
                     let mut call_args = Vec::with_capacity(arg_hls.len() + 1);
                     call_args.push(callable);
                     call_args.extend(arg_hls);
@@ -3187,8 +3188,8 @@ mod tests {
                 result_ty: ValueType::Ref(None),
             },
         };
-        let translated = translate_op(&op, &value_map, &registry)
-            .expect("simple_call(<exc class>) must lower");
+        let translated =
+            translate_op(&op, &value_map, &registry).expect("simple_call(<exc class>) must lower");
         assert_eq!(translated.len(), 1);
         let Hlvalue::Constant(ref callable) = translated[0].args[0] else {
             panic!("simple_call callable must be a Constant");

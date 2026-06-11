@@ -517,8 +517,7 @@ fn derive_program_metadata(
                 // feeds the annotation-stage attr shell
                 // (`getuniqueclassdef_for_struct_root` pass 2), which
                 // RPython grows by generalization anyway.
-                let mut seen: std::collections::HashSet<String> =
-                    std::collections::HashSet::new();
+                let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
                 seen.insert("__discriminant".to_string());
                 let mut rows: Vec<(String, String)> =
                     vec![("__discriminant".to_string(), "i64".to_string())];

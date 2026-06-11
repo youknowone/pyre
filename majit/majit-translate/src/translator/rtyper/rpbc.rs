@@ -5737,9 +5737,7 @@ impl ClassesPBCRepr {
             // that is not append-safe (a fresh subclass of an
             // already-numbered class) stays unnumbered and skips below.
             let annotator = rtyper.annotator.upgrade().ok_or_else(|| {
-                TyperError::message(
-                    "ClassesPBCRepr.redispatch_call: annotator weak ref dropped",
-                )
+                TyperError::message("ClassesPBCRepr.redispatch_call: annotator weak ref dropped")
             })?;
             crate::translator::rtyper::normalizecalls::assign_inheritance_ids(&annotator);
             if classdef.borrow().minid.is_none() {

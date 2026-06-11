@@ -497,8 +497,10 @@ pub fn stack_check() -> Result<(), PyError> {
 /// (`warmstate.py:430`). The slowpath is invoked when the cached
 /// `stack_end` is stale so it can refresh, matching the two-step
 /// check/slowpath/re-check pattern upstream.
-#[inline]
-pub fn stack_almost_full() -> bool {
+// rstack.py:92 `stack_almost_full._jit_look_inside_ = False` — the
+// JIT never traces the budget arithmetic; calls residualize.
+#[majit_macros::dont_look_inside]
+pub extern "C" fn stack_almost_full() -> bool {
     // rstack.py:80 current = llop.stack_current(Signed)
     let current = current_sp();
     // rstack.py:81 end = _stack_get_end()

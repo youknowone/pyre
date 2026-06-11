@@ -7205,12 +7205,9 @@ fn init_object_type(ns: &mut DictStorage) {
             let (_, kwargs) = crate::builtins::split_builtin_kwargs(args);
             if let Some(kw) = kwargs {
                 let has_real_kw = unsafe {
-                    pyre_object::w_dict_items(kw)
-                        .into_iter()
-                        .any(|(k, _)| {
-                            pyre_object::is_str(k)
-                                && pyre_object::w_str_get_value(k) != "__pyre_kw__"
-                        })
+                    pyre_object::w_dict_items(kw).into_iter().any(|(k, _)| {
+                        pyre_object::is_str(k) && pyre_object::w_str_get_value(k) != "__pyre_kw__"
+                    })
                 };
                 if has_real_kw {
                     return Err(crate::PyError::type_error(

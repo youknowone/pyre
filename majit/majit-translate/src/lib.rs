@@ -1151,7 +1151,10 @@ fn analyze_pipeline_from_module_paths(
         if concrete_impl_counts.get(&key) != Some(&1) || default_trait_methods.contains(&key) {
             continue;
         }
-        let Some(graph) = mir_graph_lookup.lookup_impl_method(owner, method_name).cloned() else {
+        let Some(graph) = mir_graph_lookup
+            .lookup_impl_method(owner, method_name)
+            .cloned()
+        else {
             continue;
         };
         let graph = match return_type {

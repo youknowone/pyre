@@ -2345,7 +2345,10 @@ impl InstanceRepr {
     /// `allinstancefields` entry but `__class__` is skipped; a field
     /// that survives the skips needs default-value conversion that is
     /// deferred to a follow-up and surfaces here as an explicit error.
-    pub fn new_instance(self: &Arc<Self>, llops: &mut LowLevelOpList) -> Result<Hlvalue, TyperError> {
+    pub fn new_instance(
+        self: &Arc<Self>,
+        llops: &mut LowLevelOpList,
+    ) -> Result<Hlvalue, TyperError> {
         // upstream: `ctype = inputconst(Void, self.object_type)` — the
         // Void-typed type tag carrying the resolved object Struct lltype,
         // exactly as `TupleRepr::newtuple` encodes its malloc type arg.
@@ -2369,10 +2372,8 @@ impl InstanceRepr {
             Flavor::Gc => "flavor=gc",
             Flavor::Raw => "flavor=raw",
         };
-        let cflags = Constant::with_concretetype(
-            ConstValue::byte_str(flavor_sentinel),
-            LowLevelType::Void,
-        );
+        let cflags =
+            Constant::with_concretetype(ConstValue::byte_str(flavor_sentinel), LowLevelType::Void);
         // upstream: `vptr = llops.genop('malloc', vlist,
         //                              resulttype=Ptr(self.object_type))`.
         let vptr = llops

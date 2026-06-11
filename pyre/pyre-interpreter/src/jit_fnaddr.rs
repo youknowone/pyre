@@ -482,6 +482,18 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_object::ensure_object_subclass_ranges_initialized",
         pyre_object::pyobject::ensure_object_subclass_ranges_initialized as *const (),
     );
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::gc_hook::try_gc_write_barrier",
+        "pyre_object::try_gc_write_barrier",
+        pyre_object::gc_hook::try_gc_write_barrier as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
+        "pyre_interpreter::stack_check::stack_almost_full",
+        "pyre_interpreter::stack_almost_full",
+        crate::stack_check::stack_almost_full as *const (),
+    );
 
     // `@jit.elidable`-decorated inherent methods that show up as
     // `residual_call_*` in the codewriter (`call.py:181-187
@@ -966,6 +978,57 @@ pub fn jit_static_pytype_addrs() -> Vec<(&'static str, i64)> {
             specialisedtupleobject::SPECIALISED_TUPLE_OO_TYPE
         ),
         pytype_addr!("weakref::GC_WEAKREF_TYPE", weakref::GC_WEAKREF_TYPE),
+        // CELL_TYPE / SLICE_TYPE / RANGE_TYPE / RANGE_ITER_TYPE /
+        // SEQ_ITER_TYPE are deliberately absent: folding them lets
+        // previously-Skipped object-space graphs lift, and
+        // ArithmeticOpcodeHandler::compare_value then hits a fatal
+        // "UnionError in mergeinputargs: <other> ∪ <other>" (CELL_TYPE
+        // alone reproduces it).  Add them back once that union is
+        // resolved.
+        pytype_addr!("methodobject::METHOD_TYPE", methodobject::METHOD_TYPE),
+        pytype_addr!("memberobject::MEMBER_TYPE", memberobject::MEMBER_TYPE),
+        pytype_addr!(
+            "propertyobject::PROPERTY_TYPE",
+            propertyobject::PROPERTY_TYPE
+        ),
+        pytype_addr!(
+            "propertyobject::STATICMETHOD_TYPE",
+            propertyobject::STATICMETHOD_TYPE
+        ),
+        pytype_addr!(
+            "propertyobject::CLASSMETHOD_TYPE",
+            propertyobject::CLASSMETHOD_TYPE
+        ),
+        pytype_addr!(
+            "getsetproperty::GETSET_DESCRIPTOR_TYPE",
+            getsetproperty::GETSET_DESCRIPTOR_TYPE
+        ),
+        pytype_addr!(
+            "enumerateobject::ENUMERATE_TYPE",
+            enumerateobject::ENUMERATE_TYPE
+        ),
+        pytype_addr!(
+            "callableiteratorobject::CALLABLE_ITERATOR_TYPE",
+            callableiteratorobject::CALLABLE_ITERATOR_TYPE
+        ),
+        pytype_addr!("itertoolsmodule::COUNT_TYPE", itertoolsmodule::COUNT_TYPE),
+        pytype_addr!("itertoolsmodule::REPEAT_TYPE", itertoolsmodule::REPEAT_TYPE),
+        pytype_addr!(
+            "itertoolsmodule::TAKEWHILE_TYPE",
+            itertoolsmodule::TAKEWHILE_TYPE
+        ),
+        pytype_addr!(
+            "itertoolsmodule::DROPWHILE_TYPE",
+            itertoolsmodule::DROPWHILE_TYPE
+        ),
+        pytype_addr!(
+            "itertoolsmodule::FILTERFALSE_TYPE",
+            itertoolsmodule::FILTERFALSE_TYPE
+        ),
+        pytype_addr!(
+            "itertoolsmodule::PAIRWISE_TYPE",
+            itertoolsmodule::PAIRWISE_TYPE
+        ),
     ]
 }
 

@@ -280,8 +280,12 @@ pub fn clear_gc_write_barrier_hook() {
 }
 
 /// Run the active GC write barrier for `obj` when one is installed.
-#[inline]
-pub fn try_gc_write_barrier(obj: *mut u8) -> bool {
+// `dont_look_inside`: host hook dispatch (`thread_local!` `Cell`
+// indirection) stays opaque to the JIT — traces never look inside a
+// write barrier (the backend GC rewrite owns that concern); calls
+// residualize via the registered fnaddr.
+#[majit_macros::dont_look_inside]
+pub extern "C" fn try_gc_write_barrier(obj: *mut u8) -> bool {
     GC_WRITE_BARRIER_HOOK.with(|cell| match cell.get() {
         Some(f) => {
             f(obj);
