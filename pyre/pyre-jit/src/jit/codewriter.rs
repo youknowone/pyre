@@ -6615,6 +6615,19 @@ impl CodeWriter {
                             // previous sys_exc_info so `POP_EXCEPT` can restore it).
                             let _ = emit_popvalue_ref!(current_depth, py_pc);
                             let exc_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            // A bare handler entry (no recorded catch-site
+                            // FrameState, codewriter.rs:5427-5443) fills the
+                            // symbolic stack with null sentinels, so the popped
+                            // slot can be a `Constant` — illegal as an op result
+                            // and unpinnable.  Bind a fresh Variable instead:
+                            // the `last_exc_value` re-read below becomes its
+                            // sole producer, which IS the caught exception this
+                            // slot holds at runtime.
+                            let exc_value = if exc_value.as_variable().is_some() {
+                                exc_value
+                            } else {
+                                fresh_ref_value(&mut graph)
+                            };
                             // PUSH_EXC_INFO is pyre-specific (rustpython 3.11+;
                             // no PyPy counterpart).  In the canonical splice the
                             // popped exc `Variable` has no graph producer: the
