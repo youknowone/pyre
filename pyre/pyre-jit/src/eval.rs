@@ -8814,7 +8814,18 @@ while i < 40:
     s = add(s, compute(i))
     i = add(i, 1)";
         let code = pyre_interpreter::compile_exec(source).expect("compile failed");
-        let mut frame = PyFrame::new(code);
+        // Production shape (pyrex real_main): the frame carries an
+        // ExecutionContext and the TLS slot is seeded, so
+        // `getexecutioncontext().gettopframe()` is live during blackhole
+        // resume — `bh_call_fn_impl` resolves the parent frame from it
+        // when a guard deopt re-executes a `call_fn` residual.  A bare
+        // `PyFrame::new` frame is never entered onto the EC and trips
+        // the fail-fast topframe assert.
+        let execution_context = std::rc::Rc::new(pyre_interpreter::PyExecutionContext::default());
+        pyre_interpreter::call::set_last_exec_ctx(std::rc::Rc::as_ptr(&execution_context));
+        let mut frame =
+            pyre_interpreter::pyframe::PyFrame::new_with_context(code, execution_context)
+                .expect("frame construction failed");
         let _ = eval_with_jit(&mut frame);
         unsafe {
             let s = *(*frame_globals_storage(&frame)).get("s").unwrap();

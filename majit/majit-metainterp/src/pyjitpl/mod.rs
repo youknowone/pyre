@@ -6650,17 +6650,27 @@ impl<M: Clone> MetaInterp<M> {
         let mut inputargs: Vec<InputArg> = trace.inputargs_cloned();
         // Reconcile inputarg types with optimizer's post-unbox types.
         // Pyre starts tracing with Ref values (all Python objects), but
-        // the optimizer may unbox Int-typed locals. Read the first guard's
-        // fail_arg_types to discover the optimizer's type decisions, then
-        // update inputargs to match. This ensures gcmap and adapt-live
-        // agree on which slots are GC refs vs raw ints.
-        if let Some(first_guard_types) = optimized_ops
-            .iter()
-            .find(|op| op.opcode.is_guard())
-            .and_then(|op| op.with_fail_descr(|fd| fd.fail_arg_types().to_vec()))
-        {
-            for (i, ia) in inputargs.iter_mut().enumerate() {
-                if let Some(&tp) = first_guard_types.get(i) {
+        // the optimizer may unbox Int-typed locals. Guard fail_args carry
+        // the post-unbox box views; key the reconciliation on each box's
+        // own input-arg index. fail_args list snapshot live boxes, not
+        // inputargs, so slot i of fail_args generally names a different
+        // value than inputargs[i] — a positional zip corrupts the type of
+        // any inputarg whose fail_args slot happens to hold another box
+        // (and the backend then never binds the bank the snapshot
+        // references). This ensures gcmap and adapt-live agree on which
+        // slots are GC refs vs raw ints.
+        for op in optimized_ops.iter().filter(|op| op.opcode.is_guard()) {
+            let Some(fail_args) = op.getfailargs() else {
+                continue;
+            };
+            for fa in fail_args.iter() {
+                let (idx, tp) = match fa.to_opref() {
+                    OpRef::InputArgInt(i) => (i, Type::Int),
+                    OpRef::InputArgFloat(i) => (i, Type::Float),
+                    OpRef::InputArgRef(i) => (i, Type::Ref),
+                    _ => continue,
+                };
+                if let Some(ia) = inputargs.get_mut(idx as usize) {
                     ia.tp = tp;
                 }
             }
