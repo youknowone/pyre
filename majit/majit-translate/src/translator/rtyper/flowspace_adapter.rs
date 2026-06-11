@@ -1143,6 +1143,46 @@ pub fn translate_op(
                         })?;
                         return Ok(vec![FlowspaceOp::new("same_as", vec![arg], result)]);
                     }
+                    // `core::cmp` method spellings of upstream
+                    // operations: pyre source writes `a.min(b)` /
+                    // `a != b`-via-`PartialEq::ne` where upstream
+                    // Python writes `min(a, b)` / the flowspace
+                    // binary op `ne` (flowspace/operation.py
+                    // comparison table). front::mir records the
+                    // monomorphized core path when the call survives
+                    // as a trait-method call (primitive BinOps lower
+                    // to `OpKind::BinOp` and never reach here); map
+                    // the path back to the upstream spelling so the
+                    // chain reaches binaryop.py / rbuiltin.py instead
+                    // of failing FunctionPath resolution.
+                    if segments.len() >= 3 && segments[0] == "core" && segments[1] == "cmp" {
+                        let leaf = segments[segments.len() - 1].as_str();
+                        match leaf {
+                            "eq" | "ne" | "lt" | "le" | "gt" | "ge" if arg_hls.len() == 2 => {
+                                return Ok(vec![FlowspaceOp::new(leaf, arg_hls, result)]);
+                            }
+                            "min" | "max" if arg_hls.len() == 2 => {
+                                let builtin =
+                                    HOST_ENV.lookup_builtin(leaf).ok_or_else(|| {
+                                        TyperError::message(format!(
+                                            "builtin `{leaf}` missing from HOST_ENV"
+                                        ))
+                                    })?;
+                                let callable = Hlvalue::Constant(Constant::new(
+                                    ConstValue::HostObject(builtin),
+                                ));
+                                let mut call_args = Vec::with_capacity(arg_hls.len() + 1);
+                                call_args.push(callable);
+                                call_args.extend(arg_hls);
+                                return Ok(vec![FlowspaceOp::new(
+                                    "simple_call",
+                                    call_args,
+                                    result,
+                                )]);
+                            }
+                            _ => {}
+                        }
+                    }
                     let key =
                         crate::translator::rtyper::pyre_call_registry::FunctionPathKey::from_segments(
                             segments.iter().cloned(),

@@ -2750,6 +2750,8 @@ fn lowlevel_helper_graph(
     match name {
         "ll_check_chr" => lowlevel_range_check_helper_graph(name, args, result, 255),
         "ll_check_unichr" => lowlevel_range_check_helper_graph(name, args, result, 0x10ffff),
+        "ll_min" => lowlevel_min_max_helper_graph(name, args, result, false),
+        "ll_max" => lowlevel_min_max_helper_graph(name, args, result, true),
         "ll_int_abs_ovf" => lowlevel_int_min_unary_ovf_helper_graph(name, args, result, "int_abs"),
         "ll_int_neg_ovf" => lowlevel_int_min_unary_ovf_helper_graph(name, args, result, "int_neg"),
         "ll_int_lshift_ovf" => lowlevel_int_lshift_ovf_helper_graph(name, args, result),
@@ -3683,6 +3685,103 @@ fn lowlevel_range_check_helper_graph(
         Link::new(
             exc_args,
             Some(graph.exceptblock.clone()),
+            Some(constant_with_lltype(
+                ConstValue::Bool(false),
+                LowLevelType::Bool,
+            )),
+        )
+        .into_ref(),
+    ]);
+
+    let func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(graph, argnames, func))
+}
+
+/// RPython `ll_min` / `ll_max` (rbuiltin.py:240-243 / 252-255):
+///
+/// ```python
+/// def ll_min(i1, i2):
+///     if i1 < i2:
+///         return i1
+///     return i2
+///
+/// def ll_max(i1, i2):
+///     if i1 > i2:
+///         return i1
+///     return i2
+/// ```
+///
+/// Upstream's helper is polymorphic over the argument lltype (the
+/// rtyper specializes it per call shape via `gendirectcall`); the
+/// graph here picks the comparison opname from the lltype the
+/// `(name, args, result)` cache key carries.
+fn lowlevel_min_max_helper_graph(
+    name: &str,
+    args: &[LowLevelType],
+    result: &LowLevelType,
+    is_max: bool,
+) -> Result<PyGraph, TyperError> {
+    let llt = match args {
+        [a, b] if a == b && a == result => a.clone(),
+        _ => {
+            return Err(TyperError::message(format!(
+                "{name} expects (T, T) -> T, got ({args:?}) -> {result:?}"
+            )));
+        }
+    };
+    let cmp_op = match (&llt, is_max) {
+        (LowLevelType::Signed, false) => "int_lt",
+        (LowLevelType::Signed, true) => "int_gt",
+        (LowLevelType::Unsigned, false) => "uint_lt",
+        (LowLevelType::Unsigned, true) => "uint_gt",
+        (LowLevelType::Float, false) => "float_lt",
+        (LowLevelType::Float, true) => "float_gt",
+        _ => {
+            return Err(TyperError::message(format!(
+                "{name}: unsupported argument lltype {llt:?}"
+            )));
+        }
+    };
+
+    let argnames = vec!["arg0".to_string(), "arg1".to_string()];
+    let i1 = variable_with_lltype("arg0", llt.clone());
+    let i2 = variable_with_lltype("arg1", llt.clone());
+    let cond = variable_with_lltype("cond", LowLevelType::Bool);
+    let return_var = variable_with_lltype("result", llt);
+
+    let startblock = Block::shared(vec![
+        Hlvalue::Variable(i1.clone()),
+        Hlvalue::Variable(i2.clone()),
+    ]);
+    let mut graph = FunctionGraph::with_return_var(
+        name.to_string(),
+        startblock.clone(),
+        Hlvalue::Variable(return_var),
+    );
+
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        cmp_op,
+        vec![Hlvalue::Variable(i1.clone()), Hlvalue::Variable(i2.clone())],
+        Hlvalue::Variable(cond.clone()),
+    ));
+    startblock.borrow_mut().exitswitch = Some(Hlvalue::Variable(cond));
+    startblock.closeblock(vec![
+        Link::new(
+            vec![Hlvalue::Variable(i1)],
+            Some(graph.returnblock.clone()),
+            Some(constant_with_lltype(
+                ConstValue::Bool(true),
+                LowLevelType::Bool,
+            )),
+        )
+        .into_ref(),
+        Link::new(
+            vec![Hlvalue::Variable(i2)],
+            Some(graph.returnblock.clone()),
             Some(constant_with_lltype(
                 ConstValue::Bool(false),
                 LowLevelType::Bool,
