@@ -5074,7 +5074,23 @@ fn collect_outer_active_boxes(
                 None if stack_color_map.contains(&(color as u16))
                     || local_color_map.contains(&(color as u16)) =>
                 {
-                    OpRef::const_ptr(majit_ir::GcRef(0))
+                    // Splice block reordering can hoist an op (e.g. the
+                    // bumped-counter `int_add_ovf` result) ahead of the
+                    // `-live-` marker its consumer block resumes at; the
+                    // color is then live-in at the resume marker while the
+                    // static color→slot map still names a stack slot beyond
+                    // this pc's depth window.  The walk register bank holds
+                    // the actual live value — supply it (matching the trait
+                    // `get_list_of_active_boxes`'s direct `registers_r`
+                    // read) so the blackhole / bridge seeds the real box
+                    // instead of NULL-corrupting the slot it is stored to.
+                    // Only a genuinely never-written color (dead-beyond-
+                    // depth union slot of a shared marker) falls back to
+                    // CONST_NULL to keep the positional snapshot aligned.
+                    match regs_r.get(color).copied() {
+                        Some(v) if v != OpRef::NONE => v,
+                        _ => OpRef::const_ptr(majit_ir::GcRef(0)),
+                    }
                 }
                 _ => fallback(),
             }
@@ -5433,10 +5449,43 @@ fn fbw_terminate_with_finish(
 /// `resume_jitcode_pc_for`, used by the full-body walk to stamp a guard's
 /// snapshot with the Python opcode the blackhole resumes (and re-executes)
 /// at — matching the trait path's `orgpc` snapshot coordinate.
-fn python_pc_for_jitcode_pc(pc_map: &[usize], jit_pc: usize) -> u32 {
+fn python_pc_for_jitcode_pc(metadata: &crate::PyJitCodeMetadata, jit_pc: usize) -> u32 {
+    // Exact inverse: `first_jit_pc_by_py_pc[py]` is the byte offset of the
+    // FIRST instruction opcode `py` emitted (`usize::MAX` = the PC emitted
+    // no jitcode of its own), so the containing opcode is the largest `py`
+    // whose first offset is at-or-before `jit_pc`.  `pc_map` cannot serve
+    // here: it resolves each PC to its nearest `-live-` marker at-or-before
+    // (sparse markers, carry-forward repeats), so whole PC runs share one
+    // value and the inverse is ambiguous.
+    // A coordinate that lands exactly on a `-live-` marker is a block
+    // head (branch target / catch target, reached via
+    // `resolve_branch_target_through_trampoline`): it belongs to the
+    // FIRST Python opcode that resumes at that marker — the start of the
+    // carry-forward run in `pc_map` — not to the preceding opcode whose
+    // emitted region the marker byte happens to fall inside.  Real op
+    // positions never collide with marker positions (each byte belongs
+    // to exactly one instruction), so this test only fires for block
+    // heads.
+    if let Some(py) = metadata.pc_map.iter().position(|&m| m == jit_pc) {
+        return py as u32;
+    }
+    let first_jit = &metadata.first_jit_pc_by_py_pc;
+    if !first_jit.is_empty() {
+        let mut best: Option<(usize, u32)> = None;
+        for (py, &pos) in first_jit.iter().enumerate() {
+            if pos != usize::MAX && pos <= jit_pc && best.is_none_or(|(b, _)| pos >= b) {
+                best = Some((pos, py as u32));
+            }
+        }
+        if let Some((_, py)) = best {
+            return py;
+        }
+    }
+    // Fallback (portal-bridge / fixture installs without the table): the
+    // legacy nearest-`pc_map`-entry heuristic.
     let mut best_py = 0u32;
     let mut best_jc = 0usize;
-    for (py, &jc) in pc_map.iter().enumerate() {
+    for (py, &jc) in metadata.pc_map.iter().enumerate() {
         if jc <= jit_pc && jc >= best_jc {
             best_jc = jc;
             best_py = py as u32;
@@ -5488,21 +5537,41 @@ fn skip_python_trivia_forward(code: &pyre_interpreter::CodeObject, mut py_pc: us
 /// boundary) to the wrong Python opcode (the nearest preceding entry,
 /// e.g. `RETURN_VALUE`), so the guard resumes past its real target.
 ///
-/// Real py-boundary blocks begin with `live/` (or any non-`ref_copy`,
-/// non-`goto` op), so the scan terminates there.  The iteration bound is
-/// a safety valve against a malformed self-referential chain.
-fn resolve_branch_target_through_trampoline(code: &[u8], mut target: usize) -> usize {
-    for _ in 0..16 {
-        let Some(op) = decode_op_at(code, target) else {
-            return target;
+/// Trampolines themselves can carry `live/` markers (the bare block-head
+/// marker inserted after every Label), and a py-boundary block can start
+/// with a renaming prefix before its own `live/` marker
+/// (`live; ref_copy; live; <real op>` — the first `live` belongs to the
+/// link, the second to the destination opcode).  So "starts with `live/`"
+/// does NOT terminate the scan; instead the scan skips through `live` /
+/// `ref_copy`, follows `goto`, and returns the LAST `live` position seen
+/// before the first real op — that marker has the exact `pc_map` entry
+/// for the destination Python opcode.  Returning the outer block-head
+/// instead resolves through the first-emission table to whatever opcode
+/// the codewriter placed before the trampoline in jitcode order — an
+/// unrelated coordinate (e.g. a backedge `JumpBackward`), which makes a
+/// branch guard's bridge resume into the WRONG arm.  The iteration bound
+/// is a safety valve against a malformed self-referential chain.
+fn resolve_branch_target_through_trampoline(code: &[u8], target: usize) -> usize {
+    let mut pc = target;
+    let mut resume = target;
+    for _ in 0..32 {
+        let Some(op) = decode_op_at(code, pc) else {
+            return resume;
         };
         match op.opname {
-            "ref_copy" => target = op.next_pc,
-            "goto" => target = read_label(code, &op, 0),
-            _ => return target,
+            "live" => {
+                resume = pc;
+                pc = op.next_pc;
+            }
+            "ref_copy" => pc = op.next_pc,
+            "goto" => {
+                pc = read_label(code, &op, 0);
+                resume = pc;
+            }
+            _ => return resume,
         }
     }
-    target
+    resume
 }
 
 /// Full-body-walk operand-stack depth at a branch guard's resume target.
@@ -5541,7 +5610,7 @@ fn branch_resume_target_stack_depth(target: usize) -> Option<u16> {
             return None;
         }
         let code = &*jc.payload.code_ptr;
-        let py = python_pc_for_jitcode_pc(&jc.payload.metadata.pc_map, target) as usize;
+        let py = python_pc_for_jitcode_pc(&jc.payload.metadata, target) as usize;
         let py = skip_python_trivia_forward(code, py);
         crate::liveness::liveness_for(jc.payload.code_ptr)
             .depth_at_py_pc()
@@ -5734,7 +5803,7 @@ fn walker_capture_snapshot_for_last_guard_impl(
         if !sym.jitcode.is_null() {
             let (py_pc, jitcode_index, num_instrs) = unsafe {
                 let jc = &*sym.jitcode;
-                let mut py = python_pc_for_jitcode_pc(&jc.payload.metadata.pc_map, op_pc);
+                let mut py = python_pc_for_jitcode_pc(&jc.payload.metadata, op_pc);
                 // The inverse-`pc_map` can land on a Python trivia
                 // instruction's jitcode region (e.g. a branch target
                 // whose block lowers `NOT_TAKEN`).  A resume coordinate
@@ -6447,11 +6516,11 @@ fn try_walker_call_assembler_self_recursive(
     // Single positional argument.  The boxed return value lands in either
     // the Ref dst (`residual_call_r_r`, the boxed PyObject consumed by a
     // following BINARY_OP) or the Int dst (`residual_call_r_i`).
-    if (dst_bank != 'r' && dst_bank != 'i') || r_args.len() != 3 {
+    if (dst_bank != 'r' && dst_bank != 'i') || r_args.len() != 2 {
         return Ok(None);
     }
     let arg_concretes = read_ref_var_list_concrete(code, op, 1, ctx);
-    let ConcreteValue::Ref(callable) = arg_concretes[1] else {
+    let ConcreteValue::Ref(callable) = arg_concretes[0] else {
         return Ok(None);
     };
     if callable.is_null() {
@@ -6484,7 +6553,7 @@ fn try_walker_call_assembler_self_recursive(
     }
     // The single positional argument must be a boxed int at trace time
     // (`concrete_arg0 is_int`, `trace_opcode.rs:6148`).
-    let ConcreteValue::Ref(arg_obj) = arg_concretes[2] else {
+    let ConcreteValue::Ref(arg_obj) = arg_concretes[1] else {
         return Ok(None);
     };
     if arg_obj.is_null() || !unsafe { pyre_object::is_int(arg_obj) } {
@@ -6557,7 +6626,7 @@ fn try_walker_call_assembler_self_recursive(
 
     // Unbox the boxed int argument -> raw payload, re-boxed inside the new
     // callee frame.  Mirror of `trace_guarded_int_payload(args[0])`.
-    let raw_arg = walker_unbox_int(ctx, op.pc, r_args[2], int_type_addr)?;
+    let raw_arg = walker_unbox_int(ctx, op.pc, r_args[1], int_type_addr)?;
 
     // Execution-context red (`ensure_execution_context`,
     // `trace_opcode.rs:1078-1090`): the seeded `sym.execution_context`,
@@ -6649,7 +6718,9 @@ fn try_walker_call_assembler_self_recursive(
 ///   propagated as a trace abort (sound — aborts to the interpreter rather
 ///   than mixing inlined + residual emission).
 ///
-/// Arg layout (measured): `r_args = [ctx@0, callable@1, positional@2..]`.
+/// Arg layout: `r_args = [callable@0, positional@1..]` (the `call_fn`
+/// family carries no frame argument; the parent frame is resolved from
+/// the execution context inside `bh_call_fn_impl`).
 /// Only exact-positional, closure-free callees are inlined.  Guards inside a
 /// pure-leaf callee resume to the caller's CALL boundary via the inherited
 /// single-frame snapshot (`entry_py_pc` / `outer_active_boxes`), which is
@@ -6675,9 +6746,9 @@ fn try_walker_inline_user_call(
     // (flatten.rs builders, e.g. `build_residual_call_r_v_insn_from_operands`
     // -> StoreSubscr).  Without this guard `d[f] = v` with a 1-arg function
     // key `f` lowers to `residual_call_r_v(store_subscr_fn, [d, f, v])`, whose
-    // r_args[1] passes the function sniff below and is mis-inlined as `f(v)`,
+    // ref args pass the function sniff below and are mis-inlined as `f(v)`,
     // skipping the store.  `normalize_raise_varargs_fn` carries no
-    // `pyre_helper` either, but its r_args[1] is the raised exception object,
+    // `pyre_helper` either, but its ref arg is the raised exception object,
     // never a callable on any non-erroring path.  Upstream never inlines a
     // Python call at a residual_call site (inlinable calls get their own
     // inline_call jitcodes); this restores that invariant for the pyre FBW
@@ -6685,11 +6756,11 @@ fn try_walker_inline_user_call(
     if pyre_helper != majit_ir::PyreHelperKind::None {
         return Ok(None);
     }
-    if r_args.len() < 2 {
+    if r_args.is_empty() {
         return Ok(None);
     }
     let arg_concretes = read_ref_var_list_concrete(code, op, 1, ctx);
-    let ConcreteValue::Ref(callable) = arg_concretes[1] else {
+    let ConcreteValue::Ref(callable) = arg_concretes[0] else {
         return Ok(None);
     };
     if callable.is_null() {
@@ -6711,7 +6782,7 @@ fn try_walker_inline_user_call(
         let closure = pyre_interpreter::function_get_closure(callable);
         (w_code, (*raw).arg_count as usize, !closure.is_null())
     };
-    let nargs_passed = r_args.len() - 2;
+    let nargs_passed = r_args.len() - 1;
     // Only exact-positional, closure-free calls: every callee local [0..nparams]
     // is bound from a passed arg, none from defaults/varargs/cells.
     if has_closure || nargs_passed != nparams {
@@ -6790,7 +6861,7 @@ fn try_walker_inline_user_call(
     // CALL boundary (single outer Python frame — re-execute the whole
     // call on deopt), captured via `INLINE_SUBWALK_CAPTURE_BOUNDARY` for
     // the sub-walk guards below.
-    let callable_opref = r_args[1];
+    let callable_opref = r_args[0];
     let callable_expected = ctx.trace_ctx.const_ref(callable as usize as i64);
     if !callable_opref.is_constant() {
         ctx.trace_ctx
@@ -6805,11 +6876,26 @@ fn try_walker_inline_user_call(
         mut callee_concrete_r,
         mut callee_concrete_i,
     ) = allocate_callee_register_banks(&body, ctx.trace_ctx);
-    // Fast-path arg seeding: positional args land in `r0..nparams` with
-    // their concrete shadow (mirror of `dispatch_inline_call_dr_kind`).
+    // Fast-path arg seeding: positional args land in the callee's
+    // param registers with their concrete shadow (mirror of
+    // `dispatch_inline_call_dr_kind`).  The canonical splice regalloc does
+    // not pin local-i inputargs to identity colors, so the register the
+    // body reads param i from is `pyre_color_for_semantic_local[i]`, not
+    // `r{i}`; an empty map (portal-bridge install) is identity.
+    let param_colors = crate::state::sub_jitcode_param_colors_for_code(w_code);
     for i in 0..nparams {
-        callee_regs_r[i] = r_args[2 + i];
-        callee_concrete_r[i] = arg_concretes[2 + i];
+        let reg = match &param_colors {
+            Some(colors) if !colors.is_empty() => match colors.get(i) {
+                Some(&c) => c as usize,
+                None => return Ok(None),
+            },
+            _ => i,
+        };
+        if reg >= callee_regs_r.len() {
+            return Ok(None);
+        }
+        callee_regs_r[reg] = r_args[1 + i];
+        callee_concrete_r[reg] = arg_concretes[1 + i];
     }
 
     let callee_outcome = {
@@ -7867,7 +7953,12 @@ fn compare_box_provably_dead(ctx: &WalkContext<'_, '_>, compare_pc: usize, dst_r
     }
     // SAFETY: same contract as walker_capture_snapshot_for_last_guard_impl —
     // pointer live for the full-body walk, immutable layout fields only.
-    let (code, pc_map, jitcode_index, code_ptr): (&[u8], &[usize], i32, *const _) = unsafe {
+    let (code, metadata, jitcode_index, code_ptr): (
+        &[u8],
+        &crate::PyJitCodeMetadata,
+        i32,
+        *const _,
+    ) = unsafe {
         let sym = &*full_body_sym;
         if sym.jitcode.is_null() {
             return false;
@@ -7878,7 +7969,7 @@ fn compare_box_provably_dead(ctx: &WalkContext<'_, '_>, compare_pc: usize, dst_r
         }
         (
             jc.payload.jitcode.code.as_slice(),
-            jc.payload.metadata.pc_map.as_slice(),
+            &jc.payload.metadata,
             jc.index as i32,
             jc.payload.code_ptr,
         )
@@ -7976,7 +8067,7 @@ fn compare_box_provably_dead(ctx: &WalkContext<'_, '_>, compare_pc: usize, dst_r
     let code_obj = unsafe { &*code_ptr };
     let arm_dst_live = |jc_pc: usize| -> bool {
         let py =
-            skip_python_trivia_forward(code_obj, python_pc_for_jitcode_pc(pc_map, jc_pc) as usize);
+            skip_python_trivia_forward(code_obj, python_pc_for_jitcode_pc(metadata, jc_pc) as usize);
         let banks = crate::state::frame_liveness_reg_indices_by_bank_at(jitcode_index, py as i32);
         banks.ref_.iter().any(|&c| c as u8 == dst_reg)
     };
@@ -9108,13 +9199,15 @@ fn dispatch_residual_call_iIRFd_kind(
 /// `pyjitpl.py:98-119 MIFrame.copy_constants`.
 ///
 /// Also returns Ref- and Int-bank concrete shadows sized to match
-/// `registers_r` / `registers_i`.  Ref-bank constant slots seed
-/// `ConcreteValue::Null` (concrete propagation for the const pool
-/// would need a backing `PyObjectRef` materialisation that the
-/// sub-walk doesn't yet drive); Int-bank constant slots seed
-/// `ConcreteValue::Int(v)` directly from `body.constants_i` so a
-/// future `goto_if_not/iL` reading a constant input finds a non-Null
-/// concrete and can fold the branch.
+/// `registers_r` / `registers_i`.  Constant slots seed their concrete
+/// directly from the pools: `ConcreteValue::Int(v)` from
+/// `body.constants_i` (so a `goto_if_not/iL` reading a constant input
+/// can fold the branch) and `ConcreteValue::Ref(v)` from
+/// `body.constants_r` — a Ref constant's runtime value IS the pooled
+/// object pointer (kept alive by the jitcode), and the nested
+/// call-inline gate (`try_walker_inline_user_call`) reads the callable
+/// through this shadow when a callee body calls another function
+/// through its own baked const-pool callable.
 fn allocate_callee_register_banks(
     body: &SubJitCodeBody,
     trace_ctx: &mut TraceCtx,
@@ -9131,7 +9224,7 @@ fn allocate_callee_register_banks(
     let mut regs_r = vec![OpRef::NONE; total_r];
     let mut regs_i = vec![OpRef::NONE; total_i];
     let mut regs_f = vec![OpRef::NONE; total_f];
-    let concrete_r = vec![ConcreteValue::Null; total_r];
+    let mut concrete_r = vec![ConcreteValue::Null; total_r];
     let mut concrete_i = vec![ConcreteValue::Null; total_i];
     for (i, &v) in body.constants_i.iter().enumerate() {
         regs_i[body.num_regs_i + i] = trace_ctx.const_int(v);
@@ -9139,6 +9232,8 @@ fn allocate_callee_register_banks(
     }
     for (i, &v) in body.constants_r.iter().enumerate() {
         regs_r[body.num_regs_r + i] = trace_ctx.const_ref(v);
+        concrete_r[body.num_regs_r + i] =
+            ConcreteValue::Ref(v as usize as pyre_object::PyObjectRef);
     }
     for (i, &v) in body.constants_f.iter().enumerate() {
         regs_f[body.num_regs_f + i] = trace_ctx.const_float(v);
@@ -10806,6 +10901,21 @@ fn handle(
             // pyjitpl.py:2951 self.heapcache.reset()
             ctx.trace_ctx.heap_cache_mut().reset();
 
+            // `close_loop_args_at` (trace_opcode.rs:2933-2961) runs the
+            // merge-point vable sync BEFORE building the jump args: the
+            // vable `last_instr` scalar is overridden to `merge_pc - 1`
+            // (a resume into the target loop must re-enter at the header
+            // opcode) and the reds-only-label heap writeback is emitted.
+            // The walker must do the same before `append_virtualizable_
+            // boxes` below — otherwise the compile_trace arm's JUMP into
+            // the existing loop carries the LAST GUARD's published
+            // `last_instr` (e.g. 104 instead of header-1=86 on fannkuch),
+            // and any vable sync inside the target loop then stores that
+            // stale pc into the heap frame, resuming the interpreter at
+            // the wrong bytecode (fannkuch permutation state never
+            // reaches its exit condition → non-crashing infinite loop).
+            emit_intermediate_merge_point_writeback(ctx.trace_ctx, next_instr);
+
             // Reds = the live loop args, in bytecode bank order
             // [int.., ref.., float..]. For pyre's portal jitdriver the
             // reds are `[frame, ec]` (both Ref → rr), matching the
@@ -10839,6 +10949,43 @@ fn handle(
                 }
             }
             live_args = append_virtualizable_boxes(ctx.trace_ctx, live_args);
+
+            // pyjitpl.py:2934-2965 remove_consts_and_duplicates over the
+            // reds + virtualizable_boxes[:-1]: every live arg must be a
+            // distinct non-const box before it is registered as a merge
+            // point or matched for loop closure. A const or duplicate is
+            // replaced with a fresh `same_as` op, written back into the
+            // virtualizable shadow so subsequent reads/snapshots use the
+            // new identity (the in-place boxes[i] mutation upstream).
+            // Without this, the registered green_boxes carry the SAME
+            // OpRef at two positions and `cut_trace_from`'s remap maps
+            // both to the LAST position — every body/snapshot reference
+            // to the duplicated box then reads the wrong loop-carried
+            // slot (e.g. a local aliased by a dead stack entry reads the
+            // entry's NULL at every deopt).
+            {
+                use std::collections::HashSet;
+                let mut duplicates: HashSet<OpRef> = HashSet::new();
+                for i in 0..live_args.len() {
+                    let opref = live_args[i];
+                    if opref.is_constant() || !duplicates.insert(opref) {
+                        let tp = ctx
+                            .trace_ctx
+                            .get_opref_type(opref)
+                            .unwrap_or(majit_ir::Type::Ref);
+                        let same_as_op = majit_ir::OpCode::same_as_for_type(tp);
+                        let new_opref = ctx.trace_ctx.record_op(same_as_op, &[opref]);
+                        live_args[i] = new_opref;
+                        // live_args = [frame, ec, vable_boxes[0..len-1]];
+                        // frame/ec are first-occurrence runtime boxes and
+                        // never wrap, so only the vable payload mirrors
+                        // back (virtualizable_boxes[i] = op upstream).
+                        if i >= 2 {
+                            ctx.trace_ctx.set_virtualizable_box_at(i - 2, new_opref);
+                        }
+                    }
+                }
+            }
 
             if std::env::var("PYRE_DIAG_51C").is_ok() {
                 eprintln!(
@@ -10940,15 +11087,10 @@ fn handle(
                 // This merge point registers (does not close) — the walk
                 // crossed a loop-boundary that did not match the primary
                 // loop's green key, i.e. an enclosing or sibling loop whose
-                // header is `next_instr`.
-                //
-                // Emit the intermediate merge-point vable→heap writeback the
-                // trait runs unconditionally via `close_loop_args_at` before
-                // the register/close decision.  Without it the compiled body
-                // (notably a bridge re-entering this header) leaves the heap
-                // `PyFrame` `last_instr`/array at the trace seed, so a later
-                // guard-fail resume mis-reads it (#62 / #67-remaining).
-                emit_intermediate_merge_point_writeback(ctx.trace_ctx, next_instr);
+                // header is `next_instr`.  The intermediate merge-point
+                // vable→heap writeback (#62 / #67-remaining) already ran
+                // above, before the live-args build, mirroring
+                // `close_loop_args_at`'s ordering.
                 let green_boxes: Vec<majit_metainterp::GreenBox> = live_args
                     .iter()
                     .map(|opref| {
@@ -18812,15 +18954,29 @@ mod tests {
         assert_eq!(wc.trace_ctx.seen_loop_header_for_jdindex, -1);
 
         // Second stamped crossing (same key + red shape): closes the loop.
+        // The reds here are constants, so `remove_consts_and_duplicates`
+        // (pyjitpl.py:2934-2965) replaces each with a freshly recorded
+        // `same_as` op before the close — the jump args are runtime
+        // OpRefs wrapping the original const reds, not the consts.
         wc.trace_ctx.seen_loop_header_for_jdindex = 0;
         let (second, _) = step(&code, 0, &mut wc).expect("second jit_merge_point must dispatch");
-        assert_eq!(
-            second,
+        match second {
             DispatchOutcome::CloseLoop {
-                jump_args: vec![red0, red1],
-                loop_header_pc: 42,
+                jump_args,
+                loop_header_pc,
+            } => {
+                assert_eq!(loop_header_pc, 42);
+                assert_eq!(jump_args.len(), 2);
+                for arg in &jump_args {
+                    assert!(!arg.is_constant(), "const red must be same_as-wrapped");
+                    assert_eq!(
+                        wc.trace_ctx.get_opref_type(*arg),
+                        Some(majit_ir::Type::Ref)
+                    );
+                }
             }
-        );
+            other => panic!("expected CloseLoop, got {other:?}"),
+        }
     }
 
     /// `loop_header/i` stamps `seen_loop_header_for_jdindex` from its
