@@ -2108,6 +2108,10 @@ pub fn compute_load_method_bound(obj: PyObjectRef, attr: PyObjectRef, name: &str
                 Some(d) if pyre_object::is_type(d) => PY_NULL,
                 Some(d) if pyre_object::is_property(d) => PY_NULL,
                 Some(d) if pyre_object::is_member(d) => PY_NULL,
+                // Getset descriptors (`__class__`, `__dict__`, ...) are data
+                // descriptors: getattr already ran `__get__`, so the loaded
+                // value must not prepend self.
+                Some(d) if pyre_object::getsetproperty::is_getset_property(d) => PY_NULL,
                 Some(d) if crate::is_function(d) => {
                     let ob_type = (*d).ob_type;
                     if std::ptr::eq(ob_type, &crate::BUILTIN_FUNCTION_TYPE as *const _) {
