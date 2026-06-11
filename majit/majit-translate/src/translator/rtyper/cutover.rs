@@ -280,8 +280,11 @@ pub(crate) fn dual_gate_check(legacy_graph: &LegacyGraph) -> Result<(), String> 
         let real_kind = real_state.get(&idx).unwrap_or(&ConcreteType::Unknown);
         if real_kind != legacy_kind {
             divergences.push(format!(
-                "slot {}: legacy={:?}, real={:?}",
-                idx, legacy_kind, real_kind
+                "slot {} ({}): legacy={:?}, real={:?}",
+                idx,
+                divergence_slot_label(legacy_graph, idx),
+                legacy_kind,
+                real_kind
             ));
         }
     }
@@ -291,8 +294,11 @@ pub(crate) fn dual_gate_check(legacy_graph: &LegacyGraph) -> Result<(), String> 
         let legacy_kind = legacy_graph.concretetype_at(*idx);
         if legacy_kind == ConcreteType::Unknown {
             divergences.push(format!(
-                "slot {}: legacy={:?}, real={:?}",
-                idx, legacy_kind, real_kind
+                "slot {} ({}): legacy={:?}, real={:?}",
+                idx,
+                divergence_slot_label(legacy_graph, *idx),
+                legacy_kind,
+                real_kind
             ));
         }
     }
@@ -474,6 +480,30 @@ pub(crate) fn dual_gate_check_with_registry(
 /// Used by both [`dual_gate_check_with_registry`] and the
 /// [`dual_gate_check`] anchor-test helper to diff the real path against
 /// the legacy walker.
+/// Best-effort label for a diverging slot: the variable name plus the
+/// `OpKind` (or inputarg position) defining it.  Divergence messages
+/// name anonymous temps (`v2332`) -- without the defining op the
+/// report cannot be acted on short of a graph dump.  Runs only on the
+/// divergence path.
+fn divergence_slot_label(graph: &LegacyGraph, idx: usize) -> String {
+    let Some(var) = graph.variable_at(idx) else {
+        return "<no var>".to_string();
+    };
+    for block in graph.iter_blocks() {
+        for op in &block.operations {
+            if op.result.as_ref() == Some(var) {
+                let mut kind = format!("{:?}", op.kind);
+                kind.truncate(120);
+                return format!("{} <- {}", var.name(), kind);
+            }
+        }
+        if block.inputargs.iter().any(|ia| ia == var) {
+            return format!("{} <- inputarg of block {:?}", var.name(), block.id);
+        }
+    }
+    var.name()
+}
+
 fn project_value_to_var_to_map(
     value_to_var: &LegacyToTyped,
     constant_concretetypes: &HashMap<Variable, LowLevelType>,
@@ -524,8 +554,11 @@ fn compare_real_against_legacy(
         let real_kind = real_state.get(&idx).unwrap_or(&ConcreteType::Unknown);
         if real_kind != legacy_kind {
             return Some(format!(
-                "slot {}: legacy={:?}, real={:?}",
-                idx, legacy_kind, real_kind
+                "slot {} ({}): legacy={:?}, real={:?}",
+                idx,
+                divergence_slot_label(legacy_graph, idx),
+                legacy_kind,
+                real_kind
             ));
         }
     }
@@ -533,8 +566,11 @@ fn compare_real_against_legacy(
         let legacy_kind = legacy_graph.concretetype_at(*idx);
         if legacy_kind == ConcreteType::Unknown {
             return Some(format!(
-                "slot {}: legacy={:?}, real={:?}",
-                idx, legacy_kind, real_kind
+                "slot {} ({}): legacy={:?}, real={:?}",
+                idx,
+                divergence_slot_label(legacy_graph, *idx),
+                legacy_kind,
+                real_kind
             ));
         }
     }
