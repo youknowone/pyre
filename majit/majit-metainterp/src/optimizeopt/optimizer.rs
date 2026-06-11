@@ -2421,7 +2421,7 @@ impl Optimizer {
             let resolved_args: Vec<OpRef> = terminal_op
                 .getarglist()
                 .iter()
-                .map(|arg| ctx.get_replacement_opref(arg.to_opref()))
+                .map(|arg| ctx.resolve_box_box(arg).to_opref())
                 .collect();
             for &resolved in &resolved_args {
                 self.force_box_for_end_of_preamble(resolved, &mut ctx);
@@ -2433,7 +2433,7 @@ impl Optimizer {
             //   for i in range(op.numargs()): op.setarg(i, force_box(...))
             for i in 0..terminal_op.num_args() {
                 let arg = terminal_op.arg(i);
-                let resolved = ctx.get_replacement_opref(arg.to_opref());
+                let resolved = ctx.resolve_box_box(&arg).to_opref();
                 let expected_ref =
                     i < inputargs.len() && inputargs[i].ty() == Some(majit_ir::Type::Ref);
                 // setup_optimizations seeds `trace_inputargs` into
@@ -2594,7 +2594,7 @@ impl Optimizer {
                 .map(|v| v.iter().map(|b| b.to_opref()).collect())
                 .unwrap_or_else(|| {
                     jump.getarglist().iter()
-                        .map(|a| ctx.get_replacement_opref(a.to_opref()))
+                        .map(|a| ctx.resolve_box_box(a).to_opref())
                         .collect()
                 });
             let mut resolved_args = original_jump_args.clone();
@@ -4241,7 +4241,7 @@ impl Optimizer {
                             // (caught at pyjitpl/mod.rs:3454) on
                             // either invariant violation rather
                             // than silently coercing to 0.
-                            let boxindex = ctx.get_replacement_opref(pf_op.arg(1).to_opref());
+                            let boxindex = ctx.resolve_box_box(&pf_op.arg(1)).to_opref();
                             let idx = match ctx
                                 .get_box_replacement_box(boxindex)
                                 .and_then(|cb| cb.const_int())
