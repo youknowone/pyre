@@ -1090,7 +1090,7 @@ fn dispatch_rtype_is_(
     }
 }
 
-fn pair_repr_repr_rtype_is_(
+pub(crate) fn pair_repr_repr_rtype_is_(
     r1: &dyn Repr,
     r2: &dyn Repr,
     hop: &HighLevelOp,

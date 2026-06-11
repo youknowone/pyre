@@ -439,6 +439,9 @@ fn install_default_typers(map: &mut HashMap<HostObject, BuiltinTyperFn>) {
         ("std.ptr", "null_mut", rtype_ptr_null),
         ("core.ptr", "null", rtype_ptr_null),
         ("std.ptr", "null", rtype_ptr_null),
+        // `core.ptr` shares the `std.ptr` attr instance (model.rs), so
+        // one entry covers both spellings.
+        ("std.ptr", "eq", rtype_ptr_eq),
     ];
     for (module_name, attr_name, typer) in module_entries {
         if let Some(host) = HOST_ENV
@@ -2837,23 +2840,19 @@ fn rtype_render_immortal(hop: &HighLevelOp, kwds_i: &HashMap<String, usize>) -> 
     Ok(None)
 }
 
-/// RPython `@typer_for(lltype.typeOf)` / `@typer_for(lltype.nullptr)` /
-/// `@typer_for(lltype.getRuntimeTypeInfo)` / `@typer_for(lltype.Ptr)`
-/// (rbuiltin.py:412-418). Single shared body — the result annotation
-/// is constant by the time these typers fire, so the typed result is
-/// just `inputconst(r_result.lowleveltype, s_result.const)`.
-///
-/// ```python
-/// def rtype_const_result(hop):
-///     hop.exception_cannot_occur()
-///     return hop.inputconst(hop.r_result.lowleveltype, hop.s_result.const)
-/// ```
-///
-/// Note on dispatch reach: `front::mir` synthesises most `lltype.*`
-/// ops directly (no HostObject lookup on the production path).
-/// Registration below mirrors upstream's
-/// `BUILTIN_TYPER` shape structurally; dispatch flips on once the
-/// M2.5g extern-Rust-helper walker lands.
+/// `std::ptr::eq(a, b)` — the Rust spelling of `a is b` over wrapped
+/// objects (`baseobjspace::is_w`).  Identity comparison routes through
+/// the generic pointer `rtype_is_` body (rmodel.py:300-318
+/// `pair_repr_repr_rtype_is_`), which emits `ptr_eq` with a Bool
+/// result and constant-folds when the annotator proved the answer.
+fn rtype_ptr_eq(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
+    hop.exception_cannot_occur()?;
+    let r0 = arg_repr(hop, 0)?;
+    let r1 = arg_repr(hop, 1)?;
+    crate::translator::rtyper::pairtype::pair_repr_repr_rtype_is_(r0.as_ref(), r1.as_ref(), hop)
+        .map(Some)
+}
+
 /// `std::ptr::null_mut::<T>()` / `null::<T>()` — the `lltype.nullptr`
 /// analog (rbuiltin.py:412-418) for the `{core,std}.ptr.{null_mut,null}`
 /// host builtins.  Upstream routes nullptr through `rtype_const_result`
@@ -2875,6 +2874,23 @@ fn rtype_ptr_null(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeR
     Ok(Some(Hlvalue::Constant(c)))
 }
 
+/// RPython `@typer_for(lltype.typeOf)` / `@typer_for(lltype.nullptr)` /
+/// `@typer_for(lltype.getRuntimeTypeInfo)` / `@typer_for(lltype.Ptr)`
+/// (rbuiltin.py:412-418). Single shared body — the result annotation
+/// is constant by the time these typers fire, so the typed result is
+/// just `inputconst(r_result.lowleveltype, s_result.const)`.
+///
+/// ```python
+/// def rtype_const_result(hop):
+///     hop.exception_cannot_occur()
+///     return hop.inputconst(hop.r_result.lowleveltype, hop.s_result.const)
+/// ```
+///
+/// Note on dispatch reach: `front::mir` synthesises most `lltype.*`
+/// ops directly (no HostObject lookup on the production path).
+/// Registration below mirrors upstream's
+/// `BUILTIN_TYPER` shape structurally; dispatch flips on once the
+/// M2.5g extern-Rust-helper walker lands.
 fn rtype_const_result(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
     use crate::flowspace::model::Hlvalue;
 

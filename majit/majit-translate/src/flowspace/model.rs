@@ -2067,8 +2067,13 @@ impl HostEnv {
         // the call to the canonical `["core", "ptr", "eq"]` FunctionPath
         // (e.g. `py_type_check`'s `std::ptr::eq((*obj).ob_type, …)`).  Bind
         // the `core.ptr` spelling to the same `std.ptr.eq` callable so it
-        // reuses the existing `std_ptr_eq` analyzer.
-        core_ptr.module_set("eq", HostObject::new_builtin_callable("std.ptr.eq"));
+        // reuses the existing `std_ptr_eq` analyzer — the SAME instance,
+        // not a fresh same-qualname one: `BUILTIN_TYPER` is keyed by
+        // `HostObject` Arc identity.
+        core_ptr.module_set(
+            "eq",
+            std_ptr.module_get("eq").expect("std.ptr.eq bound above"),
+        );
         // `std.ptr` was already created above with `null_mut` / `eq` /
         // `copy_nonoverlapping`; extend that same module with `null`
         // instead of re-creating it.  A fresh `new_module` here would
