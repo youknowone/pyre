@@ -794,6 +794,15 @@ pub(crate) fn is_known_unported(msg: &str) -> bool {
         // carries a single annotated type.  Skip until
         // per-instantiation classdef specialization lands.
         || msg.contains("don't know how to convert from")
+        // Annotation-stage flavour of the convertvar entry above
+        // (`annrpython.py:432 mergeinputargs` → `UnionError`): two
+        // `SomeInstance`s with no common base meet at a block merge
+        // because pyre collapses every generic-ADT instantiation onto
+        // one classdef, so unrelated payload classes union at the phi.
+        // Upstream propagates the UnionError uncaught; the dual gate
+        // skips to the legacy walker until per-instantiation classdef
+        // specialization lands.
+        || msg.contains("cannot unify instances with no common base class")
         // `dyn Trait` dispatch still enters the real-rtyper flowspace
         // adapter as pyre's pre-rtyper `CallTarget::Indirect` shape in
         // some registry-prefill paths.  The production codewriter's
