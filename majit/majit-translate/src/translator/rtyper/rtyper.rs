@@ -7740,4 +7740,75 @@ mod tests {
             "setup_block_entry error must NOT be wrapped by gottypererror: {rendered}",
         );
     }
+
+    #[test]
+    fn min_max_helper_graph_picks_cmp_op_by_lltype() {
+        // rbuiltin.py:240-243 / 252-255 — `ll_min` / `ll_max` compare
+        // with the lltype-specific lt/gt op and return the winning arg
+        // on the true/false links.
+        for (llt, is_max, expected_op) in [
+            (LowLevelType::Signed, false, "int_lt"),
+            (LowLevelType::Signed, true, "int_gt"),
+            (LowLevelType::Unsigned, false, "uint_lt"),
+            (LowLevelType::Unsigned, true, "uint_gt"),
+            (LowLevelType::Float, false, "float_lt"),
+            (LowLevelType::Float, true, "float_gt"),
+        ] {
+            let name = if is_max { "ll_max" } else { "ll_min" };
+            let pygraph =
+                lowlevel_min_max_helper_graph(name, &[llt.clone(), llt.clone()], &llt, is_max)
+                    .unwrap_or_else(|e| panic!("{name}({llt:?}) must build: {e}"));
+            assert_eq!(
+                pygraph.signature.borrow().argnames,
+                vec!["arg0".to_string(), "arg1".to_string()],
+                "{name}({llt:?}) argnames"
+            );
+            let graph = pygraph.graph.borrow();
+            let start = graph.startblock.borrow();
+            assert_eq!(start.operations.len(), 1, "{name}({llt:?}) op count");
+            assert_eq!(
+                start.operations[0].opname, expected_op,
+                "{name}({llt:?}) cmp op"
+            );
+            assert_eq!(start.exits.len(), 2, "{name}({llt:?}) two return links");
+            for link in &start.exits {
+                let link = link.borrow();
+                assert!(
+                    link.target
+                        .as_ref()
+                        .is_some_and(|t| Rc::ptr_eq(t, &graph.returnblock)),
+                    "{name}({llt:?}) links must lead to returnblock"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn min_max_helper_graph_rejects_unsupported_and_mismatched_lltypes() {
+        // Bool has no lt/gt arm in the helper.
+        let err = lowlevel_min_max_helper_graph(
+            "ll_min",
+            &[LowLevelType::Bool, LowLevelType::Bool],
+            &LowLevelType::Bool,
+            false,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("unsupported argument lltype"),
+            "Bool must be rejected: {err}"
+        );
+        // (Signed, Float) -> Signed violates the (T, T) -> T cache-key
+        // contract.
+        let err = lowlevel_min_max_helper_graph(
+            "ll_max",
+            &[LowLevelType::Signed, LowLevelType::Float],
+            &LowLevelType::Signed,
+            true,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("expects (T, T) -> T"),
+            "mixed arg lltypes must be rejected: {err}"
+        );
+    }
 }

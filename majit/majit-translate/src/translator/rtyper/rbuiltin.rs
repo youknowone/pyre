@@ -3755,6 +3755,8 @@ mod tests {
             "unicode",
             "bytearray",
             "list",
+            "min",
+            "max",
             "hasattr",
         ] {
             let host = HOST_ENV
