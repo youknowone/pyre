@@ -273,8 +273,16 @@ pub(crate) fn dual_gate_check(legacy_graph: &LegacyGraph) -> Result<(), String> 
     // `FunctionGraph::set_concretetype_of_inline`, so the graph cells
     // carry the kind view this comparison reads.
     let legacy_snapshot = legacy_graph.concretetype_snapshot();
+    let reachable_vars = reachable_defined_vars(legacy_graph);
     for (idx, legacy_kind) in legacy_snapshot.iter().enumerate() {
         if *legacy_kind == ConcreteType::Unknown {
+            continue;
+        }
+        // Legacy-only slots: see `reachable_defined_vars`.
+        if !legacy_graph
+            .variable_at(idx)
+            .is_some_and(|v| reachable_vars.contains(v))
+        {
             continue;
         }
         let real_kind = real_state.get(&idx).unwrap_or(&ConcreteType::Unknown);
@@ -501,7 +509,70 @@ fn divergence_slot_label(graph: &LegacyGraph, idx: usize) -> String {
             return format!("{} <- inputarg of block {:?}", var.name(), block.id);
         }
     }
-    var.name()
+    // Not defined by any op or inputarg — report where it is *used*
+    // (exitswitch / outgoing Link.args), the only remaining places a
+    // slot-table variable can appear; an undefined-but-used variable
+    // is itself the diagnosis.
+    for block in graph.iter_blocks() {
+        if let Some(crate::model::ExitSwitch::Value(sw)) = &block.exitswitch
+            && sw == var
+        {
+            return format!(
+                "{} <- exitswitch of block {:?} (no def)",
+                var.name(),
+                block.id
+            );
+        }
+        for link in &block.exits {
+            if link
+                .args
+                .iter()
+                .any(|a| matches!(a, crate::model::LinkArg::Value(v) if v == var))
+            {
+                return format!(
+                    "{} <- Link.args out of block {:?} (no def)",
+                    var.name(),
+                    block.id
+                );
+            }
+        }
+    }
+    format!("{} (in no reachable block)", var.name())
+}
+
+/// Variables defined (inputarg or op result) in the reachable block
+/// closure (DFS from `startblock` over `Block.exits`).  The real path
+/// converts exactly this closure (flowspace `iterblocks()` parity —
+/// an unreachable block cannot exist upstream), while legacy
+/// `resolve_types` types every lowered block — including pruned
+/// `SwitchInt` abort-default arms and the orphan `set_raise`
+/// `[etype, evalue]` Link.args they carry.  A variable defined only
+/// outside the closure is legacy-only by construction; diffing it
+/// against the real path is a guaranteed false `real=Unknown`.
+fn reachable_defined_vars(graph: &LegacyGraph) -> std::collections::HashSet<Variable> {
+    let mut seen = std::collections::HashSet::new();
+    let mut stack = vec![graph.startblock];
+    let mut vars = std::collections::HashSet::new();
+    while let Some(bid) = stack.pop() {
+        if !seen.insert(bid.0) {
+            continue;
+        }
+        let Some(block) = graph.blocks.get(bid.0) else {
+            continue;
+        };
+        for ia in &block.inputargs {
+            vars.insert(ia.clone());
+        }
+        for op in &block.operations {
+            if let Some(r) = &op.result {
+                vars.insert(r.clone());
+            }
+        }
+        for link in &block.exits {
+            stack.push(link.target);
+        }
+    }
+    vars
 }
 
 fn project_value_to_var_to_map(
@@ -547,8 +618,16 @@ fn compare_real_against_legacy(
 ) -> Option<String> {
     let real_state = project_value_to_var_to_map(value_to_var, constants, legacy_graph);
     let legacy_snapshot = legacy_graph.concretetype_snapshot();
+    let reachable_vars = reachable_defined_vars(legacy_graph);
     for (idx, legacy_kind) in legacy_snapshot.iter().enumerate() {
         if *legacy_kind == ConcreteType::Unknown {
+            continue;
+        }
+        // Legacy-only slots: see `reachable_defined_vars`.
+        if !legacy_graph
+            .variable_at(idx)
+            .is_some_and(|v| reachable_vars.contains(v))
+        {
             continue;
         }
         let real_kind = real_state.get(&idx).unwrap_or(&ConcreteType::Unknown);
