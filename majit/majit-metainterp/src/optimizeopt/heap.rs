@@ -1077,48 +1077,39 @@ impl OptHeap {
     ///
     /// RPython heap.py: force_lazy_set → emit_extra(op, emit=False).
     ///
-    /// RPython parity: if the RHS value is virtual, do NOT emit the SetfieldGc.
-    /// Instead, add it to pendingfields for the guard's resume data
-    /// (heap.py:618-620). The virtual will be materialized at guard failure
-    /// time via rd_virtuals, and the pending setfield replayed after.
-    ///
-    /// `allow_force`: true for call-triggered force, false for JUMP/flush.
-    /// heap.py: cf.force_lazy_set(optheap, descr)
+    /// force_lazy_set (heap.py:122-145) emits unconditionally; the
+    /// virtual-rhs skip belongs only to force_lazy_sets_for_guard
+    /// (heap.py:610-639), which routes those ops to rd_pendingfields
+    /// before they ever reach this fn. A virtual rhs here is
+    /// materialized first, the way Optimizer._emit_operation forces
+    /// every emitted arg (optimizer.py:345-364 force_box).
     ///
     /// `get_rhs`: polymorphic RHS extractor matching
     /// `AbstractCachedEntry._get_rhs_from_set_op` (heap.py:169-170 /
     /// :300). `Self::field_get_rhs` → `op.arg(1)` for SETFIELD_GC;
     /// `Self::array_get_rhs` → `op.arg(2)` for SETARRAYITEM_GC.
-    ///
-    /// Emit a lazy SETFIELD_GC / SETARRAYITEM_GC. If the value is
-    /// virtual, return false (the caller should handle it via
-    /// pendingfields / rd_pendingfields).
-    fn emit_lazy_setfield(
-        op: &mut Op,
-        ctx: &mut OptContext,
-        _allow_force: bool,
-        get_rhs: fn(&Op) -> OpRef,
-    ) -> bool {
+    fn emit_lazy_setfield(op: &mut Op, ctx: &mut OptContext, get_rhs: fn(&Op) -> OpRef) {
         let rhs = get_rhs(op);
-        // heap.py:136: emit_extra(op, emit=False) re-processes through passes.
-        // Virtual values are skipped — handled by rd_pendingfields at guard
-        // time or dropped at JUMP.
-        let orig_is_virtual = ctx
-            .get_box_replacement_box(rhs)
-            .as_ref()
-            .map_or(false, |b| ctx.is_virtual(b));
-        if orig_is_virtual {
-            return false;
+        let resolved_box = ctx.get_box_replacement_box(rhs);
+        let rhs_is_virtual = resolved_box.as_ref().map_or(false, |b| ctx.is_virtual(b));
+        // Virtualizable exemption mirrors Optimizer::force_box: a
+        // virtualizable tracks an existing heap object, not a deferred
+        // allocation; forcing it would destroy the tracked field state.
+        if rhs_is_virtual
+            && !resolved_box
+                .as_ref()
+                .map_or(false, |b| ctx.is_virtualizable(b))
+        {
+            ctx.force_box_inline(rhs);
         }
 
-        // Non-virtual path: resolve forwarding and route after heap
+        // Resolve forwarding and route after heap
         // optimizer.py:651-652 setarg loop parity.
         for i in 0..op.num_args() {
             op.setarg(i, ctx.resolve_box_box(&op.arg(i)));
         }
         // heap.py:136: emit_extra(op, emit=False) → next_optimization
         ctx.emit_extra(ctx.current_pass_idx, op.clone());
-        true
     }
 
     /// heap.py:122-145: force_lazy_set → emit_extra(op, emit=False)
@@ -1227,7 +1218,11 @@ impl OptHeap {
         let mut pendingfields = Vec::new();
 
         // heap.py:610-621: iterate cached fields
-        // Collect all lazy sets from CachedFields.
+        // Collect lazy sets WITHOUT consuming them: a virtual-valued
+        // lazy set stays cached (heap.py:618-620 `continue` does not
+        // clear `_lazy_set`), so every later guard re-collects it into
+        // pendingfields and a later call/flush boundary still emits it.
+        // Only force_lazy_set — the non-virtual arm — clears it.
         let mut ordered_entries: Vec<_> = self
             .cached_fields
             .iter_mut()
@@ -1238,7 +1233,7 @@ impl OptHeap {
             .into_iter()
             .filter_map(|(field_idx, descr, cf)| {
                 cf.lazy_set
-                    .take()
+                    .clone()
                     .map(|(obj, op)| (field_idx, descr, obj, op))
             })
             .collect();
@@ -1251,7 +1246,7 @@ impl OptHeap {
                 continue;
             }
             // heap.py:621: cf.force_lazy_set(self, descr) →
-            // invalidate first, then emit_extra(op, emit=False),
+            // _lazy_set = None, invalidate, emit_extra(op, emit=False),
             // then put_field_back_to_info restores the cache.
             // optimizer.py:651-652 setarg loop parity.
             for i in 0..op.num_args() {
@@ -1261,6 +1256,7 @@ impl OptHeap {
             // heap.py:129,189-191: invalidate(descr) — purity self-gate
             // inside CachedField::invalidate (heap.py:189-194 parity).
             if let Some(cf) = self.get_cached_field_mut(&descr) {
+                cf.lazy_set = None;
                 cf.invalidate(&descr, ctx);
             }
             // heap.py:142-143 put_field_back_to_info needs the lazy_set Op
@@ -1289,7 +1285,7 @@ impl OptHeap {
                     .iter_mut()
                     .filter_map(move |(index, cai)| {
                         cai.lazy_set
-                            .take()
+                            .clone()
                             .map(|(obj, op)| (*descr_idx, *index, obj, op))
                     })
             })
@@ -1303,6 +1299,14 @@ impl OptHeap {
                 continue;
             }
 
+            // heap.py:635 cf.force_lazy_set(...): consume the lazy set
+            // (the non-virtual arm is what clears it).
+            if let Some(cai) = self
+                .get_cached_array_submap_mut(descr_idx)
+                .and_then(|s| s.const_get_mut(index))
+            {
+                cai.lazy_set = None;
+            }
             // optimizer.py:651-652 setarg loop parity.
             for i in 0..op.num_args() {
                 op.setarg(i, ctx.resolve_box_box(&op.arg(i)));
@@ -1980,7 +1984,7 @@ impl OptHeap {
                         }
                     }
                 }
-                Self::emit_lazy_setfield(&mut lazy_op, ctx, true, Self::field_get_rhs);
+                Self::emit_lazy_setfield(&mut lazy_op, ctx, Self::field_get_rhs);
                 // can_cache=True: put_field_back_to_info
                 let final_value = lazy_op.arg(1);
                 let lazy_descr = lazy_op.getdescr().unwrap().clone();
@@ -2260,7 +2264,7 @@ impl OptHeap {
                 }
                 // heap.py:135 optheap.emit_extra(op, emit=False)
                 let put_back_op = lazy_op.clone();
-                Self::emit_lazy_setfield(&mut lazy_op, ctx, true, Self::array_get_rhs);
+                Self::emit_lazy_setfield(&mut lazy_op, ctx, Self::array_get_rhs);
                 // heap.py:136-137 if not can_cache: return
                 if !can_cache {
                     return;
@@ -2405,7 +2409,7 @@ impl OptHeap {
                 }
                 // heap.py:135 optheap.emit_extra(op, emit=False)
                 let put_back_op = lazy_op.clone();
-                Self::emit_lazy_setfield(&mut lazy_op, ctx, true, Self::field_get_rhs);
+                Self::emit_lazy_setfield(&mut lazy_op, ctx, Self::field_get_rhs);
                 // heap.py:136-137 if not can_cache: return
                 if !can_cache {
                     return;
@@ -2529,7 +2533,7 @@ impl OptHeap {
                             }
                         }
                     }
-                    Self::emit_lazy_setfield(&mut lazy_op, ctx, true, Self::array_get_rhs);
+                    Self::emit_lazy_setfield(&mut lazy_op, ctx, Self::array_get_rhs);
                     // can_cache=True: put_field_back_to_info
                     let final_value = lazy_op.arg(2);
                     let descr = lazy_op.getdescr();

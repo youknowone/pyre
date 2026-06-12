@@ -5187,18 +5187,20 @@ mod tests {
     }
 
     #[test]
-    fn test_jump_drops_virtual_value_lazy_setfield() {
-        // RPython parity: at JUMP, lazy SetfieldGc with virtual value is
-        // DROPPED. heap.py emit_extra(op, emit=False) re-processes the op
-        // through passes → re-absorbed as lazy_set → lost. The virtual
-        // stays virtual and is carried across JUMP via imported heap cache.
+    fn test_jump_forces_virtual_value_lazy_setfield() {
+        // At the trace end, flush() forces all lazy sets (heap.py:392-398
+        // flush → force_all_lazy_sets). force_lazy_set (heap.py:122-145)
+        // re-sends the SetfieldGc with emit=False, which routes it past
+        // OptHeap through the rest of the chain — NOT back into the lazy
+        // cache — and the final emission forces boxes in its args
+        // (optimizer.py:345-364 _emit_operation force_box). A virtual
+        // stored into a non-virtual escapes: the New materializes and the
+        // store is emitted before the Jump.
         //
         // [p0]
         // p1 = new(descr=node)
         // setfield_gc(p0, p1, descr=next)
         // jump(p0)
-        //
-        // Result: only Jump (New is virtual, SetfieldGc is lazy → dropped).
         let node_sd = size_descr(1);
         let next_fd = ref_field_descr(11);
         let mut ops = vec![
@@ -5223,19 +5225,12 @@ mod tests {
         let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 1024);
 
-        // force_all_lazy_setfields re-sends the lazy SetfieldGc through the
-        // chain with emit=False (heap.py:136 force_lazy_set). SETFIELD_GC is
-        // in the earlyforce exempt set, so its virtual value is NOT forced —
-        // the New stays virtual and the store is re-absorbed (dropped). Only
-        // the Jump survives; the field relationship is carried across the JUMP
-        // via the imported heap cache.
-        let new_count = result.iter().filter(|op| op.opcode == OpCode::New).count();
-        assert_eq!(
-            new_count, 0,
-            "virtual New stored via lazy SetfieldGc stays virtual at Jump (SETFIELD_GC is earlyforce-exempt); got {result:?}"
-        );
         let opcodes: Vec<_> = result.iter().map(|op| op.opcode).collect();
-        assert_eq!(opcodes, vec![OpCode::Jump]);
+        assert_eq!(
+            opcodes,
+            vec![OpCode::New, OpCode::SetfieldGc, OpCode::Jump],
+            "virtual New stored into a non-virtual escapes at flush; got {result:?}"
+        );
     }
 
     // OptHeap's `force_from_effectinfo` path (heap.rs:2584) selectively
