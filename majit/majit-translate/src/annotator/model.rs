@@ -2737,9 +2737,24 @@ pub fn union(s1: &SomeValue, s2: &SomeValue) -> Result<SomeValue, UnionError> {
             )))
         }
 
-        // SomeBool ∪ SomeBool (different constants) — generalise to
-        // an unconstrained SomeBool. Upstream: `__union__(SomeBool, SomeBool)`.
-        (SomeValue::Bool(_), SomeValue::Bool(_)) => Ok(SomeValue::Bool(SomeBool::new())),
+        // pairtype(SomeBool, SomeBool).union() (binaryop.py:298-306):
+        // keep the constant only when both sides agree, and intersect
+        // knowntypedata when both sides carry it. Dropping the merged
+        // knowntypedata here would break `contains` (and hence
+        // `setbinding`) for refinement-carrying bools: union(new, old)
+        // must reproduce `new` when `new` generalises `old`.
+        (SomeValue::Bool(b1), SomeValue::Bool(b2)) => {
+            let mut s = SomeBool::new();
+            if let (Some(c1), Some(c2)) = (&b1.base.const_box, &b2.base.const_box) {
+                if c1.value == c2.value {
+                    s.base.const_box = Some(Constant::new(c1.value.clone()));
+                }
+            }
+            if let (Some(k1), Some(k2)) = (&b1.knowntypedata, &b2.knowntypedata) {
+                s.set_knowntypedata(merge_knowntypedata(k1, k2));
+            }
+            Ok(SomeValue::Bool(s))
+        }
 
         // SomeBool ↔ SomeInteger: bool is a subtype of int, so the
         // union widens to SomeInteger. Upstream:
@@ -4722,6 +4737,46 @@ mod tests {
         assert_eq!(merged[&true].len(), 1);
         assert!(merged[&true].contains_key(&x));
         assert!(!merged[&true].contains_key(&y));
+    }
+
+    #[test]
+    fn bool_union_merges_knowntypedata_and_agreeing_const() {
+        // binaryop.py:298-306. A refinement-carrying non-constant bool
+        // must contain a constant bool carrying the same refinement —
+        // union() has to reproduce the merged knowntypedata, not drop
+        // it, or setbinding's contains check fails on reflow.
+        let x = Rc::new(Variable::named("x"));
+        let mut ktd: KnownTypeData = std::collections::HashMap::new();
+        add_knowntypedata(
+            &mut ktd,
+            true,
+            &[Rc::clone(&x)],
+            SomeValue::Integer(SomeInteger::new(true, false)),
+        );
+        let mut general = SomeBool::new();
+        general.set_knowntypedata(ktd.clone());
+        let mut const_false = SomeBool::new();
+        const_false.base.const_box = Some(Constant::new(ConstValue::Bool(false)));
+        const_false.set_knowntypedata(ktd);
+        let general = SomeValue::Bool(general);
+        let const_false = SomeValue::Bool(const_false);
+
+        let u = union(&general, &const_false).unwrap();
+        assert_eq!(u, general, "disagreeing const drops, ktd survives");
+        assert!(general.contains(&const_false));
+
+        // Agreeing constants survive the union.
+        let u2 = union(&const_false, &const_false.clone()).unwrap();
+        match u2 {
+            SomeValue::Bool(b) => {
+                assert!(matches!(
+                    b.base.const_box.as_ref().map(|c| &c.value),
+                    Some(ConstValue::Bool(false))
+                ));
+                assert!(b.knowntypedata.is_some());
+            }
+            other => panic!("expected SomeBool, got {other:?}"),
+        }
     }
 
     #[test]
