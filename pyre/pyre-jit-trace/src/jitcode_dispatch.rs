@@ -11076,14 +11076,15 @@ fn handle(
             // the inner loop's green key so its specialized retrace can
             // never compile. Mirrors majit's `BC_JIT_MERGE_POINT` auto
             // loop-header + close protocol (`pyjitpl/dispatch.rs`).
+            // jdindex is the op's leading `c` byte (pyjitpl.py:1537
+            // `jdindex = ord(self.jitcode.code[orgpc+1])`).
+            let jdindex = code[op.pc + 1] as i8 as usize;
             if ctx.trace_ctx.seen_loop_header_for_jdindex < 0 {
                 // pyjitpl.py:1548 `if not any_operation: return`.
                 if ctx.trace_ctx.num_ops() == 0 {
                     return Ok((DispatchOutcome::Continue, op.next_pc));
                 }
-                // pyjitpl.py:1550 `if not jitdriver_sd.no_loop_header:` —
-                // jdindex is the op's leading `c` byte.
-                let jdindex = code[op.pc + 1] as i8 as usize;
+                // pyjitpl.py:1550 `if not jitdriver_sd.no_loop_header:`
                 let no_loop_header = ctx
                     .trace_ctx
                     .metainterp_sd()
@@ -11118,9 +11119,14 @@ fn handle(
                     }
                 }
                 // pyjitpl.py:1557: automatically add a loop_header.
+                ctx.trace_ctx.seen_loop_header_for_jdindex = jdindex as i32;
             }
-            // pyjitpl.py:1562 reset; the assert at :1559 is vacuous for
-            // pyre's single portal jitdriver.
+            // pyjitpl.py:1559-1562.
+            assert!(
+                ctx.trace_ctx.seen_loop_header_for_jdindex == jdindex as i32,
+                "found a loop_header for a JitDriver that does not match \
+                 the following jit_merge_point's"
+            );
             ctx.trace_ctx.seen_loop_header_for_jdindex = -1;
 
             // pyjitpl.py:2951 self.heapcache.reset()
