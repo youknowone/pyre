@@ -1925,15 +1925,15 @@ impl AbstractShortPreambleBuilderState {
     /// + guards to short), then appends preamble_op + result guards.
     /// Called by force_op_from_preamble (unroll.py:32).
     ///
-    /// RPython passes `preamble_op` directly (there is no lookup miss).
-    /// `all_produced` + `pos_to_key` are still needed to resolve dependency
-    /// args whose Phase-2 OpRefs differ from `produced_short_boxes` keys.
+    /// Dependency args carry the dep's replay op object (produce_arg
+    /// object-carry); a non-input, non-const arg whose bound op still
+    /// holds the builder's `set_forwarded` marker IS a short-box replay
+    /// op — append it and consume the marker (upstream
+    /// `arg.set_forwarded(None)`, shortpreamble.py:391-396).
     fn use_box(
         &mut self,
         preamble_op: &majit_ir::OpRc,
         already_in_short: &VecSet<OpRef>,
-        all_produced: &VecAssoc<OpRef, ProducedShortOp>,
-        pos_to_key: &VecAssoc<OpRef, OpRef>,
         arg_guards: &[Op],
         result_guards: &[Op],
     ) -> Op {
@@ -1945,33 +1945,34 @@ impl AbstractShortPreambleBuilderState {
         }
         // shortpreamble.py:383-396: iterate preamble_op args
         for arg in preamble_op.getarglist().iter() {
-            let arg = arg.to_opref();
-            if self.short_results.contains(&arg)
-                || already_in_short.contains(&arg)
-                || self.short_inputargs.iter().any(|a| a.to_opref() == arg)
-                || self.known_constants.contains(&arg)
+            let arg_opref = arg.to_opref();
+            if self.short_results.contains(&arg_opref)
+                || already_in_short.contains(&arg_opref)
+                || self
+                    .short_inputargs
+                    .iter()
+                    .any(|a| a.to_opref() == arg_opref)
+                || self.known_constants.contains(&arg_opref)
             {
                 continue;
             }
-            // shortpreamble.py:393: self.short.append(arg)
-            // Look up dep by key first, then by preamble_op.pos reverse index.
-            // In RPython, Box identity makes this lookup trivial. In majit,
-            // produce_arg returns preamble_op.pos which may differ from the
-            // produced_short_boxes key.
-            let dep = all_produced
-                .get(&arg)
-                .or_else(|| pos_to_key.get(&arg).and_then(|key| all_produced.get(key)));
-            if let Some(dep) = dep {
-                let dep_canonical = dep.preamble_op.pos.get();
-                if !self.short_results.contains(&dep_canonical)
-                    && !already_in_short.contains(&dep_canonical)
-                {
-                    self.short_results.insert(dep_canonical);
-                    self.short.push(dep.preamble_op.clone());
-                    if dep.preamble_op.opcode.is_ovf() {
-                        self.short
-                            .push(std::rc::Rc::new(Op::new(OpCode::GuardNoOverflow, &[])));
-                    }
+            // shortpreamble.py:390-396: `arg.get_forwarded() is None` →
+            // pass; otherwise append the arg (the dep replay op itself)
+            // and consume the marker.
+            let Some(dep) = arg.bound_op() else { continue };
+            if matches!(&*dep.forwarded.borrow(), crate::r#box::Forwarded::None) {
+                continue;
+            }
+            *dep.forwarded.borrow_mut() = crate::r#box::Forwarded::None;
+            let dep_canonical = dep.pos.get();
+            if !self.short_results.contains(&dep_canonical)
+                && !already_in_short.contains(&dep_canonical)
+            {
+                self.short_results.insert(dep_canonical);
+                self.short.push(dep.clone());
+                if dep.opcode.is_ovf() {
+                    self.short
+                        .push(std::rc::Rc::new(Op::new(OpCode::GuardNoOverflow, &[])));
                 }
             }
         }
@@ -1985,6 +1986,10 @@ impl AbstractShortPreambleBuilderState {
             self.short
                 .push(std::rc::Rc::new(Op::new(OpCode::GuardNoOverflow, &[])));
         }
+        // shortpreamble.py:401-402: `info = preamble_op.get_forwarded();
+        // preamble_op.set_forwarded(None)` — consume the own marker so a
+        // later consumer's arg walk doesn't re-append this op.
+        *preamble_op.forwarded.borrow_mut() = crate::r#box::Forwarded::None;
         // shortpreamble.py:405-406: info.make_guards(preamble_op, self.short, optimizer)
         self.short
             .extend(result_guards.iter().cloned().map(std::rc::Rc::new));
@@ -2089,6 +2094,19 @@ impl ShortPreambleBuilder {
     ) -> Self {
         let mut produced_short_boxes = VecAssoc::new();
         for (k, v) in short_boxes {
+            // shortpreamble.py:414-425: __init__ plants
+            // `preamble_op.set_forwarded(info)` on every replay op. The
+            // exported infos themselves are seeded through ctx position
+            // slots (`set_preamble_forwarded_info`), so the on-object
+            // marker is the empty_info analog: its presence tells
+            // `use_box` "this operand is a short-box replay op", and
+            // consuming it (`set_forwarded(None)`) is the dedup.
+            // `OpInfo::Unknown` never appears in exported infos
+            // (mod.rs guard), so the marker is unambiguous; Op::clone
+            // resets `forwarded`, so built ShortPreamble copies never
+            // carry it.
+            *v.preamble_op.forwarded.borrow_mut() =
+                crate::r#box::Forwarded::Info(crate::optimizeopt::info::OpInfo::Unknown);
             produced_short_boxes.insert(*k, v.clone());
         }
         // shortpreamble.py:430 `self.short_inputargs = short_inputargs` —
@@ -2170,15 +2188,8 @@ impl ShortPreambleBuilder {
         }
         #[cfg(not(debug_assertions))]
         let _ = source;
-        let pos_to_key = build_pos_to_key(&self.produced_short_boxes);
-        self.state.use_box(
-            preamble_op,
-            &VecSet::new(),
-            &self.produced_short_boxes,
-            &pos_to_key,
-            arg_guards,
-            result_guards,
-        );
+        self.state
+            .use_box(preamble_op, &VecSet::new(), arg_guards, result_guards);
     }
 
     pub fn produced_short_op(&self, result: OpRef) -> Option<ProducedShortOp> {

@@ -1976,9 +1976,21 @@ pub(crate) fn patch_new_loop_to_load_virtualizable_fields(
             .expect("VirtualizableInfo.array_descrs must cover every array_field");
         let array_info = &vinfo.array_fields[ai];
         let (item_opcode, item_descr, item_base) = match array_info.item_type {
-            Type::Int => (OpCode::GetarrayitemGcI, array_descr.clone(), array_box.clone()),
-            Type::Ref => (OpCode::GetarrayitemGcR, array_descr.clone(), array_box.clone()),
-            Type::Float => (OpCode::GetarrayitemGcF, array_descr.clone(), array_box.clone()),
+            Type::Int => (
+                OpCode::GetarrayitemGcI,
+                array_descr.clone(),
+                array_box.clone(),
+            ),
+            Type::Ref => (
+                OpCode::GetarrayitemGcR,
+                array_descr.clone(),
+                array_box.clone(),
+            ),
+            Type::Float => (
+                OpCode::GetarrayitemGcF,
+                array_descr.clone(),
+                array_box.clone(),
+            ),
             Type::Void => panic!("virtualizable array {ai} has Void item_type"),
         };
         let (item_opcode, item_descr, item_base) = match array_info.storage {
@@ -2416,8 +2428,7 @@ pub fn compile_tmp_callback(
     // inline, carried directly on the OpRef variant.
     let funcbox_ref = OpRef::const_int(jitdriver_sd.portal_runner_adr);
     // Green boxes follow in declaration order.
-    let mut callargs_box: Vec<BoxRef> =
-        Vec::with_capacity(1 + greenboxes.len() + inputargs.len());
+    let mut callargs_box: Vec<BoxRef> = Vec::with_capacity(1 + greenboxes.len() + inputargs.len());
     callargs_box.push(BoxRef::from_opref(funcbox_ref));
     for gb in greenboxes.iter() {
         // history.py:227/268/314 Const{Int,Float,Ptr}.value inline.
@@ -2456,11 +2467,7 @@ pub fn compile_tmp_callback(
     let call_opcode = OpCode::call_for_type(jitdriver_sd.result_type);
     // `compile.py:1132` `call_op = ResOperation(opnum, callargs,
     // descr=jd.portal_calldescr)`.
-    let call_op = std::rc::Rc::new(Op::with_descr(
-        call_opcode,
-        &callargs_box,
-        portal_calldescr,
-    ));
+    let call_op = std::rc::Rc::new(Op::with_descr(call_opcode, &callargs_box, portal_calldescr));
     //
     // `compile.py:1133-1136` `if call_op.type != 'v': finishargs = [call_op]
     // else: finishargs = []`.

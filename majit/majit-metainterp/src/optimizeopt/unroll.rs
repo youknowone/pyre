@@ -3721,8 +3721,7 @@ impl OptUnroll {
                                 "non-guard short-preamble op carried fail_args: {:?}",
                                 new_op.opcode
                             );
-                            *arg =
-                                majit_ir::operand::Operand::Box(ctx.materialize_box_at(mapped));
+                            *arg = majit_ir::operand::Operand::Box(ctx.materialize_box_at(mapped));
                         }
                     }
                 }

@@ -2909,6 +2909,29 @@ impl OptContext {
                     crate::optimizeopt::ImportedShortPureArg::Const(_, r) => r,
                 })
             };
+        // shortpreamble.py:283-296 produce_arg object-carry: a dependency
+        // arg is the dep's replay op OBJECT (upstream returns
+        // `produced_short_boxes[op].preamble_op`). Bind dep args to the
+        // dep entry's replay Rc (the same dual-key dict the builder will
+        // hold — last insert wins, matching VecAssoc overwrite), so
+        // `use_box` reads deps off the operand binding instead of a
+        // position-keyed side map. Slot / Const args keep the positional
+        // materialization.
+        let dep_or_materialize =
+            |ctx: &mut Self, produced: &[(OpRef, ProducedShortOp)], r: OpRef| {
+                // shortpreamble.py:288 Const arm: the arg is the Const box
+                // itself — a const-folded entry carries an inline-Const
+                // pos/key, which must not bind to the replay op.
+                if r.is_constant() {
+                    return ctx.materialize_box_at(r);
+                }
+                produced
+                    .iter()
+                    .rev()
+                    .find(|(k, _)| *k == r)
+                    .map(|(_, dep)| crate::r#box::BoxRef::from_bound_op(&dep.preamble_op))
+                    .unwrap_or_else(|| ctx.materialize_box_at(r))
+            };
 
         for (source, produced_op) in short_boxes {
             // Some ProducedShortOps (PreambleOpKind::Heap with non-getfield /
@@ -2934,7 +2957,7 @@ impl OptContext {
                     }
                     let resolved_arg_boxes: Vec<crate::r#box::BoxRef> = resolved_args
                         .iter()
-                        .map(|a| self.materialize_box_at(*a))
+                        .map(|a| dep_or_materialize(self, &produced, *a))
                         .collect();
                     let mut op = Op::new(
                         pure_call_opcode(produced_op.preamble_op.opcode),
@@ -2981,7 +3004,8 @@ impl OptContext {
                                 majit_ir::Type::Float => OpCode::GetfieldGcF,
                                 majit_ir::Type::Void => return false,
                             };
-                            let mut op = Op::new(opcode, &[self.materialize_box_at(obj)]);
+                            let obj_b = dep_or_materialize(self, &produced, obj);
+                            let mut op = Op::new(opcode, &[obj_b]);
                             op.pos.set(replay_pos(*source, produced_op));
                             op.setdescr(descr);
                             let res = self.materialize_box_at(op.pos.get());
@@ -3019,8 +3043,8 @@ impl OptContext {
                                 Some(r) => r,
                                 None => return false,
                             };
-                            let obj_b = self.materialize_box_at(obj);
-                            let index_b = self.materialize_box_at(index_opref);
+                            let obj_b = dep_or_materialize(self, &produced, obj);
+                            let index_b = dep_or_materialize(self, &produced, index_opref);
                             let mut op = Op::new(opcode, &[obj_b, index_b]);
                             op.pos.set(replay_pos(*source, produced_op));
                             op.setdescr(descr);
@@ -3058,10 +3082,8 @@ impl OptContext {
                     {
                         return false;
                     }
-                    let mut op = Op::new(
-                        loop_invariant_opcode(result_type),
-                        &[self.materialize_box_at(func_opref)],
-                    );
+                    let func_b = dep_or_materialize(self, &produced, func_opref);
+                    let mut op = Op::new(loop_invariant_opcode(result_type), &[func_b]);
                     op.pos.set(replay_pos(*source, produced_op));
                     let res = self.materialize_box_at(op.pos.get());
                     let new_pop = ProducedShortOp {
