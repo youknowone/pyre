@@ -1193,6 +1193,46 @@ pub(crate) fn populate_call_registry_from_call_graphs(
             }
         }
     }
+    // Pass 3 — make impl methods visible in their owner's class dict.
+    // RPython's ClassDesc reads methods straight off the class object
+    // (`classdesc.py:808-817 find_source_for` → `cls.__dict__[name]`):
+    // a Python class object already carries its functions as members
+    // when annotation starts.  Pyre's struct-root class objects are
+    // minted with no members (`Bookkeeper::intern_class_by_qualname`),
+    // so a receiver method call — `CallTarget::Method` lowers to
+    // `getattr(recv, name)` + `simple_call`
+    // (`flowspace_adapter.rs:1357`) — found no attribute source and
+    // blocked.  Registering each `[owner, method]` registry entry's
+    // user-function HostObject as a class member completes the
+    // analogue: `find_source_for` imports it into the classdict as a
+    // Constant, and `s_get_value` binds it under the classdef
+    // (`bind_callables_under` → MethodDesc) whose `cachedgraph` hits
+    // the pass-2 prefill.  Owner names are gated on the struct-field
+    // registry (module and trait leaves are never type roots), and a
+    // same-named instance field wins — a function source for a field
+    // attribute would union-conflict in `generalize_attr`.
+    let bk = registry.bookkeeper();
+    for (key, _graph, entry) in &pending {
+        // `CallPath::for_impl_method` splits the module-qualified owner
+        // ("pyframe::PyFrame" → [pyframe, PyFrame, method]), so the
+        // owner is the second-to-last segment.  Free-function paths
+        // ([module, foo]) put a module there, and modules are never
+        // type roots — the struct-field-registry gate filters them.
+        let segs = key.segments();
+        let [.., owner, method] = segs else {
+            continue;
+        };
+        if !bk.is_pyre_struct_root(owner) || bk.pyre_struct_root_has_field(owner, method) {
+            continue;
+        }
+        let class_host = bk.intern_class_by_qualname(owner);
+        if class_host.class_get(method).is_none() {
+            class_host.class_set(
+                method.clone(),
+                crate::flowspace::model::ConstValue::HostObject(entry.host_object.clone()),
+            );
+        }
+    }
     Ok(())
 }
 

@@ -1779,6 +1779,33 @@ impl Bookkeeper {
         host
     }
 
+    /// True when `name` is a type-root key in the snapshot
+    /// struct-field registry ([`Self::pyre_struct_fields`]).  Enums and
+    /// structs both register under their qualified path AND bare leaf
+    /// (`front/mir.rs` `TypeDeclKind::Enum` / `Struct` arms), so a
+    /// ctor's `owner_path` last segment answers true exactly when the
+    /// owner is itself an ADT (an enum-variant ctor) rather than a
+    /// module (a struct ctor).
+    pub fn is_pyre_struct_root(&self, name: &str) -> bool {
+        self.pyre_struct_fields
+            .borrow()
+            .as_ref()
+            .is_some_and(|reg| reg.fields.contains_key(name))
+    }
+
+    /// True when type-root `root`'s registry rows include a field named
+    /// `name`.  The cutover's class-dict method population consults this
+    /// so a method member never shadows a same-named instance field — a
+    /// function source for a field attribute would union-conflict in
+    /// `generalize_attr`.
+    pub fn pyre_struct_root_has_field(&self, root: &str, name: &str) -> bool {
+        self.pyre_struct_fields.borrow().as_ref().is_some_and(|reg| {
+            reg.fields
+                .get(root)
+                .is_some_and(|rows| rows.iter().any(|(field, _)| field == name))
+        })
+    }
+
     /// TODO: no upstream equivalent.  Project a Rust type
     /// string (`"Vec<i32>"`, `"Option<PyFrame>"`, `"HashMap<String,
     /// Box<W_Obj>>"`, …) into a `SomeValue` matching what RPython
