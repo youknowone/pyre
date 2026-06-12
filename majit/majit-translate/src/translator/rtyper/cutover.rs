@@ -954,6 +954,21 @@ pub(crate) fn is_known_unported(msg: &str) -> bool {
         // a divergence.  Skip to the legacy walker until the pair is
         // ported.
         || msg.contains("no upstream pair(s1, s2).union() handler in current subset")
+        // `InstanceRepr.getfield` walking the `rbase` chain before the
+        // repr's deferred `setup()` ran (upstream drains pending
+        // setups via `call_all_setups`, rtyper.py:198, after every
+        // specialized block; pyre's per-subject dual-gate can reach a
+        // getfield on a freshly minted inner repr first).  Skip until
+        // the setup-ordering port lands.
+        || msg.contains("rbase missing")
+        // `rpbc` calltable row lookup miss at rtype time — the
+        // method-PBC came from the struct-root class-dict seeding
+        // (`seed_struct_root_method_members`), whose `simple_call`
+        // sites do not yet register call shapes into the CallFamily
+        // the way `bookkeeper.pbc_call` does for ordinary descs
+        // (pbc_call → getcallfamily row, bookkeeper.py:553-571).
+        // Skip until the seeded-method family registration lands.
+        || msg.contains("calltable row not found in CallFamily")
         // `rmodel.py:311 rtype_is_` — an `is` (pointer-identity)
         // comparison where one side is not a pointer repr.  The
         // production hitter is `py_type_check`'s `(*obj).ob_type ==
