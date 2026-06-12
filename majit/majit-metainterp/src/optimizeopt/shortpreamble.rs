@@ -456,7 +456,11 @@ pub struct ShortBoxes {
     potential_ops: VecAssoc<OpRef, PotentialShortOp>,
     /// shortpreamble.py:250 self.produced_short_boxes = {}
     /// (insertion order preserved by VecAssoc for deterministic export.)
-    produced_short_boxes: VecAssoc<OpRef, ProducedShortOp>,
+    /// Keyed by the result Box (`shortop.res`), compared by object
+    /// identity (shortpreamble.py:317/338) — lookups resolve their
+    /// position through `ctx.materialize_box_at`, which memoizes one
+    /// box per producer, so the same position yields the same object.
+    produced_short_boxes: VecAssoc<BoxRef, ProducedShortOp>,
     /// shortpreamble.py: const_short_boxes
     const_short_boxes: Vec<PreambleOp>,
     /// RPython shortpreamble.py: Const boxes are directly admissible in
@@ -473,9 +477,10 @@ pub struct ShortBoxes {
     /// once here and compared by position.
     short_inputargs: Vec<BoxRef>,
     /// shortpreamble.py: boxes_in_production — cycle-detection set
-    /// for `materialize_one` recursion. Active set is bounded by
-    /// recursion depth (linear scan suffices).
-    boxes_in_production: VecSet<OpRef>,
+    /// for `materialize_one` recursion, keyed by the result Box
+    /// (shortpreamble.py:314 `self.boxes_in_production[shortop.res]`).
+    /// Active set is bounded by recursion depth (linear scan suffices).
+    boxes_in_production: VecSet<BoxRef>,
     /// The number of label args.
     pub num_label_args: usize,
 }
@@ -532,7 +537,9 @@ impl PotentialShortOp {
                         // — the alias source is the Box itself; resolve to
                         // the canonical (possibly producer-bound) box.
                         alt.same_as_source = Some(ctx.materialize_box_at(compound.res));
-                        sb.produced_short_boxes.insert(alias, alt.clone());
+                        // shortpreamble.py:333 `self.produced_short_boxes[
+                        // new_name] = lst[i]` — keyed by the alias box.
+                        sb.produced_short_boxes.insert(alt.res.clone(), alt.clone());
                     }
                     Some(chosen)
                 }
@@ -670,11 +677,18 @@ impl ShortBoxes {
         ctx: &mut crate::optimizeopt::OptContext,
         opref: OpRef,
     ) -> Option<OpRef> {
-        if let Some(existing) = self.produced_short_boxes.get(&opref) {
-            return Some(existing.preamble_op.pos.get());
-        }
-        if self.boxes_in_production.iter().any(|x| *x == opref) {
-            return None;
+        // shortpreamble.py:284 `if op in self.produced_short_boxes` — the
+        // dict membership is Box identity; resolve the position to its
+        // canonical box once for both identity-keyed checks. Const args
+        // never key either set (they route to the Const arm below).
+        if !opref.is_constant() {
+            let key = ctx.materialize_box_at(opref);
+            if let Some(existing) = self.produced_short_boxes.get(&key) {
+                return Some(existing.preamble_op.pos.get());
+            }
+            if self.boxes_in_production.contains(&key) {
+                return None;
+            }
         }
         // shortpreamble.py:288 isinstance(op, Const) → return op.
         // pyre tracks iteration-known constants (body-typed OpRefs proven
@@ -724,17 +738,21 @@ impl ShortBoxes {
         ctx: &mut crate::optimizeopt::OptContext,
         result: OpRef,
     ) -> Option<ProducedShortOp> {
-        if let Some(existing) = self.produced_short_boxes.get(&result) {
+        // shortpreamble.py:311-339 add_op_to_short — guard, cycle set,
+        // and final insert all key on `shortop.res` Box identity.
+        let key = ctx.materialize_box_at(result);
+        if let Some(existing) = self.produced_short_boxes.get(&key) {
             return Some(existing.clone());
         }
-        if self.boxes_in_production.iter().any(|x| *x == result) {
+        if self.boxes_in_production.contains(&key) {
             return None;
         }
         let candidate = self.potential_ops.get(&result)?.clone();
-        self.boxes_in_production.insert(result);
-        let produced = candidate.add_op_to_short(self, ctx)?;
-        self.produced_short_boxes.insert(result, produced.clone());
-        self.boxes_in_production.remove(&result);
+        self.boxes_in_production.insert(key.clone());
+        let produced = candidate.add_op_to_short(self, ctx);
+        self.boxes_in_production.remove(&key);
+        let produced = produced?;
+        self.produced_short_boxes.insert(key, produced.clone());
         Some(produced)
     }
 
@@ -749,7 +767,7 @@ impl ShortBoxes {
         }
         self.produced_short_boxes
             .iter()
-            .map(|(k, v)| (*k, v.clone()))
+            .map(|(k, v)| (k.to_opref(), v.clone()))
             .collect()
     }
 
