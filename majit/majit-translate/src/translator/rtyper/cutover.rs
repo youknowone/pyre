@@ -924,6 +924,17 @@ pub(crate) fn is_known_unported(msg: &str) -> bool {
         // DictRepr, rrange.py iterator reprs, …) are not ported yet;
         // the legacy walker handles such graphs until each repr lands.
         || msg.contains("rtyper_makerepr — port rpython/rtyper/")
+        // `ClassRepr` / `InstanceRepr` accessors that require a
+        // completed `_setup_repr` (`rbase` populated, rclass.py:273-274)
+        // reached through a path that never ran `Repr::setup()` on the
+        // repr.  Upstream's `rtyper.getrepr` always queues `setup()`
+        // before handing the repr out; pyre's host-struct-seeded
+        // receivers (`*mut PyObject` params with a registry classdef)
+        // can reach class-field reads through reprs minted outside
+        // that queue.  Setup-ordering port gap — fall back to the
+        // legacy walker until the getrepr/setup chain covers these
+        // roots.
+        || msg.contains("rbase missing — call setup() first")
         // `BrokenReprTyperError` (`rmodel.py:42-44`, ported at
         // `rmodel.rs:449-456`): a Repr whose `setup()` failed earlier
         // is re-requested and refuses to half-initialize.  In the
