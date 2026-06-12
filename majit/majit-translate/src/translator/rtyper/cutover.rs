@@ -969,6 +969,14 @@ pub(crate) fn is_known_unported(msg: &str) -> bool {
         // (pbc_call → getcallfamily row, bookkeeper.py:553-571).
         // Skip until the seeded-method family registration lands.
         || msg.contains("calltable row not found in CallFamily")
+        // A non-instance constant (e.g. a string literal) reaching
+        // `InstanceRepr.convert_const` — the receiver field was typed
+        // by the untyped FORCE_ATTRIBUTES shell (classdef-less
+        // SomeInstance) because no registry-row projection covered
+        // it, so a String-valued field rtypes as an instance (hitter:
+        // PyError.msg via the type_error raise stubs).  Skip until
+        // the typed-Ref field projection covers the remaining rows.
+        || msg.contains("InstanceRepr.convert_const: expected HostObject or None")
         // `rmodel.py:311 rtype_is_` — an `is` (pointer-identity)
         // comparison where one side is not a pointer repr.  The
         // production hitter is `py_type_check`'s `(*obj).ob_type ==

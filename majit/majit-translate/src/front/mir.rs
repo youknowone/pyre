@@ -2835,8 +2835,17 @@ impl<'a> Lowering<'a> {
                 // argument directly (same shape as a transparent
                 // ctor alias) instead of emitting a call to core's
                 // identity body, which is not a registered callee.
+                //
+                // The clause-bound variant — `msg.into()` inside a
+                // generic body with `T: Into<String>` — has no
+                // resolved impl to devirtualize through; for a
+                // string-family target the lifted value model treats
+                // the conversion as identity too (Rust `String` and
+                // `&str` both lower to the immutable rpy_string), so
+                // it takes the same alias path.
                 if args.len() == 1
-                    && matches!(self.blanket_into_devirt(&reg), Some(IntoDevirt::Identity))
+                    && (matches!(self.blanket_into_devirt(&reg), Some(IntoDevirt::Identity))
+                        || self.trait_clause_into_string_identity(&reg, &call.dest.ty))
                 {
                     self.local_var[dest_local] = Some(args[0].clone());
                     let target_bb = self.block_id[target];
@@ -3002,10 +3011,8 @@ impl<'a> Lowering<'a> {
                     {
                         // Split like `CallPath::for_impl_method` so the
                         // segment vectors compare equal.
-                        let mut v: Vec<String> = owner_qualified
-                            .split("::")
-                            .map(str::to_string)
-                            .collect();
+                        let mut v: Vec<String> =
+                            owner_qualified.split("::").map(str::to_string).collect();
                         v.push(leaf);
                         v
                     } else {
@@ -3268,6 +3275,33 @@ impl<'a> Lowering<'a> {
             return Some(IntoDevirt::Target(segments));
         }
         None
+    }
+
+    /// `msg.into()` on a generic parameter bound `T: Into<String>` —
+    /// a `CallKind::Trait` whose trait ref is a *clause* (no resolved
+    /// impl for [`Self::blanket_into_devirt`] to read).  The blanket
+    /// `impl<T, U: From<T>> Into<U> for T` makes the result
+    /// `U::from(self)`; for a string-family target the conversion is
+    /// identity in the lifted value model (Rust `String` and `&str`
+    /// both lower to the immutable rpy_string), so the caller may
+    /// alias the destination to the argument.  The callsite's `dest`
+    /// type *is* the trait ref's target type argument, so it is the
+    /// only payload field consulted besides the trait identity.
+    fn trait_clause_into_string_identity(&self, reg: &RegularCall, dest_ty: &TyRef) -> bool {
+        let CallKind::Trait(v) = &reg.kind else {
+            return false;
+        };
+        let Some(traitref) = v.as_array().and_then(|a| a.first()) else {
+            return false;
+        };
+        let Some(trait_id) = traitref_decl_id(traitref, self.llbc, 0) else {
+            return false;
+        };
+        let is_into = self
+            .llbc
+            .trait_by_id(trait_id)
+            .is_some_and(|td| td.item_meta.name_path() == "core::convert::Into");
+        is_into && tyref_is_string_adt(dest_ty, self.llbc)
     }
 
     /// Decode the receiver type's ADT `def_id` from an `Impl` NameSeg
@@ -4417,6 +4451,16 @@ fn tyref_node<'l>(ty: &'l TyRef, llbc: &'l Llbc) -> Option<&'l serde_json::Value
         TyRef::Other(v) => Some(v),
         TyRef::Dedup { id } => llbc.dedup_body(*id),
     }
+}
+
+/// Whether a `TyRef` resolves (behind the usual wrappers) to the
+/// `alloc::string::String` ADT.
+fn tyref_is_string_adt(ty: &TyRef, llbc: &Llbc) -> bool {
+    tyref_node(ty, llbc)
+        .and_then(|n| strip_ty_wrappers(n, llbc))
+        .and_then(adt_node_def_id)
+        .and_then(|id| llbc.type_by_id(id))
+        .is_some_and(|td| td.item_meta.name_path() == "alloc::string::String")
 }
 
 /// The ADT def_id of an (already wrapper-stripped) type node, or
