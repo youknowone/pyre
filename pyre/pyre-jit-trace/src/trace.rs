@@ -383,6 +383,32 @@ fn run_perfn_walk(
         );
         return None;
     };
+    // The full-body walk drives a PORTAL trace, so the body must carry
+    // the portal entry shape (`FrameInputs::Portal`: `[frame, ec]` red
+    // inputs + the frame-vable locals prologue).  A body first compiled
+    // as a plain CALLEE (`FrameInputs::Frame` — `get_jitcode` builds the
+    // shape from `jitdriver_sd_from_portal_graph` at compile time, and a
+    // function discovered through another function's call compiles
+    // before it becomes a portal) reads its params from caller-seeded
+    // registers; the portal red seeding below would land `ec_box` in a
+    // PARAMETER color and the walk would record the ExecutionContext
+    // const as the function's argument — garbage baked into the trace
+    // (previously masked only when the unseeded color happened to stay
+    // `OpRef::NONE` and aborted as `ResidualCallArgUnbound`).  The
+    // installed body is frozen once trace-side resume data references
+    // it, so it cannot be swapped for a portal rebuild here; decline
+    // permanently like the other structural `FBW_DECLINED_KEYS` classes
+    // and let the trait tracer compile this function.
+    if !pjc.metadata.built_as_portal {
+        if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+            eprintln!(
+                "[fbw-abort] start_pc={start_pc} jitcode body compiled as plain callee \
+                 (built_as_portal=false); declining walk"
+            );
+        }
+        fbw_decline(crate::driver::make_green_key(w_code, start_pc));
+        return None;
+    }
 
     let mut mi = crate::state::MIFrame::from_sym(ctx, sym, cf_addr, start_pc, start_pc);
 
@@ -489,6 +515,7 @@ fn run_perfn_walk(
             // seed once `frame` resolves to the standard virtualizable; the
             // r0 seed is retained as a defensive best-effort (overwritten by
             // the entry prologue's first dst in practice).
+            //
             None => {
                 seed(0, pycode_box);
                 if portal_frame_reg != u16::MAX {
@@ -962,7 +989,8 @@ fn dump_perfn_jitcode_for_trace(w_code: *const (), start_pc: usize) {
     let entry = pjc.resume_jitcode_pc_for(start_pc);
     eprintln!(
         "[perfn-jitcode] code_len={} pc_map_len={} start_pc={} entry_jitcode_pc={:?} \
-         num_regs_r={} num_regs_i={} num_regs_f={}",
+         num_regs_r={} num_regs_i={} num_regs_f={} portal_frame_reg={} portal_ec_reg={} \
+         built_as_portal={} merge_point_pc={:?}",
         code.len(),
         pjc.metadata.pc_map.len(),
         start_pc,
@@ -970,6 +998,10 @@ fn dump_perfn_jitcode_for_trace(w_code: *const (), start_pc: usize) {
         pjc.jitcode.num_regs_r(),
         pjc.jitcode.num_regs_i(),
         pjc.jitcode.num_regs_f(),
+        pjc.metadata.portal_frame_reg,
+        pjc.metadata.portal_ec_reg,
+        pjc.metadata.built_as_portal,
+        pjc.merge_point_pc,
     );
     let mut count = 0usize;
     let mut last_next = 0usize;

@@ -117,6 +117,17 @@ pub struct PyJitCodeMetadata {
     /// argument (`ec`, `pypy/module/pypyjit/interp_jit.py:67`).
     /// Snapshot serializer maps this color to `sym.execution_context`.
     pub portal_ec_reg: u16,
+    /// Whether the body was compiled with the PORTAL entry shape
+    /// (`FrameInputs::Portal`: `[frame, ec]` red inputs + frame-vable
+    /// locals prologue) — `jitdriver_sd_from_portal_graph(code)` was
+    /// `Some` at compile time.  A body first compiled as a plain CALLEE
+    /// (`FrameInputs::Frame`, discovered through another function's
+    /// call) reads its params from caller-seeded registers and stays
+    /// frozen once installed trace-side (resume data captured against
+    /// it must stay consistent), so a later portal trace of the same
+    /// code must NOT walk it: `run_perfn_walk` declines on
+    /// `!built_as_portal` and the trait tracer compiles the function.
+    pub built_as_portal: bool,
     /// Absolute start index of the operand stack in PyFrame.locals_cells_stack_w.
     pub stack_base: usize,
     /// Post-regalloc
@@ -518,6 +529,7 @@ impl PyJitCode {
                 // unrelated locals/stack slots.
                 portal_frame_reg: u16::MAX,
                 portal_ec_reg: u16::MAX,
+                built_as_portal: false,
                 stack_base: 0,
                 stack_slot_color_map: Vec::new(),
                 pyre_color_for_semantic_local: Vec::new(),

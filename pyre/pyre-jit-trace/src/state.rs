@@ -10532,6 +10532,7 @@ mod tests {
                 depth_at_py_pc: vec![2],
                 portal_frame_reg: 0,
                 portal_ec_reg: 0,
+                built_as_portal: true,
                 stack_base: 1,
                 stack_slot_color_map: Vec::new(),
                 pyre_color_for_semantic_local: Vec::new(),
