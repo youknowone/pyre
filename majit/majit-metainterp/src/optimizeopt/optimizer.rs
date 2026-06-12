@@ -3274,10 +3274,18 @@ impl Optimizer {
                             *arg = majit_ir::operand::Operand::Box(BoxRef::from_opref(arg_opref));
                         }
                     }
-                    if let Some(ref mut src) = entry.same_as_source {
-                        let mut src_opref = src.to_opref();
-                        remap_opref(&mut src_opref);
-                        *src = BoxRef::from_opref(src_opref);
+                    // same_as_source: same rule as res below — the stored
+                    // box object is shared with the preview ProducedShortOp,
+                    // so rewrite its position Cell in place instead of
+                    // replacing it with a fresh position-only mint.
+                    if let Some(ref src) = entry.same_as_source {
+                        if let Some(op) = src.bound_op() {
+                            src.set_position(op.pos.get().raw());
+                        } else {
+                            let mut src_opref = src.to_opref();
+                            remap_opref(&mut src_opref);
+                            src.set_position(src_opref.raw());
+                        }
                     }
                     // res: a bound box live-tracks its producer through the
                     // op handle — the producer's `Op.pos` was already
