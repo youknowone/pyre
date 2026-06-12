@@ -1825,6 +1825,19 @@ impl OptContext {
             if !std::rc::Rc::ptr_eq(&superseded, op) {
                 let carried = superseded.forwarded.borrow().clone();
                 *op.forwarded.borrow_mut() = carried;
+                // replace_op_with parity (optimizer.py:403-411): forward the
+                // superseded stand-in to `op`. A consumer dispatched before
+                // this supersession bound its operand to `superseded` (the
+                // producer registered at its dispatch-entry rebind); without
+                // this link its box-native walk freezes on the orphaned
+                // stand-in while `find_producer_op` resolves `op`, so a later
+                // operand fold lands on a different host than the OpRef path
+                // observes. `superseded` stays alive in operand `Operand::Op`
+                // strong refs, so the `Weak` upgrades and the chain reaches
+                // `op`. Mirrors `emit`'s live-synthetic catch-up so a
+                // supersession chain (stand-in → extra-producer → emitted op)
+                // stays transitively resolvable to the final producer.
+                crate::r#box::BoxRef::from_bound_op(&superseded).set_forwarded_op(op);
             }
         }
         self.resop_refs.insert(pos, op.clone());
