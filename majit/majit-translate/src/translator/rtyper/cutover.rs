@@ -937,6 +937,14 @@ pub(crate) fn is_known_unported(msg: &str) -> bool {
         // skips to the legacy walker until per-instantiation classdef
         // specialization lands.
         || msg.contains("cannot unify instances with no common base class")
+        // `model.rs:3061` subset-gap marker — the union pair has no
+        // ported `pair(s1, s2).union()` handler.  Upstream degenerates
+        // such pairs to `SomeObject` (`annmodel` pair(SomeObject,
+        // SomeObject).union, binaryop.py:64-72) instead of erroring,
+        // so any hit here is by construction an unported handler, not
+        // a divergence.  Skip to the legacy walker until the pair is
+        // ported.
+        || msg.contains("no upstream pair(s1, s2).union() handler in current subset")
         // `rmodel.py:311 rtype_is_` — an `is` (pointer-identity)
         // comparison where one side is not a pointer repr.  The
         // production hitter is `py_type_check`'s `(*obj).ob_type ==

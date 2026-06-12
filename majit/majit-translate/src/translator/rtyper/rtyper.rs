@@ -981,8 +981,37 @@ impl RPythonTyper {
         }
         // First time seeing this key: upstream pre-inserts None as the
         // recursion sentinel, then materialises the Repr.
+        //
+        // Upstream leaves the sentinel behind when `rtyper_makerepr`
+        // raises — harmless there because any makerepr failure kills
+        // the whole translation.  Pyre's dual-gate continues past a
+        // failed subject on the SAME shared rtyper session, so a
+        // leaked `None` would make every later subject touching the
+        // same key die on the recursion assert above instead of
+        // surfacing the original makerepr error.  Drop the sentinel on
+        // the error path (and on a panic unwinding through makerepr)
+        // so later subjects re-derive the same failure cleanly.
+        struct SentinelCleanup<'a> {
+            reprs: &'a RefCell<HashMap<ReprKey, Option<Arc<dyn Repr>>>>,
+            key: Option<ReprKey>,
+        }
+        impl Drop for SentinelCleanup<'_> {
+            fn drop(&mut self) {
+                if let Some(key) = self.key.take()
+                    && let Ok(mut reprs) = self.reprs.try_borrow_mut()
+                    && matches!(reprs.get(&key), Some(None))
+                {
+                    reprs.remove(&key);
+                }
+            }
+        }
         self.reprs.borrow_mut().insert(key.clone(), None);
+        let mut cleanup = SentinelCleanup {
+            reprs: &self.reprs,
+            key: Some(key.clone()),
+        };
         let result = rtyper_makerepr(s_obj, self)?;
+        cleanup.key = None;
         self.reprs.borrow_mut().insert(key, Some(result.clone()));
         self.add_pendingsetup(result.clone());
         Ok(result)
