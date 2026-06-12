@@ -415,18 +415,29 @@ pub(crate) enum DualGateOutcome {
 pub(crate) fn dual_gate_check_with_registry(
     legacy_graph: &LegacyGraph,
     call_registry: &PyreCallRegistry,
+    lift_sources: &crate::jit_codewriter::call::GraphStore,
 ) -> Result<DualGateOutcome, String> {
     // Same panic-catch contract as `dual_gate_check` — the rtyper's
     // internal `genop`/`level` asserts surface as diagnostic panics
     // for unported pyre-front idioms; the gate uniformly returns a
     // stringified error so the env-flag wrapper can decide whether
     // to panic, log, or skip.
+    //
+    // Snapshot the session's `fixed_graphs` keys so the failure arms
+    // below can identify the shared callee graphs this subject fixed
+    // (and partially LL-rewrote) before it failed — see
+    // `unpoison_failed_subject_callees`.
+    let fixed_at_entry: HashSet<crate::flowspace::model::GraphKey> = call_registry
+        .session_if_started()
+        .map(|(ann, _)| ann.fixed_graphs.borrow().keys().cloned().collect())
+        .unwrap_or_default();
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         specialize_legacy_graph_with_registry_returning_value_to_var(legacy_graph, call_registry)
     }));
     let (real_value_to_var, real_constants) = match result {
         Ok(Ok(pair)) => pair,
         Ok(Err(e)) => {
+            unpoison_failed_subject_callees(call_registry, &fixed_at_entry, lift_sources);
             let msg = format!("{e}");
             if is_known_unported(&msg) {
                 return Ok(DualGateOutcome::Skip(msg));
@@ -434,6 +445,7 @@ pub(crate) fn dual_gate_check_with_registry(
             return Err(format!("real path failed: {msg}"));
         }
         Err(payload) => {
+            unpoison_failed_subject_callees(call_registry, &fixed_at_entry, lift_sources);
             let msg = if let Some(s) = payload.downcast_ref::<&'static str>() {
                 (*s).to_string()
             } else if let Some(s) = payload.downcast_ref::<String>() {
@@ -474,6 +486,128 @@ pub(crate) fn dual_gate_check_with_registry(
         )));
     }
     Ok(DualGateOutcome::Match { real_value_to_var })
+}
+
+/// Repair shared callee state poisoned by a failed subject scope.
+///
+/// `specialize_more_blocks` mutates callee graphs in place: it
+/// registers each graph in `annotator.fixed_graphs` at its first
+/// specialized block (rtyper.py:268) and rewrites block operations to
+/// LL form. When the subject then fails, `AddedBlocksGuard` evicts the
+/// scope's blocks and clears their annotations — but the callee's
+/// `FunctionDesc.cache` (and any calltable row built during the scope)
+/// still holds the fixed + LL-rewritten + annotation-cleared graph.
+/// Every later subject calling the same callee then dies at
+/// `addpendingblock`'s fixed-graph safety check (annrpython.py:181
+/// reads `arg.annotation`), or at `flowin`'s "unimplemented operation"
+/// on the LL ops.
+///
+/// Upstream has no counterpart: RPython's `specialize()` runs once per
+/// Translator and any failure is fatal. Pyre's per-subject dual-gate
+/// continues past failed subjects, so a failed scope must leave shared
+/// callee state as if the subject never ran. Each graph newly fixed
+/// during the scope is swapped for a fresh re-lift from its
+/// `GraphStore` source, and the rtyper/annotator records keyed to the
+/// stale graph are dropped:
+///
+/// - `annotator.fixed_graphs` row (graph identity)
+/// - `rtyper.already_seen` rows for the stale graph's blocks
+/// - `translator.graphs` entry (appended on `cachedgraph` hit)
+/// - `FunctionDesc.cache` values (patched to the fresh `PyGraph`)
+/// - calltable rows holding the same `Rc<PyGraph>` (patched in place
+///   so `total_calltable_size` and `get_concrete_calltable`'s size
+///   invariant hold; the family's cached concrete calltable is
+///   dropped so it rebuilds against the fresh graph)
+fn unpoison_failed_subject_callees(
+    call_registry: &PyreCallRegistry,
+    fixed_at_entry: &HashSet<crate::flowspace::model::GraphKey>,
+    lift_sources: &crate::jit_codewriter::call::GraphStore,
+) {
+    let Some((annotator, rtyper)) = call_registry.session_if_started() else {
+        return;
+    };
+    let newly_fixed: Vec<(
+        crate::flowspace::model::GraphKey,
+        crate::flowspace::model::GraphRef,
+    )> = annotator
+        .fixed_graphs
+        .borrow()
+        .iter()
+        .filter(|(k, _)| !fixed_at_entry.contains(*k))
+        .map(|(k, g)| (k.clone(), g.clone()))
+        .collect();
+    for (gkey, stale) in newly_fixed {
+        annotator.fixed_graphs.borrow_mut().shift_remove(&gkey);
+        for block in stale.borrow().iterblocks() {
+            rtyper
+                .already_seen
+                .borrow_mut()
+                .remove(&crate::flowspace::model::BlockKey::of(&block));
+        }
+        annotator
+            .translator
+            .graphs
+            .borrow_mut()
+            .retain(|g| !Rc::ptr_eq(g, &stale));
+        let Some((key, entry)) = call_registry.find_entry_with_cached_graph(&stale) else {
+            // The subject graph itself (lifted through the adapter, not
+            // a registry callee) — the shared-map cleanup above is all
+            // it needs.
+            continue;
+        };
+        let fresh = call_registry
+            .keys_for_entry(&key)
+            .iter()
+            .find_map(|k| {
+                lift_sources.get(&crate::parse::CallPath::from_segments(
+                    k.segments().iter().cloned(),
+                ))
+            })
+            .and_then(|source| {
+                lift_callee_to_pygraph(source, signature_for_graph(source), call_registry).ok()
+            });
+        match fresh {
+            Some(fresh) => {
+                let fd = entry.function_desc.borrow();
+                for pg in fd.cache.borrow_mut().values_mut() {
+                    if Rc::ptr_eq(&pg.graph, &stale) {
+                        *pg = fresh.clone();
+                    }
+                }
+                if let Ok(family) = fd.base.getcallfamily() {
+                    for table in family.borrow_mut().calltables.values_mut() {
+                        for row in table.iter_mut() {
+                            for pg in row.values_mut() {
+                                if Rc::ptr_eq(&pg.graph, &stale) {
+                                    *pg = fresh.clone();
+                                }
+                            }
+                        }
+                    }
+                    rtyper
+                        .concrete_calltables
+                        .borrow_mut()
+                        .remove(&(Rc::as_ptr(&family) as usize));
+                }
+            }
+            None => {
+                // No re-lift source — drop the poisoned cache rows and
+                // record the condition so later callers surface a lift
+                // error (Skip-classified) instead of the fixed-graph
+                // safety panic.
+                entry
+                    .function_desc
+                    .borrow()
+                    .cache
+                    .borrow_mut()
+                    .retain(|_, pg| !Rc::ptr_eq(&pg.graph, &stale));
+                entry.record_lift_error(
+                    "callee graph poisoned by a failed subject scope; no re-lift source"
+                        .to_string(),
+                );
+            }
+        }
+    }
 }
 
 /// Local projection of `value_to_var` Variables' concretetype cells

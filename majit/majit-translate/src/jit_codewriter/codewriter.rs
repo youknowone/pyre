@@ -302,7 +302,11 @@ impl CodeWriter {
     ) -> Option<crate::translator::rtyper::flowspace_adapter::LegacyToTyped> {
         let dual_gate_outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let registry = self.dual_gate_registry(callcontrol);
-            crate::translator::rtyper::cutover::dual_gate_check_with_registry(graph, &registry)
+            crate::translator::rtyper::cutover::dual_gate_check_with_registry(
+                graph,
+                &registry,
+                callcontrol.function_graphs(),
+            )
         }));
         let outcome = match dual_gate_outcome {
             Ok(result) => result,

@@ -399,6 +399,49 @@ impl PyreCallRegistry {
         self.entries.borrow().get(&canonical).cloned()
     }
 
+    /// The already-started session pair, without creating one.
+    /// `None` until the first [`Self::ensure_session`] call.
+    pub fn session_if_started(
+        &self,
+    ) -> Option<(
+        Rc<crate::annotator::annrpython::RPythonAnnotator>,
+        Rc<crate::translator::rtyper::rtyper::RPythonTyper>,
+    )> {
+        self.session.borrow().clone()
+    }
+
+    /// Find the canonical entry whose `FunctionDesc.cache` holds a
+    /// `PyGraph` wrapping exactly `graph` (flowspace graph identity).
+    /// Used by the failed-subject-scope repair in `cutover` to map a
+    /// poisoned shared callee graph back to its registry entry.
+    pub fn find_entry_with_cached_graph(
+        &self,
+        graph: &crate::flowspace::model::GraphRef,
+    ) -> Option<(FunctionPathKey, Rc<PyreFunctionEntry>)> {
+        for (key, entry) in self.entries.borrow().iter() {
+            let fd = entry.function_desc.borrow();
+            let cache = fd.cache.borrow();
+            if cache.values().any(|pg| Rc::ptr_eq(&pg.graph, graph)) {
+                return Some((key.clone(), entry.clone()));
+            }
+        }
+        None
+    }
+
+    /// Every key resolving to `canonical`'s entry: the canonical key
+    /// itself plus all registered aliases pointing at it.
+    pub fn keys_for_entry(&self, canonical: &FunctionPathKey) -> Vec<FunctionPathKey> {
+        let mut keys = vec![canonical.clone()];
+        keys.extend(
+            self.aliases
+                .borrow()
+                .iter()
+                .filter(|(_, c)| *c == canonical)
+                .map(|(a, _)| a.clone()),
+        );
+        keys
+    }
+
     /// Same as [`Self::lookup`] with a narrowly-scoped cross-module
     /// leaf-match fallback for callsites whose verbatim path missed.
     ///
@@ -969,5 +1012,66 @@ mod tests {
             "free-fn-shape query must NOT silently latch onto an impl-method \
              candidate sharing the leaf identifier"
         );
+    }
+
+    fn make_pygraph(name: &str, sig: Signature) -> Rc<PyGraph> {
+        use crate::flowspace::model::{ConstValue, FunctionGraph};
+        let func = GraphFunc::new(name, Constant::new(ConstValue::Dict(Default::default())));
+        let startblock = crate::flowspace::model::Block::shared(vec![]);
+        Rc::new(PyGraph {
+            graph: Rc::new(RefCell::new(FunctionGraph::new(name, startblock))),
+            func,
+            signature: RefCell::new(sig),
+            defaults: RefCell::new(Some(Vec::new())),
+            access_directly: std::cell::Cell::new(false),
+        })
+    }
+
+    #[test]
+    fn find_entry_with_cached_graph_resolves_by_graph_identity() {
+        let bk = Rc::new(Bookkeeper::new());
+        let registry = PyreCallRegistry::new(bk);
+        let key = FunctionPathKey::from_segments(["m", "f"]);
+        let pygraph = make_pygraph("f", signature(&["x"]));
+        registry.register_callee(key.clone(), signature(&["x"]), pygraph.clone());
+        let other = make_pygraph("g", signature(&["x"]));
+        registry.register_callee(
+            FunctionPathKey::from_segments(["m", "g"]),
+            signature(&["x"]),
+            other,
+        );
+        let (found_key, found_entry) = registry
+            .find_entry_with_cached_graph(&pygraph.graph)
+            .expect("entry holding the cached graph must resolve");
+        assert_eq!(found_key, key);
+        assert!(
+            found_entry
+                .function_desc
+                .borrow()
+                .cache
+                .borrow()
+                .values()
+                .any(|pg| Rc::ptr_eq(&pg.graph, &pygraph.graph))
+        );
+        let unknown = make_pygraph("h", signature(&["x"]));
+        assert!(
+            registry
+                .find_entry_with_cached_graph(&unknown.graph)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn keys_for_entry_includes_canonical_and_aliases() {
+        let bk = Rc::new(Bookkeeper::new());
+        let registry = PyreCallRegistry::new(bk);
+        let canonical = FunctionPathKey::from_segments(["m", "f"]);
+        registry.get_or_register(canonical.clone(), signature(&["x"]));
+        let alias = FunctionPathKey::from_segments(["crate", "m", "f"]);
+        registry.alias(alias.clone(), &canonical);
+        let keys = registry.keys_for_entry(&canonical);
+        assert!(keys.contains(&canonical));
+        assert!(keys.contains(&alias));
+        assert_eq!(keys.len(), 2);
     }
 }
