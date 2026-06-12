@@ -655,14 +655,16 @@ fn run_perfn_walk(
         // commit point.  All-or-nothing inside the helper; a `false`
         // return keeps the legacy replay.
         //
-        // `PYRE_FBW_END_FLUSH=1` dev gate (default OFF): adoption is only
-        // sound once every walked side effect is concretely applied at
-        // walk end; the walker's StoreSubscr interception still records
-        // list/dict stores without executing them
-        // (`try_walker_direct_opcode_dispatch` "trace-only, no concrete
-        // mutation"), so adopting today loses those writes (fannkuch
-        // flips diverge).  The store-journal slice flips this on.
-        if std::env::var_os("PYRE_FBW_END_FLUSH").as_deref() == Some(std::ffi::OsStr::new("1")) {
+        // Commit preconditions:
+        //   - no unjournaled effect (a symbolically recorded residual
+        //     call only the replay applies);
+        //   - the frame flush resolves every live slot (all-or-nothing);
+        // then the committed flag routes the portal to adopt the end
+        // state instead of replaying.  The store-journal epilogue below
+        // settles the walk's eager list stores either way (commit keeps
+        // them, non-commit rolls them back for the replay).
+        // `PYRE_FBW_END_FLUSH=0` opts out for bisection.
+        if std::env::var_os("PYRE_FBW_END_FLUSH").as_deref() != Some(std::ffi::OsStr::new("0")) {
             if let Ok((outcome, _end_pc)) = &walk_result {
                 let header_pc = match outcome {
                     crate::jitcode_dispatch::DispatchOutcome::CloseLoop {
@@ -674,9 +676,22 @@ fn run_perfn_walk(
                     _ => None,
                 };
                 if let Some(header_pc) = header_pc {
-                    let flushed =
-                        crate::state::flush_walk_end_state_to_frame(ctx, cf_addr, header_pc);
-                    if flushed {
+                    if crate::jitcode_dispatch::fbw_has_unjournaled_effect() {
+                        if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+                            eprintln!(
+                                "[fbw-end-flush] declined at header_pc={header_pc} \
+                                 (unjournaled effect) — legacy replay kept"
+                            );
+                        }
+                    } else if crate::state::flush_walk_end_state_to_frame(ctx, cf_addr, header_pc) {
+                        if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+                            eprintln!(
+                                "[fbw-end-flush] COMMIT header_pc={header_pc} bridge={} \
+                                 journal_len={} outcome={outcome:?}",
+                                ctx.is_bridge_trace,
+                                crate::jitcode_dispatch::fbw_store_journal_len(),
+                            );
+                        }
                         WALK_END_FLUSH_COMMITTED.with(|c| c.set(true));
                     } else if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
                         eprintln!(
@@ -687,6 +702,17 @@ fn run_perfn_walk(
                 }
             }
         }
+    }
+
+    // Store-journal epilogue, on EVERY walk exit (commit, declined
+    // commit, walk error): a committed walk keeps its eagerly executed
+    // list stores (drop the undo log); any other exit returns control to
+    // a replay-from-start path, which re-executes the walked region and
+    // must find the pre-walk heap — roll the stores back.
+    if WALK_END_FLUSH_COMMITTED.with(|c| c.get()) {
+        crate::jitcode_dispatch::fbw_store_journal_commit();
+    } else {
+        crate::jitcode_dispatch::fbw_store_journal_rollback();
     }
 
     Some((entry, code_len, walk_result))
@@ -735,6 +761,7 @@ fn probe_walk_perfn_jitcode(
     // at entry, but the probe never runs through that path).
     crate::jitcode_dispatch::bool_box_truth_reset();
     crate::jitcode_dispatch::fbw_finish_payload_reset();
+    crate::jitcode_dispatch::fbw_store_journal_reset();
 }
 
 /// Issue #73 production full-body tracer (Phase 5 flip, gated).
@@ -773,6 +800,9 @@ fn full_body_walk_trace(
     // aborted walk's top-level `*_return` arm may have stashed, so a stale
     // value cannot leak into this walk's `Terminate` handling.
     crate::jitcode_dispatch::fbw_finish_payload_reset();
+    // Clear the prior walk's store journal + unjournaled-effect flag so
+    // dropped (aborted) entries cannot be applied by this walk's commit.
+    crate::jitcode_dispatch::fbw_store_journal_reset();
     // A bridge resumes mid-loop from a guard failure; its input args are the
     // guard's resumedata, already seeded into the bridge sym by
     // `setup_bridge_sym`.  PyPy's `interpret()` (rebuild_state_after_failure →

@@ -4479,7 +4479,9 @@ fn try_execute_residual_call_via_executor(
     // instead: falling through with `None` leaves the recorded residual op in
     // the trace, so the compiled loop applies the side effect exactly once.
     // That is the FBW-correct equivalent of the eager step, and the net
-    // once-per-iteration effect matches the trait path.
+    // once-per-iteration effect matches the trait path.  (Every `None`
+    // from this function marks `FBW_UNJOURNALED_EFFECT` at the dispatch
+    // sites, keeping the walk-end no-replay commit off for this trace.)
     if call_descr.result_type() == majit_ir::Type::Void {
         return Ok(None);
     }
@@ -5389,6 +5391,116 @@ pub(crate) fn fbw_finish_payload_take() -> Option<(OpRef, Type)> {
     FBW_FINISH_PAYLOAD.with(|c| c.take())
 }
 
+thread_local! {
+    /// Undo log for the walked region's eagerly executed list stores:
+    /// `(list, key, displaced_value)` triples pushed by the `STORE_SUBSCR`
+    /// specializations before they mutate the list.  Upstream executes
+    /// every traced operation concretely (pyjitpl.py:2095
+    /// execute_and_record) and never re-runs the traced region, so the
+    /// walker applies the store at trace time too.  Pyre's transitional
+    /// non-commit paths instead RE-RUN the region (the legacy
+    /// replay-from-snapshot), which would re-apply the store against the
+    /// already-mutated heap (a swap re-reads its own output and swaps
+    /// back) — so a walk that does not commit its end state
+    /// (`flush_walk_end_state_to_frame`) rolls these entries back in
+    /// reverse order, restoring the pre-walk heap the replay expects.  A
+    /// committing walk drops the log (the mutation is already applied,
+    /// exactly once).  Dies with the replay paths.  Entries are GC roots
+    /// via [`fbw_store_journal_root_walker`].
+    static FBW_STORE_JOURNAL: std::cell::RefCell<Vec<[pyre_object::PyObjectRef; 3]>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+
+    /// Set when the walk records a side effect that was neither executed
+    /// at walk time nor undo-logged: a void residual call recorded
+    /// symbolically (the `try_execute_residual_call_via_executor` void
+    /// gate).  A flagged walk must not adopt its end state — the flush
+    /// site keeps the legacy replay, which is the only path that applies
+    /// the recorded effect.
+    static FBW_UNJOURNALED_EFFECT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Clear the store journal and the unjournaled-effect flag before a walk
+/// begins (mirrors [`bool_box_truth_reset`]).
+pub(crate) fn fbw_store_journal_reset() {
+    FBW_STORE_JOURNAL.with(|j| j.borrow_mut().clear());
+    FBW_UNJOURNALED_EFFECT.with(|c| c.set(false));
+}
+
+/// Record the element a walked eager list store displaces, for rollback
+/// when the walk does not commit its end state.
+pub(crate) fn fbw_store_journal_push(
+    list: pyre_object::PyObjectRef,
+    key: pyre_object::PyObjectRef,
+    displaced: pyre_object::PyObjectRef,
+) {
+    FBW_STORE_JOURNAL.with(|j| j.borrow_mut().push([list, key, displaced]));
+}
+
+/// Commit-path epilogue: the walk's eager stores stand; drop the undo log.
+pub(crate) fn fbw_store_journal_commit() {
+    FBW_STORE_JOURNAL.with(|j| j.borrow_mut().clear());
+}
+
+/// Non-commit epilogue: restore each displaced element in reverse push
+/// order so the legacy replay re-executes against the pre-walk heap.
+/// `w_list_setitem` allocates nothing on the restore (the displaced value
+/// is already boxed and strategy-matching), so entries cannot move
+/// mid-rollback.
+pub(crate) fn fbw_store_journal_rollback() {
+    FBW_STORE_JOURNAL.with(|j| {
+        let mut entries = j.borrow_mut();
+        while let Some([list, key, displaced]) = entries.pop() {
+            let restored = unsafe {
+                let index = pyre_object::w_int_get_value(key);
+                pyre_object::w_list_setitem(list, index, displaced)
+            };
+            if !restored {
+                // Only reachable when another eagerly executed residual
+                // shrank the list after the store — a shape the replay
+                // already cannot undo (the residual re-runs).  Surface it
+                // under the debug gate instead of corrupting silently.
+                if fbw_debug_abort_enabled() {
+                    eprintln!("[fbw-store-journal] rollback failed (index out of bounds)");
+                }
+            }
+        }
+    });
+}
+
+/// Current journal length (commit-point diagnostics).
+pub(crate) fn fbw_store_journal_len() -> usize {
+    FBW_STORE_JOURNAL.with(|j| j.borrow().len())
+}
+
+/// Mark the walk as carrying a recorded-but-unexecuted side effect only
+/// the legacy replay applies (see [`FBW_UNJOURNALED_EFFECT`]).
+pub(crate) fn fbw_mark_unjournaled_effect() {
+    FBW_UNJOURNALED_EFFECT.with(|c| c.set(true));
+}
+
+/// Whether the walk recorded an effect outside the journal's reach.
+pub(crate) fn fbw_has_unjournaled_effect() -> bool {
+    FBW_UNJOURNALED_EFFECT.with(|c| c.get())
+}
+
+/// `framework.py root_walker.walk_roots` parity for the store journal:
+/// the triples hold nursery-resident refs across the rest of the walk
+/// (residual calls allocate, and a minor collection moves nursery
+/// objects), so every slot is forwarded as a root.  Registered once via
+/// `majit_gc::shadow_stack::register_extra_root_walker` at JIT init.
+pub fn fbw_store_journal_root_walker(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
+    FBW_STORE_JOURNAL.with(|j| {
+        for triple in j.borrow_mut().iter_mut() {
+            for slot in triple.iter_mut() {
+                // SAFETY: `PyObjectRef` and `GcRef` share the usize repr
+                // (`GcRef` is `#[repr(transparent)]`); the borrow keeps
+                // the Vec storage alive for the visit.
+                visitor(unsafe { &mut *(slot as *mut pyre_object::PyObjectRef).cast() });
+            }
+        }
+    });
+}
+
 /// FBW-native port of [`crate::state::ensure_boxed_for_ca`] that operates
 /// purely on the [`TraceCtx`] (no borrowed `MIFrame`).  A portal-exit
 /// FINISH must carry `Type::Ref` (`pyjitpl.py:2489-2502` REF result_type);
@@ -6251,6 +6363,40 @@ fn try_walker_store_subscr_specialization(
     if !handled {
         return None;
     }
+    // The helper call below mutates the list; log the displaced element
+    // first so a non-committing walk's legacy replay re-executes against
+    // the pre-walk heap (see `FBW_STORE_JOURNAL`).  `handled` means
+    // `generated_store_subscr_value` admitted an exact in-bounds
+    // list[int] store, so the displaced read resolves.  The boxing
+    // allocation inside `w_list_getitem` can move the operands, so
+    // re-read the forwarded refs from the shadow afterwards.
+    let (concrete_obj, concrete_key, concrete_value) = {
+        let index = unsafe { pyre_object::w_int_get_value(concrete_key) };
+        let Some(displaced) = (unsafe { pyre_object::w_list_getitem(concrete_obj, index) }) else {
+            unreachable!(
+                "store_subscr specialization: in-bounds index {index} has no element \
+                 (generated_store_subscr_value admitted it)"
+            );
+        };
+        let r_args_concrete = read_ref_var_list_concrete(code, op, 1, ctx);
+        let (
+            Some(crate::state::ConcreteValue::Ref(obj)),
+            Some(crate::state::ConcreteValue::Ref(key)),
+            Some(crate::state::ConcreteValue::Ref(value)),
+        ) = (
+            r_args_concrete.first(),
+            r_args_concrete.get(1),
+            r_args_concrete.get(2),
+        )
+        else {
+            unreachable!(
+                "store_subscr specialization: operand concrete vanished from the \
+                 shadow across the displaced-element boxing"
+            );
+        };
+        fbw_store_journal_push(*obj, *key, displaced);
+        (*obj, *key, *value)
+    };
     // Specialized IR recorded.  Heap mutation: invoke the helper
     // concretely so the next read of the container sees the updated
     // value.  `bh_store_subscr_fn(obj, key, value) -> i64` returns 1 on
@@ -7253,17 +7399,23 @@ fn dispatch_residual_call_iRd_kind(
         // `symbolic_fnaddr_for_path` hashes whose bits ≥ 47 are set)
         // so unregistered helpers degrade gracefully to recording-only
         // instead of SIGBUSing.
-        let resid_raised = matches!(
-            try_execute_residual_call_via_executor(
-                ctx,
-                call_opcode,
-                &allboxes,
-                call_descr,
-                recorded,
-                op.pc,
-            )?,
-            Some(Err(_))
-        );
+        let resid_exec = try_execute_residual_call_via_executor(
+            ctx,
+            call_opcode,
+            &allboxes,
+            call_descr,
+            recorded,
+            op.pc,
+        )?;
+        // A `None` leaves the call recorded symbolically WITHOUT running
+        // it — a side effect only the legacy replay applies, so the
+        // walk-end no-replay commit must stay off for this trace (see
+        // `FBW_UNJOURNALED_EFFECT`).  Pure/elidable calls never reach
+        // this dispatcher (they fold via the pure-call executor).
+        if resid_exec.is_none() {
+            fbw_mark_unjournaled_effect();
+        }
+        let resid_raised = matches!(resid_exec, Some(Err(_)));
         debug_assert!(
             !resid_raised || can_raise,
             "dispatch_residual_call_iRd_kind: helper raised on a \
@@ -8528,6 +8680,41 @@ fn try_walker_specialize_store_subscr(
             .set_opref_concrete(raw, majit_ir::Value::Float(elem));
         crate::state::trace_raw_float_array_setitem_value(ctx.trace_ctx, items_ptr, raw_index, raw);
     }
+
+    // Tracing is execution (pyjitpl.py:2095 execute_and_record): apply the
+    // store to the concrete list now, so the walk's own region — and a
+    // walk-end commit that hands the END state to the interpreter with no
+    // replay — sees the mutation exactly once.  The displaced element goes
+    // into the undo log first: a walk that does NOT commit returns to the
+    // legacy replay, which re-executes the region and must find the
+    // pre-walk heap (see `FBW_STORE_JOURNAL`).
+    let Some(displaced) = (unsafe { pyre_object::w_list_getitem(list_obj, index) }) else {
+        unreachable!(
+            "store_subscr specialization: in-bounds index {index} has no element \
+             (strategy/bounds gates above admitted it)"
+        );
+    };
+    // `w_list_getitem` boxes the displaced int/float; that allocation can
+    // run a minor collection and move the operands, so re-read the
+    // forwarded refs from the shadow before touching the heap.  (The
+    // freshly boxed `displaced` itself cannot move before the journal
+    // push roots it — nothing below allocates.)
+    let (Some(list_obj), Some(key_obj), Some(value_obj)) = (
+        walker_concrete_ref_object(ctx, list_op),
+        walker_concrete_ref_object(ctx, key_op),
+        walker_concrete_ref_object(ctx, value_op),
+    ) else {
+        unreachable!(
+            "store_subscr specialization: operand concrete vanished from the shadow \
+             across the displaced-element boxing"
+        );
+    };
+    fbw_store_journal_push(list_obj, key_obj, displaced);
+    let stored = unsafe { pyre_object::w_list_setitem(list_obj, index, value_obj) };
+    debug_assert!(
+        stored,
+        "store_subscr specialization: in-bounds store failed"
+    );
     Ok(Some(()))
 }
 
@@ -8970,17 +9157,23 @@ fn dispatch_residual_call_iIRd_kind(
         // `symbolic_fnaddr_for_path` hashes whose bits ≥ 47 are set)
         // so unregistered helpers degrade gracefully to recording-only
         // instead of SIGBUSing.
-        let resid_raised = matches!(
-            try_execute_residual_call_via_executor(
-                ctx,
-                call_opcode,
-                &allboxes,
-                call_descr,
-                recorded,
-                op.pc,
-            )?,
-            Some(Err(_))
-        );
+        let resid_exec = try_execute_residual_call_via_executor(
+            ctx,
+            call_opcode,
+            &allboxes,
+            call_descr,
+            recorded,
+            op.pc,
+        )?;
+        // A `None` leaves the call recorded symbolically WITHOUT running
+        // it — a side effect only the legacy replay applies, so the
+        // walk-end no-replay commit must stay off for this trace (see
+        // `FBW_UNJOURNALED_EFFECT`).  Pure/elidable calls never reach
+        // this dispatcher (they fold via the pure-call executor).
+        if resid_exec.is_none() {
+            fbw_mark_unjournaled_effect();
+        }
+        let resid_raised = matches!(resid_exec, Some(Err(_)));
         debug_assert!(
             !resid_raised || can_raise,
             "dispatch_residual_call_iIRd_kind: helper raised on a \
@@ -9160,17 +9353,23 @@ fn dispatch_residual_call_iIRFd_kind(
         // `symbolic_fnaddr_for_path` hashes whose bits ≥ 47 are set)
         // so unregistered helpers degrade gracefully to recording-only
         // instead of SIGBUSing.
-        let resid_raised = matches!(
-            try_execute_residual_call_via_executor(
-                ctx,
-                call_opcode,
-                &allboxes,
-                call_descr,
-                recorded,
-                op.pc,
-            )?,
-            Some(Err(_))
-        );
+        let resid_exec = try_execute_residual_call_via_executor(
+            ctx,
+            call_opcode,
+            &allboxes,
+            call_descr,
+            recorded,
+            op.pc,
+        )?;
+        // A `None` leaves the call recorded symbolically WITHOUT running
+        // it — a side effect only the legacy replay applies, so the
+        // walk-end no-replay commit must stay off for this trace (see
+        // `FBW_UNJOURNALED_EFFECT`).  Pure/elidable calls never reach
+        // this dispatcher (they fold via the pure-call executor).
+        if resid_exec.is_none() {
+            fbw_mark_unjournaled_effect();
+        }
+        let resid_raised = matches!(resid_exec, Some(Err(_)));
         debug_assert!(
             !resid_raised || can_raise,
             "dispatch_residual_call_iIRFd_kind: helper raised on a \

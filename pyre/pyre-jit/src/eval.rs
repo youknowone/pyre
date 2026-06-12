@@ -1689,6 +1689,14 @@ thread_local! {
         // `majit_metainterp::MetaInterp::walk_active_trace_refs`.
         majit_gc::shadow_stack::register_extra_root_walker(active_trace_root_walker);
         majit_gc::shadow_stack::register_extra_root_walker(compile_snapshot_root_walker);
+        // framework.py `root_walker.walk_roots` parity for the full-body
+        // walk's store-undo journal: the `(list, key, displaced)` triples
+        // hold nursery refs across the rest of the walk (residual calls
+        // allocate, and a minor collection moves nursery objects). See
+        // `pyre_jit_trace::jitcode_dispatch::fbw_store_journal_root_walker`.
+        majit_gc::shadow_stack::register_extra_root_walker(
+            pyre_jit_trace::jitcode_dispatch::fbw_store_journal_root_walker,
+        );
         // pyre's temporary mapdict side table mirrors PyPy fields that are
         // normally traced by the translated GC. Walk its value slots
         // explicitly until the table is folded into the object layout.

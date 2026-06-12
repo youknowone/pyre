@@ -2048,6 +2048,16 @@ pub fn trace_and_compile_from_bridge(
     // If the driver is no longer tracing, the bridge was compiled
     // (or aborted) inside merge_point. Check whether a bridge was
     // actually attached to distinguish success from abort.
+    //
+    // pyjitpl.py:3057 raise_continue_running_normally: a trace that
+    // reached a merge point exits with ContinueRunningNormally from the
+    // CURRENT state — never through the blackhole-from-guard path. A
+    // committed walk already executed the region and the live frame
+    // adopted its end state above, so the caller must continue running
+    // normally even when the trace closed as a new loop at an inner
+    // header instead of attaching a bridge to this guard; resuming in
+    // the blackhole would re-apply every walked side effect from the
+    // guard-time values.
     let tracing_active = {
         let (driver, _) = crate::eval::driver_pair();
         driver.is_tracing()
@@ -2055,11 +2065,11 @@ pub fn trace_and_compile_from_bridge(
     if !tracing_active {
         if majit_metainterp::majit_log_enabled() {
             eprintln!(
-                "[jit][bridge-trace] trace ended at resume_pc={} key={} compiled={}",
-                resume_pc, green_key, compiled
+                "[jit][bridge-trace] trace ended at resume_pc={} key={} compiled={} adopted={}",
+                resume_pc, green_key, compiled, adopted_walk_end_state
             );
         }
-        return compiled;
+        return compiled || adopted_walk_end_state;
     }
 
     // Trace did not converge into a bridge. Abort like RPython's
@@ -2074,7 +2084,9 @@ pub fn trace_and_compile_from_bridge(
         let (driver, _) = crate::eval::driver_pair();
         driver.meta_interp_mut().abort_trace(false);
     }
-    false
+    // A committed walk has already executed the region into the live
+    // frame; the blackhole replay must not run even on this abort path.
+    adopted_walk_end_state
 }
 
 /// compile.py:701-717 handle_fail for call_assembler guard failures.
