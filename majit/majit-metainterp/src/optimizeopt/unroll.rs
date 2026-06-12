@@ -2106,6 +2106,7 @@ impl ExportedState {
             visitor: &mut dyn FnMut(&mut GcRef),
         ) {
             visit_op(&entry.op, visitor);
+            entry.res.walk_const_ptr_refs(visitor);
             if let Some(source) = entry.same_as_source.as_ref() {
                 source.walk_const_ptr_refs(visitor);
             }
@@ -2217,6 +2218,7 @@ impl ExportedState {
 
         for preamble_op in &self.exported_short_boxes {
             visit_op(&preamble_op.op, &mut visit);
+            visit(preamble_op.res.to_opref());
             if let Some(source) = preamble_op.same_as_source.as_ref() {
                 visit(source.to_opref());
             }
@@ -5613,6 +5615,7 @@ mod tests {
             exported_infos,
             vec![PreambleOp {
                 op: Op::new(OpCode::SameAsR, &[BoxRef::from_opref(old_ref)]),
+                res: BoxRef::from_opref(old_ref),
                 kind: PreambleOpKind::Pure,
                 label_arg_idx: None,
                 invented_name: false,
@@ -6383,6 +6386,7 @@ mod tests {
                     op.pos.set(OpRef::int_op(11));
                     op
                 },
+                res: BoxRef::from_opref(OpRef::int_op(11)),
                 kind: crate::optimizeopt::shortpreamble::PreambleOpKind::Heap,
                 label_arg_idx: Some(1),
                 invented_name: false,
@@ -6442,6 +6446,7 @@ mod tests {
                     op.pos.set(OpRef::int_op(11));
                     op
                 },
+                res: BoxRef::from_opref(OpRef::int_op(11)),
                 kind: crate::optimizeopt::shortpreamble::PreambleOpKind::Pure,
                 label_arg_idx: Some(1),
                 invented_name: false,
@@ -6499,6 +6504,7 @@ mod tests {
                     op.pos.set(OpRef::int_op(11));
                     op
                 },
+                res: BoxRef::from_opref(OpRef::int_op(11)),
                 kind: crate::optimizeopt::shortpreamble::PreambleOpKind::LoopInvariant,
                 label_arg_idx: Some(1),
                 invented_name: false,
@@ -6556,6 +6562,7 @@ mod tests {
                     op.pos.set(source);
                     op
                 },
+                res: BoxRef::from_opref(source),
                 kind: crate::optimizeopt::shortpreamble::PreambleOpKind::LoopInvariant,
                 label_arg_idx: Some(0),
                 invented_name: false,
@@ -6615,6 +6622,7 @@ mod tests {
                     op.pos.set(OpRef::int_op(20));
                     op
                 },
+                res: BoxRef::from_opref(OpRef::int_op(20)),
                 kind: crate::optimizeopt::shortpreamble::PreambleOpKind::Pure,
                 label_arg_idx: None,
                 invented_name: false,
@@ -6702,6 +6710,7 @@ mod tests {
                     op.pos.set(OpRef::ref_op(19));
                     op
                 },
+                res: BoxRef::from_opref(OpRef::ref_op(19)),
                 kind: crate::optimizeopt::shortpreamble::PreambleOpKind::Heap,
                 label_arg_idx: None,
                 invented_name: false,
@@ -6777,6 +6786,7 @@ mod tests {
                     op.pos.set(OpRef::int_op(30));
                     op
                 },
+                res: BoxRef::from_opref(OpRef::int_op(30)),
                 kind: crate::optimizeopt::shortpreamble::PreambleOpKind::Pure,
                 label_arg_idx: None,
                 invented_name: true,

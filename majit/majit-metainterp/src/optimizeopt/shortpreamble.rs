@@ -333,6 +333,11 @@ pub enum PreambleOpKind {
 pub struct PreambleOp {
     /// The operation to replay.
     pub op: Op,
+    /// `short_op.res` — the result box this entry produces. Identity-
+    /// bearing on exported entries (threaded from the preview
+    /// `ProducedShortOp.res`); on potential-op entries it is a
+    /// position-only mint that `add_op_to_short` re-resolves via ctx.
+    pub res: crate::r#box::BoxRef,
     /// Classification of this operation.
     pub kind: PreambleOpKind,
     /// Index of the argument in the label (None if not a label arg).
@@ -601,6 +606,7 @@ impl ShortBoxes {
             // shortpreamble.py:371-373: const_short_boxes.append(HeapOp(...))
             let label_arg_idx = self.lookup_label_arg(result);
             self.const_short_boxes.push(PreambleOp {
+                res: BoxRef::from_opref(op.pos.get()),
                 op,
                 kind: PreambleOpKind::Heap,
                 label_arg_idx,
@@ -641,15 +647,15 @@ impl ShortBoxes {
         }
         let label_arg_idx = self.lookup_label_arg(arg);
         // shortpreamble.py:257 `ShortInputArg(box, renamed)` — the SAME_AS
-        // replay arg is the label-arg Box itself; bind its producer.
-        let mut same_as = Op::new(
-            OpCode::same_as_for_type(arg_type),
-            &[ctx.materialize_box_at(arg)],
-        );
+        // replay arg is the label-arg Box itself (= `res`); bind its
+        // producer once and share the object.
+        let arg_box = ctx.materialize_box_at(arg);
+        let mut same_as = Op::new(OpCode::same_as_for_type(arg_type), &[arg_box.clone()]);
         same_as.pos.set(arg);
         self.potential_ops.insert(
             arg,
             PotentialShortOp::Preamble(PreambleOp {
+                res: arg_box,
                 op: same_as,
                 kind: PreambleOpKind::InputArg,
                 label_arg_idx,
@@ -849,6 +855,7 @@ impl ShortBoxes {
     pub fn add_potential_op(&mut self, label_arg_idx: Option<usize>, op: Op, kind: PreambleOpKind) {
         let result = op.pos.get();
         let pop = PotentialShortOp::Preamble(PreambleOp {
+            res: BoxRef::from_opref(result),
             op,
             kind,
             label_arg_idx,
@@ -929,6 +936,7 @@ impl CollectedExtendedShortPreambleBuilder {
     pub fn add_guard(&mut self, op: Op) {
         let label_arg_idx = self.lookup_label_arg(op.pos.get());
         self.guards.push(PreambleOp {
+            res: BoxRef::from_opref(op.pos.get()),
             op,
             kind: PreambleOpKind::Guard,
             label_arg_idx,
@@ -941,6 +949,7 @@ impl CollectedExtendedShortPreambleBuilder {
     pub fn add_pure_op(&mut self, op: Op) {
         let label_arg_idx = self.lookup_label_arg(op.pos.get());
         self.pure_ops.push(PreambleOp {
+            res: BoxRef::from_opref(op.pos.get()),
             op,
             kind: PreambleOpKind::Pure,
             label_arg_idx,
@@ -953,6 +962,7 @@ impl CollectedExtendedShortPreambleBuilder {
     pub fn add_heap_op(&mut self, op: Op) {
         let label_arg_idx = self.lookup_label_arg(op.pos.get());
         self.heap_ops.push(PreambleOp {
+            res: BoxRef::from_opref(op.pos.get()),
             op,
             kind: PreambleOpKind::Heap,
             label_arg_idx,
@@ -965,6 +975,7 @@ impl CollectedExtendedShortPreambleBuilder {
     pub fn add_loopinvariant_op(&mut self, op: Op) {
         let label_arg_idx = self.lookup_label_arg(op.pos.get());
         self.loopinvariant_ops.push(PreambleOp {
+            res: BoxRef::from_opref(op.pos.get()),
             op,
             kind: PreambleOpKind::LoopInvariant,
             label_arg_idx,
@@ -2929,11 +2940,10 @@ pub fn produced_short_boxes_from_exported_boxes(
                 preamble_op.pos.get(),
                 ProducedShortOp {
                     kind: entry.kind.clone(),
-                    // Position-only mint at the export boundary: the
-                    // exported `PreambleOp` entries do not carry the
-                    // Phase-1 res box (re-homes with
-                    // `ExportedState.exported_short_boxes`).
-                    res: BoxRef::from_opref(preamble_op.pos.get()),
+                    // shortpreamble.py:58/110 short_op.res — the exported
+                    // entry carries the Phase-1 res box across the
+                    // boundary; reuse the SAME object.
+                    res: entry.res.clone(),
                     preamble_op: std::rc::Rc::new(preamble_op),
                     invented_name: entry.invented_name,
                     same_as_source: entry.same_as_source.clone(),
@@ -3287,6 +3297,7 @@ mod tests {
                     op.pos.set(OpRef::int_op(7));
                     op
                 },
+                res: BoxRef::from_opref(OpRef::int_op(7)),
                 kind: PreambleOpKind::Pure,
                 label_arg_idx: None,
                 invented_name: false,
@@ -3304,6 +3315,7 @@ mod tests {
                     op.pos.set(OpRef::int_op(8));
                     op
                 },
+                res: BoxRef::from_opref(OpRef::int_op(8)),
                 kind: PreambleOpKind::Pure,
                 label_arg_idx: None,
                 invented_name: false,
@@ -3347,6 +3359,7 @@ mod tests {
         let exported = vec![
             PreambleOp {
                 op: ovf,
+                res: BoxRef::from_opref(OpRef::int_op(20)),
                 kind: PreambleOpKind::Pure,
                 label_arg_idx: None,
                 invented_name: false,
@@ -3354,6 +3367,7 @@ mod tests {
             },
             PreambleOp {
                 op: guard,
+                res: BoxRef::none(),
                 kind: PreambleOpKind::Guard,
                 label_arg_idx: None,
                 invented_name: false,

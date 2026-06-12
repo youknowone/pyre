@@ -2852,6 +2852,11 @@ impl Optimizer {
                     }
                     crate::optimizeopt::shortpreamble::PreambleOp {
                         op: preamble_op,
+                        // short_op.res travels with the entry — the SAME
+                        // box object the preview ProducedShortOp carries,
+                        // so the export/re-import round trip preserves
+                        // upstream Box identity.
+                        res: produced.res.clone(),
                         kind: produced.kind,
                         label_arg_idx: short_boxes.lookup_label_arg(canonical_result),
                         invented_name: produced.invented_name,
@@ -3273,6 +3278,19 @@ impl Optimizer {
                         let mut src_opref = src.to_opref();
                         remap_opref(&mut src_opref);
                         *src = BoxRef::from_opref(src_opref);
+                    }
+                    // res: a bound box live-tracks its producer through the
+                    // op handle — the producer's `Op.pos` was already
+                    // remapped above, so refreshing the position Cell from
+                    // it is idempotent (no double-map). Position-only mints
+                    // (test fixtures) go through the remap table instead;
+                    // `set_position` is a no-op for InputArg/Const kinds.
+                    if let Some(op) = entry.res.bound_op() {
+                        entry.res.set_position(op.pos.get().raw());
+                    } else {
+                        let mut res_opref = entry.res.to_opref();
+                        remap_opref(&mut res_opref);
+                        entry.res.set_position(res_opref.raw());
                     }
                 }
             }
@@ -6237,6 +6255,7 @@ mod tests {
             &[BoxRef::from_opref(OpRef::int_op(0))],
             &[crate::optimizeopt::shortpreamble::PreambleOp {
                 op: preamble_op.clone(),
+                res: BoxRef::from_opref(OpRef::int_op(14)),
                 kind: crate::optimizeopt::shortpreamble::PreambleOpKind::Pure,
                 label_arg_idx: None,
                 invented_name: false,
