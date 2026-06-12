@@ -677,12 +677,11 @@ pub fn slot_for_call_flavor(flavor: CallFlavor) -> majit_metainterp::EffectInfoS
 /// `W_TypeObject`, so the
 /// `getfield_gc_r` shape is not required.
 ///
-/// `getattr` is NOT elided (no longer in this list): the LoadAttr arm
-/// production-flipped from `emit_abort_permanent!` to a runnable
-/// residual lowering, so the `getattr` HLOp recorded by
-/// `emit_frontend_getattr` now routes through
-/// [`lower_getattr_hlop_to_insn`] (the `residual_call_r_r` →
-/// `bh_getattr_fn` shape) in the retired-family dispatcher.
+/// `getattr` is NOT in this set: the LoadAttr arm records the 4-arg
+/// rtyper-surrogate shape that [`lower_getattr_hlop_to_insn`] lowers
+/// to the `load_attr_fn` residual call (upstream `rclass.py:838
+/// rtype_getattr` would rewrite the HLOp post-rtyping; pyre's lowering
+/// arm is the surrogate for that pass).
 ///
 /// `setattr` — emitted by `codewriter.rs::emit_frontend_setattr`
 /// mirroring `flowcontext.py:1031-1036 op.setattr(w_obj,
@@ -3060,11 +3059,12 @@ pub struct LoweringContext {
     /// so the residual_call Insn has no result Register and no
     /// `ListI` (no scalar Int args).
     pub store_subscr_fn_idx: u16,
-    /// `getattr_fn` descrs-pool index.  LOAD_ATTR family (single HLOp
-    /// opname `getattr`, the `flowcontext.py:862-867 op.getattr` shape)
-    /// lowers to `residual_call_r_r` (two Ref inputs `[obj, w_name]`,
-    /// Ref result) via [`lower_getattr_hlop_to_insn`] — the no-rtyper
-    /// stand-in for `rclass.py:838 rtype_getattr → getfield_gc`.
+    /// `getattr_fn` descrs-pool index — `bh_getattr_fn(obj: Ref,
+    /// w_name: Ref) → Ref`, the interned-name residual for the bare
+    /// 2-arg `flowcontext.py:862-867 op.getattr` shape.  Dormant: the
+    /// LoadAttr arm records the 4-arg rtyper-surrogate shape lowered
+    /// via [`lower_getattr_hlop_to_insn`] to `load_attr_fn` instead,
+    /// and bare 2-arg `getattr` HLOps pass through.
     pub getattr_fn_idx: u16,
     /// `build_list_fn` descrs-pool index — see codewriter.rs:2401
     /// (`bind(assembler, cpu.build_list_fn as *const (),
@@ -3100,6 +3100,26 @@ pub struct LoweringContext {
     /// HLOp record), so the lowering arm returns `None`
     /// (passthrough) on nargs > 8.
     pub call_fn_idx_by_nargs: [u16; 9],
+    /// `load_attr_fn` descrs-pool index — see codewriter.rs
+    /// `register_helper_fn_pointers` for the production source
+    /// (`bind(assembler, cpu.load_attr_fn, CallFlavor::MayForce)`).
+    /// LOAD_ATTR family (HLOp opname `getattr`) lowers to
+    /// `residual_call_ir_r(ConstInt(fn_idx), ListI([name_idx]),
+    /// ListR([obj, code]), Descr) → reg` via
+    /// [`lower_getattr_hlop_to_insn`]; `bh_load_attr_fn(obj, code,
+    /// name_idx)` resolves the name through the code object and runs
+    /// `getattr` (may invoke user `__getattribute__` → `MayForce`).
+    pub load_attr_fn_idx: u16,
+    /// `load_method_self_fn` descrs-pool index — see codewriter.rs
+    /// `register_helper_fn_pointers` for the production source.
+    /// The LOOKUP_METHOD `null_or_self` half (pyre HLOp opname
+    /// `load_method_self`) lowers to `residual_call_ir_r(
+    /// ConstInt(fn_idx), ListI([name_idx]), ListR([obj, attr, code]),
+    /// Descr) → reg` via [`lower_load_method_self_hlop_to_insn`];
+    /// `bh_load_method_self_fn` is the pure
+    /// `compute_load_method_bound` binding decision (reads the type
+    /// MRO, never raises → `PlainCannotRaise`).
+    pub load_method_self_fn_idx: u16,
 }
 
 /// Map a BINARY_OP HLOp opname (`add`/.../`xor`/`getitem` plus the
@@ -3512,51 +3532,6 @@ fn build_load_global_fn_insn_from_operands(
         ],
         Register::new(Kind::Ref, dst_reg),
     )
-}
-
-/// Lower a `LOAD_ATTR` pre-rtype HLOp `getattr(w_obj, w_attributename)`
-/// → `result: Ref` (the `flowcontext.py:862-867 op.getattr` shape
-/// recorded by `emit_frontend_getattr`) to the post-rtype
-/// `residual_call_r_r(ConstInt(getattr_fn_idx), ListR([obj, w_name]),
-/// Descr) → reg` Insn — the no-rtyper stand-in for `rclass.py:838
-/// rtype_getattr → getfield_gc`.  `bh_getattr_fn(obj: Ref, w_name: Ref)
-/// → Ref` runs `getattr_str(obj, name)`; the name Constant lowers to
-/// the interned immortal str pointer via `lower_constant`
-/// ([`flatten_constant_operand`]'s `Str` arm → `box_str_constant`).
-/// `LOAD_ATTR` is walker-skipped during recording (the optimizer
-/// matches the `jit_getattr` trait-leg op, not this), so there is no
-/// known-result-cache constraint and the receiver lowers as a plain
-/// register operand.  `CallFlavor::Plain` (can-raise `AttributeError`,
-/// no virtual-force).
-pub fn lower_getattr_hlop_to_insn<F, LC>(
-    op: &super::flow::SpaceOperation,
-    ctx: &LoweringContext,
-    get_register: &mut F,
-    lower_constant: &mut LC,
-) -> Option<Insn>
-where
-    F: FnMut(super::flow::Variable) -> Register,
-    LC: FnMut(&Constant) -> Operand,
-{
-    if op.opname != "getattr" {
-        return None;
-    }
-    if op.args.len() != 2 {
-        return None;
-    }
-    let obj_operand = flatten_arg_with_lowering(&op.args[0], get_register, lower_constant);
-    let name_operand = flatten_arg_with_lowering(&op.args[1], get_register, lower_constant);
-    let dst_reg = match &op.result {
-        Some(super::flow::FlowValue::Variable(var)) => get_register(*var),
-        _ => return None,
-    };
-    Some(build_residual_call_r_r_insn_from_operands(
-        ctx.getattr_fn_idx,
-        vec![obj_operand, name_operand],
-        CallFlavor::Plain,
-        majit_ir::PyreHelperKind::None,
-        dst_reg,
-    ))
 }
 
 /// LOOKUP_METHOD attribute half — `bh_load_attr_fn(obj, code, name_idx)
@@ -4316,16 +4291,169 @@ where
     if let Some(insn) = lower_setitem_hlop_to_insn(op, ctx, get_register, lower_constant) {
         return Some(insn);
     }
-    if let Some(insn) = lower_getattr_hlop_to_insn(op, ctx, get_register, lower_constant) {
-        return Some(insn);
-    }
     if let Some(insn) = lower_new_sequence_hlop_to_insn(op, ctx, get_register, lower_constant) {
         return Some(insn);
     }
     if let Some(insn) = lower_simple_call_hlop_to_insn(op, ctx, get_register, lower_constant) {
         return Some(insn);
     }
+    if let Some(insn) = lower_getattr_hlop_to_insn(op, ctx, get_register, lower_constant) {
+        return Some(insn);
+    }
+    if let Some(insn) = lower_load_method_self_hlop_to_insn(op, ctx, get_register, lower_constant) {
+        return Some(insn);
+    }
     None
+}
+
+/// Resolve one `SpaceOperationArg` to a flat `Operand` (Variable →
+/// colored Register, Constant → `lower_constant`).  Returns `None`
+/// for the non-value arg variants so lowering arms can decline
+/// malformed shapes by passthrough, mirroring
+/// [`lower_simple_call_hlop_to_insn`]'s inline match.
+fn operand_for_value_arg<F, LC>(
+    arg: &super::flow::SpaceOperationArg,
+    get_register: &mut F,
+    lower_constant: &mut LC,
+) -> Option<Operand>
+where
+    F: FnMut(super::flow::Variable) -> Register,
+    LC: FnMut(&Constant) -> Operand,
+{
+    match arg {
+        super::flow::SpaceOperationArg::Value(super::flow::FlowValue::Variable(var)) => {
+            Some(Operand::Register(get_register(*var)))
+        }
+        super::flow::SpaceOperationArg::Value(super::flow::FlowValue::Constant(c)) => {
+            Some(lower_constant(c))
+        }
+        _ => None,
+    }
+}
+
+/// Read a `Constant::signed` arg as a plain `i64` (the rtyper-surrogate
+/// scalar operands the LOAD_ATTR family threads through the HLOp).
+fn const_int_for_value_arg(arg: &super::flow::SpaceOperationArg) -> Option<i64> {
+    match arg {
+        super::flow::SpaceOperationArg::Value(super::flow::FlowValue::Constant(Constant {
+            value: super::flow::ConstantValue::Signed(value),
+            ..
+        })) => Some(*value),
+        _ => None,
+    }
+}
+
+/// Lower a LOAD_ATTR pre-rtype HLOp `getattr(obj, w_attributename,
+/// code, name_idx)` → `result: Ref` to the post-rtype
+/// `residual_call_ir_r(ConstInt(load_attr_fn_idx), ListI([name_idx]),
+/// ListR([obj, code]), Descr) → reg` Insn — the
+/// [`build_load_attr_fn_residual_call_ir_r_insn`] shape.
+///
+/// Walker contract: pyre's LOAD_ATTR arm records upstream's 2-arg
+/// `op.getattr(w_obj, w_attributename)` (`flowcontext.py:862-867`)
+/// extended with two rtyper-surrogate operands — the code object as a
+/// post-rtype `Signed(ptr) + Kind::Ref` constant and the `co_names`
+/// index — because pyre runs no `rclass.py:838 rtype_getattr` to
+/// rewrite the HLOp and `bh_load_attr_fn(obj, code, name_idx)`
+/// resolves the name through the code object.  The shadow
+/// `w_attributename` string (args[1]) is not a lowerable operand
+/// (`flatten_constant_operand` has no string interning) and is
+/// carried for graph readability only.  A `getattr` with any other
+/// arity (legacy/test graphs) passes through.
+pub fn lower_getattr_hlop_to_insn<F, LC>(
+    op: &super::flow::SpaceOperation,
+    ctx: &LoweringContext,
+    get_register: &mut F,
+    lower_constant: &mut LC,
+) -> Option<Insn>
+where
+    F: FnMut(super::flow::Variable) -> Register,
+    LC: FnMut(&Constant) -> Operand,
+{
+    if op.opname != "getattr" || op.args.len() != 4 {
+        return None;
+    }
+    let obj = operand_for_value_arg(&op.args[0], get_register, lower_constant)?;
+    let code = operand_for_value_arg(&op.args[2], get_register, lower_constant)?;
+    let name_idx = const_int_for_value_arg(&op.args[3])?;
+    let dst_reg = match &op.result {
+        Some(super::flow::FlowValue::Variable(var)) => get_register(*var),
+        _ => return None,
+    };
+    let effect_info = effect_info_for_call_flavor(CallFlavor::MayForce);
+    let descr_operand = Operand::descr(DescrOperand::CallDescrStub(CallDescrStub {
+        effect_info,
+        arg_kinds: vec![Kind::Ref, Kind::Ref, Kind::Int],
+        result_kind: Some(Kind::Ref),
+    }));
+    Some(Insn::op_with_result(
+        "residual_call_ir_r",
+        vec![
+            Operand::ConstInt(ctx.load_attr_fn_idx as i64),
+            Operand::ListOfKind(ListOfKind::new(
+                Kind::Int,
+                vec![Operand::ConstInt(name_idx)],
+            )),
+            Operand::ListOfKind(ListOfKind::new(Kind::Ref, vec![obj, code])),
+            descr_operand,
+        ],
+        dst_reg,
+    ))
+}
+
+/// Lower the LOOKUP_METHOD `null_or_self` half — pyre HLOp
+/// `load_method_self(obj, attr, code, name_idx)` → `result: Ref` — to
+/// `residual_call_ir_r(ConstInt(load_method_self_fn_idx),
+/// ListI([name_idx]), ListR([obj, attr, code]), Descr) → reg`, the
+/// [`build_load_method_self_fn_residual_call_ir_r_insn`] shape.
+///
+/// The HLOp is pyre-specific: upstream PyPy has no two-value
+/// LOAD_METHOD at the flow-graph level (`callmethod.py` is an
+/// objspace-level bytecode rewrite), while pyre's CPython-3.13 method
+/// form must materialize the bound receiver as a second stack value.
+/// `attr` is the paired `getattr` HLOp's result; the binding decision
+/// (`compute_load_method_bound`) is a pure MRO inspection → the
+/// `PlainCannotRaise` flavor carries no trailing `-live-`.
+pub fn lower_load_method_self_hlop_to_insn<F, LC>(
+    op: &super::flow::SpaceOperation,
+    ctx: &LoweringContext,
+    get_register: &mut F,
+    lower_constant: &mut LC,
+) -> Option<Insn>
+where
+    F: FnMut(super::flow::Variable) -> Register,
+    LC: FnMut(&Constant) -> Operand,
+{
+    if op.opname != "load_method_self" || op.args.len() != 4 {
+        return None;
+    }
+    let obj = operand_for_value_arg(&op.args[0], get_register, lower_constant)?;
+    let attr = operand_for_value_arg(&op.args[1], get_register, lower_constant)?;
+    let code = operand_for_value_arg(&op.args[2], get_register, lower_constant)?;
+    let name_idx = const_int_for_value_arg(&op.args[3])?;
+    let dst_reg = match &op.result {
+        Some(super::flow::FlowValue::Variable(var)) => get_register(*var),
+        _ => return None,
+    };
+    let effect_info = effect_info_for_call_flavor(CallFlavor::PlainCannotRaise);
+    let descr_operand = Operand::descr(DescrOperand::CallDescrStub(CallDescrStub {
+        effect_info,
+        arg_kinds: vec![Kind::Ref, Kind::Ref, Kind::Ref, Kind::Int],
+        result_kind: Some(Kind::Ref),
+    }));
+    Some(Insn::op_with_result(
+        "residual_call_ir_r",
+        vec![
+            Operand::ConstInt(ctx.load_method_self_fn_idx as i64),
+            Operand::ListOfKind(ListOfKind::new(
+                Kind::Int,
+                vec![Operand::ConstInt(name_idx)],
+            )),
+            Operand::ListOfKind(ListOfKind::new(Kind::Ref, vec![obj, attr, code])),
+            descr_operand,
+        ],
+        dst_reg,
+    ))
 }
 
 /// Lower a CALL-family pre-rtype HLOp `simple_call(callable, arg0,
@@ -5672,6 +5800,8 @@ mod tests {
             build_list_fn_idx: 0,
             build_tuple_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
+            load_attr_fn_idx: 0,
+            load_method_self_fn_idx: 0,
         };
         let mut on = SSARepr::new("setattr_on");
         let mut on_regallocs = make_regallocs();
@@ -5804,6 +5934,8 @@ mod tests {
             build_list_fn_idx: 0,
             build_tuple_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
+            load_attr_fn_idx: 0,
+            load_method_self_fn_idx: 0,
         };
 
         let mut ssarepr = SSARepr::new("retired_families");
@@ -5923,6 +6055,8 @@ mod tests {
             build_list_fn_idx: 0,
             build_tuple_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
+            load_attr_fn_idx: 0,
+            load_method_self_fn_idx: 0,
         };
 
         let mut ssarepr = SSARepr::new("trailing_live");
@@ -6005,6 +6139,8 @@ mod tests {
             build_list_fn_idx: 0,
             build_tuple_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
+            load_attr_fn_idx: 0,
+            load_method_self_fn_idx: 0,
         };
 
         let mut ssarepr = SSARepr::new("multi_block_lowering");
@@ -6131,6 +6267,8 @@ mod tests {
             build_list_fn_idx: 0,
             build_tuple_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
+            load_attr_fn_idx: 0,
+            load_method_self_fn_idx: 0,
         };
 
         let mut ssarepr = SSARepr::new("pyre_walker_2exit");
@@ -6302,6 +6440,8 @@ mod tests {
             build_list_fn_idx: 0,
             build_tuple_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
+            load_attr_fn_idx: 0,
+            load_method_self_fn_idx: 0,
         });
 
         let mut regallocs = perform_register_allocation_all_kinds(&graph);
@@ -6522,6 +6662,8 @@ mod tests {
             build_list_fn_idx: 0,
             build_tuple_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
+            load_attr_fn_idx: 0,
+            load_method_self_fn_idx: 0,
         };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -6608,6 +6750,8 @@ mod tests {
             build_list_fn_idx: 0,
             build_tuple_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
+            load_attr_fn_idx: 0,
+            load_method_self_fn_idx: 0,
         };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -6638,6 +6782,8 @@ mod tests {
             build_list_fn_idx: 0,
             build_tuple_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
+            load_attr_fn_idx: 0,
+            load_method_self_fn_idx: 0,
         };
 
         let hlop = SpaceOperation::new("sub", vec![lhs.into(), rhs.into()], Some(result.into()), 0);
@@ -6741,6 +6887,8 @@ mod tests {
             build_list_fn_idx: 0,
             build_tuple_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
+            load_attr_fn_idx: 0,
+            load_method_self_fn_idx: 0,
         };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -6803,6 +6951,8 @@ mod tests {
             build_list_fn_idx: 0,
             build_tuple_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
+            load_attr_fn_idx: 0,
+            load_method_self_fn_idx: 0,
         };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -6831,6 +6981,8 @@ mod tests {
             build_list_fn_idx: 0,
             build_tuple_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
+            load_attr_fn_idx: 0,
+            load_method_self_fn_idx: 0,
         };
         let hlop = SpaceOperation::new("eq", vec![lhs.into(), rhs.into()], Some(result.into()), 0);
         let mut get_register = identity_register_mapper();
@@ -6866,6 +7018,8 @@ mod tests {
             build_list_fn_idx: 0,
             build_tuple_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
+            load_attr_fn_idx: 0,
+            load_method_self_fn_idx: 0,
         };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -6928,6 +7082,8 @@ mod tests {
             build_list_fn_idx: 0,
             build_tuple_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
+            load_attr_fn_idx: 0,
+            load_method_self_fn_idx: 0,
         };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -6953,6 +7109,8 @@ mod tests {
             build_list_fn_idx: 0,
             build_tuple_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
+            load_attr_fn_idx: 0,
+            load_method_self_fn_idx: 0,
         };
         let hlop = SpaceOperation::new("bool", vec![cond.into()], Some(result.into()), 0);
         let mut get_register = identity_register_mapper();
@@ -6992,6 +7150,8 @@ mod tests {
             build_list_fn_idx: 0,
             build_tuple_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
+            load_attr_fn_idx: 0,
+            load_method_self_fn_idx: 0,
         };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -7047,6 +7207,8 @@ mod tests {
             build_list_fn_idx: 0,
             build_tuple_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
+            load_attr_fn_idx: 0,
+            load_method_self_fn_idx: 0,
         };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -7087,6 +7249,8 @@ mod tests {
             build_list_fn_idx: 0,
             build_tuple_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
+            load_attr_fn_idx: 0,
+            load_method_self_fn_idx: 0,
         };
         let hlop = SpaceOperation::new(
             "setitem",
@@ -7142,6 +7306,8 @@ mod tests {
             build_list_fn_idx: 0,
             build_tuple_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
+            load_attr_fn_idx: 0,
+            load_method_self_fn_idx: 0,
         };
         let mut get_register_a = identity_register_mapper();
         let mut get_register_b = identity_register_mapper();
@@ -7173,6 +7339,8 @@ mod tests {
             build_list_fn_idx: 0,
             build_tuple_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
+            load_attr_fn_idx: 0,
+            load_method_self_fn_idx: 0,
         };
         let mut get_register_a = identity_register_mapper();
         let mut get_register_b = identity_register_mapper();
@@ -7204,6 +7372,8 @@ mod tests {
             build_list_fn_idx: 0,
             build_tuple_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
+            load_attr_fn_idx: 0,
+            load_method_self_fn_idx: 0,
         };
         let mut get_register_a = identity_register_mapper();
         let mut get_register_b = identity_register_mapper();
@@ -7240,6 +7410,8 @@ mod tests {
             build_list_fn_idx: 0,
             build_tuple_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
+            load_attr_fn_idx: 0,
+            load_method_self_fn_idx: 0,
         };
         let mut get_register_a = identity_register_mapper();
         let mut get_register_b = identity_register_mapper();
@@ -7290,6 +7462,8 @@ mod tests {
             build_list_fn_idx: 0,
             build_tuple_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
+            load_attr_fn_idx: 0,
+            load_method_self_fn_idx: 0,
         };
         let mut get_register_a = identity_register_mapper();
         let mut get_register_b = identity_register_mapper();
@@ -8663,6 +8837,8 @@ mod tests {
             build_list_fn_idx: 0,
             build_tuple_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
+            load_attr_fn_idx: 0,
+            load_method_self_fn_idx: 0,
         };
         flatten_graph_for_test_with_lowering(&graph, &mut ssarepr, ctx, Some(cpu));
         ssarepr
@@ -8935,6 +9111,8 @@ mod tests {
             build_list_fn_idx: 0,
             build_tuple_fn_idx: 0,
             call_fn_idx_by_nargs,
+            load_attr_fn_idx: 0,
+            load_method_self_fn_idx: 0,
         };
         let null_or_self_var = Variable::new(VariableId(10), Kind::Ref);
         let op = super::super::flow::SpaceOperation::new(
@@ -9010,6 +9188,229 @@ mod tests {
                         index: 102
                     }),
                     "result register must come from the op's result Variable"
+                );
+            }
+            _ => panic!("expected Insn::Op, got {insn:?}"),
+        }
+    }
+
+    /// Shared fixture for the LOAD_ATTR-family lowering tests: a
+    /// `LoweringContext` with distinct fn indices plus the rtyper-
+    /// surrogate constants (code-object `Signed(ptr) + Kind::Ref`,
+    /// `co_names` index) the 4-arg HLOp shape threads through.
+    fn load_attr_lowering_fixture() -> (LoweringContext, Constant, Constant) {
+        let ctx = LoweringContext {
+            binary_op_fn_idx: 0,
+            compare_op_fn_idx: 0,
+            truth_fn_idx: 0,
+            store_subscr_fn_idx: 0,
+            build_list_fn_idx: 0,
+            build_tuple_fn_idx: 0,
+            call_fn_idx_by_nargs: [0; 9],
+            getattr_fn_idx: 0,
+            load_attr_fn_idx: 91,
+            load_method_self_fn_idx: 92,
+        };
+        let code_const = Constant::new(
+            super::super::flow::ConstantValue::Signed(0x2000),
+            Some(Kind::Ref),
+        );
+        let name_idx_const = Constant::signed(5);
+        (ctx, code_const, name_idx_const)
+    }
+
+    #[test]
+    fn lower_getattr_hlop_emits_load_attr_fn_residual() {
+        // `getattr(obj, w_attributename, code, name_idx)` →
+        // `residual_call_ir_r(ConstInt(load_attr_fn_idx),
+        // ListI([name_idx]), ListR([obj, code]), Descr) → reg`, the
+        // `build_load_attr_fn_residual_call_ir_r_insn` shape.  The shadow
+        // string operand (args[1]) is carried for graph readability and
+        // must NOT reach the lowered operand list.
+        let obj_var = Variable::new(VariableId(8), Kind::Ref);
+        let result_var = Variable::new(VariableId(9), Kind::Ref);
+        let (ctx, code_const, name_idx_const) = load_attr_lowering_fixture();
+        let op = super::super::flow::SpaceOperation::new(
+            "getattr",
+            vec![
+                obj_var.into(),
+                Constant::string("field").into(),
+                code_const.into(),
+                name_idx_const.into(),
+            ],
+            Some(result_var.into()),
+            0,
+        );
+        let mut get_register = |var: Variable| match var.id {
+            VariableId(8) => Register {
+                kind: Kind::Ref,
+                index: 101,
+            },
+            VariableId(9) => Register {
+                kind: Kind::Ref,
+                index: 102,
+            },
+            _ => panic!("unexpected var id {:?}", var.id),
+        };
+        let mut lower_constant = super::flatten_constant_operand_for_test;
+        let insn =
+            super::lower_getattr_hlop_to_insn(&op, &ctx, &mut get_register, &mut lower_constant)
+                .expect("4-arg getattr lowering must succeed");
+        match insn {
+            Insn::Op {
+                opname,
+                args,
+                result,
+            } => {
+                assert_eq!(opname, "residual_call_ir_r");
+                assert!(
+                    matches!(args[0], Operand::ConstInt(91)),
+                    "load_attr_fn pool index, got {:?}",
+                    args[0]
+                );
+                match &args[1] {
+                    Operand::ListOfKind(list) => {
+                        assert_eq!(list.kind, Kind::Int);
+                        assert!(
+                            matches!(&list.content[..], [Operand::ConstInt(5)]),
+                            "ListI = [name_idx], got {:?}",
+                            list.content
+                        );
+                    }
+                    other => panic!("expected ListI, got {other:?}"),
+                }
+                match &args[2] {
+                    Operand::ListOfKind(list) => {
+                        assert_eq!(list.kind, Kind::Ref);
+                        match &list.content[..] {
+                            [Operand::Register(r), Operand::ConstRef(0x2000)] => {
+                                assert_eq!(r.kind, Kind::Ref);
+                                assert_eq!(r.index, 101, "leading Ref operand must be obj");
+                            }
+                            other => panic!(
+                                "ListR must be [obj, code]; the shadow string must \
+                                 not appear, got {other:?}"
+                            ),
+                        }
+                    }
+                    other => panic!("expected ListR, got {other:?}"),
+                }
+                assert_eq!(
+                    result,
+                    Some(Register {
+                        kind: Kind::Ref,
+                        index: 102
+                    }),
+                );
+            }
+            _ => panic!("expected Insn::Op, got {insn:?}"),
+        }
+    }
+
+    #[test]
+    fn lower_getattr_hlop_declines_two_arg_legacy_shape() {
+        // Upstream's bare 2-arg `op.getattr(w_obj, w_attributename)`
+        // (legacy/test graphs without the rtyper-surrogate operands) must
+        // pass through, not lower with garbage operands.
+        let obj_var = Variable::new(VariableId(8), Kind::Ref);
+        let result_var = Variable::new(VariableId(9), Kind::Ref);
+        let (ctx, _, _) = load_attr_lowering_fixture();
+        let op = super::super::flow::SpaceOperation::new(
+            "getattr",
+            vec![obj_var.into(), Constant::string("field").into()],
+            Some(result_var.into()),
+            0,
+        );
+        let mut get_register = |_var: Variable| Register {
+            kind: Kind::Ref,
+            index: 101,
+        };
+        let mut lower_constant = super::flatten_constant_operand_for_test;
+        assert!(
+            super::lower_getattr_hlop_to_insn(&op, &ctx, &mut get_register, &mut lower_constant)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn lower_load_method_self_hlop_emits_load_method_self_fn_residual() {
+        // `load_method_self(obj, attr, code, name_idx)` →
+        // `residual_call_ir_r(ConstInt(load_method_self_fn_idx),
+        // ListI([name_idx]), ListR([obj, attr, code]), Descr) → reg`, the
+        // `build_load_method_self_fn_residual_call_ir_r_insn` shape.
+        let obj_var = Variable::new(VariableId(8), Kind::Ref);
+        let attr_var = Variable::new(VariableId(9), Kind::Ref);
+        let result_var = Variable::new(VariableId(10), Kind::Ref);
+        let (ctx, code_const, name_idx_const) = load_attr_lowering_fixture();
+        let op = super::super::flow::SpaceOperation::new(
+            "load_method_self",
+            vec![
+                obj_var.into(),
+                attr_var.into(),
+                code_const.into(),
+                name_idx_const.into(),
+            ],
+            Some(result_var.into()),
+            0,
+        );
+        let mut get_register = |var: Variable| match var.id {
+            VariableId(8) => Register {
+                kind: Kind::Ref,
+                index: 101,
+            },
+            VariableId(9) => Register {
+                kind: Kind::Ref,
+                index: 102,
+            },
+            VariableId(10) => Register {
+                kind: Kind::Ref,
+                index: 103,
+            },
+            _ => panic!("unexpected var id {:?}", var.id),
+        };
+        let mut lower_constant = super::flatten_constant_operand_for_test;
+        let insn = super::lower_load_method_self_hlop_to_insn(
+            &op,
+            &ctx,
+            &mut get_register,
+            &mut lower_constant,
+        )
+        .expect("load_method_self lowering must succeed");
+        match insn {
+            Insn::Op {
+                opname,
+                args,
+                result,
+            } => {
+                assert_eq!(opname, "residual_call_ir_r");
+                assert!(
+                    matches!(args[0], Operand::ConstInt(92)),
+                    "load_method_self_fn pool index, got {:?}",
+                    args[0]
+                );
+                match &args[2] {
+                    Operand::ListOfKind(list) => {
+                        assert_eq!(list.kind, Kind::Ref);
+                        match &list.content[..] {
+                            [
+                                Operand::Register(obj),
+                                Operand::Register(attr),
+                                Operand::ConstRef(0x2000),
+                            ] => {
+                                assert_eq!(obj.index, 101);
+                                assert_eq!(attr.index, 102);
+                            }
+                            other => panic!("ListR must be [obj, attr, code], got {other:?}"),
+                        }
+                    }
+                    other => panic!("expected ListR, got {other:?}"),
+                }
+                assert_eq!(
+                    result,
+                    Some(Register {
+                        kind: Kind::Ref,
+                        index: 103
+                    }),
                 );
             }
             _ => panic!("expected Insn::Op, got {insn:?}"),

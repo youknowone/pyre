@@ -2571,15 +2571,58 @@ fn emit_frontend_getattr(
     block: &super::flow::BlockRef,
     obj: super::flow::FlowValue,
     attr_name: super::flow::FlowValue,
+    code_const: super::flow::FlowValue,
+    name_idx_const: super::flow::FlowValue,
     offset: i64,
 ) -> super::flow::Variable {
     // flowcontext.py:862-867 LOAD_ATTR ->
-    // `op.getattr(w_obj, w_attributename).eval(self)`.
+    // `op.getattr(w_obj, w_attributename).eval(self)`, extended with
+    // two rtyper-surrogate operands (the code object as a post-rtype
+    // `Signed(ptr) + Kind::Ref` constant and the `co_names` index)
+    // that `flatten.rs::lower_getattr_hlop_to_insn` threads into the
+    // `bh_load_attr_fn(obj, code, name_idx)` residual — pyre runs no
+    // `rclass.py:838 rtype_getattr` to rewrite the HLOp post-record.
     emit_graph_op_with_result(
         graph,
         block,
         "getattr",
-        vec![obj.into(), attr_name.into()],
+        vec![
+            obj.into(),
+            attr_name.into(),
+            code_const.into(),
+            name_idx_const.into(),
+        ],
+        Kind::Ref,
+        offset,
+    )
+}
+
+/// LOOKUP_METHOD `null_or_self` half — pyre-specific HLOp (upstream
+/// PyPy's `callmethod.py` two-value LOAD_METHOD is an objspace-level
+/// rewrite with no flow-graph counterpart; pyre's CPython-3.13 method
+/// form materializes the bound receiver as a second stack value).
+/// `attr` is the paired `getattr` HLOp's result.  Lowered by
+/// `flatten.rs::lower_load_method_self_hlop_to_insn` to the
+/// `bh_load_method_self_fn(obj, attr, code, name_idx)` residual.
+fn emit_frontend_load_method_self(
+    graph: &mut super::flow::FunctionGraph,
+    block: &super::flow::BlockRef,
+    obj: super::flow::FlowValue,
+    attr: super::flow::FlowValue,
+    code_const: super::flow::FlowValue,
+    name_idx_const: super::flow::FlowValue,
+    offset: i64,
+) -> super::flow::Variable {
+    emit_graph_op_with_result(
+        graph,
+        block,
+        "load_method_self",
+        vec![
+            obj.into(),
+            attr.into(),
+            code_const.into(),
+            name_idx_const.into(),
+        ],
         Kind::Ref,
         offset,
     )
@@ -4235,6 +4278,8 @@ impl CodeWriter {
                     call_fn_7_idx,
                     call_fn_8_idx,
                 ],
+                load_attr_fn_idx,
+                load_method_self_fn_idx,
             });
         }
 
@@ -7198,60 +7243,72 @@ impl CodeWriter {
                             emit_abort_permanent!();
                         }
                         Instruction::LoadAttr { namei } => {
-                            // PyPy assemble.py gives LOAD_ATTR a net-0 stack effect.
-                            // pyre's CPython-3.13 method form pushes an extra
-                            // null/self sentinel, so keep current_depth in sync.
+                            // LOAD_ATTR net-0 (plain form); the CPython-3.13
+                            // method form pushes an extra null_or_self for a
+                            // net +1.  Recorded as graph HLOps the canonical
+                            // splice lowers to residual calls
+                            // (`flatten.rs::lower_getattr_hlop_to_insn` /
+                            // `lower_load_method_self_hlop_to_insn`):
+                            //   * `load_attr_fn(obj, code, name_idx)` →
+                            //     getattr(obj, name)
+                            //   * (method only) `load_method_self_fn(obj,
+                            //     attr, code, name_idx)` → bound receiver.
+                            // Stack order is the interpreter convention: attr
+                            // at the lower slot, null_or_self above it
+                            // (`load_method` pushes attr then bound; the CALL
+                            // arm pops null_or_self first).
                             let attr = namei.get(op_arg);
                             let name_idx = attr.name_idx() as usize;
                             let attr_name =
                                 super::flow::Constant::string(code.names[name_idx].as_str());
-                            // Pop the receiver; the graph-side `getattr` HLOp
-                            // carries `obj_value`, so the vacated slot index is
-                            // not consumed here.
+                            // rtyper-surrogate operands for the splice
+                            // lowering: the jitcode's own W_CodeObject as a
+                            // post-rtype `Signed(ptr) + Kind::Ref` constant
+                            // (per-code jitcode ⇒ fixed pointer) and the
+                            // co_names index `bh_load_attr_fn` resolves the
+                            // name with.
+                            let code_const: super::flow::FlowValue = super::flow::Constant::new(
+                                super::flow::ConstantValue::Signed(w_code as i64),
+                                Some(Kind::Ref),
+                            )
+                            .into();
+                            let name_idx_const: super::flow::FlowValue =
+                                super::flow::Constant::signed(name_idx as i64).into();
                             let _ = emit_popvalue_ref!(current_depth, py_pc);
                             let obj_value = pop_ref_or_fresh(&mut current_state, &mut graph);
                             let result_value = emit_frontend_getattr(
                                 &mut graph,
                                 &current_block.block(),
-                                obj_value,
+                                obj_value.clone(),
                                 attr_name.into(),
+                                code_const.clone(),
+                                name_idx_const.clone(),
                                 py_pc as i64,
                             );
-                            // The call shape is `[callable (lower), self_or_null
-                            // (top)]` (eval.rs load_method, shared_opcode.rs
-                            // opcode_call).  The method form lands the (bound)
-                            // attribute at the deeper slot and a `PY_NULL`
-                            // self-slot on top of it, mirroring the `LoadGlobal`
-                            // push-null variant; the bound attribute already
-                            // carries `self`, so the top slot is a bare null.
-                            let loaded_dst_reg = stack_base + current_depth;
-                            pin!(Some(result_value), loaded_dst_reg);
-                            // Runnable residual lowering for the blackhole/deopt
-                            // path: `rclass.py:838 rtype_getattr` rewrites
-                            // `getattr` → `getfield_gc` after rtyping; pyre has
-                            // no rtyper, so the `getattr` HLOp recorded by
-                            // `emit_frontend_getattr` above lowers to a
-                            // `bh_getattr_fn(obj, w_name)` residual call in the
-                            // canonical flatten driver
-                            // (`flatten::lower_getattr_hlop_to_insn`); the name
-                            // Constant lowers to its interned immortal str
-                            // pointer (`box_str_constant`).  LOAD_ATTR is
-                            // walker-skipped during recording
-                            // (`trace_opcode.rs walker_skip_opcodes`), so this
-                            // call never runs while a virtualizable is live; the
-                            // optimized trace records `jit_getattr` via the
-                            // trait leg.
-                            let result_fv: super::flow::FlowValue = result_value.into();
-                            current_state.stack.push(result_fv.clone());
-                            emit_pushvalue_ref!(current_depth, loaded_dst_reg, result_fv, py_pc);
-                            // Method form: push the `PY_NULL` self-slot on top
-                            // of the attribute (callable), matching the
-                            // interpreter `load_method` push order.
+                            pin!(Some(result_value), stack_base + current_depth);
+                            current_state.stack.push(result_value.into());
+                            emit_pushvalue_ref!(
+                                current_depth,
+                                stack_base + current_depth,
+                                result_value.into(),
+                                py_pc
+                            );
                             if attr.is_method() {
-                                current_state.stack.push(null_stack_sentinel());
-                                emit_pushvalue_ref_const!(
+                                let bound_value = emit_frontend_load_method_self(
+                                    &mut graph,
+                                    &current_block.block(),
+                                    obj_value,
+                                    result_value.into(),
+                                    code_const,
+                                    name_idx_const,
+                                    py_pc as i64,
+                                );
+                                pin!(Some(bound_value), stack_base + current_depth);
+                                current_state.stack.push(bound_value.into());
+                                emit_pushvalue_ref!(
                                     current_depth,
-                                    pyre_object::PY_NULL as i64,
+                                    stack_base + current_depth,
+                                    bound_value.into(),
                                     py_pc
                                 );
                             }
@@ -9859,8 +9916,23 @@ mod tests {
         let mut graph = FunctionGraph::new("getattr", start.clone(), None);
         let obj = Variable::new(VariableId(34), Kind::Ref);
         let name = Constant::string("field");
+        // rtyper-surrogate operands (post-rtype code-object ConstRef + the
+        // co_names index) trail the upstream 2-arg flowspace shape.
+        let code_const = Constant::new(
+            super::super::flow::ConstantValue::Signed(0x1000),
+            Some(Kind::Ref),
+        );
+        let name_idx_const = Constant::signed(3);
 
-        let result = emit_frontend_getattr(&mut graph, &start, obj.into(), name.clone().into(), 57);
+        let result = emit_frontend_getattr(
+            &mut graph,
+            &start,
+            obj.into(),
+            name.clone().into(),
+            code_const.clone().into(),
+            name_idx_const.clone().into(),
+            57,
+        );
 
         let block = start.borrow();
         let op = block
@@ -9869,7 +9941,15 @@ mod tests {
             .expect("getattr op should be recorded");
         assert_eq!(op.opname, "getattr");
         assert_eq!(op.offset, 57);
-        assert_eq!(op.args, vec![obj.into(), name.into()]);
+        assert_eq!(
+            op.args,
+            vec![
+                obj.into(),
+                name.into(),
+                code_const.into(),
+                name_idx_const.into(),
+            ]
+        );
         assert_eq!(op.result, Some(result.into()));
     }
 
