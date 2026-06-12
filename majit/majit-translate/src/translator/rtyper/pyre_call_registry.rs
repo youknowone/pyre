@@ -552,6 +552,20 @@ impl PyreCallRegistry {
                     {
                         return false;
                     }
+                } else {
+                    // Impl-method-shaped query (`[Owner, leaf]`, pre-leaf
+                    // PascalCase): the candidate must carry the query as
+                    // a suffix.  Method resolution never crosses the
+                    // owner-type boundary — upstream resolves through the
+                    // receiver's `ClassDesc`, so a same-leaf method of a
+                    // different type is a different desc.  Without this
+                    // gate, an unregistered `[OwnerA, leaf]` query would
+                    // capture the sole `[OwnerB, leaf]` registration.
+                    if cand_segs.len() < segments.len()
+                        || cand_segs[cand_segs.len() - segments.len()..] != *segments
+                    {
+                        return false;
+                    }
                 }
                 true
             })

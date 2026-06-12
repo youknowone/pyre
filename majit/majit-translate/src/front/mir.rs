@@ -3545,7 +3545,9 @@ impl<'a> Lowering<'a> {
 
     /// Resolve a Charon `CallKind` to a flattened path segment list the
     /// codewriter consumes as `CallTarget::FunctionPath`, plus an
-    /// optional `(owner_root_leaf, method_leaf)` pair for impl methods.
+    /// optional `(owner_root_leaf, method_leaf)` pair for impl methods,
+    /// plus the `[Owner, leaf]` registration spelling when the callee is
+    /// an inherent-impl *associated function* (no receiver).
     ///
     /// The method hint is `Some` when the FunDecl's raw name segments
     /// encode an `Impl` block immediately before the leaf `Ident` —
@@ -3555,6 +3557,14 @@ impl<'a> Lowering<'a> {
     /// `CallTarget::FunctionPath` so the annotator can prepend a
     /// classdef-bound `SomeInstance` for `self`; see the comment at
     /// the use site in [`Self::lower_call`].
+    ///
+    /// The associated-function spelling is computed only when the
+    /// method hint is `None` (a receiver-shaped callee never consumes
+    /// it), and only the `CallTarget::FunctionPath` construction in
+    /// `lower_call` applies it — the raw `name_path()` segments stay
+    /// untouched for the std special-case matchers (`checked_neg` /
+    /// `try_from` / `into` / `expect`) that key on the
+    /// `[.., "<Impl>", leaf]` shape.
     fn call_target_segments(
         &self,
         mir_bb: usize,
