@@ -857,6 +857,16 @@ struct Lowering<'a> {
     /// Distinguishes the collapse case from a genuine Ref tuple `.N` read
     /// in [`Lowering::resolve_place`].
     binop_result_locals: std::collections::HashSet<usize>,
+    /// MIR locals bound by a devirtualized workspace `Index::index` /
+    /// `IndexMut::index_mut` call, mapped to the `(base, index)`
+    /// operand pair.  Those impls bottom out at raw-slice
+    /// construction (`as_mut_slice` → `from_raw_parts`), which has no
+    /// graph lowering, so the callsite is lowered as RPython's
+    /// getarrayitem instead and the paired `*p = v` write
+    /// ([`Lowering::emit_projection_write`] `Deref` arm) consults
+    /// this map to emit `ArrayWrite` rather than the opaque
+    /// `__deref_write` marker.
+    index_elem_alias: std::collections::HashMap<usize, (Variable, Variable)>,
 }
 
 impl<'a> Lowering<'a> {
@@ -982,6 +992,7 @@ impl<'a> Lowering<'a> {
             block_positional_conflict: vec![vec![false; n_locals]; body.body.len()],
             positional_aggregate_locals: std::collections::HashMap::new(),
             binop_result_locals: compute_binop_result_locals(body),
+            index_elem_alias: std::collections::HashMap::new(),
         })
     }
 
@@ -1694,19 +1705,42 @@ impl<'a> Lowering<'a> {
         value: Variable,
         dest_ty: &TyRef,
     ) -> Result<(), LowerError> {
+        let inner_local = match &inner.kind {
+            PlaceKind::Local(i) => Some(*i as usize),
+            _ => None,
+        };
         let base = self.resolve_place(mir_bb, inner)?;
         let bb_id = self.block_id[mir_bb];
         let op = match &elem {
             ProjectionElem::Atom(s) if s == "Deref" => {
-                // `*p = val` — no IR-level FieldWrite/ArrayWrite fits.
-                // Emit a synthetic 2-arg Call so the write remains
-                // visible to the downstream side-effect tracking.
-                OpKind::Call {
-                    target: CallTarget::FunctionPath {
-                        segments: vec!["__deref_write".to_string()],
-                    },
-                    args: vec![base, value],
-                    result_ty: ValueType::Int,
+                if let Some((arr, idx)) = inner_local
+                    .and_then(|i| self.index_elem_alias.get(&i))
+                    .cloned()
+                {
+                    // `*p = val` where `p` was bound by a
+                    // devirtualized workspace `index_mut` call is the
+                    // write half of `arr[i] = val` — emit the array
+                    // write directly (setarrayitem).
+                    OpKind::ArrayWrite {
+                        base: arr,
+                        index: idx,
+                        value,
+                        item_ty: tyref_to_value_type(dest_ty, self.llbc),
+                        array_type_id: None,
+                        nolength: false,
+                    }
+                } else {
+                    // `*p = val` — no IR-level FieldWrite/ArrayWrite
+                    // fits.  Emit a synthetic 2-arg Call so the write
+                    // remains visible to the downstream side-effect
+                    // tracking.
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath {
+                            segments: vec!["__deref_write".to_string()],
+                        },
+                        args: vec![base, value],
+                        result_ty: ValueType::Int,
+                    }
                 }
             }
             ProjectionElem::Tagged(v) => {
@@ -2853,6 +2887,39 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
+                // Workspace `Index::index` / `IndexMut::index_mut`
+                // impls (`FixedObjectArray` and friends) bottom out at
+                // raw-slice construction (`as_mut_slice` →
+                // `from_raw_parts`), which has no graph lowering.  The
+                // callsite is RPython's getarrayitem: lower it as an
+                // eager `ArrayRead` for value uses (`x = arr[i]`
+                // desugars to `x = *index(&arr, i)` and the `Deref`
+                // read collapses to the bound element), and record the
+                // `(base, index)` pair so the paired `*p = v` write
+                // (`arr[i] = v` desugar) emits `ArrayWrite` from the
+                // `emit_projection_write` `Deref` arm.
+                if args.len() == 2 && self.is_workspace_index_call(&reg) {
+                    let res = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(res.clone()),
+                        kind: OpKind::ArrayRead {
+                            base: args[0].clone(),
+                            index: args[1].clone(),
+                            item_ty: ValueType::Ref(None),
+                            array_type_id: None,
+                            nolength: false,
+                        },
+                    });
+                    self.index_elem_alias
+                        .insert(dest_local, (args[0].clone(), args[1].clone()));
+                    self.local_var[dest_local] = Some(res);
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
                 // Resolve the target function's fully-qualified path
                 // through the FunId → FunDecl table. `Trait` here is
                 // Charon's "trait-bound generic resolved at extraction
@@ -3203,6 +3270,26 @@ impl<'a> Lowering<'a> {
     /// Returns `None` (caller keeps the blanket-into path) when the
     /// obligation is unresolved (`kind` is a clause/builtin rather
     /// than `TraitImpl`) or any table lookup misses.
+    /// `arr[i]` / `arr[i] = v` on a workspace fixed-array type —
+    /// resolves to its `Index::index` / `IndexMut::index_mut` impl,
+    /// whose body bottoms out at raw-slice construction
+    /// (`as_mut_slice` → `from_raw_parts`) with no graph lowering.
+    /// The structs are length-prefixed GcArray layouts (see
+    /// `FixedObjectArray`), so the callsite IS RPython's
+    /// getarrayitem/setarrayitem on the receiver and is devirtualized
+    /// to `ArrayRead`/`ArrayWrite` by the caller.
+    fn is_workspace_index_call(&self, reg: &RegularCall) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        let Some(fd) = self.llbc.fn_by_id(*id) else {
+            return false;
+        };
+        let path = fd.item_meta.name_path();
+        let leaf = path.rsplit("::").next().unwrap_or("");
+        (leaf == "index" || leaf == "index_mut") && path.starts_with("pyre_")
+    }
+
     fn blanket_into_devirt(&self, reg: &RegularCall) -> Option<IntoDevirt> {
         let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
             return None;
