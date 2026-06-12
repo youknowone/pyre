@@ -2929,9 +2929,10 @@ pub fn rtyper_makerepr(
                 )?) as std::sync::Arc<dyn Repr>,
             )
         }
-        SomeValue::List(_) => Err(TyperError::missing_rtype_operation(
-            "SomeList.rtyper_makerepr — port rpython/rtyper/rlist.py ListRepr",
-        )),
+        SomeValue::List(l) => Err(TyperError::missing_rtype_operation(format!(
+            "SomeList.rtyper_makerepr — port rpython/rtyper/rlist.py ListRepr (listdef: {:?})",
+            l.listdef
+        ))),
         SomeValue::Dict(_) => Err(TyperError::missing_rtype_operation(
             "SomeDict.rtyper_makerepr — port rpython/rtyper/rdict.py DictRepr",
         )),
