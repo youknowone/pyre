@@ -1513,6 +1513,11 @@ pub fn lltype_cast_pointer(
     let can_be_none = match arg_at(args_s, 1, "lltype_cast_pointer") {
         SomeValue::Instance(inst) => inst.can_be_none,
         SomeValue::Ptr(_) => false,
+        // A constant-None operand is a null pointer.  Upstream null
+        // constants annotate as SomePtr and pass the lltype.py:971
+        // assert; pyre carries them as SomeNone, and the downcast of
+        // a null pointer stays null.
+        SomeValue::None_(_) => true,
         other => {
             return Err(AnnotatorError::new(format!(
                 "cast_pointer(): casting of non-pointer: {other:?}"
@@ -1968,6 +1973,26 @@ mod tests {
                 .unwrap_or("")
                 .contains("casting of non-pointer"),
         );
+    }
+
+    #[test]
+    fn lltype_cast_pointer_accepts_constant_none_as_null() {
+        // A constant-None operand is a null pointer (upstream null
+        // constants are SomePtr and pass the lltype.py:971 assert);
+        // the result is the target class, can_be_none=true.
+        let bk = bk();
+        let host = bk.intern_class_by_qualname("W_CastTarget");
+        let s_cls = bk.immutablevalue(&ConstValue::HostObject(host)).unwrap();
+        let s_none = bk.immutablevalue(&ConstValue::None).unwrap();
+        let result = lltype_cast_pointer(&bk, &[Some(s_cls), Some(s_none)], &no_kwds()).unwrap();
+        match result {
+            SomeValue::Instance(inst) => {
+                assert!(inst.can_be_none, "null downcast stays nullable");
+                let cdef = inst.classdef.expect("target classdef");
+                assert_eq!(cdef.borrow().name, "W_CastTarget");
+            }
+            other => panic!("expected SomeInstance, got {other:?}"),
+        }
     }
 
     #[test]
