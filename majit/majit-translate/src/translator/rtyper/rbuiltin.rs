@@ -2911,15 +2911,17 @@ fn rtype_render_immortal(hop: &HighLevelOp, kwds_i: &HashMap<String, usize>) -> 
 
 /// `std::ptr::eq(a, b)` — the Rust spelling of `a is b` over wrapped
 /// objects (`baseobjspace::is_w`).  Identity comparison routes through
-/// the generic pointer `rtype_is_` body (rmodel.py:300-318
-/// `pair_repr_repr_rtype_is_`), which emits `ptr_eq` with a Bool
-/// result and constant-folds when the annotator proved the answer.
+/// the full pairtype `rtype_is_` dispatch, exactly like an upstream
+/// `is` operation: instance pairs of different classes take the
+/// `pairtype(InstanceRepr, InstanceRepr)` common-base arm
+/// (rclass.py:1057-1068) before the generic pointer body
+/// (rmodel.py:300-318) emits `ptr_eq` with a Bool result and
+/// constant-folds when the annotator proved the answer.
 fn rtype_ptr_eq(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
     hop.exception_cannot_occur()?;
     let r0 = arg_repr(hop, 0)?;
     let r1 = arg_repr(hop, 1)?;
-    crate::translator::rtyper::pairtype::pair_repr_repr_rtype_is_(r0.as_ref(), r1.as_ref(), hop)
-        .map(Some)
+    crate::translator::rtyper::pairtype::pair_rtype_is_(r0.as_ref(), r1.as_ref(), hop)
 }
 
 /// `std::ptr::null_mut::<T>()` / `null::<T>()` — the `lltype.nullptr`

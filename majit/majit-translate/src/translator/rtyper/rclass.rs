@@ -2989,6 +2989,24 @@ impl Repr for InstanceRepr {
         let vlist = hop.inputargs(vec![ConvertedTo::Repr(self), ConvertedTo::from(&void)])?;
         let vinst = vlist[0].clone();
 
+        // Ptr bound method on a pointer-carrying instance: the
+        // annotator answers `getattr(p, "is_null")` with a
+        // `SomeBuiltinMethod` the way `SomePtr.getattr` would
+        // (unaryop.rs `ptr_method_is_null`; receivers that upstream
+        // keeps as `SomePtr` are carried as `SomeInstance` by pyre's
+        // pointer erasure). Mirror `PtrRepr.rtype_getattr`'s
+        // ADT-method pass-through (rptr.py:44-46 `if isinstance(
+        // hop.s_result, SomeLLADTMeth): return hop.inputarg(
+        // hop.r_result, arg=0)`): the bound method is represented as
+        // its receiver (`BuiltinMethodRepr.lowleveltype ==
+        // self_repr.lowleveltype`, rbuiltin.py:120), so getattr
+        // forwards the receiver value unchanged and
+        // `BuiltinMethodRepr.rtype_simple_call` dispatches the call
+        // back through `rtype_method` below.
+        if matches!(s_result_clone.as_ref(), Some(SomeValue::BuiltinMethod(_))) {
+            return Ok(Some(vinst));
+        }
+
         // upstream rclass.py:843-846:
         //     if attr == '__class__' and hop.r_result.lowleveltype is Void:
         //         # special case for when the result of '.__class__' is a constant
@@ -3215,6 +3233,25 @@ impl Repr for InstanceRepr {
             vlist,
             GenopResult::LLType(LowLevelType::Bool),
         ))
+    }
+
+    /// `BuiltinMethodRepr.rtype_simple_call` dispatch target for the
+    /// ptr bound method the annotator seats on pointer-carrying
+    /// instances (`unaryop.rs ptr_method_is_null`; see the
+    /// `SomeBuiltinMethod` pass-through in [`Self::rtype_getattr`]).
+    /// `is_null` is the lltype `_ptr` nullity probe — lower it as
+    /// `ptr_iszero` (opimpl.py:134-136 `op_ptr_iszero`), the negated
+    /// twin of `rtype_bool`'s `ptr_nonzero` above.
+    fn rtype_method(&self, method_name: &str, hop: &HighLevelOp) -> RTypeResult {
+        use crate::translator::rtyper::rtyper::{ConvertedTo, GenopResult};
+        if method_name == "is_null" {
+            let vlist = hop.inputargs(vec![ConvertedTo::Repr(self)])?;
+            return Ok(hop.genop("ptr_iszero", vlist, GenopResult::LLType(LowLevelType::Bool)));
+        }
+        Err(TyperError::message(format!(
+            "missing {}.rtype_method_{method_name}",
+            self.class_name()
+        )))
     }
 
     /// RPython `InstanceRepr.rtype_isinstance(self, hop)` (rclass.py:1019-1032):
@@ -3804,6 +3841,62 @@ pub(super) fn pair_instance_instance_convert_from_to(
             .map(Hlvalue::Variable));
     }
     Ok(None)
+}
+
+/// RPython `pairtype(InstanceRepr, InstanceRepr).rtype_is_`
+/// (rclass.py:1057-1068):
+///
+/// ```python
+/// def rtype_is_((r_ins1, r_ins2), hop):
+///     if r_ins1.gcflavor != r_ins2.gcflavor:
+///         # obscure logic, the is can be true only if both are None
+///         v_ins1, v_ins2 = hop.inputargs(
+///             r_ins1.common_repr(), r_ins2.common_repr())
+///         return hop.gendirectcall(ll_both_none, v_ins1, v_ins2)
+///     if r_ins1.classdef is None or r_ins2.classdef is None:
+///         basedef = None
+///     else:
+///         basedef = r_ins1.classdef.commonbase(r_ins2.classdef)
+///     r_ins = getinstancerepr(r_ins1.rtyper, basedef, r_ins1.gcflavor)
+///     return pairtype(Repr, Repr).rtype_is_(pair(r_ins, r_ins), hop)
+/// ```
+///
+/// Both sides convert to the common-base instance repr (the upcast
+/// `cast_pointer` comes from [`pair_instance_instance_convert_from_to`]
+/// at `inputargs` time) and the generic pointer-identity arm emits
+/// `ptr_eq`. The mixed-gcflavor `ll_both_none` branch has no pyre
+/// hitter yet and surfaces as an explicit unported error.
+pub(super) fn pair_instance_instance_rtype_is_(
+    r1: &dyn Repr,
+    r2: &dyn Repr,
+    hop: &HighLevelOp,
+) -> Result<Option<Hlvalue>, TyperError> {
+    let Some(r_ins1) = (r1 as &dyn std::any::Any).downcast_ref::<InstanceRepr>() else {
+        return Ok(None);
+    };
+    let Some(r_ins2) = (r2 as &dyn std::any::Any).downcast_ref::<InstanceRepr>() else {
+        return Ok(None);
+    };
+    if r_ins1.gcflavor != r_ins2.gcflavor {
+        return Err(TyperError::message(
+            "pairtype(InstanceRepr, InstanceRepr).rtype_is_: mixed gc flavors \
+             (ll_both_none, rclass.py:1058-1062) not ported",
+        ));
+    }
+    let basedef = match (&r_ins1.classdef, &r_ins2.classdef) {
+        (Some(c1), Some(c2)) => ClassDef::commonbase(c1, c2),
+        _ => None,
+    };
+    let rtyper = r_ins1.rtyper.upgrade().ok_or_else(|| {
+        TyperError::message("pair_instance_instance_rtype_is_: rtyper weak ref expired")
+    })?;
+    let r_ins = getinstancerepr(&rtyper, basedef.as_ref(), r_ins1.gcflavor)?;
+    crate::translator::rtyper::pairtype::pair_repr_repr_rtype_is_(
+        r_ins.as_ref(),
+        r_ins.as_ref(),
+        hop,
+    )
+    .map(Some)
 }
 
 /// RPython `buildinstancerepr(rtyper, classdef, gcflavor='gc')`

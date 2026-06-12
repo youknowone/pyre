@@ -937,6 +937,17 @@ pub(crate) fn is_known_unported(msg: &str) -> bool {
         // skips to the legacy walker until per-instantiation classdef
         // specialization lands.
         || msg.contains("cannot unify instances with no common base class")
+        // `rmodel.py:311 rtype_is_` — an `is` (pointer-identity)
+        // comparison where one side is not a pointer repr.  The
+        // production hitter is `py_type_check`'s `(*obj).ob_type ==
+        // tp` chain when `tp` flowed from a `&STATIC` host address:
+        // `HostStaticAddrs` annotates the static's address as a
+        // constant `SomeInteger`, so the comparison pairs
+        // `InstanceRepr` with `IntegerRepr`.  Upstream never faces
+        // this — a prebuilt instance constant stays `SomeInstance`.
+        // Skip until host static addresses annotate as typed
+        // instance pointers.
+        || msg.contains("is of instances of the non-pointers")
         // `dyn Trait` dispatch still enters the real-rtyper flowspace
         // adapter as pyre's pre-rtyper `CallTarget::Indirect` shape in
         // some registry-prefill paths.  The production codewriter's
