@@ -1121,7 +1121,11 @@ impl ClassRepr {
         // upstream: `if self.classdef is None: raise MissingRTypeAttribute(attr)`.
         // ClassRepr always has classdef != None, so route to rbase.
         let rbase = self.rbase.borrow().clone().ok_or_else(|| {
-            TyperError::message("ClassRepr.getclsfield: rbase missing — call setup() first")
+            TyperError::message(format!(
+                "ClassRepr.getclsfield({attr:?}) on class {:?}: \
+                 rbase missing — call setup() first",
+                self.classdef.borrow().name
+            ))
         })?;
         match rbase {
             ClassReprArc::Inst(inst) => inst.getclsfield(vcls, attr, llops),

@@ -376,34 +376,42 @@ impl<'a> Drop for AddedBlocksGuard<'a> {
                     .collect();
                 let fixed_graphs = self.ann.fixed_graphs.try_borrow();
                 for k in &new_keys {
-                    // Blocks of fixed (already-rtyped) graphs are
-                    // frozen — see `raise_if_subject_blocked`.  A
-                    // subject can rtype a callee during its own drive
-                    // and still fail afterwards (e.g. a dual-gate
-                    // divergence skip); the callee's annotations must
-                    // survive for later callers' fixed-graph
-                    // validation.
-                    if let Ok(fixed) = fixed_graphs.as_deref() {
-                        let graph = annotated.get(k).cloned().flatten().or_else(|| {
-                            blocked_blocks
-                                .get(k)
-                                .map(|(_, g, _)| std::rc::Rc::clone(g))
-                        });
-                        if let Some(g) = &graph {
-                            if fixed.contains_key(&GraphKey::of(g)) {
-                                continue;
-                            }
-                        }
-                    }
+                    // A block of a fixed (already-rtyped) graph is
+                    // evicted from the maps like any other — leaving it
+                    // in `annotated` would re-feed the session-global
+                    // specialize walk with a block whose rtyping
+                    // already failed, echoing one failure into every
+                    // later subject.  Only its Variable BINDINGS are
+                    // kept: the `addpendingblock` fixed-graph arm
+                    // validates later callers against them and returns
+                    // before the `bindinputargs` re-seed, so the
+                    // bindings-without-`annotated`-entry state is
+                    // harmless for fixed graphs.
+                    let is_fixed = match fixed_graphs.as_deref() {
+                        Ok(fixed) => annotated
+                            .get(k)
+                            .cloned()
+                            .flatten()
+                            .or_else(|| {
+                                blocked_blocks
+                                    .get(k)
+                                    .map(|(_, g, _)| std::rc::Rc::clone(g))
+                            })
+                            .is_some_and(|g| fixed.contains_key(&GraphKey::of(&g))),
+                        Err(_) => false,
+                    };
                     annotated.shift_remove(k);
                     blocked_blocks.shift_remove(k);
                     // See `clear_block_bindings` — every eviction from
                     // `annotated` must also reset the block's defined
-                    // Variables.  Mirrors the dual-gate Skip arm's
-                    // graph-wide `var.annotation = None` reset
+                    // Variables (unless the graph is fixed).  Mirrors
+                    // the dual-gate Skip arm's graph-wide
+                    // `var.annotation = None` reset
                     // (codewriter.rs::dual_gate_type_state).
                     if let Some(block) = all_blocks.shift_remove(k) {
-                        clear_block_bindings(&block);
+                        if !is_fixed {
+                            clear_block_bindings(&block);
+                        }
                     }
                 }
                 if !new_keys.is_empty() {
@@ -1419,24 +1427,26 @@ impl RPythonAnnotator {
         let mut blocked_blocks = self.blocked_blocks.borrow_mut();
         let fixed_graphs = self.fixed_graphs.borrow();
         for bkey in &added_keys {
-            // A block belonging to a fixed (already-rtyped) graph is
-            // frozen: its annotations must survive forever so the
-            // `addpendingblock` fixed-graph safety check can validate
-            // later callers against them.  Such a block can land in a
-            // failing subject's `added_blocks` via a notify reflow;
-            // evicting (and resetting) it here would strand every
-            // later caller on "fixed graph's inputarg lacks
-            // annotation".
-            let graph = annotated.get(bkey).cloned().flatten().or_else(|| {
-                blocked_blocks
-                    .get(bkey)
-                    .map(|(_, g, _)| std::rc::Rc::clone(g))
-            });
-            if let Some(g) = &graph {
-                if fixed_graphs.contains_key(&GraphKey::of(g)) {
-                    continue;
-                }
-            }
+            // Evict from the maps unconditionally — a leftover entry
+            // would re-feed the session-global specialize walk with a
+            // block whose processing already failed.  A block of a
+            // fixed (already-rtyped) graph keeps its Variable BINDINGS
+            // though: the `addpendingblock` fixed-graph arm validates
+            // later callers against them and returns before the
+            // `bindinputargs` re-seed, so the
+            // bindings-without-`annotated`-entry state is harmless for
+            // fixed graphs (and clearing them would strand every later
+            // caller on "fixed graph's inputarg lacks annotation").
+            let is_fixed = annotated
+                .get(bkey)
+                .cloned()
+                .flatten()
+                .or_else(|| {
+                    blocked_blocks
+                        .get(bkey)
+                        .map(|(_, g, _)| std::rc::Rc::clone(g))
+                })
+                .is_some_and(|g| fixed_graphs.contains_key(&GraphKey::of(&g)));
             annotated.shift_remove(bkey);
             // See `clear_block_bindings` — evicting from `annotated`
             // without resetting the block's defined Variables leaves a
@@ -1447,7 +1457,9 @@ impl RPythonAnnotator {
             // from `annotated`, so its `new_keys` sweep never sees
             // them).
             if let Some(block) = all_blocks.shift_remove(bkey) {
-                clear_block_bindings(&block);
+                if !is_fixed {
+                    clear_block_bindings(&block);
+                }
             }
             blocked_blocks.shift_remove(bkey);
         }
