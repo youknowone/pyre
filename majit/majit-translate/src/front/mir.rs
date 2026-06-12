@@ -850,7 +850,19 @@ pub fn lower_fun_decl_with_static_addrs(
 ///   removal to keep untouched graphs byte-identical.
 fn simplify_lowered_graph(graph: &mut FunctionGraph) {
     crate::model::eliminate_empty_blocks(graph);
-    if crate::model::remove_assertion_errors(graph) > 0 {
+    let mut dirty = crate::model::remove_assertion_errors(graph) > 0;
+    // Constant-condition arms (`if WITHPREBUILTINT { … }` with the
+    // config const folded by `const_eval_global`) collapse to the
+    // taken link and the dead arm is emptied — the registry lift
+    // (`translate_op`) walks blocks by index, so a disconnected arm
+    // reading an unliftable static (`SMALL_INTS`) would otherwise
+    // still fail the whole graph.  `constant_fold_graph` link
+    // folding (backendopt/constfold.py).
+    if crate::model::fold_constant_exitswitch(graph) > 0 {
+        crate::model::clear_unreachable_blocks(graph);
+        dirty = true;
+    }
+    if dirty {
         crate::model::prune_dead_phis(graph);
     }
 }

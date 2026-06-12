@@ -2198,6 +2198,109 @@ pub fn remove_assertion_errors(graph: &mut FunctionGraph) -> usize {
     removed
 }
 
+/// Fold a constant exitswitch to its taken link — the model-layer
+/// slice of `constant_fold_graph`'s link folding
+/// (`rpython/translator/backendopt/constfold.py`): when a block's
+/// `exitswitch` Variable is bound in the same block by a constant
+/// (`ConstBool` / `ConstInt`, optionally through the `bool` UnaryOp
+/// wrap [`FunctionGraph::set_branch`] appends), keep only the
+/// matching exit and promote it to an unconditional link.  The dead
+/// condition ops melt away in the caller's [`prune_dead_phis`]
+/// sweep; the disconnected arm is emptied by
+/// [`clear_unreachable_blocks`].  Returns the number of folded
+/// switches.
+pub fn fold_constant_exitswitch(graph: &mut FunctionGraph) -> usize {
+    let mut folded = 0usize;
+    for block_idx in 0..graph.blocks.len() {
+        let block = &graph.blocks[block_idx];
+        let Some(ExitSwitch::Value(sw)) = block.exitswitch.clone() else {
+            continue;
+        };
+        let def_of = |v: &crate::flowspace::model::Variable| {
+            block
+                .operations
+                .iter()
+                .find(|op| op.result.as_ref() == Some(v))
+                .map(|op| &op.kind)
+        };
+        let mut kind = def_of(&sw);
+        if let Some(OpKind::UnaryOp { op, operand, .. }) = kind
+            && op == "bool"
+        {
+            kind = def_of(operand);
+        }
+        // The matched exitcase spellings: an `If` branch carries
+        // `ExitCase::Bool` (`set_branch`), a MIR `SwitchInt` carries
+        // `ExitCase::Const(Int)` plus the `"default"` catch-all arm
+        // (`front::mir` terminator lowering).
+        let (bool_case, int_case) = match kind {
+            Some(OpKind::ConstBool(b)) => (Some(*b), Some(i64::from(*b))),
+            Some(OpKind::ConstInt(n)) => ((*n == 0 || *n == 1).then(|| *n != 0), Some(*n)),
+            _ => continue,
+        };
+        let matches_case = |link: &Link| match &link.exitcase {
+            Some(ExitCase::Bool(b)) => Some(*b) == bool_case,
+            Some(ExitCase::Const(ConstValue::Int(n))) => Some(*n) == int_case,
+            _ => false,
+        };
+        let is_default = |link: &Link| {
+            matches!(
+                &link.exitcase,
+                Some(ExitCase::Const(ConstValue::UniStr(s))) if s == "default"
+            )
+        };
+        let chosen = block
+            .exits
+            .iter()
+            .position(matches_case)
+            .or_else(|| block.exits.iter().position(is_default));
+        let Some(chosen) = chosen else {
+            continue;
+        };
+        let block = &mut graph.blocks[block_idx];
+        let mut taken = block.exits.swap_remove(chosen);
+        taken.exitcase = None;
+        taken.llexitcase = None;
+        block.exits = vec![taken];
+        block.exitswitch = None;
+        folded += 1;
+    }
+    folded
+}
+
+/// Empty every block unreachable from `graph.startblock` in place —
+/// operations, exits, inputargs cleared, the `Vec` slot kept because
+/// `BlockId` doubles as the index.  Needed after
+/// [`fold_constant_exitswitch`] disconnects an arm: the registry
+/// lift (`translate_op`) and [`prune_dead_phis`] both walk blocks by
+/// index, and `prune_dead_phis` pins no-predecessor blocks as extra
+/// entry points, so a disconnected arm would otherwise keep its dead
+/// ops alive.
+pub fn clear_unreachable_blocks(graph: &mut FunctionGraph) {
+    let mut reachable = vec![false; graph.blocks.len()];
+    let mut worklist = vec![graph.startblock];
+    while let Some(b) = worklist.pop() {
+        if std::mem::replace(&mut reachable[b.0], true) {
+            continue;
+        }
+        for link in &graph.blocks[b.0].exits {
+            worklist.push(link.target);
+        }
+    }
+    // The return / except sinks stay even when no live link reaches
+    // them — graph plumbing addresses them unconditionally.
+    reachable[graph.returnblock.0] = true;
+    reachable[graph.exceptblock.0] = true;
+    for (idx, block) in graph.blocks.iter_mut().enumerate() {
+        if !reachable[idx] {
+            block.operations.clear();
+            block.exits.clear();
+            block.inputargs.clear();
+            block.exitswitch = None;
+        }
+    }
+}
+
 /// Remove dead operations and dead inputargs from `graph` per
 /// backward dataflow over operation operands + exitswitches +
 /// `Link.args`-as-dependencies.  Line-by-line port of
