@@ -3305,9 +3305,12 @@ impl<'a> Transformer<'a> {
                             continue;
                         }
                         let is_const_def = match &def.kind {
-                            OpKind::ConstInt(_) | OpKind::ConstBool(_) | OpKind::ConstFloat(_) => {
-                                true
-                            }
+                            OpKind::ConstInt(_)
+                            | OpKind::ConstBool(_)
+                            | OpKind::ConstFloat(_)
+                            | OpKind::ConstRef(_)
+                            | OpKind::ConstRefNull
+                            | OpKind::ConstRefAddr(_) => true,
                             OpKind::Call {
                                 target: CallTarget::FunctionPath { segments },
                                 ..
