@@ -3040,8 +3040,15 @@ impl<'a> Assembler386<'a> {
                     let src_reg = if let Some(Loc::Reg(s)) = arglocs.get(1) {
                         *s
                     } else if let Some(src_loc) = arglocs.get(1) {
-                        // Immed or Frame — load to scratch XMM (d14/xmm14)
-                        let scratch = crate::regloc::RegLoc::new(14, true);
+                        // Immed or Frame — load to X86_64_XMM_SCRATCH_REG
+                        // (regloc.py:357-359), which sits OUTSIDE the XMM
+                        // allocation pool. xmm14 is IN the SysV pool
+                        // (regalloc.py:125), so loading the constant there
+                        // clobbered the first operand whenever the allocator
+                        // had placed `dst` in xmm14 (high-pressure bridge
+                        // entries restore all of xmm0..xmm14), turning
+                        // `x - C` into `C' - C'` = 0.
+                        let scratch = crate::regloc::X86_64_XMM_SCRATCH_REG;
                         self.regalloc_mov(src_loc, &Loc::Reg(scratch));
                         scratch
                     } else {
@@ -3066,21 +3073,28 @@ impl<'a> Assembler386<'a> {
             }
             OpCode::FloatNeg => {
                 if let Some(Loc::Reg(r)) = result_loc {
-                    let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
+                    // XMM scratch must be X86_64_XMM_SCRATCH_REG (outside
+                    // the allocation pool); reusing the GPR scratch INDEX
+                    // (r11 → xmm11) addressed a pool register and clobbered
+                    // whatever the allocator kept there.
+                    let xmm_scratch = crate::regloc::X86_64_XMM_SCRATCH_REG.value;
                     dynasm!(self.mc ; .arch x64
-                        ; xorpd Rx(scratch as u8), Rx(scratch as u8)
-                        ; subsd Rx(scratch as u8), Rx(r.value)
-                        ; movsd Rx(r.value), Rx(scratch as u8)
+                        ; xorpd Rx(xmm_scratch), Rx(xmm_scratch)
+                        ; subsd Rx(xmm_scratch), Rx(r.value)
+                        ; movsd Rx(r.value), Rx(xmm_scratch)
                     );
                 }
             }
             OpCode::FloatAbs => {
                 if let Some(Loc::Reg(r)) = result_loc {
                     let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
+                    // See FloatNeg — the mask must stage through the XMM
+                    // scratch, not pool register xmm11.
+                    let xmm_scratch = crate::regloc::X86_64_XMM_SCRATCH_REG.value;
                     dynasm!(self.mc ; .arch x64
                         ; mov Rq(scratch), QWORD 0x7FFFFFFFFFFFFFFF_u64 as i64
-                        ; movq Rx(scratch as u8), Rq(scratch)
-                        ; andpd Rx(r.value), Rx(scratch as u8)
+                        ; movq Rx(xmm_scratch), Rq(scratch)
+                        ; andpd Rx(r.value), Rx(xmm_scratch)
                     );
                 }
             }

@@ -227,3 +227,13 @@ pub const X86_64_SCRATCH_REG: RegLoc = R11;
 
 /// regloc.py:348 X86_64_SCRATCH_REG_2 = r12 (used as secondary scratch)
 pub const X86_64_SCRATCH_REG_2: RegLoc = R12;
+
+/// regloc.py:355-359 X86_64_XMM_SCRATCH_REG — xmm5 on Win64 (the XMM
+/// allocator pool is xmm0..xmm4, regalloc.py:130), xmm15 elsewhere
+/// (pool is xmm0..xmm14, regalloc.py:125). Always outside the
+/// allocation pool, so emit-time materialization through it can never
+/// clobber an allocated operand.
+#[cfg(target_os = "windows")]
+pub const X86_64_XMM_SCRATCH_REG: RegLoc = XMM5;
+#[cfg(not(target_os = "windows"))]
+pub const X86_64_XMM_SCRATCH_REG: RegLoc = XMM15;
