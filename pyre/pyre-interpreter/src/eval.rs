@@ -3694,16 +3694,18 @@ impl OpcodeStepExecutor for PyFrame {
             unsafe {
                 if pyre_object::is_str(*part) {
                     result.push_wtf8(pyre_object::w_str_get_wtf8(*part));
-                } else if pyre_object::is_int(*part) {
-                    result.push_str(&pyre_object::w_int_get_value(*part).to_string());
-                } else if pyre_object::is_none(*part) {
-                    result.push_str("None");
                 } else if pyre_object::is_bool(*part) {
+                    // `is_int` is true for a bool, so test `is_bool` first; a
+                    // bool renders "True"/"False", not its int value.
                     result.push_str(if pyre_object::w_bool_get_value(*part) {
                         "True"
                     } else {
                         "False"
                     });
+                } else if pyre_object::is_int(*part) {
+                    result.push_str(&pyre_object::w_int_get_value(*part).to_string());
+                } else if pyre_object::is_none(*part) {
+                    result.push_str("None");
                 } else {
                     result.push_str("<object>");
                 }

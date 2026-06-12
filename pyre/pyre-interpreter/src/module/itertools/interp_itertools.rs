@@ -105,10 +105,11 @@ pub fn register_module(ns: &mut DictStorage) {
                 msg: &str,
             ) -> Result<i64, crate::PyError> {
                 let v = unsafe {
-                    if pyre_object::is_int(w) {
-                        pyre_object::w_int_get_value(w)
-                    } else if pyre_object::is_bool(w) {
+                    // `is_int` is true for a bool (`BOOL_TYPE`), so test `is_bool` first.
+                    if pyre_object::is_bool(w) {
                         pyre_object::w_bool_get_value(w) as i64
+                    } else if pyre_object::is_int(w) {
+                        pyre_object::w_int_get_value(w)
                     } else {
                         return Err(crate::PyError::value_error(msg.to_string()));
                     }

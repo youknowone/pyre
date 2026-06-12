@@ -26,10 +26,12 @@ pub use crate::{PyError, PyErrorKind, PyResult};
 /// Extract a BigInt from an int or long object.
 
 unsafe fn as_bigint(obj: PyObjectRef) -> BigInt {
-    if is_int(obj) {
-        BigInt::from(w_int_get_value(obj))
-    } else if is_bool(obj) {
+    // `is_int` is true for a bool (`BOOL_TYPE`), so test `is_bool` first; a bool
+    // reads through `w_bool_get_value`, not the int accessor.
+    if is_bool(obj) {
         BigInt::from(w_bool_get_value(obj) as i64)
+    } else if is_int(obj) {
+        BigInt::from(w_int_get_value(obj))
     } else {
         w_long_get_value(obj).clone()
     }

@@ -111,13 +111,14 @@ pub fn sleep(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             }
             result_float as i64
         } else {
-            let sec = if is_int(args[0]) {
+            let sec = if is_bool(args[0]) {
+                // `is_int` is true for a bool (`BOOL_TYPE`), so test `is_bool` first.
+                boolobject::w_bool_get_value(args[0]) as i64
+            } else if is_int(args[0]) {
                 w_int_get_value(args[0])
             } else if pyre_object::pyobject::is_long(args[0]) {
                 let big = pyre_object::longobject::w_long_get_value(args[0]);
                 i64::try_from(big).map_err(|_| overflow())?
-            } else if is_bool(args[0]) {
-                boolobject::w_bool_get_value(args[0]) as i64
             } else {
                 // `timeutils.py:31` — `space.bigint_w(w_secs)` applies
                 // `space.int`, so an object with `__int__` / `__index__` is
