@@ -72,13 +72,11 @@ impl OptRewrite {
 
     // ── Constant folding for binary integer ops ──
 
-    /// Try to constant-fold a binary integer operation.
-    /// Returns `Some(result)` if both args are constant.
+    /// Constant-fold for the pyre-opcode strength-reduction rules below
+    /// (`IntFloorDiv` / `IntMod` only — every other integer fold lives in
+    /// OptIntBounds / OptPure, as upstream).
     fn try_fold_binary_int(&self, opcode: OpCode, lhs: i64, rhs: i64) -> Option<i64> {
         match opcode {
-            OpCode::IntAdd => Some(lhs.wrapping_add(rhs)),
-            OpCode::IntSub => Some(lhs.wrapping_sub(rhs)),
-            OpCode::IntMul => Some(lhs.wrapping_mul(rhs)),
             OpCode::IntFloorDiv => {
                 if rhs != 0 {
                     Some(lhs.wrapping_div(rhs))
@@ -93,530 +91,8 @@ impl OptRewrite {
                     None
                 }
             }
-            OpCode::IntAnd => Some(lhs & rhs),
-            OpCode::IntOr => Some(lhs | rhs),
-            OpCode::IntXor => Some(lhs ^ rhs),
-            OpCode::IntLshift => {
-                if (0..64).contains(&rhs) {
-                    Some(lhs.wrapping_shl(rhs as u32))
-                } else {
-                    None
-                }
-            }
-            OpCode::IntRshift => {
-                if (0..64).contains(&rhs) {
-                    Some(lhs.wrapping_shr(rhs as u32))
-                } else {
-                    None
-                }
-            }
-            OpCode::UintRshift => {
-                if (0..64).contains(&rhs) {
-                    Some(((lhs as u64).wrapping_shr(rhs as u32)) as i64)
-                } else {
-                    None
-                }
-            }
-            // Comparisons
-            OpCode::IntLt => Some(if lhs < rhs { 1 } else { 0 }),
-            OpCode::IntLe => Some(if lhs <= rhs { 1 } else { 0 }),
-            OpCode::IntEq => Some(if lhs == rhs { 1 } else { 0 }),
-            OpCode::IntNe => Some(if lhs != rhs { 1 } else { 0 }),
-            OpCode::IntGt => Some(if lhs > rhs { 1 } else { 0 }),
-            OpCode::IntGe => Some(if lhs >= rhs { 1 } else { 0 }),
-            OpCode::UintLt => Some(if (lhs as u64) < (rhs as u64) { 1 } else { 0 }),
-            OpCode::UintLe => Some(if (lhs as u64) <= (rhs as u64) { 1 } else { 0 }),
-            OpCode::UintGt => Some(if (lhs as u64) > (rhs as u64) { 1 } else { 0 }),
-            OpCode::UintGe => Some(if (lhs as u64) >= (rhs as u64) { 1 } else { 0 }),
             _ => None,
         }
-    }
-
-    /// Try to constant-fold a unary integer operation.
-    fn try_fold_unary_int(&self, opcode: OpCode, arg: i64) -> Option<i64> {
-        match opcode {
-            OpCode::IntNeg => Some(arg.wrapping_neg()),
-            OpCode::IntInvert => Some(!arg),
-            OpCode::IntIsZero => Some(if arg == 0 { 1 } else { 0 }),
-            OpCode::IntIsTrue => Some(if arg != 0 { 1 } else { 0 }),
-            OpCode::IntForceGeZero => Some(if arg < 0 { 0 } else { arg }),
-            _ => None,
-        }
-    }
-
-    // ── Algebraic simplifications ──
-
-    /// `_eq(box1, bound1, box2, bound2)` (autogenintrules.py:15-18): two
-    /// integer operands count as equal when they are the same box OR both
-    /// IntBounds are the same constant. The constant arm catches operands
-    /// proven equal by bounds analysis even when neither is a `Const` box.
-    /// Used by the `x op x` self-operation rules (sub_x_x, and_x_x, or_x_x,
-    /// xor_x_x, eq_same, ne_same).
-    fn boxes_equal_via_intbound(&self, arg0: OpRef, arg1: OpRef, ctx: &OptContext) -> bool {
-        if ctx.same_box(arg0, arg1) {
-            return true;
-        }
-        if let (Some(b0), Some(b1)) = (
-            ctx.get_box_replacement_box(arg0),
-            ctx.get_box_replacement_box(arg1),
-        ) {
-            if let (Some(ib0), Some(ib1)) = (ctx.peek_intbound_box(&b0), ctx.peek_intbound_box(&b1))
-            {
-                if ib0.is_constant() && ib1.is_constant() && ib0.lower == ib1.lower {
-                    return true;
-                }
-            }
-        }
-        false
-    }
-
-    /// Try algebraic simplification for INT_ADD.
-    /// `x + 0 -> x`, `0 + x -> x`, `x + x -> x << 1`
-    fn optimize_int_add(
-        &self,
-        op: &Op,
-        op_rc: &majit_ir::OpRc,
-        ctx: &mut OptContext,
-    ) -> OptimizationResult {
-        let arg0 = op.arg(0);
-        let arg1 = op.arg(1);
-
-        // Constant fold
-        if let (Some(a), Some(b)) = (
-            ctx.resolve_box_box_opt(&arg0)
-                .and_then(|b| ctx.get_constant_int_box(&b)),
-            ctx.resolve_box_box_opt(&arg1)
-                .and_then(|b| ctx.get_constant_int_box(&b)),
-        ) {
-            if let Some(result) = self.try_fold_binary_int(OpCode::IntAdd, a, b) {
-                ctx.make_constant(op.pos.get(), Value::Int(result));
-                return OptimizationResult::Remove;
-            }
-        }
-
-        // add_zero: int_add(x, 0) => x
-        if let Some(0) = ctx
-            .resolve_box_box_opt(&arg1)
-            .and_then(|b| ctx.get_constant_int_box(&b))
-        {
-            let b_old = BoxRef::from_bound_op(op_rc);
-            let b_arg = ctx.resolve_box_box(&arg0);
-            ctx.make_equal_to(&b_old, &b_arg);
-            return OptimizationResult::Remove;
-        }
-        if let Some(0) = ctx
-            .resolve_box_box_opt(&arg0)
-            .and_then(|b| ctx.get_constant_int_box(&b))
-        {
-            let b_old = BoxRef::from_bound_op(op_rc);
-            let b_arg = ctx.resolve_box_box(&arg1);
-            ctx.make_equal_to(&b_old, &b_arg);
-            return OptimizationResult::Remove;
-        }
-
-        // add_reassoc_consts: int_add(int_add(x, C1), C2) => int_add(x, C1+C2)
-        if let Some(c2) = ctx
-            .resolve_box_box_opt(&arg1)
-            .and_then(|b| ctx.get_constant_int_box(&b))
-        {
-            if let Some(inner) = ctx
-                .resolve_box_box_opt(&arg0)
-                .and_then(|pb| ctx.get_producing_op(&pb))
-            {
-                if inner.opcode == OpCode::IntAdd {
-                    if let Some(c1) =
-                        ctx.get_constant_int_box(&inner.arg(1).get_box_replacement(false))
-                    {
-                        let x = inner.arg(0);
-                        let c = self.emit_constant_int(ctx, c1.wrapping_add(c2));
-                        let arg_c = ctx.materialize_box_at(c);
-                        let mut new_op = Op::new(OpCode::IntAdd, &[x, arg_c]);
-                        new_op.pos.set(op.pos.get());
-                        return OptimizationResult::Emit(new_op);
-                    }
-                }
-            }
-        }
-
-        // add_sub_x_c_c: int_add(int_sub(x, C1), C2) => int_add(x, C2-C1)
-        if let Some(c2) = ctx
-            .resolve_box_box_opt(&arg1)
-            .and_then(|b| ctx.get_constant_int_box(&b))
-        {
-            if let Some(inner) = ctx
-                .resolve_box_box_opt(&arg0)
-                .and_then(|pb| ctx.get_producing_op(&pb))
-            {
-                if inner.opcode == OpCode::IntSub {
-                    if let Some(c1) =
-                        ctx.get_constant_int_box(&inner.arg(1).get_box_replacement(false))
-                    {
-                        let x = inner.arg(0);
-                        let c = self.emit_constant_int(ctx, c2.wrapping_sub(c1));
-                        let arg_c = ctx.materialize_box_at(c);
-                        let mut new_op = Op::new(OpCode::IntAdd, &[x, arg_c]);
-                        new_op.pos.set(op.pos.get());
-                        return OptimizationResult::Emit(new_op);
-                    }
-                }
-            }
-        }
-
-        // add_sub_c_x_c: int_add(int_sub(C1, x), C2) => int_sub(C1+C2, x)
-        if let Some(c2) = ctx
-            .resolve_box_box_opt(&arg1)
-            .and_then(|b| ctx.get_constant_int_box(&b))
-        {
-            if let Some(inner) = ctx
-                .resolve_box_box_opt(&arg0)
-                .and_then(|pb| ctx.get_producing_op(&pb))
-            {
-                if inner.opcode == OpCode::IntSub {
-                    if let Some(c1) =
-                        ctx.get_constant_int_box(&inner.arg(0).get_box_replacement(false))
-                    {
-                        let x = inner.arg(1);
-                        let c = self.emit_constant_int(ctx, c1.wrapping_add(c2));
-                        let arg_c = ctx.materialize_box_at(c);
-                        let mut new_op = Op::new(OpCode::IntSub, &[arg_c, x]);
-                        new_op.pos.set(op.pos.get());
-                        return OptimizationResult::Emit(new_op);
-                    }
-                }
-            }
-        }
-
-        // x + x -> x << 1
-        if ctx.same_box(arg0.to_opref(), arg1.to_opref()) {
-            let one = self.emit_constant_int(ctx, 1);
-            let arg_one = ctx.materialize_box_at(one);
-            let mut new_op = Op::new(OpCode::IntLshift, &[arg0, arg_one]);
-            new_op.pos.set(op.pos.get());
-            return OptimizationResult::Emit(new_op);
-        }
-
-        OptimizationResult::PassOn
-    }
-
-    /// Try algebraic simplification for INT_SUB.
-    /// `x - 0 -> x`, `x - x -> 0`
-    fn optimize_int_sub(
-        &self,
-        op: &Op,
-        op_rc: &majit_ir::OpRc,
-        ctx: &mut OptContext,
-    ) -> OptimizationResult {
-        let arg0 = op.arg(0);
-        let arg1 = op.arg(1);
-
-        // Constant fold
-        if let (Some(a), Some(b)) = (
-            ctx.resolve_box_box_opt(&arg0)
-                .and_then(|b| ctx.get_constant_int_box(&b)),
-            ctx.resolve_box_box_opt(&arg1)
-                .and_then(|b| ctx.get_constant_int_box(&b)),
-        ) {
-            if let Some(result) = self.try_fold_binary_int(OpCode::IntSub, a, b) {
-                ctx.make_constant(op.pos.get(), Value::Int(result));
-                return OptimizationResult::Remove;
-            }
-        }
-
-        // sub_zero: int_sub(x, 0) => x
-        if let Some(0) = ctx
-            .resolve_box_box_opt(&arg1)
-            .and_then(|b| ctx.get_constant_int_box(&b))
-        {
-            let b_old = BoxRef::from_bound_op(op_rc);
-            let b_arg = ctx.resolve_box_box(&arg0);
-            ctx.make_equal_to(&b_old, &b_arg);
-            return OptimizationResult::Remove;
-        }
-        // sub_from_zero: int_sub(0, x) => int_neg(x)
-        if let Some(0) = ctx
-            .resolve_box_box_opt(&arg0)
-            .and_then(|b| ctx.get_constant_int_box(&b))
-        {
-            let mut new_op = Op::new(OpCode::IntNeg, &[arg1]);
-            new_op.pos.set(op.pos.get());
-            return OptimizationResult::Emit(new_op);
-        }
-        // sub_x_x: int_sub(x, x) => 0
-        if self.boxes_equal_via_intbound(arg0.to_opref(), arg1.to_opref(), ctx) {
-            ctx.make_constant(op.pos.get(), Value::Int(0));
-            return OptimizationResult::Remove;
-        }
-
-        // sub_add_consts: int_sub(int_add(x, C1), C2) => int_sub(x, C2-C1)
-        if let Some(c2) = ctx
-            .resolve_box_box_opt(&arg1)
-            .and_then(|b| ctx.get_constant_int_box(&b))
-        {
-            if let Some(inner) = ctx
-                .resolve_box_box_opt(&arg0)
-                .and_then(|pb| ctx.get_producing_op(&pb))
-            {
-                if inner.opcode == OpCode::IntAdd {
-                    if let Some(c1) =
-                        ctx.get_constant_int_box(&inner.arg(1).get_box_replacement(false))
-                    {
-                        let x = inner.arg(0);
-                        let c = self.emit_constant_int(ctx, c2.wrapping_sub(c1));
-                        let arg_c = ctx.materialize_box_at(c);
-                        let mut new_op = Op::new(OpCode::IntSub, &[x, arg_c]);
-                        new_op.pos.set(op.pos.get());
-                        return OptimizationResult::Emit(new_op);
-                    }
-                }
-            }
-        }
-
-        // sub_add: int_sub(int_add(x, y), y) => x
-        if let Some(inner) = ctx
-            .resolve_box_box_opt(&arg0)
-            .and_then(|pb| ctx.get_producing_op(&pb))
-        {
-            if inner.opcode == OpCode::IntAdd && inner.arg(1).to_opref() == arg1.to_opref() {
-                let b_old = BoxRef::from_bound_op(op_rc);
-                let b_inner = ctx.resolve_box_box(&inner.arg(0));
-                ctx.make_equal_to(&b_old, &b_inner);
-                return OptimizationResult::Remove;
-            }
-        }
-
-        // sub_add_neg: int_sub(y, int_add(x, y)) => int_neg(x)
-        if let Some(inner) = ctx
-            .resolve_box_box_opt(&arg1)
-            .and_then(|pb| ctx.get_producing_op(&pb))
-        {
-            if inner.opcode == OpCode::IntAdd && inner.arg(1).to_opref() == arg0.to_opref() {
-                let mut new_op = Op::new(OpCode::IntNeg, &[inner.arg(0)]);
-                new_op.pos.set(op.pos.get());
-                return OptimizationResult::Emit(new_op);
-            }
-        }
-
-        // sub_sub_left_x_c_c: int_sub(int_sub(x, C1), C2) => int_sub(x, C1+C2)
-        if let Some(c2) = ctx
-            .resolve_box_box_opt(&arg1)
-            .and_then(|b| ctx.get_constant_int_box(&b))
-        {
-            if let Some(inner) = ctx
-                .resolve_box_box_opt(&arg0)
-                .and_then(|pb| ctx.get_producing_op(&pb))
-            {
-                if inner.opcode == OpCode::IntSub {
-                    if let Some(c1) =
-                        ctx.get_constant_int_box(&inner.arg(1).get_box_replacement(false))
-                    {
-                        let x = inner.arg(0);
-                        let c = self.emit_constant_int(ctx, c1.wrapping_add(c2));
-                        let arg_c = ctx.materialize_box_at(c);
-                        let mut new_op = Op::new(OpCode::IntSub, &[x, arg_c]);
-                        new_op.pos.set(op.pos.get());
-                        return OptimizationResult::Emit(new_op);
-                    }
-                    // sub_sub_left_c_x_c: int_sub(int_sub(C1, x), C2) => int_sub(C1-C2, x)
-                    if let Some(c1) =
-                        ctx.get_constant_int_box(&inner.arg(0).get_box_replacement(false))
-                    {
-                        let x = inner.arg(1);
-                        let c = self.emit_constant_int(ctx, c1.wrapping_sub(c2));
-                        let arg_c = ctx.materialize_box_at(c);
-                        let mut new_op = Op::new(OpCode::IntSub, &[arg_c, x]);
-                        new_op.pos.set(op.pos.get());
-                        return OptimizationResult::Emit(new_op);
-                    }
-                }
-            }
-        }
-
-        // sub_invert_one: int_sub(int_invert(x), -1) => int_neg(x)
-        if let Some(-1) = ctx
-            .resolve_box_box_opt(&arg1)
-            .and_then(|b| ctx.get_constant_int_box(&b))
-        {
-            if let Some(inner) = ctx
-                .resolve_box_box_opt(&arg0)
-                .and_then(|pb| ctx.get_producing_op(&pb))
-            {
-                if inner.opcode == OpCode::IntInvert {
-                    let mut new_op = Op::new(OpCode::IntNeg, &[inner.arg(0)]);
-                    new_op.pos.set(op.pos.get());
-                    return OptimizationResult::Emit(new_op);
-                }
-            }
-        }
-
-        // sub_xor_x_y_y: int_sub(int_xor(x, y), y) => x (if x & y == 0)
-        if let Some(inner) = ctx
-            .resolve_box_box_opt(&arg0)
-            .and_then(|pb| ctx.get_producing_op(&pb))
-        {
-            if inner.opcode == OpCode::IntXor && inner.arg(1).to_opref() == arg1.to_opref() {
-                if let (Some(bx), Some(by)) = (
-                    ctx.peek_intbound_box(&inner.arg(0).get_box_replacement(false)),
-                    ctx.resolve_box_box_opt(&arg1)
-                        .and_then(|b| ctx.peek_intbound_box(&b)),
-                ) {
-                    if bx.and_bound(&by).known_eq_const(0) {
-                        let b_old = BoxRef::from_bound_op(op_rc);
-                        let b_inner = ctx.resolve_box_box(&inner.arg(0));
-                        ctx.make_equal_to(&b_old, &b_inner);
-                        return OptimizationResult::Remove;
-                    }
-                }
-            }
-            // sub_or_x_y_y: int_sub(int_or(x, y), y) => x (if x & y == 0)
-            if inner.opcode == OpCode::IntOr && inner.arg(1).to_opref() == arg1.to_opref() {
-                if let (Some(bx), Some(by)) = (
-                    ctx.peek_intbound_box(&inner.arg(0).get_box_replacement(false)),
-                    ctx.resolve_box_box_opt(&arg1)
-                        .and_then(|b| ctx.peek_intbound_box(&b)),
-                ) {
-                    if bx.and_bound(&by).known_eq_const(0) {
-                        let b_old = BoxRef::from_bound_op(op_rc);
-                        let b_inner = ctx.resolve_box_box(&inner.arg(0));
-                        ctx.make_equal_to(&b_old, &b_inner);
-                        return OptimizationResult::Remove;
-                    }
-                }
-            }
-        }
-
-        OptimizationResult::PassOn
-    }
-
-    /// Try algebraic simplification for INT_MUL.
-    /// `x * 0 -> 0`, `x * 1 -> x`, `0 * x -> 0`, `1 * x -> x`
-    fn optimize_int_mul(
-        &self,
-        op: &Op,
-        op_rc: &majit_ir::OpRc,
-        ctx: &mut OptContext,
-    ) -> OptimizationResult {
-        let arg0 = op.arg(0);
-        let arg1 = op.arg(1);
-
-        // Constant fold
-        if let (Some(a), Some(b)) = (
-            ctx.resolve_box_box_opt(&arg0)
-                .and_then(|b| ctx.get_constant_int_box(&b)),
-            ctx.resolve_box_box_opt(&arg1)
-                .and_then(|b| ctx.get_constant_int_box(&b)),
-        ) {
-            if let Some(result) = self.try_fold_binary_int(OpCode::IntMul, a, b) {
-                ctx.make_constant(op.pos.get(), Value::Int(result));
-                return OptimizationResult::Remove;
-            }
-        }
-
-        // x * 0 -> 0 (absorbing element)
-        if let Some(0) = ctx
-            .resolve_box_box_opt(&arg1)
-            .and_then(|b| ctx.get_constant_int_box(&b))
-        {
-            ctx.make_constant(op.pos.get(), Value::Int(0));
-            return OptimizationResult::Remove;
-        }
-        // 0 * x -> 0
-        if let Some(0) = ctx
-            .resolve_box_box_opt(&arg0)
-            .and_then(|b| ctx.get_constant_int_box(&b))
-        {
-            ctx.make_constant(op.pos.get(), Value::Int(0));
-            return OptimizationResult::Remove;
-        }
-        // x * 1 -> x (identity)
-        if let Some(1) = ctx
-            .resolve_box_box_opt(&arg1)
-            .and_then(|b| ctx.get_constant_int_box(&b))
-        {
-            let b_old = BoxRef::from_bound_op(op_rc);
-            let b_arg = ctx.resolve_box_box(&arg0);
-            ctx.make_equal_to(&b_old, &b_arg);
-            return OptimizationResult::Remove;
-        }
-        // 1 * x -> x
-        if let Some(1) = ctx
-            .resolve_box_box_opt(&arg0)
-            .and_then(|b| ctx.get_constant_int_box(&b))
-        {
-            let b_old = BoxRef::from_bound_op(op_rc);
-            let b_arg = ctx.resolve_box_box(&arg1);
-            ctx.make_equal_to(&b_old, &b_arg);
-            return OptimizationResult::Remove;
-        }
-        // Strength reduction: x * 2^n -> x << n
-        if let Some(c) = ctx
-            .resolve_box_box_opt(&arg1)
-            .and_then(|b| ctx.get_constant_int_box(&b))
-        {
-            if c > 0 && (c & (c - 1)) == 0 {
-                let shift = c.trailing_zeros() as i64;
-                let shift_ref = self.emit_constant_int(ctx, shift);
-                let arg_shift = ctx.materialize_box_at(shift_ref);
-                let mut new_op = Op::new(OpCode::IntLshift, &[arg0, arg_shift]);
-                new_op.pos.set(op.pos.get());
-                return OptimizationResult::Emit(new_op);
-            }
-            // rewrite.py: x * (-1) -> INT_NEG(x)
-            if c == -1 {
-                let mut neg = Op::new(OpCode::IntNeg, &[arg0]);
-                neg.pos.set(op.pos.get());
-                return OptimizationResult::Replace(neg);
-            }
-            // rewrite.py: x * (-(2^n)) -> -(x << n)
-            if c < -1 {
-                let abs_c = (c as i128).unsigned_abs() as u64;
-                if abs_c.is_power_of_two() {
-                    let shift = abs_c.trailing_zeros() as i64;
-                    let shift_ref = self.emit_constant_int(ctx, shift);
-                    let arg_shift = ctx.materialize_box_at(shift_ref);
-                    let shifted = ctx.emit(Op::new(OpCode::IntLshift, &[arg0, arg_shift]));
-                    let arg_shifted = ctx.materialize_box_at(shifted);
-                    let mut neg = Op::new(OpCode::IntNeg, &[arg_shifted]);
-                    neg.pos.set(op.pos.get());
-                    return OptimizationResult::Emit(neg);
-                }
-            }
-        }
-        if let Some(c) = ctx
-            .resolve_box_box_opt(&arg0)
-            .and_then(|b| ctx.get_constant_int_box(&b))
-        {
-            if c > 0 && (c & (c - 1)) == 0 {
-                let shift = c.trailing_zeros() as i64;
-                let shift_ref = self.emit_constant_int(ctx, shift);
-                let arg_shift = ctx.materialize_box_at(shift_ref);
-                let mut new_op = Op::new(OpCode::IntLshift, &[arg1, arg_shift]);
-                new_op.pos.set(op.pos.get());
-                return OptimizationResult::Emit(new_op);
-            }
-            // (-1) * x -> INT_NEG(x)
-            if c == -1 {
-                let mut neg = Op::new(OpCode::IntNeg, &[arg1]);
-                neg.pos.set(op.pos.get());
-                return OptimizationResult::Replace(neg);
-            }
-        }
-
-        // mul_lshift: int_mul(x, int_lshift(1, y)) => int_lshift(x, y)
-        if let Some(inner) = ctx
-            .resolve_box_box_opt(&arg1)
-            .and_then(|pb| ctx.get_producing_op(&pb))
-        {
-            if inner.opcode == OpCode::IntLshift {
-                if let Some(1) = ctx.get_constant_int_box(&inner.arg(0).get_box_replacement(false))
-                {
-                    let mut new_op = Op::new(OpCode::IntLshift, &[arg0, inner.arg(1)]);
-                    new_op.pos.set(op.pos.get());
-                    return OptimizationResult::Emit(new_op);
-                }
-            }
-        }
-
-        OptimizationResult::PassOn
     }
 
     /// Try algebraic simplification for INT_FLOORDIV.
@@ -797,860 +273,7 @@ impl OptRewrite {
         OptimizationResult::PassOn
     }
 
-    /// Try algebraic simplification for INT_AND.
-    /// `x & 0 -> 0`, `x & -1 -> x`
-    fn optimize_int_and(
-        &self,
-        op: &Op,
-        op_rc: &majit_ir::OpRc,
-        ctx: &mut OptContext,
-    ) -> OptimizationResult {
-        let arg0 = op.arg(0);
-        let arg1 = op.arg(1);
-
-        // Constant fold
-        if let (Some(a), Some(b)) = (
-            ctx.resolve_box_box_opt(&arg0)
-                .and_then(|b| ctx.get_constant_int_box(&b)),
-            ctx.resolve_box_box_opt(&arg1)
-                .and_then(|b| ctx.get_constant_int_box(&b)),
-        ) {
-            if let Some(result) = self.try_fold_binary_int(OpCode::IntAnd, a, b) {
-                ctx.make_constant(op.pos.get(), Value::Int(result));
-                return OptimizationResult::Remove;
-            }
-        }
-
-        // x & 0 -> 0
-        if let Some(0) = ctx
-            .resolve_box_box_opt(&arg1)
-            .and_then(|b| ctx.get_constant_int_box(&b))
-        {
-            ctx.make_constant(op.pos.get(), Value::Int(0));
-            return OptimizationResult::Remove;
-        }
-        if let Some(0) = ctx
-            .resolve_box_box_opt(&arg0)
-            .and_then(|b| ctx.get_constant_int_box(&b))
-        {
-            ctx.make_constant(op.pos.get(), Value::Int(0));
-            return OptimizationResult::Remove;
-        }
-        // x & -1 -> x (all bits set = identity)
-        if let Some(-1) = ctx
-            .resolve_box_box_opt(&arg1)
-            .and_then(|b| ctx.get_constant_int_box(&b))
-        {
-            let b_old = BoxRef::from_bound_op(op_rc);
-            let b_arg = ctx.resolve_box_box(&arg0);
-            ctx.make_equal_to(&b_old, &b_arg);
-            return OptimizationResult::Remove;
-        }
-        if let Some(-1) = ctx
-            .resolve_box_box_opt(&arg0)
-            .and_then(|b| ctx.get_constant_int_box(&b))
-        {
-            let b_old = BoxRef::from_bound_op(op_rc);
-            let b_arg = ctx.resolve_box_box(&arg1);
-            ctx.make_equal_to(&b_old, &b_arg);
-            return OptimizationResult::Remove;
-        }
-        // and_x_x: int_and(a, a) => a
-        if self.boxes_equal_via_intbound(arg0.to_opref(), arg1.to_opref(), ctx) {
-            let b_old = BoxRef::from_bound_op(op_rc);
-            let b_arg = ctx.resolve_box_box(&arg0);
-            ctx.make_equal_to(&b_old, &b_arg);
-            return OptimizationResult::Remove;
-        }
-
-        // and_reassoc_consts: int_and(int_and(x, C1), C2) => int_and(x, C1&C2)
-        if let Some(c2) = ctx
-            .resolve_box_box_opt(&arg1)
-            .and_then(|b| ctx.get_constant_int_box(&b))
-        {
-            if let Some(inner) = ctx
-                .resolve_box_box_opt(&arg0)
-                .and_then(|pb| ctx.get_producing_op(&pb))
-            {
-                if inner.opcode == OpCode::IntAnd {
-                    if let Some(c1) =
-                        ctx.get_constant_int_box(&inner.arg(1).get_box_replacement(false))
-                    {
-                        let x = inner.arg(0);
-                        let c = self.emit_constant_int(ctx, c1 & c2);
-                        let arg_c = ctx.materialize_box_at(c);
-                        let mut new_op = Op::new(OpCode::IntAnd, &[x, arg_c]);
-                        new_op.pos.set(op.pos.get());
-                        return OptimizationResult::Emit(new_op);
-                    }
-                }
-            }
-        }
-
-        // and_absorb: int_and(a, int_and(a, b)) => int_and(a, b)
-        if let Some(inner) = ctx
-            .resolve_box_box_opt(&arg1)
-            .and_then(|pb| ctx.get_producing_op(&pb))
-        {
-            if inner.opcode == OpCode::IntAnd && inner.arg(0).to_opref() == arg0.to_opref() {
-                let b_old = BoxRef::from_bound_op(op_rc);
-                let b_arg = ctx.resolve_box_box(&arg1);
-                ctx.make_equal_to(&b_old, &b_arg);
-                return OptimizationResult::Remove;
-            }
-        }
-
-        // and_x_c_in_range: int_and(x, C) => x (if x in range [0, C & ~(C+1)])
-        if let Some(c) = ctx
-            .resolve_box_box_opt(&arg1)
-            .and_then(|b| ctx.get_constant_int_box(&b))
-        {
-            if let Some(bound) = ctx
-                .resolve_box_box_opt(&arg0)
-                .and_then(|b| ctx.peek_intbound_box(&b))
-            {
-                if bound.lower >= 0 && bound.upper <= (c & !(c.wrapping_add(1))) {
-                    let b_old = BoxRef::from_bound_op(op_rc);
-                    let b_arg = ctx.resolve_box_box(&arg0);
-                    ctx.make_equal_to(&b_old, &b_arg);
-                    return OptimizationResult::Remove;
-                }
-            }
-        }
-
-        // and_known_result: int_and(a, b) => C (if result bound is constant)
-        if let (Some(ba), Some(bb)) = (
-            ctx.resolve_box_box_opt(&arg0)
-                .and_then(|b| ctx.peek_intbound_box(&b)),
-            ctx.resolve_box_box_opt(&arg1)
-                .and_then(|b| ctx.peek_intbound_box(&b)),
-        ) {
-            let result_bound = ba.and_bound(&bb);
-            if result_bound.is_constant() {
-                ctx.make_constant(op.pos.get(), Value::Int(result_bound.get_constant_int()));
-                return OptimizationResult::Remove;
-            }
-            // and_idempotent: int_and(x, y) => x (if y.ones | x.zeros == -1)
-            if (bb.tvalue | (!ba.tvalue & !ba.tmask)) == u64::MAX {
-                let b_old = BoxRef::from_bound_op(op_rc);
-                let b_arg = ctx.resolve_box_box(&arg0);
-                ctx.make_equal_to(&b_old, &b_arg);
-                return OptimizationResult::Remove;
-            }
-        }
-
-        // and_or: int_and(int_or(x, y), z) => int_and(x, z) (if y & z known 0)
-        if let Some(inner) = ctx
-            .resolve_box_box_opt(&arg0)
-            .and_then(|pb| ctx.get_producing_op(&pb))
-        {
-            if inner.opcode == OpCode::IntOr {
-                if let (Some(by), Some(bz)) = (
-                    ctx.peek_intbound_box(&inner.arg(1).get_box_replacement(false)),
-                    ctx.resolve_box_box_opt(&arg1)
-                        .and_then(|b| ctx.peek_intbound_box(&b)),
-                ) {
-                    if by.and_bound(&bz).known_eq_const(0) {
-                        let mut new_op = Op::new(OpCode::IntAnd, &[inner.arg(0), arg1]);
-                        new_op.pos.set(op.pos.get());
-                        return OptimizationResult::Emit(new_op);
-                    }
-                }
-            }
-        }
-
-        OptimizationResult::PassOn
-    }
-
-    /// Try algebraic simplification for INT_OR.
-    /// `x | 0 -> x`, `x | -1 -> -1`
-    fn optimize_int_or(
-        &self,
-        op: &Op,
-        op_rc: &majit_ir::OpRc,
-        ctx: &mut OptContext,
-    ) -> OptimizationResult {
-        let arg0 = op.arg(0);
-        let arg1 = op.arg(1);
-
-        // Constant fold
-        if let (Some(a), Some(b)) = (
-            ctx.resolve_box_box_opt(&arg0)
-                .and_then(|b| ctx.get_constant_int_box(&b)),
-            ctx.resolve_box_box_opt(&arg1)
-                .and_then(|b| ctx.get_constant_int_box(&b)),
-        ) {
-            if let Some(result) = self.try_fold_binary_int(OpCode::IntOr, a, b) {
-                ctx.make_constant(op.pos.get(), Value::Int(result));
-                return OptimizationResult::Remove;
-            }
-        }
-
-        // x | 0 -> x
-        if let Some(0) = ctx
-            .resolve_box_box_opt(&arg1)
-            .and_then(|b| ctx.get_constant_int_box(&b))
-        {
-            let b_old = BoxRef::from_bound_op(op_rc);
-            let b_arg = ctx.resolve_box_box(&arg0);
-            ctx.make_equal_to(&b_old, &b_arg);
-            return OptimizationResult::Remove;
-        }
-        if let Some(0) = ctx
-            .resolve_box_box_opt(&arg0)
-            .and_then(|b| ctx.get_constant_int_box(&b))
-        {
-            let b_old = BoxRef::from_bound_op(op_rc);
-            let b_arg = ctx.resolve_box_box(&arg1);
-            ctx.make_equal_to(&b_old, &b_arg);
-            return OptimizationResult::Remove;
-        }
-        // x | -1 -> -1
-        if let Some(-1) = ctx
-            .resolve_box_box_opt(&arg1)
-            .and_then(|b| ctx.get_constant_int_box(&b))
-        {
-            ctx.make_constant(op.pos.get(), Value::Int(-1));
-            return OptimizationResult::Remove;
-        }
-        if let Some(-1) = ctx
-            .resolve_box_box_opt(&arg0)
-            .and_then(|b| ctx.get_constant_int_box(&b))
-        {
-            ctx.make_constant(op.pos.get(), Value::Int(-1));
-            return OptimizationResult::Remove;
-        }
-        // or_x_x: int_or(a, a) => a
-        if self.boxes_equal_via_intbound(arg0.to_opref(), arg1.to_opref(), ctx) {
-            let b_old = BoxRef::from_bound_op(op_rc);
-            let b_arg = ctx.resolve_box_box(&arg0);
-            ctx.make_equal_to(&b_old, &b_arg);
-            return OptimizationResult::Remove;
-        }
-
-        // or_reassoc_consts: int_or(int_or(x, C1), C2) => int_or(x, C1|C2)
-        if let Some(c2) = ctx
-            .resolve_box_box_opt(&arg1)
-            .and_then(|b| ctx.get_constant_int_box(&b))
-        {
-            if let Some(inner) = ctx
-                .resolve_box_box_opt(&arg0)
-                .and_then(|pb| ctx.get_producing_op(&pb))
-            {
-                if inner.opcode == OpCode::IntOr {
-                    if let Some(c1) =
-                        ctx.get_constant_int_box(&inner.arg(1).get_box_replacement(false))
-                    {
-                        let x = inner.arg(0);
-                        let c = self.emit_constant_int(ctx, c1 | c2);
-                        let arg_c = ctx.materialize_box_at(c);
-                        let mut new_op = Op::new(OpCode::IntOr, &[x, arg_c]);
-                        new_op.pos.set(op.pos.get());
-                        return OptimizationResult::Emit(new_op);
-                    }
-                }
-            }
-        }
-
-        // or_absorb: int_or(a, int_or(a, b)) => int_or(a, b)
-        if let Some(inner) = ctx
-            .resolve_box_box_opt(&arg1)
-            .and_then(|pb| ctx.get_producing_op(&pb))
-        {
-            if inner.opcode == OpCode::IntOr && inner.arg(0).to_opref() == arg0.to_opref() {
-                let b_old = BoxRef::from_bound_op(op_rc);
-                let b_arg = ctx.resolve_box_box(&arg1);
-                ctx.make_equal_to(&b_old, &b_arg);
-                return OptimizationResult::Remove;
-            }
-        }
-
-        // or_and_two_parts: int_or(int_and(x, C1), int_and(x, C2)) => int_and(x, C1|C2)
-        if let (Some(inner0), Some(inner1)) = (
-            ctx.resolve_box_box_opt(&arg0)
-                .and_then(|pb| ctx.get_producing_op(&pb)),
-            ctx.resolve_box_box_opt(&arg1)
-                .and_then(|pb| ctx.get_producing_op(&pb)),
-        ) {
-            if inner0.opcode == OpCode::IntAnd
-                && inner1.opcode == OpCode::IntAnd
-                && inner0.arg(0).to_opref() == inner1.arg(0).to_opref()
-            {
-                if let (Some(c1), Some(c2)) = (
-                    ctx.get_constant_int_box(&inner0.arg(1).get_box_replacement(false)),
-                    ctx.get_constant_int_box(&inner1.arg(1).get_box_replacement(false)),
-                ) {
-                    let x = inner0.arg(0);
-                    let c = self.emit_constant_int(ctx, c1 | c2);
-                    let arg_c = ctx.materialize_box_at(c);
-                    let mut new_op = Op::new(OpCode::IntAnd, &[x, arg_c]);
-                    new_op.pos.set(op.pos.get());
-                    return OptimizationResult::Emit(new_op);
-                }
-            }
-        }
-
-        // or_known_result: int_or(a, b) => C (if result bound is constant)
-        if let (Some(ba), Some(bb)) = (
-            ctx.resolve_box_box_opt(&arg0)
-                .and_then(|b| ctx.peek_intbound_box(&b)),
-            ctx.resolve_box_box_opt(&arg1)
-                .and_then(|b| ctx.peek_intbound_box(&b)),
-        ) {
-            let result_bound = ba.or_bound(&bb);
-            if result_bound.is_constant() {
-                ctx.make_constant(op.pos.get(), Value::Int(result_bound.get_constant_int()));
-                return OptimizationResult::Remove;
-            }
-            // or_idempotent: int_or(x, y) => x (if x.ones | y.zeros == -1)
-            if (ba.tvalue | (!bb.tvalue & !bb.tmask)) == u64::MAX {
-                let b_old = BoxRef::from_bound_op(op_rc);
-                let b_arg = ctx.resolve_box_box(&arg0);
-                ctx.make_equal_to(&b_old, &b_arg);
-                return OptimizationResult::Remove;
-            }
-        }
-
-        OptimizationResult::PassOn
-    }
-
-    /// Try algebraic simplification for INT_XOR.
-    /// `x ^ 0 -> x`, `x ^ x -> 0`
-    fn optimize_int_xor(
-        &self,
-        op: &Op,
-        op_rc: &majit_ir::OpRc,
-        ctx: &mut OptContext,
-    ) -> OptimizationResult {
-        let arg0 = op.arg(0);
-        let arg1 = op.arg(1);
-
-        // Constant fold
-        if let (Some(a), Some(b)) = (
-            ctx.resolve_box_box_opt(&arg0)
-                .and_then(|b| ctx.get_constant_int_box(&b)),
-            ctx.resolve_box_box_opt(&arg1)
-                .and_then(|b| ctx.get_constant_int_box(&b)),
-        ) {
-            if let Some(result) = self.try_fold_binary_int(OpCode::IntXor, a, b) {
-                ctx.make_constant(op.pos.get(), Value::Int(result));
-                return OptimizationResult::Remove;
-            }
-        }
-
-        // x ^ 0 -> x
-        if let Some(0) = ctx
-            .resolve_box_box_opt(&arg1)
-            .and_then(|b| ctx.get_constant_int_box(&b))
-        {
-            let b_old = BoxRef::from_bound_op(op_rc);
-            let b_arg = ctx.resolve_box_box(&arg0);
-            ctx.make_equal_to(&b_old, &b_arg);
-            return OptimizationResult::Remove;
-        }
-        if let Some(0) = ctx
-            .resolve_box_box_opt(&arg0)
-            .and_then(|b| ctx.get_constant_int_box(&b))
-        {
-            let b_old = BoxRef::from_bound_op(op_rc);
-            let b_arg = ctx.resolve_box_box(&arg1);
-            ctx.make_equal_to(&b_old, &b_arg);
-            return OptimizationResult::Remove;
-        }
-        // x ^ x -> 0
-        if self.boxes_equal_via_intbound(arg0.to_opref(), arg1.to_opref(), ctx) {
-            ctx.make_constant(op.pos.get(), Value::Int(0));
-            return OptimizationResult::Remove;
-        }
-        // x ^ -1 -> ~x (INT_INVERT)
-        if let Some(-1) = ctx
-            .resolve_box_box_opt(&arg1)
-            .and_then(|b| ctx.get_constant_int_box(&b))
-        {
-            let mut new_op = Op::new(OpCode::IntInvert, &[arg0]);
-            new_op.pos.set(op.pos.get());
-            return OptimizationResult::Emit(new_op);
-        }
-        if let Some(-1) = ctx
-            .resolve_box_box_opt(&arg0)
-            .and_then(|b| ctx.get_constant_int_box(&b))
-        {
-            let mut new_op = Op::new(OpCode::IntInvert, &[arg1]);
-            new_op.pos.set(op.pos.get());
-            return OptimizationResult::Emit(new_op);
-        }
-
-        // xor_reassoc_consts: int_xor(int_xor(x, C1), C2) => int_xor(x, C1^C2)
-        if let Some(c2) = ctx
-            .resolve_box_box_opt(&arg1)
-            .and_then(|b| ctx.get_constant_int_box(&b))
-        {
-            if let Some(inner) = ctx
-                .resolve_box_box_opt(&arg0)
-                .and_then(|pb| ctx.get_producing_op(&pb))
-            {
-                if inner.opcode == OpCode::IntXor {
-                    if let Some(c1) =
-                        ctx.get_constant_int_box(&inner.arg(1).get_box_replacement(false))
-                    {
-                        let x = inner.arg(0);
-                        let c = self.emit_constant_int(ctx, c1 ^ c2);
-                        let arg_c = ctx.materialize_box_at(c);
-                        let mut new_op = Op::new(OpCode::IntXor, &[x, arg_c]);
-                        new_op.pos.set(op.pos.get());
-                        return OptimizationResult::Emit(new_op);
-                    }
-                }
-            }
-        }
-
-        // xor_absorb: int_xor(int_xor(a, b), b) => a
-        if let Some(inner) = ctx
-            .resolve_box_box_opt(&arg0)
-            .and_then(|pb| ctx.get_producing_op(&pb))
-        {
-            if inner.opcode == OpCode::IntXor && inner.arg(1).to_opref() == arg1.to_opref() {
-                let b_old = BoxRef::from_bound_op(op_rc);
-                let b_inner = ctx.resolve_box_box(&inner.arg(0));
-                ctx.make_equal_to(&b_old, &b_inner);
-                return OptimizationResult::Remove;
-            }
-        }
-
-        // xor_is_not: int_xor(x, 1) => int_is_zero(x) (if x is bool)
-        if let Some(1) = ctx
-            .resolve_box_box_opt(&arg1)
-            .and_then(|b| ctx.get_constant_int_box(&b))
-        {
-            if let Some(bound) = ctx
-                .resolve_box_box_opt(&arg0)
-                .and_then(|b| ctx.peek_intbound_box(&b))
-            {
-                if bound.is_bool() {
-                    let mut new_op = Op::new(OpCode::IntIsZero, &[arg0]);
-                    new_op.pos.set(op.pos.get());
-                    return OptimizationResult::Emit(new_op);
-                }
-            }
-        }
-
-        OptimizationResult::PassOn
-    }
-
-    /// Try algebraic simplification for INT_LSHIFT.
-    /// `x << 0 -> x`
-    fn optimize_int_lshift(
-        &self,
-        op: &Op,
-        op_rc: &majit_ir::OpRc,
-        ctx: &mut OptContext,
-    ) -> OptimizationResult {
-        let arg0 = op.arg(0);
-        let arg1 = op.arg(1);
-
-        // Constant fold
-        if let (Some(a), Some(b)) = (
-            ctx.resolve_box_box_opt(&arg0)
-                .and_then(|b| ctx.get_constant_int_box(&b)),
-            ctx.resolve_box_box_opt(&arg1)
-                .and_then(|b| ctx.get_constant_int_box(&b)),
-        ) {
-            if let Some(result) = self.try_fold_binary_int(OpCode::IntLshift, a, b) {
-                ctx.make_constant(op.pos.get(), Value::Int(result));
-                return OptimizationResult::Remove;
-            }
-        }
-
-        // x << 0 -> x
-        if let Some(0) = ctx
-            .resolve_box_box_opt(&arg1)
-            .and_then(|b| ctx.get_constant_int_box(&b))
-        {
-            let b_old = BoxRef::from_bound_op(op_rc);
-            let b_arg = ctx.resolve_box_box(&arg0);
-            ctx.make_equal_to(&b_old, &b_arg);
-            return OptimizationResult::Remove;
-        }
-        // 0 << x -> 0
-        if let Some(0) = ctx
-            .resolve_box_box_opt(&arg0)
-            .and_then(|b| ctx.get_constant_int_box(&b))
-        {
-            ctx.make_constant(op.pos.get(), Value::Int(0));
-            return OptimizationResult::Remove;
-        }
-
-        // lshift_rshift_c_c: int_lshift(int_rshift(x, C1), C1) => int_and(x, -1<<C1)
-        if let Some(c1) = ctx
-            .resolve_box_box_opt(&arg1)
-            .and_then(|b| ctx.get_constant_int_box(&b))
-        {
-            if (0..64).contains(&c1) {
-                if let Some(inner) = ctx
-                    .resolve_box_box_opt(&arg0)
-                    .and_then(|pb| ctx.get_producing_op(&pb))
-                {
-                    if inner.opcode == OpCode::IntRshift {
-                        if ctx.get_constant_int_box(&inner.arg(1).get_box_replacement(false))
-                            == Some(c1)
-                        {
-                            let mask = self.emit_constant_int(ctx, (-1i64).wrapping_shl(c1 as u32));
-                            let arg_mask = ctx.materialize_box_at(mask);
-                            let mut new_op = Op::new(OpCode::IntAnd, &[inner.arg(0), arg_mask]);
-                            new_op.pos.set(op.pos.get());
-                            return OptimizationResult::Emit(new_op);
-                        }
-                    }
-                    // lshift_urshift_c_c: int_lshift(uint_rshift(x, C1), C1)
-                    if inner.opcode == OpCode::UintRshift {
-                        if ctx.get_constant_int_box(&inner.arg(1).get_box_replacement(false))
-                            == Some(c1)
-                        {
-                            let mask = self.emit_constant_int(ctx, (-1i64).wrapping_shl(c1 as u32));
-                            let arg_mask = ctx.materialize_box_at(mask);
-                            let mut new_op = Op::new(OpCode::IntAnd, &[inner.arg(0), arg_mask]);
-                            new_op.pos.set(op.pos.get());
-                            return OptimizationResult::Emit(new_op);
-                        }
-                    }
-                    // lshift_and_rshift: int_lshift(int_and(int_rshift(x, C1), C2), C1)
-                    if inner.opcode == OpCode::IntAnd {
-                        if let Some(c2) =
-                            ctx.get_constant_int_box(&inner.arg(1).get_box_replacement(false))
-                        {
-                            if let Some(inner2) = ctx
-                                .resolve_box_box_opt(&inner.arg(0))
-                                .and_then(|pb| ctx.get_producing_op(&pb))
-                            {
-                                if inner2.opcode == OpCode::IntRshift
-                                    && ctx.get_constant_int_box(
-                                        &inner2.arg(1).get_box_replacement(false),
-                                    ) == Some(c1)
-                                {
-                                    let mask =
-                                        self.emit_constant_int(ctx, c2.wrapping_shl(c1 as u32));
-                                    let arg_mask = ctx.materialize_box_at(mask);
-                                    let mut new_op =
-                                        Op::new(OpCode::IntAnd, &[inner2.arg(0), arg_mask]);
-                                    new_op.pos.set(op.pos.get());
-                                    return OptimizationResult::Emit(new_op);
-                                }
-                                // lshift_and_urshift
-                                if inner2.opcode == OpCode::UintRshift
-                                    && ctx.get_constant_int_box(
-                                        &inner2.arg(1).get_box_replacement(false),
-                                    ) == Some(c1)
-                                {
-                                    let mask =
-                                        self.emit_constant_int(ctx, c2.wrapping_shl(c1 as u32));
-                                    let arg_mask = ctx.materialize_box_at(mask);
-                                    let mut new_op =
-                                        Op::new(OpCode::IntAnd, &[inner2.arg(0), arg_mask]);
-                                    new_op.pos.set(op.pos.get());
-                                    return OptimizationResult::Emit(new_op);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // lshift_lshift_c_c: int_lshift(int_lshift(x, C1), C2) => int_lshift(x, C1+C2)
-        if let Some(c2) = ctx
-            .resolve_box_box_opt(&arg1)
-            .and_then(|b| ctx.get_constant_int_box(&b))
-        {
-            if let Some(inner) = ctx
-                .resolve_box_box_opt(&arg0)
-                .and_then(|pb| ctx.get_producing_op(&pb))
-            {
-                if inner.opcode == OpCode::IntLshift {
-                    if let Some(c1) =
-                        ctx.get_constant_int_box(&inner.arg(1).get_box_replacement(false))
-                    {
-                        if (0..64).contains(&c1) && (0..64).contains(&c2) {
-                            let c = c1 + c2;
-                            if c < 64 {
-                                let cv = self.emit_constant_int(ctx, c);
-                                let arg_cv = ctx.materialize_box_at(cv);
-                                let mut new_op =
-                                    Op::new(OpCode::IntLshift, &[inner.arg(0), arg_cv]);
-                                new_op.pos.set(op.pos.get());
-                                return OptimizationResult::Emit(new_op);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        OptimizationResult::PassOn
-    }
-
-    /// Try algebraic simplification for INT_RSHIFT.
-    /// `x >> 0 -> x`
-    fn optimize_int_rshift(
-        &self,
-        op: &Op,
-        op_rc: &majit_ir::OpRc,
-        ctx: &mut OptContext,
-    ) -> OptimizationResult {
-        let arg0 = op.arg(0);
-        let arg1 = op.arg(1);
-
-        // Constant fold
-        if let (Some(a), Some(b)) = (
-            ctx.resolve_box_box_opt(&arg0)
-                .and_then(|b| ctx.get_constant_int_box(&b)),
-            ctx.resolve_box_box_opt(&arg1)
-                .and_then(|b| ctx.get_constant_int_box(&b)),
-        ) {
-            if let Some(result) = self.try_fold_binary_int(OpCode::IntRshift, a, b) {
-                ctx.make_constant(op.pos.get(), Value::Int(result));
-                return OptimizationResult::Remove;
-            }
-        }
-
-        // x >> 0 -> x
-        if let Some(0) = ctx
-            .resolve_box_box_opt(&arg1)
-            .and_then(|b| ctx.get_constant_int_box(&b))
-        {
-            let b_old = BoxRef::from_bound_op(op_rc);
-            let b_arg = ctx.resolve_box_box(&arg0);
-            ctx.make_equal_to(&b_old, &b_arg);
-            return OptimizationResult::Remove;
-        }
-        // 0 >> x -> 0
-        if let Some(0) = ctx
-            .resolve_box_box_opt(&arg0)
-            .and_then(|b| ctx.get_constant_int_box(&b))
-        {
-            ctx.make_constant(op.pos.get(), Value::Int(0));
-            return OptimizationResult::Remove;
-        }
-
-        // rshift_known_result: int_rshift(a, b) => C (if result bound is constant)
-        if let (Some(ba), Some(bb)) = (
-            ctx.resolve_box_box_opt(&arg0)
-                .and_then(|b| ctx.peek_intbound_box(&b)),
-            ctx.resolve_box_box_opt(&arg1)
-                .and_then(|b| ctx.peek_intbound_box(&b)),
-        ) {
-            let result_bound = ba.rshift_bound(&bb);
-            if result_bound.is_constant() {
-                ctx.make_constant(op.pos.get(), Value::Int(result_bound.get_constant_int()));
-                return OptimizationResult::Remove;
-            }
-        }
-
-        // rshift_lshift: int_rshift(int_lshift(x, y), y) => x (if no overflow)
-        if let Some(inner) = ctx
-            .resolve_box_box_opt(&arg0)
-            .and_then(|pb| ctx.get_producing_op(&pb))
-        {
-            if inner.opcode == OpCode::IntLshift && inner.arg(1).to_opref() == arg1.to_opref() {
-                if let (Some(bx), Some(by)) = (
-                    ctx.peek_intbound_box(&inner.arg(0).get_box_replacement(false)),
-                    ctx.resolve_box_box_opt(&arg1)
-                        .and_then(|b| ctx.peek_intbound_box(&b)),
-                ) {
-                    if bx.lshift_bound_cannot_overflow(&by) {
-                        let b_old = BoxRef::from_bound_op(op_rc);
-                        let b_inner = ctx.resolve_box_box(&inner.arg(0));
-                        ctx.make_equal_to(&b_old, &b_inner);
-                        return OptimizationResult::Remove;
-                    }
-                }
-            }
-        }
-
-        // rshift_rshift_c_c: int_rshift(int_rshift(x, C1), C2) => int_rshift(x, min(C1+C2, 63))
-        if let Some(c2) = ctx
-            .resolve_box_box_opt(&arg1)
-            .and_then(|b| ctx.get_constant_int_box(&b))
-        {
-            if let Some(inner) = ctx
-                .resolve_box_box_opt(&arg0)
-                .and_then(|pb| ctx.get_producing_op(&pb))
-            {
-                if inner.opcode == OpCode::IntRshift {
-                    if let Some(c1) =
-                        ctx.get_constant_int_box(&inner.arg(1).get_box_replacement(false))
-                    {
-                        if (0..64).contains(&c1) && (0..64).contains(&c2) {
-                            let c = (c1 + c2).min(63);
-                            let cv = self.emit_constant_int(ctx, c);
-                            let arg_cv = ctx.materialize_box_at(cv);
-                            let mut new_op = Op::new(OpCode::IntRshift, &[inner.arg(0), arg_cv]);
-                            new_op.pos.set(op.pos.get());
-                            return OptimizationResult::Emit(new_op);
-                        }
-                    }
-                }
-            }
-        }
-
-        OptimizationResult::PassOn
-    }
-
-    /// Try algebraic simplification for UINT_RSHIFT.
-    /// `x >>> 0 -> x`
-    fn optimize_uint_rshift(
-        &self,
-        op: &Op,
-        op_rc: &majit_ir::OpRc,
-        ctx: &mut OptContext,
-    ) -> OptimizationResult {
-        let arg0 = op.arg(0);
-        let arg1 = op.arg(1);
-
-        // Constant fold
-        if let (Some(a), Some(b)) = (
-            ctx.resolve_box_box_opt(&arg0)
-                .and_then(|b| ctx.get_constant_int_box(&b)),
-            ctx.resolve_box_box_opt(&arg1)
-                .and_then(|b| ctx.get_constant_int_box(&b)),
-        ) {
-            if let Some(result) = self.try_fold_binary_int(OpCode::UintRshift, a, b) {
-                ctx.make_constant(op.pos.get(), Value::Int(result));
-                return OptimizationResult::Remove;
-            }
-        }
-
-        // x >>> 0 -> x
-        if let Some(0) = ctx
-            .resolve_box_box_opt(&arg1)
-            .and_then(|b| ctx.get_constant_int_box(&b))
-        {
-            let b_old = BoxRef::from_bound_op(op_rc);
-            let b_arg = ctx.resolve_box_box(&arg0);
-            ctx.make_equal_to(&b_old, &b_arg);
-            return OptimizationResult::Remove;
-        }
-        // 0 >>> x -> 0
-        if let Some(0) = ctx
-            .resolve_box_box_opt(&arg0)
-            .and_then(|b| ctx.get_constant_int_box(&b))
-        {
-            ctx.make_constant(op.pos.get(), Value::Int(0));
-            return OptimizationResult::Remove;
-        }
-
-        // urshift_known_result: uint_rshift(a, b) => C (if result bound is constant)
-        if let (Some(ba), Some(bb)) = (
-            ctx.resolve_box_box_opt(&arg0)
-                .and_then(|b| ctx.peek_intbound_box(&b)),
-            ctx.resolve_box_box_opt(&arg1)
-                .and_then(|b| ctx.peek_intbound_box(&b)),
-        ) {
-            let result_bound = ba.urshift_bound(&bb);
-            if result_bound.is_constant() {
-                ctx.make_constant(op.pos.get(), Value::Int(result_bound.get_constant_int()));
-                return OptimizationResult::Remove;
-            }
-        }
-
-        // urshift_lshift_x_c_c: uint_rshift(int_lshift(x, C), C) => int_and(x, mask)
-        if let Some(c) = ctx
-            .resolve_box_box_opt(&arg1)
-            .and_then(|b| ctx.get_constant_int_box(&b))
-        {
-            if (0..64).contains(&c) {
-                if let Some(inner) = ctx
-                    .resolve_box_box_opt(&arg0)
-                    .and_then(|pb| ctx.get_producing_op(&pb))
-                {
-                    if inner.opcode == OpCode::IntLshift
-                        && ctx.get_constant_int_box(&inner.arg(1).get_box_replacement(false))
-                            == Some(c)
-                    {
-                        let mask = ((-1i64 as u64).wrapping_shl(c as u32) >> (c as u32)) as i64;
-                        let mask_ref = self.emit_constant_int(ctx, mask);
-                        let arg_mask = ctx.materialize_box_at(mask_ref);
-                        let mut new_op = Op::new(OpCode::IntAnd, &[inner.arg(0), arg_mask]);
-                        new_op.pos.set(op.pos.get());
-                        return OptimizationResult::Emit(new_op);
-                    }
-                }
-            }
-        }
-
-        OptimizationResult::PassOn
-    }
-
     // ── Unary operations ──
-
-    /// Constant fold or simplify INT_NEG.
-    fn optimize_int_neg(
-        &self,
-        op: &Op,
-        op_rc: &majit_ir::OpRc,
-        ctx: &mut OptContext,
-    ) -> OptimizationResult {
-        let arg0 = op.arg(0);
-
-        if let Some(a) = ctx
-            .resolve_box_box_opt(&arg0)
-            .and_then(|b| ctx.get_constant_int_box(&b))
-        {
-            if let Some(result) = self.try_fold_unary_int(OpCode::IntNeg, a) {
-                ctx.make_constant(op.pos.get(), Value::Int(result));
-                return OptimizationResult::Remove;
-            }
-        }
-
-        // neg_neg: int_neg(int_neg(x)) => x
-        if let Some(inner) = ctx
-            .resolve_box_box_opt(&arg0)
-            .and_then(|pb| ctx.get_producing_op(&pb))
-        {
-            if inner.opcode == OpCode::IntNeg {
-                let b_old = BoxRef::from_bound_op(op_rc);
-                let b_inner = ctx.resolve_box_box(&inner.arg(0));
-                ctx.make_equal_to(&b_old, &b_inner);
-                return OptimizationResult::Remove;
-            }
-        }
-
-        OptimizationResult::PassOn
-    }
-
-    /// Constant fold or simplify INT_INVERT.
-    fn optimize_int_invert(
-        &self,
-        op: &Op,
-        op_rc: &majit_ir::OpRc,
-        ctx: &mut OptContext,
-    ) -> OptimizationResult {
-        let arg0 = op.arg(0);
-
-        if let Some(a) = ctx
-            .resolve_box_box_opt(&arg0)
-            .and_then(|b| ctx.get_constant_int_box(&b))
-        {
-            if let Some(result) = self.try_fold_unary_int(OpCode::IntInvert, a) {
-                ctx.make_constant(op.pos.get(), Value::Int(result));
-                return OptimizationResult::Remove;
-            }
-        }
-
-        // invert_invert: int_invert(int_invert(x)) => x
-        if let Some(inner) = ctx
-            .resolve_box_box_opt(&arg0)
-            .and_then(|pb| ctx.get_producing_op(&pb))
-        {
-            if inner.opcode == OpCode::IntInvert {
-                let b_old = BoxRef::from_bound_op(op_rc);
-                let b_inner = ctx.resolve_box_box(&inner.arg(0));
-                ctx.make_equal_to(&b_old, &b_inner);
-                return OptimizationResult::Remove;
-            }
-        }
-
-        OptimizationResult::PassOn
-    }
 
     /// Constant fold INT_IS_ZERO.
     /// rewrite.py:512-513 `optimize_INT_IS_ZERO`:
@@ -1905,138 +528,13 @@ impl OptRewrite {
 
     // ── Comparisons ──
 
-    /// Constant fold binary comparisons.
-    fn optimize_comparison(
-        &mut self,
-        op: &Op,
-        op_rc: &majit_ir::OpRc,
-        ctx: &mut OptContext,
-    ) -> OptimizationResult {
+    /// Comparison folds (constant folds, knownbits eq/ne, eq_zero /
+    /// eq_one / eq_sub_eq) live in OptIntBounds, as upstream. This arm
+    /// only records the comparison result for `find_rewritable_bool`
+    /// (inverse/reflex lookup).
+    fn optimize_comparison(&mut self, op: &Op) -> OptimizationResult {
         let arg0 = op.arg(0);
         let arg1 = op.arg(1);
-
-        if let (Some(a), Some(b)) = (
-            ctx.resolve_box_box_opt(&arg0)
-                .and_then(|b| ctx.get_constant_int_box(&b)),
-            ctx.resolve_box_box_opt(&arg1)
-                .and_then(|b| ctx.get_constant_int_box(&b)),
-        ) {
-            if let Some(result) = self.try_fold_binary_int(op.opcode, a, b) {
-                ctx.make_constant(op.pos.get(), Value::Int(result));
-                return OptimizationResult::Remove;
-            }
-        }
-
-        // eq_different_knownbits: int_eq(x, y) => 0 (if known_ne)
-        if op.opcode == OpCode::IntEq {
-            if let (Some(bx), Some(by)) = (
-                ctx.resolve_box_box_opt(&arg0)
-                    .and_then(|b| ctx.peek_intbound_box(&b)),
-                ctx.resolve_box_box_opt(&arg1)
-                    .and_then(|b| ctx.peek_intbound_box(&b)),
-            ) {
-                if bx.known_ne(&by) {
-                    ctx.make_constant(op.pos.get(), Value::Int(0));
-                    return OptimizationResult::Remove;
-                }
-            }
-        }
-        // ne_different_knownbits: int_ne(x, y) => 1 (if known_ne)
-        if op.opcode == OpCode::IntNe {
-            if let (Some(bx), Some(by)) = (
-                ctx.resolve_box_box_opt(&arg0)
-                    .and_then(|b| ctx.peek_intbound_box(&b)),
-                ctx.resolve_box_box_opt(&arg1)
-                    .and_then(|b| ctx.peek_intbound_box(&b)),
-            ) {
-                if bx.known_ne(&by) {
-                    ctx.make_constant(op.pos.get(), Value::Int(1));
-                    return OptimizationResult::Remove;
-                }
-            }
-        }
-        // eq_same: int_eq(x, x) => 1
-        if op.opcode == OpCode::IntEq
-            && self.boxes_equal_via_intbound(arg0.to_opref(), arg1.to_opref(), ctx)
-        {
-            ctx.make_constant(op.pos.get(), Value::Int(1));
-            return OptimizationResult::Remove;
-        }
-        // ne_same: int_ne(x, x) => 0
-        if op.opcode == OpCode::IntNe
-            && self.boxes_equal_via_intbound(arg0.to_opref(), arg1.to_opref(), ctx)
-        {
-            ctx.make_constant(op.pos.get(), Value::Int(0));
-            return OptimizationResult::Remove;
-        }
-        // eq_zero: int_eq(x, 0) => int_is_zero(x)
-        if op.opcode == OpCode::IntEq {
-            if let Some(0) = ctx
-                .resolve_box_box_opt(&arg1)
-                .and_then(|b| ctx.get_constant_int_box(&b))
-            {
-                let mut new_op = Op::new(OpCode::IntIsZero, &[arg0]);
-                new_op.pos.set(op.pos.get());
-                return OptimizationResult::Emit(new_op);
-            }
-        }
-        // ne_zero: int_ne(x, 0) => int_is_true(x)
-        if op.opcode == OpCode::IntNe {
-            if let Some(0) = ctx
-                .resolve_box_box_opt(&arg1)
-                .and_then(|b| ctx.get_constant_int_box(&b))
-            {
-                let mut new_op = Op::new(OpCode::IntIsTrue, &[arg0]);
-                new_op.pos.set(op.pos.get());
-                return OptimizationResult::Emit(new_op);
-            }
-        }
-        // eq_one: int_eq(x, 1) => x (if x is bool)
-        if op.opcode == OpCode::IntEq {
-            if let Some(1) = ctx
-                .resolve_box_box_opt(&arg1)
-                .and_then(|b| ctx.get_constant_int_box(&b))
-            {
-                if let Some(bound) = ctx
-                    .resolve_box_box_opt(&arg0)
-                    .and_then(|b| ctx.peek_intbound_box(&b))
-                {
-                    if bound.is_bool() {
-                        let b_old = BoxRef::from_bound_op(op_rc);
-                        let b_arg = ctx.resolve_box_box(&arg0);
-                        ctx.make_equal_to(&b_old, &b_arg);
-                        return OptimizationResult::Remove;
-                    }
-                }
-            }
-        }
-
-        // eq_sub_eq: int_eq(int_sub(x, int_eq(x, a)), a) => 0
-        if op.opcode == OpCode::IntEq {
-            if let Some(inner_sub) = ctx
-                .resolve_box_box_opt(&arg0)
-                .and_then(|pb| ctx.get_producing_op(&pb))
-            {
-                if inner_sub.opcode == OpCode::IntSub && inner_sub.arg(0).to_opref() != OpRef::NONE
-                {
-                    if let Some(inner_eq) = ctx
-                        .resolve_box_box_opt(&inner_sub.arg(1))
-                        .and_then(|pb| ctx.get_producing_op(&pb))
-                    {
-                        if inner_eq.opcode == OpCode::IntEq
-                            && inner_eq.arg(0).to_opref() == inner_sub.arg(0).to_opref()
-                            && inner_eq.arg(1).to_opref() == arg1.to_opref()
-                        {
-                            ctx.make_constant(op.pos.get(), Value::Int(0));
-                            return OptimizationResult::Remove;
-                        }
-                    }
-                }
-            }
-        }
-
-        // rewrite.py: postprocess — record comparison result for
-        // find_rewritable_bool (inverse/reflex lookup).
         self.bool_result_cache
             .insert((op.opcode, arg0.to_opref(), arg1.to_opref()), op.pos.get());
 
@@ -3116,22 +1614,15 @@ impl Optimization for OptRewrite {
         }
 
         match op.opcode {
-            // ── Binary integer arithmetic ──
-            OpCode::IntAdd => self.optimize_int_add(op, op_rc, ctx),
-            OpCode::IntSub => self.optimize_int_sub(op, op_rc, ctx),
-            OpCode::IntMul => self.optimize_int_mul(op, op_rc, ctx),
+            // Integer arithmetic rewrites (the autogenintrules.py ruleset)
+            // live in OptIntBounds, as upstream; rewrite.py has no
+            // optimize_INT_ADD/SUB/MUL/AND/OR/XOR/shift/NEG/INVERT methods.
+            // IntFloorDiv / IntMod are pyre opcodes (upstream lowers // and %
+            // to residual calls, see optimize_call_int_py_div / _py_mod), so
+            // their strength-reduction rules stay here with the opcode.
             OpCode::IntFloorDiv => self.optimize_int_floor_div(op, op_rc, ctx),
             OpCode::IntMod => self.optimize_int_mod(op, op_rc, ctx),
-            OpCode::IntAnd => self.optimize_int_and(op, op_rc, ctx),
-            OpCode::IntOr => self.optimize_int_or(op, op_rc, ctx),
-            OpCode::IntXor => self.optimize_int_xor(op, op_rc, ctx),
-            OpCode::IntLshift => self.optimize_int_lshift(op, op_rc, ctx),
-            OpCode::IntRshift => self.optimize_int_rshift(op, op_rc, ctx),
-            OpCode::UintRshift => self.optimize_uint_rshift(op, op_rc, ctx),
 
-            // ── Unary integer operations ──
-            OpCode::IntNeg => self.optimize_int_neg(op, op_rc, ctx),
-            OpCode::IntInvert => self.optimize_int_invert(op, op_rc, ctx),
             OpCode::IntIsZero => self.optimize_int_is_zero(op, ctx),
             OpCode::IntIsTrue => self.optimize_int_is_true(op, op_rc, ctx),
             OpCode::IntForceGeZero => self.optimize_int_force_ge_zero(op, op_rc, ctx),
@@ -3147,7 +1638,7 @@ impl Optimization for OptRewrite {
             | OpCode::UintLt
             | OpCode::UintLe
             | OpCode::UintGt
-            | OpCode::UintGe => self.optimize_comparison(op, op_rc, ctx),
+            | OpCode::UintGe => self.optimize_comparison(op),
 
             // ── Guards ──
             OpCode::GuardTrue => self.optimize_guard_true(op, ctx),
@@ -3827,6 +2318,49 @@ mod tests {
         for &(opref, value) in constants {
             ctx.make_constant(opref, value);
         }
+        let mut passes = test_pass_chain();
+        let mut op = ops[target].clone();
+        resolve_op_args_in_ctx(&mut op, &mut ctx);
+        let op_rc = std::rc::Rc::new(op.clone());
+        ctx.bind_input_resops(std::slice::from_ref(&op_rc));
+        let mut result = OptimizationResult::PassOn;
+        for pass in passes.iter_mut() {
+            result = pass.propagate_forward(&op, &op_rc, &mut ctx);
+            if !matches!(result, OptimizationResult::PassOn) {
+                break;
+            }
+        }
+        (result, ctx)
+    }
+
+    /// The int-rewrite slice of the production pipeline: integer rule
+    /// rewrites live in OptIntBounds (autogenintrules.py), all-constant
+    /// pure folding in OptPure (pure.py:131), with OptRewrite between
+    /// them as in default_pipeline. Tests in this module assert the
+    /// chain's observable result, wherever the individual rule lives.
+    fn test_pass_chain() -> Vec<Box<dyn crate::optimizeopt::Optimization>> {
+        vec![
+            Box::new(crate::optimizeopt::intbounds::OptIntBounds::new()),
+            Box::new(OptRewrite::new()),
+            Box::new(crate::optimizeopt::pure::OptPure::new()),
+        ]
+    }
+
+    /// `run_one` against OptRewrite alone, for tests that assert what the
+    /// rewrite pass itself must NOT do (a chained pass would mask it).
+    fn run_one_rewrite_only(
+        mut ops: Vec<Op>,
+        target: usize,
+        constants: &[(OpRef, Value)],
+    ) -> (OptimizationResult, OptContext) {
+        with_positions(&mut ops);
+        let mut ctx = OptContext::new(ops.len());
+        for op in &ops[..target] {
+            ctx.emit(op.clone());
+        }
+        for &(opref, value) in constants {
+            ctx.make_constant(opref, value);
+        }
         let mut pass = OptRewrite::new();
         let mut op = ops[target].clone();
         resolve_op_args_in_ctx(&mut op, &mut ctx);
@@ -3881,7 +2415,7 @@ mod tests {
     fn run_rewrite(ops: &mut [Op]) -> (Vec<Op>, OptContext) {
         with_positions(ops);
         let mut ctx = OptContext::new(ops.len());
-        let mut pass = OptRewrite::new();
+        let mut passes = test_pass_chain();
 
         for op in ops.iter() {
             // Resolve forwarded arguments
@@ -3890,7 +2424,14 @@ mod tests {
 
             let __pf_rc = std::rc::Rc::new(resolved.clone());
             ctx.bind_input_resops(std::slice::from_ref(&__pf_rc));
-            match pass.propagate_forward(&resolved, &__pf_rc, &mut ctx) {
+            let mut result = OptimizationResult::PassOn;
+            for pass in passes.iter_mut() {
+                result = pass.propagate_forward(&resolved, &__pf_rc, &mut ctx);
+                if !matches!(result, OptimizationResult::PassOn) {
+                    break;
+                }
+            }
+            match result {
                 OptimizationResult::Emit(emitted) => {
                     ctx.emit(emitted);
                 }
@@ -3966,18 +2507,6 @@ mod tests {
         assert_binop_identity(OpCode::IntAdd, 0, 0, 1);
         // constant fold
         assert_binop_const_fold(OpCode::IntAdd, 10, 20, 30);
-    }
-
-    #[test]
-    fn test_int_add_x_plus_x() {
-        // x + x → lshift(x, 1) — keep as separate test (rewrite, not identity)
-        let (result, _) = run_one(vec![same_i(), bin_i(OpCode::IntAdd, 0, 0)], 1, &[]);
-        // x + x may be rewritten to lshift(x, 1) or kept
-        assert!(
-            !matches!(result, OptimizationResult::PassOn)
-                || matches!(result, OptimizationResult::Replace(_))
-                || matches!(result, OptimizationResult::Emit(_))
-        );
     }
 
     #[test]
@@ -4240,7 +2769,7 @@ mod tests {
         // let's test the pass directly instead.
         let mut ctx = OptContext::new(3);
 
-        let mut pass = OptRewrite::new();
+        let mut passes = test_pass_chain();
 
         // Simulate the optimizer loop
         for (i, op) in ops.iter().enumerate() {
@@ -4251,7 +2780,19 @@ mod tests {
             }
             let __pf_rc = std::rc::Rc::new(resolved.clone());
             ctx.bind_input_resops(std::slice::from_ref(&__pf_rc));
-            match pass.propagate_forward(&resolved, &__pf_rc, &mut ctx) {
+            let mut result = OptimizationResult::PassOn;
+            // The production loop absorbs SameAs* before the passes
+            // (optimizer.py:864-867); the argless SameAsI fixtures here
+            // stand in for inputs and are emitted directly.
+            if resolved.opcode != OpCode::SameAsI {
+                for pass in passes.iter_mut() {
+                    result = pass.propagate_forward(&resolved, &__pf_rc, &mut ctx);
+                    if !matches!(result, OptimizationResult::PassOn) {
+                        break;
+                    }
+                }
+            }
+            match result {
                 OptimizationResult::Emit(emitted) => {
                     ctx.emit(emitted);
                 }
@@ -4303,7 +2844,7 @@ mod tests {
         with_positions(&mut ops);
 
         let mut ctx = OptContext::new(3);
-        let mut pass = OptRewrite::new();
+        let mut passes = test_pass_chain();
 
         let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             for op in &ops {
@@ -4314,7 +2855,18 @@ mod tests {
                 }
                 let __pf_rc = std::rc::Rc::new(resolved.clone());
                 ctx.bind_input_resops(std::slice::from_ref(&__pf_rc));
-                match pass.propagate_forward(&resolved, &__pf_rc, &mut ctx) {
+                let mut result = OptimizationResult::PassOn;
+                // SameAsI input fixtures bypass the passes, as in the
+                // production loop's SameAs absorption (optimizer.py:864-867).
+                if resolved.opcode != OpCode::SameAsI {
+                    for pass in passes.iter_mut() {
+                        result = pass.propagate_forward(&resolved, &__pf_rc, &mut ctx);
+                        if !matches!(result, OptimizationResult::PassOn) {
+                            break;
+                        }
+                    }
+                }
+                match result {
                     OptimizationResult::Emit(emitted) => {
                         ctx.emit(emitted);
                     }
@@ -4682,7 +3234,10 @@ mod tests {
         // history.py:307 ConstPtr — Value::Ref must land on a Ref-tagged
         // OpRef so the box class identity matches the resoperation.py:615
         // RefOp mixin of the producer SameAsR.
-        let (result, ctx) = run_one(
+        // OptRewrite alone: this asserts the REWRITE pass's behavior; the
+        // chained harness would let OptPure fold it, masking a regression
+        // where rewrite value-compares ConstPtr.
+        let (result, ctx) = run_one_rewrite_only(
             vec![same_r(), same_r(), bin_r(OpCode::PtrEq, 0, 1)],
             2,
             &[
@@ -4877,6 +3432,8 @@ mod tests {
         with_positions(&mut ops);
 
         let mut opt = crate::optimizeopt::optimizer::Optimizer::new();
+        // mul_minus_one lives in OptIntBounds (autogenintrules.py).
+        opt.add_pass(Box::new(crate::optimizeopt::intbounds::OptIntBounds::new()));
         opt.add_pass(Box::new(OptRewrite::new()));
         let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
         constants.insert(200u32, majit_ir::Value::Int(-1));
