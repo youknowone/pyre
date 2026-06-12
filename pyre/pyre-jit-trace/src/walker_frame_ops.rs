@@ -226,13 +226,16 @@ impl<'frame, 'static_a: 'frame> WalkerFrameOps
         self.trace_ctx.record_guard(opcode, args, 0);
         // `walker_capture_snapshot_for_last_guard` returns a typed abort
         // (`GuardSnapshotVableUntyped`) for the multi-frame vable case the
-        // full-body walk routes through `DispatchError`.  This
-        // `WalkerFrameOps` path — the env-gated STORE_SUBSCR specialization,
-        // dead in production (the `_r_v` arm shape is unreachable in arm
-        // jitcode) — has no abort channel through the `()` trait signature,
-        // so the snapshot is best-effort here.  If the specialization is
-        // ever activated, the abort must be threaded through
-        // `WalkerFrameOps::generate_guard`'s return type.
-        let _ = crate::jitcode_dispatch::walker_capture_snapshot_for_last_guard(self, 0);
+        // full-body walk routes through `DispatchError`.  The `()` trait
+        // signature (shared with the trait tracer's `MIFrame`) has no
+        // error channel, so latch the first failure on the context; the
+        // STORE_SUBSCR specialization's dispatcher call site drains it
+        // and aborts the walk — a guard without a resume snapshot must
+        // not reach the compile pipeline.
+        if let Err(e) = crate::jitcode_dispatch::walker_capture_snapshot_for_last_guard(self, 0) {
+            if self.pending_guard_snapshot_error.is_none() {
+                self.pending_guard_snapshot_error = Some(e);
+            }
+        }
     }
 }
