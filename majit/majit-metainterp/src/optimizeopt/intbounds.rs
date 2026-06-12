@@ -11,26 +11,9 @@ use majit_ir::{Op, OpCode, OpRef, Value};
 use crate::optimizeopt::intutils::IntBound;
 use crate::optimizeopt::{OptContext, Optimization, OptimizationResult};
 
-/// autogenintrules.py:14-18 `_eq(box1, bound1, box2, bound2)` helper.
-/// RPython's rule matcher tests identity OR constant-bound equality so
-/// two different boxes with the same known constant value are treated
-/// as `x is x`.
-fn autogen_eq(box1: OpRef, bound1: &IntBound, box2: OpRef, bound2: &IntBound) -> bool {
-    if box1 == box2 {
-        return true;
-    }
-    if bound1.is_constant()
-        && bound2.is_constant()
-        && bound1.get_constant_int() == bound2.get_constant_int()
-    {
-        return true;
-    }
-    false
-}
-
-/// `BoxRef`-terminal variant of [`autogen_eq`]: identity via `same_box`
-/// (resoperation.py:38 `self is other`, with `Const.same_box` value
-/// comparison) instead of the OpRef-flat `==`, plus the same
+/// autogenintrules.py:14-18 `_eq(box1, bound1, box2, bound2)` helper:
+/// identity via `same_box` (resoperation.py:38 `self is other`, with
+/// `Const.same_box` value comparison) plus the
 /// constant-bound equality fallback. Used by the `optimize_INT_*` bodies
 /// that resolve operands to their `_forwarded` terminal via `resolve_box`.
 fn autogen_eq_b(
