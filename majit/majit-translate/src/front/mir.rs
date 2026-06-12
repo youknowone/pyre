@@ -205,7 +205,11 @@ pub fn build_semantic_program_from_llbcs_with_static_addrs(
     // pyre-interpreter and pyre-jit `FrameBlock`s).  Re-derive the
     // verdict from the merged qualified keys.
     if let Some(acc) = &mut merged {
-        harden_duplicate_leaf_metadata(&mut acc.struct_fields, &mut acc.struct_origins);
+        harden_duplicate_leaf_metadata(
+            &mut acc.struct_fields,
+            &mut acc.struct_origins,
+            &mut acc.enum_variant_by_discriminant,
+        );
     }
     Ok(
         merged.unwrap_or_else(|| crate::front::semantic::SemanticProgram {
@@ -272,11 +276,15 @@ pub fn build_semantic_program_from_llbc_with_static_addrs(
         known_struct_names,
         known_trait_names,
         mut struct_fields,
-        enum_variant_by_discriminant,
+        mut enum_variant_by_discriminant,
         mut struct_origins,
         struct_field_attrs,
     ) = derive_program_metadata(llbc);
-    harden_duplicate_leaf_metadata(&mut struct_fields, &mut struct_origins);
+    harden_duplicate_leaf_metadata(
+        &mut struct_fields,
+        &mut struct_origins,
+        &mut enum_variant_by_discriminant,
+    );
 
     // ── Pass 2: lower every function body and build SemanticFunctions ─
     let mut functions = Vec::new();
@@ -611,6 +619,10 @@ fn derive_program_metadata(
 fn harden_duplicate_leaf_metadata(
     struct_fields: &mut crate::front::semantic::StructFieldRegistry,
     struct_origins: &mut std::collections::HashMap<String, String>,
+    enum_variant_by_discriminant: &mut std::collections::HashMap<
+        String,
+        std::collections::HashMap<i64, String>,
+    >,
 ) {
     let mut by_leaf: std::collections::HashMap<&str, Vec<&str>> = std::collections::HashMap::new();
     for key in struct_fields.fields.keys() {
@@ -653,6 +665,35 @@ fn harden_duplicate_leaf_metadata(
         if let Some(module) = struct_origins.get_mut(&leaf) {
             module.clear();
         }
+    }
+    // `enum_variant_by_discriminant` dual-publishes the same bare-leaf
+    // alias (qualified path + leaf), so a cross-decl leaf collision
+    // leaves a silent-winner discriminant map there too.  Same rule as
+    // `struct_fields.fields`: the bare alias survives only while every
+    // qualified decl answers discriminant lookups identically.
+    let mut enum_by_leaf: std::collections::HashMap<&str, Vec<&str>> =
+        std::collections::HashMap::new();
+    for key in enum_variant_by_discriminant.keys() {
+        if let Some((_, leaf)) = key.rsplit_once("::") {
+            enum_by_leaf.entry(leaf).or_default().push(key);
+        }
+    }
+    let mut drop_enum_aliases: Vec<String> = Vec::new();
+    for (leaf, quals) in &enum_by_leaf {
+        if quals.len() < 2 {
+            continue;
+        }
+        let first_map = &enum_variant_by_discriminant[quals[0]];
+        if quals[1..]
+            .iter()
+            .any(|q| &enum_variant_by_discriminant[*q] != first_map)
+        {
+            drop_enum_aliases.push((*leaf).to_string());
+        }
+    }
+    drop(enum_by_leaf);
+    for leaf in drop_enum_aliases {
+        enum_variant_by_discriminant.remove(&leaf);
     }
 }
 
@@ -5205,8 +5246,9 @@ mod tests {
         let mut origins = std::collections::HashMap::new();
         // first-decl-wins origin as `or_insert` would leave it
         origins.insert("FrameBlock".to_string(), "pyopcode".to_string());
+        let mut enums = std::collections::HashMap::new();
 
-        harden_duplicate_leaf_metadata(&mut reg, &mut origins);
+        harden_duplicate_leaf_metadata(&mut reg, &mut origins, &mut enums);
 
         assert!(
             !reg.fields.contains_key("FrameBlock"),
@@ -5238,11 +5280,44 @@ mod tests {
         reg.fields.insert("Point".to_string(), shape.clone());
         let mut origins = std::collections::HashMap::new();
         origins.insert("Point".to_string(), "eval".to_string());
+        let mut enums = std::collections::HashMap::new();
 
-        harden_duplicate_leaf_metadata(&mut reg, &mut origins);
+        harden_duplicate_leaf_metadata(&mut reg, &mut origins, &mut enums);
 
         assert_eq!(reg.fields.get("Point"), Some(&shape));
         assert_eq!(origins.get("Point").map(String::as_str), Some("eval"));
+    }
+
+    #[test]
+    fn harden_withdraws_discriminant_divergent_bare_enum_alias() {
+        let mut reg = crate::front::semantic::StructFieldRegistry::default();
+        let mut origins = std::collections::HashMap::new();
+        let map_a: std::collections::HashMap<i64, String> =
+            [(0, "Continue".to_string()), (1, "Break".to_string())].into();
+        let map_b: std::collections::HashMap<i64, String> = [(0, "Return".to_string())].into();
+        let same_as_a = map_a.clone();
+        let mut enums = std::collections::HashMap::new();
+        enums.insert("pyre_interpreter::eval::StepResult".to_string(), map_a);
+        enums.insert("pyre_jit::eval::StepResult".to_string(), map_b);
+        // silent-winner bare alias as the dual-publish would leave it
+        enums.insert("StepResult".to_string(), same_as_a.clone());
+        enums.insert("pyre_object::flow::Verdict".to_string(), same_as_a.clone());
+        enums.insert("pyre_jit::flow::Verdict".to_string(), same_as_a.clone());
+        enums.insert("Verdict".to_string(), same_as_a.clone());
+
+        harden_duplicate_leaf_metadata(&mut reg, &mut origins, &mut enums);
+
+        assert!(
+            !enums.contains_key("StepResult"),
+            "discriminant-divergent duplicate leaf must lose its bare alias"
+        );
+        assert!(enums.contains_key("pyre_interpreter::eval::StepResult"));
+        assert!(enums.contains_key("pyre_jit::eval::StepResult"));
+        assert_eq!(
+            enums.get("Verdict"),
+            Some(&same_as_a),
+            "equal-map duplicates keep the alias"
+        );
     }
 
     #[test]
@@ -5256,8 +5331,9 @@ mod tests {
         reg.fields.insert("W_IntObject".to_string(), shape.clone());
         let mut origins = std::collections::HashMap::new();
         origins.insert("W_IntObject".to_string(), "intobject".to_string());
+        let mut enums = std::collections::HashMap::new();
 
-        harden_duplicate_leaf_metadata(&mut reg, &mut origins);
+        harden_duplicate_leaf_metadata(&mut reg, &mut origins, &mut enums);
 
         assert_eq!(reg.fields.get("W_IntObject"), Some(&shape));
         assert_eq!(
