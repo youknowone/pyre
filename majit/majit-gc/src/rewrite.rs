@@ -371,8 +371,11 @@ struct PendingZero {
 /// Per-rewrite mutable state (not stored on the struct so that
 /// `rewrite_for_gc` can take `&self`).
 struct RewriteState {
-    /// Output operation list.
-    out: Vec<Op>,
+    /// Output operation list. `Rc`-carried so `emit` can hand back a
+    /// BOUND result box — downstream references to a newly emitted op
+    /// live-track its producer instead of fabricating position-only
+    /// boxes (#9 operand-union grind).
+    out: Vec<majit_ir::OpRc>,
     /// Next position index for emitted result ops that do not have an
     /// explicit source position to preserve.
     next_pos: u32,
@@ -581,11 +584,12 @@ impl RewriteState {
             pos
         };
         op.pos.set(pos);
-        self.out.push(op);
+        let rc = std::rc::Rc::new(op);
+        self.out.push(rc.clone());
         if pos.is_none() {
             BoxRef::none()
         } else {
-            BoxRef::new_resop(rt, pos.raw())
+            BoxRef::from_bound_op(&rc)
         }
     }
 
@@ -609,8 +613,9 @@ impl RewriteState {
         };
         self.result_types.insert(pos.raw(), rt);
         op.pos.set(pos);
-        self.out.push(op);
-        BoxRef::new_resop(rt, pos.raw())
+        let rc = std::rc::Rc::new(op);
+        self.out.push(rc.clone());
+        BoxRef::from_bound_op(&rc)
     }
 
     /// rewrite.py:699-711 emitting_an_operation_that_can_collect
@@ -837,7 +842,7 @@ impl RewriteState {
             let scaled_len = self.const_int((stop - start) as i64 * pz.scale);
             let one = self.const_int(1);
 
-            let op = &mut self.out[pz.out_index];
+            let op = &self.out[pz.out_index];
             // resoperation.py:290 AbstractResOp.setarg parity.
             op.setarg(1, scaled_start);
             op.setarg(2, scaled_len);
@@ -3002,7 +3007,13 @@ impl GcRewriter for GcRewriterImpl {
         // Flush any remaining pending zeros at end of trace.
         st.emit_pending_zeros();
 
-        (st.out, st.constants, st.new_constant_types)
+        // Boundary unwrap: the trait still hands the backend a
+        // `Vec<Op>`; the clone preserves bound operands (the operand
+        // `Rc`s keep their producers alive), so no position-only
+        // re-minting happens here. A follow-up slice flips the trait
+        // to `Vec<OpRc>` and removes this clone.
+        let out: Vec<Op> = st.out.iter().map(|rc| (**rc).clone()).collect();
+        (out, st.constants, st.new_constant_types)
     }
 }
 
