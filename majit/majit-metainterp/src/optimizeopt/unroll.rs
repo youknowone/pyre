@@ -5624,7 +5624,7 @@ mod tests {
             VirtualState::new(vec![VirtualStateInfo::Constant(Value::Ref(old))]),
             exported_infos,
             vec![PreambleOp {
-                op: Op::new(OpCode::SameAsR, &[BoxRef::from_opref(old_ref)]),
+                op: std::rc::Rc::new(Op::new(OpCode::SameAsR, &[BoxRef::from_opref(old_ref)])),
                 res: BoxRef::from_opref(old_ref),
                 kind: PreambleOpKind::Pure,
                 label_arg_idx: None,
@@ -6394,7 +6394,7 @@ mod tests {
                         field_descr.clone(),
                     );
                     op.pos.set(OpRef::int_op(11));
-                    op
+                    std::rc::Rc::new(op)
                 },
                 res: BoxRef::from_opref(OpRef::int_op(11)),
                 kind: crate::optimizeopt::shortpreamble::PreambleOpKind::Heap,
@@ -6454,7 +6454,7 @@ mod tests {
                         field_descr.clone(),
                     );
                     op.pos.set(OpRef::int_op(11));
-                    op
+                    std::rc::Rc::new(op)
                 },
                 res: BoxRef::from_opref(OpRef::int_op(11)),
                 kind: crate::optimizeopt::shortpreamble::PreambleOpKind::Pure,
@@ -6512,7 +6512,7 @@ mod tests {
                 op: {
                     let mut op = Op::new(OpCode::CallLoopinvariantI, &[BoxRef::from_opref(func)]);
                     op.pos.set(OpRef::int_op(11));
-                    op
+                    std::rc::Rc::new(op)
                 },
                 res: BoxRef::from_opref(OpRef::int_op(11)),
                 kind: crate::optimizeopt::shortpreamble::PreambleOpKind::LoopInvariant,
@@ -6570,7 +6570,7 @@ mod tests {
                 op: {
                     let mut op = Op::new(OpCode::CallLoopinvariantI, &[BoxRef::from_opref(func)]);
                     op.pos.set(source);
-                    op
+                    std::rc::Rc::new(op)
                 },
                 res: BoxRef::from_opref(source),
                 kind: crate::optimizeopt::shortpreamble::PreambleOpKind::LoopInvariant,
@@ -6630,7 +6630,7 @@ mod tests {
                         ],
                     );
                     op.pos.set(OpRef::int_op(20));
-                    op
+                    std::rc::Rc::new(op)
                 },
                 res: BoxRef::from_opref(OpRef::int_op(20)),
                 kind: crate::optimizeopt::shortpreamble::PreambleOpKind::Pure,
@@ -6718,7 +6718,7 @@ mod tests {
                         majit_ir::descr::make_field_descr_full(56, 0, 8, Type::Ref, false),
                     );
                     op.pos.set(OpRef::ref_op(19));
-                    op
+                    std::rc::Rc::new(op)
                 },
                 res: BoxRef::from_opref(OpRef::ref_op(19)),
                 kind: crate::optimizeopt::shortpreamble::PreambleOpKind::Heap,
@@ -6794,7 +6794,7 @@ mod tests {
                         ],
                     );
                     op.pos.set(OpRef::int_op(30));
-                    op
+                    std::rc::Rc::new(op)
                 },
                 res: BoxRef::from_opref(OpRef::int_op(30)),
                 kind: crate::optimizeopt::shortpreamble::PreambleOpKind::Pure,

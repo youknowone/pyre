@@ -2725,7 +2725,7 @@ impl OptContext {
                         crate::optimizeopt::shortpreamble::ProducedShortOp {
                             kind: entry.kind.clone(),
                             res,
-                            preamble_op: std::rc::Rc::new(entry.op.clone()),
+                            preamble_op: std::rc::Rc::new((*entry.op).clone()),
                             invented_name: entry.invented_name,
                             same_as_source: entry.same_as_source.clone(),
                         },

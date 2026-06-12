@@ -3824,7 +3824,7 @@ mod tests {
             &[object, resolved],
             &[BoxRef::from_opref(object), BoxRef::from_opref(resolved)],
             &[crate::optimizeopt::shortpreamble::PreambleOp {
-                op: preamble_op.clone(),
+                op: std::rc::Rc::new(preamble_op.clone()),
                 res: BoxRef::from_opref(source),
                 kind: crate::optimizeopt::shortpreamble::PreambleOpKind::Heap,
                 label_arg_idx: Some(1),

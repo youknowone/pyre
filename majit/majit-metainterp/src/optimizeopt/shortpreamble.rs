@@ -332,7 +332,12 @@ pub enum PreambleOpKind {
 #[derive(Clone, Debug)]
 pub struct PreambleOp {
     /// The operation to replay.
-    pub op: Op,
+    ///
+    /// Carried as an [`majit_ir::OpRc`] so the exported entry, the derived
+    /// `ProducedShortOp.preamble_op`, and replay-arg operands can share one
+    /// object across the export/import boundary (upstream `preamble_op` is
+    /// one ResOperation object, shortpreamble.py:283-296).
+    pub op: majit_ir::OpRc,
     /// `short_op.res` — the result box this entry produces. Identity-
     /// bearing on exported entries (threaded from the preview
     /// `ProducedShortOp.res`); on potential-op entries it is a
@@ -364,7 +369,7 @@ impl PreambleOp {
         ctx: &mut crate::optimizeopt::OptContext,
     ) -> Option<ProducedShortOp> {
         let preamble_op = match &self.kind {
-            PreambleOpKind::InputArg | PreambleOpKind::Guard => self.op.clone(),
+            PreambleOpKind::InputArg | PreambleOpKind::Guard => (*self.op).clone(),
             PreambleOpKind::Heap => {
                 // shortpreamble.py:91-102 HeapOp.add_op_to_short:
                 //   preamble_arg = sb.produce_arg(sop.getarg(0))
@@ -607,7 +612,7 @@ impl ShortBoxes {
             let label_arg_idx = self.lookup_label_arg(result);
             self.const_short_boxes.push(PreambleOp {
                 res: BoxRef::from_opref(op.pos.get()),
-                op,
+                op: std::rc::Rc::new(op),
                 kind: PreambleOpKind::Heap,
                 label_arg_idx,
                 invented_name: false,
@@ -656,7 +661,7 @@ impl ShortBoxes {
             arg,
             PotentialShortOp::Preamble(PreambleOp {
                 res: arg_box,
-                op: same_as,
+                op: std::rc::Rc::new(same_as),
                 kind: PreambleOpKind::InputArg,
                 label_arg_idx,
                 invented_name: false,
@@ -890,7 +895,7 @@ impl ShortBoxes {
         let result = op.pos.get();
         let pop = PotentialShortOp::Preamble(PreambleOp {
             res: BoxRef::from_opref(result),
-            op,
+            op: std::rc::Rc::new(op),
             kind,
             label_arg_idx,
             invented_name: false,
@@ -971,7 +976,7 @@ impl CollectedExtendedShortPreambleBuilder {
         let label_arg_idx = self.lookup_label_arg(op.pos.get());
         self.guards.push(PreambleOp {
             res: BoxRef::from_opref(op.pos.get()),
-            op,
+            op: std::rc::Rc::new(op),
             kind: PreambleOpKind::Guard,
             label_arg_idx,
             invented_name: false,
@@ -984,7 +989,7 @@ impl CollectedExtendedShortPreambleBuilder {
         let label_arg_idx = self.lookup_label_arg(op.pos.get());
         self.pure_ops.push(PreambleOp {
             res: BoxRef::from_opref(op.pos.get()),
-            op,
+            op: std::rc::Rc::new(op),
             kind: PreambleOpKind::Pure,
             label_arg_idx,
             invented_name: false,
@@ -997,7 +1002,7 @@ impl CollectedExtendedShortPreambleBuilder {
         let label_arg_idx = self.lookup_label_arg(op.pos.get());
         self.heap_ops.push(PreambleOp {
             res: BoxRef::from_opref(op.pos.get()),
-            op,
+            op: std::rc::Rc::new(op),
             kind: PreambleOpKind::Heap,
             label_arg_idx,
             invented_name: false,
@@ -1010,7 +1015,7 @@ impl CollectedExtendedShortPreambleBuilder {
         let label_arg_idx = self.lookup_label_arg(op.pos.get());
         self.loopinvariant_ops.push(PreambleOp {
             res: BoxRef::from_opref(op.pos.get()),
-            op,
+            op: std::rc::Rc::new(op),
             kind: PreambleOpKind::LoopInvariant,
             label_arg_idx,
             invented_name: false,
@@ -1063,7 +1068,7 @@ impl CollectedExtendedShortPreambleBuilder {
                     }
                 }
                 ShortPreambleOp {
-                    op: preamble_op.op,
+                    op: (*preamble_op.op).clone(),
                     arg_mapping,
                     fail_arg_mapping,
                 }
@@ -3010,7 +3015,7 @@ pub fn produced_short_boxes_from_exported_boxes(
         .iter()
         .filter(|entry| !entry.op.opcode.is_guard_overflow())
         .map(|entry| {
-            let mut preamble_op = entry.op.clone();
+            let mut preamble_op = (*entry.op).clone();
             // optimizer.py:651-652 setarg loop parity.
             for i in 0..preamble_op.num_args() {
                 if let Some(renamed) = inputarg_rename(preamble_op.arg(i).to_opref()) {
@@ -3392,7 +3397,7 @@ mod tests {
                         ],
                     );
                     op.pos.set(OpRef::int_op(7));
-                    op
+                    std::rc::Rc::new(op)
                 },
                 res: BoxRef::from_opref(OpRef::int_op(7)),
                 kind: PreambleOpKind::Pure,
@@ -3410,7 +3415,7 @@ mod tests {
                         ],
                     );
                     op.pos.set(OpRef::int_op(8));
-                    op
+                    std::rc::Rc::new(op)
                 },
                 res: BoxRef::from_opref(OpRef::int_op(8)),
                 kind: PreambleOpKind::Pure,
@@ -3455,7 +3460,7 @@ mod tests {
 
         let exported = vec![
             PreambleOp {
-                op: ovf,
+                op: std::rc::Rc::new(ovf),
                 res: BoxRef::from_opref(OpRef::int_op(20)),
                 kind: PreambleOpKind::Pure,
                 label_arg_idx: None,
@@ -3463,7 +3468,7 @@ mod tests {
                 same_as_source: None,
             },
             PreambleOp {
-                op: guard,
+                op: std::rc::Rc::new(guard),
                 res: BoxRef::none(),
                 kind: PreambleOpKind::Guard,
                 label_arg_idx: None,

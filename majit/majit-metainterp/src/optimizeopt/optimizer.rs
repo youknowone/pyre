@@ -2827,13 +2827,30 @@ impl Optimizer {
             // `exported_short_boxes` below).
             ctx.exported_short_inputargs =
                 short_boxes.create_short_inputargs(&preview_short_args);
+            // Single-object carry: each exported entry keeps the preview
+            // ProducedShortOp's replay Rc, so the pos/arg canonicalization
+            // below lands on the object that dep-replay operands reference
+            // (upstream exports the ResOperation objects themselves,
+            // unroll.py:478-487). The per-entry rewrites require each entry
+            // to own a distinct Rc.
+            #[cfg(debug_assertions)]
+            {
+                let mut seen: Vec<*const majit_ir::Op> = Vec::with_capacity(produced.len());
+                for (_, p) in &produced {
+                    let ptr = std::rc::Rc::as_ptr(&p.preamble_op);
+                    debug_assert!(
+                        !seen.contains(&ptr),
+                        "exported short boxes share a replay OpRc at {:?}",
+                        p.preamble_op.pos.get()
+                    );
+                    seen.push(ptr);
+                }
+            }
             ctx.exported_short_boxes = produced
                 .into_iter()
                 .map(|(result, produced)| {
                     let canonical_result = ctx.get_replacement_opref(result);
-                    // Deep-clone: dual map entries share the replay OpRc;
-                    // the pos/arg rewrites below must stay per-entry.
-                    let mut preamble_op = (*produced.preamble_op).clone();
+                    let preamble_op = produced.preamble_op.clone();
                     // RPython parity: key and preamble_op.pos must be the
                     // same resolved value. Independent get_box_replacement
                     // calls can diverge when forwarding chains differ.
@@ -2848,12 +2865,15 @@ impl Optimizer {
                     // slot is empty — only the body producer registered at
                     // the same position carries the Phase-1 forwarding to
                     // the canonical end box this export boundary needs.
+                    // (A dep handle bound to an already-rewritten sibling
+                    // resolves to the same canonical box either way —
+                    // get_box_replacement is idempotent on canonicals.)
                     for i in 0..preamble_op.num_args() {
                         let arg = preamble_op.arg(i).to_opref();
                         preamble_op.setarg(i, ctx.get_box_replacement(arg));
                     }
-                    if let Some(fail_args) = preamble_op.fail_args_mut() {
-                        for arg in fail_args {
+                    if let Some(fail_args) = preamble_op.fail_args.borrow_mut().as_mut() {
+                        for arg in fail_args.iter_mut() {
                             *arg = majit_ir::operand::Operand::from_boxref(
                                 &ctx.get_box_replacement(arg.to_opref()),
                             );
@@ -3264,7 +3284,7 @@ impl Optimizer {
                         );
                         entry.op.setarg(i, BoxRef::from_opref(arg));
                     }
-                    if let Some(fa) = entry.op.fail_args_mut() {
+                    if let Some(fa) = entry.op.fail_args.borrow_mut().as_mut() {
                         for arg in fa.iter_mut() {
                             // Bound failargs live-track the producer's
                             // already-remapped pos (same rule as the args
@@ -6271,7 +6291,7 @@ mod tests {
             &[OpRef::int_op(0)],
             &[BoxRef::from_opref(OpRef::int_op(0))],
             &[crate::optimizeopt::shortpreamble::PreambleOp {
-                op: preamble_op.clone(),
+                op: std::rc::Rc::new(preamble_op.clone()),
                 res: BoxRef::from_opref(OpRef::int_op(14)),
                 kind: crate::optimizeopt::shortpreamble::PreambleOpKind::Pure,
                 label_arg_idx: None,
