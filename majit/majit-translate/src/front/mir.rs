@@ -4256,10 +4256,23 @@ fn adt_node_class_root(node: &serde_json::Value, llbc: &Llbc) -> Option<String> 
         .and_then(|g| g.get("types"))
         .and_then(|t| t.as_array())
         .is_some_and(|t| !t.is_empty());
-    if has_type_args {
-        return None;
-    }
     let name = llbc.type_by_id(def_id)?.item_meta.name_path();
+    if has_type_args {
+        // A parameterised workspace ADT (e.g. `CodeObject<C>` used at
+        // its one `ConstantData` instantiation) registers in
+        // `struct_fields` under its ungeneric name like any other
+        // decl, so it resolves to that flat classdef — the same
+        // generics collapse `derive_program_metadata` applies.  The
+        // core/std/alloc container family (`Vec<T>`, `Option<T>`,
+        // `Box<T>`, …) stays excluded: those map to dedicated
+        // annotator models (lists, options, wrappers), never to a
+        // classdef.  Same crate-root convention as the trait-bound
+        // resolver above.
+        let crate_root = name.split("::").next().unwrap_or(&name);
+        if matches!(crate_root, "core" | "std" | "alloc") {
+            return None;
+        }
+    }
     Some(name.rsplit("::").next().unwrap_or(&name).to_string())
 }
 
