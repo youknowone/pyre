@@ -3116,6 +3116,30 @@ pub extern "C" fn bh_call_fn_8(
     )
 }
 
+/// Per-arity `bh_call_fn_<n>` thunks for nargs 9..=14, sharing the
+/// `(callable, null_or_self, arg0..arg{n-1})` ABI of the explicit
+/// `bh_call_fn_0..8` above.  nargs=14 (16 i64 params) is the ceiling
+/// the backend dispatch table (`call_stub.rs::dispatch_arity_body!`,
+/// `MAX_HOST_CALL_ARITY` = 16) supports; CALL with nargs > 14 falls
+/// through to `emit_abort_permanent!`.
+macro_rules! bh_call_fn_arity {
+    ($name:ident; $($arg:ident),+ $(,)?) => {
+        pub extern "C" fn $name(callable: i64, null_or_self: i64, $($arg: i64),+) -> i64 {
+            bh_call_fn_impl(
+                callable as PyObjectRef,
+                null_or_self as PyObjectRef,
+                &[$($arg as PyObjectRef),+],
+            )
+        }
+    };
+}
+bh_call_fn_arity!(bh_call_fn_9; a0, a1, a2, a3, a4, a5, a6, a7, a8);
+bh_call_fn_arity!(bh_call_fn_10; a0, a1, a2, a3, a4, a5, a6, a7, a8, a9);
+bh_call_fn_arity!(bh_call_fn_11; a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10);
+bh_call_fn_arity!(bh_call_fn_12; a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11);
+bh_call_fn_arity!(bh_call_fn_13; a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12);
+bh_call_fn_arity!(bh_call_fn_14; a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13);
+
 /// blackhole.py:1224 bhimpl_residual_call: cpu.bh_call_r.
 /// RPython: cpu.bh_call_r (llmodel.py:816) invokes calldescr.call_stub_r
 /// directly — a plain function-pointer call, no portal_runner indirection.

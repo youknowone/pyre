@@ -30,11 +30,15 @@ pub struct Cpu {
     pub call_fn: extern "C" fn(i64, i64, i64) -> i64,
     /// Per-arity `bhimpl_residual_call_<n>` helpers
     /// (`call_fn_0(callable, null_or_self)` ...
-    /// `call_fn_8(callable, null_or_self, a0..a7)`).  RPython
+    /// `call_fn_14(callable, null_or_self, a0..a13)`).  RPython
     /// `bhimpl_residual_call_r_r` carries no frame; the parent frame is
     /// resolved from the execution context inside `bh_call_fn_impl`.  A
     /// non-null `null_or_self` is the method receiver — the helper
-    /// prepends it as arg0 (eval.rs:3216-3226).
+    /// prepends it as arg0 (eval.rs:3216-3226).  The arity ceiling is
+    /// nargs=14: each helper takes `callable + null_or_self + nargs`
+    /// i64s, and the backend dispatch table (`call_stub.rs::
+    /// dispatch_arity_body!`, `MAX_HOST_CALL_ARITY` = 16) tops out at
+    /// 16 i64 arguments.
     pub call_fn_0: extern "C" fn(i64, i64) -> i64,
     pub call_fn_2: extern "C" fn(i64, i64, i64, i64) -> i64,
     pub call_fn_3: extern "C" fn(i64, i64, i64, i64, i64) -> i64,
@@ -43,6 +47,48 @@ pub struct Cpu {
     pub call_fn_6: extern "C" fn(i64, i64, i64, i64, i64, i64, i64, i64) -> i64,
     pub call_fn_7: extern "C" fn(i64, i64, i64, i64, i64, i64, i64, i64, i64) -> i64,
     pub call_fn_8: extern "C" fn(i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) -> i64,
+    pub call_fn_9: extern "C" fn(i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) -> i64,
+    pub call_fn_10:
+        extern "C" fn(i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) -> i64,
+    pub call_fn_11:
+        extern "C" fn(i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) -> i64,
+    pub call_fn_12:
+        extern "C" fn(i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) -> i64,
+    pub call_fn_13: extern "C" fn(
+        i64,
+        i64,
+        i64,
+        i64,
+        i64,
+        i64,
+        i64,
+        i64,
+        i64,
+        i64,
+        i64,
+        i64,
+        i64,
+        i64,
+        i64,
+    ) -> i64,
+    pub call_fn_14: extern "C" fn(
+        i64,
+        i64,
+        i64,
+        i64,
+        i64,
+        i64,
+        i64,
+        i64,
+        i64,
+        i64,
+        i64,
+        i64,
+        i64,
+        i64,
+        i64,
+        i64,
+    ) -> i64,
     /// `bhimpl_load_global` — namespace/code from getfield_vable_r plus live frame.
     pub load_global_fn: extern "C" fn(i64, i64, i64, i64) -> i64,
     /// LOOKUP_METHOD attribute half — `(obj, code, name_idx) → attr`.
@@ -236,6 +282,12 @@ impl Cpu {
             call_fn_6: crate::call_jit::bh_call_fn_6,
             call_fn_7: crate::call_jit::bh_call_fn_7,
             call_fn_8: crate::call_jit::bh_call_fn_8,
+            call_fn_9: crate::call_jit::bh_call_fn_9,
+            call_fn_10: crate::call_jit::bh_call_fn_10,
+            call_fn_11: crate::call_jit::bh_call_fn_11,
+            call_fn_12: crate::call_jit::bh_call_fn_12,
+            call_fn_13: crate::call_jit::bh_call_fn_13,
+            call_fn_14: crate::call_jit::bh_call_fn_14,
             load_global_fn: crate::call_jit::bh_load_global_fn,
             load_attr_fn: crate::call_jit::bh_load_attr_fn,
             load_method_self_fn: crate::call_jit::bh_load_method_self_fn,

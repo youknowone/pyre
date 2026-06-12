@@ -3475,6 +3475,12 @@ struct FnPtrIndices {
     call_fn_6: HelperHandle,
     call_fn_7: HelperHandle,
     call_fn_8: HelperHandle,
+    call_fn_9: HelperHandle,
+    call_fn_10: HelperHandle,
+    call_fn_11: HelperHandle,
+    call_fn_12: HelperHandle,
+    call_fn_13: HelperHandle,
+    call_fn_14: HelperHandle,
     get_current_exception_fn: HelperHandle,
     set_current_exception_fn: HelperHandle,
     load_attr_fn: HelperHandle,
@@ -3684,7 +3690,7 @@ fn register_helper_fn_pointers(
     // `load_global_fn`.  Bound after the existing fn_ptrs to preserve
     // their indices.
     let getattr_fn = bind(assembler, cpu.getattr_fn as *const (), CallFlavor::Plain);
-    // LOOKUP_METHOD lowering (appended last to preserve fn_ptr indices).
+    // LOOKUP_METHOD lowering (appended to preserve fn_ptr indices).
     // `bh_load_attr_fn` calls `baseobjspace::getattr`, which can run user
     // `__getattribute__` (forces virtualizables) and raise `AttributeError`
     // → `MayForce`.  `bh_load_method_self_fn` is the pure binding decision —
@@ -3869,6 +3875,17 @@ fn register_helper_fn_pointers(
         cpu.newlist_from_array_fn as *const (),
         CallFlavor::Plain,
     );
+    // Per-arity CALL helpers for nargs 9..=14 (every `call_fn_N` is bound
+    // `MayForce`).  Bound after the existing fn_ptrs to preserve their
+    // indices.  The arity ceiling is nargs=14 (16 i64 params: callable +
+    // null_or_self + 14 args); the backend dispatch table tops out at
+    // `MAX_HOST_CALL_ARITY` = 16.
+    let call_fn_9 = bind(assembler, cpu.call_fn_9 as *const (), CallFlavor::MayForce);
+    let call_fn_10 = bind(assembler, cpu.call_fn_10 as *const (), CallFlavor::MayForce);
+    let call_fn_11 = bind(assembler, cpu.call_fn_11 as *const (), CallFlavor::MayForce);
+    let call_fn_12 = bind(assembler, cpu.call_fn_12 as *const (), CallFlavor::MayForce);
+    let call_fn_13 = bind(assembler, cpu.call_fn_13 as *const (), CallFlavor::MayForce);
+    let call_fn_14 = bind(assembler, cpu.call_fn_14 as *const (), CallFlavor::MayForce);
     FnPtrIndices {
         call_fn,
         load_global_fn,
@@ -3895,6 +3912,12 @@ fn register_helper_fn_pointers(
         call_fn_6,
         call_fn_7,
         call_fn_8,
+        call_fn_9,
+        call_fn_10,
+        call_fn_11,
+        call_fn_12,
+        call_fn_13,
+        call_fn_14,
         get_current_exception_fn,
         set_current_exception_fn,
         load_attr_fn,
@@ -4804,6 +4827,36 @@ impl CodeWriter {
                     idx: call_fn_8_idx,
                     flavor: _call_fn_8_flavor,
                 },
+            call_fn_9:
+                HelperHandle {
+                    idx: call_fn_9_idx,
+                    flavor: _call_fn_9_flavor,
+                },
+            call_fn_10:
+                HelperHandle {
+                    idx: call_fn_10_idx,
+                    flavor: _call_fn_10_flavor,
+                },
+            call_fn_11:
+                HelperHandle {
+                    idx: call_fn_11_idx,
+                    flavor: _call_fn_11_flavor,
+                },
+            call_fn_12:
+                HelperHandle {
+                    idx: call_fn_12_idx,
+                    flavor: _call_fn_12_flavor,
+                },
+            call_fn_13:
+                HelperHandle {
+                    idx: call_fn_13_idx,
+                    flavor: _call_fn_13_flavor,
+                },
+            call_fn_14:
+                HelperHandle {
+                    idx: call_fn_14_idx,
+                    flavor: _call_fn_14_flavor,
+                },
             get_current_exception_fn:
                 HelperHandle {
                     idx: get_current_exception_fn_idx,
@@ -4964,9 +5017,9 @@ impl CodeWriter {
                 store_name_fn_idx,
                 newtuple_from_array_fn_idx,
                 newlist_from_array_fn_idx,
-                // `[u16; 9]` indexed by nargs (0..=8).  `call_fn_idx` (nargs=1)
-                // is the unsuffixed binding from line 3153; the suffixed
-                // 0/2..=8 fill the surrounding slots.
+                // `[u16; 15]` indexed by nargs (0..=14).  `call_fn_idx`
+                // (nargs=1) is the unsuffixed general binding; the suffixed
+                // 0/2..=14 fill the surrounding slots.
                 call_fn_idx_by_nargs: [
                     call_fn_0_idx,
                     call_fn_idx,
@@ -4977,6 +5030,12 @@ impl CodeWriter {
                     call_fn_6_idx,
                     call_fn_7_idx,
                     call_fn_8_idx,
+                    call_fn_9_idx,
+                    call_fn_10_idx,
+                    call_fn_11_idx,
+                    call_fn_12_idx,
+                    call_fn_13_idx,
+                    call_fn_14_idx,
                 ],
                 load_attr_fn_idx,
                 load_method_self_fn_idx,
@@ -7257,8 +7316,10 @@ impl CodeWriter {
                             // RPython blackhole.py: call_int_function transmutes
                             // to the correct arity. Each nargs needs a matching
                             // extern "C" fn with that many i64 parameters.
-                            // nargs > 8 → abort_permanent (no matching helper).
-                            let call_result_value = if nargs > 8 {
+                            // nargs > 14 → abort_permanent (no matching helper;
+                            // the backend dispatch tops out at 16 i64 args =
+                            // callable + null_or_self + 14).
+                            let call_result_value = if nargs > 14 {
                                 fresh_ref_value(&mut graph)
                             } else {
                                 // Graph-side `simple_call(callable,
@@ -7290,7 +7351,7 @@ impl CodeWriter {
                                 pin!(Some(result), stack_base + current_depth);
                                 result.into()
                             };
-                            if nargs > 8 {
+                            if nargs > 14 {
                                 emit_abort_permanent!(py_pc);
                             }
                             push_and_bump!(call_result_value, py_pc);

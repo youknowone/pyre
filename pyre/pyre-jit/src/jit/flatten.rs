@@ -3174,13 +3174,13 @@ pub struct LoweringContext {
     /// (`jtransform.py:414 rewrite_call`) — the parent frame is
     /// resolved at runtime inside the call helper, not threaded as a
     /// leading operand.
-    /// Indexed by nargs (`call_fn_idx_by_nargs[nargs]`): `[u16; 9]` keeps the
-    /// statically-known 0..=8 arity range position-indexed.
-    /// `simple_call` HLOps with nargs > 8 are walker non-orthodox
+    /// Indexed by nargs (`call_fn_idx_by_nargs[nargs]`): `[u16; 15]` keeps the
+    /// statically-known 0..=14 arity range position-indexed.
+    /// `simple_call` HLOps with nargs > 14 are walker non-orthodox
     /// (the walker emits `abort_permanent` instead and skips the
     /// HLOp record), so the lowering arm returns `None`
-    /// (passthrough) on nargs > 8.
-    pub call_fn_idx_by_nargs: [u16; 9],
+    /// (passthrough) on nargs > 14.
+    pub call_fn_idx_by_nargs: [u16; 15],
     /// `load_attr_fn` descrs-pool index — see codewriter.rs
     /// `register_helper_fn_pointers` for the production source
     /// (`bind(assembler, cpu.load_attr_fn, CallFlavor::MayForce)`).
@@ -5634,12 +5634,12 @@ where
 /// `jtransform.py:414 rewrite_call` (the lowered ListR shape is
 /// detailed in the body comment below).
 ///
-/// Arity dispatch: nargs = op.args.len() - 1 selects
+/// Arity dispatch: nargs = op.args.len() - 2 selects
 /// `ctx.call_fn_idx_by_nargs[nargs]`.  Walker contract: CALL with
-/// nargs > 8 takes the `abort_permanent` branch (codewriter.rs:6118-
-/// 6133) and does NOT record `simple_call` on the graph, so a
-/// graph-side `simple_call` with nargs > 8 indicates walker
-/// non-orthodoxy — return `None` (passthrough).
+/// nargs > 14 takes the `abort_permanent` branch and does NOT record
+/// `simple_call` on the graph, so a graph-side `simple_call` with
+/// nargs > 14 indicates walker non-orthodoxy — return `None`
+/// (passthrough).
 ///
 /// Returns `None` for non-`simple_call` opnames so the caller can
 /// fall through to other lowering arms.
@@ -5660,7 +5660,7 @@ where
         return None;
     }
     let nargs = op.args.len() - 2;
-    if nargs > 8 {
+    if nargs > 14 {
         return None;
     }
     // First arg is the callable, second the CALL opcode's null_or_self
@@ -6900,7 +6900,7 @@ mod tests {
             store_name_fn_idx: 0,
             newtuple_from_array_fn_idx: 0,
             newlist_from_array_fn_idx: 0,
-            call_fn_idx_by_nargs: [0; 9],
+            call_fn_idx_by_nargs: [0; 15],
             load_attr_fn_idx: 0,
             load_method_self_fn_idx: 0,
             store_attr_fn_idx: 0,
@@ -7055,7 +7055,7 @@ mod tests {
             store_name_fn_idx: 0,
             newtuple_from_array_fn_idx: 0,
             newlist_from_array_fn_idx: 0,
-            call_fn_idx_by_nargs: [0; 9],
+            call_fn_idx_by_nargs: [0; 15],
             load_attr_fn_idx: 0,
             load_method_self_fn_idx: 0,
             store_attr_fn_idx: 0,
@@ -7197,7 +7197,7 @@ mod tests {
             store_name_fn_idx: 0,
             newtuple_from_array_fn_idx: 0,
             newlist_from_array_fn_idx: 0,
-            call_fn_idx_by_nargs: [0; 9],
+            call_fn_idx_by_nargs: [0; 15],
             load_attr_fn_idx: 0,
             load_method_self_fn_idx: 0,
             store_attr_fn_idx: 0,
@@ -7302,7 +7302,7 @@ mod tests {
             store_name_fn_idx: 0,
             newtuple_from_array_fn_idx: 0,
             newlist_from_array_fn_idx: 0,
-            call_fn_idx_by_nargs: [0; 9],
+            call_fn_idx_by_nargs: [0; 15],
             load_attr_fn_idx: 0,
             load_method_self_fn_idx: 0,
             store_attr_fn_idx: 0,
@@ -7451,7 +7451,7 @@ mod tests {
             store_name_fn_idx: 0,
             newtuple_from_array_fn_idx: 0,
             newlist_from_array_fn_idx: 0,
-            call_fn_idx_by_nargs: [0; 9],
+            call_fn_idx_by_nargs: [0; 15],
             load_attr_fn_idx: 0,
             load_method_self_fn_idx: 0,
             store_attr_fn_idx: 0,
@@ -7645,7 +7645,7 @@ mod tests {
             store_name_fn_idx: 0,
             newtuple_from_array_fn_idx: 0,
             newlist_from_array_fn_idx: 0,
-            call_fn_idx_by_nargs: [0; 9],
+            call_fn_idx_by_nargs: [0; 15],
             load_attr_fn_idx: 0,
             load_method_self_fn_idx: 0,
             store_attr_fn_idx: 0,
@@ -7888,7 +7888,7 @@ mod tests {
             store_name_fn_idx: 0,
             newtuple_from_array_fn_idx: 0,
             newlist_from_array_fn_idx: 0,
-            call_fn_idx_by_nargs: [0; 9],
+            call_fn_idx_by_nargs: [0; 15],
             load_attr_fn_idx: 0,
             load_method_self_fn_idx: 0,
             store_attr_fn_idx: 0,
@@ -7997,7 +7997,7 @@ mod tests {
             store_name_fn_idx: 0,
             newtuple_from_array_fn_idx: 0,
             newlist_from_array_fn_idx: 0,
-            call_fn_idx_by_nargs: [0; 9],
+            call_fn_idx_by_nargs: [0; 15],
             load_attr_fn_idx: 0,
             load_method_self_fn_idx: 0,
             store_attr_fn_idx: 0,
@@ -8050,7 +8050,7 @@ mod tests {
             store_name_fn_idx: 0,
             newtuple_from_array_fn_idx: 0,
             newlist_from_array_fn_idx: 0,
-            call_fn_idx_by_nargs: [0; 9],
+            call_fn_idx_by_nargs: [0; 15],
             load_attr_fn_idx: 0,
             load_method_self_fn_idx: 0,
             store_attr_fn_idx: 0,
@@ -8180,7 +8180,7 @@ mod tests {
             store_name_fn_idx: 0,
             newtuple_from_array_fn_idx: 0,
             newlist_from_array_fn_idx: 0,
-            call_fn_idx_by_nargs: [0; 9],
+            call_fn_idx_by_nargs: [0; 15],
             load_attr_fn_idx: 0,
             load_method_self_fn_idx: 0,
             store_attr_fn_idx: 0,
@@ -8327,7 +8327,7 @@ mod tests {
             store_name_fn_idx: 0,
             newtuple_from_array_fn_idx: 0,
             newlist_from_array_fn_idx: 0,
-            call_fn_idx_by_nargs: [0; 9],
+            call_fn_idx_by_nargs: [0; 15],
             load_attr_fn_idx: 0,
             load_method_self_fn_idx: 0,
             store_attr_fn_idx: 0,
@@ -8378,7 +8378,7 @@ mod tests {
             store_name_fn_idx: 0,
             newtuple_from_array_fn_idx: 0,
             newlist_from_array_fn_idx: 0,
-            call_fn_idx_by_nargs: [0; 9],
+            call_fn_idx_by_nargs: [0; 15],
             load_attr_fn_idx: 0,
             load_method_self_fn_idx: 0,
             store_attr_fn_idx: 0,
@@ -8436,7 +8436,7 @@ mod tests {
             store_name_fn_idx: 0,
             newtuple_from_array_fn_idx: 0,
             newlist_from_array_fn_idx: 0,
-            call_fn_idx_by_nargs: [0; 9],
+            call_fn_idx_by_nargs: [0; 15],
             load_attr_fn_idx: 0,
             load_method_self_fn_idx: 0,
             store_attr_fn_idx: 0,
@@ -8521,7 +8521,7 @@ mod tests {
             store_name_fn_idx: 0,
             newtuple_from_array_fn_idx: 0,
             newlist_from_array_fn_idx: 0,
-            call_fn_idx_by_nargs: [0; 9],
+            call_fn_idx_by_nargs: [0; 15],
             load_attr_fn_idx: 0,
             load_method_self_fn_idx: 0,
             store_attr_fn_idx: 0,
@@ -8569,7 +8569,7 @@ mod tests {
             store_name_fn_idx: 0,
             newtuple_from_array_fn_idx: 0,
             newlist_from_array_fn_idx: 0,
-            call_fn_idx_by_nargs: [0; 9],
+            call_fn_idx_by_nargs: [0; 15],
             load_attr_fn_idx: 0,
             load_method_self_fn_idx: 0,
             store_attr_fn_idx: 0,
@@ -8631,7 +8631,7 @@ mod tests {
             store_name_fn_idx: 0,
             newtuple_from_array_fn_idx: 0,
             newlist_from_array_fn_idx: 0,
-            call_fn_idx_by_nargs: [0; 9],
+            call_fn_idx_by_nargs: [0; 15],
             load_attr_fn_idx: 0,
             load_method_self_fn_idx: 0,
             store_attr_fn_idx: 0,
@@ -8709,7 +8709,7 @@ mod tests {
             store_name_fn_idx: 0,
             newtuple_from_array_fn_idx: 0,
             newlist_from_array_fn_idx: 0,
-            call_fn_idx_by_nargs: [0; 9],
+            call_fn_idx_by_nargs: [0; 15],
             load_attr_fn_idx: 0,
             load_method_self_fn_idx: 0,
             store_attr_fn_idx: 0,
@@ -8772,7 +8772,7 @@ mod tests {
             store_name_fn_idx: 0,
             newtuple_from_array_fn_idx: 0,
             newlist_from_array_fn_idx: 0,
-            call_fn_idx_by_nargs: [0; 9],
+            call_fn_idx_by_nargs: [0; 15],
             load_attr_fn_idx: 0,
             load_method_self_fn_idx: 0,
             store_attr_fn_idx: 0,
@@ -8850,7 +8850,7 @@ mod tests {
             store_name_fn_idx: 0,
             newtuple_from_array_fn_idx: 0,
             newlist_from_array_fn_idx: 0,
-            call_fn_idx_by_nargs: [0; 9],
+            call_fn_idx_by_nargs: [0; 15],
             load_attr_fn_idx: 0,
             load_method_self_fn_idx: 0,
             store_attr_fn_idx: 0,
@@ -8904,7 +8904,7 @@ mod tests {
             store_name_fn_idx: 0,
             newtuple_from_array_fn_idx: 0,
             newlist_from_array_fn_idx: 0,
-            call_fn_idx_by_nargs: [0; 9],
+            call_fn_idx_by_nargs: [0; 15],
             load_attr_fn_idx: 0,
             load_method_self_fn_idx: 0,
             store_attr_fn_idx: 0,
@@ -8958,7 +8958,7 @@ mod tests {
             store_name_fn_idx: 0,
             newtuple_from_array_fn_idx: 0,
             newlist_from_array_fn_idx: 0,
-            call_fn_idx_by_nargs: [0; 9],
+            call_fn_idx_by_nargs: [0; 15],
             load_attr_fn_idx: 0,
             load_method_self_fn_idx: 0,
             store_attr_fn_idx: 0,
@@ -9017,7 +9017,7 @@ mod tests {
             store_name_fn_idx: 0,
             newtuple_from_array_fn_idx: 0,
             newlist_from_array_fn_idx: 0,
-            call_fn_idx_by_nargs: [0; 9],
+            call_fn_idx_by_nargs: [0; 15],
             load_attr_fn_idx: 0,
             load_method_self_fn_idx: 0,
             store_attr_fn_idx: 0,
@@ -9090,7 +9090,7 @@ mod tests {
             store_name_fn_idx: 0,
             newtuple_from_array_fn_idx: 0,
             newlist_from_array_fn_idx: 0,
-            call_fn_idx_by_nargs: [0; 9],
+            call_fn_idx_by_nargs: [0; 15],
             load_attr_fn_idx: 0,
             load_method_self_fn_idx: 0,
             store_attr_fn_idx: 0,
@@ -10262,7 +10262,7 @@ mod tests {
             store_name_fn_idx: 0,
             newtuple_from_array_fn_idx: 0,
             newlist_from_array_fn_idx: 0,
-            call_fn_idx_by_nargs: [0; 9],
+            call_fn_idx_by_nargs: [0; 15],
             load_attr_fn_idx: 0,
             load_method_self_fn_idx: 0,
             store_attr_fn_idx: 0,
@@ -10545,7 +10545,7 @@ mod tests {
         // frame-less `bhimpl_residual_call_r_r` ABI.
         let callable_var = Variable::new(VariableId(8), Kind::Ref);
         let result_var = Variable::new(VariableId(9), Kind::Ref);
-        let mut call_fn_idx_by_nargs = [0u16; 9];
+        let mut call_fn_idx_by_nargs = [0u16; 15];
         call_fn_idx_by_nargs[0] = 42;
         let ctx = LoweringContext {
             binary_op_fn_idx: 0,
@@ -10672,7 +10672,7 @@ mod tests {
             store_subscr_fn_idx: 0,
             newtuple_from_array_fn_idx: 0,
             newlist_from_array_fn_idx: 0,
-            call_fn_idx_by_nargs: [0; 9],
+            call_fn_idx_by_nargs: [0; 15],
             getattr_fn_idx: 0,
             load_attr_fn_idx: 91,
             load_method_self_fn_idx: 92,
