@@ -531,12 +531,18 @@ fn run_perfn_walk(
             // Key the descr by its own pool slot `i` so the per-fn
             // lookup below re-reads `exec.descrs[i].as_jitcode()`.
             RuntimeBhDescr::JitCode(_) => crate::descr::make_jitcode_descr(i),
-            // `Call` (residual_call) / `AssemblerToken` (call_assembler)
-            // adapters need arg-type + EffectInfo plumbing absent from
-            // `JitCallTarget` — the next full-body-walk slice (50b).
-            // A jitcode-descr stand-in here surfaces a clean
-            // `ResidualCallDescrNotCallDescr` at the first such op
-            // instead of mis-dispatching, marking the next blocker.
+            // `Call` / `AssemblerToken` pool entries belong to the
+            // `BC_CALL_*` / `BC_CALL_ASSEMBLER_*` op families, whose
+            // walker handlers read the target straight from the raw
+            // per-fn pool (`RawDescrPool::PerFn`), not through this
+            // adapted `DescrRef` slot; every `residual_call` `d` slot
+            // the codewriter emits is a `Descr(CanonicalBhDescr)` call
+            // descr (zero `ResidualCallDescrNotCallDescr` across the
+            // bench + synth suites with the walk default-on).  The
+            // jitcode-descr stand-in is a fail-loud tripwire: a
+            // mis-routed slot surfaces a clean typed error at the first
+            // such op instead of mis-dispatching (pinned by the
+            // FailDescr-fixture unit test in `jitcode_dispatch.rs`).
             RuntimeBhDescr::Call(_) | RuntimeBhDescr::AssemblerToken(_) => {
                 crate::descr::make_jitcode_descr(i)
             }
