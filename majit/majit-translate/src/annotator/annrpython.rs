@@ -289,6 +289,40 @@ impl<'a> Drop for PolicyGuard<'a> {
     }
 }
 
+/// Revert an evicted block to a pristine "never annotated" state by
+/// clearing the annotation on every Variable it DEFINES (inputargs +
+/// operation results).  Both dual-gate eviction paths
+/// ([`AddedBlocksGuard::drop`] and
+/// [`RPythonAnnotator::raise_if_subject_blocked`]) must pair every
+/// `annotated.shift_remove` with this reset: dropping a block from
+/// `annotated` while its Variables retain annotations leaves a
+/// half-state where a later subject reaching the same (session-shared)
+/// block sees `seen_before == false` in `addpendingblock`, takes the
+/// `bindinputargs` initial-seed path, and calls `setbinding` with the
+/// caller's (possibly narrower) cell over the retained annotation —
+/// tripping the monotonicity assert `setbinding: new value does not
+/// contain old` (e.g. two callers of one helper passing different
+/// constant static addresses).
+///
+/// Best-effort under `try_borrow`: a panic that unwinds while a cell
+/// is borrowed degrades to a leak rather than an abort-during-unwind
+/// double-borrow.
+fn clear_block_bindings(block: &BlockRef) {
+    if let Ok(blk) = block.try_borrow() {
+        let vars = blk
+            .inputargs
+            .iter()
+            .chain(blk.operations.iter().map(|op| &op.result));
+        for v in vars {
+            if let Hlvalue::Variable(var) = v {
+                if let Ok(mut slot) = var.annotation.try_borrow_mut() {
+                    *slot = None;
+                }
+            }
+        }
+    }
+}
+
 /// RAII guard for `self.added_blocks = {}; ...; finally:
 /// self.added_blocks = saved` in `complete_helpers()`.
 ///
@@ -340,13 +374,37 @@ impl<'a> Drop for AddedBlocksGuard<'a> {
                     .filter(|k| !self.annotated_at_entry.contains(*k))
                     .cloned()
                     .collect();
+                let fixed_graphs = self.ann.fixed_graphs.try_borrow();
                 for k in &new_keys {
-                    evict_block_and_clear_annotations(
-                        &mut annotated,
-                        &mut all_blocks,
-                        &mut blocked_blocks,
-                        k,
-                    );
+                    // Blocks of fixed (already-rtyped) graphs are
+                    // frozen — see `raise_if_subject_blocked`.  A
+                    // subject can rtype a callee during its own drive
+                    // and still fail afterwards (e.g. a dual-gate
+                    // divergence skip); the callee's annotations must
+                    // survive for later callers' fixed-graph
+                    // validation.
+                    if let Ok(fixed) = fixed_graphs.as_deref() {
+                        let graph = annotated.get(k).cloned().flatten().or_else(|| {
+                            blocked_blocks
+                                .get(k)
+                                .map(|(_, g, _)| std::rc::Rc::clone(g))
+                        });
+                        if let Some(g) = &graph {
+                            if fixed.contains_key(&GraphKey::of(g)) {
+                                continue;
+                            }
+                        }
+                    }
+                    annotated.shift_remove(k);
+                    blocked_blocks.shift_remove(k);
+                    // See `clear_block_bindings` — every eviction from
+                    // `annotated` must also reset the block's defined
+                    // Variables.  Mirrors the dual-gate Skip arm's
+                    // graph-wide `var.annotation = None` reset
+                    // (codewriter.rs::dual_gate_type_state).
+                    if let Some(block) = all_blocks.shift_remove(k) {
+                        clear_block_bindings(&block);
+                    }
                 }
                 if !new_keys.is_empty() {
                     if let Ok(mut pending) = self.ann.genpendingblocks.try_borrow_mut() {
@@ -359,49 +417,6 @@ impl<'a> Drop for AddedBlocksGuard<'a> {
         }
         if let Some(saved) = self.saved.take() {
             *self.ann.added_blocks.borrow_mut() = saved;
-        }
-    }
-}
-
-/// Evict one block from the session-shared tracking maps AND revert it
-/// to a pristine "never annotated" state by clearing the annotation on
-/// every Variable it DEFINES (inputargs + operation results).
-///
-/// Dropping the block from `annotated` without the clearing leaves a
-/// half-state: a later subject reaching the same (session-shared) block
-/// sees `seen_before == false` in `addpendingblock`, takes the
-/// `bindinputargs` initial-seed path, and calls `setbinding` with the
-/// caller's (possibly narrower) cell over the Variable's retained
-/// annotation — tripping the monotonicity assert `setbinding: new value
-/// does not contain old`.  Mirrors the dual-gate Skip arm's graph-wide
-/// `var.annotation = None` reset (codewriter.rs::dual_gate_type_state).
-/// Used by both eviction paths: the uncommitted [`AddedBlocksGuard`]
-/// drop and [`RPythonAnnotator::raise_if_subject_blocked`].
-///
-/// Lenient `try_borrow` on the block / annotation slots: the guard path
-/// can run during panic-unwind where a slot may still be borrowed —
-/// degrade to a leak rather than an abort-during-unwind double-borrow.
-fn evict_block_and_clear_annotations(
-    annotated: &mut IndexMap<BlockKey, Option<GraphRef>>,
-    all_blocks: &mut IndexMap<BlockKey, BlockRef>,
-    blocked_blocks: &mut IndexMap<BlockKey, (BlockRef, GraphRef, Option<usize>)>,
-    k: &BlockKey,
-) {
-    annotated.shift_remove(k);
-    blocked_blocks.shift_remove(k);
-    if let Some(block) = all_blocks.shift_remove(k) {
-        if let Ok(blk) = block.try_borrow() {
-            let vars = blk
-                .inputargs
-                .iter()
-                .chain(blk.operations.iter().map(|op| &op.result));
-            for v in vars {
-                if let Hlvalue::Variable(var) = v {
-                    if let Ok(mut slot) = var.annotation.try_borrow_mut() {
-                        *slot = None;
-                    }
-                }
-            }
         }
     }
 }
@@ -1402,30 +1417,39 @@ impl RPythonAnnotator {
         let mut annotated = self.annotated.borrow_mut();
         let mut all_blocks = self.all_blocks.borrow_mut();
         let mut blocked_blocks = self.blocked_blocks.borrow_mut();
-        // `evict_block_and_clear_annotations` (not bare `shift_remove`):
-        // this eviction runs BEFORE the subject's `AddedBlocksGuard`
-        // drops, so the guard's `new_keys` sweep no longer sees these
-        // blocks — the Variable annotations must be cleared here or
-        // they leak into the next subject's `bindinputargs`.
+        let fixed_graphs = self.fixed_graphs.borrow();
         for bkey in &added_keys {
-            evict_block_and_clear_annotations(
-                &mut annotated,
-                &mut all_blocks,
-                &mut blocked_blocks,
-                bkey,
-            );
-        }
-        // Prune the evicted blocks' pending rows too (the guard's Drop
-        // sweep can no longer see these keys in its `annotated` diff).
-        // The drain preceding this call normally leaves the queue
-        // empty, so this only matters when a blocked subject re-queued
-        // a block after its generation was processed.
-        {
-            let evicted: std::collections::HashSet<&BlockKey> = added_keys.iter().collect();
-            let mut pending = self.genpendingblocks.borrow_mut();
-            for g in pending.iter_mut() {
-                g.retain(|k, _| !evicted.contains(k));
+            // A block belonging to a fixed (already-rtyped) graph is
+            // frozen: its annotations must survive forever so the
+            // `addpendingblock` fixed-graph safety check can validate
+            // later callers against them.  Such a block can land in a
+            // failing subject's `added_blocks` via a notify reflow;
+            // evicting (and resetting) it here would strand every
+            // later caller on "fixed graph's inputarg lacks
+            // annotation".
+            let graph = annotated.get(bkey).cloned().flatten().or_else(|| {
+                blocked_blocks
+                    .get(bkey)
+                    .map(|(_, g, _)| std::rc::Rc::clone(g))
+            });
+            if let Some(g) = &graph {
+                if fixed_graphs.contains_key(&GraphKey::of(g)) {
+                    continue;
+                }
             }
+            annotated.shift_remove(bkey);
+            // See `clear_block_bindings` — evicting from `annotated`
+            // without resetting the block's defined Variables leaves a
+            // half-state that trips the `setbinding` monotonicity
+            // assert when the next subject re-seeds the same
+            // session-shared callee block (the `AddedBlocksGuard` drop
+            // cannot compensate: by then these keys are already gone
+            // from `annotated`, so its `new_keys` sweep never sees
+            // them).
+            if let Some(block) = all_blocks.shift_remove(bkey) {
+                clear_block_bindings(&block);
+            }
+            blocked_blocks.shift_remove(bkey);
         }
         Err(err)
     }
