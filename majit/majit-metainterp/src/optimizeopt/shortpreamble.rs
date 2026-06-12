@@ -1395,15 +1395,51 @@ impl ProducedShortOp {
         // single-table `imported_short_pure_ops` covers both because
         // `pure.rs` consults it for both arms during `optimize_pure_op` and
         // `optimize_call_pure_*`.
-        let imported = crate::optimizeopt::ImportedShortPureOp::new(
-            ctx,
-            opcode,
-            self.preamble_op.getdescr(),
-            args,
-            result_opref,
-            source,
-            self.invented_name,
-        );
+        // shortpreamble.py:121 `PreambleOp(op, preamble_op, ...)` — the
+        // replay op is the SAME object ShortPreambleBuilder.__init__
+        // seeded (one ResOperation per short box, threaded end to end).
+        // The builder was installed by
+        // `initialize_imported_short_preamble_builder_from_short_boxes`
+        // just before this produce_op loop; reuse its replay Rc instead
+        // of rebuilding an equal-content op. Fallback keeps the local
+        // construction for harnesses that call produce_op standalone.
+        let builder_pop = ctx
+            .imported_short_preamble_builder
+            .as_ref()
+            .and_then(|b| b.produced_short_op(source));
+        let imported = match builder_pop {
+            Some(p) => {
+                debug_assert_eq!(
+                    p.preamble_op.pos.get(),
+                    if self.invented_name {
+                        result_opref
+                    } else {
+                        source
+                    },
+                    "builder replay pos diverged from produce_pure replay rule"
+                );
+                crate::optimizeopt::ImportedShortPureOp {
+                    opcode,
+                    descr: self.preamble_op.getdescr(),
+                    args,
+                    result: result_opref,
+                    pop: crate::optimizeopt::info::PreambleOp {
+                        op: ctx.materialize_box_at(source),
+                        invented_name: self.invented_name,
+                        preamble_op: p.preamble_op.clone(),
+                    },
+                }
+            }
+            None => crate::optimizeopt::ImportedShortPureOp::new(
+                ctx,
+                opcode,
+                self.preamble_op.getdescr(),
+                args,
+                result_opref,
+                source,
+                self.invented_name,
+            ),
+        };
         ctx.imported_short_pure_ops.push(imported);
         // shortpreamble.py:432-440 add_preamble_op + 437-438 extra_same_as:
         // RPython collects the SameAs op into `short_preamble_producer.extra_same_as`
@@ -1494,11 +1530,27 @@ impl ProducedShortOp {
         // distinct Op object, so this slot juggling is the pyre adaptation
         // of that Box-identity invariant.
         getfield_op.pos.set(result_opref);
+        // shortpreamble.py:75 `PreambleOp(self.res, preamble_op, ...)` —
+        // the stored replay is the builder's object (one ResOperation per
+        // short box); see produce_pure for the threading rationale.
+        let replay_rc = ctx
+            .imported_short_preamble_builder
+            .as_ref()
+            .and_then(|b| b.produced_short_op(source))
+            .map(|p| {
+                debug_assert_eq!(
+                    p.preamble_op.pos.get(),
+                    result_opref,
+                    "builder replay pos diverged from produce_heap_field rule"
+                );
+                p.preamble_op
+            })
+            .unwrap_or_else(|| std::rc::Rc::new(getfield_op.clone()));
         let pop = crate::optimizeopt::info::PreambleOp {
             // PreambleOp.op carries the Box itself (shortpreamble.py:12).
             op: ctx.materialize_box_at(source),
             invented_name: self.invented_name,
-            preamble_op: std::rc::Rc::new(getfield_op.clone()),
+            preamble_op: replay_rc,
         };
         let parent_descr = getfield_op
             .with_field_descr(|fd| fd.get_parent_descr())
@@ -1614,11 +1666,26 @@ impl ProducedShortOp {
         // result_opref. See produce_heap_field for the Box-identity-vs-flat-OpRef
         // adaptation rationale.
         getarrayitem_op.pos.set(result_opref);
+        // shortpreamble.py:84 `PreambleOp(self.res, preamble_op, ...)` —
+        // stored replay is the builder's object; see produce_pure.
+        let replay_rc = ctx
+            .imported_short_preamble_builder
+            .as_ref()
+            .and_then(|b| b.produced_short_op(source))
+            .map(|p| {
+                debug_assert_eq!(
+                    p.preamble_op.pos.get(),
+                    result_opref,
+                    "builder replay pos diverged from produce_heap_array_item rule"
+                );
+                p.preamble_op
+            })
+            .unwrap_or_else(|| std::rc::Rc::new(getarrayitem_op.clone()));
         let pop = crate::optimizeopt::info::PreambleOp {
             // PreambleOp.op carries the Box itself (shortpreamble.py:12).
             op: ctx.materialize_box_at(source),
             invented_name: self.invented_name,
-            preamble_op: std::rc::Rc::new(getarrayitem_op.clone()),
+            preamble_op: replay_rc,
         };
         if obj_resolved.is_constant()
             || ctx
