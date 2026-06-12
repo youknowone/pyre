@@ -3654,7 +3654,10 @@ impl OptUnroll {
                     // indicate a structural mismatch (e.g., cross-loop bridge
                     // with incompatible short preamble). Raise InvalidLoop.
                     match mapping.get(&arg.to_opref()) {
-                        Some(&mapped) => new_op.setarg(i, BoxRef::from_opref(mapped)),
+                        // unroll.py:367: mapping values are the replayed op
+                        // objects; bind to the registered producer (memoized
+                        // on box_cache) rather than minting an unbound box.
+                        Some(&mapped) => new_op.setarg(i, ctx.materialize_box_at(mapped)),
                         None => {
                             // RPython: _map_args raises KeyError for unmapped
                             // args. This is equivalent to InvalidLoop — the
@@ -3712,7 +3715,8 @@ impl OptUnroll {
                                 "non-guard short-preamble op carried fail_args: {:?}",
                                 new_op.opcode
                             );
-                            *arg = majit_ir::operand::Operand::Box(BoxRef::from_opref(mapped));
+                            *arg =
+                                majit_ir::operand::Operand::Box(ctx.materialize_box_at(mapped));
                         }
                     }
                 }
