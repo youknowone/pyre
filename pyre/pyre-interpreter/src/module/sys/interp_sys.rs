@@ -565,12 +565,32 @@ pub fn register_module(ns: &mut DictStorage) {
         ns,
         "exit",
         crate::make_builtin_function("exit", |args| {
-            if args.len() > 1 {
-                return Err(crate::PyError::type_error("exit() takes at most 1 argument"));
+            // `exit(exitcode=None)` — resolve the single optional argument
+            // like the app-level signature: strip the `__pyre_kw__` trailer,
+            // reject unknown keywords, reproduce the normal function-call
+            // arity diagnostics, and reject a positional/`exitcode=`
+            // duplicate.
+            let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
+            crate::builtins::kwarg_reject_unknown(kwargs, &["exitcode"], "exit")?;
+            if positional.len() > 1 {
+                return Err(crate::PyError::type_error(format!(
+                    "exit() takes from 0 to 1 positional arguments but {} were given",
+                    positional.len()
+                )));
             }
+            let kw_exitcode = crate::builtins::kwarg_get(kwargs, "exitcode");
+            if !positional.is_empty() && kw_exitcode.is_some() {
+                return Err(crate::PyError::type_error(
+                    "exit() got multiple values for argument 'exitcode'",
+                ));
+            }
+            let exitcode = positional
+                .first()
+                .copied()
+                .or(kw_exitcode)
+                .unwrap_or_else(w_none);
             let cls = crate::builtins::lookup_exc_class("SystemExit")
                 .ok_or_else(|| crate::PyError::runtime_error("SystemExit class missing"))?;
-            let exitcode = args.first().copied().unwrap_or_else(w_none);
             let ctor_args = if unsafe { is_tuple(exitcode) } {
                 unsafe { w_tuple_items_copy_as_vec(exitcode) }
             } else {
