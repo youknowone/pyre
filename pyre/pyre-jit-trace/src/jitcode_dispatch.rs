@@ -7422,6 +7422,14 @@ fn dispatch_residual_call_iRd_kind(
         let (call_opcode, can_raise, emit_guard_not_forced) =
             select_residual_call_opcode(ei, dst_bank, "dispatch_residual_call_iRd_kind");
         walker_abort_if_mayforce_null_ref_arg(call_opcode, &allboxes, call_descr, ctx, op.pc)?;
+        // Both abort gates are static (EI flags + a jitcode body scan) and
+        // must run BEFORE the concrete executor below: `do_residual_call`
+        // (pyjitpl.py:2019) executes the helper only on a path that keeps
+        // recording — it has no execute-then-abandon shape.  Aborting after
+        // execution would leave the helper's heap/exception effects standing
+        // while the declined retrace re-runs the same bytecode, double-
+        // applying them.
+        walker_abort_if_protected_may_force(code, op, can_raise)?;
 
         // pyjitpl.py:2017 `vable_and_vrefs_before_residual_call` — fires
         // unconditionally on the forces branch.  Records FORCE_TOKEN +
@@ -7542,7 +7550,6 @@ fn dispatch_residual_call_iRd_kind(
         // optimizer's `store_final_boxes_in_guard` finds a
         // `rd_resume_position` advanced *past* the call.
         if can_raise {
-            walker_abort_if_protected_may_force(code, op, can_raise)?;
             if resid_raised {
                 walker_record_guard_exception(ctx, op.pc);
                 // `pyjitpl.py:2156-2168 handle_possible_exception` routes
@@ -9197,6 +9204,10 @@ fn dispatch_residual_call_iIRd_kind(
         let (call_opcode, can_raise, emit_guard_not_forced) =
             select_residual_call_opcode(ei, dst_bank, "dispatch_residual_call_iIRd_kind");
         walker_abort_if_mayforce_null_ref_arg(call_opcode, &allboxes, call_descr, ctx, op.pc)?;
+        // Static gate BEFORE the concrete executor — see
+        // `dispatch_residual_call_iRd_kind` for the execute-then-abandon
+        // rationale (do_residual_call, pyjitpl.py:2019).
+        walker_abort_if_protected_may_force(code, op, can_raise)?;
 
         // pyjitpl.py:2017 `vable_and_vrefs_before_residual_call` —
         // records FORCE_TOKEN + SETFIELD_GC IR; runtime heap mutations
@@ -9267,7 +9278,6 @@ fn dispatch_residual_call_iIRd_kind(
             walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
         }
         if can_raise {
-            walker_abort_if_protected_may_force(code, op, can_raise)?;
             if resid_raised {
                 walker_record_guard_exception(ctx, op.pc);
                 // pyjitpl.py:2156-2168 `handle_possible_exception`
@@ -9382,6 +9392,10 @@ fn dispatch_residual_call_iIRFd_kind(
         let (call_opcode, can_raise, emit_guard_not_forced) =
             select_residual_call_opcode(ei, dst_bank, "dispatch_residual_call_iIRFd_kind");
         walker_abort_if_mayforce_null_ref_arg(call_opcode, &allboxes, call_descr, ctx, op.pc)?;
+        // Static gate BEFORE the concrete executor — see
+        // `dispatch_residual_call_iRd_kind` for the execute-then-abandon
+        // rationale (do_residual_call, pyjitpl.py:2019).
+        walker_abort_if_protected_may_force(code, op, can_raise)?;
 
         // pyjitpl.py:2017 `vable_and_vrefs_before_residual_call` —
         // records FORCE_TOKEN + SETFIELD_GC IR; runtime heap mutations
@@ -9456,7 +9470,6 @@ fn dispatch_residual_call_iIRFd_kind(
             walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
         }
         if can_raise {
-            walker_abort_if_protected_may_force(code, op, can_raise)?;
             if resid_raised {
                 walker_record_guard_exception(ctx, op.pc);
                 // pyjitpl.py:2156-2168 `handle_possible_exception`
