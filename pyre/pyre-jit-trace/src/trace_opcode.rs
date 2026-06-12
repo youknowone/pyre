@@ -7882,6 +7882,43 @@ impl MIFrame {
         }
     }
 
+    /// True for the method-form `LOAD_ATTR` of a foldable builtin list
+    /// method (`append` / `pop` / `reverse`) on a concrete list receiver
+    /// at TOS.  The dispatch gate routes exactly this shape OFF the
+    /// walker leg so `MIFrame::load_method` can resolve it to a
+    /// class-guarded Const unbound function instead of the walker arm's
+    /// residual getattr (which materialises a fresh bound method every
+    /// iteration and resolves to a null callable on blackhole CALL
+    /// re-execution).
+    fn is_foldable_list_method_load_attr(
+        &self,
+        instruction: &Instruction,
+        op_arg: pyre_interpreter::OpArg,
+        code: &CodeObject,
+    ) -> bool {
+        let Instruction::LoadAttr { namei } = instruction else {
+            return false;
+        };
+        let attr = namei.get(op_arg);
+        if !attr.is_method() {
+            return false;
+        }
+        let Some(name) = code.names.get(attr.name_idx() as usize) else {
+            return false;
+        };
+        if !matches!(name.as_ref(), "append" | "pop" | "reverse") {
+            return false;
+        }
+        let s = self.sym();
+        let Some(stack_idx) = s.valuestackdepth.checked_sub(s.nlocals + 1) else {
+            return false;
+        };
+        matches!(
+            s.concrete_stack.get(stack_idx),
+            Some(ConcreteValue::Ref(obj)) if !obj.is_null() && unsafe { is_list(*obj) }
+        )
+    }
+
     pub fn trace_code_step(&mut self, code: &CodeObject, pc: usize) -> TraceAction {
         if pc >= code.instructions.len() {
             if majit_metainterp::majit_log_enabled() {
@@ -7996,7 +8033,12 @@ impl MIFrame {
                 // multi_frame_with_vable_vref`), fall back to trait
                 // dispatch in inline frames.
                 let in_inline_frame = !self.parent_frames.is_empty();
-                if production_walker_handles(&instruction) && !in_inline_frame {
+                let foldable_list_load_attr =
+                    self.is_foldable_list_method_load_attr(&instruction, op_arg, code);
+                if production_walker_handles(&instruction)
+                    && !in_inline_frame
+                    && !foldable_list_load_attr
+                {
                     self.dispatch_via_walker_for_opcode(&instruction, op_arg)
                 } else {
                     let shadow_outcome =
@@ -8828,6 +8870,13 @@ pub fn production_walker_handles(instruction: &Instruction) -> bool {
             | Instruction::ForIter { .. }
             | Instruction::CallKw { .. }
             | Instruction::CallFunctionEx
+            // Instruction::LoadAttr is walker-routed EXCEPT the foldable
+            // builtin list-method form (append/pop/reverse on a list
+            // receiver), which the dispatch gate carves out to the trait
+            // leg so MIFrame::load_method can resolve it to a
+            // class-guarded Const unbound function (the list
+            // specialization); see is_foldable_list_method_load_attr.
+            | Instruction::LoadAttr { .. }
             | Instruction::StoreAttr { .. }
             // Instruction::StoreFastStoreFast excluded: routed off the
             // walker JIT path (kept on trait dispatch) until the SFSF
