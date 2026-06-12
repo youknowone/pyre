@@ -4091,6 +4091,191 @@ impl<'a> Lowering<'a> {
                 result_ty: ValueType::Int,
             },
         );
+        self.emit_tagged_pair_aggregate(mir_bb, &owner, disc, payload, dest_local, target)?;
+        Ok(true)
+    }
+
+    /// Lower the infallible `usize::try_from(<u8|u16|u32>)`
+    /// (`core::convert::num::ptr_try_from_impls::<Impl>::try_from`,
+    /// Opaque in the LLBC like every core fn) to its decomposed
+    /// always-`Ok` shape: `__discriminant = 0` (`Result`'s `Ok` tag)
+    /// and `__pos_0 = arg` (the widening is an identity on the i64
+    /// carrier).  Upstream `rarithmetic.py:140-145 widen` performs
+    /// the same smaller-than-word unsigned → Signed widening as a
+    /// no-op; pyre spells it `usize::try_from(x).expect(..)`
+    /// (`pyopcode.rs` `u32_as_usize` / `raise_kind_as_usize`), whose
+    /// `Err` arm is statically dead on the 64-bit-only targets pyre
+    /// supports.  Impls with word-sized-or-wider inputs — the
+    /// genuinely fallible directions of the same impl group — keep
+    /// the `Call` form.
+    fn try_lower_usize_try_from(
+        &mut self,
+        mir_bb: usize,
+        kind: &CallKind,
+        segments: &[String],
+        args: &[Variable],
+        dest_local: usize,
+        dest_ty: &TyRef,
+        target: usize,
+    ) -> Result<bool, LowerError> {
+        let [first, .., module, impl_seg, leaf] = segments else {
+            return Ok(false);
+        };
+        if first.as_str() != "core"
+            || module.as_str() != "ptr_try_from_impls"
+            || impl_seg.as_str() != "<Impl>"
+            || leaf.as_str() != "try_from"
+        {
+            return Ok(false);
+        }
+        let [arg] = args else {
+            return Ok(false);
+        };
+        let CallKind::Fun(FunId::Regular { id }) = kind else {
+            return Ok(false);
+        };
+        let Some(fd) = self.llbc.fn_by_id(*id) else {
+            return Ok(false);
+        };
+        let Some(src) = fd.signature.inputs.first() else {
+            return Ok(false);
+        };
+        if !matches!(
+            self.tyref_literal_uint_atom(src),
+            Some("U8" | "U16" | "U32")
+        ) {
+            return Ok(false);
+        }
+        let Some(def_id) = self.tyref_adt_def_id(dest_ty) else {
+            return Ok(false);
+        };
+        let Some(td) = self.llbc.type_by_id(def_id) else {
+            return Ok(false);
+        };
+        let owner = td.item_meta.name_path();
+        let arg = arg.clone();
+        if self.multi_assigned_locals.contains(&dest_local) {
+            // A re-bindable local may later carry a runtime `Result`,
+            // so the constant tag can't be recorded and consumers
+            // can't be folded — materialize the aggregate so field
+            // reads on the local stay type-consistent.
+            let bb_id = self.block_id[mir_bb];
+            let disc = self
+                .graph
+                .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                result: Some(disc.clone()),
+                kind: OpKind::ConstInt(0),
+            });
+            self.emit_tagged_pair_aggregate(mir_bb, &owner, disc, arg, dest_local, target)?;
+            return Ok(true);
+        }
+        // Identity widening: bind the destination local directly to
+        // the operand — no `Result` object is materialized at all,
+        // exactly as upstream `widen` leaves no op in the graph.
+        // The discriminant switch always sits in a successor block
+        // (a MIR call terminates its own block), so record the
+        // constant tag per-local: `Rvalue::Discriminant` folds to
+        // `ConstInt(0)` and `expect`/`unwrap` aliases the payload
+        // (`expect_on_const_ok`) without touching the variable.
+        self.const_discriminant_locals.insert(dest_local, 0);
+        self.local_var[dest_local] = Some(arg);
+        let bb_id = self.block_id[mir_bb];
+        let target_bb = self.block_id[target];
+        let link_args = self.edge_args(mir_bb, target)?;
+        self.graph.set_goto(bb_id, target_bb, link_args);
+        Ok(true)
+    }
+
+    /// Resolve `Result::expect` / `Result::unwrap` on a receiver local
+    /// recorded always-`Ok` (`const_discriminant_locals`, tag 0) to
+    /// the receiver variable itself.  Such locals are bound directly
+    /// to the `Ok` payload by [`Lowering::try_lower_usize_try_from`]
+    /// (no `Result` object is materialized), so the unwrap is an
+    /// alias, not an op.  The match these methods perform lives
+    /// inside the Opaque core body, so without the intercept the call
+    /// keeps its panic-message `&str` argument and the graph walls on
+    /// the `__str_const` lowering even though the `Err` arm is
+    /// statically dead.  Upstream has no such call: `ovfcheck`-free
+    /// widening is a plain identity (`rarithmetic.py:140-145 widen`),
+    /// so the operand *is* the whole operation.  Returns `None` for
+    /// any other callee or a receiver without the always-`Ok` record,
+    /// keeping the generic `Call` form.
+    fn expect_on_const_ok(
+        &self,
+        segments: &[String],
+        args: &[Variable],
+        arg_locals: &[Option<usize>],
+    ) -> Option<Variable> {
+        let [first, .., module, impl_seg, leaf] = segments else {
+            return None;
+        };
+        if first.as_str() != "core"
+            || module.as_str() != "result"
+            || impl_seg.as_str() != "<Impl>"
+            || !matches!(leaf.as_str(), "expect" | "unwrap")
+        {
+            return None;
+        }
+        let recv = args.first()?;
+        let recv_local = (*arg_locals.first()?)?;
+        if *self.const_discriminant_locals.get(&recv_local)? != 0 {
+            return None;
+        }
+        Some(recv.clone())
+    }
+
+    /// The `UInt` width atom (`"U8"` / `"U32"` / `"Usize"` …) of a
+    /// scalar-typed [`TyRef`], `None` for any non-`UInt` shape.
+    fn tyref_literal_uint_atom<'t>(&self, ty: &'t TyRef) -> Option<&'t str>
+    where
+        'a: 't,
+    {
+        let value = match ty {
+            TyRef::Inline { value: (_, v) } => v,
+            TyRef::Other(v) => v,
+            TyRef::Dedup { id } => self.llbc.dedup_body(*id)?,
+        };
+        value
+            .as_object()?
+            .get("Literal")?
+            .as_object()?
+            .get("UInt")?
+            .as_str()
+    }
+
+    /// Shared tail for the decomposed checked-arithmetic /
+    /// infallible-conversion call lowerings: write `disc` and
+    /// `payload` into the destination `Option`/`Result` local as a
+    /// synthetic aggregate — the same transparent-ctor + `FieldWrite`
+    /// chain [`Rvalue::Aggregate`] emits — then bind the destination
+    /// local and close the block toward the call's success target.
+    ///
+    /// Unlike `resolve_aggregate_adt`'s enum arm, which constructs
+    /// the VARIANT identity (`Option::Some`), this constructs the
+    /// enum TYPE root (`Option`) and writes `__discriminant`
+    /// explicitly.  That is deliberate: `disc` may be a runtime value
+    /// (`checked_neg`'s `ne(v, MIN)`), so no single variant identity
+    /// is correct, and the enum root is exactly the flat class every
+    /// downstream enum attr read keys (`Rvalue::Discriminant` reads
+    /// `__discriminant` with no owner, payload projections key the
+    /// enum leaf — `resolve_adt_field` — and `extract_struct_fields`
+    /// registers `__discriminant` + the payload-field union on the
+    /// root).  Constructing a variant identity here instead breaks
+    /// the real-path annotation of multi-assigned destination locals
+    /// (`<other> ∪ int` UnionError in `mergeinputargs`).
+    fn emit_tagged_pair_aggregate(
+        &mut self,
+        mir_bb: usize,
+        owner: &str,
+        disc: Variable,
+        payload: Variable,
+        dest_local: usize,
+        target: usize,
+    ) -> Result<(), LowerError> {
+        let bb_id = self.block_id[mir_bb];
+        let mut owner_path: Vec<String> = owner.split("::").map(str::to_string).collect();
+        let ctor_name = owner_path.pop().unwrap_or_default();
         let ctor_target = if owner_path.is_empty() {
             CallTarget::synthetic_transparent_ctor(ctor_name.clone())
         } else {
