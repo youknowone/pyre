@@ -1658,12 +1658,29 @@ impl<'a> Lowering<'a> {
             }
             ProjectionElem::Tagged(v) => {
                 if let Some(field_payload) = v.as_object().and_then(|m| m.get("Field")) {
-                    let label = field_label_from_payload(field_payload);
-                    OpKind::FieldWrite {
-                        base,
-                        field: FieldDescriptor::new(label, None),
-                        value,
-                        ty: ValueType::Int,
+                    // Adt-container writes resolve the declared field
+                    // name / owner / type, mirroring the typed
+                    // `FieldRead` arm in `resolve_place` — an
+                    // asymmetric synthetic label (`Adt_<idx>`) would
+                    // make the rtyper's `getfieldrepr` miss the attr
+                    // the paired read registered under its real name.
+                    if let Some((owner_root, field_name, field_ty)) =
+                        self.resolve_adt_field(field_payload)
+                    {
+                        OpKind::FieldWrite {
+                            base,
+                            field: FieldDescriptor::new(field_name, Some(owner_root)),
+                            value,
+                            ty: tyref_to_value_type(&field_ty, self.llbc),
+                        }
+                    } else {
+                        let label = field_label_from_payload(field_payload);
+                        OpKind::FieldWrite {
+                            base,
+                            field: FieldDescriptor::new(label, None),
+                            value,
+                            ty: ValueType::Int,
+                        }
                     }
                 } else if let Some(index_payload) = v.as_object().and_then(|m| m.get("Index")) {
                     let idx_var = self.index_offset_var(mir_bb, index_payload)?;
@@ -4157,17 +4174,22 @@ fn tyref_to_attr_value_type(ty: &TyRef, llbc: &Llbc) -> ValueType {
 /// its cached struct-root `ClassDef` instead of the classdef-less
 /// `SomeInstance` shell.
 ///
+/// Raw pointers (`*const T` / `*mut T`) resolve to their pointee's
+/// ADT root: a `*mut W_Foo` parameter is the same instance-lattice
+/// value as a `&W_Foo` one (upstream `SomePtr(PTRTYPE)` carries the
+/// pointee type either way).  The pointer-method answer (`is_null`)
+/// stays intact — `SomeInstance.getattr` resolves it as a bound
+/// method BEFORE projecting the classdef (`unaryop.rs:3664`), so a
+/// seeded classdef no longer bypasses it.
+///
 /// Returns `None` for:
 ///   - primitives / tuples / builtin containers (no class root);
-///   - raw pointers (`*const T` / `*mut T`) — a raw-pointer receiver
-///     answers `is_null` through the classdef-less bound-method arm
-///     (`unaryop.rs:3683`), which a seeded classdef would bypass;
 ///   - generic ADT instantiations (`Arg<u32>`) — the registry rows for
 ///     a generic decl carry unresolved type-variable field strings, so
 ///     a seeded classdef would project bogus attr shells.
 fn tyref_class_root(ty: &TyRef, llbc: &Llbc) -> Option<String> {
-    let node = tyref_node(ty, llbc)?;
-    adt_node_class_root(strip_ty_wrappers(node, llbc)?, llbc)
+    let node = strip_ty_wrappers(tyref_node(ty, llbc)?, llbc)?;
+    adt_node_class_root(node, llbc).or_else(|| raw_ptr_pointee_class_root(node, llbc))
 }
 
 /// The underlying JSON type node of a `TyRef`, resolving the `Dedup`
@@ -4207,11 +4229,15 @@ fn adt_node_class_root(node: &serde_json::Value, llbc: &Llbc) -> Option<String> 
 /// p)` (lltype.py:964-968): the pointee root names the classdef the
 /// `lltype.cast_pointer` annotation rule resolves the result to.
 fn cast_ptr_target_class_root(ty: &TyRef, llbc: &Llbc) -> Option<String> {
-    let node = tyref_node(ty, llbc)?;
-    let raw = strip_ty_wrappers(node, llbc)?
-        .as_object()?
-        .get("RawPtr")?
-        .as_array()?;
+    raw_ptr_pointee_class_root(strip_ty_wrappers(tyref_node(ty, llbc)?, llbc)?, llbc)
+}
+
+/// The pointee's monomorphic-ADT class root of an (already
+/// wrapper-stripped) `RawPtr` type node, or `None` when the node is
+/// not a raw pointer onto a plain ADT — the shared tail of
+/// [`tyref_class_root`] / [`cast_ptr_target_class_root`].
+fn raw_ptr_pointee_class_root(node: &serde_json::Value, llbc: &Llbc) -> Option<String> {
+    let raw = node.as_object()?.get("RawPtr")?.as_array()?;
     adt_node_class_root(strip_ty_wrappers(raw.first()?, llbc)?, llbc)
 }
 
