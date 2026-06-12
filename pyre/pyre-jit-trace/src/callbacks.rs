@@ -17,6 +17,12 @@ pub struct CallJitCallbacks {
     pub callee_frame_helper: fn(usize) -> Option<*const ()>,
     pub recursive_force_cache_safe: fn(PyObjectRef) -> bool,
     pub jit_drop_callee_frame: *const (),
+    /// Inline back-edge CALL_ASSEMBLER writeback: store one
+    /// `locals_cells_stack_w` slot of the callee frame (Ref / raw-int /
+    /// raw-float variants; the raw variants box runtime-side).
+    pub jit_frame_set_slot_ref: *const (),
+    pub jit_frame_set_slot_int: *const (),
+    pub jit_frame_set_slot_float: *const (),
     pub jit_force_callee_frame: *const (),
     pub jit_force_recursive_call_1: *const (),
     pub jit_force_recursive_call_argraw_boxed_1: *const (),

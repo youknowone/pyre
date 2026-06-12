@@ -1774,7 +1774,11 @@ impl<S: JitState> JitDriver<S> {
                 self.meta.leave_profiler_tracing();
                 self.meta.clear_trace_session();
             }
-            TraceAction::Abort => {
+            // Consumed inside the metainterp dispatch loop
+            // (PyreMetaInterp::step_inline_frame pops the inline frame and
+            // records the CALL_ASSEMBLER); it never reaches the jitdriver.
+            // Defensive: treat an escaped instance as a plain Abort.
+            TraceAction::RecursiveCallAssembler { .. } | TraceAction::Abort => {
                 if self.meta.bridge_info().is_some() {
                     crate::debug::log_one("jit-abort", "Abort during bridge tracing");
                 }

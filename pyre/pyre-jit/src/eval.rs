@@ -1723,6 +1723,14 @@ thread_local! {
         // normally traced by the translated GC. Walk its value slots
         // explicitly until the table is folded into the object layout.
         majit_gc::shadow_stack::register_extra_root_walker(pyre_interpreter_side_table_root_walker);
+        // JIT-created callee frames (frame arena + heap fallbacks) hold
+        // GC refs in their locals arrays but sit on no
+        // `CURRENT_FRAME`/`f_backref` chain while compiled code runs,
+        // so `walk_pyframe_roots` never reaches them. See
+        // `call_jit::walk_jit_callee_frame_roots`.
+        majit_gc::shadow_stack::register_extra_root_walker(
+            crate::call_jit::walk_jit_callee_frame_roots,
+        );
         // Route pyre-object host-side allocators through the backend's
         // nursery. `set_gc_allocator` populated
         // `majit_gc::ACTIVE_ALLOC_NURSERY_TYPED` with the active
@@ -2589,6 +2597,9 @@ fn init_callbacks() {
                 callee_frame_helper: crate::call_jit::callee_frame_helper,
                 recursive_force_cache_safe: crate::call_jit::recursive_force_cache_safe,
                 jit_drop_callee_frame: crate::call_jit::jit_drop_callee_frame as *const (),
+                jit_frame_set_slot_ref: crate::call_jit::jit_frame_set_slot_ref as *const (),
+                jit_frame_set_slot_int: crate::call_jit::jit_frame_set_slot_int as *const (),
+                jit_frame_set_slot_float: crate::call_jit::jit_frame_set_slot_float as *const (),
                 jit_force_callee_frame: crate::call_jit::jit_force_callee_frame as *const (),
                 jit_force_recursive_call_1: crate::call_jit::jit_force_recursive_call_1
                     as *const (),

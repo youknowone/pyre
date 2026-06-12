@@ -702,6 +702,80 @@ pub(crate) fn write_stack_slot(
     }
 }
 
+/// Write an inline callee frame's live state back to its heap `PyFrame`
+/// before a loop-token CALL_ASSEMBLER (opimpl_jit_merge_point
+/// portal_call_depth>0 → do_recursive_call, pyjitpl.py:1579-1602).
+///
+/// The callee's compiled loop reads `locals_cells_stack_w` /
+/// `last_instr` / `valuestackdepth` from the frame object at entry
+/// (virtualizable.py:86-98 read_boxes), but the inlined prefix advanced
+/// those values only in the symbolic register banks; the runtime frame
+/// still holds its creation-time state (call args). Emit the
+/// virtualizable write_boxes shape (virtualizable.py:99-110):
+/// SETFIELD_GC for the per-call statics + one residual helper CALL per
+/// live array slot. Slots never touched symbolically (`OpRef::NONE`)
+/// keep their runtime creation value.
+///
+/// The other four statics (`pycode`, `debugdata`, `lastblock`,
+/// `w_globals`) are correct from frame creation and have no mutators
+/// under CPython 3.14 bytecode (see `flush_to_frame_for_guard`).
+pub(crate) fn gen_writeback_inline_frame_to_heap(
+    ctx: &mut TraceCtx,
+    sym: &mut PyreSym,
+    frame_opref: OpRef,
+    target_pc: usize,
+    valuestackdepth: usize,
+) {
+    let info = crate::frame_layout::build_pyframe_virtualizable_info();
+
+    // last_instr = target_pc - 1 so the compiled loop's next_instr()
+    // lands on the merge point (pyjitpl.py:2973 reached_loop_header pin).
+    let last_instr = ctx.const_int(target_pc as i64 - 1);
+    if let Some(idx) = info.static_field_index_by_name("last_instr") {
+        let descr = info.static_field_descr(idx);
+        ctx.vable_setfield_descr(frame_opref, last_instr, descr);
+    }
+    let vsd = ctx.const_int(valuestackdepth as i64);
+    if let Some(idx) = info.static_field_index_by_name("valuestackdepth") {
+        let descr = info.static_field_descr(idx);
+        ctx.vable_setfield_descr(frame_opref, vsd, descr);
+    }
+
+    // locals_cells_stack_w items, emitted as residual helper CALLs
+    // (jit_frame_set_slot_{ref,int,float}) rather than SetarrayitemGc.
+    // direct_assembler_call (pyjitpl.py:3613) passes the red boxes as
+    // CALL_ASSEMBLER args, so virtual values among them are forced at
+    // the call; pyre's uniform `[frame, ec]` loop ABI delivers the reds
+    // through the heap frame instead, and making each slot value a call
+    // argument keeps the same force-at-call property. The raw int/float
+    // helper variants box runtime-side (w_int_new / w_float_new), so no
+    // boxing ops enter the trace. GC visibility of the stored refs
+    // between these stores and the compiled loop's entry loads is
+    // covered by `walk_jit_callee_frame_roots` (pyre-jit::call_jit) —
+    // the heap frame sits on no `CURRENT_FRAME` chain while compiled
+    // code runs.
+    let cb = crate::callbacks::get();
+    for slot in 0..valuestackdepth {
+        let Some(&value) = sym.registers_r.get(slot) else {
+            break;
+        };
+        if value == OpRef::NONE {
+            continue;
+        }
+        let index = ctx.const_int(slot as i64);
+        let (helper, value_type) = match ctx.get_opref_type(value) {
+            Some(Type::Int) => (cb.jit_frame_set_slot_int, Type::Int),
+            Some(Type::Float) => (cb.jit_frame_set_slot_float, Type::Float),
+            _ => (cb.jit_frame_set_slot_ref, Type::Ref),
+        };
+        ctx.call_void_typed(
+            helper,
+            &[frame_opref, index, value],
+            &[Type::Ref, Type::Int, value_type],
+        );
+    }
+}
+
 /// Read the symbolic OpRef at depth offset `stack_idx`, with lazy
 /// heap-fill from `locals_cells_stack_w` when the slot is empty.
 /// Symmetric counterpart of `write_stack_slot`.
@@ -7341,6 +7415,57 @@ impl MIFrame {
             nargs: args.len(),
             caller_result_stack_idx: None,
             caller_result_type: Some(Type::Ref),
+            replay_callable: callable,
+            replay_args: args.to_vec(),
+        })
+    }
+
+    /// pyjitpl.py:1425-1432 do_recursive_call(assembler_call=True) +
+    /// pyjitpl.py:3613-3635 direct_assembler_call, invoked on the PARENT
+    /// frame after the inline callee was popped at its loop back-edge
+    /// (opimpl_jit_merge_point portal_call_depth>0, pyjitpl.py:1579-1602).
+    ///
+    /// Records CALL_ASSEMBLER into the callee loop's compiled token with
+    /// `[callee_frame, ec]` red args (interp_jit.py:67 reds), bracketed by
+    /// the same vable/vref + GuardNotForced / GuardNoException sequence as
+    /// the residual-call emission (do_residual_call, pyjitpl.py:1995-2083).
+    /// The guard resume is shaped by `push_call_replay_stack` with the
+    /// original CALL's callable/args so a failure re-executes the call in
+    /// the interpreter — the same capture the residual path uses.
+    ///
+    /// Returns the CALL_ASSEMBLER result OpRef (Ref-typed: the callee's
+    /// boxed return value).
+    pub(crate) fn do_recursive_call_assembler(
+        &mut self,
+        token_number: u64,
+        callee_frame: OpRef,
+        replay_callable: OpRef,
+        replay_args: &[OpRef],
+        call_pc: usize,
+    ) -> Result<OpRef, PyError> {
+        self.with_ctx(|this, ctx| {
+            // pyjitpl.py:2017: do_residual_call step 1
+            this.vable_and_vrefs_before_residual_call(ctx);
+            let ec = this.ensure_execution_context(ctx);
+            let ca_result = ctx.call_assembler_red_only_ref(
+                token_number,
+                &[callee_frame, ec],
+                &[Type::Ref, Type::Ref],
+            );
+            // pyjitpl.py:3625-3631 direct_assembler_call: keep the callee
+            // virtualizable alive past the CALL_ASSEMBLER.
+            ctx.record_op(OpCode::Keepalive, &[callee_frame]);
+            // pyjitpl.py:2049
+            this.vrefs_after_residual_call(ctx);
+            // pyjitpl.py:2078
+            this.vable_after_residual_call()?;
+            // pyjitpl.py:2079
+            this.push_call_replay_stack(ctx, replay_callable, replay_args, call_pc);
+            this.generate_guard(ctx, OpCode::GuardNotForced, &[]);
+            this.generate_guard(ctx, OpCode::GuardNoException, &[]);
+            ctx.heap_cache_mut().invalidate_caches_for_escaped();
+            this.pop_call_replay_stack(ctx, replay_args.len())?;
+            Ok(ca_result)
         })
     }
 
@@ -9164,6 +9289,17 @@ pub(crate) fn trace_step_result_to_action(
 ) -> TraceAction {
     match result {
         Ok(pyre_interpreter::StepResult::Continue) => {
+            // opimpl_jit_merge_point portal_call_depth>0 orthodox path
+            // (pyjitpl.py:1579-1602): the inline-frame back-edge targets a
+            // loop with compiled code; surface the signal so the metainterp
+            // pops the inline frame and records a CALL_ASSEMBLER from the
+            // parent (finishframe + do_recursive_call assembler_call=True).
+            if let Some((green_key, target_pc)) = state.ctx().take_recursive_call_assembler() {
+                return TraceAction::RecursiveCallAssembler {
+                    green_key,
+                    target_pc,
+                };
+            }
             // opimpl_jit_merge_point portal_call_depth>0 safe subset: a
             // back-edge reached inside an inline callee frame was flagged in
             // close_loop_args (it cannot be unrolled — its JUMP arg-set is

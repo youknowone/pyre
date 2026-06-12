@@ -183,6 +183,14 @@ pub enum TraceAction {
     Abort,
     /// Abort the current trace permanently (never trace this location again).
     AbortPermanent,
+    /// A loop back-edge was reached inside an inline callee frame whose
+    /// loop already has compiled code (opimpl_jit_merge_point
+    /// portal_call_depth>0, pyjitpl.py:1579-1602). The metainterp must
+    /// pop the inline frame (finishframe(None)) and record a
+    /// CALL_ASSEMBLER into the loop token from the parent frame
+    /// (do_recursive_call assembler_call=True), then continue tracing
+    /// the parent (ChangeFrame).
+    RecursiveCallAssembler { green_key: u64, target_pc: usize },
 }
 
 /// Marker macro for the tracing merge point.

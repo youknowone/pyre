@@ -48,6 +48,13 @@ pub struct MetaInterpFrame {
     /// the still-at-CALL frame.  `None` when no inline call is in progress
     /// from this frame.
     pub call_site_pc: Option<usize>,
+    /// Symbolic callable + arg OpRefs of the CALL that pushed this
+    /// (inline) frame, carried from `PendingInlineFrame`. Consumed by
+    /// the inline back-edge CALL_ASSEMBLER path (`do_recursive_call`)
+    /// to shape the guard resume via `push_call_replay_stack`.
+    /// `OpRef::NONE` / empty on root frames.
+    pub replay_callable: OpRef,
+    pub replay_args: Vec<OpRef>,
 }
 
 impl MetaInterpFrame {
@@ -488,6 +495,10 @@ impl PyreMetaInterp {
                 ctx.truncate_inline_trace_positions(self.inline_trace_base);
                 LoopAction::Return(TraceAction::Abort)
             }
+            super::state::InlineTraceStepAction::Trace(TraceAction::RecursiveCallAssembler {
+                green_key,
+                target_pc,
+            }) => self.opimpl_recursive_call_assembler(ctx, green_key, target_pc),
             super::state::InlineTraceStepAction::Trace(action) => LoopAction::Return(action),
             super::state::InlineTraceStepAction::PushFrame(pending) => {
                 // trace_code_step_inline already took the pending frame
@@ -577,6 +588,8 @@ impl PyreMetaInterp {
             // their own; cleared when this frame becomes a caller via a
             // subsequent inline push.
             call_site_pc: None,
+            replay_callable: pending.replay_callable,
+            replay_args: pending.replay_args,
         };
 
         self.portal_call_depth += 1;
@@ -669,6 +682,162 @@ impl PyreMetaInterp {
         }
 
         // No pending_concrete_push needed — concrete_stack[result_idx] already updated above.
+    }
+
+    /// pyjitpl.py:1565-1602 opimpl_jit_merge_point portal_call_depth>0:
+    /// the inline callee reached its loop back-edge and the loop's green
+    /// key has compiled code. Pop the inline frame without a result
+    /// (finishframe(None, leave_portal_frame=False)), record a
+    /// CALL_ASSEMBLER into the loop token from the parent frame
+    /// (do_recursive_call assembler_call=True), bind the call result to
+    /// the parent's pending result slot (make_result_of_lastop,
+    /// pyjitpl.py:1586-1589), then resume dispatch on the parent
+    /// (ChangeFrame).
+    ///
+    /// RPython's do_residual_call executes the portal runner concretely
+    /// at this point (the callee's remaining iterations run during
+    /// tracing). Pyre traces on a snapshot and re-runs the closed loop's
+    /// iteration on restart, so the callee's remaining execution is
+    /// DEFERRED to the restart — the same contract as deferred
+    /// StoreSubscr/StoreAttr. The result's concrete half is therefore
+    /// Null; a downstream consumer that needs it fails the
+    /// missing-concrete checks and aborts the trace gracefully.
+    /// Convergence path: trace on the live frame (no re-run), then the
+    /// concrete continuation can run here as upstream does.
+    fn opimpl_recursive_call_assembler(
+        &mut self,
+        ctx: &mut TraceCtx,
+        green_key: u64,
+        target_pc: usize,
+    ) -> LoopAction {
+        let token_number = {
+            let (driver, _) = crate::driver::driver_pair();
+            driver.get_loop_token_number(green_key)
+        };
+        // Re-verify with framestack-level data the close_loop_args signal
+        // site cannot see: the callee must own a trace-visible frame
+        // object (CALL_ASSEMBLER red arg) and carry the CALL-site OpRefs
+        // for the guard-resume replay; the parent must be the root frame
+        // with a recorded CALL site.
+        let eligible = token_number.is_some()
+            && self.framestack.len() == 2
+            && {
+                let top = self.framestack.last().unwrap();
+                top.drop_frame_opref.is_some() && top.replay_callable != OpRef::NONE
+            }
+            && self.framestack[0].call_site_pc.is_some();
+        if !eligible {
+            // Fall back to the inline-loop-abort end state (the
+            // trace_step_result_to_action drain): stop tracing the root
+            // key so the callee loop compiles standalone.
+            let root_green_key = ctx.root_green_key();
+            let (driver, _) = crate::driver::driver_pair();
+            driver
+                .meta_interp_mut()
+                .warm_state_mut()
+                .disable_noninlinable_function(root_green_key);
+            if majit_metainterp::majit_log_enabled() {
+                eprintln!(
+                    "[jit][recursive-call-assembler] ineligible, abort: key={} target_pc={} depth={} root={}",
+                    green_key,
+                    target_pc,
+                    self.framestack.len(),
+                    root_green_key,
+                );
+            }
+            ctx.truncate_inline_trace_positions(self.inline_trace_base);
+            return LoopAction::Return(TraceAction::Abort);
+        }
+        let token_number = token_number.unwrap();
+
+        // Virtualizable write_boxes on the callee frame (pre-pop): the
+        // compiled loop reads locals_cells_stack_w / last_instr /
+        // valuestackdepth from the frame object at entry.
+        {
+            let top = self.framestack.last_mut().unwrap();
+            let frame_opref = top.drop_frame_opref.unwrap();
+            let sym = unsafe { &mut *top.sym };
+            let vsd = top
+                .owned_concrete_frame
+                .as_ref()
+                .map(|cf| cf.valuestackdepth)
+                .unwrap_or(sym.valuestackdepth)
+                .max(sym.nlocals);
+            super::trace_opcode::gen_writeback_inline_frame_to_heap(
+                ctx, sym, frame_opref, target_pc, vsd,
+            );
+        }
+
+        // pyjitpl.py:1581 finishframe(None, leave_portal_frame=False).
+        let popped = self.framestack.pop().unwrap();
+        self.portal_call_depth -= 1;
+        ctx.pop_inline_trace_position();
+        {
+            let (driver, _) = crate::driver::driver_pair();
+            driver.leave_inline_frame();
+        }
+        let frame_opref = popped.drop_frame_opref.unwrap();
+
+        // pyjitpl.py:1590 frame.do_recursive_call(assembler_call=True) on
+        // the parent frame.
+        let parent = self.framestack.last_mut().unwrap();
+        let call_pc = parent.call_site_pc.take().unwrap();
+        let code = unsafe {
+            &*(pyre_interpreter::w_code_get_ptr(parent.jitcode as pyre_object::PyObjectRef)
+                as *const pyre_interpreter::CodeObject)
+        };
+        let cf_addr = parent.concrete_frame_addr();
+        let parent_frames = parent.parent_frames.clone();
+        let parent_sym = unsafe { &mut *parent.sym };
+        let fallthrough_pc = semantic_fallthrough_pc(code, call_pc);
+        let ca_result = {
+            let mut fs = MIFrame::from_sym(ctx, parent_sym, cf_addr, fallthrough_pc, call_pc);
+            fs.parent_frames = parent_frames;
+            fs.do_recursive_call_assembler(
+                token_number,
+                frame_opref,
+                popped.replay_callable,
+                &popped.replay_args,
+                call_pc,
+            )
+        };
+
+        // pyjitpl.py:1592 leave_portal_frame — after the call, mirroring
+        // finishframe_inline's vref close + callee-frame drop.
+        let parent_sym = unsafe { &mut *self.framestack.last().unwrap().sym };
+        super::state::opimpl_virtual_ref_finish(ctx, parent_sym, frame_opref);
+        ctx.call_void(
+            crate::callbacks::get().jit_drop_callee_frame,
+            &[frame_opref],
+        );
+
+        match ca_result {
+            Ok(result) => {
+                if majit_metainterp::majit_log_enabled() {
+                    eprintln!(
+                        "[jit][recursive-call-assembler] emitted: key={} target_pc={} token={} call_pc={}",
+                        green_key, target_pc, token_number, call_pc,
+                    );
+                }
+                // make_result_of_lastop (pyjitpl.py:1586-1589). Concrete
+                // half stays Null — see the method doc.
+                if let Some(result_idx) = popped.caller_result_stack_idx {
+                    super::trace_opcode::write_stack_slot(
+                        parent_sym,
+                        ctx,
+                        result_idx,
+                        result,
+                        ConcreteValue::Null,
+                    );
+                }
+                // ChangeFrame: resume dispatch on the parent.
+                LoopAction::Continue
+            }
+            Err(_) => {
+                ctx.truncate_inline_trace_positions(self.inline_trace_base);
+                LoopAction::Return(TraceAction::Abort)
+            }
+        }
     }
 
     // ── Concrete execution helpers ───────────────────────────────

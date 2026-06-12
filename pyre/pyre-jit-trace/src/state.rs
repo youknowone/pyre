@@ -8511,6 +8511,9 @@ mod tests {
                 callee_frame_helper: |_| None,
                 recursive_force_cache_safe: |_| false,
                 jit_drop_callee_frame: std::ptr::null(),
+                jit_frame_set_slot_ref: std::ptr::null(),
+                jit_frame_set_slot_int: std::ptr::null(),
+                jit_frame_set_slot_float: std::ptr::null(),
                 jit_force_callee_frame: std::ptr::null(),
                 jit_force_recursive_call_1: std::ptr::null(),
                 jit_force_recursive_call_argraw_boxed_1: std::ptr::null(),
@@ -11164,6 +11167,15 @@ pub struct PendingInlineFrame {
     pub nargs: usize,
     pub caller_result_stack_idx: Option<usize>,
     pub caller_result_type: Option<Type>,
+    /// Symbolic callable + arg OpRefs of the CALL that pushed this frame.
+    /// Consumed by the inline back-edge CALL_ASSEMBLER path
+    /// (`do_recursive_call`) to shape the GuardNotForced /
+    /// GuardNoException resume via `push_call_replay_stack` — on guard
+    /// failure the parent re-executes the CALL, mirroring the residual
+    /// call capture. `OpRef::NONE` when the path is unavailable
+    /// (bridge-reconstructed frames).
+    pub replay_callable: OpRef,
+    pub replay_args: Vec<OpRef>,
 }
 
 /// Reify one Ref-bank recipe slot as the boxed `W_Root` pointer that
@@ -11302,6 +11314,11 @@ pub(crate) fn assemble_bridge_inline_pending(
         nargs: recipe.nargs,
         caller_result_stack_idx: None,
         caller_result_type: Some(Type::Ref),
+        // Reconstructed frames carry no CALL-site OpRefs; the inline
+        // back-edge CALL_ASSEMBLER path requires drop_frame_opref and
+        // is gated out for them anyway.
+        replay_callable: OpRef::NONE,
+        replay_args: Vec::new(),
     }
 }
 
