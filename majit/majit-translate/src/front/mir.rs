@@ -1875,29 +1875,35 @@ impl<'a> Lowering<'a> {
             }
             ProjectionElem::Tagged(v) => {
                 if let Some(field_payload) = v.as_object().and_then(|m| m.get("Field")) {
-                    // Adt-container writes resolve the declared field
-                    // name / owner / type, mirroring the typed
-                    // `FieldRead` arm in `resolve_place` — an
-                    // asymmetric synthetic label (`Adt_<idx>`) would
-                    // make the rtyper's `getfieldrepr` miss the attr
-                    // the paired read registered under its real name.
-                    if let Some((owner_root, field_name, _field_ty)) =
-                        self.resolve_adt_field(field_payload)
-                    {
-                        OpKind::FieldWrite {
-                            base,
-                            field: FieldDescriptor::new(field_name, Some(owner_root)),
-                            value,
-                            ty: tyref_to_value_type(dest_ty, self.llbc),
-                        }
-                    } else {
-                        let label = field_label_from_payload(field_payload);
-                        OpKind::FieldWrite {
-                            base,
-                            field: FieldDescriptor::new(label, None),
-                            value,
-                            ty: ValueType::Int,
-                        }
+                    // Resolve the field through its TypeDecl exactly
+                    // like the read side (`resolve_place` Field arm):
+                    // the descriptor must carry the same
+                    // (`field_name`, `owner_root`) shape or no
+                    // downstream owner-keyed consumer can match it —
+                    // jtransform's vable matcher rejects a `None`
+                    // owner against an owner-rooted config, so e.g.
+                    // `PyFrame.valuestackdepth` writes stayed plain
+                    // `setfield` while the paired reads rewrote to
+                    // `getfield_vable`.  The Adt case derives the
+                    // written value's kind from `dest_ty` (a Ref field
+                    // must not be stamped `Int`); the bare-label
+                    // fallback keeps non-Adt containers lowering as
+                    // before.
+                    let (field, ty) = match self.resolve_adt_field(field_payload) {
+                        Some((owner_root, field_name, _field_ty)) => (
+                            FieldDescriptor::new(field_name, Some(owner_root)),
+                            tyref_to_value_type(dest_ty, self.llbc),
+                        ),
+                        None => (
+                            FieldDescriptor::new(field_label_from_payload(field_payload), None),
+                            ValueType::Int,
+                        ),
+                    };
+                    OpKind::FieldWrite {
+                        base,
+                        field,
+                        value,
+                        ty,
                     }
                 } else if let Some(index_payload) = v.as_object().and_then(|m| m.get("Index")) {
                     let idx_var = self.index_offset_var(mir_bb, index_payload)?;
