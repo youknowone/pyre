@@ -1506,10 +1506,19 @@ pub fn lltype_cast_pointer(
         ));
     };
     let cdef = ClassDesc::getuniqueclassdef(class_desc)?;
-    let can_be_none = matches!(
-        arg_at(args_s, 1, "lltype_cast_pointer"),
-        SomeValue::Instance(inst) if inst.can_be_none
-    );
+    // `assert isinstance(s_p, SomePtr)` (lltype.py:971) — the operand
+    // must be a pointer carrier.  Pyre's carriers are `SomePtr` and
+    // `SomeInstance` (classed cast targets and classdef-less erased
+    // pointers); anything else is a non-pointer cast.
+    let can_be_none = match arg_at(args_s, 1, "lltype_cast_pointer") {
+        SomeValue::Instance(inst) => inst.can_be_none,
+        SomeValue::Ptr(_) => false,
+        other => {
+            return Err(AnnotatorError::new(format!(
+                "cast_pointer(): casting of non-pointer: {other:?}"
+            )));
+        }
+    };
     Ok(SomeValue::Instance(SomeInstance::new(
         Some(cdef),
         can_be_none,
@@ -1940,6 +1949,24 @@ mod tests {
                 .as_deref()
                 .unwrap_or("")
                 .contains("constant class PBC"),
+        );
+    }
+
+    #[test]
+    fn lltype_cast_pointer_rejects_non_pointer_operand() {
+        // `assert isinstance(s_p, SomePtr)` (lltype.py:971) — a
+        // non-pointer second argument is rejected, not silently
+        // annotated as the target class.
+        let bk = bk();
+        let host = bk.intern_class_by_qualname("W_CastTarget");
+        let s_cls = bk.immutablevalue(&ConstValue::HostObject(host)).unwrap();
+        let s_int = bk.immutablevalue(&ConstValue::Int(1)).unwrap();
+        let err = lltype_cast_pointer(&bk, &[Some(s_cls), Some(s_int)], &no_kwds()).unwrap_err();
+        assert!(
+            err.msg
+                .as_deref()
+                .unwrap_or("")
+                .contains("casting of non-pointer"),
         );
     }
 

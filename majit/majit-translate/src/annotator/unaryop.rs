@@ -3670,17 +3670,27 @@ fn init_someinstance_overrides(
                 // CallTarget::Method), so getattr must return the
                 // callable bound method — returning a bare `SomeBool`
                 // would seat a non-callable in the simple_call callee
-                // slot.  Checked BEFORE the classdef projection: a
-                // `cast_pointer`-typed receiver (`SomeInstance(cd)`
-                // from `obj as *const W_Foo`) is still a raw pointer
-                // at the source level, and no pyre struct defines an
-                // `is_null` member that the bound method could shadow.
+                // slot.  Upstream keeps this on `SomePtr.getattr`
+                // (lltype.py:1531) and `SomeInstance.getattr`
+                // (unaryop.py:833) never sees it; pyre carries both
+                // erased pointers (classdef-less) and `cast_pointer`-
+                // typed receivers (`SomeInstance(cd)` from `obj as
+                // *const W_Foo`) as `SomeInstance`, so the ptr method
+                // answers only when the class hierarchy does not
+                // itself define `is_null` — a real member keeps
+                // upstream's classdef dispatch below.
                 if attr == "is_null" {
-                    return SomeValue::BuiltinMethod(SomeBuiltinMethod::new(
-                        "ptr_method_is_null",
-                        s_self.clone(),
-                        "is_null",
-                    ));
+                    let class_defines_attr = inst.classdef.as_ref().is_some_and(|cd| {
+                        let classdesc = cd.borrow().classdesc.clone();
+                        super::classdesc::ClassDesc::lookup(&classdesc, "is_null").is_some()
+                    });
+                    if !class_defines_attr {
+                        return SomeValue::BuiltinMethod(SomeBuiltinMethod::new(
+                            "ptr_method_is_null",
+                            s_self.clone(),
+                            "is_null",
+                        ));
+                    }
                 }
                 let classdef = match inst.classdef.as_ref() {
                     Some(cd) => cd,
@@ -5472,6 +5482,85 @@ mod tests {
         assert!(
             matches!(*method.s_self, SomeValue::Instance(_)),
             "bound method must carry the erased receiver"
+        );
+    }
+
+    #[test]
+    fn classed_instance_getattr_is_null_dispatch() {
+        // The ptr-method arm answers a classed receiver (`SomeInstance(cd)`
+        // from `cast_pointer`) only while the class hierarchy defines no
+        // `is_null` of its own — a real classdict member keeps upstream's
+        // `SomeInstance.getattr` classdef dispatch (unaryop.py:833).
+        use super::super::classdesc::{ClassDef, ClassDictEntry};
+        use super::super::model::SomeInstance;
+        let ann = mk_ann();
+
+        // No `is_null` member → the ptr method answers.
+        let bare = ClassDef::new_standalone("pkg.W_Bare", None);
+        let mut v = Variable::named("p");
+        ann.setbinding(
+            &mut v,
+            SomeValue::Instance(SomeInstance::new(
+                Some(bare),
+                false,
+                std::collections::BTreeMap::new(),
+            )),
+        );
+        let hl = HLOperation::new(
+            OpKind::GetAttr,
+            vec![
+                Hlvalue::Variable(v),
+                Hlvalue::Constant(Constant::new(ConstValue::byte_str("is_null"))),
+            ],
+        );
+        let result = hl.consider(&ann).expect("getattr must succeed").unwrap();
+        let SomeValue::BuiltinMethod(method) = result else {
+            panic!("expected the ptr bound method on a member-less class");
+        };
+        assert_eq!(method.analyser_name, "ptr_method_is_null");
+
+        // A real `is_null` classdict member shadows the ptr method and
+        // resolves through the classdef.  Built against the annotator's
+        // live bookkeeper (`new_standalone` drops its own, and the
+        // classdef path needs the backlink for `s_get_value`).
+        use super::super::classdesc::ClassDesc;
+        let pyobj = super::super::super::flowspace::model::HostObject::new_class(
+            "pkg.W_Shadow",
+            Vec::new(),
+        );
+        let classdesc = std::rc::Rc::new(std::cell::RefCell::new(ClassDesc::new_shell(
+            &ann.bookkeeper,
+            pyobj,
+            "pkg.W_Shadow".to_string(),
+        )));
+        let shadowing = ClassDef::new(&ann.bookkeeper, &classdesc);
+        classdesc.borrow_mut().classdict.insert(
+            "is_null".to_string(),
+            ClassDictEntry::constant(ConstValue::Int(7)),
+        );
+        let mut v2 = Variable::named("q");
+        ann.setbinding(
+            &mut v2,
+            SomeValue::Instance(SomeInstance::new(
+                Some(shadowing),
+                false,
+                std::collections::BTreeMap::new(),
+            )),
+        );
+        let hl2 = HLOperation::new(
+            OpKind::GetAttr,
+            vec![
+                Hlvalue::Variable(v2),
+                Hlvalue::Constant(Constant::new(ConstValue::byte_str("is_null"))),
+            ],
+        );
+        let result2 = hl2.consider(&ann).expect("getattr must succeed").unwrap();
+        assert!(
+            !matches!(
+                &result2,
+                SomeValue::BuiltinMethod(m) if m.analyser_name == "ptr_method_is_null"
+            ),
+            "a class member named is_null must win over the ptr method, got {result2:?}"
         );
     }
 
