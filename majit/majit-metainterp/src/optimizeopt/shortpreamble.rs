@@ -2129,31 +2129,29 @@ impl ShortPreambleBuilder {
     /// shortpreamble.py:382-407: use_box(box, preamble_op, optimizer)
     /// Non-recursive. Called by force_op_from_preamble (unroll.py:32).
     ///
-    /// RPython passes `preamble_op.preamble_op` directly — no lookup miss
-    /// possible. majit prefers the produced_short_boxes lookup (which may
-    /// carry a Phase-2 remapped pos), and falls back to `fallback_op` from
-    /// info::PreambleOp when absent.
+    /// RPython passes `preamble_op.preamble_op` directly — the replay op
+    /// IS the carried object, so there is no entry-selection lookup. The
+    /// pop's replay Rc is the builder's own object (threaded by the
+    /// produce_op family), verified by the debug probe below.
     pub fn use_box(
         &mut self,
         source: OpRef,
-        fallback_op: &Op,
+        preamble_op: &majit_ir::OpRc,
         arg_guards: &[Op],
         result_guards: &[Op],
     ) {
-        let preamble_op = match self.produced_short_boxes.get(&source) {
-            Some(produced) => produced.preamble_op.clone(),
-            None => {
-                if crate::optimizeopt::majit_log_enabled() {
-                    eprintln!(
-                        "[jit][use_box] produced_short_boxes miss for {source:?}, using fallback"
-                    );
-                }
-                std::rc::Rc::new(fallback_op.clone())
-            }
-        };
+        #[cfg(debug_assertions)]
+        if let Some(produced) = self.produced_short_boxes.get(&source) {
+            debug_assert!(
+                std::rc::Rc::ptr_eq(&produced.preamble_op, preamble_op),
+                "use_box pop replay diverged from builder entry at {source:?}"
+            );
+        }
+        #[cfg(not(debug_assertions))]
+        let _ = source;
         let pos_to_key = build_pos_to_key(&self.produced_short_boxes);
         self.state.use_box(
-            &preamble_op,
+            preamble_op,
             &VecSet::new(),
             &self.produced_short_boxes,
             &pos_to_key,
@@ -2704,28 +2702,26 @@ impl ExtendedShortPreambleBuilder {
     /// shortpreamble.py:478-481: use_box — pop JUMP, add deps, re-append JUMP.
     /// Called by force_op_from_preamble (unroll.py:32).
     ///
-    /// RPython passes `preamble_op.preamble_op` directly. majit uses the
-    /// produced_short_boxes lookup for the Phase-2 remapped op, with
-    /// `fallback_op` from info::PreambleOp as the safety net.
+    /// RPython passes `preamble_op.preamble_op` directly — the pop's
+    /// replay Rc is the carried object (threaded by the produce_op
+    /// family); the debug probe checks it against the builder entry.
     pub fn use_box(
         &mut self,
         source: OpRef,
-        fallback_op: &Op,
+        preamble_op: &majit_ir::OpRc,
         arg_guards: &[Op],
         result_guards: &[Op],
     ) {
-        let raw_op = match self.produced_short_boxes.get(&source) {
-            Some(produced) => (*produced.preamble_op).clone(),
-            None => {
-                if crate::optimizeopt::majit_log_enabled() {
-                    eprintln!(
-                        "[jit][use_box ext] produced_short_boxes miss for {source:?}, using fallback"
-                    );
-                }
-                fallback_op.clone()
-            }
-        };
-        let preamble_op = self.remap_op(&raw_op);
+        #[cfg(debug_assertions)]
+        if let Some(produced) = self.produced_short_boxes.get(&source) {
+            debug_assert!(
+                std::rc::Rc::ptr_eq(&produced.preamble_op, preamble_op),
+                "ext use_box pop replay diverged from builder entry at {source:?}"
+            );
+        }
+        #[cfg(not(debug_assertions))]
+        let _ = source;
+        let preamble_op = self.remap_op(preamble_op);
         let canonical = preamble_op.pos.get();
         // shortpreamble.py:479: jump_op = self.short.pop()
         let jump_op = self.short.pop();
