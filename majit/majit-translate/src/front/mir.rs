@@ -4641,6 +4641,21 @@ fn charon_type_value_to_ast_string(v: &serde_json::Value, llbc: &Llbc, depth: us
             charon_type_value_to_ast_string(elem, llbc, depth + 1)
         );
     }
+    // Trait associated-type projections (`C::Name`).  The decl-level
+    // type cannot spell a concrete type, but the program-level
+    // resolution is recoverable when the LLBC carries exactly ONE impl
+    // of the trait: the impl's `types[]` binds each associated type to
+    // its concrete value (e.g. `impl Constant for ConstantData { type
+    // Name = String }` → `CodeObject<C>`'s `varnames: Box<[C::Name]>`
+    // row renders `Box<[String]>`).  Ambiguous (multi-impl) or
+    // unresolvable projections keep the `??TraitType` fallback below,
+    // so a lookup miss stays conservative.
+    if let Some(arr) = obj.get("TraitType").and_then(serde_json::Value::as_array)
+        && arr.len() == 2
+        && let Some(rendered) = resolve_trait_assoc_type(&arr[0], &arr[1], llbc, depth)
+    {
+        return rendered;
+    }
     // `dyn Trait` -> `dyn <trait-root>`; recover the trait's leaf name
     // from the first trait-ref's resolved decl when present.
     if obj.contains_key("DynTrait") {
@@ -4654,6 +4669,78 @@ fn charon_type_value_to_ast_string(v: &serde_json::Value, llbc: &Llbc, depth: us
     }
     let key = obj.keys().next().cloned().unwrap_or_else(|| "?".into());
     format!("??{key}")
+}
+
+/// Resolve a `TraitType [traitref, assoc]` projection through the
+/// trait's unique impl, rendering the bound concrete type.
+///
+/// `traitref` names the trait via `trait_decl_ref.skip_binder.id`
+/// (possibly behind `HashConsedValue`/`Deduplicated` indirections);
+/// `assoc` selects the associated item (an index in current Charon
+/// output).  Returns `None` — keeping the caller's `??TraitType`
+/// fallback — when the trait id cannot be recovered, when zero or
+/// more than one impl of the trait exists in this LLBC (a multi-impl
+/// projection is genuinely instantiation-dependent), or when the
+/// unique impl carries no binding for the selected item.
+fn resolve_trait_assoc_type(
+    traitref: &serde_json::Value,
+    assoc: &serde_json::Value,
+    llbc: &Llbc,
+    depth: usize,
+) -> Option<String> {
+    let trait_id = traitref_decl_id(traitref, llbc, 0)?;
+    let mut unique: Option<&serde_json::Value> = None;
+    for ti in llbc.trait_impls_raw() {
+        let Some(impl_trait) = ti.get("impl_trait") else {
+            continue;
+        };
+        if impl_trait.get("id").and_then(serde_json::Value::as_u64) != Some(trait_id) {
+            continue;
+        }
+        if unique.is_some() {
+            return None;
+        }
+        unique = Some(ti);
+    }
+    let entries = unique?.get("types")?.as_array()?;
+    for entry in entries {
+        let Some(kind) = entry
+            .get("kind")
+            .and_then(|k| k.get("TraitType"))
+            .and_then(serde_json::Value::as_array)
+        else {
+            continue;
+        };
+        if kind.len() == 2 && &kind[1] == assoc {
+            let value = entry.get("skip_binder")?.get("value")?;
+            return Some(charon_type_value_to_ast_string(value, llbc, depth + 1));
+        }
+    }
+    None
+}
+
+/// Recover the trait decl id a `TraitRef` names —
+/// `trait_decl_ref.skip_binder.id`, behind the usual
+/// `HashConsedValue` / `Deduplicated` indirections.
+fn traitref_decl_id(v: &serde_json::Value, llbc: &Llbc, depth: usize) -> Option<u64> {
+    if depth > 8 {
+        return None;
+    }
+    let obj = v.as_object()?;
+    if let Some(id) = obj.get("Deduplicated").and_then(serde_json::Value::as_u64) {
+        return traitref_decl_id(llbc.dedup_body(id)?, llbc, depth + 1);
+    }
+    if let Some(arr) = obj
+        .get("HashConsedValue")
+        .and_then(serde_json::Value::as_array)
+        && arr.len() == 2
+    {
+        return traitref_decl_id(&arr[1], llbc, depth + 1);
+    }
+    obj.get("trait_decl_ref")?
+        .get("skip_binder")?
+        .get("id")?
+        .as_u64()
 }
 
 /// Render a Charon `DynTrait` body to `dyn <trait-leaf>`.  Falls back to
@@ -5199,7 +5286,8 @@ fn scalar_value_to_i64(v: &serde_json::Value) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::harden_duplicate_leaf_metadata;
-    use super::{cast_kind_is_raw_ptr, cast_pointer_marker_op};
+    use super::{cast_kind_is_raw_ptr, cast_pointer_marker_op, charon_type_value_to_ast_string};
+    use majit_charon_reader::Llbc;
 
     #[test]
     fn cast_pointer_marker_carries_root_in_path_and_result_type() {
@@ -5222,6 +5310,87 @@ mod tests {
         );
         assert_eq!(args, vec![arg]);
         assert_eq!(result_ty, ValueType::Ref(Some("W_CastTarget".to_string())));
+    }
+
+    /// Minimal `Llbc` carrying only `trait_impls` — the surface
+    /// [`resolve_trait_assoc_type`] consults.
+    fn llbc_with_trait_impls(trait_impls: serde_json::Value) -> Llbc {
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [],
+                "fun_decls": [],
+                "global_decls": [],
+                "trait_decls": [],
+                "trait_impls": trait_impls,
+            }
+        });
+        Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses")
+    }
+
+    #[test]
+    fn trait_assoc_type_resolves_via_unique_impl() {
+        // `C::Name` with `impl Trait#1 for X { type Name = bool }` as
+        // the LLBC's only impl of trait 1 renders the bound type.
+        let llbc = llbc_with_trait_impls(serde_json::json!([
+            null,
+            {
+                "impl_trait": { "id": 1 },
+                "types": [{
+                    "kind": { "TraitType": [1, 0] },
+                    "skip_binder": { "value": { "Literal": "Bool" } }
+                }]
+            }
+        ]));
+        let projection = serde_json::json!({
+            "TraitType": [
+                { "trait_decl_ref": { "skip_binder": { "id": 1 } } },
+                0
+            ]
+        });
+        assert_eq!(
+            charon_type_value_to_ast_string(&projection, &llbc, 0),
+            "bool"
+        );
+    }
+
+    #[test]
+    fn trait_assoc_type_keeps_fallback_when_impl_ambiguous_or_missing() {
+        // Two impls of trait 1 → instantiation-dependent → fallback.
+        let two_impls = llbc_with_trait_impls(serde_json::json!([
+            {
+                "impl_trait": { "id": 1 },
+                "types": [{
+                    "kind": { "TraitType": [1, 0] },
+                    "skip_binder": { "value": { "Literal": "Bool" } }
+                }]
+            },
+            {
+                "impl_trait": { "id": 1 },
+                "types": [{
+                    "kind": { "TraitType": [1, 0] },
+                    "skip_binder": { "value": { "Literal": "Char" } }
+                }]
+            }
+        ]));
+        let projection = serde_json::json!({
+            "TraitType": [
+                { "trait_decl_ref": { "skip_binder": { "id": 1 } } },
+                0
+            ]
+        });
+        assert_eq!(
+            charon_type_value_to_ast_string(&projection, &two_impls, 0),
+            "??TraitType"
+        );
+        // No impl at all → fallback too.
+        let no_impls = llbc_with_trait_impls(serde_json::json!([]));
+        assert_eq!(
+            charon_type_value_to_ast_string(&projection, &no_impls, 0),
+            "??TraitType"
+        );
     }
 
     #[test]

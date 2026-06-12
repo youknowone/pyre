@@ -191,6 +191,21 @@ impl Llbc {
             .filter_map(Option::as_ref)
     }
 
+    /// The raw `trait_impls` table (schema-opaque; entries may be
+    /// `null`).  Consumed by the front-end's trait-associated-type
+    /// resolution: an `impl Trait for T` entry binds each associated
+    /// type (`kind: {"TraitType": [trait_id, idx]}`) to a concrete
+    /// type in its `types[].skip_binder.value`.
+    pub fn trait_impls_raw(&self) -> &[serde_json::Value] {
+        self.file
+            .translated
+            .rest
+            .get("trait_impls")
+            .and_then(serde_json::Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
     /// Iterate over every present `FunDecl` (skipping opaque `null` entries).
     pub fn iter_local_fns(&self) -> impl Iterator<Item = &FunDecl> {
         self.file
