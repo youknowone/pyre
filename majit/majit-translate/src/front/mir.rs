@@ -87,8 +87,8 @@ use majit_charon_reader::{
     Llbc,
     ullbc::{
         BasicBlock, CallClass, CallFunc, CallKind, CallPayload, FunDecl, FunId, NameSeg, Operand,
-        Place, PlaceKind, ProjectionElem, Rvalue, StmtKind, SwitchTargets, TermKind, TyRef,
-        TypeDeclKind, Unstructured,
+        Place, PlaceKind, ProjectionElem, RegularCall, Rvalue, StmtKind, SwitchTargets, TermKind,
+        TyRef, TypeDeclKind, Unstructured,
     },
 };
 
@@ -2817,6 +2817,21 @@ impl<'a> Lowering<'a> {
         let op_kind = match (class, call.func) {
             (CallClass::Direct, CallFunc::Regular(reg))
             | (CallClass::Trait, CallFunc::Regular(reg)) => {
+                // Reflexive blanket `into` — the callsite selected
+                // `impl<T> From<T> for T`, a pure `T -> T` identity
+                // conversion.  Bind the destination local to the
+                // argument directly (same shape as a transparent
+                // ctor alias) instead of emitting a call to core's
+                // identity body, which is not a registered callee.
+                if args.len() == 1
+                    && matches!(self.blanket_into_devirt(&reg), Some(IntoDevirt::Identity))
+                {
+                    self.local_var[dest_local] = Some(args[0].clone());
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
                 // Resolve the target function's fully-qualified path
                 // through the FunId → FunDecl table. `Trait` here is
                 // Charon's "trait-bound generic resolved at extraction
@@ -2833,7 +2848,7 @@ impl<'a> Lowering<'a> {
                 // and any `.field` projection on it panics at
                 // `unaryop.rs:3587` (lib test
                 // `generic_handler_graphs_keep_symbolic_fnaddr_surface`).
-                let (segments, method_hint) = self.call_target_segments(mir_bb, &reg.kind)?;
+                let (segments, method_hint) = self.call_target_segments(mir_bb, &reg)?;
                 // `CallTarget::Method` requires a receiver in `args[0]`
                 // (the flowspace adapter lowers it to `getattr(recv,
                 // method_leaf) → simple_call(bound_method, …)`).
@@ -2942,13 +2957,25 @@ impl<'a> Lowering<'a> {
     fn call_target_segments(
         &self,
         mir_bb: usize,
-        kind: &CallKind,
+        reg: &RegularCall,
     ) -> Result<(Vec<String>, Option<(String, String)>), LowerError> {
-        match kind {
+        match &reg.kind {
             CallKind::Fun(FunId::Regular { id }) => self
                 .llbc
                 .fn_by_id(*id)
                 .map(|fd| {
+                    // Blanket `impl<T, U: From<T>> Into<U> for T`
+                    // (core::convert) — `x.into()` is `U::from(x)`.
+                    // The callsite's resolved `U: From<T>` obligation
+                    // names the concrete From impl, so devirtualize to
+                    // that impl's `from` the way rustc's
+                    // monomorphization does.  The blanket body itself
+                    // is generic-trait shaped and never lifts.  (The
+                    // reflexive `Identity` outcome is intercepted at
+                    // `lower_call` before reaching here.)
+                    if let Some(IntoDevirt::Target(segments)) = self.blanket_into_devirt(reg) {
+                        return (segments, None);
+                    }
                     let segments: Vec<String> = fd
                         .item_meta
                         .name_path()
@@ -3089,6 +3116,104 @@ impl<'a> Lowering<'a> {
             return None;
         }
         Some((owner_leaf, leaf))
+    }
+
+    /// Devirtualize a callsite of the blanket
+    /// `impl<T, U: From<T>> Into<U> for T` (`core::convert::<Impl>::into`).
+    ///
+    /// The callsite's `generics.trait_refs` carries the resolved
+    /// `U: From<T>` obligation as a trait ref whose `trait_decl_ref`
+    /// names `core::convert::From` and whose `kind` is
+    /// `TraitImpl { id }` — the def_id of the selected `impl From<T>
+    /// for U`.  Two outcomes:
+    ///
+    /// - The obligation's decl-ref type args are equal (`T == U`):
+    ///   the reflexive `impl<T> From<T> for T` was selected and the
+    ///   whole conversion is a `T -> T` identity —
+    ///   [`IntoDevirt::Identity`].
+    /// - Otherwise the impl's `methods` table binds the single `From`
+    ///   method to the concrete `from` FunDecl, whose path is the
+    ///   devirtualized call target — [`IntoDevirt::Target`].  `from`
+    ///   is an associated function (no `self` receiver), so the
+    ///   caller must keep the `FunctionPath` shape (a
+    ///   `CallTarget::Method` hint would bind the *argument* as a
+    ///   receiver).
+    ///
+    /// Returns `None` (caller keeps the blanket-into path) when the
+    /// obligation is unresolved (`kind` is a clause/builtin rather
+    /// than `TraitImpl`) or any table lookup misses.
+    fn blanket_into_devirt(&self, reg: &RegularCall) -> Option<IntoDevirt> {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return None;
+        };
+        let is_blanket_into = self
+            .llbc
+            .fn_by_id(*id)
+            .is_some_and(|fd| fd.item_meta.name_path() == "core::convert::<Impl>::into");
+        if !is_blanket_into {
+            return None;
+        }
+        let trait_refs = reg.generics.get("trait_refs")?.as_array()?;
+        for tref in trait_refs {
+            let Some(tref) = traitref_unwrap(tref, self.llbc, 0) else {
+                continue;
+            };
+            let Some(decl) = tref
+                .get("trait_decl_ref")
+                .and_then(|d| d.get("skip_binder"))
+            else {
+                continue;
+            };
+            let Some(decl_id) = decl.get("id").and_then(serde_json::Value::as_u64) else {
+                continue;
+            };
+            let is_from = self
+                .llbc
+                .trait_by_id(decl_id)
+                .is_some_and(|td| td.item_meta.name_path() == "core::convert::From");
+            if !is_from {
+                continue;
+            }
+            // `U: From<T>` decl-ref generics carry `[U, T]`; equal
+            // args select the reflexive blanket impl.  Compare by
+            // hash-cons id so an inline `HashConsedValue: [id, …]`
+            // matches its `Deduplicated: id` reference.
+            let types = decl.get("generics")?.get("types")?.as_array()?;
+            if types.len() == 2 {
+                let reflexive = match (ty_dedup_key(&types[0]), ty_dedup_key(&types[1])) {
+                    (Some(a), Some(b)) => a == b,
+                    _ => types[0] == types[1],
+                };
+                if reflexive {
+                    return Some(IntoDevirt::Identity);
+                }
+            }
+            let impl_id = traitref_impl_id(tref, self.llbc, 0)?;
+            let ti = self
+                .llbc
+                .file
+                .translated
+                .rest
+                .get("trait_impls")?
+                .as_array()?
+                .get(impl_id as usize)?;
+            let fn_id = ti.get("methods")?.as_array()?.iter().find_map(|m| {
+                let tm = m.get("kind")?.get("TraitMethod")?.as_array()?;
+                if tm.first()?.as_u64()? != decl_id {
+                    return None;
+                }
+                m.get("skip_binder")?.get("id")?.as_u64()
+            })?;
+            let fd = self.llbc.fn_by_id(fn_id)?;
+            let segments: Vec<String> = fd
+                .item_meta
+                .name_path()
+                .split("::")
+                .map(|s| s.to_string())
+                .collect();
+            return Some(IntoDevirt::Target(segments));
+        }
+        None
     }
 
     /// Decode the receiver type's ADT `def_id` from an `Impl` NameSeg
@@ -4741,6 +4866,74 @@ fn traitref_decl_id(v: &serde_json::Value, llbc: &Llbc, depth: usize) -> Option<
         .get("skip_binder")?
         .get("id")?
         .as_u64()
+}
+
+/// Recover the trait *impl* id a resolved `TraitRef` selected —
+/// `kind.TraitImpl.id`, behind the usual `HashConsedValue` /
+/// `Deduplicated` indirections.  `None` when the ref is still a
+/// clause/builtin obligation rather than a selected impl.
+fn traitref_impl_id(v: &serde_json::Value, llbc: &Llbc, depth: usize) -> Option<u64> {
+    if depth > 8 {
+        return None;
+    }
+    let obj = v.as_object()?;
+    if let Some(id) = obj.get("Deduplicated").and_then(serde_json::Value::as_u64) {
+        return traitref_impl_id(llbc.dedup_body(id)?, llbc, depth + 1);
+    }
+    if let Some(arr) = obj
+        .get("HashConsedValue")
+        .and_then(serde_json::Value::as_array)
+        && arr.len() == 2
+    {
+        return traitref_impl_id(&arr[1], llbc, depth + 1);
+    }
+    obj.get("kind")?.get("TraitImpl")?.get("id")?.as_u64()
+}
+
+/// Unwrap a `TraitRef`'s `HashConsedValue` / `Deduplicated` indirections
+/// to the underlying trait-ref object.
+fn traitref_unwrap<'a>(
+    v: &'a serde_json::Value,
+    llbc: &'a Llbc,
+    depth: usize,
+) -> Option<&'a serde_json::Value> {
+    if depth > 8 {
+        return None;
+    }
+    let obj = v.as_object()?;
+    if let Some(id) = obj.get("Deduplicated").and_then(serde_json::Value::as_u64) {
+        return traitref_unwrap(llbc.dedup_body(id)?, llbc, depth + 1);
+    }
+    if let Some(arr) = obj
+        .get("HashConsedValue")
+        .and_then(serde_json::Value::as_array)
+        && arr.len() == 2
+    {
+        return traitref_unwrap(&arr[1], llbc, depth + 1);
+    }
+    Some(v)
+}
+
+/// Hash-cons identity of a type expression: the `Deduplicated` id or
+/// the inline `HashConsedValue: [id, …]` id.  Two type refs with the
+/// same key denote the same monomorphized type.
+fn ty_dedup_key(v: &serde_json::Value) -> Option<u64> {
+    let obj = v.as_object()?;
+    if let Some(id) = obj.get("Deduplicated").and_then(serde_json::Value::as_u64) {
+        return Some(id);
+    }
+    obj.get("HashConsedValue")?.as_array()?.first()?.as_u64()
+}
+
+/// Outcome of devirtualizing a blanket `core::convert::<Impl>::into`
+/// callsite — see `Lowering::blanket_into_devirt`.
+enum IntoDevirt {
+    /// The reflexive `impl<T> From<T> for T` was selected — the call
+    /// is a `T -> T` identity conversion.
+    Identity,
+    /// A concrete `impl From<T> for U` was selected; the segments are
+    /// its `from` function's path.
+    Target(Vec<String>),
 }
 
 /// Render a Charon `DynTrait` body to `dyn <trait-leaf>`.  Falls back to
