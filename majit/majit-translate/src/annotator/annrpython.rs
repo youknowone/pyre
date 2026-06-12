@@ -1472,7 +1472,14 @@ impl RPythonAnnotator {
                     .borrow()
                     .as_ref()
                     .map(|rc| (**rc).clone())
-                    .expect("addpendingblock: fixed graph's inputarg lacks annotation");
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "addpendingblock: fixed graph's inputarg lacks annotation \
+                             (graph {}, inputarg {})",
+                            graph.borrow().name,
+                            v.name(),
+                        )
+                    });
                 // Upstream `cells` carries SomeObject — None never
                 // reaches the fixed-graph safety check.  Panic loud
                 // rather than silently ignoring late-stage unbound
