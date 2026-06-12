@@ -635,7 +635,16 @@ fn divergence_slot_label(graph: &LegacyGraph, idx: usize) -> String {
         for op in &block.operations {
             if op.result.as_ref() == Some(var) {
                 let mut kind = format!("{:?}", op.kind);
-                kind.truncate(120);
+                if kind.len() > 120 {
+                    // `String::truncate` panics off a char boundary;
+                    // ConstRef payloads can embed multibyte string
+                    // literals, so floor the cut to a boundary.
+                    let mut cut = 120;
+                    while !kind.is_char_boundary(cut) {
+                        cut -= 1;
+                    }
+                    kind.truncate(cut);
+                }
                 return format!("{} <- {}", var.name(), kind);
             }
         }

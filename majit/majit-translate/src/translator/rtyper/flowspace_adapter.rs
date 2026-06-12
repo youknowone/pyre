@@ -1959,7 +1959,18 @@ pub(crate) fn derive_subject_inputcells(
     // every `Ref` classdef-less, narrowed later by annotation.
     bookkeeper: Option<&Rc<crate::annotator::bookkeeper::Bookkeeper>>,
 ) -> Result<Vec<crate::annotator::model::SomeValue>, TyperError> {
-    let startblock = &legacy.blocks[legacy.startblock.0];
+    // Id-keyed lookup, not the dense `blocks[id.0]` projection — block
+    // ids need not be index-aligned (see `reachable_block_ids`).
+    let startblock = legacy
+        .blocks
+        .iter()
+        .find(|b| b.id == legacy.startblock)
+        .ok_or_else(|| {
+            TyperError::message(format!(
+                "derive_subject_inputcells: startblock {:?} not present in graph blocks",
+                legacy.startblock
+            ))
+        })?;
     let mut input_by_result: HashMap<
         crate::flowspace::model::Variable,
         (&crate::model::ValueType, &Option<String>),

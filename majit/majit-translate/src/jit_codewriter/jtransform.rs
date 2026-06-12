@@ -3293,9 +3293,18 @@ impl<'a> Transformer<'a> {
                 // the image of a source-level Constant red.  Const
                 // defining ops pass through jtransform unrewritten
                 // (`rewrite_operation` keeps them), so the scan is
-                // sound on the in-progress graph.  Loop-carried reds
-                // arrive as block inputargs, never as Const-defined
-                // temporaries, so real reds cannot false-positive.
+                // sound on the in-progress graph.  The graph-wide
+                // def-site scan equals the upstream call-operand
+                // boundary because graphs are single-assignment
+                // (`checkgraph`'s "duplicate variable" assert,
+                // flowspace/model.rs): a red holding a constant has
+                // its Const def as its ONLY def, and a red that merges
+                // a constant with other flow arrives as a fresh block
+                // inputarg whose id matches no Const def — exactly the
+                // cases upstream sees as Constant resp. Variable
+                // operands.  A constant value laundered through a
+                // value-copying op is not chased; upstream's
+                // `isinstance(v, Variable)` does not chase it either.
                 let red_ids: std::collections::HashSet<_> =
                     reds_raw.iter().map(|v| v.id()).collect();
                 for block in &graph.blocks {
