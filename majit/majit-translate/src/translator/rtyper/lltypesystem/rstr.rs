@@ -189,15 +189,18 @@ thread_local! {
     /// `StringRepr.CACHE`, `lltypesystem/rstr.py:233`): one host string →
     /// one prebuilt container identity, so repeated `convert_const` calls
     /// on the same literal return the same `_ptr` (prebuilt-constant
-    /// `is`-identity upstream relies on).  Translation-lifetime strong
+    /// `is`-identity upstream relies on).  Thread-lifetime strong
     /// cache; upstream's weak semantics only matter for memory, not
     /// identity.  Upstream is module-global because one translation owns
     /// the process; translation sessions here are single-threaded, so
-    /// thread_local is the per-session scope (the same convention as
-    /// `classdesc::FORCE_ATTRIBUTES_INTO_CLASSES`) — cached `_ptr`s carry
-    /// a mutable `hash` slot written back by
+    /// thread_local confines the cache to one session at a time (the
+    /// same convention as `classdesc::FORCE_ATTRIBUTES_INTO_CLASSES`) —
+    /// cached `_ptr`s carry a mutable `hash` slot written back by
     /// `build_ll_strhash_internal_helper_graph`, which must not be shared
-    /// across concurrently-running sessions.
+    /// across concurrently-running sessions.  Sequential sessions on one
+    /// thread DO share entries, which is sound: the value is determined
+    /// by the key bytes alone ([`llstr`] container + [`ll_strhash_value`]
+    /// fill), and the only mutation is that idempotent hash fill.
     static CONST_STR_CACHE: std::cell::RefCell<std::collections::HashMap<Vec<u8>, _ptr>> =
         std::cell::RefCell::new(std::collections::HashMap::new());
 }

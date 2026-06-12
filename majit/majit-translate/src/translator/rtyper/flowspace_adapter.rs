@@ -2084,15 +2084,19 @@ pub(crate) fn derive_subject_inputcells(
 /// (`mir.rs::lower_framestate`); startblock reachability is the general
 /// case the `dead` skip sites below also honour.
 fn reachable_block_ids(legacy: &FunctionGraph) -> std::collections::HashSet<BlockId> {
+    // Index lookup instead of `FunctionGraph::block` (a dense
+    // `blocks[id.0]` projection): final blocks reached as link targets
+    // need no `Block` entry of their own (test fixtures omit them), and
+    // a final block contributes no exits anyway.  Mirrors `iterblocks`'
+    // `exits[::-1]` stack order.
+    let by_id: HashMap<BlockId, &crate::model::Block> =
+        legacy.blocks.iter().map(|b| (b.id, b)).collect();
     let mut seen = std::collections::HashSet::new();
     let mut stack = vec![legacy.startblock];
-    while let Some(bid) = stack.pop() {
-        if !seen.insert(bid) {
-            continue;
-        }
-        if let Some(block) = legacy.blocks.get(bid.0) {
-            for link in &block.exits {
-                stack.push(link.target);
+    while let Some(id) = stack.pop() {
+        if seen.insert(id) {
+            if let Some(block) = by_id.get(&id) {
+                stack.extend(block.exits.iter().rev().map(|e| e.target));
             }
         }
     }
@@ -2204,28 +2208,11 @@ pub fn function_graph_to_flowspace(
     // `UnwindResume`/`Abort` terminator still lowers via `set_raise`,
     // leaving a predecessor-less block whose orphan `[etype, evalue]`
     // Link.args are defined by no inputarg and no op result.  Convert
-    // only the reachable closure, mirroring `iterblocks`'
-    // `exits[::-1]` stack order.  A *reachable* block with the same
+    // only the reachable closure — the same `reachable` set the const
+    // prepass above filtered on, so a block is translated iff its
+    // const-defines were seeded.  A *reachable* block with the same
     // orphan shape still fails the operand-definedness check in
     // `link_arg_to_hlvalue` — SSA-definedness is not relaxed.
-    let reachable: std::collections::HashSet<BlockId> = {
-        // Index lookup instead of `FunctionGraph::block` (a dense
-        // `blocks[id.0]` projection): final blocks reached as link
-        // targets need no `Block` entry of their own (test fixtures
-        // omit them), and a final block contributes no exits anyway.
-        let by_id: HashMap<BlockId, &crate::model::Block> =
-            legacy.blocks.iter().map(|b| (b.id, b)).collect();
-        let mut seen = std::collections::HashSet::new();
-        let mut stack: Vec<BlockId> = vec![legacy.startblock];
-        while let Some(id) = stack.pop() {
-            if seen.insert(id) {
-                if let Some(block) = by_id.get(&id) {
-                    stack.extend(block.exits.iter().rev().map(|e| e.target));
-                }
-            }
-        }
-        seen
-    };
 
     // ──────────────────────────────────────────────────────────────
     // Pass 1 — allocate fresh `flowspace::BlockRef` for every legacy
