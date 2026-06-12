@@ -4478,7 +4478,17 @@ fn try_execute_residual_call_via_executor(
     // receiver dereferences before that guard exists; fall through to
     // recording the call op and let the optimizer's guard emission
     // handle it at compile time.
+    // Exemption: `bh_call_fn_N(callable, null_or_self, args...)`'s
+    // `null_or_self` (arg index 1) is a checked sentinel — `PY_NULL`
+    // means "no receiver" and is never dereferenced (`bh_call_fn_impl`
+    // prepends it as arg0 only when non-null), so a concrete-NULL there
+    // is the normal plain-call shape.  Same exemption as
+    // `walker_abort_if_mayforce_null_ref_arg`.
+    let is_call_fn = call_descr.get_extra_info().pyre_helper == majit_ir::PyreHelperKind::CallFn;
     for (i, &arg) in args.iter().enumerate() {
+        if is_call_fn && i == 1 {
+            continue;
+        }
         if matches!(call_descr.arg_types().get(i), Some(majit_ir::Type::Ref)) && arg == 0 {
             return Ok(None);
         }
@@ -6681,7 +6691,9 @@ fn try_walker_call_assembler_self_recursive(
     ctx: &mut WalkContext<'_, '_>,
     op: &DecodedOp,
     code: &[u8],
+    funcptr: OpRef,
     r_args: &[OpRef],
+    call_descr: &dyn majit_ir::descr::CallDescr,
     pyre_helper: majit_ir::PyreHelperKind,
     dst_bank: char,
     dst: usize,
@@ -6877,6 +6889,42 @@ fn try_walker_call_assembler_self_recursive(
     // pyjitpl.py:2080-2081: KEEPALIVE on the callee virtualizable so it
     // survives until the result is consumed.
     ctx.trace_ctx.record_op(OpCode::Keepalive, &[callee_frame]);
+
+    // pyjitpl.py:2055 `execute_and_record_varargs(CALL_MAY_FORCE_R)`:
+    // the forces branch EXECUTES the call during tracing —
+    // `direct_assembler_call` (pyjitpl.py:2080) only rewrites the
+    // already-recorded op into CALL_ASSEMBLER afterwards, so the result
+    // box always carries the executed value.  Trait mirror: the
+    // call-replay leg runs the callee and `trace_guarded_int_payload(
+    // ca_result)` consumes the real concrete (trace_opcode.rs:6188-6199).
+    // Without the stamp the downstream BINARY_OP on two recursive-call
+    // results cannot take the int specialization and records the generic
+    // dunder-dispatch residual instead — the compiled loop then runs the
+    // full `lookup_where`/type-dispatch chain per call.  Reuse the
+    // residual executor primitive: it brackets the active vable with the
+    // TOKEN_TRACING_RESCALL protocol, suspends re-entrant trace
+    // continuation across the callee's `jit_merge_point`, stamps
+    // `ca_result` with the executed concrete on success, and seeds the
+    // standing exception state on a raise.
+    let argbox_types: Vec<Type> = vec![Type::Ref; r_args.len()];
+    let allboxes = build_allboxes(funcptr, r_args, &argbox_types, call_descr.arg_types());
+    let exec = try_execute_residual_call_via_executor(
+        ctx,
+        OpCode::CallMayForceR,
+        &allboxes,
+        call_descr,
+        ca_result,
+        op.pc,
+    )?;
+    // A decline leaves the CALL_ASSEMBLER recorded symbolically WITHOUT
+    // running it — a side effect only the legacy replay applies, so the
+    // walk-end no-replay commit must stay off for this trace (see
+    // `FBW_UNJOURNALED_EFFECT`).
+    if exec.is_none() {
+        fbw_mark_unjournaled_effect();
+    }
+    let exec_raised = matches!(exec, Some(Err(_)));
+
     // pyjitpl.py:2072: heapcache invalidation for the escaped frame.
     ctx.trace_ctx
         .heap_cache_mut()
@@ -6893,14 +6941,36 @@ fn try_walker_call_assembler_self_recursive(
     // `do_residual_call_walker_emit`.  `CALL_ASSEMBLER_R` yields the boxed
     // PyObject return value, taken as-is by the Ref dst (the consuming
     // BINARY_OP unboxes); eligibility pinned `dst_bank == 'r'`.
-    write_residual_call_result_to_dst(ctx, op.pc, dst, dst_bank, ca_result)?;
+    // Skipped on `exec_raised`: `ca_result` carries no concrete result
+    // (the callee raised before producing one) — same skip as the
+    // residual dispatcher.
+    if !exec_raised {
+        write_residual_call_result_to_dst(ctx, op.pc, dst, dst_bank, ca_result)?;
+    }
 
     // pyjitpl.py:2079: GUARD_NOT_FORCED + resume snapshot advanced past
     // the call (`capture_resumedata(after_residual_call=True)`).
     ctx.trace_ctx.record_guard(OpCode::GuardNotForced, &[], 0);
     walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
-    // pyjitpl.py:2082 handle_possible_exception -> GUARD_NO_EXCEPTION on
-    // the non-raising recording path.
+    // pyjitpl.py:2082 `handle_possible_exception`.
+    if exec_raised {
+        // Raising branch (pyjitpl.py:2156-2168): `GUARD_EXCEPTION` with
+        // the const class pin, then `finishframe_exception()` — the
+        // remaining bytes of the arm never run.  Mirror of the residual
+        // dispatcher's raising tail: surface `SubRaise` so `walk_loop`
+        // emits the outer `FINISH(exc)` (or an outer inline frame's
+        // handler catches it).
+        walker_record_guard_exception(ctx, op.pc);
+        let exc = ctx
+            .last_exc_value
+            .expect("exec_raised implies last_exc_value seeded by the Err branch");
+        let exc_concrete = ctx.last_exc_value_concrete;
+        return Ok(Some((
+            DispatchOutcome::SubRaise { exc, exc_concrete },
+            op.next_pc,
+        )));
+    }
+    // GUARD_NO_EXCEPTION on the non-raising recording path.
     ctx.trace_ctx.record_guard(OpCode::GuardNoException, &[], 0);
     walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
 
@@ -7263,7 +7333,9 @@ fn dispatch_residual_call_iRd_kind(
         ctx,
         op,
         code,
+        funcptr,
         &r_args,
+        call_descr,
         ei.pyre_helper,
         dst_bank,
         dst,

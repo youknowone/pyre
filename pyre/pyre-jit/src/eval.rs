@@ -8782,7 +8782,20 @@ first = g(9)
 factor = 2
 second = g(9)";
         let code = pyre_interpreter::compile_exec(source).expect("compile failed");
-        let mut frame = PyFrame::new(code);
+        // Production shape (pyrex real_main): the frame carries an
+        // ExecutionContext and the TLS slot is seeded, so
+        // `getexecutioncontext().gettopframe()` is live when the
+        // self-recursive CALL_ASSEMBLER path concretely executes the
+        // recursive `g(n - 1)` during the walk (`bh_call_fn_impl`
+        // resolves the parent frame from it).  A bare `PyFrame::new`
+        // frame is never entered onto the EC and trips the fail-fast
+        // topframe assert — same fixture shape as
+        // `test_nested_direct_helper_calls_stay_correct`.
+        let execution_context = std::rc::Rc::new(pyre_interpreter::PyExecutionContext::default());
+        pyre_interpreter::call::set_last_exec_ctx(std::rc::Rc::as_ptr(&execution_context));
+        let mut frame =
+            pyre_interpreter::pyframe::PyFrame::new_with_context(code, execution_context)
+                .expect("frame construction failed");
         let _ = eval_with_jit(&mut frame);
         unsafe {
             let first = *(*frame_globals_storage(&frame)).get("first").unwrap();
