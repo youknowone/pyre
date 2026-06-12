@@ -2988,13 +2988,33 @@ impl<'a> Lowering<'a> {
                     if let Some(IntoDevirt::Target(segments)) = self.blanket_into_devirt(reg) {
                         return (segments, None);
                     }
-                    let segments: Vec<String> = fd
-                        .item_meta
-                        .name_path()
-                        .split("::")
-                        .map(|s| s.to_string())
-                        .collect();
                     let method_hint = self.impl_method_owner(fd);
+                    // An impl-block associated function (the method
+                    // gate rejected it — no `self` receiver) is
+                    // spelled `[<qualified owner>, <fn>]`, the key the
+                    // canonical registration loop derives from
+                    // `self_ty_root`; the raw `name_path()` carries an
+                    // `<Impl>` segment that never matches a registry
+                    // entry.
+                    let segments: Vec<String> = if method_hint.is_none()
+                        && let Some((owner_qualified, leaf)) =
+                            impl_method_owner_for_fundecl(self.llbc, fd)
+                    {
+                        // Split like `CallPath::for_impl_method` so the
+                        // segment vectors compare equal.
+                        let mut v: Vec<String> = owner_qualified
+                            .split("::")
+                            .map(str::to_string)
+                            .collect();
+                        v.push(leaf);
+                        v
+                    } else {
+                        fd.item_meta
+                            .name_path()
+                            .split("::")
+                            .map(|s| s.to_string())
+                            .collect()
+                    };
                     (segments, method_hint)
                 })
                 .ok_or_else(|| {
@@ -3090,12 +3110,34 @@ impl<'a> Lowering<'a> {
         let owner_leaf = match self.resolve_impl_owner_adt_def_id(impl_payload) {
             Some(adt_def_id) => {
                 let td = self.llbc.type_by_id(adt_def_id)?;
-                td.item_meta
+                let owner = td
+                    .item_meta
                     .name_path()
                     .rsplit("::")
                     .next()
                     .unwrap_or("")
-                    .to_string()
+                    .to_string();
+                // Only an actual method (first signature input is the
+                // owner ADT, possibly behind `&`/`&mut`) may route as
+                // `CallTarget::Method`.  An associated function with
+                // arguments (`PyError::type_error(msg)`) would
+                // otherwise thread its first argument as the getattr
+                // receiver and the annotator resolves the method name
+                // against that argument's type.  Compared by ADT
+                // def_id, not name leaf, so generic owners
+                // (`Result::branch` — `?`'s Try::branch) still match.
+                let first_is_self = fd
+                    .signature
+                    .inputs
+                    .first()
+                    .and_then(|t| tyref_node(t, self.llbc))
+                    .and_then(|n| strip_ty_wrappers(n, self.llbc))
+                    .and_then(adt_node_def_id)
+                    .is_some_and(|id| id == adt_def_id);
+                if !first_is_self {
+                    return None;
+                }
+                owner
             }
             // Non-ADT `Self` (primitive / raw pointer / slice): Charon leaves
             // the impl owner type unresolved, so the ADT table has no entry.
@@ -4377,13 +4419,25 @@ fn tyref_node<'l>(ty: &'l TyRef, llbc: &'l Llbc) -> Option<&'l serde_json::Value
     }
 }
 
+/// The ADT def_id of an (already wrapper-stripped) type node, or
+/// `None` for non-ADT nodes.
+fn adt_node_def_id(node: &serde_json::Value) -> Option<u64> {
+    node.as_object()?
+        .get("Adt")?
+        .as_object()?
+        .get("id")?
+        .as_object()?
+        .get("Adt")?
+        .as_u64()
+}
+
 /// The monomorphic-ADT class root of an (already wrapper-stripped)
 /// type node, or `None` for non-ADTs and generic instantiations —
 /// the shared tail of [`tyref_class_root`] /
 /// [`cast_ptr_target_class_root`].
 fn adt_node_class_root(node: &serde_json::Value, llbc: &Llbc) -> Option<String> {
     let adt = node.as_object()?.get("Adt")?.as_object()?;
-    let def_id = adt.get("id")?.as_object()?.get("Adt")?.as_u64()?;
+    let def_id = adt_node_def_id(node)?;
     let has_type_args = adt
         .get("generics")
         .and_then(|g| g.as_object())

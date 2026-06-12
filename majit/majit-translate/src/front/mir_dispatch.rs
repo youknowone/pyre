@@ -164,15 +164,19 @@ fn build_arm_body_graph(
         return build_tail_call_wrapper(name, params, &handler_path, &forwarded);
     }
 
-    // raise-stub: a `PyError::type_error(…)` method call.
-    let is_raise_stub = blk.operations.iter().any(|op| {
-        matches!(
-            &op.kind,
-            OpKind::Call {
-                target: CallTarget::Method { name: m, .. },
-                ..
-            } if m == "type_error"
-        )
+    // raise-stub: a `PyError::type_error(…)` call.  An associated
+    // function lowers as `FunctionPath` (no `self` receiver); the
+    // `Method` form is kept for receiver-shaped lowerings.
+    let is_raise_stub = blk.operations.iter().any(|op| match &op.kind {
+        OpKind::Call {
+            target: CallTarget::Method { name: m, .. },
+            ..
+        } => m == "type_error",
+        OpKind::Call {
+            target: CallTarget::FunctionPath { segments },
+            ..
+        } => segments.last().is_some_and(|leaf| leaf == "type_error"),
+        _ => false,
     });
     if is_raise_stub {
         return build_raise_stub_wrapper(name, params, &async_raise_stub_template());
