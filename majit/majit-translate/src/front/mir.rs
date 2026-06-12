@@ -1816,8 +1816,27 @@ impl<'a> Lowering<'a> {
                                 )
                             }
                             // Same bank (or a bank pair with no host cast
-                            // callable): alias the operand.
-                            None => (None, arg),
+                            // callable): alias the operand — except a
+                            // ptr→ptr cast onto a monomorphic-ADT
+                            // pointee, which is the upstream instance
+                            // downcast `cast_pointer(PTRTYPE, p)`;
+                            // surface it for the annotator (jtransform
+                            // re-aliases, see
+                            // [`cast_pointer_marker_op`]).
+                            None => {
+                                if matches!(dst_kind, ValueType::Ref(_))
+                                    && matches!(src_kind, Some(ValueType::Ref(_)))
+                                    && let Some(root) =
+                                        cast_ptr_target_class_root(dest_ty, self.llbc)
+                                {
+                                    let res = self.graph.alloc_value_var_with_type(
+                                        crate::model::ConcreteType::Unknown,
+                                    );
+                                    (Some(cast_pointer_marker_op(root, arg)), res)
+                                } else {
+                                    (None, arg)
+                                }
+                            }
                         },
                     );
                 }
@@ -1903,8 +1922,22 @@ impl<'a> Lowering<'a> {
             // so reuse the alias path: the cast result Variable is the
             // same as the operand Variable. `as` casts that do not
             // change the JIT-visible kind collapse this way.
-            Rvalue::Cast(_kind, operand, _ty) => {
+            // Exception: a `RawPtr` cast onto a monomorphic-ADT
+            // pointee (`obj as *const W_Foo`) is the upstream instance
+            // downcast `cast_pointer(PTRTYPE, p)` — surface it as the
+            // `__cast_pointer/<Root>` marker so the annotator types
+            // the result; jtransform re-aliases it (see
+            // [`cast_pointer_marker_op`]).
+            Rvalue::Cast(kind, operand, ty) => {
                 let v = self.resolve_operand(mir_bb, operand)?;
+                if cast_kind_is_raw_ptr(&kind)
+                    && let Some(root) = cast_ptr_target_class_root(&ty, self.llbc)
+                {
+                    let res = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    return Ok((Some(cast_pointer_marker_op(root, v)), res));
+                }
                 Ok((None, v))
             }
             // `Len(place)` — slice / array length. Synthetic 1-arg
@@ -3819,6 +3852,13 @@ fn cast_label_from_payload(payload: &serde_json::Value) -> String {
     }
 }
 
+/// `true` for the Charon `CastKind::RawPtr` payload (atom or
+/// single-key object form) — the pointer-to-pointer reinterpret
+/// `expr as *const T` / `as *mut T`.
+fn cast_kind_is_raw_ptr(kind: &serde_json::Value) -> bool {
+    kind.as_str() == Some("RawPtr") || kind.as_object().is_some_and(|o| o.contains_key("RawPtr"))
+}
+
 fn scalar_is_float(v: &serde_json::Value) -> bool {
     if let Some(s) = v.as_str() {
         return matches!(s, "F32" | "F64");
@@ -4126,13 +4166,26 @@ fn tyref_to_attr_value_type(ty: &TyRef, llbc: &Llbc) -> ValueType {
 ///     a generic decl carry unresolved type-variable field strings, so
 ///     a seeded classdef would project bogus attr shells.
 fn tyref_class_root(ty: &TyRef, llbc: &Llbc) -> Option<String> {
-    let node = match ty {
-        TyRef::Inline { value: (_, v) } => v,
-        TyRef::Other(v) => v,
-        TyRef::Dedup { id } => llbc.dedup_body(*id)?,
-    };
-    let obj = strip_ty_wrappers(node, llbc)?.as_object()?;
-    let adt = obj.get("Adt")?.as_object()?;
+    let node = tyref_node(ty, llbc)?;
+    adt_node_class_root(strip_ty_wrappers(node, llbc)?, llbc)
+}
+
+/// The underlying JSON type node of a `TyRef`, resolving the `Dedup`
+/// indirection through the LLBC dedup-body index.
+fn tyref_node<'l>(ty: &'l TyRef, llbc: &'l Llbc) -> Option<&'l serde_json::Value> {
+    match ty {
+        TyRef::Inline { value: (_, v) } => Some(v),
+        TyRef::Other(v) => Some(v),
+        TyRef::Dedup { id } => llbc.dedup_body(*id),
+    }
+}
+
+/// The monomorphic-ADT class root of an (already wrapper-stripped)
+/// type node, or `None` for non-ADTs and generic instantiations —
+/// the shared tail of [`tyref_class_root`] /
+/// [`cast_ptr_target_class_root`].
+fn adt_node_class_root(node: &serde_json::Value, llbc: &Llbc) -> Option<String> {
+    let adt = node.as_object()?.get("Adt")?.as_object()?;
     let def_id = adt.get("id")?.as_object()?.get("Adt")?.as_u64()?;
     let has_type_args = adt
         .get("generics")
@@ -4145,6 +4198,40 @@ fn tyref_class_root(ty: &TyRef, llbc: &Llbc) -> Option<String> {
     }
     let name = llbc.type_by_id(def_id)?.item_meta.name_path();
     Some(name.rsplit("::").next().unwrap_or(&name).to_string())
+}
+
+/// The pointee's monomorphic-ADT class root for a `*const T` /
+/// `*mut T` cast-target type, or `None` when the target is not a raw
+/// pointer onto a plain ADT.  `expr as *const W_Foo` is pyre's surface
+/// spelling of the upstream instance downcast `cast_pointer(PTRTYPE,
+/// p)` (lltype.py:964-968): the pointee root names the classdef the
+/// `lltype.cast_pointer` annotation rule resolves the result to.
+fn cast_ptr_target_class_root(ty: &TyRef, llbc: &Llbc) -> Option<String> {
+    let node = tyref_node(ty, llbc)?;
+    let raw = strip_ty_wrappers(node, llbc)?
+        .as_object()?
+        .get("RawPtr")?
+        .as_array()?;
+    adt_node_class_root(strip_ty_wrappers(raw.first()?, llbc)?, llbc)
+}
+
+/// The `__cast_pointer/<Root>` marker call — front::mir's carrier for
+/// the upstream `cast_pointer(PTRTYPE, ptr)` op (lltype.py:964).  The
+/// target class travels in the path (same `Vec<Variable>`-carrier
+/// constraint as the `simple_call(<exc class>)` raise marker,
+/// `front/raise.rs:120-126`); the flowspace adapter rebuilds the
+/// 2-arg upstream shape, and jtransform re-aliases the call to its
+/// operand (`rewrite_op_cast_pointer` → `same_as`,
+/// jtransform.py:254-257) so the jitcode shape stays identical to the
+/// plain alias lowering.
+fn cast_pointer_marker_op(root: String, arg: Variable) -> OpKind {
+    OpKind::Call {
+        target: CallTarget::FunctionPath {
+            segments: vec!["__cast_pointer".to_string(), root.clone()],
+        },
+        args: vec![arg],
+        result_ty: ValueType::Ref(Some(root)),
+    }
 }
 
 /// Strip the indirection wrappers a Charon type node can carry —
@@ -5032,6 +5119,40 @@ fn scalar_value_to_i64(v: &serde_json::Value) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::harden_duplicate_leaf_metadata;
+    use super::{cast_kind_is_raw_ptr, cast_pointer_marker_op};
+
+    #[test]
+    fn cast_pointer_marker_carries_root_in_path_and_result_type() {
+        use crate::model::{CallTarget, OpKind, ValueType};
+        let arg = crate::flowspace::model::Variable::new();
+        let op = cast_pointer_marker_op("W_CastTarget".to_string(), arg.clone());
+        let OpKind::Call {
+            target,
+            args,
+            result_ty,
+        } = op
+        else {
+            panic!("marker must be an OpKind::Call");
+        };
+        assert_eq!(
+            target,
+            CallTarget::FunctionPath {
+                segments: vec!["__cast_pointer".to_string(), "W_CastTarget".to_string()],
+            }
+        );
+        assert_eq!(args, vec![arg]);
+        assert_eq!(result_ty, ValueType::Ref(Some("W_CastTarget".to_string())));
+    }
+
+    #[test]
+    fn cast_kind_raw_ptr_recognizes_atom_and_object_forms() {
+        assert!(cast_kind_is_raw_ptr(&serde_json::json!("RawPtr")));
+        assert!(cast_kind_is_raw_ptr(
+            &serde_json::json!({"RawPtr": ["x", "y"]})
+        ));
+        assert!(!cast_kind_is_raw_ptr(&serde_json::json!("Unsize")));
+        assert!(!cast_kind_is_raw_ptr(&serde_json::json!({"Scalar": []})));
+    }
 
     fn rows(spec: &[(&str, &str)]) -> Vec<(String, String)> {
         spec.iter()

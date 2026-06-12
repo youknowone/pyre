@@ -3661,6 +3661,27 @@ fn init_someinstance_overrides(
                             s_attr
                         )
                     });
+                // A raw-pointer inherent method is answered the way
+                // `SomePtr.getattr` would: `is_null` resolves to a
+                // bound method (lltype `_ptr.is_null`) whose call
+                // yields `SomeBool`.  The frontend lowers
+                // `p.is_null()` as `getattr(p, "is_null")` +
+                // `simple_call(bound, …)` (`flowspace_adapter.rs`
+                // CallTarget::Method), so getattr must return the
+                // callable bound method — returning a bare `SomeBool`
+                // would seat a non-callable in the simple_call callee
+                // slot.  Checked BEFORE the classdef projection: a
+                // `cast_pointer`-typed receiver (`SomeInstance(cd)`
+                // from `obj as *const W_Foo`) is still a raw pointer
+                // at the source level, and no pyre struct defines an
+                // `is_null` member that the bound method could shadow.
+                if attr == "is_null" {
+                    return SomeValue::BuiltinMethod(SomeBuiltinMethod::new(
+                        "ptr_method_is_null",
+                        s_self.clone(),
+                        "is_null",
+                    ));
+                }
                 let classdef = match inst.classdef.as_ref() {
                     Some(cd) => cd,
                     None => {
@@ -3670,23 +3691,8 @@ fn init_someinstance_overrides(
                         // `project_pyre_field_type` strips `*mut`/`*const`/`&`
                         // and resolves the pointee — when the pointee is an
                         // unregistered host struct the field becomes
-                        // `SomeInstance(classdef=None)`.  A raw-pointer inherent
-                        // method on such an erased receiver is answered the way
-                        // `SomePtr.getattr` would: `is_null` resolves to a bound
-                        // method (lltype `_ptr.is_null`) whose call yields
-                        // `SomeBool`.  The frontend lowers `p.is_null()` as
-                        // `getattr(p, "is_null")` + `simple_call(bound, …)`
-                        // (`flowspace_adapter.rs` CallTarget::Method), so getattr
-                        // must return the callable bound method here — returning a
-                        // bare `SomeBool` would seat a non-callable in the
-                        // simple_call callee slot.  Any other attr stays fail-loud.
-                        if attr == "is_null" {
-                            return SomeValue::BuiltinMethod(SomeBuiltinMethod::new(
-                                "ptr_method_is_null",
-                                s_self.clone(),
-                                "is_null",
-                            ));
-                        }
+                        // `SomeInstance(classdef=None)`.  Any attr other than
+                        // the `is_null` ptr method above stays fail-loud.
                         panic!(
                             "AnnotatorError: SomeInstance.getattr({:?}) on classdef-less instance",
                             attr

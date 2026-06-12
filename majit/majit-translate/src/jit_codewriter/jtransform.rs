@@ -2462,6 +2462,19 @@ impl<'a> Transformer<'a> {
         if self.is_synthetic_result_option_ctor(target, args, result_ty) {
             return RewriteResult::Identity(args[0].clone());
         }
+        // `rewrite_op_cast_pointer` → `rewrite_op_same_as`
+        // (jtransform.py:254-257): the JIT does not distinguish a
+        // down-cast pointer from its source, so the
+        // `__cast_pointer/<Root>` marker (front::mir's carrier for the
+        // upstream `cast_pointer` op, see `cast_pointer_marker_op`)
+        // folds back to the operand alias and emits no jitcode op.
+        if let CallTarget::FunctionPath { segments } = target
+            && segments.len() == 2
+            && segments[0] == "__cast_pointer"
+            && args.len() == 1
+        {
+            return RewriteResult::Identity(args[0].clone());
+        }
         // RPython: guess_call_kind(op) → dispatch to handle_*_call
         if let Some(cc) = self.callcontrol.as_mut() {
             let kind = cc.guess_call_kind(op);
@@ -6577,6 +6590,40 @@ mod tests {
             &[arg],
             &ValueType::Ref(None),
         ));
+    }
+
+    /// `__cast_pointer/<Root>` marker folds to the operand alias —
+    /// `rewrite_op_cast_pointer` → `rewrite_op_same_as`
+    /// (jtransform.py:254-257) emits no jitcode op.
+    #[test]
+    fn cast_pointer_marker_elides_to_operand_alias() {
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config);
+        let mut graph = FunctionGraph::new("cast_ptr_marker");
+        let arg = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let result_var = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let target = CallTarget::function_path(["__cast_pointer", "W_CastTarget"]);
+        let result_ty = ValueType::Ref(Some("W_CastTarget".into()));
+        let op = SpaceOperation {
+            result: Some(result_var),
+            kind: OpKind::Call {
+                target: target.clone(),
+                args: vec![arg.clone()],
+                result_ty: result_ty.clone(),
+            },
+        };
+        let rewritten = transformer.rewrite_op_direct_call(
+            &op,
+            &target,
+            &[arg.clone()],
+            &result_ty,
+            "cast_ptr_marker",
+            &mut graph,
+        );
+        match rewritten {
+            RewriteResult::Identity(alias) => assert_eq!(alias, arg),
+            _ => panic!("expected Identity alias to the operand"),
+        }
     }
 
     /// Reject when arg/result IR kinds disagree — that means the

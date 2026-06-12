@@ -1502,10 +1502,18 @@ fn rtype_cast_pointer_typer(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>)
         }
     }
     let r_arg1 = arg_repr(hop, 1)?;
-    // upstream `assert isinstance(hop.args_r[1], rptr.PtrRepr)`
-    if !matches!(r_arg1.repr_class_id(), ReprClassId::PtrRepr) {
+    // upstream `assert isinstance(hop.args_r[1], rptr.PtrRepr)`.
+    // Pyre also accepts `InstanceRepr`: a typed receiver lifts to the
+    // instance lattice rather than `SomePtr`, and the instance flavour
+    // of the same downcast emits the identical `cast_pointer` genop
+    // (`pairtype(InstanceRepr, InstanceRepr).convert_from_to`,
+    // rclass.py:1035-1055).
+    if !matches!(
+        r_arg1.repr_class_id(),
+        ReprClassId::PtrRepr | ReprClassId::InstanceRepr
+    ) {
         return Err(TyperError::message(format!(
-            "rtype_cast_pointer: hop.args_r[1] must be PtrRepr, got {:?}",
+            "rtype_cast_pointer: hop.args_r[1] must be PtrRepr or InstanceRepr, got {:?}",
             r_arg1.repr_class_id()
         )));
     }

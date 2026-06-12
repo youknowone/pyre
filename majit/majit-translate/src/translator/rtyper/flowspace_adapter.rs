@@ -1201,6 +1201,40 @@ pub fn translate_op(
                             _ => {}
                         }
                     }
+                    // `__cast_pointer/<Root>` marker (`front::mir`
+                    // `cast_pointer_marker_op`) — pyre's carrier for the
+                    // upstream `cast_pointer(PTRTYPE, ptr)` downcast
+                    // (lltype.py:964-968).  Same path-encoded-constant
+                    // reconstruction as the `simple_call(<exc class>)`
+                    // raise marker (Branch 3c below): rebuild the 2-arg
+                    // upstream shape with the target class as the
+                    // constant first argument.  The class is interned by
+                    // qualname so every cast site shares one `HostObject`
+                    // Arc (`getdesc` dedups on Arc identity — fresh Arcs
+                    // would mint one ClassDesc per cast site).
+                    if segments.len() == 2 && segments[0] == "__cast_pointer" && arg_hls.len() == 1
+                    {
+                        let callable_host = HOST_ENV
+                            .import_module("rpython.rtyper.lltypesystem.lltype")
+                            .and_then(|m| m.module_get("cast_pointer"))
+                            .ok_or_else(|| {
+                                TyperError::message(
+                                    "HOST_ENV lltype module must expose cast_pointer".to_string(),
+                                )
+                            })?;
+                        let class_host = call_registry
+                            .bookkeeper()
+                            .intern_class_by_qualname(&segments[1]);
+                        let mut call_args = Vec::with_capacity(arg_hls.len() + 2);
+                        call_args.push(Hlvalue::Constant(Constant::new(ConstValue::HostObject(
+                            callable_host,
+                        ))));
+                        call_args.push(Hlvalue::Constant(Constant::new(ConstValue::HostObject(
+                            class_host,
+                        ))));
+                        call_args.extend(arg_hls);
+                        return Ok(vec![FlowspaceOp::new("simple_call", call_args, result)]);
+                    }
                     let key =
                         crate::translator::rtyper::pyre_call_registry::FunctionPathKey::from_segments(
                             segments.iter().cloned(),
@@ -3516,6 +3550,67 @@ mod tests {
             msg.contains("not registered in PyreCallRegistry"),
             "error must name the missing-registration invariant, got: {msg}"
         );
+    }
+
+    #[test]
+    fn translate_op_cast_pointer_marker_rebuilds_two_arg_upstream_call() {
+        // `__cast_pointer/<Root>` marker (front::mir
+        // `cast_pointer_marker_op`) reconstructs the upstream 2-arg
+        // `cast_pointer(PTRTYPE, ptr)` shape (lltype.py:964-968):
+        // constant callable + constant interned target class, then the
+        // pointer operand.
+        let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
+        let graph = translate_op_test_graph(10);
+        let operand = Variable::new();
+        value_map.insert(
+            graph.must_variable_at(1),
+            Hlvalue::Variable(operand.clone()),
+        );
+        value_map.insert(
+            graph.must_variable_at(2),
+            Hlvalue::Variable(Variable::new()),
+        );
+        let op = SpaceOperation {
+            result: Some(graph.must_variable_at(2)),
+            kind: OpKind::Call {
+                target: crate::model::CallTarget::FunctionPath {
+                    segments: vec!["__cast_pointer".into(), "W_CastTarget".into()],
+                },
+                args: vec![graph.must_variable_at(1)],
+                result_ty: ValueType::Ref(Some("W_CastTarget".into())),
+            },
+        };
+        let registry = empty_call_registry();
+        let translated = translate_op(&op, &value_map, &registry)
+            .expect("__cast_pointer marker must lower to simple_call");
+        assert_eq!(translated.len(), 1);
+        let lowered = &translated[0];
+        assert_eq!(lowered.opname, "simple_call");
+        assert_eq!(lowered.args.len(), 3);
+        let Hlvalue::Constant(ref callable) = lowered.args[0] else {
+            panic!("simple_call callable must be a Constant");
+        };
+        let ConstValue::HostObject(ref host) = callable.value else {
+            panic!("cast_pointer callable must be ConstValue::HostObject");
+        };
+        let expected = HOST_ENV
+            .import_module("rpython.rtyper.lltypesystem.lltype")
+            .and_then(|m| m.module_get("cast_pointer"))
+            .expect("populate_host_env must register lltype.cast_pointer");
+        assert_eq!(host, &expected);
+        let Hlvalue::Constant(ref class_const) = lowered.args[1] else {
+            panic!("target class must be a Constant");
+        };
+        let ConstValue::HostObject(ref class_host) = class_const.value else {
+            panic!("target class must be ConstValue::HostObject");
+        };
+        // Interned by qualname — every cast site shares one HostObject
+        // identity, so `getdesc` resolves them to one ClassDesc.
+        let interned = registry
+            .bookkeeper()
+            .intern_class_by_qualname("W_CastTarget");
+        assert_eq!(class_host, &interned);
+        assert!(matches!(lowered.args[2], Hlvalue::Variable(ref v) if *v == operand));
     }
 
     #[test]
