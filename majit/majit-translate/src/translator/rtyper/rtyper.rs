@@ -2970,6 +2970,7 @@ fn lowlevel_helper_graph(
             LowLevelType::SignedLongLongLong,
             "lllong_eq",
         ),
+        "ll_both_none" => lowlevel_both_none_helper_graph(name, args, result),
         "ll_issubclass" => lowlevel_issubclass_helper_graph(name, args, result),
         "ll_isinstance" => lowlevel_isinstance_helper_graph(rtyper, name, args, result),
         "ll_type" => lowlevel_type_helper_graph(name, args, result),
@@ -3005,6 +3006,74 @@ pub(crate) fn helper_pygraph_from_graph(
 
 pub(crate) fn void_field_const(name: &str) -> Hlvalue {
     constant_with_lltype(ConstValue::byte_str(name), LowLevelType::Void)
+}
+
+/// `ll_both_none(ins1, ins2)` (rclass.py:1180-1181): `not ins1 and
+/// not ins2` — the mixed-gcflavor `is` comparison can only be true
+/// when both pointers are null.  The two argument pointer types
+/// differ (one gc, one raw common repr), so the shape is validated
+/// structurally rather than against fixed lltypes.
+fn lowlevel_both_none_helper_graph(
+    name: &str,
+    args: &[LowLevelType],
+    result: &LowLevelType,
+) -> Result<PyGraph, TyperError> {
+    if args.len() != 2
+        || !args.iter().all(|a| matches!(a, LowLevelType::Ptr(_)))
+        || result != &LowLevelType::Bool
+    {
+        return Err(TyperError::message(format!(
+            "{name} expects (Ptr, Ptr) -> Bool, got ({args:?}) -> {result:?}"
+        )));
+    }
+
+    let argnames = vec!["arg0".to_string(), "arg1".to_string()];
+    let ins1 = variable_with_lltype("arg0", args[0].clone());
+    let ins2 = variable_with_lltype("arg1", args[1].clone());
+    let z1 = variable_with_lltype("z1", LowLevelType::Bool);
+    let z2 = variable_with_lltype("z2", LowLevelType::Bool);
+    let both = variable_with_lltype("result", LowLevelType::Bool);
+    let return_var = variable_with_lltype("result", LowLevelType::Bool);
+
+    let startblock = Block::shared(vec![
+        Hlvalue::Variable(ins1.clone()),
+        Hlvalue::Variable(ins2.clone()),
+    ]);
+    let mut graph = FunctionGraph::with_return_var(
+        name.to_string(),
+        startblock.clone(),
+        Hlvalue::Variable(return_var),
+    );
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "ptr_iszero",
+        vec![Hlvalue::Variable(ins1)],
+        Hlvalue::Variable(z1.clone()),
+    ));
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "ptr_iszero",
+        vec![Hlvalue::Variable(ins2)],
+        Hlvalue::Variable(z2.clone()),
+    ));
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "int_and",
+        vec![Hlvalue::Variable(z1), Hlvalue::Variable(z2)],
+        Hlvalue::Variable(both.clone()),
+    ));
+    startblock.closeblock(vec![
+        Link::new(
+            vec![Hlvalue::Variable(both)],
+            Some(graph.returnblock.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    let func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(graph, argnames, func))
 }
 
 fn lowlevel_issubclass_helper_graph(

@@ -3864,8 +3864,8 @@ pub(super) fn pair_instance_instance_convert_from_to(
 /// Both sides convert to the common-base instance repr (the upcast
 /// `cast_pointer` comes from [`pair_instance_instance_convert_from_to`]
 /// at `inputargs` time) and the generic pointer-identity arm emits
-/// `ptr_eq`. The mixed-gcflavor `ll_both_none` branch has no pyre
-/// hitter yet and surfaces as an explicit unported error.
+/// `ptr_eq`. Mixed gcflavors route through the `ll_both_none` helper
+/// (`not ins1 and not ins2`, rclass.py:1180-1181).
 pub(super) fn pair_instance_instance_rtype_is_(
     r1: &dyn Repr,
     r2: &dyn Repr,
@@ -3878,10 +3878,29 @@ pub(super) fn pair_instance_instance_rtype_is_(
         return Ok(None);
     };
     if r_ins1.gcflavor != r_ins2.gcflavor {
-        return Err(TyperError::message(
-            "pairtype(InstanceRepr, InstanceRepr).rtype_is_: mixed gc flavors \
-             (ll_both_none, rclass.py:1058-1062) not ported",
-        ));
+        // "obscure logic, the is can be true only if both are None"
+        // (rclass.py:1058-1062): each side converts to its own
+        // flavor's common repr, then `ll_both_none` tests both for
+        // null.
+        use crate::translator::rtyper::rtyper::ConvertedTo;
+        let common1 = r_ins1.common_repr()?;
+        let common2 = r_ins2.common_repr()?;
+        let v_args = hop.inputargs(vec![
+            ConvertedTo::Repr(common1.as_ref() as &dyn Repr),
+            ConvertedTo::Repr(common2.as_ref()),
+        ])?;
+        let rtyper = r_ins1.rtyper.upgrade().ok_or_else(|| {
+            TyperError::message("pair_instance_instance_rtype_is_: rtyper weak ref expired")
+        })?;
+        let helper = rtyper.lowlevel_helper_function(
+            "ll_both_none",
+            vec![
+                common1.lowleveltype().clone(),
+                common2.lowleveltype().clone(),
+            ],
+            LowLevelType::Bool,
+        )?;
+        return hop.gendirectcall(&helper, v_args);
     }
     let basedef = match (&r_ins1.classdef, &r_ins2.classdef) {
         (Some(c1), Some(c2)) => ClassDef::commonbase(c1, c2),

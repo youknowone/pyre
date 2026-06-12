@@ -3678,7 +3678,12 @@ fn init_someinstance_overrides(
                 // *const W_Foo`) as `SomeInstance`, so the ptr method
                 // answers only when the class hierarchy does not
                 // itself define `is_null` — a real member keeps
-                // upstream's classdef dispatch below.
+                // upstream's classdef dispatch below.  An ordinary
+                // (non-pointer) instance cannot reach this arm:
+                // `getattr(recv, "is_null")` is only lowered from
+                // `.is_null()` callsites, which rustc typechecks
+                // against raw-pointer receivers or against a struct
+                // member (and a member is found by the lookup guard).
                 if attr == "is_null" {
                     let class_defines_attr = inst.classdef.as_ref().is_some_and(|cd| {
                         let classdesc = cd.borrow().classdesc.clone();
