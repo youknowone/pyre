@@ -901,6 +901,19 @@ pub(crate) fn is_known_unported(msg: &str) -> bool {
         // threading misses a name in the predecessor link; the
         // annotator cannot merge `None` annotations.
         || msg.contains("inputarg lacks annotation")
+        // `rtyper.py:815 convertvar` TyperError — no pairtype
+        // convert_from_to edge between the two reprs.  The live hitter
+        // is generic-enum payload conflation: the front registers ONE
+        // flat class per enum (`Result.Ok`) with first-writer-wins
+        // field rows, so two monomorphic instantiations (`Result<Tuple,
+        // _>` vs `Result<Option<_>, _>`) share one `__pos_0` attr and
+        // the second write needs an unrelated-classdef conversion
+        // (`Option.None` → `Tuple`) that
+        // `pair_instance_instance_convert_from_to` correctly answers
+        // NotImplemented for (rclass.py:1054-1055).  Skip until
+        // per-instantiation variant classes (generic payload
+        // monomorphization) land.
+        || msg.contains("don't know how to convert from")
         // Unported `rtyper_makerepr` arms (`rmodel.rs:2895-2965`
         // SomeList / SomeDict / SomeIterator / SomeByteArray /
         // SomeObject) surface bare `MissingRTypeOperation` messages of
