@@ -202,13 +202,16 @@ pub struct TraceIterator<'a> {
     /// opencoder.py:252 self.trace
     pub trace: &'a [majit_ir::OpRc],
     /// opencoder.py:255 self._cache: per-iterator map from raw trace
-    /// position to fresh box (OpRef) materialized for this iteration.
-    /// In RPython this is `[None] * trace._index`; here `Vec<Option<OpRef>>`.
-    pub _cache: Vec<Option<OpRef>>,
+    /// position to the fresh box OBJECT materialized for this iteration.
+    /// In RPython this is `[None] * trace._index` holding the fresh
+    /// `cls()` ResOperation / `inputarg_from_tp` objects themselves;
+    /// here `Vec<Option<BoxRef>>` carrying the bound `Rc` handles.
+    pub _cache: Vec<Option<BoxRef>>,
     /// opencoder.py:259-262 self.inputargs: fresh inputarg boxes for this
-    /// iteration. Each is an `OpRef` allocated from the iterator's
-    /// `_fresh` counter at construction time.
-    pub inputargs: Vec<OpRef>,
+    /// iteration. Each is a freshly allocated `InputArg` object whose
+    /// position comes from the iterator's `_fresh` counter at
+    /// construction time (`rop.inputarg_from_tp(arg.type)`).
+    pub inputargs: Vec<majit_ir::InputArgRc>,
     /// opencoder.py:268 self.start
     pub start: usize,
     /// opencoder.py:269 self.pos
@@ -270,9 +273,9 @@ impl<'a> TraceIterator<'a> {
             .max()
             .unwrap_or(0);
         let cache_size = ((max_pos as usize) + 1).max(num_inputargs);
-        let mut _cache: Vec<Option<OpRef>> = vec![None; cache_size];
+        let mut _cache: Vec<Option<BoxRef>> = vec![None; cache_size];
         let mut _fresh = start_fresh;
-        let inputargs: Vec<OpRef>;
+        let inputargs: Vec<majit_ir::InputArgRc>;
         if let Some(force) = force_inputargs {
             // opencoder.py:259-262 self.inputargs =
             //     [rop.inputarg_from_tp(arg.type) for arg in force_inputargs]
@@ -291,7 +294,7 @@ impl<'a> TraceIterator<'a> {
                             arg
                         )
                     });
-                    let r = OpRef::input_arg_typed(_fresh, tp);
+                    let r = InputArg::from_type_rc(tp, _fresh);
                     _fresh += 1;
                     r
                 })
@@ -301,7 +304,7 @@ impl<'a> TraceIterator<'a> {
                 if p >= _cache.len() {
                     _cache.resize(p + 1, None);
                 }
-                _cache[p] = Some(inputargs[i]);
+                _cache[p] = Some(BoxRef::from_bound_inputarg(&inputargs[i]));
             }
         } else {
             // opencoder.py:264-267 self.inputargs =
@@ -311,13 +314,13 @@ impl<'a> TraceIterator<'a> {
             inputargs = inputarg_types
                 .iter()
                 .map(|&tp| {
-                    let r = OpRef::input_arg_typed(_fresh, tp);
+                    let r = InputArg::from_type_rc(tp, _fresh);
                     _fresh += 1;
                     r
                 })
                 .collect();
             for i in 0..num_inputargs {
-                _cache[i] = Some(inputargs[i]);
+                _cache[i] = Some(BoxRef::from_bound_inputarg(&inputargs[i]));
             }
         }
         TraceIterator {
@@ -335,8 +338,8 @@ impl<'a> TraceIterator<'a> {
     }
 
     /// opencoder.py:286-289 _get(self, i).
-    fn _get(&self, i: usize) -> OpRef {
-        match self._cache.get(i).copied().flatten() {
+    fn _get(&self, i: usize) -> BoxRef {
+        match self._cache.get(i).cloned().flatten() {
             Some(res) => res,
             None => panic!(
                 "TraceIterator._get cache miss at {i} (cache_len={}, pos={}, start={}, end={}, index={}, start_index={}, fresh={})",
@@ -361,10 +364,11 @@ impl<'a> TraceIterator<'a> {
     /// In RPython this dispatches on the tag (TAGBOX/TAGINT/TAGCONSTPTR/
     /// TAGCONSTOTHER). majit's OpRef carries the tag implicitly: constants
     /// have `OpRef >= CONST_BASE`, NONE is `u32::MAX`. Both pass through
-    /// unchanged; only TAGBOX-equivalent OpRefs go through `_get`.
-    fn _untag(&self, opref: OpRef) -> OpRef {
+    /// unchanged (value-inline const box); only TAGBOX-equivalent OpRefs
+    /// go through `_get`, which returns the cached fresh box object.
+    fn _untag(&self, opref: OpRef) -> BoxRef {
         if opref.is_none() || opref.is_constant() {
-            opref
+            BoxRef::from_opref(opref)
         } else {
             self._get(opref.raw() as usize)
         }
@@ -383,15 +387,24 @@ impl<'a> TraceIterator<'a> {
     /// trace position (which is monotonic for non-void ops in a
     /// well-formed trace), so `_index - 1` lands on the same cache slot
     /// the previous `next()` call wrote.
-    pub fn replace_last_cached(&mut self, oldbox: OpRef, new_box: OpRef) {
+    pub fn replace_last_cached(&mut self, oldbox: OpRef, new_box: BoxRef) {
         let last_idx = (self._index - 1) as usize;
-        debug_assert_eq!(self._cache[last_idx], Some(oldbox));
+        // opencoder.py:283 `assert self._cache[self._index - 1] is oldbox`
+        // — checked by encoding here since callers identify the old box
+        // by its OpRef.
+        debug_assert_eq!(
+            self._cache[last_idx].as_ref().map(|b| b.to_opref()),
+            Some(oldbox)
+        );
         self._cache[last_idx] = Some(new_box);
     }
 
     /// opencoder.py:362-406 next() — produce the next operation as a fresh
-    /// box (`cls()` in RPython) with translated args.
-    pub fn next(&mut self) -> Option<majit_ir::Op> {
+    /// box (`cls()` in RPython) with translated args. The returned `OpRc`
+    /// IS the cached box object: a later arg referencing this op's raw
+    /// trace position resolves (via `_untag` → `_get`) to a clone of the
+    /// same `Rc` handle, matching RPython's `_cache[i] is res` identity.
+    pub fn next(&mut self) -> Option<majit_ir::OpRc> {
         if self.done() {
             return None;
         }
@@ -401,13 +414,11 @@ impl<'a> TraceIterator<'a> {
         // opencoder.py:379-387: for i in range(argnum):
         //     res.setarg(i, self._untag(self._next()))
         for i in 0..res.num_args() {
-            res.setarg(i, BoxRef::from_opref(self._untag(res.arg(i).to_opref())));
+            res.setarg(i, self._untag(res.arg(i).to_opref()));
         }
         if let Some(fa) = res.fail_args_mut() {
             for arg in fa.iter_mut() {
-                *arg = majit_ir::operand::Operand::Box(BoxRef::from_opref(
-                    self._untag(arg.to_opref()),
-                ));
+                *arg = majit_ir::operand::Operand::Box(self._untag(arg.to_opref()));
             }
         }
         // RPython opencoder.py:399-401:
@@ -429,6 +440,7 @@ impl<'a> TraceIterator<'a> {
         // monotonic `op_count`).
         let is_void_result =
             src.pos.get().is_none() || src.opcode.result_type() == majit_ir::Type::Void;
+        let mut cache_slot: Option<usize> = None;
         if !is_void_result {
             let orig = src.pos.get().raw() as usize;
             if orig >= self._cache.len() {
@@ -444,8 +456,8 @@ impl<'a> TraceIterator<'a> {
             // `opcode.result_type()`.
             let fresh = OpRef::op_typed(self._fresh, src.opcode.result_type());
             self._fresh += 1;
-            self._cache[orig] = Some(fresh);
             res.pos.set(fresh);
+            cache_slot = Some(orig);
             // RPython `_index` parity: advance past the cache slot we
             // just wrote. In RPython this happens via `_index += 1`
             // because `_index` == cache slot index; in majit the cache
@@ -465,6 +477,13 @@ impl<'a> TraceIterator<'a> {
             res.pos.set(f);
         } else {
             res.pos.set(src.pos.get());
+        }
+        let res = std::rc::Rc::new(res);
+        // opencoder.py:400-401 `self._cache[self._index] = res` — cache
+        // the fresh op OBJECT itself so later references resolve to the
+        // same identity.
+        if let Some(orig) = cache_slot {
+            self._cache[orig] = Some(BoxRef::from_bound_op(&res));
         }
         // self._count += 1
         self._count += 1;
@@ -2837,6 +2856,17 @@ mod tests {
         op
     }
 
+    /// Helper: project the iterator's fresh inputarg objects onto their
+    /// OpRef encodings for positional assertions.
+    fn inputarg_oprefs(iter: &TraceIterator<'_>) -> Vec<OpRef> {
+        iter.inputargs.iter().map(|ia| ia.opref()).collect()
+    }
+
+    /// Helper: project a `_cache` slot onto its OpRef encoding.
+    fn cache_opref(iter: &TraceIterator<'_>, i: usize) -> Option<OpRef> {
+        iter._cache[i].as_ref().map(|b| b.to_opref())
+    }
+
     #[test]
     fn test_trace_iterator_next_basic() {
         // opencoder.py:362-406 TraceIterator.next() parity:
@@ -2855,9 +2885,9 @@ mod tests {
         // as InputArgInt(0..2), op results follow as BoxInt(2..).
         let ops: Vec<majit_ir::OpRc> = ops.into_iter().map(std::rc::Rc::new).collect();
         let mut iter = TraceIterator::new(&ops, 0, ops.len(), None, &inputarg_types, 0);
-        assert_eq!(iter.inputargs, vec![iarg(0), iarg(1)]);
-        assert_eq!(iter._cache[0], Some(iarg(0)));
-        assert_eq!(iter._cache[1], Some(iarg(1)));
+        assert_eq!(inputarg_oprefs(&iter), vec![iarg(0), iarg(1)]);
+        assert_eq!(cache_opref(&iter, 0), Some(iarg(0)));
+        assert_eq!(cache_opref(&iter, 1), Some(iarg(1)));
 
         // First IntAdd: result at fresh BoxInt(2), args translated via cache.
         let r1 = iter.next().unwrap();
@@ -2915,7 +2945,7 @@ mod tests {
         while let Some(op) = p2.next() {
             p2_ops.push(op);
         }
-        assert_eq!(p2.inputargs, vec![iarg(4), iarg(5)]);
+        assert_eq!(inputarg_oprefs(&p2), vec![iarg(4), iarg(5)]);
         assert_eq!(p2_ops[0].pos.get(), iop(6));
         assert_eq!(p2_ops[0].arg(0).to_opref(), iarg(4));
         assert_eq!(p2_ops[0].arg(1).to_opref(), iarg(5));
@@ -2981,8 +3011,8 @@ mod tests {
         // replace_last_cached(oldbox=BoxInt(101), new_box=BoxInt(999))
         // must target _cache[_index - 1] = _cache[1], where the last
         // write placed BoxInt(101).
-        iter.replace_last_cached(iop(101), iop(999));
-        assert_eq!(iter._cache[1], Some(iop(999)));
+        iter.replace_last_cached(iop(101), BoxRef::from_opref(iop(999)));
+        assert_eq!(cache_opref(&iter, 1), Some(iop(999)));
 
         // The next op references raw pos 1 as its first arg, so the
         // replaced value should flow through _untag → _get.
@@ -3036,10 +3066,10 @@ mod tests {
         let mut iter = TraceIterator::new(&ops, 0, ops.len(), None, &inputarg_types, 100);
 
         assert_eq!(
-            iter.inputargs,
+            inputarg_oprefs(&iter),
             vec![rarg(100), rarg(101), iarg(102), iarg(103)]
         );
-        assert_eq!(iter._cache[1], Some(rarg(101)));
+        assert_eq!(cache_opref(&iter, 1), Some(rarg(101)));
 
         let op0 = iter.next().unwrap();
         assert_eq!(op0.pos.get(), iop(104));
@@ -3060,7 +3090,7 @@ mod tests {
             vec![iop(104), rarg(101)]
         );
         assert_eq!(op1.pos.get(), rop(105));
-        assert_eq!(iter._cache[1], Some(rop(105)));
+        assert_eq!(cache_opref(&iter, 1), Some(rop(105)));
 
         let finish = iter.next().unwrap();
         assert_eq!(

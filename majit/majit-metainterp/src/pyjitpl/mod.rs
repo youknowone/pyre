@@ -575,7 +575,7 @@ struct PreparedBridgeTrace {
     pending_bridge_rd: Option<PendingBridgeRd>,
 }
 
-fn translate_trace_iter_opref(opref: OpRef, cache: &[Option<OpRef>]) -> OpRef {
+fn translate_trace_iter_opref(opref: OpRef, cache: &[Option<crate::r#box::BoxRef>]) -> OpRef {
     if opref.is_none() || opref.is_constant() {
         return opref;
     }
@@ -587,8 +587,8 @@ fn translate_trace_iter_opref(opref: OpRef, cache: &[Option<OpRef>]) -> OpRef {
     // OpRefs the recorder produced for this bridge.
     cache
         .get(opref.raw() as usize)
-        .copied()
-        .flatten()
+        .and_then(|slot| slot.as_ref())
+        .map(|b| b.to_opref())
         .unwrap_or_else(|| {
             panic!(
                 "translate_trace_iter_opref cache miss for {opref:?} (cache_len={})",
@@ -599,7 +599,7 @@ fn translate_trace_iter_opref(opref: OpRef, cache: &[Option<OpRef>]) -> OpRef {
 
 fn translate_trace_iter_box_map(
     mut box_map: SnapshotBoxes,
-    cache: &[Option<OpRef>],
+    cache: &[Option<crate::r#box::BoxRef>],
 ) -> SnapshotBoxes {
     for boxes in box_map.iter_mut().flatten() {
         for boxref in boxes.iter_mut() {
@@ -647,14 +647,17 @@ fn prepare_bridge_trace_for_optimizer(
         &bridge_inputarg_types,
         bridge_inputarg_base,
     );
+    // Clone-out boundary: `PreparedBridgeTrace.ops` is still `Vec<Op>`
+    // by value; `Op::clone` preserves the bound operand handles minted
+    // by the iterator (Rc clones).
     let mut ops = Vec::with_capacity(bridge_ops.len());
     while let Some(op) = iter.next() {
-        ops.push(op);
+        ops.push((*op).clone());
     }
     let inputargs = bridge_inputargs
         .iter()
-        .zip(iter.inputargs.iter().copied())
-        .map(|(arg, opref)| InputArg::from_type(arg.tp, opref.raw()))
+        .zip(iter.inputargs.iter())
+        .map(|(arg, ia)| InputArg::from_type(arg.tp, ia.opref().raw()))
         .collect();
     let cache = iter._cache;
     let snapshot_boxes = translate_trace_iter_box_map(snapshot_boxes, &cache);

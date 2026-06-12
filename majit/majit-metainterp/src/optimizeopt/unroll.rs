@@ -561,9 +561,14 @@ impl UnrollOptimizer {
                 &p1_inputarg_types,
                 0, // start_fresh = 0 — inputargs at [0..num_inputs)
             );
+            // Clone-out boundary: the optimizer entry below still takes
+            // `&[Op]` by value; `Op::clone` preserves the bound operand
+            // handles minted by the iterator (Rc clones), so bindings
+            // survive the copy. Dissolves when the stage flips to
+            // `Vec<OpRc>` end-to-end.
             let mut p1_ops_in: Vec<Op> = Vec::with_capacity(ops.len());
             while let Some(op) = p1_iter.next() {
-                p1_ops_in.push(op);
+                p1_ops_in.push((*op).clone());
             }
             let p1_iter_fresh_hw = p1_iter._fresh;
             // compile.py:275 `PreambleCompileData(trace, jumpargs, ...)` —
@@ -911,9 +916,10 @@ impl UnrollOptimizer {
             &p2_inputarg_types,
             phase2_inputarg_base, // fresh inputargs at [phase2_inputarg_base..)
         );
+        // Clone-out boundary — see the Phase 1 drive loop above.
         let mut p2_ops_in: Vec<Op> = Vec::with_capacity(ops.len());
         while let Some(op) = iter.next() {
-            p2_ops_in.push(op);
+            p2_ops_in.push((*op).clone());
         }
         let p2_high_water = iter._fresh;
         let p2_cache = iter._cache;
@@ -935,8 +941,8 @@ impl UnrollOptimizer {
             }
             p2_cache
                 .get(opref.raw() as usize)
-                .copied()
-                .flatten()
+                .and_then(|slot| slot.as_ref())
+                .map(|b| b.to_opref())
                 .unwrap_or_else(|| {
                     panic!(
                         "phase2 snapshot remap cache miss for {opref:?} \
