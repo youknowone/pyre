@@ -1785,8 +1785,9 @@ impl OptVirtualize {
             Some(r) if r != OpRef::NONE => r,
             _ => return false,
         };
-        let forced_resolved = ctx.get_box_replacement(forced_ref).to_opref();
+        // One chain walk; the position view falls back to the source.
         let forced_box = ctx.get_box_replacement_box(forced_ref);
+        let forced_resolved = forced_box.as_ref().map_or(forced_ref, |b| b.to_opref());
         let forced_ok = match forced_box.as_ref().and_then(|b| ctx.peek_ptr_info(b)) {
             Some(info) => !info.is_null(),
             None => false,

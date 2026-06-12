@@ -1144,16 +1144,13 @@ impl OptRewrite {
             return true;
         }
 
-        let source_box = ctx.get_box_replacement(source_box).to_opref();
-        let dest_box = ctx.get_box_replacement(dest_box).to_opref();
-        let source_is_virtual = ctx
-            .get_box_replacement_box(source_box)
-            .as_ref()
-            .map_or(false, |b| ctx.is_virtual(b));
-        let dest_is_virtual = ctx
-            .get_box_replacement_box(dest_box)
-            .as_ref()
-            .map_or(false, |b| ctx.is_virtual(b));
+        // One chain walk each; the position view falls back to the source.
+        let source_b = ctx.get_box_replacement_box(source_box);
+        let source_box = source_b.as_ref().map_or(source_box, |b| b.to_opref());
+        let dest_b = ctx.get_box_replacement_box(dest_box);
+        let dest_box = dest_b.as_ref().map_or(dest_box, |b| b.to_opref());
+        let source_is_virtual = source_b.as_ref().map_or(false, |b| ctx.is_virtual(b));
+        let dest_is_virtual = dest_b.as_ref().map_or(false, |b| ctx.is_virtual(b));
 
         // rewrite.py:610-611: constant start indices required
         let source_start = match ctx
@@ -1982,7 +1979,7 @@ impl Optimization for OptRewrite {
                             // so `take_preamble_forwarded_opinfo` reads the
                             // info seeded at result_opref's slot per the
                             // dual-slot rule (mod.rs:1817 replay_pos).
-                            let replay_pos = ctx.get_box_replacement(source).to_opref();
+                            let replay_pos = ctx.get_replacement_opref(source);
                             let source_box = ctx.materialize_box_at(source);
                             let mut replay = Op::new(OpCode::SameAsI, &[source_box.clone()]);
                             replay.pos.set(replay_pos);
