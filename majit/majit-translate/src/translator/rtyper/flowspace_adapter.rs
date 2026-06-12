@@ -1459,14 +1459,23 @@ pub fn translate_op(
                         // the field-read side uses
                         // (`getuniqueclassdef_for_struct_root`), so
                         // ctor base and attr reads share one
-                        // `HostObject` Arc.
+                        // `HostObject` Arc.  Scoped to unit-only enums
+                        // (flat class rows = `__discriminant` alone):
+                        // a payload-bearing enum's flat class projects
+                        // the union of variant payload rows as classdef
+                        // attrs, and the subclass instance repr would
+                        // have to materialize all of them — walling on
+                        // reprs not yet ported (e.g. `Vec` payload rows
+                        // need rlist.py ListRepr).  Those enums keep
+                        // base-less variant classes until the missing
+                        // reprs land.
                         let enum_base = owner_path.last().and_then(|owner_tail| {
                             let registry = bk.pyre_struct_fields.borrow();
-                            let is_enum = registry.as_ref().is_some_and(|reg| {
-                                reg.field_type(owner_tail, "__discriminant").is_some()
-                            });
+                            let is_unit_enum = registry
+                                .as_ref()
+                                .is_some_and(|reg| reg.is_unit_only_enum(owner_tail));
                             drop(registry);
-                            is_enum.then(|| bk.intern_class_by_qualname(owner_tail))
+                            is_unit_enum.then(|| bk.intern_class_by_qualname(owner_tail))
                         });
                         match enum_base {
                             Some(base) => {

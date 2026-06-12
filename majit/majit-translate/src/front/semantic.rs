@@ -134,6 +134,15 @@ impl StructFieldRegistry {
             .map(|(_, ty)| ty.as_str())
     }
 
+    /// True when `owner` is registered as an enum flat class whose only
+    /// row is the synthetic `__discriminant` tag — a unit-only enum
+    /// (every variant fieldless).  Payload-bearing enums carry the union
+    /// of their variant fields as further rows.
+    pub fn is_unit_only_enum(&self, owner: &str) -> bool {
+        self.lookup_fields(owner)
+            .is_some_and(|rows| matches!(rows, [(name, _)] if name == "__discriminant"))
+    }
+
     fn lookup_fields(&self, owner: &str) -> Option<&[(String, String)]> {
         if let Some(fields) = self.fields.get(owner) {
             return Some(fields.as_slice());
