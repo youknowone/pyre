@@ -2013,7 +2013,7 @@ pub(crate) fn derive_subject_inputcells(
                 if let (Some(root), Some(bk)) = (class_root.as_ref(), bookkeeper) {
                     // A generic param (`&T` where `T: Trait`, incl. a
                     // trait default body's `&Self`) carries the bound
-                    // trait's leaf as `class_root`
+                    // trait's qualified path as `class_root`
                     // (`tyref_generic_trait_bound_root`).  When the
                     // analyzed world has exactly one concrete impl of
                     // that trait, the receiver's only possible shape is

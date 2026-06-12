@@ -91,6 +91,14 @@ pub struct SemanticFunction {
     /// (which need `register_trait_method`) from inherent methods
     /// (which need `register_function_graph`).
     pub trait_root: Option<String>,
+    /// Fully-qualified `name_path()` of the trait when this function
+    /// is an `impl Trait for Type {…}` method, otherwise `None`.
+    /// Distinguishes traits whose leaf names collide — the unique-impl
+    /// map (`pyre_trait_unique_impls`) keys on this, not `trait_root`.
+    /// Trait default bodies leave it `None`: Charon names them with
+    /// only the trait leaf segment, and they never feed the
+    /// unique-impl map.
+    pub trait_qualified: Option<String>,
 }
 
 /// RPython: struct field type info for `heaptracker.all_interiorfielddescrs`.
@@ -403,6 +411,7 @@ mod tests {
             hints: Vec::new(),
             access_directly: false,
             trait_root: None,
+            trait_qualified: None,
         }
     }
 

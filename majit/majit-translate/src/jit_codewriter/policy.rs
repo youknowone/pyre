@@ -401,6 +401,7 @@ mod tests {
             module_path: String::new(),
             access_directly: false,
             trait_root: None,
+            trait_qualified: None,
         }
     }
 
@@ -450,6 +451,7 @@ mod tests {
             module_path: String::new(),
             access_directly: false,
             trait_root: None,
+            trait_qualified: None,
         };
         // Without `unroll_safe`, the loop disqualifies the graph.
         assert!(!policy.look_inside_graph(&loopy));
@@ -465,6 +467,7 @@ mod tests {
             module_path: String::new(),
             access_directly: false,
             trait_root: None,
+            trait_qualified: None,
         };
         assert!(policy.look_inside_graph(&unroll_safe));
     }

@@ -255,12 +255,31 @@ impl PyreCallRegistry {
         let Some(reg) = guard.as_ref() else {
             return;
         };
+        // Leaf owners naming more than one qualified struct are
+        // ambiguous for METHOD seeding even when their bare field
+        // alias survived `harden_duplicate_leaf_metadata` (identical
+        // field rows keep the alias, but the duplicate structs'
+        // method sets may differ).  Seeding would pool both origins'
+        // methods onto the one leaf-interned class, so a getattr
+        // could bind a wrong-origin method silently.  Skip those
+        // owners — the dispatch stays blocked (census-visible)
+        // until per-origin class interning lands.
+        let mut leaf_struct_counts: std::collections::HashMap<&str, usize> =
+            std::collections::HashMap::new();
+        for key in reg.fields.keys() {
+            if let Some((_, leaf)) = key.rsplit_once("::") {
+                *leaf_struct_counts.entry(leaf).or_default() += 1;
+            }
+        }
         for (key, entry) in self.entries.borrow().iter() {
             let segs = key.segments();
             let [.., owner, method] = segs else {
                 continue;
             };
             if !reg.fields.contains_key(owner) {
+                continue;
+            }
+            if leaf_struct_counts.get(owner.as_str()).copied().unwrap_or(0) > 1 {
                 continue;
             }
             let class_host = self.bookkeeper.intern_class_by_qualname(owner);

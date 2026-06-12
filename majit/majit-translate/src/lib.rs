@@ -575,11 +575,21 @@ fn analyze_pipeline_from_module_paths(
     mark_phase!("build_semantic_program_from_parsed_files");
     let mut canonical_trait_impls = Vec::new();
     let mut canonical_inherent_methods = Vec::new();
-    // `(trait_leaf, method_name, owner, return_type, hints)` for every
-    // concrete trait-impl method — input to the single-impl
-    // devirtualization pass below.
-    let mut concrete_trait_methods: Vec<(String, String, String, Option<String>, Vec<String>)> =
-        Vec::new();
+    // `(trait_leaf, trait_qualified, method_name, owner, return_type,
+    // hints)` for every concrete trait-impl method — input to the
+    // single-impl devirtualization pass below.  `trait_qualified` is
+    // the trait's full `name_path()`; the leaf keys the
+    // direct-path-binding bookkeeping (matching `canonical_trait_impls`
+    // spelling), the qualified path keys the unique-impl map.
+    #[allow(clippy::type_complexity)]
+    let mut concrete_trait_methods: Vec<(
+        String,
+        String,
+        String,
+        String,
+        Option<String>,
+        Vec<String>,
+    )> = Vec::new();
     let mut canonical_function_graphs = std::collections::HashMap::new();
     // `bookkeeper.py:353-409 getdesc` / `newfuncdesc` keys on the host
     // function-object identity, so two unrelated `crate_a::helper` and
@@ -636,6 +646,9 @@ fn analyze_pipeline_from_module_paths(
             (Some(owner), Some(trait_leaf)) => {
                 concrete_trait_methods.push((
                     trait_leaf.clone(),
+                    func.trait_qualified
+                        .clone()
+                        .unwrap_or_else(|| trait_leaf.clone()),
                     func.name.clone(),
                     owner.clone(),
                     func.return_type.clone(),
@@ -973,7 +986,7 @@ fn analyze_pipeline_from_module_paths(
     }
     let mut concrete_impl_counts: std::collections::HashMap<(String, String), usize> =
         std::collections::HashMap::new();
-    for (trait_leaf, method_name, _, _, _) in &concrete_trait_methods {
+    for (trait_leaf, _, method_name, _, _, _) in &concrete_trait_methods {
         *concrete_impl_counts
             .entry((trait_leaf.clone(), method_name.clone()))
             .or_insert(0) += 1;
@@ -988,27 +1001,48 @@ fn analyze_pipeline_from_module_paths(
         String,
         std::collections::BTreeSet<String>,
     > = std::collections::HashMap::new();
-    for (trait_leaf, _, owner, _, _) in &concrete_trait_methods {
+    for (_, trait_qualified, _, owner, _, _) in &concrete_trait_methods {
+        // Keyed by the trait's qualified `name_path()` — two distinct
+        // traits sharing a leaf name must not pool their impl owners
+        // (`tyref_generic_trait_bound_root` resolves bound-trait
+        // receivers through this map by the same qualified path).
         trait_impl_owners
-            .entry(trait_leaf.clone())
+            .entry(trait_qualified.clone())
             .or_default()
             .insert(owner.clone());
     }
+    // Leaf names shared by more than one qualified struct in the
+    // field registry: a unique-impl entry whose owner collapses to
+    // such a leaf could seed the receiver with the OTHER same-named
+    // struct's classdef, so those entries are dropped (fail-safe: the
+    // receiver keeps the classdef-less shell and the block stays
+    // census-visible).
+    let mut struct_leaf_counts: std::collections::HashMap<&str, usize> =
+        std::collections::HashMap::new();
+    for key in program.struct_fields.fields.keys() {
+        if let Some((_, leaf)) = key.rsplit_once("::") {
+            *struct_leaf_counts.entry(leaf).or_default() += 1;
+        }
+    }
     let trait_unique_impls: std::collections::HashMap<String, String> = trait_impl_owners
         .into_iter()
-        .filter_map(|(trait_leaf, owners)| {
-            (owners.len() == 1).then(|| {
-                let owner = owners.into_iter().next().unwrap();
-                // `self_ty_root` may be module-qualified
-                // (`pyframe::PyFrame`); the struct-field registry and
-                // `getuniqueclassdef_for_struct_root` key on the leaf.
-                let leaf = owner.rsplit("::").next().unwrap_or(&owner).to_string();
-                (trait_leaf, leaf)
-            })
+        .filter_map(|(trait_qualified, owners)| {
+            if owners.len() != 1 {
+                return None;
+            }
+            let owner = owners.into_iter().next().unwrap();
+            // `self_ty_root` may be module-qualified
+            // (`pyframe::PyFrame`); the struct-field registry and
+            // `getuniqueclassdef_for_struct_root` key on the leaf.
+            let leaf = owner.rsplit("::").next().unwrap_or(&owner).to_string();
+            if struct_leaf_counts.get(leaf.as_str()).copied().unwrap_or(0) > 1 {
+                return None;
+            }
+            Some((trait_qualified, leaf))
         })
         .collect();
     call_control.set_trait_unique_impls(trait_unique_impls);
-    for (trait_leaf, method_name, owner, return_type, hints) in &concrete_trait_methods {
+    for (trait_leaf, _, method_name, owner, return_type, hints) in &concrete_trait_methods {
         let key = (trait_leaf.clone(), method_name.clone());
         if concrete_impl_counts.get(&key) != Some(&1) || default_trait_methods.contains(&key) {
             continue;

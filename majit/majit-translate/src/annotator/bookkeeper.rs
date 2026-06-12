@@ -302,13 +302,16 @@ pub struct Bookkeeper {
     /// where `t` is the already-resolved class object.  Used by
     /// [`Self::getuniqueclassdef_for_struct_root`].
     pub pyre_struct_root_classes: RefCell<HashMap<String, HostObject>>,
-    /// TODO: no upstream equivalent.  Trait leaf → owner root of its
-    /// only concrete impl in the analyzed LLBC world (computed in
-    /// `lib.rs` from `concrete_trait_methods`; multi-impl traits are
-    /// absent).  `derive_subject_inputcells` consults this when a `Ref`
-    /// parameter's `class_root` is a trait leaf (generic receiver) —
-    /// the unique impl's struct root then seeds the receiver's
-    /// `ClassDef` through [`Self::getuniqueclassdef_for_struct_root`].
+    /// TODO: no upstream equivalent.  Qualified trait path → owner
+    /// root of its only concrete impl in the analyzed LLBC world
+    /// (computed in `lib.rs` from `concrete_trait_methods`; multi-impl
+    /// traits are absent).  The key is the trait's full `name_path()`
+    /// so leaf-name collisions between distinct traits cannot pool
+    /// impl owners.  `derive_subject_inputcells` consults this when a
+    /// `Ref` parameter's `class_root` is a bound-trait path (generic
+    /// receiver) — the unique impl's struct root then seeds the
+    /// receiver's `ClassDef` through
+    /// [`Self::getuniqueclassdef_for_struct_root`].
     /// RPython's annotator never needs this: it sees the concrete
     /// receiver class at every call site (`classdesc.py:749 lookup`).
     pub pyre_trait_unique_impls: RefCell<HashMap<String, String>>,

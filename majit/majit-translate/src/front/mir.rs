@@ -354,15 +354,20 @@ pub fn build_semantic_program_from_llbc_with_static_addrs(
         //
         // Two sources feed `trait_root`:
         //   1. trait-impl bodies — penultimate NameSeg is `Impl{Trait:id}`
-        //      indirecting through `trait_impls`.  `trait_impl_trait_root_for_fundecl`
-        //      reads the id.
+        //      indirecting through `trait_impls`.  `trait_impl_trait_path_for_fundecl`
+        //      reads the id; `trait_qualified` keeps the full path so
+        //      the unique-impl map can key on trait identity.
         //   2. trait-default bodies — Charon emits these as bare
         //      functions inside the trait's namespace; the penultimate
         //      NameSeg is `Ident{TraitLeaf}` with no `Impl` segment.
         //      Detect by matching the parent ident against
         //      `known_trait_names` (which derive_program_metadata seeds
         //      with both qualified path and bare leaf).
-        let trait_root = trait_impl_trait_root_for_fundecl(llbc, fd)
+        let trait_qualified = trait_impl_trait_path_for_fundecl(llbc, fd);
+        let trait_root = trait_qualified
+            .as_ref()
+            .and_then(|p| p.rsplit("::").next())
+            .map(str::to_string)
             .or_else(|| trait_default_owner_for_fundecl(fd, &known_trait_names));
         functions.push(crate::front::semantic::SemanticFunction {
             name,
@@ -373,6 +378,7 @@ pub fn build_semantic_program_from_llbc_with_static_addrs(
             hints: Vec::new(),
             access_directly: false,
             trait_root,
+            trait_qualified,
         });
     }
     // Coverage gate. Every `skipped` entry is a function whose MIR shape
@@ -898,8 +904,9 @@ impl<'a> Lowering<'a> {
             // `ClassDef`; only `Ref`-typed params consume it there.  A
             // generic param (`&T` where `T: Trait`, incl. trait default
             // bodies' `&Self`) has no ADT leaf — carry the bound
-            // trait's leaf instead, which the adapter resolves through
-            // the unique-impl map (`pyre_trait_unique_impls`).
+            // trait's qualified path instead, which the adapter
+            // resolves through the unique-impl map
+            // (`pyre_trait_unique_impls`, keyed by qualified path).
             let class_root = match &ty {
                 ValueType::Ref(_) => tyref_class_root(&local.ty, llbc)
                     .or_else(|| tyref_generic_trait_bound_root(&local.ty, llbc, generics)),
@@ -3828,10 +3835,13 @@ fn resolve_impl_owner_adt_def_id_free(
 /// [`trait_method_owner`] without a `trait_impls` indirection).
 ///
 /// Used by `build_semantic_program_from_llbc` to populate
-/// `SemanticFunction.trait_root` so the canonical registration loop
-/// can call `CallControl::register_trait_method` instead of routing
-/// through `extract_trait_impls`.
-fn trait_impl_trait_root_for_fundecl(llbc: &Llbc, fd: &FunDecl) -> Option<String> {
+/// `SemanticFunction.trait_root` (leaf) and `trait_qualified` (this
+/// fn's return value, the full `name_path()`) so the canonical
+/// registration loop can call `CallControl::register_trait_method`
+/// instead of routing through `extract_trait_impls`, and so the
+/// unique-impl map can key on trait identity rather than a bare leaf
+/// (two distinct traits may share a final segment).
+fn trait_impl_trait_path_for_fundecl(llbc: &Llbc, fd: &FunDecl) -> Option<String> {
     let segs = &fd.item_meta.name;
     let last_idx = segs
         .iter()
@@ -3864,17 +3874,11 @@ fn trait_impl_trait_root_for_fundecl(llbc: &Llbc, fd: &FunDecl) -> Option<String
     if !td.item_meta.is_local {
         return None;
     }
-    let trait_leaf = td
-        .item_meta
-        .name_path()
-        .rsplit("::")
-        .next()
-        .unwrap_or("")
-        .to_string();
-    if trait_leaf.is_empty() {
+    let trait_path = td.item_meta.name_path();
+    if trait_path.is_empty() {
         return None;
     }
-    Some(trait_leaf)
+    Some(trait_path)
 }
 
 /// Detect a trait-default body — a function whose penultimate NameSeg
@@ -4483,7 +4487,8 @@ fn typevar_bound_index(node: &serde_json::Value) -> Option<u64> {
 }
 
 /// Resolve a generic parameter type (`&T` where `T: Trait`, including a
-/// trait default body's `&Self`) to the bound trait's name leaf.
+/// trait default body's `&Self`) to the bound trait's qualified
+/// `name_path()`.
 ///
 /// [`tyref_class_root`] answers `None` for such a parameter — a
 /// `TypeVar` has no ADT decl — so `OpKind::Input.class_root` stayed
@@ -4491,10 +4496,12 @@ fn typevar_bound_index(node: &serde_json::Value) -> Option<u64> {
 /// classdef-less `SomeInstance(None)` shell, which fails on the first
 /// `getattr`.  The bound trait names the receiver's only possible shape
 /// when the analyzed world has exactly one concrete impl;
-/// `derive_subject_inputcells` resolves the returned trait leaf through
+/// `derive_subject_inputcells` resolves the returned trait path through
 /// `Bookkeeper::pyre_trait_unique_impls` and only seeds a classdef on a
-/// unique hit, so carrying a multi-impl (or foreign) trait leaf here is
-/// inert.
+/// unique hit, so carrying a multi-impl (or foreign) trait path here is
+/// inert.  The qualified path (not the leaf) is the map key so two
+/// distinct traits sharing a final segment cannot seed each other's
+/// impl type.
 ///
 /// Bounds declared in `core`/`std`/`alloc` (`MetaSized`, `Sized`, …)
 /// are skipped: marker/stdlib traits never name a project struct, and
@@ -4536,7 +4543,7 @@ fn tyref_generic_trait_bound_root(
         if matches!(crate_root, "core" | "std" | "alloc") {
             continue;
         }
-        return Some(name.rsplit("::").next().unwrap_or(&name).to_string());
+        return Some(name);
     }
     None
 }
