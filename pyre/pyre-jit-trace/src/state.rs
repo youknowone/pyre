@@ -847,89 +847,77 @@ pub(crate) fn sub_jitcode_param_colors_for_code(code: *const ()) -> Option<Vec<u
     Some(pjc.metadata.pyre_color_for_semantic_local.clone())
 }
 
-type SubDescrPool = (
+pub(crate) type SubDescrPool = (
     &'static [DescrRef],
     &'static [majit_metainterp::jitcode::RuntimeBhDescr],
     &'static crate::jitcode_dispatch::SubJitCodeLookup,
 );
 
-thread_local! {
-    // Keyed by `(code ptr, payload ptr)` so a refined callee whose payload
-    // is replaced in place gets a fresh, correct entry instead of stale
-    // descrs.  The retained `Arc<PyJitCode>` keeps the payload (and thus the
-    // borrowed `perfn_descrs` / leaked `lookup`) alive for as long as the
-    // entry exists — reproducing RPython's refcount-keeps-JitCode-alive
-    // guarantee, which a bare code-ptr key would break on payload swap.
-    static SUB_DESCR_POOL_CACHE: std::cell::RefCell<
-        std::collections::HashMap<(usize, usize), (std::sync::Arc<crate::PyJitCode>, SubDescrPool)>,
-    > = std::cell::RefCell::new(std::collections::HashMap::new());
-}
-
-/// Build (memoized per code ptr) the per-fn descr pool a callee body needs
-/// when inlined by full-body-walk call inlining: its OWN adapted
+/// Build (memoized on the payload itself) the per-fn descr pool a callee body
+/// needs when inlined by full-body-walk call inlining: its OWN adapted
 /// `descr_refs` + raw `RuntimeBhDescr` slice (for `RawDescrPool::PerFn`) +
 /// `sub_jitcode_lookup`.  Mirror of the top-level diagnostic walk's per-fn
 /// descr-pool construction (`trace.rs:363-400`, task #50): a callee body's
 /// `d`/`j` descr operands index its OWN `exec.descrs`, not the caller's pool.
 ///
-/// The returned slices are `'static` because the cache entry retains the
-/// callee `Arc<PyJitCode>`, keeping the payload (and its `exec.descrs`) alive
-/// for as long as the entry exists; the adapted `descr_refs` Vec and the
-/// lookup closure are leaked once per distinct callee payload (bounded by the
-/// program's callable count × refinements, not per trace attempt) and cached.
-/// `'static` coerces to the walker's `'static_a`.
+/// The pool lives on `PyJitCodePayload.sub_descr_pool`, not in a side table
+/// keyed by object identity: RPython has no such table — the active MIFrame's
+/// JitCode carries its descriptors directly — and an identity-keyed cache
+/// would survive `PyJitCode::replace_with`, which refills the body in place
+/// under the same outer allocation (an in-place refill overwrites the inner
+/// `exec.descrs` the pool borrows). Carried on the payload, the pool is
+/// dropped by the same `replace_with` that invalidates its borrows.
+///
+/// The returned slices are `'static` because the payload lives for the
+/// program in the append-only `MetaInterpStaticData.jitcodes` store
+/// (warmspot.py:282) — the same justification as `sub_jitcode_body_for_code`
+/// below; the adapted `descr_refs` Vec and the lookup closure are leaked once
+/// per distinct callee body (bounded by the program's callable count ×
+/// refinements, not per trace attempt). `'static` coerces to the walker's
+/// `'static_a`.
 pub(crate) fn sub_jitcode_descr_pool_for_code(code: *const ()) -> Option<SubDescrPool> {
     use majit_metainterp::jitcode::RuntimeBhDescr;
     if code.is_null() || jitcode_for(code).is_null() {
         return None;
     }
     let pjc = pyjitcode_for_code(code)?;
-    // Key on `(code, payload)` identity: a merge-point refinement replaces the
-    // payload Arc in place for the same code ptr (set_jitcodes_from_make_result
-    // / jitcode_for), and a bare code-ptr key would then return descrs derived
-    // from the superseded payload.
-    let key = (code as usize, std::sync::Arc::as_ptr(&pjc) as usize);
-    if let Some(v) = SUB_DESCR_POOL_CACHE.with(|c| c.borrow().get(&key).map(|e| e.1)) {
-        return Some(v);
-    }
-    // SAFETY: the borrow is valid for `'static` because the cache entry below
-    // retains `Arc::clone(&pjc)`, so this payload (and its immutable, post-build
-    // `exec.descrs`) outlives every returned slice regardless of any later
-    // payload replacement for the same code ptr.
-    let perfn_descrs: &'static [RuntimeBhDescr] =
-        unsafe { &*(pjc.jitcode.exec.descrs.as_slice() as *const [RuntimeBhDescr]) };
-    let descr_refs: Vec<DescrRef> = perfn_descrs
-        .iter()
-        .enumerate()
-        .map(|(i, d)| match d {
-            RuntimeBhDescr::Descr(bh) => crate::descr::make_descr_from_bh(bh),
-            RuntimeBhDescr::JitCode(_)
-            | RuntimeBhDescr::Call(_)
-            | RuntimeBhDescr::AssemblerToken(_) => crate::descr::make_jitcode_descr(i),
-        })
-        .collect();
-    let descr_refs: &'static [DescrRef] = Box::leak(descr_refs.into_boxed_slice());
-    let lookup: Box<crate::jitcode_dispatch::SubJitCodeLookup> = Box::new(move |idx: usize| {
-        perfn_descrs
-            .get(idx)
-            .and_then(|d| d.as_jitcode())
-            .map(|jc| crate::jitcode_dispatch::SubJitCodeBody {
-                code: jc.code.as_slice(),
-                num_regs_r: jc.num_regs_r() as usize,
-                num_regs_i: jc.num_regs_i() as usize,
-                num_regs_f: jc.num_regs_f() as usize,
-                constants_i: jc.constants_i.as_slice(),
-                constants_r: jc.constants_r.as_slice(),
-                constants_f: jc.constants_f.as_slice(),
+    Some(*pjc.sub_descr_pool.get_or_init(|| {
+        // SAFETY: the borrow is valid for `'static` because the payload is
+        // retained for the program lifetime by the append-only
+        // `MetaInterpStaticData.jitcodes` store, and `exec.descrs` is
+        // immutable post-build. The one mutation path, `replace_with`,
+        // replaces this `OnceCell` together with the body, so the pool can
+        // never be returned for a body other than the one it was built from.
+        let perfn_descrs: &'static [RuntimeBhDescr] =
+            unsafe { &*(pjc.jitcode.exec.descrs.as_slice() as *const [RuntimeBhDescr]) };
+        let descr_refs: Vec<DescrRef> = perfn_descrs
+            .iter()
+            .enumerate()
+            .map(|(i, d)| match d {
+                RuntimeBhDescr::Descr(bh) => crate::descr::make_descr_from_bh(bh),
+                RuntimeBhDescr::JitCode(_)
+                | RuntimeBhDescr::Call(_)
+                | RuntimeBhDescr::AssemblerToken(_) => crate::descr::make_jitcode_descr(i),
             })
-    });
-    let lookup: &'static crate::jitcode_dispatch::SubJitCodeLookup = Box::leak(lookup);
-    let entry = (descr_refs, perfn_descrs, lookup);
-    SUB_DESCR_POOL_CACHE.with(|c| {
-        c.borrow_mut()
-            .insert(key, (std::sync::Arc::clone(&pjc), entry))
-    });
-    Some(entry)
+            .collect();
+        let descr_refs: &'static [DescrRef] = Box::leak(descr_refs.into_boxed_slice());
+        let lookup: Box<crate::jitcode_dispatch::SubJitCodeLookup> = Box::new(move |idx: usize| {
+            perfn_descrs
+                .get(idx)
+                .and_then(|d| d.as_jitcode())
+                .map(|jc| crate::jitcode_dispatch::SubJitCodeBody {
+                    code: jc.code.as_slice(),
+                    num_regs_r: jc.num_regs_r() as usize,
+                    num_regs_i: jc.num_regs_i() as usize,
+                    num_regs_f: jc.num_regs_f() as usize,
+                    constants_i: jc.constants_i.as_slice(),
+                    constants_r: jc.constants_r.as_slice(),
+                    constants_f: jc.constants_f.as_slice(),
+                })
+        });
+        let lookup: &'static crate::jitcode_dispatch::SubJitCodeLookup = Box::leak(lookup);
+        (descr_refs, perfn_descrs, lookup)
+    }))
 }
 
 /// `resume.py:1049` `consume_one_section` → `enumerate_vars` parity:

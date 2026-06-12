@@ -3554,6 +3554,7 @@ where
         ctx.getattr_fn_idx,
         vec![obj_operand, name_operand],
         CallFlavor::Plain,
+        majit_ir::PyreHelperKind::None,
         dst_reg,
     ))
 }
@@ -3602,6 +3603,7 @@ pub fn build_call_fn_residual_call_r_r_insn(
         call_fn_idx,
         ref_operands,
         CallFlavor::MayForce,
+        majit_ir::PyreHelperKind::CallFn,
         Register::new(Kind::Ref, dst_reg),
     )
 }
@@ -3627,6 +3629,7 @@ pub fn build_get_current_exception_fn_residual_call_r_r_insn(
         get_current_exception_fn_idx,
         Vec::new(),
         CallFlavor::PlainCannotRaiseNoHeap,
+        majit_ir::PyreHelperKind::None,
         Register::new(Kind::Ref, dst_reg),
     )
 }
@@ -3643,10 +3646,12 @@ pub fn build_residual_call_r_r_insn_from_operands(
     fn_idx: u16,
     ref_operands: Vec<Operand>,
     flavor: CallFlavor,
+    pyre_helper: majit_ir::PyreHelperKind,
     dst_reg: Register,
 ) -> Insn {
     let arg_kinds = vec![Kind::Ref; ref_operands.len()];
-    let effect_info = effect_info_for_call_flavor(flavor);
+    let mut effect_info = effect_info_for_call_flavor(flavor);
+    effect_info.pyre_helper = pyre_helper;
     let descr_operand = Operand::descr(DescrOperand::CallDescrStub(CallDescrStub {
         effect_info,
         arg_kinds,
@@ -3711,6 +3716,7 @@ pub fn build_normalize_raise_varargs_fn_residual_call_r_r_insn(
             cause,
         ],
         CallFlavor::MayForce,
+        majit_ir::PyreHelperKind::None,
         Register::new(Kind::Ref, dst_reg),
     )
 }
@@ -4310,6 +4316,7 @@ where
         ctx.call_fn_idx_by_nargs[nargs],
         operands,
         CallFlavor::MayForce,
+        majit_ir::PyreHelperKind::CallFn,
         dst_reg,
     ))
 }
@@ -7812,10 +7819,9 @@ mod tests {
                                 stub.arg_kinds,
                                 vec![Kind::Ref, Kind::Ref, Kind::Ref, Kind::Ref]
                             );
-                            assert_eq!(
-                                stub.effect_info,
-                                effect_info_for_call_flavor(CallFlavor::MayForce),
-                            );
+                            let mut expected_ei = effect_info_for_call_flavor(CallFlavor::MayForce);
+                            expected_ei.pyre_helper = majit_ir::PyreHelperKind::CallFn;
+                            assert_eq!(stub.effect_info, expected_ei);
                         }
                         other => panic!("expected CallDescrStub, got {other:?}"),
                     },
@@ -7897,8 +7903,10 @@ mod tests {
         let arg1 = Variable::new(VariableId(7), Kind::Ref);
         let arg2 = Variable::new(VariableId(8), Kind::Ref);
         let dst = Variable::new(VariableId(9), Kind::Ref);
+        let mut call_fn_ei = effect_info_for_call_flavor(CallFlavor::MayForce);
+        call_fn_ei.pyre_helper = majit_ir::PyreHelperKind::CallFn;
         let descr = intern_call_descr_stub(
-            effect_info_for_call_flavor(CallFlavor::MayForce),
+            call_fn_ei,
             vec![Kind::Ref, Kind::Ref, Kind::Ref, Kind::Ref, Kind::Ref],
             Some(Kind::Ref),
         );

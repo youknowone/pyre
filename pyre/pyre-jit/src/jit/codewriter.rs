@@ -6344,6 +6344,49 @@ impl CodeWriter {
                             // into these registers, so the pop order here must
                             // mirror the interpreter exactly or a pre-call
                             // resume reads the null slot as the callable.
+                            //
+                            // When the abstract stack carries the LoadAttr/
+                            // LoadGlobal null sentinel as a graph Constant, the
+                            // slot value exists ONLY in the vable array
+                            // (`emit_pushvalue_ref_const!` writes no stack
+                            // register), and it must NOT const-fold to
+                            // ConstRef(0): a pre-call resume seeds the slot
+                            // from the tracer, which may hold a real receiver
+                            // (load_method_fast_path pushes `[w_descr, w_obj]`,
+                            // callmethod.py:60-68).  Materialize the slot value
+                            // with the upstream popvalue read
+                            // (`pyframe.py:411-417` reads
+                            // `locals_cells_stack_w[depth]` BEFORE clearing it,
+                            // `jtransform.py:1877 do_fixed_list_getitem`) so the
+                            // stack register has a producer on the straight-line
+                            // jitcode path; a producer-less pinned variable
+                            // leaves the register unbound for any execution that
+                            // is not rd_numb-seeded (walker full-body walk,
+                            // blackhole entry upstream of the push).
+                            let null_or_self_needs_read = is_portal
+                                && !matches!(
+                                    current_state.stack.last(),
+                                    Some(super::flow::FlowValue::Variable(_))
+                                );
+                            let null_or_self_read = if null_or_self_needs_read {
+                                let slot =
+                                    (stack_base_absolute + current_depth as usize - 1) as i64;
+                                let v_idx: super::flow::FlowValue =
+                                    super::flow::Constant::signed(slot).into();
+                                Some(emit_graph_op_with_result(
+                                    &mut graph,
+                                    &current_block.block(),
+                                    "getarrayitem_vable_r",
+                                    vable_getarrayitem_ref_graph_args(
+                                        frame_var.into(),
+                                        v_idx.into(),
+                                    ),
+                                    Kind::Ref,
+                                    py_pc as i64,
+                                ))
+                            } else {
+                                None
+                            };
                             let null_or_self_reg = emit_popvalue_ref!(current_depth, py_pc);
                             let null_or_self_value =
                                 match pop_ref_or_fresh(&mut current_state, &mut graph) {
@@ -6351,21 +6394,38 @@ impl CodeWriter {
                                         pin!(Some(v), null_or_self_reg);
                                         v
                                     }
-                                    _ => {
-                                        // The LoadAttr/LoadGlobal arms push the
-                                        // null sentinel as a graph Constant, but it
-                                        // must NOT const-fold to ConstRef(0): a
-                                        // pre-call resume seeds this stack register
-                                        // from the tracer, which may hold a real
-                                        // receiver (load_method_fast_path pushes
-                                        // `[w_descr, w_obj]`, callmethod.py:60-68).
-                                        // Read the register instead — the pure
-                                        // blackhole path physically writes PY_NULL
-                                        // into it via emit_pushvalue_ref_const!.
-                                        let v = graph.fresh_variable(Kind::Ref);
-                                        pin!(Some(v), null_or_self_reg);
-                                        v
-                                    }
+                                    _ => match null_or_self_read {
+                                        Some(v) => {
+                                            pin!(Some(v), null_or_self_reg);
+                                            v
+                                        }
+                                        None => {
+                                            // Non-portal frames have no vable
+                                            // mirror to read the slot from;
+                                            // materialize the pure-path PY_NULL
+                                            // into the stack register with a
+                                            // `ref_copy(ConstRef(0))` producer —
+                                            // the same Insn shape
+                                            // `insert_renamings` (flatten.py:320)
+                                            // emits for a Constant link arg.  A
+                                            // producer-less pinned variable
+                                            // leaves the register unbound on the
+                                            // straight-line jitcode path; resume
+                                            // entries past this site still seed
+                                            // the register from rd_numb (which
+                                            // may carry a real receiver).
+                                            let v = emit_graph_op_with_result(
+                                                &mut graph,
+                                                &current_block.block(),
+                                                "ref_copy",
+                                                vec![super::flow::Constant::none().into()],
+                                                Kind::Ref,
+                                                py_pc as i64,
+                                            );
+                                            pin!(Some(v), null_or_self_reg);
+                                            v
+                                        }
+                                    },
                                 };
                             let callable_reg = emit_popvalue_ref!(current_depth, py_pc);
                             let callable_value = pop_ref_or_fresh(&mut current_state, &mut graph);

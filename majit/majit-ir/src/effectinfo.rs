@@ -527,6 +527,14 @@ pub enum PyreHelperKind {
     BoxInt,
     StoreSubscr,
     LoadGlobal,
+    /// `bh_call_fn_N(callable, null_or_self, args...)` — the CALL-family
+    /// Python-call helper.  `null_or_self` (arg index 1) is a sentinel
+    /// the helper checks before use (a non-null receiver is prepended as
+    /// arg0; `PY_NULL` means "no receiver" and is never dereferenced), so
+    /// a concrete-NULL there is the NORMAL plain-call shape, not the
+    /// broken baked-NULL-globals shape the walker's may-force NULL-ref
+    /// gate rejects.
+    CallFn,
 }
 
 impl EffectInfo {

@@ -202,6 +202,14 @@ pub struct PyJitCodePayload {
     pub has_abort: bool,
     /// Python PC of the jit_merge_point opcode (trace entry header).
     pub merge_point_pc: Option<usize>,
+    /// Lazily-built per-fn walker descr pool
+    /// (`state::sub_jitcode_descr_pool_for_code`): adapted `descr_refs`,
+    /// raw `RuntimeBhDescr` slice, sub-jitcode lookup. Carried on the
+    /// payload — not in a side table keyed by object identity — so a
+    /// `replace_with` body refill drops the pool together with the
+    /// `exec.descrs` it borrows from. RPython has no equivalent table:
+    /// the active MIFrame's JitCode carries its descriptors directly.
+    pub(crate) sub_descr_pool: std::cell::OnceCell<crate::state::SubDescrPool>,
 }
 
 /// Shared `PyJitCode` identity whose payload is filled in place.
@@ -232,7 +240,10 @@ pub struct PyJitCode {
 // SAFETY: `PyJitCode` payload replacement is restricted to the codewriter
 // publication path, which runs under pyre's single-threaded JIT setup before
 // the populated object is handed to runtime readers. Runtime-visible index
-// stamping uses atomics on the inner `RuntimeJitCode`.
+// stamping uses atomics on the inner `RuntimeJitCode`. The lazily-built
+// `sub_descr_pool` `OnceCell` is initialized only from the trace-side walker
+// (`state::sub_jitcode_descr_pool_for_code`), which runs on the single
+// thread owning the thread-local `METAINTERP_SD` store.
 unsafe impl Sync for PyJitCode {}
 
 impl Deref for PyJitCode {
@@ -299,6 +310,7 @@ impl PyJitCode {
             w_code,
             has_abort,
             merge_point_pc,
+            sub_descr_pool: std::cell::OnceCell::new(),
         })
     }
 
@@ -336,6 +348,7 @@ impl PyJitCode {
             w_code,
             has_abort,
             merge_point_pc,
+            sub_descr_pool,
         } = next.payload.into_inner();
         let next_jitcode = std::sync::Arc::try_unwrap(next_jitcode)
             .expect("freshly assembled PyJitCode must uniquely own its runtime JitCode");
@@ -347,6 +360,11 @@ impl PyJitCode {
             // express "shared for setup identity, exclusively mutated before
             // runtime publication", so we write through the stable allocation
             // under the setup-phase precondition documented above.
+            // Drop any pool built against the body being replaced BEFORE
+            // overwriting the inner JitCode: the pool borrows that body's
+            // `exec.descrs`, and the new body starts with no pool (built
+            // lazily on first walker inline of the refilled callee).
+            current.sub_descr_pool = sub_descr_pool;
             let current_jitcode = std::sync::Arc::as_ptr(&current.jitcode) as *mut RuntimeJitCode;
             *current_jitcode = next_jitcode;
             current.metadata = metadata;

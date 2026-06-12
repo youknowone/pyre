@@ -4139,8 +4139,18 @@ fn walker_abort_if_mayforce_null_ref_arg(
     // `arg_types[i]` (see `build_allboxes`).  A Ref arg folded to the
     // NULL constant (`GcRef(0)`) is the broken self-slot; the sentinel
     // `GcRef(usize::MAX)` means "no concrete known" and is left alone.
+    //
+    // Exemption: `bh_call_fn_N(callable, null_or_self, args...)`'s
+    // `null_or_self` (arg index 1) is a checked sentinel — `PY_NULL`
+    // means "no receiver" and is never dereferenced (`bh_call_fn_impl`
+    // prepends it as arg0 only when non-null), so a concrete-NULL there
+    // is the normal plain-call shape, not the broken baked-NULL shape.
+    let is_call_fn = call_descr.get_extra_info().pyre_helper == majit_ir::PyreHelperKind::CallFn;
     for (i, &ty) in call_descr.arg_types().iter().enumerate() {
         if ty != majit_ir::Type::Ref {
+            continue;
+        }
+        if is_call_fn && i == 1 {
             continue;
         }
         if let Some(&b) = allboxes.get(1 + i) {
@@ -6683,17 +6693,18 @@ fn try_walker_call_assembler_self_recursive(
     {
         return Ok(None);
     }
-    // Only a genuine `call_fn` residual (no `pyre_helper` tag) is a
-    // candidate — every container/builtin helper carries a distinct tag.
-    if pyre_helper != majit_ir::PyreHelperKind::None {
+    // Only a genuine `call_fn` residual is a candidate — every
+    // container/builtin helper carries a distinct tag.
+    if pyre_helper != majit_ir::PyreHelperKind::CallFn {
         return Ok(None);
     }
-    // Single positional argument; Ref dst only (`residual_call_r_r`, the
-    // boxed PyObject consumed by a following BINARY_OP).  The only
-    // `residual_call_r_i` helper is the 1-arg `truth_fn`, which can never
-    // pass the `r_args.len() != 2` bail — an Int dst is structurally
-    // unreachable here, so don't accept one.
-    if dst_bank != 'r' || r_args.len() != 2 {
+    // Single positional argument (`r_args = [callable, null_or_self,
+    // arg0]`); Ref dst only (`residual_call_r_r`, the boxed PyObject
+    // consumed by a following BINARY_OP).  The only `residual_call_r_i`
+    // helper is the 1-arg `truth_fn`, which can never pass the
+    // `r_args.len() != 3` bail — an Int dst is structurally unreachable
+    // here, so don't accept one.
+    if dst_bank != 'r' || r_args.len() != 3 {
         return Ok(None);
     }
     // A self-recursive CALL_ASSEMBLER raising inside a `try` body must
@@ -6711,6 +6722,16 @@ fn try_walker_call_assembler_self_recursive(
         return Ok(None);
     };
     if callable.is_null() {
+        return Ok(None);
+    }
+    // Plain-call shape only: a non-null `null_or_self` is a method
+    // receiver `bh_call_fn_impl` would prepend as arg0; an unknown
+    // concrete cannot be proven plain.  Either way, decline to the
+    // residual call.
+    let ConcreteValue::Ref(null_or_self) = arg_concretes[1] else {
+        return Ok(None);
+    };
+    if !null_or_self.is_null() {
         return Ok(None);
     }
     // The callable must be a plain Python function with exactly one
@@ -6740,7 +6761,7 @@ fn try_walker_call_assembler_self_recursive(
     }
     // The single positional argument must be a boxed int at trace time
     // (`concrete_arg0 is_int`, `trace_opcode.rs:6148`).
-    let ConcreteValue::Ref(arg_obj) = arg_concretes[1] else {
+    let ConcreteValue::Ref(arg_obj) = arg_concretes[2] else {
         return Ok(None);
     };
     if arg_obj.is_null() || !unsafe { pyre_object::is_int(arg_obj) } {
@@ -6813,7 +6834,7 @@ fn try_walker_call_assembler_self_recursive(
 
     // Unbox the boxed int argument -> raw payload, re-boxed inside the new
     // callee frame.  Mirror of `trace_guarded_int_payload(args[0])`.
-    let raw_arg = walker_unbox_int(ctx, op.pc, r_args[1], int_type_addr)?;
+    let raw_arg = walker_unbox_int(ctx, op.pc, r_args[2], int_type_addr)?;
 
     // Execution-context red (`ensure_execution_context`,
     // `trace_opcode.rs:1078-1090`): the seeded `sym.execution_context`,
@@ -6899,9 +6920,11 @@ fn try_walker_call_assembler_self_recursive(
 ///   propagated as a trace abort (sound — aborts to the interpreter rather
 ///   than mixing inlined + residual emission).
 ///
-/// Arg layout: `r_args = [callable@0, positional@1..]` (the `call_fn`
-/// family carries no frame argument; the parent frame is resolved from
-/// the execution context inside `bh_call_fn_impl`).
+/// Arg layout: `r_args = [callable@0, null_or_self@1, positional@2..]`
+/// (the `call_fn` family carries no frame argument; the parent frame is
+/// resolved from the execution context inside `bh_call_fn_impl`, which
+/// prepends a non-null `null_or_self` as arg0).  Only the plain-call
+/// shape (concretely-NULL `null_or_self`) is inlined.
 /// Only exact-positional, closure-free callees are inlined.  Guards inside a
 /// pure-leaf callee resume to the caller's CALL boundary via the inherited
 /// single-frame snapshot (`entry_py_pc` / `outer_active_boxes`), which is
@@ -6919,32 +6942,42 @@ fn try_walker_inline_user_call(
     if !ctx.is_authoritative_executor || std::env::var("PYRE_FBW_INLINE").as_deref() == Ok("0") {
         return Ok(None);
     }
-    // Only a genuine Python call helper (`call_fn` / `call_fn_N`) is an
-    // inline target.  It is the only `dispatch_residual_call_iRd_kind`
-    // helper that carries no `pyre_helper` tag — every container/builtin
-    // helper routed here (`store_subscr_fn` -> StoreSubscr,
-    // `set_current_exception`, ...) sets a distinct `pyre_helper`
-    // (flatten.rs builders, e.g. `build_residual_call_r_v_insn_from_operands`
-    // -> StoreSubscr).  Without this guard `d[f] = v` with a 1-arg function
-    // key `f` lowers to `residual_call_r_v(store_subscr_fn, [d, f, v])`, whose
-    // ref args pass the function sniff below and are mis-inlined as `f(v)`,
-    // skipping the store.  `normalize_raise_varargs_fn` carries no
-    // `pyre_helper` either, but its ref arg is the raised exception object,
-    // never a callable on any non-erroring path.  Upstream never inlines a
-    // Python call at a residual_call site (inlinable calls get their own
-    // inline_call jitcodes); this restores that invariant for the pyre FBW
+    // Only a genuine Python call helper (`call_fn` / `call_fn_N`, tagged
+    // `PyreHelperKind::CallFn` by the flatten lowering) is an inline
+    // target.  Every container/builtin helper routed here carries a
+    // different tag or `None` (`store_subscr_fn` -> StoreSubscr,
+    // `normalize_raise_varargs_fn` / `set_current_exception` -> None).
+    // Without this guard `d[f] = v` with a 1-arg function key `f` lowers
+    // to `residual_call_r_v(store_subscr_fn, [d, f, v])`, whose ref args
+    // pass the function sniff below and are mis-inlined as `f(v)`,
+    // skipping the store.  Upstream never inlines a Python call at a
+    // residual_call site (inlinable calls get their own inline_call
+    // jitcodes); this restores that invariant for the pyre FBW
     // inline-at-residual lever.
-    if pyre_helper != majit_ir::PyreHelperKind::None {
+    if pyre_helper != majit_ir::PyreHelperKind::CallFn {
         return Ok(None);
     }
     if r_args.is_empty() {
         return Ok(None);
     }
     let arg_concretes = read_ref_var_list_concrete(code, op, 1, ctx);
+    if r_args.len() < 2 {
+        return Ok(None);
+    }
     let ConcreteValue::Ref(callable) = arg_concretes[0] else {
         return Ok(None);
     };
     if callable.is_null() {
+        return Ok(None);
+    }
+    // Plain-call shape only: a non-null `null_or_self` is a method
+    // receiver `bh_call_fn_impl` would prepend as arg0; an unknown
+    // concrete cannot be proven plain.  Either way, decline to the
+    // residual call.
+    let ConcreteValue::Ref(null_or_self) = arg_concretes[1] else {
+        return Ok(None);
+    };
+    if !null_or_self.is_null() {
         return Ok(None);
     }
     let function_type_addr = &pyre_interpreter::FUNCTION_TYPE as *const _ as usize;
@@ -6963,7 +6996,7 @@ fn try_walker_inline_user_call(
         let closure = pyre_interpreter::function_get_closure(callable);
         (w_code, (*raw).arg_count as usize, !closure.is_null())
     };
-    let nargs_passed = r_args.len() - 1;
+    let nargs_passed = r_args.len() - 2;
     // Only exact-positional, closure-free calls: every callee local [0..nparams]
     // is bound from a passed arg, none from defaults/varargs/cells.
     if has_closure || nargs_passed != nparams {
@@ -7075,8 +7108,8 @@ fn try_walker_inline_user_call(
         if reg >= callee_regs_r.len() {
             return Ok(None);
         }
-        callee_regs_r[reg] = r_args[1 + i];
-        callee_concrete_r[reg] = arg_concretes[1 + i];
+        callee_regs_r[reg] = r_args[2 + i];
+        callee_concrete_r[reg] = arg_concretes[2 + i];
     }
 
     let callee_outcome = {
@@ -7241,7 +7274,26 @@ fn dispatch_residual_call_iRd_kind(
     // `_r_*` shape: argboxes = R-list only; argbox_types = [Ref; n].
     let argbox_types: Vec<Type> = vec![Type::Ref; r_args.len()];
     let allboxes = build_allboxes(funcptr, &r_args, &argbox_types, call_descr.arg_types());
-    ensure_residual_call_args_bound(&allboxes, op.pc)?;
+    if let Err(e) = ensure_residual_call_args_bound(&allboxes, op.pc) {
+        if fbw_debug_abort_enabled() {
+            let len_pc = op.pc + 1 + 1;
+            let n = code[len_pc] as usize;
+            let regs: Vec<u8> = code[len_pc + 1..len_pc + 1 + n].to_vec();
+            let funcaddr = ctx.trace_ctx.box_value(funcptr).and_then(|v| match v {
+                majit_ir::Value::Int(n) => Some(n as u64),
+                _ => None,
+            });
+            eprintln!(
+                "[fbw-unbound] pc={} regs={:?} r_args={:?} func={:?} pyre_helper={:?}",
+                op.pc,
+                regs,
+                r_args,
+                funcaddr.map(|a| format!("{a:#x}")),
+                ei.pyre_helper,
+            );
+        }
+        return Err(e);
+    }
 
     // Optional diagnostic for iRd-shape residual calls.  The STORE_SUBSCR
     // specialization keys on a fn-pointer match against `bh_store_subscr_fn`

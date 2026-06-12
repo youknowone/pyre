@@ -2247,40 +2247,26 @@ impl Optimizer {
             let n = nia.len();
             // `next_iteration_args` must not be longer than the trace's
             // inputargs: every loop-back value needs a backing inputarg
-            // slot to forward to. A well-formed trait trace guarantees
-            // this (the JUMP carries exactly the loop-header inputargs).
-            // The full-body walk can violate it: when a cross-loop cut
-            // reduces the inputargs to the reds-only inner merge point
-            // while the loop virtualizes a heap object whose forced
-            // virtuals expand `next_iteration_args` (fannkuch's
-            // permutation list, nbody's body tuples), `n` exceeds
-            // `inputargs.len()`. Bail with `InvalidLoop` — the designed
-            // compile-failure path `compile_loop_body` catches to fall
+            // slot to forward to. RPython guarantees this by construction:
+            // `reached_loop_header` (pyjitpl.py:2934-2978) builds
+            // `live_arg_boxes = reds + virtualizable_boxes[:-1]` for BOTH
+            // the merge-point registration and the closing JUMP, so the
+            // two shapes always match. Pyre's full-body-walk
+            // `jit_merge_point` handler now mirrors that exactly
+            // (jitcode_dispatch.rs: reds rebound to `sym.frame` /
+            // `sym.execution_context`, then `append_virtualizable_boxes`
+            // + `remove_consts_and_duplicates`), and the historical
+            // reds-only `[frame, ec]` seeding that made a cross-loop cut
+            // declare 2 inputargs against a full-shape JUMP is gone —
+            // verified unreachable across the bench suite (fannkuch /
+            // nbody, which used to trip it, at default and raised
+            // trace_eagerness).
+            //
+            // The guard stays as a tripwire: a future shape regression
+            // must decline through `InvalidLoop` — the designed
+            // compile-failure channel `compile_loop_body` catches to fall
             // back to the interpreter — instead of letting
             // `inputarg_type_at_strict` hard-panic the worker thread.
-            //
-            // NOTE (#67): the root cause is a merge-point SHAPE mismatch, not
-            // a type-fallback gap. The full-body-walk's `jit_merge_point`
-            // handler seeds the inner-loop merge point with reds only
-            // (`[frame, ec]`), whereas RPython's `reached_loop_header`
-            // (pyjitpl.py:3237-3244) and pyre's own `close_loop_args_at`
-            // (the actual JUMP, trace.rs close path) build the FULL
-            // `live_arg_boxes = reds + virtualizable_boxes[:-1]` =
-            // `[frame, ec, vable scalars, locals, stack]`. So a cross-loop
-            // cut over a forced heap virtual declares 2 inputargs while the
-            // JUMP carries `7 + extra_reds + array_capacity`, tripping this
-            // guard. Extending the walker's `live_args` to the full shape
-            // (append `virtualizable_box_at(0..len-1)` — mirrors the trait
-            // template) removes THIS bail and the body compiles — VERIFIED:
-            // flag-off 39/39 intact, int/fib/float/nested loops unaffected.
-            // BUT it then surfaces the downstream blocker: the FBW
-            // cross-loop-cut loop's guards have no packed-liveness coverage
-            // (`frame_value_count_at` panics: all_liveness shorter than the
-            // loop PC span — the #124/#281 per-PC-liveness gap), and any
-            // fallback AFTER backend compile re-attempts the costly compile
-            // every back-edge. So the shape fix is gated on the resume-
-            // liveness work landing first; until then this guard keeps the
-            // cheap Phase-2 interp fallback (fannkuch ~11s, no crash).
             if (0..n).any(|i| ctx.inputarg_type_at(i).is_none()) {
                 std::panic::panic_any(crate::optimize::InvalidLoop(
                     "next_iteration_args longer than inputargs (full-body-walk \

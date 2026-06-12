@@ -911,11 +911,12 @@ fn full_body_walk_trace(
             // interpreting forever (a try-protected raise in a hot loop
             // deopt-storms past any timeout), and upstream never marks a
             // location untraceable on an abort (pyjitpl.py:2392
-            // aborted_tracing).  These five are the multi-session-blocked
+            // aborted_tracing).  These are the multi-session-blocked
             // shapes (resume snapshot #124, exception-handler resume #51c,
-            // closure NULL-self #60, unported raise marker); other errors
-            // retain the plain `Abort` without declining so a capability
-            // that lands mid-run can still pick the location up.
+            // closure NULL-self #60, unported raise marker, a residual
+            // arg register the walk never binds); other errors retain the
+            // plain `Abort` without declining so a capability that lands
+            // mid-run can still pick the location up.
             use crate::jitcode_dispatch::DispatchError as DE;
             if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
                 eprintln!("[fbw-abort] start_pc={start_pc} Err={e:?}");
@@ -926,7 +927,8 @@ fn full_body_walk_trace(
                 | DE::MayForceProtectedByExceptionHandlerUnsupported { .. }
                 | DE::MayForceNullRefArgUnsupported { .. }
                 | DE::BranchGuardKeptStackUnsupported { .. }
-                | DE::NonStandardVableFinishPortalUnsupported { .. } => {
+                | DE::NonStandardVableFinishPortalUnsupported { .. }
+                | DE::ResidualCallArgUnbound { .. } => {
                     fbw_decline(crate::driver::make_green_key(w_code, start_pc));
                     TraceAction::Abort
                 }
@@ -976,8 +978,12 @@ fn dump_perfn_jitcode_for_trace(w_code: *const (), start_pc: usize) {
     for op in crate::jitcode_runtime::decoded_ops(code) {
         if count < 80 {
             eprintln!(
-                "[perfn-jitcode]   pc={:>4} next={:>4} {}/{}",
-                op.pc, op.next_pc, op.opname, op.argcodes
+                "[perfn-jitcode]   pc={:>4} next={:>4} {}/{} bytes={:?}",
+                op.pc,
+                op.next_pc,
+                op.opname,
+                op.argcodes,
+                &code[op.pc + 1..op.next_pc.min(code.len())]
             );
         }
         *histogram.entry(op.key.to_string()).or_default() += 1;
