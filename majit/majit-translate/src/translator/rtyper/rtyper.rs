@@ -3754,6 +3754,18 @@ fn lowlevel_min_max_helper_graph(
         (LowLevelType::UnsignedLongLongLong, true) => "ulllong_gt",
         (LowLevelType::Float, false) => "float_lt",
         (LowLevelType::Float, true) => "float_gt",
+        // `pairtype(AbstractCharRepr, AbstractCharRepr)` ordering goes
+        // through `_rtype_compare_template` → `char_<func>`
+        // (rstr.py:740-753).
+        (LowLevelType::Char, false) => "char_lt",
+        (LowLevelType::Char, true) => "char_gt",
+        // `pairtype(AbstractUniCharRepr, AbstractUniCharRepr)` ordering
+        // goes through `_rtype_unchr_compare_template_ord`
+        // (rstr.py:779-800): both operands are cast via
+        // `cast_unichar_to_int` and compared with `int_<func>`.  The
+        // casts are emitted below.
+        (LowLevelType::UniChar, false) => "int_lt",
+        (LowLevelType::UniChar, true) => "int_gt",
         _ => {
             return Err(TyperError::message(format!(
                 "{name}: unsupported argument lltype {llt:?}"
@@ -3765,7 +3777,7 @@ fn lowlevel_min_max_helper_graph(
     let i1 = variable_with_lltype("arg0", llt.clone());
     let i2 = variable_with_lltype("arg1", llt.clone());
     let cond = variable_with_lltype("cond", LowLevelType::Bool);
-    let return_var = variable_with_lltype("result", llt);
+    let return_var = variable_with_lltype("result", llt.clone());
 
     let startblock = Block::shared(vec![
         Hlvalue::Variable(i1.clone()),
@@ -3777,9 +3789,28 @@ fn lowlevel_min_max_helper_graph(
         Hlvalue::Variable(return_var),
     );
 
+    let (cmp1, cmp2) = if llt == LowLevelType::UniChar {
+        // rstr.py:795-799 `_rtype_unchr_compare_template_ord` — cast
+        // each operand to Signed before the `int_<func>` comparison.
+        let ord1 = variable_with_lltype("ord0", LowLevelType::Signed);
+        let ord2 = variable_with_lltype("ord1", LowLevelType::Signed);
+        startblock.borrow_mut().operations.push(SpaceOperation::new(
+            "cast_unichar_to_int",
+            vec![Hlvalue::Variable(i1.clone())],
+            Hlvalue::Variable(ord1.clone()),
+        ));
+        startblock.borrow_mut().operations.push(SpaceOperation::new(
+            "cast_unichar_to_int",
+            vec![Hlvalue::Variable(i2.clone())],
+            Hlvalue::Variable(ord2.clone()),
+        ));
+        (ord1, ord2)
+    } else {
+        (i1.clone(), i2.clone())
+    };
     startblock.borrow_mut().operations.push(SpaceOperation::new(
         cmp_op,
-        vec![Hlvalue::Variable(i1.clone()), Hlvalue::Variable(i2.clone())],
+        vec![Hlvalue::Variable(cmp1), Hlvalue::Variable(cmp2)],
         Hlvalue::Variable(cond.clone()),
     ));
     startblock.borrow_mut().exitswitch = Some(Hlvalue::Variable(cond));
@@ -7779,6 +7810,10 @@ mod tests {
             (LowLevelType::UnsignedLongLongLong, true, "ulllong_gt"),
             (LowLevelType::Float, false, "float_lt"),
             (LowLevelType::Float, true, "float_gt"),
+            // CharRepr ordering via `_rtype_compare_template` →
+            // `char_<func>` (rstr.py:740-753).
+            (LowLevelType::Char, false, "char_lt"),
+            (LowLevelType::Char, true, "char_gt"),
         ] {
             let name = if is_max { "ll_max" } else { "ll_min" };
             let pygraph =
@@ -7810,19 +7845,39 @@ mod tests {
     }
 
     #[test]
+    fn min_max_helper_graph_unichar_casts_then_compares_signed() {
+        // UniCharRepr ordering via `_rtype_unchr_compare_template_ord`
+        // (rstr.py:779-800): `cast_unichar_to_int` on both operands,
+        // then `int_lt` / `int_gt`; the links still return the
+        // original UniChar args.
+        for (is_max, expected_cmp) in [(false, "int_lt"), (true, "int_gt")] {
+            let name = if is_max { "ll_max" } else { "ll_min" };
+            let llt = LowLevelType::UniChar;
+            let pygraph =
+                lowlevel_min_max_helper_graph(name, &[llt.clone(), llt.clone()], &llt, is_max)
+                    .unwrap_or_else(|e| panic!("{name}(UniChar) must build: {e}"));
+            let graph = pygraph.graph.borrow();
+            let start = graph.startblock.borrow();
+            assert_eq!(start.operations.len(), 3, "{name}(UniChar) op count");
+            assert_eq!(start.operations[0].opname, "cast_unichar_to_int");
+            assert_eq!(start.operations[1].opname, "cast_unichar_to_int");
+            assert_eq!(start.operations[2].opname, expected_cmp);
+        }
+    }
+
+    #[test]
     fn min_max_helper_graph_rejects_unsupported_and_mismatched_lltypes() {
-        // Char has no lt/gt arm in the helper (no `as_int` route —
-        // upstream compares chars through `cast_primitive` first).
+        // Void has no ordering ops in any repr.
         let err = lowlevel_min_max_helper_graph(
             "ll_min",
-            &[LowLevelType::Char, LowLevelType::Char],
-            &LowLevelType::Char,
+            &[LowLevelType::Void, LowLevelType::Void],
+            &LowLevelType::Void,
             false,
         )
         .unwrap_err();
         assert!(
             err.to_string().contains("unsupported argument lltype"),
-            "Bool must be rejected: {err}"
+            "Void must be rejected: {err}"
         );
         // (Signed, Float) -> Signed violates the (T, T) -> T cache-key
         // contract.
