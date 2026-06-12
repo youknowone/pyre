@@ -486,11 +486,45 @@ impl TreeLoop {
         }
         let new_inputargs_count = new_ia_boxes.len() as u32;
 
-        let new_inputargs: Vec<InputArg> = new_ia_types
+        let new_inputargs: Vec<majit_ir::InputArgRc> = new_ia_types
             .iter()
             .enumerate()
-            .map(|(i, &tp)| InputArg::from_type(tp, i as u32))
+            .map(|(i, &tp)| std::rc::Rc::new(InputArg::from_type(tp, i as u32)))
             .collect();
+
+        // Bind a remapped operand to its producer in the NEW namespace:
+        // ops re-emitted below appear in program order, so a consumer's
+        // producer Rc always exists by the time the consumer is built
+        // (history.py cut_trace_from re-emission keeps SSA order). NONE
+        // and Const positions carry their value inline.
+        let bind_remapped = |r: OpRef,
+                             producers: &[OpRc],
+                             inputargs: &[majit_ir::InputArgRc]|
+         -> BoxRef {
+            if r.is_none() || r.is_constant() {
+                return BoxRef::from_opref(r);
+            }
+            if matches!(
+                r,
+                OpRef::InputArgInt(_) | OpRef::InputArgFloat(_) | OpRef::InputArgRef(_)
+            ) {
+                match inputargs.get(r.raw() as usize) {
+                    Some(ia) => return BoxRef::from_bound_inputarg(ia),
+                    None => {
+                        debug_assert!(false, "cut-trace operand references missing inputarg {r:?}");
+                        return BoxRef::from_opref(r);
+                    }
+                }
+            }
+            let idx = (r.raw() - new_inputargs_count) as usize;
+            match producers.get(idx) {
+                Some(rc) => BoxRef::from_bound_op(rc),
+                None => {
+                    debug_assert!(false, "cut-trace operand references unbuilt producer {r:?}");
+                    BoxRef::from_opref(r)
+                }
+            }
+        };
 
         // Phase 5: Re-emit escaped ops as prefix, assigning fresh OpRefs.
         // Result type comes from the original op's opcode so the new OpRef
@@ -528,7 +562,7 @@ impl TreeLoop {
         };
 
         // Build prefix ops (re-emitted escaped definitions).
-        let mut prefix_ops: Vec<Op> = Vec::with_capacity(op_escaped.len());
+        let mut new_ops: Vec<OpRc> = Vec::with_capacity(op_escaped.len() + cut_ops.len());
         for (pi, &r) in op_escaped.iter().enumerate() {
             let op_idx = (r.raw() - num_original_inputargs) as usize;
             let orig_op = &self.ops[op_idx];
@@ -540,19 +574,21 @@ impl TreeLoop {
                 new_inputargs_count + pi as u32,
                 new_op.opcode.result_type(),
             ));
-            // optimizer.py:651-652 setarg loop parity.
+            // optimizer.py:651-652 setarg loop parity; operands bind to
+            // the new-namespace producers built so far.
             for i in 0..new_op.num_args() {
                 let arg = new_op.arg(i);
-                new_op.setarg(i, BoxRef::from_opref(remap_ref(&arg.to_opref())));
+                new_op.setarg(
+                    i,
+                    bind_remapped(remap_ref(&arg.to_opref()), &new_ops, &new_inputargs),
+                );
             }
             // Prefix ops don't need fail_args (they're not guards).
             new_op.clearfailargs();
-            prefix_ops.push(new_op);
+            new_ops.push(std::rc::Rc::new(new_op));
         }
 
         // Phase 6: Remap post-cut ops.
-        let mut new_ops: Vec<Op> = Vec::with_capacity(prefix_ops.len() + cut_ops.len());
-        new_ops.extend(prefix_ops);
         for (i, op) in cut_ops.iter().enumerate() {
             // Deep-clone through the Rc: re-emitted post-cut ops carry
             // fresh identity in the new trace per history.py:cut_trace_from
@@ -565,7 +601,10 @@ impl TreeLoop {
             // optimizer.py:651-652 setarg loop parity.
             for j in 0..new_op.num_args() {
                 let arg = new_op.arg(j);
-                new_op.setarg(j, BoxRef::from_opref(remap_ref(&arg.to_opref())));
+                new_op.setarg(
+                    j,
+                    bind_remapped(remap_ref(&arg.to_opref()), &new_ops, &new_inputargs),
+                );
             }
             if let Some(fa) = new_op.fail_args_mut() {
                 for arg in fa.iter_mut() {
@@ -580,7 +619,7 @@ impl TreeLoop {
                     )));
                 }
             }
-            new_ops.push(new_op);
+            new_ops.push(std::rc::Rc::new(new_op));
         }
 
         // opencoder.py parity: carry snapshots through cut_trace_from.
@@ -629,7 +668,7 @@ impl TreeLoop {
                 }
             })
             .collect();
-        TreeLoop::with_snapshots(new_inputargs, new_ops, remapped_snapshots)
+        TreeLoop::from_oprc(new_inputargs, new_ops, remapped_snapshots)
     }
 }
 
