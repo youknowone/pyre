@@ -4801,17 +4801,21 @@ fn assemble_peeled_trace_with_jump_args(
             };
         // optimizer.py:651-652 force_box loop pattern:
         //   for i in range(op.numargs()): op.setarg(i, ...)
+        // Only remap hits are rewritten; a miss keeps the existing operand
+        // (a bound operand stays live-tracking instead of degrading to a
+        // position-only re-mint of the same position).
         for i in 0..new_op.num_args() {
-            new_op.setarg(
-                i,
-                BoxRef::from_opref(remap_body_arg(
-                    new_op.arg(i).to_opref(),
-                    &assembly_alias_remap,
-                    &body_result_remap,
-                    &seen_body_defs,
-                    &visible_before_label,
-                )),
+            let arg = new_op.arg(i).to_opref();
+            let mapped = remap_body_arg(
+                arg,
+                &assembly_alias_remap,
+                &body_result_remap,
+                &seen_body_defs,
+                &visible_before_label,
             );
+            if mapped != arg {
+                new_op.setarg(i, BoxRef::from_opref(mapped));
+            }
         }
         if new_op.opcode == OpCode::Label {
             let mut seen_after_label_defs = majit_ir::vec_set::VecSet::new();
