@@ -3261,6 +3261,28 @@ impl<'a> Lowering<'a> {
             Operand::Const(_) => None,
         });
         let mut args: Vec<Variable> = Vec::with_capacity(call.args.len());
+        // MIR local index behind each plain-local argument, kept
+        // alongside the resolved Variables so call intercepts can
+        // consult per-local lowering state
+        // (`const_discriminant_locals`).
+        let arg_locals: Vec<Option<usize>> = call
+            .args
+            .iter()
+            .map(|op| match op {
+                Operand::Copy(p) | Operand::Move(p) => match p.kind {
+                    PlaceKind::Local(i) => Some(i as usize),
+                    _ => None,
+                },
+                Operand::Const(_) => None,
+            })
+            .collect();
+        // First argument's MIR-declared type, captured before the
+        // operands are consumed — `reflexive_into_alias` compares it
+        // against the destination type.
+        let first_arg_ty: Option<TyRef> = call.args.first().and_then(|op| match op {
+            Operand::Copy(p) | Operand::Move(p) => Some(clone_tyref(&p.ty)),
+            Operand::Const(_) => None,
+        });
         for op in call.args {
             args.push(self.resolve_operand(mir_bb, op)?);
         }
@@ -3378,6 +3400,41 @@ impl<'a> Lowering<'a> {
                     &call.dest.ty,
                     target,
                 )? {
+                    return Ok(());
+                }
+                if self.try_lower_usize_try_from(
+                    mir_bb,
+                    &reg.kind,
+                    &segments,
+                    &args,
+                    dest_local,
+                    &call.dest.ty,
+                    target,
+                )? {
+                    return Ok(());
+                }
+                let alias = if let Some(payload) =
+                    self.expect_on_const_ok(&segments, &args, &arg_locals)
+                {
+                    // Identity unwrap: the receiver variable was bound
+                    // directly to the `Ok` payload, so the result is
+                    // that variable — bind and close the block with no
+                    // op emitted.
+                    Some(payload)
+                } else {
+                    self.reflexive_into_alias(
+                        &segments,
+                        &args,
+                        first_arg_ty.as_ref(),
+                        &call.dest.ty,
+                    )
+                };
+                if let Some(value) = alias {
+                    self.local_var[dest_local] = Some(value);
+                    let bb_id = self.block_id[mir_bb];
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
                 if let Some(field_read) = self.oparg_from_field_read(&reg.kind, &segments, &args) {
@@ -3639,6 +3696,15 @@ impl<'a> Lowering<'a> {
         };
         let owner_leaf = match self.resolve_impl_owner_adt_def_id(impl_payload) {
             Some(adt_def_id) => {
+                // The hint is only valid when the fn actually receives
+                // the impl owner as `self` (`Owner` / `&Owner` /
+                // `*mut Owner` first input).  Associated functions —
+                // `PyError::type_error(msg)` — have no receiver;
+                // routing them as `Method` makes the adapter getattr
+                // the method name off `args[0]` (the message string).
+                if !self.first_input_is_adt(fd, adt_def_id) {
+                    return None;
+                }
                 let td = self.llbc.type_by_id(adt_def_id)?;
                 let owner = td
                     .item_meta
@@ -3873,6 +3939,61 @@ impl<'a> Lowering<'a> {
             .trait_by_id(trait_id)
             .is_some_and(|td| td.item_meta.name_path() == "core::convert::Into");
         is_into && tyref_is_string_adt(dest_ty, self.llbc)
+    }
+
+    /// Whether the FunDecl's first signature input is the given ADT,
+    /// possibly behind reference / raw-pointer layers (`self: Owner`,
+    /// `&Owner`, `&mut Owner`, `*const/mut Owner`).  Distinguishes a
+    /// real method from an associated function of the same impl block.
+    fn first_input_is_adt(&self, fd: &FunDecl, adt_def_id: u64) -> bool {
+        let Some(first) = fd.signature.inputs.first() else {
+            return false;
+        };
+        let Some(mut v) = self.tyref_body(first) else {
+            return false;
+        };
+        loop {
+            let Some(obj) = v.as_object() else {
+                return false;
+            };
+            if let Some(id) = obj.get("Deduplicated").and_then(serde_json::Value::as_u64) {
+                match self.llbc.dedup_body(id) {
+                    Some(b) => {
+                        v = b;
+                        continue;
+                    }
+                    None => return false,
+                }
+            }
+            if let Some(arr) = obj
+                .get("HashConsedValue")
+                .and_then(serde_json::Value::as_array)
+                && arr.len() == 2
+            {
+                v = &arr[1];
+                continue;
+            }
+            // `{"Ref": [region, ty, kind]}` / `{"RawPtr": [ty, kind]}`.
+            if let Some(arr) = obj.get("Ref").and_then(serde_json::Value::as_array) {
+                match arr.get(1) {
+                    Some(inner) => {
+                        v = inner;
+                        continue;
+                    }
+                    None => return false,
+                }
+            }
+            if let Some(arr) = obj.get("RawPtr").and_then(serde_json::Value::as_array) {
+                match arr.first() {
+                    Some(inner) => {
+                        v = inner;
+                        continue;
+                    }
+                    None => return false,
+                }
+            }
+            return inline_adt_def_id(v) == Some(adt_def_id);
+        }
     }
 
     /// Decode the receiver type's ADT `def_id` from an `Impl` NameSeg
@@ -4223,6 +4344,55 @@ impl<'a> Lowering<'a> {
             return None;
         }
         Some(recv.clone())
+    }
+
+    /// Resolve the reflexive blanket `Into::into`
+    /// (`core::convert::<Impl>::into` where the argument's declared
+    /// type equals the destination's) to its operand.  `impl<T>
+    /// From<T> for T` makes `x.into()` an identity, but the blanket
+    /// fn's body is Opaque in the LLBC so the `Call` form is
+    /// permanently unliftable.  Upstream has no counterpart: an
+    /// identity conversion never appears as an op in RPython graphs.
+    /// Non-reflexive `into` calls (source ≠ destination type) keep
+    /// the generic `Call` form.
+    fn reflexive_into_alias(
+        &self,
+        segments: &[String],
+        args: &[Variable],
+        first_arg_ty: Option<&TyRef>,
+        dest_ty: &TyRef,
+    ) -> Option<Variable> {
+        let [first, .., module, impl_seg, leaf] = segments else {
+            return None;
+        };
+        if first.as_str() != "core"
+            || module.as_str() != "convert"
+            || impl_seg.as_str() != "<Impl>"
+            || leaf.as_str() != "into"
+        {
+            return None;
+        }
+        let [arg] = args else {
+            return None;
+        };
+        let src = self.tyref_body(first_arg_ty?)?;
+        let dst = self.tyref_body(dest_ty)?;
+        (src == dst).then(|| arg.clone())
+    }
+
+    /// The resolved JSON body of a [`TyRef`], following the dedup
+    /// table.  Two `TyRef`s denote the same type iff their bodies are
+    /// structurally equal (the dedup table only dedupes identical
+    /// bodies, so mixed inline/dedup spellings still compare equal).
+    fn tyref_body<'t>(&self, ty: &'t TyRef) -> Option<&'t serde_json::Value>
+    where
+        'a: 't,
+    {
+        match ty {
+            TyRef::Inline { value: (_, v) } => Some(v),
+            TyRef::Other(v) => Some(v),
+            TyRef::Dedup { id } => self.llbc.dedup_body(*id),
+        }
     }
 
     /// The `UInt` width atom (`"U8"` / `"U32"` / `"Usize"` …) of a
