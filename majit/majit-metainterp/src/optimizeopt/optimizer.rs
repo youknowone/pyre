@@ -3194,9 +3194,9 @@ impl Optimizer {
                                     false,
                                     "position-only failarg hit const-compact remap: {arg_opref:?}"
                                 );
-                                *arg = majit_ir::operand::Operand::Box(BoxRef::from_opref(
-                                    arg_opref.with_raw(new_pos),
-                                ));
+                                *arg = majit_ir::operand::Operand::from_boxref(
+                                    &BoxRef::from_opref(arg_opref.with_raw(new_pos)),
+                                );
                             }
                         }
                     }
@@ -3303,7 +3303,9 @@ impl Optimizer {
                                 arg_opref == pre,
                                 "position-only exported-short-box failarg remapped: {pre:?}"
                             );
-                            *arg = majit_ir::operand::Operand::Box(BoxRef::from_opref(arg_opref));
+                            *arg = majit_ir::operand::Operand::from_boxref(&BoxRef::from_opref(
+                                arg_opref,
+                            ));
                         }
                     }
                     // same_as_source: same rule as res below — the stored

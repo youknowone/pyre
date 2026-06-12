@@ -55,20 +55,16 @@ impl Renamer {
         if op.opcode.is_guard() {
             // renamer.py:27: TODO op.rd_snapshot = self.rename_rd_snapshot(...)
             // renamer.py:28-29: failargs = self.rename_failargs(op, clone=True)
+            // renamer.py:36-40: `self.rename_map.get(arg, arg)` — a missed
+            // lookup keeps the SAME box object, so only hits are rewritten.
             if let Some(fail_args) = op.fail_args_mut() {
-                let cloned: Vec<OpRef> = fail_args
-                    .iter()
-                    .map(|arg| {
-                        let opref = arg.to_opref();
-                        self.lookup(opref).unwrap_or(opref)
-                    })
-                    .collect();
-                fail_args.clear();
-                fail_args.extend(
-                    cloned
-                        .into_iter()
-                        .map(|r| majit_ir::operand::Operand::Box(BoxRef::from_opref(r))),
-                );
+                for arg in fail_args.iter_mut() {
+                    if let Some(renamed) = self.lookup(arg.to_opref()) {
+                        *arg = majit_ir::operand::Operand::from_boxref(&BoxRef::from_opref(
+                            renamed,
+                        ));
+                    }
+                }
             }
         }
 

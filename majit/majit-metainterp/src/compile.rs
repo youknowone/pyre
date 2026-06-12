@@ -1857,7 +1857,7 @@ pub(crate) fn patch_new_loop_to_load_virtualizable_fields(
             if let Some(fail_args) = emitted.fail_args_mut() {
                 for arg in fail_args.iter_mut() {
                     if let Some(bound) = get_local_box_replacement(forwarding, arg.to_opref()) {
-                        *arg = majit_ir::operand::Operand::Box(bound);
+                        *arg = majit_ir::operand::Operand::from_boxref(&bound);
                     }
                 }
             }

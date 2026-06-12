@@ -614,7 +614,7 @@ impl TreeLoop {
                     // later by store_final_boxes_in_guard. Rewrite kept as
                     // a release safety net.
                     debug_assert!(false, "cut-trace op carried fail_args: {:?}", new_op.opcode);
-                    *arg = majit_ir::operand::Operand::Box(BoxRef::from_opref(remap_ref(
+                    *arg = majit_ir::operand::Operand::from_boxref(&BoxRef::from_opref(remap_ref(
                         &arg.to_opref(),
                     )));
                 }
