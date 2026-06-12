@@ -333,13 +333,13 @@ pub unsafe fn py_repr(obj: PyObjectRef) -> Result<String, crate::PyError> {
                 if let Some((src, method)) = crate::baseobjspace::lookup_where(w_class, "__repr__")
                 {
                     if !std::ptr::eq(src, crate::typedef::w_object()) && !method.is_null() {
-                        // A raising override propagates; a non-string return
-                        // falls through to the generic tuple formatting
-                        // (structseq's `__repr__` always returns a str).
+                        // A raising override propagates; a non-string return is
+                        // a TypeError like every other `__repr__` override.
                         let r = crate::builtins::call_and_check(method, &[obj])?;
                         if pyre_object::is_str(r) {
                             return Ok(pyre_object::w_str_get_value(r).to_string());
                         }
+                        return Err(dunder_returned_non_string("__repr__", r));
                     }
                 }
             }

@@ -2626,7 +2626,7 @@ impl OpcodeStepExecutor for PyFrame {
         let s = match conv {
             crate::bytecode::ConvertValueOparg::Str => unsafe { crate::py_str(val)? },
             crate::bytecode::ConvertValueOparg::Repr => unsafe { crate::py_repr(val)? },
-            crate::bytecode::ConvertValueOparg::Ascii => unsafe { crate::py_repr(val)? },
+            crate::bytecode::ConvertValueOparg::Ascii => crate::builtins::py_ascii(val)?,
             crate::bytecode::ConvertValueOparg::None => unsafe { crate::py_str(val)? },
         };
         self.push(pyre_object::w_str_new(&s));

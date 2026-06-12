@@ -33,6 +33,11 @@ class NonStrRepr:
         return 42
 
 
+class NonStrTupleRepr(tuple):
+    def __repr__(self):
+        return 42
+
+
 show("repr-raise", lambda: repr(RaisesRepr()))
 show("str-raise", lambda: str(RaisesStr()))
 show("leaf-repr-raise", lambda: repr(MyInt(7)))
@@ -43,6 +48,11 @@ show("tuple-elem", lambda: str((RaisesStr(),)))
 show("format-r", lambda: "{!r}".format(RaisesRepr()))
 show("percent-s", lambda: "%s" % RaisesStr())
 show("fstring", lambda: f"{RaisesRepr()!r}")
+show("tuple-sub-nonstr-repr", lambda: repr(NonStrTupleRepr((1, 2))))
+
+# f-string `!a` escapes non-ASCII like ascii(), not like repr().
+s = "café"
+print("fstring-ascii", f"{s!a}", ascii(s))
 
 # Normal formatting is unaffected.
 print("normal", repr([1, 2]), str({3: 4}), repr((1,)), ascii("x"))
