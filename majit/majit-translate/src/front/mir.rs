@@ -1670,7 +1670,7 @@ impl<'a> Lowering<'a> {
                         kind: op,
                     });
                 }
-                self.emit_projection_write(mir_bb, *inner, elem, value_var)
+                self.emit_projection_write(mir_bb, *inner, elem, value_var, &dest_ty)
             }
             _ => Err(LowerError::Unsupported(format!(
                 "bb{mir_bb}: Assign to {:?} destination not yet supported",
@@ -1681,13 +1681,18 @@ impl<'a> Lowering<'a> {
 
     /// Emit the side-effectful write op for an `Assign` whose dest is
     /// a `Projection(inner, elem)`. `value` is the freshly computed
-    /// rvalue.
+    /// rvalue.  `dest_ty` is the projected place's own `TyRef` — the
+    /// field type AFTER generic substitution, mirroring the typed
+    /// `FieldRead` arm in `resolve_place` (the declaration-side field
+    /// ty is the generic param for generic ADTs, which
+    /// `tyref_to_value_type` can only degrade to `Ref(None)`).
     fn emit_projection_write(
         &mut self,
         mir_bb: usize,
         inner: Place,
         elem: ProjectionElem,
         value: Variable,
+        dest_ty: &TyRef,
     ) -> Result<(), LowerError> {
         let base = self.resolve_place(mir_bb, inner)?;
         let bb_id = self.block_id[mir_bb];
@@ -1712,14 +1717,14 @@ impl<'a> Lowering<'a> {
                     // asymmetric synthetic label (`Adt_<idx>`) would
                     // make the rtyper's `getfieldrepr` miss the attr
                     // the paired read registered under its real name.
-                    if let Some((owner_root, field_name, field_ty)) =
+                    if let Some((owner_root, field_name, _field_ty)) =
                         self.resolve_adt_field(field_payload)
                     {
                         OpKind::FieldWrite {
                             base,
                             field: FieldDescriptor::new(field_name, Some(owner_root)),
                             value,
-                            ty: tyref_to_value_type(&field_ty, self.llbc),
+                            ty: tyref_to_value_type(dest_ty, self.llbc),
                         }
                     } else {
                         let label = field_label_from_payload(field_payload);
