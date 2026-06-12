@@ -300,6 +300,13 @@ pub struct W_ExceptionObject {
     /// `interp_exceptions.py:527 W_OSError.w_filename2` /
     /// `:742 readwrite_attrproperty_w('w_filename2', W_OSError)`.
     pub w_filename2: PyObjectRef,
+    /// `interp_exceptions.py:990 W_SystemExit.w_code` /
+    /// `:1006 readwrite_attrproperty_w('w_code', W_SystemExit)`.
+    /// `PY_NULL` is the class default `None`; the `code` getattr arm
+    /// derives the value from `args_w` (descr_init: `args_w[0]` for one
+    /// argument, the args tuple for several) when the slot is unset, and
+    /// a later `e.code = x` write persists here ahead of that fallback.
+    pub w_code: PyObjectRef,
 }
 
 pub const EXC_KIND_OFFSET: usize = std::mem::offset_of!(W_ExceptionObject, kind);
@@ -316,6 +323,7 @@ pub const EXC_W_ERRNO_OFFSET: usize = std::mem::offset_of!(W_ExceptionObject, w_
 pub const EXC_W_STRERROR_OFFSET: usize = std::mem::offset_of!(W_ExceptionObject, w_strerror);
 pub const EXC_W_FILENAME_OFFSET: usize = std::mem::offset_of!(W_ExceptionObject, w_filename);
 pub const EXC_W_FILENAME2_OFFSET: usize = std::mem::offset_of!(W_ExceptionObject, w_filename2);
+pub const EXC_W_CODE_OFFSET: usize = std::mem::offset_of!(W_ExceptionObject, w_code);
 
 /// GC trace offsets for `W_ExceptionObject` — `args_w` plus the three
 /// `PyObjectRef`-shaped chained-exception slots per
@@ -324,10 +332,11 @@ pub const EXC_W_FILENAME2_OFFSET: usize = std::mem::offset_of!(W_ExceptionObject
 /// w_end / w_reason / w_encoding) that PyPy distributes across the
 /// W_UnicodeTranslateError / W_UnicodeDecodeError / W_UnicodeEncodeError
 /// subclasses, plus the four W_OSError per-class slots (w_errno /
-/// w_strerror / w_filename / w_filename2).  `kind` is a `u8` tag,
-/// `message` is a `*mut String` (raw heap), and `suppress_context` is
-/// a bool — none of those are GC-traced.
-pub const W_EXCEPTION_GC_PTR_OFFSETS: [usize; 13] = [
+/// w_strerror / w_filename / w_filename2), plus the W_SystemExit
+/// `w_code` slot.  `kind` is a `u8` tag, `message` is a `*mut String`
+/// (raw heap), and `suppress_context` is a bool — none of those are
+/// GC-traced.
+pub const W_EXCEPTION_GC_PTR_OFFSETS: [usize; 14] = [
     EXC_ARGS_W_OFFSET,
     EXC_W_CAUSE_OFFSET,
     EXC_W_CONTEXT_OFFSET,
@@ -341,6 +350,7 @@ pub const W_EXCEPTION_GC_PTR_OFFSETS: [usize; 13] = [
     EXC_W_STRERROR_OFFSET,
     EXC_W_FILENAME_OFFSET,
     EXC_W_FILENAME2_OFFSET,
+    EXC_W_CODE_OFFSET,
 ];
 
 /// GC type id assigned to `W_ExceptionObject` at JitDriver init time.
@@ -433,6 +443,9 @@ pub fn w_exception_new_empty(kind: ExcKind) -> PyObjectRef {
         w_strerror: PY_NULL,
         w_filename: PY_NULL,
         w_filename2: PY_NULL,
+        // `interp_exceptions.py:990` W_SystemExit class default
+        // `w_code = None`.
+        w_code: PY_NULL,
     }) as PyObjectRef
 }
 
@@ -880,6 +893,29 @@ pub unsafe fn w_exception_get_filename2(obj: PyObjectRef) -> PyObjectRef {
 pub unsafe fn w_exception_set_filename2(obj: PyObjectRef, value: PyObjectRef) {
     unsafe {
         (*(obj as *mut W_ExceptionObject)).w_filename2 = value;
+    }
+}
+
+/// `interp_exceptions.py:1006 readwrite_attrproperty_w('w_code', ...)`
+/// — `e.code` reader.  `PY_NULL` means the slot was never written (the
+/// `code` getattr arm then derives the value from `args_w`).
+///
+/// # Safety
+/// `obj` must point to a valid `W_ExceptionObject`.
+#[inline]
+pub unsafe fn w_exception_get_code(obj: PyObjectRef) -> PyObjectRef {
+    unsafe { (*(obj as *const W_ExceptionObject)).w_code }
+}
+
+/// `interp_exceptions.py:1006 readwrite_attrproperty_w('w_code', ...)`
+/// — `e.code = ...` writer.
+///
+/// # Safety
+/// `obj` must point to a valid `W_ExceptionObject`.
+#[inline]
+pub unsafe fn w_exception_set_code(obj: PyObjectRef, value: PyObjectRef) {
+    unsafe {
+        (*(obj as *mut W_ExceptionObject)).w_code = value;
     }
 }
 

@@ -3205,15 +3205,20 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str) -> PyResult {
             }
             "code" => {
                 // `interp_exceptions.py:986-1006 W_SystemExit`: `code` is a
-                // `readwrite_attrproperty_w('w_code')` set by `descr_init`
-                // to `args_w[0]` for a single argument, `newtuple(args_w)`
-                // for several, and the `__init__` default `None` when the
-                // instance carries no arguments.  Derived from `args_w`
-                // here, the same way `value` is above; supporting a later
-                // `e.code = x` write-back would need a dedicated `w_code`
-                // slot like OSError's `w_errno`.
+                // writable `readwrite_attrproperty_w('w_code')` slot
+                // (`:1006`) set by `descr_init` to `args_w[0]` for a single
+                // argument, `newtuple(args_w)` for several, and the
+                // `__init__` default `None` when the instance carries no
+                // arguments.  Read the slot first so an explicit
+                // `e.code = x` write persists, then derive from `args_w`
+                // (the internal-constructor path that bypasses the public
+                // setter), mirroring the OSError `errno` arm.
                 let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
                 if kind == pyre_object::excobject::ExcKind::SystemExit {
+                    let stored = unsafe { pyre_object::excobject::w_exception_get_code(obj) };
+                    if !stored.is_null() {
+                        return Ok(stored);
+                    }
                     let args = unsafe { pyre_object::excobject::w_exception_get_args(obj) };
                     let len = unsafe { pyre_object::w_tuple_len(args) };
                     if len == 1 {
@@ -5258,6 +5263,19 @@ pub fn object_setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyRes
                             _ => pyre_object::excobject::w_exception_set_filename2(obj, value),
                         }
                     };
+                    return Ok(w_none());
+                }
+            }
+            // `interp_exceptions.py:1006
+            // readwrite_attrproperty_w('w_code', W_SystemExit)` — the
+            // writer stores the raw `w_value` into the slot; the matching
+            // getattr arm reads it back ahead of the `args_w`-derived
+            // fallback.  Gated on SystemExit because PyPy installs the
+            // descriptor only on `W_SystemExit.typedef`.
+            "code" => {
+                let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
+                if kind == pyre_object::excobject::ExcKind::SystemExit {
+                    unsafe { pyre_object::excobject::w_exception_set_code(obj, value) };
                     return Ok(w_none());
                 }
             }
