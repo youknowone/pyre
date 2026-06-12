@@ -2840,8 +2840,17 @@ impl Optimizer {
                     // Use canonical_result (resolved key) for both.
                     preamble_op.pos.set(canonical_result);
                     // optimizer.py:651-652 force_box loop parity.
+                    //
+                    // Resolve POSITIONALLY (get_box_replacement on the
+                    // encoded position), not through the operand's bound
+                    // object: replay-op args carry the dep replay handle
+                    // (produce_arg, shortpreamble.py:285) whose forwarded
+                    // slot is empty — only the body producer registered at
+                    // the same position carries the Phase-1 forwarding to
+                    // the canonical end box this export boundary needs.
                     for i in 0..preamble_op.num_args() {
-                        preamble_op.setarg(i, ctx.resolve_box_box(&preamble_op.arg(i)));
+                        let arg = preamble_op.arg(i).to_opref();
+                        preamble_op.setarg(i, ctx.get_box_replacement(arg));
                     }
                     if let Some(fail_args) = preamble_op.fail_args_mut() {
                         for arg in fail_args {

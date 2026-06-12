@@ -373,7 +373,6 @@ impl PreambleOp {
                 //   else:
                 //       preamble_op = ResOperation(sop.getopnum(), [preamble_arg, sop.getarg(1)], descr=sop.getdescr())
                 let preamble_arg = sb.produce_arg(ctx, self.op.arg(0).to_opref())?;
-                let preamble_arg = ctx.materialize_box_at(preamble_arg);
                 let args: smallvec::SmallVec<[BoxRef; 3]> = if self.op.opcode.is_getfield() {
                     smallvec::smallvec![preamble_arg]
                 } else {
@@ -393,10 +392,7 @@ impl PreambleOp {
                     .op
                     .getarglist()
                     .iter()
-                    .map(|arg| {
-                        sb.produce_arg(ctx, arg.to_opref())
-                            .map(|r| ctx.materialize_box_at(r))
-                    })
+                    .map(|arg| sb.produce_arg(ctx, arg.to_opref()))
                     .collect::<Option<smallvec::SmallVec<[BoxRef; 3]>>>()?;
                 let opnum = if self.op.opcode.is_call() {
                     match self.op.opcode {
@@ -420,10 +416,7 @@ impl PreambleOp {
                     .op
                     .getarglist()
                     .iter()
-                    .map(|arg| {
-                        sb.produce_arg(ctx, arg.to_opref())
-                            .map(|r| ctx.materialize_box_at(r))
-                    })
+                    .map(|arg| sb.produce_arg(ctx, arg.to_opref()))
                     .collect::<Option<smallvec::SmallVec<[BoxRef; 3]>>>()?;
                 let opnum = match self.op.opcode {
                     OpCode::CallI => OpCode::CallLoopinvariantI,
@@ -676,7 +669,7 @@ impl ShortBoxes {
         &mut self,
         ctx: &mut crate::optimizeopt::OptContext,
         opref: OpRef,
-    ) -> Option<OpRef> {
+    ) -> Option<BoxRef> {
         // shortpreamble.py:284 `if op in self.produced_short_boxes` — the
         // dict membership is Box identity; resolve the position to its
         // canonical box once for both identity-keyed checks. Const args
@@ -684,27 +677,50 @@ impl ShortBoxes {
         if !opref.is_constant() {
             let key = ctx.materialize_box_at(opref);
             if let Some(existing) = self.produced_short_boxes.get(&key) {
-                return Some(existing.preamble_op.pos.get());
+                // shortpreamble.py:285 `return ...preamble_op` — the
+                // dependency's replay op object itself, so preamble-op
+                // args carry the dep replay handle.
+                //
+                // ShortInputArg: upstream `preamble_op` IS the inputarg
+                // box (shortpreamble.py:255-259), not an op. pyre models
+                // the replay as a SAME_AS op squatting the inputarg
+                // position; binding to that op retags the position into
+                // the op namespace (from_bound_op derives the OpRef from
+                // the box kind), so return the carried res box instead.
+                if existing.kind == PreambleOpKind::InputArg {
+                    return Some(existing.res.clone());
+                }
+                return Some(BoxRef::from_bound_op(&existing.preamble_op));
             }
             if self.boxes_in_production.contains(&key) {
                 return None;
             }
         }
         // shortpreamble.py:288 isinstance(op, Const) → return op.
+        if opref.is_constant() {
+            return Some(BoxRef::from_opref(opref));
+        }
         // pyre tracks iteration-known constants (body-typed OpRefs proven
         // constant for this pass) in `known_constants`; those are this
         // stage's `Const` boxes, mirroring `use_box`/`insert_dep_recursive`.
-        if opref.is_constant() || self.known_constants.contains(&opref) {
-            return Some(opref);
+        if self.known_constants.contains(&opref) {
+            return Some(ctx.materialize_box_at(opref));
         }
         if self.potential_ops.iter().any(|(k, _)| *k == opref) {
-            return self
-                .materialize_one(ctx, opref)
-                .map(|produced| produced.preamble_op.pos.get());
+            // shortpreamble.py:291-294 `r = self.add_op_to_short(...);
+            // return r.preamble_op`. ShortInputArg: res box, see the
+            // produced arm above.
+            return self.materialize_one(ctx, opref).map(|produced| {
+                if produced.kind == PreambleOpKind::InputArg {
+                    produced.res.clone()
+                } else {
+                    BoxRef::from_bound_op(&produced.preamble_op)
+                }
+            });
         }
         // Label args are always available as inputs (RPython: isinstance(op, InputArgIntOp))
-        if self.short_inputargs.iter().any(|a| a.to_opref() == opref) {
-            return Some(opref);
+        if let Some(arg) = self.short_inputargs.iter().find(|a| a.to_opref() == opref) {
+            return Some(arg.clone());
         }
         None
     }
@@ -831,7 +847,7 @@ impl ShortBoxes {
                 continue;
             };
             // shortpreamble.py:277-278: copy_and_change(opnum, [preamble_arg] + args[1:])
-            let mut new_args = vec![ctx.materialize_box_at(preamble_arg)];
+            let mut new_args = vec![preamble_arg];
             new_args.extend_from_slice(&getfield_op.getarglist()[1..]);
             let mut new_op = Op::with_descr(
                 getfield_op.opcode,
