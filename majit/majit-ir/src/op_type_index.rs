@@ -16,9 +16,9 @@ use crate::value::{InputArg, Type};
 /// `inputarg_pos` and `op_pos` are stored as `Cow` so callers may
 /// either let `new` build them eagerly or share pre-built indexes that
 /// outlive the trace (e.g. `RegAlloc<'a>`).
-pub struct OpTypeIndex<'a> {
+pub struct OpTypeIndex<'a, T: AsRef<Op> = Op> {
     inputargs: &'a [InputArg],
-    ops: &'a [Op],
+    ops: &'a [T],
     /// `inputarg_pos[raw] = slice index in inputargs`, sentinel
     /// [`NO_POS`] for unset slots. `arg.index` raw uniqueness is
     /// enforced at build time, mirroring RPython's backend uniqueness
@@ -39,8 +39,8 @@ pub struct OpTypeIndex<'a> {
 /// below `u32::MAX`.
 pub const NO_POS: u32 = u32::MAX;
 
-impl<'a> OpTypeIndex<'a> {
-    pub fn new(inputargs: &'a [InputArg], ops: &'a [Op]) -> Self {
+impl<'a, T: AsRef<Op>> OpTypeIndex<'a, T> {
+    pub fn new(inputargs: &'a [InputArg], ops: &'a [T]) -> Self {
         let inputarg_pos = Self::build_inputarg_pos(inputargs);
         let op_pos = Self::build_op_pos(ops);
         Self {
@@ -55,7 +55,7 @@ impl<'a> OpTypeIndex<'a> {
     /// O(1) — borrows slices instead of rebuilding the position arrays.
     pub fn from_parts(
         inputargs: &'a [InputArg],
-        ops: &'a [Op],
+        ops: &'a [T],
         inputarg_pos: &'a [u32],
         op_pos: &'a [u32],
     ) -> Self {
@@ -107,9 +107,10 @@ impl<'a> OpTypeIndex<'a> {
     /// tag, because pyre's backend boundary keys by raw u32 and would
     /// silently keep only the later op. Hard-panic on raw collision so
     /// the violation surfaces here.
-    pub fn build_op_pos(ops: &[Op]) -> Vec<u32> {
+    pub fn build_op_pos(ops: &[T]) -> Vec<u32> {
         let max_raw = ops
             .iter()
+            .map(|op| op.as_ref())
             .filter(|op| !op.pos.get().is_none() && op.type_ != Type::Void)
             .map(|op| op.pos.get().raw())
             .max();
@@ -118,6 +119,7 @@ impl<'a> OpTypeIndex<'a> {
         };
         let mut pos: Vec<u32> = vec![NO_POS; max_raw as usize + 1];
         for (idx, op) in ops.iter().enumerate() {
+            let op = op.as_ref();
             if op.pos.get().is_none() || op.type_ == Type::Void {
                 continue;
             }
@@ -127,7 +129,7 @@ impl<'a> OpTypeIndex<'a> {
                     "OpTypeIndex: raw {} bound to ops[{}] {:?} and ops[{}] {:?} — Box identity broken",
                     op.pos.get().raw(),
                     pos[r],
-                    ops[pos[r] as usize].opcode,
+                    ops[pos[r] as usize].as_ref().opcode,
                     idx,
                     op.opcode,
                 );
@@ -189,7 +191,7 @@ impl<'a> OpTypeIndex<'a> {
             return None;
         }
         let idx = op_pos_lookup(&self.op_pos, opref.raw() as usize)?;
-        Some(&self.ops[idx])
+        Some(self.ops[idx].as_ref())
     }
 
     /// Inputarg-only type lookup; returns `None` if `opref` does not

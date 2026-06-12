@@ -407,7 +407,7 @@ impl<'a> AssemblerARM64<'a> {
         inputargs: &'a [InputArg],
         operations: &'a [Op],
     ) -> Self {
-        let inputarg_pos = OpTypeIndex::build_inputarg_pos(inputargs);
+        let inputarg_pos = OpTypeIndex::<Op>::build_inputarg_pos(inputargs);
         let op_pos = OpTypeIndex::build_op_pos(operations);
         AssemblerARM64 {
             mc: Assembler::new().unwrap(),

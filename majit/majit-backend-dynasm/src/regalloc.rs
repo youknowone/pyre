@@ -1675,7 +1675,7 @@ impl<'a> RegAlloc<'a> {
         let rm = Self::make_gpr_manager();
         let xrm = Self::make_xmm_manager();
         let fm = FrameManager::new(0);
-        let inputarg_pos = OpTypeIndex::build_inputarg_pos(inputargs);
+        let inputarg_pos = OpTypeIndex::<Op>::build_inputarg_pos(inputargs);
         let op_pos = OpTypeIndex::build_op_pos(operations);
         RegAlloc {
             longevity,

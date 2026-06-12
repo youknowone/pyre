@@ -1908,6 +1908,9 @@ impl Optimizer {
         let ops_rc: Vec<majit_ir::OpRc> =
             ops.iter().map(|op| std::rc::Rc::new(op.clone())).collect();
         self.run_optimize_from_inputs(&ops_rc, constants, num_inputs, false)
+            .into_iter()
+            .map(|rc| (*rc).clone())
+            .collect()
     }
 
     /// `OpRc`-threading entry for callers that hold the canonical
@@ -1921,17 +1924,17 @@ impl Optimizer {
         ops: &[majit_ir::OpRc],
         constants: &mut majit_ir::VecAssoc<u32, majit_ir::Value>,
         num_inputs: usize,
-    ) -> Vec<Op> {
+    ) -> Vec<majit_ir::OpRc> {
         self.run_optimize_from_inputs(ops, constants, num_inputs, true)
     }
 
-    fn run_optimize_from_inputs(
+    pub(crate) fn run_optimize_from_inputs(
         &mut self,
         ops: &[majit_ir::OpRc],
         constants: &mut majit_ir::VecAssoc<u32, majit_ir::Value>,
         num_inputs: usize,
         input_ops_from_ops: bool,
-    ) -> Vec<Op> {
+    ) -> Vec<majit_ir::OpRc> {
         // Ensure new ops get positions beyond all original trace positions.
         // Original ops keep their tracer-assigned positions; new ops (constants,
         // force materializations) must not collide with them.
@@ -1969,7 +1972,7 @@ impl Optimizer {
         inputarg_base: u32,
         start_next_pos: u32,
         input_ops_from_ops: bool,
-    ) -> Vec<Op> {
+    ) -> Vec<majit_ir::OpRc> {
         use majit_ir::OpRef;
         // Test-only auto-seed of `trace_inputargs` from the variant
         // tags of any InputArg*/IntOp/FloatOp/RefOp OpRef that references
@@ -3392,7 +3395,7 @@ impl Optimizer {
             }
         }
         self.final_ctx = Some(ctx);
-        ops.into_iter().map(|rc| (*rc).clone()).collect()
+        ops
     }
 
     /// unroll.py:183-236: optimize_bridge()
@@ -3411,7 +3414,7 @@ impl Optimizer {
     /// optimizer's exported_loop_state for the new target token.
     pub(crate) fn optimize_bridge(
         &mut self,
-        ops: &[Op],
+        ops: &[majit_ir::OpRc],
         constants: &mut majit_ir::VecAssoc<u32, majit_ir::Value>,
         num_inputs: usize,
         front_target_tokens: &mut Vec<crate::optimizeopt::unroll::TargetToken>,
@@ -3433,7 +3436,7 @@ impl Optimizer {
         // base into `optimize_with_constants_and_inputs_at` so step 3
         // seeds inputarg types at the shifted slots.
         bridge_inputarg_base: u32,
-    ) -> (Vec<Op>, bool) {
+    ) -> (Vec<majit_ir::OpRc>, bool) {
         // bridgeopt.py:124-185: deserialize_optimizer_knowledge
         // Store as pending — setup() inside optimize_with_constants_and_inputs
         // clears pass state, so we apply AFTER setup.
@@ -3471,15 +3474,13 @@ impl Optimizer {
             .map(|p| p + 1)
             .unwrap_or(bridge_inputarg_base + num_inputs as u32)
             .max(bridge_inputarg_base + num_inputs as u32);
-        let ops_rc: Vec<majit_ir::OpRc> =
-            ops.iter().map(|op| std::rc::Rc::new(op.clone())).collect();
         // Bridge ops are a fresh `TraceIterator`'s planted UNBOUND resop slots
         // (`bind_input_resops` binds them later, after `input_ops` is built),
         // so the input-ops seed is empty; producer lookup runs off `resop_refs`
         // (populated by `bind_input_resops`).
         self.explicit_input_ops_seed = Some(Vec::new());
         let optimized_ops = self.optimize_with_constants_and_inputs_at(
-            &ops_rc,
+            ops,
             constants,
             num_inputs,
             bridge_inputarg_base,
@@ -3538,7 +3539,7 @@ impl Optimizer {
                 );
                 self.send_extra_operation(&jump_op, &mut ctx);
                 let mut result = optimized_ops;
-                result.extend(ctx.new_operations.drain(..).map(|rc| (*rc).clone()));
+                result.extend(ctx.new_operations.drain(..));
                 return (result, false);
             }
             return (optimized_ops, false);
@@ -3614,7 +3615,7 @@ impl Optimizer {
                     );
                     self.send_extra_operation(&jump_op, &mut ctx);
                     let mut result = optimized_ops;
-                    result.extend(ctx.new_operations.drain(..).map(|rc| (*rc).clone()));
+                    result.extend(ctx.new_operations.drain(..));
                     return (result, false);
                 }
                 return (optimized_ops, false);
@@ -3624,7 +3625,7 @@ impl Optimizer {
         // unroll.py:212-213: vs is None → matched, JUMP redirected
         if vs.is_none() {
             let mut result = optimized_ops;
-            result.extend(ctx.new_operations.drain(..).map(|rc| (*rc).clone()));
+            result.extend(ctx.new_operations.drain(..));
             return (result, false);
         }
 
@@ -3674,7 +3675,7 @@ impl Optimizer {
         // unroll.py:226-227: vs is None → matched with forced boxes
         if vs2.is_none() {
             let mut result = optimized_ops;
-            result.extend(ctx.new_operations.drain(..).map(|rc| (*rc).clone()));
+            result.extend(ctx.new_operations.drain(..));
             return (result, false);
         }
 
@@ -3697,7 +3698,7 @@ impl Optimizer {
             );
             self.send_extra_operation(&jump_op, &mut ctx);
             let mut result = optimized_ops;
-            result.extend(ctx.new_operations.drain(..).map(|rc| (*rc).clone()));
+            result.extend(ctx.new_operations.drain(..));
             (result, false)
         } else {
             (optimized_ops, false)

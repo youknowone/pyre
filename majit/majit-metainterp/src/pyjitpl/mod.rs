@@ -249,7 +249,7 @@ pub(crate) struct CompiledTrace {
     /// Inputargs for this trace, used to recover typed exit layouts during blackhole replay.
     pub(crate) inputargs: Vec<InputArg>,
     /// Optimized ops for blackhole fallback from compiled guard failures.
-    pub(crate) ops: Vec<majit_ir::Op>,
+    pub(crate) ops: Vec<majit_ir::OpRc>,
     /// Typed constant pool paired with `ops` for blackhole fallback.
     /// history.py:220/261/307 `ConstInt`/`ConstFloat`/`ConstPtr` pin
     /// type with value, so `Const` carries both — the legacy
@@ -565,7 +565,7 @@ fn snapshot_map_from_trace_snapshots(
 }
 
 struct PreparedBridgeTrace {
-    ops: Vec<Op>,
+    ops: Vec<OpRc>,
     inputargs: Vec<InputArg>,
     snapshot_boxes: SnapshotBoxes,
     snapshot_frame_sizes: SnapshotFrameSizes,
@@ -647,12 +647,9 @@ fn prepare_bridge_trace_for_optimizer(
         &bridge_inputarg_types,
         bridge_inputarg_base,
     );
-    // Clone-out boundary: `PreparedBridgeTrace.ops` is still `Vec<Op>`
-    // by value; `Op::clone` preserves the bound operand handles minted
-    // by the iterator (Rc clones).
     let mut ops = Vec::with_capacity(bridge_ops.len());
     while let Some(op) = iter.next() {
-        ops.push((*op).clone());
+        ops.push(op);
     }
     let inputargs = bridge_inputargs
         .iter()
@@ -685,8 +682,8 @@ fn prepare_bridge_trace_for_optimizer(
 
 fn normalize_root_loop_entry_contract(
     inputargs: Vec<InputArg>,
-    optimized_ops: Vec<Op>,
-) -> Result<(Vec<InputArg>, Vec<Op>), (usize, usize)> {
+    optimized_ops: Vec<majit_ir::OpRc>,
+) -> Result<(Vec<InputArg>, Vec<majit_ir::OpRc>), (usize, usize)> {
     let last_jump = optimized_ops
         .iter()
         .rev()
@@ -846,7 +843,7 @@ impl<M> CompiledEntry<M> {
 /// Scanning them mirrors RPython's Box-identity model where every
 /// referenced Box keeps the parent trace alive: any OpRef the trace
 /// touches must be reflected in the high-water mark.
-fn compute_next_global_opref(inputargs: &[InputArg], ops: &[majit_ir::Op]) -> u32 {
+fn compute_next_global_opref<T: AsRef<majit_ir::Op>>(inputargs: &[InputArg], ops: &[T]) -> u32 {
     fn opref_high_water(r: OpRef) -> u32 {
         if r.is_none() || r.is_constant() {
             0
@@ -862,6 +859,7 @@ fn compute_next_global_opref(inputargs: &[InputArg], ops: &[majit_ir::Op]) -> u3
     let from_ops = ops
         .iter()
         .map(|op| {
+            let op = op.as_ref();
             let mut hw = opref_high_water(op.pos.get());
             for a in op.getarglist().iter() {
                 hw = hw.max(opref_high_water(a.to_opref()));
@@ -904,7 +902,7 @@ pub struct PartialTrace {
     /// variants store the value inline (history.py:227/268/314), so
     /// `compile_retrace` reuses `partial.ops` verbatim without any
     /// separate constants side table.
-    pub(crate) ops: Vec<Op>,
+    pub(crate) ops: Vec<majit_ir::OpRc>,
     /// Inputargs from the partial trace.
     pub(crate) inputargs: Vec<InputArg>,
 }
@@ -4384,7 +4382,7 @@ impl<M: Clone> MetaInterp<M> {
     pub(crate) fn patch_new_loop_to_load_virtualizable_fields(
         &self,
         inputargs: &mut Vec<InputArg>,
-        ops: &mut Vec<Op>,
+        ops: &mut Vec<majit_ir::OpRc>,
         constants: &mut majit_ir::VecAssoc<u32, majit_ir::Value>,
         driver_descriptor: Option<&crate::jitdriver::JitDriverStaticData>,
         orig_vable_ptr: *const u8,
@@ -4855,7 +4853,10 @@ impl<M: Clone> MetaInterp<M> {
         // Phase 2 InvalidLoop. Phase 1 writes to phase1_out on the caller's
         // stack BEFORE Phase 2 starts. If Phase 2 panics, phase1_out still
         // holds the Phase 1 results.
-        let mut phase1_out: Option<(Vec<Op>, crate::optimizeopt::unroll::ExportedState)> = None;
+        let mut phase1_out: Option<(
+            Vec<majit_ir::OpRc>,
+            crate::optimizeopt::unroll::ExportedState,
+        )> = None;
         let optimize_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             unroll_opt.optimize_trace_with_constants_and_inputs_vable_out(
                 &trace_ops,
@@ -4928,12 +4929,17 @@ impl<M: Clone> MetaInterp<M> {
                         // `Rc<Op>`), so producer lookup resolves identity.
                         simple_opt.explicit_input_ops_seed =
                             Some(preamble_data.base.operations().to_vec());
+                        let trace_ops_snapshot_rc: Vec<majit_ir::OpRc> = trace_ops_snapshot
+                            .iter()
+                            .map(|op| std::rc::Rc::new(op.clone()))
+                            .collect();
                         let retry_result =
                             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                simple_opt.optimize_with_constants_and_inputs(
-                                    &trace_ops_snapshot,
+                                simple_opt.run_optimize_from_inputs(
+                                    &trace_ops_snapshot_rc,
                                     &mut retry_constants,
                                     num_trace_inputargs,
+                                    false,
                                 )
                             }));
                         match retry_result {
@@ -4982,12 +4988,18 @@ impl<M: Clone> MetaInterp<M> {
             if vec_gate && vec_size != 0 && !retried_without_unroll {
                 // vector.py:124 `user_code = not jitdriver_sd.vec and warmstate.vec_all`.
                 let user_code = !driver_vec && self.warm_state.vec_all();
+                // Vectorizer-internal stage still carries `Vec<Op>`;
+                // convert at this (vec_all-gated) boundary.
+                let plain_ops: Vec<Op> = optimized_ops.iter().map(|rc| (**rc).clone()).collect();
                 crate::optimizeopt::vector::apply_loop_vectorization(
-                    optimized_ops,
+                    plain_ops,
                     vec_size,
                     self.warm_state.vec_cost() as i32,
                     user_code,
                 )
+                .into_iter()
+                .map(std::rc::Rc::new)
+                .collect()
             } else {
                 optimized_ops
             }
@@ -5067,7 +5079,7 @@ impl<M: Clone> MetaInterp<M> {
                     .collect::<Vec<_>>(),
             );
             label_op.pos.set(majit_ir::OpRef::NONE);
-            optimized_ops.insert(0, label_op);
+            optimized_ops.insert(0, std::rc::Rc::new(label_op));
         }
         let (inputargs, optimized_ops) = match normalize_root_loop_entry_contract(
             root_inputargs,
@@ -5187,16 +5199,10 @@ impl<M: Clone> MetaInterp<M> {
 
         let front_target_tokens = if retried_without_unroll {
             let target_token = crate::optimizeopt::unroll::TargetToken::new_loop(token_num);
-            if let Some(jump_op) = compiled_ops
-                .last_mut()
-                .filter(|op| op.opcode == OpCode::Jump)
-            {
+            if let Some(jump_op) = compiled_ops.last().filter(|op| op.opcode == OpCode::Jump) {
                 jump_op.setdescr(target_token.as_jump_target_descr());
             }
-            if let Some(label_op) = compiled_ops
-                .iter_mut()
-                .find(|op| op.opcode == OpCode::Label)
-            {
+            if let Some(label_op) = compiled_ops.iter().find(|op| op.opcode == OpCode::Label) {
                 label_op.setdescr(target_token.as_jump_target_descr());
             } else {
                 let mut label_op = majit_ir::Op::new(
@@ -5208,7 +5214,7 @@ impl<M: Clone> MetaInterp<M> {
                 );
                 label_op.pos.set(majit_ir::OpRef::NONE);
                 label_op.setdescr(target_token.as_jump_target_descr());
-                compiled_ops.insert(0, label_op);
+                compiled_ops.insert(0, std::rc::Rc::new(label_op));
             }
             vec![target_token]
         } else if unroll_opt.target_tokens.is_empty() {
@@ -5260,13 +5266,6 @@ impl<M: Clone> MetaInterp<M> {
         // handle VStr/VUni at the backend layer (dynasm) get a no-op.
         self.backend
             .set_callinfocollection(self.callinfocollection.clone());
-        // Wrap optimizer-output `Vec<Op>` into `Vec<OpRc>` for the
-        // backend's `&[OpRc]` boundary (history.py:528 ResOperation
-        // identity at trace level).
-        let compiled_ops_rc: Vec<majit_ir::OpRc> = compiled_ops
-            .iter()
-            .map(|op| std::rc::Rc::new(op.clone()))
-            .collect();
         // compile.py:532-546 `debug_start("jit-backend") +
         // profiler.start_backend() ... try: do_compile_loop ... finally:
         // ... profiler.end_backend() + debug_stop("jit-backend")`.
@@ -5277,7 +5276,7 @@ impl<M: Clone> MetaInterp<M> {
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 self.backend.compile_loop(
                     &inputargs,
-                    &compiled_ops_rc,
+                    &compiled_ops,
                     Arc::get_mut(&mut token)
                         .expect("JitCellToken must stay uniquely owned until backend compile"),
                 )
@@ -5328,7 +5327,7 @@ impl<M: Clone> MetaInterp<M> {
                 self.warm_state.memory_manager.keep_loop_alive(&token);
                 // compile.py:213 record_loop_or_bridge — record this loop's
                 // CALL_ASSEMBLER / JUMP keepalive targets.
-                self.record_loop_or_bridge(&token, &mut compiled_ops, trace_id);
+                self.record_loop_or_bridge(&token, &compiled_ops, trace_id);
                 if crate::majit_log_enabled() {
                     eprintln!(
                         "[jit] compiled loop at key={}, num_inputs={}",
@@ -5824,7 +5823,7 @@ impl<M: Clone> MetaInterp<M> {
     pub fn retrace_needed(
         &mut self,
         green_key: u64,
-        ops: Vec<Op>,
+        ops: Vec<majit_ir::OpRc>,
         inputargs: Vec<InputArg>,
         mut exported_state: crate::optimizeopt::unroll::ExportedState,
     ) {
@@ -6168,14 +6167,9 @@ impl<M: Clone> MetaInterp<M> {
         let compile_result = {
             let _backend_scope = self.staticdata.profiler.enter_backend();
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                // Wrap to `Vec<OpRc>` for the backend's trait boundary.
-                let combined_ops_rc: Vec<majit_ir::OpRc> = combined_ops
-                    .iter()
-                    .map(|op| std::rc::Rc::new(op.clone()))
-                    .collect();
                 self.backend.compile_loop(
                     &inputargs,
-                    &combined_ops_rc,
+                    &combined_ops,
                     Arc::get_mut(&mut token)
                         .expect("JitCellToken must stay uniquely owned until backend compile"),
                 )
@@ -6220,7 +6214,7 @@ impl<M: Clone> MetaInterp<M> {
                 }
                 self.warm_state.memory_manager.keep_loop_alive(&token);
                 // compile.py:213 record_loop_or_bridge.
-                self.record_loop_or_bridge(&token, &mut combined_ops, trace_id);
+                self.record_loop_or_bridge(&token, &combined_ops, trace_id);
                 if crate::majit_log_enabled() {
                     eprintln!(
                         "[jit] compiled retrace at key={}, num_inputs={}",
@@ -6711,10 +6705,6 @@ impl<M: Clone> MetaInterp<M> {
         // handle VStr/VUni at the backend layer (dynasm) get a no-op.
         self.backend
             .set_callinfocollection(self.callinfocollection.clone());
-        let optimized_ops_rc: Vec<majit_ir::OpRc> = optimized_ops
-            .iter()
-            .map(|op| std::rc::Rc::new(op.clone()))
-            .collect();
         // compile.py:532-546 `debug_start("jit-backend") +
         // profiler.start_backend() ... try: do_compile_loop ... finally:
         // ... profiler.end_backend() + debug_stop("jit-backend")`.
@@ -6722,7 +6712,7 @@ impl<M: Clone> MetaInterp<M> {
             let _backend_guard = self.staticdata.profiler.enter_backend();
             self.backend.compile_loop(
                 &inputargs,
-                &optimized_ops_rc,
+                &optimized_ops,
                 Arc::get_mut(&mut token)
                     .expect("JitCellToken must stay uniquely owned until backend compile"),
             )
@@ -6732,7 +6722,7 @@ impl<M: Clone> MetaInterp<M> {
                 self.assign_guard_hashes(token.as_ref());
                 self.warm_state.memory_manager.keep_loop_alive(&token);
                 // compile.py:213 record_loop_or_bridge.
-                self.record_loop_or_bridge(&token, &mut optimized_ops, trace_id);
+                self.record_loop_or_bridge(&token, &optimized_ops, trace_id);
                 let (mut resume_data, mut exit_layouts) =
                     compile::build_guard_metadata(&inputargs, &optimized_ops, green_key);
                 let mut terminal_exit_layouts =
@@ -7031,10 +7021,7 @@ impl<M: Clone> MetaInterp<M> {
         // mirror onto JCT for `has_compiled_targets` (`pyjitpl.py:3898`).
         token.record_target_token(target_token.as_jump_target_descr());
         let mut compiled_ops = optimized_ops.clone();
-        if let Some(jump_op) = compiled_ops
-            .last_mut()
-            .filter(|op| op.opcode == OpCode::Jump)
-        {
+        if let Some(jump_op) = compiled_ops.last().filter(|op| op.opcode == OpCode::Jump) {
             jump_op.setdescr(target_token.as_jump_target_descr());
         }
         let mut label_op = majit_ir::Op::new(
@@ -7046,7 +7033,7 @@ impl<M: Clone> MetaInterp<M> {
         );
         label_op.pos.set(majit_ir::OpRef::NONE);
         label_op.setdescr(target_token.as_jump_target_descr());
-        compiled_ops.insert(0, label_op);
+        compiled_ops.insert(0, std::rc::Rc::new(label_op));
 
         // compile.py:504-511 send_loop_to_backend virtualizable hook —
         // simple-loop compile path must also reload virtualizable fields on
@@ -7071,10 +7058,6 @@ impl<M: Clone> MetaInterp<M> {
         // handle VStr/VUni at the backend layer (dynasm) get a no-op.
         self.backend
             .set_callinfocollection(self.callinfocollection.clone());
-        let compiled_ops_rc: Vec<majit_ir::OpRc> = compiled_ops
-            .iter()
-            .map(|op| std::rc::Rc::new(op.clone()))
-            .collect();
         // compile.py:532-546 `debug_start("jit-backend") +
         // profiler.start_backend() ... try: do_compile_loop ... finally:
         // ... profiler.end_backend() + debug_stop("jit-backend")`.
@@ -7082,7 +7065,7 @@ impl<M: Clone> MetaInterp<M> {
             let _backend_guard = self.staticdata.profiler.enter_backend();
             self.backend.compile_loop(
                 &inputargs,
-                &compiled_ops_rc,
+                &compiled_ops,
                 Arc::get_mut(&mut token)
                     .expect("JitCellToken must stay uniquely owned until backend compile"),
             )
@@ -7092,7 +7075,7 @@ impl<M: Clone> MetaInterp<M> {
                 self.assign_guard_hashes(token.as_ref());
                 self.warm_state.memory_manager.keep_loop_alive(&token);
                 // compile.py:213 record_loop_or_bridge.
-                self.record_loop_or_bridge(&token, &mut compiled_ops, trace_id);
+                self.record_loop_or_bridge(&token, &compiled_ops, trace_id);
                 let (mut resume_data, mut exit_layouts) =
                     compile::build_guard_metadata(&inputargs, &compiled_ops, green_key);
                 let mut terminal_exit_layouts =
@@ -8117,7 +8100,7 @@ impl<M: Clone> MetaInterp<M> {
     fn record_loop_or_bridge(
         &self,
         original: &Arc<JitCellToken>,
-        ops: &mut [majit_ir::Op],
+        ops: &[majit_ir::OpRc],
         trace_id: u64,
     ) {
         // `compile.py:178-179` `assert original_jitcell_token.generation > 0`.
@@ -8136,7 +8119,7 @@ impl<M: Clone> MetaInterp<M> {
         }
         //
         // `compile.py:183` `for op in loop.operations`.
-        for op in ops.iter_mut() {
+        for op in ops.iter() {
             // `compile.py:184 descr = op.getdescr()`. Clone the Arc
             // (single atomic bump) so the rest of this loop iteration
             // can hold the descr value while still freely mutating
@@ -9103,13 +9086,9 @@ impl<M: Clone> MetaInterp<M> {
         let compile_result = {
             let _backend_scope = self.staticdata.profiler.enter_backend();
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let optimized_ops_rc: Vec<majit_ir::OpRc> = optimized_ops
-                    .iter()
-                    .map(|op| std::rc::Rc::new(op.clone()))
-                    .collect();
                 self.backend.compile_loop(
                     bridge_inputargs,
-                    &optimized_ops_rc,
+                    &optimized_ops,
                     Arc::get_mut(&mut token)
                         .expect("JitCellToken must stay uniquely owned until backend compile"),
                 )
@@ -9128,7 +9107,7 @@ impl<M: Clone> MetaInterp<M> {
                 self.assign_guard_hashes(token.as_ref());
                 self.warm_state.memory_manager.keep_loop_alive(&token);
                 // compile.py:213 record_loop_or_bridge.
-                self.record_loop_or_bridge(&token, &mut optimized_ops, trace_id);
+                self.record_loop_or_bridge(&token, &optimized_ops, trace_id);
                 let (mut resume_data, mut exit_layouts) = compile::build_guard_metadata(
                     bridge_inputargs,
                     &optimized_ops,
@@ -9753,11 +9732,6 @@ impl<M: Clone> MetaInterp<M> {
                 .get(&fail_descr.trace_id())
                 .and_then(|tr| tr.exit_layouts.get(&fail_descr.fail_index_per_trace()))
                 .and_then(|sl| sl.recovery_layout.clone());
-            // Wrap to `Vec<OpRc>` for the backend's trait boundary.
-            let optimized_ops_rc_for_bridge: Vec<majit_ir::OpRc> = optimized_ops
-                .iter()
-                .map(|op| std::rc::Rc::new(op.clone()))
-                .collect();
             // compile.py:589-599 `debug_start("jit-backend") +
             // profiler.start_backend() ... try: do_compile_bridge ...
             // finally: ... profiler.end_backend() +
@@ -9768,7 +9742,7 @@ impl<M: Clone> MetaInterp<M> {
                     self.backend.compile_bridge(
                         fail_descr,
                         bridge_inputargs,
-                        &optimized_ops_rc_for_bridge,
+                        &optimized_ops,
                         &source_jct,
                         previous_tokens,
                         caller_recovery_layout.as_ref(),
@@ -17777,7 +17751,7 @@ mod tests {
             10,
         );
         meta.partial_trace = Some(PartialTrace {
-            ops: vec![op],
+            ops: vec![std::rc::Rc::new(op)],
             inputargs: Vec::new(),
         });
 
@@ -17805,7 +17779,7 @@ mod tests {
             BoxRef::from_opref(OpRef::const_int(123)),
         ]);
         meta.partial_trace = Some(PartialTrace {
-            ops: vec![guard],
+            ops: vec![std::rc::Rc::new(guard)],
             inputargs: Vec::new(),
         });
 
@@ -17941,6 +17915,7 @@ mod tests {
             ),
         ];
 
+        let ops: Vec<majit_ir::OpRc> = ops.into_iter().map(std::rc::Rc::new).collect();
         let err =
             normalize_root_loop_entry_contract(inputargs, ops).expect_err("missing LABEL rejects");
         assert_eq!(err, (0, 3));
@@ -17959,6 +17934,7 @@ mod tests {
             OpRef::NONE.raw(),
         )];
 
+        let ops: Vec<majit_ir::OpRc> = ops.into_iter().map(std::rc::Rc::new).collect();
         let err =
             normalize_root_loop_entry_contract(inputargs, ops).expect_err("missing LABEL rejects");
         assert_eq!(err, (0, 2));
@@ -18120,7 +18096,7 @@ mod tests {
             trace_id,
             CompiledTrace {
                 inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
-                ops,
+                ops: ops.into_iter().map(std::rc::Rc::new).collect(),
                 constants,
                 exit_layouts: crate::optimizeopt::vec_assoc::VecAssoc::new(),
                 terminal_exit_layouts: crate::optimizeopt::vec_assoc::VecAssoc::new(),
@@ -18690,7 +18666,7 @@ mod tests {
             trace_id,
             CompiledTrace {
                 inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
-                ops,
+                ops: ops.into_iter().map(std::rc::Rc::new).collect(),
                 constants: constants_typed,
                 exit_layouts,
                 terminal_exit_layouts,

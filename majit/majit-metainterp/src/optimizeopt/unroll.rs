@@ -367,14 +367,21 @@ impl UnrollOptimizer {
     /// Redirect the closing JUMP to the preamble entry token
     /// (target_tokens[0], virtual_state=None). Only changes the
     /// descriptor, keeping arglist intact — RPython parity.
-    pub fn jump_to_preamble(body_ops: &[Op], preamble_target: &TargetToken) -> Vec<Op> {
+    pub fn jump_to_preamble(
+        body_ops: &[majit_ir::OpRc],
+        preamble_target: &TargetToken,
+    ) -> Vec<majit_ir::OpRc> {
         assert!(
             preamble_target.virtual_state.is_none(),
             "jump_to_preamble expects the start/preamble target token"
         );
         let mut result = body_ops.to_vec();
-        if let Some(jump) = result.iter_mut().rfind(|op| op.opcode == OpCode::Jump) {
+        if let Some(idx) = result.iter().rposition(|op| op.opcode == OpCode::Jump) {
+            // Re-clone before the descr write: the input Rc may still be
+            // registered in the optimizer's producer stores.
+            let jump = (*result[idx]).clone();
             jump.setdescr(preamble_target.as_jump_target_descr());
+            result[idx] = std::rc::Rc::new(jump);
         }
         result
     }
@@ -427,7 +434,7 @@ impl UnrollOptimizer {
         ops: &[Op],
         constants: &mut majit_ir::VecAssoc<u32, majit_ir::Value>,
         num_inputs: usize,
-    ) -> (Vec<Op>, usize) {
+    ) -> (Vec<majit_ir::OpRc>, usize) {
         self.optimize_trace_with_constants_and_inputs_vable(ops, constants, num_inputs, None)
     }
 
@@ -444,7 +451,7 @@ impl UnrollOptimizer {
         constants: &mut majit_ir::VecAssoc<u32, majit_ir::Value>,
         num_inputs: usize,
         vable_config: Option<crate::optimizeopt::virtualize::VirtualizableConfig>,
-    ) -> (Vec<Op>, usize) {
+    ) -> (Vec<majit_ir::OpRc>, usize) {
         self.optimize_trace_with_constants_and_inputs_vable_out(
             ops,
             constants,
@@ -465,34 +472,33 @@ impl UnrollOptimizer {
         constants: &mut majit_ir::VecAssoc<u32, majit_ir::Value>,
         num_inputs: usize,
         vable_config: Option<crate::optimizeopt::virtualize::VirtualizableConfig>,
-        phase1_out: Option<&mut Option<(Vec<Op>, ExportedState)>>,
-    ) -> (Vec<Op>, usize) {
+        phase1_out: Option<&mut Option<(Vec<majit_ir::OpRc>, ExportedState)>>,
+    ) -> (Vec<majit_ir::OpRc>, usize) {
         // compile.py:362: if imported_state is pre-set (compile_retrace path),
         // skip Phase 1 and go directly to Phase 2 with the imported state.
-        let (mut exported_state, consts_p1, p1_ops) = if let Some(pre_imported) =
-            self.imported_state.take()
-        {
-            // RPython uses object identity for Boxes, so a TraceIterator over a
-            // retrace can never numerically collide with the already optimized
-            // partial preamble. Majit's OpRef is the identity; when Phase 1 is
-            // skipped, recover the partial preamble high-water from the imported
-            // state before allocating Phase 2 input/result OpRefs.
-            self.next_global_opref = self
-                .next_global_opref
-                .max(num_inputs as u32)
-                .max(pre_imported.opref_high_water());
-            // Retrace path: Phase 1 already done; preamble ops are in
-            // the caller's partial_trace, not produced here.
-            // RPython: same Optimizer persists patchguardop. Recover here.
-            if self.phase1_patchguardop.is_none() {
-                self.phase1_patchguardop = pre_imported.patchguardop.clone();
-            }
-            (pre_imported, constants.clone(), Vec::new())
-        } else {
-            // ── Phase 1: PreambleCompileData.optimize() ──
-            // ── Phase 1: optimize_preamble (compile.py:275-276) ──
-            let mut consts_p1 = constants.clone();
-            let mut opt_p1 = match vable_config.as_ref() {
+        let (mut exported_state, consts_p1, p1_ops) =
+            if let Some(pre_imported) = self.imported_state.take() {
+                // RPython uses object identity for Boxes, so a TraceIterator over a
+                // retrace can never numerically collide with the already optimized
+                // partial preamble. Majit's OpRef is the identity; when Phase 1 is
+                // skipped, recover the partial preamble high-water from the imported
+                // state before allocating Phase 2 input/result OpRefs.
+                self.next_global_opref = self
+                    .next_global_opref
+                    .max(num_inputs as u32)
+                    .max(pre_imported.opref_high_water());
+                // Retrace path: Phase 1 already done; preamble ops are in
+                // the caller's partial_trace, not produced here.
+                // RPython: same Optimizer persists patchguardop. Recover here.
+                if self.phase1_patchguardop.is_none() {
+                    self.phase1_patchguardop = pre_imported.patchguardop.clone();
+                }
+                (pre_imported, constants.clone(), Vec::new())
+            } else {
+                // ── Phase 1: PreambleCompileData.optimize() ──
+                // ── Phase 1: optimize_preamble (compile.py:275-276) ──
+                let mut consts_p1 = constants.clone();
+                let mut opt_p1 = match vable_config.as_ref() {
                 Some(c) => {
                     crate::optimizeopt::optimizer::Optimizer::default_pipeline_with_virtualizable(
                         c.clone(),
@@ -500,255 +506,250 @@ impl UnrollOptimizer {
                 }
                 None => crate::optimizeopt::optimizer::Optimizer::default_pipeline(),
             };
-            opt_p1.all_descrs = std::mem::take(&mut self.all_descrs);
-            opt_p1.callinfocollection = self.callinfocollection.clone();
-            opt_p1.cpu = self.cpu.clone();
-            opt_p1.trace_inputargs = self.trace_inputargs.clone();
-            opt_p1.snapshot_boxes = self.snapshot_boxes.clone();
-            opt_p1.snapshot_frame_sizes = self.snapshot_frame_sizes.clone();
-            opt_p1.snapshot_vable_boxes = self.snapshot_vable_boxes.clone();
-            opt_p1.snapshot_vref_boxes = self.snapshot_vref_boxes.clone();
-            opt_p1.snapshot_frame_pcs = self.snapshot_frame_pcs.clone();
-            self.replace_compile_snapshot_roots(Self::collect_snapshot_const_ptr_slots(&mut [
-                &mut opt_p1.snapshot_boxes,
-                &mut opt_p1.snapshot_vable_boxes,
-                &mut opt_p1.snapshot_vref_boxes,
-            ]));
-            opt_p1.call_pure_results = self.call_pure_results.clone();
-            // RPython optimize_preamble (unroll.py:101-103): flush=False.
-            // JUMP/FINISH is NOT sent through the pass pipeline; it's
-            // returned in info.jump_op for Phase 2 to consume.
-            opt_p1.skip_flush = true;
-            // RPython unroll.py:101-103 `optimize_preamble` calls
-            // `propagate_all_forward(trace.get_iter())`. `trace.get_iter()`
-            // is a fresh `TraceIterator` whose `next()` produces a freshly
-            // allocated `cls()` ResOperation for every visited op.
-            //
-            // Phase 1 routes the input ops through `TraceIterator::new`
-            // with `start_fresh = 0`. The recorder emits ops at
-            // monotonically increasing positions starting from
-            // `num_inputs` (recorder.rs `record_op` uses `op_count` for
-            // BOTH inputargs and ops, and ops follow inputargs), and
-            // `TraceIterator::next` allocates fresh OpRefs from `_fresh`
-            // which is also seeded at `num_inputs` after the inputarg
-            // pre-seed loop. Both void and non-void ops advance `_fresh`
-            // (see opencoder.rs::next), so the freshly produced OpRef
-            // sequence is bit-identical to the input — this wrap is a
-            // structural alignment with RPython's `trace.get_iter()`
-            // call site, not a functional change.
-            // opencoder.py:264 `inputarg_from_tp(arg.type)` — fresh inputargs
-            // are typed via `self.trace_inputargs`, the recorder-supplied
-            // Box list (length must equal `num_inputs`). Derive the &[Type]
-            // surface TraceIterator expects from each Box's variant tag
-            // (resoperation.py:719/727/739).
-            debug_assert_eq!(self.trace_inputargs.len(), num_inputs);
-            let p1_inputarg_types: Vec<majit_ir::Type> = self
-                .trace_inputargs
-                .iter()
-                .map(|op| op.ty().expect("inputarg OpRef must carry box.type"))
-                .collect();
-            // Wrap input ops as `Vec<OpRc>` so TraceIterator's `&[OpRc]`
-            // surface receives shared identity (history.py:528). The
-            // deep-clone here corresponds to PyPy's `cls()` per-op fresh
-            // allocation inside `TraceIterator.next` (opencoder.py:399-401).
-            let ops_oprc: Vec<majit_ir::OpRc> =
-                ops.iter().map(|op| std::rc::Rc::new(op.clone())).collect();
-            let mut p1_iter = crate::opencoder::TraceIterator::new(
-                &ops_oprc,
-                0,
-                ops_oprc.len(),
-                None,
-                &p1_inputarg_types,
-                0, // start_fresh = 0 — inputargs at [0..num_inputs)
-            );
-            // Clone-out boundary: the optimizer entry below still takes
-            // `&[Op]` by value; `Op::clone` preserves the bound operand
-            // handles minted by the iterator (Rc clones), so bindings
-            // survive the copy. Dissolves when the stage flips to
-            // `Vec<OpRc>` end-to-end.
-            let mut p1_ops_in: Vec<Op> = Vec::with_capacity(ops.len());
-            while let Some(op) = p1_iter.next() {
-                p1_ops_in.push((*op).clone());
-            }
-            let p1_iter_fresh_hw = p1_iter._fresh;
-            // compile.py:275 `PreambleCompileData(trace, jumpargs, ...)` —
-            // the recorded JUMP arglist is the preamble's `runtime_boxes`
-            // (live_arg_boxes captured at the merge point). Capture it into a
-            // local here; `opt_p1.runtime_boxes` cannot carry it because
-            // `setup()` clears that field at the start of every optimize run
-            // (optimizer.rs `self.runtime_boxes.clear()`). Threaded into the
-            // exported state below so the peeled-loop close reads it as
-            // `state.runtime_boxes` (unroll.py:105 → :153/166) rather than the
-            // peeled body's own jump args.
-            let recorded_jump_args: Vec<OpRef> = ops
-                .iter()
-                .rfind(|op| op.opcode == OpCode::Jump)
-                .map(|op| op.getarglist().iter().map(|a| a.to_opref()).collect())
-                .unwrap_or_default();
-            // Hand opt_p1 the per-iter BoxRef pool that p1_iter
-            // allocated (slice 77b.A). trace.get_iter() per-call
-            // inputarg_from_tp(...) / cls() — each phase optimizes against a
-            // fresh Box identity set so _forwarded mutations cannot alias
-            // across phases.
-            //
-            // Const BoxRefs are NOT cached: `get_box_replacement_box`
-            // allocates `BoxRef::new_const(value)` per call from `const_pool`
-            // (`history.py:220` ConstInt(value) per-call-site parity).
-            // opt_p1's entry path seeds `const_pool` from the shared
-            // `constants` map (`optimizer.rs:1944`).
-            // unroll.py:100-110 `optimize_preamble` has no
-            // SpeculativeError catch — Phase 1 corresponds to the
-            // preamble, whose gcrefs are concrete runtime values
-            // from the recorded interpreter and never raise
-            // SpeculativeError under correct construction.  A raise
-            // here is a real bug and must propagate.
-            // Phase 1's input ops are the same recorder ops the seed names,
-            // so its `input_ops` can come from the seed too — only the read
-            // source changes; `_forwarded` writes are untouched. No
-            // forwarding yet at Phase 1 setup, so the seed is trivially the
-            // authoritative source here.
-            if let Some(seed) = &self.phase2_input_ops_seed {
-                opt_p1.explicit_input_ops_seed = Some(seed.clone());
-            }
-            let p1_ops =
-                opt_p1.optimize_with_constants_and_inputs(&p1_ops_in, &mut consts_p1, num_inputs);
-            // RPython parity: Phase 1 optimizer may discover new constants
-            // via make_constant (e.g., constant-folded heap reads, guard
-            // class pointers). These live on the BoxRef forwarded chain
-            // (and in `ctx.const_pool` for const-namespace OpRefs) but
-            // not in `consts_p1` (which was only seeded from the input
-            // constants). Merge them back so
-            // build_short_preamble_from_exported_boxes can capture all
-            // constants referenced by short preamble ops.
-            if let Some(ref final_ctx) = opt_p1.final_ctx {
-                // history.py:220 box.type parity: every `Value` carries its
-                // Const class identity intrinsically; no companion type map
-                // needs threading alongside.
-                crate::optimizeopt::optimizer::merge_backend_constants_from_ctx(
-                    final_ctx,
-                    &mut consts_p1,
+                opt_p1.all_descrs = std::mem::take(&mut self.all_descrs);
+                opt_p1.callinfocollection = self.callinfocollection.clone();
+                opt_p1.cpu = self.cpu.clone();
+                opt_p1.trace_inputargs = self.trace_inputargs.clone();
+                opt_p1.snapshot_boxes = self.snapshot_boxes.clone();
+                opt_p1.snapshot_frame_sizes = self.snapshot_frame_sizes.clone();
+                opt_p1.snapshot_vable_boxes = self.snapshot_vable_boxes.clone();
+                opt_p1.snapshot_vref_boxes = self.snapshot_vref_boxes.clone();
+                opt_p1.snapshot_frame_pcs = self.snapshot_frame_pcs.clone();
+                self.replace_compile_snapshot_roots(Self::collect_snapshot_const_ptr_slots(&mut [
+                    &mut opt_p1.snapshot_boxes,
+                    &mut opt_p1.snapshot_vable_boxes,
+                    &mut opt_p1.snapshot_vref_boxes,
+                ]));
+                opt_p1.call_pure_results = self.call_pure_results.clone();
+                // RPython optimize_preamble (unroll.py:101-103): flush=False.
+                // JUMP/FINISH is NOT sent through the pass pipeline; it's
+                // returned in info.jump_op for Phase 2 to consume.
+                opt_p1.skip_flush = true;
+                // RPython unroll.py:101-103 `optimize_preamble` calls
+                // `propagate_all_forward(trace.get_iter())`. `trace.get_iter()`
+                // is a fresh `TraceIterator` whose `next()` produces a freshly
+                // allocated `cls()` ResOperation for every visited op.
+                //
+                // Phase 1 routes the input ops through `TraceIterator::new`
+                // with `start_fresh = 0`. The recorder emits ops at
+                // monotonically increasing positions starting from
+                // `num_inputs` (recorder.rs `record_op` uses `op_count` for
+                // BOTH inputargs and ops, and ops follow inputargs), and
+                // `TraceIterator::next` allocates fresh OpRefs from `_fresh`
+                // which is also seeded at `num_inputs` after the inputarg
+                // pre-seed loop. Both void and non-void ops advance `_fresh`
+                // (see opencoder.rs::next), so the freshly produced OpRef
+                // sequence is bit-identical to the input — this wrap is a
+                // structural alignment with RPython's `trace.get_iter()`
+                // call site, not a functional change.
+                // opencoder.py:264 `inputarg_from_tp(arg.type)` — fresh inputargs
+                // are typed via `self.trace_inputargs`, the recorder-supplied
+                // Box list (length must equal `num_inputs`). Derive the &[Type]
+                // surface TraceIterator expects from each Box's variant tag
+                // (resoperation.py:719/727/739).
+                debug_assert_eq!(self.trace_inputargs.len(), num_inputs);
+                let p1_inputarg_types: Vec<majit_ir::Type> = self
+                    .trace_inputargs
+                    .iter()
+                    .map(|op| op.ty().expect("inputarg OpRef must carry box.type"))
+                    .collect();
+                // Wrap input ops as `Vec<OpRc>` so TraceIterator's `&[OpRc]`
+                // surface receives shared identity (history.py:528). The
+                // deep-clone here corresponds to PyPy's `cls()` per-op fresh
+                // allocation inside `TraceIterator.next` (opencoder.py:399-401).
+                let ops_oprc: Vec<majit_ir::OpRc> =
+                    ops.iter().map(|op| std::rc::Rc::new(op.clone())).collect();
+                let mut p1_iter = crate::opencoder::TraceIterator::new(
+                    &ops_oprc,
+                    0,
+                    ops_oprc.len(),
+                    None,
+                    &p1_inputarg_types,
+                    0, // start_fresh = 0 — inputargs at [0..num_inputs)
                 );
-            }
-            let p1_ni = opt_p1.final_num_inputs();
+                let mut p1_ops_in: Vec<majit_ir::OpRc> = Vec::with_capacity(ops.len());
+                while let Some(op) = p1_iter.next() {
+                    p1_ops_in.push(op);
+                }
+                let p1_iter_fresh_hw = p1_iter._fresh;
+                // compile.py:275 `PreambleCompileData(trace, jumpargs, ...)` —
+                // the recorded JUMP arglist is the preamble's `runtime_boxes`
+                // (live_arg_boxes captured at the merge point). Capture it into a
+                // local here; `opt_p1.runtime_boxes` cannot carry it because
+                // `setup()` clears that field at the start of every optimize run
+                // (optimizer.rs `self.runtime_boxes.clear()`). Threaded into the
+                // exported state below so the peeled-loop close reads it as
+                // `state.runtime_boxes` (unroll.py:105 → :153/166) rather than the
+                // peeled body's own jump args.
+                let recorded_jump_args: Vec<OpRef> = ops
+                    .iter()
+                    .rfind(|op| op.opcode == OpCode::Jump)
+                    .map(|op| op.getarglist().iter().map(|a| a.to_opref()).collect())
+                    .unwrap_or_default();
+                // Hand opt_p1 the per-iter BoxRef pool that p1_iter
+                // allocated (slice 77b.A). trace.get_iter() per-call
+                // inputarg_from_tp(...) / cls() — each phase optimizes against a
+                // fresh Box identity set so _forwarded mutations cannot alias
+                // across phases.
+                //
+                // Const BoxRefs are NOT cached: `get_box_replacement_box`
+                // allocates `BoxRef::new_const(value)` per call from `const_pool`
+                // (`history.py:220` ConstInt(value) per-call-site parity).
+                // opt_p1's entry path seeds `const_pool` from the shared
+                // `constants` map (`optimizer.rs:1944`).
+                // unroll.py:100-110 `optimize_preamble` has no
+                // SpeculativeError catch — Phase 1 corresponds to the
+                // preamble, whose gcrefs are concrete runtime values
+                // from the recorded interpreter and never raise
+                // SpeculativeError under correct construction.  A raise
+                // here is a real bug and must propagate.
+                // Phase 1's input ops are the same recorder ops the seed names,
+                // so its `input_ops` can come from the seed too — only the read
+                // source changes; `_forwarded` writes are untouched. No
+                // forwarding yet at Phase 1 setup, so the seed is trivially the
+                // authoritative source here.
+                if let Some(seed) = &self.phase2_input_ops_seed {
+                    opt_p1.explicit_input_ops_seed = Some(seed.clone());
+                }
+                let p1_ops =
+                    opt_p1.run_optimize_from_inputs(&p1_ops_in, &mut consts_p1, num_inputs, false);
+                // RPython parity: Phase 1 optimizer may discover new constants
+                // via make_constant (e.g., constant-folded heap reads, guard
+                // class pointers). These live on the BoxRef forwarded chain
+                // (and in `ctx.const_pool` for const-namespace OpRefs) but
+                // not in `consts_p1` (which was only seeded from the input
+                // constants). Merge them back so
+                // build_short_preamble_from_exported_boxes can capture all
+                // constants referenced by short preamble ops.
+                if let Some(ref final_ctx) = opt_p1.final_ctx {
+                    // history.py:220 box.type parity: every `Value` carries its
+                    // Const class identity intrinsically; no companion type map
+                    // needs threading alongside.
+                    crate::optimizeopt::optimizer::merge_backend_constants_from_ctx(
+                        final_ctx,
+                        &mut consts_p1,
+                    );
+                }
+                let p1_ni = opt_p1.final_num_inputs();
 
-            match opt_p1.exported_loop_state.take() {
-                Some(mut state) => {
-                    // unroll.py:105 `export_state(..., runtime_boxes, ...)` —
-                    // carry the recorded JUMP args into ExportedState so the
-                    // peeled-loop close passes them to generate_guards as
-                    // `state.runtime_boxes` (unroll.py:153/166).
-                    state.runtime_boxes = recorded_jump_args.clone();
-                    // end_arg_types is already populated by
-                    // `Optimizer::optimize_with_constants_and_inputs_at`
-                    // using the optimizer-visible `ctx.opref_type()` (see
-                    // optimizer.rs:2405-2416). Overwriting it here with
-                    // `opcode.result_type()` + `Type::Ref` default would
-                    // retype Phase 1 inputarg OpRefs (absent from `p1_ops`)
-                    // as `Ref`, which later feeds the cross-type forward
-                    // assertion in `OptContext::make_equal_to`.
-                    // RPython Phase 1 → Phase 2 heap cache transfer:
-                    // RPython does NOT serialize heap cache in ExportedState.
-                    // HeapOps in the short preamble are replayed during Phase 2's
-                    // inline_short_preamble, populating the heap cache naturally
-                    // through OptHeap. serialize_optheap is only for bridgeopt.
-                    // opencoder.py:271 _index parity: Phase 2's TraceIterator
-                    // must allocate fresh boxes ABOVE Phase 1's high water
-                    // mark so the two phases' OpRef namespaces are disjoint
-                    // (RPython relies on Python identity to distinguish them;
-                    // majit relies on disjoint integer ranges). The high
-                    // water is `final_ctx.next_pos` after Phase 1 emit, with
-                    // a floor of `num_inputs` for empty traces.
-                    // Phase 1's emit-side high water (`final_ctx.next_pos`)
-                    // reflects only the positions `ctx.reserve_pos` handed
-                    // out; the per-iteration TraceIterator additionally
-                    // allocates fresh OpRefs via its `_fresh` counter and
-                    // those values can exceed `next_pos` for traces where
-                    // Phase 1 dropped or folded many ops. Taking the max
-                    // with `p1_iter_fresh_hw` keeps Phase 2's inputarg base
-                    // strictly above every OpRef Phase 1 ever allocated,
-                    // so Phase 2's own fresh OpRefs cannot collide with
-                    // positions in `phase1_emit_ops` / typed snapshots.
-                    self.next_global_opref = opt_p1
-                        .final_ctx
-                        .as_ref()
-                        .map(|c| c.next_pos)
-                        .unwrap_or(num_inputs as u32)
-                        .max(num_inputs as u32)
-                        .max(p1_iter_fresh_hw);
-                    // RPython Box type parity: Phase 1's emit ops carry
-                    // `op.type_` intrinsically; Phase 2's `op_at` reads it
-                    // directly to resolve cross-phase OpRefs that appear as
-                    // imported_label_args / fail_args / record_same_as
-                    // sources (history.py:220 parity).
-                    self.phase1_emit_ops = std::mem::take(&mut opt_p1.phase1_emit_ops);
-                    // RPython: same Optimizer instance keeps patchguardop.
-                    if self.phase1_patchguardop.is_none() {
-                        self.phase1_patchguardop = opt_p1.patchguardop.clone();
+                match opt_p1.exported_loop_state.take() {
+                    Some(mut state) => {
+                        // unroll.py:105 `export_state(..., runtime_boxes, ...)` —
+                        // carry the recorded JUMP args into ExportedState so the
+                        // peeled-loop close passes them to generate_guards as
+                        // `state.runtime_boxes` (unroll.py:153/166).
+                        state.runtime_boxes = recorded_jump_args.clone();
+                        // end_arg_types is already populated by
+                        // `Optimizer::optimize_with_constants_and_inputs_at`
+                        // using the optimizer-visible `ctx.opref_type()` (see
+                        // optimizer.rs:2405-2416). Overwriting it here with
+                        // `opcode.result_type()` + `Type::Ref` default would
+                        // retype Phase 1 inputarg OpRefs (absent from `p1_ops`)
+                        // as `Ref`, which later feeds the cross-type forward
+                        // assertion in `OptContext::make_equal_to`.
+                        // RPython Phase 1 → Phase 2 heap cache transfer:
+                        // RPython does NOT serialize heap cache in ExportedState.
+                        // HeapOps in the short preamble are replayed during Phase 2's
+                        // inline_short_preamble, populating the heap cache naturally
+                        // through OptHeap. serialize_optheap is only for bridgeopt.
+                        // opencoder.py:271 _index parity: Phase 2's TraceIterator
+                        // must allocate fresh boxes ABOVE Phase 1's high water
+                        // mark so the two phases' OpRef namespaces are disjoint
+                        // (RPython relies on Python identity to distinguish them;
+                        // majit relies on disjoint integer ranges). The high
+                        // water is `final_ctx.next_pos` after Phase 1 emit, with
+                        // a floor of `num_inputs` for empty traces.
+                        // Phase 1's emit-side high water (`final_ctx.next_pos`)
+                        // reflects only the positions `ctx.reserve_pos` handed
+                        // out; the per-iteration TraceIterator additionally
+                        // allocates fresh OpRefs via its `_fresh` counter and
+                        // those values can exceed `next_pos` for traces where
+                        // Phase 1 dropped or folded many ops. Taking the max
+                        // with `p1_iter_fresh_hw` keeps Phase 2's inputarg base
+                        // strictly above every OpRef Phase 1 ever allocated,
+                        // so Phase 2's own fresh OpRefs cannot collide with
+                        // positions in `phase1_emit_ops` / typed snapshots.
+                        self.next_global_opref = opt_p1
+                            .final_ctx
+                            .as_ref()
+                            .map(|c| c.next_pos)
+                            .unwrap_or(num_inputs as u32)
+                            .max(num_inputs as u32)
+                            .max(p1_iter_fresh_hw);
+                        // RPython Box type parity: Phase 1's emit ops carry
+                        // `op.type_` intrinsically; Phase 2's `op_at` reads it
+                        // directly to resolve cross-phase OpRefs that appear as
+                        // imported_label_args / fail_args / record_same_as
+                        // sources (history.py:220 parity).
+                        self.phase1_emit_ops = std::mem::take(&mut opt_p1.phase1_emit_ops);
+                        // RPython: same Optimizer instance keeps patchguardop.
+                        if self.phase1_patchguardop.is_none() {
+                            self.phase1_patchguardop = opt_p1.patchguardop.clone();
+                        }
+                        state.patchguardop = opt_p1.patchguardop.clone();
+                        self.all_descrs = std::mem::take(&mut opt_p1.all_descrs);
+                        // Box.type parity: retain Phase 1's renamed_inputargs so
+                        // the backend can read the reduced LABEL's declared types
+                        // off each typed InputArg OpRef. Clone only the field we
+                        // need to avoid keeping Phase 1 short preamble data alive
+                        // longer than before.
+                        let mut final_exported_state = ExportedState {
+                            end_args: Vec::new(),
+                            next_iteration_args: Vec::new(),
+                            end_arg_types: Vec::new(),
+                            virtual_state: state.virtual_state.clone(),
+                            exported_infos: crate::optimizeopt::vec_assoc::VecAssoc::new(),
+                            exported_short_boxes: Vec::new(),
+                            short_boxes: Vec::new(),
+                            short_box_const_values: crate::optimizeopt::vec_assoc::VecAssoc::new(),
+                            short_preamble: None,
+                            renamed_inputargs: state.renamed_inputargs.clone(),
+                            short_inputargs: Vec::new(),
+                            runtime_boxes: Vec::new(),
+                            patchguardop: None,
+                            phase1_emit_high_water: self.next_global_opref,
+                            partial_trace_inputargs: Vec::new(),
+                            partial_trace_operations: Vec::new(),
+                            rooted_refs: Vec::new(),
+                            rooted_const_ptr_slots: Vec::new(),
+                            shadow_stack_base: 0,
+                        };
+                        final_exported_state.root_all_gcrefs();
+                        self.final_exported_state = Some(final_exported_state);
+                        (state, consts_p1, p1_ops)
                     }
-                    state.patchguardop = opt_p1.patchguardop.clone();
-                    self.all_descrs = std::mem::take(&mut opt_p1.all_descrs);
-                    // Box.type parity: retain Phase 1's renamed_inputargs so
-                    // the backend can read the reduced LABEL's declared types
-                    // off each typed InputArg OpRef. Clone only the field we
-                    // need to avoid keeping Phase 1 short preamble data alive
-                    // longer than before.
-                    let mut final_exported_state = ExportedState {
-                        end_args: Vec::new(),
-                        next_iteration_args: Vec::new(),
-                        end_arg_types: Vec::new(),
-                        virtual_state: state.virtual_state.clone(),
-                        exported_infos: crate::optimizeopt::vec_assoc::VecAssoc::new(),
-                        exported_short_boxes: Vec::new(),
-                        short_boxes: Vec::new(),
-                        short_box_const_values: crate::optimizeopt::vec_assoc::VecAssoc::new(),
-                        short_preamble: None,
-                        renamed_inputargs: state.renamed_inputargs.clone(),
-                        short_inputargs: Vec::new(),
-                        runtime_boxes: Vec::new(),
-                        patchguardop: None,
-                        phase1_emit_high_water: self.next_global_opref,
-                        partial_trace_inputargs: Vec::new(),
-                        partial_trace_operations: Vec::new(),
-                        rooted_refs: Vec::new(),
-                        rooted_const_ptr_slots: Vec::new(),
-                        shadow_stack_base: 0,
-                    };
-                    final_exported_state.root_all_gcrefs();
-                    self.final_exported_state = Some(final_exported_state);
-                    (state, consts_p1, p1_ops)
-                }
-                None => {
-                    *constants = consts_p1;
-                    // Take back the descriptor table grown during Phase 1's pass
-                    // (`ensure_descr_index` appends at guard-resume serialization),
-                    // mirroring the Some branch's restore above. Without this the
-                    // non-peeled path drops those descriptors and publishes a stale
-                    // `all_descrs` back over the global table.
-                    self.all_descrs = std::mem::take(&mut opt_p1.all_descrs);
-                    // RPython: compile_loop uses flush=True — terminal op
-                    // (Finish/Jump) goes through the pass pipeline normally.
-                    // majit: flush=False stores it in terminal_op; restore it
-                    // here for non-peeled traces that return directly.
-                    let mut ops = p1_ops;
-                    if let Some(terminal) = opt_p1.terminal_op.take() {
-                        ops.push(terminal);
+                    None => {
+                        *constants = consts_p1;
+                        // Take back the descriptor table grown during Phase 1's pass
+                        // (`ensure_descr_index` appends at guard-resume serialization),
+                        // mirroring the Some branch's restore above. Without this the
+                        // non-peeled path drops those descriptors and publishes a stale
+                        // `all_descrs` back over the global table.
+                        self.all_descrs = std::mem::take(&mut opt_p1.all_descrs);
+                        // RPython: compile_loop uses flush=True — terminal op
+                        // (Finish/Jump) goes through the pass pipeline normally.
+                        // majit: flush=False stores it in terminal_op; restore it
+                        // here for non-peeled traces that return directly.
+                        let mut ops = p1_ops;
+                        if let Some(terminal) = opt_p1.terminal_op.take() {
+                            ops.push(std::rc::Rc::new(terminal));
+                        }
+                        // `compile.py:245` `jitcell_token.target_tokens = [target_token]`
+                        // / `:290` `jitcell_token.target_tokens = [start_descr]` —
+                        // PyPy unconditionally publishes one preamble target token
+                        // for any successful compile path (compile_simple_loop +
+                        // compile_loop both).  Phase 2 is bypassed here (no
+                        // exported_loop_state) but the loop still compiles, so
+                        // mirror the unconditional preamble registration so that
+                        // `JitCellToken.target_tokens` is non-empty at the
+                        // `has_compiled_targets` (`pyjitpl.py:3898`) read site.
+                        self.ensure_preamble_target_token();
+                        let loop_arity = closing_loop_contract_arity(&ops, p1_ni);
+                        self.clear_compile_snapshot_roots();
+                        return (ops, loop_arity);
                     }
-                    // `compile.py:245` `jitcell_token.target_tokens = [target_token]`
-                    // / `:290` `jitcell_token.target_tokens = [start_descr]` —
-                    // PyPy unconditionally publishes one preamble target token
-                    // for any successful compile path (compile_simple_loop +
-                    // compile_loop both).  Phase 2 is bypassed here (no
-                    // exported_loop_state) but the loop still compiles, so
-                    // mirror the unconditional preamble registration so that
-                    // `JitCellToken.target_tokens` is non-empty at the
-                    // `has_compiled_targets` (`pyjitpl.py:3898`) read site.
-                    self.ensure_preamble_target_token();
-                    let loop_arity = closing_loop_contract_arity(&ops, p1_ni);
-                    self.clear_compile_snapshot_roots();
-                    return (ops, loop_arity);
                 }
-            }
-        };
+            };
         self.clear_compile_snapshot_roots();
         // unroll.py:454 end_args carry type via Box; export_state already
         // populated `exported_state.end_arg_types` from ctx.
@@ -916,10 +917,9 @@ impl UnrollOptimizer {
             &p2_inputarg_types,
             phase2_inputarg_base, // fresh inputargs at [phase2_inputarg_base..)
         );
-        // Clone-out boundary — see the Phase 1 drive loop above.
-        let mut p2_ops_in: Vec<Op> = Vec::with_capacity(ops.len());
+        let mut p2_ops_in: Vec<majit_ir::OpRc> = Vec::with_capacity(ops.len());
         while let Some(op) = iter.next() {
-            p2_ops_in.push((*op).clone());
+            p2_ops_in.push(op);
         }
         let p2_high_water = iter._fresh;
         let p2_cache = iter._cache;
@@ -989,10 +989,6 @@ impl UnrollOptimizer {
         // unroll.py:119-123 — Phase 2 (peeled loop) raises
         // SpeculativeError on speculative-fold paths; convert
         // to InvalidLoop so the caller's catch handles it.
-        let p2_ops_in_rc: Vec<majit_ir::OpRc> = p2_ops_in
-            .iter()
-            .map(|op| std::rc::Rc::new(op.clone()))
-            .collect();
         // Seed Phase 2's `input_ops` from the recorder `Rc<Op>` (same `Rc`,
         // same Phase-1 `_forwarded`) so `input_ops` is the authoritative
         // producer store. A `Some(empty)` (cut path) leaves it empty.
@@ -1001,7 +997,7 @@ impl UnrollOptimizer {
         }
         let p2_ops = with_speculative_to_invalid_loop(|| {
             opt_p2.optimize_with_constants_and_inputs_at(
-                &p2_ops_in_rc,
+                &p2_ops_in,
                 &mut consts_p2,
                 body_num_inputs,
                 phase2_inputarg_base, // inputarg_base — Phase 2 inputargs at [phase2_inputarg_base..)
@@ -1619,10 +1615,7 @@ impl UnrollOptimizer {
             if jumped && redirected_tail_ops.is_empty() {
                 // Only take jump_ctx ops if we don't already have
                 // a self-loop Jump from the retrace path.
-                redirected_tail_ops = std::mem::take(&mut jump_ctx.new_operations)
-                    .into_iter()
-                    .map(|rc| (*rc).clone())
-                    .collect();
+                redirected_tail_ops = std::mem::take(&mut jump_ctx.new_operations);
                 // Check if the redirected Jump targets the current body token
                 // (last in target_tokens) or an external token from a previous
                 // compilation.  The Cranelift backend compiles each trace as a
@@ -1706,11 +1699,8 @@ impl UnrollOptimizer {
                     // partial-inline operations already appended to
                     // _newoperations.
                     opt_p2.send_extra_operation(&end_jump, &mut final_ctx);
-                    let redirected_tail_ops: Vec<Op> =
-                        std::mem::take(&mut final_ctx.new_operations)
-                            .into_iter()
-                            .map(|rc| (*rc).clone())
-                            .collect();
+                    let redirected_tail_ops: Vec<majit_ir::OpRc> =
+                        std::mem::take(&mut final_ctx.new_operations);
                     opt_p2.final_ctx = Some(final_ctx);
                     body_ops = splice_redirected_tail(&body_ops, &redirected_tail_ops);
                 } else {
@@ -1769,7 +1759,7 @@ impl UnrollOptimizer {
             });
         }
         crate::optimizeopt::optimizer::sanitize_backend_constants_for_ops(
-            &combined,
+            combined.iter().map(|op| &**op),
             &mut consts_p2,
         );
         if crate::debug::have_debug_prints() {
@@ -1792,13 +1782,15 @@ impl UnrollOptimizer {
     /// RPython compile.py uses the optimized loop state's inputargs contract,
     /// not a stale input counter. When majit falls back to the phase-1 trace,
     /// derive the live loop arity from the actual closing Label/Jump.
-    pub fn closing_loop_contract_arity(ops: &[Op], fallback: usize) -> usize {
+    pub fn closing_loop_contract_arity<T: AsRef<Op>>(ops: &[T], fallback: usize) -> usize {
         closing_loop_contract_arity(ops, fallback)
     }
 
     /// Count the guards in an optimized trace (for retrace_limit checks).
-    pub fn count_guards(ops: &[Op]) -> u32 {
-        ops.iter().filter(|op| op.opcode.is_guard()).count() as u32
+    pub fn count_guards<T: AsRef<Op>>(ops: &[T]) -> u32 {
+        ops.iter()
+            .filter(|op| op.as_ref().opcode.is_guard())
+            .count() as u32
     }
 
     /// unroll.py: _map_args(mapping, arglist)
@@ -1822,7 +1814,10 @@ impl UnrollOptimizer {
     /// unroll.py: disable_retracing_if_max_retrace_guards(ops, target_token)
     /// If the trace has too many guards, disable retracing for this location.
     /// Returns true if retracing was disabled.
-    pub fn disable_retracing_if_max_retrace_guards(ops: &[Op], max_retrace_guards: u32) -> bool {
+    pub fn disable_retracing_if_max_retrace_guards<T: AsRef<Op>>(
+        ops: &[T],
+        max_retrace_guards: u32,
+    ) -> bool {
         let guard_count = Self::count_guards(ops);
         guard_count > max_retrace_guards
     }
@@ -1837,8 +1832,9 @@ impl UnrollOptimizer {
     }
 }
 
-fn closing_loop_contract_arity(ops: &[Op], fallback: usize) -> usize {
+fn closing_loop_contract_arity<T: AsRef<Op>>(ops: &[T], fallback: usize) -> usize {
     ops.iter()
+        .map(|op| op.as_ref())
         .rev()
         .find_map(|op| match op.opcode {
             OpCode::Label | OpCode::Jump => Some(op.num_args()),
@@ -2794,12 +2790,15 @@ impl OptUnroll {
     /// When the peeled body contains more guards than `max_retrace_guards`,
     /// set `retraced_count = u32::MAX` on the targeting JitCellToken so that
     /// future bridges jump to the preamble instead of requesting a retrace.
-    pub fn disable_retracing_if_max_retrace_guards(
-        ops: &[majit_ir::Op],
+    pub fn disable_retracing_if_max_retrace_guards<T: AsRef<Op>>(
+        ops: &[T],
         retraced_count: &mut u32,
         max_retrace_guards: u32,
     ) {
-        let guard_count = ops.iter().filter(|op| op.opcode.is_guard()).count();
+        let guard_count = ops
+            .iter()
+            .filter(|op| op.as_ref().opcode.is_guard())
+            .count();
         if guard_count > max_retrace_guards as usize {
             *retraced_count = u32::MAX;
         }
@@ -4311,11 +4310,19 @@ fn assemble_peeled_trace(
     constants: &majit_ir::VecAssoc<u32, majit_ir::Value>,
     start_label_descr: Option<DescrRef>,
     loop_label_descr: Option<DescrRef>,
-) -> Vec<Op> {
+) -> Vec<majit_ir::OpRc> {
     let mut ctx = assemble_test_context(p1_ops, p2_ops, body_num_inputs);
+    let p1_ops_rc: Vec<majit_ir::OpRc> = p1_ops
+        .iter()
+        .map(|op| std::rc::Rc::new(op.clone()))
+        .collect();
+    let p2_ops_rc: Vec<majit_ir::OpRc> = p2_ops
+        .iter()
+        .map(|op| std::rc::Rc::new(op.clone()))
+        .collect();
     assemble_peeled_trace_with_jump_args(
-        p1_ops,
-        p2_ops,
+        &p1_ops_rc,
+        &p2_ops_rc,
         label_args,
         start_label_args,
         extra_label_args,
@@ -4353,19 +4360,19 @@ fn assemble_test_context(p1_ops: &[Op], p2_ops: &[Op], body_num_inputs: usize) -
 /// `pos=alias.result` per entry so the body's reference to the alias result
 /// has a defining op.
 fn emit_alias_same_as_for_imports(
-    result: &mut Vec<Op>,
+    result: &mut Vec<majit_ir::OpRc>,
     imported_short_aliases: &[crate::optimizeopt::ImportedShortAlias],
 ) {
     for alias in imported_short_aliases {
         let mut op = Op::new(alias.same_as_opcode, &[alias.same_as_source.clone()]);
         op.pos.set(alias.result);
-        result.push(op);
+        result.push(std::rc::Rc::new(op));
     }
 }
 
 fn assemble_peeled_trace_with_jump_args(
-    p1_ops: &[Op],
-    p2_ops: &[Op],
+    p1_ops: &[majit_ir::OpRc],
+    p2_ops: &[majit_ir::OpRc],
     label_args: &[OpRef],
     start_label_args: &[OpRef],
     extra_label_args: &[OpRef],
@@ -4379,7 +4386,7 @@ fn assemble_peeled_trace_with_jump_args(
     loop_label_descr: Option<DescrRef>,
     _p1_end_args: &[OpRef],
     ctx: &mut crate::optimizeopt::OptContext,
-) -> Vec<Op> {
+) -> Vec<majit_ir::OpRc> {
     let mut result =
         Vec::with_capacity(p1_ops.len() + p2_ops.len() + 1 + imported_short_aliases.len());
     let mut filtered_extra_label_args = Vec::new();
@@ -4434,7 +4441,7 @@ fn assemble_peeled_trace_with_jump_args(
         let mut start_label = Op::new(OpCode::Label, &start_label_args_box);
         start_label.pos.set(OpRef::NONE);
         start_label.setdescr(start_label_descr);
-        result.push(start_label);
+        result.push(std::rc::Rc::new(start_label));
     }
 
     // Preamble: everything except Jump
@@ -4442,7 +4449,7 @@ fn assemble_peeled_trace_with_jump_args(
         if op.opcode == OpCode::Jump {
             break;
         }
-        result.push(op.clone());
+        result.push(std::rc::Rc::new((**op).clone()));
     }
 
     // max_pos must account for ALL p1_ops positions, including SameAs
@@ -4654,8 +4661,8 @@ fn assemble_peeled_trace_with_jump_args(
     if let Some(d) = loop_label_descr {
         label_op.setdescr(d);
     }
-    result.extend(fallthrough_aliases);
-    result.push(label_op);
+    result.extend(fallthrough_aliases.into_iter().map(std::rc::Rc::new));
+    result.push(std::rc::Rc::new(label_op));
 
     // Body: 2-pass remap (inputarg refs -> label args, body results -> fresh boxes)
     let max_label_arg_pos = full_label_args
@@ -4763,7 +4770,7 @@ fn assemble_peeled_trace_with_jump_args(
     let mut defs_since_inner_label: majit_ir::vec_set::VecSet<OpRef> =
         majit_ir::vec_set::VecSet::new();
     for (op_idx, op) in p2_ops.iter().enumerate() {
-        let mut new_op = op.clone();
+        let mut new_op = (**op).clone();
         let mut original_args = op.getarglist_copy();
         if let Some(&mapped_pos) = body_result_remap.get(&op.pos.get()) {
             new_op.pos.set(mapped_pos);
@@ -5047,7 +5054,7 @@ fn assemble_peeled_trace_with_jump_args(
         // fail_index for the sharing-path guard. Both phases of the
         // unroll optimizer therefore emit body guards with unique
         // descrs already; no post-process re-stamping is needed.
-        result.push(new_op);
+        result.push(std::rc::Rc::new(new_op));
         if op.opcode == OpCode::Label {
             current_inner_label_index = Some(result.len() - 1);
             defs_since_inner_label.clear();
@@ -5061,7 +5068,10 @@ fn assemble_peeled_trace_with_jump_args(
     result
 }
 
-fn splice_redirected_tail(body_ops: &[Op], redirected_tail_ops: &[Op]) -> Vec<Op> {
+fn splice_redirected_tail(
+    body_ops: &[majit_ir::OpRc],
+    redirected_tail_ops: &[majit_ir::OpRc],
+) -> Vec<majit_ir::OpRc> {
     let mut result = Vec::with_capacity(body_ops.len() + redirected_tail_ops.len());
     let split_idx = body_ops
         .iter()
@@ -5072,14 +5082,14 @@ fn splice_redirected_tail(body_ops: &[Op], redirected_tail_ops: &[Op]) -> Vec<Op
     result
 }
 
-fn replace_terminal_jump(body_ops: &[Op], jump_op: Op) -> Vec<Op> {
+fn replace_terminal_jump(body_ops: &[majit_ir::OpRc], jump_op: Op) -> Vec<majit_ir::OpRc> {
     let mut result = Vec::with_capacity(body_ops.len() + 1);
     let split_idx = body_ops
         .iter()
         .rposition(|op| op.opcode == OpCode::Jump)
         .unwrap_or(body_ops.len());
     result.extend_from_slice(&body_ops[..split_idx]);
-    result.push(jump_op);
+    result.push(std::rc::Rc::new(jump_op));
     result
 }
 
@@ -5484,6 +5494,7 @@ mod tests {
         ];
         let preamble_target = TargetToken::new_preamble(7);
 
+        let body_ops: Vec<majit_ir::OpRc> = body_ops.into_iter().map(std::rc::Rc::new).collect();
         let result = UnrollOptimizer::jump_to_preamble(&body_ops, &preamble_target);
         assert_eq!(result[1].opcode, OpCode::Jump);
         assert_eq!(
@@ -5530,6 +5541,7 @@ mod tests {
         let mut jump = Op::new(OpCode::Jump, &[BoxRef::from_opref(OpRef::int_op(2))]);
         jump.setdescr(TargetToken::new_preamble(7).as_jump_target_descr());
 
+        let body_ops: Vec<majit_ir::OpRc> = body_ops.into_iter().map(std::rc::Rc::new).collect();
         let result = replace_terminal_jump(&body_ops, jump);
 
         assert_eq!(result.len(), 2);
@@ -7161,9 +7173,17 @@ mod tests {
             majit_ir::VecAssoc::from([(OpRef::void_op(857).raw(), majit_ir::Value::Int(2))]);
 
         let mut ctx = assemble_test_context(&p1_ops, &p2_ops, 1);
+        let p1_ops_rc: Vec<majit_ir::OpRc> = p1_ops
+            .iter()
+            .map(|op| std::rc::Rc::new(op.clone()))
+            .collect();
+        let p2_ops_rc: Vec<majit_ir::OpRc> = p2_ops
+            .iter()
+            .map(|op| std::rc::Rc::new(op.clone()))
+            .collect();
         let combined = assemble_peeled_trace_with_jump_args(
-            &p1_ops,
-            &p2_ops,
+            &p1_ops_rc,
+            &p2_ops_rc,
             &[OpRef::int_op(10)],
             &[OpRef::int_op(0)],
             &[OpRef::int_op(22), OpRef::void_op(857), OpRef::int_op(150)],
@@ -7730,6 +7750,9 @@ mod tests {
             ),
         ];
 
+        let body_ops: Vec<majit_ir::OpRc> = body_ops.into_iter().map(std::rc::Rc::new).collect();
+        let redirected_tail: Vec<majit_ir::OpRc> =
+            redirected_tail.into_iter().map(std::rc::Rc::new).collect();
         let spliced = splice_redirected_tail(&body_ops, &redirected_tail);
         assert_eq!(spliced.len(), 3);
         assert_eq!(spliced[0].opcode, OpCode::IntAdd);

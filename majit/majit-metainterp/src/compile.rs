@@ -369,9 +369,9 @@ impl<'a> UnrolledLoopData<'a> {
 /// The backend numbers every guard and finish in a single exit table, so this
 /// helper mirrors that numbering and records only the guard entries that need
 /// resume data plus the corresponding op index for blackhole fallback.
-pub(crate) fn build_guard_metadata(
+pub(crate) fn build_guard_metadata<T: AsRef<majit_ir::Op>>(
     inputargs: &[InputArg],
-    ops: &[majit_ir::Op],
+    ops: &[T],
     pc: u64,
 ) -> (
     crate::optimizeopt::vec_assoc::VecAssoc<u32, crate::resume::ResumeLayoutSummary>,
@@ -389,6 +389,7 @@ pub(crate) fn build_guard_metadata(
     // (the OpRef variant tag, `ty()`); a fail_arg carries its own type
     // regardless of trace position, so no position-keyed side table is needed.
     for (op_idx, op) in ops.iter().enumerate() {
+        let op = op.as_ref();
         let is_guard = op.opcode.is_guard();
         let is_finish = op.opcode == OpCode::Finish;
         if !is_guard && !is_finish {
@@ -1060,10 +1061,10 @@ pub(crate) fn build_guard_metadata(
     (result, exit_layouts)
 }
 
-pub(crate) fn merge_backend_exit_layouts(
+pub(crate) fn merge_backend_exit_layouts<T: AsRef<majit_ir::Op>>(
     exit_layouts: &mut crate::optimizeopt::vec_assoc::VecAssoc<u32, StoredExitLayout>,
     backend_layouts: &[FailDescrLayout],
-    ops: &[majit_ir::Op],
+    ops: &[T],
 ) {
     for layout in backend_layouts {
         // compile.py:861 copy_all_attributes_from parity: when the backend
@@ -1099,7 +1100,7 @@ pub(crate) fn merge_backend_exit_layouts(
         let descr_from_op = layout
             .source_op_index
             .and_then(|idx| ops.get(idx))
-            .and_then(|op| op.getdescr())
+            .and_then(|op| op.as_ref().getdescr())
             .or_else(|| {
                 Some(if layout.is_finish {
                     make_finish_fail_descr_typed(
@@ -1363,10 +1364,10 @@ pub(crate) fn enrich_resume_layout_with_frame_stack(
     }
 }
 
-pub(crate) fn merge_backend_terminal_exit_layouts(
+pub(crate) fn merge_backend_terminal_exit_layouts<T: AsRef<majit_ir::Op>>(
     terminal_exit_layouts: &mut crate::optimizeopt::vec_assoc::VecAssoc<usize, StoredExitLayout>,
     backend_layouts: &[TerminalExitLayout],
-    ops: &[majit_ir::Op],
+    ops: &[T],
 ) {
     for layout in backend_layouts {
         // Pre-resolve the source-op `descr` for backend-only entries so
@@ -1385,7 +1386,7 @@ pub(crate) fn merge_backend_terminal_exit_layouts(
         // downstream readers that probe `entry.descr.is_some_and(...)`
         // (e.g. `assign_guard_hashes` via the backend layout, exit-type
         // resolution paths) keep working uniformly.
-        let source_op = ops.get(layout.op_index);
+        let source_op = ops.get(layout.op_index).map(|op| op.as_ref());
         let is_jump = match source_op {
             Some(op) => op.opcode == OpCode::Jump,
             None => !layout.is_finish,
@@ -1485,9 +1486,13 @@ pub(crate) fn enrich_resume_layout_with_trace_metadata(
     }
 }
 
-pub(crate) fn find_fail_index_for_exit_op(ops: &[majit_ir::Op], op_index: usize) -> Option<u32> {
+pub(crate) fn find_fail_index_for_exit_op<T: AsRef<majit_ir::Op>>(
+    ops: &[T],
+    op_index: usize,
+) -> Option<u32> {
     let mut fail_index = 0u32;
     for (idx, op) in ops.iter().enumerate() {
+        let op = op.as_ref();
         if op.opcode.is_guard() || op.opcode == OpCode::Finish {
             if idx == op_index {
                 return Some(fail_index);
@@ -1498,14 +1503,14 @@ pub(crate) fn find_fail_index_for_exit_op(ops: &[majit_ir::Op], op_index: usize)
     None
 }
 
-pub(crate) fn infer_terminal_exit_layout(
+pub(crate) fn infer_terminal_exit_layout<T: AsRef<majit_ir::Op>>(
     inputargs: &[InputArg],
-    ops: &[majit_ir::Op],
+    ops: &[T],
     owning_key: u64,
     trace_id: u64,
     op_index: usize,
 ) -> Option<CompiledExitLayout> {
-    let op = ops.get(op_index)?;
+    let op = ops.get(op_index)?.as_ref();
     let is_finish = op.opcode == OpCode::Finish;
     if !is_finish && op.opcode != OpCode::Jump {
         return None;
@@ -1568,13 +1573,14 @@ pub(crate) fn infer_terminal_exit_layout(
     })
 }
 
-pub(crate) fn build_terminal_exit_layouts(
+pub(crate) fn build_terminal_exit_layouts<T: AsRef<majit_ir::Op>>(
     inputargs: &[InputArg],
-    ops: &[majit_ir::Op],
+    ops: &[T],
 ) -> crate::optimizeopt::vec_assoc::VecAssoc<usize, StoredExitLayout> {
     let mut layouts: crate::optimizeopt::vec_assoc::VecAssoc<usize, StoredExitLayout> =
         crate::optimizeopt::vec_assoc::VecAssoc::new();
     for (op_index, op) in ops.iter().enumerate() {
+        let op = op.as_ref();
         if op.opcode != OpCode::Finish && op.opcode != OpCode::Jump {
             continue;
         }
@@ -1648,10 +1654,10 @@ pub(crate) fn decode_values_with_layout(
 }
 
 pub(crate) fn normalize_closing_jump_args(
-    mut ops: Vec<Op>,
+    ops: Vec<majit_ir::OpRc>,
     constants: &majit_ir::VecAssoc<u32, majit_ir::Value>,
     num_inputs: usize,
-) -> Vec<Op> {
+) -> Vec<majit_ir::OpRc> {
     let Some(label_args) = ops
         .iter()
         .rev()
@@ -1667,7 +1673,7 @@ pub(crate) fn normalize_closing_jump_args(
         .map(|op| op.pos.get())
         .collect();
 
-    let Some(jump) = ops.iter_mut().rfind(|op| op.opcode == OpCode::Jump) else {
+    let Some(jump) = ops.iter().rfind(|op| op.opcode == OpCode::Jump) else {
         return ops;
     };
 
@@ -1751,7 +1757,7 @@ pub(crate) fn normalize_closing_jump_args(
 /// reads: one length per array field (in `vinfo.array_fields` order), taken
 /// from the concrete virtualizable at trace-start time.
 pub(crate) fn patch_new_loop_to_load_virtualizable_fields(
-    ops: &mut Vec<Op>,
+    ops: &mut Vec<majit_ir::OpRc>,
     inputargs: &mut Vec<InputArg>,
     vinfo: &crate::virtualizable::VirtualizableInfo,
     vable_array_lengths: &[usize],
@@ -2074,10 +2080,7 @@ pub(crate) fn patch_new_loop_to_load_virtualizable_fields(
     for op in original_ops.iter() {
         emit_forwarded_patch_op(&mut extra_ops, op, &mut forwarding, &mut next_opref);
     }
-    // The compiled-loop assembly stage still carries `Vec<Op>` by value
-    // (re-wrapped as `Rc` at the backend boundary); cloning out preserves
-    // the bound operand handles while matching the stage's storage.
-    *ops = extra_ops.iter().map(|rc| (**rc).clone()).collect();
+    *ops = extra_ops;
 }
 
 /// RPython dependency.py requires GUARD_(NO_)OVERFLOW to be scheduled only
@@ -2085,7 +2088,7 @@ pub(crate) fn patch_new_loop_to_load_virtualizable_fields(
 /// intbounds.py:231-242: optimizer raises InvalidLoop for stray overflow
 /// guards. This function is a post-optimization safety net: if any stray
 /// guard survived, strip it to prevent backend panic.
-pub(crate) fn strip_stray_overflow_guards(ops: Vec<Op>) -> Vec<Op> {
+pub(crate) fn strip_stray_overflow_guards(ops: Vec<majit_ir::OpRc>) -> Vec<majit_ir::OpRc> {
     use majit_ir::OpCode;
 
     let mut pending_ovf = false;
@@ -2697,6 +2700,7 @@ mod tests {
         let mut inputargs = vec![InputArg::new_ref(0), InputArg::new_ref(1)];
         let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
 
+        let mut ops: Vec<majit_ir::OpRc> = ops.into_iter().map(std::rc::Rc::new).collect();
         patch_new_loop_to_load_virtualizable_fields(
             &mut ops,
             &mut inputargs,
@@ -2774,6 +2778,7 @@ mod tests {
         ];
         let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
 
+        let mut ops: Vec<majit_ir::OpRc> = ops.into_iter().map(std::rc::Rc::new).collect();
         patch_new_loop_to_load_virtualizable_fields(
             &mut ops,
             &mut inputargs,
