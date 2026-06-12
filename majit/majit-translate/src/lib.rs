@@ -877,7 +877,22 @@ fn analyze_pipeline_from_module_paths(
             // without an override, and traits with several concrete
             // impl types (the receiver stays ambiguous —
             // indirect-call family territory keeps the default).
-            let devirt: Option<(&str, &front::semantic::SemanticFunction)> = if is_default {
+            //
+            // Staged scope: whole-trait shadowing is blocked on the
+            // classdef-hints-before-BFS annotator work — registering
+            // objspace-heavy overrides (load_attr / call_callable /
+            // binary_op …) pulls their graph closure into the BFS,
+            // where the annotator fails on classdef-less SomeInstance
+            // attr reads and on runtime statics no build-time table
+            // can resolve (`JIT_DRIVER`).  Grown deliberately, one
+            // fail-loud resolution at a time (same staging discipline
+            // as `RESULT_EXC_LOWERING_SCOPE` in `front/result_exc.rs`);
+            // the motivating members are the exception-handler pair
+            // whose empty defaults broke generic-dispatch resolution.
+            const DEFAULT_SHADOW_DEVIRT_SCOPE: &[&str] = &["push_exc_info", "pop_except"];
+            let devirt: Option<(&str, &front::semantic::SemanticFunction)> = if is_default
+                && DEFAULT_SHADOW_DEVIRT_SCOPE.contains(&method.name.as_str())
+            {
                 trait_method_overrides
                     .get(&(impl_info.trait_name.as_str(), method.name.as_str()))
                     .filter(|_| {
