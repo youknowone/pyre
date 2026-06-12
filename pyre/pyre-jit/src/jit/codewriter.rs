@@ -9546,18 +9546,24 @@ impl CodeWriter {
         // pyre-only PyJitCode.has_abort: a "this jitcode cannot be
         // blackhole-dispatched, pipe straight to the interpreter" flag.
         // RPython has no such flag (rpython/jit/codewriter/jitcode.py:14
-        // — no abort tracking on JitCode). Upstream's `Assembler.abort()`
-        // (assembler.py:177-181, bhimpl_abort) emits BC_ABORT so the
-        // blackhole raises SwitchToBlackhole(ABORT_ESCAPE) at runtime;
-        // `abort_permanent()` is a different pyre-only bytecode we emit
-        // for genuinely unsupported Python opcodes, and its execution
-        // path already raises/aborts correctly from the blackhole. We
-        // keep has_abort narrowly scoped to `abort()` emissions (matches
-        // the JitCodeBuilder flag shape) so the flag's meaning doesn't
-        // drift into "assembler overflow" or "abort_permanent present"
-        // — both of which the assembler/blackhole already handle without
-        // a front-end gate.
-        let has_abort = assembler.has_abort_flag();
+        // — no abort tracking on JitCode), because upstream's blackhole
+        // never aborts: every Python opcode lowers, so a guard-failure
+        // resume always runs the jitcode forward to completion.  pyre
+        // deviates with `abort` / `abort_permanent` opcodes for ops it
+        // cannot lower; a blackhole that hits one mid-run has already
+        // committed the preceding side effects (locals/stack to the
+        // vable, and any observable residual call) and then drops to the
+        // interpreter, which re-runs the region and double-applies them.
+        // So a jitcode carrying EITHER opcode must skip the blackhole
+        // entirely and resume the plain interpreter from the guard
+        // snapshot, where every effect runs exactly once.
+        //
+        // `has_abort` is computed from the production stream after the
+        // splice below (`ssarepr.insns`).  It cannot be read here via
+        // `assembler.has_abort_flag()`: the builder only assembles the
+        // stream inside `finalize_jitcode`
+        // (`finish_with_positions_from`), so the flag is still false at
+        // this point in the pipeline.
 
         // `simplify_graph` (`translator.py:55-56`) parity: collapse the
         // empty forwarding blocks `mergeblock` supersede left behind
@@ -9890,6 +9896,21 @@ impl CodeWriter {
         }
         ssarepr.insns = spliced.insns;
         ssarepr.pc_first_insn_pos = spliced.pc_first_insn_pos;
+        // has_abort (see the note above the splice): scan the production
+        // stream for an `abort` / `abort_permanent` opcode.  `flatten_graph`
+        // always serializes these even though the bail-out severs the
+        // block's CFG successor, so the opcode is present in
+        // `ssarepr.insns` whenever the jitcode can reach a non-lowerable
+        // op.  A jitcode that contains one must skip the blackhole resume
+        // (`resolve_jitcode` returns `None`) so its guard failures replay
+        // through the plain interpreter exactly once.
+        let has_abort = ssarepr.insns.iter().any(|insn| {
+            matches!(
+                insn,
+                super::flatten::Insn::Op { opname, .. }
+                    if opname == "abort" || opname == "abort_permanent"
+            )
+        });
         // Per-PC `-live-` marker indices feeding `filter_liveness_in_place`
         // (translated through its `remove_repeated_live` remap), and the
         // sparse after-residual-call resume anchors — both derived from the
