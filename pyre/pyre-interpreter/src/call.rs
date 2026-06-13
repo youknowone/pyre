@@ -2646,16 +2646,18 @@ fn build_class_inner(
                 }
             }
         } else {
-            // Arbitrary non-dict mapping: walk its keys through the
-            // iteration protocol and read each value back via
-            // `space.getitem` so `__getitem__` overrides apply.
-            let w_iter = crate::baseobjspace::iter(w_ns)?;
-            loop {
-                let key = match crate::baseobjspace::next(w_iter) {
-                    Ok(k) => k,
-                    Err(e) if e.kind == crate::PyErrorKind::StopIteration => break,
-                    Err(e) => return Err(e),
-                };
+            // Arbitrary non-dict mapping: enumerate via the mapping
+            // protocol's `keys()` (the `PyMapping_Keys` path `type.__new__`
+            // takes for a non-dict namespace) and read each value back via
+            // `space.getitem` so `__getitem__` overrides apply.  Using
+            // `keys()` rather than `iter()` keeps a mapping that implements
+            // the mapping protocol without `__iter__` working, matching
+            // `compiling.py:207` passing the namespace to the metaclass
+            // unchanged.
+            let keys_method = crate::baseobjspace::getattr_str(w_ns, "keys")?;
+            let keys_obj = crate::call::call_function_impl_result(keys_method, &[])?;
+            let keys = crate::builtins::collect_iterable(keys_obj)?;
+            for key in keys {
                 if !unsafe { pyre_object::is_str(key) } {
                     continue;
                 }
