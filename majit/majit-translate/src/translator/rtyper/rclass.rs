@@ -4045,6 +4045,23 @@ pub(super) fn pair_instance_instance_rtype_is_(
     .map(Some)
 }
 
+/// RPython `pairtype(InstanceRepr, InstanceRepr).rtype_ne`
+/// (rclass.py:1072-1074): negate `rtype_eq` (which aliases `rtype_is_`).
+pub(super) fn pair_instance_instance_rtype_ne(
+    r1: &dyn Repr,
+    r2: &dyn Repr,
+    hop: &HighLevelOp,
+) -> Result<Option<Hlvalue>, TyperError> {
+    let Some(v_eq) = pair_instance_instance_rtype_is_(r1, r2, hop)? else {
+        return Ok(None);
+    };
+    Ok(hop.genop(
+        "bool_not",
+        vec![v_eq],
+        GenopResult::LLType(LowLevelType::Bool),
+    ))
+}
+
 /// RPython `buildinstancerepr(rtyper, classdef, gcflavor='gc')`
 /// (`rclass.py:91-119`).
 ///

@@ -581,6 +581,17 @@ fn dispatch_rtype_op(
         (Repr, PtrRepr, "eq") => committed(r2.rtype_eq(hop)),
         (Repr, PtrRepr, "ne") => committed(r2.rtype_ne(hop)),
 
+        // rclass.py:1070 — `pairtype(InstanceRepr, InstanceRepr).rtype_eq
+        // = rtype_is_`: both sides upcast to the common-base instance
+        // repr, then pointer identity (`ptr_eq`).  rtype_ne (1072-1074)
+        // negates it.
+        (InstanceRepr, InstanceRepr, "eq") => {
+            committed(super::rclass::pair_instance_instance_rtype_is_(r1, r2, hop))
+        }
+        (InstanceRepr, InstanceRepr, "ne") => {
+            committed(super::rclass::pair_instance_instance_rtype_ne(r1, r2, hop))
+        }
+
         // rint.py:217-310 — IntegerRepr/IntegerRepr pair arithmetic and
         // comparisons. `truediv` is intentionally absent here: upstream
         // delegates it to FloatRepr through the MRO.
