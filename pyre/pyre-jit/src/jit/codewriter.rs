@@ -3235,10 +3235,12 @@ fn new_shadow_graph(code: &CodeObject) -> super::flow::FunctionGraph {
 }
 
 fn attach_catch_exception_edge(
+    code: &CodeObject,
     graph: &mut super::flow::FunctionGraph,
     block: &super::flow::BlockRef,
     target: &SpamBlockRef,
     source_state: &FrameState,
+    site: &ExceptionCatchSite,
 ) -> super::flow::LinkRef {
     // `flowcontext.py:148-149 guessexception` sets
     // `block.exitswitch = c_last_exception` before the link is
@@ -3257,7 +3259,26 @@ fn attach_catch_exception_edge(
     // sets `last_exception` to the fresh pair, so the same
     // Variables can be threaded into BOTH `link.args` (via
     // `getoutputargs` below) AND `link.extravars`.
-    let edge_state = exception_landing_state(graph, source_state);
+    //
+    // Reshape the cloned state to the handler-entry layout: unwind the
+    // operand stack to the handler's try-level `stack_depth`, push the
+    // `lasti` box (when flagged) and the exception value, and retarget
+    // `next_offset` to the handler PC — the exact transform
+    // `handler_entry_state_from_catch_site` applies when it builds the
+    // catch landing's framestate / inputargs.  A `raise` reached from a
+    // DEEPER operand-stack PC (e.g. mid-expression, inside a call's
+    // argument build-up) otherwise leaves `edge_state` at the raise
+    // point's stack depth and `next_offset`, so it is NOT union-
+    // compatible with the landing (`FrameState::union` declines on the
+    // `next_offset` / stack-length mismatch and `update_catch_landing_
+    // state` silently keeps the landing as-is).  The positional
+    // `getoutputargs` then shifts every arg past the stack delta,
+    // pairing a Ref slot with the landing's `last_exception` Int slot —
+    // surfacing downstream as an `int_copy` kind-mismatch at assemble
+    // time and as an `enforce_input_args` colour collision when the
+    // shifted CFG coalesce pair merges two landing inputargs.
+    let seeded = exception_landing_state(graph, source_state);
+    let edge_state = handler_entry_state_from_catch_site(code, graph, &seeded, site);
 
     // Update the landing block's framestate / inputargs from the
     // edge state.  Note: RPython models each
@@ -5698,17 +5719,18 @@ impl CodeWriter {
                 // normal-control-flow Link (fallthrough / goto) is
                 // added by its own emit macro so the two edges coexist
                 // on `Block.exits`.
-                let landing = catch_sites
+                let site = catch_sites
                     .iter()
                     .find(|s| s.landing_label == catch_label)
                     .expect("catch_sites entry for catch_label")
-                    .landing
                     .clone();
                 attach_catch_exception_edge(
+                    code,
                     &mut graph,
                     &current_block.block(),
-                    &landing,
+                    &site.landing,
                     &current_state,
+                    &site,
                 );
             }};
         }
@@ -11018,6 +11040,22 @@ mod tests {
             .expect("expected nested function code object")
     }
 
+    // Minimal `ExceptionCatchSite` for the `attach_catch_exception_edge`
+    // tests: a try-level stack depth of 0 with no `lasti` push and a
+    // handler PC at offset 0.  `handler_entry_state_from_catch_site`
+    // unwinds the edge state to this depth and pushes the exception value,
+    // matching the landing block's handler-entry layout.
+    fn synthetic_catch_site(landing: &SpamBlockRef) -> ExceptionCatchSite {
+        ExceptionCatchSite {
+            landing_label: 0,
+            handler_py_pc: 0,
+            stack_depth: 0,
+            push_lasti: false,
+            lasti_py_pc: 0,
+            landing: landing.clone(),
+        }
+    }
+
     fn fresh_variable_factory(start: u32) -> impl FnMut(Option<Kind>) -> Variable {
         let mut next_id = start;
         move |kind| {
@@ -12513,9 +12551,16 @@ mod tests {
         let catch_ref = SpamBlockRef::new(catch_block.clone(), None);
         let source_state = FrameState::new(Vec::new(), Vec::new(), None, Vec::new(), 0);
         let startblock_ref = graph.startblock.clone();
+        let site = synthetic_catch_site(&catch_ref);
 
-        let link =
-            attach_catch_exception_edge(&mut graph, &startblock_ref, &catch_ref, &source_state);
+        let link = attach_catch_exception_edge(
+            &code,
+            &mut graph,
+            &startblock_ref,
+            &catch_ref,
+            &source_state,
+            &site,
+        );
         let startblock = graph.startblock.borrow();
 
         assert_eq!(
@@ -12546,9 +12591,16 @@ mod tests {
             0,
         );
         let startblock_ref = graph.startblock.clone();
+        let site = synthetic_catch_site(&catch_ref);
 
-        let link =
-            attach_catch_exception_edge(&mut graph, &startblock_ref, &catch_ref, &source_state);
+        let link = attach_catch_exception_edge(
+            &code,
+            &mut graph,
+            &startblock_ref,
+            &catch_ref,
+            &source_state,
+            &site,
+        );
 
         let link_borrow = link.borrow();
         assert!(link_borrow.last_exception.is_some());
@@ -12571,19 +12623,28 @@ mod tests {
         let source_state =
             FrameState::new(vec![Some(local.into())], Vec::new(), None, Vec::new(), 0);
         let startblock_ref = graph.startblock.clone();
+        let site = synthetic_catch_site(&catch_ref);
 
         assert!(
             catch_block.borrow().inputargs.is_empty(),
             "catch landing block starts with no inputargs"
         );
 
-        attach_catch_exception_edge(&mut graph, &startblock_ref, &catch_ref, &source_state);
+        attach_catch_exception_edge(
+            &code,
+            &mut graph,
+            &startblock_ref,
+            &catch_ref,
+            &source_state,
+            &site,
+        );
 
         let inputargs = catch_block.borrow().inputargs.clone();
         assert_eq!(
             inputargs.len(),
-            3,
-            "expected 1 local + 2 exception Variables, got {:?}",
+            4,
+            "handler-entry layout: 1 local + the pushed exception value + \
+             the (last_exception, last_exc_value) pair, got {:?}",
             inputargs
         );
         assert!(
