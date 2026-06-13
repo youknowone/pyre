@@ -29,6 +29,7 @@ pub mod rbuiltin;
 pub mod rclass;
 pub mod rfloat;
 pub mod rint;
+pub mod rlist;
 pub mod rmodel;
 pub mod rnone;
 pub mod rpbc;

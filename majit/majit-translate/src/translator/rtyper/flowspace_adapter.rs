@@ -1230,6 +1230,32 @@ pub fn translate_op(
                         call_args.extend(arg_hls);
                         return Ok(vec![FlowspaceOp::new("simple_call", call_args, result)]);
                     }
+                    // `<[T]>::len(slice)` — the slice-receiver `.len()`
+                    // method call.  Rust lowers `slice.len()` to a MIR
+                    // call to `core::slice::<impl [T]>::len`, not to the
+                    // `Rvalue::Len` that `front/mir.rs` lowers to a
+                    // `__len` synthetic.  There is no source body for the
+                    // intrinsic to register, so route it to the rtyper's
+                    // `len` operation (`rtyper.rs:2016 "len" arm` →
+                    // `Repr.rtype_len`), the same dispatch upstream
+                    // `op.len(v)` reaches via `unaryop.py:867-870`.  The
+                    // receiver annotates as `SomeList` (slices map to
+                    // `SomeList` in `bookkeeper`), so `rtype_len` lands on
+                    // the list repr's `ll_length` lowering.
+                    if segments.len() == 4
+                        && segments[0] == "core"
+                        && segments[1] == "slice"
+                        && segments[2] == "<Impl>"
+                        && segments[3] == "len"
+                    {
+                        let mut iter = arg_hls.into_iter();
+                        let arg = iter.next().ok_or_else(|| {
+                            TyperError::message(
+                                "core::slice::<Impl>::len requires a receiver arg".to_string(),
+                            )
+                        })?;
+                        return Ok(vec![FlowspaceOp::new("len", vec![arg], result)]);
+                    }
                     let key =
                         crate::translator::rtyper::pyre_call_registry::FunctionPathKey::from_segments(
                             segments.iter().cloned(),

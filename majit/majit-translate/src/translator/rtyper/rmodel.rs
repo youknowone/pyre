@@ -2929,10 +2929,30 @@ pub fn rtyper_makerepr(
                 )?) as std::sync::Arc<dyn Repr>,
             )
         }
-        SomeValue::List(l) => Err(TyperError::missing_rtype_operation(format!(
-            "SomeList.rtyper_makerepr — port rpython/rtyper/rlist.py ListRepr (listdef: {:?})",
-            l.listdef
-        ))),
+        SomeValue::List(s_list) => {
+            // rlist.py:43-50 — `BaseListRepr.__new__` returns
+            // `FixedSizeListRepr` for a non-resized listdef and
+            // `ListRepr` for a resized one. Pyre lands the non-resized
+            // (slice / fixed-array) repr today; the resized
+            // `GcStruct("list", length, items)` variant is deferred.
+            let resized = s_list.listdef.listitem_rc().borrow().resized;
+            if resized {
+                Err(TyperError::missing_rtype_operation(format!(
+                    "SomeList(resized).rtyper_makerepr — port \
+                     rpython/rtyper/lltypesystem/rlist.py ListRepr (GcStruct length+items) \
+                     (listdef: {:?})",
+                    s_list.listdef
+                )))
+            } else {
+                let item_r = rtyper.getrepr(&s_list.listdef.s_value())?;
+                let rtyper_rc = rtyper.self_rc()?;
+                Ok(
+                    std::sync::Arc::new(crate::translator::rtyper::rlist::FixedSizeListRepr::new(
+                        &rtyper_rc, item_r,
+                    )?) as std::sync::Arc<dyn Repr>,
+                )
+            }
+        }
         SomeValue::Dict(_) => Err(TyperError::missing_rtype_operation(
             "SomeDict.rtyper_makerepr — port rpython/rtyper/rdict.py DictRepr",
         )),

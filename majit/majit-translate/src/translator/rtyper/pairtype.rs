@@ -120,6 +120,12 @@ pub enum ReprClassId {
     InstanceRepr,
     /// `rtuple.py:129 TupleRepr`.
     TupleRepr,
+    /// `lltypesystem/rlist.py:173 FixedSizeListRepr(
+    /// AbstractFixedSizeListRepr, BaseListRepr)` — the non-resized list
+    /// whose `LIST` lowers to a bare `Ptr(GcArray(ITEM))`. Slices
+    /// (`&[T]`) annotate as a non-resized `SomeList`, so this is the
+    /// repr the `len` lowering lands on.
+    FixedSizeListRepr,
     /// `rstr.py:483 AbstractCharRepr` (`CharRepr` lltypesystem
     /// realisation, `lowleveltype = Char`).
     CharRepr,
@@ -182,6 +188,7 @@ impl ReprClassId {
             MethodsPBCRepr => &[MethodsPBCRepr, Repr],
             ClassesPBCRepr => &[ClassesPBCRepr, Repr],
             InstanceRepr => &[InstanceRepr, Repr],
+            FixedSizeListRepr => &[FixedSizeListRepr, Repr],
             TupleRepr => &[TupleRepr, Repr],
             CharRepr => &[CharRepr, Repr],
             UniCharRepr => &[UniCharRepr, Repr],
