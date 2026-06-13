@@ -491,8 +491,17 @@ impl UnrollOptimizer {
                     .next_global_opref
                     .max(num_inputs as u32)
                     .max(pre_imported.opref_high_water());
-                // Retrace path: Phase 1 already done; preamble ops are in
-                // the caller's partial_trace, not produced here.
+                // Retrace path: Phase 1 already done; the preamble producers
+                // live in the imported state's `partial_trace_operations`
+                // (export records them there from `phase1_emit_ops`, #104). The
+                // non-skip path populates `self.phase1_emit_ops` from `opt_p1`;
+                // restore the same pool here so Phase 2's producer lookup
+                // (`new_operations ∪ phase1_emit_ops ∪ resop_refs`) can reach a
+                // const-folded preamble producer that no other store carries.
+                // RPython keeps box `_forwarded` reachable across the retrace;
+                // this is the pyre analog. (Readers dedup, so double-coverage
+                // with `resop_refs` is idempotent.)
+                self.phase1_emit_ops = pre_imported.partial_trace_operations.clone();
                 // RPython: same Optimizer persists patchguardop. Recover here.
                 if self.phase1_patchguardop.is_none() {
                     self.phase1_patchguardop = pre_imported.patchguardop.clone();
