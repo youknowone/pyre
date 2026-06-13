@@ -1217,6 +1217,15 @@ impl SharedOpcodeHandler for PyFrame {
 
     fn pop_value(&mut self) -> Result<Self::Value, PyError> {
         if self.valuestackdepth <= self.nlocals() {
+            if std::env::var_os("PYRE_51C_DIAG").is_some() {
+                eprintln!(
+                    "[51c-diag][underflow] last_instr={} next_instr={} valuestackdepth={} nlocals={}",
+                    self.last_instr,
+                    self.next_instr(),
+                    self.valuestackdepth,
+                    self.nlocals(),
+                );
+            }
             return Err(stack_underflow_error("interpreter opcode"));
         }
         Ok(self.pop())

@@ -481,6 +481,24 @@ extern "C" fn jit_exc_raise_shim(value: i64) {
     majit_backend_dynasm::jit_exc_raise(value);
 }
 
+/// Publish a raise from a may-force residual helper to BOTH executors.
+///
+/// `bh_call_fn`/`bh_call_fn_N` is bound as the may-force CALL target
+/// (`cpu.rs` `call_fn`, `codewriter.rs:3160` `CallFlavor::MayForce`), so the
+/// same helper runs under the blackhole interpreter AND inside a compiled
+/// trace.  The blackhole reads the raise from `BH_LAST_EXC_VALUE`; a compiled
+/// trace's `GUARD_NO_EXCEPTION` reads it from the backend `_store_exception`
+/// cells (`jit_exc_raise`).  Writing only `BH_LAST_EXC_VALUE` leaves
+/// `GUARD_NO_EXCEPTION` reading a stale 0, so the guard wrongly passes and the
+/// helper's NULL result flows to the consumer — keep both states in sync.
+fn publish_residual_call_exception(exc_obj: i64) {
+    majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc_obj));
+    #[cfg(feature = "cranelift")]
+    majit_backend_cranelift::jit_exc_raise(exc_obj);
+    #[cfg(feature = "dynasm")]
+    majit_backend_dynasm::jit_exc_raise(exc_obj);
+}
+
 #[majit_macros::jit_may_force]
 pub extern "C" fn jit_force_callee_frame(frame_ptr: i64) -> i64 {
     #[cfg(feature = "cranelift")]
@@ -3124,7 +3142,7 @@ fn bh_call_fn_impl(callable: PyObjectRef, null_or_self: PyObjectRef, args: &[PyO
             pyre_interpreter::PyErrorKind::TypeError,
             "call on null callable".to_string(),
         );
-        majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(err.to_exc_object() as i64));
+        publish_residual_call_exception(err.to_exc_object() as i64);
         return 0;
     }
     // llmodel.py:822 bh_call_r — calldescr.call_stub_r is callable-type-agnostic.
@@ -3143,8 +3161,7 @@ fn bh_call_fn_impl(callable: PyObjectRef, null_or_self: PyObjectRef, args: &[PyO
                 Ok(result) if !result.is_null() => result as i64,
                 Ok(_) => 0,
                 Err(err) => {
-                    let exc_obj = err.to_exc_object();
-                    majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc_obj as i64));
+                    publish_residual_call_exception(err.to_exc_object() as i64);
                     0
                 }
             };
@@ -3173,8 +3190,7 @@ fn bh_call_fn_impl(callable: PyObjectRef, null_or_self: PyObjectRef, args: &[PyO
         return match result {
             Ok(result) => result as i64,
             Err(err) => {
-                let exc_obj = err.to_exc_object();
-                majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc_obj as i64));
+                publish_residual_call_exception(err.to_exc_object() as i64);
                 0
             }
         };
@@ -3198,8 +3214,7 @@ fn bh_call_fn_impl(callable: PyObjectRef, null_or_self: PyObjectRef, args: &[PyO
     match result {
         Ok(result) => result as i64,
         Err(err) => {
-            let exc_obj = err.to_exc_object();
-            majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc_obj as i64));
+            publish_residual_call_exception(err.to_exc_object() as i64);
             0
         }
     }

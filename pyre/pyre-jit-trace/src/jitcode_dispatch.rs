@@ -4271,7 +4271,9 @@ fn walker_abort_if_protected_may_force(
     // first; until then the conservative whole-body scan is the correct gate.
     // Bodies with no handler (the loop benches / nbody / fannkuch) never deopt
     // into a handler and compile under the walk.
-    if jitcode_has_exception_handler(code) {
+    if jitcode_has_exception_handler(code)
+        && std::env::var_os("PYRE_51C_RELAX").is_none()
+    {
         return Err(DispatchError::MayForceProtectedByExceptionHandlerUnsupported { pc: op.pc });
     }
     Ok(())
@@ -6049,8 +6051,22 @@ fn walker_capture_snapshot_for_last_guard_impl(
                     // call instead of re-executing it from a coordinate whose
                     // stack no longer holds those operands (which drops/dups
                     // the side effect, e.g. an in-place list swap store).
+                    let py_after_trivia = py;
                     if after_residual_call {
                         py = crate::metainterp::semantic_fallthrough_pc(code, py as usize) as u32;
+                    }
+                    if std::env::var_os("PYRE_51C_DIAG").is_some() && after_residual_call {
+                        let pm = &jc.payload.metadata.pc_map;
+                        eprintln!(
+                            "[51c-diag][snap] guard={:?} op_pc={} py_after_trivia={} py_final={} \
+                             pc_map[py_after_trivia]={:?} pc_map[py_final]={:?}",
+                            ctx.trace_ctx.last_guard_opcode(),
+                            op_pc,
+                            py_after_trivia,
+                            py,
+                            pm.get(py_after_trivia as usize),
+                            pm.get(py as usize),
+                        );
                     }
                 }
                 (py, jc.index as u32, jc.payload.metadata.pc_map.len())

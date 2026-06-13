@@ -4068,6 +4068,7 @@ impl CodeWriter {
         // [last_instr, pycode, valuestackdepth, debugdata, lastblock,
         // w_globals], so the literals match
         // `virtualizable_spec.rs::PYFRAME_VABLE_FIELDS`.
+        const VABLE_LAST_INSTR_FIELD_IDX: u16 = 0;
         const VABLE_CODE_FIELD_IDX: u16 = 1;
         const VABLE_VALUESTACKDEPTH_FIELD_IDX: u16 = 2;
         const VABLE_NAMESPACE_FIELD_IDX: u16 = 5;
@@ -4780,7 +4781,35 @@ impl CodeWriter {
         // `"abort_permanent"` to the builder, so the external push is
         // an exact mirror of the pre-existing internal behavior.
         macro_rules! emit_abort_permanent {
-            () => {{
+            ($py_pc:expr) => {{
+                // Publish `last_instr` to the vable before the bail so the
+                // blackhole hands the interpreter the right resume
+                // coordinate.  The blackhole replays codewriter jitcode that
+                // only syncs `valuestackdepth` (`emit_vsd!`), never
+                // `last_instr` (field 0) — so a replay that travels far from
+                // its resume snapshot (e.g. an exception handler walked into
+                // a try/finally cleanup) reaches `abort_permanent` with
+                // `frame.last_instr` frozen at the snapshot pc.  The bail
+                // (`bhimpl_abort_permanent` → interpreter) would then resume
+                // at the stale opcode with the post-replay value stack and
+                // underflow.  Store `py_pc - 1` (the `set_last_instr_from_next_instr`
+                // convention: `next_instr = last_instr + 1`) so the
+                // interpreter resumes at this unsupported opcode and runs it.
+                if is_portal {
+                    let v_li: super::flow::FlowValue =
+                        super::flow::Constant::signed(($py_pc) as i64 - 1).into();
+                    record_graph_op(
+                        &current_block.block(),
+                        "setfield_vable_i",
+                        vable_setfield_int_graph_args(
+                            frame_var.into(),
+                            v_li.into(),
+                            VABLE_LAST_INSTR_FIELD_IDX,
+                        ),
+                        None,
+                        ($py_pc) as i64,
+                    );
+                }
                 // Graph-side dual-write so the canonical `flatten_graph`
                 // driver sees the same `abort_permanent` SpaceOp via
                 // passthrough.  Without this dual-write, canonical
@@ -6613,7 +6642,7 @@ impl CodeWriter {
                                 result.into()
                             };
                             if nargs > 8 {
-                                emit_abort_permanent!();
+                                emit_abort_permanent!(py_pc);
                             }
                             push_and_bump!(call_result_value, py_pc);
                         }
@@ -6721,7 +6750,7 @@ impl CodeWriter {
                                     let _ = emit_popvalue_ref!(current_depth, py_pc);
                                     let _ = pop_ref_or_fresh(&mut current_state, &mut graph);
                                 }
-                                emit_abort_permanent!();
+                                emit_abort_permanent!(py_pc);
                                 push_fresh_ref(&mut current_state, &mut graph);
                                 current_depth += 1;
                                 emit_vsd!(current_depth, py_pc);
@@ -7213,7 +7242,7 @@ impl CodeWriter {
                             // result on top. Preserve the net `+1` stack effect in
                             // the shadow graph and fall back to the interpreter for
                             // the actual helper call semantics.
-                            emit_abort_permanent!();
+                            emit_abort_permanent!(py_pc);
                             push_fresh_ref(&mut current_state, &mut graph);
                             current_depth += 1;
                             emit_vsd!(current_depth, py_pc);
@@ -7325,7 +7354,7 @@ impl CodeWriter {
                             // RustPython: (1 pushed, 1 popped).
                             let _ = current_state.stack.pop();
                             push_fresh_ref(&mut current_state, &mut graph);
-                            emit_abort_permanent!();
+                            emit_abort_permanent!(py_pc);
                         }
                         Instruction::StoreAttr { namei } => {
                             let name_idx = namei.get(op_arg) as usize;
@@ -7345,7 +7374,7 @@ impl CodeWriter {
                                 stored_value,
                                 py_pc as i64,
                             );
-                            emit_abort_permanent!();
+                            emit_abort_permanent!(py_pc);
                         }
                         Instruction::LoadAttr { namei } => {
                             // LOAD_ATTR net-0 (plain form); the CPython-3.13
@@ -7491,12 +7520,12 @@ impl CodeWriter {
                             // pypy/interpreter/pyopcode.py:1281.
                             let _ = current_state.stack.pop();
                             push_fresh_ref(&mut current_state, &mut graph);
-                            emit_abort_permanent!();
+                            emit_abort_permanent!(py_pc);
                         }
 
                         Instruction::ForIter { .. } => {
                             // push next item: net +1
-                            emit_abort_permanent!();
+                            emit_abort_permanent!(py_pc);
                             current_depth += 1;
                             emit_vsd!(current_depth, py_pc);
                         }
@@ -7504,7 +7533,7 @@ impl CodeWriter {
                         Instruction::EndFor => {
                             // Pyre's end_for() is a no-op (pyopcode.rs:999). Net: 0.
                             // The actual pop is handled by the subsequent PopIter (-1).
-                            emit_abort_permanent!();
+                            emit_abort_permanent!(py_pc);
                         }
 
                         Instruction::PopIter => {
@@ -7522,7 +7551,7 @@ impl CodeWriter {
                             }
                             push_fresh_ref(&mut current_state, &mut graph);
                             current_depth += 1;
-                            emit_abort_permanent!();
+                            emit_abort_permanent!(py_pc);
                         }
 
                         // ContainsOp: item in container — pops 2, pushes 1 (bool).
@@ -7534,7 +7563,7 @@ impl CodeWriter {
                             }
                             push_fresh_ref(&mut current_state, &mut graph);
                             current_depth += 1;
-                            emit_abort_permanent!();
+                            emit_abort_permanent!(py_pc);
                         }
 
                         // CallKw: like Call but with extra kwnames tuple.
@@ -7549,7 +7578,7 @@ impl CodeWriter {
                             }
                             push_fresh_ref(&mut current_state, &mut graph);
                             current_depth += 1;
-                            emit_abort_permanent!();
+                            emit_abort_permanent!(py_pc);
                         }
 
                         // Swap: swap TOS with TOS[i]. No net stack effect.
@@ -7560,7 +7589,7 @@ impl CodeWriter {
                             if depth > 0 && depth <= stack_len {
                                 current_state.stack.swap(stack_len - 1, stack_len - depth);
                             }
-                            emit_abort_permanent!();
+                            emit_abort_permanent!(py_pc);
                         }
 
                         // LoadFastAndClear: push local, clear it. Net: +1.
@@ -7575,14 +7604,14 @@ impl CodeWriter {
                             }
                             current_state.stack.push(value);
                             current_depth += 1;
-                            emit_abort_permanent!();
+                            emit_abort_permanent!(py_pc);
                         }
 
                         // ListAppend(i): peek list at stack[i], pop value. Net: -1.
                         // shared_opcode.rs opcode_list_append.
                         Instruction::ListAppend { .. } => {
                             pop_and_decr_depth(&mut current_state, &mut current_depth);
-                            emit_abort_permanent!();
+                            emit_abort_permanent!(py_pc);
                         }
 
                         // BuildMap(count): pop 2*count key-value pairs, push dict. Net: -(2*count - 1).
@@ -7594,7 +7623,7 @@ impl CodeWriter {
                             }
                             push_fresh_ref(&mut current_state, &mut graph);
                             current_depth += 1;
-                            emit_abort_permanent!();
+                            emit_abort_permanent!(py_pc);
                         }
 
                         // MapAdd(i): peek dict at stack[i], pop value + key. Net: -2.
@@ -7603,7 +7632,7 @@ impl CodeWriter {
                             for _ in 0..2 {
                                 pop_and_decr_depth(&mut current_state, &mut current_depth);
                             }
-                            emit_abort_permanent!();
+                            emit_abort_permanent!(py_pc);
                         }
 
                         // ── Remaining instructions: stack-effect-only accounting ──
@@ -7618,7 +7647,7 @@ impl CodeWriter {
                             }
                             push_fresh_ref(&mut current_state, &mut graph);
                             current_depth += 1;
-                            emit_abort_permanent!();
+                            emit_abort_permanent!(py_pc);
                         }
 
                         // BuildTuple(count): pops count items, pushes 1 tuple. Net: -(count-1).
@@ -7699,7 +7728,7 @@ impl CodeWriter {
                             }
                             push_fresh_ref(&mut current_state, &mut graph);
                             current_depth += 1;
-                            emit_abort_permanent!();
+                            emit_abort_permanent!(py_pc);
                         }
 
                         // BuildString(count): pops count strings, pushes 1. Net: -(count-1).
@@ -7710,7 +7739,7 @@ impl CodeWriter {
                             }
                             push_fresh_ref(&mut current_state, &mut graph);
                             current_depth += 1;
-                            emit_abort_permanent!();
+                            emit_abort_permanent!(py_pc);
                         }
 
                         // CallFunctionEx: pops callable+null+args+kwargs_or_null (4), pushes 1. Net: -3.
@@ -7720,7 +7749,7 @@ impl CodeWriter {
                             }
                             push_fresh_ref(&mut current_state, &mut graph);
                             current_depth += 1;
-                            emit_abort_permanent!();
+                            emit_abort_permanent!(py_pc);
                         }
 
                         // DeleteSubscr: pops 2 (key, obj). Net: -2.
@@ -7728,44 +7757,44 @@ impl CodeWriter {
                             for _ in 0..2 {
                                 pop_and_decr_depth(&mut current_state, &mut current_depth);
                             }
-                            emit_abort_permanent!();
+                            emit_abort_permanent!(py_pc);
                         }
 
                         // DeleteAttr: pops 1 (obj). Net: -1.
                         Instruction::DeleteAttr { .. } => {
                             pop_and_decr_depth(&mut current_state, &mut current_depth);
-                            emit_abort_permanent!();
+                            emit_abort_permanent!(py_pc);
                         }
 
                         // PopJumpIfNone / PopJumpIfNotNone: pops 1. Net: -1.
                         Instruction::PopJumpIfNone { .. }
                         | Instruction::PopJumpIfNotNone { .. } => {
                             pop_and_decr_depth(&mut current_state, &mut current_depth);
-                            emit_abort_permanent!();
+                            emit_abort_permanent!(py_pc);
                         }
 
                         // SetAdd(i): peek set, pop value. Net: -1.
                         Instruction::SetAdd { .. } => {
                             pop_and_decr_depth(&mut current_state, &mut current_depth);
-                            emit_abort_permanent!();
+                            emit_abort_permanent!(py_pc);
                         }
 
                         // ListExtend(i): peek list, pop iterable. Net: -1.
                         Instruction::ListExtend { .. } => {
                             pop_and_decr_depth(&mut current_state, &mut current_depth);
-                            emit_abort_permanent!();
+                            emit_abort_permanent!(py_pc);
                         }
 
                         // SetUpdate(i): peek set, pop iterable. Net: -1.
                         Instruction::SetUpdate { .. } => {
                             pop_and_decr_depth(&mut current_state, &mut current_depth);
-                            emit_abort_permanent!();
+                            emit_abort_permanent!(py_pc);
                         }
 
                         // DictUpdate(i) / DictMerge(i): peek dict, pop source. Net: -1.
                         Instruction::DictUpdate { .. } | Instruction::DictMerge { .. } => {
                             pop_and_decr_depth(&mut current_state, &mut current_depth);
-                            emit_abort_permanent!();
+                            emit_abort_permanent!(py_pc);
                         }
 
                         // SetFunctionAttribute: pops func (TOS), pops attr (TOS1),
@@ -7778,7 +7807,7 @@ impl CodeWriter {
                             current_depth = current_depth.saturating_sub(1);
                             current_state.stack.push(func);
                             current_depth += 1;
-                            emit_abort_permanent!();
+                            emit_abort_permanent!(py_pc);
                         }
 
                         // EndSend: pops result (TOS), pops iter (TOS1), pushes result back.
@@ -7790,7 +7819,7 @@ impl CodeWriter {
                             current_depth = current_depth.saturating_sub(1);
                             current_state.stack.push(result);
                             current_depth += 1;
-                            emit_abort_permanent!();
+                            emit_abort_permanent!(py_pc);
                         }
 
                         // ImportName: pops 2 (level, fromlist), pushes 1 module. Net: -1.
@@ -7800,14 +7829,14 @@ impl CodeWriter {
                             }
                             push_fresh_ref(&mut current_state, &mut graph);
                             current_depth += 1;
-                            emit_abort_permanent!();
+                            emit_abort_permanent!(py_pc);
                         }
 
                         // ImportFrom: peek module, push attr. Net: +1.
                         Instruction::ImportFrom { .. } => {
                             push_fresh_ref(&mut current_state, &mut graph);
                             current_depth += 1;
-                            emit_abort_permanent!();
+                            emit_abort_permanent!(py_pc);
                         }
 
                         // StoreSlice: pops 4 (stop, start, obj, value). Net: -4.
@@ -7815,7 +7844,7 @@ impl CodeWriter {
                             for _ in 0..4 {
                                 pop_and_decr_depth(&mut current_state, &mut current_depth);
                             }
-                            emit_abort_permanent!();
+                            emit_abort_permanent!(py_pc);
                         }
 
                         // FormatWithSpec: pops 2 (spec, value), pushes 1 string. Net: -1.
@@ -7825,7 +7854,7 @@ impl CodeWriter {
                             }
                             push_fresh_ref(&mut current_state, &mut graph);
                             current_depth += 1;
-                            emit_abort_permanent!();
+                            emit_abort_permanent!(py_pc);
                         }
 
                         // LoadSuperAttr: pops 3 (super, cls, self).
@@ -7843,7 +7872,7 @@ impl CodeWriter {
                                 push_fresh_ref(&mut current_state, &mut graph);
                                 current_depth += 1;
                             }
-                            emit_abort_permanent!();
+                            emit_abort_permanent!(py_pc);
                         }
 
                         // UnpackEx: pops 1, pushes before+1+after items. Net: before+after.
@@ -7856,7 +7885,7 @@ impl CodeWriter {
                                 push_fresh_ref(&mut current_state, &mut graph);
                                 current_depth += 1;
                             }
-                            emit_abort_permanent!();
+                            emit_abort_permanent!(py_pc);
                         }
 
                         // BuildInterpolation: conditionally pops format_spec when (oparg & 1) != 0,
@@ -7874,7 +7903,7 @@ impl CodeWriter {
                             }
                             push_fresh_ref(&mut current_state, &mut graph);
                             current_depth += 1;
-                            emit_abort_permanent!();
+                            emit_abort_permanent!(py_pc);
                         }
 
                         // BuildTemplate: pops 2, pushes 1. Net: -1.
@@ -7884,14 +7913,14 @@ impl CodeWriter {
                             }
                             push_fresh_ref(&mut current_state, &mut graph);
                             current_depth += 1;
-                            emit_abort_permanent!();
+                            emit_abort_permanent!(py_pc);
                         }
 
                         // CallIntrinsic1: pops 1, pushes 1 (result may differ). Net: 0.
                         Instruction::CallIntrinsic1 { .. } => {
                             let _ = current_state.stack.pop();
                             push_fresh_ref(&mut current_state, &mut graph);
-                            emit_abort_permanent!();
+                            emit_abort_permanent!(py_pc);
                         }
 
                         // CallIntrinsic2: variant-dependent stack effect.
@@ -7913,14 +7942,14 @@ impl CodeWriter {
                                     current_depth += 1;
                                 }
                             }
-                            emit_abort_permanent!();
+                            emit_abort_permanent!(py_pc);
                         }
 
                         // GetLen: peeks obj, pushes len. Net: +1.
                         Instruction::GetLen => {
                             push_fresh_ref(&mut current_state, &mut graph);
                             current_depth += 1;
-                            emit_abort_permanent!();
+                            emit_abort_permanent!(py_pc);
                         }
 
                         // LoadSpecial: pops 1 (obj), pushes 2 (callable, self_or_null). Net: +1.
@@ -7931,7 +7960,7 @@ impl CodeWriter {
                             current_depth += 1;
                             push_fresh_ref(&mut current_state, &mut graph);
                             current_depth += 1;
-                            emit_abort_permanent!();
+                            emit_abort_permanent!(py_pc);
                         }
 
                         // LoadFromDictOrGlobals: pops 1 (dict), pushes 1 (result). Net: 0.
@@ -7939,7 +7968,7 @@ impl CodeWriter {
                         Instruction::LoadFromDictOrGlobals { .. } => {
                             let _ = current_state.stack.pop();
                             push_fresh_ref(&mut current_state, &mut graph);
-                            emit_abort_permanent!();
+                            emit_abort_permanent!(py_pc);
                         }
 
                         // LoadFromDictOrDeref: structural adaptation — CPython pops dict,
@@ -7949,7 +7978,7 @@ impl CodeWriter {
                         Instruction::LoadFromDictOrDeref { .. } => {
                             let _ = current_state.stack.pop();
                             push_fresh_ref(&mut current_state, &mut graph);
-                            emit_abort_permanent!();
+                            emit_abort_permanent!(py_pc);
                         }
 
                         // Loads that push +1.
@@ -7960,7 +7989,7 @@ impl CodeWriter {
                         | Instruction::LoadBuildClass => {
                             push_fresh_ref(&mut current_state, &mut graph);
                             current_depth += 1;
-                            emit_abort_permanent!();
+                            emit_abort_permanent!(py_pc);
                         }
 
                         // Pops 1, pushes 1 (net 0). Replace shadow value.
@@ -7971,7 +8000,7 @@ impl CodeWriter {
                         | Instruction::GetYieldFromIter => {
                             let _ = current_state.stack.pop();
                             push_fresh_ref(&mut current_state, &mut graph);
-                            emit_abort_permanent!();
+                            emit_abort_permanent!(py_pc);
                         }
 
                         // Structural adaptation: async opcodes. Pyre's dispatcher
@@ -7980,13 +8009,13 @@ impl CodeWriter {
                         Instruction::GetAiter | Instruction::GetAwaitable { .. } => {
                             let _ = current_state.stack.pop();
                             push_fresh_ref(&mut current_state, &mut graph);
-                            emit_abort_permanent!();
+                            emit_abort_permanent!(py_pc);
                         }
 
                         // StoreDeref: pops 1 value. Net: -1.
                         Instruction::StoreDeref { .. } => {
                             pop_and_decr_depth(&mut current_state, &mut current_depth);
-                            emit_abort_permanent!();
+                            emit_abort_permanent!(py_pc);
                         }
 
                         // Instructions that don't touch the operand stack (locals/cells only).
@@ -7997,14 +8026,14 @@ impl CodeWriter {
                         | Instruction::CopyFreeVars { .. }
                         | Instruction::MakeCell { .. }
                         | Instruction::SetupAnnotations => {
-                            emit_abort_permanent!();
+                            emit_abort_permanent!(py_pc);
                         }
 
                         // ExitInitCheck: no-op in pyre (pyopcode.rs:2069). Net: 0.
                         // RustPython pops the __init__ return value, but pyre's
                         // dispatch is a plain Ok(StepResult::Continue).
                         Instruction::ExitInitCheck => {
-                            emit_abort_permanent!();
+                            emit_abort_permanent!(py_pc);
                         }
 
                         // StoreName pops 1 value from the stack.
@@ -8016,14 +8045,14 @@ impl CodeWriter {
                         Instruction::YieldValue { .. } => {
                             let _ = current_state.stack.pop();
                             push_fresh_ref(&mut current_state, &mut graph);
-                            emit_abort_permanent!();
+                            emit_abort_permanent!(py_pc);
                         }
 
                         // ReturnGenerator: pushes 1. Net: +1.
                         Instruction::ReturnGenerator => {
                             push_fresh_ref(&mut current_state, &mut graph);
                             current_depth += 1;
-                            emit_abort_permanent!();
+                            emit_abort_permanent!(py_pc);
                         }
 
                         // Send: pops sent value, peeks iter, pushes next result. Net: 0.
@@ -8031,7 +8060,7 @@ impl CodeWriter {
                         Instruction::Send { .. } => {
                             let _ = current_state.stack.pop();
                             push_fresh_ref(&mut current_state, &mut graph);
-                            emit_abort_permanent!();
+                            emit_abort_permanent!(py_pc);
                         }
 
                         // Structural adaptation: async opcodes below. Pyre's dispatcher
@@ -8042,7 +8071,7 @@ impl CodeWriter {
                         Instruction::GetAnext => {
                             push_fresh_ref(&mut current_state, &mut graph);
                             current_depth += 1;
-                            emit_abort_permanent!();
+                            emit_abort_permanent!(py_pc);
                         }
 
                         // EndAsyncFor: pops 2. Net: -2.
@@ -8053,7 +8082,7 @@ impl CodeWriter {
                             for _ in 0..2 {
                                 pop_and_decr_depth(&mut current_state, &mut current_depth);
                             }
-                            emit_abort_permanent!();
+                            emit_abort_permanent!(py_pc);
                         }
 
                         // CleanupThrow: pops 3, pushes 1. Net: -2.
@@ -8063,7 +8092,7 @@ impl CodeWriter {
                             }
                             push_fresh_ref(&mut current_state, &mut graph);
                             current_depth += 1;
-                            emit_abort_permanent!();
+                            emit_abort_permanent!(py_pc);
                         }
 
                         // MatchSequence: peeks TOS (subject), pushes bool. Net: +1.
@@ -8071,12 +8100,12 @@ impl CodeWriter {
                         Instruction::MatchSequence => {
                             push_fresh_ref(&mut current_state, &mut graph);
                             current_depth += 1;
-                            emit_abort_permanent!();
+                            emit_abort_permanent!(py_pc);
                         }
 
                         // Catch-all: unknown instruction.
                         _other => {
-                            emit_abort_permanent!();
+                            emit_abort_permanent!(py_pc);
                         }
                     }
                     sync_stack_state(&mut graph, &mut current_state, current_depth);

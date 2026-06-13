@@ -1087,40 +1087,101 @@ impl BlackholeInterpreter {
     pub fn handle_exception_in_frame(&mut self, exc_value: i64) -> bool {
         let code = &self.jitcode.code;
         let mut position = self.position;
-        if position < code.len() {
-            let mut opcode = code[position];
-            if opcode == self.op_live {
-                position += majit_translate::liveness::OFFSET_SIZE + 1;
-                if position >= code.len() {
-                    return false;
-                }
-                opcode = code[position];
-            }
-            if opcode == self.op_catch_exception {
-                self.exception_last_value = exc_value;
-                if position + 2 >= code.len() {
-                    return false;
-                }
-                let target = (code[position + 1] as usize) | ((code[position + 2] as usize) << 8);
-                self.position = target;
-                // blackhole.py:407 parity: once the handler is dispatched the
-                // residual-call TLS slot is stale. Clear it so a subsequent
-                // opcode that reads `BH_LAST_EXC_VALUE` without issuing a new
-                // call can't pick up this already-caught exception.
-                BH_LAST_EXC_VALUE.with(|c| c.set(0));
-                return true;
-            }
-            if opcode == self.op_rvmprof_code {
-                // blackhole.py:412-420: on exception immediately before a
-                // `rvmprof_code/ii`, run the leaving hook and continue
-                // propagating.
-                let leaving = self.registers_i[code[position + 1] as usize];
-                let unique_id = self.registers_i[code[position + 2] as usize];
-                assert_eq!(leaving, 1);
-                self.bhimpl_rvmprof_code(leaving, unique_id);
+        if std::env::var_os("PYRE_51C_DIAG").is_some() {
+            let win: Vec<(usize, u8)> = (position.saturating_sub(8)..(position + 6).min(code.len()))
+                .map(|p| (p, code[p]))
+                .collect();
+            eprintln!(
+                "[51c-diag][handle_exc] pos={} op_catch={} op_live={} window={:?}",
+                position, self.op_catch_exception, self.op_live, win
+            );
+        }
+        if position >= code.len() {
+            return false;
+        }
+        let resume_live_pos = position;
+        if code[position] == self.op_live {
+            position += majit_translate::liveness::OFFSET_SIZE + 1;
+            if position >= code.len() {
+                return false;
             }
         }
+        let opcode = code[position];
+        // Forward case (explicit `raise`, `emit_raise!`): the `catch_exception`
+        // is directly after the resume `-live-` (blackhole.py:396 parity).
+        if opcode == self.op_catch_exception {
+            return self.route_to_catch(position, exc_value);
+        }
+        // Backward case (after-residual-call guard): pyre resumes the post-call
+        // `GUARD_NO_EXCEPTION` at the next opcode's `-live-`
+        // (`pc_map[fallthrough_pc]`, jitcode_dispatch.rs / capture_resumedata),
+        // because the raising op's vable-mirror stores (flatten.rs:1832-1857)
+        // sit between the call's own post-call `-live-` and its
+        // `catch_exception` — there is no Python PC that resolves onto the
+        // catch.  The catch therefore lies BEHIND `resume_live_pos`; scan op
+        // boundaries backward, bounded by the call's own post-call `-live-`,
+        // so only the just-executed opcode's catch can match.
+        if let Some(catch_pos) = self.find_catch_before_resume_live(resume_live_pos) {
+            return self.route_to_catch(catch_pos, exc_value);
+        }
+        if opcode == self.op_rvmprof_code {
+            // blackhole.py:412-420: on exception immediately before a
+            // `rvmprof_code/ii`, run the leaving hook and continue
+            // propagating.
+            let leaving = self.registers_i[code[position + 1] as usize];
+            let unique_id = self.registers_i[code[position + 2] as usize];
+            assert_eq!(leaving, 1);
+            self.bhimpl_rvmprof_code(leaving, unique_id);
+        }
         false
+    }
+
+    /// Dispatch the in-frame `catch_exception/L` at `catch_pos`: stash the
+    /// exception in `exception_last_value`, jump to the handler label, and
+    /// clear the residual-call TLS slot (blackhole.py:407 parity — once the
+    /// handler runs, a later opcode reading `BH_LAST_EXC_VALUE` without
+    /// issuing a new call must not pick up this already-caught exception).
+    fn route_to_catch(&mut self, catch_pos: usize, exc_value: i64) -> bool {
+        let code = &self.jitcode.code;
+        if catch_pos + 2 >= code.len() {
+            return false;
+        }
+        let target = (code[catch_pos + 1] as usize) | ((code[catch_pos + 2] as usize) << 8);
+        self.exception_last_value = exc_value;
+        self.position = target;
+        BH_LAST_EXC_VALUE.with(|c| c.set(0));
+        true
+    }
+
+    /// Locate the `catch_exception` op that belongs to the just-executed
+    /// opcode whose post-call guard resumed at `resume_live_pos` (the next
+    /// opcode's `-live-`).  Scans op boundaries (the jitcode's `startpoints`)
+    /// strictly before `resume_live_pos`, newest first, and stops at the
+    /// first `-live-` — that is the call's own post-call `-live-`, so the only
+    /// `catch_exception` that can match sits inside this opcode's expansion.
+    /// Returns `None` (propagate) when the opcode raised outside any
+    /// try-block (no `catch_exception` was emitted for it).
+    fn find_catch_before_resume_live(&self, resume_live_pos: usize) -> Option<usize> {
+        let code = &self.jitcode.code;
+        let startpoints = self.jitcode.startpoints.as_ref()?;
+        let mut points: Vec<usize> = startpoints
+            .iter()
+            .copied()
+            .filter(|&q| q < resume_live_pos)
+            .collect();
+        points.sort_unstable_by(|a, b| b.cmp(a));
+        for q in points {
+            let op = code[q];
+            if op == self.op_catch_exception {
+                return Some(q);
+            }
+            if op == self.op_live {
+                // The call's own post-call `-live-`: bound the scan here so a
+                // preceding opcode's catch can never be mis-selected.
+                return None;
+            }
+        }
+        None
     }
 
     /// blackhole.py:424-439 handle_rvmprof_enter.
