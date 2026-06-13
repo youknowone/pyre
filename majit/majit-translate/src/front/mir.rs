@@ -582,19 +582,6 @@ fn derive_program_metadata(
                     enum_variant_by_discriminant.insert(leaf, by_discr);
                 }
             }
-            TypeDeclKind::Opaque if name == "rustpython_compiler_core::bytecode::oparg::OpArg" => {
-                // `pub struct OpArg(u32)` (oparg.rs:57) — the decl body
-                // is external to the extraction, but the word field is
-                // the one payload the devirtualized accessor family
-                // reads (`Lowering::bytecode_accessor_devirt`), so the
-                // row is synthesized from the documented upstream
-                // definition.
-                let rows = vec![("__pos_0".to_string(), "u32".to_string())];
-                struct_fields.fields.insert(name.clone(), rows.clone());
-                struct_fields.fields.insert("OpArg".to_string(), rows);
-                known_struct_names.insert(name);
-                known_struct_names.insert("OpArg".to_string());
-            }
             TypeDeclKind::Alias(_) | TypeDeclKind::Opaque | TypeDeclKind::Unknown => {}
         }
     }
@@ -3067,41 +3054,6 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
-                // Opaque `rustpython_compiler_core::bytecode` oparg
-                // accessors — `Arg<T>::get(self, arg)` is
-                // `T::try_from(u32::from(arg))` (instruction.rs:1286-
-                // 1292) and the `oparg` conversions are word-level
-                // numeric, so in the lifted model each reduces to the
-                // `OpArg(u32)` word read or to its argument.
-                if let Some(acc) = self.bytecode_accessor_devirt(&reg, args.len()) {
-                    match acc {
-                        BytecodeAccessor::OpArgWord(i) => {
-                            let res = self
-                                .graph
-                                .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-                            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-                                result: Some(res.clone()),
-                                kind: OpKind::FieldRead {
-                                    base: args[i].clone(),
-                                    field: FieldDescriptor::new(
-                                        "__pos_0".to_string(),
-                                        Some("OpArg".to_string()),
-                                    ),
-                                    ty: ValueType::Int,
-                                    pure: false,
-                                },
-                            });
-                            self.local_var[dest_local] = Some(res);
-                        }
-                        BytecodeAccessor::Identity(i) => {
-                            self.local_var[dest_local] = Some(args[i].clone());
-                        }
-                    }
-                    let target_bb = self.block_id[target];
-                    let link_args = self.edge_args(mir_bb, target)?;
-                    self.graph.set_goto(bb_id, target_bb, link_args);
-                    return Ok(());
-                }
                 // `usize::try_from(x).expect(…)` where `x` is u8/u16/
                 // u32 — a widening conversion that cannot fail on the
                 // 64-bit targets pyre supports, routed through the
@@ -3508,57 +3460,6 @@ impl<'a> Lowering<'a> {
         self.llbc
             .fn_by_id(*id)
             .is_some_and(|fd| fd.item_meta.name_path() == "core::result::<Impl>::expect")
-    }
-
-    /// Classify a call to one of the opaque
-    /// `rustpython_compiler_core::bytecode` oparg accessors.  The
-    /// external crate's bodies are Opaque in the LLBC; their
-    /// documented definitions are word-level numeric:
-    ///
-    /// - `Arg<T>::get(self, arg: OpArg) -> T` is
-    ///   `T::try_from(u32::from(arg)).unwrap()` (instruction.rs:1286-
-    ///   1292) — the ZST marker receiver carries nothing; the result
-    ///   is `arg`'s `u32` word.
-    /// - `u32::from(OpArg)` / `OpArg::as_usize` read the same word
-    ///   (`pub struct OpArg(u32)`, oparg.rs:57).
-    /// - the remaining `oparg` `From` impls (`u32::from(RaiseKind)`
-    ///   etc.) and `as_usize` on word-sized newtypes (`Label`,
-    ///   `VarNum`) are numeric identity on an argument the lifted
-    ///   model already carries as an integer.
-    ///
-    /// Packed-word extractors (`idx_1` / `idx_2` / `is_method` /
-    /// `name_idx`) and `OpArgState::get` are NOT identities and are
-    /// left as ordinary calls.
-    fn bytecode_accessor_devirt(
-        &self,
-        reg: &RegularCall,
-        nargs: usize,
-    ) -> Option<BytecodeAccessor> {
-        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
-            return None;
-        };
-        let fd = self.llbc.fn_by_id(*id)?;
-        match fd.item_meta.name_path().as_str() {
-            "rustpython_compiler_core::bytecode::instruction::<Impl>::get" if nargs == 2 => {
-                Some(BytecodeAccessor::OpArgWord(1))
-            }
-            "rustpython_compiler_core::bytecode::oparg::<Impl>::as_usize"
-            | "rustpython_compiler_core::bytecode::oparg::<Impl>::from"
-                if nargs == 1 =>
-            {
-                let is_oparg = fd
-                    .signature
-                    .inputs
-                    .first()
-                    .is_some_and(|t| tyref_is_oparg_adt(t, self.llbc));
-                Some(if is_oparg {
-                    BytecodeAccessor::OpArgWord(0)
-                } else {
-                    BytecodeAccessor::Identity(0)
-                })
-            }
-            _ => None,
-        }
     }
 
     /// Devirtualize a callsite of the blanket
@@ -4845,15 +4746,6 @@ fn tyref_is_string_adt(ty: &TyRef, llbc: &Llbc) -> bool {
         .is_some_and(|td| td.item_meta.name_path() == "alloc::string::String")
 }
 
-/// How a devirtualized opaque bytecode oparg accessor binds its
-/// destination — see [`Lowering::bytecode_accessor_devirt`].
-enum BytecodeAccessor {
-    /// Read the `OpArg(u32)` word of the argument at this index.
-    OpArgWord(usize),
-    /// Alias the argument at this index (word-level numeric identity).
-    Identity(usize),
-}
-
 /// The qualified declaration path of a `TyRef`'s base ADT, after
 /// stripping `Ref` / hash-cons wrappers.  `None` for non-ADT types.
 fn adt_path_of_tyref(ty: &TyRef, llbc: &Llbc) -> Option<String> {
@@ -4868,19 +4760,12 @@ fn adt_path_of_tyref(ty: &TyRef, llbc: &Llbc) -> Option<String> {
 /// (PhantomData<T>)`, instruction.rs:1262).  The external decl is
 /// Opaque in the LLBC, so a payload row spelled through it would
 /// project to an attr the annotator cannot type; the lifted model
-/// carries the marker as a plain integer instead (its only consumer,
-/// `Arg::get`, is devirtualized by [`Lowering::bytecode_accessor_devirt`]
-/// and never reads it).
+/// carries the marker as a plain integer instead.  Its consumer
+/// `Arg::get` keeps its ordinary (residual) call lowering — the ZST
+/// marker is never dereferenced.
 fn tyref_is_bytecode_arg_marker(ty: &TyRef, llbc: &Llbc) -> bool {
     adt_path_of_tyref(ty, llbc)
         .is_some_and(|p| p == "rustpython_compiler_core::bytecode::instruction::Arg")
-}
-
-/// `OpArg` from `rustpython_compiler_core::bytecode::oparg` —
-/// `pub struct OpArg(u32)` (oparg.rs:57), Opaque in the LLBC.
-fn tyref_is_oparg_adt(ty: &TyRef, llbc: &Llbc) -> bool {
-    adt_path_of_tyref(ty, llbc)
-        .is_some_and(|p| p == "rustpython_compiler_core::bytecode::oparg::OpArg")
 }
 
 /// The ADT def_id of an (already wrapper-stripped) type node, or
