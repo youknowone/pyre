@@ -2515,6 +2515,23 @@ impl<'a> Lowering<'a> {
             // those as constants; a synthetic 0-arg call would invent a
             // callable that neither Rust nor RPython has.
             PlaceKind::Global { id, .. } => {
+                // A `NamedConst` (Rust `const`, not `static`) has no
+                // address — the value is inlined at every use site.
+                // Charon still emits a `Global` read, so fold the
+                // trivial literal initializer to a constant rather than
+                // calling a non-existent accessor.  Statics keep the
+                // address/`FunctionPath` path.
+                if let Some(const_op) = self.fold_named_const_global(id) {
+                    let res = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    let bb_id = self.block_id[mir_bb];
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(res.clone()),
+                        kind: const_op,
+                    });
+                    return Ok(res);
+                }
                 let segments = self.global_segments(mir_bb, id)?;
                 let op = self
                     .static_addr_op(&segments)
@@ -2739,6 +2756,68 @@ impl<'a> Lowering<'a> {
                     "bb{mir_bb}: Place::Global references unknown GlobalDecl id {def_id}"
                 ))
             })
+    }
+
+    /// Fold a `NamedConst` global (Rust `const`) whose initializer is a
+    /// single literal assignment to its `ConstInt` / `ConstBool` /
+    /// `ConstFloat` value.  `None` for statics (`global_kind` ≠
+    /// `NamedConst`), absent initializers, or any non-trivial init body
+    /// (a computed const keeps the accessor path so it is not
+    /// mis-evaluated here).
+    fn fold_named_const_global(&self, def_id: u64) -> Option<OpKind> {
+        let gd = self.llbc.global_by_id(def_id)?;
+        if gd
+            .rest
+            .get("global_kind")
+            .and_then(serde_json::Value::as_str)
+            != Some("NamedConst")
+        {
+            return None;
+        }
+        let init_id = gd.rest.get("init")?.as_u64()?;
+        let init = self.llbc.fn_by_id(init_id)?;
+        let body = init.unstructured()?;
+        // The initializer must be exactly one literal assignment to the
+        // return local (`_0 = const <lit>`); anything else (arithmetic,
+        // calls, multiple assigns) is a computed const left to the
+        // accessor path.
+        let mut found: Option<&serde_json::Value> = None;
+        for blk in &body.body {
+            for st in &blk.statements {
+                let Some(assign) = st.kind.get("Assign").and_then(|a| a.as_array()) else {
+                    continue;
+                };
+                let is_local0 = assign
+                    .first()
+                    .and_then(|p| p.get("kind"))
+                    .and_then(|k| k.get("Local"))
+                    .and_then(serde_json::Value::as_u64)
+                    == Some(0);
+                let lit = assign
+                    .get(1)
+                    .and_then(|rv| rv.get("Use"))
+                    .and_then(|u| u.get("Const"))
+                    .and_then(|c| c.get("kind"))
+                    .and_then(|k| k.get("Literal"));
+                match lit {
+                    Some(l) if is_local0 => {
+                        if found.is_some() {
+                            return None;
+                        }
+                        found = Some(l);
+                    }
+                    // A non-literal write to _0 (computed const) — bail.
+                    _ if is_local0 => return None,
+                    _ => {}
+                }
+            }
+        }
+        match decode_literal(found?).ok()? {
+            DecodedConst::Int(n) => Some(OpKind::ConstInt(n)),
+            DecodedConst::Bool(b) => Some(OpKind::ConstBool(b)),
+            DecodedConst::Float(bits) => Some(OpKind::ConstFloat(bits)),
+            _ => None,
+        }
     }
 
     fn static_addr_op(&self, segments: &[String]) -> Option<OpKind> {
