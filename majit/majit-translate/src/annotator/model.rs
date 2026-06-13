@@ -2948,16 +2948,23 @@ pub fn union(s1: &SomeValue, s2: &SomeValue) -> Result<SomeValue, UnionError> {
         // keeps only flags that agree on both sides.
         (SomeValue::Instance(a), SomeValue::Instance(b)) => {
             let can_be_none = a.can_be_none || b.can_be_none;
+            // binaryop.py unions two SomeInstances through
+            // `commonbase(classdef1, classdef2)`.  Upstream always
+            // finds a base because every annotated class roots at
+            // `object`; pyre's flat Rust W_-structs carry no
+            // synthesized `object`/`W_Root` root, so `commonbase`
+            // legitimately yields None for correct code (e.g.
+            // `normalize_slice` / `w_range_getitem` merging
+            // differently-narrowed PyObjectRefs at a join).  The
+            // runtime value there is a generic PyObjectRef, modelled
+            // exactly by the classdef-less top instance
+            // `SomeInstance(None)` — the same annotation the `(None, _)`
+            // arm produces and the rtyper already lowers — so widen to
+            // it instead of raising the "no common base" UnionError that
+            // a rooted hierarchy can never reach here.
             let merged_classdef = match (&a.classdef, &b.classdef) {
-                (None, _) | (_, None) => Some(None),
-                (Some(ca), Some(cb)) => ClassDef::commonbase(ca, cb).map(Some),
-            };
-            let Some(merged_classdef) = merged_classdef else {
-                return Err(UnionError {
-                    lhs: s1.clone(),
-                    rhs: s2.clone(),
-                    msg: "RPython cannot unify instances with no common base class".into(),
-                });
+                (Some(ca), Some(cb)) => ClassDef::commonbase(ca, cb),
+                _ => None,
             };
             let mut flags = a.flags.clone();
             flags.retain(|key, value| b.flags.get(key) == Some(value));
@@ -4564,21 +4571,6 @@ mod tests {
     }
 
     #[test]
-    fn union_distinct_classdef_instances_errors() {
-        let a = SomeValue::Instance(SomeInstance::new(
-            Some(ClassDef::new_standalone("pkg.A", None)),
-            false,
-            std::collections::BTreeMap::new(),
-        ));
-        let b = SomeValue::Instance(SomeInstance::new(
-            Some(ClassDef::new_standalone("pkg.B", None)),
-            false,
-            std::collections::BTreeMap::new(),
-        ));
-        assert!(union(&a, &b).is_err());
-    }
-
-    #[test]
     fn union_instance_uses_common_base_classdef() {
         let base = ClassDef::new_standalone("pkg.Base", None);
         let sub = ClassDef::new_standalone("pkg.Sub", Some(&base));
@@ -4612,6 +4604,29 @@ mod tests {
             std::collections::BTreeMap::new(),
         ));
         let u = union(&a, &b).unwrap();
+        let SomeValue::Instance(inst) = u else {
+            panic!("expected SomeInstance");
+        };
+        assert!(inst.classdef.is_none());
+    }
+
+    #[test]
+    fn union_instances_with_no_common_base_widens_to_object() {
+        // Two standalone classes share no base.  RPython's rooted
+        // hierarchy never hits this (everything roots at `object`);
+        // pyre's flat W_-structs do, so the union widens to the
+        // classdef-less top instance rather than raising UnionError.
+        let a = SomeValue::Instance(SomeInstance::new(
+            Some(ClassDef::new_standalone("pkg.A", None)),
+            false,
+            std::collections::BTreeMap::new(),
+        ));
+        let b = SomeValue::Instance(SomeInstance::new(
+            Some(ClassDef::new_standalone("pkg.B", None)),
+            false,
+            std::collections::BTreeMap::new(),
+        ));
+        let u = union(&a, &b).expect("no-common-base instances must widen, not error");
         let SomeValue::Instance(inst) = u else {
             panic!("expected SomeInstance");
         };
