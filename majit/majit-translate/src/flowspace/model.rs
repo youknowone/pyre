@@ -1628,6 +1628,17 @@ impl HostEnv {
         for name in ["object.__init__"] {
             self.insert_builtin(name, HostObject::new_builtin_callable(name));
         }
+        // Pyre-internal front-end pointer-downcast narrow (#298): the
+        // frontend lowers `obj as *const RegisteredStruct` to a
+        // `simple_call` against this stub so the classdef-less pointer
+        // narrows to `SomeInstance(root)` and a field read on the pointee
+        // resolves.  Its analyzer (annotator/builtin.rs) keys on this
+        // qualname and its typer (rtyper/rbuiltin.rs) keys on this same
+        // singleton Arc, so the binding must live in HOST_ENV.
+        self.insert_builtin(
+            "__pyre_cast_instance",
+            HostObject::new_builtin_callable("__pyre_cast_instance"),
+        );
     }
 
     fn bootstrap_std_modules(&mut self) {

@@ -217,6 +217,11 @@ fn install_default_typers(map: &mut HashMap<HostObject, BuiltinTyperFn>) {
         ("hasattr", rtype_builtin_hasattr),
         // rbuiltin.py:264-267
         ("object.__init__", rtype_object__init__),
+        // Pyre-internal front-end pointer-downcast narrow (#298).  Keyed
+        // by the `__pyre_cast_instance` HOST_ENV singleton (same Arc the
+        // adapter resolves the call's callable to), lowers to a
+        // `cast_pointer` into the narrowed `InstanceRepr`.
+        ("__pyre_cast_instance", rtype_pyre_cast_instance),
     ];
     for (name, typer) in entries {
         if let Some(host) = HOST_ENV.lookup_builtin(name) {
@@ -3167,6 +3172,34 @@ pub fn rtype_cast_int_to_ptr(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>
     let vlist = hop.inputargs(vec![ConvertedTo::LowLevelType(&LowLevelType::Signed)])?;
     hop.exception_cannot_occur()?;
     Ok(hop.genop("cast_int_to_ptr", vlist, GenopResult::LLType(result_lltype)))
+}
+
+/// `__pyre_cast_instance` typer — front-end pointer-downcast narrow
+/// (#298).  The annotator typed the result as `SomeInstance(root)`, so
+/// `hop.r_result` is the target `InstanceRepr`; lower the call to a
+/// `cast_pointer` of the pointer operand to that lowleveltype.  This
+/// mirrors `pairtype(InstanceRepr, InstanceRepr).convert_from_to`
+/// (rclass.py:1035) — the same `genop('cast_pointer', [v],
+/// resulttype=r_ins2.lowleveltype)` it emits for the `r_ins1.classdef is
+/// None` (classdef-less → concrete) arm.  `args[0]` is the pointer
+/// operand; `args[1]` is the constant root name (read by the annotator,
+/// unused here — it carries no runtime value).
+pub fn rtype_pyre_cast_instance(
+    hop: &HighLevelOp,
+    _kwds_i: &HashMap<String, usize>,
+) -> RTypeResult {
+    use crate::translator::rtyper::rtyper::GenopResult;
+
+    let r_result = hop
+        .r_result
+        .borrow()
+        .as_ref()
+        .cloned()
+        .ok_or_else(|| TyperError::message("rtype_pyre_cast_instance: missing r_result"))?;
+    let result_lltype = r_result.lowleveltype().clone();
+    let v_ptr = hop.args_v.borrow()[0].clone();
+    hop.exception_cannot_occur()?;
+    Ok(hop.genop("cast_pointer", vec![v_ptr], GenopResult::LLType(result_lltype)))
 }
 
 #[cfg(test)]

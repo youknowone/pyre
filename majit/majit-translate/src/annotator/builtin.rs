@@ -333,6 +333,13 @@ fn register_builtins() -> HashMap<String, BuiltinAnalyzer> {
     // `usize` lattice as `size_of`; called by `object_array.rs` /
     // `pyframe.rs`.
     analyzer_for(&mut reg, "std.mem.align_of", std_mem_align_of);
+    // `__pyre_cast_instance` — front-end pointer-downcast narrow (#298).
+    // `obj as *const RegisteredStruct` lowers to a simple_call against
+    // this stub so the classdef-less pointer narrows to
+    // `SomeInstance(root)` and a field read on the pointee resolves.
+    // Keyed by the qualname `flowspace/model.rs`'s HOST_ENV bootstrap
+    // assigns (which also keys the `BUILTIN_TYPER` entry on the same Arc).
+    analyzer_for(&mut reg, "__pyre_cast_instance", pyre_cast_instance);
     // Rust `String::new()` / `String::with_capacity(n)` construct an empty
     // owned UTF-8 buffer; both annotate as a mutable `SomeString` so the
     // `String.new` / `String.with_capacity` HOST_ENV stubs do not reach the
@@ -1289,6 +1296,47 @@ pub fn std_mem_align_of(
     kwds: &HashMap<String, Option<SomeValue>>,
 ) -> Result<SomeValue, AnnotatorError> {
     std_mem_size_of(bk, args_s, kwds)
+}
+
+/// Analyzer for `__pyre_cast_instance` — the front-end pointer-downcast
+/// narrow (#298).  `front::mir` aliases the classdef-less pointer for a
+/// same-bank `obj as *const RegisteredStruct` cast, so a field read on
+/// the pointee blocks on a classdef-less `SomeInstance` (unaryop.rs
+/// getattr arm).  The frontend instead lowers such a cast to
+/// `simple_call(__pyre_cast_instance, operand)`, stashing the target
+/// struct root in the `FunctionPath`; `flowspace_adapter` reconstructs
+/// the root as a trailing `ByteStr` constant arg (the `Vec<Variable>`
+/// arg carrier cannot hold a `Constant`).  The result is
+/// `SomeInstance(classdef)` for that root so the field read resolves;
+/// the rtyper lowers the call to a `cast_pointer` (rclass
+/// `pairtype(InstanceRepr, InstanceRepr).convert_from_to`,
+/// rclass.py:1035 — its `r_ins1.classdef is None` arm already emits the
+/// root→concrete cast).  `args[0]` is the pointer operand; `args[1]` is
+/// the constant root name.
+pub fn pyre_cast_instance(
+    bk: &Rc<Bookkeeper>,
+    args_s: &[Option<SomeValue>],
+    _kwds: &HashMap<String, Option<SomeValue>>,
+) -> Result<SomeValue, AnnotatorError> {
+    let root = match args_s
+        .get(1)
+        .and_then(|o| o.as_ref())
+        .and_then(|sv| sv.const_())
+        .and_then(|c| c.as_pystr())
+    {
+        Some(s) => s.to_string(),
+        None => {
+            return Err(AnnotatorError::new(
+                "__pyre_cast_instance: target struct root must be a constant string",
+            ));
+        }
+    };
+    let classdef = bk.getuniqueclassdef_for_struct_root(&root)?;
+    Ok(SomeValue::Instance(super::model::SomeInstance::new(
+        Some(classdef),
+        false,
+        std::collections::BTreeMap::new(),
+    )))
 }
 
 /// Analyzer for `String::new()` / `String::with_capacity(n)`.  Both

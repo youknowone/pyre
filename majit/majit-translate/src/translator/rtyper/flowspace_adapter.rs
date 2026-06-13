@@ -1230,6 +1230,40 @@ pub fn translate_op(
                         call_args.extend(arg_hls);
                         return Ok(vec![FlowspaceOp::new("simple_call", call_args, result)]);
                     }
+                    // `__pyre_cast_instance` — front-end pointer-downcast
+                    // narrow (#298).  `front::mir` emits a synthetic
+                    // `Call(["__pyre_cast_instance", <root>], [operand])`
+                    // for `obj as *const RegisteredStruct`, stashing the
+                    // target struct root in `segments[1]` because the
+                    // `Vec<Variable>` arg carrier cannot hold a `Constant`
+                    // (same carrier limitation as the Branch-3c
+                    // `simple_call(<exc class>)` reconstruction below).
+                    // Reconstruct it here as `simple_call(callable,
+                    // operand, Constant(root))`: the analyzer reads the
+                    // trailing `ByteStr` root to type the result
+                    // `SomeInstance(root)`, and the typer lowers the call
+                    // to a `cast_pointer`.  The callable resolves through
+                    // the `__pyre_cast_instance` HOST_ENV singleton so its
+                    // Arc identity matches the `BUILTIN_TYPER` key.
+                    if segments.len() == 2 && segments[0] == "__pyre_cast_instance" {
+                        let callable_host =
+                            HOST_ENV.lookup_builtin("__pyre_cast_instance").ok_or_else(|| {
+                                TyperError::message(
+                                    "__pyre_cast_instance missing from HOST_ENV bootstrap"
+                                        .to_string(),
+                                )
+                            })?;
+                        let callable = Hlvalue::Constant(Constant::new(ConstValue::HostObject(
+                            callable_host,
+                        )));
+                        let mut call_args = Vec::with_capacity(arg_hls.len() + 2);
+                        call_args.push(callable);
+                        call_args.extend(arg_hls);
+                        call_args.push(Hlvalue::Constant(Constant::new(ConstValue::byte_str(
+                            &segments[1],
+                        ))));
+                        return Ok(vec![FlowspaceOp::new("simple_call", call_args, result)]);
+                    }
                     // `<[T]>::len(slice)` — the slice-receiver `.len()`
                     // method call.  Rust lowers `slice.len()` to a MIR
                     // call to `core::slice::<impl [T]>::len`, not to the

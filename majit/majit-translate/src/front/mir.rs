@@ -2131,22 +2131,32 @@ impl<'a> Lowering<'a> {
                             }
                             // Same bank (or a bank pair with no host cast
                             // callable): alias the operand — except a
-                            // ptr→ptr cast onto a monomorphic-ADT
-                            // pointee, which is the upstream instance
-                            // downcast `cast_pointer(PTRTYPE, p)`;
-                            // surface it for the annotator (jtransform
-                            // re-aliases, see
-                            // [`cast_pointer_marker_op`]).
+                            // ptr→ptr cast to a registered struct root,
+                            // which narrows to `SomeInstance(root)` so a
+                            // field read on the pointee resolves (#298;
+                            // see the `Rvalue::Cast` arm for the full
+                            // rationale).
                             None => {
-                                if matches!(dst_kind, ValueType::Ref(_))
-                                    && matches!(src_kind, Some(ValueType::Ref(_)))
+                                if let ValueType::Ref(_) = dst_kind
                                     && let Some(root) =
-                                        cast_ptr_target_class_root(dest_ty, self.llbc)
+                                        tyref_class_root(dest_ty, self.llbc)
                                 {
                                     let res = self.graph.alloc_value_var_with_type(
                                         crate::model::ConcreteType::Unknown,
                                     );
-                                    (Some(cast_pointer_marker_op(root, arg)), res)
+                                    (
+                                        Some(OpKind::Call {
+                                            target: CallTarget::FunctionPath {
+                                                segments: vec![
+                                                    "__pyre_cast_instance".to_string(),
+                                                    root.clone(),
+                                                ],
+                                            },
+                                            args: vec![arg],
+                                            result_ty: ValueType::Ref(Some(root)),
+                                        }),
+                                        res,
+                                    )
                                 } else {
                                     (None, arg)
                                 }
@@ -2236,21 +2246,36 @@ impl<'a> Lowering<'a> {
             // so reuse the alias path: the cast result Variable is the
             // same as the operand Variable. `as` casts that do not
             // change the JIT-visible kind collapse this way.
-            // Exception: a `RawPtr` cast onto a monomorphic-ADT
-            // pointee (`obj as *const W_Foo`) is the upstream instance
-            // downcast `cast_pointer(PTRTYPE, p)` — surface it as the
-            // `__cast_pointer/<Root>` marker so the annotator types
-            // the result; jtransform re-aliases it (see
-            // [`cast_pointer_marker_op`]).
-            Rvalue::Cast(kind, operand, ty) => {
+            Rvalue::Cast(_kind, operand, ty) => {
                 let v = self.resolve_operand(mir_bb, operand)?;
-                if cast_kind_is_raw_ptr(&kind)
-                    && let Some(root) = cast_ptr_target_class_root(&ty, self.llbc)
+                // #298: a same-bank ptr→ptr cast to a registered struct
+                // root (`obj as *const W_CodeObject`) keeps the i64
+                // pointer carrier in place, so it would alias like above
+                // — but the result is then read like an instance of that
+                // struct (`(*p).code_ptr`), and aliasing leaves the
+                // pointer classdef-less so the field read blocks at the
+                // annotator getattr arm.  `tyref_class_root` returns
+                // `Some` only for a named-ADT pointee (None for
+                // primitives / builtin containers / generics / multi-impl
+                // type-vars), so emit a `__pyre_cast_instance` narrow
+                // whose annotator types the result `SomeInstance(root)`
+                // and whose typer folds to a `cast_pointer`.
+                if let ValueType::Ref(_) = tyref_to_value_type(&ty, self.llbc)
+                    && let Some(root) = tyref_class_root(&ty, self.llbc)
                 {
                     let res = self
                         .graph
                         .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-                    return Ok((Some(cast_pointer_marker_op(root, v)), res));
+                    return Ok((
+                        Some(OpKind::Call {
+                            target: CallTarget::FunctionPath {
+                                segments: vec!["__pyre_cast_instance".to_string(), root.clone()],
+                            },
+                            args: vec![v],
+                            result_ty: ValueType::Ref(Some(root)),
+                        }),
+                        res,
+                    ));
                 }
                 Ok((None, v))
             }
