@@ -2749,6 +2749,42 @@ impl<'a> Lowering<'a> {
                     return Ok(res);
                 }
                 let segments = self.global_segments(mir_bb, id)?;
+                // A `PyType` singleton static (`&SLICE_TYPE`): narrow the
+                // raw address through `__pyre_cast_instance["PyType"]` so
+                // the read types `SomeInstance("PyType")`, matching the
+                // `(*obj).ob_type` field-read.  The bare `ConstInt` address
+                // would pair `IntegerRepr` against that field's
+                // `InstanceRepr` and block `rtype_is_` on the
+                // `ob_type == &TYPE` pointer-identity chain — the same
+                // narrow `obj as *const RegisteredStruct` already uses
+                // (#298).
+                if let Some(addr) = self.pytype_static_addr(&segments) {
+                    let bb_id = self.block_id[mir_bb];
+                    let raw = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(raw.clone()),
+                        kind: OpKind::ConstRefAddr(addr),
+                    });
+                    let res = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(res.clone()),
+                        kind: OpKind::Call {
+                            target: CallTarget::FunctionPath {
+                                segments: vec![
+                                    "__pyre_cast_instance".to_string(),
+                                    "PyType".to_string(),
+                                ],
+                            },
+                            args: vec![raw],
+                            result_ty: ValueType::Ref(Some("PyType".to_string())),
+                        },
+                    });
+                    return Ok(res);
+                }
                 let op = self
                     .static_addr_op(&segments)
                     .or_else(|| self.const_eval_global(id))
@@ -3043,17 +3079,33 @@ impl<'a> Lowering<'a> {
     fn static_addr_op(&self, segments: &[String]) -> Option<OpKind> {
         let full = segments.join("::");
         let stripped = strip_crate_prefix(&full);
-        for (key, addr) in self.static_addrs.pytypes {
-            if static_key_matches(&full, &stripped, key) {
-                return Some(OpKind::ConstInt(*addr));
-            }
-        }
         for (key, addr) in self.static_addrs.refs {
             if static_key_matches(&full, &stripped, key) {
                 return Some(OpKind::ConstRefAddr(*addr));
             }
         }
         None
+    }
+
+    /// Address of a `pytypes`-bucket host static — a `PyType` singleton
+    /// (`&SLICE_TYPE`, `&INT_TYPE`, …).  The `Global` reader lowers these
+    /// to a `__pyre_cast_instance["PyType"]` narrow of the raw address
+    /// (a typed instance pointer) rather than the bare `ConstInt` the
+    /// `refs` siblings avoid: a `PyType` static is the same kind of value
+    /// as the `(*obj).ob_type` field-read it is compared against, so it
+    /// must type `SomeInstance("PyType")` for `rtype_is_` (pointer
+    /// identity) to lower the `ob_type == &TYPE` chain
+    /// (`is_slice` / `is_cell` / `is_range`).  `jit_static_pytype_addrs`
+    /// puts only `PyType` statics in this bucket, so the root is always
+    /// `"PyType"`.
+    fn pytype_static_addr(&self, segments: &[String]) -> Option<i64> {
+        let full = segments.join("::");
+        let stripped = strip_crate_prefix(&full);
+        self.static_addrs
+            .pytypes
+            .iter()
+            .find(|(key, _)| static_key_matches(&full, &stripped, key))
+            .map(|(_, addr)| *addr)
     }
 
     /// Evaluate a global's initializer to its literal when the body is
