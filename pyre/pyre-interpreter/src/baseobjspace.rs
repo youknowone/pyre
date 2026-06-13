@@ -642,6 +642,12 @@ pub fn is_true(obj: PyObjectRef) -> bool {
         if is_str(obj) {
             return w_str_len(obj) != 0;
         }
+        if pyre_object::is_bytes(obj) {
+            return pyre_object::w_bytes_len(obj) != 0;
+        }
+        if pyre_object::is_bytearray(obj) {
+            return pyre_object::w_bytearray_len(obj) != 0;
+        }
         if is_list(obj) {
             return w_list_len(obj) > 0;
         }
