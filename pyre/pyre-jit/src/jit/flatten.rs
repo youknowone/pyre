@@ -9483,6 +9483,8 @@ mod tests {
             getattr_fn_idx: 0,
             load_attr_fn_idx: 91,
             load_method_self_fn_idx: 92,
+            load_name_fn_idx: 93,
+            store_name_fn_idx: 94,
         };
         let code_const = Constant::new(
             super::super::flow::ConstantValue::Signed(0x2000),

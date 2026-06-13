@@ -1056,6 +1056,20 @@ pub enum DispatchError {
     /// own-portal callee frame is registered as the standard virtualizable
     /// (a perf follow-up).
     NonStandardVableFinishPortalUnsupported { pc: usize },
+    /// A residual call to a pure-Python callee that is inline-eligible
+    /// (plain, exact-positional, closure-free, not recursion-bound) but
+    /// whose body is NOT a straight-line leaf — it carries an internal loop
+    /// or branch (`goto_if_not` / `switch`) or a non-static `vable` op, so
+    /// the fast-path register-seeding inline (`try_walker_inline_user_call`)
+    /// declines.  Emitting the residual leaves the callee re-interpreted per
+    /// iteration (and its short inner loops compile + deopt-storm), strictly
+    /// slower than interpreting.  The trait tracer inlines such callees via
+    /// `push_inline_frame` + the `recursive-call-assembler` loop back-edge
+    /// (`metainterp.rs` opimpl_recursive_call_assembler).  Surface a typed
+    /// abort so the key routes to the trait leg (`FBW_DECLINED_KEYS`) until
+    /// the walker itself covers loop-callee inlining (task #62, the Phase-6
+    /// convergence).
+    LoopBearingCalleeInlineUnsupported { pc: usize },
 }
 
 /// Walk one opcode at `pc` and return the dispatch outcome plus the
@@ -7170,11 +7184,24 @@ fn try_walker_inline_user_call(
     // residual_call args).  A callee that materializes a frame — any
     // `*_vable_*` op, emitted when a local must survive a sub-call —
     // reads from the unseeded frame box; inlining it would abort the
-    // *whole* enclosing trace with `VableBoxNotSeeded`.  Decline such
-    // callees (and the zero-param case) so the call lowers to an ordinary
-    // residual call rather than aborting (orthodox non-inlinable path).
-    if nparams == 0 || !callee_fast_path_inlinable(body.code, callee_descr_refs, ctx) {
+    // *whole* enclosing trace with `VableBoxNotSeeded`.
+    //
+    // The zero-param case lowers to an ordinary residual call (orthodox
+    // non-inlinable path); a residual zero-arg call is cheap and the trait
+    // leg has no positional-arg inline win to recover.
+    if nparams == 0 {
         return Ok(None);
+    }
+    // A param-bearing Python callee that is otherwise inline-eligible but
+    // whose body is not a straight-line leaf (loop / branch / non-static
+    // vable) cannot be served by the fast-path register seeding.  Emitting
+    // the residual leaves it re-interpreted per iteration and lets its short
+    // inner loops compile + deopt-storm — strictly slower than interpreting.
+    // The trait leg inlines such callees via `push_inline_frame` +
+    // `recursive-call-assembler`, so route the enclosing key there
+    // (`FBW_DECLINED_KEYS`) instead of recording the slow residual.
+    if !callee_fast_path_inlinable(body.code, callee_descr_refs, ctx) {
+        return Err(DispatchError::LoopBearingCalleeInlineUnsupported { pc: op.pc });
     }
 
     // Path-1 (#68): the inlined callee's compile-time-constant frame fields,

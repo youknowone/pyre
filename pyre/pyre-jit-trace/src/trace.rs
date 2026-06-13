@@ -973,6 +973,7 @@ fn full_body_walk_trace(
                 | DE::MayForceNullRefArgUnsupported { .. }
                 | DE::BranchGuardKeptStackUnsupported { .. }
                 | DE::NonStandardVableFinishPortalUnsupported { .. }
+                | DE::LoopBearingCalleeInlineUnsupported { .. }
                 | DE::ResidualCallArgUnbound { .. } => {
                     fbw_decline(crate::driver::make_green_key(w_code, start_pc));
                     TraceAction::Abort

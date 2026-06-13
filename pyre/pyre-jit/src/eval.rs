@@ -3110,21 +3110,22 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
     //   - "has back-edge AND name != <module>": same problem —
     //     non-loop function frames are skipped.
     //
-    // interp_jit.py:81-99 applies pypyjitdriver to every frame including
-    // `<module>`, so `true` is the parity-correct value and is what lets
-    // the module-level driver loop (nbody_50k `while i < n: advance(...)`)
-    // trace at all.  But module-loop tracing is a NET perf regression
-    // today: the dynamic call to `advance` cannot be inlined by the
-    // full-body walker (#62 not yet landed), so the trace is pure overhead
-    // and advance's short inner loop deopt-storms (nbody_50k 0.20s
-    // interpreter-only -> 3.6s traced).  Gate module-frame portal status
-    // behind PYRE_MODULE_LOOP_TRACE until call-inlining (#62) makes the
-    // trace a win; the default keeps `<module>` non-portal.  Function
-    // frames are always portals (the alternatives in the note above that
-    // skip non-loop function frames regress; excluding only `<module>`
-    // does not).
-    let is_portal: bool = &*code.obj_name != "<module>"
-        || std::env::var_os("PYRE_MODULE_LOOP_TRACE").as_deref() == Some(std::ffi::OsStr::new("1"));
+    // interp_jit.py:81-99 `PyFrame.dispatch` applies `pypyjitdriver`
+    // (`jit_merge_point` :87, `can_enter_jit` :117) to EVERY frame
+    // uniformly — there is no `co_name == "<module>"` gate and no env
+    // switch, so `<module>` frames trace exactly like function frames.
+    // The parity-correct value is unconditional `true`.
+    //
+    // This was briefly gated (a `<module>` exclusion, then a
+    // PYRE_MODULE_LOOP_TRACE env switch) while module-loop tracing was a
+    // deopt-storm regression: a dynamic driver-loop call to a loop-bearing
+    // callee is not inlinable by the full-body walker yet (#62).  That is
+    // resolved — the walk now declines such a key to the trait leg
+    // (`DispatchError::LoopBearingCalleeInlineUnsupported` ->
+    // `FBW_DECLINED_KEYS`), which inlines the callee via
+    // `recursive-call-assembler` — so module-loop tracing is a win
+    // (nbody_50k 0.22s interpreter -> 0.09s traced) and the gate is gone.
+    let is_portal: bool = true;
     // interp_jit.py:66 — next_instr, pycode are greens (managed by jit_merge_point).
     // No explicit promote needed; the JitDriver green-key mechanism handles this.
 
