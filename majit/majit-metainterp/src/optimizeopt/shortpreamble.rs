@@ -2537,9 +2537,17 @@ impl ExtendedShortPreambleBuilder {
                 self.phase1_to_inputarg
                     .get(&arg.to_opref())
                     .cloned()
-                    // Unmapped Phase 1 jump arg: no current-namespace
-                    // producer to bind; position-only box as before.
-                    .unwrap_or_else(|| arg.clone())
+                    .unwrap_or_else(|| {
+                        // Unmapped Phase 1 jump arg (no rename): resolve the
+                        // Phase-2 producer registered at this position — the
+                        // inlined short box op or the label inputarg — so the
+                        // JUMP arg carries the producer object instead of a
+                        // producer-less position-only box. Mirrors the mapped
+                        // arm, which binds via `materialize_box_at`; falls back
+                        // to a position-only box only if no producer exists.
+                        ctx.get_box_replacement_box(arg.to_opref())
+                            .unwrap_or_else(|| BoxRef::from_opref(arg.to_opref()))
+                    })
             })
             .collect();
         self.short.push(Op::new(OpCode::Jump, &jump_args_box));
