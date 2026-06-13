@@ -54,5 +54,18 @@ show("tuple-sub-nonstr-repr", lambda: repr(NonStrTupleRepr((1, 2))))
 s = "café"
 print("fstring-ascii", f"{s!a}", ascii(s))
 
+
+# `complex(str)` and `format(value, spec)` read the string's stored value
+# directly; a `str` subclass `__str__` is not consulted (so a raising one
+# does not leak out of these paths).
+class StrSubRaisingStr(str):
+    def __str__(self):
+        raise ValueError("boom")
+
+
+print("complex-strsub", complex(StrSubRaisingStr("1")) == 1.0)
+print("format-strsub", format(12, StrSubRaisingStr("04d")), format(255, StrSubRaisingStr("x")))
+show("format-nonstr-spec", lambda: format(12, 34))
+
 # Normal formatting is unaffected.
 print("normal", repr([1, 2]), str({3: 4}), repr((1,)), ascii("x"))
