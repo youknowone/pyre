@@ -2442,6 +2442,28 @@ fn make_exc_type_with_init(
     cls
 }
 
+/// Build a builtin exception class with more than one base, e.g.
+/// `class UnsupportedOperation(OSError, ValueError)`
+/// (`Modules/_io/_iomodule.c`).  The MRO is the C3 linearization over
+/// `bases`; the first base drives instance layout.  `with_traceback` /
+/// `add_note` are inherited through the MRO from `BaseException`, so
+/// only `__new__` is installed here.
+pub(crate) fn make_exc_type_multi(
+    name: &'static str,
+    new_fn: crate::gateway::BuiltinCodeFn,
+    bases: &[PyObjectRef],
+) -> PyObjectRef {
+    let cls = crate::typedef::make_builtin_type_with_bases(
+        name,
+        move |ns| {
+            crate::dict_storage_store(ns, "__new__", make_builtin_function("__new__", new_fn));
+        },
+        bases,
+    );
+    register_exc_class(name, cls);
+    cls
+}
+
 /// Thread-local registry from exception class name (as used by
 /// `ExcKind → exc_kind_name`) to the W_TypeObject exposed in the builtins
 /// namespace. Populated at init-builtins time via `make_exc_type`.

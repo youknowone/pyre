@@ -18,7 +18,9 @@ use sre_engine::engine::{Request, SearchIter, State};
 use sre_engine::string::StrDrive;
 
 pub fn register_module(ns: &mut DictStorage) {
-    dict_storage_store(ns, "MAGIC", w_int_new(20230612)); // SRE magic number
+    // Must equal `re/_constants.py:MAGIC` (the bundled stdlib) — `_compiler.py`
+    // asserts `_sre.MAGIC == MAGIC` at import time.
+    dict_storage_store(ns, "MAGIC", w_int_new(20220615)); // SRE magic number
     dict_storage_store(ns, "CODESIZE", w_int_new(sre_engine::CODESIZE as i64));
     dict_storage_store(ns, "MAXREPEAT", w_int_new(sre_engine::MAXREPEAT as i64));
     dict_storage_store(ns, "MAXGROUPS", w_int_new(sre_engine::MAXGROUPS as i64));

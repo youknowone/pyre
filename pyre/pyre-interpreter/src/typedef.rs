@@ -928,6 +928,68 @@ fn new_typeobject_with_base_and_layout(
     type_obj
 }
 
+/// Create a named builtin type inheriting from multiple `bases`.
+///
+/// The first entry is the primary base (drives layout/hasdict/weakref
+/// inheritance, like `w_bestbase` in typeobject.py:setup_builtin_type);
+/// the full tuple is recorded as `__bases__` and the MRO is the C3
+/// linearization (`compute_default_mro`).  Used for builtin exception
+/// classes with more than one base, e.g.
+/// `class UnsupportedOperation(OSError, ValueError)`.
+pub fn make_builtin_type_with_bases(
+    name: &str,
+    init: impl FnOnce(&mut DictStorage),
+    bases: &[PyObjectRef],
+) -> PyObjectRef {
+    let layout_pytype = &INSTANCE_TYPE as *const PyType;
+    let base = bases[0];
+    let mut ns = Box::new(DictStorage::new());
+    ns.fix_ptr();
+    init(&mut ns);
+    let ns_ptr = Box::into_raw(ns);
+    let bases_tuple = w_tuple_new(bases.to_vec());
+    let type_obj = w_type_new_builtin(name, bases_tuple, ns_ptr as *mut u8, layout_pytype);
+
+    unsafe {
+        let parent_layout = pyre_object::w_type_get_layout_ptr(base);
+        let reuse = if !parent_layout.is_null() {
+            std::ptr::eq((*parent_layout).typedef, layout_pytype)
+        } else {
+            false
+        };
+        let has_dict = (*ns_ptr).get("__dict__").is_some();
+        let has_weakref = (*ns_ptr).get("__weakref__").is_some();
+        let layout = if reuse {
+            parent_layout
+        } else {
+            let has_new = (*ns_ptr).get("__new__").is_some();
+            pyre_object::typeobject::leak_layout(pyre_object::typeobject::Layout {
+                typedef: layout_pytype,
+                nslots: 0,
+                newslotnames: vec![],
+                base_layout: parent_layout,
+                acceptable_as_base_class: has_new,
+                typedef_hasdict: false,
+            })
+        };
+        pyre_object::w_type_set_layout(type_obj, layout);
+        // typedef.py:39-41: inherit hasdict/weakrefable from any base.
+        let mut hasdict = has_dict;
+        let mut weakrefable = has_weakref;
+        for &b in bases {
+            hasdict |= pyre_object::w_type_get_hasdict(b);
+            weakrefable |= pyre_object::w_type_get_weakrefable(b);
+        }
+        pyre_object::w_type_set_hasdict(type_obj, hasdict);
+        pyre_object::w_type_set_weakrefable(type_obj, weakrefable);
+    }
+
+    // MRO = C3 linearization over the recorded `__bases__`.
+    let mro = unsafe { crate::baseobjspace::compute_default_mro(type_obj) };
+    unsafe { w_type_set_mro(type_obj, mro) };
+    type_obj
+}
+
 /// Create a named builtin type inheriting from `object`.
 ///
 /// Used by extension modules (e.g. _sre) to define their own types.
