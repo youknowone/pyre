@@ -2861,16 +2861,20 @@ impl Optimizer {
                     preamble_op.pos.set(canonical_result);
                     // optimizer.py:651-652 force_box loop parity.
                     //
-                    // Resolve POSITIONALLY (get_box_replacement on the
-                    // encoded position), not through the operand's bound
-                    // object: replay-op args carry the dep replay handle
-                    // (produce_arg, shortpreamble.py:285) whose forwarded
-                    // slot is empty — only the body producer registered at
-                    // the same position carries the Phase-1 forwarding to
-                    // the canonical end box this export boundary needs.
-                    // (A dep handle bound to an already-rewritten sibling
-                    // resolves to the same canonical box either way —
-                    // get_box_replacement is idempotent on canonicals.)
+                    // Resolve POSITIONALLY when a producer is registered at
+                    // this slot: replay-op args carry the dep replay handle
+                    // (produce_arg, shortpreamble.py:285) whose forwarded slot
+                    // is empty, so only the body producer registered at the
+                    // same position carries the Phase-1 forwarding to the
+                    // canonical end box this export boundary needs.
+                    //
+                    // When positional resolution finds NO producer, the carried
+                    // handle is unforwarded and resolves to itself
+                    // (resoperation.py:57-68): keep the handle OBJECT instead of
+                    // re-minting a producer-less position-only box, so its
+                    // identity (and the `Operand::Op`/`InputArg` shed) survives
+                    // the export. The encoded OpRef is identical either way
+                    // (`from_opref(arg.to_opref()) == arg.to_opref()`).
                     for i in 0..preamble_op.num_args() {
                         let arg = preamble_op.arg(i);
                         // The `OpRef::none()` sentinel has no producer box
@@ -2880,7 +2884,10 @@ impl Optimizer {
                         if arg.is_none() {
                             continue;
                         }
-                        preamble_op.setarg(i, ctx.get_box_replacement(arg.to_opref()));
+                        let resolved = ctx
+                            .get_box_replacement_box(arg.to_opref())
+                            .unwrap_or_else(|| arg.clone());
+                        preamble_op.setarg(i, resolved);
                     }
                     if let Some(fail_args) = preamble_op.fail_args.borrow_mut().as_mut() {
                         for arg in fail_args.iter_mut() {
