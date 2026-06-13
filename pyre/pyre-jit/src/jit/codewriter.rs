@@ -7344,7 +7344,7 @@ impl CodeWriter {
                             // value.  Unlike STORE_NAME it bypasses w_locals
                             // (`pyopcode.py:940`), and no hot path needs it
                             // yet — keep the abort until a helper lands.
-                            emit_abort_permanent!();
+                            emit_abort_permanent!(py_pc);
                             pop_and_decr_depth(&mut current_state, &mut current_depth);
                             emit_vsd!(current_depth, py_pc);
                         }
