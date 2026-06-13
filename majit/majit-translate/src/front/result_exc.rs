@@ -213,7 +213,8 @@ pub(crate) fn tyref_result_ok_is_unit(ty: &TyRef, llbc: &Llbc) -> bool {
 /// `exceptiontransform.py` would return `Void`.  Drop the return
 /// variable and every arg on the exits feeding it; an empty returnblock
 /// `inputargs` is the void-return shape `graph_result_kind` maps to
-/// `v`.  The now-dead unit producers are left to the dead-op sweep.
+/// `v`.  The now-dead unit producers are swept by the `prune_dead_phis`
+/// pass the codewriter runs immediately after this widen.
 pub(crate) fn widen_unit_return_to_void(graph: &mut FunctionGraph) {
     let returnblock = graph.returnblock;
     for block in &mut graph.blocks {
@@ -762,6 +763,10 @@ fn rewire_one_call_site(
         return Ok(SiteOutcome::Rewrapped);
     };
     assert_single_pred(graph, b, &name)?;
+    // Block B is bypassed by the rewrite (A exits straight to the
+    // continue target); only the `branch` destructuring may carry an
+    // effect, so any other side-effecting op here is unsupported.
+    assert_block_pure_besides(graph, b, &[branch_op_idx], "branch", &name)?;
     let cf = graph.blocks[b].operations[branch_op_idx]
         .result
         .clone()
@@ -770,14 +775,15 @@ fn rewire_one_call_site(
         follow_single_exit(graph, b, &cf).map_err(|e| format!("{name}: branch block exit: {e}"))?;
     assert_single_pred(graph, c, &name)?;
     // Block C: `d = cf.__discriminant`; switch d {0 → continue, 1 → break}.
-    let disc_var = graph.blocks[c]
+    let (disc_idx, disc_var) = graph.blocks[c]
         .operations
         .iter()
-        .find_map(|op| match &op.kind {
+        .enumerate()
+        .find_map(|(i, op)| match &op.kind {
             OpKind::FieldRead { base, field, .. }
                 if *base == cf_c && field.name == "__discriminant" =>
             {
-                op.result.clone()
+                op.result.clone().map(|r| (i, r))
             }
             _ => None,
         })
@@ -791,6 +797,9 @@ fn rewire_one_call_site(
             ));
         }
     }
+    // Block C is bypassed too; only the discriminant read may carry an
+    // effect.  Reject any extra side-effecting op the switch would drop.
+    assert_block_pure_besides(graph, c, &[disc_idx], "discriminant", &name)?;
     let (continue_link, break_link) = split_diamond_exits(&graph.blocks[c].exits, &name)?;
     // The break arm must be the pure `?` re-raise tail
     // (`__pos_0` read + `from_residual` + return).  A custom handler
@@ -1239,6 +1248,34 @@ fn split_diamond_exits(exits: &[Link], name: &str) -> Result<(Link, Link), Strin
 /// The break arm must be exactly `e = cf.__pos_0; from_residual(e);
 /// → returnblock` — the `?` re-raise tail that the exception link
 /// replaces.  Anything else is a custom handler and must fail loud.
+/// Assert every operation in `block` other than the `recognized`
+/// indices is side-effect-free.  The `?`-diamond rewrite disconnects the
+/// branch / discriminant / break-arm blocks, so an unrecognised
+/// side-effecting op in any of them would be silently bypassed; RPython
+/// exception links are equivalent only when the removed shape is pure
+/// control / unwrap / reraise plumbing.  Pure extras (constants, reads)
+/// are harmless to bypass and are allowed.
+fn assert_block_pure_besides(
+    graph: &FunctionGraph,
+    block: usize,
+    recognized: &[usize],
+    role: &str,
+    name: &str,
+) -> Result<(), String> {
+    for (i, op) in graph.blocks[block].operations.iter().enumerate() {
+        if recognized.contains(&i) {
+            continue;
+        }
+        if !crate::inline::is_pure_op(&op.kind) {
+            return Err(format!(
+                "{name}: {role} block {block} carries a side-effecting operation \
+                 the `?`-diamond rewrite would silently bypass — unsupported shape"
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn verify_break_arm_is_reraise(
     graph: &FunctionGraph,
     break_link: &Link,
@@ -1257,34 +1294,43 @@ fn verify_break_arm_is_reraise(
         .cloned()
         .ok_or_else(|| format!("{name}: break arm target lacks inputarg {pos}"))?;
     let ops = &graph.blocks[e_block].operations;
-    let payload_var = ops.iter().find_map(|op| match &op.kind {
+    let payload = ops.iter().enumerate().find_map(|(i, op)| match &op.kind {
         OpKind::FieldRead { base, field, .. } if *base == cf_e && field.name == "__pos_0" => {
-            op.result.clone()
+            op.result.clone().map(|r| (i, r))
         }
         _ => None,
     });
-    let Some(payload_var) = payload_var else {
+    let Some((pos0_idx, payload_var)) = payload else {
         return Err(format!(
             "{name}: break arm block {e_block} lacks the __pos_0 residual read — \
              custom `?` handler shapes are not supported yet"
         ));
     };
-    let residual_result = ops.iter().find_map(|op| match &op.kind {
+    let residual = ops.iter().enumerate().find_map(|(i, op)| match &op.kind {
         OpKind::Call {
             target: CallTarget::Method { name: m, .. },
             args,
             ..
         } if m == "from_residual" && args.as_slice() == std::slice::from_ref(&payload_var) => {
-            op.result.clone()
+            op.result.clone().map(|r| (i, r))
         }
         _ => None,
     });
-    let Some(residual_result) = residual_result else {
+    let Some((from_residual_idx, residual_result)) = residual else {
         return Err(format!(
             "{name}: break arm block {e_block} lacks the from_residual call — \
              custom `?` handler shapes are not supported yet"
         ));
     };
+    // Only the `__pos_0` read and the `from_residual` call may carry an
+    // effect; any other side-effecting op would be dropped by the rewrite.
+    assert_block_pure_besides(
+        graph,
+        e_block,
+        &[pos0_idx, from_residual_idx],
+        "break arm",
+        name,
+    )?;
     verify_forwards_to_returnblock(graph, e_block, &residual_result)
 }
 

@@ -813,17 +813,18 @@ pub fn lower_fun_decl_with_static_addrs(
         if lo.mir_model_is_acyclic() {
             match lo.lower_framestate() {
                 Ok(()) => {
-                    // The exception-link ABI (raise-through vs Result
-                    // return) must be uniform across lowering
-                    // strategies — a framestate-lowered scoped callee
-                    // that kept its Result returns would break a
-                    // monotonic-lowered caller whose call site was
-                    // rewired to LastException exits.  Bodies the
-                    // transforms don't touch skip this, keeping the
-                    // framestate output unchanged.
-                    if !lo.result_exc_call_results.is_empty() || result_exc_callee {
-                        finish(&mut lo)?;
-                    }
+                    // Run the shared post-lowering stage uniformly, same
+                    // as the linear / RPO paths below.  `finish` folds
+                    // constant exitswitches, drops `Abort` arms and runs
+                    // `simplify_lowered_graph`; gating it on result-exc
+                    // activity would let the framestate path keep dead
+                    // arms the other strategies prune, diverging the
+                    // graph for the same body.  The result-exc-specific
+                    // `clear_unreachable_blocks` stays gated inside
+                    // `finish`, and the exception-link ABI (raise-through
+                    // vs Result return) the transforms install runs here
+                    // too — uniform across lowering strategies.
+                    finish(&mut lo)?;
                     return Ok(lo.graph);
                 }
                 Err(e) => {

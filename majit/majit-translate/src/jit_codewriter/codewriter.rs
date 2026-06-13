@@ -606,6 +606,15 @@ impl CodeWriter {
             && graph_result_kind(&rewritten.graph) == 'r'
         {
             crate::front::result_exc::widen_unit_return_to_void(&mut rewritten.graph);
+            // Sweep the unit producers the widen just orphaned.  Clearing
+            // the returnblock args/inputargs leaves the `()` ctor (or a
+            // tail-forwarded `Ref` call result) unread; without a dead-op
+            // pass it would survive into flatten as a value the void
+            // return no longer consumes.  `rpython/translator/simplify.py`
+            // `remove_dead_links_and_setattrs` runs after exceptiontransform
+            // for the same reason — `prune_dead_phis` keeps raising/impure
+            // producers and only drops the genuinely pure dead unit shells.
+            crate::model::prune_dead_phis(&mut rewritten.graph);
         }
         let mut regallocs = crate::jit_codewriter::transform_profile::time_phase(
             "step2_perform_all_register_allocations",
