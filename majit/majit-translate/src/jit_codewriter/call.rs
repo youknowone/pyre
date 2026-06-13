@@ -3471,6 +3471,14 @@ impl CallControl {
     /// returned so the resolved `CallPath` is stable across runs and
     /// lines up with the still-path-keyed registries.
     fn suffix_match_impl_method(&self, receiver: &str, name: &str) -> Option<CallPath> {
+        // The leaf strip below cannot verify the receiver's module, so a
+        // qualified receiver (`pkg_a::Foo`) could bind an unrelated
+        // same-leaf type (`pkg_b::Foo`).  This helper exists only for the
+        // bare in-impl `self.method()` spelling; a qualified receiver must
+        // resolve through the exact / canonical path or not at all.
+        if receiver.contains("::") {
+            return None;
+        }
         let receiver_leaf = receiver.rsplit("::").next().unwrap_or(receiver);
         let leaf_bucket = self.impl_method_leaf_index.get(name)?;
         let matches: Vec<&CallPath> = leaf_bucket
@@ -3537,9 +3545,20 @@ impl CallControl {
             ..
         } = target
         {
-            let qualified = CallPath::for_impl_method(receiver, name.as_str());
-            if let Some(&addr) = self.function_fnaddrs.get(&qualified) {
-                return addr;
+            // In-impl `self.method()` sites carry the bare receiver
+            // (`PyFrame`) while fnaddr bindings register under the
+            // defining-module qualifier; try the canonical spelling too,
+            // mirroring `resolve_method`'s receiver-string fallback.
+            let canonical = majit_ir::descr::canonical_struct_name(receiver);
+            let mut candidates = vec![receiver.as_str()];
+            if canonical != *receiver {
+                candidates.push(canonical.as_str());
+            }
+            for candidate in candidates {
+                let qualified = CallPath::for_impl_method(candidate, name.as_str());
+                if let Some(&addr) = self.function_fnaddrs.get(&qualified) {
+                    return addr;
+                }
             }
         }
         symbolic_fnaddr_for_target(target)
@@ -3799,6 +3818,14 @@ impl CallControl {
             if let Some(impl_name) = impls.iter().copied().find(|t| t.as_str() == receiver) {
                 return Some(impl_name.as_str());
             }
+            // A qualified receiver (`pkg_a::Foo`) that missed the exact
+            // match must not strip to its leaf and bind an unrelated
+            // same-leaf type (`pkg_b::Foo`); the leaf fallback below is
+            // only for the bare in-impl `self.method()` spelling.  Return
+            // None, mirroring [`Self::resolve_method`]'s qualified guard.
+            if receiver.contains("::") {
+                return None;
+            }
             // Bare-receiver leaf match: the table stores canonical
             // `module::Type` names while in-impl `self.method()` call
             // sites carry the syntactic bare spelling.  Unique-leaf
@@ -3817,9 +3844,7 @@ impl CallControl {
             // suppress the receiver-agnostic fallback (mirrors
             // [`Self::resolve_method`]) — generic-parameter receivers
             // keep it.
-            if receiver.contains("::")
-                || majit_ir::descr::canonical_struct_name(receiver) != receiver
-            {
+            if majit_ir::descr::canonical_struct_name(receiver) != receiver {
                 return None;
             }
         }
