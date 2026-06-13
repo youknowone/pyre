@@ -2872,11 +2872,21 @@ impl Optimizer {
                     // resolves to the same canonical box either way —
                     // get_box_replacement is idempotent on canonicals.)
                     for i in 0..preamble_op.num_args() {
-                        let arg = preamble_op.arg(i).to_opref();
-                        preamble_op.setarg(i, ctx.get_box_replacement(arg));
+                        let arg = preamble_op.arg(i);
+                        // The `OpRef::none()` sentinel has no producer box
+                        // (`materialize_box_at` doc) — routing it through the
+                        // producer lookup is meaningless and trips the
+                        // `get_box_replacement` "box must exist" debug tripwire.
+                        if arg.is_none() {
+                            continue;
+                        }
+                        preamble_op.setarg(i, ctx.get_box_replacement(arg.to_opref()));
                     }
                     if let Some(fail_args) = preamble_op.fail_args.borrow_mut().as_mut() {
                         for arg in fail_args.iter_mut() {
+                            if arg.is_none() {
+                                continue;
+                            }
                             *arg = majit_ir::operand::Operand::from_boxref(
                                 &ctx.get_box_replacement(arg.to_opref()),
                             );
