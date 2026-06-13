@@ -2380,6 +2380,34 @@ impl<'a> Lowering<'a> {
                     });
                     return Ok(res);
                 }
+                // `xs[i]` element read — the symmetric counterpart of
+                // the `ArrayWrite` Index arm in
+                // `emit_projection_write`.  Collapsing to the base
+                // (the previous behaviour for every non-Field Tagged
+                // projection) aliased the element to the sequence
+                // itself, so a method call on the element resolved
+                // against the list annotation.
+                if let ProjectionElem::Tagged(v) = &elem
+                    && let Some(index_payload) = v.as_object().and_then(|m| m.get("Index"))
+                {
+                    let idx_var = self.index_offset_var(mir_bb, index_payload)?;
+                    let base = self.resolve_place(mir_bb, *inner)?;
+                    let bb_id = self.block_id[mir_bb];
+                    let res = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(res.clone()),
+                        kind: OpKind::ArrayRead {
+                            base,
+                            index: idx_var,
+                            item_ty: tyref_to_value_type(&place_ty, self.llbc),
+                            array_type_id: None,
+                            nolength: false,
+                        },
+                    });
+                    return Ok(res);
+                }
                 // Positional aggregate `.N` read: the base local was
                 // bound by a non-Adt `Rvalue::Aggregate`, so emit the
                 // `FieldRead __pos_<N>` that pairs with the
