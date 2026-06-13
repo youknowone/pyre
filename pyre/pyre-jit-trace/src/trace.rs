@@ -972,7 +972,6 @@ fn full_body_walk_trace(
             match e {
                 DE::AbortPermanentMarkerReached { .. }
                 | DE::GuardSnapshotVableUntyped { .. }
-                | DE::MayForceProtectedByExceptionHandlerUnsupported { .. }
                 | DE::MayForceNullRefArgUnsupported { .. }
                 | DE::BranchGuardKeptStackUnsupported { .. }
                 | DE::NonStandardVableFinishPortalUnsupported { .. }

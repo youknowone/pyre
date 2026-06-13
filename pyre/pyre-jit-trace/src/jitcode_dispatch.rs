@@ -952,20 +952,6 @@ pub enum DispatchError {
     /// driver maps it to `TraceAction::Abort` and the loop falls back to
     /// the interpreter instead of compiling a wrong trace.
     MayForceNullRefArgUnsupported { pc: usize },
-    /// A may-force residual CALL that can raise (`GUARD_NO_EXCEPTION`
-    /// emitted) sits at a jitcode position immediately followed by a
-    /// `catch_exception/L` — i.e. the call is covered by a Python
-    /// `try`/`except` handler. The full-body walk cannot yet resume the
-    /// `GUARD_NO_EXCEPTION` deopt into that handler: the exception-path
-    /// bridge reads the standing exception value, but the walker's guard
-    /// resume snapshot does not seed it (task #51c exc-routing), so the
-    /// bridge dereferences a NULL exception object (`GuardClass ldr [x0]`
-    /// with `x0 == 0`). The trait tracer resumes the handler correctly,
-    /// so the walker surfaces a typed abort and the driver maps it to
-    /// `TraceAction::Abort` → interpreter fallback. Calls NOT covered by
-    /// a handler (e.g. `math.sqrt` in nbody) never deopt into a handler
-    /// and are unaffected.
-    MayForceProtectedByExceptionHandlerUnsupported { pc: usize },
     /// The virtualizable escaped during a concrete-executed may-force
     /// residual call: `vinfo.tracing_after_residual_call(virtualizable)`
     /// found the token cleared by the callee's force path
@@ -4236,54 +4222,11 @@ fn walker_abort_if_mayforce_null_ref_arg(
     Ok(())
 }
 
-/// Abort the walk when a may-force residual CALL that can raise lives in
-/// a jitcode body that contains exception-handler structure (any
-/// `catch_exception/L`).  CPython 3.13 routes a call's exception through
-/// the per-frame exception table rather than an inline marker right
-/// after the call, so the handler is reachable from the call site even
-/// though it is not at `op.next_pc`.  The full-body walk cannot yet
-/// resume the `GUARD_NO_EXCEPTION` deopt into such a handler: the
-/// exception-path bridge reads the standing exception value, but the
-/// walker's guard resume snapshot never seeds it (task #51c exc-routing),
-/// so the bridge dereferences a NULL exception object (`GuardClass ldr
-/// [x0]` with `x0 == 0`).  Falling back to the trait tracer (which
-/// resumes the handler correctly) keeps the loop correct.  Bodies with
-/// no `catch_exception/L` (nbody / fannkuch / the loop benches) never
-/// deopt into a handler and compile under the walk.  See
-/// [`DispatchError::MayForceProtectedByExceptionHandlerUnsupported`].
-fn walker_abort_if_protected_may_force(
-    code: &[u8],
-    op: &DecodedOp,
-    can_raise: bool,
-) -> Result<(), DispatchError> {
-    if !can_raise {
-        return Ok(());
-    }
-    // Abort whenever the walked body contains any `catch_exception/L`.  A
-    // may-force call's `GUARD_NO_EXCEPTION` deopt can route into that handler,
-    // and the walk cannot yet seed the handler's standing exception value at
-    // resume — the exception-path bridge bakes a NULL exception object, so the
-    // compiled `GuardClass ldr [x0]` dereferences `x0 == 0` (the synth
-    // `exceptions` loop: `may_fail` raises, caught in `main`'s handler reading
-    // `e.args[0]`).  Falling back to the trait tracer keeps such loops correct.
-    // A per-call precise gate (abort only when THIS call's Python pc is covered
-    // by a handler range) would need the handler-resume seeding to be reliable
-    // first; until then the conservative whole-body scan is the correct gate.
-    // Bodies with no handler (the loop benches / nbody / fannkuch) never deopt
-    // into a handler and compile under the walk.
-    if jitcode_has_exception_handler(code)
-        && std::env::var_os("PYRE_51C_RELAX").is_none()
-    {
-        return Err(DispatchError::MayForceProtectedByExceptionHandlerUnsupported { pc: op.pc });
-    }
-    Ok(())
-}
-
 /// Returns `true` when the jitcode body contains any `catch_exception/L`
 /// op — i.e. the source function has a `try`/`except` handler.  Used by
-/// [`walker_abort_if_protected_may_force`] to keep the full-body walk
-/// off functions whose `GUARD_NO_EXCEPTION` deopt could route into an
-/// exception handler the walk cannot yet resume.
+/// the residual-call fast paths that conservatively decline a handler-
+/// bearing body to the generic walk (which resumes a `GUARD_NO_EXCEPTION`
+/// deopt into the handler correctly) rather than to their concrete fold.
 fn jitcode_has_exception_handler(code: &[u8]) -> bool {
     crate::jitcode_runtime::decoded_ops(code).any(|op| op.opname == "catch_exception")
 }
@@ -6051,22 +5994,8 @@ fn walker_capture_snapshot_for_last_guard_impl(
                     // call instead of re-executing it from a coordinate whose
                     // stack no longer holds those operands (which drops/dups
                     // the side effect, e.g. an in-place list swap store).
-                    let py_after_trivia = py;
                     if after_residual_call {
                         py = crate::metainterp::semantic_fallthrough_pc(code, py as usize) as u32;
-                    }
-                    if std::env::var_os("PYRE_51C_DIAG").is_some() && after_residual_call {
-                        let pm = &jc.payload.metadata.pc_map;
-                        eprintln!(
-                            "[51c-diag][snap] guard={:?} op_pc={} py_after_trivia={} py_final={} \
-                             pc_map[py_after_trivia]={:?} pc_map[py_final]={:?}",
-                            ctx.trace_ctx.last_guard_opcode(),
-                            op_pc,
-                            py_after_trivia,
-                            py,
-                            pm.get(py_after_trivia as usize),
-                            pm.get(py as usize),
-                        );
                     }
                 }
                 (py, jc.index as u32, jc.payload.metadata.pc_map.len())
@@ -6813,12 +6742,10 @@ fn try_walker_call_assembler_self_recursive(
         return Ok(None);
     }
     // A self-recursive CALL_ASSEMBLER raising inside a `try` body must
-    // route its GUARD_NO_EXCEPTION deopt into the handler, which the
-    // walker snapshot cannot encode yet — the same gap
-    // `walker_abort_if_protected_may_force` gates on the residual path,
-    // but that gate runs only after this fast path would already have
-    // emitted.  Decline, so the residual path's protected-body abort
-    // falls back to the trait tracer.
+    // route its GUARD_NO_EXCEPTION deopt into the handler.  The concrete
+    // CALL_ASSEMBLER fold here cannot encode that resume in its snapshot;
+    // decline so the body takes the generic residual path, which walks the
+    // handler-bearing body and resumes the deopt into the handler.
     if jitcode_has_exception_handler(code) {
         return Ok(None);
     }
@@ -7615,15 +7542,13 @@ fn dispatch_residual_call_iRd_kind(
     } else {
         let (call_opcode, can_raise, emit_guard_not_forced) =
             select_residual_call_opcode(ei, dst_bank, "dispatch_residual_call_iRd_kind");
+        // The abort gate is static (EI flags) and must run BEFORE the
+        // concrete executor below: `do_residual_call` (pyjitpl.py:2019)
+        // executes the helper only on a path that keeps recording — it has
+        // no execute-then-abandon shape.  Aborting after execution would
+        // leave the helper's heap/exception effects standing while the
+        // declined retrace re-runs the same bytecode, double-applying them.
         walker_abort_if_mayforce_null_ref_arg(call_opcode, &allboxes, call_descr, ctx, op.pc)?;
-        // Both abort gates are static (EI flags + a jitcode body scan) and
-        // must run BEFORE the concrete executor below: `do_residual_call`
-        // (pyjitpl.py:2019) executes the helper only on a path that keeps
-        // recording — it has no execute-then-abandon shape.  Aborting after
-        // execution would leave the helper's heap/exception effects standing
-        // while the declined retrace re-runs the same bytecode, double-
-        // applying them.
-        walker_abort_if_protected_may_force(code, op, can_raise)?;
 
         // pyjitpl.py:2017 `vable_and_vrefs_before_residual_call` — fires
         // unconditionally on the forces branch.  Records FORCE_TOKEN +
@@ -9264,11 +9189,11 @@ fn dispatch_residual_call_iIRd_kind(
     // concrete; only the cell-strategy module-dict fast path is foldable.
     //
     // Skip handler-bearing bodies: `load_global_fn` is `CallFlavor::Plain`
-    // (can raise), so the generic residual path normally trips
-    // `walker_abort_if_protected_may_force` and falls the whole loop back to
-    // the trait tracer when a `catch_exception/L` is present.  Folding here
-    // would suppress that abort and let the walk compile a try/except body it
-    // cannot yet resume.
+    // (can raise a NameError), so folding away its residual call would drop
+    // the `GUARD_NO_EXCEPTION` that a `catch_exception/L` in the same body
+    // may resume into.  Leave such bodies on the generic residual path
+    // (which keeps the guard and resumes the handler correctly); the fold is
+    // a perf shortcut for handler-free global-call loops.
     //
     // Default ON since the Phase 5 flip (`PYRE_FBW_LOADGLOBAL_FOLD=0` opts
     // out): the fold is correct (`try_walker_load_global_cell_fold`
@@ -9411,10 +9336,6 @@ fn dispatch_residual_call_iIRd_kind(
         let (call_opcode, can_raise, emit_guard_not_forced) =
             select_residual_call_opcode(ei, dst_bank, "dispatch_residual_call_iIRd_kind");
         walker_abort_if_mayforce_null_ref_arg(call_opcode, &allboxes, call_descr, ctx, op.pc)?;
-        // Static gate BEFORE the concrete executor — see
-        // `dispatch_residual_call_iRd_kind` for the execute-then-abandon
-        // rationale (do_residual_call, pyjitpl.py:2019).
-        walker_abort_if_protected_may_force(code, op, can_raise)?;
 
         // pyjitpl.py:2017 `vable_and_vrefs_before_residual_call` —
         // records FORCE_TOKEN + SETFIELD_GC IR; runtime heap mutations
@@ -9599,10 +9520,6 @@ fn dispatch_residual_call_iIRFd_kind(
         let (call_opcode, can_raise, emit_guard_not_forced) =
             select_residual_call_opcode(ei, dst_bank, "dispatch_residual_call_iIRFd_kind");
         walker_abort_if_mayforce_null_ref_arg(call_opcode, &allboxes, call_descr, ctx, op.pc)?;
-        // Static gate BEFORE the concrete executor — see
-        // `dispatch_residual_call_iRd_kind` for the execute-then-abandon
-        // rationale (do_residual_call, pyjitpl.py:2019).
-        walker_abort_if_protected_may_force(code, op, can_raise)?;
 
         // pyjitpl.py:2017 `vable_and_vrefs_before_residual_call` —
         // records FORCE_TOKEN + SETFIELD_GC IR; runtime heap mutations

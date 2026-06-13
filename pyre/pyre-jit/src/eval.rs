@@ -4154,31 +4154,6 @@ fn execute_assembler(
                                     green_key, trace_id, fail_index,
                                 );
                             }
-                            if std::env::var_os("PYRE_51C_DIAG").is_some() {
-                                let decode = |w: pyre_object::PyObjectRef| -> Option<i64> {
-                                    if w.is_null()
-                                        || !unsafe { pyre_object::pyobject::is_int(w) }
-                                    {
-                                        None
-                                    } else {
-                                        Some(unsafe { pyre_object::intobject::w_int_get_value(w) })
-                                    }
-                                };
-                                let l = frame.locals_w();
-                                let nl = l.len();
-                                let li = |idx: usize| -> Option<i64> {
-                                    if idx < nl { decode(l[idx]) } else { None }
-                                };
-                                eprintln!(
-                                    "[51c-diag][failed] last_instr={} next_instr={} vsd={} nlocals={} i={:?} acc={:?}",
-                                    frame.last_instr,
-                                    frame.next_instr(),
-                                    frame.valuestackdepth,
-                                    frame.nlocals(),
-                                    li(0),
-                                    li(1),
-                                );
-                            }
                             driver.invalidate_loop(green_key);
                             None
                         }

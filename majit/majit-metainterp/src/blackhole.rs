@@ -1087,15 +1087,6 @@ impl BlackholeInterpreter {
     pub fn handle_exception_in_frame(&mut self, exc_value: i64) -> bool {
         let code = &self.jitcode.code;
         let mut position = self.position;
-        if std::env::var_os("PYRE_51C_DIAG").is_some() {
-            let win: Vec<(usize, u8)> = (position.saturating_sub(8)..(position + 6).min(code.len()))
-                .map(|p| (p, code[p]))
-                .collect();
-            eprintln!(
-                "[51c-diag][handle_exc] pos={} op_catch={} op_live={} window={:?}",
-                position, self.op_catch_exception, self.op_live, win
-            );
-        }
         if position >= code.len() {
             return false;
         }
