@@ -3400,6 +3400,20 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
+                // `*const T::cast_mut()` / `*mut T::cast_const()` /
+                // `<ptr>::cast()` — address-preserving pointer
+                // reinterprets the JIT models as identity (the
+                // receiver-method twin of the `CastKind::RawPtr` Rvalue
+                // → `same_as`).  Alias the destination to the receiver so
+                // the method name never reaches the rtyper as a
+                // `ptr.getattr`.
+                if args.len() == 1 && self.is_ptr_identity_cast(&reg) {
+                    self.local_var[dest_local] = Some(args[0].clone());
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
                 // Resolve the target function's fully-qualified path
                 // through the FunId → FunDecl table. `Trait` here is
                 // Charon's "trait-bound generic resolved at extraction
@@ -3859,6 +3873,38 @@ impl<'a> Lowering<'a> {
         self.llbc
             .fn_by_id(*id)
             .is_some_and(|fd| fd.item_meta.name_path() == "core::result::<Impl>::expect")
+    }
+
+    /// Pointer reinterprets `*const T::cast_mut` / `*mut T::cast_const`
+    /// / `<ptr>::cast` — address-preserving const↔mut flips and pointee
+    /// retypes.  The same i64 machine repr as the receiver, so the JIT
+    /// models them as identity, the receiver-method twin of the
+    /// `CastKind::RawPtr` Rvalue (`same_as`, [`cast_label_from_payload`]).
+    /// Gating on a `RawPtr` self excludes unrelated inherent `cast`
+    /// methods on non-pointer owners.
+    fn is_ptr_identity_cast(&self, reg: &RegularCall) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        let Some(fd) = self.llbc.fn_by_id(*id) else {
+            return false;
+        };
+        let leaf = fd
+            .item_meta
+            .name_path()
+            .rsplit("::")
+            .next()
+            .unwrap_or("")
+            .to_string();
+        if !matches!(leaf.as_str(), "cast" | "cast_mut" | "cast_const") {
+            return false;
+        }
+        fd.signature.inputs.first().is_some_and(|t| {
+            tyref_node(t, self.llbc)
+                .and_then(|n| strip_ty_wrappers(n, self.llbc))
+                .and_then(serde_json::Value::as_object)
+                .is_some_and(|o| o.contains_key("RawPtr"))
+        })
     }
 
     /// Devirtualize a callsite of the blanket
