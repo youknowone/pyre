@@ -2993,6 +2993,31 @@ impl<'a> Lowering<'a> {
     /// calls, aggregates) return `None` and keep the Call fallback.
     fn const_eval_global(&self, def_id: u64) -> Option<OpKind> {
         let g = self.llbc.global_by_id(def_id)?;
+        // Only an immutable, non-thread-local global folds to its init
+        // literal.  A `static mut` is written at runtime and a
+        // thread-local holds a per-thread value, so a post-init read of
+        // either must reach the live accessor, not the initialiser.  (A
+        // by-value read carries no address identity, so an immutable
+        // `static`'s literal is safe to inline here even when its address
+        // is taken elsewhere.)  `global_kind` does not distinguish
+        // `static mut` from `static`, so the mutability comes from the
+        // `static mut` keyword in Charon's recorded `source_text`.
+        if g.rest
+            .get("global_kind")
+            .and_then(serde_json::Value::as_str)
+            == Some("ThreadLocal")
+        {
+            return None;
+        }
+        let is_static_mut = g
+            .rest
+            .get("item_meta")
+            .and_then(|m| m.get("source_text"))
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|s| s.contains("static mut"));
+        if is_static_mut {
+            return None;
+        }
         let init_id = g.rest.get("init")?.as_u64()?;
         let fd = self.llbc.fn_by_id(init_id)?;
         let u = fd.unstructured()?;
