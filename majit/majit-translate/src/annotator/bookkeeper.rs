@@ -1814,7 +1814,15 @@ impl Bookkeeper {
             seen.insert(cur.rsplit("::").next().unwrap_or(&cur).to_string());
             chain.push(cur.clone());
             let next = self.pyre_struct_fields.borrow().as_ref().and_then(|reg| {
-                let (_, first_ty) = reg.fields.get(&cur)?.first()?;
+                let (first_name, first_ty) = reg.fields.get(&cur)?.first()?;
+                // Only header-conventional first fields mark subclassing
+                // (`ob_header: PyObject` / `base: FrameBlock`).  A
+                // by-value first field of another registered type is
+                // otherwise plain composition (`PyError { kind:
+                // PyErrorKind, … }`), not a class hierarchy.
+                if first_name != "ob_header" && first_name != "base" {
+                    return None;
+                }
                 let leaf = first_ty.rsplit("::").next().unwrap_or(first_ty);
                 (reg.fields.contains_key(leaf) && !seen.contains(leaf)).then(|| leaf.to_string())
             });
@@ -1910,7 +1918,13 @@ impl Bookkeeper {
             "f32" => return SomeValue::SingleFloat(super::model::SomeSingleFloat::new()),
             "f64" => return SomeValue::Float(super::model::SomeFloat::new()),
             "bool" => return super::model::s_bool(),
-            "String" | "str" => return super::model::s_str0(),
+            // Rust strings are UTF-8 text; literals lower through
+            // `__str_const` into `UniStr` constants (UnicodeString
+            // annotation, `UnicodeRepr::convert_const`), so the field
+            // projection must be the unicode string type or attr-cell
+            // unions degrade to the byte `StringRepr` ("not a str:
+            // UniStr(..)" at convert_const).
+            "String" | "str" => return super::model::s_unicode0(),
             "char" => return SomeValue::Char(super::model::SomeChar::new(false)),
             "()" => return super::model::s_none(),
             _ => {}

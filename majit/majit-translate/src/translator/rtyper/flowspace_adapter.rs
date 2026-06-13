@@ -2061,6 +2061,21 @@ pub(crate) fn derive_subject_inputcells(
             // classdef-less shell, narrowed by call-propagation as before
             // (`description.py:283-305 FunctionDesc.pycall`).
             if matches!(ty, crate::model::ValueType::Ref(_)) {
+                // String-typed params are string values, not class
+                // instances: `String` and `str` both map to the single
+                // unicode string type (`project_pyre_field_type` —
+                // `s_unicode0`; string literals lower to `UniStr`
+                // constants).  The foreign
+                // `alloc::string::String` TypeDecl also registers
+                // struct-field rows, so the registry path below would
+                // otherwise seed a `SomeInstance(String)` shell whose
+                // field writes poison classdef attr cells with
+                // instance-annotated strings.
+                if class_root.as_deref() == Some("String") || class_root.as_deref() == Some("str")
+                {
+                    cells.push(crate::annotator::model::s_unicode0());
+                    continue;
+                }
                 if let (Some(root), Some(bk)) = (class_root.as_ref(), bookkeeper) {
                     // A generic param (`&T` where `T: Trait`, incl. a
                     // trait default body's `&Self`) carries the bound

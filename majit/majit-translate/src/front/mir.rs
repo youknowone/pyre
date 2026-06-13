@@ -3428,6 +3428,9 @@ impl<'a> Lowering<'a> {
                         first_arg_ty.as_ref(),
                         &call.dest.ty,
                     )
+                    .or_else(|| {
+                        self.trait_into_string_alias(&segments, &args, &call.dest.ty)
+                    })
                 };
                 if let Some(value) = alias {
                     self.local_var[dest_local] = Some(value);
@@ -4388,6 +4391,61 @@ impl<'a> Lowering<'a> {
         let src = self.tyref_body(first_arg_ty?)?;
         let dst = self.tyref_body(dest_ty)?;
         (src == dst).then(|| arg.clone())
+    }
+
+    /// Resolve the trait-spelled `Into::into` (`["Into", "into"]` — a
+    /// generic-parameter receiver, so Charon cannot select the impl at
+    /// the call site) to its operand when the destination type is
+    /// `alloc::string::String`.  `impl Into<String>` message parameters
+    /// (the `PyError` constructor family) reach `msg.into()` inside the
+    /// generic body; the annotation model maps `String` and `str` to
+    /// the same string value (`project_pyre_field_type` — `s_unicode0`),
+    /// matching upstream's single string type (`rstr.py`), so the
+    /// conversion is an identity at the annotation level.  Other
+    /// destination types keep the generic `Call` form.
+    fn trait_into_string_alias(
+        &self,
+        segments: &[String],
+        args: &[Variable],
+        dest_ty: &TyRef,
+    ) -> Option<Variable> {
+        let [trait_seg, leaf] = segments else {
+            return None;
+        };
+        if trait_seg.as_str() != "Into" || leaf.as_str() != "into" {
+            return None;
+        }
+        let [arg] = args else {
+            return None;
+        };
+        let dest_path = self.tyref_adt_name_path(dest_ty)?;
+        (dest_path == "alloc::string::String").then(|| arg.clone())
+    }
+
+    /// The fully-qualified `name_path()` of the ADT a [`TyRef`]
+    /// resolves to, following `Deduplicated` / `HashConsedValue`
+    /// wrapper layers.  `None` for non-ADT shapes.
+    fn tyref_adt_name_path(&self, ty: &TyRef) -> Option<String> {
+        let mut v = self.tyref_body(ty)?;
+        loop {
+            let obj = v.as_object()?;
+            if let Some(id) = obj.get("Deduplicated").and_then(serde_json::Value::as_u64) {
+                v = self.llbc.dedup_body(id)?;
+                continue;
+            }
+            if let Some(arr) = obj
+                .get("HashConsedValue")
+                .and_then(serde_json::Value::as_array)
+                && arr.len() == 2
+            {
+                v = &arr[1];
+                continue;
+            }
+            break;
+        }
+        let def_id = inline_adt_def_id(v)?;
+        let td = self.llbc.type_by_id(def_id)?;
+        Some(td.item_meta.name_path())
     }
 
     /// The resolved JSON body of a [`TyRef`], following the dedup
@@ -5790,6 +5848,93 @@ fn typevar_bound_index(node: &serde_json::Value) -> Option<u64> {
         .as_u64()
 }
 
+/// True when fn-level type variable `var_index` carries an
+/// `Into<String>` trait clause.  The clause's trait generics spell
+/// `[<subject>, <target>]`; the subject must be our variable and the
+/// target must resolve to the `alloc::string::String` ADT, with the
+/// trait decl's leaf name `Into` (a `From<String>` bound has the same
+/// generics shape but means the *opposite* conversion).
+fn typevar_bounded_by_into_string(
+    var_index: u64,
+    fn_generics: &serde_json::Value,
+    llbc: &Llbc,
+) -> bool {
+    let Some(clauses) = fn_generics
+        .as_object()
+        .and_then(|g| g.get("trait_clauses"))
+        .and_then(|c| c.as_array())
+    else {
+        return false;
+    };
+    fn strip<'a>(
+        llbc: &'a Llbc,
+        mut v: &'a serde_json::Value,
+    ) -> Option<&'a serde_json::Value> {
+        loop {
+            let obj = v.as_object()?;
+            if let Some(id) = obj.get("Deduplicated").and_then(serde_json::Value::as_u64) {
+                v = llbc.dedup_body(id)?;
+                continue;
+            }
+            if let Some(arr) = obj
+                .get("HashConsedValue")
+                .and_then(serde_json::Value::as_array)
+                && arr.len() == 2
+            {
+                v = &arr[1];
+                continue;
+            }
+            return Some(v);
+        }
+    }
+    for clause in clauses {
+        let Some(sb) = clause
+            .as_object()
+            .and_then(|c| c.get("trait_"))
+            .and_then(|t| t.as_object())
+            .and_then(|t| t.get("skip_binder"))
+            .and_then(|s| s.as_object())
+        else {
+            continue;
+        };
+        let is_into = sb
+            .get("id")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|id| llbc.trait_by_id(id))
+            .map(|td| td.item_meta.name_path())
+            .is_some_and(|n| n.rsplit("::").next() == Some("Into"));
+        if !is_into {
+            continue;
+        }
+        let Some(types) = sb
+            .get("generics")
+            .and_then(|g| g.get("types"))
+            .and_then(|t| t.as_array())
+        else {
+            continue;
+        };
+        let subject_is_var = types
+            .first()
+            .and_then(|s| strip(llbc, s))
+            .and_then(|s| s.as_object())
+            .and_then(|o| o.get("TypeVar"))
+            .and_then(typevar_bound_index)
+            == Some(var_index);
+        if !subject_is_var {
+            continue;
+        }
+        let target_is_string = types
+            .get(1)
+            .and_then(|t| resolve_tyexpr_to_adt_def_id_free(llbc, t))
+            .and_then(|id| llbc.type_by_id(id))
+            .is_some_and(|td| td.item_meta.name_path() == "alloc::string::String");
+        if target_is_string {
+            return true;
+        }
+    }
+    false
+}
+
 /// Resolve a generic parameter type (`&T` where `T: Trait`, including a
 /// trait default body's `&Self`) to the bound trait's qualified
 /// `name_path()`.
@@ -5822,6 +5967,16 @@ fn tyref_generic_trait_bound_root(
         TyRef::Dedup { id } => llbc.dedup_body(*id)?,
     };
     let param_index = typevar_bound_index(strip_ty_wrappers(node, llbc)?)?;
+    // `T: Into<String>` — the conventional message-parameter bound
+    // (`PyError::type_error(msg: impl Into<String>)`).  Such a variable
+    // is a string at the annotation level (the model maps `String` and
+    // `str` to one string type), so it resolves to the `"String"` root
+    // and the input-cell derivation seeds `s_unicode0` instead of a
+    // classdef-less instance shell whose field writes would poison
+    // classdef attr cells.
+    if typevar_bounded_by_into_string(param_index, generics, llbc) {
+        return Some("String".to_string());
+    }
     for clause in generics.get("trait_clauses")?.as_array()? {
         let Some(pred) = clause.get("trait_").and_then(|t| t.get("skip_binder")) else {
             continue;

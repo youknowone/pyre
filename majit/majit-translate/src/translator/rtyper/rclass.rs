@@ -3500,9 +3500,14 @@ impl Repr for InstanceRepr {
         let host_obj = match value {
             ConstValue::HostObject(h) => h.clone(),
             other => {
+                let class = self
+                    .classdef
+                    .as_ref()
+                    .map(|cd| cd.borrow().name.clone())
+                    .unwrap_or_else(|| "<no classdef>".to_string());
                 return Err(TyperError::message(format!(
                     "InstanceRepr.convert_const: expected HostObject or None, \
-                     got {other:?}"
+                     got {other:?} (repr class: {class})"
                 )));
             }
         };
