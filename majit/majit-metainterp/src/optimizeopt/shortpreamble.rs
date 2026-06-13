@@ -655,6 +655,14 @@ impl ShortBoxes {
         // replay arg is the label-arg Box itself (= `res`); bind its
         // producer once and share the object.
         let arg_box = ctx.materialize_box_at(arg);
+        // shortpreamble.py:255-259 — `short_inputargs` carry those same
+        // label-arg Box objects. Rebind the position-only skeleton slot
+        // from `with_label_args` so every consumer (create_short_inputargs
+        // → ExportedState → produced_short_boxes rename) shares the
+        // canonical producer-bound box.
+        if let Some(idx) = label_arg_idx {
+            self.short_inputargs[idx] = arg_box.clone();
+        }
         let mut same_as = Op::new(OpCode::same_as_for_type(arg_type), &[arg_box.clone()]);
         same_as.pos.set(arg);
         self.potential_ops.insert(
