@@ -21,6 +21,7 @@
 
 use crate::opencoder::Box as OcBox;
 use crate::recorder::Trace;
+use majit_ir::box_ref::BoxRef;
 use majit_ir::{DescrRef, GreenKey, OpCode, OpRef, Type, Value};
 use majit_trace::heapcache::HeapCache;
 
@@ -311,13 +312,14 @@ pub struct TraceCtx {
     /// pyjitpl.py:2594 frame.pc: last bytecode pc passed to trace_fn.
     /// Used by force_finish_trace segmenting to record the guard-point pc.
     pub last_traced_pc: usize,
-    /// GC-safe constant OpRefs for each initial inputarg at trace start.
-    /// Each entry is an inline `Const*` OpRef mirroring
-    /// history.py:227/268/314 (`Const*.value` lives on the box). Ref
-    /// entries are forwarded by `MetaInterp::walk_active_trace_refs`.
-    /// Used by cut_trace_from to remap escaped original inputargs to
-    /// stable inline Const OpRefs.
-    pub initial_inputarg_consts: Vec<majit_ir::OpRef>,
+    /// GC-safe constant value snapshot for each initial inputarg at trace
+    /// start. Each entry is a `BoxKind::Const` box mirroring
+    /// history.py:227/268/314 (`Const*.value` lives on the box); the inline
+    /// gcref of a Ref entry is forwarded once through the canonical
+    /// `BoxRef::walk_const_ptr_refs` by `MetaInterp::walk_active_trace_refs`.
+    /// Used by cut_trace_from to remap escaped original inputargs to their
+    /// stable Const value.
+    pub initial_inputarg_consts: Vec<BoxRef>,
     /// pyjitpl.py:1087 parity: quasi-immutable field read needs a
     /// GUARD_NOT_INVALIDATED with full snapshot at the field read's orgpc.
     /// Stores Some(orgpc) when pending.
@@ -1435,10 +1437,16 @@ impl TraceCtx {
     /// ordinary `OpRef(index)`, matching RPython's `original_boxes` list.
     pub fn initial_inputarg_argbox(&self, index: usize) -> Option<(JitArgKind, OpRef, i64)> {
         let tp = self.recorder.inputarg_types().get(index).copied()?;
-        let const_ref = self.initial_inputarg_consts.get(index).copied()?;
+        let const_box = self.initial_inputarg_consts.get(index)?;
         // history.py:227/268/314 — Const{Int,Float,Ptr}.value lives inline
-        // on the Box; `inline_const_bits` resolves it directly.
-        let bits = const_ref.inline_const_bits()?;
+        // on the Box; read it and resolve the raw bits (Int→value,
+        // Float→bit pattern, Ref→gcref address).
+        let bits = match const_box.const_value()? {
+            Value::Int(v) => v,
+            Value::Float(v) => v.to_bits() as i64,
+            Value::Ref(r) => r.0 as i64,
+            Value::Void => return None,
+        };
         let kind = match tp {
             Type::Int => JitArgKind::Int,
             Type::Ref => JitArgKind::Ref,
