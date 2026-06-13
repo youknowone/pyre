@@ -4771,6 +4771,11 @@ fn assemble_peeled_trace_with_jump_args(
     let mut current_inner_label_index: Option<usize> = None;
     let mut defs_since_inner_label: majit_ir::vec_set::VecSet<OpRef> =
         majit_ir::vec_set::VecSet::new();
+    // Combined-trace position → emitted clone, so remap hits bind to the
+    // body clone producer instead of re-minting a position-only box (SSA:
+    // a remapped arg's target clone was pushed in an earlier iteration).
+    let mut emitted_at: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, majit_ir::OpRc> =
+        crate::optimizeopt::vec_assoc::VecAssoc::new();
     for (op_idx, op) in p2_ops.iter().enumerate() {
         let mut new_op = (**op).clone();
         let mut original_args = op.getarglist_copy();
@@ -4814,7 +4819,11 @@ fn assemble_peeled_trace_with_jump_args(
                 &visible_before_label,
             );
             if mapped != arg {
-                new_op.setarg(i, BoxRef::from_opref(mapped));
+                let boxed = match emitted_at.get(&mapped) {
+                    Some(rc) => BoxRef::from_bound_op(rc),
+                    None => BoxRef::from_opref(mapped),
+                };
+                new_op.setarg(i, boxed);
             }
         }
         if new_op.opcode == OpCode::Label {
@@ -5000,7 +5009,11 @@ fn assemble_peeled_trace_with_jump_args(
                     if seen_body_defs.contains(&a.to_opref())
                         && !visible_before_label.contains(&a.to_opref())
                     {
-                        *a = majit_ir::operand::Operand::from_boxref(&BoxRef::from_opref(mapped));
+                        let boxed = match emitted_at.get(&mapped) {
+                            Some(rc) => BoxRef::from_bound_op(rc),
+                            None => BoxRef::from_opref(mapped),
+                        };
+                        *a = majit_ir::operand::Operand::from_boxref(&boxed);
                     }
                 }
             }
@@ -5060,7 +5073,11 @@ fn assemble_peeled_trace_with_jump_args(
         // fail_index for the sharing-path guard. Both phases of the
         // unroll optimizer therefore emit body guards with unique
         // descrs already; no post-process re-stamping is needed.
-        result.push(std::rc::Rc::new(new_op));
+        let new_rc = std::rc::Rc::new(new_op);
+        if new_rc.result_type() != Type::Void && !new_rc.pos.get().is_none() {
+            emitted_at.insert(new_rc.pos.get(), new_rc.clone());
+        }
+        result.push(new_rc);
         if op.opcode == OpCode::Label {
             current_inner_label_index = Some(result.len() - 1);
             defs_since_inner_label.clear();

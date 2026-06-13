@@ -5070,12 +5070,17 @@ impl<M: Clone> MetaInterp<M> {
                 .is_some_and(|op| op.opcode == OpCode::Label)
         {
             // compile.py:251-259 compile_simple_loop synthesizes
-            // LABEL(inputargs) before the optimized body.
+            // LABEL(inputargs) before the optimized body. The retry path's
+            // root_inputargs are value copies of `trace.inputargs`
+            // (inputargs_cloned above); bind the label args to the
+            // TreeLoop's canonical InputArgRc producers instead of
+            // re-minting position-only boxes.
             let mut label_op = majit_ir::Op::new(
                 majit_ir::OpCode::Label,
-                &root_inputargs
+                &trace
+                    .inputargs
                     .iter()
-                    .map(|ia| BoxRef::from_opref(ia.opref()))
+                    .map(BoxRef::from_bound_inputarg)
                     .collect::<Vec<_>>(),
             );
             label_op.pos.set(majit_ir::OpRef::NONE);
@@ -5205,11 +5210,15 @@ impl<M: Clone> MetaInterp<M> {
             if let Some(label_op) = compiled_ops.iter().find(|op| op.opcode == OpCode::Label) {
                 label_op.setdescr(target_token.as_jump_target_descr());
             } else {
+                // Same canonical-producer bind as the Label synthesis
+                // above: the retry path's inputargs mirror
+                // `trace.inputargs` slot-for-slot.
                 let mut label_op = majit_ir::Op::new(
                     majit_ir::OpCode::Label,
-                    &inputargs
+                    &trace
+                        .inputargs
                         .iter()
-                        .map(|ia| BoxRef::from_opref(ia.opref()))
+                        .map(BoxRef::from_bound_inputarg)
                         .collect::<Vec<_>>(),
                 );
                 label_op.pos.set(majit_ir::OpRef::NONE);
