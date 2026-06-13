@@ -10492,9 +10492,22 @@ impl OpcodeStepExecutor for MIFrame {
             s.current_exc_value = prev_exc.concrete.to_pyobj();
             s.current_exc_box = prev_exc.opref;
         }
+        // POP_EXCEPT pops the saved exc_info (prev_exc). The matching
+        // POP_TOP that discards the caught exception runs through the
+        // generic opcode executor, which updates the symbolic stack
+        // (`pop_value`) but not this concrete frame — so the exception
+        // object pushed at handler entry (`finishframe_exception` /
+        // `push_exc_info`) is still on the concrete frame above prev_exc.
+        // Unwind to the symbolic baseline (authoritative once the handler
+        // block closes) rather than popping a single slot, so the
+        // closing-jump's `concrete_valuestackdepth()` matches the loop
+        // entry instead of carrying the stale exception slot.
+        let target_vsd = self.sym().valuestackdepth;
         let frame =
             unsafe { &mut *(self.concrete_frame_addr as *mut pyre_interpreter::pyframe::PyFrame) };
-        let _ = frame.pop();
+        while frame.valuestackdepth > target_vsd {
+            let _ = frame.pop();
+        }
         // RPython pyjitpl.py:2751 clear_exception: exception fully handled.
         let s = self.sym_mut();
         s.last_exc_value = std::ptr::null_mut();
