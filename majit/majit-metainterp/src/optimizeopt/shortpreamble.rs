@@ -2249,17 +2249,24 @@ impl ShortPreambleBuilder {
     /// shortpreamble.py:432-440: add_preamble_op(preamble_op)
     /// Called from optimizer.force_box when popping from potential_extra_ops.
     ///
-    /// RPython unconditionally appends to used_boxes and short_preamble_jump
-    /// without any produced_short_boxes lookup:
+    /// RPython unconditionally uses the carried `preamble_op` with no
+    /// produced_short_boxes lookup:
     ///   op = preamble_op.op.get_box_replacement()
+    ///   if preamble_op.invented_name: self.extra_same_as.append(op)
     ///   self.used_boxes.append(op)
     ///   self.short_preamble_jump.append(preamble_op.preamble_op)
-    /// shortpreamble.py:432-440: add_preamble_op(preamble_op)
-    /// RPython unconditionally appends:
-    ///   op = preamble_op.op.get_box_replacement()
-    ///   self.used_boxes.append(op)
-    ///   self.short_preamble_jump.append(preamble_op.preamble_op)
-    /// shortpreamble.py:432-440: add_preamble_op(preamble_op)
+    ///
+    /// The `else` arm below is that unconditional pattern. The `if` arm
+    /// (map lookup) is a pyre-only side table and CANNOT yet collapse onto
+    /// the `else`: for an invented-name CompoundOp alternate the map entry's
+    /// `same_as_source` is the ORIGINAL aliased box, whereas the carried
+    /// `info::PreambleOp` only knows `op` (the invented SameAs name itself).
+    /// `record_imported_preamble_use` builds `same_as(source)`, so the `else`
+    /// arm would emit `same_as(invented_name)` — a self-alias — instead of
+    /// `same_as(original)`. (Empirically: map source `IntOp(14)` vs carried
+    /// `op` `IntOp(30)`.) Collapsing this (#149) requires threading
+    /// `same_as_source` onto `info::PreambleOp` (field_entry::PreambleOp) at
+    /// the export sites so the carried pop reproduces the map entry's record.
     pub fn add_preamble_op_from_pop(
         &mut self,
         preamble_op: &crate::optimizeopt::info::PreambleOp,
