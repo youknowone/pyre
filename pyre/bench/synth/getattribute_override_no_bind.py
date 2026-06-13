@@ -1,13 +1,19 @@
-# A non-default `__getattribute__` must suppress LOAD_METHOD self-binding.
-# The override returns the raw function object (`type(self).__dict__[name]`),
-# never a bound method, so `c.f(...)` must call `f(...)` with exactly the
-# supplied positionals — no implicit self.  `compute_load_method_bound`
-# (shared by the interpreter `load_method` and the blackhole
-# `bh_load_method_self_fn`) used to infer the binding from MRO shape alone and
-# wrongly prepend self, inflating `len(args)` by one.
+# Two regressions in one hot loop:
 #
-# Straight-line so it stays in the interpreter: a hot loop calling through a
-# custom `__getattribute__` trips a separate, pre-existing JIT crash.
+# 1. Binding: a non-default `__getattribute__` must suppress LOAD_METHOD
+#    self-binding.  The override returns the raw function object
+#    (`type(self).__dict__[name]`), never a bound method, so `c.f(i)` calls
+#    `f(i)` (a single positional, no implicit self).  `compute_load_method_bound`
+#    (shared by the interpreter `load_method` and the blackhole
+#    `bh_load_method_self_fn`) used to infer the binding from MRO shape alone
+#    and wrongly prepend self, making `len(args)` 2 instead of 1.
+#
+# 2. GC: `type.__dict__` caches its canonical `W_DictObject` in the type
+#    namespace's off-GC `DictStorage.mirror_target`.  The moving collector did
+#    not forward that field, so once the loop's allocations triggered a minor
+#    collection the cache dangled and the next `__dict__` access returned a
+#    wild pointer (SIGSEGV in `getitem`).  The loop count is large enough to
+#    force collections through the blackhole-resumed `__getattribute__`.
 class C:
     def f(*args):
         return len(args)
@@ -16,7 +22,13 @@ class C:
         return type(self).__dict__[name]
 
 
-c = C()
-print(c.f())
-print(c.f(1))
-print(c.f(1, 2))
+def run(c, n):
+    total = 0
+    i = 0
+    while i < n:
+        total += c.f(i)
+        i += 1
+    return total
+
+
+print(run(C(), 300000))

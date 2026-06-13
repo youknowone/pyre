@@ -364,6 +364,21 @@ impl DictStorage {
         self.mirror_target
     }
 
+    /// Mutable handle to the `mirror_target` slot for in-place GC
+    /// forwarding (`None` when no mirror is bound).  The cached canonical
+    /// `W_DictObject` is GC-managed and reachable only through this off-GC
+    /// field, so an owner's root walk must forward it or a moving
+    /// collection relocates/reclaims the dict and leaves the cache
+    /// dangling.
+    #[inline]
+    pub fn mirror_target_slot_mut(&mut self) -> Option<&mut pyre_object::PyObjectRef> {
+        if self.mirror_target.is_null() {
+            None
+        } else {
+            Some(&mut self.mirror_target)
+        }
+    }
+
     /// Reallocate `values` to fit at least `min_cap` entries, copying
     /// the live prefix. Upstream `_ll_list_resize_really`
     /// (rlist.py:262-267) parity.

@@ -256,6 +256,16 @@ pub unsafe fn type_walk_namespace_values(
                 for slot in value_slots {
                     forward(&mut *slot);
                 }
+                // The lazily-cached canonical `W_DictObject` that
+                // `type.__dict__` returns (`dict_storage_to_dict_kind`'s
+                // `mirror_target`) is GC-managed but reachable only through
+                // this off-GC storage field; forward it so a minor
+                // collection that relocates or reclaims it updates the
+                // cache instead of returning a dangling pointer on the next
+                // `__dict__` access.
+                if let Some(slot) = (*dict_ptr).mirror_target_slot_mut() {
+                    forward(slot);
+                }
             }
         }
     }
