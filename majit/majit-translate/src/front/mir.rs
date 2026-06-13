@@ -549,7 +549,17 @@ fn derive_program_metadata(
                     for (i, f) in v.fields.iter().enumerate() {
                         let fname = f.name.clone().unwrap_or_else(|| format!("__pos_{i}"));
                         if seen.insert(fname.clone()) {
-                            rows.push((fname, tyref_to_ast_string(&f.ty, llbc)));
+                            // Zero-sized `Arg<T>` oparg markers row as a
+                            // plain integer — the Opaque external decl
+                            // has no projectable shape and the marker
+                            // value is never read (see
+                            // `tyref_is_bytecode_arg_marker`).
+                            let row_ty = if tyref_is_bytecode_arg_marker(&f.ty, llbc) {
+                                "u32".to_string()
+                            } else {
+                                tyref_to_ast_string(&f.ty, llbc)
+                            };
+                            rows.push((fname, row_ty));
                         }
                     }
                 }
@@ -571,6 +581,19 @@ fn derive_program_metadata(
                     enum_variant_by_discriminant.insert(name.clone(), by_discr.clone());
                     enum_variant_by_discriminant.insert(leaf, by_discr);
                 }
+            }
+            TypeDeclKind::Opaque if name == "rustpython_compiler_core::bytecode::oparg::OpArg" => {
+                // `pub struct OpArg(u32)` (oparg.rs:57) — the decl body
+                // is external to the extraction, but the word field is
+                // the one payload the devirtualized accessor family
+                // reads (`Lowering::bytecode_accessor_devirt`), so the
+                // row is synthesized from the documented upstream
+                // definition.
+                let rows = vec![("__pos_0".to_string(), "u32".to_string())];
+                struct_fields.fields.insert(name.clone(), rows.clone());
+                struct_fields.fields.insert("OpArg".to_string(), rows);
+                known_struct_names.insert(name);
+                known_struct_names.insert("OpArg".to_string());
             }
             TypeDeclKind::Alias(_) | TypeDeclKind::Opaque | TypeDeclKind::Unknown => {}
         }
@@ -867,6 +890,12 @@ struct Lowering<'a> {
     /// this map to emit `ArrayWrite` rather than the opaque
     /// `__deref_write` marker.
     index_elem_alias: std::collections::HashMap<usize, (Variable, Variable)>,
+    /// MIR locals bound by a devirtualized infallible widening
+    /// `usize::try_from(u8|u16|u32)` call.  The value is the source
+    /// integer itself (the conversion cannot fail on 64-bit targets),
+    /// so the paired `Result::expect` on such a local also aliases it
+    /// — see [`Lowering::is_infallible_widening_try_from`].
+    infallible_result_locals: std::collections::HashSet<usize>,
 }
 
 impl<'a> Lowering<'a> {
@@ -993,6 +1022,7 @@ impl<'a> Lowering<'a> {
             positional_aggregate_locals: std::collections::HashMap::new(),
             binop_result_locals: compute_binop_result_locals(body),
             index_elem_alias: std::collections::HashMap::new(),
+            infallible_result_locals: std::collections::HashSet::new(),
         })
     }
 
@@ -2854,6 +2884,16 @@ impl<'a> Lowering<'a> {
 
         // Resolve arguments before deciding the call shape so receiver
         // resolution and `dyn` operand handling share the same path.
+        // The first operand's MIR local (if it is one) feeds the
+        // paired `try_from`/`expect` devirtualization below, which
+        // keys on `infallible_result_locals`.
+        let first_arg_local = call.args.first().and_then(|op| match op {
+            Operand::Move(p) | Operand::Copy(p) => match &p.kind {
+                PlaceKind::Local(i) => Some(*i as usize),
+                _ => None,
+            },
+            Operand::Const(_) => None,
+        });
         let mut args: Vec<Variable> = Vec::with_capacity(call.args.len());
         for op in call.args {
             args.push(self.resolve_operand(mir_bb, op)?);
@@ -2915,6 +2955,68 @@ impl<'a> Lowering<'a> {
                     self.index_elem_alias
                         .insert(dest_local, (args[0].clone(), args[1].clone()));
                     self.local_var[dest_local] = Some(res);
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
+                // Opaque `rustpython_compiler_core::bytecode` oparg
+                // accessors — `Arg<T>::get(self, arg)` is
+                // `T::try_from(u32::from(arg))` (instruction.rs:1286-
+                // 1292) and the `oparg` conversions are word-level
+                // numeric, so in the lifted model each reduces to the
+                // `OpArg(u32)` word read or to its argument.
+                if let Some(acc) = self.bytecode_accessor_devirt(&reg, args.len()) {
+                    match acc {
+                        BytecodeAccessor::OpArgWord(i) => {
+                            let res = self
+                                .graph
+                                .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                                result: Some(res.clone()),
+                                kind: OpKind::FieldRead {
+                                    base: args[i].clone(),
+                                    field: FieldDescriptor::new(
+                                        "__pos_0".to_string(),
+                                        Some("OpArg".to_string()),
+                                    ),
+                                    ty: ValueType::Int,
+                                    pure: false,
+                                },
+                            });
+                            self.local_var[dest_local] = Some(res);
+                        }
+                        BytecodeAccessor::Identity(i) => {
+                            self.local_var[dest_local] = Some(args[i].clone());
+                        }
+                    }
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
+                // `usize::try_from(x).expect(…)` where `x` is u8/u16/
+                // u32 — a widening conversion that cannot fail on the
+                // 64-bit targets pyre supports, routed through the
+                // Opaque `ptr_try_from_impls` core impls.  `try_from`
+                // aliases its argument and records the destination
+                // local; the paired `expect` on that local unwraps by
+                // aliasing the same value.  A fallible source width
+                // never matches, so genuine error paths keep their
+                // ordinary call lowering.
+                if args.len() == 1 && self.is_infallible_widening_try_from(&reg) {
+                    self.infallible_result_locals.insert(dest_local);
+                    self.local_var[dest_local] = Some(args[0].clone());
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
+                if args.len() == 2
+                    && first_arg_local.is_some_and(|l| self.infallible_result_locals.contains(&l))
+                    && self.is_result_expect(&reg)
+                {
+                    self.local_var[dest_local] = Some(args[0].clone());
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -3246,6 +3348,112 @@ impl<'a> Lowering<'a> {
         Some((owner_leaf, leaf))
     }
 
+    /// `arr[i]` / `arr[i] = v` on a workspace fixed-array type —
+    /// resolves to its `Index::index` / `IndexMut::index_mut` impl,
+    /// whose body bottoms out at raw-slice construction
+    /// (`as_mut_slice` → `from_raw_parts`) with no graph lowering.
+    /// The structs are length-prefixed GcArray layouts (see
+    /// `FixedObjectArray`), so the callsite IS RPython's
+    /// getarrayitem/setarrayitem on the receiver and is devirtualized
+    /// to `ArrayRead`/`ArrayWrite` by the caller.
+    fn is_workspace_index_call(&self, reg: &RegularCall) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        let Some(fd) = self.llbc.fn_by_id(*id) else {
+            return false;
+        };
+        let path = fd.item_meta.name_path();
+        let leaf = path.rsplit("::").next().unwrap_or("");
+        (leaf == "index" || leaf == "index_mut") && path.starts_with("pyre_")
+    }
+
+    /// `usize::try_from` (`ptr_try_from_impls`, Opaque core code)
+    /// applied to a u8/u16/u32 source — always `Ok` when the target
+    /// is pointer-width on 64-bit, so the call aliases its argument
+    /// (see the paired `expect` handling in [`Self::lower_call`]).
+    fn is_infallible_widening_try_from(&self, reg: &RegularCall) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        let Some(fd) = self.llbc.fn_by_id(*id) else {
+            return false;
+        };
+        if fd.item_meta.name_path() != "core::convert::num::ptr_try_from_impls::<Impl>::try_from" {
+            return false;
+        }
+        fd.signature.inputs.first().is_some_and(|t| {
+            tyref_node(t, self.llbc)
+                .and_then(|n| strip_ty_wrappers(n, self.llbc))
+                .and_then(|n| n.get("Literal"))
+                .and_then(|l| l.get("UInt"))
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|w| matches!(w, "U8" | "U16" | "U32"))
+        })
+    }
+
+    /// `Result::expect` (Opaque core code) — only devirtualized when
+    /// the receiver local was bound by an infallible `try_from` above.
+    fn is_result_expect(&self, reg: &RegularCall) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        self.llbc
+            .fn_by_id(*id)
+            .is_some_and(|fd| fd.item_meta.name_path() == "core::result::<Impl>::expect")
+    }
+
+    /// Classify a call to one of the opaque
+    /// `rustpython_compiler_core::bytecode` oparg accessors.  The
+    /// external crate's bodies are Opaque in the LLBC; their
+    /// documented definitions are word-level numeric:
+    ///
+    /// - `Arg<T>::get(self, arg: OpArg) -> T` is
+    ///   `T::try_from(u32::from(arg)).unwrap()` (instruction.rs:1286-
+    ///   1292) — the ZST marker receiver carries nothing; the result
+    ///   is `arg`'s `u32` word.
+    /// - `u32::from(OpArg)` / `OpArg::as_usize` read the same word
+    ///   (`pub struct OpArg(u32)`, oparg.rs:57).
+    /// - the remaining `oparg` `From` impls (`u32::from(RaiseKind)`
+    ///   etc.) and `as_usize` on word-sized newtypes (`Label`,
+    ///   `VarNum`) are numeric identity on an argument the lifted
+    ///   model already carries as an integer.
+    ///
+    /// Packed-word extractors (`idx_1` / `idx_2` / `is_method` /
+    /// `name_idx`) and `OpArgState::get` are NOT identities and are
+    /// left as ordinary calls.
+    fn bytecode_accessor_devirt(
+        &self,
+        reg: &RegularCall,
+        nargs: usize,
+    ) -> Option<BytecodeAccessor> {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return None;
+        };
+        let fd = self.llbc.fn_by_id(*id)?;
+        match fd.item_meta.name_path().as_str() {
+            "rustpython_compiler_core::bytecode::instruction::<Impl>::get" if nargs == 2 => {
+                Some(BytecodeAccessor::OpArgWord(1))
+            }
+            "rustpython_compiler_core::bytecode::oparg::<Impl>::as_usize"
+            | "rustpython_compiler_core::bytecode::oparg::<Impl>::from"
+                if nargs == 1 =>
+            {
+                let is_oparg = fd
+                    .signature
+                    .inputs
+                    .first()
+                    .is_some_and(|t| tyref_is_oparg_adt(t, self.llbc));
+                Some(if is_oparg {
+                    BytecodeAccessor::OpArgWord(0)
+                } else {
+                    BytecodeAccessor::Identity(0)
+                })
+            }
+            _ => None,
+        }
+    }
+
     /// Devirtualize a callsite of the blanket
     /// `impl<T, U: From<T>> Into<U> for T` (`core::convert::<Impl>::into`).
     ///
@@ -3270,26 +3478,6 @@ impl<'a> Lowering<'a> {
     /// Returns `None` (caller keeps the blanket-into path) when the
     /// obligation is unresolved (`kind` is a clause/builtin rather
     /// than `TraitImpl`) or any table lookup misses.
-    /// `arr[i]` / `arr[i] = v` on a workspace fixed-array type —
-    /// resolves to its `Index::index` / `IndexMut::index_mut` impl,
-    /// whose body bottoms out at raw-slice construction
-    /// (`as_mut_slice` → `from_raw_parts`) with no graph lowering.
-    /// The structs are length-prefixed GcArray layouts (see
-    /// `FixedObjectArray`), so the callsite IS RPython's
-    /// getarrayitem/setarrayitem on the receiver and is devirtualized
-    /// to `ArrayRead`/`ArrayWrite` by the caller.
-    fn is_workspace_index_call(&self, reg: &RegularCall) -> bool {
-        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
-            return false;
-        };
-        let Some(fd) = self.llbc.fn_by_id(*id) else {
-            return false;
-        };
-        let path = fd.item_meta.name_path();
-        let leaf = path.rsplit("::").next().unwrap_or("");
-        (leaf == "index" || leaf == "index_mut") && path.starts_with("pyre_")
-    }
-
     fn blanket_into_devirt(&self, reg: &RegularCall) -> Option<IntoDevirt> {
         let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
             return None;
@@ -4548,6 +4736,44 @@ fn tyref_is_string_adt(ty: &TyRef, llbc: &Llbc) -> bool {
         .and_then(adt_node_def_id)
         .and_then(|id| llbc.type_by_id(id))
         .is_some_and(|td| td.item_meta.name_path() == "alloc::string::String")
+}
+
+/// How a devirtualized opaque bytecode oparg accessor binds its
+/// destination — see [`Lowering::bytecode_accessor_devirt`].
+enum BytecodeAccessor {
+    /// Read the `OpArg(u32)` word of the argument at this index.
+    OpArgWord(usize),
+    /// Alias the argument at this index (word-level numeric identity).
+    Identity(usize),
+}
+
+/// The qualified declaration path of a `TyRef`'s base ADT, after
+/// stripping `Ref` / hash-cons wrappers.  `None` for non-ADT types.
+fn adt_path_of_tyref(ty: &TyRef, llbc: &Llbc) -> Option<String> {
+    let node = tyref_node(ty, llbc)?;
+    let node = strip_ty_wrappers(node, llbc)?;
+    let id = adt_node_def_id(node)?;
+    Some(llbc.type_by_id(id)?.item_meta.name_path())
+}
+
+/// `Arg<T>` from `rustpython_compiler_core::bytecode::instruction` —
+/// the zero-sized oparg marker (`pub struct Arg<T: OpArgType>
+/// (PhantomData<T>)`, instruction.rs:1262).  The external decl is
+/// Opaque in the LLBC, so a payload row spelled through it would
+/// project to an attr the annotator cannot type; the lifted model
+/// carries the marker as a plain integer instead (its only consumer,
+/// `Arg::get`, is devirtualized by [`Lowering::bytecode_accessor_devirt`]
+/// and never reads it).
+fn tyref_is_bytecode_arg_marker(ty: &TyRef, llbc: &Llbc) -> bool {
+    adt_path_of_tyref(ty, llbc)
+        .is_some_and(|p| p == "rustpython_compiler_core::bytecode::instruction::Arg")
+}
+
+/// `OpArg` from `rustpython_compiler_core::bytecode::oparg` —
+/// `pub struct OpArg(u32)` (oparg.rs:57), Opaque in the LLBC.
+fn tyref_is_oparg_adt(ty: &TyRef, llbc: &Llbc) -> bool {
+    adt_path_of_tyref(ty, llbc)
+        .is_some_and(|p| p == "rustpython_compiler_core::bytecode::oparg::OpArg")
 }
 
 /// The ADT def_id of an (already wrapper-stripped) type node, or
