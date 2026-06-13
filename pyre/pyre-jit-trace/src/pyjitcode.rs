@@ -208,8 +208,9 @@ pub struct PyJitCodePayload {
     pub code_ptr: *const pyre_interpreter::CodeObject,
     /// pyre-only wrapper identity for trace-side jitcode lookup.
     pub w_code: *const (),
-    /// True if the jitcode contains BC_ABORT opcodes (unsupported bytecodes).
-    /// Precomputed at compile time to avoid repeated bytecode scanning.
+    /// True if the jitcode contains an `abort` or `abort_permanent` opcode
+    /// (unsupported bytecodes / emission-time bail-outs). Precomputed at
+    /// compile time to avoid repeated bytecode scanning.
     pub has_abort: bool,
     /// Python PC of the jit_merge_point opcode (trace entry header).
     pub merge_point_pc: Option<usize>,
