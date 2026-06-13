@@ -216,7 +216,7 @@ fn make_simple_compile_views<'a>(
 /// than installing an unsound loop.
 ///
 /// Returns the offending slot index, or `None` when the contract is consistent.
-fn cross_loop_cut_label_jump_null_guard_slot(ops: &[Op]) -> Option<usize> {
+fn cross_loop_cut_label_jump_null_guard_slot(ops: &[majit_ir::OpRc]) -> Option<usize> {
     let label = ops.first().filter(|op| op.opcode == OpCode::Label)?;
     let jump = ops.last().filter(|op| op.opcode == OpCode::Jump)?;
     let label_slots: Vec<OpRef> = (0..label.num_args())
