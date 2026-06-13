@@ -738,6 +738,11 @@ pub fn lower_fun_decl_with_static_addrs(
     // dead-op sweep the Abort → RaiseImplicit fold uses.
     let result_exc_callee = crate::front::result_exc::in_result_exc_scope(&name)
         && crate::front::result_exc::tyref_is_result_of_pyerror(&fd.signature.output, llbc);
+    // A `Result<(), PyError>` scoped callee returns void after the
+    // exception-link lowering; widen its returnblock so the call
+    // descriptor's `FUNC.RESULT` is `v`, not the `Ref`-typed unit shell.
+    let result_exc_ok_is_unit = result_exc_callee
+        && crate::front::result_exc::tyref_result_ok_is_unit(&fd.signature.output, llbc);
     let finish = |lo: &mut Lowering<'_>| -> Result<(), LowerError> {
         if !lo.result_exc_call_results.is_empty() || result_exc_callee {
             // The exception-link transforms run on a simplified graph,
@@ -766,6 +771,32 @@ pub fn lower_fun_decl_with_static_addrs(
                 tail_forwarded_returns,
             )
             .map_err(LowerError::Unsupported)?;
+            if result_exc_ok_is_unit {
+                // Stamp `FUNC.RESULT = void`.  The exception-link lowering
+                // already returns the unit `()` (the callee no longer
+                // builds a `Result` shell), but `front::mir` types every
+                // aggregate — including `()` — as `Ref`, so the CFG return
+                // kind is still `r`.  The codewriter reconciles this by
+                // collapsing the returnblock to a genuine void return
+                // post-annotation (the `declared==v && cfg==r` gate),
+                // mirroring `exceptiontransform.py` running after rtyping;
+                // doing the structural collapse here, before the
+                // whole-program annotation fixpoint, destabilises it.
+                lo.graph.return_type = Some("()".to_string());
+            }
+        }
+        // The `?`-diamond rewrite (`rewire_result_exc_call_sites`) detaches
+        // the pre-rewrite branch / discriminant / break blocks: the call
+        // block now exits straight to the continue arm and `exceptblock`,
+        // so those blocks lose their only predecessor.  RPython graph
+        // consumers only iterate blocks reachable from `startblock`
+        // (`flowspace/model.py:66 iterblocks`), so drop the now-unreachable
+        // blocks here — before `prune_dead_phis`, which would otherwise
+        // treat a no-predecessor block as an extra root
+        // (`transform_dead_op_vars`'s start set), and before the
+        // `jit_codewriter` consumers that scan `graph.blocks` directly.
+        if !lo.result_exc_call_results.is_empty() || result_exc_callee {
+            crate::model::clear_unreachable_blocks(&mut lo.graph);
         }
         simplify_lowered_graph(&mut lo.graph);
         Ok(())
@@ -5277,7 +5308,11 @@ fn tyref_to_ast_string(ty: &TyRef, llbc: &Llbc) -> String {
 /// Recursive worker for [`tyref_to_ast_string`] operating on a raw
 /// Charon type-expression `Value` (a TyRef body or a nested
 /// generic-argument type).  `depth` guards against pathological cycles.
-fn charon_type_value_to_ast_string(v: &serde_json::Value, llbc: &Llbc, depth: usize) -> String {
+pub(crate) fn charon_type_value_to_ast_string(
+    v: &serde_json::Value,
+    llbc: &Llbc,
+    depth: usize,
+) -> String {
     if depth > 24 {
         return "??deep".to_string();
     }

@@ -29,6 +29,45 @@ fn interp() -> &'static Llbc {
 }
 
 #[test]
+fn unit_result_callee_declares_void_return() {
+    // A `Result<(), PyError>` scoped callee returns void after the
+    // exception-link lowering, so `front::mir` stamps `return_type =
+    // "()"` (`FUNC.RESULT = void`); the codewriter then collapses the
+    // returnblock to a genuine void return post-annotation.  Without the
+    // stamp the call descriptor would read `r` for the `Ref`-typed unit
+    // `()` shell.  Covered: the callee-rule `Ok(())` (`store_local_value`)
+    // and the tail-forward `f(...)?` (`store_fast` / `store_fast_store_fast`).
+    for name in [
+        "pyre_interpreter::eval::<Impl>::store_local_value",
+        "pyre_interpreter::pyopcode::OpcodeStepExecutor::store_fast",
+        "pyre_interpreter::pyopcode::OpcodeStepExecutor::store_fast_store_fast",
+    ] {
+        let g = lower_function(interp(), name).expect("lower");
+        assert_eq!(
+            g.return_type.as_deref(),
+            Some("()"),
+            "{name}: Result<(), PyError> callee must declare FUNC.RESULT = void"
+        );
+    }
+
+    // A non-unit `Result<T, PyError>` callee is not void-widened:
+    // `pop_value` returns `Result<PyObjectRef, PyError>`, so it carries
+    // no void stamp and keeps its single ref return variable.
+    let pv = lower_function(interp(), "pyre_interpreter::eval::<Impl>::pop_value")
+        .expect("lower pop_value");
+    assert_ne!(
+        pv.return_type.as_deref(),
+        Some("()"),
+        "pop_value returns a value, not void"
+    );
+    assert_eq!(
+        pv.block(pv.returnblock).inputargs.len(),
+        1,
+        "pop_value returns a value; its returnblock keeps the return var"
+    );
+}
+
+#[test]
 fn pop_value_lowers_to_raise_links() {
     let llbc = interp();
     let graph =

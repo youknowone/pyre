@@ -170,6 +170,60 @@ pub(crate) fn tyref_is_result_of_pyerror(ty: &TyRef, llbc: &Llbc) -> bool {
     adt_path_of(err_body, llbc).is_some_and(|p| p == "pyre_interpreter::error::PyError")
 }
 
+/// True when `ty` is `Result<(), PyError>` — the Ok payload is the unit
+/// type.  Such a callee returns void after the exception-link lowering
+/// (`exceptiontransform.py` widens the value-encoded result to the inner
+/// type, which is `Void` for the unit case), so its return must be
+/// widened to a genuine void return rather than forwarding the unit
+/// `()` value as a `Ref`-typed shell — see [`widen_unit_return_to_void`].
+pub(crate) fn tyref_result_ok_is_unit(ty: &TyRef, llbc: &Llbc) -> bool {
+    let body = match ty {
+        TyRef::Inline { value: (_, v) } => v,
+        TyRef::Other(v) => v,
+        TyRef::Dedup { id } => match llbc.dedup_body(*id) {
+            Some(v) => v,
+            None => return false,
+        },
+    };
+    if adt_path_of(body, llbc).as_deref() != Some("core::result::Result") {
+        return false;
+    }
+    let Some(ok_slot) = body
+        .get("Adt")
+        .and_then(|a| a.get("generics"))
+        .and_then(|g| g.get("types"))
+        .and_then(|t| t.get(0))
+    else {
+        return false;
+    };
+    crate::front::mir::charon_type_value_to_ast_string(ok_slot, llbc, 0) == "()"
+}
+
+/// Collapse a scoped callee's returnblock to a genuine void return.
+///
+/// A `Result<(), PyError>` callee carries the unit `Ok` payload as a
+/// `Ref`-typed value: the callee rule forwards the `()` aggregate (a
+/// niladic transparent ctor, `front::mir` types every aggregate as
+/// `Ref`), and a tail-forwarded `f(...)?` carries the inner callee's
+/// `Ref` call result.  Either way the returnblock's return variable
+/// colours `GcRef`, so `graph_result_kind` (and thus the call
+/// descriptor's `FUNC.RESULT`) reads `r` for a function that
+/// `exceptiontransform.py` would return `Void`.  Drop the return
+/// variable and every arg on the exits feeding it; an empty returnblock
+/// `inputargs` is the void-return shape `graph_result_kind` maps to
+/// `v`.  The now-dead unit producers are left to the dead-op sweep.
+pub(crate) fn widen_unit_return_to_void(graph: &mut FunctionGraph) {
+    let returnblock = graph.returnblock;
+    for block in &mut graph.blocks {
+        for link in &mut block.exits {
+            if link.target == returnblock {
+                link.args.clear();
+            }
+        }
+    }
+    graph.blocks[returnblock.0].inputargs.clear();
+}
+
 /// Is `target` the `Result::Ok` / `Result::Err` transparent ctor?
 fn result_ctor_kind(target: &CallTarget) -> Option<bool> {
     let CallTarget::SyntheticTransparentCtor { name, owner_path } = target else {
