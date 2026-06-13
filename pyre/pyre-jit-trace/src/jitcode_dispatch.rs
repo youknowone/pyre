@@ -2694,8 +2694,10 @@ fn setfield_gc_via_heapcache(
 /// that fires `executor.execute(cpu, metainterp, opnum, fielddescr,
 /// box)` and returns `ConstInt/ConstFloat/ConstPtr(resvalue)` —
 /// recording NO trace op (the value is directly substituted as a Const
-/// literal). The symbolic walker has no `executor.execute` (no cpu /
-/// concrete box pair), so the fast path is structurally unreachable.
+/// literal). The walker's `executor.execute` counterpart is
+/// `field_sanity_load`, so the fast path is implemented: a constant
+/// source register through an always-pure descr folds to the loaded
+/// value as a Const literal with no recorded op.
 ///
 /// Walker behaviour mirrors `_opimpl_getfield_gc_any_pureornot`
 /// uniformly: heapcache hit returns the cached box (no IR op);
@@ -2721,7 +2723,43 @@ fn getfield_gc_via_heapcache(
     let descr = read_descr(code, op, 1, ctx)?;
     let descr_index = descr.index();
 
-    let result = if let Some(cached) = ctx.trace_ctx.heapcache_getfield_cached(obj, descr_index) {
+    // ConstPtr + always-pure fast path (pyjitpl.py:856-860): a constant
+    // source through an immutable descr loads the field now and
+    // substitutes the value as a Const literal, recording no op.
+    let const_pure_result = if obj.is_constant() && descr.is_always_pure() {
+        let load_type = match opcode {
+            OpCode::GetfieldGcI | OpCode::GetfieldGcPureI => Some(majit_ir::Type::Int),
+            OpCode::GetfieldGcR | OpCode::GetfieldGcPureR => Some(majit_ir::Type::Ref),
+            OpCode::GetfieldGcF | OpCode::GetfieldGcPureF => Some(majit_ir::Type::Float),
+            _ => None,
+        };
+        let struct_ptr = match ctx.trace_ctx.box_value(obj) {
+            Some(majit_ir::Value::Ref(struct_ref)) => {
+                let p = struct_ref.0 as i64;
+                (p != 0 && p != usize::MAX as i64).then_some(p)
+            }
+            _ => None,
+        };
+        match (load_type, struct_ptr) {
+            (Some(ty), Some(p)) => {
+                ctx.trace_ctx
+                    .field_sanity_load(p, &descr, ty)
+                    .map(|v| match v {
+                        majit_ir::Value::Int(n) => ctx.trace_ctx.const_int(n),
+                        majit_ir::Value::Ref(r) => ctx.trace_ctx.const_ref(r.0 as i64),
+                        majit_ir::Value::Float(f) => ctx.trace_ctx.const_float(f.to_bits() as i64),
+                        _ => unreachable!("field_sanity_load returns Int/Ref/Float only"),
+                    })
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
+
+    let result = if let Some(constant) = const_pure_result {
+        constant
+    } else if let Some(cached) = ctx.trace_ctx.heapcache_getfield_cached(obj, descr_index) {
         // Cache hit (RPython pyjitpl.py:929-947 _opimpl_getfield_gc_any_pureornot):
         //   if upd.currfieldbox is not None:
         //       self.metainterp.staticdata.profiler.count_ops(rop.GETFIELD_GC_I, Counters.HEAPCACHED_OPS)

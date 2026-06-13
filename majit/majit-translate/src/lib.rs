@@ -890,20 +890,19 @@ fn analyze_pipeline_from_module_paths(
             // the motivating members are the exception-handler pair
             // whose empty defaults broke generic-dispatch resolution.
             const DEFAULT_SHADOW_DEVIRT_SCOPE: &[&str] = &["push_exc_info", "pop_except"];
-            let devirt: Option<(&str, &front::semantic::SemanticFunction)> = if is_default
-                && DEFAULT_SHADOW_DEVIRT_SCOPE.contains(&method.name.as_str())
-            {
-                trait_method_overrides
-                    .get(&(impl_info.trait_name.as_str(), method.name.as_str()))
-                    .filter(|_| {
-                        trait_concrete_impl_types
-                            .get(impl_info.trait_name.as_str())
-                            .is_some_and(|types| types.len() == 1)
-                    })
-                    .copied()
-            } else {
-                None
-            };
+            let devirt: Option<(&str, &front::semantic::SemanticFunction)> =
+                if is_default && DEFAULT_SHADOW_DEVIRT_SCOPE.contains(&method.name.as_str()) {
+                    trait_method_overrides
+                        .get(&(impl_info.trait_name.as_str(), method.name.as_str()))
+                        .filter(|_| {
+                            trait_concrete_impl_types
+                                .get(impl_info.trait_name.as_str())
+                                .is_some_and(|types| types.len() == 1)
+                        })
+                        .copied()
+                } else {
+                    None
+                };
             // Hints for the direct path follow the graph registered
             // there (RPython binds hints to graph identity).
             let direct_hints: &Vec<String> = match devirt {
