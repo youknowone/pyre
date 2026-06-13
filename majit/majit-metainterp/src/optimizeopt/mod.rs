@@ -646,6 +646,17 @@ pub struct OptContext {
     /// PreambleOp)` with linear-scan insert/pop/contains. The pool stays
     /// small per trace (one entry per imported pure short-preamble op),
     /// so O(n) operations are acceptable.
+    ///
+    /// The key stays the box's `OpRef` position rather than PyPy's box
+    /// identity (`unroll.py:37` keys by the box object). This is a
+    /// PRE-EXISTING-ADAPTATION beyond the Vec-vs-dict shape: the insert key
+    /// is the Phase-1 preamble source box (`force_op_from_preamble_op`,
+    /// `preamble_op.op`) while the `force_box` pop key is the Phase-2 body
+    /// box resolved to a position (`get_replacement_opref`) — two distinct
+    /// `Rc`s sharing one position across the peel boundary. A `BoxRef`
+    /// `Rc::ptr_eq` key would silent-miss the pop. Re-keying to box identity
+    /// is gated on the same short-preamble / InputArg identity unification
+    /// that defers `resolve_box_box`'s InputArg arm (#9/S9).
     pub(crate) potential_extra_ops: Vec<(OpRef, crate::optimizeopt::info::PreambleOp)>,
     /// RPython unroll.py: live ExtendedShortPreambleBuilder while replaying an
     /// existing target token's short preamble.
