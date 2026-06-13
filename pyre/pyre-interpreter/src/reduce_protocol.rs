@@ -195,7 +195,21 @@ pub fn descr_reduce_ex(w_obj: PyObjectRef, proto: i64) -> PyResult {
             .ok_or_else(|| PyError::type_error("cannot determine type for __reduce_ex__"))?;
         let w_cls_reduce = crate::baseobjspace::getattr_str(w_type, "__reduce__")?;
         let w_obj_reduce = crate::baseobjspace::getattr_str(crate::typedef::w_object(), "__reduce__")?;
-        let override_ = !crate::baseobjspace::is_w(w_cls_reduce, w_obj_reduce);
+        let mut override_ = !crate::baseobjspace::is_w(w_cls_reduce, w_obj_reduce);
+        // Built-in types (range, the iterators) expose `__reduce__`
+        // through instance dispatch rather than the type MRO, so the
+        // type-level comparison above sees `object.__reduce__` and
+        // misses the override.  Compare the bound instance method's
+        // `__func__` against `object.__reduce__` to catch it: a genuine
+        // override binds a different function.
+        if !override_ {
+            let w_inst_func = if unsafe { pyre_object::methodobject::is_method(w_reduce) } {
+                unsafe { pyre_object::methodobject::w_method_get_func(w_reduce) }
+            } else {
+                w_reduce
+            };
+            override_ = !crate::baseobjspace::is_w(w_inst_func, w_obj_reduce);
+        }
         if override_ {
             return crate::call::call_function_impl_result(w_reduce, &[]);
         }

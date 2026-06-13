@@ -104,6 +104,26 @@ pub unsafe fn w_range_iter_fields(obj: PyObjectRef) -> (i64, i64, i64) {
     unsafe { ((*iter).current, (*iter).stop, (*iter).step) }
 }
 
+/// Count of elements not yet produced by a range iterator — the number
+/// of `current += step` steps before `current` crosses `stop`.
+///
+/// # Safety
+/// `obj` must point to a valid `W_RangeIterator`.
+pub unsafe fn w_range_iter_remaining(obj: PyObjectRef) -> i64 {
+    let (current, stop, step) = unsafe { w_range_iter_fields(obj) };
+    if step > 0 {
+        if current >= stop {
+            0
+        } else {
+            (stop - current + step - 1) / step
+        }
+    } else if current <= stop {
+        0
+    } else {
+        (current - stop - step - 1) / (-step)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -628,6 +648,18 @@ pub unsafe fn w_long_range_iter_len(obj: PyObjectRef) -> BigInt {
     }
 }
 
+/// Read the `(start, step, len, index)` fields of a long-range iterator
+/// as wrapped int/long objects.
+///
+/// # Safety
+/// `obj` must point to a valid `W_LongRangeIterator`.
+pub unsafe fn w_long_range_iter_fields(
+    obj: PyObjectRef,
+) -> (PyObjectRef, PyObjectRef, PyObjectRef, PyObjectRef) {
+    let it = obj as *const W_LongRangeIterator;
+    unsafe { ((*it).start, (*it).step, (*it).len, (*it).index) }
+}
+
 /// Whether the long-range iterator has elements left — peek, non-mutating.
 ///
 /// # Safety
@@ -765,6 +797,44 @@ pub fn w_seq_iter_new(seq: PyObjectRef, length: usize) -> PyObjectRef {
 
 pub unsafe fn is_seq_iter(obj: PyObjectRef) -> bool {
     !obj.is_null() && unsafe { (*obj).ob_type == &SEQ_ITER_TYPE as *const PyType }
+}
+
+/// The wrapped sequence the iterator walks.
+///
+/// # Safety
+/// `obj` must point to a valid `W_SeqIterator`.
+#[inline]
+pub unsafe fn w_seq_iter_seq(obj: PyObjectRef) -> PyObjectRef {
+    unsafe { (*(obj as *const W_SeqIterator)).seq }
+}
+
+/// The current cursor position.
+///
+/// # Safety
+/// `obj` must point to a valid `W_SeqIterator`.
+#[inline]
+pub unsafe fn w_seq_iter_index(obj: PyObjectRef) -> i64 {
+    unsafe { (*(obj as *const W_SeqIterator)).index }
+}
+
+/// The captured sequence length.
+///
+/// # Safety
+/// `obj` must point to a valid `W_SeqIterator`.
+#[inline]
+pub unsafe fn w_seq_iter_length(obj: PyObjectRef) -> i64 {
+    unsafe { (*(obj as *const W_SeqIterator)).length }
+}
+
+/// Set the cursor position.
+///
+/// # Safety
+/// `obj` must point to a valid `W_SeqIterator`.
+#[inline]
+pub unsafe fn w_seq_iter_set_index(obj: PyObjectRef, value: i64) {
+    unsafe {
+        (*(obj as *mut W_SeqIterator)).index = value;
+    }
 }
 
 #[cfg(test)]

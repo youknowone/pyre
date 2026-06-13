@@ -1270,10 +1270,13 @@ fn range_reversed_method(args: &[PyObjectRef]) -> PyResult {
 /// `(type(self), (start, stop, step))`.
 fn range_reduce_method(args: &[PyObjectRef]) -> PyResult {
     let (start, stop, step) = unsafe { pyre_object::w_range_fields(args[0]) };
-    let range_type =
-        crate::typedef::gettypefor(&pyre_object::rangeobject::RANGE_TYPE).unwrap_or(PY_NULL);
+    // `range` is bound in builtins as a constructor function, not as the
+    // registry type object, so the reconstructor must be that name-bound
+    // callable: `pickle.save_global` matches it to `builtins.range`, and
+    // `range(start, stop, step)` rebuilds the instance.
+    let range_ctor = builtin_callable("range");
     let state = w_tuple_new(vec![start, stop, step]);
-    Ok(w_tuple_new(vec![range_type, state]))
+    Ok(w_tuple_new(vec![range_ctor, state]))
 }
 
 /// `range.__hash__()` — `functional.py W_Range.descr_hash`: hashes the
@@ -1293,6 +1296,175 @@ fn range_hash_method(args: &[PyObjectRef]) -> PyResult {
         vec![len_obj, start, step]
     };
     Ok(w_int_new(hash_w_strict(w_tuple_new(items))?))
+}
+
+/// The builtin function `name` (`iter` / `enumerate`) as the
+/// reconstructor for an iterator's `__reduce__`.  Mirrors PyPy's
+/// `space.getbuiltin(name)` — the reduce tuple's first element must be
+/// the live builtin so `pickle` recreates the iterator via `iter(seq)` /
+/// `enumerate(iterable)`.
+fn builtin_callable(name: &str) -> PyObjectRef {
+    let ctx = crate::call::getexecutioncontext();
+    if ctx.is_null() {
+        return PY_NULL;
+    }
+    unsafe { (*ctx).lookup_builtin(name).unwrap_or(PY_NULL) }
+}
+
+/// `list_iterator.__reduce__()` — `iterobject.py
+/// W_AbstractSeqIterObject.descr_reduce`: `(iter, (seq,), index)`.
+fn seq_iter_reduce_method(args: &[PyObjectRef]) -> PyResult {
+    unsafe {
+        let seq = pyre_object::w_seq_iter_seq(args[0]);
+        let index = pyre_object::w_seq_iter_index(args[0]);
+        let state = w_tuple_new(vec![seq]);
+        Ok(w_tuple_new(vec![
+            builtin_callable("iter"),
+            state,
+            w_int_new(index),
+        ]))
+    }
+}
+
+/// `list_iterator.__setstate__(index)` — clamp the cursor into
+/// `[0, length]` (`iterobject.py descr_setstate`).
+fn seq_iter_setstate_method(args: &[PyObjectRef]) -> PyResult {
+    unsafe {
+        let length = pyre_object::w_seq_iter_length(args[0]);
+        let mut index = w_int_get_value(args[1]);
+        if index < 0 {
+            index = 0;
+        } else if index > length {
+            index = length;
+        }
+        pyre_object::w_seq_iter_set_index(args[0], index);
+    }
+    Ok(w_none())
+}
+
+/// `list_iterator.__length_hint__()` — elements not yet produced.
+fn seq_iter_length_hint_method(args: &[PyObjectRef]) -> PyResult {
+    unsafe {
+        let remaining = pyre_object::w_seq_iter_length(args[0]) - pyre_object::w_seq_iter_index(args[0]);
+        Ok(w_int_new(remaining.max(0)))
+    }
+}
+
+/// `range_iterator.__reduce__()` — `iterobject.py
+/// W_IntRangeIterator.descr_reduce`: rebuild a `range(current, stop,
+/// step)` covering the remaining span, `(iter, (range,), None)`.
+fn range_iter_reduce_method(args: &[PyObjectRef]) -> PyResult {
+    unsafe {
+        let (current, stop, step) = pyre_object::w_range_iter_fields(args[0]);
+        let w_range = pyre_object::w_range_new_i64(current, stop, step);
+        let state = w_tuple_new(vec![w_range]);
+        Ok(w_tuple_new(vec![builtin_callable("iter"), state, w_none()]))
+    }
+}
+
+/// `range_iterator.__length_hint__()` — remaining element count.
+fn range_iter_length_hint_method(args: &[PyObjectRef]) -> PyResult {
+    unsafe { Ok(w_int_new(pyre_object::w_range_iter_remaining(args[0]))) }
+}
+
+/// `longrange_iterator.__reduce__()` — rebuild a `range` covering the
+/// remaining span (`current = start + index*step`, `stop = start +
+/// len*step`), `(iter, (range,), None)`.
+fn long_range_iter_reduce_method(args: &[PyObjectRef]) -> PyResult {
+    unsafe {
+        let (start, step, len, index) = pyre_object::w_long_range_iter_fields(args[0]);
+        let start_b = pyre_object::range_obj_to_bigint(start);
+        let step_b = pyre_object::range_obj_to_bigint(step);
+        let len_b = pyre_object::range_obj_to_bigint(len);
+        let index_b = pyre_object::range_obj_to_bigint(index);
+        let current = &start_b + &index_b * &step_b;
+        let stop = &start_b + &len_b * &step_b;
+        let w_range = pyre_object::w_range_new(
+            pyre_object::range_bigint_to_obj(current),
+            pyre_object::range_bigint_to_obj(stop),
+            pyre_object::range_bigint_to_obj(step_b),
+        );
+        let state = w_tuple_new(vec![w_range]);
+        Ok(w_tuple_new(vec![builtin_callable("iter"), state, w_none()]))
+    }
+}
+
+/// `longrange_iterator.__length_hint__()` — remaining element count.
+fn long_range_iter_length_hint_method(args: &[PyObjectRef]) -> PyResult {
+    unsafe {
+        Ok(pyre_object::range_bigint_to_obj(
+            pyre_object::w_long_range_iter_len(args[0]),
+        ))
+    }
+}
+
+/// `dict_keyiterator.__reduce__()` (and value/item siblings) —
+/// `dictmultiobject.py W_BaseDictIterator.descr_reduce`: the remaining
+/// entries as a list, wrapped `(iter, (list,))`.  No third element.
+fn dict_view_iter_reduce_method(args: &[PyObjectRef]) -> PyResult {
+    unsafe {
+        let w_dict = pyre_object::dictviewobject::w_dict_view_iterator_get_dict(args[0]);
+        let kind = pyre_object::dictviewobject::w_dict_view_iterator_get_kind(args[0]);
+        let index = pyre_object::dictviewobject::w_dict_view_iterator_get_index(args[0]);
+        let entries = pyre_object::w_dict_items(w_dict);
+        let mut items = Vec::new();
+        for (k, v) in entries.into_iter().skip(index) {
+            let item = match kind {
+                pyre_object::dictviewobject::DictViewKind::Keys => k,
+                pyre_object::dictviewobject::DictViewKind::Values => v,
+                pyre_object::dictviewobject::DictViewKind::Items => w_tuple_new(vec![k, v]),
+            };
+            items.push(item);
+        }
+        let state = w_tuple_new(vec![w_list_new(items)]);
+        Ok(w_tuple_new(vec![builtin_callable("iter"), state]))
+    }
+}
+
+/// `dict_keyiterator.__length_hint__()` — remaining entries.
+fn dict_view_iter_length_hint_method(args: &[PyObjectRef]) -> PyResult {
+    unsafe {
+        let w_dict = pyre_object::dictviewobject::w_dict_view_iterator_get_dict(args[0]);
+        let index = pyre_object::dictviewobject::w_dict_view_iterator_get_index(args[0]);
+        let remaining = (pyre_object::w_dict_len(w_dict) as i64) - (index as i64);
+        Ok(w_int_new(remaining.max(0)))
+    }
+}
+
+/// `enumerate.__reduce__()` — `functional.py W_Enumerate.descr_reduce`:
+/// `(enumerate, (source_iter, index))`.
+fn enumerate_reduce_method(args: &[PyObjectRef]) -> PyResult {
+    unsafe {
+        let i64_index = pyre_object::enumerateobject::w_enumerate_get_index(args[0]);
+        let raw = pyre_object::enumerateobject::w_enumerate_get_iter_or_list(args[0]);
+        let w_iter = if raw.is_null() {
+            // Exhausted enumerate (`:294-295` set `w_iter_or_list` to
+            // null); substitute an empty seq-iter so the reduce stays
+            // round-trippable.
+            pyre_object::w_seq_iter_new(w_list_new(vec![]), 0)
+        } else if pyre_object::is_list(raw) {
+            // List fast path (`:289-294`): `w_iter_or_list` is the source
+            // list itself and `index` is the cursor into it.  Materialise
+            // a seq-iterator positioned at the cursor so the reconstructed
+            // enumerate resumes from the right element rather than the
+            // list head.
+            let len = pyre_object::w_list_len(raw);
+            let it = pyre_object::w_seq_iter_new(raw, len);
+            let pos = i64_index.clamp(0, len as i64);
+            pyre_object::w_seq_iter_set_index(it, pos);
+            it
+        } else {
+            raw
+        };
+        let w_index_slot = pyre_object::enumerateobject::w_enumerate_get_w_index(args[0]);
+        let index = if w_index_slot.is_null() {
+            w_int_new(i64_index)
+        } else {
+            w_index_slot
+        };
+        let state = w_tuple_new(vec![w_iter, index]);
+        Ok(w_tuple_new(vec![builtin_callable("enumerate"), state]))
+    }
 }
 
 unsafe fn getitem_range_iter(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
@@ -2261,6 +2433,54 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyResul
             };
             if let Some((func, sname)) = entry {
                 let func_obj = crate::make_builtin_function_with_arity(sname, func, 1);
+                return Ok(pyre_object::w_method_new(
+                    func_obj,
+                    obj,
+                    pyre_object::PY_NULL,
+                ));
+            }
+            // Per-iterator-type pickle protocol: `__reduce__` /
+            // `__setstate__` / `__length_hint__` recreate the iterator's
+            // CPython 3.14 pickle shape.  `arity` includes `self`.
+            let entry: Option<(fn(&[PyObjectRef]) -> PyResult, &str, u16)> = if is_seq_iter(obj) {
+                match name {
+                    "__reduce__" => Some((seq_iter_reduce_method, "__reduce__", 1)),
+                    "__setstate__" => Some((seq_iter_setstate_method, "__setstate__", 2)),
+                    "__length_hint__" => Some((seq_iter_length_hint_method, "__length_hint__", 1)),
+                    _ => None,
+                }
+            } else if is_range_iter(obj) {
+                match name {
+                    "__reduce__" => Some((range_iter_reduce_method, "__reduce__", 1)),
+                    "__length_hint__" => Some((range_iter_length_hint_method, "__length_hint__", 1)),
+                    _ => None,
+                }
+            } else if pyre_object::is_long_range_iter(obj) {
+                match name {
+                    "__reduce__" => Some((long_range_iter_reduce_method, "__reduce__", 1)),
+                    "__length_hint__" => {
+                        Some((long_range_iter_length_hint_method, "__length_hint__", 1))
+                    }
+                    _ => None,
+                }
+            } else if pyre_object::dictviewobject::is_dict_view_iterator(obj) {
+                match name {
+                    "__reduce__" => Some((dict_view_iter_reduce_method, "__reduce__", 1)),
+                    "__length_hint__" => {
+                        Some((dict_view_iter_length_hint_method, "__length_hint__", 1))
+                    }
+                    _ => None,
+                }
+            } else if pyre_object::enumerateobject::is_enumerate(obj) {
+                match name {
+                    "__reduce__" => Some((enumerate_reduce_method, "__reduce__", 1)),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            if let Some((func, sname, arity)) = entry {
+                let func_obj = crate::make_builtin_function_with_arity(sname, func, arity);
                 return Ok(pyre_object::w_method_new(
                     func_obj,
                     obj,
@@ -3272,6 +3492,26 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
                 ),
             ));
         }
+    }
+
+    // `Objects/methodobject.c meth_reduce` — a module-level builtin
+    // pickles by reference: `__reduce__` / `__reduce_ex__` return the
+    // `__qualname__` string, which `pickle.Pickler.save` routes to
+    // `save_global`.  pyre's builtins carry no bound `__self__`, so the
+    // bare-qualname branch always applies.  This must precede the generic
+    // MRO lookup below, which would otherwise bind `object.__reduce__`.
+    if (name == "__reduce__" || name == "__reduce_ex__")
+        && unsafe { pyre_object::py_type_check(obj, &crate::function::BUILTIN_FUNCTION_TYPE) }
+    {
+        let reduce_fn: fn(&[PyObjectRef]) -> PyResult =
+            |args| Ok(w_str_new(&unsafe { crate::function::function_get_qualname(args[0]) }));
+        let (sname, arity): (&'static str, u16) = if name == "__reduce_ex__" {
+            ("__reduce_ex__", 2)
+        } else {
+            ("__reduce__", 1)
+        };
+        let func_obj = crate::make_builtin_function_with_arity(sname, reduce_fn, arity);
+        return Ok(pyre_object::w_method_new(func_obj, obj, pyre_object::PY_NULL));
     }
 
     // Builtin type method lookup via TypeDef registry.

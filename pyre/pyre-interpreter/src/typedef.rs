@@ -643,6 +643,22 @@ pub fn init_typeobjects() {
             new_typeobject_with_base("range_iterator", |_| {}, object_type) as usize,
         );
         reg.insert(
+            &pyre_object::enumerateobject::ENUMERATE_TYPE as *const PyType as usize,
+            new_typeobject_with_base("enumerate", |_| {}, object_type) as usize,
+        );
+        reg.insert(
+            &pyre_object::dictviewobject::DICT_KEYITERATOR_TYPE as *const PyType as usize,
+            new_typeobject_with_base("dict_keyiterator", |_| {}, object_type) as usize,
+        );
+        reg.insert(
+            &pyre_object::dictviewobject::DICT_VALUEITERATOR_TYPE as *const PyType as usize,
+            new_typeobject_with_base("dict_valueiterator", |_| {}, object_type) as usize,
+        );
+        reg.insert(
+            &pyre_object::dictviewobject::DICT_ITEMITERATOR_TYPE as *const PyType as usize,
+            new_typeobject_with_base("dict_itemiterator", |_| {}, object_type) as usize,
+        );
+        reg.insert(
             &pyre_object::cellobject::CELL_TYPE as *const PyType as usize,
             new_typeobject_with_base("cell", init_cell_type, object_type) as usize,
         );
