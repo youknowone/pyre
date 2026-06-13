@@ -9244,9 +9244,15 @@ pub fn production_walker_handles(instruction: &Instruction) -> bool {
             // specialization); see is_foldable_list_method_load_attr.
             | Instruction::LoadAttr { .. }
             | Instruction::StoreAttr { .. }
-            // Instruction::StoreFastStoreFast excluded: routed off the
-            // walker JIT path (kept on trait dispatch) until the SFSF
-            // walker re-enable is unblocked.
+            // Instruction::StoreFastStoreFast excluded: a probe flip
+            // (2026-06-13) confirmed the GcVec-fnaddr SIGBUS the prior
+            // comment described is gone (the #406 result_exc lowering
+            // drained the Result-shell residual chains in pop_value /
+            // store_local_value).  The remaining blocker is shared with
+            // BuildTuple / UnpackSequence: `ResidualCallArgUnbound`
+            // (var_nums payload register unbound) because arm entry seeds
+            // only r0.  Re-enable once arm-entry operand seeding (#405)
+            // lands on dispatch_via_miframe_at_opcode_entry.
             | Instruction::StoreSubscr // handled by dispatch_via_walker_for_opcode entry hook
             // Instruction::PopExcept excluded: same bridge-tracing
             // rationale as PushExcInfo below — its arm manages the
