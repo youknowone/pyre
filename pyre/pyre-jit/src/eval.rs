@@ -3879,6 +3879,7 @@ fn handle_fail(
     _owning_key: u64,
     exit_layout: &CompiledExitLayout,
     raw_values: &[i64],
+    guard_exc: i64,
     _info: &majit_metainterp::virtualizable::VirtualizableInfo,
 ) -> HandleFailOutcome {
     // compile.py:702-703: must_compile() AND not stack_almost_full()
@@ -3906,6 +3907,7 @@ fn handle_fail(
                     frame,
                     raw_values,
                     exit_layout,
+                    guard_exc,
                 )
             };
             if compiled {
@@ -4177,6 +4179,7 @@ fn execute_assembler(
                 owning_key,
                 exit_layout,
                 raw_values,
+                guard_exc,
                 info,
             ) {
                 HandleFailOutcome::BridgeCompiled => Some(LoopResult::ContinueRunningNormally),
@@ -4436,6 +4439,7 @@ fn bound_reached(
                 owning_key,
                 exit_layout,
                 raw_values,
+                guard_exc,
                 info,
             ) {
                 HandleFailOutcome::BridgeCompiled => {
@@ -4613,6 +4617,7 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
                 owning_key,
                 exit_layout,
                 raw_values,
+                guard_exc,
                 info,
             ) {
                 HandleFailOutcome::BridgeCompiled => {

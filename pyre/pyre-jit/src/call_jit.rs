@@ -1935,6 +1935,11 @@ pub fn trace_and_compile_from_bridge(
     frame: &mut PyFrame,
     raw_values: &[i64],
     exit_layout: &majit_metainterp::CompiledExitLayout,
+    // `cpu.grab_exc_value(deadframe)` (llmodel.py:240): the pending
+    // exception this guard failure carries, or 0. Threaded so the bridge
+    // tracer can decline a pending-exception resume at a non-exception
+    // guard (see the deferral below).
+    guard_exc: i64,
 ) -> bool {
     use crate::eval::build_jit_state;
     use crate::jit::state::PyreEnv;
@@ -2083,6 +2088,54 @@ pub fn trace_and_compile_from_bridge(
         }
         let (driver, _) = crate::eval::driver_pair();
         driver.last_bridge_is_exception_guard = false;
+    }
+
+    // A pending exception at a NON-exception guard means a may-force
+    // residual call both raised and forced the frame, so GUARD_NOT_FORCED
+    // failed before GUARD_NO_EXCEPTION ran. That guard's resume_pc is the
+    // no-exception semantic fallthrough (the next opcode, e.g.
+    // RETURN_VALUE), so a normal-path bridge walk would trace the return
+    // of the NULL call result — emitting `Finish(NONE)` with no
+    // return-value box — and run the post-call residual ops concretely on
+    // a NULL operand. Decline the bridge and resume in the blackhole,
+    // which propagates the pending exception to its `catch_exception`
+    // handler exactly once. Skipping the walk also prevents the walk's
+    // concrete side effects from double-applying the handler's mutations
+    // against the post-blackhole replay.
+    //
+    // GUARD_NOT_FORCED is not an exception guard, so it does not stash the
+    // raised value into `jf_guard_exc` (`guard_exc` is 0 here); the live
+    // signal is the backend `pos_exception` cell the compiled
+    // GUARD_NO_EXCEPTION reads. A stale cell only over-declines (the
+    // blackhole resume with `guard_exc == 0` runs the no-exception
+    // continuation, identical to the prior panic-then-fallback path), so
+    // this never changes a result — only whether a bridge is attached.
+    let pending_exc = guard_exc != 0 || {
+        #[cfg(feature = "cranelift")]
+        {
+            majit_backend_cranelift::jit_exc_class_raw() != 0
+        }
+        #[cfg(all(feature = "dynasm", not(feature = "cranelift")))]
+        {
+            majit_backend_dynasm::jit_exc_class_raw() != 0
+        }
+        #[cfg(not(any(feature = "cranelift", feature = "dynasm")))]
+        {
+            false
+        }
+    };
+    if pending_exc && !last_bridge_is_exception_guard {
+        if majit_metainterp::majit_log_enabled() {
+            eprintln!(
+                "[jit][bridge-trace] decline (pending exc at non-exception guard) key={} trace={} fail={} resume_pc={}",
+                green_key, trace_id, fail_index, resume_pc
+            );
+        }
+        let (driver, _) = crate::eval::driver_pair();
+        if driver.is_tracing() {
+            driver.meta_interp_mut().abort_trace(false);
+        }
+        return false;
     }
 
     // pyjitpl.py:2841 interpret(): after start_retrace_from_guard, RPython
@@ -2314,7 +2367,10 @@ fn jit_ca_handle_guard_failure(
     // with the matching `start_compiling` even on panic.
     let compiled = {
         let _guard = crate::eval::GuardCompilingScope::new(&descr_arc);
-        trace_and_compile_from_bridge(&descr_arc, frame, raw_values, &exit_layout)
+        // CALL_ASSEMBLER guard failures grab their callee exception on the
+        // blackhole leg, not here; pass 0 so the non-exception-guard
+        // deferral keys only off the general guard path's `guard_exc`.
+        trace_and_compile_from_bridge(&descr_arc, frame, raw_values, &exit_layout, 0)
     };
 
     if majit_metainterp::majit_log_enabled() {
