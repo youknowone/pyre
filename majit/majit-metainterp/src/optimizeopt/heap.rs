@@ -1575,10 +1575,7 @@ impl OptHeap {
             }
             owners.push(owner);
             if let Some(deps) = self.heapc_deps.get(&owner) {
-                stack.extend(
-                    deps.iter()
-                        .map(|dep| ctx.get_replacement_opref(*dep)),
-                );
+                stack.extend(deps.iter().map(|dep| ctx.get_replacement_opref(*dep)));
             }
         }
         owners
