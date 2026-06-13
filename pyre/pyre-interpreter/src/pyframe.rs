@@ -96,10 +96,11 @@ pub struct PyFrame {
     /// PyPy: `f_backref = jit.vref_None`.
     pub f_backref: *mut PyFrame,
     /// pyframe.py:115-116 — `self.builtin = space.builtin
-    /// .pick_builtin(w_globals)` (gated under `honor__builtins__` upstream;
-    /// pyre runs as if the option were always on, matching CPython's
-    /// unconditional `__builtins__` honoring).  Cached at frame creation
-    /// from `globals['__builtins__']` and consulted by LOAD_GLOBAL's
+    /// .pick_builtin(w_globals)`, gated under `honor__builtins__`
+    /// (`baseobjspace::HONOR_BUILTINS`, default False).  With the option
+    /// off (the default) `frame_builtin*` returns `space.builtin`, ignoring
+    /// a custom `__builtins__` in globals; with it on the `pick_builtin*`
+    /// family honors `globals['__builtins__']`.  Consulted by LOAD_GLOBAL's
     /// builtins fallback (`pyopcode.py:918-927`) via
     /// `space.finditem_str(self.w_builtin.w_dict, name)` — honouring
     /// dict subclass `__getitem__` overrides (`moduledef.py:102-103`)
@@ -944,7 +945,7 @@ impl PyFrame {
         // slots, resolved eagerly here exactly as `new_minimal` does, so a
         // frame built through this hook is left in the same state as one
         // built by `createframe`.
-        self.w_builtin = crate::baseobjspace::pick_builtin(w_globals, self.execution_context);
+        self.w_builtin = crate::baseobjspace::frame_builtin(w_globals, self.execution_context);
         self.w_globals_obj = if w_globals.is_null() {
             PY_NULL
         } else {
@@ -1167,7 +1168,7 @@ impl PyFrame {
         let size = nlocals + ncells + 16; // small stack
         let stores_global =
             unsafe { crate::w_code_frame_stores_global(code as PyObjectRef, w_globals) };
-        let w_builtin = crate::baseobjspace::pick_builtin(w_globals, execution_context);
+        let w_builtin = crate::baseobjspace::frame_builtin(w_globals, execution_context);
         // `pyframe.py:98 __init__(self, space, code, w_globals, ...)`
         // stores `w_globals` as the canonical W_DictObject directly.
         // Pyre carries both the raw storage pointer (`w_globals`) and
@@ -1283,7 +1284,7 @@ impl PyFrame {
 
         let stores_global =
             unsafe { crate::w_code_frame_stores_global(code as PyObjectRef, w_globals) };
-        let w_builtin = crate::baseobjspace::pick_builtin(w_globals, execution_context);
+        let w_builtin = crate::baseobjspace::frame_builtin(w_globals, execution_context);
         // `pyframe.py:98 __init__` — `self.w_globals = w_globals` stores
         // the W_DictObject directly; eager `dict_storage_to_dict`
         // mirrors the identity invariant on pyre's split layout.
@@ -2393,9 +2394,9 @@ impl PyFrame {
         closure: PyObjectRef,
     ) -> Result<Self, crate::PyError> {
         let w_builtin = if w_globals_obj.is_null() {
-            crate::baseobjspace::pick_builtin(globals, execution_context)
+            crate::baseobjspace::frame_builtin(globals, execution_context)
         } else {
-            crate::baseobjspace::pick_builtin_obj_checked(w_globals_obj, execution_context)?
+            crate::baseobjspace::frame_builtin_obj_checked(w_globals_obj, execution_context)?
         };
         Ok(Self::finish_for_call_with_globals_obj(
             code,
@@ -2428,9 +2429,9 @@ impl PyFrame {
         closure: PyObjectRef,
     ) -> Self {
         let w_builtin = if w_globals_obj.is_null() {
-            crate::baseobjspace::pick_builtin(globals, execution_context)
+            crate::baseobjspace::frame_builtin(globals, execution_context)
         } else {
-            crate::baseobjspace::pick_builtin_obj(w_globals_obj, execution_context)
+            crate::baseobjspace::frame_builtin_obj(w_globals_obj, execution_context)
         };
         Self::finish_for_call_with_globals_obj(
             code,
@@ -2765,7 +2766,7 @@ pub fn createframe(
         unsafe { crate::w_code_frame_stores_global(code as PyObjectRef, w_globals) };
 
     let size = num_locals + num_cells + max_stack;
-    let w_builtin = crate::baseobjspace::pick_builtin(w_globals, execution_context);
+    let w_builtin = crate::baseobjspace::frame_builtin(w_globals, execution_context);
     // `pyframe.py:98 __init__` — `self.w_globals = w_globals` stores the
     // dict object directly so `frame.w_globals` retains object identity
     // for the lifetime of the frame.  pyre's split layout pairs the raw

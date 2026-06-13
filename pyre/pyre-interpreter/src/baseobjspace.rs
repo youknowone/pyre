@@ -6808,6 +6808,70 @@ pub fn getindex_w(obj: PyObjectRef) -> Result<i64, PyError> {
     }
 }
 
+/// `objspace.honor__builtins__` default is False — the frame builtin is
+/// `space.builtin`, ignoring a custom `__builtins__` in globals.  The
+/// `pick_builtin*` family below is the `honor__builtins__=True` path,
+/// reached only when this flag is set.
+pub const HONOR_BUILTINS: bool = false;
+
+/// Resolve the frame builtin for a raw-storage globals.  Default
+/// (`HONOR_BUILTINS=false`) returns `space.builtin` (`ec.get_builtin()`),
+/// ignoring a custom `__builtins__`; the `true` path delegates to
+/// [`pick_builtin`].
+pub fn frame_builtin(
+    w_globals: *mut crate::DictStorage,
+    exec_ctx: *const crate::PyExecutionContext,
+) -> PyObjectRef {
+    if HONOR_BUILTINS {
+        return pick_builtin(w_globals, exec_ctx);
+    }
+    if !exec_ctx.is_null() {
+        let b = unsafe { (*exec_ctx).get_builtin() };
+        if !b.is_null() {
+            return b;
+        }
+    }
+    build_default_pick_builtin_module()
+}
+
+/// Resolve the frame builtin for an object globals.  Default
+/// (`HONOR_BUILTINS=false`) returns `space.builtin`; the `true` path
+/// delegates to [`pick_builtin_obj`].
+pub fn frame_builtin_obj(
+    w_globals: PyObjectRef,
+    exec_ctx: *const crate::PyExecutionContext,
+) -> PyObjectRef {
+    if HONOR_BUILTINS {
+        return pick_builtin_obj(w_globals, exec_ctx);
+    }
+    if !exec_ctx.is_null() {
+        let b = unsafe { (*exec_ctx).get_builtin() };
+        if !b.is_null() {
+            return b;
+        }
+    }
+    build_default_pick_builtin_module()
+}
+
+/// Fallible variant of [`frame_builtin_obj`].  Default
+/// (`HONOR_BUILTINS=false`) returns `space.builtin`; the `true` path
+/// delegates to [`pick_builtin_obj_checked`].
+pub fn frame_builtin_obj_checked(
+    w_globals: PyObjectRef,
+    exec_ctx: *const crate::PyExecutionContext,
+) -> Result<PyObjectRef, crate::PyError> {
+    if HONOR_BUILTINS {
+        return pick_builtin_obj_checked(w_globals, exec_ctx);
+    }
+    if !exec_ctx.is_null() {
+        let b = unsafe { (*exec_ctx).get_builtin() };
+        if !b.is_null() {
+            return Ok(b);
+        }
+    }
+    Ok(build_default_pick_builtin_module())
+}
+
 /// `pyframe.py:115-116 self.builtin = space.builtin.pick_builtin(
 /// w_globals)`.  Body ports `pypy/module/__builtin__/moduledef.py:89-109
 /// pick_builtin`:
