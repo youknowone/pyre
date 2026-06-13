@@ -965,8 +965,7 @@ fn render_exc_object(exc: PyObjectRef) -> String {
                 if first.is_null() {
                     String::new()
                 } else {
-                    crate::display::py_str(first)
-                        .unwrap_or_else(|_| "<unprintable>".to_string())
+                    crate::display::py_str(first).unwrap_or_else(|_| "<unprintable>".to_string())
                 }
             } else {
                 // Multi-arg exceptions render as tuple repr — matches
@@ -974,8 +973,7 @@ fn render_exc_object(exc: PyObjectRef) -> String {
                 let items: Vec<String> = (0..len as i64)
                     .filter_map(|i| pyre_object::w_tuple_getitem(args, i))
                     .map(|w| {
-                        crate::display::py_repr(w)
-                            .unwrap_or_else(|_| "<unprintable>".to_string())
+                        crate::display::py_repr(w).unwrap_or_else(|_| "<unprintable>".to_string())
                     })
                     .collect();
                 format!("({})", items.join(", "))

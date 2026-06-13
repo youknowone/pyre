@@ -1353,10 +1353,7 @@ fn pad_to_width(body: String, fill: char, align: char, width: usize) -> String {
 /// Public entry point for the f-string `FormatWithSpec` opcode in
 /// `eval.rs::format_with_spec`. Forwards to the same parser used by
 /// `str.format` so both surfaces share the spec semantics.
-pub fn format_with_spec_public(
-    val: PyObjectRef,
-    spec: &str,
-) -> Result<Wtf8Buf, crate::PyError> {
+pub fn format_with_spec_public(val: PyObjectRef, spec: &str) -> Result<Wtf8Buf, crate::PyError> {
     format_with_spec(val, spec)
 }
 
@@ -1436,7 +1433,9 @@ fn format_with_spec(val: PyObjectRef, spec: &str) -> Result<Wtf8Buf, crate::PyEr
                     .map_or_else(|| format!("{v}"), |c| c.to_string());
                 // `c` keeps the integer default alignment (right).
                 let align = p.align.unwrap_or('>');
-                return Ok(Wtf8Buf::from_string(pad_to_width(body, p.fill, align, p.width)));
+                return Ok(Wtf8Buf::from_string(pad_to_width(
+                    body, p.fill, align, p.width,
+                )));
             }
             // Float-style spec on int: coerce to f64 (matches CPython
             // `int.__format__('.3f')` behaviour).  `%` is a float-only

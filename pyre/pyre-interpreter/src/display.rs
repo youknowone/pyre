@@ -727,10 +727,7 @@ pub unsafe fn py_str(obj: PyObjectRef) -> Result<String, crate::PyError> {
                                     py_repr(fname2)?
                                 ));
                             }
-                            return Ok(format!(
-                                "[Errno {errno}] {strerror}: {}",
-                                py_repr(fname)?
-                            ));
+                            return Ok(format!("[Errno {errno}] {strerror}: {}", py_repr(fname)?));
                         }
                         return Ok(format!("[Errno {errno}] {strerror}"));
                     }
@@ -1129,7 +1126,8 @@ impl fmt::Display for PyDisplay {
             // diagnostic output context degrades to a placeholder rather than
             // propagating (the user-facing `print()`/`str()` paths thread the
             // error through `py_str`).
-            let s = unsafe { py_str(self.0) }.unwrap_or_else(|_| "<exception in __str__>".to_string());
+            let s =
+                unsafe { py_str(self.0) }.unwrap_or_else(|_| "<exception in __str__>".to_string());
             write!(f, "{s}")
         }
     }
