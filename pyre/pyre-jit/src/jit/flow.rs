@@ -1099,8 +1099,18 @@ impl FunctionGraph {
         };
 
         let return_var = return_var.unwrap_or_else(|| graph.fresh_untyped_variable());
-        let except_etype = graph.fresh_untyped_variable();
-        let except_evalue = graph.fresh_untyped_variable();
+        // The exceptblock pair carries the same concrete kinds the rtyper
+        // assigns upstream before the JIT codewriter sees the graph:
+        // `etype` is the exception class read back by `last_exception/>i`
+        // (Int), `evalue` the instance read back by `last_exc_value/>r`
+        // (Ref).  Without these, `make_dependencies` (which only colors
+        // inputargs whose `kind` is set) skips the pair, and any link that
+        // propagates to `exceptblock` through the generic
+        // `make_link`/`generate_last_exc` path hits `regalloc_color`'s
+        // missing-color panic.  Matches the typed pair `exception_edge_vars`
+        // already mints for explicit catch edges.
+        let except_etype = graph.fresh_variable(Kind::Int);
+        let except_evalue = graph.fresh_variable(Kind::Ref);
 
         let returnblock = Block::shared(vec![return_var.into()]);
         returnblock.borrow_mut().mark_final();
@@ -1558,13 +1568,17 @@ mod tests {
         assert_eq!(g.startblock.borrow().inputargs, vec![arg.into()]);
         assert_eq!(g.returnblock.borrow().inputargs, vec![ret.into()]);
         assert_eq!(g.exceptblock.borrow().inputargs.len(), 2);
-        assert!(
-            g.exceptblock
-                .borrow()
-                .inputargs
-                .iter()
-                .all(|value| value.as_variable().is_some_and(|v| v.kind.is_none()))
-        );
+        // The exceptblock pair carries the post-rtyping concrete kinds:
+        // `etype` (read back by `last_exception/>i`) is Int, `evalue`
+        // (read back by `last_exc_value/>r`) is Ref.
+        let exc_kinds: Vec<Option<Kind>> = g
+            .exceptblock
+            .borrow()
+            .inputargs
+            .iter()
+            .map(|value| value.as_variable().and_then(|v| v.kind))
+            .collect();
+        assert_eq!(exc_kinds, vec![Some(Kind::Int), Some(Kind::Ref)]);
         assert_eq!(g.iterblocks(), vec![g.startblock.clone()]);
         assert!(g.iterlinks().is_empty());
     }
