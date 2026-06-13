@@ -3543,7 +3543,8 @@ impl<'a> Lowering<'a> {
                 // it takes the same alias path.
                 if args.len() == 1
                     && (matches!(self.blanket_into_devirt(&reg), Some(IntoDevirt::Identity))
-                        || self.trait_clause_into_string_identity(&reg, &call.dest.ty))
+                        || self.trait_clause_into_string_identity(&reg, &call.dest.ty)
+                        || self.is_noop_ptr_cast(&reg))
                 {
                     self.local_var[dest_local] = Some(args[0].clone());
                     let target_bb = self.block_id[target];
@@ -4236,6 +4237,28 @@ impl<'a> Lowering<'a> {
     /// Returns `None` (caller keeps the blanket-into path) when the
     /// obligation is unresolved (`kind` is a clause/builtin rather
     /// than `TraitImpl`) or any table lookup misses.
+    /// `<*const T>::cast_mut` / `<*mut T>::cast_const` / `cast` — pointer
+    /// representation casts that change only const/mut or the pointee
+    /// type.  The JIT does not model either (`Ref` / `RawPtr` lower to a
+    /// same-Variable alias, mir.rs:50), so a `p.cast_mut()` callsite binds
+    /// its destination straight to the pointer argument instead of
+    /// emitting a call to core's raw-pointer method (which has no graph
+    /// lowering and is not a registered callee).
+    fn is_noop_ptr_cast(&self, reg: &RegularCall) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        self.llbc.fn_by_id(*id).is_some_and(|fd| {
+            matches!(
+                fd.item_meta.name_path().as_str(),
+                "core::ptr::const_ptr::<Impl>::cast_mut"
+                    | "core::ptr::mut_ptr::<Impl>::cast_const"
+                    | "core::ptr::const_ptr::<Impl>::cast"
+                    | "core::ptr::mut_ptr::<Impl>::cast"
+            )
+        })
+    }
+
     fn blanket_into_devirt(&self, reg: &RegularCall) -> Option<IntoDevirt> {
         let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
             return None;
