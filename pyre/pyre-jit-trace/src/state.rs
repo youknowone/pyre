@@ -11520,10 +11520,12 @@ mod indirectcalltargets_tests {
         // Identity pc_map: the resume pc IS the jitcode byte offset.
         let metadata = crate::PyJitCodeMetadata {
             pc_map: (0..code_len).collect(),
+            first_jit_pc_by_py_pc: (0..code_len).collect(),
             depth_at_py_pc: vec![0; code_len],
             after_residual_call_resume_pc: vec![None; code_len],
             portal_frame_reg: u16::MAX,
             portal_ec_reg: u16::MAX,
+            built_as_portal: false,
             stack_base: 0,
             stack_slot_color_map: Vec::new(),
             pyre_color_for_semantic_local: Vec::new(),
