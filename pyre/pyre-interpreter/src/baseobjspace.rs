@@ -3192,7 +3192,6 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
                 ));
             }
             if name == "__doc__"
-                || name == "__flags__"
                 || name == "__code__"
                 || name == "__func__"
                 || name == "__self__"

@@ -664,6 +664,36 @@ pub unsafe fn w_type_is_heaptype(obj: PyObjectRef) -> bool {
     (*(obj as *const W_TypeObject)).flag_heaptype
 }
 
+/// typeobject.py:866 `get_flags(self)` — the `__flags__` bitmask.
+///
+/// `_HEAPTYPE = 1<<9`, `_CPYTYPE = 1` (non-heap builtin types),
+/// `PATMA_SEQUENCE = 1<<5`, `PATMA_MAPPING = 1<<6`.  pyre tracks
+/// `flag_heaptype` and `flag_map_or_seq`; the cpytype bit follows
+/// `!flag_heaptype` (every non-heap type is a builtin C type).  The
+/// abstract / method-descriptor bits have no pyre flag yet.
+pub unsafe fn w_type_get_flags(obj: PyObjectRef) -> i64 {
+    if obj.is_null() || !is_type(obj) {
+        return 0;
+    }
+    const HEAPTYPE: i64 = 1 << 9;
+    const CPYTYPE: i64 = 1;
+    const PATMA_SEQUENCE: i64 = 1 << 5;
+    const PATMA_MAPPING: i64 = 1 << 6;
+    let t = &*(obj as *const W_TypeObject);
+    let mut flags = 0i64;
+    if t.flag_heaptype {
+        flags |= HEAPTYPE;
+    } else {
+        flags |= CPYTYPE;
+    }
+    match t.flag_map_or_seq.load(std::sync::atomic::Ordering::Acquire) {
+        b'M' => flags |= PATMA_MAPPING,
+        b'S' => flags |= PATMA_SEQUENCE,
+        _ => {}
+    }
+    flags
+}
+
 /// typedef.py:43 `acceptable_as_base_class` — read from Layout level.
 /// typeobject.py:1116: w_bestbase.layout.typedef.acceptable_as_base_class
 pub unsafe fn w_type_get_acceptable_as_base_class(obj: PyObjectRef) -> bool {

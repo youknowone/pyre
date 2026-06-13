@@ -1,0 +1,212 @@
+//! Pickle reduce protocol for `object` — PyPy: `pypy/objspace/std/objectobject.py`.
+//!
+//! The app-level helpers `reduce_1` / `reduce_2` / `get_slotvalues` /
+//! `slotnames` (objectobject.py:23-84) are bundled in
+//! `reduce_protocol_app.py` and resolved lazily through
+//! `appleveldef_install` into a leaked scratch namespace.  The three
+//! handles the interp-level code calls (`reduce_1`, `reduce_2`,
+//! `get_slotvalues`) keep that namespace as their `__globals__`, so
+//! `get_slotvalues` can still reach its sibling `slotnames`.
+//!
+//! The interp-level descriptors `descr_reduce` / `descr_reduce_ex` /
+//! `object_getstate_default` / `getnewargs` mirror objectobject.py's
+//! `descr__reduce__` / `descr__reduce_ex__` / `object_getstate_default`
+//! / `_getnewargs`.
+
+use pyre_object::PyObjectRef;
+
+use crate::PyResult;
+use crate::error::PyError;
+
+/// Resolved app-level handles, indexed `[reduce_1, reduce_2,
+/// get_slotvalues]`.  PyPy resolves these once via `app.interphook`
+/// (objectobject.py:88-90); pyre resolves them on first use into a
+/// thread-local cache.
+const REDUCE_1: usize = 0;
+const REDUCE_2: usize = 1;
+const GET_SLOTVALUES: usize = 2;
+
+thread_local! {
+    static HANDLES: std::cell::OnceCell<[PyObjectRef; 3]> = const { std::cell::OnceCell::new() };
+}
+
+/// Resolve (and cache) the three app-level handles.
+///
+/// Executes `reduce_protocol_app.py` into a fresh, intentionally leaked
+/// `DictStorage` and reads back the named globals.  The functions retain
+/// that namespace as their `__globals__`, which keeps `slotnames`
+/// reachable from `get_slotvalues` even though only three names are
+/// surfaced.
+fn handle(which: usize) -> PyObjectRef {
+    HANDLES.with(|cell| {
+        cell.get_or_init(|| {
+            let ctx = crate::call::getexecutioncontext();
+            if ctx.is_null() {
+                panic!("reduce_protocol: no execution context");
+            }
+            let mut app_ns = Box::new(unsafe { (*ctx).fresh_dict_storage() });
+            app_ns.fix_ptr();
+            let app_ns_ptr: *mut crate::DictStorage = Box::leak(app_ns);
+            crate::importing::appleveldef_install(
+                unsafe { &mut *app_ns_ptr },
+                include_str!("reduce_protocol_app.py"),
+                "reduce_protocol_app.py",
+                &["reduce_1", "reduce_2", "get_slotvalues"],
+            );
+            let ns = unsafe { &*app_ns_ptr };
+            let get = |name: &str| {
+                crate::dict_storage_get(ns, name)
+                    .unwrap_or_else(|| panic!("reduce_protocol: `{name}` not bound"))
+            };
+            [get("reduce_1"), get("reduce_2"), get("get_slotvalues")]
+        })[which]
+    })
+}
+
+/// `%T`-style class name of `w_obj` for error messages.
+fn typename(w_obj: PyObjectRef) -> String {
+    match crate::typedef::r#type(w_obj) {
+        Some(tp) => unsafe { pyre_object::w_type_get_name(tp) }.to_string(),
+        None => "object".to_string(),
+    }
+}
+
+/// objectobject.py:53 `get_slotvalues(obj)` — app-level handle.
+pub fn get_slotvalues(w_obj: PyObjectRef) -> PyResult {
+    crate::call::call_function_impl_result(handle(GET_SLOTVALUES), &[w_obj])
+}
+
+/// objectobject.py:245 `object_getstate_default(space, w_obj, required)`.
+///
+/// `required` is always 0 from both callers (`descr__getstate__` and the
+/// proto>=2 path), so the variable-sized raise is unreachable and pyre
+/// has no `variable_sized` layout notion to gate it on — the structure
+/// is ported without that dead arm.
+pub fn object_getstate_default(w_obj: PyObjectRef) -> PyResult {
+    let w_objdict = crate::baseobjspace::findattr(w_obj, "__dict__");
+    let mut w_ret = match w_objdict {
+        Some(d) if crate::baseobjspace::len_w(d)? > 0 => {
+            crate::call::call_function_impl_result(crate::baseobjspace::getattr_str(d, "copy")?, &[])?
+        }
+        _ => pyre_object::w_none(),
+    };
+    let w_slots = get_slotvalues(w_obj)?;
+    if !unsafe { pyre_object::is_none(w_slots) } {
+        w_ret = pyre_object::w_tuple_new(vec![w_ret, w_slots]);
+    }
+    Ok(w_ret)
+}
+
+/// objectobject.py:201 `_getnewargs(space, w_obj)` — returns
+/// `(hasargs, w_args, w_kwargs)`.
+pub fn getnewargs(
+    w_obj: PyObjectRef,
+) -> Result<(bool, PyObjectRef, PyObjectRef), PyError> {
+    let w_descr = unsafe { crate::baseobjspace::lookup(w_obj, "__getnewargs_ex__") };
+    let hasargs;
+    let w_args;
+    let w_kwargs;
+    if let Some(w_descr) = w_descr {
+        let w_result = crate::call::call_function_impl_result(w_descr, &[w_obj])?;
+        if !unsafe { pyre_object::is_tuple(w_result) } {
+            return Err(PyError::type_error(format!(
+                "__getnewargs_ex__ should return a tuple, not '{}'",
+                typename(w_result)
+            )));
+        }
+        let n = unsafe { pyre_object::w_tuple_len(w_result) };
+        if n != 2 {
+            return Err(PyError::value_error(format!(
+                "__getnewargs_ex__ should return a tuple of length 2, not {n}"
+            )));
+        }
+        let items = unsafe { pyre_object::w_tuple_items_copy_as_vec(w_result) };
+        let wa = items[0];
+        let wk = items[1];
+        if !unsafe { pyre_object::is_tuple(wa) } {
+            return Err(PyError::type_error(format!(
+                "first item of the tuple returned by __getnewargs_ex__ must be a tuple, not '{}'",
+                typename(wa)
+            )));
+        }
+        if !unsafe { pyre_object::is_dict(wk) } {
+            return Err(PyError::type_error(format!(
+                "second item of the tuple returned by __getnewargs_ex__ must be a dict, not '{}'",
+                typename(wk)
+            )));
+        }
+        hasargs = true;
+        w_args = wa;
+        w_kwargs = wk;
+    } else {
+        let w_descr = unsafe { crate::baseobjspace::lookup(w_obj, "__getnewargs__") };
+        if let Some(w_descr) = w_descr {
+            let wa = crate::call::call_function_impl_result(w_descr, &[w_obj])?;
+            if !unsafe { pyre_object::is_tuple(wa) } {
+                return Err(PyError::type_error(format!(
+                    "__getnewargs__ should return a tuple, not '{}'",
+                    typename(wa)
+                )));
+            }
+            hasargs = true;
+            w_args = wa;
+        } else {
+            hasargs = false;
+            w_args = pyre_object::w_tuple_new(vec![]);
+        }
+        w_kwargs = pyre_object::w_none();
+    }
+    Ok((hasargs, w_args, w_kwargs))
+}
+
+/// objectobject.py:240 `descr__reduce__(space, w_obj)` — `reduce_1(obj, 0)`.
+pub fn descr_reduce(w_obj: PyObjectRef) -> PyResult {
+    reduce_1(w_obj, 0)
+}
+
+/// objectobject.py:23 `reduce_1(obj, proto)` — app-level handle.
+fn reduce_1(w_obj: PyObjectRef, proto: i64) -> PyResult {
+    crate::call::call_function_impl_result(
+        handle(REDUCE_1),
+        &[w_obj, pyre_object::w_int_new(proto)],
+    )
+}
+
+/// objectobject.py:27 `reduce_2(obj, proto, args, kwargs)` — app-level handle.
+fn reduce_2(
+    w_obj: PyObjectRef,
+    proto: i64,
+    w_args: PyObjectRef,
+    w_kwargs: PyObjectRef,
+) -> PyResult {
+    crate::call::call_function_impl_result(
+        handle(REDUCE_2),
+        &[w_obj, pyre_object::w_int_new(proto), w_args, w_kwargs],
+    )
+}
+
+/// objectobject.py:260 `descr__reduce_ex__(space, w_obj, proto)`.
+pub fn descr_reduce_ex(w_obj: PyObjectRef, proto: i64) -> PyResult {
+    // Honour a user `__reduce__` override:
+    // `type(obj).__reduce__ is not object.__reduce__`.
+    let w_reduce = crate::baseobjspace::findattr(w_obj, "__reduce__");
+    if let Some(w_reduce) = w_reduce {
+        let w_type = crate::typedef::r#type(w_obj)
+            .ok_or_else(|| PyError::type_error("cannot determine type for __reduce_ex__"))?;
+        let w_cls_reduce = crate::baseobjspace::getattr_str(w_type, "__reduce__")?;
+        let w_obj_reduce = crate::baseobjspace::getattr_str(crate::typedef::w_object(), "__reduce__")?;
+        let override_ = !crate::baseobjspace::is_w(w_cls_reduce, w_obj_reduce);
+        if override_ {
+            return crate::call::call_function_impl_result(w_reduce, &[]);
+        }
+    }
+    if proto >= 2 {
+        let (_hasargs, w_args, w_kwargs) = getnewargs(w_obj)?;
+        // objectobject.py:276 looks up the (always-absent) `__get_state__`
+        // and, only for variable-sized types lacking newargs, raises.
+        // pyre has no variable-sized layout notion, so the raise is a
+        // no-op here; the structure is preserved for parity.
+        return reduce_2(w_obj, proto, w_args, w_kwargs);
+    }
+    reduce_1(w_obj, proto)
+}

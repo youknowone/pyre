@@ -31,6 +31,7 @@ pub mod opcode_ops;
 pub mod pycode;
 pub mod pyopcode;
 pub mod pytraceback;
+pub mod reduce_protocol;
 pub mod runtime_ops;
 pub mod sandbox;
 pub mod shared_opcode;

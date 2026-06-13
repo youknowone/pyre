@@ -2262,6 +2262,22 @@ fn init_str_type(ns: &mut DictStorage) {
     ] {
         dict_storage_store(ns, name, make_builtin_function_with_arity(name, func, 2));
     }
+    // unicodeobject.py descr_getnewargs — `(W_UnicodeObject(self._utf8),)`:
+    // a fresh plain str from the contents, so a str subclass reduces to str.
+    dict_storage_store(
+        ns,
+        "__getnewargs__",
+        make_builtin_function_with_arity(
+            "__getnewargs__",
+            |args| {
+                let s = unsafe { pyre_object::w_str_get_wtf8(args[0]) };
+                Ok(pyre_object::w_tuple_new(vec![pyre_object::w_str_from_wtf8(
+                    s.to_owned(),
+                )]))
+            },
+            1,
+        ),
+    );
 }
 
 // ── Dict TypeDef ─────────────────────────────────────────────────────
@@ -3814,6 +3830,19 @@ fn init_tuple_type(ns: &mut DictStorage) {
     ] {
         dict_storage_store(ns, name, make_builtin_function_with_arity(name, func, 2));
     }
+    // tupleobject.py descr_getnewargs — `((self-copy),)`
+    dict_storage_store(
+        ns,
+        "__getnewargs__",
+        make_builtin_function_with_arity(
+            "__getnewargs__",
+            |args| {
+                let items = unsafe { pyre_object::w_tuple_items_copy_as_vec(args[0]) };
+                Ok(pyre_object::w_tuple_new(vec![pyre_object::w_tuple_new(items)]))
+            },
+            1,
+        ),
+    );
 }
 
 /// `tupleobject.c` `tuple * n` / `n * tuple`.  A non-integer count
@@ -4811,6 +4840,14 @@ fn init_type_type(ns: &mut DictStorage) {
         2,
     );
     dict_storage_store(ns, "__mro__", make_getset_descriptor(mro_getter));
+
+    // typeobject.py:1237 descr__flags — the `tp_flags` bitmask.
+    let flags_getter = make_builtin_function_with_arity(
+        "__flags__",
+        |args| Ok(pyre_object::w_int_new(unsafe { pyre_object::w_type_get_flags(args[1]) })),
+        2,
+    );
+    dict_storage_store(ns, "__flags__", make_getset_descriptor(flags_getter));
 
     // `type.mro(cls)` — typeobject.c `mro_external` / `type.mro`: the method
     // form returns the MRO as a fresh list (the `__mro__` getset above
@@ -6881,6 +6918,21 @@ fn init_int_type(ns: &mut DictStorage) {
     ] {
         dict_storage_store(ns, name, make_builtin_function_with_arity(name, func, 2));
     }
+    // intobject.py descr_getnewargs — `(wrapint(self.intval),)`: a fresh
+    // plain int from the value, so an int subclass (e.g. bool) reduces to
+    // the base int.
+    dict_storage_store(
+        ns,
+        "__getnewargs__",
+        make_builtin_function_with_arity(
+            "__getnewargs__",
+            |args| {
+                let v = unsafe { pyre_object::w_int_get_value(args[0]) };
+                Ok(pyre_object::w_tuple_new(vec![pyre_object::w_int_new(v)]))
+            },
+            1,
+        ),
+    );
 }
 fn init_float_type(ns: &mut DictStorage) {
     dict_storage_store(ns, "__new__", make_new_descr(float_descr_new));
@@ -7255,6 +7307,20 @@ fn init_float_type(ns: &mut DictStorage) {
     ] {
         dict_storage_store(ns, name, make_builtin_function_with_arity(name, func, 2));
     }
+    // floatobject.py descr_getnewargs — `(self.descr_float(),)`: a fresh
+    // plain float from the value.
+    dict_storage_store(
+        ns,
+        "__getnewargs__",
+        make_builtin_function_with_arity(
+            "__getnewargs__",
+            |args| {
+                let v = unsafe { pyre_object::w_float_get_value(args[0]) };
+                Ok(pyre_object::w_tuple_new(vec![pyre_object::w_float_new(v)]))
+            },
+            1,
+        ),
+    );
 }
 
 #[derive(Copy, Clone)]
@@ -7599,11 +7665,36 @@ fn init_object_type(ns: &mut DictStorage) {
             2,
         ),
     );
-    // PyPy: objectobject.py descr___reduce_ex__
+    // objectobject.py descr__reduce__ / descr__reduce_ex__ / descr__getstate__
+    dict_storage_store(
+        ns,
+        "__reduce__",
+        make_builtin_function_with_arity(
+            "__reduce__",
+            |args| crate::reduce_protocol::descr_reduce(args[0]),
+            1,
+        ),
+    );
     dict_storage_store(
         ns,
         "__reduce_ex__",
-        make_builtin_function_with_arity("__reduce_ex__", |_| Ok(pyre_object::w_none()), 2),
+        make_builtin_function_with_arity(
+            "__reduce_ex__",
+            |args| {
+                let proto = unsafe { pyre_object::w_int_get_value(args[1]) };
+                crate::reduce_protocol::descr_reduce_ex(args[0], proto)
+            },
+            2,
+        ),
+    );
+    dict_storage_store(
+        ns,
+        "__getstate__",
+        make_builtin_function_with_arity(
+            "__getstate__",
+            |args| crate::reduce_protocol::object_getstate_default(args[0]),
+            1,
+        ),
     );
     // typeobject.py descr___init_subclass__ — the default accepts no
     // keywords; class-definition keywords reaching it via the builtin
@@ -8019,6 +8110,22 @@ fn init_bytes_type(ns: &mut DictStorage) {
     ] {
         dict_storage_store(ns, name, make_builtin_function_with_arity(name, func, 2));
     }
+    // bytesobject.py descr_getnewargs — a fresh plain bytes from the value,
+    // so a bytes subclass reduces to bytes.
+    dict_storage_store(
+        ns,
+        "__getnewargs__",
+        make_builtin_function_with_arity(
+            "__getnewargs__",
+            |args| {
+                let data = unsafe { pyre_object::w_bytes_data(args[0]) };
+                Ok(pyre_object::w_tuple_new(vec![
+                    pyre_object::w_bytes_from_bytes(data),
+                ]))
+            },
+            1,
+        ),
+    );
     // bytes methods are mostly shared with bytearray — add as needed.
 }
 
