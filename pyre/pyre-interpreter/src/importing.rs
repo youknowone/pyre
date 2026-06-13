@@ -313,6 +313,10 @@ fn load_builtin_module(name: &str) -> Option<PyObjectRef> {
     let w_dict = pyre_object::w_module_dict_new();
     for (key, &value) in namespace.entries() {
         if !value.is_null() {
+            // MixedModule parity: interp-level builtin functions carry the
+            // module name as `__module__`, so `pickle` can save them by
+            // reference (`save_global`) without guessing via `whichmodule`.
+            unsafe { crate::function::builtin_function_set_module(value, name_obj) };
             unsafe { pyre_object::w_dict_setitem_str(w_dict, key, value) };
         }
     }

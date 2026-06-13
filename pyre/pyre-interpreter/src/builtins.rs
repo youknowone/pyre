@@ -596,7 +596,7 @@ pub fn install_default_builtins(namespace: &mut DictStorage) {
     namespace.get_or_insert_with("filter", || {
         make_module_builtin_function("filter", |args| {
             if args.len() < 2 {
-                return Ok(w_list_new(vec![]));
+                return Ok(pyre_object::w_seq_iter_new(w_list_new(vec![]), 0));
             }
             let func = args[0];
             let items = collect_iterable(args[1])?;
@@ -617,7 +617,11 @@ pub fn install_default_builtins(namespace: &mut DictStorage) {
                     out.push(item);
                 }
             }
-            Ok(w_list_new(out))
+            // `filter` is a lazy iterator in CPython; pyre eagerly applies
+            // the predicate but still hands back an iterator (matching
+            // `map`/`zip`) so `next(filter(...))` works.
+            let n = out.len();
+            Ok(pyre_object::w_seq_iter_new(w_list_new(out), n))
         })
     });
     namespace.get_or_insert_with("input", || {
@@ -992,8 +996,14 @@ pub fn new_builtin_module_dict() -> pyre_object::PyObjectRef {
     let mut seed = DictStorage::new();
     install_default_builtins(&mut seed);
     let w_dict = pyre_object::w_module_dict_new();
+    // MixedModule parity: the interp-level builtins carry "builtins" as
+    // `__module__`, so `pickle.save_global` resolves them by reference
+    // without the `whichmodule` guess (every module namespace exposes the
+    // builtins, which makes that guess unstable).
+    let module_name = w_str_new("builtins");
     for (key, &value) in seed.entries() {
         if !value.is_null() {
+            unsafe { crate::function::builtin_function_set_module(value, module_name) };
             unsafe { pyre_object::w_dict_setitem_str(w_dict, key, value) };
         }
     }
@@ -2863,6 +2873,11 @@ fn parse_int_from_str(s: &str, base: u32) -> Result<PyObjectRef, crate::PyError>
     let cleaned: String = digits.chars().filter(|&c| c != '_').collect();
     if let Ok(v) = i64::from_str_radix(&cleaned, radix) {
         return Ok(w_int_new(sign * v));
+    }
+    // Values outside the machine-int range parse as arbitrary precision.
+    if let Some(big) = BigInt::parse_bytes(cleaned.as_bytes(), radix) {
+        let signed = if sign < 0 { -big } else { big };
+        return Ok(w_long_new(signed));
     }
     Err(crate::PyError::new(
         crate::PyErrorKind::ValueError,

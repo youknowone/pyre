@@ -491,6 +491,26 @@ pub unsafe fn is_function(obj: PyObjectRef) -> bool {
     unsafe { py_type_check(obj, &FUNCTION_TYPE) || py_type_check(obj, &BUILTIN_FUNCTION_TYPE) }
 }
 
+/// Stamp a module-level builtin function's `__module__` with its
+/// containing module at install time — `MixedModule` registration sets
+/// `func.w_module = w(modulename)` for each interp-level definition.
+/// Only touches `BUILTIN_FUNCTION_TYPE` objects whose module is still
+/// unset; app-level functions derive `__module__` from their globals and
+/// are left alone.
+///
+/// # Safety
+/// `obj` must be a valid, non-null pointer to a `PyObject`.
+pub unsafe fn builtin_function_set_module(obj: PyObjectRef, w_module: PyObjectRef) {
+    unsafe {
+        if py_type_check(obj, &BUILTIN_FUNCTION_TYPE) {
+            let func = obj as *mut Function;
+            if (*func).w_module.is_null() {
+                (*func).w_module = w_module;
+            }
+        }
+    }
+}
+
 /// `isinstance(obj, FunctionWithFixedCode)` parity.
 ///
 /// function.py:783 — `class FunctionWithFixedCode(Function):
