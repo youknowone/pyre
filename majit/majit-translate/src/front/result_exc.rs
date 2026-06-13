@@ -69,7 +69,9 @@ use majit_charon_reader::Llbc;
 use majit_charon_reader::ullbc::TyRef;
 
 use crate::flowspace::model::Variable;
-use crate::model::{CallTarget, ExitSwitch, FunctionGraph, Link, LinkArg, OpKind, ValueType};
+use crate::model::{
+    CallFuncPtr, CallTarget, ExitSwitch, FunctionGraph, Link, LinkArg, OpKind, ValueType,
+};
 
 /// Callees whose `Result<T, PyError>` surface lowers to raise links.
 /// Grown deliberately, one fail-loud pipeline convergence at a time;
@@ -435,17 +437,167 @@ fn count_var_uses(graph: &FunctionGraph, var: &Variable) -> UseCounts {
     UseCounts { op_uses, link_uses }
 }
 
-/// Operand variables of an op kind, restricted to the kinds the
-/// Result-shell pattern can contain.  Every other kind returns its
-/// operands through the generic arms below.
+/// Every `Variable` operand of an op kind.
+///
+/// `count_var_uses` and the carrier-unused check in `collapse_pos0_read`
+/// rely on this being exhaustive: a missed operand-bearing variant makes
+/// a live `Result`-shell consumer invisible, so the rewrite could still
+/// delete the shell or collapse `__pos_0`.  The match has no wildcard —
+/// a new `OpKind` variant is a compile error here until its operands are
+/// declared, keeping the pass fail-closed.  Producer / constant / marker
+/// kinds carry no operand `Variable` and return empty.
 fn op_operand_vars(kind: &OpKind) -> Vec<Variable> {
+    let extend_all = |dst: &mut Vec<Variable>, lists: &[&Vec<Variable>]| {
+        for list in lists {
+            dst.extend(list.iter().cloned());
+        }
+    };
     match kind {
-        OpKind::Call { args, .. } => args.clone(),
-        OpKind::FieldWrite { base, value, .. } => vec![base.clone(), value.clone()],
-        OpKind::FieldRead { base, .. } => vec![base.clone()],
+        OpKind::Input { .. }
+        | OpKind::ConstInt(_)
+        | OpKind::ConstBool(_)
+        | OpKind::ConstFloat(_)
+        | OpKind::ConstRef(_)
+        | OpKind::ConstRefNull
+        | OpKind::ConstRefAddr(_)
+        | OpKind::CurrentTraceLength
+        | OpKind::Live
+        | OpKind::LoopHeader { .. }
+        | OpKind::Abort { .. }
+        | OpKind::LoadStatic { .. } => Vec::new(),
+
+        OpKind::FieldRead { base, .. }
+        | OpKind::VableFieldRead { base, .. }
+        | OpKind::VableForce { base }
+        | OpKind::RecordQuasiImmutField { base, .. } => vec![base.clone()],
+        OpKind::FieldWrite { base, value, .. } | OpKind::VableFieldWrite { base, value, .. } => {
+            vec![base.clone(), value.clone()]
+        }
+        OpKind::ArrayRead { base, index, .. } | OpKind::InteriorFieldRead { base, index, .. } => {
+            vec![base.clone(), index.clone()]
+        }
+        OpKind::ArrayWrite {
+            base, index, value, ..
+        }
+        | OpKind::InteriorFieldWrite {
+            base, index, value, ..
+        } => vec![base.clone(), index.clone(), value.clone()],
+        OpKind::VableArrayRead {
+            base, elem_index, ..
+        } => vec![base.clone(), elem_index.clone()],
+        OpKind::VableArrayWrite {
+            base,
+            elem_index,
+            value,
+            ..
+        } => vec![base.clone(), elem_index.clone(), value.clone()],
+        OpKind::Call { args, .. } | OpKind::JitDebug { args } | OpKind::NewTuple { args } => {
+            args.clone()
+        }
+        OpKind::GuardTrue { cond } | OpKind::GuardFalse { cond } => vec![cond.clone()],
+        OpKind::GuardValue { value, .. }
+        | OpKind::AssertGreen { value, .. }
+        | OpKind::IsConstant { value, .. }
+        | OpKind::IsVirtual { value, .. } => vec![value.clone()],
+        OpKind::VtableMethodPtr { receiver, .. } => vec![receiver.clone()],
+        OpKind::IsInstance {
+            obj, class_carrier, ..
+        } => vec![obj.clone(), class_carrier.clone()],
         OpKind::BinOp { lhs, rhs, .. } => vec![lhs.clone(), rhs.clone()],
         OpKind::UnaryOp { operand, .. } => vec![operand.clone()],
-        _ => Vec::new(),
+        OpKind::IndirectCall { funcptr, args, .. } => {
+            let mut v = vec![funcptr.clone()];
+            v.extend(args.iter().cloned());
+            v
+        }
+        OpKind::CallElidable {
+            funcptr,
+            args_i,
+            args_r,
+            args_f,
+            ..
+        }
+        | OpKind::CallResidual {
+            funcptr,
+            args_i,
+            args_r,
+            args_f,
+            ..
+        }
+        | OpKind::CallMayForce {
+            funcptr,
+            args_i,
+            args_r,
+            args_f,
+            ..
+        } => {
+            let mut v = Vec::new();
+            if let CallFuncPtr::Value(var) = funcptr {
+                v.push(var.clone());
+            }
+            extend_all(&mut v, &[args_i, args_r, args_f]);
+            v
+        }
+        OpKind::InlineCall {
+            args_i,
+            args_r,
+            args_f,
+            ..
+        } => {
+            let mut v = Vec::new();
+            extend_all(&mut v, &[args_i, args_r, args_f]);
+            v
+        }
+        OpKind::ConditionalCall {
+            condition: gate,
+            args_i,
+            args_r,
+            args_f,
+            ..
+        }
+        | OpKind::ConditionalCallValue {
+            value: gate,
+            args_i,
+            args_r,
+            args_f,
+            ..
+        }
+        | OpKind::RecordKnownResult {
+            result_value: gate,
+            args_i,
+            args_r,
+            args_f,
+            ..
+        } => {
+            let mut v = vec![gate.clone()];
+            extend_all(&mut v, &[args_i, args_r, args_f]);
+            v
+        }
+        OpKind::RecursiveCall {
+            greens_i,
+            greens_r,
+            greens_f,
+            reds_i,
+            reds_r,
+            reds_f,
+            ..
+        }
+        | OpKind::JitMergePoint {
+            greens_i,
+            greens_r,
+            greens_f,
+            reds_i,
+            reds_r,
+            reds_f,
+            ..
+        } => {
+            let mut v = Vec::new();
+            extend_all(
+                &mut v,
+                &[greens_i, greens_r, greens_f, reds_i, reds_r, reds_f],
+            );
+            v
+        }
     }
 }
 
@@ -463,6 +615,22 @@ fn verify_forwards_to_returnblock(
     // revisiting a block, which the bound rejects.
     for _ in 0..graph.blocks.len() {
         let block = &graph.blocks[current];
+        // Every hop after `from_block` must be a pure forwarder — no
+        // operations and no conditional exit — otherwise the value is
+        // inspected or re-derived en route rather than carried untouched
+        // to the returnblock, and deleting the shell / collapsing
+        // `__pos_0` would be unsound.  `from_block` itself is the
+        // producer (it keeps the ctor + `__pos_0` write, or the call),
+        // so it is exempt.
+        if current != from_block && (!block.operations.is_empty() || block.exitswitch.is_some()) {
+            return Err(format!(
+                "{}: block {current} on the Result-return forwarding chain \
+                 is not a pure forwarder ({} ops, exitswitch present: {})",
+                graph.name,
+                block.operations.len(),
+                block.exitswitch.is_some()
+            ));
+        }
         let [link] = block.exits.as_slice() else {
             return Err(format!(
                 "{}: block {current} on the Result-return forwarding chain \
@@ -781,6 +949,18 @@ fn catch_and_rewrap(graph: &mut FunctionGraph, a: usize, r: &Variable) -> Result
     let (e_id, e_inputs) = graph.create_block_with_arg_vars(nonr_args.len() + 2);
     let e_exc_value_in = e_inputs[nonr_args.len() + 1].clone();
     let e_shell: Option<Variable> = if has_r {
+        // `PyError::from_exc_object(exc_value)` is an associated fn (no
+        // `self`), yet it is spelled as a `Method` target with the caught
+        // exception value as `args[0]`.  This is correct here: a
+        // `CallTarget::Method` is a *static* impl-resolution hint
+        // (`call.rs resolve_method` → `for_impl_method(receiver, name)`),
+        // not a runtime `getattr(args[0], name)` dispatch, so args map
+        // positionally to the graph's params — `obj ← exc_value` — exactly
+        // as for the inherent `&self` `to_exc_object` above.  A
+        // `FunctionPath(["PyError", "from_exc_object"])` would instead
+        // resolve to that bare two-segment path, which misses the
+        // module-qualified impl-method registration and falls back to a
+        // symbolic address.
         let v_err = graph
             .push_op_var(
                 e_id,
@@ -891,6 +1071,16 @@ fn forwards_to_returnblock(graph: &FunctionGraph, block: usize, var: &Variable) 
     let mut current = block;
     let mut tracked = var.clone();
     for _ in 0..graph.blocks.len() {
+        // A pure tail forward only crosses empty, unconditional blocks
+        // after the producer `block`; an intermediate block with
+        // operations or a conditional exit inspects the value and is not
+        // a tail forward.
+        if current != block {
+            let b = &graph.blocks[current];
+            if !b.operations.is_empty() || b.exitswitch.is_some() {
+                return false;
+            }
+        }
         let [link] = graph.blocks[current].exits.as_slice() else {
             return false;
         };
