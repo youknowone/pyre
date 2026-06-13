@@ -1997,6 +1997,16 @@ pub struct PyreSym {
     /// Virtualizable object pointer (PyFrame).
     /// RPython MetaInterp stores the virtualizable separately from MIFrame.
     pub(crate) concrete_vable_ptr: *mut u8,
+    /// Live (interpreter-owned) virtualizable `PyFrame` behind the tracing
+    /// snapshot, or 0 when tracing runs without one (tests).
+    /// `concrete_vable_ptr` points at the `snapshot_for_tracing` copy whose
+    /// `debugdata` / `lastblock` are owned clones freed when the snapshot
+    /// drops; vable-statics capture (`flush_to_frame`) reads those
+    /// pointer-valued fields from this frame so the trace's resume data
+    /// never carries snapshot-owned pointers.  RPython has no snapshot —
+    /// `read_boxes` (virtualizable.py:86-93) always reads the live
+    /// virtualizable, which is what this field restores.
+    pub(crate) live_vable_frame_addr: usize,
     /// Function-entry traces use typed locals (RPython MIFrame parity).
     pub(crate) is_function_entry_trace: bool,
     /// RPython MetaInterp.last_exc_value (pyjitpl.py:2745): concrete
@@ -3583,6 +3593,7 @@ impl PyreSym {
             is_function_entry_trace: false,
             concrete_execution_context: std::ptr::null(),
             concrete_vable_ptr: std::ptr::null_mut(),
+            live_vable_frame_addr: 0,
             last_exc_value: std::ptr::null_mut(),
             class_of_last_exc_is_const: false,
             last_exc_box: OpRef::NONE,

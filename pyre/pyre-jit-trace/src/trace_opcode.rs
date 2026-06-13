@@ -2528,12 +2528,32 @@ impl MIFrame {
     pub(crate) fn flush_to_frame(&mut self, ctx: &mut TraceCtx) {
         let resume_pc = self.orgpc;
         let frame_addr = self.concrete_frame_addr;
-        let (code_ptr, debugdata, lastblock) = if frame_addr != 0 {
+        // virtualizable.py:86-93 read_boxes reads statics from the LIVE
+        // virtualizable.  The root MIFrame's concrete frame is the
+        // trace-stepping snapshot (`snapshot_for_tracing`), whose
+        // `debugdata` / `lastblock` are owned clones freed when tracing
+        // ends — a const captured from the snapshot dangles in the
+        // compiled trace's resume data, and the guard-failure vable
+        // write (`write_from_resume_data_partial`) then stamps the
+        // dangling pointer into the live frame.  Read the pointer-valued
+        // statics from the live virtualizable instead; `pycode` is
+        // copied by the snapshot so either source gives the same value.
+        // `last_instr` / `valuestackdepth` are plain values that evolve
+        // with the trace, so they stay snapshot-sourced below.
+        let statics_addr = {
+            let live = self.sym().live_vable_frame_addr;
+            if live != 0 && self.sym().owns_virtualizable_shadow() {
+                live
+            } else {
+                frame_addr
+            }
+        };
+        let (code_ptr, debugdata, lastblock) = if statics_addr != 0 {
             unsafe {
                 (
-                    *((frame_addr + PYFRAME_PYCODE_OFFSET) as *const usize),
-                    *((frame_addr + PYFRAME_DEBUGDATA_OFFSET) as *const usize),
-                    *((frame_addr + PYFRAME_LASTBLOCK_OFFSET) as *const usize),
+                    *((statics_addr + PYFRAME_PYCODE_OFFSET) as *const usize),
+                    *((statics_addr + PYFRAME_DEBUGDATA_OFFSET) as *const usize),
+                    *((statics_addr + PYFRAME_LASTBLOCK_OFFSET) as *const usize),
                 )
             }
         } else {
@@ -3149,9 +3169,18 @@ impl MIFrame {
                 }
             }
         }
+        // An active virtualizable owner must have its array base seeded by
+        // `init_symbolic` / `become_active_vable_owner` before the JUMP-arg
+        // derivation below reads `nlocals`/`vable_array_base`.  `nlocals` is
+        // NOT a usable proxy for "init ran": module-scope (`<module>`) frames
+        // are vable owners (M1 portal gate) yet have `co_nlocals == 0`, the
+        // same value as the struct default — names go through globals, not
+        // fast locals.  `target_array_capacity` below handles `nlocals == 0`
+        // via the `valuestackdepth` saturating-sub, so the seeded base is the
+        // real precondition.
         debug_assert!(
-            self.sym().nlocals > 0 || !self.sym().is_active_vable_owner,
-            "nlocals must be set by init_symbolic before close_loop_args_at"
+            !self.sym().is_active_vable_owner || self.sym().vable_array_base.is_some(),
+            "an active vable owner must have a seeded vable_array_base before close_loop_args_at"
         );
         // RPython close_loop_args parity: JUMP args must match the target
         // label's types (inputarg_types). materialize_loop_carried_value
@@ -7872,6 +7901,41 @@ impl MIFrame {
             return Ok(Some(pyre_interpreter::StepResult::Continue));
         }
 
+        // PUSH_NULL walker activation via direct symbolic push.
+        //
+        // The auto-gen arm jitcode for `PushNull` is `int_copy,
+        // residual_call_r_r(opcode_push_null, frame), live, ref_return` —
+        // a residual wrapper whose helper is NOT in the runtime fnaddr
+        // registry, so `try_execute_residual_call_via_executor` rejects
+        // its placeholder funcptr (47-bit gate) and the arm walk records
+        // the call WITHOUT executing it.  The concrete `PyFrame.
+        // valuestackdepth` then never advances, and the post-walk
+        // `resync_sym_vsd_from_concrete_frame` clobbers
+        // `sym.valuestackdepth` with the stale frame value — losing every
+        // preceding trait-leg push and underflowing the next CALL
+        // (`LOAD_NAME f; PUSH_NULL; LOAD_NAME s; CALL` at module scope,
+        // `f = g; f(s)` local-callable calls in function scope).
+        //
+        // Short-circuit the arm walk with the symbolic effect directly:
+        // PUSH_NULL pushes a constant NULL stack slot (the `_null_or_self`
+        // operand `opcode_call` pops and discards), so no IR op is needed —
+        // a `const_ref(PY_NULL)` through the trait push machinery keeps
+        // `sym.valuestackdepth` / vable shadow / concrete mirror coherent.
+        // Same delegation pattern as the StoreSubscr hook above; bypasses
+        // `apply_walker_stack_effect` because `push_value` handles vsd.
+        if matches!(instruction, Instruction::PushNull) {
+            use pyre_interpreter::SharedOpcodeHandler;
+            let _ = op_arg;
+            let null_opref = self.with_ctx(|_this, ctx| {
+                Ok::<_, PyError>(ctx.const_ref(pyre_object::PY_NULL as i64))
+            })?;
+            SharedOpcodeHandler::push_value(
+                self,
+                FrontendOp::new(null_opref, ConcreteValue::Ref(pyre_object::PY_NULL)),
+            )?;
+            return Ok(Some(pyre_interpreter::StepResult::Continue));
+        }
+
         // `pyopcode.py:1348-1376 RERAISE` parity for the walker leg.
         //
         // Production walker excluded `Reraise` because the trait path
@@ -8989,8 +9053,15 @@ pub fn production_walker_handles(instruction: &Instruction) -> bool {
             | Instruction::DictMerge { .. }
             | Instruction::SetFunctionAttribute { .. }
             | Instruction::UnpackEx { .. }
-            | Instruction::LoadName { .. }
-            | Instruction::StoreName { .. }
+            // Instruction::LoadName / StoreName excluded: the trait
+            // handlers (`load_name_value` / `store_name_value`) carry the
+            // celldict ModuleDictStrategy fast path (LOAD_GLOBAL_cached
+            // celldict.py:285-322: QUASIIMMUT_FIELD version dep + elidable
+            // cell fold; STORE_GLOBAL_cached celldict.py:328-333:
+            // layout-agnostic setitem_str). The walker's jitcode arm for
+            // these aborts with ResidualCallArgUnbound on the &str name
+            // argument — it was never exercised before module-level frames
+            // became portals.
             | Instruction::StoreGlobal { .. }
             | Instruction::DeleteAttr { .. }
             | Instruction::ImportName { .. }
@@ -9071,10 +9142,12 @@ pub fn production_walker_handles(instruction: &Instruction) -> bool {
             // wrong arg count (bridge fails to compile) and a backend
             // regalloc panic.  Keep the whole handler region on one concrete
             // (trait) leg so the bridge's framestate matches the loop entry.
-            // PushNull is a bare stack push (delta +1) with no may-force
-            // receiver and no `vsd <= nlocals` underflow guard, so it
-            // routes through the non-zero stack-effect resync alongside
-            // the other pure pushes.
+            // PushNull is handled by the dispatch_via_walker_for_opcode
+            // entry hook (direct const-NULL symbolic push): its auto-gen
+            // arm is an inert residual wrapper (`opcode_push_null` is not
+            // in the runtime fnaddr registry), so the arm-walk +
+            // vsd-resync route loses the push and underflows the
+            // following CALL.
             | Instruction::PushNull
     )
 }
@@ -9251,8 +9324,8 @@ fn apply_walker_stack_effect(state: &mut MIFrame, instruction: &Instruction) {
         | Instruction::LoadAttr { .. }
         | Instruction::StoreAttr { .. }
         // | Instruction::StoreSubscr { .. } // see production_walker_handles for the walker hook rationale
-        | Instruction::StoreFastStoreFast { .. }
-        | Instruction::PushNull => {
+        // | Instruction::PushNull // handled by the dispatch_via_walker_for_opcode entry hook; push_value advances vsd
+        | Instruction::StoreFastStoreFast { .. } => {
             // Non-zero stack delta. The walker arm's
             // `setfield_vable_i(valuestackdepth)` emit routes through
             // `vable_setfield` (trace_ctx.rs:2608-2655) which calls

@@ -68,6 +68,14 @@ pub struct Cpu {
     /// constant.  Blackhole/deopt lowering of `LOAD_ATTR`
     /// (`rclass.py:838 rtype_getattr`).
     pub getattr_fn: extern "C" fn(i64, i64) -> i64,
+    /// `bhimpl_load_name` — `(frame: Ref, w_name: Ref, namei: Int) → Ref`
+    /// with `w_name` an interned str constant.  Blackhole/deopt lowering
+    /// of `LOAD_NAME` (`pyopcode.py:945`).
+    pub load_name_fn: extern "C" fn(i64, i64, i64) -> i64,
+    /// `bhimpl_store_name` — `(frame: Ref, w_name: Ref, value: Ref) → Void`
+    /// with `w_name` an interned str constant.  Blackhole/deopt lowering
+    /// of `STORE_NAME` (`pyopcode.py:855`).
+    pub store_name_fn: extern "C" fn(i64, i64, i64) -> i64,
     /// `bhimpl_build_list` — (argc, item0, item1, item2) → new list.
     pub build_list_fn: extern "C" fn(i64, i64, i64, i64) -> i64,
     /// `newtuple(list_w)` (`objspace.py:332`) — (ref array) → new tuple.
@@ -174,6 +182,8 @@ impl Cpu {
             load_const_fn: crate::call_jit::bh_load_const_fn,
             store_subscr_fn: pyre_interpreter::opcode_ops::bh_store_subscr_fn,
             getattr_fn: crate::call_jit::bh_getattr_fn,
+            load_name_fn: crate::call_jit::bh_load_name_fn,
+            store_name_fn: crate::call_jit::bh_store_name_fn,
             build_list_fn: crate::call_jit::bh_build_list_fn,
             newtuple_from_array_fn: crate::call_jit::bh_newtuple_from_array,
             unpack_sequence_fn: crate::call_jit::bh_unpack_sequence_fn,

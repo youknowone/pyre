@@ -2066,6 +2066,7 @@ pub fn trace_and_compile_from_bridge(
     // value-stack underflow / off-by-one-iteration result otherwise).
     let resume_state = frame.snapshot_for_tracing();
     let trace_frame = frame.snapshot_for_tracing();
+    let live_frame_addr = frame as *const PyFrame as usize;
     let mut adopted_walk_end_state = false;
     let outcome = {
         let (driver, _) = crate::eval::driver_pair();
@@ -2076,7 +2077,8 @@ pub fn trace_and_compile_from_bridge(
             &env,
             || {},
             |meta, sym| {
-                let (action, executed) = trace_bytecode(meta, sym, code, resume_pc, trace_frame);
+                let (action, executed) =
+                    trace_bytecode(meta, sym, code, resume_pc, trace_frame, live_frame_addr);
                 // pyjitpl.py:3048-3091 raise_continue_running_normally:
                 // a bridge walk that closed at a merge point and committed
                 // its end-of-walk state into the trace snapshot
@@ -3386,6 +3388,72 @@ pub extern "C" fn bh_load_method_self_fn(
         attr as pyre_object::PyObjectRef,
         name,
     ) as i64
+}
+
+/// `LOAD_NAME` residual for the standalone (blackhole / deopt)
+/// per-CodeObject jitcode.  `pyopcode.py:945-955 LOAD_NAME` — when
+/// `getorcreatedebug().w_locals is not get_w_globals()` the lookup
+/// tries `finditem_str(w_locals, varname)` first, then falls through
+/// to the `LOAD_GLOBAL` globals → builtins chain.  Delegates to the
+/// interpreter trait impl (`eval.rs load_name_checked_value`) so the
+/// blackhole re-execution and the interpreter share one lookup order.
+/// `LOAD_NAME` is traced via the `NamespaceOpcodeHandler` trait leg
+/// (not the walker), so this helper runs ONLY on the blackhole
+/// resume / deopt path, like `bh_getattr_fn`.  `w_name` is the
+/// interned immortal str constant the flatten driver lowers the
+/// `load_name` HLOp's name operand to (`box_str_constant`); `namei`
+/// feeds the `pycode._globals_caches[nameindex]` global cache
+/// (`celldict.py:292`).  On error it sets `BH_LAST_EXC_VALUE` and
+/// returns 0, matching `bh_load_global_fn`'s NameError path.
+pub extern "C" fn bh_load_name_fn(frame_ptr: i64, w_name: i64, namei: i64) -> i64 {
+    use pyre_interpreter::pyopcode::NamespaceOpcodeHandler;
+    assert!(
+        frame_ptr != 0,
+        "bh_load_name_fn requires a non-null PyFrame; every LOAD_NAME emit \
+         site must thread portal_frame_reg as the leading ref operand"
+    );
+    let frame = unsafe { &mut *(frame_ptr as *mut PyFrame) };
+    let name =
+        unsafe { pyre_object::strobject::w_str_get_value(w_name as pyre_object::PyObjectRef) };
+    match frame.load_name_checked_value(name, namei as usize) {
+        Ok(w_value) => w_value as i64,
+        Err(err) => {
+            let exc_obj = err.to_exc_object();
+            majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc_obj as i64));
+            0
+        }
+    }
+}
+
+/// `STORE_NAME` residual for the standalone (blackhole / deopt)
+/// per-CodeObject jitcode.  `pyopcode.py:855-859 STORE_NAME` —
+/// `setitem_str(getorcreatedebug().w_locals, varname, w_newvalue)`.
+/// Delegates to the interpreter trait impl (`eval.rs
+/// store_name_value`), which routes non-dict mapping locals through
+/// `space.setitem` and module/class namespaces through the dict
+/// strategy.  Same blackhole-only execution contract and `w_name` ABI
+/// as `bh_load_name_fn`.  `STORE_NAME` carries no nameindex-keyed
+/// cache upstream, so the trait's `nameindex` argument is passed as 0.
+/// Returns 1 on success; on error it sets `BH_LAST_EXC_VALUE` and
+/// returns 0, matching `bh_store_subscr_fn`.
+pub extern "C" fn bh_store_name_fn(frame_ptr: i64, w_name: i64, value: i64) -> i64 {
+    use pyre_interpreter::pyopcode::NamespaceOpcodeHandler;
+    assert!(
+        frame_ptr != 0,
+        "bh_store_name_fn requires a non-null PyFrame; every STORE_NAME emit \
+         site must thread portal_frame_reg as the leading ref operand"
+    );
+    let frame = unsafe { &mut *(frame_ptr as *mut PyFrame) };
+    let name =
+        unsafe { pyre_object::strobject::w_str_get_value(w_name as pyre_object::PyObjectRef) };
+    match frame.store_name_value(name, 0, value as pyre_object::PyObjectRef) {
+        Ok(()) => 1,
+        Err(err) => {
+            let exc_obj = err.to_exc_object();
+            majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc_obj as i64));
+            0
+        }
+    }
 }
 
 /// Load a constant from the code object.

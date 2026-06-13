@@ -66,6 +66,7 @@ pub fn trace_bytecode(
     _code: &CodeObject,
     start_pc: usize,
     mut concrete_frame: pyre_interpreter::pyframe::FrameBox,
+    live_frame_addr: usize,
 ) -> (TraceAction, pyre_interpreter::pyframe::FrameBox) {
     // `llmodel.py:557` parity — install pyre's `Cpu` impl so the
     // optimizer's `protect_speculative_string` / `bh_strlen` /
@@ -123,6 +124,13 @@ pub fn trace_bytecode(
     // (trace_opcode.rs:3323-3424) and don't call init_symbolic; this path
     // handles the root frame push.
     sym.init_symbolic(ctx, cf_addr);
+    // The snapshot stands in for concrete stepping only; vable-statics
+    // capture must read pointer-valued fields (`debugdata` / `lastblock`)
+    // from the live frame the compiled loop will run on.  See the
+    // `live_vable_frame_addr` field doc (state.rs).  Set before the
+    // full-body-walk leg below so the walker path (the production tracer
+    // post-#73) sees it as well as the trait `interpret()` leg.
+    sym.live_vable_frame_addr = live_frame_addr;
     // Issue #73 walker-as-tracer foundation probe (slice #1, gated).
     // `PYRE_WALK_PERFN_JITCODE=1` attempts to walk the per-CodeObject
     // JitCode body via `dispatch_via_miframe` from the resume entry pc,

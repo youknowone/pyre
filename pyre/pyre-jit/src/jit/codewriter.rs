@@ -2609,6 +2609,54 @@ fn emit_frontend_load_method_self(
     )
 }
 
+fn emit_frontend_load_name(
+    graph: &mut super::flow::FunctionGraph,
+    block: &super::flow::BlockRef,
+    frame: super::flow::FlowValue,
+    name: super::flow::FlowValue,
+    namei: usize,
+    offset: i64,
+) -> super::flow::Variable {
+    // pyopcode.py:945-955 LOAD_NAME is a frame method (w_locals probe +
+    // LOAD_GLOBAL fallback); flow analysis never processes module-scope
+    // code upstream, so there is no flowspace HLOp to mirror.  Record
+    // the frame-receiver call shape directly; the canonical flatten
+    // driver lowers it to a `bh_load_name_fn(frame, w_name, namei)`
+    // residual call (`flatten::lower_load_name_hlop_to_insn`).
+    let v_namei: super::flow::FlowValue = super::flow::Constant::signed(namei as i64).into();
+    emit_graph_op_with_result(
+        graph,
+        block,
+        "load_name",
+        vec![frame.into(), name.into(), v_namei.into()],
+        Kind::Ref,
+        offset,
+    )
+}
+
+fn emit_frontend_store_name(
+    _graph: &mut super::flow::FunctionGraph,
+    block: &super::flow::BlockRef,
+    frame: super::flow::FlowValue,
+    name: super::flow::FlowValue,
+    value: super::flow::FlowValue,
+    offset: i64,
+) {
+    // pyopcode.py:855-859 STORE_NAME ->
+    // `setitem_str(getorcreatedebug().w_locals, varname, w_newvalue)`.
+    // Frame-receiver call shape like `emit_frontend_load_name`; lowers
+    // to `bh_store_name_fn(frame, w_name, value)`
+    // (`flatten::lower_store_name_hlop_to_insn`).  See
+    // `emit_frontend_setitem` for the void-result rationale.
+    record_graph_op(
+        block,
+        "store_name",
+        vec![frame.into(), name.into(), value.into()],
+        None,
+        offset,
+    );
+}
+
 fn emit_frontend_simple_call(
     graph: &mut super::flow::FunctionGraph,
     block: &super::flow::BlockRef,
@@ -3069,6 +3117,8 @@ struct FnPtrIndices {
     load_const_fn: HelperHandle,
     store_subscr_fn: HelperHandle,
     getattr_fn: HelperHandle,
+    load_name_fn: HelperHandle,
+    store_name_fn: HelperHandle,
     build_list_fn: HelperHandle,
     newtuple_from_array_fn: HelperHandle,
     unpack_sequence_fn: HelperHandle,
@@ -3294,6 +3344,15 @@ fn register_helper_fn_pointers(
         cpu.load_method_self_fn as *const (),
         CallFlavor::PlainCannotRaise,
     );
+    // `bh_load_name_fn` / `bh_store_name_fn` delegate to the interpreter
+    // `NamespaceOpcodeHandler` impl (pyopcode.py:945 LOAD_NAME / :855
+    // STORE_NAME).  Both run only on the blackhole/deopt path —
+    // LOAD_NAME / STORE_NAME are traced via the trait leg, never the
+    // walker — so they share `bh_getattr_fn`'s classification:
+    // `CallFlavor::Plain` (can raise, no virtual-force while live).
+    // Bound after the existing fn_ptrs to preserve their indices.
+    let load_name_fn = bind(assembler, cpu.load_name_fn as *const (), CallFlavor::Plain);
+    let store_name_fn = bind(assembler, cpu.store_name_fn as *const (), CallFlavor::Plain);
     FnPtrIndices {
         call_fn,
         load_global_fn,
@@ -3304,6 +3363,8 @@ fn register_helper_fn_pointers(
         load_const_fn,
         store_subscr_fn,
         getattr_fn,
+        load_name_fn,
+        store_name_fn,
         build_list_fn,
         newtuple_from_array_fn,
         unpack_sequence_fn,
@@ -4127,6 +4188,16 @@ impl CodeWriter {
                     idx: getattr_fn_idx,
                     flavor: _getattr_fn_flavor,
                 },
+            load_name_fn:
+                HelperHandle {
+                    idx: load_name_fn_idx,
+                    flavor: _load_name_fn_flavor,
+                },
+            store_name_fn:
+                HelperHandle {
+                    idx: store_name_fn_idx,
+                    flavor: _store_name_fn_flavor,
+                },
             build_list_fn:
                 HelperHandle {
                     idx: build_list_fn_idx,
@@ -4258,6 +4329,8 @@ impl CodeWriter {
                 truth_fn_idx,
                 store_subscr_fn_idx,
                 getattr_fn_idx,
+                load_name_fn_idx,
+                store_name_fn_idx,
                 build_list_fn_idx,
                 newtuple_from_array_fn_idx,
                 // `[u16; 9]` indexed by nargs (0..=8).  `call_fn_idx` (nargs=1)
@@ -7183,32 +7256,65 @@ impl CodeWriter {
                         // Stack-effect-aware abort_permanent for unsupported ops.
                         // current_depth must track interpreter parity so that
                         // subsequent CALL handlers don't underflow.
-                        Instruction::LoadName { .. } => {
-                            // flowcontext.py:859 LOAD_NAME = LOAD_GLOBAL.
-                            // RPython resolves the name to a Constant during flow
-                            // analysis; pyre cannot fold module namespace lookups at
-                            // codewriter time, so do not invent a graph op here.
-                            // The abort_permanent above means the loaded value is
-                            // never observed at runtime, but downstream ops in the
-                            // same block (e.g. the bool() arg of POP_JUMP_IF_FALSE)
-                            // pop from current_state.stack and would otherwise
-                            // hit `fresh_ref_value` — producing an orphan Variable
-                            // with no graph SpaceOp producer that breaks canonical
-                            // SSARepr build's make_dependencies (regalloc.py:26-77
-                            // adds depgraph nodes only for op.result + inputargs).
-                            // Push `Constant::none()` so downstream pops resolve
-                            // to a constant, not a fresh Variable.
-                            current_state
-                                .stack
-                                .push(super::flow::Constant::none().into());
-                            emit_abort_permanent!();
-                            current_depth += 1;
-                            emit_vsd!(current_depth, py_pc);
+                        Instruction::LoadName { namei } => {
+                            // pyopcode.py:945-955 LOAD_NAME — w_locals probe +
+                            // LOAD_GLOBAL fallback, a runtime namespace lookup
+                            // that cannot fold at codewriter time (module-loop
+                            // names mutate every iteration).  Record the
+                            // `load_name` HLOp with the portal frame as
+                            // receiver; the canonical splice lowers it to a
+                            // `bh_load_name_fn(frame, w_name, namei)` residual
+                            // call.  LOAD_NAME is traced via the trait leg
+                            // (`NamespaceOpcodeHandler::load_name_value`), so
+                            // the residual runs only on blackhole/deopt —
+                            // same contract as the LoadAttr arm.
+                            let name_idx = namei.get(op_arg) as usize;
+                            let attr_name =
+                                super::flow::Constant::string(code.names[name_idx].as_str());
+                            let loaded_dst_reg = stack_base + current_depth;
+                            let result_value = emit_frontend_load_name(
+                                &mut graph,
+                                &current_block.block(),
+                                frame_var.into(),
+                                attr_name.into(),
+                                name_idx,
+                                py_pc as i64,
+                            );
+                            pin!(Some(result_value), loaded_dst_reg);
+                            let result_fv: super::flow::FlowValue = result_value.into();
+                            current_state.stack.push(result_fv.clone());
+                            emit_pushvalue_ref!(current_depth, loaded_dst_reg, result_fv, py_pc);
                         }
-                        Instruction::StoreName { .. } | Instruction::StoreGlobal { .. } => {
-                            // flowcontext.py marks STORE_NAME unsupported, but the
-                            // stack effect still consumes one value. STORE_GLOBAL
-                            // follows the same shape in flowcontext.py:884-890.
+                        Instruction::StoreName { namei } => {
+                            // pyopcode.py:855-859 STORE_NAME — pops the value
+                            // and writes it into `w_locals` via the
+                            // `store_name` HLOp → `bh_store_name_fn(frame,
+                            // w_name, value)` residual call.  Traced via the
+                            // trait leg (`store_name_value`); the residual
+                            // runs only on blackhole/deopt.
+                            let name_idx = namei.get(op_arg) as usize;
+                            let attr_name =
+                                super::flow::Constant::string(code.names[name_idx].as_str());
+                            let value_reg = emit_popvalue_ref!(current_depth, py_pc);
+                            let stored_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            if let super::flow::FlowValue::Variable(v) = &stored_value {
+                                pin!(Some(*v), value_reg);
+                            }
+                            emit_frontend_store_name(
+                                &mut graph,
+                                &current_block.block(),
+                                frame_var.into(),
+                                attr_name.into(),
+                                stored_value,
+                                py_pc as i64,
+                            );
+                        }
+                        Instruction::StoreGlobal { .. } => {
+                            // flowcontext.py:884-890 STORE_GLOBAL is
+                            // unsupported; the stack effect still consumes one
+                            // value.  Unlike STORE_NAME it bypasses w_locals
+                            // (`pyopcode.py:940`), and no hot path needs it
+                            // yet — keep the abort until a helper lands.
                             emit_abort_permanent!();
                             pop_and_decr_depth(&mut current_state, &mut current_depth);
                             emit_vsd!(current_depth, py_pc);

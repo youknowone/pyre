@@ -764,7 +764,11 @@ impl PyreMetaInterp {
                 .unwrap_or(sym.valuestackdepth)
                 .max(sym.nlocals);
             super::trace_opcode::gen_writeback_inline_frame_to_heap(
-                ctx, sym, frame_opref, target_pc, vsd,
+                ctx,
+                sym,
+                frame_opref,
+                target_pc,
+                vsd,
             );
         }
 

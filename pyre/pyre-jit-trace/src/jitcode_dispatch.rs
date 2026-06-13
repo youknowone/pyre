@@ -4536,33 +4536,24 @@ fn try_execute_residual_call_via_executor(
             return Ok(None);
         }
     }
-    // Void-result calls (STORE_SUBSCR / list.append / dict.__setitem__ etc.)
-    // carry no value the walk specializes on — only their side effect.
-    //
     // `do_residual_call` (pyjitpl.py:2040/2104/2123 for CALL_MAY_FORCE_N /
-    // CALL_LOOPINVARIANT_N / CALL_N) still runs `executor.execute_varargs` for a
-    // void call, applying the side effect once during tracing, and then resumes
-    // the compiled loop at the *next* iteration (`raise_continue_running_normally`,
-    // pyjitpl.py:3072-3091, hands back the end-of-iteration-N state).  The
-    // full-body walk cannot mirror that eager step: it is a SYMBOLIC walk that
-    // does not advance the interpreter, so the compiled loop re-enters at the
-    // traced iteration N (entry = loop header) and re-runs the body.  Executing
-    // the helper here would land the heap mutation twice — once now, once when
-    // the compiled loop re-runs iteration N.  Record the call symbolically
-    // instead: falling through with `None` leaves the recorded residual op in
-    // the trace, so the compiled loop applies the side effect exactly once.
-    // That is the FBW-correct equivalent of the eager step, and the net
-    // once-per-iteration effect matches the trait path.  (Every `None`
-    // from this function marks `FBW_UNJOURNALED_EFFECT` at the dispatch
-    // sites, keeping the walk-end no-replay commit off for this trace.)
+    // CALL_LOOPINVARIANT_N / CALL_N) runs `executor.execute_varargs` for a void
+    // call exactly like the value-returning shapes, applying the side effect
+    // once during tracing and then resuming the compiled loop at the *next*
+    // iteration (`raise_continue_running_normally`, pyjitpl.py:3072-3091, hands
+    // back the end-of-iteration-N state so iteration N is never re-run).  Pyre
+    // mirrors the second half via the walk-end commit
+    // (`flush_walk_end_state_to_frame`, run_perfn_walk): a successful commit
+    // adopts the end-of-walk frame so the compiled loop enters at iteration
+    // N+1, leaving the eagerly-applied side effect counted once.  Executing
+    // void calls here (rather than recording-only) keeps that invariant whole —
+    // a deferred void store would be lost on commit (its symbolic op only fires
+    // for N+1+), which is why deferral previously forced the no-commit legacy
+    // replay.  The replay path that re-runs iteration N has the symmetric
+    // hazard for already-executed value calls (e.g. `list.insert` returns the
+    // None ref, so it is not a void call yet still mutates) — eager-everything +
+    // commit is the single consistent rule, matching `do_residual_call`.
     //
-    // The per-opcode arm walk has NO replay behind it (the interpreter
-    // advances opcode by opcode; the compiled loop enters at the next
-    // iteration), so a declined void effect would be lost, not deferred —
-    // it executes eagerly below, the direct `execute_varargs` analogue.
-    if ctx.is_full_body_walk && call_descr.result_type() == majit_ir::Type::Void {
-        return Ok(None);
-    }
     // pyjitpl.py:3329-3330 `vinfo.tracing_before_residual_call(virtualizable)`
     // heap half: every decline gate has passed, so the helper WILL execute —
     // set TOKEN_TRACING_RESCALL on the active virtualizable so a force

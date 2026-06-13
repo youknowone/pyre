@@ -3066,6 +3066,18 @@ pub struct LoweringContext {
     /// via [`lower_getattr_hlop_to_insn`] to `load_attr_fn` instead,
     /// and bare 2-arg `getattr` HLOps pass through.
     pub getattr_fn_idx: u16,
+    /// `load_name_fn` descrs-pool index.  LOAD_NAME family (single
+    /// HLOp opname `load_name`, the `pyopcode.py:945` frame-receiver
+    /// shape) lowers to `residual_call_ir_r` (`ListI([namei])` +
+    /// `ListR([frame, w_name])`, Ref result) via
+    /// [`lower_load_name_hlop_to_insn`].
+    pub load_name_fn_idx: u16,
+    /// `store_name_fn` descrs-pool index.  STORE_NAME family (single
+    /// HLOp opname `store_name`, the `pyopcode.py:855` frame-receiver
+    /// shape) lowers to `residual_call_r_v` (three Ref inputs `[frame,
+    /// w_name, value]`, void result) via
+    /// [`lower_store_name_hlop_to_insn`].
+    pub store_name_fn_idx: u16,
     /// `build_list_fn` descrs-pool index — see codewriter.rs:2401
     /// (`bind(assembler, cpu.build_list_fn as *const (),
     /// CallFlavor::Plain)`) for the production source.  BUILD_LIST
@@ -3617,6 +3629,93 @@ pub fn build_load_method_self_fn_residual_call_ir_r_insn(
         ],
         Register::new(Kind::Ref, dst_reg),
     )
+}
+
+/// Lower a `LOAD_NAME` pre-rtype HLOp `load_name(frame, w_name, namei)`
+/// → `result: Ref` (the `pyopcode.py:945-955 LOAD_NAME` frame-receiver
+/// shape recorded by `emit_frontend_load_name`) to the post-rtype
+/// `residual_call_ir_r(ConstInt(load_name_fn_idx), ListI([namei]),
+/// ListR([frame, w_name]), Descr) → reg` Insn.  `bh_load_name_fn(frame:
+/// Ref, w_name: Ref, namei: Int) → Ref` delegates to the interpreter
+/// `load_name_checked_value`; the name Constant lowers to the interned
+/// immortal str pointer via `lower_constant` and `namei` to a plain
+/// `ConstInt`.  `LOAD_NAME` is traced via the trait leg (the walker
+/// never records this residual), so the frame lowers as a plain
+/// register operand.  `CallFlavor::Plain` (can-raise `NameError`, no
+/// virtual-force) — same classification as `getattr_fn`.
+pub fn lower_load_name_hlop_to_insn<F, LC>(
+    op: &super::flow::SpaceOperation,
+    ctx: &LoweringContext,
+    get_register: &mut F,
+    lower_constant: &mut LC,
+) -> Option<Insn>
+where
+    F: FnMut(super::flow::Variable) -> Register,
+    LC: FnMut(&Constant) -> Operand,
+{
+    if op.opname != "load_name" {
+        return None;
+    }
+    if op.args.len() != 3 {
+        return None;
+    }
+    let frame_operand = flatten_arg_with_lowering(&op.args[0], get_register, lower_constant);
+    let name_operand = flatten_arg_with_lowering(&op.args[1], get_register, lower_constant);
+    let namei = match flatten_arg_with_lowering(&op.args[2], get_register, lower_constant) {
+        Operand::ConstInt(v) => v,
+        _ => return None,
+    };
+    let dst_reg = match &op.result {
+        Some(super::flow::FlowValue::Variable(var)) => get_register(*var),
+        _ => return None,
+    };
+    Some(build_residual_call_ir_r_insn_from_operands(
+        ctx.load_name_fn_idx,
+        namei,
+        frame_operand,
+        name_operand,
+        CallFlavor::Plain,
+        majit_ir::PyreHelperKind::None,
+        dst_reg,
+    ))
+}
+
+/// Lower a `STORE_NAME` pre-rtype HLOp `store_name(frame, w_name,
+/// value)` → void (the `pyopcode.py:855-859 STORE_NAME` frame-receiver
+/// shape recorded by `emit_frontend_store_name`) to the post-rtype
+/// `residual_call_r_v(ConstInt(store_name_fn_idx), ListR([frame,
+/// w_name, value]), Descr)` Insn — the same void 3-Ref shape as
+/// SETITEM.  `bh_store_name_fn(frame: Ref, w_name: Ref, value: Ref)`
+/// delegates to the interpreter `store_name_value`.
+/// `CallFlavor::Plain` like [`lower_load_name_hlop_to_insn`].
+pub fn lower_store_name_hlop_to_insn<F, LC>(
+    op: &super::flow::SpaceOperation,
+    ctx: &LoweringContext,
+    get_register: &mut F,
+    lower_constant: &mut LC,
+) -> Option<Insn>
+where
+    F: FnMut(super::flow::Variable) -> Register,
+    LC: FnMut(&Constant) -> Operand,
+{
+    if op.opname != "store_name" {
+        return None;
+    }
+    if op.args.len() != 3 {
+        return None;
+    }
+    if op.result.is_some() {
+        return None;
+    }
+    let frame_operand = flatten_arg_with_lowering(&op.args[0], get_register, lower_constant);
+    let name_operand = flatten_arg_with_lowering(&op.args[1], get_register, lower_constant);
+    let value_operand = flatten_arg_with_lowering(&op.args[2], get_register, lower_constant);
+    Some(build_residual_call_r_v_insn_from_operands(
+        ctx.store_name_fn_idx,
+        vec![frame_operand, name_operand, value_operand],
+        CallFlavor::Plain,
+        majit_ir::PyreHelperKind::None,
+    ))
 }
 
 /// Construct the CALL-family `residual_call_r_r` Insn from raw
@@ -4406,6 +4505,12 @@ where
         return Some(insn);
     }
     if let Some(insn) = lower_setitem_hlop_to_insn(op, ctx, get_register, lower_constant) {
+        return Some(insn);
+    }
+    if let Some(insn) = lower_load_name_hlop_to_insn(op, ctx, get_register, lower_constant) {
+        return Some(insn);
+    }
+    if let Some(insn) = lower_store_name_hlop_to_insn(op, ctx, get_register, lower_constant) {
         return Some(insn);
     }
     if let Some(insn) = lower_new_sequence_hlop_to_insn(op, ctx, get_register, lower_constant) {
@@ -5915,6 +6020,8 @@ mod tests {
             truth_fn_idx: 17,
             store_subscr_fn_idx: 19,
             getattr_fn_idx: 0,
+            load_name_fn_idx: 0,
+            store_name_fn_idx: 0,
             build_list_fn_idx: 0,
             newtuple_from_array_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
@@ -6049,6 +6156,8 @@ mod tests {
             truth_fn_idx: 17,
             store_subscr_fn_idx: 19,
             getattr_fn_idx: 0,
+            load_name_fn_idx: 0,
+            store_name_fn_idx: 0,
             build_list_fn_idx: 0,
             newtuple_from_array_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
@@ -6170,6 +6279,8 @@ mod tests {
             truth_fn_idx: 17,
             store_subscr_fn_idx: 19,
             getattr_fn_idx: 0,
+            load_name_fn_idx: 0,
+            store_name_fn_idx: 0,
             build_list_fn_idx: 0,
             newtuple_from_array_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
@@ -6254,6 +6365,8 @@ mod tests {
             truth_fn_idx: 17,
             store_subscr_fn_idx: 19,
             getattr_fn_idx: 0,
+            load_name_fn_idx: 0,
+            store_name_fn_idx: 0,
             build_list_fn_idx: 0,
             newtuple_from_array_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
@@ -6382,6 +6495,8 @@ mod tests {
             truth_fn_idx: 17,
             store_subscr_fn_idx: 19,
             getattr_fn_idx: 0,
+            load_name_fn_idx: 0,
+            store_name_fn_idx: 0,
             build_list_fn_idx: 0,
             newtuple_from_array_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
@@ -6555,6 +6670,8 @@ mod tests {
             truth_fn_idx: 17,
             store_subscr_fn_idx: 19,
             getattr_fn_idx: 0,
+            load_name_fn_idx: 0,
+            store_name_fn_idx: 0,
             build_list_fn_idx: 0,
             newtuple_from_array_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
@@ -6777,6 +6894,8 @@ mod tests {
             truth_fn_idx: 0,
             store_subscr_fn_idx: 0,
             getattr_fn_idx: 0,
+            load_name_fn_idx: 0,
+            store_name_fn_idx: 0,
             build_list_fn_idx: 0,
             newtuple_from_array_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
@@ -6865,6 +6984,8 @@ mod tests {
             truth_fn_idx: 0,
             store_subscr_fn_idx: 0,
             getattr_fn_idx: 0,
+            load_name_fn_idx: 0,
+            store_name_fn_idx: 0,
             build_list_fn_idx: 0,
             newtuple_from_array_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
@@ -6897,6 +7018,8 @@ mod tests {
             truth_fn_idx: 0,
             store_subscr_fn_idx: 0,
             getattr_fn_idx: 0,
+            load_name_fn_idx: 0,
+            store_name_fn_idx: 0,
             build_list_fn_idx: 0,
             newtuple_from_array_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
@@ -7002,6 +7125,8 @@ mod tests {
             truth_fn_idx: 0,
             store_subscr_fn_idx: 0,
             getattr_fn_idx: 0,
+            load_name_fn_idx: 0,
+            store_name_fn_idx: 0,
             build_list_fn_idx: 0,
             newtuple_from_array_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
@@ -7066,6 +7191,8 @@ mod tests {
             truth_fn_idx: 0,
             store_subscr_fn_idx: 0,
             getattr_fn_idx: 0,
+            load_name_fn_idx: 0,
+            store_name_fn_idx: 0,
             build_list_fn_idx: 0,
             newtuple_from_array_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
@@ -7096,6 +7223,8 @@ mod tests {
             truth_fn_idx: 0,
             store_subscr_fn_idx: 0,
             getattr_fn_idx: 0,
+            load_name_fn_idx: 0,
+            store_name_fn_idx: 0,
             build_list_fn_idx: 0,
             newtuple_from_array_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
@@ -7133,6 +7262,8 @@ mod tests {
             truth_fn_idx: 23,
             store_subscr_fn_idx: 0,
             getattr_fn_idx: 0,
+            load_name_fn_idx: 0,
+            store_name_fn_idx: 0,
             build_list_fn_idx: 0,
             newtuple_from_array_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
@@ -7197,6 +7328,8 @@ mod tests {
             truth_fn_idx: 23,
             store_subscr_fn_idx: 0,
             getattr_fn_idx: 0,
+            load_name_fn_idx: 0,
+            store_name_fn_idx: 0,
             build_list_fn_idx: 0,
             newtuple_from_array_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
@@ -7224,6 +7357,8 @@ mod tests {
             truth_fn_idx: 31,
             store_subscr_fn_idx: 0,
             getattr_fn_idx: 0,
+            load_name_fn_idx: 0,
+            store_name_fn_idx: 0,
             build_list_fn_idx: 0,
             newtuple_from_array_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
@@ -7265,6 +7400,8 @@ mod tests {
             truth_fn_idx: 0,
             store_subscr_fn_idx: 41,
             getattr_fn_idx: 0,
+            load_name_fn_idx: 0,
+            store_name_fn_idx: 0,
             build_list_fn_idx: 0,
             newtuple_from_array_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
@@ -7322,6 +7459,8 @@ mod tests {
             truth_fn_idx: 0,
             store_subscr_fn_idx: 41,
             getattr_fn_idx: 0,
+            load_name_fn_idx: 0,
+            store_name_fn_idx: 0,
             build_list_fn_idx: 0,
             newtuple_from_array_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
@@ -7364,6 +7503,8 @@ mod tests {
             truth_fn_idx: 0,
             store_subscr_fn_idx: 53,
             getattr_fn_idx: 0,
+            load_name_fn_idx: 0,
+            store_name_fn_idx: 0,
             build_list_fn_idx: 0,
             newtuple_from_array_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
@@ -7421,6 +7562,8 @@ mod tests {
             truth_fn_idx: 31,
             store_subscr_fn_idx: 53,
             getattr_fn_idx: 0,
+            load_name_fn_idx: 0,
+            store_name_fn_idx: 0,
             build_list_fn_idx: 0,
             newtuple_from_array_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
@@ -7454,6 +7597,8 @@ mod tests {
             truth_fn_idx: 31,
             store_subscr_fn_idx: 53,
             getattr_fn_idx: 0,
+            load_name_fn_idx: 0,
+            store_name_fn_idx: 0,
             build_list_fn_idx: 0,
             newtuple_from_array_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
@@ -7487,6 +7632,8 @@ mod tests {
             truth_fn_idx: 31,
             store_subscr_fn_idx: 53,
             getattr_fn_idx: 0,
+            load_name_fn_idx: 0,
+            store_name_fn_idx: 0,
             build_list_fn_idx: 0,
             newtuple_from_array_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
@@ -7525,6 +7672,8 @@ mod tests {
             truth_fn_idx: 31,
             store_subscr_fn_idx: 53,
             getattr_fn_idx: 0,
+            load_name_fn_idx: 0,
+            store_name_fn_idx: 0,
             build_list_fn_idx: 0,
             newtuple_from_array_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
@@ -7577,6 +7726,8 @@ mod tests {
             truth_fn_idx: 31,
             store_subscr_fn_idx: 53,
             getattr_fn_idx: 0,
+            load_name_fn_idx: 0,
+            store_name_fn_idx: 0,
             build_list_fn_idx: 0,
             newtuple_from_array_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
@@ -8952,6 +9103,8 @@ mod tests {
             truth_fn_idx: 0,
             store_subscr_fn_idx: 0,
             getattr_fn_idx: 0,
+            load_name_fn_idx: 0,
+            store_name_fn_idx: 0,
             build_list_fn_idx: 0,
             newtuple_from_array_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
@@ -9226,6 +9379,8 @@ mod tests {
             truth_fn_idx: 0,
             store_subscr_fn_idx: 0,
             getattr_fn_idx: 0,
+            load_name_fn_idx: 0,
+            store_name_fn_idx: 0,
             build_list_fn_idx: 0,
             newtuple_from_array_fn_idx: 0,
             call_fn_idx_by_nargs,

@@ -3092,13 +3092,9 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
     // The codewriter-side portal check
     // (`CallControl::jitdriver_sd_from_portal_graph`, codewriter.py:37)
     // is the canonical "is this code a portal" answer once
-    // `setup_jitdriver` has registered it. The eval-side gate below
-    // is a different question — "should this **frame** go through the
-    // JIT machinery at all" — and stays a structural pyre-specific
-    // check because module-level `<module>` frames lack the
-    // function-scope PyFrame layout the JIT relies on.
+    // `setup_jitdriver` has registered it.
     //
-    // Note: pyre routes every function-scope
+    // Note: pyre routes every
     // CodeObject through `jit_merge_point_hook` and `can_enter_jit`
     // so that recursive calls into a previously-traced function reach
     // `maybe_compile_and_run` even before the function's own loop
@@ -3114,11 +3110,21 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
     //   - "has back-edge AND name != <module>": same problem —
     //     non-loop function frames are skipped.
     //
-    // Until pyre's portal/interpreter split is ported, the eval-side
-    // gate stays pyre-specific: every non-module CodeObject reaches
-    // the JIT machinery; the codewriter-side decides portal-ness via
-    // the registry.
-    let is_portal: bool = &*code.obj_name != "<module>";
+    // interp_jit.py:81-99 applies pypyjitdriver to every frame including
+    // `<module>`, so `true` is the parity-correct value and is what lets
+    // the module-level driver loop (nbody_50k `while i < n: advance(...)`)
+    // trace at all.  But module-loop tracing is a NET perf regression
+    // today: the dynamic call to `advance` cannot be inlined by the
+    // full-body walker (#62 not yet landed), so the trace is pure overhead
+    // and advance's short inner loop deopt-storms (nbody_50k 0.20s
+    // interpreter-only -> 3.6s traced).  Gate module-frame portal status
+    // behind PYRE_MODULE_LOOP_TRACE until call-inlining (#62) makes the
+    // trace a win; the default keeps `<module>` non-portal.  Function
+    // frames are always portals (the alternatives in the note above that
+    // skip non-loop function frames regress; excluding only `<module>`
+    // does not).
+    let is_portal: bool = &*code.obj_name != "<module>"
+        || std::env::var_os("PYRE_MODULE_LOOP_TRACE").as_deref() == Some(std::ffi::OsStr::new("1"));
     // interp_jit.py:66 — next_instr, pycode are greens (managed by jit_merge_point).
     // No explicit promote needed; the JitDriver green-key mechanism handles this.
 
@@ -3546,7 +3552,9 @@ fn jit_merge_point_hook(
             crate::jit::codewriter::register_portal_jitdriver(code, frame.pycode, Some(pc));
             let snapshot = frame.snapshot_for_tracing();
             let _ = concrete_frame;
-            let (action, executed_frame) = trace_bytecode(meta, sym, code, pc, snapshot);
+            let live_frame_addr = &*frame as *const PyFrame as usize;
+            let (action, executed_frame) =
+                trace_bytecode(meta, sym, code, pc, snapshot, live_frame_addr);
             // pyjitpl.py:3048-3091 raise_continue_running_normally: tracing
             // IS execution — a walk that committed its end-of-walk state
             // into the snapshot (CloseLoop / CompileTracePending flush)
@@ -4235,8 +4243,15 @@ fn bound_reached(
                         Some(loop_header_pc),
                     );
                     let concrete_frame = frame.snapshot_for_tracing();
-                    let (action, executed_frame) =
-                        trace_bytecode(meta, sym, code, loop_header_pc, concrete_frame);
+                    let live_frame_addr = &*frame as *const PyFrame as usize;
+                    let (action, executed_frame) = trace_bytecode(
+                        meta,
+                        sym,
+                        code,
+                        loop_header_pc,
+                        concrete_frame,
+                        live_frame_addr,
+                    );
                     // raise_continue_running_normally seam — see the
                     // jit_merge_point_hook tracing site for the contract.
                     if pyre_jit_trace::trace::take_walk_end_flush_committed() {
@@ -8946,7 +8961,17 @@ while i < 40:
     s = s + outer(i)
     i = i + 1";
         let code = pyre_interpreter::compile_exec(source).expect("compile failed");
-        let mut frame = PyFrame::new(code);
+        // Production shape (see `test_nested_direct_helper_calls_stay_correct`):
+        // the module-level loop is a portal (interp_jit.py:81-99 applies the
+        // jitdriver to every frame), so the full-body walk concrete-executes
+        // the `outer(i)` residual during tracing — `bh_call_fn_impl` resolves
+        // the parent frame from `getexecutioncontext().gettopframe()`, which a
+        // bare `PyFrame::new` frame never seeds.
+        let execution_context = std::rc::Rc::new(pyre_interpreter::PyExecutionContext::default());
+        pyre_interpreter::call::set_last_exec_ctx(std::rc::Rc::as_ptr(&execution_context));
+        let mut frame =
+            pyre_interpreter::pyframe::PyFrame::new_with_context(code, execution_context)
+                .expect("frame construction failed");
         let _ = eval_with_jit(&mut frame);
         unsafe {
             let s = *(*frame_globals_storage(&frame)).get("s").unwrap();
