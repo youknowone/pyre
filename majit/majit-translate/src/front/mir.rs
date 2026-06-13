@@ -980,6 +980,20 @@ impl std::error::Error for LowerError {}
 // Lowering state
 // ---------------------------------------------------------------------------
 
+/// The `(base, index)` operands of a devirtualized workspace index call,
+/// recorded for the paired `*p = v` write.  Each operand keeps the
+/// resolving-block Variable plus its source MIR local (`None` for a
+/// constant operand) so the write site can re-resolve through
+/// `local_var` after the operand is rebound across the call's block
+/// split.  See [`Lowering::index_elem_alias`].
+#[derive(Clone)]
+struct IndexElemAlias {
+    base_local: Option<usize>,
+    base_var: Variable,
+    index_local: Option<usize>,
+    index_var: Variable,
+}
+
 struct Lowering<'a> {
     graph: FunctionGraph,
     llbc: &'a Llbc,
@@ -1045,8 +1059,14 @@ struct Lowering<'a> {
     /// getarrayitem instead and the paired `*p = v` write
     /// ([`Lowering::emit_projection_write`] `Deref` arm) consults
     /// this map to emit `ArrayWrite` rather than the opaque
-    /// `__deref_write` marker.
-    index_elem_alias: std::collections::HashMap<usize, (Variable, Variable)>,
+    /// `__deref_write` marker.  The base/index are kept as both the
+    /// resolving-block Variable and their source MIR local: the write
+    /// usually lands in a later block (the index call terminates its
+    /// own block), where the operands have been rebound to fresh
+    /// inputarg Variables, so the consumer re-resolves through
+    /// `local_var` by local and only falls back to the recorded
+    /// Variable for a base/index without a backing local (a constant).
+    index_elem_alias: std::collections::HashMap<usize, IndexElemAlias>,
     /// MIR locals bound by a devirtualized infallible widening
     /// `usize::try_from(u8|u16|u32)` call.  The value is the source
     /// integer itself (the conversion cannot fail on 64-bit targets),
@@ -1147,7 +1167,8 @@ impl<'a> Lowering<'a> {
         for _ in 1..body.body.len() {
             block_id.push(graph.create_block());
         }
-        let block_live_in = compute_mir_liveness(body);
+        let index_write_extra_live = compute_index_write_extra_live(body, llbc);
+        let block_live_in = compute_mir_liveness(body, &index_write_extra_live);
         let mut block_entry_local_var = vec![vec![None; n_locals]; body.body.len()];
         let block_entry_positional_aggregate_locals =
             vec![std::collections::HashMap::new(); body.body.len()];
@@ -1885,6 +1906,18 @@ impl<'a> Lowering<'a> {
         }
     }
 
+    /// Re-resolve a recorded [`IndexElemAlias`] operand to the Variable
+    /// live in the current block: prefer the current `local_var` binding
+    /// of its source MIR local (rebound to a fresh inputarg if the
+    /// operand was threaded across the index call's block split), and
+    /// fall back to the Variable captured at the index call for a
+    /// constant operand with no backing local.
+    fn realias_operand(&self, local: Option<usize>, recorded: Variable) -> Variable {
+        local
+            .and_then(|l| self.local_var.get(l).cloned().flatten())
+            .unwrap_or(recorded)
+    }
+
     /// Emit the side-effectful write op for an `Assign` whose dest is
     /// a `Projection(inner, elem)`. `value` is the freshly computed
     /// rvalue.  `dest_ty` is the projected place's own `TyRef` — the
@@ -1908,14 +1941,21 @@ impl<'a> Lowering<'a> {
         let bb_id = self.block_id[mir_bb];
         let op = match &elem {
             ProjectionElem::Atom(s) if s == "Deref" => {
-                if let Some((arr, idx)) = inner_local
+                if let Some(alias) = inner_local
                     .and_then(|i| self.index_elem_alias.get(&i))
                     .cloned()
                 {
                     // `*p = val` where `p` was bound by a
                     // devirtualized workspace `index_mut` call is the
                     // write half of `arr[i] = val` — emit the array
-                    // write directly (setarrayitem).
+                    // write directly (setarrayitem).  The index call
+                    // terminates its own block, so the base/index
+                    // operands are typically rebound to fresh inputarg
+                    // Variables here; re-resolve them through
+                    // `local_var` by their source local and fall back
+                    // to the recorded Variable for a constant operand.
+                    let arr = self.realias_operand(alias.base_local, alias.base_var);
+                    let idx = self.realias_operand(alias.index_local, alias.index_var);
                     OpKind::ArrayWrite {
                         base: arr,
                         index: idx,
@@ -3416,8 +3456,15 @@ impl<'a> Lowering<'a> {
                             nolength: false,
                         },
                     });
-                    self.index_elem_alias
-                        .insert(dest_local, (args[0].clone(), args[1].clone()));
+                    self.index_elem_alias.insert(
+                        dest_local,
+                        IndexElemAlias {
+                            base_local: arg_locals.first().copied().flatten(),
+                            base_var: args[0].clone(),
+                            index_local: arg_locals.get(1).copied().flatten(),
+                            index_var: args[1].clone(),
+                        },
+                    );
                     self.local_var[dest_local] = Some(res);
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
@@ -3892,15 +3939,7 @@ impl<'a> Lowering<'a> {
     /// getarrayitem/setarrayitem on the receiver and is devirtualized
     /// to `ArrayRead`/`ArrayWrite` by the caller.
     fn is_workspace_index_call(&self, reg: &RegularCall) -> bool {
-        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
-            return false;
-        };
-        let Some(fd) = self.llbc.fn_by_id(*id) else {
-            return false;
-        };
-        let path = fd.item_meta.name_path();
-        let leaf = path.rsplit("::").next().unwrap_or("");
-        (leaf == "index" || leaf == "index_mut") && path.starts_with("pyre_")
+        is_workspace_index_regular(reg, self.llbc)
     }
 
     /// `usize::try_from` (`ptr_try_from_impls`, Opaque core code)
@@ -4925,7 +4964,111 @@ fn compute_binop_result_locals(body: &Unstructured) -> std::collections::HashSet
     set
 }
 
-fn compute_mir_liveness(body: &Unstructured) -> Vec<Vec<bool>> {
+/// Whether a statically-resolved [`RegularCall`] is a workspace
+/// `Index::index` / `IndexMut::index_mut` impl (the `FixedObjectArray`
+/// family) — those bottom out at raw-slice construction and are lowered
+/// as RPython's getarrayitem rather than a residual call.  Shared by the
+/// call-lowering intercept and the liveness pre-pass.
+fn is_workspace_index_regular(reg: &RegularCall, llbc: &Llbc) -> bool {
+    let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+        return false;
+    };
+    let Some(fd) = llbc.fn_by_id(*id) else {
+        return false;
+    };
+    let path = fd.item_meta.name_path();
+    let leaf = path.rsplit("::").next().unwrap_or("");
+    (leaf == "index" || leaf == "index_mut") && path.starts_with("pyre_")
+}
+
+/// The MIR local behind a plain-local [`Operand`], or `None` for a
+/// constant or a projected place.
+fn operand_local(op: Option<&Operand>) -> Option<usize> {
+    match op? {
+        Operand::Copy(p) | Operand::Move(p) => match p.kind {
+            PlaceKind::Local(i) => Some(i as usize),
+            _ => None,
+        },
+        Operand::Const(_) => None,
+    }
+}
+
+/// The base MIR local of a `*p = v` deref write (`Projection(Local(p),
+/// Deref)`), or `None` for any other place shape — the same destination
+/// shape [`Lowering::emit_projection_write`] re-expresses as an
+/// `ArrayWrite` when `p` was bound by a workspace index call.
+fn deref_write_base_local(place: &Place) -> Option<usize> {
+    let PlaceKind::Projection(inner, elem) = &place.kind else {
+        return None;
+    };
+    let ProjectionElem::Atom(s) = elem else {
+        return None;
+    };
+    if s != "Deref" {
+        return None;
+    }
+    match inner.kind {
+        PlaceKind::Local(i) => Some(i as usize),
+        _ => None,
+    }
+}
+
+/// Per-block extra-live MIR locals for the deferred array-write base /
+/// index of a workspace `index` / `index_mut` call.
+///
+/// `arr[i] = v` lowers to `_p = index_mut(_s, _i)` (recorded as an
+/// `index_elem_alias`, [`Lowering::lower_call`]) followed — across the
+/// call's own block split — by `*_p = v`, which
+/// [`Lowering::emit_projection_write`] re-expresses as `ArrayWrite {
+/// base: _s, index: _i, .. }`.  That `ArrayWrite` is a synthetic use of
+/// `_s` / `_i` the MIR never spells, so plain liveness drops them before
+/// the write block and the base reaches the rtyper as an undefined
+/// operand.  Return, per block, the base/index locals of every such
+/// `_p` deref-written in it, for [`compute_mir_liveness`] to mark live;
+/// the backward fixpoint then threads them from their definition (which
+/// dominates the `_p` use).
+fn compute_index_write_extra_live(body: &Unstructured, llbc: &Llbc) -> Vec<Vec<usize>> {
+    let mut index_call: std::collections::HashMap<usize, (Option<usize>, Option<usize>)> =
+        std::collections::HashMap::new();
+    for bb in &body.body {
+        let Ok(TermKind::Call { call, .. }) = bb.term() else {
+            continue;
+        };
+        let CallFunc::Regular(reg) = &call.func else {
+            continue;
+        };
+        if !is_workspace_index_regular(reg, llbc) {
+            continue;
+        }
+        let PlaceKind::Local(p) = call.dest.kind else {
+            continue;
+        };
+        index_call.insert(
+            p as usize,
+            (operand_local(call.args.first()), operand_local(call.args.get(1))),
+        );
+    }
+    let mut extra = vec![Vec::new(); body.body.len()];
+    if index_call.is_empty() {
+        return extra;
+    }
+    for (bb_idx, bb) in body.body.iter().enumerate() {
+        for stmt in &bb.statements {
+            let Ok(StmtKind::Assign(place, _)) = stmt.stmt_kind() else {
+                continue;
+            };
+            if let Some(p) = deref_write_base_local(&place)
+                && let Some((base, idx)) = index_call.get(&p)
+            {
+                extra[bb_idx].extend(base.iter().copied());
+                extra[bb_idx].extend(idx.iter().copied());
+            }
+        }
+    }
+    extra
+}
+
+fn compute_mir_liveness(body: &Unstructured, extra_live: &[Vec<usize>]) -> Vec<Vec<bool>> {
     let n_blocks = body.body.len();
     let n_locals = body.locals.locals.len();
     let mut uses = vec![vec![false; n_locals]; n_blocks];
@@ -4983,6 +5126,20 @@ fn compute_mir_liveness(body: &Unstructured) -> Vec<Vec<bool>> {
             }
             TermKind::Drop { target, .. } => push_successor(&mut succs[bb_idx], target, n_blocks),
             TermKind::UnwindResume | TermKind::Abort(_) | TermKind::Unknown => {}
+        }
+    }
+
+    // Synthetic deferred-array-write uses: the base/index of a
+    // workspace index call feed an `ArrayWrite` the MIR never spells
+    // (see `compute_index_write_extra_live`).  Mark them live-used in
+    // the block that holds the `*p = v` write — unless that block also
+    // defines them — so the backward fixpoint threads them in from
+    // their definition, which dominates the `_p` use.
+    for (bb_idx, locals) in extra_live.iter().enumerate().take(n_blocks) {
+        for &local_idx in locals {
+            if local_idx < n_locals && !defs[bb_idx][local_idx] {
+                uses[bb_idx][local_idx] = true;
+            }
         }
     }
 
