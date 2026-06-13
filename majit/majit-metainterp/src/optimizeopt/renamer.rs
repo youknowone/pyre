@@ -60,9 +60,8 @@ impl Renamer {
             if let Some(fail_args) = op.fail_args_mut() {
                 for arg in fail_args.iter_mut() {
                     if let Some(renamed) = self.lookup(arg.to_opref()) {
-                        *arg = majit_ir::operand::Operand::from_boxref(&BoxRef::from_opref(
-                            renamed,
-                        ));
+                        *arg =
+                            majit_ir::operand::Operand::from_boxref(&BoxRef::from_opref(renamed));
                     }
                 }
             }

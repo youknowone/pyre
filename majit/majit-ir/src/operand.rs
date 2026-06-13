@@ -25,14 +25,6 @@ use crate::resoperation::{OpRc, OpRef};
 use crate::value::{Const, GcRef, InputArgRc, Type, Value};
 use std::rc::Rc;
 
-/// TEMPORARY (#9-④ S0 probe): `PYRE_OPBOX_PROBE=1` logs every surviving
-/// position-only `Operand::Box` mint in [`Operand::from_boxref`].
-fn opbox_probe_enabled() -> bool {
-    use std::sync::OnceLock;
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("PYRE_OPBOX_PROBE").is_some())
-}
-
 /// An operand stored in `Op.args` / `Op.fail_args`.
 ///
 /// Mirror of `OpRef`'s four logical cases, but carrying the producer by
@@ -262,17 +254,12 @@ impl Operand {
         if b.is_constant() {
             return Operand::Const(b.clone());
         }
-        // TEMPORARY (#9-④ S0 probe): count surviving position-only mints
-        // before grinding `Operand::Box` to zero. Env-gated, off by default.
-        if opbox_probe_enabled() {
-            eprintln!(
-                "[opbox-probe] position-only operand minted: {:?}",
-                b.to_opref()
-            );
-            if std::env::var_os("PYRE_OPBOX_PROBE_BT").is_some() {
-                eprintln!("{}", std::backtrace::Backtrace::force_capture());
-            }
-        }
+        // Only position-only boxes remain `Operand::Box`. The optimizer
+        // grind (#9-④) reduced production mints to the S9 cross-phase
+        // residual: export-boundary `get_box_replacement` fallbacks (which
+        // carry their own producerless tripwire) and unmapped Phase-1
+        // short-preamble jump args. Both are producer-less by construction
+        // in the current context.
         Operand::Box(b.clone())
     }
 
