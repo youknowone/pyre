@@ -3471,6 +3471,77 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
+                // `<[T]>::swap(s, a, b)` over a `&mut [T]` whose base is
+                // the same `FixedObjectArray` shape the workspace index
+                // path reads.  Lower to the getarrayitem/setarrayitem
+                // decomposition: read both elements, then write each
+                // back to the other's index.  The base operand feeds the
+                // synthetic `ArrayWrite`s the MIR never spells, but every
+                // arg here is live in the call block (no cross-block
+                // rebind like the deferred `index_mut` write), so no
+                // extra liveness threading is needed.  The call returns
+                // `()`; its dead destination binds to a fresh Void var.
+                if args.len() == 3 && self.is_slice_swap_call(&reg) {
+                    let base = args[0].clone();
+                    let idx_a = args[1].clone();
+                    let idx_b = args[2].clone();
+                    let elem_a = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    let elem_b = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(elem_a.clone()),
+                        kind: OpKind::ArrayRead {
+                            base: base.clone(),
+                            index: idx_a.clone(),
+                            item_ty: ValueType::Ref(None),
+                            array_type_id: None,
+                            nolength: false,
+                        },
+                    });
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(elem_b.clone()),
+                        kind: OpKind::ArrayRead {
+                            base: base.clone(),
+                            index: idx_b.clone(),
+                            item_ty: ValueType::Ref(None),
+                            array_type_id: None,
+                            nolength: false,
+                        },
+                    });
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: None,
+                        kind: OpKind::ArrayWrite {
+                            base: base.clone(),
+                            index: idx_a,
+                            value: elem_b,
+                            item_ty: ValueType::Ref(None),
+                            array_type_id: None,
+                            nolength: false,
+                        },
+                    });
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: None,
+                        kind: OpKind::ArrayWrite {
+                            base,
+                            index: idx_b,
+                            value: elem_a,
+                            item_ty: ValueType::Ref(None),
+                            array_type_id: None,
+                            nolength: false,
+                        },
+                    });
+                    self.local_var[dest_local] = Some(
+                        self.graph
+                            .alloc_value_var_with_type(crate::model::ConcreteType::Void),
+                    );
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
                 // `usize::try_from(x).expect(…)` where `x` is u8/u16/
                 // u32 — a widening conversion that cannot fail on the
                 // 64-bit targets pyre supports, routed through the
@@ -3940,6 +4011,20 @@ impl<'a> Lowering<'a> {
     /// to `ArrayRead`/`ArrayWrite` by the caller.
     fn is_workspace_index_call(&self, reg: &RegularCall) -> bool {
         is_workspace_index_regular(reg, self.llbc)
+    }
+
+    /// `<[T]>::swap(s, a, b)` (`core::slice::<Impl>::swap`) — an
+    /// in-place element exchange through a `&mut [T]`.  The slice base
+    /// is the same `FixedObjectArray` shape `is_workspace_index_call`
+    /// reads, so the callsite lowers to the getarrayitem/setarrayitem
+    /// decomposition rather than residualizing the Opaque core body.
+    fn is_slice_swap_call(&self, reg: &RegularCall) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        self.llbc
+            .fn_by_id(*id)
+            .is_some_and(|fd| fd.item_meta.name_path() == "core::slice::<Impl>::swap")
     }
 
     /// `usize::try_from` (`ptr_try_from_impls`, Opaque core code)
