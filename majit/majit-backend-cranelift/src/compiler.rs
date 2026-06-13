@@ -2166,17 +2166,19 @@ fn call_assembler_result_kind_name(kind: u64) -> &'static str {
     }
 }
 
-fn actual_call_assembler_target_result_kind(fail_descrs: &[DescrRef]) -> Result<u64, BackendError> {
-    let finish_descr = fail_descrs
-        .iter()
-        .find(|descr| as_fd(descr).is_finish())
-        .ok_or_else(|| {
-            unsupported_semantics(
-                OpCode::CallAssemblerN,
-                "call-assembler target must expose at least one finish exit",
-            )
-        })?;
-    actual_call_assembler_result_kind(as_fd(finish_descr))
+/// `None` when the target exposes no FINISH descr: a loop-greenkey target
+/// reached via do_recursive_call(assembler_call=True) at an inline-frame loop
+/// header (pyjitpl.py:1586) exits via guard-deopt, not FINISH, so it has no
+/// fixed result kind to compare against a caller's expectation. The result is
+/// reconstructed on the deopt/helper path. Callers skip the (cranelift-only)
+/// expectation check in that case.
+fn actual_call_assembler_target_result_kind(
+    fail_descrs: &[DescrRef],
+) -> Result<Option<u64>, BackendError> {
+    let Some(finish_descr) = fail_descrs.iter().find(|descr| as_fd(descr).is_finish()) else {
+        return Ok(None);
+    };
+    actual_call_assembler_result_kind(as_fd(finish_descr)).map(Some)
 }
 
 fn validate_call_assembler_target_result_kind(
@@ -2208,7 +2210,10 @@ fn validate_registered_target_against_call_assembler_expectations(
         return Ok(());
     }
 
-    let actual_result_kind = actual_call_assembler_target_result_kind(&target.fail_descrs)?;
+    let Some(actual_result_kind) = actual_call_assembler_target_result_kind(&target.fail_descrs)?
+    else {
+        return Ok(());
+    };
     for expected_result_kind in expected_result_kinds {
         validate_call_assembler_target_result_kind(
             target_token,
@@ -2305,13 +2310,16 @@ fn install_call_assembler_expectations(
 
     for (&target_token, &expected_result_kind) in &expectations {
         if let Some(target) = lookup_call_assembler_target(target_token) {
-            let actual_result_kind = actual_call_assembler_target_result_kind(&target.fail_descrs)?;
-            validate_call_assembler_target_result_kind(
-                target_token,
-                expected_result_kind,
-                actual_result_kind,
-                "callee finish result kind",
-            )?;
+            if let Some(actual_result_kind) =
+                actual_call_assembler_target_result_kind(&target.fail_descrs)?
+            {
+                validate_call_assembler_target_result_kind(
+                    target_token,
+                    expected_result_kind,
+                    actual_result_kind,
+                    "callee finish result kind",
+                )?;
+            }
         }
     }
 
@@ -4423,37 +4431,37 @@ fn resolve_call_assembler_target(
             ),
         ));
     }
-    let finish_descr = target
-        .fail_descrs
-        .iter()
-        .find(|descr| as_fd(descr).is_finish())
-        .ok_or_else(|| {
-            unsupported_semantics(
-                opcode,
-                "call-assembler target must expose at least one finish exit",
-            )
-        })?;
-    let finish_types = as_fd(finish_descr).fail_arg_types();
+    // A target reached via do_recursive_call(assembler_call=True) at an
+    // inline-frame loop header (opimpl_jit_merge_point pyjitpl.py:1586) is a
+    // loop greenkey, not a function-entry trace: it exits via guard-deopt and
+    // exposes no FINISH descr. RPython/x86 never require a target-local finish
+    // exit — _call_assembler_check_descr (x86/assembler.py:2274) compares the
+    // returned jf_descr against the CPU-global done_with_this_frame descr, and
+    // the helper path handles the deopt result. When the target DOES expose a
+    // finish exit (function-entry traces), keep validating its result type.
+    if let Some(finish_descr) = target.fail_descrs.iter().find(|d| as_fd(d).is_finish()) {
+        let finish_types = as_fd(finish_descr).fail_arg_types();
 
-    // Validate that the finish result type matches the call descriptor.
-    // When force_token_slots are present the finish output type is Ref
-    // (the raw force-token handle), so accept that as matching a Ref
-    // result descriptor even though the value isn't a real GC ref.
-    match call_descr.result_type() {
-        Type::Void => {
-            if !finish_types.is_empty() {
-                return Err(unsupported_semantics(
-                    opcode,
-                    "void call-assembler targets must finish without result values",
-                ));
+        // Validate that the finish result type matches the call descriptor.
+        // When force_token_slots are present the finish output type is Ref
+        // (the raw force-token handle), so accept that as matching a Ref
+        // result descriptor even though the value isn't a real GC ref.
+        match call_descr.result_type() {
+            Type::Void => {
+                if !finish_types.is_empty() {
+                    return Err(unsupported_semantics(
+                        opcode,
+                        "void call-assembler targets must finish without result values",
+                    ));
+                }
             }
-        }
-        result_type => {
-            if finish_types != [result_type] {
-                // Type mismatch between caller's expected result and target's
-                // actual finish type. Treat as unresolved — runtime will use
-                // the helper fallback path.
-                return Ok(None);
+            result_type => {
+                if finish_types != [result_type] {
+                    // Type mismatch between caller's expected result and target's
+                    // actual finish type. Treat as unresolved — runtime will use
+                    // the helper fallback path.
+                    return Ok(None);
+                }
             }
         }
     }
@@ -4473,16 +4481,14 @@ fn expected_call_assembler_result_kind(
             let Some(target) = target else {
                 return Ok(CALL_ASSEMBLER_RESULT_REF);
             };
-            let finish_descr = target
-                .fail_descrs
-                .iter()
-                .find(|descr| as_fd(descr).is_finish())
-                .ok_or_else(|| {
-                    unsupported_semantics(
-                        OpCode::CallAssemblerR,
-                        "call-assembler target must expose at least one finish exit",
-                    )
-                })?;
+            // Loop-token targets expose no FINISH descr (see
+            // resolve_call_assembler_target): default to a plain Ref result.
+            // The FORCE_TOKEN_REF refinement only applies to function-entry
+            // traces whose finish carries a force-token slot.
+            let Some(finish_descr) = target.fail_descrs.iter().find(|d| as_fd(d).is_finish())
+            else {
+                return Ok(CALL_ASSEMBLER_RESULT_REF);
+            };
             let finish_fd = as_fd(finish_descr);
             Ok(
                 if finish_fd.fail_arg_types() == [Type::Ref] && finish_fd.force_token_slots() == [0]
