@@ -3466,6 +3466,18 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
+                // `<Atomic*>::load(&self, ordering)` — a relaxed read of a
+                // layout-transparent atomic.  `&self` already aliases the
+                // inner field read, so alias the destination to it (the
+                // `ordering` arg is discarded); the `load` name never
+                // reaches the rtyper as a `ptr.getattr`.
+                if args.len() == 2 && self.is_atomic_load(&reg) {
+                    self.local_var[dest_local] = Some(args[0].clone());
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
                 // Resolve the target function's fully-qualified path
                 // through the FunId → FunDecl table. `Trait` here is
                 // Charon's "trait-bound generic resolved at extraction
@@ -3956,6 +3968,37 @@ impl<'a> Lowering<'a> {
                 .and_then(|n| strip_ty_wrappers(n, self.llbc))
                 .and_then(serde_json::Value::as_object)
                 .is_some_and(|o| o.contains_key("RawPtr"))
+        })
+    }
+
+    /// `<core::sync::atomic::Atomic*>::load(&self, ordering)` — a relaxed
+    /// read of a std atomic.  The atomic types are layout-transparent
+    /// over their inner scalar/pointer (asserted for the `PyType`
+    /// `subclassrange_*` / `instantiate` vtable fields), so the JIT
+    /// models the load as that inner value: [`tyref_atomic_inner_value_type`]
+    /// types the `Atomic*` field as its inner [`ValueType`], the `&self`
+    /// `Ref` rvalue aliases to that field read, and this aliases the load
+    /// destination to the receiver.  Gating on an atomic receiver
+    /// excludes unrelated inherent `load` methods, and the method name
+    /// never reaches the rtyper as a `ptr.getattr`.
+    fn is_atomic_load(&self, reg: &RegularCall) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        let Some(fd) = self.llbc.fn_by_id(*id) else {
+            return false;
+        };
+        let name = fd.item_meta.name_path();
+        if name.rsplit("::").next() != Some("load") {
+            return false;
+        }
+        fd.signature.inputs.first().is_some_and(|t| {
+            adt_path_of_tyref(t, self.llbc).is_some_and(|p| {
+                p.contains("::sync::atomic::")
+                    && p.rsplit("::")
+                        .next()
+                        .is_some_and(|leaf| leaf.starts_with("Atomic"))
+            })
         })
     }
 
@@ -5665,6 +5708,14 @@ fn cast_call_segments(src: &ValueType, dst: &ValueType) -> Option<Vec<String>> {
 }
 
 fn tyref_to_value_type(ty: &TyRef, llbc: &Llbc) -> ValueType {
+    // Atomic wrappers type as their inner value; integer widths collapse
+    // to `Int` here, matching the literal-int handling below.
+    if let Some(inner) = tyref_atomic_inner_value_type(ty, llbc) {
+        return match inner {
+            ValueType::Unsigned => ValueType::Int,
+            other => other,
+        };
+    }
     // The HashConsedValue arm carries the body inline; primitives
     // typically land here.  The Deduplicated arm carries only an
     // ID; consult the dedup-body index to recover the inline shape
@@ -5738,6 +5789,12 @@ fn tyref_to_value_type(ty: &TyRef, llbc: &Llbc) -> ValueType {
 /// slice, array, `Box`/`Rc`/`Arc` wrapper) folds to `Ref(None)` whose
 /// someshell ignores the payload.
 fn tyref_to_attr_value_type(ty: &TyRef, llbc: &Llbc) -> ValueType {
+    // Atomic wrappers register as their inner value, keeping the
+    // signed/unsigned split so `AtomicUsize` shells to `SomeInteger {
+    // unsigned: true }` like a bare `usize` field.
+    if let Some(inner) = tyref_atomic_inner_value_type(ty, llbc) {
+        return inner;
+    }
     let value = match ty {
         TyRef::Inline { value: (_, v) } => v,
         TyRef::Other(v) => v,
@@ -5830,6 +5887,29 @@ fn adt_path_of_tyref(ty: &TyRef, llbc: &Llbc) -> Option<String> {
     let node = strip_ty_wrappers(node, llbc)?;
     let id = adt_node_def_id(node)?;
     Some(llbc.type_by_id(id)?.item_meta.name_path())
+}
+
+/// The inner [`ValueType`] of a `core::sync::atomic` atomic type
+/// (`AtomicI64` → `Int`, `AtomicUsize` → `Unsigned`, `AtomicBool` →
+/// `Bool`, `AtomicPtr<T>` → `Ref(None)`), or `None` when `ty` is not a
+/// std atomic.  The atomic wrappers are layout-transparent over their
+/// inner scalar/pointer (asserted at pyobject.rs for the `PyType` vtable
+/// `subclassrange_*` / `instantiate` fields), and the upstream typeptr
+/// ranges are plain int fields, so a field of one types as that inner
+/// value and its `load`/`store` fold to it (`is_atomic_load`).
+fn tyref_atomic_inner_value_type(ty: &TyRef, llbc: &Llbc) -> Option<ValueType> {
+    let path = adt_path_of_tyref(ty, llbc)?;
+    if !path.contains("::sync::atomic::") {
+        return None;
+    }
+    let leaf = path.rsplit("::").next().unwrap_or(&path);
+    match leaf {
+        "AtomicPtr" => Some(ValueType::Ref(None)),
+        "AtomicBool" => Some(ValueType::Bool),
+        l if l.starts_with("AtomicI") => Some(ValueType::Int),
+        l if l.starts_with("AtomicU") => Some(ValueType::Unsigned),
+        _ => None,
+    }
 }
 
 /// `Arg<T>` from `rustpython_compiler_core::bytecode::instruction` —
