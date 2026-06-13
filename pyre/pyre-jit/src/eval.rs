@@ -3322,8 +3322,10 @@ pub(crate) fn eval_loop_jit_bridge(frame: &mut PyFrame) -> LoopResult {
             // Mirror `eval_loop_jit`'s walker-dispatched bypass — the
             // walker arm already mutated the live PyFrame via
             // `vable_setfield` → `synchronize_virtualizable`, and the
-            // compiled trace owns the rest of the bytecode's heap
-            // effects on replay.  Running `execute_opcode_step` here
+            // walker executor concrete-executed the arm's non-elidable
+            // residual calls (the arm walk is the sole execution leg —
+            // no replay applies a declined effect).  Running
+            // `execute_opcode_step` here
             // would double-mutate `valuestackdepth` for the same opcode.
             // Drain any pending raise from `BH_LAST_EXC_VALUE` so the
             // exception handler runs against the bridge frame.

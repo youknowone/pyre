@@ -412,22 +412,43 @@ pub struct WalkContext<'frame, 'static_a: 'frame> {
     pub raw_descrs: RawDescrPool<'static_a>,
     /// Whether this walk is the SOLE concrete-execution leg (task #51b).
     ///
-    /// `false` (default — arm walks, shadow validation, the diagnostic
-    /// full-body probe): a separate concrete interpreter (the Python
-    /// interpreter on the trait path, or none for the discard-the-trace
-    /// probe) is authoritative, so the walker must NOT re-execute
-    /// may-force residual calls — doing so would double their side
-    /// effects / corrupt the live heap (`cut_trace` rolls back only the
-    /// IR recorder, not heap/iterator state).
+    /// `false` (shadow validation, the diagnostic full-body probe,
+    /// tests): a separate concrete interpreter (the Python interpreter
+    /// on the trait path, or none for the discard-the-trace probe) is
+    /// authoritative, so the walker must NOT re-execute may-force
+    /// residual calls — doing so would double their side effects /
+    /// corrupt the live heap (`cut_trace` rolls back only the IR
+    /// recorder, not heap/iterator state).
     ///
-    /// `true` (the full-body walk once it is the production tracer): the
-    /// walker is the only thing executing the JitCode body, so
-    /// [`try_execute_residual_call_via_executor`] runs may-force residual
-    /// calls concretely — RPython parity, where the metainterp executes
-    /// EVERY residual_call during tracing (`do_residual_call` →
-    /// `executor.execute_varargs`), pure or not, so a downstream
-    /// `goto_if_not` reads a concrete result.
+    /// `true` (the production full-body walk AND the production
+    /// per-opcode arm walk): the walker is the only thing executing the
+    /// JitCode body — `eval_loop_jit` skips `execute_opcode_step` for
+    /// walker-handled opcodes — so
+    /// [`try_execute_residual_call_via_executor`] runs residual calls
+    /// concretely.  RPython parity: the metainterp executes EVERY
+    /// residual_call during tracing (`do_residual_call` →
+    /// `executor.execute_varargs`, pyjitpl.py:1995), pure or not, so a
+    /// downstream `goto_if_not` reads a concrete result.
     pub is_authoritative_executor: bool,
+    /// Whether this walk is a full-body walk (`dispatch_via_miframe`
+    /// rooted, including its inline sub-walks) as opposed to a
+    /// per-opcode arm walk (`dispatch_via_miframe_at_opcode_entry`
+    /// rooted).
+    ///
+    /// The distinction decides who applies a recorded-but-unexecuted
+    /// side effect.  A full-body walk is replay-backed: the walk is
+    /// symbolic and does not advance the interpreter, so on compile the
+    /// loop re-enters at the traced iteration and re-runs the recorded
+    /// ops — an effect declined at walk time still lands exactly once
+    /// (see the void gate in
+    /// [`try_execute_residual_call_via_executor`] and
+    /// [`FBW_UNJOURNALED_EFFECT`]).  A per-opcode arm walk has no
+    /// replay: the interpreter advances opcode by opcode during
+    /// tracing and the compiled loop is entered at the NEXT iteration,
+    /// so an effect the walker declines to execute is simply lost —
+    /// the arm walk must execute eagerly (`do_residual_call` runs
+    /// `execute_varargs` for void callees too, pyjitpl.py:2038-2040).
+    pub is_full_body_walk: bool,
     /// Live trace recorder. `record_finish` / `record_op` /
     /// `record_op_with_descr` go through this.
     pub trace_ctx: &'frame mut TraceCtx,
@@ -2099,6 +2120,11 @@ pub fn dispatch_via_miframe(
             descr_refs,
             raw_descrs,
             is_authoritative_executor,
+            // `dispatch_via_miframe` is the full-body walk entry
+            // (production tracer, shadow validation, diagnostic probe
+            // — the non-production roots are excluded from concrete
+            // execution by `is_authoritative_executor: false` instead).
+            is_full_body_walk: true,
             trace_ctx,
             done_with_this_frame_descr_ref,
             done_with_this_frame_descr_int,
@@ -2332,7 +2358,19 @@ pub fn dispatch_via_miframe_at_opcode_entry<'a>(
             concrete_registers_i: &mut concrete_i,
             descr_refs,
             raw_descrs: RawDescrPool::Global,
-            is_authoritative_executor: false,
+            // The per-opcode arm walk is the sole concrete-execution
+            // leg for allow-listed opcodes: `eval_loop_jit` /
+            // `eval_loop_jit_bridge` skip `execute_opcode_step` when
+            // `production_walker_handles(instruction)`, so nothing else
+            // applies the arm's residual-call effects.  Tracing
+            // executes as it records (`pyjitpl.py:1995
+            // do_residual_call` → `executor.execute_varargs`).
+            is_authoritative_executor: true,
+            // No replay backs this walk: the interpreter advances
+            // opcode by opcode and the compiled loop enters at the
+            // NEXT iteration, so declined effects would be lost, not
+            // deferred (see the field doc).
+            is_full_body_walk: false,
             trace_ctx,
             done_with_this_frame_descr_ref,
             done_with_this_frame_descr_int,
@@ -4264,8 +4302,10 @@ fn bool_box_truth_lookup(boxed: OpRef) -> Option<OpRef> {
 /// prior aborted walk's entries never leak into the next one.  This is the
 /// reset boundary for the walk-local thread-local; it is called at the two FBW
 /// walk entry points (`trace.rs` `full_body_walk_trace` at walk start, and
-/// after `probe_walk_perfn_jitcode` discards its throwaway trace), which are
-/// the only sites that set `is_authoritative_executor`.
+/// after `probe_walk_perfn_jitcode` discards its throwaway trace).  The
+/// per-opcode arm walk is also authoritative but never consults this map
+/// (its specialization gates are FBW-shaped opcodes outside the arm
+/// allow-list), so it needs no reset boundary of its own.
 pub fn bool_box_truth_reset() {
     BOOL_BOX_TRUTH.with(|m| m.borrow_mut().clear());
 }
@@ -4328,13 +4368,15 @@ pub fn bool_box_truth_reset() {
 /// * `allboxes[0]` is the funcbox (per `build_allboxes` layout); the
 ///   remaining slots are user args in `descr.arg_types()` ABI order.
 ///
-/// **Authoritative-executor gate**: fires ONLY when the full-body walk
-/// is the sole concrete-execution leg
-/// ([`WalkContext::is_authoritative_executor`]).  In arm-walk / shadow /
-/// diagnostic-probe mode the flag is `false`, so the call is recorded
-/// symbolically only — re-executing there would double the side effects
-/// (the trait-path interpreter already ran it) or corrupt the live heap
-/// under the discard-the-trace probe.
+/// **Authoritative-executor gate**: fires ONLY when the walk is the
+/// sole concrete-execution leg
+/// ([`WalkContext::is_authoritative_executor`]) — the production
+/// full-body walk and the production per-opcode arm walk both qualify
+/// (`eval_loop_jit` skips `execute_opcode_step` for walker-handled
+/// opcodes).  In shadow / diagnostic-probe mode the flag is `false`, so
+/// the call is recorded symbolically only — re-executing there would
+/// double the side effects (the trait-path interpreter already ran it)
+/// or corrupt the live heap under the discard-the-trace probe.
 ///
 /// **Return value**:
 /// * `Ok(Some(Ok(_)))` — helper executed normally, `recorded` OpRef
@@ -4371,10 +4413,11 @@ fn try_execute_residual_call_via_executor(
     recorded: OpRef,
     op_pc: usize,
 ) -> Result<Option<Result<i64, i64>>, DispatchError> {
-    // Authoritative-executor gate (#51b/#54): fire ONLY when the
-    // full-body walk is the sole concrete-execution leg.  Arm-walk /
-    // shadow / diagnostic-probe runs leave the flag `false` so the call
-    // is recorded symbolically without re-running its side effects.
+    // Authoritative-executor gate (#51b/#54): fire ONLY when the walk
+    // is the sole concrete-execution leg (production full-body walk and
+    // production per-opcode arm walk).  Shadow / diagnostic-probe runs
+    // leave the flag `false` so the call is recorded symbolically
+    // without re-running its side effects.
     if !ctx.is_authoritative_executor {
         return Ok(None);
     }
@@ -4512,7 +4555,12 @@ fn try_execute_residual_call_via_executor(
     // once-per-iteration effect matches the trait path.  (Every `None`
     // from this function marks `FBW_UNJOURNALED_EFFECT` at the dispatch
     // sites, keeping the walk-end no-replay commit off for this trace.)
-    if call_descr.result_type() == majit_ir::Type::Void {
+    //
+    // The per-opcode arm walk has NO replay behind it (the interpreter
+    // advances opcode by opcode; the compiled loop enters at the next
+    // iteration), so a declined void effect would be lost, not deferred —
+    // it executes eagerly below, the direct `execute_varargs` analogue.
+    if ctx.is_full_body_walk && call_descr.result_type() == majit_ir::Type::Void {
         return Ok(None);
     }
     // pyjitpl.py:3329-3330 `vinfo.tracing_before_residual_call(virtualizable)`
@@ -4584,8 +4632,9 @@ fn try_execute_residual_call_via_executor(
             // pyjitpl.py:1392 `result_box.value = result` analogue — stamp
             // the recorded OpRef with the executed concrete so downstream
             // `concrete_of_opref` / `box_value` consumers see the folded
-            // value.  Void results returned `None` above (recorded symbolically)
-            // and never reach this arm; the case is kept for exhaustiveness.
+            // value.  Full-body-walk Void results returned `None` above
+            // (recorded symbolically); a per-opcode arm walk reaches this
+            // arm for an executed void helper with nothing to stamp.
             match call_descr.result_type() {
                 majit_ir::Type::Int => {
                     ctx.trace_ctx
@@ -6700,7 +6749,11 @@ fn try_walker_call_assembler_self_recursive(
 ) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
     // ---- non-emitting eligibility checks (free to bail with Ok(None)) ----
     // Default ON since the Phase 5 flip; `PYRE_FBW_REC_CA=0` opts out.
+    // Full-body walks only: the CALL_ASSEMBLER record + walk-commit
+    // bookkeeping is FBW machinery; the per-opcode arm walk records the
+    // plain residual instead.
     if !ctx.is_authoritative_executor
+        || !ctx.is_full_body_walk
         || std::env::var_os("PYRE_FBW_REC_CA").as_deref() == Some(std::ffi::OsStr::new("0"))
     {
         return Ok(None);
@@ -7009,7 +7062,12 @@ fn try_walker_inline_user_call(
     dst: usize,
 ) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
     // Default ON since the Phase 5 flip; `PYRE_FBW_INLINE=0` opts out.
-    if !ctx.is_authoritative_executor || std::env::var("PYRE_FBW_INLINE").as_deref() == Ok("0") {
+    // Full-body walks only: inline sub-walks lean on FBW multi-frame
+    // snapshot plumbing the per-opcode arm walk does not carry.
+    if !ctx.is_authoritative_executor
+        || !ctx.is_full_body_walk
+        || std::env::var("PYRE_FBW_INLINE").as_deref() == Ok("0")
+    {
         return Ok(None);
     }
     // Only a genuine Python call helper (`call_fn` / `call_fn_N`, tagged
@@ -7192,6 +7250,7 @@ fn try_walker_inline_user_call(
             descr_refs: callee_descr_refs,
             raw_descrs: RawDescrPool::PerFn(callee_perfn_descrs),
             is_authoritative_executor: ctx.is_authoritative_executor,
+            is_full_body_walk: ctx.is_full_body_walk,
             store_subscr_fn_addr: ctx.store_subscr_fn_addr,
             pending_guard_snapshot_error: None,
             trace_ctx: ctx.trace_ctx,
@@ -7447,7 +7506,14 @@ fn dispatch_residual_call_iRd_kind(
     // lookup is read-only (it does not remove the entry); OpRef SSA-uniqueness
     // (`recorder.rs`) guarantees the box opref never re-binds within one walk,
     // so a stale mis-fold is impossible and physical removal is unnecessary.
-    if ctx.is_authoritative_executor && dst_bank == 'i' && r_args.len() == 1 {
+    // Full-body walks only: `BOOL_BOX_TRUTH` is reset at FBW walk entry;
+    // an arm walk consulting it could read a stale OpRef key from an
+    // earlier FBW walk's recorder.
+    if ctx.is_authoritative_executor
+        && ctx.is_full_body_walk
+        && dst_bank == 'i'
+        && r_args.len() == 1
+    {
         if let Some(truth) = bool_box_truth_lookup(r_args[0]) {
             write_residual_call_result_to_dst(ctx, op.pc, dst, dst_bank, truth)?;
             return Ok((DispatchOutcome::Continue, op.next_pc));
@@ -7458,7 +7524,10 @@ fn dispatch_residual_call_iRd_kind(
     // in-bounds, type-matching) to the walker-native `setarrayitem_raw` form,
     // eliding the `CALL_MAY_FORCE` that would force the virtualizable every
     // iteration.  Falls through to the generic residual otherwise (SAFE).
+    // Full-body walks only: the eager store rides `FBW_STORE_JOURNAL`,
+    // whose commit/rollback epilogues run on FBW walk ends.
     if ctx.is_authoritative_executor
+        && ctx.is_full_body_walk
         && dst_bank == 'v'
         && ei.pyre_helper == majit_ir::PyreHelperKind::StoreSubscr
         && try_walker_specialize_store_subscr(ctx, op.pc, &r_args)?.is_some()
@@ -8009,7 +8078,11 @@ fn try_walker_specialize_binary_op_int(
     dst: usize,
     dst_bank: char,
 ) -> Result<Option<()>, DispatchError> {
-    if !ctx.is_authoritative_executor || r_args.len() != 2 || dst_bank != 'r' {
+    if !ctx.is_authoritative_executor
+        || !ctx.is_full_body_walk
+        || r_args.len() != 2
+        || dst_bank != 'r'
+    {
         return Ok(None);
     }
     let Some(bin_op) = pyre_interpreter::runtime_ops::binary_op_from_tag(op_tag) else {
@@ -8186,7 +8259,7 @@ fn try_walker_specialize_compare_op_int(
     dst: usize,
     dst_bank: char,
 ) -> Result<Option<()>, DispatchError> {
-    if !ctx.is_authoritative_executor || dst_bank != 'r' {
+    if !ctx.is_authoritative_executor || !ctx.is_full_body_walk || dst_bank != 'r' {
         return Ok(None);
     }
     let Some(cmp_op) = pyre_interpreter::runtime_ops::compare_op_from_tag(op_tag) else {
@@ -8430,7 +8503,11 @@ fn try_walker_specialize_binary_op_float(
     dst: usize,
     dst_bank: char,
 ) -> Result<Option<()>, DispatchError> {
-    if !ctx.is_authoritative_executor || r_args.len() != 2 || dst_bank != 'r' {
+    if !ctx.is_authoritative_executor
+        || !ctx.is_full_body_walk
+        || r_args.len() != 2
+        || dst_bank != 'r'
+    {
         return Ok(None);
     }
     let Some(bin_op) = pyre_interpreter::runtime_ops::binary_op_from_tag(op_tag) else {
@@ -8537,7 +8614,11 @@ fn try_walker_specialize_subscr(
     dst: usize,
     dst_bank: char,
 ) -> Result<Option<()>, DispatchError> {
-    if !ctx.is_authoritative_executor || r_args.len() != 2 || dst_bank != 'r' {
+    if !ctx.is_authoritative_executor
+        || !ctx.is_full_body_walk
+        || r_args.len() != 2
+        || dst_bank != 'r'
+    {
         return Ok(None);
     }
     let list_op = r_args[0];
@@ -8711,7 +8792,7 @@ fn try_walker_specialize_store_subscr(
     op_pc: usize,
     r_args: &[OpRef],
 ) -> Result<Option<()>, DispatchError> {
-    if !ctx.is_authoritative_executor || r_args.len() != 3 {
+    if !ctx.is_authoritative_executor || !ctx.is_full_body_walk || r_args.len() != 3 {
         return Ok(None);
     }
     let list_op = r_args[0];
@@ -8888,7 +8969,7 @@ fn try_walker_specialize_compare_op_float(
     dst: usize,
     dst_bank: char,
 ) -> Result<Option<()>, DispatchError> {
-    if !ctx.is_authoritative_executor || dst_bank != 'r' {
+    if !ctx.is_authoritative_executor || !ctx.is_full_body_walk || dst_bank != 'r' {
         return Ok(None);
     }
     let Some(cmp_op) = pyre_interpreter::runtime_ops::compare_op_from_tag(op_tag) else {
@@ -9142,6 +9223,7 @@ fn dispatch_residual_call_iIRd_kind(
     // and reaches production parity for global-function-call loops when
     // combined with the user-call inlining path.
     if ctx.is_authoritative_executor
+        && ctx.is_full_body_walk
         && ei.pyre_helper == majit_ir::PyreHelperKind::LoadGlobal
         && !jitcode_has_exception_handler(code)
         && std::env::var("PYRE_FBW_LOADGLOBAL_FOLD").as_deref() != Ok("0")
@@ -9695,6 +9777,7 @@ fn dispatch_inline_call_dr_kind(
             descr_refs: ctx.descr_refs,
             raw_descrs: ctx.raw_descrs,
             is_authoritative_executor: ctx.is_authoritative_executor,
+            is_full_body_walk: ctx.is_full_body_walk,
             trace_ctx: ctx.trace_ctx,
             done_with_this_frame_descr_ref: ctx.done_with_this_frame_descr_ref.clone(),
             done_with_this_frame_descr_int: ctx.done_with_this_frame_descr_int.clone(),
@@ -9892,6 +9975,7 @@ fn dispatch_inline_call_dir_kind(
             descr_refs: ctx.descr_refs,
             raw_descrs: ctx.raw_descrs,
             is_authoritative_executor: ctx.is_authoritative_executor,
+            is_full_body_walk: ctx.is_full_body_walk,
             trace_ctx: ctx.trace_ctx,
             done_with_this_frame_descr_ref: ctx.done_with_this_frame_descr_ref.clone(),
             done_with_this_frame_descr_int: ctx.done_with_this_frame_descr_int.clone(),
@@ -10084,6 +10168,7 @@ fn dispatch_inline_call_dirf_kind(
             descr_refs: ctx.descr_refs,
             raw_descrs: ctx.raw_descrs,
             is_authoritative_executor: ctx.is_authoritative_executor,
+            is_full_body_walk: ctx.is_full_body_walk,
             trace_ctx: ctx.trace_ctx,
             done_with_this_frame_descr_ref: ctx.done_with_this_frame_descr_ref.clone(),
             done_with_this_frame_descr_int: ctx.done_with_this_frame_descr_int.clone(),
@@ -11625,6 +11710,7 @@ mod tests {
             descr_refs: &descr_pool,
             raw_descrs: RawDescrPool::Global,
             is_authoritative_executor: false,
+            is_full_body_walk: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr,
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -11682,6 +11768,7 @@ mod tests {
             descr_refs: &descr_pool,
             raw_descrs: RawDescrPool::Global,
             is_authoritative_executor: false,
+            is_full_body_walk: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: make_fail_descr(1),
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -11729,6 +11816,7 @@ mod tests {
             descr_refs: &descr_pool,
             raw_descrs: RawDescrPool::Global,
             is_authoritative_executor: false,
+            is_full_body_walk: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: make_fail_descr(1),
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -11806,6 +11894,7 @@ mod tests {
                 outer_jitcode_index: 0,
                 raw_descrs: RawDescrPool::Global,
                 is_authoritative_executor: false,
+                is_full_body_walk: false,
                 outer_active_boxes: Vec::new(),
                 store_subscr_fn_addr: None,
                 pending_guard_snapshot_error: None,
@@ -11970,6 +12059,7 @@ mod tests {
             descr_refs: &descr_pool,
             raw_descrs: RawDescrPool::Global,
             is_authoritative_executor: false,
+            is_full_body_walk: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -12018,6 +12108,7 @@ mod tests {
             descr_refs: &descr_pool,
             raw_descrs: RawDescrPool::Global,
             is_authoritative_executor: false,
+            is_full_body_walk: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -12065,6 +12156,7 @@ mod tests {
             descr_refs: &descr_pool,
             raw_descrs: RawDescrPool::Global,
             is_authoritative_executor: false,
+            is_full_body_walk: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -12121,6 +12213,7 @@ mod tests {
             descr_refs: &[],
             raw_descrs: RawDescrPool::Global,
             is_authoritative_executor: false,
+            is_full_body_walk: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -12169,6 +12262,7 @@ mod tests {
             descr_refs: &[],
             raw_descrs: RawDescrPool::Global,
             is_authoritative_executor: false,
+            is_full_body_walk: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -12216,6 +12310,7 @@ mod tests {
             descr_refs: &[],
             raw_descrs: RawDescrPool::Global,
             is_authoritative_executor: false,
+            is_full_body_walk: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -12358,6 +12453,7 @@ mod tests {
             descr_refs: &descr_pool,
             raw_descrs: RawDescrPool::Global,
             is_authoritative_executor: false,
+            is_full_body_walk: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -12518,6 +12614,7 @@ mod tests {
             descr_refs: &descr_pool,
             raw_descrs: RawDescrPool::Global,
             is_authoritative_executor: false,
+            is_full_body_walk: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -12626,6 +12723,7 @@ mod tests {
             descr_refs: &descr_pool,
             raw_descrs: RawDescrPool::Global,
             is_authoritative_executor: false,
+            is_full_body_walk: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -12728,6 +12826,7 @@ mod tests {
             descr_refs: &descr_pool,
             raw_descrs: RawDescrPool::Global,
             is_authoritative_executor: false,
+            is_full_body_walk: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -12819,6 +12918,7 @@ mod tests {
             descr_refs: &descr_pool,
             raw_descrs: RawDescrPool::Global,
             is_authoritative_executor: false,
+            is_full_body_walk: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -12907,6 +13007,7 @@ mod tests {
             descr_refs: &descr_pool,
             raw_descrs: RawDescrPool::Global,
             is_authoritative_executor: false,
+            is_full_body_walk: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr,
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -12976,6 +13077,7 @@ mod tests {
             descr_refs: &descr_pool,
             raw_descrs: RawDescrPool::Global,
             is_authoritative_executor: false,
+            is_full_body_walk: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr,
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -13024,6 +13126,7 @@ mod tests {
             descr_refs: &descr_pool,
             raw_descrs: RawDescrPool::Global,
             is_authoritative_executor: false,
+            is_full_body_walk: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr,
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -13068,6 +13171,7 @@ mod tests {
             descr_refs: &[],
             raw_descrs: RawDescrPool::Global,
             is_authoritative_executor: false,
+            is_full_body_walk: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -13121,6 +13225,7 @@ mod tests {
             descr_refs: &[],
             raw_descrs: RawDescrPool::Global,
             is_authoritative_executor: false,
+            is_full_body_walk: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -13172,6 +13277,7 @@ mod tests {
             descr_refs: &[],
             raw_descrs: RawDescrPool::Global,
             is_authoritative_executor: false,
+            is_full_body_walk: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -13226,6 +13332,7 @@ mod tests {
             descr_refs: &[],
             raw_descrs: RawDescrPool::Global,
             is_authoritative_executor: false,
+            is_full_body_walk: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: make_fail_descr(1),
             done_with_this_frame_descr_int: descr_int.clone(),
@@ -13296,6 +13403,7 @@ mod tests {
             descr_refs: &[],
             raw_descrs: RawDescrPool::Global,
             is_authoritative_executor: false,
+            is_full_body_walk: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: make_fail_descr(1),
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -13353,6 +13461,7 @@ mod tests {
             descr_refs: &[],
             raw_descrs: RawDescrPool::Global,
             is_authoritative_executor: false,
+            is_full_body_walk: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: make_fail_descr(1),
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -13414,6 +13523,7 @@ mod tests {
             descr_refs: &[],
             raw_descrs: RawDescrPool::Global,
             is_authoritative_executor: false,
+            is_full_body_walk: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: make_fail_descr(1),
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -13461,6 +13571,7 @@ mod tests {
             descr_refs: &[],
             raw_descrs: RawDescrPool::Global,
             is_authoritative_executor: false,
+            is_full_body_walk: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -13511,6 +13622,7 @@ mod tests {
             descr_refs: &[],
             raw_descrs: RawDescrPool::Global,
             is_authoritative_executor: false,
+            is_full_body_walk: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -13561,6 +13673,7 @@ mod tests {
             descr_refs: &[],
             raw_descrs: RawDescrPool::Global,
             is_authoritative_executor: false,
+            is_full_body_walk: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -13659,6 +13772,7 @@ mod tests {
             descr_refs: &[],
             raw_descrs: RawDescrPool::Global,
             is_authoritative_executor: false,
+            is_full_body_walk: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -13705,6 +13819,7 @@ mod tests {
             descr_refs: &[],
             raw_descrs: RawDescrPool::Global,
             is_authoritative_executor: false,
+            is_full_body_walk: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -13763,6 +13878,7 @@ mod tests {
             descr_refs: &[],
             raw_descrs: RawDescrPool::Global,
             is_authoritative_executor: false,
+            is_full_body_walk: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr_done,
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -13854,6 +13970,7 @@ mod tests {
             descr_refs: &[],
             raw_descrs: RawDescrPool::Global,
             is_authoritative_executor: false,
+            is_full_body_walk: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr_done,
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -13927,6 +14044,7 @@ mod tests {
             descr_refs: &[],
             raw_descrs: RawDescrPool::Global,
             is_authoritative_executor: false,
+            is_full_body_walk: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr_done,
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -13994,6 +14112,7 @@ mod tests {
             descr_refs: &[],
             raw_descrs: RawDescrPool::Global,
             is_authoritative_executor: false,
+            is_full_body_walk: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr,
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -14039,6 +14158,7 @@ mod tests {
             descr_refs: &[],
             raw_descrs: RawDescrPool::Global,
             is_authoritative_executor: false,
+            is_full_body_walk: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr_done,
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -14148,6 +14268,7 @@ mod tests {
             descr_refs: &descr_pool,
             raw_descrs: RawDescrPool::Global,
             is_authoritative_executor: false,
+            is_full_body_walk: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr_done.clone(),
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -14260,6 +14381,7 @@ mod tests {
             descr_refs: &descr_pool,
             raw_descrs: RawDescrPool::Global,
             is_authoritative_executor: false,
+            is_full_body_walk: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr_done,
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -14321,6 +14443,7 @@ mod tests {
             descr_refs: &[],
             raw_descrs: RawDescrPool::Global,
             is_authoritative_executor: false,
+            is_full_body_walk: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -14378,6 +14501,7 @@ mod tests {
             descr_refs: &[],
             raw_descrs: RawDescrPool::Global,
             is_authoritative_executor: false,
+            is_full_body_walk: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -14426,6 +14550,7 @@ mod tests {
             descr_refs: &[],
             raw_descrs: RawDescrPool::Global,
             is_authoritative_executor: false,
+            is_full_body_walk: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -14473,6 +14598,7 @@ mod tests {
             descr_refs: &[],
             raw_descrs: RawDescrPool::Global,
             is_authoritative_executor: false,
+            is_full_body_walk: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -14541,6 +14667,7 @@ mod tests {
             descr_refs: &[],
             raw_descrs: RawDescrPool::Global,
             is_authoritative_executor: false,
+            is_full_body_walk: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -14597,6 +14724,7 @@ mod tests {
             descr_refs: &[],
             raw_descrs: RawDescrPool::Global,
             is_authoritative_executor: false,
+            is_full_body_walk: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -14644,6 +14772,7 @@ mod tests {
             descr_refs: &[],
             raw_descrs: RawDescrPool::Global,
             is_authoritative_executor: false,
+            is_full_body_walk: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -14690,6 +14819,7 @@ mod tests {
             descr_refs: &[],
             raw_descrs: RawDescrPool::Global,
             is_authoritative_executor: false,
+            is_full_body_walk: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -14746,6 +14876,7 @@ mod tests {
             descr_refs: &[],
             raw_descrs: RawDescrPool::Global,
             is_authoritative_executor: false,
+            is_full_body_walk: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr,
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -14930,6 +15061,7 @@ mod tests {
             descr_refs: &[],
             raw_descrs: RawDescrPool::Global,
             is_authoritative_executor: false,
+            is_full_body_walk: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr,
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -15058,6 +15190,7 @@ mod tests {
             descr_refs: &[],
             raw_descrs: RawDescrPool::Global,
             is_authoritative_executor: false,
+            is_full_body_walk: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr,
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -15138,6 +15271,7 @@ mod tests {
             descr_refs: &[],
             raw_descrs: RawDescrPool::Global,
             is_authoritative_executor: false,
+            is_full_body_walk: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr,
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -15196,6 +15330,7 @@ mod tests {
             descr_refs: &[],
             raw_descrs: RawDescrPool::Global,
             is_authoritative_executor: false,
+            is_full_body_walk: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr,
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -15279,6 +15414,7 @@ mod tests {
             descr_refs: &[],
             raw_descrs: RawDescrPool::Global,
             is_authoritative_executor: false,
+            is_full_body_walk: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr,
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -15342,6 +15478,7 @@ mod tests {
             descr_refs: &[],
             raw_descrs: RawDescrPool::Global,
             is_authoritative_executor: false,
+            is_full_body_walk: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr,
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -15388,6 +15525,7 @@ mod tests {
             descr_refs: &[],
             raw_descrs: RawDescrPool::Global,
             is_authoritative_executor: false,
+            is_full_body_walk: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr,
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -15436,6 +15574,7 @@ mod tests {
             descr_refs: &[],
             raw_descrs: RawDescrPool::Global,
             is_authoritative_executor: false,
+            is_full_body_walk: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr,
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -15492,6 +15631,7 @@ mod tests {
             descr_refs: &[],
             raw_descrs: RawDescrPool::Global,
             is_authoritative_executor: false,
+            is_full_body_walk: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -15540,6 +15680,7 @@ mod tests {
             descr_refs: &[],
             raw_descrs: RawDescrPool::Global,
             is_authoritative_executor: false,
+            is_full_body_walk: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -15615,6 +15756,7 @@ mod tests {
             descr_refs: &[],
             raw_descrs: RawDescrPool::Global,
             is_authoritative_executor: false,
+            is_full_body_walk: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -15672,6 +15814,7 @@ mod tests {
             descr_refs: &[],
             raw_descrs: RawDescrPool::Global,
             is_authoritative_executor: false,
+            is_full_body_walk: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -15745,6 +15888,7 @@ mod tests {
             descr_refs: &[],
             raw_descrs: RawDescrPool::Global,
             is_authoritative_executor: false,
+            is_full_body_walk: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -15831,6 +15975,7 @@ mod tests {
             descr_refs: &descr_pool,
             raw_descrs: RawDescrPool::Global,
             is_authoritative_executor: false,
+            is_full_body_walk: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done_descr,
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -15989,6 +16134,7 @@ mod tests {
             descr_refs: &descr_pool,
             raw_descrs: RawDescrPool::Global,
             is_authoritative_executor: false,
+            is_full_body_walk: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done_descr,
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -16064,6 +16210,7 @@ mod tests {
             descr_refs: &[],
             raw_descrs: RawDescrPool::Global,
             is_authoritative_executor: true,
+            is_full_body_walk: true,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: make_fail_descr(1),
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -16112,6 +16259,7 @@ mod tests {
             descr_refs: &[],
             raw_descrs: RawDescrPool::Global,
             is_authoritative_executor: false,
+            is_full_body_walk: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: make_fail_descr(1),
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -16175,6 +16323,7 @@ mod tests {
             descr_refs: &[],
             raw_descrs: RawDescrPool::Global,
             is_authoritative_executor: true,
+            is_full_body_walk: true,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: make_fail_descr(1),
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -16262,6 +16411,7 @@ mod tests {
             descr_refs: &[],
             raw_descrs: RawDescrPool::Global,
             is_authoritative_executor: true,
+            is_full_body_walk: true,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: make_fail_descr(1),
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -16353,6 +16503,7 @@ mod tests {
             descr_refs: &[],
             raw_descrs: RawDescrPool::Global,
             is_authoritative_executor: true,
+            is_full_body_walk: true,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: make_fail_descr(1),
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -16419,6 +16570,7 @@ mod tests {
             descr_refs: &descr_pool,
             raw_descrs: RawDescrPool::Global,
             is_authoritative_executor: false,
+            is_full_body_walk: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done_descr,
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -16473,6 +16625,7 @@ mod tests {
             descr_refs: &descr_pool,
             raw_descrs: RawDescrPool::Global,
             is_authoritative_executor: false,
+            is_full_body_walk: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done_descr,
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -16522,6 +16675,7 @@ mod tests {
             descr_refs: &descr_pool,
             raw_descrs: RawDescrPool::Global,
             is_authoritative_executor: false,
+            is_full_body_walk: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done_descr,
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -16580,6 +16734,7 @@ mod tests {
             descr_refs: &descr_pool,
             raw_descrs: RawDescrPool::Global,
             is_authoritative_executor: false,
+            is_full_body_walk: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done_descr,
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -16640,6 +16795,7 @@ mod tests {
             descr_refs: &descr_pool,
             raw_descrs: RawDescrPool::Global,
             is_authoritative_executor: false,
+            is_full_body_walk: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done_descr,
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -16720,6 +16876,7 @@ mod tests {
             descr_refs: &descr_pool,
             raw_descrs: RawDescrPool::Global,
             is_authoritative_executor: false,
+            is_full_body_walk: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done_descr,
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -16789,6 +16946,7 @@ mod tests {
             descr_refs: &descr_pool,
             raw_descrs: RawDescrPool::Global,
             is_authoritative_executor: false,
+            is_full_body_walk: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done_descr,
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -16857,6 +17015,7 @@ mod tests {
             descr_refs: &descr_pool,
             raw_descrs: RawDescrPool::Global,
             is_authoritative_executor: false,
+            is_full_body_walk: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done_descr,
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -16907,6 +17066,7 @@ mod tests {
             descr_refs: &descr_pool,
             raw_descrs: RawDescrPool::Global,
             is_authoritative_executor: false,
+            is_full_body_walk: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done_descr,
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -16995,6 +17155,7 @@ mod tests {
             descr_refs: &descr_pool,
             raw_descrs: RawDescrPool::Global,
             is_authoritative_executor: false,
+            is_full_body_walk: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done_descr,
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -17080,6 +17241,7 @@ mod tests {
             descr_refs: &descr_pool,
             raw_descrs: RawDescrPool::Global,
             is_authoritative_executor: false,
+            is_full_body_walk: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done_descr,
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -17175,6 +17337,7 @@ mod tests {
             descr_refs: &descr_pool,
             raw_descrs: RawDescrPool::Global,
             is_authoritative_executor: false,
+            is_full_body_walk: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done_descr,
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -17300,6 +17463,7 @@ mod tests {
             descr_refs: &descr_pool,
             raw_descrs: RawDescrPool::Global,
             is_authoritative_executor: false,
+            is_full_body_walk: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done_descr,
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -17361,6 +17525,7 @@ mod tests {
             descr_refs: &descr_pool,
             raw_descrs: RawDescrPool::Global,
             is_authoritative_executor: false,
+            is_full_body_walk: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done_descr,
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -17410,6 +17575,7 @@ mod tests {
             descr_refs: &descr_pool,
             raw_descrs: RawDescrPool::Global,
             is_authoritative_executor: false,
+            is_full_body_walk: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done_descr,
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -17483,6 +17649,7 @@ mod tests {
             descr_refs: &descr_pool,
             raw_descrs: RawDescrPool::Global,
             is_authoritative_executor: false,
+            is_full_body_walk: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -17601,6 +17768,7 @@ mod tests {
             descr_refs: &descr_pool,
             raw_descrs: RawDescrPool::Global,
             is_authoritative_executor: false,
+            is_full_body_walk: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done_descr,
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -17695,6 +17863,7 @@ mod tests {
             descr_refs: &descr_pool,
             raw_descrs: RawDescrPool::Global,
             is_authoritative_executor: false,
+            is_full_body_walk: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr,
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -17788,6 +17957,7 @@ mod tests {
             descr_refs: &descr_pool,
             raw_descrs: RawDescrPool::Global,
             is_authoritative_executor: false,
+            is_full_body_walk: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -17860,6 +18030,7 @@ mod tests {
             descr_refs: &descr_pool,
             raw_descrs: RawDescrPool::Global,
             is_authoritative_executor: false,
+            is_full_body_walk: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -17935,6 +18106,7 @@ mod tests {
             descr_refs: &descr_pool,
             raw_descrs: RawDescrPool::Global,
             is_authoritative_executor: false,
+            is_full_body_walk: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -18008,6 +18180,7 @@ mod tests {
             descr_refs: &descr_pool,
             raw_descrs: RawDescrPool::Global,
             is_authoritative_executor: false,
+            is_full_body_walk: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -18087,6 +18260,7 @@ mod tests {
             descr_refs: &descr_pool,
             raw_descrs: RawDescrPool::Global,
             is_authoritative_executor: false,
+            is_full_body_walk: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -18164,6 +18338,7 @@ mod tests {
             descr_refs: &descr_pool,
             raw_descrs: RawDescrPool::Global,
             is_authoritative_executor: false,
+            is_full_body_walk: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -18229,6 +18404,7 @@ mod tests {
             descr_refs: &descr_pool,
             raw_descrs: RawDescrPool::Global,
             is_authoritative_executor: false,
+            is_full_body_walk: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done,
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -18315,6 +18491,7 @@ mod tests {
             descr_refs: &descr_pool,
             raw_descrs: RawDescrPool::Global,
             is_authoritative_executor: false,
+            is_full_body_walk: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done,
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -18379,6 +18556,7 @@ mod tests {
             descr_refs: &descr_pool,
             raw_descrs: RawDescrPool::Global,
             is_authoritative_executor: false,
+            is_full_body_walk: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done,
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -18431,6 +18609,7 @@ mod tests {
             descr_refs: &descr_pool,
             raw_descrs: RawDescrPool::Global,
             is_authoritative_executor: false,
+            is_full_body_walk: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done,
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -18495,6 +18674,7 @@ mod tests {
             descr_refs: &descr_pool,
             raw_descrs: RawDescrPool::Global,
             is_authoritative_executor: false,
+            is_full_body_walk: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done,
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -18579,6 +18759,7 @@ mod tests {
             descr_refs: &descr_pool,
             raw_descrs: RawDescrPool::Global,
             is_authoritative_executor: false,
+            is_full_body_walk: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done,
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -18653,6 +18834,7 @@ mod tests {
             descr_refs: &descr_pool,
             raw_descrs: RawDescrPool::Global,
             is_authoritative_executor: false,
+            is_full_body_walk: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done,
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -18705,6 +18887,7 @@ mod tests {
             descr_refs: &descr_pool,
             raw_descrs: RawDescrPool::Global,
             is_authoritative_executor: false,
+            is_full_body_walk: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done,
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -18783,6 +18966,7 @@ mod tests {
             descr_refs: &descr_pool,
             raw_descrs: RawDescrPool::Global,
             is_authoritative_executor: false,
+            is_full_body_walk: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done,
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -18844,6 +19028,7 @@ mod tests {
             descr_refs: &descr_pool,
             raw_descrs: RawDescrPool::Global,
             is_authoritative_executor: false,
+            is_full_body_walk: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done,
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -18919,6 +19104,7 @@ mod tests {
             descr_refs: &descr_pool,
             raw_descrs: RawDescrPool::Global,
             is_authoritative_executor: false,
+            is_full_body_walk: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done,
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -18982,6 +19168,7 @@ mod tests {
             descr_refs: &descr_pool,
             raw_descrs: RawDescrPool::Global,
             is_authoritative_executor: false,
+            is_full_body_walk: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done,
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -19056,6 +19243,7 @@ mod tests {
             descr_refs: &descr_pool,
             raw_descrs: RawDescrPool::Global,
             is_authoritative_executor: false,
+            is_full_body_walk: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done,
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -19355,6 +19543,7 @@ mod tests {
             descr_refs: &[],
             raw_descrs: RawDescrPool::Global,
             is_authoritative_executor: false,
+            is_full_body_walk: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -19417,6 +19606,7 @@ mod tests {
             descr_refs: &[],
             raw_descrs: RawDescrPool::Global,
             is_authoritative_executor: false,
+            is_full_body_walk: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -19497,6 +19687,7 @@ mod tests {
             descr_refs: &[],
             raw_descrs: RawDescrPool::Global,
             is_authoritative_executor: false,
+            is_full_body_walk: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -19552,6 +19743,7 @@ mod tests {
             descr_refs: &[],
             raw_descrs: RawDescrPool::Global,
             is_authoritative_executor: false,
+            is_full_body_walk: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
             done_with_this_frame_descr_int: make_fail_descr(101),
