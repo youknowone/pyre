@@ -660,12 +660,26 @@ fn handle_fail_resume_guard(
     // `must_save_exception` failure-recovery stub (GUARD_EXCEPTION /
     // GUARD_NO_EXCEPTION / GUARD_NOT_FORCED) staged `pos_exc_value`
     // here; non-exception guards leave it null.
-    let guard_exc = unsafe {
+    //
+    // Clearing the slot drops the only GC root for the exception object
+    // (`jf_guard_exc` is a GCREF visited by `jitframe_trace`).  The bridge
+    // hook below can allocate and trigger a moving nursery collection,
+    // which would relocate the object and leave a bare `usize` copy stale.
+    // RPython keeps the `grab_exc_value` result alive across
+    // `_trace_and_compile_from_bridge` automatically (shadowstack-rooted
+    // local); pyre has no GC-transform pass, so root the value explicitly
+    // via `gc_add_root` for the duration of the bridge hook — the collector
+    // rewrites `guard_exc_root` in place if it moves the object.
+    let mut guard_exc_root = majit_ir::GcRef(unsafe {
         let slot = &mut (*frame_ptr).jf_guard_exc;
-        let v = *slot as i64;
+        let v = *slot;
         *slot = 0;
         v
-    };
+    });
+    let guard_exc_rooted = guard_exc_root.0 != 0;
+    if guard_exc_rooted {
+        unsafe { majit_gc::gc_add_root(&mut guard_exc_root as *mut majit_ir::GcRef) };
+    }
 
     // compile.py:704-709 `_trace_and_compile_from_bridge`.
     // The hook compiles+attaches; it does NOT re-enter the bridge.
@@ -677,26 +691,33 @@ fn handle_fail_resume_guard(
     // compile.py:710-716 `resume_in_blackhole(descr, deadframe)`: the
     // descr is the sole identity carrier; the receiver derives green_key /
     // trace_id / fail_index from it via `fail_descr_arc_from_addr` and
-    // `descr_owning_jct`.  The `guard_exc` grabbed above is seeded as the
-    // resume exception (`blackhole.py:1647` `_prepare_resume_from_failure`,
-    // consumed at `blackhole.py:1794`); re-reading `jf_guard_exc` here would
-    // observe the post-`grab_exc_value` null and drop the exception.
-    if let Some(blackhole) = CA_BLACKHOLE_FN.get() {
-        if let Some(bh_result) = blackhole(
+    // `descr_owning_jct`.  Read the (possibly relocated) exception pointer
+    // back from the rooted slot before handing it off, then drop the root —
+    // the blackhole receiver re-roots it through the resumed interpreter.
+    // The value is seeded as the resume exception (`blackhole.py:1647`
+    // `_prepare_resume_from_failure`, consumed at `blackhole.py:1794`);
+    // re-reading `jf_guard_exc` here would observe the post-`grab_exc_value`
+    // null and drop the exception.
+    let bh_result = CA_BLACKHOLE_FN.get().and_then(|blackhole| {
+        blackhole(
             descr_raw,
             raw_values.as_ptr(),
             raw_values.len(),
             raw_values.as_ptr(),
             raw_values.len(),
-            guard_exc,
-        ) {
-            if majit_log_enabled() {
-                eprintln!(
-                    "[dynasm][ca-helper] resume-guard trace_id={trace_id} fail_index={fail_index} result=0x{bh_result:x}"
-                );
-            }
-            return bh_result;
+            guard_exc_root.0 as i64,
+        )
+    });
+    if guard_exc_rooted {
+        majit_gc::gc_remove_root(&mut guard_exc_root as *mut majit_ir::GcRef);
+    }
+    if let Some(bh_result) = bh_result {
+        if majit_log_enabled() {
+            eprintln!(
+                "[dynasm][ca-helper] resume-guard trace_id={trace_id} fail_index={fail_index} result=0x{bh_result:x}"
+            );
         }
+        return bh_result;
     }
     if majit_log_enabled() {
         eprintln!(
