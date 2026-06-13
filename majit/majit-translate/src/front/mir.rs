@@ -2138,8 +2138,7 @@ impl<'a> Lowering<'a> {
                             // rationale).
                             None => {
                                 if let ValueType::Ref(_) = dst_kind
-                                    && let Some(root) =
-                                        tyref_class_root(dest_ty, self.llbc)
+                                    && let Some(root) = tyref_class_root(dest_ty, self.llbc)
                                 {
                                     let res = self.graph.alloc_value_var_with_type(
                                         crate::model::ConcreteType::Unknown,
@@ -5708,14 +5707,6 @@ fn cast_call_segments(src: &ValueType, dst: &ValueType) -> Option<Vec<String>> {
 }
 
 fn tyref_to_value_type(ty: &TyRef, llbc: &Llbc) -> ValueType {
-    // Atomic wrappers type as their inner value; integer widths collapse
-    // to `Int` here, matching the literal-int handling below.
-    if let Some(inner) = tyref_atomic_inner_value_type(ty, llbc) {
-        return match inner {
-            ValueType::Unsigned => ValueType::Int,
-            other => other,
-        };
-    }
     // The HashConsedValue arm carries the body inline; primitives
     // typically land here.  The Deduplicated arm carries only an
     // ID; consult the dedup-body index to recover the inline shape
@@ -5773,6 +5764,16 @@ fn tyref_to_value_type(ty: &TyRef, llbc: &Llbc) -> ValueType {
             }
         }
     }
+    // Non-`Literal` (ADT / pointer / tuple) shapes only.  Atomic wrappers
+    // type as their inner value; integer widths collapse to `Int` here,
+    // matching the literal-int handling above.  Checked after the cheap
+    // `Literal` fast-path so primitive operands never pay the lookup.
+    if let Some(inner) = tyref_atomic_inner_value_type(ty, llbc) {
+        return match inner {
+            ValueType::Unsigned => ValueType::Int,
+            other => other,
+        };
+    }
     ValueType::Ref(None)
 }
 
@@ -5789,12 +5790,6 @@ fn tyref_to_value_type(ty: &TyRef, llbc: &Llbc) -> ValueType {
 /// slice, array, `Box`/`Rc`/`Arc` wrapper) folds to `Ref(None)` whose
 /// someshell ignores the payload.
 fn tyref_to_attr_value_type(ty: &TyRef, llbc: &Llbc) -> ValueType {
-    // Atomic wrappers register as their inner value, keeping the
-    // signed/unsigned split so `AtomicUsize` shells to `SomeInteger {
-    // unsigned: true }` like a bare `usize` field.
-    if let Some(inner) = tyref_atomic_inner_value_type(ty, llbc) {
-        return inner;
-    }
     let value = match ty {
         TyRef::Inline { value: (_, v) } => v,
         TyRef::Other(v) => v,
@@ -5830,6 +5825,14 @@ fn tyref_to_attr_value_type(ty: &TyRef, llbc: &Llbc) -> ValueType {
                 return ValueType::Float;
             }
         }
+    }
+    // Non-`Literal` (ADT / pointer / tuple) shapes only.  Atomic wrappers
+    // type as their inner value; unlike [`tyref_to_value_type`] the
+    // signed/unsigned split is kept here (`AtomicUsize` → `Unsigned`) so
+    // the per-field someshell matches the inner scalar.  Checked after
+    // the cheap `Literal` fast-path so primitive fields never pay it.
+    if let Some(inner) = tyref_atomic_inner_value_type(ty, llbc) {
+        return inner;
     }
     ValueType::Ref(None)
 }
@@ -5898,11 +5901,29 @@ fn adt_path_of_tyref(ty: &TyRef, llbc: &Llbc) -> Option<String> {
 /// ranges are plain int fields, so a field of one types as that inner
 /// value and its `load`/`store` fold to it (`is_atomic_load`).
 fn tyref_atomic_inner_value_type(ty: &TyRef, llbc: &Llbc) -> Option<ValueType> {
-    let path = adt_path_of_tyref(ty, llbc)?;
-    if !path.contains("::sync::atomic::") {
+    let node = strip_ty_wrappers(tyref_node(ty, llbc)?, llbc)?;
+    let id = adt_node_def_id(node)?;
+    let name = &llbc.type_by_id(id)?.item_meta.name;
+    // Cheap leaf check first — no path-string allocation (unlike
+    // `name_path` / `adt_path_of_tyref`).  This runs on the hot
+    // `tyref_to_value_type` fallback path, so it must stay
+    // allocation-free: bail before the module scan unless the type's
+    // last segment is an `Atomic*` ident.
+    let leaf = match name.last()? {
+        NameSeg::Ident { ident: (s, _) } => s.as_str(),
+        NameSeg::Other(_) => return None,
+    };
+    if !leaf.starts_with("Atomic") {
         return None;
     }
-    let leaf = path.rsplit("::").next().unwrap_or(&path);
+    // Confirm std's `core::sync::atomic` module so a user type
+    // coincidentally named `Atomic*` does not match.
+    let in_atomic_mod = name
+        .iter()
+        .any(|s| matches!(s, NameSeg::Ident { ident: (id, _) } if id == "atomic"));
+    if !in_atomic_mod {
+        return None;
+    }
     match leaf {
         "AtomicPtr" => Some(ValueType::Ref(None)),
         "AtomicBool" => Some(ValueType::Bool),

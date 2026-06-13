@@ -1086,10 +1086,7 @@ pub fn jit_static_pytype_addrs() -> Vec<(&'static str, i64)> {
         pytype_addr!("cellobject::CELL_TYPE", cellobject::CELL_TYPE),
         pytype_addr!("sliceobject::SLICE_TYPE", sliceobject::SLICE_TYPE),
         pytype_addr!("rangeobject::RANGE_TYPE", rangeobject::RANGE_TYPE),
-        pytype_addr!(
-            "rangeobject::RANGE_ITER_TYPE",
-            rangeobject::RANGE_ITER_TYPE
-        ),
+        pytype_addr!("rangeobject::RANGE_ITER_TYPE", rangeobject::RANGE_ITER_TYPE),
         pytype_addr!("rangeobject::SEQ_ITER_TYPE", rangeobject::SEQ_ITER_TYPE),
         pytype_addr!("methodobject::METHOD_TYPE", methodobject::METHOD_TYPE),
         pytype_addr!("memberobject::MEMBER_TYPE", memberobject::MEMBER_TYPE),

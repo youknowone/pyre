@@ -3199,7 +3199,11 @@ pub fn rtype_pyre_cast_instance(
     let result_lltype = r_result.lowleveltype().clone();
     let v_ptr = hop.args_v.borrow()[0].clone();
     hop.exception_cannot_occur()?;
-    Ok(hop.genop("cast_pointer", vec![v_ptr], GenopResult::LLType(result_lltype)))
+    Ok(hop.genop(
+        "cast_pointer",
+        vec![v_ptr],
+        GenopResult::LLType(result_lltype),
+    ))
 }
 
 #[cfg(test)]

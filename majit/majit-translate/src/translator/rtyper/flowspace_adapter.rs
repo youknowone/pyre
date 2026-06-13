@@ -1246,16 +1246,16 @@ pub fn translate_op(
                     // the `__pyre_cast_instance` HOST_ENV singleton so its
                     // Arc identity matches the `BUILTIN_TYPER` key.
                     if segments.len() == 2 && segments[0] == "__pyre_cast_instance" {
-                        let callable_host =
-                            HOST_ENV.lookup_builtin("__pyre_cast_instance").ok_or_else(|| {
+                        let callable_host = HOST_ENV
+                            .lookup_builtin("__pyre_cast_instance")
+                            .ok_or_else(|| {
                                 TyperError::message(
                                     "__pyre_cast_instance missing from HOST_ENV bootstrap"
                                         .to_string(),
                                 )
                             })?;
-                        let callable = Hlvalue::Constant(Constant::new(ConstValue::HostObject(
-                            callable_host,
-                        )));
+                        let callable =
+                            Hlvalue::Constant(Constant::new(ConstValue::HostObject(callable_host)));
                         let mut call_args = Vec::with_capacity(arg_hls.len() + 2);
                         call_args.push(callable);
                         call_args.extend(arg_hls);
