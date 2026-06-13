@@ -30,7 +30,7 @@ def multiply_AtAv(n, v, result, tmp):
     multiply_Av(n, v, tmp)
     multiply_Atv(n, tmp, result)
 
-n = 100
+n = 700
 u = [1.0] * n
 v = [0.0] * n
 tmp = [0.0] * n
