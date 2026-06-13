@@ -1083,19 +1083,14 @@ pub fn jit_static_pytype_addrs() -> Vec<(&'static str, i64)> {
             specialisedtupleobject::SPECIALISED_TUPLE_OO_TYPE
         ),
         pytype_addr!("weakref::GC_WEAKREF_TYPE", weakref::GC_WEAKREF_TYPE),
-        // CELL_TYPE / SLICE_TYPE / RANGE_TYPE / RANGE_ITER_TYPE /
-        // SEQ_ITER_TYPE are deliberately absent.  The earlier
-        // `IntegerRepr`-vs-`InstanceRepr` comparison wall is resolved
-        // (a `&PYTYPE_STATIC` read now types `SomeInstance("PyType")`),
-        // but registering these still lifts previously-Skipped
-        // object-space graphs (`is_slice` / `is_cell` / `is_range` and
-        // their callers, which pull in the `pyre_jit::eval` driver) onto
-        // the real rtyper path, where they hit a fatal classdef-less
-        // `getattr("load")` cascade (an atomic load on a `*const`/`*mut`
-        // field whose pointee host struct is unregistered, projecting to
-        // `SomeInstance(classdef=None)` — unaryop.rs:3742) plus sibling
-        // walls not yet in the dual-gate `is_known_unported` allowlist.
-        // Add them back once that classdef-less getattr cascade drains.
+        pytype_addr!("cellobject::CELL_TYPE", cellobject::CELL_TYPE),
+        pytype_addr!("sliceobject::SLICE_TYPE", sliceobject::SLICE_TYPE),
+        pytype_addr!("rangeobject::RANGE_TYPE", rangeobject::RANGE_TYPE),
+        pytype_addr!(
+            "rangeobject::RANGE_ITER_TYPE",
+            rangeobject::RANGE_ITER_TYPE
+        ),
+        pytype_addr!("rangeobject::SEQ_ITER_TYPE", rangeobject::SEQ_ITER_TYPE),
         pytype_addr!("methodobject::METHOD_TYPE", methodobject::METHOD_TYPE),
         pytype_addr!("memberobject::MEMBER_TYPE", memberobject::MEMBER_TYPE),
         pytype_addr!(
