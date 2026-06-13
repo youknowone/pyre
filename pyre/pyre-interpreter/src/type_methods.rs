@@ -1839,6 +1839,7 @@ pub fn encode_object(
             "ordinal not in range(256)",
             errors,
         ),
+        "raw-unicode-escape" => Ok(encode_raw_unicode_escape(s)),
         _ => match encode_utf16_32(s, &enc_lower, w_object, errors) {
             Some(out) => out,
             None => Err(crate::PyError::new(
@@ -1847,6 +1848,70 @@ pub fn encode_object(
             )),
         },
     }
+}
+
+/// `unicodeobject.c:_PyUnicode_EncodeRawUnicodeEscape` — code points
+/// below 0x100 map to a single Latin-1 byte; 0x100..0x10000 become the
+/// 6-byte `\uXXXX` form; everything larger becomes `\UXXXXXXXX`.  Unlike
+/// `unicode-escape`, the backslash and control characters are not
+/// escaped.
+pub fn encode_raw_unicode_escape(s: &Wtf8) -> Vec<u8> {
+    let mut out: Vec<u8> = Vec::new();
+    for cp in s.code_points() {
+        let v = cp.to_u32();
+        if v < 0x100 {
+            out.push(v as u8);
+        } else if v < 0x10000 {
+            out.extend_from_slice(format!("\\u{v:04x}").as_bytes());
+        } else {
+            out.extend_from_slice(format!("\\U{v:08x}").as_bytes());
+        }
+    }
+    out
+}
+
+/// `unicodeobject.c:_PyUnicode_DecodeRawUnicodeEscape` — the inverse of
+/// [`encode_raw_unicode_escape`].  A backslash starts a `\uXXXX` /
+/// `\UXXXXXXXX` escape; any other byte (including a lone backslash or a
+/// malformed escape) is taken as a Latin-1 code point.
+pub fn decode_raw_unicode_escape(data: &[u8]) -> Result<Wtf8Buf, crate::PyError> {
+    let mut out = Wtf8Buf::new();
+    let mut i = 0usize;
+    while i < data.len() {
+        let b = data[i];
+        if b != b'\\' {
+            out.push_char(b as char);
+            i += 1;
+            continue;
+        }
+        // Count the run of backslashes; only an odd run can introduce a
+        // `\u`/`\U` escape (an even run is literal escaped backslashes,
+        // but raw-unicode-escape does not collapse them — each `\` is a
+        // literal byte 0x5c).  The escape applies when `\` is followed by
+        // `u` or `U` with enough hex digits.
+        let kind = data.get(i + 1).copied();
+        let want = match kind {
+            Some(b'u') => 4usize,
+            Some(b'U') => 8usize,
+            _ => 0,
+        };
+        if want != 0 && i + 2 + want <= data.len() {
+            let hex = &data[i + 2..i + 2 + want];
+            if let Ok(hs) = std::str::from_utf8(hex) {
+                if let Ok(v) = u32::from_str_radix(hs, 16) {
+                    if let Some(c) = CodePoint::from_u32(v) {
+                        out.push(c);
+                        i += 2 + want;
+                        continue;
+                    }
+                }
+            }
+        }
+        // Not a valid escape — emit the backslash literally as Latin-1.
+        out.push_char(b as char);
+        i += 1;
+    }
+    Ok(out)
 }
 
 fn encode_narrow(

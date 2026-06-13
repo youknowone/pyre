@@ -5,6 +5,8 @@
 
 pub mod __builtin__;
 #[allow(non_snake_case)]
+pub mod __pypy__;
+#[allow(non_snake_case)]
 pub mod _abc;
 #[allow(non_snake_case)]
 pub mod _ast;

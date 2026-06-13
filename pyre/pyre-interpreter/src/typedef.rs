@@ -10047,6 +10047,7 @@ pub(crate) fn bytes_method_decode(args: &[PyObjectRef]) -> Result<PyObjectRef, c
         "latin-1" | "latin1" | "iso-8859-1" | "8859" => {
             Wtf8Buf::from_string(data.iter().map(|&b| b as char).collect::<String>())
         }
+        "raw-unicode-escape" => crate::type_methods::decode_raw_unicode_escape(data)?,
         _ => {
             if let Some(result) = crate::type_methods::decode_utf16_32(data, &enc_lower, err_mode) {
                 result?

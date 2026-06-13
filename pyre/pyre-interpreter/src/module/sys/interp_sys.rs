@@ -619,6 +619,7 @@ pub fn register_module(ns: &mut DictStorage) {
         ns,
         "builtin_module_names",
         w_tuple_new(vec![
+            w_str_new("__pypy__"),
             w_str_new("_abc"),
             w_str_new("_bisect"),
             w_str_new("_blake2"),

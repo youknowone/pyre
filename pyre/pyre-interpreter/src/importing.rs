@@ -186,6 +186,11 @@ pub fn install_builtin_modules() {
         crate::module::importlib::interp_importlib::register_abc
     );
 
+    // __pypy__ package + builders submodule — the PyPy-only surface
+    // pickle.py imports (identity_dict + builders.BytesBuilder).
+    pyre_install_module!("__pypy__" => crate::module::__pypy__::init);
+    pyre_install_module!("__pypy__.builders" => crate::module::__pypy__::builders::init);
+
     pyre_install_module!(_signal);
     pyre_install_module!(atexit);
     pyre_install_module!(pwd);
