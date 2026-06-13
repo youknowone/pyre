@@ -5862,10 +5862,16 @@ impl MIFrame {
         list: OpRef,
         concrete_list: PyObjectRef,
         concrete_len: usize,
+        // Generic-call replay shape when the fast path bails: `[]` for the
+        // bound-method form `xs.pop()` (`callable` is the bound method) and
+        // `[receiver]` for the builtin form `list.pop(xs)` (`callable` is the
+        // unbound builtin, so an empty list must record `list.pop(xs)` to
+        // raise IndexError rather than `list.pop()`'s arity TypeError).
+        fallback_args: &[OpRef],
     ) -> Result<OpRef, PyError> {
         if concrete_list.is_null() || concrete_len == 0 {
             // Caller's guard ensures concrete_len > 0; defensive fallback.
-            return self.trace_call_callable(callable, &[]);
+            return self.trace_call_callable(callable, fallback_args);
         }
         unsafe {
             if is_list(concrete_list) {
@@ -5886,7 +5892,7 @@ impl MIFrame {
                 }
             }
         }
-        self.trace_call_callable(callable, &[])
+        self.trace_call_callable(callable, fallback_args)
     }
 
     /// Direct trace path for `list.reverse()`.
@@ -5939,6 +5945,13 @@ impl MIFrame {
         index: OpRef,
         concrete_list: PyObjectRef,
         concrete_index: PyObjectRef,
+        // Operand-stack shape to replay when the fast path bails to the
+        // generic residual: `[index]` for the bound-method form `xs.pop(i)`
+        // (`callable` is the bound method) and `[receiver, index]` for the
+        // builtin form `list.pop(xs, i)` (`callable` is the unbound builtin,
+        // so the receiver must be re-supplied for the wrong-exception cases to
+        // match the concrete call).
+        fallback_args: &[OpRef],
     ) -> Result<OpRef, PyError> {
         // Pick the strategy-specific length field so the inline length update
         // mirrors `generated_list_pop_by_strategy`. A null / non-list / mixed
@@ -5958,8 +5971,7 @@ impl MIFrame {
             }
         };
         let Some((strategy_id, len_descr)) = strategy else {
-            // The method-form generic call shape is `callable(index)`.
-            return self.trace_call_callable(callable, &[index]);
+            return self.trace_call_callable(callable, fallback_args);
         };
         // The `jit_list_pop_at` residual panics on an out-of-range index
         // instead of raising IndexError, so the fast path may only be taken
@@ -5975,7 +5987,7 @@ impl MIFrame {
             }
         };
         let Some(concrete_key) = concrete_key else {
-            return self.trace_call_callable(callable, &[index]);
+            return self.trace_call_callable(callable, fallback_args);
         };
         let concrete_len = unsafe { w_list_len(concrete_list) } as i64;
         let normalized_key = if concrete_key < 0 {
@@ -5984,7 +5996,7 @@ impl MIFrame {
             concrete_key
         };
         if normalized_key < 0 || normalized_key >= concrete_len {
-            return self.trace_call_callable(callable, &[index]);
+            return self.trace_call_callable(callable, fallback_args);
         }
         let len_descr_idx = len_descr.index();
         let result = self.with_ctx(|this, ctx| {
@@ -6279,6 +6291,9 @@ impl MIFrame {
                         args[0],
                         inner_self,
                         concrete_args[0],
+                        // Bound method: the receiver is inside `callable`, so
+                        // the generic shape is `callable(index)`.
+                        &[args[0]],
                     );
                 }
                 if args.len() == 0 && canonical_list_method("pop") == Some(inner_func) {
@@ -6288,7 +6303,8 @@ impl MIFrame {
                     });
                     let self_ref = recover_self(self);
                     let concrete_len = unsafe { w_list_len(inner_self) };
-                    let res = self.list_pop_value(callable, self_ref, inner_self, concrete_len);
+                    let res =
+                        self.list_pop_value(callable, self_ref, inner_self, concrete_len, &[]);
                     self.with_ctx(|this, ctx| this.pop_call_replay_stack(ctx, args.len()))?;
                     return res;
                 }
@@ -6381,6 +6397,9 @@ impl MIFrame {
                         args[1],
                         concrete_args[0],
                         concrete_args[1],
+                        // Unbound builtin: the receiver is the explicit first
+                        // arg, so the generic shape is `list.pop(xs, i)`.
+                        &[args[0], args[1]],
                     );
                 }
                 if args.len() == 1
@@ -6388,7 +6407,15 @@ impl MIFrame {
                     && !concrete_args.first().copied().unwrap_or(PY_NULL).is_null()
                     && is_list(concrete_args[0])
                 {
-                    self.dm143_mark_heap_mutated();
+                    let concrete_len = w_list_len(concrete_args[0]);
+                    // Mark the mutation only once the concrete pop is known to
+                    // have removed an element: `call_callable` already ran the
+                    // builtin concretely, but on an empty list it raised
+                    // without mutating, so `dm143_advance_live_locals` must not
+                    // advance across that non-mutating iteration.
+                    if concrete_len > 0 {
+                        self.dm143_mark_heap_mutated();
+                    }
                     self.with_ctx(|this, ctx| {
                         this.implement_guard_value(ctx, callable, concrete_callable as i64)
                     });
@@ -6402,9 +6429,16 @@ impl MIFrame {
                             call_pc,
                         )
                     });
-                    let concrete_len = w_list_len(concrete_args[0]);
-                    let res =
-                        self.list_pop_value(callable, args[0], concrete_args[0], concrete_len);
+                    let res = self.list_pop_value(
+                        callable,
+                        args[0],
+                        concrete_args[0],
+                        concrete_len,
+                        // Unbound builtin: re-supply the receiver so an empty
+                        // list records `list.pop(xs)` (IndexError), not
+                        // `list.pop()` (arity TypeError).
+                        &[args[0]],
+                    );
                     self.with_ctx(|this, ctx| {
                         this.pop_call_replay_stack_self_in_args(ctx, args.len())
                     })?;

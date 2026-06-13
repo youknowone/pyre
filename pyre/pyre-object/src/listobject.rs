@@ -1248,6 +1248,48 @@ mod tests {
     }
 
     #[test]
+    fn test_jit_list_pop_at_returns_and_shifts() {
+        let list = w_list_new(vec![w_int_new(10), w_int_new(20), w_int_new(30)]);
+        let popped = jit_list_pop_at(list as i64, 1) as PyObjectRef;
+        unsafe {
+            assert_eq!(crate::intobject::w_int_get_value(popped), 20);
+            assert_eq!(w_list_len(list), 2);
+            assert_eq!(
+                crate::intobject::w_int_get_value(w_list_getitem(list, 0).unwrap()),
+                10
+            );
+            assert_eq!(
+                crate::intobject::w_int_get_value(w_list_getitem(list, 1).unwrap()),
+                30
+            );
+        }
+    }
+
+    #[test]
+    fn test_jit_list_pop_at_normalizes_negative_index() {
+        let list = w_list_new(vec![w_int_new(10), w_int_new(20), w_int_new(30)]);
+        let popped = jit_list_pop_at(list as i64, -1) as PyObjectRef;
+        unsafe {
+            assert_eq!(crate::intobject::w_int_get_value(popped), 30);
+            assert_eq!(w_list_len(list), 2);
+        }
+    }
+
+    #[test]
+    fn test_jit_list_pop_at_out_of_range_is_rejected() {
+        // `jit_list_pop_at` panics on an out-of-range index (an `extern "C"`
+        // panic aborts rather than unwinds, so the contract is asserted on the
+        // `w_list_pop` it guards on: a `None` is what drives the panic).  The
+        // tracer only emits the helper behind a runtime in-range guard.
+        let list = w_list_new(vec![w_int_new(10)]);
+        unsafe {
+            assert!(w_list_pop(list, 5).is_none());
+            assert!(w_list_pop(list, -5).is_none());
+            assert_eq!(w_list_len(list), 1);
+        }
+    }
+
+    #[test]
     fn test_list_uses_integer_strategy_for_homogeneous_ints() {
         let list = w_list_new(vec![w_int_new(1), w_int_new(2), w_int_new(3)]);
         unsafe {

@@ -2125,6 +2125,17 @@ pub fn compute_load_method_bound(obj: PyObjectRef, attr: PyObjectRef, name: &str
             let shadowed =
                 crate::objspace::std::mapdict::instance_node_getdictvalue(obj, name).is_some();
             let w_type = pyre_object::w_instance_get_type(obj);
+            // callmethod.py:33 `w_type.has_object_getattribute()`: a non-default
+            // `__getattribute__` produced `attr` through the override rather
+            // than the default descriptor path, so the MRO-shape binding
+            // inference below does not apply.  `_PyObject_GetMethod` skips the
+            // self-binding optimization for a custom `tp_getattro` (pushes
+            // NULL), so an override returning the raw descriptor must call as a
+            // plain function, not a bound method.  This is the same gate
+            // `load_method_fast_path` applies before its fast path.
+            if !pyre_object::typeobject::w_type_get_uses_object_getattribute(w_type) {
+                return PY_NULL;
+            }
             let raw = crate::baseobjspace::lookup_in_type(w_type, name);
             match raw {
                 _ if shadowed => PY_NULL,

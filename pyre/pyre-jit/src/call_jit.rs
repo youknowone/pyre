@@ -3206,7 +3206,18 @@ pub extern "C" fn bh_load_attr_fn(obj: i64, w_code_ptr: i64, name_idx: i64) -> i
         &*(pyre_interpreter::w_code_get_ptr(w_code_ptr as pyre_object::PyObjectRef)
             as *const pyre_interpreter::CodeObject)
     };
+    // `name_idx` is a `co_names` index baked into the residual call by the
+    // codewriter from the originating LOAD_ATTR oparg, so it is in range for
+    // the code object loaded out of the resume frame.  The bound is a codegen
+    // invariant rather than a runtime-reachable error (a negative index would
+    // wrap to a huge `usize` and trip the same check), so assert it in debug
+    // and degrade to a null result in release.
     let idx = name_idx as usize;
+    debug_assert!(
+        idx < code.names.len(),
+        "bh_load_attr_fn name_idx {idx} out of range ({} names) — codegen invariant",
+        code.names.len()
+    );
     if idx >= code.names.len() {
         return 0;
     }
@@ -3236,7 +3247,15 @@ pub extern "C" fn bh_load_method_self_fn(
         &*(pyre_interpreter::w_code_get_ptr(w_code_ptr as pyre_object::PyObjectRef)
             as *const pyre_interpreter::CodeObject)
     };
+    // Same `co_names`-index codegen invariant as `bh_load_attr_fn`; the
+    // release-path `PY_NULL` is also the legitimate "no self prepended"
+    // result, so the debug assert is what catches an invalid index.
     let idx = name_idx as usize;
+    debug_assert!(
+        idx < code.names.len(),
+        "bh_load_method_self_fn name_idx {idx} out of range ({} names) — codegen invariant",
+        code.names.len()
+    );
     if idx >= code.names.len() {
         return pyre_object::PY_NULL as i64;
     }
