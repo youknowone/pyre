@@ -1390,6 +1390,17 @@ pub fn format_value_dispatch(val: PyObjectRef, spec: &str) -> Result<Wtf8Buf, cr
     }
 }
 
+/// The type name of `obj` for a TypeError message — the `w_class` name
+/// for instances, else the storage type name.
+pub(crate) fn arg_type_name(obj: PyObjectRef) -> String {
+    unsafe {
+        match crate::typedef::r#type(obj) {
+            Some(tp) => w_type_get_name(tp).to_string(),
+            None => (*(*obj).ob_type).name.to_string(),
+        }
+    }
+}
+
 /// Read a format spec's stored string value. The spec must be a `str`
 /// (or subclass); its `__str__` is not consulted, so a raising override
 /// does not leak out of formatting.  `arg_desc` names the argument in
@@ -1401,14 +1412,9 @@ pub(crate) fn read_format_spec(
     if unsafe { is_str(spec_obj) } {
         return Ok(unsafe { w_str_get_value(spec_obj) }.to_string());
     }
-    let tn = unsafe {
-        match crate::typedef::r#type(spec_obj) {
-            Some(tp) => w_type_get_name(tp).to_string(),
-            None => (*(*spec_obj).ob_type).name.to_string(),
-        }
-    };
     Err(crate::PyError::type_error(format!(
-        "{arg_desc} must be str, not {tn}"
+        "{arg_desc} must be str, not {}",
+        arg_type_name(spec_obj)
     )))
 }
 

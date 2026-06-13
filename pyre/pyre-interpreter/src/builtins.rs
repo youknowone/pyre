@@ -1000,6 +1000,30 @@ pub fn new_builtin_module_dict() -> pyre_object::PyObjectRef {
     w_dict
 }
 
+/// `print`'s `sep`/`end`: `None` selects the default and a non-`str` is
+/// a TypeError ("sep must be None or a string, not …").  A `str` value is
+/// written directly (`app_io.py print_`: `file.write(sep)`), so its
+/// stored value is used without invoking a `str` subclass `__str__`.
+fn print_separator(
+    val: Option<PyObjectRef>,
+    name: &str,
+    default: &str,
+) -> Result<String, crate::PyError> {
+    let Some(v) = val else {
+        return Ok(default.to_string());
+    };
+    if unsafe { pyre_object::is_none(v) } {
+        return Ok(default.to_string());
+    }
+    if unsafe { pyre_object::is_str(v) } {
+        return Ok(unsafe { pyre_object::w_str_get_value(v) }.to_string());
+    }
+    Err(crate::PyError::type_error(format!(
+        "{name} must be None or a string, not {}",
+        crate::type_methods::arg_type_name(v)
+    )))
+}
+
 /// `print(*args)` — write space-separated str representations to stdout.
 fn builtin_print(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // Check if last arg is a kwargs dict (from CALL_KW builtin dispatch).
@@ -1015,14 +1039,8 @@ fn builtin_print(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         let sep_key = w_str_new("sep");
         let end_val = unsafe { pyre_object::w_dict_lookup(kwargs, end_key) };
         let sep_val = unsafe { pyre_object::w_dict_lookup(kwargs, sep_key) };
-        let end_str = end_val
-            .map(|v| unsafe { crate::py_str(v) })
-            .transpose()?
-            .unwrap_or_else(|| "\n".to_string());
-        let sep_str = sep_val
-            .map(|v| unsafe { crate::py_str(v) })
-            .transpose()?
-            .unwrap_or_else(|| " ".to_string());
+        let end_str = print_separator(end_val, "end", "\n")?;
+        let sep_str = print_separator(sep_val, "sep", " ")?;
         (&args[..args.len() - 1], end_str, sep_str)
     } else {
         (args, "\n".to_string(), " ".to_string())

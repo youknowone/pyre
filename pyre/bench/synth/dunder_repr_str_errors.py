@@ -44,7 +44,7 @@ show("leaf-repr-raise", lambda: repr(MyInt(7)))
 show("nonstr-repr", lambda: repr(NonStrRepr()))
 show("list-elem", lambda: repr([RaisesRepr()]))
 show("dict-key", lambda: repr({RaisesRepr(): 1}))
-show("tuple-elem", lambda: str((RaisesStr(),)))
+show("tuple-elem", lambda: str((RaisesRepr(),)))
 show("format-r", lambda: "{!r}".format(RaisesRepr()))
 show("percent-s", lambda: "%s" % RaisesStr())
 show("fstring", lambda: f"{RaisesRepr()!r}")
@@ -73,6 +73,19 @@ print("int-format-strsub", (12).__format__(StrSubRaisingStr("04d")))
 print("str-format-strsub", "hi".__format__(StrSubRaisingStr(">5")))
 print("object-format-strsub", object().__format__(StrSubRaisingStr("")) != "")
 show("int-format-nonstr", lambda: (12).__format__(34))
+
+# print(sep=, end=): None selects the default, a str subclass uses its
+# stored value, and a non-str raises TypeError. (A str subclass __str__
+# override is intentionally not exercised here — CPython str()-ifies the
+# separator while PyPy writes it directly, so they diverge.)
+class PlainSep(str):
+    pass
+
+
+print("a", "b", sep=PlainSep("-"))
+print("pend-none", end=None)
+show("print-end-int", lambda: print("x", end=5))
+show("print-sep-int", lambda: print("x", sep=5, end="\n"))
 
 # Normal formatting is unaffected.
 print("normal", repr([1, 2]), str({3: 4}), repr((1,)), ascii("x"))
