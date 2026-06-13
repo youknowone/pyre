@@ -4,17 +4,35 @@
 use majit_charon_reader::Llbc;
 use majit_translate::front::mir::lower_function;
 use majit_translate::model::{CallTarget, ExitSwitch, OpKind};
+use std::sync::OnceLock;
 
 const INTERP: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../build/llbc/pyre-interpreter.ullbc",
 );
 
+/// Load `pyre-interpreter.ullbc` once and share it across every test.
+///
+/// The corpus is ~224MB on disk and its parsed `serde_json` form is
+/// several GB resident.  Loading it per test means the four tests here
+/// — run concurrently by the default test harness — each hold a full
+/// parse resident at the same time, several times the runner's RAM on
+/// the 16GB CI hosts; the resulting OOM/swap-thrash gets the job killed
+/// (Linux), where a developer machine with more headroom only runs
+/// slowly.  `Llbc` is read-only after `load`, so a single shared parse
+/// behind a `OnceLock` is sufficient: `get_or_init` runs the load
+/// exactly once even under the concurrent test threads, and
+/// `lower_function` only borrows it.
+fn interp() -> &'static Llbc {
+    static LLBC: OnceLock<Llbc> = OnceLock::new();
+    LLBC.get_or_init(|| Llbc::load(INTERP).expect("load pyre-interpreter.ullbc"))
+}
+
 #[test]
 fn pop_value_lowers_to_raise_links() {
-    let llbc = Llbc::load(INTERP).expect("load pyre-interpreter.ullbc");
-    let graph = lower_function(&llbc, "pyre_interpreter::eval::<Impl>::pop_value")
-        .expect("lower pop_value");
+    let llbc = interp();
+    let graph =
+        lower_function(llbc, "pyre_interpreter::eval::<Impl>::pop_value").expect("lower pop_value");
     let mut result_ctors = 0usize;
     let mut to_exc_object_calls = 0usize;
     let mut except_links = 0usize;
@@ -51,10 +69,10 @@ fn pop_value_lowers_to_raise_links() {
 
 #[test]
 fn pop_value_caller_gets_lastexception_exits() {
-    let llbc = Llbc::load(INTERP).expect("load pyre-interpreter.ullbc");
+    let llbc = interp();
     // The SFSF chain's free-fn body pops twice via `?`
     // (pyopcode.rs `opcode_store_fast_store_fast`).
-    let graph = lower_function(&llbc, "opcode_store_fast_store_fast").expect("lower caller");
+    let graph = lower_function(llbc, "opcode_store_fast_store_fast").expect("lower caller");
     eprintln!("caller graph = {}", graph.name);
     let lastexc_blocks = graph
         .blocks
@@ -97,12 +115,12 @@ fn count_result_ctors(graph: &majit_translate::model::FunctionGraph) -> usize {
 
 #[test]
 fn execute_wrapper_family_lowers_to_raise_links() {
-    let llbc = Llbc::load(INTERP).expect("load pyre-interpreter.ullbc");
+    let llbc = interp();
     // The arm wrapper's `Ok(StepResult::Continue)` shell must be gone
     // and the `?` on the scoped `store_fast_store_fast` method must be
     // a LastException diamond.
     let graph = lower_function(
-        &llbc,
+        llbc,
         "pyre_interpreter::pyopcode::execute_store_fast_store_fast",
     )
     .expect("lower wrapper");
@@ -121,9 +139,8 @@ fn execute_wrapper_family_lowers_to_raise_links() {
 
 #[test]
 fn eval_loop_custom_match_gets_catch_and_rewrap() {
-    let llbc = Llbc::load(INTERP).expect("load pyre-interpreter.ullbc");
-    let graph =
-        lower_function(&llbc, "pyre_interpreter::eval::eval_loop").expect("lower eval_loop");
+    let llbc = interp();
+    let graph = lower_function(llbc, "pyre_interpreter::eval::eval_loop").expect("lower eval_loop");
     // The execute_opcode_step call block must carry LastException exits.
     let call_block = graph
         .blocks
