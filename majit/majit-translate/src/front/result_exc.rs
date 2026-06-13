@@ -54,11 +54,16 @@
 //! Both rules must apply together per callee: a transformed callee
 //! returns `T` and raises, so an untransformed caller-side
 //! discriminant switch would read garbage.  Until the whole-program
-//! conformance scan lands, [`RESULT_EXC_LOWERING_SCOPE`] pins the
-//! callee set; every call site of a scoped callee either matches the
-//! `?`-diamond or fails the build loudly (custom `match` handlers
-//! need the caught value bound from `last_exc_value` — a later
-//! widening).
+//! conformance scan lands, [`RESULT_EXC_LOWERING_SCOPE`] plus the
+//! `pyopcode::execute_*` wrapper family pin the callee set; every call
+//! site of a scoped callee either matches the `?`-diamond, tail-forwards
+//! inside a scoped enclosing graph, or — for hand-written `match`
+//! consumers (`eval_loop`, the `eval_loop_jit*` portals whose
+//! `match step_result` merges seven predecessors) — gets the
+//! [`catch_and_rewrap`] treatment: `LastException` exits on the call
+//! block whose arms locally re-encode the `Result` (`Ok(raw)` /
+//! `Err(PyError::from_exc_object(last_exc_value))`), leaving the
+//! downstream destructuring untouched.
 
 use majit_charon_reader::Llbc;
 use majit_charon_reader::ullbc::TyRef;
@@ -79,21 +84,40 @@ const RESULT_EXC_LOWERING_SCOPE: &[&str] = &[
     "store_fast_store_fast",
 ];
 
+/// Dispatch-wrapper family rule: every `pyopcode::execute_*` wrapper —
+/// the per-opcode `execute_<name>` free fns plus `execute_opcode_step`
+/// itself — is scoped as a family.  The wrappers share one shape
+/// (`executor.method(..)?; Ok(StepResult::..)`) and the dispatch arms
+/// tail-forward their `Result`s, so scoping them one-by-one would leave
+/// the dispatch graph returning raw `StepResult` on transformed arms
+/// and `Result` shells on the rest — type-inconsistent for the
+/// custom-match consumers (`eval_loop`, the portals).  The family lands
+/// as a unit; the callee-side type gate
+/// ([`tyref_is_result_of_pyerror`]) still filters non-`Result` returns.
+fn in_execute_wrapper_family(name_path: &str, leaf: &str) -> bool {
+    name_path.contains("pyopcode") && leaf.starts_with("execute_")
+}
+
 /// True when `name_path`'s leaf is a scoped callee.
 pub(crate) fn in_result_exc_scope(name_path: &str) -> bool {
+    let leaf = name_path.rsplit("::").next().unwrap_or(name_path);
     RESULT_EXC_LOWERING_SCOPE
         .iter()
-        .any(|leaf| name_path == *leaf || name_path.ends_with(&format!("::{leaf}")))
+        .any(|scoped| name_path == *scoped || leaf == *scoped)
+        || in_execute_wrapper_family(name_path, leaf)
 }
 
 /// True when a call target's leaf names a scoped callee.
 pub(crate) fn call_target_in_scope(target: &CallTarget) -> bool {
-    let leaf = match target {
-        CallTarget::Method { name, .. } => name.as_str(),
-        CallTarget::FunctionPath { segments } => segments.last().map(String::as_str).unwrap_or(""),
-        _ => return false,
-    };
-    RESULT_EXC_LOWERING_SCOPE.contains(&leaf)
+    match target {
+        CallTarget::Method { name, .. } => RESULT_EXC_LOWERING_SCOPE.contains(&name.as_str()),
+        CallTarget::FunctionPath { segments } => {
+            let leaf = segments.last().map(String::as_str).unwrap_or("");
+            RESULT_EXC_LOWERING_SCOPE.contains(&leaf)
+                || (segments.iter().any(|s| s == "pyopcode") && leaf.starts_with("execute_"))
+        }
+        _ => false,
+    }
 }
 
 /// Resolve the JSON body behind a generics slot — `{"Deduplicated":
@@ -435,13 +459,25 @@ pub(crate) struct RewireOutcome {
     /// that is itself a scoped callee; an unscoped enclosing graph
     /// would hand `T` to callers still switching on a discriminant.
     pub tail_forwards: usize,
+    /// Custom-match sites handled by [`catch_and_rewrap`]: the call
+    /// gets `LastException` exits and the two arms locally rebuild the
+    /// value-encoded `Result` the untouched downstream `match` keeps
+    /// consuming.
+    pub rewrapped: usize,
+}
+
+/// Per-site disposition for [`rewire_one_call_site`].
+enum SiteOutcome {
+    Diamond,
+    TailForward,
+    Rewrapped,
 }
 
 /// Caller rule.  `results` are the result `Variable`s of calls to
-/// scoped callees (captured during lowering).  Each must sit at the
-/// head of a `Try::branch` diamond — rewired into
-/// `ExitSwitch::LastException` exits — or tail-forward to
-/// `returnblock` inside a scoped enclosing graph.
+/// scoped callees (captured during lowering).  Each site is either a
+/// `?`-diamond — rewired into `ExitSwitch::LastException` exits — or a
+/// tail-forward to `returnblock` inside a scoped enclosing graph, or a
+/// custom `match` consumer that gets the catch-and-rewrap treatment.
 pub(crate) fn rewire_result_exc_call_sites(
     graph: &mut FunctionGraph,
     results: &[Variable],
@@ -450,24 +486,23 @@ pub(crate) fn rewire_result_exc_call_sites(
     let mut outcome = RewireOutcome {
         diamonds: 0,
         tail_forwards: 0,
+        rewrapped: 0,
     };
     for r in results {
-        if rewire_one_call_site(graph, r, enclosing_scoped)? {
-            outcome.diamonds += 1;
-        } else {
-            outcome.tail_forwards += 1;
+        match rewire_one_call_site(graph, r, enclosing_scoped)? {
+            SiteOutcome::Diamond => outcome.diamonds += 1,
+            SiteOutcome::TailForward => outcome.tail_forwards += 1,
+            SiteOutcome::Rewrapped => outcome.rewrapped += 1,
         }
     }
     Ok(outcome)
 }
 
-/// Returns `true` for a rewired diamond, `false` for a (no-op)
-/// tail-forward.
 fn rewire_one_call_site(
     graph: &mut FunctionGraph,
     r: &Variable,
     enclosing_scoped: bool,
-) -> Result<bool, String> {
+) -> Result<SiteOutcome, String> {
     let name = graph.name.clone();
     // Block A: contains the call producing `r`; closed by lower_call
     // with a single forwarding exit.
@@ -485,29 +520,26 @@ fn rewire_one_call_site(
                  the callers' discriminant switches read garbage"
             ));
         }
-        return Ok(false);
+        return Ok(SiteOutcome::TailForward);
     }
     let (b, r_b) =
         follow_single_exit(graph, a, r).map_err(|e| format!("{name}: call block exit: {e}"))?;
+    // Block B: `cf = Result::branch(r)`.  A block without the branch
+    // call is a custom-match consumer (hand-written `match` on the
+    // Result, possibly behind a multi-predecessor merge) — handled by
+    // the local catch-and-rewrap arm instead of the diamond rewire.
+    let branch_op_idx = graph.blocks[b].operations.iter().position(|op| {
+        matches!(
+            &op.kind,
+            OpKind::Call { target: CallTarget::Method { name, .. }, args, .. }
+                if name == "branch" && args.as_slice() == std::slice::from_ref(&r_b)
+        )
+    });
+    let Some(branch_op_idx) = branch_op_idx else {
+        catch_and_rewrap(graph, a, r)?;
+        return Ok(SiteOutcome::Rewrapped);
+    };
     assert_single_pred(graph, b, &name)?;
-    // Block B: `cf = Result::branch(r)`.
-    let branch_op_idx = graph.blocks[b]
-        .operations
-        .iter()
-        .position(|op| {
-            matches!(
-                &op.kind,
-                OpKind::Call { target: CallTarget::Method { name, .. }, args, .. }
-                    if name == "branch" && args.as_slice() == std::slice::from_ref(&r_b)
-            )
-        })
-        .ok_or_else(|| {
-            format!(
-                "{name}: block {b} after a scoped call does not start a \
-                 Try::branch diamond — non-`?` use of a scoped callee's \
-                 Result (custom match handlers are not supported yet)"
-            )
-        })?;
     let cf = graph.blocks[b].operations[branch_op_idx]
         .result
         .clone()
@@ -598,7 +630,202 @@ fn rewire_one_call_site(
     ];
     // Blocks B, C and the break arm are now unreachable; the dead-op
     // sweep leaves them to the reachability-walking consumers.
-    Ok(true)
+    Ok(SiteOutcome::Diamond)
+}
+
+/// Custom-match fallback: the call's `Result` is consumed by a
+/// hand-written `match` (eval.rs `eval_loop` dispatches `StepResult` +
+/// the error handler) — possibly behind a multi-predecessor merge
+/// shared with sibling shells (`eval_loop_jit`'s `match step_result`
+/// merges 7 predecessors).  Rewiring that destructuring in place would
+/// need per-predecessor jump threading, so instead the rewrite stays
+/// local to the call edge: the call block gets `LastException` exits
+/// whose two arms REBUILD the value-encoded `Result` the untouched
+/// downstream keeps consuming — the normal arm wraps the raw return in
+/// an `Ok` shell, the exception arm binds the caught `W_ExceptionObject`
+/// back into the `PyError` domain (`PyError::from_exc_object`, the
+/// inverse of the callee rule's `to_exc_object`) and wraps it in an
+/// `Err` shell.  This is the same erasure boundary the residual-call
+/// ABI implements at host calls (`Ok` → value, `Err` →
+/// `BH_LAST_EXC_VALUE`), value-encoded again one block later.  The
+/// rebuilt shells sit in the CALLER's graph next to the sibling shells
+/// the caller already builds for its own returns, so no new shell
+/// exposure is introduced on walked paths.
+fn catch_and_rewrap(graph: &mut FunctionGraph, a: usize, r: &Variable) -> Result<(), String> {
+    use crate::model::BlockId;
+    let name = graph.name.clone();
+    if graph.blocks[a].exitswitch.is_some() {
+        return Err(format!(
+            "{name}: rewrap call block {a} has an exitswitch — expected the \
+             single forwarding exit lower_call installs"
+        ));
+    }
+    let [orig] = graph.blocks[a].exits.as_slice() else {
+        return Err(format!(
+            "{name}: rewrap call block {a} must have a single exit"
+        ));
+    };
+    let orig = orig.clone();
+    if orig.exitcase.is_some() {
+        return Err(format!(
+            "{name}: rewrap call block {a} exit carries an exitcase"
+        ));
+    }
+    let is_r = |arg: &LinkArg| matches!(arg, LinkArg::Value(v) if v == r);
+    let has_r = orig.args.iter().any(|a| is_r(a));
+
+    // --- Normal arm N: receive every Value arg, rebuild `Ok(r)`.
+    let value_args: Vec<LinkArg> = orig
+        .args
+        .iter()
+        .filter(|a| matches!(a, LinkArg::Value(_)))
+        .cloned()
+        .collect();
+    let (n_id, n_inputs) = graph.create_block_with_arg_vars(value_args.len());
+    let n_shell: Option<Variable> = if has_r {
+        let r_value_idx = value_args
+            .iter()
+            .position(|a| is_r(a))
+            .expect("has_r implies a Value position");
+        let payload = n_inputs[r_value_idx].clone();
+        Some(build_shell(graph, n_id, "Ok", payload))
+    } else {
+        None
+    };
+    let mut vi = 0usize;
+    let n_exit_args: Vec<LinkArg> = orig
+        .args
+        .iter()
+        .map(|arg| match arg {
+            LinkArg::Const(c) => LinkArg::Const(c.clone()),
+            LinkArg::Value(_) => {
+                let v = n_inputs[vi].clone();
+                vi += 1;
+                if is_r(arg) {
+                    LinkArg::Value(n_shell.clone().expect("shell built when r flows"))
+                } else {
+                    LinkArg::Value(v)
+                }
+            }
+        })
+        .collect();
+    graph.set_control_flow_metadata(
+        n_id,
+        None,
+        vec![Link::new_mixed(n_exit_args, orig.target, None)],
+    );
+
+    // --- Exception arm E: receive the non-`r` Value args plus the
+    // caught `[exc_type, exc_value]` pair, rebuild `Err(from_exc_object
+    // (exc_value))`.
+    let nonr_args: Vec<LinkArg> = orig
+        .args
+        .iter()
+        .filter(|a| matches!(a, LinkArg::Value(_)) && !is_r(a))
+        .cloned()
+        .collect();
+    let (e_id, e_inputs) = graph.create_block_with_arg_vars(nonr_args.len() + 2);
+    let e_exc_value_in = e_inputs[nonr_args.len() + 1].clone();
+    let e_shell: Option<Variable> = if has_r {
+        let v_err = graph
+            .push_op_var(
+                e_id,
+                OpKind::Call {
+                    target: CallTarget::method("from_exc_object", Some("PyError".to_string())),
+                    args: vec![e_exc_value_in],
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .expect("from_exc_object must produce a value");
+        Some(build_shell(graph, e_id, "Err", v_err))
+    } else {
+        None
+    };
+    let mut ei = 0usize;
+    let e_exit_args: Vec<LinkArg> = orig
+        .args
+        .iter()
+        .map(|arg| match arg {
+            LinkArg::Const(c) => LinkArg::Const(c.clone()),
+            LinkArg::Value(_) if is_r(arg) => {
+                LinkArg::Value(e_shell.clone().expect("shell built when r flows"))
+            }
+            LinkArg::Value(_) => {
+                let v = e_inputs[ei].clone();
+                ei += 1;
+                LinkArg::Value(v)
+            }
+        })
+        .collect();
+    graph.set_control_flow_metadata(
+        e_id,
+        None,
+        vec![Link::new_mixed(e_exit_args, orig.target, None)],
+    );
+
+    // --- Rewire A: LastException exits — normal → N, exception → E.
+    let va = graph.alloc_value_var();
+    let vb = graph.alloc_value_var();
+    let a_to_e_args: Vec<LinkArg> = nonr_args
+        .into_iter()
+        .chain([LinkArg::Value(va.clone()), LinkArg::Value(vb.clone())])
+        .collect();
+    let mut exc_link = Link::new_mixed(a_to_e_args, e_id, Some(crate::model::exception_exitcase()));
+    exc_link.last_exception = Some(LinkArg::Value(va));
+    exc_link.last_exc_value = Some(LinkArg::Value(vb));
+    graph.set_control_flow_metadata(
+        BlockId(a),
+        Some(ExitSwitch::LastException),
+        vec![Link::new_mixed(value_args, n_id, None), exc_link],
+    );
+    Ok(())
+}
+
+/// Emit `shell = Result::<variant>(); shell.__pos_0 = payload` into
+/// `block`, mirroring the front lowering's Aggregate shape
+/// (`front/mir.rs` `Rvalue::Aggregate`: niladic transparent ctor + one
+/// FieldWrite per operand, `result: None` on the write).
+fn build_shell(
+    graph: &mut FunctionGraph,
+    block: crate::model::BlockId,
+    variant: &str,
+    payload: Variable,
+) -> Variable {
+    use crate::model::FieldDescriptor;
+    let owner = format!("core::result::Result::{variant}");
+    let shell = graph
+        .push_op_var(
+            block,
+            OpKind::Call {
+                target: CallTarget::synthetic_transparent_ctor_with_owner(
+                    ["core", "result", "Result"]
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect(),
+                    variant,
+                ),
+                args: Vec::new(),
+                result_ty: ValueType::Ref(Some(owner.clone())),
+            },
+            true,
+        )
+        .expect("Result ctor must produce a value");
+    graph.blocks[block.0]
+        .operations
+        .push(crate::model::SpaceOperation {
+            result: None,
+            kind: OpKind::FieldWrite {
+                base: shell.clone(),
+                field: FieldDescriptor {
+                    name: "__pos_0".to_string(),
+                    owner_root: Some(owner),
+                },
+                value: payload,
+                ty: ValueType::Ref(None),
+            },
+        });
+    shell
 }
 
 /// Probe: does `var` flow from `block`'s exit through pure positional

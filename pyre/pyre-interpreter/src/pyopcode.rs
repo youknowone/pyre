@@ -1669,11 +1669,12 @@ where
     let Instruction::JumpBackward { delta } = instruction else {
         unreachable!()
     };
-    executor.jump_backward(jump_target_backward(
+    let step = executor.jump_backward(jump_target_backward(
         &code.instructions,
         next_instr,
         delta.get(op_arg).as_usize(),
-    ))
+    ))?;
+    Ok(step)
 }
 
 pub fn execute_pop_jump_if_false<E: OpcodeStepExecutor>(
@@ -1908,7 +1909,8 @@ pub fn execute_return_value<E: OpcodeStepExecutor>(
 where
     E: ControlFlowOpcodeHandler,
 {
-    executor.return_value()
+    let step = executor.return_value()?;
+    Ok(step)
 }
 
 pub fn execute_return_generator<E: OpcodeStepExecutor>(
@@ -2845,7 +2847,8 @@ pub fn execute_unsupported<E: OpcodeStepExecutor>(
     executor: &mut E,
     instruction: Instruction,
 ) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError> {
-    executor.unsupported(&instruction)
+    let step = executor.unsupported(&instruction)?;
+    Ok(step)
 }
 
 pub fn execute_opcode_step<E: OpcodeStepExecutor>(

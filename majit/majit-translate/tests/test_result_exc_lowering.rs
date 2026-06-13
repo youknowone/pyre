@@ -75,3 +75,89 @@ fn pop_value_caller_gets_lastexception_exits() {
         "pop_value call sites get LastException exits"
     );
 }
+
+/// Count Result-shell ctors (`SyntheticTransparentCtor` with owner
+/// `core::result::Result`) in a lowered graph.
+fn count_result_ctors(graph: &majit_translate::model::FunctionGraph) -> usize {
+    graph
+        .blocks
+        .iter()
+        .flat_map(|b| b.operations.iter())
+        .filter(|op| {
+            matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::SyntheticTransparentCtor { owner_path, .. },
+                    ..
+                } if owner_path.last().map(String::as_str) == Some("Result")
+            )
+        })
+        .count()
+}
+
+#[test]
+fn execute_wrapper_family_lowers_to_raise_links() {
+    let llbc = Llbc::load(INTERP).expect("load pyre-interpreter.ullbc");
+    // The arm wrapper's `Ok(StepResult::Continue)` shell must be gone
+    // and the `?` on the scoped `store_fast_store_fast` method must be
+    // a LastException diamond.
+    let graph = lower_function(
+        &llbc,
+        "pyre_interpreter::pyopcode::execute_store_fast_store_fast",
+    )
+    .expect("lower wrapper");
+    assert_eq!(
+        count_result_ctors(&graph),
+        0,
+        "wrapper Result shells must be gone"
+    );
+    let lastexc_blocks = graph
+        .blocks
+        .iter()
+        .filter(|b| matches!(b.exitswitch, Some(ExitSwitch::LastException)))
+        .count();
+    assert!(lastexc_blocks >= 1, "wrapper `?` gets LastException exits");
+}
+
+#[test]
+fn eval_loop_custom_match_gets_catch_and_rewrap() {
+    let llbc = Llbc::load(INTERP).expect("load pyre-interpreter.ullbc");
+    let graph =
+        lower_function(&llbc, "pyre_interpreter::eval::eval_loop").expect("lower eval_loop");
+    // The execute_opcode_step call block must carry LastException exits.
+    let call_block = graph
+        .blocks
+        .iter()
+        .find(|b| {
+            b.operations.iter().any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                        if segments.last().map(String::as_str) == Some("execute_opcode_step")
+                )
+            })
+        })
+        .expect("eval_loop calls execute_opcode_step");
+    assert!(
+        matches!(call_block.exitswitch, Some(ExitSwitch::LastException)),
+        "custom-match call site gets catch-and-rewrap LastException exits"
+    );
+    // The exception arm re-binds the caught value into the PyError
+    // domain before rebuilding the Err shell.
+    let from_exc_calls = graph
+        .blocks
+        .iter()
+        .flat_map(|b| b.operations.iter())
+        .filter(|op| {
+            matches!(
+                &op.kind,
+                OpKind::Call { target: CallTarget::Method { name, .. }, .. }
+                    if name == "from_exc_object"
+            )
+        })
+        .count();
+    assert!(
+        from_exc_calls >= 1,
+        "rewrap exception arm binds PyError::from_exc_object(last_exc_value)"
+    );
+}
