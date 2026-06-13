@@ -1390,13 +1390,35 @@ pub fn format_value_dispatch(val: PyObjectRef, spec: &str) -> Result<Wtf8Buf, cr
     }
 }
 
+/// Read a format spec's stored string value. The spec must be a `str`
+/// (or subclass); its `__str__` is not consulted, so a raising override
+/// does not leak out of formatting.  `arg_desc` names the argument in
+/// the TypeError raised when the spec is not a `str`.
+pub(crate) fn read_format_spec(
+    spec_obj: PyObjectRef,
+    arg_desc: &str,
+) -> Result<String, crate::PyError> {
+    if unsafe { is_str(spec_obj) } {
+        return Ok(unsafe { w_str_get_value(spec_obj) }.to_string());
+    }
+    let tn = unsafe {
+        match crate::typedef::r#type(spec_obj) {
+            Some(tp) => w_type_get_name(tp).to_string(),
+            None => (*(*spec_obj).ob_type).name.to_string(),
+        }
+    };
+    Err(crate::PyError::type_error(format!(
+        "{arg_desc} must be str, not {tn}"
+    )))
+}
+
 /// `int/float/str/bool.__format__(self, format_spec)` — formats `self`
 /// through the shared spec parser without re-dispatching to an instance
 /// `__format__` (which `format_value_dispatch` would do for subclasses,
 /// risking recursion).  An empty spec collapses to `str(self)`.
 pub fn builtin_value_format(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let spec = if args.len() > 1 {
-        unsafe { crate::py_str(args[1])? }
+        read_format_spec(args[1], "__format__() argument")?
     } else {
         String::new()
     };

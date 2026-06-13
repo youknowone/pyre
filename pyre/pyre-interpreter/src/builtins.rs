@@ -5803,24 +5803,11 @@ fn builtin_complex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
 fn builtin_format(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(!args.is_empty(), "format() takes at least one argument");
     let value = args[0];
+    // `format_spec` must be a `str`; its stored value is used directly
+    // without invoking a `str` subclass `__str__` (bltinmodule.c
+    // `builtin_format_impl`).
     let spec = if args.len() > 1 {
-        let a = args[1];
-        // `format_spec` must be a `str`; its stored value is used
-        // directly without invoking a `str` subclass `__str__`
-        // (bltinmodule.c `builtin_format_impl`).
-        if unsafe { pyre_object::is_str(a) } {
-            unsafe { pyre_object::w_str_get_value(a).to_string() }
-        } else {
-            let tn = unsafe {
-                match crate::typedef::r#type(a) {
-                    Some(tp) => pyre_object::w_type_get_name(tp).to_string(),
-                    None => (*(*a).ob_type).name.to_string(),
-                }
-            };
-            return Err(crate::PyError::type_error(format!(
-                "format() argument 2 must be str, not {tn}"
-            )));
-        }
+        crate::type_methods::read_format_spec(args[1], "format() argument 2")?
     } else {
         String::new()
     };

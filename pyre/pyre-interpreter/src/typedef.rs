@@ -7519,7 +7519,8 @@ fn init_object_type(ns: &mut DictStorage) {
                     return Ok(pyre_object::w_str_new(""));
                 }
                 if args.len() > 1 {
-                    let spec = unsafe { crate::py_str(args[1])? };
+                    let spec =
+                        crate::type_methods::read_format_spec(args[1], "__format__() argument")?;
                     if !spec.is_empty() {
                         return Err(crate::PyError::type_error(
                             "unsupported format string passed to object.__format__",

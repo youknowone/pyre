@@ -67,5 +67,12 @@ print("complex-strsub", complex(StrSubRaisingStr("1")) == 1.0)
 print("format-strsub", format(12, StrSubRaisingStr("04d")), format(255, StrSubRaisingStr("x")))
 show("format-nonstr-spec", lambda: format(12, 34))
 
+# `type.__format__` (int/float/str/bool) and `object.__format__` read the
+# spec storage directly too.
+print("int-format-strsub", (12).__format__(StrSubRaisingStr("04d")))
+print("str-format-strsub", "hi".__format__(StrSubRaisingStr(">5")))
+print("object-format-strsub", object().__format__(StrSubRaisingStr("")) != "")
+show("int-format-nonstr", lambda: (12).__format__(34))
+
 # Normal formatting is unaffected.
 print("normal", repr([1, 2]), str({3: 4}), repr((1,)), ascii("x"))
