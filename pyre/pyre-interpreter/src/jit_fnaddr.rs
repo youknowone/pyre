@@ -1245,6 +1245,65 @@ mod tests {
         );
     }
 
+    /// These path spellings are what keep the `pop_value` / paired-local
+    /// / exception-TLS residual calls off the `symbolic_fnaddr_for_path`
+    /// fallback (which SEGVs at trace time); a typo in either the
+    /// module-qualified or root alias would silently regress to a
+    /// symbolic hash, so pin both spellings against the live fnaddr.
+    #[test]
+    fn jit_trace_fnaddrs_covers_pop_value_and_exception_tls_helpers() {
+        let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
+
+        let nlocals: fn(&crate::pyframe::PyFrame) -> usize = crate::pyframe::PyFrame::nlocals;
+        let nlocals = nlocals as *const () as usize as i64;
+        assert_eq!(
+            bindings["pyre_interpreter::pyframe::PyFrame::nlocals"],
+            nlocals
+        );
+        assert_eq!(bindings["pyre_interpreter::PyFrame::nlocals"], nlocals);
+
+        let get_exc: fn() -> pyre_object::PyObjectRef = crate::eval::get_current_exception;
+        let get_exc = get_exc as *const () as usize as i64;
+        assert_eq!(
+            bindings["pyre_interpreter::eval::get_current_exception"],
+            get_exc
+        );
+        assert_eq!(bindings["pyre_interpreter::get_current_exception"], get_exc);
+
+        let set_exc: fn(pyre_object::PyObjectRef) = crate::eval::set_current_exception;
+        let set_exc = set_exc as *const () as usize as i64;
+        assert_eq!(
+            bindings["pyre_interpreter::eval::set_current_exception"],
+            set_exc
+        );
+        assert_eq!(bindings["pyre_interpreter::set_current_exception"], set_exc);
+
+        let first: fn(
+            crate::bytecode::Arg<crate::bytecode::oparg::VarNums>,
+            crate::bytecode::OpArg,
+        ) -> usize = crate::pyopcode::var_nums_to_first_index;
+        let first = first as *const () as usize as i64;
+        assert_eq!(
+            bindings["pyre_interpreter::pyopcode::var_nums_to_first_index"],
+            first
+        );
+        assert_eq!(bindings["pyre_interpreter::var_nums_to_first_index"], first);
+
+        let second: fn(
+            crate::bytecode::Arg<crate::bytecode::oparg::VarNums>,
+            crate::bytecode::OpArg,
+        ) -> usize = crate::pyopcode::var_nums_to_second_index;
+        let second = second as *const () as usize as i64;
+        assert_eq!(
+            bindings["pyre_interpreter::pyopcode::var_nums_to_second_index"],
+            second
+        );
+        assert_eq!(
+            bindings["pyre_interpreter::var_nums_to_second_index"],
+            second
+        );
+    }
+
     /// Negative parity guard: pyre intentionally does NOT publish a
     /// host fnaddr for `_ll_2_str_eq_nonnull` (see the comment block
     /// at `jit_trace_fnaddrs` next to the `cast_float_to_uint`

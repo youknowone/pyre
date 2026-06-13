@@ -2188,9 +2188,12 @@ pub fn remove_assertion_errors(graph: &mut FunctionGraph) -> usize {
                 // Promote the survivor to an unconditional link —
                 // upstream's canraise arm (`simplify.py:333-335`) plus
                 // the `kill_assertion_link` normalisation for value
-                // switches (`removeassert.py:84-89`, see above).
+                // switches (`removeassert.py:84-89`, see above).  Clear
+                // the low-level case too so no branch metadata lingers on
+                // a now-unconditional edge, matching `fold_constant_exitswitch`.
                 block.exitswitch = None;
                 block.exits[0].exitcase = None;
+                block.exits[0].llexitcase = None;
             }
             removed += 1;
         }
