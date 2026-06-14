@@ -394,8 +394,7 @@ fn save_object(ctx: &mut PickleCtx, buf: &mut Framer, w_obj: PyObjectRef) -> Res
         return Ok(());
     }
     if unsafe { pyre_object::is_bool(w_obj) } {
-        save_bool(ctx, buf, w_obj)?;
-        return Ok(());
+        return save_bool(ctx, buf, w_obj);
     }
     if unsafe { pyre_object::is_int_or_long(w_obj) } {
         save_long(ctx, buf, w_obj)?;

@@ -1674,7 +1674,22 @@ where
         next_instr,
         delta.get(op_arg).as_usize(),
     ))?;
-    Ok(step)
+    // Rebuild the StepResult per variant so the Result-of-PyError
+    // lowering sees a concrete `Ok(StepResult::_)` shell to rewrite. A
+    // bare `Ok(step)` forward of the method's same-typed Result collapses
+    // in MIR, leaving this scoped wrapper with no rewritable return.
+    match step {
+        StepResult::Continue => Ok(StepResult::Continue),
+        StepResult::Return(value) => Ok(StepResult::Return(value)),
+        StepResult::CloseLoop {
+            jump_args,
+            loop_header_pc,
+        } => Ok(StepResult::CloseLoop {
+            jump_args,
+            loop_header_pc,
+        }),
+        StepResult::Yield(value) => Ok(StepResult::Yield(value)),
+    }
 }
 
 pub fn execute_pop_jump_if_false<E: OpcodeStepExecutor>(
@@ -1910,7 +1925,22 @@ where
     E: ControlFlowOpcodeHandler,
 {
     let step = executor.return_value()?;
-    Ok(step)
+    // Rebuild the StepResult per variant so the Result-of-PyError
+    // lowering sees a concrete `Ok(StepResult::_)` shell to rewrite. A
+    // bare `Ok(step)` forward of the method's same-typed Result collapses
+    // in MIR, leaving this scoped wrapper with no rewritable return.
+    match step {
+        StepResult::Continue => Ok(StepResult::Continue),
+        StepResult::Return(value) => Ok(StepResult::Return(value)),
+        StepResult::CloseLoop {
+            jump_args,
+            loop_header_pc,
+        } => Ok(StepResult::CloseLoop {
+            jump_args,
+            loop_header_pc,
+        }),
+        StepResult::Yield(value) => Ok(StepResult::Yield(value)),
+    }
 }
 
 pub fn execute_return_generator<E: OpcodeStepExecutor>(
@@ -2848,7 +2878,22 @@ pub fn execute_unsupported<E: OpcodeStepExecutor>(
     instruction: Instruction,
 ) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError> {
     let step = executor.unsupported(&instruction)?;
-    Ok(step)
+    // Rebuild the StepResult per variant so the Result-of-PyError
+    // lowering sees a concrete `Ok(StepResult::_)` shell to rewrite. A
+    // bare `Ok(step)` forward of the method's same-typed Result collapses
+    // in MIR, leaving this scoped wrapper with no rewritable return.
+    match step {
+        StepResult::Continue => Ok(StepResult::Continue),
+        StepResult::Return(value) => Ok(StepResult::Return(value)),
+        StepResult::CloseLoop {
+            jump_args,
+            loop_header_pc,
+        } => Ok(StepResult::CloseLoop {
+            jump_args,
+            loop_header_pc,
+        }),
+        StepResult::Yield(value) => Ok(StepResult::Yield(value)),
+    }
 }
 
 pub fn execute_opcode_step<E: OpcodeStepExecutor>(
