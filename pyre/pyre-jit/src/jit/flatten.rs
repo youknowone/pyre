@@ -3501,6 +3501,8 @@ fn compare_op_tag_for_opname(opname: &str) -> Option<i64> {
         "ne" => 5,
         "contains" => 6,
         "not_contains" => 7,
+        "is" => 8,
+        "is_not" => 9,
         _ => return None,
     })
 }
@@ -7714,6 +7716,10 @@ mod tests {
             ("ge", 3),
             ("eq", 4),
             ("ne", 5),
+            ("contains", 6),
+            ("not_contains", 7),
+            ("is", 8),
+            ("is_not", 9),
         ] {
             assert_eq!(
                 compare_op_tag_for_opname(opname),
@@ -7808,6 +7814,59 @@ mod tests {
                 match &args[3] {
                     Operand::Descr(_) => {}
                     other => panic!("expected Operand::Descr, got {other:?}"),
+                }
+            }
+            other => panic!("expected Insn::Op, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lower_compare_op_hlop_to_insn_emits_is_op_tag() {
+        // IS_OP routes through the same compare residual as COMPARE_OP;
+        // `is` lowers to op_val tag 8 (`is_not` → 9, bh_compare_fn).
+        let lhs = Variable::new(VariableId(0), Kind::Ref);
+        let rhs = Variable::new(VariableId(1), Kind::Ref);
+        let result = Variable::new(VariableId(2), Kind::Ref);
+        let op = SpaceOperation::new("is", vec![lhs.into(), rhs.into()], Some(result.into()), 11);
+        let ctx = LoweringContext {
+            binary_op_fn_idx: 0,
+            compare_op_fn_idx: 13,
+            truth_fn_idx: 0,
+            store_subscr_fn_idx: 0,
+            getattr_fn_idx: 0,
+            load_name_fn_idx: 0,
+            store_name_fn_idx: 0,
+            build_list_fn_idx: 0,
+            newtuple_from_array_fn_idx: 0,
+            call_fn_idx_by_nargs: [0; 9],
+            load_attr_fn_idx: 0,
+            load_method_self_fn_idx: 0,
+            store_attr_fn_idx: 0,
+            build_map_from_array_fn_idx: 0,
+            binary_slice_fn_idx: 0,
+            delete_subscr_fn_idx: 0,
+            delete_attr_fn_idx: 0,
+            build_set_from_array_fn_idx: 0,
+            build_string_from_array_fn_idx: 0,
+            format_simple_fn_idx: 0,
+            format_with_spec_fn_idx: 0,
+            convert_value_fn_idx: 0,
+        };
+        let mut get_register = identity_register_mapper();
+        let mut lower_constant = test_constant_lowering();
+
+        let insn = lower_compare_op_hlop_to_insn(&op, &ctx, &mut get_register, &mut lower_constant)
+            .expect("IS_OP HLOp must lower through the compare residual");
+
+        match insn {
+            Insn::Op { opname, args, .. } => {
+                assert_eq!(opname, "residual_call_ir_r");
+                match &args[1] {
+                    Operand::ListOfKind(list) => match &list.content[0] {
+                        Operand::ConstInt(v) => assert_eq!(*v, 8, "is → tag 8"),
+                        other => panic!("expected ConstInt(8) in ListI, got {other:?}"),
+                    },
+                    other => panic!("expected ListOfKind(Int, 1), got {other:?}"),
                 }
             }
             other => panic!("expected Insn::Op, got {other:?}"),

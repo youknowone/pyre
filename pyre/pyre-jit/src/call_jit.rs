@@ -3749,6 +3749,14 @@ pub extern "C" fn bh_compare_fn(lhs: i64, rhs: i64, op_code: i64) -> i64 {
         }
     }
 
+    // op_code 8 = IS_OP `is`, 9 = `is not` (from compare_op_tag).
+    // Pointer identity, infallible — never publishes BH_LAST_EXC_VALUE.
+    if op_code == 8 || op_code == 9 {
+        let same = std::ptr::eq(lhs, rhs);
+        let result = if op_code == 9 { !same } else { same };
+        return pyre_object::w_bool_from(result) as i64;
+    }
+
     // op_code is the compact tag from compare_op_tag (0-5), NOT the raw
     // ComparisonOperator discriminant. Reverse the mapping to get the enum.
     let Some(op) = pyre_interpreter::runtime_ops::compare_op_from_tag(op_code) else {

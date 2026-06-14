@@ -2902,6 +2902,28 @@ fn emit_frontend_contains(
     )
 }
 
+fn emit_frontend_is_op(
+    graph: &mut super::flow::FunctionGraph,
+    block: &super::flow::BlockRef,
+    lhs: super::flow::FlowValue,
+    rhs: super::flow::FlowValue,
+    invert: pyre_interpreter::bytecode::Invert,
+    offset: i64,
+) -> super::flow::Variable {
+    let opname = match invert {
+        pyre_interpreter::bytecode::Invert::No => "is",
+        pyre_interpreter::bytecode::Invert::Yes => "is_not",
+    };
+    emit_graph_op_with_result(
+        graph,
+        block,
+        opname,
+        vec![lhs.into(), rhs.into()],
+        Kind::Ref,
+        offset,
+    )
+}
+
 fn frontend_load_const_flow_value(code: &CodeObject, idx: usize) -> super::flow::FlowValue {
     // `flowcontext.py:841-843 LOAD_CONST`: fetch the pre-wrapped constant
     // and push that value.  Pyre's CodeObject stores RustPython
@@ -8013,13 +8035,24 @@ impl CodeWriter {
                         // codewriter's mergeblock/pendingblocks converge.
 
                         // IsOp: pops 2, pushes 1 bool. Net: -1.
-                        Instruction::IsOp { .. } => {
-                            for _ in 0..2 {
-                                pop_and_decr_depth(&mut current_state, &mut current_depth);
-                            }
-                            push_fresh_ref(&mut current_state, &mut graph);
-                            current_depth += 1;
-                            emit_abort_permanent!(py_pc);
+                        // Pointer identity routed through the compare residual
+                        // (`is` → tag 8, `is_not` → tag 9; bh_compare_fn).
+                        Instruction::IsOp { invert } => {
+                            let invert_kind = invert.get(op_arg);
+                            let _ = emit_popvalue_ref!(current_depth, py_pc);
+                            let rhs_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            let _ = emit_popvalue_ref!(current_depth, py_pc);
+                            let lhs_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            let result_value = emit_frontend_is_op(
+                                &mut graph,
+                                &current_block.block(),
+                                lhs_value,
+                                rhs_value,
+                                invert_kind,
+                                py_pc as i64,
+                            );
+                            pin!(Some(result_value), stack_base + current_depth);
+                            push_and_bump!(result_value.into(), py_pc);
                         }
 
                         // BuildTuple(count): pops count items, pushes 1 tuple. Net: -(count-1).
