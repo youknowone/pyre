@@ -1546,9 +1546,12 @@ impl<M: Clone> MetaInterp<M> {
             // compilation is paused for GC, mirroring RPython's in-place field
             // update of `ConstPtr.value`.
             let opref = unsafe { &mut *(slot_addr as *mut majit_ir::OpRef) };
-            if let Some(gcref) = opref.as_const_ptr_mut() {
-                visitor(gcref);
-            }
+            // Forward the snapshot slot's inline const gcref through the
+            // canonical BoxRef-Const walk, writing the updated ref back in
+            // place (mirroring an in-place ConstPtr.value field update).
+            let b = BoxRef::from_opref(*opref);
+            b.walk_const_ptr_refs(&mut visitor);
+            *opref = b.to_opref();
         }
     }
 

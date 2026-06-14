@@ -2077,9 +2077,14 @@ impl ExportedState {
     /// expose their actual mutable storage.
     pub fn walk_const_ptr_refs_mut(&mut self, visitor: &mut dyn FnMut(&mut GcRef)) {
         fn visit_opref(opref: &mut OpRef, visitor: &mut dyn FnMut(&mut GcRef)) {
-            if let Some(slot) = opref.as_const_ptr_mut() {
-                visitor(slot);
-            }
+            // Forward an inline const gcref through the canonical BoxRef-Const
+            // walk; a no-op for non-const positions (they carry no gcref).
+            // short_box_const_values keys are genuine const OpRefs; the other
+            // call sites (op.pos, exported_infos / short_boxes keys) are op
+            // result positions, where this resolves to nothing.
+            let b = BoxRef::from_opref(*opref);
+            b.walk_const_ptr_refs(visitor);
+            *opref = b.to_opref();
         }
 
         fn visit_boxrefs(boxes: &[BoxRef], visitor: &mut dyn FnMut(&mut GcRef)) {

@@ -575,19 +575,6 @@ impl OpRef {
         }
     }
 
-    /// Mutable view of the inline `GcRef` carried by `ConstPtr`;
-    /// `None` for any other variant. Used by minor-collection root
-    /// walkers (framework.py `root_walker.walk_roots`) to forward
-    /// nursery-resident Ref constants in-place. `ConstInt` ≡ `ConstPtr`
-    /// at the AbstractValue level (history.py:227/268/314) — only the
-    /// `ConstPtr.value` slot needs GC tracing because `ConstInt.value`
-    /// is a plain integer.
-    pub fn as_const_ptr_mut(&mut self) -> Option<&mut GcRef> {
-        match self {
-            Self::ConstPtr(v) => Some(v),
-            _ => None,
-        }
-    }
 }
 
 // `#[derive(PartialEq, Eq, Hash)]` on `OpRef` enforces RPython's

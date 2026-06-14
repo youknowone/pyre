@@ -482,9 +482,11 @@ impl PtrInfo {
     /// must walk the actual `OpRef` / `GcRef` slots explicitly.
     pub fn walk_const_ptr_refs_mut(&mut self, visitor: &mut dyn FnMut(&mut GcRef)) {
         fn visit_opref(opref: &mut OpRef, visitor: &mut dyn FnMut(&mut GcRef)) {
-            if let Some(slot) = opref.as_const_ptr_mut() {
-                visitor(slot);
-            }
+            // Forward an inline const gcref through the canonical BoxRef-Const
+            // walk; a no-op for the non-const virtual-field positions.
+            let b = BoxRef::from_opref(*opref);
+            b.walk_const_ptr_refs(visitor);
+            *opref = b.to_opref();
         }
 
         fn visit_field(entry: &mut FieldEntry, visitor: &mut dyn FnMut(&mut GcRef)) {
