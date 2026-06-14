@@ -30,6 +30,9 @@ struct PickleCtx {
     bin: bool,
     memo: HashMap<usize, usize>,
     memo_size: usize,
+    /// `persistent_id` callable resolved off the pickler (subclass override
+    /// or set attribute), or `PY_NULL` when not defined.
+    pers_func: PyObjectRef,
 }
 
 impl PickleCtx {
@@ -88,17 +91,27 @@ impl W_Pickler {
         let bin = self.bin;
         let framing = self.framing;
         let w_file = self.w_file;
+        // A `persistent_id` defined on a subclass (or set as an attribute)
+        // overrides the default no-op; the base class has none.
+        let self_ptr = self as *mut W_Pickler as PyObjectRef;
+        let pers_func = crate::baseobjspace::findattr(self_ptr, "persistent_id")
+            .filter(|&f| !unsafe { pyre_object::is_none(f) })
+            .unwrap_or(pyre_object::PY_NULL);
 
         let _roots = pyre_object::gc_roots::push_roots();
         pyre_object::gc_roots::pin_root(w_file);
         let file_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         pyre_object::gc_roots::pin_root(w_obj);
+        if !pers_func.is_null() {
+            pyre_object::gc_roots::pin_root(pers_func);
+        }
 
         let mut ctx = PickleCtx {
             proto,
             bin,
             memo: HashMap::new(),
             memo_size: 0,
+            pers_func,
         };
         let mut body: Vec<u8> = Vec::new();
         save(&mut ctx, &mut body, w_obj)?;
@@ -123,12 +136,52 @@ impl W_Pickler {
     }
 }
 
-/// `interp_pickle.py W_Pickler.save`. Exact-type dispatch via the `is_*`
-/// predicates (bool is checked before int because a bool is not an int
-/// here, and `is_int_or_long` also covers big integers). Atoms are never
-/// memoized; everything else is checked against the identity memo for a
-/// GET back-reference before being saved.
+/// `interp_pickle.py W_Pickler.save` with the persistent-id hook: every
+/// object is first offered to `persistent_id`; a non-None result is saved
+/// as a persistent reference instead of by value.
 fn save(ctx: &mut PickleCtx, buf: &mut Vec<u8>, w_obj: PyObjectRef) -> Result<(), PyError> {
+    if !ctx.pers_func.is_null() {
+        let w_pid = call_fn(ctx.pers_func, &[w_obj])?;
+        if !unsafe { pyre_object::is_none(w_pid) } {
+            return save_pers(ctx, buf, w_pid);
+        }
+    }
+    save_object(ctx, buf, w_obj)
+}
+
+/// `interp_pickle.py save_pers` — emit a persistent reference. The
+/// persistent id itself is saved by value (skipping the persistent-id
+/// hook) in binary protocols, or as an ASCII line in protocol 0.
+fn save_pers(ctx: &mut PickleCtx, buf: &mut Vec<u8>, w_pid: PyObjectRef) -> Result<(), PyError> {
+    if ctx.bin {
+        save_object(ctx, buf, w_pid)?;
+        buf.push(op::BINPERSID);
+        return Ok(());
+    }
+    let w_str = if unsafe { pyre_object::is_str(w_pid) } {
+        w_pid
+    } else {
+        let str_fn = crate::module::_pickle::lookup_builtin("str")
+            .ok_or_else(|| pickling_error("str builtin unavailable"))?;
+        call_fn(str_fn, &[w_pid])?
+    };
+    let s = unsafe { pyre_object::strobject::w_str_get_value(w_str) };
+    if !s.is_ascii() {
+        return Err(pickling_error(
+            "persistent IDs in protocol 0 must be ASCII strings",
+        ));
+    }
+    buf.push(op::PERSID);
+    buf.extend_from_slice(s.as_bytes());
+    buf.push(b'\n');
+    Ok(())
+}
+
+/// Exact-type dispatch via the `is_*` predicates (bool is checked before
+/// int because a bool is not an int here, and `is_int_or_long` also covers
+/// big integers). Atoms are never memoized; everything else is checked
+/// against the identity memo for a GET back-reference before being saved.
+fn save_object(ctx: &mut PickleCtx, buf: &mut Vec<u8>, w_obj: PyObjectRef) -> Result<(), PyError> {
     // Atoms — never memoized.
     if unsafe { pyre_object::is_none(w_obj) } {
         buf.push(op::NONE);
@@ -157,8 +210,7 @@ fn save(ctx: &mut PickleCtx, buf: &mut Vec<u8>, w_obj: PyObjectRef) -> Result<()
         return save_bytes(ctx, buf, w_obj);
     }
     if unsafe { pyre_object::is_str(w_obj) } {
-        save_str(ctx, buf, w_obj);
-        return Ok(());
+        return save_str(ctx, buf, w_obj);
     }
     if unsafe { pyre_object::is_dict(w_obj) } {
         return save_dict(ctx, buf, w_obj);
@@ -209,9 +261,7 @@ fn save(ctx: &mut PickleCtx, buf: &mut Vec<u8>, w_obj: PyObjectRef) -> Result<()
             .collect();
         return save_reduce(ctx, buf, &rv, Some(w_obj));
     }
-    Err(pickling_error(
-        "__reduce__ must return string or tuple",
-    ))
+    Err(pickling_error("__reduce__ must return string or tuple"))
 }
 
 fn save_bool(ctx: &PickleCtx, buf: &mut Vec<u8>, w_obj: PyObjectRef) {
@@ -225,37 +275,49 @@ fn save_bool(ctx: &PickleCtx, buf: &mut Vec<u8>, w_obj: PyObjectRef) {
 }
 
 fn save_long(ctx: &PickleCtx, buf: &mut Vec<u8>, w_obj: PyObjectRef) -> Result<(), PyError> {
-    match crate::baseobjspace::int_w(w_obj) {
-        Ok(v) => {
-            if ctx.bin {
-                if v >= 0 {
-                    if v <= 0xff {
-                        buf.push(op::BININT1);
-                        buf.push(v as u8);
-                        return Ok(());
-                    }
-                    if v <= 0xffff {
-                        buf.push(op::BININT2);
-                        buf.extend_from_slice(&(v as u16).to_le_bytes());
-                        return Ok(());
-                    }
+    let small = crate::baseobjspace::int_w(w_obj).ok();
+    let to_big = |v: Option<i64>| match v {
+        Some(v) => BigInt::from(v),
+        None => unsafe { crate::builtins::obj_to_bigint(w_obj) },
+    };
+    if ctx.bin {
+        if let Some(v) = small {
+            if v >= 0 {
+                if v <= 0xff {
+                    buf.push(op::BININT1);
+                    buf.push(v as u8);
+                    return Ok(());
                 }
-                if (-0x8000_0000..=0x7fff_ffff).contains(&v) {
-                    buf.push(op::BININT);
-                    buf.extend_from_slice(&(v as i32).to_le_bytes());
+                if v <= 0xffff {
+                    buf.push(op::BININT2);
+                    buf.extend_from_slice(&(v as u16).to_le_bytes());
                     return Ok(());
                 }
             }
-            write_long(buf, &encode_long(&BigInt::from(v)));
-            Ok(())
-        }
-        Err(_) => {
-            // Beyond i64 — a true big integer.
-            let big = unsafe { crate::builtins::obj_to_bigint(w_obj) };
-            write_long(buf, &encode_long(&big));
-            Ok(())
+            if (-0x8000_0000..=0x7fff_ffff).contains(&v) {
+                buf.push(op::BININT);
+                buf.extend_from_slice(&(v as i32).to_le_bytes());
+                return Ok(());
+            }
         }
     }
+    if ctx.proto >= 2 {
+        write_long(buf, &encode_long(&to_big(small)));
+        return Ok(());
+    }
+    // protocol 0 / 1 text: INT for a signed 4-byte value, else LONG.
+    if let Some(v) = small {
+        if (-0x8000_0000..=0x7fff_ffff).contains(&v) {
+            buf.push(op::INT);
+            buf.extend_from_slice(v.to_string().as_bytes());
+            buf.push(b'\n');
+            return Ok(());
+        }
+    }
+    buf.push(op::LONG);
+    buf.extend_from_slice(to_big(small).to_string().as_bytes());
+    buf.extend_from_slice(b"L\n");
+    Ok(())
 }
 
 fn write_long(buf: &mut Vec<u8>, enc: &[u8]) {
@@ -270,11 +332,19 @@ fn write_long(buf: &mut Vec<u8>, enc: &[u8]) {
     buf.extend_from_slice(enc);
 }
 
-fn save_float(_ctx: &PickleCtx, buf: &mut Vec<u8>, w_obj: PyObjectRef) -> Result<(), PyError> {
-    let f = crate::baseobjspace::float_w(w_obj)?;
-    // BINFLOAT — 8-byte big-endian IEEE 754.
-    buf.push(op::BINFLOAT);
-    buf.extend_from_slice(&f.to_be_bytes());
+fn save_float(ctx: &PickleCtx, buf: &mut Vec<u8>, w_obj: PyObjectRef) -> Result<(), PyError> {
+    if ctx.bin {
+        let f = crate::baseobjspace::float_w(w_obj)?;
+        // BINFLOAT — 8-byte big-endian IEEE 754.
+        buf.push(op::BINFLOAT);
+        buf.extend_from_slice(&f.to_be_bytes());
+    } else {
+        // proto 0: FLOAT + repr(obj) + '\n' (shortest round-trip text).
+        let f = crate::baseobjspace::float_w(w_obj)?;
+        buf.push(op::FLOAT);
+        buf.extend_from_slice(crate::display::format_float_repr(f).as_bytes());
+        buf.push(b'\n');
+    }
     Ok(())
 }
 
@@ -314,22 +384,52 @@ fn save_bytes(ctx: &mut PickleCtx, buf: &mut Vec<u8>, w_obj: PyObjectRef) -> Res
     Ok(())
 }
 
-fn save_str(ctx: &mut PickleCtx, buf: &mut Vec<u8>, w_obj: PyObjectRef) {
-    let s = unsafe { pyre_object::strobject::w_str_get_value(w_obj) };
-    let data = s.as_bytes();
-    let n = data.len();
-    if n <= 0xff && ctx.proto >= 4 {
-        buf.push(op::SHORT_BINUNICODE);
-        buf.push(n as u8);
-    } else if n > 0xffff_ffff && ctx.proto >= 4 {
-        buf.push(op::BINUNICODE8);
-        buf.extend_from_slice(&(n as u64).to_le_bytes());
+fn save_str(ctx: &mut PickleCtx, buf: &mut Vec<u8>, w_obj: PyObjectRef) -> Result<(), PyError> {
+    if ctx.bin {
+        let s = unsafe { pyre_object::strobject::w_str_get_value(w_obj) };
+        let data = s.as_bytes();
+        let n = data.len();
+        if n <= 0xff && ctx.proto >= 4 {
+            buf.push(op::SHORT_BINUNICODE);
+            buf.push(n as u8);
+        } else if n > 0xffff_ffff && ctx.proto >= 4 {
+            buf.push(op::BINUNICODE8);
+            buf.extend_from_slice(&(n as u64).to_le_bytes());
+        } else {
+            buf.push(op::BINUNICODE);
+            buf.extend_from_slice(&(n as u32).to_le_bytes());
+        }
+        buf.extend_from_slice(data);
     } else {
-        buf.push(op::BINUNICODE);
-        buf.extend_from_slice(&(n as u32).to_le_bytes());
+        // proto 0: UNICODE + raw-unicode-escape. The codec leaves
+        // backslash / NUL / newline / CR / EOF-on-DOS literal, so escape
+        // those first; the load side reverses with raw-unicode-escape.
+        let mut w_tmp = w_obj;
+        for (from, to) in [
+            ("\\", "\\u005c"),
+            ("\0", "\\u0000"),
+            ("\n", "\\u000a"),
+            ("\r", "\\u000d"),
+            ("\u{1a}", "\\u001a"),
+        ] {
+            w_tmp = call_meth(
+                w_tmp,
+                "replace",
+                &[pyre_object::w_str_new(from), pyre_object::w_str_new(to)],
+            )?;
+        }
+        let w_enc = call_meth(
+            w_tmp,
+            "encode",
+            &[pyre_object::w_str_new("raw-unicode-escape")],
+        )?;
+        let data = unsafe { pyre_object::bytesobject::w_bytes_data(w_enc) };
+        buf.push(op::UNICODE);
+        buf.extend_from_slice(data);
+        buf.push(b'\n');
     }
-    buf.extend_from_slice(data);
     memoize(ctx, buf, w_obj);
+    Ok(())
 }
 
 /// `interp_pickle.py save_tuple`.
@@ -528,6 +628,14 @@ fn batch_appends(
     buf: &mut Vec<u8>,
     items: &[PyObjectRef],
 ) -> Result<(), PyError> {
+    if !ctx.bin {
+        // proto 0 — no APPENDS, one APPEND per item.
+        for &item in items {
+            save(ctx, buf, item)?;
+            buf.push(op::APPEND);
+        }
+        return Ok(());
+    }
     let n = items.len();
     let mut i = 0;
     while i < n {
@@ -556,6 +664,15 @@ fn batch_setitems(
     buf: &mut Vec<u8>,
     items: &[(PyObjectRef, PyObjectRef)],
 ) -> Result<(), PyError> {
+    if !ctx.bin {
+        // proto 0 — no SETITEMS, one SETITEM per pair.
+        for &(k, v) in items {
+            save(ctx, buf, k)?;
+            save(ctx, buf, v)?;
+            buf.push(op::SETITEM);
+        }
+        return Ok(());
+    }
     let n = items.len();
     let mut i = 0;
     while i < n {
@@ -631,8 +748,10 @@ fn whichmodule(w_obj: PyObjectRef, name: &str) -> Result<PyObjectRef, PyError> {
     }
     let modules = crate::importing::sys_modules_dict();
     if !modules.is_null() {
-        for (w_modname, w_module) in unsafe { pyre_object::dictmultiobject::w_dict_items(modules) } {
-            if !unsafe { pyre_object::is_str(w_modname) } || unsafe { pyre_object::is_none(w_module) }
+        for (w_modname, w_module) in unsafe { pyre_object::dictmultiobject::w_dict_items(modules) }
+        {
+            if !unsafe { pyre_object::is_str(w_modname) }
+                || unsafe { pyre_object::is_none(w_module) }
             {
                 continue;
             }
@@ -692,6 +811,13 @@ fn save_global(
             pyre_object::tupleobject::w_tuple_new(vec![parent, pyre_object::w_str_new(lastname)]);
         save_reduce(ctx, buf, &[w_getattr, w_args], None)?;
     } else {
+        // protocol < 3 applies the py3 → py2 `_compat_pickle` reverse map
+        // (fix_imports); protocol 3 writes the name verbatim.
+        let (module_name, name) = if ctx.proto < 3 {
+            crate::module::_pickle::compat_map(&module_name, &name, true)
+        } else {
+            (module_name, name)
+        };
         buf.push(op::GLOBAL);
         buf.extend_from_slice(module_name.as_bytes());
         buf.push(b'\n');
@@ -720,7 +846,11 @@ fn save_reduce(
 ) -> Result<(), PyError> {
     let w_func = rv[0];
     let w_args = rv[1];
-    let nonnull = |i: usize| rv.get(i).copied().filter(|&x| !unsafe { pyre_object::is_none(x) });
+    let nonnull = |i: usize| {
+        rv.get(i)
+            .copied()
+            .filter(|&x| !unsafe { pyre_object::is_none(x) })
+    };
     let w_state = nonnull(2);
     let w_listitems = nonnull(3);
     let w_dictitems = nonnull(4);
@@ -742,7 +872,9 @@ fn save_reduce(
         }
         let (w_cls, w_a, w_kw) = (args_w[0], args_w[1], args_w[2]);
         if crate::baseobjspace::findattr(w_cls, "__new__").is_none() {
-            return Err(pickling_error("args[0] from __newobj_ex__ args has no __new__"));
+            return Err(pickling_error(
+                "args[0] from __newobj_ex__ args has no __new__",
+            ));
         }
         if ctx.proto >= 4 {
             save(ctx, buf, w_cls)?;
@@ -770,7 +902,9 @@ fn save_reduce(
         }
         let w_cls = args_w[0];
         if crate::baseobjspace::findattr(w_cls, "__new__").is_none() {
-            return Err(pickling_error("args[0] from __newobj__ args has no __new__"));
+            return Err(pickling_error(
+                "args[0] from __newobj__ args has no __new__",
+            ));
         }
         let w_newargs = pyre_object::tupleobject::w_tuple_new(args_w[1..].to_vec());
         save(ctx, buf, w_cls)?;

@@ -6,7 +6,7 @@ use crate::PyError;
 
 use super::{
     HIGHEST_PROTOCOL, call_fn, call_meth, decode_long, getattribute_dotted, import_module, op,
-    read_int_le, str_from_utf8, unpickling_error,
+    parse_int_text, read_int_le, str_from_utf8, unpickling_error,
 };
 
 #[crate::pyre_class("_pickle.Unpickler")]
@@ -264,6 +264,42 @@ fn dispatch(slot: usize, opcode: u8) -> Result<(), PyError> {
             let f = f64::from_be_bytes([d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7]]);
             push(slot, pyre_object::w_float_new(f));
         }
+        x if x == op::INT => {
+            let s = read_line(slot)?;
+            let w = match s.as_str() {
+                "00" => pyre_object::w_bool_from(false),
+                "01" => pyre_object::w_bool_from(true),
+                _ => parse_int_text(&s)?,
+            };
+            push(slot, w);
+        }
+        x if x == op::LONG => {
+            let mut s = read_line(slot)?;
+            // strip the Python 2 'L' suffix, if present.
+            if s.ends_with('L') {
+                s.pop();
+            }
+            push(slot, parse_int_text(&s)?);
+        }
+        x if x == op::FLOAT => {
+            let s = read_line(slot)?;
+            let f = s
+                .trim()
+                .parse::<f64>()
+                .map_err(|_| PyError::value_error("could not convert string to float"))?;
+            push(slot, pyre_object::w_float_new(f));
+        }
+        x if x == op::UNICODE => {
+            // raw-unicode-escape over the line's raw bytes.
+            let data = read_line_bytes(slot)?;
+            let w_bytes = pyre_object::w_bytes_from_bytes(&data);
+            let w_uni = call_meth(
+                w_bytes,
+                "decode",
+                &[pyre_object::w_str_new("raw-unicode-escape")],
+            )?;
+            push(slot, w_uni);
+        }
         x if x == op::SHORT_BINUNICODE => {
             let n = read(slot, 1)?[0] as usize;
             let d = read(slot, n)?;
@@ -390,7 +426,10 @@ fn dispatch(slot: usize, opcode: u8) -> Result<(), PyError> {
             let nb = read(slot, 8)?;
             let n = read_int_le(&nb) as usize;
             let d = read(slot, n)?;
-            push(slot, pyre_object::bytearrayobject::w_bytearray_from_bytes(&d));
+            push(
+                slot,
+                pyre_object::bytearrayobject::w_bytearray_from_bytes(&d),
+            );
         }
         // ── global / reduce / build ───────────────────────────────────
         x if x == op::GLOBAL => {
@@ -402,7 +441,8 @@ fn dispatch(slot: usize, opcode: u8) -> Result<(), PyError> {
         x if x == op::STACK_GLOBAL => {
             let w_name = pop(slot)?;
             let w_module = pop(slot)?;
-            if !unsafe { pyre_object::is_str(w_name) } || !unsafe { pyre_object::is_str(w_module) } {
+            if !unsafe { pyre_object::is_str(w_name) } || !unsafe { pyre_object::is_str(w_module) }
+            {
                 return Err(unpickling_error("STACK_GLOBAL requires str"));
             }
             let name = unsafe { pyre_object::strobject::w_str_get_value(w_name) }.to_string();
@@ -429,9 +469,7 @@ fn dispatch(slot: usize, opcode: u8) -> Result<(), PyError> {
             let w_cls = pop(slot)?;
             let kw_len = unsafe { pyre_object::dictmultiobject::w_dict_items(w_kwargs) }.len();
             if kw_len > 0 {
-                return Err(PyError::not_implemented(
-                    "_pickle: NEWOBJ_EX with kwargs",
-                ));
+                return Err(PyError::not_implemented("_pickle: NEWOBJ_EX with kwargs"));
             }
             let w_obj = new_instance(w_cls, &tuple_items(w_args))?;
             push(slot, w_obj);
@@ -479,6 +517,45 @@ fn dispatch(slot: usize, opcode: u8) -> Result<(), PyError> {
             let d = read(slot, 4)?;
             let i = u32::from_le_bytes([d[0], d[1], d[2], d[3]]) as i64;
             let v = memo_get(slot, i)?;
+            push(slot, v);
+        }
+        x if x == op::PERSID => {
+            let pid = read_line_bytes(slot)?;
+            if !pid.is_ascii() {
+                return Err(unpickling_error(
+                    "persistent IDs in protocol 0 must be ASCII strings",
+                ));
+            }
+            let w_pid = str_from_utf8(&pid)?;
+            let v = persistent_load(slot, w_pid)?;
+            push(slot, v);
+        }
+        x if x == op::BINPERSID => {
+            let w_pid = pop(slot)?;
+            let v = persistent_load(slot, w_pid)?;
+            push(slot, v);
+        }
+        x if x == op::INST => {
+            let module = read_line(slot)?;
+            let name = read_line(slot)?;
+            let w_cls = find_class(&module, &name, cur(slot).proto)?;
+            let w_args = pop_mark(slot)?;
+            let v = instantiate(w_cls, w_args)?;
+            push(slot, v);
+        }
+        x if x == op::OBJ => {
+            let args = pop_mark(slot)?;
+            let n = unsafe { pyre_object::listobject::w_list_len(args) };
+            if n == 0 {
+                return Err(unpickling_error("OBJ opcode with empty stack"));
+            }
+            let w_cls = unsafe { pyre_object::listobject::w_list_getitem(args, 0).unwrap() };
+            let rest: Vec<PyObjectRef> = (1..n)
+                .map(|i| unsafe {
+                    pyre_object::listobject::w_list_getitem(args, i as i64).unwrap()
+                })
+                .collect();
+            let v = instantiate(w_cls, pyre_object::listobject::w_list_new(rest))?;
             push(slot, v);
         }
         _ => {
@@ -532,7 +609,7 @@ fn dict_update_from_pairs(w_dict: PyObjectRef, items: PyObjectRef) -> Result<(),
 }
 
 /// Read a newline-terminated line (without the trailing newline).
-fn read_line(slot: usize) -> Result<String, PyError> {
+fn read_line_bytes(slot: usize) -> Result<Vec<u8>, PyError> {
     let mut bytes: Vec<u8> = Vec::new();
     loop {
         let b = read1(slot)?;
@@ -541,6 +618,11 @@ fn read_line(slot: usize) -> Result<String, PyError> {
         }
         bytes.push(b);
     }
+    Ok(bytes)
+}
+
+fn read_line(slot: usize) -> Result<String, PyError> {
+    let bytes = read_line_bytes(slot)?;
     String::from_utf8(bytes).map_err(|_| unpickling_error("invalid utf-8 in pickle line"))
 }
 
@@ -559,7 +641,16 @@ fn read_line_int(slot: usize) -> Result<i64, PyError> {
 /// builtins installed on the underlying storage. Other non-dotted names
 /// resolve through the module's `__dict__` (dict subscript), and dotted
 /// (protocol >= 4 nested) names fall back to the attribute walk.
-fn find_class(module_name: &str, name: &str, _proto: i64) -> Result<PyObjectRef, PyError> {
+fn find_class(module_name: &str, name: &str, proto: i64) -> Result<PyObjectRef, PyError> {
+    // protocol < 3 applies the py2 → py3 `_compat_pickle` forward map
+    // (fix_imports) before resolution.
+    let (module_name, name) = if proto < 3 {
+        crate::module::_pickle::compat_map(module_name, name, false)
+    } else {
+        (module_name.to_string(), name.to_string())
+    };
+    let module_name = module_name.as_str();
+    let name = name.as_str();
     if module_name == "builtins" && !name.contains('.') {
         if let Some(obj) = crate::module::_pickle::lookup_builtin(name) {
             return Ok(obj);
@@ -571,6 +662,32 @@ fn find_class(module_name: &str, name: &str, _proto: i64) -> Result<PyObjectRef,
     }
     let w_dict = crate::baseobjspace::getattr_str(module, "__dict__")?;
     crate::baseobjspace::getitem(w_dict, pyre_object::w_str_new(name))
+}
+
+/// Resolve and invoke `self.persistent_load(pid)` (PERSID / BINPERSID).
+fn persistent_load(slot: usize, w_pid: PyObjectRef) -> Result<PyObjectRef, PyError> {
+    let self_obj = pyre_object::gc_roots::shadow_stack_get(slot);
+    match crate::baseobjspace::findattr(self_obj, "persistent_load") {
+        Some(f) if !unsafe { pyre_object::is_none(f) } => call_fn(f, &[w_pid]),
+        _ => Err(unpickling_error("unsupported persistent id encountered")),
+    }
+}
+
+/// `_instantiate` — build an old-style INST / OBJ instance. With args, or a
+/// non-type class, or a `__getinitargs__`, call the class; otherwise build
+/// via `__new__` without invoking `__init__`.
+fn instantiate(w_cls: PyObjectRef, w_args: PyObjectRef) -> Result<PyObjectRef, PyError> {
+    let n = unsafe { pyre_object::listobject::w_list_len(w_args) };
+    let has_getinitargs = crate::baseobjspace::findattr(w_cls, "__getinitargs__").is_some();
+    let is_type = unsafe { pyre_object::typeobject::is_type(w_cls) };
+    if n > 0 || !is_type || has_getinitargs {
+        let args: Vec<PyObjectRef> = (0..n)
+            .map(|i| unsafe { pyre_object::listobject::w_list_getitem(w_args, i as i64).unwrap() })
+            .collect();
+        call_fn(w_cls, &args)
+    } else {
+        new_instance(w_cls, &[])
+    }
 }
 
 /// `cls.__new__(cls, *args)`.

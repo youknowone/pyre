@@ -92,6 +92,20 @@ pub(crate) mod op {
     pub const EXT1: u8 = 0x82;
     pub const EXT2: u8 = 0x83;
     pub const EXT4: u8 = 0x84;
+    // protocol 0 / 1 legacy text opcodes
+    pub const INT: u8 = b'I';
+    pub const LONG: u8 = b'L';
+    pub const FLOAT: u8 = b'F';
+    pub const STRING: u8 = b'S';
+    pub const UNICODE: u8 = b'V';
+    pub const BINSTRING: u8 = b'T';
+    pub const SHORT_BINSTRING: u8 = b'U';
+    pub const INST: u8 = b'i';
+    pub const OBJ: u8 = b'o';
+    pub const DUP: u8 = b'2';
+    // persistent id
+    pub const PERSID: u8 = b'P';
+    pub const BINPERSID: u8 = b'Q';
 
     /// `_tuplesize2code` — TUPLE1/2/3 indexed by element count (1..=3).
     pub const TUPLESIZE2CODE: [u8; 4] = [EMPTY_TUPLE, TUPLE1, TUPLE2, TUPLE3];
@@ -107,8 +121,9 @@ pub(crate) const BATCHSIZE: usize = 1000;
 pub(crate) fn call_fn(callable: PyObjectRef, args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     let r = crate::baseobjspace::call_function(callable, args);
     if r.is_null() {
-        return Err(crate::call::take_call_error()
-            .unwrap_or_else(|| PyError::runtime_error("call failed")));
+        return Err(
+            crate::call::take_call_error().unwrap_or_else(|| PyError::runtime_error("call failed"))
+        );
     }
     Ok(r)
 }
@@ -191,6 +206,50 @@ pub(crate) fn lookup_builtin(name: &str) -> Option<PyObjectRef> {
     current_ec().and_then(|ec| unsafe { (*ec).lookup_builtin(name) })
 }
 
+/// `_compat_pickle` import/name compatibility mapping applied at protocol
+/// < 3. `reverse` picks the py3 → py2 direction used when dumping (the
+/// REVERSE_* tables); the forward direction (py2 → py3) is used when
+/// loading. Returns the mapped `(module, name)`, unchanged when no entry
+/// matches.
+pub(crate) fn compat_map(module: &str, name: &str, reverse: bool) -> (String, String) {
+    let (name_map_attr, import_map_attr) = if reverse {
+        ("REVERSE_NAME_MAPPING", "REVERSE_IMPORT_MAPPING")
+    } else {
+        ("NAME_MAPPING", "IMPORT_MAPPING")
+    };
+    let compat = match import_module("_compat_pickle") {
+        Ok(m) => m,
+        Err(_) => return (module.to_string(), name.to_string()),
+    };
+    // (module, name) entry takes precedence over a bare module remap.
+    if let Ok(w_name_map) = crate::baseobjspace::getattr_str(compat, name_map_attr) {
+        let key = pyre_object::tupleobject::w_tuple_new(vec![
+            pyre_object::w_str_new(module),
+            pyre_object::w_str_new(name),
+        ]);
+        if let Some(v) = unsafe { pyre_object::w_dict_lookup(w_name_map, key) } {
+            let m = unsafe { pyre_object::tupleobject::w_tuple_getitem(v, 0) };
+            let n = unsafe { pyre_object::tupleobject::w_tuple_getitem(v, 1) };
+            if let (Some(m), Some(n)) = (m, n) {
+                return (
+                    unsafe { pyre_object::strobject::w_str_get_value(m) }.to_string(),
+                    unsafe { pyre_object::strobject::w_str_get_value(n) }.to_string(),
+                );
+            }
+        }
+    }
+    if let Ok(w_import_map) = crate::baseobjspace::getattr_str(compat, import_map_attr) {
+        if let Some(v) = unsafe { pyre_object::w_dict_lookup(w_import_map, pyre_object::w_str_new(module)) }
+        {
+            return (
+                unsafe { pyre_object::strobject::w_str_get_value(v) }.to_string(),
+                name.to_string(),
+            );
+        }
+    }
+    (module.to_string(), name.to_string())
+}
+
 /// `interp_pickle.py _getattribute` — walk a dotted `qualname` from `obj`,
 /// returning `(resolved, parent)`.
 pub(crate) fn getattribute_dotted(
@@ -271,6 +330,14 @@ pub(crate) fn int_from_bigint(value: BigInt) -> PyObjectRef {
     match i64::try_from(&value) {
         Ok(v) => pyre_object::w_int_new(v),
         Err(_) => pyre_object::w_long_new(value),
+    }
+}
+
+/// Parse a decimal integer literal (INT / LONG text opcodes) into an int.
+pub(crate) fn parse_int_text(s: &str) -> Result<PyObjectRef, PyError> {
+    match BigInt::parse_bytes(s.trim().as_bytes(), 10) {
+        Some(big) => Ok(int_from_bigint(big)),
+        None => Err(unpickling_error("could not convert string to int")),
     }
 }
 
