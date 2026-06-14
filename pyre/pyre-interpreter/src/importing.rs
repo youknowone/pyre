@@ -353,19 +353,47 @@ pub fn init_sys_path(script_dir: &Path) {
     });
 }
 
-/// Detect CPython stdlib path via `python3 -c "import sysconfig; ..."`.
+/// Locate the vendored stdlib (`lib-python/3`) by walking up the running
+/// executable's ancestor directories.
+///
+/// PyPy equivalent: initpath.py walks up from the executable to a
+/// directory containing `lib-python/X.Y`.
+#[cfg(feature = "host_env")]
+fn find_intree_stdlib() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let mut dir = exe.parent();
+    while let Some(d) = dir {
+        let candidate = d.join("lib-python").join("3");
+        if candidate.is_dir() {
+            return Some(candidate);
+        }
+        dir = d.parent();
+    }
+    None
+}
+
+/// Resolve the stdlib directory to add to `sys.path`.
+///
+/// Order: the `PYRE_STDLIB` override, then the vendored `lib-python/3`
+/// next to the executable, then a host `python3`'s stdlib as a last
+/// resort. The vendored copy matches the `_sre` MAGIC pyre links; a host
+/// stdlib only works when its `re`/`_sre` MAGIC agrees.
 ///
 /// PyPy equivalent: initpath.py scans for lib-python/X.Y at startup.
 #[cfg(feature = "host_env")]
 fn detect_stdlib_path() -> Option<PathBuf> {
-    // Try PYRE_STDLIB env var first
+    // Explicit override.
     if let Ok(p) = host_os::var("PYRE_STDLIB") {
         let path = PathBuf::from(p);
         if path.is_dir() {
             return Some(path);
         }
     }
-    // Auto-detect via python3
+    // Vendored in-tree stdlib, located relative to the executable.
+    if let Some(path) = find_intree_stdlib() {
+        return Some(path);
+    }
+    // Last resort: borrow a host CPython's stdlib.
     let output = std::process::Command::new("python3")
         .args([
             "-c",
