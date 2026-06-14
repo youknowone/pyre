@@ -2527,6 +2527,24 @@ fn emit_frontend_setitem(
     );
 }
 
+fn emit_frontend_delsubscr(
+    _graph: &mut super::flow::FunctionGraph,
+    block: &super::flow::BlockRef,
+    obj: super::flow::FlowValue,
+    key: super::flow::FlowValue,
+    offset: i64,
+) {
+    // flowcontext.py DELETE_SUBSCR -> `op.delitem(w_obj, w_subscr).eval(self)`.
+    // See `emit_frontend_setitem` for the void-result rationale.
+    record_graph_op(
+        block,
+        "delete_subscr",
+        vec![obj.into(), key.into()],
+        None,
+        offset,
+    );
+}
+
 fn emit_frontend_setattr(
     _graph: &mut super::flow::FunctionGraph,
     block: &super::flow::BlockRef,
@@ -3215,6 +3233,7 @@ struct FnPtrIndices {
     store_attr_fn: HelperHandle,
     build_map_from_array_fn: HelperHandle,
     binary_slice_fn: HelperHandle,
+    delete_subscr_fn: HelperHandle,
 }
 
 /// Register every blackhole helper fn pointer with the assembler in
@@ -3457,6 +3476,14 @@ fn register_helper_fn_pointers(
         cpu.binary_slice_fn as *const (),
         CallFlavor::MayForce,
     );
+    // `bh_delete_subscr_fn` runs `del obj[index]` via `baseobjspace::delitem`;
+    // a user `__delitem__` can run Python and force virtualizables → `MayForce`.
+    // Appended last to preserve fn_ptr indices.
+    let delete_subscr_fn = bind(
+        assembler,
+        cpu.delete_subscr_fn as *const (),
+        CallFlavor::MayForce,
+    );
     FnPtrIndices {
         call_fn,
         load_global_fn,
@@ -3490,6 +3517,7 @@ fn register_helper_fn_pointers(
         store_attr_fn,
         build_map_from_array_fn,
         binary_slice_fn,
+        delete_subscr_fn,
     }
 }
 
@@ -4411,6 +4439,11 @@ impl CodeWriter {
                     idx: binary_slice_fn_idx,
                     flavor: _binary_slice_fn_flavor,
                 },
+            delete_subscr_fn:
+                HelperHandle {
+                    idx: delete_subscr_fn_idx,
+                    flavor: _delete_subscr_fn_flavor,
+                },
         } = register_helper_fn_pointers(&mut assembler, self.cpu());
 
         // codewriter.py:37 `portal_jd = self.callcontrol.jitdriver_sd_from_portal_graph(graph)`
@@ -4475,6 +4508,7 @@ impl CodeWriter {
                 store_attr_fn_idx,
                 build_map_from_array_fn_idx,
                 binary_slice_fn_idx,
+                delete_subscr_fn_idx,
             });
         }
 
@@ -7977,12 +8011,21 @@ impl CodeWriter {
                             emit_abort_permanent!(py_pc);
                         }
 
-                        // DeleteSubscr: pops 2 (key, obj). Net: -2.
+                        // DeleteSubscr: pops 2 (index, obj). Net: -2.
                         Instruction::DeleteSubscr => {
-                            for _ in 0..2 {
-                                pop_and_decr_depth(&mut current_state, &mut current_depth);
-                            }
-                            emit_abort_permanent!(py_pc);
+                            current_depth -= 1;
+                            emit_vsd!(current_depth, py_pc);
+                            let key_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            current_depth -= 1;
+                            emit_vsd!(current_depth, py_pc);
+                            let obj_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            emit_frontend_delsubscr(
+                                &mut graph,
+                                &current_block.block(),
+                                obj_value,
+                                key_value,
+                                py_pc as i64,
+                            );
                         }
 
                         // DeleteAttr: pops 1 (obj). Net: -1.

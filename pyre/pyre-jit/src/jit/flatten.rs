@@ -3231,6 +3231,14 @@ pub struct LoweringContext {
     /// `runtime_ops::binary_slice_values` (a user `__getitem__` fallback may
     /// force virtualizables → `MayForce`).
     pub binary_slice_fn_idx: u16,
+    /// `delete_subscr_fn` descrs-pool index — see codewriter.rs
+    /// `register_helper_fn_pointers` (`bind(assembler, cpu.delete_subscr_fn,
+    /// CallFlavor::MayForce)`).  DELETE_SUBSCR records the `delete_subscr(obj,
+    /// index)` HLOp lowered to `residual_call_r_v(ConstInt(fn_idx),
+    /// ListR([obj, index]), Descr)` (void result) via
+    /// [`lower_delsubscr_hlop_to_insn`]; `bh_delete_subscr_fn` runs
+    /// `baseobjspace::delitem` (a user `__delitem__` may force → `MayForce`).
+    pub delete_subscr_fn_idx: u16,
 }
 
 /// Map a BINARY_OP HLOp opname (`add`/.../`xor`/`getitem` plus the
@@ -4652,6 +4660,9 @@ where
     if let Some(insn) = lower_binary_slice_hlop_to_insn(op, ctx, get_register, lower_constant) {
         return Some(insn);
     }
+    if let Some(insn) = lower_delsubscr_hlop_to_insn(op, ctx, get_register, lower_constant) {
+        return Some(insn);
+    }
     None
 }
 
@@ -4833,6 +4844,46 @@ where
         CallFlavor::MayForce,
         majit_ir::PyreHelperKind::None,
         dst_reg,
+    ))
+}
+
+/// Lower the DELETE_SUBSCR pyre HLOp `delete_subscr(obj, index)` (no
+/// result — `emit_frontend_delsubscr` records the SpaceOperation with
+/// `result = None`, the same void rewrite as `setitem`) to the
+/// post-rtype `residual_call_r_v(ConstInt(delete_subscr_fn_idx),
+/// ListR([obj, index]), Descr)` Insn.  `bh_delete_subscr_fn(obj, index)`
+/// runs `baseobjspace::delitem` (the same code the interpreter's
+/// `delete_subscript` runs); a user `__delitem__` may force
+/// virtualizables → `MayForce`.
+///
+/// Returns `None` for non-`delete_subscr` opnames or non-void shapes so
+/// the caller can fall through to other lowering arms.
+pub fn lower_delsubscr_hlop_to_insn<F, LC>(
+    op: &super::flow::SpaceOperation,
+    ctx: &LoweringContext,
+    get_register: &mut F,
+    lower_constant: &mut LC,
+) -> Option<Insn>
+where
+    F: FnMut(super::flow::Variable) -> Register,
+    LC: FnMut(&Constant) -> Operand,
+{
+    if op.opname != "delete_subscr" {
+        return None;
+    }
+    if op.args.len() != 2 {
+        return None;
+    }
+    if op.result.is_some() {
+        return None;
+    }
+    let obj_operand = flatten_arg_with_lowering(&op.args[0], get_register, lower_constant);
+    let key_operand = flatten_arg_with_lowering(&op.args[1], get_register, lower_constant);
+    Some(build_residual_call_r_v_insn_from_operands(
+        ctx.delete_subscr_fn_idx,
+        vec![obj_operand, key_operand],
+        CallFlavor::MayForce,
+        majit_ir::PyreHelperKind::None,
     ))
 }
 
@@ -6240,6 +6291,7 @@ mod tests {
             store_attr_fn_idx: 0,
             build_map_from_array_fn_idx: 0,
             binary_slice_fn_idx: 0,
+            delete_subscr_fn_idx: 0,
 };
         let mut on = SSARepr::new("setattr_on");
         let mut on_regallocs = make_regallocs();
@@ -6379,6 +6431,7 @@ mod tests {
             store_attr_fn_idx: 0,
             build_map_from_array_fn_idx: 0,
             binary_slice_fn_idx: 0,
+            delete_subscr_fn_idx: 0,
 };
 
         let mut ssarepr = SSARepr::new("retired_families");
@@ -6505,6 +6558,7 @@ mod tests {
             store_attr_fn_idx: 0,
             build_map_from_array_fn_idx: 0,
             binary_slice_fn_idx: 0,
+            delete_subscr_fn_idx: 0,
 };
 
         let mut ssarepr = SSARepr::new("trailing_live");
@@ -6594,6 +6648,7 @@ mod tests {
             store_attr_fn_idx: 0,
             build_map_from_array_fn_idx: 0,
             binary_slice_fn_idx: 0,
+            delete_subscr_fn_idx: 0,
 };
 
         let mut ssarepr = SSARepr::new("multi_block_lowering");
@@ -6727,6 +6782,7 @@ mod tests {
             store_attr_fn_idx: 0,
             build_map_from_array_fn_idx: 0,
             binary_slice_fn_idx: 0,
+            delete_subscr_fn_idx: 0,
 };
 
         let mut ssarepr = SSARepr::new("pyre_walker_2exit");
@@ -6905,6 +6961,7 @@ mod tests {
             store_attr_fn_idx: 0,
             build_map_from_array_fn_idx: 0,
             binary_slice_fn_idx: 0,
+            delete_subscr_fn_idx: 0,
 });
 
         let mut regallocs = perform_register_allocation_all_kinds(&graph);
@@ -7132,6 +7189,7 @@ mod tests {
             store_attr_fn_idx: 0,
             build_map_from_array_fn_idx: 0,
             binary_slice_fn_idx: 0,
+            delete_subscr_fn_idx: 0,
 };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -7225,6 +7283,7 @@ mod tests {
             store_attr_fn_idx: 0,
             build_map_from_array_fn_idx: 0,
             binary_slice_fn_idx: 0,
+            delete_subscr_fn_idx: 0,
 };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -7262,6 +7321,7 @@ mod tests {
             store_attr_fn_idx: 0,
             build_map_from_array_fn_idx: 0,
             binary_slice_fn_idx: 0,
+            delete_subscr_fn_idx: 0,
 };
 
         let hlop = SpaceOperation::new("sub", vec![lhs.into(), rhs.into()], Some(result.into()), 0);
@@ -7372,6 +7432,7 @@ mod tests {
             store_attr_fn_idx: 0,
             build_map_from_array_fn_idx: 0,
             binary_slice_fn_idx: 0,
+            delete_subscr_fn_idx: 0,
 };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -7441,6 +7502,7 @@ mod tests {
             store_attr_fn_idx: 0,
             build_map_from_array_fn_idx: 0,
             binary_slice_fn_idx: 0,
+            delete_subscr_fn_idx: 0,
 };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -7476,6 +7538,7 @@ mod tests {
             store_attr_fn_idx: 0,
             build_map_from_array_fn_idx: 0,
             binary_slice_fn_idx: 0,
+            delete_subscr_fn_idx: 0,
 };
         let hlop = SpaceOperation::new("eq", vec![lhs.into(), rhs.into()], Some(result.into()), 0);
         let mut get_register = identity_register_mapper();
@@ -7518,6 +7581,7 @@ mod tests {
             store_attr_fn_idx: 0,
             build_map_from_array_fn_idx: 0,
             binary_slice_fn_idx: 0,
+            delete_subscr_fn_idx: 0,
 };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -7587,6 +7651,7 @@ mod tests {
             store_attr_fn_idx: 0,
             build_map_from_array_fn_idx: 0,
             binary_slice_fn_idx: 0,
+            delete_subscr_fn_idx: 0,
 };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -7619,6 +7684,7 @@ mod tests {
             store_attr_fn_idx: 0,
             build_map_from_array_fn_idx: 0,
             binary_slice_fn_idx: 0,
+            delete_subscr_fn_idx: 0,
 };
         let hlop = SpaceOperation::new("bool", vec![cond.into()], Some(result.into()), 0);
         let mut get_register = identity_register_mapper();
@@ -7665,6 +7731,7 @@ mod tests {
             store_attr_fn_idx: 0,
             build_map_from_array_fn_idx: 0,
             binary_slice_fn_idx: 0,
+            delete_subscr_fn_idx: 0,
 };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -7727,6 +7794,7 @@ mod tests {
             store_attr_fn_idx: 0,
             build_map_from_array_fn_idx: 0,
             binary_slice_fn_idx: 0,
+            delete_subscr_fn_idx: 0,
 };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -7774,6 +7842,7 @@ mod tests {
             store_attr_fn_idx: 0,
             build_map_from_array_fn_idx: 0,
             binary_slice_fn_idx: 0,
+            delete_subscr_fn_idx: 0,
 };
         let hlop = SpaceOperation::new(
             "setitem",
@@ -7836,6 +7905,7 @@ mod tests {
             store_attr_fn_idx: 0,
             build_map_from_array_fn_idx: 0,
             binary_slice_fn_idx: 0,
+            delete_subscr_fn_idx: 0,
 };
         let mut get_register_a = identity_register_mapper();
         let mut get_register_b = identity_register_mapper();
@@ -7874,6 +7944,7 @@ mod tests {
             store_attr_fn_idx: 0,
             build_map_from_array_fn_idx: 0,
             binary_slice_fn_idx: 0,
+            delete_subscr_fn_idx: 0,
 };
         let mut get_register_a = identity_register_mapper();
         let mut get_register_b = identity_register_mapper();
@@ -7912,6 +7983,7 @@ mod tests {
             store_attr_fn_idx: 0,
             build_map_from_array_fn_idx: 0,
             binary_slice_fn_idx: 0,
+            delete_subscr_fn_idx: 0,
 };
         let mut get_register_a = identity_register_mapper();
         let mut get_register_b = identity_register_mapper();
@@ -7955,6 +8027,7 @@ mod tests {
             store_attr_fn_idx: 0,
             build_map_from_array_fn_idx: 0,
             binary_slice_fn_idx: 0,
+            delete_subscr_fn_idx: 0,
 };
         let mut get_register_a = identity_register_mapper();
         let mut get_register_b = identity_register_mapper();
@@ -8012,6 +8085,7 @@ mod tests {
             store_attr_fn_idx: 0,
             build_map_from_array_fn_idx: 0,
             binary_slice_fn_idx: 0,
+            delete_subscr_fn_idx: 0,
 };
         let mut get_register_a = identity_register_mapper();
         let mut get_register_b = identity_register_mapper();
@@ -9392,6 +9466,7 @@ mod tests {
             store_attr_fn_idx: 0,
             build_map_from_array_fn_idx: 0,
             binary_slice_fn_idx: 0,
+            delete_subscr_fn_idx: 0,
 };
         flatten_graph_for_test_with_lowering(&graph, &mut ssarepr, ctx, Some(cpu));
         ssarepr
@@ -9671,6 +9746,7 @@ mod tests {
             store_attr_fn_idx: 0,
             build_map_from_array_fn_idx: 0,
             binary_slice_fn_idx: 0,
+            delete_subscr_fn_idx: 0,
 };
         let null_or_self_var = Variable::new(VariableId(10), Kind::Ref);
         let op = super::super::flow::SpaceOperation::new(
@@ -9773,6 +9849,7 @@ mod tests {
             store_attr_fn_idx: 95,
             build_map_from_array_fn_idx: 96,
             binary_slice_fn_idx: 97,
+            delete_subscr_fn_idx: 98,
         };
         let code_const = Constant::new(
             super::super::flow::ConstantValue::Signed(0x2000),
@@ -10126,6 +10203,71 @@ mod tests {
                         index: 102
                     }),
                 );
+            }
+            _ => panic!("expected Insn::Op, got {insn:?}"),
+        }
+    }
+
+    #[test]
+    fn lower_delsubscr_hlop_emits_delete_subscr_fn_residual() {
+        // `delete_subscr(obj, index)` →
+        // `residual_call_r_v(ConstInt(delete_subscr_fn_idx),
+        // ListR([obj, index]), Descr)` (void — a user `__delitem__` may
+        // run Python).
+        let obj_var = Variable::new(VariableId(8), Kind::Ref);
+        let key_var = Variable::new(VariableId(10), Kind::Ref);
+        let (ctx, _, _) = load_attr_lowering_fixture();
+        let op = super::super::flow::SpaceOperation::new(
+            "delete_subscr",
+            vec![obj_var.into(), key_var.into()],
+            None,
+            0,
+        );
+        let mut get_register = |var: Variable| match var.id {
+            VariableId(8) => Register {
+                kind: Kind::Ref,
+                index: 101,
+            },
+            VariableId(10) => Register {
+                kind: Kind::Ref,
+                index: 103,
+            },
+            _ => panic!("unexpected var id {:?}", var.id),
+        };
+        let mut lower_constant = super::flatten_constant_operand_for_test;
+        let insn = super::lower_delsubscr_hlop_to_insn(
+            &op,
+            &ctx,
+            &mut get_register,
+            &mut lower_constant,
+        )
+        .expect("2-arg delete_subscr lowering must succeed");
+        match insn {
+            Insn::Op {
+                opname,
+                args,
+                result,
+            } => {
+                assert_eq!(opname, "residual_call_r_v");
+                assert!(
+                    matches!(args[0], Operand::ConstInt(98)),
+                    "delete_subscr_fn pool index, got {:?}",
+                    args[0]
+                );
+                match &args[1] {
+                    Operand::ListOfKind(list) => {
+                        assert_eq!(list.kind, Kind::Ref);
+                        match &list.content[..] {
+                            [Operand::Register(obj), Operand::Register(key)] => {
+                                assert_eq!(obj.index, 101, "ListR[0] must be obj");
+                                assert_eq!(key.index, 103, "ListR[1] must be index");
+                            }
+                            other => panic!("ListR must be [obj, index], got {other:?}"),
+                        }
+                    }
+                    other => panic!("expected ListR, got {other:?}"),
+                }
+                assert_eq!(result, None, "delete_subscr is void");
             }
             _ => panic!("expected Insn::Op, got {insn:?}"),
         }

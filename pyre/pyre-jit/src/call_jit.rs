@@ -3425,6 +3425,24 @@ pub extern "C" fn bh_binary_slice_fn(obj: i64, start: i64, stop: i64) -> i64 {
     }
 }
 
+/// DELETE_SUBSCR residual (`delete_subscr` HLOp → `residual_call_r_v`).
+/// Runs `del obj[index]` through the shared `baseobjspace::delitem` (the
+/// same code the interpreter's `delete_subscript` runs).  A `__delitem__`
+/// on a user object may run Python (`MayForce`).  Void result, so always
+/// returns 0; on error the exception is published through
+/// `BH_LAST_EXC_VALUE` for the trailing `GuardNoException`, matching
+/// `bh_store_subscr_fn`.
+pub extern "C" fn bh_delete_subscr_fn(obj: i64, index: i64) -> i64 {
+    if let Err(err) = pyre_interpreter::baseobjspace::delitem(
+        obj as pyre_object::PyObjectRef,
+        index as pyre_object::PyObjectRef,
+    ) {
+        let exc_obj = err.to_exc_object();
+        majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc_obj as i64));
+    }
+    0
+}
+
 /// Compute the LOOKUP_METHOD `null_or_self` for blackhole LOAD_ATTR resume,
 /// given the already-resolved `attr` from [`bh_load_attr_fn`].  Delegates to
 /// the shared `compute_load_method_bound`, a pure MRO inspection that never
