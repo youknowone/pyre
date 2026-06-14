@@ -712,9 +712,10 @@ pub(crate) fn write_stack_slot(
 /// those values only in the symbolic register banks; the runtime frame
 /// still holds its creation-time state (call args). Emit the
 /// virtualizable write_boxes shape (virtualizable.py:99-110):
-/// SETFIELD_GC for the per-call statics + one residual helper CALL per
-/// live array slot. Slots never touched symbolically (`OpRef::NONE`)
-/// keep their runtime creation value.
+/// SETFIELD_GC for the per-call statics + SETARRAYITEM_GC per live
+/// boxed array slot (unboxed int/float slots stay residual helper CALLs
+/// that box runtime-side). Slots never touched symbolically
+/// (`OpRef::NONE`) keep their runtime creation value.
 ///
 /// The other four statics (`pycode`, `debugdata`, `lastblock`,
 /// `w_globals`) are correct from frame creation and have no mutators
@@ -741,20 +742,25 @@ pub(crate) fn gen_writeback_inline_frame_to_heap(
         ctx.vable_setfield_descr(frame_opref, vsd, descr);
     }
 
-    // locals_cells_stack_w items, emitted as residual helper CALLs
-    // (jit_frame_set_slot_{ref,int,float}) rather than SetarrayitemGc.
-    // direct_assembler_call (pyjitpl.py:3613) passes the red boxes as
-    // CALL_ASSEMBLER args, so virtual values among them are forced at
-    // the call; pyre's uniform `[frame, ec]` loop ABI delivers the reds
-    // through the heap frame instead, and making each slot value a call
-    // argument keeps the same force-at-call property. The raw int/float
-    // helper variants box runtime-side (w_int_new / w_float_new), so no
-    // boxing ops enter the trace. GC visibility of the stored refs
-    // between these stores and the compiled loop's entry loads is
-    // covered by `walk_jit_callee_frame_roots` (pyre-jit::call_jit) —
-    // the heap frame sits on no `CURRENT_FRAME` chain while compiled
-    // code runs.
+    // locals_cells_stack_w items. Boxed (Ref) slots are written back with
+    // an inline `SetarrayitemGc` into `locals_cells_stack_w`, the same
+    // primitive `gen_writeback_vable_to_heap` (trace_ctx.rs) uses for the
+    // root loop's vable array items. The array base, item descr
+    // (`pyobject_gcarray_descr`) and flat slot index match the
+    // `trace_array_getitem_value` read path the compiled loop uses at
+    // entry, so the optimizer's heapcache pairs them. Among the boxed
+    // values, any virtual is forced by `OptVirtualize` when stored
+    // through the array (write_boxes parity, virtualizable.py:99-110).
+    //
+    // Unboxed int/float slots have no W_Root to store, so they stay
+    // residual `jit_frame_set_slot_{int,float}` CALLs that box runtime-
+    // side (w_int_new / w_float_new) — keeping the boxing out of the
+    // trace. GC visibility of the stored refs between these stores and
+    // the compiled loop's entry loads is covered by
+    // `walk_jit_callee_frame_roots` (pyre-jit::call_jit) — the heap frame
+    // sits on no `CURRENT_FRAME` chain while compiled code runs.
     let cb = crate::callbacks::get();
+    let mut array_ref = OpRef::NONE;
     for slot in 0..valuestackdepth {
         let Some(&value) = sym.registers_r.get(slot) else {
             break;
@@ -763,16 +769,24 @@ pub(crate) fn gen_writeback_inline_frame_to_heap(
             continue;
         }
         let index = ctx.const_int(slot as i64);
-        let (helper, value_type) = match ctx.get_opref_type(value) {
-            Some(Type::Int) => (cb.jit_frame_set_slot_int, Type::Int),
-            Some(Type::Float) => (cb.jit_frame_set_slot_float, Type::Float),
-            _ => (cb.jit_frame_set_slot_ref, Type::Ref),
-        };
-        ctx.call_void_typed(
-            helper,
-            &[frame_opref, index, value],
-            &[Type::Ref, Type::Int, value_type],
-        );
+        match ctx.get_opref_type(value) {
+            Some(Type::Int) => ctx.call_void_typed(
+                cb.jit_frame_set_slot_int,
+                &[frame_opref, index, value],
+                &[Type::Ref, Type::Int, Type::Int],
+            ),
+            Some(Type::Float) => ctx.call_void_typed(
+                cb.jit_frame_set_slot_float,
+                &[frame_opref, index, value],
+                &[Type::Ref, Type::Int, Type::Float],
+            ),
+            _ => {
+                if array_ref == OpRef::NONE {
+                    array_ref = frame_locals_cells_stack_array(ctx, frame_opref);
+                }
+                ctx.vable_setarrayitem_descr(array_ref, index, value, pyobject_gcarray_descr());
+            }
+        }
     }
 }
 
