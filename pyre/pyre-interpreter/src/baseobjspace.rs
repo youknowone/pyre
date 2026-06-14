@@ -8093,8 +8093,7 @@ fn iter_self_method(args: &[PyObjectRef]) -> PyResult {
 /// `(type(self), (predicate, iterable), stopped)`.
 fn takewhile_reduce_method(args: &[PyObjectRef]) -> PyResult {
     let it = unsafe { &*(args[0] as *const pyre_object::itertoolsmodule::W_TakeWhile) };
-    let w_type = crate::typedef::gettypefor(&pyre_object::itertoolsmodule::TAKEWHILE_TYPE)
-        .unwrap_or(PY_NULL);
+    let w_type = crate::typedef::r#type(args[0]).unwrap_or(PY_NULL);
     let state = w_tuple_new(vec![it.w_predicate, it.w_iterable]);
     Ok(w_tuple_new(vec![w_type, state, w_bool_from(it.stopped)]))
 }
@@ -8103,7 +8102,7 @@ fn takewhile_reduce_method(args: &[PyObjectRef]) -> PyResult {
 /// `self.stopped = space.bool_w(w_state)`.
 fn takewhile_setstate_method(args: &[PyObjectRef]) -> PyResult {
     let it = unsafe { &mut *(args[0] as *mut pyre_object::itertoolsmodule::W_TakeWhile) };
-    it.stopped = is_true(args.get(1).copied().unwrap_or(w_none()));
+    it.stopped = int_w(args.get(1).copied().unwrap_or(w_none()))? != 0;
     Ok(w_none())
 }
 
@@ -8111,8 +8110,7 @@ fn takewhile_setstate_method(args: &[PyObjectRef]) -> PyResult {
 /// `(type(self), (predicate, iterable), started)`.
 fn dropwhile_reduce_method(args: &[PyObjectRef]) -> PyResult {
     let it = unsafe { &*(args[0] as *const pyre_object::itertoolsmodule::W_DropWhile) };
-    let w_type = crate::typedef::gettypefor(&pyre_object::itertoolsmodule::DROPWHILE_TYPE)
-        .unwrap_or(PY_NULL);
+    let w_type = crate::typedef::r#type(args[0]).unwrap_or(PY_NULL);
     let state = w_tuple_new(vec![it.w_predicate, it.w_iterable]);
     Ok(w_tuple_new(vec![w_type, state, w_bool_from(it.started)]))
 }
@@ -8121,7 +8119,7 @@ fn dropwhile_reduce_method(args: &[PyObjectRef]) -> PyResult {
 /// `self.started = space.bool_w(w_state)`.
 fn dropwhile_setstate_method(args: &[PyObjectRef]) -> PyResult {
     let it = unsafe { &mut *(args[0] as *mut pyre_object::itertoolsmodule::W_DropWhile) };
-    it.started = is_true(args.get(1).copied().unwrap_or(w_none()));
+    it.started = int_w(args.get(1).copied().unwrap_or(w_none()))? != 0;
     Ok(w_none())
 }
 
@@ -8129,8 +8127,7 @@ fn dropwhile_setstate_method(args: &[PyObjectRef]) -> PyResult {
 /// `(type(self), (None-or-predicate, iterable))` — no state element.
 fn filterfalse_reduce_method(args: &[PyObjectRef]) -> PyResult {
     let it = unsafe { &*(args[0] as *const pyre_object::itertoolsmodule::W_FilterFalse) };
-    let w_type = crate::typedef::gettypefor(&pyre_object::itertoolsmodule::FILTERFALSE_TYPE)
-        .unwrap_or(PY_NULL);
+    let w_type = crate::typedef::r#type(args[0]).unwrap_or(PY_NULL);
     let w_pred = if it.w_predicate.is_null() {
         w_none()
     } else {
