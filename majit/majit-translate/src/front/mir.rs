@@ -1081,12 +1081,6 @@ struct Lowering<'a> {
     /// `local_var` by local and only falls back to the recorded
     /// Variable for a base/index without a backing local (a constant).
     index_elem_alias: std::collections::HashMap<usize, IndexElemAlias>,
-    /// MIR locals bound by a devirtualized infallible widening
-    /// `usize::try_from(u8|u16|u32)` call.  The value is the source
-    /// integer itself (the conversion cannot fail on 64-bit targets),
-    /// so the paired `Result::expect` on such a local also aliases it
-    /// — see [`Lowering::is_infallible_widening_try_from`].
-    infallible_result_locals: std::collections::HashSet<usize>,
     /// MIR locals whose enum discriminant is a translation-time
     /// constant: single-assignment locals bound by an always-`Ok`
     /// decomposed conversion ([`Lowering::try_lower_usize_try_from`]).
@@ -1236,7 +1230,6 @@ impl<'a> Lowering<'a> {
             positional_aggregate_locals: std::collections::HashMap::new(),
             binop_result_locals: compute_binop_result_locals(body),
             index_elem_alias: std::collections::HashMap::new(),
-            infallible_result_locals: std::collections::HashSet::new(),
             const_discriminant_locals: std::collections::HashMap::new(),
             multi_assigned_locals: compute_multi_assigned_locals(body),
             result_exc_call_results: Vec::new(),
@@ -3397,16 +3390,6 @@ impl<'a> Lowering<'a> {
 
         // Resolve arguments before deciding the call shape so receiver
         // resolution and `dyn` operand handling share the same path.
-        // The first operand's MIR local (if it is one) feeds the
-        // paired `try_from`/`expect` devirtualization below, which
-        // keys on `infallible_result_locals`.
-        let first_arg_local = call.args.first().and_then(|op| match op {
-            Operand::Move(p) | Operand::Copy(p) => match &p.kind {
-                PlaceKind::Local(i) => Some(*i as usize),
-                _ => None,
-            },
-            Operand::Const(_) => None,
-        });
         let mut args: Vec<Variable> = Vec::with_capacity(call.args.len());
         // MIR local index behind each plain-local argument, kept
         // alongside the resolved Variables so call intercepts can
@@ -3568,33 +3551,6 @@ impl<'a> Lowering<'a> {
                         self.graph
                             .alloc_value_var_with_type(crate::model::ConcreteType::Void),
                     );
-                    let target_bb = self.block_id[target];
-                    let link_args = self.edge_args(mir_bb, target)?;
-                    self.graph.set_goto(bb_id, target_bb, link_args);
-                    return Ok(());
-                }
-                // `usize::try_from(x).expect(…)` where `x` is u8/u16/
-                // u32 — a widening conversion that cannot fail on the
-                // 64-bit targets pyre supports, routed through the
-                // Opaque `ptr_try_from_impls` core impls.  `try_from`
-                // aliases its argument and records the destination
-                // local; the paired `expect` on that local unwraps by
-                // aliasing the same value.  A fallible source width
-                // never matches, so genuine error paths keep their
-                // ordinary call lowering.
-                if args.len() == 1 && self.is_infallible_widening_try_from(&reg) {
-                    self.infallible_result_locals.insert(dest_local);
-                    self.local_var[dest_local] = Some(args[0].clone());
-                    let target_bb = self.block_id[target];
-                    let link_args = self.edge_args(mir_bb, target)?;
-                    self.graph.set_goto(bb_id, target_bb, link_args);
-                    return Ok(());
-                }
-                if args.len() == 2
-                    && first_arg_local.is_some_and(|l| self.infallible_result_locals.contains(&l))
-                    && self.is_result_expect(&reg)
-                {
-                    self.local_var[dest_local] = Some(args[0].clone());
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -4053,41 +4009,6 @@ impl<'a> Lowering<'a> {
         self.llbc
             .fn_by_id(*id)
             .is_some_and(|fd| fd.item_meta.name_path() == "core::slice::<Impl>::swap")
-    }
-
-    /// `usize::try_from` (`ptr_try_from_impls`, Opaque core code)
-    /// applied to a u8/u16/u32 source — always `Ok` when the target
-    /// is pointer-width on 64-bit, so the call aliases its argument
-    /// (see the paired `expect` handling in [`Self::lower_call`]).
-    fn is_infallible_widening_try_from(&self, reg: &RegularCall) -> bool {
-        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
-            return false;
-        };
-        let Some(fd) = self.llbc.fn_by_id(*id) else {
-            return false;
-        };
-        if fd.item_meta.name_path() != "core::convert::num::ptr_try_from_impls::<Impl>::try_from" {
-            return false;
-        }
-        fd.signature.inputs.first().is_some_and(|t| {
-            tyref_node(t, self.llbc)
-                .and_then(|n| strip_ty_wrappers(n, self.llbc))
-                .and_then(|n| n.get("Literal"))
-                .and_then(|l| l.get("UInt"))
-                .and_then(serde_json::Value::as_str)
-                .is_some_and(|w| matches!(w, "U8" | "U16" | "U32"))
-        })
-    }
-
-    /// `Result::expect` (Opaque core code) — only devirtualized when
-    /// the receiver local was bound by an infallible `try_from` above.
-    fn is_result_expect(&self, reg: &RegularCall) -> bool {
-        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
-            return false;
-        };
-        self.llbc
-            .fn_by_id(*id)
-            .is_some_and(|fd| fd.item_meta.name_path() == "core::result::<Impl>::expect")
     }
 
     /// Pointer reinterprets `*const T::cast_mut` / `*mut T::cast_const`
@@ -4845,6 +4766,12 @@ impl<'a> Lowering<'a> {
                 result_ty: ValueType::Ref(Some(owner.to_string())),
             },
         });
+        // Both decomposed fields carry integers: the `__discriminant`
+        // tag is an `i64` (matching the `Rvalue::Discriminant`
+        // `FieldRead` and the `i64` field registration) and the
+        // `__pos_0` payload is the negated / widened integer the
+        // `checked_neg` / `usize::try_from` callers materialize.  A
+        // `Ref` field type here would disagree with that registration.
         for (name, value) in [("__discriminant", disc), ("__pos_0", payload)] {
             self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                 result: None,
@@ -4855,7 +4782,7 @@ impl<'a> Lowering<'a> {
                         owner_root: Some(owner.to_string()),
                     },
                     value,
-                    ty: ValueType::Ref(None),
+                    ty: ValueType::Int,
                 },
             });
         }
