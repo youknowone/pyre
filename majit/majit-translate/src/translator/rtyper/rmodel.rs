@@ -2930,11 +2930,29 @@ pub fn rtyper_makerepr(
             )
         }
         SomeValue::List(s_list) => {
-            // rlist.py:43-50 — `BaseListRepr.__new__` returns
-            // `FixedSizeListRepr` for a non-resized listdef and
-            // `ListRepr` for a resized one. Pyre lands the non-resized
-            // (slice / fixed-array) repr today; the resized
-            // `GcStruct("list", length, items)` variant is deferred.
+            // rlist.py:40-58 `SomeList.rtyper_makerepr`. Three upstream
+            // branches; pyre lands only the non-resized one today:
+            //
+            //   1. `range_step is not None and not mutated and
+            //      not SomeImpossibleValue` → `RangeRepr(range_step)`
+            //      (lltypesystem/rrange.py). Not ported — `RangeRepr`
+            //      has no Rust counterpart yet (the whole `rrange.py`
+            //      surface is deferred, see `SomeIterator` below); a
+            //      range-list therefore falls through to the
+            //      fixed-size repr instead.
+            //   2. resized listdef → `ListRepr` (`GcStruct("list",
+            //      length, items)`) — deferred (the `Err` arm below).
+            //   3. non-resized → `FixedSizeListRepr`.
+            //
+            // Upstream also passes a LAZY `item_repr = lambda:
+            // rtyper.getrepr(listitem.s_value)` for recursive list
+            // structures; pyre computes it EAGERLY below. Sound for the
+            // current usage (list items are `PyObjectRef`, i.e. the root
+            // `InstanceRepr`, never the list type itself), so no eager
+            // recursion occurs; the lazy form is a parity follow-up.
+            // (`externalvsinternal`'s `gcref=True` arm is likewise
+            // deferred — `rclass.rs` — and unreached for `PyObjectRef`
+            // items.)
             let resized = s_list.listdef.listitem_rc().borrow().resized;
             if resized {
                 Err(TyperError::missing_rtype_operation(format!(
