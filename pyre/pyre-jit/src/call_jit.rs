@@ -3434,6 +3434,75 @@ pub extern "C" fn bh_delete_attr_fn(obj: i64, w_code_ptr: i64, name_idx: i64) ->
     0
 }
 
+/// IMPORT_NAME residual (`import_name` HLOp → `residual_call_ir_r`).
+/// Resolves the module name from the jitcode's own code object via
+/// `name_idx` (same `co_names` invariant as `bh_load_attr_fn`), reads the
+/// frame's `__name__`/`__package__` from the code object's globals (for
+/// relative imports), and runs `importhook` with the TLS-pinned execution
+/// context the eval loop stamps on entry.  Importing a module may run its
+/// top-level Python (`MayForce`); on error the exception is published
+/// through `BH_LAST_EXC_VALUE` for the trailing `GuardNoException` and the
+/// call returns 0.  `fromlist` and `level` are the two popped operands
+/// (`eval.rs import_name`: `fromlist = pop()`, `level = pop()`).
+pub extern "C" fn bh_import_name_fn(
+    fromlist: i64,
+    level: i64,
+    w_code_ptr: i64,
+    name_idx: i64,
+) -> i64 {
+    let w_code = w_code_ptr as pyre_object::PyObjectRef;
+    let code = unsafe {
+        &*(pyre_interpreter::w_code_get_ptr(w_code) as *const pyre_interpreter::CodeObject)
+    };
+    let idx = name_idx as usize;
+    debug_assert!(
+        idx < code.names.len(),
+        "bh_import_name_fn name_idx {idx} out of range ({} names) — codegen invariant",
+        code.names.len()
+    );
+    if idx >= code.names.len() {
+        return 0;
+    }
+    let name = code.names[idx].as_ref();
+    // `import_name` reads the active frame's globals for relative-import
+    // package resolution (`__name__` / `__package__`); the eval loop pins the
+    // execution context whose top frame is the importing frame.  `w_globals`
+    // must be the wrapped dict object `resolve_package_name` does
+    // `finditem_str` against (not the raw DictStorage), so resolve it through
+    // `get_w_globals_obj`, mirroring `bh_call_fn_impl`'s top-frame lookup.
+    let ec = pyre_interpreter::call::getexecutioncontext();
+    let w_globals = if ec.is_null() {
+        pyre_object::PY_NULL
+    } else {
+        let frame = unsafe { (*ec).gettopframe() };
+        if frame.is_null() {
+            pyre_object::PY_NULL
+        } else {
+            unsafe { (*frame).get_w_globals_obj() }
+        }
+    };
+    let w_level = level as pyre_object::PyObjectRef;
+    let level = if unsafe { pyre_object::is_int(w_level) } {
+        unsafe { pyre_object::w_int_get_value(w_level) }
+    } else {
+        0
+    };
+    match pyre_interpreter::importing::importhook(
+        name,
+        w_globals,
+        fromlist as pyre_object::PyObjectRef,
+        level,
+        ec,
+    ) {
+        Ok(module) => module as i64,
+        Err(err) => {
+            let exc_obj = err.to_exc_object();
+            majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc_obj as i64));
+            0
+        }
+    }
+}
+
 /// BINARY_SLICE residual (`binary_slice` HLOp → `residual_call_r_r`).
 /// Computes `obj[start:stop]` through the shared
 /// `runtime_ops::binary_slice_values` (the same code the interpreter's

@@ -71,6 +71,11 @@ pub struct Cpu {
     /// `conv` is a `runtime_ops::convert_value_code`; user `__str__` /
     /// `__repr__` may run Python (fallible).
     pub convert_value_fn: extern "C" fn(i64, i64) -> i64,
+    /// `bh_import_name_fn(fromlist, level, code, name_idx)` — IMPORT_NAME
+    /// `__import__` residual; resolves the module name from the code object
+    /// and imports through the TLS-pinned execution context (may run module
+    /// top-level Python → fallible).
+    pub import_name_fn: extern "C" fn(i64, i64, i64, i64) -> i64,
     /// `bhimpl_compare_op` — RPython compare_op opcodes.
     pub compare_fn: extern "C" fn(i64, i64, i64) -> i64,
     /// `bhimpl_binary_op` — RPython binary_op opcodes.
@@ -212,6 +217,7 @@ impl Cpu {
             format_simple_fn: crate::call_jit::bh_format_simple_fn,
             format_with_spec_fn: crate::call_jit::bh_format_with_spec_fn,
             convert_value_fn: crate::call_jit::bh_convert_value_fn,
+            import_name_fn: crate::call_jit::bh_import_name_fn,
             compare_fn: crate::call_jit::bh_compare_fn,
             binary_op_fn: crate::call_jit::bh_binary_op_fn,
             box_int_fn: crate::call_jit::bh_box_int_fn,

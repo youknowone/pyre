@@ -2924,6 +2924,30 @@ fn emit_frontend_is_op(
     )
 }
 
+fn emit_frontend_import_name(
+    graph: &mut super::flow::FunctionGraph,
+    block: &super::flow::BlockRef,
+    fromlist: super::flow::FlowValue,
+    level: super::flow::FlowValue,
+    code: super::flow::FlowValue,
+    name_idx: super::flow::FlowValue,
+    offset: i64,
+) -> super::flow::Variable {
+    emit_graph_op_with_result(
+        graph,
+        block,
+        "import_name",
+        vec![
+            fromlist.into(),
+            level.into(),
+            code.into(),
+            name_idx.into(),
+        ],
+        Kind::Ref,
+        offset,
+    )
+}
+
 fn frontend_load_const_flow_value(code: &CodeObject, idx: usize) -> super::flow::FlowValue {
     // `flowcontext.py:841-843 LOAD_CONST`: fetch the pre-wrapped constant
     // and push that value.  Pyre's CodeObject stores RustPython
@@ -3282,6 +3306,7 @@ struct FnPtrIndices {
     format_with_spec_fn: HelperHandle,
     build_string_from_array_fn: HelperHandle,
     convert_value_fn: HelperHandle,
+    import_name_fn: HelperHandle,
 }
 
 /// Register every blackhole helper fn pointer with the assembler in
@@ -3577,6 +3602,13 @@ fn register_helper_fn_pointers(
         cpu.convert_value_fn as *const (),
         CallFlavor::MayForce,
     );
+    // `bh_import_name_fn` runs `__import__` (module top-level Python may run)
+    // → `MayForce`.  Appended last to preserve fn_ptr indices.
+    let import_name_fn = bind(
+        assembler,
+        cpu.import_name_fn as *const (),
+        CallFlavor::MayForce,
+    );
     FnPtrIndices {
         call_fn,
         load_global_fn,
@@ -3617,6 +3649,7 @@ fn register_helper_fn_pointers(
         format_with_spec_fn,
         build_string_from_array_fn,
         convert_value_fn,
+        import_name_fn,
     }
 }
 
@@ -4573,6 +4606,11 @@ impl CodeWriter {
                     idx: convert_value_fn_idx,
                     flavor: _convert_value_fn_flavor,
                 },
+            import_name_fn:
+                HelperHandle {
+                    idx: import_name_fn_idx,
+                    flavor: _import_name_fn_flavor,
+                },
         } = register_helper_fn_pointers(&mut assembler, self.cpu());
 
         // codewriter.py:37 `portal_jd = self.callcontrol.jitdriver_sd_from_portal_graph(graph)`
@@ -4644,6 +4682,7 @@ impl CodeWriter {
                 format_with_spec_fn_idx,
                 build_string_from_array_fn_idx,
                 convert_value_fn_idx,
+                import_name_fn_idx,
             });
         }
 
@@ -8365,14 +8404,43 @@ impl CodeWriter {
                             emit_abort_permanent!(py_pc);
                         }
 
-                        // ImportName: pops 2 (level, fromlist), pushes 1 module. Net: -1.
-                        Instruction::ImportName { .. } => {
-                            for _ in 0..2 {
-                                pop_and_decr_depth(&mut current_state, &mut current_depth);
-                            }
-                            push_fresh_ref(&mut current_state, &mut graph);
-                            current_depth += 1;
-                            emit_abort_permanent!(py_pc);
+                        // ImportName: pops 2 (fromlist=TOS, level=TOS1), pushes
+                        // 1 module. Net: -1.  `import_name(fromlist, level, code,
+                        // name_idx)` HLOp → `residual_call_ir_r(import_name_fn,
+                        // ListI[name_idx], ListR[fromlist, level, code])`.  The
+                        // jitcode's own W_CodeObject travels as a post-rtype
+                        // `Signed(ptr) + Kind::Ref` constant and the `co_names`
+                        // index the helper resolves the module name with — the
+                        // same surrogate-operand shape as the LoadAttr arm.
+                        // `bh_import_name_fn` runs `__import__` through the
+                        // TLS-pinned execution context (MayForce).
+                        Instruction::ImportName { namei } => {
+                            let name_idx = namei.get(op_arg) as usize;
+                            let code_const: super::flow::FlowValue =
+                                super::flow::Constant::new(
+                                    super::flow::ConstantValue::Signed(w_code as i64),
+                                    Some(Kind::Ref),
+                                )
+                                .into();
+                            let name_idx_const: super::flow::FlowValue =
+                                super::flow::Constant::signed(name_idx as i64).into();
+                            let _ = emit_popvalue_ref!(current_depth, py_pc);
+                            let fromlist_value =
+                                pop_ref_or_fresh(&mut current_state, &mut graph);
+                            let _ = emit_popvalue_ref!(current_depth, py_pc);
+                            let level_value =
+                                pop_ref_or_fresh(&mut current_state, &mut graph);
+                            let result_value = emit_frontend_import_name(
+                                &mut graph,
+                                &current_block.block(),
+                                fromlist_value,
+                                level_value,
+                                code_const,
+                                name_idx_const,
+                                py_pc as i64,
+                            );
+                            pin!(Some(result_value), stack_base + current_depth);
+                            push_and_bump!(result_value.into(), py_pc);
                         }
 
                         // ImportFrom: peek module, push attr. Net: +1.
