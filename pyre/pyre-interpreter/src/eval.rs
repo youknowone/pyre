@@ -3666,86 +3666,9 @@ impl OpcodeStepExecutor for PyFrame {
         let stop = self.pop();
         let start = self.pop();
         let obj = self.pop();
-        unsafe {
-            if pyre_object::is_list(obj) {
-                let len = pyre_object::w_list_len(obj) as i64;
-                let s = if pyre_object::is_none(start) {
-                    0
-                } else {
-                    pyre_object::w_int_get_value(start)
-                };
-                let e = if pyre_object::is_none(stop) {
-                    len
-                } else {
-                    pyre_object::w_int_get_value(stop)
-                };
-                let s = if s < 0 { (len + s).max(0) } else { s.min(len) } as usize;
-                let e = if e < 0 { (len + e).max(0) } else { e.min(len) } as usize;
-                let mut items = Vec::new();
-                for i in s..e {
-                    if let Some(v) = pyre_object::w_list_getitem(obj, i as i64) {
-                        items.push(v);
-                    }
-                }
-                self.push(pyre_object::w_list_new(items));
-                return Ok(());
-            }
-            if pyre_object::is_str(obj) {
-                // Slice on code-point boundaries over the WTF-8 view, so a
-                // surrogate-bearing or multi-byte string slices correctly.
-                let full = pyre_object::w_str_get_wtf8(obj);
-                let mut offsets: Vec<usize> = full.code_point_indices().map(|(i, _)| i).collect();
-                offsets.push(full.as_bytes().len());
-                let len = (offsets.len() - 1) as i64;
-                let s = if pyre_object::is_none(start) {
-                    0
-                } else {
-                    pyre_object::w_int_get_value(start)
-                };
-                let e = if pyre_object::is_none(stop) {
-                    len
-                } else {
-                    pyre_object::w_int_get_value(stop)
-                };
-                let s = if s < 0 { (len + s).max(0) } else { s.min(len) } as usize;
-                let e = (if e < 0 { (len + e).max(0) } else { e.min(len) } as usize).max(s);
-                let part =
-                    rustpython_wtf8::Wtf8::from_bytes(&full.as_bytes()[offsets[s]..offsets[e]])
-                        .expect("code-point-aligned slice is WTF-8");
-                self.push(pyre_object::w_str_from_wtf8(part.to_wtf8_buf()));
-                return Ok(());
-            }
-            if pyre_object::is_tuple(obj) {
-                let len = pyre_object::w_tuple_len(obj) as i64;
-                let s = if pyre_object::is_none(start) {
-                    0
-                } else {
-                    pyre_object::w_int_get_value(start)
-                };
-                let e = if pyre_object::is_none(stop) {
-                    len
-                } else {
-                    pyre_object::w_int_get_value(stop)
-                };
-                let s = if s < 0 { (len + s).max(0) } else { s.min(len) } as usize;
-                let e = if e < 0 { (len + e).max(0) } else { e.min(len) } as usize;
-                let mut items = Vec::new();
-                for i in s..e {
-                    if let Some(v) = pyre_object::w_tuple_getitem(obj, i as i64) {
-                        items.push(v);
-                    }
-                }
-                self.push(pyre_object::w_tuple_new(items));
-                return Ok(());
-            }
-            // Fall back to slice(start, stop) → getitem dispatch.
-            // Handles bytearray, instances with __getitem__, etc.
-            let slice_obj =
-                pyre_object::sliceobject::w_slice_new(start, stop, pyre_object::w_none());
-            let result = crate::baseobjspace::getitem(obj, slice_obj)?;
-            self.push(result);
-            Ok(())
-        }
+        let result = crate::runtime_ops::binary_slice_values(obj, start, stop)?;
+        self.push(result);
+        Ok(())
     }
 
     // ── StoreSlice (a[b:c] = d) ──

@@ -2786,6 +2786,27 @@ fn emit_frontend_binary(
     )
 }
 
+/// BINARY_SLICE — records the 3-arg `binary_slice(obj, start, stop)` HLOp
+/// (Ref result) lowered by `flatten.rs::lower_binary_slice_hlop_to_insn`
+/// into the `bh_binary_slice_fn(obj, start, stop)` residual.
+fn emit_frontend_binary_slice(
+    graph: &mut super::flow::FunctionGraph,
+    block: &super::flow::BlockRef,
+    obj: super::flow::FlowValue,
+    start: super::flow::FlowValue,
+    stop: super::flow::FlowValue,
+    offset: i64,
+) -> super::flow::Variable {
+    emit_graph_op_with_result(
+        graph,
+        block,
+        "binary_slice",
+        vec![obj.into(), start.into(), stop.into()],
+        Kind::Ref,
+        offset,
+    )
+}
+
 fn compare_opname(op: pyre_interpreter::bytecode::ComparisonOperator) -> &'static str {
     use pyre_interpreter::bytecode::ComparisonOperator as C;
 
@@ -3193,6 +3214,7 @@ struct FnPtrIndices {
     load_method_self_fn: HelperHandle,
     store_attr_fn: HelperHandle,
     build_map_from_array_fn: HelperHandle,
+    binary_slice_fn: HelperHandle,
 }
 
 /// Register every blackhole helper fn pointer with the assembler in
@@ -3426,6 +3448,15 @@ fn register_helper_fn_pointers(
         cpu.build_map_from_array_fn as *const (),
         CallFlavor::MayForce,
     );
+    // `bh_binary_slice_fn` runs `runtime_ops::binary_slice_values`, whose
+    // fallback dispatches a `slice` object through `getitem` — a user
+    // `__getitem__` can run Python and force virtualizables → `MayForce`.
+    // Appended last to preserve fn_ptr indices.
+    let binary_slice_fn = bind(
+        assembler,
+        cpu.binary_slice_fn as *const (),
+        CallFlavor::MayForce,
+    );
     FnPtrIndices {
         call_fn,
         load_global_fn,
@@ -3458,6 +3489,7 @@ fn register_helper_fn_pointers(
         load_method_self_fn,
         store_attr_fn,
         build_map_from_array_fn,
+        binary_slice_fn,
     }
 }
 
@@ -4374,6 +4406,11 @@ impl CodeWriter {
                     idx: build_map_from_array_fn_idx,
                     flavor: _build_map_from_array_fn_flavor,
                 },
+            binary_slice_fn:
+                HelperHandle {
+                    idx: binary_slice_fn_idx,
+                    flavor: _binary_slice_fn_flavor,
+                },
         } = register_helper_fn_pointers(&mut assembler, self.cpu());
 
         // codewriter.py:37 `portal_jd = self.callcontrol.jitdriver_sd_from_portal_graph(graph)`
@@ -4437,6 +4474,7 @@ impl CodeWriter {
                 load_method_self_fn_idx,
                 store_attr_fn_idx,
                 build_map_from_array_fn_idx,
+                binary_slice_fn_idx,
             });
         }
 
@@ -7642,15 +7680,28 @@ impl CodeWriter {
                         }
 
                         // BinarySlice: obj[start:stop] — pops 3 (stop, start, obj), pushes 1 (result).
-                        // Net stack effect: -2.
-                        // pyopcode.py BINARY_SLICE / eval.rs:2857-2935.
+                        // Net stack effect: -2.  Same stack-direct pattern as
+                        // BinaryOp: the `binary_slice` HLOp reads its operands from
+                        // the popped slots and `flatten::lower_binary_slice_hlop_to_insn`
+                        // threads them into the `bh_binary_slice_fn(obj, start, stop)`
+                        // residual.  TOS = stop, TOS1 = start, TOS2 = obj.
                         Instruction::BinarySlice => {
-                            for _ in 0..3 {
-                                pop_and_decr_depth(&mut current_state, &mut current_depth);
-                            }
-                            push_fresh_ref(&mut current_state, &mut graph);
-                            current_depth += 1;
-                            emit_abort_permanent!(py_pc);
+                            let _ = emit_popvalue_ref!(current_depth, py_pc);
+                            let stop_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            let _ = emit_popvalue_ref!(current_depth, py_pc);
+                            let start_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            let _ = emit_popvalue_ref!(current_depth, py_pc);
+                            let obj_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            let result_value = emit_frontend_binary_slice(
+                                &mut graph,
+                                &current_block.block(),
+                                obj_value,
+                                start_value,
+                                stop_value,
+                                py_pc as i64,
+                            );
+                            pin!(Some(result_value), stack_base + current_depth);
+                            push_and_bump!(result_value.into(), py_pc);
                         }
 
                         // ContainsOp: item in container — pops 2, pushes 1 (bool).

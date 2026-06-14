@@ -521,6 +521,93 @@ pub fn build_map_from_refs(items: &[PyObjectRef]) -> PyObjectRef {
     dict
 }
 
+/// BINARY_SLICE evaluation, shared by the interpreter (`binary_slice`)
+/// and the JIT residual (`bh_binary_slice_fn`): returns `obj[start:stop]`.
+/// `list` / `str` / `tuple` slice on element (code-point for `str`)
+/// boundaries; everything else (`bytes`, `bytearray`, instances with
+/// `__getitem__`) falls back to a `slice` object dispatched through
+/// `getitem`. A `None` start/stop defaults to `0` / `len`.
+pub fn binary_slice_values(
+    obj: PyObjectRef,
+    start: PyObjectRef,
+    stop: PyObjectRef,
+) -> Result<PyObjectRef, PyError> {
+    unsafe {
+        if pyre_object::is_list(obj) {
+            let len = pyre_object::w_list_len(obj) as i64;
+            let s = if pyre_object::is_none(start) {
+                0
+            } else {
+                pyre_object::w_int_get_value(start)
+            };
+            let e = if pyre_object::is_none(stop) {
+                len
+            } else {
+                pyre_object::w_int_get_value(stop)
+            };
+            let s = if s < 0 { (len + s).max(0) } else { s.min(len) } as usize;
+            let e = if e < 0 { (len + e).max(0) } else { e.min(len) } as usize;
+            let mut items = Vec::new();
+            for i in s..e {
+                if let Some(v) = pyre_object::w_list_getitem(obj, i as i64) {
+                    items.push(v);
+                }
+            }
+            return Ok(pyre_object::w_list_new(items));
+        }
+        if pyre_object::is_str(obj) {
+            // Slice on code-point boundaries over the WTF-8 view, so a
+            // surrogate-bearing or multi-byte string slices correctly.
+            let full = pyre_object::w_str_get_wtf8(obj);
+            let mut offsets: Vec<usize> = full.code_point_indices().map(|(i, _)| i).collect();
+            offsets.push(full.as_bytes().len());
+            let len = (offsets.len() - 1) as i64;
+            let s = if pyre_object::is_none(start) {
+                0
+            } else {
+                pyre_object::w_int_get_value(start)
+            };
+            let e = if pyre_object::is_none(stop) {
+                len
+            } else {
+                pyre_object::w_int_get_value(stop)
+            };
+            let s = if s < 0 { (len + s).max(0) } else { s.min(len) } as usize;
+            let e = (if e < 0 { (len + e).max(0) } else { e.min(len) } as usize).max(s);
+            let part = rustpython_wtf8::Wtf8::from_bytes(&full.as_bytes()[offsets[s]..offsets[e]])
+                .expect("code-point-aligned slice is WTF-8");
+            return Ok(pyre_object::w_str_from_wtf8(part.to_wtf8_buf()));
+        }
+        if pyre_object::is_tuple(obj) {
+            let len = pyre_object::w_tuple_len(obj) as i64;
+            let s = if pyre_object::is_none(start) {
+                0
+            } else {
+                pyre_object::w_int_get_value(start)
+            };
+            let e = if pyre_object::is_none(stop) {
+                len
+            } else {
+                pyre_object::w_int_get_value(stop)
+            };
+            let s = if s < 0 { (len + s).max(0) } else { s.min(len) } as usize;
+            let e = if e < 0 { (len + e).max(0) } else { e.min(len) } as usize;
+            let mut items = Vec::new();
+            for i in s..e {
+                if let Some(v) = pyre_object::w_tuple_getitem(obj, i as i64) {
+                    items.push(v);
+                }
+            }
+            return Ok(pyre_object::w_tuple_new(items));
+        }
+        // Fall back to slice(start, stop) → getitem dispatch.
+        // Handles bytes, bytearray, instances with __getitem__, etc.
+        let slice_obj =
+            pyre_object::sliceobject::w_slice_new(start, stop, pyre_object::w_none());
+        crate::baseobjspace::getitem(obj, slice_obj)
+    }
+}
+
 fn build_list_from_args(args: &[i64]) -> i64 {
     let items: Vec<_> = args.iter().map(|&arg| arg as PyObjectRef).collect();
     build_list_from_refs(&items) as i64

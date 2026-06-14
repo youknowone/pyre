@@ -3403,6 +3403,28 @@ pub extern "C" fn bh_store_attr_fn(obj: i64, value: i64, w_code_ptr: i64, name_i
     0
 }
 
+/// BINARY_SLICE residual (`binary_slice` HLOp → `residual_call_r_r`).
+/// Computes `obj[start:stop]` through the shared
+/// `runtime_ops::binary_slice_values` (the same code the interpreter's
+/// `binary_slice` runs).  A `__getitem__` on a user object may run Python
+/// (`MayForce`); on error the exception is published through
+/// `BH_LAST_EXC_VALUE` for the trailing `GuardNoException` and the call
+/// returns 0, matching [`bh_load_attr_fn`].
+pub extern "C" fn bh_binary_slice_fn(obj: i64, start: i64, stop: i64) -> i64 {
+    match pyre_interpreter::runtime_ops::binary_slice_values(
+        obj as pyre_object::PyObjectRef,
+        start as pyre_object::PyObjectRef,
+        stop as pyre_object::PyObjectRef,
+    ) {
+        Ok(result) => result as i64,
+        Err(err) => {
+            let exc_obj = err.to_exc_object();
+            majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc_obj as i64));
+            0
+        }
+    }
+}
+
 /// Compute the LOOKUP_METHOD `null_or_self` for blackhole LOAD_ATTR resume,
 /// given the already-resolved `attr` from [`bh_load_attr_fn`].  Delegates to
 /// the shared `compute_load_method_bound`, a pure MRO inspection that never
