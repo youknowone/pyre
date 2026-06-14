@@ -3720,6 +3720,27 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
+                // `f64::is_nan(x)` is `x != x` (`rfloat.isnan`) — emit the
+                // reflexive `ne` BinOp instead of an unresolved call.
+                if args.len() == 1 && self.is_f64_is_nan(&reg) {
+                    let res = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(res.clone()),
+                        kind: OpKind::BinOp {
+                            op: "ne".to_string(),
+                            lhs: args[0].clone(),
+                            rhs: args[0].clone(),
+                            result_ty: ValueType::Int,
+                        },
+                    });
+                    self.local_var[dest_local] = Some(res);
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
                 // Resolve the target function's fully-qualified path
                 // through the FunId → FunDecl table. `Trait` here is
                 // Charon's "trait-bound generic resolved at extraction
@@ -4258,6 +4279,21 @@ impl<'a> Lowering<'a> {
                     | "core::ptr::mut_ptr::<Impl>::cast"
             )
         })
+    }
+
+    /// `f64::is_nan(self)` — `core` has no graph body (Opaque), so the
+    /// callsite would skip as an unregistered `FunctionPath`.  `is_nan`
+    /// is `value != value` (`rfloat.isnan`), so the caller lowers it to
+    /// a reflexive `ne` `BinOp`; the float operand makes the rtyper pick
+    /// `float_ne`, which (unlike `int_ne`) carries no `n(x, x) => 0`
+    /// reflexive fold, preserving the NaN-only truth value.
+    fn is_f64_is_nan(&self, reg: &RegularCall) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        self.llbc
+            .fn_by_id(*id)
+            .is_some_and(|fd| fd.item_meta.name_path() == "core::f64::<Impl>::is_nan")
     }
 
     fn blanket_into_devirt(&self, reg: &RegularCall) -> Option<IntoDevirt> {
