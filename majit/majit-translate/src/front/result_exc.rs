@@ -1033,14 +1033,21 @@ fn catch_and_rewrap(graph: &mut FunctionGraph, a: usize, r: &Variable) -> Result
     let e_exc_value_in = e_inputs[nonr_args.len() + 1].clone();
     let e_shell: Option<Variable> = if has_r {
         // `PyError::from_exc_object(exc_value)` is an associated fn (no
-        // `self`), yet it is spelled as a `Method` target with the caught
-        // exception value as `args[0]`.  This is correct here: a
-        // `CallTarget::Method` is a *static* impl-resolution hint
-        // (`call.rs resolve_method` → `for_impl_method(receiver, name)`),
-        // not a runtime `getattr(args[0], name)` dispatch, so args map
-        // positionally to the graph's params — `obj ← exc_value` — exactly
-        // as for the inherent `&self` `to_exc_object` above.  A
-        // `FunctionPath(["PyError", "from_exc_object"])` would instead
+        // `self`), yet it is spelled as a `Method` target with `receiver_root
+        // = "PyError"` and the caught exception value as `args[0]`.  The
+        // codewriter resolves the recorded call statically, not by a runtime
+        // dispatch on the exception object: `call.rs::resolve_method` keys the
+        // `getfunctionptr(graph)` identity on
+        // `CallPath::for_impl_method(receiver_root, name)` →
+        // `for_impl_method("PyError", "from_exc_object")` and never on the
+        // runtime receiver's class, so `exc_value` flows positionally into
+        // the callee's first param (`obj`) — the same way the inherent
+        // `&self` `to_exc_object` above threads its receiver positionally.
+        // (The rtyper's annotator-facing lowering in `flowspace_adapter.rs`
+        // does turn every `Method` into `getattr(args[0], leaf) →
+        // simple_call`; that view drives type inference only — the
+        // codewriter's static `resolve_method` above mints the actual call.)
+        // A `FunctionPath(["PyError", "from_exc_object"])` would instead
         // resolve to that bare two-segment path, which misses the
         // module-qualified impl-method registration and falls back to a
         // symbolic address.
