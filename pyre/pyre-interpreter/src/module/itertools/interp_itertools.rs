@@ -493,4 +493,48 @@ pub fn register_module(ns: &mut DictStorage) {
             1,
         ),
     );
+    // batched(iterable, n, *, strict=False) — CPython 3.13 itertools.batched.
+    // Batches the input into tuples of length `n`; the last tuple may be
+    // shorter unless `strict` is set, in which case a short final batch
+    // raises ValueError.  Materialized eagerly like the other builtins here.
+    crate::dict_storage_store(
+        ns,
+        "batched",
+        crate::make_builtin_function("batched", |args| {
+            let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
+            crate::builtins::kwarg_reject_unknown(kwargs, &["strict"], "batched")?;
+            if positional.len() < 2 {
+                return Err(crate::PyError::type_error(format!(
+                    "batched expected at least 2 arguments, got {}",
+                    positional.len()
+                )));
+            }
+            // `n` goes through `space.index` (`__index__`); a non-integer
+            // raises "'X' object cannot be interpreted as an integer".
+            let n = crate::builtins::space_index_w(positional[1])?;
+            if n < 1 {
+                return Err(crate::PyError::value_error("n must be at least one"));
+            }
+            let strict = match crate::builtins::kwarg_get(kwargs, "strict") {
+                Some(w) => crate::baseobjspace::is_true(w),
+                None => false,
+            };
+            let n = n as usize;
+            let items = crate::builtins::collect_iterable(positional[0])?;
+            let mut tuples = Vec::with_capacity(items.len().div_ceil(n));
+            let mut i = 0usize;
+            while i < items.len() {
+                let end = (i + n).min(items.len());
+                let chunk: Vec<_> = items[i..end].to_vec();
+                if strict && chunk.len() != n {
+                    return Err(crate::PyError::value_error("batched(): incomplete batch"));
+                }
+                tuples.push(pyre_object::w_tuple_new(chunk));
+                i = end;
+            }
+            let count = tuples.len();
+            let list = pyre_object::w_list_new(tuples);
+            Ok(pyre_object::w_seq_iter_new(list, count))
+        }),
+    );
 }
