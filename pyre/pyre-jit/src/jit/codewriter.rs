@@ -3353,6 +3353,7 @@ struct FnPtrIndices {
     load_deref_value_fn: HelperHandle,
     unary_invert_fn: HelperHandle,
     unary_not_fn: HelperHandle,
+    load_fast_check_fn: HelperHandle,
 }
 
 /// Register every blackhole helper fn pointer with the assembler in
@@ -3688,6 +3689,14 @@ fn register_helper_fn_pointers(
     // `bh_unary_not_fn` runs the truth test; a user `__bool__` / `__len__`
     // may run Python → `MayForce`.  Appended last to preserve fn_ptr indices.
     let unary_not_fn = bind(assembler, cpu.unary_not_fn as *const (), CallFlavor::MayForce);
+    // `bh_load_fast_check_fn` only null-checks the local and raises NameError;
+    // it reads no heap and runs no user code → `Plain`.  Appended last to
+    // preserve fn_ptr indices.
+    let load_fast_check_fn = bind(
+        assembler,
+        cpu.load_fast_check_fn as *const (),
+        CallFlavor::Plain,
+    );
     FnPtrIndices {
         call_fn,
         load_global_fn,
@@ -3734,6 +3743,7 @@ fn register_helper_fn_pointers(
         load_deref_value_fn,
         unary_invert_fn,
         unary_not_fn,
+        load_fast_check_fn,
     }
 }
 
@@ -4720,6 +4730,11 @@ impl CodeWriter {
                     idx: unary_not_fn_idx,
                     flavor: _unary_not_fn_flavor,
                 },
+            load_fast_check_fn:
+                HelperHandle {
+                    idx: load_fast_check_fn_idx,
+                    flavor: _load_fast_check_fn_flavor,
+                },
         } = register_helper_fn_pointers(&mut assembler, self.cpu());
 
         // codewriter.py:37 `portal_jd = self.callcontrol.jitdriver_sd_from_portal_graph(graph)`
@@ -4797,6 +4812,7 @@ impl CodeWriter {
                 load_deref_value_fn_idx,
                 unary_invert_fn_idx,
                 unary_not_fn_idx,
+                load_fast_check_fn_idx,
             });
         }
 
@@ -8804,9 +8820,48 @@ impl CodeWriter {
                             push_and_bump!(result_value.into(), py_pc);
                         }
 
+                        // LOAD_FAST_CHECK: reads a local that may be unbound,
+                        // pushes it, and raises NameError when the slot is
+                        // PY_NULL.  The local is read from the vable exactly
+                        // like LOAD_FAST (`emit_load_fast_ref!`, inlining-safe
+                        // via `frame_var`); the `load_fast_check(value, code,
+                        // name_idx)` HLOp → `residual_call_ir_r(
+                        // load_fast_check_fn, ListR[value, code],
+                        // ListI[name_idx])` returns the value when bound or
+                        // raises the unbound NameError (`bh_load_fast_check_fn`,
+                        // CallFlavor::Plain — reads no heap, runs no user code).
+                        // `name_idx` is the `co_varnames` index the residual
+                        // resolves the variable name with.
+                        Instruction::LoadFastCheck { var_num } => {
+                            let idx = var_num.get(op_arg).as_usize() as u16;
+                            let code_const: super::flow::FlowValue =
+                                super::flow::Constant::new(
+                                    super::flow::ConstantValue::Signed(w_code as i64),
+                                    Some(Kind::Ref),
+                                )
+                                .into();
+                            let name_idx_const: super::flow::FlowValue =
+                                super::flow::Constant::signed(idx as i64).into();
+                            emit_load_fast_ref!(current_depth, idx, py_pc);
+                            let value_reg = emit_popvalue_ref!(current_depth, py_pc);
+                            let value_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            if let super::flow::FlowValue::Variable(v) = &value_value {
+                                pin!(Some(*v), value_reg);
+                            }
+                            let result_value = emit_graph_op_with_result(
+                                &mut graph,
+                                &current_block.block(),
+                                "load_fast_check",
+                                vec![value_value.into(), code_const.into(), name_idx_const.into()],
+                                Kind::Ref,
+                                py_pc as i64,
+                            );
+                            pin!(Some(result_value), stack_base + current_depth);
+                            push_and_bump!(result_value.into(), py_pc);
+                        }
+
                         // Loads that push +1.
-                        Instruction::LoadFastCheck { .. }
-                        | Instruction::LoadCommonConstant { .. }
+                        Instruction::LoadCommonConstant { .. }
                         | Instruction::LoadLocals
                         | Instruction::LoadBuildClass => {
                             push_fresh_ref(&mut current_state, &mut graph);

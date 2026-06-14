@@ -4148,6 +4148,43 @@ pub extern "C" fn bh_unary_not_fn(value: i64) -> i64 {
     pyre_object::w_bool_from(!truth) as i64
 }
 
+/// LOAD_FAST_CHECK residual (`load_fast_check` HLOp → `residual_call_ir_r`).
+/// The local slot is read from the vable exactly like LOAD_FAST and handed in
+/// as `value` (possibly `PY_NULL` for an unbound local).  Returns `value`
+/// unchanged when bound; on an unbound local raises `NameError`, resolving the
+/// variable name from the resume frame's code object via the `co_varnames`
+/// index baked in by the codewriter.  Reads no heap and runs no user code
+/// (`CallFlavor::Plain`); the exception is published through
+/// `BH_LAST_EXC_VALUE` for the trailing `GuardNoException` and the call
+/// returns 0.
+pub extern "C" fn bh_load_fast_check_fn(value: i64, w_code_ptr: i64, name_idx: i64) -> i64 {
+    if value as pyre_object::PyObjectRef != pyre_object::PY_NULL {
+        return value;
+    }
+    let code = unsafe {
+        &*(pyre_interpreter::w_code_get_ptr(w_code_ptr as pyre_object::PyObjectRef)
+            as *const pyre_interpreter::CodeObject)
+    };
+    // `name_idx` is a `co_varnames` index baked into the residual call by the
+    // codewriter from the originating LOAD_FAST_CHECK oparg.  An out-of-range
+    // index is a codegen invariant rather than a runtime-reachable error;
+    // mirror `execute_load_fast_check`'s `idx < code_varnames_len(code)` guard,
+    // falling back to the "<cell>" label rather than panicking in release.
+    let idx = name_idx as usize;
+    let name = if idx < code.varnames.len() {
+        code.varnames[idx].as_ref()
+    } else {
+        "<cell>"
+    };
+    let exc_obj = pyre_interpreter::PyError::new(
+        pyre_interpreter::PyErrorKind::NameError,
+        format!("local variable '{name}' referenced before assignment"),
+    )
+    .to_exc_object();
+    majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc_obj as i64));
+    0
+}
+
 #[cfg(test)]
 mod tests_bh_newtuple_from_array {
     use super::bh_newtuple_from_array;

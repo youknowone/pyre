@@ -92,6 +92,9 @@ pub struct Cpu {
     /// `bh_unary_not_fn(value)` — UNARY_NOT `not value` residual returning a
     /// bool (a user `__bool__` / `__len__` may run Python; infallible).
     pub unary_not_fn: extern "C" fn(i64) -> i64,
+    /// `bh_load_fast_check_fn(value, code, name_idx)` — LOAD_FAST_CHECK
+    /// unbound-local guard (returns `value`, or raises `NameError`).
+    pub load_fast_check_fn: extern "C" fn(i64, i64, i64) -> i64,
     /// `bhimpl_compare_op` — RPython compare_op opcodes.
     pub compare_fn: extern "C" fn(i64, i64, i64) -> i64,
     /// `bhimpl_binary_op` — RPython binary_op opcodes.
@@ -239,6 +242,7 @@ impl Cpu {
             load_deref_value_fn: crate::call_jit::bh_load_deref_value_fn,
             unary_invert_fn: crate::call_jit::bh_unary_invert_fn,
             unary_not_fn: crate::call_jit::bh_unary_not_fn,
+            load_fast_check_fn: crate::call_jit::bh_load_fast_check_fn,
             compare_fn: crate::call_jit::bh_compare_fn,
             binary_op_fn: crate::call_jit::bh_binary_op_fn,
             box_int_fn: crate::call_jit::bh_box_int_fn,
