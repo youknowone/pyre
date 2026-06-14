@@ -5009,17 +5009,36 @@ fn collect_outer_active_boxes(
         unsafe {
             let jc = &*sym.jitcode;
             let payload = &jc.payload;
-            let live_locals = if payload.code_ptr.is_null() {
-                Vec::new()
+            let (live_locals, stack_depth_at_pc) = if payload.code_ptr.is_null() {
+                (Vec::new(), 0usize)
             } else {
                 let live_vars = crate::liveness::liveness_for(payload.code_ptr);
-                (0..sym.nlocals)
+                let live_locals = (0..sym.nlocals)
                     .filter(|&idx| live_vars.is_local_live(entry_py_pc as usize, idx))
-                    .collect::<Vec<usize>>()
+                    .collect::<Vec<usize>>();
+                // Operand-stack depth AT the snapshot's `entry_py_pc`.  The
+                // liveness banks (`frame_liveness_reg_indices_by_bank_at`)
+                // are read at that py_pc, so the stack-slot classification
+                // window must be the depth at that py_pc too — NOT
+                // `sym.valuestackdepth` (the walker's *current* position).
+                // For the per-opcode entry caller the two coincide, but a
+                // guard resuming at a not-taken branch target with a kept
+                // operand-stack temp (conditional expr / short-circuit /
+                // chained compare, #124/#281) resumes at a py_pc whose
+                // depth `> 0` while the walker stands at depth 0 — using
+                // the current depth there truncates `stack_color_map` and
+                // drops the kept temp's semantic slot, corrupting the
+                // resumed frame.
+                let depth = live_vars
+                    .depth_at_py_pc()
+                    .get(entry_py_pc as usize)
+                    .copied()
+                    .unwrap_or(0) as usize;
+                (live_locals, depth)
             };
             (
                 sym.nlocals,
-                sym.valuestackdepth.saturating_sub(sym.nlocals),
+                stack_depth_at_pc,
                 sym.owns_virtualizable_shadow(),
                 payload.metadata.pyre_color_for_semantic_local.clone(),
                 payload.metadata.stack_slot_color_map.clone(),
