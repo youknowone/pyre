@@ -8,9 +8,11 @@
 ///
 /// Reference: rpython/memory/gc/incminimark.py, rpython/jit/backend/llsupport/gc.py
 use majit_ir::{Const, GcRef, Op, VecAssoc};
+pub use gcreftracer::{GcTable, install_gc_table_walker};
 pub use trace::{ClassTypeLayout, TypeEntry, TypeInfo, TypeInfoLayout};
 
 pub mod collector;
+pub mod gcreftracer;
 pub mod header;
 pub mod nursery;
 pub mod oldgen;
