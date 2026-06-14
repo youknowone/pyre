@@ -248,15 +248,20 @@ pub fn string_copy_parts(
     let action = match resolved_box.as_ref().and_then(|b| ctx.getptrinfo(b)) {
         Some(info) => match info {
             PtrInfo::Str(sinfo) if sinfo.is_virtual() => match &sinfo.variant {
-                VStringVariant::Plain(p) => Action::Plain(p._chars.clone()),
+                VStringVariant::Plain(p) => Action::Plain(
+                    p._chars
+                        .iter()
+                        .map(|slot| slot.as_ref().map(|b| b.to_opref()))
+                        .collect(),
+                ),
                 VStringVariant::Slice(s) => Action::Slice {
-                    s: s.s,
-                    start: s.start,
-                    lgtop: s.lgtop,
+                    s: s.s.to_opref(),
+                    start: s.start.to_opref(),
+                    lgtop: s.lgtop.to_opref(),
                 },
                 VStringVariant::Concat(c) => Action::Concat {
-                    vleft: c.vleft,
-                    vright: c.vright,
+                    vleft: c.vleft.to_opref(),
+                    vright: c.vright.to_opref(),
                 },
                 VStringVariant::Ptr => Action::NonVirtual,
             },
@@ -597,7 +602,7 @@ impl OptString {
             let did_write = self
                 .with_plain_info_mut(str_ref, ctx, |info| {
                     if i < info._chars.len() {
-                        info._chars[i] = Some(char_resolved);
+                        info._chars[i] = Some(BoxRef::from_opref(char_resolved));
                         return true;
                     }
                     false
@@ -750,7 +755,7 @@ impl OptString {
                         for (index, ch_ref) in dst_chars.into_iter().enumerate() {
                             let dst_index = (dst_start as usize) + index;
                             if dst_index < info._chars.len() {
-                                info._chars[dst_index] = ch_ref;
+                                info._chars[dst_index] = ch_ref.map(BoxRef::from_opref);
                             }
                         }
                     });
@@ -909,8 +914,8 @@ impl OptString {
                     mode,
                     length: -1,
                     variant: VStringVariant::Concat(VStringConcatInfo {
-                        vleft,
-                        vright,
+                        vleft: BoxRef::from_opref(vleft),
+                        vright: BoxRef::from_opref(vright),
                         _is_virtual: true,
                     }),
                     last_guard_pos: -1,
@@ -942,8 +947,8 @@ impl OptString {
             let stop = ctx.resolve_box_box(&op.arg(3)).to_opref();
             let lgtop = self.int_sub(stop, start, ctx);
             if let Some(info) = self.get_slice_info(s, ctx) {
-                let source = info.s;
-                let source_start = info.start;
+                let source = info.s.to_opref();
+                let source_start = info.start.to_opref();
                 s = source;
                 start = _int_add(source_start, start, ctx);
             }
@@ -954,10 +959,14 @@ impl OptString {
                 &b,
                 PtrInfo::Str(StrPtrInfo {
                     lenbound: None,
-                    lgtop: Some(lgtop),
+                    lgtop: Some(BoxRef::from_opref(lgtop)),
                     mode,
                     length: -1,
-                    variant: VStringVariant::Slice(VStringSliceInfo { s, start, lgtop }),
+                    variant: VStringVariant::Slice(VStringSliceInfo {
+                        s: BoxRef::from_opref(s),
+                        start: BoxRef::from_opref(start),
+                        lgtop: BoxRef::from_opref(lgtop),
+                    }),
                     last_guard_pos: -1,
                     avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
                 }),
@@ -1114,9 +1123,9 @@ impl OptString {
                 // vstring.py:769-774: arg1 is a virtual slice, arg2 is length 1
                 let resolved1 = ctx.get_replacement_opref(arg1);
                 if let Some(info) = self.get_slice_info(resolved1, ctx) {
-                    let source = info.s;
-                    let start = info.start;
-                    let length = info.lgtop;
+                    let source = info.s.to_opref();
+                    let start = info.start.to_opref();
+                    let length = info.lgtop.to_opref();
                     if let Some(vchar) = self.strgetitem(arg2, 0, ctx) {
                         return self.generate_modified_call(
                             OopSpecIndex::StreqSliceChar,
@@ -1192,9 +1201,9 @@ impl OptString {
         // vstring.py:807-813: if arg1 is a virtual slice
         let resolved1 = ctx.get_replacement_opref(arg1);
         if let Some(info) = self.get_slice_info(resolved1, ctx) {
-            let source = info.s;
-            let start = info.start;
-            let length = info.lgtop;
+            let source = info.s.to_opref();
+            let start = info.start.to_opref();
+            let length = info.lgtop.to_opref();
             let oopspec = if self.is_known_nonnull(arg2, ctx) {
                 OopSpecIndex::StreqSliceNonnull
             } else {
@@ -1571,7 +1580,9 @@ mod tests {
                 lgtop: None,
                 mode: 0,
                 length,
-                variant: VStringVariant::Plain(VStringPlainInfo { _chars: chars }),
+                variant: VStringVariant::Plain(VStringPlainInfo {
+                    _chars: chars.into_iter().map(|o| o.map(BoxRef::from_opref)).collect(),
+                }),
                 last_guard_pos: -1,
                 avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
             }),
@@ -1588,8 +1599,8 @@ mod tests {
                 mode: 0,
                 length: -1,
                 variant: VStringVariant::Concat(VStringConcatInfo {
-                    vleft,
-                    vright,
+                    vleft: BoxRef::from_opref(vleft),
+                    vright: BoxRef::from_opref(vright),
                     _is_virtual: true,
                 }),
                 last_guard_pos: -1,
@@ -1604,10 +1615,14 @@ mod tests {
             &b,
             PtrInfo::Str(StrPtrInfo {
                 lenbound: None,
-                lgtop: Some(lgtop), // vstring.py:223: self.lgtop = length
+                lgtop: Some(BoxRef::from_opref(lgtop)), // vstring.py:223: self.lgtop = length
                 mode: 0,
                 length: -1,
-                variant: VStringVariant::Slice(VStringSliceInfo { s, start, lgtop }),
+                variant: VStringVariant::Slice(VStringSliceInfo {
+                    s: BoxRef::from_opref(s),
+                    start: BoxRef::from_opref(start),
+                    lgtop: BoxRef::from_opref(lgtop),
+                }),
                 last_guard_pos: -1,
                 avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
             }),

@@ -84,7 +84,7 @@ pub struct StrPtrInfo {
     /// vstring.py:53 self.lgtop — cached length OpRef (set by getstrlen).
     /// After force_box, this preserves the computed length so subsequent
     /// STRLEN queries reuse it instead of emitting a new STRLEN op.
-    pub lgtop: Option<OpRef>,
+    pub lgtop: Option<BoxRef>,
     /// vstring.py: self.mode — 0 = mode_string, 1 = mode_unicode.
     pub mode: u8,
     /// vstring.py: self.length — known exact length (-1 if unknown).
@@ -129,22 +129,22 @@ pub enum VStringVariant {
 /// vstring.py:142-212 `VStringPlainInfo`
 #[derive(Clone, Debug)]
 pub struct VStringPlainInfo {
-    pub _chars: Vec<Option<OpRef>>,
+    pub _chars: Vec<Option<BoxRef>>,
 }
 
 /// vstring.py:214-264 `VStringSliceInfo`
 #[derive(Clone, Debug)]
 pub struct VStringSliceInfo {
-    pub s: OpRef,
-    pub start: OpRef,
-    pub lgtop: OpRef,
+    pub s: BoxRef,
+    pub start: BoxRef,
+    pub lgtop: BoxRef,
 }
 
 /// vstring.py:266-334 `VStringConcatInfo`
 #[derive(Clone, Debug)]
 pub struct VStringConcatInfo {
-    pub vleft: OpRef,
-    pub vright: OpRef,
+    pub vleft: BoxRef,
+    pub vright: BoxRef,
     pub _is_virtual: bool,
 }
 
@@ -458,9 +458,13 @@ pub enum PtrInfo {
 fn str_child_oprefs(s: &StrPtrInfo) -> Vec<OpRef> {
     match &s.variant {
         VStringVariant::Ptr => Vec::new(),
-        VStringVariant::Plain(p) => p._chars.iter().filter_map(|slot| *slot).collect(),
-        VStringVariant::Slice(sl) => vec![sl.s, sl.start, sl.lgtop],
-        VStringVariant::Concat(c) => vec![c.vleft, c.vright],
+        VStringVariant::Plain(p) => p
+            ._chars
+            .iter()
+            .filter_map(|slot| slot.as_ref().map(|b| b.to_opref()))
+            .collect(),
+        VStringVariant::Slice(sl) => vec![sl.s.to_opref(), sl.start.to_opref(), sl.lgtop.to_opref()],
+        VStringVariant::Concat(c) => vec![c.vleft.to_opref(), c.vright.to_opref()],
     }
 }
 
@@ -553,26 +557,26 @@ impl PtrInfo {
                 }
             }
             PtrInfo::Str(info) => {
-                if let Some(opref) = info.lgtop.as_mut() {
-                    visit_opref(opref, visitor);
+                if let Some(b) = info.lgtop.as_ref() {
+                    b.walk_const_ptr_refs(visitor);
                 }
-                match &mut info.variant {
+                match &info.variant {
                     VStringVariant::Ptr => {}
                     VStringVariant::Plain(plain) => {
-                        for slot in &mut plain._chars {
-                            if let Some(opref) = slot.as_mut() {
-                                visit_opref(opref, visitor);
+                        for slot in &plain._chars {
+                            if let Some(b) = slot.as_ref() {
+                                b.walk_const_ptr_refs(visitor);
                             }
                         }
                     }
                     VStringVariant::Slice(slice) => {
-                        visit_opref(&mut slice.s, visitor);
-                        visit_opref(&mut slice.start, visitor);
-                        visit_opref(&mut slice.lgtop, visitor);
+                        slice.s.walk_const_ptr_refs(visitor);
+                        slice.start.walk_const_ptr_refs(visitor);
+                        slice.lgtop.walk_const_ptr_refs(visitor);
                     }
                     VStringVariant::Concat(concat) => {
-                        visit_opref(&mut concat.vleft, visitor);
-                        visit_opref(&mut concat.vright, visitor);
+                        concat.vleft.walk_const_ptr_refs(visitor);
+                        concat.vright.walk_const_ptr_refs(visitor);
                     }
                 }
             }
@@ -785,7 +789,7 @@ impl PtrInfo {
     /// vstring.py:112: return self.lgtop — cached length OpRef if available.
     pub fn get_cached_lgtop(&self) -> Option<OpRef> {
         match self {
-            PtrInfo::Str(info) => info.lgtop,
+            PtrInfo::Str(info) => info.lgtop.as_ref().map(|b| b.to_opref()),
             _ => None,
         }
     }

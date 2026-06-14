@@ -1134,20 +1134,21 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
                         ._chars
                         .iter()
                         .map(|slot| {
-                            slot.map(|r| self.ctx.get_replacement_opref(r))
+                            slot.as_ref()
+                                .map(|r| self.ctx.get_replacement_opref(r.to_opref()))
                                 .unwrap_or(OpRef::NONE)
                         })
                         .collect(),
                     // vstring.py:255-257: [self.s, self.start, self.lgtop].
                     VStringVariant::Slice(s) => vec![
-                        self.ctx.get_replacement_opref(s.s),
-                        self.ctx.get_replacement_opref(s.start),
-                        self.ctx.get_replacement_opref(s.lgtop),
+                        self.ctx.get_replacement_opref(s.s.to_opref()),
+                        self.ctx.get_replacement_opref(s.start.to_opref()),
+                        self.ctx.get_replacement_opref(s.lgtop.to_opref()),
                     ],
                     // vstring.py:319-324: [self.vleft, self.vright].
                     VStringVariant::Concat(c) => vec![
-                        self.ctx.get_replacement_opref(c.vleft),
-                        self.ctx.get_replacement_opref(c.vright),
+                        self.ctx.get_replacement_opref(c.vleft.to_opref()),
+                        self.ctx.get_replacement_opref(c.vright.to_opref()),
                     ],
                     // Non-virtual `VStringVariant::Ptr` would not reach
                     // here because of the `is_virtual()` guard above.
@@ -2291,7 +2292,7 @@ impl OptContext {
                 use crate::optimizeopt::info::VStringVariant;
                 if let PtrInfo::Str(sinfo) = info {
                     if let VStringVariant::Concat(c) = sinfo.variant {
-                        return Some((c.vleft, c.vright));
+                        return Some((c.vleft.to_opref(), c.vright.to_opref()));
                     }
                 }
                 None
@@ -2357,7 +2358,7 @@ impl OptContext {
         }
         self.with_ptr_info_mut(&resolved, |info| {
             if let PtrInfo::Str(si) = info {
-                si.lgtop = Some(lgtop);
+                si.lgtop = Some(crate::r#box::BoxRef::from_opref(lgtop));
             }
         });
     }
