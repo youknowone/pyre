@@ -2930,6 +2930,7 @@ fn emit_frontend_import_name(
     fromlist: super::flow::FlowValue,
     level: super::flow::FlowValue,
     code: super::flow::FlowValue,
+    frame: super::flow::FlowValue,
     name_idx: super::flow::FlowValue,
     offset: i64,
 ) -> super::flow::Variable {
@@ -2937,7 +2938,13 @@ fn emit_frontend_import_name(
         graph,
         block,
         "import_name",
-        vec![fromlist.into(), level.into(), code.into(), name_idx.into()],
+        vec![
+            fromlist.into(),
+            level.into(),
+            code.into(),
+            frame.into(),
+            name_idx.into(),
+        ],
         Kind::Ref,
         offset,
     )
@@ -8559,6 +8566,7 @@ impl CodeWriter {
                                 fromlist_value,
                                 level_value,
                                 code_const,
+                                frame_var.into(),
                                 name_idx_const,
                                 py_pc as i64,
                             );

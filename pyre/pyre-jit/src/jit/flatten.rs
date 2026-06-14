@@ -5325,14 +5325,17 @@ where
     ))
 }
 
-/// Lower the IMPORT_NAME pyre HLOp `import_name(fromlist, level, code,
+/// Lower the IMPORT_NAME pyre HLOp `import_name(fromlist, level, code, frame,
 /// name_idx)` → `result: Ref` to `residual_call_ir_r(ConstInt(
-/// import_name_fn_idx), ListI([name_idx]), ListR([fromlist, level, code]),
-/// Descr) → reg`, the three-Ref sibling of [`lower_getattr_hlop_to_insn`]
-/// (same `(refs.., int) → ref` marshalling the void STORE_ATTR residual
-/// already proves with `[obj, value, code]`).  `bh_import_name_fn` resolves
-/// the module name from the code object and runs `__import__` (module
-/// top-level Python may force → `MayForce`).
+/// import_name_fn_idx), ListI([name_idx]), ListR([fromlist, level, code,
+/// frame]), Descr) → reg`, the four-Ref sibling of
+/// [`lower_getattr_hlop_to_insn`] (same `(refs.., int) → ref` marshalling the
+/// void STORE_ATTR residual already proves with `[obj, value, code]`).
+/// `bh_import_name_fn` resolves the module name from the code object and runs
+/// `__import__` (module top-level Python may force → `MayForce`); `frame` is
+/// the live red frame the residual reads `__name__`/`__package__` from for
+/// relative-import resolution, mirroring `bh_load_global_fn`'s threaded frame
+/// pointer instead of `getexecutioncontext().gettopframe()`.
 ///
 /// Returns `None` for non-`import_name` opnames so the caller can fall
 /// through to other lowering arms.
@@ -5346,13 +5349,14 @@ where
     F: FnMut(super::flow::Variable) -> Register,
     LC: FnMut(&Constant) -> Operand,
 {
-    if op.opname != "import_name" || op.args.len() != 4 {
+    if op.opname != "import_name" || op.args.len() != 5 {
         return None;
     }
     let fromlist = operand_for_value_arg(&op.args[0], get_register, lower_constant)?;
     let level = operand_for_value_arg(&op.args[1], get_register, lower_constant)?;
     let code = operand_for_value_arg(&op.args[2], get_register, lower_constant)?;
-    let name_idx = const_int_for_value_arg(&op.args[3])?;
+    let frame = operand_for_value_arg(&op.args[3], get_register, lower_constant)?;
+    let name_idx = const_int_for_value_arg(&op.args[4])?;
     let dst_reg = match &op.result {
         Some(super::flow::FlowValue::Variable(var)) => get_register(*var),
         _ => return None,
@@ -5360,7 +5364,7 @@ where
     let effect_info = effect_info_for_call_flavor(CallFlavor::MayForce);
     let descr_operand = Operand::descr(DescrOperand::CallDescrStub(CallDescrStub {
         effect_info,
-        arg_kinds: vec![Kind::Ref, Kind::Ref, Kind::Ref, Kind::Int],
+        arg_kinds: vec![Kind::Ref, Kind::Ref, Kind::Ref, Kind::Ref, Kind::Int],
         result_kind: Some(Kind::Ref),
     }));
     Some(Insn::op_with_result(
@@ -5371,7 +5375,10 @@ where
                 Kind::Int,
                 vec![Operand::ConstInt(name_idx)],
             )),
-            Operand::ListOfKind(ListOfKind::new(Kind::Ref, vec![fromlist, level, code])),
+            Operand::ListOfKind(ListOfKind::new(
+                Kind::Ref,
+                vec![fromlist, level, code, frame],
+            )),
             descr_operand,
         ],
         dst_reg,
@@ -11944,13 +11951,15 @@ mod tests {
 
     #[test]
     fn lower_import_name_hlop_emits_import_name_fn_residual() {
-        // `import_name(fromlist, level, code, name_idx)` →
+        // `import_name(fromlist, level, code, frame, name_idx)` →
         // `residual_call_ir_r(ConstInt(import_name_fn_idx), ListI([name_idx]),
-        // ListR([fromlist, level, code]), Descr) → reg` (MayForce — module
-        // top-level Python may run).  Three Ref operands plus one Int, the
-        // ir_r counterpart of the void STORE_ATTR 3-Ref residual.
+        // ListR([fromlist, level, code, frame]), Descr) → reg` (MayForce —
+        // module top-level Python may run).  Four Ref operands plus one Int;
+        // `frame` is the live red frame the residual reads
+        // `__name__`/`__package__` from for relative-import resolution.
         let fromlist_var = Variable::new(VariableId(8), Kind::Ref);
         let level_var = Variable::new(VariableId(10), Kind::Ref);
+        let frame_var = Variable::new(VariableId(11), Kind::Ref);
         let result_var = Variable::new(VariableId(9), Kind::Ref);
         let (ctx, code_const, name_idx_const) = load_attr_lowering_fixture();
         let op = super::super::flow::SpaceOperation::new(
@@ -11959,6 +11968,7 @@ mod tests {
                 fromlist_var.into(),
                 level_var.into(),
                 code_const.into(),
+                frame_var.into(),
                 name_idx_const.into(),
             ],
             Some(result_var.into()),
@@ -11973,6 +11983,10 @@ mod tests {
                 kind: Kind::Ref,
                 index: 103,
             },
+            VariableId(11) => Register {
+                kind: Kind::Ref,
+                index: 104,
+            },
             VariableId(9) => Register {
                 kind: Kind::Ref,
                 index: 102,
@@ -11986,7 +12000,7 @@ mod tests {
             &mut get_register,
             &mut lower_constant,
         )
-        .expect("4-arg import_name lowering must succeed");
+        .expect("5-arg import_name lowering must succeed");
         match insn {
             Insn::Op {
                 opname,
@@ -12018,11 +12032,15 @@ mod tests {
                                 Operand::Register(fl),
                                 Operand::Register(lv),
                                 Operand::ConstRef(0x2000),
+                                Operand::Register(fr),
                             ] => {
                                 assert_eq!(fl.index, 101, "leading Ref operand must be fromlist");
                                 assert_eq!(lv.index, 103, "second Ref operand must be level");
+                                assert_eq!(fr.index, 104, "fourth Ref operand must be frame");
                             }
-                            other => panic!("ListR must be [fromlist, level, code], got {other:?}"),
+                            other => {
+                                panic!("ListR must be [fromlist, level, code, frame], got {other:?}")
+                            }
                         }
                     }
                     other => panic!("expected ListR, got {other:?}"),
