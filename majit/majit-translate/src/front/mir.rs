@@ -3646,6 +3646,10 @@ impl<'a> Lowering<'a> {
                 }
                 if let Some(field_read) = self.oparg_from_field_read(&reg.kind, &segments, &args) {
                     field_read
+                } else if let Some(field_read) =
+                    self.oparg_arg_get_field_read(&reg.kind, &segments, &args)
+                {
+                    field_read
                 } else {
                     // `CallTarget::Method` requires a receiver in `args[0]`
                     // (the flowspace adapter lowers it to `getattr(recv,
@@ -4362,6 +4366,66 @@ impl<'a> Lowering<'a> {
         };
         Some(OpKind::FieldRead {
             base: arg.clone(),
+            field: FieldDescriptor::new(field, Some(owner_root)),
+            ty: ValueType::Int,
+            pure: false,
+        })
+    }
+
+    /// Lower `Arg::<T>::get(self, arg: OpArg) -> T`
+    /// (`rustpython_compiler_core::bytecode::instruction`, instruction.rs:1286)
+    /// to a direct `OpArg` payload read.  `Arg<T>` is the zero-sized
+    /// oparg marker ([`tyref_is_bytecode_arg_marker`]); the lifted
+    /// model carries it as a plain integer, so the method call's `self`
+    /// receiver surfaces as `getattr(Integer, "get")` — an attribute
+    /// the annotator cannot type (the dominant `Cannot find attribute
+    /// "get" on Integer` wall behind `complete_pending_blocks` for the
+    /// `execute_unpack_sequence` / `build_list` / `build_tuple` /
+    /// `build_map` count-argument family).  The body is
+    /// `T::try_from(u32::from(arg)).unwrap()`, and every `OpArgType`
+    /// (`VarNum` / `VarNums` / `u32`) is a transparent newtype over
+    /// `u32`, so the value's bits equal `u32::from(arg)` — the raw
+    /// operand.  That is exactly the `FieldRead __pos_0` the inverse
+    /// [`Self::oparg_from_field_read`] (`u32::from(oparg)`) emits.
+    ///
+    /// Identified by the second input being the single-field `OpArg`
+    /// struct: no other `.get` (slice / `Vec` / map) takes an `OpArg`,
+    /// and the concrete `OpArg` resolves robustly where the generic
+    /// `self: Arg<T>` marker would not.  Returns `None` for any other
+    /// `.get` so those keep the `Call` form.
+    fn oparg_arg_get_field_read(
+        &self,
+        kind: &CallKind,
+        segments: &[String],
+        args: &[Variable],
+    ) -> Option<OpKind> {
+        if segments.last().map(String::as_str) != Some("get") {
+            return None;
+        }
+        let CallKind::Fun(FunId::Regular { id }) = kind else {
+            return None;
+        };
+        let fd = self.llbc.fn_by_id(*id)?;
+        // The `OpArg` argument (`inputs[1]` — `args[1]`, after the
+        // `self` receiver) is the payload source.
+        let oparg_ty = fd.signature.inputs.get(1)?;
+        let def_id = self.tyref_adt_def_id(oparg_ty)?;
+        let td = self.llbc.type_by_id(def_id)?;
+        let name_path = td.item_meta.name_path();
+        if !name_path.ends_with("oparg::OpArg") {
+            return None;
+        }
+        let owner_root = name_path.rsplit("::").next().unwrap_or("").to_string();
+        let field = match &td.kind {
+            TypeDeclKind::Struct(fields) if fields.len() == 1 => fields[0]
+                .name
+                .clone()
+                .unwrap_or_else(|| "__pos_0".to_string()),
+            _ => return None,
+        };
+        let oparg_arg = args.get(1)?;
+        Some(OpKind::FieldRead {
+            base: oparg_arg.clone(),
             field: FieldDescriptor::new(field, Some(owner_root)),
             ty: ValueType::Int,
             pure: false,
