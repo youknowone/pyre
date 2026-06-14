@@ -1015,7 +1015,13 @@ impl GcRewriterImpl {
         // guard for the next iteration to pick up.
         let mut new_guard = op.clone();
         if let Some(fa) = new_guard.fail_args_mut() {
-            fa[idx] = Operand::Box(same_pos);
+            // `same_pos` is bound to the freshly-emitted SAME_AS producer
+            // (emit_result returns `from_bound_op`), so lower it to the
+            // live-tracking `Operand::Op` rather than a frozen position-only
+            // `Operand::Box` (#9): the failarg then auto-tracks the producer's
+            // `op.pos` if it is renumbered, matching RPython's box-identity
+            // failarg.
+            fa[idx] = Operand::from_boxref(&same_pos);
         }
         // pos is reassigned when emit/emit_result runs on the substituted op.
         new_guard.pos.set(OpRef::NONE);
