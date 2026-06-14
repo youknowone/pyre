@@ -3,7 +3,8 @@
 //! RPython parity target:
 //! `rpython/jit/metainterp/optimizeopt/rawbuffer.py`.
 
-use crate::{DescrRef, OpRef};
+use crate::box_ref::BoxRef;
+use crate::{DescrRef, GcRef, OpRef};
 
 /// rawbuffer.py:13 RawBuffer — 4 parallel lists: offsets, lengths, descrs, values.
 /// Sorted by offset. Invariant: offsets[i]+lengths[i] <= offsets[i+1].
@@ -20,7 +21,7 @@ pub struct RawBuffer {
     /// rawbuffer.py:16: self.descrs — per-entry ArrayDescr.
     descrs: Vec<DescrRef>,
     /// rawbuffer.py:17: self.values
-    values: Vec<OpRef>,
+    values: Vec<BoxRef>,
 }
 
 /// Error returned when a raw buffer operation violates invariants.
@@ -75,12 +76,17 @@ impl RawBuffer {
         &self.descrs
     }
 
-    pub fn values(&self) -> &[OpRef] {
-        &self.values
+    pub fn values(&self) -> Vec<OpRef> {
+        self.values.iter().map(|b| b.to_opref()).collect()
     }
 
-    pub fn values_mut(&mut self) -> &mut [OpRef] {
-        &mut self.values
+    /// Forward each stored value's inline const gcref through the canonical
+    /// BoxRef-Const walk. Replaces the old `values_mut()` round-trip used by
+    /// the PtrInfo GC walker.
+    pub fn walk_const_ptr_refs(&self, visitor: &mut dyn FnMut(&mut GcRef)) {
+        for b in &self.values {
+            b.walk_const_ptr_refs(visitor);
+        }
     }
 
     pub fn iter_entries(&self) -> impl Iterator<Item = (i64, usize, &DescrRef, OpRef)> + '_ {
@@ -89,7 +95,7 @@ impl RawBuffer {
             .copied()
             .zip(self.lengths.iter().copied())
             .zip(self.descrs.iter())
-            .zip(self.values.iter().copied())
+            .zip(self.values.iter().map(|b| b.to_opref()))
             .map(|(((offset, length), descr), value)| (offset, length, descr, value))
     }
 
@@ -106,7 +112,7 @@ impl RawBuffer {
             .zip(lengths)
             .zip(descrs)
             .zip(values)
-            .map(|(((offset, length), descr), value)| (offset, length, descr, value))
+            .map(|(((offset, length), descr), value)| (offset, length, descr, value.to_opref()))
             .collect()
     }
 
@@ -163,7 +169,7 @@ impl RawBuffer {
                     });
                 }
                 // rawbuffer.py:102: only replace value, keep existing descr.
-                self.values[i] = value;
+                self.values[i] = BoxRef::from_opref(value);
                 return Ok(());
             } else if wo > offset {
                 break;
@@ -212,7 +218,7 @@ impl RawBuffer {
         self.offsets.insert(insert_pos, offset);
         self.lengths.insert(insert_pos, length);
         self.descrs.insert(insert_pos, descr);
-        self.values.insert(insert_pos, value);
+        self.values.insert(insert_pos, BoxRef::from_opref(value));
         Ok(())
     }
 
@@ -233,7 +239,7 @@ impl RawBuffer {
                         write_length: self.lengths[i],
                     });
                 }
-                return Ok(self.values[i]);
+                return Ok(self.values[i].to_opref());
             }
         }
         Err(RawBufferError::UninitializedRead { offset, length })

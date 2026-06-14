@@ -540,11 +540,7 @@ impl PtrInfo {
                     }
                 }
             }
-            PtrInfo::VirtualRawBuffer(info) => {
-                for opref in info.buffer.values_mut() {
-                    visit_opref(opref, visitor);
-                }
-            }
+            PtrInfo::VirtualRawBuffer(info) => info.buffer.walk_const_ptr_refs(visitor),
             PtrInfo::VirtualRawSlice(info) => info.parent.walk_const_ptr_refs(visitor),
             PtrInfo::Virtualizable(info) => {
                 for (_, opref) in &mut info.fields {
@@ -835,7 +831,7 @@ impl PtrInfo {
                 .iter()
                 .flat_map(|fields| fields.iter().map(|(_, r)| *r))
                 .collect(),
-            PtrInfo::VirtualRawBuffer(v) => v.buffer.values().to_vec(),
+            PtrInfo::VirtualRawBuffer(v) => v.buffer.values(),
             PtrInfo::VirtualRawSlice(v) => vec![v.parent.to_opref()],
             PtrInfo::Virtualizable(v) => {
                 let mut refs: Vec<OpRef> = v.fields.iter().map(|(_, r)| *r).collect();

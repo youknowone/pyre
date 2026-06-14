@@ -3579,7 +3579,7 @@ impl OptContext {
                         .iter()
                         .flat_map(|row| row.iter().map(|(_, r)| *r))
                         .collect(),
-                    PtrInfo::VirtualRawBuffer(r) => r.buffer.values().to_vec(),
+                    PtrInfo::VirtualRawBuffer(r) => r.buffer.values(),
                     _ => Vec::new(),
                 };
                 self.setinfo_from_preamble_list(&items, infos);
