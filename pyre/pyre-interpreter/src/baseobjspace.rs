@@ -1345,7 +1345,8 @@ fn seq_iter_setstate_method(args: &[PyObjectRef]) -> PyResult {
 /// `list_iterator.__length_hint__()` — elements not yet produced.
 fn seq_iter_length_hint_method(args: &[PyObjectRef]) -> PyResult {
     unsafe {
-        let remaining = pyre_object::w_seq_iter_length(args[0]) - pyre_object::w_seq_iter_index(args[0]);
+        let remaining =
+            pyre_object::w_seq_iter_length(args[0]) - pyre_object::w_seq_iter_index(args[0]);
         Ok(w_int_new(remaining.max(0)))
     }
 }
@@ -2452,7 +2453,9 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyResul
             } else if is_range_iter(obj) {
                 match name {
                     "__reduce__" => Some((range_iter_reduce_method, "__reduce__", 1)),
-                    "__length_hint__" => Some((range_iter_length_hint_method, "__length_hint__", 1)),
+                    "__length_hint__" => {
+                        Some((range_iter_length_hint_method, "__length_hint__", 1))
+                    }
                     _ => None,
                 }
             } else if pyre_object::is_long_range_iter(obj) {
@@ -3503,15 +3506,22 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
     if (name == "__reduce__" || name == "__reduce_ex__")
         && unsafe { pyre_object::py_type_check(obj, &crate::function::BUILTIN_FUNCTION_TYPE) }
     {
-        let reduce_fn: fn(&[PyObjectRef]) -> PyResult =
-            |args| Ok(w_str_new(&unsafe { crate::function::function_get_qualname(args[0]) }));
+        let reduce_fn: fn(&[PyObjectRef]) -> PyResult = |args| {
+            Ok(w_str_new(&unsafe {
+                crate::function::function_get_qualname(args[0])
+            }))
+        };
         let (sname, arity): (&'static str, u16) = if name == "__reduce_ex__" {
             ("__reduce_ex__", 2)
         } else {
             ("__reduce__", 1)
         };
         let func_obj = crate::make_builtin_function_with_arity(sname, reduce_fn, arity);
-        return Ok(pyre_object::w_method_new(func_obj, obj, pyre_object::PY_NULL));
+        return Ok(pyre_object::w_method_new(
+            func_obj,
+            obj,
+            pyre_object::PY_NULL,
+        ));
     }
 
     // Builtin type method lookup via TypeDef registry.

@@ -2287,9 +2287,9 @@ fn init_str_type(ns: &mut DictStorage) {
             "__getnewargs__",
             |args| {
                 let s = unsafe { pyre_object::w_str_get_wtf8(args[0]) };
-                Ok(pyre_object::w_tuple_new(vec![pyre_object::w_str_from_wtf8(
-                    s.to_owned(),
-                )]))
+                Ok(pyre_object::w_tuple_new(vec![
+                    pyre_object::w_str_from_wtf8(s.to_owned()),
+                ]))
             },
             1,
         ),
@@ -3854,7 +3854,9 @@ fn init_tuple_type(ns: &mut DictStorage) {
             "__getnewargs__",
             |args| {
                 let items = unsafe { pyre_object::w_tuple_items_copy_as_vec(args[0]) };
-                Ok(pyre_object::w_tuple_new(vec![pyre_object::w_tuple_new(items)]))
+                Ok(pyre_object::w_tuple_new(vec![pyre_object::w_tuple_new(
+                    items,
+                )]))
             },
             1,
         ),
@@ -4860,7 +4862,11 @@ fn init_type_type(ns: &mut DictStorage) {
     // typeobject.py:1237 descr__flags — the `tp_flags` bitmask.
     let flags_getter = make_builtin_function_with_arity(
         "__flags__",
-        |args| Ok(pyre_object::w_int_new(unsafe { pyre_object::w_type_get_flags(args[1]) })),
+        |args| {
+            Ok(pyre_object::w_int_new(unsafe {
+                pyre_object::w_type_get_flags(args[1])
+            }))
+        },
         2,
     );
     dict_storage_store(ns, "__flags__", make_getset_descriptor(flags_getter));

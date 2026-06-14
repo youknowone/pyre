@@ -85,9 +85,10 @@ pub fn get_slotvalues(w_obj: PyObjectRef) -> PyResult {
 pub fn object_getstate_default(w_obj: PyObjectRef) -> PyResult {
     let w_objdict = crate::baseobjspace::findattr(w_obj, "__dict__");
     let mut w_ret = match w_objdict {
-        Some(d) if crate::baseobjspace::len_w(d)? > 0 => {
-            crate::call::call_function_impl_result(crate::baseobjspace::getattr_str(d, "copy")?, &[])?
-        }
+        Some(d) if crate::baseobjspace::len_w(d)? > 0 => crate::call::call_function_impl_result(
+            crate::baseobjspace::getattr_str(d, "copy")?,
+            &[],
+        )?,
         _ => pyre_object::w_none(),
     };
     let w_slots = get_slotvalues(w_obj)?;
@@ -99,9 +100,7 @@ pub fn object_getstate_default(w_obj: PyObjectRef) -> PyResult {
 
 /// objectobject.py:201 `_getnewargs(space, w_obj)` — returns
 /// `(hasargs, w_args, w_kwargs)`.
-pub fn getnewargs(
-    w_obj: PyObjectRef,
-) -> Result<(bool, PyObjectRef, PyObjectRef), PyError> {
+pub fn getnewargs(w_obj: PyObjectRef) -> Result<(bool, PyObjectRef, PyObjectRef), PyError> {
     let w_descr = unsafe { crate::baseobjspace::lookup(w_obj, "__getnewargs_ex__") };
     let hasargs;
     let w_args;
@@ -194,7 +193,8 @@ pub fn descr_reduce_ex(w_obj: PyObjectRef, proto: i64) -> PyResult {
         let w_type = crate::typedef::r#type(w_obj)
             .ok_or_else(|| PyError::type_error("cannot determine type for __reduce_ex__"))?;
         let w_cls_reduce = crate::baseobjspace::getattr_str(w_type, "__reduce__")?;
-        let w_obj_reduce = crate::baseobjspace::getattr_str(crate::typedef::w_object(), "__reduce__")?;
+        let w_obj_reduce =
+            crate::baseobjspace::getattr_str(crate::typedef::w_object(), "__reduce__")?;
         let mut override_ = !crate::baseobjspace::is_w(w_cls_reduce, w_obj_reduce);
         // Built-in types (range, the iterators) expose `__reduce__`
         // through instance dispatch rather than the type MRO, so the
