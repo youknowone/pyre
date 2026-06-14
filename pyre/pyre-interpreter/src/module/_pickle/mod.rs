@@ -3,10 +3,11 @@
 //! Port of `pypy/module/_pickle/interp_pickle.py` (`W_Pickler` /
 //! `W_Unpickler`). Targets the CPython 3.14 wire format.
 //!
-//! Increment 1 scope: protocol 2-5 atoms — None / bool / int / float /
-//! str / bytes — plus PROTO / FRAME / STOP framing and the MEMOIZE write
-//! (so single-atom output is byte-identical). Memo back-references
-//! (GET/BINGET dedup), containers, sets, global/reduce, the legacy
+//! Current scope: protocol 2-5 atoms — None / bool / int / float / str /
+//! bytes — plus PROTO / FRAME / STOP framing, the memo (MEMOIZE/BINPUT/PUT
+//! writes + GET/BINGET/LONG_BINGET back-references), and the built-in
+//! containers tuple / list / dict (with APPENDS / SETITEMS batching and
+//! recursive-structure handling). Sets, global/reduce, the legacy
 //! protocol-0/1 text opcodes, and out-of-band buffers land in later
 //! increments. The module deliberately exports only `Pickler` /
 //! `Unpickler`; `pickle.py`'s `from _pickle import (...)` keeps falling
@@ -47,11 +48,47 @@ pub(crate) mod op {
     pub const SHORT_BINBYTES: u8 = b'C';
     pub const BINBYTES: u8 = b'B';
     pub const BINBYTES8: u8 = 0x8e;
+    // memo
     pub const MEMOIZE: u8 = 0x94;
     pub const BINPUT: u8 = b'q';
     pub const LONG_BINPUT: u8 = b'r';
     pub const PUT: u8 = b'p';
+    pub const GET: u8 = b'g';
+    pub const BINGET: u8 = b'h';
+    pub const LONG_BINGET: u8 = b'j';
+    // stack
+    pub const MARK: u8 = b'(';
+    pub const POP: u8 = b'0';
+    pub const POP_MARK: u8 = b'1';
+    // tuple
+    pub const EMPTY_TUPLE: u8 = b')';
+    pub const TUPLE: u8 = b't';
+    pub const TUPLE1: u8 = 0x85;
+    pub const TUPLE2: u8 = 0x86;
+    pub const TUPLE3: u8 = 0x87;
+    // list
+    pub const EMPTY_LIST: u8 = b']';
+    pub const LIST: u8 = b'l';
+    pub const APPEND: u8 = b'a';
+    pub const APPENDS: u8 = b'e';
+    // dict
+    pub const EMPTY_DICT: u8 = b'}';
+    pub const DICT: u8 = b'd';
+    pub const SETITEM: u8 = b's';
+    pub const SETITEMS: u8 = b'u';
+    // set / frozenset
+    pub const EMPTY_SET: u8 = 0x8f;
+    pub const FROZENSET: u8 = 0x91;
+    pub const ADDITEMS: u8 = 0x90;
+    // bytearray
+    pub const BYTEARRAY8: u8 = 0x96;
+
+    /// `_tuplesize2code` — TUPLE1/2/3 indexed by element count (1..=3).
+    pub const TUPLESIZE2CODE: [u8; 4] = [EMPTY_TUPLE, TUPLE1, TUPLE2, TUPLE3];
 }
+
+/// `interp_pickle.py W_Pickler._BATCHSIZE`.
+pub(crate) const BATCHSIZE: usize = 1000;
 
 // ── shared call helpers ──────────────────────────────────────────────
 // `call_function` / `call_method` return PY_NULL on failure and stash the
