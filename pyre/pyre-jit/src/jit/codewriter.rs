@@ -3257,6 +3257,7 @@ struct FnPtrIndices {
     delete_attr_fn: HelperHandle,
     build_set_from_array_fn: HelperHandle,
     format_simple_fn: HelperHandle,
+    format_with_spec_fn: HelperHandle,
 }
 
 /// Register every blackhole helper fn pointer with the assembler in
@@ -3530,6 +3531,13 @@ fn register_helper_fn_pointers(
         cpu.format_simple_fn as *const (),
         CallFlavor::MayForce,
     );
+    // `bh_format_with_spec_fn` formats a value with a spec (user `__format__`
+    // may run Python) → `MayForce`.  Appended last to preserve fn_ptr indices.
+    let format_with_spec_fn = bind(
+        assembler,
+        cpu.format_with_spec_fn as *const (),
+        CallFlavor::MayForce,
+    );
     FnPtrIndices {
         call_fn,
         load_global_fn,
@@ -3567,6 +3575,7 @@ fn register_helper_fn_pointers(
         delete_attr_fn,
         build_set_from_array_fn,
         format_simple_fn,
+        format_with_spec_fn,
     }
 }
 
@@ -4508,6 +4517,11 @@ impl CodeWriter {
                     idx: format_simple_fn_idx,
                     flavor: _format_simple_fn_flavor,
                 },
+            format_with_spec_fn:
+                HelperHandle {
+                    idx: format_with_spec_fn_idx,
+                    flavor: _format_with_spec_fn_flavor,
+                },
         } = register_helper_fn_pointers(&mut assembler, self.cpu());
 
         // codewriter.py:37 `portal_jd = self.callcontrol.jitdriver_sd_from_portal_graph(graph)`
@@ -4576,6 +4590,7 @@ impl CodeWriter {
                 delete_attr_fn_idx,
                 build_set_from_array_fn_idx,
                 format_simple_fn_idx,
+                format_with_spec_fn_idx,
             });
         }
 
@@ -8258,14 +8273,34 @@ impl CodeWriter {
                             emit_abort_permanent!(py_pc);
                         }
 
-                        // FormatWithSpec: pops 2 (spec, value), pushes 1 string. Net: -1.
+                        // FormatWithSpec: pops 2 (spec=TOS, value=TOS1), pushes 1
+                        // string. Net: -1.  `f"{x:.2f}"` →
+                        // `format_with_spec(value, spec)` HLOp lowered to
+                        // `residual_call_r_r(format_with_spec_fn_idx,
+                        // ListR[value, spec])` (`bh_format_with_spec_fn` formats
+                        // through the shared `runtime_ops::format_value`; a user
+                        // `__format__` may run Python → MayForce).
                         Instruction::FormatWithSpec => {
-                            for _ in 0..2 {
-                                pop_and_decr_depth(&mut current_state, &mut current_depth);
+                            let spec_reg = emit_popvalue_ref!(current_depth, py_pc);
+                            let spec_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            if let super::flow::FlowValue::Variable(v) = &spec_value {
+                                pin!(Some(*v), spec_reg);
                             }
-                            push_fresh_ref(&mut current_state, &mut graph);
-                            current_depth += 1;
-                            emit_abort_permanent!(py_pc);
+                            let val_reg = emit_popvalue_ref!(current_depth, py_pc);
+                            let val_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            if let super::flow::FlowValue::Variable(v) = &val_value {
+                                pin!(Some(*v), val_reg);
+                            }
+                            let result_value = emit_graph_op_with_result(
+                                &mut graph,
+                                &current_block.block(),
+                                "format_with_spec",
+                                vec![val_value.into(), spec_value.into()],
+                                Kind::Ref,
+                                py_pc as i64,
+                            );
+                            pin!(Some(result_value), stack_base + current_depth);
+                            push_and_bump!(result_value.into(), py_pc);
                         }
 
                         // LoadSuperAttr: pops 3 (super, cls, self).

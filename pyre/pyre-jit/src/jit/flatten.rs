@@ -3265,6 +3265,15 @@ pub struct LoweringContext {
     /// `bh_format_simple_fn` formats with the empty spec (a user `__format__`
     /// may force → `MayForce`).
     pub format_simple_fn_idx: u16,
+    /// `format_with_spec_fn` descrs-pool index — see codewriter.rs
+    /// `register_helper_fn_pointers` (`bind(assembler,
+    /// cpu.format_with_spec_fn, CallFlavor::MayForce)`).  FORMAT_WITH_SPEC
+    /// records the `format_with_spec(value, spec)` HLOp lowered to
+    /// `residual_call_r_r(ConstInt(fn_idx), ListR([value, spec]), Descr) →
+    /// reg` via [`lower_format_with_spec_hlop_to_insn`];
+    /// `bh_format_with_spec_fn` formats `value` with `spec` (a user
+    /// `__format__` may force → `MayForce`).
+    pub format_with_spec_fn_idx: u16,
 }
 
 /// Map a BINARY_OP HLOp opname (`add`/.../`xor`/`getitem` plus the
@@ -4716,6 +4725,9 @@ where
     if let Some(insn) = lower_format_simple_hlop_to_insn(op, ctx, get_register, lower_constant) {
         return Some(insn);
     }
+    if let Some(insn) = lower_format_with_spec_hlop_to_insn(op, ctx, get_register, lower_constant) {
+        return Some(insn);
+    }
     None
 }
 
@@ -4929,6 +4941,43 @@ where
     Some(build_residual_call_r_r_insn_from_operands(
         ctx.format_simple_fn_idx,
         vec![value],
+        CallFlavor::MayForce,
+        majit_ir::PyreHelperKind::None,
+        dst_reg,
+    ))
+}
+
+/// Lower the FORMAT_WITH_SPEC pyre HLOp `format_with_spec(value, spec)` →
+/// `result: Ref` to `residual_call_r_r(ConstInt(format_with_spec_fn_idx),
+/// ListR([value, spec]), Descr) → reg`.  `bh_format_with_spec_fn(value,
+/// spec)` formats `value` with `spec` (`f"{x:.2f}"`) through the shared
+/// `runtime_ops::format_value`; a user `__format__` may force
+/// virtualizables → `MayForce`.
+///
+/// Returns `None` for non-`format_with_spec` opnames so the caller can fall
+/// through to other lowering arms.
+pub fn lower_format_with_spec_hlop_to_insn<F, LC>(
+    op: &super::flow::SpaceOperation,
+    ctx: &LoweringContext,
+    get_register: &mut F,
+    lower_constant: &mut LC,
+) -> Option<Insn>
+where
+    F: FnMut(super::flow::Variable) -> Register,
+    LC: FnMut(&Constant) -> Operand,
+{
+    if op.opname != "format_with_spec" || op.args.len() != 2 {
+        return None;
+    }
+    let value = operand_for_value_arg(&op.args[0], get_register, lower_constant)?;
+    let spec = operand_for_value_arg(&op.args[1], get_register, lower_constant)?;
+    let dst_reg = match &op.result {
+        Some(super::flow::FlowValue::Variable(var)) => get_register(*var),
+        _ => return None,
+    };
+    Some(build_residual_call_r_r_insn_from_operands(
+        ctx.format_with_spec_fn_idx,
+        vec![value, spec],
         CallFlavor::MayForce,
         majit_ir::PyreHelperKind::None,
         dst_reg,
@@ -6429,6 +6478,7 @@ mod tests {
             delete_attr_fn_idx: 0,
             build_set_from_array_fn_idx: 0,
             format_simple_fn_idx: 0,
+            format_with_spec_fn_idx: 0,
 };
         let mut on = SSARepr::new("setattr_on");
         let mut on_regallocs = make_regallocs();
@@ -6572,6 +6622,7 @@ mod tests {
             delete_attr_fn_idx: 0,
             build_set_from_array_fn_idx: 0,
             format_simple_fn_idx: 0,
+            format_with_spec_fn_idx: 0,
 };
 
         let mut ssarepr = SSARepr::new("retired_families");
@@ -6702,6 +6753,7 @@ mod tests {
             delete_attr_fn_idx: 0,
             build_set_from_array_fn_idx: 0,
             format_simple_fn_idx: 0,
+            format_with_spec_fn_idx: 0,
 };
 
         let mut ssarepr = SSARepr::new("trailing_live");
@@ -6795,6 +6847,7 @@ mod tests {
             delete_attr_fn_idx: 0,
             build_set_from_array_fn_idx: 0,
             format_simple_fn_idx: 0,
+            format_with_spec_fn_idx: 0,
 };
 
         let mut ssarepr = SSARepr::new("multi_block_lowering");
@@ -6932,6 +6985,7 @@ mod tests {
             delete_attr_fn_idx: 0,
             build_set_from_array_fn_idx: 0,
             format_simple_fn_idx: 0,
+            format_with_spec_fn_idx: 0,
 };
 
         let mut ssarepr = SSARepr::new("pyre_walker_2exit");
@@ -7114,6 +7168,7 @@ mod tests {
             delete_attr_fn_idx: 0,
             build_set_from_array_fn_idx: 0,
             format_simple_fn_idx: 0,
+            format_with_spec_fn_idx: 0,
 });
 
         let mut regallocs = perform_register_allocation_all_kinds(&graph);
@@ -7345,6 +7400,7 @@ mod tests {
             delete_attr_fn_idx: 0,
             build_set_from_array_fn_idx: 0,
             format_simple_fn_idx: 0,
+            format_with_spec_fn_idx: 0,
 };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -7442,6 +7498,7 @@ mod tests {
             delete_attr_fn_idx: 0,
             build_set_from_array_fn_idx: 0,
             format_simple_fn_idx: 0,
+            format_with_spec_fn_idx: 0,
 };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -7483,6 +7540,7 @@ mod tests {
             delete_attr_fn_idx: 0,
             build_set_from_array_fn_idx: 0,
             format_simple_fn_idx: 0,
+            format_with_spec_fn_idx: 0,
 };
 
         let hlop = SpaceOperation::new("sub", vec![lhs.into(), rhs.into()], Some(result.into()), 0);
@@ -7597,6 +7655,7 @@ mod tests {
             delete_attr_fn_idx: 0,
             build_set_from_array_fn_idx: 0,
             format_simple_fn_idx: 0,
+            format_with_spec_fn_idx: 0,
 };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -7670,6 +7729,7 @@ mod tests {
             delete_attr_fn_idx: 0,
             build_set_from_array_fn_idx: 0,
             format_simple_fn_idx: 0,
+            format_with_spec_fn_idx: 0,
 };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -7709,6 +7769,7 @@ mod tests {
             delete_attr_fn_idx: 0,
             build_set_from_array_fn_idx: 0,
             format_simple_fn_idx: 0,
+            format_with_spec_fn_idx: 0,
 };
         let hlop = SpaceOperation::new("eq", vec![lhs.into(), rhs.into()], Some(result.into()), 0);
         let mut get_register = identity_register_mapper();
@@ -7755,6 +7816,7 @@ mod tests {
             delete_attr_fn_idx: 0,
             build_set_from_array_fn_idx: 0,
             format_simple_fn_idx: 0,
+            format_with_spec_fn_idx: 0,
 };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -7828,6 +7890,7 @@ mod tests {
             delete_attr_fn_idx: 0,
             build_set_from_array_fn_idx: 0,
             format_simple_fn_idx: 0,
+            format_with_spec_fn_idx: 0,
 };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -7864,6 +7927,7 @@ mod tests {
             delete_attr_fn_idx: 0,
             build_set_from_array_fn_idx: 0,
             format_simple_fn_idx: 0,
+            format_with_spec_fn_idx: 0,
 };
         let hlop = SpaceOperation::new("bool", vec![cond.into()], Some(result.into()), 0);
         let mut get_register = identity_register_mapper();
@@ -7914,6 +7978,7 @@ mod tests {
             delete_attr_fn_idx: 0,
             build_set_from_array_fn_idx: 0,
             format_simple_fn_idx: 0,
+            format_with_spec_fn_idx: 0,
 };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -7980,6 +8045,7 @@ mod tests {
             delete_attr_fn_idx: 0,
             build_set_from_array_fn_idx: 0,
             format_simple_fn_idx: 0,
+            format_with_spec_fn_idx: 0,
 };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -8031,6 +8097,7 @@ mod tests {
             delete_attr_fn_idx: 0,
             build_set_from_array_fn_idx: 0,
             format_simple_fn_idx: 0,
+            format_with_spec_fn_idx: 0,
 };
         let hlop = SpaceOperation::new(
             "setitem",
@@ -8097,6 +8164,7 @@ mod tests {
             delete_attr_fn_idx: 0,
             build_set_from_array_fn_idx: 0,
             format_simple_fn_idx: 0,
+            format_with_spec_fn_idx: 0,
 };
         let mut get_register_a = identity_register_mapper();
         let mut get_register_b = identity_register_mapper();
@@ -8139,6 +8207,7 @@ mod tests {
             delete_attr_fn_idx: 0,
             build_set_from_array_fn_idx: 0,
             format_simple_fn_idx: 0,
+            format_with_spec_fn_idx: 0,
 };
         let mut get_register_a = identity_register_mapper();
         let mut get_register_b = identity_register_mapper();
@@ -8181,6 +8250,7 @@ mod tests {
             delete_attr_fn_idx: 0,
             build_set_from_array_fn_idx: 0,
             format_simple_fn_idx: 0,
+            format_with_spec_fn_idx: 0,
 };
         let mut get_register_a = identity_register_mapper();
         let mut get_register_b = identity_register_mapper();
@@ -8228,6 +8298,7 @@ mod tests {
             delete_attr_fn_idx: 0,
             build_set_from_array_fn_idx: 0,
             format_simple_fn_idx: 0,
+            format_with_spec_fn_idx: 0,
 };
         let mut get_register_a = identity_register_mapper();
         let mut get_register_b = identity_register_mapper();
@@ -8289,6 +8360,7 @@ mod tests {
             delete_attr_fn_idx: 0,
             build_set_from_array_fn_idx: 0,
             format_simple_fn_idx: 0,
+            format_with_spec_fn_idx: 0,
 };
         let mut get_register_a = identity_register_mapper();
         let mut get_register_b = identity_register_mapper();
@@ -9673,6 +9745,7 @@ mod tests {
             delete_attr_fn_idx: 0,
             build_set_from_array_fn_idx: 0,
             format_simple_fn_idx: 0,
+            format_with_spec_fn_idx: 0,
 };
         flatten_graph_for_test_with_lowering(&graph, &mut ssarepr, ctx, Some(cpu));
         ssarepr
@@ -9956,6 +10029,7 @@ mod tests {
             delete_attr_fn_idx: 0,
             build_set_from_array_fn_idx: 0,
             format_simple_fn_idx: 0,
+            format_with_spec_fn_idx: 0,
 };
         let null_or_self_var = Variable::new(VariableId(10), Kind::Ref);
         let op = super::super::flow::SpaceOperation::new(
@@ -10062,6 +10136,7 @@ mod tests {
             delete_attr_fn_idx: 99,
             build_set_from_array_fn_idx: 100,
             format_simple_fn_idx: 101,
+            format_with_spec_fn_idx: 102,
         };
         let code_const = Constant::new(
             super::super::flow::ConstantValue::Signed(0x2000),
@@ -10613,6 +10688,82 @@ mod tests {
                             "ListR = [value], got {:?}",
                             list.content
                         );
+                    }
+                    other => panic!("expected ListR, got {other:?}"),
+                }
+                assert_eq!(
+                    result,
+                    Some(Register {
+                        kind: Kind::Ref,
+                        index: 102
+                    }),
+                );
+            }
+            _ => panic!("expected Insn::Op, got {insn:?}"),
+        }
+    }
+
+    #[test]
+    fn lower_format_with_spec_hlop_emits_format_with_spec_fn_residual() {
+        // `format_with_spec(value, spec)` →
+        // `residual_call_r_r(ConstInt(format_with_spec_fn_idx),
+        // ListR([value, spec]), Descr) → reg` (MayForce — a user
+        // `__format__` may run Python).
+        let value_var = Variable::new(VariableId(8), Kind::Ref);
+        let spec_var = Variable::new(VariableId(10), Kind::Ref);
+        let result_var = Variable::new(VariableId(9), Kind::Ref);
+        let (ctx, _, _) = load_attr_lowering_fixture();
+        let op = super::super::flow::SpaceOperation::new(
+            "format_with_spec",
+            vec![value_var.into(), spec_var.into()],
+            Some(result_var.into()),
+            0,
+        );
+        let mut get_register = |var: Variable| match var.id {
+            VariableId(8) => Register {
+                kind: Kind::Ref,
+                index: 101,
+            },
+            VariableId(10) => Register {
+                kind: Kind::Ref,
+                index: 103,
+            },
+            VariableId(9) => Register {
+                kind: Kind::Ref,
+                index: 102,
+            },
+            _ => panic!("unexpected var id {:?}", var.id),
+        };
+        let mut lower_constant = super::flatten_constant_operand_for_test;
+        let insn = super::lower_format_with_spec_hlop_to_insn(
+            &op,
+            &ctx,
+            &mut get_register,
+            &mut lower_constant,
+        )
+        .expect("2-arg format_with_spec lowering must succeed");
+        match insn {
+            Insn::Op {
+                opname,
+                args,
+                result,
+            } => {
+                assert_eq!(opname, "residual_call_r_r");
+                assert!(
+                    matches!(args[0], Operand::ConstInt(102)),
+                    "format_with_spec_fn pool index, got {:?}",
+                    args[0]
+                );
+                match &args[1] {
+                    Operand::ListOfKind(list) => {
+                        assert_eq!(list.kind, Kind::Ref);
+                        match &list.content[..] {
+                            [Operand::Register(value), Operand::Register(spec)] => {
+                                assert_eq!(value.index, 101, "ListR[0] must be value");
+                                assert_eq!(spec.index, 103, "ListR[1] must be spec");
+                            }
+                            other => panic!("ListR must be [value, spec], got {other:?}"),
+                        }
                     }
                     other => panic!("expected ListR, got {other:?}"),
                 }

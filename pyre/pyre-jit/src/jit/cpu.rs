@@ -64,6 +64,9 @@ pub struct Cpu {
     /// FORMAT_SIMPLE residual — `value → str` (`f"{x}"`, empty spec).
     /// User `__format__` may run Python (fallible).
     pub format_simple_fn: extern "C" fn(i64) -> i64,
+    /// FORMAT_WITH_SPEC residual — `(value, spec) → str` (`f"{x:.2f}"`).
+    /// User `__format__` may run Python (fallible).
+    pub format_with_spec_fn: extern "C" fn(i64, i64) -> i64,
     /// `bhimpl_compare_op` — RPython compare_op opcodes.
     pub compare_fn: extern "C" fn(i64, i64, i64) -> i64,
     /// `bhimpl_binary_op` — RPython binary_op opcodes.
@@ -199,6 +202,7 @@ impl Cpu {
             delete_subscr_fn: crate::call_jit::bh_delete_subscr_fn,
             delete_attr_fn: crate::call_jit::bh_delete_attr_fn,
             format_simple_fn: crate::call_jit::bh_format_simple_fn,
+            format_with_spec_fn: crate::call_jit::bh_format_with_spec_fn,
             compare_fn: crate::call_jit::bh_compare_fn,
             binary_op_fn: crate::call_jit::bh_binary_op_fn,
             box_int_fn: crate::call_jit::bh_box_int_fn,
