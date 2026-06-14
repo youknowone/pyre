@@ -8,8 +8,8 @@ use pyre_object::PyObjectRef;
 use crate::PyError;
 
 use super::{
-    BATCHSIZE, DEFAULT_PROTOCOL, FRAME_SIZE_MIN, HIGHEST_PROTOCOL, call_fn, call_meth, encode_long,
-    getattribute_dotted, import_module, op, pickling_error,
+    BATCHSIZE, DEFAULT_PROTOCOL, FRAME_SIZE_MIN, FRAME_SIZE_TARGET, HIGHEST_PROTOCOL, call_fn,
+    call_meth, encode_long, getattribute_dotted, import_module, op, pickling_error,
 };
 
 #[crate::pyre_class("_pickle.Pickler")]
@@ -38,6 +38,88 @@ struct PickleCtx {
 impl PickleCtx {
     fn memo_get(&self, w_obj: PyObjectRef) -> Option<usize> {
         self.memo.get(&(w_obj as usize)).copied()
+    }
+}
+
+/// `interp_pickle.py _Framer` — accumulates output into frames. Bytes are
+/// appended to the active frame; once a frame reaches `FRAME_SIZE_TARGET`
+/// it is flushed (FRAME opcode + 8-byte little-endian length + body when the
+/// body is at least `FRAME_SIZE_MIN` bytes). Large payloads bypass the frame
+/// entirely (`write_large_bytes`). When framing is off (protocol < 4) the
+/// active frame is `None` and bytes pass straight through to `output`.
+///
+/// `push` / `extend_from_slice` mirror the `Vec<u8>` methods the save
+/// routines call, so they write through the framer unchanged.
+struct Framer {
+    current_frame: Option<Vec<u8>>,
+    output: Vec<u8>,
+}
+
+impl Framer {
+    fn new() -> Self {
+        Framer {
+            current_frame: None,
+            output: Vec::new(),
+        }
+    }
+
+    /// `_Framer.write` (single byte).
+    fn push(&mut self, byte: u8) {
+        match &mut self.current_frame {
+            Some(f) => f.push(byte),
+            None => self.output.push(byte),
+        }
+    }
+
+    /// `_Framer.write` (slice).
+    fn extend_from_slice(&mut self, data: &[u8]) {
+        match &mut self.current_frame {
+            Some(f) => f.extend_from_slice(data),
+            None => self.output.extend_from_slice(data),
+        }
+    }
+
+    /// `_Framer.start_framing`.
+    fn start_framing(&mut self) {
+        self.current_frame = Some(Vec::new());
+    }
+
+    /// `_Framer.end_framing` — flush any remaining frame and stop framing.
+    fn end_framing(&mut self) {
+        if matches!(&self.current_frame, Some(f) if !f.is_empty()) {
+            self.commit_frame(true);
+        }
+        self.current_frame = None;
+    }
+
+    /// `_Framer.commit_frame` — flush the active frame when it has reached
+    /// the target size (or `force`).
+    fn commit_frame(&mut self, force: bool) {
+        let flush = match &self.current_frame {
+            Some(f) => f.len() >= FRAME_SIZE_TARGET || force,
+            None => false,
+        };
+        if !flush {
+            return;
+        }
+        let data = std::mem::take(self.current_frame.as_mut().unwrap());
+        if data.len() >= FRAME_SIZE_MIN {
+            self.output.push(op::FRAME);
+            self.output
+                .extend_from_slice(&(data.len() as u64).to_le_bytes());
+        }
+        self.output.extend_from_slice(&data);
+    }
+
+    /// `_Framer.write_large_bytes` — terminate the active frame, then write a
+    /// large header + payload directly (unframed) to avoid copying the
+    /// payload into the frame builder.
+    fn write_large_bytes(&mut self, header: &[u8], payload: &[u8]) {
+        if matches!(&self.current_frame, Some(f) if !f.is_empty()) {
+            self.commit_frame(true);
+        }
+        self.output.extend_from_slice(header);
+        self.output.extend_from_slice(payload);
     }
 }
 
@@ -113,22 +195,22 @@ impl W_Pickler {
             memo_size: 0,
             pers_func,
         };
-        let mut body: Vec<u8> = Vec::new();
-        save(&mut ctx, &mut body, w_obj)?;
-        body.push(op::STOP);
-
-        let mut out: Vec<u8> = Vec::new();
+        // PROTO is written before framing begins (it stays outside the
+        // frame); STOP is written while framing is active (inside the last
+        // frame). `end_framing` flushes the final frame.
+        let mut fr = Framer::new();
         if proto >= 2 {
-            out.push(op::PROTO);
-            out.push(proto as u8);
+            fr.push(op::PROTO);
+            fr.push(proto as u8);
         }
-        if framing && body.len() >= FRAME_SIZE_MIN {
-            out.push(op::FRAME);
-            out.extend_from_slice(&(body.len() as u64).to_le_bytes());
+        if framing {
+            fr.start_framing();
         }
-        out.extend_from_slice(&body);
+        save(&mut ctx, &mut fr, w_obj)?;
+        fr.push(op::STOP);
+        fr.end_framing();
 
-        let w_bytes = pyre_object::w_bytes_from_bytes(&out);
+        let w_bytes = pyre_object::w_bytes_from_bytes(&fr.output);
         // `w_file` may have moved during the build; re-read from the pin.
         let w_file = pyre_object::gc_roots::shadow_stack_get(file_slot);
         call_meth(w_file, "write", &[w_bytes])?;
@@ -139,7 +221,10 @@ impl W_Pickler {
 /// `interp_pickle.py W_Pickler.save` with the persistent-id hook: every
 /// object is first offered to `persistent_id`; a non-None result is saved
 /// as a persistent reference instead of by value.
-fn save(ctx: &mut PickleCtx, buf: &mut Vec<u8>, w_obj: PyObjectRef) -> Result<(), PyError> {
+fn save(ctx: &mut PickleCtx, buf: &mut Framer, w_obj: PyObjectRef) -> Result<(), PyError> {
+    // A frame boundary can only fall at the start of a `save`, never inside
+    // an object; flush the active frame once it has grown past the target.
+    buf.commit_frame(false);
     if !ctx.pers_func.is_null() {
         let w_pid = call_fn(ctx.pers_func, &[w_obj])?;
         if !unsafe { pyre_object::is_none(w_pid) } {
@@ -152,7 +237,7 @@ fn save(ctx: &mut PickleCtx, buf: &mut Vec<u8>, w_obj: PyObjectRef) -> Result<()
 /// `interp_pickle.py save_pers` — emit a persistent reference. The
 /// persistent id itself is saved by value (skipping the persistent-id
 /// hook) in binary protocols, or as an ASCII line in protocol 0.
-fn save_pers(ctx: &mut PickleCtx, buf: &mut Vec<u8>, w_pid: PyObjectRef) -> Result<(), PyError> {
+fn save_pers(ctx: &mut PickleCtx, buf: &mut Framer, w_pid: PyObjectRef) -> Result<(), PyError> {
     if ctx.bin {
         save_object(ctx, buf, w_pid)?;
         buf.push(op::BINPERSID);
@@ -181,7 +266,7 @@ fn save_pers(ctx: &mut PickleCtx, buf: &mut Vec<u8>, w_pid: PyObjectRef) -> Resu
 /// int because a bool is not an int here, and `is_int_or_long` also covers
 /// big integers). Atoms are never memoized; everything else is checked
 /// against the identity memo for a GET back-reference before being saved.
-fn save_object(ctx: &mut PickleCtx, buf: &mut Vec<u8>, w_obj: PyObjectRef) -> Result<(), PyError> {
+fn save_object(ctx: &mut PickleCtx, buf: &mut Framer, w_obj: PyObjectRef) -> Result<(), PyError> {
     // Atoms — never memoized.
     if unsafe { pyre_object::is_none(w_obj) } {
         buf.push(op::NONE);
@@ -264,7 +349,7 @@ fn save_object(ctx: &mut PickleCtx, buf: &mut Vec<u8>, w_obj: PyObjectRef) -> Re
     Err(pickling_error("__reduce__ must return string or tuple"))
 }
 
-fn save_bool(ctx: &PickleCtx, buf: &mut Vec<u8>, w_obj: PyObjectRef) {
+fn save_bool(ctx: &PickleCtx, buf: &mut Framer, w_obj: PyObjectRef) {
     let truthy = crate::baseobjspace::is_true(w_obj);
     if ctx.proto >= 2 {
         buf.push(if truthy { op::NEWTRUE } else { op::NEWFALSE });
@@ -274,7 +359,7 @@ fn save_bool(ctx: &PickleCtx, buf: &mut Vec<u8>, w_obj: PyObjectRef) {
     }
 }
 
-fn save_long(ctx: &PickleCtx, buf: &mut Vec<u8>, w_obj: PyObjectRef) -> Result<(), PyError> {
+fn save_long(ctx: &PickleCtx, buf: &mut Framer, w_obj: PyObjectRef) -> Result<(), PyError> {
     let small = crate::baseobjspace::int_w(w_obj).ok();
     let to_big = |v: Option<i64>| match v {
         Some(v) => BigInt::from(v),
@@ -320,7 +405,7 @@ fn save_long(ctx: &PickleCtx, buf: &mut Vec<u8>, w_obj: PyObjectRef) -> Result<(
     Ok(())
 }
 
-fn write_long(buf: &mut Vec<u8>, enc: &[u8]) {
+fn write_long(buf: &mut Framer, enc: &[u8]) {
     let n = enc.len();
     if n < 256 {
         buf.push(op::LONG1);
@@ -332,7 +417,7 @@ fn write_long(buf: &mut Vec<u8>, enc: &[u8]) {
     buf.extend_from_slice(enc);
 }
 
-fn save_float(ctx: &PickleCtx, buf: &mut Vec<u8>, w_obj: PyObjectRef) -> Result<(), PyError> {
+fn save_float(ctx: &PickleCtx, buf: &mut Framer, w_obj: PyObjectRef) -> Result<(), PyError> {
     if ctx.bin {
         let f = crate::baseobjspace::float_w(w_obj)?;
         // BINFLOAT — 8-byte big-endian IEEE 754.
@@ -348,7 +433,7 @@ fn save_float(ctx: &PickleCtx, buf: &mut Vec<u8>, w_obj: PyObjectRef) -> Result<
     Ok(())
 }
 
-fn save_bytes(ctx: &mut PickleCtx, buf: &mut Vec<u8>, w_obj: PyObjectRef) -> Result<(), PyError> {
+fn save_bytes(ctx: &mut PickleCtx, buf: &mut Framer, w_obj: PyObjectRef) -> Result<(), PyError> {
     // proto < 3 emits a `codecs.encode(s, 'latin1')` / `bytes()` reduce
     // instead of a BINBYTES opcode (interp_pickle.py:1349).
     if ctx.proto < 3 {
@@ -372,19 +457,25 @@ fn save_bytes(ctx: &mut PickleCtx, buf: &mut Vec<u8>, w_obj: PyObjectRef) -> Res
     if n <= 0xff {
         buf.push(op::SHORT_BINBYTES);
         buf.push(n as u8);
+        buf.extend_from_slice(data);
     } else if n > 0xffff_ffff && ctx.proto >= 4 {
-        buf.push(op::BINBYTES8);
-        buf.extend_from_slice(&(n as u64).to_le_bytes());
+        let mut header = vec![op::BINBYTES8];
+        header.extend_from_slice(&(n as u64).to_le_bytes());
+        buf.write_large_bytes(&header, data);
+    } else if n >= FRAME_SIZE_TARGET {
+        let mut header = vec![op::BINBYTES];
+        header.extend_from_slice(&(n as u32).to_le_bytes());
+        buf.write_large_bytes(&header, data);
     } else {
         buf.push(op::BINBYTES);
         buf.extend_from_slice(&(n as u32).to_le_bytes());
+        buf.extend_from_slice(data);
     }
-    buf.extend_from_slice(data);
     memoize(ctx, buf, w_obj);
     Ok(())
 }
 
-fn save_str(ctx: &mut PickleCtx, buf: &mut Vec<u8>, w_obj: PyObjectRef) -> Result<(), PyError> {
+fn save_str(ctx: &mut PickleCtx, buf: &mut Framer, w_obj: PyObjectRef) -> Result<(), PyError> {
     if ctx.bin {
         let s = unsafe { pyre_object::strobject::w_str_get_value(w_obj) };
         let data = s.as_bytes();
@@ -392,14 +483,20 @@ fn save_str(ctx: &mut PickleCtx, buf: &mut Vec<u8>, w_obj: PyObjectRef) -> Resul
         if n <= 0xff && ctx.proto >= 4 {
             buf.push(op::SHORT_BINUNICODE);
             buf.push(n as u8);
+            buf.extend_from_slice(data);
         } else if n > 0xffff_ffff && ctx.proto >= 4 {
-            buf.push(op::BINUNICODE8);
-            buf.extend_from_slice(&(n as u64).to_le_bytes());
+            let mut header = vec![op::BINUNICODE8];
+            header.extend_from_slice(&(n as u64).to_le_bytes());
+            buf.write_large_bytes(&header, data);
+        } else if n >= FRAME_SIZE_TARGET {
+            let mut header = vec![op::BINUNICODE];
+            header.extend_from_slice(&(n as u32).to_le_bytes());
+            buf.write_large_bytes(&header, data);
         } else {
             buf.push(op::BINUNICODE);
             buf.extend_from_slice(&(n as u32).to_le_bytes());
+            buf.extend_from_slice(data);
         }
-        buf.extend_from_slice(data);
     } else {
         // proto 0: UNICODE + raw-unicode-escape. The codec leaves
         // backslash / NUL / newline / CR / EOF-on-DOS literal, so escape
@@ -433,7 +530,7 @@ fn save_str(ctx: &mut PickleCtx, buf: &mut Vec<u8>, w_obj: PyObjectRef) -> Resul
 }
 
 /// `interp_pickle.py save_tuple`.
-fn save_tuple(ctx: &mut PickleCtx, buf: &mut Vec<u8>, w_obj: PyObjectRef) -> Result<(), PyError> {
+fn save_tuple(ctx: &mut PickleCtx, buf: &mut Framer, w_obj: PyObjectRef) -> Result<(), PyError> {
     let n = unsafe { pyre_object::tupleobject::w_tuple_len(w_obj) };
     if n == 0 {
         if ctx.bin {
@@ -493,7 +590,7 @@ fn save_tuple(ctx: &mut PickleCtx, buf: &mut Vec<u8>, w_obj: PyObjectRef) -> Res
 /// `interp_pickle.py save_list`. The PyPy ascii/bytes-list fast paths are
 /// gated on `pypy_extensions` (off here) so the generic path is used,
 /// matching CPython's wire format.
-fn save_list(ctx: &mut PickleCtx, buf: &mut Vec<u8>, w_obj: PyObjectRef) -> Result<(), PyError> {
+fn save_list(ctx: &mut PickleCtx, buf: &mut Framer, w_obj: PyObjectRef) -> Result<(), PyError> {
     if ctx.bin {
         buf.push(op::EMPTY_LIST);
     } else {
@@ -510,7 +607,7 @@ fn save_list(ctx: &mut PickleCtx, buf: &mut Vec<u8>, w_obj: PyObjectRef) -> Resu
 }
 
 /// `interp_pickle.py save_dict`.
-fn save_dict(ctx: &mut PickleCtx, buf: &mut Vec<u8>, w_obj: PyObjectRef) -> Result<(), PyError> {
+fn save_dict(ctx: &mut PickleCtx, buf: &mut Framer, w_obj: PyObjectRef) -> Result<(), PyError> {
     if ctx.bin {
         buf.push(op::EMPTY_DICT);
     } else {
@@ -526,7 +623,7 @@ fn save_dict(ctx: &mut PickleCtx, buf: &mut Vec<u8>, w_obj: PyObjectRef) -> Resu
 /// `interp_pickle.py save_set`. Sets are unordered, so the wire bytes are
 /// not byte-identical to CPython, but the encoding round-trips. The
 /// protocol < 4 reduce fallback arrives with `save_reduce`.
-fn save_set(ctx: &mut PickleCtx, buf: &mut Vec<u8>, w_obj: PyObjectRef) -> Result<(), PyError> {
+fn save_set(ctx: &mut PickleCtx, buf: &mut Framer, w_obj: PyObjectRef) -> Result<(), PyError> {
     if ctx.proto < 4 {
         // save_reduce(set, (list(obj),)).
         let items = unsafe { pyre_object::setobject::w_set_items(w_obj) };
@@ -566,7 +663,7 @@ fn save_set(ctx: &mut PickleCtx, buf: &mut Vec<u8>, w_obj: PyObjectRef) -> Resul
 /// Unordered, so not byte-identical to CPython.
 fn save_frozenset(
     ctx: &mut PickleCtx,
-    buf: &mut Vec<u8>,
+    buf: &mut Framer,
     w_obj: PyObjectRef,
 ) -> Result<(), PyError> {
     if ctx.proto < 4 {
@@ -597,7 +694,7 @@ fn save_frozenset(
 /// reach the generic reduce path).
 fn save_bytearray(
     ctx: &mut PickleCtx,
-    buf: &mut Vec<u8>,
+    buf: &mut Framer,
     w_obj: PyObjectRef,
 ) -> Result<(), PyError> {
     if ctx.proto < 5 {
@@ -614,9 +711,16 @@ fn save_bytearray(
         return save_reduce(ctx, buf, &[w_bytearray_type, w_args], Some(w_obj));
     }
     let data = unsafe { pyre_object::bytearrayobject::w_bytearray_data(w_obj) };
-    buf.push(op::BYTEARRAY8);
-    buf.extend_from_slice(&(data.len() as u64).to_le_bytes());
-    buf.extend_from_slice(data);
+    let n = data.len();
+    if n >= FRAME_SIZE_TARGET {
+        let mut header = vec![op::BYTEARRAY8];
+        header.extend_from_slice(&(n as u64).to_le_bytes());
+        buf.write_large_bytes(&header, data);
+    } else {
+        buf.push(op::BYTEARRAY8);
+        buf.extend_from_slice(&(n as u64).to_le_bytes());
+        buf.extend_from_slice(data);
+    }
     memoize(ctx, buf, w_obj);
     Ok(())
 }
@@ -625,7 +729,7 @@ fn save_bytearray(
 /// APPEND; otherwise MARK … APPENDS in batches of `BATCHSIZE`.
 fn batch_appends(
     ctx: &mut PickleCtx,
-    buf: &mut Vec<u8>,
+    buf: &mut Framer,
     items: &[PyObjectRef],
 ) -> Result<(), PyError> {
     if !ctx.bin {
@@ -661,7 +765,7 @@ fn batch_appends(
 /// otherwise MARK … SETITEMS in batches of `BATCHSIZE`.
 fn batch_setitems(
     ctx: &mut PickleCtx,
-    buf: &mut Vec<u8>,
+    buf: &mut Framer,
     items: &[(PyObjectRef, PyObjectRef)],
 ) -> Result<(), PyError> {
     if !ctx.bin {
@@ -697,7 +801,7 @@ fn batch_setitems(
 }
 
 /// `interp_pickle.py W_Pickler.write_get` — emit a GET back-reference.
-fn write_get(ctx: &PickleCtx, buf: &mut Vec<u8>, idx: usize) {
+fn write_get(ctx: &PickleCtx, buf: &mut Framer, idx: usize) {
     if ctx.bin {
         if idx < 256 {
             buf.push(op::BINGET);
@@ -714,7 +818,7 @@ fn write_get(ctx: &PickleCtx, buf: &mut Vec<u8>, idx: usize) {
 
 /// `interp_pickle.py memoize` — record the object's identity and write the
 /// put opcode.
-fn memoize(ctx: &mut PickleCtx, buf: &mut Vec<u8>, w_obj: PyObjectRef) {
+fn memoize(ctx: &mut PickleCtx, buf: &mut Framer, w_obj: PyObjectRef) {
     let idx = ctx.memo_size;
     ctx.memo_size += 1;
     ctx.memo.insert(w_obj as usize, idx);
@@ -774,7 +878,7 @@ fn whichmodule(w_obj: PyObjectRef, name: &str) -> Result<PyObjectRef, PyError> {
 /// returned a string; otherwise it is derived from `__qualname__`.
 fn save_global(
     ctx: &mut PickleCtx,
-    buf: &mut Vec<u8>,
+    buf: &mut Framer,
     w_obj: PyObjectRef,
     w_name_opt: Option<PyObjectRef>,
 ) -> Result<(), PyError> {
@@ -840,7 +944,7 @@ fn builtin_attr(name: &str) -> Result<PyObjectRef, PyError> {
 /// `(func, args[, state[, listitems[, dictitems[, state_setter]]]])`.
 fn save_reduce(
     ctx: &mut PickleCtx,
-    buf: &mut Vec<u8>,
+    buf: &mut Framer,
     rv: &[PyObjectRef],
     w_obj_opt: Option<PyObjectRef>,
 ) -> Result<(), PyError> {

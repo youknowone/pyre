@@ -27,6 +27,7 @@ pub use unpickler::W_Unpickler;
 pub(crate) const HIGHEST_PROTOCOL: i64 = 5;
 pub(crate) const DEFAULT_PROTOCOL: i64 = 5;
 pub(crate) const FRAME_SIZE_MIN: usize = 4;
+pub(crate) const FRAME_SIZE_TARGET: usize = 64 * 1024;
 
 /// `interp_pickle.py Opcodes`.
 pub(crate) mod op {
