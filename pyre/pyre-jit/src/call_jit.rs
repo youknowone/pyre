@@ -2921,7 +2921,7 @@ fn bh_call_self_recursive_portal(
         Ok(result) => result as i64,
         Err(err) => {
             let exc_obj = err.to_exc_object();
-            majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc_obj as i64));
+            publish_residual_call_exception(exc_obj as i64);
             0
         }
     })
@@ -3277,8 +3277,7 @@ pub extern "C" fn bh_load_global_fn(
                     Ok(None) => {}
                     Err(err) => {
                         let exc_obj = err.to_exc_object();
-                        majit_metainterp::blackhole::BH_LAST_EXC_VALUE
-                            .with(|c| c.set(exc_obj as i64));
+                        publish_residual_call_exception(exc_obj as i64);
                         return 0;
                     }
                 }
@@ -3292,7 +3291,7 @@ pub extern "C" fn bh_load_global_fn(
         format!("name '{}' is not defined", varname),
     );
     let exc_obj = err.to_exc_object();
-    majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc_obj as i64));
+    publish_residual_call_exception(exc_obj as i64);
     0
 }
 
@@ -3398,7 +3397,7 @@ pub extern "C" fn bh_store_attr_fn(obj: i64, value: i64, w_code_ptr: i64, name_i
         value as pyre_object::PyObjectRef,
     ) {
         let exc_obj = err.to_exc_object();
-        majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc_obj as i64));
+        publish_residual_call_exception(exc_obj as i64);
     }
     0
 }
@@ -3429,7 +3428,7 @@ pub extern "C" fn bh_delete_attr_fn(obj: i64, w_code_ptr: i64, name_idx: i64) ->
         pyre_interpreter::baseobjspace::delattr_str(obj as pyre_object::PyObjectRef, name)
     {
         let exc_obj = err.to_exc_object();
-        majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc_obj as i64));
+        publish_residual_call_exception(exc_obj as i64);
     }
     0
 }
@@ -3497,7 +3496,7 @@ pub extern "C" fn bh_import_name_fn(
         Ok(module) => module as i64,
         Err(err) => {
             let exc_obj = err.to_exc_object();
-            majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc_obj as i64));
+            publish_residual_call_exception(exc_obj as i64);
             0
         }
     }
@@ -3539,7 +3538,7 @@ pub extern "C" fn bh_load_super_attr_fn(
         Ok(result) => result as i64,
         Err(err) => {
             let exc_obj = err.to_exc_object();
-            majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc_obj as i64));
+            publish_residual_call_exception(exc_obj as i64);
             0
         }
     }
@@ -3583,7 +3582,7 @@ pub extern "C" fn bh_binary_slice_fn(obj: i64, start: i64, stop: i64) -> i64 {
         Ok(result) => result as i64,
         Err(err) => {
             let exc_obj = err.to_exc_object();
-            majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc_obj as i64));
+            publish_residual_call_exception(exc_obj as i64);
             0
         }
     }
@@ -3602,7 +3601,7 @@ pub extern "C" fn bh_delete_subscr_fn(obj: i64, index: i64) -> i64 {
         index as pyre_object::PyObjectRef,
     ) {
         let exc_obj = err.to_exc_object();
-        majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc_obj as i64));
+        publish_residual_call_exception(exc_obj as i64);
     }
     0
 }
@@ -3835,7 +3834,7 @@ pub extern "C" fn bh_compare_fn(lhs: i64, rhs: i64, op_code: i64) -> i64 {
             pyre_interpreter::PyErrorKind::TypeError,
             "comparison on null operand".to_string(),
         );
-        majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(err.to_exc_object() as i64));
+        publish_residual_call_exception(err.to_exc_object() as i64);
         return 0;
     }
 
@@ -3876,7 +3875,7 @@ pub extern "C" fn bh_compare_fn(lhs: i64, rhs: i64, op_code: i64) -> i64 {
             }
             Err(err) => {
                 let exc_obj = err.to_exc_object();
-                majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc_obj as i64));
+                publish_residual_call_exception(exc_obj as i64);
                 return 0;
             }
         }
@@ -3897,14 +3896,14 @@ pub extern "C" fn bh_compare_fn(lhs: i64, rhs: i64, op_code: i64) -> i64 {
             pyre_interpreter::PyErrorKind::TypeError,
             format!("unknown compare op tag {op_code}"),
         );
-        majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(err.to_exc_object() as i64));
+        publish_residual_call_exception(err.to_exc_object() as i64);
         return 0;
     };
     match pyre_interpreter::opcode_ops::compare_value(lhs, rhs, op) {
         Ok(result) => result as i64,
         Err(err) => {
             let exc_obj = err.to_exc_object();
-            majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc_obj as i64));
+            publish_residual_call_exception(exc_obj as i64);
             0
         }
     }
@@ -3922,7 +3921,7 @@ pub extern "C" fn bh_binary_op_fn(lhs: i64, rhs: i64, op_code: i64) -> i64 {
             pyre_interpreter::PyErrorKind::TypeError,
             "binary op on null operand".to_string(),
         );
-        majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(err.to_exc_object() as i64));
+        publish_residual_call_exception(err.to_exc_object() as i64);
         return 0;
     }
 
@@ -3933,14 +3932,14 @@ pub extern "C" fn bh_binary_op_fn(lhs: i64, rhs: i64, op_code: i64) -> i64 {
             pyre_interpreter::PyErrorKind::TypeError,
             format!("unknown binary op tag {op_code}"),
         );
-        majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(err.to_exc_object() as i64));
+        publish_residual_call_exception(err.to_exc_object() as i64);
         return 0;
     };
     match pyre_interpreter::opcode_ops::binary_value(lhs, rhs, op) {
         Ok(result) => result as i64,
         Err(err) => {
             let exc_obj = err.to_exc_object();
-            majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc_obj as i64));
+            publish_residual_call_exception(exc_obj as i64);
             0
         }
     }
@@ -4017,7 +4016,7 @@ pub extern "C" fn bh_build_set_from_array(array: i64) -> i64 {
         Ok(set) => set as i64,
         Err(err) => {
             let exc_obj = err.to_exc_object();
-            majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc_obj as i64));
+            publish_residual_call_exception(exc_obj as i64);
             0
         }
     }
@@ -4053,7 +4052,7 @@ pub extern "C" fn bh_format_simple_fn(value: i64) -> i64 {
         Ok(s) => s as i64,
         Err(err) => {
             let exc_obj = err.to_exc_object();
-            majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc_obj as i64));
+            publish_residual_call_exception(exc_obj as i64);
             0
         }
     }
@@ -4070,7 +4069,7 @@ pub extern "C" fn bh_convert_value_fn(value: i64, conv: i64) -> i64 {
         Ok(s) => s as i64,
         Err(err) => {
             let exc_obj = err.to_exc_object();
-            majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc_obj as i64));
+            publish_residual_call_exception(exc_obj as i64);
             0
         }
     }
@@ -4090,7 +4089,7 @@ pub extern "C" fn bh_format_with_spec_fn(value: i64, spec: i64) -> i64 {
         Ok(s) => s as i64,
         Err(err) => {
             let exc_obj = err.to_exc_object();
-            majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc_obj as i64));
+            publish_residual_call_exception(exc_obj as i64);
             0
         }
     }
@@ -4115,7 +4114,7 @@ pub extern "C" fn bh_load_deref_value_fn(cell: i64) -> i64 {
         let exc_obj =
             pyre_interpreter::PyError::type_error("free variable referenced before assignment")
                 .to_exc_object();
-        majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc_obj as i64));
+        publish_residual_call_exception(exc_obj as i64);
         return 0;
     }
     value as i64
@@ -4131,7 +4130,7 @@ pub extern "C" fn bh_unary_invert_fn(value: i64) -> i64 {
         Ok(result) => result as i64,
         Err(err) => {
             let exc_obj = err.to_exc_object();
-            majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc_obj as i64));
+            publish_residual_call_exception(exc_obj as i64);
             0
         }
     }
@@ -4181,7 +4180,7 @@ pub extern "C" fn bh_load_fast_check_fn(value: i64, w_code_ptr: i64, name_idx: i
         format!("local variable '{name}' referenced before assignment"),
     )
     .to_exc_object();
-    majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc_obj as i64));
+    publish_residual_call_exception(exc_obj as i64);
     0
 }
 
