@@ -1600,6 +1600,36 @@ pub fn blackhole_resume_via_rd_numb(
         eprintln!("[blackhole-resume] rd_numb path, chain built, running _run_forever",);
     }
 
+    // #326 blackhole-continuation rollback snapshot.  The blackhole
+    // commits every STORE_FAST / operand push to the virtualizable heap
+    // frame as it runs forward (`setarrayitem_vable_*` /
+    // `setfield_vable_i`).  If it later aborts — an opcode pyre cannot
+    // translate emits `BC_ABORT_PERMANENT` — the deopt drops back to the
+    // plain interpreter, which re-runs from the guard's resume PC.  But
+    // the heap frame still carries the aborted run's partial forward
+    // mutations, so any side effect already committed before the abort is
+    // applied a second time.  Capture the live frame here, right after the
+    // resume restore put it at the guard snapshot and before `bh.run()`
+    // mutates it, so the abort arm can roll it back and the interpreter's
+    // re-run applies each side effect exactly once.
+    //
+    // Objects are immortal under the current GC (no move/collect), so
+    // holding raw `PyObjectRef`s across `bh.run()` is safe; this snapshot
+    // would have to be registered as a GC root if that ever changes.
+    let vable_rollback: Option<(Vec<PyObjectRef>, usize, isize)> = {
+        let frame_ptr = bh.virtualizable_ptr as *const PyFrame;
+        if frame_ptr.is_null() {
+            None
+        } else {
+            let frame = unsafe { &*frame_ptr };
+            Some((
+                frame.locals_w().as_slice().to_vec(),
+                frame.valuestackdepth,
+                frame.last_instr,
+            ))
+        }
+    };
+
     // blackhole.py:1794-1795 resume_in_blackhole:
     //   current_exc = _prepare_resume_from_failure(guard_opnum, deadframe)
     //   _run_forever(blackholeinterp, current_exc)
@@ -1666,6 +1696,26 @@ pub fn blackhole_resume_via_rd_numb(
             };
         }
         if bh.aborted {
+            // #326: roll the virtualizable heap frame back to the guard
+            // snapshot captured before `bh.run()`, discarding this aborted
+            // run's partial forward mutations.  The interpreter resumes
+            // from the guard resume PC with the pre-blackhole frame state,
+            // so every side effect (the aborting opcode's included) is
+            // applied exactly once instead of twice.
+            if let Some((locals, vsd, last_instr)) = &vable_rollback {
+                let frame_ptr = bh.virtualizable_ptr as *mut PyFrame;
+                if !frame_ptr.is_null() {
+                    let frame = unsafe { &mut *frame_ptr };
+                    let arr = frame.locals_w_mut().as_mut_slice();
+                    // The locals_cells_stack array length is fixed for a
+                    // frame's lifetime; restore it verbatim.
+                    if arr.len() == locals.len() {
+                        arr.copy_from_slice(locals);
+                    }
+                    frame.valuestackdepth = *vsd;
+                    frame.last_instr = *last_instr;
+                }
+            }
             if nbody_debug {
                 eprintln!(
                     "[nbody-debug] blackhole_resume_via_rd_numb failed: bh.aborted position={} last_opcode_position={}",
