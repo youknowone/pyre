@@ -8314,6 +8314,41 @@ impl MIFrame {
             return Ok(Some(pyre_interpreter::StepResult::Continue));
         }
 
+        // POP_TOP / PUSH_EXC_INFO / POP_EXCEPT — the exception-handler trio.
+        //
+        // The auto-gen arm jitcodes recurse through `inline_call` into the
+        // exc-info-stack helper jitcodes whose `PyFrame::pop` is concrete-
+        // executed by `try_execute_residual_call_via_executor` against the live
+        // frame and underflows (`pyframe.rs:1320`, raise_catch_loop /
+        // exception_inlined_callee_caught) — the same live-frame-pop hazard the
+        // StoreFastStoreFast / StoreSubscr hooks above avoid.  Delegate to the
+        // shared symbolic handlers the trait leg already runs: `opcode_pop_top`
+        // (`pop_value`), `OpcodeStepExecutor::push_exc_info` /
+        // `pop_except` (vable-only `pop_value`/`push_value` for the stack
+        // effect plus the EC `sys_exc_value` save/restore GETFIELD_GC /
+        // SETFIELD_GC).  `pop_value`/`push_value` keep the symbolic + vable
+        // shadow + vsd coherent, so this bypasses `apply_walker_stack_effect`
+        // (the early `return` skips both the arm walk and the post-walk
+        // resync).  Same delegation pattern as the hooks above.
+        if matches!(instruction, Instruction::PopTop) {
+            use pyre_interpreter::SharedOpcodeHandler;
+            let _ = op_arg;
+            let _ = SharedOpcodeHandler::pop_value(self)?;
+            return Ok(Some(pyre_interpreter::StepResult::Continue));
+        }
+        if matches!(instruction, Instruction::PushExcInfo) {
+            use pyre_interpreter::OpcodeStepExecutor;
+            let _ = op_arg;
+            OpcodeStepExecutor::push_exc_info(self)?;
+            return Ok(Some(pyre_interpreter::StepResult::Continue));
+        }
+        if matches!(instruction, Instruction::PopExcept) {
+            use pyre_interpreter::OpcodeStepExecutor;
+            let _ = op_arg;
+            OpcodeStepExecutor::pop_except(self)?;
+            return Ok(Some(pyre_interpreter::StepResult::Continue));
+        }
+
         Ok(None)
     }
 
@@ -9548,36 +9583,21 @@ pub fn production_walker_handles(instruction: &Instruction) -> bool {
             // only r0.  Re-enable once arm-entry operand seeding (#405)
             // lands on dispatch_via_miframe_at_opcode_entry.
             | Instruction::StoreSubscr // handled by dispatch_via_walker_for_opcode entry hook
-            // Instruction::PopExcept excluded: same bridge-tracing
-            // rationale as PushExcInfo below — its arm manages the
-            // exception-info stack via impure helper jitcodes the walker
-            // cannot execute concretely, so on the bridge leg the handler's
-            // stack is left inflated and the loop-back `Jump` carries the
-            // wrong arg count.  Trait dispatch executes it concretely.
-            // Instruction::PushExcInfo excluded: its codewriter arm
-            // `inline_call`s the exception-info-stack helper jitcodes,
-            // which branch on the concrete result of an impure /
-            // may-raise `residual_call`.  The production walker only folds
-            // the concrete result of *pure* calls
-            // (`try_fold_pure_call_via_executor`), so the helper's
-            // post-call `goto_if_not` reads a `Null` concrete and mis-routes
-            // into the helper's `raise/r` tail — surfacing a spurious
-            // `SubRaise { exc_concrete: Null }` that aborts every bridge
-            // trace of an exception handler.  The walker path was never
-            // exercised before (the main loop only traces the no-exception
-            // path; the bridge that reaches the handler never compiled
-            // until the exc-value threading fix landed).  Keep PUSH_EXC_INFO
-            // on trait dispatch — which executes the opcode concretely — the
-            // same rationale that excludes `Reraise` above, until the walker
-            // can execute impure residual calls during tracing.
-            // Instruction::PopTop excluded: in the exception-handler
-            // region it pops the matched exception value off the stack the
-            // PUSH_EXC_INFO / POP_EXCEPT helpers manage.  Leaving it on the
-            // walker while those are trait-dispatched desyncs the bridge's
-            // handler-region stack, producing a loop-back `Jump` with the
-            // wrong arg count (bridge fails to compile) and a backend
-            // regalloc panic.  Keep the whole handler region on one concrete
-            // (trait) leg so the bridge's framestate matches the loop entry.
+            // PopExcept / PushExcInfo / PopTop — the exception-handler trio —
+            // handled by the dispatch_via_walker_for_opcode entry hook
+            // (try_walker_direct_opcode_dispatch), NOT the generic arm-jitcode
+            // walk.  The arm walk recurses through `inline_call` into the
+            // exc-info-stack helper jitcodes whose `PyFrame::pop` is
+            // concrete-executed by `try_execute_residual_call_via_executor`
+            // against the live frame and underflows (`pyframe.rs:1320`); the
+            // hook instead delegates to the shared symbolic
+            // `opcode_pop_top`/`push_exc_info`/`pop_except` (vable-only
+            // `pop_value`/`push_value` for the stack effect), exactly as the
+            // StoreSubscr / StoreFastStoreFast hooks avoid the same
+            // live-frame-pop hazard.
+            | Instruction::PopExcept
+            | Instruction::PushExcInfo
+            | Instruction::PopTop
             // PushNull is handled by the dispatch_via_walker_for_opcode
             // entry hook (direct const-NULL symbolic push): its auto-gen
             // arm is an inert residual wrapper (`opcode_push_null` is not
