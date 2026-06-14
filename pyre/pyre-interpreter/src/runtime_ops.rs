@@ -1,7 +1,7 @@
 use std::slice;
 use std::sync::OnceLock;
 
-use crate::bytecode::{BinaryOperator, ComparisonOperator};
+use crate::bytecode::{BinaryOperator, ComparisonOperator, ConvertValueOparg};
 use pyre_object::{
     PY_NULL, PyObjectRef, W_SeqIterator, is_instance, is_list, is_range_iter, is_seq_iter, is_str,
     is_tuple, w_dict_new, w_dict_store, w_int_get_value, w_int_new, w_list_getitem, w_list_len,
@@ -560,6 +560,38 @@ pub fn build_string_from_refs(parts: &[PyObjectRef]) -> PyObjectRef {
         }
     }
     pyre_object::w_str_from_wtf8(result)
+}
+
+/// CONVERT_VALUE conversion code, shared by the interpreter and the JIT
+/// codewriter so the `convert_value` residual carries a stable integer the
+/// C ABI can pass (`ConvertValueOparg` can't cross the residual boundary).
+/// `0 = Str`, `1 = Repr`, `2 = Ascii`, `3 = None` (`None` behaves as `Str`).
+pub fn convert_value_code(conv: ConvertValueOparg) -> i64 {
+    match conv {
+        ConvertValueOparg::Str => 0,
+        ConvertValueOparg::Repr => 1,
+        ConvertValueOparg::Ascii => 2,
+        ConvertValueOparg::None => 3,
+    }
+}
+
+/// CONVERT_VALUE evaluation, shared by the interpreter (`convert_value`) and
+/// the JIT residual (`bh_convert_value_fn`).  `conv` is a
+/// [`convert_value_code`] integer.  `Str` / `None` compute `str(value)` in
+/// WTF-8 so a lone surrogate survives (the `'%s' % x` rewrite path);
+/// `Repr` / `Ascii` go through `py_repr` / `py_ascii`.  A user
+/// `__str__` / `__repr__` may run Python → fallible.
+pub fn convert_value(value: PyObjectRef, conv: i64) -> Result<PyObjectRef, crate::PyError> {
+    if conv == 0 || conv == 3 {
+        let w = unsafe { crate::py_str_wtf8(value)? };
+        return Ok(pyre_object::w_str_from_wtf8(w));
+    }
+    let s = match conv {
+        1 => unsafe { crate::py_repr(value)? },
+        2 => crate::builtins::py_ascii(value)?,
+        _ => unsafe { crate::py_str(value)? },
+    };
+    Ok(pyre_object::w_str_new(&s))
 }
 
 /// FORMAT_SIMPLE / FORMAT_WITH_SPEC evaluation, shared by the interpreter

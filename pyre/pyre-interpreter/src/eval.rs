@@ -2643,22 +2643,8 @@ impl OpcodeStepExecutor for PyFrame {
         // of being forced through a Rust `String` via `py_str`.  This is
         // the path the `'%s' % x` → CONVERT_VALUE/FORMAT_SIMPLE compile
         // rewrite takes.
-        let is_str_conv = matches!(
-            conv,
-            crate::bytecode::ConvertValueOparg::Str | crate::bytecode::ConvertValueOparg::None
-        );
-        if is_str_conv {
-            let w = unsafe { crate::py_str_wtf8(val)? };
-            self.push(pyre_object::w_str_from_wtf8(w));
-            return Ok(());
-        }
-        let s = match conv {
-            crate::bytecode::ConvertValueOparg::Str => unsafe { crate::py_str(val)? },
-            crate::bytecode::ConvertValueOparg::Repr => unsafe { crate::py_repr(val)? },
-            crate::bytecode::ConvertValueOparg::Ascii => crate::builtins::py_ascii(val)?,
-            crate::bytecode::ConvertValueOparg::None => unsafe { crate::py_str(val)? },
-        };
-        self.push(pyre_object::w_str_new(&s));
+        let code = crate::runtime_ops::convert_value_code(conv);
+        self.push(crate::runtime_ops::convert_value(val, code)?);
         Ok(())
     }
 

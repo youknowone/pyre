@@ -3918,6 +3918,23 @@ pub extern "C" fn bh_format_simple_fn(value: i64) -> i64 {
     }
 }
 
+/// CONVERT_VALUE residual (`convert_value` HLOp → `residual_call_ir_r`).
+/// Converts `value` per `conv` (`0=Str/3=None → str`, `1=Repr → repr`,
+/// `2=Ascii → ascii`) through the shared `runtime_ops::convert_value`.  A
+/// user `__str__` / `__repr__` may run Python (`MayForce`); on error the
+/// exception is published through `BH_LAST_EXC_VALUE` for the trailing
+/// `GuardNoException` and the call returns 0.
+pub extern "C" fn bh_convert_value_fn(value: i64, conv: i64) -> i64 {
+    match pyre_interpreter::runtime_ops::convert_value(value as pyre_object::PyObjectRef, conv) {
+        Ok(s) => s as i64,
+        Err(err) => {
+            let exc_obj = err.to_exc_object();
+            majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc_obj as i64));
+            0
+        }
+    }
+}
+
 /// FORMAT_WITH_SPEC residual (`format_with_spec` HLOp → `residual_call_r_r`).
 /// Formats `value` with `spec` (`f"{x:.2f}"`) through the shared
 /// `runtime_ops::format_value`.  A user `__format__` may run Python

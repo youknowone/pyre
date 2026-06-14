@@ -3259,6 +3259,7 @@ struct FnPtrIndices {
     format_simple_fn: HelperHandle,
     format_with_spec_fn: HelperHandle,
     build_string_from_array_fn: HelperHandle,
+    convert_value_fn: HelperHandle,
 }
 
 /// Register every blackhole helper fn pointer with the assembler in
@@ -3547,6 +3548,13 @@ fn register_helper_fn_pointers(
         cpu.build_string_from_array_fn as *const (),
         CallFlavor::Plain,
     );
+    // `bh_convert_value_fn` converts a value (user `__str__` / `__repr__`
+    // may run Python) → `MayForce`.  Appended last to preserve fn_ptr indices.
+    let convert_value_fn = bind(
+        assembler,
+        cpu.convert_value_fn as *const (),
+        CallFlavor::MayForce,
+    );
     FnPtrIndices {
         call_fn,
         load_global_fn,
@@ -3586,6 +3594,7 @@ fn register_helper_fn_pointers(
         format_simple_fn,
         format_with_spec_fn,
         build_string_from_array_fn,
+        convert_value_fn,
     }
 }
 
@@ -4537,6 +4546,11 @@ impl CodeWriter {
                     idx: build_string_from_array_fn_idx,
                     flavor: _build_string_from_array_fn_flavor,
                 },
+            convert_value_fn:
+                HelperHandle {
+                    idx: convert_value_fn_idx,
+                    flavor: _convert_value_fn_flavor,
+                },
         } = register_helper_fn_pointers(&mut assembler, self.cpu());
 
         // codewriter.py:37 `portal_jd = self.callcontrol.jitdriver_sd_from_portal_graph(graph)`
@@ -4607,6 +4621,7 @@ impl CodeWriter {
                 format_simple_fn_idx,
                 format_with_spec_fn_idx,
                 build_string_from_array_fn_idx,
+                convert_value_fn_idx,
             });
         }
 
@@ -8530,9 +8545,44 @@ impl CodeWriter {
                             push_and_bump!(result_value.into(), py_pc);
                         }
 
+                        // ConvertValue: pops 1 (value), pushes 1 (str). Net 0.
+                        // `f"{x!r}"` / the `'%s' % x` rewrite →
+                        // `convert_value(value, conv)` HLOp lowered to
+                        // `residual_call_ir_r(convert_value_fn_idx, ListI[conv],
+                        // ListR[value])`.  `conv` (Str/Repr/Ascii/None) is a
+                        // compile-time `runtime_ops::convert_value_code` baked as
+                        // a constant; `bh_convert_value_fn` runs str/repr/ascii
+                        // (a user `__str__` / `__repr__` may run Python →
+                        // MayForce).
+                        Instruction::ConvertValue { oparg } => {
+                            let conv_code = pyre_interpreter::runtime_ops::convert_value_code(
+                                oparg.get(op_arg),
+                            );
+                            let val_reg = emit_popvalue_ref!(current_depth, py_pc);
+                            let val_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            if let super::flow::FlowValue::Variable(v) = &val_value {
+                                pin!(Some(*v), val_reg);
+                            }
+                            let result_value = emit_graph_op_with_result(
+                                &mut graph,
+                                &current_block.block(),
+                                "convert_value",
+                                vec![
+                                    val_value.into(),
+                                    super::flow::FlowValue::Constant(
+                                        super::flow::Constant::signed(conv_code),
+                                    )
+                                    .into(),
+                                ],
+                                Kind::Ref,
+                                py_pc as i64,
+                            );
+                            pin!(Some(result_value), stack_base + current_depth);
+                            push_and_bump!(result_value.into(), py_pc);
+                        }
+
                         // Pops 1, pushes 1 (net 0). Replace shadow value.
-                        Instruction::ConvertValue { .. }
-                        | Instruction::UnaryNot
+                        Instruction::UnaryNot
                         | Instruction::UnaryInvert
                         | Instruction::GetYieldFromIter => {
                             let _ = current_state.stack.pop();
