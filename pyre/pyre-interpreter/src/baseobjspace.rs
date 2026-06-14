@@ -763,7 +763,7 @@ pub(crate) unsafe fn normalize_slice(
 /// `get` (`space.get`) first, then called with `args_w` alone, so
 /// `@staticmethod` / `@classmethod` / custom-descriptor dunders receive the
 /// arguments PyPy gives them.
-unsafe fn get_and_call_function(
+pub(crate) unsafe fn get_and_call_function(
     w_descr: PyObjectRef,
     w_obj: PyObjectRef,
     w_type: PyObjectRef,
@@ -4373,6 +4373,68 @@ pub(crate) unsafe fn lookup_in_type_where(w_type: PyObjectRef, name: &str) -> Op
     // typeobject.py:510 — `_pure_lookup_where_with_method_cache(name, version_tag)`.
     let v = _pure_lookup_where_with_method_cache(w_type, w_name, version_tag);
     if v.is_null() { None } else { Some(v) }
+}
+
+/// `objspace.py:817 getfulltypename` — the type name used by the default
+/// object repr.  A heaptype renders as `<module>.<qualname>` when it
+/// carries a string `__module__`; a builtin type is just its `name`.
+///
+/// # Safety
+/// `w_obj` must be a valid, non-null `PyObject`.
+pub unsafe fn getfulltypename(w_obj: PyObjectRef) -> String {
+    match crate::typedef::r#type(w_obj) {
+        Some(w_type) => getfulltypename_of_type(w_type),
+        None => "object".to_string(),
+    }
+}
+
+/// [`getfulltypename`] for an already-resolved type.
+///
+/// # Safety
+/// `w_type` must be a valid `W_TypeObject`.
+pub unsafe fn getfulltypename_of_type(w_type: PyObjectRef) -> String {
+    if !pyre_object::w_type_is_heaptype(w_type) {
+        return w_type_get_name(w_type).to_string();
+    }
+    // `w_type.getqualname(space)` — an explicit `__qualname__` set in the
+    // class body, else the bare name.
+    let qualname = match lookup_in_type_where(w_type, "__qualname__") {
+        Some(qn) if is_str(qn) => w_str_get_value(qn).to_string(),
+        _ => w_type_get_name(w_type).to_string(),
+    };
+    // `w_type.lookup("__module__")` prepends a string module name; a
+    // non-string `__module__` is ignored (`utf8_w` raises `TypeError`).
+    match lookup_in_type(w_type, "__module__") {
+        Some(m) if is_str(m) => format!("{}.{qualname}", w_str_get_value(m)),
+        _ => qualname,
+    }
+}
+
+/// `typeobject.py:797 descr_repr` name component — the `module.qualname`
+/// rendered inside `<class '…'>` when a heaptype carries a string
+/// `__module__` other than `builtins`, else the bare `name` (a builtin
+/// type's dotted `name` already carries its module).
+///
+/// # Safety
+/// `w_type` must be a valid `W_TypeObject`.
+pub unsafe fn type_repr_qualified_name(w_type: PyObjectRef) -> String {
+    let name = w_type_get_name(w_type).to_string();
+    if !pyre_object::w_type_is_heaptype(w_type) {
+        return name;
+    }
+    let module = lookup_in_type_where(w_type, "__module__")
+        .filter(|m| is_str(*m))
+        .map(|m| w_str_get_value(m).to_string());
+    match module {
+        Some(m) if m != "builtins" => {
+            let qualname = match lookup_in_type_where(w_type, "__qualname__") {
+                Some(qn) if is_str(qn) => w_str_get_value(qn).to_string(),
+                _ => name,
+            };
+            format!("{m}.{qualname}")
+        }
+        _ => name,
+    }
 }
 
 /// `callmethod.py:25-85 LOAD_METHOD` fast-path decision, shared by the

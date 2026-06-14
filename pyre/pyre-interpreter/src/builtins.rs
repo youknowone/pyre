@@ -1000,23 +1000,24 @@ pub fn new_builtin_module_dict() -> pyre_object::PyObjectRef {
     w_dict
 }
 
-/// `print`'s `sep`/`end`: `None` selects the default and a non-`str` is
-/// a TypeError ("sep must be None or a string, not …").  A `str` value is
-/// written directly (`app_io.py print_`: `file.write(sep)`), so its
-/// stored value is used without invoking a `str` subclass `__str__`.
-fn print_separator(
+/// `print`'s `sep`/`end` type check, applied up front: `None` (or absent)
+/// selects the default and a non-`str` is a TypeError ("sep must be None or
+/// a string, not <type>").  A `str` value is returned for the caller to
+/// render at write time with `Py_PRINT_RAW`, which goes through `str()`, so
+/// a `str` subclass `__str__` override is honored — and a raising one
+/// surfaces only after the preceding argument has already been written.
+fn print_sep_check(
     val: Option<PyObjectRef>,
     name: &str,
-    default: &str,
-) -> Result<String, crate::PyError> {
+) -> Result<Option<PyObjectRef>, crate::PyError> {
     let Some(v) = val else {
-        return Ok(default.to_string());
+        return Ok(None);
     };
     if unsafe { pyre_object::is_none(v) } {
-        return Ok(default.to_string());
+        return Ok(None);
     }
     if unsafe { pyre_object::is_str(v) } {
-        return Ok(unsafe { pyre_object::w_str_get_value(v) }.to_string());
+        return Ok(Some(v));
     }
     Err(crate::PyError::type_error(format!(
         "{name} must be None or a string, not {}",
@@ -1039,18 +1040,31 @@ fn builtin_print(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         let sep_key = w_str_new("sep");
         let end_val = unsafe { pyre_object::w_dict_lookup(kwargs, end_key) };
         let sep_val = unsafe { pyre_object::w_dict_lookup(kwargs, sep_key) };
-        let end_str = print_separator(end_val, "end", "\n")?;
-        let sep_str = print_separator(sep_val, "sep", " ")?;
-        (&args[..args.len() - 1], end_str, sep_str)
+        // The type check is up front; the str() rendering happens at write
+        // time so a raising `__str__` leaves the preceding output in place.
+        let end_obj = print_sep_check(end_val, "end")?;
+        let sep_obj = print_sep_check(sep_val, "sep")?;
+        (&args[..args.len() - 1], end_obj, sep_obj)
     } else {
-        (args, "\n".to_string(), " ".to_string())
+        (args, None, None)
     };
 
-    let parts: Vec<String> = positional
-        .iter()
-        .map(|&obj| unsafe { crate::py_str(obj) })
-        .collect::<Result<Vec<String>, _>>()?;
-    crate::print_output(&format!("{}{}", parts.join(&sep), end));
+    // `bltinmodule.c print_impl` writes incrementally: `str(arg)`, then the
+    // separator before each following arg, then `end`.  Each `str()` may
+    // raise, leaving the bytes already emitted on the stream.
+    for (i, &obj) in positional.iter().enumerate() {
+        if i > 0 {
+            match sep {
+                Some(s) => crate::print_output(&unsafe { crate::py_str(s)? }),
+                None => crate::print_output(" "),
+            }
+        }
+        crate::print_output(&unsafe { crate::py_str(obj)? });
+    }
+    match end {
+        Some(e) => crate::print_output(&unsafe { crate::py_str(e)? }),
+        None => crate::print_output("\n"),
+    }
     Ok(w_none())
 }
 
@@ -5817,22 +5831,22 @@ fn builtin_complex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
     }
 }
 
-/// `format(value, format_spec='')` — PyPy: operation.py format
+/// `format(value, format_spec='')` — operation.py format → space.format
 fn builtin_format(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(!args.is_empty(), "format() takes at least one argument");
     let value = args[0];
-    // `format_spec` must be a `str`; its stored value is used directly
-    // without invoking a `str` subclass `__str__` (bltinmodule.c
-    // `builtin_format_impl`).
+    // `builtin_format_impl`: the `format_spec` must be a `str` — validated
+    // here, before dispatch, so `format(value, 34)` reports `format()
+    // argument 2 must be str, not int` for any `value`.  Its stored value is
+    // used directly (no `str` subclass `__str__`), then `format_value_dispatch`
+    // applies it — dispatching a `__format__` override (including a builtin
+    // subclass's) or, for a plain builtin, the shared spec parser; the same
+    // path f-string `{v:spec}` and `"{:spec}".format(v)` use.
     let spec = if args.len() > 1 {
         crate::type_methods::read_format_spec(args[1], "format() argument 2")?
     } else {
         String::new()
     };
-    // `PyObject_Format(value, spec)`: dispatch to a user-defined
-    // `__format__` when present, else the shared spec parser (empty spec →
-    // `str(value)`) — the same path f-string `{v:spec}` and
-    // `"{:spec}".format(v)` use, so all three produce identical output.
     let s = crate::type_methods::format_value_dispatch(value, &spec)?;
     Ok(pyre_object::w_str_from_wtf8(s))
 }

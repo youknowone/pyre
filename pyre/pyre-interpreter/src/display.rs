@@ -505,7 +505,7 @@ pub unsafe fn py_repr(obj: PyObjectRef) -> Result<String, crate::PyError> {
             };
             format!("{class_name}({inner})")
         } else if std::ptr::eq(tp, &TYPE_TYPE as *const PyType) {
-            let name = pyre_object::w_type_get_name(obj);
+            let name = crate::baseobjspace::type_repr_qualified_name(obj);
             format!("<class '{name}'>")
         } else if std::ptr::eq(tp, &pyre_object::UNION_TYPE as *const PyType) {
             // PyPy: UnionType.__repr__ → " | ".join([_repr_item(x) for x in self.__args__])
@@ -606,11 +606,11 @@ pub unsafe fn py_repr(obj: PyObjectRef) -> Result<String, crate::PyError> {
             if let Some(s) = try_call_dunder(obj, "__str__")? {
                 return Ok(s);
             }
-            let w_type = pyre_object::w_instance_get_type(obj);
-            let name = pyre_object::w_type_get_name(w_type);
+            let name = crate::baseobjspace::getfulltypename(obj);
             format!("<{name} object at {obj:?}>")
         } else {
-            format!("<{} object at {:?}>", (*tp).name, obj)
+            let name = crate::baseobjspace::getfulltypename(obj);
+            format!("<{name} object at {obj:?}>")
         };
         Ok(formatted)
     }

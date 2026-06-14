@@ -7479,8 +7479,8 @@ fn init_object_type(ns: &mut DictStorage) {
                 let obj = args[0];
                 unsafe {
                     if pyre_object::is_instance(obj) {
-                        let w_type = pyre_object::w_instance_get_type(obj);
-                        let name = pyre_object::w_type_get_name(w_type);
+                        // `w_obj.getrepr(space, '%s object' % fulltypename)`.
+                        let name = crate::baseobjspace::getfulltypename(obj);
                         return Ok(pyre_object::w_str_new(&format!(
                             "<{name} object at {obj:?}>"
                         )));
@@ -7519,12 +7519,17 @@ fn init_object_type(ns: &mut DictStorage) {
                     return Ok(pyre_object::w_str_new(""));
                 }
                 if args.len() > 1 {
+                    // object.__format__(self, format_spec): the spec must be
+                    // a `str` (a `bytes` spec is rejected like any other
+                    // non-`str`); a non-empty one is unsupported, an empty
+                    // one falls through to `str(self)`.
                     let spec =
                         crate::type_methods::read_format_spec(args[1], "__format__() argument")?;
                     if !spec.is_empty() {
-                        return Err(crate::PyError::type_error(
-                            "unsupported format string passed to object.__format__",
-                        ));
+                        return Err(crate::PyError::type_error(format!(
+                            "unsupported format string passed to {}.__format__",
+                            crate::type_methods::arg_type_name(args[0])
+                        )));
                     }
                 }
                 Ok(pyre_object::w_str_new(&unsafe { crate::py_str(args[0])? }))
