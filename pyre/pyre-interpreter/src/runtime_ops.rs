@@ -4,7 +4,8 @@ use std::sync::OnceLock;
 use crate::bytecode::{BinaryOperator, ComparisonOperator, ConvertValueOparg};
 use pyre_object::{
     PY_NULL, PyObjectRef, W_SeqIterator, is_instance, is_list, is_range_iter, is_seq_iter, is_str,
-    is_tuple, w_dict_new, w_dict_store, w_int_get_value, w_int_new, w_list_getitem, w_list_len,
+    is_tuple, w_dict_new, w_dict_store_checked, w_int_get_value, w_int_new, w_list_getitem,
+    w_list_len,
     w_list_new, w_range_iter_has_next, w_range_iter_next, w_str_from_wtf8, w_str_get_wtf8,
     w_str_len, w_tuple_getitem, w_tuple_len, w_tuple_new,
 };
@@ -509,16 +510,22 @@ pub fn build_tuple_from_refs(items: &[PyObjectRef]) -> PyObjectRef {
     w_tuple_new(items.to_vec())
 }
 
-pub fn build_map_from_refs(items: &[PyObjectRef]) -> PyObjectRef {
+/// BUILD_MAP evaluation, shared by the interpreter (`build_map`) and the JIT
+/// residual (`bh_build_map_from_array`).  Stores each `[key, value]` pair
+/// through the checked dict setitem, which hashes the key (may run user
+/// `__hash__` / `__eq__`); an unhashable key raises, so — like
+/// `build_set_from_refs` — this is fallible.
+pub fn build_map_from_refs(items: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let dict = w_dict_new();
     for pair in items.chunks_exact(2) {
         let key = pair[0];
         let value = pair[1];
         unsafe {
-            w_dict_store(dict, key, value);
+            w_dict_store_checked(dict, key, value)
+                .map_err(|_| crate::baseobjspace::take_pending_hash_error())?;
         }
     }
-    dict
+    Ok(dict)
 }
 
 /// BUILD_SET evaluation, shared by the JIT residual (`bh_build_set_from_array`).
@@ -713,7 +720,19 @@ fn build_tuple_from_args(args: &[i64]) -> i64 {
 
 fn build_map_from_args(args: &[i64]) -> i64 {
     let items: Vec<_> = args.iter().map(|&arg| arg as PyObjectRef).collect();
-    build_map_from_refs(&items) as i64
+    // Legacy fixed-arity BUILD_MAP residual reached only on the blackhole /
+    // deopt path (the codewriter lowers BUILD_MAP through the array-based
+    // `bh_build_map_from_array`).  An unhashable key raises; signal it through
+    // `BH_LAST_EXC_VALUE` and return PY_NULL, like the other blackhole-only
+    // residuals.
+    match build_map_from_refs(&items) {
+        Ok(dict) => dict as i64,
+        Err(err) => {
+            let exc_obj = err.to_exc_object();
+            majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc_obj as i64));
+            PY_NULL as i64
+        }
+    }
 }
 
 #[majit_macros::dont_look_inside]

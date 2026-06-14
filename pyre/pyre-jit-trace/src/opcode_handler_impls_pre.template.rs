@@ -200,7 +200,7 @@ impl pyre_interpreter::SharedOpcodeHandler for crate::state::MIFrame {
             items.iter().map(|i| i.concrete.to_pyobj()).collect();
         let mut result_concrete = crate::state::ConcreteValue::Null;
         if concrete_items.iter().all(|v| !v.is_null()) {
-            let dict = pyre_interpreter::build_map_from_refs(&concrete_items);
+            let dict = pyre_interpreter::build_map_from_refs(&concrete_items)?;
             result_concrete = crate::state::ConcreteValue::from_pyobj(dict);
         }
         let item_oprefs: Vec<majit_ir::OpRef> = items.iter().map(|i| i.opref).collect();

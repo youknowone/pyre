@@ -3988,7 +3988,10 @@ pub extern "C" fn bh_newtuple_from_array(array: i64) -> i64 {
 /// The length-prefixed array holds the interleaved `[k0, v0, k1, v1, ...]`
 /// pairs the codewriter unrolled via `setarrayitem_gc_r`;
 /// `build_map_from_refs` consumes them in `chunks_exact(2)`.  Keys are
-/// hashed (may run user `__hash__` / `__eq__`), so the call is MayForce.
+/// hashed (may run user `__hash__` / `__eq__`) and an unhashable key raises
+/// (`MayForce`, fallible); on error the exception is published through
+/// `BH_LAST_EXC_VALUE` for the trailing `GuardNoException` and the call
+/// returns 0.
 pub extern "C" fn bh_build_map_from_array(array: i64) -> i64 {
     let arr = array as *const pyre_object::object_array::GcTypedArray;
     let len = pyre_object::object_array::gcarray_len(arr);
@@ -3996,7 +3999,14 @@ pub extern "C" fn bh_build_map_from_array(array: i64) -> i64 {
     for i in 0..len {
         items.push(pyre_object::object_array::getarrayitem_ref(arr, i));
     }
-    pyre_interpreter::runtime_ops::build_map_from_refs(&items) as i64
+    match pyre_interpreter::runtime_ops::build_map_from_refs(&items) {
+        Ok(dict) => dict as i64,
+        Err(err) => {
+            let exc_obj = err.to_exc_object();
+            publish_residual_call_exception(exc_obj as i64);
+            0
+        }
+    }
 }
 
 /// BUILD_SET residual — the set counterpart of [`bh_build_map_from_array`].

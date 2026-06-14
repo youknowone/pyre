@@ -1265,7 +1265,7 @@ impl SharedOpcodeHandler for PyFrame {
     }
 
     fn build_map(&mut self, items: &[Self::Value]) -> Result<Self::Value, PyError> {
-        Ok(build_map_from_refs(items))
+        build_map_from_refs(items)
     }
 
     fn store_subscr(
