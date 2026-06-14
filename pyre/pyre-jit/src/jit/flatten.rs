@@ -3324,6 +3324,13 @@ pub struct LoweringContext {
     /// (`Plain` — reads heap, raises on an unbound free variable, runs no
     /// user code).
     pub load_deref_value_fn_idx: u16,
+    /// `unary_invert_fn` descrs-pool index.  UNARY_INVERT records the
+    /// `unary_invert(value)` HLOp lowered to `residual_call_r_r(ConstInt(
+    /// fn_idx), ListR([value]), Descr) → reg` via
+    /// [`lower_unary_invert_hlop_to_insn`] (the single-Ref FORMAT_SIMPLE
+    /// shape); `bh_unary_invert_fn` computes `~value` (a user `__invert__`
+    /// may force virtualizables → `MayForce`).
+    pub unary_invert_fn_idx: u16,
 }
 
 /// Map a BINARY_OP HLOp opname (`add`/.../`xor`/`getitem` plus the
@@ -4816,6 +4823,9 @@ where
     if let Some(insn) = lower_load_deref_value_hlop_to_insn(op, ctx, get_register, lower_constant) {
         return Some(insn);
     }
+    if let Some(insn) = lower_unary_invert_hlop_to_insn(op, ctx, get_register, lower_constant) {
+        return Some(insn);
+    }
     None
 }
 
@@ -5068,6 +5078,41 @@ where
         ctx.load_deref_value_fn_idx,
         vec![cell],
         CallFlavor::Plain,
+        majit_ir::PyreHelperKind::None,
+        dst_reg,
+    ))
+}
+
+/// Lower the UNARY_INVERT pyre HLOp `unary_invert(value)` → `result: Ref`
+/// to `residual_call_r_r(ConstInt(unary_invert_fn_idx), ListR([value]),
+/// Descr) → reg`, the single-Ref [`lower_format_simple_hlop_to_insn`] shape.
+/// `bh_unary_invert_fn` computes `~value`; a user `__invert__` may force
+/// virtualizables → `MayForce`.
+///
+/// Returns `None` for non-`unary_invert` opnames so the caller can fall
+/// through to other lowering arms.
+pub fn lower_unary_invert_hlop_to_insn<F, LC>(
+    op: &super::flow::SpaceOperation,
+    ctx: &LoweringContext,
+    get_register: &mut F,
+    lower_constant: &mut LC,
+) -> Option<Insn>
+where
+    F: FnMut(super::flow::Variable) -> Register,
+    LC: FnMut(&Constant) -> Operand,
+{
+    if op.opname != "unary_invert" || op.args.len() != 1 {
+        return None;
+    }
+    let value = operand_for_value_arg(&op.args[0], get_register, lower_constant)?;
+    let dst_reg = match &op.result {
+        Some(super::flow::FlowValue::Variable(var)) => get_register(*var),
+        _ => return None,
+    };
+    Some(build_residual_call_r_r_insn_from_operands(
+        ctx.unary_invert_fn_idx,
+        vec![value],
+        CallFlavor::MayForce,
         majit_ir::PyreHelperKind::None,
         dst_reg,
     ))
@@ -6810,6 +6855,7 @@ mod tests {
             load_super_attr_fn_idx: 0,
             super_attr_unwrap_fn_idx: 0,
             load_deref_value_fn_idx: 0,
+            unary_invert_fn_idx: 0,
 };
         let mut on = SSARepr::new("setattr_on");
         let mut on_regallocs = make_regallocs();
@@ -6960,6 +7006,7 @@ mod tests {
             load_super_attr_fn_idx: 0,
             super_attr_unwrap_fn_idx: 0,
             load_deref_value_fn_idx: 0,
+            unary_invert_fn_idx: 0,
 };
 
         let mut ssarepr = SSARepr::new("retired_families");
@@ -7097,6 +7144,7 @@ mod tests {
             load_super_attr_fn_idx: 0,
             super_attr_unwrap_fn_idx: 0,
             load_deref_value_fn_idx: 0,
+            unary_invert_fn_idx: 0,
 };
 
         let mut ssarepr = SSARepr::new("trailing_live");
@@ -7197,6 +7245,7 @@ mod tests {
             load_super_attr_fn_idx: 0,
             super_attr_unwrap_fn_idx: 0,
             load_deref_value_fn_idx: 0,
+            unary_invert_fn_idx: 0,
 };
 
         let mut ssarepr = SSARepr::new("multi_block_lowering");
@@ -7341,6 +7390,7 @@ mod tests {
             load_super_attr_fn_idx: 0,
             super_attr_unwrap_fn_idx: 0,
             load_deref_value_fn_idx: 0,
+            unary_invert_fn_idx: 0,
 };
 
         let mut ssarepr = SSARepr::new("pyre_walker_2exit");
@@ -7530,6 +7580,7 @@ mod tests {
             load_super_attr_fn_idx: 0,
             super_attr_unwrap_fn_idx: 0,
             load_deref_value_fn_idx: 0,
+            unary_invert_fn_idx: 0,
 });
 
         let mut regallocs = perform_register_allocation_all_kinds(&graph);
@@ -7768,6 +7819,7 @@ mod tests {
             load_super_attr_fn_idx: 0,
             super_attr_unwrap_fn_idx: 0,
             load_deref_value_fn_idx: 0,
+            unary_invert_fn_idx: 0,
 };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -7872,6 +7924,7 @@ mod tests {
             load_super_attr_fn_idx: 0,
             super_attr_unwrap_fn_idx: 0,
             load_deref_value_fn_idx: 0,
+            unary_invert_fn_idx: 0,
 };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -7920,6 +7973,7 @@ mod tests {
             load_super_attr_fn_idx: 0,
             super_attr_unwrap_fn_idx: 0,
             load_deref_value_fn_idx: 0,
+            unary_invert_fn_idx: 0,
 };
 
         let hlop = SpaceOperation::new("sub", vec![lhs.into(), rhs.into()], Some(result.into()), 0);
@@ -8045,6 +8099,7 @@ mod tests {
             load_super_attr_fn_idx: 0,
             super_attr_unwrap_fn_idx: 0,
             load_deref_value_fn_idx: 0,
+            unary_invert_fn_idx: 0,
 };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -8128,6 +8183,7 @@ mod tests {
             load_super_attr_fn_idx: 0,
             super_attr_unwrap_fn_idx: 0,
             load_deref_value_fn_idx: 0,
+            unary_invert_fn_idx: 0,
         };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -8182,6 +8238,7 @@ mod tests {
             load_super_attr_fn_idx: 0,
             super_attr_unwrap_fn_idx: 0,
             load_deref_value_fn_idx: 0,
+            unary_invert_fn_idx: 0,
 };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -8228,6 +8285,7 @@ mod tests {
             load_super_attr_fn_idx: 0,
             super_attr_unwrap_fn_idx: 0,
             load_deref_value_fn_idx: 0,
+            unary_invert_fn_idx: 0,
 };
         let hlop = SpaceOperation::new("eq", vec![lhs.into(), rhs.into()], Some(result.into()), 0);
         let mut get_register = identity_register_mapper();
@@ -8281,6 +8339,7 @@ mod tests {
             load_super_attr_fn_idx: 0,
             super_attr_unwrap_fn_idx: 0,
             load_deref_value_fn_idx: 0,
+            unary_invert_fn_idx: 0,
 };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -8361,6 +8420,7 @@ mod tests {
             load_super_attr_fn_idx: 0,
             super_attr_unwrap_fn_idx: 0,
             load_deref_value_fn_idx: 0,
+            unary_invert_fn_idx: 0,
 };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -8404,6 +8464,7 @@ mod tests {
             load_super_attr_fn_idx: 0,
             super_attr_unwrap_fn_idx: 0,
             load_deref_value_fn_idx: 0,
+            unary_invert_fn_idx: 0,
 };
         let hlop = SpaceOperation::new("bool", vec![cond.into()], Some(result.into()), 0);
         let mut get_register = identity_register_mapper();
@@ -8461,6 +8522,7 @@ mod tests {
             load_super_attr_fn_idx: 0,
             super_attr_unwrap_fn_idx: 0,
             load_deref_value_fn_idx: 0,
+            unary_invert_fn_idx: 0,
 };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -8534,6 +8596,7 @@ mod tests {
             load_super_attr_fn_idx: 0,
             super_attr_unwrap_fn_idx: 0,
             load_deref_value_fn_idx: 0,
+            unary_invert_fn_idx: 0,
 };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -8592,6 +8655,7 @@ mod tests {
             load_super_attr_fn_idx: 0,
             super_attr_unwrap_fn_idx: 0,
             load_deref_value_fn_idx: 0,
+            unary_invert_fn_idx: 0,
 };
         let hlop = SpaceOperation::new(
             "setitem",
@@ -8665,6 +8729,7 @@ mod tests {
             load_super_attr_fn_idx: 0,
             super_attr_unwrap_fn_idx: 0,
             load_deref_value_fn_idx: 0,
+            unary_invert_fn_idx: 0,
 };
         let mut get_register_a = identity_register_mapper();
         let mut get_register_b = identity_register_mapper();
@@ -8714,6 +8779,7 @@ mod tests {
             load_super_attr_fn_idx: 0,
             super_attr_unwrap_fn_idx: 0,
             load_deref_value_fn_idx: 0,
+            unary_invert_fn_idx: 0,
 };
         let mut get_register_a = identity_register_mapper();
         let mut get_register_b = identity_register_mapper();
@@ -8763,6 +8829,7 @@ mod tests {
             load_super_attr_fn_idx: 0,
             super_attr_unwrap_fn_idx: 0,
             load_deref_value_fn_idx: 0,
+            unary_invert_fn_idx: 0,
 };
         let mut get_register_a = identity_register_mapper();
         let mut get_register_b = identity_register_mapper();
@@ -8817,6 +8884,7 @@ mod tests {
             load_super_attr_fn_idx: 0,
             super_attr_unwrap_fn_idx: 0,
             load_deref_value_fn_idx: 0,
+            unary_invert_fn_idx: 0,
 };
         let mut get_register_a = identity_register_mapper();
         let mut get_register_b = identity_register_mapper();
@@ -8885,6 +8953,7 @@ mod tests {
             load_super_attr_fn_idx: 0,
             super_attr_unwrap_fn_idx: 0,
             load_deref_value_fn_idx: 0,
+            unary_invert_fn_idx: 0,
 };
         let mut get_register_a = identity_register_mapper();
         let mut get_register_b = identity_register_mapper();
@@ -10276,6 +10345,7 @@ mod tests {
             load_super_attr_fn_idx: 0,
             super_attr_unwrap_fn_idx: 0,
             load_deref_value_fn_idx: 0,
+            unary_invert_fn_idx: 0,
 };
         flatten_graph_for_test_with_lowering(&graph, &mut ssarepr, ctx, Some(cpu));
         ssarepr
@@ -10566,6 +10636,7 @@ mod tests {
             load_super_attr_fn_idx: 0,
             super_attr_unwrap_fn_idx: 0,
             load_deref_value_fn_idx: 0,
+            unary_invert_fn_idx: 0,
 };
         let null_or_self_var = Variable::new(VariableId(10), Kind::Ref);
         let op = super::super::flow::SpaceOperation::new(
@@ -10679,6 +10750,7 @@ mod tests {
             load_super_attr_fn_idx: 106,
             super_attr_unwrap_fn_idx: 107,
             load_deref_value_fn_idx: 108,
+            unary_invert_fn_idx: 109,
         };
         let code_const = Constant::new(
             super::super::flow::ConstantValue::Signed(0x2000),
@@ -11367,6 +11439,75 @@ mod tests {
                         assert!(
                             matches!(&list.content[..], [Operand::Register(r)] if r.index == 101),
                             "ListR = [cell], got {:?}",
+                            list.content
+                        );
+                    }
+                    other => panic!("expected ListR, got {other:?}"),
+                }
+                assert_eq!(
+                    result,
+                    Some(Register {
+                        kind: Kind::Ref,
+                        index: 102
+                    }),
+                );
+            }
+            _ => panic!("expected Insn::Op, got {insn:?}"),
+        }
+    }
+
+    #[test]
+    fn lower_unary_invert_hlop_emits_unary_invert_fn_residual() {
+        // `unary_invert(value)` →
+        // `residual_call_r_r(ConstInt(unary_invert_fn_idx), ListR([value]),
+        // Descr) → reg` (MayForce — a user `__invert__` may run Python).
+        // Same single-Ref shape as FORMAT_SIMPLE.
+        let value_var = Variable::new(VariableId(8), Kind::Ref);
+        let result_var = Variable::new(VariableId(9), Kind::Ref);
+        let (ctx, _, _) = load_attr_lowering_fixture();
+        let op = super::super::flow::SpaceOperation::new(
+            "unary_invert",
+            vec![value_var.into()],
+            Some(result_var.into()),
+            0,
+        );
+        let mut get_register = |var: Variable| match var.id {
+            VariableId(8) => Register {
+                kind: Kind::Ref,
+                index: 101,
+            },
+            VariableId(9) => Register {
+                kind: Kind::Ref,
+                index: 102,
+            },
+            _ => panic!("unexpected var id {:?}", var.id),
+        };
+        let mut lower_constant = super::flatten_constant_operand_for_test;
+        let insn = super::lower_unary_invert_hlop_to_insn(
+            &op,
+            &ctx,
+            &mut get_register,
+            &mut lower_constant,
+        )
+        .expect("1-arg unary_invert lowering must succeed");
+        match insn {
+            Insn::Op {
+                opname,
+                args,
+                result,
+            } => {
+                assert_eq!(opname, "residual_call_r_r");
+                assert!(
+                    matches!(args[0], Operand::ConstInt(109)),
+                    "unary_invert_fn pool index, got {:?}",
+                    args[0]
+                );
+                match &args[1] {
+                    Operand::ListOfKind(list) => {
+                        assert_eq!(list.kind, Kind::Ref);
+                        assert!(
+                            matches!(&list.content[..], [Operand::Register(r)] if r.index == 101),
+                            "ListR = [value], got {:?}",
                             list.content
                         );
                     }
