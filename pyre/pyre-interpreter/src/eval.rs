@@ -2367,9 +2367,7 @@ impl OpcodeStepExecutor for PyFrame {
             slot
         };
         if value == PY_NULL {
-            return Err(PyError::type_error(
-                "free variable referenced before assignment",
-            ));
+            return Err(crate::pyframe::deref_unbound_error(self.code(), idx));
         }
         self.push(value);
         Ok(())

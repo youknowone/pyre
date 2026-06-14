@@ -4105,15 +4105,17 @@ pub extern "C" fn bh_format_with_spec_fn(value: i64, spec: i64) -> i64 {
     }
 }
 
-/// LOAD_DEREF residual (`load_deref_value` HLOp → `residual_call_r_r`).
+/// LOAD_DEREF residual (`load_deref_value` HLOp → `residual_call_ir_r`).
 /// `cell` is the slot read from `locals_cells_stack_w`: a cell object whose
 /// contents are the free/cell variable's value, or the raw value for a slot
 /// that is not a cell.  Mirrors `load_deref` — dereference the cell and
-/// raise if the result is empty.  Runs no user code but reads mutable heap
-/// (`CallFlavor::Plain`); on the unbound-variable error the exception is
-/// published through `BH_LAST_EXC_VALUE` for the trailing `GuardNoException`
-/// and the call returns 0.
-pub extern "C" fn bh_load_deref_value_fn(cell: i64) -> i64 {
+/// raise if the result is empty.  `code` + `deref_idx` resolve the variable
+/// name for the unbound-variable `NameError` (`deref_unbound_error`).  Runs no
+/// user code but reads mutable heap (`CallFlavor::Plain`); on the
+/// unbound-variable error the exception is published through
+/// `BH_LAST_EXC_VALUE` for the trailing `GuardNoException` and the call
+/// returns 0.
+pub extern "C" fn bh_load_deref_value_fn(cell: i64, w_code_ptr: i64, deref_idx: i64) -> i64 {
     let slot = cell as pyre_object::PyObjectRef;
     let value = if !slot.is_null() && unsafe { pyre_object::is_cell(slot) } {
         unsafe { pyre_object::w_cell_get(slot) }
@@ -4121,9 +4123,12 @@ pub extern "C" fn bh_load_deref_value_fn(cell: i64) -> i64 {
         slot
     };
     if value == pyre_object::PY_NULL {
+        let code = unsafe {
+            &*(pyre_interpreter::w_code_get_ptr(w_code_ptr as pyre_object::PyObjectRef)
+                as *const pyre_interpreter::CodeObject)
+        };
         let exc_obj =
-            pyre_interpreter::PyError::type_error("free variable referenced before assignment")
-                .to_exc_object();
+            pyre_interpreter::pyframe::deref_unbound_error(code, deref_idx as usize).to_exc_object();
         publish_residual_call_exception(exc_obj as i64);
         return 0;
     }

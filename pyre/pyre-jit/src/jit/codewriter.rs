@@ -8786,13 +8786,24 @@ impl CodeWriter {
                         // `locals_cells_stack_w` array as the plain locals, so
                         // `i` is a unified localsplus index read exactly like
                         // LOAD_FAST (the vable getarrayitem path, inlining-safe
-                        // via `frame_var`).  The `load_deref_value(cell)` HLOp →
-                        // `residual_call_r_r(load_deref_value_fn, ListR[cell])`
-                        // dereferences the cell and raises on an unbound free
-                        // variable (`bh_load_deref_value_fn`, CallFlavor::Plain
-                        // — reads heap, runs no user code).
+                        // via `frame_var`).  The `load_deref_value(cell, code,
+                        // deref_idx)` HLOp → `residual_call_ir_r(
+                        // load_deref_value_fn, ListR[cell, code],
+                        // ListI[deref_idx])` dereferences the cell and raises
+                        // the named unbound-variable NameError
+                        // (`bh_load_deref_value_fn`, CallFlavor::Plain — reads
+                        // heap, runs no user code).  `deref_idx` is the unified
+                        // localsplus index the residual resolves the variable
+                        // name with through `code`.
                         Instruction::LoadDeref { i } => {
                             let deref_idx = i.get(op_arg).as_usize() as u16;
+                            let code_const: super::flow::FlowValue = super::flow::Constant::new(
+                                super::flow::ConstantValue::Signed(w_code as i64),
+                                Some(Kind::Ref),
+                            )
+                            .into();
+                            let deref_idx_const: super::flow::FlowValue =
+                                super::flow::Constant::signed(deref_idx as i64).into();
                             emit_load_fast_ref!(current_depth, deref_idx, py_pc);
                             let cell_reg = emit_popvalue_ref!(current_depth, py_pc);
                             let cell_value = pop_ref_or_fresh(&mut current_state, &mut graph);
@@ -8803,7 +8814,7 @@ impl CodeWriter {
                                 &mut graph,
                                 &current_block.block(),
                                 "load_deref_value",
-                                vec![cell_value.into()],
+                                vec![cell_value.into(), code_const.into(), deref_idx_const.into()],
                                 Kind::Ref,
                                 py_pc as i64,
                             );

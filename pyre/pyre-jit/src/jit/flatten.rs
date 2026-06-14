@@ -5118,17 +5118,18 @@ where
     ))
 }
 
-/// Lower the LOAD_DEREF pyre HLOp `load_deref_value(cell)` → `result: Ref`
-/// to `residual_call_r_r(ConstInt(load_deref_value_fn_idx), ListR([cell]),
-/// Descr) → reg`, the single-Ref [`lower_format_simple_hlop_to_insn`] shape.
-/// `cell` is the slot read from `locals_cells_stack_w`;
-/// `bh_load_deref_value_fn` dereferences it and raises on an unbound free
-/// variable.  It reads mutable heap but runs no user code → `Plain`
-/// (CanRaise, no virtualizable force), unlike the `MayForce` format/convert
-/// residuals.
+/// Lower the LOAD_DEREF pyre HLOp `load_deref_value(cell, code, deref_idx)`
+/// → `result: Ref` to `residual_call_ir_r(ConstInt(load_deref_value_fn_idx),
+/// ListI([deref_idx]), ListR([cell, code]), Descr) → reg`, the two-Ref-plus-
+/// one-Int [`lower_load_fast_check_hlop_to_insn`] shape.  `cell` is the slot
+/// read from `locals_cells_stack_w`; `bh_load_deref_value_fn(cell, code,
+/// deref_idx)` dereferences it and raises the named unbound-variable
+/// `NameError` resolved through `code` + `deref_idx`.  It reads mutable heap
+/// but runs no user code → `Plain` (CanRaise, no virtualizable force), unlike
+/// the `MayForce` format/convert residuals.
 ///
-/// Returns `None` for non-`load_deref_value` opnames so the caller can fall
-/// through to other lowering arms.
+/// Returns `None` for a non-`load_deref_value` opname or unexpected arity so
+/// the caller can fall through to other lowering arms.
 pub fn lower_load_deref_value_hlop_to_insn<F, LC>(
     op: &super::flow::SpaceOperation,
     ctx: &LoweringContext,
@@ -5139,19 +5140,33 @@ where
     F: FnMut(super::flow::Variable) -> Register,
     LC: FnMut(&Constant) -> Operand,
 {
-    if op.opname != "load_deref_value" || op.args.len() != 1 {
+    if op.opname != "load_deref_value" || op.args.len() != 3 {
         return None;
     }
     let cell = operand_for_value_arg(&op.args[0], get_register, lower_constant)?;
+    let code = operand_for_value_arg(&op.args[1], get_register, lower_constant)?;
+    let deref_idx = const_int_for_value_arg(&op.args[2])?;
     let dst_reg = match &op.result {
         Some(super::flow::FlowValue::Variable(var)) => get_register(*var),
         _ => return None,
     };
-    Some(build_residual_call_r_r_insn_from_operands(
-        ctx.load_deref_value_fn_idx,
-        vec![cell],
-        CallFlavor::Plain,
-        majit_ir::PyreHelperKind::None,
+    let effect_info = effect_info_for_call_flavor(CallFlavor::Plain);
+    let descr_operand = Operand::descr(DescrOperand::CallDescrStub(CallDescrStub {
+        effect_info,
+        arg_kinds: vec![Kind::Ref, Kind::Ref, Kind::Int],
+        result_kind: Some(Kind::Ref),
+    }));
+    Some(Insn::op_with_result(
+        "residual_call_ir_r",
+        vec![
+            Operand::ConstInt(ctx.load_deref_value_fn_idx as i64),
+            Operand::ListOfKind(ListOfKind::new(
+                Kind::Int,
+                vec![Operand::ConstInt(deref_idx)],
+            )),
+            Operand::ListOfKind(ListOfKind::new(Kind::Ref, vec![cell, code])),
+            descr_operand,
+        ],
         dst_reg,
     ))
 }
@@ -11547,17 +11562,19 @@ mod tests {
 
     #[test]
     fn lower_load_deref_value_hlop_emits_load_deref_value_fn_residual() {
-        // `load_deref_value(cell)` →
-        // `residual_call_r_r(ConstInt(load_deref_value_fn_idx), ListR([cell]),
-        // Descr) → reg` (Plain — reads the cell's heap contents and raises on
-        // an unbound free variable, runs no user code).  Same single-Ref
-        // shape as FORMAT_SIMPLE.
+        // `load_deref_value(cell, code, deref_idx)` →
+        // `residual_call_ir_r(ConstInt(load_deref_value_fn_idx),
+        // ListI([deref_idx]), ListR([cell, code]), Descr) → reg` (Plain —
+        // reads the cell's heap contents and raises the named unbound-variable
+        // NameError, runs no user code).  Same two-Ref-plus-one-Int shape as
+        // LOAD_FAST_CHECK.
         let cell_var = Variable::new(VariableId(8), Kind::Ref);
         let result_var = Variable::new(VariableId(9), Kind::Ref);
-        let (ctx, _, _) = load_attr_lowering_fixture();
+        let (ctx, code_const, _) = load_attr_lowering_fixture();
+        let deref_idx_const = Constant::signed(7);
         let op = super::super::flow::SpaceOperation::new(
             "load_deref_value",
-            vec![cell_var.into()],
+            vec![cell_var.into(), code_const.into(), deref_idx_const.into()],
             Some(result_var.into()),
             0,
         );
@@ -11579,14 +11596,14 @@ mod tests {
             &mut get_register,
             &mut lower_constant,
         )
-        .expect("1-arg load_deref_value lowering must succeed");
+        .expect("3-arg load_deref_value lowering must succeed");
         match insn {
             Insn::Op {
                 opname,
                 args,
                 result,
             } => {
-                assert_eq!(opname, "residual_call_r_r");
+                assert_eq!(opname, "residual_call_ir_r");
                 assert!(
                     matches!(args[0], Operand::ConstInt(108)),
                     "load_deref_value_fn pool index, got {:?}",
@@ -11594,12 +11611,25 @@ mod tests {
                 );
                 match &args[1] {
                     Operand::ListOfKind(list) => {
-                        assert_eq!(list.kind, Kind::Ref);
+                        assert_eq!(list.kind, Kind::Int);
                         assert!(
-                            matches!(&list.content[..], [Operand::Register(r)] if r.index == 101),
-                            "ListR = [cell], got {:?}",
+                            matches!(&list.content[..], [Operand::ConstInt(7)]),
+                            "ListI = [deref_idx], got {:?}",
                             list.content
                         );
+                    }
+                    other => panic!("expected ListI, got {other:?}"),
+                }
+                match &args[2] {
+                    Operand::ListOfKind(list) => {
+                        assert_eq!(list.kind, Kind::Ref);
+                        match &list.content[..] {
+                            [Operand::Register(c), Operand::ConstRef(0x2000)] => {
+                                assert_eq!(c.kind, Kind::Ref);
+                                assert_eq!(c.index, 101, "leading Ref operand must be cell");
+                            }
+                            other => panic!("ListR must be [cell, code], got {other:?}"),
+                        }
                     }
                     other => panic!("expected ListR, got {other:?}"),
                 }

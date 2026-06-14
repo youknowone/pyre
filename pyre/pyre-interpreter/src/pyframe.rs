@@ -701,6 +701,60 @@ pub fn ncells(code: &CodeObject) -> usize {
     npure_cellvars(code) + code.freevars.len()
 }
 
+/// `LOAD_DEREF` unbound-variable error for the unified deref slot `idx`,
+/// shared by the interpreter (`load_deref`) and the JIT residual
+/// (`bh_load_deref_value_fn`).
+///
+/// pyopcode.py `_load_deref_unbound`: a cell variable (a captured local whose
+/// deref slot shares its `varnames` index via `MAKE_CELL`, or a pure cellvar
+/// in the `[nvarnames, nvarnames + npure_cellvars)` band) reports "local
+/// variable '{name}' referenced before assignment"; a free variable reports
+/// "free variable '{name}' referenced before assignment in enclosing scope".
+/// pyre has no `UnboundLocalError`, so — like `load_local_checked_value` —
+/// both use `NameError`.
+///
+/// `idx` follows the `npure_cellvars` slot layout: `varnames` occupy
+/// `[0, nvarnames)`, pure cellvars (those not also varnames) the next
+/// `npure_cellvars` slots, then freevars.
+pub fn deref_unbound_error(code: &CodeObject, idx: usize) -> crate::PyError {
+    let nvarnames = code.varnames.len();
+    let (name, is_free): (&str, bool) = if idx < nvarnames {
+        (code.varnames[idx].as_ref(), false)
+    } else {
+        let cell_slot = idx - nvarnames;
+        let npure = npure_cellvars(code);
+        if cell_slot < npure {
+            let name = code
+                .cellvars
+                .iter()
+                .filter(|c| {
+                    let cs: &str = c.as_ref();
+                    !code.varnames.iter().any(|v| {
+                        let vs: &str = v.as_ref();
+                        vs == cs
+                    })
+                })
+                .nth(cell_slot)
+                .map(|c| c.as_ref())
+                .unwrap_or("");
+            (name, false)
+        } else {
+            let name = code
+                .freevars
+                .get(cell_slot - npure)
+                .map(|f| f.as_ref())
+                .unwrap_or("");
+            (name, true)
+        }
+    };
+    let message = if is_free {
+        format!("free variable '{name}' referenced before assignment in enclosing scope")
+    } else {
+        format!("local variable '{name}' referenced before assignment")
+    };
+    crate::PyError::new(crate::PyErrorKind::NameError, message)
+}
+
 /// Whether calling a code object with these flags produces a suspended
 /// frame object (generator / coroutine / async generator) rather than
 /// running the body eagerly.

@@ -83,9 +83,10 @@ pub struct Cpu {
     /// `bh_super_attr_unwrap_fn(raw, which)` — LOAD_SUPER_ATTR method-form
     /// unwrap (`which` 0 = func slot, 1 = self slot); pure / infallible.
     pub super_attr_unwrap_fn: extern "C" fn(i64, i64) -> i64,
-    /// `bh_load_deref_value_fn(cell)` — LOAD_DEREF dereference residual
-    /// (cell contents, raising on an unbound free variable).
-    pub load_deref_value_fn: extern "C" fn(i64) -> i64,
+    /// `bh_load_deref_value_fn(cell, code, deref_idx)` — LOAD_DEREF
+    /// dereference residual (cell contents, raising the named unbound-variable
+    /// `NameError` resolved via `code` + `deref_idx`).
+    pub load_deref_value_fn: extern "C" fn(i64, i64, i64) -> i64,
     /// `bh_unary_invert_fn(value)` — UNARY_INVERT `~value` residual
     /// (a user `__invert__` may run Python → fallible).
     pub unary_invert_fn: extern "C" fn(i64) -> i64,
