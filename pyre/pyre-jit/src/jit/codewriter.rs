@@ -3350,6 +3350,7 @@ struct FnPtrIndices {
     import_name_fn: HelperHandle,
     load_super_attr_fn: HelperHandle,
     super_attr_unwrap_fn: HelperHandle,
+    load_deref_value_fn: HelperHandle,
 }
 
 /// Register every blackhole helper fn pointer with the assembler in
@@ -3666,6 +3667,15 @@ fn register_helper_fn_pointers(
         cpu.super_attr_unwrap_fn as *const (),
         CallFlavor::MayForce,
     );
+    // `bh_load_deref_value_fn` reads a cell's contents (mutable heap) and
+    // raises on an unbound free variable; it runs no user code, so `Plain`
+    // (CanRaise, no virtualizable force) rather than `MayForce`.  Appended
+    // last to preserve fn_ptr indices.
+    let load_deref_value_fn = bind(
+        assembler,
+        cpu.load_deref_value_fn as *const (),
+        CallFlavor::Plain,
+    );
     FnPtrIndices {
         call_fn,
         load_global_fn,
@@ -3709,6 +3719,7 @@ fn register_helper_fn_pointers(
         import_name_fn,
         load_super_attr_fn,
         super_attr_unwrap_fn,
+        load_deref_value_fn,
     }
 }
 
@@ -4680,6 +4691,11 @@ impl CodeWriter {
                     idx: super_attr_unwrap_fn_idx,
                     flavor: _super_attr_unwrap_fn_flavor,
                 },
+            load_deref_value_fn:
+                HelperHandle {
+                    idx: load_deref_value_fn_idx,
+                    flavor: _load_deref_value_fn_flavor,
+                },
         } = register_helper_fn_pointers(&mut assembler, self.cpu());
 
         // codewriter.py:37 `portal_jd = self.callcontrol.jitdriver_sd_from_portal_graph(graph)`
@@ -4754,6 +4770,7 @@ impl CodeWriter {
                 import_name_fn_idx,
                 load_super_attr_fn_idx,
                 super_attr_unwrap_fn_idx,
+                load_deref_value_fn_idx,
             });
         }
 
@@ -8731,9 +8748,38 @@ impl CodeWriter {
                             emit_abort_permanent!(py_pc);
                         }
 
+                        // LOAD_DEREF: pushes the dereferenced cell value (+1).
+                        // The cell object lives in the same vable
+                        // `locals_cells_stack_w` array as the plain locals, so
+                        // `i` is a unified localsplus index read exactly like
+                        // LOAD_FAST (the vable getarrayitem path, inlining-safe
+                        // via `frame_var`).  The `load_deref_value(cell)` HLOp →
+                        // `residual_call_r_r(load_deref_value_fn, ListR[cell])`
+                        // dereferences the cell and raises on an unbound free
+                        // variable (`bh_load_deref_value_fn`, CallFlavor::Plain
+                        // — reads heap, runs no user code).
+                        Instruction::LoadDeref { i } => {
+                            let deref_idx = i.get(op_arg).as_usize() as u16;
+                            emit_load_fast_ref!(current_depth, deref_idx, py_pc);
+                            let cell_reg = emit_popvalue_ref!(current_depth, py_pc);
+                            let cell_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            if let super::flow::FlowValue::Variable(v) = &cell_value {
+                                pin!(Some(*v), cell_reg);
+                            }
+                            let result_value = emit_graph_op_with_result(
+                                &mut graph,
+                                &current_block.block(),
+                                "load_deref_value",
+                                vec![cell_value.into()],
+                                Kind::Ref,
+                                py_pc as i64,
+                            );
+                            pin!(Some(result_value), stack_base + current_depth);
+                            push_and_bump!(result_value.into(), py_pc);
+                        }
+
                         // Loads that push +1.
-                        Instruction::LoadDeref { .. }
-                        | Instruction::LoadFastCheck { .. }
+                        Instruction::LoadFastCheck { .. }
                         | Instruction::LoadCommonConstant { .. }
                         | Instruction::LoadLocals
                         | Instruction::LoadBuildClass => {

@@ -83,6 +83,9 @@ pub struct Cpu {
     /// `bh_super_attr_unwrap_fn(raw, which)` — LOAD_SUPER_ATTR method-form
     /// unwrap (`which` 0 = func slot, 1 = self slot); pure / infallible.
     pub super_attr_unwrap_fn: extern "C" fn(i64, i64) -> i64,
+    /// `bh_load_deref_value_fn(cell)` — LOAD_DEREF dereference residual
+    /// (cell contents, raising on an unbound free variable).
+    pub load_deref_value_fn: extern "C" fn(i64) -> i64,
     /// `bhimpl_compare_op` — RPython compare_op opcodes.
     pub compare_fn: extern "C" fn(i64, i64, i64) -> i64,
     /// `bhimpl_binary_op` — RPython binary_op opcodes.
@@ -227,6 +230,7 @@ impl Cpu {
             import_name_fn: crate::call_jit::bh_import_name_fn,
             load_super_attr_fn: crate::call_jit::bh_load_super_attr_fn,
             super_attr_unwrap_fn: crate::call_jit::bh_super_attr_unwrap_fn,
+            load_deref_value_fn: crate::call_jit::bh_load_deref_value_fn,
             compare_fn: crate::call_jit::bh_compare_fn,
             binary_op_fn: crate::call_jit::bh_binary_op_fn,
             box_int_fn: crate::call_jit::bh_box_int_fn,
