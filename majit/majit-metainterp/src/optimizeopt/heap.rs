@@ -1129,10 +1129,54 @@ impl OptHeap {
     /// `AbstractCachedEntry._get_rhs_from_set_op` (heap.py:169-170 /
     /// :300). `Self::field_get_rhs` → `op.arg(1)` for SETFIELD_GC;
     /// `Self::array_get_rhs` → `op.arg(2)` for SETARRAYITEM_GC.
+    /// True when `op` writes into the standard virtualizable frame: either a
+    /// SETFIELD_GC whose target object is the virtualizable, or a
+    /// SETARRAYITEM_GC whose array operand was read from the virtualizable's
+    /// array-pointer field (`GetfieldGc*`/`GetfieldRaw*` of the frame). Such
+    /// writes are deferred at the export flush — see `emit_lazy_setfield`.
+    fn writes_into_virtualizable(op: &Op, ctx: &OptContext) -> bool {
+        let Some(target) = ctx.resolve_box_box_opt(&op.arg(0)) else {
+            return false;
+        };
+        if ctx.is_virtualizable(&target) {
+            return true;
+        }
+        // Indirect: SETARRAYITEM_GC on the frame's array-pointer field. The
+        // array operand is produced by reading that field off the frame.
+        match ctx.get_producing_op(&target) {
+            Some(producer)
+                if matches!(
+                    producer.opcode,
+                    OpCode::GetfieldGcI
+                        | OpCode::GetfieldGcR
+                        | OpCode::GetfieldGcF
+                        | OpCode::GetfieldRawI
+                        | OpCode::GetfieldRawR
+                        | OpCode::GetfieldRawF
+                ) =>
+            {
+                ctx.resolve_box_box_opt(&producer.arg(0))
+                    .map_or(false, |frame| ctx.is_virtualizable(&frame))
+            }
+            _ => false,
+        }
+    }
+
     fn emit_lazy_setfield(op: &mut Op, ctx: &mut OptContext, get_rhs: fn(&Op) -> OpRef) {
         let rhs = get_rhs(op);
         let resolved_box = ctx.get_box_replacement_box(rhs);
         let rhs_is_virtual = resolved_box.as_ref().map_or(false, |b| ctx.is_virtual(b));
+        // A virtual value stored into the standard virtualizable frame is
+        // deferred, not flushed: the frame is a tracked existing object whose
+        // fields are reconstructed at resume (guard pendingfields, via
+        // force_lazy_sets_for_guard) or carried as JUMP args into the target
+        // loop. Forcing+emitting here would box a loop-carried virtual —
+        // turning Virtual{W_IntObject} into KnownClass and breaking the
+        // VirtualState match at a peeled label — and write a redundant inline
+        // store. OptVirtualize already mirrored the element for read-folding.
+        if rhs_is_virtual && Self::writes_into_virtualizable(op, ctx) {
+            return;
+        }
         // Virtualizable exemption mirrors Optimizer::force_box: a
         // virtualizable tracks an existing heap object, not a deferred
         // allocation; forcing it would destroy the tracked field state.
