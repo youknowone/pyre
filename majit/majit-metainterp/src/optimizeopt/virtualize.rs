@@ -566,7 +566,7 @@ impl OptVirtualize {
                     let b = BoxRef::from_bound_op(op_rc);
                     ctx.set_ptr_info(&b, PtrInfo::VirtualArrayStruct(vinfo));
                 } else {
-                    let items = vec![OpRef::NONE; size as usize];
+                    let items = vec![BoxRef::none(); size as usize];
                     let vinfo = VirtualArrayInfo {
                         descr,
                         clear: matches!(op.opcode, OpCode::NewArrayClear),
@@ -889,7 +889,7 @@ impl OptVirtualize {
                     ctx.with_ptr_info_mut(b, |info| {
                         if let PtrInfo::VirtualArray(vinfo) = info {
                             if idx < vinfo.items.len() {
-                                vinfo.items[idx] = value_ref;
+                                vinfo.items[idx] = BoxRef::from_opref(value_ref);
                                 return true;
                             }
                         }
@@ -942,7 +942,7 @@ impl OptVirtualize {
                     if index < 0 || (index as usize) >= vinfo.items.len() {
                         return OptimizationResult::InvalidLoop;
                     }
-                    let item_ref = vinfo.items[index as usize];
+                    let item_ref = vinfo.items[index as usize].to_opref();
                     if item_ref.is_none() {
                         return OptimizationResult::InvalidLoop;
                     }

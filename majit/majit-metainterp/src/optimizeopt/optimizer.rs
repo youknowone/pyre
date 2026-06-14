@@ -485,7 +485,9 @@ impl Optimizer {
             VirtualStateInfo::VArray { descr, items, .. } => {
                 let imported_items = items
                     .iter()
-                    .map(|item_info| Self::import_virtual_state_value(item_info, ctx))
+                    .map(|item_info| {
+                        BoxRef::from_opref(Self::import_virtual_state_value(item_info, ctx))
+                    })
                     .collect();
                 ctx.set_ptr_info(
                     box_,
@@ -955,13 +957,13 @@ impl Optimizer {
                 let imported_items = items
                     .iter()
                     .map(|item_info| {
-                        Self::import_virtual_state_from_label_args_recurse(
+                        BoxRef::from_opref(Self::import_virtual_state_from_label_args_recurse(
                             item_info,
                             imported_label_args,
                             label_slot,
                             ctx,
                             walk_visited,
-                        )
+                        ))
                     })
                     .collect();
                 let opref_box = ctx.get_box_replacement_box(opref);

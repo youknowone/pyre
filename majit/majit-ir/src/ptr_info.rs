@@ -200,7 +200,7 @@ pub struct VirtualArrayInfo {
     /// Whether this was created by NewArrayClear (zero-initialized).
     pub clear: bool,
     /// Element values.
-    pub items: Vec<OpRef>,
+    pub items: Vec<BoxRef>,
     /// info.py:91-92
     pub last_guard_pos: i32,
     /// info.py `_cached_vinfo` — see AbstractVirtualPtrInfo.
@@ -524,8 +524,8 @@ impl PtrInfo {
                 }
             }
             PtrInfo::VirtualArray(info) => {
-                for opref in &mut info.items {
-                    visit_opref(opref, visitor);
+                for b in &info.items {
+                    b.walk_const_ptr_refs(visitor);
                 }
             }
             PtrInfo::VirtualStruct(info) => {
@@ -720,7 +720,7 @@ impl PtrInfo {
         PtrInfo::VirtualArray(VirtualArrayInfo {
             descr,
             clear,
-            items: vec![OpRef::NONE; length],
+            items: vec![BoxRef::none(); length],
             last_guard_pos: -1,
             avpi: AbstractVirtualPtrInfo::new(),
         })
@@ -828,7 +828,7 @@ impl PtrInfo {
             PtrInfo::Struct(v) => v.fields.iter().filter_map(|(_, e)| e.as_opref()).collect(),
             PtrInfo::Array(v) => v.items.iter().filter_map(|e| e.as_opref()).collect(),
             PtrInfo::Virtual(v) => v.fields.iter().map(|(_, r)| *r).collect(),
-            PtrInfo::VirtualArray(v) => v.items.clone(),
+            PtrInfo::VirtualArray(v) => v.items.iter().map(|b| b.to_opref()).collect(),
             PtrInfo::VirtualStruct(v) => v.fields.iter().map(|(_, r)| *r).collect(),
             PtrInfo::VirtualArrayStruct(v) => v
                 .element_fields
@@ -878,7 +878,7 @@ impl PtrInfo {
             PtrInfo::VirtualArray(v) => {
                 for item in &mut v.items {
                     if !item.is_none() {
-                        *item = recurse(*item);
+                        *item = BoxRef::from_opref(recurse(item.to_opref()));
                     }
                 }
             }
@@ -1291,7 +1291,7 @@ impl PtrInfo {
                 .items
                 .iter()
                 .enumerate()
-                .map(|(i, val)| (i as u32, FieldEntry::Value(BoxRef::from_opref(*val))))
+                .map(|(i, val)| (i as u32, FieldEntry::Value(val.clone())))
                 .collect(),
             _ => Vec::new(),
         }
@@ -1337,7 +1337,7 @@ impl PtrInfo {
                 // info.py:568-569 `if self.is_virtual(): return  # bogus
                 // setarrayitem_gc into virtual, drop the operation`.
                 if index < v.items.len() {
-                    v.items[index] = value;
+                    v.items[index] = BoxRef::from_opref(value);
                 }
             }
             _ => {}
@@ -1351,7 +1351,7 @@ impl PtrInfo {
             PtrInfo::VirtualArray(v) => v
                 .items
                 .get(index)
-                .map(|r| FieldEntry::Value(BoxRef::from_opref(*r))),
+                .map(|r| FieldEntry::Value(r.clone())),
             _ => None,
         }
     }
@@ -1366,7 +1366,7 @@ impl PtrInfo {
             }
             PtrInfo::VirtualArray(v) => {
                 if index < v.items.len() {
-                    v.items[index] = OpRef::NONE;
+                    v.items[index] = BoxRef::none();
                 }
             }
             _ => {}

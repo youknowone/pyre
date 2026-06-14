@@ -1043,6 +1043,7 @@ fn force_box_impl(
             let clear = vinfo.clear;
             let descr = vinfo.descr.clone();
             for (i, item_ref) in items.into_iter().enumerate() {
+                let item_ref = item_ref.to_opref();
                 if item_ref == OpRef::NONE {
                     continue;
                 }

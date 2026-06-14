@@ -1055,7 +1055,7 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
                 field_oprefs: vi
                     .items
                     .iter()
-                    .map(|vref| self.ctx.get_replacement_opref(*vref))
+                    .map(|vref| self.ctx.get_replacement_opref(vref.to_opref()))
                     .collect(),
             }),
             PtrInfo::VirtualArrayStruct(vi) => Some(majit_ir::VirtualFieldsInfo {
@@ -3572,7 +3572,7 @@ impl OptContext {
             if let Some(infos) = exported_infos {
                 let items: Vec<OpRef> = match &*preamble_info_handle.borrow() {
                     PtrInfo::Virtual(v) => v.fields.iter().map(|(_, r)| *r).collect(),
-                    PtrInfo::VirtualArray(a) => a.items.iter().copied().collect(),
+                    PtrInfo::VirtualArray(a) => a.items.iter().map(|b| b.to_opref()).collect(),
                     PtrInfo::VirtualStruct(s) => s.fields.iter().map(|(_, r)| *r).collect(),
                     PtrInfo::VirtualArrayStruct(a) => a
                         .element_fields
@@ -5336,7 +5336,7 @@ impl OptContext {
                 let items: Vec<FieldEntry> = v
                     .items
                     .iter()
-                    .map(|&r| FieldEntry::Value(crate::r#box::BoxRef::from_opref(r)))
+                    .map(|r| FieldEntry::Value(r.clone()))
                     .collect();
                 let ci = self.const_infos.entry(key).or_insert_with(|| {
                     PtrInfo::Array(ArrayPtrInfo {

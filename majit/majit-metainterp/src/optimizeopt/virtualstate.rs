@@ -1741,7 +1741,9 @@ impl VirtualState {
                         .get_box_replacement_box(box_opref)
                         .and_then(|b| state.ctx.getptrinfo(&b))
                         .and_then(|info| match info {
-                            PtrInfo::VirtualArray(a) => Some(a.items.clone()),
+                            PtrInfo::VirtualArray(a) => {
+                                Some(a.items.iter().map(|b| b.to_opref()).collect())
+                            }
                             _ => None,
                         })
                 } else {
@@ -2569,7 +2571,7 @@ fn export_single_value_inner(
                 let items: Vec<Rc<VirtualStateInfoNode>> = vinfo
                     .items
                     .iter()
-                    .map(|item_ref| export_single_value(*item_ref, ctx, cache))
+                    .map(|item_ref| export_single_value(item_ref.to_opref(), ctx, cache))
                     .collect();
                 let len = items.len();
                 return VirtualStateInfo::VArray {
