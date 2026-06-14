@@ -1581,7 +1581,10 @@ mod tests {
                 mode: 0,
                 length,
                 variant: VStringVariant::Plain(VStringPlainInfo {
-                    _chars: chars.into_iter().map(|o| o.map(BoxRef::from_opref)).collect(),
+                    _chars: chars
+                        .into_iter()
+                        .map(|o| o.map(BoxRef::from_opref))
+                        .collect(),
                 }),
                 last_guard_pos: -1,
                 avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),

@@ -7,9 +7,9 @@ use std::sync::Arc;
 
 use majit_ir::{OpRef, Type};
 
+use crate::r#box::BoxRef;
 use crate::jitcode::{JitArgKind, JitCode, read_u8, read_u16};
 use crate::opencoder::{Box as OpBox, TraceRecordBuffer};
-use crate::r#box::BoxRef;
 use crate::recorder::SnapshotTagged;
 
 /// Map an int register (OpRef, concrete value) to an `OpBox`.

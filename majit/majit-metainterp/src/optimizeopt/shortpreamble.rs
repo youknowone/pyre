@@ -2055,7 +2055,11 @@ fn build_short_preamble_struct_from_ops(
         crate::optimizeopt::vec_assoc::VecAssoc::new();
     ShortPreamble {
         ops: entries,
-        inputargs: short_inputargs.iter().copied().map(BoxRef::from_opref).collect(),
+        inputargs: short_inputargs
+            .iter()
+            .copied()
+            .map(BoxRef::from_opref)
+            .collect(),
         used_boxes: used_boxes.iter().copied().map(BoxRef::from_opref).collect(),
         jump_args: jump_args.iter().copied().map(BoxRef::from_opref).collect(),
         exported_state: None,
@@ -2821,8 +2825,12 @@ impl ExtendedShortPreambleBuilder {
         let mut sp =
             build_short_preamble_struct_from_ops(inputargs, &ops, &used_boxes, &short_jump_args);
         if inputargs != &short_inputargs {
-            sp.phase1_inputargs =
-                Some(short_inputargs.into_iter().map(BoxRef::from_opref).collect());
+            sp.phase1_inputargs = Some(
+                short_inputargs
+                    .into_iter()
+                    .map(BoxRef::from_opref)
+                    .collect(),
+            );
         }
         sp
     }
@@ -3442,7 +3450,10 @@ mod tests {
         assert_eq!(sp.ops[1].op.opcode, OpCode::IntSub);
         assert_eq!(sp.ops[1].arg_mapping, vec![(1, 1)]);
         assert_eq!(
-            sp.inputargs.iter().map(|b| b.to_opref()).collect::<Vec<_>>(),
+            sp.inputargs
+                .iter()
+                .map(|b| b.to_opref())
+                .collect::<Vec<_>>(),
             vec![OpRef::int_op(10), OpRef::int_op(11)]
         );
     }

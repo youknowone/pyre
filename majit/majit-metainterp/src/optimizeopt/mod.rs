@@ -1029,7 +1029,7 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
                         vi.fields
                             .iter()
                             .find(|(field_idx, _)| *field_idx == fi as u32)
-                            .map(|(_, vref)| self.ctx.get_replacement_opref(*vref))
+                            .map(|(_, vref)| self.ctx.get_replacement_opref(vref.to_opref()))
                             .unwrap_or(OpRef::NONE)
                     })
                     .collect(),
@@ -1044,7 +1044,7 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
                         vi.fields
                             .iter()
                             .find(|(field_idx, _)| *field_idx == fi as u32)
-                            .map(|(_, vref)| self.ctx.get_replacement_opref(*vref))
+                            .map(|(_, vref)| self.ctx.get_replacement_opref(vref.to_opref()))
                             .unwrap_or(OpRef::NONE)
                     })
                     .collect(),
@@ -1068,7 +1068,7 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
                         vi.fielddescrs.iter().enumerate().map(|(fi, _)| {
                             ef.iter()
                                 .find(|(field_idx, _)| *field_idx == fi as u32)
-                                .map(|(_, vref)| self.ctx.get_replacement_opref(*vref))
+                                .map(|(_, vref)| self.ctx.get_replacement_opref(vref.to_opref()))
                                 .unwrap_or(OpRef::NONE)
                         })
                     })
@@ -3572,13 +3572,15 @@ impl OptContext {
             }
             if let Some(infos) = exported_infos {
                 let items: Vec<OpRef> = match &*preamble_info_handle.borrow() {
-                    PtrInfo::Virtual(v) => v.fields.iter().map(|(_, r)| *r).collect(),
+                    PtrInfo::Virtual(v) => v.fields.iter().map(|(_, r)| r.to_opref()).collect(),
                     PtrInfo::VirtualArray(a) => a.items.iter().map(|b| b.to_opref()).collect(),
-                    PtrInfo::VirtualStruct(s) => s.fields.iter().map(|(_, r)| *r).collect(),
+                    PtrInfo::VirtualStruct(s) => {
+                        s.fields.iter().map(|(_, r)| r.to_opref()).collect()
+                    }
                     PtrInfo::VirtualArrayStruct(a) => a
                         .element_fields
                         .iter()
-                        .flat_map(|row| row.iter().map(|(_, r)| *r))
+                        .flat_map(|row| row.iter().map(|(_, r)| r.to_opref()))
                         .collect(),
                     PtrInfo::VirtualRawBuffer(r) => r.buffer.values(),
                     _ => Vec::new(),
@@ -5280,7 +5282,7 @@ impl OptContext {
                 let fields: Vec<(u32, FieldEntry)> = v
                     .fields
                     .iter()
-                    .map(|&(k, r)| (k, FieldEntry::Value(crate::r#box::BoxRef::from_opref(r))))
+                    .map(|(k, r)| (*k, FieldEntry::Value(r.clone())))
                     .collect();
                 let ci = self.const_infos.entry(key).or_insert_with(|| {
                     PtrInfo::Struct(StructPtrInfo {
@@ -5299,7 +5301,7 @@ impl OptContext {
                 let fields: Vec<(u32, FieldEntry)> = v
                     .fields
                     .iter()
-                    .map(|&(k, r)| (k, FieldEntry::Value(crate::r#box::BoxRef::from_opref(r))))
+                    .map(|(k, r)| (*k, FieldEntry::Value(r.clone())))
                     .collect();
                 let ci = self.const_infos.entry(key).or_insert_with(|| {
                     PtrInfo::Struct(StructPtrInfo {

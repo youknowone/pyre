@@ -951,9 +951,11 @@ impl VirtualState {
                     .as_ref()
                     .and_then(|b| ctx.peek_ptr_info(b))
                 {
-                    Some(crate::optimizeopt::info::PtrInfo::VirtualArrayStruct(vinfo)) => {
-                        vinfo.element_fields
-                    }
+                    Some(crate::optimizeopt::info::PtrInfo::VirtualArrayStruct(vinfo)) => vinfo
+                        .element_fields
+                        .iter()
+                        .map(|row| row.iter().map(|(i, b)| (*i, b.to_opref())).collect())
+                        .collect(),
                     _ => return Err(()),
                 };
                 if runtime_fields.len() != element_fields.len() {
@@ -1650,7 +1652,9 @@ impl VirtualState {
                 let parent_fields =
                     Self::peek_parent_field_oprefs(state.ctx, box_opref, runtime_box, |info| {
                         match info {
-                            PtrInfo::Virtual(v) => Some(v.fields.clone()),
+                            PtrInfo::Virtual(v) => {
+                                Some(v.fields.iter().map(|(i, b)| (*i, b.to_opref())).collect())
+                            }
                             _ => None,
                         }
                     });
@@ -1695,7 +1699,9 @@ impl VirtualState {
                 let parent_fields =
                     Self::peek_parent_field_oprefs(state.ctx, box_opref, runtime_box, |info| {
                         match info {
-                            PtrInfo::VirtualStruct(s) => Some(s.fields.clone()),
+                            PtrInfo::VirtualStruct(s) => {
+                                Some(s.fields.iter().map(|(i, b)| (*i, b.to_opref())).collect())
+                            }
                             _ => None,
                         }
                     });
@@ -1839,7 +1845,9 @@ impl VirtualState {
                         Self::peek_parent_field_oprefs(state.ctx, box_opref, runtime_box, |info| {
                             match info {
                                 PtrInfo::VirtualArrayStruct(a) => {
-                                    a.element_fields.get(elem_idx).cloned()
+                                    a.element_fields.get(elem_idx).map(|row| {
+                                        row.iter().map(|(i, b)| (*i, b.to_opref())).collect()
+                                    })
                                 }
                                 _ => None,
                             }
@@ -2555,7 +2563,7 @@ fn export_single_value_inner(
                     .fields
                     .iter()
                     .map(|(field_idx, field_ref)| {
-                        let field_state = export_single_value(*field_ref, ctx, cache);
+                        let field_state = export_single_value(field_ref.to_opref(), ctx, cache);
                         (*field_idx, field_state)
                     })
                     .collect();
@@ -2585,7 +2593,7 @@ fn export_single_value_inner(
                     .fields
                     .iter()
                     .map(|(field_idx, field_ref)| {
-                        let field_state = export_single_value(*field_ref, ctx, cache);
+                        let field_state = export_single_value(field_ref.to_opref(), ctx, cache);
                         (*field_idx, field_state)
                     })
                     .collect();
@@ -2603,7 +2611,8 @@ fn export_single_value_inner(
                         fields
                             .iter()
                             .map(|(field_idx, field_ref)| {
-                                let field_state = export_single_value(*field_ref, ctx, cache);
+                                let field_state =
+                                    export_single_value(field_ref.to_opref(), ctx, cache);
                                 (*field_idx, field_state)
                             })
                             .collect()
@@ -3106,7 +3115,7 @@ mod tests {
             &outer_a_box,
             PtrInfo::VirtualStruct(VirtualStructInfo {
                 descr: descr.clone(),
-                fields: vec![(0, inner_field_value)],
+                fields: vec![(0, BoxRef::from_opref(inner_field_value))],
                 last_guard_pos: -1,
                 avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
             }),
@@ -3115,7 +3124,7 @@ mod tests {
             &outer_b_box,
             PtrInfo::VirtualStruct(VirtualStructInfo {
                 descr,
-                fields: vec![(0, inner_field_value)],
+                fields: vec![(0, BoxRef::from_opref(inner_field_value))],
                 last_guard_pos: -1,
                 avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
             }),
@@ -3177,7 +3186,7 @@ mod tests {
             &virtual_box,
             PtrInfo::VirtualStruct(VirtualStructInfo {
                 descr,
-                fields: vec![(0, OpRef::NONE), (8, field_value)],
+                fields: vec![(0, BoxRef::none()), (8, BoxRef::from_opref(field_value))],
                 last_guard_pos: -1,
                 avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
             }),

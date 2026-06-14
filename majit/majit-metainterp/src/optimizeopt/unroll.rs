@@ -3143,10 +3143,10 @@ impl OptUnroll {
         let opref_box = ctx.get_box_replacement_box(opref);
         let fields: Vec<OpRef> = match opref_box.as_ref().and_then(|b| ctx.peek_ptr_info(b)) {
             Some(crate::optimizeopt::info::PtrInfo::Virtual(v)) => {
-                v.fields.iter().map(|(_, r)| *r).collect()
+                v.fields.iter().map(|(_, r)| r.to_opref()).collect()
             }
             Some(crate::optimizeopt::info::PtrInfo::VirtualStruct(v)) => {
-                v.fields.iter().map(|(_, r)| *r).collect()
+                v.fields.iter().map(|(_, r)| r.to_opref()).collect()
             }
             Some(crate::optimizeopt::info::PtrInfo::VirtualArray(v)) => {
                 v.items.iter().map(|b| b.to_opref()).collect()
@@ -6442,7 +6442,11 @@ mod tests {
         let exported = export_state(&[OpRef::int_op(0)], &[], &mut optimizer, &mut ctx, None);
 
         assert_eq!(
-            exported.end_args.iter().map(|b| b.to_opref()).collect::<Vec<_>>(),
+            exported
+                .end_args
+                .iter()
+                .map(|b| b.to_opref())
+                .collect::<Vec<_>>(),
             vec![OpRef::int_op(21)]
         );
     }
@@ -6753,11 +6757,17 @@ mod tests {
         // After force_box: orthodox `add_preamble_op` (shortpreamble.py:432-440)
         // populated all three lists in lock-step.
         assert_eq!(
-            sp.used_boxes.iter().map(|b| b.to_opref()).collect::<Vec<_>>(),
+            sp.used_boxes
+                .iter()
+                .map(|b| b.to_opref())
+                .collect::<Vec<_>>(),
             vec![OpRef::int_op(20)]
         );
         assert_eq!(
-            sp.jump_args.iter().map(|b| b.to_opref()).collect::<Vec<_>>(),
+            sp.jump_args
+                .iter()
+                .map(|b| b.to_opref())
+                .collect::<Vec<_>>(),
             vec![OpRef::int_op(20)]
         );
         assert!(
@@ -6855,11 +6865,17 @@ mod tests {
         // so used_boxes carries the resolved body-visible OpRef while
         // jump_args carries the unresolved Phase 1 source.
         assert_eq!(
-            sp.used_boxes.iter().map(|b| b.to_opref()).collect::<Vec<_>>(),
+            sp.used_boxes
+                .iter()
+                .map(|b| b.to_opref())
+                .collect::<Vec<_>>(),
             vec![OpRef::ref_op(14)]
         );
         assert_eq!(
-            sp.jump_args.iter().map(|b| b.to_opref()).collect::<Vec<_>>(),
+            sp.jump_args
+                .iter()
+                .map(|b| b.to_opref())
+                .collect::<Vec<_>>(),
             vec![OpRef::ref_op(19)]
         );
         assert!(

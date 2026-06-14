@@ -792,7 +792,8 @@ impl PtrInfoExt for PtrInfo {
         if fields.len() != size_descr.all_fielddescrs().len() {
             return false;
         }
-        for &(_, val) in fields {
+        for (_, val) in fields {
+            let val = val.to_opref();
             if !ctx
                 .get_box_replacement_box(val)
                 .and_then(|cb| cb.const_value())
@@ -878,7 +879,9 @@ fn force_box_impl(
                 if !ptr.is_null() {
                     // info.py:144: _force_elements_immutable
                     // Write constant field values directly to the allocated memory.
-                    for &(field_idx, val_ref) in fields.iter() {
+                    for (field_idx, val_ref) in fields.iter() {
+                        let field_idx = *field_idx;
+                        let val_ref = val_ref.to_opref();
                         if let Some(value) = ctx
                             .get_box_replacement_box(val_ref)
                             .and_then(|cb| cb.const_value())
@@ -952,7 +955,7 @@ fn force_box_impl(
                 ctx.make_equal_to(&box_, &b_alloc);
             }
             for (field_idx, value_ref) in std::mem::take(&mut vinfo.fields) {
-                let value_ref = force_child(value_ref, ctx);
+                let value_ref = force_child(value_ref.to_opref(), ctx);
                 let descr = lookup_field_descr(&cached_fielddescrs, field_idx);
                 debug_assert!(
                     descr.is_some(),
@@ -1005,7 +1008,7 @@ fn force_box_impl(
                 ctx.make_equal_to(&box_, &b_alloc);
             }
             for (field_idx, value_ref) in std::mem::take(&mut vinfo.fields) {
-                let value_ref = force_child(value_ref, ctx);
+                let value_ref = force_child(value_ref.to_opref(), ctx);
                 let descr = lookup_field_descr(&cached_fielddescrs, field_idx);
                 let descr = descr.expect(
                     "force_box: field_idx must resolve through descr.get_all_fielddescrs()[i]",
@@ -1123,7 +1126,7 @@ fn force_box_impl(
                     if value_ref.is_none() {
                         continue;
                     }
-                    let subbox = force_child(value_ref, ctx);
+                    let subbox = force_child(value_ref.to_opref(), ctx);
                     let arg_alloc = ctx.materialize_box_at(alloc_ref);
                     let arg_idx = ctx.materialize_box_at(idx_ref);
                     let arg_sub = ctx.materialize_box_at(subbox);

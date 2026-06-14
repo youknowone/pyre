@@ -574,7 +574,6 @@ impl OpRef {
             _ => None,
         }
     }
-
 }
 
 // `#[derive(PartialEq, Eq, Hash)]` on `OpRef` enforces RPython's

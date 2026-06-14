@@ -6942,7 +6942,9 @@ mod tests {
         sub.parent_descr_idx = 3;
         sub.int_regs[0] = Some(majit_ir::OpRef::int_op(11));
         sub.int_values[0] = Some(110);
-        sub.ref_regs[0] = Some(crate::r#box::BoxRef::from_opref(majit_ir::OpRef::ref_op(22)));
+        sub.ref_regs[0] = Some(crate::r#box::BoxRef::from_opref(majit_ir::OpRef::ref_op(
+            22,
+        )));
         sub.ref_values[0] = Some(220);
         sub.float_regs[0] = Some(majit_ir::OpRef::float_op(33));
         sub.float_values[0] = Some(330);

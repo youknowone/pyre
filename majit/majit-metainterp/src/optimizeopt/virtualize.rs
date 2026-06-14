@@ -219,6 +219,7 @@ impl VirtualizableTracker {
                 flat_input_idx += 1;
             }
             if !elements.is_empty() {
+                let elements: Vec<BoxRef> = elements.into_iter().map(BoxRef::from_opref).collect();
                 state.arrays.push((array_idx as u32, elements));
             }
         }
@@ -554,7 +555,7 @@ impl OptVirtualize {
                     let lgt = fielddescrs.len();
                     // info.py:648: self._items = [None] * (size * lgt)
                     let element_fields = (0..size as usize)
-                        .map(|_| (0..lgt as u32).map(|j| (j, OpRef::NONE)).collect())
+                        .map(|_| (0..lgt as u32).map(|j| (j, BoxRef::none())).collect())
                         .collect();
                     let vinfo = VirtualArrayStructInfo {
                         descr,
@@ -1587,8 +1588,11 @@ impl OptVirtualize {
         // → InstancePtrInfo(descr, known_class, is_virtual=True)
         let known_class = Some(crate::virtualref::JIT_VIRTUAL_REF_VTABLE as i64);
         let fields = vec![
-            (VREF_VIRTUAL_TOKEN_FIELD_INDEX, token_ref),
-            (VREF_FORCED_FIELD_INDEX, null_ref),
+            (
+                VREF_VIRTUAL_TOKEN_FIELD_INDEX,
+                BoxRef::from_opref(token_ref),
+            ),
+            (VREF_FORCED_FIELD_INDEX, BoxRef::from_opref(null_ref)),
         ];
         // info.py:175-188 stores no fielddescr side-list; the SizeDescr
         // (VRefSizeDescr.all_fielddescrs) is the authoritative view.
@@ -2193,14 +2197,14 @@ impl Optimization for OptVirtualize {
 
 // ── Field list helpers ──
 
-fn set_field(fields: &mut Vec<(u32, OpRef)>, field_idx: u32, value_ref: OpRef) {
+fn set_field(fields: &mut Vec<(u32, BoxRef)>, field_idx: u32, value_ref: OpRef) {
     for entry in fields.iter_mut() {
         if entry.0 == field_idx {
-            entry.1 = value_ref;
+            entry.1 = BoxRef::from_opref(value_ref);
             return;
         }
     }
-    fields.push((field_idx, value_ref));
+    fields.push((field_idx, BoxRef::from_opref(value_ref)));
 }
 
 fn set_field_descr(field_descrs: &mut Vec<(u32, DescrRef)>, field_idx: u32, descr: DescrRef) {
@@ -2220,11 +2224,11 @@ fn get_field_descr(field_descrs: &[(u32, DescrRef)], field_idx: u32) -> Option<D
         .map(|(_, descr)| descr.clone())
 }
 
-fn get_field(fields: &[(u32, OpRef)], field_idx: u32) -> Option<OpRef> {
+fn get_field(fields: &[(u32, BoxRef)], field_idx: u32) -> Option<OpRef> {
     fields
         .iter()
         .find(|(idx, _)| *idx == field_idx)
-        .map(|(_, opref)| *opref)
+        .map(|(_, b)| b.to_opref())
 }
 
 #[derive(Debug)]
@@ -2401,11 +2405,15 @@ impl majit_ir::SizeDescr for VRefSizeDescr {
 
 /// Lookup helper for `PtrInfo::Virtualizable.arrays` — returns the OpRef
 /// stored at `arrays[arr_idx][elem_idx]` if present and non-NONE.
-fn get_array_element(arrays: &[(u32, Vec<OpRef>)], arr_idx: u32, elem_idx: usize) -> Option<OpRef> {
+fn get_array_element(
+    arrays: &[(u32, Vec<BoxRef>)],
+    arr_idx: u32,
+    elem_idx: usize,
+) -> Option<OpRef> {
     arrays
         .iter()
         .find(|(i, _)| *i == arr_idx)
-        .and_then(|(_, e)| e.get(elem_idx).copied())
+        .and_then(|(_, e)| e.get(elem_idx).map(|b| b.to_opref()))
         .filter(|r| !r.is_none())
 }
 
@@ -2413,19 +2421,19 @@ fn get_array_element(arrays: &[(u32, Vec<OpRef>)], arr_idx: u32, elem_idx: usize
 /// with `OpRef::NONE` placeholders as needed, then stores `value` at
 /// `arr_idx`/`elem_idx`.
 fn set_array_element(
-    arrays: &mut Vec<(u32, Vec<OpRef>)>,
+    arrays: &mut Vec<(u32, Vec<BoxRef>)>,
     arr_idx: u32,
     elem_idx: usize,
     value: OpRef,
 ) {
     if let Some((_, elems)) = arrays.iter_mut().find(|(i, _)| *i == arr_idx) {
         if elem_idx >= elems.len() {
-            elems.resize(elem_idx + 1, OpRef::NONE);
+            elems.resize(elem_idx + 1, BoxRef::none());
         }
-        elems[elem_idx] = value;
+        elems[elem_idx] = BoxRef::from_opref(value);
     } else {
-        let mut elems = vec![OpRef::NONE; elem_idx + 1];
-        elems[elem_idx] = value;
+        let mut elems = vec![BoxRef::none(); elem_idx + 1];
+        elems[elem_idx] = BoxRef::from_opref(value);
         arrays.push((arr_idx, elems));
     }
 }
@@ -2874,7 +2882,7 @@ mod tests {
             PtrInfo::Virtualizable(VirtualizableFieldState {
                 fields: vec![],
                 field_descrs: vec![],
-                arrays: vec![(0, vec![OpRef::NONE])],
+                arrays: vec![(0, vec![BoxRef::none()])],
                 last_guard_pos: -1,
             }),
         );
@@ -3624,7 +3632,14 @@ mod tests {
         let PtrInfo::Virtual(vinfo) = info else {
             panic!("expected Virtual ptr info, got {info:?}");
         };
-        assert_eq!(vinfo.fields, vec![(0, OpRef::int_op(100))]);
+        assert_eq!(
+            vinfo
+                .fields
+                .iter()
+                .map(|(i, b)| (*i, b.to_opref()))
+                .collect::<Vec<_>>(),
+            vec![(0, OpRef::int_op(100))]
+        );
         // info.py:188 keeps no cached fielddescr list — `descr.get_all_fielddescrs()`
         // is the authoritative view. Round-trip the size descr the same way
         // production consumers (info.rs all_fielddescrs_from_descr) do.
