@@ -3859,6 +3859,29 @@ pub extern "C" fn bh_build_map_from_array(array: i64) -> i64 {
     pyre_interpreter::runtime_ops::build_map_from_refs(&items) as i64
 }
 
+/// BUILD_SET residual — the set counterpart of [`bh_build_map_from_array`].
+/// The length-prefixed array holds the `count` set elements the codewriter
+/// unrolled via `setarrayitem_gc_r`.  Element hashing may run user `__hash__`
+/// and a non-hashable element raises (`MayForce`, fallible); on error the
+/// exception is published through `BH_LAST_EXC_VALUE` for the trailing
+/// `GuardNoException` and the call returns 0.
+pub extern "C" fn bh_build_set_from_array(array: i64) -> i64 {
+    let arr = array as *const pyre_object::object_array::GcTypedArray;
+    let len = pyre_object::object_array::gcarray_len(arr);
+    let mut items: Vec<pyre_object::PyObjectRef> = Vec::with_capacity(len);
+    for i in 0..len {
+        items.push(pyre_object::object_array::getarrayitem_ref(arr, i));
+    }
+    match pyre_interpreter::runtime_ops::build_set_from_refs(&items) {
+        Ok(set) => set as i64,
+        Err(err) => {
+            let exc_obj = err.to_exc_object();
+            majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc_obj as i64));
+            0
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests_bh_newtuple_from_array {
     use super::bh_newtuple_from_array;

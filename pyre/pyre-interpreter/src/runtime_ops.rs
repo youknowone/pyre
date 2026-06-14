@@ -521,6 +521,14 @@ pub fn build_map_from_refs(items: &[PyObjectRef]) -> PyObjectRef {
     dict
 }
 
+/// BUILD_SET evaluation, shared by the JIT residual (`bh_build_set_from_array`).
+/// Builds a set from the forced element array; element hashing may run user
+/// `__hash__` / `__eq__` and a non-hashable element raises `TypeError`, so —
+/// unlike `build_map_from_refs` / `build_tuple_from_refs` — this is fallible.
+pub fn build_set_from_refs(items: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    crate::builtins::builtin_set_from_items(items)
+}
+
 /// BINARY_SLICE evaluation, shared by the interpreter (`binary_slice`)
 /// and the JIT residual (`bh_binary_slice_fn`): returns `obj[start:stop]`.
 /// `list` / `str` / `tuple` slice on element (code-point for `str`)

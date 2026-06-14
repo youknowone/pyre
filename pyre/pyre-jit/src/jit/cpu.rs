@@ -95,6 +95,9 @@ pub struct Cpu {
     /// BUILD_MAP — the forced `[k0, v0, ...]` pair array → dict.  Length
     /// travels inside the array, so any arity fits.
     pub build_map_from_array_fn: extern "C" fn(i64) -> i64,
+    /// BUILD_SET — the forced element array → set (fallible: element
+    /// hashing may run user `__hash__` / raise on a non-hashable element).
+    pub build_set_from_array_fn: extern "C" fn(i64) -> i64,
     /// `bhimpl_unpack_sequence` — (count, seq) → validated tuple of items.
     pub unpack_sequence_fn: extern "C" fn(i64, i64) -> i64,
     /// Read item `index` out of the validated unpack tuple — (index, seq) → item.
@@ -204,6 +207,7 @@ impl Cpu {
             build_list_fn: crate::call_jit::bh_build_list_fn,
             newtuple_from_array_fn: crate::call_jit::bh_newtuple_from_array,
             build_map_from_array_fn: crate::call_jit::bh_build_map_from_array,
+            build_set_from_array_fn: crate::call_jit::bh_build_set_from_array,
             unpack_sequence_fn: crate::call_jit::bh_unpack_sequence_fn,
             unpack_item_fn: crate::call_jit::bh_unpack_item_fn,
             build_slice_fn: crate::call_jit::bh_build_slice_fn,

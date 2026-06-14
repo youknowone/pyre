@@ -3255,6 +3255,7 @@ struct FnPtrIndices {
     binary_slice_fn: HelperHandle,
     delete_subscr_fn: HelperHandle,
     delete_attr_fn: HelperHandle,
+    build_set_from_array_fn: HelperHandle,
 }
 
 /// Register every blackhole helper fn pointer with the assembler in
@@ -3513,6 +3514,14 @@ fn register_helper_fn_pointers(
         cpu.delete_attr_fn as *const (),
         CallFlavor::MayForce,
     );
+    // `bh_build_set_from_array` builds a set from the forced element array;
+    // element hashing may run user `__hash__` → `MayForce`.  Appended last to
+    // preserve fn_ptr indices.
+    let build_set_from_array_fn = bind(
+        assembler,
+        cpu.build_set_from_array_fn as *const (),
+        CallFlavor::MayForce,
+    );
     FnPtrIndices {
         call_fn,
         load_global_fn,
@@ -3548,6 +3557,7 @@ fn register_helper_fn_pointers(
         binary_slice_fn,
         delete_subscr_fn,
         delete_attr_fn,
+        build_set_from_array_fn,
     }
 }
 
@@ -4479,6 +4489,11 @@ impl CodeWriter {
                     idx: delete_attr_fn_idx,
                     flavor: _delete_attr_fn_flavor,
                 },
+            build_set_from_array_fn:
+                HelperHandle {
+                    idx: build_set_from_array_fn_idx,
+                    flavor: _build_set_from_array_fn_flavor,
+                },
         } = register_helper_fn_pointers(&mut assembler, self.cpu());
 
         // codewriter.py:37 `portal_jd = self.callcontrol.jitdriver_sd_from_portal_graph(graph)`
@@ -4545,6 +4560,7 @@ impl CodeWriter {
                 binary_slice_fn_idx,
                 delete_subscr_fn_idx,
                 delete_attr_fn_idx,
+                build_set_from_array_fn_idx,
             });
         }
 
@@ -8016,14 +8032,67 @@ impl CodeWriter {
                         }
 
                         // BuildSet(count): pops count items, pushes 1 set. Net: -(count-1).
+                        //
+                        // Mirrors BuildMap's `new_array_clear` + unrolled
+                        // `setarrayitem_gc_r` array build, then a single
+                        // `build_set_from_array` residual consuming the forced
+                        // element array.  No arity cap: the length travels in
+                        // the array.  Unlike BuildMap, no count==0 decline —
+                        // BuildSet has no raising corpus site (`{}` is a dict),
+                        // and an empty array yields an empty set.
                         Instruction::BuildSet { count } => {
                             let n = count.get(op_arg) as usize;
+                            let mut item_values_rev = Vec::with_capacity(n);
                             for _ in 0..n {
-                                pop_and_decr_depth(&mut current_state, &mut current_depth);
+                                let item_reg = emit_popvalue_ref!(current_depth, py_pc);
+                                let item_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                                if let super::flow::FlowValue::Variable(v) = &item_value {
+                                    pin!(Some(*v), item_reg);
+                                }
+                                item_values_rev.push(item_value);
                             }
-                            push_fresh_ref(&mut current_state, &mut graph);
-                            current_depth += 1;
-                            emit_abort_permanent!(py_pc);
+                            // popvalues pops top-first; the array keeps
+                            // bottom-to-top order, so reverse the pop order.
+                            let items: Vec<super::flow::FlowValue> =
+                                item_values_rev.into_iter().rev().collect();
+                            let array_var = emit_graph_op_with_result(
+                                &mut graph,
+                                &current_block.block(),
+                                "new_array_clear",
+                                vec![
+                                    super::flow::FlowValue::Constant(
+                                        super::flow::Constant::signed(n as i64),
+                                    )
+                                    .into(),
+                                ],
+                                Kind::Ref,
+                                py_pc as i64,
+                            );
+                            for (i, item) in items.into_iter().enumerate() {
+                                emit_graph_op_void(
+                                    &current_block.block(),
+                                    "setarrayitem_gc_r",
+                                    vec![
+                                        super::flow::FlowValue::Variable(array_var).into(),
+                                        super::flow::FlowValue::Constant(
+                                            super::flow::Constant::signed(i as i64),
+                                        )
+                                        .into(),
+                                        item.into(),
+                                    ],
+                                    py_pc as i64,
+                                );
+                            }
+                            let result_value = emit_graph_op_with_result(
+                                &mut graph,
+                                &current_block.block(),
+                                "build_set_from_array",
+                                vec![super::flow::FlowValue::Variable(array_var).into()],
+                                Kind::Ref,
+                                py_pc as i64,
+                            );
+                            pin!(Some(result_value), stack_base + current_depth);
+                            push_and_bump!(result_value.into(), py_pc);
                         }
 
                         // BuildString(count): pops count strings, pushes 1. Net: -(count-1).

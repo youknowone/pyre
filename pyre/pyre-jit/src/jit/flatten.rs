@@ -3248,6 +3248,15 @@ pub struct LoweringContext {
     /// name through the code object and runs `baseobjspace::delattr_str` (a
     /// user `__delattr__` may force → `MayForce`).
     pub delete_attr_fn_idx: u16,
+    /// `build_set_from_array_fn` descrs-pool index — see codewriter.rs
+    /// `register_helper_fn_pointers` (`bind(assembler, cpu.build_set_from_array_fn,
+    /// CallFlavor::MayForce)`).  BUILD_SET records the BuildMap-style
+    /// `new_array_clear` + unrolled `setarrayitem_gc_r` element array, then the
+    /// `build_set_from_array(array)` HLOp lowers to `residual_call_r_r(
+    /// ConstInt(fn_idx), ListR([array]), Descr) → reg` via
+    /// [`lower_tuple_build_hlop_to_insn`]; `bh_build_set_from_array` builds the
+    /// set (element hashing may run user `__hash__` / raise → `MayForce`).
+    pub build_set_from_array_fn_idx: u16,
 }
 
 /// Map a BINARY_OP HLOp opname (`add`/.../`xor`/`getitem` plus the
@@ -4031,6 +4040,27 @@ where
             // allocation-only `newtuple_from_array`.
             Some(build_residual_call_r_r_insn_from_operands(
                 ctx.build_map_from_array_fn_idx,
+                vec![array_operand],
+                CallFlavor::MayForce,
+                majit_ir::PyreHelperKind::None,
+                dst_reg,
+            ))
+        }
+        "build_set_from_array" => {
+            if op.args.len() != 1 {
+                return None;
+            }
+            let array_operand =
+                flatten_arg_with_lowering(&op.args[0], get_register, lower_constant);
+            let dst_reg = match &op.result {
+                Some(super::flow::FlowValue::Variable(var)) => get_register(*var),
+                _ => return None,
+            };
+            // Set construction hashes elements (`__hash__` / `__eq__` may run
+            // user code; a non-hashable element raises) → `MayForce`, like
+            // `build_map_from_array`.
+            Some(build_residual_call_r_r_insn_from_operands(
+                ctx.build_set_from_array_fn_idx,
                 vec![array_operand],
                 CallFlavor::MayForce,
                 majit_ir::PyreHelperKind::None,
@@ -6351,6 +6381,7 @@ mod tests {
             binary_slice_fn_idx: 0,
             delete_subscr_fn_idx: 0,
             delete_attr_fn_idx: 0,
+            build_set_from_array_fn_idx: 0,
 };
         let mut on = SSARepr::new("setattr_on");
         let mut on_regallocs = make_regallocs();
@@ -6492,6 +6523,7 @@ mod tests {
             binary_slice_fn_idx: 0,
             delete_subscr_fn_idx: 0,
             delete_attr_fn_idx: 0,
+            build_set_from_array_fn_idx: 0,
 };
 
         let mut ssarepr = SSARepr::new("retired_families");
@@ -6620,6 +6652,7 @@ mod tests {
             binary_slice_fn_idx: 0,
             delete_subscr_fn_idx: 0,
             delete_attr_fn_idx: 0,
+            build_set_from_array_fn_idx: 0,
 };
 
         let mut ssarepr = SSARepr::new("trailing_live");
@@ -6711,6 +6744,7 @@ mod tests {
             binary_slice_fn_idx: 0,
             delete_subscr_fn_idx: 0,
             delete_attr_fn_idx: 0,
+            build_set_from_array_fn_idx: 0,
 };
 
         let mut ssarepr = SSARepr::new("multi_block_lowering");
@@ -6846,6 +6880,7 @@ mod tests {
             binary_slice_fn_idx: 0,
             delete_subscr_fn_idx: 0,
             delete_attr_fn_idx: 0,
+            build_set_from_array_fn_idx: 0,
 };
 
         let mut ssarepr = SSARepr::new("pyre_walker_2exit");
@@ -7026,6 +7061,7 @@ mod tests {
             binary_slice_fn_idx: 0,
             delete_subscr_fn_idx: 0,
             delete_attr_fn_idx: 0,
+            build_set_from_array_fn_idx: 0,
 });
 
         let mut regallocs = perform_register_allocation_all_kinds(&graph);
@@ -7255,6 +7291,7 @@ mod tests {
             binary_slice_fn_idx: 0,
             delete_subscr_fn_idx: 0,
             delete_attr_fn_idx: 0,
+            build_set_from_array_fn_idx: 0,
 };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -7350,6 +7387,7 @@ mod tests {
             binary_slice_fn_idx: 0,
             delete_subscr_fn_idx: 0,
             delete_attr_fn_idx: 0,
+            build_set_from_array_fn_idx: 0,
 };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -7389,6 +7427,7 @@ mod tests {
             binary_slice_fn_idx: 0,
             delete_subscr_fn_idx: 0,
             delete_attr_fn_idx: 0,
+            build_set_from_array_fn_idx: 0,
 };
 
         let hlop = SpaceOperation::new("sub", vec![lhs.into(), rhs.into()], Some(result.into()), 0);
@@ -7501,6 +7540,7 @@ mod tests {
             binary_slice_fn_idx: 0,
             delete_subscr_fn_idx: 0,
             delete_attr_fn_idx: 0,
+            build_set_from_array_fn_idx: 0,
 };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -7572,6 +7612,7 @@ mod tests {
             binary_slice_fn_idx: 0,
             delete_subscr_fn_idx: 0,
             delete_attr_fn_idx: 0,
+            build_set_from_array_fn_idx: 0,
 };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -7609,6 +7650,7 @@ mod tests {
             binary_slice_fn_idx: 0,
             delete_subscr_fn_idx: 0,
             delete_attr_fn_idx: 0,
+            build_set_from_array_fn_idx: 0,
 };
         let hlop = SpaceOperation::new("eq", vec![lhs.into(), rhs.into()], Some(result.into()), 0);
         let mut get_register = identity_register_mapper();
@@ -7653,6 +7695,7 @@ mod tests {
             binary_slice_fn_idx: 0,
             delete_subscr_fn_idx: 0,
             delete_attr_fn_idx: 0,
+            build_set_from_array_fn_idx: 0,
 };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -7724,6 +7767,7 @@ mod tests {
             binary_slice_fn_idx: 0,
             delete_subscr_fn_idx: 0,
             delete_attr_fn_idx: 0,
+            build_set_from_array_fn_idx: 0,
 };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -7758,6 +7802,7 @@ mod tests {
             binary_slice_fn_idx: 0,
             delete_subscr_fn_idx: 0,
             delete_attr_fn_idx: 0,
+            build_set_from_array_fn_idx: 0,
 };
         let hlop = SpaceOperation::new("bool", vec![cond.into()], Some(result.into()), 0);
         let mut get_register = identity_register_mapper();
@@ -7806,6 +7851,7 @@ mod tests {
             binary_slice_fn_idx: 0,
             delete_subscr_fn_idx: 0,
             delete_attr_fn_idx: 0,
+            build_set_from_array_fn_idx: 0,
 };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -7870,6 +7916,7 @@ mod tests {
             binary_slice_fn_idx: 0,
             delete_subscr_fn_idx: 0,
             delete_attr_fn_idx: 0,
+            build_set_from_array_fn_idx: 0,
 };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -7919,6 +7966,7 @@ mod tests {
             binary_slice_fn_idx: 0,
             delete_subscr_fn_idx: 0,
             delete_attr_fn_idx: 0,
+            build_set_from_array_fn_idx: 0,
 };
         let hlop = SpaceOperation::new(
             "setitem",
@@ -7983,6 +8031,7 @@ mod tests {
             binary_slice_fn_idx: 0,
             delete_subscr_fn_idx: 0,
             delete_attr_fn_idx: 0,
+            build_set_from_array_fn_idx: 0,
 };
         let mut get_register_a = identity_register_mapper();
         let mut get_register_b = identity_register_mapper();
@@ -8023,6 +8072,7 @@ mod tests {
             binary_slice_fn_idx: 0,
             delete_subscr_fn_idx: 0,
             delete_attr_fn_idx: 0,
+            build_set_from_array_fn_idx: 0,
 };
         let mut get_register_a = identity_register_mapper();
         let mut get_register_b = identity_register_mapper();
@@ -8063,6 +8113,7 @@ mod tests {
             binary_slice_fn_idx: 0,
             delete_subscr_fn_idx: 0,
             delete_attr_fn_idx: 0,
+            build_set_from_array_fn_idx: 0,
 };
         let mut get_register_a = identity_register_mapper();
         let mut get_register_b = identity_register_mapper();
@@ -8108,6 +8159,7 @@ mod tests {
             binary_slice_fn_idx: 0,
             delete_subscr_fn_idx: 0,
             delete_attr_fn_idx: 0,
+            build_set_from_array_fn_idx: 0,
 };
         let mut get_register_a = identity_register_mapper();
         let mut get_register_b = identity_register_mapper();
@@ -8167,6 +8219,7 @@ mod tests {
             binary_slice_fn_idx: 0,
             delete_subscr_fn_idx: 0,
             delete_attr_fn_idx: 0,
+            build_set_from_array_fn_idx: 0,
 };
         let mut get_register_a = identity_register_mapper();
         let mut get_register_b = identity_register_mapper();
@@ -9549,6 +9602,7 @@ mod tests {
             binary_slice_fn_idx: 0,
             delete_subscr_fn_idx: 0,
             delete_attr_fn_idx: 0,
+            build_set_from_array_fn_idx: 0,
 };
         flatten_graph_for_test_with_lowering(&graph, &mut ssarepr, ctx, Some(cpu));
         ssarepr
@@ -9830,6 +9884,7 @@ mod tests {
             binary_slice_fn_idx: 0,
             delete_subscr_fn_idx: 0,
             delete_attr_fn_idx: 0,
+            build_set_from_array_fn_idx: 0,
 };
         let null_or_self_var = Variable::new(VariableId(10), Kind::Ref);
         let op = super::super::flow::SpaceOperation::new(
@@ -9934,6 +9989,7 @@ mod tests {
             binary_slice_fn_idx: 97,
             delete_subscr_fn_idx: 98,
             delete_attr_fn_idx: 99,
+            build_set_from_array_fn_idx: 100,
         };
         let code_const = Constant::new(
             super::super::flow::ConstantValue::Signed(0x2000),
@@ -10252,6 +10308,75 @@ mod tests {
                 assert!(
                     matches!(args[0], Operand::ConstInt(96)),
                     "build_map_from_array_fn pool index, got {:?}",
+                    args[0]
+                );
+                match &args[1] {
+                    Operand::ListOfKind(list) => {
+                        assert_eq!(list.kind, Kind::Ref);
+                        assert!(
+                            matches!(&list.content[..], [Operand::Register(r)] if r.index == 101),
+                            "ListR = [array], got {:?}",
+                            list.content
+                        );
+                    }
+                    other => panic!("expected ListR, got {other:?}"),
+                }
+                assert_eq!(
+                    result,
+                    Some(Register {
+                        kind: Kind::Ref,
+                        index: 102
+                    }),
+                );
+            }
+            _ => panic!("expected Insn::Op, got {insn:?}"),
+        }
+    }
+
+    #[test]
+    fn lower_build_set_from_array_emits_build_set_fn_residual() {
+        // `build_set_from_array(array)` →
+        // `residual_call_r_r(ConstInt(build_set_from_array_fn_idx),
+        // ListR([array]), Descr) → reg`, the BuildMap-style array consumer
+        // (MayForce — set element hashing runs user code / may raise).
+        let array_var = Variable::new(VariableId(8), Kind::Ref);
+        let result_var = Variable::new(VariableId(9), Kind::Ref);
+        let (ctx, _, _) = load_attr_lowering_fixture();
+        let op = super::super::flow::SpaceOperation::new(
+            "build_set_from_array",
+            vec![array_var.into()],
+            Some(result_var.into()),
+            0,
+        );
+        let mut get_register = |var: Variable| match var.id {
+            VariableId(8) => Register {
+                kind: Kind::Ref,
+                index: 101,
+            },
+            VariableId(9) => Register {
+                kind: Kind::Ref,
+                index: 102,
+            },
+            _ => panic!("unexpected var id {:?}", var.id),
+        };
+        let mut lower_constant = super::flatten_constant_operand_for_test;
+        let insn = super::lower_tuple_build_hlop_to_insn(
+            &op,
+            &ctx,
+            &mut get_register,
+            &mut lower_constant,
+        )
+        .expect("build_set_from_array lowering must succeed");
+        match insn {
+            Insn::Op {
+                opname,
+                args,
+                result,
+            } => {
+                assert_eq!(opname, "residual_call_r_r");
+                assert!(
+                    matches!(args[0], Operand::ConstInt(100)),
+                    "build_set_from_array_fn pool index, got {:?}",
                     args[0]
                 );
                 match &args[1] {
