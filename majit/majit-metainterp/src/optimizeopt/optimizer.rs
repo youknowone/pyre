@@ -6345,8 +6345,14 @@ mod tests {
         let sp = ctx
             .build_imported_short_preamble()
             .expect("forcing imported short guard arg should build short preamble");
-        assert_eq!(sp.used_boxes, vec![OpRef::int_op(14)]);
-        assert_eq!(sp.jump_args, vec![OpRef::int_op(14)]);
+        assert_eq!(
+            sp.used_boxes.iter().map(|b| b.to_opref()).collect::<Vec<_>>(),
+            vec![OpRef::int_op(14)]
+        );
+        assert_eq!(
+            sp.jump_args.iter().map(|b| b.to_opref()).collect::<Vec<_>>(),
+            vec![OpRef::int_op(14)]
+        );
     }
 
     #[test]
