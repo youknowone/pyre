@@ -4027,6 +4027,17 @@ pub extern "C" fn bh_compare_fn(lhs: i64, rhs: i64, op_code: i64) -> i64 {
     // proper exception type object, which made every `except SomeError:`
     // appear to match — wrong for any clause beyond the first.
     if op_code == 10 {
+        // Validate the match target is an exception class / tuple of exception
+        // classes first (`cmp_exc_match`, pyopcode.py:1034-1039), raising
+        // TypeError otherwise.  The BC handler runs
+        // `validate_check_exc_match_class` before the bool-returning
+        // `check_exc_match_against`, so the residual path must too — `except 5:`
+        // (or a tuple with a non-exception member) raises instead of silently
+        // producing a bool.
+        if let Err(err) = pyre_interpreter::eval::validate_check_exc_match_class(rhs) {
+            publish_residual_call_exception(err.to_exc_object() as i64);
+            return 0;
+        }
         let matched = pyre_interpreter::eval::check_exc_match_against(lhs, rhs);
         return pyre_object::w_bool_from(matched) as i64;
     }
