@@ -2180,6 +2180,10 @@ pub fn clear_unreachable_blocks(graph: &mut FunctionGraph) {
             block.exits.clear();
             block.inputargs.clear();
             block.exitswitch = None;
+            // Drop the locals snapshot too: a retained framestate keeps
+            // variable references alive into later analysis passes, which
+            // defeats the unreachable-block drain.
+            block.framestate = None;
         }
     }
 }
