@@ -58,6 +58,22 @@ pub(super) struct Lowerer<'c> {
     /// model where `loop_header` lives only in the dispatch-equivalent
     /// JitCode.
     pub(super) in_dispatch_arm_body: bool,
+    /// Label for the dispatch loop start (BC_JIT_MERGE_POINT).
+    /// Set by `lower_dispatch_body` so that `continue` statements
+    /// in pre-dispatch match arms can emit BC_GOTO to restart the
+    /// dispatch iteration (RPython `pc = target; continue` parity).
+    pub(super) dispatch_loop_label: Option<Ident>,
+    /// `true` while lowering a dispatch arm body INLINE into the dispatch
+    /// JitCode (green-pc gated inline path, `lower_dispatch_chain`).  When
+    /// set, `pc`-writes (`pc += N`, `pc = target`) are pinned to pc's
+    /// register (reg0) via `lower_pc_pinned_write` instead of the default
+    /// SSA rebind / drop — the dispatch merge point reads pc from reg0, so
+    /// an inline arm's pc update must land there to advance the loop.
+    /// PyPy `tl.py` `greens=['pc','code']`: pc is a green threaded through
+    /// the portal, advanced in place by each opcode.  Always `false` for
+    /// the sub-JitCode arm path (BC_INLINE_CALL copies args caller→callee
+    /// only, so a sub-JitCode pc-write cannot reach the dispatch reg0).
+    pub(super) pc_pinned: bool,
 }
 
 impl<'c> Lowerer<'c> {
@@ -85,6 +101,8 @@ impl<'c> Lowerer<'c> {
             dispatch_tainted_reason: None,
             opcode_var_name: None,
             in_dispatch_arm_body: false,
+            dispatch_loop_label: None,
+            pc_pinned: false,
         };
         this.install_vable_input_binding();
         this

@@ -2722,8 +2722,28 @@ impl<M: Clone> MetaInterp<M> {
         // The caller derives `index` above from jitdriver_sd so the bootstrap
         // path and the regular JitDriver registry agree. The virtualizable
         // is a Ref-typed inputarg (resoperation.py:739 InputArgRef).
-        let virtualizable_box = OpRef::input_arg_ref(index as u32);
-        let virtualizable_value = live_values[index];
+        //
+        // `index` is a flat arg ordinal; `OpRef::input_arg_ref` wants a
+        // ref-register-bank index. They coincide only when no ref arg precedes
+        // the virtualizable in the ref bank (PyFrame strips its green refs, so
+        // its frame is ref-bank 0 == ordinal 0). A host whose lowering keeps a
+        // green ref ahead of the identity (the state-field JIT's `program` at
+        // ref reg 0) publishes the true ref-bank index via
+        // `identity_ref_bank_index`; honor it so the minted box matches the
+        // traced vable base. `index` still drives the flat `live_values` reads.
+        let box_ref_index = info.identity_ref_bank_index.unwrap_or(index);
+        let virtualizable_box = OpRef::input_arg_ref(box_ref_index as u32);
+        // The identity's concrete VALUE is the live virtualizable pointer.
+        // For PyFrame `live_values[index]` already IS the frame pointer
+        // (== `vable_ptr`), so this is a no-op there. For the state-field
+        // JIT `live_values[index]` is the first scalar (stackpos), NOT the
+        // `&state` identity, so prefer `vable_ptr` when it is set
+        // (`virtualizable_heap_ptr` cached it in `sync_before`).
+        let virtualizable_value = if !self.vable_ptr.is_null() {
+            majit_ir::Value::Ref(majit_ir::GcRef(self.vable_ptr as usize))
+        } else {
+            live_values[index]
+        };
         let has_expanded_tail = live_values.len() >= num_reds + total_vable;
         // pyjitpl.py:3302: virtualizable_boxes = vinfo.read_boxes(...)
         // pyjitpl.py appends these boxes to `original_boxes` before
@@ -3993,7 +4013,8 @@ impl<M: Clone> MetaInterp<M> {
         fdescr: DescrRef,
         adescr: DescrRef,
     ) {
-        self.tracing
+        let ok = self
+            .tracing
             .as_mut()
             .expect("opimpl_setarrayitem_vable_int requires active tracing")
             .vable_setarrayitem_indexed(
@@ -4006,6 +4027,10 @@ impl<M: Clone> MetaInterp<M> {
                 value,
                 concrete,
             );
+        assert!(
+            ok,
+            "opimpl_setarrayitem_vable_int: virtualizable array slot missing"
+        );
     }
 
     /// pyjitpl.py:1236-1247 `_opimpl_setarrayitem_vable` — ref variant.
@@ -4020,7 +4045,8 @@ impl<M: Clone> MetaInterp<M> {
         fdescr: DescrRef,
         adescr: DescrRef,
     ) {
-        self.tracing
+        let ok = self
+            .tracing
             .as_mut()
             .expect("opimpl_setarrayitem_vable_ref requires active tracing")
             .vable_setarrayitem_indexed(
@@ -4033,6 +4059,10 @@ impl<M: Clone> MetaInterp<M> {
                 value,
                 concrete,
             );
+        assert!(
+            ok,
+            "opimpl_setarrayitem_vable_ref: virtualizable array slot missing"
+        );
     }
 
     /// pyjitpl.py:1236-1247 `_opimpl_setarrayitem_vable` — float variant.
@@ -4047,7 +4077,8 @@ impl<M: Clone> MetaInterp<M> {
         fdescr: DescrRef,
         adescr: DescrRef,
     ) {
-        self.tracing
+        let ok = self
+            .tracing
             .as_mut()
             .expect("opimpl_setarrayitem_vable_float requires active tracing")
             .vable_setarrayitem_indexed(
@@ -4060,6 +4091,10 @@ impl<M: Clone> MetaInterp<M> {
                 value,
                 concrete,
             );
+        assert!(
+            ok,
+            "opimpl_setarrayitem_vable_float: virtualizable array slot missing"
+        );
     }
 
     /// pyjitpl.py:1253-1263 `opimpl_arraylen_vable(box, fdescr, adescr, pc)`.
@@ -5023,6 +5058,12 @@ impl<M: Clone> MetaInterp<M> {
             }
         };
         let num_ops_after = optimized_ops.len();
+        if crate::majit_log_enabled() {
+            eprintln!(
+                "[jit] post-opt: {} ops (before: {})",
+                num_ops_after, num_ops_before
+            );
+        }
 
         // RPython compile.py keeps the root entry contract on the original
         // loop inputargs. Simple loops synthesize a LABEL from that contract;
@@ -5158,8 +5199,17 @@ impl<M: Clone> MetaInterp<M> {
                 return CompileOutcome::Aborted;
             }
         }
+        if crate::majit_log_enabled() {
+            eprintln!("[jit] normalize_closing_jump_args start");
+        }
         let mut compiled_ops =
             compile::normalize_closing_jump_args(optimized_ops, &constants, final_num_inputs);
+        if crate::majit_log_enabled() {
+            eprintln!(
+                "[jit] normalize_closing_jump_args done, {} ops",
+                compiled_ops.len()
+            );
+        }
 
         if crate::debug::have_debug_prints() {
             let _s = crate::debug::scope("jit-log-opt-loop");
@@ -5283,6 +5333,13 @@ impl<M: Clone> MetaInterp<M> {
             driver_descriptor.as_ref(),
             orig_vable_ptr_loop,
         );
+        if crate::majit_log_enabled() {
+            eprintln!(
+                "[jit] pre-backend: {} ops, {} inputargs",
+                compiled_ops.len(),
+                inputargs.len()
+            );
+        }
         let compiled_constants_typed =
             crate::optimizeopt::optimizer::lower_typed_constants_to_const_pool(&constants);
         self.backend
@@ -5299,6 +5356,12 @@ impl<M: Clone> MetaInterp<M> {
         // ... profiler.end_backend() + debug_stop("jit-backend")`.
         // `enter_backend` RAII guard pairs the debug section + profiler
         // event; drop fires end_backend then debug_stop in LIFO order.
+        if crate::majit_log_enabled() {
+            eprintln!(
+                "[jit] backend.compile_loop start ({} ops)",
+                compiled_ops.len()
+            );
+        }
         let compile_result = {
             let _backend_scope = self.staticdata.profiler.enter_backend();
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -7828,6 +7891,11 @@ impl<M: Clone> MetaInterp<M> {
                 );
             }
         }
+    }
+
+    pub fn remove_compiled_loop(&mut self, green_key: u64) {
+        self.compiled_loops.remove(&green_key);
+        self.pending_preamble_tokens.remove(&green_key);
     }
 
     /// rpython/rlib/rstack.py:75-90 `stack_almost_full` — delegates to

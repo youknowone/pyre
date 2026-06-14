@@ -90,7 +90,22 @@ pub fn generate_trace_fn(config: &JitInterpConfig, func: &ItemFn) -> TokenStream
     // `with_trace_ctx_and_token_resolver` split-borrow helper.
     // (Legacy identity closure `|pc| pc` retained at the
     // call site there.)
-    let push_virtualizable_argbox = if config.virtualizable_decl.is_some() {
+    // State-field `[int; virt]` arrays also seed a standard-virtualizable
+    // identity: the OpRef of `virtualizable_boxes[-1]` must reach ref reg 1
+    // so the `getarrayitem_vable_*` dispatch ops resolve the same box that
+    // `init_virtualizable_boxes` minted (identity-equal per
+    // `is_nonstandard_virtualizable` Step 3). Push the identity argbox for
+    // both the PyFrame-style declaration and the state-field virt-array case.
+    let state_has_virt_array = config
+        .state_fields
+        .as_ref()
+        .map(|sf| {
+            sf.fields
+                .iter()
+                .any(|f| matches!(f.kind, crate::jit_interp::StateFieldKind::VirtArray(_)))
+        })
+        .unwrap_or(false);
+    let push_virtualizable_argbox = if config.virtualizable_decl.is_some() || state_has_virt_array {
         quote! {
             let Some(__vable_argbox) = __ctx.standard_virtualizable_jitcode_argbox() else {
                 return TraceAction::Abort;
@@ -272,12 +287,45 @@ pub fn generate_trace_fn(config: &JitInterpConfig, func: &ItemFn) -> TokenStream
 }
 
 pub(crate) fn find_dispatch_match(block: &syn::Block) -> Option<&syn::ExprMatch> {
+    // Select the match with the most arms — the dispatch match has many
+    // opcode arms while pre-dispatch branch matches have only a few.
+    let mut all = Vec::new();
+    collect_all_matches(block, &mut all);
+    all.into_iter().max_by_key(|m| m.arms.len())
+}
+
+fn collect_all_matches<'a>(block: &'a syn::Block, out: &mut Vec<&'a syn::ExprMatch>) {
     for stmt in &block.stmts {
-        if let Some(m) = find_match_in_stmt(stmt) {
-            return Some(m);
-        }
+        collect_matches_in_stmt(stmt, out);
     }
-    None
+}
+
+fn collect_matches_in_stmt<'a>(stmt: &'a syn::Stmt, out: &mut Vec<&'a syn::ExprMatch>) {
+    match stmt {
+        syn::Stmt::Expr(expr, _) => collect_matches_in_expr(expr, out),
+        syn::Stmt::Local(local) => {
+            if let Some(init) = &local.init {
+                collect_matches_in_expr(&init.expr, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_matches_in_expr<'a>(expr: &'a syn::Expr, out: &mut Vec<&'a syn::ExprMatch>) {
+    match expr {
+        syn::Expr::Match(m) => out.push(m),
+        syn::Expr::While(w) => collect_all_matches(&w.body, out),
+        syn::Expr::Loop(l) => collect_all_matches(&l.body, out),
+        syn::Expr::Block(b) => collect_all_matches(&b.block, out),
+        syn::Expr::If(i) => {
+            collect_all_matches(&i.then_branch, out);
+            if let Some((_, else_expr)) = &i.else_branch {
+                collect_matches_in_expr(else_expr, out);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn find_match_in_stmt(stmt: &syn::Stmt) -> Option<&syn::ExprMatch> {

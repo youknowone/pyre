@@ -46,6 +46,20 @@ pub const BC_NEWLIST: u8 = 9;
 pub const BC_NEWLIST_CLEAR: u8 = 10;
 pub const BC_NEWLIST_HINT: u8 = 11;
 
+// Single-object / array allocation — `blackhole.py:1301-1327`
+// `bhimpl_new` / `bhimpl_new_with_vtable` / `bhimpl_new_array`.
+// Bytes above the prior high-water so they never disturb existing
+// serialised byte assignments; 213 belongs to `BC_INT_BETWEEN`, 214 to
+// `BC_NEW_ARRAY_CLEAR` (both defined below with the BUILD_TUPLE notes),
+// and 215/216 to the c-argcode array forms `BC_SETARRAYITEM_GC_R_C` /
+// `BC_NEW_ARRAY_CLEAR_C`, so `new` / `new_array` / `new_with_vtable`
+// take the next free bytes 217/218/219. The blackhole handler bodies
+// already exist (`handler_new` etc.) but were unwired until these keys
+// joined `wellknown_bh_insns()`.
+pub const BC_NEW: u8 = 217;
+pub const BC_NEW_ARRAY: u8 = 218;
+pub const BC_NEW_WITH_VTABLE: u8 = 219;
+
 pub const BC_LOOP_HEADER: u8 = 12;
 pub const BC_ABORT: u8 = 13;
 pub const BC_ABORT_PERMANENT: u8 = 14;
@@ -123,12 +137,19 @@ pub const BC_CALL_ASSEMBLER_INT: u8 = 50;
 pub const BC_CALL_ASSEMBLER_REF: u8 = 51;
 pub const BC_CALL_ASSEMBLER_FLOAT: u8 = 52;
 pub const BC_CALL_ASSEMBLER_VOID: u8 = 53;
+// Ref-typed scalar state field: the field lives in the ref register bank
+// (registers_r) so getfield_gc/setfield_gc on it heap-cache and the
+// optimizer can reason about its identity. `d` = u16 field index, `r` =
+// ref register. (slots 54/55 were free between the call_assembler family
+// and the int state-field family.)
+pub const BC_LOAD_STATE_FIELD_REF: u8 = 54;
+pub const BC_STORE_STATE_FIELD_REF: u8 = 55;
 pub const BC_LOAD_STATE_FIELD: u8 = 56;
 pub const BC_STORE_STATE_FIELD: u8 = 57;
 pub const BC_LOAD_STATE_ARRAY: u8 = 58;
 pub const BC_STORE_STATE_ARRAY: u8 = 59;
-pub const BC_LOAD_STATE_VARRAY: u8 = 60;
-pub const BC_STORE_STATE_VARRAY: u8 = 61;
+// (bytes 60/61 were freed when the raw state-varray path was retired; virt
+// arrays now lower through the standard vable opcodes.)
 pub const BC_GETFIELD_VABLE_I: u8 = 62;
 pub const BC_GETFIELD_VABLE_R: u8 = 63;
 pub const BC_GETFIELD_VABLE_F: u8 = 64;
@@ -839,11 +860,10 @@ pub fn wellknown_bh_insns() -> VecAssoc<&'static str, u8> {
     m.insert("setarrayitem_gc_i/riid", BC_SETARRAYITEM_GC_I);
     m.insert("setarrayitem_gc_r/rird", BC_SETARRAYITEM_GC_R);
     m.insert("setarrayitem_gc_f/rifd", BC_SETARRAYITEM_GC_F);
-    // GC array allocation — `blackhole.py:1311-1313
-    // bhimpl_new_array_clear @arguments("cpu","i","d",returns="r")`.
-    m.insert("new_array_clear/id>r", BC_NEW_ARRAY_CLEAR);
     // `c`-argcode forms (USE_C_FORM, `assembler.py:163/312`): small
     // ConstInt index/length written inline as one signed byte.
+    // `new_array_clear/id>r` itself is registered with the other
+    // allocation opcodes (`new` / `new_with_vtable` / `new_array`) below.
     m.insert("setarrayitem_gc_r/rcrd", BC_SETARRAYITEM_GC_R_C);
     m.insert("new_array_clear/cd>r", BC_NEW_ARRAY_CLEAR_C);
     m.insert("getarrayitem_gc_i/rid>i", BC_GETARRAYITEM_GC_I);
@@ -946,6 +966,16 @@ pub fn wellknown_bh_insns() -> VecAssoc<&'static str, u8> {
     m.insert("newlist/idddd>r", BC_NEWLIST);
     m.insert("newlist_clear/idddd>r", BC_NEWLIST_CLEAR);
     m.insert("newlist_hint/idddd>r", BC_NEWLIST_HINT);
+
+    // Single-object / array allocation — `blackhole.py:1301-1327`
+    // `bhimpl_new` (`@arguments("cpu", "d", returns="r")`),
+    // `bhimpl_new_with_vtable` (same shape; descr carries the class),
+    // `bhimpl_new_array{,_clear}` (`@arguments("cpu", "i", "d",
+    // returns="r")`): length + arraydescr → ref result.
+    m.insert("new/d>r", BC_NEW);
+    m.insert("new_with_vtable/d>r", BC_NEW_WITH_VTABLE);
+    m.insert("new_array/id>r", BC_NEW_ARRAY);
+    m.insert("new_array_clear/id>r", BC_NEW_ARRAY_CLEAR);
 
     // Raw memory load — `blackhole.py:1512-1518`
     // `bhimpl_raw_load_{i,f}` (`@arguments("cpu", "i", "i", "d",
@@ -1057,12 +1087,12 @@ pub fn pyre_extension_insns() -> VecAssoc<&'static str, u8> {
     //   `d` = state-slot index (u16); `i` = int register (u16).
     //   Array variants carry an extra `i` for the index register
     //   before the destination/source slot.
+    m.insert("load_state_field_ref/dr", BC_LOAD_STATE_FIELD_REF);
+    m.insert("store_state_field_ref/dr", BC_STORE_STATE_FIELD_REF);
     m.insert("load_state_field/di", BC_LOAD_STATE_FIELD);
     m.insert("store_state_field/di", BC_STORE_STATE_FIELD);
     m.insert("load_state_array/dii", BC_LOAD_STATE_ARRAY);
     m.insert("store_state_array/dii", BC_STORE_STATE_ARRAY);
-    m.insert("load_state_varray/dii", BC_LOAD_STATE_VARRAY);
-    m.insert("store_state_varray/dii", BC_STORE_STATE_VARRAY);
     // TODO: pyre nested-bytecode `inline_call`.
     //
     // RPython's canonical `inline_call_*` keys (`/dIRF>i`, `/dIR>r`, …)

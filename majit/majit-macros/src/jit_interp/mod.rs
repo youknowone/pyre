@@ -97,6 +97,11 @@ pub struct JitInterpConfig {
     /// instead of requiring a storage pool. Enables `state.field` and
     /// `state.array[index]` patterns in match arms.
     pub state_fields: Option<StateFieldsConfig>,
+    /// Optional recovery method path called after compiled loop guard failure.
+    /// The method is called on `&mut self` (the state type) to re-derive
+    /// tracked state fields from shared mutable state after the compiled
+    /// loop's residual calls have mutated it.
+    pub recover: Option<Path>,
 }
 
 /// Virtualizable frame field declaration for `#[jit_interp]`.
@@ -231,6 +236,16 @@ pub enum StateFieldKind {
     /// touch the underlying memory through `jit_promote!` + raw-load IR.
     #[allow(dead_code)]
     Opaque(syn::Path),
+    /// Ref-typed scalar (e.g., `sel: ref(Stack)`) — a genuine `InputArgRef`
+    /// threaded through the ref register bank (`registers_r`) rather than the
+    /// int bank.  Storage on the state struct is a `usize` carrier (raw
+    /// GcRef / pointer bits); the `ref(T)` type path `T` names the heap class
+    /// the value points at.  Routing it through the ref bank lets the
+    /// optimizer heap-cache `getfield_gc` off it (a stable ref box), unlike
+    /// the cosmetic `input_arg_ref` virt-array pointer which flows through the
+    /// int bank.
+    #[allow(dead_code)]
+    Ref(syn::Path),
 }
 
 /// One entry in the `calls = { ... }` / `helpers = [ ... ]` map.
@@ -314,6 +329,16 @@ pub(crate) enum CallPolicyKind {
     InlineInt,
     InlineRef,
     InlineFloat,
+    /// `BC_INLINE_CALL` ('j' argcode) into a pipeline-built sub-jitcode
+    /// resolved by name through the host's `__majit_pipeline_jitcode`, rather
+    /// than a macro-generated `__majit_inline_jitcode_<name>` helper. Int /
+    /// Ref / Float select the trailing-return register kind read back into the
+    /// caller binding. `make_jitcodes()` (codewriter.py:89) builds the callee;
+    /// the dispatch traces into it the same way `Inline*` does, only the
+    /// jitcode source differs.
+    InlinePipelineInt,
+    InlinePipelineRef,
+    InlinePipelineFloat,
 }
 
 pub(crate) fn parse_call_policy_kind(kind: &Ident) -> Option<CallPolicyKind> {
@@ -368,6 +393,9 @@ pub(crate) fn parse_call_policy_kind(kind: &Ident) -> Option<CallPolicyKind> {
         "inline_int" => CallPolicyKind::InlineInt,
         "inline_ref" => CallPolicyKind::InlineRef,
         "inline_float" => CallPolicyKind::InlineFloat,
+        "inline_pipeline_int" => CallPolicyKind::InlinePipelineInt,
+        "inline_pipeline_ref" => CallPolicyKind::InlinePipelineRef,
+        "inline_pipeline_float" => CallPolicyKind::InlinePipelineFloat,
         _ => return None,
     })
 }
@@ -383,6 +411,7 @@ impl Parse for JitInterpConfig {
         let mut reds = None;
         let mut virtualizable_decl = None;
         let mut state_fields = None;
+        let mut recover: Option<Path> = None;
 
         while !input.is_empty() {
             let key: Ident = input.parse()?;
@@ -422,6 +451,9 @@ impl Parse for JitInterpConfig {
                 }
                 "state_fields" => {
                     state_fields = Some(parse_state_fields(input)?);
+                }
+                "recover" => {
+                    recover = Some(input.parse::<Path>()?);
                 }
                 other => {
                     return Err(syn::Error::new(
@@ -464,6 +496,7 @@ impl Parse for JitInterpConfig {
             green_type_tags,
             virtualizable_decl,
             state_fields,
+            recover,
         })
     }
 }
@@ -516,6 +549,17 @@ fn parse_state_fields(input: ParseStream) -> syn::Result<StateFieldsConfig> {
             } else {
                 StateFieldKind::Array(item_type)
             }
+        } else if content.peek(Token![ref]) {
+            // `ref(<TypePath>)` — a ref-typed scalar carried in the ref
+            // register bank.  `ref` is a reserved keyword, so it is matched
+            // with `Token![ref]` before the identifier-based scalar forms.
+            // Storage on the state struct is a usize carrier; `T` names the
+            // pointed-at heap class.
+            content.parse::<Token![ref]>()?;
+            let inner;
+            syn::parenthesized!(inner in content);
+            let type_path: syn::Path = inner.parse()?;
+            StateFieldKind::Ref(type_path)
         } else {
             // Scalar forms: `int`, `int(<TypePath>)`, or `opaque(TypePath)`.
             let head: Ident = content.parse()?;
@@ -1532,17 +1576,19 @@ fn rewrite_body(
                                 }
                                 (args.greens.clone(), self.default_green_type_tags.clone())
                             };
-                            let stacksize_update: TokenStream = quote! { #stacksize_expr = 0i32; };
                             // compile.py:711 parity: back_edge returns
                             // Some(resume_pc) on guard failure (blackhole
                             // resume) or FINISH (loop header re-entry).
+                            // state.restore_values already restores all
+                            // state fields (including stacksize) from the
+                            // compiled loop's exit state, so no explicit
+                            // stacksize reset is needed here.
                             let back_edge: TokenStream = if let Some(green_key) =
                                 green_key_expr(target_expr, &greens, &green_type_tags)
                             {
                                 quote! {
                                     if let Some(__resume_pc) = #driver_expr.back_edge_structured(#green_key, #target_expr, #state_expr, #env_expr, #pre_run_expr) {
                                         #pc_expr = __resume_pc;
-                                        #stacksize_update
                                         continue;
                                     }
                                 }
@@ -1550,7 +1596,6 @@ fn rewrite_body(
                                 quote! {
                                     if let Some(__resume_pc) = #driver_expr.back_edge(#target_expr, #state_expr, #env_expr, #pre_run_expr) {
                                         #pc_expr = __resume_pc;
-                                        #stacksize_update
                                         continue;
                                     }
                                 }
@@ -1741,6 +1786,28 @@ mod tests {
             parsed.fields[2].kind,
             StateFieldKind::VirtArray(_)
         ));
+    }
+
+    #[test]
+    fn parse_state_fields_accepts_ref_scalar() {
+        let tokens: proc_macro2::TokenStream = parse_quote! {
+            {
+                a: int,
+                sel: ref(crate::Stack),
+            }
+        };
+        let parsed = syn::parse2::<StateFieldsWrapper>(tokens).unwrap().0;
+        assert_eq!(parsed.fields.len(), 2);
+        assert!(matches!(
+            parsed.fields[0].kind,
+            StateFieldKind::Scalar { .. }
+        ));
+        match &parsed.fields[1].kind {
+            StateFieldKind::Ref(p) => {
+                assert_eq!(p.segments.last().unwrap().ident.to_string(), "Stack");
+            }
+            _ => panic!("expected Ref variant"),
+        }
     }
 
     #[test]

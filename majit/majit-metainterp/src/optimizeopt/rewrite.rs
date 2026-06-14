@@ -765,15 +765,14 @@ impl OptRewrite {
             }
         }
 
-        // rewrite.py postprocess_GUARD_VALUE:
-        //   box = get_box_replacement(op.getarg(0))
-        //   self.make_constant(box, op.getarg(1))
-        let box_ref = ctx.resolve_box_box(&arg0);
-        let v = ctx
-            .resolve_box_box_opt(&arg1)
-            .and_then(|b| b.const_value())
-            .expect("postprocess_GUARD_VALUE requires const arg1");
-        ctx.make_constant_box(&box_ref, v);
+        // rewrite.py:303-305 postprocess_GUARD_VALUE `make_constant(box,
+        // op.getarg(1))` runs in `propagate_postprocess` below, AFTER the
+        // guard has been emitted with its argument resolved. Calling it
+        // here (pre-emit) installs the Const forwarding before
+        // `emit_operation` resolves the guard's own arg0, collapsing the
+        // emitted guard to `guard_value(Const, Const)` — a no-op the
+        // backend compiles to nothing, so promoted values were never
+        // re-checked at runtime (#210 unguarded zombie loops).
         OptimizationResult::PassOn
     }
 
@@ -3427,8 +3426,25 @@ mod tests {
 
     #[test]
     fn test_guard_value_to_guard_false() {
-        // GUARD_VALUE(v, 0) → GUARD_FALSE(v)
-        let mut ops = vec![
+        // GUARD_VALUE(v, 0) on a bool-bounded v → GUARD_FALSE(v)
+        // (_maybe_replace_guard_value, optimizer.py:755-776). The [0,1]
+        // bound on v comes from the `int_gt` producer the intbounds pass
+        // analyzed; the guard's own make_constant runs in
+        // postprocess_GUARD_VALUE (rewrite.py:313-315), after emit, so it
+        // does not bound v at emit time.
+        let ops = vec![
+            // v = (i0 > i1): intbounds bounds the comparison result to [0,1].
+            {
+                let mut op = Op::new(
+                    OpCode::IntGt,
+                    &[
+                        BoxRef::from_opref(OpRef::int_op(0)),
+                        BoxRef::from_opref(OpRef::int_op(1)),
+                    ],
+                );
+                op.pos.set(OpRef::int_op(100));
+                op
+            },
             {
                 let mut op = Op::new(
                     OpCode::GuardValue,
@@ -3440,16 +3456,21 @@ mod tests {
                 op.pos.set(OpRef::void_op(0));
                 op
             },
-            Op::new(OpCode::Finish, &[]),
+            {
+                let mut op = Op::new(OpCode::Finish, &[]);
+                op.pos.set(OpRef::void_op(1));
+                op
+            },
         ];
-        ops[1].pos.set(OpRef::void_op(1));
         let mut opt = crate::optimizeopt::optimizer::Optimizer::new();
+        opt.add_pass(Box::new(crate::optimizeopt::intbounds::OptIntBounds::new()));
         opt.add_pass(Box::new(OptRewrite::new()));
+        opt.trace_inputargs = majit_ir::OpRef::inputarg_refs(&vec![majit_ir::Type::Int; 2]);
         let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
         constants.insert(200u32, majit_ir::Value::Int(0));
         let (ops, snapshots) = super::super::seed_empty_guard_snapshots(&ops);
         opt.snapshot_boxes = snapshots;
-        let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 1024);
+        let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 2);
 
         assert!(
             result.iter().any(|o| o.opcode == OpCode::GuardFalse),

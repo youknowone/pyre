@@ -1998,8 +1998,8 @@ mod oparg_with_body_local_method_call_green {
     #[test]
     fn dispatch_with_body_local_method_call_green_pins_canonical_call_before_merge_point() {
         use majit_metainterp::jitcode::insns::{
-            BC_INT_GUARD_VALUE, BC_INT_LE, BC_JIT_MERGE_POINT, BC_JIT_MERGE_POINT_C, BC_LIVE,
-            BC_RESIDUAL_CALL_IR_I,
+            BC_INT_GUARD_VALUE, BC_INT_LE, BC_INT_LSHIFT, BC_INT_RSHIFT, BC_JIT_MERGE_POINT,
+            BC_JIT_MERGE_POINT_C, BC_LIVE, BC_RESIDUAL_CALL_IR_I,
         };
 
         let mut asm = Assembler::new();
@@ -2055,10 +2055,10 @@ mod oparg_with_body_local_method_call_green {
         );
         let call_result_reg_byte = code[call_pos + 8];
 
-        // BC_INT_LE for `<call_result> <= state.f1` must land AFTER the
-        // canonical call op and BEFORE the merge point. The LHS of `<=`
-        // is the call result, so BC_INT_LE's first arg byte (`int_le_pos
-        // + 2`, i.e. lhs slot) equals `call_result_reg_byte`.
+        // BC_INT_LE for `<call_result> as i32 <= state.f1 as i32` must land
+        // AFTER the canonical call op and BEFORE the merge point. Its LHS is
+        // the `as i32` sign-extension of the call result; the dataflow chain
+        // is verified below.
         let int_le_pos = code[..mp_pos].iter().position(|&b| b == BC_INT_LE).expect(
             "A.3.6.3: BC_INT_LE must precede BC_JIT_MERGE_POINT for \
                  the body-local `<=` comparison",
@@ -2080,13 +2080,39 @@ mod oparg_with_body_local_method_call_green {
             mp_pos
         );
         let g_reg_byte = code[int_le_pos + 3];
+
+        // The fixture compares `get_req_size(pc) as i32 <= state.f1 as i32`
+        // (line 1976), so BC_INT_LE's lhs is the `as i32` sign-extension of
+        // the call result, not the raw call-result register. The cast lowers
+        // to `(x << 32) >> 32` — BC_INT_LSHIFT then arithmetic BC_INT_RSHIFT
+        // (lower_value.rs) — so verify BC_INT_LE's lhs chains back through
+        // that pair to the canonical call-result reg rather than asserting a
+        // direct register reuse (which the register allocator is free to
+        // forgo).
+        let int_le_lhs = code[int_le_pos + 1];
+        // binop_i encoding is `[opcode][lhs][rhs][dst]` (assembler.py:165-174).
+        let find_binop_dst = |op: u8, dst: u8| -> Option<usize> {
+            code[call_pos..int_le_pos]
+                .windows(4)
+                .position(|w| w[0] == op && w[3] == dst)
+                .map(|p| call_pos + p)
+        };
+        let rshift_pos = find_binop_dst(BC_INT_RSHIFT, int_le_lhs).expect(
+            "A.3.6.3: BC_INT_LE lhs must be produced by the `as i32` \
+             sign-extension (arithmetic BC_INT_RSHIFT) of the call result",
+        );
+        let lshift_dst = code[rshift_pos + 1];
+        let lshift_pos = find_binop_dst(BC_INT_LSHIFT, lshift_dst).expect(
+            "A.3.6.3: the `as i32` BC_INT_RSHIFT must consume a \
+             BC_INT_LSHIFT result",
+        );
         assert_eq!(
-            code[int_le_pos + 1],
+            code[lshift_pos + 1],
             call_result_reg_byte,
-            "A.3.6.3: BC_INT_LE lhs reg (at int_le_pos+1, 1-byte \
-             canonical) must equal the canonical call result reg; got \
-             int_le_lhs={} call_result_reg={}",
-            code[int_le_pos + 1],
+            "A.3.6.3: the `as i32` sign-extension feeding BC_INT_LE's lhs \
+             must root at the canonical call-result reg; got lshift_lhs={} \
+             call_result_reg={}",
+            code[lshift_pos + 1],
             call_result_reg_byte,
         );
 

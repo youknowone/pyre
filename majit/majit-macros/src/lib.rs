@@ -1039,6 +1039,29 @@ fn expand_dont_look_inside_attribute(item: TokenStream, attr_name: &str) -> Toke
     };
     let rpython_attribute_const = rpython_attribute_const_for(attr_name, sig, vis);
 
+    // No-op inline-prebuild fn.  A residual (opaque) helper has no inline
+    // body, hence no per-marker `-live-` triples to pre-register.  But a
+    // value-position call to this helper under `auto_calls` takes the
+    // `CallPolicySpec::Infer` arm in `lower_call_value`, which
+    // unconditionally queues `inline_prebuild_path(func)(__asm)` into the
+    // parent's `__prebuild_jitcode_liveness_*` (the path is always
+    // constructible).  Emit a no-op `__majit_inline_jitcode_<name>_prebuild`
+    // so that reference resolves and registers zero triples — matching the
+    // "no triples to register" intent documented at
+    // `jitcode_lower::lower_value::lower_call_value`'s Infer arm.  Mirrors
+    // the `#[jit_inline]` prebuild fn shape (`lib.rs` jit_inline expansion),
+    // with an empty body in place of the inline helper's triples.
+    //
+    // The assembler parameter is generic rather than the concrete
+    // `majit_metainterp::Assembler`: unlike `#[jit_inline]`/`#[jit_interp]`
+    // (used only inside the JIT crate), `#[dont_look_inside]` annotates
+    // functions in crates that have no `majit_metainterp` dependency at all
+    // (e.g. `pyre-object`), so naming the type here fails to resolve. The fn
+    // is only ever CALLED from the parent `__prebuild_jitcode_liveness_*`
+    // (codegen_trace.rs) where `__asm: &mut Assembler`, so the type param is
+    // inferred to `Assembler` at that single JIT-crate call site.
+    let prebuild_name = format_ident!("__majit_inline_jitcode_{}_prebuild", sig.ident);
+
     let expanded = quote! {
         #(#attrs)*
         #[inline(never)]
@@ -1050,6 +1073,10 @@ fn expand_dont_look_inside_attribute(item: TokenStream, attr_name: &str) -> Toke
             const _MAJIT_OPAQUE: bool = true;
             #block
         }
+
+        #[doc(hidden)]
+        #[allow(non_snake_case, unused_variables)]
+        #vis fn #prebuild_name<__MajitAsm>(__asm: &mut __MajitAsm) {}
 
         #call_target_fn
         #policy_fn

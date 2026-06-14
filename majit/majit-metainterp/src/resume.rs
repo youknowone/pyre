@@ -6390,11 +6390,15 @@ impl<'a> ResumeDataDirectReader<'a> {
         // jitcode.py:152
         let mut offset = info + 3;
 
+        let bh_debug = std::env::var_os("MAJIT_BH_DEBUG").is_some();
         // resume.py:1028-1030 `_callback_i` / jitcode.py:153-157.
         if length_i != 0 {
             let mut it = LivenessIterator::new(offset, length_i, all_liveness);
             while let Some(reg_idx) = it.next() {
                 let value = self.next_int();
+                if bh_debug {
+                    eprintln!("[bh-seed] i{reg_idx} = {value}");
+                }
                 // resume.py:1590-1591 `write_an_int`.
                 bh.setarg_i(reg_idx as usize, value);
             }
@@ -6405,6 +6409,9 @@ impl<'a> ResumeDataDirectReader<'a> {
             let mut it = LivenessIterator::new(offset, length_r, all_liveness);
             while let Some(reg_idx) = it.next() {
                 let value = self.next_ref();
+                if bh_debug {
+                    eprintln!("[bh-seed] r{reg_idx} = {value:#x}");
+                }
                 // resume.py:1593-1594 `write_a_ref`.
                 bh.setarg_r(reg_idx as usize, value);
             }
@@ -6547,12 +6554,31 @@ impl<'a> ResumeDataDirectReader<'a> {
     pub fn consume_vable_info(&mut self, vinfo: &dyn VirtualizableInfo, vable_size: i32) {
         // resume.py:1403
         assert!(vable_size > 0);
-        // resume.py:1404
-        let virtualizable = self.next_ref();
+        // The vable section is encoded identity-FIRST: the snapshot writer
+        // (`_list_of_boxes_virtualizable`, opencoder.py:718-726) reorders
+        // `[field0..fieldN, vable]` to `[vable, field0..fieldN]` so the resume
+        // reader can pull the virtualizable out before its field payload. So
+        // the identity is the first of the `vable_size` items and the field
+        // payload the remaining `vable_size - 1`, read sequentially.
+        // resume.py:1404 virtualizable = self.next_ref()
+        let decoded = self.next_ref();
+        // The state-field JIT's `&state` identity is a loop-invariant constant
+        // the optimizer folds out of the live registers, so it is absent from
+        // the deadframe and decodes to null. Recover it from the driver-
+        // published live pointer (mirrors how RPython's metainterp — which IS
+        // the resume context — holds the virtualizable). A null decode never
+        // arises for a heap-object virtualizable whose pointer is genuinely
+        // live in the deadframe, so this only fires for the folded-constant
+        // identity and leaves every other consumer's behavior unchanged.
+        let virtualizable = if decoded == 0 {
+            let live = live_vable_ptr();
+            if live != 0 { live } else { decoded }
+        } else {
+            decoded
+        };
         self.virtualizable_ptr = virtualizable;
-        // resume.py:1406
-        let expected = vinfo.get_total_size(virtualizable) as i32;
         // resume.py:1406: assert vinfo.get_total_size(virtualizable) == vable_size - 1
+        let expected = vinfo.get_total_size(virtualizable) as i32;
         assert!(
             expected == vable_size - 1,
             "consume_vable_info: vinfo.get_total_size(0x{:x}) = {} != vable_size - 1 = {}",
@@ -6562,7 +6588,9 @@ impl<'a> ResumeDataDirectReader<'a> {
         );
         // resume.py:1407
         vinfo.reset_token_gcref(virtualizable);
-        // resume.py:1408
+        // resume.py:1408 write_from_resume_data_partial reads the field
+        // payload from the remaining `vable_size - 1` items, leaving the reader
+        // positioned just past the vable section for the vref/frame chain.
         vinfo.write_from_resume_data_partial(virtualizable, self);
     }
 
@@ -6804,6 +6832,31 @@ impl<'a> ResumeDataDirectReader<'a> {
     }
 }
 
+thread_local! {
+    /// Live virtualizable identity for the in-progress blackhole resume.
+    ///
+    /// The state-field JIT's vable identity (`&state`) is a loop-invariant
+    /// constant the optimizer folds out of the live registers, so it is
+    /// absent from the guard deadframe (decodes to null). The driver
+    /// publishes the live `&state` here around its blackhole resume so
+    /// `consume_vable_info` can recover the null identity. Zero means unset
+    /// — the default for every consumer whose virtualizable pointer is
+    /// genuinely live in the deadframe (e.g. a heap-object frame), which
+    /// never reads this channel because its identity decodes non-null.
+    static LIVE_VABLE_PTR: std::cell::Cell<i64> = const { std::cell::Cell::new(0) };
+}
+
+/// Publish the live virtualizable identity for the next blackhole resume.
+/// Pass `0` to clear. See `LIVE_VABLE_PTR`.
+pub fn set_live_vable_ptr(ptr: i64) {
+    LIVE_VABLE_PTR.with(|c| c.set(ptr));
+}
+
+/// Read the driver-published live virtualizable identity (`0` if unset).
+pub fn live_vable_ptr() -> i64 {
+    LIVE_VABLE_PTR.with(|c| c.get())
+}
+
 /// resume.py:1312 blackhole_from_resumedata
 ///
 /// Build a chain of BlackholeInterpreters from encoded resume data.
@@ -6890,6 +6943,12 @@ pub fn blackhole_from_resumedata<'a>(
         let (jitcode_pos, pc) = resumereader.read_jitcode_pos_pc();
         // resume.py:1339-1340: jitcode = jitcodes[jitcode_pos]; curbh.setposition(jitcode, pc)
         let resolved = resolve_jitcode(jitcode_pos, pc)?;
+        if std::env::var_os("MAJIT_BH_DEBUG").is_some() {
+            eprintln!(
+                "[bh-frame] jitcode_pos={jitcode_pos} encoded_pc={pc} resolved_pc={}",
+                resolved.pc
+            );
+        }
         nextbh.setposition(resolved.jitcode.clone(), resolved.pc);
         if let Some(stack_base) = resolved.virtualizable_stack_base {
             nextbh.virtualizable_stack_base = stack_base;

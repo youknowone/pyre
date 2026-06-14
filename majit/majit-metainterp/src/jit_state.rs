@@ -275,17 +275,33 @@ pub trait JitState: Sized {
 
     fn restore(&mut self, meta: &Self::Meta, values: &[i64]);
 
+    /// Restore from the typed register banks separately. The forward-resume
+    /// path (jitdriver back-edge) holds int reds in `registers_i` and ref
+    /// reds in `registers_r`; a ref-typed state field must be read from the
+    /// ref bank, not the int bank. The default ignores `ref_values` and
+    /// restores int-only, so interpreters with no ref state fields keep
+    /// their existing behavior; the `#[jit_interp]` macro overrides this
+    /// when a `ref(...)` state field is declared.
+    fn restore_banked(&mut self, meta: &Self::Meta, int_values: &[i64], _ref_values: &[i64]) {
+        self.restore(meta, int_values);
+    }
+
     fn restore_values(&mut self, meta: &Self::Meta, values: &[Value]) {
-        let ints: Vec<i64> = values
-            .iter()
-            .map(|value| match value {
-                Value::Int(v) => *v,
-                Value::Float(v) => v.to_bits() as i64,
-                Value::Ref(r) => r.as_usize() as i64,
-                Value::Void => 0,
-            })
-            .collect();
-        self.restore(meta, &ints);
+        // Split the canonical-order typed values into the int and ref
+        // register banks (preserving per-type order) so ref-typed state
+        // fields route to `restore_banked`'s ref slice. Float/Void ride the
+        // int bank — no float/void state fields exist today.
+        let mut ints: Vec<i64> = Vec::with_capacity(values.len());
+        let mut refs: Vec<i64> = Vec::new();
+        for value in values {
+            match value {
+                Value::Int(v) => ints.push(*v),
+                Value::Float(v) => ints.push(v.to_bits() as i64),
+                Value::Ref(r) => refs.push(r.as_usize() as i64),
+                Value::Void => ints.push(0),
+            }
+        }
+        self.restore_banked(meta, &ints, &refs);
     }
 
     fn restore_guard_failure_values(
@@ -296,6 +312,19 @@ pub trait JitState: Sized {
     ) -> bool {
         self.restore_values(meta, values);
         true
+    }
+
+    fn recover_after_compiled_run(&mut self) {}
+
+    /// State-field JIT register layout: the per-instance scalar count,
+    /// flattened fixed `[int]` array lengths, and virt-array count, mirroring
+    /// `live_slots_for_state_field_jit`.  The blackhole resume path threads
+    /// this onto the root `BlackholeInterpreter` so its `state_field` handlers
+    /// map a logical scalar/array index to the flat register slot the resume
+    /// reader seeded (`blackhole.py:339 setarg_i`).  Default empty for
+    /// interpreters with no state fields (pyre).
+    fn state_field_layout(&self) -> crate::blackhole::StateFieldLayout {
+        crate::blackhole::StateFieldLayout::default()
     }
 
     fn sync_virtualizable_before_jit(
@@ -427,6 +456,29 @@ pub trait JitState: Sized {
     }
 
     fn collect_jump_args(sym: &Self::Sym) -> Vec<OpRef>;
+
+    /// Loop-close jump-arg collection with access to the live
+    /// `virtualizable_boxes` shadow (the trace ctx's standard-virtualizable
+    /// box list, identity LAST).
+    ///
+    /// pyjitpl.py:2982-2989 `reached_loop_header`:
+    /// `live_arg_boxes += self.virtualizable_boxes; live_arg_boxes.pop()`
+    /// — the loop-carried args include every virtualizable element box
+    /// (dropping the trailing identity). The macro state-field JIT carries
+    /// `[int; virt]` array elements through the vable shadow
+    /// (`set_virtualizable_entry_at`, no IR), so the elements only exist in
+    /// `boxes`, not in `Sym`; this hook lets the carrier splice them into the
+    /// JUMP in place of the `<arr>_ptr`/`<arr>_len` placeholders that the
+    /// no-ctx `collect_jump_args` emits.
+    ///
+    /// `boxes` is `TraceCtx::collect_virtualizable_boxes()` extracted by the
+    /// caller (owned clone, so the trace-ctx borrow is released before the
+    /// subsequent `compile_loop`). Default delegates to `collect_jump_args`,
+    /// so PyFrame (which closes via `CloseLoopWithArgs`, never this path) and
+    /// non-virtualizable state-field JITs (e.g. `regs: [int]`) are unaffected.
+    fn collect_jump_args_with_boxes(sym: &Self::Sym, _boxes: &[OpRef]) -> Vec<OpRef> {
+        Self::collect_jump_args(sym)
+    }
 
     /// Bridge `Sym`'s state slots onto the current `MIFrame.int_regs`
     /// and return a single-frame `recorder::Snapshot` for the guard

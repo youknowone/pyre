@@ -62,6 +62,24 @@ pub struct VirtualizableConfig {
     /// Mirrors `interp_jit.py:67 reds = ['frame', 'ec']` — the non-vable
     /// extra reds occupy `InputArg` slots `1..1+vable_input_offset`.
     pub vable_input_offset: usize,
+    /// Whether the tracker seeds array-element state from the trace-entry
+    /// input args (`init`'s array loop).
+    ///
+    /// `true` (PyFrame and the optimizer unit tests) keeps the legacy
+    /// stopgap behavior: array elements are mapped from input args into
+    /// `VirtualizableFieldState.arrays`, and the loop boundary expands the
+    /// virtualizable back into those element slots.
+    ///
+    /// `false` (the macro state-field JIT) suppresses that seeding. The
+    /// state-field tracer carries `[int; virt]` elements through the live
+    /// `virtualizable_boxes` shadow and splices the symbolically-updated
+    /// boxes straight into the loop JUMP (`collect_jump_args_with_boxes`,
+    /// pyjitpl.py:2982-2989). Re-seeding from the trace-entry input args
+    /// would thread stale loop-entry boxes alongside the fresh shadow boxes,
+    /// double-counting the array at the loop boundary. The identity
+    /// `PtrInfo::Virtualizable` is still installed (so the base is not
+    /// forced); only the per-element seeding is skipped.
+    pub track_array_elements: bool,
 }
 
 /// JitVirtualRef field slot indices.
@@ -204,38 +222,46 @@ impl VirtualizableTracker {
                 flat_input_idx += 1;
             }
 
-            for (array_idx, (&_offset, &length)) in self
-                .config
-                .array_field_offsets
-                .iter()
-                .zip(self.config.array_lengths.iter())
-                .enumerate()
-            {
-                let descr_for_slot = self.config.array_field_descrs.get(array_idx).cloned();
-                let field_idx = descr_for_slot
-                    .as_ref()
-                    .and_then(|d| d.as_field_descr())
-                    .map(|fd| fd.index_in_parent() as u32)
-                    .unwrap_or((1 + num_static + array_idx) as u32);
-                if let Some(descr) = descr_for_slot {
-                    set_field_descr(&mut state.field_descrs, field_idx, descr);
-                }
-
-                let mut elements = Vec::with_capacity(length);
-                for _ in 0..length {
-                    if flat_input_idx >= ctx.num_inputs() {
-                        break;
+            // The state-field JIT carries array elements through the live
+            // `virtualizable_boxes` shadow into the loop JUMP, so seeding element
+            // state from the trace-entry input args here would double-count them
+            // at the loop boundary. Skip the per-element loop in that mode; the
+            // empty `PtrInfo::Virtualizable` installed below still keeps the
+            // identity base from being forced.
+            if self.config.track_array_elements {
+                for (array_idx, (&_offset, &length)) in self
+                    .config
+                    .array_field_offsets
+                    .iter()
+                    .zip(self.config.array_lengths.iter())
+                    .enumerate()
+                {
+                    let descr_for_slot = self.config.array_field_descrs.get(array_idx).cloned();
+                    let field_idx = descr_for_slot
+                        .as_ref()
+                        .and_then(|d| d.as_field_descr())
+                        .map(|fd| fd.index_in_parent() as u32)
+                        .unwrap_or((1 + num_static + array_idx) as u32);
+                    if let Some(descr) = descr_for_slot {
+                        set_field_descr(&mut state.field_descrs, field_idx, descr);
                     }
-                    let slot_tp = ctx
-                        .inputarg_type_at(flat_input_idx)
-                        .unwrap_or(majit_ir::Type::Ref);
-                    elements.push(OpRef::input_arg_typed(flat_input_idx as u32, slot_tp));
-                    flat_input_idx += 1;
-                }
-                if !elements.is_empty() {
-                    let elements: Vec<BoxRef> =
-                        elements.into_iter().map(BoxRef::from_opref).collect();
-                    state.arrays.push((array_idx as u32, elements));
+
+                    let mut elements = Vec::with_capacity(length);
+                    for _ in 0..length {
+                        if flat_input_idx >= ctx.num_inputs() {
+                            break;
+                        }
+                        let slot_tp = ctx
+                            .inputarg_type_at(flat_input_idx)
+                            .unwrap_or(majit_ir::Type::Ref);
+                        elements.push(OpRef::input_arg_typed(flat_input_idx as u32, slot_tp));
+                        flat_input_idx += 1;
+                    }
+                    if !elements.is_empty() {
+                        let elements: Vec<BoxRef> =
+                            elements.into_iter().map(BoxRef::from_opref).collect();
+                        state.arrays.push((array_idx as u32, elements));
+                    }
                 }
             }
         }
@@ -2945,6 +2971,7 @@ mod tests {
                 array_field_descrs: vec![],
                 array_lengths: vec![1],
                 vable_input_offset: 0,
+                track_array_elements: true,
             },
         )));
         let forced = opt.force_box(OpRef::input_arg_ref(0), &mut ctx);
@@ -2975,6 +3002,7 @@ mod tests {
             array_field_descrs: vec![],
             array_lengths: vec![1],
             vable_input_offset: 0,
+            track_array_elements: true,
         });
         pass.setup();
 
@@ -3071,6 +3099,7 @@ mod tests {
             array_field_descrs: vec![],
             array_lengths: vec![],
             vable_input_offset: 0,
+            track_array_elements: true,
         });
         pass.setup();
 
@@ -3119,6 +3148,7 @@ mod tests {
             array_field_descrs: vec![],
             array_lengths: vec![],
             vable_input_offset: 0,
+            track_array_elements: true,
         });
         pass.setup();
 
@@ -3146,6 +3176,7 @@ mod tests {
             array_field_descrs: vec![],
             array_lengths: vec![],
             vable_input_offset: 0,
+            track_array_elements: true,
         });
         pass.setup();
 
@@ -3223,6 +3254,7 @@ mod tests {
             array_field_descrs: vec![],
             array_lengths: vec![1],
             vable_input_offset: 0,
+            track_array_elements: true,
         });
         pass.setup();
 
@@ -3265,6 +3297,7 @@ mod tests {
             array_field_descrs: vec![],
             array_lengths: vec![1],
             vable_input_offset: 0,
+            track_array_elements: true,
         });
         pass.setup();
 
@@ -3312,6 +3345,7 @@ mod tests {
             array_field_descrs: vec![],
             array_lengths: vec![1],
             vable_input_offset: 0,
+            track_array_elements: true,
         });
         pass.setup();
 
@@ -3419,6 +3453,7 @@ mod tests {
             array_field_descrs: vec![],
             array_lengths: vec![1],
             vable_input_offset: 0,
+            track_array_elements: true,
         });
         pass.setup();
 
@@ -3530,6 +3565,7 @@ mod tests {
             array_field_descrs: vec![],
             array_lengths: vec![1],
             vable_input_offset: 0,
+            track_array_elements: true,
         });
         let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
         let mut ops = vec![

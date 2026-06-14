@@ -840,8 +840,32 @@ mod tests {
 
     #[test]
     fn test_guard_value_to_guard_true() {
-        // GUARD_VALUE(v, 1) → GUARD_TRUE(v) via rewrite pass.
-        let mut ops = vec![
+        // GUARD_VALUE(v, 1) on a bool-bounded v → GUARD_TRUE(v)
+        // (_maybe_replace_guard_value, optimizer.py:755-776). The [0,1]
+        // bound on v must come from a producer the intbounds pass analyzed
+        // (here `int_gt`), not from the guard's own make_constant:
+        // postprocess_GUARD_VALUE (rewrite.py:313-315) runs make_constant
+        // after the guard is emitted, so at emit time the bound is only
+        // whatever the producer established.
+        let mut opt = crate::optimizeopt::optimizer::Optimizer::new();
+        opt.add_pass(Box::new(crate::optimizeopt::intbounds::OptIntBounds::new()));
+        opt.add_pass(Box::new(crate::optimizeopt::rewrite::OptRewrite::new()));
+        opt.trace_inputargs = majit_ir::OpRef::inputarg_refs(&vec![majit_ir::Type::Int; 2]);
+
+        let ops = vec![
+            // v = (i0 > i1): intbounds bounds the comparison result to [0,1].
+            {
+                let mut op = Op::new(
+                    OpCode::IntGt,
+                    &[
+                        BoxRef::from_opref(OpRef::int_op(0)),
+                        BoxRef::from_opref(OpRef::int_op(1)),
+                    ],
+                );
+                op.pos.set(OpRef::int_op(100));
+                op
+            },
+            // guard_value(v, 1)
             {
                 let mut op = Op::new(
                     OpCode::GuardValue,
@@ -853,24 +877,14 @@ mod tests {
                 op.pos.set(OpRef::void_op(0));
                 op
             },
-            Op::new(
-                OpCode::IntAdd,
-                &[
-                    BoxRef::from_opref(OpRef::int_op(100)),
-                    BoxRef::from_opref(OpRef::int_op(101)),
-                ],
-            ),
         ];
-        ops[1].pos.set(OpRef::int_op(1));
 
         // Pre-seed constant 1 for OpRef::int_op(200)
-        let mut opt = crate::optimizeopt::optimizer::Optimizer::new();
-        opt.add_pass(Box::new(crate::optimizeopt::rewrite::OptRewrite::new()));
         let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
         constants.insert(200u32, majit_ir::Value::Int(1));
         let (ops, snapshots) = super::super::seed_empty_guard_snapshots(&ops);
         opt.snapshot_boxes = snapshots;
-        let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 1024);
+        let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 2);
 
         // GUARD_VALUE should be replaced with GUARD_TRUE
         assert!(

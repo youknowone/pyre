@@ -774,6 +774,7 @@ impl Optimizer {
             // SAME_AS_*.type parity); the immediate push below makes
             // op_at(fresh) the authoritative type source. No
             // `value_types` write needed (5).
+            ctx.emitted_operations.insert(fresh);
             ctx.new_operations.push(std::rc::Rc::new(op));
             // Update the field to reference the SameAs result.
             entries[*entry_idx].fields[*field_idx].1 = fresh;
@@ -1487,19 +1488,27 @@ impl Optimizer {
     pub fn force_box(&mut self, opref: OpRef, ctx: &mut OptContext) -> OpRef {
         // optimizer.py:346: op = get_box_replacement(op)
         let resolved = ctx.get_replacement_opref(opref);
-        // optimizer.py:351-359: potential_extra_ops.pop(op)
-        // → sb.add_preamble_op(preamble_op)
-        let tracked = ctx
-            .take_potential_extra_op(resolved)
-            .or_else(|| ctx.take_potential_extra_op(opref));
-        if let Some(preamble_op) = tracked {
-            // shortpreamble.py:434 `op = preamble_op.op.get_box_replacement()`
-            // — the resolved Box itself is handed to the builder.
-            let resolved_for_pop = ctx.resolve_box_box(&preamble_op.op);
-            if let Some(builder) = ctx.active_short_preamble_producer_mut() {
-                builder.add_preamble_op_from_pop(&preamble_op, resolved_for_pop);
-            } else if let Some(builder) = ctx.imported_short_preamble_builder.as_mut() {
-                builder.add_preamble_op_from_pop(&preamble_op, resolved_for_pop);
+        // optimizer.py:351-359: potential_extra_ops.pop(op) → sb.add_preamble_op.
+        // The pool is keyed by the pure op's result Box. When that result
+        // folded to an inline Const, the Const can never be a pool key (the
+        // value is reproduced by inlining at use sites, not by a produced
+        // short box), so `op in potential_extra_ops` is always false and no
+        // short-preamble op is recorded. Skip the recording for const-resolved
+        // results — otherwise the Const reaches `used_boxes` and the carried
+        // label slot trips `OpRef::raw()` in unroll.rs.
+        if !resolved.is_constant() {
+            let tracked = ctx
+                .take_potential_extra_op(resolved)
+                .or_else(|| ctx.take_potential_extra_op(opref));
+            if let Some(preamble_op) = tracked {
+                // shortpreamble.py:434 `op = preamble_op.op.get_box_replacement()`
+                // — the resolved Box itself is handed to the builder.
+                let resolved_for_pop = ctx.resolve_box_box(&preamble_op.op);
+                if let Some(builder) = ctx.active_short_preamble_producer_mut() {
+                    builder.add_preamble_op_from_pop(&preamble_op, resolved_for_pop);
+                } else if let Some(builder) = ctx.imported_short_preamble_builder.as_mut() {
+                    builder.add_preamble_op_from_pop(&preamble_op, resolved_for_pop);
+                }
             }
         }
         let resolved_box = ctx.get_box_replacement_box(opref);
@@ -2056,6 +2065,11 @@ impl Optimizer {
             // `bind_input_resops` / emit), so the store is empty here.
             Vec::new()
         };
+        // `input_ops` is now fully seeded for this OptContext's lifetime;
+        // index it so `find_producer_op`'s lowest-priority lookup is O(1)
+        // instead of a full rfind over the recorder trace (O(n^2) over the
+        // whole optimization pass on large traces).
+        ctx.rebuild_input_ops_index();
         ctx.string_length_resolver = self.string_length_resolver.clone();
         ctx.string_content_resolver = self.string_content_resolver.clone();
         ctx.string_constant_alloc = self.string_constant_alloc.clone();
@@ -2872,8 +2886,21 @@ impl Optimizer {
             }
             ctx.exported_short_boxes = produced
                 .into_iter()
-                .map(|(result, produced)| {
+                .filter_map(|(result, produced)| {
                     let canonical_result = ctx.get_replacement_opref(result);
+                    // A produced short box whose result forwards to an inline
+                    // Const after optimization is not a real short box: a pure
+                    // op (e.g. an IntLe on loop-constant args) folds to a Const,
+                    // whose value is reproduced by inlining at use sites. A
+                    // Const must never enter exported_short_boxes / used_boxes —
+                    // it has no box index, so the carried-slot `.raw()` in
+                    // unroll.rs panics. RPython folds such ops away before
+                    // short-box creation, so its short boxes are always genuine
+                    // value Boxes. (pyre never reaches here with a Const, so
+                    // this filter is inert for the PyFrame portal.)
+                    if canonical_result.is_constant() {
+                        return None;
+                    }
                     let preamble_op = produced.preamble_op.clone();
                     // RPython parity: key and preamble_op.pos must be the
                     // same resolved value. Independent get_box_replacement
@@ -2920,7 +2947,7 @@ impl Optimizer {
                             );
                         }
                     }
-                    crate::optimizeopt::shortpreamble::PreambleOp {
+                    Some(crate::optimizeopt::shortpreamble::PreambleOp {
                         op: preamble_op,
                         // short_op.res travels with the entry — the SAME
                         // box object the preview ProducedShortOp carries,
@@ -2931,7 +2958,7 @@ impl Optimizer {
                         label_arg_idx: short_boxes.lookup_label_arg(canonical_result),
                         invented_name: produced.invented_name,
                         same_as_source: produced.same_as_source.clone(),
-                    }
+                    })
                 })
                 .collect();
             if std::env::var_os("MAJIT_LOG").is_some() {

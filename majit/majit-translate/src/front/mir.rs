@@ -252,12 +252,19 @@ fn is_known_lowering_gap(msg: &str) -> bool {
     // `lower_fun_decl` first hits this under MIR-index order, then retries
     // the body in reverse-postorder — which orders the defining block
     // before the reading block and resolves every such read in the
-    // current snapshot.  This predicate has two roles: it triggers that
-    // RPO retry, and (defensively) if even RPO cannot bind the read — a
-    // genuine loop-carried definition, of which there are none today —
-    // it classifies the residual failure as a tracked degradation (the
-    // function becomes a residual call) rather than a build-failing
-    // regression.
+    // current snapshot.  This predicate triggers that RPO retry, and
+    // (defensively) if even RPO cannot bind the read it classifies the
+    // residual failure as a tracked degradation (the function becomes a
+    // residual call) rather than a build-failing regression.
+    //
+    // Loop-carried definitions (a local defined on a back-edge and read
+    // at the loop header) are NOT a residual case: every block's live-in
+    // locals already receive a block inputarg in `Lowering::new`, and
+    // `edge_args` threads each predecessor's binding — including the
+    // back-edge — into it, so the header read resolves to the inputarg
+    // regardless of processing order.  The only requirement is that
+    // `compute_mir_liveness` mark every local the lowering reads; see
+    // `mark_projection_index_offset_use` for the `place[idx]` case.
     if msg.contains("uninitialised local") {
         return true;
     }
@@ -861,9 +868,11 @@ pub fn lower_fun_decl_with_static_addrs(
         // whole body in reverse-postorder, which visits the defining
         // block first.  This is scoped to exactly the bodies that fail
         // linearly (every other body keeps its linear-order bindings
-        // untouched), and RPO is proven sufficient for all of them
-        // (`classify_uninitialised_local_rpo_vs_loop_carried`: 0
-        // loop-carried, so no phi / block-inputarg threading is needed).
+        // untouched).  Loop-carried locals do not need RPO at all: they
+        // ride the per-block live-in inputargs minted in `new` and
+        // threaded by `edge_args` across the back-edge (phi / block
+        // inputargs), which is order-independent.  RPO only resolves the
+        // acyclic forward-reference case above.
         Err(LowerError::Unsupported(msg)) if is_known_lowering_gap(&msg) => {
             let mut lo = Lowering::new(llbc, name, &u, static_addrs, fd.generics.as_ref())?;
             lo.lower(BlockOrder::ReversePostorder)?;
@@ -5384,7 +5393,10 @@ fn mark_operand_use(op: &Operand, uses: &mut [bool], defs: &[bool]) {
 fn mark_place_use(place: &Place, uses: &mut [bool], defs: &[bool]) {
     match &place.kind {
         PlaceKind::Local(i) => mark_local_use(*i as usize, uses, defs),
-        PlaceKind::Projection(inner, _) => mark_place_use(inner, uses, defs),
+        PlaceKind::Projection(inner, elem) => {
+            mark_place_use(inner, uses, defs);
+            mark_projection_index_offset_use(elem, uses, defs);
+        }
         PlaceKind::Global { .. } | PlaceKind::Unknown => {}
     }
 }
@@ -5392,8 +5404,38 @@ fn mark_place_use(place: &Place, uses: &mut [bool], defs: &[bool]) {
 fn mark_place_write(place: &Place, uses: &mut [bool], defs: &mut [bool]) {
     match &place.kind {
         PlaceKind::Local(i) => mark_local_def(*i as usize, defs),
-        PlaceKind::Projection(inner, _) => mark_place_use(inner, uses, defs),
+        PlaceKind::Projection(inner, elem) => {
+            mark_place_use(inner, uses, defs);
+            mark_projection_index_offset_use(elem, uses, defs);
+        }
         PlaceKind::Global { .. } | PlaceKind::Unknown => {}
+    }
+}
+
+/// A place whose projection chain contains an `Index { offset, .. }`
+/// reads the offset operand's local at lowering time — `resolve_place`
+/// (read) and `emit_projection_write` (write) both route the offset
+/// through `index_offset_var` → `resolve_operand`.  The offset lives in
+/// the projection element, not in `inner`, so the surrounding
+/// `mark_place_use` / `mark_place_write` recursion (which descends only
+/// into `inner`) would miss it.  Mark it as a use so a loop-carried
+/// index local receives a block inputarg and threads across the
+/// back-edge, instead of failing loud as an uninitialised local at the
+/// loop header.  `from_end` is ignored, matching `index_offset_var`.
+fn mark_projection_index_offset_use(elem: &ProjectionElem, uses: &mut [bool], defs: &[bool]) {
+    let ProjectionElem::Tagged(v) = elem else {
+        return;
+    };
+    let Some(offset) = v
+        .as_object()
+        .and_then(|m| m.get("Index"))
+        .and_then(|idx| idx.as_object())
+        .and_then(|m| m.get("offset"))
+    else {
+        return;
+    };
+    if let Ok(op) = serde_json::from_value::<Operand>(offset.clone()) {
+        mark_operand_use(&op, uses, defs);
     }
 }
 
@@ -7759,5 +7801,86 @@ mod tests {
             origins.get("W_IntObject").map(String::as_str),
             Some("intobject")
         );
+    }
+
+    #[test]
+    fn liveness_marks_loop_carried_index_local_as_live_in() {
+        use majit_charon_reader::ullbc::Unstructured;
+        // A self-loop whose only read of the loop-carried local `_2` is
+        // as an `Index` offset (`_3 = _1[_2]`); `_2` is redefined on the
+        // back edge from `_3`, so it is never read as a plain operand.
+        // The index offset lives in the projection element, not in the
+        // projected place's `inner`, so a liveness pass that descends
+        // only into `inner` misses it: `_2` is not marked live-in at the
+        // loop block, the monotonic lowering mints no block inputarg for
+        // it, and the loop-header read fails loud as an uninitialised
+        // local (#176).  `mark_projection_index_offset_use` closes the
+        // gap — assert `_2` is live-in at bb1.
+        let span = || {
+            serde_json::json!({
+                "data": {
+                    "file_id": 0,
+                    "beg": {"line": 0, "col": 0},
+                    "end": {"line": 0, "col": 0}
+                },
+                "generated_from_span": null
+            })
+        };
+        let ty = || serde_json::json!({"Deduplicated": 0});
+        let place_local = |i: u64| serde_json::json!({"kind": {"Local": i}, "ty": ty()});
+        let copy_local = |i: u64| serde_json::json!({"Copy": place_local(i)});
+        let local =
+            |i: u64| serde_json::json!({"index": i, "name": null, "span": span(), "ty": ty()});
+        let stmt = |kind: serde_json::Value| serde_json::json!({"kind": kind, "comments_before": [], "span": span()});
+        // bb0:  _2 = const 0;  goto bb1
+        let bb0 = serde_json::json!({
+            "statements": [stmt(serde_json::json!({
+                "Assign": [place_local(2), {"Use": {"Const": null}}]
+            }))],
+            "terminator": {"kind": {"Goto": {"target": 1}}}
+        });
+        // bb1:  _3 = _1[_2];  _2 = _3;  goto bb1   (self-loop)
+        let read_index = stmt(serde_json::json!({
+            "Assign": [
+                place_local(3),
+                {"Use": {"Copy": {
+                    "kind": {"Projection": [
+                        place_local(1),
+                        {"Index": {"offset": copy_local(2), "from_end": false}}
+                    ]},
+                    "ty": ty()
+                }}}
+            ]
+        }));
+        let carry = stmt(serde_json::json!({
+            "Assign": [place_local(2), {"Use": copy_local(3)}]
+        }));
+        let bb1 = serde_json::json!({
+            "statements": [read_index, carry],
+            "terminator": {"kind": {"Goto": {"target": 1}}}
+        });
+        let body_json = serde_json::json!({
+            "span": span(),
+            "locals": {
+                "arg_count": 1,
+                "locals": [local(0), local(1), local(2), local(3)]
+            },
+            "body": [bb0, bb1]
+        });
+        let body: Unstructured =
+            serde_json::from_value(body_json).expect("fixture Unstructured parses");
+        // Base dataflow only: this case is closed by
+        // `mark_projection_index_offset_use` in the statement scan, not by
+        // the index-write `extra_live` set, so pass an empty extra_live.
+        let live = super::compute_mir_liveness(&body, &[]);
+        assert!(
+            live[1][2],
+            "loop-carried index local _2 must be live-in at the loop block bb1"
+        );
+        // Sanity: the array base _1 (read as the projection inner) is
+        // also live-in, and the throwaway temp _3 (defined before its
+        // only use within bb1) is not.
+        assert!(live[1][1], "array base _1 must be live-in at bb1");
+        assert!(!live[1][3], "temp _3 is block-local, not live-in at bb1");
     }
 }

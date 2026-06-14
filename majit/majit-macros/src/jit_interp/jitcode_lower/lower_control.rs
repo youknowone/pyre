@@ -61,7 +61,9 @@ impl<'c> Lowerer<'c> {
         self.emit_aux(quote! { let #end_label = __builder.new_label(); });
 
         // Separate literal/path arms from the wildcard/default arm.
-        let mut guarded_arms = Vec::new();
+        // Uses extract_pat_value_tokens (not extract_pat_literals) so
+        // symbolic constants like OP_JMP are accepted alongside literals.
+        let mut guarded_arms: Vec<(Vec<TokenStream>, &Box<Expr>)> = Vec::new();
         let mut default_arm = None;
 
         for arm in &expr_match.arms {
@@ -70,30 +72,34 @@ impl<'c> Lowerer<'c> {
                     default_arm = Some(&arm.body);
                 }
                 Pat::Ident(pat_ident) if pat_ident.subpat.is_none() => {
-                    // Catch-all binding like `x => ...` treated as default
-                    default_arm = Some(&arm.body);
+                    let name = pat_ident.ident.to_string();
+                    if name.starts_with(|c: char| c.is_lowercase()) {
+                        default_arm = Some(&arm.body);
+                    } else {
+                        let tokens = extract_pat_value_tokens(&arm.pat)?;
+                        guarded_arms.push((tokens, &arm.body));
+                    }
                 }
                 _ => {
-                    let literals = extract_pat_literals(&arm.pat)?;
-                    guarded_arms.push((literals, &arm.body));
+                    let tokens = extract_pat_value_tokens(&arm.pat)?;
+                    guarded_arms.push((tokens, &arm.body));
                 }
             }
         }
 
         let disc_reg = discriminant.reg;
 
-        for (literals, body) in &guarded_arms {
+        for (value_tokens, body) in &guarded_arms {
             let next_label = self.alloc_label();
             self.emit_aux(quote! { let #next_label = __builder.new_label(); });
 
-            if literals.len() == 1 {
-                // Single literal: eq check + branch
-                let value = literals[0];
+            if value_tokens.len() == 1 {
+                let value_tok = &value_tokens[0];
                 let const_reg = self.alloc_reg();
                 let eq_reg = self.alloc_reg();
                 self.emit_op(
                     OpMeta::linear(OpKind::LoadConstI, vec![], vec![Register::int(const_reg)]),
-                    quote! { __builder.load_const_i_value(#const_reg, #value); },
+                    quote! { __builder.load_const_i_value(#const_reg, #value_tok); },
                 );
                 self.emit_op(
                     OpMeta::linear(
@@ -109,9 +115,7 @@ impl<'c> Lowerer<'c> {
                 );
                 self.emit_conditional_guard(eq_reg, &next_label);
             } else {
-                // Multiple literals (Or pattern): chain with logical OR
-                // (val == lit1) | (val == lit2) | ...
-                let first_val = literals[0];
+                let first_tok = &value_tokens[0];
                 let first_const_reg = self.alloc_reg();
                 let mut or_reg = self.alloc_reg();
                 self.emit_op(
@@ -120,7 +124,7 @@ impl<'c> Lowerer<'c> {
                         vec![],
                         vec![Register::int(first_const_reg)],
                     ),
-                    quote! { __builder.load_const_i_value(#first_const_reg, #first_val); },
+                    quote! { __builder.load_const_i_value(#first_const_reg, #first_tok); },
                 );
                 self.emit_op(
                     OpMeta::linear(
@@ -130,13 +134,13 @@ impl<'c> Lowerer<'c> {
                     ),
                     quote! { __builder.record_binop_i(#or_reg, majit_ir::OpCode::IntEq, #disc_reg, #first_const_reg); },
                 );
-                for &lit_val in &literals[1..] {
+                for tok in &value_tokens[1..] {
                     let const_reg = self.alloc_reg();
                     let eq_reg = self.alloc_reg();
                     let new_or_reg = self.alloc_reg();
                     self.emit_op(
                         OpMeta::linear(OpKind::LoadConstI, vec![], vec![Register::int(const_reg)]),
-                        quote! { __builder.load_const_i_value(#const_reg, #lit_val); },
+                        quote! { __builder.load_const_i_value(#const_reg, #tok); },
                     );
                     self.emit_op(
                     OpMeta::linear(
@@ -271,6 +275,8 @@ impl<'c> Lowerer<'c> {
             dispatch_tainted_reason: None,
             opcode_var_name: self.opcode_var_name.clone(),
             in_dispatch_arm_body: self.in_dispatch_arm_body,
+            dispatch_loop_label: self.dispatch_loop_label.clone(),
+            pc_pinned: self.pc_pinned,
         };
 
         for stmt in &block.stmts {

@@ -29,6 +29,7 @@ pub fn interpret(code: &[u8], inputarg: i64) -> i64 {
     interpret_at(code, 0, inputarg)
 }
 
+#[majit_macros::dont_look_inside]
 pub fn interpret_at(code: &[u8], mut pc: usize, inputarg: i64) -> i64 {
     let mut stack: Vec<i64> = Vec::with_capacity(code.len());
 

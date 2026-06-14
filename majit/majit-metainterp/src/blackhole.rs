@@ -284,6 +284,13 @@ pub struct BlackholeInterpreter {
     /// table; the builder owns the wired table and propagates an `Arc`
     /// clone via `acquire_interp`.
     pub(crate) dispatch_table: std::sync::Arc<Vec<BhOpcodeHandler>>,
+    /// State-field JIT register layout (`StateFieldLayout`).  Set on the
+    /// root resume frame from `JitState::state_field_layout` so the
+    /// `state_field` handlers can map a logical field/array index to the
+    /// flat register slot the resume reader seeded.  Empty (no scalars /
+    /// arrays) for pyre frames and inline callees, which never dispatch
+    /// `state_field` opcodes.
+    pub state_field_layout: StateFieldLayout,
 }
 
 // blackhole.py: last exception value from a residual call.
@@ -337,6 +344,7 @@ impl Default for BlackholeInterpreter {
             jitdrivers_sd: Vec::new(),
             virtualizable_stack_base: 0,
             dispatch_table: std::sync::Arc::new(Vec::new()),
+            state_field_layout: StateFieldLayout::default(),
         }
     }
 }
@@ -953,6 +961,12 @@ impl BlackholeInterpreter {
         let mut values = Vec::with_capacity(length);
         for _ in 0..length {
             let index = self.next_u8() as usize;
+            if std::env::var_os("MAJIT_BH_DEBUG").is_some() {
+                eprintln!(
+                    "[bh-getlist] i{index} -> {}",
+                    self.registers_i.get(index).copied().unwrap_or(0)
+                );
+            }
             values.push(self.registers_i.get(index).copied().unwrap_or(0));
         }
         values
@@ -2414,6 +2428,150 @@ mod tests {
     //! helpers and arithmetic edge cases directly.
 
     use super::*;
+
+    // ── StateFieldLayout field→slot mapping tests (#183) ──
+
+    #[test]
+    fn state_field_layout_scalar_slots_are_identity() {
+        // No arrays, base 0: scalars fill `[0..num_scalars]`, slot == field_idx.
+        let layout = StateFieldLayout::new(4, vec![], 0, 0);
+        assert_eq!(layout.total_slots(), 4);
+        for i in 0..4 {
+            assert_eq!(layout.scalar_slot(i), i);
+        }
+    }
+
+    #[test]
+    fn state_field_layout_int_scalar_base_offsets_slots() {
+        // int_scalar_base shifts every int identity slot past the dispatch
+        // JitCode's int arguments (pc at i0): scalars at i1..i3, the array
+        // right after.
+        let layout = StateFieldLayout::new(2, vec![3], 0, 1);
+        assert_eq!(layout.total_slots(), 2 + 3);
+        assert_eq!(layout.scalar_slot(0), 1);
+        assert_eq!(layout.scalar_slot(1), 2);
+        assert_eq!(layout.array_elem_slot(0, 0), 3);
+        assert_eq!(layout.array_elem_slot(0, 2), 5);
+    }
+
+    #[test]
+    fn state_field_layout_tlr_regs_fixed_array() {
+        // tlr: `a: int` (scalar 0) + `regs: [int]` (fixed array, here len 8).
+        let layout = StateFieldLayout::new(1, vec![8], 0, 0);
+        assert_eq!(layout.total_slots(), 1 + 8);
+        assert_eq!(layout.scalar_slot(0), 0);
+        // regs[0..8] occupy slots 1..9.
+        assert_eq!(layout.array_elem_slot(0, 0), 1);
+        assert_eq!(layout.array_elem_slot(0, 7), 8);
+    }
+
+    #[test]
+    fn state_field_layout_total_matches_live_slots_helper() {
+        // The struct's total must equal the canonical liveness slot count.
+        for &(s, ref a, v) in &[
+            (1usize, vec![], 1usize),
+            (1, vec![8], 0),
+            (2, vec![3, 5], 2),
+            (0, vec![], 0),
+        ] {
+            let layout = StateFieldLayout::new(s, a.clone(), v, 0);
+            let (live_i, live_r, live_f) = crate::live_slots_for_state_field_jit(s, a, v, 0, 0, 0);
+            assert_eq!(layout.total_slots(), live_i.len());
+            assert!(live_r.is_empty() && live_f.is_empty());
+        }
+    }
+
+    #[test]
+    fn state_field_layout_total_live_values_includes_ref_scalars() {
+        // aheui: selected/stacksize/pool_ptr (3 int scalars) + selected_ref
+        // (1 ref scalar past the `program` ref arg at r0 → base 1).
+        // total_slots() counts only int-bank slots; the ref scalar lives in
+        // the ref bank and is appended by extract_live, so
+        // total_live_values() = total_slots() + num_ref_scalars. The
+        // trace-start / run-compiled gate compares the flat extract_live count
+        // against total_live_values(), not total_slots().
+        let layout = StateFieldLayout::with_ref_scalars(3, vec![], 0, 1, 1, 0);
+        assert_eq!(layout.total_slots(), 3);
+        assert_eq!(layout.total_live_values(), 4);
+        assert_eq!(layout.ref_scalar_slot(0), 1);
+        let (live_i, live_r, live_f) = crate::live_slots_for_state_field_jit(3, &[], 0, 1, 1, 0);
+        assert_eq!(layout.total_slots(), live_i.len());
+        assert_eq!(layout.num_ref_scalars, live_r.len());
+        assert_eq!(live_r, vec![1]);
+        assert_eq!(layout.total_live_values(), live_i.len() + live_r.len());
+        assert!(live_f.is_empty());
+    }
+
+    // ── state_field handler register-slot tests (#183) ──
+    #[test]
+    fn handler_state_field_moves_between_register_slots() {
+        // Two scalars: slot 0, slot 1. load_state_field copies a scalar slot
+        // into a working register; store_state_field copies back.
+        let mut bh = BlackholeInterpreter::default();
+        bh.state_field_layout = StateFieldLayout::new(2, vec![], 0, 0);
+        bh.registers_i = vec![10, 20, 0, 0];
+
+        // load_state_field/di: field_idx=1 (u16 LE) → dest reg 2.
+        let next = handler_load_state_field_di(&mut bh, &[1, 0, 2], 0).unwrap();
+        assert_eq!(next, 3);
+        assert_eq!(bh.registers_i[2], 20);
+
+        // store_state_field/di: src reg 2 (now holds 20+something) → field_idx=0.
+        bh.registers_i[2] = 99;
+        let next = handler_store_state_field_di(&mut bh, &[0, 0, 2], 0).unwrap();
+        assert_eq!(next, 3);
+        assert_eq!(bh.registers_i[0], 99);
+    }
+
+    #[test]
+    fn handler_state_field_ref_moves_between_ref_register_slots() {
+        // Two ref scalars at ref slots 1 and 2 (base 1: the `program` ref
+        // arg keeps r0). load_state_field_ref copies a ref slot into a
+        // working ref register; store_state_field_ref copies back. Raw
+        // pointer bits round-trip.
+        let mut bh = BlackholeInterpreter::default();
+        bh.state_field_layout = StateFieldLayout::with_ref_scalars(0, vec![], 0, 2, 1, 0);
+        bh.registers_r = vec![0x9999, 0xAAAA, 0xBBBB, 0, 0];
+
+        // load_state_field_ref/dr: field_idx=1 (u16 LE) → dest ref reg 3.
+        let next = handler_load_state_field_ref_dr(&mut bh, &[1, 0, 3], 0).unwrap();
+        assert_eq!(next, 3);
+        assert_eq!(bh.registers_r[3], 0xBBBB);
+
+        // store_state_field_ref/dr: src ref reg 3 → field_idx=0 (slot 1).
+        bh.registers_r[3] = 0xCCCC;
+        let next = handler_store_state_field_ref_dr(&mut bh, &[0, 0, 3], 0).unwrap();
+        assert_eq!(next, 3);
+        assert_eq!(bh.registers_r[1], 0xCCCC);
+        // The argument register below the base is untouched.
+        assert_eq!(bh.registers_r[0], 0x9999);
+
+        // The int bank is untouched by the ref handlers.
+        assert!(bh.registers_i.is_empty() || bh.registers_i.iter().all(|&v| v == 0));
+    }
+
+    #[test]
+    fn handler_state_array_indexes_flattened_slots() {
+        // 1 scalar (slot 0) + 1 fixed array of len 4 (slots 1..5).
+        let mut bh = BlackholeInterpreter::default();
+        bh.state_field_layout = StateFieldLayout::new(1, vec![4], 0, 0);
+        // [scalar, a0, a1, a2, a3, idx_reg, dest_reg]
+        bh.registers_i = vec![0, 100, 101, 102, 103, 0, 0];
+
+        // load_state_array/dii: array_idx=0, index_reg=5 (holds 2), dest=6.
+        bh.registers_i[5] = 2;
+        let next = handler_load_state_array_dii(&mut bh, &[0, 0, 5, 6], 0).unwrap();
+        assert_eq!(next, 4);
+        // slot of (array 0, elem 2) = 1 + 2 = 3 → value 102.
+        assert_eq!(bh.registers_i[6], 102);
+
+        // store_state_array/dii: write reg 6 into array elem 0 (slot 1).
+        bh.registers_i[5] = 0;
+        bh.registers_i[6] = 555;
+        let next = handler_store_state_array_dii(&mut bh, &[0, 0, 5, 6], 0).unwrap();
+        assert_eq!(next, 4);
+        assert_eq!(bh.registers_i[1], 555);
+    }
 
     // ── Executor opcode tests (bhimpl_* runtime coverage) ──
     //
@@ -4187,34 +4345,249 @@ fn handler_abort_result_marker_i(
     Ok(position + 1)
 }
 
-// pyre-only: `state_field` family. RPython has no counterpart — these are
-// emitted by `#[jit_interp]`'s `jitcode_lower` macro to express loads/stores
-// against a Rust-port `state_fields` register file used during tracing.
-// Blackhole has nothing to do for them: the state-field semantics live
-// only in the trace path with a `JitCodeSym`. Handlers exist solely so the
-// dispatch_table entry is wired (not placeholder), keeping RPython
-// `blackhole.py:287` `self.dispatch_loop = builder.dispatch_loop`'s
-// table-driven invariant.
+/// Register-slot layout for state-field JIT blackhole resume.
+///
+/// Mirrors `live_slots_for_state_field_jit` (`jitcode/assembler.rs:4476`): the
+/// blackhole int register file holds, in flat order,
+/// `[scalars 0..num_scalars | flattened fixed-array elements |
+/// virt-array (ptr,len) pairs]`, seeded by the resume reader via `setarg_i`
+/// (`resume.rs _prepare_next_section` → `blackhole.py:339 setarg_i`).
+///
+/// majit's `state_field` opcodes carry a section-relative logical index
+/// (scalar `field_idx`, array/varray `array_idx`) rather than a flat register
+/// slot. RPython's codewriter assigns register indices directly, so this
+/// mapping is the majit-port adaptation recovering the flat slot a handler
+/// must read/write. `array_lens` are per-instance (a fixed `[int]` array's
+/// length comes from the live state, e.g. tlr's `regs`); virt arrays
+/// contribute exactly two slots each (data pointer + length) regardless of
+/// element count — those slots are threaded as loop inputargs / live values
+/// alongside the element boxes the virtualizable machinery carries.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct StateFieldLayout {
+    pub num_scalars: usize,
+    pub array_lens: Vec<usize>,
+    pub num_virt_arrays: usize,
+    /// Ref-typed scalar state fields. They live in the SEPARATE ref
+    /// register bank at `registers_r[ref_scalar_base ..
+    /// ref_scalar_base + num_ref_scalars]`, seeded by the resume reader
+    /// in ref-fail-arg order, so they do NOT consume any `total_slots()`
+    /// int slot.
+    pub num_ref_scalars: usize,
+    /// First ref-bank register of the ref-scalar identity slots. The
+    /// dispatch JitCode's ref-bank ARGUMENTS occupy the registers below
+    /// it (`MIFrame::setup_call` packs args densely from r0: `program`
+    /// at r0, the virtualizable identity at r1 when present), and the
+    /// blackhole re-executes ops that read those argument registers, so
+    /// the identity slots cannot alias them.
+    pub ref_scalar_base: usize,
+    /// First int-bank register of the scalar/array identity slots —
+    /// the int-bank mirror of `ref_scalar_base`. The dispatch JitCode's
+    /// int argument (`pc` at i0) sits below it; an identity slot
+    /// aliasing i0 lets the guard-time materialization overwrite the pc
+    /// register, so the resume stream encodes the state scalar where
+    /// the re-executed jit_merge_point op expects the green pc.
+    pub int_scalar_base: usize,
+}
 
-/// No-op handler for `load_state_field/di` / `store_state_field/di` —
-/// canonical encoding per `assembler.py`: 1× u16 descr + 1× u8 register
-/// = 3 bytes total.
-fn handler_state_field_noop_di(
-    _bh: &mut BlackholeInterpreter,
-    _code: &[u8],
+impl StateFieldLayout {
+    pub fn new(
+        num_scalars: usize,
+        array_lens: Vec<usize>,
+        num_virt_arrays: usize,
+        int_scalar_base: usize,
+    ) -> Self {
+        Self {
+            num_scalars,
+            array_lens,
+            num_virt_arrays,
+            num_ref_scalars: 0,
+            ref_scalar_base: 0,
+            int_scalar_base,
+        }
+    }
+
+    /// Like [`new`] but with ref-typed scalar fields in the ref bank,
+    /// starting at `ref_scalar_base`.
+    pub fn with_ref_scalars(
+        num_scalars: usize,
+        array_lens: Vec<usize>,
+        num_virt_arrays: usize,
+        num_ref_scalars: usize,
+        ref_scalar_base: usize,
+        int_scalar_base: usize,
+    ) -> Self {
+        Self {
+            num_scalars,
+            array_lens,
+            num_virt_arrays,
+            num_ref_scalars,
+            ref_scalar_base,
+            int_scalar_base,
+        }
+    }
+
+    /// Total int register slots — equals the `live_slots_for_state_field_jit`
+    /// slot count `num_scalars + Σ array_lens + 2·num_virt_arrays`.
+    pub fn total_slots(&self) -> usize {
+        self.num_scalars + self.array_lens.iter().sum::<usize>() + 2 * self.num_virt_arrays
+    }
+
+    /// Total live values `extract_live_values` produces: the int register
+    /// slots ([`Self::total_slots`]) plus the ref-bank scalars, which
+    /// `extract_live` appends after the int slots. The trace-start /
+    /// run-compiled gate validates the flat live-value vector against this
+    /// count (int slots flow to `registers_i`, ref scalars to `registers_r`).
+    pub fn total_live_values(&self) -> usize {
+        self.total_slots() + self.num_ref_scalars
+    }
+
+    /// Flat slot of scalar `field_idx` (scalars occupy
+    /// `[int_scalar_base..int_scalar_base + num_scalars]`).
+    pub fn scalar_slot(&self, field_idx: usize) -> usize {
+        debug_assert!(
+            field_idx < self.num_scalars,
+            "scalar field_idx {field_idx} out of range (num_scalars={})",
+            self.num_scalars
+        );
+        self.int_scalar_base + field_idx
+    }
+
+    /// Ref register slot of ref-typed scalar `field_idx`. Ref scalars are
+    /// densely packed in the ref register bank starting at
+    /// `ref_scalar_base` (past the dispatch JitCode's ref-bank argument
+    /// registers) in the same order the resume reader seeds the ref
+    /// fail-args.
+    pub fn ref_scalar_slot(&self, field_idx: usize) -> usize {
+        debug_assert!(
+            field_idx < self.num_ref_scalars,
+            "ref scalar field_idx {field_idx} out of range (num_ref_scalars={})",
+            self.num_ref_scalars
+        );
+        self.ref_scalar_base + field_idx
+    }
+
+    /// First flat slot of fixed array `array_idx`.
+    fn array_base(&self, array_idx: usize) -> usize {
+        self.int_scalar_base + self.num_scalars + self.array_lens[..array_idx].iter().sum::<usize>()
+    }
+
+    /// Flat slot of element `elem` in fixed array `array_idx`.
+    pub fn array_elem_slot(&self, array_idx: usize, elem: usize) -> usize {
+        debug_assert!(
+            array_idx < self.array_lens.len(),
+            "array_idx {array_idx} out of range (num_arrays={})",
+            self.array_lens.len()
+        );
+        debug_assert!(
+            elem < self.array_lens[array_idx],
+            "array elem {elem} out of range (len={})",
+            self.array_lens[array_idx]
+        );
+        self.array_base(array_idx) + elem
+    }
+}
+
+// pyre-only: `state_field` family. RPython has no opcode counterpart — the
+// `#[jit_interp]` `jitcode_lower` macro emits these to read/write the
+// Rust-port `state_fields`, which ARE the jitdriver reds.  PyPy reds are the
+// blackhole frame's int registers (`blackhole.py:300-302`), seeded by the
+// resume reader via `setarg_i` (`blackhole.py:339`) and read/written by the
+// register-addressed dispatch opcodes (`blackhole.py:193/223`).  These
+// handlers move between the canonical red register slots: `field_idx` /
+// `array_idx` are section-relative logical indices that
+// `StateFieldLayout` maps to the flat slot the seed populated.
+
+/// `load_state_field/di` — `registers_i[dest] = registers_i[slot(field_idx)]`.
+/// Encoding: 1× u16 `field_idx` + 1× u8 dest register = 3 bytes.
+fn handler_load_state_field_di(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
     position: usize,
 ) -> Result<usize, DispatchError> {
+    let field_idx = (code[position] as usize) | ((code[position + 1] as usize) << 8);
+    let dest = code[position + 2] as usize;
+    let slot = bh.state_field_layout.scalar_slot(field_idx);
+    bh.registers_i[dest] = bh.registers_i[slot];
     Ok(position + 3)
 }
 
-/// No-op handler for `load_state_array/dii` / `store_state_array/dii` /
-/// `load_state_varray/dii` / `store_state_varray/dii` — canonical
-/// encoding: 1× u16 descr + 2× u8 register = 4 bytes total.
-fn handler_state_array_noop_dii(
-    _bh: &mut BlackholeInterpreter,
-    _code: &[u8],
+/// `store_state_field/di` — `registers_i[slot(field_idx)] = registers_i[src]`.
+/// Encoding: 1× u16 `field_idx` + 1× u8 src register = 3 bytes.
+fn handler_store_state_field_di(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
     position: usize,
 ) -> Result<usize, DispatchError> {
+    let field_idx = (code[position] as usize) | ((code[position + 1] as usize) << 8);
+    let src = code[position + 2] as usize;
+    let slot = bh.state_field_layout.scalar_slot(field_idx);
+    bh.registers_i[slot] = bh.registers_i[src];
+    Ok(position + 3)
+}
+
+/// `load_state_field_ref/dr` — `registers_r[dest] = registers_r[ref_slot(field_idx)]`.
+/// The ref-typed scalar state field lives in the ref register bank; the
+/// resume reader seeded it from the ref fail-args. Mirror of
+/// `handler_load_state_field_di` on the ref bank.
+/// Encoding: 1× u16 `field_idx` + 1× u8 dest ref register = 3 bytes.
+fn handler_load_state_field_ref_dr(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    let field_idx = (code[position] as usize) | ((code[position + 1] as usize) << 8);
+    let dest = code[position + 2] as usize;
+    let slot = bh.state_field_layout.ref_scalar_slot(field_idx);
+    bh.registers_r[dest] = bh.registers_r[slot];
+    Ok(position + 3)
+}
+
+/// `store_state_field_ref/dr` — `registers_r[ref_slot(field_idx)] = registers_r[src]`.
+/// Encoding: 1× u16 `field_idx` + 1× u8 src ref register = 3 bytes.
+fn handler_store_state_field_ref_dr(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    let field_idx = (code[position] as usize) | ((code[position + 1] as usize) << 8);
+    let src = code[position + 2] as usize;
+    let slot = bh.state_field_layout.ref_scalar_slot(field_idx);
+    bh.registers_r[slot] = bh.registers_r[src];
+    Ok(position + 3)
+}
+
+/// `load_state_array/dii` — `registers_i[dest] =
+/// registers_i[slot(array_idx, registers_i[index_reg])]`.  Flattened fixed
+/// array element lives in its own register slot.
+/// Encoding: 1× u16 `array_idx` + 1× u8 index register + 1× u8 dest = 4 bytes.
+fn handler_load_state_array_dii(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    let array_idx = (code[position] as usize) | ((code[position + 1] as usize) << 8);
+    let index_reg = code[position + 2] as usize;
+    let dest = code[position + 3] as usize;
+    let elem = bh.registers_i[index_reg] as usize;
+    let slot = bh.state_field_layout.array_elem_slot(array_idx, elem);
+    bh.registers_i[dest] = bh.registers_i[slot];
+    Ok(position + 4)
+}
+
+/// `store_state_array/dii` — `registers_i[slot(array_idx,
+/// registers_i[index_reg])] = registers_i[src]`.
+/// Encoding: 1× u16 `array_idx` + 1× u8 index register + 1× u8 src = 4 bytes.
+fn handler_store_state_array_dii(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    let array_idx = (code[position] as usize) | ((code[position + 1] as usize) << 8);
+    let index_reg = code[position + 2] as usize;
+    let src = code[position + 3] as usize;
+    let elem = bh.registers_i[index_reg] as usize;
+    let slot = bh.state_field_layout.array_elem_slot(array_idx, elem);
+    bh.registers_i[slot] = bh.registers_i[src];
     Ok(position + 4)
 }
 
@@ -4850,7 +5223,31 @@ macro_rules! bhhandler_goto_if_not_ii {
 
 bhhandler_goto_if_not_ii!(handler_goto_if_not_int_lt, |a: i64, b: i64| a < b);
 bhhandler_goto_if_not_ii!(handler_goto_if_not_int_le, |a: i64, b: i64| a <= b);
-bhhandler_goto_if_not_ii!(handler_goto_if_not_int_eq, |a: i64, b: i64| a == b);
+// Temporarily expanded from `bhhandler_goto_if_not_ii!` for MAJIT_BH_DEBUG
+// cond inspection (#210).
+fn handler_goto_if_not_int_eq(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    let a = bh.registers_i[code[position] as usize];
+    let b = bh.registers_i[code[position + 1] as usize];
+    let target = (code[position + 2] as usize) | ((code[position + 3] as usize) << 8);
+    let pc = position + 4;
+    if std::env::var_os("MAJIT_BH_DEBUG").is_some() {
+        eprintln!(
+            "[bh-brcond] pos={} int_eq i{}={} i{}={} target={} fallthrough={}",
+            position - 1,
+            code[position],
+            a,
+            code[position + 1],
+            b,
+            target,
+            pc
+        );
+    }
+    if a == b { Ok(pc) } else { Ok(target) }
+}
 bhhandler_goto_if_not_ii!(handler_goto_if_not_int_ne, |a: i64, b: i64| a != b);
 bhhandler_goto_if_not_ii!(handler_goto_if_not_int_gt, |a: i64, b: i64| a > b);
 bhhandler_goto_if_not_ii!(handler_goto_if_not_int_ge, |a: i64, b: i64| a >= b);
@@ -5116,7 +5513,28 @@ bhhandler_r_v!(handler_virtual_ref_finish, bhimpl_virtual_ref_finish);
 bhhandler_i_v!(handler_loop_header, bhimpl_loop_header);
 bhhandler_r_i!(handler_ref_isconstant, bhimpl_ref_isconstant);
 bhhandler_r_i!(handler_ref_isvirtual, bhimpl_ref_isvirtual);
-bhhandler_goto_if_not_i!(handler_goto_if_not, bhimpl_goto_if_not);
+// Temporarily expanded from `bhhandler_goto_if_not_i!(handler_goto_if_not,
+// bhimpl_goto_if_not)` for MAJIT_BH_DEBUG cond inspection (#210).
+fn handler_goto_if_not(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    let a = bh.registers_i[code[position] as usize];
+    let target = (code[position + 1] as usize) | ((code[position + 2] as usize) << 8);
+    let pc = position + 3;
+    if std::env::var_os("MAJIT_BH_DEBUG").is_some() {
+        eprintln!(
+            "[bh-brcond] pos={} cond_reg=i{} cond={} target={} fallthrough={}",
+            position - 1,
+            code[position],
+            a,
+            target,
+            pc
+        );
+    }
+    Ok(bhimpl_goto_if_not(a, target, pc))
+}
 bhhandler_goto_if_not_i!(
     handler_goto_if_not_int_is_zero,
     bhimpl_goto_if_not_int_is_zero
@@ -6393,6 +6811,14 @@ pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
     for (key, byte) in [
         // state_field/array/varray — canonical handlers wire directly.
         (
+            "load_state_field_ref/dr",
+            majit_translate::insns::BC_LOAD_STATE_FIELD_REF,
+        ),
+        (
+            "store_state_field_ref/dr",
+            majit_translate::insns::BC_STORE_STATE_FIELD_REF,
+        ),
+        (
             "load_state_field/di",
             majit_translate::insns::BC_LOAD_STATE_FIELD,
         ),
@@ -6407,14 +6833,6 @@ pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
         (
             "store_state_array/dii",
             majit_translate::insns::BC_STORE_STATE_ARRAY,
-        ),
-        (
-            "load_state_varray/dii",
-            majit_translate::insns::BC_LOAD_STATE_VARRAY,
-        ),
-        (
-            "store_state_varray/dii",
-            majit_translate::insns::BC_STORE_STATE_VARRAY,
         ),
         // A3 epic: push/pop family migrated to canonical 1-byte register
         // encoding; handlers wired in `wire_bhimpl_handlers` decode via
@@ -6641,12 +7059,12 @@ pub fn wire_bhimpl_handlers(builder: &mut BlackholeInterpBuilder) {
     // treats these as no-ops; handlers exist only to advance position past
     // the operand bytes so strict dispatch sees a real handler instead of
     // the unwired placeholder.
-    builder.wire_handler("load_state_field/di", handler_state_field_noop_di);
-    builder.wire_handler("store_state_field/di", handler_state_field_noop_di);
-    builder.wire_handler("load_state_array/dii", handler_state_array_noop_dii);
-    builder.wire_handler("store_state_array/dii", handler_state_array_noop_dii);
-    builder.wire_handler("load_state_varray/dii", handler_state_array_noop_dii);
-    builder.wire_handler("store_state_varray/dii", handler_state_array_noop_dii);
+    builder.wire_handler("load_state_field_ref/dr", handler_load_state_field_ref_dr);
+    builder.wire_handler("store_state_field_ref/dr", handler_store_state_field_ref_dr);
+    builder.wire_handler("load_state_field/di", handler_load_state_field_di);
+    builder.wire_handler("store_state_field/di", handler_store_state_field_di);
+    builder.wire_handler("load_state_array/dii", handler_load_state_array_dii);
+    builder.wire_handler("store_state_array/dii", handler_store_state_array_dii);
 
     // jit_merge_point + abort_permanent — bodies live on
     // `BlackholeInterpreter::bhimpl_jit_merge_point` / `bhimpl_abort_permanent`

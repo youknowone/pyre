@@ -1833,7 +1833,9 @@ impl OptIntBounds {
 
     /// autogenintrules.py helper `as_operation(box, opnum)`: the producing
     /// op of an operand already resolved to its terminal box
-    /// (`resolve_box`), returned iff its opcode matches, else None.
+    /// (`resolve_box`), returned iff its opcode matches, else None. The
+    /// `op in self._emittedoperations` gate (optimizer.py:369-377) lives in
+    /// `ctx.get_producing_op`.
     fn as_operation_b(
         &self,
         b: &crate::r#box::BoxRef,

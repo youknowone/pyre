@@ -1,5 +1,15 @@
 use super::*;
 
+/// Deterministic per-struct type id for a `new` size descr.  Hashes the
+/// struct path tokens; collisions only affect descr-cache keying (never
+/// per-field tracking, which keys on each setfield's own FieldDescr).
+fn struct_type_id(path: &syn::Path) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    quote!(#path).to_string().hash(&mut hasher);
+    hasher.finish()
+}
+
 impl<'c> Lowerer<'c> {
     pub(super) fn lower_value_expr(&mut self, expr: &Expr) -> Option<Binding> {
         // State field read (register/tape machines).
@@ -7,6 +17,17 @@ impl<'c> Lowerer<'c> {
             return Some(binding);
         }
         if let Some(binding) = self.lower_state_array_read(expr) {
+            return Some(binding);
+        }
+        // RPython pyopcode.py:171 `ord(co_code[next_instr])` — an indexed
+        // read of the green bytecode array fetches an immediate operand.
+        // The dispatch-top opcode fetch is lowered by the stmt-level
+        // `try_lower_opcode_fetch_stmt`, which arm-body lowering does not
+        // reach; this handler lowers the identical `program[<idx>]` shape
+        // in value position so operand reads inside opcode arm bodies emit
+        // the same `getarrayitem_gc_i` on the green array (folded by the
+        // optimizer since array + index are green).
+        if let Some(binding) = self.lower_env_array_read(expr) {
             return Some(binding);
         }
         // RPython jtransform.py:832 — virtualizable field read rewrite.
@@ -48,6 +69,24 @@ impl<'c> Lowerer<'c> {
                     depends_on_stack: false,
                 })
             }
+            // Bool comparisons (`stackok == false`) ride the int channel:
+            // bool bindings are IntLt/IntLe/… results carrying 0/1.
+            Expr::Lit(ExprLit {
+                lit: Lit::Bool(bool_lit),
+                ..
+            }) => {
+                let value = i64::from(bool_lit.value);
+                let reg = self.alloc_reg();
+                self.emit_op(
+                    OpMeta::linear(OpKind::LoadConstI, vec![], vec![Register::int(reg)]),
+                    quote! { __builder.load_const_i_value(#reg, #value); },
+                );
+                Some(Binding {
+                    reg,
+                    kind: BindingKind::Int,
+                    depends_on_stack: false,
+                })
+            }
             Expr::Path(ExprPath { path, .. }) => {
                 let ident = path.get_ident()?;
                 self.bindings.get(&ident.to_string()).cloned()
@@ -57,7 +96,7 @@ impl<'c> Lowerer<'c> {
                 if !matches!(binding.kind, BindingKind::Int) {
                     return None;
                 }
-                Some(binding)
+                self.lower_int_cast(binding, ty)
             }
             Expr::Paren(ExprParen { expr, .. }) => self.lower_value_expr(expr),
             Expr::If(expr_if) => self.lower_if_value(expr_if),
@@ -77,8 +116,81 @@ impl<'c> Lowerer<'c> {
                 self.lower_call_value(call)
             }
             Expr::MethodCall(call) => self.lower_method_call_value(call),
+            Expr::Struct(s) => self.lower_struct_value(s),
             _ => None,
         }
+    }
+
+    /// Lower a struct literal `Path { f0: v0, f1: v1, .. }` to a JIT
+    /// allocation plus per-field stores: `new` (size from `size_of`) then
+    /// `setfield_gc_<kind>` at each field's `offset_of`.  Mirrors
+    /// `jtransform.py` malloc + setfield rewrite; the optimizer's
+    /// virtualize pass folds the New away when the struct does not escape.
+    /// Returns the result ref binding, or `None` (helper falls back to a
+    /// residual call) for struct-update base syntax or float fields, which
+    /// the bytecode field-op path does not express yet.
+    fn lower_struct_value(&mut self, s: &syn::ExprStruct) -> Option<Binding> {
+        if s.rest.is_some() {
+            return None;
+        }
+        let struct_path = &s.path;
+        // Lower every field value (rejecting unsupported kinds) before
+        // emitting the allocation, so a failed field never leaves a
+        // dangling New in the op stream.
+        let mut fields = Vec::new();
+        let mut depends_on_stack = false;
+        for field in &s.fields {
+            let value = self.lower_value_expr(&field.expr)?;
+            if matches!(value.kind, BindingKind::Float) {
+                return None;
+            }
+            depends_on_stack |= value.depends_on_stack;
+            fields.push((field.member.clone(), value));
+        }
+        let type_id = struct_type_id(struct_path);
+        let result_reg = self.alloc_reg();
+        self.emit_op(
+            OpMeta::linear(OpKind::New, vec![], vec![Register::ref_(result_reg)]),
+            quote! {
+                __builder.new_struct(
+                    #result_reg,
+                    ::core::mem::size_of::<#struct_path>(),
+                    #type_id,
+                );
+            },
+        );
+        for (member, value) in fields {
+            let value_reg = value.reg;
+            let (reads, tokens) = match value.kind {
+                BindingKind::Int => (
+                    vec![Register::ref_(result_reg), Register::int(value_reg)],
+                    quote! {
+                        __builder.setfield_gc_i(
+                            #result_reg,
+                            #value_reg,
+                            ::core::mem::offset_of!(#struct_path, #member),
+                        );
+                    },
+                ),
+                BindingKind::Ref => (
+                    vec![Register::ref_(result_reg), Register::ref_(value_reg)],
+                    quote! {
+                        __builder.setfield_gc_r(
+                            #result_reg,
+                            #value_reg,
+                            ::core::mem::offset_of!(#struct_path, #member),
+                        );
+                    },
+                ),
+                BindingKind::Float => unreachable!("float fields rejected above"),
+            };
+            self.emit_op(OpMeta::linear(OpKind::SetfieldGc, reads, vec![]), tokens);
+        }
+        Some(Binding {
+            reg: result_reg,
+            kind: BindingKind::Ref,
+            depends_on_stack,
+        })
     }
 
     /// Statement-context lowering for `hint(x, promote=True)`:
@@ -98,6 +210,30 @@ impl<'c> Lowerer<'c> {
     /// jtransform.py:613-615: the `None` sentinel means the result is
     /// considered equal to arg0, so the LHS aliases the RHS binding
     /// (`x = promote(y)` makes `x` read from y's register).
+    /// Reassign a local variable that already has a binding: `pc = expr`.
+    /// Lowers the RHS via `lower_value_expr` and rebinds the LHS name to
+    /// the new register. RPython parity: the flat dispatch's
+    /// `pc = target; continue` updates the JitCode's pc register in-place
+    /// (`flatten.py` emits a goto to the bytecode label, not an SSA rename,
+    /// but majit's binding model is SSA-like — rebinding the name achieves
+    /// the same effect because subsequent reads of `pc` pick up the new
+    /// register).
+    pub(super) fn lower_local_reassign(&mut self, expr: &Expr) -> Option<()> {
+        let Expr::Assign(assign) = expr else {
+            return None;
+        };
+        let Expr::Path(lhs_path) = &*assign.left else {
+            return None;
+        };
+        let lhs_ident = lhs_path.path.get_ident()?.to_string();
+        if !self.bindings.contains_key(&lhs_ident) {
+            return None;
+        }
+        let binding = self.lower_value_expr(&assign.right)?;
+        self.bindings.insert(lhs_ident, binding);
+        Some(())
+    }
+
     pub(super) fn lower_promote_stmt(&mut self, expr: &Expr) -> Option<()> {
         match expr {
             Expr::Assign(assign) => {
@@ -299,6 +435,15 @@ impl<'c> Lowerer<'c> {
         let reg = self.alloc_reg();
         let func = &call.func;
         let mut result_kind = BindingKind::Int;
+        // jtransform.py:467-471 / 480-482: `-live-` follows the call, it does
+        // not precede it.  Decide here whether the explicit arm below needs a
+        // trailing marker; the inline arms emit their own (`post_live`) and
+        // the inferred arm emits a runtime-conditional one, so both report
+        // `false` and are excluded.
+        let post_live_after_call = match &policy {
+            CallPolicySpec::Explicit(kind) => explicit_call_emits_post_live(*kind),
+            CallPolicySpec::Infer => false,
+        };
         match policy {
             CallPolicySpec::Explicit(kind) => match kind {
                 crate::jit_interp::CallPolicyKind::ResidualInt
@@ -617,6 +762,41 @@ impl<'c> Lowerer<'c> {
                     );
                     self.emit_op(OpMeta::live_marker(), post_live);
                 }
+                crate::jit_interp::CallPolicyKind::InlinePipelineInt
+                | crate::jit_interp::CallPolicyKind::InlinePipelineRef
+                | crate::jit_interp::CallPolicyKind::InlinePipelineFloat => {
+                    result_kind = binding_kind_for_inline_policy(kind).unwrap();
+                    // Resolve the callee by name through the host's
+                    // `__majit_pipeline_jitcode`, which returns the
+                    // pipeline-built (`make_jitcodes()`, codewriter.py:89)
+                    // sub-jitcode shell. Unlike the macro-helper `Inline*`
+                    // path there is no `_prebuild` symbol: the pipeline
+                    // jitcode carries its own `-live-` markers from the build,
+                    // installed when the host registers the descr pool.
+                    let pipeline_name = match &*call.func {
+                        syn::Expr::Path(ep) => ep.path.segments.last().map(|s| s.ident.to_string()),
+                        _ => None,
+                    }?;
+                    let (inline_call, post_live) = inline_call_tokens(&arg_bindings, reg);
+                    let __arg_regs: Vec<Register> =
+                        arg_bindings.iter().map(Register::from_binding).collect();
+                    self.emit_op(
+                        OpMeta::linear(
+                            OpKind::InlineCall,
+                            __arg_regs,
+                            vec![Register::new(result_kind, reg)],
+                        ),
+                        quote! {
+                            let __sub_jitcode = __majit_pipeline_jitcode(#pipeline_name);
+                            let (__sub_return_kind, _) = __sub_jitcode
+                                .trailing_return_info()
+                                .expect("pipeline jitcode must end in a typed return opcode");
+                            let __sub_idx = __builder.add_sub_jitcode_arc(__sub_jitcode);
+                            #inline_call
+                        },
+                    );
+                    self.emit_op(OpMeta::live_marker(), post_live);
+                }
                 _ => return None,
             },
             CallPolicySpec::Infer => {
@@ -855,6 +1035,15 @@ impl<'c> Lowerer<'c> {
             }
         }
 
+        // jtransform.py:467-471 / 480-482 — trailing `-live-` for the explicit
+        // residual / elidable / may-force / release-gil arms (computed above).
+        if post_live_after_call {
+            self.emit_op(
+                OpMeta::live_marker(),
+                quote! { let _ = __builder.live_placeholder(); },
+            );
+        }
+
         Some(Binding {
             reg,
             kind: result_kind,
@@ -892,18 +1081,12 @@ impl<'c> Lowerer<'c> {
         };
         let receiver_name = receiver_ident.to_string();
         let config = self.config?;
-        // Receiver-name → owning-type mapping mirrors the dispatch-portal
-        // input-binding convention installed at `lower_dispatch_body`
-        // (jitcode_lower.rs:6948 / :6957: `bindings.insert("program", …)`,
-        // `bindings.insert("pc", …)`). Other receivers cannot be resolved
-        // to a canonical owning type at macro time and fall through.
         let type_name = match receiver_name.as_str() {
             "program" => config.env_type_name.clone(),
             "state" => config.state_type_name.clone(),
             _ => return None,
         };
 
-        // Synthesize <Type>::<method> for call-policy lookup.
         let method_segments = vec![type_name.clone(), call.method.to_string()];
         let policy = self
             .call_policies
@@ -996,24 +1179,46 @@ impl<'c> Lowerer<'c> {
             return None;
         }
         let (_, else_expr) = expr_if.else_branch.as_ref()?;
+        let then_lowered = self.lower_branch_value_expr(&Expr::Block(syn::ExprBlock {
+            attrs: Vec::new(),
+            label: None,
+            block: expr_if.then_branch.clone(),
+        }));
+        let else_lowered = self.lower_branch_value_expr(else_expr);
+
+        // A branch that fails to lower in the state-field dispatch body
+        // becomes an abort stub: recording stops at branch entry if
+        // execution ever takes it, so the walker's executed-call queue
+        // stays a clean prefix for the outer replay (same contract as
+        // `lower_stmt_fallback`), and the surviving branch still
+        // compiles. With `config` absent, branch failure fails the whole
+        // if-expression as before.
+        if self.config.is_none() && (then_lowered.is_none() || else_lowered.is_none()) {
+            return None;
+        }
+        // Both branches unlowerable: nothing of value here; let the
+        // caller's statement fallback emit a single abort.
+        if then_lowered.is_none() && else_lowered.is_none() {
+            return None;
+        }
+        for (lowered, which) in [(&then_lowered, "then"), (&else_lowered, "else")] {
+            if let Some((_, binding)) = lowered {
+                if !matches!(binding.kind, BindingKind::Int) {
+                    return None;
+                }
+            } else if std::env::var_os("MAJIT_MACRO_DEBUG").is_some() {
+                eprintln!(
+                    "[majit-macro] if-value {which} branch abort-stub: {}",
+                    quote!(#expr_if)
+                );
+            }
+        }
+
         let else_label = self.alloc_label();
         let end_label = self.alloc_label();
         let result_reg = self.alloc_reg();
         let cond_reg = cond.reg;
-        let (then_seq, then_binding) =
-            self.lower_branch_value_expr(&Expr::Block(syn::ExprBlock {
-                attrs: Vec::new(),
-                label: None,
-                block: expr_if.then_branch.clone(),
-            }))?;
-        let (else_seq, else_binding) = self.lower_branch_value_expr(else_expr)?;
-        if !matches!(then_binding.kind, BindingKind::Int)
-            || !matches!(else_binding.kind, BindingKind::Int)
-        {
-            return None;
-        }
-        let then_reg = then_binding.reg;
-        let else_reg = else_binding.reg;
+        let mut depends_on_stack = cond.depends_on_stack;
 
         self.emit_aux(quote! { let #else_label = __builder.new_label(); });
         self.emit_aux(quote! { let #end_label = __builder.new_label(); });
@@ -1022,34 +1227,60 @@ impl<'c> Lowerer<'c> {
             quote! { let _ = __builder.live_placeholder(); },
         );
         self.emit_conditional_guard(cond_reg, &else_label);
-        self.append_lowered_sequence(then_seq);
-        self.emit_op(
-            OpMeta::linear(
-                OpKind::MoveI,
-                vec![Register::int(then_reg)],
-                vec![Register::int(result_reg)],
-            ),
-            quote! { __builder.move_i(#result_reg, #then_reg); },
-        );
-        self.emit_jump(&end_label);
+        match then_lowered {
+            Some((then_seq, then_binding)) => {
+                let then_reg = then_binding.reg;
+                depends_on_stack |= then_binding.depends_on_stack;
+                self.append_lowered_sequence(then_seq);
+                self.emit_op(
+                    OpMeta::linear(
+                        OpKind::MoveI,
+                        vec![Register::int(then_reg)],
+                        vec![Register::int(result_reg)],
+                    ),
+                    quote! { __builder.move_i(#result_reg, #then_reg); },
+                );
+                self.emit_jump(&end_label);
+            }
+            None => {
+                self.emit_op(
+                    OpMeta::terminal(Vec::new()),
+                    quote! {
+                        __builder.abort();
+                    },
+                );
+            }
+        }
         self.emit_label_def(&else_label);
-        self.append_lowered_sequence(else_seq);
-        self.emit_op(
-            OpMeta::linear(
-                OpKind::MoveI,
-                vec![Register::int(else_reg)],
-                vec![Register::int(result_reg)],
-            ),
-            quote! { __builder.move_i(#result_reg, #else_reg); },
-        );
+        match else_lowered {
+            Some((else_seq, else_binding)) => {
+                let else_reg = else_binding.reg;
+                depends_on_stack |= else_binding.depends_on_stack;
+                self.append_lowered_sequence(else_seq);
+                self.emit_op(
+                    OpMeta::linear(
+                        OpKind::MoveI,
+                        vec![Register::int(else_reg)],
+                        vec![Register::int(result_reg)],
+                    ),
+                    quote! { __builder.move_i(#result_reg, #else_reg); },
+                );
+            }
+            None => {
+                self.emit_op(
+                    OpMeta::terminal(Vec::new()),
+                    quote! {
+                        __builder.abort();
+                    },
+                );
+            }
+        }
         self.emit_label_def(&end_label);
 
         Some(Binding {
             reg: result_reg,
             kind: BindingKind::Int,
-            depends_on_stack: cond.depends_on_stack
-                || then_binding.depends_on_stack
-                || else_binding.depends_on_stack,
+            depends_on_stack,
         })
     }
 
@@ -1130,12 +1361,95 @@ impl<'c> Lowerer<'c> {
                 Register::ints(&[lhs_reg, rhs_reg]),
                 vec![Register::int(reg)],
             ),
-            quote! { __builder.record_binop_i(#reg, majit_ir::OpCode::#opcode, #lhs_reg, #rhs_reg); },
+            binop_i_emit_tokens(reg, &opcode, lhs_reg, rhs_reg),
         );
         Some(Binding {
             reg,
             kind: BindingKind::Int,
             depends_on_stack: lhs.depends_on_stack || rhs.depends_on_stack,
+        })
+    }
+
+    /// Lower an integer `as <ty>` cast to the truncate + (sign|zero)-extend
+    /// the Rust `as` operator performs (RPython's rtyper inserts the same
+    /// `int_signext` / mask when an interpreter narrows a wider value).
+    /// A cast to a 64-bit or pointer-width target is a no-op on the
+    /// already-machine-word binding.  A narrowing cast to a signed type
+    /// sign-extends from the type's high bit (`(x << s) >> s`, arithmetic
+    /// shift); to an unsigned type it masks the low bits (`x & ((1<<n)-1)`).
+    /// Previously every int cast was a no-op, dropping the sign extension a
+    /// `program[pc] as i8 as i64` operand fetch relies on (an 8-bit `0xEE`
+    /// stayed `238` instead of `-18`, so backward branch targets computed
+    /// out of range).
+    fn lower_int_cast(&mut self, binding: Binding, ty: &Type) -> Option<Binding> {
+        let ident = match ty {
+            Type::Path(tp) => tp.path.get_ident()?,
+            _ => return None,
+        };
+        let (signed, bits): (bool, u32) = match ident.to_string().as_str() {
+            "i8" => (true, 8),
+            "i16" => (true, 16),
+            "i32" => (true, 32),
+            "u8" => (false, 8),
+            "u16" => (false, 16),
+            "u32" => (false, 32),
+            // 64-bit / pointer-width targets keep the full machine word.
+            "i64" | "u64" | "isize" | "usize" => return Some(binding),
+            _ => return None,
+        };
+        let depends_on_stack = binding.depends_on_stack;
+        let x_reg = binding.reg;
+        let result_reg = if signed {
+            let shift = (64 - bits) as i64;
+            let shift_reg = self.alloc_reg();
+            self.emit_op(
+                OpMeta::linear(OpKind::LoadConstI, vec![], vec![Register::int(shift_reg)]),
+                quote! { __builder.load_const_i_value(#shift_reg, #shift); },
+            );
+            let shl_reg = self.alloc_reg();
+            let lshift = syn::Ident::new("IntLshift", proc_macro2::Span::call_site());
+            self.emit_op(
+                OpMeta::linear(
+                    OpKind::BinopI,
+                    Register::ints(&[x_reg, shift_reg]),
+                    vec![Register::int(shl_reg)],
+                ),
+                binop_i_emit_tokens(shl_reg, &lshift, x_reg, shift_reg),
+            );
+            let res_reg = self.alloc_reg();
+            let rshift = syn::Ident::new("IntRshift", proc_macro2::Span::call_site());
+            self.emit_op(
+                OpMeta::linear(
+                    OpKind::BinopI,
+                    Register::ints(&[shl_reg, shift_reg]),
+                    vec![Register::int(res_reg)],
+                ),
+                binop_i_emit_tokens(res_reg, &rshift, shl_reg, shift_reg),
+            );
+            res_reg
+        } else {
+            let mask = ((1u64 << bits) - 1) as i64;
+            let mask_reg = self.alloc_reg();
+            self.emit_op(
+                OpMeta::linear(OpKind::LoadConstI, vec![], vec![Register::int(mask_reg)]),
+                quote! { __builder.load_const_i_value(#mask_reg, #mask); },
+            );
+            let res_reg = self.alloc_reg();
+            let and = syn::Ident::new("IntAnd", proc_macro2::Span::call_site());
+            self.emit_op(
+                OpMeta::linear(
+                    OpKind::BinopI,
+                    Register::ints(&[x_reg, mask_reg]),
+                    vec![Register::int(res_reg)],
+                ),
+                binop_i_emit_tokens(res_reg, &and, x_reg, mask_reg),
+            );
+            res_reg
+        };
+        Some(Binding {
+            reg: result_reg,
+            kind: BindingKind::Int,
+            depends_on_stack,
         })
     }
 
@@ -1155,6 +1469,8 @@ impl<'c> Lowerer<'c> {
             dispatch_tainted_reason: None,
             opcode_var_name: self.opcode_var_name.clone(),
             in_dispatch_arm_body: self.in_dispatch_arm_body,
+            dispatch_loop_label: self.dispatch_loop_label.clone(),
+            pc_pinned: self.pc_pinned,
         };
 
         for stmt in &stmts {
@@ -1184,6 +1500,8 @@ impl<'c> Lowerer<'c> {
             dispatch_tainted_reason: None,
             opcode_var_name: self.opcode_var_name.clone(),
             in_dispatch_arm_body: self.in_dispatch_arm_body,
+            dispatch_loop_label: self.dispatch_loop_label.clone(),
+            pc_pinned: self.pc_pinned,
         };
 
         let binding = nested.lower_scoped_value_expr(expr)?;
@@ -1226,6 +1544,49 @@ mod tests {
             kind,
             depends_on_stack: false,
         }
+    }
+
+    #[test]
+    fn struct_literal_lowers_to_new_plus_setfield_gc() {
+        // `Node { value: v, next: n }` with v:Int, n:Ref lowers to a New
+        // allocation followed by a per-field setfield_gc_{i,r}.
+        let mut lowerer = Lowerer::new(None);
+        lowerer
+            .bindings
+            .insert("v".to_string(), binding(1, BindingKind::Int));
+        lowerer
+            .bindings
+            .insert("n".to_string(), binding(2, BindingKind::Ref));
+        let expr: Expr =
+            syn::parse_str("Node { value: v, next: n }").expect("parse struct literal");
+
+        let result = lowerer.lower_value_expr(&expr).expect("struct lowers");
+        assert!(matches!(result.kind, BindingKind::Ref));
+
+        let kinds: Vec<_> = lowerer.op_metadata.iter().map(|m| m.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![OpKind::New, OpKind::SetfieldGc, OpKind::SetfieldGc]
+        );
+        // The int field reads the int bank, the ref field the ref bank.
+        assert_eq!(
+            lowerer.op_metadata[1].reads,
+            vec![Register::ref_(result.reg), Register::int(1)]
+        );
+        assert_eq!(
+            lowerer.op_metadata[2].reads,
+            vec![Register::ref_(result.reg), Register::ref_(2)]
+        );
+        let emitted = lowerer
+            .statements
+            .iter()
+            .map(ToString::to_string)
+            .collect::<String>();
+        assert!(emitted.contains("new_struct"));
+        assert!(emitted.contains("setfield_gc_i"));
+        assert!(emitted.contains("setfield_gc_r"));
+        assert!(emitted.contains("offset_of"));
+        assert!(emitted.contains("size_of"));
     }
 
     #[test]

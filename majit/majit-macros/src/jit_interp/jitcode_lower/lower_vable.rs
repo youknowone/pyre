@@ -1,6 +1,67 @@
 use super::*;
 
 impl<'c> Lowerer<'c> {
+    /// Read an immediate operand byte from the green bytecode array:
+    /// `program[<index>]`.  Mirrors the dispatch-top opcode fetch
+    /// (`try_lower_opcode_fetch_stmt`) so the same `getarrayitem_gc_i` is
+    /// emitted for operand reads inside opcode arm bodies.  RPython
+    /// `pyopcode.py:171 ord(co_code[next_instr])`: the bytecode array and
+    /// `pc` are green, so the optimizer constant-folds the load.
+    ///
+    /// The env parameter name is the macro convention `program`, matching
+    /// `try_lower_opcode_fetch_stmt`'s hard-coded recognition.
+    pub(super) fn lower_env_array_read(&mut self, expr: &Expr) -> Option<Binding> {
+        // The constant-fold this read relies on ("array + index are green",
+        // `pyopcode.py:171 ord(co_code[next_instr])`) only holds when `pc` is
+        // a declared green — PyPy `tl.py greens=['pc','code']` makes both the
+        // bytecode array and the instruction pointer green, so the load folds
+        // away.  With a red `pc` the `getarrayitem_gc_i` does not fold and the
+        // surrounding state-field dispatch loop cannot close on it; leave the
+        // operand read unlowered so the arm aborts and the interpreter handles
+        // that opcode (the pre-green-pc behaviour).
+        if !self.config.map(pc_is_green).unwrap_or(false) {
+            return None;
+        }
+        let Expr::Index(index_expr) = expr else {
+            return None;
+        };
+        if !expr_matches_local_name(&index_expr.expr, "program") {
+            return None;
+        }
+        let program_binding = self.bindings.get("program").cloned()?;
+        if !matches!(program_binding.kind, BindingKind::Ref) {
+            return None;
+        }
+        let program_reg = program_binding.reg;
+        let idx_binding = self.lower_value_expr(&index_expr.index)?;
+        if !matches!(idx_binding.kind, BindingKind::Int) {
+            return None;
+        }
+        let index_reg = idx_binding.reg;
+        let result_reg = self.alloc_reg();
+        self.emit_op(
+            OpMeta::linear(
+                OpKind::Vable,
+                vec![Register::ref_(program_reg), Register::int(index_reg)],
+                vec![Register::int(result_reg)],
+            ),
+            quote! {
+                let __descr_idx = __builder.add_gc_byte_array_descr();
+                __builder.getarrayitem_gc_i(
+                    #result_reg as u16,
+                    #program_reg as u16,
+                    #index_reg as u16,
+                    __descr_idx,
+                );
+            },
+        );
+        Some(Binding {
+            reg: result_reg,
+            kind: BindingKind::Int,
+            depends_on_stack: false,
+        })
+    }
+
     pub(super) fn lower_vable_field_write(&mut self, expr: &Expr) -> Option<()> {
         let config = self.config?;
         let vable_var = config.vable_var.as_ref()?;
@@ -134,16 +195,33 @@ impl<'c> Lowerer<'c> {
             return None;
         }
         let member_name = named_member(&field.member)?;
-        let &field_index = config.state_scalars.get(&member_name)?;
-        let fi = field_index as u16;
-        let binding = self.lower_value_expr(&assign.right)?;
-        let src = binding.reg;
-        // store_state_field/di — `src` is Int per assembler.py:217 'i' argcode.
-        self.emit_op(
-            OpMeta::linear(OpKind::StateField, vec![Register::int(src)], vec![]),
-            quote! { __builder.store_state_field(#fi, #src); },
-        );
-        Some(())
+        if let Some(&field_index) = config.state_scalars.get(&member_name) {
+            let fi = field_index as u16;
+            let binding = self.lower_value_expr(&assign.right)?;
+            let src = binding.reg;
+            // store_state_field/di — `src` is Int per assembler.py:217 'i' argcode.
+            self.emit_op(
+                OpMeta::linear(OpKind::StateField, vec![Register::int(src)], vec![]),
+                quote! { __builder.store_state_field(#fi, #src); },
+            );
+            return Some(());
+        }
+        // ref(T) scalar: the RHS must lower to a ref binding (another ref
+        // state read or a residual ref-returning call).
+        if let Some(&field_index) = config.state_ref_scalars.get(&member_name) {
+            let fi = field_index as u16;
+            let binding = self.lower_value_expr(&assign.right)?;
+            if !matches!(binding.kind, BindingKind::Ref) {
+                return None;
+            }
+            let src = binding.reg;
+            self.emit_op(
+                OpMeta::linear(OpKind::StateField, vec![Register::ref_(src)], vec![]),
+                quote! { __builder.store_state_field_ref(#fi, #src); },
+            );
+            return Some(());
+        }
+        None
     }
 
     /// Recognizes `state.field += expr` for scalar state fields.
@@ -178,7 +256,7 @@ impl<'c> Lowerer<'c> {
                 Register::ints(&[lhs_reg, rhs_reg]),
                 vec![Register::int(dst)],
             ),
-            quote! { __builder.record_binop_i(#dst, majit_ir::OpCode::#opcode, #lhs_reg, #rhs_reg); },
+            binop_i_emit_tokens(dst, &opcode, lhs_reg, rhs_reg),
         );
         let fi = field_index as u16;
         self.emit_op(
@@ -189,7 +267,8 @@ impl<'c> Lowerer<'c> {
     }
 
     /// Recognizes `state.array[index] = expr` for array state fields.
-    /// Routes to `store_state_varray` for virtualizable arrays, `store_state_array` for flattened.
+    /// Virtualizable arrays bail to the standard vable path; flattened arrays
+    /// emit `store_state_array`.
     pub(super) fn lower_state_array_write(&mut self, expr: &Expr) -> Option<()> {
         let config = self.config?;
         let assign = match expr {
@@ -209,23 +288,23 @@ impl<'c> Lowerer<'c> {
             return None;
         }
         let member_name = named_member(&field.member)?;
+        // `[int; virt]` arrays are NOT handled here — they lower through the
+        // standard virtualizable path (`lower_vable_array_write`), reached
+        // because `LowererConfig::new` registers the state binding as the
+        // vable identity var. Bail before lowering the index/value so they
+        // are not emitted twice when the dispatch falls through.
+        if config.state_virt_arrays.contains_key(&member_name) {
+            return None;
+        }
         let idx_binding = self.lower_value_expr(&index_expr.index)?;
         let idx_reg = idx_binding.reg;
         let val_binding = self.lower_value_expr(&assign.right)?;
         let val_reg = val_binding.reg;
 
-        // store_state_{varray,array}/dii — both reg args are Int per
+        // store_state_array/dii — both reg args are Int per
         // assembler.py:217 'i' argcode.
         let idx_r = Register::int(idx_reg);
         let val_r = Register::int(val_reg);
-        if let Some(&va_idx) = config.state_virt_arrays.get(&member_name) {
-            let ai = va_idx as u16;
-            self.emit_op(
-                OpMeta::linear(OpKind::StateField, vec![idx_r, val_r], vec![]),
-                quote! { __builder.store_state_varray(#ai, #idx_reg, #val_reg); },
-            );
-            return Some(());
-        }
         let &array_index = config.state_arrays.get(&member_name)?;
         let ai = array_index as u16;
         self.emit_op(
@@ -521,23 +600,67 @@ impl<'c> Lowerer<'c> {
             return None;
         }
         let member_name = named_member(&field.member)?;
-        let &field_index = config.state_scalars.get(&member_name)?;
-        let fi = field_index as u16;
-        let reg = self.alloc_reg();
-        // load_state_field reads the field at int index `fi` into int `reg`.
-        self.emit_op(
-            OpMeta::linear(OpKind::StateField, vec![], vec![Register::int(reg)]),
-            quote! { __builder.load_state_field(#fi, #reg); },
-        );
-        Some(Binding {
-            reg,
-            kind: BindingKind::Int,
-            depends_on_stack: false,
-        })
+        if let Some(&field_index) = config.state_scalars.get(&member_name) {
+            let fi = field_index as u16;
+            let reg = self.alloc_reg();
+            // load_state_field reads the field at its int identity slot into
+            // int `reg`.  Declare the identity slot as a read (liveness.py:67
+            // adds every Register arg to the alive set) so the backward
+            // liveness walk keeps the slot live across every downstream
+            // `-live-` marker — without it the marker omits the slot, the
+            // blackhole resume seeder never restores it, and forward
+            // re-execution reads garbage.  Mirrors `store_state_field`
+            // declaring its source and `vable_field_read` declaring `vable_r`.
+            // The slot sits at `int_identity_base() + fi`, past the dispatch
+            // JitCode's int argument (`pc` at i0).
+            let slot = config.int_identity_base() + fi;
+            self.emit_op(
+                OpMeta::linear(
+                    OpKind::StateField,
+                    vec![Register::int(slot)],
+                    vec![Register::int(reg)],
+                ),
+                quote! { __builder.load_state_field(#fi, #reg); },
+            );
+            return Some(Binding {
+                reg,
+                kind: BindingKind::Int,
+                depends_on_stack: false,
+            });
+        }
+        // ref(T) scalar: read into the ref register bank so a subsequent
+        // getfield_gc reads its struct base from a real ref value.
+        if let Some(&field_index) = config.state_ref_scalars.get(&member_name) {
+            let fi = field_index as u16;
+            let reg = self.alloc_reg();
+            // Declare the ref identity slot as a read so the backward
+            // liveness walk keeps it live across guards (mirrors the int
+            // load_state_field). Without it the slot drops from interior
+            // -live- markers and the blackhole resume seeder leaves
+            // registers_r[ref_scalar_slot(fi)] uninitialized. The slot
+            // sits at `ref_identity_base() + fi`, past the dispatch
+            // JitCode's ref-bank arguments.
+            let slot = config.ref_identity_base() + fi;
+            self.emit_op(
+                OpMeta::linear(
+                    OpKind::StateField,
+                    vec![Register::ref_(slot)],
+                    vec![Register::ref_(reg)],
+                ),
+                quote! { __builder.load_state_field_ref(#fi, #reg); },
+            );
+            return Some(Binding {
+                reg,
+                kind: BindingKind::Ref,
+                depends_on_stack: false,
+            });
+        }
+        None
     }
 
     /// Recognizes `state.array[index]` for array state fields.
-    /// Routes to `load_state_varray` for virtualizable arrays, `load_state_array` for flattened.
+    /// Virtualizable arrays bail to the standard vable path; flattened arrays
+    /// emit `load_state_array`.
     pub(super) fn lower_state_array_read(&mut self, expr: &Expr) -> Option<Binding> {
         let config = self.config?;
         let index_expr = match expr {
@@ -553,27 +676,17 @@ impl<'c> Lowerer<'c> {
             return None;
         }
         let member_name = named_member(&field.member)?;
+        // `[int; virt]` arrays are NOT handled here — they lower through the
+        // standard virtualizable path (`lower_vable_array_read`). Bail before
+        // lowering the index expression so it is not emitted twice when the
+        // dispatch falls through to the vable read.
+        if config.state_virt_arrays.contains_key(&member_name) {
+            return None;
+        }
         let idx_binding = self.lower_value_expr(&index_expr.index)?;
         let idx_reg = idx_binding.reg;
         let reg = self.alloc_reg();
 
-        // Check virtualizable arrays first, then flattened arrays.
-        if let Some(&va_idx) = config.state_virt_arrays.get(&member_name) {
-            let ai = va_idx as u16;
-            self.emit_op(
-                OpMeta::linear(
-                    OpKind::StateField,
-                    vec![Register::int(idx_reg)],
-                    vec![Register::int(reg)],
-                ),
-                quote! { __builder.load_state_varray(#ai, #idx_reg, #reg); },
-            );
-            return Some(Binding {
-                reg,
-                kind: BindingKind::Int,
-                depends_on_stack: false,
-            });
-        }
         let &array_index = config.state_arrays.get(&member_name)?;
         let ai = array_index as u16;
         self.emit_op(

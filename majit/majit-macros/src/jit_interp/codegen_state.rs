@@ -48,6 +48,8 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
             // RPython parity: opaque(T) fields are pass-through; the JIT
             // does not enumerate them as inputargs, so any T is allowed.
             StateFieldKind::Opaque(_) => None,
+            // ref(T) is supported — a ref-typed scalar (usize carrier).
+            StateFieldKind::Ref(_) => None,
         })
         .collect();
     if !unsupported_fields.is_empty() {
@@ -91,9 +93,40 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
         .enumerate()
         .filter(|(_, f)| matches!(f.kind, StateFieldKind::VirtArray(_)))
         .collect();
+    let ref_scalars: Vec<_> = sf
+        .fields
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| matches!(f.kind, StateFieldKind::Ref(_)))
+        .collect();
 
     let num_scalars = scalars.len();
     let num_virt_arrays = virt_arrays.len();
+    let num_ref_scalars = ref_scalars.len();
+    // First ref-bank register available for ref-scalar identity slots.
+    // `MIFrame::setup_call` packs the dispatch JitCode's ref args densely
+    // from r0 (`program` at r0, the virtualizable identity at r1 when
+    // present — `with_vable_input_ref_reg(1)` in codegen_trace), and the
+    // blackhole re-executes ops reading those argument registers, so the
+    // identity slots start past them.  Mirrors
+    // `LowererConfig::ref_identity_base`; the vable-presence condition
+    // matches the lowerer's `vable_var` synthesis (an explicit
+    // `virtualizable` decl or any `[int; virt]` state array).
+    let ref_identity_base: usize =
+        1 + usize::from(config.virtualizable_decl.is_some() || num_virt_arrays > 0);
+    let ref_identity_end: usize = ref_identity_base + num_ref_scalars;
+    // First int-bank register available for scalar/array identity slots —
+    // the int-bank mirror of `ref_identity_base`. The dispatch JitCode's
+    // only int argument is `pc` at i0; aliasing it lets the guard-time
+    // canonical materialization overwrite the pc register before resume
+    // encode. Mirrors `LowererConfig::int_identity_base`.
+    let int_identity_base: usize = 1;
+
+    let recover_body: TokenStream = if let Some(ref recover_path) = config.recover {
+        quote! { self.#recover_path(); }
+    } else {
+        quote! {}
+    };
 
     // ── __JitMeta fields: one `{name}_len: usize` per flattened array ──
     // Virt arrays do NOT store length in meta (it's dynamic, tracked as inputarg).
@@ -249,26 +282,6 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
         })
         .collect();
 
-    // ── JitCodeSym: state_varray_ptr / state_varray_len ──
-    let state_varray_ptr_arms: Vec<TokenStream> = virt_arrays
-        .iter()
-        .enumerate()
-        .map(|(va_idx, (_, f))| {
-            let ptr_name = quote::format_ident!("{}_ptr", f.name);
-            let va_idx_lit = va_idx;
-            quote! { #va_idx_lit => Some(self.#ptr_name), }
-        })
-        .collect();
-    let state_varray_len_arms: Vec<TokenStream> = virt_arrays
-        .iter()
-        .enumerate()
-        .map(|(va_idx, (_, f))| {
-            let len_name = quote::format_ident!("{}_len", f.name);
-            let va_idx_lit = va_idx;
-            quote! { #va_idx_lit => Some(self.#len_name), }
-        })
-        .collect();
-
     // ── collect_jump_args: scalars, then flattened arrays, then virt array ptr+len ──
     let collect_scalar_parts: Vec<TokenStream> = scalars
         .iter()
@@ -292,6 +305,39 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
             quote! {
                 args.push(sym.#ptr_name);
                 args.push(sym.#len_name);
+            }
+        })
+        .collect();
+    // collect_jump_args_with_boxes (ctx-aware close): carry the live
+    // `virtualizable_boxes[:-1]` element shadow AFTER the `<arr>_ptr`/`<arr>_len`
+    // header (pyjitpl.py:2982-2989 `live_arg_boxes += virtualizable_boxes;
+    // live_arg_boxes.pop()`). `__boxes` = `TraceCtx::collect_virtualizable_boxes()`
+    // = `[arr0_elem0.., identity]` (num_static_extra_boxes==0 for state-field,
+    // identity LAST).
+    //
+    // The JUMP must be slot-for-slot identical to the trace-entry Label, whose
+    // virt-array inputargs are `[ptr, len, elem0..elemN-1]` (`create_sym`
+    // mints `ptr`+`len`; `initialize_virtualizable` mints the N element boxes
+    // right after). So push `ptr` then `len` (both loop-invariant — the
+    // identity base and `program.len()`), then the N symbolically-updated
+    // element boxes in place of the optimizer's trace-entry-seeded tracker
+    // expansion. Dropping `len` here (or putting elements before it) shifts
+    // every later slot and breaks the unroll's Label↔Jump virtual-state match.
+    // Emitted only for a single `[int; virt]` array (the macro examples);
+    // multi-virt falls back to the default `collect_jump_args` (ptr+len) to
+    // avoid mis-splitting the shared element block.
+    let collect_virt_array_box_parts: Vec<TokenStream> = virt_arrays
+        .iter()
+        .map(|(_, f)| {
+            let ptr_name = quote::format_ident!("{}_ptr", f.name);
+            let len_name = quote::format_ident!("{}_len", f.name);
+            quote! {
+                args.push(sym.#ptr_name);
+                args.push(sym.#len_name);
+                let __elem_count = __boxes.len().saturating_sub(1);
+                for __i in 0..__elem_count {
+                    args.push(__boxes[__i]);
+                }
             }
         })
         .collect();
@@ -347,9 +393,15 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
             let ptr_value_name = quote::format_ident!("{}_ptr_value", f.name);
             let len_value_name = quote::format_ident!("{}_len_value", f.name);
             quote! {
-                if __slot < frame.int_regs.len() {
-                    frame.int_regs[__slot] = Some(self.#ptr_name);
-                    frame.int_values[__slot] = Some(self.#ptr_value_name);
+                // The identity ptr is the vable base (`vable_input_ref_reg`),
+                // a Ref box — populate the REF bank so the box carries a Ref
+                // value and the optimizer folds it to a ref const (TAGCONST),
+                // matching the jitcode ref-liveness the resume reader decodes
+                // through `decode_ref`. The length stays an int slot.
+                if __slot < frame.ref_regs.len() {
+                    frame.ref_regs[__slot] =
+                        Some(majit_ir::box_ref::BoxRef::from_opref(self.#ptr_name));
+                    frame.ref_values[__slot] = Some(self.#ptr_value_name);
                 }
                 __slot += 1;
                 if __slot < frame.int_regs.len() {
@@ -437,7 +489,11 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
         .map(|(_, f)| {
             let fname = &f.name;
             quote! {
-                values.push(self.#fname.as_ptr() as i64);
+                // The vable base is the virtualizable identity (`&state` ==
+                // `virtualizable_heap_ptr`), NOT the array's data pointer:
+                // `vable_getarrayitem_*` reaches the element through the
+                // RustVec storage from this base. Every virt array shares it.
+                values.push(self as *const Self as i64);
                 values.push(self.#fname.len() as i64);
             }
         })
@@ -608,7 +664,10 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
             let ptr_value_name = quote::format_ident!("{}_ptr_value", f.name);
             let len_value_name = quote::format_ident!("{}_len_value", f.name);
             quote! {
-                sym.#ptr_value_name = self.#fname.as_ptr() as i64;
+                // Vable base identity (`&state`), matching `extract_live` and
+                // `standard_virtualizable_concrete` so the traced vable box is
+                // recognized as the standard virtualizable (no force).
+                sym.#ptr_value_name = self as *const Self as i64;
                 sym.#len_value_name = self.#fname.len() as i64;
             }
         })
@@ -625,6 +684,396 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
         })
         .collect();
 
+    // ── ref(T) scalars ──
+    // A ref scalar mints `InputArgRef(__offset)` in the same flat position
+    // space as every other inputarg (the virt-array identity slot above
+    // does the same).  The optimizer keys inputarg identity by flat
+    // position (`OptContext::inputarg_refs[pos]`, `bind_canonical_inputarg`
+    // keyed by `OpRef::raw()`), so a bank-local 0-based index would alias
+    // `InputArgInt(0)` and `InputArgRef(0)` onto one forwarding host — a
+    // promote on the int slot would const-fold every use of the ref slot.
+    // In the value vector the ref scalar is APPENDED LAST (after int
+    // scalars/arrays/virt) so the int-bank slot layout is unchanged and the
+    // flat offset coincides with the value-vector position;
+    // `live_value_types` tags those trailing positions `Type::Ref` so
+    // `restore_values` routes them to the ref bank.  Struct storage is a
+    // `usize` carrier (raw GcRef / pointer bits).
+    let sym_ref_scalar_fields: Vec<TokenStream> = ref_scalars
+        .iter()
+        .map(|(_, f)| {
+            let fname = &f.name;
+            quote! { #fname: majit_ir::OpRef, }
+        })
+        .collect();
+    let sym_ref_scalar_value_fields: Vec<TokenStream> = ref_scalars
+        .iter()
+        .map(|(_, f)| {
+            let value_name = quote::format_ident!("{}_value", f.name);
+            quote! { #value_name: i64, }
+        })
+        .collect();
+    let create_sym_ref_scalar_inits: Vec<TokenStream> = ref_scalars
+        .iter()
+        .map(|(_, f)| {
+            let fname = &f.name;
+            let value_name = quote::format_ident!("{}_value", f.name);
+            quote! {
+                let #fname = majit_ir::OpRef::input_arg_ref(__offset as u32);
+                __offset += 1;
+                let #value_name = 0i64;
+            }
+        })
+        .collect();
+    let create_sym_ref_scalar_names: Vec<&syn::Ident> =
+        ref_scalars.iter().map(|(_, f)| &f.name).collect();
+    let create_sym_ref_scalar_value_names: Vec<syn::Ident> = ref_scalars
+        .iter()
+        .map(|(_, f)| quote::format_ident!("{}_value", f.name))
+        .collect();
+    let extract_ref_scalar_parts: Vec<TokenStream> = ref_scalars
+        .iter()
+        .map(|(_, f)| {
+            let fname = &f.name;
+            quote! { values.push(self.#fname as i64); }
+        })
+        .collect();
+    let restore_ref_scalar_parts: Vec<TokenStream> = ref_scalars
+        .iter()
+        .enumerate()
+        .map(|(ref_idx, (_, f))| {
+            let fname = &f.name;
+            quote! { self.#fname = ref_values[#ref_idx] as usize; }
+        })
+        .collect();
+    let initialize_sym_ref_scalar_parts: Vec<TokenStream> = ref_scalars
+        .iter()
+        .map(|(_, f)| {
+            let fname = &f.name;
+            let value_name = quote::format_ident!("{}_value", f.name);
+            quote! { sym.#value_name = self.#fname as i64; }
+        })
+        .collect();
+    let collect_ref_scalar_parts: Vec<TokenStream> = ref_scalars
+        .iter()
+        .map(|(_, f)| {
+            let fname = &f.name;
+            quote! { args.push(sym.#fname); }
+        })
+        .collect();
+    // Canonical ref-bank identity slots: ref scalar `j` lives at
+    // `ref_regs[ref_identity_base + j]` so the guard-time snapshot's
+    // live_r decode (`get_list_of_active_boxes`) and the blackhole's
+    // `ref_scalar_slot` agree without aliasing the dispatch JitCode's
+    // ref arguments.
+    let populate_ref_scalar_parts: Vec<TokenStream> = ref_scalars
+        .iter()
+        .enumerate()
+        .map(|(ref_idx, (_, f))| {
+            let fname = &f.name;
+            let value_name = quote::format_ident!("{}_value", f.name);
+            let slot = ref_identity_base + ref_idx;
+            quote! {
+                if #slot < frame.ref_regs.len() {
+                    frame.ref_regs[#slot] =
+                        Some(majit_ir::box_ref::BoxRef::from_opref(self.#fname));
+                    frame.ref_values[#slot] = Some(self.#value_name);
+                }
+            }
+        })
+        .collect();
+    // Override `JitState::collect_jump_args_with_boxes` only for a single
+    // `[int; virt]` array (tl/tlc/tla/aheui). 0 virt arrays (tlr) and the
+    // multi-virt case fall back to the defaulted trait method (ptr+len).
+    let collect_jump_args_with_boxes_method: TokenStream = if num_virt_arrays == 1 {
+        quote! {
+            fn collect_jump_args_with_boxes(
+                sym: &__JitSym,
+                __boxes: &[majit_ir::OpRef],
+            ) -> Vec<majit_ir::OpRef> {
+                let mut args = Vec::new();
+                #(#collect_scalar_parts)*
+                #(#collect_array_parts)*
+                #(#collect_virt_array_box_parts)*
+                #(#collect_ref_scalar_parts)*
+                args
+            }
+        }
+    } else {
+        quote! {}
+    };
+    let fail_ref_scalar_parts: Vec<TokenStream> = ref_scalars
+        .iter()
+        .map(|(_, f)| {
+            let fname = &f.name;
+            quote! { args.push(self.#fname); }
+        })
+        .collect();
+    let state_ref_field_ref_arms: Vec<TokenStream> = ref_scalars
+        .iter()
+        .enumerate()
+        .map(|(ref_idx, (_, f))| {
+            let fname = &f.name;
+            quote! { #ref_idx => Some(self.#fname), }
+        })
+        .collect();
+    let set_state_ref_field_ref_arms: Vec<TokenStream> = ref_scalars
+        .iter()
+        .enumerate()
+        .map(|(ref_idx, (_, f))| {
+            let fname = &f.name;
+            quote! { #ref_idx => { self.#fname = value; } }
+        })
+        .collect();
+    let state_ref_field_value_arms: Vec<TokenStream> = ref_scalars
+        .iter()
+        .enumerate()
+        .map(|(ref_idx, (_, f))| {
+            let value_name = quote::format_ident!("{}_value", f.name);
+            quote! { #ref_idx => Some(self.#value_name), }
+        })
+        .collect();
+    let set_state_ref_field_value_arms: Vec<TokenStream> = ref_scalars
+        .iter()
+        .enumerate()
+        .map(|(ref_idx, (_, f))| {
+            let value_name = quote::format_ident!("{}_value", f.name);
+            quote! { #ref_idx => { self.#value_name = value; } }
+        })
+        .collect();
+
+    // Optional method overrides — emitted ONLY when ref scalars exist, so
+    // interps with none generate a byte-identical token stream (the trait
+    // defaults from `JitState` / `JitCodeSym` apply).
+    // Per-virt-array value-routing types: the identity pointer slot is Ref,
+    // the length slot is Int (in `extract_live` ptr-then-len order).
+    let virt_array_type_parts: Vec<TokenStream> = virt_arrays
+        .iter()
+        .map(|_| {
+            quote! {
+                types.push(majit_ir::Type::Ref);
+                types.push(majit_ir::Type::Int);
+            }
+        })
+        .collect();
+    // Per-array value-routing types: one Int per element.
+    let array_type_parts: Vec<TokenStream> = arrays
+        .iter()
+        .map(|(_, f)| {
+            let fname = &f.name;
+            quote! {
+                for _ in 0..self.#fname.len() {
+                    types.push(majit_ir::Type::Int);
+                }
+            }
+        })
+        .collect();
+    let live_value_types_override: TokenStream = if num_ref_scalars > 0 || num_virt_arrays > 0 {
+        quote! {
+            fn live_value_types(&self, _meta: &__JitMeta) -> Vec<majit_ir::Type> {
+                // Value-routing types in `extract_live` order: int scalars,
+                // int array elements, then per virt-array the identity ptr
+                // (Ref) + length (Int), then the appended ref scalars (Ref).
+                // The ptr slot MUST be Ref so the folded loop-invariant
+                // `&state` identity numbers as a ref const (TAGCONST), not an
+                // int const — the resume reader decodes it through `decode_ref`
+                // in both the vable section and the frame ref-liveness.
+                let mut types: Vec<majit_ir::Type> = Vec::new();
+                for _ in 0..#num_scalars {
+                    types.push(majit_ir::Type::Int);
+                }
+                #(#array_type_parts)*
+                #(#virt_array_type_parts)*
+                for _ in 0..#num_ref_scalars {
+                    types.push(majit_ir::Type::Ref);
+                }
+                types
+            }
+        }
+    } else {
+        quote! {}
+    };
+    let restore_banked_override: TokenStream = if num_ref_scalars > 0 {
+        quote! {
+            fn restore_banked(
+                &mut self,
+                meta: &__JitMeta,
+                int_values: &[i64],
+                ref_values: &[i64],
+            ) {
+                // Int scalars/arrays/virt restore from the int bank exactly
+                // as `restore`; ref scalars restore from the ref bank by
+                // 0-based ref index.
+                self.restore(meta, int_values);
+                #(#restore_ref_scalar_parts)*
+            }
+        }
+    } else {
+        quote! {}
+    };
+    let ref_field_accessor_overrides: TokenStream = if num_ref_scalars > 0 {
+        quote! {
+            fn state_ref_field_ref(&self, field_idx: usize) -> Option<majit_ir::OpRef> {
+                match field_idx {
+                    #(#state_ref_field_ref_arms)*
+                    _ => None,
+                }
+            }
+            fn set_state_ref_field_ref(&mut self, field_idx: usize, value: majit_ir::OpRef) {
+                match field_idx {
+                    #(#set_state_ref_field_ref_arms)*
+                    _ => {}
+                }
+            }
+            fn state_ref_field_value(&self, field_idx: usize) -> Option<i64> {
+                match field_idx {
+                    #(#state_ref_field_value_arms)*
+                    _ => None,
+                }
+            }
+            fn set_state_ref_field_value(&mut self, field_idx: usize, value: i64) {
+                match field_idx {
+                    #(#set_state_ref_field_value_arms)*
+                    _ => {}
+                }
+            }
+
+            fn ref_identity_slots_end(&self) -> usize {
+                #ref_identity_end
+            }
+        }
+    } else {
+        quote! {}
+    };
+    let state_field_layout_ctor: TokenStream = if num_ref_scalars > 0 {
+        quote! {
+            majit_metainterp::blackhole::StateFieldLayout::with_ref_scalars(
+                #num_scalars,
+                ::std::vec![#(self.#create_sym_array_names.len()),*],
+                #num_virt_arrays,
+                #num_ref_scalars,
+                #ref_identity_base,
+                #int_identity_base,
+            )
+        }
+    } else {
+        quote! {
+            majit_metainterp::blackhole::StateFieldLayout::new(
+                #num_scalars,
+                ::std::vec![#(self.#create_sym_array_names.len()),*],
+                #num_virt_arrays,
+                #int_identity_base,
+            )
+        }
+    };
+
+    // ── VirtualizableInfo / heap-ptr overrides for `[int; virt]` arrays ──
+    // Each virt array becomes a standard-virtualizable RustVec array field on
+    // a zero-static-field vinfo, so `state.<arr>[i]` lowers through the
+    // `virtualizable_boxes` devirt path. Scalars stay in the state-field
+    // scalar resume mechanism (disjoint from the array restore).
+    let build_vinfo_override: TokenStream = if num_virt_arrays > 0 {
+        // Per virt array: nested data-ptr/len extractor fns + an
+        // `add_rust_vec_array_field` call keyed on the field byte offset.
+        let virt_array_field_parts: Vec<TokenStream> = virt_arrays
+            .iter()
+            .map(|(_, f)| {
+                let fname = &f.name;
+                let data_ptr_fn = quote::format_ident!("__vinfo_{}_data_ptr", f.name);
+                let len_fn = quote::format_ident!("__vinfo_{}_len", f.name);
+                let fname_str = f.name.to_string();
+                quote! {
+                    fn #data_ptr_fn(__p: *mut u8) -> *mut i64 {
+                        unsafe { (*(__p as *mut #state_type)).#fname.as_mut_ptr() }
+                    }
+                    fn #len_fn(__p: *const u8) -> usize {
+                        unsafe { (*(__p as *const #state_type)).#fname.len() }
+                    }
+                    let __descr = majit_ir::descr::make_array_descr(
+                        0,
+                        ::std::mem::size_of::<i64>(),
+                        majit_ir::Type::Int,
+                    );
+                    __info.add_rust_vec_array_field(
+                        #fname_str,
+                        majit_ir::Type::Int,
+                        ::std::mem::offset_of!(#state_type, #fname),
+                        #data_ptr_fn,
+                        #len_fn,
+                        __descr,
+                    );
+                }
+            })
+            .collect();
+        // Field idents in `virt_arrays` order — the same order
+        // `add_rust_vec_array_field` registers them, which is the order
+        // `flatten_virtualizable_values` (jitdriver.rs) reads them back.
+        let virt_array_field_idents: Vec<&syn::Ident> =
+            virt_arrays.iter().map(|(_, f)| &f.name).collect();
+        quote! {
+            #[allow(non_snake_case)]
+            fn __build_virtualizable_info()
+            -> Option<::std::sync::Arc<majit_metainterp::virtualizable::VirtualizableInfo>> {
+                use majit_metainterp::virtualizable::VirtualizableInfo;
+                // token_offset=0: the stack-local state struct is non-GC and
+                // never moved, so the vable_token protocol is inert — the
+                // identity value (a `&state` pointer) is recovered straight
+                // from the resume snapshot, not via a heap token.
+                let mut __info = VirtualizableInfo::new(0);
+                __info.name = "state".to_string();
+                // The dispatch lowering binds the green ref `program` to ref
+                // register 0 (it is the base for `program[pc]` reads) and the
+                // `&state` virtualizable identity to ref register 1
+                // (`vable_input_ref_reg = 1`, jitcode_lower/mod.rs). Tell
+                // `initialize_virtualizable` to mint the standard box at that
+                // ref-bank index so it matches the traced vable base (the flat
+                // `num_green_args + index_of_virtualizable` ordinal would
+                // resolve to 0, the slot the green ref occupies).
+                __info.identity_ref_bank_index = Some(1);
+                #(#virt_array_field_parts)*
+                Some(__info.finalize_arc(
+                    majit_ir::descr::make_size_descr(::std::mem::size_of::<#state_type>()),
+                ))
+            }
+
+            fn virtualizable_heap_ptr(
+                &self,
+                _meta: &Self::Meta,
+                _virtualizable: &str,
+                _info: &majit_metainterp::virtualizable::VirtualizableInfo,
+            ) -> Option<*mut u8> {
+                // The state struct is a stack-allocated mainloop local —
+                // stable and non-GC. Use its address as the vable identity
+                // heap pointer.
+                Some(self as *const Self as *mut u8)
+            }
+
+            fn export_virtualizable_boxes(
+                &self,
+                _meta: &Self::Meta,
+                _virtualizable: &str,
+                _info: &majit_metainterp::virtualizable::VirtualizableInfo,
+            ) -> Option<(::std::vec::Vec<i64>, ::std::vec::Vec<::std::vec::Vec<i64>>)> {
+                // warmstate.py:482-511: supply the live virtualizable field
+                // values so `extend_compiled_live_values` can grow the entry
+                // `live_values` to the compiled loop's full inputarg width.
+                // The array elements were seeded as boxes by
+                // `initialize_virtualizable` at trace start and carried as
+                // loop inputargs; re-entry must re-supply them in
+                // `flatten_virtualizable_values` order (statics then arrays,
+                // each array ascending). Static boxes is empty: scalars stay
+                // in the state-field scalar resume mechanism — only
+                // `[int; virt]` arrays are virtualized via the vable.
+                let __static_boxes: ::std::vec::Vec<i64> = ::std::vec::Vec::new();
+                let __array_boxes: ::std::vec::Vec<::std::vec::Vec<i64>> = ::std::vec![
+                    #( self.#virt_array_field_idents.iter().map(|&__x| __x as i64).collect() ),*
+                ];
+                Some((__static_boxes, __array_boxes))
+            }
+        }
+    } else {
+        quote! {}
+    };
+
     quote! {
         /// Compiled loop metadata for state_fields mode: flattened array lengths at trace start.
         #[derive(Clone)]
@@ -636,11 +1085,12 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
         impl __JitMeta {
             /// RPython `assembler.py:218-231 get_liveness_info(insn, kind)`
             /// adapted for flat-state JIT: every state_field slot is
-            /// permanently live, so the canonical
-            /// `(live_i, live_r, live_f)` triple is just `0..total_slots`
-            /// in the int bank.  state-field JIT enforces `Type::Int` on
-            /// every slot at macro expansion (`codegen_state.rs:30-43`),
-            /// so `live_r` and `live_f` are empty.  Used by
+            /// permanently live, so the canonical `(live_i, live_r,
+            /// live_f)` triple is `live_i = 0..total_slots` in the int
+            /// bank (int scalars, fixed-array elements, virt-array
+            /// ptr/len) plus `live_r = 0..num_ref_scalars` for any
+            /// `ref(T)` scalars carried in the ref bank.  `live_f` is
+            /// always empty (no float state fields).  Used by
             /// `JitCodeBuilder::live` (`assembler.py:148+158`) to
             /// register the canonical entry once per process and emit
             /// a `live/<offset>` prefix on each per-opcode jitcode.
@@ -653,6 +1103,9 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                     #num_scalars,
                     __array_lens,
                     #num_virt_arrays,
+                    #num_ref_scalars,
+                    #ref_identity_base,
+                    #int_identity_base,
                 )
             }
 
@@ -857,6 +1310,8 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
             #(#sym_array_fields)*
             #(#sym_array_value_fields)*
             #(#sym_virt_array_fields)*
+            #(#sym_ref_scalar_fields)*
+            #(#sym_ref_scalar_value_fields)*
             loop_header_pc: usize,
             trace_started: bool,
         }
@@ -864,6 +1319,10 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
         impl majit_metainterp::JitCodeSym for __JitSym {
             fn total_slots(&self) -> usize {
                 #num_scalars #(#total_slots_array_parts)* + #num_virt_arrays * 2
+            }
+
+            fn int_identity_slots_end(&self) -> usize {
+                #int_identity_base + self.total_slots()
             }
 
             fn loop_header_pc(&self) -> usize {
@@ -898,6 +1357,8 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                 }
             }
 
+            #ref_field_accessor_overrides
+
             fn state_array_ref(&self, array_idx: usize, elem_idx: usize) -> Option<majit_ir::OpRef> {
                 match array_idx {
                     #(#state_array_ref_arms)*
@@ -926,25 +1387,12 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                 }
             }
 
-            fn state_varray_ptr(&self, array_idx: usize) -> Option<majit_ir::OpRef> {
-                match array_idx {
-                    #(#state_varray_ptr_arms)*
-                    _ => None,
-                }
-            }
-
-            fn state_varray_len(&self, array_idx: usize) -> Option<majit_ir::OpRef> {
-                match array_idx {
-                    #(#state_varray_len_arms)*
-                    _ => None,
-                }
-            }
-
             fn fail_args(&self) -> Option<Vec<majit_ir::OpRef>> {
                 let mut args = Vec::new();
                 #(#fail_scalar_parts)*
                 #(#fail_array_parts)*
                 #(#fail_virt_array_parts)*
+                #(#fail_ref_scalar_parts)*
                 Some(args)
             }
 
@@ -954,7 +1402,9 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                 frame: &mut majit_metainterp::MIFrame,
             ) {
                 // Slot layout matches `live_slots_for_state_field_jit`
-                // Scalars at `0..num_scalars`,
+                // Scalars at `int_identity_base..base+num_scalars`
+                // (the base keeps the dispatch JitCode's `pc` argument
+                // at i0 out of the seeded range),
                 // then flattened arrays, then virt-array (ptr, len)
                 // pairs.  Virt-array value mirrors are cached at
                 // `JitState::initialize_sym` time
@@ -962,11 +1412,12 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                 // user state's `<varr>.as_ptr()` / `<varr>.len()`,
                 // accurate iff the Vec does not reallocate during
                 // tracing.
-                let mut __slot: usize = 0;
+                let mut __slot: usize = #int_identity_base;
                 #(#populate_scalar_parts)*
                 #(#populate_array_parts)*
                 #(#populate_virt_array_parts)*
                 let _ = __slot;
+                #(#populate_ref_scalar_parts)*
             }
         }
 
@@ -990,14 +1441,18 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                 #(#extract_scalar_parts)*
                 #(#extract_array_parts)*
                 #(#extract_virt_array_parts)*
+                #(#extract_ref_scalar_parts)*
                 values
             }
+
+            #live_value_types_override
 
             fn create_sym(meta: &__JitMeta, header_pc: usize) -> __JitSym {
                 let mut __offset: usize = 0;
                 #(#create_sym_scalar_inits)*
                 #(#create_sym_array_inits)*
                 #(#create_sym_virt_array_inits)*
+                #(#create_sym_ref_scalar_inits)*
                 __JitSym {
                     #(#create_sym_scalar_names,)*
                     #(#create_sym_scalar_value_names,)*
@@ -1007,6 +1462,8 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                     #(#create_sym_virt_array_len_names,)*
                     #(#create_sym_virt_array_ptr_value_names,)*
                     #(#create_sym_virt_array_len_value_names,)*
+                    #(#create_sym_ref_scalar_names,)*
+                    #(#create_sym_ref_scalar_value_names,)*
                     loop_header_pc: header_pc,
                     trace_started: false,
                 }
@@ -1016,6 +1473,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                 #(#initialize_sym_scalar_parts)*
                 #(#initialize_sym_array_parts)*
                 #(#initialize_sym_virt_array_parts)*
+                #(#initialize_sym_ref_scalar_parts)*
             }
 
             fn is_compatible(&self, meta: &__JitMeta) -> bool {
@@ -1029,13 +1487,32 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                 #(#restore_virt_array_parts)*
             }
 
+            #restore_banked_override
+
+            fn recover_after_compiled_run(&mut self) {
+                #recover_body
+            }
+
+            fn state_field_layout(&self) -> majit_metainterp::blackhole::StateFieldLayout {
+                // Flat slot layout for blackhole resume: scalar count is
+                // static, each flattened fixed `[int]` array contributes its
+                // live length, and each virt array contributes two slots
+                // (ptr, len).  Ref scalars add a parallel 0-based ref-bank
+                // count.  Mirrors `extract_live` / the canonical
+                // `live_slots_for_state_field_jit` ordering.
+                #state_field_layout_ctor
+            }
+
             fn collect_jump_args(sym: &__JitSym) -> Vec<majit_ir::OpRef> {
                 let mut args = Vec::new();
                 #(#collect_scalar_parts)*
                 #(#collect_array_parts)*
                 #(#collect_virt_array_parts)*
+                #(#collect_ref_scalar_parts)*
                 args
             }
+
+            #collect_jump_args_with_boxes_method
 
             fn validate_close(sym: &__JitSym, meta: &__JitMeta) -> bool {
                 true #(#validate_array_checks)*
@@ -1062,9 +1539,8 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                 if frames.frames.is_empty() {
                     return None;
                 }
-                let __total_slots = sym.total_slots();
                 let __root = &mut frames.frames[0];
-                let __n = __total_slots.min(__root.int_regs.len());
+                let __n = sym.int_identity_slots_end().min(__root.int_regs.len());
                 let __saved_int_regs: Vec<Option<majit_ir::OpRef>> =
                     __root.int_regs[..__n].to_vec();
                 let __saved_int_values: Vec<Option<i64>> =
@@ -1088,6 +1564,8 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                 __root.int_values[..__n].copy_from_slice(&__saved_int_values);
                 Some(__snapshot)
             }
+
+            #build_vinfo_override
         }
     }
 }

@@ -7,19 +7,19 @@ impl<'c> Lowerer<'c> {
                 if let Some(()) = self.lower_local(local) {
                     return Some(());
                 }
-                if self.config.is_some() && !self.stmt_modifies_jit_state(stmt) {
-                    return Some(());
-                }
-                None
+                self.lower_stmt_fallback(stmt, "local")
             }
             Stmt::Expr(expr, _) => {
+                if matches!(expr, Expr::Continue(_)) {
+                    if let Some(label) = self.dispatch_loop_label.clone() {
+                        self.emit_jump(&label);
+                    }
+                    return Some(());
+                }
                 if let Some(()) = self.lower_expr_stmt(expr) {
                     return Some(());
                 }
-                if self.config.is_some() && !self.stmt_modifies_jit_state(stmt) {
-                    return Some(());
-                }
-                None
+                self.lower_stmt_fallback(stmt, "expr")
             }
             Stmt::Macro(stmt_macro) => {
                 // jtransform.py:1714-1723 handle_jit_marker__loop_header —
@@ -43,9 +43,9 @@ impl<'c> Lowerer<'c> {
                 // TODO: not present in RPython, so
                 // omitting `loop_header` there is consistent with
                 // upstream's single-JitCode model.
-                if !self.in_dispatch_arm_body {
-                    return None;
-                }
+                // Allow can_enter_jit! in the dispatch JitCode body
+                // (both at the dispatch level and inside arm sub-JitCodes).
+                // __jdindex is in scope in both contexts.
                 let path_str = stmt_macro
                     .mac
                     .path
@@ -54,7 +54,11 @@ impl<'c> Lowerer<'c> {
                     .map(|s| s.ident.to_string())
                     .collect::<Vec<_>>()
                     .join("::");
-                if path_str == "can_enter_jit" || path_str.ends_with("::can_enter_jit") {
+                if path_str == "can_enter_jit"
+                    || path_str.ends_with("::can_enter_jit")
+                    || path_str == "jit_loop_header"
+                    || path_str.ends_with("::jit_loop_header")
+                {
                     self.emit_op(
                         OpMeta::linear(OpKind::LoopHeader, vec![], vec![]),
                         quote! {
@@ -72,6 +76,52 @@ impl<'c> Lowerer<'c> {
             }
             Stmt::Item(_) => None,
         }
+    }
+
+    /// Last resort for a statement no lowering arm accepted, in the
+    /// state-field dispatch body (`config` present).
+    ///
+    /// A statement with no observable effect — it neither writes jit
+    /// state nor touches storage/heap/user locals — is dropped from the
+    /// jitcode (e.g. `pc += 1`: the dispatch loop manages the pc
+    /// register itself).
+    ///
+    /// Anything else (state-field writes, residual side effects,
+    /// bindings later statements may observe) must NOT be dropped: the
+    /// dispatch jitcode IS the recording-time execution, so a dropped
+    /// statement desynchronises the walker from the outer interpreter
+    /// (and the trace from the language semantics). Emit BC_ABORT at
+    /// this position instead — recording stops here if execution ever
+    /// reaches the statement, the executed-prefix queue stays consistent
+    /// for the outer replay (see `ObserverGuard`), and branches that
+    /// never reach it lower untouched.
+    fn lower_stmt_fallback(&mut self, stmt: &Stmt, what: &str) -> Option<()> {
+        if self.config.is_none() {
+            return None;
+        }
+        let inert = !self.stmt_modifies_jit_state(stmt) && !self.stmt_touches_storage(stmt);
+        if inert {
+            if std::env::var_os("MAJIT_MACRO_DEBUG").is_some() {
+                eprintln!(
+                    "[majit-macro] lower_stmt silent-skip ({what}): {}",
+                    quote!(#stmt)
+                );
+            }
+            return Some(());
+        }
+        if std::env::var_os("MAJIT_MACRO_DEBUG").is_some() {
+            eprintln!(
+                "[majit-macro] lower_stmt abort-emit ({what}): {}",
+                quote!(#stmt)
+            );
+        }
+        self.emit_op(
+            OpMeta::terminal(Vec::new()),
+            quote! {
+                __builder.abort();
+            },
+        );
+        Some(())
     }
 
     pub(super) fn lower_local(&mut self, local: &Local) -> Option<()> {
@@ -689,6 +739,14 @@ impl<'c> Lowerer<'c> {
     }
 
     fn lower_expr_stmt(&mut self, expr: &Expr) -> Option<()> {
+        // Green-pc inline dispatch: a `pc += N` / `pc = target` write inside
+        // an inlined arm body must land in pc's pinned register (reg0), not
+        // SSA-rebind the `pc` name (`lower_local_reassign`) nor be dropped as
+        // non-jit-state.  Runs first so it intercepts the pc-write before the
+        // generic reassign / drop path; a no-op when `!self.pc_pinned`.
+        if let Some(()) = self.lower_pc_pinned_write(expr) {
+            return Some(());
+        }
         // jtransform.py:596 rewrite_op_hint — `hint(x, promote=True)` in
         // statement context.  Routes both `x = promote(arg)` (plain local
         // re-assignment, no state-write to trigger
@@ -745,6 +803,11 @@ impl<'c> Lowerer<'c> {
         if let Some(()) = self.lower_record_known_result(expr) {
             return Some(());
         }
+        // Local variable reassignment: `pc = expr` or `stackok = expr`.
+        // Rebinds an already-known local to a freshly-lowered RHS value.
+        if let Some(()) = self.lower_local_reassign(expr) {
+            return Some(());
+        }
 
         if let Expr::If(expr_if) = expr {
             return self.lower_if_stmt(expr_if);
@@ -797,15 +860,18 @@ impl<'c> Lowerer<'c> {
             arg_bindings.push(binding);
         }
         let func = &call.func;
+        // jtransform.py:467-471 / 480-482: `-live-` follows the call, it does
+        // not precede it.  Decide here whether the explicit arm below needs a
+        // trailing marker; the inferred arm emits its own runtime-conditional
+        // one, so it reports `false` and is excluded.
+        let post_live_after_call = match &policy {
+            CallPolicySpec::Explicit(kind) => explicit_call_emits_post_live(*kind),
+            CallPolicySpec::Infer => false,
+        };
         match policy {
             CallPolicySpec::Explicit(kind) => match kind {
                 crate::jit_interp::CallPolicyKind::ResidualVoid
                 | crate::jit_interp::CallPolicyKind::ResidualVoidCannotRaise => {
-                    // `call.py:301-303 getcalldescr`: `EF_CAN_RAISE` for the
-                    // analyzer-absent default, `EF_CANNOT_RAISE` when
-                    // `_canraise(op) == False` on the non-elidable `else`
-                    // branch.  Both share the residual_call dispatch byte
-                    // family; only the descr's `EffectInfo` differs.
                     let cannot_raise = matches!(
                         kind,
                         crate::jit_interp::CallPolicyKind::ResidualVoidCannotRaise,
@@ -1416,7 +1482,26 @@ impl<'c> Lowerer<'c> {
                         }
                     },
                 );
+                // jtransform.py:467-471 — trailing `-live-` gated on the
+                // runtime policy byte's can-raise codes (void residual /
+                // may-force / release-gil); LOOP_INVARIANT and the
+                // CANNOT_RAISE void surface skip it.
+                self.emit_op(
+                    OpMeta::live_marker_if(inferred_policy_live_condition(
+                        func,
+                        &[VOID_DONT_LOOK_INSIDE, VOID_MAY_FORCE, VOID_RELEASE_GIL],
+                    )),
+                    quote! { let _ = __builder.live_placeholder(); },
+                );
             }
+        }
+        // jtransform.py:467-471 / 480-482 — trailing `-live-` for the explicit
+        // residual / elidable / may-force / release-gil arms (computed above).
+        if post_live_after_call {
+            self.emit_op(
+                OpMeta::live_marker(),
+                quote! { let _ = __builder.live_placeholder(); },
+            );
         }
         Some(())
     }
@@ -1434,7 +1519,6 @@ impl<'c> Lowerer<'c> {
                 let arg = unwrap_ref_expr(call.args.first()?);
                 let binding = self.lower_value_expr(arg)?;
                 let reg = binding.reg;
-                // residual_call_void_args takes int-banked args.
                 self.emit_op(
                     OpMeta::linear(OpKind::Call, vec![Register::int(reg)], vec![]),
                     quote! {
@@ -1444,6 +1528,12 @@ impl<'c> Lowerer<'c> {
                             &[majit_metainterp::JitCallArg::int(#reg)],
                         );
                     },
+                );
+                // jtransform.py:467-471 — the void shim is a may-raise
+                // residual call, so `-live-` follows it.
+                self.emit_op(
+                    OpMeta::live_marker(),
+                    quote! { let _ = __builder.live_placeholder(); },
                 );
                 return Some(());
             }

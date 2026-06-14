@@ -289,6 +289,37 @@ impl MIFrame {
         (base, field_idx, dst)
     }
 
+    /// Decode a `new/d>r` (or `new_with_vtable/d>r`) operand pair,
+    /// returning `(descr_pool_idx, dest_reg)`. Canonical layout: 2B
+    /// descr_pool_idx + 1B dest_reg (`blackhole.py:1301-1310`).
+    pub fn read_new(&mut self) -> (usize, usize) {
+        let descr_idx = self.next_u16() as usize;
+        let dst = self.next_u8() as usize;
+        (descr_idx, dst)
+    }
+
+    /// Decode a `setfield_gc_<kind>/rXd` operand triple, returning
+    /// `(struct_reg, value_reg, descr_pool_idx)`. Canonical layout: 1B
+    /// struct_reg + 1B value_reg + 2B descr_pool_idx
+    /// (`blackhole.py:1471 bhimpl_setfield_gc_i`).
+    pub fn read_setfield_gc(&mut self) -> (usize, usize, usize) {
+        let struct_reg = self.next_u8() as usize;
+        let value_reg = self.next_u8() as usize;
+        let descr_idx = self.next_u16() as usize;
+        (struct_reg, value_reg, descr_idx)
+    }
+
+    /// Decode a `getfield_gc_<kind>/rd>X` operand triple, returning
+    /// `(struct_reg, descr_pool_idx, dest_reg)`. Canonical layout: 1B
+    /// struct_reg + 2B descr_pool_idx + 1B dest_reg
+    /// (`blackhole.py:1432 bhimpl_getfield_gc_i`).
+    pub fn read_getfield_gc(&mut self) -> (usize, usize, usize) {
+        let struct_reg = self.next_u8() as usize;
+        let descr_idx = self.next_u16() as usize;
+        let dst = self.next_u8() as usize;
+        (struct_reg, descr_idx, dst)
+    }
+
     /// Decode a `setfield_vable_<kind>/rXd` operand triple, returning
     /// `(vable_reg, field_idx, value_reg)`. Canonical layout: 1B
     /// vable_reg + 1B value_reg + 2B descr_pool_idx.

@@ -30,16 +30,17 @@ mod reexports {
     pub(super) use super::dispatch::{
         collect_arm_caller_locals, collect_pat_bound_idents, dispatch_arm_inline_call_tokens,
         emit_promote_greens, find_dispatch_loop_body, green_schema, is_jit_merge_point_macro,
-        lower_dispatch_chain, lower_pre_dispatch_stmts, red_schema, resolve_greens, resolve_reds,
+        lower_dispatch_chain, lower_pre_dispatch_stmts, pc_is_green, red_schema, resolve_greens,
+        resolve_reds,
     };
     pub(super) use super::helpers::{
-        binding_kind_for_inline_policy, block_has_loop_control, expr_has_loop_control,
-        extract_block_tail_int, extract_bool_branch_values, extract_branch_int,
-        extract_pat_literals, extract_pat_value_tokens, extract_stmts, inline_builder_path,
-        inline_call_tokens, inline_float_arg_tokens, inline_int_arg_tokens, inline_prebuild_path,
-        inline_ref_arg_tokens, int_arg_regs, is_supported_float_type, is_supported_int_cast,
-        is_supported_ref_type, opcode_for_assign_binop, opcode_for_binop, stmt_has_loop_control,
-        typed_call_arg_tokens,
+        binding_kind_for_inline_policy, binop_i_emit_tokens, block_has_loop_control,
+        expr_has_loop_control, extract_block_tail_int, extract_bool_branch_values,
+        extract_branch_int, extract_pat_literals, extract_pat_value_tokens, extract_stmts,
+        inline_builder_path, inline_call_tokens, inline_float_arg_tokens, inline_int_arg_tokens,
+        inline_prebuild_path, inline_ref_arg_tokens, int_arg_regs, is_supported_float_type,
+        is_supported_int_cast, is_supported_ref_type, opcode_for_assign_binop, opcode_for_binop,
+        stmt_has_loop_control, typed_call_arg_tokens,
     };
     pub(super) use super::liveness::{
         annotate_live_markers_with_liveness, compute_per_marker_liveness, get_liveness_info,
@@ -136,6 +137,10 @@ pub struct LowererConfig {
     /// State field virtualizable arrays: field_name → virt_array_index.
     /// These emit GETARRAYITEM_RAW_I/SETARRAYITEM_RAW instead of element-level tracking.
     pub(super) state_virt_arrays: HashMap<String, usize>,
+    /// State field ref scalars: field_name → ref_scalar_index (0-based, its own
+    /// space separate from `state_scalars`). These lower to
+    /// load_state_field_ref/store_state_field_ref in the ref register bank.
+    pub(super) state_ref_scalars: HashMap<String, usize>,
     /// Green-variable expressions for `jit_merge_point` / `promote_greens`.
     ///
     /// Source: `JitInterpConfig.greens` (mod.rs:65) — the `greens = [...]` list
@@ -162,6 +167,28 @@ pub struct LowererConfig {
     /// (the env parameter — convention fixed at the dispatch portal-input
     /// installer below). Source: `JitInterpConfig.env_type` Ident.
     pub(super) env_type_name: String,
+}
+
+impl LowererConfig {
+    /// First ref-bank register available for ref-scalar identity slots.
+    /// `MIFrame::setup_call` packs the dispatch JitCode's ref args densely
+    /// from r0 (`program` at r0, the virtualizable identity at r1 when
+    /// present), and the blackhole re-executes ops reading those argument
+    /// registers, so identity slots start past them.
+    pub(super) fn ref_identity_base(&self) -> u16 {
+        1 + u16::from(self.vable_var.is_some())
+    }
+
+    /// First int-bank register available for scalar/array identity
+    /// slots — the int-bank mirror of `ref_identity_base`. The dispatch
+    /// JitCode's only int argument is `pc` at i0; an identity slot
+    /// aliasing it lets the guard-time canonical materialization
+    /// overwrite the pc register before the resume stream is encoded,
+    /// so the blackhole's re-executed jit_merge_point reads a state
+    /// scalar where it expects the green pc.
+    pub(super) fn int_identity_base(&self) -> u16 {
+        1
+    }
 }
 
 pub(super) const MAX_HELPER_CALL_ARITY: usize = 16;
@@ -381,8 +408,28 @@ pub(super) fn call_policy_effect_slot(
         | K::ReleaseGilFloatWrapped
         | K::InlineInt
         | K::InlineRef
-        | K::InlineFloat => None,
+        | K::InlineFloat
+        | K::InlinePipelineInt
+        | K::InlinePipelineRef
+        | K::InlinePipelineFloat => None,
     }
+}
+
+/// Whether an explicit residual/elidable lowering arm for `kind` must be
+/// followed by a `-live-` marker.  `jtransform.py:467-471` appends `-live-`
+/// after a residual `call_*` only when `calldescr_canraise`;
+/// `jtransform.py:480-482` appends it after every `inline_call_*`.  The
+/// inline arms emit their own trailing marker (`inline_call_tokens`'
+/// `post_live`), so inline kinds return `false`; otherwise the calldescr's
+/// can-raise classification decides.  MayForce / ReleaseGil have no
+/// conditional-call slot but force / may raise, so they keep the marker.
+pub(super) fn explicit_call_emits_post_live(kind: crate::jit_interp::CallPolicyKind) -> bool {
+    if binding_kind_for_inline_policy(kind).is_some() {
+        return false;
+    }
+    call_policy_effect_slot(kind)
+        .map(CondCallEffectSlot::can_raise)
+        .unwrap_or(true)
 }
 
 pub(super) fn call_policy_result_kind(
@@ -417,7 +464,8 @@ pub(super) fn call_policy_result_kind(
         | K::ElidableIntCannotRaiseWrapped
         | K::ElidableIntOrMemerror
         | K::ElidableIntOrMemerrorWrapped
-        | K::InlineInt => Some(CallResultKind::Int),
+        | K::InlineInt
+        | K::InlinePipelineInt => Some(CallResultKind::Int),
 
         K::ResidualRefWrapped
         | K::ResidualRefCannotRaiseWrapped
@@ -426,7 +474,8 @@ pub(super) fn call_policy_result_kind(
         | K::ElidableRefWrapped
         | K::ElidableRefCannotRaiseWrapped
         | K::ElidableRefOrMemerrorWrapped
-        | K::InlineRef => Some(CallResultKind::Ref),
+        | K::InlineRef
+        | K::InlinePipelineRef => Some(CallResultKind::Ref),
 
         K::ResidualFloatWrapped
         | K::ResidualFloatCannotRaiseWrapped
@@ -436,7 +485,8 @@ pub(super) fn call_policy_result_kind(
         | K::ElidableFloatWrapped
         | K::ElidableFloatCannotRaiseWrapped
         | K::ElidableFloatOrMemerrorWrapped
-        | K::InlineFloat => Some(CallResultKind::Float),
+        | K::InlineFloat
+        | K::InlinePipelineFloat => Some(CallResultKind::Float),
     }
 }
 
@@ -710,7 +760,7 @@ impl LowererConfig {
                 (canonical_path_segments(&entry.path), spec)
             })
             .collect();
-        let (vable_var, vable_input_ref_reg, vable_fields, vable_arrays) =
+        let (mut vable_var, mut vable_input_ref_reg, vable_fields, mut vable_arrays) =
             if let Some(decl) = vable_decl {
                 let var = Some(decl.var_name.to_string());
                 let fields = decl
@@ -734,37 +784,66 @@ impl LowererConfig {
             } else {
                 (None, None, HashMap::new(), HashMap::new())
             };
-        let (state_scalars, state_arrays, state_virt_arrays) = if let Some(sf) = state_fields_cfg {
-            use crate::jit_interp::StateFieldKind;
-            let mut scalars = HashMap::new();
-            let mut arrays = HashMap::new();
-            let mut virt_arrays = HashMap::new();
-            let mut scalar_idx = 0usize;
-            let mut array_idx = 0usize;
-            let mut virt_array_idx = 0usize;
-            for f in &sf.fields {
-                match &f.kind {
-                    StateFieldKind::Scalar { .. } => {
-                        scalars.insert(f.name.to_string(), scalar_idx);
-                        scalar_idx += 1;
+        let (state_scalars, state_arrays, state_virt_arrays, state_ref_scalars) =
+            if let Some(sf) = state_fields_cfg {
+                use crate::jit_interp::StateFieldKind;
+                let mut scalars = HashMap::new();
+                let mut arrays = HashMap::new();
+                let mut virt_arrays = HashMap::new();
+                let mut ref_scalars = HashMap::new();
+                let mut scalar_idx = 0usize;
+                let mut array_idx = 0usize;
+                let mut virt_array_idx = 0usize;
+                let mut ref_scalar_idx = 0usize;
+                for f in &sf.fields {
+                    match &f.kind {
+                        StateFieldKind::Scalar { .. } => {
+                            scalars.insert(f.name.to_string(), scalar_idx);
+                            scalar_idx += 1;
+                        }
+                        StateFieldKind::Array(_) => {
+                            arrays.insert(f.name.to_string(), array_idx);
+                            array_idx += 1;
+                        }
+                        StateFieldKind::VirtArray(_) => {
+                            virt_arrays.insert(f.name.to_string(), virt_array_idx);
+                            virt_array_idx += 1;
+                        }
+                        // Opaque fields are not registered in any index map —
+                        // the lowering layer must not see them as state slots.
+                        StateFieldKind::Opaque(_) => {}
+                        // ref(T) scalars get a separate 0-based index space;
+                        // they lower to the ref register bank.
+                        StateFieldKind::Ref(_) => {
+                            ref_scalars.insert(f.name.to_string(), ref_scalar_idx);
+                            ref_scalar_idx += 1;
+                        }
                     }
-                    StateFieldKind::Array(_) => {
-                        arrays.insert(f.name.to_string(), array_idx);
-                        array_idx += 1;
-                    }
-                    StateFieldKind::VirtArray(_) => {
-                        virt_arrays.insert(f.name.to_string(), virt_array_idx);
-                        virt_array_idx += 1;
-                    }
-                    // Opaque fields are not registered in any index map —
-                    // the lowering layer must not see them as state slots.
-                    StateFieldKind::Opaque(_) => {}
                 }
+                (scalars, arrays, virt_arrays, ref_scalars)
+            } else {
+                (
+                    HashMap::new(),
+                    HashMap::new(),
+                    HashMap::new(),
+                    HashMap::new(),
+                )
+            };
+        // State-field `[int; virt]` arrays converge onto the standard
+        // virtualizable path: the state binding is the vable identity var and
+        // each virt array becomes a `vable_arrays` entry under its virt index.
+        // The dispatch lowerer overrides the identity ref register to 1 (the
+        // argbox order is `program`(ref reg 0), then the pushed vable identity
+        // → ref reg 1; see `with_vable_input_ref_reg(1)` in codegen_trace).
+        // `state_virt_arrays` stays populated; the raw-varray lowering branch
+        // is retired in a later task.
+        if vable_var.is_none() && !state_virt_arrays.is_empty() {
+            vable_var = Some("state".to_string());
+            vable_input_ref_reg = Some(1);
+            for (name, &idx) in &state_virt_arrays {
+                vable_arrays.insert(name.clone(), (idx, ValueKind::Int));
             }
-            (scalars, arrays, virt_arrays)
-        } else {
-            (HashMap::new(), HashMap::new(), HashMap::new())
-        };
+        }
         Self {
             io_shims,
             calls,
@@ -776,6 +855,7 @@ impl LowererConfig {
             state_scalars,
             state_arrays,
             state_virt_arrays,
+            state_ref_scalars,
             greens: greens.to_vec(),
             green_type_tags: green_type_tags.to_vec(),
             reds: reds.to_vec(),
@@ -980,6 +1060,12 @@ pub(super) enum OpKind {
     /// `vable_*` family (getfield/setfield/getarrayitem/setarrayitem/
     /// arraylen/force).
     Vable,
+    /// `new` / `new_with_vtable` — allocate a JIT struct.  `writes`
+    /// carries the result ref reg; `reads` is empty.
+    New,
+    /// `setfield_gc_{i,r,f}` — store a field through a struct ref.
+    /// `reads` carries `[struct_reg, value_reg]`; no writes.
+    SetfieldGc,
     /// `load_state_*` / `store_state_*` family.
     StateField,
     /// `int_guard_value` / `float_guard_value` / `ref_guard_value`.
@@ -2216,6 +2302,31 @@ mod tests {
         let statements = &lowerer.statements;
         let body = quote! { #(#statements)* }.to_string();
         assert!(body.contains("add_sub_jitcode"));
+        assert!(body.contains("__sub_return_kind"));
+    }
+
+    #[test]
+    fn inline_pipeline_int_policy_resolves_callee_by_name() {
+        let call = parse_call("stack_pop()");
+        let mut lowerer = Lowerer::new_with_call_policies(
+            None,
+            vec![(
+                vec!["stack_pop".to_string()],
+                CallPolicySpec::Explicit(crate::jit_interp::CallPolicyKind::InlinePipelineInt),
+            )],
+            InferenceFailureMode::Panic,
+        );
+        let binding = lowerer
+            .lower_call_value(&call)
+            .expect("inline-pipeline int call should lower");
+        assert!(matches!(binding.kind, BindingKind::Int));
+        let statements = &lowerer.statements;
+        let body = quote! { #(#statements)* }.to_string();
+        // The callee is resolved by name through the host convention symbol,
+        // then attached as a sub-jitcode by Arc.
+        assert!(body.contains("__majit_pipeline_jitcode"));
+        assert!(body.contains("stack_pop"));
+        assert!(body.contains("add_sub_jitcode_arc"));
         assert!(body.contains("__sub_return_kind"));
     }
 }

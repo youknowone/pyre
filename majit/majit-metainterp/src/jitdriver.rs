@@ -1486,7 +1486,17 @@ impl<S: JitState> JitDriver<S> {
                             );
                         }
                         if let Some(sym) = self.sym.as_ref() {
-                            let finish_args = S::collect_jump_args(sym);
+                            // pyjitpl.py:2982-2989: carry virtualizable_boxes[:-1]
+                            // into the bridge JUMP too (owned clone releases the
+                            // trace-ctx borrow before close_bridge).
+                            let vable_boxes = self
+                                .meta
+                                .trace_ctx()
+                                .and_then(|ctx| ctx.collect_virtualizable_boxes());
+                            let finish_args = match vable_boxes {
+                                Some(ref boxes) => S::collect_jump_args_with_boxes(sym, boxes),
+                                None => S::collect_jump_args(sym),
+                            };
                             let result = self.meta.close_bridge(
                                 target_key,
                                 bridge_trace_id,
@@ -1540,7 +1550,19 @@ impl<S: JitState> JitDriver<S> {
                     return;
                 };
                 if S::validate_close(sym, &trace_meta) {
-                    let jump_args = S::collect_jump_args(sym);
+                    // pyjitpl.py:2982-2989 reached_loop_header:
+                    // `live_arg_boxes += self.virtualizable_boxes;
+                    // live_arg_boxes.pop()`. Extract the live shadow as an
+                    // owned Vec so the trace-ctx borrow is released before the
+                    // `self.meta.compile_loop` mutable borrow below.
+                    let vable_boxes = self
+                        .meta
+                        .trace_ctx()
+                        .and_then(|ctx| ctx.collect_virtualizable_boxes());
+                    let jump_args = match vable_boxes {
+                        Some(ref boxes) => S::collect_jump_args_with_boxes(sym, boxes),
+                        None => S::collect_jump_args(sym),
+                    };
                     // pyjitpl.py:2993-3036 parity: compile_loop borrows the
                     // frontend meta the same way `self.history` is a shared
                     // mutable object on the RPython MetaInterp — the caller
@@ -2063,7 +2085,11 @@ impl<S: JitState> JitDriver<S> {
                 return None;
             }
             let live_values = state.extract_live_values(&compiled_meta);
-            if !Self::live_values_match_descriptor(descriptor.as_ref(), &live_values) {
+            if !Self::live_values_match_descriptor(
+                descriptor.as_ref(),
+                &live_values,
+                state.state_field_layout().total_live_values(),
+            ) {
                 return None;
             }
             let Some(live_values) = self.extend_compiled_live_values(
@@ -2087,7 +2113,9 @@ impl<S: JitState> JitDriver<S> {
 
             if result.is_finish {
                 let run_meta = result.meta.clone();
-                state.restore_values(&run_meta, &result.typed_values);
+                if !result.typed_values.is_empty() {
+                    state.restore_values(&run_meta, &result.typed_values);
+                }
                 let run_descriptor = self.driver_descriptor_for(state, &run_meta);
                 self.sync_after(state, &run_meta, run_descriptor.as_ref());
                 return Some(target_pc);
@@ -2096,7 +2124,9 @@ impl<S: JitState> JitDriver<S> {
             // Normal loop back-edge JUMP, not a guard failure.
             if result.fail_index == u32::MAX {
                 let run_meta = result.meta.clone();
-                state.restore_values(&run_meta, &result.typed_values);
+                if !result.typed_values.is_empty() {
+                    state.restore_values(&run_meta, &result.typed_values);
+                }
                 let run_descriptor = self.driver_descriptor_for(state, &run_meta);
                 self.sync_after(state, &run_meta, run_descriptor.as_ref());
                 return Some(target_pc);
@@ -2156,6 +2186,27 @@ impl<S: JitState> JitDriver<S> {
                         green_key, trace_id, fail_index, guard_resume_pc, bridge_ok
                     );
                 }
+            }
+
+            // compile.py:701-716 handle_fail. PyPy: `must_compile() and not
+            // stack_almost_full()` → `_trace_and_compile_from_bridge`, else
+            // `resume_in_blackhole`; the two are mutually exclusive and
+            // neither returns. majit adapts by returning the interpreter
+            // resume pc. The bridge path (started above) keeps the crude loop
+            // teardown (status quo); only the blackhole path below is the
+            // forward-resume this epic introduces.
+            if should_bridge {
+                state.recover_after_compiled_run();
+                self.meta.invalidate_loop(green_key);
+                self.meta.remove_compiled_loop(green_key);
+                self.meta.warm_state_mut().abort_tracing(green_key, true);
+                if crate::majit_log_enabled() {
+                    eprintln!(
+                        "[jit-run] guard failure (bridge) fail_index={}, resume_pc={}, target_pc={}, key={}",
+                        fail_index, guard_resume_pc, target_pc, green_key
+                    );
+                }
+                return Some(guard_resume_pc);
             }
 
             // compile.py:711 resume_in_blackhole
@@ -2262,6 +2313,11 @@ impl<S: JitState> JitDriver<S> {
                     self.meta_interp().staticdata.op_rvmprof_code,
                 );
                 let all_liveness = self.meta_interp().staticdata.liveness_info.as_slice();
+                // Publish the live `&state` identity so consume_vable_info can
+                // recover the folded-constant virtualizable pointer (absent
+                // from the deadframe for the state-field JIT). Re-set before
+                // every resume so the value is always fresh for this thread.
+                crate::resume::set_live_vable_ptr(self.meta_interp().vable_ptr as i64);
                 let bh = crate::resume::blackhole_from_resumedata(
                     &mut bh_builder,
                     &resolve_jitcode,
@@ -2276,40 +2332,111 @@ impl<S: JitState> JitDriver<S> {
                         &self.meta_interp().staticdata.virtualref_info
                             as &dyn crate::resume::VRefInfo,
                     ),
-                    None, // vinfo
+                    // Pass the registered vinfo so the vable section of the
+                    // resume stream is consumed (avoids a stream desync when
+                    // the trace carries virtualizable array boxes).
+                    self.meta
+                        .virtualizable_info()
+                        .map(|a| a.as_ref() as &dyn crate::resume::VirtualizableInfo),
                     None, // ginfo
                     allocator,
                 );
-                if let Some((bh, _vable_ptr)) = bh {
+                if let Some((mut bh, _vable_ptr)) = bh {
+                    // Thread the state-field register layout so the
+                    // `state_field` handlers map a logical scalar/array index
+                    // to the flat register slot the resume reader seeded.
+                    bh.state_field_layout = state.state_field_layout();
                     let exc = crate::blackhole::BlackholeInterpreter::prepare_resume_from_failure(
                         guard_exc,
                     );
-                    let jit_exc = crate::blackhole::run_forever_with_portal(
-                        &mut bh_builder,
-                        bh,
-                        exc,
-                        self.portal_runner.as_ref().map(|r| {
-                            r.as_ref()
-                                as &dyn Fn(
-                                    &crate::jitexc::JitException,
-                                ) -> Result<
-                                    (crate::blackhole::BhReturnType, i64),
-                                    crate::jitexc::JitException,
-                                >
-                        }),
-                    );
-                    // compile.py:716 assert 0, "unreachable"
+                    // Drive the single resume frame directly (not
+                    // `run_forever_with_portal`, which consumes `bh`) so the
+                    // red register file stays readable when the frame raises
+                    // ContinueRunningNormally at the next merge point. PyPy
+                    // re-enters the portal with the CRN reds
+                    // (warmspot.py:970-983); majit's interpreter is a live
+                    // `state` struct, so the structural equivalent is
+                    // restoring the full red register file — the CRN reds are
+                    // only the declared subset, so restore from `registers_i`
+                    // (resume.py:1028-1038 seeded it in slot order).
+                    let outcome = bh.resume_mainloop(exc);
                     if crate::majit_log_enabled() {
-                        eprintln!(
-                            "[bh] back_edge_internal: run_forever completed with {:?}",
-                            jit_exc
-                        );
+                        eprintln!("[bh] back_edge_internal: resume_mainloop → {:?}", outcome);
                     }
-                    return Some(target_pc);
+                    let resume_pc = match outcome {
+                        // Next merge point reached (loop back-edge): flush the
+                        // register file into the live state and resume the
+                        // interpreter at the merge point's green pc.
+                        Err(crate::jitexc::JitException::ContinueRunningNormally {
+                            ref green_int,
+                            ..
+                        }) => {
+                            // PyPy re-enters the portal with the CRN greens
+                            // (warmspot.py:970-983), so the interpreter
+                            // resumes at the pc the re-executed
+                            // jit_merge_point reported — every `greens`
+                            // declaration puts `pc` first (jit_merge_point
+                            // bucket order), so it is `green_int[0]`. The
+                            // blackhole may have crossed a non-back-edge
+                            // path (e.g. a branch fall-through that leaves
+                            // the loop), in which case the green pc differs
+                            // from the loop-header `target_pc`.
+                            let green_pc = green_int.first().map(|&pc| pc as usize);
+                            // `restore_banked` consumes both banks densely
+                            // (int slot j at index j, ref scalar j at index
+                            // j); the register file holds them at
+                            // `scalar_slot(j) = int_scalar_base + j` /
+                            // `ref_scalar_slot(j) = ref_scalar_base + j`, so
+                            // slice off the dispatch JitCode's argument
+                            // prefix in each bank.
+                            let layout = state.state_field_layout();
+                            let int_base = layout.int_scalar_base.min(bh.registers_i.len());
+                            let ref_base = layout.ref_scalar_base.min(bh.registers_r.len());
+                            state.restore_banked(
+                                &compiled_meta,
+                                &bh.registers_i[int_base..],
+                                &bh.registers_r[ref_base..],
+                            );
+                            Some(green_pc.unwrap_or(target_pc))
+                        }
+                        // The interpreted frame ran to completion inside the
+                        // blackhole: flush, then force the generated mainloop's
+                        // `while pc < len` guard to fail so it exits and
+                        // returns the value computed from the flushed state.
+                        Err(crate::jitexc::JitException::DoneWithThisFrameVoid)
+                        | Err(crate::jitexc::JitException::DoneWithThisFrameInt(_))
+                        | Err(crate::jitexc::JitException::DoneWithThisFrameRef(_))
+                        | Err(crate::jitexc::JitException::DoneWithThisFrameFloat(_)) => {
+                            let layout = state.state_field_layout();
+                            let int_base = layout.int_scalar_base.min(bh.registers_i.len());
+                            let ref_base = layout.ref_scalar_base.min(bh.registers_r.len());
+                            state.restore_banked(
+                                &compiled_meta,
+                                &bh.registers_i[int_base..],
+                                &bh.registers_r[ref_base..],
+                            );
+                            Some(usize::MAX)
+                        }
+                        // Exception exit / multi-frame continuation / anything
+                        // else: defer to the crude recovery below.
+                        _ => None,
+                    };
+                    bh_builder.release_interp(bh);
+                    if let Some(pc) = resume_pc {
+                        return Some(pc);
+                    }
                 }
             }
 
-            return Some(target_pc);
+            // resume_in_blackhole could not build a frame, or returned an
+            // outcome the forward-resume does not yet handle (exception exit /
+            // multi-frame chain): fall back to crude state recovery and resume
+            // the interpreter at the guard pc.
+            state.recover_after_compiled_run();
+            self.meta.invalidate_loop(green_key);
+            self.meta.remove_compiled_loop(green_key);
+            self.meta.warm_state_mut().abort_tracing(green_key, true);
+            return Some(guard_resume_pc);
         }
 
         self.maybe_start_tracing(green_key, structured_green_key, target_pc, state, env);
@@ -2366,7 +2493,11 @@ impl<S: JitState> JitDriver<S> {
             return;
         }
         let live_values = state.extract_live_values(&meta);
-        if !Self::live_values_match_descriptor(descriptor.as_ref(), &live_values) {
+        if !Self::live_values_match_descriptor(
+            descriptor.as_ref(),
+            &live_values,
+            state.state_field_layout().total_live_values(),
+        ) {
             return;
         }
 
@@ -2406,7 +2537,11 @@ impl<S: JitState> JitDriver<S> {
             return;
         }
         let live_values = state.extract_live_values(&meta);
-        if !Self::live_values_match_descriptor(descriptor.as_ref(), &live_values) {
+        if !Self::live_values_match_descriptor(
+            descriptor.as_ref(),
+            &live_values,
+            state.state_field_layout().total_live_values(),
+        ) {
             return;
         }
 
@@ -2444,7 +2579,11 @@ impl<S: JitState> JitDriver<S> {
             return;
         }
         let live_values = state.extract_live_values(&meta);
-        if !Self::live_values_match_descriptor(descriptor.as_ref(), &live_values) {
+        if !Self::live_values_match_descriptor(
+            descriptor.as_ref(),
+            &live_values,
+            state.state_field_layout().total_live_values(),
+        ) {
             return;
         }
 
@@ -2478,15 +2617,37 @@ impl<S: JitState> JitDriver<S> {
     fn live_values_match_descriptor(
         descriptor: Option<&JitDriverStaticData>,
         live_values: &[Value],
+        state_field_live_count: usize,
     ) -> bool {
         let Some(descriptor) = descriptor else {
             return true;
         };
-        let reds = descriptor.reds();
+        // State-field JIT whose schema carries a vable_var red: the flat
+        // `StateFieldLayout` live values ARE the runtime red shape (the values
+        // the compiled entry is invoked with via `extract_live_values` — int
+        // slots flow to `registers_i`, ref-bank scalars to `registers_r`).
+        // The logical descriptor reds are the BC_JIT_MERGE_POINT payload
+        // schema, in which the vable_var array appears as a single box
+        // (red_schema's `vable_var` candidate); extract_live flat-expands it
+        // into scalar + (ptr, len) i64 slots, so the flat live count cannot
+        // equal the logical red count.  Validate the flat live count against
+        // the declared flat layout instead — the logical-reds shape check
+        // below is a category mismatch for the flat model.  This precedes the
+        // reds check so state-field drivers that declare no logical reds are
+        // still validated (not blanket-passed).  (`state_field_live_count == 0`
+        // for non-state-field drivers such as pyre, which keep the strict reds
+        // check.)
+        if state_field_live_count != 0 {
+            return live_values.len() == state_field_live_count;
+        }
         // warmstate.py:387 execute_assembler parity: the runtime entrypoint
-        // is called with the JitDriver reds only. If the state reports any
-        // other live-value shape while a descriptor is active, refuse the
+        // is called with the JitDriver reds only.  An empty redlist therefore
+        // requires zero live values (jtransform.py:1697-1703 validates the
+        // redlist strictly); the shape check below covers that case rather
+        // than blanket-accepting any live-value shape.  If the state reports
+        // any other live-value shape while a descriptor is active, refuse the
         // run instead of silently accepting a pyre-specific prefix match.
+        let reds = descriptor.reds();
         if live_values.len() != reds.len() {
             return false;
         }
@@ -2813,7 +2974,11 @@ impl<S: JitState> JitDriver<S> {
                 &format!("run_bridge live_values: {}", vals.join(", ")),
             );
         }
-        if !Self::live_values_match_descriptor(descriptor.as_ref(), &live_values) {
+        if !Self::live_values_match_descriptor(
+            descriptor.as_ref(),
+            &live_values,
+            state.state_field_layout().total_live_values(),
+        ) {
             return DetailedDriverRunOutcome::Abort {
                 restored: false,
                 via_blackhole: false,
@@ -2933,7 +3098,11 @@ impl<S: JitState> JitDriver<S> {
                 &format!("BRIDGE live_values: {}", vals.join(", ")),
             );
         }
-        if !Self::live_values_match_descriptor(descriptor.as_ref(), &live_values) {
+        if !Self::live_values_match_descriptor(
+            descriptor.as_ref(),
+            &live_values,
+            state.state_field_layout().total_live_values(),
+        ) {
             if crate::debug::have_debug_prints() {
                 crate::debug::log_one(
                     "jit-abort",
@@ -3828,7 +3997,11 @@ impl<S: JitState> JitDriver<S> {
             return None;
         }
         let live_values = state.extract_live_values(&meta);
-        if !Self::live_values_match_descriptor(descriptor.as_ref(), &live_values) {
+        if !Self::live_values_match_descriptor(
+            descriptor.as_ref(),
+            &live_values,
+            state.state_field_layout().total_live_values(),
+        ) {
             return None;
         }
         let live_values = self.extend_compiled_live_values(
@@ -3877,7 +4050,11 @@ impl<S: JitState> JitDriver<S> {
                         let nd = self.driver_descriptor_for(state, &meta);
                         if self.sync_before(state, &meta, nd.as_ref()) {
                             let nl = state.extract_live_values(&meta);
-                            if Self::live_values_match_descriptor(nd.as_ref(), &nl) {
+                            if Self::live_values_match_descriptor(
+                                nd.as_ref(),
+                                &nl,
+                                state.state_field_layout().total_live_values(),
+                            ) {
                                 if let Some(v) = self.extend_compiled_live_values(
                                     key_hash,
                                     state,
@@ -4039,6 +4216,11 @@ impl<S: JitState> JitDriver<S> {
                     self.meta_interp().staticdata.op_rvmprof_code,
                 );
                 let all_liveness = self.meta_interp().staticdata.liveness_info.as_slice();
+                // Publish the live `&state` identity so consume_vable_info can
+                // recover the folded-constant virtualizable pointer (absent
+                // from the deadframe for the state-field JIT). Re-set before
+                // every resume so the value is always fresh for this thread.
+                crate::resume::set_live_vable_ptr(self.meta_interp().vable_ptr as i64);
                 let bh = crate::resume::blackhole_from_resumedata(
                     &mut bh_builder,
                     &resolve_jitcode,
@@ -4053,11 +4235,20 @@ impl<S: JitState> JitDriver<S> {
                         &self.meta_interp().staticdata.virtualref_info
                             as &dyn crate::resume::VRefInfo,
                     ),
-                    None, // vinfo
+                    // Pass the registered vinfo so the vable section of the
+                    // resume stream is consumed (avoids a stream desync when
+                    // the trace carries virtualizable array boxes).
+                    self.meta
+                        .virtualizable_info()
+                        .map(|a| a.as_ref() as &dyn crate::resume::VirtualizableInfo),
                     None, // ginfo
                     allocator,
                 );
-                if let Some((bh, _vable_ptr)) = bh {
+                if let Some((mut bh, _vable_ptr)) = bh {
+                    // Thread the state-field register layout so the
+                    // `state_field` handlers map a logical scalar/array index
+                    // to the flat register slot the resume reader seeded.
+                    bh.state_field_layout = state.state_field_layout();
                     let exc = crate::blackhole::BlackholeInterpreter::prepare_resume_from_failure(
                         result_exc,
                     );
@@ -4871,7 +5062,7 @@ mod tests {
         // Build the canonical liveness exactly the way the macro expansion
         // does (orth-6 helper + orth-2 _encode_liveness + insns
         // registration mirroring `assembler.py:222 self.insns[key] = opnum`).
-        let (live_i, live_r, live_f) = crate::live_slots_for_state_field_jit(2, &[1], 0);
+        let (live_i, live_r, live_f) = crate::live_slots_for_state_field_jit(2, &[1], 0, 0, 0, 0);
         let mut asm = Assembler::new();
         let mut scratch = Vec::<u8>::new();
         asm._encode_liveness(&live_i, &live_r, &live_f, &mut scratch);

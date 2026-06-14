@@ -17,6 +17,22 @@ impl<'c> Lowerer<'c> {
         self.expr_has_jit_state_reference(expr) || self.expr_references_unknown_local(expr)
     }
 
+    /// Statement-level [`Self::expr_touches_storage`]: whether the
+    /// statement reads or writes jit state, storage, or user locals the
+    /// trace function does not carry. Used to decide whether a statement
+    /// that failed to lower can be dropped from the jitcode or must
+    /// become a recording-time abort (`lower_stmt_fallback`).
+    pub(super) fn stmt_touches_storage(&self, stmt: &Stmt) -> bool {
+        match stmt {
+            Stmt::Expr(expr, _) => self.expr_touches_storage(expr),
+            Stmt::Local(local) => local
+                .init
+                .as_ref()
+                .is_some_and(|init| self.expr_touches_storage(&init.expr)),
+            _ => false,
+        }
+    }
+
     /// Walks the expression looking for `Path` references to locals that
     /// are not visible in the generated trace function. The trace
     /// function's scope only carries `program`, `pc`, `__op`, plus the
@@ -140,7 +156,25 @@ impl<'c> Lowerer<'c> {
                 self.expr_modifies_jit_state(func)
                     || args.iter().any(|arg| self.expr_modifies_jit_state(arg))
             }
-            Expr::Binary(ExprBinary { left, right, .. }) => {
+            Expr::Binary(ExprBinary {
+                left, right, op, ..
+            }) => {
+                if matches!(
+                    op,
+                    syn::BinOp::AddAssign(_)
+                        | syn::BinOp::SubAssign(_)
+                        | syn::BinOp::MulAssign(_)
+                        | syn::BinOp::DivAssign(_)
+                        | syn::BinOp::RemAssign(_)
+                        | syn::BinOp::BitAndAssign(_)
+                        | syn::BinOp::BitOrAssign(_)
+                        | syn::BinOp::BitXorAssign(_)
+                        | syn::BinOp::ShlAssign(_)
+                        | syn::BinOp::ShrAssign(_)
+                ) && self.expr_is_jit_state_place(left)
+                {
+                    return true;
+                }
                 self.expr_modifies_jit_state(left) || self.expr_modifies_jit_state(right)
             }
             Expr::Cast(ExprCast { expr, .. })

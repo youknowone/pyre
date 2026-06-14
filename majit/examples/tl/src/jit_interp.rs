@@ -94,6 +94,7 @@ const PUSHARG: u8 = 22;
     state = TlState,
     env = Bytecode,
     auto_calls = true,
+    greens = [pc, program],
     state_fields = {
         stackpos: int,
         stack: [int; virt],
@@ -375,6 +376,57 @@ mod tests {
         let mut jit = JitTlInterp::new();
         for a in [3, 5, 10, 20, 50, 100] {
             let expected = interp::interpret(&bc, a);
+            let got = jit.run(&bc, a);
+            assert_eq!(got, expected, "mismatch for a={a}");
+        }
+    }
+
+    /// A loop whose body branches on `counter > 50` (a *forward* BR_COND, so
+    /// it is an in-trace guard, not a back-edge).  Traced while `counter > 50`,
+    /// it guard-fails on every iteration once `counter <= 50` — driving the
+    /// state-field blackhole forward-resume path (the `!should_bridge` arm of
+    /// `back_edge_internal`) rather than the clean `is_finish` loop-exit.
+    /// The computed value is irrelevant; the assertion is that the JIT result
+    /// equals the plain interpreter result across the guard-failure divergence.
+    fn divergent_branch_bytecode() -> Vec<u8> {
+        vec![
+            PUSH, 0,       // [0] acc = 0
+            PUSHARG, // [2] counter = N            stack = [acc, counter]
+            // loop header (offset 3):
+            PICK, 0, //       [3] dup counter
+            BR_COND, 2,      //    [5] if counter != 0 -> body(9); else fall through
+            POP,    //      [7] pop counter
+            RETURN, //      [8] return acc
+            // body (offset 9):
+            PICK, 0, //       [9]  dup counter            [acc, ctr, ctr]
+            PUSH, 50, //      [11] push 50                [acc, ctr, ctr, 50]
+            GT, //      [13] ctr > 50 ?             [acc, ctr, (ctr>50)]
+            BR_COND, 5, //    [14] if ctr>50 -> skip_extra(21)
+            // not-taken (ctr <= 50): acc += 1 (the divergent path)
+            SWAP, //          [16] [ctr, acc]
+            PUSH, 1,    //       [17] [ctr, acc, 1]
+            ADD,  //          [19] [ctr, acc+1]
+            SWAP, //          [20] [acc+1, ctr]
+            // skip_extra (offset 21): common tail — acc += counter; counter -= 1
+            SWAP, //          [21] [ctr, acc]
+            PICK, 1,    //       [22] [ctr, acc, ctr]
+            ADD,  //          [24] [ctr, acc+ctr]
+            SWAP, //          [25] [acc+ctr, ctr]
+            PUSH, 1,   //       [26] [acc+ctr, ctr, 1]
+            SUB, //          [28] [acc+ctr, ctr-1]
+            PUSH, 1, //       [29] push 1 (unconditional back-jump cond)
+            BR_COND, 226, //  [31] -30: jump to loop header(3)
+        ]
+    }
+
+    #[test]
+    fn jit_divergent_branch_matches_interp() {
+        let bc = divergent_branch_bytecode();
+        // N spans both sides of the `counter > 50` split so the traced
+        // (`> 50`) path guard-fails for the lower half of every run.
+        for a in [3, 5, 49, 50, 51, 60, 100, 200] {
+            let expected = interp::interpret(&bc, a);
+            let mut jit = JitTlInterp::new();
             let got = jit.run(&bc, a);
             assert_eq!(got, expected, "mismatch for a={a}");
         }

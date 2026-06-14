@@ -359,6 +359,25 @@ impl JitCodeBuilder {
         self.push_u8(src as u8);
     }
 
+    /// Load a ref-typed scalar state field into a ref register. The field
+    /// lives in the ref register bank (`registers_r`) so a subsequent
+    /// `getfield_gc_*` reads its struct base from a real ref value.
+    /// `d` = u16 field index, `r` = ref register.
+    pub fn load_state_field_ref(&mut self, field_idx: u16, dest: u16) {
+        self.touch_ref_reg(dest);
+        self.write_insn("load_state_field_ref/dr");
+        self.push_u16(field_idx);
+        self.push_u8(dest as u8);
+    }
+
+    /// Store a ref register value into a ref-typed scalar state field.
+    pub fn store_state_field_ref(&mut self, field_idx: u16, src: u16) {
+        self.touch_ref_reg(src);
+        self.write_insn("store_state_field_ref/dr");
+        self.push_u16(field_idx);
+        self.push_u8(src as u8);
+    }
+
     /// Load an array state field element into an int register.
     /// The element index comes from another int register.
     pub fn load_state_array(&mut self, array_idx: u16, index_reg: u16, dest: u16) {
@@ -390,6 +409,114 @@ impl JitCodeBuilder {
     // helper-style legacy methods that omitted `vable_reg` and inlined
     // the field index were retired in Stage 3c-2 once `jit_interp` DSL
     // and pyre-jit both committed to the canonical encoding.
+
+    /// Emit `new_with_vtable/d>r` (`blackhole.py:1308 bhimpl_new_with_vtable`):
+    /// allocate a zeroed struct of `size` bytes and write `vtable` at the
+    /// CPU's vtable offset; ref result in `dest`. The size descr is transient
+    /// (no struct context, empty field layout) — sufficient for the blackhole
+    /// allocation; the tracer records `OpCode::NewWithVtable` carrying it.
+    pub fn new_with_vtable(&mut self, dest: u16, size: usize, type_id: u64, vtable: usize) {
+        self.touch_ref_reg(dest);
+        let descr = self.add_bh_descr(CanonicalBhDescr::Size {
+            size,
+            type_id,
+            vtable,
+            owner: String::new(),
+            all_fielddescrs: Vec::new(),
+        });
+        self.write_insn("new_with_vtable/d>r");
+        self.push_u16(descr);
+        self.push_reg_u8(dest, "new_with_vtable result");
+    }
+
+    /// Emit `new/d>r` (`blackhole.py:1301 bhimpl_new`): allocate a zeroed
+    /// struct of `size` bytes; ref result in `dest`. No vtable write.
+    pub fn new_struct(&mut self, dest: u16, size: usize, type_id: u64) {
+        self.touch_ref_reg(dest);
+        let descr = self.add_bh_descr(CanonicalBhDescr::Size {
+            size,
+            type_id,
+            vtable: 0,
+            owner: String::new(),
+            all_fielddescrs: Vec::new(),
+        });
+        self.write_insn("new/d>r");
+        self.push_u16(descr);
+        self.push_reg_u8(dest, "new result");
+    }
+
+    /// Build a scalar `Field` descr (one machine word) for a plain
+    /// getfield_gc/setfield_gc operand.  `blackhole.py:1432-1481`
+    /// resolves the `d` argcode to a FieldDescr carrying the byte
+    /// offset; the flag/sign follow the field kind.
+    fn add_scalar_field_descr(&mut self, offset: usize, field_type: majit_ir::value::Type) -> u16 {
+        let (field_flag, is_field_signed) = match field_type {
+            majit_ir::value::Type::Ref => (majit_ir::descr::ArrayFlag::Pointer, false),
+            majit_ir::value::Type::Float => (majit_ir::descr::ArrayFlag::Float, false),
+            _ => (majit_ir::descr::ArrayFlag::Signed, true),
+        };
+        self.add_bh_descr(CanonicalBhDescr::Field {
+            offset,
+            field_size: 8,
+            field_type,
+            field_flag,
+            is_field_signed,
+            is_immutable: false,
+            is_quasi_immutable: false,
+            index_in_parent: 0,
+            parent: None,
+            name: String::new(),
+            owner: String::new(),
+        })
+    }
+
+    /// Emit `setfield_gc_i/rid` (`blackhole.py:1471 bhimpl_setfield_gc_i`):
+    /// store the int in `value_reg` into `struct_reg`'s field at `offset`.
+    pub fn setfield_gc_i(&mut self, struct_reg: u16, value_reg: u16, offset: usize) {
+        self.touch_ref_reg(struct_reg);
+        self.touch_reg(value_reg);
+        let descr = self.add_scalar_field_descr(offset, majit_ir::value::Type::Int);
+        self.write_insn("setfield_gc_i/rid");
+        self.push_reg_u8(struct_reg, "setfield_gc_i struct");
+        self.push_reg_u8(value_reg, "setfield_gc_i value");
+        self.push_u16(descr);
+    }
+
+    /// Emit `setfield_gc_r/rrd` (`blackhole.py:1476 bhimpl_setfield_gc_r`):
+    /// store the ref in `value_reg` into `struct_reg`'s field at `offset`.
+    pub fn setfield_gc_r(&mut self, struct_reg: u16, value_reg: u16, offset: usize) {
+        self.touch_ref_reg(struct_reg);
+        self.touch_ref_reg(value_reg);
+        let descr = self.add_scalar_field_descr(offset, majit_ir::value::Type::Ref);
+        self.write_insn("setfield_gc_r/rrd");
+        self.push_reg_u8(struct_reg, "setfield_gc_r struct");
+        self.push_reg_u8(value_reg, "setfield_gc_r value");
+        self.push_u16(descr);
+    }
+
+    /// Emit `getfield_gc_i/rd>i` (`blackhole.py:1432 bhimpl_getfield_gc_i`):
+    /// load `struct_reg`'s int field at `offset` into `dest`.
+    pub fn getfield_gc_i(&mut self, dest: u16, struct_reg: u16, offset: usize) {
+        self.touch_ref_reg(struct_reg);
+        self.touch_reg(dest);
+        let descr = self.add_scalar_field_descr(offset, majit_ir::value::Type::Int);
+        self.write_insn("getfield_gc_i/rd>i");
+        self.push_reg_u8(struct_reg, "getfield_gc_i struct");
+        self.push_u16(descr);
+        self.push_reg_u8(dest, "getfield_gc_i result");
+    }
+
+    /// Emit `getfield_gc_r/rd>r` (`blackhole.py:1437 bhimpl_getfield_gc_r`):
+    /// load `struct_reg`'s ref field at `offset` into `dest`.
+    pub fn getfield_gc_r(&mut self, dest: u16, struct_reg: u16, offset: usize) {
+        self.touch_ref_reg(struct_reg);
+        self.touch_ref_reg(dest);
+        let descr = self.add_scalar_field_descr(offset, majit_ir::value::Type::Ref);
+        self.write_insn("getfield_gc_r/rd>r");
+        self.push_reg_u8(struct_reg, "getfield_gc_r struct");
+        self.push_u16(descr);
+        self.push_reg_u8(dest, "getfield_gc_r result");
+    }
 
     pub fn vable_getfield_int_with_base(&mut self, dest: u16, vable_reg: u16, field_idx: u16) {
         self.touch_ref_reg(vable_reg);
@@ -979,28 +1106,6 @@ impl JitCodeBuilder {
         self.push_reg_u8(vable_reg, "hint_force_virtualizable base");
     }
 
-    /// Load from a virtualizable state array: emit GETARRAYITEM_RAW_I.
-    /// The array stays on heap; only ptr+len are tracked as inputargs.
-    pub fn load_state_varray(&mut self, array_idx: u16, index_reg: u16, dest: u16) {
-        self.touch_reg(index_reg);
-        self.touch_reg(dest);
-        self.write_insn("load_state_varray/dii");
-        self.push_u16(array_idx);
-        self.push_u8(index_reg as u8);
-        self.push_u8(dest as u8);
-    }
-
-    /// Store to a virtualizable state array: emit SETARRAYITEM_RAW.
-    /// The array stays on heap; only ptr+len are tracked as inputargs.
-    pub fn store_state_varray(&mut self, array_idx: u16, index_reg: u16, src: u16) {
-        self.touch_reg(index_reg);
-        self.touch_reg(src);
-        self.write_insn("store_state_varray/dii");
-        self.push_u16(array_idx);
-        self.push_u8(index_reg as u8);
-        self.push_u8(src as u8);
-    }
-
     /// Load an integer element from a GC-managed array.
     ///
     /// blackhole.py `bhimpl_getarrayitem_gc_i @arguments("r","i","d",returns="i")`:
@@ -1194,6 +1299,53 @@ impl JitCodeBuilder {
         self.push_u8(lhs as u8);
         self.push_u8(rhs as u8);
         self.push_u8(dst as u8);
+    }
+
+    /// `jtransform.py:576-577` `rewrite_op_int_floordiv = _do_builtin_call`
+    /// / `rewrite_op_int_mod = _do_builtin_call`: `int_floordiv` / `int_mod`
+    /// have no `bhimpl_int_*` primitive (`record_binop_i` rejects them), so
+    /// RPython rewrites them to the `int.py_div` / `int.py_mod` oopspec
+    /// residual call (`rint.py ll_int_py_div` / `ll_int_py_mod`,
+    /// `EF_ELIDABLE_CANNOT_RAISE`). Mirrors the trace-path redirect at
+    /// `majit-translate/src/codegen.rs::generated_binary_int_value`.  The
+    /// `_ovf_zer` zero/overflow guards the trace path inlines have no
+    /// jitcode `guard_false` analog here, so the helper carries the same
+    /// precondition (`rhs != 0`, not `INT_MIN / -1`) as any non-traced caller.
+    pub fn record_int_py_div(&mut self, dst: u16, lhs: u16, rhs: u16) {
+        self.record_int_py_helper(
+            dst,
+            lhs,
+            rhs,
+            crate::blackhole::ll_int_py_div as *const (),
+            crate::call_descr::INT_PY_DIV_EFFECT_INFO,
+        );
+    }
+
+    pub fn record_int_py_mod(&mut self, dst: u16, lhs: u16, rhs: u16) {
+        self.record_int_py_helper(
+            dst,
+            lhs,
+            rhs,
+            crate::blackhole::ll_int_py_mod as *const (),
+            crate::call_descr::INT_PY_MOD_EFFECT_INFO,
+        );
+    }
+
+    fn record_int_py_helper(
+        &mut self,
+        dst: u16,
+        lhs: u16,
+        rhs: u16,
+        funcptr: *const (),
+        effect_info: majit_ir::descr::EffectInfo,
+    ) {
+        let fn_ptr_idx = self.add_call_target(funcptr, funcptr);
+        self.residual_call_int_canonical_via_target_with_effect_info(
+            fn_ptr_idx,
+            &[JitCallArg::int(lhs), JitCallArg::int(rhs)],
+            dst,
+            effect_info,
+        );
     }
 
     /// RPython `blackhole.py:527-533` `bhimpl_int_{neg,invert}` per-opname
@@ -4468,7 +4620,8 @@ fn canonical_bh_descr_eq(lhs: &CanonicalBhDescr, rhs: &CanonicalBhDescr) -> bool
 /// RPython `assembler.py:218-231 get_liveness_info(insn, kind)` adapted
 /// for the flat-state JIT: every state_field slot is permanently live,
 /// so the canonical `(live_i, live_r, live_f)` triple just enumerates
-/// the int register file from `0..total_slots`.
+/// the int register file from `int_scalar_base..int_scalar_base +
+/// total_slots`.
 ///
 /// state-field JIT enforces `Type::Int` on every slot at macro
 /// expansion (`codegen_state.rs:30-43`), so `live_r` and `live_f` are
@@ -4488,15 +4641,44 @@ pub fn live_slots_for_state_field_jit(
     num_scalars: usize,
     array_lens: &[usize],
     num_virt_arrays: usize,
+    num_ref_scalars: usize,
+    ref_scalar_base: usize,
+    int_scalar_base: usize,
 ) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
     let total_slots: usize = num_scalars + array_lens.iter().sum::<usize>() + 2 * num_virt_arrays;
+    // Int identity slots start past the dispatch JitCode's int-bank
+    // argument registers (`pc` at i0), mirroring the ref-bank base
+    // below: the guard-time canonical materialization writes the
+    // identity slots into the frame registers, so a slot aliasing an
+    // argument register would overwrite it before the resume stream is
+    // encoded (the re-executed jit_merge_point op then reads the state
+    // scalar where it expects the green `pc`).
+    let int_scalar_end = int_scalar_base + total_slots;
     assert!(
-        total_slots <= u8::MAX as usize + 1 - 1, // i.e. < 256
-        "live_slots_for_state_field_jit: total_slots={total_slots} exceeds RPython jitcode \
-         u8 register-index limit (assembler.py:241, liveness.py:148-159)",
+        int_scalar_end < 256,
+        "live_slots_for_state_field_jit: int_scalar_base={int_scalar_base} + \
+         total_slots={total_slots} exceeds RPython jitcode u8 register-index \
+         limit (assembler.py:241, liveness.py:148-159)",
     );
-    let live_i: Vec<u8> = (0..total_slots as u32).map(|i| i as u8).collect();
-    (live_i, Vec::new(), Vec::new())
+    // Ref-typed scalars occupy the ref register bank, densely packed at
+    // ref_scalar_base..ref_scalar_base+num_ref_scalars. The base skips the
+    // dispatch JitCode's ref-bank argument registers (`program` at r0, the
+    // virtualizable identity at r1 when present): the blackhole re-executes
+    // ops that read those argument registers, so an identity slot aliasing
+    // one would clobber it at resume-decode time.
+    let ref_scalar_end = ref_scalar_base + num_ref_scalars;
+    assert!(
+        ref_scalar_end < 256,
+        "live_slots_for_state_field_jit: ref_scalar_base={ref_scalar_base} + \
+         num_ref_scalars={num_ref_scalars} exceeds the u8 register-index limit",
+    );
+    let live_i: Vec<u8> = (int_scalar_base as u32..int_scalar_end as u32)
+        .map(|i| i as u8)
+        .collect();
+    let live_r: Vec<u8> = (ref_scalar_base as u32..ref_scalar_end as u32)
+        .map(|i| i as u8)
+        .collect();
+    (live_i, live_r, Vec::new())
 }
 
 #[cfg(test)]
@@ -4569,6 +4751,51 @@ mod tests {
                 .and_then(|resulttypes| resulttypes.get(&5).copied()),
             Some('r')
         );
+    }
+
+    #[test]
+    fn canonical_new_with_vtable_emit_uses_size_descr_and_ref_result() {
+        let mut builder = JitCodeBuilder::new();
+        builder.new_with_vtable(2, 16, 0xAB, 0x1234);
+        let jitcode = builder.finish();
+        let opcode = jitcode::insn_byte("new_with_vtable/d>r");
+        // [opcode, descr_idx_lo, descr_idx_hi, dest]
+        assert_eq!(jitcode.code, vec![opcode, 0, 0, 2]);
+        assert!(matches!(
+            &jitcode.exec.descrs[0],
+            RuntimeBhDescr::Descr(CanonicalBhDescr::Size {
+                size: 16,
+                type_id: 0xAB,
+                vtable: 0x1234,
+                ..
+            })
+        ));
+        assert_eq!(
+            jitcode
+                .body()
+                .resulttypes
+                .as_ref()
+                .and_then(|resulttypes| resulttypes.get(&4).copied()),
+            Some('r')
+        );
+    }
+
+    #[test]
+    fn canonical_new_struct_emit_uses_size_descr_without_vtable() {
+        let mut builder = JitCodeBuilder::new();
+        builder.new_struct(3, 16, 0xCD);
+        let jitcode = builder.finish();
+        let opcode = jitcode::insn_byte("new/d>r");
+        assert_eq!(jitcode.code, vec![opcode, 0, 0, 3]);
+        assert!(matches!(
+            &jitcode.exec.descrs[0],
+            RuntimeBhDescr::Descr(CanonicalBhDescr::Size {
+                size: 16,
+                type_id: 0xCD,
+                vtable: 0,
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -4964,9 +5191,41 @@ mod tests {
     #[test]
     fn state_field_canonical_slots_empty_state() {
         // No scalars, no arrays, no virt arrays — empty triple.
-        let (live_i, live_r, live_f) = super::live_slots_for_state_field_jit(0, &[], 0);
+        let (live_i, live_r, live_f) = super::live_slots_for_state_field_jit(0, &[], 0, 0, 0, 0);
         assert!(live_i.is_empty());
         assert!(live_r.is_empty());
+        assert!(live_f.is_empty());
+    }
+
+    #[test]
+    fn state_field_canonical_slots_ref_scalars_populate_live_r() {
+        // 2 int scalars + 2 ref scalars at base 0: live_i = [0,1] (int
+        // bank), live_r = [0,1] (ref bank), live_f empty.
+        let (live_i, live_r, live_f) = super::live_slots_for_state_field_jit(2, &[], 0, 2, 0, 0);
+        assert_eq!(live_i, vec![0u8, 1]);
+        assert_eq!(live_r, vec![0u8, 1]);
+        assert!(live_f.is_empty());
+    }
+
+    #[test]
+    fn state_field_canonical_slots_ref_scalars_offset_by_base() {
+        // ref_scalar_base shifts the ref bank past the dispatch JitCode's
+        // ref arguments (program at r0): 2 ref scalars at base 1 occupy
+        // r1..r3 while the int bank stays 0-based.
+        let (live_i, live_r, live_f) = super::live_slots_for_state_field_jit(2, &[], 0, 2, 1, 0);
+        assert_eq!(live_i, vec![0u8, 1]);
+        assert_eq!(live_r, vec![1u8, 2]);
+        assert!(live_f.is_empty());
+    }
+
+    #[test]
+    fn state_field_canonical_slots_int_scalars_offset_by_base() {
+        // int_scalar_base shifts the int bank past the dispatch JitCode's
+        // int arguments (pc at i0): 2 int scalars at base 1 occupy
+        // i1..i3 while the ref bank stays at its own base.
+        let (live_i, live_r, live_f) = super::live_slots_for_state_field_jit(2, &[], 0, 2, 1, 1);
+        assert_eq!(live_i, vec![1u8, 2]);
+        assert_eq!(live_r, vec![1u8, 2]);
         assert!(live_f.is_empty());
     }
 
@@ -4976,7 +5235,7 @@ mod tests {
         // virt array (`stack`, ptr+len) plus a synthetic 3-element
         // flattened array.  total_slots = 1 + 3 + 2 = 6, so
         // live_i = [0, 1, 2, 3, 4, 5] and ref/float banks are empty.
-        let (live_i, live_r, live_f) = super::live_slots_for_state_field_jit(1, &[3], 1);
+        let (live_i, live_r, live_f) = super::live_slots_for_state_field_jit(1, &[3], 1, 0, 0, 0);
         assert_eq!(live_i, vec![0u8, 1, 2, 3, 4, 5]);
         assert!(live_r.is_empty());
         assert!(live_f.is_empty());
@@ -4992,7 +5251,7 @@ mod tests {
         // triples.
         let mut asm = Assembler::new();
         let mut builder = JitCodeBuilder::new();
-        let (li, lr, lf) = super::live_slots_for_state_field_jit(2, &[1], 0);
+        let (li, lr, lf) = super::live_slots_for_state_field_jit(2, &[1], 0, 0, 0, 0);
         builder.live(&mut asm, &li, &lr, &lf);
         // Header bytes = 3 (len_i, len_r, len_f).  live_i has 3 indices
         // (0, 1, 2) all in the first bitset byte.  live_r/live_f empty.
@@ -5007,7 +5266,7 @@ mod tests {
     fn state_field_canonical_slots_panics_on_overflow() {
         // 256 slots overflows the u8 register-index encoding upstream
         // jitcode bytes are written through (assembler.py:241).
-        let _ = super::live_slots_for_state_field_jit(256, &[], 0);
+        let _ = super::live_slots_for_state_field_jit(256, &[], 0, 0, 0, 0);
     }
 
     #[test]

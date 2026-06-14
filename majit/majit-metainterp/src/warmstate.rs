@@ -401,8 +401,12 @@ impl WarmEnterState {
         green_key_hash: u64,
         flags: u8,
         has_seen_a_procedure_token: bool,
+        abort_count: u32,
     ) -> bool {
         if flags & jc_flags::DONT_TRACE_HERE == 0 || has_seen_a_procedure_token {
+            return false;
+        }
+        if abort_count >= MAX_TRACE_ABORT_COUNT {
             return false;
         }
         if flags & jc_flags::TRACING_OCCURRED != 0 {
@@ -545,6 +549,7 @@ impl WarmEnterState {
             let is_tracing = cell.is_tracing();
             let flags = cell.flags;
             let has_seen_a_procedure_token = cell.has_seen_a_procedure_token();
+            let abort_count = cell.abort_count;
             if is_compiled {
                 return HotResult::RunCompiled;
             }
@@ -555,6 +560,7 @@ impl WarmEnterState {
                 green_key_hash,
                 flags,
                 has_seen_a_procedure_token,
+                abort_count,
             ) {
                 return self.start_tracing_cell(green_key_hash);
             }
@@ -600,13 +606,19 @@ impl WarmEnterState {
             let is_tracing = cell.is_tracing();
             let flags = cell.flags;
             let has_seen_a_procedure_token = cell.has_seen_a_procedure_token();
+            let abort_count = cell.abort_count;
             if is_compiled {
                 return HotResult::RunCompiled;
             }
             if is_tracing {
                 return HotResult::AlreadyTracing;
             }
-            if self.should_start_dont_trace_here_trace(hash, flags, has_seen_a_procedure_token) {
+            if self.should_start_dont_trace_here_trace(
+                hash,
+                flags,
+                has_seen_a_procedure_token,
+                abort_count,
+            ) {
                 return self.start_tracing_cell_for_key(key);
             }
             if flags & jc_flags::DONT_TRACE_HERE != 0 {

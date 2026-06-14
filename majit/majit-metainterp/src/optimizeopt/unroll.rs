@@ -70,7 +70,11 @@ fn is_trace_constant_ref(
     }
     // history.py:189-220 — Const variants are constants by Box class.
     // Const OpRefs carry the value directly; the surviving raw `constants`
-    // pool (empty in production) is also treated as Const.
+    // map (empty in production) is also treated as Const. A guard minted by
+    // `jump_to_existing_trace` (IntBound.make_guards, unroll.py:333) can
+    // reference a fresh const-namespace OpRef whose raw is not yet a key in
+    // `constants`; the variant check is authoritative, while the map check
+    // additionally catches body-namespace OpRefs forwarded to a constant.
     if opref.is_constant() {
         return true;
     }
@@ -3560,6 +3564,27 @@ impl OptUnroll {
         let mut mapping: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef> =
             crate::optimizeopt::vec_assoc::VecAssoc::new();
 
+        // unroll.py:393 `assert len(short_inputargs) == len(jump_args)` —
+        // the mapping below is positional, so a length mismatch misaligns
+        // every seeded pair (a recurring red maps to the wrong slot and the
+        // back edge carries the loop-entry value as if it were invariant).
+        // RPython guarantees equality by construction; reaching here with a
+        // mismatch means the exported short inputargs cover a different
+        // label shape than the target's make_inputargs output. Fall back to
+        // jump_to_preamble via InvalidLoop instead of seeding a misaligned
+        // mapping.
+        if short_preamble.inputargs.len() != jump_args.len() {
+            if crate::optimizeopt::majit_log_enabled() {
+                eprintln!(
+                    "[jit] inline_short_preamble: short_inputargs len {} != jump_args len {} — InvalidLoop",
+                    short_preamble.inputargs.len(),
+                    jump_args.len()
+                );
+            }
+            std::panic::panic_any(crate::optimize::InvalidLoop(
+                "inline_short_preamble: short_inputargs/jump_args arity mismatch",
+            ));
+        }
         for (i, short_inputarg) in short_preamble.inputargs.iter().enumerate() {
             let short_inputarg = short_inputarg.to_opref();
             if let Some(&jump_arg) = jump_args.get(i) {

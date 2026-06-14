@@ -2726,14 +2726,14 @@ impl TraceCtx {
     /// value seen at trace time.
     pub fn promote_int(&mut self, opref: OpRef, runtime_value: i64, num_live: usize) -> OpRef {
         let const_ref = self.const_int(runtime_value);
-        self.record_guard(OpCode::GuardValue, &[opref, const_ref], num_live);
+        self.record_guard_with_snapshot(OpCode::GuardValue, &[opref, const_ref], num_live);
         const_ref
     }
 
     /// Record a ref-typed promote (GUARD_VALUE for GC references).
     pub fn promote_ref(&mut self, opref: OpRef, runtime_value: i64, num_live: usize) -> OpRef {
         let const_ref = self.const_ref(runtime_value);
-        self.record_guard(OpCode::GuardValue, &[opref, const_ref], num_live);
+        self.record_guard_with_snapshot(OpCode::GuardValue, &[opref, const_ref], num_live);
         const_ref
     }
 
@@ -2742,8 +2742,32 @@ impl TraceCtx {
     /// pyjitpl.py:1515 opimpl_float_guard_value = _opimpl_guard_value
     pub fn promote_float(&mut self, opref: OpRef, runtime_value: i64, num_live: usize) -> OpRef {
         let const_ref = self.const_float(runtime_value);
-        self.record_guard(OpCode::GuardValue, &[opref, const_ref], num_live);
+        self.record_guard_with_snapshot(OpCode::GuardValue, &[opref, const_ref], num_live);
         const_ref
+    }
+
+    /// pyjitpl.py:2548-2602 generate_guard + capture_resumedata parity:
+    /// record a guard AND attach a minimal snapshot so the optimizer's
+    /// `store_final_boxes_in_guard` finds `rd_resume_position >= 0`.
+    fn record_guard_with_snapshot(
+        &mut self,
+        opcode: OpCode,
+        args: &[OpRef],
+        num_live: usize,
+    ) -> OpRef {
+        let snapshot_idx = self.snapshots.len() as i32;
+        self.snapshots.push(crate::recorder::Snapshot {
+            frames: vec![crate::recorder::SnapshotFrame {
+                jitcode_index: 0,
+                pc: self.last_traced_pc as u32,
+                boxes: Vec::new(),
+            }],
+            vable_boxes: Vec::new(),
+            vref_boxes: Vec::new(),
+        });
+        let opref = self.record_guard(opcode, args, num_live);
+        self.recorder.set_last_op_resume_position(snapshot_idx);
+        opref
     }
 
     /// Record a call to an elidable (pure) function.

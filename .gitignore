@@ -81,6 +81,7 @@ benchmarks/*
 # Local Claude settings (personal, not committed)
 .claude/settings.local.json
 .claude/stop-hook.sh
+docs/superpowers
 aheui/
 CLAUDE.md
 

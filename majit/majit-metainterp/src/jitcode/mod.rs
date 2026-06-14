@@ -737,12 +737,12 @@ mod tests {
             ("abort/", insns::BC_ABORT),
             ("abort_permanent/", insns::BC_ABORT_PERMANENT),
             // Proc-macro JIT-machine state addressing.
+            ("load_state_field_ref/dr", insns::BC_LOAD_STATE_FIELD_REF),
+            ("store_state_field_ref/dr", insns::BC_STORE_STATE_FIELD_REF),
             ("load_state_field/di", insns::BC_LOAD_STATE_FIELD),
             ("store_state_field/di", insns::BC_STORE_STATE_FIELD),
             ("load_state_array/dii", insns::BC_LOAD_STATE_ARRAY),
             ("store_state_array/dii", insns::BC_STORE_STATE_ARRAY),
-            ("load_state_varray/dii", insns::BC_LOAD_STATE_VARRAY),
-            ("store_state_varray/dii", insns::BC_STORE_STATE_VARRAY),
             // pyre nested-bytecode inline_call (pyre-only `P` argcode).
             ("inline_call_pyre_nested/P", insns::BC_INLINE_CALL),
             // Ref-result variant of the borrow-checker abort signal.

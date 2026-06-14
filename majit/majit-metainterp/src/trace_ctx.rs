@@ -1285,11 +1285,21 @@ impl TraceCtx {
 
     /// `BoxRef::get_value` reader — the concrete value stamped onto
     /// this OpRef's frontend value slot (`history.py:803 *FrontendOp(pos,
-    /// value)` analog).  `None` if never stamped — RPython equivalent:
-    /// the operation result has not been computed at trace time
-    /// (residual calls + guards keep their result `None` until
-    /// blackhole runs them).  Const variants delegate to
+    /// value)` analog).  Const variants delegate to
     /// `BoxKind::Const { value, .. }` directly.
+    ///
+    /// PyPy's normal record path attaches the value at FrontendOp
+    /// construction time (execute() runs before record()), so for any
+    /// op produced by the normal trace path the answer is always
+    /// `Some(_)`.  The `None` arm is reserved for the residual-call /
+    /// guard / unstamped result family where no trace-time concrete
+    /// exists until blackhole runs the op — plus synthetic / test
+    /// fixtures that materialise OpRefs without going through
+    /// `record_op*`.  Callers MUST treat `None` as the exceptional
+    /// branch (skip the sanity check, leave the cache entry alone);
+    /// silently substituting `Value::Void` would conflate "unstamped"
+    /// with "stamped Void", which the `BoxRef::set_value` type-check
+    /// already forbids.
     pub fn lookup_opref_concrete(&self, opref: OpRef) -> Option<Value> {
         if opref.is_constant() {
             return opref.inline_const_to_value();
@@ -1743,6 +1753,22 @@ impl TraceCtx {
             }
             array_bits.push(items);
             cursor += len;
+        }
+        // When the virtualizable array is a Rust `Vec` embedded by value in
+        // the interpreter's live state struct (`RustVec` storage), an outer
+        // executor (the macro-generated mainloop) owns that struct and writes
+        // it on every opcode. The trace's shadow is seeded from that heap and
+        // tracked for IR purposes only; flushing the shadow back here would
+        // clobber the outer executor's writes. The heap is authoritative, so
+        // skip the write-back during tracing — the resume path performs its
+        // own field-aware flush on guard failure.
+        if info.array_fields.iter().any(|a| {
+            matches!(
+                a.storage,
+                crate::virtualizable::VableArrayStorage::RustVec { .. }
+            )
+        }) {
+            return;
         }
         // Safety: `heap_ptr` is cached at trace/bridge entry from
         // `MetaInterp::vable_ptr`, which the JitState pins for the trace
@@ -3357,6 +3383,11 @@ impl TraceCtx {
     }
 
     /// pyjitpl.py:1236-1247 `_opimpl_setarrayitem_vable(box, indexbox, valuebox, fdescr, adescr, pc)`.
+    ///
+    /// Returns `false` when the promoted index does not resolve to a standard
+    /// virtualizable slot (e.g. a transient out-of-bounds index during state-
+    /// field tracing). The caller aborts the trace in that case, mirroring the
+    /// read path's graceful handling in `vable_getarrayitem_int_indexed`.
     pub fn vable_setarrayitem_indexed(
         &mut self,
         pc: usize,
@@ -3367,22 +3398,25 @@ impl TraceCtx {
         adescr: DescrRef,
         value: OpRef,
         concrete: Value,
-    ) {
+    ) -> bool {
         let vable_concrete = self.concrete_of_opref(vable_opref);
         if self.is_nonstandard_virtualizable(pc, vable_opref, &fdescr, vable_concrete) {
             let array_opref =
                 self.record_op_with_descr(OpCode::GetfieldGcR, &[vable_opref], fdescr);
             self.vable_setarrayitem_descr(array_opref, index, value, adescr);
-            return;
+            return true;
         }
         // index = self._get_arrayitem_vable_index(pc, fdescr, indexbox)
         // self.metainterp.virtualizable_boxes[index] = valuebox
         // self.metainterp.synchronize_virtualizable()
-        let flat_idx = self
-            .get_arrayitem_vable_index(pc, index, index_runtime_value, &fdescr)
-            .expect("vable_setarrayitem_indexed: virtualizable array slot missing");
+        let Some(flat_idx) =
+            self.get_arrayitem_vable_index(pc, index, index_runtime_value, &fdescr)
+        else {
+            return false;
+        };
         self.set_virtualizable_entry_at(flat_idx, value, concrete);
         self.synchronize_virtualizable();
+        true
     }
 
     /// pyjitpl.py:1253-1263 `opimpl_arraylen_vable(box, fdescr, adescr, pc)`.

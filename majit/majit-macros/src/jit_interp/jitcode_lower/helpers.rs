@@ -289,7 +289,9 @@ pub(super) fn is_supported_int_cast(ty: &Type) -> bool {
     match ty {
         Type::Path(type_path) => {
             type_path.path.is_ident("i64")
+                || type_path.path.is_ident("u64")
                 || type_path.path.is_ident("isize")
+                || type_path.path.is_ident("usize")
                 || type_path.path.is_ident("i32")
                 || type_path.path.is_ident("u32")
                 || type_path.path.is_ident("i16")
@@ -317,10 +319,13 @@ pub(super) fn is_supported_float_type(ty: &Type) -> bool {
 }
 
 pub(crate) fn classify_param_type(ty: &Type) -> Option<InlineReturnKind> {
-    if is_supported_int_cast(ty) {
-        Some(InlineReturnKind::Int)
-    } else if is_supported_ref_type(ty) {
+    // `usize`/pointer params are Ref in the inline-helper ABI. `usize` also
+    // satisfies `is_supported_int_cast` (for `as` casts), so the Ref check
+    // must precede the Int check or `usize` would misclassify as Int.
+    if is_supported_ref_type(ty) {
         Some(InlineReturnKind::Ref)
+    } else if is_supported_int_cast(ty) {
+        Some(InlineReturnKind::Int)
     } else if is_supported_float_type(ty) {
         Some(InlineReturnKind::Float)
     } else {
@@ -385,9 +390,12 @@ pub(super) fn binding_kind_for_inline_policy(
     kind: crate::jit_interp::CallPolicyKind,
 ) -> Option<BindingKind> {
     match kind {
-        crate::jit_interp::CallPolicyKind::InlineInt => Some(BindingKind::Int),
-        crate::jit_interp::CallPolicyKind::InlineRef => Some(BindingKind::Ref),
-        crate::jit_interp::CallPolicyKind::InlineFloat => Some(BindingKind::Float),
+        crate::jit_interp::CallPolicyKind::InlineInt
+        | crate::jit_interp::CallPolicyKind::InlinePipelineInt => Some(BindingKind::Int),
+        crate::jit_interp::CallPolicyKind::InlineRef
+        | crate::jit_interp::CallPolicyKind::InlinePipelineRef => Some(BindingKind::Ref),
+        crate::jit_interp::CallPolicyKind::InlineFloat
+        | crate::jit_interp::CallPolicyKind::InlinePipelineFloat => Some(BindingKind::Float),
         _ => None,
     }
 }
@@ -400,6 +408,26 @@ pub(crate) fn helper_policy_path(expr: &Expr) -> Option<Path> {
     let last = path.segments.last_mut()?;
     last.ident = format_ident!("__majit_call_policy_{}", last.ident);
     Some(path)
+}
+
+/// Emit the int-binop recording call for `dst = lhs <op> rhs`.
+///
+/// `jtransform.py:576-577` rewrites `int_floordiv` / `int_mod` to the
+/// `int.py_div` / `int.py_mod` oopspec builtin call (no `bhimpl_int_*`
+/// primitive exists), so those route to `record_int_py_div` /
+/// `record_int_py_mod` (residual call to `ll_int_py_div` / `ll_int_py_mod`);
+/// every other int binop keeps the bare-primitive `record_binop_i`.
+pub(super) fn binop_i_emit_tokens(
+    dst: u16,
+    opcode: &Ident,
+    lhs: u16,
+    rhs: u16,
+) -> proc_macro2::TokenStream {
+    match opcode.to_string().as_str() {
+        "IntFloorDiv" => quote! { __builder.record_int_py_div(#dst, #lhs, #rhs); },
+        "IntMod" => quote! { __builder.record_int_py_mod(#dst, #lhs, #rhs); },
+        _ => quote! { __builder.record_binop_i(#dst, majit_ir::OpCode::#opcode, #lhs, #rhs); },
+    }
 }
 
 pub(super) fn opcode_for_binop(op: &BinOp) -> Option<Ident> {

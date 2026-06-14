@@ -614,14 +614,60 @@ pub(super) fn lower_pre_dispatch_stmts(
             continue;
         }
         // Only lower stmts that modify JIT state (e.g. state field writes,
-        // promote calls on state fields). Skip remaining runtime-only stmts
+        // promote calls on state fields) or contain a can_enter_jit! macro
+        // (which emits BC_LOOP_HEADER). Skip remaining runtime-only stmts
         // that are neither opcode-fetch patterns nor state-modifying.
-        if !lowerer.stmt_modifies_jit_state(stmt) {
+        if !lowerer.stmt_modifies_jit_state(stmt) && !stmt_contains_can_enter_jit(stmt) {
             continue;
         }
         let _ = lowerer.lower_stmt(stmt);
     }
     Some(())
+}
+
+/// Walk a statement AST to check if it contains a `can_enter_jit!` macro call
+/// anywhere in its body (possibly nested inside if-blocks).
+fn stmt_contains_can_enter_jit(stmt: &Stmt) -> bool {
+    match stmt {
+        Stmt::Macro(m) => {
+            let path_str = m
+                .mac
+                .path
+                .segments
+                .iter()
+                .map(|s| s.ident.to_string())
+                .collect::<Vec<_>>()
+                .join("::");
+            path_str == "can_enter_jit"
+                || path_str.ends_with("::can_enter_jit")
+                || path_str == "jit_loop_header"
+                || path_str.ends_with("::jit_loop_header")
+        }
+        Stmt::Expr(expr, _) => expr_contains_can_enter_jit(expr),
+        _ => false,
+    }
+}
+
+fn expr_contains_can_enter_jit(expr: &Expr) -> bool {
+    match expr {
+        Expr::If(expr_if) => {
+            block_contains_can_enter_jit(&expr_if.then_branch)
+                || expr_if
+                    .else_branch
+                    .as_ref()
+                    .map_or(false, |(_, e)| expr_contains_can_enter_jit(e))
+        }
+        Expr::Block(expr_block) => block_contains_can_enter_jit(&expr_block.block),
+        Expr::Match(expr_match) => expr_match
+            .arms
+            .iter()
+            .any(|arm| expr_contains_can_enter_jit(&arm.body)),
+        _ => false,
+    }
+}
+
+fn block_contains_can_enter_jit(block: &syn::Block) -> bool {
+    block.stmts.iter().any(|s| stmt_contains_can_enter_jit(s))
 }
 
 /// A.2.5.a: lower a free-function call statement whose callee has a
@@ -808,6 +854,15 @@ fn lower_extended_arg_inner_while(
     // goto_if_not_int_eq/iiL. `opcode_reg` is the canonical loop reg
     // updated each iteration by the inner BC_GETARRAYITEM_GC_I aliased
     // through `inner_alias`.
+    //
+    // flatten.py:258-260 emits -live- ahead of every goto_if_not. The
+    // guard records through build_state_field_snapshot, which reads the
+    // LIVE marker at guard_pc - SIZE_LIVE_OP; without a preceding -live-
+    // the snapshot mis-decodes the prior op's bytes as a liveness offset.
+    lowerer.emit_op(
+        OpMeta::live_marker(),
+        quote::quote! { let _ = __builder.live_placeholder(); },
+    );
     lowerer.emit_op(
         OpMeta::conditional_guard_int_eq(
             Register::int(opcode_reg),
@@ -1017,6 +1072,14 @@ fn try_lower_have_argument_guard(lowerer: &mut Lowerer, stmt: &Stmt) -> bool {
     let ok_label = lowerer.alloc_label();
     lowerer.emit_aux(quote! { let #ok_label = __builder.new_label(); });
     let local_reg = local.reg;
+    // flatten.py:258-260 emits -live- ahead of every goto_if_not. The
+    // guard records through build_state_field_snapshot, which reads the
+    // LIVE marker at guard_pc - SIZE_LIVE_OP; without a preceding -live-
+    // the snapshot mis-decodes the prior op's bytes as a liveness offset.
+    lowerer.emit_op(
+        OpMeta::live_marker(),
+        quote! { let _ = __builder.live_placeholder(); },
+    );
     lowerer.emit_op(
         OpMeta::conditional_guard_int_eq(
             Register::int(local_reg),
@@ -1312,6 +1375,33 @@ fn try_lower_opcode_fetch_stmt(lowerer: &mut Lowerer, stmt: &Stmt) -> bool {
                 }
                 _ => None,
             };
+            // Method-call form: `let op = program.get_op(pc)` where
+            // `get_op` is registered as an elidable call policy. Emit
+            // `call_pure_int` and bind the result so `lower_dispatch_chain`
+            // finds the opcode register.
+            if opcode_fetch.is_none() {
+                if let Expr::MethodCall(mc) = init_expr {
+                    let receiver_name = expr_single_ident(&mc.receiver);
+                    if receiver_name.as_deref() == Some("program") {
+                        if let Some(binding) =
+                            lowerer.lower_value_expr(&syn::Expr::MethodCall(mc.clone()))
+                        {
+                            if let Some(name) = pat_bound_ident_name(&local.pat) {
+                                lowerer.bindings.insert(
+                                    name.clone(),
+                                    Binding {
+                                        reg: binding.reg,
+                                        kind: binding.kind,
+                                        depends_on_stack: false,
+                                    },
+                                );
+                                lowerer.opcode_var_name = Some(name);
+                            }
+                            return true;
+                        }
+                    }
+                }
+            }
             if let Some(idx_expr) = opcode_fetch {
                 // Binding names: "program" → r0, "pc" → i0 (installed by
                 // lower_dispatch_body before this fn is called).
@@ -1718,6 +1808,237 @@ mod dispatch_arm_inline_call_tokens_tests {
 /// `default_label` is bound at the typed-return emission site in
 /// `lower_dispatch_body`; `loop_start_label` is the back-edge target
 /// (JIT_MERGE_POINT position) emitted after each matched arm's body.
+/// `true` when the dispatch declares `pc` as a green (e.g.
+/// `#[jit_interp(greens = [pc])]`).  PyPy `tl.py` `greens=['pc','code']`:
+/// with pc green the opcode/operand reads at `program[pc]` and the dispatch
+/// chain constant-fold, and the loop closes on the pc value.  Gates the
+/// green-pc inline dispatch path (`try_inline_dispatch_arm`); red-pc
+/// dispatches keep the sub-JitCode + BC_INLINE_CALL model.
+pub(super) fn pc_is_green(config: &LowererConfig) -> bool {
+    config.greens.iter().any(|green| {
+        matches!(green, Expr::Path(p)
+            if p.qself.is_none()
+                && p.path.get_ident().map(|id| id == "pc").unwrap_or(false))
+    })
+}
+
+/// Recognise a self-increment of `pc`: `pc += N` (BinOp::AddAssign) or
+/// `pc = pc + N` (Assign of `pc + N`), returning the literal `N`.  Mirrors
+/// `match_pc_increment_stmt` but operates on an `Expr` and is pc-specific —
+/// used by `lower_pc_pinned_write` on the inline arm path.
+fn pc_self_increment(expr: &Expr) -> Option<i64> {
+    if let Expr::Binary(bin) = expr {
+        if matches!(bin.op, syn::BinOp::AddAssign(_))
+            && expr_single_ident(&bin.left).as_deref() == Some("pc")
+        {
+            return expr_int_literal_value(&bin.right);
+        }
+    }
+    if let Expr::Assign(a) = expr {
+        if expr_single_ident(&a.left).as_deref() == Some("pc") {
+            if let Expr::Binary(bin) = a.right.as_ref() {
+                if matches!(bin.op, syn::BinOp::Add(_))
+                    && expr_single_ident(&bin.left).as_deref() == Some("pc")
+                {
+                    return expr_int_literal_value(&bin.right);
+                }
+            }
+        }
+    }
+    None
+}
+
+impl<'c> Lowerer<'c> {
+    /// Green-pc inline dispatch pc-write pinning (see `Lowerer::pc_pinned`).
+    /// Lowers `pc += N`, `pc = pc + N`, and the generic branch `pc = <expr>`
+    /// so the result lands in pc's register (reg0), the slot the dispatch
+    /// merge point reads.  `pc += N` emits `record_binop_i(pc_reg, IntAdd,
+    /// pc_reg, const_N)` — the same advance shape as the dispatch-top
+    /// opcode-fetch (`try_lower_opcode_fetch_stmt` Pattern 2).  `pc = target`
+    /// lowers the RHS then copies it into pc_reg via `record_binop_i(pc_reg,
+    /// IntAdd, rhs, const_0)`; the JitCode bytecode has no int-move op, and
+    /// the optimizer folds the `+ 0`.  Returns `None` when `!pc_pinned` or
+    /// `expr` is not a pc-write, so the caller falls through to the normal
+    /// statement lowering (and, off the inline path, to the existing
+    /// SSA-rebind / drop behaviour — pinning is inert there).
+    pub(super) fn lower_pc_pinned_write(&mut self, expr: &Expr) -> Option<()> {
+        if !self.pc_pinned {
+            return None;
+        }
+        let pc_reg = self.bindings.get("pc")?.reg;
+
+        if let Some(increment) = pc_self_increment(expr) {
+            let tmp_reg = self.alloc_reg();
+            self.emit_op(
+                OpMeta::linear(OpKind::LoadConstI, vec![], vec![Register::int(tmp_reg)]),
+                quote::quote! {
+                    __builder.load_const_i_value(#tmp_reg as u16, #increment as i64);
+                },
+            );
+            self.emit_op(
+                OpMeta::linear(
+                    OpKind::BinopI,
+                    vec![Register::int(pc_reg), Register::int(tmp_reg)],
+                    vec![Register::int(pc_reg)],
+                ),
+                quote::quote! {
+                    __builder.record_binop_i(
+                        #pc_reg as u16,
+                        majit_ir::OpCode::IntAdd,
+                        #pc_reg as u16,
+                        #tmp_reg as u16,
+                    );
+                },
+            );
+            // pc binding stays at pc_reg (no rebind).
+            return Some(());
+        }
+
+        if let Expr::Assign(assign) = expr {
+            if expr_single_ident(&assign.left).as_deref() == Some("pc") {
+                let rhs = self.lower_value_expr(&assign.right)?;
+                if !matches!(rhs.kind, BindingKind::Int) {
+                    return None;
+                }
+                if rhs.reg != pc_reg {
+                    let zero_reg = self.alloc_reg();
+                    let rhs_reg = rhs.reg;
+                    self.emit_op(
+                        OpMeta::linear(OpKind::LoadConstI, vec![], vec![Register::int(zero_reg)]),
+                        quote::quote! {
+                            __builder.load_const_i_value(#zero_reg as u16, 0i64);
+                        },
+                    );
+                    self.emit_op(
+                        OpMeta::linear(
+                            OpKind::BinopI,
+                            vec![Register::int(rhs_reg), Register::int(zero_reg)],
+                            vec![Register::int(pc_reg)],
+                        ),
+                        quote::quote! {
+                            __builder.record_binop_i(
+                                #pc_reg as u16,
+                                majit_ir::OpCode::IntAdd,
+                                #rhs_reg as u16,
+                                #zero_reg as u16,
+                            );
+                        },
+                    );
+                }
+                // Re-pin `pc` to reg0, overriding any SSA rebind the RHS
+                // lowering may have left.
+                self.bindings.insert(
+                    "pc".to_string(),
+                    Binding {
+                        reg: pc_reg,
+                        kind: BindingKind::Int,
+                        depends_on_stack: false,
+                    },
+                );
+                return Some(());
+            }
+        }
+        None
+    }
+
+    /// `true` if `body` contains a call whose policy resolves to
+    /// `CallPolicySpec::Infer` — an auto-discovered helper whose effect /
+    /// raisability (and, for `&[u8]`-arg helpers like `interpret_at`, whether
+    /// a marshalable C-ABI call target exists at all) is decided at runtime.
+    /// Such an arm keeps the sub-JitCode path: its build-time IIFE degrades
+    /// to an abort stub when the runtime policy is unsupported, which the
+    /// inline stream cannot do cleanly.  Explicit-policy and helper-free arms
+    /// are inlineable.
+    pub(super) fn arm_body_has_infer_call(&self, body: &Expr) -> bool {
+        use syn::visit::Visit;
+        struct InferCallProbe<'a, 'c> {
+            lowerer: &'a Lowerer<'c>,
+            hit: bool,
+        }
+        impl<'ast, 'a, 'c> Visit<'ast> for InferCallProbe<'a, 'c> {
+            fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+                if !self.hit
+                    && matches!(
+                        self.lowerer.resolve_call_policy(&call.func),
+                        Some(CallPolicySpec::Infer)
+                    )
+                {
+                    self.hit = true;
+                }
+                syn::visit::visit_expr_call(self, call);
+            }
+        }
+        let mut probe = InferCallProbe {
+            lowerer: self,
+            hit: false,
+        };
+        probe.visit_expr(body);
+        probe.hit
+    }
+
+    /// Lower a dispatch arm `body` INLINE into this dispatch JitCode (green-pc
+    /// path).  Sets `pc_pinned` so pc-writes hit reg0, lowers each statement
+    /// via `lower_stmt`, and on success drops the arm-local bindings so they
+    /// do not leak into the next arm (matching the isolated sub-JitCode arm
+    /// scope; emitted ops reference concrete registers, so this is safe).
+    /// Returns `false` and fully rolls back the partial emission when the
+    /// body does not lower cleanly, so the caller falls back to the
+    /// sub-JitCode path.
+    pub(super) fn try_inline_dispatch_arm(&mut self, body: &Expr) -> bool {
+        let stmts = extract_stmts(body);
+        let snap_stmts = self.statements.len();
+        let snap_meta = self.op_metadata.len();
+        let snap_reg = self.next_reg;
+        let snap_bindings = self.bindings.clone();
+        let snap_opcode = self.opcode_var_name.clone();
+
+        self.pc_pinned = true;
+        let mut ok = true;
+        for stmt in &stmts {
+            if self.lower_stmt(stmt).is_none() {
+                ok = false;
+                break;
+            }
+        }
+        self.pc_pinned = false;
+
+        if !ok {
+            self.statements.truncate(snap_stmts);
+            self.op_metadata.truncate(snap_meta);
+            self.next_reg = snap_reg;
+            self.bindings = snap_bindings;
+            self.opcode_var_name = snap_opcode;
+            return false;
+        }
+
+        if std::env::var_os("MAJIT_MACRO_DEBUG").is_some() {
+            let kinds: Vec<String> = self.op_metadata[snap_meta..]
+                .iter()
+                .map(|m| format!("{:?}", m.kind))
+                .collect();
+            eprintln!(
+                "[majit-macro] inline arm body ops ({}): {}",
+                kinds.len(),
+                kinds.join(",")
+            );
+        }
+        // Inlined: restore the binding map / opcode name so arm-local `let`s
+        // do not leak across arms, and reclaim the register space.  Each arm
+        // sits behind its own opcode guard (the skip-label chain), so only one
+        // arm body executes per dispatch iteration and arm-local temporaries
+        // are dead at the back-edge (the merge point keeps only pc / program /
+        // state slots live).  Reusing the same registers across the mutually
+        // exclusive arm bodies keeps the dispatch JitCode's register count
+        // bounded — without it ~20 inlined arms overflow the u8 const-ref slot
+        // space (statements stay committed; the emitted ops already hold their
+        // concrete register numbers).
+        self.bindings = snap_bindings;
+        self.opcode_var_name = snap_opcode;
+        self.next_reg = snap_reg;
+        true
+    }
+}
+
 pub(super) fn lower_dispatch_chain(
     lowerer: &mut Lowerer,
     classified_arms: &[crate::jit_interp::classify::ClassifiedArm],
@@ -1791,11 +2112,21 @@ pub(super) fn lower_dispatch_chain(
                 lowerer.emit_aux(quote::quote! { let #label = __builder.new_label(); });
                 label
             };
-            // Fused goto_if_not_int_eq: branch to the next alternative (or
-            // the arm skip label) if opcode != const. For `A | B`, a
-            // successful early alternative jumps to the shared matched label
-            // so the remaining alternatives are not tested as an accidental
-            // conjunction.
+            // RPython flatten.py:258-260 emits `-live-` UNCONDITIONALLY ahead
+            // of every goto_if_not / goto_if_not_<cmp>; optimize_goto_if_not
+            // (jtransform.py:225) tags the fused compare `-live-before`. The
+            // tracer records this guard through record_state_guard →
+            // build_state_field_snapshot, which reads the LIVE marker at
+            // `guard_pc - SIZE_LIVE_OP`. Without a preceding `-live-` the
+            // snapshot mis-decodes the prior op's bytes as a liveness offset
+            // and indexes out of bounds. One marker per chained alternative so
+            // each goto_if_not_int_eq has its own preceding LIVE.
+            lowerer.emit_op(
+                OpMeta::live_marker(),
+                quote::quote! { let _ = __builder.live_placeholder(); },
+            );
+            // Fused goto_if_not_int_eq: branch to the next alternative (or the
+            // arm skip label) if opcode != const.
             lowerer.emit_op(
                 OpMeta::conditional_guard_int_eq(
                     Register::int(opcode_reg),
@@ -1817,118 +2148,212 @@ pub(super) fn lower_dispatch_chain(
             lowerer.emit_label_def(matched_label);
         }
 
-        // jtransform.py:473-482 — inline_call_* + trailing -live-.
-        // Build the arm sub-JitCode and register it; emit BC_INLINE_CALL.
-        // This executes when the arm MATCHED (guards fell through); the
-        // sub-JitCode encodes the opcode handler body.
-        //
-        // Dispatch-arm caller-local plumbing: walk the arm
-        // body to collect parent-scope idents (via `collect_arm_caller_locals`),
-        // pre-bind them on the sub-Lowerer at fresh per-bank callee regs
-        // (via `try_generate_jitcode_body_parts_with_caller_bindings`), and
-        // emit the typed `inline_call_<types>_v(__sub_idx, args_i, args_r,
-        // args_f)` so the callee jitcode receives them as portal-input
-        // bindings.  Mirrors `jtransform.py:480 inline_call_<types>(jitcode,
-        // args...)`.  When the arm body has no parent-scope refs the layout
-        // is empty and the emit reduces to the no-arg `inline_call_r_v`
-        // (equivalent to the previous `__builder.inline_call(__sub_idx)`).
-        let mut arm_inline_call_reads: Vec<Register> = Vec::new();
-        let (arm_body_tokens, arm_inline_call_emit): (
-            proc_macro2::TokenStream,
-            proc_macro2::TokenStream,
-        ) = match &arm.pattern {
-            crate::jit_interp::classify::ArmPattern::Lowerable => {
-                let caller_locals =
-                    collect_arm_caller_locals(&arm.original_body, &arm.pat, &lowerer.bindings);
-                match try_generate_jitcode_body_parts_with_caller_bindings(
-                    &arm.original_body,
-                    Some(config),
-                    &caller_locals,
-                ) {
-                    Some((generated, layout)) => {
-                        let body = generated.body;
-                        let liveness_prebuild = generated.liveness_prebuild;
-                        lowerer.inline_liveness_prebuild.push(liveness_prebuild);
-                        // Carry the parent-side caller regs into the
-                        // BC_INLINE_CALL OpMeta so the liveness walker
-                        // accounts for them as live at the call site
-                        // (assembler.py:225 get_liveness_info reads).
-                        for entry in &layout {
-                            arm_inline_call_reads.push(Register::new(entry.kind, entry.parent_reg));
-                        }
-                        let inline_call_emit = dispatch_arm_inline_call_tokens(&layout);
-                        (
-                            quote::quote! {
-                                let mut __sub_builder = majit_metainterp::JitCodeBuilder::new();
-                                let _live_offset_patch = __sub_builder.live_placeholder();
-                                {
-                                    let __builder = &mut __sub_builder;
-                                    #body
-                                }
-                                __sub_builder.finalize_liveness(__asm);
-                                __sub_builder.finish()
-                            },
-                            inline_call_emit,
-                        )
-                    }
-                    None => (
-                        quote::quote! {
-                            {
-                                let mut __sub_builder = majit_metainterp::JitCodeBuilder::new();
-                                __sub_builder.abort();
-                                __sub_builder.finish()
-                            }
-                        },
-                        // Failed-lower fallback: no caller args (the abort
-                        // body never reads them anyway).
-                        dispatch_arm_inline_call_tokens(&[]),
-                    ),
+        // Green-pc gated inline (Option A, #184): when `pc` is a declared
+        // green, lower a Lowerable arm body DIRECTLY into this dispatch
+        // JitCode so its pc-writes (operand `pc += N`, branch `pc = target`)
+        // reach the dispatch loop's reg0.  A BC_INLINE_CALL into a sub-JitCode
+        // copies args caller→callee only, so a sub-JitCode pc-write never
+        // reaches reg0 (the merge-point pc) — the inline path is what makes
+        // the green pc advance.  Arms whose body contains an inferred-policy
+        // call (`interpret_at`'s &[u8] unsupported residual, `storage_roll`)
+        // keep the sub-JitCode path: its build-time IIFE degrades to an abort
+        // stub when the runtime policy is unsupported, which the inline stream
+        // cannot do without a partial-ops-then-abort hazard.  Red-pc
+        // dispatches keep the sub-JitCode path unconditionally.
+        let inlined = pc_is_green(config)
+            && matches!(
+                arm.pattern,
+                crate::jit_interp::classify::ArmPattern::Lowerable
+            )
+            && !lowerer.arm_body_has_infer_call(&arm.original_body)
+            && lowerer.try_inline_dispatch_arm(&arm.original_body);
+
+        if std::env::var_os("MAJIT_MACRO_DEBUG").is_some() {
+            let pat = &arm.pat;
+            let pattern_name = match &arm.pattern {
+                crate::jit_interp::classify::ArmPattern::Lowerable => "Lowerable".to_string(),
+                crate::jit_interp::classify::ArmPattern::Nop => "Nop".to_string(),
+                crate::jit_interp::classify::ArmPattern::Halt => "Halt".to_string(),
+                crate::jit_interp::classify::ArmPattern::AbortPermanent => {
+                    "AbortPermanent".to_string()
                 }
-            }
-            // `break` arms (`Halt`) share the empty Nop body — RPython
-            // codewriter has no `abort_permanent/`, and emitting
-            // `BC_ABORT_PERMANENT` here was a pyre-only divergence that
-            // failed blackhole resume when a guard tail landed on the
-            // loop-exit arm of `while cond { ... }` patterns.
-            crate::jit_interp::classify::ArmPattern::Nop
-            | crate::jit_interp::classify::ArmPattern::Halt => (
-                quote::quote! { majit_metainterp::JitCodeBuilder::new().finish() },
-                dispatch_arm_inline_call_tokens(&[]),
-            ),
-            crate::jit_interp::classify::ArmPattern::AbortPermanent => (
-                quote::quote! {
-                    {
-                        let mut __sub_builder = majit_metainterp::JitCodeBuilder::new();
-                        __sub_builder.abort_permanent();
-                        __sub_builder.finish()
+                crate::jit_interp::classify::ArmPattern::Unsupported(reason) => {
+                    format!("Unsupported({reason})")
+                }
+            };
+            eprintln!(
+                "[majit-macro] dispatch arm {} pattern={} inlined={}",
+                quote::quote!(#pat),
+                pattern_name,
+                inlined,
+            );
+        }
+
+        if !inlined {
+            // jtransform.py:473-482 — inline_call_* + trailing -live-.
+            // Build the arm sub-JitCode and register it; emit BC_INLINE_CALL.
+            // This executes when the arm MATCHED (guards fell through); the
+            // sub-JitCode encodes the opcode handler body.
+            //
+            // Dispatch-arm caller-local plumbing: walk the arm
+            // body to collect parent-scope idents (via `collect_arm_caller_locals`),
+            // pre-bind them on the sub-Lowerer at fresh per-bank callee regs
+            // (via `try_generate_jitcode_body_parts_with_caller_bindings`), and
+            // emit the typed `inline_call_<types>_v(__sub_idx, args_i, args_r,
+            // args_f)` so the callee jitcode receives them as portal-input
+            // bindings.  Mirrors `jtransform.py:480 inline_call_<types>(jitcode,
+            // args...)`.  When the arm body has no parent-scope refs the layout
+            // is empty and the emit reduces to the no-arg `inline_call_r_v`
+            // (equivalent to the previous `__builder.inline_call(__sub_idx)`).
+            let mut arm_inline_call_reads: Vec<Register> = Vec::new();
+            let (arm_body_tokens, arm_inline_call_emit): (
+                proc_macro2::TokenStream,
+                proc_macro2::TokenStream,
+            ) = match &arm.pattern {
+                crate::jit_interp::classify::ArmPattern::Lowerable => {
+                    let caller_locals =
+                        collect_arm_caller_locals(&arm.original_body, &arm.pat, &lowerer.bindings);
+                    match try_generate_jitcode_body_parts_with_caller_bindings(
+                        &arm.original_body,
+                        Some(config),
+                        &caller_locals,
+                    ) {
+                        Some((generated, layout)) => {
+                            let body = generated.body;
+                            let liveness_prebuild = generated.liveness_prebuild;
+                            lowerer.inline_liveness_prebuild.push(liveness_prebuild);
+                            // Carry the parent-side caller regs into the
+                            // BC_INLINE_CALL OpMeta so the liveness walker
+                            // accounts for them as live at the call site
+                            // (assembler.py:225 get_liveness_info reads).
+                            for entry in &layout {
+                                arm_inline_call_reads
+                                    .push(Register::new(entry.kind, entry.parent_reg));
+                            }
+                            let inline_call_emit = dispatch_arm_inline_call_tokens(&layout);
+                            let min_i_regs = layout
+                                .iter()
+                                .filter(|e| matches!(e.kind, BindingKind::Int))
+                                .map(|e| e.callee_reg + 1)
+                                .max()
+                                .unwrap_or(0) as u16;
+                            let min_r_regs = layout
+                                .iter()
+                                .filter(|e| matches!(e.kind, BindingKind::Ref))
+                                .map(|e| e.callee_reg + 1)
+                                .max()
+                                .unwrap_or(0) as u16;
+                            let min_f_regs = layout
+                                .iter()
+                                .filter(|e| matches!(e.kind, BindingKind::Float))
+                                .map(|e| e.callee_reg + 1)
+                                .max()
+                                .unwrap_or(0) as u16;
+                            (
+                                quote::quote! {
+                                    // A runtime-resolved unsupported call policy
+                                    // (`inference_failure_tokens` → `return None`,
+                                    // e.g. a `#[dont_look_inside]` helper whose
+                                    // signature has no marshalable C-ABI call
+                                    // target) escapes arm-body lowering as the
+                                    // IIFE's `None`.  Degrade THIS arm to an abort
+                                    // sub-JitCode rather than failing the whole
+                                    // `__dispatch_jitcode_*` build: jtransform.py /
+                                    // `make_jitcodes()` builds the portal jitcode
+                                    // even when an individual opcode lowers to a
+                                    // residual the tracer can't follow — that opcode
+                                    // aborts the trace when hit, it never disables
+                                    // the JIT for every other opcode.
+                                    let __arm_jc: Option<majit_metainterp::JitCode> =
+                                        (|| -> Option<majit_metainterp::JitCode> {
+                                            let mut __sub_builder = majit_metainterp::JitCodeBuilder::new();
+                                            __sub_builder.ensure_i_regs(#min_i_regs);
+                                            __sub_builder.ensure_r_regs(#min_r_regs);
+                                            __sub_builder.ensure_f_regs(#min_f_regs);
+                                            let _live_offset_patch = __sub_builder.live_placeholder();
+                                            {
+                                                let __builder = &mut __sub_builder;
+                                                #body
+                                            }
+                                            __sub_builder.finalize_liveness(__asm);
+                                            Some(__sub_builder.finish())
+                                        })();
+                                    match __arm_jc {
+                                        Some(__jc) => __jc,
+                                        None => {
+                                            // Abort stub with the arm's register
+                                            // shape so the paired BC_INLINE_CALL's
+                                            // arg copies stay in bounds before the
+                                            // BC_ABORT.
+                                            let mut __sub_builder = majit_metainterp::JitCodeBuilder::new();
+                                            __sub_builder.ensure_i_regs(#min_i_regs);
+                                            __sub_builder.ensure_r_regs(#min_r_regs);
+                                            __sub_builder.ensure_f_regs(#min_f_regs);
+                                            __sub_builder.abort();
+                                            __sub_builder.finish()
+                                        }
+                                    }
+                                },
+                                inline_call_emit,
+                            )
+                        }
+                        None => (
+                            quote::quote! {
+                                {
+                                    let mut __sub_builder = majit_metainterp::JitCodeBuilder::new();
+                                    __sub_builder.abort();
+                                    __sub_builder.finish()
+                                }
+                            },
+                            dispatch_arm_inline_call_tokens(&[]),
+                        ),
                     }
-                },
-                dispatch_arm_inline_call_tokens(&[]),
-            ),
-            crate::jit_interp::classify::ArmPattern::Unsupported(_) => (
+                }
+                // `break` arms (`Halt`) share the empty Nop body — RPython
+                // codewriter has no `abort_permanent/`, and emitting
+                // `BC_ABORT_PERMANENT` here was a pyre-only divergence that
+                // failed blackhole resume when a guard tail landed on the
+                // loop-exit arm of `while cond { ... }` patterns.
+                crate::jit_interp::classify::ArmPattern::Nop
+                | crate::jit_interp::classify::ArmPattern::Halt => (
+                    quote::quote! { majit_metainterp::JitCodeBuilder::new().finish() },
+                    dispatch_arm_inline_call_tokens(&[]),
+                ),
+                crate::jit_interp::classify::ArmPattern::AbortPermanent => (
+                    quote::quote! {
+                        {
+                            let mut __sub_builder = majit_metainterp::JitCodeBuilder::new();
+                            __sub_builder.abort_permanent();
+                            __sub_builder.finish()
+                        }
+                    },
+                    dispatch_arm_inline_call_tokens(&[]),
+                ),
+                crate::jit_interp::classify::ArmPattern::Unsupported(_reason) => (
+                    quote::quote! {
+                        {
+                            let mut __sub_builder = majit_metainterp::JitCodeBuilder::new();
+                            __sub_builder.abort();
+                            __sub_builder.finish()
+                        }
+                    },
+                    dispatch_arm_inline_call_tokens(&[]),
+                ),
+            };
+            lowerer.emit_op(
+                OpMeta::linear(OpKind::InlineCall, arm_inline_call_reads, vec![]),
                 quote::quote! {
-                    {
-                        let mut __sub_builder = majit_metainterp::JitCodeBuilder::new();
-                        __sub_builder.abort();
-                        __sub_builder.finish()
-                    }
+                    let __sub_jitcode = { #arm_body_tokens };
+                    let __sub_idx = __builder.add_sub_jitcode(__sub_jitcode);
+                    #arm_inline_call_emit
                 },
-                dispatch_arm_inline_call_tokens(&[]),
-            ),
-        };
-        lowerer.emit_op(
-            OpMeta::linear(OpKind::InlineCall, arm_inline_call_reads, vec![]),
-            quote::quote! {
-                let __sub_jitcode = { #arm_body_tokens };
-                let __sub_idx = __builder.add_sub_jitcode(__sub_jitcode);
-                #arm_inline_call_emit
-            },
-        );
-        // jtransform.py:480-482 — trailing -live- after inline_call_*.
-        lowerer.emit_op(
-            OpMeta::live_marker(),
-            quote::quote! { let _ = __builder.live_placeholder(); },
-        );
+            );
+            // jtransform.py:480-482 — trailing -live- after inline_call_*.
+            lowerer.emit_op(
+                OpMeta::live_marker(),
+                quote::quote! { let _ = __builder.live_placeholder(); },
+            );
+        }
         // jtransform.py:1714-1723 `handle_jit_marker__loop_header`:
         // RPython lowers `can_enter_jit()` at the user's source-code
         // back-edge (interp_jit.py:118 `pypyjitdriver.can_enter_jit(...)`
@@ -2519,6 +2944,7 @@ pub(crate) fn lower_dispatch_body(
     let loop_start_label = lowerer.alloc_label();
     lowerer.emit_aux(quote::quote! { let #loop_start_label = __builder.new_label(); });
     lowerer.emit_label_def(&loop_start_label);
+    lowerer.dispatch_loop_label = Some(loop_start_label.clone());
 
     // Register the portal-input bindings at proc-macro time before
     // resolve_greens (below) consults the binding map.  These are
@@ -2545,7 +2971,27 @@ pub(crate) fn lower_dispatch_body(
             depends_on_stack: false,
         },
     );
-    lowerer.next_reg = lowerer.next_reg.max(1);
+    // State-field scalars occupy reserved identity-slot prefixes:
+    // int scalars at `int_regs[base..base+num_scalars)` where base =
+    // `int_identity_base()` skips the dispatch JitCode's int argument
+    // (`pc` at i0), and ref scalars at
+    // `ref_regs[base..base+num_ref_scalars)` where base =
+    // `ref_identity_base()` skips the dispatch JitCode's ref-bank arguments
+    // (`program` at r0, vable identity at r1 when present), populated by
+    // populate_frame_int_regs / restore_banked.  `alloc_reg` draws BOTH int
+    // and ref working registers from the single `next_reg` counter, so floor
+    // it above the larger prefix: a working register that aliased an identity
+    // slot in either bank would overwrite the field value the blackhole
+    // resume seeder restored, corrupting the live interpreter state on guard
+    // failure.  With no scalars `int_identity_end` is just the base, which
+    // keeps pc's i0 reserved.
+    let ref_identity_end = if config.state_ref_scalars.is_empty() {
+        0
+    } else {
+        config.ref_identity_base() + config.state_ref_scalars.len() as u16
+    };
+    let int_identity_end = config.int_identity_base() + config.state_scalars.len() as u16;
+    lowerer.next_reg = lowerer.next_reg.max(int_identity_end).max(ref_identity_end);
 
     // A.3.6.1 (jtransform.py:1693): bind body-local `let` stmts that
     // appear BEFORE `jit_merge_point!()` in the dispatch while-body, so
@@ -2649,9 +3095,12 @@ pub(crate) fn lower_dispatch_body(
     //
     // TODO: derive env_param_name / pc_var_name from LowererConfig or
     // macro config instead of hard-coding "program"/"pc".
+    // Placeholder: actual register counts patched after dispatch chain
+    // lowers all arms and we know the final next_reg.
+    let ensure_regs_stmt_idx = lowerer.statements.len();
     lowerer.emit_aux(quote::quote! {
-        __builder.ensure_r_regs(2u16);  // r0 = program; r1 = virtualizable when present
-        __builder.ensure_i_regs(1u16);  // i0 = pc (Int bank)
+        __builder.ensure_r_regs(2u16);
+        __builder.ensure_i_regs(1u16);
     });
 
     // interp_jit.py:91-93: lower stmts that appear between jit_merge_point
@@ -2661,7 +3110,22 @@ pub(crate) fn lower_dispatch_body(
     //
     // Walk: find the dispatch match, then find the while body that contains it,
     // then iterate stmts before the match-containing stmt.
+    //
+    // Pin pc-writes to i0 for the whole pre-dispatch walk. The branch-op
+    // match that precedes the dispatch match (aheui-jit lib.rs:520-545
+    // OP_BRPOP/OP_JMP/OP_BRZ, rpaheui aheui.py:294-311) carries
+    // `pc = program.get_label(pc - 1); ...; continue;` arms. Without the
+    // pin, the assignment SSA-rebinds `pc` to a fresh register that dies
+    // at the `continue` back-edge, so the next merge point reads the
+    // STALE fall-through pc from i0 (pre-advanced `pc += 1`) — the
+    // recorded green-pc channel diverges from concrete execution (an
+    // unconditional JMP at the last program index records pc == len,
+    // and `get_req_size(len)` is out of bounds). RPython has no rebind
+    // hazard: `pc` is one Variable through jtransform, so every write
+    // reaches the merge point by construction.
+    lowerer.pc_pinned = true;
     let _lowered_pre_dispatch = lower_pre_dispatch_stmts(&mut lowerer, func_block);
+    lowerer.pc_pinned = false;
     // A.2.3a fail-closed install gate: if pre-dispatch lowering detected
     // a structurally unrecognized inner construct (currently only the
     // `Expr::While` shape mismatch path), abort dispatch JitCode body
@@ -2679,6 +3143,16 @@ pub(crate) fn lower_dispatch_body(
     // into goto_if_not_int_eq/iiL (BC_GOTO_IF_NOT_INT_EQ).
     let default_label =
         lower_dispatch_chain(&mut lowerer, classified_arms, config, &loop_start_label);
+
+    // Patch ensure_regs placeholder with actual register counts.
+    {
+        let final_i_regs = lowerer.next_reg;
+        let final_r_regs = 2u16; // r0=program, r1=vable (unchanged)
+        lowerer.statements[ensure_regs_stmt_idx] = quote::quote! {
+            __builder.ensure_r_regs(#final_r_regs);
+            __builder.ensure_i_regs(#final_i_regs);
+        };
+    }
 
     // Task 1.7: default arm typed return.
     // Bind default_label here so the dispatch chain's fall-through GOTO lands
