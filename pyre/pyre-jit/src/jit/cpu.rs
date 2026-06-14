@@ -76,6 +76,13 @@ pub struct Cpu {
     /// and imports through the TLS-pinned execution context (may run module
     /// top-level Python → fallible).
     pub import_name_fn: extern "C" fn(i64, i64, i64, i64) -> i64,
+    /// `bh_load_super_attr_fn(self, cls, code, name_idx)` — LOAD_SUPER_ATTR
+    /// `getattr(super(cls, self), name)` residual (descriptor `__get__` may
+    /// run Python → fallible).
+    pub load_super_attr_fn: extern "C" fn(i64, i64, i64, i64) -> i64,
+    /// `bh_super_attr_unwrap_fn(raw, which)` — LOAD_SUPER_ATTR method-form
+    /// unwrap (`which` 0 = func slot, 1 = self slot); pure / infallible.
+    pub super_attr_unwrap_fn: extern "C" fn(i64, i64) -> i64,
     /// `bhimpl_compare_op` — RPython compare_op opcodes.
     pub compare_fn: extern "C" fn(i64, i64, i64) -> i64,
     /// `bhimpl_binary_op` — RPython binary_op opcodes.
@@ -218,6 +225,8 @@ impl Cpu {
             format_with_spec_fn: crate::call_jit::bh_format_with_spec_fn,
             convert_value_fn: crate::call_jit::bh_convert_value_fn,
             import_name_fn: crate::call_jit::bh_import_name_fn,
+            load_super_attr_fn: crate::call_jit::bh_load_super_attr_fn,
+            super_attr_unwrap_fn: crate::call_jit::bh_super_attr_unwrap_fn,
             compare_fn: crate::call_jit::bh_compare_fn,
             binary_op_fn: crate::call_jit::bh_binary_op_fn,
             box_int_fn: crate::call_jit::bh_box_int_fn,

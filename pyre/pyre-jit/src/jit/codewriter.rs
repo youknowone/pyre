@@ -2948,6 +2948,47 @@ fn emit_frontend_import_name(
     )
 }
 
+fn emit_frontend_load_super_attr(
+    graph: &mut super::flow::FunctionGraph,
+    block: &super::flow::BlockRef,
+    self_value: super::flow::FlowValue,
+    cls_value: super::flow::FlowValue,
+    code: super::flow::FlowValue,
+    name_idx: super::flow::FlowValue,
+    offset: i64,
+) -> super::flow::Variable {
+    emit_graph_op_with_result(
+        graph,
+        block,
+        "load_super_attr",
+        vec![
+            self_value.into(),
+            cls_value.into(),
+            code.into(),
+            name_idx.into(),
+        ],
+        Kind::Ref,
+        offset,
+    )
+}
+
+fn emit_frontend_super_attr_unwrap(
+    graph: &mut super::flow::FunctionGraph,
+    block: &super::flow::BlockRef,
+    raw: super::flow::FlowValue,
+    which: super::flow::FlowValue,
+    offset: i64,
+) -> super::flow::Variable {
+    emit_graph_op_with_result(
+        graph,
+        block,
+        "super_attr_unwrap",
+        vec![raw.into(), which.into()],
+        Kind::Ref,
+        offset,
+    )
+}
+
 fn frontend_load_const_flow_value(code: &CodeObject, idx: usize) -> super::flow::FlowValue {
     // `flowcontext.py:841-843 LOAD_CONST`: fetch the pre-wrapped constant
     // and push that value.  Pyre's CodeObject stores RustPython
@@ -3307,6 +3348,8 @@ struct FnPtrIndices {
     build_string_from_array_fn: HelperHandle,
     convert_value_fn: HelperHandle,
     import_name_fn: HelperHandle,
+    load_super_attr_fn: HelperHandle,
+    super_attr_unwrap_fn: HelperHandle,
 }
 
 /// Register every blackhole helper fn pointer with the assembler in
@@ -3609,6 +3652,20 @@ fn register_helper_fn_pointers(
         cpu.import_name_fn as *const (),
         CallFlavor::MayForce,
     );
+    // `bh_load_super_attr_fn` runs `getattr` on the super proxy (descriptor
+    // `__get__` may run Python) → `MayForce`.  `bh_super_attr_unwrap_fn` is
+    // pure but routes through the proven MayForce ir_r path.  Appended last
+    // to preserve fn_ptr indices.
+    let load_super_attr_fn = bind(
+        assembler,
+        cpu.load_super_attr_fn as *const (),
+        CallFlavor::MayForce,
+    );
+    let super_attr_unwrap_fn = bind(
+        assembler,
+        cpu.super_attr_unwrap_fn as *const (),
+        CallFlavor::MayForce,
+    );
     FnPtrIndices {
         call_fn,
         load_global_fn,
@@ -3650,6 +3707,8 @@ fn register_helper_fn_pointers(
         build_string_from_array_fn,
         convert_value_fn,
         import_name_fn,
+        load_super_attr_fn,
+        super_attr_unwrap_fn,
     }
 }
 
@@ -4611,6 +4670,16 @@ impl CodeWriter {
                     idx: import_name_fn_idx,
                     flavor: _import_name_fn_flavor,
                 },
+            load_super_attr_fn:
+                HelperHandle {
+                    idx: load_super_attr_fn_idx,
+                    flavor: _load_super_attr_fn_flavor,
+                },
+            super_attr_unwrap_fn:
+                HelperHandle {
+                    idx: super_attr_unwrap_fn_idx,
+                    flavor: _super_attr_unwrap_fn_flavor,
+                },
         } = register_helper_fn_pointers(&mut assembler, self.cpu());
 
         // codewriter.py:37 `portal_jd = self.callcontrol.jitdriver_sd_from_portal_graph(graph)`
@@ -4683,6 +4752,8 @@ impl CodeWriter {
                 build_string_from_array_fn_idx,
                 convert_value_fn_idx,
                 import_name_fn_idx,
+                load_super_attr_fn_idx,
+                super_attr_unwrap_fn_idx,
             });
         }
 
@@ -8488,22 +8559,70 @@ impl CodeWriter {
                             push_and_bump!(result_value.into(), py_pc);
                         }
 
-                        // LoadSuperAttr: pops 3 (super, cls, self).
-                        // is_method=false → pushes 1 (result). Net: -2.
-                        // is_method=true  → pushes 2 (func, self_or_null). Net: -1.
-                        // pyopcode.rs:1926-1932, eval.rs:2331-2360.
+                        // LoadSuperAttr: pops 3 (self=TOS, cls=TOS1,
+                        // global_super=TOS2). is_method=false → pushes 1
+                        // (result). Net: -2.  is_method=true → pushes 2 (func,
+                        // self_or_null). Net: -1.  `oparg >> 2` is the co_names
+                        // index, `oparg & 1` the is_method flag (both
+                        // compile-time constants).  `load_super_attr(self, cls,
+                        // code, name_idx)` HLOp →
+                        // `residual_call_ir_r(load_super_attr_fn, ListI[name_idx],
+                        // ListR[self, cls, code])` resolves `getattr(super(cls,
+                        // self), name)` (MayForce).  The is_method form runs the
+                        // runtime bound-method unwrap through two pure
+                        // `super_attr_unwrap(raw, which)` residuals (which 0 =
+                        // func slot, 1 = self slot), mirroring the LOAD_ATTR
+                        // method form's two-residual push.
                         Instruction::LoadSuperAttr { .. } => {
+                            let name_idx = (u32::from(op_arg) >> 2) as usize;
                             let is_method = (u32::from(op_arg) & 1) != 0;
-                            for _ in 0..3 {
-                                pop_and_decr_depth(&mut current_state, &mut current_depth);
-                            }
-                            push_fresh_ref(&mut current_state, &mut graph);
-                            current_depth += 1;
+                            let code_const: super::flow::FlowValue =
+                                super::flow::Constant::new(
+                                    super::flow::ConstantValue::Signed(w_code as i64),
+                                    Some(Kind::Ref),
+                                )
+                                .into();
+                            let name_idx_const: super::flow::FlowValue =
+                                super::flow::Constant::signed(name_idx as i64).into();
+                            let _ = emit_popvalue_ref!(current_depth, py_pc);
+                            let self_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            let _ = emit_popvalue_ref!(current_depth, py_pc);
+                            let cls_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            let _ = emit_popvalue_ref!(current_depth, py_pc);
+                            let _global_super =
+                                pop_ref_or_fresh(&mut current_state, &mut graph);
+                            let raw_value = emit_frontend_load_super_attr(
+                                &mut graph,
+                                &current_block.block(),
+                                self_value,
+                                cls_value,
+                                code_const,
+                                name_idx_const,
+                                py_pc as i64,
+                            );
                             if is_method {
-                                push_fresh_ref(&mut current_state, &mut graph);
-                                current_depth += 1;
+                                let func_value = emit_frontend_super_attr_unwrap(
+                                    &mut graph,
+                                    &current_block.block(),
+                                    raw_value.into(),
+                                    super::flow::Constant::signed(0).into(),
+                                    py_pc as i64,
+                                );
+                                pin!(Some(func_value), stack_base + current_depth);
+                                push_and_bump!(func_value.into(), py_pc);
+                                let self_slot_value = emit_frontend_super_attr_unwrap(
+                                    &mut graph,
+                                    &current_block.block(),
+                                    raw_value.into(),
+                                    super::flow::Constant::signed(1).into(),
+                                    py_pc as i64,
+                                );
+                                pin!(Some(self_slot_value), stack_base + current_depth);
+                                push_and_bump!(self_slot_value.into(), py_pc);
+                            } else {
+                                pin!(Some(raw_value), stack_base + current_depth);
+                                push_and_bump!(raw_value.into(), py_pc);
                             }
-                            emit_abort_permanent!(py_pc);
                         }
 
                         // UnpackEx: pops 1, pushes before+1+after items. Net: before+after.

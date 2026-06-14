@@ -3503,6 +3503,70 @@ pub extern "C" fn bh_import_name_fn(
     }
 }
 
+/// LOAD_SUPER_ATTR residual (`load_super_attr` HLOp → `residual_call_ir_r`).
+/// Resolves the attribute name from the jitcode's code object via `name_idx`
+/// (same `co_names` invariant as `bh_load_attr_fn`), builds the `super(cls,
+/// self)` proxy, and runs `getattr` (a descriptor `__get__` may run Python →
+/// `MayForce`).  Returns the raw resolved attribute; the `is_method` form
+/// post-processes it through [`bh_super_attr_unwrap_fn`].  On error the
+/// exception is published through `BH_LAST_EXC_VALUE` for the trailing
+/// `GuardNoException` and the call returns 0.
+pub extern "C" fn bh_load_super_attr_fn(
+    self_obj: i64,
+    cls: i64,
+    w_code_ptr: i64,
+    name_idx: i64,
+) -> i64 {
+    let w_code = w_code_ptr as pyre_object::PyObjectRef;
+    let code = unsafe {
+        &*(pyre_interpreter::w_code_get_ptr(w_code) as *const pyre_interpreter::CodeObject)
+    };
+    let idx = name_idx as usize;
+    debug_assert!(
+        idx < code.names.len(),
+        "bh_load_super_attr_fn name_idx {idx} out of range ({} names) — codegen invariant",
+        code.names.len()
+    );
+    if idx >= code.names.len() {
+        return 0;
+    }
+    let name = code.names[idx].as_ref();
+    let proxy = pyre_object::superobject::w_super_new(
+        cls as pyre_object::PyObjectRef,
+        self_obj as pyre_object::PyObjectRef,
+    );
+    match pyre_interpreter::baseobjspace::getattr_str(proxy, name) {
+        Ok(result) => result as i64,
+        Err(err) => {
+            let exc_obj = err.to_exc_object();
+            majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc_obj as i64));
+            0
+        }
+    }
+}
+
+/// LOAD_SUPER_ATTR method-form unwrap (`super_attr_unwrap` HLOp →
+/// `residual_call_ir_r`).  Pure function of the raw attribute resolved by
+/// [`bh_load_super_attr_fn`] — `which == 0` yields the func slot, `which ==
+/// 1` the self slot.  When the attribute is a bound method, unwraps it to
+/// `(func, receiver)`; otherwise (staticmethod / classmethod) yields
+/// `(result, NULL)`.  Infallible and idempotent, so safe under the walk /
+/// replay double-execution seam.
+pub extern "C" fn bh_super_attr_unwrap_fn(raw: i64, which: i64) -> i64 {
+    let result = raw as pyre_object::PyObjectRef;
+    if unsafe { pyre_object::is_method(result) } {
+        if which == 0 {
+            unsafe { pyre_object::w_method_get_func(result) as i64 }
+        } else {
+            unsafe { pyre_object::w_method_get_self(result) as i64 }
+        }
+    } else if which == 0 {
+        raw
+    } else {
+        pyre_object::PY_NULL as i64
+    }
+}
+
 /// BINARY_SLICE residual (`binary_slice` HLOp → `residual_call_r_r`).
 /// Computes `obj[start:stop]` through the shared
 /// `runtime_ops::binary_slice_values` (the same code the interpreter's

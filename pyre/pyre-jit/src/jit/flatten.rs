@@ -3303,6 +3303,19 @@ pub struct LoweringContext {
     /// `bh_import_name_fn` runs `__import__` (module top-level Python may
     /// run → `MayForce`).
     pub import_name_fn_idx: u16,
+    /// `load_super_attr_fn` descrs-pool index.  LOAD_SUPER_ATTR records the
+    /// `load_super_attr(self, cls, code, name_idx)` HLOp lowered to
+    /// `residual_call_ir_r(ConstInt(fn_idx), ListI([name_idx]), ListR([self,
+    /// cls, code]), Descr) → reg` via [`lower_load_super_attr_hlop_to_insn`];
+    /// `bh_load_super_attr_fn` resolves `getattr(super(cls, self), name)`
+    /// (descriptor `__get__` may run → `MayForce`).
+    pub load_super_attr_fn_idx: u16,
+    /// `super_attr_unwrap_fn` descrs-pool index.  The LOAD_SUPER_ATTR
+    /// method form records `super_attr_unwrap(raw, which)` HLOps lowered to
+    /// `residual_call_ir_r(ConstInt(fn_idx), ListI([which]), ListR([raw]),
+    /// Descr) → reg` via [`lower_super_attr_unwrap_hlop_to_insn`] (the
+    /// single-Ref CONVERT_VALUE shape); `bh_super_attr_unwrap_fn` is pure.
+    pub super_attr_unwrap_fn_idx: u16,
 }
 
 /// Map a BINARY_OP HLOp opname (`add`/.../`xor`/`getitem` plus the
@@ -4786,6 +4799,12 @@ where
     if let Some(insn) = lower_import_name_hlop_to_insn(op, ctx, get_register, lower_constant) {
         return Some(insn);
     }
+    if let Some(insn) = lower_load_super_attr_hlop_to_insn(op, ctx, get_register, lower_constant) {
+        return Some(insn);
+    }
+    if let Some(insn) = lower_super_attr_unwrap_hlop_to_insn(op, ctx, get_register, lower_constant) {
+        return Some(insn);
+    }
     None
 }
 
@@ -5139,6 +5158,102 @@ where
                 Kind::Ref,
                 vec![fromlist, level, code],
             )),
+            descr_operand,
+        ],
+        dst_reg,
+    ))
+}
+
+/// Lower the LOAD_SUPER_ATTR pyre HLOp `load_super_attr(self, cls, code,
+/// name_idx)` → `result: Ref` to `residual_call_ir_r(ConstInt(
+/// load_super_attr_fn_idx), ListI([name_idx]), ListR([self, cls, code]),
+/// Descr) → reg` — the same three-Ref shape as IMPORT_NAME.
+/// `bh_load_super_attr_fn` resolves `getattr(super(cls, self), name)`
+/// (descriptor `__get__` may run → `MayForce`).
+///
+/// Returns `None` for non-`load_super_attr` opnames so the caller can fall
+/// through to other lowering arms.
+pub fn lower_load_super_attr_hlop_to_insn<F, LC>(
+    op: &super::flow::SpaceOperation,
+    ctx: &LoweringContext,
+    get_register: &mut F,
+    lower_constant: &mut LC,
+) -> Option<Insn>
+where
+    F: FnMut(super::flow::Variable) -> Register,
+    LC: FnMut(&Constant) -> Operand,
+{
+    if op.opname != "load_super_attr" || op.args.len() != 4 {
+        return None;
+    }
+    let self_obj = operand_for_value_arg(&op.args[0], get_register, lower_constant)?;
+    let cls = operand_for_value_arg(&op.args[1], get_register, lower_constant)?;
+    let code = operand_for_value_arg(&op.args[2], get_register, lower_constant)?;
+    let name_idx = const_int_for_value_arg(&op.args[3])?;
+    let dst_reg = match &op.result {
+        Some(super::flow::FlowValue::Variable(var)) => get_register(*var),
+        _ => return None,
+    };
+    let effect_info = effect_info_for_call_flavor(CallFlavor::MayForce);
+    let descr_operand = Operand::descr(DescrOperand::CallDescrStub(CallDescrStub {
+        effect_info,
+        arg_kinds: vec![Kind::Ref, Kind::Ref, Kind::Ref, Kind::Int],
+        result_kind: Some(Kind::Ref),
+    }));
+    Some(Insn::op_with_result(
+        "residual_call_ir_r",
+        vec![
+            Operand::ConstInt(ctx.load_super_attr_fn_idx as i64),
+            Operand::ListOfKind(ListOfKind::new(
+                Kind::Int,
+                vec![Operand::ConstInt(name_idx)],
+            )),
+            Operand::ListOfKind(ListOfKind::new(Kind::Ref, vec![self_obj, cls, code])),
+            descr_operand,
+        ],
+        dst_reg,
+    ))
+}
+
+/// Lower the LOAD_SUPER_ATTR method-form unwrap HLOp `super_attr_unwrap(raw,
+/// which)` → `result: Ref` to `residual_call_ir_r(ConstInt(
+/// super_attr_unwrap_fn_idx), ListI([which]), ListR([raw]), Descr) → reg`,
+/// the single-Ref CONVERT_VALUE shape.  `which` is a compile-time constant
+/// (0 = func slot, 1 = self slot); `bh_super_attr_unwrap_fn` is pure.
+///
+/// Returns `None` for non-`super_attr_unwrap` opnames so the caller can fall
+/// through to other lowering arms.
+pub fn lower_super_attr_unwrap_hlop_to_insn<F, LC>(
+    op: &super::flow::SpaceOperation,
+    ctx: &LoweringContext,
+    get_register: &mut F,
+    lower_constant: &mut LC,
+) -> Option<Insn>
+where
+    F: FnMut(super::flow::Variable) -> Register,
+    LC: FnMut(&Constant) -> Operand,
+{
+    if op.opname != "super_attr_unwrap" || op.args.len() != 2 {
+        return None;
+    }
+    let raw = operand_for_value_arg(&op.args[0], get_register, lower_constant)?;
+    let which = const_int_for_value_arg(&op.args[1])?;
+    let dst_reg = match &op.result {
+        Some(super::flow::FlowValue::Variable(var)) => get_register(*var),
+        _ => return None,
+    };
+    let effect_info = effect_info_for_call_flavor(CallFlavor::MayForce);
+    let descr_operand = Operand::descr(DescrOperand::CallDescrStub(CallDescrStub {
+        effect_info,
+        arg_kinds: vec![Kind::Ref, Kind::Int],
+        result_kind: Some(Kind::Ref),
+    }));
+    Some(Insn::op_with_result(
+        "residual_call_ir_r",
+        vec![
+            Operand::ConstInt(ctx.super_attr_unwrap_fn_idx as i64),
+            Operand::ListOfKind(ListOfKind::new(Kind::Int, vec![Operand::ConstInt(which)])),
+            Operand::ListOfKind(ListOfKind::new(Kind::Ref, vec![raw])),
             descr_operand,
         ],
         dst_reg,
@@ -6643,6 +6758,8 @@ mod tests {
             format_with_spec_fn_idx: 0,
             convert_value_fn_idx: 0,
             import_name_fn_idx: 0,
+            load_super_attr_fn_idx: 0,
+            super_attr_unwrap_fn_idx: 0,
 };
         let mut on = SSARepr::new("setattr_on");
         let mut on_regallocs = make_regallocs();
@@ -6790,6 +6907,8 @@ mod tests {
             format_with_spec_fn_idx: 0,
             convert_value_fn_idx: 0,
             import_name_fn_idx: 0,
+            load_super_attr_fn_idx: 0,
+            super_attr_unwrap_fn_idx: 0,
 };
 
         let mut ssarepr = SSARepr::new("retired_families");
@@ -6924,6 +7043,8 @@ mod tests {
             format_with_spec_fn_idx: 0,
             convert_value_fn_idx: 0,
             import_name_fn_idx: 0,
+            load_super_attr_fn_idx: 0,
+            super_attr_unwrap_fn_idx: 0,
 };
 
         let mut ssarepr = SSARepr::new("trailing_live");
@@ -7021,6 +7142,8 @@ mod tests {
             format_with_spec_fn_idx: 0,
             convert_value_fn_idx: 0,
             import_name_fn_idx: 0,
+            load_super_attr_fn_idx: 0,
+            super_attr_unwrap_fn_idx: 0,
 };
 
         let mut ssarepr = SSARepr::new("multi_block_lowering");
@@ -7162,6 +7285,8 @@ mod tests {
             format_with_spec_fn_idx: 0,
             convert_value_fn_idx: 0,
             import_name_fn_idx: 0,
+            load_super_attr_fn_idx: 0,
+            super_attr_unwrap_fn_idx: 0,
 };
 
         let mut ssarepr = SSARepr::new("pyre_walker_2exit");
@@ -7348,6 +7473,8 @@ mod tests {
             format_with_spec_fn_idx: 0,
             convert_value_fn_idx: 0,
             import_name_fn_idx: 0,
+            load_super_attr_fn_idx: 0,
+            super_attr_unwrap_fn_idx: 0,
 });
 
         let mut regallocs = perform_register_allocation_all_kinds(&graph);
@@ -7583,6 +7710,8 @@ mod tests {
             format_with_spec_fn_idx: 0,
             convert_value_fn_idx: 0,
             import_name_fn_idx: 0,
+            load_super_attr_fn_idx: 0,
+            super_attr_unwrap_fn_idx: 0,
 };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -7684,6 +7813,8 @@ mod tests {
             format_with_spec_fn_idx: 0,
             convert_value_fn_idx: 0,
             import_name_fn_idx: 0,
+            load_super_attr_fn_idx: 0,
+            super_attr_unwrap_fn_idx: 0,
 };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -7729,6 +7860,8 @@ mod tests {
             format_with_spec_fn_idx: 0,
             convert_value_fn_idx: 0,
             import_name_fn_idx: 0,
+            load_super_attr_fn_idx: 0,
+            super_attr_unwrap_fn_idx: 0,
 };
 
         let hlop = SpaceOperation::new("sub", vec![lhs.into(), rhs.into()], Some(result.into()), 0);
@@ -7851,6 +7984,8 @@ mod tests {
             format_with_spec_fn_idx: 0,
             convert_value_fn_idx: 0,
             import_name_fn_idx: 0,
+            load_super_attr_fn_idx: 0,
+            super_attr_unwrap_fn_idx: 0,
 };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -7931,6 +8066,8 @@ mod tests {
             format_with_spec_fn_idx: 0,
             convert_value_fn_idx: 0,
             import_name_fn_idx: 0,
+            load_super_attr_fn_idx: 0,
+            super_attr_unwrap_fn_idx: 0,
         };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -7982,6 +8119,8 @@ mod tests {
             format_with_spec_fn_idx: 0,
             convert_value_fn_idx: 0,
             import_name_fn_idx: 0,
+            load_super_attr_fn_idx: 0,
+            super_attr_unwrap_fn_idx: 0,
 };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -8025,6 +8164,8 @@ mod tests {
             format_with_spec_fn_idx: 0,
             convert_value_fn_idx: 0,
             import_name_fn_idx: 0,
+            load_super_attr_fn_idx: 0,
+            super_attr_unwrap_fn_idx: 0,
 };
         let hlop = SpaceOperation::new("eq", vec![lhs.into(), rhs.into()], Some(result.into()), 0);
         let mut get_register = identity_register_mapper();
@@ -8075,6 +8216,8 @@ mod tests {
             format_with_spec_fn_idx: 0,
             convert_value_fn_idx: 0,
             import_name_fn_idx: 0,
+            load_super_attr_fn_idx: 0,
+            super_attr_unwrap_fn_idx: 0,
 };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -8152,6 +8295,8 @@ mod tests {
             format_with_spec_fn_idx: 0,
             convert_value_fn_idx: 0,
             import_name_fn_idx: 0,
+            load_super_attr_fn_idx: 0,
+            super_attr_unwrap_fn_idx: 0,
 };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -8192,6 +8337,8 @@ mod tests {
             format_with_spec_fn_idx: 0,
             convert_value_fn_idx: 0,
             import_name_fn_idx: 0,
+            load_super_attr_fn_idx: 0,
+            super_attr_unwrap_fn_idx: 0,
 };
         let hlop = SpaceOperation::new("bool", vec![cond.into()], Some(result.into()), 0);
         let mut get_register = identity_register_mapper();
@@ -8246,6 +8393,8 @@ mod tests {
             format_with_spec_fn_idx: 0,
             convert_value_fn_idx: 0,
             import_name_fn_idx: 0,
+            load_super_attr_fn_idx: 0,
+            super_attr_unwrap_fn_idx: 0,
 };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -8316,6 +8465,8 @@ mod tests {
             format_with_spec_fn_idx: 0,
             convert_value_fn_idx: 0,
             import_name_fn_idx: 0,
+            load_super_attr_fn_idx: 0,
+            super_attr_unwrap_fn_idx: 0,
 };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -8371,6 +8522,8 @@ mod tests {
             format_with_spec_fn_idx: 0,
             convert_value_fn_idx: 0,
             import_name_fn_idx: 0,
+            load_super_attr_fn_idx: 0,
+            super_attr_unwrap_fn_idx: 0,
 };
         let hlop = SpaceOperation::new(
             "setitem",
@@ -8441,6 +8594,8 @@ mod tests {
             format_with_spec_fn_idx: 0,
             convert_value_fn_idx: 0,
             import_name_fn_idx: 0,
+            load_super_attr_fn_idx: 0,
+            super_attr_unwrap_fn_idx: 0,
 };
         let mut get_register_a = identity_register_mapper();
         let mut get_register_b = identity_register_mapper();
@@ -8487,6 +8642,8 @@ mod tests {
             format_with_spec_fn_idx: 0,
             convert_value_fn_idx: 0,
             import_name_fn_idx: 0,
+            load_super_attr_fn_idx: 0,
+            super_attr_unwrap_fn_idx: 0,
 };
         let mut get_register_a = identity_register_mapper();
         let mut get_register_b = identity_register_mapper();
@@ -8533,6 +8690,8 @@ mod tests {
             format_with_spec_fn_idx: 0,
             convert_value_fn_idx: 0,
             import_name_fn_idx: 0,
+            load_super_attr_fn_idx: 0,
+            super_attr_unwrap_fn_idx: 0,
 };
         let mut get_register_a = identity_register_mapper();
         let mut get_register_b = identity_register_mapper();
@@ -8584,6 +8743,8 @@ mod tests {
             format_with_spec_fn_idx: 0,
             convert_value_fn_idx: 0,
             import_name_fn_idx: 0,
+            load_super_attr_fn_idx: 0,
+            super_attr_unwrap_fn_idx: 0,
 };
         let mut get_register_a = identity_register_mapper();
         let mut get_register_b = identity_register_mapper();
@@ -8649,6 +8810,8 @@ mod tests {
             format_with_spec_fn_idx: 0,
             convert_value_fn_idx: 0,
             import_name_fn_idx: 0,
+            load_super_attr_fn_idx: 0,
+            super_attr_unwrap_fn_idx: 0,
 };
         let mut get_register_a = identity_register_mapper();
         let mut get_register_b = identity_register_mapper();
@@ -10037,6 +10200,8 @@ mod tests {
             format_with_spec_fn_idx: 0,
             convert_value_fn_idx: 0,
             import_name_fn_idx: 0,
+            load_super_attr_fn_idx: 0,
+            super_attr_unwrap_fn_idx: 0,
 };
         flatten_graph_for_test_with_lowering(&graph, &mut ssarepr, ctx, Some(cpu));
         ssarepr
@@ -10324,6 +10489,8 @@ mod tests {
             format_with_spec_fn_idx: 0,
             convert_value_fn_idx: 0,
             import_name_fn_idx: 0,
+            load_super_attr_fn_idx: 0,
+            super_attr_unwrap_fn_idx: 0,
 };
         let null_or_self_var = Variable::new(VariableId(10), Kind::Ref);
         let op = super::super::flow::SpaceOperation::new(
@@ -10434,6 +10601,8 @@ mod tests {
             format_with_spec_fn_idx: 102,
             convert_value_fn_idx: 104,
             import_name_fn_idx: 105,
+            load_super_attr_fn_idx: 106,
+            super_attr_unwrap_fn_idx: 107,
         };
         let code_const = Constant::new(
             super::super::flow::ConstantValue::Signed(0x2000),
@@ -11230,6 +11399,182 @@ mod tests {
                                 "ListR must be [fromlist, level, code], got {other:?}"
                             ),
                         }
+                    }
+                    other => panic!("expected ListR, got {other:?}"),
+                }
+                assert_eq!(
+                    result,
+                    Some(Register {
+                        kind: Kind::Ref,
+                        index: 102
+                    }),
+                );
+            }
+            _ => panic!("expected Insn::Op, got {insn:?}"),
+        }
+    }
+
+    #[test]
+    fn lower_load_super_attr_hlop_emits_load_super_attr_fn_residual() {
+        // `load_super_attr(self, cls, code, name_idx)` →
+        // `residual_call_ir_r(ConstInt(load_super_attr_fn_idx),
+        // ListI([name_idx]), ListR([self, cls, code]), Descr) → reg`
+        // (MayForce — descriptor `__get__` may run).  Same three-Ref shape
+        // as IMPORT_NAME.
+        let self_var = Variable::new(VariableId(8), Kind::Ref);
+        let cls_var = Variable::new(VariableId(10), Kind::Ref);
+        let result_var = Variable::new(VariableId(9), Kind::Ref);
+        let (ctx, code_const, name_idx_const) = load_attr_lowering_fixture();
+        let op = super::super::flow::SpaceOperation::new(
+            "load_super_attr",
+            vec![
+                self_var.into(),
+                cls_var.into(),
+                code_const.into(),
+                name_idx_const.into(),
+            ],
+            Some(result_var.into()),
+            0,
+        );
+        let mut get_register = |var: Variable| match var.id {
+            VariableId(8) => Register {
+                kind: Kind::Ref,
+                index: 101,
+            },
+            VariableId(10) => Register {
+                kind: Kind::Ref,
+                index: 103,
+            },
+            VariableId(9) => Register {
+                kind: Kind::Ref,
+                index: 102,
+            },
+            _ => panic!("unexpected var id {:?}", var.id),
+        };
+        let mut lower_constant = super::flatten_constant_operand_for_test;
+        let insn = super::lower_load_super_attr_hlop_to_insn(
+            &op,
+            &ctx,
+            &mut get_register,
+            &mut lower_constant,
+        )
+        .expect("4-arg load_super_attr lowering must succeed");
+        match insn {
+            Insn::Op {
+                opname,
+                args,
+                result,
+            } => {
+                assert_eq!(opname, "residual_call_ir_r");
+                assert!(
+                    matches!(args[0], Operand::ConstInt(106)),
+                    "load_super_attr_fn pool index, got {:?}",
+                    args[0]
+                );
+                match &args[1] {
+                    Operand::ListOfKind(list) => {
+                        assert_eq!(list.kind, Kind::Int);
+                        assert!(
+                            matches!(&list.content[..], [Operand::ConstInt(5)]),
+                            "ListI = [name_idx], got {:?}",
+                            list.content
+                        );
+                    }
+                    other => panic!("expected ListI, got {other:?}"),
+                }
+                match &args[2] {
+                    Operand::ListOfKind(list) => {
+                        assert_eq!(list.kind, Kind::Ref);
+                        match &list.content[..] {
+                            [Operand::Register(s), Operand::Register(c), Operand::ConstRef(0x2000)] => {
+                                assert_eq!(s.index, 101, "leading Ref operand must be self");
+                                assert_eq!(c.index, 103, "second Ref operand must be cls");
+                            }
+                            other => {
+                                panic!("ListR must be [self, cls, code], got {other:?}")
+                            }
+                        }
+                    }
+                    other => panic!("expected ListR, got {other:?}"),
+                }
+                assert_eq!(
+                    result,
+                    Some(Register {
+                        kind: Kind::Ref,
+                        index: 102
+                    }),
+                );
+            }
+            _ => panic!("expected Insn::Op, got {insn:?}"),
+        }
+    }
+
+    #[test]
+    fn lower_super_attr_unwrap_hlop_emits_super_attr_unwrap_fn_residual() {
+        // `super_attr_unwrap(raw, which)` →
+        // `residual_call_ir_r(ConstInt(super_attr_unwrap_fn_idx),
+        // ListI([which]), ListR([raw]), Descr) → reg`, the single-Ref
+        // CONVERT_VALUE shape (`which` is a compile-time const).
+        let raw_var = Variable::new(VariableId(8), Kind::Ref);
+        let result_var = Variable::new(VariableId(9), Kind::Ref);
+        let (ctx, _code_const, _name_idx_const) = load_attr_lowering_fixture();
+        let which_const = Constant::signed(1);
+        let op = super::super::flow::SpaceOperation::new(
+            "super_attr_unwrap",
+            vec![raw_var.into(), which_const.into()],
+            Some(result_var.into()),
+            0,
+        );
+        let mut get_register = |var: Variable| match var.id {
+            VariableId(8) => Register {
+                kind: Kind::Ref,
+                index: 101,
+            },
+            VariableId(9) => Register {
+                kind: Kind::Ref,
+                index: 102,
+            },
+            _ => panic!("unexpected var id {:?}", var.id),
+        };
+        let mut lower_constant = super::flatten_constant_operand_for_test;
+        let insn = super::lower_super_attr_unwrap_hlop_to_insn(
+            &op,
+            &ctx,
+            &mut get_register,
+            &mut lower_constant,
+        )
+        .expect("2-arg super_attr_unwrap lowering must succeed");
+        match insn {
+            Insn::Op {
+                opname,
+                args,
+                result,
+            } => {
+                assert_eq!(opname, "residual_call_ir_r");
+                assert!(
+                    matches!(args[0], Operand::ConstInt(107)),
+                    "super_attr_unwrap_fn pool index, got {:?}",
+                    args[0]
+                );
+                match &args[1] {
+                    Operand::ListOfKind(list) => {
+                        assert_eq!(list.kind, Kind::Int);
+                        assert!(
+                            matches!(&list.content[..], [Operand::ConstInt(1)]),
+                            "ListI = [which], got {:?}",
+                            list.content
+                        );
+                    }
+                    other => panic!("expected ListI, got {other:?}"),
+                }
+                match &args[2] {
+                    Operand::ListOfKind(list) => {
+                        assert_eq!(list.kind, Kind::Ref);
+                        assert!(
+                            matches!(&list.content[..], [Operand::Register(r)] if r.index == 101),
+                            "ListR = [raw], got {:?}",
+                            list.content
+                        );
                     }
                     other => panic!("expected ListR, got {other:?}"),
                 }
