@@ -16,16 +16,15 @@ try:
 except ImportError:
     ssl = None
 
-from unittest import TestCase, skipUnless
+from unittest import mock, TestCase, skipUnless
 from test import support
+from test.support import requires_subprocess
 from test.support import threading_helper
 from test.support import socket_helper
 from test.support import warnings_helper
+from test.support import asynchat
+from test.support import asyncore
 from test.support.socket_helper import HOST, HOSTv6
-
-
-asynchat = warnings_helper.import_deprecated('asynchat')
-asyncore = warnings_helper.import_deprecated('asyncore')
 
 
 support.requires_working_socket(module=True)
@@ -82,7 +81,7 @@ class DummyDTPHandler(asynchat.async_chat):
         # (behaviour witnessed with test_data_connection)
         if not self.dtp_conn_closed:
             self.baseclass.push('226 transfer complete')
-            self.close()
+            self.shutdown()
             self.dtp_conn_closed = True
 
     def push(self, what):
@@ -95,6 +94,9 @@ class DummyDTPHandler(asynchat.async_chat):
 
     def handle_error(self):
         default_error_handler()
+
+    def shutdown(self):
+        self.close()
 
 
 class DummyFTPHandler(asynchat.async_chat):
@@ -228,7 +230,7 @@ class DummyFTPHandler(asynchat.async_chat):
 
     def cmd_quit(self, arg):
         self.push('221 quit ok')
-        self.close()
+        self.shutdown()
 
     def cmd_abor(self, arg):
         self.push('226 abor ok')
@@ -315,7 +317,7 @@ class DummyFTPServer(asyncore.dispatcher, threading.Thread):
         self.handler_instance = self.handler(conn, encoding=self.encoding)
 
     def handle_connect(self):
-        self.close()
+        self.shutdown()
     handle_read = handle_connect
 
     def writable(self):
@@ -427,12 +429,12 @@ if ssl is not None:
         def handle_error(self):
             default_error_handler()
 
-        def close(self):
+        def shutdown(self):
             if (isinstance(self.socket, ssl.SSLSocket) and
                     self.socket._sslobj is not None):
                 self._do_ssl_shutdown()
             else:
-                super(SSLConnection, self).close()
+                self.close()
 
 
     class DummyTLS_DTPHandler(SSLConnection, DummyDTPHandler):
@@ -902,6 +904,7 @@ class TestIPv6Environment(TestCase):
 
 
 @skipUnless(ssl, "SSL not available")
+@requires_subprocess()
 class TestTLS_FTPClassMixin(TestFTPClass):
     """Repeat TestFTPClass tests starting the TLS layer for both control
     and data connections first.
@@ -918,6 +921,7 @@ class TestTLS_FTPClassMixin(TestFTPClass):
 
 
 @skipUnless(ssl, "SSL not available")
+@requires_subprocess()
 class TestTLS_FTPClass(TestCase):
     """Specific TLS_FTP class tests."""
 
@@ -982,11 +986,11 @@ class TestTLS_FTPClass(TestCase):
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
-        self.assertRaises(ValueError, ftplib.FTP_TLS, keyfile=CERTFILE,
+        self.assertRaises(TypeError, ftplib.FTP_TLS, keyfile=CERTFILE,
                           context=ctx)
-        self.assertRaises(ValueError, ftplib.FTP_TLS, certfile=CERTFILE,
+        self.assertRaises(TypeError, ftplib.FTP_TLS, certfile=CERTFILE,
                           context=ctx)
-        self.assertRaises(ValueError, ftplib.FTP_TLS, certfile=CERTFILE,
+        self.assertRaises(TypeError, ftplib.FTP_TLS, certfile=CERTFILE,
                           keyfile=CERTFILE, context=ctx)
 
         self.client = ftplib.FTP_TLS(context=ctx, timeout=TIMEOUT)
@@ -1139,6 +1143,40 @@ class TestTimeouts(TestCase):
         self.assertEqual(ftp.sock.gettimeout(), 30)
         self.evt.wait()
         ftp.close()
+
+
+class TestFtpcpSecurity(TestCase):
+    """ftpcp() must not trust the host a source server advertises in PASV.
+
+    A malicious source server can otherwise redirect the target server's
+    data connection to an arbitrary host:port (SSRF), so ftpcp() uses the
+    source server's actual peer address instead, the same as FTP.makepasv().
+    """
+
+    def _make_pair(self, *, advertised_host, real_host, trust=False):
+        source = mock.Mock(spec=ftplib.FTP)
+        source.trust_server_pasv_ipv4_address = trust
+        source.sock.getpeername.return_value = (real_host, 21)
+        # PASV replies give the host as comma-separated octets, not dotted.
+        advertised = advertised_host.replace('.', ',')
+        source.sendcmd.side_effect = lambda cmd: (
+            f'227 Entering Passive Mode ({advertised},1,2).'
+            if cmd == 'PASV' else '150 ok')
+        target = mock.Mock(spec=ftplib.FTP)
+        target.sendcmd.return_value = '150 ok'
+        return source, target
+
+    def test_ftpcp_ignores_untrusted_pasv_host(self):
+        source, target = self._make_pair(advertised_host='10.0.0.5',
+                                         real_host='198.51.100.7')
+        ftplib.ftpcp(source, 'a', target, 'b')
+        target.sendport.assert_called_once_with('198.51.100.7', 258)
+
+    def test_ftpcp_trust_server_pasv_ipv4_address(self):
+        source, target = self._make_pair(advertised_host='10.0.0.5',
+                                         real_host='198.51.100.7', trust=True)
+        ftplib.ftpcp(source, 'a', target, 'b')
+        target.sendport.assert_called_once_with('10.0.0.5', 258)
 
 
 class MiscTestCase(TestCase):

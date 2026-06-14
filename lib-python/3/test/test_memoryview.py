@@ -13,17 +13,15 @@ import array
 import io
 import copy
 import pickle
-from test.support import check_impl_detail
+import struct
 
-IS_PYPY = sys.implementation.name == 'pypy'
+from itertools import product
+from test import support
+from test.support import import_helper, threading_helper
 
-try:
-    getrefcount = sys.getrefcount
-except AttributeError:
-    # PyPy
-    getrefcount = lambda o: len(gc.get_referents(o))
 
-from test.support import import_helper
+class MyObject:
+    pass
 
 
 class AbstractMemoryTests:
@@ -39,7 +37,7 @@ class AbstractMemoryTests:
 
     def check_getitem_with_type(self, tp):
         b = tp(self._source)
-        oldrefcount = getrefcount(b)
+        oldrefcount = sys.getrefcount(b)
         m = self._view(b)
         self.assertEqual(m[0], ord(b"a"))
         self.assertIsInstance(m[0], int)
@@ -56,11 +54,36 @@ class AbstractMemoryTests:
         self.assertRaises(TypeError, lambda: m[0.0])
         self.assertRaises(TypeError, lambda: m["a"])
         m = None
-        self.assertEqual(getrefcount(b), oldrefcount)
+        self.assertEqual(sys.getrefcount(b), oldrefcount)
 
     def test_getitem(self):
         for tp in self._types:
             self.check_getitem_with_type(tp)
+
+    def test_index(self):
+        for tp in self._types:
+            b = tp(self._source)
+            m = self._view(b)  # may be a sub-view
+            l = m.tolist()
+            k = 2 * len(self._source)
+
+            for chi in self._source:
+                if chi in l:
+                    self.assertEqual(m.index(chi), l.index(chi))
+                else:
+                    self.assertRaises(ValueError, m.index, chi)
+
+                for start, stop in product(range(-k, k), range(-k, k)):
+                    index = -1
+                    try:
+                        index = l.index(chi, start, stop)
+                    except ValueError:
+                        pass
+
+                    if index == -1:
+                        self.assertRaises(ValueError, m.index, chi, start, stop)
+                    else:
+                        self.assertEqual(m.index(chi, start, stop), index)
 
     def test_iter(self):
         for tp in self._types:
@@ -68,11 +91,27 @@ class AbstractMemoryTests:
             m = self._view(b)
             self.assertEqual(list(m), [m[i] for i in range(len(m))])
 
+    def test_count(self):
+        for tp in self._types:
+            b = tp(self._source)
+            m = self._view(b)
+            l = m.tolist()
+            for ch in list(m):
+                self.assertEqual(m.count(ch), l.count(ch))
+
+            b = tp((b'a' * 5) + (b'c' * 3))
+            m = self._view(b)  # may be sliced
+            l = m.tolist()
+            with self.subTest('count', buffer=b):
+                self.assertEqual(m.count(ord('a')), l.count(ord('a')))
+                self.assertEqual(m.count(ord('b')), l.count(ord('b')))
+                self.assertEqual(m.count(ord('c')), l.count(ord('c')))
+
     def test_setitem_readonly(self):
         if not self.ro_type:
             self.skipTest("no read-only type to test")
         b = self.ro_type(self._source)
-        oldrefcount = getrefcount(b)
+        oldrefcount = sys.getrefcount(b)
         m = self._view(b)
         def setitem(value):
             m[0] = value
@@ -80,14 +119,14 @@ class AbstractMemoryTests:
         self.assertRaises(TypeError, setitem, 65)
         self.assertRaises(TypeError, setitem, memoryview(b"a"))
         m = None
-        self.assertEqual(getrefcount(b), oldrefcount)
+        self.assertEqual(sys.getrefcount(b), oldrefcount)
 
     def test_setitem_writable(self):
         if not self.rw_type:
             self.skipTest("no writable type to test")
         tp = self.rw_type
         b = self.rw_type(self._source)
-        oldrefcount = getrefcount(b)
+        oldrefcount = sys.getrefcount(b)
         m = self._view(b)
         m[0] = ord(b'1')
         self._check_contents(tp, b, b"1bcdef")
@@ -116,11 +155,10 @@ class AbstractMemoryTests:
         self.assertRaises(IndexError, setitem, -sys.maxsize, b"a")
         # Wrong index/slice types
         self.assertRaises(TypeError, setitem, 0.0, b"a")
-        if check_impl_detail():
-            self.assertRaises(TypeError, setitem, (0,), b"a")
-            self.assertRaises(TypeError, setitem, (slice(0,1,1), 0), b"a")
-            self.assertRaises(TypeError, setitem, (0, slice(0,1,1)), b"a")
-            self.assertRaises(TypeError, setitem, (0,), b"a")
+        self.assertRaises(TypeError, setitem, (0,), b"a")
+        self.assertRaises(TypeError, setitem, (slice(0,1,1), 0), b"a")
+        self.assertRaises(TypeError, setitem, (0, slice(0,1,1)), b"a")
+        self.assertRaises(TypeError, setitem, (0,), b"a")
         self.assertRaises(TypeError, setitem, "a", b"a")
         # Not implemented: multidimensional slices
         slices = (slice(0,1,1), slice(0,1,2))
@@ -133,7 +171,7 @@ class AbstractMemoryTests:
         self.assertRaises(ValueError, setitem, slice(0,2), b"a")
 
         m = None
-        self.assertEqual(getrefcount(b), oldrefcount)
+        self.assertEqual(sys.getrefcount(b), oldrefcount)
 
     def test_delitem(self):
         for tp in self._types:
@@ -217,14 +255,14 @@ class AbstractMemoryTests:
         # Test PyObject_GetBuffer() on a memoryview object.
         for tp in self._types:
             b = tp(self._source)
-            oldrefcount = getrefcount(b)
+            oldrefcount = sys.getrefcount(b)
             m = self._view(b)
-            oldviewrefcount = getrefcount(m)
+            oldviewrefcount = sys.getrefcount(m)
             s = str(m, "utf-8")
             self._check_contents(tp, b, s.encode("utf-8"))
-            self.assertEqual(getrefcount(m), oldviewrefcount)
+            self.assertEqual(sys.getrefcount(m), oldviewrefcount)
             m = None
-            self.assertEqual(getrefcount(b), oldrefcount)
+            self.assertEqual(sys.getrefcount(b), oldrefcount)
 
     def test_gc(self):
         for tp in self._types:
@@ -236,8 +274,6 @@ class AbstractMemoryTests:
                 def __init__(self, base):
                     self.m = memoryview(base)
             class MySource(tp):
-                pass
-            class MyObject:
                 pass
 
             # Create a reference cycle through a memoryview object.
@@ -351,6 +387,20 @@ class AbstractMemoryTests:
         m = self._view(b)
         self.assertRaises(ValueError, hash, m)
 
+    def test_hash_use_after_free(self):
+        # Prevent crash in memoryview(v).__hash__ with re-entrant v.__hash__.
+        # Regression test for https://github.com/python/cpython/issues/142664.
+        class E(array.array):
+            def __hash__(self):
+                mv.release()
+                self.clear()
+                return 123
+
+        v = E('B', b'A' * 4096)
+        mv = memoryview(v).toreadonly()   # must be read-only for hash()
+        self.assertRaises(BufferError, hash, mv)
+        self.assertRaises(BufferError, mv.__hash__)
+
     def test_weakref(self):
         # Check memoryviews are weakrefable
         for tp in self._types:
@@ -406,6 +456,20 @@ class AbstractMemoryTests:
         self.assertEqual(c.format, "H")
         self.assertEqual(d.format, "H")
 
+    def test_hex_use_after_free(self):
+        # Prevent UAF in memoryview.hex(sep) with re-entrant sep.__len__.
+        # Regression test for https://github.com/python/cpython/issues/143195.
+        ba = bytearray(b'A' * 1024)
+        mv = memoryview(ba)
+
+        class S(bytes):
+            def __len__(self):
+                mv.release()
+                ba.clear()
+                return 1
+
+        self.assertRaises(BufferError, mv.hex, S(b':'))
+
 
 # Variations on source objects for the buffer: bytes-like objects, then arrays
 # with itemsize > 1.
@@ -445,6 +509,18 @@ class BaseMemoryviewTests:
     def _check_contents(self, tp, obj, contents):
         self.assertEqual(obj, tp(contents))
 
+    def test_count(self):
+        super().test_count()
+        for tp in self._types:
+            b = tp((b'a' * 5) + (b'c' * 3))
+            m = self._view(b)  # should not be sliced
+            self.assertEqual(len(b), len(m))
+            with self.subTest('count', buffer=b):
+                self.assertEqual(m.count(ord('a')), 5)
+                self.assertEqual(m.count(ord('b')), 0)
+                self.assertEqual(m.count(ord('c')), 3)
+
+
 class BaseMemorySliceTests:
     source_bytes = b"XabcdefY"
 
@@ -458,9 +534,9 @@ class BaseMemorySliceTests:
     def test_refs(self):
         for tp in self._types:
             m = memoryview(tp(self._source))
-            oldrefcount = getrefcount(m)
+            oldrefcount = sys.getrefcount(m)
             m[1:2]
-            self.assertEqual(getrefcount(m), oldrefcount)
+            self.assertEqual(sys.getrefcount(m), oldrefcount)
 
 class BaseMemorySliceSliceTests:
     source_bytes = b"XabcdefY"
@@ -498,6 +574,28 @@ class ArrayMemoryviewTest(unittest.TestCase,
         new_a = array.array('i', range(9, -1, -1))
         m[:] = new_a
         self.assertEqual(a, new_a)
+
+    def test_boolean_format(self):
+        # Test '?' format (keep all the checks below for UBSan)
+        # See github.com/python/cpython/issues/148390.
+
+        # m1a and m1b are equivalent to [False, True, False]
+        m1a = memoryview(b'\0\2\0').cast('?')
+        self.assertEqual(m1a.tolist(), [False, True, False])
+        m1b = memoryview(b'\0\4\0').cast('?')
+        self.assertEqual(m1b.tolist(), [False, True, False])
+        self.assertEqual(m1a, m1b)
+
+        # m2a and m2b are equivalent to [True, True, True]
+        m2a = memoryview(b'\1\3\5').cast('?')
+        self.assertEqual(m2a.tolist(), [True, True, True])
+        m2b = memoryview(b'\2\4\6').cast('?')
+        self.assertEqual(m2b.tolist(), [True, True, True])
+        self.assertEqual(m2a, m2b)
+
+        allbytes = bytes(range(256))
+        allbytes = memoryview(allbytes).cast('?')
+        self.assertEqual(allbytes.tolist(), [False] + [True] * 255)
 
 
 class BytesMemorySliceTest(unittest.TestCase,
@@ -537,12 +635,39 @@ class OtherTest(unittest.TestCase):
                 m[2:] = memoryview(p6).cast(format)[2:]
                 self.assertEqual(d.value, 0.6)
 
+    def test_half_float(self):
+        half_data = struct.pack('eee', 0.0, -1.5, 1.5)
+        float_data = struct.pack('fff', 0.0, -1.5, 1.5)
+        half_view = memoryview(half_data).cast('e')
+        float_view = memoryview(float_data).cast('f')
+        self.assertEqual(half_view.nbytes * 2, float_view.nbytes)
+        self.assertListEqual(half_view.tolist(), float_view.tolist())
+
     def test_memoryview_hex(self):
         # Issue #9951: memoryview.hex() segfaults with non-contiguous buffers.
         x = b'0' * 200000
         m1 = memoryview(x)
         m2 = m1[::-1]
         self.assertEqual(m2.hex(), '30' * 200000)
+
+    def test_memoryview_hex_separator(self):
+        x = bytes(range(97, 102))
+        m1 = memoryview(x)
+        m2 = m1[::-1]
+        self.assertEqual(m2.hex(':'), '65:64:63:62:61')
+        self.assertEqual(m2.hex(':', 2), '65:6463:6261')
+        self.assertEqual(m2.hex(':', -2), '6564:6362:61')
+        self.assertEqual(m2.hex(sep=':', bytes_per_sep=2), '65:6463:6261')
+        self.assertEqual(m2.hex(sep=':', bytes_per_sep=-2), '6564:6362:61')
+        for bytes_per_sep in 5, -5, 2**31-1, -(2**31-1):
+            with self.subTest(bytes_per_sep=bytes_per_sep):
+                self.assertEqual(m2.hex(':', bytes_per_sep), '6564636261')
+        for bytes_per_sep in 2**31, -2**31, 2**1000, -2**1000:
+            with self.subTest(bytes_per_sep=bytes_per_sep):
+                try:
+                    self.assertEqual(m2.hex(':', bytes_per_sep), '6564636261')
+                except OverflowError:
+                    pass
 
     def test_copy(self):
         m = memoryview(b'abc')
@@ -579,17 +704,16 @@ class OtherTest(unittest.TestCase):
 
         ba = None
         m = memoryview(bytearray(b'\xff'*size))
-        with self.assertRaises(ValueError) as e:
+        with self.assertRaises(ValueError):
             m[MyIndex()]
 
-        if not IS_PYPY:
-            ba = None
-            m = memoryview(bytearray(b'\xff'*size))
-            self.assertEqual(list(m[:MyIndex()]), [255] * 4)
+        ba = None
+        m = memoryview(bytearray(b'\xff'*size))
+        self.assertEqual(list(m[:MyIndex()]), [255] * 4)
 
-            ba = None
-            m = memoryview(bytearray(b'\xff'*size))
-            self.assertEqual(list(m[MyIndex():8]), [255] * 4)
+        ba = None
+        m = memoryview(bytearray(b'\xff'*size))
+        self.assertEqual(list(m[MyIndex():8]), [255] * 4)
 
         ba = None
         m = memoryview(bytearray(b'\xff'*size)).cast('B', (64, 2))
@@ -657,6 +781,55 @@ class OtherTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "operation forbidden"):
             m[0] = MyBool()
         self.assertEqual(ba[:8], b'\0'*8)
+
+    def test_buffer_reference_loop(self):
+        m = memoryview(b'abc').__buffer__(0)
+        o = MyObject()
+        o.m = m
+        o.o = o
+        wr = weakref.ref(o)
+        del m, o
+        gc.collect()
+        self.assertIsNone(wr())
+
+    def test_picklebuffer_reference_loop(self):
+        pb = pickle.PickleBuffer(memoryview(b'abc'))
+        o = MyObject()
+        o.pb = pb
+        o.o = o
+        wr = weakref.ref(o)
+        del pb, o
+        gc.collect()
+        self.assertIsNone(wr())
+
+
+@threading_helper.requires_working_threading()
+@support.requires_resource("cpu")
+class RacingTest(unittest.TestCase):
+    def test_racing_getbuf_and_releasebuf(self):
+        """Repeatly access the memoryview for racing."""
+        try:
+            from multiprocessing.managers import SharedMemoryManager
+        except ImportError:
+            self.skipTest("Test requires multiprocessing")
+        from threading import Thread, Event
+
+        start = Event()
+        with SharedMemoryManager() as smm:
+            obj = smm.ShareableList(range(100))
+            def test():
+                # Issue gh-127085, the `ShareableList.count` is just a
+                # convenient way to mess the `exports` counter of `memoryview`,
+                # this issue has no direct relation with `ShareableList`.
+                start.wait(support.SHORT_TIMEOUT)
+                for i in range(10):
+                    obj.count(1)
+            threads = [Thread(target=test) for _ in range(10)]
+            with threading_helper.start_threads(threads):
+                start.set()
+
+            del obj
+
 
 if __name__ == "__main__":
     unittest.main()

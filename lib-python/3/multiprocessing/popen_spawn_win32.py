@@ -3,6 +3,7 @@ import msvcrt
 import signal
 import sys
 import _winapi
+from subprocess import STARTUPINFO, STARTF_FORCEOFFFEEDBACK
 
 from .context import reduction, get_spawning_popen, set_spawning_popen
 from . import spawn
@@ -23,9 +24,7 @@ WINSERVICE = sys.executable.lower().endswith("pythonservice.exe")
 def _path_eq(p1, p2):
     return p1 == p2 or os.path.normcase(p1) == os.path.normcase(p2)
 
-# PyPy is not affected by bpo-35797
-# WINENV = not _path_eq(sys.executable, sys._base_executable)
-WINENV = False
+WINENV = not _path_eq(sys.executable, sys._base_executable)
 
 
 def _close_handles(*handles):
@@ -76,7 +75,8 @@ class Popen(object):
             try:
                 hp, ht, pid, tid = _winapi.CreateProcess(
                     python_exe, cmd,
-                    None, None, False, 0, env, None, None)
+                    None, None, False, 0, env, None,
+                    STARTUPINFO(dwFlags=STARTF_FORCEOFFFEEDBACK))
                 _winapi.CloseHandle(ht)
             except:
                 _winapi.CloseHandle(rhandle)

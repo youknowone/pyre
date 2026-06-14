@@ -1,8 +1,10 @@
 """ Tests for the internal type cache in CPython. """
-import unittest
+import collections.abc
 import dis
+import unittest
+import warnings
 from test import support
-from test.support import import_helper
+from test.support import import_helper, requires_specialization, requires_specialization_ft
 try:
     from sys import _clear_type_cache
 except ImportError:
@@ -10,17 +12,16 @@ except ImportError:
 
 # Skip this test if the _testcapi module isn't available.
 _testcapi = import_helper.import_module("_testcapi")
+_testinternalcapi = import_helper.import_module("_testinternalcapi")
 type_get_version = _testcapi.type_get_version
-type_assign_specific_version_unsafe = _testcapi.type_assign_specific_version_unsafe
+type_assign_specific_version_unsafe = _testinternalcapi.type_assign_specific_version_unsafe
+type_assign_version = _testcapi.type_assign_version
 type_modified = _testcapi.type_modified
 
-
-def type_assign_version(type_):
-    try:
-        type_.x
-    except AttributeError:
-        pass
-
+def clear_type_cache():
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        _clear_type_cache()
 
 @support.cpython_only
 @unittest.skipIf(_clear_type_cache is None, "requires sys._clear_type_cache")
@@ -43,7 +44,7 @@ class TypeCacheTests(unittest.TestCase):
         append_result = all_version_tags.append
         assertNotEqual = self.assertNotEqual
         for _ in range(30):
-            _clear_type_cache()
+            clear_type_cache()
             X = type('Y', (), {})
             X.x = 1
             X.x
@@ -52,6 +53,19 @@ class TypeCacheTests(unittest.TestCase):
             append_result(tp_version_tag_after)
         self.assertEqual(len(set(all_version_tags)), 30,
                          msg=f"{all_version_tags} contains non-unique versions")
+
+    def test_type_assign_version(self):
+        class C:
+            x = 5
+
+        self.assertEqual(type_assign_version(C), 1)
+        c_ver = type_get_version(C)
+
+        C.x = 6
+        self.assertEqual(type_get_version(C), 0)
+        self.assertEqual(type_assign_version(C), 1)
+        self.assertNotEqual(type_get_version(C), 0)
+        self.assertNotEqual(type_get_version(C), c_ver)
 
     def test_type_assign_specific_version(self):
         """meta-test for type_assign_specific_version_unsafe"""
@@ -70,13 +84,60 @@ class TypeCacheTests(unittest.TestCase):
         new_version = type_get_version(C)
         self.assertEqual(new_version, orig_version + 5)
 
-        _clear_type_cache()
+        clear_type_cache()
 
+    def test_per_class_limit(self):
+        class C:
+            x = 0
+
+        type_assign_version(C)
+        orig_version = type_get_version(C)
+        for i in range(1001):
+            C.x = i
+            type_assign_version(C)
+
+        new_version = type_get_version(C)
+        self.assertEqual(new_version, 0)
+
+    def test_119462(self):
+
+        class Holder:
+            value = None
+
+            @classmethod
+            def set_value(cls):
+                cls.value = object()
+
+        class HolderSub(Holder):
+            pass
+
+        for _ in range(1050):
+            Holder.set_value()
+            HolderSub.value
+
+    def test_abc_register_invalidates_subclass_versions(self):
+        class Parent:
+            pass
+
+        class Child(Parent):
+            pass
+
+        type_assign_version(Parent)
+        type_assign_version(Child)
+        parent_version = type_get_version(Parent)
+        child_version = type_get_version(Child)
+        if parent_version == 0 or child_version == 0:
+            self.skipTest("Could not assign valid type versions")
+
+        collections.abc.Mapping.register(Parent)
+
+        self.assertEqual(type_get_version(Parent), 0)
+        self.assertEqual(type_get_version(Child), 0)
 
 @support.cpython_only
 class TypeCacheWithSpecializationTests(unittest.TestCase):
     def tearDown(self):
-        _clear_type_cache()
+        clear_type_cache()
 
     def _assign_valid_version_or_skip(self, type_):
         type_modified(type_)
@@ -84,8 +145,10 @@ class TypeCacheWithSpecializationTests(unittest.TestCase):
         if type_get_version(type_) == 0:
             self.skipTest("Could not assign valid type version")
 
-    def _assign_and_check_version_0(self, user_type):
+    def _no_more_versions(self, user_type):
         type_modified(user_type)
+        for _ in range(1001):
+            type_assign_specific_version_unsafe(user_type, 1000_000_000)
         type_assign_specific_version_unsafe(user_type, 0)
         self.assertEqual(type_get_version(user_type), 0)
 
@@ -93,7 +156,7 @@ class TypeCacheWithSpecializationTests(unittest.TestCase):
         return set(instr.opname for instr in dis.Bytecode(func, adaptive=True))
 
     def _check_specialization(self, func, arg, opname, *, should_specialize):
-        for _ in range(100):
+        for _ in range(_testinternalcapi.SPECIALIZATION_THRESHOLD):
             func(arg)
 
         if should_specialize:
@@ -101,102 +164,121 @@ class TypeCacheWithSpecializationTests(unittest.TestCase):
         else:
             self.assertIn(opname, self._all_opnames(func))
 
-    def test_load_method_specialization_user_type(self):
+    @requires_specialization
+    def test_class_load_attr_specialization_user_type(self):
         class A:
             def foo(self):
                 pass
 
         self._assign_valid_version_or_skip(A)
 
-        def load_foo_1(instance):
-            instance.foo()
+        def load_foo_1(type_):
+            type_.foo
 
-        self._check_specialization(
-            load_foo_1, A(), "LOAD_METHOD_ADAPTIVE", should_specialize=True
-        )
+        self._check_specialization(load_foo_1, A, "LOAD_ATTR", should_specialize=True)
         del load_foo_1
 
-        self._assign_and_check_version_0(A)
+        self._no_more_versions(A)
 
-        def load_foo_2(instance):
-            instance.foo()
+        def load_foo_2(type_):
+            return type_.foo
 
-        self._check_specialization(
-            load_foo_2, A(), "LOAD_METHOD_ADAPTIVE", should_specialize=False
-        )
+        self._check_specialization(load_foo_2, A, "LOAD_ATTR", should_specialize=False)
 
+    @requires_specialization
+    def test_class_load_attr_specialization_static_type(self):
+        self.assertNotEqual(type_get_version(str), 0)
+        self.assertNotEqual(type_get_version(bytes), 0)
+
+        def get_capitalize_1(type_):
+            return type_.capitalize
+
+        self._check_specialization(get_capitalize_1, str, "LOAD_ATTR", should_specialize=True)
+        self.assertEqual(get_capitalize_1(str)('hello'), 'Hello')
+        self.assertEqual(get_capitalize_1(bytes)(b'hello'), b'Hello')
+
+    @requires_specialization
+    def test_property_load_attr_specialization_user_type(self):
+        class G:
+            @property
+            def x(self):
+                return 9
+
+        self._assign_valid_version_or_skip(G)
+
+        def load_x_1(instance):
+            instance.x
+
+        self._check_specialization(load_x_1, G(), "LOAD_ATTR", should_specialize=True)
+        del load_x_1
+
+        self._no_more_versions(G)
+
+        def load_x_2(instance):
+            instance.x
+
+        self._check_specialization(load_x_2, G(), "LOAD_ATTR", should_specialize=False)
+
+    @requires_specialization
     def test_store_attr_specialization_user_type(self):
         class B:
             __slots__ = ("bar",)
 
         self._assign_valid_version_or_skip(B)
 
-        def store_bar_1(instance):
-            instance.bar = 10
+        def store_bar_1(type_):
+            type_.bar = 10
 
-        self._check_specialization(
-            store_bar_1, B(), "STORE_ATTR_ADAPTIVE", should_specialize=True
-        )
+        self._check_specialization(store_bar_1, B(), "STORE_ATTR", should_specialize=True)
         del store_bar_1
 
-        self._assign_and_check_version_0(B)
+        self._no_more_versions(B)
 
-        def store_bar_2(instance):
-            instance.bar = 10
+        def store_bar_2(type_):
+            type_.bar = 10
 
-        self._check_specialization(
-            store_bar_2, B(), "STORE_ATTR_ADAPTIVE", should_specialize=False
-        )
+        self._check_specialization(store_bar_2, B(), "STORE_ATTR", should_specialize=False)
 
-    def test_load_attr_specialization_user_type(self):
-        class C:
-            __slots__ = ("biz",)
+    @requires_specialization_ft
+    def test_class_call_specialization_user_type(self):
+        class F:
             def __init__(self):
-                self.biz = 8
+                pass
 
-        self._assign_valid_version_or_skip(C)
+        self._assign_valid_version_or_skip(F)
 
-        def load_biz_1(type_):
-            type_.biz
+        def call_class_1(type_):
+            type_()
 
-        self._check_specialization(
-            load_biz_1, C(), "LOAD_ATTR_ADAPTIVE", should_specialize=True
-        )
-        del load_biz_1
+        self._check_specialization(call_class_1, F, "CALL", should_specialize=True)
+        del call_class_1
 
-        self._assign_and_check_version_0(C)
+        self._no_more_versions(F)
 
-        def load_biz_2(type_):
-            type_.biz
+        def call_class_2(type_):
+            type_()
 
-        self._check_specialization(
-            load_biz_2, C(), "LOAD_ATTR_ADAPTIVE", should_specialize=False
-        )
+        self._check_specialization(call_class_2, F, "CALL", should_specialize=False)
 
-    def test_binary_subscript_specialization_user_type(self):
-        class D:
-            def __getitem__(self, _):
-                return 1
+    @requires_specialization
+    def test_to_bool_specialization_user_type(self):
+        class H:
+            pass
 
-        self._assign_valid_version_or_skip(D)
+        self._assign_valid_version_or_skip(H)
 
-        def subscript_1(instance):
-            instance[6]
+        def to_bool_1(instance):
+            not instance
 
-        self._check_specialization(
-            subscript_1, D(), "BINARY_SUBSCR_ADAPTIVE", should_specialize=True
-        )
-        del subscript_1
+        self._check_specialization(to_bool_1, H(), "TO_BOOL", should_specialize=True)
+        del to_bool_1
 
-        self._assign_and_check_version_0(D)
+        self._no_more_versions(H)
 
-        def subscript_2(instance):
-            instance[6]
+        def to_bool_2(instance):
+            not instance
 
-        self._check_specialization(
-            subscript_2, D(), "BINARY_SUBSCR_ADAPTIVE", should_specialize=False
-        )
-
+        self._check_specialization(to_bool_2, H(), "TO_BOOL", should_specialize=False)
 
 
 if __name__ == "__main__":

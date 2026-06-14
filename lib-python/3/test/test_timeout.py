@@ -26,10 +26,8 @@ class CreationTestCase(unittest.TestCase):
     """Test case for socket.gettimeout() and socket.settimeout()"""
 
     def setUp(self):
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-
-    def tearDown(self):
-        self.sock.close()
+        self.sock = self.enterContext(
+            socket.socket(socket.AF_INET, socket.SOCK_STREAM))
 
     def testObjectCreation(self):
         # Test Socket creation
@@ -50,10 +48,10 @@ class CreationTestCase(unittest.TestCase):
     def testReturnType(self):
         # Test return type of gettimeout()
         self.sock.settimeout(1)
-        self.assertEqual(type(self.sock.gettimeout()), type(1.0))
+        self.assertIs(type(self.sock.gettimeout()), float)
 
         self.sock.settimeout(3.9)
-        self.assertEqual(type(self.sock.gettimeout()), type(1.0))
+        self.assertIs(type(self.sock.gettimeout()), float)
 
     def testTypeCheck(self):
         # Test type checking by settimeout()
@@ -113,8 +111,6 @@ class TimeoutTestCase(unittest.TestCase):
     def setUp(self):
         raise NotImplementedError()
 
-    tearDown = setUp
-
     def _sock_operation(self, count, timeout, method, *args):
         """
         Test the specified socket method.
@@ -142,11 +138,9 @@ class TCPTimeoutTestCase(TimeoutTestCase):
     """TCP test case for socket.socket() timeout functions"""
 
     def setUp(self):
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.sock = self.enterContext(
+            socket.socket(socket.AF_INET, socket.SOCK_STREAM))
         self.addr_remote = resolve_address('www.python.org.', 80)
-
-    def tearDown(self):
-        self.sock.close()
 
     def testConnectTimeout(self):
         # Testing connect timeout is tricky: we need to have IP connectivity
@@ -190,19 +184,16 @@ class TCPTimeoutTestCase(TimeoutTestCase):
         # for the current configuration.
 
         skip = True
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        timeout = support.LOOPBACK_TIMEOUT
-        sock.settimeout(timeout)
-        try:
-            sock.connect((whitehole))
-        except TimeoutError:
-            pass
-        except OSError as err:
-            if err.errno == errno.ECONNREFUSED:
-                skip = False
-        finally:
-            sock.close()
-            del sock
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            try:
+                timeout = support.LOOPBACK_TIMEOUT
+                sock.settimeout(timeout)
+                sock.connect((whitehole))
+            except TimeoutError:
+                pass
+            except OSError as err:
+                if err.errno == errno.ECONNREFUSED:
+                    skip = False
 
         if skip:
             self.skipTest(
@@ -269,10 +260,8 @@ class UDPTimeoutTestCase(TimeoutTestCase):
     """UDP test case for socket.socket() timeout functions"""
 
     def setUp(self):
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-
-    def tearDown(self):
-        self.sock.close()
+        self.sock = self.enterContext(
+            socket.socket(socket.AF_INET, socket.SOCK_DGRAM))
 
     def testRecvfromTimeout(self):
         # Test recvfrom() timeout

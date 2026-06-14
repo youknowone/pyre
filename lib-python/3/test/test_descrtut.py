@@ -8,8 +8,7 @@
 # of much interest anymore), and a few were fiddled to make the output
 # deterministic.
 
-from test.support import sortdict
-import pprint
+from test.support import sortdict  # noqa: F401
 import doctest
 import unittest
 
@@ -140,7 +139,7 @@ instance variables cannot be assigned to:
     >>> a.x1 = 1
     Traceback (most recent call last):
       File "<stdin>", line 1, in ?
-    AttributeError: 'defaultdict2' object has no attribute 'x1'
+    AttributeError: 'defaultdict2' object has no attribute 'x1' and no __dict__ for setting new attributes
     >>>
 
 """
@@ -167,6 +166,7 @@ For instance of built-in types, x.__class__ is now the same as type(x):
 
 You can get the information from the list type:
 
+    >>> import pprint
     >>> pprint.pprint(dir(list))    # like list.__dict__.keys(), but sorted
     ['__add__',
      '__class__',
@@ -202,6 +202,7 @@ You can get the information from the list type:
      '__rmul__',
      '__setattr__',
      '__setitem__',
+     '__sizeof__',
      '__str__',
      '__subclasshook__',
      'append',

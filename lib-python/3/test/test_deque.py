@@ -287,6 +287,22 @@ class TestBasic(unittest.TestCase):
                     else:
                         self.assertEqual(d.index(element, start, stop), target)
 
+        # Test stop argument
+        for elem in d:
+            index = d.index(elem)
+            self.assertEqual(
+                index,
+                d.index(elem, 0),
+            )
+            self.assertEqual(
+                index,
+                d.index(elem, 0, len(d)),
+            )
+            self.assertEqual(
+                index,
+                d.index(elem, 0, len(d) + 100),
+            )
+
         # Test large start argument
         d = deque(range(0, 10000, 10))
         for step in range(100):
@@ -524,10 +540,7 @@ class TestBasic(unittest.TestCase):
         for match in (True, False):
             d = deque(['ab'])
             d.extend([MutateCmp(d, match), 'c'])
-            # On CPython we get IndexError: deque mutated during remove().
-            # Why is it an IndexError during remove() only???
-            # On PyPy it is a RuntimeError, as in the other operations.
-            self.assertRaises((IndexError, RuntimeError), d.remove, 'c')
+            self.assertRaises(IndexError, d.remove, 'c')
             self.assertEqual(d, deque())
 
     def test_repr(self):
@@ -841,7 +854,7 @@ class TestSubclass(unittest.TestCase):
                     self.assertEqual(list(d), list(e))
                     self.assertEqual(e.x, d.x)
                     self.assertEqual(e.z, d.z)
-                    self.assertFalse(hasattr(e, 'y'))
+                    self.assertNotHasAttr(e, 'y')
 
     def test_pickle_recursive(self):
         for proto in range(pickle.HIGHEST_PROTOCOL + 1):

@@ -27,7 +27,6 @@ def threading_setup():
 
 def threading_cleanup(*original_values):
     orig_count, orig_ndangling = original_values
-    support.gc_collect()
 
     timeout = 1.0
     for _ in support.sleeping_retry(timeout, error=False):
@@ -54,7 +53,6 @@ def threading_cleanup(*original_values):
     # threads explicitly to wait until they complete.
     #
     # To make the warning more likely, reduce the timeout.
-    support.gc_collect()
 
 
 def reap_threads(func):
@@ -120,7 +118,11 @@ def join_thread(thread, timeout=None):
 
 @contextlib.contextmanager
 def start_threads(threads, unlock=None):
-    import faulthandler
+    try:
+        import faulthandler
+    except ImportError:
+        # It isn't supported on subinterpreters yet.
+        faulthandler = None
     threads = list(threads)
     started = []
     try:
@@ -152,7 +154,8 @@ def start_threads(threads, unlock=None):
         finally:
             started = [t for t in started if t.is_alive()]
             if started:
-                faulthandler.dump_traceback(sys.stdout)
+                if faulthandler is not None:
+                    faulthandler.dump_traceback(sys.stdout)
                 raise AssertionError('Unable to join %d threads' % len(started))
 
 
@@ -245,3 +248,38 @@ def requires_working_threading(*, module=False):
             raise unittest.SkipTest(msg)
     else:
         return unittest.skipUnless(can_start_thread, msg)
+
+
+def run_concurrently(worker_func, nthreads=None, args=(), kwargs={}):
+    """
+    Run the worker function(s) concurrently in multiple threads.
+
+    If `worker_func` is a single callable, it is used for all threads.
+    If it is a list of callables, each callable is used for one thread.
+    """
+    from collections.abc import Iterable
+
+    if nthreads is None:
+        nthreads = len(worker_func)
+    if not isinstance(worker_func, Iterable):
+        worker_func = [worker_func] * nthreads
+    assert len(worker_func) == nthreads
+
+    barrier = threading.Barrier(nthreads)
+
+    def wrapper_func(func, *args, **kwargs):
+        # Wait for all threads to reach this point before proceeding.
+        barrier.wait()
+        func(*args, **kwargs)
+
+    with catch_threading_exception() as cm:
+        workers = [
+            threading.Thread(target=wrapper_func, args=(func, *args), kwargs=kwargs)
+            for func in worker_func
+        ]
+        with start_threads(workers):
+            pass
+
+        # If a worker thread raises an exception, re-raise it.
+        if cm.exc_value is not None:
+            raise cm.exc_value

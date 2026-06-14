@@ -1,5 +1,4 @@
 from test.test_json import PyTest, CTest
-from test import support
 
 # 2007-10-05
 JSONDOCS = [
@@ -90,7 +89,7 @@ class TestFail:
             except self.JSONDecodeError:
                 pass
             else:
-                self.fail("Expected failure for fail{0}.json: {1!r}".format(idx, doc))
+                self.fail(f"Expected failure for fail{idx}.json: {doc!r}")
 
     def test_non_string_keys_dict(self):
         data = {'a' : 1, (1, 2) : 2}
@@ -101,8 +100,27 @@ class TestFail:
     def test_not_serializable(self):
         import sys
         with self.assertRaisesRegex(TypeError,
-                'Object of type module is not JSON serializable'):
+                'Object of type module is not JSON serializable') as cm:
             self.dumps(sys)
+        self.assertNotHasAttr(cm.exception, '__notes__')
+
+        with self.assertRaises(TypeError) as cm:
+            self.dumps([1, [2, 3, sys]])
+        self.assertEqual(cm.exception.__notes__,
+                         ['when serializing list item 2',
+                          'when serializing list item 1'])
+
+        with self.assertRaises(TypeError) as cm:
+            self.dumps((1, (2, 3, sys)))
+        self.assertEqual(cm.exception.__notes__,
+                         ['when serializing tuple item 2',
+                          'when serializing tuple item 1'])
+
+        with self.assertRaises(TypeError) as cm:
+            self.dumps({'a': {'b': sys}})
+        self.assertEqual(cm.exception.__notes__,
+                         ["when serializing dict item 'b'",
+                          "when serializing dict item 'a'"])
 
     def test_truncated_input(self):
         test_cases = [
@@ -130,16 +148,7 @@ class TestFail:
             with self.assertRaises(self.JSONDecodeError) as cm:
                 self.loads(data)
             err = cm.exception
-            if support.check_impl_detail():
-                self.assertEqual(err.msg, msg)
-            else:
-                if data in ['[42',         # skip these tests, PyPy gets
-                            '["spam"',     # another error which makes sense
-                            '{"spam":42',  # too: unterminated array
-                           ]:
-                    continue
-                msg = err.msg   # ignore the message provided in the test,
-                                # only check for position
+            self.assertEqual(err.msg, msg)
             self.assertEqual(err.pos, idx)
             self.assertEqual(err.lineno, 1)
             self.assertEqual(err.colno, idx + 1)
@@ -153,11 +162,11 @@ class TestFail:
             ('{"spam":[}', 'Expecting value', 9),
             ('[42:', "Expecting ',' delimiter", 3),
             ('[42 "spam"', "Expecting ',' delimiter", 4),
-            ('[42,]', 'Expecting value', 4),
+            ('[42,]', "Illegal trailing comma before end of array", 3),
             ('{"spam":[42}', "Expecting ',' delimiter", 11),
             ('["]', 'Unterminated string starting at', 1),
             ('["spam":', "Expecting ',' delimiter", 7),
-            ('["spam",]', 'Expecting value', 8),
+            ('["spam",]', "Illegal trailing comma before end of array", 7),
             ('{:', 'Expecting property name enclosed in double quotes', 1),
             ('{,', 'Expecting property name enclosed in double quotes', 1),
             ('{42', 'Expecting property name enclosed in double quotes', 1),
@@ -169,17 +178,15 @@ class TestFail:
             ('[{"spam":]', 'Expecting value', 9),
             ('{"spam":42 "ham"', "Expecting ',' delimiter", 11),
             ('[{"spam":42]', "Expecting ',' delimiter", 11),
-            ('{"spam":42,}', 'Expecting property name enclosed in double quotes', 11),
+            ('{"spam":42,}', "Illegal trailing comma before end of object", 10),
+            ('{"spam":42 , }', "Illegal trailing comma before end of object", 11),
+            ('[123  , ]', "Illegal trailing comma before end of array", 6),
         ]
         for data, msg, idx in test_cases:
             with self.assertRaises(self.JSONDecodeError) as cm:
                 self.loads(data)
             err = cm.exception
-            if support.check_impl_detail():
-                self.assertEqual(err.msg, msg)
-            else:
-                msg = err.msg   # ignore the message provided in the test,
-                                # only check for position
+            self.assertEqual(err.msg, msg)
             self.assertEqual(err.pos, idx)
             self.assertEqual(err.lineno, 1)
             self.assertEqual(err.colno, idx + 1)
@@ -221,18 +228,13 @@ class TestFail:
             with self.assertRaises(self.JSONDecodeError) as cm:
                 self.loads(data)
             err = cm.exception
-            if support.check_impl_detail():
-                msg = 'Expecting value'
-                self.assertEqual(err.msg, msg)
-            else:
-                msg = err.msg   # ignore the message provided in the test,
-                                # only check for position
+            self.assertEqual(err.msg, 'Expecting value')
             self.assertEqual(err.pos, idx)
             self.assertEqual(err.lineno, line)
             self.assertEqual(err.colno, col)
             self.assertEqual(str(err),
-                             '%s: line %s column %d (char %d)' %
-                             (msg, line, col, idx))
+                             'Expecting value: line %s column %d (char %d)' %
+                             (line, col, idx))
 
 class TestPyFail(TestFail, PyTest): pass
 class TestCFail(TestFail, CTest): pass

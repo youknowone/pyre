@@ -23,8 +23,7 @@ def check_syntax_warning(testcase, statement, errtext='',
     testcase.assertEqual(len(warns), 1, warns)
 
     warn, = warns
-    testcase.assertTrue(issubclass(warn.category, SyntaxWarning),
-                        warn.category)
+    testcase.assertIsSubclass(warn.category, SyntaxWarning)
     if errtext:
         testcase.assertRegex(str(warn.message), errtext)
     testcase.assertEqual(warn.filename, '<testcase>')
@@ -121,8 +120,6 @@ def check_no_warnings(testcase, message='', category=Warning, force_gc=False):
     Other keyword arguments are passed to warnings.filterwarnings().
     """
     from test.support import gc_collect
-    if force_gc:
-        gc_collect()
     with warnings.catch_warnings(record=True) as warns:
         warnings.filterwarnings('always',
                                 message=message,
@@ -162,11 +159,12 @@ def _filterwarnings(filters, quiet=False):
     registry = frame.f_globals.get('__warningregistry__')
     if registry:
         registry.clear()
-    with warnings.catch_warnings(record=True) as w:
-        # Set filter "always" to record all warnings.  Because
-        # test_warnings swap the module, we need to look up in
-        # the sys.modules dictionary.
-        sys.modules['warnings'].simplefilter("always")
+    # Because test_warnings swap the module, we need to look up in the
+    # sys.modules dictionary.
+    wmod = sys.modules['warnings']
+    with wmod.catch_warnings(record=True) as w:
+        # Set filter "always" to record all warnings.
+        wmod.simplefilter("always")
         yield WarningsRecorder(w)
     # Filter the recorded warnings
     reraise = list(w)

@@ -4,6 +4,7 @@ import html.parser
 import pprint
 import unittest
 
+from unittest.mock import patch
 from test import support
 
 
@@ -108,12 +109,13 @@ class EventCollectorNoNormalize(EventCollector):
 
 class TestCaseBase(unittest.TestCase):
 
-    def get_collector(self):
-        return EventCollector(convert_charrefs=False)
+    def get_collector(self, convert_charrefs=False):
+        return EventCollector(convert_charrefs=convert_charrefs)
 
-    def _run_check(self, source, expected_events, collector=None):
+    def _run_check(self, source, expected_events,
+                   *, collector=None, convert_charrefs=False):
         if collector is None:
-            collector = self.get_collector()
+            collector = self.get_collector(convert_charrefs=convert_charrefs)
         parser = collector
         for s in source:
             parser.feed(s)
@@ -127,7 +129,7 @@ class TestCaseBase(unittest.TestCase):
 
     def _run_check_extra(self, source, events):
         self._run_check(source, events,
-                        EventCollectorExtra(convert_charrefs=False))
+            collector=EventCollectorExtra(convert_charrefs=False))
 
 
 class HTMLParserTestCase(TestCaseBase):
@@ -186,10 +188,87 @@ text
         ])
 
     def test_unclosed_entityref(self):
-        self._run_check("&entityref foo", [
-            ("entityref", "entityref"),
-            ("data", " foo"),
-            ])
+        self._run_check('&gt &lt;', [('entityref', 'gt'), ('data', ' '), ('entityref', 'lt')],
+                        convert_charrefs=False)
+        self._run_check('&gt &lt;', [('data', '> <')], convert_charrefs=True)
+
+        self._run_check('&undefined &lt;',
+                        [('entityref', 'undefined'), ('data', ' '), ('entityref', 'lt')],
+                        convert_charrefs=False)
+        self._run_check('&undefined &lt;', [('data', '&undefined <')],
+                        convert_charrefs=True)
+
+        self._run_check('&gtundefined &lt;',
+                        [('entityref', 'gtundefined'), ('data', ' '), ('entityref', 'lt')],
+                        convert_charrefs=False)
+        self._run_check('&gtundefined &lt;', [('data', '>undefined <')],
+                        convert_charrefs=True)
+
+        self._run_check('& &lt;', [('data', '& '), ('entityref', 'lt')],
+                        convert_charrefs=False)
+        self._run_check('& &lt;', [('data', '& <')], convert_charrefs=True)
+
+    def test_eof_in_entityref(self):
+        self._run_check('&gt', [('entityref', 'gt')], convert_charrefs=False)
+        self._run_check('&gt', [('data', '>')], convert_charrefs=True)
+
+        self._run_check('&g', [('entityref', 'g')], convert_charrefs=False)
+        self._run_check('&g', [('data', '&g')], convert_charrefs=True)
+
+        self._run_check('&undefined', [('entityref', 'undefined')],
+                        convert_charrefs=False)
+        self._run_check('&undefined', [('data', '&undefined')],
+                        convert_charrefs=True)
+
+        self._run_check('&gtundefined', [('entityref', 'gtundefined')],
+                        convert_charrefs=False)
+        self._run_check('&gtundefined', [('data', '>undefined')],
+                        convert_charrefs=True)
+
+        self._run_check('&', [('data', '&')], convert_charrefs=False)
+        self._run_check('&', [('data', '&')], convert_charrefs=True)
+
+    def test_unclosed_charref(self):
+        self._run_check('&#123 &lt;', [('charref', '123'), ('data', ' '), ('entityref', 'lt')],
+                        convert_charrefs=False)
+        self._run_check('&#123 &lt;', [('data', '{ <')], convert_charrefs=True)
+        self._run_check('&#xab &lt;', [('charref', 'xab'), ('data', ' '), ('entityref', 'lt')],
+                        convert_charrefs=False)
+        self._run_check('&#xab &lt;', [('data', '\xab <')], convert_charrefs=True)
+
+        self._run_check('&#123456789 &lt;',
+                        [('charref', '123456789'), ('data', ' '), ('entityref', 'lt')],
+                        convert_charrefs=False)
+        self._run_check('&#123456789 &lt;', [('data', '\ufffd <')],
+                        convert_charrefs=True)
+        self._run_check('&#x123456789 &lt;',
+                        [('charref', 'x123456789'), ('data', ' '), ('entityref', 'lt')],
+                        convert_charrefs=False)
+        self._run_check('&#x123456789 &lt;', [('data', '\ufffd <')],
+                        convert_charrefs=True)
+
+        self._run_check('&# &lt;', [('data', '&# '), ('entityref', 'lt')], convert_charrefs=False)
+        self._run_check('&# &lt;', [('data', '&# <')], convert_charrefs=True)
+        self._run_check('&#x &lt;', [('data', '&#x '), ('entityref', 'lt')], convert_charrefs=False)
+        self._run_check('&#x &lt;', [('data', '&#x <')], convert_charrefs=True)
+
+    def test_eof_in_charref(self):
+        self._run_check('&#123', [('charref', '123')], convert_charrefs=False)
+        self._run_check('&#123', [('data', '{')], convert_charrefs=True)
+        self._run_check('&#xab', [('charref', 'xab')], convert_charrefs=False)
+        self._run_check('&#xab', [('data', '\xab')], convert_charrefs=True)
+
+        self._run_check('&#123456789', [('charref', '123456789')],
+                        convert_charrefs=False)
+        self._run_check('&#123456789', [('data', '\ufffd')], convert_charrefs=True)
+        self._run_check('&#x123456789', [('charref', 'x123456789')],
+                        convert_charrefs=False)
+        self._run_check('&#x123456789', [('data', '\ufffd')], convert_charrefs=True)
+
+        self._run_check('&#', [('data', '&#')], convert_charrefs=False)
+        self._run_check('&#', [('data', '&#')], convert_charrefs=True)
+        self._run_check('&#x', [('data', '&#x')], convert_charrefs=False)
+        self._run_check('&#x', [('data', '&#x')], convert_charrefs=True)
 
     def test_bad_nesting(self):
         # Strangely, this *is* supposed to test that overlapping
@@ -551,18 +630,16 @@ text
         collector = lambda: EventCollectorCharrefs()
         self.assertTrue(collector().convert_charrefs)
         charrefs = ['&quot;', '&#34;', '&#x22;', '&quot', '&#34', '&#x22']
-        # check charrefs in the middle of the text/attributes
-        expected = [('starttag', 'a', [('href', 'foo"zar')]),
-                    ('data', 'a"z'), ('endtag', 'a')]
+        # check charrefs in the middle of the text
+        expected = [('starttag', 'a', []), ('data', 'a"z'), ('endtag', 'a')]
         for charref in charrefs:
-            self._run_check('<a href="foo{0}zar">a{0}z</a>'.format(charref),
+            self._run_check('<a>a{0}z</a>'.format(charref),
                             expected, collector=collector())
-        # check charrefs at the beginning/end of the text/attributes
-        expected = [('data', '"'),
-                    ('starttag', 'a', [('x', '"'), ('y', '"X'), ('z', 'X"')]),
+        # check charrefs at the beginning/end of the text
+        expected = [('data', '"'), ('starttag', 'a', []),
                     ('data', '"'), ('endtag', 'a'), ('data', '"')]
         for charref in charrefs:
-            self._run_check('{0}<a x="{0}" y="{0}X" z="X{0}">'
+            self._run_check('{0}<a>'
                             '{0}</a>{0}'.format(charref),
                             expected, collector=collector())
         # check charrefs in <script>/<style> elements
@@ -584,6 +661,35 @@ text
         # check a string with no charrefs
         self._run_check('no charrefs here', [('data', 'no charrefs here')],
                         collector=collector())
+
+    def test_convert_charrefs_in_attribute_values(self):
+        # default value for convert_charrefs is now True
+        collector = lambda: EventCollectorCharrefs()
+        self.assertTrue(collector().convert_charrefs)
+
+        # always unescape terminated entity refs, numeric and hex char refs:
+        # - regardless whether they are at start, middle, end of attribute
+        # - or followed by alphanumeric, non-alphanumeric, or equals char
+        charrefs = ['&cent;', '&#xa2;', '&#xa2', '&#162;', '&#162']
+        expected = [('starttag', 'a',
+                     [('x', '¢'), ('x', 'z¢'), ('x', '¢z'),
+                      ('x', 'z¢z'), ('x', '¢ z'), ('x', '¢=z')]),
+                    ('endtag', 'a')]
+        for charref in charrefs:
+            self._run_check('<a x="{0}" x="z{0}" x="{0}z" '
+                            '   x="z{0}z" x="{0} z" x="{0}=z"></a>'
+                            .format(charref), expected, collector=collector())
+
+        # only unescape unterminated entity matches if they are not followed by
+        # an alphanumeric or an equals sign
+        charref = '&cent'
+        expected = [('starttag', 'a',
+                     [('x', '¢'), ('x', 'z¢'), ('x', '&centz'),
+                      ('x', 'z&centz'), ('x', '¢ z'), ('x', '&cent=z')]),
+                    ('endtag', 'a')]
+        self._run_check('<a x="{0}" x="z{0}" x="{0}z" '
+                        '   x="z{0}z" x="{0} z" x="{0}=z"></a>'
+                        .format(charref), expected, collector=collector())
 
     # the remaining tests were for the "tolerant" parser (which is now
     # the default), and check various kind of broken markup
@@ -734,20 +840,6 @@ text
         ]
         self._run_check(html, expected)
 
-    def test_EOF_in_charref(self):
-        # see #17802
-        # This test checks that the UnboundLocalError reported in the issue
-        # is not raised, however I'm not sure the returned values are correct.
-        # Maybe HTMLParser should use self.unescape for these
-        data = [
-            ('a&', [('data', 'a&')]),
-            ('a&b', [('data', 'ab')]),
-            ('a&b ', [('data', 'a'), ('entityref', 'b'), ('data', ' ')]),
-            ('a&b;', [('data', 'a'), ('entityref', 'b')]),
-        ]
-        for html, expected in data:
-            self._run_check(html, expected)
-
     def test_eof_in_comments(self):
         data = [
             ('<!--', [('comment', '')]),
@@ -803,7 +895,15 @@ text
                 '<! not a comment either -->'
                 '<! -- close enough -->'
                 '<!><!<-- this was an empty comment>'
-                '<!!! another bogus comment !!!>')
+                '<!!! another bogus comment !!!>'
+                # see #32876
+                '<![with square brackets]!>'
+                '<![\nmultiline\nbogusness\n]!>'
+                '<![more brackets]-[and a hyphen]!>'
+                '<![cdata[should be uppercase]]>'
+                '<![CDATA [whitespaces are not ignored]]>'
+                '<![CDATA]]>'  # required '[' after CDATA
+        )
         expected = [
             ('comment', 'ELEMENT br EMPTY'),
             ('comment', ' not really a comment '),
@@ -812,41 +912,43 @@ text
             ('comment', ''),
             ('comment', '<-- this was an empty comment'),
             ('comment', '!! another bogus comment !!!'),
+            ('comment', '[with square brackets]!'),
+            ('comment', '[\nmultiline\nbogusness\n]!'),
+            ('comment', '[more brackets]-[and a hyphen]!'),
+            ('comment', '[cdata[should be uppercase]]'),
+            ('comment', '[CDATA [whitespaces are not ignored]]'),
+            ('comment', '[CDATA]]'),
         ]
         self._run_check(html, expected)
 
     def test_broken_condcoms(self):
         # these condcoms are missing the '--' after '<!' and before the '>'
+        # and they are considered bogus comments according to
+        # "8.2.4.42. Markup declaration open state"
         html = ('<![if !(IE)]>broken condcom<![endif]>'
                 '<![if ! IE]><link href="favicon.tiff"/><![endif]>'
                 '<![if !IE 6]><img src="firefox.png" /><![endif]>'
                 '<![if !ie 6]><b>foo</b><![endif]>'
                 '<![if (!IE)|(lt IE 9)]><img src="mammoth.bmp" /><![endif]>')
-        # According to the HTML5 specs sections "8.2.4.44 Bogus comment state"
-        # and "8.2.4.45 Markup declaration open state", comment tokens should
-        # be emitted instead of 'unknown decl', but calling unknown_decl
-        # provides more flexibility.
-        # See also Lib/_markupbase.py:parse_declaration
         expected = [
-            ('unknown decl', 'if !(IE)'),
+            ('comment', '[if !(IE)]'),
             ('data', 'broken condcom'),
-            ('unknown decl', 'endif'),
-            ('unknown decl', 'if ! IE'),
+            ('comment', '[endif]'),
+            ('comment', '[if ! IE]'),
             ('startendtag', 'link', [('href', 'favicon.tiff')]),
-            ('unknown decl', 'endif'),
-            ('unknown decl', 'if !IE 6'),
+            ('comment', '[endif]'),
+            ('comment', '[if !IE 6]'),
             ('startendtag', 'img', [('src', 'firefox.png')]),
-            ('unknown decl', 'endif'),
-            ('unknown decl', 'if !ie 6'),
+            ('comment', '[endif]'),
+            ('comment', '[if !ie 6]'),
             ('starttag', 'b', []),
             ('data', 'foo'),
             ('endtag', 'b'),
-            ('unknown decl', 'endif'),
-            ('unknown decl', 'if (!IE)|(lt IE 9)'),
+            ('comment', '[endif]'),
+            ('comment', '[if (!IE)|(lt IE 9)]'),
             ('startendtag', 'img', [('src', 'mammoth.bmp')]),
-            ('unknown decl', 'endif')
+            ('comment', '[endif]')
         ]
-
         self._run_check(html, expected)
 
     @support.subTests('content', [
@@ -1131,6 +1233,18 @@ class AttributesTestCase(TestCaseBase):
         self._run_check('<form action=bogus|&#()value>', [
                             ('starttag', 'form',
                                 [('action', 'bogus|&#()value')])])
+
+
+class TestInheritance(unittest.TestCase):
+
+    @patch("_markupbase.ParserBase.__init__")
+    @patch("_markupbase.ParserBase.reset")
+    def test_base_class_methods_called(self, super_reset_method, super_init_method):
+        with patch('_markupbase.ParserBase') as parser_base:
+            EventCollector()
+            super_init_method.assert_called_once()
+            super_reset_method.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main()

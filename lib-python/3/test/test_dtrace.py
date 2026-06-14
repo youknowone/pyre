@@ -8,7 +8,7 @@ import types
 import unittest
 
 from test import support
-from test.support import findfile
+from test.support import findfile, MS_WINDOWS
 
 
 if not support.has_subprocess_support:
@@ -103,6 +103,7 @@ class SystemTapBackend(TraceBackend):
     COMMAND = ["stap", "-g"]
 
 
+@unittest.skipIf(MS_WINDOWS, "Tests not compliant with trace on Windows.")
 class TraceTests:
     # unittest.TestCase options
     maxDiff = None
@@ -234,12 +235,24 @@ class CheckDtraceProbes(unittest.TestCase):
             "Name: audit",
             "Name: gc__start",
             "Name: gc__done",
+        ]
+
+        for probe_name in available_probe_names:
+            with self.subTest(probe_name=probe_name):
+                self.assertIn(probe_name, readelf_output)
+
+    @unittest.expectedFailure
+    def test_missing_probes(self):
+        readelf_output = self.get_readelf_output()
+
+        # Missing probes will be added in the future.
+        missing_probe_names = [
             "Name: function__entry",
             "Name: function__return",
             "Name: line",
         ]
 
-        for probe_name in available_probe_names:
+        for probe_name in missing_probe_names:
             with self.subTest(probe_name=probe_name):
                 self.assertIn(probe_name, readelf_output)
 

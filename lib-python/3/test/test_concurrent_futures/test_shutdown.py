@@ -187,11 +187,7 @@ class ThreadPoolShutdownTest(ThreadPoolMixin, ExecutorShutdownTest, BaseTestCase
         del executor
 
         for t in threads:
-            # t.join()
-            # XXX PyPy change: gc must collect the executor, or test will hang
-            while t.is_alive():
-                support.gc_collect()  # For PyPy or other GCs.
-                t.join(0.01)  # 10 ms
+            t.join()
 
         # Make sure the results were all computed before the
         # executor got shutdown.
@@ -218,30 +214,24 @@ class ThreadPoolShutdownTest(ThreadPoolMixin, ExecutorShutdownTest, BaseTestCase
         executor.map(abs, range(-5, 5))
         threads = executor._threads
         del executor
+        support.gc_collect()  # For PyPy or other GCs.
 
         for t in threads:
             self.assertRegex(t.name, r'^SpecialPool_[0-4]$')
-            # t.join()
-            # XXX PyPy change: gc must collect the executor, or test will hang
-            while t.is_alive():
-                support.gc_collect()  # For PyPy or other GCs.
-                t.join(0.01)  # 10 ms
+            t.join()
 
     def test_thread_names_default(self):
         executor = futures.ThreadPoolExecutor(max_workers=5)
         executor.map(abs, range(-5, 5))
         threads = executor._threads
         del executor
+        support.gc_collect()  # For PyPy or other GCs.
 
         for t in threads:
             # Ensure that our default name is reasonably sane and unique when
             # no thread_name_prefix was supplied.
             self.assertRegex(t.name, r'ThreadPoolExecutor-\d+_[0-4]$')
-            # t.join()
-            # XXX PyPy change: gc must collect the executor, or test will hang
-            while t.is_alive():
-                support.gc_collect()  # For PyPy or other GCs.
-                t.join(0.01)  # 10 ms
+            t.join()
 
     def test_cancel_futures_wait_false(self):
         # Can only be reliably tested for TPE, since PPE often hangs with
@@ -305,17 +295,11 @@ class ProcessPoolShutdownTest(ExecutorShutdownTest):
         call_queue = executor._call_queue
         executor_manager_thread = executor._executor_manager_thread
         del executor
+        support.gc_collect()  # For PyPy or other GCs.
 
         # Make sure that all the executor resources were properly cleaned by
         # the shutdown process
-        # executor_manager_thread.join()
-        # XXX PyPy change: gc must collect the executor, or test will hang
-        start = time.monotonic()
-        while executor_manager_thread.is_alive():
-            support.gc_collect()  # For PyPy or other GCs.
-            if time.monotonic() - start > 5:
-                assert executor_manager_thread.executor_reference() is None
-            executor_manager_thread.join(0.01)  # 10 ms
+        executor_manager_thread.join()
         for p in processes.values():
             p.join()
         call_queue.join_thread()
@@ -345,6 +329,64 @@ class ProcessPoolShutdownTest(ExecutorShutdownTest):
         # Make sure the results were all computed before the executor got
         # shutdown.
         assert all([r == abs(v) for r, v in zip(res, range(-5, 5))])
+
+    @classmethod
+    def _failing_task_gh_132969(cls, n):
+        raise ValueError("failing task")
+
+    @classmethod
+    def _good_task_gh_132969(cls, n):
+        time.sleep(0.1 * n)
+        return n
+
+    def _run_test_issue_gh_132969(self, max_workers):
+        # max_workers=2 will repro exception
+        # max_workers=4 will repro exception and then hang
+
+        # Repro conditions
+        #   max_tasks_per_child=1
+        #   a task ends abnormally
+        #   shutdown(wait=False) is called
+        start_method = self.get_context().get_start_method()
+        if (start_method == "fork" or
+           (start_method == "forkserver" and sys.platform.startswith("win"))):
+                self.skipTest(f"Skipping test for {start_method = }")
+        executor = futures.ProcessPoolExecutor(
+                max_workers=max_workers,
+                max_tasks_per_child=1,
+                mp_context=self.get_context())
+        f1 = executor.submit(ProcessPoolShutdownTest._good_task_gh_132969, 1)
+        f2 = executor.submit(ProcessPoolShutdownTest._failing_task_gh_132969, 2)
+        f3 = executor.submit(ProcessPoolShutdownTest._good_task_gh_132969, 3)
+        result = 0
+        try:
+            result += f1.result()
+            result += f2.result()
+            result += f3.result()
+        except ValueError:
+            # stop processing results upon first exception
+            pass
+
+        # Ensure that the executor cleans up after called
+        # shutdown with wait=False
+        executor_manager_thread = executor._executor_manager_thread
+        executor.shutdown(wait=False)
+        time.sleep(0.2)
+        executor_manager_thread.join()
+        return result
+
+    def test_shutdown_gh_132969_case_1(self):
+        # gh-132969: test that exception "object of type 'NoneType' has no len()"
+        # is not raised when shutdown(wait=False) is called.
+        result = self._run_test_issue_gh_132969(2)
+        self.assertEqual(result, 1)
+
+    def test_shutdown_gh_132969_case_2(self):
+        # gh-132969: test that process does not hang and
+        # exception "object of type 'NoneType' has no len()" is not raised
+        # when shutdown(wait=False) is called.
+        result = self._run_test_issue_gh_132969(4)
+        self.assertEqual(result, 1)
 
 
 create_executor_tests(globals(), ProcessPoolShutdownTest,

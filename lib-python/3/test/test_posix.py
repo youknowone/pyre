@@ -1,17 +1,19 @@
 "Test posix functions"
 
 from test import support
-from test.support import import_helper
+from test.support import is_apple
 from test.support import os_helper
 from test.support import warnings_helper
 from test.support.script_helper import assert_python_ok
 
+import copy
 import errno
 import sys
 import signal
 import time
 import os
 import platform
+import pickle
 import stat
 import tempfile
 import unittest
@@ -233,6 +235,9 @@ class PosixTester(unittest.TestCase):
         with self.assertRaises(TypeError, msg="Invalid arg was allowed"):
             # Ensure a combination of valid and invalid is an error.
             os.register_at_fork(before=None, after_in_parent=lambda: 3)
+        with self.assertRaises(TypeError, msg="At least one argument is required"):
+            # when no arg is passed
+            os.register_at_fork()
         with self.assertRaises(TypeError, msg="Invalid arg was allowed"):
             # Ensure a combination of valid and invalid is an error.
             os.register_at_fork(before=lambda: None, after_in_child='')
@@ -408,8 +413,10 @@ class PosixTester(unittest.TestCase):
             # issue33655: Also ignore EINVAL on *BSD since ZFS is also
             # often used there.
             if inst.errno == errno.EINVAL and sys.platform.startswith(
-                ('sunos', 'freebsd', 'netbsd', 'openbsd', 'gnukfreebsd')):
+                ('sunos', 'freebsd', 'openbsd', 'gnukfreebsd')):
                 raise unittest.SkipTest("test may fail on ZFS filesystems")
+            elif inst.errno == errno.EOPNOTSUPP and sys.platform.startswith("netbsd"):
+                raise unittest.SkipTest("test may fail on FFS filesystems")
             else:
                 raise
         finally:
@@ -562,8 +569,37 @@ class PosixTester(unittest.TestCase):
     @unittest.skipUnless(hasattr(posix, 'confstr'),
                          'test needs posix.confstr()')
     def test_confstr(self):
-        self.assertRaises(ValueError, posix.confstr, "CS_garbage")
-        self.assertEqual(len(posix.confstr("CS_PATH")) > 0, True)
+        with self.assertRaisesRegex(
+            ValueError, "unrecognized configuration name"
+        ):
+            posix.confstr("CS_garbage")
+
+        with self.assertRaisesRegex(
+            TypeError, "configuration names must be strings or integers"
+        ):
+            posix.confstr(1.23)
+
+        path = posix.confstr("CS_PATH")
+        self.assertGreater(len(path), 0)
+        self.assertEqual(posix.confstr(posix.confstr_names["CS_PATH"]), path)
+
+    @unittest.skipUnless(hasattr(posix, 'sysconf'),
+                         'test needs posix.sysconf()')
+    def test_sysconf(self):
+        with self.assertRaisesRegex(
+            ValueError, "unrecognized configuration name"
+        ):
+            posix.sysconf("SC_garbage")
+
+        with self.assertRaisesRegex(
+            TypeError, "configuration names must be strings or integers"
+        ):
+            posix.sysconf(1.23)
+
+        arg_max = posix.sysconf("SC_ARG_MAX")
+        self.assertGreater(arg_max, 0)
+        self.assertEqual(
+            posix.sysconf(posix.sysconf_names["SC_ARG_MAX"]), arg_max)
 
     @unittest.skipUnless(hasattr(posix, 'dup2'),
                          'test needs posix.dup2()')
@@ -632,11 +668,23 @@ class PosixTester(unittest.TestCase):
         finally:
             fp.close()
 
+    @unittest.skipUnless(hasattr(posix, 'stat'),
+                         'test needs posix.stat()')
+    @unittest.skipUnless(os.stat in os.supports_follow_symlinks,
+                         'test needs follow_symlinks support in os.stat()')
+    def test_stat_fd_zero_follow_symlinks(self):
+        with self.assertRaisesRegex(ValueError,
+                'cannot use fd and follow_symlinks together'):
+            posix.stat(0, follow_symlinks=False)
+        with self.assertRaisesRegex(ValueError,
+                'cannot use fd and follow_symlinks together'):
+            posix.stat(1, follow_symlinks=False)
+
     def test_stat(self):
         self.assertTrue(posix.stat(os_helper.TESTFN))
         self.assertTrue(posix.stat(os.fsencode(os_helper.TESTFN)))
 
-        self.assertWarnsRegex(DeprecationWarning,
+        self.assertRaisesRegex(TypeError,
                 'should be string, bytes, os.PathLike or integer, not',
                 posix.stat, bytearray(os.fsencode(os_helper.TESTFN)))
         self.assertRaisesRegex(TypeError,
@@ -700,7 +748,8 @@ class PosixTester(unittest.TestCase):
         self.assertEqual(posix.major(dev), major)
         self.assertRaises(TypeError, posix.major, float(dev))
         self.assertRaises(TypeError, posix.major)
-        self.assertRaises((ValueError, OverflowError), posix.major, -1)
+        for x in -2, 2**64, -2**63-1:
+            self.assertRaises((ValueError, OverflowError), posix.major, x)
 
         minor = posix.minor(dev)
         self.assertIsInstance(minor, int)
@@ -708,13 +757,23 @@ class PosixTester(unittest.TestCase):
         self.assertEqual(posix.minor(dev), minor)
         self.assertRaises(TypeError, posix.minor, float(dev))
         self.assertRaises(TypeError, posix.minor)
-        self.assertRaises((ValueError, OverflowError), posix.minor, -1)
+        for x in -2, 2**64, -2**63-1:
+            self.assertRaises((ValueError, OverflowError), posix.minor, x)
 
         self.assertEqual(posix.makedev(major, minor), dev)
         self.assertRaises(TypeError, posix.makedev, float(major), minor)
         self.assertRaises(TypeError, posix.makedev, major, float(minor))
         self.assertRaises(TypeError, posix.makedev, major)
         self.assertRaises(TypeError, posix.makedev)
+        for x in -2, 2**32, 2**64, -2**63-1:
+            self.assertRaises((ValueError, OverflowError), posix.makedev, x, minor)
+            self.assertRaises((ValueError, OverflowError), posix.makedev, major, x)
+
+        if sys.platform == 'linux' and not support.linked_to_musl():
+            NODEV = -1
+            self.assertEqual(posix.major(NODEV), NODEV)
+            self.assertEqual(posix.minor(NODEV), NODEV)
+            self.assertEqual(posix.makedev(NODEV, NODEV), NODEV)
 
     def _test_all_chown_common(self, chown_func, first_param, stat_func):
         """Common code for chown, fchown and lchown tests."""
@@ -778,9 +837,10 @@ class PosixTester(unittest.TestCase):
             check_stat(uid, gid)
             self.assertRaises(OSError, chown_func, first_param, 0, -1)
             check_stat(uid, gid)
-            if 0 not in os.getgroups():
-                self.assertRaises(OSError, chown_func, first_param, -1, 0)
-                check_stat(uid, gid)
+            if hasattr(os, 'getgroups'):
+                if 0 not in os.getgroups():
+                    self.assertRaises(OSError, chown_func, first_param, -1, 0)
+                    check_stat(uid, gid)
         # test illegal types
         for t in str, float:
             self.assertRaises(TypeError, chown_func, first_param, t(uid), gid)
@@ -843,11 +903,8 @@ class PosixTester(unittest.TestCase):
 
     def test_listdir_bytes_like(self):
         for cls in bytearray, memoryview:
-            with self.assertWarns(DeprecationWarning):
-                names = posix.listdir(cls(b'.'))
-            self.assertIn(os.fsencode(os_helper.TESTFN), names)
-            for name in names:
-                self.assertIs(type(name), bytes)
+            with self.assertRaises(TypeError):
+                posix.listdir(cls(b'.'))
 
     @unittest.skipUnless(posix.listdir in os.supports_fd,
                          "test needs fd support for posix.listdir()")
@@ -936,6 +993,7 @@ class PosixTester(unittest.TestCase):
         posix.utime(os_helper.TESTFN, (now, now))
 
     def check_chmod(self, chmod_func, target, **kwargs):
+        closefd = not isinstance(target, int)
         mode = os.stat(target).st_mode
         try:
             new_mode = mode & ~(stat.S_IWOTH | stat.S_IWGRP | stat.S_IWUSR)
@@ -943,7 +1001,7 @@ class PosixTester(unittest.TestCase):
             self.assertEqual(os.stat(target).st_mode, new_mode)
             if stat.S_ISREG(mode):
                 try:
-                    with open(target, 'wb+'):
+                    with open(target, 'wb+', closefd=closefd):
                         pass
                 except PermissionError:
                     pass
@@ -951,10 +1009,10 @@ class PosixTester(unittest.TestCase):
             chmod_func(target, new_mode, **kwargs)
             self.assertEqual(os.stat(target).st_mode, new_mode)
             if stat.S_ISREG(mode):
-                with open(target, 'wb+'):
+                with open(target, 'wb+', closefd=closefd):
                     pass
         finally:
-            posix.chmod(target, mode)
+            chmod_func(target, mode)
 
     @os_helper.skip_unless_working_chmod
     def test_chmod_file(self):
@@ -970,6 +1028,12 @@ class PosixTester(unittest.TestCase):
     def test_chmod_dir(self):
         target = self.tempdir()
         self.check_chmod(posix.chmod, target)
+
+    @os_helper.skip_unless_working_chmod
+    def test_fchmod_file(self):
+        with open(os_helper.TESTFN, 'wb+') as f:
+            self.check_chmod(posix.fchmod, f.fileno())
+            self.check_chmod(posix.chmod, f.fileno())
 
     @unittest.skipUnless(hasattr(posix, 'lchmod'), 'test needs os.lchmod()')
     def test_lchmod_file(self):
@@ -1019,7 +1083,7 @@ class PosixTester(unittest.TestCase):
             self.check_lchmod_link(posix.chmod, target, link)
         else:
             self.check_chmod_link(posix.chmod, target, link)
-            self.check_chmod_link(posix.chmod, target, link, follow_symlinks=True)
+        self.check_chmod_link(posix.chmod, target, link, follow_symlinks=True)
 
     @os_helper.skip_unless_symlink
     def test_chmod_dir_symlink(self):
@@ -1031,7 +1095,7 @@ class PosixTester(unittest.TestCase):
             self.check_lchmod_link(posix.chmod, target, link)
         else:
             self.check_chmod_link(posix.chmod, target, link)
-            self.check_chmod_link(posix.chmod, target, link, follow_symlinks=True)
+        self.check_chmod_link(posix.chmod, target, link, follow_symlinks=True)
 
     @unittest.skipUnless(hasattr(posix, 'lchmod'), 'test needs os.lchmod()')
     @os_helper.skip_unless_symlink
@@ -1055,7 +1119,7 @@ class PosixTester(unittest.TestCase):
 
     def _test_chflags_regular_file(self, chflags_func, target_file, **kwargs):
         st = os.stat(target_file)
-        self.assertTrue(hasattr(st, 'st_flags'))
+        self.assertHasAttr(st, 'st_flags')
 
         # ZFS returns EOPNOTSUPP when attempting to set flag UF_IMMUTABLE.
         flags = st.st_flags | stat.UF_IMMUTABLE
@@ -1091,7 +1155,7 @@ class PosixTester(unittest.TestCase):
     def test_lchflags_symlink(self):
         testfn_st = os.stat(os_helper.TESTFN)
 
-        self.assertTrue(hasattr(testfn_st, 'st_flags'))
+        self.assertHasAttr(testfn_st, 'st_flags')
 
         self.addCleanup(os_helper.unlink, _DUMMY_SYMLINK)
         os.symlink(os_helper.TESTFN, _DUMMY_SYMLINK)
@@ -1249,8 +1313,8 @@ class PosixTester(unittest.TestCase):
         self.assertIsInstance(lo, int)
         self.assertIsInstance(hi, int)
         self.assertGreaterEqual(hi, lo)
-        # OSX evidently just returns 15 without checking the argument.
-        if sys.platform != "darwin":
+        # Apple platforms return 15 without checking the argument.
+        if not is_apple:
             self.assertRaises(OSError, posix.sched_get_priority_min, -23)
             self.assertRaises(OSError, posix.sched_get_priority_max, -23)
 
@@ -1262,9 +1326,10 @@ class PosixTester(unittest.TestCase):
         self.assertIn(mine, possible_schedulers)
         try:
             parent = posix.sched_getscheduler(os.getppid())
-        except OSError as e:
-            if e.errno != errno.EPERM:
-                raise
+        except PermissionError:
+            # POSIX specifies EPERM, but Android returns EACCES. Both errno
+            # values are mapped to PermissionError.
+            pass
         else:
             self.assertIn(parent, possible_schedulers)
         self.assertRaises(OSError, posix.sched_getscheduler, -1)
@@ -1279,9 +1344,8 @@ class PosixTester(unittest.TestCase):
             try:
                 posix.sched_setscheduler(0, mine, param)
                 posix.sched_setparam(0, param)
-            except OSError as e:
-                if e.errno != errno.EPERM:
-                    raise
+            except PermissionError:
+                pass
             self.assertRaises(OSError, posix.sched_setparam, -1, param)
 
         self.assertRaises(OSError, posix.sched_setscheduler, -1, mine, param)
@@ -1294,6 +1358,33 @@ class PosixTester(unittest.TestCase):
         self.assertRaises(OverflowError, posix.sched_setparam, 0, param)
         param = posix.sched_param(sched_priority=-large)
         self.assertRaises(OverflowError, posix.sched_setparam, 0, param)
+
+    @requires_sched
+    def test_sched_param(self):
+        param = posix.sched_param(1)
+        for proto in range(pickle.HIGHEST_PROTOCOL+1):
+            newparam = pickle.loads(pickle.dumps(param, proto))
+            self.assertEqual(newparam, param)
+        newparam = copy.copy(param)
+        self.assertIsNot(newparam, param)
+        self.assertEqual(newparam, param)
+        newparam = copy.deepcopy(param)
+        self.assertIsNot(newparam, param)
+        self.assertEqual(newparam, param)
+        newparam = copy.replace(param)
+        self.assertIsNot(newparam, param)
+        self.assertEqual(newparam, param)
+        newparam = copy.replace(param, sched_priority=0)
+        self.assertNotEqual(newparam, param)
+        self.assertEqual(newparam.sched_priority, 0)
+
+    @requires_sched
+    def test_bug_140634(self):
+        sched_priority = float('inf')  # any new reference
+        param = posix.sched_param(sched_priority)
+        param.__reduce__()
+        del sched_priority, param  # should not crash
+        support.gc_collect()  # just to be sure
 
     @unittest.skipUnless(hasattr(posix, "sched_rr_get_interval"), "no function")
     def test_sched_rr_get_interval(self):
@@ -1450,6 +1541,51 @@ class PosixTester(unittest.TestCase):
         self.assertEqual(cm.exception.errno, errno.EINVAL)
         os.close(os.pidfd_open(os.getpid(), 0))
 
+    @os_helper.skip_unless_hardlink
+    @os_helper.skip_unless_symlink
+    def test_link_follow_symlinks(self):
+        default_follow = sys.platform.startswith(
+            ('darwin', 'freebsd', 'netbsd', 'openbsd', 'dragonfly', 'sunos5'))
+        default_no_follow = sys.platform.startswith(('win32', 'linux'))
+        orig = os_helper.TESTFN
+        symlink = orig + 'symlink'
+        posix.symlink(orig, symlink)
+        self.addCleanup(os_helper.unlink, symlink)
+
+        with self.subTest('no follow_symlinks'):
+            # no follow_symlinks -> platform depending
+            link = orig + 'link'
+            posix.link(symlink, link)
+            self.addCleanup(os_helper.unlink, link)
+            if os.link in os.supports_follow_symlinks or default_follow:
+                self.assertEqual(posix.lstat(link), posix.lstat(orig))
+            elif default_no_follow:
+                self.assertEqual(posix.lstat(link), posix.lstat(symlink))
+
+        with self.subTest('follow_symlinks=False'):
+            # follow_symlinks=False -> duplicate the symlink itself
+            link = orig + 'link_nofollow'
+            try:
+                posix.link(symlink, link, follow_symlinks=False)
+            except NotImplementedError:
+                if os.link in os.supports_follow_symlinks or default_no_follow:
+                    raise
+            else:
+                self.addCleanup(os_helper.unlink, link)
+                self.assertEqual(posix.lstat(link), posix.lstat(symlink))
+
+        with self.subTest('follow_symlinks=True'):
+            # follow_symlinks=True -> duplicate the target file
+            link = orig + 'link_following'
+            try:
+                posix.link(symlink, link, follow_symlinks=True)
+            except NotImplementedError:
+                if os.link in os.supports_follow_symlinks or default_follow:
+                    raise
+            else:
+                self.addCleanup(os_helper.unlink, link)
+                self.assertEqual(posix.lstat(link), posix.lstat(orig))
+
 
 # tests for the posix *at functions follow
 class TestPosixDirFd(unittest.TestCase):
@@ -1514,6 +1650,13 @@ class TestPosixDirFd(unittest.TestCase):
                     posix.stat, name, dir_fd=float(dir_fd))
             self.assertRaises(OverflowError,
                     posix.stat, name, dir_fd=10**20)
+
+            for fd in False, True:
+                with self.assertWarnsRegex(RuntimeWarning,
+                        'bool is used as a file descriptor') as cm:
+                    with self.assertRaises(OSError):
+                        posix.stat('nonexisting', dir_fd=fd)
+                self.assertEqual(cm.filename, __file__)
 
     @unittest.skipUnless(os.utime in os.supports_dir_fd, "test needs dir_fd support in os.utime()")
     def test_utime_dir_fd(self):
@@ -1781,12 +1924,6 @@ class _PosixSpawnMixin:
         )
         support.wait_process(pid, exitcode=0)
 
-    def test_resetids_wrong_type(self):
-        with self.assertRaises(TypeError):
-            self.spawn_func(sys.executable,
-                            [sys.executable, "-c", "pass"],
-                            os.environ, resetids=None)
-
     def test_setpgroup(self):
         pid = self.spawn_func(
             sys.executable,
@@ -1794,6 +1931,11 @@ class _PosixSpawnMixin:
             os.environ,
             setpgroup=os.getpgrp()
         )
+        support.wait_process(pid, exitcode=0)
+
+    def test_setpgroup_allow_none(self):
+        path, args = self.NOOP_PROGRAM[0], self.NOOP_PROGRAM
+        pid = self.spawn_func(path, args, os.environ, setpgroup=None)
         support.wait_process(pid, exitcode=0)
 
     def test_setpgroup_wrong_type(self):
@@ -1896,6 +2038,20 @@ class _PosixSpawnMixin:
                             [sys.executable, "-c", "pass"],
                             os.environ, setsigdef=[signal.NSIG, signal.NSIG+1])
 
+    def test_scheduler_allow_none(self):
+        path, args = self.NOOP_PROGRAM[0], self.NOOP_PROGRAM
+        pid = self.spawn_func(path, args, os.environ, scheduler=None)
+        support.wait_process(pid, exitcode=0)
+
+    @support.subTests("scheduler", [object(), 1, [1, 2]])
+    def test_scheduler_wrong_type(self, scheduler):
+        path, args = self.NOOP_PROGRAM[0], self.NOOP_PROGRAM
+        with self.assertRaisesRegex(
+            TypeError,
+            "scheduler must be a tuple or None",
+        ):
+            self.spawn_func(path, args, os.environ, scheduler=scheduler)
+
     @requires_sched
     @unittest.skipIf(sys.platform.startswith(('freebsd', 'netbsd')),
                      "bpo-34685: test can fail on BSD")
@@ -1919,6 +2075,12 @@ class _PosixSpawnMixin:
     @requires_sched
     @unittest.skipIf(sys.platform.startswith(('freebsd', 'netbsd')),
                      "bpo-34685: test can fail on BSD")
+    @unittest.skipIf(platform.libc_ver()[0] == 'glibc' and
+                     os.sched_getscheduler(0) in [
+                        os.SCHED_BATCH,
+                        os.SCHED_IDLE,
+                        os.SCHED_DEADLINE],
+                     "Skip test due to glibc posix_spawn policy")
     def test_setscheduler_with_policy(self):
         policy = os.sched_getscheduler(0)
         priority = os.sched_get_priority_min(policy)
@@ -2036,11 +2198,13 @@ class _PosixSpawnMixin:
 
 
 @unittest.skipUnless(hasattr(os, 'posix_spawn'), "test needs os.posix_spawn")
+@support.requires_subprocess()
 class TestPosixSpawn(unittest.TestCase, _PosixSpawnMixin):
     spawn_func = getattr(posix, 'posix_spawn', None)
 
 
 @unittest.skipUnless(hasattr(os, 'posix_spawnp'), "test needs os.posix_spawnp")
+@support.requires_subprocess()
 class TestPosixSpawnP(unittest.TestCase, _PosixSpawnMixin):
     spawn_func = getattr(posix, 'posix_spawnp', None)
 
@@ -2099,12 +2263,12 @@ class TestPosixWeaklinking(unittest.TestCase):
     def test_pwritev(self):
         self._verify_available("HAVE_PWRITEV")
         if self.mac_ver >= (10, 16):
-            self.assertTrue(hasattr(os, "pwritev"), "os.pwritev is not available")
-            self.assertTrue(hasattr(os, "preadv"), "os.readv is not available")
+            self.assertHasAttr(os, "pwritev")
+            self.assertHasAttr(os, "preadv")
 
         else:
-            self.assertFalse(hasattr(os, "pwritev"), "os.pwritev is available")
-            self.assertFalse(hasattr(os, "preadv"), "os.readv is available")
+            self.assertNotHasAttr(os, "pwritev")
+            self.assertNotHasAttr(os, "preadv")
 
     def test_stat(self):
         self._verify_available("HAVE_FSTATAT")
@@ -2116,6 +2280,13 @@ class TestPosixWeaklinking(unittest.TestCase):
 
             with self.assertRaisesRegex(NotImplementedError, "dir_fd unavailable"):
                 os.stat("file", dir_fd=0)
+
+    def test_ptsname_r(self):
+        self._verify_available("HAVE_PTSNAME_R")
+        if self.mac_ver >= (10, 13, 4):
+            self.assertIn("HAVE_PTSNAME_R", posix._have_functions)
+        else:
+            self.assertNotIn("HAVE_PTSNAME_R", posix._have_functions)
 
     def test_access(self):
         self._verify_available("HAVE_FACCESSAT")
@@ -2324,6 +2495,53 @@ class TestPosixWeaklinking(unittest.TestCase):
 
             with self.assertRaisesRegex(NotImplementedError, "dir_fd unavailable"):
                 os.utime("path", dir_fd=0)
+
+
+class NamespacesTests(unittest.TestCase):
+    """Tests for os.unshare() and os.setns()."""
+
+    @unittest.skipUnless(hasattr(os, 'unshare'), 'needs os.unshare()')
+    @unittest.skipUnless(hasattr(os, 'setns'), 'needs os.setns()')
+    @unittest.skipUnless(os.path.exists('/proc/self/ns/uts'), 'need /proc/self/ns/uts')
+    @support.requires_linux_version(3, 0, 0)
+    def test_unshare_setns(self):
+        code = """if 1:
+            import errno
+            import os
+            import sys
+            fd = os.open('/proc/self/ns/uts', os.O_RDONLY)
+            try:
+                original = os.readlink('/proc/self/ns/uts')
+                try:
+                    os.unshare(os.CLONE_NEWUTS)
+                except OSError as e:
+                    if e.errno == errno.ENOSPC:
+                        # skip test if limit is exceeded
+                        sys.exit()
+                    raise
+                new = os.readlink('/proc/self/ns/uts')
+                if original == new:
+                    raise Exception('os.unshare failed')
+                os.setns(fd, os.CLONE_NEWUTS)
+                restored = os.readlink('/proc/self/ns/uts')
+                if original != restored:
+                    raise Exception('os.setns failed')
+            except PermissionError:
+                # The calling process did not have the required privileges
+                # for this operation
+                pass
+            except OSError as e:
+                # Skip the test on these errors:
+                # - ENOSYS: syscall not available
+                # - EINVAL: kernel was not configured with the CONFIG_UTS_NS option
+                # - ENOMEM: not enough memory
+                if e.errno not in (errno.ENOSYS, errno.EINVAL, errno.ENOMEM):
+                    raise
+            finally:
+                os.close(fd)
+            """
+
+        assert_python_ok("-c", code)
 
 
 def tearDownModule():

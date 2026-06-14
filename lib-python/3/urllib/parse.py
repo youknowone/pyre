@@ -1,6 +1,6 @@
 """Parse (absolute and relative) URLs.
 
-urlparse module is based upon the following RFC specifications.
+urllib.parse module is based upon the following RFC specifications.
 
 RFC 3986 (STD66): "Uniform Resource Identifiers" by T. Berners-Lee, R. Fielding
 and L.  Masinter, January 2005.
@@ -20,7 +20,7 @@ RFC 1738: "Uniform Resource Locators (URL)" by T. Berners-Lee, L. Masinter, M.
 McCahill, December 1994
 
 RFC 3986 is considered the current standard and any future changes to
-urlparse module should conform with it.  The urlparse module is
+urllib.parse module should conform with it.  The urllib.parse module is
 currently not entirely compliant with this RFC due to defacto
 scenarios for parsing, and for backward compatibility purposes, some
 parsing quirks from older RFCs are retained. The testcases in
@@ -33,8 +33,8 @@ It serves as a useful guide when making changes.
 
 from collections import namedtuple
 import functools
+import math
 import re
-import sys
 import types
 import warnings
 import ipaddress
@@ -59,7 +59,7 @@ uses_netloc = ['', 'ftp', 'http', 'gopher', 'nntp', 'telnet',
                'imap', 'wais', 'file', 'mms', 'https', 'shttp',
                'snews', 'prospero', 'rtsp', 'rtsps', 'rtspu', 'rsync',
                'svn', 'svn+ssh', 'sftp', 'nfs', 'git', 'git+ssh',
-               'ws', 'wss']
+               'ws', 'wss', 'itms-services']
 
 uses_params = ['', 'ftp', 'hdl', 'prospero', 'http', 'imap',
                'https', 'shttp', 'rtsp', 'rtsps', 'rtspu', 'sip',
@@ -247,11 +247,11 @@ class _NetlocResultMixinBytes(_NetlocResultMixinBase, _ResultMixinBytes):
         return hostname, port
 
 
-_DefragResultBase = namedtuple('DefragResult', 'url fragment')
+_DefragResultBase = namedtuple('_DefragResultBase', 'url fragment')
 _SplitResultBase = namedtuple(
-    'SplitResult', 'scheme netloc path query fragment')
+    '_SplitResultBase', 'scheme netloc path query fragment')
 _ParseResultBase = namedtuple(
-    'ParseResult', 'scheme netloc path params query fragment')
+    '_ParseResultBase', 'scheme netloc path params query fragment')
 
 _DefragResultBase.__doc__ = """
 DefragResult(url, fragment)
@@ -390,22 +390,27 @@ def urlparse(url, scheme='', allow_fragments=True):
     path or query.
 
     Note that % escapes are not expanded.
+
+    urlsplit() should generally be used instead of urlparse().
     """
     url, scheme, _coerce_result = _coerce_args(url, scheme)
-    splitresult = urlsplit(url, scheme, allow_fragments)
-    scheme, netloc, url, query, fragment = splitresult
-    if scheme in uses_params and ';' in url:
-        url, params = _splitparams(url)
-    else:
-        params = ''
-    result = ParseResult(scheme, netloc, url, params, query, fragment)
+    scheme, netloc, url, params, query, fragment = _urlparse(url, scheme, allow_fragments)
+    result = ParseResult(scheme or '', netloc or '', url, params or '', query or '', fragment or '')
     return _coerce_result(result)
 
-def _splitparams(url):
+def _urlparse(url, scheme=None, allow_fragments=True):
+    scheme, netloc, url, query, fragment = _urlsplit(url, scheme, allow_fragments)
+    if (scheme or '') in uses_params and ';' in url:
+        url, params = _splitparams(url, allow_none=True)
+    else:
+        params = None
+    return (scheme, netloc, url, params, query, fragment)
+
+def _splitparams(url, allow_none=False):
     if '/'  in url:
         i = url.find(';', url.rfind('/'))
         if i < 0:
-            return url, ''
+            return url, None if allow_none else ''
     else:
         i = url.find(';')
     return url[:i], url[i+1:]
@@ -457,7 +462,7 @@ def _check_bracketed_netloc(netloc):
 # https://www.rfc-editor.org/rfc/rfc3986#page-49 and https://url.spec.whatwg.org/
 def _check_bracketed_host(hostname):
     if hostname.startswith('v'):
-        if not re.match(r"\Av[a-fA-F0-9]+\..+\Z", hostname):
+        if not re.match(r"\Av[a-fA-F0-9]+\..+\z", hostname):
             raise ValueError(f"IPvFuture address is invalid")
     else:
         ip = ipaddress.ip_address(hostname) # Throws Value Error if not IPv6 or IPv4
@@ -489,17 +494,23 @@ def urlsplit(url, scheme='', allow_fragments=True):
     """
 
     url, scheme, _coerce_result = _coerce_args(url, scheme)
+    scheme, netloc, url, query, fragment = _urlsplit(url, scheme, allow_fragments)
+    v = SplitResult(scheme or '', netloc or '', url, query or '', fragment or '')
+    return _coerce_result(v)
+
+def _urlsplit(url, scheme=None, allow_fragments=True):
     # Only lstrip url as some applications rely on preserving trailing space.
     # (https://url.spec.whatwg.org/#concept-basic-url-parser would strip both)
     url = url.lstrip(_WHATWG_C0_CONTROL_OR_SPACE)
-    scheme = scheme.strip(_WHATWG_C0_CONTROL_OR_SPACE)
-
     for b in _UNSAFE_URL_BYTES_TO_REMOVE:
         url = url.replace(b, "")
-        scheme = scheme.replace(b, "")
+    if scheme is not None:
+        scheme = scheme.strip(_WHATWG_C0_CONTROL_OR_SPACE)
+        for b in _UNSAFE_URL_BYTES_TO_REMOVE:
+            scheme = scheme.replace(b, "")
 
     allow_fragments = bool(allow_fragments)
-    netloc = query = fragment = ''
+    netloc = query = fragment = None
     i = url.find(':')
     if i > 0 and url[0].isascii() and url[0].isalpha():
         for c in url[:i]:
@@ -519,8 +530,7 @@ def urlsplit(url, scheme='', allow_fragments=True):
     if '?' in url:
         url, query = url.split('?', 1)
     _checknetloc(netloc)
-    v = SplitResult(scheme, netloc, url, query, fragment)
-    return _coerce_result(v)
+    return (scheme, netloc, url, query, fragment)
 
 def urlunparse(components):
     """Put a parsed URL back together again.  This may result in a
@@ -529,9 +539,15 @@ def urlunparse(components):
     (the draft states that these are equivalent)."""
     scheme, netloc, url, params, query, fragment, _coerce_result = (
                                                   _coerce_args(*components))
+    if not netloc:
+        if scheme and scheme in uses_netloc and (not url or url[:1] == '/'):
+            netloc = ''
+        else:
+            netloc = None
     if params:
         url = "%s;%s" % (url, params)
-    return _coerce_result(urlunsplit((scheme, netloc, url, query, fragment)))
+    return _coerce_result(_urlunsplit(scheme or None, netloc, url,
+                                      query or None, fragment or None))
 
 def urlunsplit(components):
     """Combine the elements of a tuple as returned by urlsplit() into a
@@ -541,16 +557,27 @@ def urlunsplit(components):
     empty query; the RFC states that these are equivalent)."""
     scheme, netloc, url, query, fragment, _coerce_result = (
                                           _coerce_args(*components))
-    if netloc or (scheme and scheme in uses_netloc) or url[:2] == '//':
+    if not netloc:
+        if scheme and scheme in uses_netloc and (not url or url[:1] == '/'):
+            netloc = ''
+        else:
+            netloc = None
+    return _coerce_result(_urlunsplit(scheme or None, netloc, url,
+                                      query or None, fragment or None))
+
+def _urlunsplit(scheme, netloc, url, query, fragment):
+    if netloc is not None:
         if url and url[:1] != '/': url = '/' + url
-        url = '//' + (netloc or '') + url
+        url = '//' + netloc + url
+    elif url[:2] == '//':
+        url = '//' + url
     if scheme:
         url = scheme + ':' + url
-    if query:
+    if query is not None:
         url = url + '?' + query
-    if fragment:
+    if fragment is not None:
         url = url + '#' + fragment
-    return _coerce_result(url)
+    return url
 
 def urljoin(base, url, allow_fragments=True):
     """Join a base URL and a possibly relative URL to form an absolute
@@ -561,26 +588,29 @@ def urljoin(base, url, allow_fragments=True):
         return base
 
     base, url, _coerce_result = _coerce_args(base, url)
-    bscheme, bnetloc, bpath, bparams, bquery, bfragment = \
-            urlparse(base, '', allow_fragments)
-    scheme, netloc, path, params, query, fragment = \
-            urlparse(url, bscheme, allow_fragments)
+    bscheme, bnetloc, bpath, bquery, bfragment = \
+            _urlsplit(base, None, allow_fragments)
+    scheme, netloc, path, query, fragment = \
+            _urlsplit(url, None, allow_fragments)
 
-    if scheme != bscheme or scheme not in uses_relative:
+    if scheme is None:
+        scheme = bscheme
+    if scheme != bscheme or (scheme and scheme not in uses_relative):
         return _coerce_result(url)
-    if scheme in uses_netloc:
+    if not scheme or scheme in uses_netloc:
         if netloc:
-            return _coerce_result(urlunparse((scheme, netloc, path,
-                                              params, query, fragment)))
+            return _coerce_result(_urlunsplit(scheme, netloc, path,
+                                              query, fragment))
         netloc = bnetloc
 
-    if not path and not params:
+    if not path:
         path = bpath
-        params = bparams
-        if not query:
+        if query is None:
             query = bquery
-        return _coerce_result(urlunparse((scheme, netloc, path,
-                                          params, query, fragment)))
+            if fragment is None:
+                fragment = bfragment
+        return _coerce_result(_urlunsplit(scheme, netloc, path,
+                                          query, fragment))
 
     base_parts = bpath.split('/')
     if base_parts[-1] != '':
@@ -617,8 +647,8 @@ def urljoin(base, url, allow_fragments=True):
         # then we need to append the trailing '/'
         resolved_path.append('')
 
-    return _coerce_result(urlunparse((scheme, netloc, '/'.join(
-        resolved_path) or '/', params, query, fragment)))
+    return _coerce_result(_urlunsplit(scheme, netloc, '/'.join(
+        resolved_path) or '/', query, fragment))
 
 
 def urldefrag(url):
@@ -630,18 +660,21 @@ def urldefrag(url):
     """
     url, _coerce_result = _coerce_args(url)
     if '#' in url:
-        s, n, p, a, q, frag = urlparse(url)
-        defrag = urlunparse((s, n, p, a, q, ''))
+        s, n, p, q, frag = _urlsplit(url)
+        defrag = _urlunsplit(s, n, p, q, None)
     else:
         frag = ''
         defrag = url
-    return _coerce_result(DefragResult(defrag, frag))
+    return _coerce_result(DefragResult(defrag, frag or ''))
 
 _hexdig = '0123456789ABCDEFabcdef'
 _hextobyte = None
 
 def unquote_to_bytes(string):
     """unquote_to_bytes('abc%20def') -> b'abc def'."""
+    return bytes(_unquote_impl(string))
+
+def _unquote_impl(string: bytes | bytearray | str) -> bytes | bytearray:
     # Note: strings are encoded as UTF-8. This is only an issue if it contains
     # unescaped non-ASCII characters, which URIs should not.
     if not string:
@@ -653,8 +686,8 @@ def unquote_to_bytes(string):
     bits = string.split(b'%')
     if len(bits) == 1:
         return string
-    res = [bits[0]]
-    append = res.append
+    res = bytearray(bits[0])
+    append = res.extend
     # Delay the initialization of the table to not waste memory
     # if the function is never called
     global _hextobyte
@@ -668,9 +701,19 @@ def unquote_to_bytes(string):
         except KeyError:
             append(b'%')
             append(item)
-    return b''.join(res)
+    return res
 
 _asciire = re.compile('([\x00-\x7f]+)')
+
+def _generate_unquoted_parts(string, encoding, errors):
+    previous_match_end = 0
+    for ascii_match in _asciire.finditer(string):
+        start, end = ascii_match.span()
+        yield string[previous_match_end:start]  # Non-ASCII
+        # The ascii_match[1] group == string[start:end].
+        yield _unquote_impl(ascii_match[1]).decode(encoding, errors)
+        previous_match_end = end
+    yield string[previous_match_end:]  # Non-ASCII tail
 
 def unquote(string, encoding='utf-8', errors='replace'):
     """Replace %xx escapes by their single-character equivalent. The optional
@@ -683,21 +726,16 @@ def unquote(string, encoding='utf-8', errors='replace'):
     unquote('abc%20def') -> 'abc def'.
     """
     if isinstance(string, bytes):
-        return unquote_to_bytes(string).decode(encoding, errors)
+        return _unquote_impl(string).decode(encoding, errors)
     if '%' not in string:
+        # Is it a string-like object?
         string.split
         return string
     if encoding is None:
         encoding = 'utf-8'
     if errors is None:
         errors = 'replace'
-    bits = _asciire.split(string)
-    res = [bits[0]]
-    append = res.append
-    for i in range(1, len(bits), 2):
-        append(unquote_to_bytes(bits[i]).decode(encoding, errors))
-        append(bits[i + 1])
-    return ''.join(res)
+    return ''.join(_generate_unquoted_parts(string, encoding, errors))
 
 
 def parse_qs(qs, keep_blank_values=False, strict_parsing=False,
@@ -733,7 +771,8 @@ def parse_qs(qs, keep_blank_values=False, strict_parsing=False,
     parsed_result = {}
     pairs = parse_qsl(qs, keep_blank_values, strict_parsing,
                       encoding=encoding, errors=errors,
-                      max_num_fields=max_num_fields, separator=separator)
+                      max_num_fields=max_num_fields, separator=separator,
+                      _stacklevel=2)
     for name, value in pairs:
         if name in parsed_result:
             parsed_result[name].append(value)
@@ -743,7 +782,7 @@ def parse_qs(qs, keep_blank_values=False, strict_parsing=False,
 
 
 def parse_qsl(qs, keep_blank_values=False, strict_parsing=False,
-              encoding='utf-8', errors='replace', max_num_fields=None, separator='&'):
+              encoding='utf-8', errors='replace', max_num_fields=None, separator='&', *, _stacklevel=1):
     """Parse a query given as a string argument.
 
         Arguments:
@@ -771,7 +810,6 @@ def parse_qsl(qs, keep_blank_values=False, strict_parsing=False,
 
         Returns a list, as G-d intended.
     """
-
     if not separator or not isinstance(separator, (str, bytes)):
         raise ValueError("Separator must be of type string or bytes.")
     if isinstance(qs, str):
@@ -780,12 +818,21 @@ def parse_qsl(qs, keep_blank_values=False, strict_parsing=False,
         eq = '='
         def _unquote(s):
             return unquote_plus(s, encoding=encoding, errors=errors)
+    elif qs is None:
+        return []
     else:
-        if not qs:
-            return []
-        # Use memoryview() to reject integers and iterables,
-        # acceptable by the bytes constructor.
-        qs = bytes(memoryview(qs))
+        try:
+            # Use memoryview() to reject integers and iterables,
+            # acceptable by the bytes constructor.
+            qs = bytes(memoryview(qs))
+        except TypeError:
+            if not qs:
+                warnings.warn(f"Accepting {type(qs).__name__} objects with "
+                              f"false value in urllib.parse.parse_qsl() is "
+                              f"deprecated as of 3.14",
+                              DeprecationWarning, stacklevel=_stacklevel + 1)
+                return []
+            raise
         if isinstance(separator, str):
             separator = bytes(separator, 'ascii')
         eq = b'='
@@ -830,14 +877,6 @@ _ALWAYS_SAFE = frozenset(b'ABCDEFGHIJKLMNOPQRSTUVWXYZ'
                          b'_.-~')
 _ALWAYS_SAFE_BYTES = bytes(_ALWAYS_SAFE)
 
-def __getattr__(name):
-    if name == 'Quoter':
-        warnings.warn('Deprecated in 3.11. '
-                      'urllib.parse.Quoter will be removed in Python 3.14. '
-                      'It was not intended to be a public API.',
-                      DeprecationWarning, stacklevel=2)
-        return _Quoter
-    raise AttributeError(f'module {__name__!r} has no attribute {name!r}')
 
 class _Quoter(dict):
     """A mapping from bytes numbers (in range(0,256)) to strings.
@@ -954,7 +993,14 @@ def quote_from_bytes(bs, safe='/'):
     if not bs.rstrip(_ALWAYS_SAFE_BYTES + safe):
         return bs.decode()
     quoter = _byte_quoter_factory(safe)
-    return ''.join([quoter(char) for char in bs])
+    if (bs_len := len(bs)) < 200_000:
+        return ''.join(map(quoter, bs))
+    else:
+        # This saves memory - https://github.com/python/cpython/issues/95865
+        chunk_size = math.isqrt(bs_len)
+        chunks = [''.join(map(quoter, bs[i:i+chunk_size]))
+                  for i in range(0, bs_len, chunk_size)]
+        return ''.join(chunks)
 
 def urlencode(query, doseq=False, safe='', encoding=None, errors=None,
               quote_via=quote_plus):

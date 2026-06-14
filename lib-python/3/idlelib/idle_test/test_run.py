@@ -8,6 +8,7 @@ import unittest
 from unittest import mock
 import idlelib
 from idlelib.idle_test.mock_idle import Func
+from test.support import force_not_colorized
 
 idlelib.testing = True  # Use {} for executing test user code.
 
@@ -38,15 +39,15 @@ class ExceptionTest(unittest.TestCase):
         self.assertIn('UnhashableException: ex1', tb[10])
 
     data = (('1/0', ZeroDivisionError, "division by zero\n"),
-            # PyPy appends "Or did you forget to import 'abc'" after the typo
-            # hint, so check only the common prefix (no trailing newline).
             ('abc', NameError, "name 'abc' is not defined. "
-                               "Did you mean: 'abs'?"),
+                               "Did you mean: 'abs'? "
+                               "Or did you forget to import 'abc'?\n"),
             ('int.reel', AttributeError,
                  "type object 'int' has no attribute 'reel'. "
                  "Did you mean: 'real'?\n"),
             )
 
+    @force_not_colorized
     def test_get_message(self):
         for code, exc, msg in self.data:
             with self.subTest(code=code):
@@ -56,8 +57,9 @@ class ExceptionTest(unittest.TestCase):
                     typ, val, tb = sys.exc_info()
                     actual = run.get_message_lines(typ, val, tb)[0]
                     expect = f'{exc.__name__}: {msg}'
-                    self.assertIn(expect, actual)
+                    self.assertEqual(actual, expect)
 
+    @force_not_colorized
     @mock.patch.object(run, 'cleanup_traceback',
                        new_callable=lambda: (lambda t, e: None))
     def test_get_multiple_message(self, mock):
@@ -88,8 +90,7 @@ class S(str):
     def __unicode__(self):
         return '%s:unicode' % type(self).__name__
     def __len__(self):
-        # PYPY: encode/decode calls len(self) on error, make it correct
-        return len(repr(self)) - 2
+        return 3
     def __iter__(self):
         return iter('abc')
     def __getitem__(self, *args):

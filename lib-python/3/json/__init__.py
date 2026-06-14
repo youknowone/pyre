@@ -86,13 +86,13 @@ Specializing JSON object encoding::
     '[2.0, 1.0]'
 
 
-Using json.tool from the shell to validate and pretty-print::
+Using json from the shell to validate and pretty-print::
 
-    $ echo '{"json":"obj"}' | python -m json.tool
+    $ echo '{"json":"obj"}' | python -m json
     {
         "json": "obj"
     }
-    $ echo '{ 1.2:3.4}' | python -m json.tool
+    $ echo '{ 1.2:3.4}' | python -m json
     Expecting property name enclosed in double quotes: line 1 column 3 (char 2)
 """
 __version__ = '2.0.9'
@@ -102,12 +102,6 @@ __all__ = [
 ]
 
 __author__ = 'Bob Ippolito <bob@redivi.com>'
-
-try:
-    # PyPy speedup, the interface is different than CPython's _json
-    import _pypyjson
-except ImportError:
-    _pypyjson = None
 
 from .decoder import JSONDecoder, JSONDecodeError
 from .encoder import JSONEncoder
@@ -134,8 +128,9 @@ def dump(obj, fp, *, skipkeys=False, ensure_ascii=True, check_circular=True,
     instead of raising a ``TypeError``.
 
     If ``ensure_ascii`` is false, then the strings written to ``fp`` can
-    contain non-ASCII characters if they appear in strings contained in
-    ``obj``. Otherwise, all such characters are escaped in JSON strings.
+    contain non-ASCII and non-printable characters if they appear in strings
+    contained in ``obj``. Otherwise, all such characters are escaped in JSON
+    strings.
 
     If ``check_circular`` is false, then the circular reference check
     for container types will be skipped and a circular reference will
@@ -148,13 +143,14 @@ def dump(obj, fp, *, skipkeys=False, ensure_ascii=True, check_circular=True,
 
     If ``indent`` is a non-negative integer, then JSON array elements and
     object members will be pretty-printed with that indent level. An indent
-    level of 0 will only insert newlines. ``None`` is the most compact
-    representation.
+    level of 0 will only insert newlines. ``None`` is the default and gives
+    a representation with no newlines inserted.
 
-    If specified, ``separators`` should be an ``(item_separator, key_separator)``
-    tuple.  The default is ``(', ', ': ')`` if *indent* is ``None`` and
-    ``(',', ': ')`` otherwise.  To get the most compact JSON representation,
-    you should specify ``(',', ':')`` to eliminate whitespace.
+    If specified, ``separators`` should be an ``(item_separator,
+    key_separator)`` tuple.  The default is ``(', ', ': ')`` if *indent* is
+    ``None`` and ``(',', ': ')`` otherwise.  To get the most compact JSON
+    representation, you should specify ``(',', ':')`` to eliminate
+    whitespace.
 
     ``default(obj)`` is a function that should return a serializable version
     of obj or raise TypeError. The default simply raises TypeError.
@@ -195,9 +191,10 @@ def dumps(obj, *, skipkeys=False, ensure_ascii=True, check_circular=True,
     (``str``, ``int``, ``float``, ``bool``, ``None``) will be skipped
     instead of raising a ``TypeError``.
 
-    If ``ensure_ascii`` is false, then the return value can contain non-ASCII
-    characters if they appear in strings contained in ``obj``. Otherwise, all
-    such characters are escaped in JSON strings.
+    If ``ensure_ascii`` is false, then the return value can contain
+    non-ASCII and non-printable characters if they appear in strings
+    contained in ``obj``.  Otherwise, all such characters are escaped in
+    JSON strings.
 
     If ``check_circular`` is false, then the circular reference check
     for container types will be skipped and a circular reference will
@@ -210,13 +207,14 @@ def dumps(obj, *, skipkeys=False, ensure_ascii=True, check_circular=True,
 
     If ``indent`` is a non-negative integer, then JSON array elements and
     object members will be pretty-printed with that indent level. An indent
-    level of 0 will only insert newlines. ``None`` is the most compact
-    representation.
+    level of 0 will only insert newlines. ``None`` is the default and gives
+    a representation with no newlines inserted.
 
-    If specified, ``separators`` should be an ``(item_separator, key_separator)``
-    tuple.  The default is ``(', ', ': ')`` if *indent* is ``None`` and
-    ``(',', ': ')`` otherwise.  To get the most compact JSON representation,
-    you should specify ``(',', ':')`` to eliminate whitespace.
+    If specified, ``separators`` should be an ``(item_separator,
+    key_separator)`` tuple.  The default is ``(', ', ': ')`` if *indent* is
+    ``None`` and ``(',', ': ')`` otherwise.  To get the most compact JSON
+    representation, you should specify ``(',', ':')`` to eliminate
+    whitespace.
 
     ``default(obj)`` is a function that should return a serializable version
     of obj or raise TypeError. The default simply raises TypeError.
@@ -287,11 +285,12 @@ def load(fp, *, cls=None, object_hook=None, parse_float=None,
     ``object_hook`` will be used instead of the ``dict``. This feature
     can be used to implement custom decoders (e.g. JSON-RPC class hinting).
 
-    ``object_pairs_hook`` is an optional function that will be called with the
-    result of any object literal decoded with an ordered list of pairs.  The
-    return value of ``object_pairs_hook`` will be used instead of the ``dict``.
-    This feature can be used to implement custom decoders.  If ``object_hook``
-    is also defined, the ``object_pairs_hook`` takes priority.
+    ``object_pairs_hook`` is an optional function that will be called with
+    the result of any object literal decoded with an ordered list of pairs.
+    The return value of ``object_pairs_hook`` will be used instead of the
+    ``dict``.  This feature can be used to implement custom decoders.  If
+    ``object_hook`` is also defined, the ``object_pairs_hook`` takes
+    priority.
 
     To use a custom ``JSONDecoder`` subclass, specify it with the ``cls``
     kwarg; otherwise ``JSONDecoder`` is used.
@@ -312,11 +311,12 @@ def loads(s, *, cls=None, object_hook=None, parse_float=None,
     ``object_hook`` will be used instead of the ``dict``. This feature
     can be used to implement custom decoders (e.g. JSON-RPC class hinting).
 
-    ``object_pairs_hook`` is an optional function that will be called with the
-    result of any object literal decoded with an ordered list of pairs.  The
-    return value of ``object_pairs_hook`` will be used instead of the ``dict``.
-    This feature can be used to implement custom decoders.  If ``object_hook``
-    is also defined, the ``object_pairs_hook`` takes priority.
+    ``object_pairs_hook`` is an optional function that will be called with
+    the result of any object literal decoded with an ordered list of pairs.
+    The return value of ``object_pairs_hook`` will be used instead of the
+    ``dict``.  This feature can be used to implement custom decoders.  If
+    ``object_hook`` is also defined, the ``object_pairs_hook`` takes
+    priority.
 
     ``parse_float``, if specified, will be called with the string
     of every JSON float to be decoded. By default this is equivalent to
@@ -349,8 +349,7 @@ def loads(s, *, cls=None, object_hook=None, parse_float=None,
     if (cls is None and object_hook is None and
             parse_int is None and parse_float is None and
             parse_constant is None and object_pairs_hook is None and not kw):
-        return (_pypyjson.loads(s, JSONDecodeError)
-                if _pypyjson else _default_decoder.decode(s))
+        return _default_decoder.decode(s)
     if cls is None:
         cls = JSONDecoder
     if object_hook is not None:

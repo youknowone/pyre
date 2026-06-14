@@ -225,7 +225,7 @@ def _unquote(str):
 # header.  By default, _getdate() returns the current time in the appropriate
 # "expires" format for a Set-Cookie header.  The one optional argument is an
 # offset from now, in seconds.  For example, an offset of -3600 means "one hour
-# ago".  The offset may be a floating point number.
+# ago".  The offset may be a floating-point number.
 #
 
 _weekdayname = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
@@ -273,17 +273,19 @@ class Morsel(dict):
         "httponly" : "HttpOnly",
         "version"  : "Version",
         "samesite" : "SameSite",
+        "partitioned": "Partitioned",
     }
 
-    _flags = {'secure', 'httponly'}
+    _reserved_defaults = dict.fromkeys(_reserved, "")
+
+    _flags = {'secure', 'httponly', 'partitioned'}
 
     def __init__(self):
         # Set defaults
         self._key = self._value = self._coded_value = None
 
         # Set default attributes
-        for key in self._reserved:
-            dict.__setitem__(self, key, "")
+        dict.update(self, self._reserved_defaults)
 
     @property
     def key(self):
@@ -335,8 +337,15 @@ class Morsel(dict):
             key = key.lower()
             if key not in self._reserved:
                 raise CookieError("Invalid attribute %r" % (key,))
+            if _has_control_character(key, val):
+                raise CookieError("Control characters are not allowed in "
+                                  f"cookies {key!r} {val!r}")
             data[key] = val
         dict.update(self, data)
+
+    def __ior__(self, values):
+        self.update(values)
+        return self
 
     def isReservedKey(self, K):
         return K.lower() in self._reserved
@@ -363,9 +372,15 @@ class Morsel(dict):
         }
 
     def __setstate__(self, state):
-        self._key = state['key']
-        self._value = state['value']
-        self._coded_value = state['coded_value']
+        key = state['key']
+        value = state['value']
+        coded_value = state['coded_value']
+        if _has_control_character(key, value, coded_value):
+            raise CookieError("Control characters are not allowed in cookies "
+                              f"{key!r} {value!r} {coded_value!r}")
+        self._key = key
+        self._value = value
+        self._coded_value = coded_value
 
     def output(self, attrs=None, header="Set-Cookie:"):
         return "%s %s" % (header, self.OutputString(attrs))
@@ -376,14 +391,21 @@ class Morsel(dict):
         return '<%s: %s>' % (self.__class__.__name__, self.OutputString())
 
     def js_output(self, attrs=None):
+        import urllib.parse
         # Print javascript
+        output_string = self.OutputString(attrs)
+        if _has_control_character(output_string):
+            raise CookieError("Control characters are not allowed in cookies")
+        # Base64-encode value to avoid template
+        # injection in cookie values.
+        output_encoded = urllib.parse.quote(output_string, safe='', encoding='utf-8')
         return """
         <script type="text/javascript">
         <!-- begin hiding
-        document.cookie = \"%s\";
+        document.cookie = decodeURIComponent(\"%s\");
         // end hiding -->
         </script>
-        """ % (self.OutputString(attrs).replace('"', r'\"'))
+        """ % (output_encoded,)
 
     def OutputString(self, attrs=None):
         # Build up our result
@@ -440,9 +462,11 @@ _CookiePattern = re.compile(r"""
     (                              # Optional group: there may not be a value.
     \s*=\s*                          # Equal Sign
     (?P<val>                         # Start of group 'val'
-    "(?:[^\\"]|\\.)*"                  # Any doublequoted string
+    "(?:[^\\"]|\\.)*"                  # Any double-quoted string
     |                                  # or
-    \w{3},\s[\w\d\s-]{9,11}\s[\d:]{8}\sGMT  # Special case for "expires" attr
+    # Special case for "expires" attr
+    (\w{3,6}day|\w{3}),\s              # Day of the week or abbreviated day
+    [\w\d\s-]{9,11}\s[\d:]{8}\sGMT     # Date and time in specific format
     |                                  # or
     [""" + _LegalValueChars + r"""]*      # Any word or empty string
     )                                # End of group 'val'

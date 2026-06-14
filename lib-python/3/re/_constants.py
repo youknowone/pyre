@@ -13,20 +13,14 @@
 
 # update when constants are added or removed
 
-MAGIC = 20220615
-import sys
-_IS_PYPY = sys.implementation.name == 'pypy'
+MAGIC = 20230612
 
-from _sre import MAXREPEAT, MAXGROUPS
-if _IS_PYPY:
-    from _sre import OPCODES as _internal_opcodes
-else:
-    _internal_opcodes = []
+from _sre import MAXREPEAT, MAXGROUPS  # noqa: F401
 
 # SRE standard exception (access as sre.error)
 # should this really be here?
 
-class error(Exception):
+class PatternError(Exception):
     """Exception raised for invalid regular expressions.
 
     Attributes:
@@ -59,6 +53,9 @@ class error(Exception):
         super().__init__(msg)
 
 
+# Backward compatibility after renaming in 3.13
+error = PatternError
+
 class _NamedIntConstant(int):
     def __new__(cls, value, name):
         self = super(_NamedIntConstant, cls).__new__(cls, value)
@@ -72,17 +69,12 @@ class _NamedIntConstant(int):
 
 MAXREPEAT = _NamedIntConstant(MAXREPEAT, 'MAXREPEAT')
 
-def _makecodes(*names, preexisting_values=None):
-    # pypy change: preexisting_values support
-    items = [_NamedIntConstant(preexisting_values[name] if preexisting_values else i, name) for i, name in enumerate(names)]
+def _makecodes(*names):
+    items = [_NamedIntConstant(i, name) for i, name in enumerate(names)]
     globals().update({item.name: item for item in items})
     return items
 
 # operators
-_preexisting_values = {name.upper(): i for i, name in enumerate(_internal_opcodes)}
-if _IS_PYPY:
-    _preexisting_values['MIN_REPEAT'] = max(_preexisting_values.values()) + 1
-    _preexisting_values['MAX_REPEAT'] = max(_preexisting_values.values()) + 1
 OPCODES = _makecodes(
     # failure=0 success=1 (just because it looks better that way :-)
     'FAILURE', 'SUCCESS',
@@ -131,9 +123,6 @@ OPCODES = _makecodes(
     # The following opcodes are only occurred in the parser output,
     # but not in the compiled code.
     'MIN_REPEAT', 'MAX_REPEAT',
-
-    # pypy change: use the internal opcode values
-    preexisting_values=_preexisting_values
 )
 del OPCODES[-2:] # remove MIN_REPEAT and MAX_REPEAT
 
@@ -217,8 +206,9 @@ CH_UNICODE = {
     CATEGORY_NOT_LINEBREAK: CATEGORY_UNI_NOT_LINEBREAK
 }
 
+CH_NEGATE = dict(zip(CHCODES[::2] + CHCODES[1::2], CHCODES[1::2] + CHCODES[::2]))
+
 # flags
-SRE_FLAG_TEMPLATE = 1 # template mode (unknown purpose, deprecated)
 SRE_FLAG_IGNORECASE = 2 # case insensitive
 SRE_FLAG_LOCALE = 4 # honour system locale
 SRE_FLAG_MULTILINE = 8 # treat target as multiline string

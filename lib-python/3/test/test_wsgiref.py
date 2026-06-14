@@ -137,7 +137,7 @@ class IntegrationTests(TestCase):
     def test_request_length(self):
         out, err = run_amock(data=b"GET " + (b"x" * 65537) + b" HTTP/1.0\n\n")
         self.assertEqual(out.splitlines()[0],
-                         b"HTTP/1.0 414 Request-URI Too Long")
+                         b"HTTP/1.0 414 URI Too Long")
 
     def test_validated_hello(self):
         out, err = run_amock(validator(hello_app))
@@ -149,9 +149,9 @@ class IntegrationTests(TestCase):
             start_response("200 OK", ('Content-Type','text/plain'))
             return ["Hello, world!"]
         out, err = run_amock(validator(bad_app))
-        self.assertTrue(out.endswith(
+        self.assertEndsWith(out,
             b"A server error occurred.  Please contact the administrator."
-        ))
+        )
         self.assertEqual(
             err.splitlines()[-2],
             "AssertionError: Headers (('Content-Type', 'text/plain')) must"
@@ -174,9 +174,9 @@ class IntegrationTests(TestCase):
         for status, exc_message in tests:
             with self.subTest(status=status):
                 out, err = run_amock(create_bad_app(status))
-                self.assertTrue(out.endswith(
+                self.assertEndsWith(out,
                     b"A server error occurred.  Please contact the administrator."
-                ))
+                )
                 self.assertEqual(err.splitlines()[-2], exc_message)
 
     def test_wsgi_input(self):
@@ -185,9 +185,9 @@ class IntegrationTests(TestCase):
             s("200 OK", [("Content-Type", "text/plain; charset=utf-8")])
             return [b"data"]
         out, err = run_amock(validator(bad_app))
-        self.assertTrue(out.endswith(
+        self.assertEndsWith(out,
             b"A server error occurred.  Please contact the administrator."
-        ))
+        )
         self.assertEqual(
             err.splitlines()[-2], "AssertionError"
         )
@@ -200,7 +200,7 @@ class IntegrationTests(TestCase):
                 ])
             return [b"data"]
         out, err = run_amock(validator(app))
-        self.assertTrue(err.endswith('"GET / HTTP/1.0" 200 4\n'))
+        self.assertEndsWith(err, '"GET / HTTP/1.0" 200 4\n')
         ver = sys.version.split()[0].encode('ascii')
         py  = python_implementation().encode('ascii')
         pyver = py + b"/" + ver
@@ -854,6 +854,25 @@ class HandlerTests(TestCase):
         self.assertIsNotNone(h.headers)
         self.assertIsNotNone(h.status)
         self.assertIsNotNone(h.environ)
+
+    def testRaisesControlCharacters(self):
+        for c0 in control_characters_c0():
+            with self.subTest(c0):
+                base = BaseHandler()
+                with self.assertRaises(ValueError):
+                    base.start_response(c0, [('x', 'y')])
+
+                base = BaseHandler()
+                with self.assertRaises(ValueError):
+                    base.start_response('200 OK', [(c0, 'y')])
+
+                # HTAB (\x09) is allowed in header values, but not in names.
+                base = BaseHandler()
+                if c0 != "\t":
+                    with self.assertRaises(ValueError):
+                        base.start_response('200 OK', [('x', c0)])
+                else:
+                    base.start_response('200 OK', [('x', c0)])
 
 
 if __name__ == "__main__":

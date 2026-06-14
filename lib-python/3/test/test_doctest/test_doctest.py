@@ -3,8 +3,7 @@ Test script for doctest.
 """
 
 from test import support
-from test.support import import_helper, os_helper
-from test.support.pty_helper import FakeInput  # used in doctests
+from test.support import import_helper
 import doctest
 import functools
 import os
@@ -14,13 +13,16 @@ import importlib.abc
 import importlib.util
 import unittest
 import tempfile
-import shutil
 import types
 import contextlib
 
 
-if not support.has_subprocess_support:
-    raise unittest.SkipTest("test_CLI requires subprocess support.")
+def doctest_skip_if(condition):
+    def decorator(func):
+        if condition and support.HAVE_DOCSTRINGS:
+            func.__doc__ = ">>> pass  # doctest: +SKIP"
+        return func
+    return decorator
 
 
 # NOTE: There are some additional tests relating to interaction with
@@ -113,14 +115,13 @@ class SampleClass:
 
     a_class_attribute = 42
 
-    @classmethod
-    @property
-    def a_classmethod_property(cls):
+    @functools.cached_property
+    def a_cached_property(self):
         """
-        >>> print(SampleClass.a_classmethod_property)
-        42
+        >>> print(SampleClass(29).get())
+        29
         """
-        return cls.a_class_attribute
+        return "hello"
 
     class NestedClass:
         """
@@ -468,7 +469,7 @@ We'll simulate a __file__ attr that ends in pyc:
     >>> tests = finder.find(sample_func)
 
     >>> print(tests)  # doctest: +ELLIPSIS
-    [<DocTest sample_func from test_doctest.py:34 (1 example)>]
+    [<DocTest sample_func from test_doctest.py:36 (1 example)>]
 
 The exact name depends on how test_doctest was invoked, so allow for
 leading path components.
@@ -524,8 +525,8 @@ methods, classmethods, staticmethods, properties, and nested classes.
      3  SampleClass.NestedClass
      1  SampleClass.NestedClass.__init__
      1  SampleClass.__init__
+     1  SampleClass.a_cached_property
      2  SampleClass.a_classmethod
-     1  SampleClass.a_classmethod_property
      1  SampleClass.a_property
      1  SampleClass.a_staticmethod
      1  SampleClass.double
@@ -581,8 +582,8 @@ functions, classes, and the `__test__` dictionary, if it exists:
      3  some_module.SampleClass.NestedClass
      1  some_module.SampleClass.NestedClass.__init__
      1  some_module.SampleClass.__init__
+     1  some_module.SampleClass.a_cached_property
      2  some_module.SampleClass.a_classmethod
-     1  some_module.SampleClass.a_classmethod_property
      1  some_module.SampleClass.a_property
      1  some_module.SampleClass.a_staticmethod
      1  some_module.SampleClass.double
@@ -638,8 +639,8 @@ By default, an object with no doctests doesn't create any tests:
      3  SampleClass.NestedClass
      1  SampleClass.NestedClass.__init__
      1  SampleClass.__init__
+     1  SampleClass.a_cached_property
      2  SampleClass.a_classmethod
-     1  SampleClass.a_classmethod_property
      1  SampleClass.a_property
      1  SampleClass.a_staticmethod
      1  SampleClass.double
@@ -660,8 +661,8 @@ displays.
      0  SampleClass.NestedClass.get
      0  SampleClass.NestedClass.square
      1  SampleClass.__init__
+     1  SampleClass.a_cached_property
      2  SampleClass.a_classmethod
-     1  SampleClass.a_classmethod_property
      1  SampleClass.a_property
      1  SampleClass.a_staticmethod
      1  SampleClass.double
@@ -677,6 +678,8 @@ It used to be broken for quite some time until `bpo-28249`.
     >>> for t in tests:
     ...     print('%5s  %s' % (t.lineno, t.name))
      None  test.test_doctest.doctest_lineno
+     None  test.test_doctest.doctest_lineno.ClassWithACachedProperty
+      102  test.test_doctest.doctest_lineno.ClassWithACachedProperty.cached
        22  test.test_doctest.doctest_lineno.ClassWithDocstring
        30  test.test_doctest.doctest_lineno.ClassWithDoctest
      None  test.test_doctest.doctest_lineno.ClassWithoutDocstring
@@ -686,6 +689,8 @@ It used to be broken for quite some time until `bpo-28249`.
        45  test.test_doctest.doctest_lineno.MethodWrapper.method_with_doctest
      None  test.test_doctest.doctest_lineno.MethodWrapper.method_without_docstring
        61  test.test_doctest.doctest_lineno.MethodWrapper.property_with_doctest
+       86  test.test_doctest.doctest_lineno.cached_func_with_doctest
+     None  test.test_doctest.doctest_lineno.cached_func_without_docstring
         4  test.test_doctest.doctest_lineno.func_with_docstring
        77  test.test_doctest.doctest_lineno.func_with_docstring_wrapped
        12  test.test_doctest.doctest_lineno.func_with_doctest
@@ -734,11 +739,10 @@ Finding Doctests in Modules Not Written in Python
 DocTestFinder can also find doctests in most modules not written in Python.
 We'll use builtins as an example, since it almost certainly isn't written in
 plain ol' Python and is guaranteed to be available.
-PyPy change: there are fewer builtin objects with docstrings, change 825 to 725
 
     >>> import builtins
     >>> tests = doctest.DocTestFinder().find(builtins)
-    >>> 725 < len(tests) < 845 # approximate number of objects with docstrings
+    >>> 750 < len(tests) < 800 # approximate number of objects with docstrings
     True
     >>> real_tests = [t for t in tests if len(t.examples) > 0]
     >>> len(real_tests) # objects that actually have doctests
@@ -765,6 +769,38 @@ Note here that 'bin', 'oct', and 'hex' are functions; 'float.as_integer_ratio',
 'float.hex', and 'int.bit_length' are methods; 'float.fromhex' is a classmethod,
 and 'int' is a type.
 """
+
+
+class TestDocTest(unittest.TestCase):
+
+    def test_run(self):
+        test = '''
+            >>> 1 + 1
+            11
+            >>> 2 + 3      # doctest: +SKIP
+            "23"
+            >>> 5 + 7
+            57
+        '''
+
+        def myfunc():
+            pass
+        myfunc.__doc__ = test
+
+        # test DocTestFinder.run()
+        test = doctest.DocTestFinder().find(myfunc)[0]
+        with support.captured_stdout():
+            with support.captured_stderr():
+                results = doctest.DocTestRunner(verbose=False).run(test)
+
+        # test TestResults
+        self.assertIsInstance(results, doctest.TestResults)
+        self.assertEqual(results.failed, 2)
+        self.assertEqual(results.attempted, 3)
+        self.assertEqual(results.skipped, 1)
+        self.assertEqual(tuple(results), (2, 3))
+        x, y = results
+        self.assertEqual((x, y), (2, 3))
 
 
 class TestDocTestFinder(unittest.TestCase):
@@ -859,6 +895,10 @@ Unit tests for the `DocTestRunner` class.
 DocTestRunner is used to run DocTest test cases, and to accumulate
 statistics.  Here's a simple DocTest case we can use:
 
+    >>> import _colorize
+    >>> save_colorize = _colorize.COLORIZE
+    >>> _colorize.COLORIZE = False
+
     >>> def f(x):
     ...     '''
     ...     >>> x = 12
@@ -913,6 +953,8 @@ the failure and proceeds to the next example:
         6
     ok
     TestResults(failed=1, attempted=3)
+
+    >>> _colorize.COLORIZE = save_colorize
 """
     def verbose_flag(): r"""
 The `verbose` flag makes the test runner generate more detailed
@@ -988,12 +1030,16 @@ An expected exception is specified with a traceback message.  The
 lines between the first line and the type/value may be omitted or
 replaced with any other string:
 
+    >>> import _colorize
+    >>> save_colorize = _colorize.COLORIZE
+    >>> _colorize.COLORIZE = False
+
     >>> def f(x):
     ...     '''
     ...     >>> x = 12
     ...     >>> print(x//0)
     ...     Traceback (most recent call last):
-    ...     ZeroDivisionError: integer division or modulo by zero
+    ...     ZeroDivisionError: division by zero
     ...     '''
     >>> test = doctest.DocTestFinder().find(f)[0]
     >>> doctest.DocTestRunner(verbose=False).run(test)
@@ -1010,7 +1056,7 @@ unexpected exception:
     ...     >>> print('pre-exception output', x//0)
     ...     pre-exception output
     ...     Traceback (most recent call last):
-    ...     ZeroDivisionError: integer division or modulo by zero
+    ...     ZeroDivisionError: division by zero
     ...     '''
     >>> test = doctest.DocTestFinder().find(f)[0]
     >>> doctest.DocTestRunner(verbose=False).run(test)
@@ -1021,7 +1067,7 @@ unexpected exception:
         print('pre-exception output', x//0)
     Exception raised:
         ...
-        ZeroDivisionError: integer division or modulo by zero
+        ZeroDivisionError: division by zero
     TestResults(failed=1, attempted=2)
 
 Exception messages may contain newlines:
@@ -1216,8 +1262,10 @@ unexpected exception:
     Exception raised:
         Traceback (most recent call last):
         ...
-        ZeroDivisionError: integer division or modulo by zero
+        ZeroDivisionError: division by zero
     TestResults(failed=1, attempted=1)
+
+    >>> _colorize.COLORIZE = save_colorize
 """
     def displayhook(): r"""
 Test that changing sys.displayhook doesn't matter for doctest.
@@ -1258,6 +1306,10 @@ together).
 
 The DONT_ACCEPT_TRUE_FOR_1 flag disables matches between True/False
 and 1/0:
+
+    >>> import _colorize
+    >>> save_colorize = _colorize.COLORIZE
+    >>> _colorize.COLORIZE = False
 
     >>> def f(x):
     ...     '>>> True\n1\n'
@@ -1316,14 +1368,14 @@ The NORMALIZE_WHITESPACE flag causes all sequences of whitespace to be
 treated as equal:
 
     >>> def f(x):
-    ...     '>>> print(1, 2, 3)\n  1   2\n 3'
+    ...     '\n>>> print(1, 2, 3)\n  1   2\n 3'
 
     >>> # Without the flag:
     >>> test = doctest.DocTestFinder().find(f)[0]
     >>> doctest.DocTestRunner(verbose=False).run(test)
     ... # doctest: +ELLIPSIS
     **********************************************************************
-    File ..., line 2, in f
+    File ..., line 3, in f
     Failed example:
         print(1, 2, 3)
     Expected:
@@ -1678,6 +1730,7 @@ more than one flag value.  Here we verify that's fixed:
 
 Clean up.
     >>> del doctest.OPTIONFLAGS_BY_NAME[unlikely]
+    >>> _colorize.COLORIZE = save_colorize
 
     """
 
@@ -1687,6 +1740,10 @@ Tests of `DocTestRunner`'s option directive mechanism.
 Option directives can be used to turn option flags on or off for a
 single example.  To turn an option on for an example, follow that
 example with a comment of the form ``# doctest: +OPTION``:
+
+    >>> import _colorize
+    >>> save_colorize = _colorize.COLORIZE
+    >>> _colorize.COLORIZE = False
 
     >>> def f(x): r'''
     ...     >>> print(list(range(10)))      # should fail: no ellipsis
@@ -1895,6 +1952,8 @@ source:
     >>> test = doctest.DocTestParser().get_doctest(s, {}, 's', 's.py', 0)
     Traceback (most recent call last):
     ValueError: line 0 of the doctest for s has an option directive on a line with no example: '# doctest: +ELLIPSIS'
+
+    >>> _colorize.COLORIZE = save_colorize
 """
 
 def test_testsource(): r"""
@@ -1949,6 +2008,7 @@ Create a docstring that we want to debug:
 
 Create some fake stdin input, to feed to the debugger:
 
+    >>> from test.support.pty_helper import FakeInput
     >>> real_stdin = sys.stdin
     >>> sys.stdin = FakeInput(['next', 'print(x)', 'continue'])
 
@@ -1978,6 +2038,10 @@ if not hasattr(sys, 'gettrace') or not sys.gettrace():
         with a version that restores stdout.  This is necessary for you to
         see debugger output.
 
+          >>> import _colorize
+          >>> save_colorize = _colorize.COLORIZE
+          >>> _colorize.COLORIZE = False
+
           >>> doc = '''
           ... >>> x = 42
           ... >>> raise Exception('clé')
@@ -1992,6 +2056,7 @@ if not hasattr(sys, 'gettrace') or not sys.gettrace():
         To demonstrate this, we'll create a fake standard input that
         captures our debugger input:
 
+          >>> from test.support.pty_helper import FakeInput
           >>> real_stdin = sys.stdin
           >>> sys.stdin = FakeInput([
           ...    'print(x)',  # print data defined by the example
@@ -2000,8 +2065,7 @@ if not hasattr(sys, 'gettrace') or not sys.gettrace():
 
           >>> try: runner.run(test)
           ... finally: sys.stdin = real_stdin
-          --Return--
-          > <doctest foo-bar@baz[2]>(1)<module>()->None
+          > <doctest foo-bar@baz[2]>(1)<module>()
           -> import pdb; pdb.set_trace()
           (Pdb) print(x)
           42
@@ -2031,8 +2095,7 @@ if not hasattr(sys, 'gettrace') or not sys.gettrace():
           ...     runner.run(test)
           ... finally:
           ...     sys.stdin = real_stdin
-          --Return--
-          > <doctest test.test_doctest.test_doctest.test_pdb_set_trace[7]>(3)calls_set_trace()->None
+          > <doctest test.test_doctest.test_doctest.test_pdb_set_trace[11]>(3)calls_set_trace()
           -> import pdb; pdb.set_trace()
           (Pdb) print(y)
           2
@@ -2058,6 +2121,7 @@ if not hasattr(sys, 'gettrace') or not sys.gettrace():
           >>> test = parser.get_doctest(doc, globals(), "foo-bar@baz", "foo-bar@baz.py", 0)
           >>> real_stdin = sys.stdin
           >>> sys.stdin = FakeInput([
+          ...    'step',     # return event of g
           ...    'list',     # list source from example 2
           ...    'next',     # return from g()
           ...    'list',     # list source from example 1
@@ -2068,6 +2132,9 @@ if not hasattr(sys, 'gettrace') or not sys.gettrace():
           >>> try: runner.run(test)
           ... finally: sys.stdin = real_stdin
           ... # doctest: +NORMALIZE_WHITESPACE
+          > <doctest foo-bar@baz[1]>(3)g()
+          -> import pdb; pdb.set_trace()
+          (Pdb) step
           --Return--
           > <doctest foo-bar@baz[1]>(3)g()->None
           -> import pdb; pdb.set_trace()
@@ -2100,6 +2167,8 @@ if not hasattr(sys, 'gettrace') or not sys.gettrace():
           Got:
               9
           TestResults(failed=1, attempted=3)
+
+          >>> _colorize.COLORIZE = save_colorize
           """
 
     def test_pdb_set_trace_nested():
@@ -2128,8 +2197,10 @@ if not hasattr(sys, 'gettrace') or not sys.gettrace():
         >>> parser = doctest.DocTestParser()
         >>> runner = doctest.DocTestRunner(verbose=False)
         >>> test = parser.get_doctest(doc, globals(), "foo-bar@baz", "foo-bar@baz.py", 0)
+        >>> from test.support.pty_helper import FakeInput
         >>> real_stdin = sys.stdin
         >>> sys.stdin = FakeInput([
+        ...    'step',
         ...    'print(y)',  # print data defined in the function
         ...    'step', 'step', 'step', 'step', 'step', 'step', 'print(z)',
         ...    'up', 'print(x)',
@@ -2143,6 +2214,9 @@ if not hasattr(sys, 'gettrace') or not sys.gettrace():
         ... finally:
         ...     sys.stdin = real_stdin
         ... # doctest: +REPORT_NDIFF
+        > <doctest test.test_doctest.test_doctest.test_pdb_set_trace_nested[0]>(4)calls_set_trace()
+        -> import pdb; pdb.set_trace()
+        (Pdb) step
         > <doctest test.test_doctest.test_doctest.test_pdb_set_trace_nested[0]>(5)calls_set_trace()
         -> self.f1()
         (Pdb) print(y)
@@ -2197,13 +2271,21 @@ def test_DocTestSuite():
          >>> import unittest
          >>> import test.test_doctest.sample_doctest
          >>> suite = doctest.DocTestSuite(test.test_doctest.sample_doctest)
-         >>> suite.run(unittest.TestResult())
+         >>> result = suite.run(unittest.TestResult())
+         >>> result
          <unittest.result.TestResult run=9 errors=0 failures=4>
+         >>> for tst, _ in result.failures:
+         ...     print(tst)
+         bad (test.test_doctest.sample_doctest.__test__)
+         foo (test.test_doctest.sample_doctest)
+         test_silly_setup (test.test_doctest.sample_doctest)
+         y_is_one (test.test_doctest.sample_doctest)
 
        We can also supply the module by name:
 
          >>> suite = doctest.DocTestSuite('test.test_doctest.sample_doctest')
-         >>> suite.run(unittest.TestResult())
+         >>> result = suite.run(unittest.TestResult())
+         >>> result
          <unittest.result.TestResult run=9 errors=0 failures=4>
 
        The module need not contain any doctest examples:
@@ -2217,6 +2299,24 @@ def test_DocTestSuite():
          >>> suite = doctest.DocTestSuite('test.test_doctest.sample_doctest_no_docstrings')
          >>> suite.run(unittest.TestResult())
          <unittest.result.TestResult run=0 errors=0 failures=0>
+
+       If all examples in a docstring are skipped, unittest will report it as a
+       skipped test:
+
+         >>> suite = doctest.DocTestSuite('test.test_doctest.sample_doctest_skip')
+         >>> result = suite.run(unittest.TestResult())
+         >>> result
+         <unittest.result.TestResult run=6 errors=0 failures=2>
+        >>> len(result.skipped)
+        2
+        >>> for tst, _ in result.skipped:
+        ...     print(tst)
+        double_skip (test.test_doctest.sample_doctest_skip)
+        single_skip (test.test_doctest.sample_doctest_skip)
+        >>> for tst, _ in result.failures:
+        ...     print(tst)
+        no_skip_fail (test.test_doctest.sample_doctest_skip)
+        partial_skip_fail (test.test_doctest.sample_doctest_skip)
 
        We can use the current module:
 
@@ -2303,7 +2403,127 @@ def test_DocTestSuite():
        modified the test globals, which are a copy of the
        sample_doctest module dictionary.  The test globals are
        automatically cleared for us after a test.
-       """
+    """
+
+def test_DocTestSuite_errors():
+    """Tests for error reporting in DocTestSuite.
+
+         >>> import unittest
+         >>> import test.test_doctest.sample_doctest_errors as mod
+         >>> suite = doctest.DocTestSuite(mod)
+         >>> result = suite.run(unittest.TestResult())
+         >>> result
+         <unittest.result.TestResult run=4 errors=0 failures=4>
+         >>> print(result.failures[0][1]) # doctest: +ELLIPSIS
+         AssertionError: Failed doctest test for test.test_doctest.sample_doctest_errors
+           File "...sample_doctest_errors.py", line 0, in sample_doctest_errors
+         <BLANKLINE>
+         ----------------------------------------------------------------------
+         File "...sample_doctest_errors.py", line 5, in test.test_doctest.sample_doctest_errors
+         Failed example:
+             2 + 2
+         Expected:
+             5
+         Got:
+             4
+         ----------------------------------------------------------------------
+         File "...sample_doctest_errors.py", line 7, in test.test_doctest.sample_doctest_errors
+         Failed example:
+             1/0
+         Exception raised:
+             Traceback (most recent call last):
+               File "<doctest test.test_doctest.sample_doctest_errors[1]>", line 1, in <module>
+                 1/0
+                 ~^~
+             ZeroDivisionError: division by zero
+         <BLANKLINE>
+         >>> print(result.failures[1][1]) # doctest: +ELLIPSIS
+         AssertionError: Failed doctest test for test.test_doctest.sample_doctest_errors.__test__.bad
+           File "...sample_doctest_errors.py", line unknown line number, in bad
+         <BLANKLINE>
+         ----------------------------------------------------------------------
+         File "...sample_doctest_errors.py", line ?, in test.test_doctest.sample_doctest_errors.__test__.bad
+         Failed example:
+             2 + 2
+         Expected:
+             5
+         Got:
+             4
+         ----------------------------------------------------------------------
+         File "...sample_doctest_errors.py", line ?, in test.test_doctest.sample_doctest_errors.__test__.bad
+         Failed example:
+             1/0
+         Exception raised:
+             Traceback (most recent call last):
+               File "<doctest test.test_doctest.sample_doctest_errors.__test__.bad[1]>", line 1, in <module>
+                 1/0
+                 ~^~
+             ZeroDivisionError: division by zero
+         <BLANKLINE>
+         >>> print(result.failures[2][1]) # doctest: +ELLIPSIS
+         AssertionError: Failed doctest test for test.test_doctest.sample_doctest_errors.errors
+           File "...sample_doctest_errors.py", line 14, in errors
+         <BLANKLINE>
+         ----------------------------------------------------------------------
+         File "...sample_doctest_errors.py", line 16, in test.test_doctest.sample_doctest_errors.errors
+         Failed example:
+             2 + 2
+         Expected:
+             5
+         Got:
+             4
+         ----------------------------------------------------------------------
+         File "...sample_doctest_errors.py", line 18, in test.test_doctest.sample_doctest_errors.errors
+         Failed example:
+             1/0
+         Exception raised:
+             Traceback (most recent call last):
+               File "<doctest test.test_doctest.sample_doctest_errors.errors[1]>", line 1, in <module>
+                 1/0
+                 ~^~
+             ZeroDivisionError: division by zero
+         ----------------------------------------------------------------------
+         File "...sample_doctest_errors.py", line 23, in test.test_doctest.sample_doctest_errors.errors
+         Failed example:
+             f()
+         Exception raised:
+             Traceback (most recent call last):
+               File "<doctest test.test_doctest.sample_doctest_errors.errors[3]>", line 1, in <module>
+                 f()
+                 ~^^
+               File "<doctest test.test_doctest.sample_doctest_errors.errors[2]>", line 2, in f
+                 2 + '2'
+                 ~~^~~~~
+             TypeError: ...
+         ----------------------------------------------------------------------
+         File "...sample_doctest_errors.py", line 25, in test.test_doctest.sample_doctest_errors.errors
+         Failed example:
+             g()
+         Exception raised:
+             Traceback (most recent call last):
+               File "<doctest test.test_doctest.sample_doctest_errors.errors[4]>", line 1, in <module>
+                 g()
+                 ~^^
+               File "...sample_doctest_errors.py", line 12, in g
+                 [][0] # line 12
+                 ~~^^^
+             IndexError: list index out of range
+         <BLANKLINE>
+         >>> print(result.failures[3][1]) # doctest: +ELLIPSIS
+         AssertionError: Failed doctest test for test.test_doctest.sample_doctest_errors.syntax_error
+           File "...sample_doctest_errors.py", line 29, in syntax_error
+         <BLANKLINE>
+         ----------------------------------------------------------------------
+         File "...sample_doctest_errors.py", line 31, in test.test_doctest.sample_doctest_errors.syntax_error
+         Failed example:
+             2+*3
+         Exception raised:
+               File "<doctest test.test_doctest.sample_doctest_errors.syntax_error[0]>", line 1
+                 2+*3
+                   ^
+             SyntaxError: invalid syntax
+         <BLANKLINE>
+    """
 
 def test_DocFileSuite():
     """We can test tests found in text files using a DocFileSuite.
@@ -2328,25 +2548,6 @@ def test_DocFileSuite():
          ...                              'test_doctest4.txt',
          ...                              package='test.test_doctest')
          >>> suite.run(unittest.TestResult())
-         <unittest.result.TestResult run=3 errors=0 failures=2>
-
-       Support for using a package's __loader__.get_data() is also
-       provided.
-
-         >>> import unittest, pkgutil, test
-         >>> added_loader = False
-         >>> if not hasattr(test, '__loader__'):
-         ...     test.__loader__ = pkgutil.get_loader(test)
-         ...     added_loader = True
-         >>> try:
-         ...     suite = doctest.DocFileSuite('test_doctest.txt',
-         ...                                  'test_doctest2.txt',
-         ...                                  'test_doctest4.txt',
-         ...                                  package='test.test_doctest')
-         ...     suite.run(unittest.TestResult())
-         ... finally:
-         ...     if added_loader:
-         ...         del test.__loader__
          <unittest.result.TestResult run=3 errors=0 failures=2>
 
        '/' should be used as a path separator.  It will be converted
@@ -2388,6 +2589,22 @@ def test_DocFileSuite():
          ...                              package='test')
          Traceback (most recent call last):
          ValueError: Package may only be specified for module-relative paths.
+
+       If all examples in a file are skipped, unittest will report it as a
+       skipped test:
+
+         >>> suite = doctest.DocFileSuite('test_doctest.txt',
+         ...                              'test_doctest4.txt',
+         ...                              'test_doctest_skip.txt',
+         ...                              'test_doctest_skip2.txt')
+         >>> result = suite.run(unittest.TestResult())
+         >>> result
+         <unittest.result.TestResult run=4 errors=0 failures=1>
+         >>> len(result.skipped)
+         1
+         >>> for tst, _ in result.skipped: # doctest: +ELLIPSIS
+         ...     print('=', tst)
+         = ...test_doctest_skip.txt
 
        You can specify initial global variables:
 
@@ -2469,8 +2686,62 @@ def test_DocFileSuite():
          ...                              encoding='utf-8')
          >>> suite.run(unittest.TestResult())
          <unittest.result.TestResult run=3 errors=0 failures=2>
+    """
 
-       """
+def test_DocFileSuite_errors():
+    """Tests for error reporting in DocTestSuite.
+
+        >>> import unittest
+        >>> suite = doctest.DocFileSuite('test_doctest_errors.txt')
+        >>> result = suite.run(unittest.TestResult())
+        >>> result
+        <unittest.result.TestResult run=1 errors=0 failures=1>
+        >>> print(result.failures[0][1]) # doctest: +ELLIPSIS
+        AssertionError: Failed doctest test for test_doctest_errors.txt
+          File "...test_doctest_errors.txt", line 0
+        <BLANKLINE>
+        ----------------------------------------------------------------------
+        File "...test_doctest_errors.txt", line 4, in test_doctest_errors.txt
+        Failed example:
+            2 + 2
+        Expected:
+            5
+        Got:
+            4
+        ----------------------------------------------------------------------
+        File "...test_doctest_errors.txt", line 6, in test_doctest_errors.txt
+        Failed example:
+            1/0
+        Exception raised:
+            Traceback (most recent call last):
+              File "<doctest test_doctest_errors.txt[1]>", line 1, in <module>
+                1/0
+                ~^~
+            ZeroDivisionError: division by zero
+        ----------------------------------------------------------------------
+        File "...test_doctest_errors.txt", line 11, in test_doctest_errors.txt
+        Failed example:
+            f()
+        Exception raised:
+            Traceback (most recent call last):
+              File "<doctest test_doctest_errors.txt[3]>", line 1, in <module>
+                f()
+                ~^^
+              File "<doctest test_doctest_errors.txt[2]>", line 2, in f
+                2 + '2'
+                ~~^~~~~
+            TypeError: ...
+        ----------------------------------------------------------------------
+        File "...test_doctest_errors.txt", line 13, in test_doctest_errors.txt
+        Failed example:
+            2+*3
+        Exception raised:
+              File "<doctest test_doctest_errors.txt[4]>", line 1
+                2+*3
+                  ^
+            SyntaxError: invalid syntax
+        <BLANKLINE>
+    """
 
 def test_trailing_space_in_test():
     """
@@ -2490,12 +2761,41 @@ class Wrapper:
         self.func(*args, **kwargs)
 
 @Wrapper
-def test_look_in_unwrapped():
+def wrapped():
     """
     Docstrings in wrapped functions must be detected as well.
 
     >>> 'one other test'
     'one other test'
+    """
+
+def test_look_in_unwrapped():
+    """
+    Ensure that wrapped doctests work correctly.
+
+    >>> import doctest
+    >>> doctest.run_docstring_examples(
+    ...     wrapped, {}, name=wrapped.__name__, verbose=True)
+    Finding tests in wrapped
+    Trying:
+        'one other test'
+    Expecting:
+        'one other test'
+    ok
+    """
+
+@doctest_skip_if(support.check_impl_detail(cpython=False))
+def test_wrapped_c_func():
+    """
+    # https://github.com/python/cpython/issues/117692
+    >>> import binascii
+    >>> from test.test_doctest.decorator_mod import decorator
+
+    >>> c_func_wrapped = decorator(binascii.b2a_hex)
+    >>> tests = doctest.DocTestFinder(exclude_empty=False).find(c_func_wrapped)
+    >>> for test in tests:
+    ...    print(test.lineno, test.name)
+    None b2a_hex
     """
 
 def test_unittest_reportflags():
@@ -2510,8 +2810,11 @@ def test_unittest_reportflags():
       ...                          optionflags=doctest.DONT_ACCEPT_BLANKLINE)
       >>> import unittest
       >>> result = suite.run(unittest.TestResult())
+      >>> result
+      <unittest.result.TestResult run=1 errors=0 failures=1>
       >>> print(result.failures[0][1]) # doctest: +ELLIPSIS
-      Traceback ...
+      AssertionError: Failed doctest test for test_doctest.txt
+      ...
       Failed example:
           favorite_color
       ...
@@ -2527,14 +2830,16 @@ def test_unittest_reportflags():
     Now, when we run the test:
 
       >>> result = suite.run(unittest.TestResult())
+      >>> result
+      <unittest.result.TestResult run=1 errors=0 failures=1>
       >>> print(result.failures[0][1]) # doctest: +ELLIPSIS
-      Traceback ...
+      AssertionError: Failed doctest test for test_doctest.txt
+      ...
       Failed example:
           favorite_color
       Exception raised:
           ...
           NameError: name 'favorite_color' is not defined
-      <BLANKLINE>
       <BLANKLINE>
 
     We get only the first failure.
@@ -2548,12 +2853,15 @@ def test_unittest_reportflags():
     Then the default eporting options are ignored:
 
       >>> result = suite.run(unittest.TestResult())
+      >>> result
+      <unittest.result.TestResult run=1 errors=0 failures=1>
 
     *NOTE*: These doctest are intentionally not placed in raw string to depict
     the trailing whitespace using `\x20` in the diff below.
 
       >>> print(result.failures[0][1]) # doctest: +ELLIPSIS
-      Traceback ...
+      AssertionError: Failed doctest test for test_doctest.txt
+      ...
       Failed example:
           favorite_color
       ...
@@ -2567,7 +2875,6 @@ def test_unittest_reportflags():
           - <BLANKLINE>
           +\x20
             b
-      <BLANKLINE>
       <BLANKLINE>
 
 
@@ -2583,7 +2890,11 @@ doctest examples in a given file.  In its simple invocation, it is
 called with the name of a file, which is taken to be relative to the
 calling module.  The return value is (#failures, #tests).
 
-We don't want `-v` in sys.argv for these tests.
+We don't want color or `-v` in sys.argv for these tests.
+
+    >>> import _colorize
+    >>> save_colorize = _colorize.COLORIZE
+    >>> _colorize.COLORIZE = False
 
     >>> save_argv = sys.argv
     >>> if '-v' in sys.argv:
@@ -2599,9 +2910,9 @@ We don't want `-v` in sys.argv for these tests.
         ...
         NameError: name 'favorite_color' is not defined
     **********************************************************************
-    1 items had failures:
+    1 item had failures:
        1 of   2 in test_doctest.txt
-    ***Test Failed*** 1 failures.
+    ***Test Failed*** 1 failure.
     TestResults(failed=1, attempted=2)
     >>> doctest.master = None  # Reset master.
 
@@ -2628,9 +2939,9 @@ Globals may be specified with the `globs` and `extraglobs` parameters:
     Got:
         'red'
     **********************************************************************
-    1 items had failures:
+    1 item had failures:
        1 of   2 in test_doctest.txt
-    ***Test Failed*** 1 failures.
+    ***Test Failed*** 1 failure.
     TestResults(failed=1, attempted=2)
     >>> doctest.master = None  # Reset master.
 
@@ -2660,10 +2971,10 @@ Verbosity can be increased with the optional `verbose` parameter:
         <BLANKLINE>
         b
     ok
-    1 items passed all tests:
+    1 item passed all tests:
        2 tests in test_doctest.txt
-    2 tests in 1 items.
-    2 passed and 0 failed.
+    2 tests in 1 item.
+    2 passed.
     Test passed.
     TestResults(failed=0, attempted=2)
     >>> doctest.master = None  # Reset master.
@@ -2720,7 +3031,7 @@ using the optional keyword argument `encoding`:
     **********************************************************************
     ...
     **********************************************************************
-    1 items had failures:
+    1 item had failures:
        2 of   2 in test_doctest4.txt
     ***Test Failed*** 2 failures.
     TestResults(failed=2, attempted=2)
@@ -2743,17 +3054,69 @@ Test the verbose output:
     Expecting:
         'b\u0105r'
     ok
-    1 items passed all tests:
+    1 item passed all tests:
        2 tests in test_doctest4.txt
-    2 tests in 1 items.
-    2 passed and 0 failed.
+    2 tests in 1 item.
+    2 passed.
     Test passed.
     TestResults(failed=0, attempted=2)
     >>> doctest.master = None  # Reset master.
     >>> sys.argv = save_argv
+    >>> _colorize.COLORIZE = save_colorize
 """
 
-class TestImporter(importlib.abc.MetaPathFinder, importlib.abc.ResourceLoader):
+def test_testfile_errors(): r"""
+Tests for error reporting in the testfile() function.
+
+    >>> doctest.testfile('test_doctest_errors.txt', verbose=False) # doctest: +ELLIPSIS
+    **********************************************************************
+    File "...test_doctest_errors.txt", line 4, in test_doctest_errors.txt
+    Failed example:
+        2 + 2
+    Expected:
+        5
+    Got:
+        4
+    **********************************************************************
+    File "...test_doctest_errors.txt", line 6, in test_doctest_errors.txt
+    Failed example:
+        1/0
+    Exception raised:
+        Traceback (most recent call last):
+          File "<doctest test_doctest_errors.txt[1]>", line 1, in <module>
+            1/0
+            ~^~
+        ZeroDivisionError: division by zero
+    **********************************************************************
+    File "...test_doctest_errors.txt", line 11, in test_doctest_errors.txt
+    Failed example:
+        f()
+    Exception raised:
+        Traceback (most recent call last):
+          File "<doctest test_doctest_errors.txt[3]>", line 1, in <module>
+            f()
+            ~^^
+          File "<doctest test_doctest_errors.txt[2]>", line 2, in f
+            2 + '2'
+            ~~^~~~~
+        TypeError: ...
+    **********************************************************************
+    File "...test_doctest_errors.txt", line 13, in test_doctest_errors.txt
+    Failed example:
+        2+*3
+    Exception raised:
+          File "<doctest test_doctest_errors.txt[4]>", line 1
+            2+*3
+              ^
+        SyntaxError: invalid syntax
+    **********************************************************************
+    1 item had failures:
+       4 of   5 in test_doctest_errors.txt
+    ***Test Failed*** 4 failures.
+    TestResults(failed=4, attempted=5)
+"""
+
+class TestImporter(importlib.abc.MetaPathFinder):
 
     def find_spec(self, fullname, path, target=None):
         return importlib.util.spec_from_file_location(fullname, path, loader=self)
@@ -2761,6 +3124,12 @@ class TestImporter(importlib.abc.MetaPathFinder, importlib.abc.ResourceLoader):
     def get_data(self, path):
         with open(path, mode='rb') as f:
             return f.read()
+
+    def exec_module(self, module):
+        raise ImportError
+
+    def create_module(self, spec):
+        return None
 
 class TestHook:
 
@@ -2839,6 +3208,8 @@ in it, and use a package hook to install a custom loader; on any platform,
 at least one of the line endings will raise a ValueError for inconsistent
 whitespace if doctest does not correctly do the newline conversion.
 
+    >>> from test.support import os_helper
+    >>> import shutil
     >>> dn = tempfile.mkdtemp()
     >>> pkg = os.path.join(dn, "doctest_testpkg")
     >>> os.mkdir(pkg)
@@ -2875,6 +3246,110 @@ out of the binary module.
     TestResults(failed=0, attempted=0)
 """
 
+def test_testmod_errors(): r"""
+Tests for error reporting in the testmod() function.
+
+    >>> import test.test_doctest.sample_doctest_errors as mod
+    >>> doctest.testmod(mod, verbose=False) # doctest: +ELLIPSIS
+    **********************************************************************
+    File "...sample_doctest_errors.py", line 5, in test.test_doctest.sample_doctest_errors
+    Failed example:
+        2 + 2
+    Expected:
+        5
+    Got:
+        4
+    **********************************************************************
+    File "...sample_doctest_errors.py", line 7, in test.test_doctest.sample_doctest_errors
+    Failed example:
+        1/0
+    Exception raised:
+        Traceback (most recent call last):
+          File "<doctest test.test_doctest.sample_doctest_errors[1]>", line 1, in <module>
+            1/0
+            ~^~
+        ZeroDivisionError: division by zero
+    **********************************************************************
+    File "...sample_doctest_errors.py", line ?, in test.test_doctest.sample_doctest_errors.__test__.bad
+    Failed example:
+        2 + 2
+    Expected:
+        5
+    Got:
+        4
+    **********************************************************************
+    File "...sample_doctest_errors.py", line ?, in test.test_doctest.sample_doctest_errors.__test__.bad
+    Failed example:
+        1/0
+    Exception raised:
+        Traceback (most recent call last):
+          File "<doctest test.test_doctest.sample_doctest_errors.__test__.bad[1]>", line 1, in <module>
+            1/0
+            ~^~
+        ZeroDivisionError: division by zero
+    **********************************************************************
+    File "...sample_doctest_errors.py", line 16, in test.test_doctest.sample_doctest_errors.errors
+    Failed example:
+        2 + 2
+    Expected:
+        5
+    Got:
+        4
+    **********************************************************************
+    File "...sample_doctest_errors.py", line 18, in test.test_doctest.sample_doctest_errors.errors
+    Failed example:
+        1/0
+    Exception raised:
+        Traceback (most recent call last):
+          File "<doctest test.test_doctest.sample_doctest_errors.errors[1]>", line 1, in <module>
+            1/0
+            ~^~
+        ZeroDivisionError: division by zero
+    **********************************************************************
+    File "...sample_doctest_errors.py", line 23, in test.test_doctest.sample_doctest_errors.errors
+    Failed example:
+        f()
+    Exception raised:
+        Traceback (most recent call last):
+          File "<doctest test.test_doctest.sample_doctest_errors.errors[3]>", line 1, in <module>
+            f()
+            ~^^
+          File "<doctest test.test_doctest.sample_doctest_errors.errors[2]>", line 2, in f
+            2 + '2'
+            ~~^~~~~
+        TypeError: ...
+    **********************************************************************
+    File "...sample_doctest_errors.py", line 25, in test.test_doctest.sample_doctest_errors.errors
+    Failed example:
+        g()
+    Exception raised:
+        Traceback (most recent call last):
+          File "<doctest test.test_doctest.sample_doctest_errors.errors[4]>", line 1, in <module>
+            g()
+            ~^^
+          File "...sample_doctest_errors.py", line 12, in g
+            [][0] # line 12
+            ~~^^^
+        IndexError: list index out of range
+    **********************************************************************
+    File "...sample_doctest_errors.py", line 31, in test.test_doctest.sample_doctest_errors.syntax_error
+    Failed example:
+        2+*3
+    Exception raised:
+          File "<doctest test.test_doctest.sample_doctest_errors.syntax_error[0]>", line 1
+            2+*3
+              ^
+        SyntaxError: invalid syntax
+    **********************************************************************
+    4 items had failures:
+       2 of   2 in test.test_doctest.sample_doctest_errors
+       2 of   2 in test.test_doctest.sample_doctest_errors.__test__.bad
+       4 of   5 in test.test_doctest.sample_doctest_errors.errors
+       1 of   1 in test.test_doctest.sample_doctest_errors.syntax_error
+    ***Test Failed*** 9 failures.
+    TestResults(failed=9, attempted=10)
+"""
+
 try:
     os.fsencode("foo-bär@baz.py")
     supports_unicode = True
@@ -2885,6 +3360,10 @@ except UnicodeEncodeError:
 if supports_unicode:
     def test_unicode(): """
 Check doctest with a non-ascii filename:
+
+    >>> import _colorize
+    >>> save_colorize = _colorize.COLORIZE
+    >>> _colorize.COLORIZE = False
 
     >>> doc = '''
     ... >>> raise Exception('clé')
@@ -2902,14 +3381,16 @@ Check doctest with a non-ascii filename:
         raise Exception('clé')
     Exception raised:
         Traceback (most recent call last):
-          File ...
-            exec(compile(example.source, filename, "single",
           File "<doctest foo-bär@baz[0]>", line 1, in <module>
             raise Exception('clé')
         Exception: clé
     TestResults(failed=1, attempted=1)
+
+    >>> _colorize.COLORIZE = save_colorize
     """
 
+
+@doctest_skip_if(not support.has_subprocess_support)
 def test_CLI(): r"""
 The doctest module can be used to run doctests against an arbitrary file.
 These tests test this CLI functionality.
@@ -2963,10 +3444,10 @@ With the verbose flag, we should see the test output, but no error output:
     Expecting:
         'a'
     ok
-    1 items passed all tests:
+    1 item passed all tests:
        2 tests in myfile.doc
-    2 tests in 1 items.
-    2 passed and 0 failed.
+    2 tests in 1 item.
+    2 passed.
     Test passed.
 
 Now we'll write a couple files, one with three tests, the other a python module
@@ -3040,7 +3521,7 @@ not stderr:
     Got:
         'ajkml'
     **********************************************************************
-    1 items had failures:
+    1 item had failures:
        2 of   3 in myfile.doc
     ***Test Failed*** 2 failures.
 
@@ -3067,9 +3548,9 @@ The fourth run uses FAIL_FAST, so we should see only one error:
     Got:
         'abcdef'
     **********************************************************************
-    1 items had failures:
+    1 item had failures:
        1 of   2 in myfile.doc
-    ***Test Failed*** 1 failures.
+    ***Test Failed*** 1 failure.
 
 The fifth test uses verbose with the two options, so we should get verbose
 success output for the tests in both files:
@@ -3092,10 +3573,10 @@ success output for the tests in both files:
     Expecting:
         'a...l'
     ok
-    1 items passed all tests:
+    1 item passed all tests:
        3 tests in myfile.doc
-    3 tests in 1 items.
-    3 passed and 0 failed.
+    3 tests in 1 item.
+    3 passed.
     Test passed.
     Trying:
         1 + 1
@@ -3107,12 +3588,12 @@ success output for the tests in both files:
     Expecting:
         'abc def'
     ok
-    1 items had no tests:
+    1 item had no tests:
         myfile2
-    1 items passed all tests:
+    1 item passed all tests:
        2 tests in myfile2.test_func
     2 tests in 2 items.
-    2 passed and 0 failed.
+    2 passed.
     Test passed.
 
 We should also check some typical error cases.
@@ -3200,6 +3681,10 @@ def test_run_doctestsuite_multiple_times():
 
 def test_exception_with_note(note):
     """
+    >>> import _colorize
+    >>> save_colorize = _colorize.COLORIZE
+    >>> _colorize.COLORIZE = False
+
     >>> test_exception_with_note('Note')
     Traceback (most recent call last):
       ...
@@ -3249,6 +3734,8 @@ def test_exception_with_note(note):
         ValueError: message
         note
     TestResults(failed=1, attempted=...)
+
+    >>> _colorize.COLORIZE = save_colorize
     """
     exc = ValueError('Text')
     exc.add_note(note)
@@ -3329,6 +3816,10 @@ def test_syntax_error_subclass_from_stdlib():
 
 def test_syntax_error_with_incorrect_expected_note():
     """
+    >>> import _colorize
+    >>> save_colorize = _colorize.COLORIZE
+    >>> _colorize.COLORIZE = False
+
     >>> def f(x):
     ...     r'''
     ...     >>> exc = SyntaxError("error", ("x.py", 23, None, "bad syntax"))
@@ -3357,6 +3848,8 @@ def test_syntax_error_with_incorrect_expected_note():
         note1
         note2
     TestResults(failed=1, attempted=...)
+
+    >>> _colorize.COLORIZE = save_colorize
     """
 
 

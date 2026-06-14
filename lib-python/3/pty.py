@@ -32,24 +32,18 @@ def openpty():
     except (AttributeError, OSError):
         pass
     master_fd, slave_name = _open_terminal()
-    slave_fd = slave_open(slave_name)
-    return master_fd, slave_fd
 
-def master_open():
-    """master_open() -> (master_fd, slave_name)
-    Open a pty master and return the fd, and the filename of the slave end.
-    Deprecated, use openpty() instead."""
-
+    slave_fd = os.open(slave_name, os.O_RDWR)
     try:
-        master_fd, slave_fd = os.openpty()
-    except (AttributeError, OSError):
+        from fcntl import ioctl, I_PUSH
+    except ImportError:
+         return master_fd, slave_fd
+    try:
+        ioctl(slave_fd, I_PUSH, "ptem")
+        ioctl(slave_fd, I_PUSH, "ldterm")
+    except OSError:
         pass
-    else:
-        slave_name = os.ttyname(slave_fd)
-        os.close(slave_fd)
-        return master_fd, slave_name
-
-    return _open_terminal()
+    return master_fd, slave_fd
 
 def _open_terminal():
     """Open pty master and return (master_fd, tty_name)."""
@@ -63,23 +57,6 @@ def _open_terminal():
             return (fd, '/dev/tty' + x + y)
     raise OSError('out of pty devices')
 
-def slave_open(tty_name):
-    """slave_open(tty_name) -> slave_fd
-    Open the pty slave and acquire the controlling terminal, returning
-    opened filedescriptor.
-    Deprecated, use openpty() instead."""
-
-    result = os.open(tty_name, os.O_RDWR)
-    try:
-        from fcntl import ioctl, I_PUSH
-    except ImportError:
-        return result
-    try:
-        ioctl(result, I_PUSH, "ptem")
-        ioctl(result, I_PUSH, "ldterm")
-    except OSError:
-        pass
-    return result
 
 def fork():
     """fork() -> (pid, master_fd)
@@ -101,20 +78,8 @@ def fork():
     master_fd, slave_fd = openpty()
     pid = os.fork()
     if pid == CHILD:
-        # Establish a new session.
-        os.setsid()
         os.close(master_fd)
-
-        # Slave becomes stdin/stdout/stderr of child.
-        os.dup2(slave_fd, STDIN_FILENO)
-        os.dup2(slave_fd, STDOUT_FILENO)
-        os.dup2(slave_fd, STDERR_FILENO)
-        if slave_fd > STDERR_FILENO:
-            os.close(slave_fd)
-
-        # Explicitly open the tty to make it become a controlling tty.
-        tmp_fd = os.open(os.ttyname(STDOUT_FILENO), os.O_RDWR)
-        os.close(tmp_fd)
+        os.login_tty(slave_fd)
     else:
         os.close(slave_fd)
 
@@ -192,7 +157,7 @@ def _copy(master_fd, master_read=_read, stdin_read=_read):
 
 def spawn(argv, master_read=_read, stdin_read=_read):
     """Create a spawned process."""
-    if type(argv) == type(''):
+    if isinstance(argv, str):
         argv = (argv,)
     sys.audit('pty.spawn', argv)
 
