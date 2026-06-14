@@ -3632,7 +3632,7 @@ impl OptUnroll {
         ) -> Vec<OpRef> {
             ctx.active_short_preamble_producer
                 .as_ref()
-                .map(|builder| builder.jump_args().to_vec())
+                .map(|builder| builder.jump_args().iter().map(|b| b.to_opref()).collect())
                 .unwrap_or_else(|| {
                     short_preamble
                         .jump_args
