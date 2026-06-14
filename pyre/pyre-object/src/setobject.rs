@@ -61,16 +61,53 @@ unsafe fn set_keys_equal(a: PyObjectRef, b: PyObjectRef) -> bool {
     crate::dictmultiobject::dict_keys_equal(a, b)
 }
 
+/// Fire the GC write barrier for a set whose element storage just gained
+/// a possibly-young element. `set_object_custom_trace` only forwards the
+/// `items` slots when the set is reached by a collection; an old-gen set
+/// that stored a young element is reached on a minor GC only if it sits in
+/// the remembered set, so the barrier must run after every insert. Mirrors
+/// `dict_write_barrier`.
+#[inline]
+fn set_write_barrier(obj: PyObjectRef) {
+    crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
+}
+
 fn alloc_set_with_type(tp: &'static PyType) -> PyObjectRef {
     let items = crate::lltype::malloc_raw(Vec::new());
-    crate::lltype::malloc_typed(W_SetObject {
-        ob_header: PyObject {
-            ob_type: tp as *const PyType,
-            w_class: get_instantiate(tp),
-        },
-        items,
-        len: 0,
-    }) as PyObjectRef
+    let header = PyObject {
+        ob_type: tp as *const PyType,
+        w_class: get_instantiate(tp),
+    };
+    // Allocate the body in GC old-gen (mark-sweep, non-moving) so it
+    // carries TRACK_YOUNG_PTRS, mirroring `w_list_new` / `w_tuple_new`.
+    // `w_set_add` stores possibly-young elements into `items`; the write
+    // barrier (`set_write_barrier`) only remembers the set on a minor
+    // collection when the body is an old-gen object, so a body allocated
+    // through the plain `malloc_typed` (no TRACK_YOUNG_PTRS) would leave
+    // young elements unforwarded and collected. Falls back to
+    // `malloc_typed` when no GC hook is installed (unit tests).
+    match crate::gc_hook::try_gc_alloc_stable(W_SET_GC_TYPE_ID, W_SET_OBJECT_SIZE)
+        .filter(|p| !p.is_null())
+    {
+        Some(raw) => {
+            unsafe {
+                std::ptr::write(
+                    raw as *mut W_SetObject,
+                    W_SetObject {
+                        ob_header: header,
+                        items,
+                        len: 0,
+                    },
+                );
+            }
+            raw as PyObjectRef
+        }
+        None => crate::lltype::malloc_typed(W_SetObject {
+            ob_header: header,
+            items,
+            len: 0,
+        }) as PyObjectRef,
+    }
 }
 
 /// Allocate an empty `set`.
@@ -115,6 +152,7 @@ pub unsafe fn w_set_add(obj: PyObjectRef, item: PyObjectRef) {
     }
     entries.push(item);
     s.len += 1;
+    set_write_barrier(obj);
 }
 
 /// Membership test.
