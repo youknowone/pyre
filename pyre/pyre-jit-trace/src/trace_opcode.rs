@@ -8284,6 +8284,36 @@ impl MIFrame {
             return Ok(Some(pyre_interpreter::StepResult::Continue));
         }
 
+        // STORE_FAST_STORE_FAST walker activation via trait-path delegation.
+        //
+        // The auto-gen arm jitcode lowers to a chain of `residual_call` ops
+        // whose funcptr `constants_i` entries are unresolved symbolic-hash
+        // placeholders (not patched by `patch_constants_i_fnaddrs`); the arm
+        // walk would `blr` an unmapped address, and its authoritative
+        // `try_execute_residual_call_via_executor` would concretely run the
+        // real `PyFrame::store_fast_store_fast`, popping the LIVE frame's
+        // value stack — which the trace walk never populates (only symbolic
+        // `pop_value` / vsd advance), underflowing `PyFrame::pop`.
+        //
+        // Both hazards are arm-walk-only.  Delegate to
+        // `OpcodeStepExecutor::store_fast_store_fast` (→ `pop_value` ×2 +
+        // `store_local_value` ×2) exactly as trait dispatch does: `pop_value`
+        // is the symbolic pop and `store_local_value` records the
+        // `setarrayitem_vable` write into the virtualizable locals (the
+        // frame is forced on deopt), so there is no live-frame pop and no
+        // unresolved residual.  `var_nums_to_first_index` /
+        // `var_nums_to_second_index` fold the paired local indices from
+        // `op_arg` (the same `#[elidable_cannot_raise]` helpers the seam
+        // uses).  Same delegation pattern as the BuildTuple / UnpackSequence
+        // hooks above; bypasses `apply_walker_stack_effect`.
+        if let Instruction::StoreFastStoreFast { var_nums } = instruction {
+            use pyre_interpreter::OpcodeStepExecutor;
+            let idx1 = pyre_interpreter::var_nums_to_first_index(*var_nums, op_arg);
+            let idx2 = pyre_interpreter::var_nums_to_second_index(*var_nums, op_arg);
+            OpcodeStepExecutor::store_fast_store_fast(self, idx1, idx2)?;
+            return Ok(Some(pyre_interpreter::StepResult::Continue));
+        }
+
         Ok(None)
     }
 
@@ -9368,14 +9398,14 @@ pub fn production_walker_handles(instruction: &Instruction) -> bool {
     // call), so the direct hook is the orthodox dispatch — the same shape
     // as the StoreSubscr / PushNull / Reraise hooks.
     //
-    // StoreFastStoreFast is still excluded: its codewriter arm lowers to a
-    // chain of `residual_call` ops whose funcptr `constants_i` entries are
-    // unresolved placeholders (not patched by `patch_constants_i_fnaddrs`,
-    // which only rewrites build→runtime fnaddr pairs). The walker reads one
-    // of those placeholders as the call target and branches to it (`blr`),
-    // faulting on an unmapped address. Route it through the trait handler
-    // (`opcode_store_fast_store_fast`) until the arm's helper fnaddrs are
-    // resolved.
+    // StoreFastStoreFast is walker-handled via the
+    // `try_walker_direct_opcode_dispatch` entry hook (NOT the auto-gen arm
+    // jitcode): the hook delegates to
+    // `OpcodeStepExecutor::store_fast_store_fast`, whose symbolic
+    // `pop_value` + `store_local_value` (`setarrayitem_vable`) avoid both
+    // arm-walk hazards — the unresolved placeholder funcptrs the arm `blr`s
+    // and the concrete live-frame `PyFrame::pop` underflow.  See the hook
+    // comment for detail.
     matches!(
         instruction,
         Instruction::Nop
@@ -9564,6 +9594,12 @@ pub fn production_walker_handles(instruction: &Instruction) -> bool {
             // `InlineCallArityMismatch` on inlined tuples.
             | Instruction::BuildTuple { .. }
             | Instruction::UnpackSequence { .. }
+            // StoreFastStoreFast handled by the
+            // dispatch_via_walker_for_opcode entry hook, delegating to the
+            // symbolic `OpcodeStepExecutor::store_fast_store_fast` (the arm
+            // jitcode carries unresolved placeholder funcptrs and would pop
+            // the live frame; see the hook comment).
+            | Instruction::StoreFastStoreFast { .. }
     )
 }
 
