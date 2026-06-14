@@ -369,6 +369,29 @@ fn dispatch(slot: usize, opcode: u8) -> Result<(), PyError> {
             let w_dict = top(slot, "SETITEMS")?;
             dict_update_from_pairs(w_dict, items)?;
         }
+        // ── set / frozenset ───────────────────────────────────────────
+        x if x == op::EMPTY_SET => push(slot, pyre_object::setobject::w_set_new()),
+        x if x == op::FROZENSET => {
+            let items = pop_mark(slot)?;
+            push(slot, list_to_frozenset(items));
+        }
+        x if x == op::ADDITEMS => {
+            let items = pop_mark(slot)?;
+            let w_set = top(slot, "ADDITEMS")?;
+            let n = unsafe { pyre_object::listobject::w_list_len(items) };
+            for i in 0..n {
+                let item =
+                    unsafe { pyre_object::listobject::w_list_getitem(items, i as i64).unwrap() };
+                unsafe { pyre_object::setobject::w_set_add(w_set, item) };
+            }
+        }
+        // ── bytearray ─────────────────────────────────────────────────
+        x if x == op::BYTEARRAY8 => {
+            let nb = read(slot, 8)?;
+            let n = read_int_le(&nb) as usize;
+            let d = read(slot, n)?;
+            push(slot, pyre_object::bytearrayobject::w_bytearray_from_bytes(&d));
+        }
         // ── memo ──────────────────────────────────────────────────────
         x if x == op::MEMOIZE => {
             let v = top(slot, "MEMOIZE")?;
@@ -423,6 +446,15 @@ fn list_to_tuple(items: PyObjectRef) -> PyObjectRef {
         .map(|i| unsafe { pyre_object::listobject::w_list_getitem(items, i as i64).unwrap() })
         .collect();
     pyre_object::tupleobject::w_tuple_new(v)
+}
+
+/// Build a frozenset from the items of a (popped) stack list.
+fn list_to_frozenset(items: PyObjectRef) -> PyObjectRef {
+    let n = unsafe { pyre_object::listobject::w_list_len(items) };
+    let v: Vec<PyObjectRef> = (0..n)
+        .map(|i| unsafe { pyre_object::listobject::w_list_getitem(items, i as i64).unwrap() })
+        .collect();
+    pyre_object::setobject::w_frozenset_from_items(&v)
 }
 
 /// Copy a (popped) stack list into a fresh list.

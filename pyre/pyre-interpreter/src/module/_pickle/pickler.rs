@@ -163,11 +163,20 @@ fn save(ctx: &mut PickleCtx, buf: &mut Vec<u8>, w_obj: PyObjectRef) -> Result<()
     if unsafe { pyre_object::is_dict(w_obj) } {
         return save_dict(ctx, buf, w_obj);
     }
+    if unsafe { pyre_object::is_set(w_obj) } {
+        return save_set(ctx, buf, w_obj);
+    }
+    if unsafe { pyre_object::is_frozenset(w_obj) } && ctx.proto >= 4 {
+        return save_frozenset(ctx, buf, w_obj);
+    }
     if unsafe { pyre_object::is_list(w_obj) } {
         return save_list(ctx, buf, w_obj);
     }
     if unsafe { pyre_object::is_tuple(w_obj) } {
         return save_tuple(ctx, buf, w_obj);
+    }
+    if unsafe { pyre_object::is_bytearray(w_obj) } {
+        return save_bytearray(ctx, buf, w_obj);
     }
     Err(PyError::not_implemented(
         "_pickle: this object type is not supported in this build",
@@ -367,6 +376,83 @@ fn save_dict(ctx: &mut PickleCtx, buf: &mut Vec<u8>, w_obj: PyObjectRef) -> Resu
 
     let items = unsafe { pyre_object::dictmultiobject::w_dict_items(w_obj) };
     batch_setitems(ctx, buf, &items)
+}
+
+/// `interp_pickle.py save_set`. Sets are unordered, so the wire bytes are
+/// not byte-identical to CPython, but the encoding round-trips. The
+/// protocol < 4 reduce fallback arrives with `save_reduce`.
+fn save_set(ctx: &mut PickleCtx, buf: &mut Vec<u8>, w_obj: PyObjectRef) -> Result<(), PyError> {
+    if ctx.proto < 4 {
+        return Err(PyError::not_implemented(
+            "_pickle: set at protocol < 4 needs save_reduce (later increment)",
+        ));
+    }
+    buf.push(op::EMPTY_SET);
+    memoize(ctx, buf, w_obj);
+
+    let items = unsafe { pyre_object::setobject::w_set_items(w_obj) };
+    let length = items.len();
+    if length == 0 {
+        return Ok(());
+    }
+    buf.push(op::MARK);
+    save(ctx, buf, items[0])?;
+    let mut i = 1;
+    while i + 1 < length {
+        if i % BATCHSIZE == 0 {
+            buf.push(op::ADDITEMS);
+            buf.push(op::MARK);
+        }
+        save(ctx, buf, items[i])?;
+        i += 1;
+    }
+    if length > 1 {
+        save(ctx, buf, items[length - 1])?;
+    }
+    buf.push(op::ADDITEMS);
+    Ok(())
+}
+
+/// `interp_pickle.py save_frozenset` (proto >= 4 only; lower protocols reach
+/// the generic reduce path). Unordered, so not byte-identical to CPython.
+fn save_frozenset(
+    ctx: &mut PickleCtx,
+    buf: &mut Vec<u8>,
+    w_obj: PyObjectRef,
+) -> Result<(), PyError> {
+    buf.push(op::MARK);
+    let items = unsafe { pyre_object::setobject::w_set_items(w_obj) };
+    for &e in &items {
+        save(ctx, buf, e)?;
+    }
+    if let Some(idx) = ctx.memo_get(w_obj) {
+        buf.push(op::POP);
+        write_get(ctx, buf, idx);
+    } else {
+        buf.push(op::FROZENSET);
+        memoize(ctx, buf, w_obj);
+    }
+    Ok(())
+}
+
+/// `interp_pickle.py save_bytearray` (proto >= 5 raw form; lower protocols
+/// reach the generic reduce path).
+fn save_bytearray(
+    ctx: &mut PickleCtx,
+    buf: &mut Vec<u8>,
+    w_obj: PyObjectRef,
+) -> Result<(), PyError> {
+    if ctx.proto < 5 {
+        return Err(PyError::not_implemented(
+            "_pickle: bytearray at protocol < 5 needs save_reduce (later increment)",
+        ));
+    }
+    let data = unsafe { pyre_object::bytearrayobject::w_bytearray_data(w_obj) };
+    buf.push(op::BYTEARRAY8);
+    buf.extend_from_slice(&(data.len() as u64).to_le_bytes());
+    buf.extend_from_slice(data);
+    memoize(ctx, buf, w_obj);
+    Ok(())
 }
 
 /// `interp_pickle.py _batch_appends` (generic bin path). Single item →
