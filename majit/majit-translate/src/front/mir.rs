@@ -5130,7 +5130,10 @@ fn compute_index_write_extra_live(body: &Unstructured, llbc: &Llbc) -> Vec<Vec<u
         };
         index_call.insert(
             p as usize,
-            (operand_local(call.args.first()), operand_local(call.args.get(1))),
+            (
+                operand_local(call.args.first()),
+                operand_local(call.args.get(1)),
+            ),
         );
     }
     let mut extra = vec![Vec::new(); body.body.len()];

@@ -2645,15 +2645,30 @@ fn build_class_inner(
                     );
                 }
             }
+        } else if w_metaclass.is_some() {
+            // A custom metaclass receives the raw mapping unchanged (passed
+            // below) and owns its enumeration — `type.__new__` runs
+            // `PyMapping_Keys` itself.  The mapping must therefore not be
+            // walked here; only `__classcell__` is consumed locally, for the
+            // post-metaclass cell validation below, so lift just that one key
+            // via `space.getitem` rather than calling the mapping's `keys()`.
+            let w_cellkey = pyre_object::w_str_new("__classcell__");
+            match crate::baseobjspace::getitem(w_ns, w_cellkey) {
+                Ok(value) if !value.is_null() => {
+                    crate::dict_storage_store(class_ns, "__classcell__", value);
+                }
+                Ok(_) => {}
+                Err(e) if e.kind == crate::PyErrorKind::KeyError => {}
+                Err(e) => return Err(e),
+            }
         } else {
-            // Arbitrary non-dict mapping: enumerate via the mapping
-            // protocol's `keys()` (the `PyMapping_Keys` path `type.__new__`
-            // takes for a non-dict namespace) and read each value back via
-            // `space.getitem` so `__getitem__` overrides apply.  Using
-            // `keys()` rather than `iter()` keeps a mapping that implements
-            // the mapping protocol without `__iter__` working, matching
-            // `compiling.py:207` passing the namespace to the metaclass
-            // unchanged.
+            // Arbitrary non-dict mapping with the default metaclass: this path
+            // builds the type directly from `class_ns`, so materialize the
+            // whole namespace via the mapping protocol's `keys()` (the
+            // `PyMapping_Keys` path `type.__new__` takes for a non-dict
+            // namespace) and read each value back via `space.getitem` so
+            // `__getitem__` overrides apply.  `keys()` rather than `iter()`
+            // keeps a mapping without `__iter__` working.
             let keys_method = crate::baseobjspace::getattr_str(w_ns, "keys")?;
             let keys_obj = crate::call::call_function_impl_result(keys_method, &[])?;
             let keys = crate::builtins::collect_iterable(keys_obj)?;
