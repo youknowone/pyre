@@ -2547,6 +2547,34 @@ fn emit_frontend_setattr(
     );
 }
 
+/// STORE_ATTR — the residual counterpart of [`emit_frontend_getattr`].
+/// Records the 4-arg `store_attr(obj, value, code, name_idx)` HLOp (void
+/// result) that `flatten.rs::lower_setattr_hlop_to_insn` threads into the
+/// `bh_store_attr_fn(obj, value, code, name_idx)` residual.  Distinct from
+/// the bare `setattr` HLOp (an `is_pyre_canonical_elidable_hlop` rewritten
+/// to `setfield_gc`), so the generic attribute store survives lowering.
+fn emit_frontend_store_attr(
+    block: &super::flow::BlockRef,
+    obj: super::flow::FlowValue,
+    value: super::flow::FlowValue,
+    code_const: super::flow::FlowValue,
+    name_idx_const: super::flow::FlowValue,
+    offset: i64,
+) {
+    record_graph_op(
+        block,
+        "store_attr",
+        vec![
+            obj.into(),
+            value.into(),
+            code_const.into(),
+            name_idx_const.into(),
+        ],
+        None,
+        offset,
+    );
+}
+
 fn emit_frontend_getattr(
     graph: &mut super::flow::FunctionGraph,
     block: &super::flow::BlockRef,
@@ -3163,6 +3191,7 @@ struct FnPtrIndices {
     set_current_exception_fn: HelperHandle,
     load_attr_fn: HelperHandle,
     load_method_self_fn: HelperHandle,
+    store_attr_fn: HelperHandle,
 }
 
 /// Register every blackhole helper fn pointer with the assembler in
@@ -3379,6 +3408,14 @@ fn register_helper_fn_pointers(
     // Bound after the existing fn_ptrs to preserve their indices.
     let load_name_fn = bind(assembler, cpu.load_name_fn as *const (), CallFlavor::Plain);
     let store_name_fn = bind(assembler, cpu.store_name_fn as *const (), CallFlavor::Plain);
+    // `bh_store_attr_fn` calls `baseobjspace::setattr_str`, which can run
+    // user `__setattr__` (forces virtualizables) and raise → `MayForce`.
+    // Symmetric to `load_attr_fn`; appended last to preserve fn_ptr indices.
+    let store_attr_fn = bind(
+        assembler,
+        cpu.store_attr_fn as *const (),
+        CallFlavor::MayForce,
+    );
     FnPtrIndices {
         call_fn,
         load_global_fn,
@@ -3409,6 +3446,7 @@ fn register_helper_fn_pointers(
         set_current_exception_fn,
         load_attr_fn,
         load_method_self_fn,
+        store_attr_fn,
     }
 }
 
@@ -4315,6 +4353,11 @@ impl CodeWriter {
                     idx: load_method_self_fn_idx,
                     flavor: _load_method_self_fn_flavor,
                 },
+            store_attr_fn:
+                HelperHandle {
+                    idx: store_attr_fn_idx,
+                    flavor: _store_attr_fn_flavor,
+                },
         } = register_helper_fn_pointers(&mut assembler, self.cpu());
 
         // codewriter.py:37 `portal_jd = self.callcontrol.jitdriver_sd_from_portal_graph(graph)`
@@ -4376,6 +4419,7 @@ impl CodeWriter {
                 ],
                 load_attr_fn_idx,
                 load_method_self_fn_idx,
+                store_attr_fn_idx,
             });
         }
 
@@ -7384,23 +7428,35 @@ impl CodeWriter {
                         }
                         Instruction::StoreAttr { namei } => {
                             let name_idx = namei.get(op_arg) as usize;
-                            let attr_name =
-                                super::flow::Constant::string(code.names[name_idx].as_str());
+                            // rtyper-surrogate operands threaded into the
+                            // `bh_store_attr_fn(obj, value, code, name_idx)`
+                            // residual, identical to the LoadAttr arm: the
+                            // jitcode's own W_CodeObject as a post-rtype
+                            // `Signed(ptr) + Kind::Ref` constant and the
+                            // `co_names` index the helper resolves the name
+                            // with.
+                            let code_const: super::flow::FlowValue =
+                                super::flow::Constant::new(
+                                    super::flow::ConstantValue::Signed(w_code as i64),
+                                    Some(Kind::Ref),
+                                )
+                                .into();
+                            let name_idx_const: super::flow::FlowValue =
+                                super::flow::Constant::signed(name_idx as i64).into();
                             current_depth = current_depth.saturating_sub(1);
                             emit_vsd!(current_depth, py_pc);
                             let obj_value = pop_ref_or_fresh(&mut current_state, &mut graph);
                             current_depth = current_depth.saturating_sub(1);
                             emit_vsd!(current_depth, py_pc);
                             let stored_value = pop_ref_or_fresh(&mut current_state, &mut graph);
-                            emit_frontend_setattr(
-                                &mut graph,
+                            emit_frontend_store_attr(
                                 &current_block.block(),
                                 obj_value,
-                                attr_name.into(),
                                 stored_value,
+                                code_const,
+                                name_idx_const,
                                 py_pc as i64,
                             );
-                            emit_abort_permanent!(py_pc);
                         }
                         Instruction::LoadAttr { namei } => {
                             // LOAD_ATTR net-0 (plain form); the CPython-3.13

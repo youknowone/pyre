@@ -3370,6 +3370,39 @@ pub extern "C" fn bh_load_attr_fn(obj: i64, w_code_ptr: i64, name_idx: i64) -> i
     }
 }
 
+/// STORE_ATTR residual (`store_attr` HLOp → `residual_call_ir_v`).  The
+/// symmetric counterpart of [`bh_load_attr_fn`]: resolves the attribute
+/// name from the resume frame's code object via `name_idx` and runs the
+/// generic `setattr_str` (may invoke user `__setattr__` → `MayForce`).
+/// Void result, so always returns 0; an exception is published through
+/// `BH_LAST_EXC_VALUE` for the trailing `GuardNoException`.
+pub extern "C" fn bh_store_attr_fn(obj: i64, value: i64, w_code_ptr: i64, name_idx: i64) -> i64 {
+    let code = unsafe {
+        &*(pyre_interpreter::w_code_get_ptr(w_code_ptr as pyre_object::PyObjectRef)
+            as *const pyre_interpreter::CodeObject)
+    };
+    // Same `co_names`-index codegen invariant as `bh_load_attr_fn`.
+    let idx = name_idx as usize;
+    debug_assert!(
+        idx < code.names.len(),
+        "bh_store_attr_fn name_idx {idx} out of range ({} names) — codegen invariant",
+        code.names.len()
+    );
+    if idx >= code.names.len() {
+        return 0;
+    }
+    let name = code.names[idx].as_ref();
+    if let Err(err) = pyre_interpreter::baseobjspace::setattr_str(
+        obj as pyre_object::PyObjectRef,
+        name,
+        value as pyre_object::PyObjectRef,
+    ) {
+        let exc_obj = err.to_exc_object();
+        majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc_obj as i64));
+    }
+    0
+}
+
 /// Compute the LOOKUP_METHOD `null_or_self` for blackhole LOAD_ATTR resume,
 /// given the already-resolved `attr` from [`bh_load_attr_fn`].  Delegates to
 /// the shared `compute_load_method_bound`, a pure MRO inspection that never

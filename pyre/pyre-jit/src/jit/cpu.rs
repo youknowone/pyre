@@ -51,6 +51,9 @@ pub struct Cpu {
     /// LOOKUP_METHOD `null_or_self` half — `(obj, attr, code, name_idx) →
     /// bound`. Pure binding decision shared with the interpreter.
     pub load_method_self_fn: extern "C" fn(i64, i64, i64, i64) -> i64,
+    /// STORE_ATTR residual — `(obj, value, code, name_idx) → void`.
+    /// Resolves the name from the code object and runs generic `setattr`.
+    pub store_attr_fn: extern "C" fn(i64, i64, i64, i64) -> i64,
     /// `bhimpl_compare_op` — RPython compare_op opcodes.
     pub compare_fn: extern "C" fn(i64, i64, i64) -> i64,
     /// `bhimpl_binary_op` — RPython binary_op opcodes.
@@ -175,6 +178,7 @@ impl Cpu {
             load_global_fn: crate::call_jit::bh_load_global_fn,
             load_attr_fn: crate::call_jit::bh_load_attr_fn,
             load_method_self_fn: crate::call_jit::bh_load_method_self_fn,
+            store_attr_fn: crate::call_jit::bh_store_attr_fn,
             compare_fn: crate::call_jit::bh_compare_fn,
             binary_op_fn: crate::call_jit::bh_binary_op_fn,
             box_int_fn: crate::call_jit::bh_box_int_fn,

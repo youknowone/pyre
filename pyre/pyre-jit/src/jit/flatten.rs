@@ -3202,6 +3202,16 @@ pub struct LoweringContext {
     /// `compute_load_method_bound` binding decision (reads the type
     /// MRO, never raises → `PlainCannotRaise`).
     pub load_method_self_fn_idx: u16,
+    /// `store_attr_fn` descrs-pool index — see codewriter.rs
+    /// `register_helper_fn_pointers` for the production source
+    /// (`bind(assembler, cpu.store_attr_fn, CallFlavor::MayForce)`).
+    /// STORE_ATTR family (HLOp opname `store_attr`) lowers to
+    /// `residual_call_ir_v(ConstInt(fn_idx), ListI([name_idx]),
+    /// ListR([obj, value, code]), Descr)` (void result) via
+    /// [`lower_setattr_hlop_to_insn`]; `bh_store_attr_fn(obj, value,
+    /// code, name_idx)` resolves the name through the code object and
+    /// runs `setattr` (may invoke user `__setattr__` → `MayForce`).
+    pub store_attr_fn_idx: u16,
 }
 
 /// Map a BINARY_OP HLOp opname (`add`/.../`xor`/`getitem` plus the
@@ -4596,6 +4606,9 @@ where
     if let Some(insn) = lower_load_method_self_hlop_to_insn(op, ctx, get_register, lower_constant) {
         return Some(insn);
     }
+    if let Some(insn) = lower_setattr_hlop_to_insn(op, ctx, get_register, lower_constant) {
+        return Some(insn);
+    }
     None
 }
 
@@ -4691,6 +4704,54 @@ where
             descr_operand,
         ],
         dst_reg,
+    ))
+}
+
+/// Lower the STORE_ATTR pyre HLOp `store_attr(obj, value, code,
+/// name_idx)` → void — the residual counterpart of
+/// [`lower_getattr_hlop_to_insn`] — to `residual_call_ir_v(
+/// ConstInt(store_attr_fn_idx), ListI([name_idx]), ListR([obj, value,
+/// code]), Descr)`.  `bh_store_attr_fn(obj, value, code, name_idx)`
+/// resolves the name through the code object and runs the generic
+/// `setattr` (may invoke user `__setattr__` → `MayForce`).  Void result,
+/// so the Insn carries no trailing result Register.
+///
+/// Returns `None` for non-`store_attr` opnames so the caller can fall
+/// through to other lowering arms.
+pub fn lower_setattr_hlop_to_insn<F, LC>(
+    op: &super::flow::SpaceOperation,
+    ctx: &LoweringContext,
+    get_register: &mut F,
+    lower_constant: &mut LC,
+) -> Option<Insn>
+where
+    F: FnMut(super::flow::Variable) -> Register,
+    LC: FnMut(&Constant) -> Operand,
+{
+    if op.opname != "store_attr" || op.args.len() != 4 {
+        return None;
+    }
+    let obj = operand_for_value_arg(&op.args[0], get_register, lower_constant)?;
+    let value = operand_for_value_arg(&op.args[1], get_register, lower_constant)?;
+    let code = operand_for_value_arg(&op.args[2], get_register, lower_constant)?;
+    let name_idx = const_int_for_value_arg(&op.args[3])?;
+    let effect_info = effect_info_for_call_flavor(CallFlavor::MayForce);
+    let descr_operand = Operand::descr(DescrOperand::CallDescrStub(CallDescrStub {
+        effect_info,
+        arg_kinds: vec![Kind::Ref, Kind::Ref, Kind::Ref, Kind::Int],
+        result_kind: None,
+    }));
+    Some(Insn::op(
+        "residual_call_ir_v",
+        vec![
+            Operand::ConstInt(ctx.store_attr_fn_idx as i64),
+            Operand::ListOfKind(ListOfKind::new(
+                Kind::Int,
+                vec![Operand::ConstInt(name_idx)],
+            )),
+            Operand::ListOfKind(ListOfKind::new(Kind::Ref, vec![obj, value, code])),
+            descr_operand,
+        ],
     ))
 }
 
@@ -6095,7 +6156,8 @@ mod tests {
             call_fn_idx_by_nargs: [0; 9],
             load_attr_fn_idx: 0,
             load_method_self_fn_idx: 0,
-        };
+            store_attr_fn_idx: 0,
+};
         let mut on = SSARepr::new("setattr_on");
         let mut on_regallocs = make_regallocs();
         let mut on_flat =
@@ -6231,7 +6293,8 @@ mod tests {
             call_fn_idx_by_nargs: [0; 9],
             load_attr_fn_idx: 0,
             load_method_self_fn_idx: 0,
-        };
+            store_attr_fn_idx: 0,
+};
 
         let mut ssarepr = SSARepr::new("retired_families");
         flatten_graph_for_test_with_lowering(&graph, &mut ssarepr, ctx, None);
@@ -6354,7 +6417,8 @@ mod tests {
             call_fn_idx_by_nargs: [0; 9],
             load_attr_fn_idx: 0,
             load_method_self_fn_idx: 0,
-        };
+            store_attr_fn_idx: 0,
+};
 
         let mut ssarepr = SSARepr::new("trailing_live");
         flatten_graph_for_test_with_lowering(&graph, &mut ssarepr, ctx, None);
@@ -6440,7 +6504,8 @@ mod tests {
             call_fn_idx_by_nargs: [0; 9],
             load_attr_fn_idx: 0,
             load_method_self_fn_idx: 0,
-        };
+            store_attr_fn_idx: 0,
+};
 
         let mut ssarepr = SSARepr::new("multi_block_lowering");
         flatten_graph_for_test_with_lowering(&graph, &mut ssarepr, ctx, None);
@@ -6570,7 +6635,8 @@ mod tests {
             call_fn_idx_by_nargs: [0; 9],
             load_attr_fn_idx: 0,
             load_method_self_fn_idx: 0,
-        };
+            store_attr_fn_idx: 0,
+};
 
         let mut ssarepr = SSARepr::new("pyre_walker_2exit");
         flatten_graph_for_test_with_lowering(&graph, &mut ssarepr, ctx, None);
@@ -6745,7 +6811,8 @@ mod tests {
             call_fn_idx_by_nargs: [0; 9],
             load_attr_fn_idx: 0,
             load_method_self_fn_idx: 0,
-        });
+            store_attr_fn_idx: 0,
+});
 
         let mut regallocs = perform_register_allocation_all_kinds(&graph);
         let ssarepr = super::flatten_graph(&graph, &mut regallocs, false, Some(&cpu));
@@ -6969,7 +7036,8 @@ mod tests {
             call_fn_idx_by_nargs: [0; 9],
             load_attr_fn_idx: 0,
             load_method_self_fn_idx: 0,
-        };
+            store_attr_fn_idx: 0,
+};
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
 
@@ -7059,7 +7127,8 @@ mod tests {
             call_fn_idx_by_nargs: [0; 9],
             load_attr_fn_idx: 0,
             load_method_self_fn_idx: 0,
-        };
+            store_attr_fn_idx: 0,
+};
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
         assert!(
@@ -7093,7 +7162,8 @@ mod tests {
             call_fn_idx_by_nargs: [0; 9],
             load_attr_fn_idx: 0,
             load_method_self_fn_idx: 0,
-        };
+            store_attr_fn_idx: 0,
+};
 
         let hlop = SpaceOperation::new("sub", vec![lhs.into(), rhs.into()], Some(result.into()), 0);
         let mut get_register = identity_register_mapper();
@@ -7200,7 +7270,8 @@ mod tests {
             call_fn_idx_by_nargs: [0; 9],
             load_attr_fn_idx: 0,
             load_method_self_fn_idx: 0,
-        };
+            store_attr_fn_idx: 0,
+};
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
 
@@ -7266,7 +7337,8 @@ mod tests {
             call_fn_idx_by_nargs: [0; 9],
             load_attr_fn_idx: 0,
             load_method_self_fn_idx: 0,
-        };
+            store_attr_fn_idx: 0,
+};
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
         assert!(
@@ -7298,7 +7370,8 @@ mod tests {
             call_fn_idx_by_nargs: [0; 9],
             load_attr_fn_idx: 0,
             load_method_self_fn_idx: 0,
-        };
+            store_attr_fn_idx: 0,
+};
         let hlop = SpaceOperation::new("eq", vec![lhs.into(), rhs.into()], Some(result.into()), 0);
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -7337,7 +7410,8 @@ mod tests {
             call_fn_idx_by_nargs: [0; 9],
             load_attr_fn_idx: 0,
             load_method_self_fn_idx: 0,
-        };
+            store_attr_fn_idx: 0,
+};
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
 
@@ -7403,7 +7477,8 @@ mod tests {
             call_fn_idx_by_nargs: [0; 9],
             load_attr_fn_idx: 0,
             load_method_self_fn_idx: 0,
-        };
+            store_attr_fn_idx: 0,
+};
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
         assert!(
@@ -7432,7 +7507,8 @@ mod tests {
             call_fn_idx_by_nargs: [0; 9],
             load_attr_fn_idx: 0,
             load_method_self_fn_idx: 0,
-        };
+            store_attr_fn_idx: 0,
+};
         let hlop = SpaceOperation::new("bool", vec![cond.into()], Some(result.into()), 0);
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -7475,7 +7551,8 @@ mod tests {
             call_fn_idx_by_nargs: [0; 9],
             load_attr_fn_idx: 0,
             load_method_self_fn_idx: 0,
-        };
+            store_attr_fn_idx: 0,
+};
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
 
@@ -7534,7 +7611,8 @@ mod tests {
             call_fn_idx_by_nargs: [0; 9],
             load_attr_fn_idx: 0,
             load_method_self_fn_idx: 0,
-        };
+            store_attr_fn_idx: 0,
+};
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
         assert!(
@@ -7578,7 +7656,8 @@ mod tests {
             call_fn_idx_by_nargs: [0; 9],
             load_attr_fn_idx: 0,
             load_method_self_fn_idx: 0,
-        };
+            store_attr_fn_idx: 0,
+};
         let hlop = SpaceOperation::new(
             "setitem",
             vec![obj.into(), key.into(), value.into()],
@@ -7637,7 +7716,8 @@ mod tests {
             call_fn_idx_by_nargs: [0; 9],
             load_attr_fn_idx: 0,
             load_method_self_fn_idx: 0,
-        };
+            store_attr_fn_idx: 0,
+};
         let mut get_register_a = identity_register_mapper();
         let mut get_register_b = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -7672,7 +7752,8 @@ mod tests {
             call_fn_idx_by_nargs: [0; 9],
             load_attr_fn_idx: 0,
             load_method_self_fn_idx: 0,
-        };
+            store_attr_fn_idx: 0,
+};
         let mut get_register_a = identity_register_mapper();
         let mut get_register_b = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -7707,7 +7788,8 @@ mod tests {
             call_fn_idx_by_nargs: [0; 9],
             load_attr_fn_idx: 0,
             load_method_self_fn_idx: 0,
-        };
+            store_attr_fn_idx: 0,
+};
         let mut get_register_a = identity_register_mapper();
         let mut get_register_b = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -7747,7 +7829,8 @@ mod tests {
             call_fn_idx_by_nargs: [0; 9],
             load_attr_fn_idx: 0,
             load_method_self_fn_idx: 0,
-        };
+            store_attr_fn_idx: 0,
+};
         let mut get_register_a = identity_register_mapper();
         let mut get_register_b = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -7801,7 +7884,8 @@ mod tests {
             call_fn_idx_by_nargs: [0; 9],
             load_attr_fn_idx: 0,
             load_method_self_fn_idx: 0,
-        };
+            store_attr_fn_idx: 0,
+};
         let mut get_register_a = identity_register_mapper();
         let mut get_register_b = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -9178,7 +9262,8 @@ mod tests {
             call_fn_idx_by_nargs: [0; 9],
             load_attr_fn_idx: 0,
             load_method_self_fn_idx: 0,
-        };
+            store_attr_fn_idx: 0,
+};
         flatten_graph_for_test_with_lowering(&graph, &mut ssarepr, ctx, Some(cpu));
         ssarepr
     }
@@ -9454,7 +9539,8 @@ mod tests {
             call_fn_idx_by_nargs,
             load_attr_fn_idx: 0,
             load_method_self_fn_idx: 0,
-        };
+            store_attr_fn_idx: 0,
+};
         let null_or_self_var = Variable::new(VariableId(10), Kind::Ref);
         let op = super::super::flow::SpaceOperation::new(
             "simple_call",
@@ -9553,6 +9639,7 @@ mod tests {
             load_method_self_fn_idx: 92,
             load_name_fn_idx: 93,
             store_name_fn_idx: 94,
+            store_attr_fn_idx: 95,
         };
         let code_const = Constant::new(
             super::super::flow::ConstantValue::Signed(0x2000),
@@ -9673,6 +9760,87 @@ mod tests {
             super::lower_getattr_hlop_to_insn(&op, &ctx, &mut get_register, &mut lower_constant)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn lower_setattr_hlop_emits_store_attr_fn_residual() {
+        // `store_attr(obj, value, code, name_idx)` →
+        // `residual_call_ir_v(ConstInt(store_attr_fn_idx),
+        // ListI([name_idx]), ListR([obj, value, code]), Descr)` — void
+        // result, the [`lower_setattr_hlop_to_insn`] shape.
+        let obj_var = Variable::new(VariableId(8), Kind::Ref);
+        let value_var = Variable::new(VariableId(10), Kind::Ref);
+        let (ctx, code_const, name_idx_const) = load_attr_lowering_fixture();
+        let op = super::super::flow::SpaceOperation::new(
+            "store_attr",
+            vec![
+                obj_var.into(),
+                value_var.into(),
+                code_const.into(),
+                name_idx_const.into(),
+            ],
+            None,
+            0,
+        );
+        let mut get_register = |var: Variable| match var.id {
+            VariableId(8) => Register {
+                kind: Kind::Ref,
+                index: 101,
+            },
+            VariableId(10) => Register {
+                kind: Kind::Ref,
+                index: 103,
+            },
+            _ => panic!("unexpected var id {:?}", var.id),
+        };
+        let mut lower_constant = super::flatten_constant_operand_for_test;
+        let insn =
+            super::lower_setattr_hlop_to_insn(&op, &ctx, &mut get_register, &mut lower_constant)
+                .expect("4-arg store_attr lowering must succeed");
+        match insn {
+            Insn::Op {
+                opname,
+                args,
+                result,
+            } => {
+                assert_eq!(opname, "residual_call_ir_v");
+                assert!(
+                    matches!(args[0], Operand::ConstInt(95)),
+                    "store_attr_fn pool index, got {:?}",
+                    args[0]
+                );
+                match &args[1] {
+                    Operand::ListOfKind(list) => {
+                        assert_eq!(list.kind, Kind::Int);
+                        assert!(
+                            matches!(&list.content[..], [Operand::ConstInt(5)]),
+                            "ListI = [name_idx], got {:?}",
+                            list.content
+                        );
+                    }
+                    other => panic!("expected ListI, got {other:?}"),
+                }
+                match &args[2] {
+                    Operand::ListOfKind(list) => {
+                        assert_eq!(list.kind, Kind::Ref);
+                        match &list.content[..] {
+                            [
+                                Operand::Register(obj),
+                                Operand::Register(val),
+                                Operand::ConstRef(0x2000),
+                            ] => {
+                                assert_eq!(obj.index, 101, "ListR[0] must be obj");
+                                assert_eq!(val.index, 103, "ListR[1] must be value");
+                            }
+                            other => panic!("ListR must be [obj, value, code], got {other:?}"),
+                        }
+                    }
+                    other => panic!("expected ListR, got {other:?}"),
+                }
+                assert_eq!(result, None, "STORE_ATTR is void — no result register");
+            }
+            _ => panic!("expected Insn::Op, got {insn:?}"),
+        }
     }
 
     #[test]
