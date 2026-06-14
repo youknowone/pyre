@@ -7908,16 +7908,18 @@ impl CodeWriter {
                             // (which has no RERAISE bytecode — its
                             // `Reraise.nomoreblocks` calls reraise
                             // directly into the exception link).
-                            // Suppress catch_exception adjacency:
-                            // RERAISE's source FrameState has had
-                            // POP_EXCEPT mutate the stack, which
-                            // makes the catch-landing union path
+                            // Attach the byte-adjacent catch when this
+                            // RERAISE PC is itself inside an outer
+                            // exception_table range: `emit_raise!` only
+                            // emits the catch when `catch_for_pc[py_pc]`
+                            // is Some, otherwise it falls through to
+                            // `exceptblock`. The catch-landing union path
                             // (`attach_catch_exception_edge` →
-                            // `getoutputargs_with_positions`)
-                            // mismatched against the explicit-raise
-                            // shape that earlier raise sites already
-                            // populated into the same landing.
-                            emit_raise!(exc_reg, exc_value, py_pc as i64, false);
+                            // `handler_entry_state_from_catch_site`)
+                            // reshapes the POP_EXCEPT-mutated source stack
+                            // to the handler try-level, so the landing no
+                            // longer mismatches the explicit-raise shape.
+                            emit_raise!(exc_reg, exc_value, py_pc as i64, true);
                         }
 
                         Instruction::WithExceptStart => {
