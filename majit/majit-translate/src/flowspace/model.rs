@@ -2093,6 +2093,63 @@ impl HostEnv {
         // `copy_nonoverlapping` members before the `mods.insert` below.
         std_ptr.module_set("null", HostObject::new_builtin_callable("std.ptr.null"));
 
+        // `std::mem::size_of` / `align_of` re-export `core::mem::*`;
+        // monomorphised LLBC spells the canonical `["core", "mem", _]`
+        // form (same std→core normalisation as `core.ptr` above).  Bind
+        // `core.mem` to the SAME `std.mem` callables so the size_of /
+        // align_of analyzers (keyed by `HostObject` Arc identity) apply.
+        let core_mem = HostObject::new_module("core.mem");
+        core_mem.module_set(
+            "size_of",
+            std_mem.module_get("size_of").expect("std.mem.size_of bound above"),
+        );
+        core_mem.module_set(
+            "align_of",
+            std_mem.module_get("align_of").expect("std.mem.align_of bound above"),
+        );
+
+        // Container / bigint ctors reach the adapter spelled with their
+        // DEFINING crate's canonical module path (`vec::Vec`,
+        // `bigint::BigInt`, `boxed::Box`, and IndexMap's internal `map`
+        // module), not the type-name / re-export shape registered above
+        // (`Vec`, `BigInt`, `Box`, `indexmap.IndexMap`).  Branch 3b joins
+        // `segments[..len-1]` with `.`, so the crate-qualified module key
+        // must exist for resolution.  Reuse the existing analyzer-less
+        // callables where present; mint fresh ones for the methods not
+        // yet surfaced (`with_capacity` / `zero` / `new_uninit`).
+        let vec_crate = HostObject::new_module("vec.Vec");
+        vec_crate.module_set("new", vec_ty.module_get("new").expect("Vec.new bound above"));
+        vec_crate.module_set(
+            "with_capacity",
+            HostObject::new_builtin_callable("vec.Vec.with_capacity"),
+        );
+        let bigint_crate = HostObject::new_module("bigint.BigInt");
+        bigint_crate.module_set(
+            "from",
+            bigint.module_get("from").expect("BigInt.from bound above"),
+        );
+        bigint_crate.module_set(
+            "zero",
+            HostObject::new_builtin_callable("bigint.BigInt.zero"),
+        );
+        let boxed_crate = HostObject::new_module("boxed.Box");
+        boxed_crate.module_set("new", box_ty.module_get("new").expect("Box.new bound above"));
+        boxed_crate.module_set(
+            "into_raw",
+            box_ty.module_get("into_raw").expect("Box.into_raw bound above"),
+        );
+        boxed_crate.module_set(
+            "new_uninit",
+            HostObject::new_builtin_callable("boxed.Box.new_uninit"),
+        );
+        let map_indexmap = HostObject::new_module("map.IndexMap");
+        map_indexmap.module_set(
+            "new",
+            indexmap_indexmap
+                .module_get("new")
+                .expect("indexmap.IndexMap.new bound above"),
+        );
+
         // `pub const PY_NULL: PyObjectRef = std::ptr::null_mut()`
         // (`pyre_object::pyobject::PY_NULL`).  Charon emits the const
         // read as a Global place; `front::mir` lowers an unknown global
@@ -2125,6 +2182,11 @@ impl HostEnv {
         mods.insert("rpython.rtyper.lltypesystem.llmemory".into(), llmemory);
         mods.insert("weakref".into(), weakref_mod);
         mods.insert("core.ptr".into(), core_ptr);
+        mods.insert("core.mem".into(), core_mem);
+        mods.insert("vec.Vec".into(), vec_crate);
+        mods.insert("bigint.BigInt".into(), bigint_crate);
+        mods.insert("boxed.Box".into(), boxed_crate);
+        mods.insert("map.IndexMap".into(), map_indexmap);
         mods.insert("std.ptr".into(), std_ptr);
         mods.insert("std.mem".into(), std_mem);
         mods.insert("std.alloc".into(), std_alloc);
