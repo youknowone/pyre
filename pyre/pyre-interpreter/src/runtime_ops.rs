@@ -529,6 +529,39 @@ pub fn build_set_from_refs(items: &[PyObjectRef]) -> Result<PyObjectRef, crate::
     crate::builtins::builtin_set_from_items(items)
 }
 
+/// BUILD_STRING evaluation, shared by the interpreter (`build_string`) and
+/// the JIT residual (`bh_build_string_from_array`): concatenates `parts`
+/// (already-stringified f-string fragments, in bottom-to-top order) into a
+/// single `str`.  Each fragment is a `str` by construction (FORMAT_SIMPLE /
+/// FORMAT_WITH_SPEC / CONVERT_VALUE ran first); the `bool` / `int` / `None`
+/// / `<object>` arms are defensive rendering, so this never runs user code
+/// and is infallible.
+pub fn build_string_from_refs(parts: &[PyObjectRef]) -> PyObjectRef {
+    let mut result = rustpython_wtf8::Wtf8Buf::new();
+    for part in parts {
+        unsafe {
+            if pyre_object::is_str(*part) {
+                result.push_wtf8(pyre_object::w_str_get_wtf8(*part));
+            } else if pyre_object::is_bool(*part) {
+                // `is_int` is true for a bool, so test `is_bool` first; a
+                // bool renders "True"/"False", not its int value.
+                result.push_str(if pyre_object::w_bool_get_value(*part) {
+                    "True"
+                } else {
+                    "False"
+                });
+            } else if pyre_object::is_int(*part) {
+                result.push_str(&pyre_object::w_int_get_value(*part).to_string());
+            } else if pyre_object::is_none(*part) {
+                result.push_str("None");
+            } else {
+                result.push_str("<object>");
+            }
+        }
+    }
+    pyre_object::w_str_from_wtf8(result)
+}
+
 /// FORMAT_SIMPLE / FORMAT_WITH_SPEC evaluation, shared by the interpreter
 /// (`format_simple` / `format_with_spec`) and the JIT residuals
 /// (`bh_format_simple_fn` / `bh_format_with_spec_fn`).  Formats `value`

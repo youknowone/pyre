@@ -3257,6 +3257,15 @@ pub struct LoweringContext {
     /// [`lower_tuple_build_hlop_to_insn`]; `bh_build_set_from_array` builds the
     /// set (element hashing may run user `__hash__` / raise → `MayForce`).
     pub build_set_from_array_fn_idx: u16,
+    /// `build_string_from_array_fn` descrs-pool index — see codewriter.rs
+    /// `register_helper_fn_pointers` (`bind(assembler,
+    /// cpu.build_string_from_array_fn, CallFlavor::Plain)`).  BUILD_STRING
+    /// records the same `new_array_clear` + unrolled `setarrayitem_gc_r`
+    /// fragment array, then the `build_string_from_array(array)` HLOp lowers
+    /// to `residual_call_r_r(ConstInt(fn_idx), ListR([array]), Descr) → reg`
+    /// via [`lower_tuple_build_hlop_to_insn`]; `bh_build_string_from_array`
+    /// concatenates already-formatted fragments (no user code → `Plain`).
+    pub build_string_from_array_fn_idx: u16,
     /// `format_simple_fn` descrs-pool index — see codewriter.rs
     /// `register_helper_fn_pointers` (`bind(assembler, cpu.format_simple_fn,
     /// CallFlavor::MayForce)`).  FORMAT_SIMPLE records the `format_simple(value)`
@@ -4080,6 +4089,27 @@ where
                 ctx.build_set_from_array_fn_idx,
                 vec![array_operand],
                 CallFlavor::MayForce,
+                majit_ir::PyreHelperKind::None,
+                dst_reg,
+            ))
+        }
+        "build_string_from_array" => {
+            if op.args.len() != 1 {
+                return None;
+            }
+            let array_operand =
+                flatten_arg_with_lowering(&op.args[0], get_register, lower_constant);
+            let dst_reg = match &op.result {
+                Some(super::flow::FlowValue::Variable(var)) => get_register(*var),
+                _ => return None,
+            };
+            // String concatenation over already-formatted fragments runs no
+            // user code (no `__str__` dispatch — FORMAT_* / CONVERT_VALUE ran
+            // first) → `Plain`, like the allocation-only `newtuple_from_array`.
+            Some(build_residual_call_r_r_insn_from_operands(
+                ctx.build_string_from_array_fn_idx,
+                vec![array_operand],
+                CallFlavor::Plain,
                 majit_ir::PyreHelperKind::None,
                 dst_reg,
             ))
@@ -6477,6 +6507,7 @@ mod tests {
             delete_subscr_fn_idx: 0,
             delete_attr_fn_idx: 0,
             build_set_from_array_fn_idx: 0,
+            build_string_from_array_fn_idx: 0,
             format_simple_fn_idx: 0,
             format_with_spec_fn_idx: 0,
 };
@@ -6621,6 +6652,7 @@ mod tests {
             delete_subscr_fn_idx: 0,
             delete_attr_fn_idx: 0,
             build_set_from_array_fn_idx: 0,
+            build_string_from_array_fn_idx: 0,
             format_simple_fn_idx: 0,
             format_with_spec_fn_idx: 0,
 };
@@ -6752,6 +6784,7 @@ mod tests {
             delete_subscr_fn_idx: 0,
             delete_attr_fn_idx: 0,
             build_set_from_array_fn_idx: 0,
+            build_string_from_array_fn_idx: 0,
             format_simple_fn_idx: 0,
             format_with_spec_fn_idx: 0,
 };
@@ -6846,6 +6879,7 @@ mod tests {
             delete_subscr_fn_idx: 0,
             delete_attr_fn_idx: 0,
             build_set_from_array_fn_idx: 0,
+            build_string_from_array_fn_idx: 0,
             format_simple_fn_idx: 0,
             format_with_spec_fn_idx: 0,
 };
@@ -6984,6 +7018,7 @@ mod tests {
             delete_subscr_fn_idx: 0,
             delete_attr_fn_idx: 0,
             build_set_from_array_fn_idx: 0,
+            build_string_from_array_fn_idx: 0,
             format_simple_fn_idx: 0,
             format_with_spec_fn_idx: 0,
 };
@@ -7167,6 +7202,7 @@ mod tests {
             delete_subscr_fn_idx: 0,
             delete_attr_fn_idx: 0,
             build_set_from_array_fn_idx: 0,
+            build_string_from_array_fn_idx: 0,
             format_simple_fn_idx: 0,
             format_with_spec_fn_idx: 0,
 });
@@ -7399,6 +7435,7 @@ mod tests {
             delete_subscr_fn_idx: 0,
             delete_attr_fn_idx: 0,
             build_set_from_array_fn_idx: 0,
+            build_string_from_array_fn_idx: 0,
             format_simple_fn_idx: 0,
             format_with_spec_fn_idx: 0,
 };
@@ -7497,6 +7534,7 @@ mod tests {
             delete_subscr_fn_idx: 0,
             delete_attr_fn_idx: 0,
             build_set_from_array_fn_idx: 0,
+            build_string_from_array_fn_idx: 0,
             format_simple_fn_idx: 0,
             format_with_spec_fn_idx: 0,
 };
@@ -7539,6 +7577,7 @@ mod tests {
             delete_subscr_fn_idx: 0,
             delete_attr_fn_idx: 0,
             build_set_from_array_fn_idx: 0,
+            build_string_from_array_fn_idx: 0,
             format_simple_fn_idx: 0,
             format_with_spec_fn_idx: 0,
 };
@@ -7654,6 +7693,7 @@ mod tests {
             delete_subscr_fn_idx: 0,
             delete_attr_fn_idx: 0,
             build_set_from_array_fn_idx: 0,
+            build_string_from_array_fn_idx: 0,
             format_simple_fn_idx: 0,
             format_with_spec_fn_idx: 0,
 };
@@ -7728,6 +7768,7 @@ mod tests {
             delete_subscr_fn_idx: 0,
             delete_attr_fn_idx: 0,
             build_set_from_array_fn_idx: 0,
+            build_string_from_array_fn_idx: 0,
             format_simple_fn_idx: 0,
             format_with_spec_fn_idx: 0,
 };
@@ -7768,6 +7809,7 @@ mod tests {
             delete_subscr_fn_idx: 0,
             delete_attr_fn_idx: 0,
             build_set_from_array_fn_idx: 0,
+            build_string_from_array_fn_idx: 0,
             format_simple_fn_idx: 0,
             format_with_spec_fn_idx: 0,
 };
@@ -7815,6 +7857,7 @@ mod tests {
             delete_subscr_fn_idx: 0,
             delete_attr_fn_idx: 0,
             build_set_from_array_fn_idx: 0,
+            build_string_from_array_fn_idx: 0,
             format_simple_fn_idx: 0,
             format_with_spec_fn_idx: 0,
 };
@@ -7889,6 +7932,7 @@ mod tests {
             delete_subscr_fn_idx: 0,
             delete_attr_fn_idx: 0,
             build_set_from_array_fn_idx: 0,
+            build_string_from_array_fn_idx: 0,
             format_simple_fn_idx: 0,
             format_with_spec_fn_idx: 0,
 };
@@ -7926,6 +7970,7 @@ mod tests {
             delete_subscr_fn_idx: 0,
             delete_attr_fn_idx: 0,
             build_set_from_array_fn_idx: 0,
+            build_string_from_array_fn_idx: 0,
             format_simple_fn_idx: 0,
             format_with_spec_fn_idx: 0,
 };
@@ -7977,6 +8022,7 @@ mod tests {
             delete_subscr_fn_idx: 0,
             delete_attr_fn_idx: 0,
             build_set_from_array_fn_idx: 0,
+            build_string_from_array_fn_idx: 0,
             format_simple_fn_idx: 0,
             format_with_spec_fn_idx: 0,
 };
@@ -8044,6 +8090,7 @@ mod tests {
             delete_subscr_fn_idx: 0,
             delete_attr_fn_idx: 0,
             build_set_from_array_fn_idx: 0,
+            build_string_from_array_fn_idx: 0,
             format_simple_fn_idx: 0,
             format_with_spec_fn_idx: 0,
 };
@@ -8096,6 +8143,7 @@ mod tests {
             delete_subscr_fn_idx: 0,
             delete_attr_fn_idx: 0,
             build_set_from_array_fn_idx: 0,
+            build_string_from_array_fn_idx: 0,
             format_simple_fn_idx: 0,
             format_with_spec_fn_idx: 0,
 };
@@ -8163,6 +8211,7 @@ mod tests {
             delete_subscr_fn_idx: 0,
             delete_attr_fn_idx: 0,
             build_set_from_array_fn_idx: 0,
+            build_string_from_array_fn_idx: 0,
             format_simple_fn_idx: 0,
             format_with_spec_fn_idx: 0,
 };
@@ -8206,6 +8255,7 @@ mod tests {
             delete_subscr_fn_idx: 0,
             delete_attr_fn_idx: 0,
             build_set_from_array_fn_idx: 0,
+            build_string_from_array_fn_idx: 0,
             format_simple_fn_idx: 0,
             format_with_spec_fn_idx: 0,
 };
@@ -8249,6 +8299,7 @@ mod tests {
             delete_subscr_fn_idx: 0,
             delete_attr_fn_idx: 0,
             build_set_from_array_fn_idx: 0,
+            build_string_from_array_fn_idx: 0,
             format_simple_fn_idx: 0,
             format_with_spec_fn_idx: 0,
 };
@@ -8297,6 +8348,7 @@ mod tests {
             delete_subscr_fn_idx: 0,
             delete_attr_fn_idx: 0,
             build_set_from_array_fn_idx: 0,
+            build_string_from_array_fn_idx: 0,
             format_simple_fn_idx: 0,
             format_with_spec_fn_idx: 0,
 };
@@ -8359,6 +8411,7 @@ mod tests {
             delete_subscr_fn_idx: 0,
             delete_attr_fn_idx: 0,
             build_set_from_array_fn_idx: 0,
+            build_string_from_array_fn_idx: 0,
             format_simple_fn_idx: 0,
             format_with_spec_fn_idx: 0,
 };
@@ -9744,6 +9797,7 @@ mod tests {
             delete_subscr_fn_idx: 0,
             delete_attr_fn_idx: 0,
             build_set_from_array_fn_idx: 0,
+            build_string_from_array_fn_idx: 0,
             format_simple_fn_idx: 0,
             format_with_spec_fn_idx: 0,
 };
@@ -10028,6 +10082,7 @@ mod tests {
             delete_subscr_fn_idx: 0,
             delete_attr_fn_idx: 0,
             build_set_from_array_fn_idx: 0,
+            build_string_from_array_fn_idx: 0,
             format_simple_fn_idx: 0,
             format_with_spec_fn_idx: 0,
 };
@@ -10135,6 +10190,7 @@ mod tests {
             delete_subscr_fn_idx: 98,
             delete_attr_fn_idx: 99,
             build_set_from_array_fn_idx: 100,
+            build_string_from_array_fn_idx: 103,
             format_simple_fn_idx: 101,
             format_with_spec_fn_idx: 102,
         };
@@ -10524,6 +10580,75 @@ mod tests {
                 assert!(
                     matches!(args[0], Operand::ConstInt(100)),
                     "build_set_from_array_fn pool index, got {:?}",
+                    args[0]
+                );
+                match &args[1] {
+                    Operand::ListOfKind(list) => {
+                        assert_eq!(list.kind, Kind::Ref);
+                        assert!(
+                            matches!(&list.content[..], [Operand::Register(r)] if r.index == 101),
+                            "ListR = [array], got {:?}",
+                            list.content
+                        );
+                    }
+                    other => panic!("expected ListR, got {other:?}"),
+                }
+                assert_eq!(
+                    result,
+                    Some(Register {
+                        kind: Kind::Ref,
+                        index: 102
+                    }),
+                );
+            }
+            _ => panic!("expected Insn::Op, got {insn:?}"),
+        }
+    }
+
+    #[test]
+    fn lower_build_string_from_array_emits_build_string_fn_residual() {
+        // `build_string_from_array(array)` →
+        // `residual_call_r_r(ConstInt(build_string_from_array_fn_idx),
+        // ListR([array]), Descr) → reg`, the BuildSet-style array consumer
+        // (Plain — fragment concatenation runs no user code).
+        let array_var = Variable::new(VariableId(8), Kind::Ref);
+        let result_var = Variable::new(VariableId(9), Kind::Ref);
+        let (ctx, _, _) = load_attr_lowering_fixture();
+        let op = super::super::flow::SpaceOperation::new(
+            "build_string_from_array",
+            vec![array_var.into()],
+            Some(result_var.into()),
+            0,
+        );
+        let mut get_register = |var: Variable| match var.id {
+            VariableId(8) => Register {
+                kind: Kind::Ref,
+                index: 101,
+            },
+            VariableId(9) => Register {
+                kind: Kind::Ref,
+                index: 102,
+            },
+            _ => panic!("unexpected var id {:?}", var.id),
+        };
+        let mut lower_constant = super::flatten_constant_operand_for_test;
+        let insn = super::lower_tuple_build_hlop_to_insn(
+            &op,
+            &ctx,
+            &mut get_register,
+            &mut lower_constant,
+        )
+        .expect("build_string_from_array lowering must succeed");
+        match insn {
+            Insn::Op {
+                opname,
+                args,
+                result,
+            } => {
+                assert_eq!(opname, "residual_call_r_r");
+                assert!(
+                    matches!(args[0], Operand::ConstInt(103)),
+                    "build_string_from_array_fn pool index, got {:?}",
                     args[0]
                 );
                 match &args[1] {

@@ -3258,6 +3258,7 @@ struct FnPtrIndices {
     build_set_from_array_fn: HelperHandle,
     format_simple_fn: HelperHandle,
     format_with_spec_fn: HelperHandle,
+    build_string_from_array_fn: HelperHandle,
 }
 
 /// Register every blackhole helper fn pointer with the assembler in
@@ -3538,6 +3539,14 @@ fn register_helper_fn_pointers(
         cpu.format_with_spec_fn as *const (),
         CallFlavor::MayForce,
     );
+    // `bh_build_string_from_array` concatenates the forced fragment array;
+    // fragments are already strings, so this runs no user code → `Plain`.
+    // Appended last to preserve fn_ptr indices.
+    let build_string_from_array_fn = bind(
+        assembler,
+        cpu.build_string_from_array_fn as *const (),
+        CallFlavor::Plain,
+    );
     FnPtrIndices {
         call_fn,
         load_global_fn,
@@ -3576,6 +3585,7 @@ fn register_helper_fn_pointers(
         build_set_from_array_fn,
         format_simple_fn,
         format_with_spec_fn,
+        build_string_from_array_fn,
     }
 }
 
@@ -4522,6 +4532,11 @@ impl CodeWriter {
                     idx: format_with_spec_fn_idx,
                     flavor: _format_with_spec_fn_flavor,
                 },
+            build_string_from_array_fn:
+                HelperHandle {
+                    idx: build_string_from_array_fn_idx,
+                    flavor: _build_string_from_array_fn_flavor,
+                },
         } = register_helper_fn_pointers(&mut assembler, self.cpu());
 
         // codewriter.py:37 `portal_jd = self.callcontrol.jitdriver_sd_from_portal_graph(graph)`
@@ -4591,6 +4606,7 @@ impl CodeWriter {
                 build_set_from_array_fn_idx,
                 format_simple_fn_idx,
                 format_with_spec_fn_idx,
+                build_string_from_array_fn_idx,
             });
         }
 
@@ -8126,14 +8142,67 @@ impl CodeWriter {
                         }
 
                         // BuildString(count): pops count strings, pushes 1. Net: -(count-1).
+                        //
+                        // Same `new_array_clear` + unrolled `setarrayitem_gc_r`
+                        // array build as BuildSet, then a single
+                        // `build_string_from_array` residual concatenating the
+                        // forced fragment array.  The length travels in the
+                        // array (no arity cap).  Fragments are already strings
+                        // (FORMAT_SIMPLE / FORMAT_WITH_SPEC / CONVERT_VALUE ran
+                        // first), so the residual runs no user code → `Plain`.
                         Instruction::BuildString { count } => {
                             let n = count.get(op_arg) as usize;
+                            let mut item_values_rev = Vec::with_capacity(n);
                             for _ in 0..n {
-                                pop_and_decr_depth(&mut current_state, &mut current_depth);
+                                let item_reg = emit_popvalue_ref!(current_depth, py_pc);
+                                let item_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                                if let super::flow::FlowValue::Variable(v) = &item_value {
+                                    pin!(Some(*v), item_reg);
+                                }
+                                item_values_rev.push(item_value);
                             }
-                            push_fresh_ref(&mut current_state, &mut graph);
-                            current_depth += 1;
-                            emit_abort_permanent!(py_pc);
+                            // popvalues pops top-first; the array keeps
+                            // bottom-to-top order, so reverse the pop order.
+                            let items: Vec<super::flow::FlowValue> =
+                                item_values_rev.into_iter().rev().collect();
+                            let array_var = emit_graph_op_with_result(
+                                &mut graph,
+                                &current_block.block(),
+                                "new_array_clear",
+                                vec![
+                                    super::flow::FlowValue::Constant(
+                                        super::flow::Constant::signed(n as i64),
+                                    )
+                                    .into(),
+                                ],
+                                Kind::Ref,
+                                py_pc as i64,
+                            );
+                            for (i, item) in items.into_iter().enumerate() {
+                                emit_graph_op_void(
+                                    &current_block.block(),
+                                    "setarrayitem_gc_r",
+                                    vec![
+                                        super::flow::FlowValue::Variable(array_var).into(),
+                                        super::flow::FlowValue::Constant(
+                                            super::flow::Constant::signed(i as i64),
+                                        )
+                                        .into(),
+                                        item.into(),
+                                    ],
+                                    py_pc as i64,
+                                );
+                            }
+                            let result_value = emit_graph_op_with_result(
+                                &mut graph,
+                                &current_block.block(),
+                                "build_string_from_array",
+                                vec![super::flow::FlowValue::Variable(array_var).into()],
+                                Kind::Ref,
+                                py_pc as i64,
+                            );
+                            pin!(Some(result_value), stack_base + current_depth);
+                            push_and_bump!(result_value.into(), py_pc);
                         }
 
                         // CallFunctionEx: pops callable+null+args+kwargs_or_null (4), pushes 1. Net: -3.

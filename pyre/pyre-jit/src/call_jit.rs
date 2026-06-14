@@ -3882,6 +3882,22 @@ pub extern "C" fn bh_build_set_from_array(array: i64) -> i64 {
     }
 }
 
+/// BUILD_STRING residual (`build_string_from_array` HLOp →
+/// `residual_call_r_r`).  Concatenates the forced fragment array into a
+/// single `str` through the shared `runtime_ops::build_string_from_refs`.
+/// Fragments are already strings (FORMAT_SIMPLE / CONVERT_VALUE ran first),
+/// so this never runs user code → `Plain` (infallible, no exception
+/// publish), mirroring `bh_newtuple_from_array`.
+pub extern "C" fn bh_build_string_from_array(array: i64) -> i64 {
+    let arr = array as *const pyre_object::object_array::GcTypedArray;
+    let len = pyre_object::object_array::gcarray_len(arr);
+    let mut items: Vec<pyre_object::PyObjectRef> = Vec::with_capacity(len);
+    for i in 0..len {
+        items.push(pyre_object::object_array::getarrayitem_ref(arr, i));
+    }
+    pyre_interpreter::runtime_ops::build_string_from_refs(&items) as i64
+}
+
 /// FORMAT_SIMPLE residual (`format_simple` HLOp → `residual_call_r_r`).
 /// Formats `value` with the empty spec (`f"{x}"` → `str(value)`) through the
 /// shared `runtime_ops::format_value`.  A user `__format__` may run Python

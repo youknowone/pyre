@@ -3673,29 +3673,7 @@ impl OpcodeStepExecutor for PyFrame {
             parts.push(self.pop());
         }
         parts.reverse();
-        let mut result = rustpython_wtf8::Wtf8Buf::new();
-        for part in &parts {
-            unsafe {
-                if pyre_object::is_str(*part) {
-                    result.push_wtf8(pyre_object::w_str_get_wtf8(*part));
-                } else if pyre_object::is_bool(*part) {
-                    // `is_int` is true for a bool, so test `is_bool` first; a
-                    // bool renders "True"/"False", not its int value.
-                    result.push_str(if pyre_object::w_bool_get_value(*part) {
-                        "True"
-                    } else {
-                        "False"
-                    });
-                } else if pyre_object::is_int(*part) {
-                    result.push_str(&pyre_object::w_int_get_value(*part).to_string());
-                } else if pyre_object::is_none(*part) {
-                    result.push_str("None");
-                } else {
-                    result.push_str("<object>");
-                }
-            }
-        }
-        self.push(pyre_object::w_str_from_wtf8(result));
+        self.push(crate::runtime_ops::build_string_from_refs(&parts));
         Ok(())
     }
 
