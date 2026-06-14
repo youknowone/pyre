@@ -3212,6 +3212,16 @@ pub struct LoweringContext {
     /// code, name_idx)` resolves the name through the code object and
     /// runs `setattr` (may invoke user `__setattr__` → `MayForce`).
     pub store_attr_fn_idx: u16,
+    /// `build_map_from_array_fn` descrs-pool index — see codewriter.rs
+    /// `register_helper_fn_pointers` for the production source
+    /// (`bind(assembler, cpu.build_map_from_array_fn, CallFlavor::MayForce)`).
+    /// BUILD_MAP records the BuildTuple-style `new_array_clear` + unrolled
+    /// `setarrayitem_gc_r` pair array, then the `build_map_from_array(array)`
+    /// HLOp lowers to `residual_call_r_r(ConstInt(fn_idx), ListR([array]),
+    /// Descr) → reg` via [`lower_tuple_build_hlop_to_insn`];
+    /// `bh_build_map_from_array` inserts the `[k0, v0, ...]` pairs (key
+    /// hashing may run user `__hash__` → `MayForce`).
+    pub build_map_from_array_fn_idx: u16,
 }
 
 /// Map a BINARY_OP HLOp opname (`add`/.../`xor`/`getitem` plus the
@@ -3976,6 +3986,27 @@ where
                 ctx.newtuple_from_array_fn_idx,
                 vec![array_operand],
                 CallFlavor::Plain,
+                majit_ir::PyreHelperKind::None,
+                dst_reg,
+            ))
+        }
+        "build_map_from_array" => {
+            if op.args.len() != 1 {
+                return None;
+            }
+            let array_operand =
+                flatten_arg_with_lowering(&op.args[0], get_register, lower_constant);
+            let dst_reg = match &op.result {
+                Some(super::flow::FlowValue::Variable(var)) => get_register(*var),
+                _ => return None,
+            };
+            // Dict construction hashes keys (`__hash__` / `__eq__` may run
+            // user code that forces virtualizables) → `MayForce`, unlike the
+            // allocation-only `newtuple_from_array`.
+            Some(build_residual_call_r_r_insn_from_operands(
+                ctx.build_map_from_array_fn_idx,
+                vec![array_operand],
+                CallFlavor::MayForce,
                 majit_ir::PyreHelperKind::None,
                 dst_reg,
             ))
@@ -6157,6 +6188,7 @@ mod tests {
             load_attr_fn_idx: 0,
             load_method_self_fn_idx: 0,
             store_attr_fn_idx: 0,
+            build_map_from_array_fn_idx: 0,
 };
         let mut on = SSARepr::new("setattr_on");
         let mut on_regallocs = make_regallocs();
@@ -6294,6 +6326,7 @@ mod tests {
             load_attr_fn_idx: 0,
             load_method_self_fn_idx: 0,
             store_attr_fn_idx: 0,
+            build_map_from_array_fn_idx: 0,
 };
 
         let mut ssarepr = SSARepr::new("retired_families");
@@ -6418,6 +6451,7 @@ mod tests {
             load_attr_fn_idx: 0,
             load_method_self_fn_idx: 0,
             store_attr_fn_idx: 0,
+            build_map_from_array_fn_idx: 0,
 };
 
         let mut ssarepr = SSARepr::new("trailing_live");
@@ -6505,6 +6539,7 @@ mod tests {
             load_attr_fn_idx: 0,
             load_method_self_fn_idx: 0,
             store_attr_fn_idx: 0,
+            build_map_from_array_fn_idx: 0,
 };
 
         let mut ssarepr = SSARepr::new("multi_block_lowering");
@@ -6636,6 +6671,7 @@ mod tests {
             load_attr_fn_idx: 0,
             load_method_self_fn_idx: 0,
             store_attr_fn_idx: 0,
+            build_map_from_array_fn_idx: 0,
 };
 
         let mut ssarepr = SSARepr::new("pyre_walker_2exit");
@@ -6812,6 +6848,7 @@ mod tests {
             load_attr_fn_idx: 0,
             load_method_self_fn_idx: 0,
             store_attr_fn_idx: 0,
+            build_map_from_array_fn_idx: 0,
 });
 
         let mut regallocs = perform_register_allocation_all_kinds(&graph);
@@ -7037,6 +7074,7 @@ mod tests {
             load_attr_fn_idx: 0,
             load_method_self_fn_idx: 0,
             store_attr_fn_idx: 0,
+            build_map_from_array_fn_idx: 0,
 };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -7128,6 +7166,7 @@ mod tests {
             load_attr_fn_idx: 0,
             load_method_self_fn_idx: 0,
             store_attr_fn_idx: 0,
+            build_map_from_array_fn_idx: 0,
 };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -7163,6 +7202,7 @@ mod tests {
             load_attr_fn_idx: 0,
             load_method_self_fn_idx: 0,
             store_attr_fn_idx: 0,
+            build_map_from_array_fn_idx: 0,
 };
 
         let hlop = SpaceOperation::new("sub", vec![lhs.into(), rhs.into()], Some(result.into()), 0);
@@ -7271,6 +7311,7 @@ mod tests {
             load_attr_fn_idx: 0,
             load_method_self_fn_idx: 0,
             store_attr_fn_idx: 0,
+            build_map_from_array_fn_idx: 0,
 };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -7338,6 +7379,7 @@ mod tests {
             load_attr_fn_idx: 0,
             load_method_self_fn_idx: 0,
             store_attr_fn_idx: 0,
+            build_map_from_array_fn_idx: 0,
 };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -7371,6 +7413,7 @@ mod tests {
             load_attr_fn_idx: 0,
             load_method_self_fn_idx: 0,
             store_attr_fn_idx: 0,
+            build_map_from_array_fn_idx: 0,
 };
         let hlop = SpaceOperation::new("eq", vec![lhs.into(), rhs.into()], Some(result.into()), 0);
         let mut get_register = identity_register_mapper();
@@ -7411,6 +7454,7 @@ mod tests {
             load_attr_fn_idx: 0,
             load_method_self_fn_idx: 0,
             store_attr_fn_idx: 0,
+            build_map_from_array_fn_idx: 0,
 };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -7478,6 +7522,7 @@ mod tests {
             load_attr_fn_idx: 0,
             load_method_self_fn_idx: 0,
             store_attr_fn_idx: 0,
+            build_map_from_array_fn_idx: 0,
 };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -7508,6 +7553,7 @@ mod tests {
             load_attr_fn_idx: 0,
             load_method_self_fn_idx: 0,
             store_attr_fn_idx: 0,
+            build_map_from_array_fn_idx: 0,
 };
         let hlop = SpaceOperation::new("bool", vec![cond.into()], Some(result.into()), 0);
         let mut get_register = identity_register_mapper();
@@ -7552,6 +7598,7 @@ mod tests {
             load_attr_fn_idx: 0,
             load_method_self_fn_idx: 0,
             store_attr_fn_idx: 0,
+            build_map_from_array_fn_idx: 0,
 };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -7612,6 +7659,7 @@ mod tests {
             load_attr_fn_idx: 0,
             load_method_self_fn_idx: 0,
             store_attr_fn_idx: 0,
+            build_map_from_array_fn_idx: 0,
 };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -7657,6 +7705,7 @@ mod tests {
             load_attr_fn_idx: 0,
             load_method_self_fn_idx: 0,
             store_attr_fn_idx: 0,
+            build_map_from_array_fn_idx: 0,
 };
         let hlop = SpaceOperation::new(
             "setitem",
@@ -7717,6 +7766,7 @@ mod tests {
             load_attr_fn_idx: 0,
             load_method_self_fn_idx: 0,
             store_attr_fn_idx: 0,
+            build_map_from_array_fn_idx: 0,
 };
         let mut get_register_a = identity_register_mapper();
         let mut get_register_b = identity_register_mapper();
@@ -7753,6 +7803,7 @@ mod tests {
             load_attr_fn_idx: 0,
             load_method_self_fn_idx: 0,
             store_attr_fn_idx: 0,
+            build_map_from_array_fn_idx: 0,
 };
         let mut get_register_a = identity_register_mapper();
         let mut get_register_b = identity_register_mapper();
@@ -7789,6 +7840,7 @@ mod tests {
             load_attr_fn_idx: 0,
             load_method_self_fn_idx: 0,
             store_attr_fn_idx: 0,
+            build_map_from_array_fn_idx: 0,
 };
         let mut get_register_a = identity_register_mapper();
         let mut get_register_b = identity_register_mapper();
@@ -7830,6 +7882,7 @@ mod tests {
             load_attr_fn_idx: 0,
             load_method_self_fn_idx: 0,
             store_attr_fn_idx: 0,
+            build_map_from_array_fn_idx: 0,
 };
         let mut get_register_a = identity_register_mapper();
         let mut get_register_b = identity_register_mapper();
@@ -7885,6 +7938,7 @@ mod tests {
             load_attr_fn_idx: 0,
             load_method_self_fn_idx: 0,
             store_attr_fn_idx: 0,
+            build_map_from_array_fn_idx: 0,
 };
         let mut get_register_a = identity_register_mapper();
         let mut get_register_b = identity_register_mapper();
@@ -9263,6 +9317,7 @@ mod tests {
             load_attr_fn_idx: 0,
             load_method_self_fn_idx: 0,
             store_attr_fn_idx: 0,
+            build_map_from_array_fn_idx: 0,
 };
         flatten_graph_for_test_with_lowering(&graph, &mut ssarepr, ctx, Some(cpu));
         ssarepr
@@ -9540,6 +9595,7 @@ mod tests {
             load_attr_fn_idx: 0,
             load_method_self_fn_idx: 0,
             store_attr_fn_idx: 0,
+            build_map_from_array_fn_idx: 0,
 };
         let null_or_self_var = Variable::new(VariableId(10), Kind::Ref);
         let op = super::super::flow::SpaceOperation::new(
@@ -9640,6 +9696,7 @@ mod tests {
             load_name_fn_idx: 93,
             store_name_fn_idx: 94,
             store_attr_fn_idx: 95,
+            build_map_from_array_fn_idx: 96,
         };
         let code_const = Constant::new(
             super::super::flow::ConstantValue::Signed(0x2000),
@@ -9838,6 +9895,75 @@ mod tests {
                     other => panic!("expected ListR, got {other:?}"),
                 }
                 assert_eq!(result, None, "STORE_ATTR is void — no result register");
+            }
+            _ => panic!("expected Insn::Op, got {insn:?}"),
+        }
+    }
+
+    #[test]
+    fn lower_build_map_from_array_emits_build_map_fn_residual() {
+        // `build_map_from_array(array)` →
+        // `residual_call_r_r(ConstInt(build_map_from_array_fn_idx),
+        // ListR([array]), Descr) → reg`, the BuildTuple-style array
+        // consumer (MayForce — dict key hashing runs user code).
+        let array_var = Variable::new(VariableId(8), Kind::Ref);
+        let result_var = Variable::new(VariableId(9), Kind::Ref);
+        let (ctx, _, _) = load_attr_lowering_fixture();
+        let op = super::super::flow::SpaceOperation::new(
+            "build_map_from_array",
+            vec![array_var.into()],
+            Some(result_var.into()),
+            0,
+        );
+        let mut get_register = |var: Variable| match var.id {
+            VariableId(8) => Register {
+                kind: Kind::Ref,
+                index: 101,
+            },
+            VariableId(9) => Register {
+                kind: Kind::Ref,
+                index: 102,
+            },
+            _ => panic!("unexpected var id {:?}", var.id),
+        };
+        let mut lower_constant = super::flatten_constant_operand_for_test;
+        let insn = super::lower_tuple_build_hlop_to_insn(
+            &op,
+            &ctx,
+            &mut get_register,
+            &mut lower_constant,
+        )
+        .expect("build_map_from_array lowering must succeed");
+        match insn {
+            Insn::Op {
+                opname,
+                args,
+                result,
+            } => {
+                assert_eq!(opname, "residual_call_r_r");
+                assert!(
+                    matches!(args[0], Operand::ConstInt(96)),
+                    "build_map_from_array_fn pool index, got {:?}",
+                    args[0]
+                );
+                match &args[1] {
+                    Operand::ListOfKind(list) => {
+                        assert_eq!(list.kind, Kind::Ref);
+                        assert!(
+                            matches!(&list.content[..], [Operand::Register(r)] if r.index == 101),
+                            "ListR = [array], got {:?}",
+                            list.content
+                        );
+                    }
+                    other => panic!("expected ListR, got {other:?}"),
+                }
+                assert_eq!(
+                    result,
+                    Some(Register {
+                        kind: Kind::Ref,
+                        index: 102
+                    }),
+                );
             }
             _ => panic!("expected Insn::Op, got {insn:?}"),
         }

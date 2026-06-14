@@ -3192,6 +3192,7 @@ struct FnPtrIndices {
     load_attr_fn: HelperHandle,
     load_method_self_fn: HelperHandle,
     store_attr_fn: HelperHandle,
+    build_map_from_array_fn: HelperHandle,
 }
 
 /// Register every blackhole helper fn pointer with the assembler in
@@ -3416,6 +3417,15 @@ fn register_helper_fn_pointers(
         cpu.store_attr_fn as *const (),
         CallFlavor::MayForce,
     );
+    // `bh_build_map_from_array` allocates a dict and inserts the forced
+    // pair array; key insertion hashes (`__hash__` / `__eq__` can run user
+    // code that forces virtualizables) → `MayForce`.  Appended last to
+    // preserve fn_ptr indices.
+    let build_map_from_array_fn = bind(
+        assembler,
+        cpu.build_map_from_array_fn as *const (),
+        CallFlavor::MayForce,
+    );
     FnPtrIndices {
         call_fn,
         load_global_fn,
@@ -3447,6 +3457,7 @@ fn register_helper_fn_pointers(
         load_attr_fn,
         load_method_self_fn,
         store_attr_fn,
+        build_map_from_array_fn,
     }
 }
 
@@ -4358,6 +4369,11 @@ impl CodeWriter {
                     idx: store_attr_fn_idx,
                     flavor: _store_attr_fn_flavor,
                 },
+            build_map_from_array_fn:
+                HelperHandle {
+                    idx: build_map_from_array_fn_idx,
+                    flavor: _build_map_from_array_fn_flavor,
+                },
         } = register_helper_fn_pointers(&mut assembler, self.cpu());
 
         // codewriter.py:37 `portal_jd = self.callcontrol.jitdriver_sd_from_portal_graph(graph)`
@@ -4420,6 +4436,7 @@ impl CodeWriter {
                 load_attr_fn_idx,
                 load_method_self_fn_idx,
                 store_attr_fn_idx,
+                build_map_from_array_fn_idx,
             });
         }
 
@@ -7708,14 +7725,79 @@ impl CodeWriter {
 
                         // BuildMap(count): pop 2*count key-value pairs, push dict. Net: -(2*count - 1).
                         // shared_opcode.rs opcode_build_map.
+                        // BuildMap(count): pops count key-value pairs (2*count
+                        // stack items), pushes 1 dict. Net: -(2*count - 1).
+                        //
+                        // Mirrors BuildTuple's `new_array_clear` + unrolled
+                        // `setarrayitem_gc_r` array build (`pyframe.py:408-419`),
+                        // then a single `build_map_from_array` residual consuming
+                        // the forced `[k0, v0, k1, v1, ...]` array. No arity cap:
+                        // the length travels in the array.
                         Instruction::BuildMap { count } => {
-                            let n = count.get(op_arg) as usize;
-                            for _ in 0..n * 2 {
-                                pop_and_decr_depth(&mut current_state, &mut current_depth);
+                            let nitems = count.get(op_arg) as usize * 2;
+                            // Empty `{}` (count 0) declines: the only corpus
+                            // site is `type(name, (), {})`, whose raise
+                            // (UnicodeEncodeError) exercises the unsupported
+                            // exception-resume-through-call path (#68/#51c).
+                            // Non-empty dict literals lower to the array
+                            // residual below.
+                            if nitems == 0 {
+                                push_fresh_ref(&mut current_state, &mut graph);
+                                current_depth += 1;
+                                emit_abort_permanent!(py_pc);
+                                continue;
                             }
-                            push_fresh_ref(&mut current_state, &mut graph);
-                            current_depth += 1;
-                            emit_abort_permanent!(py_pc);
+                            let mut item_values_rev = Vec::with_capacity(nitems);
+                            for _ in 0..nitems {
+                                let item_reg = emit_popvalue_ref!(current_depth, py_pc);
+                                let item_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                                if let super::flow::FlowValue::Variable(v) = &item_value {
+                                    pin!(Some(*v), item_reg);
+                                }
+                                item_values_rev.push(item_value);
+                            }
+                            // popvalues pops top-first; the array keeps
+                            // bottom-to-top order, so reverse the pop order.
+                            let items: Vec<super::flow::FlowValue> =
+                                item_values_rev.into_iter().rev().collect();
+                            let array_var = emit_graph_op_with_result(
+                                &mut graph,
+                                &current_block.block(),
+                                "new_array_clear",
+                                vec![
+                                    super::flow::FlowValue::Constant(
+                                        super::flow::Constant::signed(nitems as i64),
+                                    )
+                                    .into(),
+                                ],
+                                Kind::Ref,
+                                py_pc as i64,
+                            );
+                            for (i, item) in items.into_iter().enumerate() {
+                                emit_graph_op_void(
+                                    &current_block.block(),
+                                    "setarrayitem_gc_r",
+                                    vec![
+                                        super::flow::FlowValue::Variable(array_var).into(),
+                                        super::flow::FlowValue::Constant(
+                                            super::flow::Constant::signed(i as i64),
+                                        )
+                                        .into(),
+                                        item.into(),
+                                    ],
+                                    py_pc as i64,
+                                );
+                            }
+                            let result_value = emit_graph_op_with_result(
+                                &mut graph,
+                                &current_block.block(),
+                                "build_map_from_array",
+                                vec![super::flow::FlowValue::Variable(array_var).into()],
+                                Kind::Ref,
+                                py_pc as i64,
+                            );
+                            pin!(Some(result_value), stack_base + current_depth);
+                            push_and_bump!(result_value.into(), py_pc);
                         }
 
                         // MapAdd(i): peek dict at stack[i], pop value + key. Net: -2.

@@ -3773,6 +3773,21 @@ pub extern "C" fn bh_newtuple_from_array(array: i64) -> i64 {
     pyre_interpreter::runtime_ops::build_tuple_from_refs(&items) as i64
 }
 
+/// BUILD_MAP residual — the dict counterpart of [`bh_newtuple_from_array`].
+/// The length-prefixed array holds the interleaved `[k0, v0, k1, v1, ...]`
+/// pairs the codewriter unrolled via `setarrayitem_gc_r`;
+/// `build_map_from_refs` consumes them in `chunks_exact(2)`.  Keys are
+/// hashed (may run user `__hash__` / `__eq__`), so the call is MayForce.
+pub extern "C" fn bh_build_map_from_array(array: i64) -> i64 {
+    let arr = array as *const pyre_object::object_array::GcTypedArray;
+    let len = pyre_object::object_array::gcarray_len(arr);
+    let mut items: Vec<pyre_object::PyObjectRef> = Vec::with_capacity(len);
+    for i in 0..len {
+        items.push(pyre_object::object_array::getarrayitem_ref(arr, i));
+    }
+    pyre_interpreter::runtime_ops::build_map_from_refs(&items) as i64
+}
+
 #[cfg(test)]
 mod tests_bh_newtuple_from_array {
     use super::bh_newtuple_from_array;
