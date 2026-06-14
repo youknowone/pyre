@@ -30,6 +30,8 @@ pub mod _multiprocessing;
 #[allow(non_snake_case)]
 pub mod _opcode;
 #[allow(non_snake_case)]
+pub mod _pickle;
+#[allow(non_snake_case)]
 pub mod _posixshmem;
 #[allow(non_snake_case)]
 pub mod _random;

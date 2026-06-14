@@ -211,6 +211,7 @@ pub fn install_builtin_modules() {
     pyre_install_module!(_multiprocessing);
     pyre_install_module!(_locale);
     pyre_install_module!(_random);
+    pyre_install_module!(_pickle);
     pyre_install_module!(_struct);
     pyre_install_module!(gc);
     pyre_install_module!(unicodedata);
@@ -246,7 +247,6 @@ pub fn install_builtin_modules() {
         "_sha3",
         "_blake2",
         "_decimal",
-        "_pickle",
         "_datetime",
         "_json",
         "_csv",

@@ -1699,6 +1699,24 @@ thread_local! {
             <pyre_object::genericaliasobject::W_GenericAlias
                 as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
         );
+        // W_Pickler / W_Unpickler (`_pickle` accelerator) — typed payloads
+        // via `#[pyre_class]` in AUTO-ID mode.  Both carry inline
+        // `PyObjectRef` fields (the pickler's output file; the unpickler's
+        // read/readline callables, result stack, and active frame) that the
+        // collector must walk.  Registered at the tail of the tid chain so
+        // no earlier explicit-id slot shifts.
+        register_pyre_class(
+            &mut gc,
+            &mut pytype_to_tid,
+            <pyre_interpreter::module::_pickle::W_Pickler
+                as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+        );
+        register_pyre_class(
+            &mut gc,
+            &mut pytype_to_tid,
+            <pyre_interpreter::module::_pickle::W_Unpickler
+                as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+        );
         // rclass.py:340-346 — assign subclassrange_{min,max} to each
         // vtable entry. freeze_types() runs assign_inheritance_ids
         // (normalizecalls.py:373-389), then we write the computed ranges
