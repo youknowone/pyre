@@ -7,6 +7,7 @@
 //! / `BoxRef` from `majit-metainterp` live as extension traits in
 //! `metainterp::optimizeopt::info`.
 
+use crate::box_ref::BoxRef;
 use crate::field_entry::{FieldEntry, PreambleOp};
 use crate::intbound::IntBound;
 use crate::rawbuffer::{RawBuffer, RawBufferError};
@@ -488,7 +489,7 @@ impl PtrInfo {
 
         fn visit_field(entry: &mut FieldEntry, visitor: &mut dyn FnMut(&mut GcRef)) {
             match entry {
-                FieldEntry::Value(opref) => visit_opref(opref, visitor),
+                FieldEntry::Value(b) => b.walk_const_ptr_refs(visitor),
                 FieldEntry::Preamble(pop) => {
                     pop.op.walk_const_ptr_refs(visitor);
                     pop.preamble_op.walk_const_ptr_refs_mut(visitor);
@@ -1103,20 +1104,22 @@ impl PtrInfo {
             PtrInfo::Instance(v) => {
                 for entry in &mut v.fields {
                     if entry.0 == field_idx {
-                        entry.1 = FieldEntry::Value(value);
+                        entry.1 = FieldEntry::Value(BoxRef::from_opref(value));
                         return;
                     }
                 }
-                v.fields.push((field_idx, FieldEntry::Value(value)));
+                v.fields
+                    .push((field_idx, FieldEntry::Value(BoxRef::from_opref(value))));
             }
             PtrInfo::Struct(v) => {
                 for entry in &mut v.fields {
                     if entry.0 == field_idx {
-                        entry.1 = FieldEntry::Value(value);
+                        entry.1 = FieldEntry::Value(BoxRef::from_opref(value));
                         return;
                     }
                 }
-                v.fields.push((field_idx, FieldEntry::Value(value)));
+                v.fields
+                    .push((field_idx, FieldEntry::Value(BoxRef::from_opref(value))));
             }
             PtrInfo::Virtual(v) => {
                 for entry in &mut v.fields {
@@ -1168,7 +1171,7 @@ impl PtrInfo {
         assert!(!self.is_virtual(), "set_preamble_item on virtual");
         if let PtrInfo::Array(v) = self {
             if index >= v.items.len() {
-                v.items.resize(index + 1, FieldEntry::Value(OpRef::NONE));
+                v.items.resize(index + 1, FieldEntry::Value(BoxRef::none()));
             }
             v.items[index] = FieldEntry::Preamble(pop);
         }
@@ -1233,7 +1236,7 @@ impl PtrInfo {
             PtrInfo::Array(v) => {
                 if let Some(entry) = v.items.get_mut(index) {
                     if entry.is_preamble() {
-                        let taken = std::mem::replace(entry, FieldEntry::Value(OpRef::NONE));
+                        let taken = std::mem::replace(entry, FieldEntry::Value(BoxRef::none()));
                         taken.into_preamble()
                     } else {
                         None
@@ -1269,12 +1272,12 @@ impl PtrInfo {
             PtrInfo::Virtual(v) => v
                 .fields
                 .iter()
-                .map(|(k, v)| (*k, FieldEntry::Value(*v)))
+                .map(|(k, v)| (*k, FieldEntry::Value(BoxRef::from_opref(*v))))
                 .collect(),
             PtrInfo::VirtualStruct(v) => v
                 .fields
                 .iter()
-                .map(|(k, v)| (*k, FieldEntry::Value(*v)))
+                .map(|(k, v)| (*k, FieldEntry::Value(BoxRef::from_opref(*v))))
                 .collect(),
             PtrInfo::Array(v) => v
                 .items
@@ -1286,7 +1289,7 @@ impl PtrInfo {
                 .items
                 .iter()
                 .enumerate()
-                .map(|(i, val)| (i as u32, FieldEntry::Value(*val)))
+                .map(|(i, val)| (i as u32, FieldEntry::Value(BoxRef::from_opref(*val))))
                 .collect(),
             _ => Vec::new(),
         }
@@ -1309,12 +1312,12 @@ impl PtrInfo {
                 .fields
                 .iter()
                 .find(|(k, _)| *k == field_idx)
-                .map(|(_, v)| FieldEntry::Value(*v)),
+                .map(|(_, v)| FieldEntry::Value(BoxRef::from_opref(*v))),
             PtrInfo::VirtualStruct(v) => v
                 .fields
                 .iter()
                 .find(|(k, _)| *k == field_idx)
-                .map(|(_, v)| FieldEntry::Value(*v)),
+                .map(|(_, v)| FieldEntry::Value(BoxRef::from_opref(*v))),
             _ => None,
         }
     }
@@ -1324,9 +1327,9 @@ impl PtrInfo {
         match self {
             PtrInfo::Array(v) => {
                 if index >= v.items.len() {
-                    v.items.resize(index + 1, FieldEntry::Value(OpRef::NONE));
+                    v.items.resize(index + 1, FieldEntry::Value(BoxRef::none()));
                 }
-                v.items[index] = FieldEntry::Value(value);
+                v.items[index] = FieldEntry::Value(BoxRef::from_opref(value));
             }
             PtrInfo::VirtualArray(v) => {
                 // info.py:568-569 `if self.is_virtual(): return  # bogus
@@ -1343,7 +1346,10 @@ impl PtrInfo {
     pub fn getitem(&self, index: usize) -> Option<FieldEntry> {
         match self {
             PtrInfo::Array(v) => v.items.get(index).cloned(),
-            PtrInfo::VirtualArray(v) => v.items.get(index).map(|r| FieldEntry::Value(*r)),
+            PtrInfo::VirtualArray(v) => v
+                .items
+                .get(index)
+                .map(|r| FieldEntry::Value(BoxRef::from_opref(*r))),
             _ => None,
         }
     }
@@ -1353,7 +1359,7 @@ impl PtrInfo {
         match self {
             PtrInfo::Array(v) => {
                 if index < v.items.len() {
-                    v.items[index] = FieldEntry::Value(OpRef::NONE);
+                    v.items[index] = FieldEntry::Value(BoxRef::none());
                 }
             }
             PtrInfo::VirtualArray(v) => {

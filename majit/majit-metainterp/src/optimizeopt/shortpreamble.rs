@@ -1735,7 +1735,7 @@ impl ProducedShortOp {
                         if idx >= array_info.items.len() {
                             array_info.items.resize(
                                 idx + 1,
-                                crate::optimizeopt::info::FieldEntry::Value(OpRef::NONE),
+                                crate::optimizeopt::info::FieldEntry::Value(BoxRef::none()),
                             );
                         }
                         array_info.items[idx] =

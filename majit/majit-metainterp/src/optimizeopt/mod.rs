@@ -5279,7 +5279,7 @@ impl OptContext {
                 let fields: Vec<(u32, FieldEntry)> = v
                     .fields
                     .iter()
-                    .map(|&(k, r)| (k, FieldEntry::Value(r)))
+                    .map(|&(k, r)| (k, FieldEntry::Value(crate::r#box::BoxRef::from_opref(r))))
                     .collect();
                 let ci = self.const_infos.entry(key).or_insert_with(|| {
                     PtrInfo::Struct(StructPtrInfo {
@@ -5298,7 +5298,7 @@ impl OptContext {
                 let fields: Vec<(u32, FieldEntry)> = v
                     .fields
                     .iter()
-                    .map(|&(k, r)| (k, FieldEntry::Value(r)))
+                    .map(|&(k, r)| (k, FieldEntry::Value(crate::r#box::BoxRef::from_opref(r))))
                     .collect();
                 let ci = self.const_infos.entry(key).or_insert_with(|| {
                     PtrInfo::Struct(StructPtrInfo {
@@ -5333,8 +5333,11 @@ impl OptContext {
             PtrInfo::VirtualArray(v) if !v.items.is_empty() => {
                 let descr = v.descr.clone();
                 let len = v.items.len() as i64;
-                let items: Vec<FieldEntry> =
-                    v.items.iter().map(|&r| FieldEntry::Value(r)).collect();
+                let items: Vec<FieldEntry> = v
+                    .items
+                    .iter()
+                    .map(|&r| FieldEntry::Value(crate::r#box::BoxRef::from_opref(r)))
+                    .collect();
                 let ci = self.const_infos.entry(key).or_insert_with(|| {
                     PtrInfo::Array(ArrayPtrInfo {
                         descr,

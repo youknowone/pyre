@@ -10,7 +10,7 @@
 //! PtrInfo move that follows can reference these types without a
 //! `majit-metainterp → majit-ir` circular dep.
 
-use crate::{Op, OpRef};
+use crate::OpRef;
 
 /// shortpreamble.py:11-49: PreambleOp
 ///
@@ -47,8 +47,11 @@ pub struct PreambleOp {
 /// Rust equivalent: typed enum instead of Python's duck-typed list.
 #[derive(Clone, Debug)]
 pub enum FieldEntry {
-    /// Normal cached field value (info.py:203 setfield).
-    Value(OpRef),
+    /// Normal cached field value (info.py:203 setfield). Stored as a
+    /// [`BoxRef`](crate::box_ref::BoxRef) so a `Const` ref is GC-walked
+    /// through `BoxRef::walk_const_ptr_refs`, never persisting a Copy
+    /// `OpRef::ConstPtr` that a moving collection cannot reach.
+    Value(crate::box_ref::BoxRef),
     /// shortpreamble.py:11 PreambleOp — sentinel stored during Phase 2 import.
     Preamble(PreambleOp),
 }
@@ -59,7 +62,7 @@ impl FieldEntry {
     /// via `force_op_from_preamble`).
     pub fn as_opref(&self) -> Option<OpRef> {
         match self {
-            FieldEntry::Value(opref) => Some(*opref),
+            FieldEntry::Value(b) => Some(b.to_opref()),
             FieldEntry::Preamble(_) => None,
         }
     }
@@ -86,7 +89,7 @@ impl FieldEntry {
     /// `get_box_replacement(PreambleOp(...))` behavior.
     pub fn as_seen_opref(&self) -> OpRef {
         match self {
-            FieldEntry::Value(opref) => *opref,
+            FieldEntry::Value(b) => b.to_opref(),
             FieldEntry::Preamble(pop) => pop.op.to_opref(),
         }
     }

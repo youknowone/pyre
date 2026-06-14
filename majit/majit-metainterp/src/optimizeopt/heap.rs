@@ -258,7 +258,7 @@ impl CachedField {
         if let Some((lazy_obj, lazy_op)) = &self.lazy_set {
             if *lazy_obj == struct_opref {
                 return Some(crate::optimizeopt::info::FieldEntry::Value(
-                    Self::_get_rhs_from_set_op(lazy_op),
+                    BoxRef::from_opref(Self::_get_rhs_from_set_op(lazy_op)),
                 ));
             }
         }
@@ -580,7 +580,7 @@ impl ArrayCachedItem {
         if let Some((lazy_obj, lazy_op)) = &self.lazy_set {
             if *lazy_obj == array_opref {
                 return Some(crate::optimizeopt::info::FieldEntry::Value(
-                    Self::_get_rhs_from_set_op(lazy_op),
+                    BoxRef::from_opref(Self::_get_rhs_from_set_op(lazy_op)),
                 ));
             }
         }
@@ -1952,7 +1952,7 @@ impl OptHeap {
                         crate::optimizeopt::info::FieldEntry::Value(cached) => {
                             if !cached.is_none() {
                                 let b_old = BoxRef::from_bound_op(op_rc);
-                                let b_cached = ctx.get_box_replacement(cached);
+                                let b_cached = ctx.get_box_replacement(cached.to_opref());
                                 ctx.make_equal_to(&b_old, &b_cached);
                                 return OptimizationResult::Remove;
                             }
@@ -2023,7 +2023,7 @@ impl OptHeap {
                     crate::optimizeopt::info::FieldEntry::Value(cached) => {
                         if !cached.is_none() {
                             let b_old = BoxRef::from_bound_op(op_rc);
-                            let b_cached = ctx.get_box_replacement(cached);
+                            let b_cached = ctx.get_box_replacement(cached.to_opref());
                             ctx.make_equal_to(&b_old, &b_cached);
                             return OptimizationResult::Remove;
                         }
@@ -2198,7 +2198,7 @@ impl OptHeap {
                 crate::optimizeopt::info::FieldEntry::Value(cached) => {
                     // heap.py:88 not cached_field.same_box(arg1)
                     // (ctx.same_box resolves both sides internally)
-                    if ctx.same_box(cached, arg1) {
+                    if ctx.same_box(cached.to_opref(), arg1) {
                         // heap.py:100 self._lazy_set = None
                         self.field_cache(descr).lazy_set = None;
                         return OptimizationResult::Remove;
@@ -2340,7 +2340,7 @@ impl OptHeap {
                 crate::optimizeopt::info::FieldEntry::Value(cached) => {
                     // heap.py:88 not cached_field.same_box(arg1)
                     // (ctx.same_box resolves both sides internally)
-                    if ctx.same_box(cached, arg1) {
+                    if ctx.same_box(cached.to_opref(), arg1) {
                         // heap.py:100 self._lazy_set = None
                         self.arrayitem_cache(descr, const_index).lazy_set = None;
                         return OptimizationResult::Remove;
@@ -2506,7 +2506,7 @@ impl OptHeap {
                             crate::optimizeopt::info::FieldEntry::Value(cached) => {
                                 if !cached.is_none() {
                                     let b_old = BoxRef::from_bound_op(op_rc);
-                                    let b_cached = ctx.get_box_replacement(cached);
+                                    let b_cached = ctx.get_box_replacement(cached.to_opref());
                                     ctx.make_equal_to(&b_old, &b_cached);
                                     return OptimizationResult::Remove;
                                 }
@@ -2587,7 +2587,7 @@ impl OptHeap {
                         crate::optimizeopt::info::FieldEntry::Value(cached) => {
                             if !cached.is_none() {
                                 let b_old = BoxRef::from_bound_op(op_rc);
-                                let b_cached = ctx.get_box_replacement(cached);
+                                let b_cached = ctx.get_box_replacement(cached.to_opref());
                                 ctx.make_equal_to(&b_old, &b_cached);
                                 return OptimizationResult::Remove;
                             }
@@ -6637,7 +6637,10 @@ mod tests {
             PtrInfo::Array(ArrayPtrInfo {
                 descr: arr_descr.clone(),
                 lenbound: IntBound::from_constant(2),
-                items: vec![FieldEntry::Value(const_10), FieldEntry::Value(const_20)],
+                items: vec![
+                    FieldEntry::Value(BoxRef::from_opref(const_10)),
+                    FieldEntry::Value(BoxRef::from_opref(const_20)),
+                ],
                 last_guard_pos: -1,
             }),
         );
@@ -6646,7 +6649,10 @@ mod tests {
             PtrInfo::Array(ArrayPtrInfo {
                 descr: arr_descr,
                 lenbound: IntBound::from_constant(2),
-                items: vec![FieldEntry::Value(const_10), FieldEntry::Value(const_30)],
+                items: vec![
+                    FieldEntry::Value(BoxRef::from_opref(const_10)),
+                    FieldEntry::Value(BoxRef::from_opref(const_30)),
+                ],
                 last_guard_pos: -1,
             }),
         );
