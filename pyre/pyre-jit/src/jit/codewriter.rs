@@ -2937,12 +2937,7 @@ fn emit_frontend_import_name(
         graph,
         block,
         "import_name",
-        vec![
-            fromlist.into(),
-            level.into(),
-            code.into(),
-            name_idx.into(),
-        ],
+        vec![fromlist.into(), level.into(), code.into(), name_idx.into()],
         Kind::Ref,
         offset,
     )
@@ -3688,7 +3683,11 @@ fn register_helper_fn_pointers(
     );
     // `bh_unary_not_fn` runs the truth test; a user `__bool__` / `__len__`
     // may run Python → `MayForce`.  Appended last to preserve fn_ptr indices.
-    let unary_not_fn = bind(assembler, cpu.unary_not_fn as *const (), CallFlavor::MayForce);
+    let unary_not_fn = bind(
+        assembler,
+        cpu.unary_not_fn as *const (),
+        CallFlavor::MayForce,
+    );
     // `bh_load_fast_check_fn` only null-checks the local and raises NameError;
     // it reads no heap and runs no user code → `Plain`.  Appended last to
     // preserve fn_ptr indices.
@@ -7828,12 +7827,11 @@ impl CodeWriter {
                             // `Signed(ptr) + Kind::Ref` constant and the
                             // `co_names` index the helper resolves the name
                             // with.
-                            let code_const: super::flow::FlowValue =
-                                super::flow::Constant::new(
-                                    super::flow::ConstantValue::Signed(w_code as i64),
-                                    Some(Kind::Ref),
-                                )
-                                .into();
+                            let code_const: super::flow::FlowValue = super::flow::Constant::new(
+                                super::flow::ConstantValue::Signed(w_code as i64),
+                                Some(Kind::Ref),
+                            )
+                            .into();
                             let name_idx_const: super::flow::FlowValue =
                                 super::flow::Constant::signed(name_idx as i64).into();
                             current_depth = current_depth.saturating_sub(1);
@@ -8048,8 +8046,7 @@ impl CodeWriter {
                         Instruction::ContainsOp { invert } => {
                             let invert_kind = invert.get(op_arg);
                             let _ = emit_popvalue_ref!(current_depth, py_pc);
-                            let container_value =
-                                pop_ref_or_fresh(&mut current_state, &mut graph);
+                            let container_value = pop_ref_or_fresh(&mut current_state, &mut graph);
                             let _ = emit_popvalue_ref!(current_depth, py_pc);
                             let item_value = pop_ref_or_fresh(&mut current_state, &mut graph);
                             let result_value = emit_frontend_contains(
@@ -8458,12 +8455,11 @@ impl CodeWriter {
                             // W_CodeObject as a post-rtype `Signed(ptr) + Kind::Ref`
                             // constant and the `co_names` index the helper resolves
                             // the name with.
-                            let code_const: super::flow::FlowValue =
-                                super::flow::Constant::new(
-                                    super::flow::ConstantValue::Signed(w_code as i64),
-                                    Some(Kind::Ref),
-                                )
-                                .into();
+                            let code_const: super::flow::FlowValue = super::flow::Constant::new(
+                                super::flow::ConstantValue::Signed(w_code as i64),
+                                Some(Kind::Ref),
+                            )
+                            .into();
                             let name_idx_const: super::flow::FlowValue =
                                 super::flow::Constant::signed(name_idx as i64).into();
                             current_depth = current_depth.saturating_sub(1);
@@ -8546,20 +8542,17 @@ impl CodeWriter {
                         // TLS-pinned execution context (MayForce).
                         Instruction::ImportName { namei } => {
                             let name_idx = namei.get(op_arg) as usize;
-                            let code_const: super::flow::FlowValue =
-                                super::flow::Constant::new(
-                                    super::flow::ConstantValue::Signed(w_code as i64),
-                                    Some(Kind::Ref),
-                                )
-                                .into();
+                            let code_const: super::flow::FlowValue = super::flow::Constant::new(
+                                super::flow::ConstantValue::Signed(w_code as i64),
+                                Some(Kind::Ref),
+                            )
+                            .into();
                             let name_idx_const: super::flow::FlowValue =
                                 super::flow::Constant::signed(name_idx as i64).into();
                             let _ = emit_popvalue_ref!(current_depth, py_pc);
-                            let fromlist_value =
-                                pop_ref_or_fresh(&mut current_state, &mut graph);
+                            let fromlist_value = pop_ref_or_fresh(&mut current_state, &mut graph);
                             let _ = emit_popvalue_ref!(current_depth, py_pc);
-                            let level_value =
-                                pop_ref_or_fresh(&mut current_state, &mut graph);
+                            let level_value = pop_ref_or_fresh(&mut current_state, &mut graph);
                             let result_value = emit_frontend_import_name(
                                 &mut graph,
                                 &current_block.block(),
@@ -8635,12 +8628,11 @@ impl CodeWriter {
                         Instruction::LoadSuperAttr { .. } => {
                             let name_idx = (u32::from(op_arg) >> 2) as usize;
                             let is_method = (u32::from(op_arg) & 1) != 0;
-                            let code_const: super::flow::FlowValue =
-                                super::flow::Constant::new(
-                                    super::flow::ConstantValue::Signed(w_code as i64),
-                                    Some(Kind::Ref),
-                                )
-                                .into();
+                            let code_const: super::flow::FlowValue = super::flow::Constant::new(
+                                super::flow::ConstantValue::Signed(w_code as i64),
+                                Some(Kind::Ref),
+                            )
+                            .into();
                             let name_idx_const: super::flow::FlowValue =
                                 super::flow::Constant::signed(name_idx as i64).into();
                             let _ = emit_popvalue_ref!(current_depth, py_pc);
@@ -8648,8 +8640,7 @@ impl CodeWriter {
                             let _ = emit_popvalue_ref!(current_depth, py_pc);
                             let cls_value = pop_ref_or_fresh(&mut current_state, &mut graph);
                             let _ = emit_popvalue_ref!(current_depth, py_pc);
-                            let _global_super =
-                                pop_ref_or_fresh(&mut current_state, &mut graph);
+                            let _global_super = pop_ref_or_fresh(&mut current_state, &mut graph);
                             let raw_value = emit_frontend_load_super_attr(
                                 &mut graph,
                                 &current_block.block(),
@@ -8834,12 +8825,11 @@ impl CodeWriter {
                         // resolves the variable name with.
                         Instruction::LoadFastCheck { var_num } => {
                             let idx = var_num.get(op_arg).as_usize() as u16;
-                            let code_const: super::flow::FlowValue =
-                                super::flow::Constant::new(
-                                    super::flow::ConstantValue::Signed(w_code as i64),
-                                    Some(Kind::Ref),
-                                )
-                                .into();
+                            let code_const: super::flow::FlowValue = super::flow::Constant::new(
+                                super::flow::ConstantValue::Signed(w_code as i64),
+                                Some(Kind::Ref),
+                            )
+                            .into();
                             let name_idx_const: super::flow::FlowValue =
                                 super::flow::Constant::signed(idx as i64).into();
                             emit_load_fast_ref!(current_depth, idx, py_pc);

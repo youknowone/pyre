@@ -10399,27 +10399,37 @@ fn handle(
                 switchcase,
                 op.pc
             );
-            let (opcode, promoted) = if switchcase != 0 {
-                (OpCode::GuardTrue, ctx.trace_ctx.const_int(1))
+            let opcode = if switchcase != 0 {
+                OpCode::GuardTrue
             } else {
-                (OpCode::GuardFalse, ctx.trace_ctx.const_int(0))
+                OpCode::GuardFalse
             };
             // `pyjitpl.py:511-526 opimpl_goto_if_not` calls
             // `generate_guard(opnum, box, resumepc=orgpc)`; the first
             // line of `generate_guard` (`pyjitpl.py:2583`) is
             // `if isinstance(box, Const): return` — Const boxes already
-            // pin the value and need no guard. Same gate then governs
-            // the `replace_box` / register-rewrite path
-            // (`pyjitpl.py:523-526`). Resume-data capture
-            // (`capture_resumedata(resumepc=orgpc)` at
-            // `pyjitpl.py:2603`) is omitted here: the walker's IR is
-            // rolled back via `cut_trace`, so the snapshot the trait
-            // leg builds in `trace_opcode.rs:3275 MIFrame::generate_guard`
-            // has no production effect on this leg. Once the walker
-            // becomes the production trace emitter it needs to thread
-            // `op.pc` here as resumepc and
-            // capture the active-box snapshot the same way `MIFrame`
-            // does.
+            // pin the value and need no guard.
+            //
+            // No `replace_box`/register-rewrite here: the condbox feeding
+            // GOTO_IF_NOT is always the result of an int_is_* family op
+            // (the `assert switchcase == 0 || 1` invariant above), which
+            // `opimpl_goto_if_not_int_is_true` / `_int_is_zero` / the
+            // `int_lt..float_ge` fusions all dispatch with
+            // `replace=False` (`pyjitpl.py:529-556`): "does not make sense
+            // to replace condbox, because it does not appear anywhere in
+            // any register, we either just made it or it's constant
+            // anyway".  Only the bare `opimpl_goto_if_not(replace=True)`
+            // promotes its operand, and pyre never routes a raw boolean
+            // local through this arm.  Promoting the condbox to a constant
+            // here would fold a loop-variant truth value (e.g. the kept
+            // `flag` of `x = flag and 7`, `flag = i & 1`) into a constant,
+            // making the optimizer hoist the producing op + its guard out
+            // of the steady-state loop and drop the induction variable —
+            // a non-terminating miscompile.
+            //
+            // Resume-data capture (`capture_resumedata(resumepc=orgpc)` at
+            // `pyjitpl.py:2603`) is threaded via
+            // `walker_capture_snapshot_for_last_guard(other_target)`.
             // Branch guards resume at the runtime jump destination — the
             // branch NOT taken in the trace — not the `goto_if_not` opcode
             // itself (`trace_opcode.rs:4456-4462`, `resume_pc =
@@ -10449,12 +10459,6 @@ fn handle(
                 }
                 ctx.trace_ctx.record_guard(opcode, &[valuebox], 0);
                 walker_capture_snapshot_for_last_guard(ctx, other_target)?;
-                ctx.trace_ctx.replace_box(valuebox, promoted);
-                for slot in ctx.registers_i.iter_mut() {
-                    if *slot == valuebox {
-                        *slot = promoted;
-                    }
-                }
             }
             let next_pc = if switchcase != 0 { op.next_pc } else { target };
             Ok((DispatchOutcome::Continue, next_pc))

@@ -600,10 +600,7 @@ pub fn convert_value(value: PyObjectRef, conv: i64) -> Result<PyObjectRef, crate
 /// through `format_value_dispatch` (user `__format__` may run Python →
 /// fallible); a `PY_NULL` or non-`str` `spec` reads as the empty spec
 /// (`str(value)`), matching `format_simple`.
-pub fn format_value(
-    value: PyObjectRef,
-    spec: PyObjectRef,
-) -> Result<PyObjectRef, crate::PyError> {
+pub fn format_value(value: PyObjectRef, spec: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
     let spec_str = unsafe {
         if !spec.is_null() && pyre_object::is_str(spec) {
             match pyre_object::w_str_get_wtf8(spec).as_str() {
@@ -699,8 +696,7 @@ pub fn binary_slice_values(
         }
         // Fall back to slice(start, stop) → getitem dispatch.
         // Handles bytes, bytearray, instances with __getitem__, etc.
-        let slice_obj =
-            pyre_object::sliceobject::w_slice_new(start, stop, pyre_object::w_none());
+        let slice_obj = pyre_object::sliceobject::w_slice_new(start, stop, pyre_object::w_none());
         crate::baseobjspace::getitem(obj, slice_obj)
     }
 }

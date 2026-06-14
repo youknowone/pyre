@@ -4833,7 +4833,8 @@ where
     if let Some(insn) = lower_load_super_attr_hlop_to_insn(op, ctx, get_register, lower_constant) {
         return Some(insn);
     }
-    if let Some(insn) = lower_super_attr_unwrap_hlop_to_insn(op, ctx, get_register, lower_constant) {
+    if let Some(insn) = lower_super_attr_unwrap_hlop_to_insn(op, ctx, get_register, lower_constant)
+    {
         return Some(insn);
     }
     if let Some(insn) = lower_load_deref_value_hlop_to_insn(op, ctx, get_register, lower_constant) {
@@ -5355,10 +5356,7 @@ where
                 Kind::Int,
                 vec![Operand::ConstInt(name_idx)],
             )),
-            Operand::ListOfKind(ListOfKind::new(
-                Kind::Ref,
-                vec![fromlist, level, code],
-            )),
+            Operand::ListOfKind(ListOfKind::new(Kind::Ref, vec![fromlist, level, code])),
             descr_operand,
         ],
         dst_reg,
@@ -6965,7 +6963,7 @@ mod tests {
             unary_invert_fn_idx: 0,
             unary_not_fn_idx: 0,
             load_fast_check_fn_idx: 0,
-};
+        };
         let mut on = SSARepr::new("setattr_on");
         let mut on_regallocs = make_regallocs();
         let mut on_flat =
@@ -7118,7 +7116,7 @@ mod tests {
             unary_invert_fn_idx: 0,
             unary_not_fn_idx: 0,
             load_fast_check_fn_idx: 0,
-};
+        };
 
         let mut ssarepr = SSARepr::new("retired_families");
         flatten_graph_for_test_with_lowering(&graph, &mut ssarepr, ctx, None);
@@ -7258,7 +7256,7 @@ mod tests {
             unary_invert_fn_idx: 0,
             unary_not_fn_idx: 0,
             load_fast_check_fn_idx: 0,
-};
+        };
 
         let mut ssarepr = SSARepr::new("trailing_live");
         flatten_graph_for_test_with_lowering(&graph, &mut ssarepr, ctx, None);
@@ -7361,7 +7359,7 @@ mod tests {
             unary_invert_fn_idx: 0,
             unary_not_fn_idx: 0,
             load_fast_check_fn_idx: 0,
-};
+        };
 
         let mut ssarepr = SSARepr::new("multi_block_lowering");
         flatten_graph_for_test_with_lowering(&graph, &mut ssarepr, ctx, None);
@@ -7508,7 +7506,7 @@ mod tests {
             unary_invert_fn_idx: 0,
             unary_not_fn_idx: 0,
             load_fast_check_fn_idx: 0,
-};
+        };
 
         let mut ssarepr = SSARepr::new("pyre_walker_2exit");
         flatten_graph_for_test_with_lowering(&graph, &mut ssarepr, ctx, None);
@@ -7700,7 +7698,7 @@ mod tests {
             unary_invert_fn_idx: 0,
             unary_not_fn_idx: 0,
             load_fast_check_fn_idx: 0,
-});
+        });
 
         let mut regallocs = perform_register_allocation_all_kinds(&graph);
         let ssarepr = super::flatten_graph(&graph, &mut regallocs, false, Some(&cpu));
@@ -7941,7 +7939,7 @@ mod tests {
             unary_invert_fn_idx: 0,
             unary_not_fn_idx: 0,
             load_fast_check_fn_idx: 0,
-};
+        };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
 
@@ -8048,7 +8046,7 @@ mod tests {
             unary_invert_fn_idx: 0,
             unary_not_fn_idx: 0,
             load_fast_check_fn_idx: 0,
-};
+        };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
         assert!(
@@ -8099,7 +8097,7 @@ mod tests {
             unary_invert_fn_idx: 0,
             unary_not_fn_idx: 0,
             load_fast_check_fn_idx: 0,
-};
+        };
 
         let hlop = SpaceOperation::new("sub", vec![lhs.into(), rhs.into()], Some(result.into()), 0);
         let mut get_register = identity_register_mapper();
@@ -8227,7 +8225,7 @@ mod tests {
             unary_invert_fn_idx: 0,
             unary_not_fn_idx: 0,
             load_fast_check_fn_idx: 0,
-};
+        };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
 
@@ -8370,7 +8368,7 @@ mod tests {
             unary_invert_fn_idx: 0,
             unary_not_fn_idx: 0,
             load_fast_check_fn_idx: 0,
-};
+        };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
         assert!(
@@ -8419,7 +8417,7 @@ mod tests {
             unary_invert_fn_idx: 0,
             unary_not_fn_idx: 0,
             load_fast_check_fn_idx: 0,
-};
+        };
         let hlop = SpaceOperation::new("eq", vec![lhs.into(), rhs.into()], Some(result.into()), 0);
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -8475,7 +8473,7 @@ mod tests {
             unary_invert_fn_idx: 0,
             unary_not_fn_idx: 0,
             load_fast_check_fn_idx: 0,
-};
+        };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
 
@@ -8558,7 +8556,7 @@ mod tests {
             unary_invert_fn_idx: 0,
             unary_not_fn_idx: 0,
             load_fast_check_fn_idx: 0,
-};
+        };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
         assert!(
@@ -8604,7 +8602,7 @@ mod tests {
             unary_invert_fn_idx: 0,
             unary_not_fn_idx: 0,
             load_fast_check_fn_idx: 0,
-};
+        };
         let hlop = SpaceOperation::new("bool", vec![cond.into()], Some(result.into()), 0);
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -8664,7 +8662,7 @@ mod tests {
             unary_invert_fn_idx: 0,
             unary_not_fn_idx: 0,
             load_fast_check_fn_idx: 0,
-};
+        };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
 
@@ -8740,7 +8738,7 @@ mod tests {
             unary_invert_fn_idx: 0,
             unary_not_fn_idx: 0,
             load_fast_check_fn_idx: 0,
-};
+        };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
         assert!(
@@ -8801,7 +8799,7 @@ mod tests {
             unary_invert_fn_idx: 0,
             unary_not_fn_idx: 0,
             load_fast_check_fn_idx: 0,
-};
+        };
         let hlop = SpaceOperation::new(
             "setitem",
             vec![obj.into(), key.into(), value.into()],
@@ -8877,7 +8875,7 @@ mod tests {
             unary_invert_fn_idx: 0,
             unary_not_fn_idx: 0,
             load_fast_check_fn_idx: 0,
-};
+        };
         let mut get_register_a = identity_register_mapper();
         let mut get_register_b = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -8929,7 +8927,7 @@ mod tests {
             unary_invert_fn_idx: 0,
             unary_not_fn_idx: 0,
             load_fast_check_fn_idx: 0,
-};
+        };
         let mut get_register_a = identity_register_mapper();
         let mut get_register_b = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -8981,7 +8979,7 @@ mod tests {
             unary_invert_fn_idx: 0,
             unary_not_fn_idx: 0,
             load_fast_check_fn_idx: 0,
-};
+        };
         let mut get_register_a = identity_register_mapper();
         let mut get_register_b = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -9038,7 +9036,7 @@ mod tests {
             unary_invert_fn_idx: 0,
             unary_not_fn_idx: 0,
             load_fast_check_fn_idx: 0,
-};
+        };
         let mut get_register_a = identity_register_mapper();
         let mut get_register_b = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -9109,7 +9107,7 @@ mod tests {
             unary_invert_fn_idx: 0,
             unary_not_fn_idx: 0,
             load_fast_check_fn_idx: 0,
-};
+        };
         let mut get_register_a = identity_register_mapper();
         let mut get_register_b = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -10503,7 +10501,7 @@ mod tests {
             unary_invert_fn_idx: 0,
             unary_not_fn_idx: 0,
             load_fast_check_fn_idx: 0,
-};
+        };
         flatten_graph_for_test_with_lowering(&graph, &mut ssarepr, ctx, Some(cpu));
         ssarepr
     }
@@ -10796,7 +10794,7 @@ mod tests {
             unary_invert_fn_idx: 0,
             unary_not_fn_idx: 0,
             load_fast_check_fn_idx: 0,
-};
+        };
         let null_or_self_var = Variable::new(VariableId(10), Kind::Ref);
         let op = super::super::flow::SpaceOperation::new(
             "simple_call",
@@ -11986,14 +11984,15 @@ mod tests {
                     Operand::ListOfKind(list) => {
                         assert_eq!(list.kind, Kind::Ref);
                         match &list.content[..] {
-                            [Operand::Register(fl), Operand::Register(lv), Operand::ConstRef(0x2000)] =>
-                            {
+                            [
+                                Operand::Register(fl),
+                                Operand::Register(lv),
+                                Operand::ConstRef(0x2000),
+                            ] => {
                                 assert_eq!(fl.index, 101, "leading Ref operand must be fromlist");
                                 assert_eq!(lv.index, 103, "second Ref operand must be level");
                             }
-                            other => panic!(
-                                "ListR must be [fromlist, level, code], got {other:?}"
-                            ),
+                            other => panic!("ListR must be [fromlist, level, code], got {other:?}"),
                         }
                     }
                     other => panic!("expected ListR, got {other:?}"),
@@ -12082,7 +12081,11 @@ mod tests {
                     Operand::ListOfKind(list) => {
                         assert_eq!(list.kind, Kind::Ref);
                         match &list.content[..] {
-                            [Operand::Register(s), Operand::Register(c), Operand::ConstRef(0x2000)] => {
+                            [
+                                Operand::Register(s),
+                                Operand::Register(c),
+                                Operand::ConstRef(0x2000),
+                            ] => {
                                 assert_eq!(s.index, 101, "leading Ref operand must be self");
                                 assert_eq!(c.index, 103, "second Ref operand must be cls");
                             }
@@ -12289,13 +12292,9 @@ mod tests {
             _ => panic!("unexpected var id {:?}", var.id),
         };
         let mut lower_constant = super::flatten_constant_operand_for_test;
-        let insn = super::lower_delsubscr_hlop_to_insn(
-            &op,
-            &ctx,
-            &mut get_register,
-            &mut lower_constant,
-        )
-        .expect("2-arg delete_subscr lowering must succeed");
+        let insn =
+            super::lower_delsubscr_hlop_to_insn(&op, &ctx, &mut get_register, &mut lower_constant)
+                .expect("2-arg delete_subscr lowering must succeed");
         match insn {
             Insn::Op {
                 opname,
