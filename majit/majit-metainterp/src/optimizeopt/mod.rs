@@ -1107,7 +1107,7 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
                 Some(majit_ir::VirtualFieldsInfo {
                     descr: None,
                     known_class: None,
-                    field_oprefs: vec![self.ctx.get_replacement_opref(vi.parent)],
+                    field_oprefs: vec![self.ctx.get_replacement_opref(vi.parent.to_opref())],
                 })
             }
             // vstring.py:207-208 VStringPlainInfo._visitor_walk_recursive:
@@ -9430,7 +9430,7 @@ mod constant_ptr_info_tests {
             &slice_box,
             PtrInfo::VirtualRawSlice(VirtualRawSliceInfo {
                 offset: 8,
-                parent,
+                parent: crate::r#box::BoxRef::from_opref(parent),
                 last_guard_pos: -1,
                 avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
             }),

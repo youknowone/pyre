@@ -1203,7 +1203,7 @@ fn force_box_impl(
             // Overwriting with `PtrInfo::nonnull()` would lose the
             // raw-slice identity and mis-route any later
             // `get_virtual_fields` / raw-guard path.
-            let parent_forced = force_child(slice.parent, ctx);
+            let parent_forced = force_child(slice.parent.to_opref(), ctx);
             let offset_ref = ctx.emit_constant_int(slice.offset as i64);
             let arg_parent = ctx.materialize_box_at(parent_forced);
             let arg_offset = ctx.materialize_box_at(offset_ref);
@@ -1219,7 +1219,7 @@ fn force_box_impl(
                     &b,
                     PtrInfo::VirtualRawSlice(VirtualRawSliceInfo {
                         offset: slice.offset,
-                        parent: OpRef::NONE,
+                        parent: BoxRef::none(),
                         last_guard_pos: slice.last_guard_pos,
                         avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
                     }),

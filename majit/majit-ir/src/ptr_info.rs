@@ -304,7 +304,7 @@ pub struct VirtualRawSliceInfo {
     /// OpRef of the parent VirtualRawBuffer (or another VirtualRawSlice
     /// — `optimize_int_add` flattens chained slices when the underlying
     /// info is `VirtualRawBufferInfo`/`VirtualRawSliceInfo`).
-    pub parent: OpRef,
+    pub parent: BoxRef,
     /// info.py:91-92
     pub last_guard_pos: i32,
     /// info.py `_cached_vinfo` — see AbstractVirtualPtrInfo.
@@ -545,7 +545,7 @@ impl PtrInfo {
                     visit_opref(opref, visitor);
                 }
             }
-            PtrInfo::VirtualRawSlice(info) => visit_opref(&mut info.parent, visitor),
+            PtrInfo::VirtualRawSlice(info) => info.parent.walk_const_ptr_refs(visitor),
             PtrInfo::Virtualizable(info) => {
                 for (_, opref) in &mut info.fields {
                     visit_opref(opref, visitor);
@@ -836,7 +836,7 @@ impl PtrInfo {
                 .flat_map(|fields| fields.iter().map(|(_, r)| *r))
                 .collect(),
             PtrInfo::VirtualRawBuffer(v) => v.buffer.values().to_vec(),
-            PtrInfo::VirtualRawSlice(v) => vec![v.parent],
+            PtrInfo::VirtualRawSlice(v) => vec![v.parent.to_opref()],
             PtrInfo::Virtualizable(v) => {
                 let mut refs: Vec<OpRef> = v.fields.iter().map(|(_, r)| *r).collect();
                 for (_, items) in &v.arrays {

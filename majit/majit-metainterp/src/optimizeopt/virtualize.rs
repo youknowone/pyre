@@ -425,7 +425,7 @@ impl OptVirtualize {
     ) {
         let opinfo = crate::optimizeopt::info::VirtualRawSliceInfo {
             offset,
-            parent,
+            parent: BoxRef::from_opref(parent),
             last_guard_pos: -1,
             avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
         };
@@ -468,7 +468,7 @@ impl OptVirtualize {
                     // signed addends is always representable. In Rust we
                     // bail on i64 overflow rather than wrap.
                     total_offset = total_offset.checked_add(slice.offset)?;
-                    current = slice.parent;
+                    current = slice.parent.to_opref();
                 }
                 Some(PtrInfo::VirtualRawBuffer(_)) => return Some((current, total_offset)),
                 _ => return None,
