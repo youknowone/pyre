@@ -316,6 +316,17 @@ fn save_object(ctx: &mut PickleCtx, buf: &mut Framer, w_obj: PyObjectRef) -> Res
         return save_bytearray(ctx, buf, w_obj);
     }
 
+    // `save_picklebuffer` (protocol 5 out-of-band buffers) is deferred. The
+    // CPython surface is `Pickler(file, protocol, *, buffer_callback=None)`
+    // and `Unpickler(file, *, buffers=None)` with keyword-only arguments, but
+    // `#[pyre_class]` `__init__` does not bind keyword arguments (module-level
+    // functions do; constructors do not), so `buffer_callback` / `buffers`
+    // cannot be supplied without diverging from CPython's keyword-only
+    // signature. The NEXT_BUFFER / READONLY_BUFFER opcodes are reserved in the
+    // `op` module for when that ABI gap is closed. PickleBuffer in-band is the
+    // CPython default (buffer_callback=None) but reduces to plain bytes /
+    // bytearray, so nothing is lost by routing those through the normal path.
+
     // Classes and functions are saved by reference.
     if unsafe { pyre_object::typeobject::is_type(w_obj) }
         || unsafe { crate::function::is_function(w_obj) }

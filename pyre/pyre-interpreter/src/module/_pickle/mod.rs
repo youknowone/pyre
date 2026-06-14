@@ -83,6 +83,9 @@ pub(crate) mod op {
     pub const ADDITEMS: u8 = 0x90;
     // bytearray
     pub const BYTEARRAY8: u8 = 0x96;
+    // protocol 5 out-of-band buffers (see the deferral note in `pickler.rs`).
+    pub const NEXT_BUFFER: u8 = 0x97;
+    pub const READONLY_BUFFER: u8 = 0x98;
     // reduce / global
     pub const REDUCE: u8 = b'R';
     pub const BUILD: u8 = b'b';
