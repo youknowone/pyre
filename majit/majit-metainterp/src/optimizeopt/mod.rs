@@ -4354,6 +4354,16 @@ impl OptContext {
     /// matching upstream totality and the `a-producerless` arm of
     /// `classify_s9_fallback` ("an unforwarded box returns itself").
     pub fn get_box_replacement(&self, opref: OpRef) -> crate::r#box::BoxRef {
+        // The sentinel `OpRef::none()` (absent operand: empty fail_arg slot,
+        // unset lazy setfield) is not a value-bearing position — its total
+        // resolution is the `none()` box itself, which `from_opref` already
+        // round-trips below. Resolve it here so the "box must exist" assert
+        // and the `s9_probe`/`from_opref` fallback apply only to value-bearing
+        // positions, matching the explicit NONE handling in `resolve_to_boxref`
+        // / `materialize_box_at` / `clear_forwarded`.
+        if opref.is_none() {
+            return crate::r#box::BoxRef::none();
+        }
         if let Some(b) = self.get_box_replacement_box(opref) {
             return b;
         }
