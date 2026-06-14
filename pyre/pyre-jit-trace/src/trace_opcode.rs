@@ -8250,6 +8250,40 @@ impl MIFrame {
             return Ok(Some(pyre_interpreter::StepResult::Continue));
         }
 
+        // BUILD_TUPLE / UNPACK_SEQUENCE walker activation via trait-path
+        // delegation.
+        //
+        // These two opcodes carry a specialised, virtualization-aware
+        // recorder (`MIFrame::trace_build_tuple_value` /
+        // `unpack_sequence_value`): the arity-2 int/float build emits
+        // `NewWithVtable` + inline `value0`/`value1` `SetfieldGc` + paired
+        // `w_class` guards so `OptVirtualize` can elide a tuple that is
+        // built only to be immediately unpacked (`makespecialisedtuple2`
+        // parity).  The auto-gen arm jitcode records the OPAQUE
+        // `bh_build_tuple` residual instead, which OptVirtualize cannot see
+        // through (it also aborts `InlineCallArityMismatch` when the tuple
+        // flows through an inlined call).  Routing through the generic arm
+        // walk would therefore both lose the virtualization and abort on
+        // inlined tuples — so dispatch them here, reusing the exact shared
+        // opcode functions the trait leg runs
+        // (`OpcodeStepExecutor::build_tuple` → `opcode_build_tuple` →
+        // `pop_n` + `SharedOpcodeHandler::build_tuple` + `push_value`).
+        // `pop_n`/`pop_value`/`push_value` update the symbolic + concrete-
+        // shadow stacks + vsd shadow, so this bypasses
+        // `apply_walker_stack_effect` (the early `return` below skips both
+        // the arm walk and the post-walk resync).  Same delegation pattern
+        // as the StoreSubscr / PushNull / Reraise hooks above.
+        if let Instruction::BuildTuple { count } = instruction {
+            use pyre_interpreter::OpcodeStepExecutor;
+            OpcodeStepExecutor::build_tuple(self, count.get(op_arg) as usize)?;
+            return Ok(Some(pyre_interpreter::StepResult::Continue));
+        }
+        if let Instruction::UnpackSequence { count } = instruction {
+            use pyre_interpreter::OpcodeStepExecutor;
+            OpcodeStepExecutor::unpack_sequence(self, count.get(op_arg) as usize)?;
+            return Ok(Some(pyre_interpreter::StepResult::Continue));
+        }
+
         Ok(None)
     }
 
@@ -9323,15 +9357,18 @@ pub fn production_walker_handles(instruction: &Instruction) -> bool {
     // through `ref_copy/r>r` (`assembler.rs::emit_const_r`), so arms
     // decode without residual-call wrappers around unit variants.
     //
-    // BuildTuple / UnpackSequence are intentionally NOT in this set: the
-    // trait-dispatch handlers (`trace_build_tuple_value`,
-    // `unpack_sequence_value`) carry the specialised arity-2 tuple
-    // build/unpack fast paths, and the walker's jitcode dispatch cannot
-    // yet express them (it aborts with `InlineCallArityMismatch` when the
-    // tuple flows through an inlined call). Keep them on the trait path
-    // until the walker can encode the specialised tuple layout.
+    // BuildTuple / UnpackSequence are walker-handled via the
+    // `try_walker_direct_opcode_dispatch` entry hook (NOT the auto-gen arm
+    // jitcode): the hook delegates to `OpcodeStepExecutor::build_tuple` /
+    // `unpack_sequence`, which run the specialised arity-2 tuple
+    // build/unpack fast paths (`trace_build_tuple_value` /
+    // `unpack_sequence_value`).  The generic arm jitcode CANNOT express
+    // those (it records the opaque `bh_build_tuple` residual and aborts
+    // `InlineCallArityMismatch` when the tuple flows through an inlined
+    // call), so the direct hook is the orthodox dispatch — the same shape
+    // as the StoreSubscr / PushNull / Reraise hooks.
     //
-    // StoreFastStoreFast is also excluded: its codewriter arm lowers to a
+    // StoreFastStoreFast is still excluded: its codewriter arm lowers to a
     // chain of `residual_call` ops whose funcptr `constants_i` entries are
     // unresolved placeholders (not patched by `patch_constants_i_fnaddrs`,
     // which only rewrites build→runtime fnaddr pairs). The walker reads one
@@ -9518,6 +9555,15 @@ pub fn production_walker_handles(instruction: &Instruction) -> bool {
             // vsd-resync route loses the push and underflows the
             // following CALL.
             | Instruction::PushNull
+            // BuildTuple / UnpackSequence handled by the
+            // dispatch_via_walker_for_opcode entry hook, delegating to the
+            // specialised `OpcodeStepExecutor::build_tuple` /
+            // `unpack_sequence` recorders (see the hook comment): the
+            // generic arm records an opaque residual that loses
+            // OptVirtualize's build→unpack elision and aborts
+            // `InlineCallArityMismatch` on inlined tuples.
+            | Instruction::BuildTuple { .. }
+            | Instruction::UnpackSequence { .. }
     )
 }
 
