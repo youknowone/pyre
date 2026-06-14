@@ -2593,6 +2593,26 @@ fn emit_frontend_store_attr(
     );
 }
 
+/// DELETE_ATTR — the residual counterpart of [`emit_frontend_store_attr`]
+/// with no stored value.  Records the 3-arg `delete_attr(obj, code,
+/// name_idx)` HLOp (void result) that `flatten.rs::lower_delete_attr_hlop_to_insn`
+/// threads into the `bh_delete_attr_fn(obj, code, name_idx)` residual.
+fn emit_frontend_delete_attr(
+    block: &super::flow::BlockRef,
+    obj: super::flow::FlowValue,
+    code_const: super::flow::FlowValue,
+    name_idx_const: super::flow::FlowValue,
+    offset: i64,
+) {
+    record_graph_op(
+        block,
+        "delete_attr",
+        vec![obj.into(), code_const.into(), name_idx_const.into()],
+        None,
+        offset,
+    );
+}
+
 fn emit_frontend_getattr(
     graph: &mut super::flow::FunctionGraph,
     block: &super::flow::BlockRef,
@@ -3234,6 +3254,7 @@ struct FnPtrIndices {
     build_map_from_array_fn: HelperHandle,
     binary_slice_fn: HelperHandle,
     delete_subscr_fn: HelperHandle,
+    delete_attr_fn: HelperHandle,
 }
 
 /// Register every blackhole helper fn pointer with the assembler in
@@ -3484,6 +3505,14 @@ fn register_helper_fn_pointers(
         cpu.delete_subscr_fn as *const (),
         CallFlavor::MayForce,
     );
+    // `bh_delete_attr_fn` runs `del obj.name` via `baseobjspace::delattr_str`;
+    // a user `__delattr__` can run Python and force virtualizables → `MayForce`.
+    // Appended last to preserve fn_ptr indices.
+    let delete_attr_fn = bind(
+        assembler,
+        cpu.delete_attr_fn as *const (),
+        CallFlavor::MayForce,
+    );
     FnPtrIndices {
         call_fn,
         load_global_fn,
@@ -3518,6 +3547,7 @@ fn register_helper_fn_pointers(
         build_map_from_array_fn,
         binary_slice_fn,
         delete_subscr_fn,
+        delete_attr_fn,
     }
 }
 
@@ -4444,6 +4474,11 @@ impl CodeWriter {
                     idx: delete_subscr_fn_idx,
                     flavor: _delete_subscr_fn_flavor,
                 },
+            delete_attr_fn:
+                HelperHandle {
+                    idx: delete_attr_fn_idx,
+                    flavor: _delete_attr_fn_flavor,
+                },
         } = register_helper_fn_pointers(&mut assembler, self.cpu());
 
         // codewriter.py:37 `portal_jd = self.callcontrol.jitdriver_sd_from_portal_graph(graph)`
@@ -4509,6 +4544,7 @@ impl CodeWriter {
                 build_map_from_array_fn_idx,
                 binary_slice_fn_idx,
                 delete_subscr_fn_idx,
+                delete_attr_fn_idx,
             });
         }
 
@@ -8029,9 +8065,32 @@ impl CodeWriter {
                         }
 
                         // DeleteAttr: pops 1 (obj). Net: -1.
-                        Instruction::DeleteAttr { .. } => {
-                            pop_and_decr_depth(&mut current_state, &mut current_depth);
-                            emit_abort_permanent!(py_pc);
+                        Instruction::DeleteAttr { namei } => {
+                            let name_idx = namei.get(op_arg) as usize;
+                            // rtyper-surrogate operands threaded into the
+                            // `bh_delete_attr_fn(obj, code, name_idx)` residual,
+                            // identical to the StoreAttr arm: the jitcode's own
+                            // W_CodeObject as a post-rtype `Signed(ptr) + Kind::Ref`
+                            // constant and the `co_names` index the helper resolves
+                            // the name with.
+                            let code_const: super::flow::FlowValue =
+                                super::flow::Constant::new(
+                                    super::flow::ConstantValue::Signed(w_code as i64),
+                                    Some(Kind::Ref),
+                                )
+                                .into();
+                            let name_idx_const: super::flow::FlowValue =
+                                super::flow::Constant::signed(name_idx as i64).into();
+                            current_depth = current_depth.saturating_sub(1);
+                            emit_vsd!(current_depth, py_pc);
+                            let obj_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            emit_frontend_delete_attr(
+                                &current_block.block(),
+                                obj_value,
+                                code_const,
+                                name_idx_const,
+                                py_pc as i64,
+                            );
                         }
 
                         // PopJumpIfNone / PopJumpIfNotNone: pops 1. Net: -1.

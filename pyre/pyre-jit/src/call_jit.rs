@@ -3403,6 +3403,37 @@ pub extern "C" fn bh_store_attr_fn(obj: i64, value: i64, w_code_ptr: i64, name_i
     0
 }
 
+/// DELETE_ATTR residual (`delete_attr` HLOp → `residual_call_ir_v`).
+/// Resolves the `co_names` name through the jitcode's own code object
+/// (same invariant as `bh_store_attr_fn`) and runs `del obj.name` through
+/// `baseobjspace::delattr_str`.  A user `__delattr__` may run Python
+/// (`MayForce`); on error the exception is published through
+/// `BH_LAST_EXC_VALUE` for the trailing `GuardNoException` and the call
+/// returns 0.
+pub extern "C" fn bh_delete_attr_fn(obj: i64, w_code_ptr: i64, name_idx: i64) -> i64 {
+    let code = unsafe {
+        &*(pyre_interpreter::w_code_get_ptr(w_code_ptr as pyre_object::PyObjectRef)
+            as *const pyre_interpreter::CodeObject)
+    };
+    let idx = name_idx as usize;
+    debug_assert!(
+        idx < code.names.len(),
+        "bh_delete_attr_fn name_idx {idx} out of range ({} names) — codegen invariant",
+        code.names.len()
+    );
+    if idx >= code.names.len() {
+        return 0;
+    }
+    let name = code.names[idx].as_ref();
+    if let Err(err) =
+        pyre_interpreter::baseobjspace::delattr_str(obj as pyre_object::PyObjectRef, name)
+    {
+        let exc_obj = err.to_exc_object();
+        majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc_obj as i64));
+    }
+    0
+}
+
 /// BINARY_SLICE residual (`binary_slice` HLOp → `residual_call_r_r`).
 /// Computes `obj[start:stop]` through the shared
 /// `runtime_ops::binary_slice_values` (the same code the interpreter's

@@ -58,6 +58,9 @@ pub struct Cpu {
     pub binary_slice_fn: extern "C" fn(i64, i64, i64) -> i64,
     /// DELETE_SUBSCR residual — `(obj, index) → void` (`del obj[index]`).
     pub delete_subscr_fn: extern "C" fn(i64, i64) -> i64,
+    /// DELETE_ATTR residual — `(obj, code, name_idx) → void` (`del obj.name`).
+    /// Resolves the name from the code object and runs generic `delattr`.
+    pub delete_attr_fn: extern "C" fn(i64, i64, i64) -> i64,
     /// `bhimpl_compare_op` — RPython compare_op opcodes.
     pub compare_fn: extern "C" fn(i64, i64, i64) -> i64,
     /// `bhimpl_binary_op` — RPython binary_op opcodes.
@@ -188,6 +191,7 @@ impl Cpu {
             store_attr_fn: crate::call_jit::bh_store_attr_fn,
             binary_slice_fn: crate::call_jit::bh_binary_slice_fn,
             delete_subscr_fn: crate::call_jit::bh_delete_subscr_fn,
+            delete_attr_fn: crate::call_jit::bh_delete_attr_fn,
             compare_fn: crate::call_jit::bh_compare_fn,
             binary_op_fn: crate::call_jit::bh_binary_op_fn,
             box_int_fn: crate::call_jit::bh_box_int_fn,
