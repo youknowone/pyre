@@ -3545,7 +3545,8 @@ impl<'a> Lowering<'a> {
                 if args.len() == 1
                     && (matches!(self.blanket_into_devirt(&reg), Some(IntoDevirt::Identity))
                         || self.trait_clause_into_string_identity(&reg, &call.dest.ty)
-                        || self.is_noop_ptr_cast(&reg))
+                        || self.is_noop_ptr_cast(&reg)
+                        || self.is_reflexive_into_iter(&reg))
                 {
                     self.local_var[dest_local] = Some(args[0].clone());
                     let target_bb = self.block_id[target];
@@ -4278,6 +4279,22 @@ impl<'a> Lowering<'a> {
                     | "core::ptr::const_ptr::<Impl>::cast"
                     | "core::ptr::mut_ptr::<Impl>::cast"
             )
+        })
+    }
+
+    /// The blanket `impl<I: Iterator> IntoIterator for I`
+    /// (`core::iter::traits::collect`) — its `into_iter(self) -> I`
+    /// returns the receiver unchanged, so a `for` desugar's `into_iter`
+    /// callsite aliases its argument instead of calling core's identity
+    /// body (an unregistered callee).  Container impls
+    /// (`Vec`/array/`Range`) live under other module paths, so the exact
+    /// path match selects only the reflexive blanket.
+    fn is_reflexive_into_iter(&self, reg: &RegularCall) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        self.llbc.fn_by_id(*id).is_some_and(|fd| {
+            fd.item_meta.name_path() == "core::iter::traits::collect::<Impl>::into_iter"
         })
     }
 
