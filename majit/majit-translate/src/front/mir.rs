@@ -3664,25 +3664,22 @@ impl<'a> Lowering<'a> {
                 )? {
                     return Ok(());
                 }
-                let alias = if let Some(payload) =
-                    self.expect_on_const_ok(&segments, &args, &arg_locals)
-                {
-                    // Identity unwrap: the receiver variable was bound
-                    // directly to the `Ok` payload, so the result is
-                    // that variable — bind and close the block with no
-                    // op emitted.
-                    Some(payload)
-                } else {
-                    self.reflexive_into_alias(
-                        &segments,
-                        &args,
-                        first_arg_ty.as_ref(),
-                        &call.dest.ty,
-                    )
-                    .or_else(|| {
-                        self.trait_into_string_alias(&segments, &args, &call.dest.ty)
-                    })
-                };
+                let alias =
+                    if let Some(payload) = self.expect_on_const_ok(&segments, &args, &arg_locals) {
+                        // Identity unwrap: the receiver variable was bound
+                        // directly to the `Ok` payload, so the result is
+                        // that variable — bind and close the block with no
+                        // op emitted.
+                        Some(payload)
+                    } else {
+                        self.reflexive_into_alias(
+                            &segments,
+                            &args,
+                            first_arg_ty.as_ref(),
+                            &call.dest.ty,
+                        )
+                        .or_else(|| self.trait_into_string_alias(&segments, &args, &call.dest.ty))
+                    };
                 if let Some(value) = alias {
                     self.local_var[dest_local] = Some(value);
                     let bb_id = self.block_id[mir_bb];
@@ -6394,10 +6391,7 @@ fn typevar_bounded_by_into_string(
     else {
         return false;
     };
-    fn strip<'a>(
-        llbc: &'a Llbc,
-        mut v: &'a serde_json::Value,
-    ) -> Option<&'a serde_json::Value> {
+    fn strip<'a>(llbc: &'a Llbc, mut v: &'a serde_json::Value) -> Option<&'a serde_json::Value> {
         loop {
             let obj = v.as_object()?;
             if let Some(id) = obj.get("Deduplicated").and_then(serde_json::Value::as_u64) {

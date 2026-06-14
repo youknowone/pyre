@@ -2131,8 +2131,7 @@ pub(crate) fn derive_subject_inputcells(
                 // otherwise seed a `SomeInstance(String)` shell whose
                 // field writes poison classdef attr cells with
                 // instance-annotated strings.
-                if class_root.as_deref() == Some("String") || class_root.as_deref() == Some("str")
-                {
+                if class_root.as_deref() == Some("String") || class_root.as_deref() == Some("str") {
                     cells.push(crate::annotator::model::s_unicode0());
                     continue;
                 }

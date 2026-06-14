@@ -1886,11 +1886,14 @@ impl Bookkeeper {
     /// function source for a field attribute would union-conflict in
     /// `generalize_attr`.
     pub fn pyre_struct_root_has_field(&self, root: &str, name: &str) -> bool {
-        self.pyre_struct_fields.borrow().as_ref().is_some_and(|reg| {
-            reg.fields
-                .get(root)
-                .is_some_and(|rows| rows.iter().any(|(field, _)| field == name))
-        })
+        self.pyre_struct_fields
+            .borrow()
+            .as_ref()
+            .is_some_and(|reg| {
+                reg.fields
+                    .get(root)
+                    .is_some_and(|rows| rows.iter().any(|(field, _)| field == name))
+            })
     }
 
     /// TODO: no upstream equivalent.  Project a Rust type

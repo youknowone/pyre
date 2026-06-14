@@ -393,9 +393,7 @@ impl<'a> Drop for AddedBlocksGuard<'a> {
                             .cloned()
                             .flatten()
                             .or_else(|| {
-                                blocked_blocks
-                                    .get(k)
-                                    .map(|(_, g, _)| std::rc::Rc::clone(g))
+                                blocked_blocks.get(k).map(|(_, g, _)| std::rc::Rc::clone(g))
                             })
                             .is_some_and(|g| fixed.contains_key(&GraphKey::of(&g))),
                         Err(_) => false,
