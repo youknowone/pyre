@@ -82,6 +82,16 @@ pub(crate) mod op {
     pub const ADDITEMS: u8 = 0x90;
     // bytearray
     pub const BYTEARRAY8: u8 = 0x96;
+    // reduce / global
+    pub const REDUCE: u8 = b'R';
+    pub const BUILD: u8 = b'b';
+    pub const GLOBAL: u8 = b'c';
+    pub const STACK_GLOBAL: u8 = 0x93;
+    pub const NEWOBJ: u8 = 0x81;
+    pub const NEWOBJ_EX: u8 = 0x92;
+    pub const EXT1: u8 = 0x82;
+    pub const EXT2: u8 = 0x83;
+    pub const EXT4: u8 = 0x84;
 
     /// `_tuplesize2code` — TUPLE1/2/3 indexed by element count (1..=3).
     pub const TUPLESIZE2CODE: [u8; 4] = [EMPTY_TUPLE, TUPLE1, TUPLE2, TUPLE3];
@@ -121,6 +131,84 @@ pub(crate) fn call_meth(
 // text on a generic error.
 pub(crate) fn unpickling_error(msg: &str) -> PyError {
     PyError::value_error(msg)
+}
+
+pub(crate) fn pickling_error(msg: impl Into<String>) -> PyError {
+    PyError::value_error(msg.into())
+}
+
+// ── import / dotted attribute resolution (save_global / find_class) ───
+
+/// Return the named module from `sys.modules`, importing it only if absent.
+/// An already-loaded module is returned directly: re-running `importhook`
+/// for a loaded module (notably `builtins`) can rebind the canonical module
+/// object and corrupt name resolution elsewhere. The `sys.modules` entry
+/// (not the `importhook` return) is authoritative.
+pub(crate) fn import_module(name: &str) -> Result<PyObjectRef, PyError> {
+    if let Some(m) = crate::importing::get_sys_module(name) {
+        return Ok(m);
+    }
+    // The `builtins` module lives on the execution context, not in the
+    // importable `sys.modules` cache; re-running `importhook` on it would
+    // reinitialise builtin state (and orphan the live exception classes).
+    if name == "builtins" {
+        if let Some(b) = ec_builtins_module() {
+            return Ok(b);
+        }
+    }
+    crate::importing::importhook(
+        name,
+        pyre_object::w_none(),
+        pyre_object::listobject::w_list_new(vec![pyre_object::w_str_new("*")]),
+        0,
+        crate::call::getexecutioncontext(),
+    )?;
+    crate::importing::get_sys_module(name)
+        .ok_or_else(|| PyError::value_error(format!("Can't find module {name:?} in sys.modules")))
+}
+
+/// The live execution context reached via the current frame, or `None`
+/// when no frame is on the stack.
+fn current_ec() -> Option<*const crate::PyExecutionContext> {
+    let frame = crate::eval::CURRENT_FRAME.with(|f| f.get());
+    if frame.is_null() {
+        return None;
+    }
+    let ec = unsafe { (*frame).execution_context };
+    if ec.is_null() { None } else { Some(ec) }
+}
+
+/// The current execution context's `builtins` module, via the live frame.
+fn ec_builtins_module() -> Option<PyObjectRef> {
+    current_ec().map(|ec| unsafe { (*ec).get_builtin() })
+}
+
+/// Resolve a name in the `builtins` module through the execution context's
+/// `lookup_builtin` (the `LOAD_GLOBAL` fallback path). This bypasses the
+/// module-object `getattr` wrapper, whose hash table does not see builtins
+/// installed on the underlying storage.
+pub(crate) fn lookup_builtin(name: &str) -> Option<PyObjectRef> {
+    current_ec().and_then(|ec| unsafe { (*ec).lookup_builtin(name) })
+}
+
+/// `interp_pickle.py _getattribute` — walk a dotted `qualname` from `obj`,
+/// returning `(resolved, parent)`.
+pub(crate) fn getattribute_dotted(
+    obj: PyObjectRef,
+    qualname: &str,
+) -> Result<(PyObjectRef, PyObjectRef), PyError> {
+    let mut cur = obj;
+    let mut parent = obj;
+    for sub in qualname.split('.') {
+        if sub == "<locals>" {
+            return Err(PyError::attribute_error(format!(
+                "Can't get local attribute {qualname:?}"
+            )));
+        }
+        parent = cur;
+        cur = crate::baseobjspace::getattr_str(cur, sub)?;
+    }
+    Ok((cur, parent))
 }
 
 // ── encode_long / decode_long — two's-complement little-endian ───────

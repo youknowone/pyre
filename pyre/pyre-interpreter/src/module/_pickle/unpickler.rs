@@ -5,8 +5,8 @@ use pyre_object::PyObjectRef;
 use crate::PyError;
 
 use super::{
-    HIGHEST_PROTOCOL, call_fn, call_meth, decode_long, op, read_int_le, str_from_utf8,
-    unpickling_error,
+    HIGHEST_PROTOCOL, call_fn, call_meth, decode_long, getattribute_dotted, import_module, op,
+    read_int_le, str_from_utf8, unpickling_error,
 };
 
 #[crate::pyre_class("_pickle.Unpickler")]
@@ -392,6 +392,55 @@ fn dispatch(slot: usize, opcode: u8) -> Result<(), PyError> {
             let d = read(slot, n)?;
             push(slot, pyre_object::bytearrayobject::w_bytearray_from_bytes(&d));
         }
+        // ── global / reduce / build ───────────────────────────────────
+        x if x == op::GLOBAL => {
+            let module = read_line(slot)?;
+            let name = read_line(slot)?;
+            let proto = cur(slot).proto;
+            push(slot, find_class(&module, &name, proto)?);
+        }
+        x if x == op::STACK_GLOBAL => {
+            let w_name = pop(slot)?;
+            let w_module = pop(slot)?;
+            if !unsafe { pyre_object::is_str(w_name) } || !unsafe { pyre_object::is_str(w_module) } {
+                return Err(unpickling_error("STACK_GLOBAL requires str"));
+            }
+            let name = unsafe { pyre_object::strobject::w_str_get_value(w_name) }.to_string();
+            let module = unsafe { pyre_object::strobject::w_str_get_value(w_module) }.to_string();
+            let proto = cur(slot).proto;
+            push(slot, find_class(&module, &name, proto)?);
+        }
+        x if x == op::REDUCE => {
+            let w_args = pop(slot)?;
+            let w_func = pop(slot)?;
+            let args = tuple_items(w_args);
+            let w_obj = call_fn(w_func, &args)?;
+            push(slot, w_obj);
+        }
+        x if x == op::NEWOBJ => {
+            let w_args = pop(slot)?;
+            let w_cls = pop(slot)?;
+            let w_obj = new_instance(w_cls, &tuple_items(w_args))?;
+            push(slot, w_obj);
+        }
+        x if x == op::NEWOBJ_EX => {
+            let w_kwargs = pop(slot)?;
+            let w_args = pop(slot)?;
+            let w_cls = pop(slot)?;
+            let kw_len = unsafe { pyre_object::dictmultiobject::w_dict_items(w_kwargs) }.len();
+            if kw_len > 0 {
+                return Err(PyError::not_implemented(
+                    "_pickle: NEWOBJ_EX with kwargs",
+                ));
+            }
+            let w_obj = new_instance(w_cls, &tuple_items(w_args))?;
+            push(slot, w_obj);
+        }
+        x if x == op::BUILD => {
+            let w_state = pop(slot)?;
+            let w_inst = top(slot, "BUILD")?;
+            build_instance(w_inst, w_state)?;
+        }
         // ── memo ──────────────────────────────────────────────────────
         x if x == op::MEMOIZE => {
             let v = top(slot, "MEMOIZE")?;
@@ -482,20 +531,93 @@ fn dict_update_from_pairs(w_dict: PyObjectRef, items: PyObjectRef) -> Result<(),
     Ok(())
 }
 
-/// Read a newline-terminated decimal integer argument (GET / PUT in the
-/// text protocols).
-fn read_line_int(slot: usize) -> Result<i64, PyError> {
-    let mut digits: Vec<u8> = Vec::new();
+/// Read a newline-terminated line (without the trailing newline).
+fn read_line(slot: usize) -> Result<String, PyError> {
+    let mut bytes: Vec<u8> = Vec::new();
     loop {
         let b = read1(slot)?;
         if b == b'\n' {
             break;
         }
-        digits.push(b);
+        bytes.push(b);
     }
-    let s = std::str::from_utf8(&digits)
-        .map_err(|_| PyError::value_error("invalid int literal"))?;
+    String::from_utf8(bytes).map_err(|_| unpickling_error("invalid utf-8 in pickle line"))
+}
+
+/// Read a newline-terminated decimal integer argument (GET / PUT in the
+/// text protocols).
+fn read_line_int(slot: usize) -> Result<i64, PyError> {
+    let s = read_line(slot)?;
     s.trim()
         .parse::<i64>()
         .map_err(|_| PyError::value_error("invalid int literal"))
+}
+
+/// `find_class` — import `module_name` and resolve `name` against it.
+/// Builtin names resolve through the execution context's `lookup_builtin`
+/// (the `LOAD_GLOBAL` path); the module-object `getattr` does not see
+/// builtins installed on the underlying storage. Other non-dotted names
+/// resolve through the module's `__dict__` (dict subscript), and dotted
+/// (protocol >= 4 nested) names fall back to the attribute walk.
+fn find_class(module_name: &str, name: &str, _proto: i64) -> Result<PyObjectRef, PyError> {
+    if module_name == "builtins" && !name.contains('.') {
+        if let Some(obj) = crate::module::_pickle::lookup_builtin(name) {
+            return Ok(obj);
+        }
+    }
+    let module = import_module(module_name)?;
+    if name.contains('.') {
+        return Ok(getattribute_dotted(module, name)?.0);
+    }
+    let w_dict = crate::baseobjspace::getattr_str(module, "__dict__")?;
+    crate::baseobjspace::getitem(w_dict, pyre_object::w_str_new(name))
+}
+
+/// `cls.__new__(cls, *args)`.
+fn new_instance(w_cls: PyObjectRef, args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
+    let w_new = crate::baseobjspace::getattr_str(w_cls, "__new__")?;
+    let mut call_args = vec![w_cls];
+    call_args.extend_from_slice(args);
+    call_fn(w_new, &call_args)
+}
+
+/// `load_build` — apply pickled state to a freshly created instance.
+fn build_instance(w_inst: PyObjectRef, w_state: PyObjectRef) -> Result<(), PyError> {
+    // __setstate__ takes precedence.
+    if let Some(setstate) = crate::baseobjspace::findattr(w_inst, "__setstate__") {
+        if !unsafe { pyre_object::is_none(setstate) } {
+            call_fn(setstate, &[w_state])?;
+            return Ok(());
+        }
+    }
+
+    // state may be a (dict-state, slot-state) pair.
+    let (w_dict_state, w_slot_state) = if unsafe { pyre_object::is_tuple(w_state) }
+        && unsafe { pyre_object::tupleobject::w_tuple_len(w_state) } == 2
+    {
+        (
+            unsafe { pyre_object::tupleobject::w_tuple_getitem(w_state, 0).unwrap() },
+            unsafe { pyre_object::tupleobject::w_tuple_getitem(w_state, 1).unwrap() },
+        )
+    } else {
+        (w_state, pyre_object::w_none())
+    };
+
+    if !unsafe { pyre_object::is_none(w_dict_state) } {
+        let w_inst_dict = crate::baseobjspace::getattr_str(w_inst, "__dict__")?;
+        call_meth(w_inst_dict, "update", &[w_dict_state])?;
+    }
+    if !unsafe { pyre_object::is_none(w_slot_state) } {
+        for (k, v) in unsafe { pyre_object::dictmultiobject::w_dict_items(w_slot_state) } {
+            crate::baseobjspace::setattr(w_inst, k, v)?;
+        }
+    }
+    Ok(())
+}
+
+fn tuple_items(w_tuple: PyObjectRef) -> Vec<PyObjectRef> {
+    let n = unsafe { pyre_object::tupleobject::w_tuple_len(w_tuple) };
+    (0..n)
+        .map(|i| unsafe { pyre_object::tupleobject::w_tuple_getitem(w_tuple, i as i64).unwrap() })
+        .collect()
 }

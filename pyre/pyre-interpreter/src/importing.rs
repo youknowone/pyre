@@ -449,6 +449,19 @@ fn check_sys_modules(name: &str) -> Option<PyObjectRef> {
     SYS_MODULES.with(|m| m.borrow().get(name).copied())
 }
 
+/// Look up a loaded module by name in `sys.modules` (Python-visible dict
+/// first, then the interpreter cache). Mirrors `check_sys_modules`.
+pub fn get_sys_module(name: &str) -> Option<PyObjectRef> {
+    check_sys_modules(name)
+}
+
+/// The Python-visible `sys.modules` dict, or `PY_NULL` before it is
+/// installed. Used by callers that need to iterate every loaded module
+/// (e.g. pickle's `whichmodule` scan).
+pub fn sys_modules_dict() -> PyObjectRef {
+    SYS_MODULES_DICT.with(|d| d.get())
+}
+
 pub fn set_sys_module(name: &str, module: PyObjectRef) {
     SYS_MODULES.with(|m| {
         m.borrow_mut().insert(name.to_string(), module);
