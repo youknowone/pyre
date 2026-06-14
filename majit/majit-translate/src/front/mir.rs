@@ -258,7 +258,21 @@ fn is_known_lowering_gap(msg: &str) -> bool {
     // it classifies the residual failure as a tracked degradation (the
     // function becomes a residual call) rather than a build-failing
     // regression.
-    msg.contains("uninitialised local")
+    if msg.contains("uninitialised local") {
+        return true;
+    }
+    // A scoped (`execute_*` family) Result-of-PyError wrapper whose body
+    // is a pure tail-forward of an *unscoped* Result-of-PyError callee
+    // (`let step = executor.method()?; Ok(step)` where `method` is not in
+    // `RESULT_EXC_LOWERING_SCOPE`).  The forward collapses to a direct
+    // returnblock link with no `Ok`/`Err` shell, so the callee rule finds
+    // nothing to rewrite and the caller rule never saw a scoped call —
+    // `result_exc::lower_result_exc_returns` reports "no rewritable
+    // returns".  The exception-link lowering cannot model this shape, so
+    // the wrapper degrades to a residual call (the trivial forward runs
+    // unchanged at the interpreter level); the inner method still JITs
+    // through its own scoped callees.
+    msg.contains("no rewritable returns")
 }
 
 pub fn build_semantic_program_from_llbc(
@@ -1073,6 +1087,21 @@ struct Lowering<'a> {
     /// so the paired `Result::expect` on such a local also aliases it
     /// — see [`Lowering::is_infallible_widening_try_from`].
     infallible_result_locals: std::collections::HashSet<usize>,
+    /// MIR locals whose enum discriminant is a translation-time
+    /// constant: single-assignment locals bound by an always-`Ok`
+    /// decomposed conversion ([`Lowering::try_lower_usize_try_from`]).
+    /// `Rvalue::Discriminant` on such a local emits `ConstInt(tag)`
+    /// instead of the synthetic FieldRead, which lets the
+    /// `lower_switch` Constant fold drop the statically dead
+    /// `Err`/panic arm even though MIR calls terminate their block
+    /// (the switch always sits in a successor block).  Only locals
+    /// outside [`Lowering::multi_assigned_locals`] enter this map, so
+    /// a re-bound local can never carry a stale tag.
+    const_discriminant_locals: std::collections::HashMap<usize, i64>,
+    /// MIR locals assigned more than once anywhere in the body
+    /// (statement assigns + call destinations).  Guard set for
+    /// [`Lowering::const_discriminant_locals`].
+    multi_assigned_locals: std::collections::HashSet<usize>,
     /// Result `Variable`s of calls to `RESULT_EXC_LOWERING_SCOPE`
     /// callees whose declared result is `Result<T, PyError>`.  Each
     /// heads a `Try::branch` diamond that
@@ -1208,6 +1237,8 @@ impl<'a> Lowering<'a> {
             binop_result_locals: compute_binop_result_locals(body),
             index_elem_alias: std::collections::HashMap::new(),
             infallible_result_locals: std::collections::HashSet::new(),
+            const_discriminant_locals: std::collections::HashMap::new(),
+            multi_assigned_locals: compute_multi_assigned_locals(body),
             result_exc_call_results: Vec::new(),
         })
     }
@@ -4483,12 +4514,10 @@ impl<'a> Lowering<'a> {
         // performs, so the ctor target and FieldWrite owner carry the
         // spellings the rest of the aggregate machinery expects.
         let owner = td.item_meta.name_path();
-        let mut owner_path: Vec<String> = owner.split("::").map(str::to_string).collect();
-        let ctor_name = owner_path.pop().unwrap_or_default();
         let arg = arg.clone();
         let bb_id = self.block_id[mir_bb];
 
-        let mut push_op = |graph: &mut FunctionGraph, kind: OpKind| {
+        let push_op = |graph: &mut FunctionGraph, kind: OpKind| {
             let res = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
             graph.block_mut(bb_id).operations.push(SpaceOperation {
                 result: Some(res.clone()),
@@ -4808,14 +4837,17 @@ impl<'a> Lowering<'a> {
         } else {
             CallTarget::synthetic_transparent_ctor_with_owner(owner_path, ctor_name)
         };
-        let res = push_op(
-            &mut self.graph,
-            OpKind::Call {
+        let res = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(res.clone()),
+            kind: OpKind::Call {
                 target: ctor_target,
                 args: Vec::new(),
                 result_ty: ValueType::Ref(Some(owner.to_string())),
             },
-        );
+        });
         for (name, value) in [("__discriminant", disc), ("__pos_0", payload)] {
             self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                 result: None,
@@ -4834,7 +4866,7 @@ impl<'a> Lowering<'a> {
         let target_bb = self.block_id[target];
         let link_args = self.edge_args(mir_bb, target)?;
         self.graph.set_goto(bb_id, target_bb, link_args);
-        Ok(true)
+        Ok(())
     }
 
     fn lower_switch(
@@ -5047,6 +5079,33 @@ fn compute_binop_result_locals(body: &Unstructured) -> std::collections::HashSet
         }
     }
     set
+}
+
+/// MIR locals assigned more than once anywhere in `body` — statement
+/// assigns plus call destinations.  See
+/// [`Lowering::multi_assigned_locals`].
+fn compute_multi_assigned_locals(body: &Unstructured) -> std::collections::HashSet<usize> {
+    let mut counts: std::collections::HashMap<usize, u32> = std::collections::HashMap::new();
+    let mut bump = |place: &Place| {
+        if let PlaceKind::Local(i) = place.kind {
+            *counts.entry(i as usize).or_insert(0) += 1;
+        }
+    };
+    for bb in &body.body {
+        for stmt in &bb.statements {
+            if let Ok(StmtKind::Assign(place, _)) = stmt.stmt_kind() {
+                bump(&place);
+            }
+        }
+        if let Ok(TermKind::Call { call, .. }) = bb.term() {
+            bump(&call.dest);
+        }
+    }
+    counts
+        .into_iter()
+        .filter(|(_, c)| *c > 1)
+        .map(|(i, _)| i)
+        .collect()
 }
 
 /// Whether a statically-resolved [`RegularCall`] is a workspace
