@@ -738,6 +738,7 @@ const CAN_REMOVE: &[&str] = &[
     "cmp",
     "coerce",
     "contains",
+    "not_contains",
     "iter",
     "get",
 ];

@@ -3408,6 +3408,8 @@ fn compare_op_tag_for_opname(opname: &str) -> Option<i64> {
         "ge" => 3,
         "eq" => 4,
         "ne" => 5,
+        "contains" => 6,
+        "not_contains" => 7,
         _ => return None,
     })
 }

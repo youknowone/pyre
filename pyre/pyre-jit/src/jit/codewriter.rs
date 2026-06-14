@@ -2789,6 +2789,32 @@ fn emit_frontend_compare(
     )
 }
 
+/// CONTAINS_OP lowering — reuses the compare-residual machinery. The
+/// graph op carries the args as `[item, container]`; `flatten`'s
+/// `compare_op_tag_for_opname` maps `contains`/`not_contains` to tags
+/// 6/7, and `bh_compare_fn` dispatches them to `baseobjspace::contains`.
+fn emit_frontend_contains(
+    graph: &mut super::flow::FunctionGraph,
+    block: &super::flow::BlockRef,
+    item: super::flow::FlowValue,
+    container: super::flow::FlowValue,
+    invert: pyre_interpreter::bytecode::Invert,
+    offset: i64,
+) -> super::flow::Variable {
+    let opname = match invert {
+        pyre_interpreter::bytecode::Invert::No => "contains",
+        pyre_interpreter::bytecode::Invert::Yes => "not_contains",
+    };
+    emit_graph_op_with_result(
+        graph,
+        block,
+        opname,
+        vec![item.into(), container.into()],
+        Kind::Ref,
+        offset,
+    )
+}
+
 fn frontend_load_const_flow_value(code: &CodeObject, idx: usize) -> super::flow::FlowValue {
     // `flowcontext.py:841-843 LOAD_CONST`: fetch the pre-wrapped constant
     // and push that value.  Pyre's CodeObject stores RustPython
@@ -7555,15 +7581,25 @@ impl CodeWriter {
                         }
 
                         // ContainsOp: item in container — pops 2, pushes 1 (bool).
-                        // Net stack effect: -1.
-                        // pyopcode.py CONTAINS_OP / eval.rs:1784-1798.
-                        Instruction::ContainsOp { .. } => {
-                            for _ in 0..2 {
-                                pop_and_decr_depth(&mut current_state, &mut current_depth);
-                            }
-                            push_fresh_ref(&mut current_state, &mut graph);
-                            current_depth += 1;
-                            emit_abort_permanent!(py_pc);
+                        // Net stack effect: -1. Same stack-direct pattern as
+                        // CompareOp: TOS = container, TOS1 = item.
+                        Instruction::ContainsOp { invert } => {
+                            let invert_kind = invert.get(op_arg);
+                            let _ = emit_popvalue_ref!(current_depth, py_pc);
+                            let container_value =
+                                pop_ref_or_fresh(&mut current_state, &mut graph);
+                            let _ = emit_popvalue_ref!(current_depth, py_pc);
+                            let item_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            let result_value = emit_frontend_contains(
+                                &mut graph,
+                                &current_block.block(),
+                                item_value,
+                                container_value,
+                                invert_kind,
+                                py_pc as i64,
+                            );
+                            pin!(Some(result_value), stack_base + current_depth);
+                            push_and_bump!(result_value.into(), py_pc);
                         }
 
                         // CallKw: like Call but with extra kwnames tuple.

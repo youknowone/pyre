@@ -136,6 +136,14 @@ pub fn compare_value_from_tag(
     b: PyObjectRef,
     op_tag: i64,
 ) -> Result<PyObjectRef, PyError> {
+    // CONTAINS_OP routes through the compare-residual machinery: tag 6 =
+    // `in`, tag 7 = `not in`. `a` is the needle, `b` the container (flatten
+    // lowers the args as `[item, container]`).
+    if op_tag == 6 || op_tag == 7 {
+        let found = crate::baseobjspace::contains(b, a)?;
+        let result = if op_tag == 7 { !found } else { found };
+        return Ok(w_bool_from(result));
+    }
     let op = match op_tag {
         0 => CompareOp::Lt,
         1 => CompareOp::Le,

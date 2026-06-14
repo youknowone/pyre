@@ -3628,6 +3628,23 @@ pub extern "C" fn bh_compare_fn(lhs: i64, rhs: i64, op_code: i64) -> i64 {
         return pyre_object::w_bool_from(matched) as i64;
     }
 
+    // op_code 6 = CONTAINS_OP `in`, 7 = `not in` (from compare_op_tag).
+    // lhs = needle/item, rhs = container/haystack (flatten lowers the args
+    // as `[item, container]`).
+    if op_code == 6 || op_code == 7 {
+        match pyre_interpreter::baseobjspace::contains(rhs, lhs) {
+            Ok(found) => {
+                let result = if op_code == 7 { !found } else { found };
+                return pyre_object::w_bool_from(result) as i64;
+            }
+            Err(err) => {
+                let exc_obj = err.to_exc_object();
+                majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc_obj as i64));
+                return 0;
+            }
+        }
+    }
+
     // op_code is the compact tag from compare_op_tag (0-5), NOT the raw
     // ComparisonOperator discriminant. Reverse the mapping to get the enum.
     let Some(op) = pyre_interpreter::runtime_ops::compare_op_from_tag(op_code) else {
