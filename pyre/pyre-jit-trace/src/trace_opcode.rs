@@ -3424,13 +3424,33 @@ impl MIFrame {
             let value = self.materialize_fail_arg_slot(ctx, value, target_type, idx);
             args.push(self.materialize_loop_carried_value(ctx, value, target_type));
         }
+        // Live value-stack window: slots at index >= live_stack_len are dead
+        // capacity (Python index >= valuestackdepth). `interpreter/pyframe.py`
+        // `popvalue_maybe_none` nulls a popped slot, so `read_boxes` reports
+        // None for every dead stack slot and `virtualizable_boxes` carries a
+        // null tail; the target loop LABEL's stack tail is therefore all-null
+        // and folds away. pyre's bridge value-stack clear is gated off
+        // (`is_active_vable_owner` excludes bridges to avoid the null-base
+        // `InvalidLoop` abort), so the concrete frame still holds the stale
+        // popped pointers (e.g. a caught exception) in those slots. Reading
+        // them through `materialize_fail_arg_slot` would put live pointers in
+        // the JUMP tail where the loop label expects null, blocking
+        // `optimize_bridge` retarget, and would also disagree with resume,
+        // which reconstructs the dead tail as null. Force the null here: these
+        // slots reach only the terminal JUMP args, never an in-trace field
+        // base, so no `get_const_info_mut` null-base abort.
+        let live_stack_len = portal_vsd.unwrap_or(concrete_vsd).saturating_sub(nlocals);
         for (stack_idx, value) in stack.into_iter().enumerate() {
             let target_type = inputarg_types
                 .get(num_scalars + nlocals + stack_idx)
                 .copied()
                 .unwrap_or(Type::Ref);
-            let value =
-                self.materialize_fail_arg_slot(ctx, value, target_type, nlocals + stack_idx);
+            let value = if stack_idx >= live_stack_len {
+                let typed_null = extract_concrete_typed_value(target_type, PY_NULL);
+                fail_arg_opref_for_typed_value(ctx, typed_null)
+            } else {
+                self.materialize_fail_arg_slot(ctx, value, target_type, nlocals + stack_idx)
+            };
             args.push(self.materialize_loop_carried_value(ctx, value, target_type));
         }
         // virtualizable.py:44 parity (delayed): now that all materialize_loop_
