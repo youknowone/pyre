@@ -618,8 +618,8 @@ where
                 .ref_regs
                 .iter()
                 .zip(frame.ref_values.iter())
-                .find_map(|(opref, concrete)| {
-                    (*opref == Some(vable_opref))
+                .find_map(|(slot, concrete)| {
+                    (slot.as_ref().map(|b| b.to_opref()) == Some(vable_opref))
                         .then_some(*concrete)
                         .flatten()
                         .map(|value| value as usize as *mut u8)
@@ -1512,7 +1512,7 @@ where
                                 .return_r
                                 .expect("inline ref return missing caller destination");
                             parent.ref_regs[caller_dst] =
-                                finished_frame.ref_regs[callee_src as usize];
+                                finished_frame.ref_regs[callee_src as usize].clone();
                             parent.ref_values[caller_dst] =
                                 finished_frame.ref_values[callee_src as usize];
                         }
@@ -2583,7 +2583,11 @@ where
                             // bug.
                             let opref_opt = match slot {
                                 0 => frame.int_regs.get(reg_idx).copied().flatten(),
-                                1 => frame.ref_regs.get(reg_idx).copied().flatten(),
+                                1 => frame
+                                    .ref_regs
+                                    .get(reg_idx)
+                                    .and_then(|o| o.as_ref())
+                                    .map(|b| b.to_opref()),
                                 2 => frame.float_regs.get(reg_idx).copied().flatten(),
                                 _ => unreachable!(),
                             };
@@ -2815,7 +2819,8 @@ where
                         }
                         JitArgKind::Ref => {
                             let (value, concrete) = self.read_ref_reg(caller_src);
-                            sub_frame.ref_regs[callee_dst] = Some(value);
+                            sub_frame.ref_regs[callee_dst] =
+                                Some(crate::r#box::BoxRef::from_opref(value));
                             sub_frame.ref_values[callee_dst] = Some(concrete);
                         }
                         JitArgKind::Float => {
@@ -4718,14 +4723,17 @@ where
 
     fn set_ref_reg(&mut self, reg: usize, opref: Option<OpRef>, value: Option<i64>) {
         let frame = self.frames.current_mut();
-        frame.ref_regs[reg] = opref;
+        frame.ref_regs[reg] = opref.map(crate::r#box::BoxRef::from_opref);
         frame.ref_values[reg] = value;
     }
 
     fn read_ref_reg(&mut self, reg: usize) -> (OpRef, i64) {
         let frame = self.frames.current_mut();
         (
-            frame.ref_regs[reg].expect("jitcode ref register was uninitialized"),
+            frame.ref_regs[reg]
+                .as_ref()
+                .expect("jitcode ref register was uninitialized")
+                .to_opref(),
             frame.ref_values[reg].expect("jitcode concrete ref register was uninitialized"),
         )
     }
@@ -6934,7 +6942,7 @@ mod tests {
         sub.parent_descr_idx = 3;
         sub.int_regs[0] = Some(majit_ir::OpRef::int_op(11));
         sub.int_values[0] = Some(110);
-        sub.ref_regs[0] = Some(majit_ir::OpRef::ref_op(22));
+        sub.ref_regs[0] = Some(crate::r#box::BoxRef::from_opref(majit_ir::OpRef::ref_op(22)));
         sub.ref_values[0] = Some(220);
         sub.float_regs[0] = Some(majit_ir::OpRef::float_op(33));
         sub.float_values[0] = Some(330);

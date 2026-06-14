@@ -1485,12 +1485,10 @@ impl<M: Clone> MetaInterp<M> {
         // Python object graph automatically; pyre's `Vec<Option<OpRef>>`
         // storage needs an explicit walker. Independent of `self.tracing`:
         // frames are pushed for both recording and recursive-portal calls.
-        for frame in self.framestack.frames.iter_mut() {
-            for slot in frame.ref_regs.iter_mut() {
-                if let Some(opref) = slot.as_mut() {
-                    if let Some(gcref) = opref.as_const_ptr_mut() {
-                        visitor(gcref);
-                    }
+        for frame in self.framestack.frames.iter() {
+            for slot in frame.ref_regs.iter() {
+                if let Some(b) = slot.as_ref() {
+                    b.walk_const_ptr_refs(&mut visitor);
                 }
             }
         }
@@ -15272,7 +15270,10 @@ mod metainterp_static_data_tests {
         assert_eq!(f.int_values[0], Some(100));
         assert_eq!(f.int_regs[1], Some(OpRef::int_op(11)));
         assert_eq!(f.int_values[1], Some(101));
-        assert_eq!(f.ref_regs[0], Some(OpRef::ref_op(20)));
+        assert_eq!(
+            f.ref_regs[0].as_ref().map(|b| b.to_opref()),
+            Some(OpRef::ref_op(20))
+        );
         assert_eq!(f.ref_values[0], Some(200));
         assert_eq!(f.float_regs[0], Some(OpRef::float_op(30)));
         assert_eq!(f.float_values[0], Some(300));
