@@ -529,6 +529,30 @@ pub fn build_set_from_refs(items: &[PyObjectRef]) -> Result<PyObjectRef, crate::
     crate::builtins::builtin_set_from_items(items)
 }
 
+/// FORMAT_SIMPLE / FORMAT_WITH_SPEC evaluation, shared by the interpreter
+/// (`format_simple` / `format_with_spec`) and the JIT residuals
+/// (`bh_format_simple_fn` / `bh_format_with_spec_fn`).  Formats `value`
+/// through `format_value_dispatch` (user `__format__` may run Python →
+/// fallible); a `PY_NULL` or non-`str` `spec` reads as the empty spec
+/// (`str(value)`), matching `format_simple`.
+pub fn format_value(
+    value: PyObjectRef,
+    spec: PyObjectRef,
+) -> Result<PyObjectRef, crate::PyError> {
+    let spec_str = unsafe {
+        if !spec.is_null() && pyre_object::is_str(spec) {
+            match pyre_object::w_str_get_wtf8(spec).as_str() {
+                Ok(v) => v.to_string(),
+                Err(_) => String::new(),
+            }
+        } else {
+            String::new()
+        }
+    };
+    let s = crate::type_methods::format_value_dispatch(value, &spec_str)?;
+    Ok(pyre_object::w_str_from_wtf8(s))
+}
+
 /// BINARY_SLICE evaluation, shared by the interpreter (`binary_slice`)
 /// and the JIT residual (`bh_binary_slice_fn`): returns `obj[start:stop]`.
 /// `list` / `str` / `tuple` slice on element (code-point for `str`)

@@ -2616,8 +2616,8 @@ impl OpcodeStepExecutor for PyFrame {
         let val = self.pop();
         // `f'{x}'` → `PyObject_Format(x, NULL)`; a user `__format__` is
         // invoked with an empty spec, otherwise this is `str(value)`.
-        let s = crate::type_methods::format_value_dispatch(val, "")?;
-        self.push(pyre_object::w_str_from_wtf8(s));
+        let s = crate::runtime_ops::format_value(val, pyre_object::PY_NULL)?;
+        self.push(s);
         Ok(())
     }
 
@@ -2627,23 +2627,11 @@ impl OpcodeStepExecutor for PyFrame {
         let val = self.pop();
         // `PyObject_Format(value, spec)` — dispatch to a user-defined
         // `__format__` when present, else apply the shared spec parser
-        // (empty spec → `str(value)`).  `type_methods::format_value_dispatch`
-        // keeps f-string `{n:08.3f}` and `"{:08.3f}".format(n)` identical.
-        // A format spec is expected to be valid text (specs do not carry
-        // surrogates), so a non-UTF-8 spec reads as empty rather than
-        // panicking.
-        let spec_str = unsafe {
-            if pyre_object::is_str(spec) {
-                match pyre_object::w_str_get_wtf8(spec).as_str() {
-                    Ok(v) => v.to_string(),
-                    Err(_) => String::new(),
-                }
-            } else {
-                String::new()
-            }
-        };
-        let s = crate::type_methods::format_value_dispatch(val, &spec_str)?;
-        self.push(pyre_object::w_str_from_wtf8(s));
+        // (empty spec → `str(value)`).  `runtime_ops::format_value` keeps
+        // f-string `{n:08.3f}` and `"{:08.3f}".format(n)` identical, and
+        // reads a non-`str`/non-UTF-8 spec as empty rather than panicking.
+        let s = crate::runtime_ops::format_value(val, spec)?;
+        self.push(s);
         Ok(())
     }
 

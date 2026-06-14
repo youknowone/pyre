@@ -3882,6 +3882,26 @@ pub extern "C" fn bh_build_set_from_array(array: i64) -> i64 {
     }
 }
 
+/// FORMAT_SIMPLE residual (`format_simple` HLOp → `residual_call_r_r`).
+/// Formats `value` with the empty spec (`f"{x}"` → `str(value)`) through the
+/// shared `runtime_ops::format_value`.  A user `__format__` may run Python
+/// (`MayForce`); on error the exception is published through
+/// `BH_LAST_EXC_VALUE` for the trailing `GuardNoException` and the call
+/// returns 0.
+pub extern "C" fn bh_format_simple_fn(value: i64) -> i64 {
+    match pyre_interpreter::runtime_ops::format_value(
+        value as pyre_object::PyObjectRef,
+        pyre_object::PY_NULL,
+    ) {
+        Ok(s) => s as i64,
+        Err(err) => {
+            let exc_obj = err.to_exc_object();
+            majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc_obj as i64));
+            0
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests_bh_newtuple_from_array {
     use super::bh_newtuple_from_array;
