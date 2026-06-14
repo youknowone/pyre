@@ -5,9 +5,8 @@ use crate::bytecode::{BinaryOperator, ComparisonOperator, ConvertValueOparg};
 use pyre_object::{
     PY_NULL, PyObjectRef, W_SeqIterator, is_instance, is_list, is_range_iter, is_seq_iter, is_str,
     is_tuple, w_dict_new, w_dict_store_checked, w_int_get_value, w_int_new, w_list_getitem,
-    w_list_len,
-    w_list_new, w_range_iter_has_next, w_range_iter_next, w_str_from_wtf8, w_str_get_wtf8,
-    w_str_len, w_tuple_getitem, w_tuple_len, w_tuple_new,
+    w_list_len, w_list_new, w_range_iter_has_next, w_range_iter_next, w_str_from_wtf8,
+    w_str_get_wtf8, w_str_len, w_tuple_getitem, w_tuple_len, w_tuple_new,
 };
 use rustpython_wtf8::{Wtf8, Wtf8Buf};
 

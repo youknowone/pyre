@@ -4126,8 +4126,8 @@ pub extern "C" fn bh_load_deref_value_fn(cell: i64, w_code_ptr: i64, deref_idx: 
             &*(pyre_interpreter::w_code_get_ptr(w_code_ptr as pyre_object::PyObjectRef)
                 as *const pyre_interpreter::CodeObject)
         };
-        let exc_obj =
-            pyre_interpreter::pyframe::deref_unbound_error(code, deref_idx as usize).to_exc_object();
+        let exc_obj = pyre_interpreter::pyframe::deref_unbound_error(code, deref_idx as usize)
+            .to_exc_object();
         publish_residual_call_exception(exc_obj as i64);
         return 0;
     }

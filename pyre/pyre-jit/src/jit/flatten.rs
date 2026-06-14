@@ -12039,7 +12039,9 @@ mod tests {
                                 assert_eq!(fr.index, 104, "fourth Ref operand must be frame");
                             }
                             other => {
-                                panic!("ListR must be [fromlist, level, code, frame], got {other:?}")
+                                panic!(
+                                    "ListR must be [fromlist, level, code, frame], got {other:?}"
+                                )
                             }
                         }
                     }

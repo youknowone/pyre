@@ -6062,6 +6062,47 @@ fn walker_capture_snapshot_for_last_guard_impl(
                     last_instr_op,
                     Value::Int(last_instr_value),
                 );
+                // Publish `valuestackdepth` for THIS guard's resume
+                // coordinate the same way `last_instr` is published above.
+                // `sym.valuestackdepth` is NOT usable: the walker never
+                // crosses `set_orgpc`, so that scalar keeps the loop-entry
+                // inputarg the trace was seeded with (a loop-invariant the
+                // optimizer folds to a constant = the loop-header depth).  A
+                // guard that resumes at a different depth — the `while`
+                // condition branch, or a may-force call whose
+                // `semantic_fallthrough_pc` lands on an opcode that keeps an
+                // operand-stack temp (`#124`) — then carries the wrong depth
+                // into its snapshot.  The resume reader writes this scalar
+                // into `frame.valuestackdepth`; an under-count hides the kept
+                // operand (the interpreter resumes thinking the stack is
+                // shallower than it is), and `setup_bridge_sym` derives
+                // `stack_only = valuestackdepth - nlocals` from it
+                // (`state.rs` Part 1), so a wrong count desyncs the bridge's
+                // operand-stack slots.  Compute the depth at the resume py_pc
+                // the SAME way the encoder (`collect_outer_active_boxes`)
+                // derives `valid_stack_only` — `nlocals +
+                // depth_at_py_pc[py_pc]` — so the published scalar stays
+                // symmetric with the active-box layout.  Fall back to
+                // `sym.valuestackdepth` only when liveness is unavailable.
+                let vsd_value = unsafe {
+                    let jc = &*sym.jitcode;
+                    if jc.payload.code_ptr.is_null() {
+                        sym.valuestackdepth as i64
+                    } else {
+                        let lv = crate::liveness::liveness_for(jc.payload.code_ptr);
+                        match lv.depth_at_py_pc().get(py_pc as usize).copied() {
+                            Some(d) => (sym.nlocals + d as usize) as i64,
+                            None => sym.valuestackdepth as i64,
+                        }
+                    }
+                };
+                let vsd_op = ctx.trace_ctx.const_int(vsd_value);
+                crate::trace_opcode::mirror_vable_static_to_boxes(
+                    ctx.trace_ctx,
+                    "valuestackdepth",
+                    vsd_op,
+                    Value::Int(vsd_value),
+                );
             }
             let (vable_boxes, vref_boxes) = ctx.trace_ctx.build_snapshot_vable_vref_boxes();
             let active = collect_outer_active_boxes(
