@@ -39,7 +39,7 @@ fn test_make_jitcodes_produces_graph_keyed_output() {
     if !ensure_workspace_llbc_env() {
         eprintln!(
             "skipping: build/llbc/{{pyre-object,pyre-interpreter,pyre-jit}}.ullbc missing — \
-             run `scripts/extract-llbc.sh` to enable this test"
+             run `scripts/extract-llbc.py` to enable this test"
         );
         return;
     }

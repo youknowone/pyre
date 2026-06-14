@@ -2,7 +2,7 @@
 //! extracted `pyre-interpreter.ullbc` snapshot.
 //!
 //! Skipped by default: the snapshot is 133 MB and not checked into git
-//! (regenerable via `scripts/extract-llbc.sh`). Set
+//! (regenerable via `scripts/extract-llbc.py`). Set
 //! `PYRE_MIR_STRESS_LLBC=path/to/file.ullbc` to enable, or use the
 //! default path the extractor writes to.
 
@@ -36,7 +36,7 @@ fn stress_path() -> Option<PathBuf> {
 fn mir_lowering_tally_pyre_interpreter() {
     let Some(path) = stress_path() else {
         eprintln!(
-            "skip: set PYRE_MIR_STRESS_LLBC or run scripts/extract-llbc.sh to make \
+            "skip: set PYRE_MIR_STRESS_LLBC or run scripts/extract-llbc.py to make \
              build/llbc/pyre-interpreter.ullbc available"
         );
         return;
@@ -535,7 +535,7 @@ fn classify_unwind_chain(
 fn mir_on_unwind_target_taxonomy() {
     let Some(path) = stress_path() else {
         eprintln!(
-            "skip: set PYRE_MIR_STRESS_LLBC or run scripts/extract-llbc.sh to make \
+            "skip: set PYRE_MIR_STRESS_LLBC or run scripts/extract-llbc.py to make \
              build/llbc/pyre-interpreter.ullbc available"
         );
         return;

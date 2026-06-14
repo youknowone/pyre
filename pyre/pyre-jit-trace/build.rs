@@ -44,7 +44,7 @@ fn main() {
 /// and fail the build *before* the worker spawns — so the contributor
 /// sees the exact steps to run instead of a worker-thread panic buried
 /// under the source-file dump.  Auto-running the bootstrap from here is
-/// deliberately avoided: `scripts/extract-llbc.sh` shells out to a nested
+/// deliberately avoided: `scripts/extract-llbc.py` shells out to a nested
 /// `cargo build`, which would block on the outer build's target-directory
 /// lock (deadlock), and a build script that downloads a toolchain breaks
 /// hermetic / offline / CI builds.
@@ -89,16 +89,16 @@ fn preflight_llbc_or_fail() {
         missing.join(", "),
     );
     if !charon_present {
-        println!("cargo::error=Install charon (one-time): scripts/install-charon.sh");
+        println!("cargo::error=Install charon (one-time): scripts/install-charon.py");
     }
-    println!("cargo::error=Extract the LLBC: scripts/extract-llbc.sh pyre-object pyre-interpreter");
+    println!("cargo::error=Extract the LLBC: scripts/extract-llbc.py pyre-object pyre-interpreter");
 
     // The install step is only needed when the charon binary is absent;
     // with it present the fix is the single extract command.
     let install_line = if charon_present {
         String::new()
     } else {
-        "   scripts/install-charon.sh                            # one-time\n".to_string()
+        "   scripts/install-charon.py                            # one-time\n".to_string()
     };
     eprintln!(
         "\n\
@@ -109,7 +109,7 @@ fn preflight_llbc_or_fail() {
 {}\n\
  Bootstrap (run from the repo root):\n\
 {}\
-   scripts/extract-llbc.sh pyre-object pyre-interpreter\n\
+   scripts/extract-llbc.py pyre-object pyre-interpreter\n\
 \n\
  …or point the build at existing artefacts:\n\
    export PYRE_MIR_FRONTEND_LLBC=/abs/pyre-object.ullbc:/abs/pyre-interpreter.ullbc\n\
@@ -448,7 +448,7 @@ fn real_main() {
     // The mir-frontend analysis derives `jit_trace_gen.rs` from
     // the workspace LLBC artefacts — or the `PYRE_MIR_FRONTEND_LLBC`
     // override — none of which are `.rs` sources covered above.  Track
-    // them so re-extracting the ullbc (scripts/extract-llbc.sh) or
+    // them so re-extracting the ullbc (scripts/extract-llbc.py) or
     // repointing the override invalidates the cached generated trace
     // instead of silently reusing a stale one.  A `rerun-if-changed` on
     // a not-yet-present path is harmless (Cargo reruns when it appears),

@@ -107,12 +107,12 @@ pub struct MethodInfo {
 ///    Windows, `:`-separated elsewhere). Explicit override for CI /
 ///    test fixtures targeting a specific LLBC set.
 /// 2. Auto-discovery at `<workspace>/build/llbc/<expected>.ullbc`,
-///    where `scripts/extract-llbc.sh` writes. If every expected file
+///    where `scripts/extract-llbc.py` writes. If every expected file
 ///    exists, the MIR front-end engages automatically.
 ///
 /// Panics when neither source resolves: the MIR front-end is the only
 /// graph builder, so a missing LLBC set (Charon not installed, or
-/// `scripts/extract-llbc.sh` not run) is a fatal misconfiguration
+/// `scripts/extract-llbc.py` not run) is a fatal misconfiguration
 /// rather than a fallback to another path.
 fn build_semantic_program_via_active_frontend(
     module_paths: &[&str],
@@ -192,7 +192,7 @@ fn build_semantic_program_via_active_frontend(
     // misconfiguration immediately.
     panic!(
         "no LLBC source resolved.\n\
-         Run `scripts/extract-llbc.sh` to produce \
+         Run `scripts/extract-llbc.py` to produce \
          `build/llbc/{{pyre-object,pyre-interpreter,pyre-jit}}.ullbc`, \
          or set `PYRE_MIR_FRONTEND_LLBC` to an OS path-list \
          (`;`-separated on Windows, `:` elsewhere) explicitly."
@@ -216,7 +216,7 @@ fn build_semantic_program_via_active_frontend(
 ///
 /// `pyre-jit.ullbc` is *not* mandatory: when only it is missing the
 /// returned set degrades to the mandatory pair (see the body) so the
-/// `extract-llbc.sh pyre-jit` bootstrap can build `pyre-jit-trace`
+/// `extract-llbc.py pyre-jit` bootstrap can build `pyre-jit-trace`
 /// before `pyre-jit.ullbc` exists.
 ///
 /// The two gates together match the production fingerprint:
@@ -230,7 +230,7 @@ fn build_semantic_program_via_active_frontend(
 /// The workspace root is anchored at compile time via
 /// `env!("CARGO_MANIFEST_DIR")` — `<workspace>/majit/majit-translate`
 /// resolves up to `<workspace>` via two `..` segments.  The
-/// `scripts/extract-llbc.sh` script writes to the same
+/// `scripts/extract-llbc.py` script writes to the same
 /// `<workspace>/build/llbc/` directory by convention, so the two
 /// halves stay in sync.
 #[cfg(feature = "mir-frontend")]
@@ -258,7 +258,7 @@ fn auto_discover_workspace_llbc_paths(module_paths: &[&str]) -> Option<Vec<Strin
     //
     // `pyre-jit.ullbc` is part of the production set (it hosts the
     // `eval_loop_jit` portal), but it is itself produced by
-    // `scripts/extract-llbc.sh pyre-jit`, which builds `pyre-jit` — and
+    // `scripts/extract-llbc.py pyre-jit`, which builds `pyre-jit` — and
     // `pyre-jit` depends on `pyre-jit-trace`, whose build script re-enters
     // this analysis.  During that bootstrap `pyre-jit.ullbc` does not yet
     // exist, so its absence must NOT abort the build: degrade to the
@@ -283,7 +283,7 @@ fn auto_discover_workspace_llbc_paths(module_paths: &[&str]) -> Option<Vec<Strin
         eprintln!(
             "[majit-translate] pyre-jit.ullbc absent — degrading to the \
              2-crate front-end (eval_loop_jit portal unavailable). Expected \
-             only while extract-llbc.sh bootstraps pyre-jit.ullbc itself."
+             only while extract-llbc.py bootstraps pyre-jit.ullbc itself."
         );
     }
     Some(paths)
@@ -536,7 +536,7 @@ fn analyze_pipeline_from_module_paths(
     // SemanticProgram build through the MIR-driven
     // `front::mir::build_semantic_program_from_llbcs` path.  The LLBC
     // source is a Charon-extracted .ullbc snapshot (produced by
-    // `scripts/extract-llbc.sh`), located via `PYRE_MIR_FRONTEND_LLBC`
+    // `scripts/extract-llbc.py`), located via `PYRE_MIR_FRONTEND_LLBC`
     // or workspace auto-discovery.
     mark_phase!("known_statics + struct_field_attrs populated");
     let program = build_semantic_program_via_active_frontend(module_paths, static_addrs);

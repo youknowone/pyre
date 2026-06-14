@@ -384,7 +384,7 @@ class Check:
                 # producer instead.
                 print(red("LLBC artefacts are missing under build/llbc/."))
                 print("Run the extractor first, then re-run this script:")
-                print("    scripts/extract-llbc.sh")
+                print("    scripts/extract-llbc.py")
             else:
                 self._print_cargo_diagnostics(cargo_path)
             sys.exit(1)

@@ -3,8 +3,8 @@
 Stable-Rust parser for Charon `.llbc` / `.ullbc` JSON artefacts.
 
 Consumed by `majit-translate`'s MIR-driven flowspace driver. Produced
-by `scripts/extract-llbc.sh` running the pinned Charon binary that
-`scripts/install-charon.sh` installs.
+by `scripts/extract-llbc.py` running the pinned Charon binary that
+`scripts/install-charon.py` installs.
 
 ## Usage
 
@@ -58,7 +58,7 @@ The reader is validated against the corpus snapshot (checked in at
 `majit/charon-corpus/corpus.ullbc`) via `tests/corpus.rs`, and against
 the full extracted `pyre-object.ullbc` (23 MB) / `pyre-interpreter.ullbc`
 (133 MB) snapshots not committed to git (regenerable via
-`scripts/extract-llbc.sh`). Every statement and terminator in every
+`scripts/extract-llbc.py`). Every statement and terminator in every
 extracted body decodes:
 
 | crate            | bodies | stmt decode errors | term decode errors |

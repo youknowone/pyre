@@ -15,7 +15,7 @@
 //!
 //! The crate compiles on **stable Rust**. The pinned-nightly toolchain
 //! required to produce `.llbc` lives inside Charon itself
-//! (`scripts/install-charon.sh`); nothing in this crate touches it.
+//! (`scripts/install-charon.py`); nothing in this crate touches it.
 
 #![forbid(unsafe_code)]
 
