@@ -1316,8 +1316,30 @@ pub fn std_mem_align_of(
 pub fn pyre_cast_instance(
     bk: &Rc<Bookkeeper>,
     args_s: &[Option<SomeValue>],
-    _kwds: &HashMap<String, Option<SomeValue>>,
+    kwds: &HashMap<String, Option<SomeValue>>,
 ) -> Result<SomeValue, AnnotatorError> {
+    // The marker is `Call(["__pyre_cast_instance", <root>], [operand])`:
+    // exactly the pointer operand plus the constant-root string, no
+    // keywords.  A different shape is a producer bug, surfaced here
+    // rather than silently swallowed.
+    if !kwds.is_empty() || args_s.len() != 2 {
+        return Err(AnnotatorError::new(
+            "__pyre_cast_instance expects (operand, constant_root) positional arguments",
+        ));
+    }
+    // Carry the operand's nullability onto the downcast result instead
+    // of unconditionally narrowing to non-None: a downcast of a nullable
+    // pointer is itself nullable.
+    let can_be_none = match arg_at(args_s, 0, "__pyre_cast_instance") {
+        SomeValue::Instance(inst) => inst.can_be_none,
+        SomeValue::None_(_) => true,
+        SomeValue::Ptr(_) | SomeValue::Address(_) => false,
+        other => {
+            return Err(AnnotatorError::new(format!(
+                "__pyre_cast_instance: non-pointer operand: {other:?}"
+            )));
+        }
+    };
     let root = match args_s
         .get(1)
         .and_then(|o| o.as_ref())
@@ -1334,7 +1356,7 @@ pub fn pyre_cast_instance(
     let classdef = bk.getuniqueclassdef_for_struct_root(&root)?;
     Ok(SomeValue::Instance(super::model::SomeInstance::new(
         Some(classdef),
-        false,
+        can_be_none,
         std::collections::BTreeMap::new(),
     )))
 }

@@ -1246,6 +1246,12 @@ pub fn translate_op(
                     // the `__pyre_cast_instance` HOST_ENV singleton so its
                     // Arc identity matches the `BUILTIN_TYPER` key.
                     if segments.len() == 2 && segments[0] == "__pyre_cast_instance" {
+                        if arg_hls.len() != 1 {
+                            return Err(TyperError::message(format!(
+                                "__pyre_cast_instance requires exactly one operand, got {}",
+                                arg_hls.len()
+                            )));
+                        }
                         let callable_host = HOST_ENV
                             .lookup_builtin("__pyre_cast_instance")
                             .ok_or_else(|| {
@@ -1282,6 +1288,12 @@ pub fn translate_op(
                         && segments[2] == "<Impl>"
                         && segments[3] == "len"
                     {
+                        if arg_hls.len() != 1 {
+                            return Err(TyperError::message(format!(
+                                "core::slice::<Impl>::len requires exactly one receiver arg, got {}",
+                                arg_hls.len()
+                            )));
+                        }
                         let mut iter = arg_hls.into_iter();
                         let arg = iter.next().ok_or_else(|| {
                             TyperError::message(

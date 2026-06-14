@@ -3197,7 +3197,11 @@ pub fn rtype_pyre_cast_instance(
         .cloned()
         .ok_or_else(|| TyperError::message("rtype_pyre_cast_instance: missing r_result"))?;
     let result_lltype = r_result.lowleveltype().clone();
-    let v_ptr = hop.args_v.borrow()[0].clone();
+    // Validated operand extraction: a malformed call (wrong arity)
+    // surfaces a `TyperError` here instead of panicking on a raw
+    // `args_v[0]` index, matching the other typers in this module.
+    let r_arg0 = arg_repr(hop, 0)?;
+    let v_ptr = hop.inputarg(&r_arg0, 0)?;
     hop.exception_cannot_occur()?;
     Ok(hop.genop(
         "cast_pointer",
