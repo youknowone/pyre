@@ -3,15 +3,18 @@
 //! Port of `pypy/module/_pickle/interp_pickle.py` (`W_Pickler` /
 //! `W_Unpickler`). Targets the CPython 3.14 wire format.
 //!
-//! Current scope: protocol 2-5 atoms — None / bool / int / float / str /
-//! bytes — plus PROTO / FRAME / STOP framing, the memo (MEMOIZE/BINPUT/PUT
-//! writes + GET/BINGET/LONG_BINGET back-references), and the built-in
-//! containers tuple / list / dict (with APPENDS / SETITEMS batching and
-//! recursive-structure handling). Sets, global/reduce, the legacy
-//! protocol-0/1 text opcodes, and out-of-band buffers land in later
-//! increments. The module deliberately exports only `Pickler` /
-//! `Unpickler`; `pickle.py`'s `from _pickle import (...)` keeps falling
-//! back to the pure-Python path until the full surface is ready.
+//! Scope: protocols 0-5 — atoms (None / bool / int / float / str / bytes),
+//! the memo (PUT/GET families), containers (tuple / list / dict with
+//! APPENDS / SETITEMS batching + recursion), set / frozenset / bytearray,
+//! the reduce protocol (save_reduce / save_global / find_class), the legacy
+//! protocol-0/1 text opcodes, persistent_id, `_compat_pickle` fix_imports,
+//! and the multi-frame framer. Out-of-band proto-5 buffers are deferred
+//! (see the note at the pickler dispatch site).
+//!
+//! The module exports all nine names `pickle.py` imports — `Pickler`,
+//! `Unpickler`, `dump`, `dumps`, `load`, `loads`, `PickleError`,
+//! `PicklingError`, `UnpicklingError` — so `from _pickle import (...)`
+//! resolves and the accelerated path engages.
 
 use malachite_bigint::{BigInt, Sign};
 use pyre_object::PyObjectRef;
@@ -145,15 +148,27 @@ pub(crate) fn call_meth(
     Ok(r)
 }
 
-// TODO(inc8): raise the app-level `_pickle.PicklingError` / `UnpicklingError`
-// once those classes are registered; until then carry the faithful message
-// text on a generic error.
+/// Build a `PyError` whose raised object is an instance of the named
+/// `_pickle` exception class (registered by the `exceptions:` block), with
+/// `msg` as the single argument. Falls back to a generic ValueError carrying
+/// the same text if the class is somehow unavailable.
+fn pickle_exc(class_name: &str, msg: String) -> PyError {
+    let mut err = PyError::value_error(msg.clone());
+    if let Some(cls) = crate::builtins::lookup_exc_class(class_name) {
+        let args = [cls, pyre_object::w_str_new(&msg)];
+        if let Ok(exc) = crate::builtins::exc_exception_new(&args) {
+            err.exc_object = exc;
+        }
+    }
+    err
+}
+
 pub(crate) fn unpickling_error(msg: &str) -> PyError {
-    PyError::value_error(msg)
+    pickle_exc("_pickle.UnpicklingError", msg.to_string())
 }
 
 pub(crate) fn pickling_error(msg: impl Into<String>) -> PyError {
-    PyError::value_error(msg.into())
+    pickle_exc("_pickle.PicklingError", msg.into())
 }
 
 // ── import / dotted attribute resolution (save_global / find_class) ───
@@ -243,7 +258,8 @@ pub(crate) fn compat_map(module: &str, name: &str, reverse: bool) -> (String, St
         }
     }
     if let Ok(w_import_map) = crate::baseobjspace::getattr_str(compat, import_map_attr) {
-        if let Some(v) = unsafe { pyre_object::w_dict_lookup(w_import_map, pyre_object::w_str_new(module)) }
+        if let Some(v) =
+            unsafe { pyre_object::w_dict_lookup(w_import_map, pyre_object::w_str_new(module)) }
         {
             return (
                 unsafe { pyre_object::strobject::w_str_get_value(v) }.to_string(),
@@ -363,5 +379,85 @@ crate::py_module! {
     interpleveldefs: {
         "Pickler" => pickler::type_object(),
         "Unpickler" => unpickler::type_object(),
+    },
+    exceptions: {
+        "PickleError" => crate::builtins::lookup_exc_class("Exception")
+            .expect("Exception must be installed before _pickle init"),
+        "PicklingError" => crate::builtins::lookup_exc_class("_pickle.PickleError")
+            .expect("_pickle.PickleError registered just above"),
+        "UnpicklingError" => crate::builtins::lookup_exc_class("_pickle.PickleError")
+            .expect("_pickle.PickleError registered just above"),
+    },
+    inline_functions: {
+        // `pickle.dump` — write a pickle of `obj` to `file`.
+        fn dump(
+            obj: PyObjectRef,
+            file: PyObjectRef,
+            #[default(pyre_object::w_none())] protocol: PyObjectRef,
+            #[default(pyre_object::w_none())] fix_imports: PyObjectRef,
+            #[default(pyre_object::w_none())] buffer_callback: PyObjectRef,
+        ) -> Result<PyObjectRef, PyError> {
+            // `buffer_callback` is accepted for signature compatibility but
+            // only ever invoked for PickleBuffer values (out-of-band buffers,
+            // deferred); no PickleBuffer can be constructed here, so ignoring
+            // it is behaviorally identical to the callback never firing.
+            let _ = (fix_imports, buffer_callback);
+            let proto = pickler::normalize_protocol(protocol)?;
+            let _roots = pyre_object::gc_roots::push_roots();
+            pyre_object::gc_roots::pin_root(file);
+            let file_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+            let w_bytes =
+                pickler::pickle_core(obj, proto, proto >= 1, proto >= 4, pyre_object::PY_NULL)?;
+            let file = pyre_object::gc_roots::shadow_stack_get(file_slot);
+            call_meth(file, "write", &[w_bytes])?;
+            Ok(pyre_object::w_none())
+        }
+
+        // `pickle.dumps` — return a pickle of `obj` as `bytes`.
+        fn dumps(
+            obj: PyObjectRef,
+            #[default(pyre_object::w_none())] protocol: PyObjectRef,
+            #[default(pyre_object::w_none())] fix_imports: PyObjectRef,
+            #[default(pyre_object::w_none())] buffer_callback: PyObjectRef,
+        ) -> Result<PyObjectRef, PyError> {
+            let _ = (fix_imports, buffer_callback);
+            let proto = pickler::normalize_protocol(protocol)?;
+            pickler::pickle_core(obj, proto, proto >= 1, proto >= 4, pyre_object::PY_NULL)
+        }
+
+        // `pickle.load` — read a pickle from `file`.
+        fn load(
+            file: PyObjectRef,
+            #[default(pyre_object::w_none())] fix_imports: PyObjectRef,
+            #[default(pyre_object::w_none())] encoding: PyObjectRef,
+            #[default(pyre_object::w_none())] errors: PyObjectRef,
+            #[default(pyre_object::w_none())] buffers: PyObjectRef,
+        ) -> Result<PyObjectRef, PyError> {
+            let _ = (fix_imports, encoding, errors, buffers);
+            let unpickler = call_fn(unpickler::type_object(), &[file])?;
+            call_meth(unpickler, "load", &[])
+        }
+
+        // `pickle.loads` — read a pickle from a `bytes` object.
+        fn loads(
+            data: PyObjectRef,
+            #[default(pyre_object::w_none())] fix_imports: PyObjectRef,
+            #[default(pyre_object::w_none())] encoding: PyObjectRef,
+            #[default(pyre_object::w_none())] errors: PyObjectRef,
+            #[default(pyre_object::w_none())] buffers: PyObjectRef,
+        ) -> Result<PyObjectRef, PyError> {
+            let _ = (fix_imports, encoding, errors, buffers);
+            let _roots = pyre_object::gc_roots::push_roots();
+            pyre_object::gc_roots::pin_root(data);
+            let data_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+            let io = import_module("io")?;
+            let bytesio_cls = crate::baseobjspace::getattr_str(io, "BytesIO")?;
+            let file = call_fn(
+                bytesio_cls,
+                &[pyre_object::gc_roots::shadow_stack_get(data_slot)],
+            )?;
+            let unpickler = call_fn(unpickler::type_object(), &[file])?;
+            call_meth(unpickler, "load", &[])
+        }
     },
 }

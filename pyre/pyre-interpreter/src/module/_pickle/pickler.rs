@@ -144,18 +144,7 @@ impl W_Pickler {
         w_file: PyObjectRef,
         #[default(pyre_object::w_none())] w_protocol: PyObjectRef,
     ) -> Result<(), PyError> {
-        let proto = if unsafe { pyre_object::is_none(w_protocol) } {
-            DEFAULT_PROTOCOL
-        } else {
-            let p = crate::baseobjspace::int_w(w_protocol)?;
-            if p < 0 {
-                HIGHEST_PROTOCOL
-            } else if p > HIGHEST_PROTOCOL {
-                return Err(PyError::value_error("pickle protocol must be <= 5"));
-            } else {
-                p
-            }
-        };
+        let proto = normalize_protocol(w_protocol)?;
         // `file must have a 'write' attribute` (interp_pickle.py:557).
         if crate::baseobjspace::findattr(w_file, "write").is_none() {
             return Err(PyError::type_error("file must have a 'write' attribute"));
@@ -183,39 +172,70 @@ impl W_Pickler {
         let _roots = pyre_object::gc_roots::push_roots();
         pyre_object::gc_roots::pin_root(w_file);
         let file_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-        pyre_object::gc_roots::pin_root(w_obj);
-        if !pers_func.is_null() {
-            pyre_object::gc_roots::pin_root(pers_func);
-        }
 
-        let mut ctx = PickleCtx {
-            proto,
-            bin,
-            memo: HashMap::new(),
-            memo_size: 0,
-            pers_func,
-        };
-        // PROTO is written before framing begins (it stays outside the
-        // frame); STOP is written while framing is active (inside the last
-        // frame). `end_framing` flushes the final frame.
-        let mut fr = Framer::new();
-        if proto >= 2 {
-            fr.push(op::PROTO);
-            fr.push(proto as u8);
-        }
-        if framing {
-            fr.start_framing();
-        }
-        save(&mut ctx, &mut fr, w_obj)?;
-        fr.push(op::STOP);
-        fr.end_framing();
-
-        let w_bytes = pyre_object::w_bytes_from_bytes(&fr.output);
-        // `w_file` may have moved during the build; re-read from the pin.
+        let w_bytes = pickle_core(w_obj, proto, bin, framing, pers_func)?;
+        // `w_file` may have moved while building the pickle; re-read the pin.
         let w_file = pyre_object::gc_roots::shadow_stack_get(file_slot);
         call_meth(w_file, "write", &[w_bytes])?;
         Ok(())
     }
+}
+
+/// `interp_pickle.py W_Pickler.__init__` protocol resolution: `None` →
+/// `DEFAULT_PROTOCOL`, a negative value → `HIGHEST_PROTOCOL`, and anything
+/// above `HIGHEST_PROTOCOL` is rejected.
+pub(crate) fn normalize_protocol(w_protocol: PyObjectRef) -> Result<i64, PyError> {
+    if unsafe { pyre_object::is_none(w_protocol) } {
+        return Ok(DEFAULT_PROTOCOL);
+    }
+    let p = crate::baseobjspace::int_w(w_protocol)?;
+    if p < 0 {
+        Ok(HIGHEST_PROTOCOL)
+    } else if p > HIGHEST_PROTOCOL {
+        Err(PyError::value_error("pickle protocol must be <= 5"))
+    } else {
+        Ok(p)
+    }
+}
+
+/// Build the full pickle byte string for `w_obj` and return it as a `bytes`.
+/// Shared by `W_Pickler.dump` (which then writes it to the file) and the
+/// module-level `dump` / `dumps`. `pers_func` is the `persistent_id` callable
+/// or `PY_NULL`. PROTO is written before framing begins (outside the frame);
+/// STOP is written while framing is active (inside the last frame).
+pub(crate) fn pickle_core(
+    w_obj: PyObjectRef,
+    proto: i64,
+    bin: bool,
+    framing: bool,
+    pers_func: PyObjectRef,
+) -> Result<PyObjectRef, PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    pyre_object::gc_roots::pin_root(w_obj);
+    if !pers_func.is_null() {
+        pyre_object::gc_roots::pin_root(pers_func);
+    }
+
+    let mut ctx = PickleCtx {
+        proto,
+        bin,
+        memo: HashMap::new(),
+        memo_size: 0,
+        pers_func,
+    };
+    let mut fr = Framer::new();
+    if proto >= 2 {
+        fr.push(op::PROTO);
+        fr.push(proto as u8);
+    }
+    if framing {
+        fr.start_framing();
+    }
+    save(&mut ctx, &mut fr, w_obj)?;
+    fr.push(op::STOP);
+    fr.end_framing();
+
+    Ok(pyre_object::w_bytes_from_bytes(&fr.output))
 }
 
 /// `interp_pickle.py W_Pickler.save` with the persistent-id hook: every
