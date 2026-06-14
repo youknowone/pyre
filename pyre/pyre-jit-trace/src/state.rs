@@ -792,6 +792,46 @@ thread_local! {
     /// warmspot.py:282: MetaInterp.staticdata (per-thread for no-GIL).
     pub(crate) static METAINTERP_SD: RefCell<MetaInterpStaticData> =
         RefCell::new(MetaInterpStaticData::new());
+
+    /// Set when a guard's frame reports a resume coordinate the jitcode
+    /// `pc_map` cannot resolve — the cross-frame snapshot gap (an inlined
+    /// callee + exception-resume shape whose parent resume pc was never
+    /// recorded; #124/#130).  `get_list_of_active_boxes` raises it instead of
+    /// panicking; `metainterp::interpret` polls it each step and aborts the
+    /// trace.  The trace is discarded before any code is installed, so the
+    /// abort is side-effect free and the location interprets rather than the
+    /// process crashing.
+    static TRACE_ABORT_REQUESTED: std::cell::Cell<bool> = std::cell::Cell::new(false);
+}
+
+/// Request that the in-progress trait-tracer trace abort at the next step
+/// boundary.  See [`TRACE_ABORT_REQUESTED`].
+pub fn request_trace_abort() {
+    TRACE_ABORT_REQUESTED.with(|c| c.set(true));
+}
+
+/// Read-and-clear the trace-abort request.  `metainterp::interpret` calls
+/// this after every step; `trace_bytecode` calls it once at entry to drop a
+/// flag a prior aborted trace may have left set.
+pub fn take_trace_abort_requested() -> bool {
+    TRACE_ABORT_REQUESTED.with(|c| c.replace(false))
+}
+
+/// Request a trace abort and return a bit-14-encodable stand-in for a resume
+/// pc that does not fit the marker scheme (`>= AFTER_RESIDUAL_CALL_PC_FLAG`).
+///
+/// The bit-14 resume asserts (`trace_opcode.rs marker_aware_*_resume_pc`)
+/// document that an unencodable pc is meant to fall back to the interpreter
+/// via the recording loop's `catch_unwind` — but the pyre tracer runs its own
+/// `metainterp::interpret`, which has no such catch, so the bare assert
+/// crashed the process instead.  The cross-frame snapshot coordinate gap
+/// (#124/#130) can hand such a pc (e.g. one already carrying the marker bit
+/// from a corrupted cross-frame coordinate).  Requesting an abort discards the
+/// guard with the (pre-install) trace, so the clamped value is never decoded.
+pub fn abort_unencodable_resume_pc(pc: usize) -> usize {
+    let flag = majit_ir::resumedata::AFTER_RESIDUAL_CALL_PC_FLAG as usize;
+    request_trace_abort();
+    pc & (flag - 1)
 }
 
 /// pyjitpl.py:2255 `MetaInterpStaticData.finish_setup` parity entry point.

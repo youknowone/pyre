@@ -148,6 +148,15 @@ impl PyreMetaInterp {
                 self.step_root_frame(ctx, pc)
             };
 
+            // A guard emitted during this step may have hit a resume
+            // coordinate the jitcode pc_map cannot resolve (#124/#130) and
+            // requested an abort.  Honor it before acting on the step outcome
+            // so the pre-install trace is discarded and the location
+            // interprets instead of the process crashing.
+            if crate::state::take_trace_abort_requested() {
+                return TraceAction::Abort;
+            }
+
             match action {
                 LoopAction::Continue => {}
                 LoopAction::Return(ta) => return ta,

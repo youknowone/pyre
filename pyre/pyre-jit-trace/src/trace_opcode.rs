@@ -1363,13 +1363,28 @@ impl MIFrame {
             if jc.payload.metadata.pc_map.is_empty() {
                 None
             } else {
-                Some(
-                    self.residual_call_pc
-                        .filter(|_| in_a_call)
-                        .and_then(|call_pc| jc.payload.after_residual_call_resume_pc_for(call_pc))
-                        .or_else(|| jc.payload.resume_jitcode_pc_for(live_pc))
-                        .expect("pc_map non-empty: resume pc lookup hits"),
-                )
+                match self
+                    .residual_call_pc
+                    .filter(|_| in_a_call)
+                    .and_then(|call_pc| jc.payload.after_residual_call_resume_pc_for(call_pc))
+                    .or_else(|| jc.payload.resume_jitcode_pc_for(live_pc))
+                {
+                    Some(jit_pc) => Some(jit_pc),
+                    None => {
+                        // This (parent) frame reports a `live_pc` the jitcode
+                        // `pc_map` has no entry for — the cross-frame snapshot
+                        // coordinate gap (#124/#130): an inlined callee +
+                        // exception-resume shape whose parent resume pc was
+                        // never recorded.  Building the guard from this frame
+                        // would emit incorrect resume data, so request a trace
+                        // abort and return no active boxes.  The recorded guard
+                        // is thrown away with the aborted (pre-install) trace,
+                        // so the empty list — already a valid return for the
+                        // skeleton / short-liveness paths below — is harmless.
+                        crate::state::request_trace_abort();
+                        return Vec::new();
+                    }
+                }
             }
         };
         let live_regs_for_banks: Vec<(LiveBank, usize)> = unsafe {
@@ -3972,12 +3987,12 @@ impl MIFrame {
     /// the non-after_residual_call path) must independently leave bit 14
     /// free, or `decode_resume_pc` mis-reads it as marked.  A function with
     /// >= 16384 trace-bytecode units exceeds this and cannot be encoded
-    /// under the bit-14 scheme — fail loudly rather than corrupt decode
-    /// silently at resume time (resumedata.rs:48-62).  The panic is caught
-    /// by the recording-loop `catch_unwind` (pyjitpl/dispatch.rs:1419) and
-    /// converted to `AbortPermanent`, so an oversized function falls back
-    /// to the interpreter rather than crashing — consistent with
-    /// `resumecode::append_int`'s i16 assert on the same recording path.
+    /// under the bit-14 scheme — request a trace abort rather than corrupt
+    /// decode silently at resume time (resumedata.rs:48-62).
+    /// `abort_unencodable_resume_pc` sets the flag `metainterp::interpret`
+    /// polls each step, so an unencodable pc (an oversized function, or a
+    /// corrupted cross-frame coordinate, #124/#130) falls back to the
+    /// interpreter rather than crashing.
     fn marker_aware_resume_pc(&self, call_pc: usize, after_residual_call: bool) -> usize {
         let flag = majit_ir::resumedata::AFTER_RESIDUAL_CALL_PC_FLAG as usize;
         let wants_marker = after_residual_call && {
@@ -3991,13 +4006,11 @@ impl MIFrame {
             // routed by the bit-14 marker.  If `call_pc` cannot fit under the
             // marker, downgrading to an unmarked pc would silently mis-resume
             // (decode routes through `pc_map` re-execution instead of
-            // `after_residual_call_resume_pc_for`), so fail loudly here too —
-            // caught by the recording `catch_unwind` → interpreter fallback.
-            assert!(
-                call_pc < flag,
-                "after-residual-call resume pc {call_pc} >= AFTER_RESIDUAL_CALL_PC_FLAG ({flag}); \
-                 function too large for bit-14 resume encoding"
-            );
+            // `after_residual_call_resume_pc_for`), so request a trace abort
+            // here too → interpreter fallback.
+            if call_pc >= flag {
+                return crate::state::abort_unencodable_resume_pc(call_pc);
+            }
             majit_ir::resumedata::encode_after_residual_call_pc(call_pc as i32) as usize
         } else {
             let raw = if after_residual_call {
@@ -4005,11 +4018,9 @@ impl MIFrame {
             } else {
                 call_pc
             };
-            assert!(
-                raw < flag,
-                "resume pc {raw} >= AFTER_RESIDUAL_CALL_PC_FLAG ({flag}); \
-                 function too large for bit-14 resume encoding"
-            );
+            if raw >= flag {
+                return crate::state::abort_unencodable_resume_pc(raw);
+            }
             raw
         }
     }
@@ -4038,18 +4049,14 @@ impl MIFrame {
                 .is_some()
         });
         if let Some(cp) = marked_call_pc {
-            assert!(
-                cp < flag,
-                "after-residual-call parent resume pc {cp} >= AFTER_RESIDUAL_CALL_PC_FLAG \
-                 ({flag}); function too large for bit-14 resume encoding"
-            );
+            if cp >= flag {
+                return crate::state::abort_unencodable_resume_pc(cp);
+            }
             majit_ir::resumedata::encode_after_residual_call_pc(cp as i32) as usize
         } else {
-            assert!(
-                return_point_pc < flag,
-                "parent resume pc {return_point_pc} >= AFTER_RESIDUAL_CALL_PC_FLAG ({flag}); \
-                 function too large for bit-14 resume encoding"
-            );
+            if return_point_pc >= flag {
+                return crate::state::abort_unencodable_resume_pc(return_point_pc);
+            }
             return_point_pc
         }
     }

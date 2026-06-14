@@ -77,6 +77,10 @@ pub fn trace_bytecode(
     // A stale flag from a prior trace on this thread must not leak into
     // this trace's adoption decision.
     WALK_END_FLUSH_COMMITTED.with(|c| c.set(false));
+    // Likewise drop any cross-frame-resume abort request a prior aborted
+    // trace left unconsumed (`metainterp::interpret` clears it on the normal
+    // path; this guards the paths that exit before the poll runs).
+    let _ = crate::state::take_trace_abort_requested();
 
     let ctx = meta
         .trace_ctx()
@@ -916,7 +920,22 @@ fn full_body_walk_trace(
             .collect();
         ctx.add_merge_point(start_key, input_args, start_pc);
     }
-    match run_perfn_walk(ctx, sym, w_code, start_pc, cf_addr, true) {
+    let walk_result = run_perfn_walk(ctx, sym, w_code, start_pc, cf_addr, true);
+    // A guard snapshot emitted during the walk may have hit a resume
+    // coordinate the jitcode pc_map cannot encode (#124/#130) and requested
+    // an abort (`state::request_trace_abort`).  The walker does not poll the
+    // flag mid-walk, so honor it here before mapping the outcome — otherwise a
+    // walk that reaches a terminator would compile a trace carrying the bad
+    // guard.  Discarding the trace matches the trait leg's `interpret()` poll.
+    if crate::state::take_trace_abort_requested() {
+        if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+            eprintln!(
+                "[fbw-abort] start_pc={start_pc} unencodable cross-frame resume coordinate (#124/#130)"
+            );
+        }
+        return TraceAction::Abort;
+    }
+    match walk_result {
         Some((_entry, _code_len, Ok((outcome, _end_pc)))) => match outcome {
             crate::jitcode_dispatch::DispatchOutcome::CloseLoop {
                 jump_args,
