@@ -2957,6 +2957,7 @@ impl<'a> Lowering<'a> {
                 let op = self
                     .static_addr_op(&segments)
                     .or_else(|| self.const_eval_global(id))
+                    .or_else(|| primitive_float_const(&segments))
                     .unwrap_or_else(|| OpKind::Call {
                         target: CallTarget::FunctionPath { segments },
                         args: vec![],
@@ -7452,6 +7453,24 @@ fn static_key_matches(full: &str, stripped: &str, key: &str) -> bool {
         || stripped
             .strip_suffix(key)
             .is_some_and(|prefix| prefix.ends_with("::"))
+}
+
+/// Supply the value of a primitive `f64` associated constant whose
+/// initializer Charon records as an `Opaque` body — `core` defines
+/// `f64::INFINITY` as `1.0_f64 / 0.0_f64`, so no in-LLBC init survives
+/// for [`Lowering::const_eval_global`] to evaluate.  The value is a
+/// fixed IEEE-754 bit pattern the host (rustc) already computed, so
+/// emit it as the same by-value `ConstFloat` an inline float literal
+/// lowers to (mirroring `rfloat.INFINITY` reaching the flow graph as a
+/// float `Constant`).  Matches on the `f64::<Impl>::<NAME>` tail so a
+/// `core`- or `std`-rooted path resolves identically.
+fn primitive_float_const(segments: &[String]) -> Option<OpKind> {
+    let tail: Vec<&str> = segments.iter().rev().take(3).rev().map(String::as_str).collect();
+    let bits = match tail.as_slice() {
+        ["f64", "<Impl>", "INFINITY"] => f64::INFINITY.to_bits(),
+        _ => return None,
+    };
+    Some(OpKind::ConstFloat(bits))
 }
 
 fn place_kind_label(k: &PlaceKind) -> &'static str {
