@@ -4137,6 +4137,17 @@ pub extern "C" fn bh_unary_invert_fn(value: i64) -> i64 {
     }
 }
 
+/// UNARY_NOT residual (`unary_not` HLOp → `residual_call_r_r`).  Returns
+/// `not value` as a bool object via `opcode_ops::truth_value`.  A user
+/// `__bool__` / `__len__` may run Python (`MayForce`), matching the
+/// interpreter's UNARY_NOT truth path; `truth_value` does not surface an
+/// error (the JIT and the interpreter share `is_true`), so the helper is
+/// infallible and never publishes `BH_LAST_EXC_VALUE`.
+pub extern "C" fn bh_unary_not_fn(value: i64) -> i64 {
+    let truth = pyre_interpreter::opcode_ops::truth_value(value as pyre_object::PyObjectRef);
+    pyre_object::w_bool_from(!truth) as i64
+}
+
 #[cfg(test)]
 mod tests_bh_newtuple_from_array {
     use super::bh_newtuple_from_array;

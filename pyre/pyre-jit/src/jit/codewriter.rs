@@ -3352,6 +3352,7 @@ struct FnPtrIndices {
     super_attr_unwrap_fn: HelperHandle,
     load_deref_value_fn: HelperHandle,
     unary_invert_fn: HelperHandle,
+    unary_not_fn: HelperHandle,
 }
 
 /// Register every blackhole helper fn pointer with the assembler in
@@ -3684,6 +3685,9 @@ fn register_helper_fn_pointers(
         cpu.unary_invert_fn as *const (),
         CallFlavor::MayForce,
     );
+    // `bh_unary_not_fn` runs the truth test; a user `__bool__` / `__len__`
+    // may run Python → `MayForce`.  Appended last to preserve fn_ptr indices.
+    let unary_not_fn = bind(assembler, cpu.unary_not_fn as *const (), CallFlavor::MayForce);
     FnPtrIndices {
         call_fn,
         load_global_fn,
@@ -3729,6 +3733,7 @@ fn register_helper_fn_pointers(
         super_attr_unwrap_fn,
         load_deref_value_fn,
         unary_invert_fn,
+        unary_not_fn,
     }
 }
 
@@ -4710,6 +4715,11 @@ impl CodeWriter {
                     idx: unary_invert_fn_idx,
                     flavor: _unary_invert_fn_flavor,
                 },
+            unary_not_fn:
+                HelperHandle {
+                    idx: unary_not_fn_idx,
+                    flavor: _unary_not_fn_flavor,
+                },
         } = register_helper_fn_pointers(&mut assembler, self.cpu());
 
         // codewriter.py:37 `portal_jd = self.callcontrol.jitdriver_sd_from_portal_graph(graph)`
@@ -4786,6 +4796,7 @@ impl CodeWriter {
                 super_attr_unwrap_fn_idx,
                 load_deref_value_fn_idx,
                 unary_invert_fn_idx,
+                unary_not_fn_idx,
             });
         }
 
@@ -8886,8 +8897,32 @@ impl CodeWriter {
                             push_and_bump!(result_value.into(), py_pc);
                         }
 
+                        // UNARY_NOT: pops `value`, pushes `not value` as a bool
+                        // (net 0).  `unary_not(value)` HLOp →
+                        // `residual_call_r_r(unary_not_fn, ListR[value])`
+                        // returns `not truth(value)` through
+                        // `opcode_ops::truth_value`; a user `__bool__` /
+                        // `__len__` may run Python → MayForce.
+                        Instruction::UnaryNot => {
+                            let val_reg = emit_popvalue_ref!(current_depth, py_pc);
+                            let val_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            if let super::flow::FlowValue::Variable(v) = &val_value {
+                                pin!(Some(*v), val_reg);
+                            }
+                            let result_value = emit_graph_op_with_result(
+                                &mut graph,
+                                &current_block.block(),
+                                "unary_not",
+                                vec![val_value.into()],
+                                Kind::Ref,
+                                py_pc as i64,
+                            );
+                            pin!(Some(result_value), stack_base + current_depth);
+                            push_and_bump!(result_value.into(), py_pc);
+                        }
+
                         // Pops 1, pushes 1 (net 0). Replace shadow value.
-                        Instruction::UnaryNot | Instruction::GetYieldFromIter => {
+                        Instruction::GetYieldFromIter => {
                             let _ = current_state.stack.pop();
                             push_fresh_ref(&mut current_state, &mut graph);
                             emit_abort_permanent!(py_pc);
