@@ -5606,6 +5606,23 @@ fn fbw_terminate_with_finish(
     Ok(())
 }
 
+/// Void variant of [`fbw_terminate_with_finish`] for the top-level
+/// `void_return/` portal exit (`compile_done_with_this_frame`'s VOID
+/// branch, pyjitpl.py:3202-3205).  Records the vable store-back +
+/// `GUARD_NOT_FORCED_2`, then stashes a `Type::Void`-marked payload so
+/// [`crate::trace::full_body_walk_trace`] builds a `TraceAction::Finish`
+/// with no args (`done_with_this_frame_descr_from_types(&[])` resolves the
+/// void descr).  Like the value path it does NOT record the `FINISH` op —
+/// the compile consumer records it from the empty `finish_args`.
+fn fbw_terminate_void_with_finish(
+    ctx: &mut WalkContext<'_, '_>,
+    op_pc: usize,
+) -> Result<(), DispatchError> {
+    fbw_store_token_in_vable(ctx, op_pc)?;
+    FBW_FINISH_PAYLOAD.with(|c| c.set(Some((OpRef::NONE, Type::Void))));
+    Ok(())
+}
+
 /// Map a JitCode byte offset back to the Python PC of the opcode whose
 /// JitCode region contains it: the largest `py_pc` with
 /// `pc_map[py_pc] <= jit_pc` (ties → larger `py_pc`).  `pc_map[py_pc]` is
@@ -11048,8 +11065,19 @@ fn handle(
             // marker for void calls).
             // No operand bytes (the `/` argcodes is empty).
             if ctx.is_top_level {
-                ctx.trace_ctx
-                    .finish(&[], ctx.done_with_this_frame_descr_void.clone());
+                if fbw_call_assembler_enabled() {
+                    // Slice b: route the void portal exit through
+                    // `TraceAction::Finish` (empty args) so the compile
+                    // pipeline records the FINISH(void) from `finish_args`,
+                    // mirroring the three value-returning arms.  Store the
+                    // assembler token in the vable + GUARD_NOT_FORCED_2 like
+                    // those arms, then stash a void-marked payload; do NOT
+                    // call `ctx.trace_ctx.finish()` here (would double-record).
+                    fbw_terminate_void_with_finish(ctx, op.pc)?;
+                } else {
+                    ctx.trace_ctx
+                        .finish(&[], ctx.done_with_this_frame_descr_void.clone());
+                }
                 Ok((DispatchOutcome::Terminate, op.next_pc))
             } else {
                 Ok((DispatchOutcome::SubReturn { result: None }, op.next_pc))
@@ -13444,20 +13472,21 @@ mod tests {
     }
 
     #[test]
-    fn step_through_void_return_records_empty_finish_with_void_descr() {
-        // top-level `void_return/` records `FINISH([])` with
-        // `done_with_this_frame_descr_void`. RPython
-        // `pyjitpl.py:3202-3205 compile_done_with_this_frame`:
-        //   if result_type == VOID:
-        //       assert exitbox is None
-        //       exits = []
-        //       token = sd.done_with_this_frame_descr_void
+    fn step_through_void_return_stashes_void_finish_payload() {
+        // Top-level `void_return/` is the VOID portal exit (RPython
+        // `pyjitpl.py:3202-3205 compile_done_with_this_frame`, the
+        // `result_type == VOID` branch — `exits = []`,
+        // `token = sd.done_with_this_frame_descr_void`).  Under the
+        // `PYRE_FBW_CALL_ASSEMBLER` gate (default on) it mirrors the three
+        // value-returning arms: it does NOT record the FINISH op itself
+        // (the compile consumer records `FINISH([])` from the empty
+        // finish_args) and stashes a `Type::Void`-marked payload so
+        // `full_body_walk_trace` builds `TraceAction::Finish` with no args.
         let ret_byte = *insns_opname_to_byte()
             .get("void_return/")
             .expect("`void_return/` must be in insns table");
         let code = [ret_byte];
         let mut tc = fresh_trace_ctx();
-        let descr_void = make_fail_descr(77);
         let mut wc = WalkContext {
             registers_r: &mut [],
             registers_i: &mut [],
@@ -13472,7 +13501,7 @@ mod tests {
             done_with_this_frame_descr_ref: make_fail_descr(1),
             done_with_this_frame_descr_int: make_fail_descr(101),
             done_with_this_frame_descr_float: make_fail_descr(102),
-            done_with_this_frame_descr_void: descr_void.clone(),
+            done_with_this_frame_descr_void: make_fail_descr(77),
             exit_frame_with_exception_descr_ref: make_fail_descr(2),
             is_top_level: true,
             sub_jitcode_lookup: &no_sub_jitcodes,
@@ -13485,23 +13514,21 @@ mod tests {
             pending_guard_snapshot_error: None,
         };
         let ops_before = wc.trace_ctx.num_ops();
+        fbw_finish_payload_reset();
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("void_return/ must dispatch");
         assert_eq!(outcome, DispatchOutcome::Terminate);
         assert_eq!(next_pc, 1, "void_return/ has zero operand bytes");
         drop(wc);
-        assert_eq!(tc.num_ops(), ops_before + 1);
-        let last = tc.ops().last().expect("recorded op must exist");
-        assert_eq!(last.opcode, majit_ir::OpCode::Finish);
-        assert!(
-            last.num_args() == 0,
-            "void_return/ FINISH must carry zero args (RPython exits = [])",
+        assert_eq!(
+            tc.num_ops(),
+            ops_before,
+            "void_return must NOT record the FINISH itself: the compile \
+             consumer records FINISH([]) from the empty finish_args",
         );
-        let recorded_descr = last
-            .getdescr()
-            .expect("Finish must carry done_with_this_frame_descr_void");
-        assert!(
-            std::sync::Arc::ptr_eq(&recorded_descr, &descr_void),
-            "void_return/ must use done_with_this_frame_descr_void, not _ref",
+        assert_eq!(
+            fbw_finish_payload_take(),
+            Some((OpRef::NONE, Type::Void)),
+            "void portal exit stashes a Type::Void-marked payload",
         );
     }
 

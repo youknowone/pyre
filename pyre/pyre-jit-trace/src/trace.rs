@@ -953,6 +953,17 @@ fn full_body_walk_trace(
                 // path, trace_opcode.rs).  Ungated → no payload → `Abort`
                 // exactly as before the slice.
                 match crate::jitcode_dispatch::fbw_finish_payload_take() {
+                    // A top-level `void_return/` stashes a `Type::Void`-marked
+                    // payload: the portal exits with no value, so build a
+                    // FINISH with empty args.  The compile pipeline maps an
+                    // empty `finish_arg_types` to `done_with_this_frame_descr_void`
+                    // (pyjitpl/mod.rs `done_with_this_frame_descr_from_types`),
+                    // matching the trait tracer's `BC_VOID_RETURN` action.
+                    Some((_, majit_ir::Type::Void)) => TraceAction::Finish {
+                        finish_args: vec![],
+                        finish_arg_types: vec![],
+                        exit_with_exception: false,
+                    },
                     Some((finish_value, finish_type)) => TraceAction::Finish {
                         finish_args: vec![finish_value],
                         finish_arg_types: vec![finish_type],
