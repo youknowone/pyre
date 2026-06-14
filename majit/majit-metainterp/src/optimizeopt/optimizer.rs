@@ -2292,7 +2292,7 @@ impl Optimizer {
             let targetargs: Vec<OpRef> = (0..n)
                 .map(|i| {
                     let source = typed_inputargs[i];
-                    let target = nia[i];
+                    let target = nia[i].to_opref();
                     // Constants don't participate in forwarding.
                     if ctx.get_box_replacement_box(target).and_then(|cb| cb.const_value()).is_some() {
                         return source;
@@ -3242,14 +3242,19 @@ impl Optimizer {
                         *opref = opref.with_raw(new_pos);
                     }
                 };
+                let remap_boxref = |arg: &mut crate::r#box::BoxRef| {
+                    let mut opref = arg.to_opref();
+                    remap_opref(&mut opref);
+                    *arg = crate::r#box::BoxRef::from_opref(opref);
+                };
                 for arg in &mut state.next_iteration_args {
-                    remap_opref(arg);
+                    remap_boxref(arg);
                 }
                 for arg in &mut state.end_args {
-                    remap_opref(arg);
+                    remap_boxref(arg);
                 }
                 for arg in &mut state.renamed_inputargs {
-                    remap_opref(arg);
+                    remap_boxref(arg);
                 }
                 for arg in &state.short_inputargs {
                     // Renamed-box positions track op compaction through the

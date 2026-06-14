@@ -638,7 +638,10 @@ impl UnrollOptimizer {
                         // carry the recorded JUMP args into ExportedState so the
                         // peeled-loop close passes them to generate_guards as
                         // `state.runtime_boxes` (unroll.py:153/166).
-                        state.runtime_boxes = recorded_jump_args.clone();
+                        state.runtime_boxes = recorded_jump_args
+                            .iter()
+                            .map(|&a| BoxRef::from_opref(a))
+                            .collect();
                         // end_arg_types is already populated by
                         // `Optimizer::optimize_with_constants_and_inputs_at`
                         // using the optimizer-visible `ctx.opref_type()` (see
@@ -1131,11 +1134,17 @@ impl UnrollOptimizer {
                 .expect("imported_loop_state must survive Phase 2");
             (
                 es.virtual_state.clone(),
-                es.end_args.clone(),
+                es.end_args.iter().map(|b| b.to_opref()).collect::<Vec<_>>(),
                 es.short_inputargs.clone(),
                 es.short_boxes.clone(),
-                es.renamed_inputargs.clone(),
-                es.runtime_boxes.clone(),
+                es.renamed_inputargs
+                    .iter()
+                    .map(|b| b.to_opref())
+                    .collect::<Vec<_>>(),
+                es.runtime_boxes
+                    .iter()
+                    .map(|b| b.to_opref())
+                    .collect::<Vec<_>>(),
             )
         };
         // RPython unroll.py:124-141 performs an extra end-of-preamble forcing
@@ -1865,9 +1874,9 @@ impl Default for UnrollOptimizer {
 #[derive(Debug)]
 pub struct ExportedState {
     /// Label args at the end of the preamble (after forcing).
-    pub end_args: Vec<OpRef>,
+    pub end_args: Vec<BoxRef>,
     /// Args for the next iteration (before forcing).
-    pub next_iteration_args: Vec<OpRef>,
+    pub next_iteration_args: Vec<BoxRef>,
     /// Types of end_args as determined by Phase 1 optimization.
     /// Used by Phase 2 import_state to propagate unboxed types.
     pub end_arg_types: Vec<Type>,
@@ -1921,7 +1930,7 @@ pub struct ExportedState {
     /// `InputArg{Int,Float,Ref}` variant carrying its `.type` intrinsically
     /// (history.py:220), so consumers read the type via `OpRef::ty()` —
     /// RPython `info.renamed_inputargs` Box parity, no parallel type array.
-    pub renamed_inputargs: Vec<OpRef>,
+    pub renamed_inputargs: Vec<BoxRef>,
     /// Short inputargs for the short preamble — the renamed inputarg box
     /// objects themselves (shortpreamble.py:430 / unroll.py:480), shared
     /// with the renamed operands inside `short_boxes`.
@@ -1930,7 +1939,7 @@ pub struct ExportedState {
     /// Threaded into Phase 2 import as `runtime_boxes` for guard generation.
     /// Default `Vec::new()` until the export site populates it; callers
     /// that need it write the field directly after `ExportedState::new`.
-    pub runtime_boxes: Vec<OpRef>,
+    pub runtime_boxes: Vec<BoxRef>,
     /// RPython parity: patchguardop from Phase 1's GuardFutureCondition.
     /// Phase 2's extra_guards (from virtualstate) need rd_resume_position
     /// from this patchguardop (unroll.py:333-336).
@@ -2027,8 +2036,11 @@ impl ExportedState {
                 &exported_short_boxes,
             );
         ExportedState {
-            end_args,
-            next_iteration_args,
+            end_args: end_args.iter().map(|&a| BoxRef::from_opref(a)).collect(),
+            next_iteration_args: next_iteration_args
+                .iter()
+                .map(|&a| BoxRef::from_opref(a))
+                .collect(),
             end_arg_types: Vec::new(),
             virtual_state,
             exported_infos,
@@ -2036,7 +2048,10 @@ impl ExportedState {
             short_boxes,
             short_box_const_values: crate::optimizeopt::vec_assoc::VecAssoc::new(),
             short_preamble: None,
-            renamed_inputargs,
+            renamed_inputargs: renamed_inputargs
+                .iter()
+                .map(|&a| BoxRef::from_opref(a))
+                .collect(),
             short_inputargs,
             runtime_boxes: Vec::new(),
             patchguardop: None,
@@ -2067,9 +2082,9 @@ impl ExportedState {
             }
         }
 
-        fn visit_oprefs(oprefs: &mut [OpRef], visitor: &mut dyn FnMut(&mut GcRef)) {
-            for opref in oprefs {
-                visit_opref(opref, visitor);
+        fn visit_boxrefs(boxes: &[BoxRef], visitor: &mut dyn FnMut(&mut GcRef)) {
+            for b in boxes {
+                b.walk_const_ptr_refs(visitor);
             }
         }
 
@@ -2129,8 +2144,8 @@ impl ExportedState {
             }
         }
 
-        visit_oprefs(&mut self.end_args, visitor);
-        visit_oprefs(&mut self.next_iteration_args, visitor);
+        visit_boxrefs(&self.end_args, visitor);
+        visit_boxrefs(&self.next_iteration_args, visitor);
         self.virtual_state.walk_const_ptr_refs_mut(visitor);
         for (key, info) in self.exported_infos.iter_entries_mut() {
             visit_opref(key, visitor);
@@ -2150,11 +2165,11 @@ impl ExportedState {
         if let Some(short_preamble) = self.short_preamble.as_mut() {
             short_preamble.walk_const_ptr_refs_mut(visitor);
         }
-        visit_oprefs(&mut self.renamed_inputargs, visitor);
+        visit_boxrefs(&self.renamed_inputargs, visitor);
         for arg in &self.short_inputargs {
             arg.walk_const_ptr_refs(visitor);
         }
-        visit_oprefs(&mut self.runtime_boxes, visitor);
+        visit_boxrefs(&self.runtime_boxes, visitor);
         if let Some(patchguardop) = self.patchguardop.as_ref() {
             visit_op(patchguardop, visitor);
         }
@@ -2196,20 +2211,20 @@ impl ExportedState {
                 }
             }
         };
-        for &opref in &self.end_args {
-            visit(opref);
+        for arg in &self.end_args {
+            visit(arg.to_opref());
         }
-        for &opref in &self.next_iteration_args {
-            visit(opref);
+        for arg in &self.next_iteration_args {
+            visit(arg.to_opref());
         }
-        for &opref in &self.renamed_inputargs {
-            visit(opref);
+        for arg in &self.renamed_inputargs {
+            visit(arg.to_opref());
         }
         for arg in &self.short_inputargs {
             visit(arg.to_opref());
         }
-        for &opref in &self.runtime_boxes {
-            visit(opref);
+        for arg in &self.runtime_boxes {
+            visit(arg.to_opref());
         }
 
         for (&opref, info) in &self.exported_infos {
@@ -3841,12 +3856,13 @@ impl OptUnroll {
         );
         // for i, target in enumerate(exported_state.next_iteration_args):
         for (i, target) in exported_state.next_iteration_args.iter().enumerate() {
+            let target = target.to_opref();
             // source = targetargs[i]
             let source = targetargs[i];
             // assert source is not target — see commit log for the
             // disjoint-namespace invariant from Step 2 Commit D2 that
             // makes this hold by construction in production callers.
-            debug_assert!(source != *target, "import_state: source is target");
+            debug_assert!(source != target, "import_state: source is target");
             // source.set_forwarded(target)
             // `source` is `targetargs[i]`, produced by the caller's
             // cross-slot resolution as either a materialized inputarg or a
@@ -3861,9 +3877,9 @@ impl OptUnroll {
             // would re-materialize the unbound target internally anyway —
             // resolve-or-materialize here keeps the chain target canonical
             // from the start).
-            let b_target = match ctx.get_box_replacement_box(*target) {
+            let b_target = match ctx.get_box_replacement_box(target) {
                 Some(b) => b,
-                None => ctx.materialize_box_at(*target),
+                None => ctx.materialize_box_at(target),
             };
             ctx.make_equal_to(&b_source, &b_target);
             if crate::debug::have_debug_prints() {
@@ -3874,7 +3890,7 @@ impl OptUnroll {
             }
             // info = exported_state.exported_infos.get(target, None)
             // if info is not None:
-            if let Some(info) = exported_state.exported_infos.get(target) {
+            if let Some(info) = exported_state.exported_infos.get(&target) {
                 //     self.optimizer.setinfo_from_preamble(source, info,
                 //                                     exported_state.exported_infos)
                 self.setinfo_from_preamble(source, info, &exported_state.exported_infos, ctx);
@@ -5712,7 +5728,7 @@ mod tests {
             inputarg_infos: vec![Some(PtrInfo::Constant(old))],
             phase1_inputargs: Some(vec![BoxRef::from_opref(old_ref)]),
         });
-        state.runtime_boxes.push(old_ref);
+        state.runtime_boxes.push(BoxRef::from_opref(old_ref));
         state.patchguardop = Some(Op::new(
             OpCode::GuardNonnull,
             &[BoxRef::from_opref(old_ref)],
@@ -5724,11 +5740,11 @@ mod tests {
             }
         });
 
-        assert_eq!(state.end_args[0], new_ref);
-        assert_eq!(state.next_iteration_args[0], new_ref);
-        assert_eq!(state.renamed_inputargs[0], new_ref);
+        assert_eq!(state.end_args[0].to_opref(), new_ref);
+        assert_eq!(state.next_iteration_args[0].to_opref(), new_ref);
+        assert_eq!(state.renamed_inputargs[0].to_opref(), new_ref);
         assert_eq!(state.short_inputargs[0].to_opref(), new_ref);
-        assert_eq!(state.runtime_boxes[0], new_ref);
+        assert_eq!(state.runtime_boxes[0].to_opref(), new_ref);
         assert!(state.exported_infos.get(&new_ref).is_some());
         assert_eq!(state.exported_short_boxes[0].op.arg(0).to_opref(), new_ref);
         assert_eq!(
@@ -6418,7 +6434,10 @@ mod tests {
 
         let exported = export_state(&[OpRef::int_op(0)], &[], &mut optimizer, &mut ctx, None);
 
-        assert_eq!(exported.end_args, vec![OpRef::int_op(21)]);
+        assert_eq!(
+            exported.end_args.iter().map(|b| b.to_opref()).collect::<Vec<_>>(),
+            vec![OpRef::int_op(21)]
+        );
     }
 
     #[test]
