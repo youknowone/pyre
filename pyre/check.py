@@ -25,6 +25,33 @@ PYPY3 = os.environ.get("PYRE_CHECK_PYPY3") or (
     "pypy3" if shutil.which("pypy3") else "pypy"
 )
 
+
+def _detect_cpython_stdlib():
+    """Stdlib directory of the CPython baseline (`PYTHON3`).
+
+    pyre's native modules (`_sre`, ...) are coupled to one CPython version,
+    and pyre's own `detect_stdlib_path` falls back to a bare `python3` on
+    PATH. When several interpreters are on PATH (e.g. CI sets up CPython
+    then PyPy, whose `python3` then shadows it) that fallback can resolve
+    to a foreign stdlib; only the regex bench — the one pure-Python stdlib
+    import in the suite — then crashes. Resolve the baseline's own stdlib
+    so `pyre_env` can pin pyre to it.
+    """
+    try:
+        proc = subprocess.run(
+            [PYTHON3, "-c", "import sysconfig; print(sysconfig.get_paths()['stdlib'])"],
+            capture_output=True, text=True, timeout=15,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    path = (proc.stdout or "").strip()
+    return path if path and os.path.isdir(path) else None
+
+
+PYRE_STDLIB = _detect_cpython_stdlib()
+
 BENCH_DIR = "pyre/bench"
 SYNTHETIC_BENCH_DIR = "pyre/bench/synth"
 SNAP_DIR = "pyre/check.snap"
@@ -186,6 +213,11 @@ def pyre_env():
     env = dict(os.environ)
     env["MAJIT_STRICT"] = "1"
     env["MAJIT_STATS"] = "1"
+    # Pin the stdlib to the CPython baseline so pyre never auto-detects a
+    # foreign `python3` (e.g. a PyPy that shadows CPython on the CI PATH).
+    # An explicit PYRE_STDLIB in the environment wins.
+    if PYRE_STDLIB and "PYRE_STDLIB" not in env:
+        env["PYRE_STDLIB"] = PYRE_STDLIB
     return env
 
 
@@ -452,6 +484,7 @@ class Check:
                         [self._pyre(backend), script],
                         stdout=subprocess.DEVNULL,
                         timeout=30,
+                        env=pyre_env(),
                     )
                 except Exception:
                     pass
