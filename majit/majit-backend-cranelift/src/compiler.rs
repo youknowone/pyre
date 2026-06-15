@@ -7794,7 +7794,7 @@ impl CraneliftBackend {
         if let Some(rewriter) = self.gc_rewriter() {
             // The rewriter takes the typed `Const` pool directly; each box
             // variant carries its own type (`Const::get_type`).
-            let (result, new_constants) =
+            let (result, new_constants, _gcrefs) =
                 rewriter.rewrite_for_gc_with_constants(&normalized, constants);
             // rewrite.py creates fresh ConstInt boxes for sizes, offsets
             // and helper addresses; `new_constants` is the full typed pool.

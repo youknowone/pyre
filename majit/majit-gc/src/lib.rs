@@ -521,9 +521,13 @@ pub trait GcRewriter: Send {
     /// Rewrite a list of operations, inserting GC-aware code.
     fn rewrite_for_gc(&self, ops: &[Op]) -> Vec<Op>;
     /// Rewrite with access to the constant pool.
-    /// Returns (rewritten ops, merged constants). Each `Const` box carries
-    /// its own type via `Const::get_type`, so a separate type side-table is
-    /// no longer threaded through the return.
+    /// Returns (rewritten ops, merged constants, gc_table gcrefs). Each
+    /// `Const` box carries its own type via `Const::get_type`, so a separate
+    /// type side-table is no longer threaded through the return. The third
+    /// element is the per-loop reference-constant list collected by
+    /// `remove_constptr` (rewrite.py:1033-1043 `gcrefs_output_list`); the
+    /// backend builds a `GcTable` from it and bakes its base address into the
+    /// `LoadFromGcTable` loads.
     ///
     /// The default impl forwards to `rewrite_for_gc` and preserves the
     /// caller's constants verbatim. `rewrite_for_gc` may leave `Const*`
@@ -533,8 +537,8 @@ pub trait GcRewriter: Send {
         &self,
         ops: &[Op],
         constants: &VecAssoc<u32, Const>,
-    ) -> (Vec<Op>, VecAssoc<u32, Const>) {
-        (self.rewrite_for_gc(ops), constants.clone())
+    ) -> (Vec<Op>, VecAssoc<u32, Const>, Vec<GcRef>) {
+        (self.rewrite_for_gc(ops), constants.clone(), Vec::new())
     }
 }
 
