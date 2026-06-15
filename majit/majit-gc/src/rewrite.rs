@@ -473,9 +473,18 @@ struct RewriteState {
     /// rewrite.py:352 `gcrefs_output_list` — the per-loop list of
     /// reference constants pulled out of operations by `remove_constptr`.
     /// The backend builds a `GcTable` from this and emits
-    /// `LoadFromGcTable(index)` against its base. Populated only once
-    /// `remove_constptr` is wired (a later slice); empty until then.
+    /// `LoadFromGcTable(index)` against its base.
     gcrefs_output_list: Vec<GcRef>,
+    /// rewrite.py:353 `gcrefs_map` — dedup map from a reference constant
+    /// (keyed by `GcRef.0`) to its index in `gcrefs_output_list`.
+    gcrefs_map: VecAssoc<usize, u32>,
+    /// rewrite.py:354 `gcrefs_recently_loaded` — CSE cache from a gc_table
+    /// index to the `LoadFromGcTable` result box already emitted in the
+    /// current basic block. Reset at every Label (rewrite.py:1005). Reuse
+    /// across a can-collect point is sound: the load result is a Ref box,
+    /// so the register allocator keeps it in the GC map and the collector
+    /// forwards the held copy.
+    gcrefs_recently_loaded: VecAssoc<u32, BoxRef>,
 }
 
 impl RewriteState {
@@ -500,6 +509,8 @@ impl RewriteState {
             forwarded_ops: VecAssoc::new(),
             current_i: 0,
             gcrefs_output_list: Vec::new(),
+            gcrefs_map: VecAssoc::new(),
+            gcrefs_recently_loaded: VecAssoc::new(),
         }
     }
 
@@ -555,12 +566,67 @@ impl RewriteState {
         BoxRef::new_const(Value::Int(value))
     }
 
+    /// rewrite.py:1033-1043 `_gcref_index` — dedup a reference constant
+    /// into `gcrefs_output_list`, returning its stable index.
+    fn gcref_index(&mut self, gcref: GcRef) -> u32 {
+        if let Some(&index) = self.gcrefs_map.get(&gcref.0) {
+            return index;
+        }
+        let index = self.gcrefs_output_list.len() as u32;
+        self.gcrefs_map.insert(gcref.0, index);
+        self.gcrefs_output_list.push(gcref);
+        index
+    }
+
+    /// rewrite.py:1100-1115 `remove_constptr` — replace a reference
+    /// constant with the result of a `LoadFromGcTable(index)` load,
+    /// reusing one already emitted in this basic block (CSE) when
+    /// possible.
+    fn remove_constptr(&mut self, gcref: GcRef) -> BoxRef {
+        let index = self.gcref_index(gcref);
+        if let Some(load) = self.gcrefs_recently_loaded.get(&index) {
+            return load.clone();
+        }
+        let index_box = BoxRef::new_const(Value::Int(index as i64));
+        let load = self.emit(Op::new(OpCode::LoadFromGcTable, &[index_box]));
+        self.gcrefs_recently_loaded.insert(index, load.clone());
+        load
+    }
+
+    /// rewrite.py:106-116 `emit_op` arg loop — substitute each non-null
+    /// reference-constant argument with a `LoadFromGcTable` result so no
+    /// raw `GcRef` is baked into the backend. JIT_DEBUG keeps its
+    /// constants inline (rewrite.py:105 `keep`). Null pointers stay inline
+    /// (rewrite.py:109 `bool(arg.value)`). Failargs are NOT processed —
+    /// they are resolved as plain constants in `rewrite_op` (rewrite.py:121
+    /// `get_box_replacement`), matching upstream.
+    ///
+    /// rewrite.py:123-126 additionally appends the op's *descr* gcref to
+    /// the table when the descr itself is a GC object. pyre descrs are
+    /// `Arc<FailDescrCell>` pinned via the CLT keepalive
+    /// (`asmmemmgr_gcreftracers`), not moving-GC objects, so there is no
+    /// descr gcref to forward and that branch is intentionally not ported.
+    fn remove_constptrs_in(&mut self, op: &Op) {
+        if op.opcode == OpCode::JitDebug {
+            return;
+        }
+        for i in 0..op.num_args() {
+            if let Some(Value::Ref(gcref)) = op.arg(i).const_value() {
+                if !gcref.is_null() {
+                    let load = self.remove_constptr(gcref);
+                    op.setarg(i, load);
+                }
+            }
+        }
+    }
+
     /// Emit an op. Void ops do not consume a result id.
     ///
     /// The result OpRef carries its own type via the variant tag
     /// (`int_op`/`float_op`/`ref_op`) — rewrite.py:930 `v.type` parity —
     /// so no separate type table is maintained.
     fn emit(&mut self, op: Op) -> BoxRef {
+        self.remove_constptrs_in(&op);
         let rt = op.result_type();
         let pos = if rt == Type::Void {
             OpRef::NONE
@@ -590,6 +656,7 @@ impl RewriteState {
     /// The result OpRef carries its own type via the variant tag, so no
     /// separate type table is maintained — see `emit()` doc.
     fn emit_result(&mut self, op: Op, preferred_pos: OpRef) -> BoxRef {
+        self.remove_constptrs_in(&op);
         let rt = op.result_type();
         let pos = if preferred_pos.is_none() {
             let pos = OpRef::op_typed(self.next_pos, rt);
@@ -2825,6 +2892,8 @@ impl GcRewriter for GcRewriterImpl {
                 OpCode::Label => {
                     st.emitting_an_operation_that_can_collect();
                     st.known_lengths.clear();
+                    // rewrite.py:1005 emit_label resets the per-block load CSE.
+                    st.gcrefs_recently_loaded.clear();
                     let rewritten = st.rewrite_op(op);
                     st.emit_rewritten_from(op, rewritten);
                 }
@@ -5072,5 +5141,146 @@ mod tests {
             .find(|o| o.arg(2).to_opref() == guard.pos.get())
             .expect("consumer GcStore must reference the guard's result");
         assert_eq!(store.arg(0).to_opref(), result[0].pos.get());
+    }
+
+    // ── gc_table: remove_constptr / gcref dedup / load CSE ──
+    // rewrite.py:106-116 emit_op ConstPtr branch, rewrite.py:1100-1115
+    // remove_constptr, rewrite.py:1033-1043 _gcref_index, rewrite.py:1005
+    // emit_label CSE reset.
+
+    #[test]
+    fn test_remove_constptr_emits_load_and_collects_gcref() {
+        let rw = make_rewriter();
+        let r = majit_ir::GcRef(0x4000);
+        let ops = vec![Op::new(
+            OpCode::GuardNonnull,
+            &[BoxRef::new_const(Value::Ref(r))],
+        )];
+
+        let (result, _consts, gcrefs) = rw.rewrite_for_gc_with_constants(&ops, &VecAssoc::new());
+
+        // The reference constant is collected at index 0.
+        assert_eq!(gcrefs, vec![r]);
+        // A LoadFromGcTable(0) is emitted before the consuming op.
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].opcode, OpCode::LoadFromGcTable);
+        assert_eq!(result[0].arg(0).const_value(), Some(Value::Int(0)));
+        // The consumer's ConstPtr arg is replaced by the load result.
+        assert_eq!(result[1].opcode, OpCode::GuardNonnull);
+        assert_eq!(result[1].arg(0).to_opref(), result[0].pos.get());
+    }
+
+    #[test]
+    fn test_remove_constptr_dedup_and_block_cse() {
+        let rw = make_rewriter();
+        let r = majit_ir::GcRef(0x4000);
+        let ops = vec![
+            Op::new(OpCode::GuardNonnull, &[BoxRef::new_const(Value::Ref(r))]),
+            Op::new(OpCode::GuardNonnull, &[BoxRef::new_const(Value::Ref(r))]),
+        ];
+
+        let (result, _consts, gcrefs) = rw.rewrite_for_gc_with_constants(&ops, &VecAssoc::new());
+
+        // Same ref ⇒ one gcref entry (dedup) and one LoadFromGcTable (block CSE).
+        assert_eq!(gcrefs, vec![r]);
+        let loads = result
+            .iter()
+            .filter(|o| o.opcode == OpCode::LoadFromGcTable)
+            .count();
+        assert_eq!(loads, 1);
+        // Both consumers reference the single load result.
+        let load_pos = result
+            .iter()
+            .find(|o| o.opcode == OpCode::LoadFromGcTable)
+            .unwrap()
+            .pos
+            .get();
+        for g in result.iter().filter(|o| o.opcode == OpCode::GuardNonnull) {
+            assert_eq!(g.arg(0).to_opref(), load_pos);
+        }
+    }
+
+    #[test]
+    fn test_remove_constptr_distinct_refs() {
+        let rw = make_rewriter();
+        let r0 = majit_ir::GcRef(0x4000);
+        let r1 = majit_ir::GcRef(0x5000);
+        let ops = vec![
+            Op::new(OpCode::GuardNonnull, &[BoxRef::new_const(Value::Ref(r0))]),
+            Op::new(OpCode::GuardNonnull, &[BoxRef::new_const(Value::Ref(r1))]),
+        ];
+
+        let (result, _consts, gcrefs) = rw.rewrite_for_gc_with_constants(&ops, &VecAssoc::new());
+
+        // Distinct refs occupy distinct, stable indices.
+        assert_eq!(gcrefs, vec![r0, r1]);
+        let load_indices: Vec<i64> = result
+            .iter()
+            .filter(|o| o.opcode == OpCode::LoadFromGcTable)
+            .map(|o| match o.arg(0).const_value() {
+                Some(Value::Int(i)) => i,
+                other => panic!("LoadFromGcTable index must be ConstInt, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(load_indices, vec![0, 1]);
+    }
+
+    #[test]
+    fn test_remove_constptr_null_stays_inline() {
+        let rw = make_rewriter();
+        let null = majit_ir::GcRef(0);
+        let ops = vec![Op::new(
+            OpCode::GuardNonnull,
+            &[BoxRef::new_const(Value::Ref(null))],
+        )];
+
+        let (result, _consts, gcrefs) = rw.rewrite_for_gc_with_constants(&ops, &VecAssoc::new());
+
+        // rewrite.py:109 `bool(arg.value)` — a null ConstPtr stays inline.
+        assert!(gcrefs.is_empty(), "null ConstPtr must not enter the gc_table");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].opcode, OpCode::GuardNonnull);
+        assert_eq!(result[0].arg(0).const_value(), Some(Value::Ref(null)));
+    }
+
+    #[test]
+    fn test_remove_constptr_cse_resets_at_label() {
+        let rw = make_rewriter();
+        let r = majit_ir::GcRef(0x4000);
+        let ops = vec![
+            Op::new(OpCode::GuardNonnull, &[BoxRef::new_const(Value::Ref(r))]),
+            Op::new(OpCode::Label, &[]),
+            Op::new(OpCode::GuardNonnull, &[BoxRef::new_const(Value::Ref(r))]),
+        ];
+
+        let (result, _consts, gcrefs) = rw.rewrite_for_gc_with_constants(&ops, &VecAssoc::new());
+
+        // Dedup persists across the block boundary (one gcref) ...
+        assert_eq!(gcrefs, vec![r]);
+        // ... but the load CSE resets at the Label, so the ref is reloaded.
+        let loads = result
+            .iter()
+            .filter(|o| o.opcode == OpCode::LoadFromGcTable)
+            .count();
+        assert_eq!(loads, 2);
+    }
+
+    #[test]
+    fn test_jit_debug_keeps_constptr_inline() {
+        let rw = make_rewriter();
+        let r = majit_ir::GcRef(0x4000);
+        let ops = vec![Op::new(
+            OpCode::JitDebug,
+            &[BoxRef::new_const(Value::Ref(r))],
+        )];
+
+        let (result, _consts, gcrefs) = rw.rewrite_for_gc_with_constants(&ops, &VecAssoc::new());
+
+        // rewrite.py:105 `keep` — JIT_DEBUG keeps its constants inline.
+        assert!(gcrefs.is_empty(), "JIT_DEBUG keeps its constants inline");
+        assert!(
+            !result.iter().any(|o| o.opcode == OpCode::LoadFromGcTable),
+            "JIT_DEBUG must not route its ConstPtr through the gc_table"
+        );
     }
 }

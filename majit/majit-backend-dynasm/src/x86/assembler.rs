@@ -768,6 +768,12 @@ pub struct Assembler386<'a> {
     /// passed in at construction time so the emit path bakes it as a
     /// 64-bit immediate without re-touching the backend.
     malloc_slowpath_fixed: usize,
+    /// `assembler.py:1545` `genop_load_from_gc_table`: base address of
+    /// this loop's per-loop `GcTable` slot array. Baked as a 64-bit
+    /// immediate by the `LoadFromGcTable` genop; 0 when the trace
+    /// references no reference constants. Set before `assemble_loop` /
+    /// `assemble_bridge` via [`set_gc_table_base`](Self::set_gc_table_base).
+    gc_table_base: usize,
 }
 
 /// assembler.py GuardToken — represents a pending guard needing
@@ -912,7 +918,16 @@ impl<'a> Assembler386<'a> {
             frame_depth_to_patch: Vec::new(),
             jump_target_frame_depth: 0,
             malloc_slowpath_fixed,
+            gc_table_base: 0,
         }
+    }
+
+    /// `assembler.py:793-824` parity: hand the per-loop `GcTable`'s base
+    /// address to the assembler before emission, so `LoadFromGcTable`
+    /// genops bake it as the slot-array base immediate. 0 leaves the
+    /// trace with no reference constants (no `LoadFromGcTable` emitted).
+    pub(crate) fn set_gc_table_base(&mut self, base: usize) {
+        self.gc_table_base = base;
     }
 
     /// `compile.py:665` parity: heap-pinned address of `self.cpu`'s
@@ -3168,12 +3183,30 @@ impl<'a> Assembler386<'a> {
             | OpCode::SameAsR
             | OpCode::SameAsF
             | OpCode::CastOpaquePtr
-            | OpCode::LoadFromGcTable
             | OpCode::VirtualRefR
             | OpCode::ConvertFloatBytesToLonglong
             | OpCode::ConvertLonglongBytesToFloat => {
                 if let (Some(src), Some(dst)) = (arglocs.first(), result_loc) {
                     self.regalloc_mov(src, dst);
+                }
+            }
+            // `assembler.py:1545` `genop_load_from_gc_table`: load the
+            // reference constant at `gc_table_base + index*WORD`. The
+            // index arrives as an immediate (the `ConstInt(index)` arg
+            // produced by `remove_constptr`); the table base is baked
+            // absolute (x86-32 `MOV_rj` model, `assembler.py:1551-1552`)
+            // because dynasm has no code-buffer-start reservation seam.
+            // The slot value is GC-forwarded in place by the gc_table
+            // root walker, so each load observes the relocated object.
+            OpCode::LoadFromGcTable => {
+                if let (Some(Loc::Immed(idx)), Some(Loc::Reg(dst))) =
+                    (arglocs.first(), result_loc)
+                {
+                    let slot_addr = self.gc_table_base + (idx.value as usize) * WORD;
+                    dynasm!(self.mc ; .arch x64
+                        ; mov Rq(dst.value), QWORD slot_addr as i64
+                        ; mov Rq(dst.value), [Rq(dst.value)]
+                    );
                 }
             }
             // `assembler.py:1528 genop_cast_ptr_to_int = _genop_same_as`

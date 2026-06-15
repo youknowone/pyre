@@ -72,6 +72,13 @@ impl GcTable {
     /// are filled before the `Arc` exists, and registration happens last,
     /// so no collection can observe a half-filled, registered table.
     pub fn from_gcrefs(gcrefs: &[GcRef]) -> Arc<GcTable> {
+        // Ensure the forwarding walker is installed before the table can
+        // be observed by a collection. `register_extra_root_walker`
+        // dedups by fn address, so this is idempotent across every
+        // compiled loop; before the first table exists there is nothing
+        // to walk, so installing lazily here is equivalent to a one-time
+        // backend init without depending on a separate init call site.
+        install_gc_table_walker();
         let slots: Box<[Cell<GcRef>]> = gcrefs.iter().map(|g| Cell::new(*g)).collect();
         let table = Arc::new(GcTable { slots });
         register_table(&table);
@@ -151,8 +158,18 @@ pub fn install_gc_table_walker() {
 mod tests {
     use super::*;
 
+    // `LIVE_GC_TABLES` is a process-global registry; in production it is
+    // only mutated outside a collection (table build at compile time) and
+    // only read inside a stop-the-world collection, so there is never a
+    // concurrent build-vs-walk. The test harness runs tests in parallel,
+    // which would let one table-building test's registry mutation race
+    // another's global `walk_all_gc_tables` assertion. Serialize the
+    // table-touching tests against each other to model the STW invariant.
+    static TEST_REGISTRY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn trace_forwards_slots_in_place() {
+        let _serialize = TEST_REGISTRY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let table = GcTable::from_gcrefs(&[GcRef(0x1000), GcRef(0x2000)]);
         // A moving collection relocates 0x1000 -> 0x9000.
         table.trace(&mut |r| {
@@ -168,6 +185,7 @@ mod tests {
 
     #[test]
     fn dropping_table_deregisters_from_walk() {
+        let _serialize = TEST_REGISTRY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // A sentinel unlikely to collide with any other test's table.
         const SENTINEL: GcRef = GcRef(0x0DEAD_BEEF);
         let count_sentinels = || {

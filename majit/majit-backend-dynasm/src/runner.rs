@@ -967,6 +967,25 @@ impl DynasmBackend {
         }
     }
 
+    /// `assembler.py:822 gcreftracers.append(tracer)` parity for the
+    /// per-loop reference-constant `GcTable`.  The table's base address
+    /// is baked into machine code by the `LoadFromGcTable` genops, so the
+    /// strong `Arc` must outlive the compiled trace.
+    /// `clt.asmmemmgr_gcreftracers` is that lifetime root (`model.py:294`
+    /// / `llmodel.py:252-268 free_loop_and_bridges`); when the CLT drops,
+    /// the table frees and its `Weak` in the gcreftracer registry is
+    /// reaped lazily, so deregistration needs no `free_loop` hook.
+    fn register_gc_table(
+        &self,
+        token: &majit_backend::JitCellToken,
+        table: Arc<majit_gc::GcTable>,
+    ) {
+        if let Some(clt) = token.compiled_loop_token.as_ref() {
+            let tracer: Arc<dyn std::any::Any + Send + Sync> = table;
+            clt.asmmemmgr_gcreftracers.lock().push(tracer);
+        }
+    }
+
     // `set_constants_pool`, `set_next_trace_id`, and `set_next_header_pc`
     // are provided via the `Backend` trait impl below so
     // `compile_tmp_callback` and other backend-agnostic consumers can
@@ -1062,7 +1081,15 @@ impl DynasmBackend {
     }
 
     /// rewrite.py:345 parity: run GC rewriter on ops before assembly.
-    fn prepare_ops_for_compile(&mut self, inputargs: &[InputArg], ops: &[Op]) -> Vec<Op> {
+    /// Returns the rewritten ops plus the per-loop reference-constant
+    /// list (`rewrite.py:352 gcrefs_output_list`) the caller turns into a
+    /// `GcTable`. The list is empty when no rewriter is configured or the
+    /// trace references no reference constants.
+    fn prepare_ops_for_compile(
+        &mut self,
+        inputargs: &[InputArg],
+        ops: &[Op],
+    ) -> (Vec<Op>, Vec<GcRef>) {
         let num_inputs = inputargs.len() as u32;
         let mut normalized: Vec<Op> = ops
             .iter()
@@ -1087,7 +1114,7 @@ impl DynasmBackend {
             use majit_gc::GcRewriter;
             // The rewriter takes the typed `Const` pool directly; each box
             // variant carries its own type (`Const::get_type`).
-            let (result, new_constants, _gcrefs) =
+            let (result, new_constants, gcrefs) =
                 rewriter.rewrite_for_gc_with_constants(&normalized, &self.constants);
             // rewrite.py creates fresh ConstInt boxes for sizes, offsets
             // and helper addresses; `new_constants` is the full typed pool.
@@ -1095,9 +1122,9 @@ impl DynasmBackend {
             for (k, c) in new_constants {
                 self.constants.entry(k).or_insert(c);
             }
-            result
+            (result, gcrefs)
         } else {
-            normalized
+            (normalized, Vec::new())
         }
     }
 
@@ -1686,7 +1713,7 @@ impl Backend for DynasmBackend {
         self.next_trace_id += 1;
         let header_pc = self.next_header_pc;
         // gc.py:109 rewrite_assembler parity: run GC rewriter before regalloc.
-        let prepared_ops = self.prepare_ops_for_compile(inputargs, &ops_owned);
+        let (prepared_ops, gcrefs) = self.prepare_ops_for_compile(inputargs, &ops_owned);
         // The assembler stores the typed `Const` pool directly; each box
         // variant carries its own type (`Const::get_type`).
         let const_pool = std::mem::take(&mut self.constants);
@@ -1724,6 +1751,14 @@ impl Backend for DynasmBackend {
             inputargs,
             &prepared_ops,
         );
+        // assembler.py:793-824 parity: build the per-loop gc_table from
+        // the rewrite's reference-constant list and bake its base before
+        // emission, so `LoadFromGcTable` genops resolve their slot
+        // addresses. Empty list ⇒ no table, base stays 0.
+        let gc_table = (!gcrefs.is_empty()).then(|| majit_gc::GcTable::from_gcrefs(&gcrefs));
+        if let Some(table) = gc_table.as_ref() {
+            asm.set_gc_table_base(table.base_addr());
+        }
         asm.set_call_assembler_targets(Self::call_assembler_targets_snapshot());
         let compiled = asm.assemble_loop()?;
 
@@ -1732,6 +1767,9 @@ impl Backend for DynasmBackend {
         let frame_depth = compiled.frame_depth.load(Ordering::Acquire) as i64;
         Self::register_call_assembler_target(token, code_addr);
         self.register_fail_descrs(token, &compiled.fail_descrs);
+        if let Some(table) = gc_table {
+            self.register_gc_table(token, table);
+        }
 
         // `compile.py:183-186 record_loop_or_bridge`: for each ResumeDescr
         // in the newly-compiled trace, stamp the owning CompiledLoopToken.
@@ -1905,7 +1943,7 @@ impl Backend for DynasmBackend {
         let trace_id = self.next_trace_id;
         self.next_trace_id += 1;
 
-        let prepared_ops = self.prepare_ops_for_compile(inputargs, &ops_owned);
+        let (prepared_ops, gcrefs) = self.prepare_ops_for_compile(inputargs, &ops_owned);
         // format_trace reads raw `i64` values; the assembler stores the
         // typed `Const` pool directly (type rides on `Const::get_type`).
         let const_pool = std::mem::take(&mut self.constants);
@@ -1955,6 +1993,13 @@ impl Backend for DynasmBackend {
             inputargs,
             &prepared_ops,
         );
+        // assembler.py:793-824 parity: build the per-loop gc_table from
+        // the rewrite's reference-constant list and bake its base before
+        // emission (same as compile_loop). A bridge gets its own table.
+        let gc_table = (!gcrefs.is_empty()).then(|| majit_gc::GcTable::from_gcrefs(&gcrefs));
+        if let Some(table) = gc_table.as_ref() {
+            asm.set_gc_table_base(table.base_addr());
+        }
         asm.set_call_assembler_targets(Self::call_assembler_targets_snapshot());
 
         let _orig_compiled = Self::get_compiled(original_token);
@@ -2038,6 +2083,9 @@ impl Backend for DynasmBackend {
         // tracer batch lands on `original_token`'s
         // `asmmemmgr_gcreftracers` (`model.py:294`).
         self.register_fail_descrs(original_token, &compiled.fail_descrs);
+        if let Some(table) = gc_table {
+            self.register_gc_table(original_token, table);
+        }
 
         // `compile.py:183-186 record_loop_or_bridge`: a bridge's ResumeDescrs
         // inherit the original loop's CompiledLoopToken.  See the

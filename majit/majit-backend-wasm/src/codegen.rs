@@ -1063,12 +1063,19 @@ fn build_function(
                 // Zero-initialize array region — skip for MVP
             }
             OpCode::LoadFromGcTable => {
-                // Load from GC reference table — treat as field load
-                let vi = op.pos.get().raw();
-                if !OpRef::raw_is_constant(vi) {
-                    emit_resolve(&mut sink, constants, op.arg(0).to_opref());
-                    sink.local_set(1 + vi);
-                }
+                // `assembler.py:1545` `genop_load_from_gc_table`: this op is
+                // produced only by the GC rewrite's `remove_constptr`
+                // (`rewrite.py:1100`), whose arg is a `ConstInt(index)` into
+                // a per-loop `GcTable` whose base is baked absolute. The
+                // wasm backend does not run the GC rewrite and has no
+                // host-address gc_table model (linear memory), so this op
+                // never reaches here. Panic loudly rather than emit the old
+                // SAME_AS pass-through, which after the rewrite flip would
+                // load the raw index in place of the reference constant.
+                panic!(
+                    "wasm backend: LoadFromGcTable is unsupported (no gc_table model); \
+                     the GC rewrite must not run for wasm"
+                );
             }
 
             // ── CALL operations (via trampoline) ──
