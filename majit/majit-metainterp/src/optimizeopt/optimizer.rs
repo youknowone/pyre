@@ -67,12 +67,13 @@ pub struct Optimizer {
     last_guard_op_idx: Option<usize>,
     /// optimizer.py:241/304/632-634 `replaces_guard` — maps an emitted
     /// guard op to its replacement. RPython keys this dict by the guard
-    /// `op` object itself (object identity); pyre keys by `op.pos:
-    /// OpRef`. The parity invariant is that `alloc_op_position` issues
-    /// a fresh OpRef per emitted guard so OpRef → Op is bijective on
-    /// the guard subspace, matching RPython's object-identity keying.
-    /// No site re-uses an OpRef across distinct guard ops.
-    replaces_guard: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, Op>,
+    /// `op` object itself (object identity); pyre keys by the guard op's
+    /// canonical box (`BoxRef`, compared by `Rc::ptr_eq`), the box-identity
+    /// analog of `op is op`. Every key is resolved through
+    /// `ctx.get_box_replacement(op.pos)` so insert and lookup agree on the
+    /// canonical box. Guard ops are never Const, so the key is always a
+    /// ptr-stable ResOp box.
+    replaces_guard: crate::optimizeopt::vec_assoc::VecAssoc<BoxRef, Op>,
     /// optimizer.py: `pendingfields` — heap fields that need to be
     /// written back before the next guard (lazy set forcing).
     pendingfields: Vec<Op>,
@@ -202,8 +203,10 @@ pub struct Optimizer {
     /// at `setup_optimizations` time.
     pub cpu: std::sync::Arc<dyn crate::cpu::Cpu>,
     /// optimizer.py:246 `self._emittedoperations = {}`. Tracks the
-    /// set of OpRefs the optimizer has emitted (or that
-    /// `replace_guard_op` substituted in place of an emitted op).
+    /// set of ops the optimizer has emitted (or that `replace_guard_op`
+    /// substituted in place of an emitted op). RPython keys this set by
+    /// the op object (`op in self._emittedoperations` is identity-keyed);
+    /// pyre keys by the emitted op's canonical box (`BoxRef`, `Rc::ptr_eq`).
     /// Populated at:
     /// - `emit_operation` after `ctx.emit` (optimizer.py:674
     ///   `self._emittedoperations[op] = None` inside _emit_operation).
@@ -212,11 +215,10 @@ pub struct Optimizer {
     ///
     /// Read by `as_operation(opref, required_opnum)` (optimizer.py:369-377)
     /// which returns the opref iff it has been emitted *and* its opcode
-    /// matches the optional `required_opnum`. Used by callers that need
-    /// to verify an OpRef refers to an actually-emitted op before
-    /// reasoning about descriptor-shared guards or other emit-bound
-    /// metadata.
-    pub emitted_operations: majit_ir::vec_set::VecSet<OpRef>,
+    /// matches the optional `required_opnum`. The lookup resolves the
+    /// queried opref through `ctx.get_box_replacement` so it compares the
+    /// same canonical box the insert recorded.
+    pub emitted_operations: majit_ir::vec_set::VecSet<BoxRef>,
     /// One-shot explicit `input_ops` seed for the next
     /// `optimize_with_constants_and_inputs_at` run. When `Some`, the
     /// canonical producer `Rc<Op>` slice is used directly as
@@ -1220,9 +1222,17 @@ impl Optimizer {
 
     /// optimizer.py: notice_guard_future_condition(op)
     /// Record that a guard at the given position should be replaced
-    /// with the given op when the future condition is realized.
-    pub fn notice_guard_future_condition(&mut self, guard_pos: OpRef, replacement: Op) {
-        self.replaces_guard.insert(guard_pos, replacement);
+    /// with the given op when the future condition is realized. Keyed by
+    /// the replaced guard's canonical box (`ctx.get_box_replacement`) so
+    /// the emit-time lookup compares the same box.
+    pub fn notice_guard_future_condition(
+        &mut self,
+        ctx: &OptContext,
+        guard_pos: OpRef,
+        replacement: Op,
+    ) {
+        self.replaces_guard
+            .insert(ctx.get_box_replacement(guard_pos), replacement);
     }
 
     /// optimizer.py:713: replace_guard_op(old_op_pos, new_op)
@@ -1232,10 +1242,12 @@ impl Optimizer {
     /// the new guard takes over the emit identity, so it must enter
     /// the emit set even though it was substituted post-hoc rather
     /// than directly emitted via `_emit_operation`.
-    pub fn replace_guard_op(&mut self, old_pos: OpRef, new_guard: Op) {
+    pub fn replace_guard_op(&mut self, ctx: &OptContext, old_pos: OpRef, new_guard: Op) {
         let new_pos = new_guard.pos.get();
-        self.replaces_guard.insert(old_pos, new_guard);
-        self.emitted_operations.insert(new_pos);
+        self.replaces_guard
+            .insert(ctx.get_box_replacement(old_pos), new_guard);
+        self.emitted_operations
+            .insert(ctx.get_box_replacement(new_pos));
     }
 
     /// optimizer.py:369-377 `as_operation(op, required_opnum=-1)`:
@@ -1266,7 +1278,10 @@ impl Optimizer {
                 return None;
             }
         }
-        if self.emitted_operations.contains(&opref) {
+        if self
+            .emitted_operations
+            .contains(&ctx.get_box_replacement(opref))
+        {
             Some(opref)
         } else {
             None
@@ -4239,7 +4254,10 @@ impl Optimizer {
 
             // optimizer.py:632-635: replaces_guard check BEFORE emit_guard_operation.
             if self.can_replace_guards {
-                if let Some(replacement) = self.replaces_guard.remove(&op.pos.get()) {
+                if let Some(replacement) = self
+                    .replaces_guard
+                    .remove(&ctx.get_box_replacement(op.pos.get()))
+                {
                     let target_pos = replacement.pos.get().raw() as usize;
                     if target_pos < ctx.new_operations.len() {
                         if std::env::var_os("MAJIT_LOG").is_some() {
@@ -4321,8 +4339,10 @@ impl Optimizer {
         // optimizer.py:674 `self._emittedoperations[op] = None` — record
         // the freshly emitted op so `as_operation` can later confirm it
         // is in the emit set before downstream callers reason about
-        // descriptor-sharing or other emit-bound state.
-        self.emitted_operations.insert(emitted);
+        // descriptor-sharing or other emit-bound state. Keyed by the
+        // emitted op's canonical box (the box-identity analog of `op`).
+        self.emitted_operations
+            .insert(ctx.get_box_replacement(emitted));
         // optimizer.py:84-92 `_emit_operation` clears the REMOVED
         // sentinel on each successful emit. Cross-pass readers
         // (rewrite.py:712-718 `optimize_GUARD_NO_EXCEPTION`) see the
