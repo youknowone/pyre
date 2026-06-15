@@ -513,6 +513,23 @@ pub fn call_user_function_resolved(
 /// so even a no-keyword call must materialize the (possibly empty) tail
 /// slots the `#[pyre_function]` wrapper reads.  Non-variadic builtins keep
 /// the raw `func(args)` fast path.
+/// GenericAlias.__call__ (`_pypy_generic_alias.py:43-46`) — after calling
+/// `__origin__`, set `result.__orig_class__ = self`.  This is wrapped in
+/// `try: ... except (AttributeError, TypeError): pass`, so only those two
+/// errors are swallowed; anything else propagates.
+fn set_orig_class(result: PyObjectRef, alias: PyObjectRef) -> Result<(), crate::PyError> {
+    match crate::baseobjspace::setattr_str(result, "__orig_class__", alias) {
+        Ok(_) => Ok(()),
+        Err(e)
+            if e.kind == crate::error::PyErrorKind::AttributeError
+                || e.kind == crate::error::PyErrorKind::TypeError =>
+        {
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
+}
+
 fn call_builtin_code_positional(code: PyObjectRef, args: &[PyObjectRef]) -> PyResult {
     let func = unsafe { builtin_code_get(code) };
     if let Some(sig) = unsafe { crate::builtin_code_get_signature(code) } {
@@ -577,7 +594,7 @@ pub fn call_callable(frame: &mut PyFrame, callable: PyObjectRef, args: &[PyObjec
     if unsafe { pyre_object::is_generic_alias(callable) } {
         let origin = unsafe { pyre_object::w_generic_alias_get_origin(callable) };
         let result = call_callable(frame, origin, args)?;
-        let _ = crate::baseobjspace::setattr_str(result, "__orig_class__", callable);
+        set_orig_class(result, callable)?;
         return Ok(result);
     }
 
@@ -1633,7 +1650,7 @@ pub fn call_with_kwargs(
     if unsafe { pyre_object::is_generic_alias(callable) } {
         let origin = unsafe { pyre_object::w_generic_alias_get_origin(callable) };
         let result = call_with_kwargs(frame, origin, pos_args, kwargs)?;
-        let _ = crate::baseobjspace::setattr_str(result, "__orig_class__", callable);
+        set_orig_class(result, callable)?;
         return Ok(result);
     }
 
@@ -1798,9 +1815,7 @@ pub fn call_function_impl_result(
         if pyre_object::is_generic_alias(callable) {
             let origin = pyre_object::w_generic_alias_get_origin(callable);
             let result = call_function_impl_result(origin, args)?;
-            // `except (AttributeError, TypeError): pass` — builtins without
-            // a writable `__dict__` skip the stamp.
-            let _ = crate::baseobjspace::setattr_str(result, "__orig_class__", callable);
+            set_orig_class(result, callable)?;
             return Ok(result);
         }
         // Instance with __call__ — PyPy: descroperation.py
@@ -2643,11 +2658,11 @@ fn build_class_inner(
             class_ns.fix_ptr();
         }
         if let Some(w_ns) = mapping_namespace {
-            let _ = crate::baseobjspace::setitem(
+            crate::baseobjspace::setitem(
                 w_ns,
                 pyre_object::w_str_new("__orig_bases__"),
                 w_orig_bases,
-            );
+            )?;
         }
     }
 

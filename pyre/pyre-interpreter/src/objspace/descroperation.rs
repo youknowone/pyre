@@ -587,29 +587,18 @@ pub(crate) unsafe fn int_value(obj: PyObjectRef) -> i64 {
 
 // ── Bitwise operations ───────────────────────────────────────────────
 
+// W_IntObject.descr_and/or/xor — always int; the bool result is produced
+// by W_BoolObject's own descr_and/or/xor, not by the int path.
 unsafe fn int_bitand(a: PyObjectRef, b: PyObjectRef) -> PyResult {
-    let r = int_value(a) & int_value(b);
-    // bool & bool → bool
-    if is_bool(a) && is_bool(b) {
-        return Ok(w_bool_from(r != 0));
-    }
-    Ok(w_int_new(r))
+    Ok(w_int_new(int_value(a) & int_value(b)))
 }
 
 unsafe fn int_bitor(a: PyObjectRef, b: PyObjectRef) -> PyResult {
-    let r = int_value(a) | int_value(b);
-    if is_bool(a) && is_bool(b) {
-        return Ok(w_bool_from(r != 0));
-    }
-    Ok(w_int_new(r))
+    Ok(w_int_new(int_value(a) | int_value(b)))
 }
 
 unsafe fn int_bitxor(a: PyObjectRef, b: PyObjectRef) -> PyResult {
-    let r = int_value(a) ^ int_value(b);
-    if is_bool(a) && is_bool(b) {
-        return Ok(w_bool_from(r != 0));
-    }
-    Ok(w_int_new(r))
+    Ok(w_int_new(int_value(a) ^ int_value(b)))
 }
 
 unsafe fn long_bitand(a: PyObjectRef, b: PyObjectRef) -> PyResult {
@@ -1699,9 +1688,8 @@ pub(crate) fn and_builtin(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let a = unwrap_cell(a);
     let b = unwrap_cell(b);
     unsafe {
-        if is_bool(a) && is_bool(b) {
-            return Ok(pyre_object::bool_descr_and(a, b));
-        }
+        // int.__and__ — bool operands are treated as ints; the bool-typed
+        // result is produced by bool.__and__ (init_bool_type), not here.
         if is_int(a) && is_int(b) {
             return int_bitand(a, b);
         }
@@ -1716,9 +1704,6 @@ pub(crate) fn or_builtin(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let a = unwrap_cell(a);
     let b = unwrap_cell(b);
     unsafe {
-        if is_bool(a) && is_bool(b) {
-            return Ok(pyre_object::bool_descr_or(a, b));
-        }
         if is_int(a) && is_int(b) {
             return int_bitor(a, b);
         }
@@ -1733,9 +1718,6 @@ pub(crate) fn xor_builtin(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let a = unwrap_cell(a);
     let b = unwrap_cell(b);
     unsafe {
-        if is_bool(a) && is_bool(b) {
-            return Ok(pyre_object::bool_descr_xor(a, b));
-        }
         if is_int(a) && is_int(b) {
             return int_bitxor(a, b);
         }
@@ -2282,7 +2264,7 @@ pub fn and_(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 ///
 /// PyPy equivalent: _unionable() in _pypy_generic_alias.py
 #[inline]
-fn unionable(obj: PyObjectRef) -> bool {
+pub(crate) fn unionable(obj: PyObjectRef) -> bool {
     unsafe {
         is_none(obj)
             || is_type(obj)
@@ -2365,9 +2347,10 @@ pub fn or_(a: PyObjectRef, b: PyObjectRef) -> PyResult {
             return result;
         }
         // type | type — PEP 604 union types (Python 3.10+)
-        // PyPy: typeobject.py descr_or → _pypy_generic_alias._create_union
+        // PyPy: typeobject.py descr_or → _pypy_generic_alias._create_union,
+        // which collapses identical operands (`int | int` is `int`).
         if unionable(a) && unionable(b) {
-            return Ok(pyre_object::w_union_new(a, b));
+            return crate::genericalias::create_union(a, b);
         }
         if let Some(result) = try_instance_binop(a, b, "__ror__") {
             return result;

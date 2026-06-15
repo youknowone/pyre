@@ -38,11 +38,23 @@ pub(crate) fn is_attr_exception(name: &str) -> bool {
 /// `generic_alias_class_getitem(space, w_cls, w_item)` (util.py:99).
 ///
 /// Registered as the `__class_getitem__` classmethod on builtin
-/// containers, so the bound call delivers `args = [w_cls, w_item]`.
+/// containers, so the bound call delivers `args = [w_cls, w_item]`.  The
+/// `w_item` operand is mandatory (the gateway declares it positional).
 pub fn generic_alias_class_getitem(args: &[PyObjectRef]) -> crate::PyResult {
-    let w_cls = args.first().copied().unwrap_or_else(w_none);
-    let w_item = args.get(1).copied().unwrap_or_else(w_none);
-    Ok(make_generic_alias(w_cls, w_item))
+    if args.len() != 2 {
+        // The message is prefixed with the bound class's name
+        // (`list.__class_getitem__() takes exactly one argument`).
+        let prefix = args
+            .first()
+            .filter(|&&c| unsafe { is_type(c) })
+            .map(|&c| format!("{}.", unsafe { pyre_object::w_type_get_name(c) }))
+            .unwrap_or_default();
+        return Err(crate::PyError::type_error(format!(
+            "{prefix}__class_getitem__() takes exactly one argument ({} given)",
+            args.len().saturating_sub(1)
+        )));
+    }
+    Ok(make_generic_alias(args[0], args[1]))
 }
 
 /// `GenericAlias.__new__` (`_pypy_generic_alias.py:19`) — wrap a bare item
@@ -142,11 +154,23 @@ fn ga_get_parameters(args: &[PyObjectRef]) -> crate::PyResult {
     }
 }
 
+/// Read `args[0]` as the bound `self`, rejecting a non-GenericAlias
+/// before any unsafe field access (an unbound/forged direct call).
+fn self_alias(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let self_ = args.first().copied().unwrap_or_else(w_none);
+    if !unsafe { is_generic_alias(self_) } {
+        return Err(crate::PyError::type_error(
+            "descriptor requires a 'types.GenericAlias' object",
+        ));
+    }
+    Ok(self_)
+}
+
 /// `GenericAlias.__eq__` (`_pypy_generic_alias.py:64`).
 fn ga_eq(args: &[PyObjectRef]) -> crate::PyResult {
     let self_ = args.first().copied().unwrap_or_else(w_none);
     let other = args.get(1).copied().unwrap_or_else(w_none);
-    if !unsafe { is_generic_alias(other) } {
+    if !unsafe { is_generic_alias(self_) } || !unsafe { is_generic_alias(other) } {
         return Ok(w_not_implemented());
     }
     let eq = unsafe {
@@ -164,7 +188,7 @@ fn ga_eq(args: &[PyObjectRef]) -> crate::PyResult {
 /// `GenericAlias.__mro_entries__` (`_pypy_generic_alias.py:49`) —
 /// `(self.__origin__,)`, so `class C(list[int])` resolves to `list`.
 fn ga_mro_entries(args: &[PyObjectRef]) -> crate::PyResult {
-    let self_ = args.first().copied().unwrap_or_else(w_none);
+    let self_ = self_alias(args)?;
     let origin = unsafe { w_generic_alias_get_origin(self_) };
     Ok(w_tuple_new(vec![origin]))
 }
@@ -174,7 +198,7 @@ fn ga_mro_entries(args: &[PyObjectRef]) -> crate::PyResult {
 /// always carries an empty `__parameters__`; subscripting it then raises
 /// the `subs_parameters` `nparams == 0` error.
 fn ga_getitem(args: &[PyObjectRef]) -> crate::PyResult {
-    let self_ = args.first().copied().unwrap_or_else(w_none);
+    let self_ = self_alias(args)?;
     let nparams = unsafe { w_tuple_len(w_generic_alias_get_parameters(self_)) };
     if nparams == 0 {
         let repr = unsafe { crate::display::py_repr(self_)? };
@@ -188,18 +212,31 @@ fn ga_getitem(args: &[PyObjectRef]) -> crate::PyResult {
     ))
 }
 
+/// `_create_union(x, y)` (`_pypy_generic_alias.py:328`) — both operands
+/// must be unionable, else `NotImplemented`; identical operands collapse.
+pub(crate) fn create_union(x: PyObjectRef, y: PyObjectRef) -> crate::PyResult {
+    use crate::objspace::descroperation::unionable;
+    if !unionable(x) || !unionable(y) {
+        return Ok(w_not_implemented());
+    }
+    if unsafe { crate::baseobjspace::eq_w(x, y) } {
+        return Ok(x);
+    }
+    Ok(w_union_new(x, y))
+}
+
 /// `GenericAlias.__or__` (`_pypy_generic_alias.py:102`) — `X[...] | Y`.
 fn ga_or(args: &[PyObjectRef]) -> crate::PyResult {
     let a = args.first().copied().unwrap_or_else(w_none);
     let b = args.get(1).copied().unwrap_or_else(w_none);
-    Ok(w_union_new(a, b))
+    create_union(a, b)
 }
 
 /// `GenericAlias.__ror__` (`_pypy_generic_alias.py:105`) — `Y | X[...]`.
 fn ga_ror(args: &[PyObjectRef]) -> crate::PyResult {
     let a = args.first().copied().unwrap_or_else(w_none);
     let b = args.get(1).copied().unwrap_or_else(w_none);
-    Ok(w_union_new(b, a))
+    create_union(b, a)
 }
 
 /// `GenericAlias.__instancecheck__` (`_pypy_generic_alias.py:93`).
@@ -216,8 +253,22 @@ fn ga_subclasscheck(_args: &[PyObjectRef]) -> crate::PyResult {
     ))
 }
 
+/// `GenericAlias.__new__(cls, origin, args)` (`_pypy_generic_alias.py:19`)
+/// — the public `types.GenericAlias(list, int)` constructor.
+fn ga_new(args: &[PyObjectRef]) -> crate::PyResult {
+    // args[0] is the cls passed by `type.__call__`.
+    if args.len() != 3 {
+        return Err(crate::PyError::type_error(format!(
+            "GenericAlias expected 2 arguments, got {}",
+            args.len().saturating_sub(1)
+        )));
+    }
+    Ok(make_generic_alias(args[1], args[2]))
+}
+
 /// Build the `types.GenericAlias` namespace.
 pub(crate) fn init_generic_alias_type(ns: &mut DictStorage) {
+    dict_storage_store(ns, "__new__", crate::typedef::make_new_descr(ga_new));
     dict_storage_store(
         ns,
         "__origin__",

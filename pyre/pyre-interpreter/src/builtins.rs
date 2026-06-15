@@ -2488,8 +2488,27 @@ pub(crate) fn builtin_str(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
         .copied()
         .or_else(|| kwarg_get(kwargs, "encoding"));
     let w_errors = pos.get(2).copied().or_else(|| kwarg_get(kwargs, "errors"));
-    let has_encoding = w_encoding.is_some_and(|w| !unsafe { is_none(w) });
-    let has_errors = w_errors.is_some_and(|w| !unsafe { is_none(w) });
+    // `_get_encoding_and_errors` — a *supplied* encoding/errors must be a
+    // str; an explicit `None` is supplied (not "omitted") and so is
+    // rejected.  Encoding is validated before errors.
+    if let Some(w) = w_encoding {
+        if !unsafe { is_str(w) } {
+            let tn = unsafe { (*(*w).ob_type).name };
+            return Err(crate::PyError::type_error(format!(
+                "str() argument 'encoding' must be str, not {tn}"
+            )));
+        }
+    }
+    if let Some(w) = w_errors {
+        if !unsafe { is_str(w) } {
+            let tn = unsafe { (*(*w).ob_type).name };
+            return Err(crate::PyError::type_error(format!(
+                "str() argument 'errors' must be str, not {tn}"
+            )));
+        }
+    }
+    let has_encoding = w_encoding.is_some();
+    let has_errors = w_errors.is_some();
     if has_encoding || has_errors {
         if unsafe { is_str(obj) } {
             return Err(crate::PyError::type_error("decoding str is not supported"));
@@ -4168,6 +4187,15 @@ pub fn try_hash_value(obj: PyObjectRef) -> Result<i64, crate::PyError> {
                 .map(try_hash_value)
                 .collect();
             return Ok(_hash_frozenset(&hashes?));
+        }
+        if pyre_object::is_generic_alias(obj) {
+            // GenericAlias.__hash__ (`_pypy_generic_alias.py:82`) —
+            // `hash(self.__origin__) ^ hash(self.__args__)`.  Routed through
+            // `try_hash_value` so an unhashable element in `__args__`
+            // surfaces its TypeError instead of being swallowed.
+            let origin = pyre_object::w_generic_alias_get_origin(obj);
+            let args = pyre_object::w_generic_alias_get_args(obj);
+            return Ok(try_hash_value(origin)? ^ try_hash_value(args)?);
         }
         if pyre_object::is_instance(obj) {
             let w_type = pyre_object::w_instance_get_type(obj);

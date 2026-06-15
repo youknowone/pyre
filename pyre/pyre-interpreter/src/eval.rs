@@ -3410,7 +3410,7 @@ impl OpcodeStepExecutor for PyFrame {
             } else {
                 0
             };
-            let n_pos = args.len() - nkw;
+            let n_pos = args.len().saturating_sub(nkw);
             let pos_args = args[..n_pos].to_vec();
             let mut kw_entries = Vec::with_capacity(nkw);
             for ki in 0..nkw {

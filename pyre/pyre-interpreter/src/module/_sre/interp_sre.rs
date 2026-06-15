@@ -1113,7 +1113,9 @@ fn subx(args: &[PyObjectRef]) -> Result<(PyObjectRef, i64), crate::PyError> {
     let mut n: i64 = 0;
     let mut last = 0i64;
     for snap in &matches {
-        if count > 0 && n >= count {
+        // interp_sre.py:494 — `while not count or n < count`: 0 is unlimited,
+        // a negative count performs no substitutions at all.
+        if count != 0 && n >= count {
             break;
         }
         let (mstart, mend) = snap.spans[0];
@@ -1195,7 +1197,9 @@ fn sre_pattern_split(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
     let mut n: i64 = 0;
     let mut last = 0i64;
     for snap in &matches {
-        if maxsplit > 0 && n >= maxsplit {
+        // interp_sre.py:388 — `while not maxsplit or n < maxsplit`: 0 is
+        // unlimited, a negative cap performs no splits at all.
+        if maxsplit != 0 && n >= maxsplit {
             break;
         }
         let (mstart, mend) = snap.spans[0];
@@ -1447,17 +1451,17 @@ fn do_span(m: *const W_SRE_Match, w_arg: Option<PyObjectRef>) -> Result<(i64, i6
     let groupnum: i64 = match w_arg {
         None => 0,
         Some(w_arg) => {
-            // `match_getindex` — an operand with `__index__` (any int
-            // subclass, or a duck-typed integer) is the group number;
-            // anything else is a name looked up in `srepat.w_groupindex`.
+            // `match_getindex` — `PyIndex_Check(index)` gate: an operand whose
+            // type defines `__index__` (any int subclass, or a duck-typed
+            // integer) is the group number, and any error from that conversion
+            // propagates.  Only an operand without an `__index__` slot is
+            // treated as a group *name*, looked up in `srepat.w_groupindex`
+            // (a miss → IndexError "no such group").
             let has_index = unsafe { pyre_object::pyobject::is_int_or_long(w_arg) }
                 || unsafe { crate::baseobjspace::lookup(w_arg, "__index__") }.is_some();
             if has_index {
                 crate::baseobjspace::getindex_w(w_arg)?
             } else {
-                // interp_sre.py:812-818 — non-integer argument: look the
-                // name up in `srepat.w_groupindex`; KeyError →
-                // IndexError("no such group").
                 let w_groupindex =
                     unsafe { (*(*m).w_srepat.cast::<W_SRE_Pattern>()).w_groupindex };
                 let found = if unsafe { is_dict(w_groupindex) } {

@@ -1036,7 +1036,9 @@ fn float_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
 /// type-creation time. pyre's TypeDef registry uses this helper at install
 /// time so each builtin type's `__new__` slot already carries the correct
 /// non-binding descriptor.
-fn make_new_descr(func: fn(&[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>) -> PyObjectRef {
+pub(crate) fn make_new_descr(
+    func: fn(&[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>,
+) -> PyObjectRef {
     let f = make_builtin_function("__new__", func);
     pyre_object::w_staticmethod_new(f)
 }
@@ -3394,6 +3396,16 @@ fn mappingproxy_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
 fn init_mappingproxy_type(ns: &mut DictStorage) {
     // dictproxyobject.py:105 __new__=interp2app(descr_new)
     dict_storage_store(ns, "__new__", make_new_descr(mappingproxy_descr_new));
+    // dictproxyobject.py:117 __class_getitem__ = interp2app(
+    //     generic_alias_class_getitem, as_classmethod=True)
+    dict_storage_store(
+        ns,
+        "__class_getitem__",
+        pyre_object::propertyobject::w_classmethod_new(make_builtin_function(
+            "__class_getitem__",
+            crate::genericalias::generic_alias_class_getitem,
+        )),
+    );
     // dictproxyobject.py:32 descr_len → space.len(self.w_mapping)
     dict_storage_store(
         ns,
@@ -4620,6 +4632,16 @@ fn init_type_type(ns: &mut DictStorage) {
         "__new__",
         make_new_descr(crate::builtins::type_descr_new),
     );
+    // typeobject.py — `__class_getitem__ = interp2app(generic_alias_class_getitem,
+    // as_classmethod=True)` so `type[int]` builds a GenericAlias.
+    dict_storage_store(
+        ns,
+        "__class_getitem__",
+        pyre_object::propertyobject::w_classmethod_new(make_builtin_function(
+            "__class_getitem__",
+            crate::genericalias::generic_alias_class_getitem,
+        )),
+    );
     // type.__init__ — no-op for now
     dict_storage_store(
         ns,
@@ -4720,15 +4742,25 @@ fn init_type_type(ns: &mut DictStorage) {
         "__module__",
         |args| {
             let cls = args[1];
+            // Reached as `type.__module__`: this getset lives on `type`'s own
+            // dict, so the descriptor protocol binds it with a null instance.
+            // There is no class to inspect, so use the builtin default that
+            // the dot-split would produce for the unqualified name `type`.
+            if cls.is_null() {
+                return Ok(pyre_object::w_str_new("builtins"));
+            }
             // `typeobject.py:614-617 get_module`:
             //     if self.is_heaptype():
             //         return self.getdictvalue(space, '__module__')
-            // `lookup_in_type` filters out null entries but
-            // preserves `w_none()`, matching PyPy's "value present
-            // even if it's None" semantic.
-            if let Some(v) = unsafe { crate::baseobjspace::lookup_in_type(cls, "__module__") } {
-                if !v.is_null() {
-                    return Ok(v);
+            // Only a heaptype reads `__module__` from its dict; a builtin
+            // type derives it from the qualified name.  `lookup_in_type`
+            // filters out null entries but preserves `w_none()`, matching
+            // PyPy's "value present even if it's None" semantic.
+            if unsafe { pyre_object::w_type_is_heaptype(cls) } {
+                if let Some(v) = unsafe { crate::baseobjspace::lookup_in_type(cls, "__module__") } {
+                    if !v.is_null() {
+                        return Ok(v);
+                    }
                 }
             }
             // Builtin-name dot split fallback (`typeobject.py:619-624`).
@@ -6183,6 +6215,11 @@ int_binop_rev!(
 /// `int.__pow__(self, exp[, mod])` — optional modulus routes through the
 /// three-argument modular power.
 fn int_dunder_pow(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    if args.len() < 2 || args.len() > 3 {
+        return Err(crate::PyError::type_error(
+            "__pow__ expected 1 or 2 arguments",
+        ));
+    }
     if unsafe { pyre_object::pyobject::is_int_or_long(args[1]) } {
         if args.len() >= 3 {
             if unsafe { pyre_object::pyobject::is_none(args[2]) } {
@@ -7242,8 +7279,66 @@ fn integer_decode(v: f64) -> (u64, i16, i8) {
     exponent -= 1023 + 52;
     (mantissa, exponent, sign)
 }
+/// boolobject.py `_make_bitwise_binop` — when both operands are bool the
+/// result is bool; a non-bool operand delegates to the int dunder, which
+/// returns an int.  `descr_rbinop` reuses `descr_binop`, so the reflected
+/// slots bind to the same function.
+fn bool_bitwise_binop(
+    args: &[PyObjectRef],
+    bool_op: unsafe fn(PyObjectRef, PyObjectRef) -> PyObjectRef,
+    int_op: fn(PyObjectRef, PyObjectRef) -> Result<PyObjectRef, crate::PyError>,
+) -> Result<PyObjectRef, crate::PyError> {
+    if args.len() < 2 {
+        return Err(crate::PyError::type_error("expected 1 argument, got 0"));
+    }
+    let a = crate::baseobjspace::unwrap_cell(args[0]);
+    let b = crate::baseobjspace::unwrap_cell(args[1]);
+    if !unsafe { pyre_object::is_bool(b) } {
+        return int_op(a, b);
+    }
+    Ok(unsafe { bool_op(a, b) })
+}
+
+fn bool_dunder_and(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    bool_bitwise_binop(
+        args,
+        pyre_object::bool_descr_and,
+        crate::objspace::descroperation::and_builtin,
+    )
+}
+
+fn bool_dunder_or(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    bool_bitwise_binop(
+        args,
+        pyre_object::bool_descr_or,
+        crate::objspace::descroperation::or_builtin,
+    )
+}
+
+fn bool_dunder_xor(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    bool_bitwise_binop(
+        args,
+        pyre_object::bool_descr_xor,
+        crate::objspace::descroperation::xor_builtin,
+    )
+}
+
 fn init_bool_type(ns: &mut DictStorage) {
     dict_storage_store(ns, "__new__", make_new_descr(bool_descr_new));
+    // boolobject.py:97-106 — bool defines its own bitwise dunders so that
+    // `True & True` is `True`; int.__and__ etc. return int.
+    for (and_name, rand_name, f) in [
+        (
+            "__and__",
+            "__rand__",
+            bool_dunder_and as fn(&[PyObjectRef]) -> _,
+        ),
+        ("__or__", "__ror__", bool_dunder_or),
+        ("__xor__", "__rxor__", bool_dunder_xor),
+    ] {
+        dict_storage_store(ns, and_name, make_builtin_function(and_name, f));
+        dict_storage_store(ns, rand_name, make_builtin_function(rand_name, f));
+    }
 }
 
 // ── Object TypeDef ───────────────────────────────────────────────────
