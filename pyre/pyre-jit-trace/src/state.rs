@@ -1960,6 +1960,15 @@ pub struct PyreSym {
     /// of the vable_array_base-based layout. This ensures bridge traces see
     /// frame locals as symbolic InputArgs, not concrete values.
     pub(crate) bridge_local_oprefs: Option<Vec<OpRef>>,
+    /// Bridge-specific override for the kept operand-stack slice of
+    /// registers_r ([nlocals..nlocals+stack_only], semantic-slot == color
+    /// in that prefix). resume.py:1042 parity: setup_bridge_sym resolves
+    /// the live operand-stack temps from the guard's resume data; this
+    /// preserves them so init_symbolic (which runs AFTER setup_bridge_sym
+    /// in pyre's bridge launcher) does not clobber the rebuilt stack tail
+    /// back to NONE, and so the full-body-walk argbox seed can recover the
+    /// kept conditional-expression / short-circuit value (#124).
+    pub(crate) bridge_stack_oprefs: Option<Vec<OpRef>>,
     /// Bridge-specific override for symbolic_local_types.
     /// virtualizable.py:44 + interp_jit.py:25-31: locals_cells_stack_w[*]
     /// is a W_Root array → all items are Type::Ref. setup_bridge_sym
@@ -3725,6 +3734,7 @@ impl PyreSym {
             valuestackdepth: 0,
             nlocals: 0,
             bridge_local_oprefs: None,
+            bridge_stack_oprefs: None,
             bridge_local_types: None,
             vable_last_instr: OpRef::NONE,
             vable_pycode: OpRef::NONE,
@@ -4058,6 +4068,16 @@ impl PyreSym {
             (0..stack_only_depth)
                 .map(|i| OpRef::input_arg_ref(stack_base + i as u32))
                 .collect()
+        } else if let Some(ref bridge_stack) = self.bridge_stack_oprefs {
+            // #124: a bridge resumes from a guard whose live operand stack
+            // setup_bridge_sym already resolved into these OpRefs. The local
+            // override (above) plus the comment at the bridge_local_oprefs
+            // branch assume setup_bridge_sym overwrites the rebuilt tail,
+            // but pyre's launcher runs setup_bridge_sym BEFORE this; so
+            // preserve the kept temps here rather than reset them to NONE.
+            let mut seed = bridge_stack.clone();
+            seed.resize(stack_only_depth, OpRef::NONE);
+            seed
         } else {
             vec![OpRef::NONE; stack_only_depth]
         };
@@ -7472,6 +7492,22 @@ impl JitState for PyreJitState {
         sym.symbolic_stack_types = vec![Type::Ref; stack_only];
         sym.valuestackdepth = bridge_valuestackdepth;
         sym.bridge_local_oprefs = Some(bridge_locals);
+        // #124: preserve the resolved kept operand-stack temps. Within the
+        // semantic prefix [0..nlocals+stack_only] the abstract-register
+        // color equals the semantic slot, so the stack tail is
+        // `bridge_registers_r[nlocals..nlocals+stack_only]`. init_symbolic
+        // runs AFTER setup_bridge_sym in pyre's bridge launcher and would
+        // otherwise reset this tail to NONE; keeping it lets both the
+        // rebuilt registers_r and the full-body-walk argbox seed recover
+        // the kept conditional-expression / short-circuit value.
+        sym.bridge_stack_oprefs = Some(
+            bridge_registers_r
+                .iter()
+                .skip(nlocals)
+                .take(stack_only)
+                .copied()
+                .collect(),
+        );
         sym.bridge_local_types = Some(bridge_local_types);
 
         // pyjitpl.py:3424 `rebuild_state_after_failure` tail —

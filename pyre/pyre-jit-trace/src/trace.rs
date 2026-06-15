@@ -435,6 +435,7 @@ fn run_perfn_walk(
         return None;
     }
 
+    let is_bridge_trace = ctx.is_bridge_trace;
     let mut mi = crate::state::MIFrame::from_sym(ctx, sym, cf_addr, start_pc, start_pc);
 
     // Resolve the five terminal descrs off MetaInterpStaticData so the
@@ -552,6 +553,27 @@ fn run_perfn_walk(
                     seed(portal_ec_reg as u8, ec_box);
                 } else {
                     seed(2, ec_box);
+                }
+            }
+        }
+        // #124: a bridge enters mid-body, where the loop-header merge-point
+        // colors seeded above (the loop's green pycode / red frame+ec) are
+        // reused for live operand-stack temps — the kept conditional-
+        // expression / short-circuit / chained-compare value.  Leaving e.g.
+        // the pycode green at the kept temp's color feeds a stale code object
+        // into its binary op (`unsupported operand type(s) for +: 'code' and
+        // 'int'`).  Override the kept operand-stack colors
+        // [nlocals..nlocals+stack_only) with the resume-data OpRefs
+        // setup_bridge_sym resolved; in that semantic prefix the abstract-
+        // register color equals the semantic slot.  Locals (read through the
+        // vable) and frame/ec (at their own colors) keep the seeding above.
+        if is_bridge_trace {
+            if let Some(ref bridge_stack) = sym.bridge_stack_oprefs {
+                let nl = sym.nlocals;
+                for (i, &opref) in bridge_stack.iter().enumerate() {
+                    if !opref.is_none() {
+                        seed((nl + i) as u8, opref);
+                    }
                 }
             }
         }
