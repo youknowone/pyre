@@ -418,15 +418,19 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
             let ptr_value_name = quote::format_ident!("{}_ptr_value", f.name);
             let len_value_name = quote::format_ident!("{}_len_value", f.name);
             quote! {
-                // The identity ptr is the vable base (`vable_input_ref_reg`),
-                // a Ref box — populate the REF bank so the box carries a Ref
-                // value and the optimizer folds it to a ref const (TAGCONST),
-                // matching the jitcode ref-liveness the resume reader decodes
-                // through `decode_ref`. The length stays an int slot.
-                if __slot < frame.ref_regs.len() {
-                    frame.ref_regs[__slot] =
-                        Some(majit_ir::box_ref::BoxRef::from_opref(self.#ptr_name));
-                    frame.ref_values[__slot] = Some(self.#ptr_value_name);
+                // `<varr>_ptr` is the backing storage's raw data pointer (a
+                // raw address, not a GC ref) and `<varr>_len` its length: both
+                // occupy int slots, matching `live_slots_for_state_field_jit`
+                // (which counts `2 * num_virt_arrays` into `live_i`), the
+                // `StateFieldLayout::total_slots` decode, and the int-stream
+                // resume reader. The vable identity, when the state has one,
+                // is a separate `ref(<T>)` scalar in the ref bank — NOT this
+                // pointer. Writing the ptr to the ref bank desyncs it from the
+                // int `live_i` index the resume reader decodes, leaving
+                // `int_regs[slot]` unset when the guard snapshot is collected.
+                if __slot < frame.int_regs.len() {
+                    frame.int_regs[__slot] = Some(self.#ptr_name);
+                    frame.int_values[__slot] = Some(self.#ptr_value_name);
                 }
                 __slot += 1;
                 if __slot < frame.int_regs.len() {
