@@ -3635,7 +3635,9 @@ impl<'a> Lowering<'a> {
                             &call.dest.ty,
                         )
                         .or_else(|| self.trait_into_string_alias(&segments, &args, &call.dest.ty))
-                        .or_else(|| self.oparg_arg_get_alias(&reg.kind, &segments, &args))
+                        .or_else(|| {
+                            self.oparg_arg_get_alias(&reg.kind, &segments, &args, &call.dest.ty)
+                        })
                         .or_else(|| self.oparg_value_alias(&segments, &args))
                     };
                 if let Some(value) = alias {
@@ -4334,6 +4336,7 @@ impl<'a> Lowering<'a> {
         kind: &CallKind,
         segments: &[String],
         args: &[Variable],
+        dest_ty: &TyRef,
     ) -> Option<Variable> {
         if segments.last().map(String::as_str) != Some("get") {
             return None;
@@ -4348,6 +4351,18 @@ impl<'a> Lowering<'a> {
         // `OpArg` is `Opaque` in the LLBC (external crate), so resolve it
         // by qualified name rather than structural shape.
         if !adt_path_of_tyref(oparg_ty, self.llbc).is_some_and(|p| p.ends_with("oparg::OpArg")) {
+            return None;
+        }
+        // A fieldless-enum result (`Arg::<SpecialMethod>::get`) must keep
+        // its `Ref` enum shape.  Aliasing to the bare integer operand
+        // would make the downstream `match`'s `Rvalue::Discriminant` read
+        // a `__discriminant` field off an integer base — a
+        // `getfield_gc_i_pure/id>i` opname no blackhole handler covers.
+        // The generic `fd.signature.output` is the type parameter `T`, so
+        // key off the call's concrete destination type instead.  Only the
+        // int-newtype results (`VarNum` / `u32`, whose bits *are* the
+        // operand) alias; the enum keeps the canonical `…/rd>i` read.
+        if self.tyref_is_fieldless_enum(dest_ty) {
             return None;
         }
         args.get(1).cloned()
@@ -4389,6 +4404,28 @@ impl<'a> Lowering<'a> {
         match ty {
             TyRef::Inline { value: (_, v) } | TyRef::Other(v) => inline_adt_def_id(v),
             TyRef::Dedup { id } => self.llbc.dedup_to_adt_def_id(*id),
+        }
+    }
+
+    /// `true` when `ty` resolves to a fieldless (C-like) enum — at least
+    /// one variant and every variant carrying zero payload fields.  Such
+    /// an enum is represented by-value as its discriminant integer, so
+    /// `Rvalue::Discriminant` on it is the identity on that value (see the
+    /// `Discriminant` lowering).  Payload-carrying enums return `false`
+    /// and keep the `__discriminant` field read against their aggregate
+    /// `Ref` base.
+    fn tyref_is_fieldless_enum(&self, ty: &TyRef) -> bool {
+        let Some(def_id) = self.tyref_adt_def_id(ty) else {
+            return false;
+        };
+        let Some(td) = self.llbc.type_by_id(def_id) else {
+            return false;
+        };
+        match &td.kind {
+            TypeDeclKind::Enum(variants) => {
+                !variants.is_empty() && variants.iter().all(|v| v.fields.is_empty())
+            }
+            _ => false,
         }
     }
 
