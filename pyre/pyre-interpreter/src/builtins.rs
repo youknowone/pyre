@@ -499,6 +499,37 @@ pub fn install_default_builtins(namespace: &mut DictStorage) {
                     1,
                 ),
             );
+            // memoryview.toreadonly — a fresh view over a bytes copy of the
+            // backing buffer, which the stub treats as read-only.
+            crate::dict_storage_store(
+                ns,
+                "toreadonly",
+                make_builtin_function_with_arity(
+                    "toreadonly",
+                    |args| {
+                        let mv = args.get(0).copied().unwrap_or(w_none());
+                        unsafe {
+                            let (data, itemsize, _) = memoryview_data(mv)?;
+                            let fmt = crate::baseobjspace::getattr_str(mv, "__pyre_fmt__")?;
+                            let cls = crate::typedef::r#type(mv).unwrap_or(pyre_object::PY_NULL);
+                            let inst = pyre_object::w_instance_new(cls);
+                            crate::baseobjspace::setattr_str(
+                                inst,
+                                "__pyre_buf__",
+                                pyre_object::bytesobject::w_bytes_from_bytes(&data),
+                            )?;
+                            crate::baseobjspace::setattr_str(inst, "__pyre_fmt__", fmt)?;
+                            crate::baseobjspace::setattr_str(
+                                inst,
+                                "__pyre_itemsize__",
+                                w_int_new(itemsize as i64),
+                            )?;
+                            Ok(inst)
+                        }
+                    },
+                    1,
+                ),
+            );
             // memoryview.itemsize attribute — read from the per-instance
             // __pyre_itemsize__ slot via property descriptor.
             crate::dict_storage_store(

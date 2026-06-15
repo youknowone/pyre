@@ -379,6 +379,9 @@ crate::py_module! {
     interpleveldefs: {
         "Pickler" => pickler::type_object(),
         "Unpickler" => unpickler::type_object(),
+        // Shared singleton with `__pypy__.PickleBuffer`; `pickle.py` does
+        // `from _pickle import PickleBuffer` to set `_HAVE_PICKLE_BUFFER`.
+        "PickleBuffer" => crate::module::__pypy__::pickle_buffer::type_object(),
     },
     exceptions: {
         "PickleError" => crate::builtins::lookup_exc_class("Exception")
@@ -397,17 +400,21 @@ crate::py_module! {
             #[default(pyre_object::w_none())] fix_imports: PyObjectRef,
             #[default(pyre_object::w_none())] buffer_callback: PyObjectRef,
         ) -> Result<PyObjectRef, PyError> {
-            // `buffer_callback` is accepted for signature compatibility but
-            // only ever invoked for PickleBuffer values (out-of-band buffers,
-            // deferred); no PickleBuffer can be constructed here, so ignoring
-            // it is behaviorally identical to the callback never firing.
-            let _ = (fix_imports, buffer_callback);
+            // `fix_imports` is applied at the save sites by protocol.
+            let _ = fix_imports;
             let proto = pickler::normalize_protocol(protocol)?;
+            pickler::check_buffer_callback(buffer_callback, proto)?;
             let _roots = pyre_object::gc_roots::push_roots();
             pyre_object::gc_roots::pin_root(file);
             let file_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-            let w_bytes =
-                pickler::pickle_core(obj, proto, proto >= 1, proto >= 4, pyre_object::PY_NULL)?;
+            let w_bytes = pickler::pickle_core(
+                obj,
+                proto,
+                proto >= 1,
+                proto >= 4,
+                pyre_object::PY_NULL,
+                buffer_callback,
+            )?;
             let file = pyre_object::gc_roots::shadow_stack_get(file_slot);
             call_meth(file, "write", &[w_bytes])?;
             Ok(pyre_object::w_none())
@@ -420,9 +427,17 @@ crate::py_module! {
             #[default(pyre_object::w_none())] fix_imports: PyObjectRef,
             #[default(pyre_object::w_none())] buffer_callback: PyObjectRef,
         ) -> Result<PyObjectRef, PyError> {
-            let _ = (fix_imports, buffer_callback);
+            let _ = fix_imports;
             let proto = pickler::normalize_protocol(protocol)?;
-            pickler::pickle_core(obj, proto, proto >= 1, proto >= 4, pyre_object::PY_NULL)
+            pickler::check_buffer_callback(buffer_callback, proto)?;
+            pickler::pickle_core(
+                obj,
+                proto,
+                proto >= 1,
+                proto >= 4,
+                pyre_object::PY_NULL,
+                buffer_callback,
+            )
         }
 
         // `pickle.load` — read a pickle from `file`.
@@ -433,8 +448,10 @@ crate::py_module! {
             #[default(pyre_object::w_none())] errors: PyObjectRef,
             #[default(pyre_object::w_none())] buffers: PyObjectRef,
         ) -> Result<PyObjectRef, PyError> {
-            let _ = (fix_imports, encoding, errors, buffers);
-            let unpickler = call_fn(unpickler::type_object(), &[file])?;
+            let unpickler = call_fn(
+                unpickler::type_object(),
+                &[file, fix_imports, encoding, errors, buffers],
+            )?;
             call_meth(unpickler, "load", &[])
         }
 
@@ -446,17 +463,31 @@ crate::py_module! {
             #[default(pyre_object::w_none())] errors: PyObjectRef,
             #[default(pyre_object::w_none())] buffers: PyObjectRef,
         ) -> Result<PyObjectRef, PyError> {
-            let _ = (fix_imports, encoding, errors, buffers);
+            // Pin every argument that outlives the `BytesIO` construction;
+            // a minor collection there can relocate them.
             let _roots = pyre_object::gc_roots::push_roots();
+            let base = pyre_object::gc_roots::shadow_stack_len();
             pyre_object::gc_roots::pin_root(data);
-            let data_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+            pyre_object::gc_roots::pin_root(fix_imports);
+            pyre_object::gc_roots::pin_root(encoding);
+            pyre_object::gc_roots::pin_root(errors);
+            pyre_object::gc_roots::pin_root(buffers);
             let io = import_module("io")?;
             let bytesio_cls = crate::baseobjspace::getattr_str(io, "BytesIO")?;
             let file = call_fn(
                 bytesio_cls,
-                &[pyre_object::gc_roots::shadow_stack_get(data_slot)],
+                &[pyre_object::gc_roots::shadow_stack_get(base)],
             )?;
-            let unpickler = call_fn(unpickler::type_object(), &[file])?;
+            let unpickler = call_fn(
+                unpickler::type_object(),
+                &[
+                    file,
+                    pyre_object::gc_roots::shadow_stack_get(base + 1),
+                    pyre_object::gc_roots::shadow_stack_get(base + 2),
+                    pyre_object::gc_roots::shadow_stack_get(base + 3),
+                    pyre_object::gc_roots::shadow_stack_get(base + 4),
+                ],
+            )?;
             call_meth(unpickler, "load", &[])
         }
     },

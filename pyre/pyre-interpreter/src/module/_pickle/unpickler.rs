@@ -25,6 +25,8 @@ pub struct W_Unpickler {
     w_frame: PyObjectRef,
     frame_index: i64,
     proto: i64,
+    /// Out-of-band `buffers` iterator (proto 5), or None.
+    w_buffers: PyObjectRef,
 }
 
 #[crate::pyre_methods(doc = "Unpickler(file) -> unpickler reading from file.")]
@@ -45,12 +47,24 @@ impl W_Unpickler {
             w_frame: pyre_object::w_none(),
             frame_index: 0,
             proto: 0,
+            w_buffers: pyre_object::w_none(),
         })
     }
 
-    fn __init__(&mut self, w_file: PyObjectRef) -> Result<(), PyError> {
-        self.w_file_read = crate::baseobjspace::getattr_str(w_file, "read")?;
-        self.w_file_readline = crate::baseobjspace::getattr_str(w_file, "readline")?;
+    fn __init__(
+        &mut self,
+        file: PyObjectRef,
+        #[default(pyre_object::w_none())] fix_imports: PyObjectRef,
+        #[default(pyre_object::w_none())] encoding: PyObjectRef,
+        #[default(pyre_object::w_none())] errors: PyObjectRef,
+        #[default(pyre_object::w_none())] buffers: PyObjectRef,
+    ) -> Result<(), PyError> {
+        // `fix_imports` / `encoding` / `errors` govern the legacy py2 byte
+        // string decode path; pyre stores unicode natively, so they are
+        // accepted for signature compatibility.
+        let _ = (fix_imports, encoding, errors);
+        self.w_file_read = crate::baseobjspace::getattr_str(file, "read")?;
+        self.w_file_readline = crate::baseobjspace::getattr_str(file, "readline")?;
         self.w_stack = pyre_object::w_none();
         self.w_metastack = pyre_object::w_none();
         self.w_memo = pyre_object::w_none();
@@ -58,6 +72,12 @@ impl W_Unpickler {
         self.w_frame = pyre_object::w_none();
         self.frame_index = 0;
         self.proto = 0;
+        // A non-None `buffers` is consumed as an iterator by NEXT_BUFFER.
+        self.w_buffers = if unsafe { pyre_object::is_none(buffers) } {
+            pyre_object::w_none()
+        } else {
+            crate::baseobjspace::iter(buffers)?
+        };
         Ok(())
     }
 
@@ -135,6 +155,55 @@ fn pop_mark(slot: usize) -> Result<PyObjectRef, PyError> {
         .ok_or_else(|| unpickling_error("no items on stack"))?;
     cur(slot).w_stack = prev;
     Ok(items)
+}
+
+// ── out-of-band buffers ──────────────────────────────────────────────
+
+/// `load_next_buffer` (NEXT_BUFFER) — push the next buffer from the
+/// `buffers` iterator given at construction.
+fn load_next_buffer(slot: usize) -> Result<(), PyError> {
+    let w_buffers = cur(slot).w_buffers;
+    if unsafe { pyre_object::is_none(w_buffers) } {
+        return Err(unpickling_error(
+            "pickle stream refers to out-of-band data but no *buffers* argument was given",
+        ));
+    }
+    let w_buf = match crate::baseobjspace::next(w_buffers) {
+        Ok(b) => b,
+        Err(e) if e.kind == crate::PyErrorKind::StopIteration => {
+            return Err(unpickling_error("not enough out-of-band buffers"));
+        }
+        Err(e) => return Err(e),
+    };
+    push(slot, w_buf);
+    Ok(())
+}
+
+/// `load_readonly_buffer` (READONLY_BUFFER) — replace the top buffer with a
+/// read-only memoryview onto it.
+fn load_readonly_buffer(slot: usize) -> Result<(), PyError> {
+    let w_buf = top(slot, "READONLY_BUFFER")?;
+    let w_mv = call_fn(memoryview_type()?, &[w_buf])?;
+    let w_readonly = call_meth(w_mv, "toreadonly", &[])?;
+    // Replace the top of the stack (`stack[-1] = w_readonly`).
+    pop(slot)?;
+    push(slot, w_readonly);
+    Ok(())
+}
+
+/// The `memoryview` builtin type via the live execution context.
+fn memoryview_type() -> Result<PyObjectRef, PyError> {
+    let frame = crate::eval::CURRENT_FRAME.with(|f| f.get());
+    let ec = if frame.is_null() {
+        std::ptr::null()
+    } else {
+        unsafe { (*frame).execution_context }
+    };
+    if ec.is_null() {
+        return Err(unpickling_error("memoryview type unavailable"));
+    }
+    unsafe { (*ec).lookup_builtin("memoryview") }
+        .ok_or_else(|| unpickling_error("memoryview type unavailable"))
 }
 
 // ── memo helpers ─────────────────────────────────────────────────────
@@ -431,6 +500,9 @@ fn dispatch(slot: usize, opcode: u8) -> Result<(), PyError> {
                 pyre_object::bytearrayobject::w_bytearray_from_bytes(&d),
             );
         }
+        // ── proto-5 out-of-band buffers ───────────────────────────────
+        x if x == op::NEXT_BUFFER => load_next_buffer(slot)?,
+        x if x == op::READONLY_BUFFER => load_readonly_buffer(slot)?,
         // ── global / reduce / build ───────────────────────────────────
         x if x == op::GLOBAL => {
             let module = read_line(slot)?;

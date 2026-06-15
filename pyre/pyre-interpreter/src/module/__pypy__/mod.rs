@@ -5,11 +5,23 @@
 //! (an identity-keyed memo dict) and `builders.BytesBuilder` in one
 //! shared `try` block; both must resolve for the optimized path to
 //! activate, so both are provided here as app-level classes.
+//!
+//! `PickleBuffer` (`interp_buffer.py W_PickleBuffer`) is exposed here as
+//! an interp-level class; `pickle.py` re-exports it and the `_pickle`
+//! accelerator serializes it in-band or out-of-band under protocol 5.
+
+pub mod pickle_buffer;
+
+pub use pickle_buffer::W_PickleBuffer;
 
 crate::py_module! {
     "__pypy__",
-    // `identity_dict` keys a memo by object identity (id(key)) so the
-    // Pickler can memoize unhashable containers.
+    // `PickleBuffer` wraps a bytes-like object for proto-5 out-of-band
+    // buffers; `identity_dict` keys a memo by object identity (id(key))
+    // so the Pickler can memoize unhashable containers.
+    interpleveldefs: {
+        "PickleBuffer" => pickle_buffer::type_object(),
+    },
     appleveldefs: {
         "identity_dict_app.py" => ["identity_dict"],
     },

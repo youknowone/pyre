@@ -19,6 +19,8 @@ pub struct W_Pickler {
     proto: i64,
     bin: bool,
     framing: bool,
+    /// `buffer_callback` for proto-5 out-of-band buffers, or `None`.
+    buffer_callback: PyObjectRef,
 }
 
 /// Per-`dump` pickling context. The identity memo maps an already-saved
@@ -33,6 +35,8 @@ struct PickleCtx {
     /// `persistent_id` callable resolved off the pickler (subclass override
     /// or set attribute), or `PY_NULL` when not defined.
     pers_func: PyObjectRef,
+    /// `buffer_callback` for proto-5 out-of-band buffers, or `None`/`PY_NULL`.
+    buffer_callback: PyObjectRef,
 }
 
 impl PickleCtx {
@@ -136,23 +140,34 @@ impl W_Pickler {
             proto: 0,
             bin: false,
             framing: false,
+            buffer_callback: pyre_object::w_none(),
         })
     }
 
     fn __init__(
         &mut self,
-        w_file: PyObjectRef,
-        #[default(pyre_object::w_none())] w_protocol: PyObjectRef,
+        file: PyObjectRef,
+        #[default(pyre_object::w_none())] protocol: PyObjectRef,
+        #[default(pyre_object::w_none())] fix_imports: PyObjectRef,
+        #[default(pyre_object::w_none())] buffer_callback: PyObjectRef,
     ) -> Result<(), PyError> {
-        let proto = normalize_protocol(w_protocol)?;
+        // `fix_imports` selects the `_compat_pickle` name mapping at the save
+        // sites by protocol already; the flag is accepted for signature
+        // compatibility but the proto-< 3 path is always applied.
+        let _ = fix_imports;
+        let proto = normalize_protocol(protocol)?;
         // `file must have a 'write' attribute` (interp_pickle.py:557).
-        if crate::baseobjspace::findattr(w_file, "write").is_none() {
+        if crate::baseobjspace::findattr(file, "write").is_none() {
             return Err(PyError::type_error("file must have a 'write' attribute"));
         }
-        self.w_file = w_file;
+        if !unsafe { pyre_object::is_none(buffer_callback) } && proto < 5 {
+            return Err(PyError::value_error("buffer_callback needs protocol >= 5"));
+        }
+        self.w_file = file;
         self.proto = proto;
         self.bin = proto >= 1;
         self.framing = proto >= 4;
+        self.buffer_callback = buffer_callback;
         Ok(())
     }
 
@@ -162,6 +177,7 @@ impl W_Pickler {
         let bin = self.bin;
         let framing = self.framing;
         let w_file = self.w_file;
+        let buffer_callback = self.buffer_callback;
         // A `persistent_id` defined on a subclass (or set as an attribute)
         // overrides the default no-op; the base class has none.
         let self_ptr = self as *mut W_Pickler as PyObjectRef;
@@ -173,12 +189,24 @@ impl W_Pickler {
         pyre_object::gc_roots::pin_root(w_file);
         let file_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
 
-        let w_bytes = pickle_core(w_obj, proto, bin, framing, pers_func)?;
+        let w_bytes = pickle_core(w_obj, proto, bin, framing, pers_func, buffer_callback)?;
         // `w_file` may have moved while building the pickle; re-read the pin.
         let w_file = pyre_object::gc_roots::shadow_stack_get(file_slot);
         call_meth(w_file, "write", &[w_bytes])?;
         Ok(())
     }
+}
+
+/// `buffer_callback needs protocol >= 5` — reject a non-None callback under
+/// an earlier protocol (interp_pickle.py:1818).
+pub(crate) fn check_buffer_callback(
+    buffer_callback: PyObjectRef,
+    proto: i64,
+) -> Result<(), PyError> {
+    if !unsafe { pyre_object::is_none(buffer_callback) } && proto < 5 {
+        return Err(PyError::value_error("buffer_callback needs protocol >= 5"));
+    }
+    Ok(())
 }
 
 /// `interp_pickle.py W_Pickler.__init__` protocol resolution: `None` →
@@ -209,11 +237,15 @@ pub(crate) fn pickle_core(
     bin: bool,
     framing: bool,
     pers_func: PyObjectRef,
+    buffer_callback: PyObjectRef,
 ) -> Result<PyObjectRef, PyError> {
     let _roots = pyre_object::gc_roots::push_roots();
     pyre_object::gc_roots::pin_root(w_obj);
     if !pers_func.is_null() {
         pyre_object::gc_roots::pin_root(pers_func);
+    }
+    if !buffer_callback.is_null() && !unsafe { pyre_object::is_none(buffer_callback) } {
+        pyre_object::gc_roots::pin_root(buffer_callback);
     }
 
     let mut ctx = PickleCtx {
@@ -222,6 +254,7 @@ pub(crate) fn pickle_core(
         memo: HashMap::new(),
         memo_size: 0,
         pers_func,
+        buffer_callback,
     };
     let mut fr = Framer::new();
     if proto >= 2 {
@@ -335,17 +368,9 @@ fn save_object(ctx: &mut PickleCtx, buf: &mut Framer, w_obj: PyObjectRef) -> Res
     if unsafe { pyre_object::is_bytearray(w_obj) } {
         return save_bytearray(ctx, buf, w_obj);
     }
-
-    // `save_picklebuffer` (protocol 5 out-of-band buffers) is deferred. The
-    // CPython surface is `Pickler(file, protocol, *, buffer_callback=None)`
-    // and `Unpickler(file, *, buffers=None)` with keyword-only arguments, but
-    // `#[pyre_class]` `__init__` does not bind keyword arguments (module-level
-    // functions do; constructors do not), so `buffer_callback` / `buffers`
-    // cannot be supplied without diverging from CPython's keyword-only
-    // signature. The NEXT_BUFFER / READONLY_BUFFER opcodes are reserved in the
-    // `op` module for when that ABI gap is closed. PickleBuffer in-band is the
-    // CPython default (buffer_callback=None) but reduces to plain bytes /
-    // bytearray, so nothing is lost by routing those through the normal path.
+    if crate::module::__pypy__::W_PickleBuffer::from_obj(w_obj).is_some() {
+        return save_picklebuffer(ctx, buf, w_obj);
+    }
 
     // Classes and functions are saved by reference.
     if unsafe { pyre_object::typeobject::is_type(w_obj) }
@@ -754,6 +779,95 @@ fn save_bytearray(
     }
     memoize(ctx, buf, w_obj);
     Ok(())
+}
+
+/// `interp_pickle.py save_picklebuffer` — serialize a `PickleBuffer`. With
+/// no `buffer_callback`, or a callback returning a true value, the contents
+/// are written in-band (BINBYTES for a read-only buffer, BYTEARRAY8 for a
+/// mutable one). A callback returning a false value writes the data
+/// out-of-band: NEXT_BUFFER, plus READONLY_BUFFER for a read-only buffer.
+fn save_picklebuffer(
+    ctx: &mut PickleCtx,
+    buf: &mut Framer,
+    w_obj: PyObjectRef,
+) -> Result<(), PyError> {
+    if ctx.proto < 5 {
+        return Err(pickling_error(
+            "PickleBuffer can only pickled with protocol >= 5",
+        ));
+    }
+    // Read the wrapped object out of the buffer, then drop the borrow before
+    // any allocation (the callback below) can relocate the wrapper.
+    let wrapped = {
+        let pb = crate::module::__pypy__::W_PickleBuffer::from_obj(w_obj)
+            .ok_or_else(|| pickling_error("save_picklebuffer: not a PickleBuffer"))?;
+        pb.wrapped()
+    };
+    if unsafe { pyre_object::is_none(wrapped) } {
+        return Err(pickling_error(
+            "PickleBuffer can not be pickled after release",
+        ));
+    }
+    let (data, readonly) = crate::module::__pypy__::pickle_buffer::buffer_view(wrapped)?;
+    let mut in_band = true;
+    if !unsafe { pyre_object::is_none(ctx.buffer_callback) } {
+        let w_ret = call_fn(ctx.buffer_callback, &[w_obj])?;
+        in_band = crate::baseobjspace::is_true(w_ret);
+    }
+    if in_band {
+        // In-band buffers memoize the wrapper (`_save_bytes_data` /
+        // `_save_bytearray_data`), so a repeated reference becomes a GET.
+        if readonly {
+            save_raw_bytes(ctx, buf, &data);
+        } else {
+            save_raw_bytearray(buf, &data);
+        }
+        memoize(ctx, buf, w_obj);
+    } else {
+        buf.push(op::NEXT_BUFFER);
+        if readonly {
+            buf.push(op::READONLY_BUFFER);
+        }
+    }
+    Ok(())
+}
+
+/// `interp_pickle.py save_raw_bytes` — emit raw bytes with the size-appropriate
+/// BINBYTES opcode (no memoization).
+fn save_raw_bytes(ctx: &PickleCtx, buf: &mut Framer, data: &[u8]) {
+    let n = data.len();
+    if n <= 0xff {
+        buf.push(op::SHORT_BINBYTES);
+        buf.push(n as u8);
+        buf.extend_from_slice(data);
+    } else if n > 0xffff_ffff && ctx.proto >= 4 {
+        let mut header = vec![op::BINBYTES8];
+        header.extend_from_slice(&(n as u64).to_le_bytes());
+        buf.write_large_bytes(&header, data);
+    } else if n >= FRAME_SIZE_TARGET {
+        let mut header = vec![op::BINBYTES];
+        header.extend_from_slice(&(n as u32).to_le_bytes());
+        buf.write_large_bytes(&header, data);
+    } else {
+        buf.push(op::BINBYTES);
+        buf.extend_from_slice(&(n as u32).to_le_bytes());
+        buf.extend_from_slice(data);
+    }
+}
+
+/// `interp_pickle.py save_raw_bytearray` — emit raw bytes with BYTEARRAY8
+/// (no memoization).
+fn save_raw_bytearray(buf: &mut Framer, data: &[u8]) {
+    let n = data.len();
+    if n >= FRAME_SIZE_TARGET {
+        let mut header = vec![op::BYTEARRAY8];
+        header.extend_from_slice(&(n as u64).to_le_bytes());
+        buf.write_large_bytes(&header, data);
+    } else {
+        buf.push(op::BYTEARRAY8);
+        buf.extend_from_slice(&(n as u64).to_le_bytes());
+        buf.extend_from_slice(data);
+    }
 }
 
 /// `interp_pickle.py _batch_appends` (generic bin path). Single item →

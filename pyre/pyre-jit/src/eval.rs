@@ -1717,6 +1717,15 @@ thread_local! {
             <pyre_interpreter::module::_pickle::W_Unpickler
                 as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
         );
+        // W_PickleBuffer (`__pypy__.PickleBuffer`) — typed payload via
+        // `#[pyre_class]` in AUTO-ID mode; its `w_obj` field is a traced
+        // edge the collector must walk.  Tail of the tid chain.
+        register_pyre_class(
+            &mut gc,
+            &mut pytype_to_tid,
+            <pyre_interpreter::module::__pypy__::W_PickleBuffer
+                as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+        );
         // rclass.py:340-346 — assign subclassrange_{min,max} to each
         // vtable entry. freeze_types() runs assign_inheritance_ids
         // (normalizecalls.py:373-389), then we write the computed ranges

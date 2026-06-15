@@ -85,4 +85,16 @@ calls = []
 assert pickle.loads(pickle.dumps(b"data", 5, buffer_callback=calls.append)) == b"data"
 assert calls == []
 
+# Protocol-5 out-of-band buffers via the public API: PickleBuffer resolves
+# from the accelerator and round-trips through buffer_callback / buffers.
+assert pickle._HAVE_PICKLE_BUFFER
+assert pickle.PickleBuffer is not None
+bufs = []
+pb_data = pickle.dumps(pickle.PickleBuffer(b"oob payload"), 5,
+                       buffer_callback=lambda b: bufs.append(b) or False)
+assert len(bufs) == 1
+restored = pickle.loads(pb_data, buffers=[b"oob payload"])
+restored = restored if isinstance(restored, (bytes, bytearray)) else restored.tobytes()
+assert restored == b"oob payload", restored
+
 print("_pickle_module OK")
