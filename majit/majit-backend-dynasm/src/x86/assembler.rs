@@ -3199,8 +3199,7 @@ impl<'a> Assembler386<'a> {
             // The slot value is GC-forwarded in place by the gc_table
             // root walker, so each load observes the relocated object.
             OpCode::LoadFromGcTable => {
-                if let (Some(Loc::Immed(idx)), Some(Loc::Reg(dst))) =
-                    (arglocs.first(), result_loc)
+                if let (Some(Loc::Immed(idx)), Some(Loc::Reg(dst))) = (arglocs.first(), result_loc)
                 {
                     let slot_addr = self.gc_table_base + (idx.value as usize) * WORD;
                     dynasm!(self.mc ; .arch x64

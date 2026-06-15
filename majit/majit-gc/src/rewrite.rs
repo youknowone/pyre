@@ -3062,6 +3062,31 @@ impl GcRewriter for GcRewriterImpl {
         // re-minting happens here. A follow-up slice flips the trait
         // to `Vec<OpRc>` and removes this clone.
         let out: Vec<Op> = st.out.iter().map(|rc| (**rc).clone()).collect();
+
+        // rewrite.py:106-116 post-condition: `remove_constptr` replaced
+        // every non-null reference-constant *operand* with a
+        // `LoadFromGcTable` result, so no raw non-null `GcRef` is left for
+        // a backend to bake as an immortal immediate. Failargs are NOT
+        // operands — they keep their constants and are forwarded by the
+        // resume path (`rd_consts`), so this scans operands only.
+        // JIT_DEBUG keeps its constants inline (rewrite.py:105). This is
+        // the "ConstPtr transient-only" invariant: any survivor is a
+        // missed emit point.
+        #[cfg(debug_assertions)]
+        for op in &out {
+            if op.opcode == OpCode::JitDebug {
+                continue;
+            }
+            for i in 0..op.num_args() {
+                debug_assert!(
+                    !matches!(op.arg(i).const_value(), Some(Value::Ref(g)) if !g.is_null()),
+                    "rewrite output {:?} still carries a non-null ConstPtr operand at \
+                     arg {i}; remove_constptr must route it through the gc_table",
+                    op.opcode
+                );
+            }
+        }
+
         (out, st.constants, st.gcrefs_output_list)
     }
 }
@@ -5237,7 +5262,10 @@ mod tests {
         let (result, _consts, gcrefs) = rw.rewrite_for_gc_with_constants(&ops, &VecAssoc::new());
 
         // rewrite.py:109 `bool(arg.value)` — a null ConstPtr stays inline.
-        assert!(gcrefs.is_empty(), "null ConstPtr must not enter the gc_table");
+        assert!(
+            gcrefs.is_empty(),
+            "null ConstPtr must not enter the gc_table"
+        );
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].opcode, OpCode::GuardNonnull);
         assert_eq!(result[0].arg(0).const_value(), Some(Value::Ref(null)));

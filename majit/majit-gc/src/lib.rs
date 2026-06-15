@@ -1,3 +1,4 @@
+pub use gcreftracer::{GcTable, install_gc_table_walker};
 /// GC traits and interfaces for the JIT.
 ///
 /// The GC subsystem provides:
@@ -8,7 +9,6 @@
 ///
 /// Reference: rpython/memory/gc/incminimark.py, rpython/jit/backend/llsupport/gc.py
 use majit_ir::{Const, GcRef, Op, VecAssoc};
-pub use gcreftracer::{GcTable, install_gc_table_walker};
 pub use trace::{ClassTypeLayout, TypeEntry, TypeInfo, TypeInfoLayout};
 
 pub mod collector;

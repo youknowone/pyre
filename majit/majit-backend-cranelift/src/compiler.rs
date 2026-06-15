@@ -4005,6 +4005,17 @@ fn resolve_opref(
          emitted this null OpRef must bind it (or rewrite the op) \
          instead of relying on a zero-load fallback"
     );
+    // rewrite.py:1100 post-flip invariant: `remove_constptr` routes every
+    // non-null reference constant *operand* through `LoadFromGcTable`, so
+    // a non-null `ConstPtr` must never reach op-arg resolution (which would
+    // bake an immortal, un-forwarded immediate). This path is op-arg-only;
+    // failargs resolve through `resolve_failarg_opref` and keep their
+    // constants. Null pointers stay inline and are allowed.
+    debug_assert!(
+        !opref.as_const_ptr().is_some_and(|g| !g.is_null()),
+        "cranelift resolve_opref: non-null ConstPtr {opref:?} reached op-arg \
+         resolution — remove_constptr must have replaced it with LoadFromGcTable"
+    );
     // RPython boxes/inputargs are distinct from Consts even when pyre's
     // compact OpRef numbering collides with an entry in the constant pool.
     // Once an OpRef has a declared variable, the variable is authoritative.

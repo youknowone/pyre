@@ -2433,8 +2433,7 @@ impl<'a> AssemblerARM64<'a> {
             // The slot value is GC-forwarded in place by the gc_table
             // root walker, so each load observes the relocated object.
             OpCode::LoadFromGcTable => {
-                if let (Some(Loc::Immed(idx)), Some(Loc::Reg(dst))) =
-                    (arglocs.first(), result_loc)
+                if let (Some(Loc::Immed(idx)), Some(Loc::Reg(dst))) = (arglocs.first(), result_loc)
                 {
                     let slot_addr = self.gc_table_base + (idx.value as usize) * WORD;
                     self.emit_mov_imm64(dst.value as u32, slot_addr as i64);
