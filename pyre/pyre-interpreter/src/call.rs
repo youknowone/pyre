@@ -542,7 +542,31 @@ fn call_builtin_code_positional(code: PyObjectRef, args: &[PyObjectRef]) -> PyRe
     func(args)
 }
 
+/// Leaf execution mode for a user-function call reached through
+/// [`call_callable_with_mode`].
+///
+/// `Jit` routes through the injected JIT-aware eval override
+/// (`call_user_function`); `Plain` routes through the interpreter-only
+/// eval (`call_user_function_plain`).  The callable-kind dispatch
+/// (method / type / staticmethod / classmethod / instance-`__call__`) is
+/// identical for both — only the leaf executor differs — so the two entry
+/// points share one body instead of a stripped-down copy.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CallMode {
+    Jit,
+    Plain,
+}
+
 pub fn call_callable(frame: &mut PyFrame, callable: PyObjectRef, args: &[PyObjectRef]) -> PyResult {
+    call_callable_with_mode(frame, callable, args, CallMode::Jit)
+}
+
+fn call_callable_with_mode(
+    frame: &mut PyFrame,
+    callable: PyObjectRef,
+    args: &[PyObjectRef],
+    mode: CallMode,
+) -> PyResult {
     let callable = crate::baseobjspace::unwrap_cell(callable);
     if unsafe { pyre_object::is_method(callable) } {
         let func = unsafe { pyre_object::w_method_get_func(callable) };
@@ -559,22 +583,22 @@ pub fn call_callable(frame: &mut PyFrame, callable: PyObjectRef, args: &[PyObjec
             call_args.push(receiver);
         }
         call_args.extend_from_slice(args);
-        return call_callable(frame, func, &call_args);
+        return call_callable_with_mode(frame, func, &call_args, mode);
     }
     if unsafe { pyre_object::is_type(callable) } {
-        return type_descr_call(frame, callable, args);
+        return type_descr_call_with_mode(frame, callable, args, mode);
     }
 
     // staticmethod → unwrap
     // PyPy: function.py StaticMethod.descr_staticmethod__call__
     if unsafe { pyre_object::is_staticmethod(callable) } {
         let func = unsafe { pyre_object::w_staticmethod_get_func(callable) };
-        return call_callable(frame, func, args);
+        return call_callable_with_mode(frame, func, args, mode);
     }
     // classmethod → unwrap
     if unsafe { pyre_object::is_classmethod(callable) } {
         let func = unsafe { pyre_object::w_classmethod_get_func(callable) };
-        return call_callable(frame, func, args);
+        return call_callable_with_mode(frame, func, args, mode);
     }
 
     // Instance with __call__ — PyPy: descroperation.py descr_call
@@ -584,7 +608,7 @@ pub fn call_callable(frame: &mut PyFrame, callable: PyObjectRef, args: &[PyObjec
             let mut call_args = Vec::with_capacity(1 + args.len());
             call_args.push(callable);
             call_args.extend_from_slice(args);
-            return call_callable(frame, call_fn, &call_args);
+            return call_callable_with_mode(frame, call_fn, &call_args, mode);
         }
     }
 
@@ -628,7 +652,10 @@ pub fn call_callable(frame: &mut PyFrame, callable: PyObjectRef, args: &[PyObjec
             let code = unsafe { crate::getcode(callable) };
             call_builtin_code_positional(code as pyre_object::PyObjectRef, args)
         },
-        |callable| call_user_function(frame, callable, args),
+        |callable| match mode {
+            CallMode::Jit => call_user_function(frame, callable, args),
+            CallMode::Plain => call_user_function_plain(frame, callable, args),
+        },
     )
 }
 
@@ -709,40 +736,20 @@ pub fn call_user_function_plain_with_ctx(
 /// Explicit residual-call protocol used by JIT inline framestack concrete
 /// execution.
 ///
-/// PyPy treats residual calls reached from inline execution as opaque slow
-/// paths. They must not accidentally reuse the generic JIT-aware
-/// `call_user_function()` entry, because that can re-enter portal state that
-/// belongs to the outer trace instead of the active inline framestack.
+/// Residual calls reached from inline execution are opaque slow paths. They
+/// must not accidentally reuse the generic JIT-aware `call_user_function()`
+/// entry, because that can re-enter portal state that belongs to the outer
+/// trace instead of the active inline framestack — hence `CallMode::Plain`,
+/// which keeps every user-function leaf (including `__new__`/`__init__`
+/// reached through type construction) on the interpreter-only eval. The
+/// callable-kind dispatch is otherwise identical to `call_callable`, so both
+/// share `call_callable_with_mode` rather than maintaining a divergent copy.
 pub fn call_callable_inline_residual(
-    frame: &PyFrame,
+    frame: &mut PyFrame,
     callable: PyObjectRef,
     args: &[PyObjectRef],
 ) -> PyResult {
-    if unsafe { pyre_object::is_method(callable) } {
-        let func = unsafe { pyre_object::w_method_get_func(callable) };
-        let receiver = unsafe {
-            let w_self = pyre_object::w_method_get_self(callable);
-            if !w_self.is_null() && !pyre_object::is_none(w_self) {
-                w_self
-            } else {
-                pyre_object::w_method_get_class(callable)
-            }
-        };
-        let mut call_args = Vec::with_capacity(1 + args.len());
-        if !receiver.is_null() && unsafe { !pyre_object::is_none(receiver) } {
-            call_args.push(receiver);
-        }
-        call_args.extend_from_slice(args);
-        return call_callable_inline_residual(frame, func, &call_args);
-    }
-    dispatch_callable(
-        callable,
-        |callable| {
-            let code = unsafe { crate::getcode(callable) };
-            call_builtin_code_positional(code as pyre_object::PyObjectRef, args)
-        },
-        |callable| call_user_function_plain(frame, callable, args),
-    )
+    call_callable_with_mode(frame, callable, args, CallMode::Plain)
 }
 
 // ── __build_class__ implementation ───────────────────────────────────
@@ -3035,7 +3042,12 @@ pub fn set_build_class_exec_ctx(ctx: *const crate::PyExecutionContext) {
 // ── Type calling (instance creation) ─────────────────────────────────
 // PyPy equivalent: typeobject.py descr_call → __new__ + __init__
 
-fn type_descr_call(frame: &mut PyFrame, w_type: PyObjectRef, args: &[PyObjectRef]) -> PyResult {
+fn type_descr_call_with_mode(
+    frame: &mut PyFrame,
+    w_type: PyObjectRef,
+    args: &[PyObjectRef],
+    mode: CallMode,
+) -> PyResult {
     // Step 1: Look up __new__ via type MRO → allocate instance
     // PyPy: typeobject.py descr_call → w_type.lookup_where('__new__'),
     // then bind/call the resulting descriptor with w_type as the first arg.
@@ -3045,7 +3057,7 @@ fn type_descr_call(frame: &mut PyFrame, w_type: PyObjectRef, args: &[PyObjectRef
             let mut new_args = Vec::with_capacity(1 + args.len());
             new_args.push(w_type);
             new_args.extend_from_slice(args);
-            call_callable(frame, new_fn, &new_args)?
+            call_callable_with_mode(frame, new_fn, &new_args, mode)?
         } else {
             // Default: allocate bare instance
             pyre_object::w_instance_new(w_type)
@@ -3060,7 +3072,7 @@ fn type_descr_call(frame: &mut PyFrame, w_type: PyObjectRef, args: &[PyObjectRef
             let mut init_args = Vec::with_capacity(1 + args.len());
             init_args.push(instance);
             init_args.extend_from_slice(args);
-            let init_result = call_callable(frame, init_fn, &init_args)?;
+            let init_result = call_callable_with_mode(frame, init_fn, &init_args, mode)?;
             check_init_returned_none(init_result)?;
         }
     }
