@@ -1372,14 +1372,22 @@ fn reserve_local_ref_colors_in_place(
 /// re-separated, so the resume reverse map stays non-injective.
 ///
 /// This simulates the same in-order union-find merge the regalloc applies
-/// and skips any pair whose union would place two different frame-local
-/// slots — or a frame-local slot and a stack slot — in one group.  A
-/// skipped pair's endpoints get a `*_copy` at flatten time instead of
-/// sharing a register — correct, since they hold distinct frame slots.
-/// Two stack slots MAY still coalesce (their colors are allowed to alias),
-/// matching [`collect_distinct_slot_interference_pairs`], so within-slot
-/// pairs and stack↔stack pairs are kept.  Splice-only (production passes
-/// the unfiltered pairs and is byte-identical).
+/// and skips any pair whose union would place two different frame slots —
+/// two distinct frame-local slots, two distinct stack slots, or a
+/// frame-local and a stack slot — in one group.  A skipped pair's
+/// endpoints get a `*_copy` at flatten time instead of sharing a register —
+/// correct, since they hold distinct frame slots.  Two distinct stack slots
+/// must not coalesce either: a guard compare's two operands occupy adjacent
+/// stack slots and are simultaneously live, so merging them aliases one
+/// register across both operands and the pre-merge voids the SSA-liveness
+/// edge that would otherwise keep them apart (the assumption in
+/// [`collect_distinct_slot_interference_pairs`] that simultaneously-live
+/// stack slots interfere through normal liveness only holds once the
+/// pre-merge no longer collapses them).  Distinct stack slots that are
+/// disjoint-live stay free to share a color — the chordal coloring aliases
+/// them when no interference edge forces them apart, so this only forbids
+/// the union-find MERGE, not color reuse.  Only WITHIN-slot pairs survive.
+/// Splice-only (production passes the unfiltered pairs and is byte-identical).
 fn filter_cross_slot_coalesce_pairs(
     pairs: &[(super::flow::VariableId, super::flow::VariableId)],
     walker_slot_for_variable: &[Option<u16>],
@@ -1412,15 +1420,29 @@ fn filter_cross_slot_coalesce_pairs(
     };
     let local_of =
         |id: VariableId| -> Option<u16> { slot_of(id).filter(|s| (*s as usize) < nlocals) };
-    let is_stack =
-        |id: VariableId| -> bool { slot_of(id).is_some_and(|s| (s as usize) >= nlocals) };
+    let stack_of =
+        |id: VariableId| -> Option<u16> { slot_of(id).filter(|s| (*s as usize) >= nlocals) };
+    // Claim at most one slot of a given kind for the merged group, treating
+    // a second distinct slot of that kind as a conflict.  Returns the
+    // claimed slot (if any) or signals a conflict.
+    let claim_slot = |candidates: [Option<u16>; 4]| -> Result<Option<u16>, ()> {
+        let mut claimed: Option<u16> = None;
+        for s in candidates.into_iter().flatten() {
+            match claimed {
+                None => claimed = Some(s),
+                Some(c) if c == s => {}
+                Some(_) => return Err(()),
+            }
+        }
+        Ok(claimed)
+    };
     let mut parent: HashMap<VariableId, VariableId> = HashMap::new();
     // Frame-local slot claimed by each union-find root (absent = the group
     // touches no frame-local slot).
     let mut group_local: HashMap<VariableId, u16> = HashMap::new();
-    // Roots whose group already touches at least one stack slot.
-    let mut group_has_stack: std::collections::HashSet<VariableId> =
-        std::collections::HashSet::new();
+    // Stack slot claimed by each union-find root (absent = the group touches
+    // no stack slot).
+    let mut group_stack: HashMap<VariableId, u16> = HashMap::new();
     let mut kept = Vec::with_capacity(pairs.len());
     for &(a, b) in pairs {
         parent.entry(a).or_insert(a);
@@ -1434,45 +1456,39 @@ fn filter_cross_slot_coalesce_pairs(
         // The single frame-local slot the merged group may claim, or a
         // conflict if the two groups + raw endpoints name 2+ distinct
         // frame-local slots.
-        let mut claimed: Option<u16> = None;
-        let mut conflict = false;
-        for s in [
+        let Ok(claimed_local) = claim_slot([
             group_local.get(&ra).copied(),
             group_local.get(&rb).copied(),
             local_of(a),
             local_of(b),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            match claimed {
-                None => claimed = Some(s),
-                Some(c) if c == s => {}
-                Some(_) => {
-                    conflict = true;
-                    break;
-                }
-            }
-        }
-        if conflict {
+        ]) else {
             continue;
-        }
-        let merged_has_stack = group_has_stack.contains(&ra)
-            || group_has_stack.contains(&rb)
-            || is_stack(a)
-            || is_stack(b);
+        };
+        // Likewise the single stack slot the merged group may claim: two
+        // distinct stack slots hold simultaneously-live values (e.g. the
+        // two operands of a guard compare), so merging them would alias one
+        // register across both and the pre-merge would void the SSA-liveness
+        // edge that keeps them apart.  Reject the cross-slot stack merge.
+        let Ok(claimed_stack) = claim_slot([
+            group_stack.get(&ra).copied(),
+            group_stack.get(&rb).copied(),
+            stack_of(a),
+            stack_of(b),
+        ]) else {
+            continue;
+        };
         // A frame-local slot must not share a register group with any stack
-        // slot (① local↔stack collision), so reject a merge that would put
-        // a claimed local and a stack slot together.
-        if claimed.is_some() && merged_has_stack {
+        // slot (local↔stack collision), so reject a merge that would put a
+        // claimed local and a claimed stack slot together.
+        if claimed_local.is_some() && claimed_stack.is_some() {
             continue;
         }
         parent.insert(rb, ra);
-        if let Some(s) = claimed {
+        if let Some(s) = claimed_local {
             group_local.insert(ra, s);
         }
-        if merged_has_stack {
-            group_has_stack.insert(ra);
+        if let Some(s) = claimed_stack {
+            group_stack.insert(ra, s);
         }
         kept.push((a, b));
     }
@@ -10692,20 +10708,22 @@ mod tests {
         assert!(pairs.is_empty());
     }
 
-    /// The coalesce filter drops a pair that would merge a frame
-    /// local with a stack slot (keeping the local↔stack interference edge
-    /// effective), but keeps a pair that merges two stack slots.
+    /// The coalesce filter drops any pair that would merge two distinct
+    /// frame slots — local↔stack AND stack↔stack — but keeps a within-slot
+    /// pair (two Variables pinned to the same stack slot).
     #[test]
-    fn filter_cross_slot_coalesce_pairs_rejects_local_stack_keeps_stack_stack() {
-        // V0 → local slot 0; V1 → stack slot 3; V2 → stack slot 4.
-        let walker_slot_for_variable = vec![Some(0u16), Some(3u16), Some(4u16)];
-        // local↔stack pair (V0,V1) must be dropped; stack↔stack (V1,V2) kept.
+    fn filter_cross_slot_coalesce_pairs_rejects_all_cross_slot_merges() {
+        // V0 → local slot 0; V1,V3 → stack slot 3; V2 → stack slot 4.
+        let walker_slot_for_variable = vec![Some(0u16), Some(3u16), Some(4u16), Some(3u16)];
+        // local↔stack (V0,V1) dropped; cross-slot stack↔stack (V1,V2)
+        // dropped; within-slot stack (V1,V3) kept.
         let pairs = vec![
             (VariableId(0), VariableId(1)),
             (VariableId(1), VariableId(2)),
+            (VariableId(1), VariableId(3)),
         ];
         let kept = filter_cross_slot_coalesce_pairs(&pairs, &walker_slot_for_variable, 1);
-        assert_eq!(kept, vec![(VariableId(1), VariableId(2))]);
+        assert_eq!(kept, vec![(VariableId(1), VariableId(3))]);
     }
 
     /// A single qualifying frame-local slot yields no interference pairs.
