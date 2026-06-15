@@ -1607,6 +1607,9 @@ fn expand_pyre_methods(
 
         let mut unwrap_stmts = Vec::<proc_macro2::TokenStream>::new();
         let mut call_args = Vec::<proc_macro2::TokenStream>::new();
+        let mut param_names = Vec::<String>::new();
+        let mut param_required = Vec::<bool>::new();
+        let mut has_varargs = false;
         for (offset, arg) in inputs.enumerate() {
             let FnArg::Typed(pt) = arg else {
                 return Err(syn::Error::new(
@@ -1615,10 +1618,65 @@ fn expand_pyre_methods(
                 ));
             };
             let arg_idx = offset + first_arg_idx;
+            if is_varargs_param(&pt.ty) {
+                has_varargs = true;
+            }
+            param_names.push(param_name(offset, pt));
+            // Optional iff it has a `#[default(...)]` or is `Option<T>`.
+            param_required.push(arg_default(pt)?.is_none() && option_inner(&pt.ty).is_none());
             let (stmt, ident) = unwrap_arg(arg_idx, pt)?;
             unwrap_stmts.push(stmt);
             call_args.push(quote! { #ident });
         }
+
+        // Keyword-binding preamble (mirrors `#[pyre_function]`): when the
+        // call carried a trailing `__pyre_kw__` dict, rebind positional +
+        // keyword args into a resolved scope keyed by parameter name before
+        // the receiver/arg unwraps run; otherwise the positional fast path
+        // is untouched. Instance methods prepend a `self` slot — filled
+        // positionally — so the receiver index lines up with the bound
+        // scope; static/class methods already carry every slot (including
+        // `cls`) as a typed parameter. Property getters/setters/deleters use
+        // the descriptor calling convention and varargs methods consume the
+        // whole slice, so both opt out.
+        let kwargs_preamble = {
+            let is_property = matches!(
+                kind,
+                MethodKind::Getter(..) | MethodKind::Setter(..) | MethodKind::Deleter(..)
+            );
+            if has_varargs || is_property {
+                quote! {}
+            } else {
+                let mut all_names: Vec<String> = Vec::new();
+                let mut all_required: Vec<bool> = Vec::new();
+                if matches!(kind, MethodKind::Instance) {
+                    all_names.push("self".to_string());
+                    all_required.push(true);
+                }
+                all_names.extend(param_names.iter().cloned());
+                all_required.extend(param_required.iter().copied());
+                let name_lits = all_names.iter().map(|n| quote! { #n });
+                let req_lits = all_required.iter().map(|b| quote! { #b });
+                let fn_name_str = mname.to_string();
+                quote! {
+                    const __PYRE_PARAM_NAMES: &[&str] = &[ #(#name_lits),* ];
+                    const __PYRE_PARAM_REQUIRED: &[bool] = &[ #(#req_lits),* ];
+                    let __pyre_bound_args;
+                    let args: &[::pyre_object::PyObjectRef] =
+                        if crate::builtins::has_builtin_kwargs(args) {
+                            __pyre_bound_args = crate::builtins::bind_builtin_kwargs(
+                                args,
+                                __PYRE_PARAM_NAMES,
+                                __PYRE_PARAM_REQUIRED,
+                                #fn_name_str,
+                            )?;
+                            &__pyre_bound_args
+                        } else {
+                            args
+                        };
+                }
+            }
+        };
 
         let call_inner = quote! { #call_target( #(#call_args),* ) };
         let body = wrap_return(&m.sig.output, call_inner)?;
@@ -1667,6 +1725,7 @@ fn expand_pyre_methods(
             pub fn #wrapper_name(
                 args: &[::pyre_object::PyObjectRef],
             ) -> ::std::result::Result<::pyre_object::PyObjectRef, crate::PyError> {
+                #kwargs_preamble
                 #preamble
                 #(#unwrap_stmts)*
                 #body
