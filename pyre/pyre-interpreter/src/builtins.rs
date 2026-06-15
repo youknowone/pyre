@@ -2361,9 +2361,10 @@ fn make_exc_type_with_init(
                                     "add_note() missing 1 required positional argument: 'note'",
                                 )
                             })?;
-                            // `interp_exceptions.py:238-239` — only
-                            // `str` is accepted.
-                            if w_note.is_null() || !unsafe { pyre_object::is_str(w_note) } {
+                            // `interp_exceptions.py:238-239` — accept
+                            // `str` and any `str` subclass
+                            // (`isinstance_w(w_note, space.w_unicode)`).
+                            if !unsafe { crate::baseobjspace::isinstance_str_w(w_note) } {
                                 return Err(crate::PyError::type_error("note must be a string"));
                             }
                             // `interp_exceptions.py:240-254` — lazy
@@ -2375,7 +2376,9 @@ fn make_exc_type_with_init(
                                 .ok()
                                 .filter(|w| !w.is_null());
                             let notes = match existing {
-                                Some(v) if unsafe { pyre_object::is_list(v) } => v,
+                                Some(v) if unsafe { crate::baseobjspace::isinstance_list_w(v) } => {
+                                    v
+                                }
                                 Some(_) => {
                                     return Err(crate::PyError::type_error(
                                         "Cannot add note: __notes__ is not a list",
@@ -2472,10 +2475,37 @@ pub fn get_build_class_func() -> PyObjectRef {
 
 /// `str(obj)` → convert to string
 pub(crate) fn builtin_str(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    if args.is_empty() {
-        return Ok(w_str_new(""));
+    let (pos, kwargs) = split_builtin_kwargs(args);
+    let obj = match pos.first() {
+        Some(&o) => o,
+        None => return Ok(w_str_new("")),
+    };
+    // `str(object, encoding, errors)` — decode a bytes-like object
+    // (unicodeobject.py:descr_new / unicode_from_encoded_object).  An
+    // encoding or errors of None counts as "not given".
+    let w_encoding = pos
+        .get(1)
+        .copied()
+        .or_else(|| kwarg_get(kwargs, "encoding"));
+    let w_errors = pos.get(2).copied().or_else(|| kwarg_get(kwargs, "errors"));
+    let has_encoding = w_encoding.is_some_and(|w| !unsafe { is_none(w) });
+    let has_errors = w_errors.is_some_and(|w| !unsafe { is_none(w) });
+    if has_encoding || has_errors {
+        if unsafe { is_str(obj) } {
+            return Err(crate::PyError::type_error("decoding str is not supported"));
+        }
+        if !unsafe { pyre_object::bytesobject::is_bytes_like(obj) } {
+            let tn = unsafe { (*(*obj).ob_type).name };
+            return Err(crate::PyError::type_error(format!(
+                "decoding to str: need a bytes-like object, {tn} found"
+            )));
+        }
+        let mut decode_args = vec![obj, w_encoding.unwrap_or_else(w_none)];
+        if let Some(e) = w_errors {
+            decode_args.push(e);
+        }
+        return crate::typedef::bytes_method_decode(&decode_args);
     }
-    let obj = args[0];
     unsafe {
         if is_str(obj) {
             // A `str` subclass keeps `ob_type` at STR_TYPE but carries the
@@ -4569,6 +4599,15 @@ pub fn hash_value(obj: PyObjectRef) -> i64 {
             };
             let tup = pyre_object::w_tuple_new(vec![w_len, a, b]);
             return hash_value(tup);
+        }
+        if pyre_object::is_generic_alias(obj) {
+            // GenericAlias.__hash__ (`_pypy_generic_alias.py:82`) —
+            // `hash(self.__origin__) ^ hash(self.__args__)`.  Resolved
+            // here because `hash_w` does not consult a typedef `__hash__`
+            // for builtin W_Roots.
+            let origin = pyre_object::w_generic_alias_get_origin(obj);
+            let args = pyre_object::w_generic_alias_get_args(obj);
+            return hash_value(origin) ^ hash_value(args);
         }
         if pyre_object::is_instance(obj) {
             let w_type = pyre_object::w_instance_get_type(obj);

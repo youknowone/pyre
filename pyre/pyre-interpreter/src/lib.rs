@@ -24,6 +24,7 @@ pub mod executioncontext;
 pub mod frame_array;
 pub mod function;
 pub mod gateway;
+pub mod genericalias;
 pub mod jit_fnaddr;
 pub mod listobject;
 pub mod opcode_ops;

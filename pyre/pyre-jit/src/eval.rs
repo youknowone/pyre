@@ -1687,6 +1687,18 @@ thread_local! {
             <pyre_object::sreobject::W_SRE_Scanner
                 as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
         );
+        // W_GenericAlias (`types.GenericAlias`, PEP 585) — typed payload
+        // via `#[pyre_class]` in AUTO-ID mode.  Its three `PyObjectRef`
+        // fields (origin/args/parameters) are traced edges; registered at
+        // the tail of the tid chain alongside the `_sre` types so no
+        // explicit-id slot above shifts.  Absent from `all_foreign_pytypes`,
+        // so this is the only path that GC-manages it.
+        register_pyre_class(
+            &mut gc,
+            &mut pytype_to_tid,
+            <pyre_object::genericaliasobject::W_GenericAlias
+                as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+        );
         // rclass.py:340-346 — assign subclassrange_{min,max} to each
         // vtable entry. freeze_types() runs assign_inheritance_ids
         // (normalizecalls.py:373-389), then we write the computed ranges

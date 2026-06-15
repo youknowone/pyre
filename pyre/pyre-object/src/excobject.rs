@@ -365,6 +365,17 @@ pub const W_EXCEPTION_GC_PTR_OFFSETS: [usize; 15] = [
 /// GC type id assigned to `W_ExceptionObject` at JitDriver init time.
 pub const W_EXCEPTION_GC_TYPE_ID: u32 = 31;
 
+/// Record an old→young edge when a `W_ExceptionObject` slot
+/// (`W_EXCEPTION_GC_PTR_OFFSETS`) is overwritten after allocation.
+/// No-op while the exception still lives in the nursery; once it is
+/// promoted, the minor collector relies on the remembered set to find
+/// the young pointers reachable only through it. The slot writers below
+/// call this for the same reason `function.rs` barriers its setters.
+#[inline]
+fn exception_write_barrier(obj: PyObjectRef) {
+    crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
+}
+
 /// Fixed payload size (`framework.py:811`).
 pub const W_EXCEPTION_OBJECT_SIZE: usize = std::mem::size_of::<W_ExceptionObject>();
 
@@ -582,6 +593,7 @@ pub unsafe fn w_exception_get_args(obj: PyObjectRef) -> PyObjectRef {
 pub unsafe fn w_exception_set_args(obj: PyObjectRef, args_list: PyObjectRef) {
     unsafe {
         (*(obj as *mut W_ExceptionObject)).args_w = args_list;
+        exception_write_barrier(obj);
     }
 }
 
@@ -609,6 +621,7 @@ pub unsafe fn w_exception_get_cause(obj: PyObjectRef) -> PyObjectRef {
 pub unsafe fn w_exception_set_cause(obj: PyObjectRef, value: PyObjectRef) {
     unsafe {
         (*(obj as *mut W_ExceptionObject)).w_cause = value;
+        exception_write_barrier(obj);
     }
 }
 
@@ -636,6 +649,7 @@ pub unsafe fn w_exception_get_context(obj: PyObjectRef) -> PyObjectRef {
 pub unsafe fn w_exception_set_context(obj: PyObjectRef, value: PyObjectRef) {
     unsafe {
         (*(obj as *mut W_ExceptionObject)).w_context = value;
+        exception_write_barrier(obj);
     }
 }
 
@@ -661,6 +675,7 @@ pub unsafe fn w_exception_get_traceback(obj: PyObjectRef) -> PyObjectRef {
 pub unsafe fn w_exception_set_traceback(obj: PyObjectRef, value: PyObjectRef) {
     unsafe {
         (*(obj as *mut W_ExceptionObject)).w_traceback = value;
+        exception_write_barrier(obj);
     }
 }
 
@@ -681,6 +696,7 @@ pub unsafe fn w_exception_getdict(obj: PyObjectRef) -> PyObjectRef {
         let exc = obj as *mut W_ExceptionObject;
         if (*exc).w_dict.is_null() {
             (*exc).w_dict = crate::w_dict_new();
+            exception_write_barrier(obj);
         }
         (*exc).w_dict
     }
@@ -696,6 +712,7 @@ pub unsafe fn w_exception_getdict(obj: PyObjectRef) -> PyObjectRef {
 pub unsafe fn w_exception_setdict(obj: PyObjectRef, w_dict: PyObjectRef) {
     unsafe {
         (*(obj as *mut W_ExceptionObject)).w_dict = w_dict;
+        exception_write_barrier(obj);
     }
 }
 
@@ -761,6 +778,7 @@ pub unsafe fn w_exception_get_object(obj: PyObjectRef) -> PyObjectRef {
 pub unsafe fn w_exception_set_object(obj: PyObjectRef, value: PyObjectRef) {
     unsafe {
         (*(obj as *mut W_ExceptionObject)).w_object = value;
+        exception_write_barrier(obj);
     }
 }
 
@@ -783,6 +801,7 @@ pub unsafe fn w_exception_get_start(obj: PyObjectRef) -> PyObjectRef {
 pub unsafe fn w_exception_set_start(obj: PyObjectRef, value: PyObjectRef) {
     unsafe {
         (*(obj as *mut W_ExceptionObject)).w_start = value;
+        exception_write_barrier(obj);
     }
 }
 
@@ -805,6 +824,7 @@ pub unsafe fn w_exception_get_end(obj: PyObjectRef) -> PyObjectRef {
 pub unsafe fn w_exception_set_end(obj: PyObjectRef, value: PyObjectRef) {
     unsafe {
         (*(obj as *mut W_ExceptionObject)).w_end = value;
+        exception_write_barrier(obj);
     }
 }
 
@@ -827,6 +847,7 @@ pub unsafe fn w_exception_get_reason(obj: PyObjectRef) -> PyObjectRef {
 pub unsafe fn w_exception_set_reason(obj: PyObjectRef, value: PyObjectRef) {
     unsafe {
         (*(obj as *mut W_ExceptionObject)).w_reason = value;
+        exception_write_barrier(obj);
     }
 }
 
@@ -851,6 +872,7 @@ pub unsafe fn w_exception_get_encoding(obj: PyObjectRef) -> PyObjectRef {
 pub unsafe fn w_exception_set_encoding(obj: PyObjectRef, value: PyObjectRef) {
     unsafe {
         (*(obj as *mut W_ExceptionObject)).w_encoding = value;
+        exception_write_barrier(obj);
     }
 }
 
@@ -874,6 +896,7 @@ pub unsafe fn w_exception_get_errno(obj: PyObjectRef) -> PyObjectRef {
 pub unsafe fn w_exception_set_errno(obj: PyObjectRef, value: PyObjectRef) {
     unsafe {
         (*(obj as *mut W_ExceptionObject)).w_errno = value;
+        exception_write_barrier(obj);
     }
 }
 
@@ -896,6 +919,7 @@ pub unsafe fn w_exception_get_strerror(obj: PyObjectRef) -> PyObjectRef {
 pub unsafe fn w_exception_set_strerror(obj: PyObjectRef, value: PyObjectRef) {
     unsafe {
         (*(obj as *mut W_ExceptionObject)).w_strerror = value;
+        exception_write_barrier(obj);
     }
 }
 
@@ -918,6 +942,7 @@ pub unsafe fn w_exception_get_filename(obj: PyObjectRef) -> PyObjectRef {
 pub unsafe fn w_exception_set_filename(obj: PyObjectRef, value: PyObjectRef) {
     unsafe {
         (*(obj as *mut W_ExceptionObject)).w_filename = value;
+        exception_write_barrier(obj);
     }
 }
 
@@ -940,6 +965,7 @@ pub unsafe fn w_exception_get_filename2(obj: PyObjectRef) -> PyObjectRef {
 pub unsafe fn w_exception_set_filename2(obj: PyObjectRef, value: PyObjectRef) {
     unsafe {
         (*(obj as *mut W_ExceptionObject)).w_filename2 = value;
+        exception_write_barrier(obj);
     }
 }
 
@@ -963,6 +989,7 @@ pub unsafe fn w_exception_get_code(obj: PyObjectRef) -> PyObjectRef {
 pub unsafe fn w_exception_set_code(obj: PyObjectRef, value: PyObjectRef) {
     unsafe {
         (*(obj as *mut W_ExceptionObject)).w_code = value;
+        exception_write_barrier(obj);
     }
 }
 

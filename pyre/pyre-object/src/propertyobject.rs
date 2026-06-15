@@ -74,6 +74,9 @@ pub unsafe fn w_property_set_doc(obj: PyObjectRef, w_doc: PyObjectRef) {
     let prop = obj as *mut W_PropertyObject;
     (*prop).w_doc = w_doc;
     (*prop).getter_doc = false;
+    // Record the old→young edge: `w_doc` is a traced slot and the
+    // property may already have been promoted out of the nursery.
+    crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
 }
 
 /// `descriptor.py:199-204` — stamp a doc inherited from `fget.__doc__`
@@ -82,6 +85,7 @@ pub unsafe fn w_property_set_getter_doc(obj: PyObjectRef, w_doc: PyObjectRef) {
     let prop = obj as *mut W_PropertyObject;
     (*prop).w_doc = w_doc;
     (*prop).getter_doc = true;
+    crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
 }
 
 #[inline]

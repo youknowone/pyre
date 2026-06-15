@@ -511,6 +511,17 @@ pub fn init_typeobjects() {
             new_typeobject_with_base("types.UnionType", init_union_type, object_type) as usize,
         );
 
+        // types.GenericAlias — PyPy: _pypy_generic_alias.py GenericAlias,
+        // bases=(object,)
+        reg.insert(
+            &pyre_object::GENERIC_ALIAS_TYPE as *const PyType as usize,
+            new_typeobject_with_base(
+                "types.GenericAlias",
+                crate::genericalias::init_generic_alias_type,
+                object_type,
+            ) as usize,
+        );
+
         // slice — PyPy: sliceobject.py, bases=(object,)
         reg.insert(
             &pyre_object::sliceobject::SLICE_TYPE as *const PyType as usize,
@@ -1480,6 +1491,16 @@ fn arg_type_name(obj: PyObjectRef) -> String {
 
 fn init_list_type(ns: &mut DictStorage) {
     dict_storage_store(ns, "__new__", make_new_descr(list_descr_new));
+    // listobject.py:2486 __class_getitem__ = interp2app(
+    //     generic_alias_class_getitem, as_classmethod=True)
+    dict_storage_store(
+        ns,
+        "__class_getitem__",
+        pyre_object::propertyobject::w_classmethod_new(make_builtin_function(
+            "__class_getitem__",
+            crate::genericalias::generic_alias_class_getitem,
+        )),
+    );
     dict_storage_store(
         ns,
         "append",
@@ -2184,6 +2205,16 @@ fn init_str_type(ns: &mut DictStorage) {
 
 fn init_dict_type(ns: &mut DictStorage) {
     dict_storage_store(ns, "__new__", make_new_descr(dict_descr_new));
+    // dictmultiobject.py:446 __class_getitem__ = interp2app(
+    //     generic_alias_class_getitem, as_classmethod=True)
+    dict_storage_store(
+        ns,
+        "__class_getitem__",
+        pyre_object::propertyobject::w_classmethod_new(make_builtin_function(
+            "__class_getitem__",
+            crate::genericalias::generic_alias_class_getitem,
+        )),
+    );
     // `dictmultiobject.py:137-138 descr_init` →
     // `init_or_update(space, self, __args__, 'dict')`
     dict_storage_store(
@@ -3594,6 +3625,16 @@ fn init_mappingproxy_type(ns: &mut DictStorage) {
 
 fn init_tuple_type(ns: &mut DictStorage) {
     dict_storage_store(ns, "__new__", make_new_descr(tuple_descr_new));
+    // tupleobject.py:354 __class_getitem__ = interp2app(
+    //     generic_alias_class_getitem, as_classmethod=True)
+    dict_storage_store(
+        ns,
+        "__class_getitem__",
+        pyre_object::propertyobject::w_classmethod_new(make_builtin_function(
+            "__class_getitem__",
+            crate::genericalias::generic_alias_class_getitem,
+        )),
+    );
     dict_storage_store(
         ns,
         "index",
@@ -5949,11 +5990,23 @@ fn init_property_type(ns: &mut DictStorage) {
                     .or_else(|| crate::builtins::kwarg_get(kwargs, name))
                     .unwrap_or(pyre_object::PY_NULL)
             };
+            let cls = pos.first().copied().unwrap_or(pyre_object::PY_NULL);
             let fget = arg(1, "fget");
             let fset = arg(2, "fset");
             let fdel = arg(3, "fdel");
             let w_doc = arg(4, "doc");
             let prop = pyre_object::w_property_new(fget, fset, fdel);
+            // typeobject.py:511 `allocate_instance(W_Property, w_subtype)`
+            // — `generic_new_descr(W_Property)` honours the subtype, so a
+            // `property` subclass instance keeps its own class.
+            let property_type =
+                crate::typedef::gettypeobject(&pyre_object::propertyobject::PROPERTY_TYPE);
+            if !cls.is_null() && !std::ptr::eq(cls, property_type) {
+                check_user_subclass(property_type, cls)?;
+                unsafe {
+                    (*prop).w_class = cls;
+                }
+            }
             unsafe {
                 // descriptor.py:193 `self.w_doc = w_doc`
                 if !w_doc.is_null() && !pyre_object::is_none(w_doc) {
@@ -5993,10 +6046,12 @@ fn int_as_plain_int(args: &[PyObjectRef]) -> PyObjectRef {
 }
 
 // ── Numeric binary-op dunders ────────────────────────────────────────
-// Each forwards to the object-space op when the operand is numerically
-// compatible, else returns NotImplemented so the interpreter can try the
-// reflected method.  `descroperation` fast-paths the concrete int/float,
-// so these never re-dispatch back through the dunder.
+// Each computes the concrete int/long/float result when the operand is
+// numerically compatible, else returns NotImplemented so the interpreter
+// can try the reflected method.  These resolve to the `*_builtin`
+// type-slot computations, not the operator-level dispatch — a slot wired
+// to the operator would re-enter it when the other operand is a numeric
+// subclass that overrides the special method, and recurse without bound.
 macro_rules! int_binop_fwd {
     ($name:ident, $op:path) => {
         fn $name(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -6048,40 +6103,82 @@ macro_rules! float_binop_rev {
     };
 }
 
-int_binop_fwd!(int_dunder_add, crate::objspace::descroperation::add);
-int_binop_rev!(int_dunder_radd, crate::objspace::descroperation::add);
-int_binop_fwd!(int_dunder_sub, crate::objspace::descroperation::sub);
-int_binop_rev!(int_dunder_rsub, crate::objspace::descroperation::sub);
-int_binop_fwd!(int_dunder_mul, crate::objspace::descroperation::mul);
-int_binop_rev!(int_dunder_rmul, crate::objspace::descroperation::mul);
-int_binop_fwd!(int_dunder_truediv, crate::objspace::descroperation::truediv);
+int_binop_fwd!(int_dunder_add, crate::objspace::descroperation::add_builtin);
+int_binop_rev!(
+    int_dunder_radd,
+    crate::objspace::descroperation::add_builtin
+);
+int_binop_fwd!(int_dunder_sub, crate::objspace::descroperation::sub_builtin);
+int_binop_rev!(
+    int_dunder_rsub,
+    crate::objspace::descroperation::sub_builtin
+);
+int_binop_fwd!(int_dunder_mul, crate::objspace::descroperation::mul_builtin);
+int_binop_rev!(
+    int_dunder_rmul,
+    crate::objspace::descroperation::mul_builtin
+);
+int_binop_fwd!(
+    int_dunder_truediv,
+    crate::objspace::descroperation::truediv_builtin
+);
 int_binop_rev!(
     int_dunder_rtruediv,
-    crate::objspace::descroperation::truediv
+    crate::objspace::descroperation::truediv_builtin
 );
 int_binop_fwd!(
     int_dunder_floordiv,
-    crate::objspace::descroperation::floordiv
+    crate::objspace::descroperation::floordiv_builtin
 );
 int_binop_rev!(
     int_dunder_rfloordiv,
-    crate::objspace::descroperation::floordiv
+    crate::objspace::descroperation::floordiv_builtin
 );
-int_binop_fwd!(int_dunder_mod, crate::objspace::descroperation::mod_);
-int_binop_rev!(int_dunder_rmod, crate::objspace::descroperation::mod_);
-int_binop_fwd!(int_dunder_divmod, crate::objspace::descroperation::divmod);
-int_binop_rev!(int_dunder_rdivmod, crate::objspace::descroperation::divmod);
-int_binop_rev!(int_dunder_rpow, crate::objspace::descroperation::pow);
-int_binop_fwd!(int_dunder_lshift, crate::objspace::descroperation::lshift);
-int_binop_rev!(int_dunder_rlshift, crate::objspace::descroperation::lshift);
-int_binop_fwd!(int_dunder_rshift, crate::objspace::descroperation::rshift);
-int_binop_rev!(int_dunder_rrshift, crate::objspace::descroperation::rshift);
-int_binop_fwd!(int_dunder_and, crate::objspace::descroperation::and_);
-int_binop_rev!(int_dunder_rand, crate::objspace::descroperation::and_);
-int_binop_fwd!(int_dunder_or, crate::objspace::descroperation::or_);
-int_binop_rev!(int_dunder_ror, crate::objspace::descroperation::or_);
-int_binop_fwd!(int_dunder_xor, crate::objspace::descroperation::xor);
-int_binop_rev!(int_dunder_rxor, crate::objspace::descroperation::xor);
+int_binop_fwd!(int_dunder_mod, crate::objspace::descroperation::mod_builtin);
+int_binop_rev!(
+    int_dunder_rmod,
+    crate::objspace::descroperation::mod_builtin
+);
+int_binop_fwd!(
+    int_dunder_divmod,
+    crate::objspace::descroperation::divmod_builtin
+);
+int_binop_rev!(
+    int_dunder_rdivmod,
+    crate::objspace::descroperation::divmod_builtin
+);
+int_binop_rev!(
+    int_dunder_rpow,
+    crate::objspace::descroperation::pow_builtin
+);
+int_binop_fwd!(
+    int_dunder_lshift,
+    crate::objspace::descroperation::lshift_builtin
+);
+int_binop_rev!(
+    int_dunder_rlshift,
+    crate::objspace::descroperation::lshift_builtin
+);
+int_binop_fwd!(
+    int_dunder_rshift,
+    crate::objspace::descroperation::rshift_builtin
+);
+int_binop_rev!(
+    int_dunder_rrshift,
+    crate::objspace::descroperation::rshift_builtin
+);
+int_binop_fwd!(int_dunder_and, crate::objspace::descroperation::and_builtin);
+int_binop_rev!(
+    int_dunder_rand,
+    crate::objspace::descroperation::and_builtin
+);
+int_binop_fwd!(int_dunder_or, crate::objspace::descroperation::or_builtin);
+int_binop_rev!(int_dunder_ror, crate::objspace::descroperation::or_builtin);
+int_binop_fwd!(int_dunder_xor, crate::objspace::descroperation::xor_builtin);
+int_binop_rev!(
+    int_dunder_rxor,
+    crate::objspace::descroperation::xor_builtin
+);
 
 /// `int.__pow__(self, exp[, mod])` — optional modulus routes through the
 /// three-argument modular power.
@@ -6089,49 +6186,82 @@ fn int_dunder_pow(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if unsafe { pyre_object::pyobject::is_int_or_long(args[1]) } {
         if args.len() >= 3 {
             if unsafe { pyre_object::pyobject::is_none(args[2]) } {
-                crate::objspace::descroperation::pow(args[0], args[1])
+                crate::objspace::descroperation::pow_builtin(args[0], args[1])
             } else {
                 crate::objspace::descroperation::pow3(args[0], args[1], args[2])
             }
         } else {
-            crate::objspace::descroperation::pow(args[0], args[1])
+            crate::objspace::descroperation::pow_builtin(args[0], args[1])
         }
     } else {
         Ok(pyre_object::w_not_implemented())
     }
 }
 
-float_binop_fwd!(float_dunder_add, crate::objspace::descroperation::add);
-float_binop_rev!(float_dunder_radd, crate::objspace::descroperation::add);
-float_binop_fwd!(float_dunder_sub, crate::objspace::descroperation::sub);
-float_binop_rev!(float_dunder_rsub, crate::objspace::descroperation::sub);
-float_binop_fwd!(float_dunder_mul, crate::objspace::descroperation::mul);
-float_binop_rev!(float_dunder_rmul, crate::objspace::descroperation::mul);
+float_binop_fwd!(
+    float_dunder_add,
+    crate::objspace::descroperation::add_builtin
+);
+float_binop_rev!(
+    float_dunder_radd,
+    crate::objspace::descroperation::add_builtin
+);
+float_binop_fwd!(
+    float_dunder_sub,
+    crate::objspace::descroperation::sub_builtin
+);
+float_binop_rev!(
+    float_dunder_rsub,
+    crate::objspace::descroperation::sub_builtin
+);
+float_binop_fwd!(
+    float_dunder_mul,
+    crate::objspace::descroperation::mul_builtin
+);
+float_binop_rev!(
+    float_dunder_rmul,
+    crate::objspace::descroperation::mul_builtin
+);
 float_binop_fwd!(
     float_dunder_truediv,
-    crate::objspace::descroperation::truediv
+    crate::objspace::descroperation::truediv_builtin
 );
 float_binop_rev!(
     float_dunder_rtruediv,
-    crate::objspace::descroperation::truediv
+    crate::objspace::descroperation::truediv_builtin
 );
 float_binop_fwd!(
     float_dunder_floordiv,
-    crate::objspace::descroperation::floordiv
+    crate::objspace::descroperation::floordiv_builtin
 );
 float_binop_rev!(
     float_dunder_rfloordiv,
-    crate::objspace::descroperation::floordiv
+    crate::objspace::descroperation::floordiv_builtin
 );
-float_binop_fwd!(float_dunder_mod, crate::objspace::descroperation::mod_);
-float_binop_rev!(float_dunder_rmod, crate::objspace::descroperation::mod_);
-float_binop_fwd!(float_dunder_divmod, crate::objspace::descroperation::divmod);
+float_binop_fwd!(
+    float_dunder_mod,
+    crate::objspace::descroperation::mod_builtin
+);
+float_binop_rev!(
+    float_dunder_rmod,
+    crate::objspace::descroperation::mod_builtin
+);
+float_binop_fwd!(
+    float_dunder_divmod,
+    crate::objspace::descroperation::divmod_builtin
+);
 float_binop_rev!(
     float_dunder_rdivmod,
-    crate::objspace::descroperation::divmod
+    crate::objspace::descroperation::divmod_builtin
 );
-float_binop_fwd!(float_dunder_pow, crate::objspace::descroperation::pow);
-float_binop_rev!(float_dunder_rpow, crate::objspace::descroperation::pow);
+float_binop_fwd!(
+    float_dunder_pow,
+    crate::objspace::descroperation::pow_builtin
+);
+float_binop_rev!(
+    float_dunder_rpow,
+    crate::objspace::descroperation::pow_builtin
+);
 
 // Rich comparison dunders (`__eq__` / `__ne__` / `__lt__` / `__le__` /
 // `__gt__` / `__ge__`).  Each built-in numeric / sequence type only
@@ -9622,7 +9752,7 @@ fn decode_utf8_with_errors(data: &[u8], err_mode: &str) -> Result<Wtf8Buf, crate
 }
 
 /// bytesobject.py descr_decode → stringmethods.py:196 decode_object
-fn bytes_method_decode(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub(crate) fn bytes_method_decode(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(!args.is_empty());
     let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) };
     // unicodeobject.py:1669 — encoding/errors must be str (space.text_w)
@@ -10708,6 +10838,16 @@ fn set_method_ge(
 
 fn init_set_type(ns: &mut DictStorage) {
     dict_storage_store(ns, "__new__", make_new_descr(set_descr_new));
+    // setobject.py:528 __class_getitem__ = gateway.interp2app(
+    //     generic_alias_class_getitem, as_classmethod=True)
+    dict_storage_store(
+        ns,
+        "__class_getitem__",
+        pyre_object::propertyobject::w_classmethod_new(make_builtin_function(
+            "__class_getitem__",
+            crate::genericalias::generic_alias_class_getitem,
+        )),
+    );
     dict_storage_store(
         ns,
         "__init__",
@@ -10896,6 +11036,16 @@ fn init_set_type(ns: &mut DictStorage) {
 
 fn init_frozenset_type(ns: &mut DictStorage) {
     dict_storage_store(ns, "__new__", make_new_descr(frozenset_descr_new));
+    // setobject.py:661 __class_getitem__ = gateway.interp2app(
+    //     generic_alias_class_getitem, as_classmethod=True)
+    dict_storage_store(
+        ns,
+        "__class_getitem__",
+        pyre_object::propertyobject::w_classmethod_new(make_builtin_function(
+            "__class_getitem__",
+            crate::genericalias::generic_alias_class_getitem,
+        )),
+    );
     init_setlike_common(ns);
 }
 

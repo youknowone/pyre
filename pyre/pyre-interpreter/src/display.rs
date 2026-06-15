@@ -524,6 +524,9 @@ pub unsafe fn py_repr(obj: PyObjectRef) -> Result<String, crate::PyError> {
                 }
             }
             parts.join(" | ")
+        } else if std::ptr::eq(tp, &pyre_object::GENERIC_ALIAS_TYPE as *const PyType) {
+            // GenericAlias.__repr__ (`_pypy_generic_alias.py:57`).
+            return crate::genericalias::repr(obj);
         } else if std::ptr::eq(tp, &MODULE_TYPE as *const PyType) {
             let name = pyre_object::w_module_get_name(obj);
             format!("<module '{name}'>")

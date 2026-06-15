@@ -571,6 +571,16 @@ pub fn call_callable(frame: &mut PyFrame, callable: PyObjectRef, args: &[PyObjec
         }
     }
 
+    // GenericAlias.__call__ (`_pypy_generic_alias.py:41`) —
+    // `self.__origin__(*args, **kwargs)`, then best-effort
+    // `result.__orig_class__ = self`.
+    if unsafe { pyre_object::is_generic_alias(callable) } {
+        let origin = unsafe { pyre_object::w_generic_alias_get_origin(callable) };
+        let result = call_callable(frame, origin, args)?;
+        let _ = crate::baseobjspace::setattr_str(result, "__orig_class__", callable);
+        return Ok(result);
+    }
+
     let frame_ptr = frame as *mut PyFrame;
     dispatch_callable(
         callable,
@@ -1617,6 +1627,16 @@ pub fn call_with_kwargs(
         }
     }
 
+    // GenericAlias.__call__ (`_pypy_generic_alias.py:41`) —
+    // `self.__origin__(*args, **kwargs)`, then best-effort
+    // `result.__orig_class__ = self`.
+    if unsafe { pyre_object::is_generic_alias(callable) } {
+        let origin = unsafe { pyre_object::w_generic_alias_get_origin(callable) };
+        let result = call_with_kwargs(frame, origin, pos_args, kwargs)?;
+        let _ = crate::baseobjspace::setattr_str(result, "__orig_class__", callable);
+        return Ok(result);
+    }
+
     // Fallback: call_callable with positional args only
     call_callable(frame, callable, pos_args)
 }
@@ -1770,6 +1790,18 @@ pub fn call_function_impl_result(
         if pyre_object::is_classmethod(callable) {
             let func = pyre_object::w_classmethod_get_func(callable);
             return call_function_impl_result(func, args);
+        }
+        // GenericAlias.__call__ (`_pypy_generic_alias.py:41`) —
+        // `self.__origin__(*args, **kwargs)`, then best-effort
+        // `result.__orig_class__ = self`.  Resolved here because the call
+        // path does not consult a typedef `__call__` for builtin W_Roots.
+        if pyre_object::is_generic_alias(callable) {
+            let origin = pyre_object::w_generic_alias_get_origin(callable);
+            let result = call_function_impl_result(origin, args)?;
+            // `except (AttributeError, TypeError): pass` — builtins without
+            // a writable `__dict__` skip the stamp.
+            let _ = crate::baseobjspace::setattr_str(result, "__orig_class__", callable);
+            return Ok(result);
         }
         // Instance with __call__ — PyPy: descroperation.py
         if pyre_object::is_instance(callable) {
@@ -2225,6 +2257,67 @@ fn pack_varargs(code: &crate::CodeObject, args: Vec<PyObjectRef>) -> Vec<PyObjec
     packed
 }
 
+/// Resolve `__mro_entries__` for every base that is not a type.
+///
+/// compiling.py `_update_bases` — for each base that is not a `type`, look up
+/// `__mro_entries__` (getattr, not lookup) and, if present, call it with the
+/// original bases tuple and splice the returned tuple in place.  Returns the
+/// resolved bases and whether any substitution happened.
+fn update_bases(
+    base_args: &[PyObjectRef],
+    w_orig_bases: PyObjectRef,
+) -> Result<(Vec<PyObjectRef>, bool), crate::PyError> {
+    let mut new_bases: Option<Vec<PyObjectRef>> = None;
+    for (i, &w_base) in base_args.iter().enumerate() {
+        if unsafe { pyre_object::is_type(w_base) } {
+            if let Some(nb) = new_bases.as_mut() {
+                nb.push(w_base);
+            }
+            continue;
+        }
+        match crate::baseobjspace::getattr_str(w_base, "__mro_entries__") {
+            Err(e) if e.kind == crate::PyErrorKind::AttributeError => {
+                if let Some(nb) = new_bases.as_mut() {
+                    nb.push(w_base);
+                }
+            }
+            Err(e) => return Err(e),
+            Ok(w_meth) => {
+                let w_new_base = crate::call_function(w_meth, &[w_orig_bases]);
+                if w_new_base.is_null() {
+                    if let Some(err) = take_call_error() {
+                        return Err(err);
+                    }
+                    return Err(crate::PyError::type_error(
+                        "__mro_entries__ must return a tuple",
+                    ));
+                }
+                if !unsafe { pyre_object::is_tuple(w_new_base) } {
+                    return Err(crate::PyError::type_error(
+                        "__mro_entries__ must return a tuple",
+                    ));
+                }
+                if new_bases.is_none() {
+                    new_bases = Some(base_args[..i].to_vec());
+                }
+                let nb = new_bases.as_mut().unwrap();
+                let n = unsafe { pyre_object::w_tuple_len(w_new_base) };
+                for j in 0..n {
+                    if let Some(item) =
+                        unsafe { pyre_object::w_tuple_getitem(w_new_base, j as i64) }
+                    {
+                        nb.push(item);
+                    }
+                }
+            }
+        }
+    }
+    match new_bases {
+        None => Ok((base_args.to_vec(), false)),
+        Some(nb) => Ok((nb, true)),
+    }
+}
+
 /// The real __build_class__(body_fn, name, *bases) implementation.
 ///
 /// PyPy equivalent: pyopcode.py BUILD_CLASS →
@@ -2277,7 +2370,16 @@ pub(crate) fn real_build_class(args: &[PyObjectRef]) -> Result<PyObjectRef, crat
     };
 
     let name = unsafe { pyre_object::w_str_get_value(name_obj) };
-    let bases_tuple = pyre_object::w_tuple_new(base_args.to_vec());
+    // compiling.py:166-167 — resolve __mro_entries__ before metaclass
+    // inference; record the original bases for __orig_bases__ when changed.
+    let w_orig_bases = pyre_object::w_tuple_new(base_args.to_vec());
+    let (resolved_bases, bases_changed) = update_bases(base_args, w_orig_bases)?;
+    let bases_tuple = pyre_object::w_tuple_new(resolved_bases);
+    let w_orig_bases = if bases_changed {
+        Some(w_orig_bases)
+    } else {
+        None
+    };
 
     // If no explicit metaclass, infer from bases (PyPy: calculate_metaclass)
     let w_metaclass = metaclass.or_else(|| {
@@ -2302,7 +2404,14 @@ pub(crate) fn real_build_class(args: &[PyObjectRef]) -> Result<PyObjectRef, crat
         None
     });
 
-    build_class_inner(body_fn, name, bases_tuple, w_metaclass, extra_kwargs)
+    build_class_inner(
+        body_fn,
+        name,
+        bases_tuple,
+        w_metaclass,
+        extra_kwargs,
+        w_orig_bases,
+    )
 }
 
 fn build_class_inner(
@@ -2311,6 +2420,7 @@ fn build_class_inner(
     bases: PyObjectRef,
     w_metaclass: Option<PyObjectRef>,
     extra_kwargs: Option<PyObjectRef>,
+    w_orig_bases: Option<PyObjectRef>,
 ) -> PyResult {
     let w_code = unsafe { crate::getcode(body_fn) };
     let globals = unsafe { function_get_globals(body_fn) };
@@ -2521,6 +2631,23 @@ fn build_class_inner(
                 }
             }
             unsafe { (*class_ns_ptr).fix_ptr() };
+        }
+    }
+
+    // compiling.py:211-212 — when __mro_entries__ rewrote the bases, expose
+    // the user-declared bases via __orig_bases__ in the class namespace.
+    if let Some(w_orig_bases) = w_orig_bases {
+        unsafe {
+            let class_ns = &mut *class_ns_ptr;
+            crate::dict_storage_store(class_ns, "__orig_bases__", w_orig_bases);
+            class_ns.fix_ptr();
+        }
+        if let Some(w_ns) = mapping_namespace {
+            let _ = crate::baseobjspace::setitem(
+                w_ns,
+                pyre_object::w_str_new("__orig_bases__"),
+                w_orig_bases,
+            );
         }
     }
 

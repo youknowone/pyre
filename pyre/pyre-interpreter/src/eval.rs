@@ -3400,6 +3400,32 @@ impl OpcodeStepExecutor for PyFrame {
             }
         }
 
+        // A generic alias has no signature of its own; its __call__
+        // forwards to __origin__(*args, **kwargs).  Split the keyword tail
+        // and route through call_with_kwargs so the origin's own kwargs
+        // handling (e.g. dict.__init__) sees real keywords.
+        if unsafe { pyre_object::is_generic_alias(callable_unwrapped) } {
+            let nkw = if unsafe { pyre_object::is_tuple(kwarg_names) } {
+                unsafe { pyre_object::w_tuple_len(kwarg_names) }
+            } else {
+                0
+            };
+            let n_pos = args.len() - nkw;
+            let pos_args = args[..n_pos].to_vec();
+            let mut kw_entries = Vec::with_capacity(nkw);
+            for ki in 0..nkw {
+                let name = unsafe { pyre_object::w_tuple_getitem(kwarg_names, ki as i64) };
+                if let Some(name_obj) = name {
+                    let key = unsafe { pyre_object::w_str_get_value(name_obj) }.to_string();
+                    kw_entries.push((key, args[n_pos + ki]));
+                }
+            }
+            let result =
+                crate::call::call_with_kwargs(self, callable_unwrapped, &pos_args, &kw_entries)?;
+            self.push(result);
+            return Ok(());
+        }
+
         // Resolve keyword args into positional order.
         // argument.py Arguments._match_signature step: match keywords to
         // argnames, fill defaults, pack *args/**kwargs. PyPy's
