@@ -2199,9 +2199,14 @@ impl<'a> Lowering<'a> {
                             // which narrows to `SomeInstance(root)` so a
                             // field read on the pointee resolves (#298;
                             // see the `Rvalue::Cast` arm for the full
-                            // rationale).
+                            // rationale).  The SOURCE must already be a Ref
+                            // for this to be a genuine `cast_pointer`
+                            // (ptr→ptr); an int→ptr or unknown-source cast
+                            // is `cast_int_to_ptr` territory and aliases
+                            // instead of narrowing to an instance.
                             None => {
-                                if let ValueType::Ref(_) = dst_kind
+                                if matches!(src_kind, Some(ValueType::Ref(_)))
+                                    && let ValueType::Ref(_) = dst_kind
                                     && let Some(root) = tyref_class_root(dest_ty, self.llbc)
                                 {
                                     let res = self.graph.alloc_value_var_with_type(
@@ -2309,7 +2314,7 @@ impl<'a> Lowering<'a> {
             // so reuse the alias path: the cast result Variable is the
             // same as the operand Variable. `as` casts that do not
             // change the JIT-visible kind collapse this way.
-            Rvalue::Cast(_kind, operand, ty) => {
+            Rvalue::Cast(kind, operand, ty) => {
                 let v = self.resolve_operand(mir_bb, operand)?;
                 // #298: a same-bank ptr→ptr cast to a registered struct
                 // root (`obj as *const W_CodeObject`) keeps the i64
@@ -2322,8 +2327,14 @@ impl<'a> Lowering<'a> {
                 // primitives / builtin containers / generics / multi-impl
                 // type-vars), so emit a `__pyre_cast_instance` narrow
                 // whose annotator types the result `SomeInstance(root)`
-                // and whose typer folds to a `cast_pointer`.
-                if let ValueType::Ref(_) = tyref_to_value_type(&ty, self.llbc)
+                // and whose typer folds to a `cast_pointer`.  Gate on the
+                // raw-pointer cast kind: `lltype.cast_pointer`
+                // (`lltype.py:964-975`) is pointer-to-pointer only, and
+                // int-to-pointer is the separate `cast_int_to_ptr`
+                // analyzer, so an `addr_usize as *const Struct` reinterpret
+                // must NOT be narrowed to an instance downcast.
+                if cast_kind_is_raw_ptr(&kind)
+                    && let ValueType::Ref(_) = tyref_to_value_type(&ty, self.llbc)
                     && let Some(root) = tyref_class_root(&ty, self.llbc)
                 {
                     let res = self
