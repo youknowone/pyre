@@ -3145,9 +3145,17 @@ pub(crate) fn lower_dispatch_body(
         lower_dispatch_chain(&mut lowerer, classified_arms, config, &loop_start_label);
 
     // Patch ensure_regs placeholder with actual register counts.
+    // The ref bank must cover the ref-scalar identity slots at
+    // `ref_regs[ref_identity_base..ref_identity_end)`, not just the
+    // r0=program / r1=vable arguments. `MIFrame.setup` sizes `registers_r`
+    // from `jitcode.num_regs_r()` (`pyjitpl.py:88`) and guard-failure
+    // resume reads every ref register out of that bank, so a bank capped
+    // at 2 would leave the ref scalars out of the frame and drop them from
+    // the snapshot. `ref_identity_end` is 0 when there are no ref scalars,
+    // so the no-ref-scalar case keeps the original count of 2.
     {
         let final_i_regs = lowerer.next_reg;
-        let final_r_regs = 2u16; // r0=program, r1=vable (unchanged)
+        let final_r_regs = 2u16.max(ref_identity_end);
         lowerer.statements[ensure_regs_stmt_idx] = quote::quote! {
             __builder.ensure_r_regs(#final_r_regs);
             __builder.ensure_i_regs(#final_i_regs);

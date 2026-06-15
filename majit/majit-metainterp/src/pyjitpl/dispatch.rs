@@ -427,16 +427,60 @@ fn value_as_float_bits(value: Value) -> i64 {
     }
 }
 
+/// Mirror a serialized `BhFieldSpec` onto a `SimpleFieldDescrSpec` so
+/// `make_simple_descr_group_keyed` can rebuild the runtime
+/// `SizeDescr.all_fielddescrs` / per-field `FieldDescr` group with the
+/// parent back-references the optimizer's virtualize pass relies on.
+fn field_spec_from_bh(
+    f: &majit_translate::jitcode::BhFieldSpec,
+) -> majit_ir::descr::SimpleFieldDescrSpec {
+    majit_ir::descr::SimpleFieldDescrSpec {
+        index: f.index,
+        name: f.name.clone(),
+        offset: f.offset,
+        field_size: f.field_size,
+        field_type: f.field_type,
+        is_immutable: f.is_immutable,
+        is_quasi_immutable: f.is_quasi_immutable,
+        flag: f.field_flag,
+        virtualizable: false,
+        index_in_parent: f.index_in_parent,
+    }
+}
+
 /// Convert a canonical `Size` blackhole descr (from the per-jitcode
 /// descr pool) into the optimizer-facing `DescrRef` that `New` /
-/// `NewWithVtable` carry.  Mirrors `descr.py:117-118 SizeDescr(size,
-/// vtable=vtable)`.  The per-field `all_fielddescrs` fan-out arrives
-/// with the field-store opcodes that follow the allocation, so the
-/// size descr built here carries only size + vtable + type identity.
-/// `type_id` narrows the codewriter-side u64 path-hash to the runtime
-/// SizeDescr u32 tid; collisions only affect descr-cache keying, never
-/// per-field tracking (which keys on each SetfieldGc's own FieldDescr).
+/// `NewWithVtable` carry.  Mirrors `descr.py:117-120 get_size_descr` +
+/// `:188 init_size_descr`: when the producer shipped a non-empty
+/// `all_fielddescrs` (a struct-literal `new`), rebuild the cyclic
+/// SizeDescr + per-field FieldDescr group so the optimizer's virtualize
+/// pass reads the full field list off `vinfo.descr.all_fielddescrs()`
+/// (`optimizeopt/info.rs init_fields`, `virtualize.rs` debug_assert).
+/// A transient fieldless allocation carries only size + vtable + type
+/// identity, matching `bh_new`/`bh_new_with_vtable` dispatch descrs.
 fn size_descr_ref_from_bh(descr: &crate::blackhole::BhDescr) -> majit_ir::DescrRef {
+    if let crate::blackhole::BhDescr::Size {
+        size,
+        type_id,
+        vtable,
+        all_fielddescrs,
+        ..
+    } = descr
+    {
+        if !all_fielddescrs.is_empty() {
+            let specs: Vec<_> = all_fielddescrs.iter().map(field_spec_from_bh).collect();
+            let group = majit_ir::descr::make_simple_descr_group_keyed(
+                u32::MAX,
+                *size,
+                *type_id as u32,
+                *type_id,
+                *vtable,
+                &specs,
+            );
+            let sd: majit_ir::DescrRef = group.size_descr;
+            return sd;
+        }
+    }
     let size = descr.as_size();
     let vtable = descr.get_vtable();
     let type_id = descr.get_type_id() as u32;
@@ -460,6 +504,13 @@ fn size_descr_ref_from_bh(descr: &crate::blackhole::BhDescr) -> majit_ir::DescrR
 /// Resolve a plain `Field` blackhole descr (from the per-jitcode descr
 /// pool) to its byte offset plus the optimizer-facing FieldDescr that
 /// getfield_gc / setfield_gc records carry (`descr.py FieldDescr`).
+/// When the producer attached the owning struct's layout (`parent` from
+/// a struct-literal `setfield_gc`), rebuild the descr group so the
+/// FieldDescr carries `index_in_parent` (`descr.py:228`) + `parent_descr
+/// = get_size_descr(STRUCT)` (`descr.py:238`); `optimize_setfield_gc`
+/// (`optimizeopt/virtualize.rs:689`) requires the parent to virtualize
+/// the store.  A parentless field (getfield round-trip / non-virtualized
+/// store) keeps the placeholder builder.
 fn field_descr_ref_from_bh(descr: &crate::blackhole::BhDescr) -> (usize, majit_ir::DescrRef) {
     match descr {
         crate::blackhole::BhDescr::Field {
@@ -467,11 +518,50 @@ fn field_descr_ref_from_bh(descr: &crate::blackhole::BhDescr) -> (usize, majit_i
             field_size,
             field_type,
             field_flag,
+            index_in_parent,
+            parent,
+            name,
             ..
-        } => (
-            *offset,
-            majit_ir::descr::make_field_descr(*offset, *field_size, *field_type, *field_flag),
-        ),
+        } => {
+            if let Some(p) = parent {
+                if !p.all_fielddescrs.is_empty() {
+                    let specs: Vec<_> = p.all_fielddescrs.iter().map(field_spec_from_bh).collect();
+                    // descr.py:218-239 get_field_descr: populate the
+                    // gccache (first-write-wins, idempotent across the
+                    // matching `new`) then return the *cached*
+                    // Arc<FieldDescr>.  The cache (`_cache_size`) keeps the
+                    // parent SizeDescr alive process-wide, so the field's
+                    // Weak parent back-reference upgrades — a freshly built
+                    // group would drop its size descr here (the op only
+                    // carries the field) and dangle the parent.
+                    majit_ir::descr::make_simple_descr_group_keyed(
+                        u32::MAX,
+                        p.size,
+                        p.type_id as u32,
+                        p.type_id,
+                        p.vtable,
+                        &specs,
+                    );
+                    let struct_key = majit_ir::descr::LLType::Struct(p.type_id);
+                    let cached = majit_ir::descr::gc_cache()
+                        .lock()
+                        .unwrap()
+                        ._cache_field
+                        .get(&struct_key)
+                        .and_then(|m| m.get(name.as_str()))
+                        .cloned();
+                    if let Some(fd) = cached {
+                        let fd: majit_ir::DescrRef = fd;
+                        return (*offset, fd);
+                    }
+                    let _ = index_in_parent;
+                }
+            }
+            (
+                *offset,
+                majit_ir::descr::make_field_descr(*offset, *field_size, *field_type, *field_flag),
+            )
+        }
         other => panic!("getfield_gc/setfield_gc: descr is not a Field: {other:?}"),
     }
 }
@@ -6454,7 +6544,7 @@ mod tests {
         // SizeDescr (size from the per-jitcode descr pool) and binds the
         // allocation pointer to the destination ref register.
         let mut builder = JitCodeBuilder::new();
-        builder.new_struct(0, 16, 0xCD);
+        builder.new_struct(0, 16, 0xCD, &[]);
         let jitcode = builder.finish();
 
         let mut ctx = TraceCtx::for_test(0);
@@ -6503,10 +6593,10 @@ mod tests {
         // through the live struct ptr, then read them back.  Exercises the
         // emit -> trace-dispatch -> record path for plain getfield/setfield_gc.
         let mut builder = JitCodeBuilder::new();
-        builder.new_struct(0, 16, 0xCD); // ref reg 0 = Node*
+        builder.new_struct(0, 16, 0xCD, &[(0, false, "value"), (8, true, "next")]); // ref reg 0 = Node*
         builder.load_const_i_value(0, 99); // int reg 0 = 99
-        builder.setfield_gc_i(0, 0, 0); // Node.value = 99
-        builder.setfield_gc_r(0, 0, 8); // Node.next  = Node (self-ref)
+        builder.setfield_gc_i(0, 0, 0, 0xCD, 0); // Node.value = 99
+        builder.setfield_gc_r(0, 0, 8, 0xCD, 1); // Node.next  = Node (self-ref)
         builder.getfield_gc_i(1, 0, 0); // int reg 1 = Node.value
         builder.getfield_gc_r(1, 0, 8); // ref reg 1 = Node.next
         let jitcode = builder.finish();
@@ -6537,6 +6627,27 @@ mod tests {
             .and_then(|d| d.as_field_descr().map(|f| f.offset()));
         assert_eq!(off_i, Some(0));
         assert_eq!(off_r, Some(8));
+
+        // The New's SizeDescr carries the full struct layout
+        // (`descr.py:188 init_size_descr`) so the optimizer can size
+        // `VirtualStructInfo._fields`.
+        let n_fields = recorder.ops()[0]
+            .getdescr()
+            .and_then(|d| d.as_size_descr().map(|s| s.all_fielddescrs().len()));
+        assert_eq!(n_fields, Some(2));
+        // Each setfield FieldDescr carries `index_in_parent` (descr.py:228)
+        // and a parent SizeDescr (descr.py:238) so `optimize_setfield_gc`
+        // virtualizes the store instead of panicking on a `None` parent.
+        let sf_i = recorder.ops()[1].getdescr().and_then(|d| {
+            d.as_field_descr()
+                .map(|f| (f.index_in_parent(), f.get_parent_descr().is_some()))
+        });
+        let sf_r = recorder.ops()[2].getdescr().and_then(|d| {
+            d.as_field_descr()
+                .map(|f| (f.index_in_parent(), f.get_parent_descr().is_some()))
+        });
+        assert_eq!(sf_i, Some((0, true)));
+        assert_eq!(sf_r, Some((1, true)));
     }
 
     #[test]

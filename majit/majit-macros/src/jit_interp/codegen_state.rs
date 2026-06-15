@@ -100,6 +100,31 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
         .filter(|(_, f)| matches!(f.kind, StateFieldKind::Ref(_)))
         .collect();
 
+    // A jitdriver has at most one virtualizable, whose `virtualizable_boxes`
+    // is one flat block carried whole at the loop header (pyjitpl.py:2982).
+    // pyre models a `[int; virt]` array as a `<arr>_ptr`/`<arr>_len` header
+    // plus its element boxes; the loop-close carries those elements out of
+    // the single shared `collect_virtualizable_boxes()` slice, which has no
+    // per-array boundaries. Two `[int; virt]` arrays would need that flat
+    // slice split per array — a shape with no upstream analogue — so reject
+    // it as unsupported rather than emit a close that silently drops every
+    // element box (a desync between the JUMP and the unroll Label).
+    if virt_arrays.len() > 1 {
+        let names = virt_arrays
+            .iter()
+            .map(|(_, f)| f.name.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let message = format!(
+            "state_fields supports at most one [int; virt] array; found {}: {}",
+            virt_arrays.len(),
+            names
+        );
+        return quote! {
+            compile_error!(#message);
+        };
+    }
+
     let num_scalars = scalars.len();
     let num_virt_arrays = virt_arrays.len();
     let num_ref_scalars = ref_scalars.len();
@@ -323,9 +348,9 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
     // element boxes in place of the optimizer's trace-entry-seeded tracker
     // expansion. Dropping `len` here (or putting elements before it) shifts
     // every later slot and breaks the unroll's Label↔Jump virtual-state match.
-    // Emitted only for a single `[int; virt]` array (the macro examples);
-    // multi-virt falls back to the default `collect_jump_args` (ptr+len) to
-    // avoid mis-splitting the shared element block.
+    // Only one `[int; virt]` array is ever present (>1 is rejected at
+    // expansion), so `__boxes[..len-1]` is exactly that array's element
+    // block and needs no per-array split.
     let collect_virt_array_box_parts: Vec<TokenStream> = virt_arrays
         .iter()
         .map(|(_, f)| {
@@ -782,8 +807,10 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
         })
         .collect();
     // Override `JitState::collect_jump_args_with_boxes` only for a single
-    // `[int; virt]` array (tl/tlc/tla/aheui). 0 virt arrays (tlr) and the
-    // multi-virt case fall back to the defaulted trait method (ptr+len).
+    // `[int; virt]` array (tl/tlc/tla/braininterp). With 0 virt arrays
+    // (tlr/tinyframe) the defaulted trait method (scalars + fixed arrays) is
+    // already correct; >1 is rejected above, so the `else` is only the
+    // 0-array case.
     let collect_jump_args_with_boxes_method: TokenStream = if num_virt_arrays == 1 {
         quote! {
             fn collect_jump_args_with_boxes(
@@ -1545,6 +1572,19 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                     __root.int_regs[..__n].to_vec();
                 let __saved_int_values: Vec<Option<i64>> =
                     __root.int_values[..__n].to_vec();
+                // `populate_frame_int_regs` also seeds the ref-scalar
+                // identity slots (`ref_regs[ref_identity_base..]`,
+                // `codegen_state.rs` populate_ref_scalar_parts), so the ref
+                // bank needs the same transient save/restore the int bank
+                // gets — mirrors `record_state_guard`
+                // (`pyjitpl/dispatch.rs:959-1019`).  Without it the ref
+                // scalars stay clobbered in the live frame after the
+                // jitdriver-level GuardAlwaysFails snapshot is built.
+                let __rn = sym.ref_identity_slots_end().min(__root.ref_regs.len());
+                let __saved_ref_regs: Vec<Option<majit_ir::box_ref::BoxRef>> =
+                    __root.ref_regs[..__rn].to_vec();
+                let __saved_ref_values: Vec<Option<i64>> =
+                    __root.ref_values[..__rn].to_vec();
                 sym.populate_frame_int_regs(__root);
                 // pyjitpl.py:2586-2610 `capture_resumedata(framestack,
                 // virtualizable_boxes, virtualref_boxes,
@@ -1562,6 +1602,8 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                 let __root = &mut frames.frames[0];
                 __root.int_regs[..__n].copy_from_slice(&__saved_int_regs);
                 __root.int_values[..__n].copy_from_slice(&__saved_int_values);
+                __root.ref_regs[..__rn].clone_from_slice(&__saved_ref_regs);
+                __root.ref_values[..__rn].copy_from_slice(&__saved_ref_values);
                 Some(__snapshot)
             }
 

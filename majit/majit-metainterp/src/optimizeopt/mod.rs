@@ -837,6 +837,18 @@ pub struct OptContext {
     /// recorder trace that `find_producer_op` otherwise performs on every
     /// miss of the higher-priority stores (the dominant O(n^2) cost on very
     /// large traces, e.g. aheui's logo loop).
+    ///
+    /// No PyPy counterpart: upstream keys producer information on the box
+    /// itself (`box._forwarded` / `PtrInfo`, `optimizer.py`), so a
+    /// positional producer scan never exists there. Pyre's flat
+    /// `OpRef(u32)` has no such per-box slot, so `find_producer_op` scans
+    /// by position; this map is a pure O(1) acceleration of that scan, not
+    /// a new data model. Permitted under the AGENTS.md HashMap rule (3)
+    /// because it is a derived index — its sole invariant is that
+    /// `get(pos)` equals `input_ops.iter().rfind(|o| o.pos == pos)`
+    /// (last occurrence wins), enforced by rebuilding forward (a later
+    /// `insert` at the same key overwrites the earlier) and covered by
+    /// `input_ops_index_last_occurrence_wins`.
     pub(crate) input_ops_index: std::collections::HashMap<OpRef, majit_ir::OpRc>,
     /// optimizer.py:644,679 _last_guard_op — index of the last guard in
     /// new_operations that had full resume data built. Consecutive guards
@@ -4426,6 +4438,15 @@ impl OptContext {
         self.heal_arg_to_canonical(arg);
         if arg.bound_op().is_some() || arg.is_constant() {
             let resolved = arg.get_box_replacement(false);
+            // A non-canonical duplicate operand box resolves to itself
+            // box-native while its position's canonical forwarding lives in
+            // the `OpRef` store (see `resolve_box_box_opt`); defer to the
+            // store, which returns the box unchanged when it holds no entry.
+            if resolved.same_box(arg) {
+                return self.get_box_replacement(arg.to_opref());
+            }
+            // The box-native walk forwarded: that chain is canonical and the
+            // `OpRef` store must agree (migration tripwire).
             #[cfg(debug_assertions)]
             {
                 let legacy = self.get_box_replacement(arg.to_opref());
@@ -4454,6 +4475,23 @@ impl OptContext {
         self.heal_arg_to_canonical(arg);
         if arg.bound_op().is_some() || arg.is_constant() {
             let resolved = arg.get_box_replacement(false);
+            // A non-canonical duplicate operand box (short-preamble replay
+            // handle / position-only export box — the bound-ResOp analog of
+            // the stale `InputArgRc` duplicate documented on `resolve_box_box`)
+            // carries no forwarding on its own `_forwarded` chain, so the
+            // box-native walk resolves it to itself even though the canonical
+            // forwarding for its position lives in the `OpRef` store. When the
+            // box resolves to itself the store is the canonical position
+            // resolution — defer to it, as the InputArg `else` arm and the
+            // "resolve positionally" short-preamble export both do.
+            if resolved.same_box(arg) {
+                return Some(
+                    self.get_box_replacement_box(arg.to_opref())
+                        .unwrap_or(resolved),
+                );
+            }
+            // The box-native walk forwarded: that chain is canonical and the
+            // `OpRef` store must agree (migration tripwire).
             #[cfg(debug_assertions)]
             {
                 let legacy = self.get_box_replacement_box(arg.to_opref());
@@ -8295,6 +8333,52 @@ where
 #[cfg(test)]
 pub(crate) fn seed_empty_guard_snapshots(ops: &[Op]) -> (Vec<Op>, SnapshotBoxes) {
     seed_guard_snapshots_with(ops, |_| Vec::new())
+}
+
+#[cfg(test)]
+mod input_ops_index_tests {
+    use super::*;
+    use majit_ir::OpRef;
+    use majit_ir::resoperation::{Op, OpCode};
+    use std::rc::Rc;
+
+    fn op_at(pos: OpRef) -> majit_ir::OpRc {
+        let op = Op::new(OpCode::SameAsI, &[]);
+        op.pos.set(pos);
+        Rc::new(op)
+    }
+
+    /// `input_ops_index` is a derived O(1) acceleration of
+    /// `input_ops.iter().rfind(|o| o.pos == pos)`. Its sole invariant is
+    /// that when two seeded producers share a position, the LATER one wins —
+    /// matching the `rfind` it replaces and `find_producer_op`'s "a later
+    /// emission at the same position always wins" priority. The forward
+    /// rebuild guarantees this because a later `insert` at the same key
+    /// overwrites the earlier.
+    #[test]
+    fn input_ops_index_last_occurrence_wins() {
+        let mut ctx = OptContext::with_num_inputs_and_start_pos(0, 0, 0, 0);
+        // A position outside any higher-priority store (new_operations,
+        // phase1_emit_ops, resop_refs are all empty here) so the lookup
+        // falls through to input_ops_index.
+        let pos = OpRef::int_op(100);
+        let first = op_at(pos);
+        let last = op_at(pos);
+        ctx.input_ops = vec![first.clone(), last.clone()];
+        ctx.rebuild_input_ops_index();
+
+        let producer = ctx
+            .find_producer_op(pos)
+            .expect("a producer must be found at the seeded position");
+        assert!(
+            Rc::ptr_eq(&producer, &last),
+            "the last occurrence at a shared position must win"
+        );
+        assert!(
+            !Rc::ptr_eq(&producer, &first),
+            "the earlier occurrence must be shadowed by the later one"
+        );
+    }
 }
 
 #[cfg(test)]

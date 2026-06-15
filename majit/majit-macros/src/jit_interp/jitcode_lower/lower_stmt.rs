@@ -87,14 +87,15 @@ impl<'c> Lowerer<'c> {
     /// register itself).
     ///
     /// Anything else (state-field writes, residual side effects,
-    /// bindings later statements may observe) must NOT be dropped: the
-    /// dispatch jitcode IS the recording-time execution, so a dropped
-    /// statement desynchronises the walker from the outer interpreter
-    /// (and the trace from the language semantics). Emit BC_ABORT at
-    /// this position instead — recording stops here if execution ever
-    /// reaches the statement, the executed-prefix queue stays consistent
-    /// for the outer replay (see `ObserverGuard`), and branches that
-    /// never reach it lower untouched.
+    /// bindings later statements may observe) cannot be expressed and
+    /// fails as unsupported (`None`). The codewriter lowers a graph op
+    /// exactly or rejects it — `jtransform.py` `rewrite_operation` raises
+    /// for operations it cannot transform — rather than emitting a
+    /// runtime abort for part of a body. Returning `None` lets the caller
+    /// degrade cleanly: `try_inline_dispatch_arm` rolls back the partial
+    /// emission and the sub-JitCode entry returns `None` too, so the arm
+    /// runs in the interpreter instead of compiling to a trace that
+    /// aborts mid-record.
     fn lower_stmt_fallback(&mut self, stmt: &Stmt, what: &str) -> Option<()> {
         if self.config.is_none() {
             return None;
@@ -111,17 +112,11 @@ impl<'c> Lowerer<'c> {
         }
         if std::env::var_os("MAJIT_MACRO_DEBUG").is_some() {
             eprintln!(
-                "[majit-macro] lower_stmt abort-emit ({what}): {}",
+                "[majit-macro] lower_stmt unsupported ({what}): {}",
                 quote!(#stmt)
             );
         }
-        self.emit_op(
-            OpMeta::terminal(Vec::new()),
-            quote! {
-                __builder.abort();
-            },
-        );
-        Some(())
+        None
     }
 
     pub(super) fn lower_local(&mut self, local: &Local) -> Option<()> {

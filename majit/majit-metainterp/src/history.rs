@@ -2746,9 +2746,36 @@ impl TraceCtx {
         const_ref
     }
 
-    /// pyjitpl.py:2548-2602 generate_guard + capture_resumedata parity:
-    /// record a guard AND attach a minimal snapshot so the optimizer's
-    /// `store_final_boxes_in_guard` finds `rd_resume_position >= 0`.
+    /// `pyjitpl.py:2548-2602 generate_guard` + `:2610 capture_resumedata`:
+    /// record a guard AND attach a resume snapshot so the optimizer's
+    /// `store_final_boxes_in_guard` (`optimizeopt/mod.rs:5897`) reads a
+    /// valid `rd_resume_position >= 0` — `resume.py:396-397` asserts that,
+    /// and the pyre port hard-panics a guard that reaches finish() with
+    /// neither a snapshot nor a patchguardop ancestor (`mod.rs:5938`). The
+    /// single-frame snapshot here is therefore **load-bearing**: removing
+    /// it (reverting to a bare `record_guard`, as on main) panics the
+    /// optimizer for these interpreter-side promotes.
+    ///
+    /// The frame `boxes` / `vable_boxes` / `vref_boxes` are empty because
+    /// `capture_resumedata` (`pyjitpl.py:2610-2625`) walks
+    /// `self.framestack` + `self.virtualizable_boxes` +
+    /// `self.virtualref_boxes`, and `TraceCtx` is the recorder-side trace
+    /// buffer — it holds no `MIFrameStack`, so the live boxes are not
+    /// reachable at this layer. The parity-complete capture lives at the
+    /// dispatch layer: `record_state_guard`
+    /// (`pyjitpl/dispatch.rs`) builds a full snapshot via
+    /// `build_state_field_snapshot(frames, …, virtualizable_boxes,
+    /// virtualref_boxes)` for the state-field JIT guards.
+    ///
+    /// Convergence (forward-resume epic, task #208): when the
+    /// interpreter-side promote path threads the live framestack /
+    /// virtualizable / virtualref boxes into this recorder (the same
+    /// `framestack`-walk `record_state_guard` already performs), the empty
+    /// vectors below are replaced by that capture and this hook matches
+    /// `generate_guard` 1:1. Until then a partial box list would be
+    /// positionally misaligned against the resume reader's per-frame
+    /// register layout, so the snapshot stays minimal rather than
+    /// half-populated.
     fn record_guard_with_snapshot(
         &mut self,
         opcode: OpCode,

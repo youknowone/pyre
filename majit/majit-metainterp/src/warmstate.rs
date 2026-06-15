@@ -396,17 +396,21 @@ pub enum HotResult {
 }
 
 impl WarmEnterState {
+    /// warmstate.py:485-496: a `JC_DONT_TRACE_HERE` cell that has never seen
+    /// a procedure token is retried — immediately the first time
+    /// (`tick = True` when `JC_TRACING_OCCURRED` is unset), then by the
+    /// back-edge counter on subsequent entries. The retry is gated purely on
+    /// `has_seen_a_procedure_token` and `JC_TRACING_OCCURRED`; upstream
+    /// applies no abort-count ceiling here (the abort lifecycle lives in
+    /// `abort_tracing`, which flips the cell to permanent `DONT_TRACE_HERE`),
+    /// so neither does this.
     fn should_start_dont_trace_here_trace(
         &mut self,
         green_key_hash: u64,
         flags: u8,
         has_seen_a_procedure_token: bool,
-        abort_count: u32,
     ) -> bool {
         if flags & jc_flags::DONT_TRACE_HERE == 0 || has_seen_a_procedure_token {
-            return false;
-        }
-        if abort_count >= MAX_TRACE_ABORT_COUNT {
             return false;
         }
         if flags & jc_flags::TRACING_OCCURRED != 0 {
@@ -549,7 +553,6 @@ impl WarmEnterState {
             let is_tracing = cell.is_tracing();
             let flags = cell.flags;
             let has_seen_a_procedure_token = cell.has_seen_a_procedure_token();
-            let abort_count = cell.abort_count;
             if is_compiled {
                 return HotResult::RunCompiled;
             }
@@ -560,7 +563,6 @@ impl WarmEnterState {
                 green_key_hash,
                 flags,
                 has_seen_a_procedure_token,
-                abort_count,
             ) {
                 return self.start_tracing_cell(green_key_hash);
             }
@@ -606,19 +608,13 @@ impl WarmEnterState {
             let is_tracing = cell.is_tracing();
             let flags = cell.flags;
             let has_seen_a_procedure_token = cell.has_seen_a_procedure_token();
-            let abort_count = cell.abort_count;
             if is_compiled {
                 return HotResult::RunCompiled;
             }
             if is_tracing {
                 return HotResult::AlreadyTracing;
             }
-            if self.should_start_dont_trace_here_trace(
-                hash,
-                flags,
-                has_seen_a_procedure_token,
-                abort_count,
-            ) {
+            if self.should_start_dont_trace_here_trace(hash, flags, has_seen_a_procedure_token) {
                 return self.start_tracing_cell_for_key(key);
             }
             if flags & jc_flags::DONT_TRACE_HERE != 0 {

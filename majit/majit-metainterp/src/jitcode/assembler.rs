@@ -7,6 +7,7 @@ use std::cmp::max;
 
 use majit_backend::JitCellToken;
 use majit_ir::OpCode;
+use majit_translate::jitcode::{BhFieldSpec, BhSizeSpec};
 
 use crate::jitcode;
 
@@ -67,6 +68,17 @@ pub struct JitCodeBuilder {
     /// `BC_RESIDUAL_CALL_*` operand is a 2-byte index into this pool
     /// (RPython `j`/`d` argcode → `descrs[idx]` dispatch).
     descrs: Vec<RuntimeBhDescr>,
+    /// `descr.py:108-120` `gccache._cache_size[STRUCT]` analog: the
+    /// per-struct `BhSizeSpec` (size + full `all_fielddescrs`) registered
+    /// when a `new` for that struct type is emitted, so a following
+    /// `setfield_gc_*` can attach the parent SizeDescr plus the field's
+    /// `index_in_parent` to its FieldDescr (`descr.py:238`
+    /// `fielddescr.parent_descr = get_size_descr(...)`).  Keyed by the
+    /// `path_hash` `type_id` the same way `LLType::Struct(type_id)` keys
+    /// the runtime `DescrCache`.  Without it the optimizer's
+    /// `optimize_setfield_gc` (`optimizeopt/virtualize.rs:689`) panics on
+    /// the `get_parent_descr()` of a virtualized struct field.
+    struct_size_specs: std::collections::HashMap<u64, BhSizeSpec>,
     /// Pyre-only bridge for canonical `residual_call_*_v`: the bytecode
     /// itself keeps the RPython shape (`i` funcptr operand + `d`
     /// calldescr operand), while the runtime trace path still needs the
@@ -431,18 +443,88 @@ impl JitCodeBuilder {
 
     /// Emit `new/d>r` (`blackhole.py:1301 bhimpl_new`): allocate a zeroed
     /// struct of `size` bytes; ref result in `dest`. No vtable write.
-    pub fn new_struct(&mut self, dest: u16, size: usize, type_id: u64) {
+    ///
+    /// `fields` is the struct's full `(offset, is_ref, name)` layout in
+    /// `index_in_parent` order (`descr.py:122-126` `init_size_descr`
+    /// populates `SizeDescr.all_fielddescrs` from
+    /// `heaptracker.all_fielddescrs(STRUCT)`).  It is recorded into the
+    /// `Size` descr's `all_fielddescrs` and cached under `type_id` so the
+    /// matching `setfield_gc_*` can resolve the parent SizeDescr and the
+    /// field index; pass an empty slice for a transient allocation with no
+    /// field stores (the optimizer never virtualizes a fieldless New).
+    pub fn new_struct(
+        &mut self,
+        dest: u16,
+        size: usize,
+        type_id: u64,
+        fields: &[(usize, bool, &str)],
+    ) {
         self.touch_ref_reg(dest);
+        let all_fielddescrs = Self::field_specs_from_layout(fields);
+        // descr.py:108-120 get_size_descr + init_size_descr: cache the
+        // full per-struct layout so the matching setfield_gc_* resolves
+        // the parent SizeDescr and field index (descr.py:238).
+        self.struct_size_specs.insert(
+            type_id,
+            BhSizeSpec {
+                size,
+                type_id,
+                vtable: 0,
+                all_fielddescrs: all_fielddescrs.clone(),
+            },
+        );
         let descr = self.add_bh_descr(CanonicalBhDescr::Size {
             size,
             type_id,
             vtable: 0,
             owner: String::new(),
-            all_fielddescrs: Vec::new(),
+            all_fielddescrs,
         });
         self.write_insn("new/d>r");
         self.push_u16(descr);
         self.push_reg_u8(dest, "new result");
+    }
+
+    /// Build `Vec<BhFieldSpec>` from a `(offset, is_ref, name)` layout,
+    /// mirroring `descr.py:230-231 FieldDescr(name, offset, size, flag,
+    /// index_in_parent, is_pure)` for each field.  Scalar fields are one
+    /// machine word (`field_size = 8`); the flag/sign follow the field
+    /// kind (pointer vs signed int).
+    fn field_specs_from_layout(fields: &[(usize, bool, &str)]) -> Vec<BhFieldSpec> {
+        fields
+            .iter()
+            .enumerate()
+            .map(|(idx, &(offset, is_ref, name))| {
+                let (field_type, field_flag, is_field_signed) = if is_ref {
+                    (
+                        majit_ir::value::Type::Ref,
+                        majit_ir::descr::ArrayFlag::Pointer,
+                        false,
+                    )
+                } else {
+                    (
+                        majit_ir::value::Type::Int,
+                        majit_ir::descr::ArrayFlag::Signed,
+                        true,
+                    )
+                };
+                BhFieldSpec {
+                    // descr.py:656 SimpleFieldDescr id is unset until the
+                    // runtime DescrCache mints one; index_in_parent carries
+                    // the structural slot the optimizer indexes by.
+                    index: u32::MAX,
+                    name: name.to_string(),
+                    offset,
+                    field_size: 8,
+                    field_type,
+                    field_flag,
+                    is_field_signed,
+                    is_immutable: false,
+                    is_quasi_immutable: false,
+                    index_in_parent: idx,
+                }
+            })
+            .collect()
     }
 
     /// Build a scalar `Field` descr (one machine word) for a plain
@@ -470,12 +552,73 @@ impl JitCodeBuilder {
         })
     }
 
+    /// Build a `Field` descr for a `setfield_gc_*` on a struct whose
+    /// `new` already registered its layout under `type_id`.  Mirrors
+    /// `descr.py:218-239 get_field_descr`: the descr carries
+    /// `index_in_parent` (`descr.py:228`) and `parent_descr =
+    /// get_size_descr(STRUCT)` (`descr.py:238`).  The optimizer's
+    /// `optimize_setfield_gc` (`optimizeopt/virtualize.rs:689`) requires
+    /// the parent SizeDescr to virtualize the field; a missing
+    /// registration falls back to the placeholder builder (an escaping
+    /// allocation that is never virtualized).
+    fn add_struct_field_descr(
+        &mut self,
+        offset: usize,
+        field_type: majit_ir::value::Type,
+        type_id: u64,
+        index_in_parent: usize,
+    ) -> u16 {
+        let parent = self.struct_size_specs.get(&type_id).cloned();
+        if parent.is_none() {
+            return self.add_scalar_field_descr(offset, field_type);
+        }
+        let (field_flag, is_field_signed) = match field_type {
+            majit_ir::value::Type::Ref => (majit_ir::descr::ArrayFlag::Pointer, false),
+            majit_ir::value::Type::Float => (majit_ir::descr::ArrayFlag::Float, false),
+            _ => (majit_ir::descr::ArrayFlag::Signed, true),
+        };
+        // descr.py:227 name = '%s.%s' % (STRUCT._name, fieldname): take it
+        // from the cached layout so the descr's repr matches the field.
+        let name = parent
+            .as_ref()
+            .and_then(|p| p.all_fielddescrs.get(index_in_parent))
+            .map(|fd| fd.name.clone())
+            .unwrap_or_default();
+        self.add_bh_descr(CanonicalBhDescr::Field {
+            offset,
+            field_size: 8,
+            field_type,
+            field_flag,
+            is_field_signed,
+            is_immutable: false,
+            is_quasi_immutable: false,
+            index_in_parent,
+            parent,
+            name,
+            owner: String::new(),
+        })
+    }
+
     /// Emit `setfield_gc_i/rid` (`blackhole.py:1471 bhimpl_setfield_gc_i`):
     /// store the int in `value_reg` into `struct_reg`'s field at `offset`.
-    pub fn setfield_gc_i(&mut self, struct_reg: u16, value_reg: u16, offset: usize) {
+    /// `type_id` + `index_in_parent` identify the field against the layout
+    /// `new_struct` registered, so the optimizer can virtualize the store.
+    pub fn setfield_gc_i(
+        &mut self,
+        struct_reg: u16,
+        value_reg: u16,
+        offset: usize,
+        type_id: u64,
+        index_in_parent: usize,
+    ) {
         self.touch_ref_reg(struct_reg);
         self.touch_reg(value_reg);
-        let descr = self.add_scalar_field_descr(offset, majit_ir::value::Type::Int);
+        let descr = self.add_struct_field_descr(
+            offset,
+            majit_ir::value::Type::Int,
+            type_id,
+            index_in_parent,
+        );
         self.write_insn("setfield_gc_i/rid");
         self.push_reg_u8(struct_reg, "setfield_gc_i struct");
         self.push_reg_u8(value_reg, "setfield_gc_i value");
@@ -484,10 +627,24 @@ impl JitCodeBuilder {
 
     /// Emit `setfield_gc_r/rrd` (`blackhole.py:1476 bhimpl_setfield_gc_r`):
     /// store the ref in `value_reg` into `struct_reg`'s field at `offset`.
-    pub fn setfield_gc_r(&mut self, struct_reg: u16, value_reg: u16, offset: usize) {
+    /// `type_id` + `index_in_parent` identify the field against the layout
+    /// `new_struct` registered, so the optimizer can virtualize the store.
+    pub fn setfield_gc_r(
+        &mut self,
+        struct_reg: u16,
+        value_reg: u16,
+        offset: usize,
+        type_id: u64,
+        index_in_parent: usize,
+    ) {
         self.touch_ref_reg(struct_reg);
         self.touch_ref_reg(value_reg);
-        let descr = self.add_scalar_field_descr(offset, majit_ir::value::Type::Ref);
+        let descr = self.add_struct_field_descr(
+            offset,
+            majit_ir::value::Type::Ref,
+            type_id,
+            index_in_parent,
+        );
         self.write_insn("setfield_gc_r/rrd");
         self.push_reg_u8(struct_reg, "setfield_gc_r struct");
         self.push_reg_u8(value_reg, "setfield_gc_r value");
@@ -4783,7 +4940,7 @@ mod tests {
     #[test]
     fn canonical_new_struct_emit_uses_size_descr_without_vtable() {
         let mut builder = JitCodeBuilder::new();
-        builder.new_struct(3, 16, 0xCD);
+        builder.new_struct(3, 16, 0xCD, &[]);
         let jitcode = builder.finish();
         let opcode = jitcode::insn_byte("new/d>r");
         assert_eq!(jitcode.code, vec![opcode, 0, 0, 3]);

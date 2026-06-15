@@ -1,8 +1,11 @@
 use super::*;
 
 /// Deterministic per-struct type id for a `new` size descr.  Hashes the
-/// struct path tokens; collisions only affect descr-cache keying (never
-/// per-field tracking, which keys on each setfield's own FieldDescr).
+/// struct path tokens; the same id keys the builder's `struct_size_specs`
+/// cache so each `setfield_gc_*` resolves its field's parent SizeDescr +
+/// `index_in_parent` (`descr.py:238`).  Distinct struct paths collide only
+/// at `DefaultHasher`'s 64-bit range, matching the runtime
+/// `LLType::Struct(type_id)` cache-key identity.
 fn struct_type_id(path: &syn::Path) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -149,6 +152,24 @@ impl<'c> Lowerer<'c> {
         }
         let type_id = struct_type_id(struct_path);
         let result_reg = self.alloc_reg();
+        // descr.py:122-126 init_size_descr: the SizeDescr carries the
+        // struct's full `(offset, is_ref, name)` layout in declaration
+        // order so the optimizer can virtualize the New and resolve each
+        // field's parent SizeDescr + index. The literal lists every field,
+        // so its iteration order IS the canonical `index_in_parent` order.
+        let field_layout: Vec<TokenStream> = fields
+            .iter()
+            .map(|(member, value)| {
+                let is_ref = matches!(value.kind, BindingKind::Ref);
+                quote! {
+                    (
+                        ::core::mem::offset_of!(#struct_path, #member),
+                        #is_ref,
+                        stringify!(#member),
+                    )
+                }
+            })
+            .collect();
         self.emit_op(
             OpMeta::linear(OpKind::New, vec![], vec![Register::ref_(result_reg)]),
             quote! {
@@ -156,10 +177,11 @@ impl<'c> Lowerer<'c> {
                     #result_reg,
                     ::core::mem::size_of::<#struct_path>(),
                     #type_id,
+                    &[ #(#field_layout),* ],
                 );
             },
         );
-        for (member, value) in fields {
+        for (index_in_parent, (member, value)) in fields.iter().enumerate() {
             let value_reg = value.reg;
             let (reads, tokens) = match value.kind {
                 BindingKind::Int => (
@@ -169,6 +191,8 @@ impl<'c> Lowerer<'c> {
                             #result_reg,
                             #value_reg,
                             ::core::mem::offset_of!(#struct_path, #member),
+                            #type_id,
+                            #index_in_parent,
                         );
                     },
                 ),
@@ -179,6 +203,8 @@ impl<'c> Lowerer<'c> {
                             #result_reg,
                             #value_reg,
                             ::core::mem::offset_of!(#struct_path, #member),
+                            #type_id,
+                            #index_in_parent,
                         );
                     },
                 ),
@@ -1179,46 +1205,30 @@ impl<'c> Lowerer<'c> {
             return None;
         }
         let (_, else_expr) = expr_if.else_branch.as_ref()?;
-        let then_lowered = self.lower_branch_value_expr(&Expr::Block(syn::ExprBlock {
-            attrs: Vec::new(),
-            label: None,
-            block: expr_if.then_branch.clone(),
-        }));
-        let else_lowered = self.lower_branch_value_expr(else_expr);
-
-        // A branch that fails to lower in the state-field dispatch body
-        // becomes an abort stub: recording stops at branch entry if
-        // execution ever takes it, so the walker's executed-call queue
-        // stays a clean prefix for the outer replay (same contract as
-        // `lower_stmt_fallback`), and the surviving branch still
-        // compiles. With `config` absent, branch failure fails the whole
-        // if-expression as before.
-        if self.config.is_none() && (then_lowered.is_none() || else_lowered.is_none()) {
+        // A branch that fails to lower fails the whole if-expression as
+        // unsupported (`?`): the codewriter lowers expressible ops exactly
+        // or rejects the construct (`jtransform.py`), never replacing one
+        // branch with a runtime abort stub. The caller degrades cleanly
+        // (sub-JitCode entry returns `None`, arm runs in the interpreter).
+        let (then_seq, then_binding) =
+            self.lower_branch_value_expr(&Expr::Block(syn::ExprBlock {
+                attrs: Vec::new(),
+                label: None,
+                block: expr_if.then_branch.clone(),
+            }))?;
+        let (else_seq, else_binding) = self.lower_branch_value_expr(else_expr)?;
+        if !matches!(then_binding.kind, BindingKind::Int)
+            || !matches!(else_binding.kind, BindingKind::Int)
+        {
             return None;
         }
-        // Both branches unlowerable: nothing of value here; let the
-        // caller's statement fallback emit a single abort.
-        if then_lowered.is_none() && else_lowered.is_none() {
-            return None;
-        }
-        for (lowered, which) in [(&then_lowered, "then"), (&else_lowered, "else")] {
-            if let Some((_, binding)) = lowered {
-                if !matches!(binding.kind, BindingKind::Int) {
-                    return None;
-                }
-            } else if std::env::var_os("MAJIT_MACRO_DEBUG").is_some() {
-                eprintln!(
-                    "[majit-macro] if-value {which} branch abort-stub: {}",
-                    quote!(#expr_if)
-                );
-            }
-        }
+        let then_reg = then_binding.reg;
+        let else_reg = else_binding.reg;
 
         let else_label = self.alloc_label();
         let end_label = self.alloc_label();
         let result_reg = self.alloc_reg();
         let cond_reg = cond.reg;
-        let mut depends_on_stack = cond.depends_on_stack;
 
         self.emit_aux(quote! { let #else_label = __builder.new_label(); });
         self.emit_aux(quote! { let #end_label = __builder.new_label(); });
@@ -1227,60 +1237,34 @@ impl<'c> Lowerer<'c> {
             quote! { let _ = __builder.live_placeholder(); },
         );
         self.emit_conditional_guard(cond_reg, &else_label);
-        match then_lowered {
-            Some((then_seq, then_binding)) => {
-                let then_reg = then_binding.reg;
-                depends_on_stack |= then_binding.depends_on_stack;
-                self.append_lowered_sequence(then_seq);
-                self.emit_op(
-                    OpMeta::linear(
-                        OpKind::MoveI,
-                        vec![Register::int(then_reg)],
-                        vec![Register::int(result_reg)],
-                    ),
-                    quote! { __builder.move_i(#result_reg, #then_reg); },
-                );
-                self.emit_jump(&end_label);
-            }
-            None => {
-                self.emit_op(
-                    OpMeta::terminal(Vec::new()),
-                    quote! {
-                        __builder.abort();
-                    },
-                );
-            }
-        }
+        self.append_lowered_sequence(then_seq);
+        self.emit_op(
+            OpMeta::linear(
+                OpKind::MoveI,
+                vec![Register::int(then_reg)],
+                vec![Register::int(result_reg)],
+            ),
+            quote! { __builder.move_i(#result_reg, #then_reg); },
+        );
+        self.emit_jump(&end_label);
         self.emit_label_def(&else_label);
-        match else_lowered {
-            Some((else_seq, else_binding)) => {
-                let else_reg = else_binding.reg;
-                depends_on_stack |= else_binding.depends_on_stack;
-                self.append_lowered_sequence(else_seq);
-                self.emit_op(
-                    OpMeta::linear(
-                        OpKind::MoveI,
-                        vec![Register::int(else_reg)],
-                        vec![Register::int(result_reg)],
-                    ),
-                    quote! { __builder.move_i(#result_reg, #else_reg); },
-                );
-            }
-            None => {
-                self.emit_op(
-                    OpMeta::terminal(Vec::new()),
-                    quote! {
-                        __builder.abort();
-                    },
-                );
-            }
-        }
+        self.append_lowered_sequence(else_seq);
+        self.emit_op(
+            OpMeta::linear(
+                OpKind::MoveI,
+                vec![Register::int(else_reg)],
+                vec![Register::int(result_reg)],
+            ),
+            quote! { __builder.move_i(#result_reg, #else_reg); },
+        );
         self.emit_label_def(&end_label);
 
         Some(Binding {
             reg: result_reg,
             kind: BindingKind::Int,
-            depends_on_stack,
+            depends_on_stack: cond.depends_on_stack
+                || then_binding.depends_on_stack
+                || else_binding.depends_on_stack,
         })
     }
 
