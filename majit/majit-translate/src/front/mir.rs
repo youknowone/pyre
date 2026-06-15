@@ -3635,6 +3635,7 @@ impl<'a> Lowering<'a> {
                             &call.dest.ty,
                         )
                         .or_else(|| self.trait_into_string_alias(&segments, &args, &call.dest.ty))
+                        .or_else(|| self.oparg_arg_get_alias(&reg.kind, &segments, &args))
                     };
                 if let Some(value) = alias {
                     self.local_var[dest_local] = Some(value);
@@ -3645,10 +3646,6 @@ impl<'a> Lowering<'a> {
                     return Ok(());
                 }
                 if let Some(field_read) = self.oparg_from_field_read(&reg.kind, &segments, &args) {
-                    field_read
-                } else if let Some(field_read) =
-                    self.oparg_arg_get_field_read(&reg.kind, &segments, &args)
-                {
                     field_read
                 } else {
                     // `CallTarget::Method` requires a receiver in `args[0]`
@@ -4372,33 +4369,35 @@ impl<'a> Lowering<'a> {
         })
     }
 
-    /// Lower `Arg::<T>::get(self, arg: OpArg) -> T`
+    /// Alias `Arg::<T>::get(self, arg: OpArg) -> T`
     /// (`rustpython_compiler_core::bytecode::instruction`, instruction.rs:1286)
-    /// to a direct `OpArg` payload read.  `Arg<T>` is the zero-sized
-    /// oparg marker ([`tyref_is_bytecode_arg_marker`]); the lifted
-    /// model carries it as a plain integer, so the method call's `self`
-    /// receiver surfaces as `getattr(Integer, "get")` — an attribute
-    /// the annotator cannot type (the dominant `Cannot find attribute
-    /// "get" on Integer` wall behind `complete_pending_blocks` for the
-    /// `execute_unpack_sequence` / `build_list` / `build_tuple` /
-    /// `build_map` count-argument family).  The body is
-    /// `T::try_from(u32::from(arg)).unwrap()`, and every `OpArgType`
-    /// (`VarNum` / `VarNums` / `u32`) is a transparent newtype over
-    /// `u32`, so the value's bits equal `u32::from(arg)` — the raw
-    /// operand.  That is exactly the `FieldRead __pos_0` the inverse
-    /// [`Self::oparg_from_field_read`] (`u32::from(oparg)`) emits.
+    /// to its `OpArg` argument.  `Arg<T>` is the zero-sized oparg marker
+    /// ([`tyref_is_bytecode_arg_marker`]) and `OpArg` is the transparent
+    /// `struct OpArg(u32)` newtype, both modeled as a plain integer (the
+    /// raw operand) — see [`tyref_is_oparg`].
+    /// The body is `T::try_from(u32::from(arg)).unwrap()`, and every
+    /// `OpArgType` (`VarNum` / `VarNums` / `u32`) is a transparent newtype
+    /// over `u32`, so the result's bits equal `u32::from(arg)` — the
+    /// argument's own integer value.  Returning `arg` (`args[1]`) directly
+    /// is the identity the marker `self` is dropped around.
     ///
-    /// Identified by the second input being the single-field `OpArg`
-    /// struct: no other `.get` (slice / `Vec` / map) takes an `OpArg`,
-    /// and the concrete `OpArg` resolves robustly where the generic
-    /// `self: Arg<T>` marker would not.  Returns `None` for any other
-    /// `.get` so those keep the `Call` form.
-    fn oparg_arg_get_field_read(
+    /// Without this the `.get` method call lowers to `getattr(Integer,
+    /// "get")` on the integer `self` marker — an attribute the annotator
+    /// cannot type (the dominant `Cannot find attribute "get" on Integer`
+    /// wall behind `complete_pending_blocks` for the opcode-dispatch
+    /// handler family, which all read their operand via `<field>.get(op_arg)`).
+    ///
+    /// Identified by the second input being the `oparg::OpArg` type: no
+    /// other `.get` (slice / `Vec` / map) takes an `OpArg`, and the
+    /// concrete `OpArg` resolves robustly where the generic `self: Arg<T>`
+    /// marker would not.  Returns `None` for any other `.get` so those
+    /// keep the `Call` form.
+    fn oparg_arg_get_alias(
         &self,
         kind: &CallKind,
         segments: &[String],
         args: &[Variable],
-    ) -> Option<OpKind> {
+    ) -> Option<Variable> {
         if segments.last().map(String::as_str) != Some("get") {
             return None;
         }
@@ -4407,29 +4406,16 @@ impl<'a> Lowering<'a> {
         };
         let fd = self.llbc.fn_by_id(*id)?;
         // The `OpArg` argument (`inputs[1]` — `args[1]`, after the
-        // `self` receiver) is the payload source.
+        // `self` receiver) is the operand value.
         let oparg_ty = fd.signature.inputs.get(1)?;
-        let def_id = self.tyref_adt_def_id(oparg_ty)?;
-        let td = self.llbc.type_by_id(def_id)?;
-        let name_path = td.item_meta.name_path();
-        if !name_path.ends_with("oparg::OpArg") {
+        // `OpArg` is `Opaque` in the LLBC (external crate), so resolve it
+        // by qualified name rather than structural shape.
+        if !adt_path_of_tyref(oparg_ty, self.llbc)
+            .is_some_and(|p| p.ends_with("oparg::OpArg"))
+        {
             return None;
         }
-        let owner_root = name_path.rsplit("::").next().unwrap_or("").to_string();
-        let field = match &td.kind {
-            TypeDeclKind::Struct(fields) if fields.len() == 1 => fields[0]
-                .name
-                .clone()
-                .unwrap_or_else(|| "__pos_0".to_string()),
-            _ => return None,
-        };
-        let oparg_arg = args.get(1)?;
-        Some(OpKind::FieldRead {
-            base: oparg_arg.clone(),
-            field: FieldDescriptor::new(field, Some(owner_root)),
-            ty: ValueType::Int,
-            pure: false,
-        })
+        args.get(1).cloned()
     }
 
     /// The ADT `def_id` behind a signature [`TyRef`], whether inline
@@ -6066,6 +6052,13 @@ fn tyref_to_value_type(ty: &TyRef, llbc: &Llbc) -> ValueType {
             other => other,
         };
     }
+    // `OpArg` is the transparent `struct OpArg(u32)` raw-operand wrapper;
+    // its external decl is `Opaque`, so it would otherwise fall to
+    // `Ref(None)` and shell to a classdef-less instance.  Model it as the
+    // bare integer operand it carries (`tyref_is_oparg`).
+    if tyref_is_oparg(ty, llbc) {
+        return ValueType::Int;
+    }
     ValueType::Ref(None)
 }
 
@@ -6236,6 +6229,34 @@ fn tyref_atomic_inner_value_type(ty: &TyRef, llbc: &Llbc) -> Option<ValueType> {
 fn tyref_is_bytecode_arg_marker(ty: &TyRef, llbc: &Llbc) -> bool {
     adt_path_of_tyref(ty, llbc)
         .is_some_and(|p| p == "rustpython_compiler_core::bytecode::instruction::Arg")
+}
+
+/// Whether a `TyRef` resolves (behind reference wrappers) to the
+/// `rustpython_compiler_core::bytecode::oparg::OpArg` newtype.  `OpArg`
+/// is the transparent `struct OpArg(u32)` raw-operand wrapper; its
+/// external decl is `Opaque` in the LLBC, so a payload row spelled
+/// through it would project to an attr the annotator cannot type.  The
+/// value is only ever the raw u32 operand (constructed from a `u32`,
+/// consumed by `Arg::get` / `u32::from`), so the lifted model carries it
+/// as a plain integer wherever it appears — matching upstream, where the
+/// bytecode operand is a bare int with no wrapper type.
+fn tyref_is_oparg(ty: &TyRef, llbc: &Llbc) -> bool {
+    let Some(node) = tyref_node(ty, llbc).and_then(|n| strip_ty_wrappers(n, llbc)) else {
+        return false;
+    };
+    let Some(id) = adt_node_def_id(node) else {
+        return false;
+    };
+    let Some(td) = llbc.type_by_id(id) else {
+        return false;
+    };
+    // Cheap leaf check before the full path-string comparison: bail
+    // unless the type's last segment is the `OpArg` ident.
+    let leaf_is_oparg = matches!(
+        td.item_meta.name.last(),
+        Some(NameSeg::Ident { ident: (s, _) }) if s == "OpArg"
+    );
+    leaf_is_oparg && td.item_meta.name_path().ends_with("oparg::OpArg")
 }
 
 /// The ADT def_id of an (already wrapper-stripped) type node, or
