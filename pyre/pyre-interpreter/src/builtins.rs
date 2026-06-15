@@ -4197,6 +4197,20 @@ pub fn try_hash_value(obj: PyObjectRef) -> Result<i64, crate::PyError> {
             let args = pyre_object::w_generic_alias_get_args(obj);
             return Ok(try_hash_value(origin)? ^ try_hash_value(args)?);
         }
+        if pyre_object::is_union(obj) {
+            // UnionType.__hash__ (`_pypy_generic_alias.py:275`) —
+            // `hash(frozenset(self.__args__))`, order-independent so it
+            // agrees with `__eq__`'s set equality.
+            let args = pyre_object::w_union_get_args(obj);
+            let n = pyre_object::w_tuple_len(args);
+            let mut members = Vec::with_capacity(n);
+            for i in 0..n {
+                if let Some(item) = pyre_object::w_tuple_getitem(args, i as i64) {
+                    members.push(item);
+                }
+            }
+            return try_hash_value(pyre_object::w_frozenset_from_items(&members));
+        }
         if pyre_object::is_instance(obj) {
             let w_type = pyre_object::w_instance_get_type(obj);
             if let Some(method) = crate::baseobjspace::lookup_in_type(w_type, "__hash__") {

@@ -514,7 +514,15 @@ pub unsafe fn py_repr(obj: PyObjectRef) -> Result<String, crate::PyError> {
             let mut parts = Vec::with_capacity(n);
             for i in 0..n {
                 if let Some(item) = pyre_object::w_tuple_getitem(args, i as i64) {
-                    if pyre_object::is_none(item) {
+                    // `_repr_item_union` (`_pypy_generic_alias.py:141`) —
+                    // `type(None)` renders as `None`; a bare `None` may
+                    // still reach here from direct construction paths.
+                    if pyre_object::is_none(item)
+                        || std::ptr::eq(
+                            item,
+                            crate::typedef::gettypeobject(&pyre_object::NONE_TYPE),
+                        )
+                    {
                         parts.push("None".to_string());
                     } else if pyre_object::is_type(item) {
                         parts.push(pyre_object::w_type_get_name(item).to_string());

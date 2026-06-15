@@ -212,6 +212,17 @@ fn ga_getitem(args: &[PyObjectRef]) -> crate::PyResult {
     ))
 }
 
+/// `add_recurse` (`_pypy_generic_alias.py:253-255`) maps a bare `None`
+/// operand to `type(None)` before it lands in `__args__`, so
+/// `(int | None).__args__` is `(int, NoneType)`.
+fn normalize_none(x: PyObjectRef) -> PyObjectRef {
+    if unsafe { pyre_object::is_none(x) } {
+        crate::typedef::gettypeobject(&pyre_object::NONE_TYPE)
+    } else {
+        x
+    }
+}
+
 /// `_create_union(x, y)` (`_pypy_generic_alias.py:328`) — both operands
 /// must be unionable, else `NotImplemented`; identical operands collapse.
 pub(crate) fn create_union(x: PyObjectRef, y: PyObjectRef) -> crate::PyResult {
@@ -222,7 +233,41 @@ pub(crate) fn create_union(x: PyObjectRef, y: PyObjectRef) -> crate::PyResult {
     if unsafe { crate::baseobjspace::eq_w(x, y) } {
         return Ok(x);
     }
-    Ok(w_union_new(x, y))
+    Ok(w_union_new(normalize_none(x), normalize_none(y)))
+}
+
+/// `UnionType.__eq__` (`_pypy_generic_alias.py:270-273`) —
+/// `set(self.__args__) == set(other.__args__)`.  Both arg tuples are
+/// deduplicated at construction, so equal length plus subset is set
+/// equality.
+pub(crate) fn union_set_eq(a: PyObjectRef, b: PyObjectRef) -> bool {
+    unsafe {
+        let aa = w_union_get_args(a);
+        let bb = w_union_get_args(b);
+        let na = w_tuple_len(aa);
+        let nb = w_tuple_len(bb);
+        if na != nb {
+            return false;
+        }
+        for i in 0..na {
+            let Some(x) = w_tuple_getitem(aa, i as i64) else {
+                return false;
+            };
+            let mut found = false;
+            for j in 0..nb {
+                if let Some(y) = w_tuple_getitem(bb, j as i64) {
+                    if crate::baseobjspace::eq_w(x, y) {
+                        found = true;
+                        break;
+                    }
+                }
+            }
+            if !found {
+                return false;
+            }
+        }
+        true
+    }
 }
 
 /// `GenericAlias.__or__` (`_pypy_generic_alias.py:102`) — `X[...] | Y`.

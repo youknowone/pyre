@@ -4037,6 +4037,22 @@ fn init_union_type(ns: &mut DictStorage) {
         2,
     );
     dict_storage_store(ns, "__args__", make_getset_descriptor(args_getter));
+    // UnionType.__parameters__ — pyre has no TypeVar, so a constructed
+    // union always carries an empty parameter tuple
+    // (`_pypy_generic_alias.py:264` `_collect_parameters`).
+    let params_getter = make_builtin_function_with_arity(
+        "__parameters__",
+        |args| {
+            let self_ = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+            if unsafe { pyre_object::is_union(self_) } {
+                Ok(w_tuple_new(Vec::new()))
+            } else {
+                Ok(pyre_object::PY_NULL)
+            }
+        },
+        2,
+    );
+    dict_storage_store(ns, "__parameters__", make_getset_descriptor(params_getter));
     // UnionType.__or__ — PyPy: UnionType.__or__ → _create_union
     dict_storage_store(
         ns,
@@ -4047,7 +4063,7 @@ fn init_union_type(ns: &mut DictStorage) {
                 if args.len() < 2 {
                     return Err(crate::PyError::type_error("__or__ requires 2 arguments"));
                 }
-                Ok(pyre_object::w_union_new(args[0], args[1]))
+                crate::genericalias::create_union(args[0], args[1])
             },
             2,
         ),
@@ -4062,7 +4078,27 @@ fn init_union_type(ns: &mut DictStorage) {
                 if args.len() < 2 {
                     return Err(crate::PyError::type_error("__ror__ requires 2 arguments"));
                 }
-                Ok(pyre_object::w_union_new(args[1], args[0]))
+                crate::genericalias::create_union(args[1], args[0])
+            },
+            2,
+        ),
+    );
+    // UnionType.__eq__ — `set(self.__args__) == set(other.__args__)`
+    // (`_pypy_generic_alias.py:270`).
+    dict_storage_store(
+        ns,
+        "__eq__",
+        make_builtin_function_with_arity(
+            "__eq__",
+            |args| {
+                let self_ = args[0];
+                let other = args[1];
+                if !unsafe { pyre_object::is_union(other) } {
+                    return Ok(pyre_object::w_not_implemented());
+                }
+                Ok(pyre_object::w_bool_from(crate::genericalias::union_set_eq(
+                    self_, other,
+                )))
             },
             2,
         ),

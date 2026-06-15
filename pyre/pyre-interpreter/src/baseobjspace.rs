@@ -2237,14 +2237,16 @@ pub fn getattr_str(obj: PyObjectRef, name: &str) -> PyResult {
             let static_name: Option<(
                 &'static str,
                 fn(&[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>,
+                u16,
             )> = match name {
-                "setter" => Some(("setter", property_setter_impl)),
-                "getter" => Some(("getter", property_getter_impl)),
-                "deleter" => Some(("deleter", property_deleter_impl)),
+                "setter" => Some(("setter", property_setter_impl, 2)),
+                "getter" => Some(("getter", property_getter_impl, 2)),
+                "deleter" => Some(("deleter", property_deleter_impl, 2)),
+                "__set_name__" => Some(("__set_name__", property_set_name_impl, 3)),
                 _ => None,
             };
-            if let Some((sname, func)) = static_name {
-                let builtin = crate::make_builtin_function_with_arity(sname, func, 2);
+            if let Some((sname, func, arity)) = static_name {
+                let builtin = crate::make_builtin_function_with_arity(sname, func, arity);
                 return Ok(pyre_object::methodobject::w_method_new(
                     builtin,
                     obj,
@@ -2255,6 +2257,15 @@ pub fn getattr_str(obj: PyObjectRef, name: &str) -> PyResult {
                 "fget" => return Ok(w_property_get_fget(obj)),
                 "fset" => return Ok(w_property_get_fset(obj)),
                 "fdel" => return Ok(w_property_get_fdel(obj)),
+                "__name__" => {
+                    // descriptor.py exposes the name set by `__set_name__`;
+                    // an unset name falls through to the normal
+                    // `'property' object has no attribute '__name__'`.
+                    let w_name = pyre_object::propertyobject::w_property_get_name(obj);
+                    if !w_name.is_null() {
+                        return Ok(w_name);
+                    }
+                }
                 "__doc__" => {
                     // descriptor.py:316-318 `__doc__ = GetSetProperty(
                     // W_Property.get_doc, W_Property.set_doc)` → :249-250
@@ -4866,7 +4877,7 @@ unsafe fn get(
         }
         let fget = w_property_get_fget(descr);
         if fget.is_null() || is_none(fget) {
-            return Ok(None);
+            return Err(property_no_accessor(descr, obj, "getter"));
         }
         return Ok(Some(crate::call_function(fget, &[obj])));
     }
@@ -4947,10 +4958,7 @@ unsafe fn set(
     if is_property(descr) {
         let fset = w_property_get_fset(descr);
         if fset.is_null() || is_none(fset) {
-            return Err(crate::PyError::new(
-                crate::PyErrorKind::AttributeError,
-                "property has no setter".to_string(),
-            ));
+            return Err(property_no_accessor(descr, obj, "setter"));
         }
         crate::call_function(fset, &[obj, value]);
         return Ok(true);
@@ -5008,10 +5016,7 @@ unsafe fn delete(descr: PyObjectRef, obj: PyObjectRef) -> Result<(), crate::PyEr
     if is_property(descr) {
         let fdel = w_property_get_fdel(descr);
         if fdel.is_null() || is_none(fdel) {
-            return Err(crate::PyError::new(
-                crate::PyErrorKind::AttributeError,
-                "cannot delete attribute".to_string(),
-            ));
+            return Err(property_no_accessor(descr, obj, "deleter"));
         }
         crate::call::call_function_impl_result(fdel, &[obj])?;
         return Ok(());
@@ -5277,9 +5282,15 @@ pub fn object_setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyRes
     // Other names (and member descriptors, which expose no setter,
     // typedef.py:533-540) fall through to raiseattrerror.
     unsafe {
-        if is_property(obj) && name == "__doc__" {
-            pyre_object::propertyobject::w_property_set_doc(obj, value);
-            return Ok(w_none());
+        if is_property(obj) {
+            if name == "__doc__" {
+                pyre_object::propertyobject::w_property_set_doc(obj, value);
+                return Ok(w_none());
+            }
+            if name == "__name__" {
+                pyre_object::propertyobject::w_property_set_name(obj, value);
+                return Ok(w_none());
+            }
         }
     }
     // Exception instances accept arbitrary attribute writes —
@@ -5604,6 +5615,21 @@ pub fn delattr_str(obj: PyObjectRef, name: &str) -> PyResult {
 /// Terminal `object.__delattr__` — bypasses user override.
 pub fn object_delattr(obj: PyObjectRef, name: &str) -> PyResult {
     let obj = crate::module::_weakref::interp_weakref::force(obj)?;
+    // `property.__name__` is a writable/deletable slot; deleting clears
+    // the name recorded by `__set_name__`, and deleting when unset
+    // raises like a missing attribute.
+    unsafe {
+        if is_property(obj) && name == "__name__" {
+            let w_name = pyre_object::propertyobject::w_property_get_name(obj);
+            if w_name.is_null() {
+                return Err(crate::PyError::attribute_error(
+                    "'property' object has no attribute '__name__'",
+                ));
+            }
+            pyre_object::propertyobject::w_property_set_name(obj, pyre_object::PY_NULL);
+            return Ok(w_none());
+        }
+    }
     // descroperation.py:131-140 descr__delattr__: a data descriptor's
     // `__delete__` takes priority over the namespace delete. PyPy walks
     // `space.type(obj)`, so the lookup must run for any object whose type
@@ -7800,7 +7826,45 @@ unsafe fn property_copy(
     let w_type = crate::typedef::r#type(prop).unwrap_or_else(|| {
         crate::typedef::gettypeobject(&pyre_object::propertyobject::PROPERTY_TYPE)
     });
-    crate::call::call_function_impl_result(w_type, &[getter, setter, deleter, w_doc])
+    let w_res = crate::call::call_function_impl_result(w_type, &[getter, setter, deleter, w_doc])?;
+    // descriptor.py:270-271 `if isinstance(w_res, W_Property): w_res.w_name
+    // = self.w_name` — the copy keeps the source's name.
+    if is_property(w_res) {
+        let w_name = pyre_object::propertyobject::w_property_get_name(prop);
+        if !w_name.is_null() {
+            pyre_object::propertyobject::w_property_set_name(w_res, w_name);
+        }
+    }
+    Ok(w_res)
+}
+
+/// `descriptor.py:206-217 W_Property._properror` — AttributeError naming
+/// the missing accessor and, when known, the property's `__name__`.
+unsafe fn property_no_accessor(prop: PyObjectRef, obj: PyObjectRef, kind: &str) -> crate::PyError {
+    let qualname = match crate::typedef::r#type(obj) {
+        Some(w_type) => match getattr_str(w_type, "__qualname__") {
+            Ok(q) if !q.is_null() && is_str(q) => pyre_object::w_str_get_value(q).to_string(),
+            _ => pyre_object::w_type_get_name(w_type).to_string(),
+        },
+        None => (*(*obj).ob_type).name.to_string(),
+    };
+    let w_name = pyre_object::propertyobject::w_property_get_name(prop);
+    let msg = if !w_name.is_null() {
+        let name_repr = crate::display::py_repr(w_name).unwrap_or_else(|_| "<name>".to_string());
+        format!("property {name_repr} of '{qualname}' object has no {kind}")
+    } else {
+        format!("property of '{qualname}' object has no {kind}")
+    };
+    crate::PyError::attribute_error(msg)
+}
+
+fn property_set_name_impl(args: &[PyObjectRef]) -> PyResult {
+    // descriptor.py:274-276 `set_name(self, w_type, w_name)` — the bound
+    // method receives `[property, owner, name]`.
+    if let Some(&w_name) = args.get(2) {
+        unsafe { pyre_object::propertyobject::w_property_set_name(args[0], w_name) };
+    }
+    Ok(pyre_object::w_none())
 }
 
 fn property_setter_impl(args: &[PyObjectRef]) -> PyResult {
