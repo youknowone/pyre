@@ -142,9 +142,9 @@ pub struct Cpu {
     /// Fragments are already strings (formatted first), so this runs no
     /// user code and is infallible (`Plain`).
     pub build_string_from_array_fn: extern "C" fn(i64) -> i64,
-    /// `newlist(list_w)` — (ref array) → new list.  The array is the
-    /// forced `popvalues_mutable` list; length travels inside the array,
-    /// so any arity fits.
+    /// `newlist(list_w)` (`objspace.py`) — (ref array) → new list.  The
+    /// array is the forced `popvalues_mutable` list; length travels
+    /// inside the array, so any arity fits.
     pub newlist_from_array_fn: extern "C" fn(i64) -> i64,
     /// `bhimpl_unpack_sequence` — (count, seq) → validated tuple of items.
     pub unpack_sequence_fn: extern "C" fn(i64, i64) -> i64,
