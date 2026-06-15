@@ -7183,6 +7183,24 @@ pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
         "setarrayitem_gc_f/rifd".to_string(),
         majit_translate::insns::BC_SETARRAYITEM_GC_F,
     );
+    // Constant-operand "_C" forms, emitted when the array length / store
+    // index is a compile-time constant — a fixed-size tuple/list build
+    // (`new_array_clear/cd>r`) and its element stores
+    // (`setarrayitem_gc_r/rcrd`). Whether the assembler emits the `_C` or
+    // the register form depends on constant folding during
+    // `make_jitcodes`, so a guard failure resuming forward through a
+    // constant-size build must dispatch these too. Their `bhimpl_*`
+    // handlers are already wired in `wire_bhimpl_handlers` below; without
+    // the map entry `wire_handler` silently no-ops and the byte stays
+    // unwired (`dispatch_step` panics on `0xd8`).
+    insns.insert(
+        "setarrayitem_gc_r/rcrd".to_string(),
+        majit_translate::insns::BC_SETARRAYITEM_GC_R_C,
+    );
+    insns.insert(
+        "new_array_clear/cd>r".to_string(),
+        majit_translate::insns::BC_NEW_ARRAY_CLEAR_C,
+    );
     builder.setup_insns(&insns);
     // `setup_insns` already derives `op_live` and `op_catch_exception`
     // from the registered canonical subset above.  `rvmprof_code/ii` is
