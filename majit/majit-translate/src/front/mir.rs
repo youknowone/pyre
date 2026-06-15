@@ -3636,6 +3636,7 @@ impl<'a> Lowering<'a> {
                         )
                         .or_else(|| self.trait_into_string_alias(&segments, &args, &call.dest.ty))
                         .or_else(|| self.oparg_arg_get_alias(&reg.kind, &segments, &args))
+                        .or_else(|| self.oparg_value_alias(&segments, &args))
                     };
                 if let Some(value) = alias {
                     self.local_var[dest_local] = Some(value);
@@ -3645,9 +3646,7 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
-                if let Some(field_read) = self.oparg_from_field_read(&reg.kind, &segments, &args) {
-                    field_read
-                } else {
+                {
                     // `CallTarget::Method` requires a receiver in `args[0]`
                     // (the flowspace adapter lowers it to `getattr(recv,
                     // method_leaf) → simple_call(bound_method, …)`).
@@ -4307,68 +4306,6 @@ impl<'a> Lowering<'a> {
         None
     }
 
-    /// Lower `u32::from(<oparg value>)` — the `From<OpArg> for u32`
-    /// (`rustpython-compiler-core` `bytecode/oparg.rs:95`) and
-    /// `oparg_enum!`-synthesized `From<$Enum> for u32` impls — to the
-    /// extraction their bodies perform.  The dependency crate's bodies
-    /// are never in the local LLBC, so the `Call` form is permanently
-    /// unliftable.  Each impl is a single extraction: `self.0` for the
-    /// transparent newtype, a discriminant cast for the fieldless
-    /// enums — the same reads local code expresses as `FieldRead
-    /// __pos_0` / `FieldRead __discriminant` (the
-    /// `Rvalue::Discriminant` lowering).  Returns `None` for any other
-    /// path or shape so unrelated `from` impls keep the `Call` form.
-    fn oparg_from_field_read(
-        &self,
-        kind: &CallKind,
-        segments: &[String],
-        args: &[Variable],
-    ) -> Option<OpKind> {
-        let [first, .., module, impl_seg, leaf] = segments else {
-            return None;
-        };
-        if first.as_str() != "rustpython_compiler_core"
-            || module.as_str() != "oparg"
-            || impl_seg.as_str() != "<Impl>"
-            || leaf.as_str() != "from"
-        {
-            return None;
-        }
-        let [arg] = args else {
-            return None;
-        };
-        let CallKind::Fun(FunId::Regular { id }) = kind else {
-            return None;
-        };
-        let fd = self.llbc.fn_by_id(*id)?;
-        let src_ty = fd.signature.inputs.first()?;
-        let def_id = self.tyref_adt_def_id(src_ty)?;
-        let td = self.llbc.type_by_id(def_id)?;
-        let owner_root = td
-            .item_meta
-            .name_path()
-            .rsplit("::")
-            .next()
-            .unwrap_or("")
-            .to_string();
-        let field = match &td.kind {
-            TypeDeclKind::Struct(fields) if fields.len() == 1 => fields[0]
-                .name
-                .clone()
-                .unwrap_or_else(|| "__pos_0".to_string()),
-            TypeDeclKind::Enum(variants) if variants.iter().all(|v| v.fields.is_empty()) => {
-                "__discriminant".to_string()
-            }
-            _ => return None,
-        };
-        Some(OpKind::FieldRead {
-            base: arg.clone(),
-            field: FieldDescriptor::new(field, Some(owner_root)),
-            ty: ValueType::Int,
-            pure: false,
-        })
-    }
-
     /// Alias `Arg::<T>::get(self, arg: OpArg) -> T`
     /// (`rustpython_compiler_core::bytecode::instruction`, instruction.rs:1286)
     /// to its `OpArg` argument.  `Arg<T>` is the zero-sized oparg marker
@@ -4410,12 +4347,40 @@ impl<'a> Lowering<'a> {
         let oparg_ty = fd.signature.inputs.get(1)?;
         // `OpArg` is `Opaque` in the LLBC (external crate), so resolve it
         // by qualified name rather than structural shape.
-        if !adt_path_of_tyref(oparg_ty, self.llbc)
-            .is_some_and(|p| p.ends_with("oparg::OpArg"))
-        {
+        if !adt_path_of_tyref(oparg_ty, self.llbc).is_some_and(|p| p.ends_with("oparg::OpArg")) {
             return None;
         }
         args.get(1).cloned()
+    }
+
+    /// Alias the transparent `OpArgType` conversions to their single
+    /// argument.  Each oparg newtype is `#[repr(transparent)]` over
+    /// `u32` and the fieldless oparg enums carry their operand as the
+    /// discriminant, so — once the operand is modeled as an integer
+    /// ([`tyref_is_oparg`], [`oparg_arg_get_alias`]) — every conversion
+    /// below is the identity on that integer:
+    ///   * the inherent `as_u32` / `as_usize` extractors and the
+    ///     `from_u32` constructor (`newtype_oparg!`), and
+    ///   * the `From` conversions (`u32::from(oparg)` for a newtype, the
+    ///     `__discriminant` read for a fieldless enum).
+    /// Gated on the defining impl living in `bytecode::oparg` so the
+    /// generic `from` / `as_u32` / `as_usize` names cannot match
+    /// unrelated types.
+    fn oparg_value_alias(&self, segments: &[String], args: &[Variable]) -> Option<Variable> {
+        let [arg] = args else {
+            return None;
+        };
+        let [first, .., module, impl_seg, leaf] = segments else {
+            return None;
+        };
+        if first.as_str() != "rustpython_compiler_core"
+            || module.as_str() != "oparg"
+            || impl_seg.as_str() != "<Impl>"
+            || !matches!(leaf.as_str(), "as_u32" | "as_usize" | "from_u32" | "from")
+        {
+            return None;
+        }
+        Some(arg.clone())
     }
 
     /// The ADT `def_id` behind a signature [`TyRef`], whether inline

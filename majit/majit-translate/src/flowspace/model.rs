@@ -2101,11 +2101,15 @@ impl HostEnv {
         let core_mem = HostObject::new_module("core.mem");
         core_mem.module_set(
             "size_of",
-            std_mem.module_get("size_of").expect("std.mem.size_of bound above"),
+            std_mem
+                .module_get("size_of")
+                .expect("std.mem.size_of bound above"),
         );
         core_mem.module_set(
             "align_of",
-            std_mem.module_get("align_of").expect("std.mem.align_of bound above"),
+            std_mem
+                .module_get("align_of")
+                .expect("std.mem.align_of bound above"),
         );
 
         // Container / bigint ctors reach the adapter spelled with their
@@ -2118,7 +2122,10 @@ impl HostEnv {
         // callables where present; mint fresh ones for the methods not
         // yet surfaced (`with_capacity` / `zero` / `new_uninit`).
         let vec_crate = HostObject::new_module("vec.Vec");
-        vec_crate.module_set("new", vec_ty.module_get("new").expect("Vec.new bound above"));
+        vec_crate.module_set(
+            "new",
+            vec_ty.module_get("new").expect("Vec.new bound above"),
+        );
         vec_crate.module_set(
             "with_capacity",
             HostObject::new_builtin_callable("vec.Vec.with_capacity"),
@@ -2133,10 +2140,15 @@ impl HostEnv {
             HostObject::new_builtin_callable("bigint.BigInt.zero"),
         );
         let boxed_crate = HostObject::new_module("boxed.Box");
-        boxed_crate.module_set("new", box_ty.module_get("new").expect("Box.new bound above"));
+        boxed_crate.module_set(
+            "new",
+            box_ty.module_get("new").expect("Box.new bound above"),
+        );
         boxed_crate.module_set(
             "into_raw",
-            box_ty.module_get("into_raw").expect("Box.into_raw bound above"),
+            box_ty
+                .module_get("into_raw")
+                .expect("Box.into_raw bound above"),
         );
         boxed_crate.module_set(
             "new_uninit",
