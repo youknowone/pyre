@@ -3809,22 +3809,38 @@ impl<'a> Lowering<'a> {
                     return Ok(());
                 }
                 {
-                    // `CallTarget::Method` requires a receiver in `args[0]`
-                    // (the flowspace adapter lowers it to `getattr(recv,
-                    // method_leaf) → simple_call(bound_method, …)`).
-                    // Charon's `impl_method_owner` matches both inherent
-                    // methods (which carry `&self`) *and* associated
-                    // functions (e.g. `RootScope::new()` — no `self` arg).
-                    // Only the former actually has a receiver in `args[0]`;
-                    // routing a 0-arg associated function through `Method`
-                    // panics at `flowspace_adapter.rs:1045` ("Call::Method
-                    // has empty args").  Fall back to the `FunctionPath`
-                    // segments when there is no receiver to thread.
-                    let target = match method_hint {
-                        Some((owner_root, leaf)) if !args.is_empty() => {
-                            CallTarget::method(leaf, Some(owner_root))
+                    // `jit::promote(x)` rewrites to the synthesised
+                    // `hint_promote` marker so the residual `OpKind::Call`
+                    // reaches `jtransform::rewrite_op_hint`, which emits
+                    // `[-live-, <kind>_guard_value(x)]`
+                    // (`jit_codewriter/jtransform.py:608-614`).  The rtyper
+                    // lowers the marker to `same_as` for the dual-gate type
+                    // projection (`flowspace_adapter`), and jtransform aliases
+                    // the result back to `x`.  Same single-segment marker
+                    // shape as the `elidable_promote` wrapper's
+                    // `hint_promote_or_string`.
+                    let target = if args.len() == 1 && self.is_jit_promote(&reg) {
+                        CallTarget::FunctionPath {
+                            segments: vec!["hint_promote".to_string()],
                         }
-                        _ => CallTarget::FunctionPath { segments },
+                    } else {
+                        // `CallTarget::Method` requires a receiver in `args[0]`
+                        // (the flowspace adapter lowers it to `getattr(recv,
+                        // method_leaf) → simple_call(bound_method, …)`).
+                        // Charon's `impl_method_owner` matches both inherent
+                        // methods (which carry `&self`) *and* associated
+                        // functions (e.g. `RootScope::new()` — no `self` arg).
+                        // Only the former actually has a receiver in `args[0]`;
+                        // routing a 0-arg associated function through `Method`
+                        // panics at `flowspace_adapter.rs:1045` ("Call::Method
+                        // has empty args").  Fall back to the `FunctionPath`
+                        // segments when there is no receiver to thread.
+                        match method_hint {
+                            Some((owner_root, leaf)) if !args.is_empty() => {
+                                CallTarget::method(leaf, Some(owner_root))
+                            }
+                            _ => CallTarget::FunctionPath { segments },
+                        }
                     };
                     OpKind::Call {
                         target,
@@ -4311,6 +4327,23 @@ impl<'a> Lowering<'a> {
         self.llbc
             .fn_by_id(*id)
             .is_some_and(|fd| fd.item_meta.name_path() == "core::f64::<Impl>::is_nan")
+    }
+
+    /// `majit_metainterp::jit::promote(x)` = `hint(x, promote=True)`
+    /// (`rlib/jit.py:101`).  The wrapper carries the `promote` flag by its
+    /// name (its body is a bare `hint(x)`, shared with `promote_string` /
+    /// `promote_unicode`), so the callsite is recognised by the wrapper
+    /// path, not the body.  Matched on the exact `promote` leaf so the
+    /// `promote_string` / `promote_unicode` siblings — which `jtransform`
+    /// cannot lower without an `rstr.STR`/`UNICODE` layout — keep their
+    /// ordinary (skipping) call lowering.
+    fn is_jit_promote(&self, reg: &RegularCall) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        self.llbc
+            .fn_by_id(*id)
+            .is_some_and(|fd| fd.item_meta.name_path() == "majit_metainterp::jit::promote")
     }
 
     fn blanket_into_devirt(&self, reg: &RegularCall) -> Option<IntoDevirt> {

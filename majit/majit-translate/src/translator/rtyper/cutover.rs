@@ -995,6 +995,19 @@ pub(crate) fn is_known_unported(msg: &str) -> bool {
         // body-`Input` emission is replaced by a Link.args / inputargs
         // threading pass that mirrors RPython.
         || msg.contains("adapter cross-block body Input")
+        // `SomeValue::noneify()` reached a `SomePtr` operand — a block
+        // merge unioned a `_ptr` with `NoneType`.  Upstream never faces
+        // this: RPython spells a null pointer as `lltype.nullptr(T)`,
+        // which annotates as a (null-valued) `SomePtr`, not `SomeNone`,
+        // so `pair(SomePtr, SomePtr).union` (lltype.py) handles it and
+        // `noneify` is never called on a pointer.  Pyre's `front::mir`
+        // still lowers some Rust null/`Option<*T>` shapes to a
+        // `SomeNone` rather than a typed null `SomePtr` (the same
+        // null-pointer-typing gap tracked by the `LLAddress(Null)`
+        // exceptblock work), so the merge surfaces `_ptr ∪ NoneType`.
+        // Skip until the front-end lowers a typed null pointer for
+        // these merges; the legacy walker keeps handling the graphs.
+        || msg.contains("noneify() not supported")
     // There is no `normalize_unary_op_name: pyre UnaryOp` Skip entry:
     // the 13 typed numeric / ptr / Unsigned casts route through
     // `simple_call(<host_callable>, v)` — reaching

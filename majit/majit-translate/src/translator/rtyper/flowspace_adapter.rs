@@ -1146,6 +1146,25 @@ pub fn translate_op(
                         })?;
                         return Ok(vec![FlowspaceOp::new("same_as", vec![arg], result)]);
                     }
+                    // `hint_promote` is the `front::mir` marker for
+                    // `jit::promote(x)` = `hint(x, promote=True)`
+                    // (`rlib/jit.py:101`).  As with `hint_promote_or_string`
+                    // above, the marker has no registry entry; lower it to
+                    // `same_as(arg)` (`rtyper.py:478-481` internal renaming)
+                    // so the dual-gate real path types the result as the
+                    // arg's repr instead of skipping.  The residual
+                    // `OpKind::Call` survives untouched into `jtransform`,
+                    // where `rewrite_op_hint` emits the
+                    // `<kind>_guard_value` family (`jtransform.py:608-614`).
+                    if segments.len() == 1 && segments[0] == "hint_promote" {
+                        let mut iter = arg_hls.into_iter();
+                        let arg = iter.next().ok_or_else(|| {
+                            TyperError::message(
+                                "hint_promote requires at least one arg".to_string(),
+                            )
+                        })?;
+                        return Ok(vec![FlowspaceOp::new("same_as", vec![arg], result)]);
+                    }
                     // `core` method spellings of upstream operations:
                     // pyre source writes `a.min(b)` /
                     // `a != b`-via-`PartialEq::ne` / `v.len()` /
