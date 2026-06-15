@@ -2301,6 +2301,7 @@ pub fn dispatch_via_miframe_at_opcode_entry<'a>(
         &sym.registers_f,
         outer_jitcode_index,
         entry_py_pc,
+        None,
     );
 
     // pyjitpl.py:82-90 `setup` per-bank allocation: each bank gets
@@ -4960,6 +4961,7 @@ fn collect_outer_active_boxes(
     regs_f: &[OpRef],
     outer_jitcode_index: u32,
     entry_py_pc: u32,
+    guard_py_pc: Option<u32>,
 ) -> Vec<OpRef> {
     let banks = crate::state::frame_liveness_reg_indices_by_bank_at(
         outer_jitcode_index as i32,
@@ -5097,8 +5099,92 @@ fn collect_outer_active_boxes(
         }
         active.push(v);
     }
+    // #124 kept-stack recovery (gated by `guard_py_pc`, set only on the
+    // `PYRE_RELAX_124` branch-guard path).  A branch guard's not-taken arm
+    // resumes at a merge point whose live Ref colors are filled by the
+    // not-taken edge's register move — colors the walk has NOT written at
+    // the guard point, because that move executes only when the branch is
+    // taken at runtime.  Reading `registers_r[merge_color]` there yields a
+    // stale/color-reused box (the #124 corruption: it decodes to a wrong
+    // or null value on the odd-path iteration).  The kept operand-stack
+    // value lives instead in the guard-pc-only color the edge move reads
+    // from.  Recover `{resume merge color -> guard-pc kept value}`
+    // positionally: the not-taken arm preserves the bottom of the operand
+    // stack, so guard-only Ref colors (live at the guard, dead at resume),
+    // taken in ascending color order (the splice colors operand-stack
+    // slots in push order), supply the values for resume-only Ref colors
+    // that name a stack slot, in ascending semantic-slot order.
+    let kept_stack_subst: std::collections::HashMap<u32, OpRef> = match guard_py_pc {
+        Some(gpc) if gpc != entry_py_pc && owns_vable => {
+            let guard_banks = crate::state::frame_liveness_reg_indices_by_bank_at(
+                outer_jitcode_index as i32,
+                gpc as i32,
+            );
+            let resume_set: std::collections::HashSet<u32> = banks.ref_.iter().copied().collect();
+            let guard_set: std::collections::HashSet<u32> =
+                guard_banks.ref_.iter().copied().collect();
+            // Guard-only Ref colors carrying a real walk value.
+            let mut guard_only: Vec<u32> = guard_banks
+                .ref_
+                .iter()
+                .copied()
+                .filter(|c| !resume_set.contains(c))
+                .filter(|&c| {
+                    regs_r
+                        .get(c as usize)
+                        .copied()
+                        .is_some_and(|v| v != OpRef::NONE)
+                })
+                .collect();
+            guard_only.sort_unstable();
+            // Resume-only Ref colors naming an operand-stack slot.
+            let mut resume_only_stack: Vec<(usize, u32)> = banks
+                .ref_
+                .iter()
+                .copied()
+                .filter(|c| !guard_set.contains(c))
+                .filter_map(|c| {
+                    let s = crate::state::semantic_ref_slot_for_reg_color(
+                        nlocals,
+                        valid_stack_only,
+                        &local_color_map,
+                        &stack_color_map,
+                        &live_locals,
+                        c as usize,
+                    )?;
+                    (s >= nlocals).then_some((s, c))
+                })
+                .collect();
+            resume_only_stack.sort_unstable();
+            if std::env::var_os("PYRE_DIAG124C").is_some() {
+                eprintln!(
+                    "[diag124c] guard_py_pc={gpc} entry_py_pc={entry_py_pc} \
+                     guard_live_r={:?} resume_live_r={:?} guard_only={guard_only:?} \
+                     resume_only_stack={resume_only_stack:?}",
+                    guard_banks.ref_, banks.ref_,
+                );
+            }
+            resume_only_stack
+                .into_iter()
+                .zip(guard_only)
+                .map(|((_, resume_color), guard_color)| {
+                    (resume_color, regs_r[guard_color as usize])
+                })
+                .collect()
+        }
+        _ => std::collections::HashMap::new(),
+    };
     for &idx in &banks.ref_ {
         let color = idx as usize;
+        if let Some(&subst) = kept_stack_subst.get(&idx) {
+            // The guard-pc kept value overrides the (unwritten) merge-color
+            // read for this not-taken-arm operand-stack slot.
+            if subst == OpRef::NONE {
+                panic!("{}", dump_ctx("ref", idx));
+            }
+            active.push(subst);
+            continue;
+        }
         let fallback = || {
             regs_r
                 .get(color)
@@ -5277,6 +5363,21 @@ thread_local! {
     /// which is sound for the side-effect-free leaves this path inlines.
     static INLINE_SUBWALK_CAPTURE_BOUNDARY: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
+
+    /// Set (to the branch guard's own jitcode `op.pc`) only for the
+    /// duration of the `walker_capture_snapshot_for_last_guard` call a
+    /// kept-stack branch guard makes under `PYRE_RELAX_124` (#124).  The
+    /// snapshot helper is invoked with the *resume* coordinate
+    /// (`other_target`, the not-taken arm), so the guard's own coordinate
+    /// is otherwise unavailable to the encoder.  `collect_outer_active_
+    /// boxes` reads this to recover the kept operand-stack value(s): a
+    /// branch guard's not-taken arm resumes at a merge point whose live
+    /// Ref color was minted by the not-taken edge's register move and is
+    /// therefore unwritten in the walk's register file at the guard
+    /// point; the value lives instead in the guard-pc-only color the
+    /// edge move reads from.  Null outside the gated kept-stack path.
+    static BRANCH_GUARD_JITCODE_PC: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(usize::MAX) };
 }
 
 /// RAII guard: mark the current scope as an inline sub-walk (see
@@ -6105,6 +6206,21 @@ fn walker_capture_snapshot_for_last_guard_impl(
                 );
             }
             let (vable_boxes, vref_boxes) = ctx.trace_ctx.build_snapshot_vable_vref_boxes();
+            // #124 kept-stack recovery: map the guard's own jitcode pc (set
+            // by the branch handler) to its Python opcode so the encoder can
+            // read the guard-pc liveness — the resume `py_pc` is a not-taken
+            // merge point whose live colors the walk has not written.
+            let guard_py_pc = {
+                let guard_jc_pc = BRANCH_GUARD_JITCODE_PC.with(|c| c.get());
+                if guard_jc_pc == usize::MAX {
+                    None
+                } else {
+                    unsafe {
+                        let jc = &*sym.jitcode;
+                        Some(python_pc_for_jitcode_pc(&jc.payload.metadata, guard_jc_pc))
+                    }
+                }
+            };
             let active = collect_outer_active_boxes(
                 sym,
                 ctx.trace_ctx,
@@ -6113,6 +6229,7 @@ fn walker_capture_snapshot_for_last_guard_impl(
                 ctx.registers_f,
                 jitcode_index,
                 py_pc,
+                guard_py_pc,
             );
             ctx.trace_ctx
                 .capture_snapshot_for_last_guard_with_vable_vref(
@@ -10510,11 +10627,28 @@ fn handle(
                 // fallback (correct, untraced) rather than compile a trace
                 // that corrupts the frame on every odd-path iteration.
                 // Plain `while` / `if` branches resume at depth 0 and pass.
-                if branch_resume_target_stack_depth(other_target).is_some_and(|d| d > 0) {
+                //
+                // `PYRE_RELAX_124` opens the gate so the kept-stack
+                // recovery path in `collect_outer_active_boxes` can be
+                // validated against the #124 repros before it is trusted
+                // in production; the env var is unset everywhere except the
+                // targeted repro runs, so production stays on the decline.
+                let relax_124 = std::env::var_os("PYRE_RELAX_124").is_some();
+                if !relax_124
+                    && branch_resume_target_stack_depth(other_target).is_some_and(|d| d > 0)
+                {
                     return Err(DispatchError::BranchGuardKeptStackUnsupported { pc: op.pc });
                 }
                 ctx.trace_ctx.record_guard(opcode, &[valuebox], 0);
-                walker_capture_snapshot_for_last_guard(ctx, other_target)?;
+                // Publish the guard's own jitcode coordinate so the snapshot
+                // encoder can recover kept operand-stack values from the
+                // guard-pc register file (the resume coordinate
+                // `other_target` names a merge point whose live colors the
+                // walk has not written at the guard point).
+                BRANCH_GUARD_JITCODE_PC.with(|c| c.set(op.pc));
+                let capture = walker_capture_snapshot_for_last_guard(ctx, other_target);
+                BRANCH_GUARD_JITCODE_PC.with(|c| c.set(usize::MAX));
+                capture?;
             }
             let next_pc = if switchcase != 0 { op.next_pc } else { target };
             Ok((DispatchOutcome::Continue, next_pc))
