@@ -996,17 +996,24 @@ pub(crate) fn is_known_unported(msg: &str) -> bool {
         // threading pass that mirrors RPython.
         || msg.contains("adapter cross-block body Input")
         // `SomeValue::noneify()` reached a `SomePtr` operand — a block
-        // merge unioned a `_ptr` with `NoneType`.  Upstream never faces
-        // this: RPython spells a null pointer as `lltype.nullptr(T)`,
-        // which annotates as a (null-valued) `SomePtr`, not `SomeNone`,
-        // so `pair(SomePtr, SomePtr).union` (lltype.py) handles it and
-        // `noneify` is never called on a pointer.  Pyre's `front::mir`
-        // still lowers some Rust null/`Option<*T>` shapes to a
-        // `SomeNone` rather than a typed null `SomePtr` (the same
-        // null-pointer-typing gap tracked by the `LLAddress(Null)`
-        // exceptblock work), so the merge surfaces `_ptr ∪ NoneType`.
-        // Skip until the front-end lowers a typed null pointer for
-        // these merges; the legacy walker keeps handling the graphs.
+        // merge unioned a `_ptr` with `NoneType`.  The raise itself is
+        // parity-correct: RPython's default `noneify` raises `UnionError`
+        // (model.py:121-122) and `SomePtr` defines no override, while
+        // `pair(SomePtr, SomeObject).union` raises too
+        // (llannotation.py:119-120) — so this Skip catches a *correct*
+        // raise, it does not paper over a wrong annotation rule.  The
+        // only divergence is upstream of the merge: RPython spells a null
+        // pointer as `lltype.nullptr(T)`, which annotates as a
+        // (null-valued) `SomePtr`, so `pair(SomePtr, SomePtr).union`
+        // (llannotation.py:94-98) keeps it in the pointer lattice and
+        // `noneify` is never reached.  Pyre's `front::mir` still lowers
+        // some Rust null/`Option<*T>` shapes to a `SomeNone` rather than
+        // a typed null `SomePtr` (the same null-pointer-typing gap
+        // tracked by the `LLAddress(Null)` exceptblock work), so the
+        // merge surfaces `_ptr ∪ NoneType`.  CONVERGENCE: lower a typed
+        // null pointer at the `front::mir` producer; removing this Skip
+        // without that fix only hard-breaks on the parity-correct raise.
+        // Until then the legacy walker keeps handling the graphs.
         || msg.contains("noneify() not supported")
     // There is no `normalize_unary_op_name: pyre UnaryOp` Skip entry:
     // the 13 typed numeric / ptr / Unsigned casts route through
