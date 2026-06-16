@@ -219,27 +219,41 @@ pub struct Snapshot {
 /// at construction time. The explicit `tp` field stays around so the
 /// SnapshotBox API can answer `box.type` without re-decoding the
 /// variant on every read.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone)]
 pub struct SnapshotBox {
-    pub opref: majit_ir::OpRef,
+    /// The box this snapshot slot references, stored as a `BoxRef` so a
+    /// `Const{Ptr}` slot's inline gcref is GC-forwarded in place through the
+    /// canonical `BoxRef::walk_const_ptr_refs` (history.py:314
+    /// `ConstPtr.value`). Read the trace-position `OpRef` view via
+    /// [`SnapshotBox::opref`].
+    pub opref_box: majit_ir::box_ref::BoxRef,
     pub tp: Option<majit_ir::Type>,
 }
 
 impl SnapshotBox {
     pub fn untyped(opref: majit_ir::OpRef) -> Self {
-        SnapshotBox { opref, tp: None }
+        SnapshotBox {
+            opref_box: majit_ir::box_ref::BoxRef::from_opref(opref),
+            tp: None,
+        }
     }
 
     pub fn typed(opref: majit_ir::OpRef, tp: majit_ir::Type) -> Self {
         SnapshotBox {
-            opref,
+            opref_box: majit_ir::box_ref::BoxRef::from_opref(opref),
             tp: Some(tp),
         }
     }
 
-    pub fn map_opref(self, f: impl FnOnce(majit_ir::OpRef) -> majit_ir::OpRef) -> Self {
+    /// The trace-position `OpRef` view of this slot (inverse of
+    /// `BoxRef::from_opref`).
+    pub fn opref(&self) -> majit_ir::OpRef {
+        self.opref_box.to_opref()
+    }
+
+    pub fn map_opref(&self, f: impl FnOnce(majit_ir::OpRef) -> majit_ir::OpRef) -> Self {
         SnapshotBox {
-            opref: f(self.opref),
+            opref_box: majit_ir::box_ref::BoxRef::from_opref(f(self.opref())),
             tp: self.tp,
         }
     }
@@ -3694,8 +3708,8 @@ impl ResumeDataLoopMemo {
         numb_state: &mut NumberingState,
         env: &dyn BoxEnv,
     ) -> Result<(), TagOverflow> {
-        for &snapshot_box in boxes {
-            let raw_opref = snapshot_box.opref;
+        for snapshot_box in boxes {
+            let raw_opref = snapshot_box.opref();
             if raw_opref.is_none() {
                 numb_state.append_short(NULLREF);
                 continue;

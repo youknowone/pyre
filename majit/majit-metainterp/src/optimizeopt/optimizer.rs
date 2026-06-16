@@ -2157,7 +2157,7 @@ impl Optimizer {
             .chain(self.snapshot_vable_boxes.iter())
             .chain(self.snapshot_vref_boxes.iter())
             .flatten()
-            .flat_map(|boxes| boxes.iter().map(|boxref| boxref.opref))
+            .flat_map(|boxes| boxes.iter().map(|boxref| boxref.opref()))
             .filter(|opref| !opref.is_none() && !opref.is_constant())
             .map(|opref| opref.raw())
             .max()

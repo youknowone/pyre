@@ -6157,9 +6157,8 @@ impl OptContext {
             let env = OptBoxEnv { ctx: self };
             let snapshot_debug: Vec<(OpRef, OpRef, bool, Type)> = snapshot_boxes
                 .iter()
-                .copied()
                 .map(|boxref| {
-                    let boxref = boxref.opref;
+                    let boxref = boxref.opref();
                     let resolved = self.get_replacement_opref(boxref);
                     let is_virtual = self
                         .get_box_replacement_box(boxref)
@@ -6172,9 +6171,8 @@ impl OptContext {
             let vable_debug: Vec<(OpRef, OpRef, bool, Type)> = snapshot
                 .vable_array
                 .iter()
-                .copied()
                 .map(|boxref| {
-                    let boxref = boxref.opref;
+                    let boxref = boxref.opref();
                     let resolved = self.get_replacement_opref(boxref);
                     let is_virtual = self
                         .get_box_replacement_box(boxref)

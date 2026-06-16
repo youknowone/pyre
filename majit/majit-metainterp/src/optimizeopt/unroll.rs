@@ -310,9 +310,11 @@ impl UnrollOptimizer {
             for slot in map.iter_mut() {
                 if let Some(boxes) = slot {
                     for sb in boxes {
-                        if let majit_ir::OpRef::ConstPtr(gcref) = sb.opref {
+                        if let Some(majit_ir::Value::Ref(gcref)) = sb.opref_box.const_value() {
                             if !gcref.is_null() {
-                                slots.push((&mut sb.opref as *mut majit_ir::OpRef) as usize);
+                                slots.push(
+                                    (&sb.opref_box as *const BoxRef) as usize,
+                                );
                             }
                         }
                     }
@@ -5373,7 +5375,7 @@ fn remap_snapshot_boxes(
 ) -> Vec<SnapshotBox> {
     boxes
         .iter()
-        .map(|&boxref| boxref.map_opref(|opref| ref_map.get(&opref).copied().unwrap_or(opref)))
+        .map(|boxref| boxref.map_opref(|opref| ref_map.get(&opref).copied().unwrap_or(opref)))
         .collect()
 }
 
