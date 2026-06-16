@@ -2322,100 +2322,119 @@ where
                         ),
                     }
                 };
-                let (opref, reg_concrete) = if let Some(cached) = cached {
-                    // pyjitpl.py:646 `count_ops(rop.GETARRAYITEM_GC_I,
-                    // Counters.HEAPCACHED_OPS)` — folded-away op accounting.
-                    ctx.profiler().count_ops(
-                        OpCode::GetarrayitemGcI,
-                        crate::pyjitpl::counters::HEAPCACHED_OPS,
-                    );
-                    // pyjitpl.py:644-668 sanity check: compare the
-                    // freshly executed load (`resvalue`) against the
-                    // cached box's `tobox.getint()`.  On mismatch
-                    // `_record_helper` records a fallback op whose
-                    // return value is discarded; `assert 0` fires in
-                    // debug mode; the function still returns the
-                    // (stale) cached box.  `_record_helper` routes
-                    // through `heapcache.invalidate_caches`, but that
-                    // call short-circuits on GETARRAYITEM_GC_I
-                    // (`mark_escaped` does not escape the read,
-                    // `clear_caches_not_necessary` returns True), so
-                    // the heapcache state is intentionally left
-                    // untouched.  The cached Box's intrinsic value is
-                    // the upstream `tobox.getint()` payload — fetched
-                    // through `box_value(cached)` which composes the
-                    // const pool, standard-virtualizable shadow, and
-                    // the frontend object's `value` field (RPython
-                    // `currfieldbox.getint()` dispatch parity).
-                    // `None` payload (entry seeded without a live
-                    // concrete) skips the check.
-                    let cached_value = ctx.box_value(cached).unwrap_or(majit_ir::Value::Void);
-                    let expected = match cached_value {
-                        majit_ir::Value::Int(n) => Some(n),
-                        _ => None,
-                    };
-                    // Cache hit propagates the stale `tobox.getint()`
-                    // into the destination on mismatch — pyjitpl.py:669
-                    // returns `tobox` so the caller sees the cached
-                    // box's int, not `resvalue`.  Match that by
-                    // selecting `expected` (stale) when the assertion
-                    // fires, else the freshly executed int (which
-                    // equals expected in the no-mismatch arm).
-                    let stale = matches!(expected, Some(exp) if exp != concrete);
-                    if stale {
-                        // pyjitpl.py:2693-2694 `_record_helper` invalidates
-                        // before recording.  `clear_caches_not_necessary`
-                        // short-circuits for GETARRAYITEM_GC_I (no-side-
-                        // effect read), so the only remaining side effect
-                        // is `mark_escaped` escaping `array_opref` and
-                        // `index_opref` — match that structure here.
-                        ctx.heapcache_invalidate_caches_varargs(
+                let (opref, reg_concrete) =
+                    if array_opref.is_constant() && index_opref.is_constant() {
+                        // pyjitpl.py:1946-1949 `execute_varargs(pure=True)` →
+                        // `record_result_of_call_pure`: a read of the immutable
+                        // bytecode array at a green index has all-constant args, so
+                        // it folds to a ConstInt and is not recorded — the same
+                        // record-time fold PyPy applies to `strgetitem(green_str,
+                        // green_pc)` (strings/immutable arrays lower to the pure
+                        // read variant). BC_GETARRAYITEM_GC_I is emitted only for
+                        // the green-pc dispatch's `program` fetch (the sole caller,
+                        // `add_gc_byte_array_descr`; comment above), whose array is
+                        // a green ref and index a green int, so folding here
+                        // collapses the per-pc opcode-dispatch guard ladder instead
+                        // of leaving a residual load. Done at record time, the read
+                        // hits the live array directly, so the optimizer's
+                        // `protect_speculative_array` typeid check (which a raw
+                        // `&[u8]` data pointer, having no GC type header, would fail)
+                        // never applies.
+                        (ctx.const_int(concrete), concrete)
+                    } else if let Some(cached) = cached {
+                        // pyjitpl.py:646 `count_ops(rop.GETARRAYITEM_GC_I,
+                        // Counters.HEAPCACHED_OPS)` — folded-away op accounting.
+                        ctx.profiler().count_ops(
                             OpCode::GetarrayitemGcI,
-                            None,
-                            &[array_opref, index_opref],
+                            crate::pyjitpl::counters::HEAPCACHED_OPS,
                         );
-                        let _ = ctx.record_op_with_descr(
+                        // pyjitpl.py:644-668 sanity check: compare the
+                        // freshly executed load (`resvalue`) against the
+                        // cached box's `tobox.getint()`.  On mismatch
+                        // `_record_helper` records a fallback op whose
+                        // return value is discarded; `assert 0` fires in
+                        // debug mode; the function still returns the
+                        // (stale) cached box.  `_record_helper` routes
+                        // through `heapcache.invalidate_caches`, but that
+                        // call short-circuits on GETARRAYITEM_GC_I
+                        // (`mark_escaped` does not escape the read,
+                        // `clear_caches_not_necessary` returns True), so
+                        // the heapcache state is intentionally left
+                        // untouched.  The cached Box's intrinsic value is
+                        // the upstream `tobox.getint()` payload — fetched
+                        // through `box_value(cached)` which composes the
+                        // const pool, standard-virtualizable shadow, and
+                        // the frontend object's `value` field (RPython
+                        // `currfieldbox.getint()` dispatch parity).
+                        // `None` payload (entry seeded without a live
+                        // concrete) skips the check.
+                        let cached_value = ctx.box_value(cached).unwrap_or(majit_ir::Value::Void);
+                        let expected = match cached_value {
+                            majit_ir::Value::Int(n) => Some(n),
+                            _ => None,
+                        };
+                        // Cache hit propagates the stale `tobox.getint()`
+                        // into the destination on mismatch — pyjitpl.py:669
+                        // returns `tobox` so the caller sees the cached
+                        // box's int, not `resvalue`.  Match that by
+                        // selecting `expected` (stale) when the assertion
+                        // fires, else the freshly executed int (which
+                        // equals expected in the no-mismatch arm).
+                        let stale = matches!(expected, Some(exp) if exp != concrete);
+                        if stale {
+                            // pyjitpl.py:2693-2694 `_record_helper` invalidates
+                            // before recording.  `clear_caches_not_necessary`
+                            // short-circuits for GETARRAYITEM_GC_I (no-side-
+                            // effect read), so the only remaining side effect
+                            // is `mark_escaped` escaping `array_opref` and
+                            // `index_opref` — match that structure here.
+                            ctx.heapcache_invalidate_caches_varargs(
+                                OpCode::GetarrayitemGcI,
+                                None,
+                                &[array_opref, index_opref],
+                            );
+                            let _ = ctx.record_op_with_descr(
+                                OpCode::GetarrayitemGcI,
+                                &[array_opref, index_opref],
+                                descr,
+                            );
+                            debug_assert!(
+                                false,
+                                "BC_GETARRAYITEM_GC_I sanity check failed: \
+                             cached={:?} concrete={}",
+                                expected, concrete,
+                            );
+                        }
+                        let reg_concrete = if stale {
+                            expected.expect("stale only set when expected is Some")
+                        } else {
+                            concrete
+                        };
+                        (cached, reg_concrete)
+                    } else {
+                        let opref = ctx.record_op_with_descr(
                             OpCode::GetarrayitemGcI,
                             &[array_opref, index_opref],
                             descr,
                         );
-                        debug_assert!(
-                            false,
-                            "BC_GETARRAYITEM_GC_I sanity check failed: \
-                             cached={:?} concrete={}",
-                            expected, concrete,
+                        // pyjitpl.py:671-672 `heapcache.getarrayitem_now_known`.
+                        // Pair the recorded opref with the live `concrete`
+                        // payload — mirrors RPython's `resbox` Box carrying
+                        // both identity and value from `executor.execute`.
+                        // `Box.value` parity: stamp the result OpRef's
+                        // frontend value slot so `lookup_opref_concrete(opref)`
+                        // returns the runtime concrete (RPython
+                        // `IntFrontendOp(pos, intval)` construction-time
+                        // field assignment).
+                        ctx.set_opref_concrete(opref, majit_ir::Value::Int(concrete));
+                        ctx.heapcache_getarrayitem_now_known(
+                            array_opref,
+                            index_opref,
+                            descr_index,
+                            opref,
                         );
-                    }
-                    let reg_concrete = if stale {
-                        expected.expect("stale only set when expected is Some")
-                    } else {
-                        concrete
+                        (opref, concrete)
                     };
-                    (cached, reg_concrete)
-                } else {
-                    let opref = ctx.record_op_with_descr(
-                        OpCode::GetarrayitemGcI,
-                        &[array_opref, index_opref],
-                        descr,
-                    );
-                    // pyjitpl.py:671-672 `heapcache.getarrayitem_now_known`.
-                    // Pair the recorded opref with the live `concrete`
-                    // payload — mirrors RPython's `resbox` Box carrying
-                    // both identity and value from `executor.execute`.
-                    // `Box.value` parity: stamp the result OpRef's
-                    // frontend value slot so `lookup_opref_concrete(opref)`
-                    // returns the runtime concrete (RPython
-                    // `IntFrontendOp(pos, intval)` construction-time
-                    // field assignment).
-                    ctx.set_opref_concrete(opref, majit_ir::Value::Int(concrete));
-                    ctx.heapcache_getarrayitem_now_known(
-                        array_opref,
-                        index_opref,
-                        descr_index,
-                        opref,
-                    );
-                    (opref, concrete)
-                };
                 self.set_int_reg(dst, Some(opref), Some(reg_concrete));
             }
             jitcode::insns::BC_GETARRAYITEM_VABLE_I => {
