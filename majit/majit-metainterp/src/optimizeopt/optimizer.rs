@@ -3486,16 +3486,6 @@ impl Optimizer {
         // Store as pending — setup() inside optimize_with_constants_and_inputs
         // clears pass state, so we apply AFTER setup.
         self.pending_bridge_rd = pending_bridge_rd;
-        // The prepared trace's pre-optimization JUMP args are used when
-        // emitting a fallback jump through send_extra_operation.  RPython's
-        // separate `runtime_boxes` argument is threaded below into
-        // jump_to_existing_trace for virtual-state guard generation.
-        let pre_opt_jump_args: Vec<crate::r#box::BoxRef> = ops
-            .last()
-            .filter(|op| op.opcode == OpCode::Jump)
-            .map(|op| op.getarglist().to_vec())
-            .unwrap_or_default();
-
         // unroll.py:193: info, ops = self.propagate_all_forward(trace, ...)
         // Bridge ops use a disjoint OpRef
         // namespace `[bridge_inputarg_base..)` (set by
@@ -3524,6 +3514,17 @@ impl Optimizer {
         // so the input-ops seed is empty; producer lookup runs off `resop_refs`
         // (populated by `bind_input_resops`).
         self.explicit_input_ops_seed = Some(Vec::new());
+        // EXPERIMENT R1 (opt-in via R1_ON): enable bridge retarget by holding
+        // the closing JUMP (skip_flush) so try_jump_to_existing_trace can run.
+        // Default OFF — keeps production bridges on the early-return path until
+        // the resume-data (rd_numb / fail-arg delivery) divergence behind the
+        // nbody hang is resolved.
+        let r1_wr = ops.last().map_or(false, |op| op.opcode == OpCode::Jump)
+            && inline_short_preamble
+            && front_target_tokens.len() > 1
+            && std::env::var_os("R1_ON").is_some();
+        let r1_saved = self.skip_flush;
+        self.skip_flush = r1_wr;
         let optimized_ops = self.optimize_with_constants_and_inputs_at(
             ops,
             constants,
@@ -3532,6 +3533,23 @@ impl Optimizer {
             start_next_pos,
             false,
         );
+        self.skip_flush = r1_saved;
+
+        // EXPERIMENT R1: a bridge trace carries no GUARD_FUTURE_CONDITION
+        // (reached_loop_header's GFC lives in pyre's loop-creation path,
+        // which bridges skip), so `self.patchguardop` is None and the
+        // retarget's inline_short_preamble guards never receive a
+        // rd_resume_position. Synthesize patchguardop from the bridge's own
+        // last body guard (highest resume position, closest to the close).
+        if r1_wr && self.patchguardop.is_none() {
+            if let Some(g) = ops
+                .iter()
+                .filter(|o| o.opcode.is_guard() && o.rd_resume_position.get() >= 0)
+                .max_by_key(|o| o.rd_resume_position.get())
+            {
+                self.patchguardop = Some((**g).clone());
+            }
+        }
 
         // RPython flush=False: JUMP is in terminal_op, not in optimized_ops.
         let terminal_jump = self.terminal_op.take();
@@ -3577,9 +3595,10 @@ impl Optimizer {
                 // unroll.py:239-240: jump_to_preamble →
                 //   jump_op = jump_op.copy_and_change(rop.JUMP, descr=...)
                 //   self.send_extra_operation(jump_op)
+                // Keep jump_op's own (forced) args; only the descr changes.
                 let jump_op = terminal_jump.copy_and_change(
                     OpCode::Jump,
-                    Some(&pre_opt_jump_args),
+                    None,
                     Some(Some(preamble_token.as_jump_target_descr())),
                 );
                 self.send_extra_operation(&jump_op, &mut ctx);
@@ -3622,6 +3641,7 @@ impl Optimizer {
         // so the top-level VS shape is preserved. We therefore omit any
         // pre-flush snapshot and let try_jump_to_existing_trace compute
         // VS internally — matching RPython 1:1.
+        ctx.skip_flush_mode = r1_wr;
         self.flush(&mut ctx);
 
         // unroll.py:204-205: force_at_the_end_of_preamble for each jump arg
@@ -3631,6 +3651,17 @@ impl Optimizer {
             let _ = self.force_box_for_end_of_preamble(arg, &mut ctx);
         }
         ctx.current_pass_idx = saved_pass_idx;
+
+        // unroll.py:203-211: after `flush()` + `force_box_for_end_of_preamble`,
+        // `_newoperations` holds the flushed heap writebacks and forced boxes.
+        // RPython does NOT clear that buffer when `jump_to_existing_trace`
+        // raises InvalidLoop — `jump_to_preamble` appends the JUMP onto it and
+        // returns `self._newoperations[:]` (unroll.py:210-211). The
+        // fallback-to-preamble paths below therefore truncate back to this
+        // length (dropping only a retarget attempt's partial emissions)
+        // instead of clearing, which would drop the flush writebacks and leave
+        // loop-carried locals unwritten at the bridge's resume.
+        let post_force_len = ctx.new_operations.len();
 
         // unroll.py:206-211: jump_to_existing_trace(force_boxes=False)
         // RPython iterates ALL target_tokens; preamble (virtual_state=None)
@@ -3651,11 +3682,12 @@ impl Optimizer {
             // RPython: self.jump_to_preamble → send_extra_operation
             Err(()) => {
                 if let Some(preamble_token) = front_target_tokens.first() {
-                    ctx.clear_newoperations();
-                    // unroll.py:239-240 jump_to_preamble parity.
+                    ctx.new_operations.truncate(post_force_len);
+                    // unroll.py:239-240 jump_to_preamble parity: keep jump_op's
+                    // own (forced) args; only the descr changes.
                     let jump_op = terminal_jump.copy_and_change(
                         OpCode::Jump,
-                        Some(&pre_opt_jump_args),
+                        None,
                         Some(Some(preamble_token.as_jump_target_descr())),
                     );
                     self.send_extra_operation(&jump_op, &mut ctx);
@@ -3699,7 +3731,7 @@ impl Optimizer {
         // `_jump_to_existing_trace(..., force_boxes=True)` (unroll.py:222);
         // VS is recomputed inside that call from the current (post-force)
         // jump_op.getarglist() — no pre-snapshot is reused.
-        ctx.clear_newoperations();
+        ctx.new_operations.truncate(post_force_len);
         let vs2 = match Self::try_jump_to_existing_trace(
             &opt_unroll,
             &jump_args,
@@ -3734,11 +3766,13 @@ impl Optimizer {
             );
         }
         if let Some(preamble_token) = front_target_tokens.first() {
-            ctx.clear_newoperations();
-            // unroll.py:239-240 jump_to_preamble parity.
+            ctx.new_operations.truncate(post_force_len);
+            // unroll.py:239-240 jump_to_preamble parity: keep jump_op's own
+            // (forced) args so send_extra_operation's Virtualize pass forces
+            // the still-virtual ref args; only the descr changes.
             let jump_op = terminal_jump.copy_and_change(
                 OpCode::Jump,
-                Some(&pre_opt_jump_args),
+                None,
                 Some(Some(preamble_token.as_jump_target_descr())),
             );
             self.send_extra_operation(&jump_op, &mut ctx);
