@@ -162,79 +162,82 @@ impl VirtualizableTracker {
         // seeded as an empty Virtualizable and populated by those ops.
         let base = ctx.inputarg_base;
         if base == 0 {
-        let mut flat_input_idx = 1usize + self.config.vable_input_offset;
+            let mut flat_input_idx = 1usize + self.config.vable_input_offset;
 
-        // RPython `info.AbstractStructPtrInfo._fields` is keyed by
-        // `fielddescr.get_index()` (descr.py:228 `index_in_parent`,
-        // populated by `cpu.fielddescrof(VTYPE, name)`).  Mirror that
-        // here so runtime queries via
-        // `op.descr.as_field_descr()?.index_in_parent() as u32` find the
-        // slot the init step seeded.
-        //
-        // `virtualizable.py:71-72 build_field_descr` assigns
-        // `index_in_parent = 1 + i` for static fields and
-        // `1 + num_static + j` for array-pointer fields; mirror that
-        // schedule for the synthetic fallback used by tests that pass
-        // empty `static_field_descrs` / `array_field_descrs`.
-        let num_static = self.config.static_field_offsets.len();
-        for (field_idx_in_vinfo, &_offset) in self.config.static_field_offsets.iter().enumerate() {
-            if flat_input_idx >= ctx.num_inputs() {
-                break;
-            }
-            let descr_for_slot = self
-                .config
-                .static_field_descrs
-                .get(field_idx_in_vinfo)
-                .cloned();
-            let field_idx = descr_for_slot
-                .as_ref()
-                .and_then(|d| d.as_field_descr())
-                .map(|fd| fd.index_in_parent() as u32)
-                .unwrap_or((1 + field_idx_in_vinfo) as u32);
-            let slot_tp = ctx
-                .inputarg_type_at(flat_input_idx)
-                .unwrap_or(majit_ir::Type::Ref);
-            let input_ref = OpRef::input_arg_typed(flat_input_idx as u32, slot_tp);
-            set_field(&mut state.fields, field_idx, input_ref);
-            if let Some(descr) = descr_for_slot {
-                set_field_descr(&mut state.field_descrs, field_idx, descr);
-            }
-            flat_input_idx += 1;
-        }
-
-        for (array_idx, (&_offset, &length)) in self
-            .config
-            .array_field_offsets
-            .iter()
-            .zip(self.config.array_lengths.iter())
-            .enumerate()
-        {
-            let descr_for_slot = self.config.array_field_descrs.get(array_idx).cloned();
-            let field_idx = descr_for_slot
-                .as_ref()
-                .and_then(|d| d.as_field_descr())
-                .map(|fd| fd.index_in_parent() as u32)
-                .unwrap_or((1 + num_static + array_idx) as u32);
-            if let Some(descr) = descr_for_slot {
-                set_field_descr(&mut state.field_descrs, field_idx, descr);
-            }
-
-            let mut elements = Vec::with_capacity(length);
-            for _ in 0..length {
+            // RPython `info.AbstractStructPtrInfo._fields` is keyed by
+            // `fielddescr.get_index()` (descr.py:228 `index_in_parent`,
+            // populated by `cpu.fielddescrof(VTYPE, name)`).  Mirror that
+            // here so runtime queries via
+            // `op.descr.as_field_descr()?.index_in_parent() as u32` find the
+            // slot the init step seeded.
+            //
+            // `virtualizable.py:71-72 build_field_descr` assigns
+            // `index_in_parent = 1 + i` for static fields and
+            // `1 + num_static + j` for array-pointer fields; mirror that
+            // schedule for the synthetic fallback used by tests that pass
+            // empty `static_field_descrs` / `array_field_descrs`.
+            let num_static = self.config.static_field_offsets.len();
+            for (field_idx_in_vinfo, &_offset) in
+                self.config.static_field_offsets.iter().enumerate()
+            {
                 if flat_input_idx >= ctx.num_inputs() {
                     break;
                 }
+                let descr_for_slot = self
+                    .config
+                    .static_field_descrs
+                    .get(field_idx_in_vinfo)
+                    .cloned();
+                let field_idx = descr_for_slot
+                    .as_ref()
+                    .and_then(|d| d.as_field_descr())
+                    .map(|fd| fd.index_in_parent() as u32)
+                    .unwrap_or((1 + field_idx_in_vinfo) as u32);
                 let slot_tp = ctx
                     .inputarg_type_at(flat_input_idx)
                     .unwrap_or(majit_ir::Type::Ref);
-                elements.push(OpRef::input_arg_typed(flat_input_idx as u32, slot_tp));
+                let input_ref = OpRef::input_arg_typed(flat_input_idx as u32, slot_tp);
+                set_field(&mut state.fields, field_idx, input_ref);
+                if let Some(descr) = descr_for_slot {
+                    set_field_descr(&mut state.field_descrs, field_idx, descr);
+                }
                 flat_input_idx += 1;
             }
-            if !elements.is_empty() {
-                let elements: Vec<BoxRef> = elements.into_iter().map(BoxRef::from_opref).collect();
-                state.arrays.push((array_idx as u32, elements));
+
+            for (array_idx, (&_offset, &length)) in self
+                .config
+                .array_field_offsets
+                .iter()
+                .zip(self.config.array_lengths.iter())
+                .enumerate()
+            {
+                let descr_for_slot = self.config.array_field_descrs.get(array_idx).cloned();
+                let field_idx = descr_for_slot
+                    .as_ref()
+                    .and_then(|d| d.as_field_descr())
+                    .map(|fd| fd.index_in_parent() as u32)
+                    .unwrap_or((1 + num_static + array_idx) as u32);
+                if let Some(descr) = descr_for_slot {
+                    set_field_descr(&mut state.field_descrs, field_idx, descr);
+                }
+
+                let mut elements = Vec::with_capacity(length);
+                for _ in 0..length {
+                    if flat_input_idx >= ctx.num_inputs() {
+                        break;
+                    }
+                    let slot_tp = ctx
+                        .inputarg_type_at(flat_input_idx)
+                        .unwrap_or(majit_ir::Type::Ref);
+                    elements.push(OpRef::input_arg_typed(flat_input_idx as u32, slot_tp));
+                    flat_input_idx += 1;
+                }
+                if !elements.is_empty() {
+                    let elements: Vec<BoxRef> =
+                        elements.into_iter().map(BoxRef::from_opref).collect();
+                    state.arrays.push((array_idx as u32, elements));
+                }
             }
-        }
         }
 
         let b = ctx.materialize_box_at(OpRef::input_arg_ref(base));
@@ -793,10 +796,9 @@ impl OptVirtualize {
         // emits. The frame is a real object (the trace's first inputarg), so
         // reading its array-pointer field does not force it.
         let reads_vable_array_field = is_standard_vable_ref
-            && self
-                .vable
-                .as_ref()
-                .map_or(false, |vt| vt.array_idx_for_offset(field_descr.offset()).is_some());
+            && self.vable.as_ref().map_or(false, |vt| {
+                vt.array_idx_for_offset(field_descr.offset()).is_some()
+            });
         if (is_raw_op && is_standard_vable_ref) || reads_vable_array_field {
             return OptimizationResult::PassOn;
         }
