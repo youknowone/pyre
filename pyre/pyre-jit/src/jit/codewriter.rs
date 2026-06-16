@@ -7267,8 +7267,7 @@ impl CodeWriter {
                                     .unwrap_or_else(|| fresh_ref_value(&mut graph).into())
                             } else {
                                 let name_idx = raw_namei as usize >> 1;
-                                let name =
-                                    code.names.get(name_idx).map(|name| name.as_str());
+                                let name = code.names.get(name_idx).map(|name| name.as_str());
                                 let w_globals = unsafe {
                                     pyre_interpreter::w_code_get_w_globals(
                                         w_code as pyre_object::PyObjectRef,
@@ -7334,10 +7333,8 @@ impl CodeWriter {
                                         .map(super::flow::FlowValue::from)
                                         .unwrap_or_else(|| fresh_ref_value(&mut graph).into())
                                 } else {
-                                    name.and_then(|nm| {
-                                        frontend_global_flow_value(w_code, nm)
-                                    })
-                                    .unwrap_or_else(|| fresh_ref_value(&mut graph).into())
+                                    name.and_then(|nm| frontend_global_flow_value(w_code, nm))
+                                        .unwrap_or_else(|| fresh_ref_value(&mut graph).into())
                                 }
                             };
                             if let super::flow::FlowValue::Variable(v) = &result_value {
