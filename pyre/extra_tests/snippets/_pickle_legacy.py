@@ -45,6 +45,15 @@ assert dumps([1, 2], 0) == b"(lp0\nI1\naI2\na.", dumps([1, 2], 0)
 assert dumps((1, 2), 0) == b"(I1\nI2\ntp0\n.", dumps((1, 2), 0)
 assert dumps({"a": 1}, 0) == b"(dp0\nVa\np1\nI1\ns.", dumps({"a": 1}, 0)
 
+# bytes / bytearray at protocol < 3 reduce through `_codecs.encode`; the global
+# reference resolves the encode function's `__module__` (`_codecs`), so the wire
+# is byte-identical to CPython 3.14.
+assert dumps(b"abc", 0) == b"c_codecs\nencode\np0\n(Vabc\np1\nVlatin1\np2\ntp3\nRp4\n.", dumps(b"abc", 0)
+assert dumps(b"abc", 1) == b"c_codecs\nencode\nq\x00(X\x03\x00\x00\x00abcq\x01X\x06\x00\x00\x00latin1q\x02tq\x03Rq\x04.", dumps(b"abc", 1)
+assert dumps(b"abc", 2) == b"\x80\x02c_codecs\nencode\nq\x00X\x03\x00\x00\x00abcq\x01X\x06\x00\x00\x00latin1q\x02\x86q\x03Rq\x04.", dumps(b"abc", 2)
+assert dumps(bytearray(b"abc"), 0) == b"c__builtin__\nbytearray\np0\n(c_codecs\nencode\np1\n(Vabc\np2\nVlatin1\np3\ntp4\nRp5\ntp6\nRp7\n.", dumps(bytearray(b"abc"), 0)
+assert dumps(bytearray(b"abc"), 2) == b"\x80\x02c__builtin__\nbytearray\nq\x00c_codecs\nencode\nq\x01X\x03\x00\x00\x00abcq\x02X\x06\x00\x00\x00latin1q\x03\x86q\x04Rq\x05\x85q\x06Rq\x07.", dumps(bytearray(b"abc"), 2)
+
 # fix_imports: at protocol < 3, range maps to the Python 2 __builtin__.xrange
 # global; protocol 3 keeps the canonical name. Both round-trip.
 assert dumps(range(5), 2) == (

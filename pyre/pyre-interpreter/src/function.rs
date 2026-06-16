@@ -494,15 +494,21 @@ pub unsafe fn is_function(obj: PyObjectRef) -> bool {
 /// Stamp a module-level builtin function's `__module__` with its
 /// containing module at install time — `MixedModule` registration sets
 /// `func.w_module = w(modulename)` for each interp-level definition.
-/// Only touches `BUILTIN_FUNCTION_TYPE` objects whose module is still
-/// unset; app-level functions derive `__module__` from their globals and
-/// are left alone.
+/// Touches `BUILTIN_FUNCTION_TYPE` objects and globals-less
+/// `FUNCTION_TYPE` objects (the `py_module!` `inline_functions` /
+/// `functions` carriers) whose module is still unset.  App-level
+/// functions carry globals and derive `__module__` lazily from
+/// `globals['__name__']`, so a function with globals is left alone.
 ///
 /// # Safety
 /// `obj` must be a valid, non-null pointer to a `PyObject`.
 pub unsafe fn builtin_function_set_module(obj: PyObjectRef, w_module: PyObjectRef) {
     unsafe {
-        if py_type_check(obj, &BUILTIN_FUNCTION_TYPE) {
+        let stampable = py_type_check(obj, &BUILTIN_FUNCTION_TYPE)
+            || (py_type_check(obj, &FUNCTION_TYPE)
+                && (*(obj as *const Function)).w_func_globals.is_null()
+                && (*(obj as *const Function)).w_func_globals_obj.is_null());
+        if stampable {
             let func = obj as *mut Function;
             if (*func).w_module.is_null() {
                 (*func).w_module = w_module;
