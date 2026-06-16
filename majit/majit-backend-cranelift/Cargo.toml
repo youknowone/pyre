@@ -19,11 +19,17 @@ cranelift-native = { workspace = true }
 target-lexicon = { workspace = true }
 
 [features]
-# Workspace-wide `cargo test --all --features dynasm` also selects this
-# crate's tests. The cranelift backend itself has no dynasm code path, but
-# its integration tests depend on `majit-metainterp::recorder::Trace`, and
-# `majit-metainterp` requires one backend feature to compile.
+# This crate's integration tests depend on `majit-metainterp::recorder::Trace`,
+# and `majit-metainterp` requires one backend feature to compile (pyjitpl/mod.rs
+# selects `BackendImpl` and `compile_error!`s with none). Selecting the
+# metainterp backend through this crate's own features keeps both
+# `cargo test --all --features dynasm` and `--features cranelift` coherent, and
+# lets the per-package form `cargo test -p majit-backend-cranelift --features
+# cranelift` (or `--features dynasm`) compile the dev-dependency. The two
+# features are mutually exclusive at the metainterp level (cranelift wins if
+# both are set); pick one per test invocation.
 dynasm = ["majit-metainterp/dynasm"]
+cranelift = ["majit-metainterp/cranelift"]
 
 [dev-dependencies]
 majit-metainterp = { workspace = true }
