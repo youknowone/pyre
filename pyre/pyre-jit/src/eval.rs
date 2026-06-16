@@ -8682,6 +8682,10 @@ mod tests {
         let int_list =
             pyre_object::w_list_new(vec![pyre_object::w_int_new(1), pyre_object::w_int_new(2)]);
         unsafe {
+            // A freshly built list allocates capacity == length, so append
+            // once to force the over-allocating grow that leaves the raw
+            // append fast path spare capacity to write into.
+            pyre_object::listobject::w_list_append(int_list, pyre_object::w_int_new(3));
             assert!(pyre_object::listobject::w_list_uses_int_storage(int_list));
             assert!(pyre_object::listobject::w_list_can_append_without_realloc(
                 int_list
@@ -8700,6 +8704,9 @@ mod tests {
             pyre_object::w_float_new(2.5),
         ]);
         unsafe {
+            // Same as the int case: force the over-allocating grow so the
+            // raw append fast path has spare capacity.
+            pyre_object::listobject::w_list_append(float_list, pyre_object::w_float_new(3.5));
             assert!(pyre_object::listobject::w_list_uses_float_storage(
                 float_list
             ));
