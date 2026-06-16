@@ -9316,7 +9316,7 @@ fn try_walker_specialize_subscr(
     if !list_op.is_constant() && !ctx.trace_ctx.heap_cache().is_class_known(list_op) {
         let type_const = ctx.trace_ctx.const_int(list_type_addr);
         ctx.trace_ctx
-            .record_guard(OpCode::GuardNonnullClass, &[list_op, type_const], 0);
+            .record_guard(OpCode::GuardClass, &[list_op, type_const], 0);
         walker_capture_snapshot_for_last_guard(ctx, op_pc)?;
     }
     ctx.trace_ctx
@@ -9484,7 +9484,7 @@ fn try_walker_specialize_store_subscr(
     if !list_op.is_constant() && !ctx.trace_ctx.heap_cache().is_class_known(list_op) {
         let type_const = ctx.trace_ctx.const_int(list_type_addr);
         ctx.trace_ctx
-            .record_guard(OpCode::GuardNonnullClass, &[list_op, type_const], 0);
+            .record_guard(OpCode::GuardClass, &[list_op, type_const], 0);
         walker_capture_snapshot_for_last_guard(ctx, op_pc)?;
     }
     ctx.trace_ctx

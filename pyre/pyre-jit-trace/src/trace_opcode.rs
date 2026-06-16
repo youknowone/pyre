@@ -5412,7 +5412,15 @@ impl MIFrame {
             return;
         }
         let expected_type_const = ctx.const_int(expected_type as usize as i64);
-        self.generate_guard(ctx, OpCode::GuardNonnullClass, &[obj, expected_type_const]);
+        // pyjitpl.py:1521 records GUARD_CLASS. The obj is non-null by
+        // construction here (every caller passes a value-stack operand or a
+        // freshly read object, the same invariant under which the codewriter
+        // emits guard_class at jtransform.py:1004-1010 handle_getfield_typeptr).
+        // A genuinely null-fed class-guarded slot is rejected structurally by
+        // the cross-loop-CUT abort in compile_loop_body, not by the guard form.
+        // The optimizer strengthens a separately-recorded preceding GUARD_NONNULL
+        // into GUARD_NONNULL_CLASS (rewrite.py:408-444 / optimize_guard_class).
+        self.generate_guard(ctx, OpCode::GuardClass, &[obj, expected_type_const]);
         // heapcache.py:470-473: class_now_known sets class + nullity.
         ctx.heap_cache_mut()
             .class_now_known(obj, expected_type as usize as i64);

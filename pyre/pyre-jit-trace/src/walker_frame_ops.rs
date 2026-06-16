@@ -109,8 +109,13 @@ pub trait WalkerFrameOps {
     /// `pyjitpl.py:1518-1523` `opimpl_guard_class` parity.  Skips the
     /// guard when the heapcache already knows the class or the OpRef
     /// is constant (the runtime type is already pinned).  Otherwise
-    /// records `GUARD_NONNULL_CLASS` with `expected_type_const` and
-    /// updates the heapcache's class+nullity record.
+    /// records `GUARD_CLASS` with `expected_type_const` and updates the
+    /// heapcache's class+nullity record.  The obj is non-null by
+    /// construction (a value-stack operand, the same invariant under
+    /// which the codewriter emits guard_class at
+    /// jtransform.py:1004-1010 handle_getfield_typeptr); the optimizer
+    /// strengthens a preceding `GUARD_NONNULL` into `GUARD_NONNULL_CLASS`
+    /// (rewrite.py:408-444).
     fn guard_class(&mut self, obj: OpRef, expected_type: *const PyType) {
         if self.ctx().heap_cache().is_class_known(obj) {
             return;
@@ -129,7 +134,7 @@ pub trait WalkerFrameOps {
             return;
         }
         let expected_type_const = self.ctx_mut().const_int(expected_type as usize as i64);
-        self.generate_guard(OpCode::GuardNonnullClass, &[obj, expected_type_const]);
+        self.generate_guard(OpCode::GuardClass, &[obj, expected_type_const]);
         // heapcache.py:470-473 `class_now_known` parity.
         self.ctx_mut()
             .heap_cache_mut()

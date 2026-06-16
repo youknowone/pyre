@@ -7984,7 +7984,7 @@ mod tests {
 
         let recorder = ctx.into_recorder();
         let op = recorder.ops().last().expect("guard op should be present");
-        assert_eq!(op.opcode, OpCode::GuardNonnullClass);
+        assert_eq!(op.opcode, OpCode::GuardClass);
         assert_eq!(op.arg(0).to_opref(), obj);
     }
 
@@ -8064,7 +8064,7 @@ mod tests {
             })
             .collect();
         for op in recorder.ops() {
-            if op.opcode == OpCode::GuardNonnullClass {
+            if op.opcode == OpCode::GuardClass {
                 saw_guard_nonnull_class = true;
             }
             if op.opcode == OpCode::GetfieldGcPureI
@@ -8080,7 +8080,7 @@ mod tests {
         }
         assert!(
             saw_guard_nonnull_class,
-            "int payload fast path should guard object class via GuardNonnullClass: {:?}",
+            "int payload fast path should guard object class via GuardClass: {:?}",
             recorded_ops
         );
         assert!(
@@ -8515,7 +8515,7 @@ mod tests {
             recorder
                 .ops()
                 .iter()
-                .all(|op| op.opcode != majit_ir::OpCode::GuardNonnullClass),
+                .all(|op| op.opcode != majit_ir::OpCode::GuardClass),
             "typed-int index should not guard object class for an unbox fast path: {:?}",
             recorder.ops()
         );
@@ -8982,7 +8982,7 @@ r = acc",
     /// RPython portal return type is always REF (warmspot.py:449).
     /// The self-recursive call uses CALL_ASSEMBLER_R, FINISH records with
     /// done_with_this_frame_descr_ref, and the caller unboxes via
-    /// GuardNonnullClass + GetfieldGcPureI (pyjitpl.py:3198-3220).
+    /// GuardClass + GetfieldGcPureI (pyjitpl.py:3198-3220).
     ///
     /// A previous bug used CALL_ASSEMBLER_I + FINISH(Int) + forced unbox
     /// at the blackhole boundary, causing pointer-like-integer corruption
