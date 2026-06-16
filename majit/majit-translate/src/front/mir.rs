@@ -4326,20 +4326,28 @@ impl<'a> Lowering<'a> {
 
     /// A thin-pointer `Deref::deref` / `DerefMut::deref_mut` whose
     /// dereferenced `&T` is a registered struct, resolved to the pointee
-    /// struct root.  `Box<T>` / `Rc<T>` / `Arc<T>` and the workspace
-    /// `FrameBox` are each one pointer word (the heap address of the
-    /// pointee), so `*p` is a typed pointer reinterpret rather than a
-    /// value-producing operation: the caller lowers it to the
-    /// `cast_pointer(T, p)` downcast marker (`cast_pointer_marker_op`),
-    /// which yields `SomeInstance(T)` (lltype.py:964-974) independent of
-    /// the receiver's (classdef-less) annotation — the same shape pyre
-    /// emits for `obj as *const W_Foo`.
+    /// struct root.  Valid only when the handle's single pointer word *is*
+    /// the pointee address, so `*p` is a zero-offset reinterpret: `Box<T>`
+    /// (no header — `Unique<T>` points straight at `T`), the workspace
+    /// `FrameBox` (`{ptr: *mut PyFrame}`), and single-field transparent
+    /// wrappers (`{UnsafeCell<T>}`).  For these the caller lowers the
+    /// deref to the `cast_pointer(T, p)` downcast marker
+    /// (`cast_pointer_marker_op`), which yields `SomeInstance(T)`
+    /// (lltype.py:964-974) independent of the receiver's (classdef-less)
+    /// annotation — the same shape pyre emits for `obj as *const W_Foo`.
     ///
-    /// Returns `None` when the call is not a `deref` / `deref_mut` leaf
-    /// or the dereferenced type is not a named ADT (slice / `str` derefs
-    /// resolve no struct root and keep their ordinary lowering — their
-    /// `&[T]` / `&str` value model is the receiver's, narrowed by the
-    /// list / string reprs, not a pointer downcast).
+    /// `Rc<T>` / `Arc<T>` are the exception: their word points at a
+    /// refcount header, so the pointee sits at a non-zero offset and
+    /// `cast_pointer` would reinterpret the header.  They are subtracted
+    /// by owner-type leaf; an unresolved owner keeps the ordinary
+    /// thin-pointer treatment, since the dereferenced `&T` must still
+    /// resolve a registered struct root below.
+    ///
+    /// Returns `None` when the call is not a `deref` / `deref_mut` leaf or
+    /// the dereferenced type is not a named ADT (slice / `str` derefs
+    /// resolve no struct root — their `&[T]` / `&str` value model is the
+    /// receiver's, narrowed by the list / string reprs, not a pointer
+    /// downcast).
     fn deref_cast_root(&self, reg: &RegularCall, dest_ty: &TyRef) -> Option<String> {
         let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
             return None;
@@ -4348,6 +4356,11 @@ impl<'a> Lowering<'a> {
         let np = fd.item_meta.name_path();
         if !(np.ends_with("::deref") || np.ends_with("::deref_mut")) {
             return None;
+        }
+        if let Some(leaf) = deref_impl_owner_leaf(self.llbc, fd) {
+            if matches!(leaf.as_str(), "Rc" | "Arc") {
+                return None;
+            }
         }
         tyref_class_root(dest_ty, self.llbc)
     }
@@ -5770,6 +5783,33 @@ fn impl_method_owner_for_fundecl(llbc: &Llbc, fd: &FunDecl) -> Option<(String, S
         return None;
     }
     Some((owner_qualified, leaf))
+}
+
+/// For a `Deref` / `DerefMut` trait-impl method, resolve the leaf
+/// identifier of the implementing `Self` ADT (`Box`, `Rc`, `Arc`,
+/// `FrameBox`, …) directly from the impl's `Self` type, bypassing the
+/// registry-keyed `impl_method_owner_for_fundecl` (which resolves only
+/// self-receiver methods it can key into `PyreCallRegistry`).  Used to
+/// subtract the `cast_pointer` thin-pointer rewrite for the
+/// header-offset handles whose word is not the pointee address.
+/// Returns `None` when the owner cannot be resolved, in which case the
+/// caller keeps the ordinary thin-pointer treatment.
+fn deref_impl_owner_leaf(llbc: &Llbc, fd: &FunDecl) -> Option<String> {
+    let segs = &fd.item_meta.name;
+    let last_idx = segs
+        .iter()
+        .rposition(|s| matches!(s, NameSeg::Ident { .. }))?;
+    if last_idx == 0 {
+        return None;
+    }
+    let impl_payload = match &segs[last_idx - 1] {
+        NameSeg::Other(v) => v.as_object()?.get("Impl")?,
+        _ => return None,
+    };
+    let adt_def_id = resolve_impl_owner_adt_def_id_free(llbc, impl_payload)?;
+    let td = llbc.type_by_id(adt_def_id)?;
+    let path = td.item_meta.name_path();
+    Some(path.rsplit("::").next().unwrap_or(&path).to_string())
 }
 
 /// Collect, from the lowered MIR,

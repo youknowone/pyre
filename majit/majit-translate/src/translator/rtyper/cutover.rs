@@ -723,6 +723,7 @@ fn compare_real_against_legacy(
 /// | `compute_at_fixpoint failed`               | PBC dispatch / call-family coverage (per-call).                              |
 /// | `post-rtyper jtransform variant`           | Per-variant emit-site retracing (rpbc / rclass / front-end).  Includes `OpKind::Abort` (pyre-only marker; retire every `Expr::ForLoop` / `stop_unsupported` / `continue_with_unknown` emit-site at the front-end). |
 /// | `adapter cross-block body Input`           | Final emit-site retirement.                                                  |
+/// | `noneify() not supported`                  | Front-end typed null-pointer lowering (`Option<*T>` / null → `SomePtr`, not `SomeNone`); the raise itself is parity-correct. |
 ///
 /// PyPy `bookkeeper.py:108-127` propagates fixpoint failures uncaught;
 /// pyre's dual-gate Skip defers exactly the categories enumerated
@@ -1898,6 +1899,19 @@ mod tests {
         assert!(
             is_known_unported(msg),
             "registry population must skip/fallback on the current indirect-call cutover gap"
+        );
+    }
+
+    #[test]
+    fn known_unported_classifies_noneify_on_ptr_merge() {
+        // A `_ptr ∪ NoneType` block merge reaches `SomeValue::noneify()`
+        // on a `SomePtr` operand — a parity-correct raise (default
+        // `noneify` raises, `SomePtr` has no override) the dual gate
+        // defers to legacy until `front::mir` lowers a typed null pointer.
+        let msg = "RPython noneify() not supported for this annotation";
+        assert!(
+            is_known_unported(msg),
+            "noneify-on-ptr merge must skip/fallback on the typed-null-pointer-lowering gap"
         );
     }
 
