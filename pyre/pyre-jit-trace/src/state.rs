@@ -2343,6 +2343,35 @@ pub(crate) fn float_array_descr() -> DescrRef {
     )
 }
 
+/// `Ptr(GcArray(Signed))` — the `IntegerListStrategy` backing block
+/// (`erase([int])`). Length-prefixed `[capacity][i64...]`: `base_size` skips
+/// the capacity header so `GetarrayitemGcI(block, i)` lands on items[i], and
+/// the op routes through the `(array, descr, index)` heap cache (CSE), unlike
+/// the raw `int_array_descr`.
+pub(crate) fn int_gcarray_descr() -> DescrRef {
+    crate::descr::make_array_descr_with_type(
+        pyre_object::TYPED_ITEMS_BLOCK_ITEMS_OFFSET,
+        8,
+        pyre_object::GC_INT_ARRAY_GC_TYPE_ID,
+        Some(0),
+        Type::Int,
+        true,
+    )
+}
+
+/// `Ptr(GcArray(Float))` — the `FloatListStrategy` backing block
+/// (`erase([float])`). See [`int_gcarray_descr`].
+pub(crate) fn float_gcarray_descr() -> DescrRef {
+    crate::descr::make_array_descr_with_type(
+        pyre_object::TYPED_ITEMS_BLOCK_ITEMS_OFFSET,
+        8,
+        pyre_object::GC_FLOAT_ARRAY_GC_TYPE_ID,
+        Some(0),
+        Type::Float,
+        false,
+    )
+}
+
 /// `descr.py SizeDescr` for the host `PyFrame` virtualizable struct.
 ///
 /// All `PyFrame` field descriptors point at this SizeDescr via
@@ -3135,6 +3164,80 @@ pub(crate) fn trace_raw_float_array_setitem_value(
         &[array, index, value],
         float_array_descr(),
     );
+}
+
+/// `GetarrayitemGcI(block, index)` against `int_gcarray_descr` — the
+/// `IntegerListStrategy` GC-array read. Mirrors
+/// [`trace_items_block_getitem_value`] (the Object-strategy GcArray(OBJECTPTR)
+/// read) but with an `Int` item type, so the read routes through the heap cache.
+pub(crate) fn trace_int_block_getitem_value(
+    ctx: &mut TraceCtx,
+    block: OpRef,
+    index: OpRef,
+) -> OpRef {
+    let descr = int_gcarray_descr();
+    let descr_idx = descr.index();
+    if let Some(cached) = ctx.heapcache_getarrayitem(block, index, descr_idx) {
+        return cached;
+    }
+    let result = ctx.record_op_with_descr(OpCode::GetarrayitemGcI, &[block, index], descr.clone());
+    let live_value = array_load_for_cache(ctx, block, index, &descr, majit_ir::Type::Int);
+    if !matches!(live_value, majit_ir::Value::Void) {
+        ctx.set_opref_concrete(result, live_value);
+    }
+    ctx.heapcache_getarrayitem_now_known(block, index, descr_idx, result);
+    result
+}
+
+/// Companion of [`trace_int_block_getitem_value`] — `SetarrayitemGc(block,
+/// index, value)` against `int_gcarray_descr` (int items carry no pointer, so
+/// no write barrier is emitted).
+pub(crate) fn trace_int_block_setitem_value(
+    ctx: &mut TraceCtx,
+    block: OpRef,
+    index: OpRef,
+    value: OpRef,
+) {
+    let descr = int_gcarray_descr();
+    let descr_idx = descr.index();
+    ctx.record_op_with_descr(OpCode::SetarrayitemGc, &[block, index, value], descr);
+    ctx.heapcache_setarrayitem(block, index, descr_idx, value);
+}
+
+/// `GetarrayitemGcF(block, index)` against `float_gcarray_descr` — the
+/// `FloatListStrategy` GC-array read (heap-cached). See
+/// [`trace_int_block_getitem_value`].
+pub(crate) fn trace_float_block_getitem_value(
+    ctx: &mut TraceCtx,
+    block: OpRef,
+    index: OpRef,
+) -> OpRef {
+    let descr = float_gcarray_descr();
+    let descr_idx = descr.index();
+    if let Some(cached) = ctx.heapcache_getarrayitem(block, index, descr_idx) {
+        return cached;
+    }
+    let result = ctx.record_op_with_descr(OpCode::GetarrayitemGcF, &[block, index], descr.clone());
+    let live_value = array_load_for_cache(ctx, block, index, &descr, majit_ir::Type::Float);
+    if !matches!(live_value, majit_ir::Value::Void) {
+        ctx.set_opref_concrete(result, live_value);
+    }
+    ctx.heapcache_getarrayitem_now_known(block, index, descr_idx, result);
+    result
+}
+
+/// Companion of [`trace_float_block_getitem_value`] — `SetarrayitemGc(block,
+/// index, value)` against `float_gcarray_descr`.
+pub(crate) fn trace_float_block_setitem_value(
+    ctx: &mut TraceCtx,
+    block: OpRef,
+    index: OpRef,
+    value: OpRef,
+) {
+    let descr = float_gcarray_descr();
+    let descr_idx = descr.index();
+    ctx.record_op_with_descr(OpCode::SetarrayitemGc, &[block, index, value], descr);
+    ctx.heapcache_setarrayitem(block, index, descr_idx, value);
 }
 
 /// pyframe.py:49 `self.w_globals` — read the canonical dict object

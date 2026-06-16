@@ -254,6 +254,116 @@ unsafe fn grow_items_block(
     }
 }
 
+// ─── TypedItemsBlock: GcArray(Float)/GcArray(Signed) backing block ───────
+//
+// The Float / Integer list strategies (`listobject.py` FloatListStrategy /
+// IntegerListStrategy) store their unboxed items in a `Ptr(GcArray(Float))` /
+// `Ptr(GcArray(Signed))` — `erase([float])` / `erase([int])`. This block
+// mirrors that shape: an 8-byte capacity header (the GcArray length, rlist.py:251
+// `len(l.items)`) followed by inline 8-byte items (f64 or i64). The live list
+// length lives on the enclosing `FloatArray` / `IntArray` wrapper (rlist.py:116
+// `("length", Signed)`), so the header is the allocated capacity, fixed for the
+// block's lifetime (a `grow` allocates a fresh block).
+//
+// Items are non-pointer words, so the GC walker has no inner refs to trace —
+// unlike `ItemsBlock` (`GcArray(OBJECTPTR)`). STEPPING-STONE: like `ItemsBlock`,
+// allocation still uses `std::alloc` rather than MiniMark's nursery; the
+// matching `GC_FLOAT_ARRAY_GC_TYPE_ID` / `GC_INT_ARRAY_GC_TYPE_ID` are inactive
+// at collection time until the Phase L2 allocator cutover.
+
+/// `#[repr(C)] { capacity, items: [u64; 0] }` — the `GcArray(Float)` /
+/// `GcArray(Signed)` body backing `FloatArray` / `IntArray`. Layout: offset 0 =
+/// `capacity` (GcArray length header), offset 8 = items[0..capacity]. Items are
+/// 8-byte words read as `f64` / `i64` by the wrapper; the JIT-visible array
+/// descriptor carries the element type.
+#[repr(C)]
+pub struct TypedItemsBlock {
+    /// Allocated capacity — the GcArray length header (rlist.py:251).
+    pub capacity: usize,
+    /// Items inline after the header; size known only at allocation time.
+    items: [u64; 0],
+}
+
+pub const TYPED_ITEMS_BLOCK_ITEMS_OFFSET: usize = std::mem::offset_of!(TypedItemsBlock, items);
+
+/// Items base pointer (`&items[0]`) of a `TypedItemsBlock`. Null-safe.
+#[inline]
+pub unsafe fn typed_items_block_items_base(block: *mut TypedItemsBlock) -> *mut u8 {
+    if block.is_null() {
+        return std::ptr::null_mut();
+    }
+    unsafe { (block as *mut u8).add(TYPED_ITEMS_BLOCK_ITEMS_OFFSET) }
+}
+
+/// Allocated capacity (GcArray length header) of a `TypedItemsBlock`. 0 for null.
+#[inline]
+pub unsafe fn typed_items_block_capacity(block: *mut TypedItemsBlock) -> usize {
+    if block.is_null() {
+        return 0;
+    }
+    unsafe { (*block).capacity }
+}
+
+fn typed_items_block_layout(cap: usize) -> Layout {
+    let total = TYPED_ITEMS_BLOCK_ITEMS_OFFSET + cap * std::mem::size_of::<u64>();
+    Layout::from_size_align(total, std::mem::align_of::<TypedItemsBlock>())
+        .expect("TypedItemsBlock layout")
+}
+
+/// Allocate a fresh zero-filled `TypedItemsBlock` with the given capacity.
+/// Zero-fill matches `gc_malloc_array` (rlist.py:262-267 `_ll_list_resize_really`)
+/// and the Float/Int strategy `_none_value` (0.0 / 0). `cap` is clamped to at
+/// least 1 (rlist.py:251 overallocation policy keeps a slot for in-place growth).
+pub unsafe fn alloc_typed_items_block(cap: usize) -> *mut TypedItemsBlock {
+    let cap = cap.max(1);
+    let layout = typed_items_block_layout(cap);
+    unsafe {
+        let raw = alloc_zeroed(layout);
+        if raw.is_null() {
+            std::alloc::handle_alloc_error(layout);
+        }
+        let block = raw as *mut TypedItemsBlock;
+        (*block).capacity = cap;
+        block
+    }
+}
+
+/// Grow a `TypedItemsBlock` to `new_cap`, copying `live_len` words from `old`,
+/// zero-filling the rest, and deallocating `old`. `old` may be null.
+/// rlist.py:262-267 parity.
+pub unsafe fn grow_typed_items_block(
+    old: *mut TypedItemsBlock,
+    new_cap: usize,
+    live_len: usize,
+) -> *mut TypedItemsBlock {
+    unsafe {
+        let fresh = alloc_typed_items_block(new_cap);
+        if !old.is_null() && live_len > 0 {
+            std::ptr::copy_nonoverlapping(
+                typed_items_block_items_base(old),
+                typed_items_block_items_base(fresh),
+                live_len * std::mem::size_of::<u64>(),
+            );
+        }
+        if !old.is_null() {
+            dealloc_typed_items_block(old);
+        }
+        fresh
+    }
+}
+
+/// Deallocate a `TypedItemsBlock`. No-op on null.
+pub unsafe fn dealloc_typed_items_block(block: *mut TypedItemsBlock) {
+    if block.is_null() {
+        return;
+    }
+    unsafe {
+        let cap = (*block).capacity;
+        let layout = typed_items_block_layout(cap);
+        dealloc(block as *mut u8, layout);
+    }
+}
+
 // ─── FixedObjectArray: pyframe.py:112 make_sure_not_resized parity ────────
 //
 // RPython `locals_cells_stack_w = [None] * size; make_sure_not_resized(...)`

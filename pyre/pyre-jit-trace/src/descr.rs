@@ -1048,6 +1048,29 @@ static W_LIST_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
                 false,
                 false,
             ),
+            // `Ptr(GcArray(Signed))` / `Ptr(GcArray(Float))` — the typed
+            // strategy backing blocks (`erase([int])` / `erase([float])`).
+            // Read as a Ref so `GetarrayitemGcI` / `GetarrayitemGcF` address
+            // items[i] through the heap cache. Mutable: re-pointed on grow /
+            // strategy switch (like `W_ListObject.items`).
+            (
+                "W_ListObject.int_items.block",
+                std::mem::offset_of!(W_ListObject, int_items) + INT_ARRAY_BLOCK_OFFSET,
+                8,
+                Type::Ref,
+                false,
+                false,
+                false,
+            ),
+            (
+                "W_ListObject.float_items.block",
+                std::mem::offset_of!(W_ListObject, float_items) + FLOAT_ARRAY_BLOCK_OFFSET,
+                8,
+                Type::Ref,
+                false,
+                false,
+                false,
+            ),
         ],
         "W_ListObject",
         "listobject::W_ListObject",
@@ -1658,9 +1681,10 @@ use pyre_object::rangeobject::{
 };
 use pyre_object::strobject::STR_LEN_OFFSET;
 use pyre_object::{
-    BOOL_BOOLVAL_OFFSET, FLOAT_ARRAY_HEAP_CAP_OFFSET, FLOAT_ARRAY_LEN_OFFSET,
-    FLOAT_ARRAY_PTR_OFFSET, INT_ARRAY_HEAP_CAP_OFFSET, INT_ARRAY_LEN_OFFSET, INT_ARRAY_PTR_OFFSET,
-    INT_INTVAL_OFFSET, W_ListObject, W_TupleObject,
+    BOOL_BOOLVAL_OFFSET, FLOAT_ARRAY_BLOCK_OFFSET, FLOAT_ARRAY_HEAP_CAP_OFFSET,
+    FLOAT_ARRAY_LEN_OFFSET, FLOAT_ARRAY_PTR_OFFSET, INT_ARRAY_BLOCK_OFFSET,
+    INT_ARRAY_HEAP_CAP_OFFSET, INT_ARRAY_LEN_OFFSET, INT_ARRAY_PTR_OFFSET, INT_INTVAL_OFFSET,
+    W_ListObject, W_TupleObject,
 };
 // Re-import the rest without duplication
 use pyre_object::{FLOAT_TYPE, INT_TYPE};
@@ -1815,6 +1839,20 @@ pub fn list_float_items_len_descr() -> DescrRef {
 
 pub fn list_float_items_heap_cap_descr() -> DescrRef {
     field_descr_from_group(&W_LIST_DESCR_GROUP, 8)
+}
+
+/// `Ptr(GcArray(Signed))` — the `int_items` backing block (`erase([int])`).
+/// Read as a Ref; combine with the GcArray(Signed) array descr
+/// (`int_gcarray_descr`) for `GetarrayitemGcI` / `SetarrayitemGc`.
+pub fn list_int_items_block_descr() -> DescrRef {
+    field_descr_from_group(&W_LIST_DESCR_GROUP, 9)
+}
+
+/// `Ptr(GcArray(Float))` — the `float_items` backing block (`erase([float])`).
+/// Read as a Ref; combine with the GcArray(Float) array descr
+/// (`float_gcarray_descr`) for `GetarrayitemGcF` / `SetarrayitemGc`.
+pub fn list_float_items_block_descr() -> DescrRef {
+    field_descr_from_group(&W_LIST_DESCR_GROUP, 10)
 }
 
 /// `Ptr(GcArray(OBJECTPTR))` — `wrappeditems` body per

@@ -1,55 +1,67 @@
 use std::ops::{Index, IndexMut};
 
-/// Small-buffer capacity. Arrays up to this size avoid heap allocation.
+use crate::object_array::{
+    TypedItemsBlock, alloc_typed_items_block, dealloc_typed_items_block, grow_typed_items_block,
+    typed_items_block_capacity, typed_items_block_items_base,
+};
+
+/// Small-buffer capacity constant retained for the append/pop inline-capacity
+/// trace path (`is_inline()` is always false, so it is never consulted at
+/// runtime).
 pub const INT_ARRAY_INLINE_CAP: usize = 8;
 
-/// Fixed-size i64 array with small-buffer optimization.
+/// Unboxed `int` list storage — `listobject.py` IntegerListStrategy
+/// `lstorage = erase([int])`, i.e. a `Ptr(GcArray(Signed))`.
+///
+/// The data lives in a separate length-prefixed [`TypedItemsBlock`]
+/// (`[capacity][i64...]`) so the JIT can address it as a GC array
+/// (`GetfieldGcR(block) → GetarrayitemGcI`). `ptr` mirrors the block's items
+/// base; `heap_cap` mirrors the block capacity. Both are kept in sync by every
+/// method that reallocates the block.
 #[repr(C)]
 pub struct IntArray {
+    /// `Ptr(GcArray(Signed))` — the backing block. Always non-null.
+    pub block: *mut TypedItemsBlock,
+    /// Items base (`= block + ITEMS_OFFSET`). Mirrors the block.
     pub ptr: *mut i64,
+    /// Live length (rlist.py:116 `("length", Signed)`).
     len: usize,
+    /// Allocated capacity, mirroring the block header.
     heap_cap: usize,
-    inline_buf: [i64; INT_ARRAY_INLINE_CAP],
 }
 
+pub const INT_ARRAY_BLOCK_OFFSET: usize = std::mem::offset_of!(IntArray, block);
 pub const INT_ARRAY_PTR_OFFSET: usize = std::mem::offset_of!(IntArray, ptr);
 pub const INT_ARRAY_LEN_OFFSET: usize = std::mem::offset_of!(IntArray, len);
 pub const INT_ARRAY_HEAP_CAP_OFFSET: usize = std::mem::offset_of!(IntArray, heap_cap);
 
 impl IntArray {
-    pub fn from_vec(mut values: Vec<i64>) -> Self {
-        let len = values.len();
-        if len <= INT_ARRAY_INLINE_CAP {
-            let mut inline_buf = [0; INT_ARRAY_INLINE_CAP];
-            inline_buf[..len].copy_from_slice(&values);
-            let mut arr = Self {
-                ptr: std::ptr::null_mut(),
-                len,
-                heap_cap: 0,
-                inline_buf,
-            };
-            arr.ptr = arr.inline_buf.as_mut_ptr();
-            arr
-        } else {
-            let ptr = values.as_mut_ptr();
-            let cap = values.capacity();
-            std::mem::forget(values);
-            Self {
-                ptr,
-                len,
-                heap_cap: cap,
-                inline_buf: [0; INT_ARRAY_INLINE_CAP],
-            }
+    #[inline]
+    fn sync_from_block(&mut self) {
+        unsafe {
+            self.ptr = typed_items_block_items_base(self.block) as *mut i64;
+            self.heap_cap = typed_items_block_capacity(self.block);
         }
+    }
+
+    pub fn from_vec(values: Vec<i64>) -> Self {
+        let len = values.len();
+        let mut arr = Self {
+            block: unsafe { alloc_typed_items_block(len) },
+            ptr: std::ptr::null_mut(),
+            len,
+            heap_cap: 0,
+        };
+        arr.sync_from_block();
+        unsafe {
+            std::ptr::copy_nonoverlapping(values.as_ptr(), arr.ptr, len);
+        }
+        arr
     }
 
     #[inline]
     fn capacity(&self) -> usize {
-        if self.heap_cap > 0 {
-            self.heap_cap
-        } else {
-            INT_ARRAY_INLINE_CAP
-        }
+        self.heap_cap
     }
 
     #[inline]
@@ -57,56 +69,33 @@ impl IntArray {
         self.capacity().saturating_sub(self.len)
     }
 
+    /// Integer list storage is always a separate block (no inline buffer).
     #[inline]
     pub fn is_inline(&self) -> bool {
-        self.heap_cap == 0
+        false
     }
 
-    fn grow_to_heap(&mut self, min_cap: usize) {
-        let target_cap = min_cap.max(INT_ARRAY_INLINE_CAP * 2);
-        let mut values = Vec::with_capacity(target_cap);
-        values.extend_from_slice(&self.inline_buf[..self.len]);
-        self.ptr = values.as_mut_ptr();
-        self.heap_cap = values.capacity();
-        std::mem::forget(values);
-    }
-
-    fn grow_heap(&mut self, min_cap: usize) {
-        let target_cap = min_cap.max(self.heap_cap.saturating_mul(2).max(1));
-        unsafe {
-            let mut values = Vec::from_raw_parts(self.ptr, self.len, self.heap_cap);
-            values.reserve(target_cap.saturating_sub(values.capacity()));
-            self.ptr = values.as_mut_ptr();
-            self.heap_cap = values.capacity();
-            std::mem::forget(values);
-        }
+    fn grow(&mut self, min_cap: usize) {
+        let target_cap = min_cap
+            .max(self.heap_cap.saturating_mul(2))
+            .max(INT_ARRAY_INLINE_CAP);
+        self.block = unsafe { grow_typed_items_block(self.block, target_cap, self.len) };
+        self.sync_from_block();
     }
 
     pub fn push(&mut self, value: i64) {
-        if self.len == self.capacity() {
-            if self.heap_cap == 0 {
-                self.grow_to_heap(self.len + 1);
-            } else {
-                self.grow_heap(self.len + 1);
-            }
+        if self.len == self.heap_cap {
+            self.grow(self.len + 1);
         }
-
-        if self.heap_cap > 0 {
-            unsafe {
-                *self.ptr.add(self.len) = value;
-            }
-        } else {
-            self.inline_buf[self.len] = value;
-            self.ptr = self.inline_buf.as_mut_ptr();
+        unsafe {
+            *self.ptr.add(self.len) = value;
         }
         self.len += 1;
     }
 
     #[inline]
     pub fn fix_ptr(&mut self) {
-        if self.heap_cap == 0 {
-            self.ptr = self.inline_buf.as_mut_ptr();
-        }
+        self.sync_from_block();
     }
 
     #[inline]
@@ -115,19 +104,11 @@ impl IntArray {
     }
 
     pub fn as_slice(&self) -> &[i64] {
-        if self.heap_cap > 0 {
-            unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
-        } else {
-            &self.inline_buf[..self.len]
-        }
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
     }
 
     pub fn as_mut_slice(&mut self) -> &mut [i64] {
-        if self.heap_cap > 0 {
-            unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
-        } else {
-            &mut self.inline_buf[..self.len]
-        }
+        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
     }
 
     pub fn to_vec(&self) -> Vec<i64> {
@@ -136,12 +117,8 @@ impl IntArray {
 
     pub fn insert(&mut self, index: usize, value: i64) {
         assert!(index <= self.len);
-        if self.len == self.capacity() {
-            if self.heap_cap == 0 {
-                self.grow_to_heap(self.len + 1);
-            } else {
-                self.grow_heap(self.len + 1);
-            }
+        if self.len == self.heap_cap {
+            self.grow(self.len + 1);
         }
         unsafe {
             let p = self.ptr.add(index);
@@ -180,12 +157,8 @@ impl IntArray {
         let len2 = new_values.len();
         let new_len = old_len - slicelength + len2;
         if len2 > slicelength {
-            if new_len > self.capacity() {
-                if self.heap_cap == 0 {
-                    self.grow_to_heap(new_len);
-                } else {
-                    self.grow_heap(new_len);
-                }
+            if new_len > self.heap_cap {
+                self.grow(new_len);
             }
             unsafe {
                 std::ptr::copy(
@@ -232,10 +205,8 @@ impl IntArray {
 
 impl Drop for IntArray {
     fn drop(&mut self) {
-        if self.heap_cap > 0 {
-            unsafe {
-                drop(Vec::from_raw_parts(self.ptr, self.len, self.heap_cap));
-            }
+        unsafe {
+            dealloc_typed_items_block(self.block);
         }
     }
 }
@@ -245,21 +216,13 @@ impl Index<usize> for IntArray {
 
     #[inline]
     fn index(&self, index: usize) -> &Self::Output {
-        if self.heap_cap > 0 {
-            unsafe { &*self.ptr.add(index) }
-        } else {
-            &self.inline_buf[index]
-        }
+        unsafe { &*self.ptr.add(index) }
     }
 }
 
 impl IndexMut<usize> for IntArray {
     #[inline]
     fn index_mut(&mut self, index: usize) -> &mut Self::Output {
-        if self.heap_cap > 0 {
-            unsafe { &mut *self.ptr.add(index) }
-        } else {
-            &mut self.inline_buf[index]
-        }
+        unsafe { &mut *self.ptr.add(index) }
     }
 }

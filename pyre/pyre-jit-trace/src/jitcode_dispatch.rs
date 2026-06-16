@@ -8787,32 +8787,25 @@ fn try_walker_specialize_subscr(
             crate::state::trace_items_block_getitem_value(ctx.trace_ctx, items_block, raw_index)
         }
         1 => {
-            let items_ptr = crate::state::opimpl_getfield_gc_i(
+            let block = crate::state::opimpl_getfield_gc_r(
                 ctx.trace_ctx,
                 list_op,
-                crate::descr::list_int_items_ptr_descr(),
+                crate::descr::list_int_items_block_descr(),
             );
-            let raw = crate::state::trace_raw_int_array_getitem_value(
-                ctx.trace_ctx,
-                items_ptr,
-                raw_index,
-            );
+            let raw = crate::state::trace_int_block_getitem_value(ctx.trace_ctx, block, raw_index);
             let elem = unsafe { pyre_object::w_int_get_value(result_obj) };
             ctx.trace_ctx
                 .set_opref_concrete(raw, majit_ir::Value::Int(elem));
             crate::state::wrapint(ctx.trace_ctx, raw)
         }
         _ => {
-            let items_ptr = crate::state::opimpl_getfield_gc_i(
+            let block = crate::state::opimpl_getfield_gc_r(
                 ctx.trace_ctx,
                 list_op,
-                crate::descr::list_float_items_ptr_descr(),
+                crate::descr::list_float_items_block_descr(),
             );
-            let raw = crate::state::trace_raw_float_array_getitem_value(
-                ctx.trace_ctx,
-                items_ptr,
-                raw_index,
-            );
+            let raw =
+                crate::state::trace_float_block_getitem_value(ctx.trace_ctx, block, raw_index);
             let elem = unsafe { pyre_object::w_float_get_value(result_obj) };
             ctx.trace_ctx
                 .set_opref_concrete(raw, majit_ir::Value::Float(elem));
@@ -8930,16 +8923,10 @@ fn try_walker_specialize_store_subscr(
         .set_opref_concrete(raw_index, majit_ir::Value::Int(index));
 
     // Bounds guard (non-negative index path): IntLt(raw_index, len).
-    let (len_descr, items_ptr_descr) = if sid == 1 {
-        (
-            crate::descr::list_int_items_len_descr(),
-            crate::descr::list_int_items_ptr_descr(),
-        )
+    let len_descr = if sid == 1 {
+        crate::descr::list_int_items_len_descr()
     } else {
-        (
-            crate::descr::list_float_items_len_descr(),
-            crate::descr::list_float_items_ptr_descr(),
-        )
+        crate::descr::list_float_items_len_descr()
     };
     let lenbox = crate::state::opimpl_getfield_gc_i(ctx.trace_ctx, list_op, len_descr);
     let in_bounds = ctx.trace_ctx.record_op(OpCode::IntLt, &[raw_index, lenbox]);
@@ -8949,21 +8936,30 @@ fn try_walker_specialize_store_subscr(
     );
     walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardTrue, &[in_bounds])?;
 
-    // Unbox the value + setarrayitem_raw.
-    let items_ptr = crate::state::opimpl_getfield_gc_i(ctx.trace_ctx, list_op, items_ptr_descr);
+    // Unbox the value + setarrayitem.
     if sid == 1 {
+        let block = crate::state::opimpl_getfield_gc_r(
+            ctx.trace_ctx,
+            list_op,
+            crate::descr::list_int_items_block_descr(),
+        );
         let raw = walker_unbox_int(ctx, op_pc, value_op, int_type_addr)?;
         let elem = unsafe { pyre_object::w_int_get_value(value_obj) };
         ctx.trace_ctx
             .set_opref_concrete(raw, majit_ir::Value::Int(elem));
-        crate::state::trace_raw_int_array_setitem_value(ctx.trace_ctx, items_ptr, raw_index, raw);
+        crate::state::trace_int_block_setitem_value(ctx.trace_ctx, block, raw_index, raw);
     } else {
+        let block = crate::state::opimpl_getfield_gc_r(
+            ctx.trace_ctx,
+            list_op,
+            crate::descr::list_float_items_block_descr(),
+        );
         let float_type_addr = &pyre_object::pyobject::FLOAT_TYPE as *const _ as i64;
         let raw = walker_unbox_float(ctx, op_pc, value_op, float_type_addr)?;
         let elem = unsafe { pyre_object::w_float_get_value(value_obj) };
         ctx.trace_ctx
             .set_opref_concrete(raw, majit_ir::Value::Float(elem));
-        crate::state::trace_raw_float_array_setitem_value(ctx.trace_ctx, items_ptr, raw_index, raw);
+        crate::state::trace_float_block_setitem_value(ctx.trace_ctx, block, raw_index, raw);
     }
 
     // Tracing is execution (pyjitpl.py:2095 execute_and_record): apply the
