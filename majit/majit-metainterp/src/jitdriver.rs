@@ -2342,35 +2342,63 @@ impl<S: JitState> JitDriver<S> {
                     allocator,
                 );
                 if let Some((mut bh, _vable_ptr)) = bh {
-                    // Thread the state-field register layout so the
-                    // `state_field` handlers map a logical scalar/array index
-                    // to the flat register slot the resume reader seeded.
-                    bh.state_field_layout = state.state_field_layout();
+                    // Thread the state-field register layout onto every frame
+                    // so the `state_field` handlers map a logical scalar/array
+                    // index to the flat register slot the resume reader seeded.
+                    // Inlined sub-frames carry no state-field ops, but the root
+                    // dispatch frame (the chain tail, which owns the merge point
+                    // and the loop's state load/store) does, so it must hold the
+                    // layout before it runs.
+                    let sf_layout = state.state_field_layout();
+                    bh.state_field_layout = sf_layout.clone();
                     let exc = crate::blackhole::BlackholeInterpreter::prepare_resume_from_failure(
                         guard_exc,
                     );
-                    // Drive the single resume frame directly (not
-                    // `run_forever_with_portal`, which consumes `bh`) so the
-                    // red register file stays readable when the frame raises
-                    // ContinueRunningNormally at the next merge point. PyPy
-                    // re-enters the portal with the CRN reds
-                    // (warmspot.py:970-983); majit's interpreter is a live
-                    // `state` struct, so the structural equivalent is
-                    // restoring the full red register file — the CRN reds are
-                    // only the declared subset, so restore from `registers_i`
-                    // (resume.py:1028-1038 seeded it in slot order).
-                    let outcome = bh.resume_mainloop(exc);
+                    // Drive the reconstructed frame chain (blackhole.py:1752
+                    // `_run_forever`): each completed sub-frame passes its
+                    // return value to its caller (resume_mainloop did the
+                    // `setup_return_value_*` copy), then we descend to the
+                    // caller until a frame raises a control exception — CRN at
+                    // a merge point, DoneWithThisFrame at the root, or an
+                    // uncaught exception. Unlike `run_forever_with_portal`,
+                    // which consumes every frame and so leaves no register file
+                    // to read, keep the terminal frame alive: PyPy re-enters
+                    // the portal with the CRN reds (warmspot.py:970-983), but
+                    // those are only the declared subset, so the structural
+                    // equivalent for majit's live `state` struct is to restore
+                    // the terminal frame's full register bank
+                    // (resume.py:1028-1038 seeded it in slot order) and resume
+                    // at the CRN green pc.
+                    let mut cur_exc = exc;
+                    let outcome = loop {
+                        match bh.resume_mainloop(cur_exc) {
+                            Ok(next_exc) => match bh.nextblackholeinterp.take() {
+                                Some(mut caller) => {
+                                    caller.state_field_layout = sf_layout.clone();
+                                    bh_builder.release_interp(bh);
+                                    bh = *caller;
+                                    cur_exc = next_exc;
+                                }
+                                // The bottommost frame always raises
+                                // (done_with_this_frame / exit_frame_with_
+                                // exception), so an `Ok` with no caller is
+                                // unreachable; treat it as a void completion.
+                                None => break crate::jitexc::JitException::DoneWithThisFrameVoid,
+                            },
+                            Err(jit_exc) => break jit_exc,
+                        }
+                    };
                     if crate::majit_log_enabled() {
-                        eprintln!("[bh] back_edge_internal: resume_mainloop → {:?}", outcome);
+                        eprintln!("[bh] back_edge_internal: chain resume → {:?}", outcome);
                     }
                     let resume_pc = match outcome {
                         // Next merge point reached (loop back-edge): flush the
                         // register file into the live state and resume the
                         // interpreter at the merge point's green pc.
-                        Err(crate::jitexc::JitException::ContinueRunningNormally {
+                        crate::jitexc::JitException::ContinueRunningNormally {
                             ref green_int,
                             ..
-                        }) => {
+                        } => {
                             // PyPy re-enters the portal with the CRN greens
                             // (warmspot.py:970-983), so the interpreter
                             // resumes at the pc the re-executed
@@ -2403,10 +2431,10 @@ impl<S: JitState> JitDriver<S> {
                         // blackhole: flush, then force the generated mainloop's
                         // `while pc < len` guard to fail so it exits and
                         // returns the value computed from the flushed state.
-                        Err(crate::jitexc::JitException::DoneWithThisFrameVoid)
-                        | Err(crate::jitexc::JitException::DoneWithThisFrameInt(_))
-                        | Err(crate::jitexc::JitException::DoneWithThisFrameRef(_))
-                        | Err(crate::jitexc::JitException::DoneWithThisFrameFloat(_)) => {
+                        crate::jitexc::JitException::DoneWithThisFrameVoid
+                        | crate::jitexc::JitException::DoneWithThisFrameInt(_)
+                        | crate::jitexc::JitException::DoneWithThisFrameRef(_)
+                        | crate::jitexc::JitException::DoneWithThisFrameFloat(_) => {
                             let layout = state.state_field_layout();
                             let int_base = layout.int_scalar_base.min(bh.registers_i.len());
                             let ref_base = layout.ref_scalar_base.min(bh.registers_r.len());
