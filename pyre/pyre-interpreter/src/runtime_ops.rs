@@ -621,6 +621,20 @@ pub fn format_value(value: PyObjectRef, spec: PyObjectRef) -> Result<PyObjectRef
     Ok(pyre_object::w_str_from_wtf8(s))
 }
 
+/// STORE_SLICE evaluation (`obj[start:stop] = value`): builds a `slice`
+/// object and dispatches through `setitem`, mirroring `PyObject_SetItem`
+/// with a slice key. The dual of `binary_slice_values`; a `None` step.
+pub fn store_slice_values(
+    obj: PyObjectRef,
+    start: PyObjectRef,
+    stop: PyObjectRef,
+    value: PyObjectRef,
+) -> Result<(), PyError> {
+    let slice = pyre_object::w_slice_new(start, stop, pyre_object::w_none());
+    crate::baseobjspace::setitem(obj, slice, value)?;
+    Ok(())
+}
+
 /// BINARY_SLICE evaluation, shared by the interpreter (`binary_slice`)
 /// and the JIT residual (`bh_binary_slice_fn`): returns `obj[start:stop]`.
 /// `list` / `str` / `tuple` slice on element (code-point for `str`)

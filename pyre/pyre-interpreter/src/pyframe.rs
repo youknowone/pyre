@@ -701,6 +701,17 @@ pub fn ncells(code: &CodeObject) -> usize {
     npure_cellvars(code) + code.freevars.len()
 }
 
+/// True when localsplus slot `idx` carries `CO_FAST_HIDDEN`, i.e. an inlined
+/// comprehension's iteration variable (PEP 709). These slots are workspace
+/// only and stay invisible to `locals()` / the fast↔locals sync.
+#[inline]
+#[majit_macros::elidable_cannot_raise]
+pub fn hidden_local(code: &CodeObject, idx: usize) -> bool {
+    code.localspluskinds
+        .get(idx)
+        .is_some_and(|&kind| kind & crate::bytecode::CO_FAST_HIDDEN != 0)
+}
+
 /// `LOAD_DEREF` unbound-variable error for the unified deref slot `idx`,
 /// shared by the interpreter (`load_deref`) and the JIT residual
 /// (`bh_load_deref_value_fn`).
@@ -877,6 +888,20 @@ impl PyFrame {
     pub fn getdictscope(&mut self) -> Result<*mut DictStorage, crate::PyError> {
         self.fast2locals()?;
         Ok(self.get_w_locals())
+    }
+
+    /// `getorcreatedebug().w_locals` — the STORE_NAME / DELETE_NAME target
+    /// (`pyopcode.py:855-865`): the class namespace, or the globals dict at
+    /// module scope. Lazily allocates an empty dict if the frame has none.
+    /// Unlike `getdictscope` it performs no `fast2locals` materialization, so
+    /// it never disturbs `CO_FAST_HIDDEN` slots.
+    #[inline]
+    pub fn get_or_create_w_locals(&mut self) -> *mut DictStorage {
+        let data = self.getorcreate_debug_data(-1);
+        if data.w_locals.is_null() {
+            data.w_locals = pyre_object::lltype::malloc_raw(DictStorage::new());
+        }
+        data.w_locals
     }
 
     /// PyPy-compatible `__init__` hook.
@@ -1940,6 +1965,12 @@ impl PyFrame {
         // pyframe.py:609-615: copy locals from dict to fast slots
         let mut new_fastlocals_w = vec![PY_NULL; numlocals];
         for i in 0..numlocals {
+            // CO_FAST_HIDDEN slots are not reflected in the locals mapping —
+            // preserve the current fast value instead of clearing it.
+            if hidden_local(code, i) {
+                new_fastlocals_w[i] = self.locals_w()[i];
+                continue;
+            }
             let name = &code.varnames[i];
             if let Some(&w_value) = w_locals_ref.get(name.as_ref()) {
                 new_fastlocals_w[i] = w_value;
@@ -2008,6 +2039,12 @@ impl PyFrame {
 
         let mut new_fastlocals_w = vec![PY_NULL; numlocals];
         for i in 0..numlocals {
+            // CO_FAST_HIDDEN slots are not reflected in the locals mapping —
+            // preserve the current fast value instead of clearing it.
+            if hidden_local(code, i) {
+                new_fastlocals_w[i] = self.locals_w()[i];
+                continue;
+            }
             let name = &code.varnames[i];
             if let Some(w_value) = finditem_str_object(w_locals_object, name)? {
                 new_fastlocals_w[i] = w_value;
@@ -2091,6 +2128,17 @@ impl PyFrame {
 
         // pyframe.py:564-575: copy local variables
         for i in 0..numlocals {
+            // CO_FAST_HIDDEN slots — an inlined comprehension's iteration
+            // variable at module/class scope — are not user-visible and must
+            // not be synced to the locals mapping. For a module frame whose
+            // `w_locals` is its globals dict, the slot stays NULL (the name is
+            // bound by STORE_NAME in the dict, not the fast array), so the
+            // delitem branch below would otherwise erase the binding on every
+            // getdictscope. frameobject.c skips CO_FAST_HIDDEN in both
+            // directions.
+            if hidden_local(code, i) {
+                continue;
+            }
             let name = &varnames[i];
             let w_value = self.locals_w()[i];
             if !w_value.is_null() {
@@ -2171,6 +2219,10 @@ impl PyFrame {
         let numlocals = varnames.len();
 
         for i in 0..numlocals {
+            // CO_FAST_HIDDEN slots are not user-visible — see fast2locals.
+            if hidden_local(code, i) {
+                continue;
+            }
             let name = &varnames[i];
             let w_value = self.locals_w()[i];
             if !w_value.is_null() {

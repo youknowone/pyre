@@ -20,6 +20,7 @@ mod repl_readline;
 enum RunMode {
     Script(String),
     Command(String),
+    Module(String),
     Repl,
 }
 
@@ -29,6 +30,7 @@ fn usage(binary_name: &str) -> String {
 usage: {binary_name} [option] ... [-c cmd | file | -] [arg] ...
 Options:
 -c cmd : program passed in as string (terminates option list)
+-m mod : run library module as a script (terminates option list)
 -h     : print this help message and exit (also --help)
 -i     : inspect interactively after running script
 -O     : optimize (no-op, reserved for compatibility)
@@ -41,7 +43,18 @@ arg ...: arguments passed to program in sys.argv[1:]
     )
 }
 
-fn parse_args(binary_name: &str) -> Result<(RunMode, bool, bool), lexopt::Error> {
+/// Drain the parser's remaining raw arguments to become `sys.argv[1:]`.
+/// `-c`, `-m`, and a script path each terminate option parsing, so anything
+/// after them belongs to the program rather than the launcher.
+fn drain_args(parser: &mut lexopt::Parser) -> Result<Vec<String>, lexopt::Error> {
+    let mut rest = Vec::new();
+    for raw in parser.raw_args()? {
+        rest.push(raw.string()?);
+    }
+    Ok(rest)
+}
+
+fn parse_args(binary_name: &str) -> Result<(RunMode, bool, bool, Vec<String>), lexopt::Error> {
     let mut parser = lexopt::Parser::from_env();
     let mut inspect = false;
     let mut quiet = false;
@@ -50,7 +63,13 @@ fn parse_args(binary_name: &str) -> Result<(RunMode, bool, bool), lexopt::Error>
         match arg {
             Short('c') => {
                 let cmd = parser.value()?.string()?;
-                return Ok((RunMode::Command(cmd), inspect, quiet));
+                let rest = drain_args(&mut parser)?;
+                return Ok((RunMode::Command(cmd), inspect, quiet, rest));
+            }
+            Short('m') => {
+                let module = parser.value()?.string()?;
+                let rest = drain_args(&mut parser)?;
+                return Ok((RunMode::Module(module), inspect, quiet, rest));
             }
             Short('h') | Long("help") => {
                 print!("{}", usage(binary_name));
@@ -65,17 +84,16 @@ fn parse_args(binary_name: &str) -> Result<(RunMode, bool, bool), lexopt::Error>
             }
             Value(script) => {
                 let script = script.string()?;
-                let mode = if script == "-" {
-                    RunMode::Repl
-                } else {
-                    RunMode::Script(script)
-                };
-                return Ok((mode, inspect, quiet));
+                if script == "-" {
+                    return Ok((RunMode::Repl, inspect, quiet, vec![]));
+                }
+                let rest = drain_args(&mut parser)?;
+                return Ok((RunMode::Script(script), inspect, quiet, rest));
             }
             _ => return Err(arg.unexpected()),
         }
     }
-    Ok((RunMode::Repl, inspect, quiet))
+    Ok((RunMode::Repl, inspect, quiet, vec![]))
 }
 
 pub fn main_entry(binary_name: &'static str) {
@@ -122,7 +140,7 @@ fn real_main(binary_name: &str) {
             default_hook(info);
         }
     }));
-    let (mode, inspect, quiet) = match parse_args(binary_name) {
+    let (mode, inspect, quiet, args) = match parse_args(binary_name) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("{binary_name}: {e}");
@@ -148,8 +166,23 @@ fn real_main(binary_name: &str) {
             // Initialize sys.path with CWD for -c mode.
             let cwd = std::env::current_dir().unwrap_or_else(|_| Path::new(".").to_path_buf());
             importing::init_sys_path(&cwd);
-            importing::set_sys_argv(&["-c".to_string()]);
+            let mut argv = vec!["-c".to_string()];
+            argv.extend(args);
+            importing::set_sys_argv(&argv);
             run_source(&cmd, Mode::Exec, "<string>");
+            if inspect {
+                repl::run_repl(true);
+            }
+        }
+        RunMode::Module(module) => {
+            // `-m`: sys.path[0] is the cwd (runpy resets argv[0] to the
+            // module's resolved origin via `_run_module_as_main`).
+            let cwd = std::env::current_dir().unwrap_or_else(|_| Path::new(".").to_path_buf());
+            importing::init_sys_path(&cwd);
+            let mut argv = vec![module.clone()];
+            argv.extend(args);
+            importing::set_sys_argv(&argv);
+            run_module(&module);
             if inspect {
                 repl::run_repl(true);
             }
@@ -169,9 +202,9 @@ fn real_main(binary_name: &str) {
                 .canonicalize()
                 .unwrap_or_else(|_| Path::new(".").to_path_buf());
             importing::init_sys_path(&script_dir);
-            // Collect remaining CLI args for sys.argv.
-            let argv = vec![path.clone()];
-            // lexopt consumed script name; remaining values go to sys.argv[1:]
+            // sys.argv[0] is the script path; remaining values go to argv[1:].
+            let mut argv = vec![path.clone()];
+            argv.extend(args);
             importing::set_sys_argv(&argv);
             run_source(&source, Mode::Exec, &path);
             if inspect {
@@ -208,6 +241,80 @@ fn maybe_print_jit_stats() {
     );
 }
 
+/// Shared top-level launcher bootstrap for `run_source` and `run_module`:
+/// register `__build_class__`, create the process `ExecutionContext`, seed
+/// the build-class and `LAST_EXEC_CTX` TLS slots so
+/// `space.getexecutioncontext()` (sys.settrace/getframe) resolves from the
+/// first user statement, and install SIGINT handling (app_main.py:926).
+fn setup_exec_context() -> Rc<PyExecutionContext> {
+    // Register __build_class__ callback (PyPy: setup_builtin_modules)
+    register_build_class();
+    let execution_context = Rc::new(PyExecutionContext::default());
+    set_build_class_exec_ctx(Rc::as_ptr(&execution_context));
+    set_last_exec_ctx(Rc::as_ptr(&execution_context));
+    unsafe {
+        let ec_ptr = Rc::as_ptr(&execution_context) as *mut PyExecutionContext;
+        pyre_interpreter::module::_signal::interp_signal::install_signal_handling(&mut *ec_ptr);
+    }
+    execution_context
+}
+
+/// Run a library module as `__main__` via `runpy._run_module_as_main`,
+/// the `-m` entry point. `vm.run_module` analog.
+fn run_module(module: &str) {
+    let execution_context = setup_exec_context();
+    let ec_ptr = Rc::as_ptr(&execution_context);
+
+    // `_run_module_as_main` reads `sys.modules["__main__"].__dict__` and runs
+    // the module's code in it, so a `__main__` module backed by a fresh dict
+    // must exist before runpy is imported. Reuse the canonical W_DictObject
+    // paired with the storage so `__main__.__dict__` and `globals()` share one
+    // identity (module.py:77 Module.getdict()).
+    let mut namespace = Box::new(execution_context.fresh_dict_storage());
+    namespace.fix_ptr();
+    pyre_interpreter::dict_storage_store(
+        &mut namespace,
+        "__name__",
+        pyre_object::w_str_new("__main__"),
+    );
+    let namespace = Box::into_raw(namespace);
+    let canonical = pyre_interpreter::baseobjspace::dict_storage_to_dict(namespace);
+    let main_module = pyre_object::moduleobject::w_module_new_aliasing_dict(
+        "__main__",
+        namespace as *mut u8,
+        canonical,
+    );
+    importing::set_sys_module("__main__", main_module);
+
+    let result = (|| -> Result<(), pyre_interpreter::PyError> {
+        let runpy = importing::importhook("runpy", canonical, pyre_object::PY_NULL, 0, ec_ptr)?;
+        let func = pyre_interpreter::getattr(runpy, pyre_object::w_str_new("_run_module_as_main"))?;
+        let res = pyre_interpreter::call_function(func, &[pyre_object::w_str_new(module)]);
+        if res.is_null() {
+            return Err(
+                pyre_interpreter::call::take_call_error().unwrap_or_else(|| {
+                    pyre_interpreter::PyError::new(
+                        pyre_interpreter::PyErrorKind::RuntimeError,
+                        "runpy._run_module_as_main returned NULL without an exception",
+                    )
+                }),
+            );
+        }
+        Ok(())
+    })();
+
+    if let Err(e) = result {
+        if e.kind == PyErrorKind::SystemExit {
+            maybe_print_jit_stats();
+            std::process::exit(system_exit_code(&e));
+        }
+        maybe_print_jit_stats();
+        pyre_interpreter::eprint_exception(&e, true);
+        std::process::exit(1);
+    }
+    maybe_print_jit_stats();
+}
+
 fn run_source(source: &str, mode: Mode, filename: &str) {
     let code = match compile_source_with_filename(source, mode, filename) {
         Ok(code) => code,
@@ -217,26 +324,7 @@ fn run_source(source: &str, mode: Mode, filename: &str) {
         }
     };
 
-    // Register __build_class__ callback (PyPy: setup_builtin_modules)
-    register_build_class();
-
-    let execution_context = Rc::new(PyExecutionContext::default());
-    // Set execution context for __build_class__ to use
-    set_build_class_exec_ctx(Rc::as_ptr(&execution_context));
-    // Eagerly seed the LAST_EXEC_CTX TLS slot so that
-    // `space.getexecutioncontext()` (sys.settrace/setprofile/getframe)
-    // returns the live ExecutionContext from the very first user
-    // statement, not only after the first `eval_frame_plain` entry
-    // updates the slot.  Mirrors PyPy's `space.threadlocals` always
-    // holding the active EC for the current thread.
-    set_last_exec_ctx(Rc::as_ptr(&execution_context));
-    // app_main.py:926 — install SIGINT → default_int_handler so Ctrl-C
-    // raises KeyboardInterrupt, and register the periodic signal-check
-    // action on the execution context.
-    unsafe {
-        let ec_ptr = Rc::as_ptr(&execution_context) as *mut PyExecutionContext;
-        pyre_interpreter::module::_signal::interp_signal::install_signal_handling(&mut *ec_ptr);
-    }
+    let execution_context = setup_exec_context();
     let mut frame = match PyFrame::new_with_context(code, execution_context) {
         Ok(frame) => frame,
         Err(e) => {

@@ -1366,11 +1366,14 @@ impl NamespaceOpcodeHandler for PyFrame {
         self.load_global_value(name, nameindex)
     }
 
-    /// PyPy: STORE_NAME writes to locals (class body) or globals.
+    /// pyopcode.py:855-859 STORE_NAME —
+    /// `space.setitem_str(self.getorcreatedebug().w_locals, varname, w_value)`.
     ///
-    /// Non-dict mapping locals route through
-    /// `space.setitem(w_locals_object, name, value)` matching
-    /// `pyopcode.py:STORE_NAME` `space.setitem(w_locals, ...)`.
+    /// Writes straight to `w_locals` (the class namespace, or — at module
+    /// scope — the globals dict). It must NOT route through `getdictscope`:
+    /// that runs `fast2locals`, which would erase a module frame's
+    /// `CO_FAST_HIDDEN` inlined-comprehension locals (their fast slot is NULL,
+    /// the binding lives in `w_locals` via STORE_NAME) on every store.
     fn store_name_value(
         &mut self,
         name: &str,
@@ -1383,7 +1386,7 @@ impl NamespaceOpcodeHandler for PyFrame {
             crate::baseobjspace::setitem(w_locals_object, key, value)?;
             return Ok(());
         }
-        let ns = unsafe { &mut *self.getdictscope()? };
+        let ns = unsafe { &mut *self.get_or_create_w_locals() };
         dict_storage_store(ns, name, value);
         Ok(())
     }
@@ -3673,9 +3676,13 @@ impl OpcodeStepExecutor for PyFrame {
     }
 
     // ── StoreSlice (a[b:c] = d) ──
+    // Stack (bottom→top): value, container, start, stop.
     fn store_slice(&mut self) -> Result<(), PyError> {
-        // Stub — rarely used in hot loops
-        Err(PyError::type_error("STORE_SLICE not yet implemented"))
+        let stop = self.pop();
+        let start = self.pop();
+        let container = self.pop();
+        let value = self.pop();
+        crate::runtime_ops::store_slice_values(container, start, stop, value)
     }
 
     // ── BuildString (f-string concatenation) ──
