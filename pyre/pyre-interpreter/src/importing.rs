@@ -995,11 +995,23 @@ fn absolute_import(
                 format!("No module named '{modulename}'"),
             ));
         };
-        // _bootstrap._find_and_load: bind the submodule as an attribute of
-        // its parent package, so `import a.b` makes `a.b` reachable. A
-        // parent that refuses attribute assignment is ignored, as in CPython.
+        // _bootstrap._find_and_load (_bootstrap.py:1346-1352): bind the
+        // submodule as an attribute of its parent package so `import a.b`
+        // makes `a.b` reachable. Only an AttributeError is swallowed (with an
+        // ImportWarning); any other exception propagates.
         if let Some(parent_mod) = parent {
-            let _ = crate::setattr_str(parent_mod, part, module);
+            if let Err(err) = crate::setattr_str(parent_mod, part, module) {
+                if err.kind != crate::PyErrorKind::AttributeError {
+                    return Err(err);
+                }
+                let parent_name = parts[..level].join(".");
+                crate::warn::warn(
+                    &format!(
+                        "Cannot set an attribute on '{parent_name}' for child module '{part}'"
+                    ),
+                    "ImportWarning",
+                );
+            }
         }
         if level == 0 {
             first = Some(module);

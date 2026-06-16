@@ -14,10 +14,12 @@ use pyre_object::PyObjectRef;
 /// matching CPython where `_ast` types are heap types. Actual AST node
 /// construction is not supported because pyre uses RustPython's compiler.
 pub fn register_module(ns: &mut DictStorage) {
-    // `type(name, (base,), {"__module__": "_ast"})` — a fresh heap type.
+    // `type(name, (base,), {"__module__": "ast"})` — a fresh heap type. The
+    // generated AST types report `__module__ == "ast"` (astcompiler/ast.py:150;
+    // the host `_ast.Module.__module__` is likewise `'ast'`).
     let make = |name: &str, base: PyObjectRef| -> PyObjectRef {
         let dict = pyre_object::w_dict_new();
-        crate::baseobjspace::setitem(dict, pyre_object::w_str_new("__module__"), pyre_object::w_str_new("_ast"))
+        crate::baseobjspace::setitem(dict, pyre_object::w_str_new("__module__"), pyre_object::w_str_new("ast"))
             .expect("set __module__ on _ast type namespace");
         let args = [
             pyre_object::w_str_new(name),
