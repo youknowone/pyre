@@ -8658,6 +8658,183 @@ fn resolve_const_int(
     }
 }
 
+/// Whether a `Display` (`{}`) or `Debug` (`{:?}`) placeholder rendered an
+/// argument. Carried by the `fmt::rt::Argument::new_display` /
+/// `new_debug` constructor in the parallel args array (the packed pieces
+/// template does not encode the choice).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+enum FmtArgKind {
+    Display,
+    Debug,
+}
+
+/// One placeholder argument recovered from a `format_args!` chain: the
+/// value Variable the placeholder renders and its Display/Debug flavour.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+struct FmtArg {
+    value: crate::flowspace::model::Variable,
+    kind: FmtArgKind,
+}
+
+/// The decoded contents of a `format_args!` chain — the literal string
+/// pieces interleaved with the rendered placeholder arguments
+/// (`pieces.len() == args.len() + 1`).
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+struct FmtChain {
+    pieces: Vec<String>,
+    args: Vec<FmtArg>,
+}
+
+/// Match a `FunctionPath`'s trailing segments against `tail`, so a
+/// crate-qualified spelling (`core::fmt::Arguments::new`) and the
+/// crate-stripped front-end spelling (`fmt::Arguments::new`) both
+/// resolve.
+#[allow(dead_code)]
+fn fmt_path_ends_with(segments: &[String], tail: &[&str]) -> bool {
+    segments.len() >= tail.len()
+        && segments[segments.len() - tail.len()..]
+            .iter()
+            .zip(tail)
+            .all(|(s, t)| s.as_str() == *t)
+}
+
+/// The `fmt::Arguments::new(pieces, args)` constructor that `format_args!`
+/// builds from the on-stack pieces+args arrays.
+#[allow(dead_code)]
+fn is_arguments_new_path(segments: &[String]) -> bool {
+    fmt_path_ends_with(segments, &["Arguments", "new"])
+}
+
+/// Classify a `fmt::rt::Argument::new_display` / `new_debug` constructor
+/// path. Any other path (positional/named/width-bearing argument ctor) is
+/// not in the recognized subset.
+#[allow(dead_code)]
+fn fmt_argument_ctor_kind(segments: &[String]) -> Option<FmtArgKind> {
+    if fmt_path_ends_with(segments, &["Argument", "new_display"]) {
+        Some(FmtArgKind::Display)
+    } else if fmt_path_ends_with(segments, &["Argument", "new_debug"]) {
+        Some(FmtArgKind::Debug)
+    } else {
+        None
+    }
+}
+
+/// Unwrap the `format_args!` argument tuple-ref. Each Display/Debug
+/// argument reaches `Argument::new_display(&v)` as a `FieldRead` off the
+/// on-stack argument `Tuple` aggregate (`&(v,).0`); follow it back to the
+/// value written into that tuple field. Returns `var` unchanged when it
+/// is not produced by a `FieldRead` (value passed directly), and `None`
+/// when the tuple field has conflicting writers.
+#[allow(dead_code)]
+fn unwrap_fmt_arg_tuple_ref(
+    graph: &FunctionGraph,
+    var: &crate::flowspace::model::Variable,
+) -> Option<crate::flowspace::model::Variable> {
+    use crate::model::OpKind;
+    let (block_id, idx) = resolve_to_producer_op(graph, var)?;
+    let block = graph.blocks.iter().find(|b| b.id == block_id)?;
+    let (base, field_name) = match &block.operations.get(idx)?.kind {
+        OpKind::FieldRead { base, field, .. } => (base.clone(), field.name.clone()),
+        _ => return Some(var.clone()),
+    };
+    let mut found: Option<crate::flowspace::model::Variable> = None;
+    for b in &graph.blocks {
+        for op in &b.operations {
+            if let OpKind::FieldWrite {
+                base: write_base,
+                field,
+                value,
+                ..
+            } = &op.kind
+            {
+                if write_base.id() == base.id() && field.name == field_name {
+                    if found.as_ref().is_some_and(|f| f.id() != value.id()) {
+                        return None; // ambiguous: distinct values written
+                    }
+                    found = Some(value.clone());
+                }
+            }
+        }
+    }
+    found
+}
+
+/// Recover one placeholder argument from an args-array element: the
+/// element is the result of a `fmt::rt::Argument::new_display` /
+/// `new_debug` constructor, whose sole argument back-traces (through the
+/// tuple-ref wrap) to the rendered value.
+#[allow(dead_code)]
+fn extract_fmt_arg(
+    graph: &FunctionGraph,
+    arg_elem: &crate::flowspace::model::Variable,
+) -> Option<FmtArg> {
+    use crate::model::{CallTarget, OpKind};
+    let (block_id, idx) = resolve_to_producer_op(graph, arg_elem)?;
+    let block = graph.blocks.iter().find(|b| b.id == block_id)?;
+    let (kind, inner) = match &block.operations.get(idx)?.kind {
+        OpKind::Call {
+            target: CallTarget::FunctionPath { segments },
+            args,
+            ..
+        } => (fmt_argument_ctor_kind(segments)?, args.first()?.clone()),
+        _ => return None,
+    };
+    let value = unwrap_fmt_arg_tuple_ref(graph, &inner)?;
+    Some(FmtArg { value, kind })
+}
+
+/// Back-trace a recognized `format_args!` chain from the Variable passed
+/// to `alloc::fmt::format(args)` (the String producer) to the literal
+/// pieces and the Display/Debug argument values. Composes the staged
+/// primitives:
+///   fmt-args → [`resolve_to_producer_op`] → `fmt::Arguments::new(pieces, args)`
+///     · pieces: [`read_array_literal_elements`] → [`resolve_const_int`] per
+///       byte → [`decode_packed_format_pieces`]
+///     · args: [`read_array_literal_elements`] → per element
+///       [`extract_fmt_arg`]
+/// Returns `None` (the recognizer leaves the graph untouched) on any
+/// shape outside the recognized subset, so it never fires on an
+/// unsupported chain.
+#[allow(dead_code)]
+fn extract_fmt_chain(
+    graph: &FunctionGraph,
+    fmt_args_var: &crate::flowspace::model::Variable,
+) -> Option<FmtChain> {
+    use crate::model::{CallTarget, OpKind};
+    // The format(args) argument is the result of `Arguments::new(pieces, args)`.
+    let (block_id, idx) = resolve_to_producer_op(graph, fmt_args_var)?;
+    let block = graph.blocks.iter().find(|b| b.id == block_id)?;
+    let (pieces_var, args_var) = match &block.operations.get(idx)?.kind {
+        OpKind::Call {
+            target: CallTarget::FunctionPath { segments },
+            args,
+            ..
+        } if is_arguments_new_path(segments) => (args.first()?.clone(), args.get(1)?.clone()),
+        _ => return None,
+    };
+    // Pieces: an `Array` of `ConstInt` bytes → decode the packed template.
+    let piece_byte_vars = read_array_literal_elements(graph, &pieces_var)?;
+    let mut bytes = Vec::with_capacity(piece_byte_vars.len());
+    for v in &piece_byte_vars {
+        bytes.push(u8::try_from(resolve_const_int(graph, v)?).ok()?);
+    }
+    let (pieces, placeholder_count) = decode_packed_format_pieces(&bytes)?;
+    // Args: an `Array` of `Argument::new_display|new_debug(&v)` ctors, one
+    // per placeholder.
+    let arg_elems = read_array_literal_elements(graph, &args_var)?;
+    if arg_elems.len() != placeholder_count {
+        return None;
+    }
+    let mut args = Vec::with_capacity(arg_elems.len());
+    for elem in &arg_elems {
+        args.push(extract_fmt_arg(graph, elem)?);
+    }
+    Some(FmtChain { pieces, args })
+}
+
 #[cfg(test)]
 mod tests {
     use super::harden_duplicate_leaf_metadata;
@@ -8878,6 +9055,201 @@ mod tests {
                 eprintln!("  exit -> {:?} args={:?}", link.target, link.args);
             }
         }
+    }
+
+    #[test]
+    fn extract_fmt_chain_recovers_pieces_and_args_cross_block() {
+        use super::{extract_fmt_chain, FmtArgKind};
+        use crate::flowspace::model::Variable;
+        use crate::model::{
+            CallTarget, FieldDescriptor, FunctionGraph, Link, OpKind, SpaceOperation, ValueType,
+        };
+
+        // Reconstruct the real `format!("hi{}", ctx)` front-end shape:
+        // block A builds the `Argument::new_display(&ctx)` through the
+        // argument Tuple (`&(ctx,).0`); block B builds the args + pieces
+        // arrays and `Arguments::new`. The args-array element is the
+        // new_display result threaded across the A→B link, so extraction
+        // must follow the cross-block inputarg back to it.
+        let mut graph = FunctionGraph::new("fmt_chain");
+        let a = graph.create_block();
+        let b = graph.create_block();
+
+        // ── block A: Argument::new_display(&ctx) via the arg Tuple ──
+        let ctx = Variable::new();
+        let tuple = Variable::new();
+        graph.block_mut(a).operations.push(SpaceOperation {
+            result: Some(tuple.clone()),
+            kind: OpKind::Call {
+                target: CallTarget::SyntheticTransparentCtor {
+                    name: "Tuple".to_string(),
+                    owner_path: vec![],
+                },
+                args: vec![],
+                result_ty: ValueType::Ref(Some("Tuple".to_string())),
+            },
+        });
+        graph.block_mut(a).operations.push(SpaceOperation {
+            result: None,
+            kind: OpKind::FieldWrite {
+                base: tuple.clone(),
+                field: FieldDescriptor::new("__pos_0", Some("Tuple".to_string())),
+                value: ctx.clone(),
+                ty: ValueType::Ref(None),
+            },
+        });
+        let arg_ref = Variable::new();
+        graph.block_mut(a).operations.push(SpaceOperation {
+            result: Some(arg_ref.clone()),
+            kind: OpKind::FieldRead {
+                base: tuple,
+                field: FieldDescriptor::new("__pos_0", Some("Tuple".to_string())),
+                ty: ValueType::Ref(None),
+                pure: false,
+            },
+        });
+        let argument = Variable::new();
+        graph.block_mut(a).operations.push(SpaceOperation {
+            result: Some(argument.clone()),
+            kind: OpKind::Call {
+                target: CallTarget::FunctionPath {
+                    segments: vec![
+                        "fmt".to_string(),
+                        "rt".to_string(),
+                        "Argument".to_string(),
+                        "new_display".to_string(),
+                    ],
+                },
+                args: vec![arg_ref],
+                result_ty: ValueType::Ref(Some("Argument".to_string())),
+            },
+        });
+
+        // block B takes the new_display result as its single inputarg.
+        let arg_in = Variable::new();
+        graph.block_mut(b).inputargs = vec![arg_in.clone()];
+        let link = Link::from_variables(&graph, vec![argument], b, None).with_prevblock(a);
+        graph.block_mut(a).exits = vec![link];
+
+        // ── block B: args array, pieces array, Arguments::new ──
+        let args_arr = Variable::new();
+        graph.block_mut(b).operations.push(SpaceOperation {
+            result: Some(args_arr.clone()),
+            kind: OpKind::Call {
+                target: CallTarget::SyntheticTransparentCtor {
+                    name: "Array".to_string(),
+                    owner_path: vec![],
+                },
+                args: vec![],
+                result_ty: ValueType::Ref(Some("Array".to_string())),
+            },
+        });
+        graph.block_mut(b).operations.push(SpaceOperation {
+            result: None,
+            kind: OpKind::FieldWrite {
+                base: args_arr.clone(),
+                field: FieldDescriptor::new("__pos_0", Some("Array".to_string())),
+                value: arg_in,
+                ty: ValueType::Ref(None),
+            },
+        });
+        let pieces_arr = Variable::new();
+        graph.block_mut(b).operations.push(SpaceOperation {
+            result: Some(pieces_arr.clone()),
+            kind: OpKind::Call {
+                target: CallTarget::SyntheticTransparentCtor {
+                    name: "Array".to_string(),
+                    owner_path: vec![],
+                },
+                args: vec![],
+                result_ty: ValueType::Ref(Some("Array".to_string())),
+            },
+        });
+        // `format!("hi{}")` packed template: [2, 'h', 'i', 0xC0, 0].
+        for (i, byte) in [2i64, 104, 105, 0xC0, 0].iter().enumerate() {
+            let v = Variable::new();
+            graph.block_mut(b).operations.push(SpaceOperation {
+                result: Some(v.clone()),
+                kind: OpKind::ConstInt(*byte),
+            });
+            graph.block_mut(b).operations.push(SpaceOperation {
+                result: None,
+                kind: OpKind::FieldWrite {
+                    base: pieces_arr.clone(),
+                    field: FieldDescriptor::new(format!("__pos_{i}"), Some("Array".to_string())),
+                    value: v,
+                    ty: ValueType::Int,
+                },
+            });
+        }
+        let fmt_args = Variable::new();
+        graph.block_mut(b).operations.push(SpaceOperation {
+            result: Some(fmt_args.clone()),
+            kind: OpKind::Call {
+                target: CallTarget::FunctionPath {
+                    segments: vec![
+                        "fmt".to_string(),
+                        "Arguments".to_string(),
+                        "new".to_string(),
+                    ],
+                },
+                args: vec![pieces_arr.clone(), args_arr],
+                result_ty: ValueType::Ref(Some("Arguments".to_string())),
+            },
+        });
+
+        let chain = extract_fmt_chain(&graph, &fmt_args).expect("recognized fmt chain");
+        assert_eq!(chain.pieces, vec!["hi".to_string(), String::new()]);
+        assert_eq!(chain.args.len(), 1);
+        assert_eq!(chain.args[0].kind, FmtArgKind::Display);
+        // The recovered value is `ctx`, unwrapped through the arg Tuple.
+        assert_eq!(chain.args[0].value.id(), ctx.id());
+
+        // A non-`Arguments::new` producer is not recognized.
+        assert!(extract_fmt_chain(&graph, &pieces_arr).is_none());
+    }
+
+    /// Anchor [`extract_fmt_chain`] to the real lowered IR of
+    /// `stack_underflow_error` (= `type_error(format!("stack underflow
+    /// during {context}"))`). Ignored by default (loads the 242MB real
+    /// LLBC); run with `cargo test -p majit-translate --lib
+    /// extract_fmt_chain_matches_real -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn extract_fmt_chain_matches_real_stack_underflow() {
+        use super::{extract_fmt_chain, FmtArgKind};
+        use crate::model::{CallTarget, OpKind};
+
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-interpreter.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let graph = super::lower_function(&llbc, "stack_underflow_error")
+            .expect("lower stack_underflow_error");
+
+        // Find the `alloc::fmt::format(args)` call and extract its arg.
+        let fmt_args = graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.operations.iter())
+            .find_map(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments },
+                    args,
+                    ..
+                } if super::fmt_path_ends_with(segments, &["fmt", "format"]) => args.first().cloned(),
+                _ => None,
+            })
+            .expect("alloc::fmt::format call present");
+
+        let chain = extract_fmt_chain(&graph, &fmt_args).expect("recognized real fmt chain");
+        assert_eq!(
+            chain.pieces,
+            vec!["stack underflow during ".to_string(), String::new()]
+        );
+        assert_eq!(chain.args.len(), 1);
+        assert_eq!(chain.args[0].kind, FmtArgKind::Display);
     }
 
     #[test]
