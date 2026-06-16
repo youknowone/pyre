@@ -2172,9 +2172,50 @@ impl<'a> Lowering<'a> {
                 // encodes the conversion.  Genuine `Neg` / `Not` arithmetic
                 // keeps a real scalar `OpKind::UnaryOp`.
                 if unary_op_is_cast(&op_json) {
+                    // Signedness-aware source classification — `operand_value_kind`
+                    // (`tyref_to_value_type`) collapses `uN` and `iN` both to
+                    // `Int`, hiding a `usize as i64` flip; `tyref_to_attr_value_type`
+                    // keeps the signed/unsigned split.
+                    let src_attr = match &operand {
+                        Operand::Copy(p) | Operand::Move(p) => {
+                            Some(tyref_to_attr_value_type(&p.ty, self.llbc))
+                        }
+                        Operand::Const(_) => None,
+                    };
                     let src_kind = self.operand_value_kind(&operand);
                     let arg = self.resolve_operand(mir_bb, operand)?;
                     let dst_kind = tyref_to_value_type(dest_ty, self.llbc);
+                    // Signedness-flipping int cast (`w_tuple_len(obj) as i64`)
+                    // — aliasing keeps the source `r_uint` annotation on the
+                    // signed destination, tripping the SomeInteger signedness
+                    // `UnionError` (`binaryop.py:178-202`) when the length
+                    // meets a signed index.  Route the unsigned→signed flip
+                    // through `rarithmetic.intmask` (the RPython spelling of
+                    // this re-type): `rtype_intmask` coerces to `lltype.Signed`
+                    // — identity on the i64 carrier — so the value is unchanged
+                    // and the result re-types Signed.  Resolves via the Layer-3
+                    // `HOST_ENV.import_module(rpython.rlib.rarithmetic)
+                    // .module_get(intmask)` path (`flowspace_adapter.rs`).
+                    if matches!(src_attr, Some(ValueType::Unsigned))
+                        && matches!(tyref_to_attr_value_type(dest_ty, self.llbc), ValueType::Int)
+                    {
+                        let res = self
+                            .graph
+                            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                        return Ok((
+                            Some(OpKind::Call {
+                                target: CallTarget::FunctionPath {
+                                    segments: ["rpython", "rlib", "rarithmetic", "intmask"]
+                                        .into_iter()
+                                        .map(str::to_string)
+                                        .collect(),
+                                },
+                                args: vec![arg],
+                                result_ty: ValueType::Int,
+                            }),
+                            res,
+                        ));
+                    }
                     return Ok(
                         match src_kind
                             .as_ref()

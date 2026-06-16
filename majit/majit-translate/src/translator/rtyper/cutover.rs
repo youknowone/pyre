@@ -850,24 +850,6 @@ pub(crate) fn is_known_unported(msg: &str) -> bool {
         // a divergence.  Skip to the legacy walker until the pair is
         // ported.
         || msg.contains("no upstream pair(s1, s2).union() handler in current subset")
-        // Integer-signedness `UnionError` (`binaryop.py:178-202`
-        // `pairtype(SomeInteger, SomeInteger).union`): a signed and an
-        // unsigned `SomeInteger` meet and the signed side is not
-        // provably `nonneg`, which upstream raises uncaught.  The
-        // production hitter is a length-vs-index mix —
-        // `w_tuple_getitem`'s `w_tuple_len(obj) as i64` then `index +
-        // len`: `w_tuple_len` returns `usize` (annotated `r_uint`), and
-        // `front::mir` lowers the same-bank `usize as i64` cast as a
-        // pure operand alias (every int-width cast keeps the i64
-        // carrier in place), so the length keeps its `r_uint`
-        // annotation instead of converting to a `nonneg` Signed the way
-        // RPython's `intmask(r_uint(...))` would.  Adding it to a signed
-        // `index` (`nonneg=False`) then trips the signedness union.
-        // Skip to the legacy walker until the front-end models the
-        // unsigned↔signed cast as an `intmask`/`r_uint` re-typing op
-        // rather than a bare alias.
-        || msg.contains("of the same signedness")
-        || msg.contains("cannot unify these integer types")
         // `InstanceRepr.getfield` walking the `rbase` chain before the
         // repr's deferred `setup()` ran (upstream drains pending
         // setups via `call_all_setups`, rtyper.py:198, after every
