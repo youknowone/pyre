@@ -2946,7 +2946,9 @@ pub fn rtyper_makerepr(
             //      `getarraysize` / item-load ops would compile to
             //      invalid reads off a non-array).
             //   2. resized listdef → `ListRepr` (`GcStruct("list",
-            //      length, items)`) — deferred (the `Err` arm below).
+            //      length, items)`) — data shape + `len` land; the
+            //      `append`/`getitem`/`setitem`/resize ops are follow-on
+            //      slices (`rlist::ListRepr`).
             //   3. non-resized → `FixedSizeListRepr`.
             //
             // Upstream also passes a LAZY `item_repr = lambda:
@@ -2972,6 +2974,7 @@ pub fn rtyper_makerepr(
             // (rlist.py:54-57), exactly as a non-range list does.
             let range_repr_step =
                 range_step.filter(|_| !mutated && !matches!(s_value, SomeValue::Impossible));
+            use crate::translator::rtyper::rlist::{FixedSizeListRepr, ListRepr};
             if let Some(step) = range_repr_step {
                 if step == 1 {
                     Ok(
@@ -2987,21 +2990,15 @@ pub fn rtyper_makerepr(
                         s_list.listdef
                     )))
                 }
-            } else if resized {
-                Err(TyperError::missing_rtype_operation(format!(
-                    "SomeList(resized).rtyper_makerepr — port \
-                     rpython/rtyper/lltypesystem/rlist.py ListRepr (GcStruct length+items) \
-                     (listdef: {:?})",
-                    s_list.listdef
-                )))
             } else {
                 let item_r = rtyper.getrepr(&s_value)?;
                 let rtyper_rc = rtyper.self_rc()?;
-                Ok(
-                    std::sync::Arc::new(crate::translator::rtyper::rlist::FixedSizeListRepr::new(
-                        &rtyper_rc, item_r,
-                    )?) as std::sync::Arc<dyn Repr>,
-                )
+                let repr: std::sync::Arc<dyn Repr> = if resized {
+                    std::sync::Arc::new(ListRepr::new(&rtyper_rc, item_r)?)
+                } else {
+                    std::sync::Arc::new(FixedSizeListRepr::new(&rtyper_rc, item_r)?)
+                };
+                Ok(repr)
             }
         }
         SomeValue::Dict(_) => Err(TyperError::missing_rtype_operation(

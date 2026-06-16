@@ -126,6 +126,12 @@ pub enum ReprClassId {
     /// (`&[T]`) annotate as a non-resized `SomeList`, so this is the
     /// repr the `len` lowering lands on.
     FixedSizeListRepr,
+    /// `lltypesystem/rlist.py:107 ListRepr(AbstractListRepr,
+    /// BaseListRepr)` — the resized list whose `LIST` lowers to a
+    /// `Ptr(GcStruct("list", ("length", Signed), ("items",
+    /// Ptr(GcArray(ITEM)))))`. Minted when the `listdef` is `resized`
+    /// (an `.append()` consumer marks it so).
+    ListRepr,
     /// `rstr.py:483 AbstractCharRepr` (`CharRepr` lltypesystem
     /// realisation, `lowleveltype = Char`).
     CharRepr,
@@ -192,6 +198,7 @@ impl ReprClassId {
             ClassesPBCRepr => &[ClassesPBCRepr, Repr],
             InstanceRepr => &[InstanceRepr, Repr],
             FixedSizeListRepr => &[FixedSizeListRepr, Repr],
+            ListRepr => &[ListRepr, Repr],
             TupleRepr => &[TupleRepr, Repr],
             CharRepr => &[CharRepr, Repr],
             UniCharRepr => &[UniCharRepr, Repr],
