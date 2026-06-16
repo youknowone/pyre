@@ -415,6 +415,15 @@ pub trait GcAllocator: Send {
         false
     }
 
+    /// `rpython/rlib/rgc.py:229` `can_move(p)` — whether the GC object
+    /// `gcref` sits at an address that may still move. "With non-moving
+    /// GCs, it is always False; with moving GCs it can be True for some
+    /// time, then False once the object is sure not to move." The default
+    /// is `false`, matching a non-moving GC (and the no-GC case).
+    fn can_move(&self, _gcref: GcRef) -> bool {
+        false
+    }
+
     /// llsupport/gc.py:592 `get_translated_info_for_typeinfo`.
     /// Returns `(type_info_group_base, shift_by, sizeof_ti)`:
     ///  * `type_info_group_base` — base address of the `TYPE_INFO` table
@@ -638,12 +647,19 @@ pub type TypeidSubclassRangeFn = fn(typeid: u32) -> Option<(i64, i64)>;
 pub type TypeidIsObjectFn = fn(typeid: u32) -> Option<bool>;
 pub type ExtraRootWalkerFn = fn(&mut dyn FnMut(&mut GcRef));
 
+/// Thread-local callback that answers `rgc.can_move(gcref)`
+/// (rpython/rlib/rgc.py:229) for the currently active backend's GC. The
+/// const-baking site (`x86/regalloc.py:58-61 convert_to_imm`) consults
+/// this before baking a `ConstPtr` immediate.
+pub type CanMoveFn = fn(GcRef) -> bool;
+
 thread_local! {
     static ACTIVE_CHECK_IS_OBJECT: Cell<Option<CheckIsObjectFn>> = const { Cell::new(None) };
     static ACTIVE_GET_ACTUAL_TYPEID: Cell<Option<GetActualTypeidFn>> = const { Cell::new(None) };
     static ACTIVE_SUBCLASS_RANGE: Cell<Option<SubclassRangeFn>> = const { Cell::new(None) };
     static ACTIVE_TYPEID_SUBCLASS_RANGE: Cell<Option<TypeidSubclassRangeFn>> = const { Cell::new(None) };
     static ACTIVE_TYPEID_IS_OBJECT: Cell<Option<TypeidIsObjectFn>> = const { Cell::new(None) };
+    static ACTIVE_CAN_MOVE: Cell<Option<CanMoveFn>> = const { Cell::new(None) };
     static ACTIVE_SUPPORTS_GUARD_GC_TYPE: Cell<bool> = const { Cell::new(false) };
     static ACTIVE_EXTRA_ROOT_WALKER: Cell<Option<ExtraRootWalkerFn>> = const { Cell::new(None) };
 }
@@ -659,6 +675,7 @@ pub struct ActiveGcGuardHooks {
     pub subclass_range: Option<SubclassRangeFn>,
     pub typeid_subclass_range: Option<TypeidSubclassRangeFn>,
     pub typeid_is_object: Option<TypeidIsObjectFn>,
+    pub can_move: Option<CanMoveFn>,
     pub supports_guard_gc_type: bool,
 }
 
@@ -675,6 +692,7 @@ pub fn set_active_gc_guard_hooks(hooks: ActiveGcGuardHooks) {
     ACTIVE_SUBCLASS_RANGE.with(|c| c.set(hooks.subclass_range));
     ACTIVE_TYPEID_SUBCLASS_RANGE.with(|c| c.set(hooks.typeid_subclass_range));
     ACTIVE_TYPEID_IS_OBJECT.with(|c| c.set(hooks.typeid_is_object));
+    ACTIVE_CAN_MOVE.with(|c| c.set(hooks.can_move));
     ACTIVE_SUPPORTS_GUARD_GC_TYPE.with(|c| c.set(hooks.supports_guard_gc_type));
 }
 
@@ -718,6 +736,21 @@ pub fn get_actual_typeid(gcref: GcRef) -> Option<u32> {
     ACTIVE_GET_ACTUAL_TYPEID.with(|c| match c.get() {
         Some(f) => f(gcref),
         None => None,
+    })
+}
+
+/// `rgc.can_move(gcref)` shim (rpython/rlib/rgc.py:229). Delegates to the
+/// active backend's installed callback. Returns `false` for null pointers
+/// and when no backend is installed — i.e. a non-moving / absent GC, where
+/// every object address is stable (rgc.py:231 "with non-moving GCs, it is
+/// always False").
+pub fn can_move(gcref: GcRef) -> bool {
+    if gcref.is_null() {
+        return false;
+    }
+    ACTIVE_CAN_MOVE.with(|c| match c.get() {
+        Some(f) => f(gcref),
+        None => false,
     })
 }
 

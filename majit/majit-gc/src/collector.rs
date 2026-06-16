@@ -2293,6 +2293,18 @@ impl GcAllocator for MiniMarkGC {
         (byte & is_object_flag) != 0
     }
 
+    /// `rgc.can_move` (rpython/rlib/rgc.py:229). MiniMark mapping: an
+    /// object can still move iff it is a young (nursery) object that is
+    /// not pinned. Old-generation objects, prebuilt/foreign addresses
+    /// outside the nursery, and pinned nursery objects never move
+    /// (minimark.py keeps pinned objects in place across a minor cycle).
+    fn can_move(&self, gcref: GcRef) -> bool {
+        if gcref.is_null() {
+            return false;
+        }
+        self.is_in_nursery(gcref.0) && !self.pinned_objects.contains(&gcref.0)
+    }
+
     /// gc.py:592 `get_translated_info_for_typeinfo` parity.
     /// Returns `(type_info_group_base, shift_by, sizeof_ti)` — the
     /// base address of the materialized `type_info_group` table, the
@@ -4555,6 +4567,29 @@ mod tests {
         assert_eq!(val, 0xCAFE_BABE);
 
         gc.roots.clear();
+    }
+
+    #[test]
+    fn test_can_move_nursery_pin_and_bounds() {
+        let mut gc = test_gc(4096);
+        gc.register_type(TypeInfo::simple(16));
+
+        // rgc.py:229 — a young nursery object can still move.
+        let obj = gc.alloc_with_type(0, 16);
+        assert!(gc.is_in_nursery(obj.0));
+        assert!(gc.can_move(obj));
+
+        // A pinned nursery object will not move (rgc.py:233-235); unpin
+        // restores movability.
+        assert!(gc.pin(obj));
+        assert!(!gc.can_move(obj));
+        gc.unpin(obj);
+        assert!(gc.can_move(obj));
+
+        // Null and out-of-nursery addresses never move (rgc.py:231
+        // "with non-moving GCs, it is always False").
+        assert!(!gc.can_move(GcRef(0)));
+        assert!(!gc.can_move(GcRef(0xdead_0000)));
     }
 
     #[test]

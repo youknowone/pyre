@@ -1377,6 +1377,12 @@ fn get_actual_typeid_via_active_runtime(gcref: GcRef) -> Option<u32> {
     with_cranelift_gc(|gc| gc.get_actual_typeid(gcref)).flatten()
 }
 
+/// `majit_gc::CanMoveFn` installed by `set_gc_allocator`. Mirrors
+/// `rgc.can_move` (rpython/rlib/rgc.py:229).
+fn can_move_via_active_runtime(gcref: GcRef) -> bool {
+    with_cranelift_gc(|gc| gc.can_move(gcref)).unwrap_or(false)
+}
+
 /// `majit_gc::SubclassRangeFn` installed by `set_gc_allocator`.
 /// Resolves the codegen-time `rclass.CLASSTYPE.subclassrange_{min,max}`
 /// lookup from x86/assembler.py:1971-1974 through the GC's
@@ -7673,6 +7679,7 @@ impl CraneliftBackend {
             subclass_range: Some(subclass_range_via_active_runtime),
             typeid_subclass_range: Some(typeid_subclass_range_via_active_runtime),
             typeid_is_object: Some(typeid_is_object_via_active_runtime),
+            can_move: Some(can_move_via_active_runtime),
             supports_guard_gc_type,
         });
         majit_gc::set_active_alloc_nursery_typed(Some(alloc_nursery_typed_via_active_runtime));

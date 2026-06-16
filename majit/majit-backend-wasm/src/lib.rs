@@ -191,6 +191,7 @@ impl WasmBackend {
             subclass_range: Some(wasm_subclass_range),
             typeid_subclass_range: Some(wasm_typeid_subclass_range),
             typeid_is_object: Some(wasm_typeid_is_object),
+            can_move: None,
             supports_guard_gc_type,
         });
         majit_gc::set_active_alloc_nursery_typed(Some(wasm_alloc_nursery_typed));

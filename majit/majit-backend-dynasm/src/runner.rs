@@ -150,6 +150,10 @@ fn dynasm_get_actual_typeid(gcref: GcRef) -> Option<u32> {
     with_dynasm_active_gc(|gc| gc.get_actual_typeid(gcref)).flatten()
 }
 
+fn dynasm_can_move(gcref: GcRef) -> bool {
+    with_dynasm_active_gc(|gc| gc.can_move(gcref)).unwrap_or(false)
+}
+
 fn dynasm_subclass_range(classptr: usize) -> Option<(i64, i64)> {
     with_dynasm_active_gc(|gc| gc.subclass_range(classptr)).flatten()
 }
@@ -1159,6 +1163,7 @@ impl DynasmBackend {
             subclass_range: Some(dynasm_subclass_range),
             typeid_subclass_range: Some(dynasm_typeid_subclass_range),
             typeid_is_object: Some(dynasm_typeid_is_object),
+            can_move: Some(dynasm_can_move),
             supports_guard_gc_type,
         });
         majit_gc::set_active_alloc_nursery_typed(Some(dynasm_alloc_nursery_typed));
