@@ -1,0 +1,1327 @@
+{
+  "modules": {
+    "test.test___all__": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test__colorize": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test__interpchannels": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test__interpreters": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test__locale": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test__opcode": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test__osx_support": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_abc": {
+      "dynasm": "CRASH"
+    },
+    "test.test_abstract_numbers": {
+      "dynasm": "PASS"
+    },
+    "test.test_android": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_annotationlib": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_apple": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_argparse": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_array": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_asdl_parser": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_ast": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_asyncgen": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_asyncio": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_atexit": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_audit": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_augassign": {
+      "dynasm": "PASS"
+    },
+    "test.test_base64": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_baseexception": {
+      "dynasm": "PASS"
+    },
+    "test.test_bdb": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_bigaddrspace": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_bigmem": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_binascii": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_binop": {
+      "dynasm": "PASS"
+    },
+    "test.test_bisect": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_bool": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_buffer": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_bufio": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_build_details": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_builtin": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_bytes": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_bz2": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_c_locale_coercion": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_calendar": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_call": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_capi": {
+      "dynasm": "SKIP",
+      "reason": "needs C-API"
+    },
+    "test.test_cext": {
+      "dynasm": "SKIP",
+      "reason": "needs C compiler / C-API"
+    },
+    "test.test_charmapcodec": {
+      "dynasm": "PASS"
+    },
+    "test.test_class": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_clinic": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_cmath": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_cmd": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_cmd_line": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_cmd_line_script": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_code": {
+      "dynasm": "SKIP",
+      "reason": "implementation detail"
+    },
+    "test.test_code_module": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_codeccallbacks": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_codecencodings_cn": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_codecencodings_hk": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_codecencodings_iso2022": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_codecencodings_jp": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_codecencodings_kr": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_codecencodings_tw": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_codecmaps_cn": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_codecmaps_hk": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_codecmaps_jp": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_codecmaps_kr": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_codecmaps_tw": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_codecs": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_codeop": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_collections": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_colorsys": {
+      "dynasm": "PASS"
+    },
+    "test.test_compare": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_compile": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_compileall": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_compiler_assemble": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_compiler_codegen": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_complex": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_concurrent_futures": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_configparser": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_contains": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_context": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_contextlib": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_contextlib_async": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_copy": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_copyreg": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_coroutines": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_cppext": {
+      "dynasm": "SKIP",
+      "reason": "needs C compiler / C-API"
+    },
+    "test.test_cprofile": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_crossinterp": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_csv": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_ctypes": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_curses": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_dataclasses": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_datetime": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_dbm": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_dbm_dumb": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_dbm_gnu": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_dbm_ndbm": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_dbm_sqlite3": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_decimal": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_decorators": {
+      "dynasm": "PASS"
+    },
+    "test.test_defaultdict": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_deque": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_descr": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_descrtut": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_devpoll": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_dict": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_dictcomps": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_dictviews": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_difflib": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_dis": {
+      "dynasm": "SKIP",
+      "reason": "implementation detail"
+    },
+    "test.test_doctest": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_docxmlrpc": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_dtrace": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_dynamic": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_dynamicclassattribute": {
+      "dynasm": "PASS"
+    },
+    "test.test_eintr": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_email": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_embed": {
+      "dynasm": "SKIP",
+      "reason": "needs embedded CPython"
+    },
+    "test.test_ensurepip": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_enum": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_enumerate": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_eof": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_epoll": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_errno": {
+      "dynasm": "PASS"
+    },
+    "test.test_except_star": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_exception_group": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_exception_hierarchy": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_exception_variations": {
+      "dynasm": "PASS"
+    },
+    "test.test_exceptions": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_extcall": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_external_inspection": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_faulthandler": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_fcntl": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_file": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_file_eintr": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_filecmp": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_fileinput": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_fileio": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_fileutils": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_finalization": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_float": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_flufl": {
+      "dynasm": "PASS"
+    },
+    "test.test_fnmatch": {
+      "dynasm": "PASS"
+    },
+    "test.test_fork1": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_format": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_fractions": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_frame": {
+      "dynasm": "SKIP",
+      "reason": "implementation detail"
+    },
+    "test.test_free_threading": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_frozen": {
+      "dynasm": "SKIP",
+      "reason": "implementation detail"
+    },
+    "test.test_fstring": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_ftplib": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_funcattrs": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_functools": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_future_stmt": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_gc": {
+      "dynasm": "SKIP",
+      "reason": "implementation detail"
+    },
+    "test.test_gdb": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_generated_cases": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_generator_stop": {
+      "dynasm": "PASS"
+    },
+    "test.test_generators": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_genericalias": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_genericclass": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_genericpath": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_genexps": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_getopt": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_getpass": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_getpath": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_gettext": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_glob": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_global": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_grammar": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_graphlib": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_grp": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_gzip": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_hash": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_hashlib": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_heapq": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_hmac": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_html": {
+      "dynasm": "PASS"
+    },
+    "test.test_htmlparser": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_http_cookiejar": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_http_cookies": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_httplib": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_httpservers": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_idle": {
+      "dynasm": "SKIP",
+      "reason": "needs display"
+    },
+    "test.test_imaplib": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_import": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_importlib": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_index": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_inspect": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_int": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_int_literal": {
+      "dynasm": "PASS"
+    },
+    "test.test_interpreters": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_io": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_ioctl": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_ipaddress": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_isinstance": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_iter": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_iterlen": {
+      "dynasm": "PASS"
+    },
+    "test.test_itertools": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_json": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_keyword": {
+      "dynasm": "PASS"
+    },
+    "test.test_keywordonlyarg": {
+      "dynasm": "PASS"
+    },
+    "test.test_kqueue": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_largefile": {
+      "dynasm": "SKIP",
+      "reason": "demands too many resources"
+    },
+    "test.test_launcher": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_linecache": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_list": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_listcomps": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_lltrace": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_locale": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_logging": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_long": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_longexp": {
+      "dynasm": "PASS"
+    },
+    "test.test_lzma": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_mailbox": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_marshal": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_math": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_math_property": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_memoryio": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_memoryview": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_metaclass": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_mimetypes": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_minidom": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_mmap": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_module": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_modulefinder": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_monitoring": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_msvcrt": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_multibytecodec": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_multiprocessing_fork": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_multiprocessing_forkserver": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_multiprocessing_main_handling": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_multiprocessing_spawn": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_named_expressions": {
+      "dynasm": "PASS"
+    },
+    "test.test_netrc": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_ntpath": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_nturl2path": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_numeric_tower": {
+      "dynasm": "PASS"
+    },
+    "test.test_opcache": {
+      "dynasm": "SKIP",
+      "reason": "implementation detail"
+    },
+    "test.test_opcodes": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_openpty": {
+      "dynasm": "PASS"
+    },
+    "test.test_operator": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_optimizer": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_optparse": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_ordered_dict": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_os": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_osx_env": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_pathlib": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_patma": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_pdb": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_peepholer": {
+      "dynasm": "SKIP",
+      "reason": "implementation detail"
+    },
+    "test.test_peg_generator": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_pep646_syntax": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_perf_profiler": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_perfmaps": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_pickle": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_picklebuffer": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_pickletools": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_pkg": {
+      "dynasm": "PASS"
+    },
+    "test.test_pkgutil": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_platform": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_plistlib": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_poll": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_popen": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_poplib": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_positional_only_arg": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_posix": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_posixpath": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_pow": {
+      "dynasm": "PASS"
+    },
+    "test.test_pprint": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_print": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_profile": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_property": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_pstats": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_pty": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_pulldom": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_pwd": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_py_compile": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_pyclbr": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_pydoc": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_pyexpat": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_pyrepl": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_queue": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_quopri": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_raise": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_random": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_range": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_re": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_readline": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_regrtest": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_remote_pdb": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_repl": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_reprlib": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_resource": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_richcmp": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_rlcompleter": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_robotparser": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_runpy": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_sax": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_sched": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_scope": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_script_helper": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_secrets": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_select": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_selectors": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_set": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_setcomps": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_shelve": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_shlex": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_shutil": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_signal": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_site": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_slice": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_smtplib": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_smtpnet": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_socket": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_socketserver": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_sort": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_source_encoding": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_sqlite3": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_ssl": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_stable_abi_ctypes": {
+      "dynasm": "SKIP",
+      "reason": "needs ctypes.pythonapi"
+    },
+    "test.test_startfile": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_stat": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_statistics": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_str": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_strftime": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_string": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_string_literals": {
+      "dynasm": "PASS"
+    },
+    "test.test_stringprep": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_strptime": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_strtod": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_struct": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_structseq": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_subclassinit": {
+      "dynasm": "PASS"
+    },
+    "test.test_subprocess": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_sundry": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_super": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_support": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_symtable": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_syntax": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_sys": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_sys_setprofile": {
+      "dynasm": "SKIP",
+      "reason": "implementation detail"
+    },
+    "test.test_sys_settrace": {
+      "dynasm": "SKIP",
+      "reason": "implementation detail"
+    },
+    "test.test_sysconfig": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_syslog": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_tabnanny": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_tarfile": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_tcl": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_tempfile": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_termios": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_textwrap": {
+      "dynasm": "PASS"
+    },
+    "test.test_thread": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_thread_local_bytecode": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_threadedtempfile": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_threading": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_threading_local": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_threadsignals": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_time": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_timeit": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_timeout": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_tkinter": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_tokenize": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_tomllib": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_tools": {
+      "dynasm": "SKIP",
+      "reason": "CPython internal build details"
+    },
+    "test.test_trace": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_traceback": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_tracemalloc": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_tstring": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_ttk": {
+      "dynasm": "SKIP",
+      "reason": "needs display"
+    },
+    "test.test_ttk_textonly": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_tty": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_tuple": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_turtle": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_type_aliases": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_type_annotations": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_type_cache": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_type_comments": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_type_params": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_typechecks": {
+      "dynasm": "PASS"
+    },
+    "test.test_types": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_typing": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_ucn": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_unary": {
+      "dynasm": "PASS"
+    },
+    "test.test_unicode_file": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_unicode_file_functions": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_unicode_identifiers": {
+      "dynasm": "PASS"
+    },
+    "test.test_unicodedata": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_unittest": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_univnewlines": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_unpack": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_unpack_ex": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_unparse": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_urllib": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_urllib2": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_urllib2_localnet": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_urllib2net": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_urllib_response": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_urllibnet": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_urlparse": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_userdict": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_userlist": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_userstring": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_utf8_mode": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_utf8source": {
+      "dynasm": "PASS"
+    },
+    "test.test_uuid": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_venv": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_wait3": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_wait4": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_warnings": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_wave": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_weakref": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_weakset": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_webbrowser": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_winapi": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_winconsoleio": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_winreg": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_winsound": {
+      "dynasm": "SKIP",
+      "reason": "needs audio hardware"
+    },
+    "test.test_with": {
+      "dynasm": "PASS"
+    },
+    "test.test_wmi": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_wsgiref": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_xml_dom_minicompat": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_xml_dom_xmlbuilder": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_xml_etree": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_xml_etree_c": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_xmlrpc": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_xpickle": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_xxlimited": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_xxtestfuzz": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_yield_from": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_zipapp": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_zipfile": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_zipfile64": {
+      "dynasm": "SKIP",
+      "reason": "demands too many resources"
+    },
+    "test.test_zipimport": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_zipimport_support": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_zlib": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_zoneinfo": {
+      "dynasm": "IMPORTERROR"
+    },
+    "test.test_zstd": {
+      "dynasm": "IMPORTERROR"
+    }
+  },
+  "stdlib_version": "3.14.6"
+}

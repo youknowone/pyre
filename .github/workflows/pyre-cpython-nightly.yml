@@ -1,0 +1,90 @@
+name: pyre CPython suite (nightly)
+
+# Non-gating exploratory run of the FULL CPython regression suite (every
+# module, including ones that fail today) across three lanes:
+#   * dynasm, JIT on   — the gating backend, full picture
+#   * dynasm, JIT off  — interpreter baseline; a module that passes here but
+#     not under JIT is a JIT correctness divergence
+#   * cranelift, JIT on
+# Reports are uploaded as artifacts so coverage growth and JIT divergence can
+# be tracked over time. This never gates a PR (`--full` always exits 0).
+
+on:
+  schedule:
+    - cron: "0 7 * * *"  # 07:00 UTC daily
+  workflow_dispatch:
+
+concurrency:
+  group: pyre-cpython-nightly-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  full-suite:
+    name: full CPython suite (ubuntu)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      PYRE_SHARED_BUILD: ${{ github.workspace }}/.pyre-build
+      CHARON_VERSION: nightly-2026.05.29
+    steps:
+    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      with:
+        persist-credentials: false
+    - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+    - name: Set up CPython
+      id: cpython
+      uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+      with:
+        python-version: "3.14"
+    - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      with:
+        cache-bin: false
+    - name: Cache Charon binary
+      id: charon-cache
+      uses: actions/cache@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+      with:
+        path: |
+          .pyre-build/charon
+          .pyre-build/charon-src
+        key: charon-bin-${{ runner.os }}-${{ runner.arch }}-${{ env.CHARON_VERSION }}
+        restore-keys: |
+          charon-bin-${{ runner.os }}-${{ runner.arch }}-
+    - name: Install Charon
+      if: steps.charon-cache.outputs.cache-hit != 'true'
+      shell: bash
+      run: scripts/install-charon.py
+    - name: Compute LLBC fingerprint
+      id: llbc-fingerprint
+      shell: bash
+      run: |
+        value="$(scripts/extract-llbc.py --fingerprint pyre-object pyre-interpreter pyre-jit)"
+        echo "value=${value}" >> "$GITHUB_OUTPUT"
+    - name: Cache LLBC
+      id: llbc-cache
+      uses: actions/cache@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+      with:
+        path: build/llbc
+        key: llbc-${{ runner.os }}-${{ runner.arch }}-${{ env.CHARON_VERSION }}-${{ steps.llbc-fingerprint.outputs.value }}
+    - name: Extract LLBC
+      if: steps.llbc-cache.outputs.cache-hit != 'true'
+      shell: bash
+      run: scripts/extract-llbc.py pyre-object pyre-interpreter pyre-jit
+    - name: Build backends
+      run: |
+        cargo build --release -p pyrex --bin pyre-dynasm --no-default-features --features dynasm
+        cargo build --release -p pyrex --bin pyre-cranelift --no-default-features --features cranelift
+    - name: dynasm (JIT on)
+      run: ${{ steps.cpython.outputs.python-path }} pyre/cpython_tests/run.py --full --backend dynasm --jobs 4 --timeout 120 --report reports/dynasm-jit.json
+    - name: dynasm (JIT off)
+      run: ${{ steps.cpython.outputs.python-path }} pyre/cpython_tests/run.py --full --backend dynasm --no-jit --jobs 4 --timeout 120 --report reports/dynasm-nojit.json
+    - name: cranelift (JIT on)
+      run: ${{ steps.cpython.outputs.python-path }} pyre/cpython_tests/run.py --full --backend cranelift --jobs 4 --timeout 120 --report reports/cranelift-jit.json
+    - name: Upload reports
+      if: ${{ always() }}
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      with:
+        name: cpython-suite-reports
+        path: reports/
