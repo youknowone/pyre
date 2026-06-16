@@ -3838,28 +3838,16 @@ pub extern "C" fn bh_compare_fn(lhs: i64, rhs: i64, op_code: i64) -> i64 {
     }
 
     // op_code 10 = CHECK_EXC_MATCH isinstance check (from codewriter CheckExcMatch).
-    // lhs = exception value, rhs = exception type to match.
+    // lhs = exception value, rhs = exception type (or tuple of types) to match.
+    // Mirror the interpreter's `check_exc_match_against` =
+    // `exception_match(type(exc), match_class)` (eval.rs:851) so the match
+    // walks the exception class MRO and accepts a tuple of classes.  The
+    // earlier bespoke `ExcKind`-vs-type-name model only handled str / builtin
+    // function match specs and fell through to an unconditional `true` for a
+    // proper exception type object, which made every `except SomeError:`
+    // appear to match — wrong for any clause beyond the first.
     if op_code == 10 {
-        let matched = unsafe {
-            if !pyre_object::is_exception(lhs) {
-                true
-            } else {
-                let kind = pyre_object::w_exception_get_kind(lhs);
-                if pyre_object::is_str(rhs) {
-                    let type_name = pyre_object::w_str_get_value(rhs);
-                    pyre_object::exc_kind_matches(kind, type_name)
-                } else if pyre_interpreter::is_function(rhs)
-                    && pyre_interpreter::is_builtin_code(
-                        pyre_interpreter::function_get_code(rhs) as pyre_object::PyObjectRef
-                    )
-                {
-                    let type_name = pyre_interpreter::function_get_name(rhs);
-                    pyre_object::exc_kind_matches(kind, type_name)
-                } else {
-                    true
-                }
-            }
-        };
+        let matched = pyre_interpreter::eval::check_exc_match_against(lhs, rhs);
         return pyre_object::w_bool_from(matched) as i64;
     }
 

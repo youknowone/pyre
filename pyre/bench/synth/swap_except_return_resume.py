@@ -49,10 +49,28 @@ def computed_except_return(n):
     return 0
 
 
+def multi_clause_second(n):
+    # Multiple except clauses reached via loop-exit resume: the raised
+    # IndexError must skip the (non-matching) KeyError clause and be caught
+    # by the second clause.  Exercises CHECK_EXC_MATCH against a proper
+    # exception type object on the resume walk.
+    i = 0
+    while i < n:
+        i = i + 1
+    try:
+        raise IndexError(i)
+    except KeyError:
+        return -100
+    except IndexError:
+        return i - 3
+    return 0
+
+
 def main():
     print(raise_then_return(N))
     print(raise_then_return_value(N))
     print(computed_except_return(N))
+    print(multi_clause_second(N))
 
 
 main()
