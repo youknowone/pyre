@@ -3554,6 +3554,32 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
+                // `<Box<T>>::deref` / `<Rc<T>>::deref` / `<Arc<T>>::deref`
+                // / the workspace `FrameBox::deref` (+ their `deref_mut`)
+                // whose `&T` is a registered struct.  The handle is one
+                // pointer word, so `*p` is a typed pointer reinterpret:
+                // emit the `cast_pointer(T, p)` downcast marker
+                // (`cast_pointer_marker_op`) the flowspace adapter rebuilds
+                // into `simple_call(lltype.cast_pointer, T, p)`, yielding
+                // `SomeInstance(T)` regardless of the receiver's
+                // classdef-less annotation.  Slice / `str` derefs resolve
+                // no struct root and keep their ordinary lowering.
+                if args.len() == 1
+                    && let Some(root) = self.deref_cast_root(&reg, &call.dest.ty)
+                {
+                    let res = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(res.clone()),
+                        kind: cast_pointer_marker_op(root, args[0].clone()),
+                    });
+                    self.local_var[dest_local] = Some(res);
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
                 // Workspace `Index::index` / `IndexMut::index_mut`
                 // impls (`FixedObjectArray` and friends) bottom out at
                 // raw-slice construction (`as_mut_slice` →
@@ -4296,6 +4322,34 @@ impl<'a> Lowering<'a> {
                     | "core::ptr::mut_ptr::<Impl>::cast"
             )
         })
+    }
+
+    /// A thin-pointer `Deref::deref` / `DerefMut::deref_mut` whose
+    /// dereferenced `&T` is a registered struct, resolved to the pointee
+    /// struct root.  `Box<T>` / `Rc<T>` / `Arc<T>` and the workspace
+    /// `FrameBox` are each one pointer word (the heap address of the
+    /// pointee), so `*p` is a typed pointer reinterpret rather than a
+    /// value-producing operation: the caller lowers it to the
+    /// `cast_pointer(T, p)` downcast marker (`cast_pointer_marker_op`),
+    /// which yields `SomeInstance(T)` (lltype.py:964-974) independent of
+    /// the receiver's (classdef-less) annotation — the same shape pyre
+    /// emits for `obj as *const W_Foo`.
+    ///
+    /// Returns `None` when the call is not a `deref` / `deref_mut` leaf
+    /// or the dereferenced type is not a named ADT (slice / `str` derefs
+    /// resolve no struct root and keep their ordinary lowering — their
+    /// `&[T]` / `&str` value model is the receiver's, narrowed by the
+    /// list / string reprs, not a pointer downcast).
+    fn deref_cast_root(&self, reg: &RegularCall, dest_ty: &TyRef) -> Option<String> {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return None;
+        };
+        let fd = self.llbc.fn_by_id(*id)?;
+        let np = fd.item_meta.name_path();
+        if !(np.ends_with("::deref") || np.ends_with("::deref_mut")) {
+            return None;
+        }
+        tyref_class_root(dest_ty, self.llbc)
     }
 
     /// The blanket `impl<I: Iterator> IntoIterator for I`
@@ -7551,7 +7605,13 @@ fn static_key_matches(full: &str, stripped: &str, key: &str) -> bool {
 /// float `Constant`).  Matches on the `f64::<Impl>::<NAME>` tail so a
 /// `core`- or `std`-rooted path resolves identically.
 fn primitive_float_const(segments: &[String]) -> Option<OpKind> {
-    let tail: Vec<&str> = segments.iter().rev().take(3).rev().map(String::as_str).collect();
+    let tail: Vec<&str> = segments
+        .iter()
+        .rev()
+        .take(3)
+        .rev()
+        .map(String::as_str)
+        .collect();
     let bits = match tail.as_slice() {
         ["f64", "<Impl>", "INFINITY"] => f64::INFINITY.to_bits(),
         _ => return None,
