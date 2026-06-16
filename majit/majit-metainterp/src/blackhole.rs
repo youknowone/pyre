@@ -6993,6 +6993,35 @@ pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
         "arraylen_vable/rdd>i".to_string(),
         majit_translate::insns::BC_ARRAYLEN_VABLE,
     );
+    // GC array-build family — `BuildTuple` / `BuildList` / `BuildMap` /
+    // `BuildSet` / `BuildString` lower to `new_array_clear` (alloc) +
+    // unrolled `setarrayitem_gc_r` (fill) + a `new*_from_array` residual
+    // (already covered by the residual_call family above).  A
+    // guard-failure resume into a jitcode whose forward path contains a
+    // literal/return tuple (or list/map/set/str) walks the alloc + fill
+    // ops, so the strict builder must wire them or `dispatch_step`
+    // panics on the unwired byte.  Both the const-operand variants
+    // (`cd>r` length, `rcrd` index — what the codewriter emits, since
+    // the length and index are compile-time constants) and the
+    // register-operand variants (`id>r`, `rird`) are registered so the
+    // builder stays correct if the flattener ever colors them into
+    // registers.  Handlers wired in `wire_bhimpl_handlers`.
+    insns.insert(
+        "new_array_clear/cd>r".to_string(),
+        majit_translate::insns::BC_NEW_ARRAY_CLEAR_C,
+    );
+    insns.insert(
+        "new_array_clear/id>r".to_string(),
+        majit_translate::insns::BC_NEW_ARRAY_CLEAR,
+    );
+    insns.insert(
+        "setarrayitem_gc_r/rcrd".to_string(),
+        majit_translate::insns::BC_SETARRAYITEM_GC_R_C,
+    );
+    insns.insert(
+        "setarrayitem_gc_r/rird".to_string(),
+        majit_translate::insns::BC_SETARRAYITEM_GC_R,
+    );
     insns.insert(
         "hint_force_virtualizable/r".to_string(),
         majit_translate::insns::BC_HINT_FORCE_VIRTUALIZABLE,
