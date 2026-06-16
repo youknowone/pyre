@@ -1155,18 +1155,23 @@ pub(crate) fn merge_backend_exit_layouts<T: AsRef<majit_ir::Op>>(
         // rd_numb-based layout when the backend doesn't provide it.
         // The frontend populates header_pc from the guard's snapshot
         // frame.pc; the backend may only have slot layouts.
+        // copy_all_attributes_from parity: reconcile every backend frame,
+        // not only the common prefix. Overlapping frames keep the
+        // frontend's authoritative header_pc/slot_types and back-fill gaps
+        // from the backend; backend frames the frontend layout lacks are
+        // appended so no recovery frame is dropped.
         if let Some(ref backend_recovery) = layout.recovery_layout {
             if let Some(ref mut existing) = entry.recovery_layout {
-                for (target, source) in existing
-                    .frames
-                    .iter_mut()
-                    .zip(backend_recovery.frames.iter())
-                {
-                    if target.header_pc.is_none() {
-                        target.header_pc = source.header_pc;
-                    }
-                    if target.slot_types.is_none() {
-                        target.slot_types = source.slot_types.clone();
+                for (i, source) in backend_recovery.frames.iter().enumerate() {
+                    if let Some(target) = existing.frames.get_mut(i) {
+                        if target.header_pc.is_none() {
+                            target.header_pc = source.header_pc;
+                        }
+                        if target.slot_types.is_none() {
+                            target.slot_types = source.slot_types.clone();
+                        }
+                    } else {
+                        existing.frames.push(source.clone());
                     }
                 }
             } else {
