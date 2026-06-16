@@ -26,17 +26,21 @@ PYPY3 = os.environ.get("PYRE_CHECK_PYPY3") or (
 )
 
 
-def _detect_cpython_stdlib():
-    """Stdlib directory of the CPython baseline (`PYTHON3`).
+def _detect_pyre_stdlib():
+    """Stdlib directory to pin pyre to.
 
-    pyre's native modules (`_sre`, ...) are coupled to one CPython version,
-    and pyre's own `detect_stdlib_path` falls back to a bare `python3` on
-    PATH. When several interpreters are on PATH (e.g. CI sets up CPython
-    then PyPy, whose `python3` then shadows it) that fallback can resolve
-    to a foreign stdlib; only the regex bench — the one pure-Python stdlib
-    import in the suite — then crashes. Resolve the baseline's own stdlib
-    so `pyre_env` can pin pyre to it.
+    pyre's native modules (`_sre`, ...) are coupled to one CPython version
+    via `_sre.MAGIC`; the vendored `lib-python/3` is the version-matched
+    copy. pyre's own `detect_stdlib_path` already resolves it through
+    `find_intree_stdlib`, but a host `python3` whose `re`/`_sre` MAGIC
+    disagrees (e.g. an older CPython on the dev PATH, or a PyPy that
+    shadows CPython on the CI PATH) would mismatch if reached. Pin the
+    vendored copy explicitly so the result is independent of PATH.
+    The host `python3` stdlib is only a last resort for an out-of-tree run.
     """
+    intree = Path(__file__).resolve().parent.parent / "lib-python" / "3"
+    if intree.is_dir():
+        return str(intree)
     try:
         proc = subprocess.run(
             [PYTHON3, "-c", "import sysconfig; print(sysconfig.get_paths()['stdlib'])"],
@@ -50,7 +54,7 @@ def _detect_cpython_stdlib():
     return path if path and os.path.isdir(path) else None
 
 
-PYRE_STDLIB = _detect_cpython_stdlib()
+PYRE_STDLIB = _detect_pyre_stdlib()
 
 BENCH_DIR = "pyre/bench"
 SYNTHETIC_BENCH_DIR = "pyre/bench/synth"
@@ -213,9 +217,9 @@ def pyre_env():
     env = dict(os.environ)
     env["MAJIT_STRICT"] = "1"
     env["MAJIT_STATS"] = "1"
-    # Pin the stdlib to the CPython baseline so pyre never auto-detects a
-    # foreign `python3` (e.g. a PyPy that shadows CPython on the CI PATH).
-    # An explicit PYRE_STDLIB in the environment wins.
+    # Pin the vendored, `_sre.MAGIC`-matched stdlib so pyre never picks up a
+    # version-mismatched host `python3` off the PATH. An explicit PYRE_STDLIB
+    # in the environment wins.
     if PYRE_STDLIB and "PYRE_STDLIB" not in env:
         env["PYRE_STDLIB"] = PYRE_STDLIB
     return env
