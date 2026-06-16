@@ -3605,6 +3605,25 @@ pub extern "C" fn bh_delete_subscr_fn(obj: i64, index: i64) -> i64 {
     0
 }
 
+/// LIST_EXTEND residual (`list_extend` HLOp → `residual_call_r_v`).
+/// Runs `list.extend(iterable)` through the shared
+/// `opcode_ops::list_extend_value` (the same code the interpreter's
+/// `list_extend` runs); `list` is peeked and mutated in place.  A
+/// non-iterable operand or a user iterator running Python can raise
+/// (`MayForce`).  Void result, so always returns 0; on error the
+/// exception is published through `BH_LAST_EXC_VALUE` for the trailing
+/// `GuardNoException`, matching `bh_delete_subscr_fn`.
+pub extern "C" fn bh_list_extend_fn(list: i64, iterable: i64) -> i64 {
+    if let Err(err) = pyre_interpreter::opcode_ops::list_extend_value(
+        list as pyre_object::PyObjectRef,
+        iterable as pyre_object::PyObjectRef,
+    ) {
+        let exc_obj = err.to_exc_object();
+        publish_residual_call_exception(exc_obj as i64);
+    }
+    0
+}
+
 /// Compute the LOOKUP_METHOD `null_or_self` for blackhole LOAD_ATTR resume,
 /// given the already-resolved `attr` from [`bh_load_attr_fn`].  Delegates to
 /// the shared `compute_load_method_bound`, a pure MRO inspection that never

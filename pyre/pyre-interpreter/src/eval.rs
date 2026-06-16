@@ -3698,44 +3698,7 @@ impl OpcodeStepExecutor for PyFrame {
     fn list_extend(&mut self, _i: usize) -> Result<(), PyError> {
         let iterable = self.pop();
         let list = self.peek();
-        unsafe {
-            if pyre_object::is_list(iterable) {
-                let src_len = pyre_object::w_list_len(iterable);
-                for j in 0..src_len {
-                    if let Some(item) = pyre_object::w_list_getitem(iterable, j as i64) {
-                        pyre_object::w_list_append(list, item);
-                    }
-                }
-                return Ok(());
-            }
-            if pyre_object::is_tuple(iterable) {
-                let src_len = pyre_object::w_tuple_len(iterable);
-                for j in 0..src_len {
-                    if let Some(item) = pyre_object::w_tuple_getitem(iterable, j as i64) {
-                        pyre_object::w_list_append(list, item);
-                    }
-                }
-                return Ok(());
-            }
-            // Generic iter-protocol fallback for dict/set/range/generator/etc.
-            let iter = crate::baseobjspace::iter(iterable).map_err(|_| {
-                let type_name = (*(*iterable).ob_type).name;
-                PyError::type_error(format!(
-                    "Value after * must be an iterable, not {}",
-                    type_name
-                ))
-            })?;
-            loop {
-                match crate::baseobjspace::next(iter) {
-                    Ok(item) => {
-                        pyre_object::w_list_append(list, item);
-                    }
-                    Err(e) if e.kind == crate::PyErrorKind::StopIteration => break,
-                    Err(e) => return Err(e),
-                }
-            }
-        }
-        Ok(())
+        crate::opcode_ops::list_extend_value(list, iterable)
     }
 
     fn unsupported(

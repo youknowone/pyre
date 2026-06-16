@@ -2629,6 +2629,25 @@ fn emit_frontend_delete_attr(
     );
 }
 
+/// LIST_EXTEND — records the 2-arg `list_extend(list, iterable)` HLOp
+/// (void result) that `flatten.rs::lower_list_extend_hlop_to_insn`
+/// threads into the `bh_list_extend_fn(list, iterable)` residual.  The
+/// list is peeked (not popped) — the residual mutates it in place.
+fn emit_frontend_list_extend(
+    block: &super::flow::BlockRef,
+    list: super::flow::FlowValue,
+    iterable: super::flow::FlowValue,
+    offset: i64,
+) {
+    record_graph_op(
+        block,
+        "list_extend",
+        vec![list.into(), iterable.into()],
+        None,
+        offset,
+    );
+}
+
 fn emit_frontend_getattr(
     graph: &mut super::flow::FunctionGraph,
     block: &super::flow::BlockRef,
@@ -3373,6 +3392,7 @@ struct FnPtrIndices {
     unary_invert_fn: HelperHandle,
     unary_not_fn: HelperHandle,
     load_fast_check_fn: HelperHandle,
+    list_extend_fn: HelperHandle,
 }
 
 /// Register every blackhole helper fn pointer with the assembler in
@@ -3727,6 +3747,14 @@ fn register_helper_fn_pointers(
         cpu.unary_negative_fn as *const (),
         CallFlavor::MayForce,
     );
+    // `bh_list_extend_fn` extends a list in place from an arbitrary
+    // iterable; iterating it runs user `__iter__`/`__next__` → `MayForce`.
+    // Appended last to preserve fn_ptr indices.
+    let list_extend_fn = bind(
+        assembler,
+        cpu.list_extend_fn as *const (),
+        CallFlavor::MayForce,
+    );
     FnPtrIndices {
         call_fn,
         load_global_fn,
@@ -3775,6 +3803,7 @@ fn register_helper_fn_pointers(
         unary_invert_fn,
         unary_not_fn,
         load_fast_check_fn,
+        list_extend_fn,
     }
 }
 
@@ -4771,6 +4800,11 @@ impl CodeWriter {
                     idx: load_fast_check_fn_idx,
                     flavor: _load_fast_check_fn_flavor,
                 },
+            list_extend_fn:
+                HelperHandle {
+                    idx: list_extend_fn_idx,
+                    flavor: _list_extend_fn_flavor,
+                },
         } = register_helper_fn_pointers(&mut assembler, self.cpu());
 
         // codewriter.py:37 `portal_jd = self.callcontrol.jitdriver_sd_from_portal_graph(graph)`
@@ -4850,6 +4884,7 @@ impl CodeWriter {
                 unary_invert_fn_idx,
                 unary_not_fn_idx,
                 load_fast_check_fn_idx,
+                list_extend_fn_idx,
             });
         }
 
@@ -8545,10 +8580,33 @@ impl CodeWriter {
                             emit_abort_permanent!(py_pc);
                         }
 
-                        // ListExtend(i): peek list, pop iterable. Net: -1.
-                        Instruction::ListExtend { .. } => {
-                            pop_and_decr_depth(&mut current_state, &mut current_depth);
-                            emit_abort_permanent!(py_pc);
+                        // ListExtend(i): PEEK(i) list (mutated in place, stays
+                        // on the stack), POP iterable (TOS). Net: -1.
+                        // `list.extend(iterable)` via the `list_extend` residual.
+                        Instruction::ListExtend { i } => {
+                            let oparg = i.get(op_arg) as usize;
+                            current_depth = current_depth.saturating_sub(1);
+                            emit_vsd!(current_depth, py_pc);
+                            let iterable_value =
+                                pop_ref_or_fresh(&mut current_state, &mut graph);
+                            // PEEK(oparg): after popping the iterable, PEEK(1) is
+                            // the new TOS, so the list sits at `len - oparg`.
+                            // Clone its FlowValue without popping — the residual
+                            // mutates it in place and it stays live for STORE_FAST.
+                            let list_value = {
+                                let len = current_state.stack.len();
+                                if oparg >= 1 && oparg <= len {
+                                    current_state.stack[len - oparg].clone()
+                                } else {
+                                    fresh_ref_value(&mut graph)
+                                }
+                            };
+                            emit_frontend_list_extend(
+                                &current_block.block(),
+                                list_value,
+                                iterable_value,
+                                py_pc as i64,
+                            );
                         }
 
                         // SetUpdate(i): peek set, pop iterable. Net: -1.

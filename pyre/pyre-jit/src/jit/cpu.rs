@@ -58,6 +58,9 @@ pub struct Cpu {
     pub binary_slice_fn: extern "C" fn(i64, i64, i64) -> i64,
     /// DELETE_SUBSCR residual — `(obj, index) → void` (`del obj[index]`).
     pub delete_subscr_fn: extern "C" fn(i64, i64) -> i64,
+    /// LIST_EXTEND residual — `(list, iterable) → void` (`list.extend(iterable)`,
+    /// list peeked + mutated in place).
+    pub list_extend_fn: extern "C" fn(i64, i64) -> i64,
     /// DELETE_ATTR residual — `(obj, code, name_idx) → void` (`del obj.name`).
     /// Resolves the name from the code object and runs generic `delattr`.
     pub delete_attr_fn: extern "C" fn(i64, i64, i64) -> i64,
@@ -238,6 +241,7 @@ impl Cpu {
             binary_slice_fn: crate::call_jit::bh_binary_slice_fn,
             delete_subscr_fn: crate::call_jit::bh_delete_subscr_fn,
             delete_attr_fn: crate::call_jit::bh_delete_attr_fn,
+            list_extend_fn: crate::call_jit::bh_list_extend_fn,
             format_simple_fn: crate::call_jit::bh_format_simple_fn,
             format_with_spec_fn: crate::call_jit::bh_format_with_spec_fn,
             convert_value_fn: crate::call_jit::bh_convert_value_fn,

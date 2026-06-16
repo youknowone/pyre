@@ -3354,6 +3354,13 @@ pub struct LoweringContext {
     /// or raises the unbound NameError (reads no heap, runs no user code →
     /// `Plain`).
     pub load_fast_check_fn_idx: u16,
+    /// `list_extend_fn` descrs-pool index.  LIST_EXTEND records the
+    /// `list_extend(list, iterable)` HLOp lowered to
+    /// `residual_call_r_v(ConstInt(fn_idx), ListR([list, iterable]), Descr)`
+    /// (void result) via [`lower_list_extend_hlop_to_insn`] (the two-Ref
+    /// DELETE_SUBSCR shape); `bh_list_extend_fn` extends the list in place
+    /// from an arbitrary iterable (user `__iter__`/`__next__` → `MayForce`).
+    pub list_extend_fn_idx: u16,
 }
 
 /// Map a BINARY_OP HLOp opname (`add`/.../`xor`/`getitem` plus the
@@ -4827,6 +4834,9 @@ where
     if let Some(insn) = lower_delsubscr_hlop_to_insn(op, ctx, get_register, lower_constant) {
         return Some(insn);
     }
+    if let Some(insn) = lower_list_extend_hlop_to_insn(op, ctx, get_register, lower_constant) {
+        return Some(insn);
+    }
     if let Some(insn) = lower_delete_attr_hlop_to_insn(op, ctx, get_register, lower_constant) {
         return Some(insn);
     }
@@ -5568,6 +5578,45 @@ where
     Some(build_residual_call_r_v_insn_from_operands(
         ctx.delete_subscr_fn_idx,
         vec![obj_operand, key_operand],
+        CallFlavor::MayForce,
+        majit_ir::PyreHelperKind::None,
+    ))
+}
+
+/// Lower the LIST_EXTEND pyre HLOp `list_extend(list, iterable)` → void
+/// — the same two-Ref void shape as [`lower_delsubscr_hlop_to_insn`] — to
+/// `residual_call_r_v(ConstInt(list_extend_fn_idx), ListR([list,
+/// iterable]), Descr)`.  `bh_list_extend_fn(list, iterable)` runs
+/// `opcode_ops::list_extend_value` (the same code the interpreter's
+/// `list_extend` runs); iterating an arbitrary iterable may invoke user
+/// `__iter__`/`__next__` → `MayForce`.
+///
+/// Returns `None` for non-`list_extend` opnames or non-void shapes so the
+/// caller can fall through to other lowering arms.
+pub fn lower_list_extend_hlop_to_insn<F, LC>(
+    op: &super::flow::SpaceOperation,
+    ctx: &LoweringContext,
+    get_register: &mut F,
+    lower_constant: &mut LC,
+) -> Option<Insn>
+where
+    F: FnMut(super::flow::Variable) -> Register,
+    LC: FnMut(&Constant) -> Operand,
+{
+    if op.opname != "list_extend" {
+        return None;
+    }
+    if op.args.len() != 2 {
+        return None;
+    }
+    if op.result.is_some() {
+        return None;
+    }
+    let list_operand = flatten_arg_with_lowering(&op.args[0], get_register, lower_constant);
+    let iterable_operand = flatten_arg_with_lowering(&op.args[1], get_register, lower_constant);
+    Some(build_residual_call_r_v_insn_from_operands(
+        ctx.list_extend_fn_idx,
+        vec![list_operand, iterable_operand],
         CallFlavor::MayForce,
         majit_ir::PyreHelperKind::None,
     ))
@@ -7038,6 +7087,7 @@ mod tests {
             unary_invert_fn_idx: 0,
             unary_not_fn_idx: 0,
             load_fast_check_fn_idx: 0,
+            list_extend_fn_idx: 0,
         };
         let mut on = SSARepr::new("setattr_on");
         let mut on_regallocs = make_regallocs();
@@ -7192,6 +7242,7 @@ mod tests {
             unary_invert_fn_idx: 0,
             unary_not_fn_idx: 0,
             load_fast_check_fn_idx: 0,
+            list_extend_fn_idx: 0,
         };
 
         let mut ssarepr = SSARepr::new("retired_families");
@@ -7333,6 +7384,7 @@ mod tests {
             unary_invert_fn_idx: 0,
             unary_not_fn_idx: 0,
             load_fast_check_fn_idx: 0,
+            list_extend_fn_idx: 0,
         };
 
         let mut ssarepr = SSARepr::new("trailing_live");
@@ -7437,6 +7489,7 @@ mod tests {
             unary_invert_fn_idx: 0,
             unary_not_fn_idx: 0,
             load_fast_check_fn_idx: 0,
+            list_extend_fn_idx: 0,
         };
 
         let mut ssarepr = SSARepr::new("multi_block_lowering");
@@ -7585,6 +7638,7 @@ mod tests {
             unary_invert_fn_idx: 0,
             unary_not_fn_idx: 0,
             load_fast_check_fn_idx: 0,
+            list_extend_fn_idx: 0,
         };
 
         let mut ssarepr = SSARepr::new("pyre_walker_2exit");
@@ -7778,6 +7832,7 @@ mod tests {
             unary_invert_fn_idx: 0,
             unary_not_fn_idx: 0,
             load_fast_check_fn_idx: 0,
+            list_extend_fn_idx: 0,
         });
 
         let mut regallocs = perform_register_allocation_all_kinds(&graph);
@@ -8020,6 +8075,7 @@ mod tests {
             unary_invert_fn_idx: 0,
             unary_not_fn_idx: 0,
             load_fast_check_fn_idx: 0,
+            list_extend_fn_idx: 0,
         };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -8128,6 +8184,7 @@ mod tests {
             unary_invert_fn_idx: 0,
             unary_not_fn_idx: 0,
             load_fast_check_fn_idx: 0,
+            list_extend_fn_idx: 0,
         };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -8180,6 +8237,7 @@ mod tests {
             unary_invert_fn_idx: 0,
             unary_not_fn_idx: 0,
             load_fast_check_fn_idx: 0,
+            list_extend_fn_idx: 0,
         };
 
         let hlop = SpaceOperation::new("sub", vec![lhs.into(), rhs.into()], Some(result.into()), 0);
@@ -8309,6 +8367,7 @@ mod tests {
             unary_invert_fn_idx: 0,
             unary_not_fn_idx: 0,
             load_fast_check_fn_idx: 0,
+            list_extend_fn_idx: 0,
         };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -8396,6 +8455,7 @@ mod tests {
             unary_invert_fn_idx: 0,
             unary_not_fn_idx: 0,
             load_fast_check_fn_idx: 0,
+            list_extend_fn_idx: 0,
         };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -8454,6 +8514,7 @@ mod tests {
             unary_invert_fn_idx: 0,
             unary_not_fn_idx: 0,
             load_fast_check_fn_idx: 0,
+            list_extend_fn_idx: 0,
         };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -8504,6 +8565,7 @@ mod tests {
             unary_invert_fn_idx: 0,
             unary_not_fn_idx: 0,
             load_fast_check_fn_idx: 0,
+            list_extend_fn_idx: 0,
         };
         let hlop = SpaceOperation::new("eq", vec![lhs.into(), rhs.into()], Some(result.into()), 0);
         let mut get_register = identity_register_mapper();
@@ -8561,6 +8623,7 @@ mod tests {
             unary_invert_fn_idx: 0,
             unary_not_fn_idx: 0,
             load_fast_check_fn_idx: 0,
+            list_extend_fn_idx: 0,
         };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -8645,6 +8708,7 @@ mod tests {
             unary_invert_fn_idx: 0,
             unary_not_fn_idx: 0,
             load_fast_check_fn_idx: 0,
+            list_extend_fn_idx: 0,
         };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -8692,6 +8756,7 @@ mod tests {
             unary_invert_fn_idx: 0,
             unary_not_fn_idx: 0,
             load_fast_check_fn_idx: 0,
+            list_extend_fn_idx: 0,
         };
         let hlop = SpaceOperation::new("bool", vec![cond.into()], Some(result.into()), 0);
         let mut get_register = identity_register_mapper();
@@ -8753,6 +8818,7 @@ mod tests {
             unary_invert_fn_idx: 0,
             unary_not_fn_idx: 0,
             load_fast_check_fn_idx: 0,
+            list_extend_fn_idx: 0,
         };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -8830,6 +8896,7 @@ mod tests {
             unary_invert_fn_idx: 0,
             unary_not_fn_idx: 0,
             load_fast_check_fn_idx: 0,
+            list_extend_fn_idx: 0,
         };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -8892,6 +8959,7 @@ mod tests {
             unary_invert_fn_idx: 0,
             unary_not_fn_idx: 0,
             load_fast_check_fn_idx: 0,
+            list_extend_fn_idx: 0,
         };
         let hlop = SpaceOperation::new(
             "setitem",
@@ -8969,6 +9037,7 @@ mod tests {
             unary_invert_fn_idx: 0,
             unary_not_fn_idx: 0,
             load_fast_check_fn_idx: 0,
+            list_extend_fn_idx: 0,
         };
         let mut get_register_a = identity_register_mapper();
         let mut get_register_b = identity_register_mapper();
@@ -9022,6 +9091,7 @@ mod tests {
             unary_invert_fn_idx: 0,
             unary_not_fn_idx: 0,
             load_fast_check_fn_idx: 0,
+            list_extend_fn_idx: 0,
         };
         let mut get_register_a = identity_register_mapper();
         let mut get_register_b = identity_register_mapper();
@@ -9075,6 +9145,7 @@ mod tests {
             unary_invert_fn_idx: 0,
             unary_not_fn_idx: 0,
             load_fast_check_fn_idx: 0,
+            list_extend_fn_idx: 0,
         };
         let mut get_register_a = identity_register_mapper();
         let mut get_register_b = identity_register_mapper();
@@ -9133,6 +9204,7 @@ mod tests {
             unary_invert_fn_idx: 0,
             unary_not_fn_idx: 0,
             load_fast_check_fn_idx: 0,
+            list_extend_fn_idx: 0,
         };
         let mut get_register_a = identity_register_mapper();
         let mut get_register_b = identity_register_mapper();
@@ -9205,6 +9277,7 @@ mod tests {
             unary_invert_fn_idx: 0,
             unary_not_fn_idx: 0,
             load_fast_check_fn_idx: 0,
+            list_extend_fn_idx: 0,
         };
         let mut get_register_a = identity_register_mapper();
         let mut get_register_b = identity_register_mapper();
@@ -10600,6 +10673,7 @@ mod tests {
             unary_invert_fn_idx: 0,
             unary_not_fn_idx: 0,
             load_fast_check_fn_idx: 0,
+            list_extend_fn_idx: 0,
         };
         flatten_graph_for_test_with_lowering(&graph, &mut ssarepr, ctx, Some(cpu));
         ssarepr
@@ -10894,6 +10968,7 @@ mod tests {
             unary_invert_fn_idx: 0,
             unary_not_fn_idx: 0,
             load_fast_check_fn_idx: 0,
+            list_extend_fn_idx: 0,
         };
         let null_or_self_var = Variable::new(VariableId(10), Kind::Ref);
         let op = super::super::flow::SpaceOperation::new(
@@ -11011,6 +11086,7 @@ mod tests {
             unary_not_fn_idx: 110,
             load_fast_check_fn_idx: 111,
             unary_negative_fn_idx: 112,
+            list_extend_fn_idx: 113,
         };
         let code_const = Constant::new(
             super::super::flow::ConstantValue::Signed(0x2000),

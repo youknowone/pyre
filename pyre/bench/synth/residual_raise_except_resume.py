@@ -10,9 +10,12 @@
 # and the exception escaped the handler.  This bench pins that a
 # residual-call raise caught on the resume path returns byte-identically.
 #
-# These cases keep only int / immutable-literal locals live across the
-# `try` — a live heap-object local (e.g. a list bound before the `try`)
-# reconstructed on the resume walk is the separate #124 kept-stack gate.
+# `list_extend_resume` additionally builds a heap-local list via
+# LIST_EXTEND (`[*base]`) *after* the loop, so the loop-exit guard
+# failure resumes through the LIST_EXTEND: the walk must execute the
+# `list_extend` residual.  Previously LIST_EXTEND had no walker handler
+# and emitted an abort that, reached on the resume walk, invalidated the
+# live frame and crashed (SIGSEGV) — the residual port fixes that.
 N = 2000000
 
 
@@ -59,11 +62,24 @@ def tuple_index_resume(n):
         return -7
 
 
+def list_extend_resume(n):
+    i = 0
+    while i < n:
+        i = i + 1
+    base = [10, 20, 30]
+    data = [*base]
+    try:
+        return data[i]
+    except IndexError:
+        return data[0] - 100
+
+
 def main():
     print(divide_by_zero_const(N))
     print(divide_by_zero_computed(N))
     print(modulo_by_zero(N))
     print(tuple_index_resume(N))
+    print(list_extend_resume(N))
 
 
 main()

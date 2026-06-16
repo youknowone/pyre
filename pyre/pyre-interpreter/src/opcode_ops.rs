@@ -179,6 +179,49 @@ pub fn bool_value_from_truth(value: bool) -> PyObjectRef {
     w_bool_from(value)
 }
 
+/// LIST_EXTEND — extend `list` in place with the items of `iterable`.
+/// Shared by the interpreter's `list_extend` handler and the JIT residual
+/// `bh_list_extend_fn`.  Mirrors `list.extend`: fast paths for list/tuple
+/// sources, generic iterator-protocol fallback otherwise (which surfaces
+/// "Value after * must be an iterable, not <T>" when not iterable).
+pub fn list_extend_value(list: PyObjectRef, iterable: PyObjectRef) -> Result<(), PyError> {
+    unsafe {
+        if pyre_object::is_list(iterable) {
+            let src_len = pyre_object::w_list_len(iterable);
+            for j in 0..src_len {
+                if let Some(item) = pyre_object::w_list_getitem(iterable, j as i64) {
+                    pyre_object::w_list_append(list, item);
+                }
+            }
+            return Ok(());
+        }
+        if pyre_object::is_tuple(iterable) {
+            let src_len = pyre_object::w_tuple_len(iterable);
+            for j in 0..src_len {
+                if let Some(item) = pyre_object::w_tuple_getitem(iterable, j as i64) {
+                    pyre_object::w_list_append(list, item);
+                }
+            }
+            return Ok(());
+        }
+        // Generic iter-protocol fallback for dict/set/range/generator/etc.
+        let iter = crate::baseobjspace::iter(iterable).map_err(|_| {
+            let type_name = (*(*iterable).ob_type).name;
+            PyError::type_error(format!("Value after * must be an iterable, not {}", type_name))
+        })?;
+        loop {
+            match crate::baseobjspace::next(iter) {
+                Ok(item) => {
+                    pyre_object::w_list_append(list, item);
+                }
+                Err(e) if e.kind == crate::PyErrorKind::StopIteration => break,
+                Err(e) => return Err(e),
+            }
+        }
+    }
+    Ok(())
+}
+
 #[majit_macros::jit_may_force]
 pub extern "C" fn jit_truth_value(value: i64) -> i64 {
     truth_value(value as PyObjectRef) as i64
