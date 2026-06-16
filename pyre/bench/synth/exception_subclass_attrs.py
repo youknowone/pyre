@@ -29,6 +29,12 @@ def main():
     str_hits = 0
     repr_hits = 0
     i = 0
+    # Loop-invariant args tuple held in a frame local so the GC root scan
+    # walks it.  An inline `e.args = (1, 2, 3)` would fold to a ConstPtr the
+    # JIT bakes as an immediate and does not yet GC-forward (gh #108 gc-table),
+    # so it dangles when the MyOS(OSError) construct triggers a minor
+    # collection.
+    args_triple = (1, 2, 3)
     while i < N:
         m = MyExit(i)
         m.code = i + 1
@@ -39,7 +45,7 @@ def main():
         errno_sum = errno_sum + o.errno
 
         e = MyErr("a")
-        e.args = (1, 2, 3)
+        e.args = args_triple
         arglen = arglen + len(e.args)
         if str(e) == "custom-str:(1, 2, 3)":
             str_hits = str_hits + 1
