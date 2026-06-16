@@ -8062,6 +8062,17 @@ impl MIFrame {
             return Ok(Some(pyre_interpreter::StepResult::Continue));
         }
 
+        // LOAD_SMALL_INT walker activation — the const-push sibling of
+        // LoadConst (the small int lives in the oparg itself, not the
+        // constant pool).  Delegate to `OpcodeStepExecutor::load_small_int`
+        // (the same method `execute_load_small_int` calls), which emits an
+        // int ConstRef and pushes via `push_value` (advancing vsd).
+        if let Instruction::LoadSmallInt { i } = instruction {
+            use pyre_interpreter::OpcodeStepExecutor;
+            OpcodeStepExecutor::load_small_int(self, i64::from(i.get(op_arg)))?;
+            return Ok(Some(pyre_interpreter::StepResult::Continue));
+        }
+
         // LOAD_FAST / LOAD_FAST_BORROW walker activation via trait-path
         // delegation.  Same oparg-payload shape as LoadConst: the auto-gen
         // arm reads the `var_num` local index from a register the r0-only
@@ -9327,6 +9338,10 @@ pub fn production_walker_handles(instruction: &Instruction) -> bool {
             // oparg-derived `&ConstantData` operand left unbound by the
             // r0-only arm entry (ResidualCallArgUnbound).
             | Instruction::LoadConst { .. }
+            // LoadSmallInt handled by the entry hook (const-push sibling of
+            // LoadConst; small int in the oparg → load_small_int → int
+            // ConstRef + push_value).
+            | Instruction::LoadSmallInt { .. }
             // LoadFast / LoadFastBorrow handled by the
             // dispatch_via_walker_for_opcode entry hook: resolves the
             // var_num local index + name and delegates to
