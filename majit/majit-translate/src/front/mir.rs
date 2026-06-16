@@ -8835,6 +8835,80 @@ fn extract_fmt_chain(
     Some(FmtChain { pieces, args })
 }
 
+/// Emit a `__str_const` constant of `text` into `bb_id` and return its
+/// Variable — the same synthetic `Call(["__str_const", text])` shape the
+/// constant lowering uses (see [`Lowering::emit_constant`]); the flowspace
+/// adapter pre-folds it to the upstream string `Constant` and types it as
+/// a String.
+#[allow(dead_code)]
+fn emit_str_const(graph: &mut FunctionGraph, bb_id: BlockId, text: &str) -> Variable {
+    use crate::model::{CallTarget, OpKind, ValueType};
+    let var = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+    graph.block_mut(bb_id).operations.push(SpaceOperation {
+        result: Some(var.clone()),
+        kind: OpKind::Call {
+            target: CallTarget::FunctionPath {
+                segments: vec!["__str_const".to_string(), text.to_string()],
+            },
+            args: vec![],
+            result_ty: ValueType::Ref(None),
+        },
+    });
+    var
+}
+
+/// Emit a string concatenation `lhs + rhs` into `bb_id` and return its
+/// Variable. The `"add"` opname passes through the flowspace adapter
+/// unchanged; when both operands type as String the rtyper routes it to
+/// `pair(StringRepr, StringRepr).rtype_add` → `direct_call(ll_strconcat)`.
+#[allow(dead_code)]
+fn emit_str_add(
+    graph: &mut FunctionGraph,
+    bb_id: BlockId,
+    lhs: &Variable,
+    rhs: &Variable,
+) -> Variable {
+    use crate::model::{OpKind, ValueType};
+    let var = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+    graph.block_mut(bb_id).operations.push(SpaceOperation {
+        result: Some(var.clone()),
+        kind: OpKind::BinOp {
+            op: "add".to_string(),
+            lhs: lhs.clone(),
+            rhs: rhs.clone(),
+            result_ty: ValueType::Ref(None),
+        },
+    });
+    var
+}
+
+/// Emit the StringRepr-add left fold that materializes a recognized
+/// `format_args!` chain as a runtime String:
+///
+/// ```text
+/// acc = strconst(pieces[0])
+/// for each arg i:
+///     acc = acc + args[i].value          // render(&str) == identity
+///     acc = acc + strconst(pieces[i+1])
+/// ```
+///
+/// Returns the final String Variable. Each literal piece becomes a
+/// `__str_const` call and each concatenation a `BinOp("add")` the rtyper
+/// lowers through `ll_strconcat`. The caller must have verified every
+/// argument renders by identity (a `&str` `Display`); `Debug` rendering
+/// and non-`&str` `Display` are outside the recognized subset and are
+/// rejected before emission.
+#[allow(dead_code)]
+fn emit_fmt_concat(graph: &mut FunctionGraph, bb_id: BlockId, chain: &FmtChain) -> Variable {
+    let mut acc = emit_str_const(graph, bb_id, &chain.pieces[0]);
+    for (i, arg) in chain.args.iter().enumerate() {
+        acc = emit_str_add(graph, bb_id, &acc, &arg.value);
+        let next_piece = emit_str_const(graph, bb_id, &chain.pieces[i + 1]);
+        acc = emit_str_add(graph, bb_id, &acc, &next_piece);
+    }
+    acc
+}
+
 #[cfg(test)]
 mod tests {
     use super::harden_duplicate_leaf_metadata;
@@ -9207,6 +9281,68 @@ mod tests {
 
         // A non-`Arguments::new` producer is not recognized.
         assert!(extract_fmt_chain(&graph, &pieces_arr).is_none());
+    }
+
+    #[test]
+    fn emit_fmt_concat_builds_interleaved_str_add_fold() {
+        use super::{emit_fmt_concat, FmtArg, FmtArgKind, FmtChain};
+        use crate::flowspace::model::Variable;
+        use crate::model::{CallTarget, FunctionGraph, OpKind};
+
+        // `format!("a{}b{}c", x, y)` → pieces ["a","b","c"], two args.
+        let mut graph = FunctionGraph::new("concat");
+        let bb = graph.create_block();
+        let x = Variable::new();
+        let y = Variable::new();
+        let chain = FmtChain {
+            pieces: vec!["a".to_string(), "b".to_string(), "c".to_string()],
+            args: vec![
+                FmtArg {
+                    value: x.clone(),
+                    kind: FmtArgKind::Display,
+                },
+                FmtArg {
+                    value: y.clone(),
+                    kind: FmtArgKind::Display,
+                },
+            ],
+        };
+        let result = emit_fmt_concat(&mut graph, bb, &chain);
+
+        let ops = &graph.blocks.iter().find(|b| b.id == bb).unwrap().operations;
+        // 3 literal `__str_const`s + 4 `add`s = 7 ops.
+        assert_eq!(ops.len(), 7);
+
+        let str_const_text = |i: usize| -> String {
+            match &ops[i].kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments },
+                    ..
+                } if segments.first().map(String::as_str) == Some("__str_const") => {
+                    segments[1].clone()
+                }
+                other => panic!("op[{i}] not a __str_const: {other:?}"),
+            }
+        };
+        let add_operands = |i: usize| -> (u64, u64) {
+            match &ops[i].kind {
+                OpKind::BinOp {
+                    op, lhs, rhs, ..
+                } if op == "add" => (lhs.id(), rhs.id()),
+                other => panic!("op[{i}] not an add: {other:?}"),
+            }
+        };
+        let result_id = |i: usize| ops[i].result.as_ref().unwrap().id();
+
+        assert_eq!(str_const_text(0), "a");
+        assert_eq!(str_const_text(2), "b");
+        assert_eq!(str_const_text(5), "c");
+        // Fold chain: ("a" + x) + "b", then (+ y) + "c".
+        assert_eq!(add_operands(1), (result_id(0), x.id()));
+        assert_eq!(add_operands(3), (result_id(1), result_id(2)));
+        assert_eq!(add_operands(4), (result_id(3), y.id()));
+        assert_eq!(add_operands(6), (result_id(4), result_id(5)));
+        assert_eq!(result.id(), result_id(6));
     }
 
     /// Anchor [`extract_fmt_chain`] to the real lowered IR of
