@@ -726,17 +726,16 @@ impl VirtualizableInfo {
     /// pyjitpl.py:2982-2989) instead of being re-seeded from the trace-entry
     /// input args by the optimizer's stopgap `VirtualizableTracker`.
     ///
-    /// True for the macro state-field JIT: no static extra boxes, a green ref
-    /// kept ahead of the identity (so `identity_ref_bank_index` is set), and
-    /// the virtualizable named `"state"`. PyFrame (heap-object virtualizable,
-    /// `identity_ref_bank_index == None`) returns false and keeps the legacy
-    /// optimizer seeding. When true, `to_optimizer_config` clears
-    /// `track_array_elements` so the optimizer does not double-count the array
-    /// at the loop boundary.
+    /// True for the macro state-field JIT: no static extra boxes and a green
+    /// ref kept ahead of the identity (so `identity_ref_bank_index` is set).
+    /// PyFrame (a heap-object virtualizable, `identity_ref_bank_index == None`)
+    /// returns false and keeps the legacy optimizer seeding. When true,
+    /// `to_optimizer_config` clears `track_array_elements` so the optimizer
+    /// does not double-count the array at the loop boundary. The discriminator
+    /// is structural — the banked-identity layout, not the field name — so it
+    /// holds for any state-field driver regardless of what it names its state.
     pub fn elements_carried_via_shadow(&self) -> bool {
-        self.num_static_extra_boxes == 0
-            && self.identity_ref_bank_index.is_some()
-            && self.name == "state"
+        self.num_static_extra_boxes == 0 && self.identity_ref_bank_index.is_some()
     }
 
     pub fn to_optimizer_config(&self) -> crate::optimizeopt::virtualize::VirtualizableConfig {
