@@ -8104,6 +8104,27 @@ impl MIFrame {
             return Ok(Some(pyre_interpreter::StepResult::Continue));
         }
 
+        // BINARY_OP walker activation via trait-path delegation.
+        //
+        // Same oparg-payload shape (the operator tag is read from an arm
+        // register the r0-only entry leaves unbound).  Delegate to
+        // `OpcodeStepExecutor::binary_op`, which pops the two operands (via
+        // `pop_value`, advancing vsd), emits the type-specialised
+        // arithmetic IR (`int_add_ovf` &c. behind class guards), and pushes
+        // the result.  Unlike the load/store hooks above this is MAY-RAISE
+        // (TypeError on mismatched operands): `binary_op` returns
+        // `Err(PyError)`, which propagates through
+        // `dispatch_via_walker_for_opcode` to `trace_code_step` exactly as
+        // an `execute_opcode_step` error would on the trait leg, so the
+        // recorder's exception handling is identical on either dispatch
+        // leg.  Bypasses `apply_walker_stack_effect` because `pop_value` /
+        // `push_value` handle vsd.
+        if let Instruction::BinaryOp { op } = instruction {
+            use pyre_interpreter::OpcodeStepExecutor;
+            OpcodeStepExecutor::binary_op(self, op.get(op_arg))?;
+            return Ok(Some(pyre_interpreter::StepResult::Continue));
+        }
+
         // STORE_SUBSCR walker activation via trait-path delegation.
         //
         // The auto-gen arm jitcode for `StoreSubscr` is
@@ -9320,6 +9341,11 @@ pub fn production_walker_handles(instruction: &Instruction) -> bool {
             // Distinct from StoreFastStoreFast, which stays trait-routed
             // (#405 arm-entry var_nums seeding).
             | Instruction::StoreFast { .. }
+            // BinaryOp handled by the dispatch_via_walker_for_opcode entry
+            // hook: delegates to OpcodeStepExecutor::binary_op (pop_value
+            // ×2 + specialised arithmetic IR + push_value).  May-raise; the
+            // Err propagates to trace_code_step like the trait leg.
+            | Instruction::BinaryOp { .. }
             | Instruction::ExtendedArg
             | Instruction::Resume { .. }
             | Instruction::Cache
