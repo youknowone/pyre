@@ -583,6 +583,82 @@ impl Bookkeeper {
             .unwrap_or_default()
     }
 
+    /// TODO: no upstream equivalent.  Pre-mint the variant subclasses of
+    /// every unit-only enum so the session-prologue
+    /// [`crate::translator::rtyper::normalizecalls::assign_inheritance_ids`]
+    /// pass numbers each `enum-base + variant-children` subtree as a
+    /// unit.  Called from `PyreCallRegistry::ensure_session` AFTER the
+    /// struct-root loop (so the enum-base classdefs already exist,
+    /// UNNUMBERED) and BEFORE the single `assign_inheritance_ids`.
+    ///
+    /// A variant ctor instantiation (`PyError::type_error` →
+    /// `PyErrorKind::TypeError`) mints its variant class LAZILY during
+    /// annotation, after the prologue numbering has already baked the
+    /// enum base's `[minid,maxid]` bracket.  An on-demand
+    /// `assign_inheritance_ids` re-run then cannot number the fresh
+    /// child (its bracket would have to nest inside the parent's baked
+    /// range — not append-safe), so `ClassesPBCRepr.redispatch_call`
+    /// Skip-classifies the instantiation.  Pre-minting the whole subtree
+    /// here leaves every member UNNUMBERED at the single numbering pass,
+    /// so the contiguous bracket is assigned once and never shifts.
+    ///
+    /// Spelling MUST match the annotation path
+    /// (`flowspace_adapter::translate_op` `SyntheticTransparentCtor` arm)
+    /// exactly or the pre-mint is a phantom that never matches the
+    /// lazily-minted class: base = `intern_class_by_qualname(leaf)` (bare
+    /// enum leaf), variant = `intern_class_by_qualname_with_bases(
+    /// "{dotted_owner}.{variant}", [base])`.  `enum_variant_by_discriminant`
+    /// dual-publishes each enum under both its `::`-qualified path and
+    /// its bare leaf; iterate the qualified keys only (the dotted owner
+    /// path derives from `key.replace("::", ".")`).  Scoped to unit-only
+    /// enums (the same `is_unit_only_enum` gate the ctor arm uses);
+    /// payload-bearing enums keep base-less variant classes until their
+    /// payload reprs land.
+    pub fn pre_register_unit_enum_variant_classes(self: &Rc<Self>) {
+        // Collect (qualified_root, [variant names]) for unit-only enums,
+        // releasing both registry borrows before minting (the intern /
+        // getuniqueclassdef calls re-borrow `pyre_struct_fields` and
+        // `pyre_struct_root_classes`).  Sorted for a deterministic mint
+        // order so the numbering bracket is reproducible.
+        let mut pairs: Vec<(String, Vec<String>)> = {
+            let variant_guard = self.pyre_enum_variant_by_discriminant.borrow();
+            let fields_guard = self.pyre_struct_fields.borrow();
+            let (Some(variants), Some(reg)) = (variant_guard.as_ref(), fields_guard.as_ref())
+            else {
+                return;
+            };
+            variants
+                .iter()
+                .filter(|(root, _)| root.contains("::"))
+                .filter_map(|(root, by_discr)| {
+                    let leaf = root.rsplit("::").next().unwrap_or(root);
+                    reg.is_unit_only_enum(leaf).then(|| {
+                        let mut names: Vec<String> = by_discr.values().cloned().collect();
+                        names.sort();
+                        names.dedup();
+                        (root.clone(), names)
+                    })
+                })
+                .collect()
+        };
+        pairs.sort();
+
+        for (root, variant_names) in pairs {
+            let leaf = root.rsplit("::").next().unwrap_or(&root);
+            let dotted_owner = root.replace("::", ".");
+            let base = self.intern_class_by_qualname(leaf);
+            // Ensure the base classdef exists before a variant references
+            // it through `getmro`; idempotent with the struct-root loop.
+            let _ = self.getuniqueclassdef(&base);
+            for variant in variant_names {
+                let qualname = format!("{dotted_owner}.{variant}");
+                let variant_host =
+                    self.intern_class_by_qualname_with_bases(&qualname, vec![base.clone()]);
+                let _ = self.getuniqueclassdef(&variant_host);
+            }
+        }
+    }
+
     /// Push a classdef into [`Self::needs_generic_instantiate`] unless
     /// it is already present (upstream `dict[cdef] = True` idempotence).
     pub fn push_needs_generic_instantiate(&self, classdef: &Rc<RefCell<ClassDef>>) {

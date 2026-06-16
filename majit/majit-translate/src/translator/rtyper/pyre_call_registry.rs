@@ -448,6 +448,13 @@ impl PyreCallRegistry {
             // populate path's `is_known_unported` tolerance.
             let _ = self.bookkeeper.getuniqueclassdef_for_struct_root(&root);
         }
+        // Pre-mint unit-only enum variant subclasses so each
+        // `enum-base + variants` subtree is numbered as one contiguous
+        // bracket by the single pass below — a variant class minted
+        // lazily after the base's bracket is baked would otherwise stay
+        // unnumbered (not append-safe) and Skip-classify at its
+        // `ClassesPBCRepr` instantiation.
+        self.bookkeeper.pre_register_unit_enum_variant_classes();
         crate::translator::rtyper::normalizecalls::assign_inheritance_ids(&annotator);
         translator.set_rtyper(rtyper.clone());
         *self.session.borrow_mut() = Some((annotator.clone(), rtyper.clone()));
