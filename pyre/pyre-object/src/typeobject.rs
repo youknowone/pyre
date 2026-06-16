@@ -190,6 +190,13 @@ pub struct W_TypeObject {
     /// has no TypeDef struct, so the creation site of each builtin
     /// W_TypeObject sets it directly.
     pub flag_method_descriptor: bool,
+    /// `Py_TPFLAGS_DISALLOW_INSTANTIATION` (`1 << 7`) — set on types
+    /// whose `tp_new` is NULL (generator / coroutine / frame / ...).
+    /// `type.__call__` raises `cannot create 'X' instances` and
+    /// `reduce_newobj` raises `cannot pickle 'X' object` when set.  Set
+    /// once after construction via `w_type_set_disallow_instantiation`;
+    /// never inherited by heap subclasses (the default is `false`).
+    pub flag_disallow_instantiation: std::sync::atomic::AtomicBool,
 }
 
 /// Source of fresh `version_tag` identities (`VersionTag()`, typeobject.py:73).
@@ -295,6 +302,9 @@ pub fn w_type_new(name: &str, bases: PyObjectRef, dict_ptr: *mut u8) -> PyObject
         // typeobject.py:256 — user-defined typedefs never set
         // `method_descriptor` (typedef.py:22 default `False`).
         flag_method_descriptor: false,
+        // Heap subclasses are always instantiable (their `tp_new` is the
+        // slot wrapper); only builtin disallow-types flip this.
+        flag_disallow_instantiation: std::sync::atomic::AtomicBool::new(false),
     }) as PyObjectRef;
     register_heap_type(w_type as usize);
     w_type
@@ -380,6 +390,10 @@ pub fn w_type_new_builtin(
         // default `False`); the `function` creation site flips it
         // (typedef.py:807).
         flag_method_descriptor: false,
+        // `Py_TPFLAGS_DISALLOW_INSTANTIATION` off by default; the
+        // generator / coroutine / frame typedefs flip it via
+        // `w_type_set_disallow_instantiation`.
+        flag_disallow_instantiation: std::sync::atomic::AtomicBool::new(false),
     }) as PyObjectRef
 }
 
@@ -446,6 +460,35 @@ pub unsafe fn w_type_set_flag_map_or_seq(w_type: PyObjectRef, flag: u8) {
     let t = &*(w_type as *const W_TypeObject);
     t.flag_map_or_seq
         .store(flag, std::sync::atomic::Ordering::Release);
+}
+
+/// `Py_TPFLAGS_DISALLOW_INSTANTIATION` reader — `True` when `w_type`'s
+/// `tp_new` is conceptually NULL (the type refuses `Type()`).
+///
+/// # Safety
+/// `w_type` must be a valid PyObjectRef pointing at a `W_TypeObject`.
+pub unsafe fn w_type_disallows_instantiation(w_type: PyObjectRef) -> bool {
+    if w_type.is_null() || !is_type(w_type) {
+        return false;
+    }
+    let t = &*(w_type as *const W_TypeObject);
+    t.flag_disallow_instantiation
+        .load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// `Py_TPFLAGS_DISALLOW_INSTANTIATION` setter — flips a builtin type to
+/// refuse instantiation.  Called once at typedef registration for
+/// generator / coroutine / frame-shaped types.
+///
+/// # Safety
+/// `w_type` must be a valid PyObjectRef pointing at a `W_TypeObject`.
+pub unsafe fn w_type_set_disallow_instantiation(w_type: PyObjectRef) {
+    if w_type.is_null() || !is_type(w_type) {
+        return;
+    }
+    let t = &*(w_type as *const W_TypeObject);
+    t.flag_disallow_instantiation
+        .store(true, std::sync::atomic::Ordering::Release);
 }
 
 // ── Layout accessors ─────────────────────────────────────────────────
@@ -667,16 +710,18 @@ pub unsafe fn w_type_is_heaptype(obj: PyObjectRef) -> bool {
 /// typeobject.py:866 `get_flags(self)` — the `__flags__` bitmask.
 ///
 /// `_HEAPTYPE = 1<<9`, `_CPYTYPE = 1` (non-heap builtin types),
-/// `PATMA_SEQUENCE = 1<<5`, `PATMA_MAPPING = 1<<6`.  pyre tracks
-/// `flag_heaptype` and `flag_map_or_seq`; the cpytype bit follows
-/// `!flag_heaptype` (every non-heap type is a builtin C type).  The
-/// abstract / method-descriptor bits have no pyre flag yet.
+/// `PATMA_SEQUENCE = 1<<5`, `PATMA_MAPPING = 1<<6`,
+/// `DISALLOW_INSTANTIATION = 1<<7`.  pyre tracks `flag_heaptype`,
+/// `flag_map_or_seq` and `flag_disallow_instantiation`; the cpytype bit
+/// follows `!flag_heaptype` (every non-heap type is a builtin C type).
+/// The abstract / method-descriptor bits have no pyre flag yet.
 pub unsafe fn w_type_get_flags(obj: PyObjectRef) -> i64 {
     if obj.is_null() || !is_type(obj) {
         return 0;
     }
     const HEAPTYPE: i64 = 1 << 9;
     const CPYTYPE: i64 = 1;
+    const DISALLOW_INSTANTIATION: i64 = 1 << 7;
     const PATMA_SEQUENCE: i64 = 1 << 5;
     const PATMA_MAPPING: i64 = 1 << 6;
     let t = &*(obj as *const W_TypeObject);
@@ -685,6 +730,11 @@ pub unsafe fn w_type_get_flags(obj: PyObjectRef) -> i64 {
         flags |= HEAPTYPE;
     } else {
         flags |= CPYTYPE;
+    }
+    if t.flag_disallow_instantiation
+        .load(std::sync::atomic::Ordering::Acquire)
+    {
+        flags |= DISALLOW_INSTANTIATION;
     }
     match t.flag_map_or_seq.load(std::sync::atomic::Ordering::Acquire) {
         b'M' => flags |= PATMA_MAPPING,

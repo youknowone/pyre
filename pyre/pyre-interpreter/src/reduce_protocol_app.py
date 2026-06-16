@@ -7,8 +7,11 @@ def reduce_1(obj, proto):
 def reduce_2(obj, proto, args, kwargs):
     cls = obj.__class__
 
-    if not hasattr(type(obj), "__new__"):
-        raise TypeError("can't pickle %s objects" % type(obj).__name__)
+    # Py_TPFLAGS_DISALLOW_INSTANTIATION (1 << 7): a type whose tp_new is
+    # NULL (generator / frame / ...) cannot be reconstructed via
+    # __newobj__, so reduce_newobj refuses it before building the tuple.
+    if type(obj).__flags__ & (1 << 7):
+        raise TypeError("cannot pickle %r object" % type(obj).__name__)
 
     try:
         copyreg = sys.modules['copyreg']

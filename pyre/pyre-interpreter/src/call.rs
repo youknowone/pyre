@@ -1913,9 +1913,26 @@ pub(crate) fn calculate_metaclass(
     Ok(w_winner)
 }
 
+/// `typeobject.c type_call` — a type whose `tp_new` is NULL
+/// (`Py_TPFLAGS_DISALLOW_INSTANTIATION`, e.g. generator) refuses
+/// `Type()` with `cannot create 'X' instances`.
+fn check_type_instantiable(w_type: PyObjectRef) -> Result<(), PyError> {
+    if unsafe { pyre_object::w_type_disallows_instantiation(w_type) } {
+        let name = unsafe { pyre_object::w_type_get_name(w_type) };
+        return Err(PyError::type_error(format!(
+            "cannot create '{name}' instances"
+        )));
+    }
+    Ok(())
+}
+
 /// Type call without a PyFrame.
 /// PyPy: typeobject.py descr_call
 fn type_descr_call_impl(w_type: PyObjectRef, args: &[PyObjectRef]) -> PyObjectRef {
+    if let Err(e) = check_type_instantiable(w_type) {
+        set_call_error(e);
+        return PY_NULL;
+    }
     // Step 1: __new__
     let instance =
         if let Some(new_fn) = unsafe { crate::baseobjspace::lookup_in_type(w_type, "__new__") } {
@@ -3078,6 +3095,7 @@ fn type_descr_call_with_mode(
     args: &[PyObjectRef],
     mode: CallMode,
 ) -> PyResult {
+    check_type_instantiable(w_type)?;
     // Step 1: Look up __new__ via type MRO → allocate instance.
     // PyPy: typeobject.py descr_call → `w_newtype, w_newdescr =
     // self.lookup_where('__new__')`; a missing descriptor (the pathological

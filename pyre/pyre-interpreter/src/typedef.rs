@@ -619,9 +619,14 @@ pub fn init_typeobjects() {
             &pyre_object::superobject::SUPER_TYPE as *const PyType as usize,
             new_typeobject_with_base("super", |_| {}, object_type) as usize,
         );
+        let generator_type = new_typeobject_with_base("generator", |_| {}, object_type);
+        // `Py_TPFLAGS_DISALLOW_INSTANTIATION` — a generator is produced
+        // only by calling a generator function, never by `generator()`,
+        // so `tp_new` is NULL and pickling refuses it.
+        unsafe { pyre_object::w_type_set_disallow_instantiation(generator_type) };
         reg.insert(
             &pyre_object::generatorobject::GENERATOR_TYPE as *const PyType as usize,
-            new_typeobject_with_base("generator", |_| {}, object_type) as usize,
+            generator_type as usize,
         );
         reg.insert(
             &pyre_object::rangeobject::RANGE_ITER_TYPE as *const PyType as usize,
