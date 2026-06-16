@@ -8086,6 +8086,24 @@ impl MIFrame {
             return Ok(Some(pyre_interpreter::StepResult::Continue));
         }
 
+        // STORE_FAST walker activation via trait-path delegation.
+        //
+        // Same oparg-payload shape as LoadFast (the var_num local index is
+        // read from an arm register the r0-only entry leaves unbound).
+        // Delegate to `OpcodeStepExecutor::store_fast`, which pops the TOS
+        // (via `pop_value`, advancing vsd) and emits the `setarrayitem_
+        // vable_r` local write — a VABLE array write (the JIT-modeled,
+        // resume-safe kind), distinct from a globals-dict write.  The
+        // updated local rides the vable shadow to the live PyFrame through
+        // `synchronize_virtualizable`.  No `code` needed (store_fast takes
+        // only the index); bypasses `apply_walker_stack_effect` because
+        // `pop_value` handles vsd.
+        if let Instruction::StoreFast { var_num } = instruction {
+            use pyre_interpreter::OpcodeStepExecutor;
+            OpcodeStepExecutor::store_fast(self, var_num.get(op_arg).as_usize())?;
+            return Ok(Some(pyre_interpreter::StepResult::Continue));
+        }
+
         // STORE_SUBSCR walker activation via trait-path delegation.
         //
         // The auto-gen arm jitcode for `StoreSubscr` is
@@ -9296,6 +9314,12 @@ pub fn production_walker_handles(instruction: &Instruction) -> bool {
             // a register the r0-only arm entry leaves unbound.
             | Instruction::LoadFast { .. }
             | Instruction::LoadFastBorrow { .. }
+            // StoreFast handled by the dispatch_via_walker_for_opcode entry
+            // hook: delegates to OpcodeStepExecutor::store_fast (pop_value
+            // advances vsd, setarrayitem_vable_r writes the local).
+            // Distinct from StoreFastStoreFast, which stays trait-routed
+            // (#405 arm-entry var_nums seeding).
+            | Instruction::StoreFast { .. }
             | Instruction::ExtendedArg
             | Instruction::Resume { .. }
             | Instruction::Cache
