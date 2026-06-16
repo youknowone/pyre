@@ -3385,11 +3385,16 @@ fn bh_call_fn_impl(callable: PyObjectRef, null_or_self: PyObjectRef, args: &[PyO
     }
 }
 
-/// jtransform.py parity: namespace and code come from getfield_vable_r; the
-/// live frame is passed explicitly so `_load_global` can mirror
-/// `self.get_builtin()` in compiled residual-call paths as well as blackhole.
-/// namespace = getfield_vable_r(frame, w_globals), code = getfield_vable_r(frame, pycode).
-/// namei is the raw oparg from LOAD_GLOBAL: name_idx = namei >> 1.
+/// `_load_global` residual (pyopcode.py:958-969).  Resolves the namespace from
+/// the callee's OWN `w_code` (`w_code_get_w_globals`, GC-forwarded at call
+/// time), NOT the `namespace_ptr` operand: the walker emits `namespace_ptr` as
+/// the cell-fold recogniser's hint, but the frame register it reads from
+/// aliases the outermost frame on a chained / inlined-callee resume.  `w_code`
+/// is the callee's own promoted constant, so its live globals are always the
+/// correct, relocation-following dict.  The live frame is passed explicitly so
+/// `_load_global` can mirror `self.get_builtin()` in compiled residual-call
+/// paths as well as blackhole.  namei is the raw oparg from LOAD_GLOBAL:
+/// name_idx = namei >> 1.
 pub extern "C" fn bh_load_global_fn(
     namespace_ptr: i64,
     w_code_ptr: i64,
@@ -3408,7 +3413,7 @@ pub extern "C" fn bh_load_global_fn(
     }
 
     let varname = code.names[idx].as_ref();
-    let w_globals_obj = namespace_ptr as pyre_object::PyObjectRef;
+    let _ = namespace_ptr;
     // pypy/interpreter/pyopcode.py:958-969 `_load_global`:
     //   w_value = self.space.finditem_str(self.get_w_globals(), varname)
     //   if w_value is None:
@@ -3416,14 +3421,23 @@ pub extern "C" fn bh_load_global_fn(
     //       if w_value is None:
     //           self._load_global_failed(w_varname)
     //
-    // Dispatch through the dict strategy on the globals object
-    // (`dictmultiobject.py:113-115 getitem_str`) so module dicts and
-    // plain dicts (exec/eval globals, no dict_storage_proxy) are both
-    // handled — matching the interpreter `load_global_value`.
-    if !w_globals_obj.is_null() {
-        if let Some(w_value) =
-            unsafe { pyre_object::dictmultiobject::w_dict_getitem_str(w_globals_obj, varname) }
-        {
+    // Resolve the namespace from the callee's OWN `W_Code` at call time
+    // rather than the `namespace_ptr` operand.  The walker reads the
+    // operand namespace from `getfield_vable_r(frame, w_globals)`, but the
+    // frame register aliases the OUTERMOST frame on a chained blackhole /
+    // inlined-callee resume, so a non-portal callee would see the caller's
+    // globals (or a null when the frame register is unseeded).  `w_code` is
+    // the callee's own promoted constant, and reading `w_globals` from it at
+    // call time yields the current (GC-forwarded) module dict — the value
+    // the const-folding `frontend_global_flow_value` resolved statically,
+    // but live, so a relocated dict (a growing `memo`) is followed instead
+    // of dangling.  `namespace_ptr` survives only as the
+    // `try_walker_load_global_cell_fold` recogniser's hint.
+    let w_globals =
+        unsafe { pyre_interpreter::w_code_get_w_globals(w_code_ptr as pyre_object::PyObjectRef) };
+    if !w_globals.is_null() {
+        let globals = unsafe { &*w_globals };
+        if let Some(w_value) = pyre_interpreter::dict_storage_get(globals, varname) {
             return w_value as i64;
         }
     }

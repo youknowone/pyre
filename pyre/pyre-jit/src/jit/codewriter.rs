@@ -4730,7 +4730,7 @@ impl CodeWriter {
                 },
             load_global_fn:
                 HelperHandle {
-                    idx: _load_global_fn_idx,
+                    idx: load_global_fn_idx,
                     flavor: _load_global_fn_flavor,
                 },
             compare_fn:
@@ -7187,12 +7187,78 @@ impl CodeWriter {
                             if is_portal {
                                 let _ = ssarepr.fresh_var(Kind::Ref, scratch_ref_base).0;
                             }
-                            let name_idx = raw_namei as usize >> 1;
-                            let result_value = code
-                                .names
-                                .get(name_idx)
-                                .and_then(|name| frontend_global_flow_value(w_code, name.as_ref()))
-                                .unwrap_or_else(|| fresh_ref_value(&mut graph));
+                            // #336: in the PORTAL jitcode, load the global at
+                            // RUNTIME from the live frame instead of const-
+                            // folding the resolved object's address into the
+                            // jitcode constant pool.  Const-folding bakes a raw
+                            // pointer into `constants_r`, which the moving
+                            // (incminimark) GC does not forward; a global object
+                            // still young at build time and relocated afterwards
+                            // (e.g. a `memo` dict mutated in the loop) leaves a
+                            // dangling pointer the blackhole resume then reads.
+                            // The register-form namespace (`getfield_vable_r`,
+                            // field 5 = the live `w_globals_obj`) lets
+                            // `try_walker_load_global_cell_fold` hoist the lookup
+                            // to a GC-safe live cell read (`QuasiimmutField` +
+                            // `jit_namespace_cell_lookup`), so the value is read
+                            // through the forwarded dict every iteration; the
+                            // `bh_load_global_fn` residual fallback derives the
+                            // namespace from `w_code`'s live `w_globals`.  pycode
+                            // (r1) is the jitcode's own promoted `W_Code`; the
+                            // frame (r2) feeds `get_builtin()`.
+                            //
+                            // This is portal-only.  In a non-portal callee the
+                            // frame register aliases the outermost frame on a
+                            // chained / inlined-callee resume, and the extra
+                            // `getfield_vable_r` graph op misallocates against
+                            // the inlined locals; such a callee keeps the
+                            // `flowcontext.py:856-859 find_global` const-fold,
+                            // which the inliner needs as a foldable constant call
+                            // target.  Read-only module globals (functions) are
+                            // promoted to the non-moving oldgen before any
+                            // jitcode build, so their const-folded addresses are
+                            // stable.
+                            let result_value: super::flow::FlowValue = if is_portal {
+                                let ns_var = emit_graph_op_with_result(
+                                    &mut graph,
+                                    &current_block.block(),
+                                    "getfield_vable_r",
+                                    vable_getfield_ref_graph_args(
+                                        frame_var.into(),
+                                        VABLE_NAMESPACE_FIELD_IDX,
+                                    ),
+                                    Kind::Ref,
+                                    py_pc as i64,
+                                );
+                                let code_const: super::flow::FlowValue =
+                                    super::flow::Constant::new(
+                                        super::flow::ConstantValue::Signed(w_code as i64),
+                                        Some(Kind::Ref),
+                                    )
+                                    .into();
+                                let loaded = residual_call!(
+                                    load_global_fn_idx,
+                                    CallFlavor::Plain,
+                                    majit_ir::PyreHelperKind::LoadGlobal,
+                                    vec![super::flow::Constant::signed(raw_namei).into()],
+                                    vec![ns_var.into(), code_const, frame_var.into()],
+                                    vec![],
+                                    vec![Kind::Ref, Kind::Ref, Kind::Ref, Kind::Int],
+                                    ResKind::Ref,
+                                    py_pc as i64,
+                                );
+                                loaded
+                                    .map(super::flow::FlowValue::from)
+                                    .unwrap_or_else(|| fresh_ref_value(&mut graph).into())
+                            } else {
+                                let name_idx = raw_namei as usize >> 1;
+                                code.names
+                                    .get(name_idx)
+                                    .and_then(|name| {
+                                        frontend_global_flow_value(w_code, name.as_str())
+                                    })
+                                    .unwrap_or_else(|| fresh_ref_value(&mut graph).into())
+                            };
                             if let super::flow::FlowValue::Variable(v) = &result_value {
                                 pin!(Some(*v), loaded_dst_reg);
                             }
