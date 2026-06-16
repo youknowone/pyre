@@ -3572,7 +3572,12 @@ impl Optimizer {
         // RPython calls send_extra_operation(jump_op) which forces virtuals
         // through the full pass chain. No explicit flush()/force_box() needed.
         if !inline_short_preamble || front_target_tokens.len() <= 1 {
-            if let Some(preamble_token) = front_target_tokens.first() {
+            // unroll.py:196 `cell_token = jump_op.getdescr()`: the jump-to
+            // jitcell is the one the recorded close JUMP points to, not the
+            // caller-passed `front_target_tokens` (which is the bridge's
+            // ORIGIN loop and may differ from the loop the trace closed
+            // into). `assert cell_token.target_tokens` ⇒ require a target.
+            if !front_target_tokens.is_empty() {
                 let mut ctx = self.final_ctx.take().unwrap_or_else(|| {
                     // opencoder.py:259 inputarg_from_tp parity — seed inputarg
                     // BoxRefs with the producer-side types when available; the
@@ -3592,15 +3597,15 @@ impl Optimizer {
                         .unwrap_or_else(|| vec![majit_ir::Type::Ref; ni]);
                     OptContext::with_inputarg_types(32, &types)
                 });
-                // unroll.py:239-240: jump_to_preamble →
-                //   jump_op = jump_op.copy_and_change(rop.JUMP, descr=...)
+                // unroll.py:238-242: jump_to_preamble →
+                //   jump_op = jump_op.copy_and_change(rop.JUMP,
+                //                 descr=cell_token.target_tokens[0])
                 //   self.send_extra_operation(jump_op)
-                // Keep jump_op's own (forced) args; only the descr changes.
-                let jump_op = terminal_jump.copy_and_change(
-                    OpCode::Jump,
-                    None,
-                    Some(Some(preamble_token.as_jump_target_descr())),
-                );
+                // `cell_token.target_tokens[0]` is the preamble of the jitcell
+                // the JUMP points to — i.e. terminal_jump's own (recorded)
+                // descr (`is_preamble_target`). Keep both the jump_op's forced
+                // args AND its descr; only re-send it through the pass chain.
+                let jump_op = terminal_jump.copy_and_change(OpCode::Jump, None, None);
                 self.send_extra_operation(&jump_op, &mut ctx);
                 let mut result = optimized_ops;
                 result.extend(ctx.new_operations.drain(..));
@@ -3681,15 +3686,14 @@ impl Optimizer {
             // unroll.py:209-210: except InvalidLoop → jump_to_preamble
             // RPython: self.jump_to_preamble → send_extra_operation
             Err(()) => {
-                if let Some(preamble_token) = front_target_tokens.first() {
+                if !front_target_tokens.is_empty() {
                     ctx.new_operations.truncate(post_force_len);
-                    // unroll.py:239-240 jump_to_preamble parity: keep jump_op's
-                    // own (forced) args; only the descr changes.
-                    let jump_op = terminal_jump.copy_and_change(
-                        OpCode::Jump,
-                        None,
-                        Some(Some(preamble_token.as_jump_target_descr())),
-                    );
+                    // unroll.py:196,238-242 jump_to_preamble parity: the jump-to
+                    // jitcell is `jump_op.getdescr()` = terminal_jump's own
+                    // recorded descr (the preamble of the loop the trace closed
+                    // into), not the ORIGIN `front_target_tokens`. Keep both
+                    // jump_op's forced args AND its descr.
+                    let jump_op = terminal_jump.copy_and_change(OpCode::Jump, None, None);
                     self.send_extra_operation(&jump_op, &mut ctx);
                     let mut result = optimized_ops;
                     result.extend(ctx.new_operations.drain(..));
@@ -3765,16 +3769,18 @@ impl Optimizer {
                 retraced_count, retrace_limit,
             );
         }
-        if let Some(preamble_token) = front_target_tokens.first() {
+        if !front_target_tokens.is_empty() {
             ctx.new_operations.truncate(post_force_len);
-            // unroll.py:239-240 jump_to_preamble parity: keep jump_op's own
-            // (forced) args so send_extra_operation's Virtualize pass forces
-            // the still-virtual ref args; only the descr changes.
-            let jump_op = terminal_jump.copy_and_change(
-                OpCode::Jump,
-                None,
-                Some(Some(preamble_token.as_jump_target_descr())),
-            );
+            // unroll.py:196,238-242 jump_to_preamble parity: keep jump_op's own
+            // (forced) args so send_extra_operation's Virtualize pass forces the
+            // still-virtual ref args, AND keep its recorded descr. That descr is
+            // `cell_token.target_tokens[0]` (cell_token = jump_op.getdescr()) —
+            // the preamble of the jitcell the trace closed into. The caller's
+            // `front_target_tokens` belongs to the bridge's ORIGIN loop, whose
+            // preamble can be a different (reordered-arglocs) token when the
+            // bridge crosses loops, so redirecting to it delivers args to the
+            // wrong frame slots.
+            let jump_op = terminal_jump.copy_and_change(OpCode::Jump, None, None);
             self.send_extra_operation(&jump_op, &mut ctx);
             let mut result = optimized_ops;
             result.extend(ctx.new_operations.drain(..));
