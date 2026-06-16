@@ -9008,7 +9008,11 @@ fn takewhile_reduce_method(args: &[PyObjectRef]) -> PyResult {
 }
 
 /// `takewhile.__setstate__` — `interp_itertools.py W_TakeWhile.descr_setstate`:
-/// `self.stopped = space.bool_w(w_state)`.
+/// `self.stopped = space.bool_w(w_state)`.  `space.bool_w(w)` is
+/// `bool(int_w(w))` (baseobjspace.py:1944): it unwraps an int and
+/// rejects non-ints, NOT the general `is_true` truth test, so
+/// `int_w(...)? != 0` is the exact equivalent (raises on a non-int
+/// state just as `bool_w` does).
 fn takewhile_setstate_method(args: &[PyObjectRef]) -> PyResult {
     let it = unsafe { &mut *(args[0] as *mut pyre_object::itertoolsmodule::W_TakeWhile) };
     it.stopped = int_w(args.get(1).copied().unwrap_or(w_none()))? != 0;
@@ -9025,7 +9029,8 @@ fn dropwhile_reduce_method(args: &[PyObjectRef]) -> PyResult {
 }
 
 /// `dropwhile.__setstate__` — `interp_itertools.py W_DropWhile.descr_setstate`:
-/// `self.started = space.bool_w(w_state)`.
+/// `self.started = space.bool_w(w_state)` (= `bool(int_w(w))`; see
+/// `takewhile_setstate_method` for the `int_w(...)? != 0` equivalence).
 fn dropwhile_setstate_method(args: &[PyObjectRef]) -> PyResult {
     let it = unsafe { &mut *(args[0] as *mut pyre_object::itertoolsmodule::W_DropWhile) };
     it.started = int_w(args.get(1).copied().unwrap_or(w_none()))? != 0;
