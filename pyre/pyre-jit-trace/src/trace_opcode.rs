@@ -8062,6 +8062,30 @@ impl MIFrame {
             return Ok(Some(pyre_interpreter::StepResult::Continue));
         }
 
+        // LOAD_FAST / LOAD_FAST_BORROW walker activation via trait-path
+        // delegation.  Same oparg-payload shape as LoadConst: the auto-gen
+        // arm reads the `var_num` local index from a register the r0-only
+        // arm entry leaves unbound.  Resolve the local index + name
+        // (mirroring `execute_load_fast`, which serves both opcodes) and
+        // delegate to the existing `OpcodeStepExecutor::load_fast_checked`,
+        // whose vable read + `push_value` emits the specialised IR and
+        // advances vsd.  LoadFastBorrow shares the handler — the
+        // borrow-vs-own distinction is a runtime refcount concern the
+        // symbolic IR does not model.
+        if let Instruction::LoadFast { var_num } | Instruction::LoadFastBorrow { var_num } =
+            instruction
+        {
+            use pyre_interpreter::OpcodeStepExecutor;
+            let idx = pyre_interpreter::load_fast_var_num_to_index(*var_num, op_arg);
+            let name = if idx < pyre_interpreter::code_varnames_len(code) {
+                code.varnames[idx].as_ref()
+            } else {
+                "<cell>"
+            };
+            OpcodeStepExecutor::load_fast_checked(self, idx, name)?;
+            return Ok(Some(pyre_interpreter::StepResult::Continue));
+        }
+
         // STORE_SUBSCR walker activation via trait-path delegation.
         //
         // The auto-gen arm jitcode for `StoreSubscr` is
@@ -9264,6 +9288,14 @@ pub fn production_walker_handles(instruction: &Instruction) -> bool {
             // oparg-derived `&ConstantData` operand left unbound by the
             // r0-only arm entry (ResidualCallArgUnbound).
             | Instruction::LoadConst { .. }
+            // LoadFast / LoadFastBorrow handled by the
+            // dispatch_via_walker_for_opcode entry hook: resolves the
+            // var_num local index + name and delegates to
+            // OpcodeStepExecutor::load_fast_checked (push_value advances
+            // vsd).  The auto-gen arm reads the var_num oparg payload from
+            // a register the r0-only arm entry leaves unbound.
+            | Instruction::LoadFast { .. }
+            | Instruction::LoadFastBorrow { .. }
             | Instruction::ExtendedArg
             | Instruction::Resume { .. }
             | Instruction::Cache
