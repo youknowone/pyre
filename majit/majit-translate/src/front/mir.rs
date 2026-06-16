@@ -2904,10 +2904,22 @@ impl<'a> Lowering<'a> {
                     }
                     None => (None, None),
                 };
-                let base = self.resolve_place(mir_bb, place)?;
                 let res = self
                     .graph
                     .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                // A local bound directly to its payload by a decomposed
+                // always-`Ok` conversion (`try_lower_usize_try_from`)
+                // carries no runtime enum object — no `__discriminant`
+                // field exists to read.  Its tag is the recorded
+                // constant, so fold to `ConstInt(tag)` (mirrors
+                // `expect_on_const_ok`, which aliases the payload).
+                if let PlaceKind::Local(i) = &place.kind
+                    && let Some(&tag) =
+                        self.const_discriminant_locals.get(&(*i as usize))
+                {
+                    return Ok((Some(OpKind::ConstInt(tag)), res));
+                }
+                let base = self.resolve_place(mir_bb, place)?;
                 Ok((
                     Some(OpKind::FieldRead {
                         base,
@@ -4114,6 +4126,7 @@ impl<'a> Lowering<'a> {
                 let (segments, method_hint) = self.call_target_segments(mir_bb, &reg)?;
                 if self.try_lower_checked_neg(
                     mir_bb,
+                    &reg.kind,
                     &segments,
                     &args,
                     dest_local,
@@ -5097,12 +5110,19 @@ impl<'a> Lowering<'a> {
     /// payload `__pos_0 = neg(v)` (wrapping; the `None` arm never
     /// reads it).  The downstream discriminant switch and payload
     /// downcast then lower through the ordinary enum FieldRead paths.
+    /// The `i64::MIN` sentinel is only correct at word width, so the
+    /// lowering is gated on a word-sized signed operand (`i64`/`isize`)
+    /// — a narrower `checked_neg` overflows at its own narrower `MIN`
+    /// and keeps the generic `Call` form (none arise today; the live
+    /// callers are `neg`'s `int_value` and `rangeobject`'s `step`,
+    /// both `i64`).
     /// Returns `Ok(false)` when the call is not `checked_neg` (or the
     /// destination's `Option` decl cannot be resolved) so the generic
     /// `Call` lowering proceeds.
     fn try_lower_checked_neg(
         &mut self,
         mir_bb: usize,
+        kind: &CallKind,
         segments: &[String],
         args: &[Variable],
         dest_local: usize,
@@ -5122,6 +5142,22 @@ impl<'a> Lowering<'a> {
         let [arg] = args else {
             return Ok(false);
         };
+        // The decomposition compares against `i64::MIN`; restrict it to
+        // word-sized signed operands so a narrower `checked_neg` (which
+        // overflows at its own `MIN`) is not miscompiled.  The operand
+        // is the receiver — `checked_neg(self)` — so read `inputs[0]`.
+        let CallKind::Fun(FunId::Regular { id }) = kind else {
+            return Ok(false);
+        };
+        let Some(fd) = self.llbc.fn_by_id(*id) else {
+            return Ok(false);
+        };
+        let Some(src) = fd.signature.inputs.first() else {
+            return Ok(false);
+        };
+        if !matches!(self.tyref_literal_int_atom(src), Some("I64" | "Isize")) {
+            return Ok(false);
+        }
         // Resolve the destination `Option` decl so the FieldWrite owner
         // matches what `resolve_aggregate_adt` would record for a real
         // `Some(..)` construction site of the same type.
@@ -5517,6 +5553,27 @@ impl<'a> Lowering<'a> {
                 }
             })?;
         Some(format!("{owner}::{}", v.name))
+    }
+
+    /// The `Int` width atom (`"I8"` / `"I32"` / `"Isize"` …) of a
+    /// signed-integer literal type, mirroring [`tyref_literal_uint_atom`]
+    /// for the `{"Literal": {"Int": "Isize"}}` shell.  `None` for any
+    /// non-signed-literal type.
+    fn tyref_literal_int_atom<'t>(&self, ty: &'t TyRef) -> Option<&'t str>
+    where
+        'a: 't,
+    {
+        let value = match ty {
+            TyRef::Inline { value: (_, v) } => v,
+            TyRef::Other(v) => v,
+            TyRef::Dedup { id } => self.llbc.dedup_body(*id)?,
+        };
+        value
+            .as_object()?
+            .get("Literal")?
+            .as_object()?
+            .get("Int")?
+            .as_str()
     }
 
     /// Shared tail for the decomposed checked-arithmetic /

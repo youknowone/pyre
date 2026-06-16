@@ -2937,9 +2937,11 @@ pub fn rtyper_makerepr(
             //      not SomeImpossibleValue` → `RangeRepr(range_step)`
             //      (lltypesystem/rrange.py). Not ported — `RangeRepr`
             //      has no Rust counterpart yet (the whole `rrange.py`
-            //      surface is deferred, see `SomeIterator` below); a
-            //      range-list therefore falls through to the
-            //      fixed-size repr instead.
+            //      surface is deferred, see `SomeIterator` below). A
+            //      range-list is NOT array-backed, so the `Err` arm
+            //      below skips it rather than mis-lowering it as a
+            //      `FixedSizeListRepr` (whose `getarraysize` / item-load
+            //      ops would compile to invalid reads off a non-array).
             //   2. resized listdef → `ListRepr` (`GcStruct("list",
             //      length, items)`) — deferred (the `Err` arm below).
             //   3. non-resized → `FixedSizeListRepr`.
@@ -2953,8 +2955,19 @@ pub fn rtyper_makerepr(
             // (`externalvsinternal`'s `gcref=True` arm is likewise
             // deferred — `rclass.rs` — and unreached for `PyObjectRef`
             // items.)
-            let resized = s_list.listdef.listitem_rc().borrow().resized;
-            if resized {
+            let (resized, range_step) = {
+                let li_rc = s_list.listdef.listitem_rc();
+                let li = li_rc.borrow();
+                (li.resized, li.range_step)
+            };
+            if range_step.is_some() {
+                Err(TyperError::missing_rtype_operation(format!(
+                    "SomeList(range_step={range_step:?}).rtyper_makerepr — port \
+                     rpython/rtyper/lltypesystem/rrange.py RangeRepr \
+                     (listdef: {:?})",
+                    s_list.listdef
+                )))
+            } else if resized {
                 Err(TyperError::missing_rtype_operation(format!(
                     "SomeList(resized).rtyper_makerepr — port \
                      rpython/rtyper/lltypesystem/rlist.py ListRepr (GcStruct length+items) \
