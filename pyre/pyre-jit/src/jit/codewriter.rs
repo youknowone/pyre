@@ -8081,15 +8081,68 @@ impl CodeWriter {
                             emit_abort_permanent!(py_pc);
                         }
 
-                        // Swap: swap TOS with TOS[i]. No net stack effect.
-                        // pyopcode.py SWAP / eval.rs:1029-1034.
                         Instruction::Swap { i } => {
+                            // SWAP(n): exchange TOS with the value n
+                            // slots below it.  Stack values flow by symbolic
+                            // `FlowValue` identity — every consumer reads the
+                            // FlowValue, not the positional register (see
+                            // `emit_ref_return!` / `emit_pushvalue_ref!`'s
+                            // `let _ = $src`), and regalloc colors by Variable,
+                            // not by stack position — so the symbolic swap below
+                            // carries the value exchange for the compiled trace.
+                            // The two affected stack slots also mirror to the
+                            // virtualizable array at `stack_base_absolute + depth`
+                            // (jtransform.py:1898 `do_fixed_list_setitem`, vable
+                            // branch); a guard-failure resume walk reconstructs
+                            // the live frame from those slots, so emit the crossed
+                            // `setarrayitem_vable_r` writes that keep the mirror
+                            // consistent.  Previously this arm emitted
+                            // `abort_permanent`, which made any resume walk that
+                            // reached a SWAP (e.g. the `return`-from-`except`
+                            // cleanup `SWAP 2; POP_EXCEPT; RETURN_VALUE`) fail.
                             let depth = i.get(op_arg) as usize;
                             let stack_len = current_state.stack.len();
                             if depth > 0 && depth <= stack_len {
-                                current_state.stack.swap(stack_len - 1, stack_len - depth);
+                                let tos_idx = stack_len - 1;
+                                let other_idx = stack_len - depth;
+                                current_state.stack.swap(tos_idx, other_idx);
+                                if is_portal && tos_idx != other_idx {
+                                    let tos_value = current_state.stack[tos_idx].clone();
+                                    let other_value = current_state.stack[other_idx].clone();
+                                    let tos_slot: super::flow::FlowValue =
+                                        super::flow::Constant::signed(
+                                            (stack_base_absolute + tos_idx) as i64,
+                                        )
+                                        .into();
+                                    let other_slot: super::flow::FlowValue =
+                                        super::flow::Constant::signed(
+                                            (stack_base_absolute + other_idx) as i64,
+                                        )
+                                        .into();
+                                    record_graph_op(
+                                        &current_block.block(),
+                                        "setarrayitem_vable_r",
+                                        vable_setarrayitem_ref_graph_args(
+                                            frame_var.into(),
+                                            tos_slot.into(),
+                                            tos_value.into(),
+                                        ),
+                                        None,
+                                        py_pc as i64,
+                                    );
+                                    record_graph_op(
+                                        &current_block.block(),
+                                        "setarrayitem_vable_r",
+                                        vable_setarrayitem_ref_graph_args(
+                                            frame_var.into(),
+                                            other_slot.into(),
+                                            other_value.into(),
+                                        ),
+                                        None,
+                                        py_pc as i64,
+                                    );
+                                }
                             }
-                            emit_abort_permanent!(py_pc);
                         }
 
                         // LoadFastAndClear: push local, clear it. Net: +1.
