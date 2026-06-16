@@ -1702,12 +1702,24 @@ impl OptHeap {
         }
     }
 
-    /// Flush lazy stores for objects that escape as direct residual-call
-    /// arguments. EffectInfo bitstrings describe global heap effects, but a
-    /// callee can still read fields from objects it receives explicitly.
+    /// Flush lazy stores for objects observable by a residual call: the
+    /// objects that escape as direct arguments (and their transitive
+    /// dependency closure), plus any trace-allocated object that has already
+    /// escaped. EffectInfo bitstrings describe global heap effects, but a
+    /// callee can still read fields from objects it receives explicitly or
+    /// reaches through the escaped heap.
     ///
-    /// Keep this selective: unrelated lazy stores may represent loop-carried
-    /// state that should stay pending until the regular guard/JUMP flush.
+    /// Keep this selective: a lazy store on an object that is still UNESCAPED,
+    /// or one this trace never allocated (e.g. an inputarg carrying
+    /// loop-invariant state), must stay pending until the regular guard/JUMP
+    /// flush. A trace-allocated object that has escaped, however, is now
+    /// globally reachable — a residual call can observe its fields, so its
+    /// pending store must be materialized here (the role
+    /// `force_from_effectinfo` fills in RPython once the EffectInfo path is
+    /// fully ported). Storing such a value into an already-escaped container
+    /// (e.g. an int box into a forced array) escapes it via
+    /// `escape_from_write` WITHOUT recording it in the container's dependency
+    /// list, so the argument closure alone does not reach it.
     ///
     /// Do not remove as a cosmetic PyPy-parity cleanup. The direct parity
     /// change was tested with `python3 pyre/check.py --synthetic-only` and
@@ -1718,6 +1730,46 @@ impl OptHeap {
         heap_pass_idx: usize,
         ctx: &mut OptContext,
     ) {
+        // Owners whose pending lazy stores this residual call can observe:
+        // the escaped-argument closure plus any trace-allocated object that
+        // has already escaped. Built before the mutable cache walk below so
+        // the `is_unescaped`/`seen_allocation` queries do not clash with the
+        // `cached_fields`/`cached_arrayitems` borrow.
+        let mut flush_owners: Vec<OpRef> = escaped_owners.to_vec();
+        {
+            let mut consider = |owner_op: OpRef| {
+                let owner = ctx.get_replacement_opref(owner_op);
+                if flush_owners.contains(&owner) {
+                    return;
+                }
+                let allocated_here = self
+                    .seen_allocation
+                    .get(owner.raw() as usize)
+                    .copied()
+                    .unwrap_or(false);
+                let escaped = ctx
+                    .get_box_replacement_box(owner)
+                    .as_ref()
+                    .map_or(false, |b| !self.is_unescaped(b));
+                if allocated_here && escaped {
+                    flush_owners.push(owner);
+                }
+            };
+            for (_field_idx, _descr, cf) in self.cached_fields.iter() {
+                if let Some(lazy_op) = cf.lazy_set.as_ref() {
+                    consider(lazy_op.arg(0).to_opref());
+                }
+            }
+            for (_descr_idx, _, submap) in self.cached_arrayitems.iter() {
+                for (_index, cai) in submap.const_indexes.iter() {
+                    if let Some(lazy_op) = cai.lazy_set.as_ref() {
+                        consider(lazy_op.arg(0).to_opref());
+                    }
+                }
+            }
+        }
+        let escaped_owners: &[OpRef] = &flush_owners;
+
         let mut field_entries: Vec<_> = self
             .cached_fields
             .iter_mut()
