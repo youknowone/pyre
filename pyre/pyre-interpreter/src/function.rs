@@ -115,6 +115,14 @@ pub struct Function {
     /// means "no signature recorded" and the getter returns
     /// `space.w_None` per `function.py:488`.
     pub w_text_signature: PyObjectRef,
+    /// `__self__` of a builtin `__new__` descriptor — the type whose
+    /// `tp_new` this function wraps.  `typeobject.c add_tp_new_wrapper`
+    /// binds `int.__new__.__self__ is int`, so `copyreg._reduce_ex`
+    /// can ask `base.__new__.__self__ is base` to find the defining
+    /// type.  `PY_NULL` for every ordinary function (a plain `def`
+    /// has no `__self__`); only stamped on the per-type builtin
+    /// `__new__` carriers at type-finalisation time.
+    pub w_new_self: PyObjectRef,
 }
 
 /// function.py:706 — `class BuiltinFunction(Function): can_change_code = False`
@@ -188,6 +196,9 @@ pub const FUNCTION_W_OBJCLASS_OFFSET: usize = std::mem::offset_of!(Function, w_o
 /// `function.py:487-496 w_text_signature` slot.
 pub const FUNCTION_W_TEXT_SIGNATURE_OFFSET: usize =
     std::mem::offset_of!(Function, w_text_signature);
+/// Field offset of `w_new_self` within `Function` — the builtin
+/// `__new__` descriptor's `__self__` (defining type).
+pub const FUNCTION_W_NEW_SELF_OFFSET: usize = std::mem::offset_of!(Function, w_new_self);
 
 /// GC type id assigned to `Function` at JitDriver init time. Held as
 /// a constant alongside the struct (rather than runtime-queried) so
@@ -254,6 +265,9 @@ pub const FUNCTION_GC_PTR_OFFSETS: [usize; 12] = [
     // `function.py:487-496 w_text_signature` — PEP 437 text signature
     // line stripped from the docstring.
     FUNCTION_W_TEXT_SIGNATURE_OFFSET,
+    // `w_new_self` is intentionally absent: it holds the defining type
+    // of a builtin `__new__` carrier, a static-region W_TypeObject that
+    // is never nursery-relocated (same reasoning as `ob.w_class`).
 ];
 
 impl pyre_object::lltype::GcType for Function {
@@ -397,6 +411,7 @@ fn function_new_impl(
         w_qualname: PY_NULL,
         w_objclass: PY_NULL,
         w_text_signature: PY_NULL,
+        w_new_self: PY_NULL,
     };
 
     if let Some(raw) =
@@ -514,6 +529,38 @@ pub unsafe fn builtin_function_set_module(obj: PyObjectRef, w_module: PyObjectRe
                 (*func).w_module = w_module;
             }
         }
+    }
+}
+
+/// Stamp the `__self__` of a builtin `__new__` carrier — the defining
+/// type whose `tp_new` it wraps (`typeobject.c add_tp_new_wrapper`).
+/// Only touches functions whose `w_new_self` is still unset, so an
+/// inherited `__new__` keeps the ancestor that defined it.
+///
+/// # Safety
+/// `obj` must be a valid, non-null pointer to a `Function`.
+pub unsafe fn function_set_new_self(obj: PyObjectRef, w_type: PyObjectRef) {
+    unsafe {
+        let func = obj as *mut Function;
+        if (*func).w_new_self.is_null() {
+            (*func).w_new_self = w_type;
+        }
+    }
+}
+
+/// `__self__` getter for the builtin-function type.  Returns the
+/// stamped `w_new_self` (the defining type) for a builtin `__new__`
+/// carrier, else `None` — `typedef.py:816 GetSetProperty(always_none,
+/// cls=BuiltinFunction)` returns `None` for an ordinary builtin.
+///
+/// # Safety
+/// `obj` must be a valid, non-null pointer to a `Function`.
+pub unsafe fn function_get_self_or_none(obj: PyObjectRef) -> PyObjectRef {
+    let w_self = unsafe { (*(obj as *const Function)).w_new_self };
+    if w_self.is_null() {
+        pyre_object::w_none()
+    } else {
+        w_self
     }
 }
 

@@ -835,6 +835,27 @@ pub fn w_object() -> PyObjectRef {
         .unwrap_or(PY_NULL)
 }
 
+/// Stamp the builtin `__new__` carrier in `ns` with `__self__ =
+/// type_obj` (the type that defines `tp_new`), mirroring
+/// `typeobject.c add_tp_new_wrapper`.  `copyreg._reduce_ex` walks the
+/// MRO testing `base.__new__.__self__ is base`, so each builtin type
+/// that defines `__new__` must carry its own type as the wrapper's
+/// `__self__`.  Inherited `__new__` keeps the ancestor's stamp
+/// (`function_set_new_self` only writes when unset).
+///
+/// # Safety
+/// `ns_ptr` must be a valid, live `DictStorage`; `type_obj` a valid type.
+unsafe fn stamp_new_descr_self(ns_ptr: *mut DictStorage, type_obj: PyObjectRef) {
+    if let Some(w_new) = (*ns_ptr).get("__new__").copied() {
+        if !w_new.is_null() && pyre_object::propertyobject::is_staticmethod(w_new) {
+            let inner = pyre_object::propertyobject::w_staticmethod_get_func(w_new);
+            if !inner.is_null() && crate::function::is_function(inner) {
+                crate::function::function_set_new_self(inner, type_obj);
+            }
+        }
+    }
+}
+
 /// Create the root `object` type. MRO = [object].
 fn new_root_typeobject(name: &str, init: fn(&mut DictStorage)) -> PyObjectRef {
     let mut ns = Box::new(DictStorage::new());
@@ -863,6 +884,7 @@ fn new_root_typeobject(name: &str, init: fn(&mut DictStorage)) -> PyObjectRef {
         pyre_object::w_type_set_weakrefable(type_obj, false);
     }
     unsafe { w_type_set_mro(type_obj, vec![type_obj]) };
+    unsafe { stamp_new_descr_self(ns_ptr, type_obj) };
     type_obj
 }
 
@@ -941,6 +963,7 @@ fn new_typeobject_with_base_and_layout(
         mro.push(base);
     }
     unsafe { w_type_set_mro(type_obj, mro) };
+    unsafe { stamp_new_descr_self(ns_ptr, type_obj) };
     type_obj
 }
 
@@ -1003,6 +1026,7 @@ pub fn make_builtin_type_with_bases(
     // MRO = C3 linearization over the recorded `__bases__`.
     let mro = unsafe { crate::baseobjspace::compute_default_mro(type_obj) };
     unsafe { w_type_set_mro(type_obj, mro) };
+    unsafe { stamp_new_descr_self(ns_ptr, type_obj) };
     type_obj
 }
 
@@ -1117,7 +1141,12 @@ fn float_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
 pub(crate) fn make_new_descr(
     func: fn(&[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>,
 ) -> PyObjectRef {
-    let f = make_builtin_function("__new__", func);
+    // `BuiltinFunction`-typed so `type(int.__new__)` differs from a user
+    // `def`'s `function`, letting `copyreg._reduce_ex`'s
+    // `isinstance(new, type(int.__new__))` match only builtin `tp_new`
+    // wrappers (mirrors `builtin_function_or_method`).  `__self__` is
+    // stamped at type-finalisation via `stamp_new_descr_self`.
+    let f = crate::gateway::make_builtin_function_as_builtin("__new__", func);
     pyre_object::w_staticmethod_new(f)
 }
 
@@ -5487,8 +5516,21 @@ fn init_builtin_function_type(ns: &mut DictStorage) {
     // W_TypeObject is still under construction, so `cls` cannot be
     // resolved here; `patch_builtin_function_descriptors` runs after the
     // type cache is populated and writes the missing reqcls.
-    let self_getter =
-        make_builtin_function_with_arity("__self__", |_args| Ok(pyre_object::w_none()), 2);
+    // A builtin `__new__` carrier reports its defining type as `__self__`
+    // (`typeobject.c add_tp_new_wrapper`), stamped via
+    // `stamp_new_descr_self`; every other builtin function keeps the
+    // `always_none` behaviour.
+    let self_getter = make_builtin_function_with_arity(
+        "__self__",
+        |args| {
+            let func = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+            if func.is_null() {
+                return Ok(pyre_object::w_none());
+            }
+            Ok(unsafe { crate::function::function_get_self_or_none(func) })
+        },
+        2,
+    );
     dict_storage_store(ns, "__self__", make_getset_descriptor(self_getter));
 
     dict_storage_store(

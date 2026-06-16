@@ -703,6 +703,18 @@ pub fn make_builtin_function(name: &'static str, func: BuiltinCodeFn) -> PyObjec
     crate::function_new_with_fixed_code(code as *const (), name.to_string(), std::ptr::null_mut())
 }
 
+/// Like `make_builtin_function` but tagged as `BuiltinFunction`
+/// (the `builtin_function` type) rather than `FunctionWithFixedCode`.
+/// Used for builtin `__new__` carriers so `type(int.__new__)` is the
+/// builtin-function type — distinct from a user `def`'s `function` — so
+/// `copyreg._reduce_ex`'s `isinstance(new, type(int.__new__))` matches
+/// only C-level `tp_new` wrappers, mirroring the
+/// `builtin_function_or_method` type.
+pub fn make_builtin_function_as_builtin(name: &'static str, func: BuiltinCodeFn) -> PyObjectRef {
+    let code = builtin_code_new(name, func);
+    crate::function_new_builtin(code as *const (), name.to_string(), std::ptr::null_mut())
+}
+
 /// `make_builtin_function` for a builtin with a declared argument
 /// `Signature`, so the call path binds keyword arguments into positional
 /// order before the function runs (see `call::bind_kwargs_to_signature`).
