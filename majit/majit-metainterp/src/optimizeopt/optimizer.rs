@@ -6511,6 +6511,7 @@ mod tests {
                     op.pos.set(OpRef::op_typed(14, op.result_type()));
                     std::rc::Rc::new(op)
                 },
+                same_as_source: None,
             },
         );
 

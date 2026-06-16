@@ -2040,6 +2040,9 @@ impl Optimization for OptRewrite {
                                     op: source_box,
                                     invented_name: false,
                                     preamble_op: std::rc::Rc::new(replay),
+                                    // Non-invented loop-invariant producer: the
+                                    // SameAs arm is never taken, so no source.
+                                    same_as_source: None,
                                 }),
                             );
                         }

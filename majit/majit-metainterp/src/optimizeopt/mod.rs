@@ -435,6 +435,7 @@ impl ImportedShortPureOp {
         result: OpRef,
         source: OpRef,
         invented_name: bool,
+        same_as_source: Option<crate::r#box::BoxRef>,
     ) -> Self {
         let replay_args: Vec<OpRef> = args
             .iter()
@@ -500,6 +501,7 @@ impl ImportedShortPureOp {
                 op: pop_op,
                 invented_name,
                 preamble_op: std::rc::Rc::new(replay),
+                same_as_source,
             },
         }
     }
@@ -10299,6 +10301,7 @@ mod imported_short_preamble_fallback_tests {
             op: crate::r#box::BoxRef::from_opref(OpRef::int_op(41)),
             invented_name: false,
             preamble_op: std::rc::Rc::new(replay_op),
+            same_as_source: None,
         };
 
         let forced = ctx.force_op_from_preamble_op(&pop);

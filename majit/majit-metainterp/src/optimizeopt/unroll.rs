@@ -6754,6 +6754,7 @@ mod tests {
             OpRef::int_op(11),
             OpRef::int_op(11),
             false,
+            None,
         );
         assert_eq!(ctx2.imported_short_pure_ops, vec![expected]);
     }
@@ -6919,6 +6920,7 @@ mod tests {
         let pop = crate::optimizeopt::info::PreambleOp {
             op: BoxRef::from_opref(OpRef::int_op(20)),
             invented_name: produced.invented_name,
+            same_as_source: produced.same_as_source.clone(),
             preamble_op: produced.preamble_op,
         };
         let forced = ctx.force_op_from_preamble_op(&pop);
@@ -7025,6 +7027,7 @@ mod tests {
         let pop = crate::optimizeopt::info::PreambleOp {
             op: b_src.clone(),
             invented_name: produced.invented_name,
+            same_as_source: produced.same_as_source.clone(),
             preamble_op: produced.preamble_op,
         };
         let forced = ctx.force_op_from_preamble_op(&pop);

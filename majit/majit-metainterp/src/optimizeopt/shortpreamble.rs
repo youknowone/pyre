@@ -1490,6 +1490,7 @@ impl ProducedShortOp {
                         op: ctx.materialize_box_at(source),
                         invented_name: self.invented_name,
                         preamble_op: p.preamble_op.clone(),
+                        same_as_source: self.same_as_source.clone(),
                     },
                 }
             }
@@ -1501,6 +1502,7 @@ impl ProducedShortOp {
                 result_opref,
                 source,
                 self.invented_name,
+                self.same_as_source.clone(),
             ),
         };
         ctx.imported_short_pure_ops.push(imported);
@@ -1614,6 +1616,7 @@ impl ProducedShortOp {
             op: ctx.materialize_box_at(source),
             invented_name: self.invented_name,
             preamble_op: replay_rc,
+            same_as_source: self.same_as_source.clone(),
         };
         let parent_descr = getfield_op
             .with_field_descr(|fd| fd.get_parent_descr())
@@ -1749,6 +1752,7 @@ impl ProducedShortOp {
             op: ctx.materialize_box_at(source),
             invented_name: self.invented_name,
             preamble_op: replay_rc,
+            same_as_source: self.same_as_source.clone(),
         };
         let obj_box = ctx.get_box_replacement_box(obj_resolved);
         if obj_resolved.is_constant()
@@ -1923,9 +1927,9 @@ impl AbstractShortPreambleBuilderState {
             // carries `Some(same_as_source)` — the sole production writer
             // is the compound-alias path (`alt.invented_name = true` +
             // `alt.same_as_source = Some(...)`), `add_preamble_op_from_pop`
-            // always passes `Some(pop.op)`, and the export/re-import paths
-            // copy both fields as a pair. Fallback kept as a release
-            // safety net.
+            // passes the pop's threaded `same_as_source`, and the
+            // export/re-import paths copy both fields as a pair. Fallback
+            // kept as a release safety net.
             debug_assert!(
                 same_as_source.is_some(),
                 "invented_name without same_as_source at {:?}",
@@ -2256,23 +2260,32 @@ impl ShortPreambleBuilder {
     ///   self.used_boxes.append(op)
     ///   self.short_preamble_jump.append(preamble_op.preamble_op)
     ///
-    /// The `else` arm below is that unconditional pattern. The `if` arm
-    /// (map lookup) is a pyre-only side table and CANNOT yet collapse onto
-    /// the `else`: for an invented-name CompoundOp alternate the map entry's
-    /// `same_as_source` is the ORIGINAL aliased box, whereas the carried
-    /// `info::PreambleOp` only knows `op` (the invented SameAs name itself).
-    /// `record_imported_preamble_use` builds `same_as(source)`, so the `else`
-    /// arm would emit `same_as(invented_name)` — a self-alias — instead of
-    /// `same_as(original)`. (Empirically: map source `IntOp(14)` vs carried
-    /// `op` `IntOp(30)`.) Collapsing this (#149) requires threading
-    /// `same_as_source` onto `info::PreambleOp` (field_entry::PreambleOp) at
-    /// the export sites so the carried pop reproduces the map entry's record.
+    /// The `else` arm below is that unconditional pattern. Both arms now
+    /// alias the carried `same_as_source` (#149/S8f): `field_entry::PreambleOp`
+    /// carries the ORIGINAL box an invented-name CompoundOp alternate aliases
+    /// (threaded from `ProducedShortOp.same_as_source` at the produce_* export
+    /// sites), so the `else` arm emits `same_as(original)` rather than the old
+    /// `same_as(op)` self-alias (op being the invented SameAs name). The `if`
+    /// arm (map lookup) is retained behind an equivalence `debug_assert!` that
+    /// the carried `same_as_source` reproduces the map entry's; once green
+    /// across the corpus it collapses onto the `else`, deleting this lookup.
     pub fn add_preamble_op_from_pop(
         &mut self,
         preamble_op: &crate::optimizeopt::info::PreambleOp,
         resolved_op: crate::r#box::BoxRef,
     ) {
         if let Some(produced) = self.produced_short_boxes.get(&preamble_op.op.to_opref()) {
+            // #149 equivalence harness: while the builder map still holds this
+            // entry, the carried pop's `same_as_source` must reproduce the
+            // map entry's, so the `else` arm could replace this lookup (S8f
+            // builder-map collapse). Compared by position; the boxes may be
+            // distinct objects across the export/import boundary.
+            debug_assert_eq!(
+                preamble_op.same_as_source.as_ref().map(|b| b.to_opref()),
+                produced.same_as_source.as_ref().map(|b| b.to_opref()),
+                "carried pop same_as_source diverged from builder map at {:?}",
+                preamble_op.op.to_opref()
+            );
             self.state.record_preamble_use(resolved_op, produced);
         } else {
             // shortpreamble.py:432-440: same 4-line pattern via common helper.
@@ -2281,7 +2294,7 @@ impl ShortPreambleBuilder {
                 resolved_op,
                 replay_op,
                 preamble_op.invented_name,
-                Some(preamble_op.op.clone()),
+                preamble_op.same_as_source.clone(),
             );
         }
     }
@@ -2708,7 +2721,18 @@ impl ExtendedShortPreambleBuilder {
             }
             let op = resolved_key;
             if preamble_op.invented_name {
-                let source = preamble_op.op.clone();
+                // shortpreamble.py:436-437: alias the carried original
+                // (same_as_source), matching `add_tracked_preamble_op`; the
+                // resolved box is the release fallback when none was threaded.
+                debug_assert!(
+                    preamble_op.same_as_source.is_some(),
+                    "invented_name without same_as_source at {:?}",
+                    replay_op.pos.get()
+                );
+                let source = preamble_op
+                    .same_as_source
+                    .clone()
+                    .unwrap_or_else(|| resolved_op.clone());
                 let mut same_as =
                     Op::new(OpCode::same_as_for_type(replay_op.result_type()), &[source]);
                 same_as.pos.set(op);
@@ -4026,6 +4050,9 @@ mod tests {
             op: BoxRef::from_opref(OpRef::int_op(14)),
             invented_name: true,
             preamble_op: std::rc::Rc::new(replay_op),
+            // Imported invented-name pop carries the original it aliases;
+            // the else arm reads it to emit `same_as(source)`.
+            same_as_source: Some(BoxRef::from_opref(OpRef::int_op(14))),
         };
 
         builder.add_preamble_op_from_pop(&pop, BoxRef::from_opref(OpRef::int_op(41)));
@@ -4067,6 +4094,9 @@ mod tests {
             op: BoxRef::from_opref(OpRef::int_op(14)),
             invented_name: true,
             preamble_op: std::rc::Rc::new(replay_op),
+            // Imported invented-name pop carries the original it aliases;
+            // the else arm reads it to emit `same_as(source)`.
+            same_as_source: Some(BoxRef::from_opref(OpRef::int_op(14))),
         };
 
         builder.add_preamble_op_from_pop(&pop, BoxRef::from_opref(OpRef::int_op(41)));

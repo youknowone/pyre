@@ -1357,6 +1357,8 @@ mod tests {
                 op: source_box,
                 invented_name: false,
                 preamble_op: replay,
+                // Non-invented imported pure re-export: no SameAs alias.
+                same_as_source: None,
             };
             ctx.set_potential_extra_op(source, pop);
         }
@@ -2687,6 +2689,7 @@ mod tests {
             OpRef::int_op(2),
             OpRef::int_op(2),
             false,
+            None,
         );
         ctx.imported_short_pure_ops.push(imported);
 
@@ -2742,6 +2745,7 @@ mod tests {
             OpRef::int_op(1),
             OpRef::int_op(1),
             false,
+            None,
         );
         initialize_imported_short_pure_builder(
             &mut ctx,

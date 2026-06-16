@@ -36,6 +36,14 @@ pub struct PreambleOp {
     /// RPython: PreambleOp.preamble_op — the actual replay operation
     /// for the short preamble. Always present (RPython parity).
     pub preamble_op: crate::resoperation::OpRc,
+    /// Original result box an invented SameAs name aliases — the
+    /// compound-dedup winner's `res`, threaded from
+    /// `ProducedShortOp.same_as_source`. Lets an imported pop reproduce the
+    /// builder map entry's `same_as(original)` at `add_preamble_op_from_pop`
+    /// instead of `same_as(invented_name)` (a self-alias). `None` for
+    /// non-invented entries (`invented_name == false`), where the SameAs
+    /// arm is never taken.
+    pub same_as_source: Option<crate::box_ref::BoxRef>,
 }
 
 /// RPython _fields[] element — either a concrete value or a PreambleOp sentinel.
