@@ -5660,7 +5660,7 @@ where
         return None;
     }
     let nargs = op.args.len() - 2;
-    if nargs > 14 {
+    if nargs >= ctx.call_fn_idx_by_nargs.len() {
         return None;
     }
     // First arg is the callable, second the CALL opcode's null_or_self
@@ -8268,7 +8268,7 @@ mod tests {
             store_name_fn_idx: 0,
             newlist_from_array_fn_idx: 0,
             newtuple_from_array_fn_idx: 0,
-            call_fn_idx_by_nargs: [0; 9],
+            call_fn_idx_by_nargs: [0; 15],
             load_attr_fn_idx: 0,
             load_method_self_fn_idx: 0,
             store_attr_fn_idx: 0,
@@ -10658,6 +10658,70 @@ mod tests {
             }
             _ => panic!("expected Insn::Op, got {insn:?}"),
         }
+    }
+
+    #[test]
+    fn lower_simple_call_hlop_nargs_boundary() {
+        // `nargs == call_fn_idx_by_nargs.len() - 1` (14) is the widest CALL
+        // the residual table can dispatch; `nargs == len()` (15) has no
+        // matching helper and must fall through to passthrough (`None`) so
+        // the walker's `abort_permanent` branch handles it.  Pins the guard
+        // to the table length so growing the table can't silently desync the
+        // bound.
+        let (mut ctx, _code, _name) = load_attr_lowering_fixture();
+        let max_nargs = ctx.call_fn_idx_by_nargs.len() - 1; // 14
+        ctx.call_fn_idx_by_nargs[max_nargs] = 77;
+
+        // `[callable, null_or_self, arg0..arg(n-1)]`, all distinct Ref vars.
+        let build_op = |n: usize| {
+            let args: Vec<_> = (0..n + 2)
+                .map(|i| Variable::new(VariableId(i as u32), Kind::Ref).into())
+                .collect();
+            let result = Variable::new(VariableId(1000), Kind::Ref);
+            super::super::flow::SpaceOperation::new("simple_call", args, Some(result.into()), 0)
+        };
+        let mut get_register = |var: Variable| Register {
+            kind: Kind::Ref,
+            index: var.id.0 as u16,
+        };
+        let mut lower_constant = |_c: &Constant| unreachable!("test uses Variables only");
+
+        // nargs == 14 → lowers to a residual_call_r_r carrying every arg.
+        let op_max = build_op(max_nargs);
+        let insn = super::lower_simple_call_hlop_to_insn(
+            &op_max,
+            &ctx,
+            &mut get_register,
+            &mut lower_constant,
+        )
+        .expect("nargs == 14 must lower (widest supported CALL)");
+        match insn {
+            Insn::Op { opname, args, .. } => {
+                assert_eq!(opname, "residual_call_r_r");
+                match &args[1] {
+                    Operand::ListOfKind(list) => assert_eq!(
+                        list.content.len(),
+                        max_nargs + 2,
+                        "ListR carries [callable, null_or_self, args...]"
+                    ),
+                    other => panic!("expected ListOfKind Ref, got {other:?}"),
+                }
+            }
+            _ => panic!("expected Insn::Op, got {insn:?}"),
+        }
+
+        // nargs == 15 → no helper in the table → passthrough (None).
+        let op_over = build_op(max_nargs + 1);
+        assert!(
+            super::lower_simple_call_hlop_to_insn(
+                &op_over,
+                &ctx,
+                &mut get_register,
+                &mut lower_constant,
+            )
+            .is_none(),
+            "nargs == call_fn_idx_by_nargs.len() must fall through to passthrough"
+        );
     }
 
     /// Shared fixture for the LOAD_ATTR-family lowering tests: a
