@@ -1284,9 +1284,12 @@ fn rtype_builtin_max(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTy
 /// upstream functions differ only in the `ll_min` / `ll_max` helper
 /// they `gendirectcall`.
 fn rtype_builtin_min_max(hop: &HighLevelOp, helper_name: &str) -> RTypeResult {
+    // Error text names the user-facing builtin (`min` / `max`), not the
+    // internal `ll_*` helper that `gendirectcall` resolves below.
+    let builtin = helper_name.strip_prefix("ll_").unwrap_or(helper_name);
     if hop.nb_args() != 2 {
         return Err(TyperError::message(format!(
-            "{helper_name}: expected nb_args == 2, got {}",
+            "{builtin}: expected nb_args == 2, got {}",
             hop.nb_args()
         )));
     }
@@ -1295,7 +1298,7 @@ fn rtype_builtin_min_max(hop: &HighLevelOp, helper_name: &str) -> RTypeResult {
         r_result_borrow
             .as_ref()
             .cloned()
-            .ok_or_else(|| TyperError::message(format!("{helper_name}: r_result missing")))?
+            .ok_or_else(|| TyperError::message(format!("{builtin}: r_result missing")))?
     };
     let vlist = hop.inputargs(vec![
         ConvertedTo::Repr(r_result.as_ref()),
