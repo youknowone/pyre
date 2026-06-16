@@ -3290,7 +3290,7 @@ impl<'a> Assembler386<'a> {
             | OpCode::GetarrayitemRawI
             | OpCode::GetarrayitemRawR
             | OpCode::GetarrayitemRawF => {
-                if let (Some(Loc::Reg(base)), Some(index_loc), Some(Loc::Reg(dst))) =
+                if let (Some(base_loc), Some(index_loc), Some(Loc::Reg(dst))) =
                     (arglocs.first(), arglocs.get(1), result_loc)
                 {
                     let (base_size, item_size, signed) = op
@@ -3302,8 +3302,15 @@ impl<'a> Assembler386<'a> {
                             )
                         })
                         .unwrap_or((0, 8, false));
+                    // A non-register base (a constant pointer from the green-pc
+                    // inline dispatch reading `program[const]`, or a spilled
+                    // Frame slot) is staged into rax below. Relocate an index
+                    // already occupying rax so that staging cannot clobber it.
+                    let base_in_reg = matches!(base_loc, Loc::Reg(_));
                     let index_reg = match index_loc {
-                        Loc::Reg(r) => r.value,
+                        Loc::Reg(r) if base_in_reg || r.value != crate::regloc::EAX.value => {
+                            r.value
+                        }
                         _ => {
                             self.regalloc_mov(
                                 index_loc,
@@ -3315,10 +3322,22 @@ impl<'a> Assembler386<'a> {
                     if item_size != 1 {
                         dynasm!(self.mc ; .arch x64 ; imul Rq(index_reg), Rq(index_reg), item_size);
                     }
+                    // Resolve the base into a register. A Loc::Immed base
+                    // (constant array pointer) previously failed the Loc::Reg
+                    // pattern, so the address computation and load were skipped
+                    // and dst kept a stale value (mirrors the GcLoad
+                    // immediate-base handling below).
+                    let base_reg = match base_loc {
+                        Loc::Reg(r) => r.value,
+                        _ => {
+                            self.regalloc_mov(base_loc, &Loc::Reg(crate::regloc::EAX));
+                            crate::regloc::EAX.value
+                        }
+                    };
                     if base_size != 0 {
-                        dynasm!(self.mc ; .arch x64 ; lea rax, [Rq(base.value) + Rq(index_reg) + base_size]);
+                        dynasm!(self.mc ; .arch x64 ; lea rax, [Rq(base_reg) + Rq(index_reg) + base_size]);
                     } else {
-                        dynasm!(self.mc ; .arch x64 ; lea rax, [Rq(base.value) + Rq(index_reg)]);
+                        dynasm!(self.mc ; .arch x64 ; lea rax, [Rq(base_reg) + Rq(index_reg)]);
                     }
                     if dst.is_xmm {
                         dynasm!(self.mc ; .arch x64 ; movsd Rx(dst.value), [rax]);

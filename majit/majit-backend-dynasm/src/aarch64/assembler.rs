@@ -2497,7 +2497,7 @@ impl<'a> AssemblerARM64<'a> {
             | OpCode::GetarrayitemRawI
             | OpCode::GetarrayitemRawR
             | OpCode::GetarrayitemRawF => {
-                if let (Some(Loc::Reg(base)), Some(index_loc), Some(Loc::Reg(dst))) =
+                if let (Some(base_loc), Some(index_loc), Some(Loc::Reg(dst))) =
                     (arglocs.first(), arglocs.get(1), result_loc)
                 {
                     let (base_size, item_size, signed) = op
@@ -2528,7 +2528,24 @@ impl<'a> AssemblerARM64<'a> {
                     if base_size != 0 {
                         dynasm!(self.mc ; .arch aarch64 ; add x16, x16, base_size as u32);
                     }
-                    dynasm!(self.mc ; .arch aarch64 ; add x16, X(base.value), x16);
+                    // Resolve the base into a register. A Loc::Immed base
+                    // (constant array pointer from the green-pc inline dispatch
+                    // reading `program[const]`) previously failed the Loc::Reg
+                    // pattern, so the address computation and load were skipped
+                    // and dst kept a stale value (mirrors the GcLoad
+                    // immediate-base handling below). x17 is dead here: the
+                    // item_size multiply above is its only other use.
+                    let base_reg = match base_loc {
+                        Loc::Reg(r) => r.value,
+                        _ => {
+                            self.regalloc_mov(
+                                base_loc,
+                                &Loc::Reg(crate::regloc::RegLoc::new(17, false)),
+                            );
+                            17
+                        }
+                    };
+                    dynasm!(self.mc ; .arch aarch64 ; add x16, X(base_reg), x16);
                     if dst.is_xmm {
                         dynasm!(self.mc ; .arch aarch64 ; ldr D(dst.value), [x16]);
                     } else {
