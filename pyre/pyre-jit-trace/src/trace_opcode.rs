@@ -8292,6 +8292,26 @@ impl MIFrame {
             return Ok(Some(pyre_interpreter::StepResult::Continue));
         }
 
+        // BUILD_MAP walker activation via trait-path delegation.
+        //
+        // The auto-gen arm jitcode for `BuildMap` inlines the interpreter's
+        // `SharedOpcodeHandler::build_map` (`build_map_from_refs`, eval.rs:1267)
+        // and switches on its `Result<_, PyError>` Ok/Err discriminant — which
+        // the arm walk cannot make concrete (`BuildMap|SwitchValueNotConcrete`).
+        // The entry-hook instead dispatches `OpcodeStepExecutor::build_map`,
+        // resolving to MIFrame's trace-aware override (`trace_build_map` emits
+        // the BUILD_MAP IR + maintains the concrete dict shadow, exactly like
+        // `build_tuple`), bypassing the concrete `build_map_from_refs` the arm
+        // walk inlines.  `pop_n` (count*2) / `push_value` keep the symbolic +
+        // concrete-shadow stacks + vsd shadow coherent, so this bypasses
+        // `apply_walker_stack_effect`.  Same delegation pattern as the
+        // BuildTuple / UnpackSequence hooks above.
+        if let Instruction::BuildMap { count } = instruction {
+            use pyre_interpreter::OpcodeStepExecutor;
+            OpcodeStepExecutor::build_map(self, count.get(op_arg) as usize)?;
+            return Ok(Some(pyre_interpreter::StepResult::Continue));
+        }
+
         // STORE_FAST_STORE_FAST walker activation via trait-path delegation.
         //
         // The auto-gen arm jitcode lowers to a chain of `residual_call` ops
