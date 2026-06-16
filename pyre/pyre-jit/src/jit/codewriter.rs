@@ -7624,7 +7624,6 @@ impl CodeWriter {
                                 .last()
                                 .cloned()
                                 .unwrap_or_else(|| fresh_ref_value(&mut graph).into());
-                            let scratch_match = ssarepr.fresh_var(Kind::Ref, scratch_ref_base).0;
                             // CheckExcMatch
                             // compare_fn factor refactor.  `compare_fn` is
                             // the same helper used by COMPARE_OP — the
@@ -7654,10 +7653,28 @@ impl CodeWriter {
                                 ResKind::Ref,
                                 py_pc as i64,
                             );
-                            pin!(cmp_result, scratch_match);
-                            let result_value = fresh_ref_value(&mut graph);
+                            // Push the compare result itself, not a fresh
+                            // disconnected ref.  A fresh `result_value` has no
+                            // producing op, so its register colour is never
+                            // written during the body walk; PopJumpIfFalse then
+                            // feeds that unwritten register to `truth_fn`, which
+                            // reads NULL and mis-branches once the regalloc
+                            // colours the fresh ref differently from the compare
+                            // result (reproducible on a nested except resume).
+                            // Mirror CompareOp (codewriter.rs:6744): pin the
+                            // result to the stack slot it is pushed to so
+                            // PopJumpIfFalse's pop re-pins the same value to the
+                            // same slot and `truth_fn` reads the compare's own
+                            // register.
+                            let result_value: super::flow::FlowValue = match cmp_result {
+                                Some(v) => v.into(),
+                                None => fresh_ref_value(&mut graph).into(),
+                            };
+                            if let super::flow::FlowValue::Variable(v) = &result_value {
+                                pin!(Some(*v), stack_base + current_depth);
+                            }
                             current_state.stack.push(result_value.clone());
-                            emit_pushvalue_ref!(current_depth, scratch_match, result_value, py_pc);
+                            emit_pushvalue_ref!(current_depth, current_depth, result_value, py_pc);
                         }
 
                         Instruction::PopExcept => {
