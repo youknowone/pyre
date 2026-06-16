@@ -3993,6 +3993,21 @@ fn use_declared_var_or_panic(builder: &mut FunctionBuilder, opref: OpRef, what: 
     builder.use_var(var(opref.raw()))
 }
 
+/// `x86/regalloc.py:58-61` `convert_to_imm` ConstPtr guard: a non-null
+/// `ConstPtr` whose object can still move must never be baked as an
+/// immediate — `remove_constptr` (rewrite.py:1100) routes those through the
+/// gc_table. Null and non-moving (prebuilt / old-gen / no active GC)
+/// ConstPtrs are baked directly. `rgc.can_move` parity via
+/// `majit_gc::can_move`; the `we_are_translated()` clause is subsumed
+/// because `can_move` is false when no moving GC is active.
+fn guard_constptr_immediate(opref: OpRef) {
+    if let Some(g) = opref.as_const_ptr() {
+        if !g.is_null() && majit_gc::can_move(g) {
+            panic!("convert_to_imm: ConstPtr needs special care");
+        }
+    }
+}
+
 fn resolve_opref(
     builder: &mut FunctionBuilder,
     constants: &majit_ir::VecAssoc<u32, i64>,
@@ -4011,17 +4026,12 @@ fn resolve_opref(
          emitted this null OpRef must bind it (or rewrite the op) \
          instead of relying on a zero-load fallback"
     );
-    // rewrite.py:1100 post-flip invariant: `remove_constptr` routes every
-    // non-null reference constant *operand* through `LoadFromGcTable`, so
-    // a non-null `ConstPtr` must never reach op-arg resolution (which would
-    // bake an immortal, un-forwarded immediate). This path is op-arg-only;
-    // failargs resolve through `resolve_failarg_opref` and keep their
-    // constants. Null pointers stay inline and are allowed.
-    debug_assert!(
-        !opref.as_const_ptr().is_some_and(|g| !g.is_null()),
-        "cranelift resolve_opref: non-null ConstPtr {opref:?} reached op-arg \
-         resolution — remove_constptr must have replaced it with LoadFromGcTable"
-    );
+    // x86/regalloc.py:58-61: a non-null movable `ConstPtr` must never be
+    // baked as an immediate. Op-args are additionally all-rewritten to
+    // `LoadFromGcTable` (rewrite.py:1100), so in a GC-rewritten trace this
+    // never fires for op-args; the guard is the shared `convert_to_imm`
+    // parity check (null / non-moving ConstPtrs are baked directly).
+    guard_constptr_immediate(opref);
     // RPython boxes/inputargs are distinct from Consts even when pyre's
     // compact OpRef numbering collides with an entry in the constant pool.
     // Once an OpRef has a declared variable, the variable is authoritative.
@@ -4869,6 +4879,8 @@ fn resolve_opref_or_imm(
     if opref.is_none() {
         return builder.ins().iconst(cl_types::I64, 0);
     }
+    // x86/regalloc.py:58-61: refuse baking a movable non-null ConstPtr.
+    guard_constptr_immediate(opref);
     // Inline-Const fast path: history.py:227/268/314 — value lives on
     // the Box, not in a side pool.
     if let Some(c) = opref.inline_const_bits() {
@@ -4895,6 +4907,10 @@ fn resolve_failarg_opref(
     ref_root_base_ofs: i32,
     opref: OpRef,
 ) -> CValue {
+    // x86/regalloc.py:58-61: refuse baking a movable non-null ConstPtr —
+    // a fail-arg reference constant whose object can move must be reloaded
+    // through GC-forwarded resume data, not frozen as an immediate.
+    guard_constptr_immediate(opref);
     // Inline-Const fast path: history.py:227/268/314 — Const Box value
     // is inline. Stale-ref reload only applies to op-result variables
     // (regalloc-assigned slots), never to constants.

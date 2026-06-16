@@ -1538,6 +1538,18 @@ impl RegisterManager {
     /// x86/regalloc.py:55 convert_to_imm
     pub fn convert_to_imm(&self, v: OpRef, constants: &majit_ir::VecAssoc<u32, i64>) -> Loc {
         debug_assert!(v.is_constant());
+        // x86/regalloc.py:58-61: a non-null `ConstPtr` whose object can
+        // still move must never be baked as an immediate — `remove_constptr`
+        // (rewrite.py:1100) routes those through the gc_table. Null and
+        // non-moving (prebuilt / old-gen / no active GC) ConstPtrs are baked
+        // directly. `rgc.can_move` parity via `majit_gc::can_move`; the
+        // `we_are_translated()` clause is subsumed because `can_move` is
+        // false when no moving GC is active.
+        if let Some(g) = v.as_const_ptr() {
+            if !g.is_null() && majit_gc::can_move(g) {
+                panic!("convert_to_imm: ConstPtr needs special care");
+            }
+        }
         // history.py:227/268/314 — inline-Const variants carry the value
         // directly; legacy pool-indexed Const variants look up the i64
         // raw bits via the constants snapshot.
