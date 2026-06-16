@@ -3616,7 +3616,37 @@ impl<'a> Lowering<'a> {
                 // the method name never reaches the rtyper as a
                 // `ptr.getattr`.
                 if args.len() == 1 && self.is_ptr_identity_cast(&reg) {
-                    self.local_var[dest_local] = Some(args[0].clone());
+                    // When the cast target names a registered struct root
+                    // (`ptr.cast::<W_SRE_Pattern>()` then a field read),
+                    // narrow the result to `SomeInstance(root)` exactly
+                    // like the `Rvalue::Cast` arm: a bare alias leaves the
+                    // pointer classdef-less and the downstream `getattr`
+                    // blocks at the annotator.  The receiver is already a
+                    // raw pointer (`is_ptr_identity_cast`), so this is a
+                    // genuine `cast_pointer` (ptr→ptr).
+                    if let ValueType::Ref(_) = tyref_to_value_type(&call.dest.ty, self.llbc)
+                        && let Some(root) = tyref_class_root(&call.dest.ty, self.llbc)
+                    {
+                        let res = self
+                            .graph
+                            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                            result: Some(res.clone()),
+                            kind: OpKind::Call {
+                                target: CallTarget::FunctionPath {
+                                    segments: vec![
+                                        "__pyre_cast_instance".to_string(),
+                                        root.clone(),
+                                    ],
+                                },
+                                args: vec![args[0].clone()],
+                                result_ty: ValueType::Ref(Some(root)),
+                            },
+                        });
+                        self.local_var[dest_local] = Some(res);
+                    } else {
+                        self.local_var[dest_local] = Some(args[0].clone());
+                    }
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -6504,8 +6534,6 @@ fn typevar_bounded_by_into_string(
         let subject_is_var = types
             .first()
             .and_then(|s| strip(llbc, s))
-            .and_then(|s| s.as_object())
-            .and_then(|o| o.get("TypeVar"))
             .and_then(typevar_bound_index)
             == Some(var_index);
         if !subject_is_var {
