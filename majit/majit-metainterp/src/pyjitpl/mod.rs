@@ -4451,14 +4451,25 @@ impl<M: Clone> MetaInterp<M> {
     ) -> *const u8 {
         // history.py:314 ConstPtr.value lives inline on the box —
         // `orig_inpargs[idx].getref_base()` parity read.
-        driver_descriptor
+        let from_consts = driver_descriptor
             .and_then(|driver| driver.virtualizable_arg_index())
             .and_then(|idx| ctx.initial_inputarg_consts.get(idx))
             .and_then(|const_box| match const_box.const_value() {
                 Some(majit_ir::Value::Ref(gcref)) => Some(gcref.0 as *const u8),
                 _ => None,
-            })
-            .unwrap_or(std::ptr::null())
+            });
+        if let Some(ptr) = from_consts {
+            return ptr;
+        }
+        // Bridge traces start from rebuilt resume state, not a fresh portal
+        // entry, so `initial_inputarg_consts` is not seeded with the
+        // virtualizable inputarg's ConstPtr. The live virtualizable pointer
+        // cached by `set_vable_ptr` during JitState setup is the same heap
+        // object (`orig_inpargs[idx].getref_base()`), so fall back to it.
+        if !self.vable_ptr.is_null() {
+            return self.vable_ptr;
+        }
+        ctx.virtualizable_heap_ptr().unwrap_or(std::ptr::null())
     }
 
     /// compile.py:168 / pyjitpl.py:3605 parity: every real loop token must

@@ -3611,6 +3611,20 @@ impl<S: JitState> JitDriver<S> {
         // bridge tracing runs synchronously within start_bridge_tracing's
         // caller scope, so self.meta outlives the callback.
         let meta_ptr = &self.meta as *const _ as *const ();
+        // pyjitpl.py:2890 `handle_guard_failure` runs on a MetaInterp whose
+        // `jitdriver_sd` is the guard's owning loop's driver. A bridge trace
+        // that reaches a loop header (`jit_merge_point` → `compile_loop`)
+        // therefore compiles that loop with the same `jitdriver_sd`, so
+        // `send_loop_to_backend` (compile.py:504-511) emits the virtualizable
+        // field-load preamble (`patch_new_loop_to_load_virtualizable_fields`)
+        // and the loop's inputarg contract stays reds-only ([frame, ec]).
+        // Without seeding the bridge ctx's driver descriptor, the bridge-trace
+        // loop compile sees `driver=None`, skips the patch, and bakes the
+        // eager-expanded virtualizable fields into the loop inputargs
+        // (`index_of_virtualizable = -1`). A recursive CALL_ASSEMBLER into
+        // such a loop only delivers [frame, ec] and cannot fill the expanded
+        // inputarg slots, dereferencing null at the loop's GUARD_CLASS.
+        let bridge_driver_descriptor = self.driver_descriptor_for(state, &trace_meta);
         // `start_retrace_from_guard` above sets `self.meta.tracing = Some(..)`
         // on success (pyjitpl.py:9415). Fail loud rather than skipping bridge
         // header_pc / is_bridge_trace / has_compiled_targets_fn wiring
@@ -3621,6 +3635,9 @@ impl<S: JitState> JitDriver<S> {
             .as_mut()
             .expect("bridge: tracing context must be live after start_retrace_from_guard");
         ctx.header_pc = resume_pc;
+        if let Some(descriptor) = bridge_driver_descriptor {
+            ctx.set_driver_descriptor(descriptor);
+        }
         // pyjitpl.py:2978 `if not self.partial_trace:` — bridge
         // entry sets the explicit flag so close-loop consumers
         // can apply bridge-only behavior without overloading
