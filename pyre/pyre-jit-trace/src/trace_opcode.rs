@@ -8446,6 +8446,16 @@ impl MIFrame {
                 {
                     self.dispatch_via_walker_for_opcode(&instruction, op_arg)
                 } else {
+                    if flip_probe_enabled() {
+                        let reason = if !production_walker_handles(&instruction) {
+                            "not-in-allowlist"
+                        } else if in_inline_frame {
+                            "in-inline-frame"
+                        } else {
+                            "foldable-list-load-attr"
+                        };
+                        flip_probe_record(&instruction, reason);
+                    }
                     let shadow_outcome =
                         crate::shadow_walker::shadow_validate_pre(self, &instruction, op_arg);
                     let result = execute_opcode_step(self, code, instruction, op_arg, pc + 1);
@@ -8975,6 +8985,14 @@ impl MIFrame {
                 // walker, which captures a single-frame snapshot under
                 // `MAJIT_SHADOW_WALKER=1` and would diverge from the
                 // trait dispatcher's multi-frame view in inline frames.
+                if flip_probe_enabled() {
+                    let reason = if self.parent_frames.is_empty() {
+                        "toplevel-inline-step"
+                    } else {
+                        "inline-frame"
+                    };
+                    flip_probe_record(&instruction, reason);
+                }
                 let shadow_outcome = if self.parent_frames.is_empty() {
                     crate::shadow_walker::shadow_validate_pre(self, &instruction, op_arg)
                 } else {
@@ -9353,6 +9371,41 @@ pub fn production_walker_handles(instruction: &Instruction) -> bool {
             // following CALL.
             | Instruction::PushNull
     )
+}
+
+/// Phase-5 flip-completion probe: is `PYRE_FLIP_PROBE` set?  Read once.
+/// When set, the trait-dispatch fallback callers record each unique
+/// (opcode, reason) that still bypasses the walker, so the residual flip
+/// surface is measurable against the production workload.  Inert (a
+/// single cached bool load) when unset.
+fn flip_probe_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("PYRE_FLIP_PROBE").is_some())
+}
+
+/// Record one trait-dispatch fallback hit, deduplicated per
+/// (opcode-variant, reason) so each distinct residual case prints once
+/// instead of once-per-opcode-execution.  `reason` distinguishes
+/// not-in-allowlist vs the context gates (inline-frame / foldable
+/// list-method LOAD_ATTR).
+fn flip_probe_record(instruction: &Instruction, reason: &str) {
+    use std::cell::RefCell;
+    use std::collections::HashSet;
+    thread_local! {
+        static SEEN: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
+    }
+    let dbg = format!("{instruction:?}");
+    let name = dbg
+        .split(|c: char| c == ' ' || c == '{' || c == '(')
+        .next()
+        .unwrap_or(&dbg);
+    let key = format!("{name}|{reason}");
+    SEEN.with(|seen| {
+        if seen.borrow_mut().insert(key) {
+            eprintln!("[flip-probe] trait-fallback opcode={name} reason={reason}");
+        }
+    });
 }
 
 /// Apply the symbolic-tracker side effects of a walker-handled opcode.
