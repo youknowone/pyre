@@ -16067,6 +16067,12 @@ impl majit_backend::Backend for CraneliftBackend {
     ) {
         let offset = fielddescr.as_offset();
         unsafe { *((struct_ptr as *mut u8).add(offset) as *mut usize) = value.0 };
+        // llmodel.py:723 `bh_setfield_gc_r` → :495 `write_ref_at_mem`: the
+        // ref store carries an implied write barrier, identical to the array
+        // ref setters. Without it a young value stored into an old managed
+        // struct is not remembered and the next minor collection can free it
+        // while still referenced.
+        write_barrier_if_managed(majit_ir::GcRef(struct_ptr as usize));
     }
 
     /// llmodel.py:592-594 bh_getarrayitem_gc_i: ofs=base_size, size+sign
