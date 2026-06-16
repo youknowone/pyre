@@ -4146,6 +4146,17 @@ impl<'a> Lowering<'a> {
                 )? {
                     return Ok(());
                 }
+                if self.try_lower_num_from(
+                    mir_bb,
+                    &reg.kind,
+                    &segments,
+                    &args,
+                    dest_local,
+                    &call.dest.ty,
+                    target,
+                )? {
+                    return Ok(());
+                }
                 let alias =
                     if let Some(payload) = self.expect_on_const_ok(&segments, &args, &arg_locals) {
                         // Identity unwrap: the receiver variable was bound
@@ -5310,6 +5321,72 @@ impl<'a> Lowering<'a> {
         // `ConstInt(0)` and `expect`/`unwrap` aliases the payload
         // (`expect_on_const_ok`) without touching the variable.
         self.const_discriminant_locals.insert(dest_local, 0);
+        self.local_var[dest_local] = Some(arg);
+        let bb_id = self.block_id[mir_bb];
+        let target_bb = self.block_id[target];
+        let link_args = self.edge_args(mir_bb, target)?;
+        self.graph.set_goto(bb_id, target_bb, link_args);
+        Ok(true)
+    }
+
+    /// Lower an infallible numeric widening `<i64 as From<u32>>::from(x)`
+    /// (`core::convert::num::<Impl>::from`, Opaque in the LLBC) to an
+    /// identity bind on the destination local.  `From` is implemented in
+    /// core only for value-preserving conversions, and a
+    /// smaller-than-word unsigned source widens into the word-sized
+    /// carrier with no change of value — the same no-op `rarithmetic.py
+    /// widen` performs — so no op is emitted, exactly as the always-`Ok`
+    /// `usize::try_from` payload binds directly
+    /// ([`Lowering::try_lower_usize_try_from`]).  `pyopcode.rs`
+    /// `u32_as_i64` is `i64::from(x: u32)`.  Word-or-wider sources keep
+    /// the `Call` form (no smaller-than-word identity to fold).
+    fn try_lower_num_from(
+        &mut self,
+        mir_bb: usize,
+        kind: &CallKind,
+        segments: &[String],
+        args: &[Variable],
+        dest_local: usize,
+        dest_ty: &TyRef,
+        target: usize,
+    ) -> Result<bool, LowerError> {
+        let [first, .., module, impl_seg, leaf] = segments else {
+            return Ok(false);
+        };
+        if first.as_str() != "core"
+            || module.as_str() != "num"
+            || impl_seg.as_str() != "<Impl>"
+            || leaf.as_str() != "from"
+        {
+            return Ok(false);
+        }
+        let [arg] = args else {
+            return Ok(false);
+        };
+        let CallKind::Fun(FunId::Regular { id }) = kind else {
+            return Ok(false);
+        };
+        let Some(fd) = self.llbc.fn_by_id(*id) else {
+            return Ok(false);
+        };
+        let Some(src) = fd.signature.inputs.first() else {
+            return Ok(false);
+        };
+        // Only smaller-than-word unsigned sources widen as a
+        // value-preserving identity in the word carrier (the same gate
+        // `try_lower_usize_try_from` uses).
+        if !matches!(self.tyref_literal_uint_atom(src), Some("U8" | "U16" | "U32")) {
+            return Ok(false);
+        }
+        // Destination must be a word-sized integer carrier.
+        let dest_word = matches!(self.tyref_literal_int_atom(dest_ty), Some("I64" | "Isize"))
+            || matches!(self.tyref_literal_uint_atom(dest_ty), Some("U64" | "Usize"));
+        if !dest_word {
+            return Ok(false);
+        }
+        // Identity widen: bind the destination directly to the operand —
+        // no op materialized, exactly as upstream `widen` leaves none.
+        let arg = arg.clone();
         self.local_var[dest_local] = Some(arg);
         let bb_id = self.block_id[mir_bb];
         let target_bb = self.block_id[target];
