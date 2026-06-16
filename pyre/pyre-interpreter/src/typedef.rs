@@ -336,6 +336,18 @@ pub fn init_typeobjects() {
             &pyre_object::MAPPING_PROXY_TYPE as *const PyType as usize,
             new_typeobject_with_base("mappingproxy", init_mappingproxy_type, object_type) as usize,
         );
+        // module — `pypy/interpreter/module.py Module.typedef`, bases=(object,).
+        // `W_ModuleObject` carries a custom Rust layout (name + w_dict), so
+        // instances are produced by `w_module_new` at import time, not by the
+        // generic `object.__new__`.  Registering the W_TypeObject gives
+        // `type(m)` a real type (was the bare name string), so `m.__class__`,
+        // `__flags__`, `isinstance(m, object)` and the inherited
+        // `object.__reduce_ex__` all resolve.  `get_instantiate(&MODULE_TYPE)`
+        // (read by `w_module_new`) is wired by the `set_instantiate` loop below.
+        reg.insert(
+            &pyre_object::MODULE_TYPE as *const PyType as usize,
+            new_typeobject_with_base("module", init_module_type, object_type) as usize,
+        );
         // `pypy/objspace/std/dictmultiobject.py:449/459/469` —
         // dict_keys / dict_values / dict_items.  PyPy registers
         // each as a distinct TypeDef but they share the
@@ -1164,6 +1176,62 @@ fn make_maketrans_descr(
     func: fn(&[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>,
 ) -> PyObjectRef {
     pyre_object::w_staticmethod_new(make_builtin_function("maketrans", func))
+}
+
+/// `moduleobject.c module_new` — allocate an anonymous `W_ModuleObject`
+/// (empty name, fresh dict).  The name is seeded by `__init__`, so
+/// `__new__` ignores its arguments.  A subclass instance is retagged
+/// with the actual class.
+fn module_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let w_module = pyre_object::w_module_new("", std::ptr::null_mut());
+    if let Some(cls) = args.first().copied() {
+        if !cls.is_null() {
+            unsafe { (*w_module).w_class = cls };
+        }
+    }
+    Ok(w_module)
+}
+
+/// `moduleobject.c module_init` / `module.py:18-24 Module.__init__` —
+/// `module.__init__(self, name, doc=None)`.  Seeds the `name` field plus
+/// `__name__` / `__doc__` / `__package__` / `__loader__` / `__spec__`
+/// in the module dict.
+fn module_descr_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let (positional, _kwargs) = crate::builtins::split_builtin_kwargs(args);
+    if positional.len() < 2 {
+        return Err(crate::PyError::type_error(
+            "module.__init__() missing required argument 'name' (pos 1)".to_string(),
+        ));
+    }
+    let self_ = positional[0];
+    let w_name = positional[1];
+    let w_doc = positional
+        .get(2)
+        .copied()
+        .unwrap_or_else(pyre_object::w_none);
+    let name = crate::baseobjspace::text_w(w_name)?;
+    unsafe { pyre_object::w_module_set_name(self_, name) };
+    let w_dict = unsafe { pyre_object::w_module_get_w_dict(self_) };
+    unsafe {
+        pyre_object::w_dict_setitem_str(w_dict, "__name__", w_name);
+        pyre_object::w_dict_setitem_str(w_dict, "__doc__", w_doc);
+        pyre_object::w_dict_setitem_str(w_dict, "__package__", pyre_object::w_none());
+        pyre_object::w_dict_setitem_str(w_dict, "__loader__", pyre_object::w_none());
+        pyre_object::w_dict_setitem_str(w_dict, "__spec__", pyre_object::w_none());
+    }
+    Ok(pyre_object::w_none())
+}
+
+/// `module.py Module.typedef` — wire `__new__` / `__init__` so
+/// `type(m)(name)` builds a real module.  `module` defines its own
+/// `tp_new`, so `module.__new__ is not object.__new__`.
+fn init_module_type(ns: &mut DictStorage) {
+    dict_storage_store(ns, "__new__", make_new_descr(module_descr_new));
+    dict_storage_store(
+        ns,
+        "__init__",
+        make_builtin_function("__init__", module_descr_init),
+    );
 }
 
 fn ellipsis_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {

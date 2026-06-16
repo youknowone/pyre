@@ -169,6 +169,17 @@ pub unsafe fn w_module_get_name(obj: PyObjectRef) -> &'static str {
     &*module.name
 }
 
+/// Replace the module name (`module.py:24` re-seeding).  Used by
+/// `module.__init__(name, doc)` after `module.__new__` allocates an
+/// anonymous module.  The previous (immortal) name string is leaked.
+///
+/// # Safety
+/// `obj` must point to a valid `W_ModuleObject`.
+pub unsafe fn w_module_set_name(obj: PyObjectRef, name: &str) {
+    let module = &mut *(obj as *mut W_ModuleObject);
+    module.name = crate::lltype::malloc_raw(name.to_string());
+}
+
 /// Get the module's backing `DictStorage` pointer (`*mut u8`).
 ///
 /// Resolves through `w_dict.dict_storage_proxy` — pyre no longer carries a

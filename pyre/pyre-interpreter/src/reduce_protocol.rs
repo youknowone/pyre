@@ -215,11 +215,22 @@ pub fn descr_reduce_ex(w_obj: PyObjectRef, proto: i64) -> PyResult {
         }
     }
     if proto >= 2 {
-        let (_hasargs, w_args, w_kwargs) = getnewargs(w_obj)?;
-        // objectobject.py:276 looks up the (always-absent) `__get_state__`
-        // and, only for variable-sized types lacking newargs, raises.
-        // pyre has no variable-sized layout notion, so the raise is a
-        // no-op here; the structure is preserved for parity.
+        let (hasargs, w_args, w_kwargs) = getnewargs(w_obj)?;
+        // objectobject.py:276 / `_PyObject_GetState(required)`: a type whose
+        // instances carry C-level state that `__dict__`/`__slots__` cannot
+        // reconstruct, and that supplies no `__getnewargs__`, cannot be
+        // rebuilt via `__newobj__`.  `reduce_newobj` gates this on
+        // `tp_basicsize` exceeding the object+dict+weakref+slots baseline;
+        // pyre has no basicsize notion, so it recognises the one such builtin
+        // layout
+        // that reaches object-reduce — `module` (native name + dict
+        // payload).  Matches the proto < 2 `copyreg._reduce_ex` refusal.
+        if !hasargs && unsafe { pyre_object::is_module(w_obj) } {
+            return Err(PyError::type_error(format!(
+                "cannot pickle '{}' object",
+                typename(w_obj)
+            )));
+        }
         return reduce_2(w_obj, proto, w_args, w_kwargs);
     }
     reduce_1(w_obj, proto)
