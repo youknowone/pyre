@@ -8033,7 +8033,35 @@ impl MIFrame {
         &mut self,
         instruction: &Instruction,
         op_arg: pyre_interpreter::OpArg,
+        code: &CodeObject,
     ) -> Result<Option<pyre_interpreter::StepResult<FrontendOp>>, PyError> {
+        // LOAD_CONST walker activation via trait-path delegation.
+        //
+        // The auto-gen arm jitcode for `LoadConst` residualises
+        // `opcode_load_const(frame, &ConstantData)` — the `&ConstantData`
+        // operand is oparg-derived (resolved from `consti` against the
+        // code's constant pool), but the per-opcode arm entry
+        // (`dispatch_via_miframe_at_opcode_entry`) seeds only `r0 = frame`,
+        // leaving that operand register unbound — the walk aborts with
+        // `ResidualCallArgUnbound { arg_index: 2 }`.  (A const-specialising
+        // JIT wants the constant BAKED into the IR, not threaded as a
+        // runtime arg, so seeding the register is also the wrong shape.)
+        //
+        // Resolve the constant here and delegate to the existing
+        // `OpcodeStepExecutor::load_const` (the same method
+        // `execute_load_const` calls on the trait leg), which emits the
+        // type-specialised IR (`ConstRef` / `int_constant` / `str_constant`
+        // / …) and pushes via `push_value` — keeping `sym.valuestackdepth`
+        // / vable shadow / concrete mirror coherent.  Same delegation
+        // pattern as the StoreSubscr / PushNull hooks below; bypasses
+        // `apply_walker_stack_effect` because `push_value` handles vsd.
+        if let Instruction::LoadConst { consti } = instruction {
+            use pyre_interpreter::OpcodeStepExecutor;
+            let const_idx = consti.get(op_arg);
+            OpcodeStepExecutor::load_const(self, &code.constants[const_idx])?;
+            return Ok(Some(pyre_interpreter::StepResult::Continue));
+        }
+
         // STORE_SUBSCR walker activation via trait-path delegation.
         //
         // The auto-gen arm jitcode for `StoreSubscr` is
@@ -8148,6 +8176,7 @@ impl MIFrame {
         &mut self,
         instruction: &Instruction,
         op_arg: pyre_interpreter::OpArg,
+        code: &CodeObject,
     ) -> Result<pyre_interpreter::StepResult<FrontendOp>, PyError> {
         // PyPy `_opimpl_*` direct-record entry point — opcodes that bypass
         // the auto-gen arm-jitcode walk and emit IR / produce concrete
@@ -8156,7 +8185,9 @@ impl MIFrame {
         //
         // Returns `Some(step_result)` when the opcode was handled here.
         // The arm-jitcode walker below runs only when this returns `None`.
-        if let Some(step_result) = self.try_walker_direct_opcode_dispatch(instruction, op_arg)? {
+        if let Some(step_result) =
+            self.try_walker_direct_opcode_dispatch(instruction, op_arg, code)?
+        {
             return Ok(step_result);
         }
 
@@ -8444,7 +8475,7 @@ impl MIFrame {
                     && !in_inline_frame
                     && !foldable_list_load_attr
                 {
-                    self.dispatch_via_walker_for_opcode(&instruction, op_arg)
+                    self.dispatch_via_walker_for_opcode(&instruction, op_arg, code)
                 } else {
                     if flip_probe_enabled() {
                         let reason = if !production_walker_handles(&instruction) {
@@ -9225,6 +9256,14 @@ pub fn production_walker_handles(instruction: &Instruction) -> bool {
     matches!(
         instruction,
         Instruction::Nop
+            // LoadConst handled by the dispatch_via_walker_for_opcode entry
+            // hook: resolves the constant from `consti` + the code pool and
+            // delegates to `OpcodeStepExecutor::load_const`, whose
+            // `push_value` advances vsd.  The auto-gen arm residualises
+            // `opcode_load_const(frame, &ConstantData)` with the
+            // oparg-derived `&ConstantData` operand left unbound by the
+            // r0-only arm entry (ResidualCallArgUnbound).
+            | Instruction::LoadConst { .. }
             | Instruction::ExtendedArg
             | Instruction::Resume { .. }
             | Instruction::Cache
