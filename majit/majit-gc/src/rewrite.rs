@@ -2838,7 +2838,18 @@ impl GcRewriterImpl {
 
 impl GcRewriter for GcRewriterImpl {
     fn rewrite_for_gc(&self, ops: &[Op]) -> Vec<Op> {
-        self.rewrite_for_gc_with_constants(ops, &VecAssoc::new()).0
+        let (rewritten, _constants, gcrefs) =
+            self.rewrite_for_gc_with_constants(ops, &VecAssoc::new());
+        // This wrapper drops the gc_table output list. A non-null ConstPtr
+        // operand is rewritten to LoadFromGcTable, which needs that list to
+        // build the table; callers carrying one must use the
+        // constants-returning form. Fail fast rather than emit IR whose
+        // table is silently discarded.
+        assert!(
+            gcrefs.is_empty(),
+            "rewrite_for_gc discards gc_table refs; use rewrite_for_gc_with_constants"
+        );
+        rewritten
     }
 
     fn rewrite_for_gc_with_constants(

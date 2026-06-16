@@ -2471,12 +2471,20 @@ impl<'a> AssemblerARM64<'a> {
             // The slot value is GC-forwarded in place by the gc_table
             // root walker, so each load observes the relocated object.
             OpCode::LoadFromGcTable => {
-                if let (Some(Loc::Immed(idx)), Some(Loc::Reg(dst))) = (arglocs.first(), result_loc)
-                {
-                    let slot_addr = self.gc_table_base + (idx.value as usize) * WORD;
-                    self.emit_mov_imm64(dst.value as u32, slot_addr as i64);
-                    dynasm!(self.mc ; .arch aarch64 ; ldr X(dst.value), [X(dst.value)]);
-                }
+                let (Some(Loc::Immed(idx)), Some(Loc::Reg(dst))) = (arglocs.first(), result_loc)
+                else {
+                    panic!(
+                        "LoadFromGcTable expects [Immed(index)] and a register result, \
+                         got arglocs={arglocs:?} result={result_loc:?}"
+                    );
+                };
+                debug_assert_ne!(
+                    self.gc_table_base, 0,
+                    "LoadFromGcTable emitted without a GcTable base"
+                );
+                let slot_addr = self.gc_table_base + (idx.value as usize) * WORD;
+                self.emit_mov_imm64(dst.value as u32, slot_addr as i64);
+                dynasm!(self.mc ; .arch aarch64 ; ldr X(dst.value), [X(dst.value)]);
             }
             // `opassembler.py:269-270 emit_op_cast_ptr_to_int =
             // _genop_same_as` / `emit_op_cast_int_to_ptr = _genop_same_as`.
