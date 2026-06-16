@@ -616,6 +616,33 @@ fn is_str_const_define(kind: &OpKind) -> bool {
     )
 }
 
+/// The pure, non-raising flowspace opname a `core::<family>::<leaf>`
+/// method-call bridge lowers to in [`translate_op`], or `None` when the
+/// path is not such a bridge.  The single source of truth shared by
+/// [`translate_op`] (which emits the op) and [`op_canraise`] (which must
+/// agree the emitted op closes no exception edge), so the two tables
+/// cannot drift.  `core::cmp::{min,max}` is deliberately excluded: it
+/// lowers to a `simple_call(<builtin>)` that keeps the ordinary raising
+/// `CallOp` classification.
+fn nonraising_core_bridge_opname(segments: &[String], arg_count: usize) -> Option<&str> {
+    if segments.len() < 3 || segments[0] != "core" {
+        return None;
+    }
+    let family = segments[1].as_str();
+    let leaf = segments[segments.len() - 1].as_str();
+    match (family, leaf) {
+        // Rich comparisons map to the like-named flowspace op; plain
+        // comparisons carry an empty `canraise` (operation.py).
+        ("cmp", "eq" | "ne" | "lt" | "le" | "gt" | "ge") if arg_count == 2 => Some(leaf),
+        ("slice", "len") if arg_count == 1 => Some("len"),
+        ("slice", "iter") if arg_count == 1 => Some("iter"),
+        // `wrapping_mul` is the Rust spelling of upstream's plain `*`
+        // (lltype `int_mul` wraps); plain `mul` raises nothing.
+        ("num", "wrapping_mul") if arg_count == 2 => Some("mul"),
+        _ => None,
+    }
+}
+
 /// `true` iff the flowspace op(s) this `OpKind` lowers to carry a
 /// non-empty `canraise` (`operation.py`).
 ///
@@ -674,6 +701,17 @@ pub(crate) fn op_canraise(kind: &OpKind) -> bool {
         {
             false
         }
+        // `core::cmp::{eq..ge}` / `core::slice::{len,iter}` /
+        // `core::num::wrapping_mul` lower to pure, non-raising flowspace
+        // ops (see `nonraising_core_bridge_opname`); classify the
+        // originating Call the same way so a `?` tail op does not install
+        // an exception edge the lowered op cannot take.  Matched before
+        // the general `Call` arm.
+        OpKind::Call {
+            target: crate::model::CallTarget::FunctionPath { segments },
+            args,
+            ..
+        } if nonraising_core_bridge_opname(segments, args.len()).is_some() => false,
         // simple_call -> `CallOp.canraise` is `[Exception]` for a
         // non-builtin callable (operation.py:648-661).  Constant builtin
         // callables (int / float / chr / unicode) carry the narrower
@@ -1202,43 +1240,34 @@ pub fn translate_op(
                     // chain reaches unaryop.py / binaryop.py /
                     // rbuiltin.py instead of failing FunctionPath
                     // resolution.
-                    if segments.len() >= 3 && segments[0] == "core" {
-                        let family = segments[1].as_str();
+                    // Pure bridges (cmp comparisons / slice len|iter /
+                    // num wrapping_mul) → a like-named non-raising
+                    // flowspace op.  `nonraising_core_bridge_opname` is
+                    // the shared table `op_canraise` mirrors.
+                    if let Some(opname) = nonraising_core_bridge_opname(segments, arg_hls.len()) {
+                        return Ok(vec![FlowspaceOp::new(opname, arg_hls, result)]);
+                    }
+                    // `min`/`max` are the exception: they lower to a
+                    // `simple_call(<builtin>)` (raising like any builtin
+                    // call), so they stay out of the pure-bridge table.
+                    if segments.len() >= 3
+                        && segments[0] == "core"
+                        && segments[1] == "cmp"
+                        && arg_hls.len() == 2
+                    {
                         let leaf = segments[segments.len() - 1].as_str();
-                        match (family, leaf) {
-                            ("cmp", "eq" | "ne" | "lt" | "le" | "gt" | "ge")
-                                if arg_hls.len() == 2 =>
-                            {
-                                return Ok(vec![FlowspaceOp::new(leaf, arg_hls, result)]);
-                            }
-                            ("slice", "len") if arg_hls.len() == 1 => {
-                                return Ok(vec![FlowspaceOp::new("len", arg_hls, result)]);
-                            }
-                            ("slice", "iter") if arg_hls.len() == 1 => {
-                                return Ok(vec![FlowspaceOp::new("iter", arg_hls, result)]);
-                            }
-                            ("num", "wrapping_mul") if arg_hls.len() == 2 => {
-                                return Ok(vec![FlowspaceOp::new("mul", arg_hls, result)]);
-                            }
-                            ("cmp", "min" | "max") if arg_hls.len() == 2 => {
-                                let builtin = HOST_ENV.lookup_builtin(leaf).ok_or_else(|| {
-                                    TyperError::message(format!(
-                                        "builtin `{leaf}` missing from HOST_ENV"
-                                    ))
-                                })?;
-                                let callable = Hlvalue::Constant(Constant::new(
-                                    ConstValue::HostObject(builtin),
-                                ));
-                                let mut call_args = Vec::with_capacity(arg_hls.len() + 1);
-                                call_args.push(callable);
-                                call_args.extend(arg_hls);
-                                return Ok(vec![FlowspaceOp::new(
-                                    "simple_call",
-                                    call_args,
-                                    result,
-                                )]);
-                            }
-                            _ => {}
+                        if matches!(leaf, "min" | "max") {
+                            let builtin = HOST_ENV.lookup_builtin(leaf).ok_or_else(|| {
+                                TyperError::message(format!(
+                                    "builtin `{leaf}` missing from HOST_ENV"
+                                ))
+                            })?;
+                            let callable =
+                                Hlvalue::Constant(Constant::new(ConstValue::HostObject(builtin)));
+                            let mut call_args = Vec::with_capacity(arg_hls.len() + 1);
+                            call_args.push(callable);
+                            call_args.extend(arg_hls);
+                            return Ok(vec![FlowspaceOp::new("simple_call", call_args, result)]);
                         }
                     }
                     // `__cast_pointer/<Root>` marker (`front::mir`
@@ -4145,6 +4174,28 @@ mod tests {
         assert!(op_canraise(&binop("div")));
         assert!(!op_canraise(&binop("bitand_assign")));
         assert!(!op_canraise(&binop("add")));
+
+        // `core::*` method bridges that `translate_op` lowers to pure
+        // flowspace ops must classify as non-raising, so a `?` tail does
+        // not install an unreachable exception edge.  Drift here is what
+        // `nonraising_core_bridge_opname` exists to prevent.
+        let core_call = |segs: &[&str], argc: usize| OpKind::Call {
+            target: crate::model::CallTarget::FunctionPath {
+                segments: segs.iter().map(|s| s.to_string()).collect(),
+            },
+            args: (0..argc).map(|_| Variable::new()).collect(),
+            result_ty: ValueType::Int,
+        };
+        assert!(!op_canraise(&core_call(&["core", "cmp", "PartialEq", "eq"], 2)));
+        assert!(!op_canraise(&core_call(&["core", "cmp", "PartialOrd", "lt"], 2)));
+        assert!(!op_canraise(&core_call(&["core", "slice", "len"], 1)));
+        assert!(!op_canraise(&core_call(&["core", "slice", "iter"], 1)));
+        assert!(!op_canraise(&core_call(&["core", "num", "wrapping_mul"], 2)));
+        // `min`/`max` lower to a raising `simple_call`, and a wrong arg
+        // count falls through to the general raising `Call` arm.
+        assert!(op_canraise(&core_call(&["core", "cmp", "min"], 2)));
+        assert!(op_canraise(&core_call(&["core", "cmp", "max"], 2)));
+        assert!(op_canraise(&core_call(&["core", "slice", "len"], 2)));
     }
 
     #[test]
