@@ -4967,7 +4967,7 @@ unsafe fn descr_not_settable_error(descr: PyObjectRef) -> crate::PyError {
 ///
 /// PyPy: descroperation.py `space.get(w_descr, w_obj)` →
 /// dispatch on descriptor type, then fallback to __get__ MRO lookup.
-unsafe fn get(
+pub(crate) unsafe fn get(
     descr: PyObjectRef,
     obj: PyObjectRef,
     w_type: PyObjectRef,

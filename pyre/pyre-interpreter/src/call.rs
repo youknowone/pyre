@@ -590,16 +590,13 @@ fn call_callable_with_mode(
     }
 
     // staticmethod → unwrap
-    // PyPy: function.py StaticMethod.descr_staticmethod__call__
+    // PyPy: function.py StaticMethod.descr_call
     if unsafe { pyre_object::is_staticmethod(callable) } {
         let func = unsafe { pyre_object::w_staticmethod_get_func(callable) };
         return call_callable_with_mode(frame, func, args, mode);
     }
-    // classmethod → unwrap
-    if unsafe { pyre_object::is_classmethod(callable) } {
-        let func = unsafe { pyre_object::w_classmethod_get_func(callable) };
-        return call_callable_with_mode(frame, func, args, mode);
-    }
+    // ClassMethod defines no descr_call (function.py), so a raw classmethod
+    // object is not callable; it falls through to the not-callable error.
 
     // Instance with __call__ — PyPy: descroperation.py descr_call
     if unsafe { pyre_object::is_instance(callable) } {
@@ -617,7 +614,7 @@ fn call_callable_with_mode(
     // `result.__orig_class__ = self`.
     if unsafe { pyre_object::is_generic_alias(callable) } {
         let origin = unsafe { pyre_object::w_generic_alias_get_origin(callable) };
-        let result = call_callable(frame, origin, args)?;
+        let result = call_callable_with_mode(frame, origin, args, mode)?;
         set_orig_class(result, callable)?;
         return Ok(result);
     }
@@ -3048,20 +3045,31 @@ fn type_descr_call_with_mode(
     args: &[PyObjectRef],
     mode: CallMode,
 ) -> PyResult {
-    // Step 1: Look up __new__ via type MRO → allocate instance
-    // PyPy: typeobject.py descr_call → w_type.lookup_where('__new__'),
-    // then bind/call the resulting descriptor with w_type as the first arg.
-    let instance =
-        if let Some(new_fn) = unsafe { crate::baseobjspace::lookup_in_type(w_type, "__new__") } {
-            // Call __new__(cls, *args)
-            let mut new_args = Vec::with_capacity(1 + args.len());
-            new_args.push(w_type);
-            new_args.extend_from_slice(args);
-            call_callable_with_mode(frame, new_fn, &new_args, mode)?
-        } else {
-            // Default: allocate bare instance
-            pyre_object::w_instance_new(w_type)
-        };
+    // Step 1: Look up __new__ via type MRO → allocate instance.
+    // PyPy: typeobject.py descr_call → `w_newtype, w_newdescr =
+    // self.lookup_where('__new__')`; a missing descriptor (the pathological
+    // mro-without-object case) raises, otherwise the descriptor is bound via
+    // `space.get(w_newdescr, space.w_None, w_type=self)` and called with
+    // w_type as the first arg.
+    let Some(new_descr) = (unsafe { crate::baseobjspace::lookup_in_type(w_type, "__new__") })
+    else {
+        // typeobject.py:715 — `raise oefmt(space.w_TypeError,
+        // "cannot create '%N' instances", self)`.
+        let name = unsafe { pyre_object::w_type_get_name(w_type) };
+        return Err(crate::PyError::type_error(format!(
+            "cannot create '{name}' instances"
+        )));
+    };
+    // typeobject.py:726 — `w_newfunc = space.get(w_newdescr, space.w_None,
+    // w_type=self)`.  A descriptor with no __get__ (`get` → None) is its own
+    // bound value, matching `space.get`'s `if w_get is None: return w_descr`.
+    let new_fn = unsafe { crate::baseobjspace::get(new_descr, pyre_object::w_none(), w_type)? }
+        .unwrap_or(new_descr);
+    // typeobject.py:731 — `space.call_obj_args(w_newfunc, self, __args__)`.
+    let mut new_args = Vec::with_capacity(1 + args.len());
+    new_args.push(w_type);
+    new_args.extend_from_slice(args);
+    let instance = call_callable_with_mode(frame, new_fn, &new_args, mode)?;
 
     // Step 2: __init__ — only if __new__ returned an instance of w_type.
     // PyPy: descr_call — skips __init__ when __new__ returns a foreign type.
