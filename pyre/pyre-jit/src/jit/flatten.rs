@@ -4653,7 +4653,12 @@ fn build_residual_call_r_i_insn_from_operands(
     arg_operand: Operand,
     dst_reg: Register,
 ) -> Insn {
-    let effect_info = effect_info_for_call_flavor(CallFlavor::MayForce);
+    let mut effect_info = effect_info_for_call_flavor(CallFlavor::MayForce);
+    // Helper-recognition tag for the full-body walker: a provably-int truth
+    // operand specialises to `guard_class INT` + `getfield intval` +
+    // `int_is_true`, eliding the may-force call's GUARD_NOT_FORCED /
+    // GUARD_NO_EXCEPTION (mirrors the StoreSubscr / BinaryOp tags).
+    effect_info.pyre_helper = majit_ir::PyreHelperKind::Truth;
     let descr_operand = Operand::descr(DescrOperand::CallDescrStub(CallDescrStub {
         effect_info,
         arg_kinds: vec![Kind::Ref],

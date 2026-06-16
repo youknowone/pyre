@@ -535,6 +535,13 @@ pub enum PyreHelperKind {
     /// broken baked-NULL-globals shape the walker's may-force NULL-ref
     /// gate rejects.
     CallFn,
+    /// `bh_truth_fn(value)` — the TO_BOOL / `POP_JUMP_IF_*` truth helper
+    /// (`opcode_ops::truth_value`).  Returns the operand's truthiness as a
+    /// raw Int.  The full-body walker recognises this tag to specialise a
+    /// provably-int operand to a pure `guard_class INT` + `getfield intval`
+    /// + `int_is_true`, eliding the `CALL_MAY_FORCE` (and its
+    /// `GUARD_NOT_FORCED` / `GUARD_NO_EXCEPTION`) the generic residual emits.
+    Truth,
 }
 
 impl EffectInfo {

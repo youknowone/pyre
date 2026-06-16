@@ -7692,6 +7692,16 @@ fn dispatch_residual_call_iRd_kind(
             write_residual_call_result_to_dst(ctx, op.pc, dst, dst_bank, truth)?;
             return Ok((DispatchOutcome::Continue, op.next_pc));
         }
+        // #124: a TO_BOOL / POP_JUMP truth residual on a provably-int box
+        // (e.g. the `(i % 7)` in `(i % 7) and (i + 3)`) folds to a pure
+        // `int_is_true`, eliding the may-force call whose force/exc guards
+        // mis-resume the kept short-circuit stack.
+        if ei.pyre_helper == majit_ir::PyreHelperKind::Truth {
+            if let Some(truth) = try_walker_specialize_truth_int(ctx, op.pc, r_args[0])? {
+                write_residual_call_result_to_dst(ctx, op.pc, dst, dst_bank, truth)?;
+                return Ok((DispatchOutcome::Continue, op.next_pc));
+            }
+        }
     }
 
     // #62: specialize STORE_SUBSCR `list[int] = value` (int / float storage,
@@ -8018,6 +8028,41 @@ fn walker_concrete_ref_object(
         }
         _ => None,
     }
+}
+
+/// #124: walker-native truth specialization for the `truth_fn` residual
+/// (oopspec [`majit_ir::PyreHelperKind::Truth`]).  When the sole Ref operand
+/// is a concrete boxed `W_IntObject` (excluding `W_BoolObject`, whose vtable
+/// + 1-byte `boolval` layout differs), unbox it (`GUARD_CLASS INT` +
+/// `getfield intval`) and record `int_is_true`, stamping the folded concrete
+/// truth.  Returns the raw truth `OpRef` on success; `None` when the operand
+/// is not a concrete non-bool int — the caller then falls through to the
+/// generic may-force residual, preserving `__bool__` / `__len__` semantics.
+///
+/// Eliding the `CALL_MAY_FORCE` here also removes its `GUARD_NOT_FORCED` /
+/// `GUARD_NO_EXCEPTION`, whose kept-stack blackhole resume reads NULL peeled
+/// outer-Label slots in the short-circuit value-context shape
+/// (`(i % 7) and ...`).
+fn try_walker_specialize_truth_int(
+    ctx: &mut WalkContext<'_, '_>,
+    op_pc: usize,
+    operand: OpRef,
+) -> Result<Option<OpRef>, DispatchError> {
+    let Some(obj) = walker_concrete_ref_object(ctx, operand) else {
+        return Ok(None);
+    };
+    let val = unsafe {
+        if !pyre_object::is_int(obj) || pyre_object::is_bool(obj) {
+            return Ok(None);
+        }
+        pyre_object::w_int_get_value(obj)
+    };
+    let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
+    let raw = walker_unbox_int(ctx, op_pc, operand, int_type_addr)?;
+    let truth = ctx.trace_ctx.record_op(OpCode::IntIsTrue, &[raw]);
+    ctx.trace_ctx
+        .set_opref_concrete(truth, majit_ir::Value::Int((val != 0) as i64));
+    Ok(Some(truth))
 }
 
 fn walker_int_specialization_operands(
