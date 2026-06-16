@@ -2169,6 +2169,13 @@ impl ExportedState {
             visit_opref(key, visitor);
             visit_produced_short_op(produced, visitor);
         }
+        // The key stays an `OpRef`, not a `BoxRef` (unlike the migrated #108
+        // sites): this is a value-keyed const lookup, and `BoxRef` is ordered
+        // and compared by `Rc` identity (no `Ord`, `Eq` via `Rc::ptr_eq`), so
+        // two `ConstPtr` boxes carrying the same gcref would be distinct keys
+        // and the dedup the map relies on would break. `visit_opref` already
+        // forwards the key's inline gcref canonically, and `visit_value`
+        // forwards the stored `Value::Ref`, so the slot is GC-safe as-is.
         for (key, value) in self.short_box_const_values.iter_entries_mut() {
             visit_opref(key, visitor);
             visit_value(value, visitor);
