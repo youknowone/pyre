@@ -490,8 +490,20 @@ impl JitCodeBuilder {
     /// index_in_parent, is_pure)` for each field.  Scalar fields are one
     /// machine word (`field_size = 8`); the flag/sign follow the field
     /// kind (pointer vs signed int).
+    ///
+    /// `index_in_parent` is the field's rank by byte offset, not its order
+    /// in the incoming slice.  `heaptracker.get_fielddescr_index_in`
+    /// (`descr.py:228`) derives the index from the STRUCT's own field list,
+    /// a stable per-type property; the caller's slice comes from a Rust
+    /// struct literal whose source order may differ from (and vary between
+    /// literals of) the declared layout.  Sorting by offset gives every
+    /// literal of the same struct an identical, deterministic
+    /// `all_fielddescrs` order so the `type_id`-keyed cache is not polluted
+    /// and the optimizer's `FieldDescr.n()` indexing stays consistent.
     fn field_specs_from_layout(fields: &[(usize, bool, &str)]) -> Vec<BhFieldSpec> {
-        fields
+        let mut ordered: Vec<(usize, bool, &str)> = fields.to_vec();
+        ordered.sort_by_key(|&(offset, _, _)| offset);
+        ordered
             .iter()
             .enumerate()
             .map(|(idx, &(offset, is_ref, name))| {
@@ -566,24 +578,27 @@ impl JitCodeBuilder {
         offset: usize,
         field_type: majit_ir::value::Type,
         type_id: u64,
-        index_in_parent: usize,
     ) -> u16 {
         let parent = self.struct_size_specs.get(&type_id).cloned();
-        if parent.is_none() {
+        let Some(parent_spec) = parent.as_ref() else {
             return self.add_scalar_field_descr(offset, field_type);
-        }
+        };
         let (field_flag, is_field_signed) = match field_type {
             majit_ir::value::Type::Ref => (majit_ir::descr::ArrayFlag::Pointer, false),
             majit_ir::value::Type::Float => (majit_ir::descr::ArrayFlag::Float, false),
             _ => (majit_ir::descr::ArrayFlag::Signed, true),
         };
-        // descr.py:227 name = '%s.%s' % (STRUCT._name, fieldname): take it
-        // from the cached layout so the descr's repr matches the field.
-        let name = parent
-            .as_ref()
-            .and_then(|p| p.all_fielddescrs.get(index_in_parent))
-            .map(|fd| fd.name.clone())
-            .unwrap_or_default();
+        // descr.py:228 index = heaptracker.get_fielddescr_index_in(STRUCT,
+        // fieldname): resolve the field's structural slot against the cached
+        // (offset-ordered) layout `new_struct` registered, not the caller's
+        // store order.  descr.py:227 name = '%s.%s' % (STRUCT._name,
+        // fieldname): take it from the same layout so the repr matches.
+        let (index_in_parent, name) = parent_spec
+            .all_fielddescrs
+            .iter()
+            .position(|fd| fd.offset == offset)
+            .map(|idx| (idx, parent_spec.all_fielddescrs[idx].name.clone()))
+            .unwrap_or((0, String::new()));
         self.add_bh_descr(CanonicalBhDescr::Field {
             offset,
             field_size: 8,
@@ -601,24 +616,12 @@ impl JitCodeBuilder {
 
     /// Emit `setfield_gc_i/rid` (`blackhole.py:1471 bhimpl_setfield_gc_i`):
     /// store the int in `value_reg` into `struct_reg`'s field at `offset`.
-    /// `type_id` + `index_in_parent` identify the field against the layout
+    /// `type_id` + `offset` identify the field against the layout
     /// `new_struct` registered, so the optimizer can virtualize the store.
-    pub fn setfield_gc_i(
-        &mut self,
-        struct_reg: u16,
-        value_reg: u16,
-        offset: usize,
-        type_id: u64,
-        index_in_parent: usize,
-    ) {
+    pub fn setfield_gc_i(&mut self, struct_reg: u16, value_reg: u16, offset: usize, type_id: u64) {
         self.touch_ref_reg(struct_reg);
         self.touch_reg(value_reg);
-        let descr = self.add_struct_field_descr(
-            offset,
-            majit_ir::value::Type::Int,
-            type_id,
-            index_in_parent,
-        );
+        let descr = self.add_struct_field_descr(offset, majit_ir::value::Type::Int, type_id);
         self.write_insn("setfield_gc_i/rid");
         self.push_reg_u8(struct_reg, "setfield_gc_i struct");
         self.push_reg_u8(value_reg, "setfield_gc_i value");
@@ -627,24 +630,12 @@ impl JitCodeBuilder {
 
     /// Emit `setfield_gc_r/rrd` (`blackhole.py:1476 bhimpl_setfield_gc_r`):
     /// store the ref in `value_reg` into `struct_reg`'s field at `offset`.
-    /// `type_id` + `index_in_parent` identify the field against the layout
+    /// `type_id` + `offset` identify the field against the layout
     /// `new_struct` registered, so the optimizer can virtualize the store.
-    pub fn setfield_gc_r(
-        &mut self,
-        struct_reg: u16,
-        value_reg: u16,
-        offset: usize,
-        type_id: u64,
-        index_in_parent: usize,
-    ) {
+    pub fn setfield_gc_r(&mut self, struct_reg: u16, value_reg: u16, offset: usize, type_id: u64) {
         self.touch_ref_reg(struct_reg);
         self.touch_ref_reg(value_reg);
-        let descr = self.add_struct_field_descr(
-            offset,
-            majit_ir::value::Type::Ref,
-            type_id,
-            index_in_parent,
-        );
+        let descr = self.add_struct_field_descr(offset, majit_ir::value::Type::Ref, type_id);
         self.write_insn("setfield_gc_r/rrd");
         self.push_reg_u8(struct_reg, "setfield_gc_r struct");
         self.push_reg_u8(value_reg, "setfield_gc_r value");

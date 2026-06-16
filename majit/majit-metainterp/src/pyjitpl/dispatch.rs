@@ -6595,8 +6595,8 @@ mod tests {
         let mut builder = JitCodeBuilder::new();
         builder.new_struct(0, 16, 0xCD, &[(0, false, "value"), (8, true, "next")]); // ref reg 0 = Node*
         builder.load_const_i_value(0, 99); // int reg 0 = 99
-        builder.setfield_gc_i(0, 0, 0, 0xCD, 0); // Node.value = 99
-        builder.setfield_gc_r(0, 0, 8, 0xCD, 1); // Node.next  = Node (self-ref)
+        builder.setfield_gc_i(0, 0, 0, 0xCD); // Node.value = 99
+        builder.setfield_gc_r(0, 0, 8, 0xCD); // Node.next  = Node (self-ref)
         builder.getfield_gc_i(1, 0, 0); // int reg 1 = Node.value
         builder.getfield_gc_r(1, 0, 8); // ref reg 1 = Node.next
         let jitcode = builder.finish();

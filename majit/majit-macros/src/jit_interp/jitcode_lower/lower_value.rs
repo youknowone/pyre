@@ -153,10 +153,11 @@ impl<'c> Lowerer<'c> {
         let type_id = struct_type_id(struct_path);
         let result_reg = self.alloc_reg();
         // descr.py:122-126 init_size_descr: the SizeDescr carries the
-        // struct's full `(offset, is_ref, name)` layout in declaration
-        // order so the optimizer can virtualize the New and resolve each
-        // field's parent SizeDescr + index. The literal lists every field,
-        // so its iteration order IS the canonical `index_in_parent` order.
+        // struct's full `(offset, is_ref, name)` layout so the optimizer can
+        // virtualize the New and resolve each field's parent SizeDescr +
+        // index. A Rust struct literal may list fields in any order, so the
+        // builder canonicalizes `index_in_parent` by byte offset; we only
+        // need to hand it each field's `(offset, is_ref, name)`.
         let field_layout: Vec<TokenStream> = fields
             .iter()
             .map(|(member, value)| {
@@ -181,7 +182,7 @@ impl<'c> Lowerer<'c> {
                 );
             },
         );
-        for (index_in_parent, (member, value)) in fields.iter().enumerate() {
+        for (member, value) in fields.iter() {
             let value_reg = value.reg;
             let (reads, tokens) = match value.kind {
                 BindingKind::Int => (
@@ -192,7 +193,6 @@ impl<'c> Lowerer<'c> {
                             #value_reg,
                             ::core::mem::offset_of!(#struct_path, #member),
                             #type_id,
-                            #index_in_parent,
                         );
                     },
                 ),
@@ -204,7 +204,6 @@ impl<'c> Lowerer<'c> {
                             #value_reg,
                             ::core::mem::offset_of!(#struct_path, #member),
                             #type_id,
-                            #index_in_parent,
                         );
                     },
                 ),
