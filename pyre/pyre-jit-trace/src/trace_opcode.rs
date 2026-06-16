@@ -8357,6 +8357,29 @@ impl MIFrame {
             return Ok(Some(pyre_interpreter::StepResult::Continue));
         }
 
+        // COPY walker activation via trait-path delegation.
+        //
+        // The auto-gen arm jitcode for `Copy` lowers `opcode_copy_value`
+        // (`peek_at` + `push_value`), whose `Result<(), PyError>` Ok/Err
+        // discriminant the arm walk cannot make concrete
+        // (`Copy|SwitchValueNotConcrete`); the result-shell scope does not
+        // drain it because `copy_value` forwards to the shared
+        // `peek_at`/`push_value` stack ops (a whole-program lowering, not a
+        // per-opcode slice).  The blocker is arm-walk-only: `COPY i`
+        // duplicates the stack slot at `peek_at(i)` and pushes it — a pure
+        // symbolic stack manipulation that records no IR op (the duplicated
+        // `FrontendOp` flows to consumers directly, like the `PushNull`
+        // constant slot).  Delegate to `OpcodeStepExecutor::copy_value`
+        // exactly as `execute_copy` (pyopcode.rs:1989) does;
+        // `peek_at`/`push_value` keep the symbolic + concrete-shadow stacks
+        // + vsd shadow coherent, so this bypasses `apply_walker_stack_effect`.
+        // Same delegation pattern as the PopTop / PushNull hooks above.
+        if let Instruction::Copy { i } = instruction {
+            use pyre_interpreter::OpcodeStepExecutor;
+            OpcodeStepExecutor::copy_value(self, i.get(op_arg) as usize)?;
+            return Ok(Some(pyre_interpreter::StepResult::Continue));
+        }
+
         Ok(None)
     }
 
