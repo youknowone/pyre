@@ -1613,16 +1613,20 @@ pub fn blackhole_resume_via_rd_numb(
     // mutates it, so the abort arm can roll it back and the interpreter's
     // re-run applies each side effect exactly once.
     //
-    // Objects are immortal under the current GC (no move/collect), so
-    // holding raw `PyObjectRef`s across `bh.run()` is safe; this snapshot
-    // would have to be registered as a GC root if that ever changes.
-    let vable_rollback: Option<(Vec<PyObjectRef>, usize, isize)> = {
-        let frame_ptr = bh.virtualizable_ptr as *const PyFrame;
+    // The snapshot holds raw `PyObjectRef`s across `bh.run()`; the GC is a
+    // moving collector (#336), so a minor collection during the run could
+    // relocate these and this snapshot would have to be registered as a GC
+    // root — tracked with #336.  Capture the snapshotted frame pointer too,
+    // so the abort arm can confirm the frame that aborted is the same one
+    // this state belongs to before restoring it.
+    let vable_rollback: Option<(*mut PyFrame, Vec<PyObjectRef>, usize, isize)> = {
+        let frame_ptr = bh.virtualizable_ptr as *mut PyFrame;
         if frame_ptr.is_null() {
             None
         } else {
             let frame = unsafe { &*frame_ptr };
             Some((
+                frame_ptr,
                 frame.locals_w().as_slice().to_vec(),
                 frame.valuestackdepth,
                 frame.last_instr,
@@ -1702,9 +1706,17 @@ pub fn blackhole_resume_via_rd_numb(
             // from the guard resume PC with the pre-blackhole frame state,
             // so every side effect (the aborting opcode's included) is
             // applied exactly once instead of twice.
-            if let Some((locals, vsd, last_instr)) = &vable_rollback {
+            if let Some((snap_frame_ptr, locals, vsd, last_instr)) = &vable_rollback {
                 let frame_ptr = bh.virtualizable_ptr as *mut PyFrame;
-                if !frame_ptr.is_null() {
+                // Roll back only when the frame that aborted is the same one
+                // the snapshot was captured from.  The `_run_forever` loop
+                // reassigns `bh` to a caller on callee return / exception
+                // propagation; a later abort then lands on the caller frame,
+                // whose valuestackdepth / last_instr would be clobbered with
+                // the callee's snapshot.  A per-frame snapshot for that
+                // multi-frame case is the #124 stack-snapshot epic; until
+                // then, skip rather than corrupt the caller frame.
+                if !frame_ptr.is_null() && frame_ptr == *snap_frame_ptr {
                     let frame = unsafe { &mut *frame_ptr };
                     let arr = frame.locals_w_mut().as_mut_slice();
                     // The locals_cells_stack array length is fixed for a
