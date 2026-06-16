@@ -2914,8 +2914,7 @@ impl<'a> Lowering<'a> {
                 // constant, so fold to `ConstInt(tag)` (mirrors
                 // `expect_on_const_ok`, which aliases the payload).
                 if let PlaceKind::Local(i) = &place.kind
-                    && let Some(&tag) =
-                        self.const_discriminant_locals.get(&(*i as usize))
+                    && let Some(&tag) = self.const_discriminant_locals.get(&(*i as usize))
                 {
                     return Ok((Some(OpKind::ConstInt(tag)), res));
                 }
@@ -5375,7 +5374,10 @@ impl<'a> Lowering<'a> {
         // Only smaller-than-word unsigned sources widen as a
         // value-preserving identity in the word carrier (the same gate
         // `try_lower_usize_try_from` uses).
-        if !matches!(self.tyref_literal_uint_atom(src), Some("U8" | "U16" | "U32")) {
+        if !matches!(
+            self.tyref_literal_uint_atom(src),
+            Some("U8" | "U16" | "U32")
+        ) {
             return Ok(false);
         }
         // Destination must be a word-sized integer carrier.
@@ -8470,11 +8472,413 @@ fn scalar_value_to_i64(v: &serde_json::Value) -> Option<i64> {
     None
 }
 
+/// Resolve a `Variable` used as a call argument back to the operation
+/// that produced it, following block-input `Link`s across blocks.
+///
+/// The `fmt`-chain recognizer (#277) fires at `alloc::fmt::format(v)`
+/// where `v` is the `Arguments` value — but `v` reaches that block as an
+/// `inputarg` threaded from the predecessor's `Arguments::new` result via
+/// the outgoing `Link`, not as a direct op result in the current block.
+/// Existing `try_lower_*` folds only read a call's direct args; the fmt
+/// recognizer needs this cross-block back-trace.
+///
+/// Returns `(block, op_index)` of the producing `SpaceOperation`, or
+/// `None` when `var` traces to a `Const`, a function input (no producing
+/// op), a phi merge (a block with more than one incoming `Link`, so no
+/// single producer), or a producer not yet emitted into `graph`.
+//
+// Staged for the #277 recognizer; not yet wired into the call dispatch.
+#[allow(dead_code)]
+fn resolve_to_producer_op(
+    graph: &FunctionGraph,
+    var: &crate::flowspace::model::Variable,
+) -> Option<(BlockId, usize)> {
+    let mut current = var.clone();
+    let mut visited: Vec<u64> = Vec::new();
+    loop {
+        if visited.contains(&current.id()) {
+            return None; // cycle guard
+        }
+        visited.push(current.id());
+
+        // (1) Produced directly by an op in some block?
+        for block in &graph.blocks {
+            for (idx, op) in block.operations.iter().enumerate() {
+                if op.result.as_ref().is_some_and(|r| r.id() == current.id()) {
+                    return Some((block.id, idx));
+                }
+            }
+        }
+
+        // (2) Otherwise it is a block inputarg — follow the single
+        // incoming Link's matching positional arg back one block.
+        let (owner, pos) = graph.blocks.iter().find_map(|block| {
+            block
+                .inputargs
+                .iter()
+                .position(|a| a.id() == current.id())
+                .map(|pos| (block.id, pos))
+        })?;
+        let mut incoming = graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.exits.iter())
+            .filter(|link| link.target == owner);
+        let first = incoming.next()?;
+        if incoming.next().is_some() {
+            return None; // phi merge: no single producer
+        }
+        match first.args.get(pos)? {
+            crate::model::LinkArg::Value(v) => current = v.clone(),
+            crate::model::LinkArg::Const(_) => return None,
+        }
+    }
+}
+
+/// Decode the packed format-string template that `format_args!` lowers
+/// its `&[&str]` pieces into.  The pieces argument to `fmt::Arguments::new`
+/// is a `[u8; N]` byte buffer (charon lowers it as an `Array` of `U8`
+/// constant elements); this reconstructs the literal `pieces` and counts
+/// the argument placeholders.
+///
+/// Grammar (verified against the real LLBC for several handler graphs):
+/// - literal segment: a length byte `L` with `L < 0x80`, then `L` bytes
+///   of UTF-8 text appended to the current piece;
+/// - placeholder: the single byte `0xC0` — closes the current piece and
+///   begins the next (the Display-vs-Debug choice lives in the parallel
+///   args array, not in this template, so a placeholder carries no kind);
+/// - terminator: a `0x00` byte (only at a segment boundary; `0`/`0xC0`
+///   bytes inside a literal are consumed by its length prefix).
+///
+/// Returns `(pieces, placeholder_count)` with `pieces.len() ==
+/// placeholder_count + 1`.  Returns `None` (bail, leaving the graph
+/// untouched) on any high-bit control byte other than `0xC0` — i.e. a
+/// format spec with width/precision/fill or an explicit positional/named
+/// argument — and on non-UTF-8 literal bytes.
+//
+// Staged for the #277 recognizer; not yet wired into the call dispatch.
+#[allow(dead_code)]
+fn decode_packed_format_pieces(bytes: &[u8]) -> Option<(Vec<String>, usize)> {
+    let mut pieces: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut placeholders = 0usize;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == 0x00 {
+            // terminator — must be the final byte
+            if i + 1 != bytes.len() {
+                return None;
+            }
+            break;
+        } else if b == 0xC0 {
+            // plain sequential placeholder
+            pieces.push(std::mem::take(&mut current));
+            placeholders += 1;
+            i += 1;
+        } else if b < 0x80 {
+            // literal segment of length `b`
+            let start = i + 1;
+            let end = start.checked_add(b as usize)?;
+            let seg = bytes.get(start..end)?;
+            current.push_str(std::str::from_utf8(seg).ok()?);
+            i = end;
+        } else {
+            // any other control byte = format spec / positional arg: bail
+            return None;
+        }
+    }
+    pieces.push(current);
+    Some((pieces, placeholders))
+}
+
+/// Read an `Array` aggregate literal: given the Variable holding a
+/// `SyntheticTransparentCtor { name: "Array" }` result, collect the
+/// values written to its `__pos_0..__pos_{n-1}` fields in index order.
+/// The ctor and its element `FieldWrite`s are emitted into one block by
+/// the `Rvalue::Aggregate` array lowering, so the search is block-local
+/// once the ctor is found. Returns `None` if `array_var` is not produced
+/// by an `Array` ctor, or its `__pos_i` writes are not the contiguous
+/// range `0..n`.
+//
+// Staged for the #277 recognizer; not yet wired into the call dispatch.
+#[allow(dead_code)]
+fn read_array_literal_elements(
+    graph: &FunctionGraph,
+    array_var: &crate::flowspace::model::Variable,
+) -> Option<Vec<crate::flowspace::model::Variable>> {
+    use crate::model::{CallTarget, OpKind};
+    let (block_id, ctor_idx) = resolve_to_producer_op(graph, array_var)?;
+    let block = graph.blocks.iter().find(|b| b.id == block_id)?;
+    match &block.operations.get(ctor_idx)?.kind {
+        OpKind::Call {
+            target: CallTarget::SyntheticTransparentCtor { name, .. },
+            ..
+        } if name == "Array" => {}
+        _ => return None,
+    }
+    let mut by_index: Vec<(usize, crate::flowspace::model::Variable)> = Vec::new();
+    for op in &block.operations {
+        if let OpKind::FieldWrite {
+            base, field, value, ..
+        } = &op.kind
+        {
+            if base.id() == array_var.id() {
+                let idx = field.name.strip_prefix("__pos_")?.parse::<usize>().ok()?;
+                by_index.push((idx, value.clone()));
+            }
+        }
+    }
+    by_index.sort_by_key(|(i, _)| *i);
+    for (expected, (idx, _)) in by_index.iter().enumerate() {
+        if *idx != expected {
+            return None;
+        }
+    }
+    Some(by_index.into_iter().map(|(_, v)| v).collect())
+}
+
+/// Resolve a Variable to the `i64` of the `ConstInt` op that produces it,
+/// following cross-block links via [`resolve_to_producer_op`]. Used to
+/// read the packed-format pieces byte array (each `__pos_i` element is a
+/// `ConstInt` byte).
+//
+// Staged for the #277 recognizer; not yet wired into the call dispatch.
+#[allow(dead_code)]
+fn resolve_const_int(
+    graph: &FunctionGraph,
+    var: &crate::flowspace::model::Variable,
+) -> Option<i64> {
+    use crate::model::OpKind;
+    let (block_id, idx) = resolve_to_producer_op(graph, var)?;
+    let block = graph.blocks.iter().find(|b| b.id == block_id)?;
+    match block.operations.get(idx)?.kind {
+        OpKind::ConstInt(n) => Some(n),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::harden_duplicate_leaf_metadata;
     use super::{cast_kind_is_raw_ptr, cast_pointer_marker_op, charon_type_value_to_ast_string};
     use majit_charon_reader::Llbc;
+
+    #[test]
+    fn resolve_to_producer_op_follows_cross_block_inputarg_link() {
+        use super::resolve_to_producer_op;
+        use crate::flowspace::model::Variable;
+        use crate::model::{FunctionGraph, Link, OpKind, SpaceOperation};
+
+        let mut graph = FunctionGraph::new("xblock");
+        let a = graph.create_block();
+        let b = graph.create_block();
+
+        // block A produces `x` via a ConstInt op.
+        let x = Variable::new();
+        graph.block_mut(a).operations.push(SpaceOperation {
+            result: Some(x.clone()),
+            kind: OpKind::ConstInt(7),
+        });
+
+        // block B takes `w` as its single inputarg; A links to B passing
+        // `x` for `w` (the cross-block threading the recognizer sees).
+        let w = Variable::new();
+        graph.block_mut(b).inputargs = vec![w.clone()];
+        let link = Link::from_variables(&graph, vec![x.clone()], b, None).with_prevblock(a);
+        graph.block_mut(a).exits = vec![link];
+
+        // `w` (block B inputarg) back-traces to A's ConstInt op.
+        assert_eq!(resolve_to_producer_op(&graph, &w), Some((a, 0)));
+        // A direct op result resolves to itself.
+        assert_eq!(resolve_to_producer_op(&graph, &x), Some((a, 0)));
+        // An unrelated free Variable has no producer.
+        assert_eq!(resolve_to_producer_op(&graph, &Variable::new()), None);
+    }
+
+    #[test]
+    fn decode_packed_format_pieces_matches_real_llbc_templates() {
+        use super::decode_packed_format_pieces;
+
+        // The four fixtures below are the verbatim `[u8; N]` pieces buffers
+        // charon lowers for these handler graphs (captured from the real
+        // pyre-interpreter.ullbc). Each asserts the reconstructed pieces +
+        // placeholder count, i.e. the original format string.
+
+        // `format!("stack underflow during {}", context)`
+        let (pieces, n) = decode_packed_format_pieces(&[
+            23, 115, 116, 97, 99, 107, 32, 117, 110, 100, 101, 114, 102, 108, 111, 119, 32, 100,
+            117, 114, 105, 110, 103, 32, 192, 0,
+        ])
+        .unwrap();
+        assert_eq!(
+            pieces,
+            vec!["stack underflow during ".to_string(), String::new()]
+        );
+        assert_eq!(n, 1);
+
+        // `format!("{} indices must be integers or slices, not {}", ..)`
+        let (pieces, n) = decode_packed_format_pieces(&[
+            192, 41, 32, 105, 110, 100, 105, 99, 101, 115, 32, 109, 117, 115, 116, 32, 98, 101, 32,
+            105, 110, 116, 101, 103, 101, 114, 115, 32, 111, 114, 32, 115, 108, 105, 99, 101, 115,
+            44, 32, 110, 111, 116, 32, 192, 0,
+        ])
+        .unwrap();
+        assert_eq!(
+            pieces,
+            vec![
+                String::new(),
+                " indices must be integers or slices, not ".to_string(),
+                String::new(),
+            ]
+        );
+        assert_eq!(n, 2);
+
+        // `format!("'{}' object does not support item assignment", ..)`
+        let (pieces, n) = decode_packed_format_pieces(&[
+            1, 39, 192, 41, 39, 32, 111, 98, 106, 101, 99, 116, 32, 100, 111, 101, 115, 32, 110,
+            111, 116, 32, 115, 117, 112, 112, 111, 114, 116, 32, 105, 116, 101, 109, 32, 97, 115,
+            115, 105, 103, 110, 109, 101, 110, 116, 0,
+        ])
+        .unwrap();
+        assert_eq!(
+            pieces,
+            vec![
+                "'".to_string(),
+                "' object does not support item assignment".to_string(),
+            ]
+        );
+        assert_eq!(n, 1);
+
+        // `format!("__init__() should return None, not '{}'", ..)`
+        let (pieces, n) = decode_packed_format_pieces(&[
+            36, 95, 95, 105, 110, 105, 116, 95, 95, 40, 41, 32, 115, 104, 111, 117, 108, 100, 32,
+            114, 101, 116, 117, 114, 110, 32, 78, 111, 110, 101, 44, 32, 110, 111, 116, 32, 39,
+            192, 1, 39, 0,
+        ])
+        .unwrap();
+        assert_eq!(
+            pieces,
+            vec![
+                "__init__() should return None, not '".to_string(),
+                "'".to_string(),
+            ]
+        );
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn decode_packed_format_pieces_bails_and_handles_edges() {
+        use super::decode_packed_format_pieces;
+
+        // A control byte other than 0xC0 (e.g. a format-spec / positional
+        // placeholder) must bail so the recognizer leaves the graph alone.
+        assert_eq!(decode_packed_format_pieces(&[0xC1, 0]), None);
+        assert_eq!(decode_packed_format_pieces(&[0x80, 0]), None);
+
+        // A literal length that overruns the buffer bails.
+        assert_eq!(decode_packed_format_pieces(&[5, 65, 66, 0]), None);
+
+        // A 0 byte that is not the final byte bails (terminator is last).
+        assert_eq!(decode_packed_format_pieces(&[0, 1, 65, 0]), None);
+
+        // Literal-only template (no placeholders) → single piece.
+        let (pieces, n) = decode_packed_format_pieces(&[2, 104, 105, 0]).unwrap();
+        assert_eq!(pieces, vec!["hi".to_string()]);
+        assert_eq!(n, 0);
+
+        // Two consecutive literal segments accumulate into one piece
+        // (how a >127-byte literal is split); one placeholder follows.
+        let (pieces, n) = decode_packed_format_pieces(&[1, 97, 1, 98, 192, 0]).unwrap();
+        assert_eq!(pieces, vec!["ab".to_string(), String::new()]);
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn read_array_literal_then_decode_pieces_end_to_end() {
+        use super::{decode_packed_format_pieces, read_array_literal_elements, resolve_const_int};
+        use crate::flowspace::model::Variable;
+        use crate::model::{
+            CallTarget, FieldDescriptor, FunctionGraph, OpKind, SpaceOperation, ValueType,
+        };
+
+        // Build the pieces array the way the front-end lowers it: an
+        // `Array` ctor followed by `__pos_i` FieldWrites of ConstInt
+        // bytes. Template for `format!("hi{}")` → pieces ["hi", ""],
+        // one placeholder = bytes [2, 'h', 'i', 0xC0, 0].
+        let mut graph = FunctionGraph::new("arraylit");
+        let a = graph.create_block();
+        let arr = Variable::new();
+        graph.block_mut(a).operations.push(SpaceOperation {
+            result: Some(arr.clone()),
+            kind: OpKind::Call {
+                target: CallTarget::SyntheticTransparentCtor {
+                    name: "Array".to_string(),
+                    owner_path: vec![],
+                },
+                args: vec![],
+                result_ty: ValueType::Ref(Some("Array".to_string())),
+            },
+        });
+        let bytes = [2i64, 104, 105, 0xC0, 0];
+        for (i, b) in bytes.iter().enumerate() {
+            let v = Variable::new();
+            graph.block_mut(a).operations.push(SpaceOperation {
+                result: Some(v.clone()),
+                kind: OpKind::ConstInt(*b),
+            });
+            graph.block_mut(a).operations.push(SpaceOperation {
+                result: None,
+                kind: OpKind::FieldWrite {
+                    base: arr.clone(),
+                    field: FieldDescriptor::new(format!("__pos_{i}"), Some("Array".to_string())),
+                    value: v,
+                    ty: ValueType::Ref(None),
+                },
+            });
+        }
+
+        let elements = read_array_literal_elements(&graph, &arr).expect("array elements");
+        assert_eq!(elements.len(), 5);
+        let decoded: Vec<u8> = elements
+            .iter()
+            .map(|v| resolve_const_int(&graph, v).expect("const int") as u8)
+            .collect();
+        assert_eq!(decoded, vec![2, 104, 105, 0xC0, 0]);
+        let (pieces, n) = decode_packed_format_pieces(&decoded).unwrap();
+        assert_eq!(pieces, vec!["hi".to_string(), String::new()]);
+        assert_eq!(n, 1);
+
+        // A non-Array producer (plain ConstInt) is rejected.
+        assert_eq!(read_array_literal_elements(&graph, &elements[0]), None);
+    }
+
+    /// Throwaway IR-capture probe for the #277 fmt recognizer: dumps the
+    /// lowered front-end op sequence for `stack_underflow_error` (the
+    /// canonical `type_error(format!("…{x}"))` chain) so the byte-array
+    /// piece decoder can be anchored to the real `Array`/`ConstInt` shape.
+    /// Ignored by default (loads the 242MB real LLBC); run with
+    /// `cargo test -p majit-translate --lib dump_fmt_chain_ir -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn dump_fmt_chain_ir() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-interpreter.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let graph = super::lower_function(&llbc, "stack_underflow_error")
+            .expect("lower stack_underflow_error");
+        for block in &graph.blocks {
+            eprintln!("block {:?} inputargs={:?}", block.id, block.inputargs);
+            for (idx, op) in block.operations.iter().enumerate() {
+                eprintln!("  [{idx}] result={:?} kind={:?}", op.result, op.kind);
+            }
+            for link in &block.exits {
+                eprintln!("  exit -> {:?} args={:?}", link.target, link.args);
+            }
+        }
+    }
 
     #[test]
     fn cast_pointer_marker_carries_root_in_path_and_result_type() {
