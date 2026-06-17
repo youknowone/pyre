@@ -73,22 +73,19 @@ fn build_frame_stub_chain(top: *mut crate::pyframe::PyFrame) -> PyObjectRef {
         // `f_locals` by running `fast2locals()` and exposing the
         // resulting `debugdata.w_locals` dict.
         let w_locals_obj = frame_ref.getdictscope_w().unwrap_or(pyre_object::PY_NULL);
-        // pyframe.py:128 get_w_globals: `debugdata.w_globals` wins over
-        // `pycode.w_globals`.  Resolve the object FRESH from the raw
-        // (debugdata-first) `get_w_globals()` rather than the cached
-        // `get_w_globals_obj()`, whose `w_globals_obj` slot can lag a
-        // later `set_w_globals`/debugdata change while `PyFrame.w_globals`
-        // is still raw.
-        let w_globals = frame_ref.get_w_globals();
+        // pyframe.py:128 get_w_globals returns the globals dict object.  The
+        // canonical `w_globals_obj` is co-assigned with `debugdata.w_globals`
+        // at every frame constructor, so it never lags the raw storage.
+        let w_globals_obj = frame_ref.get_w_globals_obj();
         let pycode = frame_ref.pycode as pyre_object::PyObjectRef;
         let lineno = frame_ref.fget_f_lineno() as i64;
         let _ = crate::baseobjspace::setattr_str(
             stub,
             "f_globals",
-            if w_globals.is_null() {
+            if w_globals_obj.is_null() {
                 pyre_object::w_none()
             } else {
-                crate::baseobjspace::dict_storage_to_dict(w_globals as *const crate::DictStorage)
+                w_globals_obj
             },
         );
         let _ = crate::baseobjspace::setattr_str(

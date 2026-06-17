@@ -461,7 +461,6 @@ fn emit_call_assembler_callee_frame(
             };
             if ncells == 0 && !stores_global {
                 let pycode_const = ctx.const_ref(w_callee_code as i64);
-                let w_globals_const = ctx.const_ref(callee_globals as i64);
                 let w_globals_obj_const = ctx.const_ref(callee_globals_obj as i64);
                 let ec = this.ensure_execution_context(ctx);
                 let frame = crate::helpers::emit_new_pyframe_inline_self_recursive(
@@ -470,7 +469,6 @@ fn emit_call_assembler_callee_frame(
                     nlocals + ncells + max_stack,
                     nlocals + ncells,
                     pycode_const,
-                    w_globals_const,
                     w_globals_obj_const,
                     ec,
                 );

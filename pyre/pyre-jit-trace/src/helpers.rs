@@ -1006,7 +1006,6 @@ pub fn emit_new_pyframe_inline_self_recursive(
     array_size: usize,
     valuestackdepth: usize,
     pycode: OpRef,
-    w_globals: OpRef,
     w_globals_obj: OpRef,
     ec: OpRef,
 ) -> OpRef {

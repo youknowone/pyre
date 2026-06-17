@@ -7435,7 +7435,6 @@ fn try_walker_call_assembler_self_recursive(
     // Build the callee PyFrame inline (Branch A): a single positional
     // local, no cells, constant code / globals.
     let pycode_const = ctx.trace_ctx.const_ref(w_code as i64);
-    let w_globals_const = ctx.trace_ctx.const_ref(callee_globals as i64);
     let w_globals_obj_const = ctx.trace_ctx.const_ref(callee_globals_obj as i64);
     let callee_frame = crate::helpers::emit_new_pyframe_inline_self_recursive(
         ctx.trace_ctx,
@@ -7443,7 +7442,6 @@ fn try_walker_call_assembler_self_recursive(
         nlocals + max_stack,
         nlocals,
         pycode_const,
-        w_globals_const,
         w_globals_obj_const,
         ec,
     );
