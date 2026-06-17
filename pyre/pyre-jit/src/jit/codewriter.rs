@@ -8604,8 +8604,7 @@ impl CodeWriter {
                             let oparg = i.get(op_arg) as usize;
                             current_depth = current_depth.saturating_sub(1);
                             emit_vsd!(current_depth, py_pc);
-                            let iterable_value =
-                                pop_ref_or_fresh(&mut current_state, &mut graph);
+                            let iterable_value = pop_ref_or_fresh(&mut current_state, &mut graph);
                             // PEEK(oparg): after popping the iterable, PEEK(1) is
                             // the new TOS, so the list sits at `len - oparg`.
                             // Clone its FlowValue without popping — the residual

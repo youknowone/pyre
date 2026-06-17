@@ -207,7 +207,10 @@ pub fn list_extend_value(list: PyObjectRef, iterable: PyObjectRef) -> Result<(),
         // Generic iter-protocol fallback for dict/set/range/generator/etc.
         let iter = crate::baseobjspace::iter(iterable).map_err(|_| {
             let type_name = (*(*iterable).ob_type).name;
-            PyError::type_error(format!("Value after * must be an iterable, not {}", type_name))
+            PyError::type_error(format!(
+                "Value after * must be an iterable, not {}",
+                type_name
+            ))
         })?;
         loop {
             match crate::baseobjspace::next(iter) {
