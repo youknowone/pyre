@@ -8117,6 +8117,41 @@ impl MIFrame {
             return Ok(Some(pyre_interpreter::StepResult::Continue));
         }
 
+        // LOAD_FAST_LOAD_FAST / LOAD_FAST_BORROW_LOAD_FAST_BORROW walker
+        // activation via trait-path delegation.
+        //
+        // The load-side superinstruction siblings of StoreFastStoreFast: two
+        // packed var_num local indices the r0-only arm entry leaves unbound
+        // (ResidualCallArgUnbound), the same payload-seed gap as the single
+        // LoadFast hook above.  Resolve both indices + names from the code
+        // pool and delegate to `OpcodeStepExecutor::load_fast_pair_checked`,
+        // whose MIFrame override is two trace-aware `load_local_value` +
+        // `push_value` pairs — i.e. exactly two single-LoadFast pushes.  The
+        // borrow / non-borrow distinction collapses at the trace level (the
+        // single LoadFast / LoadFastBorrow hook above already routes both
+        // through `load_fast_checked`), so both superinstructions share the
+        // one pair recorder.  `push_value` advances vsd, so this bypasses
+        // `apply_walker_stack_effect` via the early return.
+        if let Instruction::LoadFastLoadFast { var_nums }
+        | Instruction::LoadFastBorrowLoadFastBorrow { var_nums } = instruction
+        {
+            use pyre_interpreter::OpcodeStepExecutor;
+            let idx1 = pyre_interpreter::var_nums_to_first_index(*var_nums, op_arg);
+            let idx2 = pyre_interpreter::var_nums_to_second_index(*var_nums, op_arg);
+            let name1 = if idx1 < pyre_interpreter::code_varnames_len(code) {
+                code.varnames[idx1].as_ref()
+            } else {
+                "<cell>"
+            };
+            let name2 = if idx2 < pyre_interpreter::code_varnames_len(code) {
+                code.varnames[idx2].as_ref()
+            } else {
+                "<cell>"
+            };
+            OpcodeStepExecutor::load_fast_pair_checked(self, idx1, name1, idx2, name2)?;
+            return Ok(Some(pyre_interpreter::StepResult::Continue));
+        }
+
         // STORE_FAST walker activation via trait-path delegation.
         //
         // Same oparg-payload shape as LoadFast (the var_num local index is
@@ -9515,6 +9550,15 @@ pub fn production_walker_handles(instruction: &Instruction) -> bool {
             // a register the r0-only arm entry leaves unbound.
             | Instruction::LoadFast { .. }
             | Instruction::LoadFastBorrow { .. }
+            // LoadFastLoadFast / LoadFastBorrowLoadFastBorrow handled by the
+            // dispatch_via_walker_for_opcode entry hook: resolves both packed
+            // var_num local indices + names and delegates to
+            // OpcodeStepExecutor::load_fast_pair_checked (two trace-aware
+            // load_local_value + push_value pairs).  The auto-gen arm reads
+            // the packed var_nums oparg payload from a register the r0-only
+            // arm entry leaves unbound — same gap as the single LoadFast.
+            | Instruction::LoadFastLoadFast { .. }
+            | Instruction::LoadFastBorrowLoadFastBorrow { .. }
             // StoreFast handled by the dispatch_via_walker_for_opcode entry
             // hook: delegates to OpcodeStepExecutor::store_fast (pop_value
             // advances vsd, setarrayitem_vable_r writes the local).
