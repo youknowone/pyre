@@ -6221,7 +6221,7 @@ pub fn builtin_open(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
     let reading = mode.contains('r') || !writing;
 
     let data: String = if reading && !mode.contains('w') && !mode.contains('x') {
-        #[cfg(not(feature = "host_env"))]
+        #[cfg(any(not(feature = "host_env"), target_arch = "wasm32"))]
         {
             // Sandbox-intentional: with the host_env feature off the
             // interpreter must not reach `std::fs` directly.  Callers in
@@ -6233,9 +6233,9 @@ pub fn builtin_open(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
                 "open() for reading requires host_env feature",
             ));
         }
-        #[cfg(feature = "host_env")]
+        #[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
         let read_result = rustpython_host_env::fs::read(&path);
-        #[cfg(feature = "host_env")]
+        #[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
         match read_result {
             Ok(bytes) => {
                 if binary {

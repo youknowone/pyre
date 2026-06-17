@@ -24,7 +24,7 @@ crate::py_module! {
                 );
             }
         };
-        #[cfg(feature = "host_env")]
+        #[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
         {
             use rustpython_host_env::errno::errors as host_errno;
             let entries: &[(&str, i32)] = &[
@@ -97,7 +97,7 @@ crate::py_module! {
                 }
             }
         }
-        #[cfg(not(feature = "host_env"))]
+        #[cfg(any(not(feature = "host_env"), target_arch = "wasm32"))]
         {
             // darwin/BSD fallback so pyre-wasm keeps the same numeric
             // surface as before host_env existed.

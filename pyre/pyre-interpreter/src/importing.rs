@@ -22,7 +22,9 @@ use pyre_object::*;
 /// stay uniform.
 #[cfg(feature = "host_env")]
 pub(crate) mod host {
-    pub use rustpython_host_env::{fs, os};
+    #[cfg(not(target_arch = "wasm32"))]
+    pub use rustpython_host_env::fs;
+    pub use rustpython_host_env::os;
 }
 #[cfg(not(feature = "host_env"))]
 pub(crate) mod host {
@@ -60,7 +62,9 @@ pub(crate) mod host {
         }
     }
 }
-use host::{fs as host_fs, os as host_os};
+#[cfg(not(target_arch = "wasm32"))]
+use host::fs as host_fs;
+use host::os as host_os;
 
 // ── sys.modules cache ────────────────────────────────────────────────
 // PyPy equivalent: space.sys.get('modules') — a dict mapping module names
@@ -144,6 +148,7 @@ pub fn install_builtin_modules() {
     // Core pyre modules backed by `interpleveldefs` tables.
     pyre_install_module!(math);
     pyre_install_module!(cmath);
+    #[cfg(not(target_arch = "wasm32"))]
     pyre_install_module!(time);
     pyre_install_module!(sys);
     pyre_install_module!(operator);
@@ -161,6 +166,7 @@ pub fn install_builtin_modules() {
     pyre_install_module!(itertools);
     pyre_install_module!(_contextvars);
     pyre_install_module!(_codecs);
+    #[cfg(not(target_arch = "wasm32"))]
     pyre_install_module!(posix);
     pyre_install_module!(errno);
     pyre_install_module!(_collections);
@@ -191,9 +197,12 @@ pub fn install_builtin_modules() {
     pyre_install_module!("__pypy__" => crate::module::__pypy__::init);
     pyre_install_module!("__pypy__.builders" => crate::module::__pypy__::builders::init);
 
+    #[cfg(not(target_arch = "wasm32"))]
     pyre_install_module!(_signal);
     pyre_install_module!(atexit);
+    #[cfg(not(target_arch = "wasm32"))]
     pyre_install_module!(pwd);
+    #[cfg(not(target_arch = "wasm32"))]
     pyre_install_module!(grp);
     #[cfg(unix)]
     pyre_install_module!(resource);
@@ -204,9 +213,12 @@ pub fn install_builtin_modules() {
     pyre_install_module!(select);
     pyre_install_module!(termios);
     pyre_install_module!(_socket);
+    #[cfg(not(target_arch = "wasm32"))]
     pyre_install_module!(mmap);
+    #[cfg(not(target_arch = "wasm32"))]
     pyre_install_module!(faulthandler);
     pyre_install_module!(_ctypes);
+    #[cfg(not(target_arch = "wasm32"))]
     pyre_install_module!(_posixshmem);
     pyre_install_module!(_multiprocessing);
     pyre_install_module!(_locale);
@@ -579,17 +591,17 @@ pub fn set_sys_modules_dict(dict: PyObjectRef) {
 #[derive(Debug)]
 enum FindInfo {
     /// A .py source file was found.
-    #[cfg(feature = "host_env")]
+    #[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
     SourceFile { pathname: PathBuf },
     /// A package directory with __init__.py was found.
-    #[cfg(feature = "host_env")]
+    #[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
     Package { dirpath: PathBuf },
     /// A builtin (Rust-implemented) module was found.
     /// PyPy equivalent: C_BUILTIN modtype in find_module()
     Builtin,
 }
 
-#[cfg(feature = "host_env")]
+#[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
 fn find_module(partname: &str) -> Option<FindInfo> {
     // Check builtin modules first (PyPy: space.builtin_modules check in find_module)
     let is_builtin = BUILTIN_MODULES.with(|m| m.borrow().contains_key(partname));
@@ -607,7 +619,7 @@ fn find_module(partname: &str) -> Option<FindInfo> {
     return find_in_sys_path(partname);
 }
 
-#[cfg(not(feature = "host_env"))]
+#[cfg(any(not(feature = "host_env"), target_arch = "wasm32"))]
 fn find_module(partname: &str) -> Option<FindInfo> {
     let is_builtin = BUILTIN_MODULES.with(|m| m.borrow().contains_key(partname));
     if is_builtin {
@@ -617,7 +629,7 @@ fn find_module(partname: &str) -> Option<FindInfo> {
 }
 
 /// Detect and add CPython stdlib to sys.path (once).
-#[cfg(feature = "host_env")]
+#[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
 fn ensure_stdlib_path() {
     thread_local! {
         static DONE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -633,7 +645,7 @@ fn ensure_stdlib_path() {
     });
 }
 
-#[cfg(feature = "host_env")]
+#[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
 fn find_in_sys_path(partname: &str) -> Option<FindInfo> {
     SYS_PATH.with(|p| {
         let path = p.borrow();
@@ -806,7 +818,7 @@ pub fn appleveldef_install(ns: &mut DictStorage, source: &str, filename: &str, n
 //
 // Parse + execute a .py source file, producing a module object.
 
-#[cfg(feature = "host_env")]
+#[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
 fn load_source_module(
     modulename: &str,
     pathname: &Path,
@@ -898,7 +910,7 @@ fn load_source_module(
 // ── load_package ─────────────────────────────────────────────────────
 // PyPy equivalent: load_module with PKG_DIRECTORY modtype
 
-#[cfg(feature = "host_env")]
+#[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
 fn load_package(
     modulename: &str,
     dirpath: &Path,
@@ -982,7 +994,7 @@ fn load_part(
     };
 
     let module = match info {
-        #[cfg(feature = "host_env")]
+        #[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
         FindInfo::SourceFile { pathname } => {
             match load_source_module(modulename, &pathname, execution_context) {
                 Ok(m) => m,
@@ -991,7 +1003,7 @@ fn load_part(
                 }
             }
         }
-        #[cfg(feature = "host_env")]
+        #[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
         FindInfo::Package { dirpath } => load_package(modulename, &dirpath, execution_context)?,
         FindInfo::Builtin => {
             // Same builtins-identity path as the full_is_builtin branch

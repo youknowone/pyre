@@ -1006,7 +1006,7 @@ fn read_source_line(filename: &str, lineno: i64) -> Option<String> {
     if lineno <= 0 || filename.is_empty() || filename.starts_with('<') {
         return None;
     }
-    #[cfg(feature = "host_env")]
+    #[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
     {
         let content = rustpython_host_env::fs::read_to_string(filename).ok()?;
         content
@@ -1014,7 +1014,7 @@ fn read_source_line(filename: &str, lineno: i64) -> Option<String> {
             .nth((lineno - 1) as usize)
             .map(|s| s.to_string())
     }
-    #[cfg(not(feature = "host_env"))]
+    #[cfg(any(not(feature = "host_env"), target_arch = "wasm32"))]
     {
         // Sandbox-intentional: PyPy's `error.py:150 linecache.getline`
         // also returns silently when the source can't be read; with

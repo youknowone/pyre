@@ -126,7 +126,7 @@ fn local_type() -> PyObjectRef {
 // host_env we always return 1 (single-threaded sentinel).
 #[crate::pyre_function]
 fn get_ident() -> i64 {
-    #[cfg(feature = "host_env")]
+    #[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
     {
         return rustpython_host_env::thread::current_thread_id() as i64;
     }

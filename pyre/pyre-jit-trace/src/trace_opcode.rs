@@ -62,9 +62,9 @@ pub(crate) extern "C" fn float_pow_jit(x: f64, y: f64) -> f64 {
             // state so the following GuardNoException sees it and fails,
             // propagating the raise into the meta-interpreter.
             let exc_obj = err.to_exc_object();
-            #[cfg(feature = "cranelift")]
+            #[cfg(all(feature = "cranelift", not(target_arch = "wasm32")))]
             majit_backend_cranelift::jit_exc_raise(exc_obj as i64);
-            #[cfg(feature = "dynasm")]
+            #[cfg(all(feature = "dynasm", not(target_arch = "wasm32")))]
             majit_backend_dynasm::jit_exc_raise(exc_obj as i64);
             let _ = exc_obj; // suppress unused warning when no backend
             // Return value is discarded by GuardNoException path; use NaN
@@ -84,9 +84,9 @@ use pyre_interpreter::eval::{get_current_exception, set_current_exception};
 /// `GuardException`, so the guard sees no pending exception and incorrectly
 /// resumes down the normal path.
 pub(crate) extern "C" fn raise_exception_jit(exc_obj: i64) {
-    #[cfg(feature = "cranelift")]
+    #[cfg(all(feature = "cranelift", not(target_arch = "wasm32")))]
     majit_backend_cranelift::jit_exc_raise(exc_obj);
-    #[cfg(feature = "dynasm")]
+    #[cfg(all(feature = "dynasm", not(target_arch = "wasm32")))]
     majit_backend_dynasm::jit_exc_raise(exc_obj);
     let _ = exc_obj;
 }

@@ -26,6 +26,20 @@ pub const CTIME: i64 = 0;
 // vfs.py:7
 static INO_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+// Error sentinels for VfsError.errno.  `libc` omits these symbols on
+// wasm32-unknown-unknown, so the standard POSIX numeric values are
+// hard-coded for that target.
+#[cfg(not(target_arch = "wasm32"))]
+use libc::{EACCES, EIO, ENOENT, ENOTDIR};
+#[cfg(target_arch = "wasm32")]
+const ENOTDIR: i32 = 20;
+#[cfg(target_arch = "wasm32")]
+const EACCES: i32 = 13;
+#[cfg(target_arch = "wasm32")]
+const ENOENT: i32 = 2;
+#[cfg(target_arch = "wasm32")]
+const EIO: i32 = 5;
+
 const S_IFDIR: Mode = 0o040000;
 const S_IFREG: Mode = 0o100000;
 const S_IFMT: Mode = 0o170000;
@@ -127,7 +141,7 @@ pub trait FSObject {
     // vfs.py:49
     fn keys(&self) -> VfsResult<Vec<String>> {
         Err(VfsError {
-            errno: libc::ENOTDIR,
+            errno: ENOTDIR,
             object: "self".to_owned(),
         })
     }
@@ -135,7 +149,7 @@ pub trait FSObject {
     // vfs.py:52
     fn open(&self) -> VfsResult<Box<dyn Read>> {
         Err(VfsError {
-            errno: libc::EACCES,
+            errno: EACCES,
             object: "self".to_owned(),
         })
     }
@@ -165,7 +179,7 @@ impl Dir {
     // vfs.py:65
     pub fn join(&self, name: &str) -> VfsResult<FsNode> {
         self.entries.get(name).cloned().ok_or_else(|| VfsError {
-            errno: libc::ENOENT,
+            errno: ENOENT,
             object: name.to_owned(),
         })
     }
@@ -242,13 +256,13 @@ impl RealDir {
             || std::path::Path::new(name).is_absolute()
         {
             return Err(VfsError {
-                errno: libc::ENOENT,
+                errno: ENOENT,
                 object: name.to_owned(),
             });
         }
         if name.starts_with('.') && !self.show_dotfiles {
             return Err(VfsError {
-                errno: libc::ENOENT,
+                errno: ENOENT,
                 object: name.to_owned(),
             });
         }
@@ -256,7 +270,7 @@ impl RealDir {
         for excl in &self.exclude {
             if lower_name.ends_with(excl) {
                 return Err(VfsError {
-                    errno: libc::ENOENT,
+                    errno: ENOENT,
                     object: name.to_owned(),
                 });
             }
@@ -281,7 +295,7 @@ impl RealDir {
             Ok(Rc::new(RealFile::new(path, 0)))
         } else {
             Err(VfsError {
-                errno: libc::EACCES,
+                errno: EACCES,
                 object: path.display().to_string(),
             })
         }
@@ -413,7 +427,7 @@ fn is_dir(mode: Mode) -> bool {
 // vfs.py:134
 fn io_error(err: io::Error, object: String) -> VfsError {
     VfsError {
-        errno: err.raw_os_error().unwrap_or(libc::EIO),
+        errno: err.raw_os_error().unwrap_or(EIO),
         object,
     }
 }
