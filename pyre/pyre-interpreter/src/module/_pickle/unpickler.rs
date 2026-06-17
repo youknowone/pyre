@@ -539,11 +539,13 @@ fn dispatch(slot: usize, opcode: u8) -> Result<(), PyError> {
             let w_kwargs = pop(slot)?;
             let w_args = pop(slot)?;
             let w_cls = pop(slot)?;
-            let kw_len = unsafe { pyre_object::dictmultiobject::w_dict_items(w_kwargs) }.len();
-            if kw_len > 0 {
-                return Err(PyError::not_implemented("_pickle: NEWOBJ_EX with kwargs"));
-            }
-            let w_obj = new_instance(w_cls, &tuple_items(w_args))?;
+            let kw_items = unsafe { pyre_object::dictmultiobject::w_dict_items(w_kwargs) };
+            let args = tuple_items(w_args);
+            let w_obj = if kw_items.is_empty() {
+                new_instance(w_cls, &args)?
+            } else {
+                new_instance_kw(w_cls, &args, &kw_items)?
+            };
             push(slot, w_obj);
         }
         x if x == op::BUILD => {
@@ -768,6 +770,38 @@ fn new_instance(w_cls: PyObjectRef, args: &[PyObjectRef]) -> Result<PyObjectRef,
     let mut call_args = vec![w_cls];
     call_args.extend_from_slice(args);
     call_fn(w_new, &call_args)
+}
+
+/// `cls.__new__(cls, *args, **kwargs)` — NEWOBJ_EX with the keyword
+/// arguments returned by `__getnewargs_ex__`. Keyword delivery to a
+/// user `__new__` needs the frame-based call path (`call_with_kwargs`);
+/// the flat-slice path binds every argument positionally.
+fn new_instance_kw(
+    w_cls: PyObjectRef,
+    args: &[PyObjectRef],
+    kw_items: &[(PyObjectRef, PyObjectRef)],
+) -> Result<PyObjectRef, PyError> {
+    let w_new = crate::baseobjspace::getattr_str(w_cls, "__new__")?;
+    let mut call_args = Vec::with_capacity(1 + args.len());
+    call_args.push(w_cls);
+    call_args.extend_from_slice(args);
+    let mut kwargs = Vec::with_capacity(kw_items.len());
+    for &(k, v) in kw_items {
+        if !unsafe { pyre_object::is_str(k) } {
+            return Err(unpickling_error("keyword arguments must be strings"));
+        }
+        let name = unsafe { pyre_object::strobject::w_str_get_wtf8(k) }.to_owned();
+        kwargs.push((name, v));
+    }
+    let ec = crate::call::getexecutioncontext();
+    if ec.is_null() {
+        return Err(unpickling_error("no execution context for NEWOBJ_EX"));
+    }
+    let frame = unsafe { (*ec).gettopframe() };
+    if frame.is_null() {
+        return Err(unpickling_error("no frame for NEWOBJ_EX with kwargs"));
+    }
+    crate::call::call_with_kwargs(unsafe { &mut *frame }, w_new, &call_args, &kwargs)
 }
 
 /// `load_build` — apply pickled state to a freshly created instance.

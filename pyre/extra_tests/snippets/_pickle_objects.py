@@ -109,4 +109,33 @@ assert loads(dumps(b"\x00\xff\x80", 2)) == b"\x00\xff\x80"
 for proto in range(2, 6):
     assert roundtrip(range(2, 10, 3), proto) == range(2, 10, 3)
 
+
+# __getnewargs_ex__ with keyword args forces NEWOBJ_EX (proto >= 4) carrying
+# a non-empty kwargs dict; the unpickler must call cls.__new__(cls, *a, **kw).
+# A class-level sink records what __new__ received (the __dict__ state then
+# overwrites the instance attrs, so the sink is the only witness of kwargs).
+class NewArgsEx:
+    seen = []
+
+    def __new__(cls, *args, **kwargs):
+        cls.seen.append((args, dict(kwargs)))
+        return super().__new__(cls)
+
+    def __init__(self, a=0, b=0):
+        self.a = a
+        self.b = b
+
+    def __getnewargs_ex__(self):
+        return ((self.a,), {"b": self.b})
+
+    def __eq__(self, o):
+        return type(self) is type(o) and self.a == o.a and self.b == o.b
+
+
+for proto in range(4, 6):
+    NewArgsEx.seen.clear()
+    roundtrip(NewArgsEx(1, 2), proto)
+    # The load-time __new__ got the keyword arg from __getnewargs_ex__.
+    assert ((1,), {"b": 2}) in NewArgsEx.seen, (proto, NewArgsEx.seen)
+
 print("_pickle_objects OK")
