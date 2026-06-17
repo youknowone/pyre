@@ -1242,7 +1242,12 @@ unsafe fn w_module_dict_setitem_str_internal(
         let storage = &mut *(*(obj as *mut W_ModuleDictObject)).dstorage;
         strategy.setitem_str(storage, key, w_value);
     }
-    maybe_sync_dict_storage_store(proxy, crate::w_str_new(key), w_value);
+    // Only wrap the key into a W_StrObject when there is a proxy to forward
+    // to.  The back-mirror from `DictStorage::insert` runs with a null proxy
+    // (`fire_proxy=false`), so eagerly allocating the key here would discard it.
+    if !proxy.is_null() {
+        maybe_sync_dict_storage_store(proxy, crate::w_str_new(key), w_value);
+    }
 }
 
 /// `celldict.py:143-145 getitem_str`.
