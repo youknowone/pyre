@@ -88,6 +88,14 @@ pub struct BridgeData {
     /// invalidation flag (AtomicBool). Holding an Arc clone keeps the flag
     /// alive as long as the bridge exists.
     pub invalidated_arc: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// Per-loop `GcTable` whose base the bridge's machine code (which lives
+    /// in the global `JITModule`, outliving any single token) bakes in to
+    /// load reference constants. The bridge is attached to fail descrs in
+    /// several tokens; each holds an Arc clone so the table — and the slots
+    /// the baked base points at — stays alive and GC-walked as long as any
+    /// of them can dispatch to the bridge, not only while `original_token`
+    /// lives. `None` when the bridge has no reference constants.
+    pub gc_table: Option<Arc<majit_gc::GcTable>>,
 }
 
 unsafe impl Send for BridgeData {}

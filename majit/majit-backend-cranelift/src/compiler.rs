@@ -7547,6 +7547,7 @@ impl CraneliftBackend {
                                             ),
                                             loop_reentry: b.loop_reentry,
                                             invalidated_arc: b.invalidated_arc.clone(),
+                                            gc_table: b.gc_table.clone(),
                                         },
                                     );
                                 }
@@ -14969,9 +14970,12 @@ impl majit_backend::Backend for CraneliftBackend {
         // are scoped to the original loop's CLT, so the tracer batch
         // lands on `original_token`'s `asmmemmgr_gcreftracers`.
         self.register_fail_descrs(original_token, &compiled.fail_descrs);
-        // The bridge's `CompiledLoop` is consumed into `BridgeData` below,
-        // so its `gc_table` would drop with it; pin the table on the
-        // original loop's CLT (same scope as the bridge's fail descrs).
+        // Pin the bridge's `gc_table` on the original loop's CLT (same scope
+        // as the bridge's fail descrs, `compile.py:183-186`). The bridge code
+        // lives in the global `JITModule` and is also attached to fail descrs
+        // in other tokens, so each `BridgeData` below additionally holds an
+        // Arc clone — the table outlives every token that can dispatch to the
+        // bridge, not only `original_token`.
         if let Some(table) = compiled.gc_table.clone() {
             self.register_gc_table(original_token, table);
         }
@@ -15046,6 +15050,7 @@ impl majit_backend::Backend for CraneliftBackend {
                     max_output_slots: compiled.max_output_slots,
 
                     invalidated_arc: Some(invalidated_arc),
+                    gc_table: compiled.gc_table.clone(),
                 },
             );
             // Cranelift can't patch machine code like RPython's x86 backend.
@@ -15089,6 +15094,7 @@ impl majit_backend::Backend for CraneliftBackend {
                                         ),
                                         loop_reentry: b.loop_reentry,
                                         invalidated_arc: b.invalidated_arc.clone(),
+                                        gc_table: b.gc_table.clone(),
                                     },
                                 );
                             }
@@ -15227,6 +15233,7 @@ impl majit_backend::Backend for CraneliftBackend {
                             ),
                             loop_reentry: b.loop_reentry,
                             invalidated_arc: b.invalidated_arc.clone(),
+                            gc_table: b.gc_table.clone(),
                         },
                     );
                 }
