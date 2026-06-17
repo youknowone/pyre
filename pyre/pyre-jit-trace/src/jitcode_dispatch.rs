@@ -5164,13 +5164,49 @@ fn collect_outer_active_boxes(
                     guard_banks.ref_, banks.ref_,
                 );
             }
-            resume_only_stack
+            let mut subst: std::collections::HashMap<u32, OpRef> = resume_only_stack
                 .into_iter()
                 .zip(guard_only)
                 .map(|((_, resume_color), guard_color)| {
                     (resume_color, regs_r[guard_color as usize])
                 })
-                .collect()
+                .collect();
+            // Live-across kept stack slot: a Ref color live at BOTH the
+            // guard and the resume point (same color) names an operand-
+            // stack slot the not-taken arm preserves.  The walker wrote
+            // its value into the color-indexed `registers_r` bank, but the
+            // `virtualizable_boxes` shadow the owns_vable read sources from
+            // is never updated on the walker path (only the retired trait
+            // `write_stack_slot` writes it), so the shadow returns a stale
+            // trace-seed box.  Supply the walker bank value directly.  Only
+            // genuinely live-across colors qualify (a guard-pc-only scratch
+            // reusing the color is excluded by the `guard_set` membership
+            // test), so a speculatively const-folded kept value absent from
+            // the guard register state still falls through unchanged.
+            for &c in &banks.ref_ {
+                if !guard_set.contains(&c) || subst.contains_key(&c) {
+                    continue;
+                }
+                let Some(s) = crate::state::semantic_ref_slot_for_reg_color(
+                    nlocals,
+                    valid_stack_only,
+                    &local_color_map,
+                    &stack_color_map,
+                    &live_locals,
+                    c as usize,
+                ) else {
+                    continue;
+                };
+                if s < nlocals {
+                    continue;
+                }
+                if let Some(v) = regs_r.get(c as usize).copied() {
+                    if v != OpRef::NONE {
+                        subst.insert(c, v);
+                    }
+                }
+            }
+            subst
         }
         _ => std::collections::HashMap::new(),
     };
