@@ -5380,17 +5380,48 @@ impl<'a> Lowering<'a> {
         ) {
             return Ok(false);
         }
-        // Destination must be a word-sized integer carrier.
-        let dest_word = matches!(self.tyref_literal_int_atom(dest_ty), Some("I64" | "Isize"))
-            || matches!(self.tyref_literal_uint_atom(dest_ty), Some("U64" | "Usize"));
-        if !dest_word {
+        // Destination must be a word-sized integer carrier.  A signed
+        // word destination needs the same annotation re-type the cast
+        // path applies (the `Rvalue::Cast` unsigned→signed arm): aliasing
+        // a `uN` source straight into an `iN` carrier preserves the source
+        // `r_uint` annotation and trips the SomeInteger signedness
+        // `UnionError` (binaryop.py:178-202) when the value later meets a
+        // signed operand.  Route signed destinations through
+        // `rarithmetic.intmask` (identity on the i64 carrier, re-types
+        // Signed); alias unsigned destinations directly, as upstream
+        // `widen` leaves no op.
+        let dest_signed_word =
+            matches!(self.tyref_literal_int_atom(dest_ty), Some("I64" | "Isize"));
+        let dest_unsigned_word =
+            matches!(self.tyref_literal_uint_atom(dest_ty), Some("U64" | "Usize"));
+        if !dest_signed_word && !dest_unsigned_word {
             return Ok(false);
         }
-        // Identity widen: bind the destination directly to the operand —
-        // no op materialized, exactly as upstream `widen` leaves none.
         let arg = arg.clone();
-        self.local_var[dest_local] = Some(arg);
         let bb_id = self.block_id[mir_bb];
+        if dest_signed_word {
+            let res = self
+                .graph
+                .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                result: Some(res.clone()),
+                kind: OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: ["rpython", "rlib", "rarithmetic", "intmask"]
+                            .into_iter()
+                            .map(str::to_string)
+                            .collect(),
+                    },
+                    args: vec![arg],
+                    result_ty: ValueType::Int,
+                },
+            });
+            self.local_var[dest_local] = Some(res);
+        } else {
+            // Identity widen: bind the destination directly to the operand —
+            // no op materialized, exactly as upstream `widen` leaves none.
+            self.local_var[dest_local] = Some(arg);
+        }
         let target_bb = self.block_id[target];
         let link_args = self.edge_args(mir_bb, target)?;
         self.graph.set_goto(bb_id, target_bb, link_args);
@@ -8563,6 +8594,7 @@ fn decode_packed_format_pieces(bytes: &[u8]) -> Option<(Vec<String>, usize)> {
     let mut current = String::new();
     let mut placeholders = 0usize;
     let mut i = 0;
+    let mut terminated = false;
     while i < bytes.len() {
         let b = bytes[i];
         if b == 0x00 {
@@ -8570,6 +8602,7 @@ fn decode_packed_format_pieces(bytes: &[u8]) -> Option<(Vec<String>, usize)> {
             if i + 1 != bytes.len() {
                 return None;
             }
+            terminated = true;
             break;
         } else if b == 0xC0 {
             // plain sequential placeholder
@@ -8587,6 +8620,12 @@ fn decode_packed_format_pieces(bytes: &[u8]) -> Option<(Vec<String>, usize)> {
             // any other control byte = format spec / positional arg: bail
             return None;
         }
+    }
+    // The grammar requires the `0x00` terminator at a segment boundary;
+    // running out of bytes without it is a truncated or wrong array, not
+    // a valid template — bail rather than accept it once wired.
+    if !terminated {
+        return None;
     }
     pieces.push(current);
     Some((pieces, placeholders))
@@ -9038,6 +9077,11 @@ mod tests {
 
         // A 0 byte that is not the final byte bails (terminator is last).
         assert_eq!(decode_packed_format_pieces(&[0, 1, 65, 0]), None);
+
+        // A buffer that runs out without the 0x00 terminator is truncated
+        // or wrong — bail rather than accept a malformed template.
+        assert_eq!(decode_packed_format_pieces(&[2, 104, 105]), None);
+        assert_eq!(decode_packed_format_pieces(&[2, 104, 105, 192]), None);
 
         // Literal-only template (no placeholders) → single piece.
         let (pieces, n) = decode_packed_format_pieces(&[2, 104, 105, 0]).unwrap();

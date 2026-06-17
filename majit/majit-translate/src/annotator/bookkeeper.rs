@@ -583,6 +583,21 @@ impl Bookkeeper {
             .unwrap_or_default()
     }
 
+    /// Canonical dotted qualname for an enum variant subclass.  The
+    /// prologue pre-mint ([`Self::pre_register_unit_enum_variant_classes`])
+    /// and the discriminant-narrowing resolver
+    /// ([`Self::getuniqueclassdef_for_enum_variant`]) MUST intern each
+    /// variant under one spelling: a `::`-vs-`.` split mints two distinct
+    /// `ClassDef`s for the same logical variant, and the single
+    /// `assign_inheritance_ids` pass numbers only the pre-minted (dotted)
+    /// one — the other escapes numbering, so a narrowed
+    /// `SomeInstance(variant)` walls as `ClassesPBCRepr`-Void at dispatch.
+    /// Mirrors the `flowspace_adapter` `SyntheticTransparentCtor` arm
+    /// spelling (`{dotted_owner}.{variant}`).
+    fn enum_variant_class_qualname(canon_root: &str, variant_name: &str) -> String {
+        format!("{}.{variant_name}", canon_root.replace("::", "."))
+    }
+
     /// TODO: no upstream equivalent.  Pre-mint the variant subclasses of
     /// every unit-only enum so the session-prologue
     /// [`crate::translator::rtyper::normalizecalls::assign_inheritance_ids`]
@@ -645,13 +660,12 @@ impl Bookkeeper {
 
         for (root, variant_names) in pairs {
             let leaf = root.rsplit("::").next().unwrap_or(&root);
-            let dotted_owner = root.replace("::", ".");
             let base = self.intern_class_by_qualname(leaf);
             // Ensure the base classdef exists before a variant references
             // it through `getmro`; idempotent with the struct-root loop.
             let _ = self.getuniqueclassdef(&base);
             for variant in variant_names {
-                let qualname = format!("{dotted_owner}.{variant}");
+                let qualname = Self::enum_variant_class_qualname(&root, &variant);
                 let variant_host =
                     self.intern_class_by_qualname_with_bases(&qualname, vec![base.clone()]);
                 let _ = self.getuniqueclassdef(&variant_host);
@@ -1722,9 +1736,11 @@ impl Bookkeeper {
     /// `pairtype(SomeInstance, SomeInstance).improve` (binaryop.py:685)
     /// needs to narrow a `SomeInstance(base)` to `SomeInstance(variant)`.
     /// Identity is the canonical struct-root cache keyed by
-    /// `canonical_struct_name`; both `enum_root` and the `enum_root::variant`
-    /// path normalise to one stable `HostObject` apiece, so repeated
-    /// calls return the same `Rc`.
+    /// `canonical_struct_name`; the base `enum_root` and the dotted
+    /// `enum_root.variant` path ([`Self::enum_variant_class_qualname`])
+    /// each normalise to one stable `HostObject`, so repeated calls
+    /// return the same `Rc` — and the variant `Rc` is the very one the
+    /// prologue pre-mint numbered.
     pub fn getuniqueclassdef_for_enum_variant(
         self: &Rc<Self>,
         enum_root: &str,
@@ -3746,6 +3762,21 @@ mod tests {
             .getuniqueclassdef_for_enum_variant("Color", "Rgb")
             .expect("variant re-lookup");
         assert!(Rc::ptr_eq(&variant, &variant2), "variant identity stable");
+
+        // The narrowing resolver, the prologue pre-mint, and the ctor arm
+        // must all intern ONE variant classdef.  A `::`-spelled variant
+        // would mint a second, distinct classdef that the single
+        // `assign_inheritance_ids` pass never reaches; assert the resolver
+        // returns the dotted-spelled (pre-mint / ctor) classdef.
+        let premint_base = bk.intern_class_by_qualname("Color");
+        let premint_host = bk.intern_class_by_qualname_with_bases("Color.Rgb", vec![premint_base]);
+        let premint = bk
+            .getuniqueclassdef(&premint_host)
+            .expect("pre-mint variant classdef");
+        assert!(
+            Rc::ptr_eq(&variant, &premint),
+            "narrowing variant must be the dotted-spelled pre-mint/ctor classdef"
+        );
 
         // The payoff: improve() narrows SomeInstance(base) to
         // SomeInstance(variant) given the variant as the refinement —
