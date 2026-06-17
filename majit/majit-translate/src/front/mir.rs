@@ -4302,13 +4302,19 @@ impl<'a> Lowering<'a> {
     /// Returns `None` (caller keeps the blanket-into path) when the
     /// obligation is unresolved (`kind` is a clause/builtin rather
     /// than `TraitImpl`) or any table lookup misses.
-    /// `<*const T>::cast_mut` / `<*mut T>::cast_const` / `cast` — pointer
-    /// representation casts that change only const/mut or the pointee
-    /// type.  The JIT does not model either (`Ref` / `RawPtr` lower to a
+    /// `<*const T>::cast_mut` / `<*mut T>::cast_const` — pointer casts that
+    /// change only const/mut, never the pointee type.  The JIT does not
+    /// model the mut/const distinction (`Ref` / `RawPtr` lower to a
     /// same-Variable alias, mir.rs:50), so a `p.cast_mut()` callsite binds
     /// its destination straight to the pointer argument instead of
     /// emitting a call to core's raw-pointer method (which has no graph
     /// lowering and is not a registered callee).
+    ///
+    /// The pointee-changing `<ptr>::cast::<U>()` is NOT matched here: it
+    /// routes to [`is_ptr_identity_cast`], which narrows a
+    /// `cast::<RegisteredStruct>()` to `SomeInstance(root)` (the same
+    /// `cast_pointer` shape as `obj as *const W_Foo`) instead of leaving
+    /// the destination classdef-less and blocking the downstream getattr.
     fn is_noop_ptr_cast(&self, reg: &RegularCall) -> bool {
         let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
             return false;
@@ -4316,10 +4322,7 @@ impl<'a> Lowering<'a> {
         self.llbc.fn_by_id(*id).is_some_and(|fd| {
             matches!(
                 fd.item_meta.name_path().as_str(),
-                "core::ptr::const_ptr::<Impl>::cast_mut"
-                    | "core::ptr::mut_ptr::<Impl>::cast_const"
-                    | "core::ptr::const_ptr::<Impl>::cast"
-                    | "core::ptr::mut_ptr::<Impl>::cast"
+                "core::ptr::const_ptr::<Impl>::cast_mut" | "core::ptr::mut_ptr::<Impl>::cast_const"
             )
         })
     }

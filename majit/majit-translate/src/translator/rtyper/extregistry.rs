@@ -340,18 +340,17 @@ impl ExtRegistryEntry {
                 ));
                 Ok(SomeValue::Builtin(result))
             }
-            // The `we_are_jitted` annotation is served by the
+            // RPython's `we_are_jitted` ExtRegistryEntry annotates the
+            // call `SomeInteger(nonneg=True)` (rlib/jit.py:399); pyre's
+            // `we_are_jitted() -> bool` makes the faithful annotation
+            // `SomeBool` — the same one the
             // `majit_metainterp.jit.we_are_jitted` `BUILTIN_ANALYZERS`
-            // entry, which `immutablevalue_hostobject` returns before
-            // the `extregistry.is_registered` fall-through
-            // (bookkeeper.py:309-314). Reaching this arm means that
-            // early-return was bypassed — fail closed so a wrong
-            // annotation can never be served silently.
-            ExtRegistryEntry::WeAreJitted => Err(AnnotatorError::new(
-                "ExtRegistryEntry::WeAreJitted.compute_annotation: we_are_jitted is annotated via \
-                 BUILTIN_ANALYZERS (majit_metainterp_bool_flag), not extregistry; this entry is \
-                 rtyper-only (specialize_call)",
-            )),
+            // entry (`majit_metainterp_bool_flag`) serves on the normal
+            // `immutablevalue_hostobject` path, which returns before the
+            // `extregistry.is_registered` fall-through
+            // (bookkeeper.py:309-314).  Returning it here keeps the
+            // entry a faithful port for any path that consults it.
+            ExtRegistryEntry::WeAreJitted => Ok(SomeValue::Bool(Default::default())),
         }
     }
 
@@ -862,8 +861,10 @@ mod tests {
     /// rlib/jit.py:396 `class Entry(ExtRegistryEntry): _about_ =
     /// we_are_jitted` — the `we_are_jitted` host callable surfaces the
     /// `WeAreJitted` entry, whose `specialize_call` resolves the rtyper
-    /// path. The annotation is served by `BUILTIN_ANALYZERS`, so the
-    /// entry's `compute_annotation` fails closed.
+    /// path. `compute_annotation` returns `SomeBool` — the faithful
+    /// port of RPython's `SomeInteger(nonneg=True)` (rlib/jit.py:399)
+    /// for pyre's bool-typed `we_are_jitted`, the same annotation the
+    /// `BUILTIN_ANALYZERS` entry serves.
     #[test]
     fn we_are_jitted_resolves_specialize_call() {
         let host = HostObject::new_builtin_callable("majit_metainterp.jit.we_are_jitted");
@@ -872,7 +873,7 @@ mod tests {
         let entry = lookup(&cv).expect("we_are_jitted must surface an entry");
         assert!(matches!(entry, ExtRegistryEntry::WeAreJitted));
         assert!(entry.specialize_call().is_ok());
-        assert!(entry.compute_annotation().is_err());
+        assert!(matches!(entry.compute_annotation(), Ok(SomeValue::Bool(_))));
     }
 
     /// Type-level lookup returns None for unregistered host classes.

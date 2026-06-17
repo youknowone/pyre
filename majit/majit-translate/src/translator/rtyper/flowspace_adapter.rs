@@ -659,6 +659,21 @@ pub(crate) fn op_canraise(kind: &OpKind) -> bool {
         // and emits no op — a Constant raises nothing.  Matched before
         // the general `Call` arm, same as the unit-variant elision.
         kind if is_str_const_define(kind) => false,
+        // The `hint_promote` / `hint_promote_or_string` markers lower to
+        // a non-raising `same_as(arg)` (`rtyper.py:478-481` internal
+        // renaming) in `translate_op` — they emit no raising op.  Matched
+        // before the general `Call` arm, same as the elisions above.
+        OpKind::Call {
+            target: crate::model::CallTarget::FunctionPath { segments },
+            ..
+        } if segments.len() == 1
+            && matches!(
+                segments[0].as_str(),
+                "hint_promote" | "hint_promote_or_string"
+            ) =>
+        {
+            false
+        }
         // simple_call -> `CallOp.canraise` is `[Exception]` for a
         // non-builtin callable (operation.py:648-661).  Constant builtin
         // callables (int / float / chr / unicode) carry the narrower

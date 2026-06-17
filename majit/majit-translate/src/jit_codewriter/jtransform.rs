@@ -2483,16 +2483,28 @@ impl<'a> Transformer<'a> {
         {
             return RewriteResult::Identity(args[0].clone());
         }
-        // `rewrite_op_int_is_true` fold of `_we_are_jitted`
-        // (jtransform.py:1636-1639): inside jitcode, `we_are_jitted()`
-        // is `true` — the code emitted here runs during tracing and
-        // blackholing (rlib/jit.py:355). The rtyper already typed the
-        // call (`rbuiltin::rtype_we_are_jitted`); fold it to a
-        // `ConstBool(true)` so the tracer sees a green branch condition
-        // instead of recording a residual call + guard on the runtime
-        // JIT-mode flag in the hot method-cache path. The frontend
-        // lowers `majit_metainterp::jit::we_are_jitted()` to a
-        // 3-segment `FunctionPath` (mir.rs splits the LLBC name_path).
+        // Jitcode-side fold of `we_are_jitted()` -> `true`: inside the
+        // tracer / blackhole interpreter `we_are_jitted()` is always
+        // true (rlib/jit.py:355) — the dual of `constfold::
+        // replace_we_are_jitted` folding the genc side to `false`.
+        //
+        // RPython folds this at the truth test: the rtyper lowers the
+        // call to the `_we_are_jitted` symbolic constant
+        // (`inputconst(Signed, _we_are_jitted)`) and
+        // `rewrite_op_int_is_true` folds `int_is_true(_we_are_jitted)`
+        // -> `Constant(True)` (jtransform.py:1633-1639).  That structure
+        // does not reproduce on pyre's model graph: the rtyper's SpecTag
+        // (`rbuiltin::rtype_we_are_jitted`) lives on the ephemeral
+        // flowspace graph (discarded after publishing types), the model
+        // `OpKind` has no SpecTag-carrying const variant, and pyre's
+        // `we_are_jitted() -> bool` feeds `exitswitch` directly with no
+        // `int_is_true` op to fold.  So the call itself — keyed by the
+        // `majit_metainterp::jit::we_are_jitted` `FunctionPath` (mir.rs
+        // splits the LLBC name_path) — is the only fold point in the
+        // model graph; folding it to `ConstBool(true)` yields the same
+        // green `exitswitch` condition RPython's folded `int_is_true`
+        // produces, and avoids a residual call + guard on the runtime
+        // JIT-mode flag in the hot method-cache path.
         if let CallTarget::FunctionPath { segments } = target
             && segments.len() == 3
             && segments[0] == "majit_metainterp"
