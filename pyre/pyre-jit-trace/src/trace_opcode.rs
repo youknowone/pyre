@@ -8152,6 +8152,24 @@ impl MIFrame {
             return Ok(Some(pyre_interpreter::StepResult::Continue));
         }
 
+        // TO_BOOL walker activation via trait-path delegation.
+        //
+        // The compiler only emits TO_BOOL ahead of a truthiness consumer
+        // (POP_JUMP_IF_TRUE/FALSE or UNARY_NOT), each of which re-evaluates
+        // the operand's truthiness through its own guard.  The MIFrame
+        // `to_bool` override is therefore a stack-neutral no-op (the explicit
+        // bool materialisation is redundant under tracing), matching exactly
+        // what the trait leg's `execute_to_bool` already records.  An entry
+        // hook delegating to the same no-op preserves that — routing through
+        // the auto-gen arm walk instead would emit the arm's bool-conversion
+        // residual and diverge.  Early return bypasses
+        // `apply_walker_stack_effect` (net-zero effect, nothing to record).
+        if let Instruction::ToBool = instruction {
+            use pyre_interpreter::OpcodeStepExecutor;
+            OpcodeStepExecutor::to_bool(self)?;
+            return Ok(Some(pyre_interpreter::StepResult::Continue));
+        }
+
         // STORE_FAST walker activation via trait-path delegation.
         //
         // Same oparg-payload shape as LoadFast (the var_num local index is
@@ -9578,6 +9596,13 @@ pub fn production_walker_handles(instruction: &Instruction) -> bool {
             | Instruction::EndFor
             | Instruction::UnaryNot
             | Instruction::UnaryInvert
+            // ToBool handled by the dispatch_via_walker_for_opcode entry hook:
+            // delegates to the stack-neutral no-op `to_bool` (truthiness is
+            // re-evaluated by the following branch / UnaryNot guard, so the
+            // bool materialisation is redundant under tracing).  Early return,
+            // so no apply_walker_stack_effect arm — unlike UnaryNot/UnaryInvert
+            // above, which arm-walk.
+            | Instruction::ToBool
             | Instruction::GetIter
             | Instruction::MatchMapping
             | Instruction::MatchSequence
