@@ -66,6 +66,8 @@ pub(crate) extern "C" fn float_pow_jit(x: f64, y: f64) -> f64 {
             majit_backend_cranelift::jit_exc_raise(exc_obj as i64);
             #[cfg(all(feature = "dynasm", not(target_arch = "wasm32")))]
             majit_backend_dynasm::jit_exc_raise(exc_obj as i64);
+            #[cfg(target_arch = "wasm32")]
+            majit_backend_wasm::jit_exc_raise(exc_obj as i64);
             let _ = exc_obj; // suppress unused warning when no backend
             // Return value is discarded by GuardNoException path; use NaN
             // as a safe sentinel in case the guard is elided.
@@ -88,6 +90,8 @@ pub(crate) extern "C" fn raise_exception_jit(exc_obj: i64) {
     majit_backend_cranelift::jit_exc_raise(exc_obj);
     #[cfg(all(feature = "dynasm", not(target_arch = "wasm32")))]
     majit_backend_dynasm::jit_exc_raise(exc_obj);
+    #[cfg(target_arch = "wasm32")]
+    majit_backend_wasm::jit_exc_raise(exc_obj);
     let _ = exc_obj;
 }
 

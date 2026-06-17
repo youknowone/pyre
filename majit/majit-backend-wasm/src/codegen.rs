@@ -375,15 +375,52 @@ fn build_function(
                 }
                 guard_idx += 1;
             }
-            // Guards that always pass in wasm MVP
+            // Guards that always pass in wasm MVP (no force-token /
+            // invalidation tracking yet).
             OpCode::GuardNotInvalidated
             | OpCode::GuardNotForced
-            | OpCode::GuardNotForced2
-            | OpCode::GuardNoException
-            | OpCode::GuardException => {
-                // No-op: these guards are about runtime state that
-                // the wasm backend doesn't track yet.
+            | OpCode::GuardNotForced2 => {
                 guard_idx += 1;
+            }
+            OpCode::GuardNoException => {
+                // x86/assembler.py:1797-1801 generate_guard_no_exception:
+                // fail the guard when a pending exception is present. The
+                // exception slot lives in the host's shared linear memory;
+                // load it by absolute address (the trace imports env.memory).
+                sink.i32_const(crate::jit_exc_value_addr() as i32);
+                sink.i64_load(mem64(0));
+                sink.i64_const(0);
+                sink.i64_ne();
+                emit_guard_if_exit(&mut sink, constants, guard_idx, op, has_loop);
+                guard_idx += 1;
+            }
+            OpCode::GuardException => {
+                // x86/assembler.py:1808-1815 genop_guard_guard_exception:
+                //   load pos_exception; CMP expected; guard on equal; then
+                //   _store_and_reset_exception: resloc = pos_exc_value;
+                //   pos_exception = 0; pos_exc_value = 0.
+                let exc_type_addr = crate::jit_exc_type_addr() as i32;
+                let exc_value_addr = crate::jit_exc_value_addr() as i32;
+                sink.i32_const(exc_type_addr);
+                sink.i64_load(mem64(0));
+                emit_resolve(&mut sink, constants, op.arg(0).to_opref());
+                sink.i64_ne();
+                emit_guard_if_exit(&mut sink, constants, guard_idx, op, has_loop);
+                guard_idx += 1;
+                // Success path: capture the caught exception into the result
+                // var, then clear both slots.
+                let vi = op.pos.get().raw();
+                if !OpRef::raw_is_constant(vi) {
+                    sink.i32_const(exc_value_addr);
+                    sink.i64_load(mem64(0));
+                    sink.local_set(1 + vi);
+                }
+                sink.i32_const(exc_type_addr);
+                sink.i64_const(0);
+                sink.i64_store(mem64(0));
+                sink.i32_const(exc_value_addr);
+                sink.i64_const(0);
+                sink.i64_store(mem64(0));
             }
 
             // ── Integer arithmetic ──

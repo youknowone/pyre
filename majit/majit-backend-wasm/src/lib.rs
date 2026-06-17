@@ -16,11 +16,55 @@ mod glue;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
 
 use failguard::{CompiledWasmLoop, WasmFailDescr, WasmFrameData};
 use majit_backend::{AsmInfo, BackendError, DeadFrame, JitCellToken};
 use majit_gc::GcAllocator;
 use majit_ir::{FailDescr, GcRef, InputArg, Op, OpRc, Value};
+
+/// JIT exception state, mirroring the native backends' `JIT_EXC_VALUE` /
+/// `JIT_EXC_TYPE` globals. A can-raise helper publishes the pending exception
+/// here via `jit_exc_raise`; the compiled trace's `GuardNoException` /
+/// `GuardException` read these slots by absolute address through the shared
+/// linear memory (host and trace import the same `env.memory`) and fail the
+/// guard accordingly. Single-slot per process, matching the single-threaded
+/// dynasm/cranelift backends.
+static JIT_EXC_VALUE: AtomicI64 = AtomicI64::new(0);
+static JIT_EXC_TYPE: AtomicI64 = AtomicI64::new(0);
+
+/// llmodel.py:194-199 _store_exception parity: set JIT exception state.
+/// `value` is a valid OBJECTPTR (or 0); the exception class is read from
+/// `value.typeptr` (offset 0).
+pub fn jit_exc_raise(value: i64) {
+    let exc_type = if value == 0 {
+        0
+    } else {
+        unsafe { *(value as *const i64) }
+    };
+    JIT_EXC_VALUE.store(value, Ordering::Relaxed);
+    JIT_EXC_TYPE.store(exc_type, Ordering::Relaxed);
+}
+
+/// grab_exc_value parity: read the pending exception value and clear both
+/// slots. Called host-side after a trace returns through a guard exit.
+pub fn jit_exc_take() -> i64 {
+    let value = JIT_EXC_VALUE.swap(0, Ordering::Relaxed);
+    JIT_EXC_TYPE.store(0, Ordering::Relaxed);
+    value
+}
+
+/// Address of `JIT_EXC_VALUE`, embedded as an immediate in JIT-emitted wasm
+/// so the trace can load/store it over the shared linear memory
+/// (`_store_and_reset_exception` parity).
+pub fn jit_exc_value_addr() -> usize {
+    &JIT_EXC_VALUE as *const _ as usize
+}
+
+/// Address of `JIT_EXC_TYPE`, embedded as an immediate in JIT-emitted wasm.
+pub fn jit_exc_type_addr() -> usize {
+    &JIT_EXC_TYPE as *const _ as usize
+}
 
 thread_local! {
     /// llmodel.py self.gc_ll_descr — owned by the active wasm
@@ -487,6 +531,13 @@ impl majit_backend::Backend for WasmBackend {
         {
             glue::execute(compiled.func_handle, _frame_ptr);
 
+            // A GuardNoException / GuardException exit leaves the pending
+            // exception in the global slot; capture and clear it here so
+            // grab_exc_value surfaces it to the meta-interpreter. Mirrors
+            // cranelift `emit_guard_exit`'s `must_save_exception` move into
+            // `jf_guard_exc`, done host-side after the trace returns.
+            let exc_value = jit_exc_take();
+
             // Read fail_index from frame[0]
             let fail_index = frame[0] as u32;
             let fail_descr = compiled
@@ -502,6 +553,7 @@ impl majit_backend::Backend for WasmBackend {
                 data: Box::new(WasmFrameData {
                     raw_values,
                     fail_descr: fail_descr.clone(),
+                    exc_value,
                 }),
             }
         }
@@ -561,6 +613,16 @@ impl majit_backend::Backend for WasmBackend {
             .downcast_ref::<WasmFrameData>()
             .expect("not WasmFrameData");
         GcRef(data.raw_values[index] as usize)
+    }
+
+    /// llmodel.py:240 grab_exc_value parity: the exception captured when the
+    /// trace exited through a GuardNoException / GuardException.
+    fn grab_exc_value(&self, frame: &DeadFrame) -> GcRef {
+        let data = frame
+            .data
+            .downcast_ref::<WasmFrameData>()
+            .expect("not WasmFrameData");
+        GcRef(data.exc_value as usize)
     }
 
     fn invalidate_loop(&self, _token: &JitCellToken) {

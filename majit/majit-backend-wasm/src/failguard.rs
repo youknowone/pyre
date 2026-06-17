@@ -57,6 +57,10 @@ impl FailDescr for WasmFailDescr {
 pub struct WasmFrameData {
     pub raw_values: Vec<i64>,
     pub fail_descr: Arc<WasmFailDescr>,
+    /// Pending exception value captured by `execute_token` after the trace
+    /// exited through a GuardNoException / GuardException (0 = none), surfaced
+    /// via `grab_exc_value`.
+    pub exc_value: i64,
 }
 
 /// Compiled wasm loop metadata, stored in `JitCellToken.compiled`.

@@ -1634,6 +1634,7 @@ dependencies = [
  "majit-backend",
  "majit-backend-cranelift",
  "majit-backend-dynasm",
+ "majit-backend-wasm",
  "majit-gc",
  "majit-ir",
  "majit-macros",

@@ -306,6 +306,49 @@ fn test_guard_types() {
     assert_eq!(guards.len(), 7);
 }
 
+/// GuardNoException loads the global exception slot and fails when it is set;
+/// GuardException compares the pending exception type against the expected one
+/// and, on match, binds the caught value into its result var and clears both
+/// slots. Validates the emitted bytecode is well-formed (stack-balanced).
+#[test]
+fn test_exception_guards() {
+    let inputargs = vec![InputArg::from_type(Type::Int, 0)];
+
+    let ops = vec![
+        Op::new(OpCode::Label, &[BoxRef::from_opref(OpRef::input_arg_int(0))]),
+        // GuardNoException — 0 args, fails when an exception is pending.
+        {
+            let mut op = Op::new(OpCode::GuardNoException, &[]);
+            op.setfailargs(smallvec![BoxRef::from_opref(OpRef::input_arg_int(0))]);
+            op
+        },
+        // GuardException(expected_type) — caught value bound to int_op(1).
+        {
+            let mut op = Op::new(
+                OpCode::GuardException,
+                &[BoxRef::from_opref(OpRef::input_arg_int(0))],
+            );
+            op.pos.set(OpRef::int_op(1));
+            op.setfailargs(smallvec![BoxRef::from_opref(OpRef::input_arg_int(0))]);
+            op
+        },
+        Op::new(OpCode::Jump, &[BoxRef::from_opref(OpRef::input_arg_int(0))]),
+    ];
+
+    let constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
+    let (bytes, guards) = codegen::build_wasm_module(
+        &inputargs,
+        &ops,
+        &constants,
+        Some(0),
+        &HashMap::new(),
+        &codegen::GuardGcTypeInfo::default(),
+    )
+    .expect("wasm codegen should succeed");
+    validate_wasm(&bytes);
+    assert_eq!(guards.len(), 2);
+}
+
 /// GuardGcType contract in majit: arg0 = object ref, arg1 = expected
 /// type_id. The wasm backend reads the GC header word at
 /// `obj - GcHeader::SIZE` (matching the cranelift backend and
