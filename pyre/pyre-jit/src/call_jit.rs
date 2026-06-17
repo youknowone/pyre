@@ -1436,6 +1436,40 @@ fn jit_blackhole_resume_from_guard(
     None
 }
 
+/// RAII guard registering each slot of the `#326` rollback snapshot's
+/// `locals` copy as a GC root for the duration of `bh.run()`.  The snapshot
+/// is a plain `Vec<PyObjectRef>` holding raw object pointers; the collector
+/// is moving (incminimark nursery -> oldgen copying), so a minor collection
+/// during the forward run would relocate those objects and leave the Vec
+/// holding from-space pointers.  Registering each element slot makes the
+/// root walker forward them in place (`collector.rs` reads `*slot`, copies,
+/// writes back), so the abort arm restores the live pointers rather than
+/// stale ones.  Mirrors `LocalsRoot` / the callee-locals root in `call.rs`.
+struct VableRollbackRoots {
+    slots: Vec<*mut *mut u8>,
+}
+
+impl VableRollbackRoots {
+    fn register(base: *const PyObjectRef, len: usize) -> Self {
+        let mut slots = Vec::with_capacity(len);
+        for i in 0..len {
+            let slot = unsafe { base.add(i) } as *mut *mut u8;
+            if unsafe { pyre_object::gc_hook::try_gc_add_root(slot) } {
+                slots.push(slot);
+            }
+        }
+        Self { slots }
+    }
+}
+
+impl Drop for VableRollbackRoots {
+    fn drop(&mut self) {
+        for &slot in &self.slots {
+            pyre_object::gc_hook::try_gc_remove_root(slot);
+        }
+    }
+}
+
 /// resume.py:1312 blackhole_from_resumedata parity:
 /// Decode rd_numb via ResumeDataDirectReader, build blackhole chain,
 /// run _run_forever.
@@ -1615,10 +1649,12 @@ pub fn blackhole_resume_via_rd_numb(
     //
     // The snapshot holds raw `PyObjectRef`s across `bh.run()`; the GC is a
     // moving collector (#336), so a minor collection during the run could
-    // relocate these and this snapshot would have to be registered as a GC
-    // root — tracked with #336.  Capture the snapshotted frame pointer too,
-    // so the abort arm can confirm the frame that aborted is the same one
-    // this state belongs to before restoring it.
+    // relocate these.  `VableRollbackRoots` below registers each `locals`
+    // slot with the root walker so the collector forwards them in place and
+    // the abort arm restores live pointers, not from-space ones.  Capture
+    // the snapshotted frame pointer too, so the abort arm can confirm the
+    // frame that aborted is the same one this state belongs to before
+    // restoring it.
     let vable_rollback: Option<(*mut PyFrame, Vec<PyObjectRef>, usize, isize)> = {
         let frame_ptr = bh.virtualizable_ptr as *mut PyFrame;
         if frame_ptr.is_null() {
@@ -1633,6 +1669,11 @@ pub fn blackhole_resume_via_rd_numb(
             ))
         }
     };
+    // Keep the snapshot's locals rooted for the whole forward run / abort
+    // window; dropped (roots removed) when this function returns.
+    let _vable_rollback_roots = vable_rollback
+        .as_ref()
+        .map(|(_, locals, _, _)| VableRollbackRoots::register(locals.as_ptr(), locals.len()));
 
     // blackhole.py:1794-1795 resume_in_blackhole:
     //   current_exc = _prepare_resume_from_failure(guard_opnum, deadframe)
