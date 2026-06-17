@@ -8233,6 +8233,26 @@ impl MIFrame {
             return Ok(Some(pyre_interpreter::StepResult::Continue));
         }
 
+        // COMPARE_OP walker activation via trait-path delegation (non-fused).
+        //
+        // The fused COMPARE_OP + POP_JUMP_IF_* path is handled earlier by
+        // `try_fused_compare_goto_if_not` (pyjitpl.py:541-556 parity), which
+        // returns before this dispatch — so this hook only sees the
+        // standalone (result-materialised) CompareOp the fusion declined.
+        // Same MAY-RAISE shape as BinaryOp: delegate to
+        // `OpcodeStepExecutor::compare_op` (the method `execute_compare_op`
+        // calls on the trait leg), which pops the two operands, emits the
+        // typed comparison IR (IntLt/FloatLt behind class guards) or the
+        // generic `compare_value` residual, and pushes the boxed bool.  The
+        // following PopJumpIf* / consumer reads that bool exactly as on the
+        // trait leg.  `pop_value` / `push_value` handle vsd; early return
+        // bypasses `apply_walker_stack_effect`.
+        if let Instruction::CompareOp { opname } = instruction {
+            use pyre_interpreter::OpcodeStepExecutor;
+            OpcodeStepExecutor::compare_op(self, opname.get(op_arg))?;
+            return Ok(Some(pyre_interpreter::StepResult::Continue));
+        }
+
         // STORE_SUBSCR walker activation via trait-path delegation.
         //
         // The auto-gen arm jitcode for `StoreSubscr` is
@@ -9612,6 +9632,12 @@ pub fn production_walker_handles(instruction: &Instruction) -> bool {
             // ×2 + specialised arithmetic IR + push_value).  May-raise; the
             // Err propagates to trace_code_step like the trait leg.
             | Instruction::BinaryOp { .. }
+            // CompareOp (non-fused) handled by the entry hook: delegates to
+            // OpcodeStepExecutor::compare_op (typed comparison IR or generic
+            // compare_value residual + push bool). May-raise; Err propagates
+            // like the trait leg. The fused compare+branch path is handled
+            // earlier by try_fused_compare_goto_if_not and never reaches here.
+            | Instruction::CompareOp { .. }
             | Instruction::ExtendedArg
             | Instruction::Resume { .. }
             | Instruction::Cache
