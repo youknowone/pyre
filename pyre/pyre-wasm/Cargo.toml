@@ -10,9 +10,22 @@ description = "pyre Python interpreter compiled to WebAssembly"
 [lib]
 crate-type = ["cdylib"]
 
+[features]
+default = ["web"]
+# Browser / JS host: `run_python` is exported through wasm-bindgen and the
+# JIT instantiates trace modules via the `WebAssembly` API (`jit_glue.js`).
+web = ["dep:wasm-bindgen", "pyre-jit/wasm-web"]
+# Native wasm host (wasmi / wasmtime): a plain C-ABI surface
+# (`pyre_alloc` / `pyre_dealloc` / `pyre_run_python`) is exported and the
+# JIT instantiates trace modules via plain wasm imports. No JavaScript.
+wasmi = ["pyre-jit/wasm-host"]
+
 [dependencies]
 pyre-object = { workspace = true }
 pyre-interpreter = { workspace = true }
-pyre-jit = { workspace = true }
-wasm-bindgen = { workspace = true }
+# Specified directly (not via workspace inheritance) so default-features
+# can be turned off — drops the native `dynasm` backend, which does not
+# build for wasm32; on wasm32 the JIT backend is selected by target_arch.
+pyre-jit = { path = "../pyre-jit", version = "0.0.2", default-features = false }
+wasm-bindgen = { workspace = true, optional = true }
 getrandom = { workspace = true }

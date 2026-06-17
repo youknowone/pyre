@@ -1,14 +1,17 @@
 /// WebAssembly backend for majit.
 ///
 /// Generates wasm bytecodes via wasm-encoder. On wasm32 targets,
-/// instantiates modules via JS WebAssembly.instantiate() and executes
-/// via JS interop. On native targets, compile_loop succeeds but
-/// execute_token requires the JS runtime (unreachable natively).
+/// instantiates the emitted trace modules through a host binding (see
+/// `glue`): the `web` feature uses the browser `WebAssembly` API via
+/// wasm-bindgen, the `host-import` feature uses plain wasm imports that a
+/// native embedder (wasmi / wasmtime) supplies. On native targets,
+/// compile_loop succeeds but execute_token requires a wasm host
+/// (unreachable natively).
 pub mod codegen;
 pub mod failguard;
 
 #[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
-mod js_glue;
+mod glue;
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -397,11 +400,12 @@ impl majit_backend::Backend for WasmBackend {
             .unwrap_or(0)
             .max(inputargs.len());
 
-        // Compile via JS on wasm32, or store bytes for testing on native
+        // Instantiate via the host binding on wasm32, or store bytes for
+        // testing on native (no wasm host available).
         #[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
-        let func_handle = js_glue::compile_module(&wasm_bytes);
+        let func_handle = glue::compile_module(&wasm_bytes);
         #[cfg(any(not(target_arch = "wasm32"), target_os = "wasi"))]
-        let func_handle = 0u32; // Placeholder — no JS runtime available
+        let func_handle = 0u32; // Placeholder — no wasm host available
 
         let compiled = CompiledWasmLoop {
             trace_id,
@@ -477,11 +481,11 @@ impl majit_backend::Backend for WasmBackend {
 
         #[cfg(any(not(target_arch = "wasm32"), target_os = "wasi"))]
         {
-            panic!("wasm backend execute_token requires JS runtime");
+            panic!("wasm backend execute_token requires a wasm host");
         }
         #[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
         {
-            js_glue::execute(compiled.func_handle, _frame_ptr);
+            glue::execute(compiled.func_handle, _frame_ptr);
 
             // Read fail_index from frame[0]
             let fail_index = frame[0] as u32;

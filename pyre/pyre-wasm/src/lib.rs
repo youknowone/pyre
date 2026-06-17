@@ -1,3 +1,4 @@
+#[cfg(feature = "web")]
 use wasm_bindgen::prelude::*;
 
 use pyre_interpreter::*;
@@ -27,8 +28,10 @@ fn install_wasm_print_hook() {
 }
 
 /// Run a Python source string and return the output as a string.
-#[wasm_bindgen]
-pub fn run_python(source: &str) -> String {
+///
+/// Host-agnostic core shared by the `web` (wasm-bindgen) and `wasmi`
+/// (C-ABI) entry points below.
+fn run_python_impl(source: &str) -> String {
     install_panic_hook();
     pyre_interpreter::importing::install_builtin_modules();
     install_wasm_print_hook();
@@ -81,4 +84,75 @@ pub fn run_python(source: &str) -> String {
     }
 
     output
+}
+
+/// Browser / JS entry point: marshalled by wasm-bindgen.
+#[cfg(feature = "web")]
+#[wasm_bindgen]
+pub fn run_python(source: &str) -> String {
+    run_python_impl(source)
+}
+
+/// Native-host (wasmi / wasmtime) C-ABI surface.
+///
+/// wasm-bindgen is unavailable without a JS runtime, so the embedder talks
+/// to the module through plain exports over linear memory:
+///   1. `pyre_alloc(len)` → reserve `len` bytes, write the UTF-8 source there;
+///   2. `pyre_run_python(ptr, len)` → run it, returns a packed `u64`
+///      (`hi32` = result pointer, `lo32` = result byte length);
+///   3. read the UTF-8 result, then `pyre_dealloc(ptr, len)` both buffers.
+#[cfg(feature = "wasmi")]
+mod host_abi {
+    use super::run_python_impl;
+    use std::alloc::{Layout, alloc, dealloc};
+
+    // Buffers crossing the boundary are allocated and freed through the
+    // global allocator with a `Layout::array::<u8>(len)` derived purely
+    // from `len`, so the host only ever needs to remember the length to
+    // free a buffer soundly.
+
+    /// Reserve `len` bytes in linear memory and return a pointer the host
+    /// can write into. Pair every call with `pyre_dealloc`.
+    #[unsafe(no_mangle)]
+    pub extern "C" fn pyre_alloc(len: usize) -> *mut u8 {
+        if len == 0 {
+            return std::ptr::NonNull::<u8>::dangling().as_ptr();
+        }
+        // Layout::array can only fail on overflow, impossible for a real
+        // wasm linear-memory size.
+        let layout = Layout::array::<u8>(len).expect("pyre_alloc: size overflow");
+        unsafe { alloc(layout) }
+    }
+
+    /// Release a buffer previously handed out by `pyre_alloc` or returned
+    /// by `pyre_run_python`.
+    #[unsafe(no_mangle)]
+    pub extern "C" fn pyre_dealloc(ptr: *mut u8, len: usize) {
+        if ptr.is_null() || len == 0 {
+            return;
+        }
+        let layout = Layout::array::<u8>(len).expect("pyre_dealloc: size overflow");
+        unsafe { dealloc(ptr, layout) }
+    }
+
+    /// Run the UTF-8 Python source at `ptr[..len]`. Returns a packed
+    /// `(result_ptr << 32) | result_len`; the result is a UTF-8 byte buffer
+    /// the host must free with `pyre_dealloc`.
+    #[unsafe(no_mangle)]
+    pub extern "C" fn pyre_run_python(ptr: *const u8, len: usize) -> u64 {
+        let source = if ptr.is_null() {
+            String::new()
+        } else {
+            let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
+            String::from_utf8_lossy(bytes).into_owned()
+        };
+
+        let out = run_python_impl(&source).into_bytes();
+        let out_len = out.len();
+        let out_ptr = pyre_alloc(out_len);
+        if out_len != 0 {
+            unsafe { std::ptr::copy_nonoverlapping(out.as_ptr(), out_ptr, out_len) };
+        }
+        ((out_ptr as u64) << 32) | (out_len as u64)
+    }
 }

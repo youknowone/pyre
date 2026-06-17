@@ -7,6 +7,16 @@ repository.workspace = true
 homepage.workspace = true
 description = "WebAssembly backend for majit — generates wasm bytecodes via wasm-encoder"
 
+[features]
+default = ["web"]
+# Instantiate JIT-emitted trace modules through the browser
+# `WebAssembly` API via wasm-bindgen (`./jit_glue.js`).
+web = ["dep:wasm-bindgen"]
+# Instantiate JIT-emitted trace modules through plain wasm imports
+# supplied by a native embedder (e.g. a wasmi/wasmtime host). No
+# JavaScript runtime required.
+host-import = []
+
 [dependencies]
 majit-ir = { workspace = true }
 majit-backend = { workspace = true }
@@ -14,7 +24,7 @@ majit-gc = { workspace = true }
 wasm-encoder = { workspace = true }
 
 [target.'cfg(all(target_arch = "wasm32", not(target_os = "wasi")))'.dependencies]
-wasm-bindgen = { workspace = true }
+wasm-bindgen = { workspace = true, optional = true }
 
 [dev-dependencies]
 wasmparser = { workspace = true }

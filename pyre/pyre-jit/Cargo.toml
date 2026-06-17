@@ -21,6 +21,12 @@ mir-frontend = ["majit-translate/mir-frontend"]
 # exercised eagerly. majit-gc is compiled once per build, so this single
 # edge enables the stress mode for the whole pyre-jit dependency closure.
 gc_stress = ["majit-gc/gc_stress"]
+# Select the host binding for the wasm backend (only meaningful on
+# wasm32). `wasm-web` instantiates JIT traces through the browser
+# `WebAssembly` API; `wasm-host` through plain wasm imports a native
+# embedder (wasmi / wasmtime) supplies.
+wasm-web = ["majit-backend-wasm/web"]
+wasm-host = ["majit-backend-wasm/host-import"]
 
 [dependencies]
 pyre-object = { workspace = true }
@@ -40,7 +46,10 @@ vecset = { workspace = true }
 rustpython-wtf8 = { workspace = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-majit-backend-wasm = { workspace = true }
+# Specified directly (not via workspace inheritance) so default-features
+# can be turned off — the host binding (web vs host-import) is chosen
+# explicitly through pyre-jit's `wasm-web` / `wasm-host` features.
+majit-backend-wasm = { path = "../../majit/majit-backend-wasm", version = "0.0.2", default-features = false }
 
 [dev-dependencies]
 pyre-jit-trace = { workspace = true, features = ["test-support"] }

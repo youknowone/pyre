@@ -20,9 +20,13 @@ use std::sync::Arc;
 use crate::r#box::BoxRef;
 use crate::optimizeopt::optimizer::{Optimizer, PendingBridgeRd};
 use majit_backend::{Backend, ExitRecoveryLayout, JitCellToken};
-#[cfg(feature = "cranelift")]
+#[cfg(all(feature = "cranelift", not(target_arch = "wasm32")))]
 pub(crate) use majit_backend_cranelift::CraneliftBackend as BackendImpl;
-#[cfg(all(feature = "dynasm", not(feature = "cranelift")))]
+#[cfg(all(
+    feature = "dynasm",
+    not(feature = "cranelift"),
+    not(target_arch = "wasm32")
+))]
 pub(crate) use majit_backend_dynasm::runner::DynasmBackend as BackendImpl;
 #[cfg(target_arch = "wasm32")]
 pub(crate) use majit_backend_wasm::WasmBackend as BackendImpl;
