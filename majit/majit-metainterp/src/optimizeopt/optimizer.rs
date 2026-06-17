@@ -3555,15 +3555,17 @@ impl Optimizer {
         // so the input-ops seed is empty; producer lookup runs off `resop_refs`
         // (populated by `bind_input_resops`).
         self.explicit_input_ops_seed = Some(Vec::new());
-        // EXPERIMENT R1 (opt-in via R1_ON): enable bridge retarget by holding
-        // the closing JUMP (skip_flush) so try_jump_to_existing_trace can run.
-        // Default OFF — keeps production bridges on the early-return path until
-        // the resume-data (rd_numb / fail-arg delivery) divergence behind the
-        // nbody hang is resolved.
+        // Bridge retarget: hold the closing JUMP (skip_flush) so
+        // try_jump_to_existing_trace can redirect it to an existing loop
+        // target (unroll.py jump_to_existing_trace) instead of
+        // jump_to_preamble's boxed entry. Fires when the bridge ends in a
+        // JUMP, the trace carries a peeled short preamble, and more than one
+        // front target token exists. Default ON; `R1_OFF` is a kill-switch
+        // routing bridges back to the early-return jump_to_preamble path.
         let r1_wr = ops.last().map_or(false, |op| op.opcode == OpCode::Jump)
             && inline_short_preamble
             && front_target_tokens.len() > 1
-            && std::env::var_os("R1_ON").is_some();
+            && std::env::var_os("R1_OFF").is_none();
         let r1_saved = self.skip_flush;
         self.skip_flush = r1_wr;
         let optimized_ops = self.optimize_with_constants_and_inputs_at(
@@ -3576,7 +3578,7 @@ impl Optimizer {
         );
         self.skip_flush = r1_saved;
 
-        // EXPERIMENT R1: a bridge trace carries no GUARD_FUTURE_CONDITION
+        // A bridge trace carries no GUARD_FUTURE_CONDITION
         // (reached_loop_header's GFC lives in pyre's loop-creation path,
         // which bridges skip), so `self.patchguardop` is None and the
         // retarget's inline_short_preamble guards never receive a
