@@ -2260,43 +2260,31 @@ impl ShortPreambleBuilder {
     ///   self.used_boxes.append(op)
     ///   self.short_preamble_jump.append(preamble_op.preamble_op)
     ///
-    /// The `else` arm below is that unconditional pattern. Both arms now
-    /// alias the carried `same_as_source` (#149/S8f): `field_entry::PreambleOp`
+    /// This is that unconditional pattern (#149/S8f collapse): the prior
+    /// produced_short_boxes map lookup is gone. `field_entry::PreambleOp` now
     /// carries the ORIGINAL box an invented-name CompoundOp alternate aliases
     /// (threaded from `ProducedShortOp.same_as_source` at the produce_* export
-    /// sites), so the `else` arm emits `same_as(original)` rather than the old
-    /// `same_as(op)` self-alias (op being the invented SameAs name). The `if`
-    /// arm (map lookup) is retained behind an equivalence `debug_assert!` that
-    /// the carried `same_as_source` reproduces the map entry's; once green
-    /// across the corpus it collapses onto the `else`, deleting this lookup.
+    /// sites), so the carried pop reproduces the former map entry's record:
+    /// `op` resolves to `resolved_op`, and `invented_name` / `same_as_source`
+    /// match — the SameAs emits `same_as(original)` rather than the old
+    /// `same_as(op)` self-alias (op being the invented SameAs name).
     pub fn add_preamble_op_from_pop(
         &mut self,
         preamble_op: &crate::optimizeopt::info::PreambleOp,
         resolved_op: crate::r#box::BoxRef,
     ) {
-        if let Some(produced) = self.produced_short_boxes.get(&preamble_op.op.to_opref()) {
-            // #149 equivalence harness: while the builder map still holds this
-            // entry, the carried pop's `same_as_source` must reproduce the
-            // map entry's, so the `else` arm could replace this lookup (S8f
-            // builder-map collapse). Compared by position; the boxes may be
-            // distinct objects across the export/import boundary.
-            debug_assert_eq!(
-                preamble_op.same_as_source.as_ref().map(|b| b.to_opref()),
-                produced.same_as_source.as_ref().map(|b| b.to_opref()),
-                "carried pop same_as_source diverged from builder map at {:?}",
-                preamble_op.op.to_opref()
-            );
-            self.state.record_preamble_use(resolved_op, produced);
-        } else {
-            // shortpreamble.py:432-440: same 4-line pattern via common helper.
-            let replay_op = &preamble_op.preamble_op;
-            self.state.record_imported_preamble_use(
-                resolved_op,
-                replay_op,
-                preamble_op.invented_name,
-                preamble_op.same_as_source.clone(),
-            );
-        }
+        // shortpreamble.py:432-440: unconditional add_preamble_op. The carried
+        // pop reproduces the builder map entry's record — `op` resolves to the
+        // same `resolved_op`, and `invented_name` / `same_as_source` are
+        // threaded through `field_entry::PreambleOp` — so the
+        // produced_short_boxes lookup is no longer consulted here (#149/S8f).
+        let replay_op = &preamble_op.preamble_op;
+        self.state.record_imported_preamble_use(
+            resolved_op,
+            replay_op,
+            preamble_op.invented_name,
+            preamble_op.same_as_source.clone(),
+        );
     }
 
     pub fn add_preamble_op(&mut self, result: OpRef) -> bool {
