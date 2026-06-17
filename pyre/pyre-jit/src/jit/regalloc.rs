@@ -580,6 +580,74 @@ pub fn perform_register_allocation_with_pairs_and_interference(
     }
 }
 
+/// Apply PyPy's `_try_coalesce` interference check
+/// (`rpython/tool/algo/regalloc.py:98-112`, the `v0 not in
+/// dg.neighbours[w0]` guard at py:105) to a candidate list of coalesce
+/// pairs and return only the pairs PyPy would accept.
+///
+/// `perform_register_allocation_with_pairs` pre-merges its
+/// `extra_coalesce_pairs` into the union-find BEFORE `make_dependencies`,
+/// which bypasses the interference check — silently coalescing pairs PyPy
+/// would reject when the two endpoints are simultaneously live (e.g. a
+/// short-circuit `(i and C)` PHI result that coalesces with the loop var
+/// `i` on the `and`-false edge, yet both are live across the following
+/// `or` guard: `i` for the loop's `i = i + 1`, the PHI result as the
+/// guard's kept operand-stack temp).  That merge collapses the kept slot's
+/// color onto `i`, so a const-folded kept value (`(i and 2.5) == 2.5`) is
+/// never recoverable at the guard snapshot (#124 float tail).
+///
+/// PyPy runs the check on the PRE-renaming graph (the CFG coalesce sweep
+/// precedes `flatten.py:154 insert_renamings`); this filter does the same
+/// by building the dependency graph on `graph` (the same pre-renaming graph
+/// `collect_cfg_coalesce_pairs` reads) with an EMPTY union-find, so
+/// `make_dependencies` records true interference.  It then replays the
+/// `_try_coalesce` chain incrementally — projecting each endpoint through
+/// the cumulative union-find and coalescing the dependency graph on each
+/// accepted pair — so transitive interference is honoured exactly as
+/// upstream `coalesce_variables` does.  Pairs whose endpoints already share
+/// a rep are kept (the pre-merge is a no-op for them); pairs whose reps
+/// interfere are dropped.
+///
+/// This is the parity-correct replacement for the unconditional pre-merge:
+/// non-interfering pins (walker scratch ↔ inputarg) survive, so the
+/// canonical coloring still matches the walker's emit, while the
+/// interfering `(i, PHI)` pair is rejected.
+pub fn filter_coalesce_pairs_by_interference(
+    graph: &FlowGraph,
+    kind: Kind,
+    pairs: &[(super::flow::VariableId, super::flow::VariableId)],
+) -> Vec<(super::flow::VariableId, super::flow::VariableId)> {
+    let mut allocator = RegAllocator::new(graph, kind);
+    allocator.make_dependencies();
+    let mut kept = Vec::with_capacity(pairs.len());
+    for &(v_id, w_id) in pairs {
+        if v_id == w_id {
+            continue;
+        }
+        let v0 = allocator._unionfind.find_rep(v_id);
+        let w0 = allocator._unionfind.find_rep(w_id);
+        if v0 == w0 {
+            // Already merged by an earlier accepted pair — pre-merging it
+            // again is a no-op, so keep it (matches `_try_coalesce`'s
+            // `v0 is w0` early return, which leaves the pair coalesced).
+            kept.push((v_id, w_id));
+            continue;
+        }
+        if allocator._depgraph.has_edge(&v0, &w0) {
+            // `regalloc.py:105` rejects an interfering pair.
+            continue;
+        }
+        let (_, rep) = allocator._unionfind.union(v0, w0);
+        if rep == v0 {
+            allocator._depgraph.coalesce(w0, v0);
+        } else {
+            allocator._depgraph.coalesce(v0, w0);
+        }
+        kept.push((v_id, w_id));
+    }
+    kept
+}
+
 /// Run `perform_register_allocation` once per `Kind` and collect
 /// the per-kind `GraphAllocationResult`s, mirroring
 /// `rpython/jit/codewriter/codewriter.py:44-46`:

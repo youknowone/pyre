@@ -9908,16 +9908,30 @@ impl CodeWriter {
         // `link.args ↔ target.inputargs` pairs once here so the canonical
         // pass observes the pre-renaming graph.
         //
-        // Parity note (regression vs PyPy): these pairs are pre-merged into
-        // the union-find BEFORE `make_dependencies`.  PyPy `regalloc.py:79-96
-        // coalesce_variables` + `:98-112 _try_coalesce` coalesce post-
-        // `make_dependencies` with the `v0 not in dg.neighbours[w0]`
-        // interference check; the pre-merge bypasses that check and silently
-        // merges pairs PyPy would reject.  Honouring the check measurably
-        // regresses cranelift (fib_recursive/raise_catch/fannkuch TIMEOUT),
-        // because the walker's colour-aggressive emit diverges from the
-        // canonical interference-respecting coloring.
+        // These pairs are pre-merged into the union-find BEFORE
+        // `make_dependencies` in `perform_register_allocation_with_pairs`.
+        // PyPy `regalloc.py:79-96 coalesce_variables` + `:98-112
+        // _try_coalesce` coalesce a `link.args ↔ target.inputargs` pair only
+        // when the two endpoints do NOT interfere (`v0 not in
+        // dg.neighbours[w0]`, py:105); the pre-merge bypasses that check.
+        // Filter the candidates through PyPy's interference check here, on
+        // the SAME pre-renaming graph PyPy runs the CFG sweep over (the
+        // collect below precedes `flatten`'s `insert_renamings`), so an
+        // interfering pair is dropped exactly as upstream would drop it.
+        // The earlier blanket-honour attempt that regressed cranelift
+        // (fib_recursive/raise_catch/fannkuch TIMEOUT) checked interference
+        // on the POST-renaming graph, where `insert_renamings` manufactures
+        // spurious interference; checking on the pre-renaming graph keeps
+        // the non-interfering walker pins (so the canonical coloring still
+        // matches the walker emit) while rejecting the genuinely-interfering
+        // short-circuit `(i and C)` PHI ↔ loop-var merge that collapses the
+        // kept operand-stack slot's color onto the loop var (#124 float).
         let cfg_variable_pairs = collect_cfg_coalesce_pairs(&graph);
+        let cfg_variable_pairs = super::regalloc::filter_coalesce_pairs_by_interference(
+            &graph,
+            Kind::Ref,
+            &cfg_variable_pairs,
+        );
         let mut graph_regallocs = super::regalloc::perform_register_allocation_all_kinds_with_pairs(
             &graph,
             &cfg_variable_pairs,
