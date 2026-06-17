@@ -885,31 +885,37 @@ impl<'a> AssemblerARM64<'a> {
     /// returning the register numbers to use. Uses x17 for lhs scratch
     /// and x16 for src scratch when the loc is Frame/Immed.
     fn load_3op_into_scratch(&mut self, lhs: &Loc, src: &Loc) -> (u8, u8) {
-        let lhs_reg = match lhs {
-            Loc::Reg(r) => r.value,
-            Loc::Frame(f) => {
-                dynasm!(self.mc ; .arch aarch64 ; ldr x17, [x29, f.ebp_loc.value as u32]);
-                17
-            }
-            Loc::Immed(i) => {
-                self.emit_mov_imm64(17, i.value);
-                17
-            }
-            _ => 17,
-        };
-        let src_reg = match src {
-            Loc::Reg(r) => r.value,
-            Loc::Frame(f) => {
-                dynasm!(self.mc ; .arch aarch64 ; ldr x16, [x29, f.ebp_loc.value as u32]);
-                16
-            }
-            Loc::Immed(i) => {
-                self.emit_mov_imm64(16, i.value);
-                16
-            }
-            _ => 16,
-        };
+        let lhs_reg = self.load_loc_to_reg(lhs, 17);
+        let src_reg = self.load_loc_to_reg(src, 16);
         (lhs_reg, src_reg)
+    }
+
+    /// Load a single operand `loc` into a register, returning its number.
+    /// Register locs are used in place; Frame/Immed locs are materialised
+    /// into the caller-supplied `scratch` register (x16/x17).
+    fn load_loc_to_reg(&mut self, loc: &Loc, scratch: u8) -> u8 {
+        match loc {
+            Loc::Reg(r) => r.value,
+            Loc::Frame(f) => {
+                dynasm!(self.mc ; .arch aarch64 ; ldr X(scratch), [x29, f.ebp_loc.value as u32]);
+                scratch
+            }
+            Loc::Immed(i) => {
+                self.emit_mov_imm64(scratch as u32, i.value);
+                scratch
+            }
+            _ => scratch,
+        }
+    }
+
+    /// If `loc` is a `ConstInt` that fits the AArch64 `#imm12` add/sub
+    /// immediate range, return it for the immediate instruction form.
+    /// Range mirrors `check_imm_box` (`0 <= v < DEFAULT_IMM_SIZE` = 4096).
+    fn addsub_imm12(loc: &Loc) -> Option<i64> {
+        match loc {
+            Loc::Immed(i) if (0..4096).contains(&i.value) => Some(i.value),
+            _ => None,
+        }
     }
 
     /// Emit a 3-operand integer binop: `OP dst, lhs, src`.
@@ -919,6 +925,30 @@ impl<'a> AssemblerARM64<'a> {
     /// `SUB dst, dst, src`. Handles reg/frame/immediate forms for both
     /// operands, routing scratch via x16/x17 as needed.
     fn emit_binop_3op(&mut self, opcode: OpCode, dst_reg: u8, lhs: &Loc, src: &Loc) {
+        // Fold a small non-negative ConstInt rhs into the `add/sub Rd,Rn,#imm12`
+        // immediate form instead of materialising it into a scratch register.
+        // The regalloc (`consider_int_ri_j2` / `consider_int_sub_j2`) only keeps
+        // add/sub rhs as `Loc::Immed`; the range mirrors `check_imm_box`
+        // (`0 <= v < DEFAULT_IMM_SIZE` = 4096, the AArch64 `#imm12` range).
+        if matches!(
+            opcode,
+            OpCode::IntAdd | OpCode::IntSub | OpCode::NurseryPtrIncrement
+        ) {
+            if let Some(im) = Self::addsub_imm12(src) {
+                let l = self.load_loc_to_reg(lhs, 17);
+                let d = dst_reg;
+                // Rd/Rn take the SP-form register family for the `#imm12`
+                // encoding; `XSP(r)` encodes identically to `X(r)` for the
+                // non-SP registers the allocator hands out here.
+                match opcode {
+                    OpCode::IntSub => {
+                        dynasm!(self.mc ; .arch aarch64 ; sub XSP(d), XSP(l), im as u32)
+                    }
+                    _ => dynasm!(self.mc ; .arch aarch64 ; add XSP(d), XSP(l), im as u32),
+                }
+                return;
+            }
+        }
         let (lhs_reg, src_reg) = self.load_3op_into_scratch(lhs, src);
         let d = dst_reg;
         let l = lhs_reg as u8;
@@ -1037,45 +1067,79 @@ impl<'a> AssemblerARM64<'a> {
     }
 
     // ── AArch64 helper: load a 64-bit immediate into register Xn ──
-    //
-    // codebuilder.py:509 `gen_load_int`: emit the minimal sequence — MOVN for
-    // a small negative, otherwise MOVZ of the low halfword plus a MOVK for
-    // each higher halfword up to the highest nonzero one.  Patchable sites
-    // that rewrite a fixed 4-word block in place (`emit_check_frame_depth`)
-    // use `emit_mov_imm64_full` instead.
+    /// Materialise a 64-bit immediate into `reg` using the *minimal*
+    /// movz/movn + movk sequence (1–4 instructions).  This is variable
+    /// length: callers whose emitted block is rewritten in place afterwards
+    /// (the `frame_depth_to_patch` sites, patched by `patch_frame_depth`
+    /// which always writes 4 words) MUST use [`emit_mov_imm64_fixed4`]
+    /// instead, which always emits exactly four words.
     pub(crate) fn emit_mov_imm64(&mut self, reg: u32, val: i64) {
-        let r = reg as u8;
-        if val < 0 {
-            if val < -65536 {
-                self.emit_mov_imm64_full(reg, val);
-            } else {
-                // MOVN Xr, ~val: val in [-65536, -1], so ~val fits in 16 bits.
-                let n = ((!val) as u32) & 0xFFFF;
-                dynasm!(self.mc ; .arch aarch64 ; movn X(r), n);
-            }
-            return;
-        }
         let v = val as u64;
-        dynasm!(self.mc ; .arch aarch64 ; movz X(r), (v & 0xFFFF) as u32);
-        let mut rem = v >> 16;
-        let mut shift = 16u32;
-        while rem != 0 {
-            let hw = (rem & 0xFFFF) as u32;
-            match shift {
-                16 => dynasm!(self.mc ; .arch aarch64 ; movk X(r), hw, lsl 16),
-                32 => dynasm!(self.mc ; .arch aarch64 ; movk X(r), hw, lsl 32),
-                48 => dynasm!(self.mc ; .arch aarch64 ; movk X(r), hw, lsl 48),
-                _ => unreachable!(),
+        let r = reg as u8;
+        let chunks = [
+            (v & 0xFFFF) as u32,
+            ((v >> 16) & 0xFFFF) as u32,
+            ((v >> 32) & 0xFFFF) as u32,
+            ((v >> 48) & 0xFFFF) as u32,
+        ];
+        // Emit only the 16-bit words that actually carry bits.  When the
+        // value is dominated by 1-bits (negative / high constants) seed with
+        // `movn` (which sets every other bit to 1) so fewer `movk` follow;
+        // otherwise seed with `movz` (other bits 0).  Mirrors the minimal
+        // mov-immediate sequence an assembler picks for `gen_load_int`.
+        let ones = chunks.iter().filter(|&&c| c == 0xFFFF).count();
+        let zeros = chunks.iter().filter(|&&c| c == 0).count();
+        let use_movn = ones > zeros;
+        let mut seeded = false;
+        for (idx, &c) in chunks.iter().enumerate() {
+            // Skip words already provided by the seed (0 for movz, 0xFFFF for movn).
+            if (use_movn && c == 0xFFFF) || (!use_movn && c == 0) {
+                continue;
             }
-            rem >>= 16;
-            shift += 16;
+            if !seeded {
+                seeded = true;
+                if use_movn {
+                    let inv = (!c) & 0xFFFF;
+                    match idx {
+                        0 => dynasm!(self.mc ; .arch aarch64 ; movn X(r), inv),
+                        1 => dynasm!(self.mc ; .arch aarch64 ; movn X(r), inv, lsl 16),
+                        2 => dynasm!(self.mc ; .arch aarch64 ; movn X(r), inv, lsl 32),
+                        _ => dynasm!(self.mc ; .arch aarch64 ; movn X(r), inv, lsl 48),
+                    }
+                } else {
+                    match idx {
+                        0 => dynasm!(self.mc ; .arch aarch64 ; movz X(r), c),
+                        1 => dynasm!(self.mc ; .arch aarch64 ; movz X(r), c, lsl 16),
+                        2 => dynasm!(self.mc ; .arch aarch64 ; movz X(r), c, lsl 32),
+                        _ => dynasm!(self.mc ; .arch aarch64 ; movz X(r), c, lsl 48),
+                    }
+                }
+            } else {
+                match idx {
+                    0 => dynasm!(self.mc ; .arch aarch64 ; movk X(r), c),
+                    1 => dynasm!(self.mc ; .arch aarch64 ; movk X(r), c, lsl 16),
+                    2 => dynasm!(self.mc ; .arch aarch64 ; movk X(r), c, lsl 32),
+                    _ => dynasm!(self.mc ; .arch aarch64 ; movk X(r), c, lsl 48),
+                }
+            }
+        }
+        // val == 0 (movz path) or val == -1 (movn path) seeds nothing above.
+        if !seeded {
+            if use_movn {
+                dynasm!(self.mc ; .arch aarch64 ; movn X(r), 0);
+            } else {
+                dynasm!(self.mc ; .arch aarch64 ; movz X(r), 0);
+            }
         }
     }
 
-    // codebuilder.py:503 `gen_load_int_full`: the fixed 4-word movz/movk block
-    // for patchable sites where `patch_stack_checks` rewrites all four words in
-    // place (and the redirect-veneer encoder `encode_mov_imm64_words`).
-    pub(crate) fn emit_mov_imm64_full(&mut self, reg: u32, val: i64) {
+    /// Materialise a 64-bit immediate as a fixed four-word
+    /// `movz`/`movk lsl 16`/`movk lsl 32`/`movk lsl 48` block, byte-identical
+    /// to [`encode_mov_imm64_words`].  Used only at the `frame_depth_to_patch`
+    /// sites, whose block is rewritten in place by `patch_frame_depth` (always
+    /// 16 bytes); the variable-length [`emit_mov_imm64`] would let the patch
+    /// overrun into the following instructions.
+    fn emit_mov_imm64_fixed4(&mut self, reg: u32, val: i64) {
         let v = val as u64;
         let r = reg as u8;
         dynasm!(self.mc ; .arch aarch64
@@ -1362,13 +1426,14 @@ impl<'a> AssemblerARM64<'a> {
     /// gcmap (a compile-time pointer) and the depth (a patchable
     /// immediate) need not be marshalled through the stack.
     ///
-    /// The depth immediate is materialized by `emit_mov_imm64` as a fixed
-    /// 4-instruction `movz/movk` block; `frame_depth_to_patch` records each
-    /// block offset (CMP operand + slowpath ARG1) and `patch_stack_checks`
+    /// The depth immediate is materialized by `emit_mov_imm64_fixed4` as a
+    /// fixed 4-instruction `movz/movk` block; `frame_depth_to_patch` records
+    /// each block offset (CMP operand + slowpath ARG1) and `patch_stack_checks`
     /// rewrites all four words at finalize once `frame_depth` is final.
     /// Unlike upstream's variable-length `gen_load_int` (which reserves
-    /// `get_max_size_of_gen_load_int()` NOPs), `emit_mov_imm64` is always
-    /// four words, so no NOP padding is needed.
+    /// `get_max_size_of_gen_load_int()` NOPs), this block is always four
+    /// words, so no NOP padding is needed.  (The general `emit_mov_imm64`
+    /// is variable length and would let the patch overrun the block.)
     fn emit_check_frame_depth(&mut self, gcmap: *mut usize) {
         let frame_len_ofs = (JF_FRAME_OFS + crate::jitframe::LENGTHOFS) as u32;
         let placeholder: i64 = 0xffffff;
@@ -1379,7 +1444,7 @@ impl<'a> AssemblerARM64<'a> {
         );
         // assembler.py:936-941 — gen_load_int ip1, expected_size (patched).
         let cmp_imm_ofs = self.mc.offset().0;
-        self.emit_mov_imm64_full(17, placeholder);
+        self.emit_mov_imm64_fixed4(17, placeholder);
         self.frame_depth_to_patch.push(cmp_imm_ofs);
 
         // assembler.py:942-944 — CMP ip0, ip1; B.GE skip (fast path:
@@ -1422,7 +1487,7 @@ impl<'a> AssemblerARM64<'a> {
         dynasm!(self.mc ; .arch aarch64 ; mov x0, x29);
         // assembler.py:447-449 arg1 = expected_size (depth), patched imm.
         let arg1_imm_ofs = self.mc.offset().0;
-        self.emit_mov_imm64_full(1, placeholder);
+        self.emit_mov_imm64_fixed4(1, placeholder);
         self.frame_depth_to_patch.push(arg1_imm_ofs);
 
         // assembler.py:467 BL realloc_frame.  pyre bakes the C-ABI wrapper
@@ -2096,9 +2161,14 @@ impl<'a> AssemblerARM64<'a> {
                 if let (Some(Loc::Reg(dst)), Some(lhs), Some(src)) =
                     (result_loc, arglocs.first(), arglocs.get(1))
                 {
-                    let (lhs_reg, src_reg) = self.load_3op_into_scratch(lhs, src);
-                    dynasm!(self.mc ; .arch aarch64
-                        ; adds X(dst.value), X(lhs_reg as u8), X(src_reg as u8));
+                    if let Some(im) = Self::addsub_imm12(src) {
+                        let l = self.load_loc_to_reg(lhs, 17);
+                        dynasm!(self.mc ; .arch aarch64 ; adds X(dst.value), XSP(l), im as u32);
+                    } else {
+                        let (lhs_reg, src_reg) = self.load_3op_into_scratch(lhs, src);
+                        dynasm!(self.mc ; .arch aarch64
+                            ; adds X(dst.value), X(lhs_reg as u8), X(src_reg as u8));
+                    }
                     self.guard_success_cc = Some(CC_NO);
                 }
             }
@@ -2107,9 +2177,14 @@ impl<'a> AssemblerARM64<'a> {
                 if let (Some(Loc::Reg(dst)), Some(lhs), Some(src)) =
                     (result_loc, arglocs.first(), arglocs.get(1))
                 {
-                    let (lhs_reg, src_reg) = self.load_3op_into_scratch(lhs, src);
-                    dynasm!(self.mc ; .arch aarch64
-                        ; subs X(dst.value), X(lhs_reg as u8), X(src_reg as u8));
+                    if let Some(im) = Self::addsub_imm12(src) {
+                        let l = self.load_loc_to_reg(lhs, 17);
+                        dynasm!(self.mc ; .arch aarch64 ; subs X(dst.value), XSP(l), im as u32);
+                    } else {
+                        let (lhs_reg, src_reg) = self.load_3op_into_scratch(lhs, src);
+                        dynasm!(self.mc ; .arch aarch64
+                            ; subs X(dst.value), X(lhs_reg as u8), X(src_reg as u8));
+                    }
                     self.guard_success_cc = Some(CC_NO);
                 }
             }
@@ -4352,56 +4427,41 @@ impl<'a> AssemblerARM64<'a> {
 
     fn emit_guard_jcc(&mut self, fail_cc: u8) -> DynamicLabel {
         let fail_label = self.mc.new_dynamic_label();
-        // aarch64: b.cond has 19-bit range (±1MB), which is too short
-        // for forward references to recovery stubs. Use inverted condition
-        // + unconditional branch (26-bit / ±128MB) pattern instead:
-        //   b.NOT_cond >skip ; b =>fail_label ; skip:
-        let skip = self.mc.new_dynamic_label();
-        let inv = invert_cc(fail_cc);
-        match inv {
-            CC_L => dynasm!(self.mc ; .arch aarch64 ; b.lt =>skip),
-            CC_LE => dynasm!(self.mc ; .arch aarch64 ; b.le =>skip),
-            CC_G => dynasm!(self.mc ; .arch aarch64 ; b.gt =>skip),
-            CC_GE => dynasm!(self.mc ; .arch aarch64 ; b.ge =>skip),
-            CC_E => dynasm!(self.mc ; .arch aarch64 ; b.eq =>skip),
-            CC_NE => dynasm!(self.mc ; .arch aarch64 ; b.ne =>skip),
-            CC_B => dynasm!(self.mc ; .arch aarch64 ; b.lo =>skip),
-            CC_BE => dynasm!(self.mc ; .arch aarch64 ; b.ls =>skip),
-            CC_A => dynasm!(self.mc ; .arch aarch64 ; b.hi =>skip),
-            CC_AE => dynasm!(self.mc ; .arch aarch64 ; b.hs =>skip),
-            CC_O => dynasm!(self.mc ; .arch aarch64 ; b.vs =>skip),
-            CC_NO => dynasm!(self.mc ; .arch aarch64 ; b.vc =>skip),
-            CC_S => dynasm!(self.mc ; .arch aarch64 ; b.mi =>skip),
-            CC_NS => dynasm!(self.mc ; .arch aarch64 ; b.pl =>skip),
-            _ => dynasm!(self.mc ; .arch aarch64 ; b.eq =>skip),
-        }
-        dynasm!(self.mc ; .arch aarch64 ; b =>fail_label);
-        dynasm!(self.mc ; .arch aarch64 ; =>skip);
+        self.emit_bcond_to_label(fail_cc, fail_label);
         fail_label
     }
 
-    fn emit_jcc_to_label(&mut self, fail_cc: u8, fail_label: DynamicLabel) {
-        let skip = self.mc.new_dynamic_label();
-        let inv = invert_cc(fail_cc);
-        match inv {
-            CC_L => dynasm!(self.mc ; .arch aarch64 ; b.lt =>skip),
-            CC_LE => dynasm!(self.mc ; .arch aarch64 ; b.le =>skip),
-            CC_G => dynasm!(self.mc ; .arch aarch64 ; b.gt =>skip),
-            CC_GE => dynasm!(self.mc ; .arch aarch64 ; b.ge =>skip),
-            CC_E => dynasm!(self.mc ; .arch aarch64 ; b.eq =>skip),
-            CC_NE => dynasm!(self.mc ; .arch aarch64 ; b.ne =>skip),
-            CC_B => dynasm!(self.mc ; .arch aarch64 ; b.lo =>skip),
-            CC_BE => dynasm!(self.mc ; .arch aarch64 ; b.ls =>skip),
-            CC_A => dynasm!(self.mc ; .arch aarch64 ; b.hi =>skip),
-            CC_AE => dynasm!(self.mc ; .arch aarch64 ; b.hs =>skip),
-            CC_O => dynasm!(self.mc ; .arch aarch64 ; b.vs =>skip),
-            CC_NO => dynasm!(self.mc ; .arch aarch64 ; b.vc =>skip),
-            CC_S => dynasm!(self.mc ; .arch aarch64 ; b.mi =>skip),
-            CC_NS => dynasm!(self.mc ; .arch aarch64 ; b.pl =>skip),
-            _ => dynasm!(self.mc ; .arch aarch64 ; b.eq =>skip),
+    /// Emit a single `b.<cc> =>label` so the guard-success path falls
+    /// through with no taken branch (the failure path takes the branch).
+    ///
+    /// `b.cond` has a 19-bit / ±1MB range; the recovery stub it targets is
+    /// emitted in this same buffer, so for any realistic trace it is well
+    /// within range (±1MB = 262144 instructions, far above the trace-length
+    /// cap).  Should a pathologically large trace overflow it, `finalize()`
+    /// returns `ImpossibleRelocation` which surfaces as `CompilationFailed`
+    /// and the trace falls back to the interpreter — never miscompiled code.
+    fn emit_bcond_to_label(&mut self, cc: u8, label: DynamicLabel) {
+        match cc {
+            CC_L => dynasm!(self.mc ; .arch aarch64 ; b.lt =>label),
+            CC_LE => dynasm!(self.mc ; .arch aarch64 ; b.le =>label),
+            CC_G => dynasm!(self.mc ; .arch aarch64 ; b.gt =>label),
+            CC_GE => dynasm!(self.mc ; .arch aarch64 ; b.ge =>label),
+            CC_E => dynasm!(self.mc ; .arch aarch64 ; b.eq =>label),
+            CC_NE => dynasm!(self.mc ; .arch aarch64 ; b.ne =>label),
+            CC_B => dynasm!(self.mc ; .arch aarch64 ; b.lo =>label),
+            CC_BE => dynasm!(self.mc ; .arch aarch64 ; b.ls =>label),
+            CC_A => dynasm!(self.mc ; .arch aarch64 ; b.hi =>label),
+            CC_AE => dynasm!(self.mc ; .arch aarch64 ; b.hs =>label),
+            CC_O => dynasm!(self.mc ; .arch aarch64 ; b.vs =>label),
+            CC_NO => dynasm!(self.mc ; .arch aarch64 ; b.vc =>label),
+            CC_S => dynasm!(self.mc ; .arch aarch64 ; b.mi =>label),
+            CC_NS => dynasm!(self.mc ; .arch aarch64 ; b.pl =>label),
+            _ => dynasm!(self.mc ; .arch aarch64 ; b.eq =>label),
         }
-        dynasm!(self.mc ; .arch aarch64 ; b =>fail_label);
-        dynasm!(self.mc ; .arch aarch64 ; =>skip);
+    }
+
+    fn emit_jcc_to_label(&mut self, fail_cc: u8, fail_label: DynamicLabel) {
+        self.emit_bcond_to_label(fail_cc, fail_label);
     }
 
     /// Infer fail_arg_types from `op.type_` (via `opref_type`) or
@@ -6770,9 +6830,12 @@ mod tests {
     use super::*;
 
     /// `patch_frame_depth` rewrites the depth placeholder by hand-encoding
-    /// four `movz/movk` words.  They must be byte-identical to what
-    /// `emit_mov_imm64` (dynasm) produces, otherwise the patched bridge
-    /// would load a corrupt depth into the realloc slowpath.
+    /// four `movz/movk` words.  They must be byte-identical to the fixed
+    /// four-word block `emit_mov_imm64_fixed4` (dynasm) emits at the patch
+    /// sites, otherwise the patched bridge would load a corrupt depth into
+    /// the realloc slowpath.  (The inline sequence below is exactly that
+    /// block; the general `emit_mov_imm64` is variable length and is not
+    /// used at patch sites.)
     #[test]
     fn frame_depth_patch_words_match_emit_mov_imm64() {
         // (rd, val): the CMP site targets x17, the ARG1 site x1; cover the
