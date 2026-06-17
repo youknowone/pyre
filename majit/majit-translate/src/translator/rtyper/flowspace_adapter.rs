@@ -4186,11 +4186,20 @@ mod tests {
             args: (0..argc).map(|_| Variable::new()).collect(),
             result_ty: ValueType::Int,
         };
-        assert!(!op_canraise(&core_call(&["core", "cmp", "PartialEq", "eq"], 2)));
-        assert!(!op_canraise(&core_call(&["core", "cmp", "PartialOrd", "lt"], 2)));
+        assert!(!op_canraise(&core_call(
+            &["core", "cmp", "PartialEq", "eq"],
+            2
+        )));
+        assert!(!op_canraise(&core_call(
+            &["core", "cmp", "PartialOrd", "lt"],
+            2
+        )));
         assert!(!op_canraise(&core_call(&["core", "slice", "len"], 1)));
         assert!(!op_canraise(&core_call(&["core", "slice", "iter"], 1)));
-        assert!(!op_canraise(&core_call(&["core", "num", "wrapping_mul"], 2)));
+        assert!(!op_canraise(&core_call(
+            &["core", "num", "wrapping_mul"],
+            2
+        )));
         // `min`/`max` lower to a raising `simple_call`, and a wrong arg
         // count falls through to the general raising `Call` arm.
         assert!(op_canraise(&core_call(&["core", "cmp", "min"], 2)));
