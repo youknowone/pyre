@@ -8625,7 +8625,10 @@ fn read_array_literal_elements(
         {
             if base.id() == array_var.id() {
                 let idx = field.name.strip_prefix("__pos_")?.parse::<usize>().ok()?;
-                by_index.push((idx, value.clone()));
+                // A `setfield_gc` inline `Const` element carries no SSA
+                // Variable; the recognizer needs a register operand per slot.
+                let write_var = value.as_variable()?;
+                by_index.push((idx, write_var.clone()));
             }
         }
     }
@@ -8751,10 +8754,13 @@ fn unwrap_fmt_arg_tuple_ref(
             } = &op.kind
             {
                 if write_base.id() == base.id() && field.name == field_name {
-                    if found.as_ref().is_some_and(|f| f.id() != value.id()) {
+                    // A `setfield_gc` inline `Const` carries no SSA Variable;
+                    // the back-trace needs a register operand to follow.
+                    let write_var = value.as_variable()?;
+                    if found.as_ref().is_some_and(|f| f.id() != write_var.id()) {
                         return None; // ambiguous: distinct values written
                     }
-                    found = Some(value.clone());
+                    found = Some(write_var.clone());
                 }
             }
         }
@@ -9083,7 +9089,7 @@ mod tests {
                 kind: OpKind::FieldWrite {
                     base: arr.clone(),
                     field: FieldDescriptor::new(format!("__pos_{i}"), Some("Array".to_string())),
-                    value: v,
+                    value: crate::model::LinkArg::Value(v),
                     ty: ValueType::Ref(None),
                 },
             });
@@ -9168,7 +9174,7 @@ mod tests {
             kind: OpKind::FieldWrite {
                 base: tuple.clone(),
                 field: FieldDescriptor::new("__pos_0", Some("Tuple".to_string())),
-                value: ctx.clone(),
+                value: crate::model::LinkArg::Value(ctx.clone()),
                 ty: ValueType::Ref(None),
             },
         });
@@ -9223,7 +9229,7 @@ mod tests {
             kind: OpKind::FieldWrite {
                 base: args_arr.clone(),
                 field: FieldDescriptor::new("__pos_0", Some("Array".to_string())),
-                value: arg_in,
+                value: crate::model::LinkArg::Value(arg_in),
                 ty: ValueType::Ref(None),
             },
         });
@@ -9251,7 +9257,7 @@ mod tests {
                 kind: OpKind::FieldWrite {
                     base: pieces_arr.clone(),
                     field: FieldDescriptor::new(format!("__pos_{i}"), Some("Array".to_string())),
-                    value: v,
+                    value: crate::model::LinkArg::Value(v),
                     ty: ValueType::Int,
                 },
             });
