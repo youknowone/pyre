@@ -9724,6 +9724,17 @@ fn try_walker_load_global_cell_fold(
     if stored.is_null() || unsafe { pyre_object::celldict::is_int_mutable_cell(stored) } {
         return Ok(false);
     }
+    // The fast path const-folds `stored` (the slot's raw value, or the
+    // `ObjectMutableCell`) as the elidable `jit_namespace_cell_lookup`
+    // result.  That bakes its address into the trace / guard resume data.
+    // The collector is moving, so a `stored` still in the nursery at trace
+    // time relocates nursery->oldgen afterwards and the baked address
+    // dangles (a `memo` dict grown in the loop is the canonical case).  Fall
+    // through to the residual live lookup, which re-reads the slot each call
+    // and follows the relocation, when `stored` can still move.
+    if majit_gc::can_move(majit_ir::GcRef(stored as usize)) {
+        return Ok(false);
+    }
     let is_obj_cell = unsafe { pyre_object::celldict::is_object_mutable_cell(stored) };
     let result_obj = unsafe { pyre_object::celldict::unwrap_cell(stored) };
 
