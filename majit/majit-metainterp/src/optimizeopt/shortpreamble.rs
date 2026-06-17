@@ -2119,21 +2119,6 @@ fn build_short_preamble_struct_from_ops(
 ///
 /// Builds the replayable short preamble from exported short boxes, while also
 /// collecting `used_boxes`, `short_preamble_jump`, and `extra_same_as`.
-///
-/// Build reverse index: preamble_op.pos → key for entries where they differ.
-/// In RPython, Box identity makes this unnecessary. In majit, produce_arg
-/// returns preamble_op.pos which may differ from the key in produced_short_boxes.
-fn build_pos_to_key(produced: &VecAssoc<OpRef, ProducedShortOp>) -> VecAssoc<OpRef, OpRef> {
-    let mut out = VecAssoc::new();
-    for (key, prod) in produced.iter() {
-        let pos = prod.preamble_op.pos.get();
-        if *key != pos {
-            out.insert(pos, *key);
-        }
-    }
-    out
-}
-
 #[derive(Clone, Debug)]
 pub struct ShortPreambleBuilder {
     state: AbstractShortPreambleBuilderState,
@@ -2503,7 +2488,6 @@ impl ExtendedShortPreambleBuilder {
         // Build single short list with inline dep resolution.
         let inputargs_set: VecSet<OpRef> = label_args.iter().copied().collect();
         let constants_set: VecSet<u32> = short_preamble.constants.keys().copied().collect();
-        let pos_to_key = build_pos_to_key(&self.produced_short_boxes);
         self.short.clear();
         self.short_results.clear();
         for entry in &short_preamble.ops {
@@ -2519,7 +2503,7 @@ impl ExtendedShortPreambleBuilder {
             // Recursive: deps of deps are also inserted (transitive closure).
             for arg in op.getarglist().iter() {
                 let arg = arg.to_opref();
-                if !self.insert_dep_recursive(arg, &inputargs_set, &constants_set, &pos_to_key) {
+                if !self.insert_dep_recursive(arg, &inputargs_set, &constants_set) {
                     if crate::optimizeopt::majit_log_enabled() {
                         eprintln!(
                             "[jit] short_preamble setup: dropping inline (unresolved arg {:?} in op pos={:?} opcode={:?})",
@@ -2583,7 +2567,6 @@ impl ExtendedShortPreambleBuilder {
         arg: OpRef,
         inputargs_set: &VecSet<OpRef>,
         constants_set: &VecSet<u32>,
-        pos_to_key: &VecAssoc<OpRef, OpRef>,
     ) -> bool {
         // history.py:227/268/314 inline-Const variants short-circuit
         // before `arg.raw()` (which panics on inline) — covered by
@@ -2598,16 +2581,27 @@ impl ExtendedShortPreambleBuilder {
         {
             return true;
         }
-        // shortpreamble.py:284-285 — `op in self.produced_short_boxes`.
-        // RPython uses Box identity; pyre needs both direct lookup and the
-        // reverse `preamble_op.pos → key` lookup because produce_arg may
-        // return a `.pos` distinct from the original key.
-        let dep = self.produced_short_boxes.get(&arg).cloned().or_else(|| {
-            pos_to_key
-                .get(&arg)
-                .and_then(|key| self.produced_short_boxes.get(key).cloned())
-        });
+        // shortpreamble.py:284-285 — `op in self.produced_short_boxes`,
+        // keyed by Box identity. Every entry is keyed by its own
+        // `preamble_op.pos` (produced_short_boxes_from_exported_boxes), so the
+        // map key equals the producer position a dep arg references — the
+        // direct lookup is exact, matching RPython's single Box-identity
+        // lookup. The former `preamble_op.pos → key` reverse index was a
+        // vestige of an earlier export that keyed by something other than the
+        // replay pos; it can never fire now (key == pos by construction).
+        let dep = self.produced_short_boxes.get(&arg).cloned();
         let Some(dep) = dep else {
+            // Tripwire: a reverse `preamble_op.pos == arg` entry must not exist
+            // when the direct lookup misses — that would mean some insert path
+            // broke the `key == preamble_op.pos` invariant the deletion relies on.
+            debug_assert!(
+                !self
+                    .produced_short_boxes
+                    .iter()
+                    .any(|(_, prod)| prod.preamble_op.pos.get() == arg),
+                "produced_short_boxes key != preamble_op.pos at {arg:?}: \
+                 direct lookup missed but a pos-keyed entry exists"
+            );
             return false;
         };
         let dep_pos = dep.preamble_op.pos.get();
@@ -2628,7 +2622,7 @@ impl ExtendedShortPreambleBuilder {
         let dep_op_args = dep_op.getarglist_copy();
         for dep_arg in dep_op_args.iter() {
             let dep_arg = dep_arg.to_opref();
-            if !self.insert_dep_recursive(dep_arg, inputargs_set, constants_set, pos_to_key) {
+            if !self.insert_dep_recursive(dep_arg, inputargs_set, constants_set) {
                 return false;
             }
         }
@@ -2824,8 +2818,11 @@ impl ExtendedShortPreambleBuilder {
         let jump_op = self.short.pop();
         // shortpreamble.py:480: AbstractShortPreambleBuilder.use_box(...)
         if !self.short_results.contains(&canonical) {
-            let pos_to_key = build_pos_to_key(&self.produced_short_boxes);
-            // Add deps for each arg
+            // Add deps for each arg. produced_short_boxes is keyed by each
+            // entry's own `preamble_op.pos`, so a dep arg (a producer position)
+            // hits its entry directly — RPython single Box-identity lookup. The
+            // former `preamble_op.pos → key` reverse index can never fire
+            // (key == pos by construction) and was removed.
             for arg in preamble_op.getarglist().iter() {
                 let arg = arg.to_opref();
                 if self.short_results.contains(&arg)
@@ -2834,11 +2831,7 @@ impl ExtendedShortPreambleBuilder {
                 {
                     continue;
                 }
-                let dep = self.produced_short_boxes.get(&arg).or_else(|| {
-                    pos_to_key
-                        .get(&arg)
-                        .and_then(|key| self.produced_short_boxes.get(key))
-                });
+                let dep = self.produced_short_boxes.get(&arg);
                 if let Some(dep) = dep {
                     let dep_pos = dep.preamble_op.pos.get();
                     if !self.short_results.contains(&dep_pos) {
