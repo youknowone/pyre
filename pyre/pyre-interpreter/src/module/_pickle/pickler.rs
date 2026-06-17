@@ -19,19 +19,33 @@ pub struct W_Pickler {
     proto: i64,
     bin: bool,
     framing: bool,
+    /// Apply the `_compat_pickle` py3→py2 name remap at protocol < 3.
+    fix_imports: bool,
     /// `buffer_callback` for proto-5 out-of-band buffers, or `None`.
     buffer_callback: PyObjectRef,
+    /// Memo of saved objects — a Python `list` (GC-walked) persisted across
+    /// `dump` calls until `clear_memo`, position = memo index.
+    w_memo: PyObjectRef,
 }
 
-/// Per-`dump` pickling context. The identity memo maps an already-saved
-/// object (by address — pyre `id()` is address-based and interpreter
-/// objects never move) to its memo index; `memo_size` is the next index
-/// and the put-opcode counter.
+/// Per-`dump` pickling context.  The identity memo maps an already-saved
+/// object to its memo index.  pyre's incminimark nursery relocates live
+/// objects, so the memo cannot key on a raw address: the memoized objects
+/// live in a pinned Python `list` (`memo_slot`) which the GC walks, so the
+/// stored references follow every move, and `index` maps the move-stable
+/// `gc_identity_hash` to the list positions sharing that hash, resolved by
+/// pointer identity against a freshly-read list element.  The memo index
+/// (the PUT/GET argument) is the object's position in that list.
 struct PickleCtx {
     proto: i64,
     bin: bool,
-    memo: HashMap<usize, usize>,
-    memo_size: usize,
+    /// Apply the `_compat_pickle` py3→py2 name remap at protocol < 3.
+    fix_imports: bool,
+    /// Shadow-stack slot of the memo `list`; re-read on every access so a
+    /// relocation of the list itself is observed.
+    memo_slot: usize,
+    /// `gc_identity_hash(obj)` → memo indices sharing that hash.
+    index: HashMap<usize, Vec<usize>>,
     /// `persistent_id` callable resolved off the pickler (subclass override
     /// or set attribute), or `PY_NULL` when not defined.
     pers_func: PyObjectRef,
@@ -40,8 +54,22 @@ struct PickleCtx {
 }
 
 impl PickleCtx {
+    /// The memo `list`, re-read from its pinned slot (it may have moved).
+    fn memo_list(&self) -> PyObjectRef {
+        pyre_object::gc_roots::shadow_stack_get(self.memo_slot)
+    }
+
     fn memo_get(&self, w_obj: PyObjectRef) -> Option<usize> {
-        self.memo.get(&(w_obj as usize)).copied()
+        let h = pyre_object::gc_hook::gc_identity_hash(w_obj as usize);
+        let list = self.memo_list();
+        for &idx in self.index.get(&h)? {
+            let memoized =
+                unsafe { pyre_object::listobject::w_list_getitem(list, idx as i64) }.unwrap();
+            if memoized == w_obj {
+                return Some(idx);
+            }
+        }
+        None
     }
 }
 
@@ -140,7 +168,9 @@ impl W_Pickler {
             proto: 0,
             bin: false,
             framing: false,
+            fix_imports: true,
             buffer_callback: pyre_object::w_none(),
+            w_memo: pyre_object::listobject::w_list_new(Vec::new()),
         })
     }
 
@@ -148,13 +178,11 @@ impl W_Pickler {
         &mut self,
         file: PyObjectRef,
         #[default(pyre_object::w_none())] protocol: PyObjectRef,
-        #[default(pyre_object::w_none())] fix_imports: PyObjectRef,
+        #[default(pyre_object::boolobject::w_bool_from(true))] fix_imports: PyObjectRef,
         #[default(pyre_object::w_none())] buffer_callback: PyObjectRef,
     ) -> Result<(), PyError> {
-        // `fix_imports` selects the `_compat_pickle` name mapping at the save
-        // sites by protocol already; the flag is accepted for signature
-        // compatibility but the proto-< 3 path is always applied.
-        let _ = fix_imports;
+        // `fix_imports` gates the `_compat_pickle` py3→py2 name remap that the
+        // protocol-< 3 save path would otherwise always apply.
         let proto = normalize_protocol(protocol)?;
         // `file must have a 'write' attribute` (interp_pickle.py:557).
         if crate::baseobjspace::findattr(file, "write").is_none() {
@@ -167,8 +195,15 @@ impl W_Pickler {
         self.proto = proto;
         self.bin = proto >= 1;
         self.framing = proto >= 4;
+        self.fix_imports = crate::baseobjspace::is_true(fix_imports);
         self.buffer_callback = buffer_callback;
+        self.w_memo = pyre_object::listobject::w_list_new(Vec::new());
         Ok(())
+    }
+
+    /// `Pickler.clear_memo` — reset the memo so the next `dump` starts fresh.
+    fn clear_memo(&mut self) {
+        self.w_memo = pyre_object::listobject::w_list_new(Vec::new());
     }
 
     fn dump(&mut self, w_obj: PyObjectRef) -> Result<(), PyError> {
@@ -176,20 +211,37 @@ impl W_Pickler {
         let proto = self.proto;
         let bin = self.bin;
         let framing = self.framing;
+        let fix_imports = self.fix_imports;
         let w_file = self.w_file;
         let buffer_callback = self.buffer_callback;
+        let w_memo = self.w_memo;
+        let self_ptr = self as *mut W_Pickler as PyObjectRef;
+
+        // Pin `w_file` and the memo list before the `persistent_id` lookup,
+        // whose allocation could otherwise relocate them.
+        let _roots = pyre_object::gc_roots::push_roots();
+        pyre_object::gc_roots::pin_root(w_file);
+        let file_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+        pyre_object::gc_roots::pin_root(w_memo);
+        let memo_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+
         // A `persistent_id` defined on a subclass (or set as an attribute)
         // overrides the default no-op; the base class has none.
-        let self_ptr = self as *mut W_Pickler as PyObjectRef;
         let pers_func = crate::baseobjspace::findattr(self_ptr, "persistent_id")
             .filter(|&f| !unsafe { pyre_object::is_none(f) })
             .unwrap_or(pyre_object::PY_NULL);
 
-        let _roots = pyre_object::gc_roots::push_roots();
-        pyre_object::gc_roots::pin_root(w_file);
-        let file_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-
-        let w_bytes = pickle_core(w_obj, proto, bin, framing, pers_func, buffer_callback)?;
+        let w_memo = pyre_object::gc_roots::shadow_stack_get(memo_slot);
+        let w_bytes = pickle_core(
+            w_obj,
+            proto,
+            bin,
+            framing,
+            fix_imports,
+            pers_func,
+            buffer_callback,
+            w_memo,
+        )?;
         // `w_file` may have moved while building the pickle; re-read the pin.
         let w_file = pyre_object::gc_roots::shadow_stack_get(file_slot);
         call_meth(w_file, "write", &[w_bytes])?;
@@ -236,8 +288,10 @@ pub(crate) fn pickle_core(
     proto: i64,
     bin: bool,
     framing: bool,
+    fix_imports: bool,
     pers_func: PyObjectRef,
     buffer_callback: PyObjectRef,
+    w_memo: PyObjectRef,
 ) -> Result<PyObjectRef, PyError> {
     let _roots = pyre_object::gc_roots::push_roots();
     pyre_object::gc_roots::pin_root(w_obj);
@@ -247,12 +301,26 @@ pub(crate) fn pickle_core(
     if !buffer_callback.is_null() && !unsafe { pyre_object::is_none(buffer_callback) } {
         pyre_object::gc_roots::pin_root(buffer_callback);
     }
+    // Pin the memo list and index its existing entries (a reused `Pickler`
+    // carries memo state across `dump` calls until `clear_memo`).
+    pyre_object::gc_roots::pin_root(w_memo);
+    let memo_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let mut index: HashMap<usize, Vec<usize>> = HashMap::new();
+    let n = unsafe { pyre_object::listobject::w_list_len(w_memo) };
+    for i in 0..n {
+        let o = unsafe { pyre_object::listobject::w_list_getitem(w_memo, i as i64) }.unwrap();
+        index
+            .entry(pyre_object::gc_hook::gc_identity_hash(o as usize))
+            .or_default()
+            .push(i);
+    }
 
     let mut ctx = PickleCtx {
         proto,
         bin,
-        memo: HashMap::new(),
-        memo_size: 0,
+        fix_imports,
+        memo_slot,
+        index,
         pers_func,
         buffer_callback,
     };
@@ -598,35 +666,43 @@ fn save_tuple(ctx: &mut PickleCtx, buf: &mut Framer, w_obj: PyObjectRef) -> Resu
         return Ok(());
     }
 
-    // Snapshot the elements before recursing (interpreter objects do not
-    // move, so the captured references stay valid across the saves below).
-    let elems: Vec<PyObjectRef> = (0..n)
-        .map(|i| unsafe { pyre_object::tupleobject::w_tuple_getitem(w_obj, i as i64).unwrap() })
-        .collect();
+    // Pin the tuple; a recursive save below can relocate the elements, so
+    // re-read each one (and the tuple itself for the memo) from the
+    // GC-walked tuple right before it is used.
+    let _roots = pyre_object::gc_roots::push_roots();
+    pyre_object::gc_roots::pin_root(w_obj);
+    let slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let elem = |i: usize| unsafe {
+        pyre_object::tupleobject::w_tuple_getitem(
+            pyre_object::gc_roots::shadow_stack_get(slot),
+            i as i64,
+        )
+        .unwrap()
+    };
 
     if n <= 3 && ctx.proto >= 2 {
-        for &e in &elems {
-            save(ctx, buf, e)?;
+        for i in 0..n {
+            save(ctx, buf, elem(i))?;
         }
         // Subtle: saving the elements may have memoized this very tuple
         // (a recursive tuple). If so, discard the elements and GET it.
-        if let Some(idx) = ctx.memo_get(w_obj) {
+        if let Some(idx) = ctx.memo_get(pyre_object::gc_roots::shadow_stack_get(slot)) {
             for _ in 0..n {
                 buf.push(op::POP);
             }
             write_get(ctx, buf, idx);
         } else {
             buf.push(op::TUPLESIZE2CODE[n]);
-            memoize(ctx, buf, w_obj);
+            memoize(ctx, buf, pyre_object::gc_roots::shadow_stack_get(slot));
         }
         return Ok(());
     }
 
     buf.push(op::MARK);
-    for &e in &elems {
-        save(ctx, buf, e)?;
+    for i in 0..n {
+        save(ctx, buf, elem(i))?;
     }
-    if let Some(idx) = ctx.memo_get(w_obj) {
+    if let Some(idx) = ctx.memo_get(pyre_object::gc_roots::shadow_stack_get(slot)) {
         // Recursive tuple: throw away the stack contents and GET it.
         if ctx.bin {
             buf.push(op::POP_MARK);
@@ -639,7 +715,7 @@ fn save_tuple(ctx: &mut PickleCtx, buf: &mut Framer, w_obj: PyObjectRef) -> Resu
         return Ok(());
     }
     buf.push(op::TUPLE);
-    memoize(ctx, buf, w_obj);
+    memoize(ctx, buf, pyre_object::gc_roots::shadow_stack_get(slot));
     Ok(())
 }
 
@@ -647,33 +723,49 @@ fn save_tuple(ctx: &mut PickleCtx, buf: &mut Framer, w_obj: PyObjectRef) -> Resu
 /// gated on `pypy_extensions` (off here) so the generic path is used,
 /// matching CPython's wire format.
 fn save_list(ctx: &mut PickleCtx, buf: &mut Framer, w_obj: PyObjectRef) -> Result<(), PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    // The list itself is a GC-walked Python `list`; pin it and append by
+    // re-reading each element, so a relocation during a recursive save is
+    // observed instead of dereferencing a stale snapshot.
+    pyre_object::gc_roots::pin_root(w_obj);
+    let slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     if ctx.bin {
         buf.push(op::EMPTY_LIST);
     } else {
         buf.push(op::MARK);
         buf.push(op::LIST);
     }
-    memoize(ctx, buf, w_obj);
-
-    let n = unsafe { pyre_object::listobject::w_list_len(w_obj) };
-    let items: Vec<PyObjectRef> = (0..n)
-        .map(|i| unsafe { pyre_object::listobject::w_list_getitem(w_obj, i as i64).unwrap() })
-        .collect();
-    batch_appends(ctx, buf, &items)
+    memoize(ctx, buf, pyre_object::gc_roots::shadow_stack_get(slot));
+    batch_appends(ctx, buf, slot)
 }
 
 /// `interp_pickle.py save_dict`.
 fn save_dict(ctx: &mut PickleCtx, buf: &mut Framer, w_obj: PyObjectRef) -> Result<(), PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    // Pin the dict (so `memoize` sees its current address) and, since a dict
+    // has no stable index access, flatten its items into a pinned
+    // `[k0, v0, …]` Python list (GC-walked), re-read per save.
+    pyre_object::gc_roots::pin_root(w_obj);
+    let dict_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let items = unsafe {
+        pyre_object::dictmultiobject::w_dict_items(pyre_object::gc_roots::shadow_stack_get(
+            dict_slot,
+        ))
+    };
+    let mut flat = Vec::with_capacity(items.len() * 2);
+    for (k, v) in items {
+        flat.push(k);
+        flat.push(v);
+    }
+    let items_slot = pin_items(flat);
     if ctx.bin {
         buf.push(op::EMPTY_DICT);
     } else {
         buf.push(op::MARK);
         buf.push(op::DICT);
     }
-    memoize(ctx, buf, w_obj);
-
-    let items = unsafe { pyre_object::dictmultiobject::w_dict_items(w_obj) };
-    batch_setitems(ctx, buf, &items)
+    memoize(ctx, buf, pyre_object::gc_roots::shadow_stack_get(dict_slot));
+    batch_setitems(ctx, buf, items_slot)
 }
 
 /// `interp_pickle.py save_set`. Sets are unordered, so the wire bytes are
@@ -689,26 +781,35 @@ fn save_set(ctx: &mut PickleCtx, buf: &mut Framer, w_obj: PyObjectRef) -> Result
         return save_reduce(ctx, buf, &[w_set_type, w_args], Some(w_obj));
     }
     buf.push(op::EMPTY_SET);
-    memoize(ctx, buf, w_obj);
+    // Pin the set so `memoize` records its current address, then snapshot its
+    // members into a pinned Python `list` re-read per save (a recursive save
+    // can relocate them).
+    let _roots = pyre_object::gc_roots::push_roots();
+    pyre_object::gc_roots::pin_root(w_obj);
+    let set_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    memoize(ctx, buf, pyre_object::gc_roots::shadow_stack_get(set_slot));
 
-    let items = unsafe { pyre_object::setobject::w_set_items(w_obj) };
-    let length = items.len();
+    let items = unsafe {
+        pyre_object::setobject::w_set_items(pyre_object::gc_roots::shadow_stack_get(set_slot))
+    };
+    let slot = pin_items(items);
+    let length = pinned_len(slot);
     if length == 0 {
         return Ok(());
     }
     buf.push(op::MARK);
-    save(ctx, buf, items[0])?;
+    save(ctx, buf, pinned_get(slot, 0))?;
     let mut i = 1;
     while i + 1 < length {
         if i % BATCHSIZE == 0 {
             buf.push(op::ADDITEMS);
             buf.push(op::MARK);
         }
-        save(ctx, buf, items[i])?;
+        save(ctx, buf, pinned_get(slot, i))?;
         i += 1;
     }
     if length > 1 {
-        save(ctx, buf, items[length - 1])?;
+        save(ctx, buf, pinned_get(slot, length - 1))?;
     }
     buf.push(op::ADDITEMS);
     Ok(())
@@ -731,17 +832,27 @@ fn save_frozenset(
             crate::typedef::gettypeobject(&pyre_object::setobject::FROZENSET_TYPE);
         return save_reduce(ctx, buf, &[w_frozenset_type, w_args], Some(w_obj));
     }
+    // Pin the frozenset and snapshot its members into a pinned Python `list`
+    // re-read per save (a recursive save can relocate them); the frozenset
+    // itself is re-read for the memo check after the saves.
+    let _roots = pyre_object::gc_roots::push_roots();
+    pyre_object::gc_roots::pin_root(w_obj);
+    let fs_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let items = unsafe {
+        pyre_object::setobject::w_set_items(pyre_object::gc_roots::shadow_stack_get(fs_slot))
+    };
+    let slot = pin_items(items);
     buf.push(op::MARK);
-    let items = unsafe { pyre_object::setobject::w_set_items(w_obj) };
-    for &e in &items {
-        save(ctx, buf, e)?;
+    let n = pinned_len(slot);
+    for i in 0..n {
+        save(ctx, buf, pinned_get(slot, i))?;
     }
-    if let Some(idx) = ctx.memo_get(w_obj) {
+    if let Some(idx) = ctx.memo_get(pyre_object::gc_roots::shadow_stack_get(fs_slot)) {
         buf.push(op::POP);
         write_get(ctx, buf, idx);
     } else {
         buf.push(op::FROZENSET);
-        memoize(ctx, buf, w_obj);
+        memoize(ctx, buf, pyre_object::gc_roots::shadow_stack_get(fs_slot));
     }
     Ok(())
 }
@@ -870,34 +981,55 @@ fn save_raw_bytearray(buf: &mut Framer, data: &[u8]) {
     }
 }
 
-/// `interp_pickle.py _batch_appends` (generic bin path). Single item →
-/// APPEND; otherwise MARK … APPENDS in batches of `BATCHSIZE`.
-fn batch_appends(
-    ctx: &mut PickleCtx,
-    buf: &mut Framer,
-    items: &[PyObjectRef],
-) -> Result<(), PyError> {
+/// Build a Python `list` from `items` and pin it in the shadow stack,
+/// returning its slot.  `w_list_new` pins each element across its own
+/// allocation, so the snapshot is captured safely; thereafter the GC walks
+/// the list and rewrites its entries, so `pinned_get` reads the relocated
+/// element even after the recursive `save` calls below trigger collections.
+fn pin_items(items: Vec<PyObjectRef>) -> usize {
+    let w_list = pyre_object::listobject::w_list_new(items);
+    pyre_object::gc_roots::pin_root(w_list);
+    pyre_object::gc_roots::shadow_stack_len() - 1
+}
+
+/// Length of the pinned list at `slot`.
+fn pinned_len(slot: usize) -> usize {
+    let list = pyre_object::gc_roots::shadow_stack_get(slot);
+    unsafe { pyre_object::listobject::w_list_len(list) }
+}
+
+/// Element `i` of the pinned list at `slot`, re-read so a relocation of the
+/// element (or the list) since the last access is observed.
+fn pinned_get(slot: usize, i: usize) -> PyObjectRef {
+    let list = pyre_object::gc_roots::shadow_stack_get(slot);
+    unsafe { pyre_object::listobject::w_list_getitem(list, i as i64) }.unwrap()
+}
+
+/// `interp_pickle.py _batch_appends`. `slot` pins a Python `list` of the
+/// items; each is re-read from the (GC-walked) list right before saving so a
+/// mid-batch collection cannot leave a stale element behind.
+fn batch_appends(ctx: &mut PickleCtx, buf: &mut Framer, slot: usize) -> Result<(), PyError> {
+    let n = pinned_len(slot);
     if !ctx.bin {
         // proto 0 — no APPENDS, one APPEND per item.
-        for &item in items {
-            save(ctx, buf, item)?;
+        for i in 0..n {
+            save(ctx, buf, pinned_get(slot, i))?;
             buf.push(op::APPEND);
         }
         return Ok(());
     }
-    let n = items.len();
     let mut i = 0;
     while i < n {
         if i + 1 == n {
             // Exactly one item left.
-            save(ctx, buf, items[i])?;
+            save(ctx, buf, pinned_get(slot, i))?;
             buf.push(op::APPEND);
             return Ok(());
         }
         buf.push(op::MARK);
         let mut cnt = 0;
         while i < n && cnt < BATCHSIZE {
-            save(ctx, buf, items[i])?;
+            save(ctx, buf, pinned_get(slot, i))?;
             i += 1;
             cnt += 1;
         }
@@ -907,37 +1039,35 @@ fn batch_appends(
 }
 
 /// `interp_pickle.py _batch_setitems` (bin path). Single pair → SETITEM;
-/// otherwise MARK … SETITEMS in batches of `BATCHSIZE`.
-fn batch_setitems(
-    ctx: &mut PickleCtx,
-    buf: &mut Framer,
-    items: &[(PyObjectRef, PyObjectRef)],
-) -> Result<(), PyError> {
+/// otherwise MARK … SETITEMS in batches of `BATCHSIZE`. `slot` pins a flat
+/// `[k0, v0, k1, v1, …]` Python `list`, re-read per access (see
+/// `batch_appends`).
+fn batch_setitems(ctx: &mut PickleCtx, buf: &mut Framer, slot: usize) -> Result<(), PyError> {
+    let npairs = pinned_len(slot) / 2;
     if !ctx.bin {
         // proto 0 — no SETITEMS, one SETITEM per pair.
-        for &(k, v) in items {
-            save(ctx, buf, k)?;
-            save(ctx, buf, v)?;
+        for p in 0..npairs {
+            save(ctx, buf, pinned_get(slot, 2 * p))?;
+            save(ctx, buf, pinned_get(slot, 2 * p + 1))?;
             buf.push(op::SETITEM);
         }
         return Ok(());
     }
-    let n = items.len();
-    let mut i = 0;
-    while i < n {
-        if i + 1 == n {
+    let mut p = 0;
+    while p < npairs {
+        if p + 1 == npairs {
             // Exactly one pair left.
-            save(ctx, buf, items[i].0)?;
-            save(ctx, buf, items[i].1)?;
+            save(ctx, buf, pinned_get(slot, 2 * p))?;
+            save(ctx, buf, pinned_get(slot, 2 * p + 1))?;
             buf.push(op::SETITEM);
             return Ok(());
         }
         buf.push(op::MARK);
         let mut cnt = 0;
-        while i < n && cnt < BATCHSIZE {
-            save(ctx, buf, items[i].0)?;
-            save(ctx, buf, items[i].1)?;
-            i += 1;
+        while p < npairs && cnt < BATCHSIZE {
+            save(ctx, buf, pinned_get(slot, 2 * p))?;
+            save(ctx, buf, pinned_get(slot, 2 * p + 1))?;
+            p += 1;
             cnt += 1;
         }
         buf.push(op::SETITEMS);
@@ -964,9 +1094,13 @@ fn write_get(ctx: &PickleCtx, buf: &mut Framer, idx: usize) {
 /// `interp_pickle.py memoize` — record the object's identity and write the
 /// put opcode.
 fn memoize(ctx: &mut PickleCtx, buf: &mut Framer, w_obj: PyObjectRef) {
-    let idx = ctx.memo_size;
-    ctx.memo_size += 1;
-    ctx.memo.insert(w_obj as usize, idx);
+    let list = ctx.memo_list();
+    let idx = unsafe { pyre_object::listobject::w_list_len(list) };
+    // Compute the move-stable hash before the append, whose growth could
+    // relocate `w_obj` and leave the local stale.
+    let h = pyre_object::gc_hook::gc_identity_hash(w_obj as usize);
+    unsafe { pyre_object::listobject::w_list_append(list, w_obj) };
+    ctx.index.entry(h).or_default().push(idx);
     if ctx.proto >= 4 {
         buf.push(op::MEMOIZE);
     } else if ctx.bin {
@@ -1060,9 +1194,10 @@ fn save_global(
             pyre_object::tupleobject::w_tuple_new(vec![parent, pyre_object::w_str_new(lastname)]);
         save_reduce(ctx, buf, &[w_getattr, w_args], None)?;
     } else {
-        // protocol < 3 applies the py3 → py2 `_compat_pickle` reverse map
-        // (fix_imports); protocol 3 writes the name verbatim.
-        let (module_name, name) = if ctx.proto < 3 {
+        // protocol < 3 with `fix_imports` applies the py3 → py2
+        // `_compat_pickle` reverse map; protocol 3 (or `fix_imports=False`)
+        // writes the name verbatim.
+        let (module_name, name) = if ctx.proto < 3 && ctx.fix_imports {
             crate::module::_pickle::compat_map(&module_name, &name, true)
         } else {
             (module_name, name)
@@ -1093,79 +1228,140 @@ fn save_reduce(
     rv: &[PyObjectRef],
     w_obj_opt: Option<PyObjectRef>,
 ) -> Result<(), PyError> {
-    let w_func = rv[0];
-    let w_args = rv[1];
-    let nonnull = |i: usize| {
-        rv.get(i)
-            .copied()
-            .filter(|&x| !unsafe { pyre_object::is_none(x) })
+    let _roots = pyre_object::gc_roots::push_roots();
+    // Recursive saves (and the reduce callbacks they invoke) relocate young
+    // objects, so pin the reduce values in a GC-walked `list` and re-read each
+    // one immediately before it is consumed.
+    let rv_len = rv.len();
+    let rv_slot = pin_items(rv.to_vec());
+    let w_obj_slot = match w_obj_opt {
+        Some(o) => {
+            pyre_object::gc_roots::pin_root(o);
+            Some(pyre_object::gc_roots::shadow_stack_len() - 1)
+        }
+        None => None,
     };
-    let w_state = nonnull(2);
-    let w_listitems = nonnull(3);
-    let w_dictitems = nonnull(4);
-    let w_state_setter = nonnull(5);
+    let rv_get = |i: usize| pinned_get(rv_slot, i);
+    let present = |i: usize| i < rv_len && !unsafe { pyre_object::is_none(pinned_get(rv_slot, i)) };
 
-    if !unsafe { pyre_object::is_tuple(w_args) } {
+    if !unsafe { pyre_object::is_tuple(rv_get(1)) } {
         return Err(pickling_error("args from save_reduce() must be a tuple"));
     }
-    if !crate::baseobjspace::callable_w(w_func) {
+    if !crate::baseobjspace::callable_w(rv_get(0)) {
         return Err(pickling_error("func from save_reduce() must be callable"));
     }
 
-    let func_name = func_name_str(w_func);
-    let args_w = tuple_items(w_args);
+    let has_state = present(2);
+    let has_listitems = present(3);
+    let has_dictitems = present(4);
+    let has_state_setter = present(5);
+
+    let func_name = func_name_str(rv_get(0));
+
+    // Pin the args tuple; its elements are re-read per save.
+    pyre_object::gc_roots::pin_root(rv_get(1));
+    let args_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let args_get = |i: usize| unsafe {
+        pyre_object::tupleobject::w_tuple_getitem(
+            pyre_object::gc_roots::shadow_stack_get(args_slot),
+            i as i64,
+        )
+        .unwrap()
+    };
+    let args_len = unsafe {
+        pyre_object::tupleobject::w_tuple_len(pyre_object::gc_roots::shadow_stack_get(args_slot))
+    };
 
     if ctx.proto >= 2 && func_name.as_deref() == Some("__newobj_ex__") {
-        if args_w.len() != 3 {
+        if args_len != 3 {
             return Err(pickling_error("__newobj_ex__ requires three args"));
         }
-        let (w_cls, w_a, w_kw) = (args_w[0], args_w[1], args_w[2]);
-        if crate::baseobjspace::findattr(w_cls, "__new__").is_none() {
+        if crate::baseobjspace::findattr(args_get(0), "__new__").is_none() {
             return Err(pickling_error(
                 "args[0] from __newobj_ex__ args has no __new__",
             ));
         }
         if ctx.proto >= 4 {
-            save(ctx, buf, w_cls)?;
-            save(ctx, buf, w_a)?;
-            save(ctx, buf, w_kw)?;
+            save(ctx, buf, args_get(0))?;
+            save(ctx, buf, args_get(1))?;
+            save(ctx, buf, args_get(2))?;
             buf.push(op::NEWOBJ_EX);
         } else {
-            // protocol 2/3 with keyword args needs functools.partial.
-            let kw_len = unsafe { pyre_object::dictmultiobject::w_dict_items(w_kw) }.len();
-            if kw_len > 0 {
-                return Err(PyError::not_implemented(
-                    "_pickle: __newobj_ex__ with kwargs at protocol < 4",
+            // protocol 2/3: encode the constructor as
+            // `partial(cls.__new__, cls, *args, **kwargs)`, then REDUCE with
+            // an empty argument tuple.
+            let functools = import_module("functools")?;
+            let w_partial = crate::baseobjspace::getattr_str(functools, "partial")?;
+            pyre_object::gc_roots::pin_root(w_partial);
+            let partial_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+            let w_new = crate::baseobjspace::getattr_str(args_get(0), "__new__")?;
+            pyre_object::gc_roots::pin_root(w_new);
+            let new_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+            // keyword arguments from the `kwargs` dict (re-read fresh; no GC
+            // until the `partial` construction below).
+            let kw_items = unsafe { pyre_object::dictmultiobject::w_dict_items(args_get(2)) };
+            let mut kwargs = Vec::with_capacity(kw_items.len());
+            for (k, v) in kw_items {
+                if !unsafe { pyre_object::is_str(k) } {
+                    return Err(pickling_error("__newobj_ex__ kwargs keys must be strings"));
+                }
+                kwargs.push((
+                    unsafe { pyre_object::strobject::w_str_get_wtf8(k) }.to_owned(),
+                    v,
                 ));
             }
-            let w_new = crate::baseobjspace::getattr_str(w_cls, "__new__")?;
-            let mut full = vec![w_cls];
-            full.extend(tuple_items(w_a));
-            save(ctx, buf, w_new)?;
-            save(ctx, buf, pyre_object::tupleobject::w_tuple_new(full))?;
+            // positional: (cls.__new__, cls, *args).
+            let mut pos = vec![
+                pyre_object::gc_roots::shadow_stack_get(new_slot),
+                args_get(0),
+            ];
+            pos.extend(tuple_items(args_get(1)));
+            let ec = crate::call::getexecutioncontext();
+            if ec.is_null() {
+                return Err(pickling_error("no execution context for __newobj_ex__"));
+            }
+            let frame = unsafe { (*ec).gettopframe() };
+            if frame.is_null() {
+                return Err(pickling_error("no frame for __newobj_ex__ at protocol < 4"));
+            }
+            let w_func = crate::call::call_with_kwargs(
+                unsafe { &mut *frame },
+                pyre_object::gc_roots::shadow_stack_get(partial_slot),
+                &pos,
+                &kwargs,
+            )?;
+            save(ctx, buf, w_func)?;
+            save(ctx, buf, pyre_object::tupleobject::w_tuple_new(Vec::new()))?;
             buf.push(op::REDUCE);
         }
     } else if ctx.proto >= 2 && func_name.as_deref() == Some("__newobj__") {
-        if args_w.is_empty() {
+        if args_len == 0 {
             return Err(pickling_error("__newobj__ requires at least one arg"));
         }
-        let w_cls = args_w[0];
-        if crate::baseobjspace::findattr(w_cls, "__new__").is_none() {
+        if crate::baseobjspace::findattr(args_get(0), "__new__").is_none() {
             return Err(pickling_error(
                 "args[0] from __newobj__ args has no __new__",
             ));
         }
-        let w_newargs = pyre_object::tupleobject::w_tuple_new(args_w[1..].to_vec());
-        save(ctx, buf, w_cls)?;
-        save(ctx, buf, w_newargs)?;
+        let w_newargs =
+            pyre_object::tupleobject::w_tuple_new((1..args_len).map(|i| args_get(i)).collect());
+        pyre_object::gc_roots::pin_root(w_newargs);
+        let newargs_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+        save(ctx, buf, args_get(0))?;
+        save(
+            ctx,
+            buf,
+            pyre_object::gc_roots::shadow_stack_get(newargs_slot),
+        )?;
         buf.push(op::NEWOBJ);
     } else {
-        save(ctx, buf, w_func)?;
-        save(ctx, buf, w_args)?;
+        save(ctx, buf, rv_get(0))?;
+        save(ctx, buf, rv_get(1))?;
         buf.push(op::REDUCE);
     }
 
-    if let Some(w_obj) = w_obj_opt {
+    if let Some(slot) = w_obj_slot {
+        let w_obj = pyre_object::gc_roots::shadow_stack_get(slot);
         if let Some(idx) = ctx.memo_get(w_obj) {
             buf.push(op::POP);
             write_get(ctx, buf, idx);
@@ -1174,24 +1370,28 @@ fn save_reduce(
         }
     }
 
-    if let Some(li) = w_listitems {
-        let items = drain_iter(li)?;
-        batch_appends(ctx, buf, &items)?;
+    if has_listitems {
+        let items_slot = drain_iter_pinned(rv_get(3))?;
+        batch_appends(ctx, buf, items_slot)?;
     }
-    if let Some(di) = w_dictitems {
-        let pairs = drain_iter_pairs(di)?;
-        batch_setitems(ctx, buf, &pairs)?;
+    if has_dictitems {
+        let pairs_slot = drain_iter_pairs_pinned(rv_get(4))?;
+        batch_setitems(ctx, buf, pairs_slot)?;
     }
-    if let Some(st) = w_state {
-        if let Some(setter) = w_state_setter {
-            save(ctx, buf, setter)?;
-            save(ctx, buf, w_obj_opt.unwrap())?;
-            save(ctx, buf, st)?;
+    if has_state {
+        if has_state_setter {
+            save(ctx, buf, rv_get(5))?;
+            save(
+                ctx,
+                buf,
+                pyre_object::gc_roots::shadow_stack_get(w_obj_slot.unwrap()),
+            )?;
+            save(ctx, buf, rv_get(2))?;
             buf.push(op::TUPLE2);
             buf.push(op::REDUCE);
             buf.push(op::POP);
         } else {
-            save(ctx, buf, st)?;
+            save(ctx, buf, rv_get(2))?;
             buf.push(op::BUILD);
         }
     }
@@ -1215,33 +1415,65 @@ fn tuple_items(w_tuple: PyObjectRef) -> Vec<PyObjectRef> {
         .collect()
 }
 
-/// Drain an iterable into a `Vec`.
-fn drain_iter(w_iterable: PyObjectRef) -> Result<Vec<PyObjectRef>, PyError> {
+/// Drain an iterable into a freshly-pinned Python `list`, returning its
+/// shadow-stack slot. Appending into a GC-walked `list` as iteration proceeds
+/// keeps every already-yielded item reachable and relocation-tracked — unlike
+/// a Rust `Vec`, whose elements a later `next()` could strand by relocating
+/// them. The iterator object is pinned too, since `next` may collect.
+fn drain_iter_pinned(w_iterable: PyObjectRef) -> Result<usize, PyError> {
+    let slot = pin_items(Vec::new());
     let w_iter = crate::baseobjspace::iter(w_iterable)?;
-    let mut out = Vec::new();
+    pyre_object::gc_roots::pin_root(w_iter);
+    let iter_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     loop {
-        match crate::baseobjspace::next(w_iter) {
-            Ok(item) => out.push(item),
+        match crate::baseobjspace::next(pyre_object::gc_roots::shadow_stack_get(iter_slot)) {
+            Ok(item) => unsafe {
+                pyre_object::listobject::w_list_append(
+                    pyre_object::gc_roots::shadow_stack_get(slot),
+                    item,
+                )
+            },
             Err(e) if e.kind == crate::PyErrorKind::StopIteration => break,
             Err(e) => return Err(e),
         }
     }
-    Ok(out)
+    Ok(slot)
 }
 
-/// Drain an iterable of `(key, value)` pairs into a `Vec`.
-fn drain_iter_pairs(w_iterable: PyObjectRef) -> Result<Vec<(PyObjectRef, PyObjectRef)>, PyError> {
-    let items = drain_iter(w_iterable)?;
-    let mut out = Vec::with_capacity(items.len());
-    for it in items {
+/// Drain an iterable of `(key, value)` pairs into a freshly-pinned, flat
+/// `[k0, v0, k1, v1, …]` Python `list` (see [`drain_iter_pinned`]), returning
+/// its shadow-stack slot.
+fn drain_iter_pairs_pinned(w_iterable: PyObjectRef) -> Result<usize, PyError> {
+    let slot = pin_items(Vec::new());
+    let w_iter = crate::baseobjspace::iter(w_iterable)?;
+    pyre_object::gc_roots::pin_root(w_iter);
+    let iter_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    loop {
+        let it = match crate::baseobjspace::next(pyre_object::gc_roots::shadow_stack_get(iter_slot))
+        {
+            Ok(it) => it,
+            Err(e) if e.kind == crate::PyErrorKind::StopIteration => break,
+            Err(e) => return Err(e),
+        };
         if !unsafe { pyre_object::is_tuple(it) }
             || unsafe { pyre_object::tupleobject::w_tuple_len(it) } != 2
         {
             return Err(pickling_error("dictitems must yield (key, value) pairs"));
         }
+        // `w_list_append` does not collect, so `it`/`k`/`v` stay valid between
+        // the reads and the two appends.
         let k = unsafe { pyre_object::tupleobject::w_tuple_getitem(it, 0).unwrap() };
         let v = unsafe { pyre_object::tupleobject::w_tuple_getitem(it, 1).unwrap() };
-        out.push((k, v));
+        unsafe {
+            pyre_object::listobject::w_list_append(
+                pyre_object::gc_roots::shadow_stack_get(slot),
+                k,
+            );
+            pyre_object::listobject::w_list_append(
+                pyre_object::gc_roots::shadow_stack_get(slot),
+                v,
+            );
+        }
     }
-    Ok(out)
+    Ok(slot)
 }

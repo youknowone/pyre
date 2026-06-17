@@ -397,11 +397,9 @@ crate::py_module! {
             obj: PyObjectRef,
             file: PyObjectRef,
             #[default(pyre_object::w_none())] protocol: PyObjectRef,
-            #[default(pyre_object::w_none())] fix_imports: PyObjectRef,
+            #[default(pyre_object::boolobject::w_bool_from(true))] fix_imports: PyObjectRef,
             #[default(pyre_object::w_none())] buffer_callback: PyObjectRef,
         ) -> Result<PyObjectRef, PyError> {
-            // `fix_imports` is applied at the save sites by protocol.
-            let _ = fix_imports;
             let proto = pickler::normalize_protocol(protocol)?;
             pickler::check_buffer_callback(buffer_callback, proto)?;
             let _roots = pyre_object::gc_roots::push_roots();
@@ -412,8 +410,10 @@ crate::py_module! {
                 proto,
                 proto >= 1,
                 proto >= 4,
+                crate::baseobjspace::is_true(fix_imports),
                 pyre_object::PY_NULL,
                 buffer_callback,
+                pyre_object::listobject::w_list_new(Vec::new()),
             )?;
             let file = pyre_object::gc_roots::shadow_stack_get(file_slot);
             call_meth(file, "write", &[w_bytes])?;
@@ -424,10 +424,9 @@ crate::py_module! {
         fn dumps(
             obj: PyObjectRef,
             #[default(pyre_object::w_none())] protocol: PyObjectRef,
-            #[default(pyre_object::w_none())] fix_imports: PyObjectRef,
+            #[default(pyre_object::boolobject::w_bool_from(true))] fix_imports: PyObjectRef,
             #[default(pyre_object::w_none())] buffer_callback: PyObjectRef,
         ) -> Result<PyObjectRef, PyError> {
-            let _ = fix_imports;
             let proto = pickler::normalize_protocol(protocol)?;
             pickler::check_buffer_callback(buffer_callback, proto)?;
             pickler::pickle_core(
@@ -435,15 +434,17 @@ crate::py_module! {
                 proto,
                 proto >= 1,
                 proto >= 4,
+                crate::baseobjspace::is_true(fix_imports),
                 pyre_object::PY_NULL,
                 buffer_callback,
+                pyre_object::listobject::w_list_new(Vec::new()),
             )
         }
 
         // `pickle.load` — read a pickle from `file`.
         fn load(
             file: PyObjectRef,
-            #[default(pyre_object::w_none())] fix_imports: PyObjectRef,
+            #[default(pyre_object::boolobject::w_bool_from(true))] fix_imports: PyObjectRef,
             #[default(pyre_object::w_none())] encoding: PyObjectRef,
             #[default(pyre_object::w_none())] errors: PyObjectRef,
             #[default(pyre_object::w_none())] buffers: PyObjectRef,
@@ -458,7 +459,7 @@ crate::py_module! {
         // `pickle.loads` — read a pickle from a `bytes` object.
         fn loads(
             data: PyObjectRef,
-            #[default(pyre_object::w_none())] fix_imports: PyObjectRef,
+            #[default(pyre_object::boolobject::w_bool_from(true))] fix_imports: PyObjectRef,
             #[default(pyre_object::w_none())] encoding: PyObjectRef,
             #[default(pyre_object::w_none())] errors: PyObjectRef,
             #[default(pyre_object::w_none())] buffers: PyObjectRef,

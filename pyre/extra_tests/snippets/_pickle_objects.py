@@ -110,10 +110,12 @@ for proto in range(2, 6):
     assert roundtrip(range(2, 10, 3), proto) == range(2, 10, 3)
 
 
-# __getnewargs_ex__ with keyword args forces NEWOBJ_EX (proto >= 4) carrying
-# a non-empty kwargs dict; the unpickler must call cls.__new__(cls, *a, **kw).
-# A class-level sink records what __new__ received (the __dict__ state then
-# overwrites the instance attrs, so the sink is the only witness of kwargs).
+# __getnewargs_ex__ with keyword args: protocol >= 4 emits NEWOBJ_EX with a
+# non-empty kwargs dict; protocols 2/3 encode the constructor as
+# partial(cls.__new__, cls, *args, **kwargs). Either way the unpickler must end
+# up calling cls.__new__(cls, *a, **kw). A class-level sink records what __new__
+# received (the __dict__ state then overwrites the instance attrs, so the sink
+# is the only witness of kwargs).
 class NewArgsEx:
     seen = []
 
@@ -132,7 +134,7 @@ class NewArgsEx:
         return type(self) is type(o) and self.a == o.a and self.b == o.b
 
 
-for proto in range(4, 6):
+for proto in range(2, 6):
     NewArgsEx.seen.clear()
     roundtrip(NewArgsEx(1, 2), proto)
     # The load-time __new__ got the keyword arg from __getnewargs_ex__.

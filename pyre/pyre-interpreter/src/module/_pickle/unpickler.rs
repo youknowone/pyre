@@ -25,6 +25,8 @@ pub struct W_Unpickler {
     w_frame: PyObjectRef,
     frame_index: i64,
     proto: i64,
+    /// Apply the `_compat_pickle` py2→py3 name remap at protocol < 3.
+    fix_imports: bool,
     /// Out-of-band `buffers` iterator (proto 5), or None.
     w_buffers: PyObjectRef,
 }
@@ -47,6 +49,7 @@ impl W_Unpickler {
             w_frame: pyre_object::w_none(),
             frame_index: 0,
             proto: 0,
+            fix_imports: true,
             w_buffers: pyre_object::w_none(),
         })
     }
@@ -54,20 +57,23 @@ impl W_Unpickler {
     fn __init__(
         &mut self,
         file: PyObjectRef,
-        #[default(pyre_object::w_none())] fix_imports: PyObjectRef,
+        #[default(pyre_object::boolobject::w_bool_from(true))] fix_imports: PyObjectRef,
         #[default(pyre_object::w_none())] encoding: PyObjectRef,
         #[default(pyre_object::w_none())] errors: PyObjectRef,
         #[default(pyre_object::w_none())] buffers: PyObjectRef,
     ) -> Result<(), PyError> {
-        // `fix_imports` / `encoding` / `errors` govern the legacy py2 byte
-        // string decode path; pyre stores unicode natively, so they are
-        // accepted for signature compatibility.
-        let _ = (fix_imports, encoding, errors);
+        // `encoding` / `errors` govern the legacy py2 byte string decode path;
+        // pyre stores unicode natively, so they are accepted for signature
+        // compatibility. `fix_imports` gates the proto-< 3 py2→py3 name remap.
+        let _ = (encoding, errors);
+        self.fix_imports = crate::baseobjspace::is_true(fix_imports);
         self.w_file_read = crate::baseobjspace::getattr_str(file, "read")?;
         self.w_file_readline = crate::baseobjspace::getattr_str(file, "readline")?;
         self.w_stack = pyre_object::w_none();
         self.w_metastack = pyre_object::w_none();
-        self.w_memo = pyre_object::w_none();
+        // The memo persists across `load` calls (a multi-object stream may
+        // back-reference an object memoized by an earlier load).
+        self.w_memo = pyre_object::dictmultiobject::w_dict_new();
         self.memo_index = 0;
         self.w_frame = pyre_object::w_none();
         self.frame_index = 0;
@@ -82,11 +88,15 @@ impl W_Unpickler {
     }
 
     fn load(&mut self) -> Result<PyObjectRef, PyError> {
-        // Fresh stack / metastack / memo each load.
+        // Fresh stack each load; the memo persists across `load` calls so a
+        // later object can back-reference one memoized by an earlier load
+        // (lazily created when the unpickler was built only via `__new__`).
         self.w_stack = pyre_object::listobject::w_list_new(Vec::new());
         self.w_metastack = pyre_object::listobject::w_list_new(Vec::new());
-        self.w_memo = pyre_object::dictmultiobject::w_dict_new();
-        self.memo_index = 0;
+        if unsafe { pyre_object::is_none(self.w_memo) } {
+            self.w_memo = pyre_object::dictmultiobject::w_dict_new();
+            self.memo_index = 0;
+        }
         self.w_frame = pyre_object::w_none();
         self.frame_index = 0;
         self.proto = 0;
@@ -508,7 +518,8 @@ fn dispatch(slot: usize, opcode: u8) -> Result<(), PyError> {
             let module = read_line(slot)?;
             let name = read_line(slot)?;
             let proto = cur(slot).proto;
-            push(slot, find_class(&module, &name, proto)?);
+            let fix_imports = cur(slot).fix_imports;
+            push(slot, find_class(&module, &name, proto, fix_imports)?);
         }
         x if x == op::STACK_GLOBAL => {
             let w_name = pop(slot)?;
@@ -520,7 +531,8 @@ fn dispatch(slot: usize, opcode: u8) -> Result<(), PyError> {
             let name = unsafe { pyre_object::strobject::w_str_get_value(w_name) }.to_string();
             let module = unsafe { pyre_object::strobject::w_str_get_value(w_module) }.to_string();
             let proto = cur(slot).proto;
-            push(slot, find_class(&module, &name, proto)?);
+            let fix_imports = cur(slot).fix_imports;
+            push(slot, find_class(&module, &name, proto, fix_imports)?);
         }
         x if x == op::REDUCE => {
             let w_args = pop(slot)?;
@@ -612,7 +624,7 @@ fn dispatch(slot: usize, opcode: u8) -> Result<(), PyError> {
         x if x == op::INST => {
             let module = read_line(slot)?;
             let name = read_line(slot)?;
-            let w_cls = find_class(&module, &name, cur(slot).proto)?;
+            let w_cls = find_class(&module, &name, cur(slot).proto, cur(slot).fix_imports)?;
             let w_args = pop_mark(slot)?;
             let v = instantiate(w_cls, w_args)?;
             push(slot, v);
@@ -715,10 +727,15 @@ fn read_line_int(slot: usize) -> Result<i64, PyError> {
 /// builtins installed on the underlying storage. Other non-dotted names
 /// resolve through the module's `__dict__` (dict subscript), and dotted
 /// (protocol >= 4 nested) names fall back to the attribute walk.
-fn find_class(module_name: &str, name: &str, proto: i64) -> Result<PyObjectRef, PyError> {
-    // protocol < 3 applies the py2 → py3 `_compat_pickle` forward map
-    // (fix_imports) before resolution.
-    let (module_name, name) = if proto < 3 {
+fn find_class(
+    module_name: &str,
+    name: &str,
+    proto: i64,
+    fix_imports: bool,
+) -> Result<PyObjectRef, PyError> {
+    // protocol < 3 with `fix_imports` applies the py2 → py3 `_compat_pickle`
+    // forward map before resolution; otherwise the name is resolved literally.
+    let (module_name, name) = if proto < 3 && fix_imports {
         crate::module::_pickle::compat_map(module_name, name, false)
     } else {
         (module_name.to_string(), name.to_string())
