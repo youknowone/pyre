@@ -62,7 +62,10 @@ not even be imported/run — an interpreter or stdlib-compat gap) · `CRASH`
 ## CI
 
 - `.github/workflows/pyre-ci.yml` job `cpython-tests` — gates PRs on the
-  baseline-`PASS` subset, dynasm with **JIT on** (`MAJIT_STRICT=1`), ubuntu.
+  baseline-`PASS` subset, dynasm with **JIT on** (`MAJIT_STRICT=1`), on
+  `macos-latest` (aarch64). The baseline is recorded on darwin-aarch64 and the
+  JIT codegen is architecture-specific, so the gate runs on the same arch the
+  baseline was observed on (x86_64 JIT-on is a separate, unstable surface).
 - `.github/workflows/pyre-cpython-nightly.yml` — non-gating nightly `--full`
   across three lanes (dynasm JIT-on, dynasm JIT-off, cranelift) with reports
   uploaded as artifacts. A module that passes JIT-off but not JIT-on is a JIT

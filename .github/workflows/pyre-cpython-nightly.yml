@@ -23,8 +23,11 @@ permissions:
 
 jobs:
   full-suite:
-    name: full CPython suite (ubuntu)
-    runs-on: ubuntu-24.04
+    name: full CPython suite (macos)
+    # aarch64: the gate's baseline is darwin-aarch64 and the JIT codegen is
+    # arch-specific, so the exploratory reports (incl. the JIT-divergence
+    # signal) are produced on the same arch as the gate.
+    runs-on: macos-latest
     timeout-minutes: 120
     env:
       PYRE_SHARED_BUILD: ${{ github.workspace }}/.pyre-build

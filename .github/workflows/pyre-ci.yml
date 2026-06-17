@@ -269,7 +269,11 @@ jobs:
 
   cpython-tests:
     name: CPython suite (gate)
-    runs-on: ubuntu-24.04
+    # aarch64: the baseline is recorded on darwin-aarch64 and the JIT codegen is
+    # arch-specific, so the gate runs where the baseline was observed.
+    # macos-latest is the only aarch64 OS in prepare-charon-llbc's matrix, so its
+    # Charon/LLBC caches (keyed by runner.os-runner.arch) are already prepared.
+    runs-on: macos-latest
     needs: prepare-charon-llbc
     if: ${{ always() }}
     timeout-minutes: 30

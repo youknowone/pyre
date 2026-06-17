@@ -35,7 +35,7 @@ passes is reported as an improvement but does not fail the run (run with
 
 Usage:
     python3 pyre/cpython_tests/run.py [--backend dynasm|cranelift]
-        [--no-jit] [--mode unittest|regrtest] [--jobs N]
+        [--no-jit] [--mode script|module|regrtest] [--jobs N]
         [--timeout SECONDS] [--filter SUBSTR] [--list]
         [--baseline PATH] [--update-baseline] [--strict-baseline] [--full]
 """
@@ -229,6 +229,13 @@ def expected_status(baseline: dict, module: str, backend: str) -> str | None:
 
 # ── main ─────────────────────────────────────────────────────────────
 
+def positive_int(value: str) -> int:
+    ivalue = int(value)
+    if ivalue <= 0:
+        raise argparse.ArgumentTypeError(f"must be a positive integer, got {value!r}")
+    return ivalue
+
+
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -236,8 +243,8 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--binary", help="explicit interpreter path (overrides --backend)")
     ap.add_argument("--no-jit", action="store_true", help="set PYRE_NO_JIT=1")
     ap.add_argument("--mode", choices=("script", "module", "regrtest"), default="script")
-    ap.add_argument("--jobs", type=int, default=os.cpu_count() or 4)
-    ap.add_argument("--timeout", type=int, default=300)
+    ap.add_argument("--jobs", type=positive_int, default=os.cpu_count() or 4)
+    ap.add_argument("--timeout", type=positive_int, default=300)
     ap.add_argument("--filter", help="only modules whose dotted name contains this")
     ap.add_argument("--list", action="store_true", help="list selected modules and exit")
     ap.add_argument("--baseline", type=Path, default=DEFAULT_BASELINE)
@@ -366,14 +373,17 @@ def main() -> int:
         print(f"\n── REGRESSIONS ({len(regressions)}) ──")
         for line in regressions:
             print(f"  - {line}")
-        return 1
+        # `--full` is report-only (the nightly exploratory lanes rely on it);
+        # never let a current PASS regression fail an exploratory run.
+        if not args.full:
+            return 1
 
-    if args.strict_baseline and improvements:
+    if args.strict_baseline and improvements and not args.full:
         print("\nstrict: newly-passing modules must be recorded "
               "(run --update-baseline)")
         return 1
 
-    print("\nno regressions")
+    print("\nno regressions" if not regressions else "\n(--full: regressions reported, not gated)")
     return 0
 
 

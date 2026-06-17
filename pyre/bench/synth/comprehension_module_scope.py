@@ -4,7 +4,7 @@
 # fast<->locals sync must skip the hidden slot, otherwise the next global
 # store erases the just-bound name and reading it raises NameError.
 
-squares = [n for n in range(5)]   # `n` is a module-scope hidden fast local
+squares = [n for n in range(5)]   # noqa: C416 - `n` is a module-scope hidden fast local (comprehension form is the point)
 n = 100                           # rebind `n` as a real global
 total = 0                         # a second global store must not erase `n`
 
