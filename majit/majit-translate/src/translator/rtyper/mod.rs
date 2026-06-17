@@ -33,6 +33,7 @@ pub mod rlist;
 pub mod rmodel;
 pub mod rnone;
 pub mod rpbc;
+pub mod rrange;
 pub mod rstr;
 pub mod rtuple;
 pub mod rtyper;

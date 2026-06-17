@@ -144,6 +144,9 @@ pub enum ReprClassId {
     WeakRefRepr,
     /// `rweakref.py:67 EmulatedWeakRefRepr(BaseWeakRefRepr)`.
     EmulatedWeakRefRepr,
+    /// `rrange.py:43 RangeRepr(AbstractRangeRepr)` — the immutable
+    /// `range()`-result list repr (`GcStruct("range", start, stop)`).
+    RangeRepr,
 }
 
 impl ReprClassId {
@@ -197,6 +200,7 @@ impl ReprClassId {
             AbstractStringRepr => &[AbstractStringRepr, Repr],
             WeakRefRepr => &[WeakRefRepr, Repr],
             EmulatedWeakRefRepr => &[EmulatedWeakRefRepr, Repr],
+            RangeRepr => &[RangeRepr, Repr],
         }
     }
 }

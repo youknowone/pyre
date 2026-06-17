@@ -9133,7 +9133,7 @@ mod tests {
 
     #[test]
     fn extract_fmt_chain_recovers_pieces_and_args_cross_block() {
-        use super::{extract_fmt_chain, FmtArgKind};
+        use super::{FmtArgKind, extract_fmt_chain};
         use crate::flowspace::model::Variable;
         use crate::model::{
             CallTarget, FieldDescriptor, FunctionGraph, Link, OpKind, SpaceOperation, ValueType,
@@ -9285,7 +9285,7 @@ mod tests {
 
     #[test]
     fn emit_fmt_concat_builds_interleaved_str_add_fold() {
-        use super::{emit_fmt_concat, FmtArg, FmtArgKind, FmtChain};
+        use super::{FmtArg, FmtArgKind, FmtChain, emit_fmt_concat};
         use crate::flowspace::model::Variable;
         use crate::model::{CallTarget, FunctionGraph, OpKind};
 
@@ -9326,9 +9326,7 @@ mod tests {
         };
         let add_operands = |i: usize| -> (u64, u64) {
             match &ops[i].kind {
-                OpKind::BinOp {
-                    op, lhs, rhs, ..
-                } if op == "add" => (lhs.id(), rhs.id()),
+                OpKind::BinOp { op, lhs, rhs, .. } if op == "add" => (lhs.id(), rhs.id()),
                 other => panic!("op[{i}] not an add: {other:?}"),
             }
         };
@@ -9353,7 +9351,7 @@ mod tests {
     #[test]
     #[ignore]
     fn extract_fmt_chain_matches_real_stack_underflow() {
-        use super::{extract_fmt_chain, FmtArgKind};
+        use super::{FmtArgKind, extract_fmt_chain};
         use crate::model::{CallTarget, OpKind};
 
         let path = concat!(
@@ -9374,7 +9372,9 @@ mod tests {
                     target: CallTarget::FunctionPath { segments },
                     args,
                     ..
-                } if super::fmt_path_ends_with(segments, &["fmt", "format"]) => args.first().cloned(),
+                } if super::fmt_path_ends_with(segments, &["fmt", "format"]) => {
+                    args.first().cloned()
+                }
                 _ => None,
             })
             .expect("alloc::fmt::format call present");

@@ -2935,13 +2935,16 @@ pub fn rtyper_makerepr(
             //
             //   1. `range_step is not None and not mutated and
             //      not SomeImpossibleValue` → `RangeRepr(range_step)`
-            //      (lltypesystem/rrange.py). Not ported — `RangeRepr`
-            //      has no Rust counterpart yet (the whole `rrange.py`
-            //      surface is deferred, see `SomeIterator` below). A
-            //      range-list is NOT array-backed, so the `Err` arm
-            //      below skips it rather than mis-lowering it as a
-            //      `FixedSizeListRepr` (whose `getarraysize` / item-load
-            //      ops would compile to invalid reads off a non-array).
+            //      (lltypesystem/rrange.py). The step-1 form
+            //      (`range(n)` / `range(a, b)`) lands on
+            //      [`rrange::RangeRepr`]; the general const-step != 1
+            //      and variable-step (`RANGEST`) lengths need
+            //      `ll_rangelen`'s `int_floordiv` (not yet a recognised
+            //      low-level op), so they fall to the `Err` arm. A
+            //      range-list is NOT array-backed, so this never
+            //      mis-lowers as a `FixedSizeListRepr` (whose
+            //      `getarraysize` / item-load ops would compile to
+            //      invalid reads off a non-array).
             //   2. resized listdef → `ListRepr` (`GcStruct("list",
             //      length, items)`) — deferred (the `Err` arm below).
             //   3. non-resized → `FixedSizeListRepr`.
@@ -2960,13 +2963,21 @@ pub fn rtyper_makerepr(
                 let li = li_rc.borrow();
                 (li.resized, li.range_step)
             };
-            if range_step.is_some() {
-                Err(TyperError::missing_rtype_operation(format!(
-                    "SomeList(range_step={range_step:?}).rtyper_makerepr — port \
-                     rpython/rtyper/lltypesystem/rrange.py RangeRepr \
-                     (listdef: {:?})",
-                    s_list.listdef
-                )))
+            if let Some(step) = range_step {
+                if step == 1 {
+                    Ok(
+                        std::sync::Arc::new(crate::translator::rtyper::rrange::RangeRepr::new(
+                            step,
+                        )?) as std::sync::Arc<dyn Repr>,
+                    )
+                } else {
+                    Err(TyperError::missing_rtype_operation(format!(
+                        "SomeList(range_step={step}).rtyper_makerepr — general \
+                         RangeRepr (const step != 1 / variable step) deferred; \
+                         ll_rangelen needs int_floordiv lowering (listdef: {:?})",
+                        s_list.listdef
+                    )))
+                }
             } else if resized {
                 Err(TyperError::missing_rtype_operation(format!(
                     "SomeList(resized).rtyper_makerepr — port \
