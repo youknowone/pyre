@@ -1047,7 +1047,7 @@ fn absolute_import(
         let w_mod = load_part(&full_name, part, execution_context)?;
         let Some(module) = w_mod else {
             return Err(crate::PyError::new(
-                crate::PyErrorKind::ImportError,
+                crate::PyErrorKind::ModuleNotFoundError,
                 format!("No module named '{modulename}'"),
             ));
         };
@@ -1087,7 +1087,7 @@ fn absolute_import(
     // `import X.Y` → return the top-level module (X)
     first.ok_or_else(|| {
         crate::PyError::new(
-            crate::PyErrorKind::ImportError,
+            crate::PyErrorKind::ModuleNotFoundError,
             format!("No module named '{modulename}'"),
         )
     })

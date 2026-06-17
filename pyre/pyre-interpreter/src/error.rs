@@ -349,6 +349,8 @@ pub enum PyErrorKind {
     OverflowError,
     ArithmeticError,
     ImportError,
+    /// Subclass of ImportError raised when a module cannot be found.
+    ModuleNotFoundError,
     NotImplementedError,
     AssertionError,
     /// Raised by `_weakref` when a proxy is dereferenced after the
@@ -655,6 +657,7 @@ impl PyError {
             PyErrorKind::OverflowError => ExcKind::OverflowError,
             PyErrorKind::ArithmeticError => ExcKind::ArithmeticError,
             PyErrorKind::ImportError => ExcKind::ImportError,
+            PyErrorKind::ModuleNotFoundError => ExcKind::ModuleNotFoundError,
             PyErrorKind::NotImplementedError => ExcKind::NotImplementedError,
             PyErrorKind::AssertionError => ExcKind::AssertionError,
             PyErrorKind::ReferenceError => ExcKind::ReferenceError,
@@ -721,6 +724,7 @@ impl PyError {
             ExcKind::OverflowError => PyErrorKind::OverflowError,
             ExcKind::ArithmeticError => PyErrorKind::ArithmeticError,
             ExcKind::ImportError => PyErrorKind::ImportError,
+            ExcKind::ModuleNotFoundError => PyErrorKind::ModuleNotFoundError,
             ExcKind::NotImplementedError => PyErrorKind::NotImplementedError,
             ExcKind::AssertionError => PyErrorKind::AssertionError,
             ExcKind::ReferenceError => PyErrorKind::ReferenceError,

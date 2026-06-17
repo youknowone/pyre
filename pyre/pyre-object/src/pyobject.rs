@@ -510,6 +510,10 @@ pub fn all_foreign_pytypes() -> &'static [(&'static PyType, &'static PyType)] {
             &crate::excobject::EXC_EXCEPTION_TYPE,
         ),
         (
+            &crate::excobject::EXC_MODULE_NOT_FOUND_ERROR_TYPE,
+            &crate::excobject::EXC_IMPORT_ERROR_TYPE,
+        ),
+        (
             &crate::excobject::EXC_ASSERTION_ERROR_TYPE,
             &crate::excobject::EXC_EXCEPTION_TYPE,
         ),
