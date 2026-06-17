@@ -8170,6 +8170,30 @@ impl MIFrame {
             return Ok(Some(pyre_interpreter::StepResult::Continue));
         }
 
+        // LOAD_NAME / STORE_NAME walker activation via trait-path delegation.
+        //
+        // Module-level namespace ops whose name operand is an oparg-derived
+        // index into `code.names` — the r0-only arm entry leaves that payload
+        // register unbound (ResidualCallArgUnbound), the same gap the single
+        // LoadFast hook handles.  Resolve the name here and delegate to the
+        // existing `OpcodeStepExecutor::load_name` / `store_name` (the methods
+        // `execute_load_name` / `execute_store_name` call on the trait leg),
+        // whose MIFrame impls record the live namespace lookup/store IR and
+        // advance the vsd shadow via push_value / pop_value — so the early
+        // return bypasses `apply_walker_stack_effect`.
+        if let Instruction::LoadName { namei } = instruction {
+            use pyre_interpreter::OpcodeStepExecutor;
+            let idx = namei.get(op_arg) as usize;
+            OpcodeStepExecutor::load_name(self, code.names[idx].as_ref(), idx)?;
+            return Ok(Some(pyre_interpreter::StepResult::Continue));
+        }
+        if let Instruction::StoreName { namei } = instruction {
+            use pyre_interpreter::OpcodeStepExecutor;
+            let idx = namei.get(op_arg) as usize;
+            OpcodeStepExecutor::store_name(self, code.names[idx].as_ref(), idx)?;
+            return Ok(Some(pyre_interpreter::StepResult::Continue));
+        }
+
         // STORE_FAST walker activation via trait-path delegation.
         //
         // Same oparg-payload shape as LoadFast (the var_num local index is
@@ -9638,15 +9662,17 @@ pub fn production_walker_handles(instruction: &Instruction) -> bool {
             | Instruction::DictMerge { .. }
             | Instruction::SetFunctionAttribute { .. }
             | Instruction::UnpackEx { .. }
-            // Instruction::LoadName / StoreName excluded: the trait
-            // handlers (`load_name_value` / `store_name_value`) carry the
-            // celldict ModuleDictStrategy fast path (LOAD_GLOBAL_cached
-            // celldict.py:285-322: QUASIIMMUT_FIELD version dep + elidable
-            // cell fold; STORE_GLOBAL_cached celldict.py:328-333:
-            // layout-agnostic setitem_str). The walker's jitcode arm for
-            // these aborts with ResidualCallArgUnbound on the &str name
-            // argument — it was never exercised before module-level frames
-            // became portals.
+            // LoadName / StoreName handled by the
+            // dispatch_via_walker_for_opcode entry hook: it resolves the
+            // &str name from `code.names[idx]` and delegates to the trait
+            // `load_name` / `store_name` (celldict ModuleDictStrategy fast
+            // path — LOAD_GLOBAL_cached celldict.py:285-322; STORE_GLOBAL_cached
+            // celldict.py:328-333). The auto-gen arm walk aborts on the
+            // oparg-derived &str name argument (ResidualCallArgUnbound); the
+            // hook pre-resolves it, the same gap the single LoadFast hook
+            // handles.
+            | Instruction::LoadName { .. }
+            | Instruction::StoreName { .. }
             | Instruction::StoreGlobal { .. }
             | Instruction::DeleteAttr { .. }
             | Instruction::ImportName { .. }
