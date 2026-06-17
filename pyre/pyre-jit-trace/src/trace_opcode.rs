@@ -8194,6 +8194,29 @@ impl MIFrame {
             return Ok(Some(pyre_interpreter::StepResult::Continue));
         }
 
+        // LOAD_GLOBAL walker activation via trait-path delegation.
+        //
+        // The oparg packs the name index (>> 1) and the PUSH_NULL flag (& 1).
+        // Resolve both and delegate to the existing
+        // `OpcodeStepExecutor::load_global` (the method `execute_load_global`
+        // calls on the trait leg) → `load_name_value`, the shared celldict
+        // ModuleDictStrategy live lookup both legs already use (the auto-gen
+        // arm aborts on the oparg-derived &str name argument).  This
+        // delegation is the LIVE lookup, not the EffectInfo-residual cell fold
+        // (`try_walker_load_global_cell_fold`, jitcode_dispatch.rs) — the
+        // early return bypasses the arm walk where that fold lives, so the
+        // moving-GC const-fold hazard it guards against (#336, fixed by the
+        // can_move skip) is not on this path.  push_value (+ the optional
+        // PUSH_NULL push) advances vsd.
+        if let Instruction::LoadGlobal { namei } = instruction {
+            use pyre_interpreter::OpcodeStepExecutor;
+            let raw = namei.get(op_arg) as usize;
+            let name_idx = raw >> 1;
+            let push_null = (raw & 1) != 0;
+            OpcodeStepExecutor::load_global(self, code.names[name_idx].as_ref(), name_idx, push_null)?;
+            return Ok(Some(pyre_interpreter::StepResult::Continue));
+        }
+
         // STORE_FAST walker activation via trait-path delegation.
         //
         // Same oparg-payload shape as LoadFast (the var_num local index is
@@ -9699,6 +9722,14 @@ pub fn production_walker_handles(instruction: &Instruction) -> bool {
             // handles.
             | Instruction::LoadName { .. }
             | Instruction::StoreName { .. }
+            // LoadGlobal handled by the dispatch_via_walker_for_opcode entry
+            // hook: resolves the name index + PUSH_NULL flag and delegates to
+            // the trait load_global → load_name_value (shared celldict live
+            // lookup). The early return bypasses the arm walk + the
+            // EffectInfo-residual cell fold (try_walker_load_global_cell_fold),
+            // so the #336 moving-GC const-fold hazard is off this path. Same
+            // oparg-derived &str name gap as LoadName.
+            | Instruction::LoadGlobal { .. }
             | Instruction::StoreGlobal { .. }
             | Instruction::DeleteAttr { .. }
             | Instruction::ImportName { .. }
