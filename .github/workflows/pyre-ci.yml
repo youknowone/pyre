@@ -182,23 +182,26 @@ jobs:
         test -s build/llbc/pyre-object.ullbc
         test -s build/llbc/pyre-interpreter.ullbc
         test -s build/llbc/pyre-jit.ullbc
+    - name: Free up runner disk space
+      if: runner.os == 'Linux'
+      shell: bash
+      # `cargo test --all` builds every workspace member, and the majit
+      # demo interpreters (tlr/tl/tla/tiny2/tiny3/tinyframe/braininterp/
+      # tlc/calc) plus the wasm crates each statically link the full
+      # selected backend. On the cranelift leg those extra binaries
+      # overflow the ubuntu runner's default free disk during the link
+      # (`No space left on device` -> ld terminates with SIGBUS). Reclaim
+      # the preinstalled toolchains CI never uses (~20+ GB) so the whole
+      # workspace's tests build and run instead of excluding crates.
+      run: |
+        sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+          /opt/hostedtoolcache/CodeQL /usr/local/.ghcup /usr/local/share/boost
+        sudo docker image prune --all --force || true
+        df -h /
     - name: Run cargo test for ${{ matrix.backend }}
-      # `--workspace` minus the standalone majit demo interpreters and the
-      # wasm crates. Each statically links the full selected backend
-      # (the examples default to cranelift), so `cargo test --all` builds
-      # ~11 redundant backend-linked binaries on top of the real targets;
-      # on the cranelift leg that overflows the ubuntu runner disk during
-      # the link (`No space left on device` -> ld terminates with SIGBUS).
-      # None of the excluded crates carry pyre coverage — pyre plus the
-      # majit crates pyre depends on stay fully tested under both backends.
       env:
         BACKEND: ${{ matrix.backend }}
-      run: >-
-        cargo test --workspace
-        --exclude tlr --exclude tl --exclude tla --exclude tiny2 --exclude tiny3
-        --exclude tinyframe --exclude braininterp --exclude tlc --exclude calc
-        --exclude pyre-wasm --exclude pyre-wasm-test
-        --no-default-features --features "$BACKEND"
+      run: cargo test --all --no-default-features --features "$BACKEND"
 
   pyre-check:
     name: pyre/check.py (${{ matrix.os }})
