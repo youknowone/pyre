@@ -2728,6 +2728,11 @@ impl OptContext {
                     Some(d) => reused.setdescr(d),
                     None => reused.cleardescr(),
                 }
+                // optimizer.py:674 `self._emittedoperations[op] = None`. The
+                // clone path below records this too; `get_producing_op` only
+                // admits producers present here, so the reused op must be
+                // marked emitted or it stays invisible to producer matching.
+                self.emitted_operations.insert(op_pos);
                 self.new_operations.push(reused);
                 return op_pos;
             }

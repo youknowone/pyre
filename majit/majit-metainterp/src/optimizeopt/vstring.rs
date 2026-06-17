@@ -246,10 +246,9 @@ pub fn string_copy_parts(
             };
             for ch in &chars {
                 if let Some(ch_ref) = ch {
-                    let ch_resolved = ctx.resolve_box_box(ch_ref);
+                    let arg_char = ctx.resolve_box_box(ch_ref);
                     let arg_target = ctx.resolve_box_box(targetbox);
                     let arg_offset = ctx.resolve_box_box(&offset);
-                    let arg_char = ctx.resolve_box_box(&ch_resolved);
                     let setitem_op = Op::new(set_opcode, &[arg_target, arg_offset, arg_char]);
                     ctx.emit_for_force(setitem_op);
                 }

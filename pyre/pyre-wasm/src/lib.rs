@@ -1,3 +1,13 @@
+// `web` (wasm-bindgen) and `wasmi` (C-ABI) export conflicting `run_python`
+// surfaces; exactly one host binding may be active at a time.
+#[cfg(all(feature = "web", feature = "wasmi"))]
+compile_error!("features `web` and `wasmi` are mutually exclusive");
+
+// The wasmi C-ABI packs a result pointer and length into the high/low halves
+// of a u64, which only round-trips with 32-bit pointers.
+#[cfg(all(feature = "wasmi", not(target_arch = "wasm32")))]
+compile_error!("feature `wasmi` requires target_arch = \"wasm32\"");
+
 #[cfg(feature = "web")]
 use wasm_bindgen::prelude::*;
 
@@ -104,7 +114,7 @@ pub fn run_python(source: &str) -> String {
 #[cfg(feature = "wasmi")]
 mod host_abi {
     use super::run_python_impl;
-    use std::alloc::{Layout, alloc, dealloc};
+    use std::alloc::{Layout, alloc, dealloc, handle_alloc_error};
 
     // Buffers crossing the boundary are allocated and freed through the
     // global allocator with a `Layout::array::<u8>(len)` derived purely
@@ -121,7 +131,11 @@ mod host_abi {
         // Layout::array can only fail on overflow, impossible for a real
         // wasm linear-memory size.
         let layout = Layout::array::<u8>(len).expect("pyre_alloc: size overflow");
-        unsafe { alloc(layout) }
+        let ptr = unsafe { alloc(layout) };
+        if ptr.is_null() {
+            handle_alloc_error(layout);
+        }
+        ptr
     }
 
     /// Release a buffer previously handed out by `pyre_alloc` or returned

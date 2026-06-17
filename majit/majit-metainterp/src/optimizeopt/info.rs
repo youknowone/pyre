@@ -916,6 +916,10 @@ fn force_box_impl(
         // const-folds it (no SETFIELD ops emitted). Run before borrowing
         // `constant_fold_alloc` (force_child needs `&mut ctx`); a field that
         // already resolves to a Const is left untouched.
+        // Should a nested field fail to const-fold (its own fold fell back to
+        // materialization), the parent's constant slot would be left
+        // uninitialized, so fold the parent only when every field is constant.
+        let mut can_fold_parent = true;
         if ctx.constant_fold_alloc.is_some() {
             let field_boxes: Vec<BoxRef> = match self_ {
                 PtrInfo::Virtual(v) => v.fields.iter().map(|(_, r)| r.clone()).collect(),
@@ -929,10 +933,17 @@ fn force_box_impl(
                     .is_none()
                 {
                     force_child(&fb, ctx);
+                    if ctx
+                        .resolve_box_box_opt(&fb)
+                        .and_then(|b| b.const_value())
+                        .is_none()
+                    {
+                        can_fold_parent = false;
+                    }
                 }
             }
         }
-        if let Some(ref alloc_fn) = ctx.constant_fold_alloc {
+        if let Some(alloc_fn) = ctx.constant_fold_alloc.as_ref().filter(|_| can_fold_parent) {
             let field_descrs = &cached_fielddescrs;
             let (descr, fields) = match self_ {
                 PtrInfo::Virtual(v) => (&v.descr, &v.fields),

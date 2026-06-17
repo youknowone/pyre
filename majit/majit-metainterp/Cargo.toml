@@ -29,7 +29,12 @@ majit-backend-cranelift = { workspace = true, optional = true }
 majit-backend-dynasm = { workspace = true, optional = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-majit-backend-wasm = { workspace = true }
+# Specified directly (not via workspace inheritance) so default-features can
+# be turned off. The host binding (web vs host-import) is chosen explicitly
+# upstream through pyre-jit's `wasm-web` / `wasm-host` features; pulling the
+# `web` default here would unify `web` into a `host-import` build and route
+# `glue.rs` through wasm-bindgen instead of the plain wasm imports.
+majit-backend-wasm = { path = "../majit-backend-wasm", version = "0.0.2", default-features = false }
 
 [dev-dependencies]
 majit-macros = { workspace = true }
