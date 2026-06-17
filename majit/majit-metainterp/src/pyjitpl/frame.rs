@@ -33,7 +33,16 @@ fn register_to_box_int(opref: OpRef, value: i64) -> OpBox {
 #[inline]
 fn register_to_box_ref(opref: OpRef, value: i64) -> OpBox {
     if opref.is_constant() {
-        OpBox::ConstPtr(value as u64)
+        // history.py:314 `ConstPtr.value` is the single object field. The
+        // forwarded gcref lives in the ConstPtr payload (the `ref_regs`
+        // BoxRef's Cell, updated in place by `walk_active_trace_refs`), so
+        // read it from `opref` rather than the unforwarded `ref_values`
+        // mirror, which is stale after a moving collection.
+        let bits = match opref {
+            OpRef::ConstPtr(gcref) => gcref.0 as u64,
+            _ => value as u64,
+        };
+        OpBox::ConstPtr(bits)
     } else {
         OpBox::ResOp(opref.raw())
     }
@@ -882,7 +891,14 @@ impl MIFrame {
                     let value = self.ref_values[idx]
                         .expect("get_list_of_active_snapshot_boxes: ref value uninitialized");
                     if opref.is_constant() {
-                        SnapshotTagged::Const(value, Type::Ref)
+                        // history.py:314 `ConstPtr.value` — take the forwarded
+                        // gcref from the BoxRef-derived ConstPtr, not the
+                        // unforwarded `ref_values` mirror (stale after a move).
+                        let bits = match opref {
+                            OpRef::ConstPtr(gcref) => gcref.0 as i64,
+                            _ => value,
+                        };
+                        SnapshotTagged::Const(bits, Type::Ref)
                     } else {
                         SnapshotTagged::Box(opref, Type::Ref)
                     }
