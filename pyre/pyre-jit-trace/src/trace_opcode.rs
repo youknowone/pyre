@@ -8378,6 +8378,25 @@ impl MIFrame {
             return Ok(Some(pyre_interpreter::StepResult::Continue));
         }
 
+        // RAISE_VARARGS walker activation via trait-path delegation.
+        //
+        // Structural twin of the Reraise hook above: `raise_varargs` always
+        // returns `Err(PyError)` (it raises), seeding `last_exc_box` /
+        // `last_exc_value` on the valid-raise path before returning.  The `?`
+        // propagates that `Err` out as the dispatch `step_result`, exactly as
+        // `execute_raise_varargs` does on the trait leg; `trace_code_step`'s
+        // post-dispatch handling is keyed on the instruction type
+        // (`Instruction::RaiseVarargs` → `handle_raise_varargs` when
+        // `last_exc_box != NONE`, else `handle_possible_exception`), so it
+        // runs identically on either dispatch leg.  Unlike a branch guard
+        // this records no kept-stack snapshot, so the #124 resume gap does
+        // not apply.
+        if let Instruction::RaiseVarargs { argc } = instruction {
+            use pyre_interpreter::OpcodeStepExecutor;
+            OpcodeStepExecutor::raise_varargs(self, u32::from(argc.get(op_arg)) as usize)?;
+            return Ok(Some(pyre_interpreter::StepResult::Continue));
+        }
+
         // BUILD_TUPLE / UNPACK_SEQUENCE walker activation via trait-path
         // delegation.
         //
@@ -9763,6 +9782,7 @@ pub fn production_walker_handles(instruction: &Instruction) -> bool {
             | Instruction::MakeCell { .. }
             | Instruction::ConvertValue { .. }
             | Instruction::Reraise { .. } // walker hook in dispatch_via_walker_for_opcode delegates to MIFrame::reraise which returns Err(PyError) with reraise_lasti seeded — `step_result.err().map(|e| e.reraise_lasti)` extraction works the same on either leg
+            | Instruction::RaiseVarargs { .. } // walker hook delegates to MIFrame::raise_varargs (always Err, seeds last_exc_box); trace_code_step's RaiseVarargs post-dispatch handler (handle_raise_varargs) is keyed on the instruction type, so it runs identically on either leg
             | Instruction::PopJumpIfNone { .. }
             | Instruction::PopJumpIfNotNone { .. }
             | Instruction::ForIter { .. }
