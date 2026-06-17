@@ -217,7 +217,7 @@ mod deque_class {
         methods: {
             // `init(iterable=None, maxlen=None)` — remember maxlen, then
             // extend so the bound is enforced while filling.
-            fn __init__(self_obj: PyObjectRef, iterable: Option<PyObjectRef>, maxlen: Option<PyObjectRef>) -> Result<(), crate::PyError> {
+            fn __init__(self_obj: PyObjectRef, #[default(None)] iterable: Option<PyObjectRef>, #[default(None)] maxlen: Option<PyObjectRef>) -> Result<(), crate::PyError> {
                 store(self_obj, vec![]);
                 // `gateway_nonnegint_w(w_maxlen)` — None is unbounded; a
                 // non-integer is a TypeError and a negative bound is a
