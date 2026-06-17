@@ -598,13 +598,27 @@ impl Bookkeeper {
         format!("{}.{variant_name}", canon_root.replace("::", "."))
     }
 
-    /// TODO: no upstream equivalent.  Pre-mint the variant subclasses of
-    /// every unit-only enum so the session-prologue
+    /// No upstream equivalent — forced by pyre's numbering order, not a
+    /// casual workaround.  Upstream runs `assign_inheritance_ids` ONCE
+    /// inside `RPythonTyper.specialize`, AFTER `annotator.complete()`
+    /// reaches its fixpoint, when every instantiated class — variant
+    /// classes included — already exists; the single numbering pass sees
+    /// the complete set and needs no pre-mint.  pyre cannot follow that
+    /// order: it runs incremental per-subject `specialize_more_blocks`
+    /// (no single post-annotation driver), and `ClassRepr.fill_vtable_root`
+    /// bakes `minid`/`maxid` as eager `Signed` constants into the
+    /// cross-graph-cached vtable, so the ids must be stable in the session
+    /// prologue — before any per-subject annotation discovers a
+    /// lazily-minted variant class.  This pre-mint is the prologue-time
+    /// analogue of upstream's "all classes exist before numbering"
+    /// invariant, restricted to the unit-only enum-variant subtrees that
+    /// would otherwise be minted lazily mid-session: it pre-mints the
+    /// variant subclasses of every unit-only enum so the session-prologue
     /// [`crate::translator::rtyper::normalizecalls::assign_inheritance_ids`]
-    /// pass numbers each `enum-base + variant-children` subtree as a
-    /// unit.  Called from `PyreCallRegistry::ensure_session` AFTER the
-    /// struct-root loop (so the enum-base classdefs already exist,
-    /// UNNUMBERED) and BEFORE the single `assign_inheritance_ids`.
+    /// pass numbers each `enum-base + variant-children` subtree as one
+    /// contiguous bracket.  Called from `PyreCallRegistry::ensure_session`
+    /// AFTER the struct-root loop (so the enum-base classdefs already
+    /// exist, UNNUMBERED) and BEFORE the single `assign_inheritance_ids`.
     ///
     /// A variant ctor instantiation (`PyError::type_error` →
     /// `PyErrorKind::TypeError`) mints its variant class LAZILY during
