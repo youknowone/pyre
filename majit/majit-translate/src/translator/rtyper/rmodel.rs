@@ -2958,12 +2958,21 @@ pub fn rtyper_makerepr(
             // (`externalvsinternal`'s `gcref=True` arm is likewise
             // deferred — `rclass.rs` — and unreached for `PyObjectRef`
             // items.)
-            let (resized, range_step) = {
+            let (resized, range_step, mutated) = {
                 let li_rc = s_list.listdef.listitem_rc();
                 let li = li_rc.borrow();
-                (li.resized, li.range_step)
+                (li.resized, li.range_step, li.mutated)
             };
-            if let Some(step) = range_step {
+            let s_value = s_list.listdef.s_value();
+            // rlist.py:45 — RangeRepr is selected ONLY when all three hold:
+            // `range_step is not None and not mutated and not
+            // SomeImpossibleValue`. A mutated (e.g. setitem'd / resized)
+            // or still-impossible range-derived list falls through to the
+            // resized→ListRepr / non-resized→FixedSizeListRepr branch
+            // (rlist.py:54-57), exactly as a non-range list does.
+            let range_repr_step =
+                range_step.filter(|_| !mutated && !matches!(s_value, SomeValue::Impossible));
+            if let Some(step) = range_repr_step {
                 if step == 1 {
                     Ok(
                         std::sync::Arc::new(crate::translator::rtyper::rrange::RangeRepr::new(
@@ -2986,7 +2995,7 @@ pub fn rtyper_makerepr(
                     s_list.listdef
                 )))
             } else {
-                let item_r = rtyper.getrepr(&s_list.listdef.s_value())?;
+                let item_r = rtyper.getrepr(&s_value)?;
                 let rtyper_rc = rtyper.self_rc()?;
                 Ok(
                     std::sync::Arc::new(crate::translator::rtyper::rlist::FixedSizeListRepr::new(
@@ -3740,6 +3749,54 @@ mod tests {
         let repr = rtyper_makerepr(&SomeValue::Ptr(SomePtr::new(ptr.clone())), &rtyper).unwrap();
         assert_eq!(repr.class_name(), "PtrRepr");
         assert_eq!(repr.lowleveltype(), &LowLevelType::Ptr(Box::new(ptr)));
+    }
+
+    /// rlist.py:45 — RangeRepr is selected only when `range_step is not
+    /// None and not mutated and not SomeImpossibleValue`; a mutated or
+    /// still-impossible range-derived list falls through to
+    /// FixedSizeListRepr / the deferred resized ListRepr, like any other
+    /// list. Regression guard against gating on `range_step.is_some()`
+    /// alone.
+    #[test]
+    fn somelist_rangerepr_gated_on_not_mutated_and_concrete_item() {
+        use crate::annotator::listdef::ListDef;
+        use crate::annotator::model::{SomeInteger, SomeList};
+
+        let rtyper = rtyper_for_tests();
+        let item = SomeValue::Integer(SomeInteger::new(false, false));
+
+        // step==1, not mutated, concrete item → RangeRepr.
+        let ldef = ListDef::new(None, item.clone(), false, false);
+        ldef.listitem_rc().borrow_mut().range_step = Some(1);
+        let repr = rtyper_makerepr(&SomeValue::List(SomeList::new(ldef)), &rtyper).unwrap();
+        assert_eq!(repr.class_name(), "RangeRepr");
+
+        // step==1 but mutated → falls through to the non-range branch
+        // (FixedSizeListRepr), NOT RangeRepr.
+        let ldef_mut = ListDef::new(None, item.clone(), true, false);
+        ldef_mut.listitem_rc().borrow_mut().range_step = Some(1);
+        let repr_mut = rtyper_makerepr(&SomeValue::List(SomeList::new(ldef_mut)), &rtyper);
+        assert!(
+            repr_mut
+                .map(|r| r.class_name() != "RangeRepr")
+                .unwrap_or(true),
+            "mutated range-list must not select RangeRepr"
+        );
+
+        // step==1 but resized (⇒ mutated) → the deferred resized ListRepr
+        // arm (Err), never RangeRepr.
+        let ldef_resized = ListDef::new(None, item, false, true);
+        ldef_resized.listitem_rc().borrow_mut().range_step = Some(1);
+        assert!(rtyper_makerepr(&SomeValue::List(SomeList::new(ldef_resized)), &rtyper).is_err());
+
+        // step==1, not mutated, but impossible item → not RangeRepr.
+        let ldef_imp = ListDef::new(None, SomeValue::Impossible, false, false);
+        ldef_imp.listitem_rc().borrow_mut().range_step = Some(1);
+        let r_imp = rtyper_makerepr(&SomeValue::List(SomeList::new(ldef_imp)), &rtyper);
+        assert!(
+            r_imp.map(|r| r.class_name() != "RangeRepr").unwrap_or(true),
+            "impossible-item range-list must not select RangeRepr"
+        );
     }
 
     #[test]
