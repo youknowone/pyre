@@ -493,6 +493,12 @@ impl PtrInfo {
                 FieldEntry::Preamble(pop) => {
                     pop.op.walk_const_ptr_refs(visitor);
                     pop.preamble_op.walk_const_ptr_refs_mut(visitor);
+                    // An invented ref-typed alias can carry a `ConstPtr`
+                    // `same_as_source`; walk it so a moving GC updates the
+                    // pointer before the cached preamble emits its `SameAs`.
+                    if let Some(src) = &pop.same_as_source {
+                        src.walk_const_ptr_refs(visitor);
+                    }
                 }
             }
         }
