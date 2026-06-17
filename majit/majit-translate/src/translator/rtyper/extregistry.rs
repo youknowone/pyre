@@ -133,6 +133,33 @@ pub enum ExtRegistryEntry {
     /// per model.py:222), so no separate `unsigned` carrier is needed
     /// here — that would duplicate state RPython does not.
     ForType { instance: HostObject },
+    /// Upstream `rpython/rlib/jit.py:396-406`:
+    ///
+    /// ```python
+    /// class Entry(ExtRegistryEntry):
+    ///     _about_ = we_are_jitted
+    ///     def compute_result_annotation(self):
+    ///         return annmodel.SomeInteger(nonneg=True)
+    ///     def specialize_call(self, hop):
+    ///         hop.exception_cannot_occur()
+    ///         return hop.inputconst(lltype.Signed, _we_are_jitted)
+    /// ```
+    ///
+    /// The entry is a value-level singleton keyed on the
+    /// `majit_metainterp.jit.we_are_jitted` host callable. It carries
+    /// no per-instance state (the `_about_` value is the function
+    /// itself), so it is a fieldless variant.
+    ///
+    /// The annotation half is served by the
+    /// `majit_metainterp.jit.we_are_jitted` `BUILTIN_ANALYZERS` entry
+    /// (`annotator/builtin.rs`, `majit_metainterp_bool_flag` →
+    /// `SomeBool`), which `Bookkeeper.immutablevalue_hostobject`
+    /// resolves and returns *before* the `extregistry.is_registered`
+    /// fall-through (bookkeeper.py:309-314). So this entry only ever
+    /// fires on the rtyper's `findbltintyper` → `specialize_call`
+    /// path; its `compute_annotation` is unreachable in practice and
+    /// fails closed to surface a bypassed early-return loudly.
+    WeAreJitted,
 }
 
 /// Small Send-able annotation payload for static HostObject type
@@ -175,6 +202,10 @@ pub enum ExtRegistryEntryKey {
     ForType {
         instance_identity: usize,
     },
+    /// Singleton key for the `we_are_jitted` `_about_` entry
+    /// (rlib/jit.py:396). No per-instance identity — the variant tag
+    /// alone supplies `self.__class__` and there is no `self.instance`.
+    WeAreJitted,
 }
 
 impl ExtRegistryEntry {
@@ -206,6 +237,7 @@ impl ExtRegistryEntry {
             ExtRegistryEntry::ForType { instance } => ExtRegistryEntryKey::ForType {
                 instance_identity: instance.identity_id(),
             },
+            ExtRegistryEntry::WeAreJitted => ExtRegistryEntryKey::WeAreJitted,
         }
     }
 
@@ -308,6 +340,18 @@ impl ExtRegistryEntry {
                 ));
                 Ok(SomeValue::Builtin(result))
             }
+            // The `we_are_jitted` annotation is served by the
+            // `majit_metainterp.jit.we_are_jitted` `BUILTIN_ANALYZERS`
+            // entry, which `immutablevalue_hostobject` returns before
+            // the `extregistry.is_registered` fall-through
+            // (bookkeeper.py:309-314). Reaching this arm means that
+            // early-return was bypassed — fail closed so a wrong
+            // annotation can never be served silently.
+            ExtRegistryEntry::WeAreJitted => Err(AnnotatorError::new(
+                "ExtRegistryEntry::WeAreJitted.compute_annotation: we_are_jitted is annotated via \
+                 BUILTIN_ANALYZERS (majit_metainterp_bool_flag), not extregistry; this entry is \
+                 rtyper-only (specialize_call)",
+            )),
         }
     }
 
@@ -427,6 +471,16 @@ impl ExtRegistryEntry {
                         instance.qualname()
                     )))
                 }
+            }
+            // rlib/jit.py:404-406 — `Entry(_about_=we_are_jitted).\
+            // specialize_call(self, hop)`:
+            //     hop.exception_cannot_occur()
+            //     return hop.inputconst(lltype.Signed, _we_are_jitted)
+            // `rtype_we_are_jitted` mirrors this, emitting the
+            // `_we_are_jitted` symbolic (`constfold::WE_ARE_JITTED_TAG_ID`)
+            // at the result repr's lltype.
+            ExtRegistryEntry::WeAreJitted => {
+                Ok(super::rbuiltin::rtype_we_are_jitted as BuiltinTyperFn)
             }
         }
     }
@@ -655,6 +709,13 @@ fn bind_lookup_instance(entry: ExtRegistryEntry, instance: &HostObject) -> ExtRe
 }
 
 fn lookup_host_object(host: &HostObject) -> Option<ExtRegistryEntry> {
+    // rlib/jit.py:396 `class Entry(ExtRegistryEntry): _about_ =
+    // we_are_jitted`. The `_about_` value is the host callable itself;
+    // match it by qualified name (the same key `annotator/builtin.rs`
+    // registers for `BUILTIN_ANALYZERS`).
+    if host.qualname() == "majit_metainterp.jit.we_are_jitted" {
+        return Some(ExtRegistryEntry::WeAreJitted);
+    }
     if let Some(entry) = host_value_registry().lock().unwrap().get(host).cloned() {
         return Some(entry);
     }
@@ -796,6 +857,22 @@ mod tests {
         let cv = ConstValue::HostObject(host);
         assert!(!is_registered(&cv));
         assert!(lookup(&cv).is_none());
+    }
+
+    /// rlib/jit.py:396 `class Entry(ExtRegistryEntry): _about_ =
+    /// we_are_jitted` — the `we_are_jitted` host callable surfaces the
+    /// `WeAreJitted` entry, whose `specialize_call` resolves the rtyper
+    /// path. The annotation is served by `BUILTIN_ANALYZERS`, so the
+    /// entry's `compute_annotation` fails closed.
+    #[test]
+    fn we_are_jitted_resolves_specialize_call() {
+        let host = HostObject::new_builtin_callable("majit_metainterp.jit.we_are_jitted");
+        let cv = ConstValue::HostObject(host);
+        assert!(is_registered(&cv));
+        let entry = lookup(&cv).expect("we_are_jitted must surface an entry");
+        assert!(matches!(entry, ExtRegistryEntry::WeAreJitted));
+        assert!(entry.specialize_call().is_ok());
+        assert!(entry.compute_annotation().is_err());
     }
 
     /// Type-level lookup returns None for unregistered host classes.

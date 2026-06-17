@@ -1119,9 +1119,13 @@ pub const WE_ARE_JITTED_TAG_ID: u64 = u64::MAX - 0x57E_A1E_71D;
 /// upstream replacement.
 pub fn replace_we_are_jitted(graph: &FunctionGraph) -> bool {
     let symbolic = ConstValue::SpecTag(WE_ARE_JITTED_TAG_ID);
+    // Upstream `Constant(0, lltype.Signed)`. pyre's `we_are_jitted() ->
+    // bool` annotates `SomeBool`, so the symbolic is emitted at `Bool`
+    // (`rbuiltin::rtype_we_are_jitted`); the non-JIT replacement matches
+    // that carrier so the rewritten exitswitch stays well-typed.
     let replacement = Constant::with_concretetype(
-        ConstValue::Int(0),
-        crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Signed,
+        ConstValue::Bool(false),
+        crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Bool,
     );
     let did_replacement = replace_symbolic(graph, &symbolic, replacement);
     if did_replacement {

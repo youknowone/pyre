@@ -1378,6 +1378,42 @@ pub(super) fn rtype_r_uint(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) 
     Ok(vlist.into_iter().next())
 }
 
+/// rlib/jit.py:404-406 — `Entry(_about_=we_are_jitted).\
+/// specialize_call(self, hop)`:
+///
+/// ```python
+/// def specialize_call(self, hop):
+///     hop.exception_cannot_occur()
+///     return hop.inputconst(lltype.Signed, _we_are_jitted)
+/// ```
+///
+/// Emits the `_we_are_jitted` symbolic singleton
+/// ([`crate::translator::backendopt::constfold::WE_ARE_JITTED_TAG_ID`])
+/// as a `Constant`. pyre's `we_are_jitted() -> bool` annotates
+/// `SomeBool`, so `r_result` is `Bool` (vs upstream's `Signed`); the
+/// symbolic is stamped at the result repr's lltype. The genc
+/// `replace_we_are_jitted` (→ `false`) and the JIT-codewriter
+/// `fold_we_are_jitted_true` (→ `true`) both key on the `SpecTag`
+/// identity, not the carrier lltype.
+pub(super) fn rtype_we_are_jitted(
+    hop: &HighLevelOp,
+    _kwds_i: &HashMap<String, usize>,
+) -> RTypeResult {
+    let result_lltype = {
+        let r_result_borrow = hop.r_result.borrow();
+        let r_result = r_result_borrow.as_ref().ok_or_else(|| {
+            TyperError::message("rtype_we_are_jitted: r_result missing".to_string())
+        })?;
+        r_result.lowleveltype().clone()
+    };
+    hop.exception_cannot_occur()?;
+    let c = Constant::with_concretetype(
+        ConstValue::SpecTag(crate::translator::backendopt::constfold::WE_ARE_JITTED_TAG_ID),
+        result_lltype,
+    );
+    Ok(Some(Hlvalue::Constant(c)))
+}
+
 /// RPython `@typer_for(hasattr) def rtype_builtin_hasattr(hop)`
 /// (rbuiltin.py:709-715).
 ///
