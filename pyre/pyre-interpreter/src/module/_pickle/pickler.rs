@@ -31,6 +31,9 @@ pub struct W_Pickler {
     /// User-set `dispatch_table` mapping, or `PY_NULL` when unset; the dump
     /// path falls back to `copyreg.dispatch_table` when unset.
     w_dispatch_table: PyObjectRef,
+    /// `persistent_id` callable set on the instance, or `PY_NULL` when unset
+    /// (a subclass may instead override the `persistent_id` method).
+    w_pers_func: PyObjectRef,
 }
 
 /// Per-`dump` pickling context.  The identity memo maps an already-saved
@@ -199,6 +202,7 @@ impl W_Pickler {
             w_memo: pyre_object::listobject::w_list_new(Vec::new()),
             fast: false,
             w_dispatch_table: pyre_object::PY_NULL,
+            w_pers_func: pyre_object::PY_NULL,
         })
     }
 
@@ -228,6 +232,7 @@ impl W_Pickler {
         self.w_memo = pyre_object::listobject::w_list_new(Vec::new());
         self.fast = false;
         self.w_dispatch_table = pyre_object::PY_NULL;
+        self.w_pers_func = pyre_object::PY_NULL;
         Ok(())
     }
 
@@ -257,8 +262,10 @@ impl W_Pickler {
         pyre_object::gc_roots::pin_root(w_memo);
         let memo_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
 
-        // A `persistent_id` / `reducer_override` defined on a subclass (or set
-        // as an attribute) overrides the default; the base class has neither.
+        // `persistent_id` resolves to a subclass method override or the
+        // instance value set through the getter (its getter raises while
+        // unset, so a base pickler resolves to `PY_NULL`); `reducer_override`
+        // is a subclass hook only.
         let pers_func = crate::baseobjspace::findattr(self_ptr, "persistent_id")
             .filter(|&f| !unsafe { pyre_object::is_none(f) })
             .unwrap_or(pyre_object::PY_NULL);
@@ -326,6 +333,32 @@ impl W_Pickler {
     #[setter]
     fn set_dispatch_table(&mut self, w_value: PyObjectRef) {
         self.w_dispatch_table = w_value;
+    }
+
+    /// `Pickler.persistent_id` — the per-instance persistent-id callable. Once
+    /// set, every object is offered to it before the type dispatch; a non-None
+    /// result is saved as a persistent reference. A subclass may instead define
+    /// a `persistent_id` method (resolved at dump time). Reading it while unset
+    /// raises `AttributeError` (a readable no-op default is omitted: a shared
+    /// callable would need a GC-stable singleton under the relocating nursery).
+    #[getter]
+    fn persistent_id(&self) -> Result<PyObjectRef, PyError> {
+        if self.w_pers_func.is_null() {
+            return Err(PyError::attribute_error(
+                "'_pickle.Pickler' object has no attribute 'persistent_id'".to_string(),
+            ));
+        }
+        Ok(self.w_pers_func)
+    }
+
+    #[setter]
+    fn set_persistent_id(&mut self, w_value: PyObjectRef) {
+        self.w_pers_func = w_value;
+    }
+
+    #[deleter("persistent_id")]
+    fn del_persistent_id(&mut self) {
+        self.w_pers_func = pyre_object::PY_NULL;
     }
 }
 
@@ -449,10 +482,16 @@ fn save(ctx: &mut PickleCtx, buf: &mut Framer, w_obj: PyObjectRef) -> Result<(),
     // an object; flush the active frame once it has grown past the target.
     buf.commit_frame(false);
     if !ctx.pers_func.is_null() {
-        let w_pid = call_fn(ctx.pers_func, &[w_obj])?;
+        // The hook is arbitrary Python; pin `w_obj` so the by-value fallback
+        // sees it at its post-call address.
+        let _roots = pyre_object::gc_roots::push_roots();
+        pyre_object::gc_roots::pin_root(w_obj);
+        let slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+        let w_pid = call_fn(ctx.pers_func, &[pyre_object::gc_roots::shadow_stack_get(slot)])?;
         if !unsafe { pyre_object::is_none(w_pid) } {
             return save_pers(ctx, buf, w_pid);
         }
+        return save_object(ctx, buf, pyre_object::gc_roots::shadow_stack_get(slot));
     }
     save_object(ctx, buf, w_obj)
 }

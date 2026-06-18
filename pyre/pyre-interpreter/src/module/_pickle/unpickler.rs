@@ -34,6 +34,9 @@ pub struct W_Unpickler {
     errors: String,
     /// Out-of-band `buffers` iterator (proto 5), or None.
     w_buffers: PyObjectRef,
+    /// `persistent_load` callable set on the instance, or `PY_NULL` when unset
+    /// (a subclass may instead override the `persistent_load` method).
+    w_persistent_load: PyObjectRef,
 }
 
 #[crate::pyre_methods(doc = "Unpickler(file) -> unpickler reading from file.")]
@@ -58,6 +61,7 @@ impl W_Unpickler {
             encoding: String::from("ASCII"),
             errors: String::from("strict"),
             w_buffers: pyre_object::w_none(),
+            w_persistent_load: pyre_object::PY_NULL,
         })
     }
 
@@ -101,6 +105,7 @@ impl W_Unpickler {
         } else {
             crate::baseobjspace::iter(buffers)?
         };
+        self.w_persistent_load = pyre_object::PY_NULL;
         Ok(())
     }
 
@@ -156,6 +161,32 @@ impl W_Unpickler {
         crate::module::_pickle::try_resolve_global(&module, &name)?.ok_or_else(|| {
             PyError::attribute_error(format!("Can't get attribute {name:?} on module {module:?}"))
         })
+    }
+
+    /// `Unpickler.persistent_load` — the per-instance persistent-id resolver.
+    /// Once set, a PERSID / BINPERSID opcode calls it with the persistent id.
+    /// A subclass may instead define a `persistent_load` method (resolved when
+    /// the opcode is read). Reading it while unset raises `AttributeError` (a
+    /// readable no-op default is omitted: a shared callable would need a
+    /// GC-stable singleton under the relocating nursery).
+    #[getter]
+    fn persistent_load(&self) -> Result<PyObjectRef, PyError> {
+        if self.w_persistent_load.is_null() {
+            return Err(PyError::attribute_error(
+                "'_pickle.Unpickler' object has no attribute 'persistent_load'".to_string(),
+            ));
+        }
+        Ok(self.w_persistent_load)
+    }
+
+    #[setter]
+    fn set_persistent_load(&mut self, w_value: PyObjectRef) {
+        self.w_persistent_load = w_value;
+    }
+
+    #[deleter("persistent_load")]
+    fn del_persistent_load(&mut self) {
+        self.w_persistent_load = pyre_object::PY_NULL;
     }
 }
 
@@ -1032,7 +1063,9 @@ fn persistent_load(slot: usize, w_pid: PyObjectRef) -> Result<PyObjectRef, PyErr
     let self_obj = pyre_object::gc_roots::shadow_stack_get(slot);
     match crate::baseobjspace::findattr(self_obj, "persistent_load") {
         Some(f) if !unsafe { pyre_object::is_none(f) } => call_fn(f, &[w_pid]),
-        _ => Err(unpickling_error("unsupported persistent id encountered")),
+        _ => Err(unpickling_error(
+            "A load persistent id instruction was encountered, but no persistent_load function was specified.",
+        )),
     }
 }
 
