@@ -1037,7 +1037,45 @@ impl<'a> AssemblerARM64<'a> {
     }
 
     // ── AArch64 helper: load a 64-bit immediate into register Xn ──
+    //
+    // codebuilder.py:509 `gen_load_int`: emit the minimal sequence — MOVN for
+    // a small negative, otherwise MOVZ of the low halfword plus a MOVK for
+    // each higher halfword up to the highest nonzero one.  Patchable sites
+    // that rewrite a fixed 4-word block in place (`emit_check_frame_depth`)
+    // use `emit_mov_imm64_full` instead.
     pub(crate) fn emit_mov_imm64(&mut self, reg: u32, val: i64) {
+        let r = reg as u8;
+        if val < 0 {
+            if val < -65536 {
+                self.emit_mov_imm64_full(reg, val);
+            } else {
+                // MOVN Xr, ~val: val in [-65536, -1], so ~val fits in 16 bits.
+                let n = ((!val) as u32) & 0xFFFF;
+                dynasm!(self.mc ; .arch aarch64 ; movn X(r), n);
+            }
+            return;
+        }
+        let v = val as u64;
+        dynasm!(self.mc ; .arch aarch64 ; movz X(r), (v & 0xFFFF) as u32);
+        let mut rem = v >> 16;
+        let mut shift = 16u32;
+        while rem != 0 {
+            let hw = (rem & 0xFFFF) as u32;
+            match shift {
+                16 => dynasm!(self.mc ; .arch aarch64 ; movk X(r), hw, lsl 16),
+                32 => dynasm!(self.mc ; .arch aarch64 ; movk X(r), hw, lsl 32),
+                48 => dynasm!(self.mc ; .arch aarch64 ; movk X(r), hw, lsl 48),
+                _ => unreachable!(),
+            }
+            rem >>= 16;
+            shift += 16;
+        }
+    }
+
+    // codebuilder.py:503 `gen_load_int_full`: the fixed 4-word movz/movk block
+    // for patchable sites where `patch_stack_checks` rewrites all four words in
+    // place (and the redirect-veneer encoder `encode_mov_imm64_words`).
+    pub(crate) fn emit_mov_imm64_full(&mut self, reg: u32, val: i64) {
         let v = val as u64;
         let r = reg as u8;
         dynasm!(self.mc ; .arch aarch64
@@ -1341,7 +1379,7 @@ impl<'a> AssemblerARM64<'a> {
         );
         // assembler.py:936-941 — gen_load_int ip1, expected_size (patched).
         let cmp_imm_ofs = self.mc.offset().0;
-        self.emit_mov_imm64(17, placeholder);
+        self.emit_mov_imm64_full(17, placeholder);
         self.frame_depth_to_patch.push(cmp_imm_ofs);
 
         // assembler.py:942-944 — CMP ip0, ip1; B.GE skip (fast path:
@@ -1384,7 +1422,7 @@ impl<'a> AssemblerARM64<'a> {
         dynasm!(self.mc ; .arch aarch64 ; mov x0, x29);
         // assembler.py:447-449 arg1 = expected_size (depth), patched imm.
         let arg1_imm_ofs = self.mc.offset().0;
-        self.emit_mov_imm64(1, placeholder);
+        self.emit_mov_imm64_full(1, placeholder);
         self.frame_depth_to_patch.push(arg1_imm_ofs);
 
         // assembler.py:467 BL realloc_frame.  pyre bakes the C-ABI wrapper
