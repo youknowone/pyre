@@ -634,9 +634,12 @@ impl Bookkeeper {
     /// Spelling MUST match the annotation path
     /// (`flowspace_adapter::translate_op` `SyntheticTransparentCtor` arm)
     /// exactly or the pre-mint is a phantom that never matches the
-    /// lazily-minted class: base = `intern_class_by_qualname(leaf)` (bare
-    /// enum leaf), variant = `intern_class_by_qualname_with_bases(
-    /// "{dotted_owner}.{variant}", [base])`.  `enum_variant_by_discriminant`
+    /// lazily-minted class: base = `intern_class_by_qualname(
+    /// canonical_struct_name(root))` (the same spelling
+    /// `getuniqueclassdef_for_enum_variant` uses, so both resolve to one
+    /// base `HostObject` independent of `STRUCT_ORIGIN_REGISTRY`), variant
+    /// = `intern_class_by_qualname_with_bases("{dotted_owner}.{variant}",
+    /// [base])`.  `enum_variant_by_discriminant`
     /// dual-publishes each enum under both its `::`-qualified path and
     /// its bare leaf; iterate the qualified keys only (the dotted owner
     /// path derives from `key.replace("::", ".")`).  Scoped to unit-only
@@ -673,13 +676,21 @@ impl Bookkeeper {
         pairs.sort();
 
         for (root, variant_names) in pairs {
-            let leaf = root.rsplit("::").next().unwrap_or(&root);
-            let base = self.intern_class_by_qualname(leaf);
+            // Intern the base under `canonical_struct_name(root)`, mirroring
+            // `getuniqueclassdef_for_enum_variant` exactly.  Both interns
+            // canonicalize to `module::Leaf`, but a bare leaf only resolves
+            // to the same key when it is registered in
+            // `STRUCT_ORIGIN_REGISTRY` under `root`'s module; feeding the
+            // qualified root drops that dependency so the pre-mint and the
+            // discriminant-narrowing resolver always share one base lineage
+            // — and the variant subtree is numbered as one bracket.
+            let canon_root = majit_ir::descr::canonical_struct_name(&root);
+            let base = self.intern_class_by_qualname(&canon_root);
             // Ensure the base classdef exists before a variant references
             // it through `getmro`; idempotent with the struct-root loop.
             let _ = self.getuniqueclassdef(&base);
             for variant in variant_names {
-                let qualname = Self::enum_variant_class_qualname(&root, &variant);
+                let qualname = Self::enum_variant_class_qualname(&canon_root, &variant);
                 let variant_host =
                     self.intern_class_by_qualname_with_bases(&qualname, vec![base.clone()]);
                 let _ = self.getuniqueclassdef(&variant_host);
