@@ -2306,14 +2306,17 @@ impl TraceCtx {
 
     /// Multi-frame variant of [`capture_snapshot_for_last_guard`].
     ///
-    /// Mirrors `opencoder.py:819-832 capture_resumedata` which walks
-    /// `framestack[-1] .. framestack[0]` and emits one `SnapshotFrame`
-    /// per `MIFrame`.  `frames[0]` is the TOP frame (currently
-    /// executing); `frames[1..]` are the paused parents in walker-call-
-    /// order (immediate caller, then its caller, etc.).
+    /// `frames` must be ordered **outermost-first** — `frames[0]` is the
+    /// outermost (root) frame and the last element is the top (currently
+    /// executing) frame.  This is the order `Snapshot.frames` requires
+    /// (`recorder.rs:54`) and is what the resume decoder consumes; the
+    /// trait-leg encoder reaches it by building an innermost-first `lead`
+    /// and `lead.reverse()`-ing (`trace_opcode.rs:4254`).  `capture_resumedata`
+    /// (`opencoder.py:819-832`) iterates `framestack[-1] .. framestack[0]`,
+    /// i.e. innermost-first, but the stored snapshot order is outermost-first.
     ///
     /// Each frame triple `(jitcode_index, py_pc, boxes)` is encoded
-    /// into `Snapshot.frames` in the order given.  Callers are
+    /// into `Snapshot.frames` verbatim in the order given.  Callers are
     /// responsible for deduplicating box positions across frames
     /// (RPython's `_number_boxes` does this implicitly via the memo
     /// table; pyre's `Snapshot.encode` does the same in
