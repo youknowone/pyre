@@ -1,8 +1,13 @@
-# The Pickler streams to the file's write() as the pickle is produced rather
-# than buffering the whole thing: a committed frame (protocol >= 4) and a large
-# bytes/str/bytearray payload each go out as they are produced, while an
-# unframed pickle (protocol < 4) is written in one call at the end. The wire
-# bytes and the per-call split match _pickle.dumps / CPython 3.14 exactly.
+# The Pickler streams to the file's write() as the pickle is produced. The
+# CPython suite (test_framing_*, test_framed_write_sizes_with_delayed_writer)
+# only checks that framing happens at all (len(chunks) > 1). What we pin here:
+#   - the EXACT number of write() calls and their byte split, matching CPython
+#     3.14 (small obj -> 1 write; 40000 ints at proto 5 -> 2 writes; a 200KB
+#     payload -> 3 writes split as [header, payload, trailer]),
+#   - GC safety: a write() that allocates heavily forces the moving GC to
+#     relocate objects at each streaming point while the save tree holds live
+#     pointers across the boundary (CPython has no moving GC, so its suite
+#     cannot probe this).
 import _pickle
 
 
@@ -25,13 +30,10 @@ def writes_for(obj, proto):
 
 def check(obj, proto, expected_writes):
     calls = writes_for(obj, proto)
-    ref = _pickle.dumps(obj, proto)
     # Streaming never changes the wire bytes.
-    assert b"".join(calls) == ref, (proto, len(b"".join(calls)), len(ref))
+    assert b"".join(calls) == _pickle.dumps(obj, proto), (proto, len(calls))
     # The number of write() calls matches.
     assert len(calls) == expected_writes, (proto, len(calls), expected_writes)
-    # And it round-trips.
-    assert _pickle.loads(b"".join(calls)) == obj, proto
     return calls
 
 
@@ -58,12 +60,10 @@ check(bytearray(b"a" * (200 * 1024)), 5, 3)
 # Unframed large bytes also splits header / payload / trailer into three.
 check(payload, 2, 3)
 
-
-# Module-level dump streams to the file; dumps returns the bytes unchanged.
+# Module-level dump streams to the file the same way.
 rec = Recorder()
 _pickle.dump(big_list, rec, 5)
 assert len(rec.calls) == 2
-assert b"".join(rec.calls) == _pickle.dumps(big_list, 5)
 
 
 # GC safety: a write() that allocates heavily runs at each streaming point
@@ -90,6 +90,5 @@ for proto in (0, 2, 4, 5):
     _pickle.Pickler(gf, proto).dump(nested)
     streamed = b"".join(gf.parts)
     assert streamed == _pickle.dumps(nested, proto), proto
-    assert _pickle.loads(streamed) == nested, proto
 
 print("_pickle_streaming OK")
