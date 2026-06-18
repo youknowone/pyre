@@ -3141,11 +3141,13 @@ fn frontend_load_const_flow_value(code: &CodeObject, idx: usize) -> super::flow:
     pyobject_const_ref_value(pyre_interpreter::pyframe::load_const_from_code(code, idx))
 }
 
-fn frontend_global_flow_value(w_code: *const (), name: &str) -> Option<super::flow::FlowValue> {
-    // `flowcontext.py:845-858 find_global` resolves globals during flow
-    // analysis and pushes a Constant.  Do the same when the current
-    // W_CodeObject exposes its globals/builtins; callers fall back to a
-    // fresh Ref only when pyre cannot reproduce the static lookup.
+/// Resolve `name` the way `flowcontext.py:845-858 find_global` does —
+/// module globals first, then `__builtins__` — returning the raw resolved
+/// object (or `None` when pyre cannot reproduce the static lookup).
+/// `frontend_global_flow_value` wraps the result in a const `FlowValue`;
+/// the `LOAD_GLOBAL` walker uses it to classify the FINAL resolved value
+/// (globals OR builtins) before deciding whether const-folding is GC-safe.
+fn frontend_global_object(w_code: *const (), name: &str) -> Option<pyre_object::PyObjectRef> {
     let w_code = w_code as pyre_object::PyObjectRef;
     if w_code.is_null() {
         return None;
@@ -3156,11 +3158,9 @@ fn frontend_global_flow_value(w_code: *const (), name: &str) -> Option<super::fl
     }
     let globals = unsafe { &*w_globals };
     if let Some(w_value) = pyre_interpreter::dict_storage_get(globals, name) {
-        return Some(pyobject_const_ref_value(w_value));
+        return Some(w_value);
     }
-    let Some(w_builtin) = pyre_interpreter::dict_storage_get(globals, "__builtins__") else {
-        return None;
-    };
+    let w_builtin = pyre_interpreter::dict_storage_get(globals, "__builtins__")?;
     let lookup_obj = if unsafe { pyre_object::is_module(w_builtin) } {
         unsafe { pyre_object::w_module_get_w_dict(w_builtin) }
     } else if unsafe { pyre_object::is_dict(w_builtin) } {
@@ -3174,7 +3174,14 @@ fn frontend_global_flow_value(w_code: *const (), name: &str) -> Option<super::fl
     pyre_interpreter::baseobjspace::finditem_str(lookup_obj, name)
         .ok()
         .flatten()
-        .map(pyobject_const_ref_value)
+}
+
+fn frontend_global_flow_value(w_code: *const (), name: &str) -> Option<super::flow::FlowValue> {
+    // `flowcontext.py:845-858 find_global` resolves globals during flow
+    // analysis and pushes a Constant.  Do the same when the current
+    // W_CodeObject exposes its globals/builtins; callers fall back to a
+    // fresh Ref only when pyre cannot reproduce the static lookup.
+    frontend_global_object(w_code, name).map(pyobject_const_ref_value)
 }
 
 fn set_last_bool_exitcase(block: &super::flow::BlockRef, branch_taken: bool) {
@@ -7273,22 +7280,21 @@ impl CodeWriter {
                                         w_code as pyre_object::PyObjectRef,
                                     )
                                 };
-                                // Classify the resolved global: a globals-only
-                                // lookup suffices since builtins are never the
-                                // user-mutated containers this gate targets.
-                                let global_is_relocatable_container = !w_globals.is_null()
-                                    && name
-                                        .and_then(|nm| {
-                                            pyre_interpreter::dict_storage_get(
-                                                unsafe { &*w_globals },
-                                                nm,
-                                            )
-                                        })
-                                        .is_some_and(|obj| unsafe {
-                                            pyre_object::is_dict(obj)
-                                                || pyre_object::is_list(obj)
-                                                || pyre_object::is_set(obj)
-                                        });
+                                // Classify the FINAL resolved global — module
+                                // globals OR `__builtins__`, the same lookup
+                                // `frontend_global_flow_value` const-folds.  A
+                                // custom / mutated builtins dict can supply a
+                                // mutable container, so a globals-only gate would
+                                // const-fold a relocating builtin container and
+                                // reintroduce the moving-GC dangling pointer the
+                                // residual avoids.
+                                let global_is_relocatable_container = name
+                                    .and_then(|nm| frontend_global_object(w_code, nm))
+                                    .is_some_and(|obj| unsafe {
+                                        pyre_object::is_dict(obj)
+                                            || pyre_object::is_list(obj)
+                                            || pyre_object::is_set(obj)
+                                    });
                                 if global_is_relocatable_container {
                                     // The namespace operand is the callee's
                                     // module dict OBJECT.  `PyFrame.__init__`
