@@ -6748,13 +6748,60 @@ fn walker_capture_multi_frame_inline_snapshot(
         }
         py
     };
+    if std::env::var_os("PYRE_FBW_MF_DIAG").is_some() {
+        let local_cm = crate::state::local_slot_color_map_at(callee_jitcode_index as i32);
+        let stack_cm = crate::state::stack_slot_color_map_at(callee_jitcode_index as i32);
+        let depth = callee_pjc
+            .metadata
+            .depth_at_py_pc
+            .get(callee_py_pc as usize)
+            .copied()
+            .unwrap_or(0);
+        let banks = crate::state::frame_liveness_reg_indices_by_bank_at(
+            callee_jitcode_index as i32,
+            callee_py_pc as i32,
+        );
+        eprintln!(
+            "[fbw-mf-diag] callee jc={callee_jitcode_index} op_pc={callee_op_pc} \
+             py_pc={callee_py_pc} after_residual={after_residual_call} depth={depth} \
+             local_color_map={local_cm:?} stack_color_map={stack_cm:?}"
+        );
+        eprintln!(
+            "[fbw-mf-diag]   live banks: i={:?} r={:?} f={:?}",
+            banks.int, banks.ref_, banks.float
+        );
+        for &c in &banks.ref_ {
+            eprintln!(
+                "[fbw-mf-diag]   regs_r[{c}] = {:?}",
+                ctx.registers_r.get(c as usize)
+            );
+        }
+        for &c in &banks.int {
+            eprintln!(
+                "[fbw-mf-diag]   regs_i[{c}] = {:?}",
+                ctx.registers_i.get(c as usize)
+            );
+        }
+        unsafe {
+            let code = &*callee_pjc.code_ptr;
+            let lo = callee_py_pc.saturating_sub(3);
+            for py in lo..callee_py_pc + 5 {
+                if let Some((instr, arg)) = pyre_interpreter::decode_instruction_at(code, py as usize)
+                {
+                    let mark = if py == callee_py_pc { " <== resume" } else { "" };
+                    eprintln!("[fbw-mf-diag]   py{py}: {instr:?} arg={arg:?}{mark}");
+                }
+            }
+        }
+    }
     let callee_boxes = collect_callee_active_boxes(
         ctx.registers_i,
         ctx.registers_r,
         ctx.registers_f,
         callee_jitcode_index as u32,
         callee_py_pc,
-    );
+        callee_op_pc,
+    )?;
 
     // Publish the OUTERMOST caller's vable scalars for its resume coordinate so
     // the resume reader restores the caller's `PyFrame` at the CALL return
@@ -7568,46 +7615,67 @@ fn callee_fast_path_inlinable_allowing_forward_branch(
 /// liveness-active register holding `OpRef::NONE` is a tracer-side invariant
 /// violation (callee banks are sized to the jitcode num_regs co-published with
 /// liveness), so panic loudly rather than bleed NONE into the encoder.
+/// Build the inlined callee (top/innermost) snapshot frame's live box list
+/// from the sub-walk register banks at the guard's callee py_pc.
+///
+/// Unlike [`collect_outer_active_boxes`], the callee sub-walk is sym-less and
+/// owns no virtualizable, so none of the vable-shadow / portal-red / #124
+/// kept-stack recovery applies — every live color must be present directly in
+/// the sub-walk's `registers_*`.  A liveness-active color the sub-walk never
+/// wrote (`OpRef::NONE` — e.g. a static-ref operand-stack slot that trace-time
+/// int-specialization left only in the int bank, or a py_pc↔jit_pc round-trip
+/// landing on a different liveness window) cannot be sourced, so return `Err`
+/// to abort the multi-frame inline and fall back to the trait leg rather than
+/// encode a NONE box.  `PYRE_FBW_MF_DIAG` dumps the missing color.
 fn collect_callee_active_boxes(
     regs_i: &[OpRef],
     regs_r: &[OpRef],
     regs_f: &[OpRef],
     callee_jitcode_index: u32,
     callee_py_pc: u32,
-) -> Vec<OpRef> {
+    callee_op_pc: usize,
+) -> Result<Vec<OpRef>, DispatchError> {
     let banks = crate::state::frame_liveness_reg_indices_by_bank_at(
         callee_jitcode_index as i32,
         callee_py_pc as i32,
     );
     let mut active = Vec::with_capacity(banks.int.len() + banks.ref_.len() + banks.float.len());
-    let read = |bank: &[OpRef], idx: u32, name: &str| -> OpRef {
-        let v = bank.get(idx as usize).copied().unwrap_or_else(|| {
-            panic!(
-                "collect_callee_active_boxes: liveness-active {name} register {idx} out of \
-                 range (callee_jitcode_index={callee_jitcode_index}, \
-                 callee_py_pc={callee_py_pc}, bank_len={})",
-                bank.len()
-            )
-        });
-        if v == OpRef::NONE {
-            panic!(
-                "collect_callee_active_boxes: liveness-active {name} register {idx} holds \
-                 OpRef::NONE (callee_jitcode_index={callee_jitcode_index}, \
-                 callee_py_pc={callee_py_pc})"
-            );
+    let diag = std::env::var_os("PYRE_FBW_MF_DIAG").is_some();
+    let read = |bank: &[OpRef], idx: u32, name: &str| -> Result<OpRef, DispatchError> {
+        match bank.get(idx as usize).copied() {
+            Some(v) if v != OpRef::NONE => Ok(v),
+            other => {
+                if diag {
+                    eprintln!(
+                        "[fbw-mf-diag] decline: callee {name} reg {idx} {} \
+                         (callee_jitcode_index={callee_jitcode_index}, \
+                         callee_py_pc={callee_py_pc}, bank_len={}, \
+                         live_i={:?} live_r={:?} live_f={:?})",
+                        if other.is_none() {
+                            "out-of-range"
+                        } else {
+                            "holds OpRef::NONE"
+                        },
+                        bank.len(),
+                        banks.int,
+                        banks.ref_,
+                        banks.float,
+                    );
+                }
+                Err(DispatchError::LoopBearingCalleeInlineUnsupported { pc: callee_op_pc })
+            }
         }
-        v
     };
     for &idx in &banks.int {
-        active.push(read(regs_i, idx, "int"));
+        active.push(read(regs_i, idx, "int")?);
     }
     for &idx in &banks.ref_ {
-        active.push(read(regs_r, idx, "ref"));
+        active.push(read(regs_r, idx, "ref")?);
     }
     for &idx in &banks.float {
-        active.push(read(regs_f, idx, "float"));
+        active.push(read(regs_f, idx, "float")?);
     }
-    active
+    Ok(active)
 }
 
 /// #62: full-body-walk direct `CALL_ASSEMBLER` for a self-recursive call
