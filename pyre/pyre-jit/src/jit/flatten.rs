@@ -4125,7 +4125,7 @@ where
                 ctx.newtuple_from_array_fn_idx,
                 vec![array_operand],
                 CallFlavor::Plain,
-                majit_ir::PyreHelperKind::None,
+                majit_ir::PyreHelperKind::NewtupleFromArray,
                 dst_reg,
             ))
         }

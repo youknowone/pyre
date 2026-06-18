@@ -542,6 +542,27 @@ pub enum PyreHelperKind {
     /// + `int_is_true`, eliding the `CALL_MAY_FORCE` (and its
     /// `GUARD_NOT_FORCED` / `GUARD_NO_EXCEPTION`) the generic residual emits.
     Truth,
+    /// `bh_unpack_sequence_fn(count, seq)` — the UNPACK_SEQUENCE validator
+    /// emitted by the codewriter UNPACK_SEQUENCE arm.  Validates the exact
+    /// length and returns the normalized tuple.  The full-body walker
+    /// recognises this tag to fold an arity-2 specialised int tuple to a
+    /// `guard_class` + pass-through, eliding the opaque residual so the
+    /// partner [`PyreHelperKind::UnpackItem`] reads fold against it.
+    UnpackSequence,
+    /// `bh_unpack_item_fn(index, tuple)` — the per-index UNPACK_SEQUENCE item
+    /// reader.  The full-body walker recognises this tag to read `value0` /
+    /// `value1` from a specialised int tuple directly (`getfield_gc_pure_i`
+    /// + `wrapint`), so the unpacked items stay unboxed ints through the
+    /// downstream BINARY_OP int fold.
+    UnpackItem,
+    /// `bh_newtuple_from_array(array)` — the BUILD_TUPLE array consumer that
+    /// `lower_tuple_build_hlop_to_insn` emits after `new_array_clear` +
+    /// `setarrayitem_gc`.  The full-body walker recognises this tag to
+    /// virtualize an arity-2 plain-int tuple as a `spec_ii`
+    /// `new_with_vtable` + `value0` / `value1` (mirroring
+    /// `trace_build_tuple_value`), so the backing array build and the
+    /// partner [`PyreHelperKind::UnpackItem`] reads DCE to a pure-int loop.
+    NewtupleFromArray,
 }
 
 impl EffectInfo {

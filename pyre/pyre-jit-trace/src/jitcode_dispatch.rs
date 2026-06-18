@@ -8048,6 +8048,20 @@ fn dispatch_residual_call_iRd_kind(
         return Ok((DispatchOutcome::Continue, op.next_pc));
     }
 
+    // #195 / #73: virtualize an arity-2 plain-int BUILD_TUPLE
+    // (`newtuple_from_array`) as a `spec_ii` `new_with_vtable` +
+    // `value0` / `value1`, so the backing array build and the partner
+    // UNPACK_SEQUENCE reads DCE to a pure-int loop.  Falls through to the
+    // opaque residual for any other shape (SAFE — never declined).
+    if ctx.is_authoritative_executor
+        && ctx.is_full_body_walk
+        && dst_bank == 'r'
+        && ei.pyre_helper == majit_ir::PyreHelperKind::NewtupleFromArray
+        && try_walker_specialize_newtuple(ctx, op.pc, &r_args, dst, dst_bank)?.is_some()
+    {
+        return Ok((DispatchOutcome::Continue, op.next_pc));
+    }
+
     // pyjitpl.py:2063 forces-branch sub-case: when the descr's
     // `call_release_gil_target` is a non-NULL `(realfuncaddr, saveerr)`
     // pair, route through `direct_call_release_gil` which records
@@ -8848,6 +8862,288 @@ fn try_walker_specialize_binary_op_int(
         majit_ir::Value::Ref(majit_ir::GcRef(boxed_result_i64 as usize)),
     );
     write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, boxed)?;
+    Ok(Some(()))
+}
+
+/// FBW fold of the UNPACK_SEQUENCE two-residual lowering (`unpack_sequence_fn`
+/// validator + per-index `unpack_item_fn` reader emitted by the codewriter
+/// UNPACK_SEQUENCE arm) for an arity-2 specialised int tuple: guard the
+/// `spec_ii` class once, then read `value0` / `value1` directly
+/// (`getfield_gc_pure_i` + `wrapint`) so the unpacked items stay unboxed ints
+/// through the downstream BINARY_OP int fold — the walker analogue of the
+/// trait path's `W_SpecialisedTupleObject_ii` value0/value1 reads.  Returns
+/// `Ok(Some(()))` when folded (the caller returns `Continue`); `Ok(None)` to
+/// fall through to the opaque residual record, which stays correct for any
+/// other shape — so a non-foldable sequence is NOT declined to the trait leg.
+#[allow(clippy::too_many_arguments)]
+fn try_walker_specialize_unpack(
+    ctx: &mut WalkContext<'_, '_>,
+    op_pc: usize,
+    helper: majit_ir::PyreHelperKind,
+    i_args: &[OpRef],
+    r_args: &[OpRef],
+    allboxes: &[OpRef],
+    call_descr: &dyn majit_ir::descr::CallDescr,
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<()>, DispatchError> {
+    if !ctx.is_authoritative_executor || !ctx.is_full_body_walk || dst_bank != 'r' {
+        return Ok(None);
+    }
+    let (Some(&int_arg), Some(&seq)) = (i_args.first(), r_args.first()) else {
+        return Ok(None);
+    };
+    let Some(majit_ir::Value::Int(int_val)) = ctx.trace_ctx.box_value(int_arg) else {
+        return Ok(None);
+    };
+    let Some(concrete_seq) = walker_concrete_ref_object(ctx, seq) else {
+        return Ok(None);
+    };
+    // Only the arity-2 int specialised tuple is folded today; any other shape
+    // falls through to the opaque residual (correct, slower).
+    let spec_ii = &pyre_object::specialisedtupleobject::SPECIALISED_TUPLE_II_TYPE
+        as *const pyre_object::pyobject::PyType;
+    if !std::ptr::eq(unsafe { (*concrete_seq).ob_type }, spec_ii) {
+        return Ok(None);
+    }
+    match helper {
+        majit_ir::PyreHelperKind::UnpackSequence => {
+            // `spec_ii` is always arity 2, so the class guard subsumes the
+            // exact-length check `unpack_sequence_fn` performs.
+            if int_val != 2 {
+                return Ok(None);
+            }
+            if !ctx.trace_ctx.heap_cache().is_class_known(seq) {
+                let type_const = ctx.trace_ctx.const_int(spec_ii as i64);
+                ctx.trace_ctx
+                    .record_guard(OpCode::GuardClass, &[seq, type_const], 0);
+                walker_capture_snapshot_for_last_guard(ctx, op_pc)?;
+                ctx.trace_ctx
+                    .heap_cache_mut()
+                    .class_now_known(seq, spec_ii as i64);
+            }
+            // Pass `seq` through as the validated tuple; the per-index
+            // `unpack_item_fn` reads below fold off it.
+            write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, seq)?;
+            Ok(Some(()))
+        }
+        majit_ir::PyreHelperKind::UnpackItem => {
+            if !(0..2).contains(&int_val) {
+                return Ok(None);
+            }
+            // Authentic boxed element (small-int caching / identity); fall
+            // through to the opaque residual if it cannot be executed.
+            let Some(elem_ptr) = walker_execute_may_force_boxed(ctx, allboxes, call_descr) else {
+                return Ok(None);
+            };
+            // The class was already guarded by the partner `unpack_sequence_fn`
+            // fold (its validated-tuple passthrough reg == `seq`).
+            let descr = if int_val == 0 {
+                crate::descr::specialised_tuple_ii_value0_descr()
+            } else {
+                crate::descr::specialised_tuple_ii_value1_descr()
+            };
+            let raw = crate::state::opimpl_getfield_gc_i(ctx.trace_ctx, seq, descr);
+            let boxed = crate::state::wrapint(ctx.trace_ctx, raw);
+            ctx.trace_ctx.set_opref_concrete(
+                boxed,
+                majit_ir::Value::Ref(majit_ir::GcRef(elem_ptr as usize)),
+            );
+            write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, boxed)?;
+            Ok(Some(()))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// Walker-native mirror of the trait `trace_guard_exact_w_class`
+/// (`trace_opcode.rs`): emit `getfield_gc_r(w_class)` → `ptr_eq(expected)`
+/// → `guard_true` so the spec_ii fast path only stays live for an element
+/// whose Python-level `w_class` is the canonical type object — a later
+/// subclass sharing the payload `ob_type` side-exits rather than being
+/// silently rewrapped as a plain int.  Skipped for an unescaped element (a
+/// fresh `wrapint` box is provably plain, and reading its `w_class` would
+/// force the box OptVirtualize removes).
+fn walker_guard_exact_w_class(
+    ctx: &mut WalkContext<'_, '_>,
+    op_pc: usize,
+    obj: OpRef,
+    expected_typeobj: pyre_object::PyObjectRef,
+) -> Result<(), DispatchError> {
+    if expected_typeobj.is_null() || ctx.trace_ctx.heap_cache().is_unescaped(obj) {
+        return Ok(());
+    }
+    let actual =
+        crate::state::opimpl_getfield_gc_r(ctx.trace_ctx, obj, crate::descr::w_class_descr());
+    let expected = ctx.trace_ctx.const_ref(expected_typeobj as i64);
+    let eq = ctx.trace_ctx.record_op(OpCode::PtrEq, &[actual, expected]);
+    walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardTrue, &[eq])
+}
+
+/// #195 / #73: FBW virtualization of an arity-2 plain-int BUILD_TUPLE.
+/// `lower_tuple_build_hlop_to_insn` lowers BUILD_TUPLE to `new_array_clear`
+/// + per-index `setarrayitem_gc` + a `newtuple_from_array` residual
+/// (oopspec [`majit_ir::PyreHelperKind::NewtupleFromArray`]).  When both
+/// backing-array elements are concrete plain `W_IntObject`, re-emit the
+/// trait `trace_build_tuple_value` spec_ii shape walker-native
+/// (`new_with_vtable` + `w_class` / `value0` / `value1` `setfield_gc`),
+/// reading the elements straight out of the array heap-cache so the array
+/// build keeps no consumer and DCEs.  The partner
+/// [`try_walker_specialize_unpack`] then folds the `value0` / `value1`
+/// reads off the virtual tuple, collapsing build→unpack to a pure-int loop.
+///
+/// Returns `Ok(Some(()))` when folded (the caller returns `Continue`);
+/// `Ok(None)` to fall through to the opaque residual, which stays correct
+/// for any other shape (object tuple, arity ≠ 2, long element, cache miss)
+/// — so a non-foldable build is NOT declined to the trait leg.
+fn try_walker_specialize_newtuple(
+    ctx: &mut WalkContext<'_, '_>,
+    op_pc: usize,
+    r_args: &[OpRef],
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<()>, DispatchError> {
+    if !ctx.is_authoritative_executor || !ctx.is_full_body_walk || dst_bank != 'r' {
+        return Ok(None);
+    }
+    if r_args.len() != 1 {
+        return Ok(None);
+    }
+    let arr = r_args[0];
+    // Read the two backing-array element boxes out of the heap-cache (the
+    // values the BUILD_TUPLE `setarrayitem_gc` ops stored); a cache miss
+    // (non-const index / clobbered array) bails to the opaque residual.
+    let descr_idx = crate::state::pyobject_gcarray_descr().index();
+    let (Some(e0), Some(e1)) = (
+        ctx.trace_ctx
+            .heapcache_getarrayitem(arr, OpRef::ConstInt(0), descr_idx),
+        ctx.trace_ctx
+            .heapcache_getarrayitem(arr, OpRef::ConstInt(1), descr_idx),
+    ) else {
+        return Ok(None);
+    };
+    // Arity must be exactly 2 (the only specialised int tuple).  A BUILD_TUPLE
+    // array sets every index before `newtuple_from_array`, so a cached element
+    // at index 2 means arity ≥ 3 → fall through to the residual (a wrongly
+    // built arity-2 spec_ii would length-mismatch the arity-N unpack).
+    if ctx
+        .trace_ctx
+        .heapcache_getarrayitem(arr, OpRef::ConstInt(2), descr_idx)
+        .is_some()
+    {
+        return Ok(None);
+    }
+    let (Some(c0), Some(c1)) = (
+        walker_concrete_ref_object(ctx, e0),
+        walker_concrete_ref_object(ctx, e1),
+    ) else {
+        return Ok(None);
+    };
+    // Only the arity-2 plain-int specialised tuple is folded today.  Gate
+    // on `is_plain_int1` (rejects int subclasses + non-fitting longs) AND
+    // an exact `&INT_TYPE` `ob_type` — that excludes the fits-in-word
+    // `W_LongObject` arm `is_plain_int1` also accepts, which would need the
+    // long unbox the trait `trace_plain_int_payload` does (out of scope
+    // here).  Any other shape falls through to the residual (correct).
+    let int_ty = &pyre_object::pyobject::INT_TYPE as *const pyre_object::pyobject::PyType;
+    let both_plain_int = unsafe {
+        pyre_object::is_plain_int1(c0)
+            && pyre_object::is_plain_int1(c1)
+            && std::ptr::eq((*c0).ob_type, int_ty)
+            && std::ptr::eq((*c1).ob_type, int_ty)
+    };
+    if !both_plain_int {
+        return Ok(None);
+    }
+    // Concrete element int payloads (already proven plain `W_IntObject`).
+    let (v0, v1) = unsafe {
+        (
+            pyre_object::w_int_get_value(c0),
+            pyre_object::w_int_get_value(c1),
+        )
+    };
+
+    // --- emit the virtual spec_ii (walker-native trace_build_tuple_value) ---
+    // Paired `w_class` guard per element so a runtime int subclass sharing
+    // `&INT_TYPE`'s payload side-exits, then the plain-int payload unbox.
+    let int_typeobj = pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::INT_TYPE);
+    walker_guard_exact_w_class(ctx, op_pc, e0, int_typeobj)?;
+    walker_guard_exact_w_class(ctx, op_pc, e1, int_typeobj)?;
+    let int_type_addr = int_ty as i64;
+    let raw0 = walker_unbox_int_typed(
+        ctx,
+        op_pc,
+        e0,
+        int_type_addr,
+        crate::descr::int_intval_descr(),
+    )?;
+    let raw1 = walker_unbox_int_typed(
+        ctx,
+        op_pc,
+        e1,
+        int_type_addr,
+        crate::descr::int_intval_descr(),
+    )?;
+
+    let tuple = ctx.trace_ctx.record_op_with_descr(
+        OpCode::NewWithVtable,
+        &[],
+        crate::descr::specialised_tuple_ii_size_descr(),
+    );
+    ctx.trace_ctx.heap_cache_mut().new_object(tuple);
+    // `ob_type` is the JIT vtable; Python-level `type()` reads `w_class`,
+    // which all specialised tuple variants share at the public `tuple`
+    // typedef.
+    let tuple_w_class = pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::TUPLE_TYPE);
+    if !tuple_w_class.is_null() {
+        let wc = ctx.trace_ctx.const_ref(tuple_w_class as i64);
+        ctx.trace_ctx.record_op_with_descr(
+            OpCode::SetfieldGc,
+            &[tuple, wc],
+            crate::descr::specialised_tuple_ii_w_class_descr(),
+        );
+        ctx.trace_ctx.heapcache_setfield_cached(
+            tuple,
+            crate::descr::specialised_tuple_ii_w_class_descr().index(),
+            wc,
+        );
+    }
+    ctx.trace_ctx.record_op_with_descr(
+        OpCode::SetfieldGc,
+        &[tuple, raw0],
+        crate::descr::specialised_tuple_ii_value0_descr(),
+    );
+    ctx.trace_ctx.heapcache_setfield_cached(
+        tuple,
+        crate::descr::specialised_tuple_ii_value0_descr().index(),
+        raw0,
+    );
+    ctx.trace_ctx.record_op_with_descr(
+        OpCode::SetfieldGc,
+        &[tuple, raw1],
+        crate::descr::specialised_tuple_ii_value1_descr(),
+    );
+    ctx.trace_ctx.heapcache_setfield_cached(
+        tuple,
+        crate::descr::specialised_tuple_ii_value1_descr().index(),
+        raw1,
+    );
+    // Concrete spec_ii shadow for the dst (read by the partner unpack fold's
+    // `walker_concrete_ref_object` + `unpack_item_fn` execution).  Built
+    // directly from the element payloads — `newtuple_from_array(arr)` cannot
+    // be executed concretely (the virtual array `arr` has no concrete
+    // shadow).  Constructed last so the construct→root window holds no
+    // intervening runtime allocation: stamping `tuple`'s concrete roots the
+    // fresh spec_ii via the trace's concrete-shadow set.
+    let tuple_ptr = pyre_object::specialisedtupleobject::w_specialised_tuple_ii_new(v0, v1);
+    if tuple_ptr.is_null() {
+        return Ok(None);
+    }
+    ctx.trace_ctx.set_opref_concrete(
+        tuple,
+        majit_ir::Value::Ref(majit_ir::GcRef(tuple_ptr as usize)),
+    );
+    write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, tuple)?;
     Ok(Some(()))
 }
 
@@ -9977,6 +10273,29 @@ fn dispatch_residual_call_iIRd_kind(
                 }
             }
         }
+    }
+
+    // UNPACK_SEQUENCE fold (#73): read an arity-2 specialised int tuple's
+    // elements directly so the unpacked items stay unboxed ints (the trait
+    // path's value0/value1 fold).  A non-foldable shape falls through to the
+    // opaque residual below — correct, no decline.
+    if matches!(
+        ei.pyre_helper,
+        majit_ir::PyreHelperKind::UnpackSequence | majit_ir::PyreHelperKind::UnpackItem
+    ) && try_walker_specialize_unpack(
+        ctx,
+        op.pc,
+        ei.pyre_helper,
+        &i_args,
+        &r_args,
+        &allboxes,
+        call_descr,
+        dst,
+        dst_bank,
+    )?
+    .is_some()
+    {
+        return Ok((DispatchOutcome::Continue, op.next_pc));
     }
 
     // pyjitpl.py:2063 forces-branch sub-case: route release-gil through

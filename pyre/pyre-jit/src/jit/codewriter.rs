@@ -4790,12 +4790,12 @@ impl CodeWriter {
                 },
             unpack_sequence_fn:
                 HelperHandle {
-                    idx: _unpack_sequence_fn_idx,
+                    idx: unpack_sequence_fn_idx,
                     flavor: _unpack_sequence_fn_flavor,
                 },
             unpack_item_fn:
                 HelperHandle {
-                    idx: _unpack_item_fn_idx,
+                    idx: unpack_item_fn_idx,
                     flavor: _unpack_item_fn_flavor,
                 },
             build_slice_fn:
@@ -8323,29 +8323,54 @@ impl CodeWriter {
                             }
                         }
 
-                        // CPython 3.13 UNPACK_SEQUENCE: pop 1 (seq), push `count`.
-                        // Emit abort_permanent (no getitem helper yet) but
-                        // adjust current_depth so subsequent instructions don't
-                        // underflow.
+                        // UNPACK_SEQUENCE: pop 1 (seq), push `count` items.
+                        // `unpack_sequence_fn(n, seq)` validates the exact length
+                        // (raises ValueError/TypeError on a mismatch or a
+                        // non-sequence) and returns the normalized tuple; each
+                        // `unpack_item_fn(k, tuple)` then produces one item with a
+                        // residual result the walker binds, matching
+                        // opcode_unpack_sequence.
                         Instruction::UnpackSequence { count } => {
                             let n = count.get(op_arg) as usize;
-                            // Pop the sequence. The unpack residual reads it from a
-                            // stable scratch register so the item pushes below (which
-                            // reuse the popped stack slots) cannot clobber it; this
-                            // residual threading is walker-stream-only — the canonical
-                            // splice owns the production lowering via `insert_renamings`.
+                            // Pop the sequence; keep its FlowValue as the residual
+                            // arg. The graph def-use (seq -> unpack_sequence_fn ->
+                            // tuple -> unpack_item_fn) keeps both alive across the
+                            // item pushes below (which reuse the popped stack slots),
+                            // so no manual scratch reservation is needed.
                             let _ = emit_popvalue_ref!(current_depth, py_pc);
-                            let _ = pop_ref_or_fresh(&mut current_state, &mut graph);
-                            let _ = ssarepr.fresh_var(Kind::Ref, scratch_ref_base).0;
-                            // unpack_sequence_fn(n, seq) → tuple of exactly n items;
-                            // raises ValueError/TypeError on length mismatch or a
-                            // non-sequence, matching opcode_unpack_sequence.
-                            let _ = ssarepr.fresh_var(Kind::Ref, scratch_ref_base).0;
+                            let seq_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            let tuple_var = residual_call!(
+                                unpack_sequence_fn_idx,
+                                CallFlavor::Plain,
+                                majit_ir::PyreHelperKind::UnpackSequence,
+                                vec![super::flow::Constant::signed(n as i64).into()],
+                                vec![seq_value],
+                                vec![],
+                                vec![Kind::Int, Kind::Ref],
+                                ResKind::Ref,
+                                py_pc as i64,
+                            );
+                            let tuple_value = tuple_var
+                                .map(super::flow::FlowValue::from)
+                                .unwrap_or_else(|| fresh_ref_value(&mut graph));
                             // Push the items in reverse so the stack top is item[0]
                             // (opcode_unpack_sequence pushes `items.into_iter().rev()`).
-                            for _k in (0..n).rev() {
+                            for k in (0..n).rev() {
                                 let item_dst = stack_base + current_depth;
-                                let item_value = fresh_ref_value(&mut graph);
+                                let item_var = residual_call!(
+                                    unpack_item_fn_idx,
+                                    CallFlavor::Plain,
+                                    majit_ir::PyreHelperKind::UnpackItem,
+                                    vec![super::flow::Constant::signed(k as i64).into()],
+                                    vec![tuple_value.clone()],
+                                    vec![],
+                                    vec![Kind::Int, Kind::Ref],
+                                    ResKind::Ref,
+                                    py_pc as i64,
+                                );
+                                let item_value = item_var
+                                    .map(super::flow::FlowValue::from)
+                                    .unwrap_or_else(|| fresh_ref_value(&mut graph));
                                 if let super::flow::FlowValue::Variable(v) = &item_value {
                                     pin!(Some(*v), item_dst);
                                 }
