@@ -2978,9 +2978,15 @@ impl OptUnroll {
         // Const box per call, so two calls would NOT be ptr_eq.
         let end_arg_boxes: Vec<BoxRef> = end_args
             .iter()
-            .map(|&a| {
-                ctx.get_box_replacement_box(a)
-                    .unwrap_or_else(|| BoxRef::from_opref(a))
+            .map(|&a| match ctx.get_box_replacement_box(a) {
+                Some(b) => b,
+                // The None arm fires only for an unregistered ResOp position
+                // (Const / InputArg always resolve); #157 drained those fires
+                // to zero. materialize_box_at mints+registers a canonical
+                // synthetic so this key is ptr-stable and a later resolve hits
+                // the same host — not a producer-less from_opref box that would
+                // miss the exported_infos / next_iteration_args ptr_eq carry.
+                None => ctx.materialize_box_at(a),
             })
             .collect();
         for (arg, arg_box) in end_args.iter().zip(end_arg_boxes.iter()) {
@@ -2993,9 +2999,14 @@ impl OptUnroll {
             .expect("export_state make_inputargs_and_virtuals failed");
         // unroll.py:464-465: for arg in label_args: _expand_info(arg, infos)
         for &arg in &label_args {
-            let arg_box = ctx
-                .get_box_replacement_box(arg)
-                .unwrap_or_else(|| BoxRef::from_opref(arg));
+            let arg_box = match ctx.get_box_replacement_box(arg) {
+                Some(b) => b,
+                // Same canonical-key fallback as end_arg_boxes above: an
+                // unregistered ResOp position (drained to zero by #157) mints a
+                // canonical synthetic instead of a producer-less from_opref box,
+                // keeping the exported_infos key ptr-stable.
+                None => ctx.materialize_box_at(arg),
+            };
             self.expand_info(arg, &arg_box, ctx, exported_int_bounds, &mut infos);
         }
         let mut short_args = label_args.to_vec();
