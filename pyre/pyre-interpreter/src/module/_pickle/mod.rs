@@ -448,8 +448,10 @@ crate::py_module! {
             // The dump-time `dispatch_table` (no per-pickler one here) — its
             // `copyreg` import can collect, so resolve it with `obj` pinned.
             let dispatch_table = pickler::copyreg_dispatch_table();
-            let w_bytes = pickler::pickle_core(
+            // Pass `file` so `pickle_core` streams the frames to it directly.
+            pickler::pickle_core(
                 pyre_object::gc_roots::shadow_stack_get(obj_slot),
+                pyre_object::gc_roots::shadow_stack_get(file_slot),
                 proto,
                 proto >= 1,
                 proto >= 4,
@@ -461,8 +463,6 @@ crate::py_module! {
                 dispatch_table,
                 pyre_object::PY_NULL,
             )?;
-            let file = pyre_object::gc_roots::shadow_stack_get(file_slot);
-            call_meth(file, "write", &[w_bytes])?;
             Ok(pyre_object::w_none())
         }
 
@@ -482,8 +482,10 @@ crate::py_module! {
             pyre_object::gc_roots::pin_root(buffer_callback);
             let bc_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
             let dispatch_table = pickler::copyreg_dispatch_table();
+            // No file: `pickle_core` accumulates and returns the pickle bytes.
             pickler::pickle_core(
                 pyre_object::gc_roots::shadow_stack_get(obj_slot),
+                pyre_object::PY_NULL,
                 proto,
                 proto >= 1,
                 proto >= 4,

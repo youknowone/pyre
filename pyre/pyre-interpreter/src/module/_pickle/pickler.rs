@@ -91,36 +91,36 @@ impl PickleCtx {
     }
 }
 
-/// `interp_pickle.py _Framer` — accumulates output into frames. Bytes are
-/// appended to the active frame; once a frame reaches `FRAME_SIZE_TARGET`
-/// it is flushed (FRAME opcode + 8-byte little-endian length + body when the
-/// body is at least `FRAME_SIZE_MIN` bytes). Large payloads bypass the frame
-/// entirely (`write_large_bytes`). When framing is off (protocol < 4) the
-/// active frame is `None` and bytes pass straight through to `output`.
+/// `interp_pickle.py _Framer` — emits output as frames and streams them to the
+/// file's `write` as they are produced. Bytes are appended to the active frame;
+/// once a frame reaches `FRAME_SIZE_TARGET` it is committed (FRAME opcode +
+/// 8-byte little-endian length + body when the body is at least
+/// `FRAME_SIZE_MIN` bytes) into `pending` and `pending` is flushed to the file.
+/// Large payloads bypass the frame and are written directly
+/// (`write_large_bytes`). When framing is off (protocol < 4) the active frame
+/// is `None` and bytes accumulate in `pending` until the final flush.
 ///
-/// `push` / `extend_from_slice` mirror the `Vec<u8>` methods the save
-/// routines call, so they write through the framer unchanged.
+/// `push` / `extend_from_slice` mirror the `Vec<u8>` methods the save routines
+/// call. They never touch Python, so the deep save tree stays GC-inert; the
+/// only nursery-relocation points are the `commit_frame` at each `save`
+/// boundary, `write_large_bytes`, and the end flush — and those callers pin the
+/// objects they still need across the `file.write` (arbitrary Python).
 ///
-/// Deliberate deviation: `_Framer` streams — it writes each committed frame
-/// (and every unframed byte at protocol < 4) to the file's `write` as it is
-/// produced. This buffers the entire pickle in `output` and the caller writes
-/// it to the file in a single `write` after the save completes. The wire bytes
-/// are identical; only the number of `write` calls and peak memory differ.
-/// Streaming is not done because the save tree treats byte emission as
-/// GC-inert: routing `file.write` (arbitrary Python, hence a nursery
-/// relocation point) through every `push` / `commit_frame` would require
-/// re-pinning and re-reading raw object pointers around every byte written
-/// across the whole save tree, not just at the existing reduce/getattr calls.
+/// `file_slot` is the shadow-stack slot of the destination file (pinned by the
+/// caller for the whole dump). When it is `None` (the `dumps` path) nothing is
+/// flushed: `pending` accumulates the entire pickle and the caller takes it.
 struct Framer {
     current_frame: Option<Vec<u8>>,
-    output: Vec<u8>,
+    pending: Vec<u8>,
+    file_slot: Option<usize>,
 }
 
 impl Framer {
-    fn new() -> Self {
+    fn new(file_slot: Option<usize>) -> Self {
         Framer {
             current_frame: None,
-            output: Vec::new(),
+            pending: Vec::new(),
+            file_slot,
         }
     }
 
@@ -128,7 +128,7 @@ impl Framer {
     fn push(&mut self, byte: u8) {
         match &mut self.current_frame {
             Some(f) => f.push(byte),
-            None => self.output.push(byte),
+            None => self.pending.push(byte),
         }
     }
 
@@ -136,7 +136,7 @@ impl Framer {
     fn extend_from_slice(&mut self, data: &[u8]) {
         match &mut self.current_frame {
             Some(f) => f.extend_from_slice(data),
-            None => self.output.extend_from_slice(data),
+            None => self.pending.extend_from_slice(data),
         }
     }
 
@@ -145,42 +145,72 @@ impl Framer {
         self.current_frame = Some(Vec::new());
     }
 
-    /// `_Framer.end_framing` — flush any remaining frame and stop framing.
-    fn end_framing(&mut self) {
-        if matches!(&self.current_frame, Some(f) if !f.is_empty()) {
-            self.commit_frame(true);
+    /// Write the buffered `pending` bytes to the file in a single `write`. A
+    /// no-op when there is no file (`dumps`) or nothing is pending. The file is
+    /// re-read from its pin because `write` (arbitrary Python) can relocate it.
+    fn flush(&mut self) -> Result<(), PyError> {
+        if let Some(slot) = self.file_slot {
+            if !self.pending.is_empty() {
+                let w_bytes = pyre_object::w_bytes_from_bytes(&self.pending);
+                let w_file = pyre_object::gc_roots::shadow_stack_get(slot);
+                call_meth(w_file, "write", &[w_bytes])?;
+                self.pending.clear();
+            }
         }
-        self.current_frame = None;
+        Ok(())
     }
 
-    /// `_Framer.commit_frame` — flush the active frame when it has reached
-    /// the target size (or `force`).
-    fn commit_frame(&mut self, force: bool) {
-        let flush = match &self.current_frame {
+    /// `_Framer.end_framing` — commit any remaining frame and stop framing.
+    fn end_framing(&mut self) -> Result<(), PyError> {
+        if matches!(&self.current_frame, Some(f) if !f.is_empty()) {
+            self.commit_frame(true)?;
+        }
+        self.current_frame = None;
+        Ok(())
+    }
+
+    /// `_Framer.commit_frame` — commit the active frame into `pending` when it
+    /// has reached the target size (or `force`), then flush `pending` to the
+    /// file. Only ever called at a `save` boundary or `end_framing`.
+    fn commit_frame(&mut self, force: bool) -> Result<(), PyError> {
+        let commit = match &self.current_frame {
             Some(f) => f.len() >= FRAME_SIZE_TARGET || force,
             None => false,
         };
-        if !flush {
-            return;
+        if !commit {
+            return Ok(());
         }
         let data = std::mem::take(self.current_frame.as_mut().unwrap());
         if data.len() >= FRAME_SIZE_MIN {
-            self.output.push(op::FRAME);
-            self.output
+            self.pending.push(op::FRAME);
+            self.pending
                 .extend_from_slice(&(data.len() as u64).to_le_bytes());
         }
-        self.output.extend_from_slice(&data);
+        self.pending.extend_from_slice(&data);
+        self.flush()
     }
 
-    /// `_Framer.write_large_bytes` — terminate the active frame, then write a
-    /// large header + payload directly (unframed) to avoid copying the
-    /// payload into the frame builder.
-    fn write_large_bytes(&mut self, header: &[u8], payload: &[u8]) {
+    /// `_Framer.write_large_bytes` — terminate the active frame, then write the
+    /// header (with the committed frame) and the payload as separate `write`s,
+    /// avoiding buffering the large payload. The payload is copied to
+    /// GC-stable storage first because the `write` calls below run arbitrary
+    /// Python and can relocate the (managed) source the slice borrows from.
+    fn write_large_bytes(&mut self, header: &[u8], payload: &[u8]) -> Result<(), PyError> {
+        let owned = payload.to_vec();
         if matches!(&self.current_frame, Some(f) if !f.is_empty()) {
-            self.commit_frame(true);
+            self.commit_frame(true)?;
         }
-        self.output.extend_from_slice(header);
-        self.output.extend_from_slice(payload);
+        self.pending.extend_from_slice(header);
+        match self.file_slot {
+            Some(slot) => {
+                self.flush()?;
+                let w_payload = pyre_object::w_bytes_from_bytes(&owned);
+                let w_file = pyre_object::gc_roots::shadow_stack_get(slot);
+                call_meth(w_file, "write", &[w_payload])?;
+            }
+            None => self.pending.extend_from_slice(&owned),
+        }
+        Ok(())
     }
 }
 
@@ -280,8 +310,12 @@ impl W_Pickler {
         };
 
         let w_memo = pyre_object::gc_roots::shadow_stack_get(memo_slot);
-        let w_bytes = pickle_core(
+        // `w_file` may have moved during the hook lookups; re-read the pin.
+        // `pickle_core` streams the frames to it as they are produced.
+        let w_file = pyre_object::gc_roots::shadow_stack_get(file_slot);
+        pickle_core(
             w_obj,
+            w_file,
             proto,
             bin,
             framing,
@@ -293,9 +327,6 @@ impl W_Pickler {
             dispatch_table,
             reducer_override,
         )?;
-        // `w_file` may have moved while building the pickle; re-read the pin.
-        let w_file = pyre_object::gc_roots::shadow_stack_get(file_slot);
-        call_meth(w_file, "write", &[w_bytes])?;
         Ok(())
     }
 
@@ -571,14 +602,17 @@ pub(crate) fn normalize_protocol(w_protocol: PyObjectRef) -> Result<i64, PyError
     }
 }
 
-/// Build the full pickle byte string for `w_obj` and return it as a `bytes`.
-/// Shared by `W_Pickler.dump` (which then writes it to the file) and the
-/// module-level `dump` / `dumps`. `pers_func` is the `persistent_id` callable
-/// or `PY_NULL`. PROTO is written before framing begins (outside the frame);
-/// STOP is written while framing is active (inside the last frame).
+/// Pickle `w_obj`. When `w_file` is a file object the frames are streamed to
+/// its `write` as they are produced and `PY_NULL` is returned; when `w_file` is
+/// `PY_NULL` (the `dumps` path) the whole pickle is accumulated and returned as
+/// a `bytes`. Shared by `W_Pickler.dump` and the module-level `dump` / `dumps`.
+/// `pers_func` is the `persistent_id` callable or `PY_NULL`. PROTO is written
+/// before framing begins (outside the frame); STOP is written while framing is
+/// active (inside the last frame).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn pickle_core(
     w_obj: PyObjectRef,
+    w_file: PyObjectRef,
     proto: i64,
     bin: bool,
     framing: bool,
@@ -630,7 +664,15 @@ pub(crate) fn pickle_core(
         dispatch_table,
         reducer_override,
     };
-    let mut fr = Framer::new();
+    // Pin the destination file so the framer can re-read it across each
+    // streaming `write` (which can relocate it). `None` selects accumulate mode.
+    let file_slot = if w_file.is_null() {
+        None
+    } else {
+        pyre_object::gc_roots::pin_root(w_file);
+        Some(pyre_object::gc_roots::shadow_stack_len() - 1)
+    };
+    let mut fr = Framer::new(file_slot);
     if proto >= 2 {
         fr.push(op::PROTO);
         fr.push(proto as u8);
@@ -640,24 +682,31 @@ pub(crate) fn pickle_core(
     }
     save(&mut ctx, &mut fr, w_obj)?;
     fr.push(op::STOP);
-    fr.end_framing();
+    fr.end_framing()?;
+    // Flush the unframed residual (the whole pickle for protocol < 4, a no-op
+    // after the last frame committed for protocol >= 4); a no-op without a file.
+    fr.flush()?;
 
-    Ok(pyre_object::w_bytes_from_bytes(&fr.output))
+    if file_slot.is_some() {
+        Ok(pyre_object::PY_NULL)
+    } else {
+        Ok(pyre_object::w_bytes_from_bytes(&fr.pending))
+    }
 }
 
 /// `interp_pickle.py W_Pickler.save` with the persistent-id hook: every
 /// object is first offered to `persistent_id`; a non-None result is saved
 /// as a persistent reference instead of by value.
 fn save(ctx: &mut PickleCtx, buf: &mut Framer, w_obj: PyObjectRef) -> Result<(), PyError> {
-    // A frame boundary can only fall at the start of a `save`, never inside
-    // an object; flush the active frame once it has grown past the target.
-    buf.commit_frame(false);
+    // A frame boundary can only fall at the start of a `save`, never inside an
+    // object; commit the active frame once it has grown past the target.
+    // Committing streams to the file (arbitrary Python), and the `persistent_id`
+    // hook below is too, so pin `w_obj` across both and read it from the pin.
+    let _roots = pyre_object::gc_roots::push_roots();
+    pyre_object::gc_roots::pin_root(w_obj);
+    let slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    buf.commit_frame(false)?;
     if !ctx.pers_func.is_null() {
-        // The hook is arbitrary Python; pin `w_obj` so the by-value fallback
-        // sees it at its post-call address.
-        let _roots = pyre_object::gc_roots::push_roots();
-        pyre_object::gc_roots::pin_root(w_obj);
-        let slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         let w_pid = call_fn(
             ctx.pers_func,
             &[pyre_object::gc_roots::shadow_stack_get(slot)],
@@ -667,7 +716,7 @@ fn save(ctx: &mut PickleCtx, buf: &mut Framer, w_obj: PyObjectRef) -> Result<(),
         }
         return save_object(ctx, buf, pyre_object::gc_roots::shadow_stack_get(slot));
     }
-    save_object(ctx, buf, w_obj)
+    save_object(ctx, buf, pyre_object::gc_roots::shadow_stack_get(slot))
 }
 
 /// `interp_pickle.py save_pers` — emit a persistent reference. The
@@ -977,6 +1026,11 @@ fn save_bytes(ctx: &mut PickleCtx, buf: &mut Framer, w_obj: PyObjectRef) -> Resu
     }
     let data = unsafe { pyre_object::bytesobject::w_bytes_data(w_obj) };
     let n = data.len();
+    // A large payload streams via `file.write` (arbitrary Python); pin `w_obj`
+    // so the trailing `memoize` reads it at its post-write address.
+    let _roots = pyre_object::gc_roots::push_roots();
+    pyre_object::gc_roots::pin_root(w_obj);
+    let slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     if n <= 0xff {
         buf.push(op::SHORT_BINBYTES);
         buf.push(n as u8);
@@ -984,21 +1038,26 @@ fn save_bytes(ctx: &mut PickleCtx, buf: &mut Framer, w_obj: PyObjectRef) -> Resu
     } else if n > 0xffff_ffff && ctx.proto >= 4 {
         let mut header = vec![op::BINBYTES8];
         header.extend_from_slice(&(n as u64).to_le_bytes());
-        buf.write_large_bytes(&header, data);
+        buf.write_large_bytes(&header, data)?;
     } else if n >= FRAME_SIZE_TARGET {
         let mut header = vec![op::BINBYTES];
         header.extend_from_slice(&(n as u32).to_le_bytes());
-        buf.write_large_bytes(&header, data);
+        buf.write_large_bytes(&header, data)?;
     } else {
         buf.push(op::BINBYTES);
         buf.extend_from_slice(&(n as u32).to_le_bytes());
         buf.extend_from_slice(data);
     }
-    memoize(ctx, buf, w_obj);
+    memoize(ctx, buf, pyre_object::gc_roots::shadow_stack_get(slot));
     Ok(())
 }
 
 fn save_str(ctx: &mut PickleCtx, buf: &mut Framer, w_obj: PyObjectRef) -> Result<(), PyError> {
+    // A large payload streams via `file.write` (arbitrary Python); pin `w_obj`
+    // so the trailing `memoize` reads it at its post-write address.
+    let _roots = pyre_object::gc_roots::push_roots();
+    pyre_object::gc_roots::pin_root(w_obj);
+    let slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     if ctx.bin {
         let s = unsafe { pyre_object::strobject::w_str_get_value(w_obj) };
         let data = s.as_bytes();
@@ -1010,11 +1069,11 @@ fn save_str(ctx: &mut PickleCtx, buf: &mut Framer, w_obj: PyObjectRef) -> Result
         } else if n > 0xffff_ffff && ctx.proto >= 4 {
             let mut header = vec![op::BINUNICODE8];
             header.extend_from_slice(&(n as u64).to_le_bytes());
-            buf.write_large_bytes(&header, data);
+            buf.write_large_bytes(&header, data)?;
         } else if n >= FRAME_SIZE_TARGET {
             let mut header = vec![op::BINUNICODE];
             header.extend_from_slice(&(n as u32).to_le_bytes());
-            buf.write_large_bytes(&header, data);
+            buf.write_large_bytes(&header, data)?;
         } else {
             buf.push(op::BINUNICODE);
             buf.extend_from_slice(&(n as u32).to_le_bytes());
@@ -1048,7 +1107,7 @@ fn save_str(ctx: &mut PickleCtx, buf: &mut Framer, w_obj: PyObjectRef) -> Result
         buf.extend_from_slice(data);
         buf.push(b'\n');
     }
-    memoize(ctx, buf, w_obj);
+    memoize(ctx, buf, pyre_object::gc_roots::shadow_stack_get(slot));
     Ok(())
 }
 
@@ -1278,16 +1337,21 @@ fn save_bytearray(
     }
     let data = unsafe { pyre_object::bytearrayobject::w_bytearray_data(w_obj) };
     let n = data.len();
+    // A large payload streams via `file.write` (arbitrary Python); pin `w_obj`
+    // so the trailing `memoize` reads it at its post-write address.
+    let _roots = pyre_object::gc_roots::push_roots();
+    pyre_object::gc_roots::pin_root(w_obj);
+    let slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     if n >= FRAME_SIZE_TARGET {
         let mut header = vec![op::BYTEARRAY8];
         header.extend_from_slice(&(n as u64).to_le_bytes());
-        buf.write_large_bytes(&header, data);
+        buf.write_large_bytes(&header, data)?;
     } else {
         buf.push(op::BYTEARRAY8);
         buf.extend_from_slice(&(n as u64).to_le_bytes());
         buf.extend_from_slice(data);
     }
-    memoize(ctx, buf, w_obj);
+    memoize(ctx, buf, pyre_object::gc_roots::shadow_stack_get(slot));
     Ok(())
 }
 
@@ -1326,13 +1390,17 @@ fn save_picklebuffer(
     }
     if in_band {
         // In-band buffers memoize the wrapper (`_save_bytes_data` /
-        // `_save_bytearray_data`), so a repeated reference becomes a GET.
+        // `_save_bytearray_data`), so a repeated reference becomes a GET. A
+        // large payload streams via `file.write`; pin `w_obj` for the memoize.
+        let _roots = pyre_object::gc_roots::push_roots();
+        pyre_object::gc_roots::pin_root(w_obj);
+        let slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         if readonly {
-            save_raw_bytes(ctx, buf, &data);
+            save_raw_bytes(ctx, buf, &data)?;
         } else {
-            save_raw_bytearray(buf, &data);
+            save_raw_bytearray(buf, &data)?;
         }
-        memoize(ctx, buf, w_obj);
+        memoize(ctx, buf, pyre_object::gc_roots::shadow_stack_get(slot));
     } else {
         buf.push(op::NEXT_BUFFER);
         if readonly {
@@ -1343,8 +1411,10 @@ fn save_picklebuffer(
 }
 
 /// `interp_pickle.py save_raw_bytes` — emit raw bytes with the size-appropriate
-/// BINBYTES opcode (no memoization).
-fn save_raw_bytes(ctx: &PickleCtx, buf: &mut Framer, data: &[u8]) {
+/// BINBYTES opcode (no memoization). `data` is owned storage, so the streaming
+/// `file.write` in `write_large_bytes` cannot dangle it; the caller pins any
+/// object it still needs afterwards.
+fn save_raw_bytes(ctx: &PickleCtx, buf: &mut Framer, data: &[u8]) -> Result<(), PyError> {
     let n = data.len();
     if n <= 0xff {
         buf.push(op::SHORT_BINBYTES);
@@ -1353,31 +1423,33 @@ fn save_raw_bytes(ctx: &PickleCtx, buf: &mut Framer, data: &[u8]) {
     } else if n > 0xffff_ffff && ctx.proto >= 4 {
         let mut header = vec![op::BINBYTES8];
         header.extend_from_slice(&(n as u64).to_le_bytes());
-        buf.write_large_bytes(&header, data);
+        buf.write_large_bytes(&header, data)?;
     } else if n >= FRAME_SIZE_TARGET {
         let mut header = vec![op::BINBYTES];
         header.extend_from_slice(&(n as u32).to_le_bytes());
-        buf.write_large_bytes(&header, data);
+        buf.write_large_bytes(&header, data)?;
     } else {
         buf.push(op::BINBYTES);
         buf.extend_from_slice(&(n as u32).to_le_bytes());
         buf.extend_from_slice(data);
     }
+    Ok(())
 }
 
 /// `interp_pickle.py save_raw_bytearray` — emit raw bytes with BYTEARRAY8
 /// (no memoization).
-fn save_raw_bytearray(buf: &mut Framer, data: &[u8]) {
+fn save_raw_bytearray(buf: &mut Framer, data: &[u8]) -> Result<(), PyError> {
     let n = data.len();
     if n >= FRAME_SIZE_TARGET {
         let mut header = vec![op::BYTEARRAY8];
         header.extend_from_slice(&(n as u64).to_le_bytes());
-        buf.write_large_bytes(&header, data);
+        buf.write_large_bytes(&header, data)?;
     } else {
         buf.push(op::BYTEARRAY8);
         buf.extend_from_slice(&(n as u64).to_le_bytes());
         buf.extend_from_slice(data);
     }
+    Ok(())
 }
 
 /// Build a Python `list` from `items` and pin it in the shadow stack,
