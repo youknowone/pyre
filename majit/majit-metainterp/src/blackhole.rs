@@ -7183,10 +7183,11 @@ pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
         "setarrayitem_gc_f/rifd".to_string(),
         majit_translate::insns::BC_SETARRAYITEM_GC_F,
     );
-    // Constant-operand "_C" forms, emitted when the array length / store
-    // index is a compile-time constant — a fixed-size tuple/list build
-    // (`new_array_clear/cd>r`) and its element stores
-    // (`setarrayitem_gc_r/rcrd`). Whether the assembler emits the `_C` or
+    // Constant-operand "_C" forms, emitted when the array length, store
+    // index, or store value is a compile-time constant — a fixed-size
+    // tuple/list build (`new_array_clear/cd>r`) and its element stores
+    // (`setarrayitem_gc_r/rcrd`, const index; `setarrayitem_gc_i/ricd`,
+    // const int value).Whether the assembler emits the `_C` or
     // the register form depends on constant folding during
     // `make_jitcodes`, so a guard failure resuming forward through a
     // constant-size build must dispatch these too. Their `bhimpl_*`
@@ -7196,6 +7197,10 @@ pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
     insns.insert(
         "setarrayitem_gc_r/rcrd".to_string(),
         majit_translate::insns::BC_SETARRAYITEM_GC_R_C,
+    );
+    insns.insert(
+        "setarrayitem_gc_i/ricd".to_string(),
+        majit_translate::insns::BC_SETARRAYITEM_GC_I_C,
     );
     insns.insert(
         "new_array_clear/cd>r".to_string(),
