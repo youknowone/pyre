@@ -6302,20 +6302,14 @@ fn emit_guard_exit(
             .ins()
             .store(MemFlags::trusted(), zero, exc_type_addr, 0);
     }
-    if info.gcmap != 0 || info.must_save_exception {
-        // aarch64/assembler.py:967-980 `_reload_frame_if_necessary`:
-        // RPython emits a JITFrame write-barrier after any potentially-
-        // allocating CALL when `gcrootmap and wbdescr` so promoted-frame
-        // young-pointer slots remain trackable. Cranelift cannot patch
-        // mid-trace, so the barrier is hoisted to every guard exit that
-        // wrote Ref fail-args (gcmap != 0) or stashed an exception value;
-        // both cases install young pointers in slots whose owner JITFrame
-        // may have been promoted by an earlier nursery collection.
-        emit_jitframe_write_barrier(builder, ptr_type, call_conv, jf_ptr);
-    }
     if info.can_have_bridge && info.must_save_exception {
         // Exception guards need the exception payload saved before a bridge
-        // sees the frame, so keep their bridge check after recovery stores.
+        // sees the frame.  Do the bridge check before the deadframe-only
+        // write-barrier/descr stores: dynasm patches exception guards to jump
+        // to the bridge after staging jf_guard_exc, and the bridge prologue
+        // immediately re-roots the same frame on the shadow stack.  A bridge
+        // hit therefore does not need the host-call write barrier that only
+        // protects the returned deadframe path.
         emit_attached_bridge_dispatch(
             builder,
             jf_ptr,
@@ -6323,6 +6317,17 @@ fn emit_guard_exit(
                 .expect("can_have_bridge=true GuardInfo must carry bridge_cache_addrs"),
             ptr_type,
         );
+    }
+    if info.gcmap != 0 || info.must_save_exception {
+        // aarch64/assembler.py:967-980 `_reload_frame_if_necessary`:
+        // RPython emits a JITFrame write-barrier after any potentially-
+        // allocating CALL when `gcrootmap and wbdescr` so promoted-frame
+        // young-pointer slots remain trackable. Cranelift cannot patch
+        // mid-trace, so the barrier is hoisted to guard exits that return a
+        // deadframe after writing Ref fail-args (gcmap != 0) or staging an
+        // exception value (must_save_exception).  Attached bridge hits tail-call
+        // above and skip this deadframe-only slow work.
+        emit_jitframe_write_barrier(builder, ptr_type, call_conv, jf_ptr);
     }
     builder
         .ins()
