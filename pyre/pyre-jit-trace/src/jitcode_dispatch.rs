@@ -7382,8 +7382,19 @@ fn try_walker_call_assembler_self_recursive(
     if pyre_interpreter::ncells(callee_code) != 0 {
         return Ok(None);
     }
-    let callee_globals = unsafe { pyre_interpreter::function_get_globals(callable) };
+    // Recover the legacy raw storage from the object via the proxy back-link
+    // for the `frame_stores_global` stamp; the function's own raw slot is
+    // null (MAKE_FUNCTION captures the object only), so reading it would
+    // mis-stamp `pycode.w_globals`.
     let callee_globals_obj = unsafe { pyre_interpreter::function_get_globals_obj(callable) };
+    let callee_globals = if callee_globals_obj.is_null() {
+        std::ptr::null_mut()
+    } else {
+        unsafe {
+            pyre_object::dictmultiobject::w_dict_get_dict_storage_proxy(callee_globals_obj)
+                as *mut pyre_interpreter::DictStorage
+        }
+    };
     if unsafe {
         pyre_interpreter::w_code_frame_stores_global(
             w_code as pyre_object::PyObjectRef,
