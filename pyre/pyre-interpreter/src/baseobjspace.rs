@@ -1797,6 +1797,151 @@ fn filter_reduce_method(args: &[PyObjectRef]) -> PyResult {
     }
 }
 
+/// `functional.py:1065-1067 _raise_strict_error` — the strict zip/map
+/// length-mismatch `ValueError`.  `index` is the 0-based position whose
+/// argument is short/long; the message numbers are 1-based.
+fn strict_zip_error(func_name: &str, index: usize, adjective: &str) -> PyError {
+    let plural = if index == 1 { " " } else { "s 1-" };
+    PyError::new(
+        PyErrorKind::ValueError,
+        format!(
+            "{}() argument {} is {} than argument{}{}",
+            func_name,
+            index + 1,
+            adjective,
+            plural,
+            index
+        ),
+    )
+}
+
+/// Pull one item from each iterator in the `list` `w_iterators`, returning
+/// them.  `Ok(None)` is a normal stop (the shortest is exhausted, non-strict).
+/// In `strict` mode a length mismatch raises `ValueError` naming `func_name`
+/// ("zip" / "map").  Shared by `map` and `zip`
+/// (`functional.py:1022-1079 W_Zip.next_w`).
+///
+/// # Safety
+/// `w_iterators` must be a valid `list` of iterator objects.
+unsafe fn pull_iterator_tuple(
+    w_iterators: PyObjectRef,
+    strict: bool,
+    func_name: &str,
+) -> Result<Option<Vec<PyObjectRef>>, PyError> {
+    let n = pyre_object::w_list_len(w_iterators) as usize;
+    if n == 0 {
+        return Ok(None);
+    }
+    let mut items: Vec<PyObjectRef> = Vec::with_capacity(n);
+    for i in 0..n {
+        let it = pyre_object::w_list_getitem(w_iterators, i as i64).unwrap();
+        match next(it) {
+            Ok(v) => items.push(v),
+            Err(e) if e.kind == PyErrorKind::StopIteration => {
+                if !strict {
+                    return Ok(None);
+                }
+                // A StopIteration in strict mode is a length mismatch.
+                // `items.len()` iterators yielded before this one ran dry.
+                let progress = items.len();
+                if progress > 0 {
+                    return Err(strict_zip_error(func_name, progress, "shorter"));
+                }
+                if n == 1 {
+                    // A single iterable can never mismatch.
+                    return Ok(None);
+                }
+                if n == 2 {
+                    // `functional.py:1047-1054` — the first ran dry; if the
+                    // second still yields it is the longer one.
+                    let it1 = pyre_object::w_list_getitem(w_iterators, 1).unwrap();
+                    return match next(it1) {
+                        Ok(_) => Err(strict_zip_error(func_name, 1, "longer")),
+                        Err(e2) if e2.kind == PyErrorKind::StopIteration => Ok(None),
+                        Err(e2) => Err(e2),
+                    };
+                }
+                // `functional.py:1069-1079 _validate_strict` — the first ran
+                // dry; any later iterator that still yields is the longer one.
+                for j in 0..n {
+                    let itj = pyre_object::w_list_getitem(w_iterators, j as i64).unwrap();
+                    match next(itj) {
+                        Ok(_) => return Err(strict_zip_error(func_name, j, "longer")),
+                        Err(e2) if e2.kind == PyErrorKind::StopIteration => {}
+                        Err(e2) => return Err(e2),
+                    }
+                }
+                return Ok(None);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(Some(items))
+}
+
+/// `map.__reduce__()` — `functional.py:869-873 W_Map.descr_reduce`:
+/// `(map, (func, *iterators))`, with a trailing `True` when `strict`
+/// (CPython 3.14).  The captured iterators carry their positions.
+fn map_reduce_method(args: &[PyObjectRef]) -> PyResult {
+    unsafe {
+        let w_fun = pyre_object::mapobject::w_map_get_fun(args[0]);
+        let w_iterators = pyre_object::mapobject::w_map_get_iterators(args[0]);
+        let n = pyre_object::w_list_len(w_iterators);
+        let mut state_items = Vec::with_capacity(n as usize + 1);
+        state_items.push(w_fun);
+        for i in 0..n {
+            state_items.push(pyre_object::w_list_getitem(w_iterators, i as i64).unwrap());
+        }
+        let state = w_tuple_new(state_items);
+        let map_fn = builtin_callable("map");
+        if pyre_object::mapobject::w_map_get_strict(args[0]) {
+            Ok(w_tuple_new(vec![map_fn, state, w_bool_from(true)]))
+        } else {
+            Ok(w_tuple_new(vec![map_fn, state]))
+        }
+    }
+}
+
+/// `map.__setstate__(strict)` — CPython 3.14: set the `strict` flag from the
+/// unpickled state.
+fn map_setstate_method(args: &[PyObjectRef]) -> PyResult {
+    let strict = is_true(args[1])?;
+    unsafe {
+        pyre_object::mapobject::w_map_set_strict(args[0], strict);
+    }
+    Ok(w_none())
+}
+
+/// `zip.__reduce__()` — `functional.py:1081-1087 W_Zip.descr_reduce`:
+/// `(zip, (*iterators))`, with a trailing `True` when `strict`.
+fn zip_reduce_method(args: &[PyObjectRef]) -> PyResult {
+    unsafe {
+        let w_iterators = pyre_object::zipobject::w_zip_get_iterators(args[0]);
+        let n = pyre_object::w_list_len(w_iterators);
+        let mut state_items = Vec::with_capacity(n as usize);
+        for i in 0..n {
+            state_items.push(pyre_object::w_list_getitem(w_iterators, i as i64).unwrap());
+        }
+        let state = w_tuple_new(state_items);
+        let zip_fn = builtin_callable("zip");
+        if pyre_object::zipobject::w_zip_get_strict(args[0]) {
+            Ok(w_tuple_new(vec![zip_fn, state, w_bool_from(true)]))
+        } else {
+            Ok(w_tuple_new(vec![zip_fn, state]))
+        }
+    }
+}
+
+/// `zip.__setstate__(strict)` — `functional.py:1089-1091
+/// W_Zip.descr_setstate`: `self.strict = bool(state)`.
+fn zip_setstate_method(args: &[PyObjectRef]) -> PyResult {
+    let strict = is_true(args[1])?;
+    unsafe {
+        pyre_object::zipobject::w_zip_set_strict(args[0], strict);
+    }
+    Ok(w_none())
+}
+
 unsafe fn getitem_range_iter(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
     let r = &*(obj as *const pyre_object::rangeobject::W_RangeIterator);
     let len = if r.step > 0 {
@@ -2787,6 +2932,8 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyResul
             || pyre_object::enumerateobject::is_enumerate(obj)
             || pyre_object::reversedobject::is_reversed(obj)
             || pyre_object::filterobject::is_filter(obj)
+            || pyre_object::mapobject::is_map(obj)
+            || pyre_object::zipobject::is_zip(obj)
             || pyre_object::callableiteratorobject::is_callable_iterator(obj)
         {
             let entry: Option<(fn(&[PyObjectRef]) -> PyResult, &str)> = match name {
@@ -2853,6 +3000,18 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyResul
             } else if pyre_object::filterobject::is_filter(obj) {
                 match name {
                     "__reduce__" => Some((filter_reduce_method, "__reduce__", 1)),
+                    _ => None,
+                }
+            } else if pyre_object::mapobject::is_map(obj) {
+                match name {
+                    "__reduce__" => Some((map_reduce_method, "__reduce__", 1)),
+                    "__setstate__" => Some((map_setstate_method, "__setstate__", 2)),
+                    _ => None,
+                }
+            } else if pyre_object::zipobject::is_zip(obj) {
+                match name {
+                    "__reduce__" => Some((zip_reduce_method, "__reduce__", 1)),
+                    "__setstate__" => Some((zip_setstate_method, "__setstate__", 2)),
                     _ => None,
                 }
             } else {
@@ -8436,6 +8595,11 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
         if pyre_object::filterobject::is_filter(obj) {
             return Ok(obj);
         }
+        // `functional.py:846-847 W_Map.iter_w` / `:1019-1020 W_Zip.iter_w` —
+        // `return self`.
+        if pyre_object::mapobject::is_map(obj) || pyre_object::zipobject::is_zip(obj) {
+            return Ok(obj);
+        }
         // `pypy/module/_sre/interp_sre.py:915 W_SRE_Scanner.iter_w` —
         // `return self` (the finditer/scanner iterator).
         if pyre_object::sreobject::is_sre_scanner(obj) {
@@ -8749,6 +8913,33 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                     return Ok(w_obj);
                 }
             }
+        }
+        // `functional.py:849-863 W_Map.next_w` — pull one item from each
+        // sub-iterator, then `call(w_fun, *items)`; stop at the shortest
+        // (strict raises on mismatch).
+        if pyre_object::mapobject::is_map(obj) {
+            use pyre_object::mapobject as mo;
+            let w_iterators = mo::w_map_get_iterators(obj);
+            let strict = mo::w_map_get_strict(obj);
+            return match pull_iterator_tuple(w_iterators, strict, "map")? {
+                Some(items) => {
+                    let w_fun = mo::w_map_get_fun(obj);
+                    crate::call::call_function_impl_result(w_fun, &items)
+                }
+                None => Err(PyError::stop_iteration()),
+            };
+        }
+        // `functional.py:1022-1057 W_Zip.next_w` — pull one item from each
+        // sub-iterator into a tuple; stop at the shortest (strict raises on
+        // mismatch).
+        if pyre_object::zipobject::is_zip(obj) {
+            use pyre_object::zipobject as zo;
+            let w_iterators = zo::w_zip_get_iterators(obj);
+            let strict = zo::w_zip_get_strict(obj);
+            return match pull_iterator_tuple(w_iterators, strict, "zip")? {
+                Some(items) => Ok(pyre_object::w_tuple_new(items)),
+                None => Err(PyError::stop_iteration()),
+            };
         }
         // itertools.pairwise — interp_itertools.py W_Pairwise.next_w
         //

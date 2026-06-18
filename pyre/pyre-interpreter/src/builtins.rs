@@ -5331,118 +5331,51 @@ fn builtin_filter(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     Ok(pyre_object::filterobject::w_filter_new(w_predicate, w_iterable))
 }
 
-/// `map()` — PyPy: functional.py W_Map (returns iterator)
+/// `map(func, *iterables, strict=False)` — `functional.py:888-902
+/// W_Map___new__` plus the CPython 3.14 `strict` keyword.  A lazy iterator:
+/// each `next()` pulls one item per iterable and calls `func(*items)`.
 fn builtin_map(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let (args, kwargs) = split_builtin_kwargs(args);
+    kwarg_reject_unknown(kwargs, &["strict"], "map")?;
+    let strict = kwarg_get(kwargs, "strict")
+        .map(|v| crate::baseobjspace::is_true(v))
+        .transpose()?
+        .unwrap_or(false);
     if args.len() < 2 {
         return Err(crate::PyError::type_error(
-            "map() requires at least 2 arguments",
+            "map() must have at least two arguments.",
         ));
     }
     let func = args[0];
-    // `pypy/module/__builtin__/functional.py:336-355 W_Map.descr_new`
-    // accepts any number of iterables; each iteration calls
-    // `func(*tuple_of_one_item_per_iterable)` and stops at the
-    // shortest iterable.  Single-iterable map is the trivial case.
-    let iters: Vec<Vec<PyObjectRef>> = args[1..]
-        .iter()
-        .map(|&it| collect_iterable(it))
-        .collect::<Result<_, _>>()?;
-    let min_len = iters.iter().map(|v| v.len()).min().unwrap_or(0);
-    let mut results = Vec::with_capacity(min_len);
-    for i in 0..min_len {
-        let call_args: Vec<PyObjectRef> = iters.iter().map(|v| v[i]).collect();
-        let result = crate::call_function(func, &call_args);
-        results.push(result);
+    // `functional.py:835-836 build_iterators_from_args` — `iter()` each input.
+    let mut iters = Vec::with_capacity(args.len() - 1);
+    for &arg in &args[1..] {
+        iters.push(crate::baseobjspace::iter(arg)?);
     }
-    let n = results.len();
-    let list = pyre_object::w_list_new(results);
-    Ok(pyre_object::w_seq_iter_new(list, n))
+    let w_iterators = pyre_object::w_list_new(iters);
+    Ok(pyre_object::mapobject::w_map_new(func, w_iterators, strict))
 }
 
-/// `zip(*iterables)` — PyPy: functional.py W_Zip
+/// `zip(*iterables, strict=False)` — `functional.py:1101-1105 W_Zip___new__`.
+/// A lazy iterator: each `next()` pulls one item per iterable into a tuple,
+/// stopping at the shortest (an empty `zip()` stops immediately); `strict`
+/// raises `ValueError` on a length mismatch.
 fn builtin_zip(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    // `pypy/module/__builtin__/functional.py:411-414 W_Zip.descr_new`
-    // accepts `strict` as a keyword.  Pyre's flat builtin ABI surfaces
-    // kwargs as a trailing `__pyre_kw__` dict; strip it before the
-    // positional walk and look up `strict` from it.
+    // Pyre's flat builtin ABI surfaces kwargs as a trailing dict; strip it
+    // before the positional walk and look up `strict` from it.
     let (args, kwargs) = split_builtin_kwargs(args);
     kwarg_reject_unknown(kwargs, &["strict"], "zip")?;
     let strict = kwarg_get(kwargs, "strict")
         .map(|v| crate::baseobjspace::is_true(v))
         .transpose()?
         .unwrap_or(false);
-    if args.is_empty() {
-        return Ok(pyre_object::w_seq_iter_new(
-            pyre_object::w_list_new(vec![]),
-            0,
-        ));
-    }
-    // Collect all iterables into lists, zip them
-    let mut iters: Vec<Vec<PyObjectRef>> = Vec::new();
+    // `functional.py:835-836 build_iterators_from_args` — `iter()` each input.
+    let mut iters = Vec::with_capacity(args.len());
     for &arg in args {
-        let mut items = Vec::new();
-        unsafe {
-            if pyre_object::is_list(arg) {
-                let n = pyre_object::w_list_len(arg);
-                for i in 0..n {
-                    if let Some(v) = pyre_object::w_list_getitem(arg, i as i64) {
-                        items.push(v);
-                    }
-                }
-            } else if pyre_object::is_tuple(arg) {
-                let n = pyre_object::w_tuple_len(arg);
-                for i in 0..n {
-                    if let Some(v) = pyre_object::w_tuple_getitem(arg, i as i64) {
-                        items.push(v);
-                    }
-                }
-            } else {
-                // Use iter/next protocol
-                let it = crate::baseobjspace::iter(arg)?;
-                loop {
-                    match crate::baseobjspace::next(it) {
-                        Ok(v) => items.push(v),
-                        Err(e) if e.kind == crate::PyErrorKind::StopIteration => break,
-                        Err(e) => return Err(e),
-                    }
-                }
-            }
-        }
-        iters.push(items);
+        iters.push(crate::baseobjspace::iter(arg)?);
     }
-    let min_len = iters.iter().map(|v| v.len()).min().unwrap_or(0);
-    // `functional.py:411-435 W_Zip.descr_new` — strict mode raises
-    // ValueError when iterables have different lengths.  Detect by
-    // checking max == min; report which argument was longer/shorter
-    // per CPython's `zip()` message format.
-    if strict {
-        let max_len = iters.iter().map(|v| v.len()).max().unwrap_or(0);
-        if max_len != min_len {
-            // CPython's `zip()` reports the first SHORT argument (the
-            // one with `len < max_len`) as "shorter than argument N"
-            // where N is some earlier (longer) argument.  Find the
-            // first short index — that's the one being reported.
-            let short = iters.iter().position(|v| v.len() < max_len).unwrap_or(0);
-            // Pick any longer argument as the reference point; CPython
-            // names the first one (typically argument 1).
-            let long = iters.iter().position(|v| v.len() == max_len).unwrap_or(0);
-            return Err(crate::PyError::new(
-                crate::PyErrorKind::ValueError,
-                format!(
-                    "zip() argument {} is shorter than argument {}",
-                    short + 1,
-                    long + 1
-                ),
-            ));
-        }
-    }
-    let mut result = Vec::with_capacity(min_len);
-    for i in 0..min_len {
-        let tuple_items: Vec<_> = iters.iter().map(|v| v[i]).collect();
-        result.push(pyre_object::w_tuple_new(tuple_items));
-    }
-    let list = pyre_object::w_list_new(result);
-    Ok(pyre_object::w_seq_iter_new(list, min_len))
+    let w_iterators = pyre_object::w_list_new(iters);
+    Ok(pyre_object::zipobject::w_zip_new(w_iterators, strict))
 }
 
 /// `pypy/module/__builtin__/functional.py:253-272 W_Enumerate.descr_new`

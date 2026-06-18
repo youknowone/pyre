@@ -1771,6 +1771,20 @@ thread_local! {
             <pyre_object::filterobject::W_Filter
                 as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
         );
+        // W_Map (`map`) — AUTO-ID; `w_fun` / `w_iterators` are traced edges.
+        register_pyre_class(
+            &mut gc,
+            &mut pytype_to_tid,
+            <pyre_object::mapobject::W_Map
+                as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+        );
+        // W_Zip (`zip`) — AUTO-ID; `w_iterators` is a traced edge.
+        register_pyre_class(
+            &mut gc,
+            &mut pytype_to_tid,
+            <pyre_object::zipobject::W_Zip
+                as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+        );
         // rclass.py:340-346 — assign subclassrange_{min,max} to each
         // vtable entry. freeze_types() runs assign_inheritance_ids
         // (normalizecalls.py:373-389), then we write the computed ranges

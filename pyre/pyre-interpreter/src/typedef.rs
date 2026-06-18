@@ -690,6 +690,14 @@ pub fn init_typeobjects() {
             new_typeobject_with_base("filter", |_| {}, object_type) as usize,
         );
         reg.insert(
+            &pyre_object::mapobject::MAP_TYPE as *const PyType as usize,
+            new_typeobject_with_base("map", |_| {}, object_type) as usize,
+        );
+        reg.insert(
+            &pyre_object::zipobject::ZIP_TYPE as *const PyType as usize,
+            new_typeobject_with_base("zip", |_| {}, object_type) as usize,
+        );
+        reg.insert(
             &pyre_object::dictviewobject::DICT_KEYITERATOR_TYPE as *const PyType as usize,
             new_typeobject_with_base("dict_keyiterator", |_| {}, object_type) as usize,
         );

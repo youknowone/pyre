@@ -22,6 +22,7 @@ pub mod dictviewobject;
 pub mod enumerateobject;
 pub mod excobject;
 pub mod filterobject;
+pub mod mapobject;
 pub mod float_array;
 pub mod floatobject;
 pub mod gc_hook;
@@ -57,6 +58,7 @@ pub mod tupleobject;
 pub mod typeobject;
 pub mod unionobject;
 pub mod weakref;
+pub mod zipobject;
 
 pub use boolobject::*;
 pub use bytearrayobject::*;

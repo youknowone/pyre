@@ -687,6 +687,27 @@ e = err(lambda: delattr(u3, "memo"))
 assert isinstance(e, TypeError) and "deletion is not supported" in str(e), e
 
 
+# ════════════════════════ lazy builtin iterators ════════════════════════
+# reversed / filter / map / zip pickle through the reduce protocol; the
+# captured sub-iterators carry their positions, so a partially consumed
+# iterator resumes where it left off.
+assert list(loads(dumps(reversed([1, 2, 3]), 2))) == [3, 2, 1]
+assert list(loads(dumps(filter(None, [0, 1, 2, 0, 3]), 2))) == [1, 2, 3]
+assert list(loads(dumps(map(str, [1, 2, 3]), 2))) == ["1", "2", "3"]
+assert list(loads(dumps(zip([1, 2], [3, 4]), 2))) == [(1, 3), (2, 4)]
+# strict= survives the round-trip via __setstate__.
+zr = loads(dumps(zip([1, 2], [3], strict=True), 2))
+try:
+    list(zr)
+    raise AssertionError("strict flag lost on unpickle")
+except ValueError:
+    pass
+# partial consumption resumes at the right spot.
+_it = map(str, [1, 2, 3, 4])
+next(_it)
+assert list(loads(dumps(_it, 2))) == ["2", "3", "4"]
+
+
 # ════════════════════════ high-level pickle facade (HAVE_PICKLE) ════════════════════════
 # The remaining sections exercise the public `pickle` module, copyreg extension
 # codes, reducer_override / dispatch_table / fast mode / find_class, and the

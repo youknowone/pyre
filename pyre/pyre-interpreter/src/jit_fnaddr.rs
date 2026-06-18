@@ -1127,6 +1127,8 @@ pub fn jit_static_pytype_addrs() -> Vec<(&'static str, i64)> {
             reversedobject::REVERSED_TYPE
         ),
         pytype_addr!("filterobject::FILTER_TYPE", filterobject::FILTER_TYPE),
+        pytype_addr!("mapobject::MAP_TYPE", mapobject::MAP_TYPE),
+        pytype_addr!("zipobject::ZIP_TYPE", zipobject::ZIP_TYPE),
         pytype_addr!(
             "callableiteratorobject::CALLABLE_ITERATOR_TYPE",
             callableiteratorobject::CALLABLE_ITERATOR_TYPE
