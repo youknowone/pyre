@@ -2192,65 +2192,90 @@ fn os_error_fill_slots(exc: PyObjectRef, args: &[PyObjectRef]) {
 fn errno_is_eshutdown(e: i32) -> bool {
     e == libc::ESHUTDOWN
 }
-#[cfg(not(unix))]
+/// wasm32 has no libc errnos; match the darwin/BSD numeric value.
+#[cfg(target_arch = "wasm32")]
+fn errno_is_eshutdown(e: i32) -> bool {
+    e == 58
+}
+#[cfg(all(not(unix), not(target_arch = "wasm32")))]
 fn errno_is_eshutdown(_e: i32) -> bool {
     false
+}
+
+/// darwin/BSD numeric errnos for wasm32, which has no libc errno constants.
+/// Kept in sync with the `errno` module's host_env-off fallback so the errno →
+/// OSError-subclass remap selects the subclass a given `errno.X` value implies.
+#[cfg(target_arch = "wasm32")]
+mod wasm_errno {
+    pub const EAGAIN: i32 = 35;
+    pub const EWOULDBLOCK: i32 = 35;
+    pub const EINPROGRESS: i32 = 36;
+    pub const EALREADY: i32 = 37;
+    pub const EPIPE: i32 = 32;
+    pub const ECHILD: i32 = 10;
+    pub const ECONNABORTED: i32 = 53;
+    pub const ECONNREFUSED: i32 = 61;
+    pub const ECONNRESET: i32 = 54;
+    pub const EEXIST: i32 = 17;
+    pub const ENOENT: i32 = 2;
+    pub const EISDIR: i32 = 21;
+    pub const ENOTDIR: i32 = 20;
+    pub const EINTR: i32 = 4;
+    pub const EACCES: i32 = 13;
+    pub const EPERM: i32 = 1;
+    pub const ESRCH: i32 = 3;
+    pub const ETIMEDOUT: i32 = 60;
 }
 
 /// `interp_exceptions.py:1207-1227 ERRNO_MAP` — the OSError subclass the
 /// exact `OSError` constructor selects for a recognised errno, by
 /// registered class name.  Returns `None` for an unmapped errno.
 fn os_error_errno_subclass(errno: i64) -> Option<&'static str> {
+    // `ESHUTDOWN` is sourced through `errno_is_eshutdown` (MSVC CRT lacks it);
+    // the rest come from `libc`, or the darwin/BSD `wasm_errno` table on wasm32.
+    #[cfg(not(target_arch = "wasm32"))]
+    use libc::{
+        EACCES, EAGAIN, EALREADY, ECHILD, ECONNABORTED, ECONNREFUSED, ECONNRESET, EEXIST,
+        EINPROGRESS, EINTR, EISDIR, ENOENT, ENOTDIR, EPERM, EPIPE, ESRCH, ETIMEDOUT, EWOULDBLOCK,
+    };
+    #[cfg(target_arch = "wasm32")]
+    use wasm_errno::*;
+
     let Ok(e) = i32::try_from(errno) else {
         return None;
     };
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        let name = if e == libc::EAGAIN
-            || e == libc::EALREADY
-            || e == libc::EINPROGRESS
-            || e == libc::EWOULDBLOCK
-        {
-            "BlockingIOError"
-        } else if e == libc::EPIPE || errno_is_eshutdown(e) {
-            "BrokenPipeError"
-        } else if e == libc::ECHILD {
-            "ChildProcessError"
-        } else if e == libc::ECONNABORTED {
-            "ConnectionAbortedError"
-        } else if e == libc::ECONNREFUSED {
-            "ConnectionRefusedError"
-        } else if e == libc::ECONNRESET {
-            "ConnectionResetError"
-        } else if e == libc::EEXIST {
-            "FileExistsError"
-        } else if e == libc::ENOENT {
-            "FileNotFoundError"
-        } else if e == libc::EISDIR {
-            "IsADirectoryError"
-        } else if e == libc::ENOTDIR {
-            "NotADirectoryError"
-        } else if e == libc::EINTR {
-            "InterruptedError"
-        } else if e == libc::EACCES || e == libc::EPERM {
-            "PermissionError"
-        } else if e == libc::ESRCH {
-            "ProcessLookupError"
-        } else if e == libc::ETIMEDOUT {
-            "TimeoutError"
-        } else {
-            return None;
-        };
-        Some(name)
-    }
-    // wasm32-unknown-unknown's libc lacks the errno constants; the errno →
-    // OSError-subclass remap is a POSIX-host concern unavailable there, so no
-    // subclass is selected (consistent with the disabled POSIX modules).
-    #[cfg(target_arch = "wasm32")]
-    {
-        let _ = e;
-        None
-    }
+    let name = if e == EAGAIN || e == EALREADY || e == EINPROGRESS || e == EWOULDBLOCK {
+        "BlockingIOError"
+    } else if e == EPIPE || errno_is_eshutdown(e) {
+        "BrokenPipeError"
+    } else if e == ECHILD {
+        "ChildProcessError"
+    } else if e == ECONNABORTED {
+        "ConnectionAbortedError"
+    } else if e == ECONNREFUSED {
+        "ConnectionRefusedError"
+    } else if e == ECONNRESET {
+        "ConnectionResetError"
+    } else if e == EEXIST {
+        "FileExistsError"
+    } else if e == ENOENT {
+        "FileNotFoundError"
+    } else if e == EISDIR {
+        "IsADirectoryError"
+    } else if e == ENOTDIR {
+        "NotADirectoryError"
+    } else if e == EINTR {
+        "InterruptedError"
+    } else if e == EACCES || e == EPERM {
+        "PermissionError"
+    } else if e == ESRCH {
+        "ProcessLookupError"
+    } else if e == ETIMEDOUT {
+        "TimeoutError"
+    } else {
+        return None;
+    };
+    Some(name)
 }
 
 /// `_parse_init_args` yields an errno only for a 2..=5 argument call whose
