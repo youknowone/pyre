@@ -3562,9 +3562,23 @@ impl Optimizer {
         // JUMP, the trace carries a peeled short preamble, and more than one
         // front target token exists. Default ON; `R1_OFF` is a kill-switch
         // routing bridges back to the early-return jump_to_preamble path.
+        //
+        // Also require a synthesizable patchguardop: a bridge carries no
+        // GUARD_FUTURE_CONDITION, so `self.patchguardop` is only populated
+        // from one of the bridge's own body guards (synthesized below). A
+        // bridge that closes into an existing loop with no body guard
+        // (interpreter-entry / straight-line prologue) would retarget with
+        // `patchguardop` left None and hit the `unroll.rs:3346` invariant the
+        // moment virtual-state matching emits an extra guard. Keep those on
+        // the jump_to_preamble path. The predicate matches the synthesis
+        // filter below, so retarget runs only when patchguardop is gettable.
+        let has_body_guard = ops
+            .iter()
+            .any(|op| op.opcode.is_guard() && op.rd_resume_position.get() >= 0);
         let r1_wr = ops.last().map_or(false, |op| op.opcode == OpCode::Jump)
             && inline_short_preamble
             && front_target_tokens.len() > 1
+            && has_body_guard
             && std::env::var_os("R1_OFF").is_none();
         let r1_saved = self.skip_flush;
         self.skip_flush = r1_wr;
@@ -3584,6 +3598,8 @@ impl Optimizer {
         // retarget's inline_short_preamble guards never receive a
         // rd_resume_position. Synthesize patchguardop from the bridge's own
         // last body guard (highest resume position, closest to the close).
+        // `r1_wr` already gated on `has_body_guard`, so the filter is
+        // guaranteed non-empty here.
         if r1_wr && self.patchguardop.is_none() {
             if let Some(g) = ops
                 .iter()
