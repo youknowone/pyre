@@ -8687,8 +8687,8 @@ mod tests {
     /// chordal coalescing legitimately reuses a color across slots that are
     /// never simultaneously live, so the shared inverse
     /// `semantic_ref_slot_for_reg_color` — called by the encode side
-    /// (collect_outer_active_boxes) and both decode sides
-    /// (restore_guard_failure_values / setup_bridge_sym) — must disambiguate
+    /// (collect_outer_active_boxes) and the decode side
+    /// (restore_guard_failure_values) — must disambiguate
     /// by the live window: the live stack prefix first, then the live locals.
     ///
     /// Layout: nlocals=2, max_stackdepth=3, live stack depth 2 (stack_only=2).
