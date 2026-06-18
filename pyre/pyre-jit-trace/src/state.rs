@@ -7438,16 +7438,48 @@ impl JitState for PyreJitState {
             sym.vable_lastblock,
             sym.vable_w_globals,
         ];
-        // virtualizable.py:139 load_list_of_boxes parity: both halves of
-        // virtualizable_boxes come from the resume-data stream — OpRefs via
-        // bridge_decode_box returns (OpRef, Value) pairs.
-        // No heap read. The seed helper pads short arrays with const-NULL
+        // virtualizable.py:139 load_list_of_boxes parity: the OpRef half of
+        // virtualizable_boxes comes from the resume-data stream
+        // (`bridge_decode_box`). The CONCRETE array shadow, however, is read
+        // from the restored live virtualizable — NOT from the resume-decoded
+        // `vable_array_values`. Those decoded values are off-heap copies of
+        // young GC pointers captured at guard-fail time; a minor collection
+        // during bridge setup (residual virtual materialization / op recording
+        // allocates) moves the referenced objects but cannot forward the
+        // off-heap decode Vec, leaving dangling pointers that crash the walk's
+        // getarrayitem_vable. The live frame (`sym.concrete_vable_ptr`,
+        // restored by `decode_and_restore_guard_failure`) sits on the
+        // CURRENT_FRAME chain, so `walk_pyframe_roots` forwards its
+        // `locals_cells_stack_w` items on every collection — its slots are
+        // always live. Read them directly, mirroring the root-trace seed
+        // (`read_all_boxes` from the rooted portal frame). Falls back to the
+        // decoded values only when no live pointer is bound (unit-test /
+        // init-before-run). The seed helper pads short arrays with const-NULL
         // OpRef; match that here by padding concrete values with
         // Value::Ref(GcRef::NULL) to the same length.
+        let live_array_values: Vec<majit_ir::Value> = if sym.concrete_vable_ptr.is_null() {
+            vable_array_values.clone()
+        } else {
+            let f =
+                unsafe { &*(sym.concrete_vable_ptr as *const pyre_interpreter::pyframe::PyFrame) };
+            let lp = f.locals_cells_stack_w;
+            if lp.is_null() {
+                vable_array_values.clone()
+            } else {
+                let arr = unsafe { &*lp };
+                let base = arr.items_ptr() as *const pyre_object::PyObjectRef;
+                let n = bridge_array_len.min(arr.len());
+                (0..n)
+                    .map(|i| {
+                        majit_ir::Value::Ref(majit_ir::GcRef(unsafe { *base.add(i) } as usize))
+                    })
+                    .collect()
+            }
+        };
         let mut concrete_values = Vec::with_capacity(vable_scalar_values.len() + bridge_array_len);
         concrete_values.extend_from_slice(&vable_scalar_values);
-        let taken_concrete = vable_array_values.len().min(bridge_array_len);
-        concrete_values.extend_from_slice(&vable_array_values[..taken_concrete]);
+        let taken_concrete = live_array_values.len().min(bridge_array_len);
+        concrete_values.extend_from_slice(&live_array_values[..taken_concrete]);
         while concrete_values.len() < vable_scalar_values.len() + bridge_array_len {
             concrete_values.push(majit_ir::Value::Ref(majit_ir::GcRef::NULL));
         }
