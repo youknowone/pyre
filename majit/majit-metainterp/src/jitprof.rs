@@ -19,7 +19,39 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(not(target_arch = "wasm32"))]
+use std::time::Instant;
+#[cfg(target_arch = "wasm32")]
+use wasm_clock::Instant;
+
+/// Monotonic substitute for `std::time::Instant` on wasm32-unknown-unknown,
+/// which has no clock (`Instant::now()` there panics). The profiler only needs
+/// non-decreasing values to charge relative time against, so each `now()`
+/// advances a global counter; the resulting `MAJIT_STATS` timings are arbitrary
+/// but internally consistent and never panic. Mirrors the
+/// `Instant::now()` / `saturating_duration_since` surface the timer uses, so
+/// the timing code below is platform-agnostic.
+#[cfg(target_arch = "wasm32")]
+mod wasm_clock {
+    use core::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
+
+    static TICK_NS: AtomicU64 = AtomicU64::new(0);
+
+    #[derive(Clone, Copy, Debug)]
+    pub struct Instant(u64);
+
+    impl Instant {
+        pub fn now() -> Self {
+            Instant(TICK_NS.fetch_add(1, Ordering::Relaxed))
+        }
+
+        pub fn saturating_duration_since(self, earlier: Instant) -> Duration {
+            Duration::from_nanos(self.0.saturating_sub(earlier.0))
+        }
+    }
+}
 
 use majit_backend::CpuTotalTracker;
 use majit_ir::OpCode;

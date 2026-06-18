@@ -7,3 +7,14 @@
 # thread's minimum stack so `cargo test` works without a manual
 # `RUST_MIN_STACK=…` prefix.
 RUST_MIN_STACK = "16777216"
+
+# Export the linker-synthesized `__indirect_function_table` from wasm32
+# builds. The JIT's `jit_call` trampoline resolves residual call targets by
+# their wasm table index (a `fn as usize` is a table index on wasm32) and so
+# needs the host to reach this table: the browser glue reads
+# `wasm.__indirect_function_table` (`pyre-wasm/www/index.html`) and the native
+# wasmtime runner reads the `__indirect_function_table` export. Without this
+# flag the table stays module-internal and indirect residual calls cannot be
+# dispatched.
+[target.wasm32-unknown-unknown]
+rustflags = ["-C", "link-arg=--export-table"]

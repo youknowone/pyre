@@ -1,0 +1,446 @@
+//! Native host that runs the wasm32 build of pyre under wasmtime so the full
+//! interpreter+JIT path executes outside a browser.
+//!
+//! It is the non-JS counterpart of `majit-backend-wasm/js/jit_glue.js` and
+//! implements the same host-import contract:
+//!
+//!   * the main module (`pyre-wasm` built with `--features wasmi`) imports
+//!     `pyre_jit.{jit_compile_wasm, jit_execute_wasm, jit_free_wasm}` and
+//!     exports `memory`, `__indirect_function_table`, `pyre_alloc`,
+//!     `pyre_dealloc`, and `pyre_run_python`;
+//!   * each JIT-emitted trace module imports `env.memory` (shared with the
+//!     main module) plus an optional `env.jit_call` trampoline, and exports a
+//!     `trace` function `(i32) -> i32`;
+//!   * the trampoline reads func_ptr / args from the frame call area, dispatches
+//!     through the main module's indirect function table (a `fn as usize` is a
+//!     table index on wasm32), and writes the result back.
+//!
+//! CLI: `pyre-wasm-runner <script.py>` runs the script and writes its output to
+//! stdout, matching the `pyrex` backend interface `pyre/check.py` drives. The
+//! wasm module is located via `$PYRE_WASM_MODULE` or `--module <path>`, else the
+//! default release artifact path.
+
+use std::collections::HashMap;
+use std::path::PathBuf;
+
+use wasmtime::error::Context;
+use wasmtime::{
+    AsContext, AsContextMut, Caller, Config, Engine, Error, Extern, Func, Instance, Linker, Memory,
+    Module, Ref, Result, Store, Table, Val, ValType,
+};
+
+// Frame call-area offsets — must match `majit-backend-wasm/src/codegen.rs`.
+const CALL_RESULT_OFS: usize = 2000;
+const CALL_FUNC_OFS: usize = 2008;
+// The arg count also lives at offset 2016, but the trampoline derives arity
+// (and the exact value types) from the resolved function's wasm signature
+// instead, which is authoritative on wasm32. Kept for layout documentation.
+#[allow(dead_code)]
+const CALL_NARGS_OFS: usize = 2016;
+const CALL_ARGS_OFS: usize = 2024;
+
+const DEFAULT_MODULE: &str = "target/wasm32-unknown-unknown/release/pyre_wasm.wasm";
+
+/// Per-store host state shared by all import callbacks.
+#[derive(Default)]
+struct Host {
+    /// The main module's exported linear memory, shared with every trace.
+    memory: Option<Memory>,
+    /// The main module's `__indirect_function_table`, used by the trampoline.
+    table: Option<Table>,
+    /// Compiled trace `trace` functions, keyed by the id handed back to wasm.
+    traces: HashMap<u32, Func>,
+    next_id: u32,
+}
+
+fn main() {
+    let mut module_path: Option<PathBuf> = None;
+    let mut script: Option<PathBuf> = None;
+    let mut inspect = false;
+
+    let mut argv = std::env::args().skip(1);
+    while let Some(arg) = argv.next() {
+        match arg.as_str() {
+            "--inspect" => inspect = true,
+            "--module" => {
+                module_path = Some(PathBuf::from(
+                    argv.next()
+                        .unwrap_or_else(|| fatal("--module needs a path")),
+                ))
+            }
+            "-h" | "--help" => {
+                eprintln!(
+                    "usage: pyre-wasm-runner [--module <pyre_wasm.wasm>] [--inspect] <script.py>"
+                );
+                std::process::exit(2);
+            }
+            other if other.starts_with('-') => fatal(&format!("unknown flag {other}")),
+            other => script = Some(PathBuf::from(other)),
+        }
+    }
+
+    let module_path = module_path
+        .or_else(|| std::env::var_os("PYRE_WASM_MODULE").map(PathBuf::from))
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_MODULE));
+
+    // The wasm runs on the calling thread's stack (sync wasmtime), so the
+    // deep interpreter recursion needs a large host stack to back the
+    // generous `max_wasm_stack` set in `run`.
+    let worker = std::thread::Builder::new()
+        .stack_size(512 * 1024 * 1024)
+        .spawn(move || -> Result<i32> {
+            if inspect {
+                inspect_module(&module_path)?;
+                return Ok(0);
+            }
+            let script = script.context("no script given")?;
+            let source = std::fs::read_to_string(&script)
+                .with_context(|| format!("read script {}", script.display()))?;
+            run(&module_path, &source)
+        })
+        .expect("spawn worker thread");
+
+    match worker.join() {
+        Ok(Ok(code)) => std::process::exit(code),
+        Ok(Err(e)) => fatal(&format!("{e:?}")),
+        Err(_) => fatal("worker thread panicked"),
+    }
+}
+
+fn fatal(msg: &str) -> ! {
+    eprintln!("pyre-wasm-runner: {msg}");
+    std::process::exit(1);
+}
+
+fn run(module_path: &PathBuf, source: &str) -> Result<i32> {
+    let mut config = Config::new();
+    // Allow the interpreter's deep recursion before wasmtime raises a stack
+    // overflow trap; the interpreter's own recursion limit normally fires
+    // first. Kept below the worker thread's stack reservation. wasmtime
+    // requires `max_wasm_stack <= async_stack_size` even for sync execution,
+    // so the async stack is sized just above it.
+    const WASM_STACK: usize = 256 * 1024 * 1024;
+    config.max_wasm_stack(WASM_STACK);
+    config.async_stack_size(WASM_STACK + 1024 * 1024);
+    let engine = Engine::new(&config)?;
+
+    let module = Module::from_file(&engine, module_path)
+        .with_context(|| format!("load wasm module {}", module_path.display()))?;
+
+    let mut store = Store::new(&engine, Host::default());
+    store.data_mut().next_id = 1;
+
+    let linker = build_linker(&engine)?;
+    let instance = linker
+        .instantiate(&mut store, &module)
+        .context("instantiate main module")?;
+
+    let memory = instance
+        .get_memory(&mut store, "memory")
+        .context("main module is missing its `memory` export")?;
+    let table = instance
+        .get_table(&mut store, "__indirect_function_table")
+        .context("main module is missing its `__indirect_function_table` export (build with --export-table)")?;
+    store.data_mut().memory = Some(memory);
+    store.data_mut().table = Some(table);
+
+    let alloc = instance.get_typed_func::<u32, u32>(&mut store, "pyre_alloc")?;
+    let run_python = instance.get_typed_func::<(u32, u32), u64>(&mut store, "pyre_run_python")?;
+    let dealloc = instance.get_typed_func::<(u32, u32), ()>(&mut store, "pyre_dealloc")?;
+
+    let src = source.as_bytes();
+    let len = src.len() as u32;
+    let in_ptr = if len == 0 {
+        0
+    } else {
+        let p = alloc.call(&mut store, len)?;
+        memory.write(&mut store, p as usize, src)?;
+        p
+    };
+
+    let packed = match run_python.call(&mut store, (in_ptr, len)) {
+        Ok(p) => p,
+        Err(e) => {
+            // wasm32-unknown-unknown has no stderr, but pyre-wasm's panic hook
+            // writes "panicked at …" into linear memory before the trap.
+            // Recover the formatted message (the heap String, not the static
+            // format template) so the real cause is visible.
+            for msg in recover_panic_messages(memory.data(&store)) {
+                eprintln!("pyre-wasm-runner: recovered panic: {msg}");
+            }
+            return Err(e);
+        }
+    };
+    let out_ptr = (packed >> 32) as u32;
+    let out_len = (packed & 0xffff_ffff) as u32;
+
+    let mut out = vec![0u8; out_len as usize];
+    if out_len != 0 {
+        memory.read(&store, out_ptr as usize, &mut out)?;
+        dealloc.call(&mut store, (out_ptr, out_len))?;
+    }
+    if len != 0 {
+        dealloc.call(&mut store, (in_ptr, len))?;
+    }
+
+    use std::io::Write;
+    std::io::stdout().write_all(&out)?;
+    std::io::stdout().flush()?;
+    Ok(0)
+}
+
+fn build_linker(engine: &Engine) -> Result<Linker<Host>> {
+    let mut linker = Linker::new(engine);
+
+    linker.func_wrap(
+        "pyre_jit",
+        "jit_compile_wasm",
+        |mut caller: Caller<'_, Host>, bytes_ptr: u32, bytes_len: u32| -> u32 {
+            match jit_compile(&mut caller, bytes_ptr, bytes_len) {
+                Ok(id) => id,
+                Err(e) => {
+                    eprintln!("[jit_compile_wasm] {e:?}");
+                    0
+                }
+            }
+        },
+    )?;
+
+    linker.func_wrap(
+        "pyre_jit",
+        "jit_execute_wasm",
+        |mut caller: Caller<'_, Host>, func_id: u32, frame_ptr: u32| -> u32 {
+            match jit_execute(&mut caller, func_id, frame_ptr) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("[jit_execute_wasm] {e:?}");
+                    0
+                }
+            }
+        },
+    )?;
+
+    linker.func_wrap(
+        "pyre_jit",
+        "jit_free_wasm",
+        |mut caller: Caller<'_, Host>, func_id: u32| {
+            caller.data_mut().traces.remove(&func_id);
+        },
+    )?;
+
+    Ok(linker)
+}
+
+/// Compile and instantiate a JIT-emitted trace module, sharing the main
+/// module's linear memory and wiring the `jit_call` trampoline.
+fn jit_compile(caller: &mut Caller<'_, Host>, bytes_ptr: u32, bytes_len: u32) -> Result<u32> {
+    let memory = caller
+        .data()
+        .memory
+        .context("main memory not initialized")?;
+
+    let mut bytes = vec![0u8; bytes_len as usize];
+    memory
+        .read(&*caller, bytes_ptr as usize, &mut bytes)
+        .context("read trace module bytes")?;
+
+    let engine = caller.engine().clone();
+    let module = Module::new(&engine, &bytes).context("compile trace module")?;
+
+    // A fresh trampoline per trace; it reads all state from `caller.data()`.
+    let jit_call = Func::wrap(
+        &mut *caller,
+        |mut inner: Caller<'_, Host>, frame_ptr: i32| {
+            if let Err(e) = jit_call_trampoline(&mut inner, frame_ptr as u32) {
+                eprintln!("[jit_call] {e:?}");
+            }
+        },
+    );
+
+    // Supply imports in the module's declared order.
+    let mut externs: Vec<Extern> = Vec::new();
+    for import in module.imports() {
+        match (import.module(), import.name()) {
+            ("env", "memory") => externs.push(Extern::Memory(memory)),
+            ("env", "jit_call") => externs.push(Extern::Func(jit_call)),
+            (m, n) => {
+                return Err(Error::msg(format!(
+                    "trace module has unexpected import {m}.{n}"
+                )));
+            }
+        }
+    }
+
+    let instance =
+        Instance::new(&mut *caller, &module, &externs).context("instantiate trace module")?;
+    let trace = instance
+        .get_func(&mut *caller, "trace")
+        .context("trace module is missing its `trace` export")?;
+
+    let host = caller.data_mut();
+    let id = host.next_id;
+    host.next_id += 1;
+    host.traces.insert(id, trace);
+    Ok(id)
+}
+
+/// Run a previously compiled trace, returning its guard-exit index.
+fn jit_execute(caller: &mut Caller<'_, Host>, func_id: u32, frame_ptr: u32) -> Result<u32> {
+    let trace = *caller
+        .data()
+        .traces
+        .get(&func_id)
+        .with_context(|| format!("jit_execute_wasm: unknown func id {func_id}"))?;
+    let mut results = [Val::I32(0)];
+    trace.call(&mut *caller, &[Val::I32(frame_ptr as i32)], &mut results)?;
+    Ok(match results[0] {
+        Val::I32(x) => x as u32,
+        _ => 0,
+    })
+}
+
+/// Dispatch a residual call requested by a running trace.
+fn jit_call_trampoline(caller: &mut Caller<'_, Host>, frame_ptr: u32) -> Result<()> {
+    let memory = caller.data().memory.context("memory")?;
+    let table = caller.data().table.context("table")?;
+    let frame = frame_ptr as usize;
+
+    let func_ptr = read_u32(&memory, &*caller, frame + CALL_FUNC_OFS);
+
+    // `func_ptr == 0` is the "newstr" sentinel; without a host string
+    // allocator (matching the browser glue's null table slot) it yields 0.
+    if func_ptr == 0 {
+        write_i64(&memory, &mut *caller, frame + CALL_RESULT_OFS, 0)?;
+        return Ok(());
+    }
+
+    let func = match table.get(&mut *caller, func_ptr as u64) {
+        Some(Ref::Func(Some(f))) => f,
+        _ => {
+            write_i64(&memory, &mut *caller, frame + CALL_RESULT_OFS, 0)?;
+            return Ok(());
+        }
+    };
+
+    let ty = func.ty(&*caller);
+    let params: Vec<ValType> = ty.params().collect();
+    let mut args: Vec<Val> = Vec::with_capacity(params.len());
+    for (i, pty) in params.iter().enumerate() {
+        let raw = read_i64(&memory, &*caller, frame + CALL_ARGS_OFS + i * 8);
+        args.push(match pty {
+            ValType::I32 => Val::I32(raw as i32),
+            ValType::I64 => Val::I64(raw),
+            // Floats cross the call area as their raw bit pattern in an i64 slot.
+            ValType::F32 => Val::F32(raw as u32),
+            ValType::F64 => Val::F64(raw as u64),
+            other => {
+                return Err(Error::msg(format!(
+                    "unsupported residual-call param type {other:?}"
+                )));
+            }
+        });
+    }
+
+    let mut results: Vec<Val> = ty
+        .results()
+        .map(|t| match t {
+            ValType::I64 => Val::I64(0),
+            ValType::F32 => Val::F32(0),
+            ValType::F64 => Val::F64(0),
+            _ => Val::I32(0),
+        })
+        .collect();
+
+    // Mirror the browser glue's try/catch: a trapping residual target is
+    // reported as a zero result rather than aborting the whole run.
+    if let Err(e) = func.call(&mut *caller, &args, &mut results) {
+        eprintln!("[jit_call] residual target trapped: {e:?}");
+        write_i64(&memory, &mut *caller, frame + CALL_RESULT_OFS, 0)?;
+        return Ok(());
+    }
+
+    let result = match results.first() {
+        Some(Val::I32(x)) => (*x as u32) as i64, // zero-extend; high word stays 0
+        Some(Val::I64(x)) => *x,
+        Some(Val::F64(x)) => *x as i64,
+        Some(Val::F32(x)) => (*x as u64) as i64,
+        _ => 0,
+    };
+    write_i64(&memory, &mut *caller, frame + CALL_RESULT_OFS, result)?;
+    Ok(())
+}
+
+/// Scan wasm linear memory for panic messages pyre-wasm's hook wrote there.
+///
+/// The hook prepends a literal `[pyre panic] ` to the panic info, and that
+/// concatenation only exists at runtime (never as a static format template), so
+/// matching the combined prefix recovers the real formatted message — including
+/// the asserted values — rather than a `{…}`-placeholder template.
+fn recover_panic_messages(data: &[u8]) -> Vec<String> {
+    let needle = b"[pyre panic] panicked at";
+    let mut out: Vec<String> = Vec::new();
+    let mut from = 0;
+    while let Some(rel) = data[from..].windows(needle.len()).position(|w| w == needle) {
+        let pos = from + rel;
+        let end = data[pos..]
+            .iter()
+            .position(|&b| b == 0)
+            .map(|n| pos + n)
+            .unwrap_or((pos + 400).min(data.len()));
+        // Decode and cut at the first non-text byte (`U+FFFD` from lossy
+        // decoding of trailing String capacity garbage).
+        let text = String::from_utf8_lossy(&data[pos..end]);
+        let text = text
+            .split('\u{FFFD}')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if !text.is_empty() && !out.contains(&text) {
+            out.push(text);
+            if out.len() >= 4 {
+                break;
+            }
+        }
+        from = end + 1;
+    }
+    out
+}
+
+fn read_u32(mem: &Memory, store: impl AsContext, off: usize) -> u32 {
+    let mut b = [0u8; 4];
+    let _ = mem.read(store, off, &mut b);
+    u32::from_le_bytes(b)
+}
+
+fn read_i64(mem: &Memory, store: impl AsContext, off: usize) -> i64 {
+    let mut b = [0u8; 8];
+    let _ = mem.read(store, off, &mut b);
+    i64::from_le_bytes(b)
+}
+
+fn write_i64(mem: &Memory, mut store: impl AsContextMut, off: usize, v: i64) -> Result<()> {
+    mem.write(&mut store, off, &v.to_le_bytes())
+        .context("write call-area result")
+}
+
+/// Dump the module's imports and exports, for debugging the host contract.
+fn inspect_module(module_path: &PathBuf) -> Result<()> {
+    let engine = Engine::new(&Config::new())?;
+    let module = Module::from_file(&engine, module_path)
+        .with_context(|| format!("load wasm module {}", module_path.display()))?;
+    println!("imports:");
+    for import in module.imports() {
+        println!(
+            "  {}.{} : {:?}",
+            import.module(),
+            import.name(),
+            import.ty()
+        );
+    }
+    println!("exports:");
+    for export in module.exports() {
+        println!("  {} : {:?}", export.name(), export.ty());
+    }
+    Ok(())
+}

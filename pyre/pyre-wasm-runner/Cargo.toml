@@ -1,0 +1,15 @@
+[package]
+name = "pyre-wasm-runner"
+version.workspace = true
+edition.workspace = true
+publish = false
+description = "Native wasmtime host that runs the wasm32 build of pyre, satisfying the JIT host-import contract"
+
+[[bin]]
+name = "pyre-wasm-runner"
+path = "src/main.rs"
+
+[dependencies]
+# wasmtime vendors its own error type (`wasmtime::Error`) and re-exports a
+# `Context` trait, so the runner needs no separate `anyhow` dependency.
+wasmtime = { workspace = true }

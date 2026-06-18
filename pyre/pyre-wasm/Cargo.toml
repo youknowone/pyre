@@ -14,10 +14,14 @@ crate-type = ["cdylib"]
 default = ["web"]
 # Browser / JS host: `run_python` is exported through wasm-bindgen and the
 # JIT instantiates trace modules via the `WebAssembly` API (`jit_glue.js`).
-web = ["dep:wasm-bindgen", "pyre-jit/wasm-web"]
+web = ["dep:wasm-bindgen", "pyre-jit/wasm-web", "getrandom/wasm_js"]
 # Native wasm host (wasmi / wasmtime): a plain C-ABI surface
 # (`pyre_alloc` / `pyre_dealloc` / `pyre_run_python`) is exported and the
 # JIT instantiates trace modules via plain wasm imports. No JavaScript.
+# getrandom uses its `custom` backend here (see the `__getrandom_v03_custom`
+# shim in `src/lib.rs`), selected by building with
+# `--cfg getrandom_backend="custom"`, so the module carries no wasm-bindgen
+# imports a non-JS embedder could not satisfy.
 wasmi = ["pyre-jit/wasm-host"]
 
 [dependencies]

@@ -81,7 +81,27 @@ CARGO_CONFIG = {
         "extra": ["--no-default-features", "--features", "cranelift"],
         "bin": "pyre-cranelift",
     },
+    # The wasm backend is not a `pyrex` binary: it is the wasm32 build of
+    # `pyre-wasm` (full interpreter+JIT) executed by the native `pyre-wasm-runner`
+    # under wasmtime. `build_backend` special-cases it (see `wasm=True`).
+    "wasm": {
+        "bin": "pyre-wasm-runner",
+        "wasm": True,
+    },
 }
+
+# Module + linker flags for the wasm32 build of `pyre-wasm`:
+#   * `--export-table` exposes `__indirect_function_table` so the runner's
+#     `jit_call` trampoline can dispatch residual calls by table index;
+#   * `getrandom_backend="custom"` selects getrandom's custom backend (see
+#     `pyre-wasm/src/lib.rs`) so the module carries no wasm-bindgen imports.
+# `pyre-wasm` builds to the same `pyre_wasm.wasm` filename for both the `web`
+# and `wasmi` features, so a later default (web) build would clobber the
+# native-host module. Copy the wasmi build to a distinct, stable path the runner
+# reads, immune to that overwrite.
+WASM_BUILD_OUTPUT = "target/wasm32-unknown-unknown/release/pyre_wasm.wasm"
+WASM_MODULE_PATH = "target/wasm32-unknown-unknown/release/pyre_wasm.wasmi.wasm"
+WASM_RUSTFLAGS = '-C link-arg=--export-table --cfg getrandom_backend="custom"'
 
 # ── ANSI helpers ─────────────────────────────────────────────────────
 
@@ -230,6 +250,10 @@ def pyre_env():
         env["PYRE_STDLIB"] = PYRE_STDLIB
     if FBW_INLINE_MULTIFRAME_OFF:
         env["PYRE_FBW_INLINE_MULTIFRAME"] = "0"
+    # Point the wasm runner at the built module by absolute path so it resolves
+    # regardless of the child's working directory (ignored by other backends).
+    if "PYRE_WASM_MODULE" not in env and Path(WASM_MODULE_PATH).exists():
+        env["PYRE_WASM_MODULE"] = str(Path(WASM_MODULE_PATH).resolve())
     return env
 
 
@@ -278,6 +302,11 @@ def default_binary(backend):
     name = CARGO_CONFIG[backend]["bin"]
     return f"./target/release/{name}{EXE}"
 
+
+# Backends rendered in fixed-column displays, in order. Any enabled backend not
+# listed here still runs and is counted; it just falls outside the fixed columns.
+ALL_BACKENDS = ("dynasm", "cranelift", "wasm")
+
 # ── Check runner ─────────────────────────────────────────────────────
 
 class Check:
@@ -285,10 +314,12 @@ class Check:
         self.args = args
         self.results = []
         self.comparisons = []
-        self.dynasm_pass = self.dynasm_fail = 0
-        self.cranelift_pass = self.cranelift_fail = 0
-        self.dynasm_pyre = ""
-        self.cranelift_pyre = ""
+        # Per-backend bookkeeping, keyed by backend name so any backend
+        # (dynasm / cranelift / wasm / a single `--pyre-path` binary) is tracked
+        # uniformly.
+        self.pass_count = {}
+        self.fail_count = {}
+        self.pyre = {}
         self.snapshot_diffs = []
         self.snapshot_missing = []
 
@@ -298,7 +329,7 @@ class Check:
         return bool(self._pyre(backend))
 
     def _pyre(self, backend):
-        return self.dynasm_pyre if backend == "dynasm" else self.cranelift_pyre
+        return self.pyre.get(backend, "")
 
     def _timeout_scale(self, backend):
         if backend == "dynasm" and self.args.dynasm_timeout_scale is not None:
@@ -308,10 +339,7 @@ class Check:
         return self.args.timeout_scale
 
     def _set_pyre(self, backend, path):
-        if backend == "dynasm":
-            self.dynasm_pyre = path
-        else:
-            self.cranelift_pyre = path
+        self.pyre[backend] = path
 
     # ── comparison table ──
 
@@ -328,9 +356,9 @@ class Check:
                 "name": name,
                 "cpython": fmt_time(t_cpython),
                 "pypy": fmt_time(t_pypy),
-                "dynasm": "-",
-                "cranelift": "-",
             }
+            for b in ALL_BACKENDS:
+                entry[b] = "-"
             self.comparisons.append(entry)
             idx = len(self.comparisons) - 1
         else:
@@ -349,16 +377,10 @@ class Check:
 
     def _record(self, backend, passed, name, detail):
         if passed:
-            if backend == "dynasm":
-                self.dynasm_pass += 1
-            else:
-                self.cranelift_pass += 1
+            self.pass_count[backend] = self.pass_count.get(backend, 0) + 1
         else:
             self.results.append(f"{red('FAIL')} {backend} {name}  {detail}")
-            if backend == "dynasm":
-                self.dynasm_fail += 1
-            else:
-                self.cranelift_fail += 1
+            self.fail_count[backend] = self.fail_count.get(backend, 0) + 1
 
     # ── snapshot gate ──
 
@@ -403,6 +425,8 @@ class Check:
 
     def build_backend(self, backend):
         cfg = CARGO_CONFIG[backend]
+        if cfg.get("wasm"):
+            return self.build_wasm_backend()
         print(f"Building {cfg['bin']} (release, backend={backend})...")
         cmd = [
             "cargo", "build", "--release", "-p", "pyrex",
@@ -435,6 +459,57 @@ class Check:
         lines = (proc.stdout or "").strip().splitlines() + (proc.stderr or "").strip().splitlines()
         if lines:
             print(lines[-1])
+
+    def build_wasm_backend(self):
+        """Build the wasm32 `pyre-wasm` module and the native `pyre-wasm-runner`.
+
+        The runner loads the module (via `$PYRE_WASM_MODULE`, defaulting to
+        `WASM_MODULE_PATH`) and executes it under wasmtime, so two artefacts are
+        produced: the wasm module (needs the export-table / custom-getrandom
+        flags) and the host runner binary.
+        """
+        steps = [
+            (
+                "pyre-wasm (wasm32, --features wasmi)",
+                [
+                    "cargo", "build", "--release", "-p", "pyre-wasm",
+                    "--target", "wasm32-unknown-unknown",
+                    "--no-default-features", "--features", "wasmi",
+                ],
+                {**os.environ, "RUSTFLAGS": WASM_RUSTFLAGS},
+            ),
+            (
+                "pyre-wasm-runner (native wasmtime host)",
+                ["cargo", "build", "--release", "-p", "pyre-wasm-runner"],
+                None,
+            ),
+        ]
+        for label, cmd, env in steps:
+            print(f"Building {label}...")
+            print("  $ " + " ".join(cmd))
+            proc = subprocess.run(
+                cmd, capture_output=True, text=True, encoding="utf-8",
+                errors="replace", env=env,
+            )
+            if proc.returncode != 0:
+                print(f"ERROR: cargo build failed (exit {proc.returncode})")
+                if proc.stdout:
+                    print("─── cargo stdout ───")
+                    print(proc.stdout.rstrip())
+                if proc.stderr:
+                    print("─── cargo stderr ───")
+                    print(proc.stderr.rstrip())
+                print("────────────────────")
+                sys.exit(1)
+            lines = (proc.stderr or "").strip().splitlines()
+            if lines:
+                print(lines[-1])
+        if not Path(WASM_BUILD_OUTPUT).exists():
+            print(f"ERROR: wasm module not produced at {WASM_BUILD_OUTPUT}")
+            sys.exit(1)
+        # Snapshot the wasmi build to a stable path so a later `web` build of the
+        # same crate cannot overwrite the module the runner loads.
+        shutil.copyfile(WASM_BUILD_OUTPUT, WASM_MODULE_PATH)
 
     def _print_cargo_diagnostics(self, cargo_path):
         """Dump the toolchain state when cargo refuses to run.
@@ -489,7 +564,7 @@ class Check:
                 )
             except Exception:
                 pass
-        for backend in ("dynasm", "cranelift"):
+        for backend in ALL_BACKENDS:
             if self.enabled(backend):
                 try:
                     subprocess.run(
@@ -633,7 +708,7 @@ class Check:
         t_pypy = f"{pypy_cpu:.2f}" if pypy_code == 0 else "-"
         if pypy_code != 0:
             print(f"{red('CRASH')} (exit {pypy_code})")
-            for backend in ("dynasm", "cranelift"):
+            for backend in ALL_BACKENDS:
                 if self.enabled(backend):
                     self._record(backend, False, name, "pypy crash")
                     self._append_comparison(backend, name, t_cpython, "-", "FAIL")
@@ -681,7 +756,7 @@ class Check:
             print(f"{red('CRASH')} (exit {cpython_code})")
             cpython_output = None
             t_cpython = "-"
-            for backend in ("dynasm", "cranelift"):
+            for backend in ALL_BACKENDS:
                 if self.enabled(backend):
                     self._record(backend, False, name, "cpython crash")
                     self._append_comparison(backend, name, "-", "-", "FAIL")
@@ -697,7 +772,7 @@ class Check:
         )
         if pypy_code != 0:
             print(f"{red('CRASH')} (exit {pypy_code})")
-            for backend in ("dynasm", "cranelift"):
+            for backend in ALL_BACKENDS:
                 if self.enabled(backend):
                     self._record(backend, False, name, "pypy crash")
                     self._append_comparison(backend, name, t_cpython, "-", "FAIL")
@@ -707,7 +782,7 @@ class Check:
 
         if cpython_output is not None and cpython_output != pypy_output:
             print(f"    {'baseline':<10s}{red('WRONG')}  cpython output differs from pypy")
-            for backend in ("dynasm", "cranelift"):
+            for backend in ALL_BACKENDS:
                 if self.enabled(backend):
                     self._record(backend, False, name, "cpython/pypy output mismatch")
                     self._append_comparison(
@@ -715,7 +790,7 @@ class Check:
                     )
             return
 
-        for backend in ("dynasm", "cranelift"):
+        for backend in ALL_BACKENDS:
             if not self.enabled(backend):
                 continue
             self._run_backend_bench(
@@ -742,7 +817,7 @@ class Check:
 
     def print_backend_config(self):
         parts = []
-        for b in ("dynasm", "cranelift"):
+        for b in ALL_BACKENDS:
             if self.enabled(b):
                 parts.append(f"{b}={self._pyre(b)}(x{self._timeout_scale(b)})")
         if parts:
@@ -751,36 +826,20 @@ class Check:
     def print_comparison_table(self):
         if not self.comparisons:
             return
-        both = self.enabled("dynasm") and self.enabled("cranelift")
-        dynasm_only = self.enabled("dynasm") and not self.enabled("cranelift")
-        cranelift_only = self.enabled("cranelift") and not self.enabled("dynasm")
+        cols = [b for b in ALL_BACKENDS if self.enabled(b)]
+        if not cols:
+            return
 
         print(bold("Comparison"))
 
-        if both:
-            print(f"  {'benchmark':<35s} {'cpython':>8s} {'pypy':>8s} {'dynasm':>18s} {'cranelift':>18s}")
-            print("  " + "─" * 98)
-            for c in self.comparisons:
-                print(
-                    f"  {c['name']:<35s} {c['cpython']:>8s} {c['pypy']:>8s}"
-                    f" {c['dynasm']:>18s} {c['cranelift']:>18s}"
-                )
-        elif dynasm_only:
-            print(f"  {'benchmark':<35s} {'cpython':>8s} {'pypy':>8s} {'dynasm':>18s}")
-            print("  " + "─" * 76)
-            for c in self.comparisons:
-                print(
-                    f"  {c['name']:<35s} {c['cpython']:>8s} {c['pypy']:>8s}"
-                    f" {c['dynasm']:>18s}"
-                )
-        elif cranelift_only:
-            print(f"  {'benchmark':<35s} {'cpython':>8s} {'pypy':>8s} {'cranelift':>18s}")
-            print("  " + "─" * 76)
-            for c in self.comparisons:
-                print(
-                    f"  {c['name']:<35s} {c['cpython']:>8s} {c['pypy']:>8s}"
-                    f" {c['cranelift']:>18s}"
-                )
+        header = f"  {'benchmark':<35s} {'cpython':>8s} {'pypy':>8s}"
+        header += "".join(f" {b:>18s}" for b in cols)
+        print(header)
+        print("  " + "─" * (54 + 19 * len(cols)))
+        for c in self.comparisons:
+            row = f"  {c['name']:<35s} {c['cpython']:>8s} {c['pypy']:>8s}"
+            row += "".join(f" {c[b]:>18s}" for b in cols)
+            print(row)
 
     def print_summary(self):
         print()
@@ -792,12 +851,11 @@ class Check:
 
         failed_runs = 0
         enabled_runs = 0
-        for b in ("dynasm", "cranelift"):
+        for b in ALL_BACKENDS:
             if not self.enabled(b):
                 continue
             enabled_runs += 1
-            fail = self.dynasm_fail if b == "dynasm" else self.cranelift_fail
-            if fail > 0:
+            if self.fail_count.get(b, 0) > 0:
                 failed_runs += 1
 
         self.print_comparison_table()
@@ -823,11 +881,11 @@ class Check:
                 print(dim(f"threshold: ±{self.args.threshold}% vs baseline"))
             print()
 
-        for b in ("dynasm", "cranelift"):
+        for b in ALL_BACKENDS:
             if not self.enabled(b):
                 continue
-            p = self.dynasm_pass if b == "dynasm" else self.cranelift_pass
-            f = self.dynasm_fail if b == "dynasm" else self.cranelift_fail
+            p = self.pass_count.get(b, 0)
+            f = self.fail_count.get(b, 0)
             if f > 0:
                 print(f"{red('FAILED')}: {b} {f} failed, {p} passed")
             else:
@@ -854,7 +912,7 @@ def parse_args():
         description="pyre pre-merge check: correctness + regression guard + comparison",
         allow_abbrev=False,
     )
-    parser.add_argument("--backend", choices=["dynasm", "cranelift"], default="")
+    parser.add_argument("--backend", choices=["dynasm", "cranelift", "wasm"], default="")
     parser.add_argument("--timeout-scale", type=float, default=1.0)
     parser.add_argument("--dynasm-timeout-scale", type=float, default=None)
     parser.add_argument("--cranelift-timeout-scale", type=float, default=None)

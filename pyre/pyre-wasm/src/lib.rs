@@ -11,6 +11,41 @@ compile_error!("feature `wasmi` requires target_arch = \"wasm32\"");
 #[cfg(feature = "web")]
 use wasm_bindgen::prelude::*;
 
+// Native-host (`wasmi`) builds target wasm32-unknown-unknown, which has no OS
+// entropy. To avoid the wasm-bindgen-based `wasm_js` backend (whose imports a
+// non-JS embedder cannot satisfy), getrandom is wired to its `custom` backend
+// via `--cfg getrandom_backend="custom"`, which calls this hook. pyre seeds only
+// non-cryptographic uses (string hash key, the `random` module) from it, and the
+// values never affect check.py's oracle comparison, so a deterministic
+// SplitMix64 stream is sufficient.
+#[cfg(all(target_arch = "wasm32", feature = "wasmi"))]
+mod custom_getrandom {
+    use core::sync::atomic::{AtomicU64, Ordering};
+
+    static STATE: AtomicU64 = AtomicU64::new(0x9e37_79b9_7f4a_7c15);
+
+    #[unsafe(no_mangle)]
+    unsafe extern "Rust" fn __getrandom_v03_custom(
+        dest: *mut u8,
+        len: usize,
+    ) -> Result<(), getrandom::Error> {
+        let mut i = 0;
+        while i < len {
+            let mut z = STATE
+                .fetch_add(0x9e37_79b9_7f4a_7c15, Ordering::Relaxed)
+                .wrapping_add(0x9e37_79b9_7f4a_7c15);
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            z ^= z >> 31;
+            let bytes = z.to_le_bytes();
+            let n = core::cmp::min(8, len - i);
+            unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), dest.add(i), n) };
+            i += n;
+        }
+        Ok(())
+    }
+}
+
 use pyre_interpreter::*;
 
 use std::cell::RefCell;
