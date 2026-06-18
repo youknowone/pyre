@@ -8918,6 +8918,73 @@ mod tests {
         assert!(stack_color_map.contains(&5));
     }
 
+    /// Encode<->decode resume-symmetry round trip over a NON-IDENTITY,
+    /// coalesced color map shaped exactly as the codewriter publishes it
+    /// (`stack_slot_color_map` built at codewriter.rs:10000-10006,
+    /// `pyre_color_for_semantic_local` at codewriter.rs:10018-10044). The
+    /// forward map assigns one post-regalloc Ref color per semantic slot;
+    /// chordal coalescing legitimately reuses a color across slots that are
+    /// never simultaneously live, so the shared inverse
+    /// `semantic_ref_slot_for_reg_color` — called by the encode side
+    /// (collect_outer_active_boxes) and both decode sides
+    /// (restore_guard_failure_values / setup_bridge_sym) — must disambiguate
+    /// by the live window: the live stack prefix first, then the live locals.
+    ///
+    /// Layout: nlocals=2, max_stackdepth=3, live stack depth 2 (stack_only=2).
+    ///   local 0 -> color 5, local 1 -> color 6
+    ///   stack 0 -> color 6 (shared with live local 1)
+    ///   stack 1 -> color 7
+    ///   stack 2 -> color 5 (shared with live local 0; DEAD, index >= stack_only)
+    ///
+    /// Expected inverses are DERIVED from the published maps, so this asserts
+    /// a true publish<->inverse identity rather than ad-hoc literals. The
+    /// non-identity local map ([5,6] not [0,1]) defeats the identity fallback
+    /// (state.rs:1649), which is why the only existing end-to-end decode test
+    /// (skeleton jitcode, empty maps) never exercises this path.
+    #[test]
+    fn resume_symmetry_roundtrip_coalesced_color_map() {
+        let nlocals = 2usize;
+        // live stack depth = valuestackdepth - nlocals; the published stack map
+        // is the FULL max_stackdepth (3), but only the live prefix is in window.
+        let stack_only = 2usize;
+        let local_map = [5u16, 6u16];
+        let stack_map = [6u16, 7u16, 5u16];
+        let live_locals = [0usize, 1usize];
+
+        let invert = |reg: u16| {
+            semantic_ref_slot_for_reg_color(
+                nlocals,
+                stack_only,
+                &local_map,
+                &stack_map,
+                &live_locals,
+                reg as usize,
+            )
+        };
+
+        // Round-trip closure: every LIVE stack slot's published color inverts
+        // back to its own semantic slot (nlocals + d) — the stack map is its
+        // own inverse over the live prefix.
+        for d in 0..stack_only {
+            assert_eq!(invert(stack_map[d]), Some(nlocals + d));
+        }
+
+        // Color 6 is shared by live local 1 and live stack slot 0. The decoder
+        // scans the live stack prefix first, so it MUST resolve to the stack
+        // slot (Some(2)), never the local (Some(1)). This is the kept-stack /
+        // local coalescing case the guard-failure deopt depends on.
+        assert_eq!(invert(stack_map[0]), Some(2));
+        assert_eq!(invert(local_map[1]), Some(2));
+
+        // Color 5 is shared by live local 0 and the DEAD stack slot 2 (index
+        // >= stack_only, outside the live window). It must route to the live
+        // local, not the dead stack slot.
+        assert_eq!(invert(local_map[0]), Some(0));
+
+        // The dead stack slot's color must never recover as that slot.
+        assert_ne!(invert(stack_map[2]), Some(nlocals + 2));
+    }
+
     fn empty_meta() -> PyreMeta {
         PyreMeta {
             num_locals: 0,
