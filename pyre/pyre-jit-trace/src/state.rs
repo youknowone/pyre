@@ -2222,6 +2222,15 @@ pub(crate) fn instruction_needs_pre_opcode_snapshot(instruction: Instruction) ->
             | Instruction::UnaryNot
             | Instruction::UnaryInvert
             | Instruction::RaiseVarargs { .. }
+            // Both pop the operand stack (BUILD_TUPLE pop_n, UNPACK_SEQUENCE
+            // pop_value) before emitting a guard: trace_build_tuple_value emits
+            // the specialised-tuple w_class guards on the popped items, and
+            // unpack_sequence_value emits the sequence class / length guards on
+            // the popped sequence. Without the opcode-start snapshot the guard's
+            // resume state reflects the post-pop stack, so resuming at the
+            // opcode start restores the consumed operands as null / mismatched.
+            | Instruction::BuildTuple { .. }
+            | Instruction::UnpackSequence { .. }
     )
 }
 
@@ -9021,6 +9030,22 @@ mod tests {
         assert!(contains_instruction(&raise_code, |instruction| {
             matches!(instruction, Instruction::RaiseVarargs { .. })
                 && !instruction_may_raise(instruction)
+                && instruction_needs_pre_opcode_snapshot(instruction)
+        }));
+
+        // BUILD_TUPLE pops its operands before trace_build_tuple_value emits
+        // the specialised-tuple w_class guards.
+        let build_tuple_code = compile_function_body("def f(a, b):\n    return (a, b)\n");
+        assert!(contains_instruction(&build_tuple_code, |instruction| {
+            matches!(instruction, Instruction::BuildTuple { .. })
+                && instruction_needs_pre_opcode_snapshot(instruction)
+        }));
+
+        // UNPACK_SEQUENCE pops the sequence before unpack_sequence_value emits
+        // the sequence class / length guards.
+        let unpack_code = compile_function_body("def f(s):\n    a, b = s\n    return a + b\n");
+        assert!(contains_instruction(&unpack_code, |instruction| {
+            matches!(instruction, Instruction::UnpackSequence { .. })
                 && instruction_needs_pre_opcode_snapshot(instruction)
         }));
     }
