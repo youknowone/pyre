@@ -40,7 +40,10 @@ pub fn jit_exc_raise(value: i64) {
     let exc_type = if value == 0 {
         0
     } else {
-        unsafe { *(value as *const i64) }
+        // `typeptr` is a machine pointer (32-bit on wasm32); read it at
+        // pointer width and zero-extend, so the high bits stay clear and
+        // `GuardException`'s type comparison matches the baked class pointer.
+        unsafe { *(value as *const usize) as i64 }
     };
     JIT_EXC_VALUE.store(value, Ordering::Relaxed);
     JIT_EXC_TYPE.store(exc_type, Ordering::Relaxed);
