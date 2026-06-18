@@ -1,9 +1,11 @@
 //! _struct module — PyPy: `pypy/module/struct/`.
 //!
 //! Implements just enough of `pack` / `unpack` / `calcsize` /
-//! `_clearcache` plus the `error` type alias to let `struct.py` load.
-//! Each packer handles the format codes pyre actually uses during
-//! import (`<q`, `<d`, etc.).
+//! `_clearcache` plus the `error` type alias to let `struct.py` load,
+//! and the `W_Struct` class (`interp_struct.py:213 W_Struct`) whose
+//! `pack` / `unpack` promote the format string by value before each
+//! call (`jit.promote_string(self.format)`).  Each packer handles the
+//! format codes pyre actually uses during import (`<q`, `<d`, etc.).
 
 use pyre_object::*;
 
@@ -172,10 +174,111 @@ fn unpack_one(buf: &[u8], pos: &mut usize, code: char, little: bool) -> Option<P
     }
 }
 
+/// `interp_struct.py:71 do_pack` — pack `values` according to `format`.
+fn do_pack(format: &str, values: &[PyObjectRef]) -> PyObjectRef {
+    let (endian, codes) = parse_format(format);
+    let little = matches!(endian, '<' | '=' | '@');
+    let mut out = Vec::new();
+    for (i, code) in codes.iter().enumerate() {
+        let arg = values.get(i).copied().unwrap_or(w_none());
+        pack_into(&mut out, *code, little, arg);
+    }
+    w_bytes_from_bytes(&out)
+}
+
+/// `interp_struct.py:139 do_unpack` — unpack `buf` according to `format`.
+fn do_unpack(format: &str, buf: &[u8]) -> PyObjectRef {
+    let (endian, codes) = parse_format(format);
+    let little = matches!(endian, '<' | '=' | '@');
+    let mut out = Vec::new();
+    let mut pos = 0usize;
+    for code in codes {
+        match unpack_one(buf, &mut pos, code, little) {
+            Some(v) => out.push(v),
+            None => break,
+        }
+    }
+    w_tuple_new(out)
+}
+
+/// `interp_struct.py:213 W_Struct` — a compiled struct object holding its
+/// format string and precomputed size.
+#[crate::pyre_class("_struct.Struct")]
+pub struct W_Struct {
+    /// Format string object (`text_or_bytes_w` of the constructor arg),
+    /// promoted by value before each pack/unpack.  `_immutable_fields_ =
+    /// ["format", "size"]`.
+    format: PyObjectRef,
+    size: i64,
+}
+
+#[crate::pyre_methods(doc = "Struct(fmt) --> compiled struct object")]
+impl W_Struct {
+    #[staticmethod]
+    fn __new__(_cls: PyObjectRef) -> PyObjectRef {
+        W_Struct::allocate(W_Struct {
+            ob: pyre_object::PyObject {
+                ob_type: std::ptr::null(),
+                w_class: std::ptr::null_mut(),
+            },
+            format: w_str_new(""),
+            size: -1,
+        })
+    }
+
+    /// `interp_struct.py:222 descr__init__` — store the (normalized)
+    /// format string and its `_calcsize`.
+    fn __init__(&mut self, w_format: PyObjectRef) -> Result<(), crate::PyError> {
+        let format = format_to_string(w_format)?;
+        let (_, codes) = parse_format(&format);
+        self.size = codes.iter().copied().map(code_size).sum::<usize>() as i64;
+        self.format = w_str_new(&format);
+        Ok(())
+    }
+
+    #[getter]
+    fn format(&self) -> PyObjectRef {
+        self.format
+    }
+
+    #[getter]
+    fn size(&self) -> i64 {
+        self.size
+    }
+
+    /// `interp_struct.py:227 descr_pack` —
+    /// `do_pack(space, jit.promote_string(self.format), args_w)`.
+    /// The whole-args-slice ABI hands `args[0]` = self; the packed values
+    /// are `args[1..]`.
+    fn pack(&self, args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+        let format = majit_metainterp::jit::promote_string(self.format);
+        let fmt = unsafe { w_str_get_value(format) };
+        Ok(do_pack(fmt, &args[1..]))
+    }
+
+    /// `interp_struct.py:234 descr_unpack` —
+    /// `do_unpack(space, jit.promote_string(self.format), w_str)`.
+    fn unpack(&self, w_str: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+        let format = majit_metainterp::jit::promote_string(self.format);
+        let fmt = unsafe { w_str_get_value(format) };
+        let buf = unsafe {
+            if bytesobject::is_bytes_like(w_str) {
+                bytesobject::bytes_like_data(w_str)
+            } else {
+                return Err(crate::PyError::type_error(
+                    "a bytes-like object is required",
+                ));
+            }
+        };
+        Ok(do_unpack(fmt, buf))
+    }
+}
+
 crate::py_module! {
     "_struct",
     interpleveldefs: {
         "error" => crate::typedef::w_object(),
+        "Struct" => type_object(),
     },
     inline_functions: {
         fn _clearcache() {}
@@ -185,17 +288,7 @@ crate::py_module! {
             Ok(codes.iter().copied().map(code_size).sum::<usize>() as i64)
         }
         fn unpack(fmt: &str, buf: &[u8]) -> PyObjectRef {
-            let (endian, codes) = parse_format(fmt);
-            let little = matches!(endian, '<' | '=' | '@');
-            let mut out = Vec::new();
-            let mut pos = 0usize;
-            for code in codes {
-                match unpack_one(buf, &mut pos, code, little) {
-                    Some(v) => out.push(v),
-                    None => break,
-                }
-            }
-            w_tuple_new(out)
+            do_unpack(fmt, buf)
         }
     },
     functions: {
@@ -210,25 +303,11 @@ crate::py_module! {
                 if !is_str(args[0]) {
                     return Err(crate::PyError::type_error("pack: format must be str"));
                 }
-                w_str_get_value(args[0]).to_string()
+                w_str_get_value(args[0])
             };
-            let (endian, codes) = parse_format(&fmt);
-            let little = matches!(endian, '<' | '=' | '@');
-            let mut out = Vec::new();
-            for (i, code) in codes.iter().enumerate() {
-                let arg = args.get(i + 1).copied().unwrap_or(w_none());
-                pack_into(&mut out, *code, little, arg);
-            }
-            Ok(w_bytes_from_bytes(&out))
+            Ok(do_pack(fmt, &args[1..]))
         },
         "unpack_from" / * = |_| Ok(w_tuple_new(vec![])),
         "iter_unpack" / 2 = |_| Ok(w_list_new(vec![])),
-        // `struct.Struct(fmt)` — minimal instance with `format` attribute.
-        "Struct" / 1 = |args| {
-            let fmt = args.first().copied().unwrap_or(w_str_new(""));
-            let obj = w_instance_new(crate::typedef::w_object());
-            let _ = crate::baseobjspace::setattr_str(obj, "format", fmt);
-            Ok(obj)
-        },
     },
 }
