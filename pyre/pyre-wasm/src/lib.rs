@@ -154,14 +154,23 @@ mod host_abi {
     /// the host must free with `pyre_dealloc`.
     #[unsafe(no_mangle)]
     pub extern "C" fn pyre_run_python(ptr: *const u8, len: usize) -> u64 {
-        let source = if ptr.is_null() {
-            String::new()
+        let result = if ptr.is_null() || len == 0 {
+            run_python_impl("")
         } else {
-            let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
-            String::from_utf8_lossy(bytes).into_owned()
+            // Reject a (ptr, len) that escapes linear memory before forming a
+            // slice; the embedder supplies these raw, so an out-of-range pair
+            // would otherwise be undefined behaviour.
+            let mem_bytes = core::arch::wasm32::memory_size(0).saturating_mul(65536);
+            match (ptr as usize).checked_add(len) {
+                Some(end) if end <= mem_bytes => {
+                    let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
+                    run_python_impl(&String::from_utf8_lossy(bytes))
+                }
+                _ => "Error: input buffer out of wasm memory bounds".to_string(),
+            }
         };
 
-        let out = run_python_impl(&source).into_bytes();
+        let out = result.into_bytes();
         let out_len = out.len();
         let out_ptr = pyre_alloc(out_len);
         if out_len != 0 {
