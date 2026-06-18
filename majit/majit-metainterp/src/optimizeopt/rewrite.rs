@@ -189,10 +189,16 @@ impl OptRewrite {
 
             // General constant divisor >= 3: magic number multiplication
             if divisor >= 3 {
+                // rewrite.py:770 `known_nonneg = b1.known_nonnegative()`:
+                // a non-negative dividend skips the sign-correction ops.
+                let known_nonneg = ctx
+                    .resolve_box_box_opt(&arg0)
+                    .and_then(|b| ctx.peek_intbound_box(&b))
+                    .map_or(false, |bound| bound.known_nonnegative());
                 let result = intdiv::division_operations(
                     arg0.to_opref(),
                     divisor,
-                    false,
+                    known_nonneg,
                     ctx.current_pass_idx,
                     ctx,
                 );
@@ -278,10 +284,16 @@ impl OptRewrite {
             .and_then(|b| ctx.get_constant_int_box(&b))
         {
             if divisor >= 3 && divisor.count_ones() != 1 {
+                // rewrite.py:809 `known_nonneg = b1.known_nonnegative()`:
+                // a non-negative dividend skips the sign-correction ops.
+                let known_nonneg = ctx
+                    .resolve_box_box_opt(&arg0)
+                    .and_then(|b| ctx.peek_intbound_box(&b))
+                    .map_or(false, |bound| bound.known_nonnegative());
                 let result = intdiv::modulo_operations(
                     arg0.to_opref(),
                     divisor,
-                    false,
+                    known_nonneg,
                     ctx.current_pass_idx,
                     ctx,
                 );
