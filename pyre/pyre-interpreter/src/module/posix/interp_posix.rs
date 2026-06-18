@@ -1289,6 +1289,27 @@ pub fn register_module(ns: &mut DictStorage) {
     {
         use rustpython_host_env::posix as host_posix;
 
+        // os.strerror(code) -> str
+        crate::dict_storage_store(
+            ns,
+            "strerror",
+            crate::make_builtin_function_with_arity(
+                "strerror",
+                |args| {
+                    let code = match args.first() {
+                        Some(&o) => (unsafe { pyre_object::w_int_get_value(o) }) as i32,
+                        None => {
+                            return Err(crate::PyError::type_error("strerror() requires 1 argument"));
+                        }
+                    };
+                    Ok(pyre_object::w_str_new(
+                        &rustpython_host_env::time::strerror(code),
+                    ))
+                },
+                1,
+            ),
+        );
+
         // os.pipe() -> (r_fd, w_fd)
         crate::dict_storage_store(
             ns,
@@ -1514,6 +1535,120 @@ pub fn register_module(ns: &mut DictStorage) {
                 |_| Ok(pyre_object::w_int_new(unsafe { libc::getppid() } as i64)),
                 0,
             ),
+        );
+
+        // os.waitpid(pid, options) -> (pid, status)
+        crate::dict_storage_store(
+            ns,
+            "waitpid",
+            crate::make_builtin_function_with_arity(
+                "waitpid",
+                |args| {
+                    if args.len() < 2 {
+                        return Err(crate::PyError::type_error("waitpid() requires 2 arguments"));
+                    }
+                    let pid = (unsafe { pyre_object::w_int_get_value(args[0]) }) as libc::pid_t;
+                    let options = (unsafe { pyre_object::w_int_get_value(args[1]) }) as i32;
+                    let mut status: i32 = 0;
+                    let res =
+                        host_posix::waitpid(pid, &mut status, options).map_err(|e| io_err(e, ""))?;
+                    Ok(pyre_object::w_tuple_new(vec![
+                        pyre_object::w_int_new(res as i64),
+                        pyre_object::w_int_new(status as i64),
+                    ]))
+                },
+                2,
+            ),
+        );
+
+        // os.wait() -> (pid, status)
+        crate::dict_storage_store(
+            ns,
+            "wait",
+            crate::make_builtin_function_with_arity(
+                "wait",
+                |_| {
+                    let mut status: i32 = 0;
+                    let res =
+                        host_posix::waitpid(-1, &mut status, 0).map_err(|e| io_err(e, ""))?;
+                    Ok(pyre_object::w_tuple_new(vec![
+                        pyre_object::w_int_new(res as i64),
+                        pyre_object::w_int_new(status as i64),
+                    ]))
+                },
+                0,
+            ),
+        );
+
+        // os._exit(code) — immediate process exit, no cleanup.
+        crate::dict_storage_store(
+            ns,
+            "_exit",
+            crate::make_builtin_function_with_arity(
+                "_exit",
+                |args| {
+                    let code = match args.first() {
+                        Some(&o) => (unsafe { pyre_object::w_int_get_value(o) }) as i32,
+                        None => return Err(crate::PyError::type_error("_exit() requires 1 argument")),
+                    };
+                    rustpython_host_env::os::exit(code)
+                },
+                1,
+            ),
+        );
+
+        // Wait-status decoding macros (WIFEXITED/WEXITSTATUS/...): override
+        // the noop stubs registered above with the libc bit-math.
+        macro_rules! reg_wstatus {
+            ($name:literal, |$s:ident| $body:expr) => {
+                crate::dict_storage_store(
+                    ns,
+                    $name,
+                    crate::make_builtin_function_with_arity(
+                        $name,
+                        |args| {
+                            let $s = match args.first() {
+                                Some(&o) => (unsafe { pyre_object::w_int_get_value(o) }) as libc::c_int,
+                                None => {
+                                    return Err(crate::PyError::type_error(concat!(
+                                        $name,
+                                        "() requires 1 argument"
+                                    )));
+                                }
+                            };
+                            Ok($body)
+                        },
+                        1,
+                    ),
+                );
+            };
+        }
+        reg_wstatus!("WIFEXITED", |s| pyre_object::w_bool_from(libc::WIFEXITED(s)));
+        reg_wstatus!("WEXITSTATUS", |s| pyre_object::w_int_new(
+            libc::WEXITSTATUS(s) as i64
+        ));
+        reg_wstatus!("WIFSIGNALED", |s| pyre_object::w_bool_from(
+            libc::WIFSIGNALED(s)
+        ));
+        reg_wstatus!("WTERMSIG", |s| pyre_object::w_int_new(libc::WTERMSIG(s) as i64));
+        reg_wstatus!("WIFSTOPPED", |s| pyre_object::w_bool_from(
+            libc::WIFSTOPPED(s)
+        ));
+        reg_wstatus!("WSTOPSIG", |s| pyre_object::w_int_new(libc::WSTOPSIG(s) as i64));
+
+        // Wait option flags — override the `0` placeholders registered above
+        // with their real libc values (os.WNOHANG must be non-zero for
+        // subprocess.poll()).
+        crate::dict_storage_store(ns, "WNOHANG", pyre_object::w_int_new(libc::WNOHANG as i64));
+        crate::dict_storage_store(
+            ns,
+            "WUNTRACED",
+            pyre_object::w_int_new(libc::WUNTRACED as i64),
+        );
+        crate::dict_storage_store(
+            ns,
+            "WCONTINUED",
+            pyre_object::w_int_new(libc::WCONTINUED as i64),
         );
 
         // os.dup(fd) -> new_fd

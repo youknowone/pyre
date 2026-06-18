@@ -220,6 +220,7 @@ pub fn install_builtin_modules() {
     pyre_install_module!(_ctypes);
     #[cfg(not(target_arch = "wasm32"))]
     pyre_install_module!(_posixshmem);
+    pyre_install_module!(_posixsubprocess);
     pyre_install_module!(_multiprocessing);
     pyre_install_module!(_locale);
     pyre_install_module!(_random);

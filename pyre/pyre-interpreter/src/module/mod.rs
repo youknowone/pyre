@@ -35,6 +35,8 @@ pub mod _pickle;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod _posixshmem;
 #[allow(non_snake_case)]
+pub mod _posixsubprocess;
+#[allow(non_snake_case)]
 pub mod _random;
 #[allow(non_snake_case)]
 #[cfg(not(target_arch = "wasm32"))]
