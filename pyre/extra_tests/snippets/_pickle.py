@@ -654,6 +654,10 @@ e = err(lambda: setattr(p, "memo", [1, 2]))
 assert isinstance(e, TypeError) and "PicklerMemoProxy object or dict" in str(e), e
 e = err(lambda: setattr(p, "memo", {1: 2}))
 assert isinstance(e, TypeError) and "2-item tuples" in str(e), e
+# The memo is a position-indexed list, so a negative slot index is rejected
+# rather than panicking on the out-of-range cast.
+e = err(lambda: setattr(p, "memo", {0: (-1, "x")}))
+assert isinstance(e, ValueError) and "non-negative" in str(e), e
 e = err(lambda: delattr(p, "memo"))
 assert isinstance(e, TypeError) and "deletion is not supported" in str(e), e
 
@@ -850,6 +854,21 @@ if HAVE_PICKLE:
     p.dispatch_table = {Boxed: reduce_boxed}
     p.dump(Boxed(7))
     assert pickle.loads(buf.getvalue()).x == 7
+
+    # dispatch_table may be any mapping, consulted via __getitem__ (a missing
+    # type surfaces as KeyError == no entry).
+    class MappingDT:
+        def __init__(self, d):
+            self._d = d
+
+        def __getitem__(self, key):
+            return self._d[key]
+
+    buf = io.BytesIO()
+    p = pickle.Pickler(buf, 2)
+    p.dispatch_table = MappingDT({Boxed: reduce_boxed})
+    p.dump(Boxed(9))
+    assert pickle.loads(buf.getvalue()).x == 9
 
     # fast mode disables the memo (no shared identity).
     shared = [1, 2, 3]

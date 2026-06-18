@@ -453,6 +453,11 @@ impl W_Pickler {
             }
             let idx = unsafe { pyre_object::tupleobject::w_tuple_getitem(*tup, 0) }.unwrap();
             let i = crate::baseobjspace::int_w(idx)?;
+            if i < 0 {
+                // The memo is a position-indexed list, so a negative slot index
+                // has no representation (and would emit a malformed back-reference).
+                return Err(PyError::value_error("memo index must be non-negative"));
+            }
             if i > max_idx {
                 max_idx = i;
             }
@@ -891,7 +896,9 @@ fn save_reduce_value(
 
 /// Look up `type(w_obj)` in the effective `dispatch_table` and, if registered,
 /// call the reduce function. Returns its result, or `None` when no table or
-/// no matching entry applies.
+/// no matching entry applies. The `copyreg.dispatch_table` fallback is a dict;
+/// a user-set `dispatch_table` may be any mapping, so a non-dict is consulted
+/// via `__getitem__` with `KeyError` meaning "no entry".
 fn dispatch_table_reduce(
     ctx: &PickleCtx,
     w_obj: PyObjectRef,
@@ -900,8 +907,9 @@ fn dispatch_table_reduce(
     if dt.is_null() || unsafe { pyre_object::is_none(dt) } {
         return Ok(None);
     }
-    if !unsafe { pyre_object::is_dict(dt) }
-        || unsafe { pyre_object::dictmultiobject::w_dict_len(dt) } == 0
+    // The common case is an empty `copyreg.dispatch_table`; skip the lookup.
+    if unsafe { pyre_object::is_dict(dt) }
+        && unsafe { pyre_object::dictmultiobject::w_dict_len(dt) } == 0
     {
         return Ok(None);
     }
@@ -909,12 +917,27 @@ fn dispatch_table_reduce(
         .ok_or_else(|| pickling_error("type builtin unavailable"))?;
     let _roots = pyre_object::gc_roots::push_roots();
     pyre_object::gc_roots::pin_root(w_obj);
-    let slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-    let w_type = call_fn(type_fn, &[pyre_object::gc_roots::shadow_stack_get(slot)])?;
-    match unsafe { pyre_object::w_dict_lookup(dt, w_type) } {
+    let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    pyre_object::gc_roots::pin_root(dt);
+    let dt_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let w_type = call_fn(type_fn, &[pyre_object::gc_roots::shadow_stack_get(obj_slot)])?;
+    pyre_object::gc_roots::pin_root(w_type);
+    let type_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let dt = pyre_object::gc_roots::shadow_stack_get(dt_slot);
+    let w_type = pyre_object::gc_roots::shadow_stack_get(type_slot);
+    let reduce_fn = if unsafe { pyre_object::is_dict(dt) } {
+        unsafe { pyre_object::w_dict_lookup(dt, w_type) }
+    } else {
+        match crate::baseobjspace::getitem(dt, w_type) {
+            Ok(reduce_fn) => Some(reduce_fn),
+            Err(e) if e.kind == crate::PyErrorKind::KeyError => None,
+            Err(e) => return Err(e),
+        }
+    };
+    match reduce_fn {
         Some(reduce_fn) => Ok(Some(call_fn(
             reduce_fn,
-            &[pyre_object::gc_roots::shadow_stack_get(slot)],
+            &[pyre_object::gc_roots::shadow_stack_get(obj_slot)],
         )?)),
         None => Ok(None),
     }

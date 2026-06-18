@@ -1039,8 +1039,24 @@ fn call_find_class(
     w_module: PyObjectRef,
     w_name: PyObjectRef,
 ) -> Result<PyObjectRef, PyError> {
-    let self_obj = pyre_object::gc_roots::shadow_stack_get(slot);
-    call_meth(self_obj, "find_class", &[w_module, w_name])
+    // Resolving the bound `find_class` allocates, which can move the nursery;
+    // pin the arguments (and re-read `self`) across the lookup.
+    let _roots = pyre_object::gc_roots::push_roots();
+    pyre_object::gc_roots::pin_root(w_module);
+    let module_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    pyre_object::gc_roots::pin_root(w_name);
+    let name_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let method = crate::baseobjspace::getattr_str(
+        pyre_object::gc_roots::shadow_stack_get(slot),
+        "find_class",
+    )?;
+    call_fn(
+        method,
+        &[
+            pyre_object::gc_roots::shadow_stack_get(module_slot),
+            pyre_object::gc_roots::shadow_stack_get(name_slot),
+        ],
+    )
 }
 
 /// Emit the `pickle.find_class` audit event.
