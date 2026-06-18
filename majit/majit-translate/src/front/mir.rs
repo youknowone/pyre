@@ -8694,8 +8694,8 @@ fn resolve_const_int(
     use crate::model::OpKind;
     let (block_id, idx) = resolve_to_producer_op(graph, var)?;
     let block = graph.blocks.iter().find(|b| b.id == block_id)?;
-    match block.operations.get(idx)?.kind {
-        OpKind::ConstInt(n) => Some(n),
+    match &block.operations.get(idx)?.kind {
+        OpKind::ConstInt(n) => Some(*n),
         _ => None,
     }
 }
