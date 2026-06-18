@@ -2434,46 +2434,67 @@ impl<'a> GraphFlattener<'a> {
         regalloc_color(&*self.regallocs, v)
     }
 
-    /// pyre-only: give a distinct fresh color to every Variable referenced
-    /// as a graph-op argument that the regalloc left uncolored.  No
+    /// pyre-only: give a distinct fresh color to every Variable the walker
+    /// leaves uncolored — referenced as a graph-op argument, an outgoing
+    /// link argument, or a block inputarg without a regalloc color.  No
     /// upstream counterpart — upstream flowgraphs are always well-formed
     /// (every operand is a block inputarg or an earlier op's result), so
     /// `make_dependencies`, which registers interference nodes only for
     /// inputargs and op results, colors every operand.
     ///
-    /// pyre's walker emits `abort_permanent` for opcodes the JIT does not
-    /// support (`CONTAINS_OP`, `UNPACK_SEQUENCE`, …) and pushes fresh
-    /// symbolic Refs onto the operand stack so the rest of the block's
-    /// symbolic execution stays stack-balanced.  Those Refs have no graph
-    /// producer, so `make_dependencies` never colors them, and a later op
-    /// that consumes one (`bool`, `setarrayitem_vable_r`) would hit the
-    /// `regalloc_color` missing-color panic when this driver serializes
-    /// it.
+    /// Two pyre walker shapes leak never-defined placeholders:
     ///
-    /// `abort_permanent` sets `needs_fallthrough = false`, severing the
-    /// block's CFG successor, so any instruction that consumes such a Ref
-    /// sits in the dead region after the bail-out: the compiled trace
-    /// returns to the interpreter before reaching it.  The instruction is
-    /// still serialized to keep the byte stream well-formed, but never
-    /// executes, so its register operand only has to be a *valid* color —
-    /// never a *value-correct* one.  A distinct fresh color satisfies that
-    /// and cannot alias any live value's color.
+    /// - `abort_permanent` for opcodes the JIT does not support
+    ///   (`CONTAINS_OP`, `UNPACK_SEQUENCE`, …) pushes fresh symbolic Refs
+    ///   onto the operand stack so the rest of the block's symbolic
+    ///   execution stays stack-balanced.  Those Refs have no graph
+    ///   producer, so `make_dependencies` never colors them, and a later
+    ///   op that consumes one (`bool`, `setarrayitem_vable_r`) would hit
+    ///   the `regalloc_color` missing-color panic.  `abort_permanent` sets
+    ///   `needs_fallthrough = false`, so the consuming instruction sits in
+    ///   the dead region after the bail-out.
+    ///
+    /// - an uncaught `finally` RERAISE leaves the 3.11 lasti slot
+    ///   (`int_w(peekvalue(oparg))`) on the stack as a never-defined Int
+    ///   placeholder that the exception edge threads as a link argument and
+    ///   the landing block names as an inputarg.  The lasti restore is
+    ///   runtime PyError state, not modeled in the jitcode, so no operation
+    ///   ever reads the placeholder.
+    ///
+    /// In both cases the placeholder is value-dead: the serialized byte
+    /// stream must stay well-formed, but the register operand only has to
+    /// be a *valid* color — never a *value-correct* one.  A distinct fresh
+    /// color satisfies that and cannot alias any live value's color.
     fn color_leaked_arg_variables(&mut self) {
         let graph: &super::flow::FunctionGraph = self.graph;
+        let mut leaked: Vec<Variable> = Vec::new();
         for block in graph.iterblocks() {
             let block_borrow = block.borrow();
+            for inputarg in &block_borrow.inputargs {
+                if let Some(v) = inputarg.as_variable() {
+                    leaked.push(v);
+                }
+            }
             for op in &block_borrow.operations {
                 for arg in &op.args {
-                    for v in arg.variables() {
-                        let kind = v.kind.unwrap_or(Kind::Ref);
-                        let alloc = &mut self.regallocs[kind.index()];
-                        if !alloc.coloring.contains_key(&v.id) {
-                            let color = alloc.num_colors;
-                            alloc.coloring.insert(v.id, color);
-                            alloc.num_colors += 1;
-                        }
+                    leaked.extend(arg.variables());
+                }
+            }
+            for link in &block_borrow.exits {
+                for arg in &link.borrow().args {
+                    if let Some(v) = arg.as_ref().and_then(FlowValue::as_variable) {
+                        leaked.push(v);
                     }
                 }
+            }
+        }
+        for v in leaked {
+            let kind = v.kind.unwrap_or(Kind::Ref);
+            let alloc = &mut self.regallocs[kind.index()];
+            if !alloc.coloring.contains_key(&v.id) {
+                let color = alloc.num_colors;
+                alloc.coloring.insert(v.id, color);
+                alloc.num_colors += 1;
             }
         }
     }
