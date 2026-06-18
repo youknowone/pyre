@@ -3426,15 +3426,16 @@ fn bh_call_fn_impl(callable: PyObjectRef, null_or_self: PyObjectRef, args: &[PyO
     }
 }
 
-/// `_load_global` residual (pyopcode.py:958-969).  Resolves the namespace from
-/// the callee's OWN `w_code` (`w_code_get_w_globals`, GC-forwarded at call
-/// time), NOT the `namespace_ptr` operand: the walker emits `namespace_ptr` as
-/// the cell-fold recogniser's hint, but the frame register it reads from
-/// aliases the outermost frame on a chained / inlined-callee resume.  `w_code`
-/// is the callee's own promoted constant, so its live globals are always the
-/// correct, relocation-following dict.  The live frame is passed explicitly so
-/// `_load_global` can mirror `self.get_builtin()` in compiled residual-call
-/// paths as well as blackhole.  namei is the raw oparg from LOAD_GLOBAL:
+/// `_load_global` residual (pyopcode.py:958-969).  Resolves the namespace via
+/// the executing frame's `get_w_globals()` when the live frame OWNS this
+/// `w_code` (`frame.pycode == w_code`) — honoring an `exec(code, ns)`
+/// frame-specific namespace — and falls back to the callee's own promoted
+/// `w_code` globals otherwise (an inlined / chained callee's frame register
+/// aliases an outer frame, so it is not this code's frame).  The
+/// `namespace_ptr` operand is ignored for the same aliasing reason; it
+/// survives only as the cell-fold recogniser's hint.  The live frame is also
+/// passed so `self.get_builtin()` works in compiled residual-call paths as
+/// well as blackhole.  namei is the raw oparg from LOAD_GLOBAL:
 /// name_idx = namei >> 1.
 pub extern "C" fn bh_load_global_fn(
     namespace_ptr: i64,
@@ -3455,6 +3456,7 @@ pub extern "C" fn bh_load_global_fn(
 
     let varname = code.names[idx].as_ref();
     let _ = namespace_ptr;
+    let parent_frame_ptr = frame_ptr as *const PyFrame;
     // pypy/interpreter/pyopcode.py:958-969 `_load_global`:
     //   w_value = self.space.finditem_str(self.get_w_globals(), varname)
     //   if w_value is None:
@@ -3462,20 +3464,28 @@ pub extern "C" fn bh_load_global_fn(
     //       if w_value is None:
     //           self._load_global_failed(w_varname)
     //
-    // Resolve the namespace from the callee's OWN `W_Code` at call time
-    // rather than the `namespace_ptr` operand.  The walker reads the
-    // operand namespace from `getfield_vable_r(frame, w_globals)`, but the
-    // frame register aliases the OUTERMOST frame on a chained blackhole /
-    // inlined-callee resume, so a non-portal callee would see the caller's
-    // globals (or a null when the frame register is unseeded).  `w_code` is
-    // the callee's own promoted constant, and reading `w_globals` from it at
-    // call time yields the current (GC-forwarded) module dict — the value
-    // the const-folding `frontend_global_flow_value` resolved statically,
-    // but live, so a relocated dict (a growing `memo`) is followed instead
-    // of dangling.  `namespace_ptr` survives only as the
-    // `try_walker_load_global_cell_fold` recogniser's hint.
-    let w_globals =
-        unsafe { pyre_interpreter::w_code_get_w_globals(w_code_ptr as pyre_object::PyObjectRef) };
+    // `self.get_w_globals()` (pyframe.py:129-133) is the executing frame's
+    // own namespace: the per-frame `w_globals` an `exec(code, ns)` installs
+    // in `debug_data`, falling back to the code's bound `w_globals` when
+    // there is no override.  Use it whenever the live frame OWNS this
+    // `w_code` (`frame.pycode == w_code`), so a compiled `LOAD_GLOBAL`
+    // resolves against the executing frame's globals — not the code's
+    // original module dict — exactly as the interpreter does.
+    //
+    // A frame that does NOT own this `w_code` is an aliased OUTER frame on a
+    // chained blackhole / inlined-callee resume (the same aliasing makes the
+    // `namespace_ptr` operand unusable, hence ignored above).  Resolve from
+    // the callee's own promoted `w_code` constant: reading `w_globals` from
+    // it yields the current (GC-forwarded) module dict the const-folding
+    // `frontend_global_flow_value` resolved statically, but live, so a
+    // relocated dict (a growing `memo`) is followed instead of dangling.
+    let w_globals = if !parent_frame_ptr.is_null()
+        && unsafe { (*parent_frame_ptr).pycode } as usize == w_code_ptr as usize
+    {
+        unsafe { (*parent_frame_ptr).get_w_globals() }
+    } else {
+        unsafe { pyre_interpreter::w_code_get_w_globals(w_code_ptr as pyre_object::PyObjectRef) }
+    };
     if !w_globals.is_null() {
         let globals = unsafe { &*w_globals };
         if let Some(w_value) = pyre_interpreter::dict_storage_get(globals, varname) {
@@ -3486,7 +3496,6 @@ pub extern "C" fn bh_load_global_fn(
     // Residual helper adaptation: `self` is the live portal frame passed as
     // an explicit Ref argument, so `self.get_builtin()` maps to
     // PyFrame::get_builtin() without relying on blackhole-only TLS.
-    let parent_frame_ptr = frame_ptr as *const PyFrame;
     if !parent_frame_ptr.is_null() {
         let w_builtin = unsafe { (*parent_frame_ptr).get_builtin() };
         if !w_builtin.is_null() && unsafe { pyre_object::is_module(w_builtin) } {
