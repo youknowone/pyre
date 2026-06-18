@@ -5413,27 +5413,25 @@ fn collect_outer_active_boxes(
     active
 }
 
-/// Emit the intermediate merge-point vable→heap writeback the trait's
-/// `close_loop_args_at` (`trace_opcode.rs:2875-2950`) runs at every
-/// `jit_merge_point`: override the vable `last_instr` scalar to
-/// `merge_pc - 1`, mirror it into the `virtualizable_boxes` shadow, and —
-/// when the target LABEL is the reds-only reduced shape — store the vable
-/// scalars + array back to the heap `PyFrame`.
+/// Sync the symbolic vable `last_instr` at an intermediate `jit_merge_point`
+/// reached mid-trace (the `jit_merge_point` REGISTER branch — a bridge
+/// re-entering the inner loop, returning `Continue`): override `last_instr`
+/// to `merge_pc - 1` (a resume into the target loop must re-enter at the
+/// header opcode) and mirror it into the `virtualizable_boxes` shadow that
+/// `close_loop_args_at`'s JUMP-arg derivation reads.
 ///
-/// The walker's loop-close path already routes through `close_loop_args_at`
-/// (`trace.rs` `run_perfn_walk` CloseLoop post-processing), so it emits the
-/// FINAL writeback.  The `jit_merge_point` REGISTER branch — an intermediate
-/// loop header reached mid-trace, e.g. a bridge re-entering the inner loop —
-/// returned `Continue` without it, so the compiled body left the heap
-/// frame's `last_instr` (and array slots) at the trace-seed (loop-header)
-/// state.  A later guard-fail resume then re-read that stale heap frame and
-/// underflowed the interpreter value stack (#62 / #67-remaining).
-fn emit_intermediate_merge_point_writeback(ctx: &mut TraceCtx, merge_pc: usize) {
-    let Some(vable_box) = ctx.standard_virtualizable_box() else {
+/// Without the override the JUMP into the existing loop carries the LAST
+/// GUARD's published `last_instr` (e.g. 104 instead of header-1=86 on
+/// fannkuch), so a vable sync inside the target loop would resume the
+/// interpreter at the wrong bytecode (permutation state never reaches its
+/// exit condition → non-crashing infinite loop).
+///
+/// No heap writeback: the vable stays virtual across the merge edge and is
+/// rebuilt from guard resume-data on failure, matching the loop-close path.
+fn sync_intermediate_merge_point_last_instr(ctx: &mut TraceCtx, merge_pc: usize) {
+    if ctx.standard_virtualizable_box().is_none() {
         return;
-    };
-    // close_loop_args_at:2875-2891 — last_instr = merge target pc - 1, so a
-    // resume into this merge point re-enters at the header opcode.
+    }
     let last_instr_value = merge_pc as i64 - 1;
     let opref = ctx.const_int(last_instr_value);
     crate::trace_opcode::mirror_vable_static_to_boxes(
@@ -5442,26 +5440,6 @@ fn emit_intermediate_merge_point_writeback(ctx: &mut TraceCtx, merge_pc: usize) 
         opref,
         Value::Int(last_instr_value),
     );
-    // close_loop_args_at:2922-2950 — heap writeback on the reds-only
-    // (reduced) target LABEL, whose patched preamble re-reads the vable
-    // static + array fields from the heap on every iteration.
-    let target_inputarg_len: Option<usize> = {
-        let (driver, _) = crate::driver::driver_pair();
-        if driver.is_bridge_tracing() {
-            driver
-                .current_trace_green_key()
-                .and_then(|gk| driver.get_loop_token(gk))
-                .map(|token| token.inputarg_types.len())
-        } else {
-            Some(ctx.inputarg_types().len())
-        }
-    };
-    if let Some(len) = target_inputarg_len {
-        let is_reduced_label = len > 0 && len < crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
-        if is_reduced_label {
-            ctx.gen_writeback_vable_to_heap(vable_box);
-        }
-    }
 }
 
 /// Walker-side port of `pyjitpl.py:2586-2602 MIFrame.capture_resumedata`
@@ -12177,20 +12155,17 @@ fn handle(
             // pyjitpl.py:2951 self.heapcache.reset()
             ctx.trace_ctx.heap_cache_mut().reset();
 
-            // `close_loop_args_at` (trace_opcode.rs:2933-2961) runs the
-            // merge-point vable sync BEFORE building the jump args: the
-            // vable `last_instr` scalar is overridden to `merge_pc - 1`
-            // (a resume into the target loop must re-enter at the header
-            // opcode) and the reds-only-label heap writeback is emitted.
-            // The walker must do the same before `append_virtualizable_
-            // boxes` below — otherwise the compile_trace arm's JUMP into
-            // the existing loop carries the LAST GUARD's published
-            // `last_instr` (e.g. 104 instead of header-1=86 on fannkuch),
-            // and any vable sync inside the target loop then stores that
-            // stale pc into the heap frame, resuming the interpreter at
-            // the wrong bytecode (fannkuch permutation state never
+            // `close_loop_args_at` (trace_opcode.rs) runs the merge-point
+            // vable `last_instr` sync BEFORE building the jump args: the
+            // scalar is overridden to `merge_pc - 1` (a resume into the
+            // target loop must re-enter at the header opcode). The walker
+            // must do the same before `append_virtualizable_boxes` below —
+            // otherwise the compile_trace arm's JUMP into the existing loop
+            // carries the LAST GUARD's published `last_instr` (e.g. 104
+            // instead of header-1=86 on fannkuch), resuming the interpreter
+            // at the wrong bytecode (fannkuch permutation state never
             // reaches its exit condition → non-crashing infinite loop).
-            emit_intermediate_merge_point_writeback(ctx.trace_ctx, next_instr);
+            sync_intermediate_merge_point_last_instr(ctx.trace_ctx, next_instr);
 
             // Reds = the live loop args, in bytecode bank order
             // [int.., ref.., float..]. For pyre's portal jitdriver the

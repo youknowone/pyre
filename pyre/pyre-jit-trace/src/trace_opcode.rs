@@ -544,8 +544,8 @@ fn emit_call_assembler_callee_frame(
 /// RPython does not have — RPython's `metainterp.virtualizable_boxes`
 /// is the single canonical source for vable static state.  Setfield-
 /// vable opcodes (`_opimpl_setfield_vable`) and the JUMP-time
-/// writeback path (`flush_to_frame`) publish into the boxes shadow so
-/// future readers (`gen_writeback_vable_to_heap`, JUMP-arg dedup)
+/// shadow flush (`flush_to_frame`) publish into the boxes shadow so
+/// future readers (JUMP-arg dedup, `close_loop_args_at`)
 /// observe the same identity as `s.vable_*`.  Callers gate on
 /// `s.owns_virtualizable_shadow()` before calling — upstream
 /// `_opimpl_setfield_vable` short-circuits on
@@ -583,8 +583,8 @@ fn emit_call_assembler_callee_frame(
 ///
 /// The snapshot does not mirror its `s.vable_*` overrides into the
 /// shared shadow because the shared shadow is the JUMP/JIT-time view
-/// (live virtualizable values that `gen_writeback_vable_to_heap` and
-/// `close_loop_args_at` consume), while `s.vable_last_instr/vsd`
+/// (live virtualizable values that `close_loop_args_at`'s JUMP-arg
+/// derivation consumes), while `s.vable_last_instr/vsd`
 /// carry the pre-opcode override that the snapshot reader needs.
 /// The two stores stay distinct deliberately: `record_branch_guard`
 /// saves `s.vable_last_instr/vsd` before flushing and restores them
@@ -748,8 +748,8 @@ pub(crate) fn gen_writeback_inline_frame_to_heap(
 
     // locals_cells_stack_w items. Boxed (Ref) slots are written back with
     // an inline `SetarrayitemGc` into `locals_cells_stack_w`, the same
-    // primitive `gen_writeback_vable_to_heap` (trace_ctx.rs) uses for the
-    // root loop's vable array items. The array base, item descr
+    // primitive `gen_store_back_in_vable` (trace_ctx.rs) uses for the
+    // vable array items. The array base, item descr
     // (`pyobject_gcarray_descr`) and flat slot index match the
     // `trace_array_getitem_value` read path the compiled loop uses at
     // entry, so the optimizer's heapcache pairs them. Among the boxed
@@ -2685,8 +2685,8 @@ impl MIFrame {
         // pyjitpl.py:1188-1199 `_opimpl_setfield_vable` parity:
         // mirror the heap-read seed into the canonical
         // `metainterp.virtualizable_boxes` shadow so subsequent readers
-        // (snapshot, gen_writeback_vable_to_heap, JUMP-arg dedup) see
-        // the same identity that `s.vable_*` carries.
+        // (snapshot, JUMP-arg dedup) see the same identity that
+        // `s.vable_*` carries.
         if owns {
             mirror_vable_static_to_boxes(
                 ctx,
@@ -2804,7 +2804,7 @@ impl MIFrame {
         // `s.vable_*` is the snapshot reader's view (carries pre-opcode
         // overrides set here, save/restored by `record_branch_guard`),
         // `ctx.virtualizable_boxes` is the JUMP/JIT-time view (consumed
-        // by `gen_writeback_vable_to_heap` and `close_loop_args_at`).
+        // by `close_loop_args_at`'s JUMP-arg derivation).
     }
 
     /// pyjitpl.py:3317-3335 vable_and_vrefs_before_residual_call.
@@ -3195,65 +3195,15 @@ impl MIFrame {
                 );
             }
         }
-        // Vable heap-writeback before JUMP.
-        //
-        // When `descriptor=Some` + `patch_new_loop_to_load_virtualizable_
-        // fields` (compile.py:425-461) reduces the target LABEL to
-        // reds-only inputargs (`[frame, ec]`), the patched body's
-        // GETFIELD_GC / GETARRAYITEM_GC preamble re-loads vable static
-        // and array fields from the heap on every iteration. Pyre's
-        // tracer updates symbolic `sym.vable_*` / `sym.registers_r`
-        // during opcode tracing but does not touch the heap; without
-        // this writeback, the bridge body re-reads stale state and
-        // ouroboroses on the first guard fail.
-        //
-        // Gate selects the target LABEL's inputarg_types length:
-        //   - root trace: ctx.inputarg_types() = own inputargs = LABEL types
-        //   - bridge with resolvable loop_token: target loop's
-        //     inputarg_types
-        //   - bridge without (current_trace_green_key missing or lookup
-        //     fails): None — gate stays off (target LABEL shape unknown)
-        //
-        // Threshold `< NUM_SCALAR_INPUTARGS` separates legacy (≥ 7
-        // entries: `[frame, 6 scalars, locals..., stack...]`) from
-        // reduced (1-2 entries: `[frame]` or `[frame, ec]`).
-        //
-        // Every direct `s.vable_*`
-        // write that touches the active sym now mirrors into
-        // `virtualizable_boxes` via `mirror_vable_static_to_boxes`,
-        // and inline frame push/pop save+restore the boxes shadow so
-        // it tracks the active sym across callee boundaries.  With
-        // those propagation paths in place the writeback can fire
-        // unconditionally on reduced LABELs.
-        {
-            let target_inputarg_len: Option<usize> = {
-                let (driver, _) = crate::driver::driver_pair();
-                if driver.is_bridge_tracing() {
-                    driver
-                        .current_trace_green_key()
-                        .and_then(|gk| driver.get_loop_token(gk))
-                        .map(|token| token.inputarg_types.len())
-                } else {
-                    Some(ctx.inputarg_types().len())
-                }
-            };
-            if let Some(len) = target_inputarg_len {
-                // `len > 0` excludes the bridge-target-loop-token-with-
-                // empty-inputarg_types edge case (probe captured 73
-                // such firings on dynasm nested_loop, all
-                // target_inputarg_len=0 — likely a freshly-allocated
-                // loop token whose types are not yet set). The
-                // reds-only LABEL always carries `[frame]` (len=1) or
-                // `[frame, ec]` (len=2).
-                let is_reduced_label =
-                    len > 0 && len < crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
-                if is_reduced_label {
-                    if let Some(vable_box) = ctx.standard_virtualizable_box() {
-                        ctx.gen_writeback_vable_to_heap(vable_box);
-                    }
-                }
-            }
-        }
+        // No vable heap-writeback before the closing JUMP: the
+        // virtualizable stays virtual across the loop/bridge edge. The
+        // live vable scalars/array items reach the target LABEL through
+        // the JUMP-arg derivation below; loop-invariant fields fold into
+        // the resume-data payload of each guard. A guard failure rebuilds
+        // the heap frame from that payload (`consume_vref_and_vable_boxes`
+        // → `write_boxes`), and a forcing residual call materializes it
+        // via `synchronize_virtualizable` — neither needs a pre-written
+        // heap frame at the JUMP boundary.
         // An active virtualizable owner must have its array base seeded by
         // `init_symbolic` / `become_active_vable_owner` before the JUMP-arg
         // derivation below reads `nlocals`/`vable_array_base`.  `nlocals` is

@@ -7038,19 +7038,24 @@ impl JitState for PyreJitState {
         //       `force_at_end_of_preamble` pass; pyre's
         //       `OptVirtualize::force_virtualizable` (virtualize.rs:348)
         //       has the SETFIELD_RAW emission machinery but is not
-        //       wired to fire at JUMP. The smallest-delta fix is a
-        //       new `gen_writeback_vable_to_heap` helper (modeled on
-        //       `trace_ctx.rs:1702 gen_store_back_in_vable` minus the
-        //       force-virtualizable bookkeeping) invoked from
-        //       `close_loop_args_at`.
+        //       wired to fire at JUMP. An eager
+        //       `gen_writeback_vable_to_heap` helper at
+        //       `close_loop_args_at` / the intermediate merge point was
+        //       tried, then removed once the hot-loop LABEL carried the
+        //       live vable values as inputargs — the patched parent no
+        //       longer reloads stale heap state each iteration, and a
+        //       guard failure rebuilds the heap frame from resume-data
+        //       (`consume_vref_and_vable_boxes` → `write_boxes`),
+        //       matching RPython's no-eager-writeback model.
         //   (e) dynasm recursive CA frame contract — *blocking*
         //       for dynasm SIGSEGV at fib(24).
         //
-        // Status: (a)+(b)+(c1)+(c2) and
-        // gen_writeback_vable_to_heap have landed; descriptor is
-        // active. (e) dynasm recursive CA frame contract
-        // remains as a separate open item driving fib_recursive on
-        // dynasm.
+        // Status: (a)+(b)+(c1)+(c2) have landed and descriptor is
+        // active; (d)'s eager writeback was removed in favor of the
+        // no-eager-writeback model (live values carried as inputargs,
+        // heap frame rebuilt from resume-data). (e) dynasm recursive CA
+        // frame contract remains a separate open item driving
+        // fib_recursive on dynasm.
         Some(Self::pypyjit_driver_descriptor())
     }
 
