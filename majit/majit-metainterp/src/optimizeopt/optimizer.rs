@@ -3560,8 +3560,7 @@ impl Optimizer {
         // target (unroll.py jump_to_existing_trace) instead of
         // jump_to_preamble's boxed entry. Fires when the bridge ends in a
         // JUMP, the trace carries a peeled short preamble, and more than one
-        // front target token exists. Default ON; `R1_OFF` is a kill-switch
-        // routing bridges back to the early-return jump_to_preamble path.
+        // front target token exists.
         //
         // Also require a synthesizable patchguardop: a bridge carries no
         // GUARD_FUTURE_CONDITION, so `self.patchguardop` is only populated
@@ -3575,13 +3574,12 @@ impl Optimizer {
         let has_body_guard = ops
             .iter()
             .any(|op| op.opcode.is_guard() && op.rd_resume_position.get() >= 0);
-        let r1_wr = ops.last().map_or(false, |op| op.opcode == OpCode::Jump)
+        let retarget_close_jump = ops.last().map_or(false, |op| op.opcode == OpCode::Jump)
             && inline_short_preamble
             && front_target_tokens.len() > 1
-            && has_body_guard
-            && std::env::var_os("R1_OFF").is_none();
-        let r1_saved = self.skip_flush;
-        self.skip_flush = r1_wr;
+            && has_body_guard;
+        let skip_flush_saved = self.skip_flush;
+        self.skip_flush = retarget_close_jump;
         let optimized_ops = self.optimize_with_constants_and_inputs_at(
             ops,
             constants,
@@ -3590,7 +3588,7 @@ impl Optimizer {
             start_next_pos,
             false,
         );
-        self.skip_flush = r1_saved;
+        self.skip_flush = skip_flush_saved;
 
         // A bridge trace carries no GUARD_FUTURE_CONDITION
         // (reached_loop_header's GFC lives in pyre's loop-creation path,
@@ -3598,9 +3596,9 @@ impl Optimizer {
         // retarget's inline_short_preamble guards never receive a
         // rd_resume_position. Synthesize patchguardop from the bridge's own
         // last body guard (highest resume position, closest to the close).
-        // `r1_wr` already gated on `has_body_guard`, so the filter is
-        // guaranteed non-empty here.
-        if r1_wr && self.patchguardop.is_none() {
+        // `retarget_close_jump` already gated on `has_body_guard`, so the
+        // filter is guaranteed non-empty here.
+        if retarget_close_jump && self.patchguardop.is_none() {
             if let Some(g) = ops
                 .iter()
                 .filter(|o| o.opcode.is_guard() && o.rd_resume_position.get() >= 0)
@@ -3705,7 +3703,7 @@ impl Optimizer {
         // so the top-level VS shape is preserved. We therefore omit any
         // pre-flush snapshot and let try_jump_to_existing_trace compute
         // VS internally — matching RPython 1:1.
-        ctx.skip_flush_mode = r1_wr;
+        ctx.skip_flush_mode = retarget_close_jump;
         self.flush(&mut ctx);
 
         // unroll.py:204-205: force_at_the_end_of_preamble for each jump arg
