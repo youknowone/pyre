@@ -583,21 +583,6 @@ impl Bookkeeper {
             .unwrap_or_default()
     }
 
-    /// Canonical dotted qualname for an enum variant subclass.  The
-    /// prologue pre-mint ([`Self::pre_register_unit_enum_variant_classes`])
-    /// and the discriminant-narrowing resolver
-    /// ([`Self::getuniqueclassdef_for_enum_variant`]) MUST intern each
-    /// variant under one spelling: a `::`-vs-`.` split mints two distinct
-    /// `ClassDef`s for the same logical variant, and the single
-    /// `assign_inheritance_ids` pass numbers only the pre-minted (dotted)
-    /// one — the other escapes numbering, so a narrowed
-    /// `SomeInstance(variant)` walls as `ClassesPBCRepr`-Void at dispatch.
-    /// Mirrors the `flowspace_adapter` `SyntheticTransparentCtor` arm
-    /// spelling (`{dotted_owner}.{variant}`).
-    fn enum_variant_class_qualname(canon_root: &str, variant_name: &str) -> String {
-        format!("{}.{variant_name}", canon_root.replace("::", "."))
-    }
-
     /// No upstream equivalent — forced by pyre's numbering order, not a
     /// casual workaround.  Upstream runs `assign_inheritance_ids` ONCE
     /// inside `RPythonTyper.specialize`, AFTER `annotator.complete()`
@@ -611,9 +596,9 @@ impl Bookkeeper {
     /// prologue — before any per-subject annotation discovers a
     /// lazily-minted variant class.  This pre-mint is the prologue-time
     /// analogue of upstream's "all classes exist before numbering"
-    /// invariant, restricted to the unit-only enum-variant subtrees that
-    /// would otherwise be minted lazily mid-session: it pre-mints the
-    /// variant subclasses of every unit-only enum so the session-prologue
+    /// invariant, restricted to the enum-variant subtrees that would
+    /// otherwise be minted lazily mid-session: it pre-mints the variant
+    /// subclasses of every registered enum so the session-prologue
     /// [`crate::translator::rtyper::normalizecalls::assign_inheritance_ids`]
     /// pass numbers each `enum-base + variant-children` subtree as one
     /// contiguous bracket.  Called from `PyreCallRegistry::ensure_session`
@@ -631,23 +616,25 @@ impl Bookkeeper {
     /// here leaves every member UNNUMBERED at the single numbering pass,
     /// so the contiguous bracket is assigned once and never shifts.
     ///
-    /// Spelling MUST match the annotation path
-    /// (`flowspace_adapter::translate_op` `SyntheticTransparentCtor` arm)
-    /// exactly or the pre-mint is a phantom that never matches the
-    /// lazily-minted class: base = `intern_class_by_qualname(
-    /// canonical_struct_name(root))` (the same spelling
-    /// `getuniqueclassdef_for_enum_variant` uses, so both resolve to one
-    /// base `HostObject` independent of `STRUCT_ORIGIN_REGISTRY`), variant
-    /// = `intern_class_by_qualname_with_bases("{dotted_owner}.{variant}",
-    /// [base])`.  `enum_variant_by_discriminant`
-    /// dual-publishes each enum under both its `::`-qualified path and
-    /// its bare leaf; iterate the qualified keys only (the dotted owner
-    /// path derives from `key.replace("::", ".")`).  Scoped to unit-only
-    /// enums (the same `is_unit_only_enum` gate the ctor arm uses);
-    /// payload-bearing enums keep base-less variant classes until their
-    /// payload reprs land.
-    pub fn pre_register_unit_enum_variant_classes(self: &Rc<Self>) {
-        // Collect (qualified_root, [variant names]) for unit-only enums,
+    /// Spelling MUST match the annotation path or the pre-mint is a
+    /// phantom that never matches the lazily-minted class, so each variant
+    /// is interned through the SAME [`Self::intern_enum_variant_host`]
+    /// primitive the discriminant-narrowing resolver
+    /// ([`Self::getuniqueclassdef_for_enum_variant`]) and the variant ctor
+    /// arm (`flowspace_adapter`'s `SyntheticTransparentCtor`) route through:
+    /// base = `intern_class_by_qualname(canonical_struct_name(root))`,
+    /// variant = `intern_class_by_qualname_with_bases(
+    /// "{canon_root}::{variant}", [base])`.  All three sites thus resolve
+    /// one `HostObject` per variant under the `::`-qualified key.
+    /// `enum_variant_by_discriminant` dual-publishes each enum under both
+    /// its `::`-qualified path and its bare leaf; iterate the qualified
+    /// keys only.  Gated on the same `is_enum_base` predicate the ctor arm
+    /// uses (a flat class whose sole row is the synthetic `__discriminant`
+    /// tag), so the pre-mint covers exactly the variant subclasses the
+    /// adapter can mint — payload-bearing enums included, since their
+    /// payloads live under `{enum}::{variant}` keys, not on the base.
+    pub fn pre_register_enum_variant_classes(self: &Rc<Self>) {
+        // Collect (qualified_root, [variant names]) for every enum base,
         // releasing both registry borrows before minting (the intern /
         // getuniqueclassdef calls re-borrow `pyre_struct_fields` and
         // `pyre_struct_root_classes`).  Sorted for a deterministic mint
@@ -664,7 +651,7 @@ impl Bookkeeper {
                 .filter(|(root, _)| root.contains("::"))
                 .filter_map(|(root, by_discr)| {
                     let leaf = root.rsplit("::").next().unwrap_or(root);
-                    reg.is_unit_only_enum(leaf).then(|| {
+                    reg.is_enum_base(leaf).then(|| {
                         let mut names: Vec<String> = by_discr.values().cloned().collect();
                         names.sort();
                         names.dedup();
@@ -676,23 +663,25 @@ impl Bookkeeper {
         pairs.sort();
 
         for (root, variant_names) in pairs {
-            // Intern the base under `canonical_struct_name(root)`, mirroring
-            // `getuniqueclassdef_for_enum_variant` exactly.  Both interns
-            // canonicalize to `module::Leaf`, but a bare leaf only resolves
-            // to the same key when it is registered in
-            // `STRUCT_ORIGIN_REGISTRY` under `root`'s module; feeding the
-            // qualified root drops that dependency so the pre-mint and the
-            // discriminant-narrowing resolver always share one base lineage
-            // — and the variant subtree is numbered as one bracket.
+            // Materialize the discriminant-only base classdef before a
+            // variant references it through `getmro`; idempotent with the
+            // struct-root loop.  `canonical_struct_name(root)` is the same
+            // spelling `intern_enum_variant_host` resolves the base under,
+            // so the pre-mint and the discriminant-narrowing resolver share
+            // one base lineage and the variant subtree numbers as one
+            // bracket.
             let canon_root = majit_ir::descr::canonical_struct_name(&root);
             let base = self.intern_class_by_qualname(&canon_root);
-            // Ensure the base classdef exists before a variant references
-            // it through `getmro`; idempotent with the struct-root loop.
             let _ = self.getuniqueclassdef(&base);
             for variant in variant_names {
-                let qualname = Self::enum_variant_class_qualname(&canon_root, &variant);
-                let variant_host =
-                    self.intern_class_by_qualname_with_bases(&qualname, vec![base.clone()]);
+                // The SAME interning primitive the discriminant-narrowing
+                // resolver ([`Self::getuniqueclassdef_for_enum_variant`])
+                // and the variant ctor arm (`flowspace_adapter`) use, so
+                // all three sites resolve ONE variant classdef under the
+                // `::`-qualified key — no `.`-vs-`::` split that would mint
+                // a second, distinct sibling the single numbering pass never
+                // reaches.
+                let variant_host = self.intern_enum_variant_host(&root, &variant);
                 let _ = self.getuniqueclassdef(&variant_host);
             }
         }
@@ -1761,8 +1750,8 @@ impl Bookkeeper {
     /// `pairtype(SomeInstance, SomeInstance).improve` (binaryop.py:685)
     /// needs to narrow a `SomeInstance(base)` to `SomeInstance(variant)`.
     /// Identity is the canonical struct-root cache keyed by
-    /// `canonical_struct_name`; the base `enum_root` and the dotted
-    /// `enum_root.variant` path ([`Self::enum_variant_class_qualname`])
+    /// `canonical_struct_name`; the base `enum_root` and the
+    /// `canon_root::variant` path ([`Self::intern_enum_variant_host`])
     /// each normalise to one stable `HostObject`, so repeated calls
     /// return the same `Rc` — and the variant `Rc` is the very one the
     /// prologue pre-mint numbered.
@@ -3789,18 +3778,19 @@ mod tests {
         assert!(Rc::ptr_eq(&variant, &variant2), "variant identity stable");
 
         // The narrowing resolver, the prologue pre-mint, and the ctor arm
-        // must all intern ONE variant classdef.  A `::`-spelled variant
-        // would mint a second, distinct classdef that the single
+        // must all intern ONE variant classdef.  A `.`-vs-`::` split would
+        // mint a second, distinct classdef that the single
         // `assign_inheritance_ids` pass never reaches; assert the resolver
-        // returns the dotted-spelled (pre-mint / ctor) classdef.
-        let premint_base = bk.intern_class_by_qualname("Color");
-        let premint_host = bk.intern_class_by_qualname_with_bases("Color.Rgb", vec![premint_base]);
+        // returns the classdef the pre-mint / ctor obtain through the
+        // shared `intern_enum_variant_host` primitive (the `::`-qualified
+        // key).
+        let premint_host = bk.intern_enum_variant_host("Color", "Rgb");
         let premint = bk
             .getuniqueclassdef(&premint_host)
             .expect("pre-mint variant classdef");
         assert!(
             Rc::ptr_eq(&variant, &premint),
-            "narrowing variant must be the dotted-spelled pre-mint/ctor classdef"
+            "narrowing variant must be the pre-mint/ctor classdef from intern_enum_variant_host"
         );
 
         // The payoff: improve() narrows SomeInstance(base) to
