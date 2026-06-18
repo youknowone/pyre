@@ -3970,6 +3970,18 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
+                // `<String>::deref` / `<Vec<T>>::deref` (+ `deref_mut`) —
+                // identity in the lifted value model (String/&str and
+                // Vec/&[T] share one repr), so alias the destination to
+                // the receiver instead of emitting a `deref` method call
+                // the rtyper cannot route on the classdef-less receiver.
+                if args.len() == 1 && self.is_container_identity_deref(&reg) {
+                    self.local_var[dest_local] = Some(args[0].clone());
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
                 // Workspace `Index::index` / `IndexMut::index_mut`
                 // impls (`FixedObjectArray` and friends) bottom out at
                 // raw-slice construction (`as_mut_slice` →
@@ -4905,6 +4917,33 @@ impl<'a> Lowering<'a> {
             }
         }
         tyref_class_root(dest_ty, self.llbc)
+    }
+
+    /// `<String as Deref>::deref(&self) -> &str` / `<Vec<T> as
+    /// Deref>::deref(&self) -> &[T]` (and their `deref_mut`).  Unlike the
+    /// `Box`/`FrameBox` handles [`Self::deref_cast_root`] reinterprets as a
+    /// typed struct pointer, the owning-container deref returns the same
+    /// value the lifted model already carries: Rust `String`/`&str` both
+    /// lower to the immutable rpy_string and `Vec<T>`/`&[T]` both to the
+    /// rpy_list, so `*s` is identity.  `deref_cast_root` returns `None`
+    /// here (a `str`/slice target has no class root), so without this the
+    /// callsite falls through to a `CallTarget::Method` `deref` getattr the
+    /// rtyper cannot route on the classdef-less receiver.  Bind the
+    /// destination to the argument instead, the same alias shape as the
+    /// blanket-`into` identity above.
+    fn is_container_identity_deref(&self, reg: &RegularCall) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        let Some(fd) = self.llbc.fn_by_id(*id) else {
+            return false;
+        };
+        let np = fd.item_meta.name_path();
+        if !(np.ends_with("::deref") || np.ends_with("::deref_mut")) {
+            return false;
+        }
+        deref_impl_owner_leaf(self.llbc, fd)
+            .is_some_and(|leaf| matches!(leaf.as_str(), "String" | "Vec"))
     }
 
     /// The blanket `impl<I: Iterator> IntoIterator for I`
