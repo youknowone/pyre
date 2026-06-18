@@ -31,6 +31,13 @@ assert deque([1, 2, 3]) * 2 == deque([1, 2, 3, 1, 2, 3])
 
 assert deque([1, 2, 3], 4) * 2 == deque([3, 1, 2, 3])
 
+# Optional constructor args, including the `maxlen` keyword form.
+assert deque(maxlen=5).maxlen == 5
+assert deque().maxlen is None
+assert deque(maxlen=2) == deque([], 2)
+assert deque([1, 2, 3], maxlen=2) == deque([2, 3], 2)
+assert deque(maxlen=None) == deque()
+
 assert deque(maxlen=3) == deque()
 
 assert deque([1, 2, 3, 4], maxlen=2) == deque([3, 4])

@@ -258,6 +258,10 @@ fn unwrap_arg(idx: usize, pt: &PatType) -> syn::Result<(proc_macro2::TokenStream
         false
     };
     let argname = ident.to_string();
+    // An `Option<T>` parameter carries its own absence: `unwrap_expr` yields
+    // `None` for an out-of-range or PY_NULL slot, so the slot is optional and
+    // gets no missing-argument guard.
+    let is_optional = option_inner(ty).is_some();
     let expr = match arg_default(pt)? {
         // `bind_kwargs_to_signature` pads `args` to the parameter count
         // with PY_NULL, so the default only applies when the slot is both
@@ -265,7 +269,7 @@ fn unwrap_arg(idx: usize, pt: &PatType) -> syn::Result<(proc_macro2::TokenStream
         Some(default) => quote! {
             if #idx < args.len() && !args[#idx].is_null() { #unwrap } else { #default }
         },
-        None if is_whole_slice => unwrap,
+        None if is_whole_slice || is_optional => unwrap,
         None => quote! {
             {
                 if #idx >= args.len() || args[#idx].is_null() {
