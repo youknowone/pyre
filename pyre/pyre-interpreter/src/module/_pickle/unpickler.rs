@@ -188,6 +188,137 @@ impl W_Unpickler {
     fn del_persistent_load(&mut self) {
         self.w_persistent_load = pyre_object::PY_NULL;
     }
+
+    /// `Unpickler.memo` — a fresh `UnpicklerMemoProxy` viewing this unpickler's
+    /// memo (CPython hands back a new proxy on each access).
+    #[getter]
+    fn memo(&self) -> PyObjectRef {
+        let self_obj = self as *const W_Unpickler as PyObjectRef;
+        let _roots = pyre_object::gc_roots::push_roots();
+        pyre_object::gc_roots::pin_root(self_obj);
+        let slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+        memo_proxy::type_object();
+        let proxy = W_UnpicklerMemoProxy::allocate(W_UnpicklerMemoProxy {
+            ob: pyre_object::PyObject {
+                ob_type: std::ptr::null(),
+                w_class: std::ptr::null_mut(),
+            },
+            w_unpickler: pyre_object::PY_NULL,
+        });
+        // `allocate` may have relocated the unpickler; wire the (young) proxy to
+        // its post-collection address.
+        if let Some(px) = W_UnpicklerMemoProxy::from_obj(proxy) {
+            px.w_unpickler = pyre_object::gc_roots::shadow_stack_get(slot);
+        }
+        proxy
+    }
+
+    /// `Unpickler.memo` setter — an `UnpicklerMemoProxy` snapshots the source
+    /// unpickler's `{index: obj}` memo into this one. A plain dict assignment
+    /// validates its keys (non-negative integers) and then leaves the memo
+    /// empty: the entries are written into the memo that is replaced wholesale.
+    /// Any other type is a `TypeError`.
+    #[setter]
+    fn set_memo(&mut self, w_value: PyObjectRef) -> Result<(), PyError> {
+        let self_obj = self as *mut W_Unpickler as PyObjectRef;
+        let _roots = pyre_object::gc_roots::push_roots();
+        pyre_object::gc_roots::pin_root(self_obj);
+        let self_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+        if W_UnpicklerMemoProxy::from_obj(w_value).is_some() {
+            let w_dict = call_meth(w_value, "copy", &[])?;
+            pyre_object::gc_roots::pin_root(w_dict);
+            let dict_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+            let len = unsafe {
+                pyre_object::dictmultiobject::w_dict_len(pyre_object::gc_roots::shadow_stack_get(
+                    dict_slot,
+                ))
+            } as i64;
+            let me = unsafe {
+                &mut *(pyre_object::gc_roots::shadow_stack_get(self_slot) as *mut W_Unpickler)
+            };
+            me.w_memo = pyre_object::gc_roots::shadow_stack_get(dict_slot);
+            me.memo_index = len;
+        } else if unsafe { pyre_object::is_dict(w_value) } {
+            // Validate keys, then discard: a dict assignment yields an empty memo.
+            let items = unsafe { pyre_object::dictmultiobject::w_dict_items(w_value) };
+            for (k, _) in &items {
+                if !unsafe { pyre_object::is_int(*k) } {
+                    return Err(PyError::type_error("memo key must be integers"));
+                }
+                if crate::baseobjspace::int_w(*k)? < 0 {
+                    return Err(PyError::value_error("memo key must be positive integers."));
+                }
+            }
+            let empty = pyre_object::dictmultiobject::w_dict_new();
+            let me = unsafe {
+                &mut *(pyre_object::gc_roots::shadow_stack_get(self_slot) as *mut W_Unpickler)
+            };
+            me.w_memo = empty;
+            me.memo_index = 0;
+        } else {
+            return Err(PyError::type_error(format!(
+                "'memo' attribute must be an UnpicklerMemoProxy object or dict, not {}",
+                crate::baseobjspace::object_functionstr_type_name(w_value),
+            )));
+        }
+        Ok(())
+    }
+
+    /// `Unpickler.memo` is not deletable.
+    #[deleter("memo")]
+    fn del_memo(&self) -> Result<(), PyError> {
+        Err(PyError::type_error("attribute deletion is not supported"))
+    }
+}
+
+/// `interp_pickle.py UnpicklerMemoProxy` — a live view of an unpickler's
+/// index→object memo (a Python `dict`). `copy` snapshots it; `clear` resets it.
+///
+/// Held in its own module so `#[pyre_methods]` emits a `type_object()` that
+/// does not clash with `W_Unpickler`'s (each impl emits a module-scoped one).
+pub use memo_proxy::W_UnpicklerMemoProxy;
+
+mod memo_proxy {
+    use super::*;
+
+    #[crate::pyre_class("_pickle.UnpicklerMemoProxy")]
+    pub struct W_UnpicklerMemoProxy {
+        pub(super) w_unpickler: PyObjectRef,
+    }
+
+    #[crate::pyre_methods(doc = "Proxy for an Unpickler's memo.")]
+    impl W_UnpicklerMemoProxy {
+        /// `UnpicklerMemoProxy.copy` — a shallow `{index: obj}` copy of the memo.
+        fn copy(&self) -> Result<PyObjectRef, PyError> {
+            let w_unpickler = self.w_unpickler;
+            let w_memo = unsafe { &*(w_unpickler as *const W_Unpickler) }.w_memo;
+            if unsafe { pyre_object::is_none(w_memo) } {
+                return Ok(pyre_object::dictmultiobject::w_dict_new());
+            }
+            let _roots = pyre_object::gc_roots::push_roots();
+            pyre_object::gc_roots::pin_root(w_memo);
+            let slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+            Ok(unsafe {
+                pyre_object::dictmultiobject::w_dict_copy(pyre_object::gc_roots::shadow_stack_get(
+                    slot,
+                ))
+            })
+        }
+
+        /// `UnpicklerMemoProxy.clear` — empty the unpickler's memo.
+        fn clear(&self) {
+            let w_unpickler = self.w_unpickler;
+            let _roots = pyre_object::gc_roots::push_roots();
+            pyre_object::gc_roots::pin_root(w_unpickler);
+            let slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+            let empty = pyre_object::dictmultiobject::w_dict_new();
+            let u = unsafe {
+                &mut *(pyre_object::gc_roots::shadow_stack_get(slot) as *mut W_Unpickler)
+            };
+            u.w_memo = empty;
+            u.memo_index = 0;
+        }
+    }
 }
 
 /// Re-read the (possibly relocated) unpickler from the pinned shadow slot.
@@ -577,7 +708,10 @@ fn dispatch(slot: usize, opcode: u8) -> Result<(), PyError> {
             let w_list = top(slot, "APPENDS")?;
             match crate::baseobjspace::findattr(w_list, "extend") {
                 Some(extend) if !unsafe { pyre_object::is_none(extend) } => {
-                    call_fn(extend, &[pyre_object::gc_roots::shadow_stack_get(items_slot)])?;
+                    call_fn(
+                        extend,
+                        &[pyre_object::gc_roots::shadow_stack_get(items_slot)],
+                    )?;
                 }
                 _ => {
                     // PEP 307 requires extend(); fall back to append() for
@@ -635,12 +769,16 @@ fn dispatch(slot: usize, opcode: u8) -> Result<(), PyError> {
             if unsafe { pyre_object::setobject::is_set(w_set) } {
                 // `set.update(items)` dispatches through the (possibly
                 // overridden) method, matching `isinstance(set_obj, set)`.
-                call_meth(w_set, "update", &[pyre_object::gc_roots::shadow_stack_get(items_slot)])?;
+                call_meth(
+                    w_set,
+                    "update",
+                    &[pyre_object::gc_roots::shadow_stack_get(items_slot)],
+                )?;
             } else {
                 let n = unsafe {
-                    pyre_object::listobject::w_list_len(
-                        pyre_object::gc_roots::shadow_stack_get(items_slot),
-                    )
+                    pyre_object::listobject::w_list_len(pyre_object::gc_roots::shadow_stack_get(
+                        items_slot,
+                    ))
                 };
                 for i in 0..n {
                     let w_set = top(slot, "ADDITEMS")?;
@@ -672,7 +810,11 @@ fn dispatch(slot: usize, opcode: u8) -> Result<(), PyError> {
         x if x == op::GLOBAL => {
             let module = read_line(slot)?;
             let name = read_line(slot)?;
-            let v = call_find_class(slot, pyre_object::w_str_new(&module), pyre_object::w_str_new(&name))?;
+            let v = call_find_class(
+                slot,
+                pyre_object::w_str_new(&module),
+                pyre_object::w_str_new(&name),
+            )?;
             push(slot, v);
         }
         x if x == op::STACK_GLOBAL => {
@@ -789,8 +931,11 @@ fn dispatch(slot: usize, opcode: u8) -> Result<(), PyError> {
         x if x == op::INST => {
             let module = read_line(slot)?;
             let name = read_line(slot)?;
-            let w_cls =
-                call_find_class(slot, pyre_object::w_str_new(&module), pyre_object::w_str_new(&name))?;
+            let w_cls = call_find_class(
+                slot,
+                pyre_object::w_str_new(&module),
+                pyre_object::w_str_new(&name),
+            )?;
             let w_args = pop_mark(slot)?;
             let v = instantiate(w_cls, w_args)?;
             push(slot, v);
@@ -961,7 +1106,11 @@ fn get_extension(slot: usize, code: i64) -> Result<(), PyError> {
 fn decode_string(slot: usize, data: &[u8]) -> Result<PyObjectRef, PyError> {
     let (encoding, errors, as_bytes) = {
         let me = cur(slot);
-        (me.encoding.clone(), me.errors.clone(), me.encoding == "bytes")
+        (
+            me.encoding.clone(),
+            me.errors.clone(),
+            me.encoding == "bytes",
+        )
     };
     if as_bytes {
         return Ok(pyre_object::w_bytes_from_bytes(data));
@@ -983,13 +1132,12 @@ fn decode_string(slot: usize, data: &[u8]) -> Result<PyObjectRef, PyError> {
 
 /// Strip the matching outer quotes from a protocol-0 STRING argument.
 fn strip_string_quotes(line: &[u8]) -> Result<Vec<u8>, PyError> {
-    if line.len() >= 2
-        && line[0] == line[line.len() - 1]
-        && (line[0] == b'"' || line[0] == b'\'')
-    {
+    if line.len() >= 2 && line[0] == line[line.len() - 1] && (line[0] == b'"' || line[0] == b'\'') {
         Ok(line[1..line.len() - 1].to_vec())
     } else {
-        Err(unpickling_error("the STRING opcode argument must be quoted"))
+        Err(unpickling_error(
+            "the STRING opcode argument must be quoted",
+        ))
     }
 }
 
@@ -1015,7 +1163,7 @@ fn escape_decode(data: &[u8]) -> Result<Vec<u8>, PyError> {
         let e = data[i];
         i += 1;
         match e {
-            b'\n' => {}            // line continuation
+            b'\n' => {} // line continuation
             b'\\' => out.push(b'\\'),
             b'\'' => out.push(b'\''),
             b'"' => out.push(b'"'),

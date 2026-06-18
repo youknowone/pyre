@@ -360,6 +360,177 @@ impl W_Pickler {
     fn del_persistent_id(&mut self) {
         self.w_pers_func = pyre_object::PY_NULL;
     }
+
+    /// `Pickler.memo` — a fresh `PicklerMemoProxy` viewing this pickler's memo
+    /// (CPython hands back a new proxy on each access).
+    #[getter]
+    fn memo(&self) -> PyObjectRef {
+        let self_obj = self as *const W_Pickler as PyObjectRef;
+        let _roots = pyre_object::gc_roots::push_roots();
+        pyre_object::gc_roots::pin_root(self_obj);
+        let slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+        memo_proxy::type_object();
+        let proxy = W_PicklerMemoProxy::allocate(W_PicklerMemoProxy {
+            ob: pyre_object::PyObject {
+                ob_type: std::ptr::null(),
+                w_class: std::ptr::null_mut(),
+            },
+            w_pickler: pyre_object::PY_NULL,
+        });
+        // `allocate` may have relocated the pickler; wire the (young) proxy to
+        // its post-collection address.
+        if let Some(px) = W_PicklerMemoProxy::from_obj(proxy) {
+            px.w_pickler = pyre_object::gc_roots::shadow_stack_get(slot);
+        }
+        proxy
+    }
+
+    /// `Pickler.memo` setter — replace the memo from a `PicklerMemoProxy` or an
+    /// `{id: (index, obj)}` mapping; the object is restored at its `index`
+    /// position (the position-indexed memo list, from which the dump rebuilds
+    /// the identity index). Any other type is a `TypeError`.
+    #[setter]
+    fn set_memo(&mut self, w_value: PyObjectRef) -> Result<(), PyError> {
+        let self_obj = self as *mut W_Pickler as PyObjectRef;
+        let _roots = pyre_object::gc_roots::push_roots();
+        pyre_object::gc_roots::pin_root(self_obj);
+        let self_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+        let w_dict = if W_PicklerMemoProxy::from_obj(w_value).is_some() {
+            call_meth(w_value, "copy", &[])?
+        } else if unsafe { pyre_object::is_dict(w_value) } {
+            unsafe { pyre_object::dictmultiobject::w_dict_copy(w_value) }
+        } else {
+            return Err(PyError::type_error(format!(
+                "'memo' attribute must be a PicklerMemoProxy object or dict, not {}",
+                crate::baseobjspace::object_functionstr_type_name(w_value),
+            )));
+        };
+        pyre_object::gc_roots::pin_root(w_dict);
+        let dict_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+        // No GC between reading the items and `w_list_new` (which re-pins them).
+        let items = unsafe {
+            pyre_object::dictmultiobject::w_dict_items(pyre_object::gc_roots::shadow_stack_get(
+                dict_slot,
+            ))
+        };
+        let mut max_idx: i64 = -1;
+        for (_, tup) in &items {
+            if !(unsafe { pyre_object::is_tuple(*tup) }
+                && unsafe { pyre_object::tupleobject::w_tuple_len(*tup) } == 2)
+            {
+                return Err(PyError::type_error("'memo' values must be 2-item tuples"));
+            }
+            let idx = unsafe { pyre_object::tupleobject::w_tuple_getitem(*tup, 0) }.unwrap();
+            let i = crate::baseobjspace::int_w(idx)?;
+            if i > max_idx {
+                max_idx = i;
+            }
+        }
+        let mut slots: Vec<PyObjectRef> = vec![pyre_object::w_none(); (max_idx + 1) as usize];
+        for (_, tup) in &items {
+            let idx = unsafe { pyre_object::tupleobject::w_tuple_getitem(*tup, 0) }.unwrap();
+            let i = crate::baseobjspace::int_w(idx)? as usize;
+            slots[i] = unsafe { pyre_object::tupleobject::w_tuple_getitem(*tup, 1) }.unwrap();
+        }
+        let list = pyre_object::listobject::w_list_new(slots);
+        let me =
+            unsafe { &mut *(pyre_object::gc_roots::shadow_stack_get(self_slot) as *mut W_Pickler) };
+        me.w_memo = list;
+        Ok(())
+    }
+
+    /// `Pickler.memo` is not deletable.
+    #[deleter("memo")]
+    fn del_memo(&self) -> Result<(), PyError> {
+        Err(PyError::type_error("attribute deletion is not supported"))
+    }
+}
+
+/// `interp_pickle.py PicklerMemoProxy` — a live view of a pickler's identity
+/// memo. `copy` snapshots it as `{id(obj): (memo_index, obj)}`; `clear` empties
+/// it. The pickler stores the memo as a position-indexed Python `list` (see
+/// `PickleCtx`), so `copy` derives the `id` keys from the listed objects.
+///
+/// Held in its own module so `#[pyre_methods]` emits a `type_object()` that
+/// does not clash with `W_Pickler`'s (each impl emits a module-scoped one).
+pub use memo_proxy::W_PicklerMemoProxy;
+
+mod memo_proxy {
+    use super::*;
+
+    #[crate::pyre_class("_pickle.PicklerMemoProxy")]
+    pub struct W_PicklerMemoProxy {
+        pub(super) w_pickler: PyObjectRef,
+    }
+
+    #[crate::pyre_methods(doc = "Proxy for a Pickler's memo.")]
+    impl W_PicklerMemoProxy {
+        /// `PicklerMemoProxy.copy` — `{id(obj): (memo_index, obj)}`.
+        fn copy(&self) -> Result<PyObjectRef, PyError> {
+            let w_memo = unsafe { &*(self.w_pickler as *const W_Pickler) }.w_memo;
+            let _roots = pyre_object::gc_roots::push_roots();
+            pyre_object::gc_roots::pin_root(w_memo);
+            let memo_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+            let result = pyre_object::dictmultiobject::w_dict_new();
+            pyre_object::gc_roots::pin_root(result);
+            let res_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+            let n = unsafe {
+                pyre_object::listobject::w_list_len(pyre_object::gc_roots::shadow_stack_get(
+                    memo_slot,
+                ))
+            };
+            for i in 0..n {
+                let _it = pyre_object::gc_roots::push_roots();
+                let obj = unsafe {
+                    pyre_object::listobject::w_list_getitem(
+                        pyre_object::gc_roots::shadow_stack_get(memo_slot),
+                        i as i64,
+                    )
+                }
+                .unwrap();
+                // `(index, obj)` — `w_tuple_new` pins its inputs across the malloc.
+                let tup = pyre_object::tupleobject::w_tuple_new(vec![
+                    pyre_object::w_int_new(i as i64),
+                    obj,
+                ]);
+                pyre_object::gc_roots::pin_root(tup);
+                let tup_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+                // id(obj) read from the (relocated) tuple element.
+                let cur_obj = unsafe {
+                    pyre_object::tupleobject::w_tuple_getitem(
+                        pyre_object::gc_roots::shadow_stack_get(tup_slot),
+                        1,
+                    )
+                }
+                .unwrap();
+                let key = pyre_object::w_int_new(cur_obj as i64);
+                pyre_object::gc_roots::pin_root(key);
+                let key_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+                // The IndexMap insert allocates via `std::alloc` (no collection), so
+                // the freshly read addresses stay valid through it.
+                unsafe {
+                    pyre_object::dictmultiobject::w_dict_store(
+                        pyre_object::gc_roots::shadow_stack_get(res_slot),
+                        pyre_object::gc_roots::shadow_stack_get(key_slot),
+                        pyre_object::gc_roots::shadow_stack_get(tup_slot),
+                    );
+                }
+            }
+            Ok(pyre_object::gc_roots::shadow_stack_get(res_slot))
+        }
+
+        /// `PicklerMemoProxy.clear` — empty the pickler's memo.
+        fn clear(&self) {
+            let w_pickler = self.w_pickler;
+            let _roots = pyre_object::gc_roots::push_roots();
+            pyre_object::gc_roots::pin_root(w_pickler);
+            let slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+            let empty = pyre_object::listobject::w_list_new(Vec::new());
+            let p =
+                unsafe { &mut *(pyre_object::gc_roots::shadow_stack_get(slot) as *mut W_Pickler) };
+            p.w_memo = empty;
+        }
+    }
 }
 
 /// `copyreg.dispatch_table`, or `PY_NULL` when `copyreg` is unavailable.
@@ -487,7 +658,10 @@ fn save(ctx: &mut PickleCtx, buf: &mut Framer, w_obj: PyObjectRef) -> Result<(),
         let _roots = pyre_object::gc_roots::push_roots();
         pyre_object::gc_roots::pin_root(w_obj);
         let slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-        let w_pid = call_fn(ctx.pers_func, &[pyre_object::gc_roots::shadow_stack_get(slot)])?;
+        let w_pid = call_fn(
+            ctx.pers_func,
+            &[pyre_object::gc_roots::shadow_stack_get(slot)],
+        )?;
         if !unsafe { pyre_object::is_none(w_pid) } {
             return save_pers(ctx, buf, w_pid);
         }
@@ -555,7 +729,12 @@ fn save_object(ctx: &mut PickleCtx, buf: &mut Framer, w_obj: PyObjectRef) -> Res
         &[pyre_object::gc_roots::shadow_stack_get(slot)],
     )?;
     if !unsafe { pyre_object::is_not_implemented(w_rv) } {
-        return save_reduce_value(ctx, buf, pyre_object::gc_roots::shadow_stack_get(slot), w_rv);
+        return save_reduce_value(
+            ctx,
+            buf,
+            pyre_object::gc_roots::shadow_stack_get(slot),
+            w_rv,
+        );
     }
     dispatch_save(ctx, buf, pyre_object::gc_roots::shadow_stack_get(slot))
 }

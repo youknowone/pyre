@@ -24,8 +24,8 @@ use crate::PyError;
 mod pickler;
 mod unpickler;
 
-pub use pickler::W_Pickler;
-pub use unpickler::W_Unpickler;
+pub use pickler::{W_Pickler, W_PicklerMemoProxy};
+pub use unpickler::{W_Unpickler, W_UnpicklerMemoProxy};
 
 pub(crate) const HIGHEST_PROTOCOL: i64 = 5;
 pub(crate) const DEFAULT_PROTOCOL: i64 = 5;
