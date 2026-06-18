@@ -8561,6 +8561,30 @@ impl MIFrame {
             return Ok(Some(pyre_interpreter::StepResult::Continue));
         }
 
+        // RETURN_VALUE — the root portal exit.  Unlike every hook above it
+        // propagates a control-flow `StepResult::Return`, NOT `Continue`.
+        // The opcode records no IR itself: `return_value` (the default
+        // `OpcodeStepExecutor::return_value`, which MIFrame does not override)
+        // is `pop_value` + `finish_value` -> `StepResult::Return(value)`; the
+        // `Finish` + `ensure_boxed_for_ca` + `store_token_in_vable` are
+        // emitted post-dispatch in `trace_step_result_to_action`'s Return
+        // arm, reached identically by both legs.  It CANNOT go via the arm
+        // walk: the arm's `ref_return/r` surfaces as
+        // `DispatchOutcome::SubReturn` (`is_top_level=false`), the wrong shape
+        // for a root return.  The entry hook propagates the Return verbatim
+        // (`dispatch_via_walker_for_opcode` returns it unchanged).  It records
+        // no guard and is in neither `instruction_may_raise` nor
+        // `instruction_needs_pre_opcode_snapshot`, so there is no
+        // dispatch-leg-dependent snapshot; the dispatch gate routes
+        // inline-frame ReturnValue to the trait leg, so only the root
+        // portal-exit case is flipped.
+        if matches!(instruction, Instruction::ReturnValue) {
+            use pyre_interpreter::OpcodeStepExecutor;
+            let _ = op_arg;
+            let step = OpcodeStepExecutor::return_value(self)?;
+            return Ok(Some(step));
+        }
+
         Ok(None)
     }
 
@@ -9869,6 +9893,15 @@ pub fn production_walker_handles(instruction: &Instruction) -> bool {
             // `InlineCallArityMismatch` on inlined tuples.
             | Instruction::BuildTuple { .. }
             | Instruction::UnpackSequence { .. }
+            // ReturnValue — the root portal exit, handled by the entry hook
+            // (NOT the arm walk, whose ref_return/r surfaces as SubReturn,
+            // the wrong shape for a root return).  The hook propagates the
+            // default OpcodeStepExecutor::return_value's StepResult::Return
+            // verbatim; the Finish is emitted post-dispatch in
+            // trace_step_result_to_action's Return arm on both legs.  Records
+            // no guard; the dispatch gate keeps inline-frame ReturnValue on
+            // the trait leg, so only the root exit is flipped.
+            | Instruction::ReturnValue
             // StoreFastStoreFast handled by the
             // dispatch_via_walker_for_opcode entry hook, delegating to the
             // symbolic `OpcodeStepExecutor::store_fast_store_fast` (the arm
