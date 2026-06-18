@@ -1,7 +1,7 @@
 {
   "modules": {
     "test.test___all__": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test__colorize": {
       "dynasm": "IMPORTERROR"
@@ -16,10 +16,10 @@
       "dynasm": "IMPORTERROR"
     },
     "test.test__opcode": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test__osx_support": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_abc": {
       "dynasm": "CRASH"
@@ -49,7 +49,7 @@
       "dynasm": "IMPORTERROR"
     },
     "test.test_asyncgen": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "CRASH"
     },
     "test.test_asyncio": {
       "dynasm": "IMPORTERROR"
@@ -67,19 +67,19 @@
       "dynasm": "IMPORTERROR"
     },
     "test.test_baseexception": {
-      "dynasm": "PASS"
+      "dynasm": "CRASH"
     },
     "test.test_bdb": {
       "dynasm": "IMPORTERROR"
     },
     "test.test_bigaddrspace": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_bigmem": {
       "dynasm": "IMPORTERROR"
     },
     "test.test_binascii": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_binop": {
       "dynasm": "PASS"
@@ -88,13 +88,13 @@
       "dynasm": "IMPORTERROR"
     },
     "test.test_bool": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_buffer": {
       "dynasm": "IMPORTERROR"
     },
     "test.test_bufio": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_build_details": {
       "dynasm": "IMPORTERROR"
@@ -115,7 +115,7 @@
       "dynasm": "IMPORTERROR"
     },
     "test.test_call": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_capi": {
       "dynasm": "SKIP",
@@ -193,7 +193,7 @@
       "dynasm": "IMPORTERROR"
     },
     "test.test_codeop": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_collections": {
       "dynasm": "IMPORTERROR"
@@ -202,7 +202,7 @@
       "dynasm": "PASS"
     },
     "test.test_compare": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_compile": {
       "dynasm": "IMPORTERROR"
@@ -211,10 +211,10 @@
       "dynasm": "IMPORTERROR"
     },
     "test.test_compiler_assemble": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_compiler_codegen": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_complex": {
       "dynasm": "IMPORTERROR"
@@ -223,22 +223,22 @@
       "dynasm": "IMPORTERROR"
     },
     "test.test_configparser": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "CRASH"
     },
     "test.test_contains": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_context": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_contextlib": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "CRASH"
     },
     "test.test_contextlib_async": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_copy": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "CRASH"
     },
     "test.test_copyreg": {
       "dynasm": "IMPORTERROR"
@@ -260,7 +260,7 @@
       "dynasm": "IMPORTERROR"
     },
     "test.test_ctypes": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "CRASH"
     },
     "test.test_curses": {
       "dynasm": "IMPORTERROR"
@@ -275,16 +275,16 @@
       "dynasm": "IMPORTERROR"
     },
     "test.test_dbm_dumb": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_dbm_gnu": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "CRASH"
     },
     "test.test_dbm_ndbm": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "CRASH"
     },
     "test.test_dbm_sqlite3": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "CRASH"
     },
     "test.test_decimal": {
       "dynasm": "IMPORTERROR"
@@ -293,7 +293,7 @@
       "dynasm": "PASS"
     },
     "test.test_defaultdict": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_deque": {
       "dynasm": "IMPORTERROR"
@@ -308,13 +308,13 @@
       "dynasm": "IMPORTERROR"
     },
     "test.test_dict": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "CRASH"
     },
     "test.test_dictcomps": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_dictviews": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "CRASH"
     },
     "test.test_difflib": {
       "dynasm": "IMPORTERROR"
@@ -333,7 +333,7 @@
       "dynasm": "IMPORTERROR"
     },
     "test.test_dynamic": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_dynamicclassattribute": {
       "dynasm": "PASS"
@@ -367,10 +367,10 @@
       "dynasm": "PASS"
     },
     "test.test_except_star": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_exception_group": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_exception_hierarchy": {
       "dynasm": "IMPORTERROR"
@@ -394,13 +394,13 @@
       "dynasm": "IMPORTERROR"
     },
     "test.test_file": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "CRASH"
     },
     "test.test_file_eintr": {
       "dynasm": "IMPORTERROR"
     },
     "test.test_filecmp": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_fileinput": {
       "dynasm": "IMPORTERROR"
@@ -412,7 +412,7 @@
       "dynasm": "IMPORTERROR"
     },
     "test.test_finalization": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "CRASH"
     },
     "test.test_float": {
       "dynasm": "IMPORTERROR"
@@ -427,7 +427,7 @@
       "dynasm": "IMPORTERROR"
     },
     "test.test_format": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "CRASH"
     },
     "test.test_fractions": {
       "dynasm": "IMPORTERROR"
@@ -478,7 +478,7 @@
       "dynasm": "IMPORTERROR"
     },
     "test.test_genericclass": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_genericpath": {
       "dynasm": "IMPORTERROR"
@@ -499,10 +499,10 @@
       "dynasm": "IMPORTERROR"
     },
     "test.test_glob": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_global": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_grammar": {
       "dynasm": "IMPORTERROR"
@@ -511,7 +511,7 @@
       "dynasm": "IMPORTERROR"
     },
     "test.test_grp": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_gzip": {
       "dynasm": "IMPORTERROR"
@@ -560,7 +560,7 @@
       "dynasm": "IMPORTERROR"
     },
     "test.test_index": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_inspect": {
       "dynasm": "IMPORTERROR"
@@ -578,16 +578,16 @@
       "dynasm": "IMPORTERROR"
     },
     "test.test_ioctl": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_ipaddress": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_isinstance": {
       "dynasm": "IMPORTERROR"
     },
     "test.test_iter": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "TIMEOUT"
     },
     "test.test_iterlen": {
       "dynasm": "PASS"
@@ -605,7 +605,7 @@
       "dynasm": "PASS"
     },
     "test.test_kqueue": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_largefile": {
       "dynasm": "SKIP",
@@ -633,7 +633,7 @@
       "dynasm": "IMPORTERROR"
     },
     "test.test_long": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_longexp": {
       "dynasm": "PASS"
@@ -648,10 +648,10 @@
       "dynasm": "IMPORTERROR"
     },
     "test.test_math": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_math_property": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_memoryio": {
       "dynasm": "IMPORTERROR"
@@ -702,13 +702,13 @@
       "dynasm": "PASS"
     },
     "test.test_netrc": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_ntpath": {
       "dynasm": "IMPORTERROR"
     },
     "test.test_nturl2path": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "CRASH"
     },
     "test.test_numeric_tower": {
       "dynasm": "PASS"
@@ -770,7 +770,7 @@
       "dynasm": "IMPORTERROR"
     },
     "test.test_picklebuffer": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_pickletools": {
       "dynasm": "IMPORTERROR"
@@ -791,13 +791,13 @@
       "dynasm": "IMPORTERROR"
     },
     "test.test_popen": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_poplib": {
       "dynasm": "IMPORTERROR"
     },
     "test.test_positional_only_arg": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_posix": {
       "dynasm": "IMPORTERROR"
@@ -809,34 +809,34 @@
       "dynasm": "PASS"
     },
     "test.test_pprint": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "TIMEOUT"
     },
     "test.test_print": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "CRASH"
     },
     "test.test_profile": {
       "dynasm": "IMPORTERROR"
     },
     "test.test_property": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_pstats": {
       "dynasm": "IMPORTERROR"
     },
     "test.test_pty": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "TIMEOUT"
     },
     "test.test_pulldom": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_pwd": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_py_compile": {
       "dynasm": "IMPORTERROR"
     },
     "test.test_pyclbr": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_pydoc": {
       "dynasm": "IMPORTERROR"
@@ -848,22 +848,22 @@
       "dynasm": "IMPORTERROR"
     },
     "test.test_queue": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_quopri": {
       "dynasm": "IMPORTERROR"
     },
     "test.test_raise": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_random": {
       "dynasm": "IMPORTERROR"
     },
     "test.test_range": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "CRASH"
     },
     "test.test_re": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_readline": {
       "dynasm": "IMPORTERROR"
@@ -878,7 +878,7 @@
       "dynasm": "IMPORTERROR"
     },
     "test.test_reprlib": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_resource": {
       "dynasm": "IMPORTERROR"
@@ -899,10 +899,10 @@
       "dynasm": "IMPORTERROR"
     },
     "test.test_sched": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_scope": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "CRASH"
     },
     "test.test_script_helper": {
       "dynasm": "IMPORTERROR"
@@ -917,7 +917,7 @@
       "dynasm": "IMPORTERROR"
     },
     "test.test_set": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "CRASH"
     },
     "test.test_setcomps": {
       "dynasm": "IMPORTERROR"
@@ -926,7 +926,7 @@
       "dynasm": "IMPORTERROR"
     },
     "test.test_shlex": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_shutil": {
       "dynasm": "IMPORTERROR"
@@ -938,7 +938,7 @@
       "dynasm": "IMPORTERROR"
     },
     "test.test_slice": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "CRASH"
     },
     "test.test_smtplib": {
       "dynasm": "IMPORTERROR"
@@ -953,7 +953,7 @@
       "dynasm": "IMPORTERROR"
     },
     "test.test_sort": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "CRASH"
     },
     "test.test_source_encoding": {
       "dynasm": "IMPORTERROR"
@@ -1011,7 +1011,7 @@
       "dynasm": "IMPORTERROR"
     },
     "test.test_sundry": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_super": {
       "dynasm": "IMPORTERROR"
@@ -1040,7 +1040,7 @@
       "dynasm": "IMPORTERROR"
     },
     "test.test_syslog": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "CRASH"
     },
     "test.test_tabnanny": {
       "dynasm": "IMPORTERROR"
@@ -1055,7 +1055,7 @@
       "dynasm": "IMPORTERROR"
     },
     "test.test_termios": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_textwrap": {
       "dynasm": "PASS"
@@ -1067,7 +1067,7 @@
       "dynasm": "IMPORTERROR"
     },
     "test.test_threadedtempfile": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_threading": {
       "dynasm": "IMPORTERROR"
@@ -1082,7 +1082,7 @@
       "dynasm": "IMPORTERROR"
     },
     "test.test_timeit": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_timeout": {
       "dynasm": "IMPORTERROR"
@@ -1120,10 +1120,10 @@
       "dynasm": "IMPORTERROR"
     },
     "test.test_tty": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "CRASH"
     },
     "test.test_tuple": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "CRASH"
     },
     "test.test_turtle": {
       "dynasm": "IMPORTERROR"
@@ -1132,13 +1132,13 @@
       "dynasm": "IMPORTERROR"
     },
     "test.test_type_annotations": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_type_cache": {
       "dynasm": "IMPORTERROR"
     },
     "test.test_type_comments": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_type_params": {
       "dynasm": "IMPORTERROR"
@@ -1159,10 +1159,10 @@
       "dynasm": "PASS"
     },
     "test.test_unicode_file": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_unicode_file_functions": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_unicode_identifiers": {
       "dynasm": "PASS"
@@ -1198,22 +1198,22 @@
       "dynasm": "IMPORTERROR"
     },
     "test.test_urllib_response": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_urllibnet": {
       "dynasm": "IMPORTERROR"
     },
     "test.test_urlparse": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_userdict": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "CRASH"
     },
     "test.test_userlist": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "CRASH"
     },
     "test.test_userstring": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_utf8_mode": {
       "dynasm": "IMPORTERROR"
@@ -1243,7 +1243,7 @@
       "dynasm": "IMPORTERROR"
     },
     "test.test_weakset": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "CRASH"
     },
     "test.test_webbrowser": {
       "dynasm": "IMPORTERROR"
@@ -1271,7 +1271,7 @@
       "dynasm": "IMPORTERROR"
     },
     "test.test_xml_dom_minicompat": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_xml_dom_xmlbuilder": {
       "dynasm": "IMPORTERROR"
@@ -1295,7 +1295,7 @@
       "dynasm": "IMPORTERROR"
     },
     "test.test_yield_from": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "CRASH"
     },
     "test.test_zipapp": {
       "dynasm": "IMPORTERROR"
