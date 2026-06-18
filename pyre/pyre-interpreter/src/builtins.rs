@@ -4283,19 +4283,30 @@ fn exec_or_eval(
             }
         }
 
-        /// Restore the user dict's pre-exec proxy and clear the temp
-        /// storage's `mirror_target`.  Idempotent.  Called via `Drop`
-        /// on every exit path including `?` early-returns and
-        /// panic-unwinds.
+        /// Tear down the forward proxy / back-mirror — but only when we do
+        /// NOT own a temp storage.
+        ///
+        /// For a fresh user dict the temp `DictStorage` is leaked (`Drop`)
+        /// and must stay attached as the dict's `dict_storage_proxy` with
+        /// its `mirror_target` intact: functions defined during the run
+        /// capture the user dict OBJECT as `__globals__`, and
+        /// `get_w_globals()` recovers their raw storage through that proxy.
+        /// Restoring the pre-exec (typically null) proxy or clearing the
+        /// mirror would orphan the leaked temp and resolve a captured
+        /// function's globals to a null raw.  So the owned case persists.
+        ///
+        /// The reuse path (existing proxy) and the empty binding own no
+        /// temp and never swapped a proxy, so there is nothing to undo.
+        /// Idempotent; called explicitly after the run and again on `Drop`.
         unsafe fn detach(&mut self) {
+            if self.owned.is_some() {
+                return;
+            }
             unsafe {
                 if self.proxy_attached {
                     pyre_object::w_dict_set_dict_storage_proxy(self.backing, self.saved_proxy);
                     self.proxy_attached = false;
                     self.saved_proxy = std::ptr::null_mut();
-                }
-                if let Some(storage) = self.owned.as_deref_mut() {
-                    storage.set_mirror_target(pyre_object::PY_NULL);
                 }
             }
         }
@@ -4311,18 +4322,19 @@ fn exec_or_eval(
             // `pypy/interpreter/pyopcode.py:771-776 EXEC_STMT` runs the
             // frame on the user-supplied dict directly — there is no
             // temp storage to release because the dict object IS the
-            // canonical store.  Pyre's pre-Phase-5-cutover model
-            // allocates a temp `DictStorage` and mirrors writes back
-            // into the user dict via `mirror_target`; functions defined
-            // during `exec` capture `w_func_globals = temp_storage_ptr`,
-            // so dropping the `Box<DictStorage>` here would dangle the
-            // captures and surface as a use-after-free on the next
-            // `g["reader"]()` invocation.  Leak the Box until the full
-            // `LegacyGlobalsBox` retirement lands (remaining
-            // slice — frame.w_globals becomes a PyObjectRef so the
-            // captured globals identity IS the backing dict and no
-            // temp is needed).  Memory cost is one DictStorage per
-            // exec invocation, which is bounded by program lifetime.
+            // canonical store.  Pyre allocates a temp `DictStorage` and
+            // mirrors writes back into the user dict via `mirror_target`.
+            // Functions defined during `exec` capture the user dict
+            // OBJECT as `__globals__`; `get_w_globals()` recovers their
+            // raw storage through the dict's `dict_storage_proxy`, which
+            // points at this temp.  `detach()` therefore leaves the proxy
+            // and mirror attached for the owned case, and the Box is
+            // leaked here so the proxy never dangles — dropping it would
+            // surface as a use-after-free (or, post-cutover, a null raw
+            // and a JIT-resume null deref) on the next `g["reader"]()`.
+            // Leak persists until exec runs on the dict object directly
+            // and no temp is needed.  Memory cost is one DictStorage per
+            // exec invocation, bounded by program lifetime.
             if let Some(storage) = self.owned.take() {
                 let _ = Box::into_raw(storage);
             }
