@@ -312,9 +312,7 @@ impl UnrollOptimizer {
                     for sb in boxes {
                         if let Some(majit_ir::Value::Ref(gcref)) = sb.opref_box.const_value() {
                             if !gcref.is_null() {
-                                slots.push(
-                                    (&sb.opref_box as *const BoxRef) as usize,
-                                );
+                                slots.push((&sb.opref_box as *const BoxRef) as usize);
                             }
                         }
                     }
@@ -714,6 +712,7 @@ impl UnrollOptimizer {
                             short_preamble: None,
                             renamed_inputargs: state.renamed_inputargs.clone(),
                             short_inputargs: Vec::new(),
+                            short_label_args: Vec::new(),
                             runtime_boxes: Vec::new(),
                             patchguardop: None,
                             phase1_emit_high_water: self.next_global_opref,
@@ -1130,6 +1129,7 @@ impl UnrollOptimizer {
             exported_vs,
             exported_end_args,
             exported_short_inputargs,
+            exported_short_label_args,
             exported_short_boxes_produced,
             exported_renamed_inputargs,
             exported_runtime_boxes,
@@ -1142,6 +1142,7 @@ impl UnrollOptimizer {
                 es.virtual_state.clone(),
                 es.end_args.iter().map(|b| b.to_opref()).collect::<Vec<_>>(),
                 es.short_inputargs.clone(),
+                es.short_label_args.clone(),
                 es.short_boxes.clone(),
                 es.renamed_inputargs
                     .iter()
@@ -1306,20 +1307,57 @@ impl UnrollOptimizer {
                 &exported_short_boxes_produced,
             )
         });
-        // shortpreamble.py:414-425 parity: store PtrInfo for each inputarg.
-        // In RPython, preamble_op.set_forwarded(info) attaches PtrInfo to
-        // the short_inputarg Box. In majit, we extract from Phase 2 final_ctx
-        // so inline_short_preamble can propagate to jump_args.
+        // shortpreamble.py:416-425 parity: attach PtrInfo to each short
+        // inputarg. RPython keys the info by the ORIGINAL res box
+        // (`op = produced_op.short_op.res; info = exported_infos.get(op)`)
+        // and forwards it onto the renamed `preamble_op`. The renamed short
+        // inputarg carries no PtrInfo of its own, so the lookup MUST use the
+        // original `short_label_args[i]` (paired 1:1 with `short_inputargs[i]`),
+        // not the renamed box — otherwise a distinct renamed identity yields
+        // None and the loop-carried info (e.g. KnownClass) is dropped.
         if let Some(ref final_ctx) = opt_p2.final_ctx {
+            debug_assert_eq!(
+                initial_sp.inputargs.len(),
+                exported_short_label_args.len(),
+                "short_inputargs must pair 1:1 with short_label_args for info carry"
+            );
             let mut infos = Vec::with_capacity(initial_sp.inputargs.len());
-            for inputarg in &initial_sp.inputargs {
-                let info = final_ctx
-                    .resolve_box_box_opt(inputarg)
+            for (i, inputarg) in initial_sp.inputargs.iter().enumerate() {
+                // Phase-2 info of the original box this short inputarg renames.
+                let original = exported_short_label_args.get(i).copied();
+                let info = original
+                    .and_then(|o| final_ctx.get_box_replacement_box(o))
+                    .or_else(|| final_ctx.resolve_box_box_opt(inputarg))
                     .as_ref()
                     .and_then(|b| final_ctx.peek_ptr_info(b));
                 infos.push(info);
             }
             initial_sp.inputarg_infos = infos;
+        }
+        // shortpreamble.py:255-259 renamed-short_inputargs: the short-preamble
+        // Label is the renamed `short_inputargs`, but use_box guards still
+        // reference the ORIGINAL Phase-1 label args (`short_label_args`) because
+        // pyre keeps disjoint Phase-1/Phase-2 box namespaces. Seed
+        // `phase1_inputargs` with the originals (paired 1:1 with the renamed
+        // Label / jump_args) so inline_short_preamble (unroll.rs:3691) maps an
+        // original-referencing guard arg to its jump_arg. Mirrors the existing
+        // phase1_inputargs adaptation; no-op when the Label already IS the
+        // originals (the two box sets coincide).
+        if initial_sp.phase1_inputargs.is_none()
+            && initial_sp.inputargs.len() == exported_short_label_args.len()
+        {
+            let differs = exported_short_label_args
+                .iter()
+                .zip(initial_sp.inputargs.iter())
+                .any(|(orig, label)| *orig != label.to_opref());
+            if differs {
+                initial_sp.phase1_inputargs = Some(
+                    exported_short_label_args
+                        .iter()
+                        .map(|&o| BoxRef::from_opref(o))
+                        .collect(),
+                );
+            }
         }
         let opt_unroll = OptUnroll::new();
         let target_token = opt_unroll.finalize_short_preamble(
@@ -1941,6 +1979,14 @@ pub struct ExportedState {
     /// objects themselves (shortpreamble.py:430 / unroll.py:480), shared
     /// with the renamed operands inside `short_boxes`.
     pub short_inputargs: Vec<crate::r#box::BoxRef>,
+    /// The ORIGINAL `label_args + virtuals` oprefs that `short_inputargs[i]`
+    /// renames (`shortpreamble.py:256 box = label_args[i]`). pyre stores
+    /// these explicitly because the renamed `short_inputargs[i]` no longer
+    /// carries the original identity; the exported short boxes reference
+    /// original positions and are renamed to `short_inputargs[i]` at import,
+    /// and the Phase-2 `result_map` slot lookup resolves a short-box key
+    /// (an original position) to its slot through this list.
+    pub short_label_args: Vec<OpRef>,
     /// unroll.py: runtime_boxes — live values at the original jump point.
     /// Threaded into Phase 2 import as `runtime_boxes` for guard generation.
     /// Default `Vec::new()` until the export site populates it; callers
@@ -2030,14 +2076,27 @@ impl ExportedState {
         exported_short_boxes: Vec<crate::optimizeopt::shortpreamble::PreambleOp>,
         renamed_inputargs: Vec<OpRef>,
         short_inputargs: Vec<crate::r#box::BoxRef>,
+        short_label_args: Vec<OpRef>,
     ) -> Self {
         // unroll.py:466-477 `sb.create_short_boxes(...)` parity: pyre
         // pre-derives the per-OpRef ProducedShortOp view (with label-arg
         // refs renamed to short-inputarg slots) and stores it directly,
         // matching RPython's `ExportedState.short_boxes`.
+        //
+        // The rename source is `short_label_args` (= label_args + virtuals),
+        // the full list `short_inputargs[i]` corresponds to — NOT `end_args`
+        // (label args only). Exported ops can reference a virtual position
+        // through a ShortInputArg dependency, so virtuals must rename too
+        // (`shortpreamble.py:255-259` registers every `label_args + virtuals`
+        // entry as a ShortInputArg).
+        debug_assert_eq!(
+            short_label_args.len(),
+            short_inputargs.len(),
+            "short_label_args must pair 1:1 with short_inputargs"
+        );
         let short_boxes =
             crate::optimizeopt::shortpreamble::produced_short_boxes_from_exported_boxes(
-                &end_args,
+                &short_label_args,
                 &short_inputargs,
                 &exported_short_boxes,
             );
@@ -2059,6 +2118,7 @@ impl ExportedState {
                 .map(|&a| BoxRef::from_opref(a))
                 .collect(),
             short_inputargs,
+            short_label_args,
             runtime_boxes: Vec::new(),
             patchguardop: None,
             phase1_emit_high_water: 0,
@@ -2187,6 +2247,12 @@ impl ExportedState {
         for arg in &self.short_inputargs {
             arg.walk_const_ptr_refs(visitor);
         }
+        // short_label_args are original label/virtual positions (op/inputarg
+        // kinds, never ConstPtr), so visit_opref is a no-op; walked for
+        // completeness and forward-compatibility.
+        for arg in &mut self.short_label_args {
+            visit_opref(arg, visitor);
+        }
         visit_boxrefs(&self.runtime_boxes, visitor);
         if let Some(patchguardop) = self.patchguardop.as_ref() {
             visit_op(patchguardop, visitor);
@@ -2240,6 +2306,9 @@ impl ExportedState {
         }
         for arg in &self.short_inputargs {
             visit(arg.to_opref());
+        }
+        for &arg in &self.short_label_args {
+            visit(arg);
         }
         for arg in &self.runtime_boxes {
             visit(arg.to_opref());
@@ -2580,6 +2649,7 @@ impl Clone for ExportedState {
             short_preamble: self.short_preamble.clone(),
             renamed_inputargs: self.renamed_inputargs.clone(),
             short_inputargs: self.short_inputargs.clone(),
+            short_label_args: self.short_label_args.clone(),
             runtime_boxes: self.runtime_boxes.clone(),
             patchguardop: self.patchguardop.clone(),
             phase1_emit_high_water: self.phase1_emit_high_water,
@@ -2908,18 +2978,25 @@ impl OptUnroll {
         // back to the local recompute.
         let short_inputargs: Vec<crate::r#box::BoxRef> = if ctx.exported_short_inputargs.is_empty()
         {
+            // No preview pass ran (test ExportedState setups): mint the fresh
+            // renamed InputArg boxes directly, mirroring `add_short_input_arg`
+            // (shortpreamble.py:257 `OpHelpers.inputarg_from_tp(box.type)`).
+            // Each is DISTINCT from its `short_args[i]` original so the rename
+            // is a real rename, not an identity no-op.
             short_args
                 .iter()
-                .map(|&a| crate::r#box::BoxRef::from_opref(a))
+                .map(|&a| {
+                    let ty = a.ty().unwrap_or_else(|| {
+                        panic!("short preamble inputarg {a:?} has no value type")
+                    });
+                    crate::r#box::BoxRef::new_inputarg(ty, ctx.alloc_op_position_typed(ty).raw())
+                })
                 .collect()
         } else {
             debug_assert_eq!(
-                ctx.exported_short_inputargs
-                    .iter()
-                    .map(|b| b.to_opref())
-                    .collect::<Vec<_>>(),
-                short_args,
-                "preview-pass create_short_inputargs diverged from the \
+                ctx.exported_short_inputargs.len(),
+                short_args.len(),
+                "preview-pass create_short_inputargs length diverged from the \
                      export-site label_args + virtuals recompute"
             );
             ctx.exported_short_inputargs.clone()
@@ -2945,7 +3022,7 @@ impl OptUnroll {
         // PyPy never carries into `short_boxes`, polluting the dict.
         let short_boxes_for_info =
             crate::optimizeopt::shortpreamble::produced_short_boxes_from_exported_boxes(
-                &label_args,
+                &short_args,
                 &short_inputargs,
                 &exported_short_boxes,
             );
@@ -2991,6 +3068,10 @@ impl OptUnroll {
             exported_short_boxes,
             renamed_inputargs.to_vec(),
             short_inputargs,
+            // shortpreamble.py:255-259 rename source = `label_args + virtuals`
+            // (the full list `short_inputargs` corresponds to), not label
+            // args alone — virtuals are registered as ShortInputArgs too.
+            short_args.clone(),
         );
         // `OptContext::next_pos` is the strict upper bound on raw OpRefs
         // Phase 1 allocated, including intermediates folded / forwarded
@@ -4034,10 +4115,14 @@ impl OptUnroll {
             let result = match produced.kind {
                 crate::optimizeopt::shortpreamble::PreambleOpKind::Pure
                 | crate::optimizeopt::shortpreamble::PreambleOpKind::LoopInvariant => {
+                    // `source` is the short-box key = an ORIGINAL label/virtual
+                    // position. Match it against `short_label_args` (originals);
+                    // `short_inputargs[slot]` is now a distinct renamed box and
+                    // would never equal `source`.
                     if let Some(slot) = exported_state
-                        .short_inputargs
+                        .short_label_args
                         .iter()
-                        .position(|arg| arg.to_opref() == *source)
+                        .position(|a| *a == *source)
                     {
                         short_args.get(slot).copied()
                     } else {
@@ -5521,6 +5606,7 @@ mod tests {
             Vec::new(),
             vec![OpRef::int_op(14)],
             vec![BoxRef::from_opref(OpRef::int_op(23))],
+            vec![OpRef::int_op(23)],
         );
 
         assert_eq!(exported.opref_high_water(), 110);
@@ -5766,6 +5852,7 @@ mod tests {
             }],
             vec![old_ref],
             vec![BoxRef::from_opref(old_ref)],
+            vec![old_ref],
         );
         state.short_boxes.push((
             old_ref,
@@ -6752,6 +6839,7 @@ mod tests {
             }],
             Vec::new(),
             vec![BoxRef::from_opref(source)],
+            vec![source],
         );
         let mut ctx = crate::optimizeopt::OptContext::with_inputarg_types(
             8,

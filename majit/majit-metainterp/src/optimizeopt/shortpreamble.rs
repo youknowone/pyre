@@ -466,10 +466,20 @@ pub struct ShortBoxes {
     /// shortpreamble.py:256 `renamed = OpHelpers.inputarg_from_tp(box.type)`
     /// mints a fresh producer-less InputArg box per label slot; the stored
     /// boxes ARE the short preamble's Label args (shortpreamble.py:443).
-    /// pyre keeps the renamed box on the label arg's position (the rename
-    /// is positional), so each entry is a fresh position-only box minted
-    /// once here and compared by position.
+    /// Each entry is a fresh InputArg box whose position is allocated from
+    /// the op-position counter (`alloc_op_position_typed`), so its identity
+    /// is DISTINCT from the original label arg (`shortpreamble.py:257`
+    /// `ShortInputArg(box, renamed)` — `box` and `renamed` are two objects).
+    /// `short_inputargs[i]` corresponds to `label_args[i]` positionally.
     short_inputargs: Vec<BoxRef>,
+    /// shortpreamble.py:256 `box = label_args[i]` — the ORIGINAL label-arg
+    /// references, kept so `potential_ops`/lookups resolve a label arg by
+    /// its own opref (`shortpreamble.py:259 potential_ops[box]`). pyre needs
+    /// this explicitly because OpRef positions are not object identities:
+    /// once `short_inputargs[i]` is a distinct renamed box, it no longer
+    /// carries the original label-arg identity, so the original must be
+    /// stored separately. `label_args[i]` pairs with `short_inputargs[i]`.
+    label_args: Vec<OpRef>,
     /// shortpreamble.py: boxes_in_production — cycle-detection set
     /// for `materialize_one` recursion, keyed by the result Box
     /// (shortpreamble.py:314 `self.boxes_in_production[shortop.res]`).
@@ -550,28 +560,32 @@ impl ShortBoxes {
             const_short_boxes: Vec::new(),
             known_constants: VecSet::new(),
             short_inputargs: Vec::new(),
+            label_args: Vec::new(),
             boxes_in_production: VecSet::new(),
             num_label_args,
         }
     }
 
+    /// shortpreamble.py:254-259 — record the original label args. The
+    /// matching `short_inputargs` renamed boxes are minted lazily by
+    /// `add_short_input_arg` (one per `box`, in `label_args` order), so
+    /// only the originals are stored here.
     pub fn with_label_args(label_args: &[OpRef]) -> Self {
         let mut boxes = Self::new(label_args.len());
-        for &arg in label_args.iter() {
-            boxes.short_inputargs.push(BoxRef::from_opref(arg));
-        }
+        boxes.label_args = label_args.to_vec();
         boxes
     }
 
+    /// shortpreamble.py:259 `self.potential_ops[box]` — resolve a label
+    /// arg to its slot by the ORIGINAL box opref (not the renamed
+    /// `short_inputargs` box, which is a distinct identity).
     pub fn lookup_label_arg(&self, opref: OpRef) -> Option<usize> {
-        self.short_inputargs
-            .iter()
-            .position(|a| a.to_opref() == opref)
+        self.label_args.iter().position(|&a| a == opref)
     }
 
     /// RPython parity: check if opref is reachable in the short preamble.
     pub fn is_reachable(&self, opref: OpRef) -> bool {
-        self.short_inputargs.iter().any(|a| a.to_opref() == opref)
+        self.label_args.iter().any(|&a| a == opref)
             || opref.is_constant()
             || self.potential_ops.iter().any(|(k, _)| *k == opref)
     }
@@ -646,19 +660,38 @@ impl ShortBoxes {
                  (shortpreamble.py:255-259)"
             );
         }
-        let label_arg_idx = self.lookup_label_arg(arg);
-        // shortpreamble.py:257 `ShortInputArg(box, renamed)` — the SAME_AS
-        // replay arg is the label-arg Box itself (= `res`); bind its
-        // producer once and share the object.
+        // shortpreamble.py:256 `box = label_args[i]` — record the original.
+        // `with_label_args` pre-seeds `label_args`; the standalone
+        // `create_short_boxes` path (empty `label_args`) appends here.
+        let label_arg_idx = match self.lookup_label_arg(arg) {
+            Some(idx) => idx,
+            None => {
+                self.label_args.push(arg);
+                self.label_args.len() - 1
+            }
+        };
+        // shortpreamble.py:257 `renamed = OpHelpers.inputarg_from_tp(box.type)`
+        // — a FRESH InputArg distinct from the original `box`. Its position
+        // comes from the op-position counter so it is unique and accounted
+        // for by `opref_high_water`; `raw()` shares the op/inputarg integer
+        // space, so a fresh op position is a fresh inputarg position too.
+        let renamed =
+            crate::r#box::BoxRef::new_inputarg(arg_type, ctx.alloc_op_position_typed(arg_type).raw());
+        // `short_inputargs[i]` pairs with `label_args[i]`; callers feed args
+        // in label-arg order (production: optimizer.rs preview loop), so an
+        // append lands at the matching slot.
+        debug_assert_eq!(
+            label_arg_idx,
+            self.short_inputargs.len(),
+            "add_short_input_arg must be called in label_args order so \
+             short_inputargs[i] pairs with label_args[i]"
+        );
+        self.short_inputargs.push(renamed);
+        // shortpreamble.py:257 `ShortInputArg(box, renamed)` — `res` is the
+        // original `box`; the SAME_AS replay arg is that box. Exported
+        // entries carry original positions and are renamed to the matching
+        // `short_inputargs` slot at import (`produced_short_boxes_from_exported_boxes`).
         let arg_box = ctx.materialize_box_at(arg);
-        // shortpreamble.py:255-259 — `short_inputargs` carry those same
-        // label-arg Box objects. Rebind the position-only skeleton slot
-        // from `with_label_args` so every consumer (create_short_inputargs
-        // → ExportedState → produced_short_boxes rename) shares the
-        // canonical producer-bound box.
-        if let Some(idx) = label_arg_idx {
-            self.short_inputargs[idx] = arg_box.clone();
-        }
         let mut same_as = Op::new(OpCode::same_as_for_type(arg_type), &[arg_box.clone()]);
         same_as.pos.set(arg);
         self.potential_ops.insert(
@@ -667,7 +700,7 @@ impl ShortBoxes {
                 res: arg_box,
                 op: std::rc::Rc::new(same_as),
                 kind: PreambleOpKind::InputArg,
-                label_arg_idx,
+                label_arg_idx: Some(label_arg_idx),
                 invented_name: false,
                 same_as_source: None,
             }),
@@ -727,9 +760,12 @@ impl ShortBoxes {
                 }
             });
         }
-        // Label args are always available as inputs (RPython: isinstance(op, InputArgIntOp))
-        if let Some(arg) = self.short_inputargs.iter().find(|a| a.to_opref() == opref) {
-            return Some(arg.clone());
+        // Label args are always available as inputs (RPython: isinstance(op, InputArgIntOp)).
+        // Return the ORIGINAL label-arg box; exported entries carry original
+        // positions and are renamed to the matching short_inputargs slot at
+        // import. Match by the original opref, not the (distinct) renamed box.
+        if self.label_args.iter().any(|&a| a == opref) {
+            return Some(ctx.materialize_box_at(opref));
         }
         None
     }
@@ -3828,6 +3864,39 @@ mod tests {
             alias.1.same_as_source.as_ref().map(|b| b.to_opref()),
             Some(OpRef::int_op(10))
         );
+    }
+
+    #[test]
+    fn test_short_inputargs_have_distinct_renamed_identity() {
+        // shortpreamble.py:256-258 `renamed = OpHelpers.inputarg_from_tp(box.type)`
+        // — each short inputarg is a FRESH InputArg distinct from the original
+        // label arg `box`. pyre's old position-identity model reused the label
+        // arg's OpRef; this test locks the distinct-renamed-box parity.
+        let mut ctx = crate::optimizeopt::OptContext::new(256);
+        let label_args = [OpRef::int_op(10), OpRef::ref_op(11)];
+        let mut sb = ShortBoxes::with_label_args(&label_args);
+        sb.add_short_input_arg(&mut ctx, OpRef::int_op(10), majit_ir::Type::Int);
+        sb.add_short_input_arg(&mut ctx, OpRef::ref_op(11), majit_ir::Type::Ref);
+
+        let si = sb.create_short_inputargs(&label_args);
+        assert_eq!(si.len(), 2);
+
+        // (A) DISTINCT identity: the renamed box is not the original label arg.
+        assert_ne!(si[0].to_opref(), OpRef::int_op(10));
+        assert_ne!(si[1].to_opref(), OpRef::ref_op(11));
+
+        // (B) the renamed boxes are InputArg-kind of the matching type
+        // (inputarg_from_tp(box.type)).
+        assert!(matches!(si[0].to_opref(), OpRef::InputArgInt(_)));
+        assert!(matches!(si[1].to_opref(), OpRef::InputArgRef(_)));
+        assert_eq!(si[0].to_opref().ty(), Some(majit_ir::Type::Int));
+        assert_eq!(si[1].to_opref().ty(), Some(majit_ir::Type::Ref));
+
+        // (C) lookups still resolve a label arg by its ORIGINAL opref
+        // (shortpreamble.py:259 potential_ops[box]).
+        assert_eq!(sb.lookup_label_arg(OpRef::int_op(10)), Some(0));
+        assert_eq!(sb.lookup_label_arg(OpRef::ref_op(11)), Some(1));
+        assert!(sb.is_reachable(OpRef::int_op(10)));
     }
 
     #[test]
