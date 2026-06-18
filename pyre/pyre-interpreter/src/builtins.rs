@@ -2140,42 +2140,53 @@ fn os_error_errno_subclass(errno: i64) -> Option<&'static str> {
     let Ok(e) = i32::try_from(errno) else {
         return None;
     };
-    let name = if e == libc::EAGAIN
-        || e == libc::EALREADY
-        || e == libc::EINPROGRESS
-        || e == libc::EWOULDBLOCK
+    #[cfg(not(target_arch = "wasm32"))]
     {
-        "BlockingIOError"
-    } else if e == libc::EPIPE || errno_is_eshutdown(e) {
-        "BrokenPipeError"
-    } else if e == libc::ECHILD {
-        "ChildProcessError"
-    } else if e == libc::ECONNABORTED {
-        "ConnectionAbortedError"
-    } else if e == libc::ECONNREFUSED {
-        "ConnectionRefusedError"
-    } else if e == libc::ECONNRESET {
-        "ConnectionResetError"
-    } else if e == libc::EEXIST {
-        "FileExistsError"
-    } else if e == libc::ENOENT {
-        "FileNotFoundError"
-    } else if e == libc::EISDIR {
-        "IsADirectoryError"
-    } else if e == libc::ENOTDIR {
-        "NotADirectoryError"
-    } else if e == libc::EINTR {
-        "InterruptedError"
-    } else if e == libc::EACCES || e == libc::EPERM {
-        "PermissionError"
-    } else if e == libc::ESRCH {
-        "ProcessLookupError"
-    } else if e == libc::ETIMEDOUT {
-        "TimeoutError"
-    } else {
-        return None;
-    };
-    Some(name)
+        let name = if e == libc::EAGAIN
+            || e == libc::EALREADY
+            || e == libc::EINPROGRESS
+            || e == libc::EWOULDBLOCK
+        {
+            "BlockingIOError"
+        } else if e == libc::EPIPE || errno_is_eshutdown(e) {
+            "BrokenPipeError"
+        } else if e == libc::ECHILD {
+            "ChildProcessError"
+        } else if e == libc::ECONNABORTED {
+            "ConnectionAbortedError"
+        } else if e == libc::ECONNREFUSED {
+            "ConnectionRefusedError"
+        } else if e == libc::ECONNRESET {
+            "ConnectionResetError"
+        } else if e == libc::EEXIST {
+            "FileExistsError"
+        } else if e == libc::ENOENT {
+            "FileNotFoundError"
+        } else if e == libc::EISDIR {
+            "IsADirectoryError"
+        } else if e == libc::ENOTDIR {
+            "NotADirectoryError"
+        } else if e == libc::EINTR {
+            "InterruptedError"
+        } else if e == libc::EACCES || e == libc::EPERM {
+            "PermissionError"
+        } else if e == libc::ESRCH {
+            "ProcessLookupError"
+        } else if e == libc::ETIMEDOUT {
+            "TimeoutError"
+        } else {
+            return None;
+        };
+        Some(name)
+    }
+    // wasm32-unknown-unknown's libc lacks the errno constants; the errno →
+    // OSError-subclass remap is a POSIX-host concern unavailable there, so no
+    // subclass is selected (consistent with the disabled POSIX modules).
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = e;
+        None
+    }
 }
 
 /// `_parse_init_args` yields an errno only for a 2..=5 argument call whose

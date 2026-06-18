@@ -377,9 +377,7 @@ fn build_function(
             }
             // Guards that always pass in wasm MVP (no force-token /
             // invalidation tracking yet).
-            OpCode::GuardNotInvalidated
-            | OpCode::GuardNotForced
-            | OpCode::GuardNotForced2 => {
+            OpCode::GuardNotInvalidated | OpCode::GuardNotForced | OpCode::GuardNotForced2 => {
                 guard_idx += 1;
             }
             OpCode::GuardNoException => {

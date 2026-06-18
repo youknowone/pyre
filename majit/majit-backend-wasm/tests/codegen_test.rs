@@ -315,7 +315,10 @@ fn test_exception_guards() {
     let inputargs = vec![InputArg::from_type(Type::Int, 0)];
 
     let ops = vec![
-        Op::new(OpCode::Label, &[BoxRef::from_opref(OpRef::input_arg_int(0))]),
+        Op::new(
+            OpCode::Label,
+            &[BoxRef::from_opref(OpRef::input_arg_int(0))],
+        ),
         // GuardNoException — 0 args, fails when an exception is pending.
         {
             let mut op = Op::new(OpCode::GuardNoException, &[]);
