@@ -14,6 +14,9 @@
 //! Both expose the same `compile_module` / `execute` / `free` surface, so
 //! the rest of the backend stays binding-agnostic.
 
+#[cfg(all(feature = "web", feature = "host-import"))]
+compile_error!("features `web` and `host-import` are mutually exclusive; enable exactly one");
+
 #[cfg(feature = "web")]
 mod imports {
     use wasm_bindgen::prelude::*;

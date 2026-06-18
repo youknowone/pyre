@@ -28,6 +28,17 @@
 //!   └── lib.rs (public API)
 //! ```
 
+// `wasm-web` / `wasm-host` select the wasm JIT backend's host binding and are
+// meaningful only on wasm32; reject misconfigurations early with a clear
+// message instead of letting them surface as undefined-symbol failures.
+#[cfg(all(feature = "wasm-web", feature = "wasm-host"))]
+compile_error!("features `wasm-web` and `wasm-host` are mutually exclusive; enable exactly one");
+#[cfg(all(
+    any(feature = "wasm-web", feature = "wasm-host"),
+    not(target_arch = "wasm32")
+))]
+compile_error!("features `wasm-web` / `wasm-host` require target_arch = \"wasm32\"");
+
 pub mod call_jit;
 pub mod driver;
 pub mod eval;

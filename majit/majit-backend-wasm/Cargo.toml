@@ -10,7 +10,7 @@ description = "WebAssembly backend for majit — generates wasm bytecodes via wa
 [features]
 default = ["web"]
 # Instantiate JIT-emitted trace modules through the browser
-# `WebAssembly` API via wasm-bindgen (`./jit_glue.js`).
+# `WebAssembly` API via wasm-bindgen (`js/jit_glue.js`).
 web = ["dep:wasm-bindgen"]
 # Instantiate JIT-emitted trace modules through plain wasm imports
 # supplied by a native embedder (e.g. a wasmi/wasmtime host). No
