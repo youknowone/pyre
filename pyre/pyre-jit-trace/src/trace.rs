@@ -77,6 +77,11 @@ pub fn trace_bytecode(
     // A stale flag from a prior trace on this thread must not leak into
     // this trace's adoption decision.
     WALK_END_FLUSH_COMMITTED.with(|c| c.set(false));
+    // Likewise clear any no-replay finish payload a prior trace left
+    // unconsumed.  The FBW walk re-clears this in `run_perfn_walk`; the
+    // trait leg (`trace_step_result_to_action`) has no such epilogue, so
+    // reset here covers both before either can stash a capture.
+    crate::jitcode_dispatch::fbw_finish_payload_reset();
     // Likewise drop any cross-frame-resume abort request a prior aborted
     // trace left unconsumed (`metainterp::interpret` clears it on the normal
     // path; this guards the paths that exit before the poll runs).

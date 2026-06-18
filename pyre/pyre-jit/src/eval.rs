@@ -4399,6 +4399,28 @@ fn bound_reached(
                         .warm_state_mut()
                         .clear_tracing_flag(green_key);
                 }
+                // No-replay portal exit for a walk that started at this
+                // loop header but fell through to `done_with_this_frame`
+                // (the back-edge counter tripped on the loop's terminal
+                // iteration, so the loop test exited immediately and the
+                // walk traced the post-loop tail to the frame return).
+                // The walk executed the tail's residual calls concretely
+                // and captured the concrete return value; re-running the
+                // freshly compiled trace for THIS invocation
+                // (ContinueRunningNormally re-enters the live frame still
+                // parked at the loop header) would re-apply those already
+                // executed side effects.  Hand the captured result back
+                // directly, mirroring the `jit_merge_point_hook` tracing
+                // site (which carries the same no-replay logic for the
+                // merge-point-driven trace path).
+                if let Some(cv) = pyre_jit_trace::jitcode_dispatch::fbw_finish_concrete_take() {
+                    let result = match cv {
+                        // A void return stashes `Null`, i.e. Python `None`.
+                        pyre_jit_trace::state::ConcreteValue::Null => w_none(),
+                        other => other.to_pyobj(),
+                    };
+                    return Some(LoopResult::Done(Ok(result)));
+                }
                 return Some(LoopResult::ContinueRunningNormally);
             }
             outcome
