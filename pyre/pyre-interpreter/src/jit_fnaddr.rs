@@ -1123,6 +1123,10 @@ pub fn jit_static_pytype_addrs() -> Vec<(&'static str, i64)> {
             enumerateobject::ENUMERATE_TYPE
         ),
         pytype_addr!(
+            "reversedobject::REVERSED_TYPE",
+            reversedobject::REVERSED_TYPE
+        ),
+        pytype_addr!(
             "callableiteratorobject::CALLABLE_ITERATOR_TYPE",
             callableiteratorobject::CALLABLE_ITERATOR_TYPE
         ),

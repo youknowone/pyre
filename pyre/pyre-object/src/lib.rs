@@ -45,6 +45,7 @@ pub mod object_array;
 pub mod propertyobject;
 pub mod pyobject;
 pub mod rangeobject;
+pub mod reversedobject;
 pub mod setobject;
 pub mod sliceobject;
 pub mod specialisedtupleobject;

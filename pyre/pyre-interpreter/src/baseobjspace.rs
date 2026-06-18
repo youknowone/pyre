@@ -1719,6 +1719,65 @@ fn enumerate_reduce_method(args: &[PyObjectRef]) -> PyResult {
     }
 }
 
+/// `reversed.__reduce__()` — `functional.py:407-417
+/// W_ReversedIterator.descr___reduce__`: `(reversed, (sequence,),
+/// remaining)` while live; `(reversed, ((),))` once exhausted (the slot
+/// is cleared to `PY_NULL`).  The reconstructor is the `reversed`
+/// builtin so `pickle` recreates the iterator via `reversed(sequence)`.
+fn reversed_reduce_method(args: &[PyObjectRef]) -> PyResult {
+    unsafe {
+        let seq = pyre_object::reversedobject::w_reversed_get_sequence(args[0]);
+        if !seq.is_null() {
+            let remaining = pyre_object::reversedobject::w_reversed_get_remaining(args[0]);
+            let state = w_tuple_new(vec![seq]);
+            Ok(w_tuple_new(vec![
+                builtin_callable("reversed"),
+                state,
+                w_int_new(remaining),
+            ]))
+        } else {
+            let state = w_tuple_new(vec![w_tuple_new(vec![])]);
+            Ok(w_tuple_new(vec![builtin_callable("reversed"), state]))
+        }
+    }
+}
+
+/// `reversed.__setstate__(index)` — `functional.py:419-429
+/// descr___setstate__`: set `remaining` then clamp into `[-1, n-1]`
+/// (`n == len(sequence)`, or 0 once exhausted).
+fn reversed_setstate_method(args: &[PyObjectRef]) -> PyResult {
+    unsafe {
+        let mut remaining = w_int_get_value(args[1]);
+        let seq = pyre_object::reversedobject::w_reversed_get_sequence(args[0]);
+        let n = if !seq.is_null() { len_w(seq)? } else { 0 };
+        if remaining < -1 {
+            remaining = -1;
+        } else if remaining > n - 1 {
+            remaining = n - 1;
+        }
+        pyre_object::reversedobject::w_reversed_set_remaining(args[0], remaining);
+    }
+    Ok(w_none())
+}
+
+/// `reversed.__length_hint__()` — `functional.py:374-383
+/// descr_length_hint`: elements not yet produced, `0` once exhausted.
+fn reversed_length_hint_method(args: &[PyObjectRef]) -> PyResult {
+    unsafe {
+        let remaining = pyre_object::reversedobject::w_reversed_get_remaining(args[0]);
+        let mut res = 0i64;
+        if remaining >= 0 {
+            let seq = pyre_object::reversedobject::w_reversed_get_sequence(args[0]);
+            let total = if !seq.is_null() { len_w(seq)? } else { 0 };
+            let rem_length = remaining + 1;
+            if rem_length <= total {
+                res = rem_length;
+            }
+        }
+        Ok(w_int_new(res))
+    }
+}
+
 unsafe fn getitem_range_iter(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
     let r = &*(obj as *const pyre_object::rangeobject::W_RangeIterator);
     let len = if r.step > 0 {
@@ -2707,6 +2766,7 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyResul
             || pyre_object::is_long_range_iter(obj)
             || pyre_object::dictviewobject::is_dict_view_iterator(obj)
             || pyre_object::enumerateobject::is_enumerate(obj)
+            || pyre_object::reversedobject::is_reversed(obj)
             || pyre_object::callableiteratorobject::is_callable_iterator(obj)
         {
             let entry: Option<(fn(&[PyObjectRef]) -> PyResult, &str)> = match name {
@@ -2759,6 +2819,15 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyResul
             } else if pyre_object::enumerateobject::is_enumerate(obj) {
                 match name {
                     "__reduce__" => Some((enumerate_reduce_method, "__reduce__", 1)),
+                    _ => None,
+                }
+            } else if pyre_object::reversedobject::is_reversed(obj) {
+                match name {
+                    "__reduce__" => Some((reversed_reduce_method, "__reduce__", 1)),
+                    "__setstate__" => Some((reversed_setstate_method, "__setstate__", 2)),
+                    "__length_hint__" => {
+                        Some((reversed_length_hint_method, "__length_hint__", 1))
+                    }
                     _ => None,
                 }
             } else {
@@ -8332,6 +8401,11 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
         if pyre_object::enumerateobject::is_enumerate(obj) {
             return Ok(obj);
         }
+        // `pypy/module/__builtin__/functional.py:371-372
+        // W_ReversedIterator.descr___iter__` — `return self`.
+        if pyre_object::reversedobject::is_reversed(obj) {
+            return Ok(obj);
+        }
         // `pypy/module/_sre/interp_sre.py:915 W_SRE_Scanner.iter_w` —
         // `return self` (the finditer/scanner iterator).
         if pyre_object::sreobject::is_sre_scanner(obj) {
@@ -8836,6 +8910,36 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                 w_item = next(w_iter_or_list)?;
             }
             return Ok(pyre_object::w_tuple_new(vec![w_index, w_item]));
+        }
+        // `pypy/module/__builtin__/functional.py:385-405
+        // W_ReversedIterator.descr_next` — `getitem(sequence, remaining)`
+        // then decrement; IndexError / StopIteration ends the walk and
+        // clears the slot.
+        if pyre_object::reversedobject::is_reversed(obj) {
+            use pyre_object::reversedobject as ro;
+            let remaining = ro::w_reversed_get_remaining(obj);
+            if remaining >= 0 {
+                let seq = ro::w_reversed_get_sequence(obj);
+                match getitem(seq, w_int_new(remaining)) {
+                    Ok(w_item) => {
+                        ro::w_reversed_set_remaining(obj, remaining - 1);
+                        return Ok(w_item);
+                    }
+                    Err(e) => {
+                        ro::w_reversed_set_remaining(obj, -1);
+                        ro::w_reversed_set_sequence(obj, pyre_object::PY_NULL);
+                        if e.kind == PyErrorKind::IndexError
+                            || e.kind == PyErrorKind::StopIteration
+                        {
+                            return Err(PyError::stop_iteration());
+                        }
+                        return Err(e);
+                    }
+                }
+            }
+            ro::w_reversed_set_remaining(obj, -1);
+            ro::w_reversed_set_sequence(obj, pyre_object::PY_NULL);
+            return Err(PyError::stop_iteration());
         }
         // `pypy/module/_sre/interp_sre.py:918 W_SRE_Scanner.next_w` —
         // search from the current position, yielding the match object.

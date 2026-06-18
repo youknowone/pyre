@@ -1754,6 +1754,15 @@ thread_local! {
             <pyre_interpreter::module::_pickle::W_UnpicklerMemoProxy
                 as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
         );
+        // W_ReversedIterator (`reversed`) — typed payload via `#[pyre_class]`
+        // in AUTO-ID mode; its `w_sequence` field is a traced edge the
+        // collector must walk. Tail of the tid chain.
+        register_pyre_class(
+            &mut gc,
+            &mut pytype_to_tid,
+            <pyre_object::reversedobject::W_ReversedIterator
+                as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+        );
         // rclass.py:340-346 — assign subclassrange_{min,max} to each
         // vtable entry. freeze_types() runs assign_inheritance_ids
         // (normalizecalls.py:373-389), then we write the computed ranges

@@ -5527,31 +5527,18 @@ fn builtin_reversed(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
     }
     let obj = args[0];
     unsafe {
-        // List: reverse a copy
+        // List / tuple → a lazy `W_ReversedIterator` over the sequence
+        // (`functional.py:354-359 __init__`): `remaining = len - 1` and
+        // `descr_next` walks `getitem(seq, remaining)` downward.  Restores
+        // the lazy `reversed` object whose `__reduce__` is
+        // `(reversed, (sequence,), remaining)`.
         if pyre_object::is_list(obj) {
-            let n = pyre_object::w_list_len(obj);
-            let mut items = Vec::with_capacity(n);
-            for i in (0..n as i64).rev() {
-                if let Some(v) = pyre_object::w_list_getitem(obj, i) {
-                    items.push(v);
-                }
-            }
-            return Ok(pyre_object::w_seq_iter_new(
-                pyre_object::w_list_new(items),
-                n,
-            ));
+            let n = pyre_object::w_list_len(obj) as i64;
+            return Ok(pyre_object::reversedobject::w_reversed_new(obj, n - 1));
         }
-        // Tuple: reverse
         if pyre_object::is_tuple(obj) {
-            let n = pyre_object::w_tuple_len(obj);
-            let mut items = Vec::with_capacity(n);
-            for i in (0..n as i64).rev() {
-                if let Some(v) = pyre_object::w_tuple_getitem(obj, i) {
-                    items.push(v);
-                }
-            }
-            let t = pyre_object::w_tuple_new(items);
-            return Ok(pyre_object::w_seq_iter_new(t, n));
+            let n = pyre_object::w_tuple_len(obj) as i64;
+            return Ok(pyre_object::reversedobject::w_reversed_new(obj, n - 1));
         }
         // range: rangeobject.py W_RangeObject.descr_reversed — reflect
         // the span and hand back a fresh reverse-walking iterator.
@@ -5598,11 +5585,10 @@ fn builtin_reversed(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
             unsafe { crate::baseobjspace::lookup_in_type(tp, "__getitem__") }.is_some();
         let has_len = unsafe { crate::baseobjspace::lookup_in_type(tp, "__len__") }.is_some();
         if has_getitem && has_len {
-            let items = collect_iterable(obj)?;
-            let mut rev = items;
-            rev.reverse();
-            let n = rev.len();
-            return Ok(pyre_object::w_seq_iter_new(pyre_object::w_list_new(rev), n));
+            // `functional.py:354-359` — any sequence with `__getitem__` +
+            // `__len__` reverses lazily through `W_ReversedIterator`.
+            let n = crate::baseobjspace::len_w(obj)?;
+            return Ok(pyre_object::reversedobject::w_reversed_new(obj, n - 1));
         }
     }
     let type_name = unsafe { (*(*obj).ob_type).name };
