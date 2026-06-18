@@ -8516,6 +8516,28 @@ impl MIFrame {
             return Ok(Some(pyre_interpreter::StepResult::Continue));
         }
 
+        // CHECK_EXC_MATCH — same exception-handler family, same two
+        // arm-walk hazards the trio above avoids.  The auto-gen arm inlines
+        // the concrete `eval::check_exc_match` whose `pop`/`peek` run against
+        // the live frame via `try_execute_residual_call_via_executor`
+        // (live-frame-pop underflow), and `validate_check_exc_match_class`'s
+        // `Result` Ok/Err is a `SwitchValueNotConcrete` arm-walk abort.  The
+        // `MIFrame::check_exc_match` override records complete leg-independent
+        // IR — symbolic `pop_value` of the match type, a read of the
+        // raise-seeded `sym.last_exc_value`, and a `push_value` of a
+        // `const_ref` bool (the immortal TRUE/FALSE singleton); it records no
+        // guard and is in neither `instruction_may_raise` nor
+        // `instruction_needs_pre_opcode_snapshot`, so there is no
+        // dispatch-leg-dependent snapshot.  The class-mismatch `TypeError`
+        // `?`-propagates as a trace Abort identically on either leg.  Same
+        // delegation pattern as the PopTop / PushExcInfo / PopExcept hooks.
+        if matches!(instruction, Instruction::CheckExcMatch) {
+            use pyre_interpreter::OpcodeStepExecutor;
+            let _ = op_arg;
+            OpcodeStepExecutor::check_exc_match(self)?;
+            return Ok(Some(pyre_interpreter::StepResult::Continue));
+        }
+
         // COPY walker activation via trait-path delegation.
         //
         // The auto-gen arm jitcode for `Copy` lowers `opcode_copy_value`
@@ -9821,6 +9843,16 @@ pub fn production_walker_handles(instruction: &Instruction) -> bool {
             | Instruction::PopExcept
             | Instruction::PushExcInfo
             | Instruction::PopTop
+            // CheckExcMatch — same exception-handler family, handled by the
+            // entry hook (NOT the arm walk): the arm inlines the concrete
+            // `eval::check_exc_match` (live-frame pop underflow) and a
+            // `validate_check_exc_match_class` Result the walk cannot make
+            // concrete (`SwitchValueNotConcrete`).  The hook delegates to the
+            // `MIFrame::check_exc_match` override (symbolic `pop_value` +
+            // raise-seeded `sym.last_exc_value` read + `const_ref` bool push,
+            // no guard), exactly as the PopTop / PushExcInfo / PopExcept hooks
+            // avoid the same live-frame-pop hazard.
+            | Instruction::CheckExcMatch
             // PushNull is handled by the dispatch_via_walker_for_opcode
             // entry hook (direct const-NULL symbolic push): its auto-gen
             // arm is an inert residual wrapper (`opcode_push_null` is not
