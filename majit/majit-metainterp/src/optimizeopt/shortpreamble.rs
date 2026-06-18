@@ -2122,6 +2122,8 @@ fn build_short_preamble_struct_from_ops(
 #[derive(Clone, Debug)]
 pub struct ShortPreambleBuilder {
     state: AbstractShortPreambleBuilderState,
+    /// Stays `OpRef`-keyed: see `produced_short_op` for why the position key
+    /// is load-bearing and resists the #146/S8 `BoxRef` re-key.
     produced_short_boxes: VecAssoc<OpRef, ProducedShortOp>,
 }
 
@@ -2231,6 +2233,26 @@ impl ShortPreambleBuilder {
             .use_box(preamble_op, &VecSet::new(), arg_guards, result_guards);
     }
 
+    /// shortpreamble.py:284-285 `op in self.produced_short_boxes`.
+    ///
+    /// This is the SOLE corpus-live lookup of any `produced_short_boxes` map
+    /// (the ExtendedShortPreambleBuilder lookups never execute; this builder's
+    /// `use_box_recursive`/`add_preamble_op` lookups never execute either —
+    /// measured over the full bench corpus). The live callers reuse the
+    /// builder's replay Rc during `produce_pure`/`produce_heap_field`/
+    /// `produce_heap_array_item` re-export (pure.rs/shortpreamble.rs, via
+    /// `OptContext.imported_short_preamble_builder`).
+    ///
+    /// The `OpRef` (position) key is LOAD-BEARING and must not be re-keyed to
+    /// `BoxRef`(produced.res): the lookup runs at produce time, BEFORE a
+    /// Phase-2 box for `result` exists. Resolving `result` through the live
+    /// `OptContext` does not yield `produced.res` — measured 75 agree / 114
+    /// diverge, the divergences split between `get_box_replacement_box(result)
+    /// == None` (no Phase-2 box has been produced yet, so there is nothing to
+    /// key by) and a distinct Phase-2 producer box (the imported `produced.res`
+    /// is a Phase-1 object with no shared identity across the peel boundary).
+    /// The position bridges the imported Phase-1 res and the Phase-2 produce-
+    /// time slot precisely because no box identity links them at this point.
     pub fn produced_short_op(&self, result: OpRef) -> Option<ProducedShortOp> {
         self.produced_short_boxes.get(&result).cloned()
     }
@@ -2346,6 +2368,13 @@ impl ShortPreambleBuilder {
 /// `use_box()` pops JUMP, appends deps/guards/op, re-appends JUMP.
 #[derive(Clone, Debug)]
 pub struct ExtendedShortPreambleBuilder {
+    /// Stays `OpRef`-keyed. `setup()` populates this map (and the GC walk +
+    /// constructor clone read it), but EVERY key-lookup of it
+    /// (insert_dep_recursive / use_box_recursive / use_box /
+    /// add_preamble_op_from_pop / add_preamble_op / produced_short_op) is dead
+    /// over the full bench corpus — measured. A #146/S8 `BoxRef` re-key here is
+    /// therefore unverifiable (the gate cannot exercise the silent-miss
+    /// surface), like the deferred vectorizer maps.
     produced_short_boxes: VecAssoc<OpRef, ProducedShortOp>,
     short_inputargs: Vec<BoxRef>,
     /// shortpreamble.py:460: self.short = short — single ops list (base + JUMP sentinel)
