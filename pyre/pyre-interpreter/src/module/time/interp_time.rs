@@ -435,11 +435,20 @@ struct c_tm {
 #[allow(non_camel_case_types)]
 type time_t = i64;
 
-#[cfg(feature = "host_env")]
+#[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
 fn _c_gmtime(seconds: time_t) -> Result<c_tm, crate::PyError> {
     host_time::gmtime_from_timestamp(seconds as host_time::TimeT)
         .map(|tm| libc_tm_to_c_tm(&tm))
         .ok_or_else(|| crate::PyError::value_error("unconvertible time"))
+}
+
+// wasm32 has no libc `struct tm` calendar conversions; the broken-down-time
+// functions raise rather than dropping `time` from the module registry.
+#[cfg(target_arch = "wasm32")]
+fn _c_gmtime(_seconds: time_t) -> Result<c_tm, crate::PyError> {
+    Err(crate::PyError::not_implemented(
+        "time.gmtime is unavailable on wasm32",
+    ))
 }
 
 // `interp_time.py c_gmtime` libc backend, used when the host_env
@@ -470,11 +479,18 @@ fn _c_gmtime(seconds: time_t) -> Result<c_tm, crate::PyError> {
     Ok(msvc_tm_to_c_tm(&tm))
 }
 
-#[cfg(feature = "host_env")]
+#[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
 fn _c_localtime(seconds: time_t) -> Result<c_tm, crate::PyError> {
     host_time::localtime_from_timestamp(seconds as host_time::TimeT)
         .map(|tm| libc_tm_to_c_tm(&tm))
         .ok_or_else(|| crate::PyError::value_error("unconvertible time"))
+}
+
+#[cfg(target_arch = "wasm32")]
+fn _c_localtime(_seconds: time_t) -> Result<c_tm, crate::PyError> {
+    Err(crate::PyError::not_implemented(
+        "time.localtime is unavailable on wasm32",
+    ))
 }
 
 #[cfg(all(unix, not(feature = "host_env")))]
@@ -504,6 +520,7 @@ fn _c_localtime(seconds: time_t) -> Result<c_tm, crate::PyError> {
 
 // ── Unix helpers ────────────────────────────────────────────────────
 
+#[cfg(not(target_arch = "wasm32"))]
 fn libc_tm_to_c_tm(tm: &libc::tm) -> c_tm {
     // `tm_gmtoff` / `tm_zone` only exist on the Unix `struct tm`.
     #[cfg(unix)]
@@ -534,6 +551,7 @@ fn libc_tm_to_c_tm(tm: &libc::tm) -> c_tm {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn c_tm_to_libc_tm(tm: &c_tm) -> libc::tm {
     unsafe {
         let mut out: libc::tm = std::mem::zeroed();
@@ -831,6 +849,13 @@ pub fn strftime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let c_fmt = std::ffi::CString::new(fmt_str)
         .map_err(|_| crate::PyError::value_error("embedded null in format string"))?;
 
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = c_fmt;
+        Err(crate::PyError::not_implemented(
+            "time.strftime is unavailable on wasm32",
+        ))
+    }
     // strftime is available on both Unix and Windows CRT.
     #[cfg(unix)]
     {
@@ -890,46 +915,51 @@ pub fn strftime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 
 /// time.mktime(tuple) — interp_time.mktime
 pub fn mktime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let mut tm = _gettmarg(args, false)?;
-    tm.tm_wday = -1;
-
-    #[cfg(feature = "host_env")]
-    let tt = {
-        let mut libc_tm = c_tm_to_libc_tm(&tm);
-        let result = host_time::mktime(&mut libc_tm);
-        tm.tm_wday = libc_tm.tm_wday;
-        result as i64
-    };
-    #[cfg(all(unix, not(feature = "host_env")))]
-    let tt: i64 = {
-        let mut libc_tm = c_tm_to_libc_tm(&tm);
-        let r = unsafe { libc::mktime(&mut libc_tm) };
-        tm.tm_wday = libc_tm.tm_wday;
-        r as i64
-    };
-    #[cfg(all(windows, not(feature = "host_env")))]
-    let tt: i64 = {
-        unsafe extern "C" {
-            fn _mktime64(out: *mut MsvcTm) -> i64;
-        }
-        let mut msvc_tm = c_tm_to_msvc_tm(&tm);
-        let r = unsafe { _mktime64(&mut msvc_tm) };
-        tm.tm_wday = msvc_tm.tm_wday;
-        r
-    };
+    // No libc `struct tm` calendar on wasm32 (and other bare targets).
     #[cfg(not(any(unix, windows)))]
-    let tt: i64 = {
-        return Err(crate::PyError::not_implemented(
-            "time.mktime requires host_env feature on this platform",
-        ));
-    };
-
-    if tt == -1 && tm.tm_wday == -1 {
-        return Err(crate::PyError::overflow_error(
-            "mktime argument out of range",
-        ));
+    {
+        let _ = args;
+        Err(crate::PyError::not_implemented(
+            "time.mktime is unavailable on this platform",
+        ))
     }
-    Ok(floatobject::w_float_new(tt as f64))
+    #[cfg(any(unix, windows))]
+    {
+        let mut tm = _gettmarg(args, false)?;
+        tm.tm_wday = -1;
+
+        #[cfg(feature = "host_env")]
+        let tt = {
+            let mut libc_tm = c_tm_to_libc_tm(&tm);
+            let result = host_time::mktime(&mut libc_tm);
+            tm.tm_wday = libc_tm.tm_wday;
+            result as i64
+        };
+        #[cfg(all(unix, not(feature = "host_env")))]
+        let tt: i64 = {
+            let mut libc_tm = c_tm_to_libc_tm(&tm);
+            let r = unsafe { libc::mktime(&mut libc_tm) };
+            tm.tm_wday = libc_tm.tm_wday;
+            r as i64
+        };
+        #[cfg(all(windows, not(feature = "host_env")))]
+        let tt: i64 = {
+            unsafe extern "C" {
+                fn _mktime64(out: *mut MsvcTm) -> i64;
+            }
+            let mut msvc_tm = c_tm_to_msvc_tm(&tm);
+            let r = unsafe { _mktime64(&mut msvc_tm) };
+            tm.tm_wday = msvc_tm.tm_wday;
+            r
+        };
+
+        if tt == -1 && tm.tm_wday == -1 {
+            return Err(crate::PyError::overflow_error(
+                "mktime argument out of range",
+            ));
+        }
+        Ok(floatobject::w_float_new(tt as f64))
+    }
 }
 
 /// time.asctime([tuple]) — interp_time.asctime
@@ -940,6 +970,13 @@ pub fn asctime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 }
 
 fn _asctime_from_tm(tm: &c_tm) -> Result<PyObjectRef, crate::PyError> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = tm;
+        Err(crate::PyError::not_implemented(
+            "time.asctime is unavailable on wasm32",
+        ))
+    }
     #[cfg(unix)]
     {
         let libc_tm = c_tm_to_libc_tm(&tm);
@@ -972,6 +1009,13 @@ fn _asctime_from_tm(tm: &c_tm) -> Result<PyObjectRef, crate::PyError> {
 pub fn ctime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let seconds = _get_seconds(args);
 
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = seconds;
+        Err(crate::PyError::not_implemented(
+            "time.ctime is unavailable on wasm32",
+        ))
+    }
     #[cfg(unix)]
     {
         let tm = _c_localtime(seconds)?;

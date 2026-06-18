@@ -84,7 +84,6 @@ pub mod select;
 pub mod sys;
 pub mod syslog;
 pub mod termios;
-#[cfg(not(target_arch = "wasm32"))]
 pub mod time;
 pub mod unicodedata;
 pub mod zlib;
