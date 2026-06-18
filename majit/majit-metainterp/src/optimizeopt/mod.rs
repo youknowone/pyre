@@ -2839,27 +2839,40 @@ impl OptContext {
         short_inputargs: &[crate::r#box::BoxRef],
         exported_short_boxes: &[crate::optimizeopt::shortpreamble::PreambleOp],
     ) {
-        let produced: Vec<(OpRef, crate::optimizeopt::shortpreamble::ProducedShortOp)> =
-            exported_short_boxes
-                .iter()
-                .map(|entry| {
-                    // `materialize_box_at`, not `from_bound_op`: a
-                    // const-folded entry carries an inline-Const pos,
-                    // which resolves to its Const box.
-                    let res = self.materialize_box_at(entry.op.pos.get());
-                    (
-                        entry.op.pos.get(),
-                        crate::optimizeopt::shortpreamble::ProducedShortOp {
-                            kind: entry.kind.clone(),
-                            res,
-                            preamble_op: std::rc::Rc::new((*entry.op).clone()),
-                            invented_name: entry.invented_name,
-                            same_as_source: entry.same_as_source.clone(),
-                        },
-                    )
-                })
-                .collect();
-        let mut builder = crate::optimizeopt::shortpreamble::ShortPreambleBuilder::new(
+        let produced: Vec<(
+            crate::r#box::BoxRef,
+            crate::optimizeopt::shortpreamble::ProducedShortOp,
+        )> = exported_short_boxes
+            .iter()
+            .map(|entry| {
+                // `materialize_box_at`, not `from_bound_op`: a
+                // const-folded entry carries an inline-Const pos,
+                // which resolves to its Const box. The map keys by this res
+                // box (#146/S8); the single-op re-export lookup (pure.rs)
+                // reproduces it via `materialize_box_at(source)`.
+                //
+                // materialize_box_at is NON-idempotent for an unregistered
+                // ResOp pos: the first call mints a fresh `new_resop` box and
+                // registers a synthetic producer; subsequent calls resolve
+                // that synthetic to a stable `from_bound_op` box. The lookup is
+                // itself a subsequent call, so the warm-up call registers the
+                // synthetic and the second (stable) box is the real key.
+                let pos = entry.op.pos.get();
+                let _ = self.materialize_box_at(pos);
+                let res = self.materialize_box_at(pos);
+                (
+                    res.clone(),
+                    crate::optimizeopt::shortpreamble::ProducedShortOp {
+                        kind: entry.kind.clone(),
+                        res,
+                        preamble_op: std::rc::Rc::new((*entry.op).clone()),
+                        invented_name: entry.invented_name,
+                        same_as_source: entry.same_as_source.clone(),
+                    },
+                )
+            })
+            .collect();
+        let builder = crate::optimizeopt::shortpreamble::ShortPreambleBuilder::new(
             label_args,
             &produced,
             short_inputargs,
@@ -2992,7 +3005,17 @@ impl OptContext {
             }
         }
 
+        // `produced` (OpRef dual-key: source + result_opref) is internal
+        // scaffolding for `dep_or_materialize` below, which resolves a
+        // dependency arg by its replay position. `builder_entries` is the
+        // #146/S8 builder map: ONE entry per short box keyed by the Phase-1
+        // carried res box (`produced_op.res`, the same Rc the produce loop
+        // reads as `self.res`). The carried box is invariant to the
+        // invented-name replay-position aliasing the dual key compensates for,
+        // so the builder map collapses to a single box-identity key.
         let mut produced: Vec<(OpRef, ProducedShortOp)> = Vec::with_capacity(short_boxes.len());
+        let mut builder_entries: Vec<(crate::r#box::BoxRef, ProducedShortOp)> =
+            Vec::with_capacity(short_boxes.len());
         let mut produced_results: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef> =
             crate::optimizeopt::vec_assoc::VecAssoc::new();
         // shortpreamble.py:PreambleOp.add_op_to_short — Pure ops whose
@@ -3112,6 +3135,7 @@ impl OptContext {
                         invented_name: produced_op.invented_name,
                         same_as_source: produced_op.same_as_source.clone(),
                     };
+                    builder_entries.push((produced_op.res.clone(), new_pop.clone()));
                     produced.push((*source, new_pop.clone()));
                     if *source != result_opref {
                         produced.push((result_opref, new_pop));
@@ -3196,6 +3220,7 @@ impl OptContext {
                         }
                         _ => continue,
                     };
+                    builder_entries.push((produced_op.res.clone(), new_pop.clone()));
                     produced.push((*source, new_pop.clone()));
                     if *source != result_opref {
                         produced.push((result_opref, new_pop));
@@ -3230,6 +3255,7 @@ impl OptContext {
                         invented_name: produced_op.invented_name,
                         same_as_source: produced_op.same_as_source.clone(),
                     };
+                    builder_entries.push((produced_op.res.clone(), new_pop.clone()));
                     produced.push((*source, new_pop.clone()));
                     if *source != result_opref {
                         produced.push((result_opref, new_pop));
@@ -3240,7 +3266,7 @@ impl OptContext {
             }
         }
 
-        let mut builder = ShortPreambleBuilder::new(short_args, &produced, short_inputargs);
+        let mut builder = ShortPreambleBuilder::new(short_args, &builder_entries, short_inputargs);
         for &opref in imported_constants.values() {
             builder.note_known_constant(opref);
         }

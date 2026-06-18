@@ -6957,11 +6957,12 @@ mod tests {
             }],
         );
 
+        let src20 = ctx.materialize_box_at(OpRef::int_op(20));
         let produced = ctx
             .imported_short_preamble_builder
             .as_ref()
             .unwrap()
-            .produced_short_op(OpRef::int_op(20))
+            .produced_short_op(&src20)
             .unwrap();
         let pop = crate::optimizeopt::info::PreambleOp {
             op: BoxRef::from_opref(OpRef::int_op(20)),
@@ -7057,11 +7058,12 @@ mod tests {
                 same_as_source: None,
             }],
         );
+        let src19 = ctx.materialize_box_at(OpRef::ref_op(19));
         let produced = ctx
             .imported_short_preamble_builder
             .as_ref()
             .unwrap()
-            .produced_short_op(OpRef::ref_op(19))
+            .produced_short_op(&src19)
             .unwrap();
         // Path B (B.6.7-heap-field): produce_heap_field no longer installs
         // make_equal_to, but the test still walks the get_box_replacement

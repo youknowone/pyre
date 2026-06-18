@@ -1342,11 +1342,13 @@ mod tests {
             let source_box = ctx.materialize_box_at(source);
             // Production threads the builder's replay Rc into the pop
             // (produce_op family); mirror that here so use_box receives
-            // the same object the builder entry carries.
+            // the same object the builder entry carries. The builder keys by
+            // its entry res (`materialize_box_at(pos)`); `source_box` is the
+            // memoized box for the same position, so the lookup hits.
             let replay = ctx
                 .imported_short_preamble_builder
                 .as_ref()
-                .and_then(|b| b.produced_short_op(source))
+                .and_then(|b| b.produced_short_op(&source_box))
                 .map(|p| p.preamble_op)
                 .unwrap_or_else(|| {
                     let mut same_as = Op::new(OpCode::SameAsI, &[source_box.clone()]);
@@ -2753,11 +2755,14 @@ mod tests {
             Some(1),
         );
         // Production threads the builder's replay Rc into the pop
-        // (produce_pure); mirror it so use_box sees one object.
+        // (produce_pure); mirror it so use_box sees one object. #146/S8: the
+        // builder keys by the entry res box (`materialize_box_at(pos)`); the
+        // memoized box for the same position hits.
+        let src1 = ctx.materialize_box_at(OpRef::int_op(1));
         if let Some(p) = ctx
             .imported_short_preamble_builder
             .as_ref()
-            .and_then(|b| b.produced_short_op(OpRef::int_op(1)))
+            .and_then(|b| b.produced_short_op(&src1))
         {
             imported.pop.preamble_op = p.preamble_op;
         }
