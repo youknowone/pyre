@@ -1220,19 +1220,24 @@ impl Optimizer {
         self.last_guard_op_idx
     }
 
-    /// optimizer.py: notice_guard_future_condition(op)
-    /// Record that a guard at the given position should be replaced
-    /// with the given op when the future condition is realized. Keyed by
-    /// the replaced guard's canonical box (`ctx.get_box_replacement`) so
-    /// the emit-time lookup compares the same box.
+    /// optimizer.py:307 replace_guard: `self.replaces_guard[op] = value.last_guard_pos`.
+    /// Record that a guard at the given position should be replaced when the
+    /// future condition is realized. PyPy keys `replaces_guard` by the raw `op`
+    /// object identity, and `_emit_operation` (optimizer.py:660) looks it up by
+    /// the raw `orig_op` — both before `get_box_replacement`. `resolve_to_boxref`
+    /// yields that producer box (chain root, before `_forwarded`), so insert and
+    /// the emit-time lookup compare the same raw box.
+    /// (The method keeps its historical name; the body performs replace_guard's
+    /// insert.)
     pub fn notice_guard_future_condition(
         &mut self,
         ctx: &OptContext,
         guard_pos: OpRef,
         replacement: Op,
     ) {
-        self.replaces_guard
-            .insert(ctx.get_box_replacement(guard_pos), replacement);
+        if let Some(box_ref) = ctx.resolve_to_boxref(guard_pos) {
+            self.replaces_guard.insert(box_ref, replacement);
+        }
     }
 
     /// optimizer.py:713: replace_guard_op(old_op_pos, new_op)
@@ -1244,8 +1249,14 @@ impl Optimizer {
     /// than directly emitted via `_emit_operation`.
     pub fn replace_guard_op(&mut self, ctx: &OptContext, old_pos: OpRef, new_guard: Op) {
         let new_pos = new_guard.pos.get();
-        self.replaces_guard
-            .insert(ctx.get_box_replacement(old_pos), new_guard);
+        // replaces_guard is keyed by the raw `op` identity (optimizer.py:307),
+        // so resolve to the producer box without following `_forwarded`.
+        if let Some(box_ref) = ctx.resolve_to_boxref(old_pos) {
+            self.replaces_guard.insert(box_ref, new_guard);
+        }
+        // optimizer.py:747 `self._emittedoperations[new_op] = None` — new_op is
+        // the canonical (get_box_replacement'd) emitted op, so this insert stays
+        // canonical, matching the emit-set keying in `_emit_operation`.
         self.emitted_operations
             .insert(ctx.get_box_replacement(new_pos));
     }
@@ -1278,13 +1289,14 @@ impl Optimizer {
                 return None;
             }
         }
-        if self
-            .emitted_operations
-            .contains(&ctx.get_box_replacement(opref))
-        {
-            Some(opref)
-        } else {
-            None
+        // optimizer.py:374 `if op in self._emittedoperations` keys by the op's
+        // own (raw) identity, not its forwarded replacement. `resolve_to_boxref`
+        // is the producer box (chain root, before `_forwarded`); the emit set is
+        // populated with the canonical box, so this matches iff the raw op is the
+        // canonical op — exactly PyPy's `op in _emittedoperations`.
+        match ctx.resolve_to_boxref(opref) {
+            Some(box_ref) if self.emitted_operations.contains(&box_ref) => Some(opref),
+            _ => None,
         }
     }
 
@@ -4253,10 +4265,13 @@ impl Optimizer {
             // and clears it.
 
             // optimizer.py:632-635: replaces_guard check BEFORE emit_guard_operation.
+            // optimizer.py:660 `orig_op in self.replaces_guard` keys by the raw
+            // `orig_op` identity (before get_box_replacement), so resolve to the
+            // producer box without following `_forwarded`.
             if self.can_replace_guards {
-                if let Some(replacement) = self
-                    .replaces_guard
-                    .remove(&ctx.get_box_replacement(op.pos.get()))
+                if let Some(replacement) = ctx
+                    .resolve_to_boxref(op.pos.get())
+                    .and_then(|box_ref| self.replaces_guard.remove(&box_ref))
                 {
                     let target_pos = replacement.pos.get().raw() as usize;
                     if target_pos < ctx.new_operations.len() {
