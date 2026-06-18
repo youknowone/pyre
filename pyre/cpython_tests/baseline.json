@@ -94,7 +94,7 @@
       "dynasm": "IMPORTERROR"
     },
     "test.test_bufio": {
-      "dynasm": "PASS"
+      "dynasm": "TIMEOUT"
     },
     "test.test_build_details": {
       "dynasm": "IMPORTERROR"
@@ -330,7 +330,7 @@
       "dynasm": "IMPORTERROR"
     },
     "test.test_dtrace": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_dynamic": {
       "dynasm": "PASS"
@@ -397,7 +397,7 @@
       "dynasm": "CRASH"
     },
     "test.test_file_eintr": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_filecmp": {
       "dynasm": "PASS"
@@ -424,7 +424,7 @@
       "dynasm": "PASS"
     },
     "test.test_fork1": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_format": {
       "dynasm": "CRASH"
@@ -730,7 +730,7 @@
       "dynasm": "IMPORTERROR"
     },
     "test.test_optparse": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_ordered_dict": {
       "dynasm": "IMPORTERROR"
@@ -739,7 +739,7 @@
       "dynasm": "IMPORTERROR"
     },
     "test.test_osx_env": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_pathlib": {
       "dynasm": "IMPORTERROR"
@@ -788,7 +788,7 @@
       "dynasm": "IMPORTERROR"
     },
     "test.test_poll": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_popen": {
       "dynasm": "PASS"
@@ -851,7 +851,7 @@
       "dynasm": "PASS"
     },
     "test.test_quopri": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_raise": {
       "dynasm": "PASS"
@@ -911,7 +911,7 @@
       "dynasm": "IMPORTERROR"
     },
     "test.test_select": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_selectors": {
       "dynasm": "IMPORTERROR"
@@ -950,7 +950,7 @@
       "dynasm": "IMPORTERROR"
     },
     "test.test_socketserver": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_sort": {
       "dynasm": "CRASH"
@@ -972,7 +972,7 @@
       "dynasm": "IMPORTERROR"
     },
     "test.test_stat": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_statistics": {
       "dynasm": "IMPORTERROR"
@@ -1085,7 +1085,7 @@
       "dynasm": "PASS"
     },
     "test.test_timeout": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "TIMEOUT"
     },
     "test.test_tkinter": {
       "dynasm": "IMPORTERROR"
