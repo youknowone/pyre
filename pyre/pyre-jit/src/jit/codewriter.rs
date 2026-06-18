@@ -8063,6 +8063,20 @@ impl CodeWriter {
                             // reshapes the POP_EXCEPT-mutated source stack
                             // to the handler try-level, so the landing no
                             // longer mismatches the explicit-raise shape.
+                            //
+                            // No-catch arm (`catch_for_pc[py_pc]` None): this is
+                            // a `finally` cleanup RERAISE, which CPython 3.11+
+                            // reaches WITHOUT a `PUSH_EXC_INFO`, so the source
+                            // FrameState carries no live `last_exception` pair.
+                            // `flatten.py:163-174 make_exception_link` emits the
+                            // `reraise/` coding only when the edge args ARE that
+                            // pair; absent it, the orthodox coding is the explicit
+                            // `raise/r` of the in-flight exception value — exactly
+                            // what `emit_raise!`'s `exceptblock` arm builds via
+                            // `explicit_raise_state(exc_value)`.  Routing this
+                            // through `emit_reraise!` instead would hit its
+                            // materialized-pair assertion, so the explicit raise
+                            // is the parity-correct port here, not a deviation.
                             emit_raise!(exc_reg, exc_value, py_pc as i64, true);
                         }
 
