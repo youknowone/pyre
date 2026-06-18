@@ -6809,6 +6809,7 @@ fn op_can_raise(op: &OpKind) -> RaiseClass {
         OpKind::Input { .. }
         | OpKind::ConstInt(_)
         | OpKind::ConstBool(_)
+        | OpKind::ConstSymbolic { .. }
         | OpKind::ConstFloat(_)
         | OpKind::ConstRef(_)
         | OpKind::ConstRefNull
@@ -6852,6 +6853,10 @@ fn op_can_raise(op: &OpKind) -> RaiseClass {
         // RPython LL: jit_force_virtualizable has `canrun=True`, not
         // `canraise`; effect classification handles its special meaning.
         OpKind::VableForce { .. } => RaiseClass::No,
+        // `hint(...)` lowers to non-raising `same_as` / `VableForce` /
+        // `*_guard_value` — `jtransform.py:1632` hint handling has no raising
+        // analogue.
+        OpKind::Hint { .. } => RaiseClass::No,
         // RPython LL: int_floordiv, int_mod → canraise = (ZeroDivisionError,)
         OpKind::BinOp { .. } => RaiseClass::Yes, // div/mod/rem/ovf (others matched above)
         // RPython LL: int_neg_ovf → canraise = (OverflowError,)

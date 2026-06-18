@@ -4193,8 +4193,9 @@ impl<'a> Lowering<'a> {
                     return Ok(());
                 }
                 {
-                    // `jit::promote(x)` rewrites to the synthesised
-                    // `hint_promote` marker so the residual `OpKind::Call`
+                    // `jit::promote(x)` (and its `promote_string` /
+                    // `promote_unicode` siblings) rewrites to the synthesised
+                    // `hint_promote*` marker so the residual `OpKind::Call`
                     // reaches `jtransform::rewrite_op_hint`, which emits
                     // `[-live-, <kind>_guard_value(x)]`
                     // (`jit_codewriter/jtransform.py:608-614`).  The rtyper
@@ -4203,9 +4204,10 @@ impl<'a> Lowering<'a> {
                     // the result back to `x`.  Same single-segment marker
                     // shape as the `elidable_promote` wrapper's
                     // `hint_promote_or_string`.
-                    let target = if args.len() == 1 && self.is_jit_promote(&reg) {
+                    let promote_marker = self.jit_promote_marker(&reg);
+                    let target = if args.len() == 1 && let Some(marker) = promote_marker {
                         CallTarget::FunctionPath {
-                            segments: vec!["hint_promote".to_string()],
+                            segments: vec![marker.to_string()],
                         }
                     } else {
                         // `CallTarget::Method` requires a receiver in `args[0]`
@@ -4271,6 +4273,31 @@ impl<'a> Lowering<'a> {
                     "bb{mir_bb}: CallClass / CallFunc mismatch"
                 )));
             }
+        };
+
+        // A hint-marker call (`jit::promote(x)` → `hint_promote`,
+        // `#[elidable_promote]` → `hint_promote_or_string`) lowers to the
+        // distinct `OpKind::Hint` op (RPython `flowspace/operation.py:521
+        // add_operator('hint', None, dispatch=1)`) carrying the structured
+        // hint `kind`, instead of a synthesised `Call` marker classified by
+        // name downstream.  The flowspace oracle types it as `same_as(value)`
+        // and `jtransform::rewrite_op_hint` rewrites it to the
+        // `<kind>_guard_value` family.
+        let op_kind = if let OpKind::Call {
+            target: CallTarget::FunctionPath { segments },
+            args,
+            ..
+        } = &op_kind
+            && !args.is_empty()
+            && let Some(kind) = crate::hints::classify_virtualizable_hint_segments(
+                segments.iter().map(String::as_str),
+            ) {
+            OpKind::Hint {
+                value: args[0].clone(),
+                kind,
+            }
+        } else {
+            op_kind
         };
 
         // Allocate the result Variable and bind it to the destination
@@ -4758,20 +4785,31 @@ impl<'a> Lowering<'a> {
     }
 
     /// `majit_metainterp::jit::promote(x)` = `hint(x, promote=True)`
-    /// (`rlib/jit.py:101`).  The wrapper carries the `promote` flag by its
-    /// name (its body is a bare `hint(x)`, shared with `promote_string` /
-    /// `promote_unicode`), so the callsite is recognised by the wrapper
-    /// path, not the body.  Matched on the exact `promote` leaf so the
-    /// `promote_string` / `promote_unicode` siblings — which `jtransform`
-    /// cannot lower without an `rstr.STR`/`UNICODE` layout — keep their
-    /// ordinary (skipping) call lowering.
-    fn is_jit_promote(&self, reg: &RegularCall) -> bool {
+    /// (`rlib/jit.py:101`), with the `promote_string` (`:118`) and
+    /// `promote_unicode` (`:124`) siblings.  All three wrappers carry their
+    /// flag by name (each body is a bare `hint(x)`), so the callsite is
+    /// recognised by the wrapper path, not the body.  Returns the
+    /// synthesised `hint_*` marker leaf for the matched wrapper so the
+    /// residual `OpKind::Call` reaches the matching `jtransform`
+    /// `rewrite_op_hint` arm.
+    ///
+    /// `promote_string`/`promote_unicode` route to their own
+    /// `hint_promote_string`/`hint_promote_unicode` markers (preserving the
+    /// upstream hint-kind distinction in the IR) even though `jtransform`
+    /// lowers all three through the same `<kind>_guard_value` family: pyre
+    /// interpreter strings are `W_UnicodeObject` GC refs, not
+    /// `Ptr(rstr.STR)`, so the string `guard_value` collapses to the
+    /// ref-kind `r_guard_value` (see `jtransform::rewrite_op_hint`).
+    fn jit_promote_marker(&self, reg: &RegularCall) -> Option<&'static str> {
         let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
-            return false;
+            return None;
         };
-        self.llbc
-            .fn_by_id(*id)
-            .is_some_and(|fd| fd.item_meta.name_path() == "majit_metainterp::jit::promote")
+        match self.llbc.fn_by_id(*id)?.item_meta.name_path().as_str() {
+            "majit_metainterp::jit::promote" => Some("hint_promote"),
+            "majit_metainterp::jit::promote_string" => Some("hint_promote_string"),
+            "majit_metainterp::jit::promote_unicode" => Some("hint_promote_unicode"),
+            _ => None,
+        }
     }
 
     fn blanket_into_devirt(&self, reg: &RegularCall) -> Option<IntoDevirt> {

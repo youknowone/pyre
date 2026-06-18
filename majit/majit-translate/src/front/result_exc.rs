@@ -509,6 +509,7 @@ fn op_operand_vars(kind: &OpKind) -> Vec<Variable> {
         OpKind::Input { .. }
         | OpKind::ConstInt(_)
         | OpKind::ConstBool(_)
+        | OpKind::ConstSymbolic { .. }
         | OpKind::ConstFloat(_)
         | OpKind::ConstRef(_)
         | OpKind::ConstRefNull
@@ -523,6 +524,7 @@ fn op_operand_vars(kind: &OpKind) -> Vec<Variable> {
         | OpKind::VableFieldRead { base, .. }
         | OpKind::VableForce { base }
         | OpKind::RecordQuasiImmutField { base, .. } => vec![base.clone()],
+        OpKind::Hint { value, .. } => vec![value.clone()],
         OpKind::FieldWrite { base, value, .. } => {
             // Only a `Variable` value contributes an SSA reference; a
             // `setfield_gc` inline `Const` carries no defining op.

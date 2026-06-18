@@ -420,6 +420,10 @@ pub(crate) fn remap_op_kind(
         },
         OpKind::ConstInt(v) => OpKind::ConstInt(*v),
         OpKind::ConstBool(v) => OpKind::ConstBool(*v),
+        OpKind::ConstSymbolic { tag, ty } => OpKind::ConstSymbolic {
+            tag: *tag,
+            ty: ty.clone(),
+        },
         OpKind::ConstFloat(bits) => OpKind::ConstFloat(*bits),
         OpKind::ConstRef(obj) => OpKind::ConstRef(obj.clone()),
         OpKind::ConstRefNull => OpKind::ConstRefNull,
@@ -624,6 +628,10 @@ pub(crate) fn remap_op_kind(
         },
         OpKind::VableForce { base } => OpKind::VableForce {
             base: remap_var(base),
+        },
+        OpKind::Hint { value, kind } => OpKind::Hint {
+            value: remap_var(value),
+            kind: *kind,
         },
         OpKind::JitDebug { args } => OpKind::JitDebug {
             args: args.iter().map(&remap_var).collect(),
@@ -833,6 +841,7 @@ pub fn op_variable_refs(kind: &OpKind) -> Vec<crate::flowspace::model::Variable>
         OpKind::Input { .. }
         | OpKind::ConstInt(_)
         | OpKind::ConstBool(_)
+        | OpKind::ConstSymbolic { .. }
         | OpKind::ConstFloat(_)
         | OpKind::ConstRef(_)
         | OpKind::ConstRefNull
@@ -847,6 +856,7 @@ pub fn op_variable_refs(kind: &OpKind) -> Vec<crate::flowspace::model::Variable>
         OpKind::NewTuple { args } => args.iter().map(clone_var).collect(),
         OpKind::LoweredBlackholeOp { args, .. } => args.iter().map(clone_var).collect(),
         OpKind::VableForce { base } => vec![clone_var(base)],
+        OpKind::Hint { value, .. } => vec![clone_var(value)],
         OpKind::JitMergePoint {
             greens_i,
             greens_r,
@@ -1098,6 +1108,10 @@ pub fn is_pure_op(kind: &OpKind) -> bool {
         OpKind::Input { .. }
         | OpKind::ConstInt(_)
         | OpKind::ConstBool(_)
+        // `_we_are_jitted` symbolic const — a pure `Constant`, removable
+        // when its result is unread (folded to a real const by
+        // `jtransform` before assembly).
+        | OpKind::ConstSymbolic { .. }
         | OpKind::ConstFloat(_)
         | OpKind::ConstRef(_)
         | OpKind::ConstRefNull
@@ -1188,6 +1202,7 @@ pub fn is_pure_op(kind: &OpKind) -> bool {
         // store mutate).  Conservatively side-effecting so the dead-op
         // sweep never drops a store or an allocation.
         | OpKind::LoweredBlackholeOp { .. }
+        | OpKind::Hint { .. }
         | OpKind::Abort { .. } => false,
     }
 }

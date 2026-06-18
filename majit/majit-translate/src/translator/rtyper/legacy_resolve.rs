@@ -559,6 +559,10 @@ fn infer_concrete_from_op(kind: &OpKind) -> ConcreteType {
         // RPython `getkind(lltype.Bool) == 'int'` (flatten.py:getkind);
         // codewriter folds Bool storage to int kind.
         OpKind::ConstBool(_) => ConcreteType::Signed,
+        // `_we_are_jitted` symbolic carries `Bool` concretetype, whose
+        // `getkind` folds to int kind — same legacy concrete as
+        // `ConstBool` so the dual-gate projection stays convergent.
+        OpKind::ConstSymbolic { .. } => ConcreteType::Signed,
         OpKind::ConstFloat(_) => ConcreteType::Float,
         // RPython `rpython/annotator/annrpython.py` types every Variable
         // at annotation time, so `OpKind::Input` reaching rtyper has a

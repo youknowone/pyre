@@ -2293,6 +2293,7 @@ impl Assembler {
                 OpKind::Input { .. } => "Input",
                 OpKind::ConstInt(_) => "ConstInt",
                 OpKind::ConstBool(_) => "ConstBool",
+                OpKind::ConstSymbolic { .. } => "ConstSymbolic",
                 OpKind::ConstFloat(_) => "ConstFloat",
                 OpKind::ConstRef(_) => "ConstRef",
                 OpKind::ConstRefNull => "ConstRefNull",
@@ -2316,6 +2317,7 @@ impl Assembler {
                 OpKind::BinOp { .. } => "BinOp",
                 OpKind::UnaryOp { .. } => "UnaryOp",
                 OpKind::VableForce { .. } => "VableForce",
+                OpKind::Hint { .. } => "Hint",
                 OpKind::CallElidable { .. } => "CallElidable",
                 OpKind::CallResidual { .. } => "CallResidual",
                 OpKind::CallMayForce { .. } => "CallMayForce",
@@ -3469,6 +3471,12 @@ fn op_kind_to_opname(kind: &crate::model::OpKind) -> String {
         // (`flatten.py:getkind`), so the bool constant materialises
         // through the same `int_copy` path as `ConstInt`.
         OpKind::ConstBool(_) => "int_copy".into(),
+        // The `_we_are_jitted` symbolic is folded to `ConstBool(true)` by
+        // `jtransform` before assembly, so it never reaches opname
+        // emission.
+        OpKind::ConstSymbolic { .. } => {
+            unreachable!("OpKind::ConstSymbolic must be folded by jtransform before assembly")
+        }
         // Mirrors `ConstInt` — the constant is materialised through the
         // shared `constants_f` pool, then a `float_copy` op moves it into
         // the SSA destination register.
@@ -3576,6 +3584,12 @@ fn op_kind_to_opname(kind: &crate::model::OpKind) -> String {
             _ => format!("int_{op}"),
         },
         OpKind::VableForce { .. } => "hint_force_virtualizable".into(),
+        // `Hint` is consumed by `jtransform::rewrite_op_hint` (lowered to
+        // `same_as` / `VableForce` / `*_guard_value`) before assembly, so it
+        // never reaches opname emission.
+        OpKind::Hint { .. } => {
+            unreachable!("OpKind::Hint must be rewritten by jtransform before assembly")
+        }
         // jtransform.py:1731-1743 — jit.* builtin ops
         OpKind::JitDebug { .. } => "jit_debug".into(),
         OpKind::AssertGreen { kind_char, .. } => {

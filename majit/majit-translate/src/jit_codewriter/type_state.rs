@@ -111,6 +111,9 @@ pub(crate) fn authoritative_result_type_from_op(kind: &OpKind) -> Option<Concret
     match kind {
         OpKind::ConstInt(_) => Some(ConcreteType::Signed),
         OpKind::ConstBool(_) => Some(ConcreteType::Signed),
+        // `_we_are_jitted` symbolic — `Bool` concretetype folds to int
+        // kind; folded to `ConstBool(true)` by `jtransform` before emit.
+        OpKind::ConstSymbolic { .. } => Some(ConcreteType::Signed),
         OpKind::ConstFloat(_) => Some(ConcreteType::Float),
         OpKind::Input { ty, .. } => concrete_if_known(valuetype_to_concrete(ty)),
         OpKind::FieldRead { ty, .. } | OpKind::VableFieldRead { ty, .. } => {

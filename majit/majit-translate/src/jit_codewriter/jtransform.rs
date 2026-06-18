@@ -457,6 +457,16 @@ impl<'a> Transformer<'a> {
         // fixtures, etc.) are also covered.
         crate::translator::rtyper::unit_variant_fold::fold_unit_variant_ctors(&mut rewritten);
 
+        // RPython rtyper `specialize_call` rewrites a `we_are_jitted()`
+        // `direct_call` to the `_we_are_jitted` symbolic constant
+        // (`rpython/rlib/jit.py:403-406`); `rewrite_op_int_is_true` then
+        // folds it by symbolic identity (`jtransform.py:1638`).  pyre's
+        // rtyper types an ephemeral oracle and never rewrites the
+        // surviving model graph, so the symbolic injection runs here —
+        // post-annotation, pre-rewrite — keeping the un-annotatable
+        // `SpecTag` out of the annotator.
+        fold_we_are_jitted_calls(&mut rewritten);
+
         let exceptblock = rewritten.exceptblock;
         let graph_name = rewritten.name.clone();
         for block_idx in 0..rewritten.blocks.len() {
@@ -679,8 +689,38 @@ impl<'a> Transformer<'a> {
     ) -> RewriteResult {
         match &op.kind {
             // ── rewrite_op_hint ──
+            //
+            // The structured `OpKind::Hint` (emitted by `front::mir` for
+            // `jit::promote` / `#[elidable_promote]`) carries the hint kind
+            // directly.  A bare `Call` to a hint-marker path is still
+            // accepted (defensive / unit tests construct it) and classified
+            // by name.
+            OpKind::Hint { value, kind } => {
+                self.rewrite_op_hint(op, *kind, std::slice::from_ref(value), "hint", graph_name)
+            }
             OpKind::Call { target, args, .. } if classify_vable_hint(target).is_some() => {
-                self.rewrite_op_hint(op, target, args, graph_name)
+                let kind = classify_vable_hint(target).expect("guard checked Some");
+                let label = target.to_string();
+                self.rewrite_op_hint(op, kind, args, &label, graph_name)
+            }
+            // ── fold of the `_we_are_jitted` symbolic ──
+            //
+            // Inside the tracer / blackhole interpreter `we_are_jitted()`
+            // is always true (`rlib/jit.py:355`).  RPython folds this at
+            // `rewrite_op_int_is_true` (`jtransform.py:1638`) keyed on the
+            // symbolic value identity (`value is _we_are_jitted`).  pyre's
+            // `we_are_jitted() -> bool` carries the symbolic as
+            // `OpKind::ConstSymbolic { tag, .. }` (injected by
+            // `front::mir`); fold it to `ConstBool(true)` keyed on the
+            // `SpecTag` identity — the dual of `constfold::
+            // replace_we_are_jitted` folding the genc side to `false`.
+            OpKind::ConstSymbolic { tag, .. }
+                if *tag == crate::translator::backendopt::constfold::WE_ARE_JITTED_TAG_ID =>
+            {
+                RewriteResult::Replace(vec![SpaceOperation {
+                    result: op.result.clone(),
+                    kind: OpKind::ConstBool(true),
+                }])
             }
             // ── rewrite_op_getfield ──
             //
@@ -1875,21 +1915,18 @@ impl<'a> Transformer<'a> {
     fn rewrite_op_hint(
         &mut self,
         op: &SpaceOperation,
-        target: &CallTarget,
+        hint_kind: crate::hints::VirtualizableHintKind,
         args: &[crate::flowspace::model::Variable],
+        label: &str,
         graph_name: &str,
     ) -> RewriteResult {
-        let hint_kind = match classify_vable_hint(target) {
-            Some(k) => k,
-            None => return RewriteResult::Keep,
-        };
         match hint_kind {
             crate::hints::VirtualizableHintKind::AccessDirectly
             | crate::hints::VirtualizableHintKind::FreshVirtualizable => {
                 // RPython: consume as identity (same_as)
                 self.notes.push(GraphTransformNote {
                     function: graph_name.to_string(),
-                    detail: format!("rewrite: {target}(...) → identity"),
+                    detail: format!("rewrite: {label}(...) → identity"),
                 });
                 if let Some(arg) = args.first() {
                     RewriteResult::Identity(arg.clone())
@@ -1901,7 +1938,7 @@ impl<'a> Transformer<'a> {
                 // RPython: emit hint_force_virtualizable, preserve value as identity
                 self.notes.push(GraphTransformNote {
                     function: graph_name.to_string(),
-                    detail: format!("rewrite: {target}(...) → VableForce"),
+                    detail: format!("rewrite: {label}(...) → VableForce"),
                 });
                 self.vable_rewrites += 1;
                 if let Some(arg) = args.first() {
@@ -1935,7 +1972,7 @@ impl<'a> Transformer<'a> {
                 // `None` sentinel that aliases the result back to the input
                 // is realized in pyre by `self.aliases.insert(result, base)`
                 // before emitting the replacement ops.
-                self.rewrite_op_hint_guard_value_family(op, target, args, graph_name)
+                self.rewrite_op_hint_guard_value_family(op, args, label, graph_name)
             }
             crate::hints::VirtualizableHintKind::PromoteString => {
                 // `rpython/jit/codewriter/jtransform.py:615-631 promote_string`:
@@ -1943,24 +1980,22 @@ impl<'a> Transformer<'a> {
                 //     assert op.args[0].concretetype == S
                 //     ...register OS_STREQ_NONNULL + emit str_guard_value...
                 //
-                // Pyre cannot satisfy `concretetype == Ptr(rstr.STR)`
-                // because pyre-object has no `rstr.STR`-equivalent GC
-                // struct (`rpython/rtyper/lltypesystem/rstr.py:1226-1237
-                // STR.become({hash, chars: Array(Char)})`).  Fail loud
-                // — same shape as upstream's `assert` failure — until
-                // the layout is ported and the helper body
-                // (`rpython/jit/codewriter/support.py:526-538
-                // _ll_2_str_eq_nonnull`) lands.
-                panic!(
-                    "hint_promote_string reached `{target}` in `{graph_name}` \
-                     but pyre-object has no `rstr.STR`-equivalent GC \
-                     layout to satisfy `jtransform.py:619 assert \
-                     op.args[0].concretetype == lltype.Ptr(rstr.STR)`. \
-                     Port `rstr.py:1226-1237 STR` into pyre-object and \
-                     `support.py:526-538 _ll_2_str_eq_nonnull` into \
-                     `majit-metainterp::blackhole` before re-enabling \
-                     this rewrite arm."
-                )
+                // The upstream `str_guard_value` op is the value-equality
+                // promotion of an `rstr.STR` low-level string: it guards on
+                // the *characters* (`support.py:526-538 _ll_2_str_eq_nonnull`)
+                // so two distinct-but-equal `Ptr(rstr.STR)` operands fold to
+                // one trace.  That representation is rtyper-internal; pyre
+                // interpreter strings are `W_UnicodeObject` GC refs, never
+                // `Ptr(rstr.STR)`, so the `assert ... == Ptr(rstr.STR)` is
+                // satisfied by absence and there is no inline char array to
+                // value-compare.  The faithful pyre lowering of a string
+                // `promote` is therefore the ref-kind member of the
+                // `<kind>_guard_value` family — `r_guard_value`, an identity
+                // guard on the `W_UnicodeObject` pointer (exact for interned
+                // names, sound for the rest).  `get_value_kind_var` reports
+                // `'r'` for the ref operand, so the shared helper emits
+                // `r_guard_value` directly.
+                self.rewrite_op_hint_guard_value_family(op, args, label, graph_name)
             }
             crate::hints::VirtualizableHintKind::PromoteUnicode => {
                 // `rpython/jit/codewriter/jtransform.py:632-648 promote_unicode`:
@@ -1968,16 +2003,11 @@ impl<'a> Transformer<'a> {
                 //     assert op.args[0].concretetype == U
                 //     ...register OS_UNIEQ_NONNULL + emit str_guard_value...
                 //
-                // Same parity blocker as `PromoteString`: pyre-object
-                // has no `rstr.UNICODE`-equivalent GC struct
-                // (`rpython/rtyper/lltypesystem/rstr.py:1238-1246
-                // UNICODE.become({hash, chars: Array(UniChar)})`).
-                panic!(
-                    "hint_promote_unicode reached `{target}` in `{graph_name}` \
-                     but pyre-object has no `rstr.UNICODE`-equivalent \
-                     GC layout to satisfy `jtransform.py:636 assert \
-                     op.args[0].concretetype == lltype.Ptr(rstr.UNICODE)`."
-                )
+                // Same shape as `PromoteString`: the `rstr.UNICODE`
+                // value-equality `str_guard_value` has no `W_UnicodeObject`
+                // counterpart, so the ref operand lowers through the shared
+                // `<kind>_guard_value` family to `r_guard_value`.
+                self.rewrite_op_hint_guard_value_family(op, args, label, graph_name)
             }
             crate::hints::VirtualizableHintKind::PromoteOrString => {
                 // `rpython/jit/codewriter/jtransform.py:599-606` —
@@ -2001,7 +2031,7 @@ impl<'a> Transformer<'a> {
                 // `<kind>_guard_value` per `jit.py:608-614` +
                 // `getkind(Ptr) == "ref"` (`rpython/jit/metainterp/
                 // history.py:64`).
-                self.rewrite_op_hint_guard_value_family(op, target, args, graph_name)
+                self.rewrite_op_hint_guard_value_family(op, args, label, graph_name)
             }
         }
     }
@@ -2016,16 +2046,17 @@ impl<'a> Transformer<'a> {
     /// `<kind>` char is the upstream `getkind()` of `op.args[0]`
     /// (`'i'`/`'r'`/`'f'`); void args fall through.
     ///
-    /// `promote_string` / `promote_unicode` (jit.py:615-648) emit the
-    /// 3-input `str_guard_value/rid>r` op which requires extras the
-    /// IR does not yet carry — those arms panic in the caller above
-    /// rather than route through this helper, which only knows how to
-    /// emit the 1-input `<kind>_guard_value` family.
+    /// `promote_string` / `promote_unicode` (jit.py:615-648) also route
+    /// through this helper: upstream's 3-input `str_guard_value` is a
+    /// value-equality guard over an `rstr.STR`/`UNICODE` char array, a
+    /// representation pyre interpreter strings (`W_UnicodeObject` refs) do
+    /// not use, so the string promote collapses to the ref-kind member of
+    /// this family — `r_guard_value`.
     fn rewrite_op_hint_guard_value_family(
         &mut self,
         op: &SpaceOperation,
-        target: &CallTarget,
         args: &[crate::flowspace::model::Variable],
+        label: &str,
         graph_name: &str,
     ) -> RewriteResult {
         let Some(arg) = args.first() else {
@@ -2052,7 +2083,7 @@ impl<'a> Transformer<'a> {
         }
         self.notes.push(GraphTransformNote {
             function: graph_name.to_string(),
-            detail: format!("rewrite: {target}(...) → {kind_char}_guard_value"),
+            detail: format!("rewrite: {label}(...) → {kind_char}_guard_value"),
         });
         RewriteResult::Replace(vec![
             SpaceOperation {
@@ -2489,39 +2520,6 @@ impl<'a> Transformer<'a> {
             && args.len() == 1
         {
             return RewriteResult::Identity(args[0].clone());
-        }
-        // Jitcode-side fold of `we_are_jitted()` -> `true`: inside the
-        // tracer / blackhole interpreter `we_are_jitted()` is always
-        // true (rlib/jit.py:355) — the dual of `constfold::
-        // replace_we_are_jitted` folding the genc side to `false`.
-        //
-        // RPython folds this at the truth test: the rtyper lowers the
-        // call to the `_we_are_jitted` symbolic constant
-        // (`inputconst(Signed, _we_are_jitted)`) and
-        // `rewrite_op_int_is_true` folds `int_is_true(_we_are_jitted)`
-        // -> `Constant(True)` (jtransform.py:1633-1639).  That structure
-        // does not reproduce on pyre's model graph: the rtyper's SpecTag
-        // (`rbuiltin::rtype_we_are_jitted`) lives on the ephemeral
-        // flowspace graph (discarded after publishing types), the model
-        // `OpKind` has no SpecTag-carrying const variant, and pyre's
-        // `we_are_jitted() -> bool` feeds `exitswitch` directly with no
-        // `int_is_true` op to fold.  So the call itself — keyed by the
-        // `majit_metainterp::jit::we_are_jitted` `FunctionPath` (mir.rs
-        // splits the LLBC name_path) — is the only fold point in the
-        // model graph; folding it to `ConstBool(true)` yields the same
-        // green `exitswitch` condition RPython's folded `int_is_true`
-        // produces, and avoids a residual call + guard on the runtime
-        // JIT-mode flag in the hot method-cache path.
-        if let CallTarget::FunctionPath { segments } = target
-            && segments.len() == 3
-            && segments[0] == "majit_metainterp"
-            && segments[1] == "jit"
-            && segments[2] == "we_are_jitted"
-        {
-            return RewriteResult::Replace(vec![SpaceOperation {
-                result: op.result.clone(),
-                kind: OpKind::ConstBool(true),
-            }]);
         }
         // RPython: guess_call_kind(op) → dispatch to handle_*_call
         if let Some(cc) = self.callcontrol.as_mut() {
@@ -4127,6 +4125,7 @@ fn remap_op(
         OpKind::Input { .. }
         | OpKind::ConstInt(_)
         | OpKind::ConstBool(_)
+        | OpKind::ConstSymbolic { .. }
         | OpKind::ConstFloat(_)
         | OpKind::ConstRef(_)
         | OpKind::ConstRefNull
@@ -4158,6 +4157,10 @@ fn remap_op(
         },
         OpKind::VableForce { base } => OpKind::VableForce {
             base: remap_value(base, aliases),
+        },
+        OpKind::Hint { value, kind } => OpKind::Hint {
+            value: remap_value(value, aliases),
+            kind: *kind,
         },
         OpKind::JitMergePoint {
             jitdriver_index,
@@ -4550,6 +4553,50 @@ fn remap_op(
     SpaceOperation {
         result: op.result.clone(),
         kind,
+    }
+}
+
+/// Rewrite `we_are_jitted()` calls to the `_we_are_jitted` symbolic
+/// constant (`OpKind::ConstSymbolic`) on the model graph — the
+/// JIT-codewriter counterpart of RPython's rtyper `specialize_call`
+/// rewrite of the `direct_call` to `inputconst(Signed, _we_are_jitted)`
+/// (`rpython/rlib/jit.py:403-406`).
+///
+/// pyre's rtyper types an ephemeral oracle and never rewrites the
+/// surviving model graph, so the symbolic is injected here, by
+/// `Transformer::transform`, after annotation (the annotator typed the
+/// call `SomeBool` via the `we_are_jitted` `ExtRegistryEntry`) and
+/// before per-op rewriting.  `rewrite_operation` then folds the
+/// symbolic to `ConstBool(true)` keyed on the `SpecTag` identity,
+/// mirroring `jtransform.py:1638 value is _we_are_jitted`.  Running on
+/// the model graph rather than the annotated flowspace oracle keeps the
+/// un-annotatable `SpecTag` out of `Bookkeeper.immutablevalue` (which
+/// has no symbolic branch — in RPython the symbolic is likewise
+/// introduced only post-annotation, at rtype).
+fn fold_we_are_jitted_calls(graph: &mut crate::model::FunctionGraph) {
+    for block in graph.blocks.iter_mut() {
+        for op in block.operations.iter_mut() {
+            let OpKind::Call {
+                target: CallTarget::FunctionPath { segments },
+                args,
+                ..
+            } = &op.kind
+            else {
+                continue;
+            };
+            if !args.is_empty()
+                || segments.len() != 3
+                || segments[0] != "majit_metainterp"
+                || segments[1] != "jit"
+                || segments[2] != "we_are_jitted"
+            {
+                continue;
+            }
+            op.kind = OpKind::ConstSymbolic {
+                tag: crate::translator::backendopt::constfold::WE_ARE_JITTED_TAG_ID,
+                ty: crate::model::ValueType::Bool,
+            };
+        }
     }
 }
 
@@ -6674,42 +6721,75 @@ mod tests {
         }
     }
 
-    /// `we_are_jitted()` folds to `ConstBool(true)` in jitcode
-    /// (`rewrite_op_int_is_true` fold of `_we_are_jitted`,
+    /// `fold_we_are_jitted_calls` rewrites the `we_are_jitted()`
+    /// `direct_call` to the `_we_are_jitted` symbolic constant — the
+    /// model-graph counterpart of RPython's rtyper `specialize_call`
+    /// (`rpython/rlib/jit.py:403-406`).
+    #[test]
+    fn we_are_jitted_specializes_to_symbolic() {
+        let mut graph = FunctionGraph::new("we_are_jitted_specialize");
+        let entry = graph.startblock;
+        let target = CallTarget::function_path(["majit_metainterp", "jit", "we_are_jitted"]);
+        let result_var = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target,
+                    args: vec![],
+                    result_ty: ValueType::Bool,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(entry, Some(result_var.clone()));
+        fold_we_are_jitted_calls(&mut graph);
+        let op = graph.blocks[0]
+            .operations
+            .iter()
+            .find(|op| op.result.as_ref() == Some(&result_var))
+            .expect("we_are_jitted op present");
+        match &op.kind {
+            OpKind::ConstSymbolic { tag, .. } => assert_eq!(
+                *tag,
+                crate::translator::backendopt::constfold::WE_ARE_JITTED_TAG_ID
+            ),
+            other => panic!("expected ConstSymbolic, got {other:?}"),
+        }
+    }
+
+    /// End-to-end: `we_are_jitted()` folds to `ConstBool(true)` in
+    /// jitcode (`fold_we_are_jitted_calls` → symbolic →
+    /// `rewrite_operation` `SpecTag`-identity fold, mirroring
+    /// `rewrite_op_int_is_true` of `_we_are_jitted`,
     /// jtransform.py:1636-1639) — the jitcode runs during tracing and
     /// blackholing where the JIT-mode flag is true (rlib/jit.py:355).
     #[test]
     fn we_are_jitted_folds_to_const_true() {
         let config = GraphTransformConfig::default();
-        let mut transformer = Transformer::new(&config);
         let mut graph = FunctionGraph::new("we_are_jitted_fold");
-        let result_var = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let entry = graph.startblock;
         let target = CallTarget::function_path(["majit_metainterp", "jit", "we_are_jitted"]);
-        let result_ty = ValueType::Bool;
-        let op = SpaceOperation {
-            result: Some(result_var.clone()),
-            kind: OpKind::Call {
-                target: target.clone(),
-                args: vec![],
-                result_ty: result_ty.clone(),
-            },
-        };
-        let rewritten = transformer.rewrite_op_direct_call(
-            &op,
-            &target,
-            &[],
-            &result_ty,
-            "we_are_jitted_fold",
-            &mut graph,
-        );
-        match rewritten {
-            RewriteResult::Replace(ops) => {
-                assert_eq!(ops.len(), 1);
-                assert_eq!(ops[0].result, Some(result_var));
-                assert!(matches!(ops[0].kind, OpKind::ConstBool(true)));
-            }
-            _ => panic!("expected Replace with ConstBool(true)"),
-        }
+        let result_var = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target,
+                    args: vec![],
+                    result_ty: ValueType::Bool,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(entry, Some(result_var.clone()));
+        let result = rewrite_graph(&graph, &config);
+        let folded = result
+            .graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.operations.iter())
+            .find(|op| op.result.as_ref() == Some(&result_var))
+            .expect("we_are_jitted op must survive as a const-define");
+        assert!(matches!(folded.kind, OpKind::ConstBool(true)));
     }
 
     /// Reject when arg/result IR kinds disagree — that means the
@@ -7620,6 +7700,76 @@ mod tests {
                 assert_eq!(
                     *kind_char, 'i',
                     "Int arg must route through the int_guard_value path"
+                );
+            }
+            other => panic!("expected GuardValue, got {other:?}"),
+        }
+    }
+
+    /// `promote_string` lowers a `W_UnicodeObject` ref through the shared
+    /// `<kind>_guard_value` family: pyre has no `Ptr(rstr.STR)` to
+    /// value-compare, so the ref operand collapses to `r_guard_value`
+    /// (`rpython/jit/codewriter/jtransform.py:615-631`).
+    #[test]
+    fn rewrite_graph_promote_string_emits_ref_guard_value() {
+        let mut graph = FunctionGraph::new("demo");
+        let v_var = graph.alloc_value_var();
+        graph.push_inputarg_var(graph.startblock, v_var.clone());
+        graph.push_op_var(
+            graph.startblock,
+            OpKind::Call {
+                target: CallTarget::function_path(["hint_promote_string"]),
+                args: vec![v_var],
+                result_ty: ValueType::Ref(None),
+            },
+            false,
+        );
+        graph.set_return(graph.startblock, None);
+
+        let result = rewrite_graph(&graph, &GraphTransformConfig::default());
+        let ops = &result.graph.block(graph.startblock).operations;
+        assert_eq!(ops.len(), 2);
+        assert!(matches!(ops[0].kind, OpKind::Live));
+        match &ops[1].kind {
+            OpKind::GuardValue { kind_char, .. } => {
+                assert_eq!(
+                    *kind_char, 'r',
+                    "string promote on a ref must emit r_guard_value"
+                );
+            }
+            other => panic!("expected GuardValue, got {other:?}"),
+        }
+    }
+
+    /// `promote_unicode` shares the `PromoteString` lowering — the
+    /// `rstr.UNICODE` value-equality guard has no `W_UnicodeObject`
+    /// counterpart, so the ref operand emits `r_guard_value`
+    /// (`rpython/jit/codewriter/jtransform.py:632-648`).
+    #[test]
+    fn rewrite_graph_promote_unicode_emits_ref_guard_value() {
+        let mut graph = FunctionGraph::new("demo");
+        let v_var = graph.alloc_value_var();
+        graph.push_inputarg_var(graph.startblock, v_var.clone());
+        graph.push_op_var(
+            graph.startblock,
+            OpKind::Call {
+                target: CallTarget::function_path(["hint_promote_unicode"]),
+                args: vec![v_var],
+                result_ty: ValueType::Ref(None),
+            },
+            false,
+        );
+        graph.set_return(graph.startblock, None);
+
+        let result = rewrite_graph(&graph, &GraphTransformConfig::default());
+        let ops = &result.graph.block(graph.startblock).operations;
+        assert_eq!(ops.len(), 2);
+        assert!(matches!(ops[0].kind, OpKind::Live));
+        match &ops[1].kind {
+            OpKind::GuardValue { kind_char, .. } => {
+                assert_eq!(
+                    *kind_char, 'r',
+                    "unicode promote on a ref must emit r_guard_value"
                 );
             }
             other => panic!("expected GuardValue, got {other:?}"),

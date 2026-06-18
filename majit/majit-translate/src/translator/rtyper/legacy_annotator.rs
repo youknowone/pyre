@@ -264,6 +264,9 @@ fn infer_op_type(kind: &OpKind) -> ValueType {
         OpKind::Input { ty, .. } => ty.clone(),
         OpKind::ConstInt(_) => ValueType::Int,
         OpKind::ConstBool(_) => ValueType::Bool,
+        // `_we_are_jitted` symbolic carries its own concretetype
+        // (`Bool` for `we_are_jitted() -> bool`).
+        OpKind::ConstSymbolic { ty, .. } => ty.clone(),
         OpKind::ConstFloat(_) => ValueType::Float,
         // Singleton instance pointer (unit-variant PBC).  The legacy
         // annotator sees this as a plain ref-typed value; concrete
@@ -304,6 +307,10 @@ fn infer_op_type(kind: &OpKind) -> ValueType {
                 read_binding(operand)
             }
         }
+        // `hint(v, ...)` returns `v` unchanged — `rlib/jit.py:hint` is
+        // identity at the annotation level, so the result carries the
+        // operand's type (the same dispatch as `same_as`).
+        OpKind::Hint { value, .. } => read_binding(value),
         // RPython `rfloat.py:rtype_neg` / `intop.py:rtype_neg`: `neg`
         // preserves the operand's lowleveltype (Float vs Int).  Pyre's
         // pre-jtransform graph emits a single `OpKind::UnaryOp` op="neg"
