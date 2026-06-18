@@ -8213,7 +8213,12 @@ impl MIFrame {
             let raw = namei.get(op_arg) as usize;
             let name_idx = raw >> 1;
             let push_null = (raw & 1) != 0;
-            OpcodeStepExecutor::load_global(self, code.names[name_idx].as_ref(), name_idx, push_null)?;
+            OpcodeStepExecutor::load_global(
+                self,
+                code.names[name_idx].as_ref(),
+                name_idx,
+                push_null,
+            )?;
             return Ok(Some(pyre_interpreter::StepResult::Continue));
         }
 
@@ -8582,6 +8587,55 @@ impl MIFrame {
             use pyre_interpreter::OpcodeStepExecutor;
             let _ = op_arg;
             let step = OpcodeStepExecutor::return_value(self)?;
+            return Ok(Some(step));
+        }
+
+        // JUMP_BACKWARD — the loop back-edge.  It CANNOT route through the
+        // arm walk, whose `ref_return/r`-style terminator surfaces as
+        // `DispatchOutcome::SubReturn` and whose top-level outcomes are
+        // rejected; the loop close needs `StepResult::CloseLoop`, which only
+        // the entry hook can propagate.  Delegate to the same pub
+        // `execute_jump_backward` the trait dispatch arm calls
+        // (pyopcode.rs:2942), with `next_instr = self.orgpc + 1` — identical
+        // to the trait leg's `pc + 1`, since `set_orgpc(pc)` ran before the
+        // gate and `close_loop_args_at`'s loop-header override of `orgpc` has
+        // not happened yet.  `jump_backward` returns `StepResult::CloseLoop`,
+        // which `dispatch_via_walker_for_opcode` propagates verbatim and
+        // `trace_step_result_to_action` maps to `CloseLoopWithArgs` — the
+        // identical mapping the trait leg uses.  Unlike PopJumpIf (two
+        // divergent recording paths), JumpBackward has a SINGLE shared
+        // `close_loop_args_at` reached identically by both legs, and is absent
+        // from `apply_walker_stack_effect` (zero net stack delta) and
+        // `instruction_needs_pre_opcode_snapshot`, so the GuardFutureCondition
+        // snapshot reads the same pre-gate orgpc / vable shadow / registers_r
+        // on either leg.  The dispatch gate keeps inline-frame JumpBackward on
+        // the trait leg.
+        if matches!(instruction, Instruction::JumpBackward { .. }) {
+            let next_instr = self.orgpc + 1;
+            let step = pyre_interpreter::execute_jump_backward(
+                self,
+                code,
+                *instruction,
+                op_arg,
+                next_instr,
+            )?;
+            return Ok(Some(step));
+        }
+
+        // JUMP_BACKWARD_NO_INTERRUPT — no guard, no loop close: just
+        // `set_next_instr(next_instr - delta)`, returns Continue.  Delegate to
+        // the same pub `execute_jump_backward_no_interrupt` the trait arm
+        // calls (pyopcode.rs:3096); it subtracts the delta from `next_instr`
+        // directly (no `skip_caches`), so `next_instr = self.orgpc + 1` (==
+        // the trait leg's `pc + 1`) is required for the identical target.
+        if matches!(instruction, Instruction::JumpBackwardNoInterrupt { .. }) {
+            let next_instr = self.orgpc + 1;
+            let step = pyre_interpreter::execute_jump_backward_no_interrupt(
+                self,
+                *instruction,
+                op_arg,
+                next_instr,
+            )?;
             return Ok(Some(step));
         }
 
@@ -9902,6 +9956,17 @@ pub fn production_walker_handles(instruction: &Instruction) -> bool {
             // no guard; the dispatch gate keeps inline-frame ReturnValue on
             // the trait leg, so only the root exit is flipped.
             | Instruction::ReturnValue
+            // JumpBackward / JumpBackwardNoInterrupt — the loop back-edge,
+            // handled by the entry hook (NOT the arm walk, which surfaces
+            // SubReturn / rejects the top-level CloseLoop outcome).  The hook
+            // delegates to the same pub execute_jump_backward(_no_interrupt)
+            // the trait dispatch arms call, propagating StepResult::CloseLoop
+            // verbatim.  Unlike PopJumpIf, JumpBackward has a single shared
+            // close_loop_args_at reached identically by both legs (no
+            // leg-dependent kept-stack snapshot); the gate keeps inline-frame
+            // JumpBackward on the trait leg.
+            | Instruction::JumpBackward { .. }
+            | Instruction::JumpBackwardNoInterrupt { .. }
             // StoreFastStoreFast handled by the
             // dispatch_via_walker_for_opcode entry hook, delegating to the
             // symbolic `OpcodeStepExecutor::store_fast_store_fast` (the arm
