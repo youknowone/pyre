@@ -102,6 +102,19 @@ impl FieldEntry {
         }
     }
 
+    /// Box analog of [`as_seen_opref`](Self::as_seen_opref): the carried
+    /// `BoxRef` rather than its resolved `OpRef` position. Used where the
+    /// caller keys a box-identity (`Rc::ptr_eq`) map by the field's Phase 1
+    /// box — `_expand_infos_from_virtual` (export) and
+    /// `setinfo_from_preamble_list` (import) read the same shared virtual
+    /// info, so the returned boxes coincide by identity.
+    pub fn as_seen_box(&self) -> crate::box_ref::BoxRef {
+        match self {
+            FieldEntry::Value(b) => b.clone(),
+            FieldEntry::Preamble(pop) => pop.op.clone(),
+        }
+    }
+
     /// Consume and extract the `PreambleOp` if this is a `Preamble` entry.
     pub fn into_preamble(self) -> Option<PreambleOp> {
         match self {

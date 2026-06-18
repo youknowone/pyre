@@ -1305,7 +1305,7 @@ impl ProducedShortOp {
         &self,
         ctx: &mut crate::optimizeopt::OptContext,
         exported_infos: &crate::optimizeopt::vec_assoc::VecAssoc<
-            OpRef,
+            BoxRef,
             crate::optimizeopt::info::OpInfo,
         >,
         short_inputargs: &[BoxRef],
@@ -1531,7 +1531,7 @@ impl ProducedShortOp {
         &self,
         ctx: &mut crate::optimizeopt::OptContext,
         exported_infos: &crate::optimizeopt::vec_assoc::VecAssoc<
-            OpRef,
+            BoxRef,
             crate::optimizeopt::info::OpInfo,
         >,
         short_inputargs: &[BoxRef],
@@ -1576,9 +1576,7 @@ impl ProducedShortOp {
         // shortpreamble.py:66-68: if g.getarg(0) in exported_infos:
         //     setinfo_from_preamble(g.getarg(0), exported_infos[...])
         // Pass the Rc handle (unroll.py:61 identity preservation).
-        if let Some(crate::optimizeopt::info::OpInfo::Ptr(rc)) =
-            exported_infos.get(&object_arg.to_opref())
-        {
+        if let Some(crate::optimizeopt::info::OpInfo::Ptr(rc)) = exported_infos.get(&object_arg) {
             ctx.setinfo_from_preamble(obj_resolved, rc, Some(exported_infos));
         }
         let mut getfield_op = Op::new(
@@ -1657,7 +1655,7 @@ impl ProducedShortOp {
         &self,
         ctx: &mut crate::optimizeopt::OptContext,
         exported_infos: &crate::optimizeopt::vec_assoc::VecAssoc<
-            OpRef,
+            BoxRef,
             crate::optimizeopt::info::OpInfo,
         >,
         short_inputargs: &[BoxRef],
@@ -1714,9 +1712,7 @@ impl ProducedShortOp {
         // getarrayitem: if the base object has exported info, import it
         // before ensuring heap/array PtrInfo.
         // Pass the Rc handle (unroll.py:61 identity preservation).
-        if let Some(crate::optimizeopt::info::OpInfo::Ptr(rc)) =
-            exported_infos.get(&object_arg.to_opref())
-        {
+        if let Some(crate::optimizeopt::info::OpInfo::Ptr(rc)) = exported_infos.get(&object_arg) {
             ctx.setinfo_from_preamble(obj_resolved, rc, Some(exported_infos));
         }
         let index_const = ctx.make_constant_int(index);

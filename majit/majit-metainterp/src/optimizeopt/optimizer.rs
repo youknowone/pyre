@@ -3351,8 +3351,23 @@ impl Optimizer {
                     remap_opref(&mut opref);
                     *arg = crate::r#box::BoxRef::from_opref(opref);
                 };
-                for arg in &mut state.next_iteration_args {
-                    remap_boxref(arg);
+                // next_iteration_args now carries the canonical Phase-1 boxes that
+                // double as exported_infos keys. Remap by `set_position` (as
+                // short_inputargs below) to preserve box identity across
+                // compaction: a `from_opref` re-mint would sever the ptr_eq carry
+                // that import_state's exported_infos lookup depends on.
+                for arg in &state.next_iteration_args {
+                    let opref = arg.to_opref();
+                    // Const args carry their value inline (no body position):
+                    // `set_position` is a Const no-op and `opref.raw()` panics on
+                    // an inline-Const OpRef, so skip them. Their Rc identity (the
+                    // exported_infos key) is preserved untouched.
+                    if opref.is_constant() {
+                        continue;
+                    }
+                    let mut opref = opref;
+                    remap_opref(&mut opref);
+                    arg.set_position(opref.raw());
                 }
                 for arg in &mut state.end_args {
                     remap_boxref(arg);
@@ -3369,19 +3384,13 @@ impl Optimizer {
                     remap_opref(&mut opref);
                     arg.set_position(opref.raw());
                 }
-                // Remap exported_infos keys (Const keys pass through)
-                let old_infos = std::mem::take(&mut state.exported_infos);
-                for (key, value) in old_infos {
-                    let new_key = if key.is_constant() {
-                        key
-                    } else {
-                        remap
-                            .get(&key.raw())
-                            .map(|&p| key.with_raw(p))
-                            .unwrap_or(key)
-                    };
-                    state.exported_infos.insert(new_key, value);
-                }
+                // exported_infos is keyed by box identity (Rc::ptr_eq), so its keys
+                // need NO position remap — the lookup matches by Rc, not OpRef. The
+                // keys are the same Rcs as next_iteration_args (for end_args) /
+                // bound producer boxes (for label/short-box args), whose positions
+                // already moved through the shared set_position Cell above; a
+                // mem::take + re-insert under a remapped OpRef would only re-mint
+                // fresh non-ptr_eq keys and break the carry.
                 // Remap exported short boxes
                 for entry in &mut state.exported_short_boxes {
                     // Cell::get() returns a copy; the previous

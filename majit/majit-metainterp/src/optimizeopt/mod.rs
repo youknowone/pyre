@@ -2896,7 +2896,7 @@ impl OptContext {
         result_map: &crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef>,
         mut imported_constants: &mut crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef>,
         exported_infos: &crate::optimizeopt::vec_assoc::VecAssoc<
-            OpRef,
+            crate::r#box::BoxRef,
             crate::optimizeopt::info::OpInfo,
         >,
     ) -> bool {
@@ -2977,7 +2977,17 @@ impl OptContext {
             }
         };
         for (source, produced_op) in short_boxes {
-            if let Some(info) = exported_infos.get(source) {
+            // shortpreamble.py:417-421: op = produced_op.short_op.res;
+            //     if isinstance(op, Const): info = optimizer.getinfo(op)
+            //     else: info = exported_infos.get(op, None)
+            // Look up by the result BOX (`produced_op.res`) — the exporter keyed
+            // `_expand_info(produced_op.res)` by the same Rc (cloned from the
+            // shared `exported_short_boxes` entry), so the box-identity lookup
+            // hits. Const results are skipped (unroll.py:483 export skips them).
+            if produced_op.res.to_opref().is_constant() {
+                continue;
+            }
+            if let Some(info) = exported_infos.get(&produced_op.res) {
                 self.set_preamble_forwarded_info(replay_pos(*source, produced_op), info);
             }
         }
@@ -3641,7 +3651,7 @@ impl OptContext {
         op: OpRef,
         preamble_info_handle: &std::rc::Rc<std::cell::RefCell<PtrInfo>>,
         exported_infos: Option<
-            &crate::optimizeopt::vec_assoc::VecAssoc<OpRef, crate::optimizeopt::info::OpInfo>,
+            &crate::optimizeopt::vec_assoc::VecAssoc<crate::r#box::BoxRef, crate::optimizeopt::info::OpInfo>,
         >,
     ) {
         let op = self.get_replacement_opref(op);
@@ -3683,20 +3693,23 @@ impl OptContext {
                 ));
             }
             if let Some(infos) = exported_infos {
-                let items: Vec<OpRef> = match &*preamble_info_handle.borrow() {
-                    PtrInfo::Virtual(v) => v.fields.iter().map(|(_, r)| r.to_opref()).collect(),
-                    PtrInfo::VirtualArray(a) => a.items.iter().map(|b| b.to_opref()).collect(),
-                    PtrInfo::VirtualStruct(s) => {
-                        s.fields.iter().map(|(_, r)| r.to_opref()).collect()
-                    }
-                    PtrInfo::VirtualArrayStruct(a) => a
-                        .element_fields
-                        .iter()
-                        .flat_map(|row| row.iter().map(|(_, r)| r.to_opref()))
-                        .collect(),
-                    PtrInfo::VirtualRawBuffer(r) => r.buffer.values(),
-                    _ => Vec::new(),
-                };
+                // unroll.py:61-62: setinfo_from_preamble_list(
+                //     preamble_info.all_items(), exported_infos).
+                // Read field BOXES via `all_items()` — the SAME accessor the
+                // exporter (`_expand_infos_from_virtual`) walks on this shared
+                // `PtrInfo` cell, so the box-identity (`Rc::ptr_eq`) lookup hits.
+                // Using `all_items()` (not a per-variant arm) keeps export/import
+                // symmetric: `VirtualRawBuffer`/`VirtualArrayStruct` return `[]`
+                // here exactly as on the export side (RPython
+                // `RawBufferPtrInfo.all_items()` is also empty), so the import
+                // never iterates raw-buffer slots and never calls
+                // `clear_forwarded` on a `from_opref`-minted unbound box.
+                let items: Vec<crate::r#box::BoxRef> = preamble_info_handle
+                    .borrow()
+                    .all_items()
+                    .iter()
+                    .map(|(_, e)| e.as_seen_box())
+                    .collect();
                 self.setinfo_from_preamble_list(&items, infos);
             }
             return;
@@ -3796,36 +3809,36 @@ impl OptContext {
     /// logic, so this method becomes the literal unroll.py loop body.
     fn setinfo_from_preamble_list(
         &mut self,
-        items: &[OpRef],
+        items: &[crate::r#box::BoxRef],
         exported_infos: &crate::optimizeopt::vec_assoc::VecAssoc<
-            OpRef,
+            crate::r#box::BoxRef,
             crate::optimizeopt::info::OpInfo,
         >,
     ) {
-        for &item in items {
-            if item.is_none() {
+        for item in items {
+            // unroll.py:42-43: if item is None: continue
+            if item.to_opref().is_none() {
                 continue;
             }
-            // unroll.py:45-46: i = infos.get(item, None)
-            match exported_infos.get(&item).cloned() {
+            // unroll.py:45-46: i = infos.get(item, None) — keyed by the field
+            // box. `item` is read from the SAME shared virtual `PtrInfo` that
+            // the exporter walked (`_expand_infos_from_virtual`), so the
+            // box-identity (`Rc::ptr_eq`) lookup hits exactly when RPython's
+            // box-keyed dict does.
+            match exported_infos.get(item).cloned() {
                 Some(info) => {
                     // unroll.py:47: self.setinfo_from_preamble(item, i, infos)
-                    self.setinfo_from_preamble_item(item, &info, exported_infos);
+                    self.setinfo_from_preamble_item(item.to_opref(), &info, exported_infos);
                 }
                 None => {
                     // unroll.py:49: item.set_forwarded(None)
-                    // "let's not inherit stuff we don't know anything about"
-                    // Clears `item`'s OWN slot, not the chain terminal —
-                    // `resolve_to_boxref` returns the BoxRef bound to item's
-                    // canonical `_forwarded` host directly, without
-                    // `get_box_replacement` walking. For a const-namespace
-                    // OpRef it returns a fresh `BoxRef::new_const` whose
-                    // `clear_forwarded` is a no-op (Const has no
-                    // `_forwarded`), matching RPython where
-                    // `Const.set_forwarded` raises.
-                    if let Some(b) = self.resolve_to_boxref(item) {
-                        b.clear_forwarded();
-                    }
+                    // "let's not inherit stuff we don't know anything about".
+                    // Clears `item`'s OWN forwarded slot directly — `item` is
+                    // the raw field box (RPython passes the unresolved
+                    // `all_items()` box here). `clear_forwarded` is a no-op for
+                    // a Const box (Const has no `_forwarded`), matching RPython
+                    // where `Const.set_forwarded` raises.
+                    item.clear_forwarded();
                 }
             }
         }
@@ -3843,7 +3856,7 @@ impl OptContext {
         op: OpRef,
         preamble_info: &crate::optimizeopt::info::OpInfo,
         exported_infos: &crate::optimizeopt::vec_assoc::VecAssoc<
-            OpRef,
+            crate::r#box::BoxRef,
             crate::optimizeopt::info::OpInfo,
         >,
     ) {
@@ -3913,7 +3926,7 @@ impl OptContext {
         op: OpRef,
         preamble_info: &crate::optimizeopt::info::OpInfo,
         exported_infos: Option<
-            &crate::optimizeopt::vec_assoc::VecAssoc<OpRef, crate::optimizeopt::info::OpInfo>,
+            &crate::optimizeopt::vec_assoc::VecAssoc<crate::r#box::BoxRef, crate::optimizeopt::info::OpInfo>,
         >,
     ) {
         use crate::optimizeopt::info::OpInfo;
