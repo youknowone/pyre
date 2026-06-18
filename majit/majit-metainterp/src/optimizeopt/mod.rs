@@ -3353,18 +3353,6 @@ impl OptContext {
     /// returns whatever is stored — PtrInfo *or* IntBound — and calls
     /// `info.make_guards(...)` uniformly.
     fn collect_use_box_guards(&mut self, preamble_op: &Op) -> (Vec<Op>, Vec<Op>) {
-        // shortpreamble.py:383-396: guards for InputArg args only
-        let short_inputargs: Vec<crate::r#box::BoxRef> = self
-            .imported_short_preamble_builder
-            .as_ref()
-            .map(|b| b.short_inputargs().to_vec())
-            .or_else(|| {
-                self.active_short_preamble_producer
-                    .as_ref()
-                    .map(|b| b.short_inputargs().to_vec())
-            })
-            .unwrap_or_default();
-
         // shortpreamble.py:383-401 line-by-line:
         //
         //   for arg in preamble_op.getarglist():
@@ -3447,7 +3435,15 @@ impl OptContext {
             if arg.is_constant() || arg.is_none() {
                 continue;
             }
-            let is_input = short_inputargs.iter().any(|a| a.to_opref() == arg);
+            // shortpreamble.py:386 `isinstance(arg, AbstractInputArg)` — the
+            // classification is the arg's TYPE, not membership in
+            // `short_inputargs`. A renamed short inputarg and an original
+            // label arg are both AbstractInputArg; either way an input arg's
+            // forwarded info must NOT be cleared (it lives across iterations).
+            let is_input = matches!(
+                arg,
+                OpRef::InputArgInt(_) | OpRef::InputArgFloat(_) | OpRef::InputArgRef(_)
+            );
             if let Some(info) = snapshot_forwarded(self, arg) {
                 arg_entries.push(ArgEntry {
                     arg,
