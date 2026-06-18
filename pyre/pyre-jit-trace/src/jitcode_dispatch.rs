@@ -5626,6 +5626,69 @@ impl Drop for InlineCalleeConstsGuard {
     }
 }
 
+/// One paused caller frame the multi-frame inline snapshot must carry
+/// (#68/#124).  Computed at the inline CALL site — where the caller's live
+/// register banks are still in scope — and read back at guard-capture time
+/// (where the walk context is the callee's, so the caller banks are gone).
+#[derive(Clone)]
+struct InlineParentFrame {
+    /// The caller's jitcode index (`(*JitCode).index`).
+    jitcode_index: u32,
+    /// The caller's resume Python pc: the CALL's return point (fallthrough),
+    /// where the next opcode pops the call result.  First slice keeps this a
+    /// plain py_pc (`< AFTER_RESIDUAL_CALL_PC_FLAG`); a CALL inside a
+    /// try-block (catch marker) declines multi-frame.
+    resume_py_pc: u32,
+    /// The caller's `in_a_call` active boxes at `resume_py_pc` — the liveness
+    /// at the return point with the not-yet-produced call-result slot nulled
+    /// (`get_list_of_active_boxes(in_a_call=true)` parity, trace_opcode.rs:1779).
+    boxes: Vec<OpRef>,
+}
+
+thread_local! {
+    /// FBW inline parent-frame chain (#68/#124): for a guard emitted inside an
+    /// inlined callee sub-walk, the chain of paused caller frames the
+    /// multi-frame snapshot must carry, OUTERMOST-FIRST (the `Snapshot.frames`
+    /// order, recorder.rs:56).  A caller is pushed at the inline CALL site and
+    /// popped when its sub-walk returns, so the innermost caller is last and a
+    /// `reverse()` is not needed.  Empty outside the gated multi-frame inline
+    /// path (`PYRE_FBW_INLINE_MULTIFRAME`); the single-frame collapse
+    /// (caller-boundary re-execute, [`INLINE_SUBWALK_CAPTURE_BOUNDARY`]) stays
+    /// the default for straight-line callees.
+    static FBW_INLINE_PARENT_FRAMES: std::cell::RefCell<Vec<InlineParentFrame>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// RAII guard: push a paused caller frame onto the FBW inline parent-frame
+/// chain for the lifetime of its callee sub-walk; pop on drop so nested
+/// inlines unwind to their parent.
+struct InlineParentFrameGuard;
+
+impl InlineParentFrameGuard {
+    fn enter(frame: InlineParentFrame) -> Self {
+        FBW_INLINE_PARENT_FRAMES.with(|s| s.borrow_mut().push(frame));
+        InlineParentFrameGuard
+    }
+}
+
+impl Drop for InlineParentFrameGuard {
+    fn drop(&mut self) {
+        FBW_INLINE_PARENT_FRAMES.with(|s| {
+            s.borrow_mut().pop();
+        });
+    }
+}
+
+/// `PYRE_FBW_INLINE_MULTIFRAME` (#68): opt-in to inlining branch-bearing
+/// callees with a multi-frame guard snapshot, instead of declining them to
+/// the trait leg (`LoopBearingCalleeInlineUnsupported`).  Off by default —
+/// the multi-frame snapshot encode↔decode contract for walker-emitted
+/// callee-frame guards is validated under this flag (function_calls byte-exact
+/// + corpus) before any production default flip (which is Linux-CI gated).
+fn fbw_inline_multiframe_enabled() -> bool {
+    std::env::var_os("PYRE_FBW_INLINE_MULTIFRAME").is_some()
+}
+
 /// RAII guard: set [`FULL_BODY_SNAPSHOT_SYM`] for the lifetime of a
 /// full-body walk and restore the prior value on drop (so any nesting
 /// restores the parent rather than clearing to null).
@@ -6313,6 +6376,35 @@ fn walker_capture_snapshot_for_last_guard_impl(
     // capture below, which resumes at the CALL site (re-execute the
     // call on deopt — see `INLINE_SUBWALK_CAPTURE_BOUNDARY`).
     let inline_subwalk = INLINE_SUBWALK_CAPTURE_BOUNDARY.with(|c| c.get());
+    // #68 multi-frame inline guard: a guard emitted inside an inlined callee
+    // sub-walk with paused caller frames on `FBW_INLINE_PARENT_FRAMES` resumes
+    // BOTH the callee (at its own pc) and the caller(s) (at the CALL return
+    // point), instead of collapsing to the caller boundary (re-execute).  Only
+    // the gated forward-branch inline path (`PYRE_FBW_INLINE_MULTIFRAME`)
+    // populates the chain; straight-line callees keep the empty chain + the
+    // single-frame collapse below.
+    if inline_subwalk {
+        // Fire the multi-frame snapshot only when the paused-caller chain
+        // covers the FULL current inline depth: `FBW_INLINE_PARENT_FRAMES`
+        // (callers pushed by the gated multiframe path) must have one entry per
+        // active inlined callee (`FBW_INLINE_CODE_STACK`).  A nested
+        // straight-line callee inlined under a multiframe ancestor (e.g.
+        // `add3` inside a multiframe `mix`) pushes NO parent frame, so its own
+        // guards see a SHORTER chain than the callee depth — fall through to
+        // the single-frame collapse (the strict callee's resume-at-CALL
+        // behavior) rather than emit a chain that skips the intermediate frame.
+        let n_parents = FBW_INLINE_PARENT_FRAMES.with(|s| s.borrow().len());
+        let n_callees = FBW_INLINE_CODE_STACK.with(|s| s.borrow().len());
+        if n_parents > 0 && n_parents == n_callees {
+            let parent_frames = FBW_INLINE_PARENT_FRAMES.with(|s| s.borrow().clone());
+            return walker_capture_multi_frame_inline_snapshot(
+                ctx,
+                op_pc,
+                after_residual_call,
+                parent_frames,
+            );
+        }
+    }
     if !inline_subwalk && !full_body_sym.is_null() {
         // SAFETY: the pointer is set only for the lifetime of the
         // full-body `dispatch_via_miframe` (the guard restores it on
@@ -6524,6 +6616,198 @@ fn walker_capture_snapshot_for_last_guard_impl(
             &ctx.outer_active_boxes,
             ctx.outer_jitcode_index,
             ctx.entry_py_pc,
+            &vable_boxes,
+            &vref_boxes,
+        );
+    Ok(())
+}
+
+/// Build the paused caller frame for a multi-frame inline snapshot (#68),
+/// computed at the inline CALL site where the caller's live register banks
+/// (`ctx.registers_*`) are still in scope.  `call_jit_pc` is the CALL op's
+/// jitcode pc in the caller.  Returns `None` (→ caller declines the inline)
+/// when the caller frame is not snapshot-able for this first slice: missing
+/// liveness/pc_map, a CALL inside a try-block (catch marker resume pc is not
+/// representable in the multi-frame capture's bit-14-free py_pc slot), or no
+/// result on the operand stack at the return point.
+///
+/// The caller resumes at the CALL's return point (fallthrough) with the
+/// not-yet-produced call-result slot nulled — `get_list_of_active_boxes(
+/// in_a_call=true)` parity (`trace_opcode.rs:1779`).  Reuses
+/// [`collect_outer_active_boxes`] (the caller owns the portal virtualizable)
+/// after temporarily nulling the result slot's register.
+fn compute_inline_caller_frame(
+    ctx: &mut WalkContext<'_, '_>,
+    call_jit_pc: usize,
+) -> Option<InlineParentFrame> {
+    let caller_sym_ptr = FULL_BODY_SNAPSHOT_SYM.with(|c| c.get());
+    if caller_sym_ptr.is_null() {
+        return None;
+    }
+    // SAFETY: set for the lifetime of the top-level `dispatch_via_miframe`;
+    // read-only access to immutable layout fields.
+    let caller_sym = unsafe { &*caller_sym_ptr };
+    if caller_sym.jitcode.is_null() {
+        return None;
+    }
+    let (jitcode_index, fallthrough_py_pc, code_ptr) = unsafe {
+        let jc = &*caller_sym.jitcode;
+        if jc.payload.code_ptr.is_null() || jc.payload.metadata.pc_map.is_empty() {
+            return None;
+        }
+        let call_py = python_pc_for_jitcode_pc(&jc.payload.metadata, call_jit_pc) as usize;
+        // A CALL inside a try-block resumes at its own catch via a bit-14
+        // marker pc, which the multi-frame capture's `py_pc < FLAG` assert
+        // rejects — decline this slice.
+        if jc.payload.after_residual_call_resume_pc_for(call_py).is_some() {
+            return None;
+        }
+        let code = &*jc.payload.code_ptr;
+        let fallthrough = crate::metainterp::semantic_fallthrough_pc(code, call_py) as u32;
+        (jc.index as u32, fallthrough, jc.payload.code_ptr)
+    };
+    // The call result is the top operand-stack slot at the return point.
+    let depth = unsafe {
+        crate::liveness::liveness_for(code_ptr)
+            .depth_at_py_pc()
+            .get(fallthrough_py_pc as usize)
+            .copied()
+            .unwrap_or(0) as usize
+    };
+    if depth == 0 {
+        return None;
+    }
+    let result_idx = depth - 1;
+    let stack_color_map = crate::state::stack_slot_color_map_at(jitcode_index as i32);
+    let result_color = *stack_color_map.get(result_idx)? as usize;
+    // Null the not-yet-produced result slot, build the box list, then restore
+    // the caller's register (the inlined callee, not the walk, produces the
+    // result; the inner frame supplies it on resume).
+    let null_ref = ctx.trace_ctx.const_ref(pyre_object::PY_NULL as i64);
+    let saved = ctx.registers_r.get(result_color).copied();
+    if result_color < ctx.registers_r.len() {
+        ctx.registers_r[result_color] = null_ref;
+    }
+    let boxes = collect_outer_active_boxes(
+        caller_sym,
+        ctx.trace_ctx,
+        ctx.registers_i,
+        ctx.registers_r,
+        ctx.registers_f,
+        jitcode_index,
+        fallthrough_py_pc,
+        None,
+    );
+    if let (Some(saved), true) = (saved, result_color < ctx.registers_r.len()) {
+        ctx.registers_r[result_color] = saved;
+    }
+    Some(InlineParentFrame {
+        jitcode_index,
+        resume_py_pc: fallthrough_py_pc,
+        boxes,
+    })
+}
+
+/// Emit a multi-frame inline guard snapshot (#68): the inlined callee's OWN
+/// (top/innermost) frame built from the live sub-walk register banks, plus the
+/// pre-computed paused caller frame(s) on [`FBW_INLINE_PARENT_FRAMES`].  Frame
+/// order is OUTERMOST-FIRST (`recorder.rs:56` / `build_resumed_frames`
+/// `eval.rs:6505`): the parent chain followed by the callee top frame.  The
+/// stale doc on `capture_snapshot_for_last_guard_multi_frame_with_vable_vref`
+/// claiming `frames[0]=top` is wrong — the function writes frames verbatim.
+fn walker_capture_multi_frame_inline_snapshot(
+    ctx: &mut WalkContext<'_, '_>,
+    callee_op_pc: usize,
+    after_residual_call: bool,
+    parent_frames: Vec<InlineParentFrame>,
+) -> Result<(), DispatchError> {
+    if !ctx.trace_ctx.vable_snapshot_buildable() {
+        return Err(DispatchError::GuardSnapshotVableUntyped { pc: callee_op_pc });
+    }
+    // Callee (top/innermost) frame: map the guard's jitcode pc to the callee's
+    // own Python pc, read liveness from the live sub-walk register banks.
+    let Some(callee_w_code) = FBW_INLINE_CODE_STACK.with(|s| s.borrow().last().copied()) else {
+        return Err(DispatchError::LoopBearingCalleeInlineUnsupported { pc: callee_op_pc });
+    };
+    let Some(callee_jitcode_index) = crate::state::ensure_jitcode_index(callee_w_code as *const ())
+    else {
+        return Err(DispatchError::LoopBearingCalleeInlineUnsupported { pc: callee_op_pc });
+    };
+    let Some(callee_pjc) = crate::state::pyjitcode_for_jitcode_index(callee_jitcode_index) else {
+        return Err(DispatchError::LoopBearingCalleeInlineUnsupported { pc: callee_op_pc });
+    };
+    if callee_pjc.metadata.pc_map.is_empty() || callee_pjc.code_ptr.is_null() {
+        return Err(DispatchError::LoopBearingCalleeInlineUnsupported { pc: callee_op_pc });
+    }
+    let callee_py_pc = unsafe {
+        let code = &*callee_pjc.code_ptr;
+        let mut py = python_pc_for_jitcode_pc(&callee_pjc.metadata, callee_op_pc);
+        py = skip_python_trivia_forward(code, py as usize) as u32;
+        if after_residual_call {
+            py = crate::metainterp::semantic_fallthrough_pc(code, py as usize) as u32;
+        }
+        py
+    };
+    let callee_boxes = collect_callee_active_boxes(
+        ctx.registers_i,
+        ctx.registers_r,
+        ctx.registers_f,
+        callee_jitcode_index as u32,
+        callee_py_pc,
+    );
+
+    // Publish the OUTERMOST caller's vable scalars for its resume coordinate so
+    // the resume reader restores the caller's `PyFrame` at the CALL return
+    // point rather than the stale loop-header seed the walker never crosses
+    // `set_orgpc` to update (mirror of the single-frame path above, 6366-6426).
+    let outer = &parent_frames[0];
+    let caller_sym_ptr = FULL_BODY_SNAPSHOT_SYM.with(|c| c.get());
+    if !caller_sym_ptr.is_null() {
+        let caller_sym = unsafe { &*caller_sym_ptr };
+        if caller_sym.owns_virtualizable_shadow() && !caller_sym.jitcode.is_null() {
+            let last_instr_value = outer.resume_py_pc as i64 - 1;
+            let last_instr_op = ctx.trace_ctx.const_int(last_instr_value);
+            crate::trace_opcode::mirror_vable_static_to_boxes(
+                ctx.trace_ctx,
+                "last_instr",
+                last_instr_op,
+                Value::Int(last_instr_value),
+            );
+            let vsd_value = unsafe {
+                let jc = &*caller_sym.jitcode;
+                if jc.payload.code_ptr.is_null() {
+                    caller_sym.valuestackdepth as i64
+                } else {
+                    let lv = crate::liveness::liveness_for(jc.payload.code_ptr);
+                    match lv.depth_at_py_pc().get(outer.resume_py_pc as usize).copied() {
+                        Some(d) => (caller_sym.nlocals + d as usize) as i64,
+                        None => caller_sym.valuestackdepth as i64,
+                    }
+                }
+            };
+            let vsd_op = ctx.trace_ctx.const_int(vsd_value);
+            crate::trace_opcode::mirror_vable_static_to_boxes(
+                ctx.trace_ctx,
+                "valuestackdepth",
+                vsd_op,
+                Value::Int(vsd_value),
+            );
+        }
+    }
+
+    let (vable_boxes, vref_boxes) = ctx.trace_ctx.build_snapshot_vable_vref_boxes();
+
+    // Frame tuples, OUTERMOST-FIRST: the paused caller chain, then the callee
+    // top frame last (innermost).
+    let mut frames: Vec<(u32, u32, &[OpRef])> = Vec::with_capacity(parent_frames.len() + 1);
+    for pf in &parent_frames {
+        frames.push((pf.jitcode_index, pf.resume_py_pc, pf.boxes.as_slice()));
+    }
+    frames.push((callee_jitcode_index as u32, callee_py_pc, callee_boxes.as_slice()));
+
+    ctx.trace_ctx
+        .capture_snapshot_for_last_guard_multi_frame_with_vable_vref(
+            &frames,
             &vable_boxes,
             &vref_boxes,
         );
@@ -7234,6 +7518,98 @@ fn inline_resolvable_static_vable_read(
     )
 }
 
+/// Relaxed variant of [`callee_fast_path_inlinable`] for the multi-frame
+/// inline path (#68, `PYRE_FBW_INLINE_MULTIFRAME`): a FORWARD `goto_if_not`
+/// (branch target ahead of the branch op) is now inlinable because its
+/// in-callee guard resumes through a multi-frame snapshot
+/// ([`walker_capture_snapshot_for_last_guard_impl`]'s parent-frame branch).
+/// A BACKWARD `goto_if_not` (a loop back-edge) and any `switch` still decline:
+/// a loop in the callee needs a `jit_merge_point` the inline snapshot does
+/// not model, and a multi-target switch is not yet handled.  Non-static vable
+/// reads decline exactly as in the strict predicate (a vable-bearing callee
+/// would abort `VableBoxNotSeeded`).
+fn callee_fast_path_inlinable_allowing_forward_branch(
+    body_code: &[u8],
+    callee_descr_refs: &[DescrRef],
+    ctx: &WalkContext<'_, '_>,
+) -> bool {
+    let mut pc = 0usize;
+    while pc < body_code.len() {
+        let Some(d) = crate::jitcode_runtime::decode_op_at(body_code, pc) else {
+            return false;
+        };
+        if d.opname.starts_with("switch") {
+            return false;
+        }
+        if d.opname.starts_with("goto_if_not") {
+            // `iL`: 2B LE label at operand offset 1 (after the 1B Int reg).
+            let target = read_label(body_code, &d, 1);
+            if target <= d.pc {
+                return false;
+            }
+        }
+        if d.opname.contains("vable")
+            && !inline_resolvable_static_vable_read(body_code, &d, callee_descr_refs, ctx)
+        {
+            return false;
+        }
+        pc = d.next_pc;
+    }
+    true
+}
+
+/// Active boxes for an inlined callee's OWN frame in a multi-frame snapshot
+/// (#68).  The fast-path inline predicate guarantees the callee does not own a
+/// virtualizable (any vable op declines the inline), so the owns_vable /
+/// portal-reg / semantic-slot machinery in [`collect_outer_active_boxes`]
+/// reduces to a plain per-bank `registers_{i,r,f}[live_color]` read — RPython
+/// `pyjitpl.py:218-225 _get_list_of_active_boxes`, banks in int → ref → float
+/// order to match the `all_liveness` header layout the decoder consumes.  A
+/// liveness-active register holding `OpRef::NONE` is a tracer-side invariant
+/// violation (callee banks are sized to the jitcode num_regs co-published with
+/// liveness), so panic loudly rather than bleed NONE into the encoder.
+fn collect_callee_active_boxes(
+    regs_i: &[OpRef],
+    regs_r: &[OpRef],
+    regs_f: &[OpRef],
+    callee_jitcode_index: u32,
+    callee_py_pc: u32,
+) -> Vec<OpRef> {
+    let banks = crate::state::frame_liveness_reg_indices_by_bank_at(
+        callee_jitcode_index as i32,
+        callee_py_pc as i32,
+    );
+    let mut active = Vec::with_capacity(banks.int.len() + banks.ref_.len() + banks.float.len());
+    let read = |bank: &[OpRef], idx: u32, name: &str| -> OpRef {
+        let v = bank.get(idx as usize).copied().unwrap_or_else(|| {
+            panic!(
+                "collect_callee_active_boxes: liveness-active {name} register {idx} out of \
+                 range (callee_jitcode_index={callee_jitcode_index}, \
+                 callee_py_pc={callee_py_pc}, bank_len={})",
+                bank.len()
+            )
+        });
+        if v == OpRef::NONE {
+            panic!(
+                "collect_callee_active_boxes: liveness-active {name} register {idx} holds \
+                 OpRef::NONE (callee_jitcode_index={callee_jitcode_index}, \
+                 callee_py_pc={callee_py_pc})"
+            );
+        }
+        v
+    };
+    for &idx in &banks.int {
+        active.push(read(regs_i, idx, "int"));
+    }
+    for &idx in &banks.ref_ {
+        active.push(read(regs_r, idx, "ref"));
+    }
+    for &idx in &banks.float {
+        active.push(read(regs_f, idx, "float"));
+    }
+    active
+}
+
 /// #62: full-body-walk direct `CALL_ASSEMBLER` for a self-recursive call
 /// at the inline recursion-bound boundary (dev-gated `PYRE_FBW_REC_CA`).
 ///
@@ -7712,7 +8088,19 @@ fn try_walker_inline_user_call(
     // The trait leg inlines such callees via `push_inline_frame` +
     // `recursive-call-assembler`, so route the enclosing key there
     // (`FBW_DECLINED_KEYS`) instead of recording the slow residual.
-    if !callee_fast_path_inlinable(body.code, callee_descr_refs, ctx) {
+    let strict_inlinable = callee_fast_path_inlinable(body.code, callee_descr_refs, ctx);
+    // #68: under `PYRE_FBW_INLINE_MULTIFRAME`, a forward-branch-bearing callee
+    // is inlinable with a multi-frame guard snapshot (its in-callee branch
+    // guard resumes through `walker_capture_multi_frame_inline_snapshot` rather
+    // than collapsing to the caller boundary).  Restricted to a TOP-LEVEL
+    // caller (single inline level) for this slice: a nested caller's jitcode
+    // index is not the inherited `outer_jitcode_index`, and its paused-frame
+    // chain needs deeper grandparent plumbing.
+    let try_multiframe = !strict_inlinable
+        && fbw_inline_multiframe_enabled()
+        && ctx.is_top_level
+        && callee_fast_path_inlinable_allowing_forward_branch(body.code, callee_descr_refs, ctx);
+    if !strict_inlinable && !try_multiframe {
         // #62: a self-recursive single-int call (`fib`'s shape) the fast-path
         // inline cannot serve is handled instead by the direct
         // `CALL_ASSEMBLER` arm (`try_walker_call_assembler_self_recursive`).
@@ -7797,6 +8185,21 @@ fn try_walker_inline_user_call(
         callee_concrete_r[reg] = arg_concretes[2 + i];
     }
 
+    // #68: a forward-branch callee inlined under the multi-frame path needs a
+    // paused caller frame on `FBW_INLINE_PARENT_FRAMES` so its in-callee guards
+    // snapshot both frames.  Compute it here, while the caller's live register
+    // banks (`ctx.registers_*`) are still in scope — at guard-capture time the
+    // walk context is the callee's.  A caller frame that is not snapshot-able
+    // (try-block catch marker / missing liveness) declines to the trait leg.
+    let parent_frame = if try_multiframe {
+        match compute_inline_caller_frame(ctx, op.pc) {
+            Some(pf) => Some(pf),
+            None => return Err(DispatchError::LoopBearingCalleeInlineUnsupported { pc: op.pc }),
+        }
+    } else {
+        None
+    };
+
     let callee_outcome = {
         let mut sub_wc = WalkContext {
             registers_r: &mut callee_regs_r,
@@ -7838,6 +8241,10 @@ fn try_walker_inline_user_call(
         // unseeded portal frame to its compile-time constants for the
         // lifetime of the sub-walk.
         let _callee_consts = InlineCalleeConstsGuard::enter(inline_consts);
+        // #68 multi-frame: push the paused caller frame for the lifetime of the
+        // callee sub-walk so its branch guards capture both frames (no-op when
+        // `parent_frame` is None — the strict straight-line inline path).
+        let _parent_frame_guard = parent_frame.map(InlineParentFrameGuard::enter);
         let (outcome, _end_pc) = match walk(body.code, 0, &mut sub_wc) {
             Ok(v) => v,
             Err(e) => {
