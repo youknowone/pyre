@@ -5368,6 +5368,31 @@ except (ValueError, 42):
     }
 
     #[test]
+    fn test_check_exc_match_against_matches_by_actual_type() {
+        // pyopcode.py:1040 `return space.exception_match(space.type(w_1), w_2)`:
+        // the left operand is matched by its *actual* type, never treated as
+        // an unconditional success.  Guards the three shapes the residual
+        // `bh_compare_fn` (call_jit.rs) and the BC `check_exc_match` share:
+        //   * a matching exception instance   -> true
+        //   * a non-matching exception class  -> false (an `except` clause
+        //     past the first must not spuriously match)
+        //   * a non-exception value           -> false (matched by `type(v)`,
+        //     whose MRO holds no exception class)
+        let (_result, frame) = run_exec_frame(
+            "exc = ValueError(\"boom\")\nplain = 5\nvalue_error = ValueError\ntype_error = TypeError",
+        );
+        let w_globals = unsafe { &*frame.fget_w_globals() };
+        let exc = *w_globals.get("exc").expect("missing exc");
+        let plain = *w_globals.get("plain").expect("missing plain");
+        let value_error = *w_globals.get("value_error").expect("missing value_error");
+        let type_error = *w_globals.get("type_error").expect("missing type_error");
+
+        assert!(check_exc_match_against(exc, value_error));
+        assert!(!check_exc_match_against(exc, type_error));
+        assert!(!check_exc_match_against(plain, value_error));
+    }
+
+    #[test]
     fn test_try_finally() {
         let source = "\
 result = 0
