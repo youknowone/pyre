@@ -5,8 +5,8 @@ use pyre_object::PyObjectRef;
 use crate::PyError;
 
 use super::{
-    HIGHEST_PROTOCOL, call_fn, call_meth, decode_long, getattribute_dotted, import_module, op,
-    parse_int_text, read_int_le, str_from_utf8, unpickling_error,
+    HIGHEST_PROTOCOL, call_fn, call_meth, decode_long, import_module, op, parse_int_text,
+    read_int_le, str_from_utf8, unpickling_error,
 };
 
 #[crate::pyre_class("_pickle.Unpickler")]
@@ -27,6 +27,11 @@ pub struct W_Unpickler {
     proto: i64,
     /// Apply the `_compat_pickle` py2→py3 name remap at protocol < 3.
     fix_imports: bool,
+    /// Encoding for the legacy STRING / BINSTRING / SHORT_BINSTRING decode
+    /// (`"ASCII"` by default; `"bytes"` returns the raw bytes object).
+    encoding: String,
+    /// Decode error handler for the above (`"strict"` by default).
+    errors: String,
     /// Out-of-band `buffers` iterator (proto 5), or None.
     w_buffers: PyObjectRef,
 }
@@ -50,6 +55,8 @@ impl W_Unpickler {
             frame_index: 0,
             proto: 0,
             fix_imports: true,
+            encoding: String::from("ASCII"),
+            errors: String::from("strict"),
             w_buffers: pyre_object::w_none(),
         })
     }
@@ -62,10 +69,20 @@ impl W_Unpickler {
         #[default(pyre_object::w_none())] errors: PyObjectRef,
         #[default(pyre_object::w_none())] buffers: PyObjectRef,
     ) -> Result<(), PyError> {
-        // `encoding` / `errors` govern the legacy py2 byte string decode path;
-        // pyre stores unicode natively, so they are accepted for signature
-        // compatibility. `fix_imports` gates the proto-< 3 py2→py3 name remap.
-        let _ = (encoding, errors);
+        // `encoding` / `errors` govern the legacy STRING / BINSTRING /
+        // SHORT_BINSTRING decode (`_decode_string`); `None` falls back to the
+        // `"ASCII"` / `"strict"` defaults. `fix_imports` gates the proto-< 3
+        // py2→py3 name remap.
+        self.encoding = if unsafe { pyre_object::is_none(encoding) } {
+            String::from("ASCII")
+        } else {
+            unsafe { pyre_object::strobject::w_str_get_value(encoding) }.to_string()
+        };
+        self.errors = if unsafe { pyre_object::is_none(errors) } {
+            String::from("strict")
+        } else {
+            unsafe { pyre_object::strobject::w_str_get_value(errors) }.to_string()
+        };
         self.fix_imports = crate::baseobjspace::is_true(fix_imports)?;
         self.w_file_read = crate::baseobjspace::getattr_str(file, "read")?;
         self.w_file_readline = crate::baseobjspace::getattr_str(file, "readline")?;
@@ -115,6 +132,30 @@ impl W_Unpickler {
             }
             dispatch(slot, opcode)?;
         }
+    }
+
+    /// `Unpickler.find_class(module, name)` — import `module` and resolve
+    /// `name` against it. A subclass may override this to control which
+    /// globals the unpickler is allowed to import (the standard security
+    /// hook). Emits the `pickle.find_class` audit event.
+    fn find_class(
+        &self,
+        w_module: PyObjectRef,
+        w_name: PyObjectRef,
+    ) -> Result<PyObjectRef, PyError> {
+        let module = unsafe { pyre_object::strobject::w_str_get_value(w_module) }.to_string();
+        let name = unsafe { pyre_object::strobject::w_str_get_value(w_name) }.to_string();
+        audit_find_class(&module, &name);
+        // protocol < 3 with `fix_imports` applies the py2 → py3 `_compat_pickle`
+        // forward map before resolution; otherwise the name resolves literally.
+        let (module, name) = if self.proto < 3 && self.fix_imports {
+            crate::module::_pickle::compat_map(&module, &name, false)
+        } else {
+            (module, name)
+        };
+        crate::module::_pickle::try_resolve_global(&module, &name)?.ok_or_else(|| {
+            PyError::attribute_error(format!("Can't get attribute {name:?} on module {module:?}"))
+        })
     }
 }
 
@@ -334,8 +375,12 @@ fn dispatch(slot: usize, opcode: u8) -> Result<(), PyError> {
         }
         x if x == op::LONG4 => {
             let nb = read(slot, 4)?;
-            let n = i32::from_le_bytes([nb[0], nb[1], nb[2], nb[3]]) as usize;
-            let d = read(slot, n)?;
+            let n = i32::from_le_bytes([nb[0], nb[1], nb[2], nb[3]]);
+            if n < 0 {
+                // Corrupt or hostile pickle -- we never write one like this.
+                return Err(unpickling_error("LONG pickle has negative byte count"));
+            }
+            let d = read(slot, n as usize)?;
             push(slot, decode_long(&d));
         }
         x if x == op::BINFLOAT => {
@@ -413,6 +458,33 @@ fn dispatch(slot: usize, opcode: u8) -> Result<(), PyError> {
             let d = read(slot, n)?;
             push(slot, pyre_object::w_bytes_from_bytes(&d));
         }
+        // ── legacy protocol-0/1 str ───────────────────────────────────
+        x if x == op::STRING => {
+            // A protocol-0 quoted py2 str: strip the matching outer quotes,
+            // decode the bytes-literal escapes, then apply `encoding`/`errors`.
+            let line = read_line_bytes(slot)?;
+            let data = strip_string_quotes(&line)?;
+            let raw = escape_decode(&data)?;
+            let w = decode_string(slot, &raw)?;
+            push(slot, w);
+        }
+        x if x == op::BINSTRING => {
+            // Deprecated BINSTRING uses a signed 32-bit length.
+            let nb = read(slot, 4)?;
+            let n = i32::from_le_bytes([nb[0], nb[1], nb[2], nb[3]]);
+            if n < 0 {
+                return Err(unpickling_error("BINSTRING pickle has negative byte count"));
+            }
+            let d = read(slot, n as usize)?;
+            let w = decode_string(slot, &d)?;
+            push(slot, w);
+        }
+        x if x == op::SHORT_BINSTRING => {
+            let n = read(slot, 1)?[0] as usize;
+            let d = read(slot, n)?;
+            let w = decode_string(slot, &d)?;
+            push(slot, w);
+        }
         // ── stack ────────────────────────────────────────────────────
         x if x == op::MARK => mark(slot),
         x if x == op::POP => {
@@ -427,6 +499,10 @@ fn dispatch(slot: usize, opcode: u8) -> Result<(), PyError> {
         }
         x if x == op::POP_MARK => {
             pop_mark(slot)?;
+        }
+        x if x == op::DUP => {
+            let v = top(slot, "DUP")?;
+            push(slot, v);
         }
         // ── tuple ─────────────────────────────────────────────────────
         x if x == op::EMPTY_TUPLE => push(slot, pyre_object::tupleobject::w_tuple_new(Vec::new())),
@@ -462,8 +538,37 @@ fn dispatch(slot: usize, opcode: u8) -> Result<(), PyError> {
         }
         x if x == op::APPENDS => {
             let items = pop_mark(slot)?;
+            // Pin `items` so the `extend`/`append` lookups (which may allocate
+            // and collect) do not strand it; re-read the list top per call.
+            let _roots = pyre_object::gc_roots::push_roots();
+            pyre_object::gc_roots::pin_root(items);
+            let items_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
             let w_list = top(slot, "APPENDS")?;
-            call_meth(w_list, "extend", &[items])?;
+            match crate::baseobjspace::findattr(w_list, "extend") {
+                Some(extend) if !unsafe { pyre_object::is_none(extend) } => {
+                    call_fn(extend, &[pyre_object::gc_roots::shadow_stack_get(items_slot)])?;
+                }
+                _ => {
+                    // PEP 307 requires extend(); fall back to append() for
+                    // objects lacking it (backward compatibility).
+                    let n = unsafe {
+                        pyre_object::listobject::w_list_len(
+                            pyre_object::gc_roots::shadow_stack_get(items_slot),
+                        )
+                    };
+                    for i in 0..n {
+                        let w_list = top(slot, "APPENDS")?;
+                        let item = unsafe {
+                            pyre_object::listobject::w_list_getitem(
+                                pyre_object::gc_roots::shadow_stack_get(items_slot),
+                                i as i64,
+                            )
+                            .unwrap()
+                        };
+                        call_meth(w_list, "append", &[item])?;
+                    }
+                }
+            }
         }
         // ── dict ──────────────────────────────────────────────────────
         x if x == op::EMPTY_DICT => push(slot, pyre_object::dictmultiobject::w_dict_new()),
@@ -492,12 +597,31 @@ fn dispatch(slot: usize, opcode: u8) -> Result<(), PyError> {
         }
         x if x == op::ADDITEMS => {
             let items = pop_mark(slot)?;
+            let _roots = pyre_object::gc_roots::push_roots();
+            pyre_object::gc_roots::pin_root(items);
+            let items_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
             let w_set = top(slot, "ADDITEMS")?;
-            let n = unsafe { pyre_object::listobject::w_list_len(items) };
-            for i in 0..n {
-                let item =
-                    unsafe { pyre_object::listobject::w_list_getitem(items, i as i64).unwrap() };
-                unsafe { pyre_object::setobject::w_set_add(w_set, item) };
+            if unsafe { pyre_object::setobject::is_set(w_set) } {
+                // `set.update(items)` dispatches through the (possibly
+                // overridden) method, matching `isinstance(set_obj, set)`.
+                call_meth(w_set, "update", &[pyre_object::gc_roots::shadow_stack_get(items_slot)])?;
+            } else {
+                let n = unsafe {
+                    pyre_object::listobject::w_list_len(
+                        pyre_object::gc_roots::shadow_stack_get(items_slot),
+                    )
+                };
+                for i in 0..n {
+                    let w_set = top(slot, "ADDITEMS")?;
+                    let item = unsafe {
+                        pyre_object::listobject::w_list_getitem(
+                            pyre_object::gc_roots::shadow_stack_get(items_slot),
+                            i as i64,
+                        )
+                        .unwrap()
+                    };
+                    call_meth(w_set, "add", &[item])?;
+                }
             }
         }
         // ── bytearray ─────────────────────────────────────────────────
@@ -517,9 +641,8 @@ fn dispatch(slot: usize, opcode: u8) -> Result<(), PyError> {
         x if x == op::GLOBAL => {
             let module = read_line(slot)?;
             let name = read_line(slot)?;
-            let proto = cur(slot).proto;
-            let fix_imports = cur(slot).fix_imports;
-            push(slot, find_class(&module, &name, proto, fix_imports)?);
+            let v = call_find_class(slot, pyre_object::w_str_new(&module), pyre_object::w_str_new(&name))?;
+            push(slot, v);
         }
         x if x == op::STACK_GLOBAL => {
             let w_name = pop(slot)?;
@@ -528,11 +651,22 @@ fn dispatch(slot: usize, opcode: u8) -> Result<(), PyError> {
             {
                 return Err(unpickling_error("STACK_GLOBAL requires str"));
             }
-            let name = unsafe { pyre_object::strobject::w_str_get_value(w_name) }.to_string();
-            let module = unsafe { pyre_object::strobject::w_str_get_value(w_module) }.to_string();
-            let proto = cur(slot).proto;
-            let fix_imports = cur(slot).fix_imports;
-            push(slot, find_class(&module, &name, proto, fix_imports)?);
+            let v = call_find_class(slot, w_module, w_name)?;
+            push(slot, v);
+        }
+        x if x == op::EXT1 => {
+            let code = read(slot, 1)?[0] as i64;
+            get_extension(slot, code)?;
+        }
+        x if x == op::EXT2 => {
+            let d = read(slot, 2)?;
+            let code = u16::from_le_bytes([d[0], d[1]]) as i64;
+            get_extension(slot, code)?;
+        }
+        x if x == op::EXT4 => {
+            let d = read(slot, 4)?;
+            let code = i32::from_le_bytes([d[0], d[1], d[2], d[3]]) as i64;
+            get_extension(slot, code)?;
         }
         x if x == op::REDUCE => {
             let w_args = pop(slot)?;
@@ -624,7 +758,8 @@ fn dispatch(slot: usize, opcode: u8) -> Result<(), PyError> {
         x if x == op::INST => {
             let module = read_line(slot)?;
             let name = read_line(slot)?;
-            let w_cls = find_class(&module, &name, cur(slot).proto, cur(slot).fix_imports)?;
+            let w_cls =
+                call_find_class(slot, pyre_object::w_str_new(&module), pyre_object::w_str_new(&name))?;
             let w_args = pop_mark(slot)?;
             let v = instantiate(w_cls, w_args)?;
             push(slot, v);
@@ -721,38 +856,175 @@ fn read_line_int(slot: usize) -> Result<i64, PyError> {
         .map_err(|_| PyError::value_error("invalid int literal"))
 }
 
-/// `find_class` — import `module_name` and resolve `name` against it.
-/// Builtin names resolve through the execution context's `lookup_builtin`
-/// (the `LOAD_GLOBAL` path); the module-object `getattr` does not see
-/// builtins installed on the underlying storage. Other non-dotted names
-/// resolve through the module's `__dict__` (dict subscript), and dotted
-/// (protocol >= 4 nested) names fall back to the attribute walk.
-fn find_class(
-    module_name: &str,
-    name: &str,
-    proto: i64,
-    fix_imports: bool,
+/// Dispatch to `self.find_class(module, name)` through the instance, so a
+/// Python subclass override (the standard security hook) is honoured.
+fn call_find_class(
+    slot: usize,
+    w_module: PyObjectRef,
+    w_name: PyObjectRef,
 ) -> Result<PyObjectRef, PyError> {
-    // protocol < 3 with `fix_imports` applies the py2 → py3 `_compat_pickle`
-    // forward map before resolution; otherwise the name is resolved literally.
-    let (module_name, name) = if proto < 3 && fix_imports {
-        crate::module::_pickle::compat_map(module_name, name, false)
-    } else {
-        (module_name.to_string(), name.to_string())
-    };
-    let module_name = module_name.as_str();
-    let name = name.as_str();
-    if module_name == "builtins" && !name.contains('.') {
-        if let Some(obj) = crate::module::_pickle::lookup_builtin(name) {
-            return Ok(obj);
+    let self_obj = pyre_object::gc_roots::shadow_stack_get(slot);
+    call_meth(self_obj, "find_class", &[w_module, w_name])
+}
+
+/// Emit the `pickle.find_class` audit event.
+fn audit_find_class(module: &str, name: &str) {
+    if let Ok(sys) = import_module("sys") {
+        if let Ok(audit) = crate::baseobjspace::getattr_str(sys, "audit") {
+            let _ = call_fn(
+                audit,
+                &[
+                    pyre_object::w_str_new("pickle.find_class"),
+                    pyre_object::w_str_new(module),
+                    pyre_object::w_str_new(name),
+                ],
+            );
         }
     }
-    let module = import_module(module_name)?;
-    if name.contains('.') {
-        return Ok(getattribute_dotted(module, name)?.0);
+}
+
+/// `get_extension` (EXT1 / EXT2 / EXT4) — resolve a `copyreg` extension code
+/// to its registered global via `_extension_cache` / `_inverted_registry`.
+fn get_extension(slot: usize, code: i64) -> Result<(), PyError> {
+    let copyreg = import_module("copyreg")?;
+    let cache = crate::baseobjspace::getattr_str(copyreg, "_extension_cache")?;
+    if let Some(obj) = unsafe { pyre_object::w_dict_lookup(cache, pyre_object::w_int_new(code)) } {
+        push(slot, obj);
+        return Ok(());
     }
-    let w_dict = crate::baseobjspace::getattr_str(module, "__dict__")?;
-    crate::baseobjspace::getitem(w_dict, pyre_object::w_str_new(name))
+    let inverted = crate::baseobjspace::getattr_str(copyreg, "_inverted_registry")?;
+    let key = match unsafe { pyre_object::w_dict_lookup(inverted, pyre_object::w_int_new(code)) } {
+        Some(k) if !unsafe { pyre_object::is_none(k) } => k,
+        _ => {
+            if code <= 0 {
+                // Corrupt or hostile pickle (0 is forbidden by add_extension).
+                return Err(unpickling_error("EXT specifies code <= 0"));
+            }
+            return Err(PyError::value_error(format!(
+                "unregistered extension code {code}"
+            )));
+        }
+    };
+    // `key` is the `(module, name)` tuple registered for this code.
+    let w_module = unsafe { pyre_object::tupleobject::w_tuple_getitem(key, 0).unwrap() };
+    let w_name = unsafe { pyre_object::tupleobject::w_tuple_getitem(key, 1).unwrap() };
+    let obj = call_find_class(slot, w_module, w_name)?;
+    // `_extension_cache[code] = obj`; pin `obj` across the dict lookups.
+    let _roots = pyre_object::gc_roots::push_roots();
+    pyre_object::gc_roots::pin_root(obj);
+    let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let copyreg = import_module("copyreg")?;
+    let cache = crate::baseobjspace::getattr_str(copyreg, "_extension_cache")?;
+    crate::baseobjspace::setitem(
+        cache,
+        pyre_object::w_int_new(code),
+        pyre_object::gc_roots::shadow_stack_get(obj_slot),
+    )?;
+    push(slot, pyre_object::gc_roots::shadow_stack_get(obj_slot));
+    Ok(())
+}
+
+/// `_decode_string` — turn the raw bytes of a STRING / BINSTRING /
+/// SHORT_BINSTRING into the object the unpickler pushes: the raw `bytes` when
+/// `encoding == "bytes"`, otherwise `bytes.decode(encoding, errors)`.
+fn decode_string(slot: usize, data: &[u8]) -> Result<PyObjectRef, PyError> {
+    let (encoding, errors, as_bytes) = {
+        let me = cur(slot);
+        (me.encoding.clone(), me.errors.clone(), me.encoding == "bytes")
+    };
+    if as_bytes {
+        return Ok(pyre_object::w_bytes_from_bytes(data));
+    }
+    let _roots = pyre_object::gc_roots::push_roots();
+    let w_bytes = pyre_object::w_bytes_from_bytes(data);
+    pyre_object::gc_roots::pin_root(w_bytes);
+    let b = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let w_encoding = pyre_object::w_str_new(&encoding);
+    pyre_object::gc_roots::pin_root(w_encoding);
+    let e = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let w_errors = pyre_object::w_str_new(&errors);
+    call_meth(
+        pyre_object::gc_roots::shadow_stack_get(b),
+        "decode",
+        &[pyre_object::gc_roots::shadow_stack_get(e), w_errors],
+    )
+}
+
+/// Strip the matching outer quotes from a protocol-0 STRING argument.
+fn strip_string_quotes(line: &[u8]) -> Result<Vec<u8>, PyError> {
+    if line.len() >= 2
+        && line[0] == line[line.len() - 1]
+        && (line[0] == b'"' || line[0] == b'\'')
+    {
+        Ok(line[1..line.len() - 1].to_vec())
+    } else {
+        Err(unpickling_error("the STRING opcode argument must be quoted"))
+    }
+}
+
+/// `codecs.escape_decode` over a byte string — decode the Python bytes-literal
+/// escapes (`PyBytes_DecodeEscape` semantics, `strict`). Unrecognised escapes
+/// keep the backslash verbatim.
+fn escape_decode(data: &[u8]) -> Result<Vec<u8>, PyError> {
+    let mut out = Vec::with_capacity(data.len());
+    let mut i = 0;
+    while i < data.len() {
+        let c = data[i];
+        if c != b'\\' {
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        i += 1;
+        if i >= data.len() {
+            // Trailing backslash — kept verbatim.
+            out.push(b'\\');
+            break;
+        }
+        let e = data[i];
+        i += 1;
+        match e {
+            b'\n' => {}            // line continuation
+            b'\\' => out.push(b'\\'),
+            b'\'' => out.push(b'\''),
+            b'"' => out.push(b'"'),
+            b'a' => out.push(0x07),
+            b'b' => out.push(0x08),
+            b'f' => out.push(0x0c),
+            b'n' => out.push(b'\n'),
+            b'r' => out.push(b'\r'),
+            b't' => out.push(b'\t'),
+            b'v' => out.push(0x0b),
+            b'0'..=b'7' => {
+                // up to three octal digits (the first already consumed).
+                let mut val = (e - b'0') as u32;
+                let mut k = 0;
+                while k < 2 && i < data.len() && (b'0'..=b'7').contains(&data[i]) {
+                    val = val * 8 + (data[i] - b'0') as u32;
+                    i += 1;
+                    k += 1;
+                }
+                out.push(val as u8);
+            }
+            b'x' => {
+                let hi = data.get(i).and_then(|&b| (b as char).to_digit(16));
+                let lo = data.get(i + 1).and_then(|&b| (b as char).to_digit(16));
+                match (hi, lo) {
+                    (Some(h), Some(l)) => {
+                        out.push((h * 16 + l) as u8);
+                        i += 2;
+                    }
+                    _ => return Err(unpickling_error("invalid \\x escape in STRING")),
+                }
+            }
+            other => {
+                // Unrecognised escape: keep the backslash and the character.
+                out.push(b'\\');
+                out.push(other);
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Resolve and invoke `self.persistent_load(pid)` (PERSID / BINPERSID).

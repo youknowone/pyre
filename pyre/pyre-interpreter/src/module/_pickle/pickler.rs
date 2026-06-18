@@ -26,6 +26,11 @@ pub struct W_Pickler {
     /// Memo of saved objects — a Python `list` (GC-walked) persisted across
     /// `dump` calls until `clear_memo`, position = memo index.
     w_memo: PyObjectRef,
+    /// `fast` mode — when set, memoization is skipped.
+    fast: bool,
+    /// User-set `dispatch_table` mapping, or `PY_NULL` when unset; the dump
+    /// path falls back to `copyreg.dispatch_table` when unset.
+    w_dispatch_table: PyObjectRef,
 }
 
 /// Per-`dump` pickling context.  The identity memo maps an already-saved
@@ -51,6 +56,16 @@ struct PickleCtx {
     pers_func: PyObjectRef,
     /// `buffer_callback` for proto-5 out-of-band buffers, or `None`/`PY_NULL`.
     buffer_callback: PyObjectRef,
+    /// `fast` mode — when set, memoization is skipped (no PUT/GET, no
+    /// recursion guard).
+    fast: bool,
+    /// Effective `dispatch_table` (the pickler's, else `copyreg.dispatch_table`)
+    /// consulted by `type` for the reduce of an otherwise-unhandled object;
+    /// `None`/`PY_NULL` when unavailable.
+    dispatch_table: PyObjectRef,
+    /// `reducer_override` callable (a subclass hook) consulted for every
+    /// object, or `PY_NULL` when not defined.
+    reducer_override: PyObjectRef,
 }
 
 impl PickleCtx {
@@ -82,6 +97,17 @@ impl PickleCtx {
 ///
 /// `push` / `extend_from_slice` mirror the `Vec<u8>` methods the save
 /// routines call, so they write through the framer unchanged.
+///
+/// Deliberate deviation: `_Framer` streams — it writes each committed frame
+/// (and every unframed byte at protocol < 4) to the file's `write` as it is
+/// produced. This buffers the entire pickle in `output` and the caller writes
+/// it to the file in a single `write` after the save completes. The wire bytes
+/// are identical; only the number of `write` calls and peak memory differ.
+/// Streaming is not done because the save tree treats byte emission as
+/// GC-inert: routing `file.write` (arbitrary Python, hence a nursery
+/// relocation point) through every `push` / `commit_frame` would require
+/// re-pinning and re-reading raw object pointers around every byte written
+/// across the whole save tree, not just at the existing reduce/getattr calls.
 struct Framer {
     current_frame: Option<Vec<u8>>,
     output: Vec<u8>,
@@ -171,6 +197,8 @@ impl W_Pickler {
             fix_imports: true,
             buffer_callback: pyre_object::w_none(),
             w_memo: pyre_object::listobject::w_list_new(Vec::new()),
+            fast: false,
+            w_dispatch_table: pyre_object::PY_NULL,
         })
     }
 
@@ -198,6 +226,8 @@ impl W_Pickler {
         self.fix_imports = crate::baseobjspace::is_true(fix_imports)?;
         self.buffer_callback = buffer_callback;
         self.w_memo = pyre_object::listobject::w_list_new(Vec::new());
+        self.fast = false;
+        self.w_dispatch_table = pyre_object::PY_NULL;
         Ok(())
     }
 
@@ -212,6 +242,8 @@ impl W_Pickler {
         let bin = self.bin;
         let framing = self.framing;
         let fix_imports = self.fix_imports;
+        let fast = self.fast;
+        let w_dispatch_table = self.w_dispatch_table;
         let w_file = self.w_file;
         let buffer_callback = self.buffer_callback;
         let w_memo = self.w_memo;
@@ -225,11 +257,20 @@ impl W_Pickler {
         pyre_object::gc_roots::pin_root(w_memo);
         let memo_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
 
-        // A `persistent_id` defined on a subclass (or set as an attribute)
-        // overrides the default no-op; the base class has none.
+        // A `persistent_id` / `reducer_override` defined on a subclass (or set
+        // as an attribute) overrides the default; the base class has neither.
         let pers_func = crate::baseobjspace::findattr(self_ptr, "persistent_id")
             .filter(|&f| !unsafe { pyre_object::is_none(f) })
             .unwrap_or(pyre_object::PY_NULL);
+        let reducer_override = crate::baseobjspace::findattr(self_ptr, "reducer_override")
+            .filter(|&f| !unsafe { pyre_object::is_none(f) })
+            .unwrap_or(pyre_object::PY_NULL);
+        // The pickler's `dispatch_table` if set, else `copyreg.dispatch_table`.
+        let dispatch_table = if !w_dispatch_table.is_null() {
+            w_dispatch_table
+        } else {
+            copyreg_dispatch_table()
+        };
 
         let w_memo = pyre_object::gc_roots::shadow_stack_get(memo_slot);
         let w_bytes = pickle_core(
@@ -241,11 +282,59 @@ impl W_Pickler {
             pers_func,
             buffer_callback,
             w_memo,
+            fast,
+            dispatch_table,
+            reducer_override,
         )?;
         // `w_file` may have moved while building the pickle; re-read the pin.
         let w_file = pyre_object::gc_roots::shadow_stack_get(file_slot);
         call_meth(w_file, "write", &[w_bytes])?;
         Ok(())
+    }
+
+    /// `Pickler.bin` — whether binary opcodes are in use (protocol >= 1).
+    #[getter]
+    fn bin(&self) -> i64 {
+        self.bin as i64
+    }
+
+    /// `Pickler.fast` — when set, memoization is skipped.
+    #[getter]
+    fn fast(&self) -> i64 {
+        self.fast as i64
+    }
+
+    #[setter]
+    fn set_fast(&mut self, w_value: PyObjectRef) -> Result<(), PyError> {
+        self.fast = crate::baseobjspace::is_true(w_value)?;
+        Ok(())
+    }
+
+    /// `Pickler.dispatch_table` — the per-pickler type→reduce mapping. Unset by
+    /// default (reading it raises `AttributeError`); when unset the dump path
+    /// falls back to `copyreg.dispatch_table`.
+    #[getter]
+    fn dispatch_table(&self) -> Result<PyObjectRef, PyError> {
+        if self.w_dispatch_table.is_null() {
+            return Err(PyError::attribute_error(
+                "'_pickle.Pickler' object has no attribute 'dispatch_table'".to_string(),
+            ));
+        }
+        Ok(self.w_dispatch_table)
+    }
+
+    #[setter]
+    fn set_dispatch_table(&mut self, w_value: PyObjectRef) {
+        self.w_dispatch_table = w_value;
+    }
+}
+
+/// `copyreg.dispatch_table`, or `PY_NULL` when `copyreg` is unavailable.
+pub(crate) fn copyreg_dispatch_table() -> PyObjectRef {
+    match import_module("copyreg") {
+        Ok(copyreg) => crate::baseobjspace::getattr_str(copyreg, "dispatch_table")
+            .unwrap_or(pyre_object::PY_NULL),
+        Err(_) => pyre_object::PY_NULL,
     }
 }
 
@@ -283,6 +372,7 @@ pub(crate) fn normalize_protocol(w_protocol: PyObjectRef) -> Result<i64, PyError
 /// module-level `dump` / `dumps`. `pers_func` is the `persistent_id` callable
 /// or `PY_NULL`. PROTO is written before framing begins (outside the frame);
 /// STOP is written while framing is active (inside the last frame).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn pickle_core(
     w_obj: PyObjectRef,
     proto: i64,
@@ -292,6 +382,9 @@ pub(crate) fn pickle_core(
     pers_func: PyObjectRef,
     buffer_callback: PyObjectRef,
     w_memo: PyObjectRef,
+    fast: bool,
+    dispatch_table: PyObjectRef,
+    reducer_override: PyObjectRef,
 ) -> Result<PyObjectRef, PyError> {
     let _roots = pyre_object::gc_roots::push_roots();
     pyre_object::gc_roots::pin_root(w_obj);
@@ -300,6 +393,12 @@ pub(crate) fn pickle_core(
     }
     if !buffer_callback.is_null() && !unsafe { pyre_object::is_none(buffer_callback) } {
         pyre_object::gc_roots::pin_root(buffer_callback);
+    }
+    if !dispatch_table.is_null() && !unsafe { pyre_object::is_none(dispatch_table) } {
+        pyre_object::gc_roots::pin_root(dispatch_table);
+    }
+    if !reducer_override.is_null() {
+        pyre_object::gc_roots::pin_root(reducer_override);
     }
     // Pin the memo list and index its existing entries (a reused `Pickler`
     // carries memo state across `dump` calls until `clear_memo`).
@@ -323,6 +422,9 @@ pub(crate) fn pickle_core(
         index,
         pers_func,
         buffer_callback,
+        fast,
+        dispatch_table,
+        reducer_override,
     };
     let mut fr = Framer::new();
     if proto >= 2 {
@@ -383,11 +485,48 @@ fn save_pers(ctx: &mut PickleCtx, buf: &mut Framer, w_pid: PyObjectRef) -> Resul
     Ok(())
 }
 
-/// Exact-type dispatch via the `is_*` predicates (bool is checked before
-/// int because a bool is not an int here, and `is_int_or_long` also covers
-/// big integers). Atoms are never memoized; everything else is checked
-/// against the identity memo for a GET back-reference before being saved.
+/// `interp_pickle.py W_Pickler.save` body after the persistent-id hook: the
+/// identity memo (atoms are never memoized) and the `reducer_override`
+/// subclass hook, then the type dispatch in [`dispatch_save`].
 fn save_object(ctx: &mut PickleCtx, buf: &mut Framer, w_obj: PyObjectRef) -> Result<(), PyError> {
+    let is_atom = unsafe {
+        pyre_object::is_none(w_obj)
+            || pyre_object::is_bool(w_obj)
+            || pyre_object::is_int_or_long(w_obj)
+            || pyre_object::is_float(w_obj)
+    };
+    // Identity memo — a repeated reference becomes a GET back-reference
+    // (checked before `reducer_override`, matching the save order).
+    if !is_atom {
+        if let Some(idx) = ctx.memo_get(w_obj) {
+            write_get(ctx, buf, idx);
+            return Ok(());
+        }
+    }
+    if ctx.reducer_override.is_null() {
+        return dispatch_save(ctx, buf, w_obj);
+    }
+    // `reducer_override` is offered every object; pin `w_obj` across the hook
+    // call. A result other than NotImplemented replaces the default reduction.
+    let _roots = pyre_object::gc_roots::push_roots();
+    pyre_object::gc_roots::pin_root(w_obj);
+    let slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let w_rv = call_fn(
+        ctx.reducer_override,
+        &[pyre_object::gc_roots::shadow_stack_get(slot)],
+    )?;
+    if !unsafe { pyre_object::is_not_implemented(w_rv) } {
+        return save_reduce_value(ctx, buf, pyre_object::gc_roots::shadow_stack_get(slot), w_rv);
+    }
+    dispatch_save(ctx, buf, pyre_object::gc_roots::shadow_stack_get(slot))
+}
+
+/// Exact-type dispatch via the `is_*` predicates (bool is checked before int
+/// because a bool is not an int here, and `is_int_or_long` also covers big
+/// integers). The memo has already been consulted by [`save_object`]. Classes
+/// and functions are saved by reference; anything else goes through the
+/// `dispatch_table` then the reduce protocol.
+fn dispatch_save(ctx: &mut PickleCtx, buf: &mut Framer, w_obj: PyObjectRef) -> Result<(), PyError> {
     // Atoms — never memoized.
     if unsafe { pyre_object::is_none(w_obj) } {
         buf.push(op::NONE);
@@ -404,13 +543,6 @@ fn save_object(ctx: &mut PickleCtx, buf: &mut Framer, w_obj: PyObjectRef) -> Res
         save_float(ctx, buf, w_obj)?;
         return Ok(());
     }
-
-    // Identity memo — a repeated reference becomes a GET back-reference.
-    if let Some(idx) = ctx.memo_get(w_obj) {
-        write_get(ctx, buf, idx);
-        return Ok(());
-    }
-
     if unsafe { pyre_object::is_bytes(w_obj) } {
         return save_bytes(ctx, buf, w_obj);
     }
@@ -446,6 +578,12 @@ fn save_object(ctx: &mut PickleCtx, buf: &mut Framer, w_obj: PyObjectRef) -> Res
         return save_global(ctx, buf, w_obj, None);
     }
 
+    // A `dispatch_table` reduce function registered for this exact type takes
+    // precedence over `__reduce_ex__`.
+    if let Some(w_rv) = dispatch_table_reduce(ctx, w_obj)? {
+        return save_reduce_value(ctx, buf, w_obj, w_rv);
+    }
+
     // Everything else goes through the reduce protocol.
     let w_rv = match crate::baseobjspace::findattr(w_obj, "__reduce_ex__") {
         Some(reduce_ex) => call_fn(reduce_ex, &[pyre_object::w_int_new(ctx.proto)])?,
@@ -454,6 +592,18 @@ fn save_object(ctx: &mut PickleCtx, buf: &mut Framer, w_obj: PyObjectRef) -> Res
             None => return Err(pickling_error("Can't pickle object: no __reduce_ex__")),
         },
     };
+    save_reduce_value(ctx, buf, w_obj, w_rv)
+}
+
+/// Save the result of a reduce hook (`reducer_override` / `dispatch_table` /
+/// `__reduce_ex__`): a `str` saves the object by global reference, a 2-to-6
+/// element tuple drives `save_reduce`.
+fn save_reduce_value(
+    ctx: &mut PickleCtx,
+    buf: &mut Framer,
+    w_obj: PyObjectRef,
+    w_rv: PyObjectRef,
+) -> Result<(), PyError> {
     if unsafe { pyre_object::is_str(w_rv) } {
         return save_global(ctx, buf, w_obj, Some(w_rv));
     }
@@ -470,6 +620,37 @@ fn save_object(ctx: &mut PickleCtx, buf: &mut Framer, w_obj: PyObjectRef) -> Res
         return save_reduce(ctx, buf, &rv, Some(w_obj));
     }
     Err(pickling_error("__reduce__ must return string or tuple"))
+}
+
+/// Look up `type(w_obj)` in the effective `dispatch_table` and, if registered,
+/// call the reduce function. Returns its result, or `None` when no table or
+/// no matching entry applies.
+fn dispatch_table_reduce(
+    ctx: &PickleCtx,
+    w_obj: PyObjectRef,
+) -> Result<Option<PyObjectRef>, PyError> {
+    let dt = ctx.dispatch_table;
+    if dt.is_null() || unsafe { pyre_object::is_none(dt) } {
+        return Ok(None);
+    }
+    if !unsafe { pyre_object::is_dict(dt) }
+        || unsafe { pyre_object::dictmultiobject::w_dict_len(dt) } == 0
+    {
+        return Ok(None);
+    }
+    let type_fn = crate::module::_pickle::lookup_builtin("type")
+        .ok_or_else(|| pickling_error("type builtin unavailable"))?;
+    let _roots = pyre_object::gc_roots::push_roots();
+    pyre_object::gc_roots::pin_root(w_obj);
+    let slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let w_type = call_fn(type_fn, &[pyre_object::gc_roots::shadow_stack_get(slot)])?;
+    match unsafe { pyre_object::w_dict_lookup(dt, w_type) } {
+        Some(reduce_fn) => Ok(Some(call_fn(
+            reduce_fn,
+            &[pyre_object::gc_roots::shadow_stack_get(slot)],
+        )?)),
+        None => Ok(None),
+    }
 }
 
 fn save_bool(ctx: &PickleCtx, buf: &mut Framer, w_obj: PyObjectRef) -> Result<(), PyError> {
@@ -1092,8 +1273,11 @@ fn write_get(ctx: &PickleCtx, buf: &mut Framer, idx: usize) {
 }
 
 /// `interp_pickle.py memoize` — record the object's identity and write the
-/// put opcode.
+/// put opcode. A no-op in `fast` mode (no PUT/GET, no recursion guard).
 fn memoize(ctx: &mut PickleCtx, buf: &mut Framer, w_obj: PyObjectRef) {
+    if ctx.fast {
+        return;
+    }
     let list = ctx.memo_list();
     let idx = unsafe { pyre_object::listobject::w_list_len(list) };
     // Compute the move-stable hash before the append, whose growth could
@@ -1119,37 +1303,69 @@ fn memoize(ctx: &mut PickleCtx, buf: &mut Framer, w_obj: PyObjectRef) {
 
 // ── reduce / global ──────────────────────────────────────────────────
 
-/// `interp_pickle.py whichmodule` — the module an object belongs to.
-/// `__module__` takes precedence; otherwise scan `sys.modules` for the
-/// module that exposes `name` resolving back to `w_obj`, skipping
-/// `__main__` / `__mp_main__` / `None`, and default to `"__main__"`.
+/// `whichmodule` — the module an object belongs to. `__module__` takes
+/// precedence; otherwise scan `sys.modules` for the module that exposes
+/// `name` resolving back to `w_obj`, skipping `__main__` / `__mp_main__` /
+/// `None`, and default to `"__main__"`. Then verify (importing the module)
+/// that `module_name.name` resolves back to this exact object, raising a
+/// PicklingError otherwise — the dump-time check that the wire reference is
+/// actually loadable.
 fn whichmodule(w_obj: PyObjectRef, name: &str) -> Result<PyObjectRef, PyError> {
-    if let Some(m) = crate::baseobjspace::findattr(w_obj, "__module__") {
-        if !unsafe { pyre_object::is_none(m) } {
-            return Ok(m);
-        }
+    if name.split('.').any(|s| s == "<locals>") {
+        return Err(pickling_error(format!("Can't pickle local object {name}")));
     }
-    let modules = crate::importing::sys_modules_dict();
-    if !modules.is_null() {
-        for (w_modname, w_module) in unsafe { pyre_object::dictmultiobject::w_dict_items(modules) }
-        {
-            if !unsafe { pyre_object::is_str(w_modname) }
-                || unsafe { pyre_object::is_none(w_module) }
-            {
-                continue;
-            }
-            let modname = unsafe { pyre_object::strobject::w_str_get_value(w_modname) };
-            if modname == "__main__" || modname == "__mp_main__" {
-                continue;
-            }
-            if let Ok((resolved, _)) = getattribute_dotted(w_module, name) {
-                if crate::baseobjspace::is_w(resolved, w_obj) {
-                    return Ok(w_modname);
+    let from_attr: Option<String> = match crate::baseobjspace::findattr(w_obj, "__module__") {
+        Some(m) if !unsafe { pyre_object::is_none(m) } && unsafe { pyre_object::is_str(m) } => {
+            Some(unsafe { pyre_object::strobject::w_str_get_value(m) }.to_string())
+        }
+        _ => None,
+    };
+    let module_name = match from_attr {
+        Some(mn) => mn,
+        None => {
+            // Scan sys.modules; a match here is already verified by identity.
+            let modules = crate::importing::sys_modules_dict();
+            let mut found: Option<String> = None;
+            if !modules.is_null() {
+                for (w_modname, w_module) in
+                    unsafe { pyre_object::dictmultiobject::w_dict_items(modules) }
+                {
+                    if !unsafe { pyre_object::is_str(w_modname) }
+                        || unsafe { pyre_object::is_none(w_module) }
+                    {
+                        continue;
+                    }
+                    let modname =
+                        unsafe { pyre_object::strobject::w_str_get_value(w_modname) }.to_string();
+                    if modname == "__main__" || modname == "__mp_main__" {
+                        continue;
+                    }
+                    if let Ok((resolved, _)) = getattribute_dotted(w_module, name) {
+                        if crate::baseobjspace::is_w(resolved, w_obj) {
+                            found = Some(modname);
+                            break;
+                        }
+                    }
                 }
             }
+            match found {
+                Some(mn) => return Ok(pyre_object::w_str_new(&mn)),
+                None => String::from("__main__"),
+            }
         }
+    };
+    // Verify `module_name.name` resolves back to `w_obj`.
+    match crate::module::_pickle::try_resolve_global(&module_name, name)? {
+        Some(resolved) if crate::baseobjspace::is_w(resolved, w_obj) => {
+            Ok(pyre_object::w_str_new(&module_name))
+        }
+        Some(_) => Err(pickling_error(format!(
+            "Can't pickle object: it's not the same object as {module_name}.{name}"
+        ))),
+        None => Err(pickling_error(format!(
+            "Can't pickle object: it's not found as {module_name}.{name}"
+        ))),
     }
-    Ok(pyre_object::w_str_new("__main__"))
 }
 
 /// `interp_pickle.py save_global` / `save_global2` — save an object by
@@ -1167,48 +1383,111 @@ fn save_global(
             .or_else(|| crate::baseobjspace::findattr(w_obj, "__name__"))
             .ok_or_else(|| pickling_error("Can't pickle object: no __qualname__ / __name__"))?,
     };
-    let name = unsafe { pyre_object::strobject::w_str_get_value(w_name) }.to_string();
-    let w_module_name = whichmodule(w_obj, &name)?;
+    // `whichmodule` imports the home module (to verify the reference), so pin
+    // `w_obj` / `w_name` and re-read them afterwards.
+    let _roots = pyre_object::gc_roots::push_roots();
+    pyre_object::gc_roots::pin_root(w_obj);
+    let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    pyre_object::gc_roots::pin_root(w_name);
+    let name_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+
+    let name = unsafe {
+        pyre_object::strobject::w_str_get_value(pyre_object::gc_roots::shadow_stack_get(name_slot))
+    }
+    .to_string();
+    let w_module_name = whichmodule(pyre_object::gc_roots::shadow_stack_get(obj_slot), &name)?;
     let module_name = unsafe { pyre_object::strobject::w_str_get_value(w_module_name) }.to_string();
 
-    // The unpickler resolves `module_name.name` at load time via `find_class`.
-    // CPython additionally verifies the name resolves back to this exact
-    // object at dump time, but pyre's `getattr` on the `builtins` module is
-    // unreliable here (it can return a non-canonical object and corrupt
-    // builtin state), so that round-trip check is skipped. Nested-ness is
-    // derived from the qualname instead of an attribute walk.
-    let nested = name.contains('.');
+    // protocol >= 2: a `copyreg` extension code is emitted as EXT1/EXT2/EXT4
+    // (and the object is not memoized — the reference is idempotent).
+    if ctx.proto >= 2 {
+        if let Some(code) = extension_code(&module_name, &name) {
+            write_ext(buf, code)?;
+            return Ok(());
+        }
+    }
 
     if ctx.proto >= 4 {
-        save(ctx, buf, w_module_name)?;
-        save(ctx, buf, w_name)?;
+        save(ctx, buf, pyre_object::w_str_new(&module_name))?;
+        save(ctx, buf, pyre_object::gc_roots::shadow_stack_get(name_slot))?;
         buf.push(op::STACK_GLOBAL);
-    } else if nested {
-        // Nested object at protocol < 4: reduce to getattr(parent, lastname).
-        let module = import_module(&module_name)?;
-        let dot = name.rfind('.').unwrap();
-        let (parent, _) = getattribute_dotted(module, &name[..dot])?;
-        let lastname = &name[dot + 1..];
-        let w_getattr = builtin_attr("getattr")?;
-        let w_args =
-            pyre_object::tupleobject::w_tuple_new(vec![parent, pyre_object::w_str_new(lastname)]);
-        save_reduce(ctx, buf, &[w_getattr, w_args], None)?;
+    } else if name.contains('.') {
+        // protocol < 4 nested: the top-level name by GLOBAL, then one
+        // `getattr(<current>, attrname)` REDUCE per remaining dotted part.
+        let parts: Vec<&str> = name.split('.').collect();
+        let rest = &parts[1..];
+        for _ in rest {
+            let w_getattr = builtin_attr("getattr")?;
+            save(ctx, buf, w_getattr)?;
+            if ctx.proto < 2 {
+                buf.push(op::MARK);
+            }
+        }
+        save_toplevel_by_name(ctx, buf, &module_name, parts[0])?;
+        for attrname in rest {
+            save(ctx, buf, pyre_object::w_str_new(attrname))?;
+            if ctx.proto < 2 {
+                buf.push(op::TUPLE);
+            } else {
+                buf.push(op::TUPLE2);
+            }
+            buf.push(op::REDUCE);
+        }
     } else {
-        // protocol < 3 with `fix_imports` applies the py3 → py2
-        // `_compat_pickle` reverse map; protocol 3 (or `fix_imports=False`)
-        // writes the name verbatim.
-        let (module_name, name) = if ctx.proto < 3 && ctx.fix_imports {
-            crate::module::_pickle::compat_map(&module_name, &name, true)
-        } else {
-            (module_name, name)
-        };
-        buf.push(op::GLOBAL);
-        buf.extend_from_slice(module_name.as_bytes());
-        buf.push(b'\n');
-        buf.extend_from_slice(name.as_bytes());
-        buf.push(b'\n');
+        save_toplevel_by_name(ctx, buf, &module_name, &name)?;
     }
-    memoize(ctx, buf, w_obj);
+    memoize(ctx, buf, pyre_object::gc_roots::shadow_stack_get(obj_slot));
+    Ok(())
+}
+
+/// `_save_toplevel_by_name` — emit a GLOBAL opcode for a top-level name,
+/// applying the protocol-< 3 `fix_imports` py3 → py2 reverse map.
+fn save_toplevel_by_name(
+    ctx: &PickleCtx,
+    buf: &mut Framer,
+    module_name: &str,
+    name: &str,
+) -> Result<(), PyError> {
+    let (module_name, name) = if ctx.proto < 3 && ctx.fix_imports {
+        crate::module::_pickle::compat_map(module_name, name, true)
+    } else {
+        (module_name.to_string(), name.to_string())
+    };
+    buf.push(op::GLOBAL);
+    buf.extend_from_slice(module_name.as_bytes());
+    buf.push(b'\n');
+    buf.extend_from_slice(name.as_bytes());
+    buf.push(b'\n');
+    Ok(())
+}
+
+/// The `copyreg._extension_registry` code for `(module_name, name)`, if any.
+fn extension_code(module_name: &str, name: &str) -> Option<i64> {
+    let copyreg = import_module("copyreg").ok()?;
+    let registry = crate::baseobjspace::getattr_str(copyreg, "_extension_registry").ok()?;
+    let key = pyre_object::tupleobject::w_tuple_new(vec![
+        pyre_object::w_str_new(module_name),
+        pyre_object::w_str_new(name),
+    ]);
+    let code = unsafe { pyre_object::w_dict_lookup(registry, key) }?;
+    crate::baseobjspace::int_w(code).ok()
+}
+
+/// Emit the size-appropriate EXT opcode for a (positive) extension code.
+fn write_ext(buf: &mut Framer, code: i64) -> Result<(), PyError> {
+    if code <= 0xff {
+        if code == 0 {
+            return Err(PyError::runtime_error("extension code 0 is out of range"));
+        }
+        buf.push(op::EXT1);
+        buf.push(code as u8);
+    } else if code <= 0xffff {
+        buf.push(op::EXT2);
+        buf.extend_from_slice(&(code as u16).to_le_bytes());
+    } else {
+        buf.push(op::EXT4);
+        buf.extend_from_slice(&(code as i32).to_le_bytes());
+    }
     Ok(())
 }
 

@@ -290,6 +290,41 @@ pub(crate) fn getattribute_dotted(
     Ok((cur, parent))
 }
 
+/// Resolve `module_name.name` to the live object, importing the module
+/// first. `builtins` names resolve through the execution context (whose
+/// `getattr` wrapper does not see builtins on the underlying storage); other
+/// names resolve through the module `__dict__`, dotted names through the
+/// attribute walk. Returns `Ok(None)` when the name is simply absent
+/// (AttributeError / KeyError) so the dump-time verification can report a
+/// precise "not found" error; the load-side `find_class` maps `None` to an
+/// error. No `_compat_pickle` remap — callers apply that first. Shared by the
+/// unpickler `find_class` (load) and `whichmodule` (dump verification) so the
+/// two stay symmetric.
+pub(crate) fn try_resolve_global(
+    module_name: &str,
+    name: &str,
+) -> Result<Option<PyObjectRef>, PyError> {
+    if module_name == "builtins" && !name.contains('.') {
+        if let Some(obj) = lookup_builtin(name) {
+            return Ok(Some(obj));
+        }
+    }
+    let module = import_module(module_name)?;
+    if name.contains('.') {
+        return match getattribute_dotted(module, name) {
+            Ok((obj, _)) => Ok(Some(obj)),
+            Err(e) if e.kind == crate::PyErrorKind::AttributeError => Ok(None),
+            Err(e) => Err(e),
+        };
+    }
+    let w_dict = crate::baseobjspace::getattr_str(module, "__dict__")?;
+    match crate::baseobjspace::getitem(w_dict, pyre_object::w_str_new(name)) {
+        Ok(obj) => Ok(Some(obj)),
+        Err(e) if e.kind == crate::PyErrorKind::KeyError => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
 // ── encode_long / decode_long — two's-complement little-endian ───────
 // `interp_pickle.py encode_long` / CPython `pickle.encode_long`.
 
@@ -402,18 +437,29 @@ crate::py_module! {
         ) -> Result<PyObjectRef, PyError> {
             let proto = pickler::normalize_protocol(protocol)?;
             pickler::check_buffer_callback(buffer_callback, proto)?;
+            let fix = crate::baseobjspace::is_true(fix_imports)?;
             let _roots = pyre_object::gc_roots::push_roots();
+            pyre_object::gc_roots::pin_root(obj);
+            let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+            pyre_object::gc_roots::pin_root(buffer_callback);
+            let bc_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
             pyre_object::gc_roots::pin_root(file);
             let file_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+            // The dump-time `dispatch_table` (no per-pickler one here) — its
+            // `copyreg` import can collect, so resolve it with `obj` pinned.
+            let dispatch_table = pickler::copyreg_dispatch_table();
             let w_bytes = pickler::pickle_core(
-                obj,
+                pyre_object::gc_roots::shadow_stack_get(obj_slot),
                 proto,
                 proto >= 1,
                 proto >= 4,
-                crate::baseobjspace::is_true(fix_imports)?,
+                fix,
                 pyre_object::PY_NULL,
-                buffer_callback,
+                pyre_object::gc_roots::shadow_stack_get(bc_slot),
                 pyre_object::listobject::w_list_new(Vec::new()),
+                false,
+                dispatch_table,
+                pyre_object::PY_NULL,
             )?;
             let file = pyre_object::gc_roots::shadow_stack_get(file_slot);
             call_meth(file, "write", &[w_bytes])?;
@@ -429,15 +475,25 @@ crate::py_module! {
         ) -> Result<PyObjectRef, PyError> {
             let proto = pickler::normalize_protocol(protocol)?;
             pickler::check_buffer_callback(buffer_callback, proto)?;
+            let fix = crate::baseobjspace::is_true(fix_imports)?;
+            let _roots = pyre_object::gc_roots::push_roots();
+            pyre_object::gc_roots::pin_root(obj);
+            let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+            pyre_object::gc_roots::pin_root(buffer_callback);
+            let bc_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+            let dispatch_table = pickler::copyreg_dispatch_table();
             pickler::pickle_core(
-                obj,
+                pyre_object::gc_roots::shadow_stack_get(obj_slot),
                 proto,
                 proto >= 1,
                 proto >= 4,
-                crate::baseobjspace::is_true(fix_imports)?,
+                fix,
                 pyre_object::PY_NULL,
-                buffer_callback,
+                pyre_object::gc_roots::shadow_stack_get(bc_slot),
                 pyre_object::listobject::w_list_new(Vec::new()),
+                false,
+                dispatch_table,
+                pyre_object::PY_NULL,
             )
         }
 
