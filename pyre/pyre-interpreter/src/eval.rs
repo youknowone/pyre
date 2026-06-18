@@ -1245,10 +1245,15 @@ impl SharedOpcodeHandler for PyFrame {
         // the frame's view — no lazy `dict_storage_to_dict` second
         // resolution that could surface a different W_DictObject.
         let w_globals_obj = self.get_w_globals_obj();
+        // Capture the globals OBJECT only; the raw `*mut DictStorage` is
+        // recovered from the object via the proxy back-link wherever a frame
+        // built from this function still needs it.  Threading a raw here is
+        // what dangled exec-defined functions when the exec temp storage was
+        // freed (the `GlobalsBinding` leak), so it is dropped.
         Ok(
             crate::runtime_ops::make_function_from_code_obj_with_globals_obj(
                 code_obj,
-                self.get_w_globals(),
+                std::ptr::null_mut(),
                 w_globals_obj,
             ),
         )

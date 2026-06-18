@@ -66,16 +66,15 @@ fn decode_name(name_ptr: i64, name_len: i64) -> Option<&'static str> {
 
 #[majit_macros::dont_look_inside]
 pub extern "C" fn jit_make_function_from_globals(globals: i64, code_obj: i64) -> i64 {
+    // `globals` is the globals OBJECT (the JIT threads the vable
+    // `w_globals_obj` slot).  Capture it directly; the raw `*mut DictStorage`
+    // is recovered from the object wherever a frame still needs it.
     let w_globals_obj = globals as PyObjectRef;
-    let ds = if w_globals_obj.is_null() {
-        std::ptr::null_mut()
-    } else {
-        unsafe {
-            pyre_object::dictmultiobject::w_dict_get_dict_storage_proxy(w_globals_obj)
-                as *mut DictStorage
-        }
-    };
-    make_function_from_code_obj_with_globals_obj(code_obj as PyObjectRef, ds, w_globals_obj) as i64
+    make_function_from_code_obj_with_globals_obj(
+        code_obj as PyObjectRef,
+        std::ptr::null_mut(),
+        w_globals_obj,
+    ) as i64
 }
 
 #[majit_macros::dont_look_inside]

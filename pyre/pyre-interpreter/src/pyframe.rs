@@ -2456,6 +2456,17 @@ impl PyFrame {
         closure: PyObjectRef,
         w_builtin: PyObjectRef,
     ) -> Self {
+        // Recover the legacy raw storage from the object (the `mirror_target`
+        // inverse of `dict_storage_to_dict`) so the `frame_stores_global`
+        // stamp and the debug-data snapshot see the canonical storage even
+        // when the caller threads a null raw (obj-only functions, e.g.
+        // MAKE_FUNCTION).  A null `w_globals_obj` (test stubs) keeps the
+        // passed raw.
+        let globals = if w_globals_obj.is_null() {
+            globals
+        } else {
+            unsafe { pyre_object::w_dict_get_dict_storage_proxy(w_globals_obj) as *mut DictStorage }
+        };
         let code_ref = unsafe {
             &*(crate::w_code_get_ptr(code as pyre_object::PyObjectRef) as *const CodeObject)
         };
