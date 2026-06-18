@@ -2253,49 +2253,40 @@ impl OpcodeStepExecutor for PyFrame {
         Ok(())
     }
 
-    /// CPython 3.14 ceval.c:WITH_EXCEPT_START
+    /// WITH_EXCEPT_START — call __exit__ for the exceptional `with` exit.
     ///
     /// Stack layout the bytecode emits (bottom → top):
-    ///   exit_func, exit_self, lasti, exc_info_prev, val
+    ///   exit_func, exit_self, lasti, unused, val
     ///
-    /// pyre's PUSH_EXC_INFO mirrors CPython here. We scan downward from TOS
-    /// looking for the first callable to use as exit_func instead of relying
-    /// on a fixed offset, because the exact slot count depends on whether
-    /// LOAD_SPECIAL preserved a NULL placeholder for the cm self.
+    /// `val` (TOS) is the in-flight exception. LOAD_SPECIAL split the
+    /// context manager's `__exit__` into `exit_func` (the function) and
+    /// `exit_self` (the bound instance, or NULL). We call
+    /// `exit_func(exit_self, type(val), val, val.__traceback__)` with
+    /// `exit_self` prepended only when it is non-NULL, and push the result
+    /// so the following TO_BOOL decides whether to suppress.
     fn with_except_start(&mut self) -> Result<(), PyError> {
         let depth = self.valuestackdepth;
-        if depth < 1 {
-            return Err(PyError::type_error("WITH_EXCEPT_START on empty stack"));
+        if depth < 5 {
+            return Err(PyError::type_error(
+                "WITH_EXCEPT_START requires five stack values",
+            ));
         }
         let val = self.locals_w()[depth - 1];
-        // Find exit_func: walk down from TOS-1 looking for the first
-        // callable. CPython's static layout puts it at TOS-4, but pyre's
-        // SWAP path may leave a NULL or different offset.
-        let mut exit_func = pyre_object::PY_NULL;
-        for offset in 2..=depth.min(8) {
-            let candidate = self.locals_w()[depth - offset];
-            if candidate.is_null() {
-                continue;
-            }
-            unsafe {
-                if crate::is_function(candidate)
-                    || pyre_object::is_method(candidate)
-                    || pyre_object::is_type(candidate)
-                {
-                    exit_func = candidate;
-                    break;
-                }
-            }
-        }
-        if exit_func.is_null() {
-            // Nothing to call — push True (suppress nothing).
-            self.push(pyre_object::w_bool_from(false));
-            return Ok(());
-        }
+        let exit_self = self.locals_w()[depth - 4];
+        let exit_func = self.locals_w()[depth - 5];
         let exc_type = crate::typedef::r#type(val).unwrap_or(pyre_object::w_none());
         let exc_tb =
             crate::baseobjspace::getattr_str(val, "__traceback__").unwrap_or(pyre_object::w_none());
-        let res = crate::call_function(exit_func, &[exc_type, val, exc_tb]);
+        let res = if exit_self.is_null() {
+            crate::call_function(exit_func, &[exc_type, val, exc_tb])
+        } else {
+            crate::call_function(exit_func, &[exit_self, exc_type, val, exc_tb])
+        };
+        if res.is_null() {
+            return Err(crate::call::take_call_error()
+                .unwrap_or_else(|| crate::PyError::type_error("__exit__ failed"))
+                .into());
+        }
         self.push(res);
         Ok(())
     }
