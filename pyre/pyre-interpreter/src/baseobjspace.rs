@@ -1778,6 +1778,25 @@ fn reversed_length_hint_method(args: &[PyObjectRef]) -> PyResult {
     }
 }
 
+/// `filter.__reduce__()` — `functional.py:944-949 W_Filter.descr_reduce`:
+/// `(filter, (predicate, iterable))`, where `predicate` is `None` when the
+/// stored predicate is `PY_NULL`.  Pickle recreates the iterator via
+/// `filter(predicate, iterable)`; the captured iterator carries its
+/// position.
+fn filter_reduce_method(args: &[PyObjectRef]) -> PyResult {
+    unsafe {
+        let w_predicate = pyre_object::filterobject::w_filter_get_predicate(args[0]);
+        let w_predicate = if w_predicate.is_null() {
+            w_none()
+        } else {
+            w_predicate
+        };
+        let w_iterable = pyre_object::filterobject::w_filter_get_iterable(args[0]);
+        let state = w_tuple_new(vec![w_predicate, w_iterable]);
+        Ok(w_tuple_new(vec![builtin_callable("filter"), state]))
+    }
+}
+
 unsafe fn getitem_range_iter(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
     let r = &*(obj as *const pyre_object::rangeobject::W_RangeIterator);
     let len = if r.step > 0 {
@@ -2767,6 +2786,7 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyResul
             || pyre_object::dictviewobject::is_dict_view_iterator(obj)
             || pyre_object::enumerateobject::is_enumerate(obj)
             || pyre_object::reversedobject::is_reversed(obj)
+            || pyre_object::filterobject::is_filter(obj)
             || pyre_object::callableiteratorobject::is_callable_iterator(obj)
         {
             let entry: Option<(fn(&[PyObjectRef]) -> PyResult, &str)> = match name {
@@ -2828,6 +2848,11 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyResul
                     "__length_hint__" => {
                         Some((reversed_length_hint_method, "__length_hint__", 1))
                     }
+                    _ => None,
+                }
+            } else if pyre_object::filterobject::is_filter(obj) {
+                match name {
+                    "__reduce__" => Some((filter_reduce_method, "__reduce__", 1)),
                     _ => None,
                 }
             } else {
@@ -8406,6 +8431,11 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
         if pyre_object::reversedobject::is_reversed(obj) {
             return Ok(obj);
         }
+        // `pypy/module/__builtin__/functional.py:927-928 W_Filter.iter_w` —
+        // `return self`.
+        if pyre_object::filterobject::is_filter(obj) {
+            return Ok(obj);
+        }
         // `pypy/module/_sre/interp_sre.py:915 W_SRE_Scanner.iter_w` —
         // `return self` (the finditer/scanner iterator).
         if pyre_object::sreobject::is_sre_scanner(obj) {
@@ -8688,6 +8718,34 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                     is_true(w_pred)?
                 };
                 if !pred {
+                    return Ok(w_obj);
+                }
+            }
+        }
+        // `pypy/module/__builtin__/functional.py:930-942 W_Filter.next_w`
+        // (reverse=False): pull from the iterator until the predicate (or
+        // truthiness, when None) passes.
+        //
+        //     def next_w(self):
+        //         w_obj = self.space.next(self.w_iterable)  # may raise w_StopIteration
+        //         if self.w_predicate is None:
+        //             pred = self.space.is_true(w_obj)
+        //         else:
+        //             w_pred = self.space.call_function(self.w_predicate, w_obj)
+        //             pred = self.space.is_true(w_pred)
+        //         if pred ^ self.reverse:
+        //             return w_obj
+        if pyre_object::filterobject::is_filter(obj) {
+            let it = &mut *(obj as *mut pyre_object::filterobject::W_Filter);
+            loop {
+                let w_obj = next(it.w_iterable)?;
+                let pred = if it.w_predicate.is_null() {
+                    is_true(w_obj)?
+                } else {
+                    let w_pred = crate::call::call_function_impl_result(it.w_predicate, &[w_obj])?;
+                    is_true(w_pred)?
+                };
+                if pred {
                     return Ok(w_obj);
                 }
             }

@@ -21,6 +21,7 @@ pub mod dictstrategy;
 pub mod dictviewobject;
 pub mod enumerateobject;
 pub mod excobject;
+pub mod filterobject;
 pub mod float_array;
 pub mod floatobject;
 pub mod gc_hook;

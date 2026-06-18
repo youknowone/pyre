@@ -1709,6 +1709,7 @@ impl IterOpcodeHandler for PyFrame {
                 || pyre_object::dictviewobject::is_dict_view_iterator(iter)
                 || pyre_object::enumerateobject::is_enumerate(iter)
                 || pyre_object::reversedobject::is_reversed(iter)
+                || pyre_object::filterobject::is_filter(iter)
                 || pyre_object::callableiteratorobject::is_callable_iterator(iter)
                 || pyre_object::sreobject::is_sre_scanner(iter)
             {
@@ -1876,6 +1877,7 @@ impl IterOpcodeHandler for PyFrame {
                 || pyre_object::itertoolsmodule::is_pairwise(iter)
                 || pyre_object::enumerateobject::is_enumerate(iter)
                 || pyre_object::reversedobject::is_reversed(iter)
+                || pyre_object::filterobject::is_filter(iter)
                 || pyre_object::callableiteratorobject::is_callable_iterator(iter)
                 || pyre_object::dictviewobject::is_dict_view_iterator(iter)
                 || pyre_object::sreobject::is_sre_scanner(iter)
@@ -1928,6 +1930,7 @@ impl IterOpcodeHandler for PyFrame {
                 || pyre_object::itertoolsmodule::is_pairwise(iter)
                 || pyre_object::enumerateobject::is_enumerate(iter)
                 || pyre_object::reversedobject::is_reversed(iter)
+                || pyre_object::filterobject::is_filter(iter)
                 || pyre_object::callableiteratorobject::is_callable_iterator(iter)
                 || pyre_object::dictviewobject::is_dict_view_iterator(iter)
                 || pyre_object::sreobject::is_sre_scanner(iter)

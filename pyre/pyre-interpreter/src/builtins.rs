@@ -625,35 +625,7 @@ pub fn install_default_builtins(namespace: &mut DictStorage) {
         make_module_builtin_function("complex", builtin_complex)
     });
     namespace.get_or_insert_with("filter", || {
-        make_module_builtin_function("filter", |args| {
-            if args.len() < 2 {
-                return Ok(pyre_object::w_seq_iter_new(w_list_new(vec![]), 0));
-            }
-            let func = args[0];
-            let items = collect_iterable(args[1])?;
-            let mut out = Vec::new();
-            let func_is_none = unsafe { pyre_object::is_none(func) };
-            for item in items {
-                let keep = if func_is_none {
-                    crate::baseobjspace::is_true(item)?
-                } else {
-                    // functional.py:936 next_w: `w_pred =
-                    // space.call_function(self.w_predicate, w_obj)` then
-                    // `space.is_true(w_pred)` — a raising predicate or
-                    // truthiness propagates.
-                    let result = crate::call::call_function_impl_result(func, &[item])?;
-                    crate::baseobjspace::is_true(result)?
-                };
-                if keep {
-                    out.push(item);
-                }
-            }
-            // `filter` is a lazy iterator in CPython; pyre eagerly applies
-            // the predicate but still hands back an iterator (matching
-            // `map`/`zip`) so `next(filter(...))` works.
-            let n = out.len();
-            Ok(pyre_object::w_seq_iter_new(w_list_new(out), n))
-        })
+        make_module_builtin_function("filter", builtin_filter)
     });
     namespace.get_or_insert_with("input", || {
         make_module_builtin_function("input", |_| Ok(pyre_object::w_str_new("")))
@@ -5335,6 +5307,28 @@ fn builtin_chr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             Ok(w_str_from_wtf8(one))
         }
     }
+}
+
+/// `filter(function or None, iterable)` — `functional.py:980-995
+/// W_Filter___new__`.  A lazy iterator: `function == None` keeps truthy
+/// items, otherwise `function(item)` is the predicate.
+fn builtin_filter(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    if args.len() != 2 {
+        return Err(crate::PyError::type_error(format!(
+            "filter expected 2 arguments, got {}",
+            args.len()
+        )));
+    }
+    let func = args[0];
+    // `functional.py:921-924` — a None predicate is stored as PY_NULL.
+    let w_predicate = if unsafe { pyre_object::is_none(func) } {
+        pyre_object::PY_NULL
+    } else {
+        func
+    };
+    // `functional.py:925 self.w_iterable = space.iter(w_iterable)`.
+    let w_iterable = crate::baseobjspace::iter(args[1])?;
+    Ok(pyre_object::filterobject::w_filter_new(w_predicate, w_iterable))
 }
 
 /// `map()` — PyPy: functional.py W_Map (returns iterator)
