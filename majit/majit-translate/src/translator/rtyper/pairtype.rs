@@ -501,6 +501,11 @@ fn dispatch_rtype_op(
         (PtrRepr, IntegerRepr, "getitem") | (InteriorPtrRepr, IntegerRepr, "getitem") => {
             committed(r1.rtype_getitem(hop))
         }
+        // rlist.py:245-267 — pair(AbstractBaseListRepr, IntegerRepr).rtype_getitem.
+        // FixedSizeListRepr (Rust slice / fixed array) handles the nonneg +
+        // checkidx=False branch (bare getarrayitem); the negative-index and
+        // checkidx branches surface a TyperError until those helpers land.
+        (FixedSizeListRepr, IntegerRepr, "getitem") => committed(r1.rtype_getitem(hop)),
         // rtuple.py:264-273 — `pairtype(TupleRepr, IntegerRepr).rtype_getitem`.
         (TupleRepr, IntegerRepr, "getitem") => {
             committed(super::rtuple::pair_tuple_int_rtype_getitem(r1, hop))
