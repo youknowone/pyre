@@ -3982,6 +3982,19 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
+                // `<String as AsRef<str>>::as_ref` / `String::as_str` /
+                // `<String as Borrow<str>>::borrow` — a `&str` view of the
+                // same string, identity in the lifted value model, so alias
+                // the destination to the receiver instead of emitting an
+                // `as_ref` method call the rtyper cannot route on the
+                // classdef-less string receiver.
+                if args.len() == 1 && self.is_string_to_str_identity(&reg, &call.dest.ty) {
+                    self.local_var[dest_local] = Some(args[0].clone());
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
                 // Workspace `Index::index` / `IndexMut::index_mut`
                 // impls (`FixedObjectArray` and friends) bottom out at
                 // raw-slice construction (`as_mut_slice` →
@@ -4944,6 +4957,40 @@ impl<'a> Lowering<'a> {
         }
         deref_impl_owner_leaf(self.llbc, fd)
             .is_some_and(|leaf| matches!(leaf.as_str(), "String" | "Vec"))
+    }
+
+    /// `<String as AsRef<str>>::as_ref(&self) -> &str`,
+    /// `String::as_str(&self) -> &str`, and
+    /// `<String as Borrow<str>>::borrow(&self) -> &str` — every one
+    /// returns a `&str` view of the same string, an identity in the
+    /// lifted value model (Rust `String`/`&str`/`str` all lower to the
+    /// immutable rpy_string).  Without the intercept the call keeps a
+    /// `CallTarget::Method` `as_ref` getattr the rtyper cannot route on
+    /// the classdef-less string receiver (the `Cannot find attribute
+    /// "as_ref" on UnicodeString` wall).  Bind the destination to the
+    /// receiver instead, the same alias shape as the container deref
+    /// above.  Gated on the `str`-typed result so `String`'s sibling
+    /// `AsRef<[u8]>` / `AsRef<OsStr>` / `AsRef<Path>` impls — whose
+    /// `&[u8]`/etc. result is a *different* value-model family — keep
+    /// their ordinary lowering.
+    fn is_string_to_str_identity(&self, reg: &RegularCall, dest_ty: &TyRef) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        let Some(fd) = self.llbc.fn_by_id(*id) else {
+            return false;
+        };
+        let np = fd.item_meta.name_path();
+        let Some(leaf) = np.rsplit("::").next() else {
+            return false;
+        };
+        if !matches!(leaf, "as_ref" | "as_str" | "borrow") {
+            return false;
+        }
+        if deref_impl_owner_leaf(self.llbc, fd).as_deref() != Some("String") {
+            return false;
+        }
+        tyref_strips_to_str(dest_ty, self.llbc)
     }
 
     /// The blanket `impl<I: Iterator> IntoIterator for I`
@@ -7461,6 +7508,20 @@ fn tyref_is_string_adt(ty: &TyRef, llbc: &Llbc) -> bool {
         .and_then(adt_node_def_id)
         .and_then(|id| llbc.type_by_id(id))
         .is_some_and(|td| td.item_meta.name_path() == "alloc::string::String")
+}
+
+/// Whether a `TyRef` resolves (behind `Ref`/dedup/hash-cons wrappers) to
+/// the `str` builtin — the unsized string slice (`{"Builtin": "Str"}`).
+/// Distinct from `[u8]` (the `Slice` builtin) and from `[T]`/`Box`/named
+/// ADTs, so it pins the string-family result of a `String -> &str` view
+/// apart from `String`'s sibling `AsRef<[u8]>` / `AsRef<OsStr>` impls.
+fn tyref_strips_to_str(ty: &TyRef, llbc: &Llbc) -> bool {
+    tyref_node(ty, llbc)
+        .and_then(|n| strip_ty_wrappers(n, llbc))
+        .and_then(|n| n.as_object()?.get("Adt")?.as_object()?.get("id")?.as_object())
+        .and_then(|id| id.get("Builtin"))
+        .and_then(serde_json::Value::as_str)
+        == Some("Str")
 }
 
 /// The qualified declaration path of a `TyRef`'s base ADT, after
