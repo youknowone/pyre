@@ -74,8 +74,8 @@ fn build_frame_stub_chain(top: *mut crate::pyframe::PyFrame) -> PyObjectRef {
         // resulting `debugdata.w_locals` dict.
         let w_locals_obj = frame_ref.getdictscope_w().unwrap_or(pyre_object::PY_NULL);
         // pyframe.py:128 get_w_globals returns the globals dict object.  The
-        // canonical `w_globals_obj` is co-assigned with `debugdata.w_globals`
-        // at every frame constructor, so it never lags the raw storage.
+        // canonical `w_globals_obj` is seeded by every frame constructor and
+        // is the source of truth for the frame's globals.
         let w_globals_obj = frame_ref.get_w_globals_obj();
         let pycode = frame_ref.pycode as pyre_object::PyObjectRef;
         let lineno = frame_ref.fget_f_lineno() as i64;
