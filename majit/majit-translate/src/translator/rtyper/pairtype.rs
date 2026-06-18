@@ -589,6 +589,11 @@ fn dispatch_rtype_op(
         (PtrRepr, IntegerRepr, "setitem") | (InteriorPtrRepr, IntegerRepr, "setitem") => {
             committed(r1.rtype_setitem(hop))
         }
+        // rlist.py:272-284 — pair(AbstractBaseListRepr, IntegerRepr).rtype_setitem.
+        // FixedSizeListRepr handles the nonneg + dum_nocheck branch (bare
+        // setarrayitem); the checkidx (IndexError) and negative-index
+        // branches surface a TyperError until those helpers land.
+        (FixedSizeListRepr, IntegerRepr, "setitem") => committed(r1.rtype_setitem(hop)),
 
         // rptr.py:165-184 — pointer comparison accepts any repr on the
         // other side and coerces both args to the pointer repr.
