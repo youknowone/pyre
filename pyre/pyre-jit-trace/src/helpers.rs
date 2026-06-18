@@ -1000,6 +1000,110 @@ pub fn emit_box_float_inline(
 ///    (`f_generator_nowref`, `w_yielding_from`, `f_backref`) are written
 ///    explicitly to match the same constructor shape instead of relying on
 ///    an implicit backend zero-fill side effect.
+/// Build a VIRTUAL callee `PyFrame` for a multi-frame inline (#68) from
+/// already-boxed positional argument refs.  Same field-complete frame shape as
+/// [`emit_new_pyframe_inline_self_recursive`] but seeds `locals[0..nparams]`
+/// from `param_boxes` (Ref boxes at the Python call boundary) instead of
+/// boxing a single raw int.  The frame is the callee MIFrame's `frame` red —
+/// `_opimpl_inline_call*` / `perform_call`+`setup_call` create a fresh frame
+/// per inlined call (`pyjitpl.py:2445-2476,1862-1874`); the box stays virtual
+/// on the hot path (the optimizer folds `NewWithVtable`+`SetfieldGc`) and is
+/// materialized lazily only on guard failure.  Field-complete so a forced
+/// materialization (`materialize_virtual_from_rd`) never dereferences an unset
+/// field.
+pub fn emit_new_pyframe_inline_with_params(
+    ctx: &mut TraceCtx,
+    param_boxes: &[OpRef],
+    array_size: usize,
+    valuestackdepth: usize,
+    pycode: OpRef,
+    w_globals_obj: OpRef,
+    ec: OpRef,
+) -> OpRef {
+    use crate::descr::{
+        pyframe_code_descr, pyframe_execution_context_descr, pyframe_f_backref_descr,
+        pyframe_f_generator_nowref_descr, pyframe_locals_cells_stack_descr,
+        pyframe_next_instr_descr, pyframe_size_descr, pyframe_stack_depth_descr,
+        pyframe_w_globals_obj_descr, pyframe_w_yielding_from_descr,
+    };
+    use crate::state::pyobject_gcarray_descr;
+
+    // locals_cells_stack_w array, zero-filled so an unbound local reads PY_NULL.
+    let len_ref = ctx.const_int(array_size as i64);
+    let array_descr = pyobject_gcarray_descr();
+    let locals_array =
+        ctx.record_op_with_descr(OpCode::NewArrayClear, &[len_ref], array_descr.clone());
+    ctx.heap_cache_mut().new_object(locals_array);
+
+    // locals[i] = param_boxes[i] — the positional arguments (already boxed).
+    for (i, &p) in param_boxes.iter().enumerate() {
+        let idx = ctx.const_int(i as i64);
+        ctx.record_op_with_descr(
+            OpCode::SetarrayitemGc,
+            &[locals_array, idx, p],
+            array_descr.clone(),
+        );
+    }
+
+    let new_frame = ctx.record_op_with_descr(OpCode::NewWithVtable, &[], pyframe_size_descr());
+    ctx.heap_cache_mut().new_object(new_frame);
+
+    let ec_descr = pyframe_execution_context_descr();
+    let ec_idx = ec_descr.index();
+    ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_frame, ec], ec_descr);
+    ctx.heapcache_setfield_cached(new_frame, ec_idx, ec);
+
+    let code_descr = pyframe_code_descr();
+    let code_idx = code_descr.index();
+    ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_frame, pycode], code_descr);
+    ctx.heapcache_setfield_cached(new_frame, code_idx, pycode);
+
+    let globals_obj_descr = pyframe_w_globals_obj_descr();
+    let globals_obj_idx = globals_obj_descr.index();
+    ctx.record_op_with_descr(
+        OpCode::SetfieldGc,
+        &[new_frame, w_globals_obj],
+        globals_obj_descr,
+    );
+    ctx.heapcache_setfield_cached(new_frame, globals_obj_idx, w_globals_obj);
+
+    let locals_descr = pyframe_locals_cells_stack_descr();
+    let locals_idx = locals_descr.index();
+    ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_frame, locals_array], locals_descr);
+    ctx.heapcache_setfield_cached(new_frame, locals_idx, locals_array);
+
+    let vsd = ctx.const_int(valuestackdepth as i64);
+    let vsd_descr = pyframe_stack_depth_descr();
+    let vsd_idx = vsd_descr.index();
+    ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_frame, vsd], vsd_descr);
+    ctx.heapcache_setfield_cached(new_frame, vsd_idx, vsd);
+
+    let neg_one = ctx.const_int(-1);
+    let last_instr_descr = pyframe_next_instr_descr();
+    let last_instr_idx = last_instr_descr.index();
+    ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_frame, neg_one], last_instr_descr);
+    ctx.heapcache_setfield_cached(new_frame, last_instr_idx, neg_one);
+
+    let null_ref = ctx.const_ref(pyre_object::PY_NULL as i64);
+
+    let generator_descr = pyframe_f_generator_nowref_descr();
+    let generator_idx = generator_descr.index();
+    ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_frame, null_ref], generator_descr);
+    ctx.heapcache_setfield_cached(new_frame, generator_idx, null_ref);
+
+    let yielding_descr = pyframe_w_yielding_from_descr();
+    let yielding_idx = yielding_descr.index();
+    ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_frame, null_ref], yielding_descr);
+    ctx.heapcache_setfield_cached(new_frame, yielding_idx, null_ref);
+
+    let backref_descr = pyframe_f_backref_descr();
+    let backref_idx = backref_descr.index();
+    ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_frame, null_ref], backref_descr);
+    ctx.heapcache_setfield_cached(new_frame, backref_idx, null_ref);
+
+    new_frame
+}
+
 pub fn emit_new_pyframe_inline_self_recursive(
     ctx: &mut TraceCtx,
     raw_int_arg: OpRef,

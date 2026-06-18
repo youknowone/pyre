@@ -6659,7 +6659,11 @@ fn compute_inline_caller_frame(
         // A CALL inside a try-block resumes at its own catch via a bit-14
         // marker pc, which the multi-frame capture's `py_pc < FLAG` assert
         // rejects — decline this slice.
-        if jc.payload.after_residual_call_resume_pc_for(call_py).is_some() {
+        if jc
+            .payload
+            .after_residual_call_resume_pc_for(call_py)
+            .is_some()
+        {
             return None;
         }
         let code = &*jc.payload.code_ptr;
@@ -6786,9 +6790,14 @@ fn walker_capture_multi_frame_inline_snapshot(
             let code = &*callee_pjc.code_ptr;
             let lo = callee_py_pc.saturating_sub(3);
             for py in lo..callee_py_pc + 5 {
-                if let Some((instr, arg)) = pyre_interpreter::decode_instruction_at(code, py as usize)
+                if let Some((instr, arg)) =
+                    pyre_interpreter::decode_instruction_at(code, py as usize)
                 {
-                    let mark = if py == callee_py_pc { " <== resume" } else { "" };
+                    let mark = if py == callee_py_pc {
+                        " <== resume"
+                    } else {
+                        ""
+                    };
                     eprintln!("[fbw-mf-diag]   py{py}: {instr:?} arg={arg:?}{mark}");
                 }
             }
@@ -6826,7 +6835,11 @@ fn walker_capture_multi_frame_inline_snapshot(
                     caller_sym.valuestackdepth as i64
                 } else {
                     let lv = crate::liveness::liveness_for(jc.payload.code_ptr);
-                    match lv.depth_at_py_pc().get(outer.resume_py_pc as usize).copied() {
+                    match lv
+                        .depth_at_py_pc()
+                        .get(outer.resume_py_pc as usize)
+                        .copied()
+                    {
                         Some(d) => (caller_sym.nlocals + d as usize) as i64,
                         None => caller_sym.valuestackdepth as i64,
                     }
@@ -6850,7 +6863,11 @@ fn walker_capture_multi_frame_inline_snapshot(
     for pf in &parent_frames {
         frames.push((pf.jitcode_index, pf.resume_py_pc, pf.boxes.as_slice()));
     }
-    frames.push((callee_jitcode_index as u32, callee_py_pc, callee_boxes.as_slice()));
+    frames.push((
+        callee_jitcode_index as u32,
+        callee_py_pc,
+        callee_boxes.as_slice(),
+    ));
 
     ctx.trace_ctx
         .capture_snapshot_for_last_guard_multi_frame_with_vable_vref(
@@ -8251,6 +8268,87 @@ fn try_walker_inline_user_call(
         }
         callee_regs_r[reg] = r_args[2 + i];
         callee_concrete_r[reg] = arg_concretes[2 + i];
+    }
+
+    // #68: seed the callee's `frame` / `ec` reds that the codewriter
+    // force-alives at every pc (portal_frame_reg / portal_ec_reg).  The
+    // sym-less fast path seeds only the param colors above, leaving the reds
+    // OpRef::NONE so an in-callee guard snapshot cannot source them
+    // (`collect_callee_active_boxes` declines).  RPython seeds these reds as
+    // part of `setup_call(allboxes)` for a recursive-portal inline
+    // (`pyjitpl.py:1862-1874`, reds=['frame','ec'] `interp_jit.py:67`): a
+    // freshly-built (virtual) callee `PyFrame` plus the caller's shared `ec`.
+    // pyre's "every function is its own portal" model makes every inlined
+    // callee portal-shaped, so the same seeding applies.  The frame box stays
+    // virtual on the hot path (the optimizer folds the NewWithVtable away) and
+    // is materialized only on guard failure; `collect_callee_active_boxes` is
+    // then unchanged (it finds real boxes).  Gated on `try_multiframe` so the
+    // strict straight-line inline path is byte-identical.
+    if try_multiframe {
+        // Branch-A frame shape only (mirror REC_CA): no cells.
+        let raw = unsafe {
+            pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
+                as *const pyre_interpreter::CodeObject
+        };
+        if raw.is_null() {
+            return Err(DispatchError::LoopBearingCalleeInlineUnsupported { pc: op.pc });
+        }
+        let callee_code = unsafe { &*raw };
+        if pyre_interpreter::ncells(callee_code) != 0 {
+            return Err(DispatchError::LoopBearingCalleeInlineUnsupported { pc: op.pc });
+        }
+        let nlocals = callee_code.varnames.len();
+        let frame_array_size = nlocals + callee_code.max_stackdepth as usize;
+
+        let Some(callee_jitcode_index) =
+            crate::state::ensure_jitcode_index(callee_code_key as *const ())
+        else {
+            return Err(DispatchError::LoopBearingCalleeInlineUnsupported { pc: op.pc });
+        };
+        let (frame_reg, ec_reg) = crate::state::portal_red_regs_at(callee_jitcode_index as i32);
+        if frame_reg == u16::MAX
+            || ec_reg == u16::MAX
+            || frame_reg as usize >= callee_regs_r.len()
+            || ec_reg as usize >= callee_regs_r.len()
+        {
+            return Err(DispatchError::LoopBearingCalleeInlineUnsupported { pc: op.pc });
+        }
+
+        // ec red: the shared ExecutionContext (perform_call threads the
+        // caller's ec down).  Seeded `sym.execution_context`, else recovered
+        // off the caller portal frame (mirror REC_CA jitcode_dispatch.rs:7873).
+        let sym_ptr = FULL_BODY_SNAPSHOT_SYM.with(|c| c.get());
+        if sym_ptr.is_null() {
+            return Err(DispatchError::LoopBearingCalleeInlineUnsupported { pc: op.pc });
+        }
+        let sym = unsafe { &*sym_ptr };
+        let callee_ec = if !sym.execution_context.is_none() {
+            sym.execution_context
+        } else {
+            ctx.trace_ctx.record_op_with_descr(
+                OpCode::GetfieldGcR,
+                &[sym.frame],
+                crate::descr::pyframe_execution_context_descr(),
+            )
+        };
+
+        let pycode_const = ctx.trace_ctx.const_ref(w_code as i64);
+        let w_globals_obj_const = ctx.trace_ctx.const_ref(inline_consts.w_globals_obj as i64);
+        let param_boxes: Vec<OpRef> = (0..nparams).map(|i| r_args[2 + i]).collect();
+        let callee_frame = crate::helpers::emit_new_pyframe_inline_with_params(
+            ctx.trace_ctx,
+            &param_boxes,
+            frame_array_size,
+            nlocals,
+            pycode_const,
+            w_globals_obj_const,
+            callee_ec,
+        );
+
+        callee_regs_r[frame_reg as usize] = callee_frame;
+        callee_concrete_r[frame_reg as usize] = ConcreteValue::Null;
+        callee_regs_r[ec_reg as usize] = callee_ec;
+        callee_concrete_r[ec_reg as usize] = ConcreteValue::Null;
     }
 
     // #68: a forward-branch callee inlined under the multi-frame path needs a
