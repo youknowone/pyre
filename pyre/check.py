@@ -101,7 +101,26 @@ CARGO_CONFIG = {
 # reads, immune to that overwrite.
 WASM_BUILD_OUTPUT = "target/wasm32-unknown-unknown/release/pyre_wasm.wasm"
 WASM_MODULE_PATH = "target/wasm32-unknown-unknown/release/pyre_wasm.wasmi.wasm"
-WASM_RUSTFLAGS = '-C link-arg=--export-table --cfg getrandom_backend="custom"'
+# `-C panic=unwind` so the JIT's `panic_any(InvalidLoop)` trace-abort signal
+# unwinds to its `catch_unwind` recovery sites instead of aborting the wasm
+# instance (wasm32-unknown-unknown defaults to panic=abort); nightly LLVM
+# lowers Rust unwinding to the wasm exception-handling proposal, enabled in the
+# runner via `Config::wasm_exceptions`. `+exception-handling` emits the EH
+# opcodes. The unwinding `std`/`panic_unwind` is supplied by `-Z build-std`
+# (the precompiled wasm32 std is panic=abort), which needs the nightly toolchain
+# and the `rust-src` component.
+WASM_RUSTFLAGS = (
+    '-C link-arg=--export-table --cfg getrandom_backend="custom"'
+    " -C panic=unwind -C target-feature=+exception-handling"
+)
+# Cargo flags selecting the nightly toolchain + build-std with the unwinding
+# panic runtime. Kept separate from the build args so the rationale lives with
+# WASM_RUSTFLAGS above.
+WASM_CARGO_TOOLCHAIN = "+nightly"
+WASM_BUILD_STD_FLAGS = [
+    "-Z", "build-std=std,panic_unwind",
+    "-Z", "build-std-features=panic-unwind",
+]
 
 # ── ANSI helpers ─────────────────────────────────────────────────────
 
@@ -472,11 +491,19 @@ class Check:
             (
                 "pyre-wasm (wasm32, --features wasmi)",
                 [
-                    "cargo", "build", "--release", "-p", "pyre-wasm",
+                    "cargo", WASM_CARGO_TOOLCHAIN, "build", "--release",
+                    "-p", "pyre-wasm",
                     "--target", "wasm32-unknown-unknown",
                     "--no-default-features", "--features", "wasmi",
+                    *WASM_BUILD_STD_FLAGS,
                 ],
-                {**os.environ, "RUSTFLAGS": WASM_RUSTFLAGS},
+                # nightly + EH-landing-pad codegen recurses deeper than the
+                # 16 MiB `.cargo/config` default; give rustc more headroom.
+                {
+                    **os.environ,
+                    "RUSTFLAGS": WASM_RUSTFLAGS,
+                    "RUST_MIN_STACK": "67108864",
+                },
             ),
             (
                 "pyre-wasm-runner (native wasmtime host)",

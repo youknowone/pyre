@@ -37,3 +37,7 @@ getrandom = { workspace = true }
 # trampoline (`call_stub::set_residual_host_call`); the `web` build keeps
 # the in-module transmute path until the JS glue grows the matching import.
 majit-backend = { workspace = true, optional = true }
+# For the panic hook: classify `InvalidLoop` / `SpeculativeError` payloads
+# (the JIT's silent trace-abort signals) so their messages are suppressed,
+# mirroring pyrex. Already compiled for wasm32 transitively via pyre-jit.
+majit-metainterp = { workspace = true }

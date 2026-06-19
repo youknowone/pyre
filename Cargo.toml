@@ -158,3 +158,12 @@ insta = "1"
 [profile.dist]
 inherits = "release"
 lto = "thin"
+
+# The wasm32 build compiles with `-C panic=unwind -C target-feature=
+# +exception-handling` (so JIT trace-abort panics unwind to their catch_unwind
+# recovery sites instead of aborting the instance). Under that codegen,
+# multi-CGU ThinLTO of this crate sends rustc into unbounded recursion (SIGSEGV
+# in spawn_thin_lto_work). A single codegen unit skips the intra-crate ThinLTO
+# path entirely; the only cost is slightly slower compilation of this one crate.
+[profile.release.package.majit-translate]
+codegen-units = 1

@@ -118,6 +118,23 @@ static PANIC_HOOK: Once = Once::new();
 fn install_panic_hook() {
     PANIC_HOOK.call_once(|| {
         std::panic::set_hook(Box::new(|info| {
+            // The JIT raises `InvalidLoop` / `SpeculativeError` as panics to
+            // abandon a trace; the wasm32 module is built with `-C panic=unwind`
+            // so these unwind to their `catch_unwind` recovery sites
+            // (jump_to_preamble fallback) and execution continues. Their message
+            // is a false crash signal — suppress it so it does not pollute the
+            // captured output, mirroring pyrex's hook. A genuinely uncaught
+            // panic still surfaces here.
+            let payload = info.payload();
+            let is_silent_control_flow = payload
+                .downcast_ref::<majit_metainterp::optimize::InvalidLoop>()
+                .is_some()
+                || payload
+                    .downcast_ref::<majit_metainterp::optimize::SpeculativeError>()
+                    .is_some();
+            if is_silent_control_flow {
+                return;
+            }
             let msg = format!("[pyre panic] {info}");
             OUTPUT_BUF.with(|buf| buf.borrow_mut().push_str(&msg));
         }));
