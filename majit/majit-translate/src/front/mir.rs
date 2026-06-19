@@ -3962,7 +3962,9 @@ impl<'a> Lowering<'a> {
                     && (matches!(self.blanket_into_devirt(&reg), Some(IntoDevirt::Identity))
                         || self.trait_clause_into_string_identity(&reg, &call.dest.ty)
                         || self.is_noop_ptr_cast(&reg)
-                        || self.is_reflexive_into_iter(&reg))
+                        || self.is_reflexive_into_iter(&reg)
+                        || self.is_hint_must_use(&reg)
+                        || self.is_arguments_from_str(&reg))
                 {
                     self.local_var[dest_local] = Some(args[0].clone());
                     let target_bb = self.block_id[target];
@@ -4015,6 +4017,17 @@ impl<'a> Lowering<'a> {
                 // `as_ref` method call the rtyper cannot route on the
                 // classdef-less string receiver.
                 if args.len() == 1 && self.is_string_to_str_identity(&reg, &call.dest.ty) {
+                    self.local_var[dest_local] = Some(args[0].clone());
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
+                // `<str|String as ToString>::to_string` on a string-family
+                // receiver — a `String` clone that is an identity in the
+                // lifted value model, so alias the destination to the
+                // receiver instead of emitting an unregistered `to_string`.
+                if args.len() == 1 && self.is_to_string_identity(&reg, first_arg_ty.as_ref()) {
                     self.local_var[dest_local] = Some(args[0].clone());
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
@@ -4204,6 +4217,23 @@ impl<'a> Lowering<'a> {
                         },
                     });
                     self.local_var[dest_local] = Some(res);
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
+                // `alloc::fmt::format` of a no-placeholder constant
+                // message — `format!("literal")`, whose `format_args!`
+                // lowered to `Arguments::from_str` (aliased to its
+                // `__str_const` operand by the identity fold above).  The
+                // render of a constant string is that string, so alias the
+                // result to the constant instead of leaving an unregistered
+                // `alloc::fmt::format` call.
+                if args.len() == 1
+                    && self.is_fmt_format_call(&reg)
+                    && self.traces_to_str_const(&args[0])
+                {
+                    self.local_var[dest_local] = Some(args[0].clone());
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -5059,6 +5089,31 @@ impl<'a> Lowering<'a> {
         tyref_strips_to_str(dest_ty, self.llbc)
     }
 
+    /// `<str as ToString>::to_string` / `<String as ToString>::to_string`
+    /// (`alloc::string::<Impl>::to_string`) — a `String` clone of a value
+    /// that is already a string in the lifted model (`String`/`&str`/`str`
+    /// all lower to the immutable rpy_string), so it is an identity.  The
+    /// path alone cannot tell the string specialization from the blanket
+    /// `impl<T: Display> ToString for T` (both monomorphize to the same
+    /// `<Impl>::to_string`), so gate on the receiver type: fold only when
+    /// the argument is itself string-family.  A non-string `to_string`
+    /// (an integer's `ll_int2dec`) has a receiver outside the family and
+    /// keeps its ordinary lowering.
+    fn is_to_string_identity(&self, reg: &RegularCall, first_arg_ty: Option<&TyRef>) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        let Some(fd) = self.llbc.fn_by_id(*id) else {
+            return false;
+        };
+        if !fd.item_meta.name_path().ends_with("::to_string") {
+            return false;
+        }
+        first_arg_ty.is_some_and(|ty| {
+            tyref_is_string_adt(ty, self.llbc) || tyref_strips_to_str(ty, self.llbc)
+        })
+    }
+
     /// `alloc::fmt::format(args)` (the `format!` macro's String producer)
     /// — the call whose `format_args!` argument the #277 recognizer
     /// back-traces.  `write!`/`writeln!` lower to `fmt::Write::write_fmt`
@@ -5073,6 +5128,58 @@ impl<'a> Lowering<'a> {
             let segs: Vec<String> = np.split("::").map(str::to_string).collect();
             fmt_path_ends_with(&segs, &["fmt", "format"])
         })
+    }
+
+    /// `fmt::Arguments::from_str(s)` — the no-placeholder `format_args!`
+    /// constructor a constant message lowers to (`debug_assert!` /
+    /// `assert!` / `panic!` with a literal, and `format!("literal")`).
+    /// Its sole argument is the `&'static str` literal itself (an already
+    /// string-family value in the lifted model), so the `Arguments` is the
+    /// constant string: the caller aliases the destination to that operand
+    /// instead of emitting the unregistered ctor.  The result then flows
+    /// either to a residualized panic (`Abort` → `RaiseImplicit`) or to
+    /// `alloc::fmt::format` (handled by [`Self::traces_to_str_const`]).
+    fn is_arguments_from_str(&self, reg: &RegularCall) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        // `from_str` is an inherent-impl associated function on
+        // `core::fmt::Arguments`, so its `name_path()` carries an `<Impl>`
+        // placeholder, not the owner name — resolve the owner the same way
+        // `call_target_segments` spells the `["fmt", "Arguments",
+        // "from_str"]` `FunctionPath` (via `impl_method_owner_for_fundecl`).
+        self.llbc.fn_by_id(*id).is_some_and(|fd| {
+            impl_method_owner_for_fundecl(self.llbc, fd).is_some_and(|(owner, leaf)| {
+                leaf == "from_str" && owner.ends_with("fmt::Arguments")
+            })
+        })
+    }
+
+    /// Whether `var` is produced by a `__str_const` synthetic call (a
+    /// string literal — see [`Lowering::emit_constant`]), following the
+    /// cross-block back-trace.  Used to recognize `alloc::fmt::format`
+    /// applied to a constant message (a folded `Arguments::from_str`),
+    /// whose render is the constant itself.
+    fn traces_to_str_const(&self, var: &Variable) -> bool {
+        use crate::model::{CallTarget, OpKind};
+        resolve_to_producer_op(&self.graph, var)
+            .and_then(|(b, i)| {
+                self.graph
+                    .blocks
+                    .iter()
+                    .find(|blk| blk.id == b)
+                    .and_then(|blk| blk.operations.get(i))
+                    .map(|op| &op.kind)
+            })
+            .is_some_and(|kind| {
+                matches!(
+                    kind,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments },
+                        ..
+                    } if segments.first().map(String::as_str) == Some("__str_const")
+                )
+            })
     }
 
     /// Whether every placeholder of a recovered `format_args!` chain
@@ -5233,6 +5340,21 @@ impl<'a> Lowering<'a> {
         self.llbc.fn_by_id(*id).is_some_and(|fd| {
             fd.item_meta.name_path() == "core::iter::traits::collect::<Impl>::into_iter"
         })
+    }
+
+    /// `core::hint::must_use(value)` — the identity wrapper
+    /// (`pub const fn must_use<T>(value: T) -> T`) the compiler inserts to
+    /// carry an `unused_must_use` lint through macro-generated code.  It
+    /// returns its argument unchanged and `core` has no graph body for it
+    /// (an unregistered callee), so the callsite aliases its argument
+    /// instead of calling the missing identity body.
+    fn is_hint_must_use(&self, reg: &RegularCall) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        self.llbc
+            .fn_by_id(*id)
+            .is_some_and(|fd| fd.item_meta.name_path() == "core::hint::must_use")
     }
 
     /// `f64::is_nan(self)` — `core` has no graph body (Opaque), so the
