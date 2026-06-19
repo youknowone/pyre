@@ -3783,8 +3783,7 @@ mod tests {
         // step==1 but resized (⇒ mutated) → selects resized ListRepr, never RangeRepr.
         let ldef_resized = ListDef::new(None, item, false, true);
         ldef_resized.listitem_rc().borrow_mut().range_step = Some(1);
-        let repr_resized =
-            rtyper_makerepr(&SomeValue::List(SomeList::new(ldef_resized)), &rtyper);
+        let repr_resized = rtyper_makerepr(&SomeValue::List(SomeList::new(ldef_resized)), &rtyper);
         assert!(
             repr_resized
                 .map(|r| r.class_name() != "RangeRepr")

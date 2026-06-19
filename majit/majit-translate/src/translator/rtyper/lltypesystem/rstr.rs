@@ -8166,37 +8166,24 @@ pub(crate) fn build_ll_stritem_checked_helper_graph(
 ///     return newstr
 /// ```
 ///
-/// Pyre lowers `s.malloc(N)` to a `malloc_varsize` SpaceOperation
-/// (rstr.py:1131 emit pattern: `[cTEMP, cflags, size]`) and inlines
-/// the two `copy_contents_from_str` calls as explicit per-char copy
-/// loops over `s.chars` / `newstr.chars` — the upstream
-/// `copy_string_contents` itself is a `mh.copy_string_contents`
-/// adtmeth wrapper that, after rtyping, decomposes into the same
-/// `getarrayitem` / `setarrayitem` loop shape.
+/// Pyre lowers `s.malloc(N)` to a `malloc_varsize` SpaceOperation and
+/// the two `copy_contents_from_str` calls to two `copystrcontent`
+/// (`copyunicodecontent` for UNICODE) ops — the same op the JIT
+/// codewriter produces for the `stroruni.copy_contents` oopspec. Both
+/// operands are whole string objects, so no interior chars pointer is
+/// materialised.
 ///
-/// 5-block-plus-returnblock CFG:
-/// - **start**: extract chars1/len1/chars2/len2, compute
-///   `total = int_add(len1, len2)`, allocate `newstr` via
-///   `malloc_varsize(struct_lltype, gc_flavor, total)`, fetch
-///   `newchars = getsubstruct(newstr, 'chars')`. Forward into
-///   `block_copy1_cond(newstr, newchars, chars1, chars2, len1, len2, 0)`.
-/// - **block_copy1_cond**: `cond = int_lt(i, len1)`. True →
-///   `block_copy1_body`; False → `block_copy2_cond(..., 0)`.
-/// - **block_copy1_body**: `c = getarrayitem(chars1, i)`,
-///   `setarrayitem(newchars, i, c)`, `i_next = int_add(i, 1)`. Cycle
-///   back into `block_copy1_cond` with `i_next`.
-/// - **block_copy2_cond**: `cond = int_lt(j, len2)`. True →
-///   `block_copy2_body`; False → returnblock(newstr).
-/// - **block_copy2_body**: `c = getarrayitem(chars2, j)`,
-///   `dst_idx = int_add(len1, j)`, `setarrayitem(newchars, dst_idx,
-///   c)`, `j_next = int_add(j, 1)`. Cycle back into
-///   `block_copy2_cond` with `j_next`.
+/// Straight-line CFG (start → returnblock):
+/// - **start**: `chars1 = getsubstruct(s1, 'chars')`,
+///   `len1 = getarraysize(chars1)`; likewise `chars2` / `len2`;
+///   `total = int_add(len1, len2)`; `newstr = malloc_varsize(struct,
+///   gc, total)`; `copystrcontent(s1, newstr, 0, 0, len1)`;
+///   `copystrcontent(s2, newstr, 0, len1, len2)`. Forward into
+///   `returnblock(newstr)`.
 ///
-/// Polymorphic over `Ptr(STR)` / `Ptr(UNICODE)`. The chars-array
-/// element type drives the lltype of the per-loop `c` temporary
-/// (Char or UniChar); `setarrayitem` does not require a per-element-
-/// type op selection (unlike `char_eq` vs `unichar_eq`) since it
-/// emits a single op name.
+/// Polymorphic over `Ptr(STR)` / `Ptr(UNICODE)`: the chars-array
+/// element type (Char / UniChar) selects `copystrcontent` vs
+/// `copyunicodecontent`.
 pub(crate) fn build_ll_strconcat_helper_graph(
     name: &str,
     ptr_lltype: LowLevelType,
@@ -8225,8 +8212,6 @@ pub(crate) fn build_ll_strconcat_helper_graph(
 
     let struct_lltype = struct_lltype_from_strptr(&ptr_lltype)?;
 
-    let bool_true = || constant_with_lltype(ConstValue::Bool(true), LowLevelType::Bool);
-    let bool_false = || constant_with_lltype(ConstValue::Bool(false), LowLevelType::Bool);
     let signed_const = |n: i64| constant_with_lltype(ConstValue::Int(n), LowLevelType::Signed);
     let chars_field_const =
         || constant_with_lltype(ConstValue::byte_str("chars"), LowLevelType::Void);
@@ -8244,80 +8229,15 @@ pub(crate) fn build_ll_strconcat_helper_graph(
         Hlvalue::Variable(return_var),
     );
 
-    // ---- Block declarations: copy1_cond / copy1_body / copy2_cond / copy2_body.
-    //
-    // copy1 carries (newstr, newchars, chars1, chars2, len1, len2, i).
-    let newstr_for_c1c = variable_with_lltype("newstr", ptr_lltype.clone());
-    let newchars_for_c1c = variable_with_lltype("newchars", chars_array_ptr_lltype.clone());
-    let chars1_for_c1c = variable_with_lltype("chars1", chars_array_ptr_lltype.clone());
-    let chars2_for_c1c = variable_with_lltype("chars2", chars_array_ptr_lltype.clone());
-    let len1_for_c1c = variable_with_lltype("len1", LowLevelType::Signed);
-    let len2_for_c1c = variable_with_lltype("len2", LowLevelType::Signed);
-    let i_for_c1c = variable_with_lltype("i", LowLevelType::Signed);
-    let block_copy1_cond = Block::shared(vec![
-        Hlvalue::Variable(newstr_for_c1c.clone()),
-        Hlvalue::Variable(newchars_for_c1c.clone()),
-        Hlvalue::Variable(chars1_for_c1c.clone()),
-        Hlvalue::Variable(chars2_for_c1c.clone()),
-        Hlvalue::Variable(len1_for_c1c.clone()),
-        Hlvalue::Variable(len2_for_c1c.clone()),
-        Hlvalue::Variable(i_for_c1c.clone()),
-    ]);
-
-    let newstr_for_c1b = variable_with_lltype("newstr", ptr_lltype.clone());
-    let newchars_for_c1b = variable_with_lltype("newchars", chars_array_ptr_lltype.clone());
-    let chars1_for_c1b = variable_with_lltype("chars1", chars_array_ptr_lltype.clone());
-    let chars2_for_c1b = variable_with_lltype("chars2", chars_array_ptr_lltype.clone());
-    let len1_for_c1b = variable_with_lltype("len1", LowLevelType::Signed);
-    let len2_for_c1b = variable_with_lltype("len2", LowLevelType::Signed);
-    let i_for_c1b = variable_with_lltype("i", LowLevelType::Signed);
-    let block_copy1_body = Block::shared(vec![
-        Hlvalue::Variable(newstr_for_c1b.clone()),
-        Hlvalue::Variable(newchars_for_c1b.clone()),
-        Hlvalue::Variable(chars1_for_c1b.clone()),
-        Hlvalue::Variable(chars2_for_c1b.clone()),
-        Hlvalue::Variable(len1_for_c1b.clone()),
-        Hlvalue::Variable(len2_for_c1b.clone()),
-        Hlvalue::Variable(i_for_c1b.clone()),
-    ]);
-
-    // copy2 carries (newstr, newchars, chars2, len1, len2, j) — chars1
-    // is no longer needed once copy1 finishes.
-    let newstr_for_c2c = variable_with_lltype("newstr", ptr_lltype.clone());
-    let newchars_for_c2c = variable_with_lltype("newchars", chars_array_ptr_lltype.clone());
-    let chars2_for_c2c = variable_with_lltype("chars2", chars_array_ptr_lltype.clone());
-    let len1_for_c2c = variable_with_lltype("len1", LowLevelType::Signed);
-    let len2_for_c2c = variable_with_lltype("len2", LowLevelType::Signed);
-    let j_for_c2c = variable_with_lltype("j", LowLevelType::Signed);
-    let block_copy2_cond = Block::shared(vec![
-        Hlvalue::Variable(newstr_for_c2c.clone()),
-        Hlvalue::Variable(newchars_for_c2c.clone()),
-        Hlvalue::Variable(chars2_for_c2c.clone()),
-        Hlvalue::Variable(len1_for_c2c.clone()),
-        Hlvalue::Variable(len2_for_c2c.clone()),
-        Hlvalue::Variable(j_for_c2c.clone()),
-    ]);
-
-    let newstr_for_c2b = variable_with_lltype("newstr", ptr_lltype.clone());
-    let newchars_for_c2b = variable_with_lltype("newchars", chars_array_ptr_lltype.clone());
-    let chars2_for_c2b = variable_with_lltype("chars2", chars_array_ptr_lltype.clone());
-    let len1_for_c2b = variable_with_lltype("len1", LowLevelType::Signed);
-    let len2_for_c2b = variable_with_lltype("len2", LowLevelType::Signed);
-    let j_for_c2b = variable_with_lltype("j", LowLevelType::Signed);
-    let block_copy2_body = Block::shared(vec![
-        Hlvalue::Variable(newstr_for_c2b.clone()),
-        Hlvalue::Variable(newchars_for_c2b.clone()),
-        Hlvalue::Variable(chars2_for_c2b.clone()),
-        Hlvalue::Variable(len1_for_c2b.clone()),
-        Hlvalue::Variable(len2_for_c2b.clone()),
-        Hlvalue::Variable(j_for_c2b.clone()),
-    ]);
-
-    // ---- start: extract chars + lengths, malloc_varsize, get newchars.
+    // ---- start: extract source lengths, malloc the result, then copy each
+    //      source's chars into it via copystrcontent.  Mirrors upstream
+    //      `ll_strconcat` (rstr.py:428): malloc + two `copy_contents_from_str`
+    //      calls, each rewritten by the JIT codewriter to a single
+    //      `copystrcontent` op.
     let chars1 = variable_with_lltype("chars1", chars_array_ptr_lltype.clone());
     startblock.borrow_mut().operations.push(SpaceOperation::new(
         "getsubstruct",
-        vec![Hlvalue::Variable(s1), chars_field_const()],
+        vec![Hlvalue::Variable(s1.clone()), chars_field_const()],
         Hlvalue::Variable(chars1.clone()),
     ));
     let len1 = variable_with_lltype("len1", LowLevelType::Signed);
@@ -8329,7 +8249,7 @@ pub(crate) fn build_ll_strconcat_helper_graph(
     let chars2 = variable_with_lltype("chars2", chars_array_ptr_lltype.clone());
     startblock.borrow_mut().operations.push(SpaceOperation::new(
         "getsubstruct",
-        vec![Hlvalue::Variable(s2), chars_field_const()],
+        vec![Hlvalue::Variable(s2.clone()), chars_field_const()],
         Hlvalue::Variable(chars2.clone()),
     ));
     let len2 = variable_with_lltype("len2", LowLevelType::Signed);
@@ -8357,222 +8277,42 @@ pub(crate) fn build_ll_strconcat_helper_graph(
         ],
         Hlvalue::Variable(newstr.clone()),
     ));
-    let newchars = variable_with_lltype("newchars", chars_array_ptr_lltype.clone());
+    // Two bulk copies: `copystrcontent(src, dst, srcstart, dststart, length)`
+    // for STR / `copyunicodecontent` for UNICODE.  The operands are whole
+    // string objects, so there is no interior chars pointer to thread.
+    let copy_opname = if matches!(elem_lltype, LowLevelType::Char) {
+        "copystrcontent"
+    } else {
+        "copyunicodecontent"
+    };
+    let void_copy1 = variable_with_lltype("copy1", LowLevelType::Void);
     startblock.borrow_mut().operations.push(SpaceOperation::new(
-        "getsubstruct",
-        vec![Hlvalue::Variable(newstr.clone()), chars_field_const()],
-        Hlvalue::Variable(newchars.clone()),
+        copy_opname,
+        vec![
+            Hlvalue::Variable(s1),
+            Hlvalue::Variable(newstr.clone()),
+            signed_const(0),
+            signed_const(0),
+            Hlvalue::Variable(len1.clone()),
+        ],
+        Hlvalue::Variable(void_copy1),
+    ));
+    let void_copy2 = variable_with_lltype("copy2", LowLevelType::Void);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        copy_opname,
+        vec![
+            Hlvalue::Variable(s2),
+            Hlvalue::Variable(newstr.clone()),
+            signed_const(0),
+            Hlvalue::Variable(len1),
+            Hlvalue::Variable(len2),
+        ],
+        Hlvalue::Variable(void_copy2),
     ));
     startblock.closeblock(vec![
         Link::new(
-            vec![
-                Hlvalue::Variable(newstr),
-                Hlvalue::Variable(newchars),
-                Hlvalue::Variable(chars1),
-                Hlvalue::Variable(chars2),
-                Hlvalue::Variable(len1),
-                Hlvalue::Variable(len2),
-                signed_const(0),
-            ],
-            Some(block_copy1_cond.clone()),
-            None,
-        )
-        .into_ref(),
-    ]);
-
-    // ---- block_copy1_cond: int_lt(i, len1).
-    let cond1 = variable_with_lltype("cond1", LowLevelType::Bool);
-    block_copy1_cond
-        .borrow_mut()
-        .operations
-        .push(SpaceOperation::new(
-            "int_lt",
-            vec![
-                Hlvalue::Variable(i_for_c1c.clone()),
-                Hlvalue::Variable(len1_for_c1c.clone()),
-            ],
-            Hlvalue::Variable(cond1.clone()),
-        ));
-    block_copy1_cond.borrow_mut().exitswitch = Some(Hlvalue::Variable(cond1));
-    block_copy1_cond.closeblock(vec![
-        Link::new(
-            vec![
-                Hlvalue::Variable(newstr_for_c1c.clone()),
-                Hlvalue::Variable(newchars_for_c1c.clone()),
-                Hlvalue::Variable(chars1_for_c1c.clone()),
-                Hlvalue::Variable(chars2_for_c1c.clone()),
-                Hlvalue::Variable(len1_for_c1c.clone()),
-                Hlvalue::Variable(len2_for_c1c.clone()),
-                Hlvalue::Variable(i_for_c1c.clone()),
-            ],
-            Some(block_copy1_body.clone()),
-            Some(bool_true()),
-        )
-        .into_ref(),
-        Link::new(
-            vec![
-                Hlvalue::Variable(newstr_for_c1c),
-                Hlvalue::Variable(newchars_for_c1c),
-                Hlvalue::Variable(chars2_for_c1c),
-                Hlvalue::Variable(len1_for_c1c),
-                Hlvalue::Variable(len2_for_c1c),
-                signed_const(0),
-            ],
-            Some(block_copy2_cond.clone()),
-            Some(bool_false()),
-        )
-        .into_ref(),
-    ]);
-
-    // ---- block_copy1_body: c = getarrayitem(chars1, i); setarrayitem;
-    //      i_next = int_add(i, 1); cycle back.
-    let c1 = variable_with_lltype("c", elem_lltype.clone());
-    block_copy1_body
-        .borrow_mut()
-        .operations
-        .push(SpaceOperation::new(
-            "getarrayitem",
-            vec![
-                Hlvalue::Variable(chars1_for_c1b.clone()),
-                Hlvalue::Variable(i_for_c1b.clone()),
-            ],
-            Hlvalue::Variable(c1.clone()),
-        ));
-    let void_set1 = variable_with_lltype("set1", LowLevelType::Void);
-    block_copy1_body
-        .borrow_mut()
-        .operations
-        .push(SpaceOperation::new(
-            "setarrayitem",
-            vec![
-                Hlvalue::Variable(newchars_for_c1b.clone()),
-                Hlvalue::Variable(i_for_c1b.clone()),
-                Hlvalue::Variable(c1),
-            ],
-            Hlvalue::Variable(void_set1),
-        ));
-    let i_next = variable_with_lltype("i_next", LowLevelType::Signed);
-    block_copy1_body
-        .borrow_mut()
-        .operations
-        .push(SpaceOperation::new(
-            "int_add",
-            vec![Hlvalue::Variable(i_for_c1b), signed_const(1)],
-            Hlvalue::Variable(i_next.clone()),
-        ));
-    block_copy1_body.closeblock(vec![
-        Link::new(
-            vec![
-                Hlvalue::Variable(newstr_for_c1b),
-                Hlvalue::Variable(newchars_for_c1b),
-                Hlvalue::Variable(chars1_for_c1b),
-                Hlvalue::Variable(chars2_for_c1b),
-                Hlvalue::Variable(len1_for_c1b),
-                Hlvalue::Variable(len2_for_c1b),
-                Hlvalue::Variable(i_next),
-            ],
-            Some(block_copy1_cond.clone()),
-            None,
-        )
-        .into_ref(),
-    ]);
-
-    // ---- block_copy2_cond: int_lt(j, len2).
-    let cond2 = variable_with_lltype("cond2", LowLevelType::Bool);
-    block_copy2_cond
-        .borrow_mut()
-        .operations
-        .push(SpaceOperation::new(
-            "int_lt",
-            vec![
-                Hlvalue::Variable(j_for_c2c.clone()),
-                Hlvalue::Variable(len2_for_c2c.clone()),
-            ],
-            Hlvalue::Variable(cond2.clone()),
-        ));
-    block_copy2_cond.borrow_mut().exitswitch = Some(Hlvalue::Variable(cond2));
-    block_copy2_cond.closeblock(vec![
-        Link::new(
-            vec![
-                Hlvalue::Variable(newstr_for_c2c.clone()),
-                Hlvalue::Variable(newchars_for_c2c.clone()),
-                Hlvalue::Variable(chars2_for_c2c.clone()),
-                Hlvalue::Variable(len1_for_c2c.clone()),
-                Hlvalue::Variable(len2_for_c2c.clone()),
-                Hlvalue::Variable(j_for_c2c.clone()),
-            ],
-            Some(block_copy2_body.clone()),
-            Some(bool_true()),
-        )
-        .into_ref(),
-        Link::new(
-            vec![Hlvalue::Variable(newstr_for_c2c)],
+            vec![Hlvalue::Variable(newstr)],
             Some(graph.returnblock.clone()),
-            Some(bool_false()),
-        )
-        .into_ref(),
-    ]);
-
-    // ---- block_copy2_body: c = getarrayitem(chars2, j);
-    //      dst_idx = int_add(len1, j); setarrayitem(newchars, dst_idx, c);
-    //      j_next = int_add(j, 1); cycle back.
-    let c2 = variable_with_lltype("c", elem_lltype);
-    block_copy2_body
-        .borrow_mut()
-        .operations
-        .push(SpaceOperation::new(
-            "getarrayitem",
-            vec![
-                Hlvalue::Variable(chars2_for_c2b.clone()),
-                Hlvalue::Variable(j_for_c2b.clone()),
-            ],
-            Hlvalue::Variable(c2.clone()),
-        ));
-    let dst_idx = variable_with_lltype("dst_idx", LowLevelType::Signed);
-    block_copy2_body
-        .borrow_mut()
-        .operations
-        .push(SpaceOperation::new(
-            "int_add",
-            vec![
-                Hlvalue::Variable(len1_for_c2b.clone()),
-                Hlvalue::Variable(j_for_c2b.clone()),
-            ],
-            Hlvalue::Variable(dst_idx.clone()),
-        ));
-    let void_set2 = variable_with_lltype("set2", LowLevelType::Void);
-    block_copy2_body
-        .borrow_mut()
-        .operations
-        .push(SpaceOperation::new(
-            "setarrayitem",
-            vec![
-                Hlvalue::Variable(newchars_for_c2b.clone()),
-                Hlvalue::Variable(dst_idx),
-                Hlvalue::Variable(c2),
-            ],
-            Hlvalue::Variable(void_set2),
-        ));
-    let j_next = variable_with_lltype("j_next", LowLevelType::Signed);
-    block_copy2_body
-        .borrow_mut()
-        .operations
-        .push(SpaceOperation::new(
-            "int_add",
-            vec![Hlvalue::Variable(j_for_c2b), signed_const(1)],
-            Hlvalue::Variable(j_next.clone()),
-        ));
-    block_copy2_body.closeblock(vec![
-        Link::new(
-            vec![
-                Hlvalue::Variable(newstr_for_c2b),
-                Hlvalue::Variable(newchars_for_c2b),
-                Hlvalue::Variable(chars2_for_c2b),
-                Hlvalue::Variable(len1_for_c2b),
-                Hlvalue::Variable(len2_for_c2b),
-                Hlvalue::Variable(j_next),
-            ],
-            Some(block_copy2_cond.clone()),
             None,
         )
         .into_ref(),
@@ -10861,33 +10601,48 @@ mod tests {
         }
     }
 
-    /// `ll_strconcat` synthesises a 5-block-plus-returnblock CFG:
-    /// start emits getsubstruct + getarraysize × 2 + int_add (total)
-    /// + **malloc_varsize** + getsubstruct (newchars), then enters
-    /// block_copy1_cond which loops int_lt + body (getarrayitem +
-    /// setarrayitem + int_add); on cond=False forwards into
-    /// block_copy2_cond with j=0 which loops int_lt + body
-    /// (getarrayitem + int_add(len1, j) for the destination index +
-    /// setarrayitem + int_add). False branch of copy2_cond returns
-    /// newstr.
+    /// `ll_strconcat` synthesises a straight-line `start → returnblock`
+    /// CFG: start emits getsubstruct + getarraysize × 2 + int_add
+    /// (total) + **malloc_varsize** + two **copystrcontent** ops, then
+    /// forwards `newstr` into the returnblock.  Mirrors upstream
+    /// `ll_strconcat` (rstr.py:428): malloc + two `copy_contents_from_str`
+    /// calls (each rewritten to a single `copystrcontent`), no per-char
+    /// loop.
     ///
-    /// First emission of `malloc_varsize` SpaceOperation from inside
-    /// an rstr helper graph: arg shape is `[Constant(struct_lltype),
-    /// Constant({'flavor': 'gc'}), length_var]` matching upstream
-    /// rstr.py:1131.
+    /// Pins the exact `copystrcontent` operand wiring (src/dst objects,
+    /// srcstart/dststart/length) so a transposed argument cannot slip
+    /// through structural shape checks alone.
     #[test]
-    fn build_ll_strconcat_synthesizes_malloc_varsize_and_two_copy_loops_for_str() {
+    fn build_ll_strconcat_synthesizes_malloc_varsize_and_two_copystrcontent_for_str() {
+        fn as_var(hlv: &Hlvalue) -> crate::flowspace::model::Variable {
+            match hlv {
+                Hlvalue::Variable(v) => v.clone(),
+                other => panic!("expected Variable operand, got {other:?}"),
+            }
+        }
+        fn assert_same_var(
+            hlv: &Hlvalue,
+            expected: &crate::flowspace::model::Variable,
+            what: &str,
+        ) {
+            assert!(
+                matches!(hlv, Hlvalue::Variable(v) if v == expected),
+                "copystrcontent {what} operand mismatch: {hlv:?}"
+            );
+        }
+        fn assert_zero(hlv: &Hlvalue, what: &str) {
+            assert!(
+                matches!(hlv, Hlvalue::Constant(c) if c.value == ConstValue::Int(0)),
+                "copystrcontent {what} must be Int(0): {hlv:?}"
+            );
+        }
+
         let helper = build_ll_strconcat_helper_graph("ll_strconcat", STRPTR.clone())
             .expect("build_ll_strconcat_helper_graph for STR");
         let inner = helper.graph.borrow();
+        let sb = inner.startblock.borrow();
 
-        // start: 6 ops (getsubstruct, getarraysize, getsubstruct,
-        // getarraysize, int_add, malloc_varsize, getsubstruct).
-        let start_ops = {
-            let sb = inner.startblock.borrow();
-            let names: Vec<String> = sb.operations.iter().map(|op| op.opname.clone()).collect();
-            names
-        };
+        let start_ops: Vec<String> = sb.operations.iter().map(|op| op.opname.clone()).collect();
         assert_eq!(
             start_ops,
             vec![
@@ -10897,127 +10652,72 @@ mod tests {
                 "getarraysize",
                 "int_add",
                 "malloc_varsize",
-                "getsubstruct",
+                "copystrcontent",
+                "copystrcontent",
             ],
-            "start emits chars1/len1/chars2/len2/total + malloc_varsize + newchars"
+            "start emits chars1/len1/chars2/len2/total + malloc_varsize + two copystrcontent"
         );
 
-        // malloc_varsize op (5th op, 0-indexed) takes 3 args:
-        // [Constant(LowLevelType::Struct), Constant(Dict), Variable(total)].
-        let mv_op = {
-            let sb = inner.startblock.borrow();
-            sb.operations[5].clone()
-        };
+        // malloc_varsize (op[5]) still takes [Constant(struct lltype),
+        // Constant(flags dict), Variable(total)].
+        let mv_op = &sb.operations[5];
         assert_eq!(mv_op.opname, "malloc_varsize");
         assert_eq!(mv_op.args.len(), 3);
-        let Hlvalue::Constant(struct_const) = &mv_op.args[0] else {
-            panic!("malloc_varsize arg[0] must be Constant carrying struct lltype");
-        };
-        assert!(matches!(struct_const.value, ConstValue::LowLevelType(_)));
-        let Hlvalue::Constant(flavor_const) = &mv_op.args[1] else {
-            panic!("malloc_varsize arg[1] must be Constant carrying flags dict");
-        };
-        assert!(matches!(flavor_const.value, ConstValue::Dict(_)));
+        assert!(
+            matches!(&mv_op.args[0], Hlvalue::Constant(c) if matches!(c.value, ConstValue::LowLevelType(_)))
+        );
+        assert!(
+            matches!(&mv_op.args[1], Hlvalue::Constant(c) if matches!(c.value, ConstValue::Dict(_)))
+        );
         assert!(matches!(mv_op.args[2], Hlvalue::Variable(_)));
 
-        // start has a single unconditional exit into block_copy1_cond
-        // (carrying newstr/newchars/chars1/chars2/len1/len2/0).
-        let block_copy1_cond = {
-            let sb = inner.startblock.borrow();
-            assert_eq!(sb.exits.len(), 1, "start has a single unconditional exit");
-            let link = sb.exits[0].clone();
-            link.borrow().target.as_ref().unwrap().clone()
-        };
+        // Capture the source/length/result Variables to compare against the
+        // copystrcontent operands by identity.
+        let s1_var = as_var(&sb.operations[0].args[0]);
+        let len1_var = as_var(&sb.operations[1].result);
+        let s2_var = as_var(&sb.operations[2].args[0]);
+        let len2_var = as_var(&sb.operations[3].result);
+        let newstr_var = as_var(&sb.operations[5].result);
 
-        // block_copy1_cond: int_lt(i, len1); 2 exits.
-        let (block_copy1_body, block_copy2_cond) = {
-            let cb = block_copy1_cond.borrow();
-            let names: Vec<&str> = cb.operations.iter().map(|op| op.opname.as_str()).collect();
-            assert_eq!(names, vec!["int_lt"]);
-            assert_eq!(cb.exits.len(), 2);
-            let mut body: Option<crate::flowspace::model::BlockRef> = None;
-            let mut next: Option<crate::flowspace::model::BlockRef> = None;
-            for link in &cb.exits {
-                let lb = link.borrow();
-                let exitcase_is_true = matches!(
-                    lb.exitcase,
-                    Some(Hlvalue::Constant(ref c)) if c.value == ConstValue::Bool(true)
-                );
-                let target = lb.target.as_ref().unwrap().clone();
-                if exitcase_is_true {
-                    body = Some(target);
-                } else {
-                    next = Some(target);
-                }
-            }
-            (body.unwrap(), next.unwrap())
-        };
+        // copy1 = copystrcontent(s1, newstr, srcstart=0, dststart=0, length=len1).
+        let copy1 = &sb.operations[6];
+        assert_eq!(copy1.opname, "copystrcontent");
+        assert_eq!(copy1.args.len(), 5);
+        assert_same_var(&copy1.args[0], &s1_var, "copy1 src");
+        assert_same_var(&copy1.args[1], &newstr_var, "copy1 dst");
+        assert_zero(&copy1.args[2], "copy1 srcstart");
+        assert_zero(&copy1.args[3], "copy1 dststart");
+        assert_same_var(&copy1.args[4], &len1_var, "copy1 length");
 
-        // block_copy1_body: getarrayitem + setarrayitem + int_add;
-        // unconditional cycle back into block_copy1_cond.
-        {
-            let bb = block_copy1_body.borrow();
-            let names: Vec<&str> = bb.operations.iter().map(|op| op.opname.as_str()).collect();
-            assert_eq!(names, vec!["getarrayitem", "setarrayitem", "int_add"]);
-            assert_eq!(bb.exits.len(), 1);
-            let cycle_target = bb.exits[0].borrow().target.as_ref().unwrap().clone();
-            assert!(
-                std::rc::Rc::ptr_eq(&cycle_target, &block_copy1_cond),
-                "copy1_body must cycle back into copy1_cond"
-            );
-        }
+        // copy2 = copystrcontent(s2, newstr, srcstart=0, dststart=len1, length=len2).
+        let copy2 = &sb.operations[7];
+        assert_eq!(copy2.opname, "copystrcontent");
+        assert_eq!(copy2.args.len(), 5);
+        assert_same_var(&copy2.args[0], &s2_var, "copy2 src");
+        assert_same_var(&copy2.args[1], &newstr_var, "copy2 dst");
+        assert_zero(&copy2.args[2], "copy2 srcstart");
+        assert_same_var(&copy2.args[3], &len1_var, "copy2 dststart");
+        assert_same_var(&copy2.args[4], &len2_var, "copy2 length");
 
-        // block_copy2_cond: int_lt(j, len2); 2 exits, False → returnblock.
-        let block_copy2_body = {
-            let cb = block_copy2_cond.borrow();
-            let names: Vec<&str> = cb.operations.iter().map(|op| op.opname.as_str()).collect();
-            assert_eq!(names, vec!["int_lt"]);
-            assert_eq!(cb.exits.len(), 2);
-            let mut body: Option<crate::flowspace::model::BlockRef> = None;
-            let mut return_target_seen = false;
-            for link in &cb.exits {
-                let lb = link.borrow();
-                let exitcase_is_true = matches!(
-                    lb.exitcase,
-                    Some(Hlvalue::Constant(ref c)) if c.value == ConstValue::Bool(true)
-                );
-                let target = lb.target.as_ref().unwrap().clone();
-                if exitcase_is_true {
-                    body = Some(target);
-                } else {
-                    assert!(
-                        std::rc::Rc::ptr_eq(&target, &inner.returnblock),
-                        "copy2_cond False branch must return"
-                    );
-                    return_target_seen = true;
-                }
-            }
-            assert!(return_target_seen);
-            body.unwrap()
-        };
-
-        // block_copy2_body: getarrayitem + int_add(len1, j) for dst_idx
-        // + setarrayitem + int_add(j, 1); cycle back into copy2_cond.
-        {
-            let bb = block_copy2_body.borrow();
-            let names: Vec<&str> = bb.operations.iter().map(|op| op.opname.as_str()).collect();
-            assert_eq!(
-                names,
-                vec!["getarrayitem", "int_add", "setarrayitem", "int_add"]
-            );
-            assert_eq!(bb.exits.len(), 1);
-            let cycle_target = bb.exits[0].borrow().target.as_ref().unwrap().clone();
-            assert!(std::rc::Rc::ptr_eq(&cycle_target, &block_copy2_cond));
-        }
+        // start has a single unconditional exit to the returnblock carrying [newstr].
+        assert_eq!(sb.exits.len(), 1, "start has a single unconditional exit");
+        let exit = sb.exits[0].borrow();
+        assert!(exit.exitcase.is_none(), "exit is unconditional");
+        assert!(
+            std::rc::Rc::ptr_eq(exit.target.as_ref().unwrap(), &inner.returnblock),
+            "start forwards into the returnblock"
+        );
+        assert_eq!(exit.args.len(), 1);
+        assert_same_var(exit.args[0].as_ref().unwrap(), &newstr_var, "return newstr");
     }
 
     /// `ll_unicode_concat` synthesised against `Ptr(UNICODE)` produces
-    /// the same CFG shape as `ll_strconcat` modulo elem type. Locks
-    /// in that the malloc_varsize struct const for UNICODE differs
-    /// from the STR one (otherwise the helper-cache families would
-    /// alias).
+    /// the same straight-line CFG as `ll_strconcat` modulo elem type:
+    /// the malloc_varsize struct const differs (otherwise the
+    /// helper-cache families would alias) and the bulk copies select
+    /// `copyunicodecontent` rather than `copystrcontent`.
     #[test]
-    fn build_ll_strconcat_synthesizes_unicode_struct_const_in_malloc_varsize() {
+    fn build_ll_strconcat_unicode_differs_in_struct_const_and_copy_opname() {
         let str_helper =
             build_ll_strconcat_helper_graph("ll_strconcat", STRPTR.clone()).expect("STR strconcat");
         let uni_helper = build_ll_strconcat_helper_graph("ll_unicode_concat", UNICODEPTR.clone())
@@ -11025,21 +10725,34 @@ mod tests {
         let str_inner = str_helper.graph.borrow();
         let uni_inner = uni_helper.graph.borrow();
 
-        let str_struct_const = {
+        let (str_struct_const, str_copy_opnames) = {
             let sb = str_inner.startblock.borrow();
             let mv = &sb.operations[5];
             assert_eq!(mv.opname, "malloc_varsize");
-            mv.args[0].clone()
+            let copies: Vec<String> = sb.operations[6..8]
+                .iter()
+                .map(|op| op.opname.clone())
+                .collect();
+            (mv.args[0].clone(), copies)
         };
-        let uni_struct_const = {
+        let (uni_struct_const, uni_copy_opnames) = {
             let sb = uni_inner.startblock.borrow();
             let mv = &sb.operations[5];
             assert_eq!(mv.opname, "malloc_varsize");
-            mv.args[0].clone()
+            let copies: Vec<String> = sb.operations[6..8]
+                .iter()
+                .map(|op| op.opname.clone())
+                .collect();
+            (mv.args[0].clone(), copies)
         };
         assert!(
             format!("{str_struct_const:?}") != format!("{uni_struct_const:?}"),
             "STR and UNICODE malloc_varsize struct constants must differ"
+        );
+        assert_eq!(str_copy_opnames, vec!["copystrcontent", "copystrcontent"]);
+        assert_eq!(
+            uni_copy_opnames,
+            vec!["copyunicodecontent", "copyunicodecontent"]
         );
     }
 

@@ -280,6 +280,25 @@ fn transduce_op(
                 result,
             );
         }
+        // `copystrcontent(src, dst, srcstart, dststart, length)` /
+        // `copyunicodecontent(...)` — bulk char copy.  Both string operands
+        // are whole objects (not chars-array interior pointers), so they
+        // bypass the `chars_alias` map.  Void result.
+        "copystrcontent" | "copyunicodecontent" => {
+            let src = expect_var(&op.args[0]);
+            let dst = expect_var(&op.args[1]);
+            let srcstart = materialize(out, block, &op.args[2]);
+            let dststart = materialize(out, block, &op.args[3]);
+            let length = materialize(out, block, &op.args[4]);
+            out.push_op_var(
+                block,
+                OpKind::LoweredBlackholeOp {
+                    opname: op.opname.clone(),
+                    args: vec![src, dst, srcstart, dststart, length],
+                },
+                false,
+            );
+        }
         // Integer arithmetic / comparison — `int_add`/`int_lt`/… → `BinOp`
         // with the bare op name (the assembler re-prefixes `int_`).  Constant
         // operands materialise as `ConstInt`/`ConstBool` since `BinOp` takes
@@ -678,5 +697,61 @@ mod tests {
             .expect("Spine-B drain commits a jitcode body");
         assert!(!body.code.is_empty(), "assembled bytecode is non-empty");
         assert_eq!(jitcode.try_index(), Some(0));
+    }
+
+    /// End-to-end: the restructured production `ll_strconcat` helper lowers
+    /// cleanly through Spine B.  The two `copystrcontent` ops become void
+    /// `LoweredBlackholeOp`s, the source-length reads fuse to `strlen`, and
+    /// the cross-Phi `resolve_string` fail-loud is never reached because no
+    /// per-char loop (strgetitem/strsetitem) survives.
+    #[test]
+    fn lower_graph_lowers_strconcat_helper_to_copystrcontent() {
+        use crate::translator::rtyper::lltypesystem::rstr::{
+            STRPTR, build_ll_strconcat_helper_graph,
+        };
+
+        let helper = build_ll_strconcat_helper_graph("ll_strconcat", STRPTR.clone())
+            .expect("build strconcat helper");
+        let flow = helper.graph.borrow();
+        let model = lower_graph(&flow);
+
+        let mut blackhole = Vec::new();
+        for block in &model.blocks {
+            for op in &block.operations {
+                if let OpKind::LoweredBlackholeOp { opname, args } = &op.kind {
+                    blackhole.push(opname.clone());
+                    if opname == "copystrcontent" {
+                        assert_eq!(args.len(), 5, "copystrcontent has 5 operands");
+                        assert!(op.result.is_none(), "copystrcontent is void");
+                    }
+                }
+            }
+        }
+
+        // Two source-length reads (strlen) + one alloc (newstr) + two copies.
+        assert_eq!(
+            blackhole.iter().filter(|n| *n == "strlen").count(),
+            2,
+            "two strlen source-length reads"
+        );
+        assert_eq!(blackhole.iter().filter(|n| *n == "newstr").count(), 1);
+        assert_eq!(
+            blackhole.iter().filter(|n| *n == "copystrcontent").count(),
+            2,
+            "two copystrcontent bulk copies"
+        );
+        // No per-char string ops: the loop is gone, so resolve_string never runs.
+        assert!(
+            !blackhole
+                .iter()
+                .any(|n| n == "strgetitem" || n == "strsetitem"),
+            "no per-char string ops survive: {blackhole:?}"
+        );
+
+        // start forwards unconditionally into the returnblock.
+        let start = model.block(model.startblock);
+        assert!(start.exitswitch.is_none(), "start exit is unconditional");
+        assert_eq!(start.exits.len(), 1);
+        assert_eq!(start.exits[0].target, model.returnblock);
     }
 }
