@@ -1095,6 +1095,16 @@ pub fn lower_fun_decl_with_static_addrs(
         // the legacy walker and codewriter already handle, so it runs
         // unconditionally.
         collapse_fmt_chains(&mut lo.graph);
+        // `panic!` / `assert!` message-block chains end in an implicit
+        // `AssertionError` raise but route through graph-less `fmt`
+        // message externs the rtyper can't type; collapse them to the
+        // bare raise so `remove_assertion_errors` prunes the branch as it
+        // does for a direct implicit raise.  Gated on an actual collapse
+        // so untouched graphs keep their single end-of-lowering simplify.
+        if collapse_panic_message_chains(&mut lo.graph) > 0 {
+            crate::model::clear_unreachable_blocks(&mut lo.graph);
+            simplify_lowered_graph(&mut lo.graph);
+        }
         Ok(())
     };
     // Opt-in framestate-threaded lowering for acyclic bodies (the GAP-B
@@ -9435,6 +9445,154 @@ fn collapse_fmt_chains(graph: &mut FunctionGraph) {
             .operations
             .splice(idx..idx + 1, expansion);
     }
+}
+
+/// A block is collapsible into a bare implicit-`AssertionError` raise when
+/// every op is a pure value / ctor / field op or a recognised `fmt`
+/// message extern — the message-building work a Rust `panic!` / `assert!`
+/// emits before its diverging call.  A `FieldWrite` is allowed only when
+/// its base aggregate was constructed earlier in the same block (the
+/// `(a, b)` tuple / `Some(_)` / pieces array the message builder fills),
+/// so a write into an escaped object (`self.field = …; panic!()`) keeps
+/// the block non-collapsible and its effect preserved.  Any other `Call`
+/// — a real side-effecting function such as `Write::write_fmt` — likewise
+/// blocks the collapse.
+fn panic_block_is_pure_message(block: &crate::model::Block) -> bool {
+    use crate::model::{CallTarget, OpKind};
+    let is_message_extern = |segments: &[String]| -> bool {
+        if segments.first().map(String::as_str) == Some("__str_const") {
+            return true;
+        }
+        let n = segments.len();
+        n >= 2
+            && segments.first().map(String::as_str) == Some("fmt")
+            && matches!(segments[n - 2].as_str(), "Argument" | "Arguments")
+    };
+    let mut produced = std::collections::HashSet::new();
+    for op in &block.operations {
+        let pure = match &op.kind {
+            OpKind::ConstInt(_)
+            | OpKind::ConstBool(_)
+            | OpKind::ConstFloat(_)
+            | OpKind::ConstRef(_)
+            | OpKind::ConstRefNull
+            | OpKind::ConstRefAddr(_)
+            | OpKind::ConstSymbolic { .. }
+            | OpKind::FieldRead { .. }
+            | OpKind::BinOp { .. }
+            | OpKind::UnaryOp { .. } => true,
+            OpKind::FieldWrite { base, .. } => produced.contains(&base.id()),
+            OpKind::Call {
+                target: CallTarget::SyntheticTransparentCtor { .. },
+                ..
+            } => true,
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments },
+                ..
+            } => is_message_extern(segments),
+            _ => false,
+        };
+        if !pure {
+            return false;
+        }
+        if let Some(r) = &op.result {
+            produced.insert(r.id());
+        }
+    }
+    true
+}
+
+/// Collapse a Rust `panic!` / `assert!` message-building block chain into
+/// a bare implicit-`AssertionError` raise, matching RPython's `_implicit_`
+/// exception form (`flowcontext.py`; `remove_assertion_errors`,
+/// simplify.py:321-346): RPython's implicit exceptions are direct raises
+/// carrying no computed message, whereas Rust lowers `panic!("…{}", x)`
+/// into a chain of message blocks (`fmt::rt::Argument::new_display`,
+/// `fmt::Arguments::new`, the on-stack pieces / args arrays) ending in the
+/// `Abort` → `set_raise_implicit(AssertionError)` exit.  Those message
+/// blocks are graph-less host externs the rtyper can't type, so they wall
+/// the dual gate.
+///
+/// Each message block has a single exit and only pure message ops
+/// (`panic_block_is_pure_message`); the chain tail exits to `exceptblock`
+/// carrying the `[AssertionError, value]` pair `set_raise_implicit`
+/// installs.  Growing that property backward over single-exit edges yields
+/// the set of collapsible blocks; the deciding block at the head (a `bool`
+/// switch whose panic arm enters the chain) is not collapsible.  Its panic
+/// edge is retargeted straight to `exceptblock` with the chain's
+/// `[AssertionError, value]` args, leaving the message blocks unreachable
+/// for `clear_unreachable_blocks`, after which `remove_assertion_errors`
+/// prunes the now-direct AssertionError edge exactly as for an
+/// already-direct implicit raise.
+///
+/// Returns the number of retargeted deciding edges so the caller can gate
+/// the follow-up `clear_unreachable_blocks` / `simplify_lowered_graph`.
+fn collapse_panic_message_chains(graph: &mut FunctionGraph) -> usize {
+    use crate::flowspace::model::{ConstValue, HOST_ENV};
+    use crate::model::LinkArg;
+    use std::collections::HashMap;
+    let assert_err = HOST_ENV
+        .lookup_builtin("AssertionError")
+        .expect("HOST_ENV missing AssertionError");
+    let exceptblock = graph.exceptblock;
+    let exit_raises_assert = |link: &crate::model::Link| -> bool {
+        link.target == exceptblock
+            && matches!(
+                link.args.first(),
+                Some(LinkArg::Const(c))
+                    if matches!(&c.value, ConstValue::HostObject(h) if *h == assert_err)
+            )
+    };
+    // Grow the collapsible set backward over single-exit pure-message
+    // edges, keyed to the `[AssertionError, value]` args the tail raise
+    // carries.
+    let mut collapsible: HashMap<crate::model::BlockId, Vec<LinkArg>> = HashMap::new();
+    loop {
+        let mut changed = false;
+        for block in &graph.blocks {
+            if collapsible.contains_key(&block.id) || block.exits.len() != 1 {
+                continue;
+            }
+            if !panic_block_is_pure_message(block) {
+                continue;
+            }
+            let exit = &block.exits[0];
+            let raise_args = if exit_raises_assert(exit) {
+                Some(exit.args.clone())
+            } else {
+                collapsible.get(&exit.target).cloned()
+            };
+            if let Some(args) = raise_args {
+                collapsible.insert(block.id, args);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    // Retarget every edge from a non-collapsible block into a collapsible
+    // block straight to `exceptblock` with the chain's raise args; the
+    // collapsible blocks themselves keep their edges and fall out as
+    // unreachable.
+    let mut redirected = 0usize;
+    for block_idx in 0..graph.blocks.len() {
+        if collapsible.contains_key(&graph.blocks[block_idx].id) {
+            continue;
+        }
+        for ei in 0..graph.blocks[block_idx].exits.len() {
+            let target = graph.blocks[block_idx].exits[ei].target;
+            let Some(args) = collapsible.get(&target) else {
+                continue;
+            };
+            let args = args.clone();
+            let exit = &mut graph.blocks[block_idx].exits[ei];
+            exit.target = exceptblock;
+            exit.args = args;
+            redirected += 1;
+        }
+    }
+    redirected
 }
 
 #[cfg(test)]
