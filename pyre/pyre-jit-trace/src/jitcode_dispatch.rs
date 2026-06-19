@@ -4611,10 +4611,28 @@ fn try_execute_residual_call_via_executor(
     // and corrupt this walk's `TraceCtx` (flaky `libsystem_malloc` freelist
     // abort during deep recursion).  Plain C-helper callees never re-enter, so
     // the guard is a no-op for them.
+    //
+    // In RPython the tracing metainterp and the executing (blackhole /
+    // compiled) interpreter are SEPARATE objects, so `do_residual_call`
+    // never perturbs the tracer's `MetaInterp.vable_ptr` /
+    // `virtualizable_boxes`.  Pyre shares one `TraceCtx` across the walk
+    // and any re-entrant JIT activity the concrete call triggers: a
+    // self-recursive `CALL_ASSEMBLER` callee that re-enters compiled code
+    // and deopts runs `set_vable_ptr` for the nested frames, leaving
+    // `virtualizable_heap_ptr` pointing at a nested callee frame whose
+    // `vable_token` is still the live JIT FORCE_TOKEN.  The next
+    // `tracing_before_residual_call` in this same walk would then assert on
+    // the non-NONE token (virtualizable.rs:565).  Snapshot the standard
+    // virtualizable pointer and restore it after the call so the walk's
+    // subsequent vable token protocol / field reads see the frame being
+    // traced, mirroring RPython's separate-state isolation.
+    let saved_vable_heap_ptr = ctx.trace_ctx.virtualizable_heap_ptr();
     let exec_result = {
         let _suspend = majit_metainterp::TraceContinuationSuspendGuard::enter();
         majit_metainterp::executor::execute_residual_call(call_descr, func_ptr, &args)
     };
+    ctx.trace_ctx
+        .set_virtualizable_heap_ptr(saved_vable_heap_ptr.unwrap_or(std::ptr::null()));
     // pyjitpl.py:3349-3353 `vinfo.tracing_after_residual_call(virtualizable)`
     // heap half: a cleared token means the callee forced the virtualizable —
     // the frame escaped, the trace must abort (pyjitpl.py:3365
