@@ -131,7 +131,14 @@ pub fn pin_root(root: PyObjectRef) {
 /// Current length of the thread-local shadow stack. Used by
 /// [`RootScope::new`] to capture the save-point and by tests to
 /// observe pin/pop behaviour.
-#[inline]
+///
+/// Reads the thread-local `SHADOW_STACK`, a runtime-mutable root the
+/// tracer cannot type; the JIT residualises the read instead of tracing
+/// into it (`@dont_look_inside`, `rlib/jit.py:139`). The attribute forces
+/// `#[inline(never)]` so the residual call has a stable symbol; the read
+/// rides on top of the surrounding allocation, so the lost inlining is
+/// in the noise.
+#[majit_macros::dont_look_inside]
 pub fn shadow_stack_len() -> usize {
     SHADOW_STACK.with(|s| s.borrow().len())
 }

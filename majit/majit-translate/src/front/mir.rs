@@ -3812,7 +3812,11 @@ impl<'a> Lowering<'a> {
             let ty = reg.generics.get("types")?.as_array()?.first()?;
             let adt = self.resolve_tyexpr_to_adt_def_id(ty)?;
             let layout = self.llbc.type_by_id(adt)?.layout_for_target("")?;
-            let value = if want_align { layout.align } else { layout.size }?;
+            let value = if want_align {
+                layout.align
+            } else {
+                layout.size
+            }?;
             return Some(OpKind::ConstInt(value as i64));
         }
         None
@@ -5375,7 +5379,8 @@ impl<'a> Lowering<'a> {
                 .iter_mut()
                 .find(|l| l.target == to)
             {
-                link.args.push(crate::model::LinkArg::Value(carried.clone()));
+                link.args
+                    .push(crate::model::LinkArg::Value(carried.clone()));
             }
             self.graph.block_mut(to).inputargs.push(new_input.clone());
             carried = new_input;
@@ -7923,7 +7928,13 @@ fn tyref_is_string_adt(ty: &TyRef, llbc: &Llbc) -> bool {
 fn tyref_strips_to_str(ty: &TyRef, llbc: &Llbc) -> bool {
     tyref_node(ty, llbc)
         .and_then(|n| strip_ty_wrappers(n, llbc))
-        .and_then(|n| n.as_object()?.get("Adt")?.as_object()?.get("id")?.as_object())
+        .and_then(|n| {
+            n.as_object()?
+                .get("Adt")?
+                .as_object()?
+                .get("id")?
+                .as_object()
+        })
         .and_then(|id| id.get("Builtin"))
         .and_then(serde_json::Value::as_str)
         == Some("Str")

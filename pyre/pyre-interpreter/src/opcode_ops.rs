@@ -432,6 +432,17 @@ pub extern "C" fn bh_store_subscr_fn(obj: i64, key: i64, value: i64) -> i64 {
     1
 }
 
+/// C-ABI residual bridge for the `dont_look_inside`
+/// [`pyre_object::typeobject::w_type_set_uses_object_setattr`]: its
+/// `bool` parameter does not match the integer arg slot a residual call
+/// supplies, so normalise it from `i64` here before forwarding.
+#[allow(improper_ctypes_definitions)]
+pub extern "C" fn bh_w_type_set_uses_object_setattr(obj: i64, v: i64) {
+    unsafe {
+        pyre_object::typeobject::w_type_set_uses_object_setattr(obj as PyObjectRef, v != 0);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

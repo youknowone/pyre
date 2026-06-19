@@ -373,6 +373,28 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         crate::opcode_ops::bh_store_subscr_fn as *const (),
     );
 
+    // `dont_look_inside` runtime-state accessors residualised at trace
+    // time (TLS / per-type atomic the tracer cannot model).  Their
+    // residual call resolves its address here by qualified path; a
+    // missing entry would fall back to a symbolic hash that SEGVs at
+    // trace time.  `shadow_stack_len` carries a JIT-representable
+    // `-> int` signature and binds its Rust `fn` directly (the
+    // `PyFrame::nlocals` / `get_current_exception` precedent);
+    // `w_type_set_uses_object_setattr` rides a C-ABI bridge that
+    // normalises its `bool` argument.
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::gc_roots::shadow_stack_len",
+        "pyre_object::shadow_stack_len",
+        pyre_object::gc_roots::shadow_stack_len as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::typeobject::w_type_set_uses_object_setattr",
+        "pyre_object::w_type_set_uses_object_setattr",
+        crate::opcode_ops::bh_w_type_set_uses_object_setattr as *const (),
+    );
+
     for (nargs, (module_path, root_path)) in CALLABLE_HELPER_PATHS.iter().enumerate() {
         if let Some(fnptr) = crate::runtime_ops::callable_call_helper(nargs) {
             push_alias_pair(&mut entries, module_path, root_path, fnptr);
