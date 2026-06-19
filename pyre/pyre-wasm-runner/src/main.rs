@@ -228,6 +228,26 @@ fn build_linker(engine: &Engine) -> Result<Linker<Host>> {
         },
     )?;
 
+    // Reflective residual-call trampoline for the *recording* / blackhole
+    // path. The compiled trace reaches residual targets through `env.jit_call`
+    // on the child module; the in-module metainterp cannot reflect a function's
+    // wasm type to build a matching `call_indirect`, so it routes residual
+    // calls here instead. Reuses the same call-area protocol and signature
+    // reflection as `jit_call_trampoline` (the child's `env.jit_call`), so a
+    // residual target whose real signature is not the uniform `(i64…) -> i64`
+    // (e.g. the void `set_current_exception_fn`, or the `-> i64`
+    // `store_subscr_fn` invoked in a void context) is coerced correctly
+    // rather than trapping on an indirect-call type mismatch.
+    linker.func_wrap(
+        "pyre_jit",
+        "jit_call_host",
+        |mut caller: Caller<'_, Host>, frame_ptr: u32| {
+            if let Err(e) = jit_call_trampoline(&mut caller, frame_ptr) {
+                eprintln!("[jit_call_host] {e:?}");
+            }
+        },
+    )?;
+
     Ok(linker)
 }
 

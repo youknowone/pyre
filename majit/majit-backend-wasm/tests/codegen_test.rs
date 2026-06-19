@@ -50,6 +50,8 @@ fn test_empty_trace() {
         Some(0),
         &HashMap::new(),
         &codegen::GuardGcTypeInfo::default(),
+        0,
+        0,
     )
     .expect("wasm codegen should succeed");
     validate_wasm(&bytes);
@@ -114,6 +116,8 @@ fn test_int_add_loop() {
         Some(0),
         &HashMap::new(),
         &codegen::GuardGcTypeInfo::default(),
+        0,
+        0,
     )
     .expect("wasm codegen should succeed");
     validate_wasm(&bytes);
@@ -171,6 +175,8 @@ fn test_float_ops() {
         Some(0),
         &HashMap::new(),
         &codegen::GuardGcTypeInfo::default(),
+        0,
+        0,
     )
     .expect("wasm codegen should succeed");
     validate_wasm(&bytes);
@@ -204,6 +210,8 @@ fn test_call_generates_import() {
         Some(0),
         &HashMap::new(),
         &codegen::GuardGcTypeInfo::default(),
+        0,
+        0,
     )
     .expect("wasm codegen should succeed");
     validate_wasm(&bytes);
@@ -300,6 +308,8 @@ fn test_guard_types() {
         Some(0),
         &HashMap::new(),
         &codegen::GuardGcTypeInfo::default(),
+        0,
+        0,
     )
     .expect("wasm codegen should succeed");
     validate_wasm(&bytes);
@@ -346,6 +356,8 @@ fn test_exception_guards() {
         Some(0),
         &HashMap::new(),
         &codegen::GuardGcTypeInfo::default(),
+        0,
+        0,
     )
     .expect("wasm codegen should succeed");
     validate_wasm(&bytes);
@@ -385,6 +397,8 @@ fn test_guard_gc_type_uses_immediate_typeid() {
         Some(0),
         &HashMap::new(),
         &codegen::GuardGcTypeInfo::default(),
+        0,
+        0,
     )
     .expect("wasm codegen should succeed");
     validate_wasm(&bytes);
@@ -446,6 +460,8 @@ fn test_guard_is_object_lowers_to_typeinfo_test() {
         Some(0),
         &HashMap::new(),
         &enabled_guard_gc_type_info(),
+        0,
+        0,
     )
     .expect("wasm codegen should succeed when supports_guard_gc_type=true");
     validate_wasm(&bytes);
@@ -489,7 +505,7 @@ fn test_guard_subclass_lowers_to_subclassrange_check() {
 
     // gcremovetypeptr branch: vtable_offset = None.
     let (bytes, guards) =
-        codegen::build_wasm_module(&inputargs, &ops, &constants, None, &HashMap::new(), &info)
+        codegen::build_wasm_module(&inputargs, &ops, &constants, None, &HashMap::new(), &info, 0, 0)
             .expect("wasm codegen should succeed when supports_guard_gc_type=true");
     validate_wasm(&bytes);
     assert_eq!(guards.len(), 1);
@@ -502,6 +518,8 @@ fn test_guard_subclass_lowers_to_subclassrange_check() {
         Some(8),
         &HashMap::new(),
         &info,
+        0,
+        0,
     )
     .expect("wasm codegen should succeed when vtable_offset is set");
     validate_wasm(&bytes2);
@@ -564,6 +582,8 @@ fn test_sameas_and_conversions() {
         Some(0),
         &HashMap::new(),
         &codegen::GuardGcTypeInfo::default(),
+        0,
+        0,
     )
     .expect("wasm codegen should succeed");
     validate_wasm(&bytes);
@@ -612,6 +632,8 @@ fn test_overflow_ops() {
         Some(0),
         &HashMap::new(),
         &codegen::GuardGcTypeInfo::default(),
+        0,
+        0,
     )
     .expect("wasm codegen should succeed");
     validate_wasm(&bytes);

@@ -22,7 +22,7 @@ web = ["dep:wasm-bindgen", "pyre-jit/wasm-web", "getrandom/wasm_js"]
 # shim in `src/lib.rs`), selected by building with
 # `--cfg getrandom_backend="custom"`, so the module carries no wasm-bindgen
 # imports a non-JS embedder could not satisfy.
-wasmi = ["pyre-jit/wasm-host"]
+wasmi = ["pyre-jit/wasm-host", "dep:majit-backend"]
 
 [dependencies]
 pyre-object = { workspace = true }
@@ -33,3 +33,7 @@ pyre-interpreter = { workspace = true }
 pyre-jit = { path = "../pyre-jit", version = "0.0.2", default-features = false }
 wasm-bindgen = { workspace = true, optional = true }
 getrandom = { workspace = true }
+# Only the `wasmi` (native-host) build installs the residual-call host
+# trampoline (`call_stub::set_residual_host_call`); the `web` build keeps
+# the in-module transmute path until the JS glue grows the matching import.
+majit-backend = { workspace = true, optional = true }

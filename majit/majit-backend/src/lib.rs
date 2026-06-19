@@ -2068,52 +2068,117 @@ pub trait Backend: Send {
 
     // ── model.py:216-228 field operations ──
     /// model.py:216 bh_getfield_gc_i(struct, fielddescr)
+    /// `llmodel.py:693-696 bh_getfield_gc_i` → `read_int_at_mem(struct,
+    /// ofs, size, sign)`.  `unpack_fielddescr_size` yields `(offset,
+    /// field_size, is_field_signed)`; the load mirrors the array
+    /// default's `read_unaligned` discrimination so byte/short fields
+    /// need not be naturally aligned.  Shared by pyre's raw-memory
+    /// backends (cranelift, dynasm, wasm); backends routing field reads
+    /// through their own runtime override.
     fn bh_getfield_gc_i(
         &self,
-        _struct_ptr: i64,
-        _fielddescr: &majit_translate::jitcode::BhDescr,
+        struct_ptr: i64,
+        fielddescr: &majit_translate::jitcode::BhDescr,
     ) -> i64 {
-        0
+        let (offset, size, sign) = fielddescr.unpack_fielddescr_size();
+        let addr = (struct_ptr as usize).wrapping_add(offset);
+        // SAFETY: `struct_ptr` is a GC-managed struct pointer threaded
+        // through from the trace recorder / blackhole; `offset`/`size`
+        // come from the field descriptor.  `read_unaligned` mirrors
+        // `llmodel.py:490 read_int_at_mem`.
+        unsafe {
+            match (size, sign) {
+                (1, true) => (addr as *const i8).read_unaligned() as i64,
+                (1, false) => (addr as *const u8).read_unaligned() as i64,
+                (2, true) => (addr as *const i16).read_unaligned() as i64,
+                (2, false) => (addr as *const u16).read_unaligned() as i64,
+                (4, true) => (addr as *const i32).read_unaligned() as i64,
+                (4, false) => (addr as *const u32).read_unaligned() as i64,
+                (8, _) => (addr as *const i64).read_unaligned(),
+                other => panic!(
+                    "bh_getfield_gc_i: unsupported (size, signed) = {:?}",
+                    other,
+                ),
+            }
+        }
     }
-    /// model.py:217 bh_getfield_gc_r(struct, fielddescr)
+    /// model.py:217 bh_getfield_gc_r(struct, fielddescr) →
+    /// `read_ref_at_mem(struct, ofs)`.  Pointer-width load at the
+    /// field offset.  Shared by pyre's raw-memory backends.
     fn bh_getfield_gc_r(
         &self,
-        _struct_ptr: i64,
-        _fielddescr: &majit_translate::jitcode::BhDescr,
+        struct_ptr: i64,
+        fielddescr: &majit_translate::jitcode::BhDescr,
     ) -> GcRef {
-        GcRef::NULL
+        let offset = fielddescr.as_offset();
+        // SAFETY: see `bh_getfield_gc_i`.
+        GcRef(unsafe { *((struct_ptr as *const u8).add(offset) as *const usize) })
     }
-    /// model.py:218 bh_getfield_gc_f(struct, fielddescr)
+    /// model.py:218 bh_getfield_gc_f(struct, fielddescr) →
+    /// `read_float_at_mem(struct, ofs)`.  Fixed `FLOATSTORAGE`-width
+    /// load at the field offset.  Shared by pyre's raw-memory backends.
     fn bh_getfield_gc_f(
         &self,
-        _struct_ptr: i64,
-        _fielddescr: &majit_translate::jitcode::BhDescr,
+        struct_ptr: i64,
+        fielddescr: &majit_translate::jitcode::BhDescr,
     ) -> f64 {
-        0.0
+        let offset = fielddescr.as_offset();
+        let addr = (struct_ptr as usize).wrapping_add(offset);
+        // SAFETY: see `bh_getfield_gc_i`.
+        unsafe { (addr as *const f64).read_unaligned() }
     }
-    /// model.py:222 bh_setfield_gc_i(struct, newvalue, fielddescr)
+    /// model.py:222 / llmodel.py:716 bh_setfield_gc_i → `write_int_at_mem(struct,
+    /// ofs, size, value)`.  Size + sign come from `unpack_fielddescr_size`;
+    /// the store mirrors the field reader's width discrimination.  Shared by
+    /// pyre's raw-memory backends; the trait default was a silent no-op that
+    /// lost blackhole field writes (e.g. a rematerialized virtual's fields).
     fn bh_setfield_gc_i(
         &self,
-        _struct_ptr: i64,
-        _newvalue: i64,
-        _fielddescr: &majit_translate::jitcode::BhDescr,
+        struct_ptr: i64,
+        newvalue: i64,
+        fielddescr: &majit_translate::jitcode::BhDescr,
     ) {
+        let (offset, size, _sign) = fielddescr.unpack_fielddescr_size();
+        let addr = (struct_ptr as usize).wrapping_add(offset);
+        // SAFETY: `struct_ptr` is a GC-managed struct pointer; `offset`/`size`
+        // come from the field descriptor. `write_unaligned` matches the reader.
+        unsafe {
+            match size {
+                1 => (addr as *mut u8).write_unaligned(newvalue as u8),
+                2 => (addr as *mut u16).write_unaligned(newvalue as u16),
+                4 => (addr as *mut u32).write_unaligned(newvalue as u32),
+                8 => (addr as *mut i64).write_unaligned(newvalue),
+                other => panic!("bh_setfield_gc_i: unsupported field size {other}"),
+            }
+        }
     }
-    /// model.py:223 bh_setfield_gc_r(struct, newvalue, fielddescr)
+    /// model.py:223 / llmodel.py:723 bh_setfield_gc_r → pointer-width store at
+    /// the field offset plus the write barrier.
     fn bh_setfield_gc_r(
         &self,
-        _struct_ptr: i64,
-        _newvalue: GcRef,
-        _fielddescr: &majit_translate::jitcode::BhDescr,
+        struct_ptr: i64,
+        newvalue: GcRef,
+        fielddescr: &majit_translate::jitcode::BhDescr,
     ) {
+        let offset = fielddescr.as_offset();
+        // SAFETY: see `bh_setfield_gc_i`. `usize` is the pointer-width store.
+        unsafe { *((struct_ptr as *mut u8).add(offset) as *mut usize) = newvalue.0 };
+        // The store target may be an old-gen object holding a young ref; the
+        // active GC's barrier remembers it. No-op where no barrier is installed.
+        majit_gc::gc_write_barrier(GcRef(struct_ptr as usize));
     }
-    /// model.py:224 bh_setfield_gc_f(struct, newvalue, fielddescr)
+    /// model.py:224 / llmodel.py:728 bh_setfield_gc_f → `FLOATSTORAGE`-width
+    /// store at the field offset.
     fn bh_setfield_gc_f(
         &self,
-        _struct_ptr: i64,
-        _newvalue: f64,
-        _fielddescr: &majit_translate::jitcode::BhDescr,
+        struct_ptr: i64,
+        newvalue: f64,
+        fielddescr: &majit_translate::jitcode::BhDescr,
     ) {
+        let offset = fielddescr.as_offset();
+        let addr = (struct_ptr as usize).wrapping_add(offset);
+        // SAFETY: see `bh_setfield_gc_i`.
+        unsafe { (addr as *mut f64).write_unaligned(newvalue) };
     }
 
     // ── model.py:209-215, 247-253 array operations ──
@@ -2175,14 +2240,22 @@ pub trait Backend: Send {
             }
         }
     }
-    /// model.py:210 bh_getarrayitem_gc_r(array, index, arraydescr)
+    /// model.py:210 / llmodel.py:597 bh_getarrayitem_gc_r → pointer-width load
+    /// at `base_size + index * WORD`.  Shared by pyre's raw-memory backends;
+    /// the trait default returned NULL, losing reads of Ref array items (e.g. a
+    /// tuple element or a `locals_cells_stack_w` slot during blackhole resume).
     fn bh_getarrayitem_gc_r(
         &self,
-        _array_ptr: i64,
-        _index: i64,
-        _arraydescr: &majit_translate::jitcode::BhDescr,
+        array_ptr: i64,
+        index: i64,
+        arraydescr: &majit_translate::jitcode::BhDescr,
     ) -> GcRef {
-        GcRef::NULL
+        let base_size = arraydescr.array_base_size();
+        let item_addr = (array_ptr as usize)
+            .wrapping_add(base_size)
+            .wrapping_add((index as usize).wrapping_mul(std::mem::size_of::<usize>()));
+        // SAFETY: see `bh_getarrayitem_gc_i`. Ref items are pointer-width.
+        GcRef(unsafe { (item_addr as *const usize).read_unaligned() })
     }
     /// model.py:211 bh_getarrayitem_gc_f(array, index, arraydescr)
     ///
@@ -2220,32 +2293,63 @@ pub trait Backend: Send {
         // natural alignment — matching the dynasm backend's read_float_at_mem.
         unsafe { (item_addr as *const f64).read_unaligned() }
     }
-    /// model.py:247 bh_setarrayitem_gc_i(array, index, newvalue, arraydescr)
+    /// model.py:247 / llmodel.py:609 bh_setarrayitem_gc_i → typed store at
+    /// `base_size + index * itemsize`.  Width from `unpack_arraydescr_size`.
     fn bh_setarrayitem_gc_i(
         &self,
-        _array_ptr: i64,
-        _index: i64,
-        _newvalue: i64,
-        _arraydescr: &majit_translate::jitcode::BhDescr,
+        array_ptr: i64,
+        index: i64,
+        newvalue: i64,
+        arraydescr: &majit_translate::jitcode::BhDescr,
     ) {
+        let (base_size, itemsize, _sign) = arraydescr.unpack_arraydescr_size();
+        let item_addr = (array_ptr as usize)
+            .wrapping_add(base_size)
+            .wrapping_add((index as usize).wrapping_mul(itemsize));
+        // SAFETY: see `bh_setfield_gc_i`.
+        unsafe {
+            match itemsize {
+                1 => (item_addr as *mut u8).write_unaligned(newvalue as u8),
+                2 => (item_addr as *mut u16).write_unaligned(newvalue as u16),
+                4 => (item_addr as *mut u32).write_unaligned(newvalue as u32),
+                8 => (item_addr as *mut i64).write_unaligned(newvalue),
+                other => panic!("bh_setarrayitem_gc_i: unsupported itemsize {other}"),
+            }
+        }
     }
-    /// model.py:248 bh_setarrayitem_gc_r(array, index, newvalue, arraydescr)
+    /// model.py:248 / llmodel.py:613 bh_setarrayitem_gc_r → pointer-width store
+    /// at `base_size + index * WORD` plus the write barrier.
     fn bh_setarrayitem_gc_r(
         &self,
-        _array_ptr: i64,
-        _index: i64,
-        _newvalue: GcRef,
-        _arraydescr: &majit_translate::jitcode::BhDescr,
+        array_ptr: i64,
+        index: i64,
+        newvalue: GcRef,
+        arraydescr: &majit_translate::jitcode::BhDescr,
     ) {
+        let base_size = arraydescr.array_base_size();
+        let item_addr = (array_ptr as usize)
+            .wrapping_add(base_size)
+            .wrapping_add((index as usize).wrapping_mul(std::mem::size_of::<usize>()));
+        // SAFETY: see `bh_setfield_gc_i`.
+        unsafe { (item_addr as *mut usize).write_unaligned(newvalue.0) };
+        majit_gc::gc_write_barrier(GcRef(array_ptr as usize));
     }
-    /// model.py:249 bh_setarrayitem_gc_f(array, index, newvalue, arraydescr)
+    /// model.py:249 / llmodel.py:618 bh_setarrayitem_gc_f → `FLOATSTORAGE`-width
+    /// store at `base_size + index * WORD`.
     fn bh_setarrayitem_gc_f(
         &self,
-        _array_ptr: i64,
-        _index: i64,
-        _newvalue: f64,
-        _arraydescr: &majit_translate::jitcode::BhDescr,
+        array_ptr: i64,
+        index: i64,
+        newvalue: f64,
+        arraydescr: &majit_translate::jitcode::BhDescr,
     ) {
+        let base_size = arraydescr.array_base_size();
+        const FSIZE: usize = 8;
+        let item_addr = (array_ptr as usize)
+            .wrapping_add(base_size)
+            .wrapping_add((index as usize).wrapping_mul(FSIZE));
+        // SAFETY: see `bh_getarrayitem_gc_f`.
+        unsafe { (item_addr as *mut f64).write_unaligned(newvalue) };
     }
 
     // ── model.py: raw array operations ──
@@ -2356,48 +2460,124 @@ pub trait Backend: Send {
     fn bh_newstr(&self, _length: i64) -> i64 {
         0
     }
-    /// model.py:266 bh_call_i(func, args_i, args_r, args_f, calldescr)
+    /// model.py:266 bh_call_i(func, args_i, args_r, args_f, calldescr).
+    /// `llmodel.py:816 call_stub_i`: ABI-correct dispatch via the shared
+    /// arity table.  Default impl shared by pyre's raw-memory backends
+    /// (cranelift, dynasm, wasm) — the `extern "C"` transmute+call is
+    /// portable.  Without it `bhimpl_residual_call_*_i` silently no-ops.
     fn bh_call_i(
         &self,
-        _func: i64,
-        _args_i: Option<&[i64]>,
-        _args_r: Option<&[i64]>,
-        _args_f: Option<&[i64]>,
-        _calldescr: &majit_translate::jitcode::BhCallDescr,
+        func: i64,
+        args_i: Option<&[i64]>,
+        args_r: Option<&[i64]>,
+        args_f: Option<&[i64]>,
+        calldescr: &majit_translate::jitcode::BhCallDescr,
     ) -> i64 {
-        0
+        if func == 0 {
+            return 0;
+        }
+        if let Some(hook) = crate::call_stub::residual_host_call() {
+            let args = crate::call_stub::collect_call_args_positional(
+                &calldescr.arg_classes,
+                args_i,
+                args_r,
+                args_f,
+            );
+            return hook(func as usize, &args);
+        }
+        let (int_args, float_args) =
+            crate::call_stub::collect_call_args(&calldescr.arg_classes, args_i, args_r, args_f);
+        // SAFETY: `func` is a valid funcptr matching the (ints, floats) arity
+        // recovered from `calldescr.arg_classes`.
+        unsafe { crate::call_stub::bh_call_i_dispatch(func as usize, &int_args, &float_args) }
     }
-    /// model.py:268 bh_call_r(func, args_i, args_r, args_f, calldescr)
+    /// model.py:268 bh_call_r(func, args_i, args_r, args_f, calldescr).
+    /// `llmodel.py:818 bh_call_r`: GCREF-returning parallel — a host pointer
+    /// matches the integer dispatcher's return register, so wrap its result.
     fn bh_call_r(
         &self,
-        _func: i64,
-        _args_i: Option<&[i64]>,
-        _args_r: Option<&[i64]>,
-        _args_f: Option<&[i64]>,
-        _calldescr: &majit_translate::jitcode::BhCallDescr,
+        func: i64,
+        args_i: Option<&[i64]>,
+        args_r: Option<&[i64]>,
+        args_f: Option<&[i64]>,
+        calldescr: &majit_translate::jitcode::BhCallDescr,
     ) -> GcRef {
-        GcRef::NULL
+        if func == 0 {
+            return GcRef::NULL;
+        }
+        if let Some(hook) = crate::call_stub::residual_host_call() {
+            let args = crate::call_stub::collect_call_args_positional(
+                &calldescr.arg_classes,
+                args_i,
+                args_r,
+                args_f,
+            );
+            return GcRef(hook(func as usize, &args) as usize);
+        }
+        let (int_args, float_args) =
+            crate::call_stub::collect_call_args(&calldescr.arg_classes, args_i, args_r, args_f);
+        // SAFETY: see `bh_call_i`.
+        let raw =
+            unsafe { crate::call_stub::bh_call_i_dispatch(func as usize, &int_args, &float_args) };
+        GcRef(raw as usize)
     }
-    /// model.py:270 bh_call_f(func, args_i, args_r, args_f, calldescr)
+    /// model.py:270 bh_call_f(func, args_i, args_r, args_f, calldescr).
+    /// `llmodel.py:825 bh_call_f`: routes through the f64-typed dispatcher so
+    /// an f64 callee returns via the float register file.
     fn bh_call_f(
         &self,
-        _func: i64,
-        _args_i: Option<&[i64]>,
-        _args_r: Option<&[i64]>,
-        _args_f: Option<&[i64]>,
-        _calldescr: &majit_translate::jitcode::BhCallDescr,
+        func: i64,
+        args_i: Option<&[i64]>,
+        args_r: Option<&[i64]>,
+        args_f: Option<&[i64]>,
+        calldescr: &majit_translate::jitcode::BhCallDescr,
     ) -> f64 {
-        0.0
+        if func == 0 {
+            return 0.0;
+        }
+        if let Some(hook) = crate::call_stub::residual_host_call() {
+            let args = crate::call_stub::collect_call_args_positional(
+                &calldescr.arg_classes,
+                args_i,
+                args_r,
+                args_f,
+            );
+            // The trampoline returns an f64 callee result as its raw bits.
+            return f64::from_bits(hook(func as usize, &args) as u64);
+        }
+        let (int_args, float_args) =
+            crate::call_stub::collect_call_args(&calldescr.arg_classes, args_i, args_r, args_f);
+        // SAFETY: see `bh_call_i`.
+        unsafe { crate::call_stub::bh_call_f_dispatch(func as usize, &int_args, &float_args) }
     }
-    /// model.py:272 bh_call_v(func, args_i, args_r, args_f, calldescr)
+    /// model.py:272 bh_call_v(func, args_i, args_r, args_f, calldescr).
+    /// `llmodel.py:834 bh_call_v`: void-typed dispatch so a genuinely void
+    /// callee is invoked with the right C-ABI signature.
     fn bh_call_v(
         &self,
-        _func: i64,
-        _args_i: Option<&[i64]>,
-        _args_r: Option<&[i64]>,
-        _args_f: Option<&[i64]>,
-        _calldescr: &majit_translate::jitcode::BhCallDescr,
+        func: i64,
+        args_i: Option<&[i64]>,
+        args_r: Option<&[i64]>,
+        args_f: Option<&[i64]>,
+        calldescr: &majit_translate::jitcode::BhCallDescr,
     ) {
+        if func == 0 {
+            return;
+        }
+        if let Some(hook) = crate::call_stub::residual_host_call() {
+            let args = crate::call_stub::collect_call_args_positional(
+                &calldescr.arg_classes,
+                args_i,
+                args_r,
+                args_f,
+            );
+            let _ = hook(func as usize, &args);
+            return;
+        }
+        let (int_args, float_args) =
+            crate::call_stub::collect_call_args(&calldescr.arg_classes, args_i, args_r, args_f);
+        // SAFETY: see `bh_call_i`.
+        unsafe { crate::call_stub::bh_call_v_dispatch(func as usize, &int_args, &float_args) }
     }
 
     // ── model.py: additional bh_* helpers ──

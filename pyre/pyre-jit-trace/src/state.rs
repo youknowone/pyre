@@ -2278,7 +2278,7 @@ pub(crate) fn pyobject_array_descr() -> DescrRef {
     // canonicalizes across analyzer / runtime consumers.
     crate::descr::make_array_descr_with_full_id(
         0,
-        8,
+        std::mem::size_of::<usize>(),
         0,
         None,
         Type::Ref,
@@ -2310,7 +2310,7 @@ pub fn pyobject_gcarray_descr() -> DescrRef {
     // length header at offset 0, items start at `FIXED_ARRAY_ITEMS_OFFSET`.
     make_array_descr_with_type(
         pyre_object::FIXED_ARRAY_ITEMS_OFFSET,
-        8,
+        std::mem::size_of::<usize>(),
         PY_OBJECT_ARRAY_GC_TYPE_ID,
         Some(0),
         Type::Ref,
@@ -3058,8 +3058,9 @@ pub(crate) fn trace_raw_array_getitem_value(
 /// `opimpl_getfield_gc_r` against the `items` /  `wrappeditems` field)
 /// directly. The `pyobject_gcarray_descr` here is
 /// `Ptr(GcArray(OBJECTPTR))` with `base_size = ITEMS_BLOCK_ITEMS_OFFSET`
-/// (= length-prefix size), `item_size = 8`, `item_type = Ref`,
-/// matching `rpython/rtyper/lltypesystem/rlist.py:84` `GcArray(OBJECTPTR)`.
+/// (= length-prefix size), `item_size = sizeof(Ptr)` (word-sized: 4 on
+/// wasm32, 8 on 64-bit), `item_type = Ref`, matching
+/// `rpython/rtyper/lltypesystem/rlist.py:84` `GcArray(OBJECTPTR)`.
 ///
 /// Replaces the prior two-step `IntAdd(items_block, OFFSET) +
 /// raw-array op` deviation with the upstream single-op shape.

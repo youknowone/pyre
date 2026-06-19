@@ -503,3 +503,80 @@ pub fn collect_call_args(
     }
     (int_args, float_args)
 }
+
+/// Bucket `args_i` / `args_r` / `args_f` into a single positional list in
+/// `arg_classes` order, floats carried as their raw 64-bit pattern.
+///
+/// Unlike [`collect_call_args`] this does NOT split the arguments into the
+/// SysV/AAPCS integer + float register files — it preserves the original
+/// declaration order so a positional ABI (the wasm `call_indirect`, where
+/// arguments are stack-positional rather than register-file partitioned)
+/// receives them as the callee declares them. Used by the residual-host-call
+/// trampoline path (see [`residual_host_call`]).
+pub fn collect_call_args_positional(
+    arg_classes: &str,
+    args_i: Option<&[i64]>,
+    args_r: Option<&[i64]>,
+    args_f: Option<&[i64]>,
+) -> Vec<i64> {
+    let mut out: Vec<i64> = Vec::with_capacity(arg_classes.len());
+    let mut ii = 0usize;
+    let mut ri = 0usize;
+    let mut fi = 0usize;
+    for c in arg_classes.chars() {
+        match c {
+            'i' => {
+                out.push(args_i.expect("collect_call_args_positional: args_i missing")[ii]);
+                ii += 1;
+            }
+            'r' => {
+                out.push(args_r.expect("collect_call_args_positional: args_r missing")[ri]);
+                ri += 1;
+            }
+            // `f` (Float) and `L` (SignedLongLong) both live in the `args_f`
+            // storage bank; their raw 64-bit slot value is forwarded verbatim
+            // — the host trampoline coerces it to f64/i64 from the callee's
+            // reflected parameter type.
+            'f' | 'L' => {
+                out.push(args_f.expect("collect_call_args_positional: args_f missing")[fi]);
+                fi += 1;
+            }
+            other => panic!(
+                "collect_call_args_positional: unsupported arg class {other:?} \
+                 in arg_classes={arg_classes:?}"
+            ),
+        }
+    }
+    out
+}
+
+/// A host-provided trampoline that performs a residual call by reflecting the
+/// callee's real signature, rather than transmuting the raw funcptr to a
+/// statically-guessed `extern "C" fn`.
+///
+/// `func_ptr` is the raw callee address (a table index on wasm32); `args` is
+/// the positional argument list (floats as raw bits). The return value is the
+/// callee result as a 64-bit pattern (Void callees return 0; Ref returns the
+/// pointer; Float returns `f64::to_bits`).
+///
+/// Installed only where in-module static-signature dispatch is impossible:
+/// the wasm32 backend, whose `call_indirect` type-checks every call and so
+/// cannot reuse the uniform-`i64` transmute that the SysV/AAPCS C ABI tolerates
+/// on native backends. `None` (the default on dynasm/cranelift) keeps the
+/// direct transmute path.
+pub type ResidualHostCallFn = fn(func_ptr: usize, args: &[i64]) -> i64;
+
+thread_local! {
+    static RESIDUAL_HOST_CALL: std::cell::Cell<Option<ResidualHostCallFn>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Install the active residual-call host trampoline. Pass `None` to clear.
+pub fn set_residual_host_call(hook: Option<ResidualHostCallFn>) {
+    RESIDUAL_HOST_CALL.with(|c| c.set(hook));
+}
+
+/// The active residual-call host trampoline, or `None` for direct transmute.
+pub fn residual_host_call() -> Option<ResidualHostCallFn> {
+    RESIDUAL_HOST_CALL.with(|c| c.get())
+}

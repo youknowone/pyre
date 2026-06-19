@@ -21,6 +21,9 @@ host-import = []
 majit-ir = { workspace = true }
 majit-backend = { workspace = true }
 majit-gc = { workspace = true }
+# `BhDescr` (blackhole allocation descriptors) names the `bh_new*` override
+# parameter types, matching the `Backend` trait signature.
+majit-translate = { workspace = true }
 wasm-encoder = { workspace = true }
 
 [target.'cfg(all(target_arch = "wasm32", not(target_os = "wasi")))'.dependencies]

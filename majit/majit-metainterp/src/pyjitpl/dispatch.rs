@@ -6441,6 +6441,12 @@ fn build_concrete_values(
 }
 
 pub fn call_int_function(func_ptr: *const (), args: &[i64]) -> i64 {
+    // Where a backend cannot build a `call_indirect` whose type matches the
+    // callee's real signature (wasm32), route through the host trampoline,
+    // which reflects the signature and coerces each positional argument.
+    if let Some(hook) = majit_backend::call_stub::residual_host_call() {
+        return hook(func_ptr as usize, args);
+    }
     unsafe {
         match args {
             [] => {
@@ -6670,6 +6676,15 @@ pub fn call_ref_function(func_ptr: *const (), args: &[i64]) -> i64 {
 }
 
 pub fn call_void_function(func_ptr: *const (), args: &[i64]) {
+    // See `call_int_function`: the host trampoline reflects the callee's real
+    // signature, so a void-typed residual whose target actually returns `i64`
+    // (e.g. `store_subscr_fn`) — or genuinely returns `()`
+    // (`set_current_exception_fn`) — is dispatched without a wasm
+    // indirect-call type mismatch. The reflected result is discarded.
+    if let Some(hook) = majit_backend::call_stub::residual_host_call() {
+        let _ = hook(func_ptr as usize, args);
+        return;
+    }
     unsafe {
         match args {
             [] => {

@@ -51,6 +51,68 @@ use pyre_interpreter::*;
 use std::cell::RefCell;
 use std::sync::Once;
 
+// Residual-call host trampoline for the native-host (`wasmi`) build.
+//
+// wasm32 `call_indirect` type-checks every call, so the in-module metainterp
+// cannot transmute a raw funcptr to a statically-guessed `extern "C" fn` and
+// call it — a residual target whose real signature is not the uniform
+// `(i64…) -> i64` traps. The compiled trace already round-trips such calls
+// through the host (`env.jit_call`); this routes the recording / blackhole
+// path through the symmetric `pyre_jit.jit_call_host` import, which reflects
+// the callee's wasm signature and coerces each positional argument.
+#[cfg(all(target_arch = "wasm32", feature = "wasmi"))]
+mod residual_host {
+    use core::cell::UnsafeCell;
+
+    // Call-area layout shared with `majit-backend-wasm` codegen and the host
+    // runner's `jit_call_trampoline`; offsets are relative to the frame-pointer
+    // base passed to the import.
+    const CALL_RESULT_OFS: usize = 2000;
+    const CALL_FUNC_OFS: usize = 2008;
+    const CALL_NARGS_OFS: usize = 2016;
+    const CALL_ARGS_OFS: usize = 2024;
+    const MAX_ARGS: usize = 16;
+    const SCRATCH_LEN: usize = CALL_ARGS_OFS + MAX_ARGS * 8;
+
+    #[link(wasm_import_module = "pyre_jit")]
+    unsafe extern "C" {
+        fn jit_call_host(frame_ptr: u32);
+    }
+
+    // A wasm32 module instance is single-threaded, so a shared scratch buffer
+    // needs no synchronization. Residual calls nest synchronously: each level
+    // writes its arguments, the host reads them before invoking the callee, and
+    // each level reads its result immediately after the host returns — so an
+    // inner call that reuses the buffer cannot clobber an outer call's
+    // already-consumed arguments or not-yet-written result.
+    struct Scratch(UnsafeCell<[u8; SCRATCH_LEN]>);
+    unsafe impl Sync for Scratch {}
+    static SCRATCH: Scratch = Scratch(UnsafeCell::new([0u8; SCRATCH_LEN]));
+
+    fn residual_host_call(func_ptr: usize, args: &[i64]) -> i64 {
+        assert!(
+            args.len() <= MAX_ARGS,
+            "residual_host_call: arity {} exceeds {MAX_ARGS}",
+            args.len()
+        );
+        let base = SCRATCH.0.get() as *mut u8;
+        unsafe {
+            (base.add(CALL_FUNC_OFS) as *mut i64).write_unaligned(func_ptr as i64);
+            (base.add(CALL_NARGS_OFS) as *mut i64).write_unaligned(args.len() as i64);
+            for (i, &a) in args.iter().enumerate() {
+                (base.add(CALL_ARGS_OFS + i * 8) as *mut i64).write_unaligned(a);
+            }
+            jit_call_host(base as u32);
+            (base.add(CALL_RESULT_OFS) as *const i64).read_unaligned()
+        }
+    }
+
+    /// Install the trampoline on the current thread. Idempotent.
+    pub fn install() {
+        majit_backend::call_stub::set_residual_host_call(Some(residual_host_call));
+    }
+}
+
 static PANIC_HOOK: Once = Once::new();
 
 fn install_panic_hook() {
@@ -78,6 +140,8 @@ fn install_wasm_print_hook() {
 /// (C-ABI) entry points below.
 fn run_python_impl(source: &str) -> String {
     install_panic_hook();
+    #[cfg(all(target_arch = "wasm32", feature = "wasmi"))]
+    residual_host::install();
     pyre_interpreter::importing::install_builtin_modules();
     install_wasm_print_hook();
     OUTPUT_BUF.with(|buf| buf.borrow_mut().clear());
@@ -88,11 +152,29 @@ fn run_python_impl(source: &str) -> String {
     };
 
     let execution_context = std::rc::Rc::new(PyExecutionContext::default());
+    // Seed the TLS execution-context slot (pyrex real_main does the same at
+    // boot). `getexecutioncontext().gettopframe()` must be live so a residual
+    // `bh_call_fn_impl` from a blackhole resume — e.g. a `print(...)` after a
+    // JIT-compiled loop — can resolve its parent frame instead of tripping the
+    // fail-fast topframe assert.
+    pyre_interpreter::call::set_last_exec_ctx(std::rc::Rc::as_ptr(&execution_context));
     let mut frame =
         match pyre_interpreter::pyframe::PyFrame::new_with_context(code, execution_context) {
             Ok(frame) => frame,
             Err(e) => return format!("Error: {e}"),
         };
+
+    // Register the `__main__` module in sys.modules (pyrex real_main does the
+    // same), reusing the canonical globals dict so `__main__.__dict__`,
+    // `globals()`, and `function.__globals__` share one identity. Without this,
+    // `sys.modules['__main__']` / `import __main__` raise KeyError.
+    let canonical = frame.get_w_globals_obj();
+    let main_module = pyre_object::moduleobject::w_module_new_aliasing_dict(
+        "__main__",
+        unsafe { pyre_object::w_dict_get_dict_storage_proxy(canonical) },
+        canonical,
+    );
+    pyre_interpreter::importing::set_sys_module("__main__", main_module);
 
     // catch_unwind to capture panics from JIT as error messages
     let eval_result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {

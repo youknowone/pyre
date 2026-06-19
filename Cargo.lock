@@ -1376,6 +1376,7 @@ dependencies = [
  "majit-backend",
  "majit-gc",
  "majit-ir",
+ "majit-translate",
  "smallvec",
  "wasm-bindgen",
  "wasm-encoder 0.245.1",
@@ -2058,6 +2059,7 @@ name = "pyre-wasm"
 version = "0.0.2"
 dependencies = [
  "getrandom 0.3.4",
+ "majit-backend",
  "pyre-interpreter",
  "pyre-jit",
  "pyre-object",

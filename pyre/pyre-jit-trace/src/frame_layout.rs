@@ -108,7 +108,9 @@ unsafe extern "C" fn pyre_clear_vable_token(obj_ptr: i64) {
     unsafe {
         let ptr = obj_ptr as *mut u8;
         if !ptr.is_null() {
-            let token_ptr = ptr.add(PYFRAME_VABLE_TOKEN_OFFSET) as *mut u64;
+            // `vable_token` is `usize` (pointer-width: 4 on wasm32). Writing
+            // 8 bytes would clobber the following field.
+            let token_ptr = ptr.add(PYFRAME_VABLE_TOKEN_OFFSET) as *mut usize;
             *token_ptr = 0;
         }
     }

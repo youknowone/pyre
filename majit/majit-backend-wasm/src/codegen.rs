@@ -28,6 +28,10 @@ use wasm_encoder::{
 const FRAME_SLOT_BASE: u64 = 8;
 const SLOT_SIZE: u64 = 8;
 
+/// Scratch i64 locals reserved past the value locals for `emit_umulhi`
+/// (al, ah, bl, bh, mid1).
+const UMULHI_SCRATCH: u32 = 5;
+
 /// Call area layout (fixed offsets from frame_ptr).
 const CALL_RESULT_OFS: u64 = 2000;
 const CALL_FUNC_OFS: u64 = 2008;
@@ -43,6 +47,98 @@ fn mem64(offset: u64) -> MemArg {
         align: 3,
         memory_index: 0,
     }
+}
+
+fn memarg(offset: u64, align: u32) -> MemArg {
+    MemArg {
+        offset,
+        align,
+        memory_index: 0,
+    }
+}
+
+/// Emit a width-correct integer load. The element address (i32) must be on
+/// the stack; the result is an i64, sign- or zero-extended from `size`
+/// bytes. Word-sized fields are 4 bytes on wasm32 (`isize`/`usize`/pointer),
+/// 8 bytes on 64-bit; reading a fixed 8 bytes here would fold in the next
+/// field's bytes on wasm32.
+fn emit_sized_int_load(sink: &mut InstructionSink<'_>, offset: u64, size: usize, signed: bool) {
+    match (size, signed) {
+        (8, _) => {
+            sink.i64_load(mem64(offset));
+        }
+        (4, true) => {
+            sink.i32_load(memarg(offset, 2));
+            sink.i64_extend_i32_s();
+        }
+        (4, false) => {
+            sink.i32_load(memarg(offset, 2));
+            sink.i64_extend_i32_u();
+        }
+        (2, true) => {
+            sink.i32_load16_s(memarg(offset, 1));
+            sink.i64_extend_i32_s();
+        }
+        (2, false) => {
+            sink.i32_load16_u(memarg(offset, 1));
+            sink.i64_extend_i32_u();
+        }
+        (1, true) => {
+            sink.i32_load8_s(memarg(offset, 0));
+            sink.i64_extend_i32_s();
+        }
+        (1, false) => {
+            sink.i32_load8_u(memarg(offset, 0));
+            sink.i64_extend_i32_u();
+        }
+        _ => {
+            sink.i64_load(mem64(offset));
+        }
+    }
+}
+
+/// Emit a width-correct integer store. The stack must hold
+/// `[addr_i32, value_i64]`; the low `size` bytes of the value are stored.
+/// A fixed 8-byte store would clobber the adjacent field/item (or run past
+/// the array end) for word-sized fields and pointer array items on wasm32.
+fn emit_sized_int_store(sink: &mut InstructionSink<'_>, offset: u64, size: usize) {
+    match size {
+        8 => {
+            sink.i64_store(mem64(offset));
+        }
+        4 => {
+            sink.i32_wrap_i64();
+            sink.i32_store(memarg(offset, 2));
+        }
+        2 => {
+            sink.i32_wrap_i64();
+            sink.i32_store16(memarg(offset, 1));
+        }
+        1 => {
+            sink.i32_wrap_i64();
+            sink.i32_store8(memarg(offset, 0));
+        }
+        _ => {
+            sink.i64_store(mem64(offset));
+        }
+    }
+}
+
+/// `(field_size, is_signed)` from an op's FieldDescr; defaults to word-sized
+/// signed when the descr is absent.
+fn field_size_sign_from_descr(op: &Op) -> (usize, bool) {
+    let descr = op.getdescr();
+    if let Some(fd) = descr.as_ref().and_then(|d| d.as_field_descr()) {
+        return (fd.field_size(), fd.is_field_signed());
+    }
+    (std::mem::size_of::<usize>(), true)
+}
+
+/// `(item_size, is_signed)` from an op's ArrayDescr; defaults to 8-byte
+/// signed when the descr is absent.
+fn array_item_size_sign_from_descr(op: &Op) -> (usize, bool) {
+    op.with_array_descr(|ad| (ad.item_size(), ad.is_item_signed()))
+        .unwrap_or((8, true))
 }
 
 /// llsupport/gc.py:563 GcLLDescr_framework
@@ -109,7 +205,20 @@ pub struct GuardGcTypeInfo {
 
 /// Check if any op in the trace is a CALL variant.
 fn has_call_ops(ops: &[Op]) -> bool {
-    ops.iter().any(|op| op.opcode.is_call())
+    // Allocation ops (`New*`, `Newstr`/`Newunicode`) also reach the host via
+    // the `jit_call` trampoline, so the import must be present for them too.
+    ops.iter().any(|op| {
+        op.opcode.is_call()
+            || matches!(
+                op.opcode,
+                OpCode::New
+                    | OpCode::NewWithVtable
+                    | OpCode::NewArray
+                    | OpCode::NewArrayClear
+                    | OpCode::Newstr
+                    | OpCode::Newunicode
+            )
+    })
 }
 
 fn collect_guards_and_vars(inputargs: &[InputArg], ops: &[Op]) -> (Vec<GuardExit>, u32) {
@@ -170,6 +279,8 @@ pub fn build_wasm_module(
     vtable_offset: Option<usize>,
     classptr_to_typeid: &HashMap<i64, u32>,
     guard_gc_type_info: &GuardGcTypeInfo,
+    alloc_fn_ptr: i64,
+    alloc_array_fn_ptr: i64,
 ) -> Result<(Vec<u8>, Vec<GuardExit>), BackendError> {
     let (guards, num_vars) = collect_guards_and_vars(inputargs, ops);
     let needs_call = has_call_ops(ops);
@@ -228,6 +339,8 @@ pub fn build_wasm_module(
         vtable_offset,
         classptr_to_typeid,
         guard_gc_type_info,
+        alloc_fn_ptr,
+        alloc_array_fn_ptr,
     )?;
     codes.function(&func);
     module.section(&codes);
@@ -244,8 +357,13 @@ fn build_function(
     vtable_offset: Option<usize>,
     classptr_to_typeid: &HashMap<i64, u32>,
     guard_gc_type_info: &GuardGcTypeInfo,
+    alloc_fn_ptr: i64,
+    alloc_array_fn_ptr: i64,
 ) -> Result<Function, BackendError> {
-    let mut func = Function::new(vec![(num_vars, ValType::I64)]);
+    // Value locals occupy `1 ..= num_vars`; reserve `UMULHI_SCRATCH` extra i64
+    // locals past them (`num_vars+1 ..= num_vars+UMULHI_SCRATCH`) as scratch for
+    // the `UintMulHigh` 32-bit-split expansion (`emit_umulhi`).
+    let mut func = Function::new(vec![(num_vars + UMULHI_SCRATCH, ValType::I64)]);
     let mut sink = func.instructions();
 
     // Load inputs from frame into locals
@@ -257,15 +375,35 @@ fn build_function(
             .local_set(local_idx);
     }
 
-    let has_loop = ops.iter().any(|op| op.opcode == OpCode::Label);
+    // A peeled loop arrives as `[preamble..][LABEL][body..][JUMP]`: the
+    // preamble runs once on entry, the LABEL is the loop-back target, and
+    // JUMP branches back to it. Emit the `loop` at the LABEL (not the top)
+    // so the preamble is not re-executed every iteration; wrap everything in
+    // a `block` so guard exits `br` out to the function epilogue. Use the
+    // LAST label (a peeled trace may carry an outer entry label plus the
+    // inner loop header).
+    let loop_label_idx = ops.iter().rposition(|op| op.opcode == OpCode::Label);
+    let has_loop = loop_label_idx.is_some();
     if has_loop {
         sink.block(BlockType::Empty);
-        sink.loop_(BlockType::Empty);
     }
 
     let mut guard_idx = 0u32;
+    let mut in_loop_body = false;
 
-    for op in ops {
+    for (op_idx, op) in ops.iter().enumerate() {
+        if Some(op_idx) == loop_label_idx {
+            sink.loop_(BlockType::Empty);
+            in_loop_body = true;
+        }
+        // Depth (from statement level) of the enclosing `block` that guard
+        // exits `br` to: preamble = 0, loop body = 1 (the `loop` sits in
+        // between). `None` for straight-line traces (no block emitted).
+        let block_exit_depth = match (has_loop, in_loop_body) {
+            (false, _) => None,
+            (true, false) => Some(0u32),
+            (true, true) => Some(1u32),
+        };
         match op.opcode {
             OpCode::Label => {}
 
@@ -283,39 +421,39 @@ fn build_function(
 
             OpCode::Finish => {
                 emit_guard_exit(&mut sink, constants, guard_idx, op);
-                if has_loop {
-                    sink.br(1);
+                if let Some(d) = block_exit_depth {
+                    sink.br(d);
                 }
                 guard_idx += 1;
             }
 
             // ── Guards ──
             OpCode::GuardTrue => {
-                emit_guard_true(&mut sink, constants, guard_idx, op, has_loop);
+                emit_guard_true(&mut sink, constants, guard_idx, op, block_exit_depth);
                 guard_idx += 1;
             }
             OpCode::GuardFalse => {
-                emit_guard_false(&mut sink, constants, guard_idx, op, has_loop);
+                emit_guard_false(&mut sink, constants, guard_idx, op, block_exit_depth);
                 guard_idx += 1;
             }
             OpCode::GuardValue => {
                 emit_resolve(&mut sink, constants, op.arg(0).to_opref());
                 emit_resolve(&mut sink, constants, op.arg(1).to_opref());
                 sink.i64_ne();
-                emit_guard_if_exit(&mut sink, constants, guard_idx, op, has_loop);
+                emit_guard_if_exit(&mut sink, constants, guard_idx, op, block_exit_depth);
                 guard_idx += 1;
             }
             OpCode::GuardNonnull => {
                 emit_resolve(&mut sink, constants, op.arg(0).to_opref());
                 sink.i64_eqz();
-                emit_guard_if_exit(&mut sink, constants, guard_idx, op, has_loop);
+                emit_guard_if_exit(&mut sink, constants, guard_idx, op, block_exit_depth);
                 guard_idx += 1;
             }
             OpCode::GuardIsnull => {
                 emit_resolve(&mut sink, constants, op.arg(0).to_opref());
                 sink.i64_const(0);
                 sink.i64_ne();
-                emit_guard_if_exit(&mut sink, constants, guard_idx, op, has_loop);
+                emit_guard_if_exit(&mut sink, constants, guard_idx, op, block_exit_depth);
                 guard_idx += 1;
             }
             OpCode::GuardClass | OpCode::GuardNonnullClass => {
@@ -330,7 +468,17 @@ fn build_function(
                 if let Some(off_usize) = vtable_offset {
                     let off = off_usize as u64;
                     emit_resolve(&mut sink, constants, op.arg(0).to_opref());
-                    sink.i64_load(mem64(off));
+                    sink.i32_wrap_i64(); // struct ptr (i64) → i32 address
+                    // The typeptr (`ob_type`) is a pointer-width field: 4
+                    // bytes on wasm32. Reading it as i64 would fold in the
+                    // following field's bytes and never match the class
+                    // immediate. Load 4 bytes and zero-extend.
+                    sink.i32_load(MemArg {
+                        offset: off,
+                        align: 2,
+                        memory_index: 0,
+                    });
+                    sink.i64_extend_i32_u();
                     emit_resolve(&mut sink, constants, op.arg(1).to_opref());
                     sink.i64_ne();
                 } else {
@@ -359,7 +507,7 @@ fn build_function(
                     sink.i32_const(expected_typeid as i32);
                     sink.i32_ne();
                 }
-                emit_guard_if_exit(&mut sink, constants, guard_idx, op, has_loop);
+                emit_guard_if_exit(&mut sink, constants, guard_idx, op, block_exit_depth);
                 guard_idx += 1;
             }
             OpCode::GuardNoOverflow => {
@@ -370,8 +518,8 @@ fn build_function(
             OpCode::GuardOverflow => {
                 // Always fails (no overflow detected in wasm MVP).
                 emit_guard_exit(&mut sink, constants, guard_idx, op);
-                if has_loop {
-                    sink.br(1);
+                if let Some(d) = block_exit_depth {
+                    sink.br(d);
                 }
                 guard_idx += 1;
             }
@@ -389,7 +537,7 @@ fn build_function(
                 sink.i64_load(mem64(0));
                 sink.i64_const(0);
                 sink.i64_ne();
-                emit_guard_if_exit(&mut sink, constants, guard_idx, op, has_loop);
+                emit_guard_if_exit(&mut sink, constants, guard_idx, op, block_exit_depth);
                 guard_idx += 1;
             }
             OpCode::GuardException => {
@@ -403,7 +551,7 @@ fn build_function(
                 sink.i64_load(mem64(0));
                 emit_resolve(&mut sink, constants, op.arg(0).to_opref());
                 sink.i64_ne();
-                emit_guard_if_exit(&mut sink, constants, guard_idx, op, has_loop);
+                emit_guard_if_exit(&mut sink, constants, guard_idx, op, block_exit_depth);
                 guard_idx += 1;
                 // Success path: capture the caught exception into the result
                 // var, then clear both slots.
@@ -433,6 +581,10 @@ fn build_function(
             OpCode::IntLshift => emit_binop(&mut sink, constants, op, BinOp::I64Shl),
             OpCode::IntRshift => emit_binop(&mut sink, constants, op, BinOp::I64ShrS),
             OpCode::UintRshift => emit_binop(&mut sink, constants, op, BinOp::I64ShrU),
+            // High 64 bits of the unsigned 64×64→128 product. The optimizer
+            // emits this for division/modulo-by-constant strength reduction;
+            // wasm has no mul-high instruction, so expand via 32-bit split.
+            OpCode::UintMulHigh => emit_umulhi(&mut sink, constants, op, num_vars),
 
             // Overflow variants: compute result + overflow flag
             OpCode::IntAddOvf => emit_ovf_binop(&mut sink, constants, op, BinOp::I64Add),
@@ -623,7 +775,8 @@ fn build_function(
                     emit_resolve(&mut sink, constants, op.arg(0).to_opref()); // struct ptr (i64)
                     sink.i32_wrap_i64(); // convert to i32 address
                     let field_offset = field_offset_from_descr(op);
-                    sink.i64_load(mem64(field_offset));
+                    let (size, signed) = field_size_sign_from_descr(op);
+                    emit_sized_int_load(&mut sink, field_offset, size, signed);
                     sink.local_set(1 + vi);
                 }
             }
@@ -648,7 +801,8 @@ fn build_function(
                 sink.i32_wrap_i64();
                 let field_offset = field_offset_from_descr(op);
                 emit_resolve(&mut sink, constants, op.arg(1).to_opref()); // value
-                sink.i64_store(mem64(field_offset));
+                let (size, _signed) = field_size_sign_from_descr(op);
+                emit_sized_int_store(&mut sink, field_offset, size);
             }
 
             // ── Float field access ──
@@ -684,7 +838,8 @@ fn build_function(
                 if !OpRef::raw_is_constant(vi) {
                     // addr = base + base_size + index * item_size
                     emit_array_addr(&mut sink, constants, op);
-                    sink.i64_load(mem64(0));
+                    let (item_size, signed) = array_item_size_sign_from_descr(op);
+                    emit_sized_int_load(&mut sink, 0, item_size, signed);
                     sink.local_set(1 + vi);
                 }
             }
@@ -704,7 +859,12 @@ fn build_function(
             OpCode::SetarrayitemGc | OpCode::SetarrayitemRaw => {
                 emit_array_addr(&mut sink, constants, op);
                 emit_resolve(&mut sink, constants, op.arg(2).to_opref()); // value
-                sink.i64_store(mem64(0));
+                // A Ref item is pointer-width (4 bytes on wasm32). Storing a
+                // fixed 8 bytes would clobber the next item, or run past the
+                // array end on the last item and corrupt the heap. A Float
+                // item is 8 bytes, so its bit pattern stores via the i64 path.
+                let (item_size, _signed) = array_item_size_sign_from_descr(op);
+                emit_sized_int_store(&mut sink, 0, item_size);
             }
 
             // ── Interior field access ──
@@ -716,7 +876,8 @@ fn build_function(
                     sink.i32_wrap_i64();
                     let field_offset = field_offset_from_descr(op);
                     // Simplified: use field_offset directly (RPython computes base+index*itemsize+offset)
-                    sink.i64_load(mem64(field_offset));
+                    let (size, signed) = field_size_sign_from_descr(op);
+                    emit_sized_int_load(&mut sink, field_offset, size, signed);
                     sink.local_set(1 + vi);
                 }
             }
@@ -725,7 +886,8 @@ fn build_function(
                 sink.i32_wrap_i64();
                 let field_offset = field_offset_from_descr(op);
                 emit_resolve(&mut sink, constants, op.arg(2).to_opref()); // value
-                sink.i64_store(mem64(field_offset));
+                let (size, _signed) = field_size_sign_from_descr(op);
+                emit_sized_int_store(&mut sink, field_offset, size);
             }
 
             // ── String/Unicode ops (direct memory access) ──
@@ -852,7 +1014,7 @@ fn build_function(
                     // i64 in the constant pool or a frame slot).
                     emit_resolve(&mut sink, constants, op.arg(1).to_opref());
                     sink.i64_ne();
-                    emit_guard_if_exit(&mut sink, constants, guard_idx, op, has_loop);
+                    emit_guard_if_exit(&mut sink, constants, guard_idx, op, block_exit_depth);
                 }
                 guard_idx += 1;
             }
@@ -920,7 +1082,7 @@ fn build_function(
                 // assembler.py:1942 guard_success_cc = Conditions['NZ']:
                 // guard passes when byte & flag != 0; fail when == 0.
                 sink.i32_eqz();
-                emit_guard_if_exit(&mut sink, constants, guard_idx, op, has_loop);
+                emit_guard_if_exit(&mut sink, constants, guard_idx, op, block_exit_depth);
                 guard_idx += 1;
             }
             // x86/assembler.py:1945-1980 genop_guard_guard_subclass.
@@ -1029,14 +1191,14 @@ fn build_function(
                 // assembler.py:1979 guard_success_cc = Conditions['B']:
                 // guard passes when sub <u limit; fail when sub >=u limit.
                 sink.i64_ge_u();
-                emit_guard_if_exit(&mut sink, constants, guard_idx, op, has_loop);
+                emit_guard_if_exit(&mut sink, constants, guard_idx, op, block_exit_depth);
                 guard_idx += 1;
             }
             OpCode::GuardFutureCondition | OpCode::GuardAlwaysFails => {
                 // GuardAlwaysFails always exits.
                 emit_guard_exit(&mut sink, constants, guard_idx, op);
-                if has_loop {
-                    sink.br(1);
+                if let Some(d) = block_exit_depth {
+                    sink.br(d);
                 }
                 guard_idx += 1;
             }
@@ -1185,10 +1347,119 @@ fn build_function(
             }
 
             // ── Allocation (via trampoline — treated as CALL) ──
-            OpCode::New | OpCode::NewWithVtable | OpCode::NewArray | OpCode::NewArrayClear => {
-                // These are handled by the optimizer and shouldn't normally
-                // appear in optimized traces (they become virtuals).
-                // If they do appear, skip — the host will handle on guard failure.
+            // llmodel.py:775-790 bh_new* parity: a `New*` survives
+            // optimization whenever the allocated object escapes the trace
+            // (e.g. reboxed result stored into a namespace). The trace cannot
+            // allocate inline (the GC is host-side), so route through the
+            // `jit_call` trampoline to the `wasm_jit_alloc` helper, then write
+            // the vtable / length fields with pointer-width (i32) stores.
+            OpCode::New | OpCode::NewWithVtable => {
+                let jit_call =
+                    jit_call_idx.expect("New op present but jit_call not imported");
+                let vi = op.pos.get().raw();
+                // llmodel.py:778-782: size, type_id, vtable from the size descr.
+                let descr = op.getdescr();
+                let sd = descr.as_ref().and_then(|d| d.as_size_descr());
+                let (size, type_id, vtable) = sd.map_or((16i64, 0i64, 0usize), |sd| {
+                    (sd.size() as i64, sd.type_id() as i64, sd.vtable())
+                });
+
+                // func_ptr = wasm_jit_alloc
+                sink.local_get(0);
+                sink.i64_const(alloc_fn_ptr);
+                sink.i64_store(mem64(CALL_FUNC_OFS));
+                // num_args = 2
+                sink.local_get(0);
+                sink.i64_const(2);
+                sink.i64_store(mem64(CALL_NARGS_OFS));
+                // arg0 = type_id
+                sink.local_get(0);
+                sink.i64_const(type_id);
+                sink.i64_store(mem64(CALL_ARGS_OFS));
+                // arg1 = size
+                sink.local_get(0);
+                sink.i64_const(size);
+                sink.i64_store(mem64(CALL_ARGS_OFS + SLOT_SIZE));
+                // call trampoline
+                sink.local_get(0);
+                sink.call(jit_call);
+
+                if !OpRef::raw_is_constant(vi) {
+                    // result pointer
+                    sink.local_get(0);
+                    sink.i64_load(mem64(CALL_RESULT_OFS));
+                    sink.local_set(1 + vi);
+
+                    // llmodel.py:779-781 write_int_at_mem(res, vtable_offset,
+                    // WORD, vtable). The `ob_type` field is pointer-width: 4
+                    // bytes on wasm32 (GuardClass reads it as i32), so store
+                    // the low 32 bits to avoid clobbering the next field.
+                    let write_vtable = op.opcode == OpCode::NewWithVtable
+                        && vtable != 0
+                        && vtable_offset.is_some();
+                    if write_vtable {
+                        let vt_off = vtable_offset.unwrap() as u64;
+                        sink.local_get(1 + vi);
+                        sink.i32_wrap_i64();
+                        sink.i32_const(vtable as i32);
+                        sink.i32_store(MemArg {
+                            offset: vt_off,
+                            align: 2,
+                            memory_index: 0,
+                        });
+                    }
+                }
+            }
+            OpCode::NewArray | OpCode::NewArrayClear => {
+                let jit_call =
+                    jit_call_idx.expect("NewArray op present but jit_call not imported");
+                let vi = op.pos.get().raw();
+                let descr = op.getdescr();
+                let ad = descr.as_ref().and_then(|d| d.as_array_descr());
+                let (base_size, item_size) =
+                    ad.map_or((16i64, 8i64), |ad| (ad.base_size() as i64, ad.item_size() as i64));
+                let len_offset = ad
+                    .and_then(|ad| ad.len_descr())
+                    .map_or(0i64, |ld| ld.offset() as i64);
+                let type_id = ad.map_or(0i64, |ad| ad.type_id() as i64);
+
+                // func_ptr = wasm_jit_alloc_array
+                sink.local_get(0);
+                sink.i64_const(alloc_array_fn_ptr);
+                sink.i64_store(mem64(CALL_FUNC_OFS));
+                // num_args = 5
+                sink.local_get(0);
+                sink.i64_const(5);
+                sink.i64_store(mem64(CALL_NARGS_OFS));
+                // arg0 = type_id
+                sink.local_get(0);
+                sink.i64_const(type_id);
+                sink.i64_store(mem64(CALL_ARGS_OFS));
+                // arg1 = base_size
+                sink.local_get(0);
+                sink.i64_const(base_size);
+                sink.i64_store(mem64(CALL_ARGS_OFS + SLOT_SIZE));
+                // arg2 = item_size
+                sink.local_get(0);
+                sink.i64_const(item_size);
+                sink.i64_store(mem64(CALL_ARGS_OFS + 2 * SLOT_SIZE));
+                // arg3 = length (op.arg(0))
+                sink.local_get(0);
+                emit_resolve(&mut sink, constants, op.arg(0).to_opref());
+                sink.i64_store(mem64(CALL_ARGS_OFS + 3 * SLOT_SIZE));
+                // arg4 = len_offset
+                sink.local_get(0);
+                sink.i64_const(len_offset);
+                sink.i64_store(mem64(CALL_ARGS_OFS + 4 * SLOT_SIZE));
+                // call trampoline
+                sink.local_get(0);
+                sink.call(jit_call);
+
+                if !OpRef::raw_is_constant(vi) {
+                    sink.local_get(0);
+                    sink.i64_load(mem64(CALL_RESULT_OFS));
+                    sink.local_set(1 + vi);
+                }
             }
 
             // ── Misc ──
@@ -1278,7 +1549,10 @@ fn build_function(
 // ── Helpers ──
 
 fn find_label_args(ops: &[Op]) -> Vec<OpRef> {
-    for op in ops {
+    // The JUMP branches back to the loop-header label, which is the LAST
+    // label in a peeled trace (an outer entry label may precede it). The
+    // `loop` is emitted at that same label in `build_function`.
+    for op in ops.iter().rev() {
         if op.opcode == OpCode::Label {
             return op.getarglist().iter().map(|a| a.to_opref()).collect();
         }
@@ -1349,11 +1623,11 @@ fn emit_guard_true(
     constants: &majit_ir::VecAssoc<u32, i64>,
     guard_idx: u32,
     op: &Op,
-    has_loop: bool,
+    block_exit_depth: Option<u32>,
 ) {
     emit_resolve(sink, constants, op.arg(0).to_opref());
     sink.i64_eqz();
-    emit_guard_if_exit(sink, constants, guard_idx, op, has_loop);
+    emit_guard_if_exit(sink, constants, guard_idx, op, block_exit_depth);
 }
 
 fn emit_guard_false(
@@ -1361,26 +1635,30 @@ fn emit_guard_false(
     constants: &majit_ir::VecAssoc<u32, i64>,
     guard_idx: u32,
     op: &Op,
-    has_loop: bool,
+    block_exit_depth: Option<u32>,
 ) {
     emit_resolve(sink, constants, op.arg(0).to_opref());
     sink.i64_const(0);
     sink.i64_ne();
-    emit_guard_if_exit(sink, constants, guard_idx, op, has_loop);
+    emit_guard_if_exit(sink, constants, guard_idx, op, block_exit_depth);
 }
 
 /// Common guard exit: condition is on stack (i32), emit if + exit.
+///
+/// `block_exit_depth` is the statement-level depth of the enclosing exit
+/// `block` (preamble = 0, loop body = 1); the `+ 1` accounts for the `if`
+/// this opens. `None` for straight-line traces with no exit block.
 fn emit_guard_if_exit(
     sink: &mut InstructionSink<'_>,
     constants: &majit_ir::VecAssoc<u32, i64>,
     guard_idx: u32,
     op: &Op,
-    has_loop: bool,
+    block_exit_depth: Option<u32>,
 ) {
     sink.if_(BlockType::Empty);
     emit_guard_exit(sink, constants, guard_idx, op);
-    if has_loop {
-        sink.br(2); // if=0, loop=1, block=2
+    if let Some(d) = block_exit_depth {
+        sink.br(d + 1);
     }
     sink.end();
 }
@@ -1475,6 +1753,84 @@ fn emit_binop(
     emit_resolve(sink, constants, op.arg(0).to_opref());
     emit_resolve(sink, constants, op.arg(1).to_opref());
     apply_binop(sink, binop);
+    sink.local_set(1 + vi);
+}
+
+/// `UintMulHigh`: high 64 bits of the unsigned 64×64→128 product. Wasm has
+/// only `i64.mul` (low 64 bits), so compute via the classic 32-bit split:
+/// a = ah·2³²+al, b = bh·2³²+bl, with carry-safe intermediates
+///   mid1 = ah·bl + (al·bl >> 32)
+///   high = ah·bh + (mid1 >> 32) + ((al·bh + (mid1 & 0xFFFFFFFF)) >> 32)
+/// Uses the five scratch locals reserved at `num_vars+1 ..= num_vars+5`.
+fn emit_umulhi(
+    sink: &mut InstructionSink<'_>,
+    constants: &majit_ir::VecAssoc<u32, i64>,
+    op: &Op,
+    num_vars: u32,
+) {
+    let vi = op.pos.get().raw();
+    if OpRef::raw_is_constant(vi) {
+        return;
+    }
+    const MASK32: i64 = 0xFFFF_FFFF;
+    let al = num_vars + 1;
+    let ah = num_vars + 2;
+    let bl = num_vars + 3;
+    let bh = num_vars + 4;
+    let mid1 = num_vars + 5;
+
+    // al = a & 0xFFFFFFFF
+    emit_resolve(sink, constants, op.arg(0).to_opref());
+    sink.i64_const(MASK32);
+    sink.i64_and();
+    sink.local_set(al);
+    // ah = a >>u 32
+    emit_resolve(sink, constants, op.arg(0).to_opref());
+    sink.i64_const(32);
+    sink.i64_shr_u();
+    sink.local_set(ah);
+    // bl = b & 0xFFFFFFFF
+    emit_resolve(sink, constants, op.arg(1).to_opref());
+    sink.i64_const(MASK32);
+    sink.i64_and();
+    sink.local_set(bl);
+    // bh = b >>u 32
+    emit_resolve(sink, constants, op.arg(1).to_opref());
+    sink.i64_const(32);
+    sink.i64_shr_u();
+    sink.local_set(bh);
+
+    // mid1 = ah*bl + ((al*bl) >>u 32)
+    sink.local_get(al);
+    sink.local_get(bl);
+    sink.i64_mul();
+    sink.i64_const(32);
+    sink.i64_shr_u();
+    sink.local_get(ah);
+    sink.local_get(bl);
+    sink.i64_mul();
+    sink.i64_add();
+    sink.local_set(mid1);
+
+    // high = ah*bh + (mid1 >>u 32) + ((al*bh + (mid1 & MASK32)) >>u 32)
+    sink.local_get(ah);
+    sink.local_get(bh);
+    sink.i64_mul();
+    sink.local_get(mid1);
+    sink.i64_const(32);
+    sink.i64_shr_u();
+    sink.i64_add();
+    sink.local_get(al);
+    sink.local_get(bh);
+    sink.i64_mul();
+    sink.local_get(mid1);
+    sink.i64_const(MASK32);
+    sink.i64_and();
+    sink.i64_add();
+    sink.i64_const(32);
+    sink.i64_shr_u();
+    sink.i64_add();
+
     sink.local_set(1 + vi);
 }
 

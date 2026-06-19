@@ -561,9 +561,11 @@ impl VirtualizableInfo {
     /// `obj_ptr` must point to a valid virtualizable object.
     pub unsafe fn tracing_before_residual_call(&self, obj_ptr: *mut u8) {
         unsafe {
-            let token_ptr = obj_ptr.add(self.token_offset) as *mut u64;
+            // The token is a word-sized (`Signed`) field: 4 bytes on wasm32.
+            // The all-ones sentinel truncates to `usize::MAX` at that width.
+            let token_ptr = obj_ptr.add(self.token_offset) as *mut usize;
             assert_eq!(*token_ptr, 0, "token should be NONE before residual call");
-            *token_ptr = TOKEN_TRACING_RESCALL;
+            *token_ptr = TOKEN_TRACING_RESCALL as usize;
         }
     }
 
@@ -576,10 +578,10 @@ impl VirtualizableInfo {
     /// `obj_ptr` must point to a valid virtualizable object.
     pub unsafe fn tracing_after_residual_call(&self, obj_ptr: *mut u8) -> bool {
         unsafe {
-            let token_ptr = obj_ptr.add(self.token_offset) as *mut u64;
+            let token_ptr = obj_ptr.add(self.token_offset) as *mut usize;
             if *token_ptr != 0 {
                 // Not forced — still TOKEN_TRACING_RESCALL
-                assert_eq!(*token_ptr, TOKEN_TRACING_RESCALL);
+                assert_eq!(*token_ptr, TOKEN_TRACING_RESCALL as usize);
                 *token_ptr = 0; // Clear back to TOKEN_NONE
                 false
             } else {
@@ -599,14 +601,14 @@ impl VirtualizableInfo {
     /// `obj_ptr` must point to a valid virtualizable object.
     pub unsafe fn force_now(&self, obj_ptr: *mut u8, force_fn: impl FnOnce(u64)) {
         unsafe {
-            let token_ptr = obj_ptr.add(self.token_offset) as *mut u64;
+            let token_ptr = obj_ptr.add(self.token_offset) as *mut usize;
             let token = *token_ptr;
-            if token == TOKEN_TRACING_RESCALL {
+            if token == TOKEN_TRACING_RESCALL as usize {
                 // During tracing — just clear the marker
                 *token_ptr = 0;
             } else if token != 0 {
                 // Active JIT frame — force it, then verify it cleared the token
-                force_fn(token);
+                force_fn(token as u64);
                 assert_eq!(*token_ptr, 0, "force_fn should have cleared the token");
             }
         }
@@ -618,8 +620,17 @@ impl VirtualizableInfo {
     /// `obj_ptr` must point to a valid virtualizable object.
     pub unsafe fn read_token(&self, obj_ptr: *const u8) -> VableToken {
         unsafe {
-            let token_ptr = obj_ptr.add(self.token_offset) as *const u64;
-            VableToken::from_raw(*token_ptr)
+            let token_ptr = obj_ptr.add(self.token_offset) as *const usize;
+            let raw = *token_ptr;
+            // The all-ones sentinel is stored width-truncated (`usize::MAX`
+            // on wasm32); widen it back to the canonical `u64::MAX` so
+            // `from_raw` matches.
+            let raw_u64 = if raw == TOKEN_TRACING_RESCALL as usize {
+                TOKEN_TRACING_RESCALL
+            } else {
+                raw as u64
+            };
+            VableToken::from_raw(raw_u64)
         }
     }
 
@@ -629,8 +640,8 @@ impl VirtualizableInfo {
     /// `obj_ptr` must point to a valid virtualizable object.
     pub unsafe fn write_token(&self, obj_ptr: *mut u8, token: VableToken) {
         unsafe {
-            let token_ptr = obj_ptr.add(self.token_offset) as *mut u64;
-            *token_ptr = token.to_raw();
+            let token_ptr = obj_ptr.add(self.token_offset) as *mut usize;
+            *token_ptr = token.to_raw() as usize;
         }
     }
 
@@ -879,9 +890,18 @@ impl VirtualizableInfo {
                     let ptr = obj_ptr.add(field.offset) as *const f64;
                     f64::to_bits(*ptr) as i64
                 }
+                // Pointer-width field: 4 bytes on wasm32. Reading 8 bytes
+                // would fold in the next field's bytes.
+                Type::Ref => {
+                    let ptr = obj_ptr.add(field.offset) as *const usize;
+                    *ptr as i64
+                }
+                // Word-sized `Signed` field (`isize`/`usize`): 4 bytes on
+                // wasm32. Read at word width and sign-extend so a negative
+                // `last_instr` round-trips.
                 _ => {
-                    let ptr = obj_ptr.add(field.offset) as *const i64;
-                    *ptr
+                    let ptr = obj_ptr.add(field.offset) as *const isize;
+                    *ptr as i64
                 }
             }
         }
@@ -901,9 +921,17 @@ impl VirtualizableInfo {
                     let ptr = obj_ptr.add(field.offset) as *mut f64;
                     *ptr = f64::from_bits(value as u64);
                 }
+                // Pointer-width field: 4 bytes on wasm32. Writing 8 bytes
+                // would clobber the adjacent field.
+                Type::Ref => {
+                    let ptr = obj_ptr.add(field.offset) as *mut usize;
+                    *ptr = value as usize;
+                }
+                // Word-sized `Signed` field (`isize`/`usize`): 4 bytes on
+                // wasm32. Writing 8 bytes would clobber the adjacent field.
                 _ => {
-                    let ptr = obj_ptr.add(field.offset) as *mut i64;
-                    *ptr = value;
+                    let ptr = obj_ptr.add(field.offset) as *mut isize;
+                    *ptr = value as isize;
                 }
             }
         }
@@ -960,6 +988,12 @@ impl VirtualizableInfo {
                     let ptr = array_ptr.add(item_offset) as *const f64;
                     f64::to_bits(*ptr) as i64
                 }
+                // Pointer-width item: 4 bytes on wasm32. Reading 8 bytes
+                // would fold in the next item's bytes.
+                Type::Ref => {
+                    let ptr = array_ptr.add(item_offset) as *const usize;
+                    *ptr as i64
+                }
                 _ => {
                     let ptr = array_ptr.add(item_offset) as *const i64;
                     *ptr
@@ -989,6 +1023,13 @@ impl VirtualizableInfo {
                 Type::Float => {
                     let ptr = array_ptr.add(item_offset) as *mut f64;
                     *ptr = f64::from_bits(value as u64);
+                }
+                // Pointer-width item: 4 bytes on wasm32. Writing 8 bytes
+                // would clobber the next item (or run past the array end on
+                // the last item, corrupting the adjacent heap chunk).
+                Type::Ref => {
+                    let ptr = array_ptr.add(item_offset) as *mut usize;
+                    *ptr = value as usize;
                 }
                 _ => {
                     let ptr = array_ptr.add(item_offset) as *mut i64;
@@ -1275,7 +1316,7 @@ unsafe fn write_virtualizable_boxes(info: &VirtualizableInfo, obj_ptr: *mut u8, 
 /// The caller must ensure `obj_ptr` points to a valid object.
 #[cfg(test)]
 unsafe fn reset_vable_token(info: &VirtualizableInfo, obj_ptr: *mut u8) {
-    let token_ptr = obj_ptr.add(info.token_offset) as *mut u64;
+    let token_ptr = obj_ptr.add(info.token_offset) as *mut usize;
     *token_ptr = 0;
 }
 
@@ -1285,7 +1326,7 @@ unsafe fn reset_vable_token(info: &VirtualizableInfo, obj_ptr: *mut u8) {
 /// The caller must ensure `obj_ptr` points to a valid object.
 pub unsafe fn is_token_nonnull(info: &VirtualizableInfo, obj_ptr: *const u8) -> bool {
     unsafe {
-        let token_ptr = obj_ptr.add(info.token_offset) as *const u64;
+        let token_ptr = obj_ptr.add(info.token_offset) as *const usize;
         *token_ptr != 0
     }
 }
@@ -1355,8 +1396,13 @@ unsafe fn read_virtualizable_array(
 /// standard types.
 pub fn item_size_for_type(ty: Type) -> usize {
     match ty {
-        // symbolic.py:get_size → sizeof(Signed) / sizeof(Ptr)
-        Type::Int => std::mem::size_of::<i64>(),
+        // symbolic.py:get_size → sizeof(Signed) / sizeof(Ptr).  `Signed` is
+        // the machine word (4 bytes on wasm32, 8 on 64-bit), matching the
+        // `isize`/`usize`/pointer virtualizable fields it describes.  A fixed
+        // 8 here would over-size word fields on wasm32.  Fixed-width 64-bit
+        // payloads (e.g. `W_IntObject.intval`, list-strategy backing arrays)
+        // carry their own explicit `8`-byte descriptors, not this helper.
+        Type::Int => std::mem::size_of::<isize>(),
         Type::Ref => std::mem::size_of::<usize>(),
         // symbolic.py:get_size → sizeof(Float) (C double)
         Type::Float => std::mem::size_of::<f64>(),
@@ -2575,7 +2621,9 @@ pub unsafe fn vable_read_array_item(
     index: usize,
 ) -> i64 {
     unsafe {
-        let item_size = 8usize; // i64/ptr size
+        // Item width is type-dependent: a pointer array is 4 bytes/item on
+        // wasm32 (`size_of::<usize>()`), not 8.
+        let item_size = item_size_for_type(array.item_type);
         let data_ptr = match array.storage {
             VableArrayStorage::EmbeddedArray { ptr_offset } => {
                 let container = *(vable_ptr.add(array.field_offset) as *const *const u8);
@@ -2593,7 +2641,11 @@ pub unsafe fn vable_read_array_item(
             0
         } else {
             let src = data_ptr.add(index * item_size);
-            std::ptr::read(src as *const i64)
+            if array.item_type == Type::Ref {
+                *(src as *const usize) as i64
+            } else {
+                std::ptr::read(src as *const i64)
+            }
         }
     }
 }
@@ -2607,7 +2659,9 @@ pub unsafe fn vable_write_array_item(
     value: i64,
 ) {
     unsafe {
-        let item_size = 8usize; // i64/ptr size
+        // Item width is type-dependent: a pointer array is 4 bytes/item on
+        // wasm32 (`size_of::<usize>()`), not 8.
+        let item_size = item_size_for_type(array.item_type);
         let data_ptr = match array.storage {
             VableArrayStorage::EmbeddedArray { ptr_offset } => {
                 let container = *(vable_ptr.add(array.field_offset) as *const *mut u8);
@@ -2621,7 +2675,11 @@ pub unsafe fn vable_write_array_item(
         };
         if !data_ptr.is_null() {
             let dest = data_ptr.add(index * item_size);
-            std::ptr::write(dest as *mut i64, value);
+            if array.item_type == Type::Ref {
+                std::ptr::write(dest as *mut usize, value as usize);
+            } else {
+                std::ptr::write(dest as *mut i64, value);
+            }
         }
     }
 }
@@ -2636,7 +2694,7 @@ pub unsafe fn vable_write_array_item(
 /// `obj_ptr` must point to a valid virtualizable object.
 pub unsafe fn bh_clear_vable_token(vinfo: &VirtualizableInfo, obj_ptr: *mut u8) {
     unsafe {
-        let token_ptr = obj_ptr.add(vinfo.token_offset) as *mut u64;
+        let token_ptr = obj_ptr.add(vinfo.token_offset) as *mut usize;
         let token = *token_ptr;
         if token != 0 {
             // TOKEN_TRACING_RESCALL or stale Active — clear unconditionally.
