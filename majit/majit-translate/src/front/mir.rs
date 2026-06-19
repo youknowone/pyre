@@ -3332,6 +3332,7 @@ impl<'a> Lowering<'a> {
                     .static_addr_op(&segments)
                     .or_else(|| self.static_int_value_op(&segments))
                     .or_else(|| self.const_eval_global(id))
+                    .or_else(|| self.fold_size_const_global(id))
                     .or_else(|| primitive_float_const(&segments))
                     .unwrap_or_else(|| OpKind::Call {
                         target: CallTarget::FunctionPath { segments },
@@ -3759,6 +3760,62 @@ impl<'a> Lowering<'a> {
             // diverge from the `Rvalue::Use(Const)` treatment.
             DecodedConst::Str(_) | DecodedConst::FnPath(_) => None,
         }
+    }
+
+    /// Fold a `NamedConst` global whose initializer is exactly
+    /// `size_of::<T>()` / `align_of::<T>()` to the concrete byte size /
+    /// alignment Charon resolved for `T`'s layout.  The const's value is
+    /// a build-time constant of the extraction target, so folding it to
+    /// a `ConstInt` removes the residual accessor call the layout-size
+    /// consts (`FUNCTION_OBJECT_SIZE`, `W_DICT_OBJECT_SIZE`, …) otherwise
+    /// lower to (a `FunctionPath` the rtyper cannot register).
+    ///
+    /// `None` for any non-trivial initializer (the `size_of` result must
+    /// flow straight to the return local — `dest` = `_0` — so a computed
+    /// const like `size_of::<A>() + size_of::<B>()` keeps the accessor
+    /// path), a non-ADT type argument (primitive / pointer / tuple, which
+    /// has no `TypeDecl` layout to read), or a layout Charon left
+    /// unresolved.
+    fn fold_size_const_global(&self, def_id: u64) -> Option<OpKind> {
+        let gd = self.llbc.global_by_id(def_id)?;
+        if gd
+            .rest
+            .get("global_kind")
+            .and_then(serde_json::Value::as_str)
+            != Some("NamedConst")
+        {
+            return None;
+        }
+        let init_id = gd.rest.get("init")?.as_u64()?;
+        let body = self.llbc.fn_by_id(init_id)?.unstructured()?;
+        for block in &body.body {
+            let Ok(TermKind::Call { call, .. }) = block.term() else {
+                continue;
+            };
+            // The size/align result must be the const's own value: a
+            // temporary destination means a computed const we must leave
+            // to the accessor path.
+            if !matches!(call.dest.kind, PlaceKind::Local(0)) {
+                continue;
+            }
+            let CallFunc::Regular(reg) = &call.func else {
+                continue;
+            };
+            let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+                continue;
+            };
+            let want_align = match self.llbc.fn_by_id(*id)?.item_meta.name_path().as_str() {
+                "core::mem::size_of" => false,
+                "core::mem::align_of" => true,
+                _ => continue,
+            };
+            let ty = reg.generics.get("types")?.as_array()?.first()?;
+            let adt = self.resolve_tyexpr_to_adt_def_id(ty)?;
+            let layout = self.llbc.type_by_id(adt)?.layout_for_target("")?;
+            let value = if want_align { layout.align } else { layout.size }?;
+            return Some(OpKind::ConstInt(value as i64));
+        }
+        None
     }
 
     // -----------------------------------------------------------------------
@@ -11342,6 +11399,52 @@ mod tests {
         );
         assert_eq!(args, vec![arg]);
         assert_eq!(result_ty, ValueType::Ref(Some("W_CastTarget".to_string())));
+    }
+
+    /// Anchor [`Lowering::fold_size_const_global`] to the real lowered
+    /// IR of `function_new_impl` (= reads `FUNCTION_OBJECT_SIZE`, a
+    /// `const usize = size_of::<Function>()`).  The global read must fold
+    /// to `Function`'s concrete byte size (144) rather than residualize
+    /// as an unregisterable `FunctionPath` accessor call.  Ignored by
+    /// default (loads the 249MB real LLBC); run with `cargo test -p
+    /// majit-translate --lib fold_size_const_real -- --ignored`.
+    #[test]
+    #[ignore]
+    fn fold_size_const_real_function_object_size() {
+        use crate::model::{CallTarget, OpKind};
+
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-interpreter.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let graph =
+            super::lower_function(&llbc, "function_new_impl").expect("lower function_new_impl");
+
+        let ops: Vec<&OpKind> = graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.operations.iter())
+            .map(|op| &op.kind)
+            .collect();
+
+        // The `size_of::<Function>()` const read folded to its byte size.
+        assert!(
+            ops.iter().any(|k| matches!(k, OpKind::ConstInt(144))),
+            "expected a ConstInt(144) for the folded FUNCTION_OBJECT_SIZE"
+        );
+        // No residual accessor call to the const remains.
+        let residual = ops.iter().any(|k| {
+            matches!(
+                k,
+                OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                    if segments.last().is_some_and(|s| s.ends_with("FUNCTION_OBJECT_SIZE"))
+            )
+        });
+        assert!(
+            !residual,
+            "FUNCTION_OBJECT_SIZE must not residualize as a FunctionPath call"
+        );
     }
 
     /// Minimal `Llbc` carrying only `trait_impls` — the surface
