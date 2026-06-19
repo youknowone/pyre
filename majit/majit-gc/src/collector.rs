@@ -64,15 +64,67 @@ fn read_float_from_env(varname: &str) -> Option<f64> {
     value.parse::<f64>().ok().filter(|v| *v > 0.0)
 }
 
+/// env.py:413-433 `get_L2cache_darwin`. Returns the L2+L3 cache size in
+/// bytes via `sysctl`, or -1 when it cannot be determined.
+#[cfg(target_os = "macos")]
+fn get_l2cache() -> i64 {
+    // env.py:374-411 `get_darwin_sysctl_signed`: read a signed integer
+    // sysctl by name; 0 on any error.
+    fn sysctl_signed(name: &[u8]) -> i64 {
+        let mut val: i64 = 0;
+        let mut len = std::mem::size_of::<i64>();
+        let rc = unsafe {
+            libc::sysctlbyname(
+                name.as_ptr() as *const libc::c_char,
+                &mut val as *mut i64 as *mut libc::c_void,
+                &mut len,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if rc == 0 && len == std::mem::size_of::<i64>() {
+            val
+        } else {
+            0
+        }
+    }
+    let mangled = sysctl_signed(b"hw.l2cachesize\0") + sysctl_signed(b"hw.l3cachesize\0");
+    if mangled > 0 { mangled } else { -1 }
+}
+
+/// env.py:437-438 `get_L2cache = globals().get('get_L2cache_' + sys.platform,
+/// lambda: -1)`. Non-macOS probes are not yet ported, so -1 (the 4MB
+/// unknown-cache fallback applies).
+#[cfg(not(target_os = "macos"))]
+fn get_l2cache() -> i64 {
+    -1
+}
+
+/// env.py:443-450 `best_nursery_size_for_L2cache`. About half the L2 cache,
+/// but only when it exceeds 8MB (so an L3-inclusive value does not size the
+/// nursery off L3); otherwise the 4MB unknown-cache fallback
+/// (`NURSERY_SIZE_UNKNOWN_CACHE`, env.py:440 = `DEFAULT_NURSERY_SIZE`).
+fn best_nursery_size_for_l2cache(l2cache: i64) -> usize {
+    if l2cache > 8 * 1024 * 1024 {
+        (l2cache / 2) as usize
+    } else {
+        DEFAULT_NURSERY_SIZE
+    }
+}
+
+/// env.py:452-456 `estimate_best_nursery_size`.
+fn estimate_best_nursery_size() -> usize {
+    best_nursery_size_for_l2cache(get_l2cache())
+}
+
 fn default_nursery_size() -> usize {
     // incminimark.py:459-470:
     //   newsize = env.read_from_env('PYPY_GC_NURSERY')
     //   if newsize <= 0: newsize = env.estimate_best_nursery_size()
     //   if newsize <= 0: newsize = defaultsize
-    //
-    // Pyre does not yet port the platform-specific cache estimator, so use
-    // env.py:441's 4MB unknown-cache fallback.
-    read_size_from_env("PYPY_GC_NURSERY").unwrap_or(DEFAULT_NURSERY_SIZE)
+    // estimate_best_nursery_size never returns <= 0 (its floor is the 4MB
+    // unknown-cache fallback), so the final `defaultsize` arm is unreachable.
+    read_size_from_env("PYPY_GC_NURSERY").unwrap_or_else(estimate_best_nursery_size)
 }
 
 impl Default for GcConfig {
@@ -160,6 +212,13 @@ struct IncrementalMarkState {
     /// Mirrors incminimark's `gc_increment_step`, which defaults to
     /// `nursery_size * 2`.
     mark_budget_per_step: usize,
+    /// Reusable scratch buffer for `mark_object`: the child refs of the
+    /// object currently being traced. Reused (cleared, capacity retained)
+    /// across calls so marking does not heap-allocate a fresh `Vec` per
+    /// object. RPython's `_collect_obj` visitor pushes straight onto the gray
+    /// stack; pyre collects into this buffer first to release the immutable
+    /// `self.types` borrow before mutating `self.incr_state.gray_stack`.
+    mark_scratch: Vec<GcRef>,
 }
 
 impl IncrementalMarkState {
@@ -169,6 +228,7 @@ impl IncrementalMarkState {
             marking_in_progress: false,
             objects_marked: 0,
             mark_budget_per_step: (nursery_size.saturating_mul(2)).max(1),
+            mark_scratch: Vec::new(),
         }
     }
 }
@@ -1364,55 +1424,67 @@ impl MiniMarkGC {
     /// Mark a single object: trace its GC pointer fields and push
     /// unmarked children onto the gray stack.
     fn mark_object(&mut self, obj_addr: usize) {
+        // Collect the object's child refs into the reused scratch buffer
+        // while `type_info` borrows `self.types`, then release that borrow
+        // before greying them (which mutates `self.incr_state.gray_stack`).
+        let mut scratch = std::mem::take(&mut self.incr_state.mark_scratch);
+        scratch.clear();
+
         let type_id = unsafe { (*header_of(obj_addr)).type_id() };
         let type_info = self.types.get(type_id);
 
         // custom_trace_hook parity for major GC marking.
         if let Some(trace_fn) = type_info.custom_trace {
-            let mut refs: Vec<GcRef> = Vec::new();
             unsafe {
                 trace_fn(obj_addr, &mut |slot_ptr: *mut GcRef| {
                     let field_ref = *slot_ptr;
                     if !field_ref.is_null() {
-                        refs.push(field_ref);
+                        scratch.push(field_ref);
                     }
                 });
             }
-            for field_ref in refs {
-                if self.is_managed_heap_object(field_ref.0) {
-                    let hdr = unsafe { header_of(field_ref.0) };
-                    if unsafe { !(*hdr).has_flag(flags::VISITED) } {
-                        unsafe { (*hdr).set_flag(flags::VISITED) };
-                        self.incr_state.gray_stack.push(field_ref.0);
+        } else {
+            // Trace fixed-part fields. The `is_managed_heap_object` guard
+            // (applied below) mirrors the `custom_trace` path and
+            // `seed_major_root`: a `Ptr(GcStruct)` field can transiently
+            // point at memory outside the GC-managed heap during the L1/L2
+            // stepping-stone state (e.g. `W_TupleObject.wrappeditems` →
+            // `std::alloc`'d ItemsBlock). In that window calling `header_of`
+            // on the field would dereference memory before the std::alloc'd
+            // block. Upstream RPython `_collect_obj`
+            // (incminimark.py:2739-2752) does not need this guard because
+            // RPython's type system guarantees every `Ptr(GcStruct)` is
+            // GC-managed; it converges away once every gc_ptr_offsets target
+            // is a real GC allocation.
+            for &offset in &type_info.gc_ptr_offsets {
+                let field_ref = unsafe { *((obj_addr + offset) as *const GcRef) };
+                if !field_ref.is_null() {
+                    scratch.push(field_ref);
+                }
+            }
+
+            // Trace variable-part items. Same `is_managed_heap_object`
+            // guard as the fixed-part loop — `items_have_gc_ptrs` blocks
+            // (e.g. `ItemsBlock` once it migrates to GC varsize) may
+            // transiently coexist with std::alloc'd siblings during the
+            // L1/L2 stepping-stone window.
+            if type_info.items_have_gc_ptrs && type_info.item_size > 0 {
+                let length = unsafe { *((obj_addr + type_info.length_offset) as *const usize) };
+                let items_start = obj_addr + type_info.size;
+                let item_size = type_info.item_size;
+                for i in 0..length {
+                    let field_ref =
+                        unsafe { *((items_start + i * item_size) as *const GcRef) };
+                    if !field_ref.is_null() {
+                        scratch.push(field_ref);
                     }
                 }
             }
-            return;
         }
 
-        let gc_ptr_offsets = type_info.gc_ptr_offsets.clone();
-        let items_have_gc_ptrs = type_info.items_have_gc_ptrs;
-        let item_size = type_info.item_size;
-        let length_offset = type_info.length_offset;
-        let base_size = type_info.size;
-
-        // Trace fixed-part fields. The `is_managed_heap_object` guard
-        // mirrors the `custom_trace` path above and `seed_major_root`
-        // (line 814): a `Ptr(GcStruct)` field can transiently point at
-        // memory outside the GC-managed heap during the L1/L2 stepping-
-        // stone state (e.g. `W_TupleObject.wrappeditems` →
-        // `std::alloc`'d ItemsBlock). In that
-        // window calling `header_of` on the field would dereference
-        // memory before the std::alloc'd block. Upstream RPython
-        // `_collect_obj` (incminimark.py:2739-2752) does not need this
-        // guard because RPython's type system guarantees every
-        // `Ptr(GcStruct)` is GC-managed. TODO:
-        // matches `mark_object`'s own custom_trace-path guard and
-        // converges away once every gc_ptr_offsets target is a real
-        // GC allocation.
-        for &offset in &gc_ptr_offsets {
-            let field_ref = unsafe { *((obj_addr + offset) as *const GcRef) };
-            if !field_ref.is_null() && self.is_managed_heap_object(field_ref.0) {
+        // `type_info` borrow ends here; now grey the collected children.
+        for &field_ref in &scratch {
+            if self.is_managed_heap_object(field_ref.0) {
                 let hdr = unsafe { header_of(field_ref.0) };
                 if unsafe { !(*hdr).has_flag(flags::VISITED) } {
                     unsafe { (*hdr).set_flag(flags::VISITED) };
@@ -1421,25 +1493,8 @@ impl MiniMarkGC {
             }
         }
 
-        // Trace variable-part items. Same `is_managed_heap_object`
-        // guard as the fixed-part loop — `items_have_gc_ptrs` blocks
-        // (e.g. `ItemsBlock` once it migrates to GC varsize) may
-        // transiently coexist with std::alloc'd siblings during the
-        // L1/L2 stepping-stone window.
-        if items_have_gc_ptrs && item_size > 0 {
-            let length = unsafe { *((obj_addr + length_offset) as *const usize) };
-            let items_start = obj_addr + base_size;
-            for i in 0..length {
-                let field_ref = unsafe { *((items_start + i * item_size) as *const GcRef) };
-                if !field_ref.is_null() && self.is_managed_heap_object(field_ref.0) {
-                    let hdr = unsafe { header_of(field_ref.0) };
-                    if unsafe { !(*hdr).has_flag(flags::VISITED) } {
-                        unsafe { (*hdr).set_flag(flags::VISITED) };
-                        self.incr_state.gray_stack.push(field_ref.0);
-                    }
-                }
-            }
-        }
+        // Return the buffer (with its capacity) for the next object.
+        self.incr_state.mark_scratch = scratch;
     }
 
     /// Complete the sweep phase after incremental marking finishes.
@@ -4550,6 +4605,23 @@ mod tests {
     fn test_can_optimize_cond_call() {
         let gc = test_gc(4096);
         assert!(gc.can_optimize_cond_call());
+    }
+
+    #[test]
+    fn test_estimate_best_nursery_size() {
+        // env.py:443-456 — half the L2 cache when it exceeds 8MB, else the
+        // 4MB unknown-cache fallback. Either way it must never return a size
+        // below the fallback, so the major-collection floor (nursery*8) is
+        // always well-defined.
+        let est = estimate_best_nursery_size();
+        assert!(est >= DEFAULT_NURSERY_SIZE, "estimate {est} below fallback");
+        // best_nursery_size_for_l2cache mirrors env.py's strict `> 8MB` test.
+        assert_eq!(best_nursery_size_for_l2cache(-1), DEFAULT_NURSERY_SIZE);
+        assert_eq!(best_nursery_size_for_l2cache(8 * 1024 * 1024), DEFAULT_NURSERY_SIZE);
+        assert_eq!(
+            best_nursery_size_for_l2cache(32 * 1024 * 1024),
+            16 * 1024 * 1024
+        );
     }
 
     #[test]

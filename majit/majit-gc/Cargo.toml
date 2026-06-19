@@ -22,3 +22,7 @@ gc_stress = []
 
 [dependencies]
 majit-ir = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# env.py:413-433 get_L2cache_darwin uses sysctl() to size the nursery.
+libc = { workspace = true }
