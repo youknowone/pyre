@@ -251,6 +251,41 @@ pub fn box_code_constant(code: &crate::CodeObject) -> PyObjectRef {
     w_code_new(code_ptr)
 }
 
+thread_local! {
+    /// Realized `W_CodeObject` for each nested code constant, keyed by
+    /// the frozen `CodeObject`'s address.  `pycode.py` realizes a nested
+    /// code constant into one `PyCode` at enclosing-code construction and
+    /// shares it through `co_consts`; pyre realizes lazily on `LOAD_CONST`,
+    /// so this table reproduces the sharing.  The frozen `CodeObject` lives
+    /// in the enclosing code's `constants` array, and that enclosing code is
+    /// Box-immortal (`w_code_new` → `Box::into_raw`), so the key address is
+    /// stable for the process and never reused.  The cached wrappers are
+    /// likewise Box-immortal, so the raw pointers never dangle and need no
+    /// GC tracing (same rationale as `MAPDICT_METHOD_CACHE_CODES`).
+    static CODE_CONSTANT_INTERN: std::cell::RefCell<std::collections::HashMap<usize, PyObjectRef>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// Realize a nested code constant into its shared `W_CodeObject`,
+/// reproducing `co_consts` holding one realized code object per nested
+/// code.  `code` must be the frozen constant embedded in an enclosing
+/// (Box-immortal) `CodeObject`'s `constants` array — its address is the
+/// stable identity key.  Repeated `LOAD_CONST` of the same nested code
+/// returns the same wrapper, giving stable `__code__` identity and a
+/// stable JIT green key (`greens = [..., 'pycode']`).  Without this the
+/// per-`LOAD_CONST` wrapper differs every call, so a closure defined in a
+/// hot-loop-called function gets a fresh green key each iteration and the
+/// trace give-up counter never accumulates.
+pub fn intern_code_constant(code: &crate::CodeObject) -> PyObjectRef {
+    let key = code as *const crate::CodeObject as usize;
+    if let Some(w) = CODE_CONSTANT_INTERN.with(|c| c.borrow().get(&key).copied()) {
+        return w;
+    }
+    let w = box_code_constant(code);
+    CODE_CONSTANT_INTERN.with(|c| c.borrow_mut().insert(key, w));
+    w
+}
+
 /// pypy/module/__pypy__/interp_magic.py:79
 /// `func.getcode().hidden_applevel = True` — explicit setter for the
 /// `__pypy__.hidden_applevel(func)` builtin marker, plus the

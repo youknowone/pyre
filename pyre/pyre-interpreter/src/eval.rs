@@ -13,7 +13,7 @@ use crate::{
     build_list_from_refs, build_map_from_refs, build_tuple_from_refs,
     decode_instruction_for_dispatch, dict_storage_load, dict_storage_store, ensure_range_iter,
     execute_opcode_step, range_iter_continues, range_iter_next_or_null, stack_underflow_error,
-    unpack_sequence_exact, w_code_new,
+    unpack_sequence_exact,
 };
 use pyre_object::*;
 
@@ -2099,8 +2099,7 @@ impl ConstantOpcodeHandler for PyFrame {
         &mut self,
         code: &crate::bytecode::CodeObject,
     ) -> Result<Self::Value, PyError> {
-        let code_ptr = Box::into_raw(Box::new(code.clone())) as *const ();
-        Ok(w_code_new(code_ptr))
+        Ok(crate::pycode::intern_code_constant(code))
     }
 
     fn none_constant(&mut self) -> Result<Self::Value, PyError> {

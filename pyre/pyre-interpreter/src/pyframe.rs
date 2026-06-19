@@ -2663,8 +2663,10 @@ fn pyobject_from_constant(constant: &crate::bytecode::ConstantData) -> PyObjectR
         ConstantData::Str { value } => pyre_object::strobject::box_str_constant(value),
         // `eval.rs:1321-1323 bytes_constant`.
         ConstantData::Bytes { value } => pyre_object::bytesobject::w_bytes_from_bytes(value),
-        // `eval.rs:1325-1331 code_constant` — same pointer-cast helper.
-        ConstantData::Code { code } => crate::pycode::box_code_constant(code),
+        // `eval.rs:1325-1331 code_constant` — intern so the blackhole
+        // reifies the same shared `W_CodeObject` the interpreter
+        // `LOAD_CONST` does (stable `__code__` identity + JIT green key).
+        ConstantData::Code { code } => crate::pycode::intern_code_constant(code),
         // `eval.rs:1333-1335 none_constant`.
         ConstantData::None => pyre_object::w_none(),
         // `eval.rs:1337-1339 ellipsis_constant`.
