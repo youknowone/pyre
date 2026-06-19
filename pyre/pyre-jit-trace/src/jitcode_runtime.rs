@@ -72,6 +72,12 @@ fn load_all_jitcodes() -> &'static [Arc<JitCode>] {
     // still 1 here, no consumer has cloned yet — using
     // `pyre_interpreter::jit_trace_fnaddrs()`'s runtime values.
     crate::runtime_fnaddr_patch::patch_constants_i_fnaddrs(&mut vec);
+    // Deferred prebuilt-string constants the codewriter could not allocate
+    // at build time (separate process) carry a non-canonical sentinel in
+    // `constants_r`; materialize their immortal STR blocks and overwrite the
+    // sentinels here, while refcount is still 1 — before any consumer can
+    // observe a sentinel as a forged GCREF.
+    crate::runtime_fnaddr_patch::materialize_str_consts(&mut vec);
     // RPython codewriter.py:80: `all_jitcodes[jitcode.index] is jitcode`.
     // Check at load time so any regression in
     // `collect_jitcodes_in_alloc_order` is caught immediately.
