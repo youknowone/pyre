@@ -689,15 +689,22 @@ impl ShortBoxes {
             arg_type,
             ctx.alloc_op_position_typed(arg_type).raw(),
         );
-        // `short_inputargs[i]` pairs with `label_args[i]`; callers feed args
-        // in label-arg order (production: optimizer.rs preview loop), so an
-        // append lands at the matching slot.
-        debug_assert_eq!(
-            label_arg_idx,
-            self.short_inputargs.len(),
-            "add_short_input_arg must be called in label_args order so \
-             short_inputargs[i] pairs with label_args[i]"
-        );
+        // shortpreamble.py:258 `self.short_inputargs.append(renamed)`: one
+        // renamed box per call, in caller order. The production caller
+        // (optimizer.rs preview loop) iterates `label_args + virtuals`
+        // (unroll.py:479) in order, appending one renamed box per slot, so
+        // `short_inputargs[i]` pairs positionally with that combined list.
+        //
+        // A box may appear twice in `label_args + virtuals` (a virtual field
+        // that coincides with a label arg). Upstream tolerates this: the
+        // `potential_ops[box]` assignment (shortpreamble.py:259) keys on the
+        // box, so the duplicate collapses to one produced entry while
+        // `short_inputargs` still holds a renamed box per slot. `label_arg_idx`
+        // is the box's first slot (`lookup_label_arg`), so the later duplicate
+        // slot's renamed box becomes a dead Label arg — never produced, never
+        // given info (shortpreamble.py:414-417 sets info only on produced
+        // boxes). `label_arg_idx == short_inputargs.len()` therefore holds only
+        // when the combined list is duplicate-free, so it is not asserted.
         self.short_inputargs.push(renamed);
         // shortpreamble.py:257 `ShortInputArg(box, renamed)` — `res` is the
         // original `box`; the SAME_AS replay arg is that box. Exported
