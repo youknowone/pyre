@@ -74,6 +74,12 @@ pub struct SnapshotFrame {
     /// context; the runtime translates `py_pc` through `pc_map` at resume
     /// time until pyre's walker-as-tracer epic lands.
     pub pc: u32,
+    /// Guard's JitCode byte offset for kept-stack resume, or
+    /// `NO_JITCODE_PC` (-1) when this frame resumes through the Python
+    /// `pc` → `pc_map` translation.  Populated by the full-body walker at
+    /// the guard from the walk cursor (`op.pc` / `BRANCH_GUARD_JITCODE_PC`);
+    /// trait-leg and bridge/embedder frames keep the sentinel.
+    pub jitcode_pc: i32,
     /// Tagged references to the live boxes in this frame.
     pub boxes: Vec<SnapshotTagged>,
 }

@@ -301,13 +301,30 @@ impl Snapshot {
     }
 
     pub fn single_frame_boxes(jitcode_index: i32, pc: i32, boxes: Vec<SnapshotBox>) -> Self {
+        Self::single_frame_boxes_with_jitcode_pc(
+            jitcode_index,
+            pc,
+            majit_ir::resumedata::NO_JITCODE_PC,
+            boxes,
+        )
+    }
+
+    /// Like [`single_frame_boxes`], but carries the guard's JitCode byte
+    /// offset (`jitcode_pc`) for kept-stack resume.  Callers that have no
+    /// JitCode coordinate pass [`majit_ir::resumedata::NO_JITCODE_PC`].
+    pub fn single_frame_boxes_with_jitcode_pc(
+        jitcode_index: i32,
+        pc: i32,
+        jitcode_pc: i32,
+        boxes: Vec<SnapshotBox>,
+    ) -> Self {
         Snapshot {
             vable_array: Vec::new(),
             vref_array: Vec::new(),
             framestack: vec![SnapshotFrame {
                 jitcode_index,
                 pc,
-                jitcode_pc: majit_ir::resumedata::NO_JITCODE_PC,
+                jitcode_pc,
                 boxes,
             }],
         }
@@ -337,15 +354,32 @@ impl Snapshot {
     }
 
     pub fn multi_frame_boxes(frames: Vec<(i32, i32, Vec<SnapshotBox>)>) -> Self {
+        Self::multi_frame_boxes_with_jitcode_pc(
+            frames
+                .into_iter()
+                .map(|(jitcode_index, pc, boxes)| {
+                    (jitcode_index, pc, majit_ir::resumedata::NO_JITCODE_PC, boxes)
+                })
+                .collect(),
+        )
+    }
+
+    /// Like [`multi_frame_boxes`], but each frame tuple carries the
+    /// guard's JitCode byte offset (`jitcode_pc`, 3rd element) for
+    /// kept-stack resume.  Frames with no JitCode coordinate pass
+    /// [`majit_ir::resumedata::NO_JITCODE_PC`].
+    pub fn multi_frame_boxes_with_jitcode_pc(
+        frames: Vec<(i32, i32, i32, Vec<SnapshotBox>)>,
+    ) -> Self {
         Snapshot {
             vable_array: Vec::new(),
             vref_array: Vec::new(),
             framestack: frames
                 .into_iter()
-                .map(|(jitcode_index, pc, boxes)| SnapshotFrame {
+                .map(|(jitcode_index, pc, jitcode_pc, boxes)| SnapshotFrame {
                     jitcode_index,
                     pc,
-                    jitcode_pc: majit_ir::resumedata::NO_JITCODE_PC,
+                    jitcode_pc,
                     boxes,
                 })
                 .collect(),
@@ -4702,6 +4736,55 @@ mod tests {
         let (val, tagbits) = untag(items[9] as i16);
         assert_eq!(tagbits, TAGBOX);
         assert_eq!(val, 1);
+    }
+
+    #[test]
+    fn test_single_frame_with_jitcode_pc_carries_offset_into_numbering() {
+        // #124 Approach B (M2): the production capture factory writes the
+        // guard's real JitCode byte offset into the per-frame `jitcode_pc`
+        // word of `rd_numb`, where `single_frame` / the legacy
+        // `single_frame_boxes` write `NO_JITCODE_PC` (`test_memo_number_simple`
+        // pins the sentinel at the same slot, `items[6]`).
+        use majit_ir::OpRef;
+        let mut memo = ResumeDataLoopMemo::new();
+        let env = SimpleBoxEnv::new();
+        let snapshot = Snapshot::single_frame_boxes_with_jitcode_pc(
+            0,
+            8,
+            42,
+            vec![OpRef::const_int(42).into(), OpRef::int_op(1).into()],
+        );
+        let numb_state = memo.number(&snapshot, &env, -1).unwrap();
+        let items = crate::resumecode::unpack_all(&numb_state.create_numbering());
+        // Empty vable/vref single-frame header:
+        // items[4]=jitcode_index(0) items[5]=pc(8) items[6]=jitcode_pc.
+        assert_eq!(items[4], 0); // jitcode_index
+        assert_eq!(items[5], 8); // pc
+        assert_eq!(items[6], 42); // jitcode_pc carried by the M2 factory
+        assert_ne!(items[6], majit_ir::resumedata::NO_JITCODE_PC);
+    }
+
+    #[test]
+    fn test_multi_frame_with_jitcode_pc_per_frame() {
+        // #124 Approach B (M2): the multi-frame factory carries a distinct
+        // `jitcode_pc` per frame; a frame with no JitCode coordinate keeps
+        // the `NO_JITCODE_PC` sentinel.
+        use majit_ir::OpRef;
+        let mut memo = ResumeDataLoopMemo::new();
+        let env = SimpleBoxEnv::new();
+        let snapshot = Snapshot::multi_frame_boxes_with_jitcode_pc(vec![
+            (0, 10, majit_ir::resumedata::NO_JITCODE_PC, vec![OpRef::int_op(1).into()]),
+            (1, 20, 55, vec![OpRef::int_op(2).into()]),
+        ]);
+        let items = crate::resumecode::unpack_all(&memo.number(&snapshot, &env, -1).unwrap().create_numbering());
+        // Frame 0: items[4]=jitcode(0) items[5]=pc(10) items[6]=jitcode_pc(sentinel) items[7]=box
+        assert_eq!(items[4], 0);
+        assert_eq!(items[5], 10);
+        assert_eq!(items[6], majit_ir::resumedata::NO_JITCODE_PC);
+        // Frame 1: items[8]=jitcode(1) items[9]=pc(20) items[10]=jitcode_pc(55) items[11]=box
+        assert_eq!(items[8], 1);
+        assert_eq!(items[9], 20);
+        assert_eq!(items[10], 55);
     }
 
     #[test]

@@ -553,10 +553,10 @@ fn snapshot_map_from_trace_snapshots(
         // AND vref_array. resume.py:243-247 _number_boxes consumes
         // vref_array as a separate section after vable_array.
         let vref_boxes: Vec<SnapshotBox> = snap.vref_boxes.iter().map(&tagged_to_box).collect();
-        let frame_pcs: Vec<(i32, i32)> = snap
+        let frame_pcs: Vec<(i32, i32, i32)> = snap
             .frames
             .iter()
-            .map(|f| (f.jitcode_index as i32, f.pc as i32))
+            .map(|f| (f.jitcode_index as i32, f.pc as i32, f.jitcode_pc))
             .collect();
         let id = id as i32;
         snapshot_insert(&mut box_map, id, boxes);
@@ -19332,6 +19332,7 @@ mod tests {
                 frames: vec![crate::recorder::SnapshotFrame {
                     jitcode_index: 0,
                     pc: 123,
+                    jitcode_pc: majit_ir::resumedata::NO_JITCODE_PC,
                     boxes: vec![crate::recorder::SnapshotTagged::Box(
                         OpRef::int_op(0),
                         majit_ir::Type::Int,

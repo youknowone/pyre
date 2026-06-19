@@ -6290,11 +6290,16 @@ fn walker_capture_inline_nonstandard_vable_guard(
     // leaves this path inlines (the non-standard identity guard is itself
     // deterministic and never fails at runtime).
     let (vable_boxes, vref_boxes) = ctx.trace_ctx.build_snapshot_vable_vref_boxes();
+    // The non-standard identity guard resumes at the caller's CALL
+    // boundary (`entry_py_pc`), re-executing the whole call on deopt —
+    // there is no kept-stack JitCode coordinate to preserve, so the
+    // frame resumes through the Python pc → pc_map path.
     ctx.trace_ctx
         .capture_snapshot_for_last_guard_op_with_vable_vref(
             &ctx.outer_active_boxes,
             ctx.outer_jitcode_index,
             ctx.entry_py_pc,
+            majit_ir::resumedata::NO_JITCODE_PC,
             &vable_boxes,
             &vref_boxes,
         );
@@ -6574,16 +6579,29 @@ fn walker_capture_snapshot_for_last_guard_impl(
             // by the branch handler) to its Python opcode so the encoder can
             // read the guard-pc liveness — the resume `py_pc` is a not-taken
             // merge point whose live colors the walk has not written.
-            let guard_py_pc = {
-                let guard_jc_pc = BRANCH_GUARD_JITCODE_PC.with(|c| c.get());
-                if guard_jc_pc == usize::MAX {
-                    None
-                } else {
-                    unsafe {
-                        let jc = &*sym.jitcode;
-                        Some(python_pc_for_jitcode_pc(&jc.payload.metadata, guard_jc_pc))
-                    }
+            let guard_jc_pc_raw = BRANCH_GUARD_JITCODE_PC.with(|c| c.get());
+            let guard_py_pc = if guard_jc_pc_raw == usize::MAX {
+                None
+            } else {
+                unsafe {
+                    let jc = &*sym.jitcode;
+                    Some(python_pc_for_jitcode_pc(&jc.payload.metadata, guard_jc_pc_raw))
                 }
+            };
+            // #124 Approach B (M2): carry the guard's raw JitCode byte offset
+            // as the resume coordinate.  A branch guard stashes its own pc in
+            // `BRANCH_GUARD_JITCODE_PC` (the kept-stack-across-branch precision
+            // `setposition(jitcode, miframe.pc)` preserves); any other guard's
+            // own offset is `op_pc`, a real coordinate on `sym.jitcode` in the
+            // full-body walk.  `after_residual_call` guards resume BEFORE the
+            // call, so their `op_pc` is not a valid resume coordinate — those
+            // keep the sentinel and resume via `py_pc` → `pc_map`.
+            let guard_jitcode_pc: i32 = if guard_jc_pc_raw != usize::MAX {
+                guard_jc_pc_raw as i32
+            } else if after_residual_call {
+                majit_ir::resumedata::NO_JITCODE_PC
+            } else {
+                op_pc as i32
             };
             let active = collect_outer_active_boxes(
                 sym,
@@ -6600,6 +6618,7 @@ fn walker_capture_snapshot_for_last_guard_impl(
                     &active,
                     jitcode_index,
                     py_pc,
+                    guard_jitcode_pc,
                     &vable_boxes,
                     &vref_boxes,
                 );
@@ -6608,7 +6627,8 @@ fn walker_capture_snapshot_for_last_guard_impl(
     }
 
     // Per-opcode arm path: `op_pc` (arm-local PC) is not a blackhole
-    // resume point, so the snapshot uses the static outer coordinate.
+    // resume point, so the snapshot uses the static outer coordinate and
+    // resumes via the Python pc → pc_map path (no JitCode coordinate).
     let _ = op_pc;
     let (vable_boxes, vref_boxes) = ctx.trace_ctx.build_snapshot_vable_vref_boxes();
     ctx.trace_ctx
@@ -6616,6 +6636,7 @@ fn walker_capture_snapshot_for_last_guard_impl(
             &ctx.outer_active_boxes,
             ctx.outer_jitcode_index,
             ctx.entry_py_pc,
+            majit_ir::resumedata::NO_JITCODE_PC,
             &vable_boxes,
             &vref_boxes,
         );
@@ -6857,15 +6878,40 @@ fn walker_capture_multi_frame_inline_snapshot(
 
     let (vable_boxes, vref_boxes) = ctx.trace_ctx.build_snapshot_vable_vref_boxes();
 
+    // #124 Approach B (M2): the callee (top) frame carries the guard's raw
+    // JitCode byte offset as the resume coordinate (mirror of the
+    // single-frame path).  A branch guard stashes its own callee pc in
+    // `BRANCH_GUARD_JITCODE_PC`; otherwise the guard's own offset is
+    // `callee_op_pc`.  `after_residual_call` guards resume BEFORE the call
+    // and keep the sentinel.  The paused caller frames resume at the CALL
+    // return point via the Python pc → pc_map path, so they keep the
+    // sentinel too (no kept-stack coordinate is carried for them in M2).
+    let callee_jitcode_pc: i32 = {
+        let g = BRANCH_GUARD_JITCODE_PC.with(|c| c.get());
+        if g != usize::MAX {
+            g as i32
+        } else if after_residual_call {
+            majit_ir::resumedata::NO_JITCODE_PC
+        } else {
+            callee_op_pc as i32
+        }
+    };
+
     // Frame tuples, OUTERMOST-FIRST: the paused caller chain, then the callee
     // top frame last (innermost).
-    let mut frames: Vec<(u32, u32, &[OpRef])> = Vec::with_capacity(parent_frames.len() + 1);
+    let mut frames: Vec<(u32, u32, i32, &[OpRef])> = Vec::with_capacity(parent_frames.len() + 1);
     for pf in &parent_frames {
-        frames.push((pf.jitcode_index, pf.resume_py_pc, pf.boxes.as_slice()));
+        frames.push((
+            pf.jitcode_index,
+            pf.resume_py_pc,
+            majit_ir::resumedata::NO_JITCODE_PC,
+            pf.boxes.as_slice(),
+        ));
     }
     frames.push((
         callee_jitcode_index as u32,
         callee_py_pc,
+        callee_jitcode_pc,
         callee_boxes.as_slice(),
     ));
 
