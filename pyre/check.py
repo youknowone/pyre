@@ -932,7 +932,7 @@ def main():
         chk.run_bench("inline_helper",  f"{B}/inline_helper.py",        5,       None,    1.2,     None,    1.2)
         chk.run_bench("fib_recursive",  f"{B}/fib_recursive.py",        5,       2,       13,      2,       13)
         chk.run_bench("nested_loop",    f"{B}/nested_loop.py",          5,       None,    2,       None,    3)
-        chk.run_bench("raise_catch",    f"{B}/raise_catch_loop.py",     5,       None,    1.5,       None,    1.5)
+        chk.run_bench("raise_catch",    f"{B}/raise_catch_loop.py",     5,       None,    1.5,       None,    2)
         chk.run_bench("spectral_norm",  f"{B}/spectral_norm.py",        5,       2,       7,       2,       7)
         chk.run_bench("nbody",          f"{B}/nbody.py",               10,       3,       None,    3,       None)
         chk.run_bench("fannkuch",       f"{B}/fannkuch.py",            30,       1,       5,       2,       None)

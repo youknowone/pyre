@@ -205,7 +205,11 @@ mod tests {
             // SAFETY: `index < len`; the slot is a live `Cell<GcRef>` (usize).
             unsafe { *((base + index * core::mem::size_of::<usize>()) as *const usize) }
         };
-        assert_eq!(baked_load(0), 0x1000, "pre-move load reads the original ref");
+        assert_eq!(
+            baked_load(0),
+            0x1000,
+            "pre-move load reads the original ref"
+        );
         assert_eq!(baked_load(1), 0x2000);
         // A moving collection relocates 0x1000 -> 0x9000.
         table.trace(&mut |r| {

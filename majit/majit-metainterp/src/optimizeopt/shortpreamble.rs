@@ -675,8 +675,10 @@ impl ShortBoxes {
         // comes from the op-position counter so it is unique and accounted
         // for by `opref_high_water`; `raw()` shares the op/inputarg integer
         // space, so a fresh op position is a fresh inputarg position too.
-        let renamed =
-            crate::r#box::BoxRef::new_inputarg(arg_type, ctx.alloc_op_position_typed(arg_type).raw());
+        let renamed = crate::r#box::BoxRef::new_inputarg(
+            arg_type,
+            ctx.alloc_op_position_typed(arg_type).raw(),
+        );
         // `short_inputargs[i]` pairs with `label_args[i]`; callers feed args
         // in label-arg order (production: optimizer.rs preview loop), so an
         // append lands at the matching slot.
