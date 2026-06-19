@@ -6163,10 +6163,12 @@ fn file_is_binary(self_obj: PyObjectRef) -> bool {
         .unwrap_or(false)
 }
 
-#[cfg(feature = "host_env")]
+#[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
 fn fd_read_into(fd: i32, buf: &mut [u8]) -> std::io::Result<usize> {
     loop {
-        let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+        // `count` is `size_t` on Unix but `c_uint` on Windows; `as _` casts
+        // to whichever the platform's `libc::read` expects.
+        let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len() as _) };
         if n < 0 {
             let e = std::io::Error::last_os_error();
             if e.raw_os_error() == Some(libc::EINTR) {
@@ -6179,7 +6181,7 @@ fn fd_read_into(fd: i32, buf: &mut [u8]) -> std::io::Result<usize> {
 }
 
 /// Read up to `n` bytes (or until EOF when `n` is `None`) from `fd`.
-#[cfg(feature = "host_env")]
+#[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
 fn fd_read(fd: i32, n: Option<usize>) -> std::io::Result<Vec<u8>> {
     let mut out = Vec::new();
     let mut buf = [0u8; 65536];
@@ -6229,12 +6231,12 @@ fn file_method_read(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
                 None
             }
         });
-        #[cfg(feature = "host_env")]
+        #[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
         {
             let data = fd_read(fd, n).map_err(fd_io_err)?;
             return Ok(fd_bytes_to_obj(args[0], data));
         }
-        #[cfg(not(feature = "host_env"))]
+        #[cfg(any(not(feature = "host_env"), target_arch = "wasm32"))]
         {
             let _ = (fd, n);
             return Err(crate::PyError::not_implemented(
@@ -6268,7 +6270,7 @@ fn file_method_readline(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
         return Err(crate::PyError::type_error("readline() requires self"));
     }
     if let Some(fd) = file_get_fd(args[0]) {
-        #[cfg(feature = "host_env")]
+        #[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
         {
             // Raw fds cannot un-read, so consume one byte at a time up to
             // the newline (or EOF) to avoid over-reading past the line.
@@ -6286,7 +6288,7 @@ fn file_method_readline(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
             }
             return Ok(fd_bytes_to_obj(args[0], out));
         }
-        #[cfg(not(feature = "host_env"))]
+        #[cfg(any(not(feature = "host_env"), target_arch = "wasm32"))]
         {
             let _ = fd;
             return Err(crate::PyError::not_implemented(
@@ -6349,15 +6351,17 @@ fn file_method_write(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
                 return Err(crate::PyError::type_error("write() expects str or bytes"));
             }
         };
-        #[cfg(feature = "host_env")]
+        #[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
         {
-            let n = unsafe { libc::write(fd, bytes.as_ptr() as *const libc::c_void, bytes.len()) };
+            // `count` is `size_t` on Unix but `c_uint` on Windows.
+            let n =
+                unsafe { libc::write(fd, bytes.as_ptr() as *const libc::c_void, bytes.len() as _) };
             if n < 0 {
                 return Err(fd_io_err(std::io::Error::last_os_error()));
             }
             return Ok(w_int_new(n as i64));
         }
-        #[cfg(not(feature = "host_env"))]
+        #[cfg(any(not(feature = "host_env"), target_arch = "wasm32"))]
         {
             let _ = (fd, bytes);
             return Err(crate::PyError::not_implemented(
@@ -6394,11 +6398,11 @@ fn file_method_close(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
             .map(|v| unsafe { pyre_object::is_bool(v) && pyre_object::w_bool_get_value(v) })
             .unwrap_or(false);
         if !already {
-            #[cfg(feature = "host_env")]
+            #[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
             unsafe {
                 libc::close(fd);
             }
-            #[cfg(not(feature = "host_env"))]
+            #[cfg(any(not(feature = "host_env"), target_arch = "wasm32"))]
             let _ = fd;
             let _ = crate::baseobjspace::setattr_str(args[0], "closed", w_bool_from(true));
         }
