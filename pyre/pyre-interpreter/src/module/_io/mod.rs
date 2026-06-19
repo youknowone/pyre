@@ -12,13 +12,12 @@ crate::py_module! {
     interpleveldefs: {
         "DEFAULT_BUFFER_SIZE" => w_int_new(8192),
     },
-    // BytesIO is the pure-Python in-memory binary stream pickle's
-    // Pickler/Unpickler write to and read from.
+    // BytesIO / StringIO are the pure-Python in-memory streams: pickle's
+    // Pickler/Unpickler use BytesIO; logging / traceback / csv use StringIO.
     appleveldefs: {
-        "_io_app.py" => ["BytesIO"],
+        "_io_app.py" => ["BytesIO", "StringIO"],
     },
     functions: {
-        "StringIO"        / * = |_| Ok(w_str_new("")),
         "FileIO"          / * = |_| Ok(w_none()),
         "BufferedReader"  / * = |_| Ok(w_none()),
         "BufferedWriter"  / * = |_| Ok(w_none()),
