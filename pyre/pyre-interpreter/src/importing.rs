@@ -229,6 +229,8 @@ pub fn install_builtin_modules() {
     pyre_install_module!(_struct);
     pyre_install_module!(binascii);
     pyre_install_module!(zlib);
+    pyre_install_module!(_hashlib);
+    pyre_install_module!(_blake2);
     pyre_install_module!(gc);
     pyre_install_module!(unicodedata);
 
@@ -274,7 +276,6 @@ pub fn install_builtin_modules() {
     ] {
         register_builtin_module(name, empty_module_init);
     }
-    register_builtin_module("_hashlib", init_hashlib_min);
     register_builtin_module("_scproxy", init_scproxy);
 }
 
@@ -323,76 +324,6 @@ fn init_sysconfigdata_empty(ns: &mut DictStorage) {
     // similar. Leave the dict empty; .get('X') returns None for unknown
     // keys which every caller already handles.
     crate::dict_storage_store(ns, "build_time_vars", vars);
-}
-
-/// `_hashlib` minimal surface — `hashlib.py` reads `openssl_md_meth_names`
-/// at import and `hmac`/`secrets` use `compare_digest`. The named-hash
-/// constructors are intentionally absent so `hashlib` falls back to its
-/// builtin (`_sha2`/`_md5`/…) implementations via the `AttributeError` /
-/// `ValueError` paths in `__get_openssl_constructor` / `__hash_new`.
-fn init_hashlib_min(ns: &mut DictStorage) {
-    let names: Vec<pyre_object::PyObjectRef> = [
-        "md5", "sha1", "sha224", "sha256", "sha384", "sha512", "sha3_224", "sha3_256",
-        "sha3_384", "sha3_512", "shake_128", "shake_256", "blake2b", "blake2s",
-    ]
-    .iter()
-    .map(|n| pyre_object::w_str_new(n))
-    .collect();
-    crate::dict_storage_store(
-        ns,
-        "openssl_md_meth_names",
-        pyre_object::w_frozenset_from_items(&names),
-    );
-    crate::dict_storage_store(
-        ns,
-        "compare_digest",
-        crate::make_builtin_function_with_arity("compare_digest", hashlib_compare_digest, 2),
-    );
-    // `_hashlib.new` exists but reports every digest as unsupported, so
-    // `hashlib.__hash_new` catches the `ValueError` and uses the builtin
-    // constructor instead of the (absent) OpenSSL one.
-    crate::dict_storage_store(
-        ns,
-        "new",
-        crate::make_builtin_function(
-            "new",
-            |_| Err(crate::PyError::value_error("unsupported hash type")),
-        ),
-    );
-}
-
-/// Constant-time equality of two ASCII strings or two bytes-like objects.
-fn hashlib_compare_digest(
-    args: &[pyre_object::PyObjectRef],
-) -> Result<pyre_object::PyObjectRef, crate::PyError> {
-    let read = |obj: pyre_object::PyObjectRef| -> Result<Vec<u8>, crate::PyError> {
-        unsafe {
-            if pyre_object::is_str(obj) {
-                let s = pyre_object::w_str_get_value(obj);
-                if !s.is_ascii() {
-                    return Err(crate::PyError::type_error(
-                        "comparing strings with non-ASCII characters is not supported",
-                    ));
-                }
-                Ok(s.as_bytes().to_vec())
-            } else if pyre_object::bytesobject::is_bytes_like(obj) {
-                Ok(pyre_object::bytesobject::bytes_like_data(obj).to_vec())
-            } else {
-                Err(crate::PyError::type_error(
-                    "unsupported operand types(s) or combination of types",
-                ))
-            }
-        }
-    };
-    let a = read(args.first().copied().unwrap_or(pyre_object::w_none()))?;
-    let b = read(args.get(1).copied().unwrap_or(pyre_object::w_none()))?;
-    // Length difference still XOR-accumulates over the shorter operand so
-    // the comparison time depends only on the first argument's length.
-    let mut result = (a.len() ^ b.len()) as u8;
-    for i in 0..a.len() {
-        result |= a[i] ^ b.get(i).copied().unwrap_or(0);
-    }
-    Ok(pyre_object::w_bool_from(result == 0))
 }
 
 /// Try to load a builtin module by name.
