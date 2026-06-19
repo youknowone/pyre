@@ -296,9 +296,10 @@ impl W_Pickler {
         // `persistent_id` resolves to a subclass method override or the
         // instance value set through the getter (its getter raises while
         // unset, so a base pickler resolves to `PY_NULL`); `reducer_override`
-        // is a subclass hook only.
+        // is a subclass hook only.  An explicit `persistent_id = None` is kept
+        // as the hook: `dump` then calls `None(obj)` and raises `TypeError`,
+        // matching `_pickle` (only deleting/leaving it unset disables it).
         let pers_func = crate::baseobjspace::findattr(self_ptr, "persistent_id")
-            .filter(|&f| !unsafe { pyre_object::is_none(f) })
             .unwrap_or(pyre_object::PY_NULL);
         let reducer_override = crate::baseobjspace::findattr(self_ptr, "reducer_override")
             .filter(|&f| !unsafe { pyre_object::is_none(f) })
@@ -937,8 +938,16 @@ fn dispatch_table_reduce(
     w_obj: PyObjectRef,
 ) -> Result<Option<PyObjectRef>, PyError> {
     let dt = ctx.dispatch_table;
-    if dt.is_null() || unsafe { pyre_object::is_none(dt) } {
+    if dt.is_null() {
         return Ok(None);
+    }
+    if unsafe { pyre_object::is_none(dt) } {
+        // An explicit `dispatch_table = None` is still consulted by subscript;
+        // `None[type(obj)]` raises, so surface that rather than silently
+        // falling back to `__reduce_ex__`.
+        return Err(PyError::type_error(
+            "'NoneType' object is not subscriptable",
+        ));
     }
     // The common case is an empty `copyreg.dispatch_table`; skip the lookup.
     if unsafe { pyre_object::is_dict(dt) }

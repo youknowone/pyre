@@ -1246,9 +1246,17 @@ fn escape_decode(data: &[u8]) -> Result<Vec<u8>, PyError> {
 
 /// Resolve and invoke `self.persistent_load(pid)` (PERSID / BINPERSID).
 fn persistent_load(slot: usize, w_pid: PyObjectRef) -> Result<PyObjectRef, PyError> {
+    // `w_pid` was just popped from the stack / freshly built for the opcode and
+    // is not in a GC-walked container; resolving the bound `persistent_load`
+    // allocates and can move the nursery, so pin it across the lookup.
+    let _roots = pyre_object::gc_roots::push_roots();
+    pyre_object::gc_roots::pin_root(w_pid);
+    let pid_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     let self_obj = pyre_object::gc_roots::shadow_stack_get(slot);
     match crate::baseobjspace::findattr(self_obj, "persistent_load") {
-        Some(f) if !unsafe { pyre_object::is_none(f) } => call_fn(f, &[w_pid]),
+        Some(f) if !unsafe { pyre_object::is_none(f) } => {
+            call_fn(f, &[pyre_object::gc_roots::shadow_stack_get(pid_slot)])
+        }
         _ => Err(unpickling_error(
             "A load persistent id instruction was encountered, but no persistent_load function was specified.",
         )),
