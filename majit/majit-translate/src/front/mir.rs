@@ -4190,6 +4190,32 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
+                // `<T as ToString>::to_string(x)` renders `x` to an owned
+                // String — the same `str(x)` (`ll_str`) the format!
+                // expansion emits for a Display placeholder.  Lower it to
+                // `UnaryOp("str")` instead of leaving the graph-less
+                // `to_string` extern; the rtyper routes `str` to the
+                // operand repr's `ll_str` (string = identity).
+                if args.len() == 1
+                    && fmt_path_ends_with(&segments, &["string", "<Impl>", "to_string"])
+                {
+                    let res = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(res.clone()),
+                        kind: OpKind::UnaryOp {
+                            op: "str".to_string(),
+                            operand: args[0].clone(),
+                            result_ty: ValueType::Ref(None),
+                        },
+                    });
+                    self.local_var[dest_local] = Some(res);
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
                 let alias =
                     if let Some(payload) = self.expect_on_const_ok(&segments, &args, &arg_locals) {
                         // Identity unwrap: the receiver variable was bound
@@ -4240,7 +4266,9 @@ impl<'a> Lowering<'a> {
                     // shape as the `elidable_promote` wrapper's
                     // `hint_promote_or_string`.
                     let promote_marker = self.jit_promote_marker(&reg);
-                    let target = if args.len() == 1 && let Some(marker) = promote_marker {
+                    let target = if args.len() == 1
+                        && let Some(marker) = promote_marker
+                    {
                         CallTarget::FunctionPath {
                             segments: vec![marker.to_string()],
                         }
@@ -9357,10 +9385,14 @@ fn collapse_fmt_chains(graph: &mut FunctionGraph) {
         }
     }
     // 2. Delete the now-dead chain ops across all blocks.
-    let dead_results: std::collections::HashSet<u64> =
-        sites.iter().flat_map(|s| s.dead_results.iter().copied()).collect();
-    let dead_bases: std::collections::HashSet<u64> =
-        sites.iter().flat_map(|s| s.dead_bases.iter().copied()).collect();
+    let dead_results: std::collections::HashSet<u64> = sites
+        .iter()
+        .flat_map(|s| s.dead_results.iter().copied())
+        .collect();
+    let dead_bases: std::collections::HashSet<u64> = sites
+        .iter()
+        .flat_map(|s| s.dead_bases.iter().copied())
+        .collect();
     for block in &mut graph.blocks {
         block.operations.retain(|op| {
             if let Some(r) = &op.result {
@@ -9942,8 +9974,9 @@ mod tests {
         });
         let ret = Variable::new();
         graph.block_mut(bret).inputargs = vec![ret];
-        graph.block_mut(bf).exits =
-            vec![Link::from_variables(&graph, vec![formatted.clone()], bret, None).with_prevblock(bf)];
+        graph.block_mut(bf).exits = vec![
+            Link::from_variables(&graph, vec![formatted.clone()], bret, None).with_prevblock(bf),
+        ];
 
         collapse_fmt_chains(&mut graph);
 
@@ -9974,12 +10007,21 @@ mod tests {
         match &bf_block.operations[2].kind {
             OpKind::BinOp { op, lhs, rhs, .. } => {
                 assert_eq!(op, "add");
-                assert_eq!(lhs.id(), bf_block.operations[0].result.as_ref().unwrap().id());
-                assert_eq!(rhs.id(), bf_block.operations[1].result.as_ref().unwrap().id());
+                assert_eq!(
+                    lhs.id(),
+                    bf_block.operations[0].result.as_ref().unwrap().id()
+                );
+                assert_eq!(
+                    rhs.id(),
+                    bf_block.operations[1].result.as_ref().unwrap().id()
+                );
             }
             other => panic!("Bf op[2] not an add BinOp: {other:?}"),
         }
-        assert_eq!(bf_block.operations[2].result.as_ref().unwrap().id(), formatted.id());
+        assert_eq!(
+            bf_block.operations[2].result.as_ref().unwrap().id(),
+            formatted.id()
+        );
 
         // The chain ops are gone: B0 keeps no Tuple/new_display ops, Bp
         // keeps no array/Arguments ops.
