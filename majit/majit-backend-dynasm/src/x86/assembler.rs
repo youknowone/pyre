@@ -3170,7 +3170,12 @@ impl<'a> Assembler386<'a> {
                             16
                         }
                     };
-                    dynasm!(self.mc ; .arch x64 ; cvtsi2sd Rx(dst.value), Rq(sr));
+                    // cvtsi2sd preserves the destination's high 64 bits, so it
+                    // carries a false dependency on the register's prior value.
+                    // In a loop that reuses the same xmm, this serialises the
+                    // conversion against the previous iteration. Break it with a
+                    // zeroing idiom (eliminated at register rename, zero latency).
+                    dynasm!(self.mc ; .arch x64 ; pxor Rx(dst.value), Rx(dst.value) ; cvtsi2sd Rx(dst.value), Rq(sr));
                 }
             }
             OpCode::CastFloatToInt => {
@@ -6273,8 +6278,11 @@ impl<'a> Assembler386<'a> {
     /// CAST_INT_TO_FLOAT: result = (f64)arg0
     fn genop_cast_int_to_float(&mut self, op: &Op) {
         self.load_arg_to_rax(op.arg(0).to_opref());
+        // Break cvtsi2sd's false dependency on the destination's prior value
+        // (it preserves the high 64 bits) with a zeroing idiom.
         dynasm!(self.mc
             ; .arch x64
+            ; pxor xmm0, xmm0
             ; cvtsi2sd xmm0, rax
         );
         self.store_d0_to_result(op.pos.get());
