@@ -184,6 +184,49 @@ mod tests {
     }
 
     #[test]
+    fn baked_load_reads_forwarded_ref_after_move() {
+        // End-to-end model of a ref constant surviving across compilation and
+        // later execution. The backend bakes a `LoadFromGcTable` as a load of
+        // `*(base + index*WORD)` (rewrite.py:1100 `remove_constptr`), with
+        // `base` fixed at compile time. A moving collection forwards the slot
+        // value in place (gcreftracer.py `trace`), so a later execution of the
+        // baked load observes the relocated address — no stale immediate. This
+        // is the shared dynasm/cranelift `LoadFromGcTable` contract; wasm never
+        // runs the GC rewrite (loud-panic), so it has no moving-GC ref-const
+        // path to cover.
+        let _serialize = TEST_REGISTRY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let table = GcTable::from_gcrefs(&[GcRef(0x1000), GcRef(0x2000)]);
+        // `base` is the value baked into the trace at compile time.
+        let base = table.base_addr();
+        // `GcRef` is `#[repr(transparent)]` over `usize` and `Cell<GcRef>`
+        // shares that layout, so `base + index*WORD` addresses `slots[index]`
+        // exactly as the emitted machine load does.
+        let baked_load = |index: usize| -> usize {
+            // SAFETY: `index < len`; the slot is a live `Cell<GcRef>` (usize).
+            unsafe { *((base + index * core::mem::size_of::<usize>()) as *const usize) }
+        };
+        assert_eq!(baked_load(0), 0x1000, "pre-move load reads the original ref");
+        assert_eq!(baked_load(1), 0x2000);
+        // A moving collection relocates 0x1000 -> 0x9000.
+        table.trace(&mut |r| {
+            if r.0 == 0x1000 {
+                r.0 = 0x9000;
+            }
+        });
+        assert_eq!(
+            table.base_addr(),
+            base,
+            "baked base address is stable across the collection"
+        );
+        assert_eq!(
+            baked_load(0),
+            0x9000,
+            "post-move load via the baked base reads the forwarded ref"
+        );
+        assert_eq!(baked_load(1), 0x2000, "unmoved ref unchanged");
+    }
+
+    #[test]
     fn dropping_table_deregisters_from_walk() {
         let _serialize = TEST_REGISTRY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // A sentinel unlikely to collide with any other test's table.
