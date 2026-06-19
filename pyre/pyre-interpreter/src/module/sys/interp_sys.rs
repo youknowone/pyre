@@ -587,6 +587,80 @@ pub fn register_module(ns: &mut DictStorage) {
         );
         dict_storage_store(ns, "_jit", jit);
     }
+    // sys.monitoring — PEP 669 low-impact monitoring API. The runtime hooks
+    // are stubbed (no events ever fire), but the namespace, tool-id
+    // constants, sentinels, and `events` flags are present so importing
+    // modules (bdb/pdb/cProfile/coverage tooling) succeed and can build
+    // their tracer objects.
+    {
+        let mon = make_sys_namespace_instance();
+        // Tool-id constants (Python/instrumentation.c).
+        for (name, id) in [
+            ("DEBUGGER_ID", 0),
+            ("COVERAGE_ID", 1),
+            ("PROFILER_ID", 2),
+            ("OPTIMIZER_ID", 5),
+        ] {
+            let _ = crate::baseobjspace::setattr_str(mon, name, w_int_new(id));
+        }
+        // DISABLE / MISSING sentinels — distinct singleton objects compared
+        // by identity (`callback() == DISABLE`, `assertIs(x, MISSING)`).
+        let _ = crate::baseobjspace::setattr_str(mon, "DISABLE", make_sys_namespace_instance());
+        let _ = crate::baseobjspace::setattr_str(mon, "MISSING", make_sys_namespace_instance());
+        // events namespace — `1 << event_id` flags that OR together.
+        {
+            let events = make_sys_namespace_instance();
+            let _ = crate::baseobjspace::setattr_str(events, "NO_EVENTS", w_int_new(0));
+            for (i, name) in [
+                "PY_START",
+                "PY_RESUME",
+                "PY_RETURN",
+                "PY_YIELD",
+                "CALL",
+                "LINE",
+                "INSTRUCTION",
+                "JUMP",
+                "BRANCH_LEFT",
+                "BRANCH_RIGHT",
+                "STOP_ITERATION",
+                "RAISE",
+                "EXCEPTION_HANDLED",
+                "PY_UNWIND",
+                "PY_THROW",
+                "RERAISE",
+                "C_RETURN",
+                "C_RAISE",
+            ]
+            .iter()
+            .enumerate()
+            {
+                let _ = crate::baseobjspace::setattr_str(events, name, w_int_new(1i64 << i));
+            }
+            // BRANCH retained as an alias of BRANCH_LEFT for callers predating
+            // the 3.14 left/right split.
+            let _ = crate::baseobjspace::setattr_str(events, "BRANCH", w_int_new(1i64 << 8));
+            let _ = crate::baseobjspace::setattr_str(mon, "events", events);
+        }
+        // Runtime hooks — no-op stubs returning sensible defaults.
+        let store_fn = |obj, name: &'static str, f: crate::gateway::BuiltinCodeFn, arity: u16| {
+            let _ = crate::baseobjspace::setattr_str(
+                obj,
+                name,
+                make_builtin_function_with_arity(name, f, arity),
+            );
+        };
+        store_fn(mon, "use_tool_id", |_| Ok(w_none()), 2);
+        store_fn(mon, "free_tool_id", |_| Ok(w_none()), 1);
+        store_fn(mon, "clear_tool_id", |_| Ok(w_none()), 1);
+        store_fn(mon, "get_tool", |_| Ok(w_none()), 1);
+        store_fn(mon, "register_callback", |_| Ok(w_none()), 3);
+        store_fn(mon, "set_events", |_| Ok(w_none()), 2);
+        store_fn(mon, "get_events", |_| Ok(w_int_new(0)), 1);
+        store_fn(mon, "set_local_events", |_| Ok(w_none()), 3);
+        store_fn(mon, "get_local_events", |_| Ok(w_int_new(0)), 2);
+        store_fn(mon, "restart_events", |_| Ok(w_none()), 0);
+        dict_storage_store(ns, "monitoring", mon);
+    }
     // sys.platlibdir — typically "lib" on POSIX; used by sysconfig to
     // construct install paths.
     dict_storage_store(ns, "platlibdir", w_str_new("lib"));
@@ -742,17 +816,60 @@ pub fn register_module(ns: &mut DictStorage) {
             w_str_new("atexit"),
         ]),
     );
-    // sys.exception — returns the currently handled exception or None
+    // sys.exception() — the value half of `sys.exc_info()`: the exception
+    // instance currently being handled, or None outside an `except` block.
     dict_storage_store(
         ns,
         "exception",
-        make_builtin_function_with_arity("exception", |_| Ok(w_none()), 0),
+        make_builtin_function_with_arity(
+            "exception",
+            |_| {
+                let exc = crate::eval::get_current_exception();
+                Ok(unsafe {
+                    if exc.is_null() || !pyre_object::is_exception(exc) {
+                        w_none()
+                    } else {
+                        exc
+                    }
+                })
+            },
+            0,
+        ),
     );
     // sys.exc_clear — no-op
     dict_storage_store(
         ns,
         "exc_clear",
         make_builtin_function_with_arity("exc_clear", |_| Ok(w_none()), 0),
+    );
+    // sys.is_remote_debug_enabled() — no remote-debug interface is wired,
+    // so always False.
+    dict_storage_store(
+        ns,
+        "is_remote_debug_enabled",
+        make_builtin_function_with_arity(
+            "is_remote_debug_enabled",
+            |_| Ok(pyre_object::w_bool_from(false)),
+            0,
+        ),
+    );
+    // sys.copyright — informational string consumed by `site` and `test`.
+    dict_storage_store(
+        ns,
+        "copyright",
+        w_str_new("Copyright (c) 2001-2024 Python Software Foundation.\nAll Rights Reserved."),
+    );
+    // sys.getsizeof(obj[, default]) — pyre has no per-object size
+    // accounting, so report a uniform nominal size (or the caller-supplied
+    // default).  Exact byte counts are an implementation detail.
+    dict_storage_store(
+        ns,
+        "getsizeof",
+        make_builtin_function_with_arity(
+            "getsizeof",
+            |args| Ok(args.get(1).copied().unwrap_or_else(|| w_int_new(16))),
+            1,
+        ),
     );
     // sys.gettrace / settrace
     dict_storage_store(
