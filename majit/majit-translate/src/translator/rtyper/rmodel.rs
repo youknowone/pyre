@@ -3780,11 +3780,17 @@ mod tests {
             "mutated range-list must not select RangeRepr"
         );
 
-        // step==1 but resized (⇒ mutated) → the deferred resized ListRepr
-        // arm (Err), never RangeRepr.
+        // step==1 but resized (⇒ mutated) → selects resized ListRepr, never RangeRepr.
         let ldef_resized = ListDef::new(None, item, false, true);
         ldef_resized.listitem_rc().borrow_mut().range_step = Some(1);
-        assert!(rtyper_makerepr(&SomeValue::List(SomeList::new(ldef_resized)), &rtyper).is_err());
+        let repr_resized =
+            rtyper_makerepr(&SomeValue::List(SomeList::new(ldef_resized)), &rtyper);
+        assert!(
+            repr_resized
+                .map(|r| r.class_name() != "RangeRepr")
+                .unwrap_or(true),
+            "resized range-list must not select RangeRepr"
+        );
 
         // step==1, not mutated, but impossible item → not RangeRepr.
         let ldef_imp = ListDef::new(None, SomeValue::Impossible, false, false);
