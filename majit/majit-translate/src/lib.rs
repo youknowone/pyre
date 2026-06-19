@@ -597,6 +597,7 @@ fn analyze_pipeline_from_module_paths(
         String,
         Option<String>,
         Vec<String>,
+        crate::model::FunctionGraph,
     )> = Vec::new();
     let mut canonical_function_graphs = std::collections::HashMap::new();
     // `bookkeeper.py:353-409 getdesc` / `newfuncdesc` keys on the host
@@ -685,6 +686,7 @@ fn analyze_pipeline_from_module_paths(
                     owner.clone(),
                     func.return_type.clone(),
                     func.hints.clone(),
+                    func.graph.clone(),
                 ));
                 let types = trait_concrete_impl_types
                     .entry(trait_leaf.as_str())
@@ -1099,7 +1101,7 @@ fn analyze_pipeline_from_module_paths(
     }
     let mut concrete_impl_counts: std::collections::HashMap<(String, String), usize> =
         std::collections::HashMap::new();
-    for (trait_leaf, _, method_name, _, _, _) in &concrete_trait_methods {
+    for (trait_leaf, _, method_name, _, _, _, _) in &concrete_trait_methods {
         *concrete_impl_counts
             .entry((trait_leaf.clone(), method_name.clone()))
             .or_insert(0) += 1;
@@ -1114,7 +1116,7 @@ fn analyze_pipeline_from_module_paths(
         String,
         std::collections::BTreeSet<String>,
     > = std::collections::HashMap::new();
-    for (_, trait_qualified, _, owner, _, _) in &concrete_trait_methods {
+    for (_, trait_qualified, _, owner, _, _, _) in &concrete_trait_methods {
         // Keyed by the trait's qualified `name_path()` — two distinct
         // traits sharing a leaf name must not pool their impl owners
         // (`tyref_generic_trait_bound_root` resolves bound-trait
@@ -1155,20 +1157,21 @@ fn analyze_pipeline_from_module_paths(
         })
         .collect();
     call_control.set_trait_unique_impls(trait_unique_impls);
-    for (trait_leaf, _, method_name, owner, return_type, hints) in &concrete_trait_methods {
+    for (trait_leaf, _, method_name, _owner, return_type, hints, graph) in &concrete_trait_methods {
         let key = (trait_leaf.clone(), method_name.clone());
         if concrete_impl_counts.get(&key) != Some(&1) || default_trait_methods.contains(&key) {
             continue;
         }
-        let Some(graph) = mir_graph_lookup
-            .lookup_impl_method(owner, method_name)
-            .cloned()
-        else {
-            continue;
-        };
+        // Use this trait-impl method's own graph rather than
+        // `lookup_impl_method(owner, method_name)`: when the impl owner
+        // also has a same-named *inherent* method (e.g. `PyFrame` has both
+        // the inherent `peek_at` and `<PyFrame as SharedOpcodeHandler>::
+        // peek_at`), the two collide on the `(owner, name)` key and the
+        // lookup resolves to `Err(())` (ambiguous), silently dropping the
+        // single-impl devirtualization.  The carried graph is unambiguous.
         let graph = match return_type {
-            Some(rt) => graph.with_return_type(rt),
-            None => graph,
+            Some(rt) => graph.clone().with_return_type(rt),
+            None => graph.clone(),
         };
         let direct_path =
             crate::parse::CallPath::from_segments([trait_leaf.as_str(), method_name.as_str()]);
