@@ -173,7 +173,11 @@ impl W_Unpickler {
         // proto >= 4 walks dotted qualnames; proto < 4 is a single getattr.
         let allow_qualname = self.proto >= 4;
         crate::module::_pickle::try_resolve_global(&module, &name, allow_qualname)?.ok_or_else(
-            || PyError::attribute_error(format!("Can't get attribute {name:?} on module {module:?}")),
+            || {
+                PyError::attribute_error(format!(
+                    "Can't get attribute {name:?} on module {module:?}"
+                ))
+            },
         )
     }
 

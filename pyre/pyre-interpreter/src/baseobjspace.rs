@@ -2992,9 +2992,7 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyResul
                 match name {
                     "__reduce__" => Some((reversed_reduce_method, "__reduce__", 1)),
                     "__setstate__" => Some((reversed_setstate_method, "__setstate__", 2)),
-                    "__length_hint__" => {
-                        Some((reversed_length_hint_method, "__length_hint__", 1))
-                    }
+                    "__length_hint__" => Some((reversed_length_hint_method, "__length_hint__", 1)),
                     _ => None,
                 }
             } else if pyre_object::filterobject::is_filter(obj) {
@@ -9177,8 +9175,7 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                     Err(e) => {
                         ro::w_reversed_set_remaining(obj, -1);
                         ro::w_reversed_set_sequence(obj, pyre_object::PY_NULL);
-                        if e.kind == PyErrorKind::IndexError
-                            || e.kind == PyErrorKind::StopIteration
+                        if e.kind == PyErrorKind::IndexError || e.kind == PyErrorKind::StopIteration
                         {
                             return Err(PyError::stop_iteration());
                         }

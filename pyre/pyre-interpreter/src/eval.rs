@@ -2318,9 +2318,7 @@ impl OpcodeStepExecutor for PyFrame {
                 // itself, so `assert x` raises `AssertionError()` and
                 // `assert x, msg` raises `AssertionError(msg)`.
                 crate::builtins::lookup_exc_class("AssertionError").unwrap_or_else(|| {
-                    crate::typedef::gettypeobject(
-                        &pyre_object::excobject::EXC_ASSERTION_ERROR_TYPE,
-                    )
+                    crate::typedef::gettypeobject(&pyre_object::excobject::EXC_ASSERTION_ERROR_TYPE)
                 })
             }
             CommonConstant::NotImplementedError => {
