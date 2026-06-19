@@ -109,6 +109,45 @@ fn build_frame_stub_chain(top: *mut crate::pyframe::PyFrame) -> PyObjectRef {
     top_stub
 }
 
+/// Build a `sys.namespace` frame stub for `traceback.tb_frame`
+/// (`typedef.rs init_pytraceback_type`).
+///
+/// A traceback outlives its frame — `W_PyTraceback.frame` dangles once
+/// the frame is freed — so the live `f_locals`/`f_globals` cannot be
+/// read back the way `build_frame_stub_chain` reads them from a still
+/// live `_getframe` stack.  The stub therefore carries only the data
+/// the traceback retains: `f_code` (from the stamped `w_code`) and
+/// `f_lineno` (from the stamped line number), plus empty
+/// `f_globals`/`f_locals` dicts, a `None` `f_back`, and a no-op
+/// `clear`.  That is enough for `traceback.clear_frames`
+/// (`tb.tb_frame.clear()`) and `unittest`'s
+/// `'__unittest' in tb.tb_frame.f_globals` traceback filter to run
+/// without `AttributeError`.  Reusing the `sys.namespace` type keeps
+/// `types.FrameType` (`type(tb.tb_frame)`) identical to
+/// `type(sys._getframe())`.
+pub(crate) fn make_traceback_frame_stub(w_code: PyObjectRef, lineno: i64) -> PyObjectRef {
+    let stub = make_sys_namespace_instance();
+    let _ = crate::baseobjspace::setattr_str(stub, "f_globals", w_dict_new());
+    let _ = crate::baseobjspace::setattr_str(stub, "f_locals", w_dict_new());
+    // `traceback._compute_suggestion_error` reads `frame.f_builtins` to
+    // build "did you mean" hints for a NameError; an empty dict keeps that
+    // path from raising while simply offering no builtin-name suggestions.
+    let _ = crate::baseobjspace::setattr_str(stub, "f_builtins", w_dict_new());
+    let _ = crate::baseobjspace::setattr_str(
+        stub,
+        "f_code",
+        if w_code.is_null() { w_none() } else { w_code },
+    );
+    let _ = crate::baseobjspace::setattr_str(stub, "f_lineno", w_int_new(lineno));
+    let _ = crate::baseobjspace::setattr_str(stub, "f_back", w_none());
+    let _ = crate::baseobjspace::setattr_str(
+        stub,
+        "clear",
+        crate::make_builtin_function("clear", |_| Ok(w_none())),
+    );
+    stub
+}
+
 /// `pypy/module/sys/vm.py:217 space.getexecutioncontext()` access for
 /// `sys.gettrace`/`settrace`/`getprofile`/`setprofile`.
 ///
@@ -393,6 +432,7 @@ pub fn register_module(ns: &mut DictStorage) {
             dict_storage_store(fns, "safe_path", w_bool_from(false));
             dict_storage_store(fns, "int_max_str_digits", w_int_new(4300));
             dict_storage_store(fns, "context_aware_warnings", w_bool_from(false));
+            dict_storage_store(fns, "thread_inherit_context", w_int_new(0));
         });
         let flags = w_instance_new(flags_type);
         dict_storage_store(ns, "flags", flags);
@@ -675,6 +715,36 @@ pub fn register_module(ns: &mut DictStorage) {
             w_str_new("time"),
         ]),
     );
+    // sys.stdlib_module_names — frozenset of stdlib module names, read by
+    // `traceback.TracebackException` (`wrong_name in sys.stdlib_module_names`)
+    // to offer "did you forget to import" hints.  Seeded from the
+    // compiled-in builtin module names; the full pure-Python stdlib set is
+    // not enumerated yet, so a name absent here simply yields no hint
+    // rather than a crash.
+    dict_storage_store(
+        ns,
+        "stdlib_module_names",
+        pyre_object::setobject::w_frozenset_from_items(&[
+            w_str_new("sys"),
+            w_str_new("builtins"),
+            w_str_new("_thread"),
+            w_str_new("time"),
+            w_str_new("errno"),
+            w_str_new("_io"),
+            w_str_new("marshal"),
+            w_str_new("_imp"),
+            w_str_new("gc"),
+            w_str_new("_warnings"),
+            w_str_new("_string"),
+            w_str_new("_codecs"),
+            w_str_new("_weakref"),
+            w_str_new("_operator"),
+            w_str_new("_collections"),
+            w_str_new("_functools"),
+            w_str_new("itertools"),
+            w_str_new("atexit"),
+        ]),
+    );
     // sys.exception — returns the currently handled exception or None
     dict_storage_store(
         ns,
@@ -729,6 +799,15 @@ pub fn register_module(ns: &mut DictStorage) {
         ns,
         "audit",
         crate::make_builtin_function("audit", |_| Ok(w_none())),
+    );
+    // sys._clear_type_descriptors(cls) — clears a type's cached descriptors
+    // before `dataclasses._add_slots` rebuilds the class with __slots__.  The
+    // rebuilt class is constructed fresh from the original's dict, so dropping
+    // the descriptors on the soon-discarded original is a no-op here.
+    dict_storage_store(
+        ns,
+        "_clear_type_descriptors",
+        crate::make_builtin_function("_clear_type_descriptors", |_| Ok(w_none())),
     );
     // sys.is_finalizing
     dict_storage_store(
