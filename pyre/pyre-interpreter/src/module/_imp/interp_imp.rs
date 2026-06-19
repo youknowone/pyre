@@ -51,6 +51,16 @@ pub fn register_module(ns: &mut DictStorage) {
             1,
         ),
     );
+    // `_imp._override_frozen_modules_for_tests(value)` — the CPython test
+    // harness (`test.support.import_helper`) toggles frozen-module
+    // overriding.  Pyre has no frozen modules, so accept and ignore.
+    crate::dict_storage_store(
+        ns,
+        "_override_frozen_modules_for_tests",
+        crate::make_builtin_function("_override_frozen_modules_for_tests", |_| {
+            Ok(pyre_object::w_none())
+        }),
+    );
     crate::dict_storage_store(
         ns,
         "get_frozen_object",
