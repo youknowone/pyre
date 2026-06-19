@@ -6013,7 +6013,9 @@ pub(crate) fn decode_and_restore_guard_failure(
 /// Decode rd_numb to produce typed values via
 /// `majit_ir::resumedata::rebuild_from_numbering`. Each slot is TAGBOX
 /// (deadframe), TAGCONST (constant), TAGINT (small int), or TAGVIRTUAL
-/// (virtual to materialize). Single-frame only (no per-jitcode liveness).
+/// (virtual to materialize). Consumes only the outermost frame's values,
+/// but splits frames by per-jitcode liveness so the box-section boundary is
+/// correct for multi-frame (inlined-callee) guards.
 ///
 /// Returns `(typed_values, rd_numb_frame_pc)`. The frame PC from rd_numb
 /// is the liveness PC used by get_list_of_active_boxes during encoding.
@@ -6027,6 +6029,15 @@ fn rebuild_typed_from_rd_numb(
 ) -> (Vec<Value>, Option<usize>, HashMap<usize, Value>) {
     use majit_ir::resumedata::rebuild_from_numbering;
 
+    // resume.py:1049-1055 parity: bound each frame's box section by jitcode
+    // liveness (the same per-(jitcode,pc) count the encoder used). Without it,
+    // the single-frame fallback makes `frames[0]` swallow every remaining
+    // item — including subsequent inline frames' headers — which is benign
+    // only as long as the over-read lands on valid tagged values. This
+    // function consumes only `frames.first()`, but it must still consume the
+    // header word stream symmetrically so that boundary is correct for
+    // multi-frame (inlined-callee) guards.
+    let cb = pyre_jit_trace::state::frame_value_count_at;
     let num_virtuals = exit_layout
         .storage
         .as_deref()
@@ -6035,7 +6046,7 @@ fn rebuild_typed_from_rd_numb(
         rd_numb,
         rd_consts,
         &exit_layout.exit_types,
-        None,
+        Some(&cb),
         num_virtuals,
     );
 
