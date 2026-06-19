@@ -11099,6 +11099,15 @@ fn init_setlike_common(ns: &mut DictStorage) {
     );
     dict_storage_store(
         ns,
+        "__reduce__",
+        make_builtin_function_with_arity(
+            "__reduce__",
+            |args| crate::reduce_protocol::set_reduce(args[0]),
+            1,
+        ),
+    );
+    dict_storage_store(
+        ns,
         "__or__",
         make_builtin_function_with_arity("__or__", set_op_or, 2),
     );
