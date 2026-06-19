@@ -1673,7 +1673,9 @@ fn whichmodule(w_obj: PyObjectRef, name: &str) -> Result<PyObjectRef, PyError> {
         return Err(pickling_error(format!("Can't pickle local object {name}")));
     }
     // `interp_pickle.py:1738-1742 whichmodule` returns any non-None
-    // `__module__`; a non-string value is rejected by the import machinery.
+    // `__module__`. A non-string module name is invalid; reject it here with
+    // `TypeError("module name must be a string")` — the same error it surfaces
+    // once used, raised at resolution time rather than deferred to the import.
     let from_attr: Option<String> = match crate::baseobjspace::findattr(w_obj, "__module__") {
         Some(m) if !unsafe { pyre_object::is_none(m) } => {
             if !unsafe { pyre_object::is_str(m) } {
