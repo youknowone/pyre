@@ -837,6 +837,7 @@ pub(crate) fn resolve_kwargs(
                 if let Some(new_fn) =
                     unsafe { crate::baseobjspace::lookup_in_type(w_winner, "__new__") }
                 {
+                    let new_fn = unsafe { unwrap_static_new(new_fn) };
                     if unsafe { crate::is_function(new_fn) } {
                         (new_fn, 1usize)
                     } else {
@@ -1597,6 +1598,7 @@ pub fn call_with_kwargs(
         let instance = if let Some(new_fn) =
             unsafe { crate::baseobjspace::lookup_in_type(w_metaclass, "__new__") }
         {
+            let new_fn = unsafe { unwrap_static_new(new_fn) };
             let mut new_args = Vec::with_capacity(1 + pos_args.len());
             new_args.push(w_metaclass);
             new_args.extend_from_slice(pos_args);
@@ -2111,6 +2113,18 @@ fn call_user_function_resolved_frameless(func: PyObjectRef, args: &[PyObjectRef]
 ///
 /// PyPy: metaclass(name, bases, namespace, **kwds).
 /// Resolves kwargs to the metaclass __new__'s kwonly / **kwds parameters.
+/// `__new__` is stored as an implicit `staticmethod` (type_new_staticmethod);
+/// unwrap it to the underlying function so the signature-based dispatch and
+/// `is_function` fast-paths below see the real callable rather than the
+/// descriptor wrapper. Builtin `__new__` (not a staticmethod) passes through.
+unsafe fn unwrap_static_new(f: PyObjectRef) -> PyObjectRef {
+    if unsafe { pyre_object::propertyobject::is_staticmethod(f) } {
+        unsafe { pyre_object::propertyobject::w_staticmethod_get_func(f) }
+    } else {
+        f
+    }
+}
+
 fn call_metaclass_with_kwargs(
     w_metaclass: PyObjectRef,
     name: PyObjectRef,
@@ -2165,6 +2179,7 @@ fn call_metaclass_with_kwargs(
     let new_fn = unsafe { crate::baseobjspace::lookup_in_type(w_metaclass, "__new__") };
 
     let instance = if let Some(new_fn) = new_fn {
+        let new_fn = unsafe { unwrap_static_new(new_fn) };
         // Resolve only against a user-defined __new__ with a real code
         // object; the builtin type.__new__ has none, so fall through.
         let is_user_fn = unsafe { crate::is_function(new_fn) }
@@ -2863,6 +2878,7 @@ fn build_class_inner(
             let class_ns = &mut *class_ns_ptr;
             class_ns.remove("__classcell__");
             class_ns.remove("__classdictcell__");
+            crate::builtins::type_new_wrap_special_methods(class_ns);
         }
         let w = pyre_object::w_type_new(name, w_effective_bases, class_ns_ptr as *mut u8);
         // typeobject.py:1143-1204 create_all_slots parity.

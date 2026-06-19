@@ -9369,6 +9369,56 @@ fn property_deleter_impl(args: &[PyObjectRef]) -> PyResult {
     unsafe { property_copy(args[0], None, None, args.get(1).copied()) }
 }
 
+/// `descriptor.py W_Property.get` as the type-dict `__get__` entry — args
+/// are `[property, obj, objtype]`.  The implicit descriptor path special-
+/// cases properties in `get()` above; this entry exists so explicit
+/// `prop.__get__(...)`, `hasattr(prop, '__get__')`, and descriptor
+/// introspection see it.
+pub(crate) fn property_descr_get_impl(args: &[PyObjectRef]) -> PyResult {
+    unsafe {
+        let prop = args[0];
+        let obj = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+        // `if space.is_w(w_obj, space.w_None): return self`
+        if obj.is_null() || is_none(obj) {
+            return Ok(prop);
+        }
+        let fget = w_property_get_fget(prop);
+        if fget.is_null() || is_none(fget) {
+            return Err(property_no_accessor(prop, obj, "getter"));
+        }
+        crate::call::call_function_impl_result(fget, &[obj])
+    }
+}
+
+/// `descriptor.py W_Property.set` — args `[property, obj, value]`.
+pub(crate) fn property_descr_set_impl(args: &[PyObjectRef]) -> PyResult {
+    unsafe {
+        let prop = args[0];
+        let obj = args[1];
+        let value = args.get(2).copied().unwrap_or(pyre_object::PY_NULL);
+        let fset = w_property_get_fset(prop);
+        if fset.is_null() || is_none(fset) {
+            return Err(property_no_accessor(prop, obj, "setter"));
+        }
+        crate::call::call_function_impl_result(fset, &[obj, value])?;
+        Ok(pyre_object::w_none())
+    }
+}
+
+/// `descriptor.py W_Property.delete` — args `[property, obj]`.
+pub(crate) fn property_descr_delete_impl(args: &[PyObjectRef]) -> PyResult {
+    unsafe {
+        let prop = args[0];
+        let obj = args[1];
+        let fdel = w_property_get_fdel(prop);
+        if fdel.is_null() || is_none(fdel) {
+            return Err(property_no_accessor(prop, obj, "deleter"));
+        }
+        crate::call::call_function_impl_result(fdel, &[obj])?;
+        Ok(pyre_object::w_none())
+    }
+}
+
 // ── Generator methods ────────────────────────────────────────────────
 //
 // PyPy: pypy/interpreter/generator.py GeneratorIterator

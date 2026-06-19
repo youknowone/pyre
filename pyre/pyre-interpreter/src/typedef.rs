@@ -5786,6 +5786,86 @@ fn init_builtin_code_type(ns: &mut DictStorage) {
         2,
     );
     dict_storage_store(ns, "co_name", make_getset_descriptor(co_name_getter));
+
+    // Signature-derived attrs (fget_co_argcount etc., typedef.py). A
+    // builtin code with no recorded Signature reports zero/empty so
+    // inspect.signature() degrades to an empty signature instead of
+    // raising AttributeError.
+    fn code_sig(args: &[pyre_object::PyObjectRef]) -> Option<&'static crate::gateway::Signature> {
+        let code = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+        if code.is_null() {
+            None
+        } else {
+            unsafe { crate::builtin_code_get_signature(code) }
+        }
+    }
+    let argcount_getter = make_builtin_function_with_arity(
+        "co_argcount",
+        |args| Ok(pyre_object::w_int_new(code_sig(args).map_or(0, |s| s.num_argnames()) as i64)),
+        2,
+    );
+    dict_storage_store(ns, "co_argcount", make_getset_descriptor(argcount_getter));
+    let posonly_getter = make_builtin_function_with_arity(
+        "co_posonlyargcount",
+        |args| {
+            Ok(pyre_object::w_int_new(
+                code_sig(args).map_or(0, |s| s.num_posonlyargnames()) as i64,
+            ))
+        },
+        2,
+    );
+    dict_storage_store(
+        ns,
+        "co_posonlyargcount",
+        make_getset_descriptor(posonly_getter),
+    );
+    let kwonly_getter = make_builtin_function_with_arity(
+        "co_kwonlyargcount",
+        |args| {
+            Ok(pyre_object::w_int_new(
+                code_sig(args).map_or(0, |s| s.num_kwonlyargnames()) as i64,
+            ))
+        },
+        2,
+    );
+    dict_storage_store(
+        ns,
+        "co_kwonlyargcount",
+        make_getset_descriptor(kwonly_getter),
+    );
+    let varnames_getter = make_builtin_function_with_arity(
+        "co_varnames",
+        |args| {
+            let names = code_sig(args)
+                .map(|s| {
+                    s.getallvarnames()
+                        .iter()
+                        .map(|n| pyre_object::w_str_new(n))
+                        .collect()
+                })
+                .unwrap_or_default();
+            Ok(pyre_object::w_tuple_new(names))
+        },
+        2,
+    );
+    dict_storage_store(ns, "co_varnames", make_getset_descriptor(varnames_getter));
+    let flags_getter = make_builtin_function_with_arity(
+        "co_flags",
+        |args| {
+            let mut flags = 0i64;
+            if let Some(s) = code_sig(args) {
+                if s.has_vararg() {
+                    flags |= 0x04; // CO_VARARGS
+                }
+                if s.has_kwarg() {
+                    flags |= 0x08; // CO_VARKEYWORDS
+                }
+            }
+            Ok(pyre_object::w_int_new(flags))
+        },
+        2,
+    );
+    dict_storage_store(ns, "co_flags", make_getset_descriptor(flags_getter));
 }
 
 fn init_method_type(ns: &mut DictStorage) {
@@ -6484,6 +6564,25 @@ fn init_property_type(ns: &mut DictStorage) {
             }
             Ok(prop)
         }),
+    );
+    // descriptor.py W_Property.typedef `__get__` / `__set__` / `__delete__`
+    // — the implicit descriptor path special-cases properties, but the
+    // type-dict entries make `prop.__get__`, `hasattr(prop, '__get__')`,
+    // and `_is_descriptor` see the property as a descriptor.
+    dict_storage_store(
+        ns,
+        "__get__",
+        make_builtin_function("__get__", crate::baseobjspace::property_descr_get_impl),
+    );
+    dict_storage_store(
+        ns,
+        "__set__",
+        make_builtin_function("__set__", crate::baseobjspace::property_descr_set_impl),
+    );
+    dict_storage_store(
+        ns,
+        "__delete__",
+        make_builtin_function("__delete__", crate::baseobjspace::property_descr_delete_impl),
     );
 }
 
