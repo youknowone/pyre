@@ -4401,6 +4401,44 @@ mod tests {
     }
 
     #[test]
+    fn assemble_ref_return_with_prebuilt_string_constant() {
+        use crate::translator::rtyper::lltypesystem::rstr::{
+            const_str_cache_llstr, ll_strhash_value,
+        };
+        // A `RefReturn` of a prebuilt `Ptr(STR)` constant drives a real
+        // `ConstValue::LLPtr(STR)` through the whole assembler emit path
+        // (encode_regorconst_source -> emit_const('r') -> emit_const_r ->
+        // emit_str_const_r) and commits the recorded descriptor into the
+        // produced `JitCodeBody.str_consts`.  This is the build-side half of
+        // the deferred-materialization loop the runtime `materialize_str_consts`
+        // pass closes (the runtime half is covered in pyre-jit-trace).
+        let mut flat = SSARepr {
+            name: "return_prebuilt_string".into(),
+            insns: vec![FlatOp::RefReturn(crate::flatten::RegOrConst::Const(
+                crate::flowspace::model::Constant::new(ConstValue::LLPtr(Box::new(
+                    const_str_cache_llstr(b"hi").expect("cache llstr"),
+                ))),
+            ))],
+            num_blocks: 1,
+            insns_pos: None,
+        };
+
+        let regallocs = empty_regallocs();
+        let mut asm = Assembler::new();
+        let body = asm.assemble(&mut flat, &regallocs);
+
+        // The committed body carries the deferred descriptor, and the
+        // `constants_r` slot it names holds the non-canonical sentinel the
+        // runtime load pass overwrites with the live STR address.
+        assert_eq!(body.str_consts.len(), 1);
+        assert_eq!(body.str_consts[0].bytes, b"hi".to_vec());
+        assert_eq!(body.str_consts[0].precomputed_hash, ll_strhash_value(b"hi"));
+        let idx = body.str_consts[0].constants_r_index;
+        assert_eq!(body.constants_r[idx], str_const_sentinel(0));
+        assert!(asm.insns.contains_key("ref_return/r"));
+    }
+
+    #[test]
     fn emit_const_r_records_prebuilt_string_descriptor_and_dedups() {
         use crate::translator::rtyper::lltypesystem::rstr::{
             const_str_cache_llstr, ll_strhash_value,
