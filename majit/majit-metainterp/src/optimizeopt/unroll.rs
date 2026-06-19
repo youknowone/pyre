@@ -4172,15 +4172,28 @@ impl OptUnroll {
             let result = match produced.kind {
                 crate::optimizeopt::shortpreamble::PreambleOpKind::Pure
                 | crate::optimizeopt::shortpreamble::PreambleOpKind::LoopInvariant => {
-                    // `source` is the short-box key = an ORIGINAL label/virtual
-                    // position. Match it against `short_label_args` (originals);
-                    // `short_inputargs[slot]` is now a distinct renamed box and
-                    // would never equal `source`.
-                    if let Some(slot) = exported_state
-                        .short_label_args
-                        .iter()
-                        .position(|a| *a == *source)
+                    // The short-box result that coincides with a label/virtual
+                    // slot maps to that slot's body OpRef. `produced.label_arg_idx`
+                    // is `lookup_label_arg(canonical_result)` recorded at export
+                    // (optimizer.rs), and `source` == `canonical_result` ==
+                    // `preamble_op.pos`, so it equals the position of `source`
+                    // within the original `label_args + virtuals` — read it off
+                    // the produced entry instead of matching `source` against the
+                    // parallel originals array. (The renamed `short_inputargs[slot]`
+                    // is a distinct box and would never equal `source` anyway.)
+                    #[cfg(debug_assertions)]
                     {
+                        let array_slot = exported_state
+                            .short_label_args
+                            .iter()
+                            .position(|a| *a == *source);
+                        debug_assert_eq!(
+                            produced.label_arg_idx, array_slot,
+                            "result_map slot re-derivation from label_arg_idx \
+                             diverged from short_label_args for {source:?}"
+                        );
+                    }
+                    if let Some(slot) = produced.label_arg_idx {
                         short_args.get(slot).copied()
                     } else {
                         Some(ctx.alloc_op_position_typed(result_type))
@@ -5928,6 +5941,7 @@ mod tests {
                 )),
                 invented_name: false,
                 same_as_source: Some(BoxRef::from_opref(old_ref)),
+                label_arg_idx: None,
             },
         ));
         state.short_box_const_values = short_box_const_values;

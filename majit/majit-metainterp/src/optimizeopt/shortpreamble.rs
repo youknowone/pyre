@@ -437,6 +437,7 @@ impl PreambleOp {
             preamble_op: std::rc::Rc::new(preamble_op),
             invented_name: self.invented_name,
             same_as_source: self.same_as_source.clone(),
+            label_arg_idx: self.label_arg_idx,
         })
     }
 }
@@ -935,6 +936,7 @@ impl ShortBoxes {
                 kind: PreambleOpKind::Heap,
                 invented_name: false,
                 same_as_source: None,
+                label_arg_idx: None,
             });
         }
         short_boxes
@@ -1240,6 +1242,13 @@ pub struct ProducedShortOp {
     /// Original result this invented name aliases.
     /// MIGRATION (#9): carried as a [`BoxRef`]; see [`PreambleOp::same_as_source`].
     pub same_as_source: Option<crate::r#box::BoxRef>,
+    /// Slot of this short box's result within the original
+    /// `label_args + virtuals`, i.e. `lookup_label_arg(canonical_result)`
+    /// carried over from [`PreambleOp::label_arg_idx`] across the export
+    /// boundary. `None` for a result that is not a label/virtual slot. Lets
+    /// the importer resolve the body-visible result slot directly instead of
+    /// matching the result against a parallel originals array.
+    pub label_arg_idx: Option<usize>,
 }
 
 /// Phase B B.1: helper used by `ProducedShortOp::produce_op` to seed a
@@ -3217,6 +3226,7 @@ pub fn produced_short_boxes_from_exported_boxes(
                     preamble_op: std::rc::Rc::new(preamble_op),
                     invented_name: entry.invented_name,
                     same_as_source: entry.same_as_source.clone(),
+                    label_arg_idx: entry.label_arg_idx,
                 },
             )
         })
@@ -3697,6 +3707,7 @@ mod tests {
                     },
                     invented_name: false,
                     same_as_source: None,
+                    label_arg_idx: None,
                 },
             ),
             (
@@ -3711,6 +3722,7 @@ mod tests {
                     },
                     invented_name: false,
                     same_as_source: None,
+                    label_arg_idx: None,
                 },
             ),
         ];

@@ -2886,6 +2886,7 @@ impl OptContext {
                         preamble_op: std::rc::Rc::new((*entry.op).clone()),
                         invented_name: entry.invented_name,
                         same_as_source: entry.same_as_source.clone(),
+                        label_arg_idx: entry.label_arg_idx,
                     },
                 )
             })
@@ -3152,6 +3153,7 @@ impl OptContext {
                         preamble_op: std::rc::Rc::new(op),
                         invented_name: produced_op.invented_name,
                         same_as_source: produced_op.same_as_source.clone(),
+                        label_arg_idx: produced_op.label_arg_idx,
                     };
                     builder_entries.push((produced_op.res.clone(), new_pop.clone()));
                     produced.push((*source, new_pop.clone()));
@@ -3194,6 +3196,7 @@ impl OptContext {
                                 preamble_op: std::rc::Rc::new(op),
                                 invented_name: produced_op.invented_name,
                                 same_as_source: produced_op.same_as_source.clone(),
+                                label_arg_idx: produced_op.label_arg_idx,
                             }
                         }
                         OpCode::GetarrayitemGcI
@@ -3234,6 +3237,7 @@ impl OptContext {
                                 preamble_op: std::rc::Rc::new(op),
                                 invented_name: produced_op.invented_name,
                                 same_as_source: produced_op.same_as_source.clone(),
+                                label_arg_idx: produced_op.label_arg_idx,
                             }
                         }
                         _ => continue,
@@ -3272,6 +3276,7 @@ impl OptContext {
                         preamble_op: std::rc::Rc::new(op),
                         invented_name: produced_op.invented_name,
                         same_as_source: produced_op.same_as_source.clone(),
+                        label_arg_idx: produced_op.label_arg_idx,
                     };
                     builder_entries.push((produced_op.res.clone(), new_pop.clone()));
                     produced.push((*source, new_pop.clone()));
