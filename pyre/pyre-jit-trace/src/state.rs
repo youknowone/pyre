@@ -2231,6 +2231,17 @@ pub(crate) fn instruction_needs_pre_opcode_snapshot(instruction: Instruction) ->
             // opcode start restores the consumed operands as null / mismatched.
             | Instruction::BuildTuple { .. }
             | Instruction::UnpackSequence { .. }
+            // LOAD_ATTR reaches the trait leg (execute_opcode_step) in two
+            // cases the dispatch gate carves out of the arm walk: the foldable
+            // builtin list-method form (append/pop/reverse on a list receiver)
+            // and any method-load inside an inline frame. Both run load_method,
+            // which pop_value's the receiver first, then emits a non-residual
+            // receiver class guard (guard_class) plus a version_tag guard_value
+            // — resume_pc=orgpc, so the consumed receiver must be in the
+            // opcode-start snapshot. The arm-walk leg (the common non-foldable
+            // form) ignores pre_opcode_registers_r, so capturing it there is
+            // inert; only the trait leg consults it.
+            | Instruction::LoadAttr { .. }
     )
 }
 
@@ -9046,6 +9057,15 @@ mod tests {
         let unpack_code = compile_function_body("def f(s):\n    a, b = s\n    return a + b\n");
         assert!(contains_instruction(&unpack_code, |instruction| {
             matches!(instruction, Instruction::UnpackSequence { .. })
+                && instruction_needs_pre_opcode_snapshot(instruction)
+        }));
+
+        // LOAD_ATTR's foldable list-method form (lst.append) reaches the trait
+        // leg load_method, which pop_value's the receiver before emitting the
+        // receiver class / version_tag guards.
+        let load_attr_code = compile_function_body("def f(lst, x):\n    return lst.append(x)\n");
+        assert!(contains_instruction(&load_attr_code, |instruction| {
+            matches!(instruction, Instruction::LoadAttr { .. })
                 && instruction_needs_pre_opcode_snapshot(instruction)
         }));
     }
