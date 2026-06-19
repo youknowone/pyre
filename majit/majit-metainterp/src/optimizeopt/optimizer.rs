@@ -310,6 +310,18 @@ pub(crate) fn merge_backend_constants_from_ctx(
             crate::r#box::Forwarded::Const(c) => c.to_value(),
             _ => return,
         };
+        // A ref constant is never resolved from this backend pool: a referenced
+        // (live) ref operand is an inline ConstPtr that `remove_constptr`
+        // (rewrite.rs:613) rewrites to `LoadFromGcTable`, loading from the
+        // GC-traced gc_table. Only dead (non-result) const-folded positions
+        // reach here, and the recorder invariant (recorder.rs:209) forbids a
+        // `RefOp(pos)` operand from referencing a dead position, so a ref entry
+        // is vestigial. Dropping it keeps the pool — and the `CompiledTrace`
+        // constants cloned from it — free of raw `GcRef`, which has no GC root
+        // walker (the gc_table is the sole GC-traced ref store).
+        if matches!(value, majit_ir::Value::Ref(_)) {
+            return;
+        }
         if idx < live_positions.len() && live_positions[idx] {
             return;
         }
@@ -325,6 +337,15 @@ pub(crate) fn merge_backend_constants_from_ctx(
     for op in ctx.resop_refs.values() {
         consider(op);
     }
+    // No raw `GcRef` survives in the backend constant pool: the only other
+    // entries are pre-existing ones the caller threaded in, which must already
+    // hold no ref for the same reason.
+    debug_assert!(
+        constants
+            .values()
+            .all(|v| !matches!(v, majit_ir::Value::Ref(_))),
+        "backend constant pool must not retain a raw GcRef (use the gc_table)"
+    );
 }
 
 /// RPython unroll.py: import_state virtual info for Phase 2.

@@ -3080,13 +3080,34 @@ mod tests {
         let ref_arg_const = OpRef::const_ptr(GcRef(0x4242));
         let result_ptr = GcRef(0xDEAD_BEEF);
 
-        let mut ops = vec![Op::new(
-            OpCode::CallPureR,
-            &[
-                BoxRef::from_opref(func_const),
-                BoxRef::from_opref(ref_arg_const),
-            ],
-        )];
+        // op0 hits the seeded cache and folds to a Ref constant. A second
+        // residual CallPureR (distinct key, no cache hit) consumes op0's
+        // result, so the fold is observed where it matters in production: the
+        // folded Ref reaches its consumer as an inline `ConstPtr` operand
+        // (later rewritten to `LoadFromGcTable` by the GC rewrite). #108: a Ref
+        // constant is NEVER exported as a raw `GcRef` into the backend constant
+        // pool — that pool has no GC root walker, so refs live only in the
+        // GC-traced gc_table. (The Int analog at :3037 DOES export to the pool;
+        // ints carry no GC concern.)
+        let func_const2 = OpRef::const_int(0xF00D);
+        let mut ops = vec![
+            Op::new(
+                OpCode::CallPureR,
+                &[
+                    BoxRef::from_opref(func_const),
+                    BoxRef::from_opref(ref_arg_const),
+                ],
+            ),
+            // arg(1) references op0's result position (RefOp(0)); after the
+            // fold it resolves to the inline ConstPtr of the cached result.
+            Op::new(
+                OpCode::CallPureR,
+                &[
+                    BoxRef::from_opref(func_const2),
+                    BoxRef::from_opref(OpRef::ref_op(0)),
+                ],
+            ),
+        ];
         assign_positions(&mut ops);
         // `assign_positions` types op.pos via result_type() → CallPureR
         // gives a Ref-typed position OpRef.
@@ -3106,25 +3127,35 @@ mod tests {
         opt.add_pass(Box::new(OptPure::new()));
 
         let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
-        let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 1);
+        let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 0);
 
-        // The 2nd identical CallPureR collapses to the cached constant —
-        // the op is removed entirely.
-        assert!(
-            result.is_empty(),
-            "identical-const-args CallPureR must be removed by call_pure_results fold; got {result:?}"
-        );
-        let folded = constants.get(&ops[0].pos.get().raw());
-        // The folded constant must be Ref-typed, value == result_ptr.
+        // op0 collapses to the cached constant (removed); op1 is the residual
+        // call that consumes it.
         assert_eq!(
-            folded,
-            Some(&Value::Ref(result_ptr)),
-            "CallPureR fold must yield ConstPtr(result_ptr), got {folded:?}"
+            result.len(),
+            1,
+            "op0 folds via call_pure_results; op1 residual remains; got {result:?}"
         );
-        // Critically: NOT a ConstInt of the same numeric value.
+        // A pure call with no cache hit lowers to a residual `CallR`.
+        let consumer = &result[0];
+        assert_eq!(consumer.opcode, OpCode::CallR);
+        // The folded constant reaches the consumer as ConstPtr(result_ptr)
+        // (history.py:314), NOT a ConstInt of the same numeric value
+        // (resoperation.py:638 `RefOp.type = 'r'`).
+        assert_eq!(
+            consumer.arg(1).to_opref(),
+            OpRef::const_ptr(result_ptr),
+            "CallPureR fold must yield ConstPtr(result_ptr), got {:?}",
+            consumer.arg(1).to_opref()
+        );
         assert!(
-            !matches!(folded, Some(Value::Int(_))),
-            "folded CallPureR constant aliased to Value::Int — ConstPtr/ConstInt distinction lost"
+            !matches!(consumer.arg(1).to_opref(), OpRef::ConstInt(_)),
+            "folded CallPureR constant aliased to ConstInt — ConstPtr/ConstInt distinction lost"
+        );
+        // #108: no raw GcRef is exported into the backend constant pool.
+        assert!(
+            constants.values().all(|v| !matches!(v, Value::Ref(_))),
+            "backend constant pool must not retain a raw GcRef (use the gc_table); got {constants:?}"
         );
     }
 }
