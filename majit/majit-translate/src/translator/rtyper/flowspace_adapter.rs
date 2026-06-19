@@ -492,6 +492,15 @@ fn normalize_unary_op_name(pyre_name: &str) -> Result<String, TyperError> {
         // `__builtin__.int/float/bool` / `lltype.cast_*` /
         // `rarithmetic.intmask` / `rarithmetic.r_uint`.
         "same_as" => Ok("same_as".to_string()),
+        // `str` — RPython `add_operator('str', 1, ..)` (`operation.py`),
+        // dispatched at `rtyper.rs "str" => rtype_str` into the per-repr
+        // `ll_str` lowering and annotated `SomeString` (`unaryop.rs str =>
+        // SomeString()`).  `front::mir`'s `format!`-chain expansion
+        // (`collapse_fmt_chains`) renders each `{}` placeholder argument
+        // with `OpKind::UnaryOp { op: "str", .. }` — the orthodox
+        // string-build lowering (`str(arg)` ++ `ll_strconcat`) in place of
+        // the graph-less `fmt::rt::Argument::new_display` chain.
+        "str" => Ok("str".to_string()),
         other => Err(TyperError::missing_rtype_operation(format!(
             "normalize_unary_op_name: pyre UnaryOp `{other}` has no \
              flowspace counterpart (operation.py:465-474 registers \
