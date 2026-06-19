@@ -73,6 +73,24 @@ pub const TAGVIRTUAL: u8 = 3;
 /// decode at resume time.
 pub const AFTER_RESIDUAL_CALL_PC_FLAG: i32 = 1 << 14;
 
+/// Sentinel for a snapshot frame's `jitcode_pc` word: "no direct JitCode
+/// resume coordinate — translate the Python `pc` through `pc_map` as
+/// before".
+///
+/// Each per-frame header carries a `jitcode_pc` word after `pc`.  Normally
+/// it is this sentinel and the frame resumes via the Python `pc` →
+/// `pc_map` indirection (`resolve_resume_pc`).  A branch guard whose
+/// not-taken arm keeps operand-stack temps the JitCode virtualized cannot
+/// be described by the merge-target Python pc: its kept temps are only
+/// live at the *guard* JitCode position, not at the resume Python opcode
+/// boundary.  For such guards the capture stores the guard's JitCode byte
+/// offset here (a non-negative value), and both the box-count liveness
+/// query and the blackhole `setposition` resolve directly off it,
+/// bypassing `pc_map` — the direct `setposition(jitcode, pc)` shape
+/// (`pyjitpl.py:2610-2624`) without the pc round-trip.  The Python `pc`
+/// word stays populated for interpreter re-entry / `last_instr`.
+pub const NO_JITCODE_PC: i32 = -1;
+
 /// Fold the after-residual-call marker into a snapshot frame pc word.
 /// `pc` must be a non-negative Python PC `< AFTER_RESIDUAL_CALL_PC_FLAG`.
 /// The bound is enforced in release builds, not only under `debug_assert`,
@@ -361,6 +379,9 @@ pub struct RebuiltFrame {
     /// PC because pyre traces Python bytecode rather than JitCode.  See
     /// `[[project-issue73-phase5-design]]`.
     pub pc: i32,
+    /// Direct JitCode resume coordinate, or [`NO_JITCODE_PC`] when the
+    /// frame resumes through the Python `pc` → `pc_map` translation.
+    pub jitcode_pc: i32,
     pub values: Vec<RebuiltValue>,
 }
 
@@ -500,6 +521,12 @@ pub fn rebuild_from_numbering(
         } else {
             0
         };
+        // Per-frame `jitcode_pc` word (after `pc`).  See [`NO_JITCODE_PC`].
+        let jitcode_pc = if reader.has_more() && reader.items_read < total_size as usize {
+            reader.next_item()
+        } else {
+            NO_JITCODE_PC
+        };
         let box_count = if let Some(f) = &frame_value_count {
             // RPython parity: liveness-driven frame boundary.
             f(jitcode_index, pc)
@@ -524,6 +551,7 @@ pub fn rebuild_from_numbering(
         frames.push(RebuiltFrame {
             jitcode_index,
             pc,
+            jitcode_pc,
             values,
         });
     }

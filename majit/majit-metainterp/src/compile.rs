@@ -2636,6 +2636,7 @@ mod tests {
             framestack: vec![SnapshotFrame {
                 jitcode_index: 0,
                 pc: 8,
+                jitcode_pc: majit_ir::resumedata::NO_JITCODE_PC,
                 boxes: vec![OpRef::input_arg_int(1).into()],
             }],
         };
