@@ -3362,6 +3362,15 @@ impl Optimization for OptIntBounds {
                 .get_box_replacement_box(arg)
                 .map(|b| b.to_opref())
                 .unwrap_or(arg);
+            // optimizer.py:118-119 `setintbound`: an IntBound is never stored
+            // on a Const (history.py:220 a Const carries its value inline);
+            // unroll.py:483 likewise skips Const args when exporting info, so
+            // a Const resolved arg has no preamble bound to carry across the
+            // peel boundary. The consumer already recovers a Const's bound via
+            // `synthesize_const_info` before this table is consulted.
+            if resolved.is_constant() {
+                continue;
+            }
             if !matches!(ctx.opref_type(resolved), Some(majit_ir::Type::Int)) {
                 continue;
             }

@@ -1664,7 +1664,8 @@ impl Optimizer {
     /// The exported loop state should record the boxes that survive the end of
     /// the preamble after virtuals have been forced into a loop-carried shape.
     pub fn force_at_the_end_of_preamble(&mut self, opref: OpRef, ctx: &mut OptContext) -> OpRef {
-        let mut rec: majit_ir::vec_set::VecSet<OpRef> = majit_ir::vec_set::VecSet::new();
+        let mut rec: majit_ir::vec_set::VecSet<crate::r#box::BoxRef> =
+            majit_ir::vec_set::VecSet::new();
         self.force_at_the_end_of_preamble_rec(opref, ctx, &mut rec)
     }
 
@@ -1672,7 +1673,7 @@ impl Optimizer {
         &mut self,
         opref: OpRef,
         ctx: &mut OptContext,
-        rec: &mut majit_ir::vec_set::VecSet<OpRef>,
+        rec: &mut majit_ir::vec_set::VecSet<crate::r#box::BoxRef>,
     ) -> OpRef {
         let resolved = ctx.get_replacement_opref(opref);
         let resolved_box = ctx.get_box_replacement_box(opref);
@@ -1710,10 +1711,16 @@ impl Optimizer {
                 | crate::optimizeopt::info::PtrInfo::VirtualArray(_)
                 | crate::optimizeopt::info::PtrInfo::VirtualArrayStruct(_)
         ) {
-            if rec.contains(&resolved) {
+            // info.py:231 `rec[self] = None` keys the recursion guard by the
+            // virtual's PtrInfo object identity; in pyre one virtual head box
+            // <-> one PtrInfo, so key by the canonical resolved box.
+            let resolved_box_key = resolved_box
+                .clone()
+                .expect("virtual PtrInfo implies a resolved box");
+            if rec.contains(&resolved_box_key) {
                 return resolved;
             }
-            rec.insert(resolved);
+            rec.insert(resolved_box_key);
             info.force_at_the_end_of_preamble(|child| {
                 self.force_at_the_end_of_preamble_rec(child, ctx, rec)
             });

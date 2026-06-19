@@ -3303,7 +3303,13 @@ impl OptUnroll {
             if field_box.to_opref().is_none() {
                 continue;
             }
-            self.expand_info(field_box.to_opref(), &field_box, ctx, exported_int_bounds, infos);
+            self.expand_info(
+                field_box.to_opref(),
+                &field_box,
+                ctx,
+                exported_int_bounds,
+                infos,
+            );
         }
     }
 
@@ -5958,10 +5964,7 @@ mod tests {
         assert_eq!(state.renamed_inputargs[0].to_opref(), new_ref);
         assert_eq!(state.short_inputargs[0].to_opref(), new_ref);
         assert_eq!(state.runtime_boxes[0].to_opref(), new_ref);
-        assert!(state
-            .exported_infos
-            .keys()
-            .any(|k| k.to_opref() == new_ref));
+        assert!(state.exported_infos.keys().any(|k| k.to_opref() == new_ref));
         assert_eq!(state.exported_short_boxes[0].op.arg(0).to_opref(), new_ref);
         assert_eq!(
             state.exported_short_boxes[0]

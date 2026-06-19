@@ -65,7 +65,11 @@ pub fn serialize_optimizer_knowledge(
         .filter_map(|opt| *opt)
         // #160/S11: liveboxes is box-keyed; resolve each backend position to
         // its canonical box for the membership probe.
-        .filter(|opref| numb_state.liveboxes.contains_key(&env.get_box_replacement_boxref(*opref)))
+        .filter(|opref| {
+            numb_state
+                .liveboxes
+                .contains_key(&env.get_box_replacement_boxref(*opref))
+        })
         .collect();
 
     // bridgeopt.py:74-88: known classes bitfield

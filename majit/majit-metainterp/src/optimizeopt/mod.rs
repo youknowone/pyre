@@ -3695,7 +3695,10 @@ impl OptContext {
         op: OpRef,
         preamble_info_handle: &std::rc::Rc<std::cell::RefCell<PtrInfo>>,
         exported_infos: Option<
-            &crate::optimizeopt::vec_assoc::VecAssoc<crate::r#box::BoxRef, crate::optimizeopt::info::OpInfo>,
+            &crate::optimizeopt::vec_assoc::VecAssoc<
+                crate::r#box::BoxRef,
+                crate::optimizeopt::info::OpInfo,
+            >,
         >,
     ) {
         let op = self.get_replacement_opref(op);
@@ -3970,7 +3973,10 @@ impl OptContext {
         op: OpRef,
         preamble_info: &crate::optimizeopt::info::OpInfo,
         exported_infos: Option<
-            &crate::optimizeopt::vec_assoc::VecAssoc<crate::r#box::BoxRef, crate::optimizeopt::info::OpInfo>,
+            &crate::optimizeopt::vec_assoc::VecAssoc<
+                crate::r#box::BoxRef,
+                crate::optimizeopt::info::OpInfo,
+            >,
         >,
     ) {
         use crate::optimizeopt::info::OpInfo;

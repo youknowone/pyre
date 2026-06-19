@@ -3305,7 +3305,11 @@ impl ResumeDataLoopMemo {
     /// RPython version mutates `boxes` list:
     /// - cached: `boxes[-num - 1] = box`
     /// - new: `boxes.append(box); num = -len(boxes)`
-    pub fn assign_number_to_box(&mut self, b: &crate::r#box::BoxRef, boxes: &mut Vec<OpRef>) -> i32 {
+    pub fn assign_number_to_box(
+        &mut self,
+        b: &crate::r#box::BoxRef,
+        boxes: &mut Vec<OpRef>,
+    ) -> i32 {
         if let Some(&num) = self.cached_boxes.get(b) {
             // resume.py:268: boxes[-num - 1] = box
             let idx = (-num - 1) as usize;
@@ -4073,7 +4077,12 @@ impl ResumeDataLoopMemo {
                     && !virtual_fields.contains_key(&resolved)
                     && (env.is_virtual_ref(resolved) || env.is_virtual_raw(resolved))
                 {
-                    self.register_virtual_box(resolved, env, &numb_state.liveboxes, &mut new_liveboxes);
+                    self.register_virtual_box(
+                        resolved,
+                        env,
+                        &numb_state.liveboxes,
+                        &mut new_liveboxes,
+                    );
                     virtual_worklist.push(resolved);
                 }
             }

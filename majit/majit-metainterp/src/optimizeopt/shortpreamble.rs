@@ -592,7 +592,10 @@ impl ShortBoxes {
     pub fn is_reachable(&self, opref: OpRef) -> bool {
         self.label_args.iter().any(|&a| a == opref)
             || opref.is_constant()
-            || self.potential_ops.iter().any(|(k, _)| k.to_opref() == opref)
+            || self
+                .potential_ops
+                .iter()
+                .any(|(k, _)| k.to_opref() == opref)
     }
 
     pub fn note_known_constant(&mut self, opref: OpRef) {
@@ -763,7 +766,11 @@ impl ShortBoxes {
         if self.known_constants.contains(&opref) {
             return Some(ctx.materialize_box_at(opref));
         }
-        if self.potential_ops.iter().any(|(k, _)| k.to_opref() == opref) {
+        if self
+            .potential_ops
+            .iter()
+            .any(|(k, _)| k.to_opref() == opref)
+        {
             // shortpreamble.py:291-294 `r = self.add_op_to_short(...);
             // return r.preamble_op`. ShortInputArg: res box, see the
             // produced arm above.
@@ -837,7 +844,11 @@ impl ShortBoxes {
         &mut self,
         ctx: &mut crate::optimizeopt::OptContext,
     ) -> Vec<(OpRef, ProducedShortOp)> {
-        let keys: Vec<OpRef> = self.potential_ops.iter().map(|(k, _)| k.to_opref()).collect();
+        let keys: Vec<OpRef> = self
+            .potential_ops
+            .iter()
+            .map(|(k, _)| k.to_opref())
+            .collect();
         for key in keys {
             let _ = self.materialize_one(ctx, key);
         }
@@ -4034,8 +4045,10 @@ mod tests {
         // #146/S8: the builder map keys by the entry res Box; re-key the
         // produced_ops list (keyed by `preamble_op.pos`) to res for new() and
         // look up by the res box of the int_op(10) entry.
-        let entries: Vec<(BoxRef, ProducedShortOp)> =
-            produced.iter().map(|(_, p)| (p.res.clone(), p.clone())).collect();
+        let entries: Vec<(BoxRef, ProducedShortOp)> = produced
+            .iter()
+            .map(|(_, p)| (p.res.clone(), p.clone()))
+            .collect();
         let res10 = produced
             .iter()
             .find(|(r, _)| *r == OpRef::int_op(10))
@@ -4102,8 +4115,10 @@ mod tests {
 
         // #146/S8: re-key the produced_ops list to res for new() + look up the
         // invented-name alias entry by its res box.
-        let entries: Vec<(BoxRef, ProducedShortOp)> =
-            produced.iter().map(|(_, p)| (p.res.clone(), p.clone())).collect();
+        let entries: Vec<(BoxRef, ProducedShortOp)> = produced
+            .iter()
+            .map(|(_, p)| (p.res.clone(), p.clone()))
+            .collect();
         let mut builder = ShortPreambleBuilder::new(
             &[OpRef::int_op(20)],
             &entries,
