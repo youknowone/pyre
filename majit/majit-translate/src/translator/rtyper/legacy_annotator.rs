@@ -379,6 +379,15 @@ fn infer_op_type(kind: &OpKind) -> ValueType {
         // `newtuple` yields a `Ref` to the freshly allocated tuple
         // object (RPython `SomeTuple` lowers to `Ptr<GcStruct>`).
         OpKind::NewTuple { .. } => ValueType::Ref(None),
+        // `LoweredBlackholeOp` is born only in the opname-dispatch spine
+        // (`jtransform_opname::lower_graph`), whose graphs re-enter the
+        // shared tail at `finalize_rewritten_graph_to_jitcode` and never
+        // pass through this legacy annotator.  Its result type is already
+        // fixed by the lowering (`Variable.concretetype`), so the legacy
+        // inference path has nothing to contribute.
+        OpKind::LoweredBlackholeOp { .. } => {
+            unreachable!("LoweredBlackholeOp is opname-spine-only; legacy annotator runs on Spine A")
+        }
         // `LoadStatic` carries the declared `ValueType` of the static
         // directly (extracted from the `syn::Item::Static.ty` at
         // `register::extract_static_decls`).

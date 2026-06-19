@@ -1011,6 +1011,30 @@ pub enum OpKind {
         args: Vec<crate::flowspace::model::Variable>,
     },
 
+    /// A pre-lowered, register-shaped blackhole opcode emitted by the
+    /// opname-dispatch convergence spine (`jit_codewriter::jtransform_opname`).
+    ///
+    /// The rtyper lowers certain helper graphs (the `ll_str*` family) to
+    /// upstream-shaped low-level `SpaceOperation`s whose opnames map 1:1 onto
+    /// a register-only blackhole insn with NO descriptor operand — e.g.
+    /// `strlen` (`r>i`), `strgetitem` (`ri>i`), `strsetitem` (`rii`),
+    /// `newstr` (`i>r`).  Rather than mint a distinct rich `OpKind` per such
+    /// opname (each forcing an arm in every exhaustive `OpKind` match), the
+    /// transducer carries the blackhole `opname` and its operand `Variable`s
+    /// directly here.  The assembler's default `encode_op` arm emits
+    /// `{opname}/{argcodes}`, with operand kinds inferred from each operand's
+    /// register bank and the result kind (if any) appended from `op.result`
+    /// — matching the `bhimpl_<opname>` argcode shape the runtime handler is
+    /// keyed on (`blackhole.rs`).
+    ///
+    /// Only for opnames whose lowering is a single register-shaped insn with
+    /// no descriptor and no special effect classification; descriptor-bearing
+    /// ops (getfield/getarrayitem/…) keep their dedicated rich `OpKind`s.
+    LoweredBlackholeOp {
+        opname: String,
+        args: Vec<crate::flowspace::model::Variable>,
+    },
+
     /// A single-segment path resolving to a crate-local `static`
     /// declaration (typically a SHOUTY_CASE constant like
     /// `GC_WEAKREF_TYPE`, `INT_TYPE`, `MODULE_DICT_TYPE`).

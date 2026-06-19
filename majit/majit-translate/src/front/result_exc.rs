@@ -566,9 +566,10 @@ fn op_operand_vars(kind: &OpKind) -> Vec<Variable> {
             value,
             ..
         } => vec![base.clone(), elem_index.clone(), value.clone()],
-        OpKind::Call { args, .. } | OpKind::JitDebug { args } | OpKind::NewTuple { args } => {
-            args.clone()
-        }
+        OpKind::Call { args, .. }
+        | OpKind::JitDebug { args }
+        | OpKind::NewTuple { args }
+        | OpKind::LoweredBlackholeOp { args, .. } => args.clone(),
         OpKind::GuardTrue { cond } | OpKind::GuardFalse { cond } => vec![cond.clone()],
         OpKind::GuardValue { value, .. }
         | OpKind::AssertGreen { value, .. }

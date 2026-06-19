@@ -4139,6 +4139,10 @@ fn remap_op(
         OpKind::NewTuple { args } => OpKind::NewTuple {
             args: args.iter().map(|a| remap_value(a, aliases)).collect(),
         },
+        OpKind::LoweredBlackholeOp { opname, args } => OpKind::LoweredBlackholeOp {
+            opname: opname.clone(),
+            args: args.iter().map(|a| remap_value(a, aliases)).collect(),
+        },
         OpKind::GuardValue { value, kind_char } => OpKind::GuardValue {
             value: remap_value(value, aliases),
             kind_char: *kind_char,

@@ -418,7 +418,7 @@ fn emit_chars_length_ops(
 /// `SomePtr`-shaped annotation (upstream `lltype.py:1530+`'s
 /// `SomePtr.__init__` rejects bare container types — see
 /// `llannotation.rs:159-167`).
-fn chars_array_ptr_lltype_from_strptr(
+pub(crate) fn chars_array_ptr_lltype_from_strptr(
     ptr_lltype: &LowLevelType,
 ) -> Result<LowLevelType, TyperError> {
     let LowLevelType::Ptr(ptr) = ptr_lltype else {
@@ -463,7 +463,9 @@ fn chars_array_ptr_lltype_from_strptr(
 /// struct lltype (mirrors upstream `cTEMP = inputconst(Void, TEMPBUF)`
 /// at rstr.py:1129 where `TEMPBUF` is the resolved GcStruct itself,
 /// not its Ptr wrapper).
-fn struct_lltype_from_strptr(ptr_lltype: &LowLevelType) -> Result<LowLevelType, TyperError> {
+pub(crate) fn struct_lltype_from_strptr(
+    ptr_lltype: &LowLevelType,
+) -> Result<LowLevelType, TyperError> {
     let LowLevelType::Ptr(ptr) = ptr_lltype else {
         return Err(TyperError::message(format!(
             "struct_lltype_from_strptr expects Ptr(STR/UNICODE), got {ptr_lltype:?}"

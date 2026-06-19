@@ -6880,6 +6880,15 @@ fn op_can_raise(op: &OpKind) -> RaiseClass {
         // RPython `newtuple` is a `PureOperation` (`operation.py:542`);
         // pure tuple construction cannot raise.
         OpKind::NewTuple { .. } => RaiseClass::No,
+        // `LoweredBlackholeOp` carries register-shaped blackhole insns
+        // lowered from the rtyper helper graphs.  String allocation
+        // (`newstr`/`newunicode`) has `canraise = (MemoryError,)`; the
+        // read/write/length insns (`strlen`/`strgetitem`/`strsetitem`/
+        // `unicode*`) cannot raise (LL_OPERATIONS `canraise = ()`).
+        OpKind::LoweredBlackholeOp { opname, .. } => match opname.as_str() {
+            "newstr" | "newunicode" => RaiseClass::MemoryErrorOnly,
+            _ => RaiseClass::No,
+        },
         // `LoadStatic` reads a `static` declaration's address — a
         // compile-time constant.  `LOAD_GLOBAL` analog
         // (`flowspace/flowcontext.py:1098`); cannot raise.

@@ -803,6 +803,10 @@ pub(crate) fn remap_op_kind(
         OpKind::NewTuple { args } => OpKind::NewTuple {
             args: args.iter().map(&remap_var).collect(),
         },
+        OpKind::LoweredBlackholeOp { opname, args } => OpKind::LoweredBlackholeOp {
+            opname: opname.clone(),
+            args: args.iter().map(&remap_var).collect(),
+        },
         OpKind::LoadStatic {
             segments,
             ty,
@@ -841,6 +845,7 @@ pub fn op_variable_refs(kind: &OpKind) -> Vec<crate::flowspace::model::Variable>
             vec![]
         }
         OpKind::NewTuple { args } => args.iter().map(clone_var).collect(),
+        OpKind::LoweredBlackholeOp { args, .. } => args.iter().map(clone_var).collect(),
         OpKind::VableForce { base } => vec![clone_var(base)],
         OpKind::JitMergePoint {
             greens_i,
@@ -1177,6 +1182,12 @@ pub fn is_pure_op(kind: &OpKind) -> bool {
         | OpKind::LoopHeader { .. }
         | OpKind::Live
         | OpKind::VableForce { .. }
+        // `LoweredBlackholeOp` carries register-shaped blackhole insns
+        // (`strlen`/`strgetitem`/`strsetitem`/`newstr`) whose side-effect
+        // class is opname-dependent (the `newstr` malloc + `strsetitem`
+        // store mutate).  Conservatively side-effecting so the dead-op
+        // sweep never drops a store or an allocation.
+        | OpKind::LoweredBlackholeOp { .. }
         | OpKind::Abort { .. } => false,
     }
 }

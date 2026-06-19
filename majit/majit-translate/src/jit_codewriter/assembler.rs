@@ -2336,6 +2336,7 @@ impl Assembler {
                 OpKind::LoopHeader { .. } => "LoopHeader",
                 OpKind::Abort { .. } => "Abort",
                 OpKind::NewTuple { .. } => "NewTuple",
+                OpKind::LoweredBlackholeOp { .. } => "LoweredBlackholeOp",
                 OpKind::LoadStatic { .. } => "LoadStatic",
             }
         }
@@ -3628,6 +3629,13 @@ fn op_kind_to_opname(kind: &crate::model::OpKind) -> String {
         OpKind::RecordQuasiImmutField { .. } => "record_quasiimmut_field".into(),
         OpKind::Abort { .. } => "abort".into(),
         OpKind::NewTuple { .. } => "newtuple".into(),
+        // The opname-dispatch spine lowers the rtyper helper graphs to
+        // register-shaped blackhole insns, carrying the resolved opname
+        // (`strlen`/`strgetitem`/`strsetitem`/`newstr`/…) verbatim.  The
+        // blackhole interpreter resolves the handler by this name, and
+        // `Assembler::get_opnum` assigns its byte dynamically when the
+        // opname has no fixed `insns.rs` slot.
+        OpKind::LoweredBlackholeOp { opname, .. } => opname.clone(),
         // RPython's codewriter never sees a crate-static carrier:
         // LOAD_GLOBAL is resolved to a Constant before JitCode assembly.
         // The flowspace adapter must either fold `LoadStatic` to a
@@ -4443,11 +4451,8 @@ mod tests {
         use crate::translator::rtyper::lltypesystem::rstr::{
             const_str_cache_llstr, ll_strhash_value,
         };
-        let str_const = |s: &[u8]| {
-            ConstValue::LLPtr(Box::new(
-                const_str_cache_llstr(s).expect("cache llstr"),
-            ))
-        };
+        let str_const =
+            |s: &[u8]| ConstValue::LLPtr(Box::new(const_str_cache_llstr(s).expect("cache llstr")));
         let mut asm = Assembler::new();
         let mut state = empty_state();
 
