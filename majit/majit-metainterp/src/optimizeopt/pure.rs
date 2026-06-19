@@ -1297,10 +1297,10 @@ impl Optimization for OptPure {
     fn produce_potential_short_preamble_ops(
         &self,
         sb: &mut crate::optimizeopt::shortpreamble::ShortBoxes,
-        _ctx: &mut OptContext,
+        ctx: &mut OptContext,
     ) {
         for op in &self.short_preamble_pure_ops {
-            sb.add_pure_op(op.clone());
+            sb.add_pure_op(ctx, op.clone());
         }
     }
 }

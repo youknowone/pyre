@@ -405,7 +405,7 @@ impl CachedField {
             let mut op =
                 Op::with_descr(opcode, &[ctx.materialize_box_at(structbox)], descr.clone());
             op.pos.set(cached_val);
-            sb.add_heap_op(op);
+            sb.add_heap_op(ctx, op);
         }
     }
 }
@@ -654,7 +654,7 @@ impl ArrayCachedItem {
             let idx_b = ctx.materialize_box_at(idx_ref);
             let mut op = Op::with_descr(opcode, &[arraybox_b, idx_b], descr.clone());
             op.pos.set(cached_val);
-            sb.add_heap_op(op);
+            sb.add_heap_op(ctx, op);
         }
     }
 }
