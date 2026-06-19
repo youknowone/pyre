@@ -128,18 +128,22 @@ pub fn trace_bytecode(
         dump_perfn_jitcode_for_trace(w_code, start_pc);
     }
     let cf_addr = &*concrete_frame as *const pyre_interpreter::pyframe::PyFrame as usize;
-    // pyjitpl.py:65 MIFrame.__init__: sym fields populated once at frame
-    // construction. Callee (inline) frames are set up by perform_call
-    // (trace_opcode.rs:3323-3424) and don't call init_symbolic; this path
-    // handles the root frame push.
-    sym.init_symbolic(ctx, cf_addr);
     // The snapshot stands in for concrete stepping only; vable-statics
     // capture must read pointer-valued fields (`debugdata` / `lastblock`)
     // from the live frame the compiled loop will run on.  See the
     // `live_vable_frame_addr` field doc (state.rs).  Set before the
     // full-body-walk leg below so the walker path (the production tracer
     // post-#73) sees it as well as the trait `interpret()` leg.
+    //
+    // gap 10 slice 2b: set this BEFORE `init_symbolic` so the root vable
+    // identity (seed_virtualizable_boxes) is baked against the live frame
+    // address, not the discarded snapshot's.
     sym.live_vable_frame_addr = live_frame_addr;
+    // pyjitpl.py:65 MIFrame.__init__: sym fields populated once at frame
+    // construction. Callee (inline) frames are set up by perform_call
+    // (trace_opcode.rs:3323-3424) and don't call init_symbolic; this path
+    // handles the root frame push.
+    sym.init_symbolic(ctx, cf_addr);
     // Issue #73 walker-as-tracer foundation probe (slice #1, gated).
     // `PYRE_WALK_PERFN_JITCODE=1` attempts to walk the per-CodeObject
     // JitCode body via `dispatch_via_miframe` from the resume entry pc,

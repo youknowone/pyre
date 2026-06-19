@@ -4350,9 +4350,23 @@ impl PyreSym {
                 while values.len() < num_vable_scalars + array_len {
                     values.push(majit_ir::Value::Ref(majit_ir::GcRef::NULL));
                 }
+                // gap 10 slice 2b: bake the virtualizable identity against the
+                // LIVE interpreter frame (the frame the compiled loop runs on),
+                // not the discarded `snapshot_for_tracing` copy.  At root entry
+                // the snapshot is a fresh copy so its field VALUES equal the
+                // live frame's (read_all_boxes above); only the identity ADDRESS
+                // must be the live one, matching the SYM_FRAME_IDX input arg's
+                // runtime value (the live frame supplied by extract_live_values).
+                // Falls back to the snapshot address when no live frame was
+                // threaded (unit-test / init-before-run path).
+                let vable_identity_addr = if self.live_vable_frame_addr != 0 {
+                    self.live_vable_frame_addr
+                } else {
+                    concrete_frame
+                };
                 (
                     values,
-                    majit_ir::Value::Ref(majit_ir::GcRef(concrete_frame)),
+                    majit_ir::Value::Ref(majit_ir::GcRef(vable_identity_addr)),
                 )
             } else {
                 (Vec::new(), majit_ir::Value::Void)
