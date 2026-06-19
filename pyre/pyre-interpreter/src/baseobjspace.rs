@@ -261,6 +261,60 @@ fn exc_blocking_written(obj: PyObjectRef) -> bool {
     unsafe { isinstance_w(obj, blocking) }
 }
 
+/// `interp_exceptions.py:1357-1424 W_SyntaxError.descr_init` parses the
+/// constructor arguments into `msg` (`args_w[0]`) and, when a second
+/// argument is supplied, a `(filename, lineno, offset, text[, end_lineno,
+/// end_offset])` details tuple, exposing each piece as a
+/// `readwrite_attrproperty_w` slot whose class default is `None`.  Pyre
+/// keeps no dedicated SyntaxError slots, so an explicit `e.lineno = ...`
+/// write lands in the hasdict instance dict: read it first so the write
+/// wins, then derive the construct-time value from `args_w`, and finally
+/// fall back to the `None` class default.
+fn syntax_error_attr(obj: PyObjectRef, name: &str) -> PyObjectRef {
+    let w_dict = getdict_backing(obj);
+    if !w_dict.is_null() {
+        if let Some(v) = unsafe { pyre_object::w_dict_getitem_str(w_dict, name) } {
+            return v;
+        }
+    }
+    let args = unsafe { pyre_object::excobject::w_exception_get_args(obj) };
+    let n = unsafe { pyre_object::w_tuple_len(args) };
+    if name == "msg" {
+        if n >= 1 {
+            if let Some(v) = unsafe { pyre_object::w_tuple_getitem(args, 0) } {
+                return v;
+            }
+        }
+        return w_none();
+    }
+    // `print_file_and_line` is a vestigial slot with no derivation.
+    if name == "print_file_and_line" {
+        return w_none();
+    }
+    // The location attributes derive from the `args_w[1]` details tuple.
+    if n == 2 {
+        if let Some(details) = unsafe { pyre_object::w_tuple_getitem(args, 1) } {
+            if unsafe { pyre_object::is_tuple(details) } {
+                let dn = unsafe { pyre_object::w_tuple_len(details) };
+                let idx: usize = match name {
+                    "filename" => 0,
+                    "lineno" => 1,
+                    "offset" => 2,
+                    "text" => 3,
+                    "end_lineno" => 4,
+                    _ => 5, // "end_offset"
+                };
+                if idx < dn {
+                    if let Some(v) = unsafe { pyre_object::w_tuple_getitem(details, idx as i64) } {
+                        return v;
+                    }
+                }
+            }
+        }
+    }
+    w_none()
+}
+
 /// pypy/interpreter/baseobjspace.py:1370-1371 `exception_issubclass_w`.
 ///
 ///   def exception_issubclass_w(self, w_cls1, w_cls2):
@@ -4192,6 +4246,11 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
                     }
                     return Ok(w_none());
                 }
+                // `W_SyntaxError` also exposes `filename`, derived from its
+                // `(filename, lineno, ...)` details tuple (`filename2` is OSError-only).
+                if kind == pyre_object::excobject::ExcKind::SyntaxError && name == "filename" {
+                    return Ok(syntax_error_attr(obj, name));
+                }
             }
             // `interp_exceptions.py:704-707 descr_get_written` — a
             // `BlockingIOError` constructed with a numeric third argument keeps
@@ -4226,6 +4285,10 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
                         return Ok(stored);
                     }
                     return Ok(w_none());
+                }
+                // `W_SyntaxError.msg` — the first constructor argument.
+                if kind == pyre_object::excobject::ExcKind::SyntaxError && name == "msg" {
+                    return Ok(syntax_error_attr(obj, name));
                 }
             }
             // Shared `name` attribute for the kinds that expose it —
@@ -4338,6 +4401,17 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
                 ) {
                     let stored = unsafe { pyre_object::excobject::w_exception_get_encoding(obj) };
                     return Ok(if stored.is_null() { w_none() } else { stored });
+                }
+            }
+            // `W_SyntaxError` location attributes, derived from the
+            // `(filename, lineno, offset, text[, end_lineno, end_offset])`
+            // details tuple; `print_file_and_line` is a vestigial slot.
+            // `filename` / `msg` are handled by the shared arms above.
+            "lineno" | "offset" | "text" | "end_lineno" | "end_offset"
+            | "print_file_and_line" => {
+                let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
+                if kind == pyre_object::excobject::ExcKind::SyntaxError {
+                    return Ok(syntax_error_attr(obj, name));
                 }
             }
             _ => {}

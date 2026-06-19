@@ -64,6 +64,9 @@ pub static EXC_LOOKUP_ERROR_TYPE: PyType = crate::pyobject::new_pytype("LookupEr
 /// W_UnicodeError = _new_exception('UnicodeError', W_ValueError, ...)`
 /// — intermediate parent for UnicodeDecodeError and UnicodeEncodeError.
 pub static EXC_UNICODE_ERROR_TYPE: PyType = crate::pyobject::new_pytype("UnicodeError");
+/// `pypy/module/exceptions/interp_exceptions.py W_SyntaxError` — subclass
+/// of Exception raised by `compile`/`exec`/`eval`/`ast.parse`.
+pub static EXC_SYNTAX_ERROR_TYPE: PyType = crate::pyobject::new_pytype("SyntaxError");
 
 /// Per-`ExcKind` `ob_type` resolver. `w_exception_new` writes the
 /// returned pointer into the allocated `W_ExceptionObject` so the
@@ -102,6 +105,7 @@ pub fn exc_kind_to_pytype(kind: ExcKind) -> &'static PyType {
         ExcKind::LookupError => &EXC_LOOKUP_ERROR_TYPE,
         ExcKind::UnicodeError => &EXC_UNICODE_ERROR_TYPE,
         ExcKind::UnicodeTranslateError => &EXC_UNICODE_TRANSLATE_ERROR_TYPE,
+        ExcKind::SyntaxError => &EXC_SYNTAX_ERROR_TYPE,
     }
 }
 
@@ -184,6 +188,14 @@ pub enum ExcKind {
     /// Subclass of ImportError raised when a module cannot be found.
     /// Identity-only like ImportError (no flattened per-class fields).
     ModuleNotFoundError = 29,
+    /// `pypy/module/exceptions/interp_exceptions.py W_SyntaxError` —
+    /// raised by `compile` / `exec` / `eval` / `ast.parse` on malformed
+    /// source.  Identity-only port: a dedicated kind so `ob_type` and
+    /// `isinstance(e, SyntaxError)` discriminate it; the
+    /// `(msg, (filename, lineno, offset, text))` `__init__` and the
+    /// flattened `msg`/`filename`/`lineno`/`offset`/`text` slots remain
+    /// TODO (the generic `args_w` constructor is used for now).
+    SyntaxError = 30,
 }
 
 impl ExcKind {
@@ -549,7 +561,7 @@ pub fn w_exception_new_empty(kind: ExcKind) -> PyObjectRef {
 /// arrays against the same authoritative bound.  Anchored on the
 /// highest-numbered variant so adding new ExcKinds at the end of the
 /// enum extends the bound automatically.
-pub const EXC_KIND_COUNT: usize = (ExcKind::ModuleNotFoundError as u8 as usize) + 1;
+pub const EXC_KIND_COUNT: usize = (ExcKind::SyntaxError as u8 as usize) + 1;
 
 thread_local! {
     static EXC_CLASS_BY_KIND: std::cell::Cell<[PyObjectRef; EXC_KIND_COUNT]> =
@@ -1263,6 +1275,7 @@ pub fn exc_kind_name(kind: ExcKind) -> &'static str {
         ExcKind::LookupError => "LookupError",
         ExcKind::UnicodeError => "UnicodeError",
         ExcKind::UnicodeTranslateError => "UnicodeTranslateError",
+        ExcKind::SyntaxError => "SyntaxError",
     }
 }
 
@@ -1376,6 +1389,7 @@ pub fn exc_kind_from_name(name: &str) -> Option<ExcKind> {
         "LookupError" => Some(ExcKind::LookupError),
         "UnicodeError" => Some(ExcKind::UnicodeError),
         "UnicodeTranslateError" => Some(ExcKind::UnicodeTranslateError),
+        "SyntaxError" => Some(ExcKind::SyntaxError),
         _ => None,
     }
 }

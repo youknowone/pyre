@@ -911,14 +911,14 @@ pub fn install_default_builtins(namespace: &mut DictStorage) {
         "EOFError",
         make_exc_type("EOFError", exc_exception_new, exception),
     );
-    let syntax_error = make_exc_type("SyntaxError", exc_exception_new, exception);
+    let syntax_error = make_exc_type("SyntaxError", exc_syntax_error_new, exception);
     crate::dict_storage_store(namespace, "SyntaxError", syntax_error);
-    let indentation_error = make_exc_type("IndentationError", exc_exception_new, syntax_error);
+    let indentation_error = make_exc_type("IndentationError", exc_syntax_error_new, syntax_error);
     crate::dict_storage_store(namespace, "IndentationError", indentation_error);
     crate::dict_storage_store(
         namespace,
         "TabError",
-        make_exc_type("TabError", exc_exception_new, indentation_error),
+        make_exc_type("TabError", exc_syntax_error_new, indentation_error),
     );
     crate::dict_storage_store(
         namespace,
@@ -1995,6 +1995,10 @@ exc_constructor!(
     exc_system_error,
     pyre_object::excobject::ExcKind::SystemError
 );
+exc_constructor!(
+    exc_syntax_error,
+    pyre_object::excobject::ExcKind::SyntaxError
+);
 
 /// `interp_exceptions.py:121-124 W_BaseException.descr_init` — store the
 /// constructor positional arguments on `self.args_w`.  Installed as
@@ -2901,6 +2905,7 @@ exc_new_wrapper!(exc_recursion_error_new, exc_recursion_error);
 exc_new_wrapper!(exc_memory_error_new, exc_memory_error);
 exc_new_wrapper!(exc_reference_error_new, exc_reference_error);
 exc_new_wrapper!(exc_system_error_new, exc_system_error);
+exc_new_wrapper!(exc_syntax_error_new, exc_syntax_error);
 
 /// Build a builtin exception type with the given name, base, and __new__ wrapper.
 pub(crate) fn make_exc_type(
@@ -3971,6 +3976,16 @@ fn builtin_callable(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
 /// Compiles a Python string to a code object. Only `source`, `filename` and
 /// `mode` are honoured; flags / dont_inherit / optimize are accepted but
 /// ignored, matching the minimal stub PyPy uses for shim modules.
+/// Map a compiler failure string to a Python `SyntaxError`, matching
+/// CPython where `compile`/`exec`/`eval`/`ast.parse` raise `SyntaxError`
+/// (not `ValueError`) for malformed source.  The `compile error: ` prefix
+/// `compile_source` prepends is stripped so the message reads like
+/// CPython's (`'yield' outside function`).
+fn compile_err_to_syntax_error(e: String) -> crate::PyError {
+    let msg = e.strip_prefix("compile error: ").unwrap_or(&e).to_string();
+    crate::PyError::syntax_error(msg)
+}
+
 fn builtin_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if args.len() < 3 {
         return Err(crate::PyError::type_error(
@@ -4017,7 +4032,7 @@ fn builtin_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
         }
     };
     let code = crate::compile::compile_source_with_filename(&source_str, mode, &filename)
-        .map_err(|e| crate::PyError::new(crate::PyErrorKind::ValueError, e))?;
+        .map_err(compile_err_to_syntax_error)?;
     let code_ptr = Box::into_raw(Box::new(code)) as *const ();
     Ok(crate::w_code_new(code_ptr))
 }
@@ -4068,7 +4083,7 @@ fn exec_or_eval(
                 crate::compile::Mode::Exec
             };
             let code = crate::compile::compile_source(&s, mode)
-                .map_err(|e| crate::PyError::new(crate::PyErrorKind::ValueError, e))?;
+                .map_err(compile_err_to_syntax_error)?;
             let code_ptr = Box::into_raw(Box::new(code)) as *const ();
             crate::w_code_new(code_ptr)
         } else if !source.is_null() && crate::is_code(source) {

@@ -422,6 +422,11 @@ pub enum PyErrorKind {
     /// 5-arg `(object, start, end, reason)` `__init__` and custom
     /// `__str__` are TODO.
     UnicodeTranslateError,
+    /// `pypy/module/exceptions/interp_exceptions.py W_SyntaxError` —
+    /// raised by `compile`/`exec`/`eval`/`ast.parse` on malformed source.
+    /// Identity-only port (dedicated PyErrorKind / ExcKind / PyType); the
+    /// `msg`/`filename`/`lineno`/`offset`/`text` slots are TODO.
+    SyntaxError,
 }
 
 impl PyError {
@@ -462,6 +467,10 @@ impl PyError {
 
     pub fn value_error(msg: impl Into<String>) -> Self {
         Self::new(PyErrorKind::ValueError, msg)
+    }
+
+    pub fn syntax_error(msg: impl Into<String>) -> Self {
+        Self::new(PyErrorKind::SyntaxError, msg)
     }
 
     pub fn zero_division(msg: impl Into<String>) -> Self {
@@ -683,6 +692,7 @@ impl PyError {
             PyErrorKind::UnicodeDecodeError => ExcKind::UnicodeDecodeError,
             PyErrorKind::UnicodeEncodeError => ExcKind::UnicodeEncodeError,
             PyErrorKind::UnicodeTranslateError => ExcKind::UnicodeTranslateError,
+            PyErrorKind::SyntaxError => ExcKind::SyntaxError,
         }
     }
 
@@ -751,6 +761,7 @@ impl PyError {
             // W_LookupError = _new_exception('LookupError', W_Exception,
             // ...) — intermediate parent of IndexError / KeyError.
             ExcKind::LookupError => PyErrorKind::LookupError,
+            ExcKind::SyntaxError => PyErrorKind::SyntaxError,
         }
     }
 

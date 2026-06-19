@@ -440,6 +440,12 @@ pub fn all_foreign_pytypes() -> &'static [(&'static PyType, &'static PyType)] {
             &crate::excobject::EXC_VALUE_ERROR_TYPE,
             &crate::excobject::EXC_EXCEPTION_TYPE,
         ),
+        // `W_SyntaxError` — direct subclass of Exception
+        // (`compile`/`exec`/`eval`/`ast.parse` raise it).
+        (
+            &crate::excobject::EXC_SYNTAX_ERROR_TYPE,
+            &crate::excobject::EXC_EXCEPTION_TYPE,
+        ),
         // UnicodeError is the intermediate parent of UnicodeDecodeError
         // and UnicodeEncodeError per `pypy/module/exceptions/
         // interp_exceptions.py:418 W_UnicodeError = _new_exception(
