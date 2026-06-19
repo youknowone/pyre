@@ -122,7 +122,9 @@ mod imp {
         match i.cmp(&-1) {
             Ordering::Greater => u32::try_from(i)
                 .map_err(|_| PyError::overflow_error(format!("{name} is larger than maximum"))),
-            Ordering::Less => Err(PyError::overflow_error(format!("{name} is less than minimum"))),
+            Ordering::Less => Err(PyError::overflow_error(format!(
+                "{name} is less than minimum"
+            ))),
             Ordering::Equal => Ok(-1i32 as u32),
         }
     }
@@ -305,7 +307,9 @@ mod imp {
         };
 
         let argv = args_list.iter().collect::<CharPtrVec<'_>>();
-        let envp = env_list.as_ref().map(|e| e.iter().collect::<CharPtrVec<'_>>());
+        let envp = env_list
+            .as_ref()
+            .map(|e| e.iter().collect::<CharPtrVec<'_>>());
 
         let decoded = Decoded {
             exec_list: &exec_list,

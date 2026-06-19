@@ -4082,8 +4082,8 @@ fn exec_or_eval(
             } else {
                 crate::compile::Mode::Exec
             };
-            let code = crate::compile::compile_source(&s, mode)
-                .map_err(compile_err_to_syntax_error)?;
+            let code =
+                crate::compile::compile_source(&s, mode).map_err(compile_err_to_syntax_error)?;
             let code_ptr = Box::into_raw(Box::new(code)) as *const ();
             crate::w_code_new(code_ptr)
         } else if !source.is_null() && crate::is_code(source) {
@@ -6032,7 +6032,9 @@ fn init_file_wrapper_type(ns: &mut DictStorage) {
             "fileno",
             |args| match args.first().copied().and_then(file_get_fd) {
                 Some(fd) => Ok(w_int_new(fd as i64)),
-                None => Err(crate::PyError::os_error("fileno() on a file without a descriptor")),
+                None => Err(crate::PyError::os_error(
+                    "fileno() on a file without a descriptor",
+                )),
             },
             1,
         ),
@@ -6063,7 +6065,10 @@ fn init_file_wrapper_type(ns: &mut DictStorage) {
                     .map(|m| unsafe { pyre_object::w_str_get_value(m).to_string() })
                     .unwrap_or_default();
                 Ok(w_bool_from(
-                    mode.contains('w') || mode.contains('a') || mode.contains('x') || mode.contains('+'),
+                    mode.contains('w')
+                        || mode.contains('a')
+                        || mode.contains('x')
+                        || mode.contains('+'),
                 ))
             },
             1,
@@ -6346,9 +6351,7 @@ fn file_method_write(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
         };
         #[cfg(feature = "host_env")]
         {
-            let n = unsafe {
-                libc::write(fd, bytes.as_ptr() as *const libc::c_void, bytes.len())
-            };
+            let n = unsafe { libc::write(fd, bytes.as_ptr() as *const libc::c_void, bytes.len()) };
             if n < 0 {
                 return Err(fd_io_err(std::io::Error::last_os_error()));
             }
@@ -6694,7 +6697,11 @@ pub fn text_io_wrapper_type() -> PyObjectRef {
 }
 
 fn init_text_io_wrapper_type(ns: &mut DictStorage) {
-    crate::dict_storage_store(ns, "read", make_builtin_function("read", textio_method_read));
+    crate::dict_storage_store(
+        ns,
+        "read",
+        make_builtin_function("read", textio_method_read),
+    );
     crate::dict_storage_store(
         ns,
         "readline",

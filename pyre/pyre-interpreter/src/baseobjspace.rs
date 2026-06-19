@@ -4412,8 +4412,7 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
             // `(filename, lineno, offset, text[, end_lineno, end_offset])`
             // details tuple; `print_file_and_line` is a vestigial slot.
             // `filename` / `msg` are handled by the shared arms above.
-            "lineno" | "offset" | "text" | "end_lineno" | "end_offset"
-            | "print_file_and_line" => {
+            "lineno" | "offset" | "text" | "end_lineno" | "end_offset" | "print_file_and_line" => {
                 let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
                 if kind == pyre_object::excobject::ExcKind::SyntaxError {
                     return Ok(syntax_error_attr(obj, name));

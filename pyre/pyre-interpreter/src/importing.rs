@@ -979,9 +979,7 @@ fn load_source_module(
     // On exec failure drop the pre-registered module from sys.modules
     // (`_bootstrap._load`) so a retried import re-runs the body instead of
     // observing a half-built module.
-    if let Err(e) =
-        exec_code_module(code, ns_ptr, execution_context, Some(&pathname_str), None)
-    {
+    if let Err(e) = exec_code_module(code, ns_ptr, execution_context, Some(&pathname_str), None) {
         remove_sys_module(modulename);
         return Err(e);
     }

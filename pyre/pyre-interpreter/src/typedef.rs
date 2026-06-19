@@ -5892,7 +5892,10 @@ fn init_code_type(ns: &mut DictStorage) {
                     .collect()
             };
             let n = rows.len();
-            Ok(pyre_object::w_seq_iter_new(pyre_object::w_list_new(rows), n))
+            Ok(pyre_object::w_seq_iter_new(
+                pyre_object::w_list_new(rows),
+                n,
+            ))
         }),
     );
 }
@@ -10352,15 +10355,15 @@ pub(crate) fn bytes_method_decode(args: &[PyObjectRef]) -> Result<PyObjectRef, c
         }
     }
     let encoding = match w_encoding {
-        Some(e) if unsafe { pyre_object::is_str(e) } => {
-            unsafe { pyre_object::w_str_get_value(e).to_string() }
-        }
+        Some(e) if unsafe { pyre_object::is_str(e) } => unsafe {
+            pyre_object::w_str_get_value(e).to_string()
+        },
         _ => "utf-8".to_string(),
     };
     let errors = match w_errors {
-        Some(e) if unsafe { pyre_object::is_str(e) } => {
-            unsafe { pyre_object::w_str_get_value(e).to_string() }
-        }
+        Some(e) if unsafe { pyre_object::is_str(e) } => unsafe {
+            pyre_object::w_str_get_value(e).to_string()
+        },
         _ => "strict".to_string(),
     };
     let err_mode = errors.as_str();
