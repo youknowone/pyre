@@ -1614,6 +1614,34 @@ pub(crate) fn check_surrogate(w_name: PyObjectRef) -> Result<(), crate::PyError>
     Ok(())
 }
 
+/// `type_new_staticmethod` / `type_new_classmethod` (Objects/typeobject.c):
+/// a class body's plain-function `__new__` becomes a `staticmethod` and
+/// `__init_subclass__` / `__class_getitem__` become `classmethod`s, so that
+/// `cls.__dict__['__new__'].__func__` resolves and the descriptors bind with
+/// the right implicit first argument.
+pub(crate) fn type_new_wrap_special_methods(ns: &mut crate::DictStorage) {
+    if let Some(f) = ns.get("__new__").copied() {
+        if unsafe { crate::function::is_function(f) }
+            && !unsafe { pyre_object::propertyobject::is_staticmethod(f) }
+        {
+            crate::dict_storage_store(
+                ns,
+                "__new__",
+                pyre_object::propertyobject::w_staticmethod_new(f),
+            );
+        }
+    }
+    for name in ["__init_subclass__", "__class_getitem__"] {
+        if let Some(f) = ns.get(name).copied() {
+            if unsafe { crate::function::is_function(f) }
+                && !unsafe { pyre_object::propertyobject::is_classmethod(f) }
+            {
+                crate::dict_storage_store(ns, name, pyre_object::propertyobject::w_classmethod_new(f));
+            }
+        }
+    }
+}
+
 fn type_descr_new_with_metaclass(
     args: &[PyObjectRef],
     w_metaclass: PyObjectRef,
@@ -1706,6 +1734,7 @@ fn type_descr_new_with_metaclass(
             }
         }
         let ns_ptr = Box::into_raw(class_ns);
+        unsafe { type_new_wrap_special_methods(&mut *ns_ptr) };
 
         // Default bases to (object,) if empty
         let w_effective_bases =
@@ -1734,6 +1763,15 @@ fn type_descr_new_with_metaclass(
             if let Some(w_metaclass_new) =
                 unsafe { crate::baseobjspace::lookup_in_type(w_winner, "__new__") }
             {
+                // `__new__` is stored as a staticmethod; unwrap before the
+                // direct delegation call.
+                let w_metaclass_new = unsafe {
+                    if pyre_object::propertyobject::is_staticmethod(w_metaclass_new) {
+                        pyre_object::propertyobject::w_staticmethod_get_func(w_metaclass_new)
+                    } else {
+                        w_metaclass_new
+                    }
+                };
                 let mut new_args = vec![w_winner, name_obj, bases, w_namespace_dict];
                 if args.len() > 3 {
                     new_args.extend_from_slice(&args[3..]);
@@ -3774,9 +3812,15 @@ pub(crate) fn builtin_dict_ctor(args: &[PyObjectRef]) -> Result<PyObjectRef, cra
     let src = args[0];
     unsafe {
         if is_dict(src) {
-            // PyPy: descr_init → shallow copy when first arg is a dict
+            // PyPy: descr_init → shallow copy when first arg is a dict.
+            // `dict(**kwargs)` reaches here with the `__pyre_kw__`-tagged
+            // kwargs vehicle as the source; the marker is an interp-level
+            // sentinel, never a real key, so drop it during the copy.
             let dict = w_dict_new();
             for (k, v) in pyre_object::w_dict_items(src) {
+                if is_str(k) && pyre_object::w_str_get_wtf8(k).as_str() == Ok("__pyre_kw__") {
+                    continue;
+                }
                 w_dict_store(dict, k, v);
             }
             return Ok(dict);
@@ -3961,15 +4005,20 @@ fn builtin_next(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 /// `callable(obj)` — PyPy: baseobjspace.py callable
 fn builtin_callable(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let obj = args[0];
+    // `PyCallable_Check` — true when `type(obj)` has `tp_call`.  The builtin
+    // callable kinds (function / builtin function, bound method, static- and
+    // classmethod, type) are dispatched through dedicated slots in `call.rs`
+    // rather than a `__call__` dict entry, so each is recognised directly;
+    // any other object is callable iff its type defines `__call__`.
     let is_callable = unsafe {
         crate::is_function(obj)
             || pyre_object::is_type(obj)
-            || (pyre_object::is_instance(obj)
-                && crate::baseobjspace::lookup_in_type(
-                    pyre_object::w_instance_get_type(obj),
-                    "__call__",
-                )
-                .is_some())
+            || pyre_object::is_method(obj)
+            || pyre_object::propertyobject::is_staticmethod(obj)
+            || pyre_object::propertyobject::is_classmethod(obj)
+            || crate::typedef::r#type(obj)
+                .and_then(|t| crate::baseobjspace::lookup_in_type(t, "__call__"))
+                .is_some()
     };
     Ok(w_bool_from(is_callable))
 }
@@ -5732,7 +5781,7 @@ fn init_file_wrapper_type(ns: &mut DictStorage) {
     crate::dict_storage_store(
         ns,
         "flush",
-        make_builtin_function_with_arity("flush", file_method_close, 1),
+        make_builtin_function_with_arity("flush", file_method_flush, 1),
     );
     crate::dict_storage_store(
         ns,
@@ -6015,6 +6064,16 @@ fn file_method_readline(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
     if args.is_empty() {
         return Err(crate::PyError::type_error("readline() requires self"));
     }
+    // Optional size cap (`readline(size)`): stop after `size` bytes even
+    // before a newline. A missing or negative size means no cap.
+    let max = args.get(1).and_then(|&o| unsafe {
+        if pyre_object::is_int(o) {
+            let v = pyre_object::w_int_get_value(o);
+            if v < 0 { None } else { Some(v as usize) }
+        } else {
+            None
+        }
+    });
     if let Some(fd) = file_get_fd(args[0]) {
         #[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
         {
@@ -6023,6 +6082,9 @@ fn file_method_readline(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
             let mut out = Vec::new();
             let mut byte = [0u8; 1];
             loop {
+                if max == Some(out.len()) {
+                    break;
+                }
                 let got = fd_read_into(fd, &mut byte).map_err(fd_io_err)?;
                 if got == 0 {
                     break;
@@ -6049,11 +6111,14 @@ fn file_method_readline(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
         return Ok(fd_bytes_to_obj(args[0], Vec::new()));
     }
     let rest = &bytes[pos..];
-    let end = rest
+    let mut end = rest
         .iter()
         .position(|&b| b == b'\n')
         .map(|i| i + 1)
         .unwrap_or(rest.len());
+    if let Some(m) = max {
+        end = end.min(m);
+    }
     let line = rest[..end].to_vec();
     file_set_pos(args[0], pos + end);
     Ok(fd_bytes_to_obj(args[0], line))
@@ -6156,37 +6221,58 @@ fn file_method_close(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
     }
     // If the file was opened in a writable mode, flush the in-memory
     // buffer to disk.
-    let dirty = crate::baseobjspace::getattr_str(args[0], "__file_dirty__")
+    file_flush_dirty(args[0])?;
+    Ok(w_none())
+}
+
+/// Write a writable file's dirty in-memory buffer out to disk, leaving the
+/// object open. Shared by `close` and `flush`.
+fn file_flush_dirty(obj: PyObjectRef) -> Result<(), crate::PyError> {
+    let dirty = crate::baseobjspace::getattr_str(obj, "__file_dirty__")
         .ok()
         .map(|v| unsafe { pyre_object::is_bool(v) && pyre_object::w_bool_get_value(v) })
         .unwrap_or(false);
-    if dirty {
-        if let (Ok(name), Ok(mode)) = (
-            crate::baseobjspace::getattr_str(args[0], "__file_name__"),
-            crate::baseobjspace::getattr_str(args[0], "__file_mode__"),
-        ) {
-            let name_s = unsafe { pyre_object::w_str_get_value(name).to_string() };
-            let mode_s = unsafe { pyre_object::w_str_get_value(mode).to_string() };
-            let data = file_get_data(args[0]);
-            let append = mode_s.contains('a');
-            let write_res = if append {
-                std::fs::OpenOptions::new()
-                    .append(true)
-                    .create(true)
-                    .open(&name_s)
-                    .and_then(|mut f| std::io::Write::write_all(&mut f, data.as_bytes()))
-            } else {
-                std::fs::write(&name_s, data.as_bytes())
-            };
-            if let Err(e) = write_res {
-                return Err(crate::PyError::os_error_with_errno(
-                    e.raw_os_error().unwrap_or(5),
-                    format!("{e}: '{name_s}'"),
-                ));
-            }
-            let _ = crate::baseobjspace::setattr_str(args[0], "__file_dirty__", w_bool_from(false));
-        }
+    if !dirty {
+        return Ok(());
     }
+    if let (Ok(name), Ok(mode)) = (
+        crate::baseobjspace::getattr_str(obj, "__file_name__"),
+        crate::baseobjspace::getattr_str(obj, "__file_mode__"),
+    ) {
+        let name_s = unsafe { pyre_object::w_str_get_value(name).to_string() };
+        let mode_s = unsafe { pyre_object::w_str_get_value(mode).to_string() };
+        let data = file_get_data(obj);
+        let append = mode_s.contains('a');
+        let write_res = if append {
+            std::fs::OpenOptions::new()
+                .append(true)
+                .create(true)
+                .open(&name_s)
+                .and_then(|mut f| std::io::Write::write_all(&mut f, data.as_bytes()))
+        } else {
+            std::fs::write(&name_s, data.as_bytes())
+        };
+        if let Err(e) = write_res {
+            return Err(crate::PyError::os_error_with_errno(
+                e.raw_os_error().unwrap_or(5),
+                format!("{e}: '{name_s}'"),
+            ));
+        }
+        let _ = crate::baseobjspace::setattr_str(obj, "__file_dirty__", w_bool_from(false));
+    }
+    Ok(())
+}
+
+/// `flush()` — push any buffered writes to disk without closing. For
+/// fd-backed objects writes go straight through, so this is a no-op.
+fn file_method_flush(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    if args.is_empty() {
+        return Ok(w_none());
+    }
+    if file_get_fd(args[0]).is_some() {
+        return Ok(w_none());
+    }
+    file_flush_dirty(args[0])?;
     Ok(w_none())
 }
 
@@ -6337,19 +6423,47 @@ fn textio_call_buffer(
     Ok(r)
 }
 
-/// Decode raw bytes (or pass through str) and apply universal-newline
+/// Read the wrapper's stored `encoding` / `errors` (set at construction),
+/// defaulting to UTF-8 / strict.
+fn textio_enc_err(self_obj: PyObjectRef) -> (String, String) {
+    let read = |name: &str, default: &str| {
+        crate::baseobjspace::getattr_str(self_obj, name)
+            .ok()
+            .and_then(|o| unsafe {
+                if pyre_object::is_str(o) {
+                    Some(pyre_object::w_str_get_value(o).to_string())
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_else(|| default.to_string())
+    };
+    (read("encoding", "utf-8"), read("errors", "strict"))
+}
+
+/// Decode raw bytes through the wrapper's codec (honoring `encoding` /
+/// `errors`), or pass a str through, then apply universal-newline
 /// translation (`\r\n`/`\r` → `\n`).
-fn textio_decode(obj: PyObjectRef) -> String {
+fn textio_decode(
+    obj: PyObjectRef,
+    encoding: &str,
+    errors: &str,
+) -> Result<String, crate::PyError> {
     let s = unsafe {
         if pyre_object::bytesobject::is_bytes_like(obj) {
-            String::from_utf8_lossy(pyre_object::bytesobject::bytes_like_data(obj)).into_owned()
+            let decoded = crate::typedef::bytes_method_decode(&[
+                obj,
+                w_str_new(encoding),
+                w_str_new(errors),
+            ])?;
+            pyre_object::w_str_get_value(decoded).to_string()
         } else if pyre_object::is_str(obj) {
             pyre_object::w_str_get_value(obj).to_string()
         } else {
             String::new()
         }
     };
-    s.replace("\r\n", "\n").replace('\r', "\n")
+    Ok(s.replace("\r\n", "\n").replace('\r', "\n"))
 }
 
 /// `io.TextIOWrapper(buffer, encoding=None, errors=None, newline=None, ...)`.
@@ -6390,20 +6504,31 @@ pub fn text_io_wrapper_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
     Ok(wrapper)
 }
 
+/// Forward an integer size argument to the underlying buffer; a missing or
+/// non-int (e.g. `None`) size means "read everything".
+fn textio_size_arg(args: &[PyObjectRef]) -> &[PyObjectRef] {
+    match args.get(1) {
+        Some(o) if unsafe { pyre_object::is_int(*o) } => std::slice::from_ref(&args[1]),
+        _ => &[],
+    }
+}
+
 fn textio_method_read(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if args.is_empty() {
         return Err(crate::PyError::type_error("read() requires self"));
     }
-    let raw = textio_call_buffer(args[0], "read", &[])?;
-    Ok(w_str_new(&textio_decode(raw)))
+    let raw = textio_call_buffer(args[0], "read", textio_size_arg(args))?;
+    let (encoding, errors) = textio_enc_err(args[0]);
+    Ok(w_str_new(&textio_decode(raw, &encoding, &errors)?))
 }
 
 fn textio_method_readline(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if args.is_empty() {
         return Err(crate::PyError::type_error("readline() requires self"));
     }
-    let raw = textio_call_buffer(args[0], "readline", &[])?;
-    Ok(w_str_new(&textio_decode(raw)))
+    let raw = textio_call_buffer(args[0], "readline", textio_size_arg(args))?;
+    let (encoding, errors) = textio_enc_err(args[0]);
+    Ok(w_str_new(&textio_decode(raw, &encoding, &errors)?))
 }
 
 fn textio_method_write(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
