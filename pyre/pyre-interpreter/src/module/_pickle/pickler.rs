@@ -26,8 +26,9 @@ pub struct W_Pickler {
     /// Memo of saved objects — a Python `list` (GC-walked) persisted across
     /// `dump` calls until `clear_memo`, position = memo index.
     w_memo: PyObjectRef,
-    /// `fast` mode — when set, memoization is skipped.
-    fast: bool,
+    /// `fast` mode — when non-zero, memoization is skipped. Stored as the
+    /// assigned integer (`space.int_w`) so `Pickler.fast` round-trips.
+    fast: i64,
     /// User-set `dispatch_table` mapping, or `PY_NULL` when unset; the dump
     /// path falls back to `copyreg.dispatch_table` when unset.
     w_dispatch_table: PyObjectRef,
@@ -230,7 +231,7 @@ impl W_Pickler {
             fix_imports: true,
             buffer_callback: pyre_object::w_none(),
             w_memo: pyre_object::listobject::w_list_new(Vec::new()),
-            fast: false,
+            fast: 0,
             w_dispatch_table: pyre_object::PY_NULL,
             w_pers_func: pyre_object::PY_NULL,
         })
@@ -260,7 +261,7 @@ impl W_Pickler {
         self.fix_imports = crate::baseobjspace::is_true(fix_imports)?;
         self.buffer_callback = buffer_callback;
         self.w_memo = pyre_object::listobject::w_list_new(Vec::new());
-        self.fast = false;
+        self.fast = 0;
         self.w_dispatch_table = pyre_object::PY_NULL;
         self.w_pers_func = pyre_object::PY_NULL;
         Ok(())
@@ -302,9 +303,15 @@ impl W_Pickler {
         let reducer_override = crate::baseobjspace::findattr(self_ptr, "reducer_override")
             .filter(|&f| !unsafe { pyre_object::is_none(f) })
             .unwrap_or(pyre_object::PY_NULL);
-        // The pickler's `dispatch_table` if set, else `copyreg.dispatch_table`.
+        // `interp_pickle.py:686-690` — the internal `dispatch_table` field,
+        // else a dynamically-resolved `dispatch_table` attribute (a subclass
+        // class attr / property), else the global `copyreg.dispatch_table`.
         let dispatch_table = if !w_dispatch_table.is_null() {
             w_dispatch_table
+        } else if let Some(dt) = crate::baseobjspace::findattr(self_ptr, "dispatch_table")
+            .filter(|&d| !unsafe { pyre_object::is_none(d) })
+        {
+            dt
         } else {
             copyreg_dispatch_table()
         };
@@ -323,7 +330,7 @@ impl W_Pickler {
             pers_func,
             buffer_callback,
             w_memo,
-            fast,
+            fast != 0,
             dispatch_table,
             reducer_override,
         )?;
@@ -336,15 +343,16 @@ impl W_Pickler {
         self.bin as i64
     }
 
-    /// `Pickler.fast` — when set, memoization is skipped.
+    /// `Pickler.fast` — when non-zero, memoization is skipped.
     #[getter]
     fn fast(&self) -> i64 {
-        self.fast as i64
+        self.fast
     }
 
     #[setter]
     fn set_fast(&mut self, w_value: PyObjectRef) -> Result<(), PyError> {
-        self.fast = crate::baseobjspace::is_true(w_value)?;
+        // `interp_pickle.py:1219-1223` stores `space.int_w(w_val)`.
+        self.fast = crate::baseobjspace::int_w(w_value)?;
         Ok(())
     }
 
@@ -753,8 +761,10 @@ fn save_pers(ctx: &mut PickleCtx, buf: &mut Framer, w_pid: PyObjectRef) -> Resul
 }
 
 /// `interp_pickle.py W_Pickler.save` body after the persistent-id hook: the
-/// identity memo (atoms are never memoized) and the `reducer_override`
-/// subclass hook, then the type dispatch in [`dispatch_save`].
+/// identity memo (atoms are never memoized), then the type dispatch in
+/// [`dispatch_save`].  The memo is consulted before `reducer_override` (a
+/// repeated reference becomes a GET, matching CPython 3.14: a second
+/// occurrence of the same object never re-enters the hook).
 fn save_object(ctx: &mut PickleCtx, buf: &mut Framer, w_obj: PyObjectRef) -> Result<(), PyError> {
     let is_atom = unsafe {
         pyre_object::is_none(w_obj)
@@ -762,35 +772,14 @@ fn save_object(ctx: &mut PickleCtx, buf: &mut Framer, w_obj: PyObjectRef) -> Res
             || pyre_object::is_int_or_long(w_obj)
             || pyre_object::is_float(w_obj)
     };
-    // Identity memo — a repeated reference becomes a GET back-reference
-    // (checked before `reducer_override`, matching the save order).
+    // Identity memo — a repeated reference becomes a GET back-reference.
     if !is_atom {
         if let Some(idx) = ctx.memo_get(w_obj) {
             write_get(ctx, buf, idx);
             return Ok(());
         }
     }
-    if ctx.reducer_override.is_null() {
-        return dispatch_save(ctx, buf, w_obj);
-    }
-    // `reducer_override` is offered every object; pin `w_obj` across the hook
-    // call. A result other than NotImplemented replaces the default reduction.
-    let _roots = pyre_object::gc_roots::push_roots();
-    pyre_object::gc_roots::pin_root(w_obj);
-    let slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-    let w_rv = call_fn(
-        ctx.reducer_override,
-        &[pyre_object::gc_roots::shadow_stack_get(slot)],
-    )?;
-    if !unsafe { pyre_object::is_not_implemented(w_rv) } {
-        return save_reduce_value(
-            ctx,
-            buf,
-            pyre_object::gc_roots::shadow_stack_get(slot),
-            w_rv,
-        );
-    }
-    dispatch_save(ctx, buf, pyre_object::gc_roots::shadow_stack_get(slot))
+    dispatch_save(ctx, buf, w_obj)
 }
 
 /// Exact-type dispatch via the `is_*` predicates (bool is checked before int
@@ -843,6 +832,42 @@ fn dispatch_save(ctx: &mut PickleCtx, buf: &mut Framer, w_obj: PyObjectRef) -> R
         return save_picklebuffer(ctx, buf, w_obj);
     }
 
+    // `reducer_override` (a Pickler subclass hook) is offered every object not
+    // dispatched above as a built-in atom/container, before save_global and
+    // the reduce protocol. A result other than NotImplemented replaces the
+    // default reduction. (interp_pickle.py:619-625 calls it earlier; CPython
+    // 3.14 — the behaviour target — dispatches built-in types first, so the
+    // hook never sees a list/dict/str and a repeated object hits the memo.)
+    if !ctx.reducer_override.is_null() {
+        let _roots = pyre_object::gc_roots::push_roots();
+        pyre_object::gc_roots::pin_root(w_obj);
+        let slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+        let w_rv = call_fn(
+            ctx.reducer_override,
+            &[pyre_object::gc_roots::shadow_stack_get(slot)],
+        )?;
+        if !unsafe { pyre_object::is_not_implemented(w_rv) } {
+            return save_reduce_value(
+                ctx,
+                buf,
+                pyre_object::gc_roots::shadow_stack_get(slot),
+                w_rv,
+            );
+        }
+        return save_global_or_reduce(ctx, buf, pyre_object::gc_roots::shadow_stack_get(slot));
+    }
+    save_global_or_reduce(ctx, buf, w_obj)
+}
+
+/// The tail of [`dispatch_save`] after built-in dispatch and the
+/// `reducer_override` hook: classes/functions by reference, then the
+/// per-pickler `dispatch_table`, then the `__reduce_ex__` / `__reduce__`
+/// protocol.
+fn save_global_or_reduce(
+    ctx: &mut PickleCtx,
+    buf: &mut Framer,
+    w_obj: PyObjectRef,
+) -> Result<(), PyError> {
     // Classes and functions are saved by reference.
     if unsafe { pyre_object::typeobject::is_type(w_obj) }
         || unsafe { crate::function::is_function(w_obj) }
@@ -1627,8 +1652,13 @@ fn whichmodule(w_obj: PyObjectRef, name: &str) -> Result<PyObjectRef, PyError> {
     if name.split('.').any(|s| s == "<locals>") {
         return Err(pickling_error(format!("Can't pickle local object {name}")));
     }
+    // `interp_pickle.py:1738-1742 whichmodule` returns any non-None
+    // `__module__`; a non-string value is rejected by the import machinery.
     let from_attr: Option<String> = match crate::baseobjspace::findattr(w_obj, "__module__") {
-        Some(m) if !unsafe { pyre_object::is_none(m) } && unsafe { pyre_object::is_str(m) } => {
+        Some(m) if !unsafe { pyre_object::is_none(m) } => {
+            if !unsafe { pyre_object::is_str(m) } {
+                return Err(PyError::type_error("module name must be a string"));
+            }
             Some(unsafe { pyre_object::strobject::w_str_get_value(m) }.to_string())
         }
         _ => None,
@@ -1667,8 +1697,8 @@ fn whichmodule(w_obj: PyObjectRef, name: &str) -> Result<PyObjectRef, PyError> {
             }
         }
     };
-    // Verify `module_name.name` resolves back to `w_obj`.
-    match crate::module::_pickle::try_resolve_global(&module_name, name)? {
+    // Verify `module_name.name` resolves back to `w_obj` (qualnames walked).
+    match crate::module::_pickle::try_resolve_global(&module_name, name, true)? {
         Some(resolved) if crate::baseobjspace::is_w(resolved, w_obj) => {
             Ok(pyre_object::w_str_new(&module_name))
         }
@@ -1725,8 +1755,13 @@ fn save_global(
         save(ctx, buf, pyre_object::gc_roots::shadow_stack_get(name_slot))?;
         buf.push(op::STACK_GLOBAL);
     } else if name.contains('.') {
-        // protocol < 4 nested: the top-level name by GLOBAL, then one
-        // `getattr(<current>, attrname)` REDUCE per remaining dotted part.
+        // protocol < 4 nested: objects with a multi-part `__qualname__` are
+        // represented as `getattr(getattr(..., attrname1), attrname2)`. The
+        // top-level name is emitted by GLOBAL and each remaining dotted part
+        // by one `getattr(<current>, attrname)` REDUCE. `getattr` and the
+        // attrname strings memoize through `save`; the top-level GLOBAL and
+        // the intermediate tuples are not memoized, and the final result is
+        // memoized by the trailing `memoize(obj)`.
         let parts: Vec<&str> = name.split('.').collect();
         let rest = &parts[1..];
         for _ in rest {
@@ -1873,6 +1908,23 @@ fn save_reduce(
                 "args[0] from __newobj_ex__ args has no __new__",
             ));
         }
+        if let Some(slot) = w_obj_slot {
+            let w_class = crate::baseobjspace::getattr_str(
+                pyre_object::gc_roots::shadow_stack_get(slot),
+                "__class__",
+            )?;
+            if !crate::baseobjspace::is_w(args_get(0), w_class) {
+                pyre_object::gc_roots::pin_root(w_class);
+                let class_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+                let cls_repr = unsafe { crate::display::py_repr(args_get(0))? };
+                let obj_class_repr = unsafe {
+                    crate::display::py_repr(pyre_object::gc_roots::shadow_stack_get(class_slot))?
+                };
+                return Err(pickling_error(format!(
+                    "first argument to __newobj_ex__() must be {obj_class_repr}, not {cls_repr}"
+                )));
+            }
+        }
         if ctx.proto >= 4 {
             save(ctx, buf, args_get(0))?;
             save(ctx, buf, args_get(1))?;
@@ -1934,6 +1986,23 @@ fn save_reduce(
             return Err(pickling_error(
                 "args[0] from __newobj__ args has no __new__",
             ));
+        }
+        if let Some(slot) = w_obj_slot {
+            let w_class = crate::baseobjspace::getattr_str(
+                pyre_object::gc_roots::shadow_stack_get(slot),
+                "__class__",
+            )?;
+            if !crate::baseobjspace::is_w(args_get(0), w_class) {
+                pyre_object::gc_roots::pin_root(w_class);
+                let class_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+                let cls_repr = unsafe { crate::display::py_repr(args_get(0))? };
+                let obj_class_repr = unsafe {
+                    crate::display::py_repr(pyre_object::gc_roots::shadow_stack_get(class_slot))?
+                };
+                return Err(pickling_error(format!(
+                    "first argument to __newobj__() must be {obj_class_repr}, not {cls_repr}"
+                )));
+            }
         }
         let w_newargs =
             pyre_object::tupleobject::w_tuple_new((1..args_len).map(|i| args_get(i)).collect());

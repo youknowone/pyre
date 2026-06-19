@@ -77,15 +77,27 @@ impl W_Unpickler {
         // SHORT_BINSTRING decode (`_decode_string`); `None` falls back to the
         // `"ASCII"` / `"strict"` defaults. `fix_imports` gates the proto-< 3
         // py2→py3 name remap.
+        // `interp_pickle.py:2858` declares `encoding="text"`, `errors="text"`:
+        // a non-string (other than the `None` default) is a TypeError.
         self.encoding = if unsafe { pyre_object::is_none(encoding) } {
             String::from("ASCII")
-        } else {
+        } else if unsafe { pyre_object::is_str(encoding) } {
             unsafe { pyre_object::strobject::w_str_get_value(encoding) }.to_string()
+        } else {
+            return Err(PyError::type_error(format!(
+                "Unpickler() argument 'encoding' must be str, not {}",
+                crate::baseobjspace::object_functionstr_type_name(encoding)
+            )));
         };
         self.errors = if unsafe { pyre_object::is_none(errors) } {
             String::from("strict")
-        } else {
+        } else if unsafe { pyre_object::is_str(errors) } {
             unsafe { pyre_object::strobject::w_str_get_value(errors) }.to_string()
+        } else {
+            return Err(PyError::type_error(format!(
+                "Unpickler() argument 'errors' must be str, not {}",
+                crate::baseobjspace::object_functionstr_type_name(errors)
+            )));
         };
         self.fix_imports = crate::baseobjspace::is_true(fix_imports)?;
         self.w_file_read = crate::baseobjspace::getattr_str(file, "read")?;
@@ -150,7 +162,7 @@ impl W_Unpickler {
     ) -> Result<PyObjectRef, PyError> {
         let module = unsafe { pyre_object::strobject::w_str_get_value(w_module) }.to_string();
         let name = unsafe { pyre_object::strobject::w_str_get_value(w_name) }.to_string();
-        audit_find_class(&module, &name);
+        audit_find_class(&module, &name)?;
         // protocol < 3 with `fix_imports` applies the py2 → py3 `_compat_pickle`
         // forward map before resolution; otherwise the name resolves literally.
         let (module, name) = if self.proto < 3 && self.fix_imports {
@@ -158,9 +170,11 @@ impl W_Unpickler {
         } else {
             (module, name)
         };
-        crate::module::_pickle::try_resolve_global(&module, &name)?.ok_or_else(|| {
-            PyError::attribute_error(format!("Can't get attribute {name:?} on module {module:?}"))
-        })
+        // proto >= 4 walks dotted qualnames; proto < 4 is a single getattr.
+        let allow_qualname = self.proto >= 4;
+        crate::module::_pickle::try_resolve_global(&module, &name, allow_qualname)?.ok_or_else(
+            || PyError::attribute_error(format!("Can't get attribute {name:?} on module {module:?}")),
+        )
     }
 
     /// `Unpickler.persistent_load` — the per-instance persistent-id resolver.
@@ -766,9 +780,11 @@ fn dispatch(slot: usize, opcode: u8) -> Result<(), PyError> {
             pyre_object::gc_roots::pin_root(items);
             let items_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
             let w_set = top(slot, "ADDITEMS")?;
-            if unsafe { pyre_object::setobject::is_set(w_set) } {
-                // `set.update(items)` dispatches through the (possibly
-                // overridden) method, matching `isinstance(set_obj, set)`.
+            let w_set_type = crate::typedef::gettypeobject(&pyre_object::setobject::SET_TYPE);
+            if unsafe { crate::baseobjspace::isinstance_w(w_set, w_set_type) } {
+                // `PySet_Check`: `set` and its subclasses (not `frozenset`)
+                // take the `update` path; `set.update(items)` dispatches
+                // through the (possibly overridden) method.
                 call_meth(
                     w_set,
                     "update",
@@ -1059,20 +1075,22 @@ fn call_find_class(
     )
 }
 
-/// Emit the `pickle.find_class` audit event.
-fn audit_find_class(module: &str, name: &str) {
+/// Emit the `pickle.find_class` audit event. `interp_pickle.py:2601` calls
+/// `space.audit(...)` and lets a blocking audit hook's error propagate.
+fn audit_find_class(module: &str, name: &str) -> Result<(), PyError> {
     if let Ok(sys) = import_module("sys") {
         if let Ok(audit) = crate::baseobjspace::getattr_str(sys, "audit") {
-            let _ = call_fn(
+            call_fn(
                 audit,
                 &[
                     pyre_object::w_str_new("pickle.find_class"),
                     pyre_object::w_str_new(module),
                     pyre_object::w_str_new(name),
                 ],
-            );
+            )?;
         }
     }
+    Ok(())
 }
 
 /// `get_extension` (EXT1 / EXT2 / EXT4) — resolve a `copyreg` extension code

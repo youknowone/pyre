@@ -297,12 +297,17 @@ pub(crate) fn getattribute_dotted(
 /// attribute walk. Returns `Ok(None)` when the name is simply absent
 /// (AttributeError / KeyError) so the dump-time verification can report a
 /// precise "not found" error; the load-side `find_class` maps `None` to an
-/// error. No `_compat_pickle` remap — callers apply that first. Shared by the
-/// unpickler `find_class` (load) and `whichmodule` (dump verification) so the
-/// two stay symmetric.
+/// error. No `_compat_pickle` remap — callers apply that first.
+///
+/// `allow_qualname` mirrors `getattribute(obj, name, allow_qualname)`: when
+/// set, a dotted `name` is walked component-by-component (proto >= 4 STACK_GLOBAL
+/// qualnames, and the dump-side `whichmodule` verification); when clear (the
+/// unpickler at protocol < 4) the name is a single `getattr`, so a dotted name
+/// resolves as one literal attribute and fails, as in CPython.
 pub(crate) fn try_resolve_global(
     module_name: &str,
     name: &str,
+    allow_qualname: bool,
 ) -> Result<Option<PyObjectRef>, PyError> {
     if module_name == "builtins" && !name.contains('.') {
         if let Some(obj) = lookup_builtin(name) {
@@ -310,9 +315,17 @@ pub(crate) fn try_resolve_global(
         }
     }
     let module = import_module(module_name)?;
-    if name.contains('.') {
+    if allow_qualname && name.contains('.') {
         return match getattribute_dotted(module, name) {
             Ok((obj, _)) => Ok(Some(obj)),
+            Err(e) if e.kind == crate::PyErrorKind::AttributeError => Ok(None),
+            Err(e) => Err(e),
+        };
+    }
+    if !allow_qualname {
+        // protocol < 4: a single `getattr`, never a qualname walk.
+        return match crate::baseobjspace::getattr_str(module, name) {
+            Ok(obj) => Ok(Some(obj)),
             Err(e) if e.kind == crate::PyErrorKind::AttributeError => Ok(None),
             Err(e) => Err(e),
         };
