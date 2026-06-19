@@ -10322,35 +10322,46 @@ fn decode_utf8_with_errors(data: &[u8], err_mode: &str) -> Result<Wtf8Buf, crate
 /// bytesobject.py descr_decode → stringmethods.py:196 decode_object
 pub(crate) fn bytes_method_decode(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(!args.is_empty());
-    let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) };
+    // `bytes.decode(encoding='utf-8', errors='strict')` — both parameters
+    // are positional-or-keyword, so accept them from either side.
+    let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    let data = unsafe { pyre_object::bytesobject::bytes_like_data(pos[0]) };
+    let w_encoding = pos
+        .get(1)
+        .copied()
+        .or_else(|| crate::builtins::kwarg_get(kwargs, "encoding"));
+    let w_errors = pos
+        .get(2)
+        .copied()
+        .or_else(|| crate::builtins::kwarg_get(kwargs, "errors"));
     // unicodeobject.py:1669 — encoding/errors must be str (space.text_w)
-    if args.len() >= 2
-        && !unsafe { pyre_object::is_str(args[1]) }
-        && !unsafe { pyre_object::is_none(args[1]) }
-    {
-        let tn = unsafe { (*(*args[1]).ob_type).name };
-        return Err(crate::PyError::type_error(format!(
-            "decode() argument 'encoding' must be str, not {tn}",
-        )));
+    if let Some(enc) = w_encoding {
+        if !unsafe { pyre_object::is_str(enc) } && !unsafe { pyre_object::is_none(enc) } {
+            let tn = unsafe { (*(*enc).ob_type).name };
+            return Err(crate::PyError::type_error(format!(
+                "decode() argument 'encoding' must be str, not {tn}",
+            )));
+        }
     }
-    if args.len() >= 3
-        && !unsafe { pyre_object::is_str(args[2]) }
-        && !unsafe { pyre_object::is_none(args[2]) }
-    {
-        let tn = unsafe { (*(*args[2]).ob_type).name };
-        return Err(crate::PyError::type_error(format!(
-            "decode() argument 'errors' must be str, not {tn}",
-        )));
+    if let Some(err) = w_errors {
+        if !unsafe { pyre_object::is_str(err) } && !unsafe { pyre_object::is_none(err) } {
+            let tn = unsafe { (*(*err).ob_type).name };
+            return Err(crate::PyError::type_error(format!(
+                "decode() argument 'errors' must be str, not {tn}",
+            )));
+        }
     }
-    let encoding = if args.len() >= 2 && unsafe { pyre_object::is_str(args[1]) } {
-        unsafe { pyre_object::w_str_get_value(args[1]).to_string() }
-    } else {
-        "utf-8".to_string()
+    let encoding = match w_encoding {
+        Some(e) if unsafe { pyre_object::is_str(e) } => {
+            unsafe { pyre_object::w_str_get_value(e).to_string() }
+        }
+        _ => "utf-8".to_string(),
     };
-    let errors = if args.len() >= 3 && unsafe { pyre_object::is_str(args[2]) } {
-        unsafe { pyre_object::w_str_get_value(args[2]).to_string() }
-    } else {
-        "strict".to_string()
+    let errors = match w_errors {
+        Some(e) if unsafe { pyre_object::is_str(e) } => {
+            unsafe { pyre_object::w_str_get_value(e).to_string() }
+        }
+        _ => "strict".to_string(),
     };
     let err_mode = errors.as_str();
     let enc_lower = encoding.to_ascii_lowercase().replace('_', "-");
