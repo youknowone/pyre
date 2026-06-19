@@ -2730,7 +2730,20 @@ fn init_dict_type(ns: &mut DictStorage) {
                 if args.len() < 2 {
                     return Ok(pyre_object::w_bool_from(false));
                 }
-                crate::baseobjspace::compare(args[0], args[1], crate::baseobjspace::CompareOp::Eq)
+                // A dict subclass is instance-represented (the mapping lives in
+                // the `__dict_data__` backing), so `compare` would not see it as
+                // a dict and would re-dispatch to this `__eq__`, recursing.
+                // Resolve each operand to its backing dict first; exact dicts
+                // and non-dict operands are left unchanged for `compare`.
+                let resolve = |o: PyObjectRef| {
+                    let backing = crate::type_methods::resolve_dict_backing(o);
+                    if backing.is_null() { o } else { backing }
+                };
+                crate::baseobjspace::compare(
+                    resolve(args[0]),
+                    resolve(args[1]),
+                    crate::baseobjspace::CompareOp::Eq,
+                )
             },
             2,
         ),
