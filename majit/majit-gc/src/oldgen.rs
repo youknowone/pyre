@@ -30,6 +30,17 @@ struct OldObject {
 pub struct OldGen {
     /// All live old-gen objects.
     objects: Vec<OldObject>,
+    /// O(1) membership index: payload addresses (`header_addr +
+    /// GcHeader::SIZE`) of every live old-gen object. incminimark's
+    /// ArenaCollection answers "is this address an old object?" in O(1) from
+    /// arena page bounds; pyre's OldGen allocates each object individually
+    /// through the system allocator (see the struct doc — no contiguous
+    /// arena), so there is no range to test. This set restores that O(1)
+    /// `contains`, kept in sync with `objects` on alloc and sweep. Without it
+    /// `contains` is a linear scan that becomes a hot O(n²) under the
+    /// parity-correct major-collection threshold once the old gen is large
+    /// (issue 215: minor-collection `walk_jf_roots` calls `contains` per root).
+    payloads: std::collections::HashSet<usize>,
     /// Total bytes allocated in old gen.
     total_bytes: usize,
 }
@@ -41,6 +52,7 @@ impl OldGen {
     pub fn new() -> Self {
         OldGen {
             objects: Vec::new(),
+            payloads: std::collections::HashSet::new(),
             total_bytes: 0,
         }
     }
@@ -75,6 +87,7 @@ impl OldGen {
             layout,
         };
         self.objects.push(obj_record);
+        self.payloads.insert(header_ptr as usize + GcHeader::SIZE);
         self.total_bytes += alloc_size;
         header_ptr
     }
@@ -118,6 +131,7 @@ impl OldGen {
             } else {
                 // Dead: free it. Dealloc from alloc_start (includes card header).
                 freed_bytes += obj_record.layout.size();
+                self.payloads.remove(&(obj_record.header_addr + GcHeader::SIZE));
                 unsafe {
                     alloc::dealloc(obj_record.alloc_start as *mut u8, obj_record.layout);
                 }
@@ -136,15 +150,12 @@ impl OldGen {
         }
     }
 
-    /// Check whether `obj_addr` is the payload address of a tracked old-gen object.
-    ///
-    /// Linear over `objects`; the write barrier does not use this (it gates on
-    /// the `TRACK_YOUNG_PTRS` header flag), so the callers are cold paths
-    /// (`is_managed_heap_object`, weakref scanning).
+    /// Check whether `obj_addr` is the payload address of a tracked old-gen
+    /// object. O(1) via the `payloads` index (see its field doc). Called per
+    /// root in minor collection (`walk_jf_roots`) and per traced field in
+    /// `is_managed_heap_object`, so it must not be a linear scan.
     pub fn contains(&self, obj_addr: usize) -> bool {
-        self.objects
-            .iter()
-            .any(|obj_record| obj_record.header_addr + GcHeader::SIZE == obj_addr)
+        self.payloads.contains(&obj_addr)
     }
 
     /// Mark an old-gen object as visited (for major collection).

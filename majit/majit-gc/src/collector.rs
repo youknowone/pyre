@@ -53,6 +53,17 @@ fn read_size_from_env(varname: &str) -> Option<usize> {
     (bytes > 0.0).then_some(bytes as usize)
 }
 
+fn read_float_from_env(varname: &str) -> Option<f64> {
+    // rpython/memory/gc/env.py:43-66 `read_float_from_env`: a plain float,
+    // or 0.0 (treated as absent) if it cannot be parsed.
+    let raw = std::env::var(varname).ok()?;
+    let value = raw.trim();
+    if value.is_empty() {
+        return None;
+    }
+    value.parse::<f64>().ok().filter(|v| *v > 0.0)
+}
+
 fn default_nursery_size() -> usize {
     // incminimark.py:459-470:
     //   newsize = env.read_from_env('PYPY_GC_NURSERY')
@@ -162,11 +173,6 @@ impl IncrementalMarkState {
     }
 }
 
-/// Default ratio of old-gen growth that triggers an incremental cycle.
-/// When old-gen bytes exceed `last_major_bytes * MAJOR_COLLECT_RATIO`,
-/// a new incremental cycle starts.
-const MAJOR_COLLECT_RATIO: f64 = 1.82;
-
 /// The MiniMark generational GC.
 #[allow(non_snake_case)] // _T_IS_RPYTHON_INSTANCE_BYTE keeps the RPython spelling
 pub struct MiniMarkGC {
@@ -210,9 +216,34 @@ pub struct MiniMarkGC {
     pub major_collections: usize,
     /// State for incremental major collection.
     incr_state: IncrementalMarkState,
-    /// Old-gen bytes at the end of the last completed major collection.
-    /// Used to decide when to start the next incremental cycle.
-    last_major_bytes: usize,
+    /// incminimark.py:304 `self.major_collection_threshold`. After a major
+    /// collection, the next one is triggered once the total old-gen size
+    /// grows to this many times the surviving size (TRANSLATION_PARAMS
+    /// default 1.82; `PYPY_GC_MAJOR_COLLECT` override).
+    major_collection_threshold: f64,
+    /// incminimark.py:305 `self.growth_rate_max`. Caps how fast the
+    /// next-major threshold may grow from one collection to the next
+    /// (TRANSLATION_PARAMS default 1.4; `PYPY_GC_GROWTH` override).
+    growth_rate_max: f64,
+    /// incminimark.py:307,488,562 `self.min_heap_size`. Floor below which the
+    /// next-major threshold is never set: `max(PYPY_GC_MIN or nursery*8,
+    /// nursery*major_collection_threshold)`. This floor is what stops
+    /// allocation-heavy, tiny-live-set workloads (e.g. recursive fib) from
+    /// thrashing major cycles off a near-zero surviving baseline.
+    min_heap_size: f64,
+    /// incminimark.py:308 `self.max_heap_size` (`PYPY_GC_MAX`; 0.0 = unbounded).
+    max_heap_size: f64,
+    /// incminimark.py:310 `self.max_delta` (`PYPY_GC_MAX_DELTA`). Caps the
+    /// absolute next-major threshold growth per cycle.
+    max_delta: f64,
+    /// incminimark.py:568 `self.next_major_collection_initial`. The
+    /// pre-reservation threshold; `set_major_threshold_from` grows the next
+    /// threshold relative to this value, bounded by `growth_rate_max`.
+    next_major_collection_initial: f64,
+    /// incminimark.py:569 `self.next_major_collection_threshold`. A new
+    /// incremental major cycle starts once `get_total_memory_used()` reaches
+    /// this value (`threshold_reached`).
+    next_major_collection_threshold: f64,
     /// Bytes promoted to old gen since the current incremental cycle started.
     ///
     /// Mirrors incminimark's `size_objects_made_old`.
@@ -275,6 +306,37 @@ impl MiniMarkGC {
     /// Create a new GC with custom configuration.
     pub fn with_config(config: GcConfig) -> Self {
         let nursery_size = config.nursery_size;
+
+        // incminimark.py:261,268,475-481 — major_collection_threshold /
+        // growth_rate_max from TRANSLATION_PARAMS, overridable by env.
+        let major_collection_threshold = read_float_from_env("PYPY_GC_MAJOR_COLLECT")
+            .filter(|v| *v > 1.0)
+            .unwrap_or(1.82);
+        let growth_rate_max = read_float_from_env("PYPY_GC_GROWTH")
+            .filter(|v| *v > 1.0)
+            .unwrap_or(1.4);
+        // incminimark.py:483-488 — min_heap_size: PYPY_GC_MIN, else nursery*8.
+        let mut min_heap_size = read_size_from_env("PYPY_GC_MIN")
+            .map(|v| v as f64)
+            .unwrap_or(nursery_size as f64 * 8.0);
+        // incminimark.py:490-492 — max_heap_size: PYPY_GC_MAX, else 0 (unbounded).
+        let max_heap_size = read_size_from_env("PYPY_GC_MAX")
+            .map(|v| v as f64)
+            .unwrap_or(0.0);
+        // incminimark.py:494-498 — max_delta: PYPY_GC_MAX_DELTA, else
+        // 0.125 * env.get_total_memory(). The total-memory probe (env.py) is
+        // not yet ported (issue 215 fix #3); until it lands, default to the
+        // pre-setup sentinel (incminimark.py:310 `float(r_uint(-1))`, i.e.
+        // unbounded) so the `total + max_delta` cap never binds and the
+        // `total * major_collection_threshold` term governs, matching
+        // incminimark on any heap small relative to total memory.
+        let max_delta = read_size_from_env("PYPY_GC_MAX_DELTA")
+            .map(|v| v as f64)
+            .unwrap_or(u64::MAX as f64);
+        // incminimark.py:562-563 — allocate_nursery floors min_heap_size by
+        // nursery_size * major_collection_threshold.
+        min_heap_size = min_heap_size.max(nursery_size as f64 * major_collection_threshold);
+
         let mut gc = MiniMarkGC {
             nursery: Nursery::new(config.nursery_size),
             oldgen: OldGen::new(),
@@ -288,7 +350,15 @@ impl MiniMarkGC {
             minor_collections: 0,
             major_collections: 0,
             incr_state: IncrementalMarkState::new(nursery_size),
-            last_major_bytes: 0,
+            major_collection_threshold,
+            growth_rate_max,
+            min_heap_size,
+            max_heap_size,
+            max_delta,
+            // incminimark.py:568-569 — both initialized to min_heap_size,
+            // then refined by set_major_threshold_from(0.0) below.
+            next_major_collection_initial: min_heap_size,
+            next_major_collection_threshold: min_heap_size,
             bytes_made_old_since_cycle: 0,
             threshold_bytes_made_old: 0,
             pinned_objects: VecSet::new(),
@@ -312,6 +382,8 @@ impl MiniMarkGC {
                 gc.card_page_shift += 1;
             }
         }
+        // incminimark.py:570 — allocate_nursery finalizes the first threshold.
+        gc.set_major_threshold_from(0.0, 0.0);
         gc._setup_guard_is_object();
         gc
     }
@@ -1106,15 +1178,48 @@ impl MiniMarkGC {
 
     // ── Incremental marking ──
 
-    /// Check whether old-gen growth warrants starting a new incremental
-    /// major collection cycle.
-    fn should_start_major_cycle(&self) -> bool {
-        if self.last_major_bytes == 0 {
-            // Never done a major collection. Use a minimum threshold so we
-            // don't start an incremental cycle with a nearly empty old gen.
-            return self.oldgen.total_bytes() > self.config.nursery_size;
+    /// incminimark.py:1264-1268 `get_total_memory_used`. Total memory the GC
+    /// is responsible for, NOT counting the nursery: old-gen objects plus
+    /// raw-malloced large objects. pyre's `oldgen.total_bytes()` already
+    /// aggregates promoted objects and large/raw objects allocated straight
+    /// into the old generation.
+    fn get_total_memory_used(&self) -> usize {
+        self.oldgen.total_bytes()
+    }
+
+    /// incminimark.py:1288-1290 `threshold_reached`. True once the old-gen
+    /// total has caught up to within `extra` of the next-major threshold,
+    /// i.e. it is time to make incremental major-collection progress.
+    fn threshold_reached(&self, extra: usize) -> bool {
+        (self.next_major_collection_threshold - self.get_total_memory_used() as f64)
+            < extra as f64
+    }
+
+    /// incminimark.py:575-594 `set_major_threshold_from`. Set the next-major
+    /// threshold, capping growth at `next_major_collection_initial *
+    /// growth_rate_max`, flooring at `min_heap_size`, and bounding by
+    /// `max_heap_size`. Returns whether the result was bounded by the heap max.
+    fn set_major_threshold_from(&mut self, mut threshold: f64, reserving_size: f64) -> bool {
+        let threshold_max = self.next_major_collection_initial * self.growth_rate_max;
+        if threshold > threshold_max {
+            threshold = threshold_max;
         }
-        self.oldgen.total_bytes() as f64 > self.last_major_bytes as f64 * MAJOR_COLLECT_RATIO
+        //
+        threshold += reserving_size;
+        if threshold < self.min_heap_size {
+            threshold = self.min_heap_size;
+        }
+        //
+        let bounded = if self.max_heap_size > 0.0 && threshold > self.max_heap_size {
+            threshold = self.max_heap_size;
+            true
+        } else {
+            false
+        };
+        //
+        self.next_major_collection_initial = threshold;
+        self.next_major_collection_threshold = threshold;
+        bounded
     }
 
     /// Begin a new incremental marking cycle.
@@ -1194,7 +1299,7 @@ impl MiniMarkGC {
     /// minors may need multiple consecutive steps so old-gen growth does not
     /// outrun marking.
     fn run_major_progress_after_minor(&mut self) {
-        if !self.incr_state.marking_in_progress && !self.should_start_major_cycle() {
+        if !self.incr_state.marking_in_progress && !self.threshold_reached(0) {
             return;
         }
 
@@ -1349,7 +1454,18 @@ impl MiniMarkGC {
             self.invalidate_old_weakrefs();
         }
         self.oldgen.sweep();
-        self.last_major_bytes = self.oldgen.total_bytes();
+        // incminimark.py:2566-2577 — set the threshold for the next major
+        // collection to `major_collection_threshold` times the surviving
+        // size, but no more than `max_delta` above it, floored at
+        // `min_heap_size` by set_major_threshold_from. (pyre has no
+        // `kept_alive_by_finalizer` accounting, so `total_memory_used` is the
+        // post-sweep old-gen size directly.)
+        let total_memory_used = self.get_total_memory_used() as f64;
+        self.set_major_threshold_from(
+            (total_memory_used * self.major_collection_threshold)
+                .min(total_memory_used + self.max_delta),
+            0.0,
+        );
         self.bytes_made_old_since_cycle = 0;
         self.threshold_bytes_made_old = 0;
     }
@@ -1758,7 +1874,7 @@ impl MiniMarkGC {
     /// If a cycle is already in progress, one bounded marking step is
     /// performed. Returns true if any GC work was done.
     pub fn gc_step(&mut self) -> bool {
-        if self.should_start_major_cycle() && !self.incr_state.marking_in_progress {
+        if self.threshold_reached(0) && !self.incr_state.marking_in_progress {
             self.start_incremental_cycle();
             let done = self.incremental_mark_step();
             if done {
@@ -4458,7 +4574,7 @@ mod tests {
         let mut gc = test_gc(256);
         gc.register_type(TypeInfo::simple(16));
 
-        // Force a minor collection to set last_major_bytes baseline.
+        // Force a full collection to establish the next-major threshold baseline.
         let obj = gc.alloc_with_type(0, 16);
         let mut root = obj;
         unsafe {
@@ -4511,8 +4627,13 @@ mod tests {
         // Promote everything to old gen.
         gc.collect_nursery();
 
-        // Add more old-gen objects to trigger the ratio threshold.
-        for _ in 0..200 {
+        // Add enough old-gen objects to cross the next-major threshold. The
+        // threshold is floored at `min_heap_size = nursery_size * 8` = 32KB
+        // for this 4096-byte nursery (incminimark.py:488,562), so the old gen
+        // must exceed 32KB before `gc_step` will start a cycle — a few hundred
+        // small objects is intentionally not enough under the parity-correct
+        // floor.
+        for _ in 0..4000 {
             gc.alloc_in_oldgen(tid, GcHeader::SIZE + 16);
         }
 
