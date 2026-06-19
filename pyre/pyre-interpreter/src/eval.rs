@@ -2314,11 +2314,13 @@ impl OpcodeStepExecutor for PyFrame {
         use crate::bytecode::CommonConstant;
         let val = match cc {
             CommonConstant::AssertionError => {
-                crate::make_builtin_function("AssertionError", |_args| {
-                    Err(crate::PyError::new(
-                        crate::PyErrorKind::AssertionError,
-                        "assertion error".to_string(),
-                    ))
+                // `LOAD_ASSERTION_ERROR` pushes the `AssertionError` class
+                // itself, so `assert x` raises `AssertionError()` and
+                // `assert x, msg` raises `AssertionError(msg)`.
+                crate::builtins::lookup_exc_class("AssertionError").unwrap_or_else(|| {
+                    crate::typedef::gettypeobject(
+                        &pyre_object::excobject::EXC_ASSERTION_ERROR_TYPE,
+                    )
                 })
             }
             CommonConstant::NotImplementedError => {
