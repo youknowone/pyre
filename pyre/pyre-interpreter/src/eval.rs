@@ -2543,6 +2543,19 @@ impl OpcodeStepExecutor for PyFrame {
     // ── Import ──
     // PyPy: pyopcode.py IMPORT_NAME
     // Stack: [level, fromlist] → pops both, pushes module object.
+    fn import_module(&mut self, name: &str) -> Result<PyObjectRef, PyError> {
+        if let Some(m) = crate::importing::get_sys_module(name) {
+            return Ok(m);
+        }
+        crate::importing::importhook(
+            name,
+            self.get_w_globals_obj(),
+            pyre_object::w_none(),
+            0,
+            self.execution_context,
+        )
+    }
+
     fn import_name(&mut self, name: &str) -> Result<(), PyError> {
         let w_fromlist = self.pop();
         let w_level = self.pop();
@@ -2838,6 +2851,30 @@ impl OpcodeStepExecutor for PyFrame {
             format!("name '{name}' is not defined"),
             name,
         ))
+    }
+
+    // ── LoadFromDictOrDeref ──
+    // CPython 3.13: LOAD_FROM_DICT_OR_DEREF — used by the PEP 695 type-param
+    // scope.  Pop the namespace mapping (TOS), try `mapping[name]`, then fall
+    // back to the cell / free variable at `idx`.
+    fn load_from_dict_or_deref(&mut self, idx: usize, name: &str) -> Result<(), PyError> {
+        let mapping = self.pop();
+        let key = pyre_object::w_str_new(name);
+        if let Ok(val) = crate::baseobjspace::getitem(mapping, key) {
+            self.push(val);
+            return Ok(());
+        }
+        let slot = self.locals_w()[idx];
+        let value = if !slot.is_null() && unsafe { pyre_object::is_cell(slot) } {
+            unsafe { pyre_object::w_cell_get(slot) }
+        } else {
+            slot
+        };
+        if value == PY_NULL {
+            return Err(crate::pyframe::deref_unbound_error(self.code(), idx));
+        }
+        self.push(value);
+        Ok(())
     }
 
     // ── GetLen ──

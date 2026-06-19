@@ -229,6 +229,7 @@ pub fn install_builtin_modules() {
     pyre_install_module!(_struct);
     pyre_install_module!(binascii);
     pyre_install_module!(zlib);
+    pyre_install_module!(_typing);
     pyre_install_module!(_hashlib);
     pyre_install_module!(_blake2);
     pyre_install_module!(gc);
@@ -263,7 +264,6 @@ pub fn install_builtin_modules() {
         "_warnings",
         "_heapq",
         "_tokenize",
-        "_typing",
         "_bisect",
         "_json",
         "_csv",

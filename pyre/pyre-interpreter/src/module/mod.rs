@@ -47,6 +47,8 @@ pub mod _sre;
 #[allow(non_snake_case)]
 pub mod _struct;
 #[allow(non_snake_case)]
+pub mod _typing;
+#[allow(non_snake_case)]
 pub mod _hashlib;
 #[allow(non_snake_case)]
 pub mod _blake2;

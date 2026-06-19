@@ -1293,6 +1293,36 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
     }
 
     /// CALL_INTRINSIC_1: single-argument intrinsic operations.
+    /// Import a module by name, returning its module object.  Overridden by
+    /// the interpreter; the trace path declines (typing intrinsics run at
+    /// import time, never inside a JIT-traced loop).
+    fn import_module(&mut self, name: &str) -> Result<Self::Value, PyError> {
+        let _ = name;
+        Err(crate::PyError::type_error("import_module not implemented").into())
+    }
+
+    /// Build a PEP 695 type-parameter object by routing the single intrinsic
+    /// operand through the named `_typing` helper.
+    fn typing_intrinsic_1(&mut self, helper: &str) -> Result<(), PyError> {
+        let arg = self.pop_value()?;
+        let module = self.import_module("_typing")?;
+        let func = SharedOpcodeHandler::load_attr(self, module, helper)?;
+        let result = self.call_callable(func, &[arg])?;
+        self.push_value(result)?;
+        Ok(())
+    }
+
+    /// Two-operand variant: TOS is the second argument, TOS1 the first.
+    fn typing_intrinsic_2(&mut self, helper: &str) -> Result<(), PyError> {
+        let arg2 = self.pop_value()?;
+        let arg1 = self.pop_value()?;
+        let module = self.import_module("_typing")?;
+        let func = SharedOpcodeHandler::load_attr(self, module, helper)?;
+        let result = self.call_callable(func, &[arg1, arg2])?;
+        self.push_value(result)?;
+        Ok(())
+    }
+
     fn call_intrinsic_1(&mut self, func: IntrinsicFunction1) -> Result<(), PyError> {
         match func {
             IntrinsicFunction1::UnaryPositive => {
@@ -1335,6 +1365,16 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
                 // the value passes through unchanged.
                 Ok(())
             }
+            // PEP 695 type-parameter construction (`class C[T]:`, `def f[T]()`).
+            IntrinsicFunction1::TypeVar => self.typing_intrinsic_1("_intrinsic_typevar"),
+            IntrinsicFunction1::ParamSpec => self.typing_intrinsic_1("_intrinsic_paramspec"),
+            IntrinsicFunction1::TypeVarTuple => {
+                self.typing_intrinsic_1("_intrinsic_typevartuple")
+            }
+            IntrinsicFunction1::SubscriptGeneric => {
+                self.typing_intrinsic_1("_intrinsic_subscript_generic")
+            }
+            IntrinsicFunction1::TypeAlias => self.typing_intrinsic_1("_intrinsic_typealias"),
             _ => Err(crate::PyError::type_error(&format!(
                 "intrinsic function {:?} not implemented",
                 func
@@ -1352,6 +1392,16 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
                 let _type_params = self.pop_value()?;
                 // just leave the function on the stack
                 Ok(())
+            }
+            // PEP 695 two-operand type-parameter intrinsics.
+            IntrinsicFunction2::TypeVarWithBound => {
+                self.typing_intrinsic_2("_intrinsic_typevar_with_bound")
+            }
+            IntrinsicFunction2::TypeVarWithConstraint => {
+                self.typing_intrinsic_2("_intrinsic_typevar_with_constraints")
+            }
+            IntrinsicFunction2::SetTypeparamDefault => {
+                self.typing_intrinsic_2("_intrinsic_set_typeparam_default")
             }
             _ => Err(crate::PyError::type_error(&format!(
                 "intrinsic function {:?} not implemented",

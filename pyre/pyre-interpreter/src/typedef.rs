@@ -4342,6 +4342,32 @@ fn union_getitem(args: &[PyObjectRef]) -> crate::PyResult {
     Ok(curr)
 }
 
+/// `UnionType.__class_getitem__(items)` — `typing.Union` is bound to this
+/// type, so `Union[int, str]` folds the members back into `int | str`.  A
+/// single member is returned unwrapped (`Union[int]` is `int`).
+fn union_class_getitem(args: &[PyObjectRef]) -> crate::PyResult {
+    // args[0] = cls (UnionType), args[1] = items.
+    let items_raw = args.get(1).copied().unwrap_or_else(pyre_object::w_none);
+    let items: Vec<PyObjectRef> = if unsafe { pyre_object::is_tuple(items_raw) } {
+        let len = unsafe { pyre_object::w_tuple_len(items_raw) };
+        (0..len)
+            .filter_map(|i| unsafe { pyre_object::w_tuple_getitem(items_raw, i as i64) })
+            .collect()
+    } else {
+        vec![items_raw]
+    };
+    if items.is_empty() {
+        return Err(crate::PyError::type_error(
+            "Cannot take a Union of no types.",
+        ));
+    }
+    let mut curr = items[0];
+    for &next in &items[1..] {
+        curr = crate::genericalias::create_union(curr, next)?;
+    }
+    Ok(curr)
+}
+
 fn init_union_type(ns: &mut DictStorage) {
     // UnionType.__args__ — returns the tuple of union member types
     let args_getter = make_builtin_function_with_arity(
@@ -4380,6 +4406,16 @@ fn init_union_type(ns: &mut DictStorage) {
         ns,
         "__getitem__",
         make_builtin_function("__getitem__", union_getitem),
+    );
+    // UnionType.__class_getitem__ — `typing.Union` is this type, so
+    // `Union[int, str]` folds members into a union.
+    dict_storage_store(
+        ns,
+        "__class_getitem__",
+        pyre_object::propertyobject::w_classmethod_new(make_builtin_function(
+            "__class_getitem__",
+            union_class_getitem,
+        )),
     );
     // UnionType.__or__ — PyPy: UnionType.__or__ → _create_union
     dict_storage_store(
