@@ -2332,6 +2332,7 @@ pub fn dispatch_via_miframe_at_opcode_entry<'a>(
         outer_jitcode_index,
         entry_py_pc,
         None,
+        majit_ir::resumedata::NO_JITCODE_PC,
     );
 
     // pyjitpl.py:82-90 `setup` per-bank allocation: each bank gets
@@ -5049,10 +5050,17 @@ fn collect_outer_active_boxes(
     outer_jitcode_index: u32,
     entry_py_pc: u32,
     guard_py_pc: Option<u32>,
+    carried_jitcode_pc: i32,
 ) -> Vec<OpRef> {
-    let banks = crate::state::frame_liveness_reg_indices_by_bank_at(
+    // `#124` Approach B: resolve the base live-box set through the carried
+    // JitCode coordinate so the encoder's color set matches the decoder's
+    // (`setup_bridge_sym` / `rebuild_inline_callee`), which read the same
+    // carried word.  With the flag off `carried_jitcode_pc` is ignored and
+    // this is the plain `pc_map`-keyed query.
+    let banks = crate::state::frame_liveness_reg_indices_by_bank_at_with_jitcode_pc(
         outer_jitcode_index as i32,
         entry_py_pc as i32,
+        carried_jitcode_pc,
     );
     let mut active = Vec::with_capacity(banks.int.len() + banks.ref_.len() + banks.float.len());
     // RPython `pyjitpl.py:216-233 _get_list_of_active_boxes` reads
@@ -6585,23 +6593,46 @@ fn walker_capture_snapshot_for_last_guard_impl(
             } else {
                 unsafe {
                     let jc = &*sym.jitcode;
-                    Some(python_pc_for_jitcode_pc(&jc.payload.metadata, guard_jc_pc_raw))
+                    Some(python_pc_for_jitcode_pc(
+                        &jc.payload.metadata,
+                        guard_jc_pc_raw,
+                    ))
                 }
             };
             // #124 Approach B (M2): carry the guard's raw JitCode byte offset
-            // as the resume coordinate.  A branch guard stashes its own pc in
-            // `BRANCH_GUARD_JITCODE_PC` (the kept-stack-across-branch precision
-            // `setposition(jitcode, miframe.pc)` preserves); any other guard's
-            // own offset is `op_pc`, a real coordinate on `sym.jitcode` in the
-            // full-body walk.  `after_residual_call` guards resume BEFORE the
-            // call, so their `op_pc` is not a valid resume coordinate — those
-            // keep the sentinel and resume via `py_pc` → `pc_map`.
+            // as the resume coordinate ONLY for branch guards — they stash
+            // their own pc in `BRANCH_GUARD_JITCODE_PC`, the
+            // kept-stack-across-branch precision `setposition(jitcode,
+            // miframe.pc)` preserves and the lossy `py_pc → pc_map` collapses.
+            //
+            // Every other guard (guard_value / guard_class / guard_no_exception,
+            // the `after_residual_call` family) resumes at a `py_pc` whose
+            // operand stack is in a deterministic state with no kept temp, so
+            // its `pc_map` translation is already exact; it keeps the sentinel
+            // and decodes via `py_pc → pc_map`, identical to the flag-off
+            // baseline.  Carrying `op_pc` for those broke encoder ↔ decoder
+            // symmetry: `collect_outer_active_boxes` resolves the reg banks at
+            // the carried coordinate but `live_locals` / `stack_color_map` at
+            // `entry_py_pc`, and for a non-branch guard `op_pc != pc_map[py_pc]`
+            // — the two windows diverge and the decoded box layout mismatches.
             let guard_jitcode_pc: i32 = if guard_jc_pc_raw != usize::MAX {
                 guard_jc_pc_raw as i32
-            } else if after_residual_call {
-                majit_ir::resumedata::NO_JITCODE_PC
             } else {
-                op_pc as i32
+                majit_ir::resumedata::NO_JITCODE_PC
+            };
+            // #124 Approach B: when the carrier holds the guard's own pc (a
+            // branch guard whose not-taken arm is reached by RE-EXECUTING
+            // `goto_if_not`), resume at the guard's Python pc too.  Keying the
+            // snapshot's resume pc on the guard coordinate makes the encoder
+            // liveness window (`collect_outer_active_boxes`), the blackhole
+            // `setposition`, and the cranelift bridge re-trace entry all agree
+            // — the kept operand stack is naturally live at the guard pc, so
+            // the positional `kept_stack_subst` recovery (gpc == entry_py_pc)
+            // is skipped.  Flag-off, `resume_py_pc` stays `py_pc`.
+            let resume_py_pc = if crate::pyjitcode::m3_jitcode_pc_enabled() {
+                guard_py_pc.unwrap_or(py_pc)
+            } else {
+                py_pc
             };
             let active = collect_outer_active_boxes(
                 sym,
@@ -6610,14 +6641,15 @@ fn walker_capture_snapshot_for_last_guard_impl(
                 ctx.registers_r,
                 ctx.registers_f,
                 jitcode_index,
-                py_pc,
+                resume_py_pc,
                 guard_py_pc,
+                guard_jitcode_pc,
             );
             ctx.trace_ctx
                 .capture_snapshot_for_last_guard_with_vable_vref(
                     &active,
                     jitcode_index,
-                    py_pc,
+                    resume_py_pc,
                     guard_jitcode_pc,
                     &vable_boxes,
                     &vref_boxes,
@@ -6722,6 +6754,7 @@ fn compute_inline_caller_frame(
         jitcode_index,
         fallthrough_py_pc,
         None,
+        majit_ir::resumedata::NO_JITCODE_PC,
     );
     if let (Some(saved), true) = (saved, result_color < ctx.registers_r.len()) {
         ctx.registers_r[result_color] = saved;
@@ -12096,24 +12129,40 @@ fn handle(
                 // that corrupts the frame on every odd-path iteration.
                 // Plain `while` / `if` branches resume at depth 0 and pass.
                 //
-                // `PYRE_RELAX_124` opens the gate so the kept-stack
-                // recovery path in `collect_outer_active_boxes` can be
-                // validated against the #124 repros before it is trusted
-                // in production; the env var is unset everywhere except the
-                // targeted repro runs, so production stays on the decline.
-                let relax_124 = std::env::var_os("PYRE_RELAX_124").is_some();
-                if !relax_124
-                    && branch_resume_target_stack_depth(other_target).is_some_and(|d| d > 0)
-                {
+                // Only a kept-stack (depth > 0) resume target is the #124
+                // case; a plain `while` / `if` resumes at depth 0 and the
+                // single-frame snapshot models it exactly.
+                let kept_stack =
+                    branch_resume_target_stack_depth(other_target).is_some_and(|d| d > 0);
+                // #124 Approach B (M4): the kept-stack guard resumes precisely
+                // at its own JitCode pc through the M3 carrier
+                // (`BRANCH_GUARD_JITCODE_PC` → rd_numb → `setposition`), so
+                // when M3 is enabled the gate opens and the guard compiles
+                // instead of declining to the interpreter.  `PYRE_RELAX_124`
+                // is the standalone validation opener — it exercises the
+                // kept-stack recovery path against the #124 repros without the
+                // M3 decode.  With both off, production keeps the conservative
+                // decline (a guard-failure deopt at depth > 0 would restore a
+                // wrong value into a loop-carried slot via the lossy
+                // `py_pc → pc_map` translation).
+                let kept_stack_resume_enabled = crate::pyjitcode::m3_jitcode_pc_enabled()
+                    || std::env::var_os("PYRE_RELAX_124").is_some();
+                if kept_stack && !kept_stack_resume_enabled {
                     return Err(DispatchError::BranchGuardKeptStackUnsupported { pc: op.pc });
                 }
                 ctx.trace_ctx.record_guard(opcode, &[valuebox], 0);
-                // Publish the guard's own jitcode coordinate so the snapshot
-                // encoder can recover kept operand-stack values from the
-                // guard-pc register file (the resume coordinate
-                // `other_target` names a merge point whose live colors the
-                // walk has not written at the guard point).
-                BRANCH_GUARD_JITCODE_PC.with(|c| c.set(op.pc));
+                // Publish the guard's own jitcode coordinate ONLY for the
+                // kept-stack case so the snapshot encoder recovers the kept
+                // operand-stack values from the guard-pc register file (the
+                // resume coordinate `other_target` names a merge point whose
+                // live colors the walk has not written at the guard point).
+                // A depth-0 branch resumes losslessly at `other_target` via
+                // the baseline `py_pc → pc_map` path; routing it through the
+                // guard-pc carrier would resume one opcode early (re-running
+                // `goto_if_not`) and desync the decoded box layout.
+                if kept_stack {
+                    BRANCH_GUARD_JITCODE_PC.with(|c| c.set(op.pc));
+                }
                 let capture = walker_capture_snapshot_for_last_guard(ctx, other_target);
                 BRANCH_GUARD_JITCODE_PC.with(|c| c.set(usize::MAX));
                 capture?;

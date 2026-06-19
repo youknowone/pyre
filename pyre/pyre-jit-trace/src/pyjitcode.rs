@@ -300,6 +300,19 @@ pub fn portal_red_pre_regalloc_slots(nlocals: usize, max_stackdepth: usize) -> (
     (portal_frame_reg, portal_ec_reg)
 }
 
+/// `#124` Approach B master switch (`PYRE_M3_JITCODE_PC`, default off).
+///
+/// When set, guard frames resume at their carried direct JitCode pc
+/// instead of the lossy `pc_map` translation of the stored Python pc, and
+/// the encoder collects the guard-pc live box set directly rather than the
+/// resume-pc set patched by the positional kept-stack heuristic.  Off by
+/// default so production keeps the heuristic path; the kept-stack-precision
+/// payoff is validated by flipping the flag on (corpus + CI).
+pub(crate) fn m3_jitcode_pc_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("PYRE_M3_JITCODE_PC").is_some())
+}
+
 impl PyJitCode {
     pub fn new(payload: PyJitCodePayload) -> Self {
         Self {
@@ -454,6 +467,46 @@ impl PyJitCode {
         } else {
             self.resume_jitcode_pc_for(py_pc as usize)
         }
+    }
+
+    /// `#124` Approach B resolver: translate a guard frame's resume
+    /// coordinate, preferring the carried direct JitCode pc (`carried`,
+    /// the rd_numb per-frame `jitcode_pc` word populated by M2) over the
+    /// lossy `pc_map` translation of the stored Python pc.
+    ///
+    /// `resolve_resume_pc(raw_pc)` routes the Python pc through `pc_map`,
+    /// which collapses every kept-operand-stack-across-branch state at one
+    /// Python pc to a single JitCode offset — the precision loss `#124`
+    /// fixes.  When `carried` names a valid startpoint, it IS the
+    /// kept-stack-precise coordinate `setposition(jitcode, miframe.pc)`
+    /// preserves upstream, so it is returned directly.
+    ///
+    /// The encoder (box collection) and decoder (box count + setposition)
+    /// both funnel through this with identical `(raw_pc, carried, op_live)`,
+    /// so the chosen offset — and hence the live-box layout — is symmetric
+    /// by construction.  Gated by [`m3_jitcode_pc_enabled`]: with the flag
+    /// off the carried word is ignored and behaviour is identical to
+    /// [`Self::resolve_resume_pc`].
+    ///
+    /// The carried word is preferred only when it is a `-live-`-anchored
+    /// coordinate ([`JitCode::can_decode_live_vars`]); a startpoint that is
+    /// not so anchored (a synthesized specialization guard's `may_force`
+    /// CALL op) falls through to the `pc_map` translation so
+    /// `get_live_vars_info` never hits `_missing_liveness`.
+    pub fn resolve_resume_pc_with_jitcode_pc(
+        &self,
+        raw_pc: i32,
+        carried: i32,
+        op_live: u8,
+    ) -> Option<usize> {
+        if m3_jitcode_pc_enabled() && carried != majit_ir::resumedata::NO_JITCODE_PC && carried >= 0
+        {
+            let jp = carried as usize;
+            if self.jitcode.can_decode_live_vars(jp, op_live) {
+                return Some(jp);
+            }
+        }
+        self.resolve_resume_pc(raw_pc)
     }
 
     /// Skeleton slot inserted by [`Self::skeleton`] — neither `code`

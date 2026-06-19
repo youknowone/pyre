@@ -13962,8 +13962,8 @@ fn collect_guards(
             {
                 use majit_ir::resumedata::{get_frame_value_count_fn, rebuild_from_numbering};
                 let fvc = get_frame_value_count_fn();
-                let fvc_ref: Option<&dyn Fn(i32, i32) -> usize> =
-                    fvc.as_ref().map(|f| f as &dyn Fn(i32, i32) -> usize);
+                let fvc_ref: Option<&dyn Fn(i32, i32, i32) -> usize> =
+                    fvc.as_ref().map(|f| f as &dyn Fn(i32, i32, i32) -> usize);
                 let num_virtuals = op.resolved_rd_virtuals().map_or(0, |v| v.len());
                 let (_nfa, _vable, _vref, frames) = rebuild_from_numbering(
                     &rd_numb_bytes,
@@ -14012,8 +14012,8 @@ fn collect_guards(
             use majit_ir::resumedata::{self, RebuiltValue, rebuild_from_numbering};
             let rd_consts_ref: &[majit_ir::Const] = &rd_consts_data;
             let fvc = majit_ir::resumedata::get_frame_value_count_fn();
-            let fvc_ref: Option<&dyn Fn(i32, i32) -> usize> =
-                fvc.as_ref().map(|f| f as &dyn Fn(i32, i32) -> usize);
+            let fvc_ref: Option<&dyn Fn(i32, i32, i32) -> usize> =
+                fvc.as_ref().map(|f| f as &dyn Fn(i32, i32, i32) -> usize);
             let num_virtuals = rd_vi.as_ref().map_or(0, |v| v.len());
             let (_num_failargs, _vable_values, _vref_values, frames) = rebuild_from_numbering(
                 &rd_numb_bytes,

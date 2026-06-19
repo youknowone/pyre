@@ -542,6 +542,41 @@ impl JitCode {
         crate::liveness::decode_offset(&self.code, pc + 1)
     }
 
+    /// `True` when `pc` is a recorded resume startpoint (`jitcode.py:85`
+    /// `assert pc in self._startpoints`).  The `#124` direct-JitCode
+    /// resume path consults this to decide whether a carried `jitcode_pc`
+    /// can drive `setposition`/liveness directly instead of routing the
+    /// stored Python pc through the lossy `pc_map`.  `False` for an
+    /// unassembled jitcode (`startpoints is None`) or a pc outside the set.
+    pub fn is_valid_startpoint(&self, pc: usize) -> bool {
+        self.startpoints.as_ref().is_some_and(|s| s.contains(&pc))
+    }
+
+    /// `True` when `get_live_vars_info(pc, op_live)` would decode without
+    /// hitting `_missing_liveness` — i.e. `pc` is anchored at a `-live-`
+    /// marker either directly (`code[pc] == op_live`) or via the same
+    /// `OFFSET_SIZE + 1` backtrack `get_live_vars_info` performs
+    /// (`code[pc - OFFSET_SIZE - 1] == op_live`).
+    ///
+    /// `is_valid_startpoint` alone is NOT sufficient for the `#124`
+    /// direct-resume gate: the assembler records a startpoint before
+    /// EVERY emitted op, so a synthesized specialization guard whose
+    /// carried `jitcode_pc` is a `residual_call`/`may_force` CALL op
+    /// (emitted as `[funcptr, Call, -live-]`, the marker AFTER the call)
+    /// passes `is_valid_startpoint` yet has no preceding `-live-` — feeding
+    /// it to `get_live_vars_info` panics.  This predicate rejects those so
+    /// the resolver falls back to the `pc_map` translation of the stored
+    /// Python pc, which lands on the opcode's own start marker.
+    pub fn can_decode_live_vars(&self, pc: usize, op_live: u8) -> bool {
+        if self.code.get(pc) == Some(&op_live) {
+            return true;
+        }
+        match pc.checked_sub(crate::liveness::OFFSET_SIZE + 1) {
+            Some(back) => self.code.get(back) == Some(&op_live),
+            None => false,
+        }
+    }
+
     /// RPython `jitcode.py:95-100` `_missing_liveness(self, pc)`:
     ///
     /// ```python

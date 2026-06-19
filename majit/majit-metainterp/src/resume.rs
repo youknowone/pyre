@@ -5048,7 +5048,7 @@ mod tests {
 
         // Roundtrip with liveness-based closure.
         let rd_consts: Vec<majit_ir::Const> = memo.consts().to_vec();
-        let frame_count = |jitcode_index: i32, _pc: i32| -> usize {
+        let frame_count = |jitcode_index: i32, _pc: i32, _jitcode_pc: i32| -> usize {
             match jitcode_index {
                 0 => 2, // Frame 0 has 2 boxes
                 1 => 2, // Frame 1 has 2 boxes
@@ -5201,9 +5201,10 @@ mod tests {
             BC_CATCH_EXCEPTION as i32,
             BC_RVMPROF_CODE as i32,
         );
-        let resolve_jitcode = |_jitcode_pos: i32, _pc: i32| -> Option<ResolvedJitCode> {
-            Some(ResolvedJitCode::new(runtime.clone(), 0))
-        };
+        let resolve_jitcode =
+            |_jitcode_pos: i32, _pc: i32, _jitcode_pc: i32| -> Option<ResolvedJitCode> {
+                Some(ResolvedJitCode::new(runtime.clone(), 0))
+            };
 
         let all_liveness: Vec<u8> = vec![0, 0, 0];
         let (bh, virtualizable_ptr) = blackhole_from_resumedata(
@@ -6711,14 +6712,18 @@ impl<'a> ResumeDataDirectReader<'a> {
         resolve_jitcode: &dyn Fn(
             i32,
             i32,
+            i32,
         )
             -> Option<(std::sync::Arc<crate::jitcode::JitCode>, usize, u8)>,
         outputs: &mut Vec<i64>,
     ) -> bool {
         while !self.done_reading() {
-            // resume.py:1338-1340 read_jitcode_pos_pc.
-            let (jitcode_pos, pc, _jitcode_pc) = self.read_jitcode_pos_pc();
-            let Some((jitcode, resolved_pc, op_live)) = resolve_jitcode(jitcode_pos, pc) else {
+            // resume.py:1338-1340 read_jitcode_pos_pc.  `#124`: forward the
+            // carried direct JitCode pc to the resolver.
+            let (jitcode_pos, pc, jitcode_pc) = self.read_jitcode_pos_pc();
+            let Some((jitcode, resolved_pc, op_live)) =
+                resolve_jitcode(jitcode_pos, pc, jitcode_pc)
+            else {
                 return false;
             };
             // `blackhole.rs:1435 get_current_position_info` parity —
@@ -7059,7 +7064,7 @@ impl ResolvedJitCode {
 
 pub fn blackhole_from_resumedata<'a>(
     builder: &mut crate::blackhole::BlackholeInterpBuilder,
-    resolve_jitcode: &dyn Fn(i32, i32) -> Option<ResolvedJitCode>,
+    resolve_jitcode: &dyn Fn(i32, i32, i32) -> Option<ResolvedJitCode>,
     rd_numb: &'a [u8],
     rd_consts: &'a [majit_ir::Const],
     all_liveness: &'a [u8],
@@ -7112,9 +7117,11 @@ pub fn blackhole_from_resumedata<'a>(
         nextbh.nextblackholeinterp = curbh;
 
         // resume.py:1338-1340
-        let (jitcode_pos, pc, _jitcode_pc) = resumereader.read_jitcode_pos_pc();
-        // resume.py:1339-1340: jitcode = jitcodes[jitcode_pos]; curbh.setposition(jitcode, pc)
-        let resolved = resolve_jitcode(jitcode_pos, pc)?;
+        let (jitcode_pos, pc, jitcode_pc) = resumereader.read_jitcode_pos_pc();
+        // resume.py:1339-1340: jitcode = jitcodes[jitcode_pos]; curbh.setposition(jitcode, pc).
+        // `#124`: pass the carried direct JitCode pc so the resolver can
+        // prefer it over the lossy `pc_map` translation.
+        let resolved = resolve_jitcode(jitcode_pos, pc, jitcode_pc)?;
         if std::env::var_os("MAJIT_BH_DEBUG").is_some() {
             eprintln!(
                 "[bh-frame] jitcode_pos={jitcode_pos} encoded_pc={pc} resolved_pc={}",

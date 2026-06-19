@@ -1188,7 +1188,7 @@ pub(crate) fn sub_jitcode_descr_pool_for_code(code: *const ()) -> Option<SubDesc
 /// `LiveVars` analysis over the Python bytecode. This path is used
 /// for inlined callee frames whose majit_jitcode has not been built
 /// at trace time.
-pub fn frame_value_count_at(jitcode_index: i32, pc: i32) -> usize {
+pub fn frame_value_count_at(jitcode_index: i32, pc: i32, carried_jitcode_pc: i32) -> usize {
     ensure_finish_setup();
     METAINTERP_SD.with(|r| {
         let sd = r.borrow();
@@ -1199,10 +1199,13 @@ pub fn frame_value_count_at(jitcode_index: i32, pc: i32) -> usize {
         };
         let payload = &jc.payload;
         // The rd_numb pc word may carry the after-residual-call marker;
-        // `resolve_resume_pc` routes it through the right map, while
-        // `real_pc` is the plain Python PC for the py_pc-keyed fallbacks.
+        // `resolve_resume_pc_with_jitcode_pc` prefers the carried direct
+        // JitCode pc (`#124`) when it names a valid startpoint and otherwise
+        // routes the marker through the right map.  `real_pc` is the plain
+        // Python PC for the py_pc-keyed fallbacks.
         let real_pc = majit_ir::resumedata::decode_resume_pc(pc).0;
-        let resolved_jit_pc: Option<usize> = payload.resolve_resume_pc(pc);
+        let resolved_jit_pc: Option<usize> =
+            payload.resolve_resume_pc_with_jitcode_pc(pc, carried_jitcode_pc, sd.op_live);
         if let Some(jit_pc) = resolved_jit_pc {
             let off = payload.jitcode.get_live_vars_info(jit_pc, sd.op_live);
             let all_liveness: &[u8] = &sd.liveness_info;
@@ -1379,6 +1382,25 @@ pub fn frame_liveness_reg_indices_by_bank_at(
     jitcode_index: i32,
     pc: i32,
 ) -> FrameLivenessRegIndices {
+    frame_liveness_reg_indices_by_bank_at_with_jitcode_pc(
+        jitcode_index,
+        pc,
+        majit_ir::resumedata::NO_JITCODE_PC,
+    )
+}
+
+/// `#124` Approach B encoder/decoder liveness query: identical to
+/// [`frame_liveness_reg_indices_by_bank_at`] but resolves the JitCode
+/// coordinate through [`PyJitCode::resolve_resume_pc_with_jitcode_pc`],
+/// preferring the carried `jitcode_pc` over the lossy `pc_map`.  The
+/// snapshot encoder (`collect_outer_active_boxes`) and the bridge/inline
+/// decoders (`setup_bridge_sym`, `rebuild_inline_callee`) call this with
+/// the SAME carried word so their register color sets agree.
+pub fn frame_liveness_reg_indices_by_bank_at_with_jitcode_pc(
+    jitcode_index: i32,
+    pc: i32,
+    carried_jitcode_pc: i32,
+) -> FrameLivenessRegIndices {
     ensure_finish_setup();
     METAINTERP_SD.with(|r| {
         let sd = r.borrow();
@@ -1415,7 +1437,8 @@ pub fn frame_liveness_reg_indices_by_bank_at(
                 float: Vec::new(),
             };
         }
-        let resolved_jit_pc: Option<usize> = payload.resolve_resume_pc(pc);
+        let resolved_jit_pc: Option<usize> =
+            payload.resolve_resume_pc_with_jitcode_pc(pc, carried_jitcode_pc, sd.op_live);
         let Some(jit_pc) = resolved_jit_pc else {
             return FrameLivenessRegIndices::default();
         };
@@ -5090,7 +5113,11 @@ fn reconstruct_inline_recipe(
     }
     let nlocals = code_ref.varnames.len();
 
-    let reg_indices = frame_liveness_reg_indices_by_bank_at(frame.jitcode_index, frame.pc);
+    let reg_indices = frame_liveness_reg_indices_by_bank_at_with_jitcode_pc(
+        frame.jitcode_index,
+        frame.pc,
+        frame.jitcode_pc,
+    );
     // resume.py:1054 consume_boxes: the liveness enumeration count must match
     // the encoded frame section exactly.
     if reg_indices.total_len() != frame.values.len() {
@@ -7202,8 +7229,11 @@ impl JitState for PyreJitState {
         // a single `registers_X` vector by abstract register color —
         // there is no `idx < nlocals` decode.
         let frame0 = &resume_data.frames[0];
-        let reg_indices =
-            crate::state::frame_liveness_reg_indices_by_bank_at(frame0.jitcode_index, frame0.pc);
+        let reg_indices = crate::state::frame_liveness_reg_indices_by_bank_at_with_jitcode_pc(
+            frame0.jitcode_index,
+            frame0.pc,
+            frame0.jitcode_pc,
+        );
         let stack_only = bridge_valuestackdepth.saturating_sub(nlocals);
         let bridge_reg_len = nlocals + stack_only;
         let mut bridge_registers_r = vec![OpRef::NONE; bridge_reg_len];
