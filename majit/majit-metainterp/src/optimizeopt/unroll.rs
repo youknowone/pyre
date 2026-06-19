@@ -1330,10 +1330,56 @@ impl UnrollOptimizer {
                 exported_short_label_args.len(),
                 "short_inputargs must pair 1:1 with short_label_args for info carry"
             );
+            // Per-slot original box (what each renamed short inputarg replaces),
+            // recovered from the produced InputArg short boxes via
+            // `label_arg_idx` — `shortpreamble.py:417` keys the info lookup by
+            // `produced_op.short_op.res` (the original) — instead of the
+            // parallel `short_label_args` array. Every label/virtual slot
+            // produces an InputArg entry (`add_short_input_arg` runs per slot,
+            // `produced_ops` materializes all, and the const-fold drop at the
+            // export boundary is inert for the portal), so the map is total.
+            let mut slot_to_original: Vec<Option<OpRef>> =
+                vec![None; initial_sp.inputargs.len()];
+            for (_, produced) in &exported_short_boxes_produced {
+                if !matches!(
+                    produced.kind,
+                    crate::optimizeopt::shortpreamble::PreambleOpKind::InputArg
+                ) {
+                    continue;
+                }
+                if let Some(slot) = produced.label_arg_idx {
+                    if slot < slot_to_original.len() {
+                        slot_to_original[slot] = Some(produced.res.to_opref());
+                    }
+                }
+            }
             let mut infos = Vec::with_capacity(initial_sp.inputargs.len());
             for (i, inputarg) in initial_sp.inputargs.iter().enumerate() {
                 // Phase-2 info of the original box this short inputarg renames.
-                let original = exported_short_label_args.get(i).copied();
+                let original = slot_to_original[i];
+                // Transitional lock vs the parallel `short_label_args` array
+                // (deleted once the rename moves to export time). A box that
+                // appears twice in `label_args + virtuals` produces ONE entry
+                // keyed at its first slot, so `slot_to_original` is None at the
+                // later (dead) duplicate slot while `short_label_args` still
+                // records the per-slot original. The dead slot's box carries no
+                // info (shortpreamble.py:414-417), so None is correct there;
+                // require an exact match only at live slots.
+                #[cfg(debug_assertions)]
+                {
+                    let expected = exported_short_label_args.get(i).copied();
+                    let is_dead_dup = original.is_none()
+                        && expected.map_or(false, |e| {
+                            exported_short_label_args[..i].contains(&e)
+                        });
+                    debug_assert!(
+                        original == expected || is_dead_dup,
+                        "inputarg_infos slot {i} original re-derived from \
+                         label_arg_idx ({original:?}) diverged from \
+                         short_label_args ({expected:?}) and is not a dead \
+                         duplicate slot"
+                    );
+                }
                 let info = original
                     .and_then(|o| final_ctx.get_box_replacement_box(o))
                     .or_else(|| final_ctx.resolve_box_box_opt(inputarg))
