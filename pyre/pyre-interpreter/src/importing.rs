@@ -245,6 +245,14 @@ pub fn install_builtin_modules() {
     // Empty C-extension stubs — `_opcode_metadata.py` etc. exist in the
     // real stdlib and are loaded from disk, but their builtin shims here
     // simply succeed at `import X`.
+    //
+    // Modules whose stdlib wrapper does `import X` + attribute access or
+    // `from X import *` are deliberately NOT stubbed here: an empty stub
+    // makes the `import` succeed and the later access raise AttributeError
+    // (or silently bind nothing), which the wrapper's `try/except
+    // ImportError` cannot recover from.  Leaving them unregistered lets the
+    // pure-Python fallback take over: `_datetime` -> `_pydatetime`,
+    // `_decimal` -> `_pydecimal`, `_asyncio` -> pure-Python asyncio.
     for name in &[
         "_string",
         "_warnings",
@@ -259,14 +267,11 @@ pub fn install_builtin_modules() {
         "_sha1",
         "_sha3",
         "_blake2",
-        "_decimal",
-        "_datetime",
         "_json",
         "_csv",
         "marshal",
         "_tracemalloc",
         "_stat",
-        "_asyncio",
         "_queue",
         "_zoneinfo",
         "array",
@@ -490,6 +495,27 @@ pub fn set_sys_module(name: &str, module: PyObjectRef) {
     });
 }
 
+/// Remove a (partially initialised) module from `sys.modules`.
+///
+/// `importlib._bootstrap._load` deletes the module it pre-registered when
+/// `exec_module` raises, so a retried import re-executes the body rather
+/// than handing back a half-built module.  Without this a failed
+/// `import ssl` (missing `_ssl`) leaves a broken `ssl` shell behind, and
+/// the next `import ssl` succeeds with no `SSLWantReadError`, etc.
+pub fn remove_sys_module(name: &str) {
+    SYS_MODULES.with(|m| {
+        m.borrow_mut().remove(name);
+    });
+    SYS_MODULES_DICT.with(|d| {
+        let dict = d.get();
+        if !dict.is_null() {
+            unsafe {
+                pyre_object::w_dict_delitem_str(dict, name);
+            }
+        }
+    });
+}
+
 /// GC root walk over every loaded module's dict storage.
 ///
 /// Modules (`malloc_typed`) and their `W_ModuleDictObject`s are
@@ -603,7 +629,16 @@ enum FindInfo {
 }
 
 #[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
-fn find_module(partname: &str) -> Option<FindInfo> {
+fn find_module(partname: &str, parent_dirs: Option<&[PathBuf]>) -> Option<FindInfo> {
+    // Submodule import: search ONLY the parent package's `__path__`, never
+    // sys.path or builtins by leaf name.  `_bootstrap._find_and_load` resolves
+    // `pkg.sub` against `pkg.__path__`; routing through sys.path lets a
+    // same-leaf module from an unrelated package on sys.path shadow it (e.g.
+    // `concurrent.futures` resolving to `asyncio/futures.py`).
+    if let Some(dirs) = parent_dirs {
+        return find_in_dirs(partname, dirs);
+    }
+
     // Check builtin modules first (PyPy: space.builtin_modules check in find_module)
     let is_builtin = BUILTIN_MODULES.with(|m| m.borrow().contains_key(partname));
     if is_builtin {
@@ -621,7 +656,7 @@ fn find_module(partname: &str) -> Option<FindInfo> {
 }
 
 #[cfg(any(not(feature = "host_env"), target_arch = "wasm32"))]
-fn find_module(partname: &str) -> Option<FindInfo> {
+fn find_module(partname: &str, _parent_dirs: Option<&[PathBuf]>) -> Option<FindInfo> {
     let is_builtin = BUILTIN_MODULES.with(|m| m.borrow().contains_key(partname));
     if is_builtin {
         return Some(FindInfo::Builtin);
@@ -647,27 +682,55 @@ fn ensure_stdlib_path() {
 }
 
 #[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
-fn find_in_sys_path(partname: &str) -> Option<FindInfo> {
-    SYS_PATH.with(|p| {
-        let path = p.borrow();
-        for dir in path.iter() {
-            // Check for package: <dir>/<partname>/__init__.py
-            let pkg_dir = dir.join(partname);
-            let init_file = pkg_dir.join("__init__.py");
-            if init_file.is_file() {
-                return Some(FindInfo::Package { dirpath: pkg_dir });
-            }
+fn find_in_dirs(partname: &str, dirs: &[PathBuf]) -> Option<FindInfo> {
+    for dir in dirs {
+        // Check for package: <dir>/<partname>/__init__.py
+        let pkg_dir = dir.join(partname);
+        let init_file = pkg_dir.join("__init__.py");
+        if init_file.is_file() {
+            return Some(FindInfo::Package { dirpath: pkg_dir });
+        }
 
-            // Check for source file: <dir>/<partname>.py
-            let source_file = dir.join(format!("{partname}.py"));
-            if source_file.is_file() {
-                return Some(FindInfo::SourceFile {
-                    pathname: source_file,
-                });
+        // Check for source file: <dir>/<partname>.py
+        let source_file = dir.join(format!("{partname}.py"));
+        if source_file.is_file() {
+            return Some(FindInfo::SourceFile {
+                pathname: source_file,
+            });
+        }
+    }
+    None
+}
+
+#[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
+fn find_in_sys_path(partname: &str) -> Option<FindInfo> {
+    SYS_PATH.with(|p| find_in_dirs(partname, &p.borrow()))
+}
+
+/// Extract a package module's `__path__` as filesystem directories.
+///
+/// Returns `None` when the module is not a package (no `__path__` list), so
+/// the caller can fall back to the top-level (sys.path) search for the rare
+/// builtin packages that carry no on-disk `__path__`.
+fn parent_package_path(parent: PyObjectRef) -> Option<Vec<PathBuf>> {
+    let w_dict = unsafe { pyre_object::w_module_get_w_dict(parent) };
+    if w_dict.is_null() || !unsafe { pyre_object::is_dict(w_dict) } {
+        return None;
+    }
+    let path_obj = unsafe { pyre_object::w_dict_getitem_str(w_dict, "__path__") }?;
+    if path_obj.is_null() || !unsafe { pyre_object::is_list(path_obj) } {
+        return None;
+    }
+    let n = unsafe { pyre_object::listobject::w_list_len(path_obj) };
+    let mut dirs = Vec::with_capacity(n);
+    for i in 0..n {
+        if let Some(item) = unsafe { pyre_object::listobject::w_list_getitem(path_obj, i as i64) } {
+            if unsafe { pyre_object::is_str(item) } {
+                dirs.push(PathBuf::from(unsafe { pyre_object::w_str_get_value(item) }));
             }
         }
-        None
-    })
+    }
+    Some(dirs)
 }
 
 // ── parse_source_module ──────────────────────────────────────────────
@@ -823,6 +886,7 @@ pub fn appleveldef_install(ns: &mut DictStorage, source: &str, filename: &str, n
 fn load_source_module(
     modulename: &str,
     pathname: &Path,
+    package_dir: Option<&Path>,
     execution_context: *const PyExecutionContext,
 ) -> Result<PyObjectRef, crate::PyError> {
     let source = host_fs::read_to_string(pathname).map_err(|e| {
@@ -861,12 +925,30 @@ fn load_source_module(
     // (`pypy/module/imp/interp_import.py`); pyre has no `_prepare_module`
     // yet, so we still seed it here as a TODO until
     // the prepare-module path is ported.
-    let pkg = if let Some(dot) = modulename.rfind('.') {
+    // A package's `__init__.py` is its own `__package__`; a plain module's
+    // `__package__` is its containing package.
+    let pkg = if package_dir.is_some() {
+        modulename
+    } else if let Some(dot) = modulename.rfind('.') {
         &modulename[..dot]
     } else {
         modulename
     };
     crate::dict_storage_store(&mut namespace, "__package__", pyre_object::w_str_new(pkg));
+
+    // Seed `__path__` BEFORE executing the package body so relative imports
+    // inside `__init__.py` (`from .sub import *`) resolve against the package
+    // directory.  `_bootstrap` sets `__path__` on the module before
+    // `exec_module`; setting it afterwards lets those imports fall through to
+    // sys.path and pick up a same-leaf module from an unrelated package.
+    if let Some(dir) = package_dir {
+        let path_str = pyre_object::w_str_new(&dir.to_string_lossy());
+        crate::dict_storage_store(
+            &mut namespace,
+            "__path__",
+            pyre_object::w_list_new(vec![path_str]),
+        );
+    }
 
     let ns_ptr = Box::into_raw(namespace);
 
@@ -893,7 +975,16 @@ fn load_source_module(
     // `exec_code_module`; pyre has no .pyc cache today so cpathname is
     // always None, matching the PyPy `cpathname is None` arm at line
     // 282-283.
-    exec_code_module(code, ns_ptr, execution_context, Some(&pathname_str), None)?;
+    //
+    // On exec failure drop the pre-registered module from sys.modules
+    // (`_bootstrap._load`) so a retried import re-runs the body instead of
+    // observing a half-built module.
+    if let Err(e) =
+        exec_code_module(code, ns_ptr, execution_context, Some(&pathname_str), None)
+    {
+        remove_sys_module(modulename);
+        return Err(e);
+    }
 
     // Module-level code may have rewritten `sys.modules[name]` (the
     // `decimal` → `_pydecimal` pattern, or PyPy's `_cffi_backend` style
@@ -917,36 +1008,12 @@ fn load_package(
     dirpath: &Path,
     execution_context: *const PyExecutionContext,
 ) -> Result<PyObjectRef, crate::PyError> {
-    // Add package directory to sys.path BEFORE executing __init__.py,
-    // so that relative sub-imports within the package can find siblings.
-    // PyPy: sets __path__ on module before exec.
-    add_sys_path(dirpath);
-
+    // `__path__` / `__package__` are seeded in `load_source_module` BEFORE
+    // the body runs (relative imports in `__init__.py` need them in place),
+    // and `__init__.py` may legitimately rewrite `__path__` (namespace
+    // packages via `pkgutil.extend_path`), so they are not re-stamped here.
     let init_path = dirpath.join("__init__.py");
-    let module = load_source_module(modulename, &init_path, execution_context)?;
-
-    // Set __path__ and __package__ on the module namespace via
-    // `module.w_dict` so storage-backed and dict-subclass-backed Modules
-    // both observe the writes (`pypy/module/__builtin__/moduledef.py:102-103
-    // Module(space, None, w_builtin)`).  When the dict is storage-backed
-    // the proxy store hook propagates the entry into the underlying
-    // DictStorage; when it's a subclass instance the write lands in the
-    // entries Vec where the subclass's `__init__` placed any seeded keys.
-    let w_dict = unsafe { pyre_object::w_module_get_w_dict(module) };
-    let path_str = pyre_object::w_str_new(&dirpath.to_string_lossy());
-    let path_list = pyre_object::w_list_new(vec![path_str]);
-    unsafe {
-        if !w_dict.is_null() && pyre_object::is_dict(w_dict) {
-            pyre_object::dictmultiobject::w_dict_setitem_str(w_dict, "__path__", path_list);
-            pyre_object::dictmultiobject::w_dict_setitem_str(
-                w_dict,
-                "__package__",
-                pyre_object::w_str_new(modulename),
-            );
-        }
-    }
-
-    Ok(module)
+    load_source_module(modulename, &init_path, Some(dirpath), execution_context)
 }
 
 // ── load_part ────────────────────────────────────────────────────────
@@ -955,6 +1022,7 @@ fn load_package(
 fn load_part(
     modulename: &str,
     partname: &str,
+    parent_dirs: Option<&[PathBuf]>,
     execution_context: *const PyExecutionContext,
 ) -> Result<Option<PyObjectRef>, crate::PyError> {
     // Check sys.modules cache first
@@ -989,7 +1057,7 @@ fn load_part(
     }
 
     // Find the module on disk
-    let find_info = find_module(partname);
+    let find_info = find_module(partname, parent_dirs);
     let Some(info) = find_info else {
         return Ok(None);
     };
@@ -997,7 +1065,7 @@ fn load_part(
     let module = match info {
         #[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
         FindInfo::SourceFile { pathname } => {
-            match load_source_module(modulename, &pathname, execution_context) {
+            match load_source_module(modulename, &pathname, None, execution_context) {
                 Ok(m) => m,
                 Err(e) => {
                     return Err(e);
@@ -1045,7 +1113,10 @@ fn absolute_import(
     for (level, &part) in parts.iter().enumerate() {
         prefix.push(part);
         let full_name = prefix.join(".");
-        let w_mod = load_part(&full_name, part, execution_context)?;
+        // A submodule is resolved against its parent package's `__path__`;
+        // top-level names (level 0, no parent) search sys.path.
+        let parent_dirs = parent.and_then(parent_package_path);
+        let w_mod = load_part(&full_name, part, parent_dirs.as_deref(), execution_context)?;
         let Some(module) = w_mod else {
             return Err(crate::PyError::new(
                 crate::PyErrorKind::ModuleNotFoundError,
@@ -1251,25 +1322,39 @@ pub fn import_from(
                 if !modname_obj.is_null() && unsafe { pyre_object::is_str(modname_obj) } {
                     let modname = unsafe { pyre_object::w_str_get_value(modname_obj) };
                     let fullname = format!("{modname}.{name}");
-                    if importhook(
+                    match importhook(
                         &fullname,
                         std::ptr::null_mut(),
                         std::ptr::null_mut(),
                         0,
                         execution_context,
-                    )
-                    .is_ok()
-                    {
-                        // importhook returns the top-level module when
-                        // fromlist is empty. Retrieve the actual leaf
-                        // module from sys.modules.
-                        if let Some(submod) = check_sys_modules(&fullname) {
-                            unsafe {
-                                pyre_object::dictmultiobject::w_dict_setitem_str(
-                                    w_dict, name, submod,
-                                );
+                    ) {
+                        Ok(_) => {
+                            // importhook returns the top-level module when
+                            // fromlist is empty. Retrieve the actual leaf
+                            // module from sys.modules.
+                            if let Some(submod) = check_sys_modules(&fullname) {
+                                unsafe {
+                                    pyre_object::dictmultiobject::w_dict_setitem_str(
+                                        w_dict, name, submod,
+                                    );
+                                }
+                                return Ok(submod);
                             }
-                            return Ok(submod);
+                        }
+                        Err(e) => {
+                            // A ModuleNotFoundError naming `fullname` itself
+                            // means `name` is simply not a submodule, so fall
+                            // through to the attribute-style "cannot import
+                            // name".  Any other failure is a transitive import
+                            // error inside the submodule and must propagate
+                            // rather than be masked (`_handle_fromlist`).
+                            let absent_submodule = e.kind
+                                == crate::PyErrorKind::ModuleNotFoundError
+                                && e.message.contains(&format!("'{fullname}'"));
+                            if !absent_submodule {
+                                return Err(e);
+                            }
                         }
                     }
                 }
@@ -1451,7 +1536,7 @@ mod tests {
     #[test]
     fn test_find_module_nonexistent() {
         // Should not find a module that doesn't exist
-        let result = find_module("__nonexistent_pyre_test_module__");
+        let result = find_module("__nonexistent_pyre_test_module__", None);
         assert!(result.is_none());
     }
 }
