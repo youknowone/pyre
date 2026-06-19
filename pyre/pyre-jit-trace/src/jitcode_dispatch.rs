@@ -7704,6 +7704,33 @@ fn try_walker_inline_user_call(
     // `recursive-call-assembler`, so route the enclosing key there
     // (`FBW_DECLINED_KEYS`) instead of recording the slow residual.
     if !callee_fast_path_inlinable(body.code, callee_descr_refs, ctx) {
+        // #62: a self-recursive single-int call (`fib`'s shape) the fast-path
+        // inline cannot serve is handled instead by the direct
+        // `CALL_ASSEMBLER` arm (`try_walker_call_assembler_self_recursive`).
+        // That arm is only reached when this inline attempt returns
+        // `Ok(None)`; an `Err` propagates out of the dispatcher via `?` and
+        // preempts it.  Detect the self-recursive single-int shape and fall
+        // through so the CA arm gets its chance.  Gate on the same
+        // `PYRE_FBW_REC_CA` flag the CA arm uses: when it is off the CA arm
+        // declines and the call would land on a deopt-storming residual, so
+        // keep the trait-leg decline there.  Non-self-recursive loop/branch
+        // callees always keep the decline (FBW_DECLINED_KEYS → trait leg).
+        let rec_ca_on =
+            std::env::var_os("PYRE_FBW_REC_CA").as_deref() != Some(std::ffi::OsStr::new("0"));
+        let is_self_recursive_single_int = rec_ca_on
+            && nparams == 1
+            && {
+                let sym_ptr = FULL_BODY_SNAPSHOT_SYM.with(|c| c.get());
+                !sym_ptr.is_null()
+                    && unsafe { (*(*sym_ptr).jitcode).code } as usize == w_code as usize
+            }
+            && matches!(
+                arg_concretes.get(2),
+                Some(ConcreteValue::Ref(a)) if !a.is_null() && unsafe { pyre_object::is_int(*a) }
+            );
+        if is_self_recursive_single_int {
+            return Ok(None);
+        }
         return Err(DispatchError::LoopBearingCalleeInlineUnsupported { pc: op.pc });
     }
 
