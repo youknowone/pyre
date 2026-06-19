@@ -3756,13 +3756,14 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
                 || name == "__code__"
                 || name == "__func__"
                 || name == "__self__"
-                || name == "__wrapped__"
                 || name == "__globals__"
                 || name == "__closure__"
                 || name == "__defaults__"
                 || name == "__kwdefaults__"
             {
-                // Check class dict first, then return None
+                // Check class dict first, then return None.  `__wrapped__` is
+                // excluded so an unset value raises AttributeError rather than
+                // feeding `inspect.unwrap` a bogus None chain.
                 if let Some(v) = lookup_in_type_where(obj, name) {
                     return Ok(v);
                 }
@@ -4053,6 +4054,9 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
                 "co_argcount" => return Ok(w_int_new(code.arg_count as i64)),
                 "co_kwonlyargcount" => return Ok(w_int_new(code.kwonlyarg_count as i64)),
                 "co_name" => return Ok(w_str_new(code.obj_name.as_ref())),
+                // `pycode.py` `co_qualname` (3.11+) — the dotted qualified
+                // name the compiler stamped (`<module>.Class.method`).
+                "co_qualname" => return Ok(w_str_new(code.qualname.as_ref())),
                 "co_filename" => return Ok(w_str_new(code.source_path.as_ref())),
                 "co_flags" => return Ok(w_int_new(code.flags.bits() as i64)),
                 // `pypy/interpreter/pycode.py:143` — `self.co_firstlineno = firstlineno`,
@@ -4069,12 +4073,13 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
         }
     }
 
-    // Common special attributes — return defaults for any object type
-    if name == "__doc__"
-        || name == "__module__"
-        || name == "__wrapped__"
-        || name == "__annotations__"
-    {
+    // Common special attributes — return defaults for any object type.
+    // `__wrapped__` is deliberately excluded: it must raise AttributeError
+    // when unset (functools.wraps stores it in the instance dict, and
+    // staticmethod/classmethod expose it via their type's GetSetProperty),
+    // otherwise `inspect.unwrap` sees an endless None chain and reports a
+    // bogus "wrapper loop".
+    if name == "__doc__" || name == "__module__" || name == "__annotations__" {
         // baseobjspace.py:46-50 W_Root.getdictvalue — consult the
         // instance dict (exception `w_dict` slot, hasdict objects),
         // else None.
