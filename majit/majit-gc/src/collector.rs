@@ -64,31 +64,34 @@ fn read_float_from_env(varname: &str) -> Option<f64> {
     value.parse::<f64>().ok().filter(|v| *v > 0.0)
 }
 
+/// env.py:387-411 `get_darwin_sysctl_signed`: read a signed integer sysctl by
+/// name; 0 on any error.
+#[cfg(target_os = "macos")]
+fn get_darwin_sysctl_signed(name: &[u8]) -> i64 {
+    let mut val: i64 = 0;
+    let mut len = std::mem::size_of::<i64>();
+    let rc = unsafe {
+        libc::sysctlbyname(
+            name.as_ptr() as *const libc::c_char,
+            &mut val as *mut i64 as *mut libc::c_void,
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc == 0 && len == std::mem::size_of::<i64>() {
+        val
+    } else {
+        0
+    }
+}
+
 /// env.py:413-433 `get_L2cache_darwin`. Returns the L2+L3 cache size in
 /// bytes via `sysctl`, or -1 when it cannot be determined.
 #[cfg(target_os = "macos")]
 fn get_l2cache() -> i64 {
-    // env.py:374-411 `get_darwin_sysctl_signed`: read a signed integer
-    // sysctl by name; 0 on any error.
-    fn sysctl_signed(name: &[u8]) -> i64 {
-        let mut val: i64 = 0;
-        let mut len = std::mem::size_of::<i64>();
-        let rc = unsafe {
-            libc::sysctlbyname(
-                name.as_ptr() as *const libc::c_char,
-                &mut val as *mut i64 as *mut libc::c_void,
-                &mut len,
-                std::ptr::null_mut(),
-                0,
-            )
-        };
-        if rc == 0 && len == std::mem::size_of::<i64>() {
-            val
-        } else {
-            0
-        }
-    }
-    let mangled = sysctl_signed(b"hw.l2cachesize\0") + sysctl_signed(b"hw.l3cachesize\0");
+    let mangled =
+        get_darwin_sysctl_signed(b"hw.l2cachesize\0") + get_darwin_sysctl_signed(b"hw.l3cachesize\0");
     if mangled > 0 { mangled } else { -1 }
 }
 
@@ -125,6 +128,36 @@ fn default_nursery_size() -> usize {
     // estimate_best_nursery_size never returns <= 0 (its floor is the 4MB
     // unknown-cache fallback), so the final `defaultsize` arm is unreachable.
     read_size_from_env("PYPY_GC_NURSERY").unwrap_or_else(estimate_best_nursery_size)
+}
+
+/// env.py:67 `addressable_size = float(2**63)` for a 64-bit host: the most
+/// memory the process could address, used as the fallback / upper clamp when
+/// the real total-memory probe is unavailable or larger.
+const ADDRESSABLE_SIZE: f64 = 9_223_372_036_854_775_808.0; // 2**63
+
+/// env.py:100-110 `get_total_memory_darwin`. Clamp the probed total memory:
+/// fall back to the addressable size when the probe failed (`<= 0`) and cap it
+/// at the addressable size otherwise.
+fn get_total_memory_darwin(result: i64) -> f64 {
+    if result <= 0 {
+        ADDRESSABLE_SIZE
+    } else {
+        (result as f64).min(ADDRESSABLE_SIZE)
+    }
+}
+
+/// env.py:117-127 `get_total_memory`. Total physical memory in bytes.
+/// macOS reads `hw.memsize` via `sysctl`; other platforms return the
+/// addressable size (env.py:126-127 "XXX implement me for other platforms";
+/// the Linux `/proc/meminfo` probe, env.py:70-98, is not yet ported).
+#[cfg(target_os = "macos")]
+fn get_total_memory() -> f64 {
+    get_total_memory_darwin(get_darwin_sysctl_signed(b"hw.memsize\0"))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn get_total_memory() -> f64 {
+    ADDRESSABLE_SIZE
 }
 
 impl Default for GcConfig {
@@ -293,8 +326,9 @@ pub struct MiniMarkGC {
     min_heap_size: f64,
     /// incminimark.py:308 `self.max_heap_size` (`PYPY_GC_MAX`; 0.0 = unbounded).
     max_heap_size: f64,
-    /// incminimark.py:310 `self.max_delta` (`PYPY_GC_MAX_DELTA`). Caps the
-    /// absolute next-major threshold growth per cycle.
+    /// incminimark.py:310,498 `self.max_delta` (`PYPY_GC_MAX_DELTA`, else
+    /// `0.125 * get_total_memory()`). Caps the absolute next-major threshold
+    /// growth per cycle.
     max_delta: f64,
     /// incminimark.py:568 `self.next_major_collection_initial`. The
     /// pre-reservation threshold; `set_major_threshold_from` grows the next
@@ -384,15 +418,10 @@ impl MiniMarkGC {
             .map(|v| v as f64)
             .unwrap_or(0.0);
         // incminimark.py:494-498 — max_delta: PYPY_GC_MAX_DELTA, else
-        // 0.125 * env.get_total_memory(). The total-memory probe (env.py) is
-        // not yet ported (issue 215 fix #3); until it lands, default to the
-        // pre-setup sentinel (incminimark.py:310 `float(r_uint(-1))`, i.e.
-        // unbounded) so the `total + max_delta` cap never binds and the
-        // `total * major_collection_threshold` term governs, matching
-        // incminimark on any heap small relative to total memory.
+        // 0.125 * env.get_total_memory().
         let max_delta = read_size_from_env("PYPY_GC_MAX_DELTA")
             .map(|v| v as f64)
-            .unwrap_or(u64::MAX as f64);
+            .unwrap_or_else(|| 0.125 * get_total_memory());
         // incminimark.py:562-563 — allocate_nursery floors min_heap_size by
         // nursery_size * major_collection_threshold.
         min_heap_size = min_heap_size.max(nursery_size as f64 * major_collection_threshold);
