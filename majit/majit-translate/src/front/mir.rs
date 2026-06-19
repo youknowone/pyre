@@ -4163,6 +4163,33 @@ impl<'a> Lowering<'a> {
                 )? {
                     return Ok(());
                 }
+                // `<str as PartialEq>::eq(a, b)` is the string-equality
+                // `BinOp("eq")` (pairtype `rtype_eq` → `ll_streq`) — emit it
+                // instead of leaving the graph-less trait-method extern.
+                // Both operands already type `SomeString`; the comparison
+                // ops share the reflexive `BinOp` dispatch `f64::is_nan`
+                // uses for `ne`.
+                if args.len() == 2
+                    && fmt_path_ends_with(&segments, &["str", "traits", "<Impl>", "eq"])
+                {
+                    let res = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(res.clone()),
+                        kind: OpKind::BinOp {
+                            op: "eq".to_string(),
+                            lhs: args[0].clone(),
+                            rhs: args[1].clone(),
+                            result_ty: ValueType::Int,
+                        },
+                    });
+                    self.local_var[dest_local] = Some(res);
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
                 let alias =
                     if let Some(payload) = self.expect_on_const_ok(&segments, &args, &arg_locals) {
                         // Identity unwrap: the receiver variable was bound
