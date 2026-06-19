@@ -351,6 +351,23 @@ fn run_source(source: &str, mode: Mode, filename: &str) {
     );
     importing::set_sys_module("__main__", main_module);
 
+    // A script run by path gets `__file__` / `__cached__` in `__main__`
+    // (pythonrun.c `_PyRun_SimpleFileObject`); the `-c "<string>"` command
+    // path does not. `__file__` is the literal command-line path, not a
+    // canonicalized one.
+    if filename != "<string>" {
+        let _ = pyre_interpreter::baseobjspace::setattr_str(
+            main_module,
+            "__file__",
+            pyre_object::w_str_new(filename),
+        );
+        let _ = pyre_interpreter::baseobjspace::setattr_str(
+            main_module,
+            "__cached__",
+            pyre_object::w_none(),
+        );
+    }
+
     match eval_with_jit(&mut frame) {
         Ok(result) => {
             if !result.is_null() && !unsafe { pyre_object::is_none(result) } {

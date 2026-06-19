@@ -143,6 +143,11 @@ def classify(rc: int, out: str, err: str) -> tuple[str, str]:
             last = line.strip()
             break
     ran = "Ran " in out or "Ran " in err or "FAILED (" in out or "FAILED (" in err
+    # A module that bails with unittest.SkipTest before any test runs is
+    # opting out (a missing optional C extension or wrong platform) — CPython
+    # skips it too, so it is honestly SKIP, not an interpreter gap.
+    if not ran and "SkipTest" in err:
+        return "SKIP", f"rc={rc} {last}"[:120]
     status = "FAIL" if ran else "IMPORTERROR"
     return status, f"rc={rc} {last}"[:120]
 
@@ -175,6 +180,23 @@ def module_path(module: str) -> Path:
     return TESTDIR / name / "__main__.py"
 
 
+def is_package(module: str) -> bool:
+    """A `test.<name>` whose `<name>` is a package directory, not a file."""
+    name = module.split(".", 1)[1]
+    return (TESTDIR / name / "__init__.py").exists()
+
+
+# Driver that imports a test *package* with real package context (so its
+# `__init__.py` / `load_tests` discovers the sub-suite) and runs it through
+# unittest, emitting the `Ran N`/`OK`/`FAILED (` markers classify() keys on.
+_PKG_DRIVER = (
+    "import sys, unittest\n"
+    "mod = {module!r}\n"
+    "__import__(mod)\n"
+    "unittest.main(module=sys.modules[mod], argv=['pyre'], verbosity=2)\n"
+)
+
+
 def build_cmd(binary: Path, module: str, mode: str) -> list[str]:
     if mode == "regrtest":
         # CPython libregrtest; <module> is the bare basename (test_xxx).
@@ -187,10 +209,18 @@ def build_cmd(binary: Path, module: str, mode: str) -> list[str]:
 
 def run_module(binary: Path, module: str, mode: str, timeout: int,
                env: dict) -> tuple[str, str]:
-    cmd = build_cmd(binary, module, mode)
     # Run in a throwaway cwd so a test writing into '.' never touches the
     # repo (the stdlib is resolved relative to the executable, not cwd).
     with tempfile.TemporaryDirectory(prefix="pyre-cpytest-") as cwd:
+        if mode == "script" and is_package(module):
+            # A package has no `__main__.py` to run as a bare script (and
+            # running a submodule file directly breaks its relative imports);
+            # drive it through a synthesized unittest entry instead.
+            driver = Path(cwd) / "_pyre_pkg_main.py"
+            driver.write_text(_PKG_DRIVER.format(module=module), encoding="utf-8")
+            cmd = [str(binary), str(driver)]
+        else:
+            cmd = build_cmd(binary, module, mode)
         try:
             proc = subprocess.run(
                 cmd, cwd=cwd, env=env, capture_output=True, text=True,
