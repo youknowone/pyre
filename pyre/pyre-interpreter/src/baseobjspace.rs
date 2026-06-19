@@ -1863,7 +1863,10 @@ unsafe fn pull_iterator_tuple(
                 }
                 // `functional.py:1069-1079 _validate_strict` — the first ran
                 // dry; any later iterator that still yields is the longer one.
-                for j in 0..n {
+                // Start at 1: iterator 0 is the one already known exhausted, so
+                // re-`next`ing it is a wasted (and on a side-effectful iterator,
+                // observable) call.
+                for j in 1..n {
                     let itj = pyre_object::w_list_getitem(w_iterators, j as i64).unwrap();
                     match next(itj) {
                         Ok(_) => return Err(strict_zip_error(func_name, j, "longer")),
