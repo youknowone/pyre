@@ -3217,7 +3217,14 @@ pub(crate) fn builtin_str(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
             if let Some(s) = crate::display::builtin_subclass_dunder(obj, tp, "__str__")? {
                 return Ok(w_str_new(&s));
             }
-            return Ok(obj);
+            // `str(s) is s` only for an exact `str`; a subclass with no
+            // `__str__` override is copied to a fresh base `str`.
+            if is_exact_type(obj, &STR_TYPE) {
+                return Ok(obj);
+            }
+            return Ok(pyre_object::w_str_from_wtf8(
+                pyre_object::w_str_get_wtf8(obj).to_owned(),
+            ));
         }
     }
     let w = unsafe { crate::py_str_wtf8(obj)? };
@@ -3546,7 +3553,12 @@ pub(crate) fn builtin_float(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
     let obj = args[value_idx];
     unsafe {
         if is_float(obj) {
-            return Ok(obj);
+            // `float(f) is f` only for an exact `float`; a subclass instance
+            // is copied to a fresh base `float`.
+            if is_exact_type(obj, &FLOAT_TYPE) {
+                return Ok(obj);
+            }
+            return Ok(floatobject::w_float_new(w_float_get_value(obj)));
         }
         if is_int(obj) {
             return Ok(floatobject::w_float_new(w_int_get_value(obj) as f64));
@@ -3676,7 +3688,16 @@ pub(crate) fn builtin_tuple(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
     let obj = args[0];
     unsafe {
         if is_tuple(obj) {
-            return Ok(obj);
+            // `tuple(t) is t` only when `t` is exactly a tuple; a tuple
+            // subclass instance is copied to a fresh base tuple.
+            if is_exact_type(obj, &TUPLE_TYPE) {
+                return Ok(obj);
+            }
+            let n = w_tuple_len(obj);
+            let items: Vec<_> = (0..n)
+                .filter_map(|i| w_tuple_getitem(obj, i as i64))
+                .collect();
+            return Ok(w_tuple_new(items));
         }
         if is_list(obj) {
             let n = w_list_len(obj);
@@ -5328,7 +5349,10 @@ fn builtin_filter(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     };
     // `functional.py:925 self.w_iterable = space.iter(w_iterable)`.
     let w_iterable = crate::baseobjspace::iter(args[1])?;
-    Ok(pyre_object::filterobject::w_filter_new(w_predicate, w_iterable))
+    Ok(pyre_object::filterobject::w_filter_new(
+        w_predicate,
+        w_iterable,
+    ))
 }
 
 /// `map(func, *iterables, strict=False)` — `functional.py:888-902

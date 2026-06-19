@@ -141,6 +141,34 @@ pub unsafe fn is_exact_builtin_instance(obj: PyObjectRef) -> bool {
     }
 }
 
+/// `type(obj) is <the builtin type object for `tp`>` — the exact-type test
+/// used for pickle dispatch and the `tuple`/`str`/`float` constructors.
+///
+/// Unlike [`is_exact_builtin_instance`] this is correct for the specialised
+/// arity-2 tuples: they carry a distinct `ob_type`
+/// (`SPECIALISED_TUPLE_*_TYPE`) but a `w_class` of the canonical `tuple` type
+/// object, so `is_exact_type(t, &TUPLE_TYPE)` is `true` for them while
+/// `is_exact_builtin_instance` (which keys off `ob_type`) is not.  A user
+/// subclass retags `w_class` to its own type object and so is rejected.
+///
+/// # Safety
+/// `obj` must be null or a valid `PyObjectRef`; `tp` must be a canonical
+/// builtin layout type with `get_instantiate(tp)` initialized.
+#[inline]
+pub unsafe fn is_exact_type(obj: PyObjectRef, tp: &PyType) -> bool {
+    if obj.is_null() {
+        return false;
+    }
+    unsafe {
+        let w_class = (*obj).w_class;
+        if w_class.is_null() {
+            std::ptr::eq((*obj).ob_type, tp as *const PyType)
+        } else {
+            std::ptr::eq(w_class, get_instantiate(tp))
+        }
+    }
+}
+
 // Compile-time verification: AtomicI64/AtomicPtr are layout-compatible
 // with i64/*mut T so the JIT can read PyType fields at raw offsets.
 // Also verify OBJECT_VTABLE field order: subclassrange_min @ 0, max @ 8.
