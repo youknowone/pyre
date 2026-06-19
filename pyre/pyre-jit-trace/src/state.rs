@@ -2242,6 +2242,16 @@ pub(crate) fn instruction_needs_pre_opcode_snapshot(instruction: Instruction) ->
             // form) ignores pre_opcode_registers_r, so capturing it there is
             // inert; only the trait leg consults it.
             | Instruction::LoadAttr { .. }
+            // LIST_APPEND reaches the trait leg in an inline frame (it is
+            // walker-routed at the root). list_append_value pop_value's the
+            // appended value, then the strategy fast path emits non-residual
+            // guards at resume_pc=orgpc: guard_class / guard_list_strategy on
+            // the peeked list and, for int/float-storage lists, an unbox
+            // guard_class / guard_value on the popped value. The sibling
+            // comprehension helpers (SET_ADD / MAP_ADD / LIST_EXTEND / …) have
+            // no tracer override and abort before popping, so only LIST_APPEND
+            // qualifies.
+            | Instruction::ListAppend { .. }
     )
 }
 
@@ -9066,6 +9076,14 @@ mod tests {
         let load_attr_code = compile_function_body("def f(lst, x):\n    return lst.append(x)\n");
         assert!(contains_instruction(&load_attr_code, |instruction| {
             matches!(instruction, Instruction::LoadAttr { .. })
+                && instruction_needs_pre_opcode_snapshot(instruction)
+        }));
+
+        // LIST_APPEND (list comprehension) pops the appended value before the
+        // strategy fast path emits its list class / strategy / unbox guards.
+        let list_append_code = compile_function_body("def f(xs):\n    return [x for x in xs]\n");
+        assert!(contains_instruction(&list_append_code, |instruction| {
+            matches!(instruction, Instruction::ListAppend { .. })
                 && instruction_needs_pre_opcode_snapshot(instruction)
         }));
     }
