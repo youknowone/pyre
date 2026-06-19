@@ -628,6 +628,40 @@ impl CodeWriter {
             crate::jit_codewriter::type_state::apply_from_flowspace_variables(value_to_var);
         }
 
+        // Steps 2-4 (regalloc → flatten → liveness/assemble → calldescr →
+        // commit) operate on the rewritten `crate::model::FunctionGraph` and
+        // are shared verbatim with the opname-dispatch spine, so they live in
+        // `finalize_rewritten_graph_to_jitcode`.
+        self.finalize_rewritten_graph_to_jitcode(
+            &mut rewritten.graph,
+            path,
+            callcontrol,
+            jitcode,
+            verbose,
+            index,
+        );
+    }
+
+    /// Shared assembler tail for both codewriter spines.
+    ///
+    /// Spine A (`transform_graph_to_jitcode`) reaches here after the rtyper
+    /// dual-gate + `Transformer::transform` produced a rewritten rich-`OpKind`
+    /// graph; Spine B (`transform_opname_graph_to_jitcode`) reaches here after
+    /// `jtransform_opname::lower_graph` produced an equivalent rich-`OpKind`
+    /// graph from the rtyper's opname `SpaceOperation`s.  From this point the
+    /// pipeline is identical — Steps 2-4 (codewriter.py:45-67): regalloc →
+    /// flatten → liveness/assemble → `get_jitcode_calldescr` → commit body →
+    /// assign `jitcode.index`.  Each Variable's `.concretetype` cell is the
+    /// kind source (the upstream `getkind(v.concretetype)` access).
+    fn finalize_rewritten_graph_to_jitcode(
+        &mut self,
+        rewritten_graph: &mut crate::model::FunctionGraph,
+        path: &crate::parse::CallPath,
+        callcontrol: &mut CallControl,
+        jitcode: &std::sync::Arc<JitCode>,
+        verbose: bool,
+        index: usize,
+    ) {
         // Step 2: regalloc (codewriter.py:45-47)
         // RPython: for kind in KINDS: regallocs[kind] = perform_register_allocation(graph, kind)
         // Pyre reads each per-value kind via
@@ -636,7 +670,7 @@ impl CodeWriter {
         // `getkind(v.concretetype)` access.
         // Stamp canonical exceptblock kinds first so the rtyper-skip
         // path still gets `(etype=Int, evalue=Ref)`.
-        crate::regalloc::augment_canonical_exceptblock_on_graph(&mut rewritten.graph);
+        crate::regalloc::augment_canonical_exceptblock_on_graph(rewritten_graph);
         // Void-widening (exceptiontransform parity).  A scoped
         // `Result<(), PyError>` callee declares `FUNC.RESULT = void`
         // (`return_type = "()"`, stamped in `front::mir`), but its CFG
@@ -649,9 +683,9 @@ impl CodeWriter {
         // `declared==v && cfg==r` gate is exactly the unit-shell case; a
         // genuinely void CFG (`cfg==v`) needs no rewrite.
         if callcontrol.declared_return_kind(path) == Some('v')
-            && graph_result_kind(&rewritten.graph) == 'r'
+            && graph_result_kind(rewritten_graph) == 'r'
         {
-            crate::front::result_exc::widen_unit_return_to_void(&mut rewritten.graph);
+            crate::front::result_exc::widen_unit_return_to_void(rewritten_graph);
             // Sweep the unit producers the widen just orphaned.  Clearing
             // the returnblock args/inputargs leaves the `()` ctor (or a
             // tail-forwarded `Ref` call result) unread; without a dead-op
@@ -660,11 +694,11 @@ impl CodeWriter {
             // `remove_dead_links_and_setattrs` runs after exceptiontransform
             // for the same reason — `prune_dead_phis` keeps raising/impure
             // producers and only drops the genuinely pure dead unit shells.
-            crate::model::prune_dead_phis(&mut rewritten.graph);
+            crate::model::prune_dead_phis(rewritten_graph);
         }
         let mut regallocs = crate::jit_codewriter::transform_profile::time_phase(
             "step2_perform_all_register_allocations",
-            || crate::regalloc::perform_all_register_allocations(&rewritten.graph),
+            || crate::regalloc::perform_all_register_allocations(rewritten_graph),
         );
 
         // Step 3: flatten (codewriter.py:53)
@@ -679,7 +713,7 @@ impl CodeWriter {
         // invocation order verbatim.
         let mut ssarepr =
             crate::jit_codewriter::transform_profile::time_phase("step3_flatten_graph", || {
-                crate::flatten::flatten_graph(&rewritten.graph, &mut regallocs)
+                crate::flatten::flatten_graph(rewritten_graph, &mut regallocs)
             });
 
         // Step 3b + 4: liveness + assemble (codewriter.py:56,67)
@@ -708,7 +742,7 @@ impl CodeWriter {
         // graphs that disagree with their declared signature surface
         // immediately.
         {
-            let start_block = rewritten.graph.block(rewritten.graph.startblock);
+            let start_block = rewritten_graph.block(rewritten_graph.startblock);
             let mut arg_classes = String::new();
             // RPython `call.py:181-187 get_jitcode_calldescr` derives
             // `FUNC.ARGS` from `lltype.typeOf(fnptr).TO.ARGS`
@@ -729,7 +763,7 @@ impl CodeWriter {
                 };
                 arg_classes.push(class);
             }
-            let cfg_kind = graph_result_kind(&rewritten.graph);
+            let cfg_kind = graph_result_kind(rewritten_graph);
             let declared_kind = callcontrol.declared_return_kind(path);
             let result_type = declared_kind.unwrap_or(cfg_kind);
             // Cross-check: when both sources are present they must agree,
@@ -755,7 +789,7 @@ impl CodeWriter {
                         || (d == 'i' && cfg_kind == 'r')
                 }),
                 "graph {} declared FUNC.RESULT={} but CFG return kind is {}",
-                rewritten.graph.name,
+                rewritten_graph.name,
                 declared_kind.unwrap(),
                 cfg_kind,
             );
@@ -803,6 +837,38 @@ impl CodeWriter {
             // dependency.
             eprintln!("[CodeWriter] {}", jitcode.name);
         }
+    }
+
+    /// Spine B entry: lower an rtyper opname helper graph and finalize it.
+    ///
+    /// The drain loop routes a path here (instead of through
+    /// `transform_graph_to_jitcode`) when `CallControl::take_opname_graph`
+    /// yields the registered `crate::flowspace::model::FunctionGraph`.
+    /// `jtransform_opname::lower_graph` transduces it to an equivalent
+    /// rich-`OpKind` `crate::model::FunctionGraph`, which then re-enters the
+    /// shared `finalize_rewritten_graph_to_jitcode` tail.  None of the
+    /// Spine-A front steps (dual-gate concretetype publish,
+    /// `lower_indirect_calls`, unit-variant fold, classdef-hint stamping) run:
+    /// the helper graph is already low-level and fully typed on each
+    /// `Variable.concretetype` cell.
+    fn transform_opname_graph_to_jitcode(
+        &mut self,
+        flow_graph: &crate::flowspace::model::FunctionGraph,
+        path: &crate::parse::CallPath,
+        callcontrol: &mut CallControl,
+        jitcode: &std::sync::Arc<JitCode>,
+        verbose: bool,
+        index: usize,
+    ) {
+        let mut lowered = crate::jit_codewriter::jtransform_opname::lower_graph(flow_graph);
+        self.finalize_rewritten_graph_to_jitcode(
+            &mut lowered,
+            path,
+            callcontrol,
+            jitcode,
+            verbose,
+            index,
+        );
     }
 
     /// RPython: `CodeWriter.make_jitcodes(verbose)` (codewriter.py:74-89).
@@ -859,6 +925,38 @@ impl CodeWriter {
                 break;
             };
             let iter_start = std::time::Instant::now();
+            // Spine B (opname-dispatch convergence): rtyper low-level helper
+            // graphs are registered as opname `SpaceOperation`s and have no
+            // rich-`OpKind` twin in `function_graphs`, so they are routed here
+            // before the lookup below (which they intentionally miss).
+            // `take_opname_graph` is empty for the rich-`OpKind` corpus, so
+            // this branch is never taken for a Spine-A graph.
+            if let Some(flow_graph) = callcontrol.take_opname_graph(&path) {
+                // RPython `codewriter.py:80` index = len(all_jitcodes).
+                let index = callcontrol.finished_jitcodes_len();
+                self.transform_opname_graph_to_jitcode(
+                    &flow_graph,
+                    &path,
+                    callcontrol,
+                    &jitcode,
+                    /* verbose = */ false,
+                    index,
+                );
+                callcontrol.finish_jitcode(jitcode.clone());
+                // Helper graphs are never portal graphs, so no
+                // `jitdriver_sd` wiring is needed (Spine A handles that).
+                if profile {
+                    drain_count += 1;
+                    let elapsed = iter_start.elapsed().as_secs_f64();
+                    if elapsed >= 0.5 {
+                        eprintln!(
+                            "[PYRE_PROFILE_DRAIN] graph #{:>3} {:>7.3}s name={}",
+                            drain_count, elapsed, jitcode.name,
+                        );
+                    }
+                }
+                continue;
+            }
             let Some(graph) = callcontrol.function_graphs().get(&path).cloned() else {
                 // RPython `enum_pending_graphs` (codewriter.py:79-84)
                 // never yields a jitcode whose graph is missing —

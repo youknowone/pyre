@@ -729,6 +729,21 @@ pub struct CallControl {
     /// RPython: `CallControl.unfinished_graphs` — graphs pending assembly.
     unfinished_graphs: Vec<CallPath>,
 
+    /// Opname-dispatch convergence spine ("Spine B"): rtyper low-level
+    /// helper graphs registered as their `crate::flowspace::model::
+    /// FunctionGraph` (opname `SpaceOperation`s) rather than as a rich
+    /// `crate::model::FunctionGraph` in [`Self::function_graphs`].  These
+    /// graphs are born only in opname form (the rtyper lowers them in
+    /// place via `genop`, with no rich-`OpKind` twin), so the drain loop
+    /// routes them through `jtransform_opname::lower_graph` — which emits
+    /// rich `OpKind` into a fresh graph that re-enters the shared
+    /// flatten/regalloc/assembler tail — instead of the rich-`OpKind`
+    /// `Transformer::transform` path.  Keyed by `CallPath` so the caller's
+    /// `direct_call` resolves to the same shell via `target_to_path`.
+    /// `take_opname_graph` consumes the entry during the drain so the
+    /// graph is lowered exactly once.
+    opname_graphs: HashMap<CallPath, crate::flowspace::model::FunctionGraph>,
+
     /// `call.py:22 virtualref_info = None` — class-level default,
     /// populated by `CodeWriter.setup_vrefinfo`
     /// (`codewriter.py:91-94`) before
@@ -1209,6 +1224,7 @@ impl CallControl {
             builtin_factory_registry: std::cell::RefCell::new(HashMap::new()),
             finished_jitcodes: Vec::new(),
             unfinished_graphs: Vec::new(),
+            opname_graphs: HashMap::new(),
             virtualref_info: None,
             callinfocollection: majit_ir::CallInfoCollection::new(),
             descr_indices: DescrIndexRegistry::default(),
@@ -3066,6 +3082,45 @@ impl CallControl {
         self.jitcodes.insert(path.clone(), arc.clone());
         self.unfinished_graphs.push(path.clone());
         arc
+    }
+
+    /// Register an rtyper low-level helper graph in opname (`SpaceOperation`)
+    /// form for the opname-dispatch convergence spine ("Spine B").
+    ///
+    /// Records the helper's `crate::flowspace::model::FunctionGraph` in
+    /// [`Self::opname_graphs`] and allocates its `Arc<JitCode>` shell via
+    /// [`Self::get_jitcode`] — which appends `path` to `unfinished_graphs`
+    /// so the drain loop picks it up exactly like a rich-`OpKind` graph.
+    /// The drain routes it through `jtransform_opname::lower_graph` instead
+    /// of `Transformer::transform` because the helper has no rich-`OpKind`
+    /// twin in [`Self::function_graphs`].  Returns the shell so a caller can
+    /// hold a stable handle before the body is assembled.
+    pub fn register_opname_helper_graph(
+        &mut self,
+        path: CallPath,
+        graph: crate::flowspace::model::FunctionGraph,
+    ) -> std::sync::Arc<crate::jitcode::JitCode> {
+        self.opname_graphs.insert(path.clone(), graph);
+        self.get_jitcode(&path)
+    }
+
+    /// Consume the opname helper graph registered under `path`, if any.
+    ///
+    /// The drain loop calls this before the `function_graphs` lookup;
+    /// `Some(graph)` routes the path through the opname-dispatch spine and
+    /// removes it from [`Self::opname_graphs`] so the lowering runs once.
+    /// `None` falls through to the rich-`OpKind` `function_graphs` path.
+    pub fn take_opname_graph(
+        &mut self,
+        path: &CallPath,
+    ) -> Option<crate::flowspace::model::FunctionGraph> {
+        self.opname_graphs.remove(path)
+    }
+
+    /// Whether `path` is registered as an opname-dispatch helper graph.
+    /// Read-only peek used where a borrow of the graph is not yet needed.
+    pub fn has_opname_graph(&self, path: &CallPath) -> bool {
+        self.opname_graphs.contains_key(path)
     }
 
     /// Read-only handle lookup. Returns `None` for paths that have not
