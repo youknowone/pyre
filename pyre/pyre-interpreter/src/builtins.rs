@@ -4132,217 +4132,66 @@ fn exec_or_eval(
         }
     }
 
-    /// Build a `DictStorage` mirror for the user dict and bind the
-    /// user dict's `W_DictObject` as the storage's `mirror_target`,
-    /// so every storage-side write (STORE_GLOBAL) and delete
-    /// (DELETE_GLOBAL) propagates straight back into the user dict's
-    /// entries Vec while exec runs.  PyPy `pyopcode.py:771-776`
-    /// achieves the same shape by running the frame on the user dict
-    /// directly; pyre's frame layout still uses `*mut DictStorage`
-    /// for the bytecode-handler fastpath, so we get parity by paring
-    /// a forward storage proxy (W_DictObject → storage, already
-    /// wired) with this back-mirror (storage → W_DictObject) — the
-    /// two halves stand in for PyPy's single `W_DictMultiObject`.
+    /// Ensure the globals dict OBJECT carries a str-keyed `DictStorage`
+    /// proxy for the bytecode globals fastpath (LOAD_GLOBAL /
+    /// STORE_GLOBAL / DELETE_GLOBAL).
     ///
-    /// The initial population copy is mandatory because the bytecode
-    /// handlers read from `*mut DictStorage`; LOAD_GLOBAL would
-    /// otherwise miss every binding the user dict already held.  The
-    /// mirror runs from this point on so no post-exec drain is
-    /// needed: the user dict is always in sync.
+    /// `pypy/interpreter/pyopcode.py:771-776` runs the frame on the user
+    /// dict directly; pyre's bytecode handlers still read a `*mut
+    /// DictStorage`, so the dict needs a storage proxy attached.  Module
+    /// dicts and dicts returned by `globals()` already carry one — reused
+    /// as-is, so a second `exec(src, g)` allocates nothing (heap-stable).
     ///
-    /// RAII binding for the frame's globals storage.
+    /// A fresh dict (`exec(src, {})`) gets one storage allocated,
+    /// pre-populated from its str-keyed entries (LOAD_GLOBAL must see
+    /// bindings the dict already held), back-mirrored (`set_mirror_target`,
+    /// so STORE_GLOBAL / DELETE_GLOBAL through the storage propagate into
+    /// the dict's entries), and attached as the proxy (so the dict's own
+    /// `__setitem__` fans str-keyed writes back into the storage via
+    /// `maybe_sync_dict_storage_store`).  The two halves stand in for
+    /// PyPy's single `W_DictMultiObject`.
     ///
-    /// Lifecycle (PyPy `pyopcode.py:771-776` parity — the user dict
-    /// and the frame's `w_globals` are one and the same throughout
-    /// the run):
-    ///
-    /// * **User dict has an existing `dict_storage_proxy`** (typical
-    ///   for `module.__dict__` whose proxy is the module's own
-    ///   storage with a back-mirror to the entries Vec): the binding
-    ///   reuses that proxy directly as the frame's globals.  No temp
-    ///   allocation, no proxy swap, no post-exec replay — STORE_GLOBAL
-    ///   / DELETE_GLOBAL inside `exec("del x", module.__dict__)` land
-    ///   on the very dict the module sees afterwards.
-    ///
-    /// * **User dict has no existing proxy** (typical fresh
-    ///   `exec(src, {})`): the binding owns a temp `DictStorage`
-    ///   pre-populated from the user dict's str-keyed entries with
-    ///   `mirror_target = backing`; `attach_forward_proxy` is called
-    ///   exactly once after all fallible setup so a `?` early-return
-    ///   never leaves a dangling proxy hand-off.
-    ///
-    /// `Drop` (and `detach`) clears both halves idempotently: forward
-    /// proxy restored to its pre-exec value, and `mirror_target`
-    /// reset on the temp storage so the box can drop without an
-    /// observer holding a freed pointer.  This is the cleanup hole
-    /// guard for `createframe` and `setdictscope_object` early
-    /// returns.
-    struct GlobalsBinding {
-        /// Owned temp storage when allocated; `None` when reusing an
-        /// existing proxy storage.
-        owned: Option<Box<crate::DictStorage>>,
-        /// The storage the frame uses for `w_globals`.  Either the
-        /// owned temp storage's interior pointer, or the user dict's
-        /// existing proxy.
-        storage_ptr: *mut crate::DictStorage,
-        /// User dict's W_DictObject backing (`PY_NULL` when no user
-        /// dict, e.g. `exec(src)` with no globals arg).
-        backing: pyre_object::PyObjectRef,
-        /// `true` once `attach_forward_proxy` swapped the user dict's
-        /// proxy to point at our temp storage; cleared by `detach`.
-        proxy_attached: bool,
-        /// User dict's pre-attach proxy, restored by `detach` when
-        /// `proxy_attached` is true.  Always null otherwise.
-        saved_proxy: *mut u8,
-    }
-
-    impl GlobalsBinding {
-        fn empty() -> Self {
-            Self {
-                owned: None,
-                storage_ptr: std::ptr::null_mut(),
-                backing: std::ptr::null_mut(),
-                proxy_attached: false,
-                saved_proxy: std::ptr::null_mut(),
-            }
+    /// The storage is owned by the dict for its lifetime — functions
+    /// defined during the run capture the dict OBJECT as `__globals__` and
+    /// recover this storage via `get_w_globals()` — so it is intentionally
+    /// leaked alongside the dict rather than freed.  Retires with the
+    /// `dict_storage_proxy` bridge when the dict becomes the single store.
+    fn ensure_globals_storage_proxy(w_globals_obj: pyre_object::PyObjectRef) {
+        if w_globals_obj.is_null() {
+            return;
         }
-
-        fn from_user_dict(d: pyre_object::PyObjectRef) -> Self {
-            let backing = unsafe { crate::type_methods::resolve_dict_backing(d) };
-            if backing.is_null() {
-                return Self::empty();
-            }
-            let existing_proxy = unsafe { pyre_object::w_dict_get_dict_storage_proxy(backing) };
-            if !existing_proxy.is_null() {
-                // Reuse the existing proxy storage directly.  PyPy
-                // `pyopcode.py:771` — the frame runs on the very
-                // same dict the caller passed in, so `exec("del x",
-                // module.__dict__)` removes from the module's
-                // storage rather than a temp copy that gets thrown
-                // away.  No proxy swap, no replay, no extra
-                // bookkeeping.
-                return Self {
-                    owned: None,
-                    storage_ptr: existing_proxy as *mut crate::DictStorage,
-                    backing,
-                    proxy_attached: false,
-                    saved_proxy: std::ptr::null_mut(),
-                };
-            }
-            // Fresh user dict — allocate a temp storage, pre-populate
-            // from the user dict's str-keyed entries, and bind the
-            // back-mirror so storage-side writes propagate to the
-            // user dict's entries Vec while exec runs.  Forward proxy
-            // attach is deferred to `attach_forward_proxy` so any
-            // fallible setup between here and `frame.run()`
-            // (createframe, setdictscope_object) cannot leave the
-            // user dict pointing at a Box we're about to drop.
-            let mut ns = Box::new(crate::DictStorage::new());
-            unsafe {
-                for (key, value) in pyre_object::w_dict_items(backing) {
-                    if !value.is_null() && pyre_object::is_str(key) {
-                        let name = pyre_object::w_str_get_value(key).to_string();
-                        crate::dict_storage_store(&mut ns, &name, value);
-                    }
-                }
-                ns.set_mirror_target(backing);
-            }
-            ns.fix_ptr();
-            let storage_ptr: *mut crate::DictStorage = ns.as_mut() as *mut _;
-            Self {
-                owned: Some(ns),
-                storage_ptr,
-                backing,
-                proxy_attached: false,
-                saved_proxy: std::ptr::null_mut(),
-            }
+        // Dispatch storage on `resolve_dict_backing` (a dict subclass
+        // resolves to itself; a dict-proxy / mapping to its inner dict),
+        // mirroring PyPy's storage-vs-original split.
+        let backing = unsafe { crate::type_methods::resolve_dict_backing(w_globals_obj) };
+        if backing.is_null() {
+            return;
         }
-
-        /// Attach the temp storage as the user dict's
-        /// `dict_storage_proxy` so alias mutations
-        /// (`exec("g['x']=1; y=x", g)`) propagate from the user
-        /// dict's W_DictObject into the frame's storage.  No-op when
-        /// reusing an existing proxy.  Call exactly once, AFTER all
-        /// fallible setup, so a `?` early-return cannot leave the
-        /// user dict pointing at a Box we're about to drop.
-        unsafe fn attach_forward_proxy(&mut self) {
-            unsafe {
-                if self.proxy_attached
-                    || self.owned.is_none()
-                    || self.backing.is_null()
-                    || self.storage_ptr.is_null()
-                {
-                    return;
-                }
-                self.saved_proxy = pyre_object::w_dict_get_dict_storage_proxy(self.backing);
-                pyre_object::w_dict_set_dict_storage_proxy(
-                    self.backing,
-                    self.storage_ptr as *mut u8,
-                );
-                self.proxy_attached = true;
-            }
+        if !unsafe { pyre_object::w_dict_get_dict_storage_proxy(backing) }.is_null() {
+            // module.__dict__ / globals() / a dict reused across exec —
+            // already storage-backed, nothing to allocate.
+            return;
         }
-
-        /// Tear down the forward proxy / back-mirror — but only when we do
-        /// NOT own a temp storage.
-        ///
-        /// For a fresh user dict the temp `DictStorage` is leaked (`Drop`)
-        /// and must stay attached as the dict's `dict_storage_proxy` with
-        /// its `mirror_target` intact: functions defined during the run
-        /// capture the user dict OBJECT as `__globals__`, and
-        /// `get_w_globals()` recovers their raw storage through that proxy.
-        /// Restoring the pre-exec (typically null) proxy or clearing the
-        /// mirror would orphan the leaked temp and resolve a captured
-        /// function's globals to a null raw.  So the owned case persists.
-        ///
-        /// The reuse path (existing proxy) and the empty binding own no
-        /// temp and never swapped a proxy, so there is nothing to undo.
-        /// Idempotent; called explicitly after the run and again on `Drop`.
-        unsafe fn detach(&mut self) {
-            if self.owned.is_some() {
-                return;
-            }
-            unsafe {
-                if self.proxy_attached {
-                    pyre_object::w_dict_set_dict_storage_proxy(self.backing, self.saved_proxy);
-                    self.proxy_attached = false;
-                    self.saved_proxy = std::ptr::null_mut();
+        let mut ns = Box::new(crate::DictStorage::new());
+        unsafe {
+            for (key, value) in pyre_object::w_dict_items(backing) {
+                if !value.is_null() && pyre_object::is_str(key) {
+                    let name = pyre_object::w_str_get_value(key).to_string();
+                    crate::dict_storage_store(&mut ns, &name, value);
                 }
             }
+            ns.set_mirror_target(backing);
         }
-
-        fn storage_ptr(&self) -> *mut crate::DictStorage {
-            self.storage_ptr
+        ns.fix_ptr();
+        let storage_ptr: *mut crate::DictStorage = ns.as_mut() as *mut _;
+        unsafe {
+            pyre_object::w_dict_set_dict_storage_proxy(backing, storage_ptr as *mut u8);
         }
-    }
-
-    impl Drop for GlobalsBinding {
-        fn drop(&mut self) {
-            unsafe { self.detach() }
-            // `pypy/interpreter/pyopcode.py:771-776 EXEC_STMT` runs the
-            // frame on the user-supplied dict directly — there is no
-            // temp storage to release because the dict object IS the
-            // canonical store.  Pyre allocates a temp `DictStorage` and
-            // mirrors writes back into the user dict via `mirror_target`.
-            // Functions defined during `exec` capture the user dict
-            // OBJECT as `__globals__`; `get_w_globals()` recovers their
-            // raw storage through the dict's `dict_storage_proxy`, which
-            // points at this temp.  `detach()` therefore leaves the proxy
-            // and mirror attached for the owned case, and the Box is
-            // leaked here so the proxy never dangles — dropping it would
-            // surface as a use-after-free (or, post-cutover, a null raw
-            // and a JIT-resume null deref) on the next `g["reader"]()`.
-            // Leak persists until exec runs on the dict object directly
-            // and no temp is needed.  Memory cost is one DictStorage per
-            // exec invocation, bounded by program lifetime.
-            if let Some(storage) = self.owned.take() {
-                let _ = Box::into_raw(storage);
-            }
-        }
+        // Owned by the dict for its lifetime; leaked rather than freed.
+        let _ = Box::into_raw(ns);
     }
 
     fn ensure_eval_builtins(
-        ns: &mut crate::DictStorage,
         w_globals_obj: pyre_object::PyObjectRef,
         exec_ctx: *const crate::PyExecutionContext,
     ) -> Result<(), crate::PyError> {
@@ -4353,30 +4202,24 @@ fn exec_or_eval(
         //
         // This is intentionally NOT pyopcode.py:773's `setdefault`
         // call-method path; dict-subclass `setdefault` overrides do
-        // not fire for eval() in PyPy.
+        // not fire for eval() in PyPy.  Dispatch on the dict object so
+        // the str-keyed write fans into the storage proxy.
         let w_builtin = if !exec_ctx.is_null() {
             unsafe { (*exec_ctx).get_builtin() }
         } else {
             pyre_object::PY_NULL
         };
-        if w_builtin.is_null() {
+        if w_builtin.is_null() || w_globals_obj.is_null() {
             return Ok(());
         }
-        if !w_globals_obj.is_null() {
-            let key = pyre_object::w_str_new("__builtins__");
-            if !crate::baseobjspace::contains(w_globals_obj, key)? {
-                crate::baseobjspace::setitem(w_globals_obj, key, w_builtin)?;
-            }
-            return Ok(());
-        }
-        if crate::dict_storage_get(ns, "__builtins__").is_none() {
-            crate::dict_storage_store(ns, "__builtins__", w_builtin);
+        let key = pyre_object::w_str_new("__builtins__");
+        if !crate::baseobjspace::contains(w_globals_obj, key)? {
+            crate::baseobjspace::setitem(w_globals_obj, key, w_builtin)?;
         }
         Ok(())
     }
 
     fn ensure_exec_builtins(
-        ns: &mut crate::DictStorage,
         w_globals_obj: pyre_object::PyObjectRef,
         caller_frame: *const crate::PyFrame,
         exec_ctx: *const crate::PyExecutionContext,
@@ -4388,7 +4231,9 @@ fn exec_or_eval(
         // builtin picked at caller-frame creation (`pyframe.py:115-116`),
         // not the EC's default.  When the caller frame's picked builtin
         // is unavailable (e.g. exec called from outside any frame), fall
-        // through to the EC default.
+        // through to the EC default.  The receiver is the ORIGINAL
+        // `w_globals` object so a dict-subclass `setdefault` override
+        // fires.
         let w_builtin = if !caller_frame.is_null() {
             unsafe { (*caller_frame).get_builtin() }
         } else if !exec_ctx.is_null() {
@@ -4396,23 +4241,12 @@ fn exec_or_eval(
         } else {
             pyre_object::PY_NULL
         };
-        if w_builtin.is_null() {
+        if w_builtin.is_null() || w_globals_obj.is_null() {
             return Ok(());
         }
-        // PyPy `space.call_method(w_globals, 'setdefault', ...)` —
-        // the receiver is the ORIGINAL `w_globals` object, not the
-        // backing W_DictObject that GlobalsBinding strips off via
-        // `resolve_dict_backing`.  Dispatching on the user object lets
-        // dict-subclass `setdefault` overrides fire.
-        if !w_globals_obj.is_null() {
-            let key = pyre_object::w_str_new("__builtins__");
-            let setdefault = crate::baseobjspace::getattr_str(w_globals_obj, "setdefault")?;
-            crate::call_and_check(setdefault, &[key, w_builtin])?;
-            return Ok(());
-        }
-        if crate::dict_storage_get(ns, "__builtins__").is_none() {
-            crate::dict_storage_store(ns, "__builtins__", w_builtin);
-        }
+        let key = pyre_object::w_str_new("__builtins__");
+        let setdefault = crate::baseobjspace::getattr_str(w_globals_obj, "setdefault")?;
+        crate::call_and_check(setdefault, &[key, w_builtin])?;
         Ok(())
     }
 
@@ -4443,72 +4277,29 @@ fn exec_or_eval(
         unsafe { (*caller_frame).execution_context }
     };
 
-    let implicit_globals_arg = if !is_none_or_null(globals_arg) {
+    // pyopcode.py:2005-2009 ensure_ns — the globals object is the
+    // user-supplied dict, else the caller frame's globals, else a fresh
+    // empty dict (`exec(src)` outside any frame, PyPy `newdict('module')`).
+    let w_globals_obj = if !is_none_or_null(globals_arg) {
         globals_arg
     } else if !caller_frame.is_null() {
         unsafe { (*caller_frame).get_w_globals_obj() }
     } else {
-        pyre_object::PY_NULL
+        pyre_object::w_dict_new()
     };
-    let mut globals_binding = if !is_none_or_null(implicit_globals_arg) {
-        GlobalsBinding::from_user_dict(implicit_globals_arg)
+    // Seed the str-keyed storage proxy that the LOAD_GLOBAL / STORE_GLOBAL
+    // bytecode fastpath reads, mirroring the dict's str entries.  A dict
+    // already backing a frame (module.__dict__ / globals()) keeps its proxy.
+    ensure_globals_storage_proxy(w_globals_obj);
+    // pyopcode.py:773-774 `space.call_method(w_globals, 'setdefault', ...)`
+    // (exec) and compiling.py:109-110 `space.setitem_str(w_globals, ...)`
+    // (eval) dispatch on the ORIGINAL `w_globals` object so a dict-subclass
+    // `setdefault` / `__contains__` / `__setitem__` override fires; the
+    // str-keyed write fans into the storage proxy seeded above.
+    if is_eval {
+        ensure_eval_builtins(w_globals_obj, exec_ctx)?;
     } else {
-        GlobalsBinding::empty()
-    };
-    // Anonymous fallback storage for the no-globals + no-caller-frame
-    // path (`exec(src)` outside any frame).  Owned outside the
-    // GlobalsBinding because it has no W_DictObject backing — there
-    // is nothing to mirror to and no proxy to swap.
-    let mut anon_globals: Option<Box<crate::DictStorage>> = None;
-    let mut globals_ptr = if !globals_binding.storage_ptr().is_null() {
-        globals_binding.storage_ptr()
-    } else if !caller_frame.is_null() {
-        unsafe { (*caller_frame).get_w_globals() }
-    } else {
-        std::ptr::null_mut()
-    };
-    if globals_ptr.is_null() {
-        let mut storage = Box::new(crate::DictStorage::new());
-        storage.fix_ptr();
-        let raw: *mut crate::DictStorage = storage.as_mut() as *mut _;
-        anon_globals = Some(storage);
-        globals_ptr = raw;
-    }
-    // Attach the forward proxy BEFORE seeding `__builtins__` so PyPy's
-    // eval `setitem_str` / exec `call_method(..., 'setdefault', ...)`
-    // lands in BOTH the user dict's W_DictObject AND the frame storage
-    // that `pick_builtin` / LOAD_GLOBAL will consult.  PyPy's single
-    // `W_DictMultiObject` makes this a non-issue; pyre's split storage
-    // requires the proxy bridge live before the write.  Drop detaches
-    // even on `?` early-return from builtins seeding / createframe.
-    unsafe {
-        globals_binding.attach_forward_proxy();
-    }
-    if !globals_ptr.is_null() {
-        // pyopcode.py:807 `space.call_method(w_globals, 'setdefault', ...)`
-        // (exec) and compiling.py:109 `space.contains_w(w_globals, ...)` /
-        // `space.setitem_str(w_globals, ...)` (eval) dispatch on the
-        // ORIGINAL `w_globals` object that `ensure_ns` returned — the
-        // user-supplied dict (possibly a subclass) for the explicit case,
-        // or the caller frame's `get_w_globals()` object for the implicit
-        // case.  Use `implicit_globals_arg`, NOT `globals_binding.backing`:
-        // the latter is `resolve_dict_backing`'s stripped W_DictObject,
-        // which bypasses dict-subclass `setdefault` / `__contains__` /
-        // `__setitem__` overrides.  `globals_ptr` is only pyre's temporary
-        // storage carrier while `PyFrame.w_globals` is still raw, so writes
-        // through the original object propagate to it via the forward proxy
-        // attached above.
-        let w_globals_obj = implicit_globals_arg;
-        if is_eval {
-            ensure_eval_builtins(unsafe { &mut *globals_ptr }, w_globals_obj, exec_ctx)?;
-        } else {
-            ensure_exec_builtins(
-                unsafe { &mut *globals_ptr },
-                w_globals_obj,
-                caller_frame,
-                exec_ctx,
-            )?;
-        }
+        ensure_exec_builtins(w_globals_obj, caller_frame, exec_ctx)?;
     }
 
     // pypy/interpreter/pyopcode.py:771-776 — `code.exec_code(space,
@@ -4564,14 +4355,14 @@ fn exec_or_eval(
     // surfaces pyframe.py:242-246's TypeError "directly executed code
     // object may not contain free variables" directly — exec()'s
     // closure-mismatch TypeError was already raised above.
-    let mut frame = match crate::createframe(code_obj_ref as *const (), globals_ptr, exec_ctx, None)
-    {
-        Ok(frame) => frame,
-        Err(err) => {
-            let _ = raw_code;
-            return Err(err);
-        }
-    };
+    let mut frame =
+        match crate::createframe_obj(code_obj_ref as *const (), w_globals_obj, exec_ctx, None) {
+            Ok(frame) => frame,
+            Err(err) => {
+                let _ = raw_code;
+                return Err(err);
+            }
+        };
     frame.fix_array_ptrs();
     // eval.py:32 frame.setdictscope(w_locals, ...) — only when locals
     // were separately supplied.  Without this call, initialize_frame_scopes'
@@ -4596,20 +4387,11 @@ fn exec_or_eval(
     // `eval(compile("(x for x in [])", ..., 'eval'))` of generator-flagged
     // code returns the wrapped generator object instead of executing the
     // body inline.
+    // STORE_GLOBAL / DELETE_GLOBAL writes during the run land on the
+    // storage proxy and back-mirror to the dict object, so the user dict
+    // and the frame's globals stay one and the same throughout the run
+    // (pyopcode.py:771-776 parity — no entry/exit drain needed).
     let result = frame.run();
-
-    // Explicit detach so the proxy/mirror state is cleared BEFORE
-    // `globals_binding` drops; `Drop` then becomes idempotent and
-    // covers the rare panic-unwind path.  STORE_GLOBAL /
-    // DELETE_GLOBAL writes during exec already landed on the user
-    // dict via the back-mirror, and alias mutations propagated
-    // through the forward proxy, so no post-exec drain is needed
-    // (PyPy `pyopcode.py:771-776` parity — the user dict and the
-    // frame's globals are one and the same throughout the run).
-    unsafe {
-        globals_binding.detach();
-    }
-    let _ = anon_globals; // keep anon storage alive across exec
 
     let _ = raw_code; // keep raw_code alive until after exec for safety.
     match result {

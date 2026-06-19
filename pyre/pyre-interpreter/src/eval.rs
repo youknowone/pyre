@@ -1250,10 +1250,12 @@ impl SharedOpcodeHandler for PyFrame {
         // built from this function still needs it.  Threading a raw here is
         // what dangled exec-defined functions when the exec temp storage was
         // freed (the `GlobalsBinding` leak), so it is dropped.
-        Ok(crate::runtime_ops::make_function_from_code_obj_with_globals_obj(
-            code_obj,
-            w_globals_obj,
-        ))
+        Ok(
+            crate::runtime_ops::make_function_from_code_obj_with_globals_obj(
+                code_obj,
+                w_globals_obj,
+            ),
+        )
     }
 
     fn call_callable(

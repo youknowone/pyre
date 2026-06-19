@@ -835,13 +835,7 @@ impl PyFrame {
     /// (the inverse of `dict_storage_to_dict`).
     #[inline]
     pub fn get_w_globals(&self) -> *mut DictStorage {
-        if self.w_globals_obj.is_null() {
-            std::ptr::null_mut()
-        } else {
-            unsafe {
-                pyre_object::w_dict_get_dict_storage_proxy(self.w_globals_obj) as *mut DictStorage
-            }
-        }
+        w_globals_obj_storage(self.w_globals_obj)
     }
 
     /// The canonical W_DictObject for this frame's globals
@@ -2792,6 +2786,26 @@ pub fn createframe_obj(
     //   self.valuestackdepth = code.co_nlocals + ncellvars + nfreevars
     //   ...
     //   self.initialize_frame_scopes(outer_func, code)
+    //
+    // Normalize a dict-subclass globals (`exec(src, G())`) to its inner
+    // `__dict_data__` dict.  The storage proxy that LOAD_GLOBAL reads lives
+    // on the `W_DictObject`, and downstream readers key off this object —
+    // `get_w_globals`, MAKE_FUNCTION's `function.__globals__`, and the JIT
+    // inline / callee globals readers — so the frame must hold the
+    // `W_DictObject`, not the subclass instance whose layout has no proxy
+    // slot.  No-op for a plain dict / module dict (`resolve_dict_backing`
+    // returns the argument).  Converges to holding the object directly when
+    // the raw `DictStorage` proxy retires.
+    let w_globals_obj = if w_globals_obj.is_null() {
+        w_globals_obj
+    } else {
+        let backing = crate::type_methods::resolve_dict_backing(w_globals_obj);
+        if backing.is_null() {
+            w_globals_obj
+        } else {
+            backing
+        }
+    };
     let raw = unsafe { crate::w_code_get_ptr(code as PyObjectRef) as *const CodeObject };
     let code_ref = unsafe { &*raw };
     let num_locals = code_ref.varnames.len();
@@ -2799,11 +2813,7 @@ pub fn createframe_obj(
     let max_stack = code_ref.max_stackdepth as usize;
     // The `frame_stores_global` check and the debug-data snapshot still read
     // the raw storage; recover it from the object via the proxy back-link.
-    let w_globals = if w_globals_obj.is_null() {
-        std::ptr::null_mut()
-    } else {
-        unsafe { pyre_object::w_dict_get_dict_storage_proxy(w_globals_obj) as *mut DictStorage }
-    };
+    let w_globals = w_globals_obj_storage(w_globals_obj);
     // pyframe.py:103 — stamp `pycode.w_globals`; side effect only (the gated
     // debugdata snapshot retired in favour of `w_globals_obj`).
     unsafe {
@@ -2846,6 +2856,21 @@ pub fn createframe_obj(
     }
 
     Ok(frame)
+}
+
+/// Recover the str-keyed storage proxy backing a globals OBJECT.  Resolves
+/// a dict subclass to its inner `__dict_data__` dict first: the proxy lives
+/// on the `W_DictObject`, so reading it straight off the subclass instance
+/// would dereference an unrelated offset.
+pub(crate) fn w_globals_obj_storage(w_globals_obj: PyObjectRef) -> *mut DictStorage {
+    if w_globals_obj.is_null() {
+        return std::ptr::null_mut();
+    }
+    let backing = crate::type_methods::resolve_dict_backing(w_globals_obj);
+    if backing.is_null() {
+        return std::ptr::null_mut();
+    }
+    unsafe { pyre_object::w_dict_get_dict_storage_proxy(backing) as *mut DictStorage }
 }
 
 /// `space.finditem_str(w_obj, key)` — `space.getitem` with KeyError

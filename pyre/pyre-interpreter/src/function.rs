@@ -277,11 +277,7 @@ impl pyre_object::lltype::GcType for Function {
 /// `name` is the function name string (leaked).
 /// `w_func_globals_obj` is the defining module's namespace dict object
 /// (shared), or `PY_NULL` for a globals-less carrier.
-pub fn function_new(
-    code: *const (),
-    name: String,
-    w_func_globals_obj: PyObjectRef,
-) -> PyObjectRef {
+pub fn function_new(code: *const (), name: String, w_func_globals_obj: PyObjectRef) -> PyObjectRef {
     function_new_with_closure(code, name, w_func_globals_obj, PY_NULL)
 }
 
@@ -298,7 +294,14 @@ pub fn function_new_with_closure(
     w_func_globals_obj: PyObjectRef,
     closure: PyObjectRef,
 ) -> PyObjectRef {
-    function_new_impl(&FUNCTION_TYPE, code, name, w_func_globals_obj, closure, true)
+    function_new_impl(
+        &FUNCTION_TYPE,
+        code,
+        name,
+        w_func_globals_obj,
+        closure,
+        true,
+    )
 }
 
 fn function_new_impl(
@@ -369,7 +372,14 @@ pub fn function_new_with_fixed_code(
     name: String,
     w_func_globals_obj: PyObjectRef,
 ) -> PyObjectRef {
-    function_new_impl(&FUNCTION_TYPE, code, name, w_func_globals_obj, PY_NULL, false)
+    function_new_impl(
+        &FUNCTION_TYPE,
+        code,
+        name,
+        w_func_globals_obj,
+        PY_NULL,
+        false,
+    )
 }
 
 /// function.py:706 — `class BuiltinFunction(Function): can_change_code = False`

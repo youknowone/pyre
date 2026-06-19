@@ -38,8 +38,7 @@ fn pyre_probe_bh_startup_enabled() -> bool {
 use pyre_interpreter::bytecode::{Instruction, OpArgState};
 use pyre_interpreter::{
     PyResult, function_get_closure, function_get_defaults, function_get_globals_obj,
-    function_get_name, is_function, register_jit_exc_raiser,
-    register_jit_function_caller,
+    function_get_name, is_function, register_jit_exc_raiser, register_jit_function_caller,
 };
 use pyre_object::intobject::w_int_get_value;
 use pyre_object::intobject::w_int_new;
