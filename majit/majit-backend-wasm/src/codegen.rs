@@ -408,13 +408,21 @@ fn build_function(
             OpCode::Label => {}
 
             OpCode::Jump => {
+                // The jump rebinds the loop's label args to the jump args — a
+                // parallel move. A jump arg may read a target local that another
+                // pair overwrites (e.g. the swap `x, y = y, x` → x<-y, y<-x), so
+                // resolving-then-storing each pair in turn would feed a clobbered
+                // value to a later read. Do all reads first (push every resolved
+                // jump arg onto the operand stack), then all writes (pop into the
+                // targets in reverse, the stack being LIFO).
                 let label_args = find_label_args(ops);
-                for (i, jump_arg) in op.getarglist().iter().enumerate() {
-                    if i < label_args.len() {
-                        let target_local = 1 + label_args[i].raw();
-                        emit_resolve(&mut sink, constants, jump_arg.to_opref());
-                        sink.local_set(target_local);
-                    }
+                let jump_args = op.getarglist();
+                let n = jump_args.len().min(label_args.len());
+                for jump_arg in jump_args.iter().take(n) {
+                    emit_resolve(&mut sink, constants, jump_arg.to_opref());
+                }
+                for i in (0..n).rev() {
+                    sink.local_set(1 + label_args[i].raw());
                 }
                 sink.br(0);
             }
