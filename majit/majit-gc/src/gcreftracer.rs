@@ -14,11 +14,32 @@
 //! Upstream models the array with a `GCREFTRACER` `GcStruct`
 //! (`gcreftracer.py:7-11`) carrying `array_base_addr` + `array_length`,
 //! registered with the GC via a custom trace hook
-//! (`register_custom_trace_hook`, `gcreftracer.py:30`). pyre has no
-//! custom-trace-hook facility; the established equivalent is the extra
-//! root walker registry (`shadow_stack::register_extra_root_walker`,
-//! walked at `collector.rs:668` minor and `collector.rs:1185` major), so
-//! a single module walker forwards every live table's slots.
+//! (`register_custom_trace_hook`, `gcreftracer.py:30`) and *reached* by
+//! the collector through the loop token's `asmmemmgr_gcreftracers`, which
+//! in RPython is a GC-managed list (`x86/assembler.py:823`,
+//! `model.py:294`) so the tracer header sits in the live object graph.
+//!
+//! pyre has the custom-trace-hook facility — `TypeInfo::custom_trace`
+//! (`trace.rs:314`, `register_custom_trace_hook` parity), already used by
+//! `JITFRAME` (`jitframe.rs:333`), the structural twin of `GCREFTRACER` —
+//! so a managed `GCREFTRACER` GcStruct with a slot-tracing hook is
+//! portable *in isolation*. What is not yet portable is the
+//! *reachability*: pyre's `CompiledLoopToken` is a Rust-owned struct and
+//! its `asmmemmgr_gcreftracers` is a `Mutex<Vec<Arc<dyn Any>>>` keepalive
+//! (`majit-backend/src/lib.rs:910`), not a GC edge — the collector has no
+//! object-graph path to a managed header. A GcStruct header would still
+//! need a GC root to be reached, and that root would be a walker over the
+//! Rust-owned keepalive — a header allocation, a hook, and a mark step
+//! added without removing the walker.
+//!
+//! So pyre forwards the slots directly from an extra root walker
+//! (`shadow_stack::register_extra_root_walker`, walked at
+//! `collector.rs:668` minor and `collector.rs:1185` major) over the
+//! live-table registry — the analog of RPython reaching the tracer
+//! through the CLT keepalive. Convergence path: once
+//! `asmmemmgr_gcreftracers` (or `CompiledLoopToken` itself) is GC-traced,
+//! this collapses to a managed `GCREFTRACER` GcStruct + custom trace
+//! hook, matching upstream exactly.
 
 use std::cell::Cell;
 use std::sync::{Arc, RwLock, Weak};
