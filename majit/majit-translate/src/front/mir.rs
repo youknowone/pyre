@@ -5136,6 +5136,18 @@ impl<'a> Lowering<'a> {
         let [arg] = args else {
             return None;
         };
+        // `fmt::Arguments::from_str(s)` is the no-placeholder `format_args!`
+        // — the constructed `Arguments` renders to exactly its `&str`
+        // argument, so the rendered value *is* that string.  Alias it to
+        // `s`, dropping the graph-less `Arguments::from_str` extern: the
+        // literal-message chains it heads dead-end in synthetic panic
+        // `Option`s pyre replaces with host exception constants, or thread
+        // into `Write::write_fmt` (whose own graph-less extern keeps those
+        // subjects residual) — no `alloc::fmt::format` consumes one.  This
+        // is the same transparent passthrough `must_use` / `identity` take.
+        if fmt_path_ends_with(segments, &["Arguments", "from_str"]) {
+            return Some(arg.clone());
+        }
         let [a, b, c] = segments else {
             return None;
         };
