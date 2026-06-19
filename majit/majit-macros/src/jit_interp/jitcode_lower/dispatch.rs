@@ -2160,6 +2160,20 @@ pub(super) fn lower_dispatch_chain(
         // stub when the runtime policy is unsupported, which the inline stream
         // cannot do without a partial-ops-then-abort hazard.  Red-pc
         // dispatches keep the sub-JitCode path unconditionally.
+        //
+        // No infer-call arm writes a *propagating* pc today, so keeping them on
+        // the sub-JitCode path loses no pc advance.  The only infer-call arms in
+        // the corpus are the `ROLL` arms of tl and tlc (bare-path `auto_calls`
+        // helpers `storage_roll` / `tlc_roll`).  tlc declares no green pc, so it
+        // never inlines any arm (every arm is red-pc sub-JitCode); the hazard is
+        // structurally absent there.  tl's green-pc `ROLL` body contains only
+        // `pc += 1`, which on the non-pinned sub-JitCode path is recognized as
+        // inert and dropped (the dispatch loop owns the pc register), so the
+        // sub-JitCode emits no pc op at all.  The hazard reappears only for a
+        // *non-droppable* pc write — a branch `pc = target` in an arm that also
+        // makes a bare-path inferred-policy call — at which point the remedy is
+        // either to lower that arm inline behind an abort guard, or to add an
+        // explicit pc-writeback from the sub-JitCode into the caller's reg0.
         let inlined = pc_is_green(config)
             && matches!(
                 arm.pattern,

@@ -5865,6 +5865,21 @@ where
             }
             jitcode::insns::BC_ABORT => return TraceAction::Abort,
             jitcode::insns::BC_ABORT_PERMANENT => return TraceAction::AbortPermanent,
+            // No BC_NEW_ARRAY / BC_NEW_ARRAY_CLEAR arm by design: the codewriter
+            // never emits these into a dispatched JitCode body (the byte-emit
+            // methods in jitcode/assembler.rs have zero callers; jtransform /
+            // flatten produce no new_array). Array allocation lives only in the
+            // recording domain — history.rs record_new_array{,_clear} emits
+            // OpCode::NewArray{,Clear} for the optimizer (optimizeopt/virtualize.rs,
+            // heap.rs) and resume/backends reconstruct it — and in the separate
+            // blackhole interpreter table (blackhole.rs handler_new_array, wired
+            // independently of this trace dispatcher). So this fall-through is a
+            // correct fail-loud guard for them, not a missing case. If a future
+            // codewriter change lowers array allocation through a dispatched
+            // JitCode, add an arm mirroring blackhole.py bhimpl_new_array{,_clear}
+            // (length reg + array descr -> ref) on the BC_NEW / BC_NEW_WITH_VTABLE
+            // template above: execute the live allocation and record
+            // OpCode::NewArray{,Clear} so the optimizer can still virtualize it.
             other => panic!("unknown jitcode bytecode {other}"),
         }
 
