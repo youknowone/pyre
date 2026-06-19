@@ -3770,12 +3770,25 @@ impl<'a> Lowering<'a> {
     /// consts (`FUNCTION_OBJECT_SIZE`, `W_DICT_OBJECT_SIZE`, …) otherwise
     /// lower to (a `FunctionPath` the rtyper cannot register).
     ///
-    /// `None` for any non-trivial initializer (the `size_of` result must
-    /// flow straight to the return local — `dest` = `_0` — so a computed
-    /// const like `size_of::<A>() + size_of::<B>()` keeps the accessor
-    /// path), a non-ADT type argument (primitive / pointer / tuple, which
-    /// has no `TypeDecl` layout to read), or a layout Charon left
-    /// unresolved.
+    /// Accepts only the *exact* shape — `_0` (the const's value) is written
+    /// once, by a single `size_of`/`align_of` call, unconditionally — and
+    /// returns `None` for anything richer so it keeps the residual accessor
+    /// path, mirroring the strict single-statement acceptance in
+    /// [`Self::const_eval_global`].  Rejected:
+    ///   * a `Switch` terminator (data-dependent control flow), so the call
+    ///     can never be made conditional;
+    ///   * any statement that assigns `_0` (a computed value such as
+    ///     `size_of::<A>() + size_of::<B>()`, whose `+` writes `_0`);
+    ///   * a second `_0`-defining call, or a `_0`-defining call to any
+    ///     function other than `size_of`/`align_of`;
+    ///   * a body with no `Return`.
+    /// Linear `Goto`s and panic-cleanup terminators (`Abort`,
+    /// `UnwindResume`, `Drop`, `Assert`), plus calls and assignments that
+    /// do *not* write `_0`, are permitted: none of them define the const
+    /// value, so with no `Switch` the single `size_of` call is its
+    /// unconditional sole definer.  Also `None` for a non-ADT type argument
+    /// (primitive / pointer / tuple, which has no `TypeDecl` layout to
+    /// read) or a layout Charon left unresolved.
     fn fold_size_const_global(&self, def_id: u64) -> Option<OpKind> {
         let gd = self.llbc.global_by_id(def_id)?;
         if gd
@@ -3788,38 +3801,79 @@ impl<'a> Lowering<'a> {
         }
         let init_id = gd.rest.get("init")?.as_u64()?;
         let body = self.llbc.fn_by_id(init_id)?.unstructured()?;
+
+        // The single `size_of`/`align_of` call that defines `_0`, captured
+        // as `(want_align, type_argument)`.  `term()`/`stmt_kind()` return
+        // owned values, so the type expression is cloned out of the call.
+        let mut found: Option<(bool, serde_json::Value)> = None;
+        let mut saw_return = false;
         for block in &body.body {
-            let Ok(TermKind::Call { call, .. }) = block.term() else {
-                continue;
-            };
-            // The size/align result must be the const's own value: a
-            // temporary destination means a computed const we must leave
-            // to the accessor path.
-            if !matches!(call.dest.kind, PlaceKind::Local(0)) {
-                continue;
+            for stmt in &block.statements {
+                match stmt.stmt_kind() {
+                    Ok(StmtKind::StorageLive(_))
+                    | Ok(StmtKind::StorageDead(_))
+                    | Ok(StmtKind::PlaceMention(_)) => {}
+                    // A statement writing `_0` means the value is computed,
+                    // not the bare `size_of`/`align_of` call result.
+                    Ok(StmtKind::Assign(place, _)) if matches!(place.kind, PlaceKind::Local(0)) => {
+                        return None;
+                    }
+                    // An assignment to a temporary cannot reach `_0` without
+                    // an `_0` write we already reject, so it is inert here.
+                    Ok(StmtKind::Assign(_, _)) => {}
+                    // `Assert` statements and anything unparsed: bail.
+                    _ => return None,
+                }
             }
-            let CallFunc::Regular(reg) = &call.func else {
-                continue;
-            };
-            let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
-                continue;
-            };
-            let want_align = match self.llbc.fn_by_id(*id)?.item_meta.name_path().as_str() {
-                "core::mem::size_of" => false,
-                "core::mem::align_of" => true,
-                _ => continue,
-            };
-            let ty = reg.generics.get("types")?.as_array()?.first()?;
-            let adt = self.resolve_tyexpr_to_adt_def_id(ty)?;
-            let layout = self.llbc.type_by_id(adt)?.layout_for_target("")?;
-            let value = if want_align {
-                layout.align
-            } else {
-                layout.size
-            }?;
-            return Some(OpKind::ConstInt(value as i64));
+            match block.term() {
+                // Data-dependent control flow or an unreadable terminator:
+                // the const value would not be the unconditional size_of.
+                Ok(TermKind::Switch { .. }) | Ok(TermKind::Unknown) | Err(_) => {
+                    return None;
+                }
+                Ok(TermKind::Return) => saw_return = true,
+                Ok(TermKind::Call { call, .. })
+                    if matches!(call.dest.kind, PlaceKind::Local(0)) =>
+                {
+                    let CallFunc::Regular(reg) = &call.func else {
+                        return None;
+                    };
+                    let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+                        return None;
+                    };
+                    let want_align = match self.llbc.fn_by_id(*id)?.item_meta.name_path().as_str() {
+                        "core::mem::size_of" => false,
+                        "core::mem::align_of" => true,
+                        // `_0` defined by some other function: not a bare
+                        // size_of/align_of const.
+                        _ => return None,
+                    };
+                    // A second `_0`-defining call makes the value
+                    // order-dependent; only a single one is foldable.
+                    if found.is_some() {
+                        return None;
+                    }
+                    let ty = reg.generics.get("types")?.as_array()?.first()?.clone();
+                    found = Some((want_align, ty));
+                }
+                // `Goto` / `Abort` / `UnwindResume` / `Drop` / `Assert`, and
+                // any call that does not define `_0`: linear continuation or
+                // panic cleanup, none of which write the const value.
+                Ok(_) => {}
+            }
         }
-        None
+        let (want_align, ty) = found?;
+        if !saw_return {
+            return None;
+        }
+        let adt = self.resolve_tyexpr_to_adt_def_id(&ty)?;
+        let layout = self.llbc.type_by_id(adt)?.layout_for_target("")?;
+        let value = if want_align {
+            layout.align
+        } else {
+            layout.size
+        }?;
+        Some(OpKind::ConstInt(value as i64))
     }
 
     // -----------------------------------------------------------------------
