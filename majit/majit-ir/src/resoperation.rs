@@ -1160,6 +1160,14 @@ pub trait BoxEnv {
     fn get_box_replacement_not_const(&self, opref: OpRef) -> OpRef {
         self.get_box_replacement(opref)
     }
+    /// resume.py:202 `box.get_box_replacement()` returning the canonical box
+    /// OBJECT, not just its OpRef. The resume-numbering maps (#160/S11
+    /// `LiveboxMap`, `cached_boxes`, `cached_virtuals`) key by box identity —
+    /// RPython's dict-by-`is` — so this must return the ONE canonical `Rc`
+    /// per logical box (memoized per producer `Op`/`InputArg` via `box_cache`)
+    /// so two reaches of one box compare `Rc::ptr_eq`. Const is classified by
+    /// `is_const` / `getconst` before any map insert and never reaches here.
+    fn get_box_replacement_boxref(&self, opref: OpRef) -> BoxRef;
     /// resume.py:204 — isinstance(box, Const)
     fn is_const(&self, opref: OpRef) -> bool;
     /// Constant value + type. Only valid when is_const returns true.

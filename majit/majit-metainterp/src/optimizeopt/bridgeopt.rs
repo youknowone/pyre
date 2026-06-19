@@ -63,7 +63,9 @@ pub fn serialize_optimizer_knowledge(
     let available_boxes: Vec<OpRef> = liveboxes
         .iter()
         .filter_map(|opt| *opt)
-        .filter(|opref| numb_state.liveboxes.contains_key(*opref))
+        // #160/S11: liveboxes is box-keyed; resolve each backend position to
+        // its canonical box for the membership probe.
+        .filter(|opref| numb_state.liveboxes.contains_key(&env.get_box_replacement_boxref(*opref)))
         .collect();
 
     // bridgeopt.py:74-88: known classes bitfield
