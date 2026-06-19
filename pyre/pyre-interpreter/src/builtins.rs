@@ -6238,8 +6238,9 @@ fn file_method_read(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
         }
     }
     let data = file_get_data(args[0]);
-    let pos = file_get_pos(args[0]);
-    let remaining = &data[pos.min(data.len())..];
+    let bytes = data.as_bytes();
+    let pos = file_get_pos(args[0]).min(bytes.len());
+    let remaining = &bytes[pos..];
     let n = if args.len() >= 2 {
         let n_val = unsafe { pyre_object::w_int_get_value(args[1]) };
         if n_val < 0 {
@@ -6250,11 +6251,11 @@ fn file_method_read(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
     } else {
         remaining.len()
     };
-    // Slice at char boundaries — count by bytes.
+    // Count by bytes; binary mode hands back `bytes`, text mode `str`.
     let end = n.min(remaining.len());
-    let chunk = &remaining[..end];
+    let chunk = remaining[..end].to_vec();
     file_set_pos(args[0], pos + end);
-    Ok(w_str_new(chunk))
+    Ok(fd_bytes_to_obj(args[0], chunk))
 }
 
 fn file_method_readline(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -6289,15 +6290,20 @@ fn file_method_readline(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
         }
     }
     let data = file_get_data(args[0]);
+    let bytes = data.as_bytes();
     let pos = file_get_pos(args[0]);
-    if pos >= data.len() {
-        return Ok(w_str_new(""));
+    if pos >= bytes.len() {
+        return Ok(fd_bytes_to_obj(args[0], Vec::new()));
     }
-    let rest = &data[pos..];
-    let end = rest.find('\n').map(|i| i + 1).unwrap_or(rest.len());
-    let line = &rest[..end];
+    let rest = &bytes[pos..];
+    let end = rest
+        .iter()
+        .position(|&b| b == b'\n')
+        .map(|i| i + 1)
+        .unwrap_or(rest.len());
+    let line = rest[..end].to_vec();
     file_set_pos(args[0], pos + end);
-    Ok(w_str_new(line))
+    Ok(fd_bytes_to_obj(args[0], line))
 }
 
 fn file_method_readlines(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -6307,8 +6313,16 @@ fn file_method_readlines(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
     let mut lines = Vec::new();
     loop {
         let line = file_method_readline(args)?;
-        let s = unsafe { pyre_object::w_str_get_value(line) };
-        if s.is_empty() {
+        // readline returns `bytes` in binary mode and `str` otherwise; an
+        // empty result of either kind marks EOF.
+        let empty = unsafe {
+            if pyre_object::bytesobject::is_bytes_like(line) {
+                pyre_object::bytesobject::bytes_like_data(line).is_empty()
+            } else {
+                pyre_object::w_str_get_value(line).is_empty()
+            }
+        };
+        if empty {
             break;
         }
         lines.push(line);
@@ -6535,6 +6549,11 @@ pub fn builtin_open(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
     let _ = crate::baseobjspace::setattr_str(wrapper, "__file_pos__", w_int_new(0));
     let _ = crate::baseobjspace::setattr_str(wrapper, "__file_name__", w_str_new(&path));
     let _ = crate::baseobjspace::setattr_str(wrapper, "__file_mode__", w_str_new(&mode));
+    // Carry binary-ness so read/readline wrap their chunks as `bytes` in
+    // binary mode (`'rb'`), matching the fd-backed branch above.  Without
+    // this a path-backed `open(p, 'rb').readline()` would hand back `str`,
+    // breaking `tokenize.detect_encoding` (`first.startswith(BOM_UTF8)`).
+    let _ = crate::baseobjspace::setattr_str(wrapper, "__file_binary__", w_bool_from(binary));
     let _ = crate::baseobjspace::setattr_str(wrapper, "name", w_str_new(&path));
     let _ = crate::baseobjspace::setattr_str(wrapper, "mode", w_str_new(&mode));
     let _ = crate::baseobjspace::setattr_str(wrapper, "closed", w_bool_from(false));
