@@ -1363,6 +1363,19 @@ struct Lowering<'a> {
     /// rewires into `ExitSwitch::LastException` exits after the body
     /// lowering completes.
     result_exc_call_results: Vec<Variable>,
+    /// `Variable.id()`s whose binding was resolved from a `Copy`/`Move`
+    /// operand whose place type is the string value-model family
+    /// (`String` ADT or the `str` builtin).  The `#277` `format_args!`
+    /// recognizer ([`Lowering::fmt_chain_all_string_display`]) consults
+    /// this set to verify every `{}` placeholder argument renders by
+    /// identity (a `&str`/`String` `Display`) before folding the chain to
+    /// a string concat; an argument absent from the set is not provably
+    /// string-family and the whole chain is left unfolded (fail-closed).
+    /// The post-build graph cannot recover this — `tyref_to_value_type`
+    /// collapses both `String` and `&str` to `Ref(None)` — so the
+    /// classification is stamped here at resolve time when the Charon
+    /// `TyRef` is still in hand.
+    fmt_arg_string_vars: std::collections::HashSet<u64>,
 }
 
 impl<'a> Lowering<'a> {
@@ -1493,6 +1506,7 @@ impl<'a> Lowering<'a> {
             const_discriminant_locals: std::collections::HashMap::new(),
             multi_assigned_locals: compute_multi_assigned_locals(body),
             result_exc_call_results: Vec::new(),
+            fmt_arg_string_vars: std::collections::HashSet::new(),
         })
     }
 
@@ -2974,7 +2988,19 @@ impl<'a> Lowering<'a> {
     /// Resolve an [`Operand`] to the Variable the IR should reference.
     fn resolve_operand(&mut self, mir_bb: usize, op: Operand) -> Result<Variable, LowerError> {
         match op {
-            Operand::Copy(place) | Operand::Move(place) => self.resolve_place(mir_bb, place),
+            Operand::Copy(place) | Operand::Move(place) => {
+                // Record the resolved Variable as string-family when the
+                // operand's place types as `String`/`&str`, so the #277
+                // `format_args!` recognizer can verify a placeholder
+                // argument renders by identity (see `fmt_arg_string_vars`).
+                let is_string = tyref_is_string_adt(&place.ty, self.llbc)
+                    || tyref_strips_to_str(&place.ty, self.llbc);
+                let var = self.resolve_place(mir_bb, place)?;
+                if is_string {
+                    self.fmt_arg_string_vars.insert(var.id());
+                }
+                Ok(var)
+            }
             Operand::Const(value) => self.emit_constant(mir_bb, &value),
         }
     }
@@ -4183,6 +4209,46 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
+                // `alloc::fmt::format(args)` over a recognized `format_args!`
+                // chain whose every `{}` placeholder is a `&str`/`String`
+                // `Display` (so each renders by identity).  Fold it to the
+                // StringRepr str-const + `add` concat (`emit_fmt_concat` →
+                // `ll_strconcat`, parity with `rstr.do_stringformat` on the
+                // all-string subset) and neutralize the chain's unregistered
+                // `fmt::Arguments::new` / `fmt::rt::Argument::new_*` ctors so
+                // the now-dead construction subgraph lifts.  Any chain
+                // outside the subset (a `Debug` placeholder, a non-string
+                // `Display`, a width/precision/positional spec, or an
+                // un-typed argument) is declined and keeps the ordinary
+                // lowering — the fold never fires unless every argument is
+                // provably string-family.
+                if args.len() == 1
+                    && self.is_fmt_format_call(&reg)
+                    && let Some(chain) = extract_fmt_chain(&self.graph, &args[0])
+                    && self.fmt_chain_all_string_display(&chain)
+                    && let Some(paths) = chain
+                        .args
+                        .iter()
+                        .map(|a| self.fmt_value_path(&a.value, bb_id))
+                        .collect::<Option<Vec<_>>>()
+                {
+                    // Each `Argument::new_*(&v)` call terminates its own
+                    // MIR block, so a placeholder value `v` is usually
+                    // dead by the `format()` block — thread it forward
+                    // along the (merge-free) construction chain so the
+                    // concat's operand is in scope.
+                    let mut threaded = chain.clone();
+                    for (arg, path) in threaded.args.iter_mut().zip(&paths) {
+                        arg.value = self.thread_along_path(&arg.value, path);
+                    }
+                    self.neutralize_fmt_chain_ctors(&args[0]);
+                    let res = emit_fmt_concat(&mut self.graph, bb_id, &threaded);
+                    self.local_var[dest_local] = Some(res);
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
                 // Resolve the target function's fully-qualified path
                 // through the FunId → FunDecl table. `Trait` here is
                 // Charon's "trait-bound generic resolved at extraction
@@ -4991,6 +5057,166 @@ impl<'a> Lowering<'a> {
             return false;
         }
         tyref_strips_to_str(dest_ty, self.llbc)
+    }
+
+    /// `alloc::fmt::format(args)` (the `format!` macro's String producer)
+    /// — the call whose `format_args!` argument the #277 recognizer
+    /// back-traces.  `write!`/`writeln!` lower to `fmt::Write::write_fmt`
+    /// (a `Result`), never `fmt::format`, so the two-segment tail keeps
+    /// the match precise.
+    fn is_fmt_format_call(&self, reg: &RegularCall) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        self.llbc.fn_by_id(*id).is_some_and(|fd| {
+            let np = fd.item_meta.name_path();
+            let segs: Vec<String> = np.split("::").map(str::to_string).collect();
+            fmt_path_ends_with(&segs, &["fmt", "format"])
+        })
+    }
+
+    /// Whether every placeholder of a recovered `format_args!` chain
+    /// renders by identity: a `Display` (`{}`, not `{:?}` `Debug`) of a
+    /// string-family value (`fmt_arg_string_vars`).  Only then is the
+    /// str-const + `add` concat ([`emit_fmt_concat`]) a faithful
+    /// substitute for the runtime render (`rstr.do_stringformat`'s
+    /// per-argument `ll_str` is the identity on a string).  A `Debug`
+    /// placeholder (adds quotes/escapes), a non-string `Display` (an
+    /// integer's `ll_int2dec`), or an argument whose type was never
+    /// stamped string-family ⇒ decline the whole chain (fail-closed).
+    fn fmt_chain_all_string_display(&self, chain: &FmtChain) -> bool {
+        chain.args.iter().all(|a| {
+            a.kind == FmtArgKind::Display && self.fmt_arg_string_vars.contains(&a.value.id())
+        })
+    }
+
+    /// Replace this `format_args!` chain's unregistered constructor calls
+    /// — the single `fmt::Arguments::new(pieces, args)` that produced
+    /// `fmt_args_var` and each `fmt::rt::Argument::new_display`/`new_debug`
+    /// element of its args array — in place with the `__str_const("")`
+    /// dummy the flowspace adapter folds to an empty-string `Constant`.
+    /// After the fold binds the result to the concat, `fmt_args_var` and
+    /// its whole construction subgraph are dead; neutralizing only the
+    /// unregistered `Call`s (the bytes/array/tuple ops already lift) lets
+    /// the dead subgraph translate instead of tripping the
+    /// `not registered in PyreCallRegistry` wall, without removing ops
+    /// (no index shift, no dangling cross-block inputarg).
+    fn neutralize_fmt_chain_ctors(&mut self, fmt_args_var: &Variable) {
+        use crate::model::{CallTarget, OpKind, ValueType};
+        let dummy = || OpKind::Call {
+            target: CallTarget::FunctionPath {
+                segments: vec!["__str_const".to_string(), String::new()],
+            },
+            args: vec![],
+            result_ty: ValueType::Ref(None),
+        };
+        let mut positions: Vec<(BlockId, usize)> = Vec::new();
+        let Some((ab, ai)) = resolve_to_producer_op(&self.graph, fmt_args_var) else {
+            return;
+        };
+        positions.push((ab, ai));
+        // The `Arguments::new(pieces, args)` second operand is the args
+        // array; each element is an `Argument::new_*` ctor to neutralize.
+        let args_var = match self
+            .graph
+            .blocks
+            .iter()
+            .find(|b| b.id == ab)
+            .and_then(|b| b.operations.get(ai))
+            .map(|op| &op.kind)
+        {
+            Some(OpKind::Call { args, .. }) => args.get(1).cloned(),
+            _ => None,
+        };
+        if let Some(args_var) = args_var
+            && let Some(arg_elems) = read_array_literal_elements(&self.graph, &args_var)
+        {
+            for elem in &arg_elems {
+                if let Some(p) = resolve_to_producer_op(&self.graph, elem) {
+                    positions.push(p);
+                }
+            }
+        }
+        for (b, i) in positions {
+            if let Some(op) = self.graph.block_mut(b).operations.get_mut(i) {
+                op.kind = dummy();
+            }
+        }
+    }
+
+    /// Whether `v` is defined in block `b` — bound as one of its
+    /// `inputargs` or produced by one of its operations.
+    fn block_defines(&self, b: BlockId, v: &Variable) -> bool {
+        let blk = self.graph.block(b);
+        blk.inputargs.iter().any(|a| a.id() == v.id())
+            || blk
+                .operations
+                .iter()
+                .any(|op| op.result.as_ref().is_some_and(|r| r.id() == v.id()))
+    }
+
+    /// The block chain `[target, .., def]` (target first) from `target`
+    /// back to the block that defines `value`, each hop a single incoming
+    /// `Link`.  `Some(vec![target])` when `value` is already in scope at
+    /// `target`; `None` when a hop has zero or several incoming links (a
+    /// merge — no single forward path to thread along).  Read-only: used
+    /// to pre-check that every `format_args!` placeholder value can be
+    /// carried to the `format()` block before any graph mutation.
+    fn fmt_value_path(&self, value: &Variable, target: BlockId) -> Option<Vec<BlockId>> {
+        if self.block_defines(target, value) {
+            return Some(vec![target]);
+        }
+        let mut path = vec![target];
+        let mut cur = target;
+        loop {
+            let mut incoming = self
+                .graph
+                .blocks
+                .iter()
+                .flat_map(|b| b.exits.iter().map(move |l| (b.id, l.target)))
+                .filter(|(_, t)| *t == cur);
+            let (src, _) = incoming.next()?;
+            if incoming.next().is_some() {
+                return None; // merge: no single forward path
+            }
+            path.push(src);
+            if self.block_defines(src, value) {
+                return Some(path);
+            }
+            cur = src;
+            if path.len() > 4096 {
+                return None; // runaway guard
+            }
+        }
+    }
+
+    /// Thread `value` forward from its defining block to the chain's
+    /// final block (`path` is `[target, .., def]` as returned by
+    /// [`Lowering::fmt_value_path`]), appending it to each hop's single
+    /// `Link` and a fresh `inputarg` to each successor.  Returns the
+    /// in-`target` Variable.  Each block on a [`fmt_value_path`] chain has
+    /// exactly one incoming `Link`, so growing that `Link`'s args and the
+    /// block's `inputargs` in lock-step preserves the arity invariant.
+    fn thread_along_path(&mut self, value: &Variable, path: &[BlockId]) -> Variable {
+        let mut chain: Vec<BlockId> = path.to_vec();
+        chain.reverse(); // [def, .., target]
+        let mut carried = value.clone();
+        for w in chain.windows(2) {
+            let (from, to) = (w[0], w[1]);
+            let new_input = Variable::new();
+            if let Some(link) = self
+                .graph
+                .block_mut(from)
+                .exits
+                .iter_mut()
+                .find(|l| l.target == to)
+            {
+                link.args.push(crate::model::LinkArg::Value(carried.clone()));
+            }
+            self.graph.block_mut(to).inputargs.push(new_input.clone());
+            carried = new_input;
+        }
+        carried
     }
 
     /// The blanket `impl<I: Iterator> IntoIterator for I`
@@ -8875,9 +9101,6 @@ fn scalar_value_to_i64(v: &serde_json::Value) -> Option<i64> {
 /// `None` when `var` traces to a `Const`, a function input (no producing
 /// op), a phi merge (a block with more than one incoming `Link`, so no
 /// single producer), or a producer not yet emitted into `graph`.
-//
-// Staged for the #277 recognizer; not yet wired into the call dispatch.
-#[allow(dead_code)]
 fn resolve_to_producer_op(
     graph: &FunctionGraph,
     var: &crate::flowspace::model::Variable,
@@ -8944,9 +9167,6 @@ fn resolve_to_producer_op(
 /// untouched) on any high-bit control byte other than `0xC0` — i.e. a
 /// format spec with width/precision/fill or an explicit positional/named
 /// argument — and on non-UTF-8 literal bytes.
-//
-// Staged for the #277 recognizer; not yet wired into the call dispatch.
-#[allow(dead_code)]
 fn decode_packed_format_pieces(bytes: &[u8]) -> Option<(Vec<String>, usize)> {
     let mut pieces: Vec<String> = Vec::new();
     let mut current = String::new();
@@ -8997,9 +9217,6 @@ fn decode_packed_format_pieces(bytes: &[u8]) -> Option<(Vec<String>, usize)> {
 /// once the ctor is found. Returns `None` if `array_var` is not produced
 /// by an `Array` ctor, or its `__pos_i` writes are not the contiguous
 /// range `0..n`.
-//
-// Staged for the #277 recognizer; not yet wired into the call dispatch.
-#[allow(dead_code)]
 fn read_array_literal_elements(
     graph: &FunctionGraph,
     array_var: &crate::flowspace::model::Variable,
@@ -9042,9 +9259,6 @@ fn read_array_literal_elements(
 /// following cross-block links via [`resolve_to_producer_op`]. Used to
 /// read the packed-format pieces byte array (each `__pos_i` element is a
 /// `ConstInt` byte).
-//
-// Staged for the #277 recognizer; not yet wired into the call dispatch.
-#[allow(dead_code)]
 fn resolve_const_int(
     graph: &FunctionGraph,
     var: &crate::flowspace::model::Variable,
@@ -9063,7 +9277,6 @@ fn resolve_const_int(
 /// `new_debug` constructor in the parallel args array (the packed pieces
 /// template does not encode the choice).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
 enum FmtArgKind {
     Display,
     Debug,
@@ -9072,7 +9285,6 @@ enum FmtArgKind {
 /// One placeholder argument recovered from a `format_args!` chain: the
 /// value Variable the placeholder renders and its Display/Debug flavour.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 struct FmtArg {
     value: crate::flowspace::model::Variable,
     kind: FmtArgKind,
@@ -9082,7 +9294,6 @@ struct FmtArg {
 /// pieces interleaved with the rendered placeholder arguments
 /// (`pieces.len() == args.len() + 1`).
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 struct FmtChain {
     pieces: Vec<String>,
     args: Vec<FmtArg>,
@@ -9092,7 +9303,6 @@ struct FmtChain {
 /// crate-qualified spelling (`core::fmt::Arguments::new`) and the
 /// crate-stripped front-end spelling (`fmt::Arguments::new`) both
 /// resolve.
-#[allow(dead_code)]
 fn fmt_path_ends_with(segments: &[String], tail: &[&str]) -> bool {
     segments.len() >= tail.len()
         && segments[segments.len() - tail.len()..]
@@ -9103,7 +9313,6 @@ fn fmt_path_ends_with(segments: &[String], tail: &[&str]) -> bool {
 
 /// The `fmt::Arguments::new(pieces, args)` constructor that `format_args!`
 /// builds from the on-stack pieces+args arrays.
-#[allow(dead_code)]
 fn is_arguments_new_path(segments: &[String]) -> bool {
     fmt_path_ends_with(segments, &["Arguments", "new"])
 }
@@ -9111,7 +9320,6 @@ fn is_arguments_new_path(segments: &[String]) -> bool {
 /// Classify a `fmt::rt::Argument::new_display` / `new_debug` constructor
 /// path. Any other path (positional/named/width-bearing argument ctor) is
 /// not in the recognized subset.
-#[allow(dead_code)]
 fn fmt_argument_ctor_kind(segments: &[String]) -> Option<FmtArgKind> {
     if fmt_path_ends_with(segments, &["Argument", "new_display"]) {
         Some(FmtArgKind::Display)
@@ -9128,7 +9336,6 @@ fn fmt_argument_ctor_kind(segments: &[String]) -> Option<FmtArgKind> {
 /// value written into that tuple field. Returns `var` unchanged when it
 /// is not produced by a `FieldRead` (value passed directly), and `None`
 /// when the tuple field has conflicting writers.
-#[allow(dead_code)]
 fn unwrap_fmt_arg_tuple_ref(
     graph: &FunctionGraph,
     var: &crate::flowspace::model::Variable,
@@ -9180,7 +9387,6 @@ fn unwrap_fmt_arg_tuple_ref(
 /// element is the result of a `fmt::rt::Argument::new_display` /
 /// `new_debug` constructor, whose sole argument back-traces (through the
 /// tuple-ref wrap) to the rendered value.
-#[allow(dead_code)]
 fn extract_fmt_arg(
     graph: &FunctionGraph,
     arg_elem: &crate::flowspace::model::Variable,
@@ -9212,7 +9418,6 @@ fn extract_fmt_arg(
 /// Returns `None` (the recognizer leaves the graph untouched) on any
 /// shape outside the recognized subset, so it never fires on an
 /// unsupported chain.
-#[allow(dead_code)]
 fn extract_fmt_chain(
     graph: &FunctionGraph,
     fmt_args_var: &crate::flowspace::model::Variable,
@@ -9254,7 +9459,6 @@ fn extract_fmt_chain(
 /// constant lowering uses (see [`Lowering::emit_constant`]); the flowspace
 /// adapter pre-folds it to the upstream string `Constant` and types it as
 /// a String.
-#[allow(dead_code)]
 fn emit_str_const(graph: &mut FunctionGraph, bb_id: BlockId, text: &str) -> Variable {
     use crate::model::{CallTarget, OpKind, ValueType};
     let var = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
@@ -9275,7 +9479,6 @@ fn emit_str_const(graph: &mut FunctionGraph, bb_id: BlockId, text: &str) -> Vari
 /// Variable. The `"add"` opname passes through the flowspace adapter
 /// unchanged; when both operands type as String the rtyper routes it to
 /// `pair(StringRepr, StringRepr).rtype_add` → `direct_call(ll_strconcat)`.
-#[allow(dead_code)]
 fn emit_str_add(
     graph: &mut FunctionGraph,
     bb_id: BlockId,
@@ -10258,33 +10461,6 @@ mod tests {
 
         // A non-Array producer (plain ConstInt) is rejected.
         assert_eq!(read_array_literal_elements(&graph, &elements[0]), None);
-    }
-
-    /// Throwaway IR-capture probe for the #277 fmt recognizer: dumps the
-    /// lowered front-end op sequence for `stack_underflow_error` (the
-    /// canonical `type_error(format!("…{x}"))` chain) so the byte-array
-    /// piece decoder can be anchored to the real `Array`/`ConstInt` shape.
-    /// Ignored by default (loads the 242MB real LLBC); run with
-    /// `cargo test -p majit-translate --lib dump_fmt_chain_ir -- --ignored --nocapture`.
-    #[test]
-    #[ignore]
-    fn dump_fmt_chain_ir() {
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-interpreter.ullbc"
-        );
-        let llbc = Llbc::load(path).expect("load real LLBC");
-        let graph = super::lower_function(&llbc, "stack_underflow_error")
-            .expect("lower stack_underflow_error");
-        for block in &graph.blocks {
-            eprintln!("block {:?} inputargs={:?}", block.id, block.inputargs);
-            for (idx, op) in block.operations.iter().enumerate() {
-                eprintln!("  [{idx}] result={:?} kind={:?}", op.result, op.kind);
-            }
-            for link in &block.exits {
-                eprintln!("  exit -> {:?} args={:?}", link.target, link.args);
-            }
-        }
     }
 
     #[test]
