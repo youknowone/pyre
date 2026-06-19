@@ -221,6 +221,47 @@ pub fn const_str_cache_llstr(s: &[u8]) -> Result<_ptr, String> {
     })
 }
 
+/// Inverse of [`llstr`] / [`const_str_cache_llstr`]: read back the
+/// Latin-1 byte payload and `hash`-slot value of a prebuilt `Ptr(STR)`
+/// container.  The codewriter uses this to lower a prebuilt-string
+/// `ConstValue::LLPtr(STR)` into a runtime-materialized descriptor: the
+/// build-time `_ptr` is process-local, so only its bytes + precomputed
+/// hash survive into the serialized jitcode.
+///
+/// Returns `None` for null, a non-struct target, a missing/empty-typed
+/// `chars` field, or a non-`Char` element (a `Ptr(UNICODE)` container,
+/// whose `chars` are `UniChar`, is out of scope here — Unicode prebuilt
+/// constants are a separate lowering).
+pub fn prebuilt_str_bytes_and_hash(p: &_ptr) -> Option<(Vec<u8>, i64)> {
+    if !p.nonzero() {
+        return None;
+    }
+    let _ptr_obj::Struct(st) = p._obj0_value().ok().flatten()? else {
+        return None;
+    };
+    let fields = st._fields.lock().unwrap();
+    // `chars` mirrors the read side of `llstr`'s per-index fill.
+    let Some((_, LowLevelValue::Array(chars))) = fields.iter().find(|(n, _)| n == "chars") else {
+        return None;
+    };
+    let mut bytes = Vec::with_capacity(chars.getlength());
+    for i in 0..chars.getlength() {
+        match chars.getitem(i) {
+            // `u8 as char` is the Latin-1 embedding `llstr` writes, so the
+            // low byte round-trips every value 0..=255.
+            Some(LowLevelValue::Char(c)) => bytes.push(c as u32 as u8),
+            _ => return None,
+        }
+    }
+    // `const_str_cache_llstr` precomputes and stores `hash` (rstr.py:199);
+    // a bare `llstr` leaves the malloc-zeroed `0` (lazy not-computed).
+    let hash = match fields.iter().find(|(n, _)| n == "hash") {
+        Some((_, LowLevelValue::Signed(h))) => *h,
+        _ => ll_strhash_value(&bytes),
+    };
+    Some((bytes, hash))
+}
+
 /// `nullptr(self.lowleveltype.TO)` for the `value is None` arm of
 /// `BaseLLStringRepr.convert_const` (`lltypesystem/rstr.py:192-193`).
 pub fn null_str_ptr() -> _ptr {
@@ -8698,6 +8739,33 @@ mod tests {
         // An uncached `llstr` of the same bytes mints a fresh container.
         let fresh = llstr(b"cache-identity-probe").expect("uncached llstr");
         assert_ne!(p1, fresh, "llstr must not consult the cache");
+    }
+
+    /// [`prebuilt_str_bytes_and_hash`] is the inverse of
+    /// [`const_str_cache_llstr`]: the bytes round-trip (incl. `0x00`/`0xFF`)
+    /// and the precomputed `hash` slot is read back, so the codewriter can
+    /// lower a prebuilt `Ptr(STR)` to a deferred runtime descriptor.  Null
+    /// pointers yield `None`.
+    #[test]
+    fn prebuilt_str_bytes_and_hash_round_trips_cache_llstr() {
+        let bytes: &[u8] = &[b'h', 0x00, 0xFF, b'i'];
+        let p = const_str_cache_llstr(bytes).expect("cache llstr");
+        let (got_bytes, got_hash) =
+            prebuilt_str_bytes_and_hash(&p).expect("prebuilt STR must decode");
+        assert_eq!(got_bytes, bytes, "bytes must round-trip every value");
+        assert_eq!(
+            got_hash,
+            ll_strhash_value(bytes),
+            "hash slot must carry the precomputed ll_strhash value"
+        );
+        // The empty string decodes to empty bytes with the `-1` hash.
+        let empty = const_str_cache_llstr(b"").expect("cache llstr empty");
+        assert_eq!(
+            prebuilt_str_bytes_and_hash(&empty),
+            Some((Vec::new(), ll_strhash_value(b"")))
+        );
+        // A typed null `Ptr(STR)` is not a prebuilt string.
+        assert_eq!(prebuilt_str_bytes_and_hash(&null_str_ptr()), None);
     }
 
     /// `nullptr(self.lowleveltype.TO)` arm of

@@ -49,6 +49,24 @@ use serde::{Deserialize, Serialize};
 /// Field-by-field mapping below preserves the RPython names. Where
 /// RPython uses `chr(int)` to pack a 0..255 register count into a single
 /// byte we use `u8` directly; the value range is identical.
+/// A prebuilt-string constant whose runtime STR GcStruct is materialized
+/// at jitcode-load time (the build-time translator cannot allocate it; see
+/// [`JitCodeBody::str_consts`]).  The content key is `bytes`; identical
+/// literals across a jitcode share one descriptor.
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct StrConstDescriptor {
+    /// Position in [`JitCodeBody::constants_r`] holding the sentinel that
+    /// the runtime load pass overwrites with the live STR address.
+    pub constants_r_index: usize,
+    /// The string's bytes (Latin-1 / Py2 `str` embedding, the `chars`
+    /// payload of the prebuilt `Ptr(STR)` container).
+    pub bytes: Vec<u8>,
+    /// `ll_strhash_value(bytes)` (the `0 -> 29872897` not-computed fixup
+    /// already applied), written to the STR block's `hash` field at
+    /// offset 0 so the runtime never recomputes it.
+    pub precomputed_hash: i64,
+}
+
 /// Body of a `JitCode` — populated once by the assembler after
 /// `transform_graph_to_jitcode` runs the full codewriter pipeline.
 ///
@@ -80,6 +98,19 @@ pub struct JitCodeBody {
     /// `i64` so the runtime register file can consume the pool entries
     /// without a re-bitcast.
     pub constants_f: Vec<i64>,
+    /// Prebuilt-string constants deferred to runtime materialization.
+    /// RPython bakes a prebuilt `Ptr(STR)` GCREF straight into
+    /// `constants_r` (`assembler.py:109-116`) because the translator and
+    /// the runtime metainterp share one C binary.  pyre's translator runs
+    /// in a separate build-script process, so it cannot allocate the
+    /// runtime STR block an `r`-bank constant must point at.  Each entry
+    /// records a string's bytes + precomputed hash and pairs them with a
+    /// `constants_r` slot holding a non-canonical sentinel; the runtime
+    /// load pass materializes an immortal STR GcStruct and overwrites that
+    /// slot with its live address before the jitcode is used.  Default
+    /// empty: existing jitcodes carry no deferred strings.
+    #[serde(default)]
+    pub str_consts: Vec<StrConstDescriptor>,
     /// RPython `jitcode.py:37-39` `self.c_num_regs_i = chr(num_regs_i)`.
     /// RPython packs into a single chr (`assert num_regs_i < 256`); pyre
     /// uses `u16` to keep CPython 3.13 codes that legitimately exceed 255

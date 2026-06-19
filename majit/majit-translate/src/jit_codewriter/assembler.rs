@@ -98,7 +98,7 @@ fn use_c_form(opname: &str) -> bool {
 // kind-search, no fallback — exactly mirroring RPython's
 // `Register(kind, index)` invariant from `flatten.py:28-33`.
 use crate::flowspace::model::ConstValue;
-use crate::jitcode::{BhCallDescr, JitCodeBody};
+use crate::jitcode::{BhCallDescr, JitCodeBody, StrConstDescriptor};
 use crate::regalloc::RegAllocResult;
 
 /// Assembler — converts SSARepr to JitCode.
@@ -349,6 +349,7 @@ impl Assembler {
             constants_i: Vec::new(),
             constants_r: Vec::new(),
             constants_f: Vec::new(),
+            str_consts: Vec::new(),
             num_regs_i,
             num_regs_r,
             num_regs_f,
@@ -442,6 +443,7 @@ impl Assembler {
             constants_i: state.constants_i,
             constants_r: state.constants_r,
             constants_f: state.constants_f,
+            str_consts: state.str_consts,
             c_num_regs_i: num_regs_i as u16,
             c_num_regs_r: num_regs_r as u16,
             c_num_regs_f: num_regs_f as u16,
@@ -2554,6 +2556,19 @@ impl Assembler {
     }
 
     fn emit_const_r(&mut self, value: &ConstValue, state: &mut AssemblyState) -> u8 {
+        // A prebuilt `Ptr(STR)` constant cannot be baked as a runtime
+        // address: the translator runs in a separate build-script process,
+        // so the `_ptr` target is process-local garbage at runtime.  Record
+        // the string's bytes + precomputed hash for runtime materialization
+        // and pool a non-canonical sentinel that the jitcode-load pass
+        // overwrites with the live immortal STR GcStruct address.
+        if let ConstValue::LLPtr(p) = value {
+            if let Some((bytes, hash)) =
+                crate::translator::rtyper::lltypesystem::rstr::prebuilt_str_bytes_and_hash(p)
+            {
+                return self.emit_str_const_r(bytes, hash, state);
+            }
+        }
         let bits = match value {
             ConstValue::HostObject(obj) => obj.identity_id() as i64,
             ConstValue::LLAddress(
@@ -2562,6 +2577,37 @@ impl Assembler {
             other => panic!("raise/r constant pool does not support {other:?}"),
         };
         self.emit_const_r_bits(bits, state)
+    }
+
+    /// Record a prebuilt-string constant for runtime materialization and
+    /// pool its sentinel, returning the `r`-bank register index.  Identical
+    /// literals (by bytes) share one descriptor and one sentinel, so
+    /// [`Self::emit_const_r_bits`]' dedup-by-bits collapses them to a single
+    /// pool entry — the analog of upstream `emit_const`'s `value_key` dedup
+    /// (`assembler.py:116`).
+    fn emit_str_const_r(
+        &mut self,
+        bytes: Vec<u8>,
+        precomputed_hash: i64,
+        state: &mut AssemblyState,
+    ) -> u8 {
+        if let Some(ordinal) = state.str_consts.iter().position(|d| d.bytes == bytes) {
+            return self.emit_const_r_bits(str_const_sentinel(ordinal), state);
+        }
+        let ordinal = state.str_consts.len();
+        let constants_r_index = state.constants_r.len();
+        let reg = self.emit_const_r_bits(str_const_sentinel(ordinal), state);
+        debug_assert_eq!(
+            state.constants_r.len(),
+            constants_r_index + 1,
+            "a fresh str-const sentinel must push a new constants_r slot"
+        );
+        state.str_consts.push(StrConstDescriptor {
+            constants_r_index,
+            bytes,
+            precomputed_hash,
+        });
+        reg
     }
 
     fn emit_const_r_bits(&mut self, bits: i64, state: &mut AssemblyState) -> u8 {
@@ -2593,12 +2639,34 @@ impl Assembler {
     }
 }
 
+/// Non-canonical tag marking a deferred prebuilt-string slot in
+/// `constants_r`.  x86-64 user addresses occupy `0..2^48`, so this high-word
+/// pattern can never alias a real GCREF / host-static address; the low 48
+/// bits carry the [`StrConstDescriptor`] ordinal.  The runtime load pass
+/// overwrites every such slot with a live immortal STR address before the
+/// jitcode is used, so the sentinel is never dereferenced (a non-canonical
+/// deref would fault, surfacing any missed patch immediately).
+pub const STR_CONST_SENTINEL_BASE: i64 = 0x7E57_0000_0000_0000u64 as i64;
+
+/// `STR_CONST_SENTINEL_BASE | ordinal` — see [`STR_CONST_SENTINEL_BASE`].
+fn str_const_sentinel(ordinal: usize) -> i64 {
+    debug_assert!(
+        (ordinal as u64) < (1u64 << 48),
+        "too many prebuilt-string constants in one jitcode"
+    );
+    STR_CONST_SENTINEL_BASE | ordinal as i64
+}
+
 /// Per-assembly state (RPython: Assembler.setup() fields).
 struct AssemblyState {
     code: Vec<u8>,
     constants_i: Vec<i64>,
     constants_r: Vec<i64>,
     constants_f: Vec<i64>,
+    /// Prebuilt-string constants recorded while assembling, committed to
+    /// [`JitCodeBody::str_consts`].  Parallel to `constants_r`: each entry
+    /// owns the `constants_r` slot named by its `constants_r_index`.
+    str_consts: Vec<StrConstDescriptor>,
     num_regs_i: usize,
     num_regs_r: usize,
     num_regs_f: usize,
@@ -3994,6 +4062,7 @@ mod tests {
             constants_i: Vec::new(),
             constants_r: Vec::new(),
             constants_f: Vec::new(),
+            str_consts: Vec::new(),
             num_regs_i: 4,
             num_regs_r: 0,
             num_regs_f: 0,
@@ -4329,6 +4398,49 @@ mod tests {
 
         assert_eq!(body.constants_r, vec![module.identity_id() as i64]);
         assert!(asm.insns.contains_key("ref_return/r"));
+    }
+
+    #[test]
+    fn emit_const_r_records_prebuilt_string_descriptor_and_dedups() {
+        use crate::translator::rtyper::lltypesystem::rstr::{
+            const_str_cache_llstr, ll_strhash_value,
+        };
+        let str_const = |s: &[u8]| {
+            ConstValue::LLPtr(Box::new(
+                const_str_cache_llstr(s).expect("cache llstr"),
+            ))
+        };
+        let mut asm = Assembler::new();
+        let mut state = empty_state();
+
+        // A prebuilt `Ptr(STR)` no longer panics: it records a descriptor
+        // and pools a sentinel slot for runtime materialization.
+        let reg_a = asm.emit_const_r(&str_const(b"hello"), &mut state);
+        assert_eq!(state.str_consts.len(), 1);
+        assert_eq!(state.str_consts[0].bytes, b"hello".to_vec());
+        assert_eq!(
+            state.str_consts[0].precomputed_hash,
+            ll_strhash_value(b"hello")
+        );
+        assert_eq!(state.str_consts[0].constants_r_index, 0);
+        assert_eq!(state.constants_r, vec![str_const_sentinel(0)]);
+
+        // The same literal dedups to the same descriptor + pool slot.
+        let reg_a2 = asm.emit_const_r(&str_const(b"hello"), &mut state);
+        assert_eq!(reg_a2, reg_a);
+        assert_eq!(state.str_consts.len(), 1);
+        assert_eq!(state.constants_r.len(), 1);
+
+        // A distinct literal gets a distinct descriptor + sentinel slot.
+        let reg_b = asm.emit_const_r(&str_const(b"world"), &mut state);
+        assert_ne!(reg_b, reg_a);
+        assert_eq!(state.str_consts.len(), 2);
+        assert_eq!(state.str_consts[1].bytes, b"world".to_vec());
+        assert_eq!(state.str_consts[1].constants_r_index, 1);
+        assert_eq!(
+            state.constants_r,
+            vec![str_const_sentinel(0), str_const_sentinel(1)]
+        );
     }
 
     #[test]
