@@ -54,39 +54,21 @@ pub fn register_pkg(ns: &mut DictStorage) {
             1,
         ),
     );
-    // Mark as a package so dotted imports treat it as such.
-    crate::dict_storage_store(ns, "__path__", pyre_object::w_list_new(vec![]));
-}
-
-/// importlib.util stub — minimal subset.
-pub fn register_util(ns: &mut DictStorage) {
-    // `importlib.util.spec_from_file_location(name, location, *, ...)`,
-    // `module_from_spec(spec)`, and `find_spec(name, package=None)` —
-    // accept any positional/keyword shape so the stubs do not reject
-    // legitimate call signatures via the arity gate.
-    crate::dict_storage_store(
-        ns,
-        "spec_from_file_location",
-        crate::make_builtin_function("spec_from_file_location", |_| Ok(pyre_object::w_none())),
-    );
-    crate::dict_storage_store(
-        ns,
-        "module_from_spec",
-        crate::make_builtin_function("module_from_spec", |_| Ok(pyre_object::w_none())),
-    );
-    crate::dict_storage_store(
-        ns,
-        "find_spec",
-        crate::make_builtin_function("find_spec", |_| Ok(pyre_object::w_none())),
-    );
-    crate::dict_storage_store(
-        ns,
-        "resolve_name",
-        crate::make_builtin_function("resolve_name", |args| {
-            Ok(args.first().copied().unwrap_or(pyre_object::w_str_new("")))
-        }),
-    );
-    crate::dict_storage_store(ns, "MAGIC_NUMBER", pyre_object::w_int_new(0));
+    // Mark as a package so dotted imports treat it as such. Point __path__
+    // at the on-disk importlib directory so unregistered submodules
+    // (importlib._bootstrap / importlib._bootstrap_external) load their real
+    // source from there; the builtin machinery/util/abc stubs still win
+    // because the full-name builtin check precedes the __path__ disk search.
+    #[cfg(feature = "host_env")]
+    let path_items = match crate::importing::detect_stdlib_path() {
+        Some(dir) => vec![pyre_object::w_str_new(
+            &dir.join("importlib").to_string_lossy(),
+        )],
+        None => vec![],
+    };
+    #[cfg(not(feature = "host_env"))]
+    let path_items: Vec<pyre_object::PyObjectRef> = vec![];
+    crate::dict_storage_store(ns, "__path__", pyre_object::w_list_new(path_items));
 }
 
 /// importlib.abc stub — abstract base classes.

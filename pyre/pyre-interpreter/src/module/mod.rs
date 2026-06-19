@@ -50,8 +50,10 @@ pub mod _struct;
 pub mod _thread;
 pub mod _weakref;
 pub mod atexit;
+pub mod binascii;
 pub mod cmath;
 pub mod errno;
+pub mod zlib;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod faulthandler;
 pub mod fcntl;
