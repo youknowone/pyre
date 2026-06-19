@@ -37,8 +37,8 @@ fn pyre_probe_bh_startup_enabled() -> bool {
 
 use pyre_interpreter::bytecode::{Instruction, OpArgState};
 use pyre_interpreter::{
-    PyResult, function_get_closure, function_get_defaults, function_get_globals,
-    function_get_globals_obj, function_get_name, is_function, register_jit_exc_raiser,
+    PyResult, function_get_closure, function_get_defaults, function_get_globals_obj,
+    function_get_name, is_function, register_jit_exc_raiser,
     register_jit_function_caller,
 };
 use pyre_object::intobject::w_int_get_value;
@@ -2585,7 +2585,8 @@ fn create_callee_frame_impl_1_boxed(
 ) -> i64 {
     let w_code = unsafe { pyre_interpreter::getcode(callable) };
     let caller = unsafe { &*(caller_frame as *const PyFrame) };
-    let globals = unsafe { function_get_globals(callable) };
+    // Raw storage is recovered from `w_globals_obj` by the frame builder.
+    let globals = std::ptr::null_mut();
     let w_globals_obj = unsafe { function_get_globals_obj(callable) };
     let one_arg = [boxed_arg];
     let args = fill_positional_defaults_for_jit_call(callable, w_code, &one_arg);
@@ -2740,7 +2741,8 @@ fn create_callee_frame_impl(caller_frame: i64, callable: i64, args: &[PyObjectRe
     let callable = callable as PyObjectRef;
     let w_code = unsafe { pyre_interpreter::getcode(callable) };
     let caller = unsafe { &*(caller_frame as *const PyFrame) };
-    let globals = unsafe { function_get_globals(callable) };
+    // Raw storage is recovered from `w_globals_obj` by the frame builder.
+    let globals = std::ptr::null_mut();
     let w_globals_obj = unsafe { function_get_globals_obj(callable) };
     let args = fill_positional_defaults_for_jit_call(callable, w_code, args);
     let args = args.as_ref();

@@ -700,7 +700,7 @@ pub unsafe fn builtin_code_get_docstring(obj: PyObjectRef) -> PyObjectRef {
 ///   `fn = FunctionWithFixedCode(space, code, None, defs, forcename=gateway.name)`
 pub fn make_builtin_function(name: &'static str, func: BuiltinCodeFn) -> PyObjectRef {
     let code = builtin_code_new(name, func);
-    crate::function_new_with_fixed_code(code as *const (), name.to_string(), std::ptr::null_mut())
+    crate::function_new_with_fixed_code(code as *const (), name.to_string(), pyre_object::PY_NULL)
 }
 
 /// Like `make_builtin_function` but tagged as `BuiltinFunction`
@@ -712,7 +712,7 @@ pub fn make_builtin_function(name: &'static str, func: BuiltinCodeFn) -> PyObjec
 /// `builtin_function_or_method` type.
 pub fn make_builtin_function_as_builtin(name: &'static str, func: BuiltinCodeFn) -> PyObjectRef {
     let code = builtin_code_new(name, func);
-    crate::function_new_builtin(code as *const (), name.to_string(), std::ptr::null_mut())
+    crate::function_new_builtin(code as *const (), name.to_string(), pyre_object::PY_NULL)
 }
 
 /// `make_builtin_function` for a builtin with a declared argument
@@ -724,7 +724,7 @@ pub fn make_builtin_function_with_signature(
     signature: Signature,
 ) -> PyObjectRef {
     let code = builtin_code_new_with_signature(name, func, None, signature);
-    crate::function_new_with_fixed_code(code as *const (), name.to_string(), std::ptr::null_mut())
+    crate::function_new_with_fixed_code(code as *const (), name.to_string(), pyre_object::PY_NULL)
 }
 
 /// `make_builtin_function`, optionally carrying a `Signature`.  `Some`
@@ -770,7 +770,7 @@ pub fn make_builtin_function_with_arity_and_maybe_sig(
         None => std::ptr::null(),
     };
     let code = builtin_code_new_full(name, func, None, arity, sig);
-    crate::function_new_with_fixed_code(code as *const (), name.to_string(), std::ptr::null_mut())
+    crate::function_new_with_fixed_code(code as *const (), name.to_string(), pyre_object::PY_NULL)
 }
 
 /// `make_builtin_function` with known fixed arity for fast-path dispatch.
@@ -780,7 +780,7 @@ pub fn make_builtin_function_with_arity(
     arity: u16,
 ) -> PyObjectRef {
     let code = builtin_code_new_with_arity(name, func, arity);
-    crate::function_new_with_fixed_code(code as *const (), name.to_string(), std::ptr::null_mut())
+    crate::function_new_with_fixed_code(code as *const (), name.to_string(), pyre_object::PY_NULL)
 }
 
 /// `make_builtin_function` with `fast_natural_arity = PASSTHROUGHARGS1` —
@@ -790,7 +790,7 @@ pub fn make_builtin_function_passthrough_args1(
     func: BuiltinCodeFn,
 ) -> PyObjectRef {
     let code = builtin_code_new_passthrough_args1(name, func);
-    crate::function_new_with_fixed_code(code as *const (), name.to_string(), std::ptr::null_mut())
+    crate::function_new_with_fixed_code(code as *const (), name.to_string(), pyre_object::PY_NULL)
 }
 
 /// mixedmodule.py:116 parity — wrap a BuiltinCodeFn as BuiltinFunction.
@@ -799,7 +799,7 @@ pub fn make_builtin_function_passthrough_args1(
 /// must not synthesize a bound method.
 pub fn make_module_builtin_function(name: &'static str, func: BuiltinCodeFn) -> PyObjectRef {
     let code = builtin_code_new(name, func);
-    crate::function_new_builtin(code as *const (), name.to_string(), std::ptr::null_mut())
+    crate::function_new_builtin(code as *const (), name.to_string(), pyre_object::PY_NULL)
 }
 
 /// `make_module_builtin_function` with known fixed arity for fast-path dispatch.
@@ -809,7 +809,7 @@ pub fn make_module_builtin_function_with_arity(
     arity: u16,
 ) -> PyObjectRef {
     let code = builtin_code_new_with_arity(name, func, arity);
-    crate::function_new_builtin(code as *const (), name.to_string(), std::ptr::null_mut())
+    crate::function_new_builtin(code as *const (), name.to_string(), pyre_object::PY_NULL)
 }
 
 #[cfg(test)]

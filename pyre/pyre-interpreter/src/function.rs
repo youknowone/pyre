@@ -6,6 +6,7 @@
 //! When called, the interpreter creates a new PyFrame that *shares*
 //! the globals pointer (no clone).
 
+#[cfg(test)]
 use crate::executioncontext::DictStorage;
 use pyre_object::pyobject::*;
 
@@ -16,14 +17,14 @@ pub static BUILTIN_FUNCTION_TYPE: PyType = pyre_object::pyobject::new_pytype("bu
 
 /// User-defined function object.
 ///
-/// Layout: `[ob_type | code | can_change_code | name_ptr | w_func_globals | closure]`
+/// Layout: `[ob_type | code | can_change_code | name_ptr | closure]`
 /// - `code`: pointer to a Code object (W_CodeObject for user funcs, BuiltinCode for builtins).
 ///   function.py:47 — `_immutable_fields_ = ['code?', ...]`
 /// - `can_change_code`: function.py:33 — True by default; False for
 ///   `FunctionWithFixedCode` subclass (used by builtins).
 /// - `name_ptr`: leaked `Box<String>` containing the function name
-/// - `w_func_globals`: raw pointer to the module-level namespace (shared)
 /// - `closure`:  tuple of cell objects, or PY_NULL if no closure
+/// - `w_func_globals_obj`: the module namespace dict object (`__globals__`)
 #[repr(C)]
 pub struct Function {
     pub ob: PyObject,
@@ -35,8 +36,6 @@ pub struct Function {
     pub can_change_code: bool,
     /// Function name (leaked Box<String>).
     pub name: *const String,
-    /// PyPy: W_Function.w_func_globals
-    pub w_func_globals: *mut DictStorage,
     /// Closure: tuple of cell objects from the enclosing scope,
     /// or PY_NULL if this function has no free variables.
     pub closure: PyObjectRef,
@@ -48,16 +47,16 @@ pub struct Function {
     pub w_kw_defs: PyObjectRef,
     /// function.py:56 — `self.w_module = None`
     pub w_module: PyObjectRef,
-    /// Lazy-resolved canonical W_DictObject sibling for `w_func_globals`.
+    /// PyPy: W_Function.w_func_globals — the module namespace dict object.
     ///
     /// `function.py:57 self.w_func_globals = w_globals` stores the dict
-    /// object directly in PyPy.  Pyre keeps the storage pointer in
-    /// `w_func_globals` (JIT call-site layout reads it for createframe)
-    /// and caches the canonical W_DictObject here once resolved, so
+    /// object directly; this is the function's sole globals carrier, so
     /// `function.__globals__` returns the same identity as the module's
-    /// `__dict__` and frames built from this function share globals.
-    /// `PY_NULL` until `function_get_globals_obj()` performs the
-    /// `dict_storage_to_dict` lookup once.
+    /// `__dict__` and frames built from this function share globals.  The
+    /// raw `*mut DictStorage` a frame builder needs is recovered from this
+    /// object via the `dict_storage_proxy` back-link
+    /// (`w_dict_get_dict_storage_proxy`).  `PY_NULL` for globals-less
+    /// carriers (gateway builtins).
     pub w_func_globals_obj: PyObjectRef,
     /// `function.py:50 w_ann=None` constructor default plus
     /// `function.py:548-551 fget_func_annotations` lazy-init shape:
@@ -163,8 +162,6 @@ fn function_write_barrier(obj: PyObjectRef) {
 pub const FUNCTION_CODE_OFFSET: usize = std::mem::offset_of!(Function, code);
 /// Field offset of `name` within `Function`.
 pub const FUNCTION_NAME_OFFSET: usize = std::mem::offset_of!(Function, name);
-/// Field offset of `w_func_globals` within `Function`.
-pub const FUNCTION_GLOBALS_OFFSET: usize = std::mem::offset_of!(Function, w_func_globals);
 /// Field offset of `closure` within `Function`.
 pub const FUNCTION_CLOSURE_OFFSET: usize = std::mem::offset_of!(Function, closure);
 /// Field offset of `defs_w` within `Function`.
@@ -227,10 +224,8 @@ pub const FUNCTION_OBJECT_SIZE: usize = std::mem::size_of::<Function>();
 /// W_Function.code? — an immutable GC reference traced as part of the
 /// closure / defs_w / w_kw_defs / w_module set.
 ///
-/// The remaining fields are non-GC: `can_change_code` is a `bool`,
-/// `name` is a manually-managed `*const String`, `w_func_globals` is a
-/// `*mut DictStorage` (manually-managed pointer to non-GC storage —
-/// see DictStorage GC migration TODO).
+/// The remaining fields are non-GC: `can_change_code` is a `bool` and
+/// `name` is a manually-managed `*const String`.
 ///
 /// `ob.w_class` is intentionally absent, mirroring how W_IntObject /
 /// W_FloatObject leave the typeptr-shaped header field out of their
@@ -242,10 +237,9 @@ pub const FUNCTION_GC_PTR_OFFSETS: [usize; 12] = [
     FUNCTION_DEFS_W_OFFSET,
     FUNCTION_W_KW_DEFS_OFFSET,
     FUNCTION_W_MODULE_OFFSET,
-    // Lazy-cached canonical W_DictObject sibling for the storage in
-    // `w_func_globals`.  Once resolved it must survive minor
-    // collection — the `dict_storage_to_dict` mirror_target invariant
-    // keeps the same identity across the function's lifetime.
+    // `function.py:57 w_func_globals` — the module namespace dict object,
+    // the function's sole globals carrier; traced for the lifetime of the
+    // function so its `__globals__` identity survives minor collection.
     FUNCTION_W_FUNC_GLOBALS_OBJ_OFFSET,
     // `function.py:50 w_ann` — annotations dict, allocated lazily on
     // first read by the getter or stamped at MAKE_FUNCTION time.
@@ -281,113 +275,55 @@ impl pyre_object::lltype::GcType for Function {
 ///
 /// `code` is a pointer to a Code object (W_CodeObject) cast to `*const ()`.
 /// `name` is the function name string (leaked).
-/// `w_func_globals` is the defining module's namespace pointer (shared).
+/// `w_func_globals_obj` is the defining module's namespace dict object
+/// (shared), or `PY_NULL` for a globals-less carrier.
 pub fn function_new(
     code: *const (),
     name: String,
-    w_func_globals: *mut DictStorage,
+    w_func_globals_obj: PyObjectRef,
 ) -> PyObjectRef {
-    function_new_with_closure(code, name, w_func_globals, PY_NULL)
+    function_new_with_closure(code, name, w_func_globals_obj, PY_NULL)
 }
 
 /// Allocate a new `Function` with a closure.
 ///
-/// `closure` is a tuple of cell objects, or PY_NULL if no closure.
+/// `pypy/interpreter/function.py:54-57 Function.__init__` —
+/// `self.w_func_globals = w_globals` stores the user-visible
+/// `__globals__` dict object directly, so the function's `__globals__`
+/// identity IS the supplied `PyObjectRef`.  `closure` is a tuple of cell
+/// objects, or PY_NULL if no closure.
 pub fn function_new_with_closure(
     code: *const (),
     name: String,
-    w_func_globals: *mut DictStorage,
-    closure: PyObjectRef,
-) -> PyObjectRef {
-    function_new_impl(
-        &FUNCTION_TYPE,
-        code,
-        name,
-        w_func_globals,
-        PY_NULL,
-        closure,
-        true,
-    )
-}
-
-/// `pypy/interpreter/function.py:54-57 Function.__init__` —
-/// `self.w_func_globals = w_globals` stores the user-visible
-/// `__globals__` dict object directly.  Use this entry point when
-/// the caller already has the canonical `PyObjectRef` (e.g. MAKE_FUNCTION
-/// dispatched from a frame whose `w_globals_obj` is resolved); it
-/// bypasses `function_new_impl`'s lazy `dict_storage_to_dict`
-/// resolution so the function's `__globals__` identity IS the supplied
-/// PyObjectRef from the moment of construction.
-///
-/// `w_func_globals_obj` may be `PY_NULL` — falls back to the lazy
-/// resolution path then.
-pub fn function_new_with_globals_obj(
-    code: *const (),
-    name: String,
-    w_func_globals: *mut DictStorage,
     w_func_globals_obj: PyObjectRef,
     closure: PyObjectRef,
 ) -> PyObjectRef {
-    function_new_impl(
-        &FUNCTION_TYPE,
-        code,
-        name,
-        w_func_globals,
-        w_func_globals_obj,
-        closure,
-        true,
-    )
+    function_new_impl(&FUNCTION_TYPE, code, name, w_func_globals_obj, closure, true)
 }
 
 fn function_new_impl(
     ob_type: &'static PyType,
     code: *const (),
     name: String,
-    w_func_globals: *mut DictStorage,
-    w_func_globals_obj_hint: PyObjectRef,
+    w_func_globals_obj: PyObjectRef,
     closure: PyObjectRef,
     can_change_code: bool,
 ) -> PyObjectRef {
     // `gct_fv_gc_malloc` bracket pattern (`framework.py:853-856`) for
-    // the `lltype::malloc_typed` call below. `closure` and `code` are
-    // PyObjectRef-shaped GC roots across the alloc — `BuiltinCode`
-    // lives in the GC heap (`gateway.rs:298 malloc_typed`) and
-    // `W_CodeObject` is currently raw/immortal; the walker's
-    // `is_in_nursery` filter (`majit-gc/src/collector.rs:764`) is what
-    // makes the heterogeneous case safe. `w_func_globals` is a
-    // host-allocated DictStorage (raw), and `name_ptr` is allocated
+    // the `lltype::malloc_typed` call below. `closure`, `code`, and
+    // `w_func_globals_obj` are PyObjectRef-shaped GC roots across the
+    // alloc — `BuiltinCode` lives in the GC heap (`gateway.rs:298
+    // malloc_typed`) and `W_CodeObject` is currently raw/immortal; the
+    // walker's `is_in_nursery` filter (`majit-gc/src/collector.rs:764`)
+    // is what makes the heterogeneous case safe. `name_ptr` is allocated
     // below via `malloc_raw` (non-GC) and stored into the struct as
     // part of the same `malloc_typed` call, so it never spans a
     // collection point.
     let _roots = pyre_object::gc_roots::push_roots();
     pyre_object::gc_roots::pin_root(closure);
     pyre_object::gc_roots::pin_root(code as PyObjectRef);
-
-    // `function.py:57 self.w_func_globals = w_globals` stores the
-    // dict object directly.  Pyre keeps both the storage pointer
-    // (for the JIT call-site layout) and the canonical W_DictObject
-    // sibling.  Resolve the sibling NOW so the freshly-allocated
-    // function carries a stable `__globals__` identity from
-    // construction onward; `function_get_globals_obj`'s lazy
-    // fallback becomes a zero-hit safety net for synthetic test
-    // stubs that pass a null storage pointer.  This is the first
-    // step toward collapsing the dual storage to
-    // a single `PyObjectRef` field requires that every Function
-    // already has its `__globals__` resolved at construction time.
-    // Prefer the explicit `PyObjectRef` hint when the caller already
-    // resolved the canonical `__globals__` identity (MAKE_FUNCTION
-    // dispatched from a frame whose `w_globals_obj` is populated, or
-    // a builtin module's loader handing in the `W_ModuleDictObject`).
-    // Fall back to the legacy lazy `dict_storage_to_dict` resolution
-    // for synthetic test stubs and callers that have only the raw
-    // storage pointer.
-    let w_func_globals_obj = if !w_func_globals_obj_hint.is_null() {
-        w_func_globals_obj_hint
-    } else if w_func_globals.is_null() {
-        PY_NULL
-    } else {
-        crate::baseobjspace::dict_storage_to_dict(w_func_globals)
-    };
+    // `function.py:57 self.w_func_globals = w_globals` stores the dict
+    // object directly as the function's sole globals carrier.
     pyre_object::gc_roots::pin_root(w_func_globals_obj);
 
     let name_ptr = pyre_object::lltype::malloc_raw(name) as *const String;
@@ -399,7 +335,6 @@ fn function_new_impl(
         code,
         can_change_code,
         name: name_ptr,
-        w_func_globals,
         closure,
         defs_w: PY_NULL,
         w_kw_defs: PY_NULL,
@@ -432,17 +367,9 @@ fn function_new_impl(
 pub fn function_new_with_fixed_code(
     code: *const (),
     name: String,
-    w_func_globals: *mut DictStorage,
+    w_func_globals_obj: PyObjectRef,
 ) -> PyObjectRef {
-    function_new_impl(
-        &FUNCTION_TYPE,
-        code,
-        name,
-        w_func_globals,
-        PY_NULL,
-        PY_NULL,
-        false,
-    )
+    function_new_impl(&FUNCTION_TYPE, code, name, w_func_globals_obj, PY_NULL, false)
 }
 
 /// function.py:706 — `class BuiltinFunction(Function): can_change_code = False`
@@ -450,14 +377,13 @@ pub fn function_new_with_fixed_code(
 pub fn function_new_builtin(
     code: *const (),
     name: String,
-    w_func_globals: *mut DictStorage,
+    w_func_globals_obj: PyObjectRef,
 ) -> PyObjectRef {
     function_new_impl(
         &BUILTIN_FUNCTION_TYPE,
         code,
         name,
-        w_func_globals,
-        PY_NULL,
+        w_func_globals_obj,
         PY_NULL,
         false,
     )
@@ -521,7 +447,6 @@ pub unsafe fn builtin_function_set_module(obj: PyObjectRef, w_module: PyObjectRe
     unsafe {
         let stampable = py_type_check(obj, &BUILTIN_FUNCTION_TYPE)
             || (py_type_check(obj, &FUNCTION_TYPE)
-                && (*(obj as *const Function)).w_func_globals.is_null()
                 && (*(obj as *const Function)).w_func_globals_obj.is_null());
         if stampable {
             let func = obj as *mut Function;
@@ -693,7 +618,7 @@ pub unsafe fn fset_func_qualname(
 ///
 /// `self.qualname` is initialised from `qualname or self.name` at
 /// `function.py:54 __init__`.  MAKE_FUNCTION
-/// (`runtime_ops::make_function_from_code_obj`) stamps `w_qualname`
+/// (`runtime_ops::make_function_from_code_obj_with_globals_obj`) stamps `w_qualname`
 /// from `codeobj.co_qualname` at construction, so subsequent
 /// `__code__ = new_code` assignments do NOT alter `__qualname__`
 /// (matching `pypy/interpreter/pyopcode.py:1457` + `function.py:54`).
@@ -714,7 +639,7 @@ pub unsafe fn function_get_qualname(obj: PyObjectRef) -> String {
 }
 
 /// `function.py:54 self.qualname = qualname or self.name` setter —
-/// used by MAKE_FUNCTION (`runtime_ops::make_function_from_code_obj`)
+/// used by MAKE_FUNCTION (`runtime_ops::make_function_from_code_obj_with_globals_obj`)
 /// to freeze the qualified name immediately after `function_new`.
 /// Bypasses `_check_code_mutable` because this is the construction
 /// path; user code goes through `fset_func_qualname` instead.
@@ -741,50 +666,19 @@ pub unsafe fn fget_func_name(obj: PyObjectRef) -> PyObjectRef {
     unsafe { pyre_object::w_str_new(function_get_name(obj)) }
 }
 
-/// Get the globals namespace pointer from a function object.
+/// Return the canonical W_DictObject stored as `function.w_func_globals`.
+///
+/// `function.py:57 self.w_func_globals = w_globals` stores the dict
+/// object directly; this is a plain field load.  Returns `PY_NULL` for
+/// a globals-less carrier (gateway builtins); callers that want the raw
+/// `*mut DictStorage` recover it from this object via
+/// `w_dict_get_dict_storage_proxy`.
 ///
 /// # Safety
 /// `obj` must point to a valid `Function`.
 #[inline]
-pub unsafe fn function_get_globals(obj: PyObjectRef) -> *mut DictStorage {
-    unsafe { (*(obj as *const Function)).w_func_globals }
-}
-
-/// Return the canonical W_DictObject paired with `function.w_func_globals`.
-///
-/// `function.py:57 self.w_func_globals = w_globals` stores the dict
-/// object directly in PyPy.  Pyre's split storage / W_DictObject
-/// model means callers that want object identity
-/// (`function.__globals__ is module.__dict__`,
-/// `f.__globals__ is g.__globals__` for sibling closures) need to
-/// reach the canonical sibling.  `function_new_impl` resolves the
-/// sibling at construction time via `dict_storage_to_dict` and
-/// stores it directly in `w_func_globals_obj`, so the fast path is
-/// a plain field load.
-///
-/// The lazy fallback below is retained as a safety net for synthetic
-/// test stubs that bypass `function_new_impl` and leave
-/// `w_func_globals_obj` unset; production call sites (`MAKE_FUNCTION`,
-/// `function_new_with_fixed_code`, `function_new_builtin`) always
-/// reach this getter with the slot pre-populated.
-///
-/// Returns `PY_NULL` when `w_func_globals` is null (zero-arg test
-/// stubs); callers should null-check before dereferencing.
-///
-/// # Safety
-/// `obj` must point to a valid `Function`.
 pub unsafe fn function_get_globals_obj(obj: PyObjectRef) -> PyObjectRef {
-    let func = unsafe { &mut *(obj as *mut Function) };
-    if !func.w_func_globals_obj.is_null() {
-        return func.w_func_globals_obj;
-    }
-    if func.w_func_globals.is_null() {
-        return pyre_object::PY_NULL;
-    }
-    let resolved = crate::baseobjspace::dict_storage_to_dict(func.w_func_globals);
-    function_write_barrier(obj);
-    func.w_func_globals_obj = resolved;
-    resolved
+    unsafe { (*(obj as *const Function)).w_func_globals_obj }
 }
 
 /// Get the closure tuple from a function object.
@@ -1501,12 +1395,9 @@ pub unsafe fn fset_func_closure(obj: PyObjectRef, closure: PyObjectRef) {
 /// After fdel___module__ writes w_none(), subsequent reads return
 /// None without re-computing from globals.
 ///
-/// TODO: reach for `w_func_globals_obj` (the canonical
-/// PyObjectRef the user actually sees via `__globals__`) and route
-/// through `w_dict_getitem_str`, which dispatches `is_module_dict`
-/// to `ModuleDictStrategy::getitem_str` (`celldict.py:143-145`).
-/// Falls back to the legacy raw-DictStorage read only when the
-/// PyObjectRef hasn't been resolved yet (synthetic test stubs).
+/// Routes through `w_func_globals_obj` (the canonical PyObjectRef the
+/// user sees via `__globals__`) and dispatches `dict.get` so dict
+/// subclasses that override `get` are observed.
 #[inline]
 pub unsafe fn fget___module__(obj: PyObjectRef) -> PyObjectRef {
     unsafe {
@@ -1529,15 +1420,6 @@ pub unsafe fn fget___module__(obj: PyObjectRef) -> PyObjectRef {
                 } else {
                     result
                 };
-            } else if !(*func).w_func_globals.is_null() {
-                // Legacy `*mut DictStorage` fast-path for synthetic
-                // test stubs (`function_new` callers that skip
-                // `dict_storage_to_dict` lazy resolution).
-                function_write_barrier(obj);
-                (*func).w_module = (*(*func).w_func_globals)
-                    .get("__name__")
-                    .copied()
-                    .unwrap_or(pyre_object::w_none());
             } else {
                 // function.py:508: self.w_module = space.w_None
                 function_write_barrier(obj);
@@ -1553,7 +1435,7 @@ pub unsafe fn fget___module__(obj: PyObjectRef) -> PyObjectRef {
 #[inline]
 pub unsafe fn descr_function__new__(
     code: *const (),
-    w_globals: *mut DictStorage,
+    w_globals: PyObjectRef,
     w_name: PyObjectRef,
     _argdefs: PyObjectRef,
     w_closure: PyObjectRef,
@@ -1618,7 +1500,7 @@ pub unsafe fn _cleanup_(_obj: PyObjectRef) -> bool {
 #[inline]
 pub unsafe fn descr_builtinfunction__new__(
     code: *const (),
-    w_globals: *mut DictStorage,
+    w_globals: PyObjectRef,
     w_name: PyObjectRef,
     _argdefs: PyObjectRef,
     w_closure: PyObjectRef,
@@ -2131,7 +2013,6 @@ fn _flat_pycall(
 ) -> PyObjectRef {
     // call.rs:423-424 parity — increment call depth for JIT depth tracking.
     let _depth_guard = crate::call::increment_call_depth();
-    let globals = unsafe { function_get_globals(func) };
     let w_globals_obj = unsafe { function_get_globals_obj(func) };
     let closure = unsafe { function_get_closure(func) };
 
@@ -2143,7 +2024,7 @@ fn _flat_pycall(
         match crate::pyframe::PyFrame::try_new_for_call_with_closure_and_globals_obj(
             code,
             &[], // locals filled below directly from stack
-            globals,
+            std::ptr::null_mut(),
             w_globals_obj,
             frame.execution_context,
             closure,
@@ -2206,7 +2087,6 @@ fn _flat_pycall_defaults(
     dropvalues: usize,
 ) -> PyObjectRef {
     let _depth_guard = crate::call::increment_call_depth();
-    let globals = unsafe { function_get_globals(func) };
     let w_globals_obj = unsafe { function_get_globals_obj(func) };
     let closure = unsafe { function_get_closure(func) };
 
@@ -2215,7 +2095,7 @@ fn _flat_pycall_defaults(
         match crate::pyframe::PyFrame::try_new_for_call_with_closure_and_globals_obj(
             code,
             &[], // locals filled below
-            globals,
+            std::ptr::null_mut(),
             w_globals_obj,
             frame.execution_context,
             closure,
@@ -2282,13 +2162,14 @@ mod tests {
         let raw_code = 0xDEAD_BEEF as *const ();
         let w_code = crate::w_code_new(raw_code);
         let mut ns = DictStorage::new();
-        let obj = function_new(w_code as *const (), "myfunc".to_string(), &mut ns);
+        let w_globals_obj = crate::baseobjspace::dict_storage_to_dict(&mut ns as *mut DictStorage);
+        let obj = function_new(w_code as *const (), "myfunc".to_string(), w_globals_obj);
         unsafe {
             assert!(is_function(obj));
             assert!(!is_int(obj));
             assert_eq!(function_get_code(obj), w_code as *const ());
             assert_eq!(function_get_name(obj), "myfunc");
-            assert_eq!(function_get_globals(obj), &mut ns as *mut DictStorage);
+            assert_eq!(function_get_globals_obj(obj), w_globals_obj);
             assert!(function_get_closure(obj).is_null());
         }
     }
@@ -2297,8 +2178,7 @@ mod tests {
     fn test_function_field_offsets() {
         assert_eq!(FUNCTION_CODE_OFFSET, 16); // after PyObject { ob_type(8) + w_class(8) }
         assert_eq!(FUNCTION_NAME_OFFSET, 32); // after code(8) + can_change_code(1) + padding(7)
-        assert_eq!(FUNCTION_GLOBALS_OFFSET, 40); // after name
-        assert_eq!(FUNCTION_CLOSURE_OFFSET, 48); // after w_func_globals
+        assert_eq!(FUNCTION_CLOSURE_OFFSET, 40); // after name
     }
 
     /// Guard against drift between the constant colocated with

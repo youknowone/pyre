@@ -11198,8 +11198,8 @@ pub(crate) fn assemble_bridge_inline_pending(
     // pyframe.py:128-132 get_w_globals(): a frame's globals come from its OWN
     // pycode (`jit.promote(self.pycode).w_globals`), not the caller. Resolve
     // the callee's globals from `recipe.w_code` — the same `pycode.w_globals`
-    // the forward inline path reads via `function_get_globals` — so a
-    // cross-module inlined callee's LOAD_GLOBAL sees the callee module's
+    // the callee module exposes through its function's `w_func_globals_obj` —
+    // so a cross-module inlined callee's LOAD_GLOBAL sees the callee module's
     // namespace. `reconstruct_inline_recipe` aborts the multi-frame path when
     // the callee code has no resolved globals, so `globals` is non-null here.
     let globals = unsafe { pyre_interpreter::w_code_get_w_globals(recipe.w_code as PyObjectRef) };

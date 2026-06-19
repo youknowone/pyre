@@ -3860,14 +3860,9 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
                 }
                 "__globals__" => {
                     // `funcobject.py:325 fget_func_globals` returns
-                    // `self.w_func_globals` directly.  Pyre's cached
-                    // `function_get_globals_obj` returns the same
-                    // canonical W_DictObject as
-                    // `dict_storage_to_dict(function_get_globals(obj))`
-                    // (mirror_target invariant) but skips the
-                    // HashMap lookup on subsequent reads — every
-                    // `f.__globals__` access on the same function
-                    // re-uses the slot stamped on first call.
+                    // `self.w_func_globals` directly — the function's
+                    // `w_func_globals_obj` field, the canonical W_DictObject
+                    // shared with the defining module's `__dict__`.
                     return Ok(unsafe { crate::function_get_globals_obj(obj) });
                 }
                 "__defaults__" => {

@@ -15,24 +15,13 @@ use crate::{
     is_function, w_code_get_ptr,
 };
 
-pub fn make_function_from_code_obj(
-    code_obj: PyObjectRef,
-    globals: *mut DictStorage,
-) -> PyObjectRef {
-    make_function_from_code_obj_with_globals_obj(code_obj, globals, pyre_object::PY_NULL)
-}
-
 /// `pypy/interpreter/pyopcode.py:1457 MAKE_FUNCTION` stamps the new
 /// function's `w_func_globals = self.w_globals` directly from the
-/// running frame's dict object.  This entry point accepts the
-/// already-resolved canonical PyObjectRef (`w_globals_obj`) alongside
-/// the legacy raw storage pointer so the freshly-created function
-/// inherits the frame's exact `__globals__` identity rather than
-/// going through `function_new_impl`'s lazy `dict_storage_to_dict`
-/// fallback (which might allocate a fresh sibling W_DictObject).
+/// running frame's dict object.  This entry point accepts the canonical
+/// PyObjectRef (`w_globals_obj`) so the freshly-created function inherits
+/// the frame's exact `__globals__` identity.
 pub fn make_function_from_code_obj_with_globals_obj(
     code_obj: PyObjectRef,
-    globals: *mut DictStorage,
     w_globals_obj: PyObjectRef,
 ) -> PyObjectRef {
     let code_ptr = unsafe { w_code_get_ptr(code_obj) };
@@ -44,10 +33,9 @@ pub fn make_function_from_code_obj_with_globals_obj(
     // `co_qualname`.  `pyopcode.py:1457 MAKE_FUNCTION` then stamps the
     // qualified name from `codeobj.co_qualname`, which is why a later
     // `__code__ = new_code` assignment does NOT change `__qualname__`.
-    let func = crate::function::function_new_with_globals_obj(
+    let func = crate::function::function_new_with_closure(
         code_obj as *const (),
         code.obj_name.to_string(),
-        globals,
         w_globals_obj,
         pyre_object::PY_NULL,
     );
@@ -70,11 +58,7 @@ pub extern "C" fn jit_make_function_from_globals(globals: i64, code_obj: i64) ->
     // `w_globals_obj` slot).  Capture it directly; the raw `*mut DictStorage`
     // is recovered from the object wherever a frame still needs it.
     let w_globals_obj = globals as PyObjectRef;
-    make_function_from_code_obj_with_globals_obj(
-        code_obj as PyObjectRef,
-        std::ptr::null_mut(),
-        w_globals_obj,
-    ) as i64
+    make_function_from_code_obj_with_globals_obj(code_obj as PyObjectRef, w_globals_obj) as i64
 }
 
 #[majit_macros::dont_look_inside]

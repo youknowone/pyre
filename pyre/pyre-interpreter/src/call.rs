@@ -10,7 +10,7 @@ use rustpython_wtf8::Wtf8Buf;
 
 use crate::{
     DictStorage, PyError, PyResult, builtin_code_get, dispatch_callable, function_get_closure,
-    function_get_globals, function_get_globals_obj,
+    function_get_globals_obj,
 };
 
 struct FrameLocalsRoot {
@@ -433,7 +433,8 @@ fn call_user_function_with_eval(
     eval_fn: EvalFn,
 ) -> PyResult {
     let w_code = unsafe { crate::getcode(callable) };
-    let globals = unsafe { function_get_globals(callable) };
+    // Raw storage is recovered from `w_globals_obj` by the frame builder.
+    let globals = std::ptr::null_mut();
     let w_globals_obj = unsafe { function_get_globals_obj(callable) };
     let closure = unsafe { function_get_closure(callable) };
     let func_code = unsafe {
@@ -485,7 +486,8 @@ pub fn call_user_function_resolved(
     let _depth_guard = increment_call_depth();
 
     let w_code = unsafe { crate::getcode(callable) };
-    let globals = unsafe { function_get_globals(callable) };
+    // Raw storage is recovered from `w_globals_obj` by the frame builder.
+    let globals = std::ptr::null_mut();
     let w_globals_obj = unsafe { function_get_globals_obj(callable) };
     let closure = unsafe { function_get_closure(callable) };
     let func_code = unsafe {
@@ -712,7 +714,8 @@ pub fn call_user_function_plain_with_ctx(
     args: &[PyObjectRef],
 ) -> PyResult {
     let w_code = unsafe { crate::getcode(callable) };
-    let globals = unsafe { function_get_globals(callable) };
+    // Raw storage is recovered from `w_globals_obj` by the frame builder.
+    let globals = std::ptr::null_mut();
     let w_globals_obj = unsafe { function_get_globals_obj(callable) };
     let closure = unsafe { function_get_closure(callable) };
     let func_code = unsafe {
@@ -1540,7 +1543,8 @@ pub fn call_with_kwargs(
             }
 
             // Create frame and execute
-            let globals = unsafe { function_get_globals(callable) };
+            // Raw storage is recovered from `w_globals_obj` by the frame builder.
+            let globals = std::ptr::null_mut();
             let w_globals_obj = unsafe { function_get_globals_obj(callable) };
             let closure = unsafe { function_get_closure(callable) };
             let mut func_frame = crate::pyframe::FrameBox::new(
@@ -1976,7 +1980,8 @@ fn issubtype_ptr(w_type: PyObjectRef, cls: PyObjectRef) -> bool {
 /// Helper: call a user function with arbitrary args from descriptor context.
 fn call_user_function_with_args(func: PyObjectRef, args: &[PyObjectRef]) -> PyObjectRef {
     let w_code = unsafe { crate::getcode(func) };
-    let globals = unsafe { function_get_globals(func) };
+    // Raw storage is recovered from `w_globals_obj` by the frame builder.
+    let globals = std::ptr::null_mut();
     let w_globals_obj = unsafe { function_get_globals_obj(func) };
     let closure = unsafe { function_get_closure(func) };
     let func_code = unsafe {
@@ -2059,7 +2064,8 @@ fn call_user_function_with_args(func: PyObjectRef, args: &[PyObjectRef]) -> PyOb
 /// packed `*args` / `**kwargs` slots as extra positionals.
 fn call_user_function_resolved_frameless(func: PyObjectRef, args: &[PyObjectRef]) -> PyObjectRef {
     let w_code = unsafe { crate::getcode(func) };
-    let globals = unsafe { function_get_globals(func) };
+    // Raw storage is recovered from `w_globals_obj` by the frame builder.
+    let globals = std::ptr::null_mut();
     let w_globals_obj = unsafe { function_get_globals_obj(func) };
     let closure = unsafe { function_get_closure(func) };
     let func_code = unsafe {
@@ -2461,7 +2467,8 @@ fn build_class_inner(
     w_orig_bases: Option<PyObjectRef>,
 ) -> PyResult {
     let w_code = unsafe { crate::getcode(body_fn) };
-    let globals = unsafe { function_get_globals(body_fn) };
+    // Raw storage is recovered from `w_globals_obj` by the frame builder.
+    let globals = std::ptr::null_mut();
     let w_globals_obj = unsafe { function_get_globals_obj(body_fn) };
     let closure = unsafe { function_get_closure(body_fn) };
     let func_code = unsafe {

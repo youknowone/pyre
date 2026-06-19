@@ -200,8 +200,8 @@ use pyre_interpreter::eval::{attach_raise_cause, normalize_raise_cause};
 use pyre_interpreter::truth_value as objspace_truth_value;
 use pyre_interpreter::{
     OpcodeStepExecutor, PyError, SharedOpcodeHandler, call_function, decode_instruction_at,
-    execute_opcode_step, function_get_defaults, function_get_globals, function_get_globals_obj,
-    is_builtin_code, is_function, range_iter_continues,
+    execute_opcode_step, function_get_defaults, function_get_globals_obj, is_builtin_code,
+    is_function, range_iter_continues,
 };
 
 use pyre_object::PyObjectRef;
@@ -7319,7 +7319,8 @@ impl MIFrame {
         let caller_exec_ctx = self.sym().concrete_execution_context;
         let caller_namespace_ptr = self.sym().concrete_namespace;
         let w_code = unsafe { pyre_interpreter::getcode(concrete_callable) };
-        let globals = unsafe { function_get_globals(concrete_callable) };
+        // Raw storage is recovered from `callee_globals_obj` by the frame builder.
+        let globals = std::ptr::null_mut();
         let callee_globals_obj = unsafe { function_get_globals_obj(concrete_callable) };
         let closure = unsafe { pyre_interpreter::function_get_closure(concrete_callable) };
         // pyjitpl.py:1396-1401 element-wise greenkey — `(code_ptr, 0)`
