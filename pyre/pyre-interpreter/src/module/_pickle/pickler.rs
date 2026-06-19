@@ -766,11 +766,13 @@ fn save_pers(ctx: &mut PickleCtx, buf: &mut Framer, w_pid: PyObjectRef) -> Resul
 /// repeated reference becomes a GET, matching CPython 3.14: a second
 /// occurrence of the same object never re-enters the hook).
 fn save_object(ctx: &mut PickleCtx, buf: &mut Framer, w_obj: PyObjectRef) -> Result<(), PyError> {
+    // Only EXACT atoms skip the memo; an `int`/`float` subclass is a regular
+    // object (memoized, saved through the reduce protocol).
     let is_atom = unsafe {
         pyre_object::is_none(w_obj)
             || pyre_object::is_bool(w_obj)
-            || pyre_object::is_int_or_long(w_obj)
-            || pyre_object::is_float(w_obj)
+            || pyre_object::is_exact_type(w_obj, &pyre_object::INT_TYPE)
+            || pyre_object::is_exact_type(w_obj, &pyre_object::FLOAT_TYPE)
     };
     // Identity memo — a repeated reference becomes a GET back-reference.
     if !is_atom {
@@ -796,36 +798,42 @@ fn dispatch_save(ctx: &mut PickleCtx, buf: &mut Framer, w_obj: PyObjectRef) -> R
     if unsafe { pyre_object::is_bool(w_obj) } {
         return save_bool(ctx, buf, w_obj);
     }
-    if unsafe { pyre_object::is_int_or_long(w_obj) } {
+    // Built-in dispatch is by EXACT type (`type(obj) is X`): a subclass of a
+    // built-in carries the same `ob_type`/layout but a retagged `w_class`, and
+    // must fall through to `save_global_or_reduce` so its subclass identity is
+    // preserved.  `is_exact_type` is correct for the specialised arity-2 tuples
+    // (distinct `ob_type`, canonical `tuple` `w_class`) where the `ob_type`
+    // predicate `is_exact_builtin_instance` is not.
+    if unsafe { pyre_object::is_exact_type(w_obj, &pyre_object::INT_TYPE) } {
         save_long(ctx, buf, w_obj)?;
         return Ok(());
     }
-    if unsafe { pyre_object::is_float(w_obj) } {
+    if unsafe { pyre_object::is_exact_type(w_obj, &pyre_object::FLOAT_TYPE) } {
         save_float(ctx, buf, w_obj)?;
         return Ok(());
     }
-    if unsafe { pyre_object::is_bytes(w_obj) } {
+    if unsafe { pyre_object::is_exact_type(w_obj, &pyre_object::bytesobject::BYTES_TYPE) } {
         return save_bytes(ctx, buf, w_obj);
     }
-    if unsafe { pyre_object::is_str(w_obj) } {
+    if unsafe { pyre_object::is_exact_type(w_obj, &pyre_object::STR_TYPE) } {
         return save_str(ctx, buf, w_obj);
     }
-    if unsafe { pyre_object::is_dict(w_obj) } {
+    if unsafe { pyre_object::is_exact_type(w_obj, &pyre_object::DICT_TYPE) } {
         return save_dict(ctx, buf, w_obj);
     }
-    if unsafe { pyre_object::is_set(w_obj) } {
+    if unsafe { pyre_object::is_exact_type(w_obj, &pyre_object::setobject::SET_TYPE) } {
         return save_set(ctx, buf, w_obj);
     }
-    if unsafe { pyre_object::is_frozenset(w_obj) } {
+    if unsafe { pyre_object::is_exact_type(w_obj, &pyre_object::setobject::FROZENSET_TYPE) } {
         return save_frozenset(ctx, buf, w_obj);
     }
-    if unsafe { pyre_object::is_list(w_obj) } {
+    if unsafe { pyre_object::is_exact_type(w_obj, &pyre_object::LIST_TYPE) } {
         return save_list(ctx, buf, w_obj);
     }
-    if unsafe { pyre_object::is_tuple(w_obj) } {
+    if unsafe { pyre_object::is_exact_type(w_obj, &pyre_object::TUPLE_TYPE) } {
         return save_tuple(ctx, buf, w_obj);
     }
-    if unsafe { pyre_object::is_bytearray(w_obj) } {
+    if unsafe { pyre_object::is_exact_type(w_obj, &pyre_object::bytearrayobject::BYTEARRAY_TYPE) } {
         return save_bytearray(ctx, buf, w_obj);
     }
     if crate::module::__pypy__::W_PickleBuffer::from_obj(w_obj).is_some() {
@@ -945,7 +953,10 @@ fn dispatch_table_reduce(
     let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     pyre_object::gc_roots::pin_root(dt);
     let dt_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-    let w_type = call_fn(type_fn, &[pyre_object::gc_roots::shadow_stack_get(obj_slot)])?;
+    let w_type = call_fn(
+        type_fn,
+        &[pyre_object::gc_roots::shadow_stack_get(obj_slot)],
+    )?;
     pyre_object::gc_roots::pin_root(w_type);
     let type_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     let dt = pyre_object::gc_roots::shadow_stack_get(dt_slot);

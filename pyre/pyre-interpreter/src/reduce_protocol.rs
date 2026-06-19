@@ -85,10 +85,29 @@ pub fn get_slotvalues(w_obj: PyObjectRef) -> PyResult {
 pub fn object_getstate_default(w_obj: PyObjectRef) -> PyResult {
     let w_objdict = crate::baseobjspace::findattr(w_obj, "__dict__");
     let mut w_ret = match w_objdict {
-        Some(d) if crate::baseobjspace::len_w(d)? > 0 => crate::call::call_function_impl_result(
-            crate::baseobjspace::getattr_str(d, "copy")?,
-            &[],
-        )?,
+        Some(d) if crate::baseobjspace::len_w(d)? > 0 => {
+            // Copy `__dict__`, dropping the internal `__dict_data__` key that a
+            // dict subclass keeps its mapping payload under: that payload is
+            // reconstructed through `dictitems`, not the instance state, so an
+            // attribute-less dict subclass must yield `None` here (matching the
+            // empty instance `__dict__` of a built-in subclass).
+            let w_copy = pyre_object::w_dict_new();
+            let mut count = 0usize;
+            for (k, v) in unsafe { pyre_object::w_dict_items(d) } {
+                if unsafe { pyre_object::is_str(k) }
+                    && unsafe { pyre_object::w_str_get_value(k) } == "__dict_data__"
+                {
+                    continue;
+                }
+                unsafe { pyre_object::w_dict_store(w_copy, k, v) };
+                count += 1;
+            }
+            if count > 0 {
+                w_copy
+            } else {
+                pyre_object::w_none()
+            }
+        }
         _ => pyre_object::w_none(),
     };
     let w_slots = get_slotvalues(w_obj)?;
