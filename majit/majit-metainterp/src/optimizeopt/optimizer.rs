@@ -3024,7 +3024,15 @@ impl Optimizer {
                         // upstream Box identity.
                         res: produced.res.clone(),
                         kind: produced.kind,
-                        label_arg_idx: short_boxes.lookup_label_arg(canonical_result),
+                        // Carry the slot stamped when the ShortInputArg was
+                        // created (`add_short_input_arg`), not a re-lookup of the
+                        // forwarded `canonical_result`: an InputArg label arg
+                        // whose canonical result forwards away is absent from
+                        // `short_boxes.label_args`, so `lookup_label_arg` returns
+                        // None and the per-slot original is lost. `produced
+                        // .label_arg_idx` preserves the original slot through
+                        // forwarding (the slot `short_inputargs[i]` pairs with).
+                        label_arg_idx: produced.label_arg_idx,
                         invented_name: produced.invented_name,
                         same_as_source: produced.same_as_source.clone(),
                     })

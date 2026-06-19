@@ -2703,15 +2703,22 @@ mod tests {
             OpRef::int_op(0),
             OpRef::int_op(1),
         ]);
+        for arg in [OpRef::int_op(0), OpRef::int_op(1)] {
+            sb.add_short_input_arg(&mut ctx, arg, majit_ir::Type::Int);
+        }
         pass.produce_potential_short_preamble_ops(&mut sb, &mut ctx);
         let collected = sb.produced_ops(&mut ctx);
-        assert_eq!(collected.len(), 1);
-        assert!(matches!(
-            collected[0].1.kind,
-            crate::optimizeopt::shortpreamble::PreambleOpKind::Pure
-        ));
-        assert_eq!(collected[0].1.preamble_op.opcode, OpCode::IntAdd);
-        assert_eq!(collected[0].1.preamble_op.pos.get(), OpRef::int_op(2));
+        // Label args are also produced as ShortInputargs; the imported pure op
+        // is the single non-InputArg short box.
+        let pure: Vec<_> = collected
+            .iter()
+            .filter(|(_, p)| {
+                matches!(p.kind, crate::optimizeopt::shortpreamble::PreambleOpKind::Pure)
+            })
+            .collect();
+        assert_eq!(pure.len(), 1);
+        assert_eq!(pure[0].1.preamble_op.opcode, OpCode::IntAdd);
+        assert_eq!(pure[0].1.preamble_op.pos.get(), OpRef::int_op(2));
     }
 
     #[test]
@@ -2817,14 +2824,21 @@ mod tests {
             OpRef::int_op(1),
             OpRef::int_op(2),
         ]);
+        // Seed the renamed ShortInputargs for the op's deps (0, 1); the op
+        // result (pos 2) is not a ShortInputArg.
+        for arg in [OpRef::int_op(0), OpRef::int_op(1)] {
+            sb.add_short_input_arg(&mut ctx, arg, majit_ir::Type::Int);
+        }
         pass.produce_potential_short_preamble_ops(&mut sb, &mut ctx);
         let collected = sb.produced_ops(&mut ctx);
-        assert_eq!(collected.len(), 1);
-        assert!(matches!(
-            collected[0].1.kind,
-            crate::optimizeopt::shortpreamble::PreambleOpKind::Pure
-        ));
-        assert_eq!(collected[0].1.preamble_op.opcode, OpCode::IntAdd);
+        let pure: Vec<_> = collected
+            .iter()
+            .filter(|(_, p)| {
+                matches!(p.kind, crate::optimizeopt::shortpreamble::PreambleOpKind::Pure)
+            })
+            .collect();
+        assert_eq!(pure.len(), 1);
+        assert_eq!(pure[0].1.preamble_op.opcode, OpCode::IntAdd);
     }
 
     #[test]
@@ -2860,20 +2874,26 @@ mod tests {
             other => panic!("expected emitted demoted call, got {other:?}"),
         }
 
+        // Deps are the call args (100, 0, 1); the call result (pos 2) is not a
+        // label arg.
         let mut sb = crate::optimizeopt::shortpreamble::ShortBoxes::with_label_args(&[
             OpRef::int_op(0),
             OpRef::int_op(1),
-            OpRef::int_op(2),
             OpRef::int_op(100),
         ]);
+        for arg in [OpRef::int_op(0), OpRef::int_op(1), OpRef::int_op(100)] {
+            sb.add_short_input_arg(&mut ctx, arg, majit_ir::Type::Int);
+        }
         pass.produce_potential_short_preamble_ops(&mut sb, &mut ctx);
         let collected = sb.produced_ops(&mut ctx);
-        assert_eq!(collected.len(), 1);
-        assert!(matches!(
-            collected[0].1.kind,
-            crate::optimizeopt::shortpreamble::PreambleOpKind::Pure
-        ));
-        assert_eq!(collected[0].1.preamble_op.opcode, OpCode::CallPureI);
+        let pure: Vec<_> = collected
+            .iter()
+            .filter(|(_, p)| {
+                matches!(p.kind, crate::optimizeopt::shortpreamble::PreambleOpKind::Pure)
+            })
+            .collect();
+        assert_eq!(pure.len(), 1);
+        assert_eq!(pure[0].1.preamble_op.opcode, OpCode::CallPureI);
     }
 
     #[test]
@@ -2928,23 +2948,29 @@ mod tests {
             other => panic!("expected emitted or pass-on from OptPure, got {other:?}"),
         }
 
-        // OptRewrite tracks loopinvariant for short preamble collection
+        // OptRewrite tracks loopinvariant for short preamble collection.
         let mut sb = crate::optimizeopt::shortpreamble::ShortBoxes::with_label_args(&[
             OpRef::int_op(0),
             OpRef::int_op(2),
             OpRef::int_op(100),
         ]);
+        // The func arg 100 is a known constant (produce_arg returns it
+        // unrenamed); only the real input 0 gets a renamed ShortInputArg.
+        sb.note_known_constant(OpRef::int_op(100));
+        sb.add_short_input_arg(&mut ctx, OpRef::int_op(0), majit_ir::Type::Int);
         rewrite.produce_potential_short_preamble_ops(&mut sb, &mut ctx);
         let collected = sb.produced_ops(&mut ctx);
-        assert_eq!(collected.len(), 1);
-        assert!(matches!(
-            collected[0].1.kind,
-            crate::optimizeopt::shortpreamble::PreambleOpKind::LoopInvariant
-        ));
-        assert_eq!(
-            collected[0].1.preamble_op.opcode,
-            OpCode::CallLoopinvariantI
-        );
+        let loopinv: Vec<_> = collected
+            .iter()
+            .filter(|(_, p)| {
+                matches!(
+                    p.kind,
+                    crate::optimizeopt::shortpreamble::PreambleOpKind::LoopInvariant
+                )
+            })
+            .collect();
+        assert_eq!(loopinv.len(), 1);
+        assert_eq!(loopinv[0].1.preamble_op.opcode, OpCode::CallLoopinvariantI);
     }
 
     #[test]
