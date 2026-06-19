@@ -2713,7 +2713,10 @@ mod tests {
         let pure: Vec<_> = collected
             .iter()
             .filter(|(_, p)| {
-                matches!(p.kind, crate::optimizeopt::shortpreamble::PreambleOpKind::Pure)
+                matches!(
+                    p.kind,
+                    crate::optimizeopt::shortpreamble::PreambleOpKind::Pure
+                )
             })
             .collect();
         assert_eq!(pure.len(), 1);
@@ -2834,7 +2837,10 @@ mod tests {
         let pure: Vec<_> = collected
             .iter()
             .filter(|(_, p)| {
-                matches!(p.kind, crate::optimizeopt::shortpreamble::PreambleOpKind::Pure)
+                matches!(
+                    p.kind,
+                    crate::optimizeopt::shortpreamble::PreambleOpKind::Pure
+                )
             })
             .collect();
         assert_eq!(pure.len(), 1);
@@ -2889,7 +2895,10 @@ mod tests {
         let pure: Vec<_> = collected
             .iter()
             .filter(|(_, p)| {
-                matches!(p.kind, crate::optimizeopt::shortpreamble::PreambleOpKind::Pure)
+                matches!(
+                    p.kind,
+                    crate::optimizeopt::shortpreamble::PreambleOpKind::Pure
+                )
             })
             .collect();
         assert_eq!(pure.len(), 1);

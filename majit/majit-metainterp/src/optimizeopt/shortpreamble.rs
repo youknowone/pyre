@@ -3178,62 +3178,35 @@ pub fn extract_short_preamble(peeled_ops: &[Op]) -> ShortPreamble {
 }
 
 /// `unroll.py:497 ExportedState.short_boxes` shape: per-OpRef
-/// `ProducedShortOp` records derived from `ctx.exported_short_boxes`,
-/// with label-arg references in each preamble op renamed to the
-/// matching short-inputarg slot
-/// (`shortpreamble.py:269-270 ShortBoxes.create_short_boxes`).
+/// `ProducedShortOp` records derived from `ctx.exported_short_boxes`.
+///
+/// The label-arg → short-inputarg rename happens at EXPORT time inside
+/// `produce_arg` (shortpreamble.py:285/294): every short op the import
+/// path emits (Pure / Heap / LoopInvariant) already carries the renamed
+/// `short_inputargs` box in its args. The only exported entries that still
+/// reference an original label box are the `ShortInputArg` `SameAs*`
+/// stand-ins, and those are never emitted (`produce_op` returns None for
+/// `InputArg`, shortpreamble.py:233-234) nor read by any import consumer:
+/// `result_map` and the `produce_op` loop skip `InputArg`, the builder
+/// init skips entries with no `result_map` slot, and `use_box_recursive`'s
+/// arg recursion is rename-invariant for the `SameAs` self-reference. So
+/// no import-time arg rewrite is needed — the produced view is a plain
+/// filter + transform of `exported_short_boxes`.
 ///
 /// OVF guards are filtered out: the guard entry depends on the
 /// preceding `Int*Ovf` op and is re-emitted by the builder through
 /// `append_to_short`'s `is_ovf` branch, so the standalone guard must
 /// not appear in the produced map.
-///
-/// Phase B prep: extracted from
-/// `build_short_preamble_from_exported_boxes` so that future B1 wiring
-/// can store the same shape on `ExportedState.produced_short_boxes`
-/// (audit memo `box_identity_phase_b_surface_audit_2026_05_02.md`
-/// option (b)) without duplicating the rename logic.
 pub fn produced_short_boxes_from_exported_boxes(
-    label_args: &[OpRef],
-    short_inputargs: &[BoxRef],
     exported_short_boxes: &[PreambleOp],
 ) -> Vec<(OpRef, ProducedShortOp)> {
-    // optimizer.py:651-652 setarg(renamed_inputargs[i]) — the renamed
-    // operand IS the stored short-inputarg box object, not a fresh
-    // equal-positioned mint.
-    let inputarg_rename = |arg: OpRef| -> Option<&BoxRef> {
-        label_args
-            .iter()
-            .position(|&a| a == arg)
-            .and_then(|i| short_inputargs.get(i))
-    };
     exported_short_boxes
         .iter()
         .filter(|entry| !entry.op.opcode.is_guard_overflow())
         .map(|entry| {
-            let mut preamble_op = (*entry.op).clone();
-            // optimizer.py:651-652 setarg loop parity.
-            for i in 0..preamble_op.num_args() {
-                if let Some(renamed) = inputarg_rename(preamble_op.arg(i).to_opref()) {
-                    preamble_op.setarg(i, renamed.clone());
-                }
-            }
-            if let Some(fail_args) = preamble_op.fail_args_mut() {
-                for arg in fail_args {
-                    if let Some(renamed) = inputarg_rename(arg.to_opref()) {
-                        // Measured dead (PYRE_REMAP_PROBE 2026-06-11: 0 fires
-                        // across check.py corpus + lib tests) — exported short
-                        // boxes carry pure ops/guards without fail_args
-                        // referencing label args. Rewrite kept as a release
-                        // safety net.
-                        debug_assert!(
-                            false,
-                            "imported short-box fail_arg hit inputarg rename: {arg:?}"
-                        );
-                        *arg = majit_ir::operand::Operand::from_boxref(renamed);
-                    }
-                }
-            }
+            // Fresh clone per entry so the builder's on-object forwarded
+            // marker (`ShortPreambleBuilder::new`) mutates an isolated Rc.
+            let preamble_op = (*entry.op).clone();
             (
                 preamble_op.pos.get(),
                 ProducedShortOp {
@@ -3302,8 +3275,7 @@ pub fn build_short_preamble_from_exported_boxes(
     short_inputargs: &[BoxRef],
     exported_short_boxes: &[PreambleOp],
 ) -> ShortPreamble {
-    let produced =
-        produced_short_boxes_from_exported_boxes(label_args, short_inputargs, exported_short_boxes);
+    let produced = produced_short_boxes_from_exported_boxes(exported_short_boxes);
     build_short_preamble_from_produced_boxes(label_args, short_inputargs, &produced)
 }
 
@@ -3601,14 +3573,19 @@ mod tests {
 
     #[test]
     fn test_build_short_preamble_from_exported_boxes_uses_exported_order() {
+        // shortpreamble.py:285/294: the label-arg → short-inputarg rename
+        // happens at EXPORT time (produce_arg), so the exported short ops
+        // already carry the renamed `short_inputargs` boxes (10/11) in place
+        // of the original label args (0/1). The op-result positions (7/8) are
+        // not inputargs and are unchanged.
         let exported = vec![
             PreambleOp {
                 op: {
                     let mut op = Op::new(
                         OpCode::IntAdd,
                         &[
-                            BoxRef::from_opref(OpRef::int_op(0)),
-                            BoxRef::from_opref(OpRef::int_op(1)),
+                            BoxRef::from_opref(OpRef::int_op(10)),
+                            BoxRef::from_opref(OpRef::int_op(11)),
                         ],
                     );
                     op.pos.set(OpRef::int_op(7));
@@ -3626,7 +3603,7 @@ mod tests {
                         OpCode::IntSub,
                         &[
                             BoxRef::from_opref(OpRef::int_op(7)),
-                            BoxRef::from_opref(OpRef::int_op(1)),
+                            BoxRef::from_opref(OpRef::int_op(11)),
                         ],
                     );
                     op.pos.set(OpRef::int_op(8));
@@ -3950,18 +3927,14 @@ mod tests {
 
         let chosen = produced
             .iter()
-            .find(|(result, p)| {
-                *result == OpRef::int_op(10) && p.kind != PreambleOpKind::InputArg
-            })
+            .find(|(result, p)| *result == OpRef::int_op(10) && p.kind != PreambleOpKind::InputArg)
             .unwrap();
         assert_eq!(chosen.1.kind, PreambleOpKind::Pure);
         assert!(!chosen.1.invented_name);
 
         let alias = produced
             .iter()
-            .find(|(result, p)| {
-                *result != OpRef::int_op(10) && p.kind != PreambleOpKind::InputArg
-            })
+            .find(|(result, p)| *result != OpRef::int_op(10) && p.kind != PreambleOpKind::InputArg)
             .unwrap();
         assert_eq!(alias.1.kind, PreambleOpKind::Heap);
         assert!(alias.1.invented_name);
@@ -4013,9 +3986,7 @@ mod tests {
 
         let chosen = produced
             .iter()
-            .find(|(result, p)| {
-                *result == OpRef::int_op(20) && p.kind != PreambleOpKind::InputArg
-            })
+            .find(|(result, p)| *result == OpRef::int_op(20) && p.kind != PreambleOpKind::InputArg)
             .unwrap();
         assert_eq!(chosen.1.kind, PreambleOpKind::Pure);
         assert!(!chosen.1.invented_name);
@@ -4127,8 +4098,7 @@ mod tests {
 
         let produced = sb.produced_ops(&mut __ctx);
         let short_inputargs = sb.create_short_inputargs(&[OpRef::int_op(30), OpRef::int_op(31)]);
-        let label_arg_oprefs: Vec<OpRef> =
-            short_inputargs.iter().map(|b| b.to_opref()).collect();
+        let label_arg_oprefs: Vec<OpRef> = short_inputargs.iter().map(|b| b.to_opref()).collect();
         // #146/S8: the builder map keys by the entry res Box; re-key the
         // produced_ops list (keyed by `preamble_op.pos`) to res for new() and
         // look up by the res box of the int_op(10) entry.
