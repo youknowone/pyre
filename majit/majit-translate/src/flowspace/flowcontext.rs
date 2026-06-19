@@ -3126,11 +3126,14 @@ impl FlowContext {
                             "WITH_EXCEPT_START expects __exit__, self-or-null, and exception state",
                         )));
                     }
-                    let w_exitfunc = match self.peekvalue_at(3) {
+                    // Stack (bottom → top): exit_func, exit_self, lasti,
+                    // unused, val. peekvalue_at(n) reads depth-1-n, so the
+                    // function sits at peekvalue_at(4) and self at (3).
+                    let w_exitfunc = match self.peekvalue_at(4) {
                         StackElem::Value(value) => value,
                         StackElem::Signal(signal) => return Err(FlowContextError::Signal(signal)),
                     };
-                    let w_self_or_null = match self.peekvalue_at(4) {
+                    let w_self_or_null = match self.peekvalue_at(3) {
                         StackElem::Value(value) => value,
                         StackElem::Signal(signal) => return Err(FlowContextError::Signal(signal)),
                     };
