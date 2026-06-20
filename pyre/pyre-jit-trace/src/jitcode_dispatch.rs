@@ -5934,6 +5934,19 @@ thread_local! {
     static FBW_STORE_JOURNAL: std::cell::RefCell<Vec<[pyre_object::PyObjectRef; 3]>> =
         const { std::cell::RefCell::new(Vec::new()) };
 
+    /// Undo log for the walked region's eagerly executed list APPENDS:
+    /// `(list, length_before_append)` pairs pushed by the `list.append`
+    /// specialization before it grows the list.  Same rationale as
+    /// [`FBW_STORE_JOURNAL`] — the append is admitted only when
+    /// `w_list_can_append_without_realloc` holds, so the undo is a pure
+    /// length rewind (`w_list_int_set_len`, no reallocation, no boxing) and
+    /// the backing array still has the slot.  A committing walk drops the
+    /// log; a non-commit walk rewinds each list's length in reverse push
+    /// order so the legacy replay re-appends against the pre-walk heap.
+    /// Entries' list refs are GC roots via [`fbw_store_journal_root_walker`].
+    static FBW_APPEND_JOURNAL: std::cell::RefCell<Vec<(pyre_object::PyObjectRef, usize)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+
     /// Set when the walk records a side effect that was neither executed
     /// at walk time nor undo-logged: a void residual call recorded
     /// symbolically (the `try_execute_residual_call_via_executor` void
@@ -5947,6 +5960,7 @@ thread_local! {
 /// begins (mirrors [`bool_box_truth_reset`]).
 pub(crate) fn fbw_store_journal_reset() {
     FBW_STORE_JOURNAL.with(|j| j.borrow_mut().clear());
+    FBW_APPEND_JOURNAL.with(|j| j.borrow_mut().clear());
     FBW_UNJOURNALED_EFFECT.with(|c| c.set(false));
 }
 
@@ -5960,9 +5974,22 @@ pub(crate) fn fbw_store_journal_push(
     FBW_STORE_JOURNAL.with(|j| j.borrow_mut().push([list, key, displaced]));
 }
 
-/// Commit-path epilogue: the walk's eager stores stand; drop the undo log.
+/// Record the live length a walked eager list append grew past, for the
+/// length rewind when the walk does not commit its end state.  `list` must
+/// be an Integer-strategy list whose backing array had spare capacity (the
+/// append's gate), so the rewind is allocation-free.
+// Consumed by the #171 P3 `list.append` specialization arm (next slice);
+// exercised now by `append_journal_rollback_rewinds_length`.
+#[allow(dead_code)]
+pub(crate) fn fbw_append_journal_push(list: pyre_object::PyObjectRef, length_before: usize) {
+    FBW_APPEND_JOURNAL.with(|j| j.borrow_mut().push((list, length_before)));
+}
+
+/// Commit-path epilogue: the walk's eager stores and appends stand; drop
+/// the undo logs.
 pub(crate) fn fbw_store_journal_commit() {
     FBW_STORE_JOURNAL.with(|j| j.borrow_mut().clear());
+    FBW_APPEND_JOURNAL.with(|j| j.borrow_mut().clear());
 }
 
 /// Non-commit epilogue: restore each displaced element in reverse push
@@ -5970,6 +5997,11 @@ pub(crate) fn fbw_store_journal_commit() {
 /// `w_list_setitem` allocates nothing on the restore (the displaced value
 /// is already boxed and strategy-matching), so entries cannot move
 /// mid-rollback.
+///
+/// Stores are restored BEFORE appends are rewound: a store's key was
+/// in-bounds at store time and stays in-bounds at the walk's final
+/// (max) length, so every restore lands while the list is still grown;
+/// shrinking first could push a restore index past the length and drop it.
 pub(crate) fn fbw_store_journal_rollback() {
     FBW_STORE_JOURNAL.with(|j| {
         let mut entries = j.borrow_mut();
@@ -5987,6 +6019,14 @@ pub(crate) fn fbw_store_journal_rollback() {
                     eprintln!("[fbw-store-journal] rollback failed (index out of bounds)");
                 }
             }
+        }
+    });
+    // Rewind each eager append's length in reverse push order
+    // (`w_list_int_set_len`, allocation-free).
+    FBW_APPEND_JOURNAL.with(|j| {
+        let mut entries = j.borrow_mut();
+        while let Some((list, length_before)) = entries.pop() {
+            unsafe { pyre_object::listobject::w_list_int_set_len(list, length_before) };
         }
     });
 }
@@ -6007,10 +6047,10 @@ pub(crate) fn fbw_has_unjournaled_effect() -> bool {
     FBW_UNJOURNALED_EFFECT.with(|c| c.get())
 }
 
-/// `framework.py root_walker.walk_roots` parity for the store journal:
-/// the triples hold nursery-resident refs across the rest of the walk
-/// (residual calls allocate, and a minor collection moves nursery
-/// objects), so every slot is forwarded as a root.  Registered once via
+/// `framework.py root_walker.walk_roots` parity for the store and append
+/// journals: the entries hold nursery-resident refs across the rest of the
+/// walk (residual calls allocate, and a minor collection moves nursery
+/// objects), so every ref slot is forwarded as a root.  Registered once via
 /// `majit_gc::shadow_stack::register_extra_root_walker` at JIT init.
 pub fn fbw_store_journal_root_walker(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
     FBW_STORE_JOURNAL.with(|j| {
@@ -6021,6 +6061,13 @@ pub fn fbw_store_journal_root_walker(visitor: &mut dyn FnMut(&mut majit_ir::GcRe
                 // the Vec storage alive for the visit.
                 visitor(unsafe { &mut *(slot as *mut pyre_object::PyObjectRef).cast() });
             }
+        }
+    });
+    FBW_APPEND_JOURNAL.with(|j| {
+        for (list, _len) in j.borrow_mut().iter_mut() {
+            // SAFETY: as above — only the `PyObjectRef` slot is a root; the
+            // `usize` length is a plain scalar.
+            visitor(unsafe { &mut *(list as *mut pyre_object::PyObjectRef).cast() });
         }
     });
 }
@@ -14376,6 +14423,63 @@ mod tests {
         );
         // Out-of-range index resolves to None (RPython: ALL_JITCODES miss).
         assert!(super::sub_jitcode_body_by_index(usize::MAX).is_none());
+    }
+
+    #[test]
+    fn append_journal_rollback_rewinds_length() {
+        // #171 P3 (Route C) "hard part" infra: a walked eager `list.append`
+        // grows the concrete list at trace time (no residual to execute via
+        // the executor — the charon body is inlined), so a NON-commit walk
+        // must rewind the length, exactly like the STORE_SUBSCR store
+        // journal restores its displaced element.  Spare-capacity gating
+        // (`w_list_can_append_without_realloc`) makes the rewind a pure
+        // length set with no reallocation to undo.
+        use pyre_object::listobject::{w_list_can_append_without_realloc, w_list_len};
+        use pyre_object::{w_int_new, w_list_append};
+
+        super::fbw_store_journal_reset();
+
+        let list = pyre_object::listobject::w_list_new(vec![
+            w_int_new(10),
+            w_int_new(20),
+            w_int_new(30),
+        ]);
+        // A first append forces the backing array to grow with a growth
+        // factor, leaving spare capacity so the *next* append is in-place
+        // (the only shape the arm specializes).
+        unsafe { w_list_append(list, w_int_new(40)) };
+        let len_before = unsafe { w_list_len(list) };
+        assert_eq!(len_before, 4);
+        assert!(
+            unsafe { w_list_can_append_without_realloc(list) },
+            "post-grow list must have spare capacity for the in-place append"
+        );
+
+        // Rollback path: eager append + journal push, then a non-commit
+        // exit rewinds the length.
+        unsafe { w_list_append(list, w_int_new(50)) };
+        super::fbw_append_journal_push(list, len_before);
+        assert_eq!(unsafe { w_list_len(list) }, 5);
+        super::fbw_store_journal_rollback();
+        assert_eq!(
+            unsafe { w_list_len(list) },
+            len_before,
+            "non-commit walk must rewind the eager append's length"
+        );
+
+        // Commit path: the eager append stands; the log is dropped.
+        unsafe { w_list_append(list, w_int_new(60)) };
+        super::fbw_append_journal_push(list, len_before);
+        super::fbw_store_journal_commit();
+        assert_eq!(
+            unsafe { w_list_len(list) },
+            len_before + 1,
+            "committed walk keeps the eager append"
+        );
+        // A subsequent rollback with the log already committed-empty is a
+        // no-op (does not shrink further).
+        super::fbw_store_journal_rollback();
+        assert_eq!(unsafe { w_list_len(list) }, len_before + 1);
     }
 
     /// Tests use the production `PyreJitCodeDescr` adapter

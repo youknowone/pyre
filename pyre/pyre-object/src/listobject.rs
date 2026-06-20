@@ -682,6 +682,26 @@ pub unsafe fn w_list_append(obj: PyObjectRef, value: PyObjectRef) {
     }
 }
 
+/// Set the live length of an Integer-strategy list without reallocating
+/// or boxing — the undo of a spare-capacity append (`_ll_list_resize_ge`'s
+/// `l.length = newsize` run in reverse).  The backing array already has
+/// room (the append that this reverses was admitted by
+/// [`w_list_can_append_without_realloc`]), so this only rewinds the length
+/// field.
+///
+/// # Safety
+/// `obj` must point to a valid Integer-strategy `W_ListObject` whose
+/// backing array has capacity for at least `n` elements.
+pub unsafe fn w_list_int_set_len(obj: PyObjectRef, n: usize) {
+    let list = &mut *(obj as *mut W_ListObject);
+    debug_assert_eq!(
+        list.strategy,
+        ListStrategy::Integer,
+        "w_list_int_set_len on non-Integer strategy"
+    );
+    ll_list_int_set_len(list, n);
+}
+
 /// Get the length of a list.
 ///
 /// # Safety
