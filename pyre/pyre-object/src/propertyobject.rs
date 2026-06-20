@@ -37,16 +37,47 @@ pub struct W_PropertyObject {
 ///
 /// PyPy: W_Property.__init__(space, w_fget, w_fset, w_fdel, w_doc)
 pub fn w_property_new(fget: PyObjectRef, fset: PyObjectRef, fdel: PyObjectRef) -> PyObjectRef {
-    // `gct_fv_gc_malloc` bracket pattern (`framework.py:853-856`).
+    // `gct_fv_gc_malloc` bracket pattern (`framework.py:853-856`): pin the
+    // three accessors across the GC malloc and read back relocated
+    // addresses. A property whose `fget`/`fset`/`fdel` is reachable only
+    // through it must be GC-traced; a `malloc_typed` property is invisible
+    // to mark-sweep. The `w_doc`/`w_name` setters already carry the write
+    // barrier (`set_doc`/`set_name`).
     let _roots = crate::gc_roots::push_roots();
+    let save_point = crate::gc_roots::shadow_stack_len();
     crate::gc_roots::pin_root(fget);
     crate::gc_roots::pin_root(fset);
     crate::gc_roots::pin_root(fdel);
+
+    let header = PyObject {
+        ob_type: &PROPERTY_TYPE as *const PyType,
+        w_class: get_instantiate(&PROPERTY_TYPE),
+    };
+    let raw = crate::gc_hook::try_gc_alloc_stable(W_PROPERTY_GC_TYPE_ID, W_PROPERTY_OBJECT_SIZE)
+        .filter(|p| !p.is_null());
+    let fget = crate::gc_roots::shadow_stack_get(save_point);
+    let fset = crate::gc_roots::shadow_stack_get(save_point + 1);
+    let fdel = crate::gc_roots::shadow_stack_get(save_point + 2);
+    if let Some(raw) = raw {
+        unsafe {
+            std::ptr::write(
+                raw as *mut W_PropertyObject,
+                W_PropertyObject {
+                    ob: header,
+                    fget,
+                    fset,
+                    fdel,
+                    w_doc: PY_NULL,
+                    w_name: PY_NULL,
+                    getter_doc: false,
+                },
+            );
+        }
+        crate::gc_hook::try_gc_write_barrier(raw);
+        return raw as PyObjectRef;
+    }
     W_PropertyObject::allocate(W_PropertyObject {
-        ob: PyObject {
-            ob_type: std::ptr::null(),
-            w_class: std::ptr::null_mut(),
-        },
+        ob: header,
         fget,
         fset,
         fdel,
@@ -124,14 +155,35 @@ pub struct W_StaticMethodObject {
 }
 
 pub fn w_staticmethod_new(func: PyObjectRef) -> PyObjectRef {
-    // `gct_fv_gc_malloc` bracket pattern (`framework.py:853-856`).
+    // `gct_fv_gc_malloc` bracket pattern (`framework.py:853-856`): pin the
+    // wrapped function across the GC malloc and read its relocated address.
     let _roots = crate::gc_roots::push_roots();
+    let save_point = crate::gc_roots::shadow_stack_len();
     crate::gc_roots::pin_root(func);
+
+    let header = PyObject {
+        ob_type: &STATICMETHOD_TYPE as *const PyType,
+        w_class: get_instantiate(&STATICMETHOD_TYPE),
+    };
+    let raw =
+        crate::gc_hook::try_gc_alloc_stable(W_STATICMETHOD_GC_TYPE_ID, W_STATICMETHOD_OBJECT_SIZE)
+            .filter(|p| !p.is_null());
+    let func = crate::gc_roots::shadow_stack_get(save_point);
+    if let Some(raw) = raw {
+        unsafe {
+            std::ptr::write(
+                raw as *mut W_StaticMethodObject,
+                W_StaticMethodObject {
+                    ob: header,
+                    w_function: func,
+                },
+            );
+        }
+        crate::gc_hook::try_gc_write_barrier(raw);
+        return raw as PyObjectRef;
+    }
     W_StaticMethodObject::allocate(W_StaticMethodObject {
-        ob: PyObject {
-            ob_type: std::ptr::null(),
-            w_class: std::ptr::null_mut(),
-        },
+        ob: header,
         w_function: func,
     })
 }
@@ -157,14 +209,35 @@ pub struct W_ClassMethodObject {
 }
 
 pub fn w_classmethod_new(func: PyObjectRef) -> PyObjectRef {
-    // `gct_fv_gc_malloc` bracket pattern (`framework.py:853-856`).
+    // `gct_fv_gc_malloc` bracket pattern (`framework.py:853-856`): pin the
+    // wrapped function across the GC malloc and read its relocated address.
     let _roots = crate::gc_roots::push_roots();
+    let save_point = crate::gc_roots::shadow_stack_len();
     crate::gc_roots::pin_root(func);
+
+    let header = PyObject {
+        ob_type: &CLASSMETHOD_TYPE as *const PyType,
+        w_class: get_instantiate(&CLASSMETHOD_TYPE),
+    };
+    let raw =
+        crate::gc_hook::try_gc_alloc_stable(W_CLASSMETHOD_GC_TYPE_ID, W_CLASSMETHOD_OBJECT_SIZE)
+            .filter(|p| !p.is_null());
+    let func = crate::gc_roots::shadow_stack_get(save_point);
+    if let Some(raw) = raw {
+        unsafe {
+            std::ptr::write(
+                raw as *mut W_ClassMethodObject,
+                W_ClassMethodObject {
+                    ob: header,
+                    w_function: func,
+                },
+            );
+        }
+        crate::gc_hook::try_gc_write_barrier(raw);
+        return raw as PyObjectRef;
+    }
     W_ClassMethodObject::allocate(W_ClassMethodObject {
-        ob: PyObject {
-            ob_type: std::ptr::null(),
-            w_class: std::ptr::null_mut(),
-        },
+        ob: header,
         w_function: func,
     })
 }
