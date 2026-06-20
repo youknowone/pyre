@@ -41,7 +41,10 @@ impl FieldDescr for PyreStrByteLenFieldDescr {
         STR_BYTE_LEN_OFFSET
     }
     fn field_size(&self) -> usize {
-        8
+        // `W_StrObject.byte_len` is a `usize`: 8 bytes on 64-bit, 4 on
+        // wasm32. A hardcoded 8 reads the adjacent field into the high
+        // half on a 32-bit target.
+        std::mem::size_of::<usize>()
     }
     fn field_type(&self) -> Type {
         Type::Int
@@ -67,7 +70,10 @@ impl FieldDescr for PyreUnicodeLenFieldDescr {
         STR_LEN_OFFSET
     }
     fn field_size(&self) -> usize {
-        8
+        // `W_StrObject.len` is a `usize`: 8 bytes on 64-bit, 4 on wasm32.
+        // A hardcoded 8 reads the adjacent field into the high half on a
+        // 32-bit target.
+        std::mem::size_of::<usize>()
     }
     fn field_type(&self) -> Type {
         Type::Int

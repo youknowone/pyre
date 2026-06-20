@@ -241,10 +241,12 @@ pub trait Cpu: Send + Sync {
         let lendescr = arraydescr.len_descr()?;
         let addr = array.0 + lendescr.offset();
         // SAFETY: caller has guaranteed `array` is a valid array gcref
-        // and `lendescr.offset()` is the registered length field
-        // offset; the length is a 64-bit signed integer per
-        // `WORD == 8` upstream (`llmodel.py:587`).
-        Some(unsafe { *(addr as *const i64) })
+        // and `lendescr.offset()` is the registered length field offset.
+        // The length is a machine-word (`Signed`/`WORD`) field
+        // (`llmodel.py:587`): read it at `usize` width so a 32-bit target
+        // (`WORD == 4`) does not pull the adjacent field into the high
+        // half. On 64-bit this is identical to the previous `i64` read.
+        Some(unsafe { *(addr as *const usize) as i64 })
     }
 
     /// `model.py:209+ cpu.bh_strlen` /
