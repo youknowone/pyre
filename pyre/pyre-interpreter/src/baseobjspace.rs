@@ -2436,7 +2436,7 @@ pub(crate) fn len_slot(obj: PyObjectRef) -> PyResult {
         }
         Err(PyError::type_error(format!(
             "object of type '{}' has no len()",
-            (*(*obj).ob_type).name,
+            object_functionstr_type_name(obj),
         )))
     }
 }

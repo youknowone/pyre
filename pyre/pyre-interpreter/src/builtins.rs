@@ -5535,23 +5535,22 @@ fn builtin_reversed(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
             return Ok(crate::call_function(method, &[obj]));
         }
     }
-    // functional.py:351 — without __reversed__, require sequence protocol
-    // (__getitem__ + __len__). Non-sequences raise TypeError.
+    // functional.py:351 — without `__reversed__`, require the sequence
+    // protocol. `PySequence_Check` first (an object with `__getitem__`): a
+    // non-sequence is "not reversible", while a sequence missing `__len__`
+    // raises the regular "has no len()" from `len`.
     if let Some(tp) = crate::typedef::r#type(obj) {
         let has_getitem =
             unsafe { crate::baseobjspace::lookup_in_type(tp, "__getitem__") }.is_some();
-        let has_len = unsafe { crate::baseobjspace::lookup_in_type(tp, "__len__") }.is_some();
-        if has_getitem && has_len {
-            // `functional.py:354-359` — any sequence with `__getitem__` +
-            // `__len__` reverses lazily through `W_ReversedIterator`.
+        if has_getitem {
+            // `functional.py:354-359` — reverse lazily through `W_ReversedIterator`.
             let n = crate::baseobjspace::len_w(obj)?;
             return Ok(pyre_object::reversedobject::w_reversed_new(obj, n - 1));
         }
     }
-    let type_name = unsafe { (*(*obj).ob_type).name };
     Err(crate::PyError::type_error(format!(
         "'{}' object is not reversible",
-        type_name
+        crate::baseobjspace::object_functionstr_type_name(obj)
     )))
 }
 
