@@ -7191,20 +7191,30 @@ fn builtin_format(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 /// `__import__(name, globals=None, locals=None, fromlist=(), level=0)`
 /// — PyPy: pypy/module/__builtin__/interp_import.importhook.
 fn builtin_import_stub(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let name_obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+    // `__import__(name, globals, locals, fromlist, level)` — every parameter
+    // may be passed by keyword (`__import__("a.b", fromlist=["c"])`), so the
+    // positional slots fall back to the matching kwarg.
+    let (pos, kwargs) = split_builtin_kwargs(args);
+    let arg = |idx: usize, key: &str| -> PyObjectRef {
+        pos.get(idx)
+            .copied()
+            .or_else(|| kwarg_get(kwargs, key))
+            .unwrap_or(pyre_object::PY_NULL)
+    };
+    let name_obj = arg(0, "name");
     let name = if !name_obj.is_null() && unsafe { pyre_object::is_str(name_obj) } {
         unsafe { pyre_object::w_str_get_value(name_obj) }
     } else {
         ""
     };
-    let globals = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
-    let fromlist = args.get(3).copied().unwrap_or(pyre_object::PY_NULL);
-    let level = args
-        .get(4)
-        .copied()
-        .filter(|&a| unsafe { pyre_object::is_int(a) })
-        .map(|a| unsafe { pyre_object::w_int_get_value(a) })
-        .unwrap_or(0);
+    let globals = arg(1, "globals");
+    let fromlist = arg(3, "fromlist");
+    let level_obj = arg(4, "level");
+    let level = if !level_obj.is_null() && unsafe { pyre_object::is_int(level_obj) } {
+        unsafe { pyre_object::w_int_get_value(level_obj) }
+    } else {
+        0
+    };
     let exec_ctx = crate::eval::CURRENT_FRAME.with(|current| {
         let frame = current.get();
         if frame.is_null() {
