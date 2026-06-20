@@ -254,28 +254,25 @@ impl Operand {
         if b.is_constant() {
             return Operand::Const(b.clone());
         }
-        // Only position-only boxes remain `Operand::Box`. The optimizer
-        // grind (#9-④) reduced production mints to the S9 cross-phase
-        // residual: export-boundary `get_box_replacement` fallbacks (which
-        // carry their own producerless tripwire) and unmapped Phase-1
-        // short-preamble jump args. Both are producer-less by construction
-        // in the current context.
+        // Only position-only boxes (no producer Rc) reach here.
         //
-        // Drain gauge (#9 keystone): the residual is being ground to zero so
-        // `Operand::Box` — and with it the `BoxRef` operand carrier — can be
-        // deleted. `MAJIT_DIAG_OPERAND_BOX=1` reports every residual mint (the
-        // position-only `OpRef` it froze) so the remaining producer-less sites
-        // can be enumerated and bound. Off by default — no behavior change in
-        // the gate.
+        // Drain status (#9 keystone, 2026-06-20): PRODUCTION mints are zero on
+        // the synth corpus. The two former sources are bound at their origin:
+        // short-preamble `short_inputargs` now mint via `from_bound_inputarg`
+        // over a rooted `InputArg` Rc carried through the preview → export →
+        // import channel (`short_inputarg_refs`, resolving to
+        // `Operand::InputArg`), and `emit_constant_*` SAME_AS placeholders take
+        // the constant box as their source (resolving to `Operand::Const`).
+        // `MAJIT_DIAG_OPERAND_BOX=1` reports each mint's position-only `OpRef`;
+        // off by default, no behavior change in the gate. A new production mint
+        // appearing here is a regression — bind it at its producer.
         //
-        // Measured frontier (2026-06-20, synth corpus): the unbound
-        // short-preamble `short_inputargs` source (formerly 94% of 3927 mints)
-        // is drained — `add_short_input_arg` now mints each renamed box via
-        // `from_bound_inputarg` over a rooted `InputArg` Rc carried through the
-        // preview → export → import channel (`short_inputarg_refs`), so the box
-        // resolves to `Operand::InputArg` instead of shedding here. The
-        // remaining 237 mints are all ResOp positions (`IntOp`/`RefOp`) from
-        // the S9 cross-phase export boundary; those need their own binding pass.
+        // The remaining minters are UNIT-TEST fixtures that construct
+        // `from_opref` / `new_inputarg` position-only boxes directly (no
+        // producer graph). Deleting the `Operand::Box` variant — and with it
+        // the `BoxRef` operand carrier — is therefore gated on migrating those
+        // fixtures to bound producers, a separate slice; the variant stays a
+        // release safety net until then.
         if std::env::var_os("MAJIT_DIAG_OPERAND_BOX").is_some() {
             eprintln!("OPERAND_BOX_MINT {:?}", b.to_opref());
         }
