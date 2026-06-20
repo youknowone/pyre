@@ -888,7 +888,12 @@ mod tests {
 pub fn fsencode_w(obj: pyre_object::PyObjectRef) -> Result<String, crate::PyError> {
     unsafe {
         if pyre_object::is_str(obj) {
-            return Ok(pyre_object::w_str_get_value(obj).to_string());
+            // A path str may carry lone surrogates (surrogateescape decoding),
+            // so read it through the WTF-8 view and lossily fold surrogates to
+            // U+FFFD rather than panicking in the strict `&str` accessor.
+            return Ok(pyre_object::w_str_get_wtf8(obj)
+                .to_string_lossy()
+                .into_owned());
         }
         if pyre_object::bytesobject::is_bytes_like(obj) {
             let data = pyre_object::bytesobject::bytes_like_data(obj);
@@ -903,7 +908,9 @@ pub fn fsencode_w(obj: pyre_object::PyObjectRef) -> Result<String, crate::PyErro
         let result = crate::call::call_function_impl_result(fspath_fn, &[obj])?;
         unsafe {
             if pyre_object::is_str(result) {
-                return Ok(pyre_object::w_str_get_value(result).to_string());
+                return Ok(pyre_object::w_str_get_wtf8(result)
+                    .to_string_lossy()
+                    .into_owned());
             }
             if pyre_object::bytesobject::is_bytes_like(result) {
                 let data = pyre_object::bytesobject::bytes_like_data(result);

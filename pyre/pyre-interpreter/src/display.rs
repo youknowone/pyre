@@ -36,6 +36,31 @@ fn try_call_dunder(obj: PyObjectRef, name: &str) -> Result<Option<String>, crate
     }
 }
 
+/// WTF-8 carrying variant of [`try_call_dunder`]: dispatches `__str__` /
+/// `__repr__` on an instance and preserves a surrogate-bearing result
+/// instead of folding it through a `&str` (which would panic).
+unsafe fn try_call_dunder_wtf8(
+    obj: PyObjectRef,
+    name: &str,
+) -> Result<Option<Wtf8Buf>, crate::PyError> {
+    unsafe {
+        if !pyre_object::is_instance(obj) {
+            return Ok(None);
+        }
+        let Some(method) = crate::baseobjspace::lookup(obj, name) else {
+            return Ok(None);
+        };
+        if method.is_null() {
+            return Ok(None);
+        }
+        let result = crate::builtins::call_and_check(method, &[obj])?;
+        if pyre_object::is_str(result) {
+            return Ok(Some(pyre_object::w_str_get_wtf8(result).to_wtf8_buf()));
+        }
+        Err(dunder_returned_non_string(name, result))
+    }
+}
+
 /// `TypeError: __repr__ returned non-string (type 'X')` for a dunder whose
 /// override returned a non-`str` (`descroperation.py:918-920`).
 unsafe fn dunder_returned_non_string(name: &str, result: PyObjectRef) -> crate::PyError {
@@ -869,6 +894,17 @@ pub unsafe fn py_str_wtf8(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> {
             }
             if pyre_object::is_exception(obj) {
                 if let Some(w) = exception_descr_str_wtf8(obj) {
+                    return Ok(w);
+                }
+            }
+            // An instance whose `__str__`/`__repr__` returns a
+            // surrogate-bearing str must keep WTF-8; the String-based
+            // `py_str` path would panic folding it to `&str`.
+            if std::ptr::eq(tp, &INSTANCE_TYPE as *const PyType) {
+                if let Some(w) = try_call_dunder_wtf8(obj, "__str__")? {
+                    return Ok(w);
+                }
+                if let Some(w) = try_call_dunder_wtf8(obj, "__repr__")? {
                     return Ok(w);
                 }
             }
