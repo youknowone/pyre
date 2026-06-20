@@ -121,6 +121,28 @@ fn local_type() -> PyObjectRef {
     })
 }
 
+// `_thread.start_new_thread(function, args[, kwargs])` — pyre is
+// single-threaded, so the callable runs synchronously and the returned
+// ident is the sole thread's sentinel (1).  A raising target is swallowed
+// (real threads report it via `_excepthook`, never to the spawner).
+fn start_new_thread(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    if args.len() < 2 {
+        return Err(crate::PyError::type_error(
+            "start_new_thread expected at least 2 arguments",
+        ));
+    }
+    let function = args[0];
+    let call_args = unsafe {
+        if is_tuple(args[1]) {
+            w_tuple_items_copy_as_vec(args[1])
+        } else {
+            return Err(crate::PyError::type_error("2nd arg must be a tuple"));
+        }
+    };
+    let _ = crate::call::call_function_impl_result(function, &call_args);
+    Ok(w_int_new(1))
+}
+
 // PyPy `_thread.get_ident` returns the pthread handle; pyre routes
 // through `rustpython_host_env::thread::current_thread_id`.  Without
 // host_env we always return 1 (single-threaded sentinel).
@@ -195,5 +217,7 @@ crate::py_module! {
         "_excepthook"            / 1 = |_| Ok(w_none()),
         "_get_main_thread_ident" / 0 = |_| Ok(w_int_new(1)),
         "start_joinable_thread"  / * = |_| Ok(w_int_new(0)),
+        "start_new_thread"       / * = start_new_thread,
+        "start_new"              / * = start_new_thread,
     },
 }

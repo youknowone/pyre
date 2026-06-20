@@ -24,4 +24,23 @@ crate::py_module! {
         "numeric"   / * = |args| args.get(1).copied()
             .ok_or_else(|| crate::PyError::value_error("not a numeric character")),
     },
+    extra_init: |ns| {
+        // `unicodedata.ucd_3_2_0` — a `UCD` instance pinned to the Unicode
+        // 3.2 database (used by `stringprep`).  pyre carries no historical
+        // tables, so it reuses the module's stub callables.  Functions live
+        // in the instance __dict__, so attribute access returns them
+        // unbound — `ucd_3_2_0.category(ch)` dispatches exactly like the
+        // module-level `category(ch)`.
+        let ucd_ty = crate::typedef::make_builtin_type("UCD", |_| {});
+        unsafe { typeobject::w_type_set_hasdict(ucd_ty, true) };
+        let ucd = w_instance_new(ucd_ty);
+        let d = crate::baseobjspace::getdict(ucd);
+        for name in ["normalize", "category", "name", "lookup", "decimal", "numeric"] {
+            if let Some(f) = crate::runtime_ops::dict_storage_get(ns, name) {
+                unsafe { w_dict_setitem_str(d, name, f) };
+            }
+        }
+        unsafe { w_dict_setitem_str(d, "unidata_version", w_str_new("3.2.0")) };
+        crate::dict_storage_store(ns, "ucd_3_2_0", ucd);
+    },
 }
