@@ -895,10 +895,20 @@ pub fn fsencode_w(obj: pyre_object::PyObjectRef) -> Result<String, crate::PyErro
             return Ok(String::from_utf8_lossy(data).into_owned());
         }
     }
-    if let Ok(fspath) = crate::baseobjspace::getattr_str(obj, "__fspath__") {
-        let result = crate::call_function(fspath, &[obj]);
-        if !result.is_null() && unsafe { pyre_object::is_str(result) } {
-            return Ok(unsafe { pyre_object::w_str_get_value(result).to_string() });
+    // `type(path).__fspath__(path)` — the descriptor read off the type is
+    // unbound, so `path` is supplied as the sole argument.
+    if let Some(fspath_fn) = crate::typedef::r#type(obj)
+        .and_then(|pt| unsafe { crate::baseobjspace::lookup_in_type(pt, "__fspath__") })
+    {
+        let result = crate::call::call_function_impl_result(fspath_fn, &[obj])?;
+        unsafe {
+            if pyre_object::is_str(result) {
+                return Ok(pyre_object::w_str_get_value(result).to_string());
+            }
+            if pyre_object::bytesobject::is_bytes_like(result) {
+                let data = pyre_object::bytesobject::bytes_like_data(result);
+                return Ok(String::from_utf8_lossy(data).into_owned());
+            }
         }
     }
     Err(crate::PyError::type_error(

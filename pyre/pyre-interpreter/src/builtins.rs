@@ -6371,10 +6371,16 @@ pub fn builtin_open(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
         } else if pyre_object::bytesobject::is_bytes_like(path_obj) {
             let data = pyre_object::bytesobject::bytes_like_data(path_obj);
             String::from_utf8_lossy(data).into_owned()
-        } else if let Ok(fspath) = crate::baseobjspace::getattr_str(path_obj, "__fspath__") {
-            let result = crate::call_function(fspath, &[path_obj]);
-            if !result.is_null() && pyre_object::is_str(result) {
+        } else if let Some(fspath_fn) = crate::typedef::r#type(path_obj)
+            .and_then(|pt| crate::baseobjspace::lookup_in_type(pt, "__fspath__"))
+        {
+            // `type(path).__fspath__(path)` — unbound descriptor + single arg.
+            let result = crate::call::call_function_impl_result(fspath_fn, &[path_obj])?;
+            if pyre_object::is_str(result) {
                 pyre_object::w_str_get_value(result).to_string()
+            } else if pyre_object::bytesobject::is_bytes_like(result) {
+                let data = pyre_object::bytesobject::bytes_like_data(result);
+                String::from_utf8_lossy(data).into_owned()
             } else {
                 return Err(crate::PyError::type_error(
                     "open(): path should be str, bytes, os.PathLike",

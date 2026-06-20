@@ -1012,27 +1012,9 @@ pub fn register_module(ns: &mut DictStorage) {
             return Err(crate::PyError::type_error("stat() missing argument"));
         }
         let path_obj = args[0];
-        let path_str = unsafe {
-            if pyre_object::is_str(path_obj) {
-                pyre_object::w_str_get_value(path_obj).to_string()
-            } else if pyre_object::bytesobject::is_bytes_like(path_obj) {
-                let data = pyre_object::bytesobject::bytes_like_data(path_obj);
-                String::from_utf8_lossy(data).into_owned()
-            } else if let Ok(fspath) = crate::baseobjspace::getattr_str(path_obj, "__fspath__") {
-                let result = crate::call_function(fspath, &[path_obj]);
-                if !result.is_null() && pyre_object::is_str(result) {
-                    pyre_object::w_str_get_value(result).to_string()
-                } else {
-                    return Err(crate::PyError::type_error(
-                        "stat: path should be string, bytes, os.PathLike",
-                    ));
-                }
-            } else {
-                return Err(crate::PyError::type_error(
-                    "stat: path should be string, bytes, os.PathLike",
-                ));
-            }
-        };
+        let path_str = crate::gateway::fsencode_w(path_obj).map_err(|_| {
+            crate::PyError::type_error("stat: path should be string, bytes, os.PathLike")
+        })?;
         let meta = if follow_symlinks {
             host_fs::metadata(&path_str)
         } else {
