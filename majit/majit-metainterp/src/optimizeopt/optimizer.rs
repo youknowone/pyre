@@ -2936,6 +2936,10 @@ impl Optimizer {
             // `exported_short_boxes` below).
             ctx.exported_short_inputargs =
                 short_boxes.create_short_inputargs(&preview_short_args);
+            // Carry the rooted InputArgRc pool alongside, index-aligned, so
+            // the renamed boxes stay bound to live `InputArg`s across the
+            // export boundary instead of shedding to position-only boxes.
+            ctx.exported_short_inputarg_refs = short_boxes.create_short_inputarg_refs();
             // Single-object carry: each exported entry keeps the preview
             // ProducedShortOp's replay Rc, so the pos/arg canonicalization
             // below lands on the object that dep-replay operands reference

@@ -478,6 +478,15 @@ pub struct ShortBoxes {
     /// `ShortInputArg(box, renamed)` — `box` and `renamed` are two objects).
     /// `short_inputargs[i]` corresponds to `label_args[i]` positionally.
     short_inputargs: Vec<BoxRef>,
+    /// Strong-`Rc` rooting pool for the renamed `InputArg` objects whose
+    /// `Weak` the `short_inputargs[i]` boxes hold (`from_bound_inputarg`
+    /// downgrades the `Rc`, box_ref.rs:293). Index-aligned 1:1 with
+    /// `short_inputargs`. Keeps each renamed `AbstractInputArg` alive so the
+    /// box stays bound (`bound_inputarg()` upgrades) until the operand it
+    /// sheds to (`Operand::InputArg`, a strong `Rc::clone`) self-roots it —
+    /// the analog of `TraceIterator.inputargs` rooting the outer-trace
+    /// inputargs (opencoder.py:250-273).
+    short_inputarg_refs: Vec<majit_ir::InputArgRc>,
     /// shortpreamble.py:256 `box = label_args[i]` — the ORIGINAL label-arg
     /// references, kept so `potential_ops`/lookups resolve a label arg by
     /// its own opref (`shortpreamble.py:259 potential_ops[box]`). pyre needs
@@ -577,6 +586,7 @@ impl ShortBoxes {
             const_short_boxes: Vec::new(),
             known_constants: VecSet::new(),
             short_inputargs: Vec::new(),
+            short_inputarg_refs: Vec::new(),
             label_args: Vec::new(),
             boxes_in_production: VecSet::new(),
             num_label_args,
@@ -708,10 +718,16 @@ impl ShortBoxes {
         // comes from the op-position counter so it is unique and accounted
         // for by `opref_high_water`; `raw()` shares the op/inputarg integer
         // space, so a fresh op position is a fresh inputarg position too.
-        let renamed = crate::r#box::BoxRef::new_inputarg(
-            arg_type,
-            ctx.alloc_op_position_typed(arg_type).raw(),
-        );
+        // Mint the `InputArg` object itself and BIND the box to it
+        // (`from_bound_inputarg`), the orthodox shape of `inputarg_from_tp`'s
+        // fresh `AbstractInputArg`; the strong `Rc` is rooted in
+        // `short_inputarg_refs[i]` so the box stays bound (the previous
+        // `new_inputarg` left `inputarg_handle = None`, minting a position-only
+        // box that shed to `Operand::Box`). `to_opref` is byte-identical
+        // (reads only `(type, position)`).
+        let pos = ctx.alloc_op_position_typed(arg_type).raw();
+        let renamed_ia = majit_ir::InputArg::from_type_rc(arg_type, pos);
+        let renamed = crate::r#box::BoxRef::from_bound_inputarg(&renamed_ia);
         // shortpreamble.py:259 `self.potential_ops[box] = ShortInputArg(...)`
         // is a plain dict assignment, so for a box duplicated across the
         // combined list it OVERWRITES: the LAST slot's `ShortInputArg`
@@ -725,6 +741,7 @@ impl ShortBoxes {
         // duplicate-free case `live_slot == lookup_label_arg(arg)`, so the
         // rename is unchanged.
         self.short_inputargs.push(renamed);
+        self.short_inputarg_refs.push(renamed_ia);
         // shortpreamble.py:257 `ShortInputArg(box, renamed)` — `res` is the
         // original `box`; the SAME_AS replay arg is that box. Exported
         // entries carry original positions and are renamed to the matching
@@ -993,6 +1010,18 @@ impl ShortBoxes {
     /// short_inputargs is the legitimate empty-loop case in upstream.
     pub fn create_short_inputargs(&self, _label_args: &[OpRef]) -> Vec<BoxRef> {
         self.short_inputargs.clone()
+    }
+
+    /// The `InputArg` rooting pool paired 1:1 with `create_short_inputargs`'s
+    /// boxes. Cloned (`Rc::clone` per handle) in lock-step so the carried
+    /// strong `Rc`s keep each `short_inputargs[i]` box bound downstream.
+    pub fn create_short_inputarg_refs(&self) -> Vec<majit_ir::InputArgRc> {
+        debug_assert_eq!(
+            self.short_inputarg_refs.len(),
+            self.short_inputargs.len(),
+            "short_inputarg_refs must stay index-aligned with short_inputargs"
+        );
+        self.short_inputarg_refs.clone()
     }
 
     /// shortpreamble.py: add_potential_op(op, pop)

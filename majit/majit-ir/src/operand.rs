@@ -268,13 +268,14 @@ impl Operand {
         // can be enumerated and bound. Off by default — no behavior change in
         // the gate.
         //
-        // Measured frontier (2026-06-20, synth corpus, 3927 mints): 94% are
-        // unbound short-preamble `short_inputargs` boxes
-        // (`shortpreamble.rs::produced_short_boxes_from_exported_boxes` setarg,
-        // minted position-only by `BoxRef::new_inputarg` at unroll.rs /
-        // shortpreamble.rs) — draining them needs the short-inputarg channel to
-        // carry bound `InputArg` Rcs; 6% are ResOp positions from the S9
-        // cross-phase export boundary.
+        // Measured frontier (2026-06-20, synth corpus): the unbound
+        // short-preamble `short_inputargs` source (formerly 94% of 3927 mints)
+        // is drained — `add_short_input_arg` now mints each renamed box via
+        // `from_bound_inputarg` over a rooted `InputArg` Rc carried through the
+        // preview → export → import channel (`short_inputarg_refs`), so the box
+        // resolves to `Operand::InputArg` instead of shedding here. The
+        // remaining 237 mints are all ResOp positions (`IntOp`/`RefOp`) from
+        // the S9 cross-phase export boundary; those need their own binding pass.
         if std::env::var_os("MAJIT_DIAG_OPERAND_BOX").is_some() {
             eprintln!("OPERAND_BOX_MINT {:?}", b.to_opref());
         }

@@ -686,6 +686,15 @@ pub struct OptContext {
     /// the export-site `label_args + virtuals` recompute (measured
     /// identical across the corpus, 2026-06-11).
     pub exported_short_inputargs: Vec<crate::r#box::BoxRef>,
+    /// Rooted `InputArgRc` carriers for `exported_short_inputargs`, index-
+    /// aligned with that vector. Each renamed short-preamble input box
+    /// (`exported_short_inputargs[i]`) holds a WEAK handle to
+    /// `exported_short_inputarg_refs[i]`; keeping the strong Rc alive here
+    /// lets the box resolve to a real bound `InputArg` (so the operand binds
+    /// to `Operand::InputArg` instead of shedding to the position-only
+    /// `Operand::Box` catch-all). Carried alongside `exported_short_inputargs`
+    /// through the same export channel.
+    pub exported_short_inputarg_refs: Vec<majit_ir::InputArgRc>,
     /// optimizer.py: `can_replace_guards` — disable guard replacement during
     /// bridge compilation. Defaults to true for preamble.
     pub can_replace_guards: bool,
@@ -1605,6 +1614,7 @@ impl OptContext {
             active_short_preamble_producer: None,
             exported_short_boxes: Vec::new(),
             exported_short_inputargs: Vec::new(),
+            exported_short_inputarg_refs: Vec::new(),
 
             imported_virtuals: Vec::new(),
             imported_label_args: None,
@@ -2150,6 +2160,7 @@ impl OptContext {
             active_short_preamble_producer: None,
             exported_short_boxes: Vec::new(),
             exported_short_inputargs: Vec::new(),
+            exported_short_inputarg_refs: Vec::new(),
 
             imported_virtuals: Vec::new(),
             imported_label_args: None,
