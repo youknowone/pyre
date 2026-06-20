@@ -5940,9 +5940,25 @@ fn init_file_wrapper_type(ns: &mut DictStorage) {
         "seekable",
         make_builtin_function_with_arity(
             "seekable",
-            // fd-backed objects wrap pipes/streams (not seekable); the
-            // in-memory path wrapper is.
-            |args| Ok(w_bool_from(file_get_fd(args[0]).is_none())),
+            // An fd-backed object is seekable iff `lseek` succeeds: a real
+            // file does, a pipe/socket fails with ESPIPE.  The in-memory
+            // path wrapper is always seekable.
+            |args| {
+                if let Some(fd) = file_get_fd(args[0]) {
+                    #[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
+                    {
+                        return Ok(w_bool_from(
+                            unsafe { libc::lseek(fd, 0, libc::SEEK_CUR) } >= 0,
+                        ));
+                    }
+                    #[cfg(any(not(feature = "host_env"), target_arch = "wasm32"))]
+                    {
+                        let _ = fd;
+                        return Ok(w_bool_from(false));
+                    }
+                }
+                Ok(w_bool_from(true))
+            },
             1,
         ),
     );
@@ -5950,6 +5966,31 @@ fn init_file_wrapper_type(ns: &mut DictStorage) {
         ns,
         "seek",
         make_builtin_function("seek", |args| {
+            if let Some(fd) = file_get_fd(args[0]) {
+                let offset = args
+                    .get(1)
+                    .map(|&o| unsafe { pyre_object::w_int_get_value(o) })
+                    .unwrap_or(0);
+                let whence = args
+                    .get(2)
+                    .map(|&o| unsafe { pyre_object::w_int_get_value(o) })
+                    .unwrap_or(0) as i32;
+                #[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
+                {
+                    let pos = unsafe { libc::lseek(fd, offset as libc::off_t, whence) };
+                    if pos < 0 {
+                        return Err(fd_io_err(std::io::Error::last_os_error()));
+                    }
+                    return Ok(w_int_new(pos as i64));
+                }
+                #[cfg(any(not(feature = "host_env"), target_arch = "wasm32"))]
+                {
+                    let _ = (fd, offset, whence);
+                    return Err(crate::PyError::not_implemented(
+                        "fd seek requires host_env feature",
+                    ));
+                }
+            }
             if args.len() >= 2 {
                 let _ = crate::baseobjspace::setattr_str(args[0], "__file_pos__", args[1]);
             }
@@ -5962,6 +6003,20 @@ fn init_file_wrapper_type(ns: &mut DictStorage) {
         make_builtin_function_with_arity(
             "tell",
             |args| {
+                if let Some(fd) = file_get_fd(args[0]) {
+                    #[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
+                    {
+                        let pos = unsafe { libc::lseek(fd, 0, libc::SEEK_CUR) };
+                        if pos < 0 {
+                            return Err(fd_io_err(std::io::Error::last_os_error()));
+                        }
+                        return Ok(w_int_new(pos as i64));
+                    }
+                    #[cfg(any(not(feature = "host_env"), target_arch = "wasm32"))]
+                    {
+                        let _ = fd;
+                    }
+                }
                 if let Ok(pos) = crate::baseobjspace::getattr_str(args[0], "__file_pos__") {
                     Ok(pos)
                 } else {
@@ -6345,6 +6400,37 @@ fn file_method_flush(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
 /// builtins.open(file, mode='r', ...) — PyPy: io.open → FileIO + TextIOWrapper.
 /// Minimal implementation that loads the entire file into memory and
 /// returns a file wrapper instance.
+/// POSIX `open(2)` flags for a text/binary mode string, used when an
+/// `opener` is supplied (the opener receives `(file, flags)`).
+#[cfg(unix)]
+fn open_flags_for_mode(mode: &str) -> i32 {
+    let write = mode.contains('w');
+    let append = mode.contains('a');
+    let exclusive = mode.contains('x');
+    let updating = mode.contains('+');
+    let mut flags = if updating {
+        libc::O_RDWR
+    } else if write || append || exclusive {
+        libc::O_WRONLY
+    } else {
+        libc::O_RDONLY
+    };
+    if write {
+        flags |= libc::O_CREAT | libc::O_TRUNC;
+    }
+    if append {
+        flags |= libc::O_CREAT | libc::O_APPEND;
+    }
+    if exclusive {
+        flags |= libc::O_CREAT | libc::O_EXCL;
+    }
+    flags
+}
+#[cfg(not(unix))]
+fn open_flags_for_mode(_mode: &str) -> i32 {
+    0
+}
+
 pub fn builtin_open(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if args.is_empty() {
         return Err(crate::PyError::type_error("open() missing 'file' argument"));
@@ -6414,6 +6500,31 @@ pub fn builtin_open(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
     let binary = mode.contains('b');
     let writing = mode.contains('w') || mode.contains('a') || mode.contains('x');
     let reading = mode.contains('r') || !writing;
+
+    // `open(..., opener=callable)`: the opener supplies the file descriptor
+    // (e.g. `tempfile.NamedTemporaryFile` creates the temp file and records
+    // its name in the opener). Call it with `(file, flags)` and wrap the
+    // returned fd directly.
+    let (_open_pos, open_kwargs) = split_builtin_kwargs(args);
+    if let Some(opener) = kwarg_get(open_kwargs, "opener") {
+        if !unsafe { pyre_object::is_none(opener) } {
+            let flags = open_flags_for_mode(&mode);
+            let fd_obj = crate::call::call_function_impl_result(
+                opener,
+                &[path_obj, w_int_new(flags as i64)],
+            )?;
+            let fd = unsafe { pyre_object::w_int_get_value(fd_obj) } as i32;
+            let wrapper = pyre_object::w_instance_new(file_wrapper_type());
+            let _ = crate::baseobjspace::setattr_str(wrapper, "__file_fd__", w_int_new(fd as i64));
+            let _ =
+                crate::baseobjspace::setattr_str(wrapper, "__file_binary__", w_bool_from(binary));
+            let _ = crate::baseobjspace::setattr_str(wrapper, "__file_mode__", w_str_new(&mode));
+            let _ = crate::baseobjspace::setattr_str(wrapper, "name", path_obj);
+            let _ = crate::baseobjspace::setattr_str(wrapper, "mode", w_str_new(&mode));
+            let _ = crate::baseobjspace::setattr_str(wrapper, "closed", w_bool_from(false));
+            return Ok(wrapper);
+        }
+    }
 
     let data: String = if reading && !mode.contains('w') && !mode.contains('x') {
         #[cfg(any(not(feature = "host_env"), target_arch = "wasm32"))]
