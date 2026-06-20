@@ -7311,10 +7311,20 @@ pub fn call_function(callable: PyObjectRef, args: &[PyObjectRef]) -> PyObjectRef
 
 /// PyPy: baseobjspace.py `callable_w`.
 pub fn callable_w(obj: PyObjectRef) -> bool {
+    // `PyCallable_Check` — the builtin callable kinds (function / builtin
+    // function, bound method, static- and classmethod, type) dispatch through
+    // dedicated slots rather than a `__call__` dict entry, so each is
+    // recognised directly; any other object is callable iff its type defines
+    // `__call__`.  Mirrors `builtins::builtin_callable`.
     unsafe {
         is_function(obj)
             || is_type(obj)
-            || (is_instance(obj) && lookup_in_type(w_instance_get_type(obj), "__call__").is_some())
+            || pyre_object::is_method(obj)
+            || pyre_object::propertyobject::is_staticmethod(obj)
+            || pyre_object::propertyobject::is_classmethod(obj)
+            || crate::typedef::r#type(obj)
+                .and_then(|t| lookup_in_type(t, "__call__"))
+                .is_some()
     }
 }
 
