@@ -5637,6 +5637,34 @@ fn init_function_type_common(ns: &mut DictStorage) {
         }
     });
     dict_storage_store(ns, "__globals__", make_getset_descriptor(globals_getter));
+    // `func.__builtins__` — `_PyEval_BuiltinsFromGlobals(globals)`: look up
+    // `__builtins__` in the function's globals; a Module yields its dict,
+    // any other value is returned directly, and an absent key falls back to
+    // the default builtin Module.  `pick_builtin_obj` already performs that
+    // resolution (honoring a custom `__builtins__`); convert the Module it
+    // returns to its dict so callers see a mapping (annotationlib's
+    // `{**annotate.__builtins__, **annotate.__globals__}`).
+    let func_builtins_getter = make_builtin_function("__builtins__", |args| {
+        let func = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+        if func.is_null() {
+            return Ok(pyre_object::w_none());
+        }
+        let w_globals = unsafe { crate::function::function_get_globals_obj(func) };
+        let exec_ctx = crate::call::take_last_exec_ctx();
+        let w_builtin = crate::baseobjspace::pick_builtin_obj(w_globals, exec_ctx);
+        if w_builtin.is_null() {
+            Ok(pyre_object::w_none())
+        } else if unsafe { pyre_object::is_module(w_builtin) } {
+            Ok(unsafe { pyre_object::w_module_get_w_dict(w_builtin) })
+        } else {
+            Ok(w_builtin)
+        }
+    });
+    dict_storage_store(
+        ns,
+        "__builtins__",
+        make_getset_descriptor(func_builtins_getter),
+    );
     // `pypy/interpreter/typedef.py:805 __objclass__ = getset_func_objclass`
     //
     // ```python
@@ -5732,6 +5760,13 @@ fn init_function_type_common(ns: &mut DictStorage) {
 
 fn init_function_type(ns: &mut DictStorage) {
     init_function_type_common(ns);
+    // `funcobject.c func_new` — `FunctionType(code, globals, name=None,
+    // argdefs=None, closure=None, kwdefaults=None)`.
+    dict_storage_store(
+        ns,
+        "__new__",
+        make_new_descr(crate::function::descr_function_new),
+    );
     dict_storage_store(
         ns,
         "__get__",

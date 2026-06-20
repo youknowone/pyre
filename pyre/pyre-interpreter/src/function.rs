@@ -1520,6 +1520,103 @@ pub unsafe fn descr_builtinfunction__new__(
     unsafe { descr_function__new__(code, w_globals, w_name, _argdefs, w_closure) }
 }
 
+/// `funcobject.c func_new_impl` — `FunctionType(code, globals,
+/// name=None, argdefs=None, closure=None, kwdefaults=None)`.
+///
+/// `args[0]` is the class (the `function` type); the remaining
+/// positional args plus the trailing `__pyre_kw__` dict
+/// (`split_builtin_kwargs`) supply the constructor parameters, so both
+/// `FunctionType(code, g)` and `FunctionType(code, g, closure=c,
+/// kwdefaults=k)` reach the same slot resolution.
+pub fn descr_function_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    crate::builtins::kwarg_reject_unknown(
+        kwargs,
+        &["code", "globals", "name", "argdefs", "closure", "kwdefaults"],
+        "function",
+    )?;
+    // `positional[0]` is `cls`; the constructor parameters start at index 1.
+    let pos = |i: usize| positional.get(i).copied().unwrap_or(PY_NULL);
+    let resolve = |i: usize, name: &str| {
+        let p = pos(i);
+        if p.is_null() {
+            crate::builtins::kwarg_get(kwargs, name).unwrap_or(PY_NULL)
+        } else {
+            p
+        }
+    };
+    let w_code = resolve(1, "code");
+    let w_globals = resolve(2, "globals");
+    let w_name = resolve(3, "name");
+    let w_argdefs = resolve(4, "argdefs");
+    let w_closure = resolve(5, "closure");
+    let w_kwdefaults = crate::builtins::kwarg_get(kwargs, "kwdefaults").unwrap_or(PY_NULL);
+
+    if w_code.is_null() || !unsafe { crate::pycode::is_code(w_code) } {
+        return Err(crate::PyError::type_error(
+            "function() argument 'code' must be code, not ...",
+        ));
+    }
+    // `PyDict_Check` accepts dict subclasses (annotationlib hands a
+    // `_StringifierDict`); resolve the backing storage rather than
+    // demanding an exact `dict`.
+    let w_globals_backing = crate::type_methods::resolve_dict_backing(w_globals);
+    if w_globals_backing.is_null() {
+        return Err(crate::PyError::type_error(
+            "function() argument 'globals' must be dict, not ...",
+        ));
+    }
+    let code_ptr = unsafe { crate::w_code_get_ptr(w_code) } as *const crate::CodeObject;
+    let name = if w_name.is_null() || unsafe { pyre_object::is_none(w_name) } {
+        unsafe { (*code_ptr).obj_name.to_string() }
+    } else if unsafe { pyre_object::is_str(w_name) } {
+        unsafe { pyre_object::w_str_get_value(w_name).to_string() }
+    } else {
+        return Err(crate::PyError::type_error(
+            "arg 3 (name) must be None or string",
+        ));
+    };
+    let globals_storage = unsafe {
+        pyre_object::dictmultiobject::w_dict_get_dict_storage_proxy(w_globals_backing)
+            as *mut DictStorage
+    };
+    let closure = if w_closure.is_null() || unsafe { pyre_object::is_none(w_closure) } {
+        PY_NULL
+    } else {
+        w_closure
+    };
+    // Normalise a dict-subclass globals to its backing `W_DictObject`
+    // (the call-path frame builder reads the storage proxy off the
+    // `__globals__` object directly; a subclass instance carries no proxy
+    // and would fault — same normalisation the exec/eval `createframe_obj`
+    // path applies).  `__missing__`-based forward references are not
+    // surfaced through the backing, but defined-name annotations resolve.
+    let func = function_new_with_globals_obj(
+        w_code as *const (),
+        name,
+        globals_storage,
+        w_globals_backing,
+        closure,
+    );
+    let qualname = pyre_object::w_str_new(unsafe { (*code_ptr).qualname.as_ref() });
+    unsafe { function_set_qualname(func, qualname) };
+    if !w_argdefs.is_null() && !unsafe { pyre_object::is_none(w_argdefs) } {
+        if !unsafe { pyre_object::is_tuple(w_argdefs) } {
+            return Err(crate::PyError::type_error(
+                "arg 4 (defaults) must be None or tuple",
+            ));
+        }
+        unsafe { function_set_defaults(func, w_argdefs) };
+    }
+    if !w_kwdefaults.is_null() && !unsafe { pyre_object::is_none(w_kwdefaults) } {
+        if !unsafe { pyre_object::is_dict(w_kwdefaults) } {
+            return Err(crate::PyError::type_error("kwdefaults must be a dict"));
+        }
+        unsafe { function_set_kwdefaults(func, w_kwdefaults) };
+    }
+    Ok(func)
+}
+
 /// PyPy-compatible static registry hook.
 #[inline]
 pub fn add_to_table() {}
