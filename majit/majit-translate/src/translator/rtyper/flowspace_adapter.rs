@@ -503,8 +503,9 @@ fn normalize_unary_op_name(pyre_name: &str) -> Result<String, TyperError> {
         "str" => Ok("str".to_string()),
         other => Err(TyperError::missing_rtype_operation(format!(
             "normalize_unary_op_name: pyre UnaryOp `{other}` has no \
-             flowspace counterpart (operation.py:465-474 registers \
-             only `pos` / `neg` / `invert` / `bool` as unary ops; \
+             flowspace counterpart (operation.py registers \
+             `pos` / `neg` / `invert` / `bool` and the ported `str` \
+             as unary ops; \
              `same_as` is rtyper's internal renaming op per \
              rtyper.py:478-481; all 13 typed cast names retired \
              across Slices A.3 / B.1 / A.4a / A.4b / A.4c — frontend \

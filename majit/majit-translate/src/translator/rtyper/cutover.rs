@@ -1900,6 +1900,13 @@ pub fn run_two_phase_prepass(
     call_registry.two_phase().prepass_done = true;
 }
 
+/// Whether the `PYRE_RTYPER_VERBOSE` de-aggregating census is enabled.
+/// Matches the `== "1"` contract the codewriter's coverage gauge uses
+/// (`codewriter.rs`), so a literal `PYRE_RTYPER_VERBOSE=0` stays off.
+fn rtyper_verbose_enabled() -> bool {
+    std::env::var_os("PYRE_RTYPER_VERBOSE").is_some_and(|v| v == "1")
+}
+
 fn run_two_phase_prepass_inner(
     call_registry: &PyreCallRegistry,
     candidate_graphs: &HashSet<crate::parse::CallPath>,
@@ -1943,7 +1950,7 @@ fn run_two_phase_prepass_inner(
                 // otherwise lumps every Phase-A failure under one opaque
                 // "subject not annotated/rtyped" Skip. Surface the per-graph
                 // reason so the onion can be triaged.
-                if std::env::var("PYRE_RTYPER_VERBOSE").is_ok() {
+                if rtyper_verbose_enabled() {
                     let reason = match other {
                         Ok(Err(e)) => format!("annotate Err: {e:?}"),
                         Err(p) => {
@@ -2045,7 +2052,7 @@ fn run_phase_b_rtype_isolated(
             match res {
                 Ok(Ok(())) => rtyper.mark_already_seen(&block),
                 ref other @ (Ok(Err(_)) | Err(_)) => {
-                    if std::env::var("PYRE_RTYPER_VERBOSE").is_ok() {
+                    if rtyper_verbose_enabled() {
                         let reason = match other {
                             Ok(Err(e)) => format!("rtype Err: {e:?}"),
                             Err(p) => {
