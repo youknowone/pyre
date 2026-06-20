@@ -74,6 +74,7 @@ pub mod mmap;
 pub mod operator;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod posix;
+pub mod pyexpat;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod pwd;
 pub mod resource;

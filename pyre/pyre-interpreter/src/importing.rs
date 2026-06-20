@@ -234,6 +234,7 @@ pub fn install_builtin_modules() {
     pyre_install_module!(_blake2);
     pyre_install_module!(gc);
     pyre_install_module!(unicodedata);
+    pyre_install_module!(pyexpat);
 
     // `_sysconfigdata_{abiflags}_{platform}_{multiarch}` is a generated
     // Python module containing `build_time_vars = {...}` that sysconfig
