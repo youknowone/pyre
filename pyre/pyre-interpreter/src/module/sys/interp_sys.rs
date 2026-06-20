@@ -553,6 +553,17 @@ pub fn register_module(ns: &mut DictStorage) {
         let _ = crate::baseobjspace::setattr_str(fi, "rounds", w_int_new(1));
         dict_storage_store(ns, "float_info", fi);
     }
+    // sysmodule.c — `sys.float_repr_style` is "short" wherever float repr
+    // uses David Gay's shortest-round-trip algorithm (always, here).
+    dict_storage_store(ns, "float_repr_style", w_str_new("short"));
+    // sys.thread_info — structseq(name, lock, version).
+    {
+        let ti = make_sys_namespace_instance();
+        let _ = crate::baseobjspace::setattr_str(ti, "name", w_str_new("pthread"));
+        let _ = crate::baseobjspace::setattr_str(ti, "lock", w_str_new("semaphore"));
+        let _ = crate::baseobjspace::setattr_str(ti, "version", w_none());
+        dict_storage_store(ns, "thread_info", ti);
+    }
     // sys.int_info — structseq with int implementation details.
     {
         let ii = make_sys_namespace_instance();

@@ -34,6 +34,11 @@ crate::py_module! {
         "get_hot_code"             / 0 = |_| Ok(w_list_new(vec![])),
     },
     extra_init: |ns| {
+        // `Python/bytecodes.c` exposes `ENABLE_SPECIALIZATION`; pyre has no
+        // CPython-style adaptive specialization, so it reads False — tests
+        // gated on `@requires_specialization` then skip.
+        crate::dict_storage_store(ns, "ENABLE_SPECIALIZATION", w_bool_from(false));
+        crate::dict_storage_store(ns, "ENABLE_SPECIALIZATION_FT", w_bool_from(false));
         for name in [
             "has_arg", "has_const", "has_name", "has_jump", "has_jrel",
             "has_jabs", "has_free", "has_local", "has_exc",
