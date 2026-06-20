@@ -3014,7 +3014,11 @@ fn eval_with_jit_inner(frame: &mut PyFrame) -> PyResult {
     let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame) };
     pyre_interpreter::call::register_eval_override(eval_with_jit);
     pyre_interpreter::call::register_set_jit_param_hook(set_jit_param_via_warmstate);
-    #[cfg(not(target_arch = "wasm32"))]
+    // The backend-agnostic registrations here — notably the JIT exception
+    // raiser (`register_jit_exc_raiser`) that `jit_publish_exception` routes
+    // residual-call raises through — are required on every backend; the
+    // cranelift/dynasm-specific blocks inside are already `cfg`-gated, so this
+    // is safe on wasm32 (where it is the only thing that installs the raiser).
     crate::call_jit::install_jit_call_bridge();
     init_callbacks();
     #[cfg(feature = "cranelift")]
@@ -3258,12 +3262,7 @@ pub fn portal_runner(frame: &mut PyFrame) -> pyre_object::PyObjectRef {
     match portal_runner_result(frame) {
         Ok(r) => r,
         Err(err) => {
-            #[cfg(feature = "cranelift")]
-            majit_backend_cranelift::jit_exc_raise(err.exc_object as i64);
-            #[cfg(feature = "dynasm")]
-            majit_backend_dynasm::jit_exc_raise(err.exc_object as i64);
-            #[cfg(not(any(feature = "cranelift", feature = "dynasm")))]
-            let _ = err;
+            crate::call_jit::store_jit_exception(err.exc_object as i64);
             pyre_object::PY_NULL
         }
     }
