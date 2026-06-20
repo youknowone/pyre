@@ -158,8 +158,20 @@ impl Repr for FixedSizeListRepr {
     /// `getarrayitem` on the `Ptr(GcArray)` receiver. The negative-index
     /// (`ll_getitem`) and `checkidx` (IndexError-raising) branches surface
     /// a `TyperError` until those helpers land — Rust slice indexing never
-    /// produces them. `recast` is a no-op here (the item lltype is already
-    /// the array element type).
+    /// produces them.
+    ///
+    /// The upstream result `recast` (`rlist.py:266`
+    /// `return r_lst.recast(hop.llops, v_res)` → `convertvar(v, item_repr,
+    /// external_item_repr)`) is omitted: `FixedSizeListRepr::new` keeps only
+    /// the internal `item_repr` and drops the `external_item_repr` half of
+    /// `externalvsinternal`, so getitem returns the internal repr directly.
+    /// That is correct for every list a live subject builds today — a
+    /// primitive item has `external == internal`, making recast an identity —
+    /// but a GC-instance list (`external != internal`) would return the
+    /// internal/root repr instead of the concrete external repr. Deferred to
+    /// the #305 slice that models `external_item_repr`: pyre's `convertvar`
+    /// keys identity on `Arc::ptr_eq`, so a same-lltype-different-`Arc`
+    /// recast added now would `TyperError` every currently-green getitem.
     fn rtype_getitem(&self, hop: &HighLevelOp) -> RTypeResult {
         use crate::annotator::model::SomeValue;
         let s1 = hop
