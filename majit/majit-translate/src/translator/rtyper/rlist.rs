@@ -174,6 +174,11 @@ impl Repr for FixedSizeListRepr {
     /// recast added now would `TyperError` every currently-green getitem.
     fn rtype_getitem(&self, hop: &HighLevelOp) -> RTypeResult {
         use crate::annotator::model::SomeValue;
+        if hop.has_implicit_exception("IndexError") {
+            return Err(TyperError::message(
+                "list rtype_getitem: checkidx IndexError branch not yet ported",
+            ));
+        }
         let s1 = hop
             .args_s
             .borrow()
@@ -845,6 +850,78 @@ mod tests {
             Some(signed_repr() as Arc<dyn Repr>),
         ]);
         assert!(list_repr.rtype_getitem(&hop).is_err());
+    }
+
+    /// A caught `IndexError` (`hop.has_implicit_exception("IndexError")`)
+    /// requires the `checkidx` path (`ll_getitem`), which is not yet
+    /// ported — `rtype_getitem` must surface a `TyperError` rather than
+    /// silently dropping the bounds check via the `dum_nocheck` fast path.
+    /// Mirrors the `rtype_setitem` checkidx guard.
+    #[test]
+    fn fixed_size_list_getitem_checkidx_indexerror_is_deferred() {
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = std::rc::Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata in test setup");
+        let list_repr: Arc<FixedSizeListRepr> = Arc::new(
+            FixedSizeListRepr::new(&rtyper, signed_repr() as Arc<dyn Repr>)
+                .expect("FixedSizeListRepr::new"),
+        );
+        let list_lltype = list_repr.lowleveltype().clone();
+        let llops = std::rc::Rc::new(std::cell::RefCell::new(LowLevelOpList::new(
+            rtyper.clone(),
+            None,
+        )));
+        let v_list = Variable::new();
+        v_list.set_concretetype(Some(list_lltype));
+        let v_idx = Variable::new();
+        v_idx.set_concretetype(Some(LowLevelType::Signed));
+        let v_result = Variable::new();
+        v_result.set_concretetype(Some(LowLevelType::Signed));
+        // A caught IndexError exitcase on this getitem.
+        let exitblock = std::rc::Rc::new(std::cell::RefCell::new(Block::new(vec![])));
+        let cls_index = crate::flowspace::model::HOST_ENV
+            .lookup_exception_class("IndexError")
+            .expect("IndexError class");
+        let link_index = std::rc::Rc::new(std::cell::RefCell::new(Link::new(
+            vec![],
+            Some(exitblock),
+            Some(Hlvalue::Constant(Constant::new(ConstValue::HostObject(
+                cls_index,
+            )))),
+        )));
+        let hop = HighLevelOp::new(
+            rtyper.clone(),
+            SpaceOperation::new(
+                "getitem".to_string(),
+                vec![Hlvalue::Variable(v_list), Hlvalue::Variable(v_idx)],
+                Hlvalue::Variable(v_result),
+            ),
+            vec![link_index],
+            llops.clone(),
+        );
+        hop.args_v.borrow_mut().extend(hop.spaceop.args.clone());
+        hop.args_s.borrow_mut().extend([
+            SomeValue::List(SomeList::new(ListDef::new(
+                None,
+                SomeValue::Integer(SomeInteger::new(false, false)),
+                /* mutated */ false,
+                /* resized */ false,
+            ))),
+            SomeValue::Integer(SomeInteger::new(/* nonneg */ true, false)),
+        ]);
+        hop.args_r.borrow_mut().extend([
+            Some(list_repr.clone() as Arc<dyn Repr>),
+            Some(signed_repr() as Arc<dyn Repr>),
+        ]);
+        let err = list_repr
+            .rtype_getitem(&hop)
+            .expect_err("checkidx IndexError must defer to a TyperError");
+        assert!(
+            format!("{err}").contains("checkidx IndexError"),
+            "expected checkidx IndexError deferral message, got {err}"
+        );
     }
 
     /// rlist.py:272-284 nonneg + dum_nocheck branch — `setitem` on a
