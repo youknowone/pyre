@@ -666,6 +666,13 @@ pub unsafe fn w_type_get_bases(obj: PyObjectRef) -> PyObjectRef {
     (*(obj as *const W_TypeObject)).bases
 }
 
+/// Replace the bases tuple (`type.__bases__` setter).  The caller is
+/// responsible for validating layout compatibility and recomputing the MRO.
+pub unsafe fn w_type_set_bases(obj: PyObjectRef, bases: PyObjectRef) {
+    crate::gc_roots::pin_root(bases);
+    (*(obj as *mut W_TypeObject)).bases = bases;
+}
+
 /// Get the class namespace pointer (as *mut u8).
 pub unsafe fn w_type_get_dict_ptr(obj: PyObjectRef) -> *mut u8 {
     (*(obj as *const W_TypeObject)).dict

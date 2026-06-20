@@ -5298,7 +5298,84 @@ fn init_type_type(ns: &mut DictStorage) {
         },
         2,
     );
-    dict_storage_store(ns, "__bases__", make_getset_descriptor(bases_getter));
+    let bases_setter = make_builtin_function_with_arity("__bases__", type_set_bases, 3);
+    dict_storage_store(
+        ns,
+        "__bases__",
+        make_getset_property_named(bases_getter, bases_setter, pyre_object::PY_NULL, "__bases__"),
+    );
+}
+
+/// `type.__bases__` setter (typeobject.py:1064-1105 `descr_set__bases__`).
+/// Heap types only; the new bases must be a non-empty tuple of classes whose
+/// best base shares the current instance layout (so instances stay valid).
+/// On success the MRO is recomputed and the type is re-registered on its new
+/// bases.
+fn type_set_bases(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    unsafe {
+        let w_type = args[1];
+        let w_value = args.get(2).copied().unwrap_or(pyre_object::PY_NULL);
+        let type_name = pyre_object::w_type_get_name(w_type);
+        if !pyre_object::w_type_is_heaptype(w_type) {
+            return Err(crate::PyError::type_error(format!(
+                "can't set {type_name}.__bases__"
+            )));
+        }
+        if w_value.is_null() || !pyre_object::is_tuple(w_value) {
+            return Err(crate::PyError::type_error(format!(
+                "can only assign tuple to {type_name}.__bases__"
+            )));
+        }
+        let n = pyre_object::w_tuple_len(w_value);
+        if n == 0 {
+            return Err(crate::PyError::type_error(format!(
+                "can only assign non-empty tuple to {type_name}.__bases__"
+            )));
+        }
+        // find_best_base: pick the base with the most-derived instance layout.
+        let mut w_bestbase = pyre_object::PY_NULL;
+        let mut best_layout: *const pyre_object::typeobject::Layout = std::ptr::null();
+        for i in 0..n {
+            let Some(w_base) = pyre_object::w_tuple_getitem(w_value, i as i64) else {
+                continue;
+            };
+            if std::ptr::eq(w_base, w_type) {
+                return Err(crate::PyError::type_error(
+                    "a __bases__ item causes an inheritance cycle",
+                ));
+            }
+            if !pyre_object::is_type(w_base) {
+                return Err(crate::PyError::type_error(format!(
+                    "{type_name}.__bases__ must be tuple of classes, not '{}'",
+                    (*(*w_base).ob_type).name
+                )));
+            }
+            let cand_layout = pyre_object::w_type_get_layout_ptr(w_base);
+            if best_layout.is_null()
+                || (cand_layout != best_layout
+                    && !cand_layout.is_null()
+                    && (*cand_layout).issublayout(best_layout))
+            {
+                w_bestbase = w_base;
+                best_layout = cand_layout;
+            }
+        }
+        // Instances keep their current layout, so the new best base must share
+        // it (no instance-size change).  Adding layout-neutral mixin bases such
+        // as Generic is fine; switching to an incompatible solid base is not.
+        let cur_layout = pyre_object::w_type_get_layout_ptr(w_type);
+        if best_layout != cur_layout {
+            return Err(crate::PyError::type_error(format!(
+                "__bases__ assignment: '{}' object layout differs from '{type_name}'",
+                pyre_object::w_type_get_name(w_bestbase)
+            )));
+        }
+        pyre_object::typeobject::w_type_set_bases(w_type, w_value);
+        let mro = crate::baseobjspace::compute_mro(w_type);
+        pyre_object::w_type_set_mro(w_type, mro);
+        pyre_object::typeobject::w_type_ready(w_type);
+        Ok(pyre_object::w_none())
+    }
 }
 
 /// function/builtin_function_or_method — PyPy: function.py Function typedef
