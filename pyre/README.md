@@ -12,7 +12,7 @@ The key insight: pyre's JIT framework [MaJIT](../majit/) handles tracing, optimi
 
 ## Status
 
-pyre is under active development. Loop tracing and function inlining work. On integer-heavy workloads, current results still trail PyPy but increasingly follow it. Many Python features are not yet implemented.
+pyre is under active development. Loop tracing and function inlining work, and the JIT now fires on integer-, float-, and exception-heavy loops alike. Most benchmarks run within ~1.5–3x of PyPy and several times faster than CPython; recursive-call-heavy code (fib_recursive) is the main remaining gap. Many Python features are not yet implemented.
 
 ## Benchmarks
 
@@ -20,16 +20,16 @@ Measured on Apple M-series, single core:
 
 | Benchmark | pyre (JIT) | PyPy 7.3 | CPython 3.14 | vs PyPy | vs CPython |
 |-----------|-----------|----------|--------------|---------|-------------|
-| int_loop | 0.06s | 0.04s | 1.86s | 1.5x slower | 31.0x faster |
-| fib_loop | 0.08s | 0.06s | 0.11s | 1.3x slower | 1.4x faster |
-| inline_helper | 0.04s | 0.04s | 1.45s | parity | 36.3x faster |
-| fib_recursive | 0.16s | 0.08s | 0.87s | 2.0x slower | 5.4x faster |
-| nbody | 1.90s | 0.03s | 0.21s | 63.3x slower | 9.0x slower |
-| fannkuch | 2.37s | 0.05s | 0.26s | 47.4x slower | 9.1x slower |
-| raise_catch | 0.34s | 0.01s | 0.06s | 34.0x slower | 5.7x slower |
-| spectral_norm | 0.24s | 0.01s | 0.04s | 24.0x slower | 6.0x slower |
+| int_loop | 0.08s | 0.11s | 3.63s | parity | 45.4x faster |
+| fib_loop | 0.14s | 0.11s | 0.20s | 1.3x slower | 1.4x faster |
+| inline_helper | 0.15s | 0.16s | 5.22s | parity | 34.8x faster |
+| fib_recursive | 1.48s | 0.22s | 0.67s | 6.7x slower | 2.2x slower |
+| nbody | 0.31s | 0.15s | 1.50s | 2.1x slower | 4.8x faster |
+| fannkuch | 0.67s | 0.24s | 1.27s | 2.8x slower | 1.9x faster |
+| raise_catch | 0.11s | 0.12s | 3.32s | parity | 30.2x faster |
+| spectral_norm | 0.05s | 0.04s | 1.12s | 1.3x slower | 22.4x faster |
 
-Integer-heavy benchmarks where the JIT fires still trail PyPy, but the gap is smaller there than on float-heavy or exception-heavy workloads. Float-heavy workloads (nbody, spectral_norm) and exception-heavy paths (raise_catch) run correctly but are not yet JIT-compiled — they fall back to the interpreter.
+The JIT now fires on integer-, float-, and exception-heavy loops alike: nbody, fannkuch, spectral_norm, and raise_catch all JIT-compile (disabling the JIT makes nbody ~70x and spectral_norm ~500x slower). Most benchmarks land within ~1.5–3x of PyPy and several times faster than CPython. The clearest remaining gap is fib_recursive, where recursive call frames still cost more than in PyPy. Sub-0.2s timings carry significant run-to-run variance and are approximate.
 
 Run `python pyre/check.py` to reproduce all benchmarks with CPython / PyPy / pyre comparison on your machine.
 
@@ -108,9 +108,9 @@ pyre is a structural port of PyPy's interpreter (`pypy/interpreter/` and `pypy/o
 
 What's next, roughly in priority order:
 
-- **Float-heavy JIT paths** — nbody and fannkuch run correctly but don't yet JIT-compile float operations; closing this gap is the biggest performance unlock remaining.
+- **Recursive-call performance** — `fib_recursive` still allocates more per call frame than PyPy and is the largest remaining single-benchmark gap; closing it is the biggest performance unlock left.
+- **Broader JIT coverage** — float and exception JIT now fire on the hot-loop benchmarks; extend that coverage to more of the language.
 - **More Python built-ins** — str methods, dict operations, list comprehensions, generators.
-- **Exception-heavy JIT** — raise/catch inside traced loops (raise_catch benchmark works interpreted, JIT bridge in progress).
 - **Multi-threaded execution** — the no-GIL foundation is there; actual parallel thread scheduling is not.
 - **CPython C extension compatibility** — long-term goal, likely via HPy or similar ABI layer.
 
