@@ -255,7 +255,7 @@ pub fn exc_info_direct() -> PyObjectRef {
 pub fn register_module(ns: &mut DictStorage) {
     dict_storage_store(ns, "maxsize", w_int_new(i64::MAX));
     dict_storage_store(ns, "maxunicode", w_int_new(0x10FFFF));
-    dict_storage_store(ns, "version", w_str_new("3.13.0 (pyre 0.0.1)"));
+    dict_storage_store(ns, "version", w_str_new("3.14.6 (pyre 0.0.1)"));
     dict_storage_store(
         ns,
         "platform",
@@ -278,17 +278,25 @@ pub fn register_module(ns: &mut DictStorage) {
             "big"
         }),
     );
-    dict_storage_store(
-        ns,
-        "version_info",
-        w_tuple_new(vec![
-            w_int_new(3),
-            w_int_new(13),
-            w_int_new(0),
-            w_str_new("final"),
-            w_int_new(0),
-        ]),
-    );
+    // sys.version_info — structseq(major, minor, micro, releaselevel,
+    // serial); a tuple subclass so `>= (3, 14)` / `[0]` and `.major` both work.
+    {
+        let version_info_type = crate::structseq::make_struct_seq(
+            "sys.version_info",
+            &["major", "minor", "micro", "releaselevel", "serial"],
+        );
+        let vi = crate::structseq::new_instance(
+            version_info_type,
+            vec![
+                w_int_new(3),
+                w_int_new(14),
+                w_int_new(6),
+                w_str_new("final"),
+                w_int_new(0),
+            ],
+        );
+        dict_storage_store(ns, "version_info", vi);
+    }
     // sys.modules — live dict synced with the import cache.
     let modules_dict = w_dict_new();
     crate::importing::set_sys_modules_dict(modules_dict);
@@ -516,8 +524,8 @@ pub fn register_module(ns: &mut DictStorage) {
                 w_int_new(0),
             ]),
         );
-        let _ = crate::baseobjspace::setattr_str(impl_obj, "hexversion", w_int_new(0x030d00f0));
-        let _ = crate::baseobjspace::setattr_str(impl_obj, "cache_tag", w_str_new("pyre-3.13"));
+        let _ = crate::baseobjspace::setattr_str(impl_obj, "hexversion", w_int_new(0x030e06f0));
+        let _ = crate::baseobjspace::setattr_str(impl_obj, "cache_tag", w_str_new("pyre-3.14"));
         let _ = crate::baseobjspace::setattr_str(impl_obj, "_multiarch", w_str_new(""));
         dict_storage_store(ns, "implementation", impl_obj);
     }
@@ -573,8 +581,14 @@ pub fn register_module(ns: &mut DictStorage) {
         let _ = crate::baseobjspace::setattr_str(ii, "str_digits_check_threshold", w_int_new(640));
         dict_storage_store(ns, "int_info", ii);
     }
-    // sys.executable
-    dict_storage_store(ns, "executable", w_str_new("pyre"));
+    dict_storage_store(ns, "hexversion", w_int_new(0x030e06f0));
+    // sys.executable — absolute path to the running interpreter so that
+    // subprocess spawns via `sys.executable` resolve.
+    let executable = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.to_str().map(str::to_owned))
+        .unwrap_or_else(|| "pyre".to_owned());
+    dict_storage_store(ns, "executable", w_str_new(&executable));
     // sys.prefix / exec_prefix
     dict_storage_store(ns, "prefix", w_str_new(""));
     dict_storage_store(ns, "exec_prefix", w_str_new(""));
