@@ -2782,6 +2782,14 @@ impl<'a> Transformer<'a> {
                     self._handle_jit_call(base, op, target, args, result_ty, graph_name, graph);
                 return prepend_const_prefix(&mut const_prefix_ops, result);
             }
+            // jtransform.py:488 — list.* / newlist oopspecs → _handle_list_call.
+            // Unhandled spellings return `None` and fall through to the
+            // residual-call path (RPython raises `NotSupported`).
+            if base.starts_with("list.") || base.starts_with("newlist") {
+                if let Some(result) = self._handle_list_call(base, op, args, graph, graph_name) {
+                    return prepend_const_prefix(&mut const_prefix_ops, result);
+                }
+            }
             // NOTE: conditional_call!/conditional_call_elidable!/record_known_result!
             // are handled by jitcode_lower (proc-macro level), NOT here.
             // The codewriter AST parser does not expand macro_rules!, so these
@@ -2872,6 +2880,149 @@ impl<'a> Transformer<'a> {
         let result =
             self.handle_residual_call(graph, op, target, descriptor, args, result_ty, graph_name);
         prepend_const_prefix(&mut const_prefix_ops, result)
+    }
+
+    /// Port of `jtransform.py:1762 _handle_list_call` for pyre's
+    /// strategy-tagged Integer-storage list oopspec leaves
+    /// (`ll_list_int_{length,getitem_fast,setitem_fast}` in
+    /// `listobject.rs`, annotated
+    /// `#[oopspec("list.int_{len,getitem,setitem}")]`).
+    ///
+    /// Lowers the oopspec call into the typed field / array ops the
+    /// heapcache understands instead of an opaque residual call.  pyre's
+    /// Integer storage is a nested inline `IntArray`
+    /// (`W_ListObject.int_items: IntArray { block: Ptr(GcArray(Signed)),
+    /// ptr, len, .. }`), so the items live behind the `int_items.block`
+    /// GC array:
+    ///   `list.int_len(l)`         → getfield_gc_i(l, int_items.len)
+    ///   `list.int_getitem(l, i)`  → getfield_gc_r(l, int_items.block);
+    ///                                getarrayitem_gc_i(block, i)
+    ///   `list.int_setitem(l,i,v)` → getfield_gc_r(l, int_items.block);
+    ///                                setarrayitem_gc(block, i, v)
+    ///
+    /// pyre splits the fused `getlistitem_gc` / `setlistitem_gc` resops
+    /// (`do_resizable_list_getitem/setitem`, jtransform.py:1954-1972)
+    /// into the explicit getfield(block) + get/setarrayitem pair because
+    /// the runtime exposes the backing GC array through the
+    /// `int_items.block` field (`Ptr(GcArray(Signed))`) rather than a
+    /// fused interior descr.
+    ///
+    /// The `_fast` leaves carry a non-negative index by contract
+    /// (`jtransform.py:1799 _get_list_nonneg_canraise_flags` → no
+    /// `check_neg_index`), so the index operand is used directly.
+    ///
+    /// Returns `None` for any oopspec spelling this does not handle, so
+    /// the caller falls through to the residual path
+    /// (`jtransform.py:1796` raises `NotSupported`).
+    fn _handle_list_call(
+        &mut self,
+        oopspec_name: &str,
+        op: &SpaceOperation,
+        args: &[crate::flowspace::model::Variable],
+        graph: &mut crate::model::FunctionGraph,
+        graph_name: &str,
+    ) -> Option<RewriteResult> {
+        use crate::jit_codewriter::type_state::ConcreteType;
+        // Field owner for the `W_ListObject` storage struct.  The dotted
+        // names address the fused offsets the runtime descr group
+        // exposes (`int_items.len` → `list_int_items_len_descr`,
+        // `int_items.block` → `list_int_items_block_descr`); the
+        // descr-resolution layer maps them to the matching
+        // `W_LIST_DESCR_GROUP` entries.
+        const LIST_OWNER: &str = "W_ListObject";
+
+        let (detail, ops): (&str, Vec<SpaceOperation>) = match oopspec_name {
+            "list.int_len" => {
+                let l = args.first()?.clone();
+                (
+                    "list.int_len → getfield_gc_i(int_items.len)",
+                    vec![SpaceOperation {
+                        result: op.result.clone(),
+                        kind: OpKind::FieldRead {
+                            base: l,
+                            field: FieldDescriptor::new(
+                                "int_items.len",
+                                Some(LIST_OWNER.to_string()),
+                            ),
+                            ty: ValueType::Int,
+                            pure: false,
+                        },
+                    }],
+                )
+            }
+            "list.int_getitem" => {
+                let l = args.first()?.clone();
+                let index = args.get(1)?.clone();
+                let block = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+                (
+                    "list.int_getitem → getfield_gc_r(int_items.block) + getarrayitem_gc_i",
+                    vec![
+                        SpaceOperation {
+                            result: Some(block.clone()),
+                            kind: OpKind::FieldRead {
+                                base: l,
+                                field: FieldDescriptor::new(
+                                    "int_items.block",
+                                    Some(LIST_OWNER.to_string()),
+                                ),
+                                ty: ValueType::Ref(None),
+                                pure: false,
+                            },
+                        },
+                        SpaceOperation {
+                            result: op.result.clone(),
+                            kind: OpKind::ArrayRead {
+                                base: block,
+                                index,
+                                item_ty: ValueType::Int,
+                                array_type_id: None,
+                                nolength: false,
+                            },
+                        },
+                    ],
+                )
+            }
+            "list.int_setitem" => {
+                let l = args.first()?.clone();
+                let index = args.get(1)?.clone();
+                let value = args.get(2)?.clone();
+                let block = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+                (
+                    "list.int_setitem → getfield_gc_r(int_items.block) + setarrayitem_gc",
+                    vec![
+                        SpaceOperation {
+                            result: Some(block.clone()),
+                            kind: OpKind::FieldRead {
+                                base: l,
+                                field: FieldDescriptor::new(
+                                    "int_items.block",
+                                    Some(LIST_OWNER.to_string()),
+                                ),
+                                ty: ValueType::Ref(None),
+                                pure: false,
+                            },
+                        },
+                        SpaceOperation {
+                            result: op.result.clone(),
+                            kind: OpKind::ArrayWrite {
+                                base: block,
+                                index,
+                                value: crate::model::LinkArg::Value(value),
+                                item_ty: ValueType::Int,
+                                array_type_id: None,
+                                nolength: false,
+                            },
+                        },
+                    ],
+                )
+            }
+            _ => return None,
+        };
+        self.notes.push(GraphTransformNote {
+            function: graph_name.to_string(),
+            detail: detail.to_string(),
+        });
+        Some(RewriteResult::Replace(ops))
     }
 
     /// RPython: `Transformer.handle_regular_call(op)`.
@@ -7941,5 +8092,172 @@ mod tests {
             }
             other => panic!("expected GuardValue, got {other:?}"),
         }
+    }
+
+    /// `list.int_len(l)` lowers to a single `getfield_gc_i(l,
+    /// int_items.len)` (`do_resizable_list_len`).
+    #[test]
+    fn handle_list_call_int_len_lowers_to_getfield_len() {
+        let config = GraphTransformConfig::default();
+        let mut graph = FunctionGraph::new("list_int_len");
+        let l = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let result = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let op = SpaceOperation {
+            result: Some(result.clone()),
+            kind: OpKind::ConstInt(0),
+        };
+        let mut transformer = Transformer::new(&config);
+        let rewrite = transformer
+            ._handle_list_call("list.int_len", &op, &[l.clone()], &mut graph, "list_int_len")
+            .expect("list.int_len must lower");
+        let RewriteResult::Replace(ops) = rewrite else {
+            panic!("expected Replace");
+        };
+        assert_eq!(ops.len(), 1);
+        match &ops[0].kind {
+            OpKind::FieldRead {
+                base,
+                field,
+                ty,
+                pure,
+            } => {
+                assert_eq!(base, &l);
+                assert_eq!(field.name, "int_items.len");
+                assert_eq!(field.owner_root.as_deref(), Some("W_ListObject"));
+                assert!(matches!(ty, ValueType::Int));
+                assert!(!pure);
+            }
+            other => panic!("expected FieldRead, got {other:?}"),
+        }
+        assert_eq!(ops[0].result, Some(result));
+    }
+
+    /// `list.int_getitem(l, i)` lowers to `getfield_gc_r(l,
+    /// int_items.block)` feeding `getarrayitem_gc_i(block, i)`.
+    #[test]
+    fn handle_list_call_int_getitem_lowers_to_block_plus_getarrayitem() {
+        let config = GraphTransformConfig::default();
+        let mut graph = FunctionGraph::new("list_int_getitem");
+        let l = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let index = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let result = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let op = SpaceOperation {
+            result: Some(result.clone()),
+            kind: OpKind::ConstInt(0),
+        };
+        let mut transformer = Transformer::new(&config);
+        let rewrite = transformer
+            ._handle_list_call(
+                "list.int_getitem",
+                &op,
+                &[l.clone(), index.clone()],
+                &mut graph,
+                "list_int_getitem",
+            )
+            .expect("list.int_getitem must lower");
+        let RewriteResult::Replace(ops) = rewrite else {
+            panic!("expected Replace");
+        };
+        assert_eq!(ops.len(), 2);
+        let block = match &ops[0].kind {
+            OpKind::FieldRead { base, field, ty, .. } => {
+                assert_eq!(base, &l);
+                assert_eq!(field.name, "int_items.block");
+                assert_eq!(field.owner_root.as_deref(), Some("W_ListObject"));
+                assert!(matches!(ty, ValueType::Ref(None)));
+                ops[0].result.clone().expect("block result var")
+            }
+            other => panic!("expected FieldRead, got {other:?}"),
+        };
+        match &ops[1].kind {
+            OpKind::ArrayRead {
+                base,
+                index: idx,
+                item_ty,
+                array_type_id,
+                nolength,
+            } => {
+                assert_eq!(base, &block);
+                assert_eq!(idx, &index);
+                assert!(matches!(item_ty, ValueType::Int));
+                assert_eq!(array_type_id, &None);
+                assert!(!nolength);
+            }
+            other => panic!("expected ArrayRead, got {other:?}"),
+        }
+        assert_eq!(ops[1].result, Some(result));
+    }
+
+    /// `list.int_setitem(l, i, v)` lowers to `getfield_gc_r(l,
+    /// int_items.block)` feeding `setarrayitem_gc(block, i, v)`.
+    #[test]
+    fn handle_list_call_int_setitem_lowers_to_block_plus_setarrayitem() {
+        let config = GraphTransformConfig::default();
+        let mut graph = FunctionGraph::new("list_int_setitem");
+        let l = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let index = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let value = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let op = SpaceOperation {
+            result: None,
+            kind: OpKind::ConstInt(0),
+        };
+        let mut transformer = Transformer::new(&config);
+        let rewrite = transformer
+            ._handle_list_call(
+                "list.int_setitem",
+                &op,
+                &[l.clone(), index.clone(), value.clone()],
+                &mut graph,
+                "list_int_setitem",
+            )
+            .expect("list.int_setitem must lower");
+        let RewriteResult::Replace(ops) = rewrite else {
+            panic!("expected Replace");
+        };
+        assert_eq!(ops.len(), 2);
+        let block = match &ops[0].kind {
+            OpKind::FieldRead { base, field, .. } => {
+                assert_eq!(base, &l);
+                assert_eq!(field.name, "int_items.block");
+                ops[0].result.clone().expect("block result var")
+            }
+            other => panic!("expected FieldRead, got {other:?}"),
+        };
+        match &ops[1].kind {
+            OpKind::ArrayWrite {
+                base,
+                index: idx,
+                value: written,
+                item_ty,
+                array_type_id,
+                nolength,
+            } => {
+                assert_eq!(base, &block);
+                assert_eq!(idx, &index);
+                assert_eq!(written.as_variable(), Some(&value));
+                assert!(matches!(item_ty, ValueType::Int));
+                assert_eq!(array_type_id, &None);
+                assert!(!nolength);
+            }
+            other => panic!("expected ArrayWrite, got {other:?}"),
+        }
+        assert_eq!(ops[1].result, None);
+    }
+
+    /// An unhandled list oopspec spelling returns `None` so the caller
+    /// falls through to the residual-call path.
+    #[test]
+    fn handle_list_call_unhandled_spelling_returns_none() {
+        let config = GraphTransformConfig::default();
+        let mut graph = FunctionGraph::new("list_unhandled");
+        let l = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let op = SpaceOperation {
+            result: None,
+            kind: OpKind::ConstInt(0),
+        };
+        let mut transformer = Transformer::new(&config);
+        assert!(transformer
+            ._handle_list_call("list.append", &op, &[l], &mut graph, "list_unhandled")
+            .is_none());
     }
 }
