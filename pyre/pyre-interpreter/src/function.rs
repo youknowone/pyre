@@ -1583,10 +1583,6 @@ pub fn descr_function_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
             "arg 3 (name) must be None or string",
         ));
     };
-    let globals_storage = unsafe {
-        pyre_object::dictmultiobject::w_dict_get_dict_storage_proxy(w_globals_backing)
-            as *mut DictStorage
-    };
     let closure = if w_closure.is_null() || unsafe { pyre_object::is_none(w_closure) } {
         PY_NULL
     } else {
@@ -1598,13 +1594,9 @@ pub fn descr_function_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     // and would fault — same normalisation the exec/eval `createframe_obj`
     // path applies).  `__missing__`-based forward references are not
     // surfaced through the backing, but defined-name annotations resolve.
-    let func = function_new_with_globals_obj(
-        w_code as *const (),
-        name,
-        globals_storage,
-        w_globals_backing,
-        closure,
-    );
+    // `function.py:57 self.w_func_globals = w_globals` stores the dict
+    // object as the function's sole globals carrier.
+    let func = function_new_with_closure(w_code as *const (), name, w_globals_backing, closure);
     let qualname = pyre_object::w_str_new(unsafe { (*code_ptr).qualname.as_ref() });
     unsafe { function_set_qualname(func, qualname) };
     if !w_argdefs.is_null() && !unsafe { pyre_object::is_none(w_argdefs) } {
