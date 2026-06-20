@@ -4630,8 +4630,33 @@ unsafe fn classdir_recurse(
 /// type MRO. Modules expose their namespace via w_module_get_namespace.
 pub(crate) fn builtin_dir(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if args.is_empty() {
-        // Return empty list — pyre doesn't currently expose locals here.
-        return Ok(w_list_new(vec![]));
+        // `bltinmodule.c builtin_dir` — with no argument, list the names in
+        // the caller's local scope: `sorted(frame.f_locals)`.  Resolve the
+        // locals mapping exactly as `locals()` does (module scope returns
+        // the globals dict), then return its sorted keys.
+        return crate::eval::CURRENT_FRAME.with(|current| {
+            let frame = current.get();
+            if frame.is_null() {
+                return Ok(w_list_new(vec![]));
+            }
+            let frame_mut = unsafe { &mut *frame };
+            let w_locals_dict = {
+                let w_locals_object = frame_mut.get_w_locals_object();
+                if !w_locals_object.is_null() {
+                    w_locals_object
+                } else {
+                    frame_mut.fast2locals()?;
+                    let w_locals = frame_mut.get_w_locals();
+                    if w_locals.is_null() {
+                        return Ok(w_list_new(vec![]));
+                    }
+                    crate::baseobjspace::dict_storage_to_dict(w_locals as *const _)
+                }
+            };
+            let keys_iter = crate::baseobjspace::iter(w_locals_dict)?;
+            let keys = collect_iterable(keys_iter)?;
+            builtin_sorted(&[w_list_new(keys)])
+        });
     }
     let obj = args[0];
     // app_inspect.py:57-62 — dir() is driven by the object's `__dir__`:
