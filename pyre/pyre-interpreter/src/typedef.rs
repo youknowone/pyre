@@ -1841,20 +1841,12 @@ fn init_list_type(ns: &mut DictStorage) {
         make_builtin_function_with_arity(
             "__reversed__",
             |args| {
-                // `listobject.py:737 descr_reversed` — reverse iterator over
-                // the list (same representation as `reversed(list)`).
+                // `listobject.py:737 descr_reversed` — a lazy reverse iterator
+                // over the list, the same `W_ReversedIterator` representation as
+                // `reversed(list)` (walks `getitem(seq, remaining)` downward).
                 let obj = args[0];
-                let n = unsafe { pyre_object::w_list_len(obj) };
-                let mut items = Vec::with_capacity(n);
-                for i in (0..n as i64).rev() {
-                    if let Some(v) = unsafe { pyre_object::w_list_getitem(obj, i) } {
-                        items.push(v);
-                    }
-                }
-                Ok(pyre_object::w_seq_iter_new(
-                    pyre_object::w_list_new(items),
-                    n,
-                ))
+                let n = unsafe { pyre_object::w_list_len(obj) } as i64;
+                Ok(pyre_object::reversedobject::w_reversed_new(obj, n - 1))
             },
             1,
         ),

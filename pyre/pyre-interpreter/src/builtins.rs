@@ -5478,21 +5478,26 @@ fn builtin_reversed(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
     }
     let obj = args[0];
     unsafe {
-        // List / tuple → a lazy `W_ReversedIterator` over the sequence
-        // (`functional.py:354-359 __init__`): `remaining = len - 1` and
-        // `descr_next` walks `getitem(seq, remaining)` downward.  Restores
-        // the lazy `reversed` object whose `__reduce__` is
-        // `(reversed, (sequence,), remaining)`.
-        if pyre_object::is_list(obj) {
-            let n = pyre_object::w_list_len(obj) as i64;
-            return Ok(pyre_object::reversedobject::w_reversed_new(obj, n - 1));
-        }
-        if pyre_object::is_tuple(obj) {
-            let n = pyre_object::w_tuple_len(obj) as i64;
-            return Ok(pyre_object::reversedobject::w_reversed_new(obj, n - 1));
+        // EXACT builtin list / tuple → a lazy `W_ReversedIterator` over the
+        // sequence (`functional.py:354-359 __init__`): `remaining = len - 1` and
+        // `descr_next` walks `getitem(seq, remaining)` downward.  A subclass
+        // shares the builtin `ob_type` but has its own `w_class`, so it falls
+        // through to the `__reversed__` MRO lookup below — CPython honors a
+        // subclass override (a non-overriding subclass inherits the builtin
+        // `list.__reversed__`, which is the same lazy iterator).
+        if pyre_object::is_exact_builtin_instance(obj) {
+            if pyre_object::is_list(obj) {
+                let n = pyre_object::w_list_len(obj) as i64;
+                return Ok(pyre_object::reversedobject::w_reversed_new(obj, n - 1));
+            }
+            if pyre_object::is_tuple(obj) {
+                let n = pyre_object::w_tuple_len(obj) as i64;
+                return Ok(pyre_object::reversedobject::w_reversed_new(obj, n - 1));
+            }
         }
         // range: rangeobject.py W_RangeObject.descr_reversed — reflect
-        // the span and hand back a fresh reverse-walking iterator.
+        // the span and hand back a fresh reverse-walking iterator. (range is
+        // not subclassable, so no override can apply.)
         if pyre_object::is_w_range(obj) {
             return Ok(pyre_object::w_range_reversed(obj));
         }
@@ -5521,12 +5526,13 @@ fn builtin_reversed(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
             let last = current + (count - 1) * step;
             return Ok(pyre_object::w_range_iter_new(last, current - step, -step));
         }
-        // Instance __reversed__
-        if pyre_object::is_instance(obj) {
-            let w_type = pyre_object::w_instance_get_type(obj);
-            if let Some(method) = crate::baseobjspace::lookup_in_type(w_type, "__reversed__") {
-                return Ok(crate::call_function(method, &[obj]));
-            }
+    }
+    // `__reversed__` resolved through the type MRO (`functional.py:362-366`) —
+    // honors a subclass override and the inherited builtin `list.__reversed__`,
+    // and any user object defining `__reversed__`.
+    if let Some(tp) = crate::typedef::r#type(obj) {
+        if let Some(method) = unsafe { crate::baseobjspace::lookup_in_type(tp, "__reversed__") } {
+            return Ok(crate::call_function(method, &[obj]));
         }
     }
     // functional.py:351 — without __reversed__, require sequence protocol
