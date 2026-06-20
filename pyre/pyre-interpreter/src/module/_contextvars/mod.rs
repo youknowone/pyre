@@ -8,6 +8,23 @@
 
 use pyre_object::*;
 
+/// `ContextVar` instance type — needs `__dict__` so `name` / `get` / `set`
+/// can be stored as instance attributes.  Plain `object` instances reject
+/// `setattr`, leaving the shell without its methods.
+fn context_var_type() -> PyObjectRef {
+    thread_local! {
+        static CELL: std::cell::OnceCell<PyObjectRef> =
+            const { std::cell::OnceCell::new() };
+    }
+    CELL.with(|c| {
+        *c.get_or_init(|| {
+            let tp = crate::typedef::make_builtin_type("ContextVar", |_| {});
+            unsafe { typeobject::w_type_set_hasdict(tp, true) };
+            tp
+        })
+    })
+}
+
 fn context_var(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // `interp_contextvars` ContextVar(name, *, default=MISSING) — name is required.
     if args.is_empty() {
@@ -15,7 +32,7 @@ fn context_var(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             "ContextVar() missing required argument: 'name'",
         ));
     }
-    let obj = w_instance_new(crate::typedef::w_object());
+    let obj = w_instance_new(context_var_type());
     let _ = crate::baseobjspace::setattr_str(obj, "name", args[0]);
     let _ = crate::baseobjspace::setattr_str(
         obj,

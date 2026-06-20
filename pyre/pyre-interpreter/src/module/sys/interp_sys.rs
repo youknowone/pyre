@@ -255,7 +255,9 @@ pub fn exc_info_direct() -> PyObjectRef {
 pub fn register_module(ns: &mut DictStorage) {
     dict_storage_store(ns, "maxsize", w_int_new(i64::MAX));
     dict_storage_store(ns, "maxunicode", w_int_new(0x10FFFF));
-    dict_storage_store(ns, "version", w_str_new("3.14.6 (pyre 0.0.1)"));
+    // Format matches `platform._sys_version`'s CPython parser:
+    // `version (buildinfo) [compiler]`.
+    dict_storage_store(ns, "version", w_str_new("3.14.6 (pyre 0.0.1) [Rust]"));
     dict_storage_store(
         ns,
         "platform",
