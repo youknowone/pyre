@@ -260,6 +260,24 @@ impl Operand {
         // carry their own producerless tripwire) and unmapped Phase-1
         // short-preamble jump args. Both are producer-less by construction
         // in the current context.
+        //
+        // Drain gauge (#9 keystone): the residual is being ground to zero so
+        // `Operand::Box` — and with it the `BoxRef` operand carrier — can be
+        // deleted. `MAJIT_DIAG_OPERAND_BOX=1` reports every residual mint (the
+        // position-only `OpRef` it froze) so the remaining producer-less sites
+        // can be enumerated and bound. Off by default — no behavior change in
+        // the gate.
+        //
+        // Measured frontier (2026-06-20, synth corpus, 3927 mints): 94% are
+        // unbound short-preamble `short_inputargs` boxes
+        // (`shortpreamble.rs::produced_short_boxes_from_exported_boxes` setarg,
+        // minted position-only by `BoxRef::new_inputarg` at unroll.rs /
+        // shortpreamble.rs) — draining them needs the short-inputarg channel to
+        // carry bound `InputArg` Rcs; 6% are ResOp positions from the S9
+        // cross-phase export boundary.
+        if std::env::var_os("MAJIT_DIAG_OPERAND_BOX").is_some() {
+            eprintln!("OPERAND_BOX_MINT {:?}", b.to_opref());
+        }
         Operand::Box(b.clone())
     }
 
