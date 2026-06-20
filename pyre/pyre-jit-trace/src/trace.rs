@@ -993,6 +993,7 @@ fn full_body_walk_trace(
     // walk that reaches a terminator would compile a trace carrying the bad
     // guard.  Discarding the trace matches the trait leg's `interpret()` poll.
     if crate::state::take_trace_abort_requested() {
+        crate::jitcode_dispatch::census_record("TraceAbortRequested");
         if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
             eprintln!(
                 "[fbw-abort] start_pc={start_pc} unencodable cross-frame resume coordinate (#124/#130)"
@@ -1054,6 +1055,7 @@ fn full_body_walk_trace(
                         exit_with_exception: false,
                     },
                     None => {
+                        crate::jitcode_dispatch::census_record("Terminate::NoFinishPayload");
                         if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
                             eprintln!(
                                 "[fbw-abort] start_pc={start_pc} Terminate without finish payload (ungated portal exit)"
@@ -1074,6 +1076,7 @@ fn full_body_walk_trace(
                 TraceAction::CompileTrace
             }
             other => {
+                crate::jitcode_dispatch::census_record("Outcome::Other");
                 if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
                     eprintln!("[fbw-abort] start_pc={start_pc} outcome={other:?}");
                 }
@@ -1100,6 +1103,7 @@ fn full_body_walk_trace(
             // plain `Abort` without declining so a capability that lands
             // mid-run can still pick the location up.
             use crate::jitcode_dispatch::DispatchError as DE;
+            crate::jitcode_dispatch::census_record(e.variant_name());
             if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
                 eprintln!("[fbw-abort] start_pc={start_pc} Err={e:?}");
             }
@@ -1125,6 +1129,7 @@ fn full_body_walk_trace(
             }
         }
         None => {
+            crate::jitcode_dispatch::census_record("RunPerfnWalkNone");
             if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
                 eprintln!("[fbw-abort] start_pc={start_pc} run_perfn_walk returned None");
             }

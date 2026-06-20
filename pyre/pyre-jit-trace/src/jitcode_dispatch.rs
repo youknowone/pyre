@@ -1166,6 +1166,105 @@ pub enum DispatchError {
     LoopBearingCalleeInlineUnsupported { pc: usize },
 }
 
+impl DispatchError {
+    /// The variant's identifier as a `'static` string, for the
+    /// decline-class census (see [`census_record`]).  One arm per
+    /// variant so a new variant fails to compile until it is named here.
+    pub(crate) fn variant_name(&self) -> &'static str {
+        match self {
+            Self::UndecodableOpcode { .. } => "UndecodableOpcode",
+            Self::UnsupportedOpname { .. } => "UnsupportedOpname",
+            Self::RegisterOutOfRange { .. } => "RegisterOutOfRange",
+            Self::DescrIndexOutOfRange { .. } => "DescrIndexOutOfRange",
+            Self::ExpectedJitCodeDescr { .. } => "ExpectedJitCodeDescr",
+            Self::SubJitCodeNotFound { .. } => "SubJitCodeNotFound",
+            Self::InlineCallArityMismatch { .. } => "InlineCallArityMismatch",
+            Self::InlineCallIntArityMismatch { .. } => "InlineCallIntArityMismatch",
+            Self::InlineCallFloatArityMismatch { .. } => "InlineCallFloatArityMismatch",
+            Self::UnexpectedVoidSubReturn { .. } => "UnexpectedVoidSubReturn",
+            Self::UnexpectedNonVoidSubReturn { .. } => "UnexpectedNonVoidSubReturn",
+            Self::ReraiseWithoutLastExcValue { .. } => "ReraiseWithoutLastExcValue",
+            Self::LastExcValueWithoutActiveException { .. } => "LastExcValueWithoutActiveException",
+            Self::CatchExceptionWithActiveException { .. } => "CatchExceptionWithActiveException",
+            Self::ResidualCallDescrNotCallDescr { .. } => "ResidualCallDescrNotCallDescr",
+            Self::ResidualCallArgUnbound { .. } => "ResidualCallArgUnbound",
+            Self::ExpectedSwitchDescr { .. } => "ExpectedSwitchDescr",
+            Self::SwitchValueNotConcrete { .. } => "SwitchValueNotConcrete",
+            Self::GotoIfNotValueNotConcrete { .. } => "GotoIfNotValueNotConcrete",
+            Self::NotInTraceRequiresConcreteExecution { .. } => {
+                "NotInTraceRequiresConcreteExecution"
+            }
+            Self::JitForceVirtualRequiresConcreteResolver { .. } => {
+                "JitForceVirtualRequiresConcreteResolver"
+            }
+            Self::VableBoxNotSeeded { .. } => "VableBoxNotSeeded",
+            Self::VableArrayDescrMalformed { .. } => "VableArrayDescrMalformed",
+            Self::VableArrayMissingVirtualizableInfo { .. } => "VableArrayMissingVirtualizableInfo",
+            Self::VableArrayIndexOutOfRange { .. } => "VableArrayIndexOutOfRange",
+            Self::VableArrayIndexNotConcrete { .. } => "VableArrayIndexNotConcrete",
+            Self::AbortMarkerReached { .. } => "AbortMarkerReached",
+            Self::AbortPermanentMarkerReached { .. } => "AbortPermanentMarkerReached",
+            Self::MayForceNullRefArgUnsupported { .. } => "MayForceNullRefArgUnsupported",
+            Self::VableEscapedDuringResidualCall { .. } => "VableEscapedDuringResidualCall",
+            Self::GuardSnapshotVableUntyped { .. } => "GuardSnapshotVableUntyped",
+            Self::LastExceptionWithoutActiveException { .. } => {
+                "LastExceptionWithoutActiveException"
+            }
+            Self::JitMergePointGreenKeyUnresolved { .. } => "JitMergePointGreenKeyUnresolved",
+            Self::LoopHeaderJdIndexUnresolved { .. } => "LoopHeaderJdIndexUnresolved",
+            Self::SubWalkClosedLoop { .. } => "SubWalkClosedLoop",
+            Self::BranchGuardKeptStackUnsupported { .. } => "BranchGuardKeptStackUnsupported",
+            Self::NonStandardVableFinishPortalUnsupported { .. } => {
+                "NonStandardVableFinishPortalUnsupported"
+            }
+            Self::LoopBearingCalleeInlineUnsupported { .. } => "LoopBearingCalleeInlineUnsupported",
+        }
+    }
+}
+
+/// Per-process census of full-body-walk decline classes, keyed by
+/// [`DispatchError::variant_name`] (or a synthetic key for the non-`Err`
+/// abort outcomes).  Populated only on the cold abort path via
+/// [`census_record`]; off the hot trace path entirely.  The dump
+/// (`census_dump`) is gated on [`fbw_debug_abort_enabled`], so with the
+/// `PYRE_FBW_DEBUG_ABORT` flag unset the only cost is one `BTreeMap`
+/// insert per declined walk (already a rare, slow event).
+thread_local! {
+    static FBW_DECLINE_CENSUS: std::cell::RefCell<std::collections::BTreeMap<&'static str, usize>> =
+        const { std::cell::RefCell::new(std::collections::BTreeMap::new()) };
+}
+
+/// Bump the decline count for `name` (a [`DispatchError::variant_name`] or
+/// a synthetic outcome key).  Called from the trace-side decline routing.
+/// When [`fbw_debug_abort_enabled`] is set, also emits the running census
+/// so a corpus run prints `[fbw-census]` lines (the last block printed is
+/// the final tally) without needing a process-exit hook.
+pub(crate) fn census_record(name: &'static str) {
+    FBW_DECLINE_CENSUS.with(|c| {
+        *c.borrow_mut().entry(name).or_insert(0) += 1;
+    });
+    census_dump();
+}
+
+/// Print the accumulated decline census as `[fbw-census] <name>: <count>`
+/// lines, sorted by name.  No-op unless [`fbw_debug_abort_enabled`].
+/// Safe to call repeatedly (a diagnostic dump, not a reset).
+pub(crate) fn census_dump() {
+    if !fbw_debug_abort_enabled() {
+        return;
+    }
+    FBW_DECLINE_CENSUS.with(|c| {
+        let map = c.borrow();
+        if map.is_empty() {
+            eprintln!("[fbw-census] (no declines recorded)");
+            return;
+        }
+        for (name, count) in map.iter() {
+            eprintln!("[fbw-census] {name}: {count}");
+        }
+    });
+}
+
 /// Walk one opcode at `pc` and return the dispatch outcome plus the
 /// next pc. Side effects reach `ctx.trace_ctx` only for opnames whose
 /// handler explicitly records (e.g. `ref_return/r` calls
