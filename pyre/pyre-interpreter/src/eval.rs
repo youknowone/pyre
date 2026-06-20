@@ -2097,6 +2097,10 @@ impl ConstantOpcodeHandler for PyFrame {
         Ok(w_float_new(value))
     }
 
+    fn complex_constant(&mut self, re: f64, im: f64) -> Result<Self::Value, PyError> {
+        Ok(pyre_object::complexobject::w_complex_new(re, im))
+    }
+
     fn bool_constant(&mut self, value: bool) -> Result<Self::Value, PyError> {
         Ok(w_bool_from(value))
     }

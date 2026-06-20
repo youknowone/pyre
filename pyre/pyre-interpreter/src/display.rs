@@ -218,6 +218,11 @@ unsafe fn builtin_leaf_repr_string(obj: PyObjectRef, tp: *const PyType) -> Optio
         } else if std::ptr::eq(tp, &FLOAT_TYPE as *const PyType) {
             let float_obj = obj as *const pyre_object::floatobject::W_FloatObject;
             Some(format_float_repr((*float_obj).floatval))
+        } else if std::ptr::eq(tp, &pyre_object::COMPLEX_TYPE as *const PyType) {
+            Some(crate::typedef::complex_repr_string(
+                pyre_object::w_complex_get_real(obj),
+                pyre_object::w_complex_get_imag(obj),
+            ))
         } else if std::ptr::eq(tp, &LONG_TYPE as *const PyType) {
             let long_obj = obj as *const pyre_object::longobject::W_LongObject;
             Some(format!("{}", &*(*long_obj).value))

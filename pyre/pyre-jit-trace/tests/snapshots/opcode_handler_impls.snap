@@ -333,6 +333,13 @@ impl pyre_interpreter::ConstantOpcodeHandler for crate::state::MIFrame {
         Ok(crate::state::FrontendOp::new(opref, concrete))
     }
 
+    fn complex_constant(&mut self, re: f64, im: f64) -> Result<Self::Value, pyre_interpreter::PyError> {
+        use crate::helpers::TraceHelperAccess;
+        let concrete = crate::state::ConcreteValue::Ref(pyre_object::complexobject::w_complex_new(re, im));
+        let opref = self.trace_complex_constant(re, im)?;
+        Ok(crate::state::FrontendOp::new(opref, concrete))
+    }
+
     fn code_constant(
         &mut self,
         code: &pyre_interpreter::CodeObject,

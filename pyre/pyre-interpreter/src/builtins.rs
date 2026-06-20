@@ -622,7 +622,7 @@ pub fn install_default_builtins(namespace: &mut DictStorage) {
         make_module_builtin_function("compile", builtin_compile)
     });
     namespace.get_or_insert_with("complex", || {
-        make_module_builtin_function("complex", builtin_complex)
+        crate::typedef::gettypeobject(&pyre_object::COMPLEX_TYPE)
     });
     namespace.get_or_insert_with("filter", || {
         make_module_builtin_function("filter", builtin_filter)
@@ -1200,6 +1200,12 @@ pub fn builtin_abs(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
         }
         if is_float(obj) {
             return Ok(w_float_new(w_float_get_value(obj).abs()));
+        }
+        if pyre_object::is_complex(obj) {
+            // abs(complex) → the float magnitude.
+            let re = pyre_object::w_complex_get_real(obj);
+            let im = pyre_object::w_complex_get_imag(obj);
+            return Ok(w_float_new(re.hypot(im)));
         }
     }
     // Instance __abs__ — PyPy: baseobjspace.py abs
@@ -5249,6 +5255,12 @@ pub fn hash_value(obj: PyObjectRef) -> i64 {
         if is_float(obj) {
             return _hash_float(pyre_object::w_float_get_value(obj));
         }
+        if pyre_object::is_complex(obj) {
+            return crate::objspace::descroperation::complex_hash(
+                pyre_object::w_complex_get_real(obj),
+                pyre_object::w_complex_get_imag(obj),
+            );
+        }
         if is_str(obj) {
             return _hash_str(pyre_object::w_str_get_wtf8(obj).as_bytes());
         }
@@ -6997,60 +7009,145 @@ fn builtin_bin(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     Ok(w_str_new(&s))
 }
 
-/// `complex(real=0, imag=0)` — PyPy: complexobject.py descr__new__
-fn builtin_complex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    use pyre_object::*;
-    let real = if args.is_empty() {
-        0.0
-    } else {
-        unsafe {
-            let a = args[0];
-            if is_bool(a) {
-                w_bool_get_value(a) as i64 as f64
-            } else if is_int(a) {
-                w_int_get_value(a) as f64
-            } else if is_float(a) {
-                w_float_get_value(a)
-            } else if is_str(a) {
-                // Parse the string's stored value directly; a `str`
-                // subclass `__str__` is not consulted
-                // (complexobject.c `complex_subtype_from_string`).
-                let s = w_str_get_value(a);
-                s.trim().parse::<f64>().map_err(|_| {
-                    crate::PyError::new(
-                        crate::PyErrorKind::ValueError,
-                        format!("could not convert string to complex: '{s}'"),
-                    )
-                })?
-            } else {
-                0.0
-            }
-        }
-    };
-    let imag = if args.len() > 1 {
-        unsafe {
-            let a = args[1];
-            if is_bool(a) {
-                w_bool_get_value(a) as i64 as f64
-            } else if is_int(a) {
-                w_int_get_value(a) as f64
-            } else if is_float(a) {
-                w_float_get_value(a)
-            } else {
-                0.0
-            }
-        }
-    } else {
-        0.0
-    };
-    // No complex type yet — return float as approximation
-    if imag == 0.0 {
-        Ok(pyre_object::w_float_new(real))
-    } else {
-        Err(crate::PyError::type_error(
-            "complex numbers not yet supported",
-        ))
+/// Parse a complex literal string into `(real, imag)`.
+///
+/// `complexobject.c complex_from_string_inner`: optional surrounding
+/// parens, then `[real][+/-]imag[j]` with no internal whitespace.
+fn parse_complex_str(raw: &str) -> Option<(f64, f64)> {
+    let mut s = raw.trim();
+    if s.starts_with('(') && s.ends_with(')') {
+        s = s[1..s.len() - 1].trim();
     }
+    if s.is_empty() || s.contains(char::is_whitespace) {
+        return None;
+    }
+    let parse_part = |p: &str, is_imag: bool| -> Option<f64> {
+        // A bare/sign-only imaginary coefficient means ±1.
+        if is_imag {
+            match p {
+                "" | "+" => return Some(1.0),
+                "-" => return Some(-1.0),
+                _ => {}
+            }
+        }
+        p.parse::<f64>().ok()
+    };
+    let bytes = s.as_bytes();
+    // Boundary between real and imaginary parts: the last '+'/'-' that is
+    // not the leading sign and not part of an exponent (`e+`/`e-`).
+    let mut split = None;
+    for i in 1..bytes.len() {
+        let c = bytes[i];
+        if (c == b'+' || c == b'-') && bytes[i - 1] != b'e' && bytes[i - 1] != b'E' {
+            split = Some(i);
+        }
+    }
+    let ends_j = matches!(bytes.last(), Some(b'j') | Some(b'J'));
+    match split {
+        Some(i) => {
+            if !ends_j {
+                return None;
+            }
+            let real = parse_part(&s[..i], false)?;
+            let imag = parse_part(&s[i..s.len() - 1], true)?;
+            Some((real, imag))
+        }
+        None => {
+            if ends_j {
+                let imag = parse_part(&s[..s.len() - 1], true)?;
+                Some((0.0, imag))
+            } else {
+                let real = parse_part(s, false)?;
+                Some((real, 0.0))
+            }
+        }
+    }
+}
+
+/// Coerce a value to `(real, imag)` for `complex()` construction.
+///
+/// `int`/`bool`/`float` become a real-only pair; a `complex` keeps both
+/// components; an instance is asked for `__complex__` then `__float__`.
+fn complex_coerce(obj: PyObjectRef) -> Result<(f64, f64), crate::PyError> {
+    use pyre_object::*;
+    unsafe {
+        if is_complex(obj) {
+            return Ok((w_complex_get_real(obj), w_complex_get_imag(obj)));
+        }
+        if is_bool(obj) {
+            return Ok((w_bool_get_value(obj) as i64 as f64, 0.0));
+        }
+        if is_int(obj) {
+            return Ok((w_int_get_value(obj) as f64, 0.0));
+        }
+        if is_long(obj) {
+            return Ok((crate::baseobjspace::float_w(obj)?, 0.0));
+        }
+        if is_float(obj) {
+            return Ok((w_float_get_value(obj), 0.0));
+        }
+    }
+    // `__complex__` then `__float__` (complexobject.c try_complex_special_method).
+    unsafe {
+        if is_instance(obj) {
+            let t = w_instance_get_type(obj);
+            if crate::baseobjspace::lookup_in_type(t, "__complex__").is_some() {
+                let res = crate::baseobjspace::call_method(obj, "__complex__", &[]);
+                if res.is_null() {
+                    return Err(crate::call::take_call_error().unwrap_or_else(|| {
+                        crate::PyError::type_error("__complex__ call failed")
+                    }));
+                }
+                if is_complex(res) {
+                    return Ok((w_complex_get_real(res), w_complex_get_imag(res)));
+                }
+                return Err(crate::PyError::type_error(
+                    "__complex__ should return a complex object",
+                ));
+            }
+        }
+    }
+    let f = crate::baseobjspace::float_w(obj)?;
+    Ok((f, 0.0))
+}
+
+/// `complex(real=0, imag=0)` — complexobject.c complex_new.
+pub(crate) fn builtin_complex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    use pyre_object::*;
+    // String form accepts only a single argument.
+    if let Some(&a) = args.first() {
+        if unsafe { is_str(a) } {
+            if args.len() > 1 {
+                return Err(crate::PyError::type_error(
+                    "complex() can't take second arg if first is a string",
+                ));
+            }
+            let s = unsafe { w_str_get_value(a) };
+            let (r, i) = parse_complex_str(s).ok_or_else(|| {
+                crate::PyError::new(
+                    crate::PyErrorKind::ValueError,
+                    format!("complex() arg is a malformed string"),
+                )
+            })?;
+            return Ok(w_complex_new(r, i));
+        }
+    }
+    let (mut real, mut imag) = match args.first() {
+        Some(&a) => complex_coerce(a)?,
+        None => (0.0, 0.0),
+    };
+    if let Some(&b) = args.get(1) {
+        if unsafe { is_str(b) } {
+            return Err(crate::PyError::type_error(
+                "complex() second arg can't be a string",
+            ));
+        }
+        // complex(a, b) = (a.real - b.imag) + (a.imag + b.real)j.
+        let (br, bi) = complex_coerce(b)?;
+        real -= bi;
+        imag += br;
+    }
+    Ok(w_complex_new(real, imag))
 }
 
 /// `format(value, format_spec='')` — operation.py format → space.format

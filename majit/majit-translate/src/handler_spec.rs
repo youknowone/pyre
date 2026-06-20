@@ -135,6 +135,17 @@ fn emit_constant_impl(out: &mut String) {
     out.push_str("        Ok(crate::state::FrontendOp::new(opref, concrete))\n");
     out.push_str("    }\n");
 
+    // complex_constant — special: two f64 args, Ref concrete via w_complex_new.
+    out.push('\n');
+    out.push_str("    fn complex_constant(&mut self, re: f64, im: f64) -> Result<Self::Value, pyre_interpreter::PyError> {\n");
+    out.push_str("        use crate::helpers::TraceHelperAccess;\n");
+    out.push_str(
+        "        let concrete = crate::state::ConcreteValue::Ref(pyre_object::complexobject::w_complex_new(re, im));\n",
+    );
+    out.push_str("        let opref = self.trace_complex_constant(re, im)?;\n");
+    out.push_str("        Ok(crate::state::FrontendOp::new(opref, concrete))\n");
+    out.push_str("    }\n");
+
     // code_constant — special: pointer cast in concrete ctor.
     out.push('\n');
     out.push_str("    fn code_constant(\n");

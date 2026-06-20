@@ -193,6 +193,7 @@ const _: () = {
 pub static INT_TYPE: PyType = new_pytype("int");
 pub static BOOL_TYPE: PyType = new_pytype("bool");
 pub static FLOAT_TYPE: PyType = new_pytype("float");
+pub static COMPLEX_TYPE: PyType = new_pytype("complex");
 pub static STR_TYPE: PyType = new_pytype("str");
 pub static LIST_TYPE: PyType = new_pytype("list");
 pub static TUPLE_TYPE: PyType = new_pytype("tuple");
@@ -646,6 +647,11 @@ pub unsafe fn is_bool(obj: PyObjectRef) -> bool {
 #[inline]
 pub unsafe fn is_float(obj: PyObjectRef) -> bool {
     unsafe { py_type_check(obj, &FLOAT_TYPE) }
+}
+
+#[inline]
+pub unsafe fn is_complex(obj: PyObjectRef) -> bool {
+    unsafe { py_type_check(obj, &COMPLEX_TYPE) }
 }
 
 #[inline]

@@ -840,6 +840,10 @@ pub(crate) fn is_true_slot(obj: PyObjectRef) -> Result<bool, PyError> {
         if is_float(obj) {
             return Ok(w_float_get_value(obj) != 0.0);
         }
+        if pyre_object::is_complex(obj) {
+            return Ok(pyre_object::w_complex_get_real(obj) != 0.0
+                || pyre_object::w_complex_get_imag(obj) != 0.0);
+        }
         if is_str(obj) {
             return Ok(w_str_len(obj) != 0);
         }

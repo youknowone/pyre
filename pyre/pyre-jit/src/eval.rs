@@ -1585,6 +1585,30 @@ thread_local! {
             w_instance_tid,
             pyre_object::instanceobject::W_INSTANCE_GC_TYPE_ID,
         );
+        // W_ComplexObject carries two f64s after the `PyObject` header and
+        // no managed pointers — a GC leaf like W_FloatObject.  Registered
+        // immediately after the last hardcoded-constant tid (instance = 53)
+        // so its fixed id 54 precedes the auto-numbered `#[pyre_class]` /
+        // per-ExcKind tids registered below.  Bound to `COMPLEX_TYPE` so the
+        // collector reads the correct size + leaf trace when a managed
+        // container holds a complex.
+        let w_complex_tid = gc.register_type(TypeInfo::object_subclass(
+            std::mem::size_of::<pyre_object::complexobject::W_ComplexObject>(),
+            object_tid,
+        ));
+        debug_assert_eq!(
+            w_complex_tid,
+            pyre_object::complexobject::W_COMPLEX_GC_TYPE_ID,
+        );
+        majit_gc::GcAllocator::register_vtable_for_type(
+            &mut gc,
+            &pyre_object::pyobject::COMPLEX_TYPE as *const _ as usize,
+            w_complex_tid,
+        );
+        pytype_to_tid.insert(
+            &pyre_object::pyobject::COMPLEX_TYPE as *const _ as usize,
+            w_complex_tid,
+        );
         // `#[pyre_class]`-emitted typed-payload registrations.  Each
         // entry is one line consuming the macro-generated
         // `PyreClassDescriptor` static; `register_pyre_class` asserts

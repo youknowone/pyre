@@ -464,6 +464,10 @@ pub fn emit_trace_float_constant(ctx: &mut TraceCtx, value: f64) -> OpRef {
     ctx.const_ref(box_float_constant(value) as i64)
 }
 
+pub fn emit_trace_complex_constant(ctx: &mut TraceCtx, re: f64, im: f64) -> OpRef {
+    ctx.const_ref(pyre_object::complexobject::w_complex_new(re, im) as i64)
+}
+
 pub fn emit_trace_unary_negative_value(ctx: &mut TraceCtx, value: OpRef) -> OpRef {
     emit_trace_call_may_force_ref_typed(
         ctx,
@@ -724,6 +728,10 @@ pub trait TraceHelperAccess {
 
     fn trace_float_constant(&mut self, value: f64) -> Result<OpRef, PyError> {
         self.with_trace_ctx(|ctx| Ok(emit_trace_float_constant(ctx, value)))
+    }
+
+    fn trace_complex_constant(&mut self, re: f64, im: f64) -> Result<OpRef, PyError> {
+        self.with_trace_ctx(|ctx| Ok(emit_trace_complex_constant(ctx, re, im)))
     }
 
     fn trace_bool_constant(&mut self, value: bool) -> Result<OpRef, PyError> {

@@ -771,6 +771,129 @@ unsafe fn float_ne(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     Ok(w_bool_from(as_float(a) != as_float(b)))
 }
 
+// ── Complex arithmetic operations ────────────────────────────────────
+
+/// `complexobject.c _PyHASH_IMAG` — the imaginary-part hash multiplier.
+const HASH_IMAG: i64 = 1_000_003;
+
+/// `(real, imag)` for any numeric operand (`complex` / `int` / `long` /
+/// `float` / `bool`), else `None`.
+pub(crate) unsafe fn complex_val(obj: PyObjectRef) -> Option<(f64, f64)> {
+    if is_complex(obj) {
+        Some((w_complex_get_real(obj), w_complex_get_imag(obj)))
+    } else if is_bool(obj) {
+        Some((w_bool_get_value(obj) as i64 as f64, 0.0))
+    } else if is_int(obj) || is_long(obj) || is_float(obj) {
+        Some((as_float(obj), 0.0))
+    } else {
+        None
+    }
+}
+
+/// True if both operands are numeric and at least one is `complex`.
+unsafe fn is_complex_pair(a: PyObjectRef, b: PyObjectRef) -> bool {
+    (is_complex(a) || is_complex(b)) && complex_val(a).is_some() && complex_val(b).is_some()
+}
+
+unsafe fn complex_add(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+    let (ar, ai) = complex_val(a).unwrap();
+    let (br, bi) = complex_val(b).unwrap();
+    Ok(w_complex_new(ar + br, ai + bi))
+}
+
+unsafe fn complex_sub(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+    let (ar, ai) = complex_val(a).unwrap();
+    let (br, bi) = complex_val(b).unwrap();
+    Ok(w_complex_new(ar - br, ai - bi))
+}
+
+unsafe fn complex_mul(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+    let (ar, ai) = complex_val(a).unwrap();
+    let (br, bi) = complex_val(b).unwrap();
+    Ok(w_complex_new(ar * br - ai * bi, ar * bi + ai * br))
+}
+
+/// `complexobject.c _Py_c_quot` — Smith's algorithm for numerical stability.
+unsafe fn complex_truediv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+    let (ar, ai) = complex_val(a).unwrap();
+    let (br, bi) = complex_val(b).unwrap();
+    let abs_br = br.abs();
+    let abs_bi = bi.abs();
+    let (real, imag) = if abs_br >= abs_bi {
+        if abs_br == 0.0 {
+            return Err(PyError::zero_division("complex division by zero"));
+        }
+        let ratio = bi / br;
+        let denom = br + bi * ratio;
+        ((ar + ai * ratio) / denom, (ai - ar * ratio) / denom)
+    } else {
+        let ratio = br / bi;
+        let denom = br * ratio + bi;
+        ((ar * ratio + ai) / denom, (ai * ratio - ar) / denom)
+    };
+    Ok(w_complex_new(real, imag))
+}
+
+/// `complexobject.c _Py_c_pow`.
+unsafe fn complex_pow(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+    let (ar, ai) = complex_val(a).unwrap();
+    let (br, bi) = complex_val(b).unwrap();
+    let (real, imag) = if br == 0.0 && bi == 0.0 {
+        (1.0, 0.0)
+    } else if ar == 0.0 && ai == 0.0 {
+        if bi != 0.0 || br < 0.0 {
+            return Err(PyError::zero_division(
+                "0.0 to a negative or complex power",
+            ));
+        }
+        (0.0, 0.0)
+    } else {
+        let vabs = ar.hypot(ai);
+        let mut len = vabs.powf(br);
+        let at = ai.atan2(ar);
+        let mut phase = at * br;
+        if bi != 0.0 {
+            len /= (at * bi).exp();
+            phase += bi * vabs.ln();
+        }
+        (len * phase.cos(), len * phase.sin())
+    };
+    Ok(w_complex_new(real, imag))
+}
+
+unsafe fn complex_neg(a: PyObjectRef) -> PyResult {
+    let (ar, ai) = complex_val(a).unwrap();
+    Ok(w_complex_new(-ar, -ai))
+}
+
+/// `abs(complex)` → the float magnitude `hypot(real, imag)`.
+unsafe fn complex_abs(a: PyObjectRef) -> PyResult {
+    let (ar, ai) = complex_val(a).unwrap();
+    Ok(w_float_new(ar.hypot(ai)))
+}
+
+/// Complex equality: `==`/`!=` only (no ordering).  Mixed numeric
+/// operands compare equal when the imaginary part is zero.
+unsafe fn complex_richcompare(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
+    let (ar, ai) = complex_val(a).unwrap();
+    let (br, bi) = complex_val(b).unwrap();
+    match op {
+        CompareOp::Eq => Ok(w_bool_from(ar == br && ai == bi)),
+        CompareOp::Ne => Ok(w_bool_from(ar != br || ai != bi)),
+        _ => Err(PyError::type_error(
+            "'<' not supported between instances of 'complex' and 'complex'",
+        )),
+    }
+}
+
+/// `complexobject.c complex_hash` — `hash(real) + _PyHASH_IMAG * hash(imag)`.
+pub(crate) fn complex_hash(real: f64, imag: f64) -> i64 {
+    let hr = crate::builtins::_hash_float(real);
+    let hi = crate::builtins::_hash_float(imag);
+    let combined = hr.wrapping_add(hi.wrapping_mul(HASH_IMAG));
+    if combined == -1 { -2 } else { combined }
+}
+
 // ── Public dispatch API ───────────────────────────────────────────────
 
 /// Try to call a dunder method on an instance for binary ops.
@@ -1168,6 +1291,9 @@ pub fn add(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         if is_float_pair(a, b) {
             return float_add(a, b);
         }
+        if is_complex_pair(a, b) {
+            return complex_add(a, b);
+        }
         if is_str(a) && is_str(b) {
             // descroperation.py:664 "unicode + string subclass" — a str
             // subclass overriding `__add__`/`__radd__` must reach the
@@ -1261,6 +1387,9 @@ pub fn sub(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         if is_float_pair(a, b) {
             return float_sub(a, b);
         }
+        if is_complex_pair(a, b) {
+            return complex_sub(a, b);
+        }
         // set / frozenset difference — PyPy: setobject.py W_BaseSetObject.descr_sub.
         // descr_sub returns NotImplemented for a non-set rhs, so `-` requires
         // both operands to be sets (the `difference` method takes iterables).
@@ -1313,6 +1442,9 @@ pub fn mul(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         }
         if is_float_pair(a, b) {
             return float_mul(a, b);
+        }
+        if is_complex_pair(a, b) {
+            return complex_mul(a, b);
         }
         if is_str(a) && is_int_or_long(b) {
             return str_repeat(a, b);
@@ -1504,6 +1636,9 @@ pub fn truediv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
             }
             return Ok(w_float_new(as_float(a) / as_float(b)));
         }
+        if is_complex_pair(a, b) {
+            return complex_truediv(a, b);
+        }
         if let Some(result) = try_dispatch_binary_special(a, b, "__truediv__", "__rtruediv__")? {
             return Ok(result);
         }
@@ -1537,6 +1672,9 @@ pub fn pow(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         }
         if is_float_pair(a, b) {
             return float_pow_impl(as_float(a), as_float(b));
+        }
+        if is_complex_pair(a, b) {
+            return complex_pow(a, b);
         }
         if let Some(result) = try_dispatch_binary_special(a, b, "__pow__", "__rpow__")? {
             return Ok(result);
@@ -1579,6 +1717,9 @@ pub(crate) fn add_builtin(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         if is_float_pair(a, b) {
             return float_add(a, b);
         }
+        if is_complex_pair(a, b) {
+            return complex_add(a, b);
+        }
         Ok(w_not_implemented())
     }
 }
@@ -1596,6 +1737,9 @@ pub(crate) fn sub_builtin(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         if is_float_pair(a, b) {
             return float_sub(a, b);
         }
+        if is_complex_pair(a, b) {
+            return complex_sub(a, b);
+        }
         Ok(w_not_implemented())
     }
 }
@@ -1612,6 +1756,9 @@ pub(crate) fn mul_builtin(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         }
         if is_float_pair(a, b) {
             return float_mul(a, b);
+        }
+        if is_complex_pair(a, b) {
+            return complex_mul(a, b);
         }
         Ok(w_not_implemented())
     }
@@ -1635,6 +1782,9 @@ pub(crate) fn truediv_builtin(a: PyObjectRef, b: PyObjectRef) -> PyResult {
                 return Ok(w_float_new(r));
             }
             return Ok(w_float_new(as_float(a) / as_float(b)));
+        }
+        if is_complex_pair(a, b) {
+            return complex_truediv(a, b);
         }
         Ok(w_not_implemented())
     }
@@ -1686,6 +1836,9 @@ pub(crate) fn pow_builtin(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         }
         if is_float_pair(a, b) {
             return float_pow_impl(as_float(a), as_float(b));
+        }
+        if is_complex_pair(a, b) {
+            return complex_pow(a, b);
         }
         Ok(w_not_implemented())
     }
@@ -2537,6 +2690,9 @@ pub fn compare_slot(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
                 CompareOp::Ne => float_ne(a, b),
             };
         }
+        if is_complex_pair(a, b) {
+            return complex_richcompare(a, b, op);
+        }
         if is_str(a) && is_str(b) {
             // Compare the WTF-8 bytes: for surrogate-free strings this is the
             // UTF-8 byte order (= code point order), and WTF-8 keeps lone
@@ -2853,6 +3009,10 @@ pub fn pos(a: PyObjectRef) -> PyResult {
         if is_float(a) {
             return Ok(w_float_new(w_float_get_value(a)));
         }
+        if is_complex(a) {
+            let (ar, ai) = complex_val(a).unwrap();
+            return Ok(w_complex_new(ar, ai));
+        }
         if let Some(result) = try_instance_unaryop(a, "__pos__") {
             return result;
         }
@@ -2888,6 +3048,9 @@ pub fn neg(a: PyObjectRef) -> PyResult {
         }
         if is_float(a) {
             return Ok(w_float_new(-w_float_get_value(a)));
+        }
+        if is_complex(a) {
+            return complex_neg(a);
         }
         // Instance __neg__
         if let Some(result) = try_instance_unaryop(a, "__neg__") {

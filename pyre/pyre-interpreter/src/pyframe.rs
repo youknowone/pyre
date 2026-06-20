@@ -2692,11 +2692,7 @@ fn pyobject_from_constant(constant: &crate::bytecode::ConstantData) -> PyObjectR
             pyre_object::w_frozenset_from_items(&items)
         }
         ConstantData::Complex { value } => {
-            if value.im == 0.0 {
-                pyre_object::floatobject::w_float_new(value.re)
-            } else {
-                panic!("complex literals with nonzero imaginary part not yet supported");
-            }
+            pyre_object::complexobject::w_complex_new(value.re, value.im)
         }
     }
 }

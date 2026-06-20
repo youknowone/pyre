@@ -292,6 +292,17 @@ pub fn init_typeobjects() {
             ) as usize,
         );
 
+        // complex — complexobject.c, bases=(object,)
+        reg.insert(
+            &pyre_object::COMPLEX_TYPE as *const PyType as usize,
+            new_typeobject_with_base_and_layout(
+                "complex",
+                init_complex_type,
+                object_type,
+                &pyre_object::COMPLEX_TYPE as *const PyType,
+            ) as usize,
+        );
+
         // bool — boolobject.py, bases=(int,)
         // Layout = BOOL_TYPE (not INT_TYPE: different struct size).
         // boolobject.py:110 W_BoolObject.typedef.acceptable_as_base_class = False
@@ -1182,6 +1193,34 @@ fn float_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
     // on it don't clobber the value-cached singleton.
     let float_val = unsafe { pyre_object::w_float_get_value(value) };
     let obj = pyre_object::w_float_new(float_val);
+    unsafe {
+        (*obj).w_class = cls;
+    }
+    Ok(obj)
+}
+
+fn complex_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let cls = if args.is_empty() {
+        pyre_object::PY_NULL
+    } else {
+        args[0]
+    };
+    let value = crate::builtins::builtin_complex(&args[1..])?;
+    if cls.is_null() || !unsafe { pyre_object::is_type(cls) } {
+        return Ok(value);
+    }
+    let complex_typeobj = gettypefor(&pyre_object::COMPLEX_TYPE);
+    if complex_typeobj.map_or(false, |t| std::ptr::eq(cls, t)) {
+        return Ok(value);
+    }
+    // Subclass path — retag a fresh W_ComplexObject with the subclass.
+    let (re, im) = unsafe {
+        (
+            pyre_object::w_complex_get_real(value),
+            pyre_object::w_complex_get_imag(value),
+        )
+    };
+    let obj = pyre_object::w_complex_new(re, im);
     unsafe {
         (*obj).w_class = cls;
     }
@@ -6825,6 +6864,36 @@ macro_rules! float_binop_rev {
         }
     };
 }
+fn complex_binop_operand(b: PyObjectRef) -> bool {
+    unsafe {
+        pyre_object::is_complex(b)
+            || pyre_object::is_float(b)
+            || pyre_object::pyobject::is_int_or_long(b)
+            || pyre_object::is_bool(b)
+    }
+}
+macro_rules! complex_binop_fwd {
+    ($name:ident, $op:path) => {
+        fn $name(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+            if complex_binop_operand(args[1]) {
+                $op(args[0], args[1])
+            } else {
+                Ok(pyre_object::w_not_implemented())
+            }
+        }
+    };
+}
+macro_rules! complex_binop_rev {
+    ($name:ident, $op:path) => {
+        fn $name(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+            if complex_binop_operand(args[1]) {
+                $op(args[1], args[0])
+            } else {
+                Ok(pyre_object::w_not_implemented())
+            }
+        }
+    };
+}
 
 int_binop_fwd!(int_dunder_add, crate::objspace::descroperation::add_builtin);
 int_binop_rev!(
@@ -6991,6 +7060,47 @@ float_binop_rev!(
     crate::objspace::descroperation::pow_builtin
 );
 
+complex_binop_fwd!(
+    complex_dunder_add,
+    crate::objspace::descroperation::add_builtin
+);
+complex_binop_rev!(
+    complex_dunder_radd,
+    crate::objspace::descroperation::add_builtin
+);
+complex_binop_fwd!(
+    complex_dunder_sub,
+    crate::objspace::descroperation::sub_builtin
+);
+complex_binop_rev!(
+    complex_dunder_rsub,
+    crate::objspace::descroperation::sub_builtin
+);
+complex_binop_fwd!(
+    complex_dunder_mul,
+    crate::objspace::descroperation::mul_builtin
+);
+complex_binop_rev!(
+    complex_dunder_rmul,
+    crate::objspace::descroperation::mul_builtin
+);
+complex_binop_fwd!(
+    complex_dunder_truediv,
+    crate::objspace::descroperation::truediv_builtin
+);
+complex_binop_rev!(
+    complex_dunder_rtruediv,
+    crate::objspace::descroperation::truediv_builtin
+);
+complex_binop_fwd!(
+    complex_dunder_pow,
+    crate::objspace::descroperation::pow_builtin
+);
+complex_binop_rev!(
+    complex_dunder_rpow,
+    crate::objspace::descroperation::pow_builtin
+);
+
 // Rich comparison dunders (`__eq__` / `__ne__` / `__lt__` / `__le__` /
 // `__gt__` / `__ge__`).  Each built-in numeric / sequence type only
 // compares against operands of an accepted type and returns
@@ -7005,6 +7115,9 @@ fn cmp_guard_int(b: PyObjectRef) -> bool {
 }
 fn cmp_guard_float(b: PyObjectRef) -> bool {
     unsafe { pyre_object::pyobject::is_float(b) || pyre_object::pyobject::is_int_or_long(b) }
+}
+fn cmp_guard_complex(b: PyObjectRef) -> bool {
+    complex_binop_operand(b)
 }
 fn cmp_guard_str(b: PyObjectRef) -> bool {
     unsafe { pyre_object::is_str(b) }
@@ -7066,6 +7179,15 @@ cmp_dunder_set!(
     float_dunder_gt,
     float_dunder_ge,
     cmp_guard_float
+);
+cmp_dunder_set!(
+    complex_dunder_eq,
+    complex_dunder_ne,
+    complex_dunder_lt,
+    complex_dunder_le,
+    complex_dunder_gt,
+    complex_dunder_ge,
+    cmp_guard_complex
 );
 cmp_dunder_set!(
     str_dunder_eq,
@@ -7492,6 +7614,248 @@ fn init_int_type(ns: &mut DictStorage) {
         ),
     );
 }
+/// Format one component of a complex repr: shortest float repr without
+/// the trailing `.0` that `float.__repr__` appends.
+fn complex_part_repr(val: f64) -> String {
+    if val.is_nan() {
+        return "nan".to_string();
+    }
+    if val.is_infinite() {
+        return if val < 0.0 {
+            "-inf".to_string()
+        } else {
+            "inf".to_string()
+        };
+    }
+    let s = crate::display::format_float_repr(val);
+    s.strip_suffix(".0")
+        .map(str::to_string)
+        .unwrap_or(s)
+}
+
+/// `complexobject.c complex_repr` — `Xj` for a pure-`+0` real part, else
+/// `(re±imj)`.
+pub(crate) fn complex_repr_string(re: f64, im: f64) -> String {
+    if re == 0.0 && re.is_sign_positive() {
+        format!("{}j", complex_part_repr(im))
+    } else {
+        let sign = if im >= 0.0 || im.is_nan() { "+" } else { "-" };
+        format!(
+            "({}{}{}j)",
+            complex_part_repr(re),
+            sign,
+            complex_part_repr(im.abs())
+        )
+    }
+}
+
+fn init_complex_type(ns: &mut DictStorage) {
+    dict_storage_store(ns, "__new__", make_new_descr(complex_descr_new));
+    let repr = |args: &[PyObjectRef]| {
+        let (re, im) = unsafe {
+            (
+                pyre_object::w_complex_get_real(args[0]),
+                pyre_object::w_complex_get_imag(args[0]),
+            )
+        };
+        Ok(pyre_object::w_str_new(&complex_repr_string(re, im)))
+    };
+    dict_storage_store(
+        ns,
+        "__repr__",
+        make_builtin_function_with_arity("__repr__", repr, 1),
+    );
+    dict_storage_store(
+        ns,
+        "__str__",
+        make_builtin_function_with_arity("__str__", repr, 1),
+    );
+    dict_storage_store(
+        ns,
+        "__hash__",
+        make_builtin_function_with_arity(
+            "__hash__",
+            |args| {
+                let (re, im) = unsafe {
+                    (
+                        pyre_object::w_complex_get_real(args[0]),
+                        pyre_object::w_complex_get_imag(args[0]),
+                    )
+                };
+                Ok(pyre_object::w_int_new(
+                    crate::objspace::descroperation::complex_hash(re, im),
+                ))
+            },
+            1,
+        ),
+    );
+    dict_storage_store(
+        ns,
+        "__bool__",
+        make_builtin_function_with_arity(
+            "__bool__",
+            |args| {
+                let (re, im) = unsafe {
+                    (
+                        pyre_object::w_complex_get_real(args[0]),
+                        pyre_object::w_complex_get_imag(args[0]),
+                    )
+                };
+                Ok(pyre_object::w_bool_from(re != 0.0 || im != 0.0))
+            },
+            1,
+        ),
+    );
+    dict_storage_store(
+        ns,
+        "__abs__",
+        make_builtin_function_with_arity(
+            "__abs__",
+            |args| {
+                let (re, im) = unsafe {
+                    (
+                        pyre_object::w_complex_get_real(args[0]),
+                        pyre_object::w_complex_get_imag(args[0]),
+                    )
+                };
+                Ok(pyre_object::w_float_new(re.hypot(im)))
+            },
+            1,
+        ),
+    );
+    dict_storage_store(
+        ns,
+        "__neg__",
+        make_builtin_function_with_arity(
+            "__neg__",
+            |args| crate::objspace::descroperation::neg(args[0]),
+            1,
+        ),
+    );
+    dict_storage_store(
+        ns,
+        "__pos__",
+        make_builtin_function_with_arity(
+            "__pos__",
+            |args| crate::objspace::descroperation::pos(args[0]),
+            1,
+        ),
+    );
+    dict_storage_store(
+        ns,
+        "__complex__",
+        make_builtin_function_with_arity(
+            "__complex__",
+            |args| {
+                // Return a plain `complex` with the same components.
+                let (re, im) = unsafe {
+                    (
+                        pyre_object::w_complex_get_real(args[0]),
+                        pyre_object::w_complex_get_imag(args[0]),
+                    )
+                };
+                Ok(pyre_object::w_complex_new(re, im))
+            },
+            1,
+        ),
+    );
+    dict_storage_store(
+        ns,
+        "conjugate",
+        make_builtin_function_with_arity(
+            "conjugate",
+            |args| {
+                let (re, im) = unsafe {
+                    (
+                        pyre_object::w_complex_get_real(args[0]),
+                        pyre_object::w_complex_get_imag(args[0]),
+                    )
+                };
+                Ok(pyre_object::w_complex_new(re, -im))
+            },
+            1,
+        ),
+    );
+    dict_storage_store(
+        ns,
+        "__getnewargs__",
+        make_builtin_function_with_arity(
+            "__getnewargs__",
+            |args| {
+                let (re, im) = unsafe {
+                    (
+                        pyre_object::w_complex_get_real(args[0]),
+                        pyre_object::w_complex_get_imag(args[0]),
+                    )
+                };
+                Ok(pyre_object::w_tuple_new(vec![
+                    pyre_object::w_complex_new(re, im),
+                ]))
+            },
+            1,
+        ),
+    );
+    // complex.real / complex.imag — read-only float components.
+    dict_storage_store(
+        ns,
+        "real",
+        pyre_object::w_property_new(
+            make_builtin_function_with_arity(
+                "real",
+                |args| {
+                    Ok(pyre_object::w_float_new(unsafe {
+                        pyre_object::w_complex_get_real(args[0])
+                    }))
+                },
+                1,
+            ),
+            pyre_object::PY_NULL,
+            pyre_object::PY_NULL,
+        ),
+    );
+    dict_storage_store(
+        ns,
+        "imag",
+        pyre_object::w_property_new(
+            make_builtin_function_with_arity(
+                "imag",
+                |args| {
+                    Ok(pyre_object::w_float_new(unsafe {
+                        pyre_object::w_complex_get_imag(args[0])
+                    }))
+                },
+                1,
+            ),
+            pyre_object::PY_NULL,
+            pyre_object::PY_NULL,
+        ),
+    );
+    for (name, func) in [
+        ("__add__", complex_dunder_add as DunderFn),
+        ("__radd__", complex_dunder_radd),
+        ("__sub__", complex_dunder_sub),
+        ("__rsub__", complex_dunder_rsub),
+        ("__mul__", complex_dunder_mul),
+        ("__rmul__", complex_dunder_rmul),
+        ("__truediv__", complex_dunder_truediv),
+        ("__rtruediv__", complex_dunder_rtruediv),
+        ("__pow__", complex_dunder_pow),
+        ("__rpow__", complex_dunder_rpow),
+    ] {
+        dict_storage_store(ns, name, make_builtin_function_with_arity(name, func, 2));
+    }
+    for (name, func) in [
+        ("__eq__", complex_dunder_eq as DunderFn),
+        ("__ne__", complex_dunder_ne),
+        ("__lt__", complex_dunder_lt),
+        ("__le__", complex_dunder_le),
+        ("__gt__", complex_dunder_gt),
+        ("__ge__", complex_dunder_ge),
+    ] {
+        dict_storage_store(ns, name, make_builtin_function_with_arity(name, func, 2));
+    }
+}
+
 fn init_float_type(ns: &mut DictStorage) {
     dict_storage_store(ns, "__new__", make_new_descr(float_descr_new));
     // float.__getformat__(kind) → returns the format string for the
