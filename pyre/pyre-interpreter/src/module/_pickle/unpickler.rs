@@ -264,7 +264,9 @@ impl W_Unpickler {
                     return Err(PyError::type_error("memo key must be integers"));
                 }
                 if crate::baseobjspace::int_w(*k)? < 0 {
-                    return Err(PyError::value_error("memo key must be positive integers."));
+                    return Err(PyError::value_error(
+                        "memo key must be non-negative integers",
+                    ));
                 }
             }
             let empty = pyre_object::dictmultiobject::w_dict_new();

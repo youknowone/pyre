@@ -1580,9 +1580,9 @@ fn seq_iter_reduce_method(args: &[PyObjectRef]) -> PyResult {
 /// `list_iterator.__setstate__(index)` — clamp the cursor into
 /// `[0, length]` (`iterobject.py descr_setstate`).
 fn seq_iter_setstate_method(args: &[PyObjectRef]) -> PyResult {
+    let mut index = int_w(args[1])?;
     unsafe {
         let length = pyre_object::w_seq_iter_length(args[0]);
-        let mut index = w_int_get_value(args[1]);
         if index < 0 {
             index = 0;
         } else if index > length {
@@ -1746,8 +1746,8 @@ fn reversed_reduce_method(args: &[PyObjectRef]) -> PyResult {
 /// descr___setstate__`: set `remaining` then clamp into `[-1, n-1]`
 /// (`n == len(sequence)`, or 0 once exhausted).
 fn reversed_setstate_method(args: &[PyObjectRef]) -> PyResult {
+    let mut remaining = int_w(args[1])?;
     unsafe {
-        let mut remaining = w_int_get_value(args[1]);
         let seq = pyre_object::reversedobject::w_reversed_get_sequence(args[0]);
         let n = if !seq.is_null() { len_w(seq)? } else { 0 };
         if remaining < -1 {
@@ -1832,20 +1832,25 @@ unsafe fn pull_iterator_tuple(
     if n == 0 {
         return Ok(None);
     }
-    let mut items: Vec<PyObjectRef> = Vec::with_capacity(n);
+    // Each pulled value must survive the `next()` calls on the later iterators:
+    // those allocate and can relocate the young objects already pulled, leaving
+    // a stale pointer in a plain `Vec`. Pin each value into the shadow stack as
+    // it is produced, then re-read the set at its (possibly relocated) address
+    // before returning.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::shadow_stack_len();
     for i in 0..n {
         let it = pyre_object::w_list_getitem(w_iterators, i as i64).unwrap();
         match next(it) {
-            Ok(v) => items.push(v),
+            Ok(v) => pyre_object::gc_roots::pin_root(v),
             Err(e) if e.kind == PyErrorKind::StopIteration => {
                 if !strict {
                     return Ok(None);
                 }
                 // A StopIteration in strict mode is a length mismatch.
-                // `items.len()` iterators yielded before this one ran dry.
-                let progress = items.len();
-                if progress > 0 {
-                    return Err(strict_zip_error(func_name, progress, "shorter"));
+                // `i` iterators yielded before this one ran dry.
+                if i > 0 {
+                    return Err(strict_zip_error(func_name, i, "shorter"));
                 }
                 if n == 1 {
                     // A single iterable can never mismatch.
@@ -1879,6 +1884,9 @@ unsafe fn pull_iterator_tuple(
             Err(e) => return Err(e),
         }
     }
+    let items: Vec<PyObjectRef> = (0..n)
+        .map(|k| pyre_object::gc_roots::shadow_stack_get(base + k))
+        .collect();
     Ok(Some(items))
 }
 

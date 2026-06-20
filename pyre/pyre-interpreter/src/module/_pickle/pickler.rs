@@ -153,8 +153,18 @@ impl Framer {
         if let Some(slot) = self.file_slot {
             if !self.pending.is_empty() {
                 let w_bytes = pyre_object::w_bytes_from_bytes(&self.pending);
+                // `call_meth` resolves `write` via getattr, which allocates a
+                // bound method and can relocate the freshly-built `w_bytes`;
+                // pin it and pass the re-read root (`w_file` is pinned at `slot`).
+                let _roots = pyre_object::gc_roots::push_roots();
+                pyre_object::gc_roots::pin_root(w_bytes);
+                let bytes_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
                 let w_file = pyre_object::gc_roots::shadow_stack_get(slot);
-                call_meth(w_file, "write", &[w_bytes])?;
+                call_meth(
+                    w_file,
+                    "write",
+                    &[pyre_object::gc_roots::shadow_stack_get(bytes_slot)],
+                )?;
                 self.pending.clear();
             }
         }
@@ -206,8 +216,17 @@ impl Framer {
             Some(slot) => {
                 self.flush()?;
                 let w_payload = pyre_object::w_bytes_from_bytes(&owned);
+                // Pin the freshly-built payload across `call_meth`'s `write`
+                // getattr (which can allocate and relocate it).
+                let _roots = pyre_object::gc_roots::push_roots();
+                pyre_object::gc_roots::pin_root(w_payload);
+                let payload_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
                 let w_file = pyre_object::gc_roots::shadow_stack_get(slot);
-                call_meth(w_file, "write", &[w_payload])?;
+                call_meth(
+                    w_file,
+                    "write",
+                    &[pyre_object::gc_roots::shadow_stack_get(payload_slot)],
+                )?;
             }
             None => self.pending.extend_from_slice(&owned),
         }
