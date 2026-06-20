@@ -5224,6 +5224,16 @@ fn init_type_type(ns: &mut DictStorage) {
     });
     dict_storage_store(ns, "mro", mro_method);
 
+    // typeobject.py:1269-1272 descr___subclasses__ — return the list of
+    // immediate subclasses recorded in `weak_subclasses` (dead weakrefs
+    // filtered out by `w_type_get_subclasses`).
+    let subclasses_method = make_builtin_function("__subclasses__", |args| {
+        let cls = args[0];
+        let subs = unsafe { pyre_object::w_type_get_subclasses(cls) };
+        Ok(pyre_object::w_list_new(subs))
+    });
+    dict_storage_store(ns, "__subclasses__", subclasses_method);
+
     // `pypy/objspace/std/typeobject.py:614-624 get_module` /
     // `:1241-1247 descr_get__module` / `descr_set__module`.
     // For heaptype (user-defined classes) the value is read from /
