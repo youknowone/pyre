@@ -3778,6 +3778,10 @@ fn register_helper_fn_pointers(
         cpu.unpack_sequence_fn as *const (),
         CallFlavor::MayForce,
     );
+    // `bh_unpack_item_fn` only ever indexes the validated tuple that
+    // `bh_unpack_sequence_fn` returned (a real `W_TupleObject`), so
+    // `sequence_getitem` takes the tuple fast path and never re-enters
+    // Python: can raise, no virtual-force → `CallFlavor::Plain`.
     let unpack_item_fn = bind(
         assembler,
         cpu.unpack_item_fn as *const (),
