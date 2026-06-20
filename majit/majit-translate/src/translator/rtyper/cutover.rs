@@ -1937,7 +1937,26 @@ fn run_two_phase_prepass_inner(
                     },
                 );
             }
-            Ok(Err(_)) | Err(_) => {
+            ref other @ (Ok(Err(_)) | Err(_)) => {
+                // De-aggregating census (PYRE_RTYPER_VERBOSE): the dual-gate
+                // otherwise lumps every Phase-A failure under one opaque
+                // "subject not annotated/rtyped" Skip. Surface the per-graph
+                // reason so the onion can be triaged.
+                if std::env::var("PYRE_RTYPER_VERBOSE").is_ok() {
+                    let reason = match other {
+                        Ok(Err(e)) => format!("annotate Err: {e:?}"),
+                        Err(p) => {
+                            let msg = p
+                                .downcast_ref::<String>()
+                                .cloned()
+                                .or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string()))
+                                .unwrap_or_else(|| "<non-string panic>".to_string());
+                            format!("annotate PANIC: {msg}")
+                        }
+                        Ok(Ok(_)) => unreachable!(),
+                    };
+                    eprintln!("[PREPASS phaseA fail] {:?}: {reason}", path);
+                }
                 // Annotate-half failed (or panicked): repair shared-callee state
                 // and leave the graph uncached so publish Skips it to the legacy
                 // walker. unpoison is itself contained — a panic here must not
@@ -2024,7 +2043,25 @@ fn run_phase_b_rtype_isolated(
             }));
             match res {
                 Ok(Ok(())) => rtyper.mark_already_seen(&block),
-                Ok(Err(_)) | Err(_) => {
+                ref other @ (Ok(Err(_)) | Err(_)) => {
+                    if std::env::var("PYRE_RTYPER_VERBOSE").is_ok() {
+                        let reason = match other {
+                            Ok(Err(e)) => format!("rtype Err: {e:?}"),
+                            Err(p) => {
+                                let msg = p
+                                    .downcast_ref::<String>()
+                                    .cloned()
+                                    .or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string()))
+                                    .unwrap_or_else(|| "<non-string panic>".to_string());
+                                format!("rtype PANIC: {msg}")
+                            }
+                            Ok(Ok(())) => unreachable!(),
+                        };
+                        eprintln!(
+                            "[PREPASS phaseB fail] {:?}: {reason}",
+                            gopt.as_ref().map(GraphKey::of)
+                        );
+                    }
                     match &gopt {
                         Some(g) => {
                             // Skip this graph; the pending recompute excludes

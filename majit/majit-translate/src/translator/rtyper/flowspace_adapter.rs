@@ -1346,9 +1346,7 @@ pub fn translate_op(
                         }
                         let mut iter = arg_hls.into_iter();
                         let arg = iter.next().ok_or_else(|| {
-                            TyperError::message(
-                                "len operation requires a receiver arg".to_string(),
-                            )
+                            TyperError::message("len operation requires a receiver arg".to_string())
                         })?;
                         return Ok(vec![FlowspaceOp::new("len", vec![arg], result)]);
                     }

@@ -4269,8 +4269,7 @@ impl<'a> Lowering<'a> {
                 // lowers to `StringRepr.rtype_len` → `ll_strlen` → the
                 // `strlen` blackhole op; the `eq` of the two `Signed`
                 // operands lowers to `int_eq`.
-                if args.len() == 1
-                    && fmt_path_ends_with(&segments, &["str", "<Impl>", "is_empty"])
+                if args.len() == 1 && fmt_path_ends_with(&segments, &["str", "<Impl>", "is_empty"])
                 {
                     let push_op = |graph: &mut FunctionGraph, kind: OpKind| {
                         let res =
@@ -10665,9 +10664,8 @@ mod tests {
         let nd0_p = Variable::new();
         let nd1_p = Variable::new();
         graph.block_mut(bp).inputargs = vec![nd0_p.clone(), nd1_p.clone()];
-        graph.block_mut(b1).exits = vec![
-            Link::from_variables(&graph, vec![nd0_in, nd1], bp, None).with_prevblock(b1),
-        ];
+        graph.block_mut(b1).exits =
+            vec![Link::from_variables(&graph, vec![nd0_in, nd1], bp, None).with_prevblock(b1)];
 
         // ── Bp: args array, pieces array, Arguments::new ──
         let args_arr = Variable::new();
@@ -10733,9 +10731,8 @@ mod tests {
         });
         let fmt_args_in = Variable::new();
         graph.block_mut(bf).inputargs = vec![fmt_args_in.clone()];
-        graph.block_mut(bp).exits = vec![
-            Link::from_variables(&graph, vec![fmt_args.clone()], bf, None).with_prevblock(bp),
-        ];
+        graph.block_mut(bp).exits =
+            vec![Link::from_variables(&graph, vec![fmt_args.clone()], bf, None).with_prevblock(bp)];
 
         // ── Bf: alloc::fmt::format(args) → String ──
         let formatted = Variable::new();
@@ -10809,9 +10806,16 @@ mod tests {
             .iter()
             .filter(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "add"))
             .count();
-        assert!(add_count >= 2, "Bp must fold both rendered args, got {add_count} adds");
+        assert!(
+            add_count >= 2,
+            "Bp must fold both rendered args, got {add_count} adds"
+        );
         let bp_exit_val = bp_block.exits[0].args[0].as_variable().unwrap().id();
-        assert_ne!(bp_exit_val, fmt_args.id(), "Bp must forward the folded String, not Arguments");
+        assert_ne!(
+            bp_exit_val,
+            fmt_args.id(),
+            "Bp must forward the folded String, not Arguments"
+        );
     }
 
     #[test]
