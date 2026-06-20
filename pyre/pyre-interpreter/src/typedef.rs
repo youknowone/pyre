@@ -5228,7 +5228,18 @@ fn init_type_type(ns: &mut DictStorage) {
     // immediate subclasses recorded in `weak_subclasses` (dead weakrefs
     // filtered out by `w_type_get_subclasses`).
     let subclasses_method = make_builtin_function("__subclasses__", |args| {
-        let cls = args[0];
+        // `type.__subclasses__` resolves unbound when read off `type` itself
+        // (it lives in `type`'s own dict, so it is not bound to a metatype
+        // instance); calling it without the class argument is the
+        // "unbound method ... needs an argument" TypeError, not a crash.
+        let cls = match args.first() {
+            Some(&c) if unsafe { pyre_object::is_type(c) } => c,
+            _ => {
+                return Err(crate::PyError::type_error(
+                    "unbound method type.__subclasses__() needs an argument",
+                ));
+            }
+        };
         let subs = unsafe { pyre_object::w_type_get_subclasses(cls) };
         Ok(pyre_object::w_list_new(subs))
     });
