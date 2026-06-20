@@ -394,6 +394,15 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_object::w_type_set_uses_object_setattr",
         crate::opcode_ops::bh_w_type_set_uses_object_setattr as *const (),
     );
+    // `lookup_exc_class_for_kind` reads the TLS `EXC_CLASS_BY_KIND`
+    // registry the tracer cannot model; its residual call rides a C-ABI
+    // bridge that reconstructs the `ExcKind` from the integer arg slot.
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::excobject::lookup_exc_class_for_kind",
+        "pyre_object::lookup_exc_class_for_kind",
+        crate::opcode_ops::bh_lookup_exc_class_for_kind as *const (),
+    );
 
     for (nargs, (module_path, root_path)) in CALLABLE_HELPER_PATHS.iter().enumerate() {
         if let Some(fnptr) = crate::runtime_ops::callable_call_helper(nargs) {

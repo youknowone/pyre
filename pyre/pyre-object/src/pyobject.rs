@@ -178,6 +178,12 @@ const _: () = {
     assert!(std::mem::size_of::<AtomicPtr<PyObject>>() == std::mem::size_of::<*mut PyObject>());
     assert!(std::mem::offset_of!(PyType, subclassrange_min) == 0);
     assert!(std::mem::offset_of!(PyType, subclassrange_max) == 8);
+    // `name: &'static str` is a fat pointer (ptr + len = 16 bytes),
+    // placing `instantiate` at offset 32. The JIT reads this slot at a
+    // raw offset via the exact Charon struct layout; the heuristic
+    // fallback sizes `&str` as 8 bytes and would compute offset 24 — a
+    // silent miscompile. This assert pins the true offset.
+    assert!(std::mem::offset_of!(PyType, instantiate) == 32);
 };
 
 pub static INT_TYPE: PyType = new_pytype("int");
@@ -210,6 +216,11 @@ pub const SUBCLASSRANGE_MIN_OFFSET: usize = std::mem::offset_of!(PyType, subclas
 /// Field offset of `subclassrange_max` within PyType (OBJECT_VTABLE).
 /// rclass.py:169 — second field in OBJECT_VTABLE.
 pub const SUBCLASSRANGE_MAX_OFFSET: usize = std::mem::offset_of!(PyType, subclassrange_max);
+
+/// Field offset of `instantiate` within PyType (OBJECT_VTABLE).
+/// rclass.py:172 — `('instantiate', Ptr(FuncType([], OBJECTPTR)))`.
+/// Equals 32: `name` is a 16-byte fat pointer, not the 8-byte heuristic.
+pub const INSTANTIATE_OFFSET: usize = std::mem::offset_of!(PyType, instantiate);
 
 /// rclass.py:1126-1127 `ll_cast_to_object(obj)`.
 ///

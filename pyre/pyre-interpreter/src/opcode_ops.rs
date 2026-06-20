@@ -443,6 +443,23 @@ pub extern "C" fn bh_w_type_set_uses_object_setattr(obj: i64, v: i64) {
     }
 }
 
+/// C-ABI residual bridge for the `dont_look_inside`
+/// [`pyre_object::excobject::lookup_exc_class_for_kind`]: its `ExcKind`
+/// parameter does not match the integer arg slot a residual call
+/// supplies, so reconstruct it from `i64` here before forwarding. The
+/// `PyObjectRef` result rides back as `i64` (null = not registered).
+#[allow(improper_ctypes_definitions)]
+pub extern "C" fn bh_lookup_exc_class_for_kind(kind_disc: i64) -> i64 {
+    use pyre_object::excobject::{EXC_KIND_COUNT, ExcKind, lookup_exc_class_for_kind};
+    if kind_disc < 0 || kind_disc as usize >= EXC_KIND_COUNT {
+        return 0;
+    }
+    // Safety: bounds-checked above; `ExcKind` is `repr(u8)` with
+    // contiguous discriminants `0..EXC_KIND_COUNT`.
+    let kind: ExcKind = unsafe { std::mem::transmute(kind_disc as u8) };
+    lookup_exc_class_for_kind(kind) as i64
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

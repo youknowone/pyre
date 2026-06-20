@@ -576,6 +576,11 @@ pub fn register_exc_class_for_kind(kind: ExcKind, cls: PyObjectRef) {
     });
 }
 
+/// Reads the thread-local `EXC_CLASS_BY_KIND`, a runtime-mutable root
+/// the tracer cannot type; the JIT residualises the read instead of
+/// tracing into it (`@dont_look_inside`, `rlib/jit.py:139`). The residual
+/// call resolves its address by qualified path in `jit_trace_fnaddrs`.
+#[majit_macros::dont_look_inside]
 pub fn lookup_exc_class_for_kind(kind: ExcKind) -> PyObjectRef {
     EXC_CLASS_BY_KIND.with(|cell| cell.get()[kind as u8 as usize])
 }

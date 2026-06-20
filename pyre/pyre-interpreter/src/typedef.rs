@@ -155,11 +155,18 @@ pub static TYPEOBJECT_CACHE: OnceLock<HashMap<usize, usize>> = OnceLock::new();
 /// Get the cached W_TypeObject for a builtin runtime type.
 ///
 /// PyPy: `space.gettypefor(cls)` / `space.gettypeobject(typedef)`
+///
+/// Reads the per-type `instantiate` slot (`rclass.py:739-743`
+/// `new_instance`), an `AtomicPtr` seeded by `init_typeobjects()`'s
+/// `set_instantiate` loop — the same source that backs
+/// `TYPEOBJECT_CACHE`. The slot read is a single field load the JIT can
+/// model, where the `usize`-keyed `HashMap` lookup is not.
 pub fn gettypefor(tp: *const PyType) -> Option<PyObjectRef> {
-    TYPEOBJECT_CACHE
-        .get()
-        .and_then(|reg| reg.get(&(tp as usize)).copied())
-        .map(|v| v as PyObjectRef)
+    if tp.is_null() {
+        return None;
+    }
+    let w = unsafe { pyre_object::get_instantiate(&*tp) };
+    if w.is_null() { None } else { Some(w) }
 }
 
 /// Get the W_TypeObject for any PyObjectRef.
@@ -191,8 +198,8 @@ pub fn r#type(obj: PyObjectRef) -> Option<PyObjectRef> {
                 return Some(w_class);
             }
             let kind = pyre_object::w_exception_get_kind(obj);
-            let name = pyre_object::excobject::exc_kind_name(kind);
-            if let Some(cls) = crate::builtins::lookup_exc_class(name) {
+            let cls = pyre_object::excobject::lookup_exc_class_for_kind(kind);
+            if !cls.is_null() {
                 return Some(cls);
             }
         }
