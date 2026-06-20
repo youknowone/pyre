@@ -697,15 +697,20 @@ pub fn install_default_builtins(namespace: &mut DictStorage) {
     );
     let value_error = make_exc_type("ValueError", exc_value_error_new, exception);
     crate::dict_storage_store(namespace, "ValueError", value_error);
+    let name_error = make_exc_type_with_init(
+        "NameError",
+        exc_name_error_new,
+        Some(exc_name_error_init),
+        exception,
+    );
+    crate::dict_storage_store(namespace, "NameError", name_error);
+    // `exceptions.c` — `UnboundLocalError(NameError)`.  pyre raises a plain
+    // NameError for unbound locals, but the builtin name must exist for
+    // `except UnboundLocalError` clauses in copyreg / pickle.
     crate::dict_storage_store(
         namespace,
-        "NameError",
-        make_exc_type_with_init(
-            "NameError",
-            exc_name_error_new,
-            Some(exc_name_error_init),
-            exception,
-        ),
+        "UnboundLocalError",
+        make_exc_type("UnboundLocalError", exc_name_error_new, name_error),
     );
 
     let runtime_error = make_exc_type("RuntimeError", exc_runtime_error_new, exception);
@@ -777,6 +782,8 @@ pub fn install_default_builtins(namespace: &mut DictStorage) {
     );
     crate::dict_storage_store(namespace, "OSError", os_error);
     crate::dict_storage_store(namespace, "IOError", os_error);
+    // `exceptions.c` — `EnvironmentError` is a deprecated alias of `OSError`.
+    crate::dict_storage_store(namespace, "EnvironmentError", os_error);
     crate::dict_storage_store(
         namespace,
         "FileNotFoundError",
