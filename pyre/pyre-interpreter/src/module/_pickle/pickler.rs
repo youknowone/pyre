@@ -510,13 +510,17 @@ impl W_Pickler {
                 max_idx = i;
             }
         }
-        let mut slots: Vec<PyObjectRef> = vec![pyre_object::w_none(); (max_idx + 1) as usize];
+        // Gaps in a sparse memo hold `PY_NULL`, not `None`: a `None` slot would
+        // be indistinguishable from a genuinely memoized `None`, which `copy()`
+        // must still expose. `w_list_new_object` keeps the `PY_NULL` holes by
+        // pointer (Object strategy), mirroring the unpickler memo.
+        let mut slots: Vec<PyObjectRef> = vec![pyre_object::PY_NULL; (max_idx + 1) as usize];
         for (_, tup) in &items {
             let idx = unsafe { pyre_object::tupleobject::w_tuple_getitem(*tup, 0) }.unwrap();
             let i = crate::baseobjspace::int_w(idx)? as usize;
             slots[i] = unsafe { pyre_object::tupleobject::w_tuple_getitem(*tup, 1) }.unwrap();
         }
-        let list = pyre_object::listobject::w_list_new(slots);
+        let list = pyre_object::listobject::w_list_new_object(slots);
         let me =
             unsafe { &mut *(pyre_object::gc_roots::shadow_stack_get(self_slot) as *mut W_Pickler) };
         me.w_memo = list;
@@ -572,10 +576,11 @@ mod memo_proxy {
                     )
                 }
                 .unwrap();
-                // Gap slots from a sparse `set_memo` hold the `None` placeholder,
-                // not real memo entries; skip them so `copy()` exposes only the
-                // memoized objects (an id-keyed, gap-free snapshot).
-                if unsafe { pyre_object::is_none(obj) } {
+                // Gap slots from a sparse `set_memo` hold the `PY_NULL`
+                // placeholder, not real memo entries; skip them so `copy()`
+                // exposes only the memoized objects (an id-keyed, gap-free
+                // snapshot) while still surfacing a genuinely memoized `None`.
+                if obj.is_null() {
                     continue;
                 }
                 // `(index, obj)` — `w_tuple_new` pins its inputs across the malloc.
@@ -705,6 +710,11 @@ pub(crate) fn pickle_core(
     let n = unsafe { pyre_object::listobject::w_list_len(w_memo) };
     for i in 0..n {
         let o = unsafe { pyre_object::listobject::w_list_getitem(w_memo, i as i64) }.unwrap();
+        // Gap slots from a sparse `set_memo` hold `PY_NULL`; they are not real
+        // memo entries, so leave them out of the identity index.
+        if o.is_null() {
+            continue;
+        }
         index
             .entry(pyre_object::gc_hook::gc_identity_hash(o as usize))
             .or_default()
