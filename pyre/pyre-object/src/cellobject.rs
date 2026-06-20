@@ -19,18 +19,46 @@ pub struct W_CellObject {
 /// Allocate a new cell wrapping `value`.
 /// Pass `PY_NULL` for an empty cell.
 pub fn w_cell_new(value: PyObjectRef) -> PyObjectRef {
-    // `gct_fv_gc_malloc` bracket pattern (`framework.py:853-856`) for
-    // the `lltype::malloc_typed` call below. `value` is a live
-    // PyObjectRef root that must survive a potential collection inside
-    // the allocation point once the malloc body swaps to a
-    // managed allocator.
+    // `gct_fv_gc_malloc` bracket pattern (`framework.py:853-856`): `value`
+    // is a live GC pointer that must survive — and be relocated by — the
+    // collection the GC malloc below may trigger. `pin_root` records it in
+    // the shadow stack so the moving collector keeps it alive and rewrites
+    // the slot; we read the relocated address back after the malloc.
     let _roots = crate::gc_roots::push_roots();
+    let save_point = crate::gc_roots::shadow_stack_len();
     crate::gc_roots::pin_root(value);
+
+    let header = PyObject {
+        ob_type: &CELL_TYPE as *const PyType,
+        w_class: get_instantiate(&CELL_TYPE),
+    };
+    // Route through the managed allocator like `w_list_new`/`w_tuple_new`.
+    // A cell whose `contents` is reachable only through this cell (e.g. a
+    // closure cellvar) must itself be GC-traced; a `malloc_typed`
+    // (`std::alloc`) cell is invisible to `is_managed_heap_object`, so the
+    // mark-sweep skips it and the only-reachable-via-cell value is swept.
+    let raw = crate::gc_hook::try_gc_alloc_stable(W_CELL_GC_TYPE_ID, W_CELL_OBJECT_SIZE)
+        .filter(|p| !p.is_null());
+    let value = crate::gc_roots::shadow_stack_get(save_point);
+    if let Some(raw) = raw {
+        unsafe {
+            std::ptr::write(
+                raw as *mut W_CellObject,
+                W_CellObject {
+                    ob: header,
+                    contents: value,
+                },
+            );
+        }
+        // The cell lives in old-gen (`try_gc_alloc_stable`); `contents` may
+        // still be a nursery object. Register the cell so the next minor
+        // collection scans it (incminimark.py:1495 write_barrier) and
+        // relocates a young value held only by `contents`.
+        crate::gc_hook::try_gc_write_barrier(raw);
+        return raw as PyObjectRef;
+    }
     W_CellObject::allocate(W_CellObject {
-        ob: PyObject {
-            ob_type: std::ptr::null(),
-            w_class: std::ptr::null_mut(),
-        },
+        ob: header,
         contents: value,
     })
 }
@@ -60,6 +88,11 @@ pub unsafe fn w_cell_get(obj: PyObjectRef) -> PyObjectRef {
 #[inline]
 pub unsafe fn w_cell_set(obj: PyObjectRef, value: PyObjectRef) {
     unsafe { (*(obj as *mut W_CellObject)).contents = value }
+    // The cell is an old-gen (`try_gc_alloc_stable`) object; storing a
+    // possibly-nursery `value` into it needs the incminimark write barrier
+    // (incminimark.py:1495) so the next minor collection scans the cell and
+    // relocates the young value held only by `contents`.
+    crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
 }
 
 #[cfg(test)]
