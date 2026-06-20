@@ -8726,6 +8726,12 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
         if pyre_object::callableiteratorobject::is_callable_iterator(obj) {
             return Ok(obj);
         }
+        // `array.array` — `interp_array.py descr_iter` returns
+        // `space.newseqiter(self)` (a fresh index cursor, not self).
+        if pyre_object::array_object::is_array(obj) {
+            let len = pyre_object::array_object::w_array_len(obj);
+            return Ok(pyre_object::w_seq_iter_new(obj, len));
+        }
         // pypy/objspace/descroperation.py:330-346 `def iter(space, w_obj)`
         // — `space.lookup(w_obj, '__iter__')` is type-MRO-only; PyPy never
         // consults the instance dict for special-method lookup (CPython
@@ -8854,6 +8860,12 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                     n += 1;
                 }
                 found
+            } else if pyre_object::array_object::is_array(seq) {
+                if (idx as usize) < pyre_object::array_object::w_array_len(seq) {
+                    Some(pyre_object::array_object::w_array_unpack_item(seq, idx as usize))
+                } else {
+                    None
+                }
             } else {
                 None
             };

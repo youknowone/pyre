@@ -309,6 +309,17 @@ pub fn init_typeobjects() {
             ) as usize,
         );
 
+        // array.array — interp_array.py, bases=(object,)
+        reg.insert(
+            &pyre_object::array_object::ARRAY_TYPE as *const PyType as usize,
+            new_typeobject_with_base_and_layout(
+                "array.array",
+                crate::module::array::init_array_type,
+                object_type,
+                &pyre_object::array_object::ARRAY_TYPE as *const PyType,
+            ) as usize,
+        );
+
         // bool — boolobject.py, bases=(int,)
         // Layout = BOOL_TYPE (not INT_TYPE: different struct size).
         // boolobject.py:110 W_BoolObject.typedef.acceptable_as_base_class = False
@@ -11279,6 +11290,9 @@ fn bytes_descr_new_impl(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
         if pyre_object::bytesobject::is_bytes_like(arg) {
             let data = pyre_object::bytesobject::bytes_like_data(arg);
             return Ok(new_bytes_like(args[0], data));
+        }
+        if let Some(data) = crate::builtins::memoryview_as_bytes(arg) {
+            return Ok(new_bytes_like(args[0], &data));
         }
     }
     // Iterable of ints — pypy/objspace/std/bytesobject.py _from_byte_sequence

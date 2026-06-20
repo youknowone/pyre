@@ -367,6 +367,8 @@ pub unsafe fn py_repr(obj: PyObjectRef) -> Result<String, crate::PyError> {
         }
         let formatted = if let Some(s) = builtin_leaf_repr_string(obj, tp) {
             s
+        } else if pyre_object::array_object::is_array(obj) {
+            crate::module::array::array_repr_string(obj)?
         } else if std::ptr::eq(tp, &pyre_object::pyobject::LIST_TYPE as *const PyType) {
             let Some(_guard) = ReprGuard::enter(obj) else {
                 return Ok("[...]".to_string());

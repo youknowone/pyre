@@ -1824,6 +1824,15 @@ impl IterOpcodeHandler for PyFrame {
                 self.locals_w_mut()[tos] = seq_iter;
                 return Ok(());
             }
+            // array.array → seq_iter cursor (interp_array.py descr_iter
+            // returns space.newseqiter(self)).
+            if pyre_object::array_object::is_array(iter) {
+                let len = pyre_object::array_object::w_array_len(iter);
+                let seq_iter = pyre_object::w_seq_iter_new(iter, len);
+                let tos = self.valuestackdepth - 1;
+                self.locals_w_mut()[tos] = seq_iter;
+                return Ok(());
+            }
             // User-defined __iter__ — PyPy: space.iter → __iter__()
             // Delegates to baseobjspace::iter which handles type MRO
             // and __getitem__ fallback (PyPy: space.iter →

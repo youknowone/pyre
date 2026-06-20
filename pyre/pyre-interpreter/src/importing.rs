@@ -272,10 +272,10 @@ pub fn install_builtin_modules() {
         "_stat",
         "_queue",
         "_zoneinfo",
-        "array",
     ] {
         register_builtin_module(name, empty_module_init);
     }
+    register_builtin_module("array", crate::module::array::init_array_module);
     register_builtin_module("_scproxy", init_scproxy);
     register_builtin_module("_tracemalloc", init_tracemalloc);
     register_builtin_module("_sysconfig", init_sysconfig_stub);

@@ -19,10 +19,24 @@ unsafe fn memoryview_data(
     let itemsize = (pyre_object::w_int_get_value(itemsize_obj) as usize).max(1);
     let data = if pyre_object::bytesobject::is_bytes_like(buf) {
         pyre_object::bytesobject::bytes_like_data(buf).to_vec()
+    } else if pyre_object::array_object::is_array(buf) {
+        pyre_object::array_object::w_array_bytes(buf).to_vec()
     } else {
         Vec::new()
     };
     Ok((data, itemsize, buf))
+}
+
+/// Raw bytes backing a memoryview stub, or `None` when `obj` is not a
+/// memoryview.  `bytes(memoryview)`/`bytearray(memoryview)` copy the
+/// buffer per the buffer protocol rather than iterating element values.
+pub(crate) unsafe fn memoryview_as_bytes(obj: PyObjectRef) -> Option<Vec<u8>> {
+    if let Some(t) = crate::typedef::r#type(obj) {
+        if unsafe { pyre_object::w_type_get_name(t) } == "memoryview" {
+            return unsafe { memoryview_data(obj) }.ok().map(|(data, _, _)| data);
+        }
+    }
+    None
 }
 
 /// Little-endian unpack of one `itemsize`-wide element at element index `i`.
@@ -404,8 +418,23 @@ pub fn install_default_builtins(namespace: &mut DictStorage) {
                         let buf = args.get(1).copied().unwrap_or(w_none());
                         let inst = pyre_object::w_instance_new(cls);
                         crate::baseobjspace::setattr_str(inst, "__pyre_buf__", buf)?;
-                        crate::baseobjspace::setattr_str(inst, "__pyre_fmt__", w_str_new("B"))?;
-                        crate::baseobjspace::setattr_str(inst, "__pyre_itemsize__", w_int_new(1))?;
+                        let (fmt, itemsize) = if unsafe { pyre_object::array_object::is_array(buf) }
+                        {
+                            let tc = unsafe { pyre_object::array_object::w_array_typecode(buf) };
+                            let isz = unsafe { pyre_object::array_object::w_array_itemsize(buf) };
+                            (
+                                String::from_utf8_lossy(&[tc]).into_owned(),
+                                isz as i64,
+                            )
+                        } else {
+                            ("B".to_owned(), 1)
+                        };
+                        crate::baseobjspace::setattr_str(inst, "__pyre_fmt__", w_str_new(&fmt))?;
+                        crate::baseobjspace::setattr_str(
+                            inst,
+                            "__pyre_itemsize__",
+                            w_int_new(itemsize),
+                        )?;
                         Ok(inst)
                     },
                     2,
