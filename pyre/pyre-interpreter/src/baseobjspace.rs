@@ -1838,9 +1838,17 @@ unsafe fn pull_iterator_tuple(
     // it is produced, then re-read the set at its (possibly relocated) address
     // before returning.
     let _roots = pyre_object::gc_roots::push_roots();
+    // Pin the iterator list itself: `next(it)` runs Python and can move it, and
+    // later iterations dereference it again — a raw local would go stale.
+    pyre_object::gc_roots::pin_root(w_iterators);
+    let iters_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     let base = pyre_object::gc_roots::shadow_stack_len();
     for i in 0..n {
-        let it = pyre_object::w_list_getitem(w_iterators, i as i64).unwrap();
+        let it = pyre_object::w_list_getitem(
+            pyre_object::gc_roots::shadow_stack_get(iters_slot),
+            i as i64,
+        )
+        .unwrap();
         match next(it) {
             Ok(v) => pyre_object::gc_roots::pin_root(v),
             Err(e) if e.kind == PyErrorKind::StopIteration => {
@@ -1859,7 +1867,11 @@ unsafe fn pull_iterator_tuple(
                 if n == 2 {
                     // `functional.py:1047-1054` — the first ran dry; if the
                     // second still yields it is the longer one.
-                    let it1 = pyre_object::w_list_getitem(w_iterators, 1).unwrap();
+                    let it1 = pyre_object::w_list_getitem(
+                        pyre_object::gc_roots::shadow_stack_get(iters_slot),
+                        1,
+                    )
+                    .unwrap();
                     return match next(it1) {
                         Ok(_) => Err(strict_zip_error(func_name, 1, "longer")),
                         Err(e2) if e2.kind == PyErrorKind::StopIteration => Ok(None),
@@ -1872,7 +1884,11 @@ unsafe fn pull_iterator_tuple(
                 // re-`next`ing it is a wasted (and on a side-effectful iterator,
                 // observable) call.
                 for j in 1..n {
-                    let itj = pyre_object::w_list_getitem(w_iterators, j as i64).unwrap();
+                    let itj = pyre_object::w_list_getitem(
+                        pyre_object::gc_roots::shadow_stack_get(iters_slot),
+                        j as i64,
+                    )
+                    .unwrap();
                     match next(itj) {
                         Ok(_) => return Err(strict_zip_error(func_name, j, "longer")),
                         Err(e2) if e2.kind == PyErrorKind::StopIteration => {}
