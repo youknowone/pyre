@@ -5687,14 +5687,21 @@ impl Drop for InlineParentFrameGuard {
     }
 }
 
-/// `PYRE_FBW_INLINE_MULTIFRAME` (#68): opt-in to inlining branch-bearing
-/// callees with a multi-frame guard snapshot, instead of declining them to
-/// the trait leg (`LoopBearingCalleeInlineUnsupported`).  Off by default —
-/// the multi-frame snapshot encode↔decode contract for walker-emitted
-/// callee-frame guards is validated under this flag (function_calls byte-exact
-/// + corpus) before any production default flip (which is Linux-CI gated).
+/// `PYRE_FBW_INLINE_MULTIFRAME` (#68): inline branch-bearing callees with a
+/// multi-frame guard snapshot, instead of declining them to the trait leg
+/// (`LoopBearingCalleeInlineUnsupported`).  Default-on; `PYRE_FBW_INLINE_MULTIFRAME=0`
+/// (or `false`) is the rollback escape hatch.  The multi-frame snapshot
+/// encode↔decode contract for walker-emitted callee-frame guards is validated
+/// byte-exact (function_calls + corpus) on both backends.
 fn fbw_inline_multiframe_enabled() -> bool {
-    std::env::var_os("PYRE_FBW_INLINE_MULTIFRAME").is_some()
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var_os("PYRE_FBW_INLINE_MULTIFRAME") {
+        Some(v) => {
+            let v = v.to_string_lossy();
+            v != "0" && !v.eq_ignore_ascii_case("false")
+        }
+        None => true,
+    })
 }
 
 /// RAII guard: set [`FULL_BODY_SNAPSHOT_SYM`] for the lifetime of a

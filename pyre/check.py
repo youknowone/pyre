@@ -56,11 +56,11 @@ def _detect_pyre_stdlib():
 
 PYRE_STDLIB = _detect_pyre_stdlib()
 
-# Opt-in (`--fbw-inline-multiframe`): export PYRE_FBW_INLINE_MULTIFRAME=1 into
-# pyre child runs so the #68 forward-branch multi-frame inline path is exercised
-# and parity-checked. Off by default; the path is otherwise reached by no
-# corpus run, so this is the only local coverage gate for it.
-FBW_INLINE_MULTIFRAME = False
+# Opt-out (`--no-fbw-inline-multiframe`): export PYRE_FBW_INLINE_MULTIFRAME=0 into
+# pyre child runs to exercise the #68 multi-frame inline rollback escape hatch.
+# The path is on by default, so the default run already parity-checks it; this
+# opt-out validates the flag-off fallback.
+FBW_INLINE_MULTIFRAME_OFF = False
 
 BENCH_DIR = "pyre/bench"
 SYNTHETIC_BENCH_DIR = "pyre/bench/synth"
@@ -228,8 +228,8 @@ def pyre_env():
     # in the environment wins.
     if PYRE_STDLIB and "PYRE_STDLIB" not in env:
         env["PYRE_STDLIB"] = PYRE_STDLIB
-    if FBW_INLINE_MULTIFRAME:
-        env["PYRE_FBW_INLINE_MULTIFRAME"] = "1"
+    if FBW_INLINE_MULTIFRAME_OFF:
+        env["PYRE_FBW_INLINE_MULTIFRAME"] = "0"
     return env
 
 
@@ -888,11 +888,11 @@ def parse_args():
         help="per-script timeout in seconds for synthetic benchmarks",
     )
     parser.add_argument(
-        "--fbw-inline-multiframe",
+        "--no-fbw-inline-multiframe",
         action="store_true",
-        help="run pyre with PYRE_FBW_INLINE_MULTIFRAME=1 (#68 forward-branch "
-        "multi-frame inline path); validates that path's parity before its "
-        "default-flip is contemplated",
+        help="run pyre with PYRE_FBW_INLINE_MULTIFRAME=0 (#68 forward-branch "
+        "multi-frame inline is on by default; this exercises the rollback "
+        "escape hatch)",
     )
     parser.add_argument("pyre_path", nargs="?", default="")
     args = parser.parse_args()
@@ -914,9 +914,9 @@ def parse_args():
 
 def main():
     args = parse_args()
-    if args.fbw_inline_multiframe:
-        global FBW_INLINE_MULTIFRAME
-        FBW_INLINE_MULTIFRAME = True
+    if args.no_fbw_inline_multiframe:
+        global FBW_INLINE_MULTIFRAME_OFF
+        FBW_INLINE_MULTIFRAME_OFF = True
     chk = Check(args)
 
     backends = [args.backend] if args.backend else ["dynasm", "cranelift"]
