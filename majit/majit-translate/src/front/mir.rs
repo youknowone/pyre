@@ -1095,6 +1095,14 @@ pub fn lower_fun_decl_with_static_addrs(
         // the legacy walker and codewriter already handle, so it runs
         // unconditionally.
         collapse_fmt_chains(&mut lo.graph);
+        // Multi-argument `format!("{a}…{b}", …)` chains build an N-field
+        // argument tuple and N `Argument::new_display` ctors across several
+        // blocks — a shape the single-argument collapser above does not
+        // recognize.  This phase rewrites each `new_display` to `str` in
+        // place and folds the rendered values with the literal pieces at
+        // the `Arguments::new` block, so multi-arg Display chains lower to
+        // native `str` + `ll_strconcat` like the single-arg case.
+        collapse_fmt_chains_multi(&mut lo.graph);
         // `panic!` / `assert!` message-block chains end in an implicit
         // `AssertionError` raise but route through graph-less `fmt`
         // message externs the rtyper can't type; collapse them to the
@@ -9027,6 +9035,14 @@ fn unwrap_fmt_arg_tuple_ref(
         OpKind::FieldRead { base, field, .. } => (base.clone(), field.name.clone()),
         _ => return Some(var.clone()),
     };
+    // The aggregate `FieldWrite`s live in the block that built the tuple,
+    // but a `FieldRead` for the 2nd+ placeholder reads a *threaded copy*
+    // of the tuple ref (forwarded across a block boundary as an inputarg),
+    // so its `base` Variable id differs from the write `base`'s id even
+    // though both denote the same tuple ctor.  Resolve the read base to
+    // its producing op so the write base can be matched by producer
+    // identity rather than raw Variable id.
+    let base_producer = resolve_to_producer_op(graph, &base);
     let mut found: Option<crate::flowspace::model::Variable> = None;
     for b in &graph.blocks {
         for op in &b.operations {
@@ -9037,7 +9053,10 @@ fn unwrap_fmt_arg_tuple_ref(
                 ..
             } = &op.kind
             {
-                if write_base.id() == base.id() && field.name == field_name {
+                let base_matches = write_base.id() == base.id()
+                    || (base_producer.is_some()
+                        && resolve_to_producer_op(graph, write_base) == base_producer);
+                if base_matches && field.name == field_name {
                     // A `setfield_gc` inline `Const` carries no SSA Variable;
                     // the back-trace needs a register operand to follow.
                     let write_var = value.as_variable()?;
@@ -9188,7 +9207,6 @@ fn emit_str_add(
 /// argument renders by identity (a `&str` `Display`); `Debug` rendering
 /// and non-`&str` `Display` are outside the recognized subset and are
 /// rejected before emission.
-#[allow(dead_code)]
 fn emit_fmt_concat(graph: &mut FunctionGraph, bb_id: BlockId, chain: &FmtChain) -> Variable {
     let mut acc = emit_str_const(graph, bb_id, &chain.pieces[0]);
     for (i, arg) in chain.args.iter().enumerate() {
@@ -9540,6 +9558,252 @@ fn collapse_fmt_chains(graph: &mut FunctionGraph) {
             .block_mut(site.format_block)
             .operations
             .splice(idx..idx + 1, expansion);
+    }
+}
+
+/// A recognized multi-argument `format!` chain ready to collapse.  Unlike
+/// the single-argument [`FmtCollapse`], a multi-arg chain builds an N-field
+/// argument tuple and one `Argument::new_display` ctor per placeholder
+/// (spread across several blocks), and the rendered values already thread
+/// to the `Arguments::new` block as the args-array elements.  So the
+/// collapse renders each placeholder in place (`new_display(inner)` →
+/// `str(inner)`) and folds the rendered values with the literal pieces at
+/// the `Arguments::new` block, threading the single resulting String to the
+/// `alloc::fmt::format` block.
+struct FmtCollapseMulti {
+    /// Block holding `Arguments::new` — where the concat fold is emitted
+    /// (every rendered value is live there, as an args-array element).
+    args_block: BlockId,
+    /// `Arguments::new` result var id (re-threaded to the folded String,
+    /// then deleted).
+    arguments_var: u64,
+    /// The rendered-value vars in placeholder order (the args-array
+    /// elements, live as inputargs of `args_block`).
+    arg_elem_vars: Vec<Variable>,
+    pieces: Vec<String>,
+    /// `(block, op_index, inner)` per `Argument::new_display` ctor to
+    /// rewrite into `str(inner)` in place.
+    new_display_ops: Vec<(BlockId, usize, Variable)>,
+    format_block: BlockId,
+    format_idx: usize,
+    /// The var the `alloc::fmt::format` op reads (an `Arguments`-threaded
+    /// inputarg that, after the link rewrite, carries the folded String).
+    fmt_args: Variable,
+    /// Op result var ids to delete (args/pieces array ctors, packed byte
+    /// consts, `Arguments::new`).
+    dead_results: Vec<u64>,
+    /// Aggregate base var ids whose `FieldWrite`s are deleted (the args and
+    /// pieces arrays).
+    dead_bases: Vec<u64>,
+}
+
+/// Recognize a multi-argument `format!` chain terminating at the
+/// `alloc::fmt::format` op `(bf, fi)` and collect the rewrite plan, or
+/// `None` for any shape outside the recognized subset (single-argument,
+/// Debug, non-threaded, phi-merged) so the collapse leaves the graph
+/// untouched.
+fn collect_fmt_collapse_multi(
+    graph: &FunctionGraph,
+    bf: BlockId,
+    fi: usize,
+) -> Option<FmtCollapseMulti> {
+    use crate::model::{CallTarget, OpKind};
+    let block_f = graph.blocks.iter().find(|b| b.id == bf)?;
+    let format_op = block_f.operations.get(fi)?;
+    let fmt_args = match &format_op.kind {
+        OpKind::Call {
+            target: CallTarget::FunctionPath { segments },
+            args,
+            ..
+        } if fmt_path_ends_with(segments, &["fmt", "format"]) => args.first()?.clone(),
+        _ => return None,
+    };
+    let chain = extract_fmt_chain(graph, &fmt_args)?;
+    if chain.args.len() < 2 {
+        return None; // single-argument chains handled by `collapse_fmt_chains`
+    }
+    if chain.args.iter().any(|a| a.kind != FmtArgKind::Display) {
+        // `{:?}` Debug over an enum has no native rstr render (no
+        // `rtype_str` on enum reprs); leave Debug chains residual.
+        return None;
+    }
+    let pieces = chain.pieces.clone();
+
+    // The `Arguments::new(pieces, args)` producer block: where the concat
+    // fold is emitted (all rendered values are live there as the args-array
+    // elements).  Require it distinct from the format block so a forwarding
+    // link exists to re-thread the folded String onto.
+    let (args_block, args_idx) = resolve_to_producer_op(graph, &fmt_args)?;
+    if args_block == bf {
+        return None;
+    }
+    let block_p = graph.blocks.iter().find(|b| b.id == args_block)?;
+    let args_new_op = block_p.operations.get(args_idx)?;
+    let (pieces_var, args_var) = match &args_new_op.kind {
+        OpKind::Call {
+            target: CallTarget::FunctionPath { segments },
+            args,
+            ..
+        } if is_arguments_new_path(segments) => (args.first()?.clone(), args.get(1)?.clone()),
+        _ => return None,
+    };
+    let arguments_var = args_new_op.result.as_ref()?.id();
+    let piece_byte_vars = read_array_literal_elements(graph, &pieces_var)?;
+    let arg_elem_vars = read_array_literal_elements(graph, &args_var)?;
+    if arg_elem_vars.len() != chain.args.len() {
+        return None;
+    }
+
+    // Each args-array element traces back to a `new_display` ctor; record it
+    // for the in-place `→ str` rewrite.
+    let mut new_display_ops = Vec::with_capacity(arg_elem_vars.len());
+    for elem in &arg_elem_vars {
+        let (b_i, idx_i) = resolve_to_producer_op(graph, elem)?;
+        let blk = graph.blocks.iter().find(|b| b.id == b_i)?;
+        let inner = match &blk.operations.get(idx_i)?.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments },
+                args,
+                ..
+            } if fmt_argument_ctor_kind(segments) == Some(FmtArgKind::Display) => {
+                args.first()?.clone()
+            }
+            _ => return None,
+        };
+        new_display_ops.push((b_i, idx_i, inner));
+    }
+
+    let mut dead_results = vec![arguments_var, pieces_var.id(), args_var.id()];
+    dead_results.extend(piece_byte_vars.iter().map(|v| v.id()));
+    let dead_bases = vec![pieces_var.id(), args_var.id()];
+
+    Some(FmtCollapseMulti {
+        args_block,
+        arguments_var,
+        arg_elem_vars,
+        pieces,
+        new_display_ops,
+        format_block: bf,
+        format_idx: fi,
+        fmt_args,
+        dead_results,
+        dead_bases,
+    })
+}
+
+/// Expand every recognized multi-argument `format!` chain into native
+/// `str` + `ll_strconcat` ops: each `Argument::new_display(inner)` becomes
+/// `str(inner)` in place (rendering the placeholder; `str(&str)` folds to
+/// identity), the rendered values are folded with the literal pieces at the
+/// `Arguments::new` block, and the resulting String is threaded to the
+/// `alloc::fmt::format` block (whose op becomes `same_as`).  The on-stack
+/// args/pieces arrays and `Arguments::new` are deleted.  Every emitted op
+/// the rtyper / codewriter / runtime already handle, so the graph-less
+/// `fmt::rt::Argument` / `fmt::Arguments` externs no longer block the
+/// rtyper.
+fn collapse_fmt_chains_multi(graph: &mut FunctionGraph) {
+    use crate::model::{CallTarget, LinkArg, OpKind, ValueType};
+    let sites: Vec<FmtCollapseMulti> = graph
+        .blocks
+        .iter()
+        .flat_map(|block| {
+            block
+                .operations
+                .iter()
+                .enumerate()
+                .filter_map(move |(fi, op)| match &op.kind {
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments },
+                        ..
+                    } if fmt_path_ends_with(segments, &["fmt", "format"]) => Some((block.id, fi)),
+                    _ => None,
+                })
+        })
+        .filter_map(|(bid, fi)| collect_fmt_collapse_multi(graph, bid, fi))
+        .collect();
+    if sites.is_empty() {
+        return;
+    }
+    for site in &sites {
+        // 1. Render each placeholder in place: `new_display(inner)` →
+        //    `str(inner)`.  The result var is unchanged, so the rendered
+        //    &str threads to the args block exactly where the opaque
+        //    `Argument` value did.
+        for (b_i, idx_i, inner) in &site.new_display_ops {
+            if let Some(op) = graph.block_mut(*b_i).operations.get_mut(*idx_i) {
+                op.kind = OpKind::UnaryOp {
+                    op: "str".to_string(),
+                    operand: inner.clone(),
+                    result_ty: ValueType::Ref(None),
+                };
+            }
+        }
+        // 2. Replace the `alloc::fmt::format` op with `same_as(fmt_args)`:
+        //    after the link re-thread below, `fmt_args` carries the folded
+        //    String, so the format result forwards it unchanged.
+        if let Some(op) = graph
+            .block_mut(site.format_block)
+            .operations
+            .get_mut(site.format_idx)
+        {
+            op.kind = OpKind::UnaryOp {
+                op: "same_as".to_string(),
+                operand: site.fmt_args.clone(),
+                result_ty: ValueType::Ref(None),
+            };
+        }
+        // 3. Fold the rendered values with the literal pieces at the args
+        //    block (`piece0 ++ rendered0 ++ piece1 ++ … ++ pieceN`).  The
+        //    args-array elements are already rendered (step 1), so they are
+        //    concatenated directly.
+        let fold_chain = FmtChain {
+            pieces: site.pieces.clone(),
+            args: site
+                .arg_elem_vars
+                .iter()
+                .map(|v| FmtArg {
+                    value: v.clone(),
+                    kind: FmtArgKind::Display,
+                })
+                .collect(),
+        };
+        let folded = emit_fmt_concat(graph, site.args_block, &fold_chain);
+        // 4. Re-thread the folded String onto the link that forwarded the
+        //    `Arguments` value out of the args block.
+        for link in &mut graph.block_mut(site.args_block).exits {
+            for arg in &mut link.args {
+                if let LinkArg::Value(v) = arg {
+                    if v.id() == site.arguments_var {
+                        *arg = LinkArg::Value(folded.clone());
+                    }
+                }
+            }
+        }
+    }
+    // 5. Delete the now-dead chain ops across all blocks (args/pieces
+    //    arrays + their `FieldWrite`s, packed byte consts, `Arguments::new`).
+    let dead_results: std::collections::HashSet<u64> = sites
+        .iter()
+        .flat_map(|s| s.dead_results.iter().copied())
+        .collect();
+    let dead_bases: std::collections::HashSet<u64> = sites
+        .iter()
+        .flat_map(|s| s.dead_bases.iter().copied())
+        .collect();
+    for block in &mut graph.blocks {
+        block.operations.retain(|op| {
+            if let Some(r) = &op.result {
+                if dead_results.contains(&r.id()) {
+                    return false;
+                }
+            }
+            if let OpKind::FieldWrite { base, .. } = &op.kind {
+                if dead_bases.contains(&base.id()) {
+                    return false;
+                }
+            }
+            true
+        });
     }
 }
 
@@ -10290,6 +10554,258 @@ mod tests {
         assert_eq!(b0_exit.args[0].as_variable().unwrap().id(), ctx.id());
         let bp_exit = &bp_block.exits[0];
         assert_eq!(bp_exit.args[0].as_variable().unwrap().id(), arg_in.id());
+    }
+
+    #[test]
+    fn collapse_fmt_chains_multi_expands_two_arg_chain() {
+        use super::{collapse_fmt_chains_multi, fmt_path_ends_with, is_arguments_new_path};
+        use crate::flowspace::model::Variable;
+        use crate::model::{
+            CallTarget, FieldDescriptor, FunctionGraph, Link, LinkArg, OpKind, SpaceOperation,
+            ValueType,
+        };
+
+        // Reconstruct the `f(format!("a{}b{}c", x, y))` shape charon lowers:
+        // B0 builds the 2-field arg Tuple + `new_display(&x)`, B1 reads the
+        // 2nd field off a *threaded copy* of the tuple ref + `new_display(&y)`
+        // (exercising the cross-block `unwrap_fmt_arg_tuple_ref` match), Bp
+        // builds the args/pieces arrays + `Arguments::new`, Bf calls
+        // `alloc::fmt::format`.
+        let mut graph = FunctionGraph::new("fmt_collapse_multi");
+        let b0 = graph.create_block();
+        let b1 = graph.create_block();
+        let bp = graph.create_block();
+        let bf = graph.create_block();
+        let bret = graph.create_block();
+
+        let fpath = |segs: &[&str]| CallTarget::FunctionPath {
+            segments: segs.iter().map(|s| s.to_string()).collect(),
+        };
+
+        // ── B0: Tuple{x, y} + FieldRead __pos_0 + new_display(&x) ──
+        let x = Variable::new();
+        let y = Variable::new();
+        graph.block_mut(b0).inputargs = vec![x.clone(), y.clone()];
+        let tuple = Variable::new();
+        graph.block_mut(b0).operations.push(SpaceOperation {
+            result: Some(tuple.clone()),
+            kind: OpKind::Call {
+                target: CallTarget::SyntheticTransparentCtor {
+                    name: "Tuple".to_string(),
+                    owner_path: vec![],
+                },
+                args: vec![],
+                result_ty: ValueType::Ref(Some("Tuple".to_string())),
+            },
+        });
+        for (i, v) in [&x, &y].iter().enumerate() {
+            graph.block_mut(b0).operations.push(SpaceOperation {
+                result: None,
+                kind: OpKind::FieldWrite {
+                    base: tuple.clone(),
+                    field: FieldDescriptor::new(format!("__pos_{i}"), Some("Tuple".to_string())),
+                    value: LinkArg::Value((*v).clone()),
+                    ty: ValueType::Ref(None),
+                },
+            });
+        }
+        let ar0 = Variable::new();
+        graph.block_mut(b0).operations.push(SpaceOperation {
+            result: Some(ar0.clone()),
+            kind: OpKind::FieldRead {
+                base: tuple.clone(),
+                field: FieldDescriptor::new("__pos_0", Some("Tuple".to_string())),
+                ty: ValueType::Ref(None),
+                pure: false,
+            },
+        });
+        let nd0 = Variable::new();
+        graph.block_mut(b0).operations.push(SpaceOperation {
+            result: Some(nd0.clone()),
+            kind: OpKind::Call {
+                target: fpath(&["fmt", "rt", "Argument", "new_display"]),
+                args: vec![ar0.clone()],
+                result_ty: ValueType::Ref(None),
+            },
+        });
+        // B0 → B1 forwards the tuple ref and the first new_display.
+        let tuple_in = Variable::new();
+        let nd0_in = Variable::new();
+        graph.block_mut(b1).inputargs = vec![tuple_in.clone(), nd0_in.clone()];
+        graph.block_mut(b0).exits = vec![
+            Link::from_variables(&graph, vec![tuple.clone(), nd0], b1, None).with_prevblock(b0),
+        ];
+
+        // ── B1: FieldRead __pos_1 (off the threaded tuple copy) + new_display(&y) ──
+        let ar1 = Variable::new();
+        graph.block_mut(b1).operations.push(SpaceOperation {
+            result: Some(ar1.clone()),
+            kind: OpKind::FieldRead {
+                base: tuple_in.clone(),
+                field: FieldDescriptor::new("__pos_1", Some("Tuple".to_string())),
+                ty: ValueType::Ref(None),
+                pure: false,
+            },
+        });
+        let nd1 = Variable::new();
+        graph.block_mut(b1).operations.push(SpaceOperation {
+            result: Some(nd1.clone()),
+            kind: OpKind::Call {
+                target: fpath(&["fmt", "rt", "Argument", "new_display"]),
+                args: vec![ar1.clone()],
+                result_ty: ValueType::Ref(None),
+            },
+        });
+        let nd0_p = Variable::new();
+        let nd1_p = Variable::new();
+        graph.block_mut(bp).inputargs = vec![nd0_p.clone(), nd1_p.clone()];
+        graph.block_mut(b1).exits = vec![
+            Link::from_variables(&graph, vec![nd0_in, nd1], bp, None).with_prevblock(b1),
+        ];
+
+        // ── Bp: args array, pieces array, Arguments::new ──
+        let args_arr = Variable::new();
+        graph.block_mut(bp).operations.push(SpaceOperation {
+            result: Some(args_arr.clone()),
+            kind: OpKind::Call {
+                target: CallTarget::SyntheticTransparentCtor {
+                    name: "Array".to_string(),
+                    owner_path: vec![],
+                },
+                args: vec![],
+                result_ty: ValueType::Ref(Some("Array".to_string())),
+            },
+        });
+        for (i, v) in [&nd0_p, &nd1_p].iter().enumerate() {
+            graph.block_mut(bp).operations.push(SpaceOperation {
+                result: None,
+                kind: OpKind::FieldWrite {
+                    base: args_arr.clone(),
+                    field: FieldDescriptor::new(format!("__pos_{i}"), Some("Array".to_string())),
+                    value: LinkArg::Value((*v).clone()),
+                    ty: ValueType::Ref(None),
+                },
+            });
+        }
+        let pieces_arr = Variable::new();
+        graph.block_mut(bp).operations.push(SpaceOperation {
+            result: Some(pieces_arr.clone()),
+            kind: OpKind::Call {
+                target: CallTarget::SyntheticTransparentCtor {
+                    name: "Array".to_string(),
+                    owner_path: vec![],
+                },
+                args: vec![],
+                result_ty: ValueType::Ref(Some("Array".to_string())),
+            },
+        });
+        // Template for "a{}b{}c": 'a', ph, 'b', ph, 'c', term.
+        for (i, byte) in [1i64, 97, 0xC0, 1, 98, 0xC0, 1, 99, 0].iter().enumerate() {
+            let v = Variable::new();
+            graph.block_mut(bp).operations.push(SpaceOperation {
+                result: Some(v.clone()),
+                kind: OpKind::ConstInt(*byte),
+            });
+            graph.block_mut(bp).operations.push(SpaceOperation {
+                result: None,
+                kind: OpKind::FieldWrite {
+                    base: pieces_arr.clone(),
+                    field: FieldDescriptor::new(format!("__pos_{i}"), Some("Array".to_string())),
+                    value: LinkArg::Value(v),
+                    ty: ValueType::Int,
+                },
+            });
+        }
+        let fmt_args = Variable::new();
+        graph.block_mut(bp).operations.push(SpaceOperation {
+            result: Some(fmt_args.clone()),
+            kind: OpKind::Call {
+                target: fpath(&["fmt", "Arguments", "new"]),
+                args: vec![pieces_arr, args_arr],
+                result_ty: ValueType::Ref(None),
+            },
+        });
+        let fmt_args_in = Variable::new();
+        graph.block_mut(bf).inputargs = vec![fmt_args_in.clone()];
+        graph.block_mut(bp).exits = vec![
+            Link::from_variables(&graph, vec![fmt_args.clone()], bf, None).with_prevblock(bp),
+        ];
+
+        // ── Bf: alloc::fmt::format(args) → String ──
+        let formatted = Variable::new();
+        graph.block_mut(bf).operations.push(SpaceOperation {
+            result: Some(formatted.clone()),
+            kind: OpKind::Call {
+                target: fpath(&["alloc", "fmt", "format"]),
+                args: vec![fmt_args_in.clone()],
+                result_ty: ValueType::Ref(None),
+            },
+        });
+        let ret = Variable::new();
+        graph.block_mut(bret).inputargs = vec![ret];
+        graph.block_mut(bf).exits = vec![
+            Link::from_variables(&graph, vec![formatted.clone()], bret, None).with_prevblock(bf),
+        ];
+
+        collapse_fmt_chains_multi(&mut graph);
+
+        // Both `new_display` ctors are rendered in place to `str`.
+        let find_str = |bid| {
+            graph
+                .blocks
+                .iter()
+                .find(|b| b.id == bid)
+                .unwrap()
+                .operations
+                .iter()
+                .find_map(|op| match &op.kind {
+                    OpKind::UnaryOp { op: o, operand, .. } if o == "str" => Some(operand.id()),
+                    _ => None,
+                })
+        };
+        assert_eq!(find_str(b0), Some(ar0.id()), "B0 new_display→str(ar0)");
+        assert_eq!(find_str(b1), Some(ar1.id()), "B1 new_display→str(ar1)");
+
+        // No `fmt` externs survive anywhere in the graph.
+        for b in &graph.blocks {
+            for op in &b.operations {
+                if let OpKind::Call {
+                    target: CallTarget::FunctionPath { segments },
+                    ..
+                } = &op.kind
+                {
+                    let bad = fmt_path_ends_with(segments, &["Argument", "new_display"])
+                        || is_arguments_new_path(segments)
+                        || fmt_path_ends_with(segments, &["fmt", "format"]);
+                    assert!(!bad, "residual fmt extern survived: {segments:?}");
+                }
+            }
+        }
+
+        // Bf's format op became `same_as(fmt_args_in)`, keeping `formatted`.
+        let bf_block = graph.blocks.iter().find(|b| b.id == bf).unwrap();
+        let same_as = bf_block
+            .operations
+            .iter()
+            .find(|op| matches!(&op.kind, OpKind::UnaryOp { op, .. } if op == "same_as"))
+            .expect("Bf same_as op");
+        match &same_as.kind {
+            OpKind::UnaryOp { operand, .. } => assert_eq!(operand.id(), fmt_args_in.id()),
+            _ => unreachable!(),
+        }
+        assert_eq!(same_as.result.as_ref().unwrap().id(), formatted.id());
+
+        // Bp now folds the rendered values with the pieces (str_const + add)
+        // and forwards the folded String where it forwarded `Arguments`.
+        let bp_block = graph.blocks.iter().find(|b| b.id == bp).unwrap();
+        let add_count = bp_block
+            .operations
+            .iter()
+            .filter(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "add"))
+            .count();
+        assert!(add_count >= 2, "Bp must fold both rendered args, got {add_count} adds");
+        let bp_exit_val = bp_block.exits[0].args[0].as_variable().unwrap().id();
+        assert_ne!(bp_exit_val, fmt_args.id(), "Bp must forward the folded String, not Arguments");
     }
 
     #[test]
