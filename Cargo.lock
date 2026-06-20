@@ -2071,6 +2071,7 @@ dependencies = [
 name = "pyre-wasm-runner"
 version = "0.0.2"
 dependencies = [
+ "wasmprinter",
  "wasmtime",
 ]
 

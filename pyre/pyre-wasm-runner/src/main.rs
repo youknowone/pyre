@@ -271,7 +271,27 @@ fn jit_compile(caller: &mut Caller<'_, Host>, bytes_ptr: u32, bytes_len: u32) ->
         .context("read trace module bytes")?;
 
     let engine = caller.engine().clone();
-    let module = Module::new(&engine, &bytes).context("compile trace module")?;
+    if std::env::var_os("PYRE_WASM_DUMP_ALL_TRACES").is_some() {
+        match wasmprinter::print_bytes(&bytes) {
+            Ok(wat) => eprintln!("=== trace module ({} bytes) ===\n{wat}", bytes.len()),
+            Err(pe) => eprintln!("[jit_compile_wasm] wat print failed: {pe}"),
+        }
+    }
+    let module = match Module::new(&engine, &bytes) {
+        Ok(m) => m,
+        Err(e) => {
+            if std::env::var_os("PYRE_WASM_DUMP_BAD_TRACE").is_some() {
+                let path = "/tmp/pyre_bad_trace.wasm";
+                let _ = std::fs::write(path, &bytes);
+                eprintln!("[jit_compile_wasm] dumped {} bytes to {path}", bytes.len());
+                match wasmprinter::print_bytes(&bytes) {
+                    Ok(wat) => eprintln!("--- WAT ---\n{wat}\n--- /WAT ---"),
+                    Err(pe) => eprintln!("[jit_compile_wasm] wat print failed: {pe}"),
+                }
+            }
+            return Err(e).context("compile trace module");
+        }
+    };
 
     // A fresh trampoline per trace; it reads all state from `caller.data()`.
     let jit_call = Func::wrap(

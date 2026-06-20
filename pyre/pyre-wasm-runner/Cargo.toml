@@ -13,3 +13,7 @@ path = "src/main.rs"
 # wasmtime vendors its own error type (`wasmtime::Error`) and re-exports a
 # `Context` trait, so the runner needs no separate `anyhow` dependency.
 wasmtime = { workspace = true }
+# Disassemble a trace module to WAT when it fails to compile, gated by
+# PYRE_WASM_DUMP_BAD_TRACE — used to debug JIT codegen bugs. Pinned to the
+# version wasmtime already resolves in the lockfile.
+wasmprinter = "0.248"
