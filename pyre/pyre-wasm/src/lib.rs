@@ -113,28 +113,98 @@ mod residual_host {
     }
 }
 
+// Host-filesystem source provider for the native-host (`wasmi`) build.
+//
+// wasm32 has no filesystem, but the wasmtime runner does, so module source is
+// read through `pyre_host.*` host imports the runner satisfies. The runner
+// reports the real stdlib root (the `$PYRE_STDLIB` directory `pyre/check.py`
+// forwards); seeding it on `sys.path` lets the SAME import machinery that runs
+// on native resolve `import re` against genuine host paths. The browser/web
+// build has no such host, so it embeds the stdlib instead (`wasm_vfs`).
+#[cfg(all(target_arch = "wasm32", feature = "wasmi"))]
+mod host_fs_provider {
+    use pyre_interpreter::importing::SourceProvider;
+    use std::path::Path;
+
+    #[link(wasm_import_module = "pyre_host")]
+    unsafe extern "C" {
+        /// Write the real stdlib root path into `[buf, buf+cap)`; return its
+        /// byte length (without writing if it exceeds `cap`), or -1 if unset.
+        fn host_stdlib_root(buf_ptr: *mut u8, buf_cap: u32) -> i64;
+        /// 1 if `[path, path+len)` names a directory, else 0.
+        fn host_is_dir(path_ptr: *const u8, path_len: u32) -> u32;
+        /// Byte length of the regular file at `path`, or -1 if not a file.
+        fn host_file_size(path_ptr: *const u8, path_len: u32) -> i64;
+        /// Read the file at `path` into `[buf, buf+cap)`; return bytes written
+        /// (clamped to `cap`), or -1 on error.
+        fn host_read(path_ptr: *const u8, path_len: u32, buf_ptr: *mut u8, buf_cap: u32) -> i64;
+    }
+
+    struct HostFsProvider;
+
+    impl SourceProvider for HostFsProvider {
+        fn is_file(&self, path: &Path) -> bool {
+            let p = path.to_string_lossy();
+            unsafe { host_file_size(p.as_ptr(), p.len() as u32) >= 0 }
+        }
+        fn is_dir(&self, path: &Path) -> bool {
+            let p = path.to_string_lossy();
+            unsafe { host_is_dir(p.as_ptr(), p.len() as u32) != 0 }
+        }
+        fn read_to_string(&self, path: &Path) -> std::io::Result<String> {
+            let p = path.to_string_lossy();
+            let size = unsafe { host_file_size(p.as_ptr(), p.len() as u32) };
+            if size < 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("{}", path.display()),
+                ));
+            }
+            let mut buf = vec![0u8; size as usize];
+            let n = unsafe {
+                host_read(
+                    p.as_ptr(),
+                    p.len() as u32,
+                    buf.as_mut_ptr(),
+                    buf.len() as u32,
+                )
+            };
+            if n < 0 {
+                return Err(std::io::Error::other(format!(
+                    "host_read failed: {}",
+                    path.display()
+                )));
+            }
+            buf.truncate(n as usize);
+            String::from_utf8(buf)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+        }
+    }
+
+    /// Query the host for the stdlib root, seed it on `sys.path`, and install
+    /// the host-FS source provider.  Called once before the first import.
+    pub fn install() {
+        let mut buf = vec![0u8; 4096];
+        let n = unsafe { host_stdlib_root(buf.as_mut_ptr(), buf.len() as u32) };
+        if n > 0 && (n as usize) <= buf.len() {
+            if let Ok(root) = std::str::from_utf8(&buf[..n as usize]) {
+                pyre_interpreter::importing::add_sys_path(Path::new(root));
+            }
+        }
+        pyre_interpreter::importing::install_source_provider(std::rc::Rc::new(HostFsProvider));
+    }
+}
+
 static PANIC_HOOK: Once = Once::new();
 
 fn install_panic_hook() {
     PANIC_HOOK.call_once(|| {
         std::panic::set_hook(Box::new(|info| {
-            // The JIT raises `InvalidLoop` / `SpeculativeError` as panics to
-            // abandon a trace; the wasm32 module is built with `-C panic=unwind`
-            // so these unwind to their `catch_unwind` recovery sites
-            // (jump_to_preamble fallback) and execution continues. Their message
-            // is a false crash signal — suppress it so it does not pollute the
-            // captured output, mirroring pyrex's hook. A genuinely uncaught
-            // panic still surfaces here.
-            let payload = info.payload();
-            let is_silent_control_flow = payload
-                .downcast_ref::<majit_metainterp::optimize::InvalidLoop>()
-                .is_some()
-                || payload
-                    .downcast_ref::<majit_metainterp::optimize::SpeculativeError>()
-                    .is_some();
-            if is_silent_control_flow {
-                return;
-            }
+            // The module is built with the default `panic=abort`, so a panic
+            // ends the run. Record the formatted message in linear memory
+            // before the abort; the runner's `recover_panic_messages` scans for
+            // it (the browser glue surfaces it the same way) so the real cause
+            // is visible rather than a bare trap.
             let msg = format!("[pyre panic] {info}");
             OUTPUT_BUF.with(|buf| buf.borrow_mut().push_str(&msg));
         }));
@@ -160,6 +230,14 @@ fn run_python_impl(source: &str) -> String {
     #[cfg(all(target_arch = "wasm32", feature = "wasmi"))]
     residual_host::install();
     pyre_interpreter::importing::install_builtin_modules();
+    // Give the import machinery a source of module bytes. The browser has no
+    // filesystem, so the web build serves the embedded stdlib closure from an
+    // in-memory VFS; the native-host (`wasmi`) build reads the host filesystem
+    // through `pyre_host.*` imports the runner satisfies.
+    #[cfg(feature = "web")]
+    pyre_interpreter::importing::mount_embedded_stdlib(std::path::Path::new("/lib-python/3"));
+    #[cfg(all(target_arch = "wasm32", feature = "wasmi"))]
+    host_fs_provider::install();
     install_wasm_print_hook();
     OUTPUT_BUF.with(|buf| buf.borrow_mut().clear());
 

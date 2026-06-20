@@ -14,7 +14,14 @@ crate-type = ["cdylib"]
 default = ["web"]
 # Browser / JS host: `run_python` is exported through wasm-bindgen and the
 # JIT instantiates trace modules via the `WebAssembly` API (`jit_glue.js`).
-web = ["dep:wasm-bindgen", "pyre-jit/wasm-web", "getrandom/wasm_js"]
+# The browser has no filesystem, so the stdlib `import re` needs is embedded
+# and served from an in-memory VFS (`pyre-interpreter/wasm_vfs`).
+web = [
+    "dep:wasm-bindgen",
+    "pyre-jit/wasm-web",
+    "getrandom/wasm_js",
+    "pyre-interpreter/wasm_vfs",
+]
 # Native wasm host (wasmi / wasmtime): a plain C-ABI surface
 # (`pyre_alloc` / `pyre_dealloc` / `pyre_run_python`) is exported and the
 # JIT instantiates trace modules via plain wasm imports. No JavaScript.
@@ -37,7 +44,3 @@ getrandom = { workspace = true }
 # trampoline (`call_stub::set_residual_host_call`); the `web` build keeps
 # the in-module transmute path until the JS glue grows the matching import.
 majit-backend = { workspace = true, optional = true }
-# For the panic hook: classify `InvalidLoop` / `SpeculativeError` payloads
-# (the JIT's silent trace-abort signals) so their messages are suppressed,
-# mirroring pyrex. Already compiled for wasm32 transitively via pyre-jit.
-majit-metainterp = { workspace = true }

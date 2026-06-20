@@ -11,6 +11,11 @@ default = ["host_env"]
 host_env = ["dep:rustpython-host_env"]
 cranelift = ["majit-metainterp/cranelift"]
 dynasm = ["majit-metainterp/dynasm"]
+# Embed the pure-Python stdlib closure needed for `import re` into the binary
+# and serve it from an in-memory VFS — the browser/web wasm target has no
+# filesystem. Off by default; the native and wasmtime-runner targets read the
+# real filesystem instead.
+wasm_vfs = ["dep:lz4_flex", "host_env"]
 
 [dependencies]
 pyre-object = { workspace = true }
@@ -35,3 +40,14 @@ siphasher = { workspace = true }
 caseless = { workspace = true }
 indexmap = { workspace = true }
 paste = { workspace = true }
+# Decompresses the embedded stdlib VFS blob at runtime (wasm_vfs). Decode-only,
+# no_std-compatible safe path; the encode side is unused here.
+lz4_flex = { version = "0.13", default-features = false, features = [
+    "safe-encode",
+    "safe-decode",
+], optional = true }
+
+[build-dependencies]
+# Compresses the embedded stdlib VFS blob at build time (only does work when the
+# wasm_vfs feature is enabled; otherwise build.rs returns early).
+lz4_flex = "0.13"

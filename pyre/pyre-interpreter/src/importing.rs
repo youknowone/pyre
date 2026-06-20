@@ -72,6 +72,203 @@ pub(crate) mod host {
 use host::fs as host_fs;
 use host::os as host_os;
 
+// ── SourceProvider: the host-agnostic byte source for module loading ──
+// PyPy/CPython read module source from a filesystem.  pyre routes the three
+// FS touchpoints the import machinery actually exercises — the package/module
+// `is_file` probes in `find_in_dirs` and the `read_to_string` in
+// `load_source_module` — through one object, so the SAME import resolution
+// runs over a real kernel FS (native, and the wasmtime runner via host
+// imports) or an in-memory VFS (the browser/web build, populated from an
+// embedded stdlib bundle).  The import machinery never branches per host;
+// only the installed provider differs.
+#[cfg(feature = "host_env")]
+pub trait SourceProvider {
+    /// True when `path` names a readable regular file.
+    fn is_file(&self, path: &Path) -> bool;
+    /// True when `path` names a directory.
+    fn is_dir(&self, path: &Path) -> bool;
+    /// Read the whole file at `path` as UTF-8 source.
+    fn read_to_string(&self, path: &Path) -> std::io::Result<String>;
+}
+
+#[cfg(feature = "host_env")]
+thread_local! {
+    static SOURCE_PROVIDER: RefCell<Option<std::rc::Rc<dyn SourceProvider>>> =
+        const { RefCell::new(None) };
+}
+
+/// Install the byte source the import machinery reads through.  The wasm
+/// bootstrap installs a host-import-backed or in-memory-VFS provider before
+/// the first import; native/pyrex leaves it unset and the default kernel-FS
+/// provider answers every probe.
+#[cfg(feature = "host_env")]
+pub fn install_source_provider(provider: std::rc::Rc<dyn SourceProvider>) {
+    SOURCE_PROVIDER.with(|p| *p.borrow_mut() = Some(provider));
+}
+
+/// Run `f` against the installed provider, lazily defaulting to the platform's
+/// kernel-FS provider when none was installed.  The `Rc` is cloned out before
+/// `f` runs so the thread-local borrow is not held across the call (the import
+/// path is re-entrant).
+#[cfg(feature = "host_env")]
+fn with_source_provider<R>(f: impl FnOnce(&dyn SourceProvider) -> R) -> R {
+    let provider = SOURCE_PROVIDER.with(|p| {
+        let mut slot = p.borrow_mut();
+        if slot.is_none() {
+            *slot = Some(default_source_provider());
+        }
+        slot.clone().unwrap()
+    });
+    f(&*provider)
+}
+
+#[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
+fn default_source_provider() -> std::rc::Rc<dyn SourceProvider> {
+    std::rc::Rc::new(HostFsProvider)
+}
+
+#[cfg(all(feature = "host_env", target_arch = "wasm32"))]
+fn default_source_provider() -> std::rc::Rc<dyn SourceProvider> {
+    std::rc::Rc::new(NullSourceProvider)
+}
+
+/// Kernel-filesystem provider — the default on native and the wasmtime
+/// runner's real-FS path.  `is_file`/`is_dir` go straight to `std::fs::
+/// metadata` via the `Path` methods (matching the historical `find_in_dirs`
+/// probes); reads route through the host_env `fs` shim.
+#[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
+struct HostFsProvider;
+
+#[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
+impl SourceProvider for HostFsProvider {
+    fn is_file(&self, path: &Path) -> bool {
+        path.is_file()
+    }
+    fn is_dir(&self, path: &Path) -> bool {
+        path.is_dir()
+    }
+    fn read_to_string(&self, path: &Path) -> std::io::Result<String> {
+        host_fs::read_to_string(path)
+    }
+}
+
+/// Default provider on wasm before the bootstrap installs a real one: resolves
+/// nothing, preserving the historical "builtins only" behaviour.
+#[cfg(all(feature = "host_env", target_arch = "wasm32"))]
+struct NullSourceProvider;
+
+#[cfg(all(feature = "host_env", target_arch = "wasm32"))]
+impl SourceProvider for NullSourceProvider {
+    fn is_file(&self, _path: &Path) -> bool {
+        false
+    }
+    fn is_dir(&self, _path: &Path) -> bool {
+        false
+    }
+    fn read_to_string(&self, path: &Path) -> std::io::Result<String> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("no source provider installed: {}", path.display()),
+        ))
+    }
+}
+
+// ── embedded-stdlib VFS (wasm_vfs) ───────────────────────────────────
+// The browser/web wasm target has no filesystem, so the pure-Python stdlib
+// closure that `import re` needs is compiled into the binary (see build.rs)
+// and served from this in-memory map.  Keys are `mount.join(<relpath>)`, so the
+// SAME `find_in_dirs` probes (`<dir>/re/__init__.py`, `<dir>/enum.py`, …) that
+// hit a real FS on native resolve here once `mount` is on sys.path.
+#[cfg(feature = "wasm_vfs")]
+pub static VFS_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/stdlib_vfs.lz4"));
+
+#[cfg(feature = "wasm_vfs")]
+enum VfsEntry {
+    File(std::rc::Rc<str>),
+    Dir,
+}
+
+#[cfg(feature = "wasm_vfs")]
+struct VfsProvider {
+    map: HashMap<PathBuf, VfsEntry>,
+}
+
+#[cfg(feature = "wasm_vfs")]
+impl VfsProvider {
+    /// Decompress and parse the build-time blob into a `mount`-rooted map.
+    /// Each embedded file becomes a `File` entry at `mount/<relpath>`, plus a
+    /// synthetic `Dir` entry for every ancestor directory (so `is_dir` answers
+    /// for `re/`, `collections/`, and the mount itself).
+    fn from_blob(blob: &[u8], mount: &Path) -> Self {
+        let raw = lz4_flex::block::decompress_size_prepended(blob)
+            .expect("wasm_vfs: corrupt embedded stdlib blob");
+        let mut map: HashMap<PathBuf, VfsEntry> = HashMap::new();
+        map.insert(mount.to_path_buf(), VfsEntry::Dir);
+
+        let mut pos = 0usize;
+        let read_u32 = |raw: &[u8], pos: &mut usize| -> usize {
+            let n = u32::from_le_bytes(raw[*pos..*pos + 4].try_into().unwrap()) as usize;
+            *pos += 4;
+            n
+        };
+        let count = read_u32(&raw, &mut pos);
+        for _ in 0..count {
+            let name_len = read_u32(&raw, &mut pos);
+            let name = std::str::from_utf8(&raw[pos..pos + name_len])
+                .expect("wasm_vfs: non-utf8 module name")
+                .to_owned();
+            pos += name_len;
+            let src_len = read_u32(&raw, &mut pos);
+            let src = std::str::from_utf8(&raw[pos..pos + src_len])
+                .expect("wasm_vfs: non-utf8 module source")
+                .to_owned();
+            pos += src_len;
+
+            let full = mount.join(&name);
+            // Register every ancestor directory under `mount` as a Dir.
+            let mut ancestor = full.parent();
+            while let Some(dir) = ancestor {
+                if dir == mount || !dir.starts_with(mount) {
+                    break;
+                }
+                map.entry(dir.to_path_buf()).or_insert(VfsEntry::Dir);
+                ancestor = dir.parent();
+            }
+            map.insert(full, VfsEntry::File(std::rc::Rc::from(src.as_str())));
+        }
+        VfsProvider { map }
+    }
+}
+
+#[cfg(feature = "wasm_vfs")]
+impl SourceProvider for VfsProvider {
+    fn is_file(&self, path: &Path) -> bool {
+        matches!(self.map.get(path), Some(VfsEntry::File(_)))
+    }
+    fn is_dir(&self, path: &Path) -> bool {
+        matches!(self.map.get(path), Some(VfsEntry::Dir))
+    }
+    fn read_to_string(&self, path: &Path) -> std::io::Result<String> {
+        match self.map.get(path) {
+            Some(VfsEntry::File(src)) => Ok(src.to_string()),
+            _ => Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("not in embedded stdlib: {}", path.display()),
+            )),
+        }
+    }
+}
+
+/// Mount the embedded stdlib closure at `mount`, add `mount` to `sys.path`, and
+/// install the VFS as the import source.  Called by the web wasm bootstrap
+/// before the first import.
+#[cfg(feature = "wasm_vfs")]
+pub fn mount_embedded_stdlib(mount: &Path) {
+    let provider = VfsProvider::from_blob(VFS_BLOB, mount);
+    add_sys_path(mount);
+    install_source_provider(std::rc::Rc::new(provider));
+}
+
 // ── sys.modules cache ────────────────────────────────────────────────
 // PyPy equivalent: space.sys.get('modules') — a dict mapping module names
 // to module objects. We use a thread-local HashMap<String, PyObjectRef>.
@@ -728,10 +925,10 @@ pub fn set_sys_modules_dict(dict: PyObjectRef) {
 #[derive(Debug)]
 enum FindInfo {
     /// A .py source file was found.
-    #[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
+    #[cfg(feature = "host_env")]
     SourceFile { pathname: PathBuf },
     /// A package directory with __init__.py was found.
-    #[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
+    #[cfg(feature = "host_env")]
     Package { dirpath: PathBuf },
     /// A builtin (Rust-implemented) module was found.
     /// PyPy equivalent: C_BUILTIN modtype in find_module()
@@ -765,7 +962,25 @@ fn find_module(partname: &str, parent_dirs: Option<&[PathBuf]>) -> Option<FindIn
     return find_in_sys_path(partname);
 }
 
-#[cfg(any(not(feature = "host_env"), target_arch = "wasm32"))]
+// wasm has no current_exe / python3 spawn, so there is no `ensure_stdlib_path`
+// lazy detection; `sys.path` is seeded by the wasm bootstrap (the embedded-VFS
+// mount point, or the host stdlib root for the runner). Otherwise this mirrors
+// the native `find_module`: submodule imports search the parent package's
+// `__path__`, top-level names check builtins then sys.path — all FS probes go
+// through the installed `SourceProvider`.
+#[cfg(all(feature = "host_env", target_arch = "wasm32"))]
+fn find_module(partname: &str, parent_dirs: Option<&[PathBuf]>) -> Option<FindInfo> {
+    if let Some(dirs) = parent_dirs {
+        return find_in_dirs(partname, dirs);
+    }
+    let is_builtin = BUILTIN_MODULES.with(|m| m.borrow().contains_key(partname));
+    if is_builtin {
+        return Some(FindInfo::Builtin);
+    }
+    find_in_sys_path(partname)
+}
+
+#[cfg(not(feature = "host_env"))]
 fn find_module(partname: &str, _parent_dirs: Option<&[PathBuf]>) -> Option<FindInfo> {
     let is_builtin = BUILTIN_MODULES.with(|m| m.borrow().contains_key(partname));
     if is_builtin {
@@ -791,19 +1006,19 @@ fn ensure_stdlib_path() {
     });
 }
 
-#[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
+#[cfg(feature = "host_env")]
 fn find_in_dirs(partname: &str, dirs: &[PathBuf]) -> Option<FindInfo> {
     for dir in dirs {
         // Check for package: <dir>/<partname>/__init__.py
         let pkg_dir = dir.join(partname);
         let init_file = pkg_dir.join("__init__.py");
-        if init_file.is_file() {
+        if with_source_provider(|p| p.is_file(&init_file)) {
             return Some(FindInfo::Package { dirpath: pkg_dir });
         }
 
         // Check for source file: <dir>/<partname>.py
         let source_file = dir.join(format!("{partname}.py"));
-        if source_file.is_file() {
+        if with_source_provider(|p| p.is_file(&source_file)) {
             return Some(FindInfo::SourceFile {
                 pathname: source_file,
             });
@@ -812,7 +1027,7 @@ fn find_in_dirs(partname: &str, dirs: &[PathBuf]) -> Option<FindInfo> {
     None
 }
 
-#[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
+#[cfg(feature = "host_env")]
 fn find_in_sys_path(partname: &str) -> Option<FindInfo> {
     SYS_PATH.with(|p| find_in_dirs(partname, &p.borrow()))
 }
@@ -992,14 +1207,14 @@ pub fn appleveldef_install(ns: &mut DictStorage, source: &str, filename: &str, n
 //
 // Parse + execute a .py source file, producing a module object.
 
-#[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
+#[cfg(feature = "host_env")]
 fn load_source_module(
     modulename: &str,
     pathname: &Path,
     package_dir: Option<&Path>,
     execution_context: *const PyExecutionContext,
 ) -> Result<PyObjectRef, crate::PyError> {
-    let source = host_fs::read_to_string(pathname).map_err(|e| {
+    let source = with_source_provider(|p| p.read_to_string(pathname)).map_err(|e| {
         crate::PyError::new(
             crate::PyErrorKind::ImportError,
             format!("cannot read '{}': {e}", pathname.display()),
@@ -1110,7 +1325,7 @@ fn load_source_module(
 // ── load_package ─────────────────────────────────────────────────────
 // PyPy equivalent: load_module with PKG_DIRECTORY modtype
 
-#[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
+#[cfg(feature = "host_env")]
 fn load_package(
     modulename: &str,
     dirpath: &Path,
@@ -1171,7 +1386,7 @@ fn load_part(
     };
 
     let module = match info {
-        #[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
+        #[cfg(feature = "host_env")]
         FindInfo::SourceFile { pathname } => {
             match load_source_module(modulename, &pathname, None, execution_context) {
                 Ok(m) => m,
@@ -1180,7 +1395,7 @@ fn load_part(
                 }
             }
         }
-        #[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
+        #[cfg(feature = "host_env")]
         FindInfo::Package { dirpath } => load_package(modulename, &dirpath, execution_context)?,
         FindInfo::Builtin => {
             // Same builtins-identity path as the full_is_builtin branch
@@ -1646,5 +1861,26 @@ mod tests {
         // Should not find a module that doesn't exist
         let result = find_module("__nonexistent_pyre_test_module__", None);
         assert!(result.is_none());
+    }
+
+    #[cfg(feature = "wasm_vfs")]
+    #[test]
+    fn test_embedded_vfs_round_trips() {
+        let mount = Path::new("/stdlib");
+        let vfs = VfsProvider::from_blob(VFS_BLOB, mount);
+
+        // `re` is a package: its `__init__.py` is a file and `re/` is a dir.
+        assert!(vfs.is_file(&mount.join("re/__init__.py")));
+        assert!(vfs.is_dir(&mount.join("re")));
+        assert!(vfs.is_dir(mount));
+
+        // A top-level module the closure pulls in.
+        assert!(vfs.is_file(&mount.join("enum.py")));
+
+        // Source is readable and non-empty; misses report NotFound.
+        let src = vfs.read_to_string(&mount.join("re/__init__.py")).unwrap();
+        assert!(src.contains("def compile"));
+        assert!(vfs.read_to_string(&mount.join("re/_nope.py")).is_err());
+        assert!(!vfs.is_file(&mount.join("re/_nope.py")));
     }
 }

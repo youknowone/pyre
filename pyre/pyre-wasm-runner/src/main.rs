@@ -51,6 +51,10 @@ struct Host {
     /// Compiled trace `trace` functions, keyed by the id handed back to wasm.
     traces: HashMap<u32, Func>,
     next_id: u32,
+    /// Real stdlib root the wasm module's `pyre_host.*` imports read source
+    /// from (`$PYRE_STDLIB`, forwarded by `pyre/check.py`). The wasm side
+    /// seeds it on `sys.path`, so the host serves genuine absolute paths.
+    stdlib_root: Option<String>,
 }
 
 fn main() {
@@ -135,6 +139,7 @@ fn run(module_path: &PathBuf, source: &str) -> Result<i32> {
 
     let mut store = Store::new(&engine, Host::default());
     store.data_mut().next_id = 1;
+    store.data_mut().stdlib_root = std::env::var("PYRE_STDLIB").ok();
 
     let linker = build_linker(&engine)?;
     let instance = linker
@@ -254,7 +259,106 @@ fn build_linker(engine: &Engine) -> Result<Linker<Host>> {
         },
     )?;
 
+    // Host-filesystem imports for the wasmi build's module loader. The wasm32
+    // module has no filesystem of its own; these serve module source from the
+    // host's real stdlib (`$PYRE_STDLIB`). See `pyre-wasm`'s `host_fs_provider`.
+    linker.func_wrap(
+        "pyre_host",
+        "host_stdlib_root",
+        |mut caller: Caller<'_, Host>, buf_ptr: u32, buf_cap: u32| -> i64 {
+            host_stdlib_root(&mut caller, buf_ptr, buf_cap)
+        },
+    )?;
+    linker.func_wrap(
+        "pyre_host",
+        "host_is_dir",
+        |mut caller: Caller<'_, Host>, path_ptr: u32, path_len: u32| -> u32 {
+            match host_path(&mut caller, path_ptr, path_len) {
+                Some(p) => PathBuf::from(p).is_dir() as u32,
+                None => 0,
+            }
+        },
+    )?;
+    linker.func_wrap(
+        "pyre_host",
+        "host_file_size",
+        |mut caller: Caller<'_, Host>, path_ptr: u32, path_len: u32| -> i64 {
+            match host_path(&mut caller, path_ptr, path_len) {
+                Some(p) => match std::fs::metadata(&p) {
+                    Ok(m) if m.is_file() => m.len() as i64,
+                    _ => -1,
+                },
+                None => -1,
+            }
+        },
+    )?;
+    linker.func_wrap(
+        "pyre_host",
+        "host_read",
+        |mut caller: Caller<'_, Host>,
+         path_ptr: u32,
+         path_len: u32,
+         buf_ptr: u32,
+         buf_cap: u32|
+         -> i64 { host_read(&mut caller, path_ptr, path_len, buf_ptr, buf_cap) },
+    )?;
+
     Ok(linker)
+}
+
+/// Read a host path argument out of wasm linear memory as a `String`.
+fn host_path(caller: &mut Caller<'_, Host>, path_ptr: u32, path_len: u32) -> Option<String> {
+    let memory = caller.data().memory?;
+    let mut bytes = vec![0u8; path_len as usize];
+    memory.read(&*caller, path_ptr as usize, &mut bytes).ok()?;
+    String::from_utf8(bytes).ok()
+}
+
+/// `pyre_host.host_stdlib_root`: write `$PYRE_STDLIB` into the wasm buffer.
+fn host_stdlib_root(caller: &mut Caller<'_, Host>, buf_ptr: u32, buf_cap: u32) -> i64 {
+    let Some(root) = caller.data().stdlib_root.clone() else {
+        return -1;
+    };
+    let bytes = root.as_bytes();
+    if bytes.len() > buf_cap as usize {
+        // Report the needed length without writing; the caller can retry.
+        return bytes.len() as i64;
+    }
+    let Some(memory) = caller.data().memory else {
+        return -1;
+    };
+    if memory.write(&mut *caller, buf_ptr as usize, bytes).is_err() {
+        return -1;
+    }
+    bytes.len() as i64
+}
+
+/// `pyre_host.host_read`: read the host file into the wasm-provided buffer.
+fn host_read(
+    caller: &mut Caller<'_, Host>,
+    path_ptr: u32,
+    path_len: u32,
+    buf_ptr: u32,
+    buf_cap: u32,
+) -> i64 {
+    let Some(path) = host_path(caller, path_ptr, path_len) else {
+        return -1;
+    };
+    let data = match std::fs::read(&path) {
+        Ok(d) => d,
+        Err(_) => return -1,
+    };
+    let n = data.len().min(buf_cap as usize);
+    let Some(memory) = caller.data().memory else {
+        return -1;
+    };
+    if memory
+        .write(&mut *caller, buf_ptr as usize, &data[..n])
+        .is_err()
+    {
+        return -1;
+    }
+    n as i64
 }
 
 /// Compile and instantiate a JIT-emitted trace module, sharing the main
