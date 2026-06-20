@@ -555,16 +555,17 @@ fn raise_speculative_error(reason: &'static str) -> ! {
 pub struct OptContext {
     /// The output operation list being built.
     pub new_operations: Vec<majit_ir::OpRc>,
-    /// optimizer.py:246 `self._emittedoperations = {}` — result positions
-    /// of ops emitted by THIS optimizer run. `as_operation`
-    /// (optimizer.py:369-377) only treats a box as a producer when
-    /// `op in self._emittedoperations`, so pattern-matching rewrites
+    /// optimizer.py:246 `self._emittedoperations = {}` — the result boxes
+    /// of ops emitted by THIS optimizer run, keyed by box identity
+    /// (`Rc::ptr_eq`) to mirror the upstream dict keyed by the `op` object.
+    /// `as_operation` (optimizer.py:369-377) only treats a box as a producer
+    /// when `op in self._emittedoperations`, so pattern-matching rewrites
     /// (e.g. autogenintrules.py int_add chain reassociation) never reach
     /// across an optimization-run boundary into a previous phase's ops.
     /// A Phase-2 lookup that followed a label arg to its Phase-1 producer
     /// would re-express a per-iteration value in terms of the PREAMBLE's
     /// entry value, which the loop header does not carry per-iteration.
-    pub emitted_operations: majit_ir::vec_set::VecSet<OpRef>,
+    pub emitted_operations: majit_ir::vec_set::VecSet<crate::r#box::BoxRef>,
     /// Number of input arguments, used to offset emitted op positions
     /// so that variable indices don't collide with input arg indices.
     num_inputs: u32,
@@ -2752,7 +2753,8 @@ impl OptContext {
                 // clone path below records this too; `get_producing_op` only
                 // admits producers present here, so the reused op must be
                 // marked emitted or it stays invisible to producer matching.
-                self.emitted_operations.insert(op_pos);
+                self.emitted_operations
+                    .insert(crate::r#box::BoxRef::from_bound_op(&reused));
                 self.new_operations.push(reused);
                 return op_pos;
             }
@@ -2795,7 +2797,8 @@ impl OptContext {
             }
         }
         // optimizer.py:674 `self._emittedoperations[op] = None`.
-        self.emitted_operations.insert(op_pos);
+        self.emitted_operations
+            .insert(crate::r#box::BoxRef::from_bound_op(&op_rc));
         self.new_operations.push(op_rc);
         pos_ref
     }
@@ -6459,7 +6462,13 @@ impl OptContext {
         // Walk the forwarding chain first (resoperation.py:58) so the
         // replacement box's producer is read.
         let producer = op.get_box_replacement(false).bound_op()?;
-        if !self.emitted_operations.contains(&producer.pos.get()) {
+        // optimizer.py:369-377 `op in self._emittedoperations` — keyed by the
+        // producer's box identity (`from_bound_op` memoizes one box per op Rc,
+        // so this is the same box recorded at emit).
+        if !self
+            .emitted_operations
+            .contains(&crate::r#box::BoxRef::from_bound_op(&producer))
+        {
             return None;
         }
         Some((*producer).clone())

@@ -797,8 +797,10 @@ impl Optimizer {
             // SAME_AS_*.type parity); the immediate push below makes
             // op_at(fresh) the authoritative type source. No
             // `value_types` write needed (5).
-            ctx.emitted_operations.insert(fresh);
-            ctx.new_operations.push(std::rc::Rc::new(op));
+            let op_rc = std::rc::Rc::new(op);
+            ctx.emitted_operations
+                .insert(crate::r#box::BoxRef::from_bound_op(&op_rc));
+            ctx.new_operations.push(op_rc);
             // Update the field to reference the SameAs result.
             entries[*entry_idx].fields[*field_idx].1 = fresh;
         }
