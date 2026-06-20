@@ -1840,7 +1840,22 @@ fn init_list_type(ns: &mut DictStorage) {
     dict_storage_store(
         ns,
         "__iter__",
-        make_builtin_function_with_arity("__iter__", |args| crate::baseobjspace::iter(args[0]), 1),
+        // Build the storage iterator directly rather than re-entering
+        // `space.iter()` — a `list` subclass that calls `super().__iter__()`
+        // would otherwise be re-dispatched back to its own override.
+        make_builtin_function_with_arity(
+            "__iter__",
+            |args| {
+                let obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+                if obj.is_null() {
+                    return Ok(pyre_object::w_none());
+                }
+                Ok(pyre_object::w_seq_iter_new(obj, unsafe {
+                    pyre_object::w_list_len(obj)
+                }))
+            },
+            1,
+        ),
     );
     dict_storage_store(
         ns,
@@ -3962,13 +3977,19 @@ fn init_tuple_type(ns: &mut DictStorage) {
     dict_storage_store(
         ns,
         "__iter__",
+        // Build the storage iterator directly rather than re-entering
+        // `space.iter()` — a `tuple` subclass that calls `super().__iter__()`
+        // would otherwise be re-dispatched back to its own override.
         make_builtin_function_with_arity(
             "__iter__",
             |args| {
-                if args.is_empty() {
+                let obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+                if obj.is_null() {
                     return Ok(pyre_object::w_none());
                 }
-                crate::baseobjspace::iter(args[0])
+                Ok(pyre_object::w_seq_iter_new(obj, unsafe {
+                    pyre_object::w_tuple_len(obj)
+                }))
             },
             1,
         ),

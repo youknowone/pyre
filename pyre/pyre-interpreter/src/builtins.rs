@@ -3725,19 +3725,15 @@ pub(crate) fn builtin_tuple(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
     }
     let obj = args[0];
     unsafe {
-        if is_tuple(obj) {
-            // `tuple(t) is t` only when `t` is exactly a tuple; a tuple
-            // subclass instance is copied to a fresh base tuple.
-            if is_exact_type(obj, &TUPLE_TYPE) {
-                return Ok(obj);
-            }
-            let n = w_tuple_len(obj);
-            let items: Vec<_> = (0..n)
-                .filter_map(|i| w_tuple_getitem(obj, i as i64))
-                .collect();
-            return Ok(w_tuple_new(items));
+        // `tuple(t)` returns `t` unchanged only for an EXACT tuple
+        // (`PyTuple_CheckExact`); a tuple subclass must be re-iterated
+        // through its (possibly overridden) `__iter__`, and the raw
+        // storage fast paths below likewise apply only to exact
+        // tuple/list instances.
+        if is_exact_tuple(obj) {
+            return Ok(obj);
         }
-        if is_list(obj) {
+        if is_exact_list(obj) {
             let n = w_list_len(obj);
             let items: Vec<_> = (0..n)
                 .filter_map(|i| w_list_getitem(obj, i as i64))
@@ -3754,7 +3750,10 @@ pub(crate) fn builtin_list_ctor(args: &[PyObjectRef]) -> Result<PyObjectRef, cra
     }
     let obj = args[0];
     unsafe {
-        if is_list(obj) {
+        // The raw-storage copy fast paths apply only to EXACT tuple/list
+        // instances; a subclass may override `__iter__`, so it must go
+        // through `collect_iterable` (`iter(obj)`).
+        if is_exact_list(obj) {
             // Copy the list
             let n = w_list_len(obj);
             let items: Vec<_> = (0..n)
@@ -3762,7 +3761,7 @@ pub(crate) fn builtin_list_ctor(args: &[PyObjectRef]) -> Result<PyObjectRef, cra
                 .collect();
             return Ok(w_list_new(items));
         }
-        if is_tuple(obj) {
+        if is_exact_tuple(obj) {
             let n = w_tuple_len(obj);
             let items: Vec<_> = (0..n)
                 .filter_map(|i| w_tuple_getitem(obj, i as i64))

@@ -8546,11 +8546,33 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
         }
     }
     unsafe {
-        // Builtin iterables
+        // Builtin iterables.  An exact list/tuple uses the direct storage
+        // iterator; a subclass may override `__iter__`, in which case the
+        // override is dispatched.  The inherited base `list/tuple.__iter__`
+        // (which itself calls back into `iter()`) is collapsed to the
+        // storage iterator to avoid an infinite recursion.
         if is_list(obj) {
+            if !pyre_object::is_exact_list(obj) {
+                if let Some((src, method)) = lookup_where((*obj).w_class, "__iter__") {
+                    if !std::ptr::eq(src, pyre_object::get_instantiate(&pyre_object::LIST_TYPE))
+                        && !is_none(method)
+                    {
+                        return crate::call::call_function_impl_result(method, &[obj]);
+                    }
+                }
+            }
             return Ok(pyre_object::w_seq_iter_new(obj, w_list_len(obj)));
         }
         if is_tuple(obj) {
+            if !pyre_object::is_exact_tuple(obj) {
+                if let Some((src, method)) = lookup_where((*obj).w_class, "__iter__") {
+                    if !std::ptr::eq(src, pyre_object::get_instantiate(&pyre_object::TUPLE_TYPE))
+                        && !is_none(method)
+                    {
+                        return crate::call::call_function_impl_result(method, &[obj]);
+                    }
+                }
+            }
             return Ok(pyre_object::w_seq_iter_new(obj, w_tuple_len(obj)));
         }
         if pyre_object::is_generic_alias(obj) {

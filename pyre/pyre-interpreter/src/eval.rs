@@ -1732,20 +1732,34 @@ impl IterOpcodeHandler for PyFrame {
                 self.locals_w_mut()[tos] = it;
                 return Ok(());
             }
-            // list → seq_iter
+            // list → seq_iter for an exact list; a subclass may override
+            // `__iter__`, so route it through `space.iter`.
             if pyre_object::is_list(iter) {
-                let len = pyre_object::w_list_len(iter);
-                let seq_iter = pyre_object::w_seq_iter_new(iter, len);
+                if pyre_object::is_exact_list(iter) {
+                    let len = pyre_object::w_list_len(iter);
+                    let seq_iter = pyre_object::w_seq_iter_new(iter, len);
+                    let tos = self.valuestackdepth - 1;
+                    self.locals_w_mut()[tos] = seq_iter;
+                    return Ok(());
+                }
+                let result = crate::baseobjspace::iter(iter)?;
                 let tos = self.valuestackdepth - 1;
-                self.locals_w_mut()[tos] = seq_iter;
+                self.locals_w_mut()[tos] = result;
                 return Ok(());
             }
-            // tuple → seq_iter
+            // tuple → seq_iter for an exact tuple; a subclass may override
+            // `__iter__`, so route it through `space.iter`.
             if pyre_object::is_tuple(iter) {
-                let len = pyre_object::w_tuple_len(iter);
-                let seq_iter = pyre_object::w_seq_iter_new(iter, len);
+                if pyre_object::is_exact_tuple(iter) {
+                    let len = pyre_object::w_tuple_len(iter);
+                    let seq_iter = pyre_object::w_seq_iter_new(iter, len);
+                    let tos = self.valuestackdepth - 1;
+                    self.locals_w_mut()[tos] = seq_iter;
+                    return Ok(());
+                }
+                let result = crate::baseobjspace::iter(iter)?;
                 let tos = self.valuestackdepth - 1;
-                self.locals_w_mut()[tos] = seq_iter;
+                self.locals_w_mut()[tos] = result;
                 return Ok(());
             }
             // str → list of 1-char strings → seq_iter

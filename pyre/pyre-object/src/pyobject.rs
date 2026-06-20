@@ -683,6 +683,22 @@ pub unsafe fn is_tuple(obj: PyObjectRef) -> bool {
     }
 }
 
+/// `PyTuple_CheckExact` — an exact `tuple`, excluding tuple subclasses.
+/// Covers the specialised arity-2 variants too: they all carry
+/// `w_class == get_instantiate(&TUPLE_TYPE)`, so comparing the user-visible
+/// class object (not `get_instantiate(ob_type)`) keeps them exact while a
+/// subclass instance (retagged `w_class`) reads as non-exact.
+#[inline]
+pub unsafe fn is_exact_tuple(obj: PyObjectRef) -> bool {
+    unsafe { is_tuple(obj) && std::ptr::eq((*obj).w_class, get_instantiate(&TUPLE_TYPE)) }
+}
+
+/// `PyList_CheckExact` — an exact `list`, excluding list subclasses.
+#[inline]
+pub unsafe fn is_exact_list(obj: PyObjectRef) -> bool {
+    unsafe { is_list(obj) && std::ptr::eq((*obj).w_class, get_instantiate(&LIST_TYPE)) }
+}
+
 /// `pypy/objspace/std/dictmultiobject.py` makes both `W_DictObject` and
 /// `W_ModuleDictObject` subclasses of `W_DictMultiObject`, so user-level
 /// `isinstance(obj, dict)` is true for both.  Pyre exposes each layout
