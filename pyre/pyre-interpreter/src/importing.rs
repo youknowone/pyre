@@ -1152,11 +1152,12 @@ fn exec_code_module(
     // Code.exec_code → space.createframe(...) + frame.run().  Surface
     // initialize_frame_scopes' freevar/closure mismatch (TypeError /
     // ValueError per pyframe.py:242-253) as PyError so the importer
-    // reports it instead of panicking.  Route through run() so the
+    // reports it instead of panicking.  Route through run_with_jit so the
     // GENERATOR / COROUTINE / ASYNC_GENERATOR dispatch in
-    // pyframe.py:268-273 holds for the import path too.
+    // pyframe.py:268-273 holds for the import path too, and so an imported
+    // module's top-level hot loop reaches the JIT portal.
     let mut frame = crate::createframe(w_code as *const (), namespace, execution_context, None)?;
-    frame.run()
+    frame.run_with_jit()
 }
 
 // ── appleveldef_install ──────────────────────────────────────────────
@@ -1190,7 +1191,7 @@ pub fn appleveldef_install(ns: &mut DictStorage, source: &str, filename: &str, n
     let w_code = crate::w_code_new(code_ptr as *const ());
     let mut frame = crate::createframe(w_code as *const (), app_ns_ptr, ctx, None)
         .unwrap_or_else(|e| panic!("appleveldef `{filename}`: createframe — {e:?}"));
-    if let Err(e) = frame.run() {
+    if let Err(e) = frame.run_with_jit() {
         panic!("appleveldef `{filename}`: exec — {e:?}");
     }
     let app_ns_ref = unsafe { &*app_ns_ptr };
