@@ -162,6 +162,17 @@ impl W_Unpickler {
         w_module: PyObjectRef,
         w_name: PyObjectRef,
     ) -> Result<PyObjectRef, PyError> {
+        // `find_class` is public; reject non-str args before the unchecked
+        // `w_str_get_value` reinterpret cast (a non-str would be UB).
+        if !unsafe { pyre_object::is_str(w_module) } {
+            return Err(PyError::type_error("module name must be a string"));
+        }
+        if !unsafe { pyre_object::is_str(w_name) } {
+            return Err(PyError::type_error(format!(
+                "attribute name must be string, not '{}'",
+                crate::baseobjspace::object_functionstr_type_name(w_name)
+            )));
+        }
         let module = unsafe { pyre_object::strobject::w_str_get_value(w_module) }.to_string();
         let name = unsafe { pyre_object::strobject::w_str_get_value(w_name) }.to_string();
         audit_find_class(&module, &name)?;
@@ -919,11 +930,7 @@ fn dispatch(slot: usize, opcode: u8) -> Result<(), PyError> {
         x if x == op::GLOBAL => {
             let module = read_line(slot)?;
             let name = read_line(slot)?;
-            let v = call_find_class(
-                slot,
-                pyre_object::w_str_new(&module),
-                pyre_object::w_str_new(&name),
-            )?;
+            let v = call_find_class_names(slot, &module, &name)?;
             push(slot, v);
         }
         x if x == op::STACK_GLOBAL => {
@@ -1040,11 +1047,7 @@ fn dispatch(slot: usize, opcode: u8) -> Result<(), PyError> {
         x if x == op::INST => {
             let module = read_line(slot)?;
             let name = read_line(slot)?;
-            let w_cls = call_find_class(
-                slot,
-                pyre_object::w_str_new(&module),
-                pyre_object::w_str_new(&name),
-            )?;
+            let w_cls = call_find_class_names(slot, &module, &name)?;
             let w_args = pop_mark(slot)?;
             let v = instantiate(w_cls, w_args)?;
             push(slot, v);
@@ -1143,6 +1146,22 @@ fn read_line_int(slot: usize) -> Result<i64, PyError> {
 
 /// Dispatch to `self.find_class(module, name)` through the instance, so a
 /// Python subclass override (the standard security hook) is honoured.
+/// `call_find_class` for two fresh module/name strings: allocate and pin the
+/// module string before allocating the name string, so the second `w_str_new`
+/// cannot relocate the first before both are rooted.
+fn call_find_class_names(slot: usize, module: &str, name: &str) -> Result<PyObjectRef, PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let w_module = pyre_object::w_str_new(module);
+    pyre_object::gc_roots::pin_root(w_module);
+    let module_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let w_name = pyre_object::w_str_new(name);
+    call_find_class(
+        slot,
+        pyre_object::gc_roots::shadow_stack_get(module_slot),
+        w_name,
+    )
+}
+
 fn call_find_class(
     slot: usize,
     w_module: PyObjectRef,
@@ -1342,11 +1361,13 @@ fn persistent_load(slot: usize, w_pid: PyObjectRef) -> Result<PyObjectRef, PyErr
     pyre_object::gc_roots::pin_root(w_pid);
     let pid_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     let self_obj = pyre_object::gc_roots::shadow_stack_get(slot);
-    match crate::baseobjspace::findattr(self_obj, "persistent_load") {
-        Some(f) if !unsafe { pyre_object::is_none(f) } => {
-            call_fn(f, &[pyre_object::gc_roots::shadow_stack_get(pid_slot)])
-        }
-        _ => Err(unpickling_error(
+    // `findattr_result` propagates a descriptor's own error instead of panicking;
+    // an explicit `persistent_load = None` is kept as the hook so `call_fn(None,
+    // pid)` raises `TypeError: 'NoneType' object is not callable` (only an absent
+    // attribute disables the hook).
+    match crate::baseobjspace::findattr_result(self_obj, "persistent_load")? {
+        Some(f) => call_fn(f, &[pyre_object::gc_roots::shadow_stack_get(pid_slot)]),
+        None => Err(unpickling_error(
             "A load persistent id instruction was encountered, but no persistent_load function was specified.",
         )),
     }

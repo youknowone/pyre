@@ -10357,6 +10357,14 @@ pub(crate) fn bytes_method_decode(args: &[PyObjectRef]) -> Result<PyObjectRef, c
     // `bytes.decode(encoding='utf-8', errors='strict')` — both parameters
     // are positional-or-keyword, so accept them from either side.
     let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    crate::builtins::kwarg_reject_unknown(kwargs, &["encoding", "errors"], "decode")?;
+    // `encoding` is positional-or-keyword at position 1; giving it both ways is
+    // a TypeError (the rarer 3-positional `errors` over-count is not modelled).
+    if pos.len() > 1 && crate::builtins::kwarg_get(kwargs, "encoding").is_some() {
+        return Err(crate::PyError::type_error(
+            "argument for decode() given by name ('encoding') and position (1)",
+        ));
+    }
     let data = unsafe { pyre_object::bytesobject::bytes_like_data(pos[0]) };
     let w_encoding = pos
         .get(1)

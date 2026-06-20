@@ -448,9 +448,9 @@ crate::py_module! {
             #[default(pyre_object::boolobject::w_bool_from(true))] fix_imports: PyObjectRef,
             #[default(pyre_object::w_none())] buffer_callback: PyObjectRef,
         ) -> Result<PyObjectRef, PyError> {
-            let proto = pickler::normalize_protocol(protocol)?;
-            pickler::check_buffer_callback(buffer_callback, proto)?;
-            let fix = crate::baseobjspace::is_true(fix_imports)?;
+            // Pin every input before any Python-visible work: `normalize_protocol`
+            // (`__index__`) and `is_true` (`__bool__`) run user code and can
+            // relocate objects under the moving GC.
             let _roots = pyre_object::gc_roots::push_roots();
             pyre_object::gc_roots::pin_root(obj);
             let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
@@ -458,9 +458,22 @@ crate::py_module! {
             let bc_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
             pyre_object::gc_roots::pin_root(file);
             let file_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+            pyre_object::gc_roots::pin_root(protocol);
+            let proto_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+            pyre_object::gc_roots::pin_root(fix_imports);
+            let fix_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+            let proto = pickler::normalize_protocol(pyre_object::gc_roots::shadow_stack_get(
+                proto_slot,
+            ))?;
+            pickler::check_buffer_callback(pyre_object::gc_roots::shadow_stack_get(bc_slot), proto)?;
+            let fix =
+                crate::baseobjspace::is_true(pyre_object::gc_roots::shadow_stack_get(fix_slot))?;
             // The dump-time `dispatch_table` (no per-pickler one here) — its
-            // `copyreg` import can collect, so resolve it with `obj` pinned.
+            // `copyreg` import can collect; pin it before the memo allocation.
             let dispatch_table = pickler::copyreg_dispatch_table();
+            pyre_object::gc_roots::pin_root(dispatch_table);
+            let dt_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+            let w_memo = pyre_object::listobject::w_list_new(Vec::new());
             // Pass `file` so `pickle_core` streams the frames to it directly.
             pickler::pickle_core(
                 pyre_object::gc_roots::shadow_stack_get(obj_slot),
@@ -471,9 +484,9 @@ crate::py_module! {
                 fix,
                 pyre_object::PY_NULL,
                 pyre_object::gc_roots::shadow_stack_get(bc_slot),
-                pyre_object::listobject::w_list_new(Vec::new()),
+                w_memo,
                 false,
-                dispatch_table,
+                pyre_object::gc_roots::shadow_stack_get(dt_slot),
                 pyre_object::PY_NULL,
             )?;
             Ok(pyre_object::w_none())
@@ -486,15 +499,27 @@ crate::py_module! {
             #[default(pyre_object::boolobject::w_bool_from(true))] fix_imports: PyObjectRef,
             #[default(pyre_object::w_none())] buffer_callback: PyObjectRef,
         ) -> Result<PyObjectRef, PyError> {
-            let proto = pickler::normalize_protocol(protocol)?;
-            pickler::check_buffer_callback(buffer_callback, proto)?;
-            let fix = crate::baseobjspace::is_true(fix_imports)?;
+            // Pin every input before any Python-visible work (`__index__` /
+            // `__bool__` / `copyreg` import / memo alloc can relocate objects).
             let _roots = pyre_object::gc_roots::push_roots();
             pyre_object::gc_roots::pin_root(obj);
             let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
             pyre_object::gc_roots::pin_root(buffer_callback);
             let bc_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+            pyre_object::gc_roots::pin_root(protocol);
+            let proto_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+            pyre_object::gc_roots::pin_root(fix_imports);
+            let fix_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+            let proto = pickler::normalize_protocol(pyre_object::gc_roots::shadow_stack_get(
+                proto_slot,
+            ))?;
+            pickler::check_buffer_callback(pyre_object::gc_roots::shadow_stack_get(bc_slot), proto)?;
+            let fix =
+                crate::baseobjspace::is_true(pyre_object::gc_roots::shadow_stack_get(fix_slot))?;
             let dispatch_table = pickler::copyreg_dispatch_table();
+            pyre_object::gc_roots::pin_root(dispatch_table);
+            let dt_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+            let w_memo = pyre_object::listobject::w_list_new(Vec::new());
             // No file: `pickle_core` accumulates and returns the pickle bytes.
             pickler::pickle_core(
                 pyre_object::gc_roots::shadow_stack_get(obj_slot),
@@ -505,9 +530,9 @@ crate::py_module! {
                 fix,
                 pyre_object::PY_NULL,
                 pyre_object::gc_roots::shadow_stack_get(bc_slot),
-                pyre_object::listobject::w_list_new(Vec::new()),
+                w_memo,
                 false,
-                dispatch_table,
+                pyre_object::gc_roots::shadow_stack_get(dt_slot),
                 pyre_object::PY_NULL,
             )
         }

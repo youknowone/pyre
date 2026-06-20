@@ -2267,6 +2267,27 @@ pub fn findattr(obj: PyObjectRef, name: &str) -> Option<PyObjectRef> {
     }
 }
 
+/// Like [`findattr`] but propagates a non-`AttributeError`/`NameError` error
+/// (e.g. a descriptor or `__getattr__` raising) instead of panicking. `Ok(None)`
+/// means the attribute is absent.
+pub fn findattr_result(obj: PyObjectRef, name: &str) -> Result<Option<PyObjectRef>, PyError> {
+    if unsafe { is_none(obj) } {
+        return Ok(None);
+    }
+    match getattr_str(obj, name) {
+        Ok(value) => Ok(Some(value)),
+        Err(err) => {
+            if err.kind == crate::PyErrorKind::AttributeError
+                || err.kind == crate::PyErrorKind::NameError
+            {
+                Ok(None)
+            } else {
+                Err(err)
+            }
+        }
+    }
+}
+
 /// Check whether `exc_type` matches `check_class`, including tuple/list class inputs.
 pub fn exception_match(exc_type: PyObjectRef, check_class: PyObjectRef) -> bool {
     let (exc_type, check_class) = (exc_type, check_class);
@@ -8909,17 +8930,34 @@ pub fn next(obj: PyObjectRef) -> PyResult {
         //         if pred ^ self.reverse:
         //             return w_obj
         if pyre_object::filterobject::is_filter(obj) {
-            let it = &mut *(obj as *mut pyre_object::filterobject::W_Filter);
+            // `next`, the predicate, and `is_true`/`__bool__` all run Python and
+            // can move the filter and the yielded item; pin the filter and re-read
+            // its fields after each call, and pin the item across the predicate.
+            let _roots = pyre_object::gc_roots::push_roots();
+            pyre_object::gc_roots::pin_root(obj);
+            let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
             loop {
-                let w_obj = next(it.w_iterable)?;
-                let pred = if it.w_predicate.is_null() {
-                    is_true(w_obj)?
+                let w_iterable = (*(pyre_object::gc_roots::shadow_stack_get(obj_slot)
+                    as *const pyre_object::filterobject::W_Filter))
+                    .w_iterable;
+                let w_obj = next(w_iterable)?;
+                let _r = pyre_object::gc_roots::push_roots();
+                pyre_object::gc_roots::pin_root(w_obj);
+                let w_obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+                let w_predicate = (*(pyre_object::gc_roots::shadow_stack_get(obj_slot)
+                    as *const pyre_object::filterobject::W_Filter))
+                    .w_predicate;
+                let pred = if w_predicate.is_null() {
+                    is_true(pyre_object::gc_roots::shadow_stack_get(w_obj_slot))?
                 } else {
-                    let w_pred = crate::call::call_function_impl_result(it.w_predicate, &[w_obj])?;
+                    let w_pred = crate::call::call_function_impl_result(
+                        w_predicate,
+                        &[pyre_object::gc_roots::shadow_stack_get(w_obj_slot)],
+                    )?;
                     is_true(w_pred)?
                 };
                 if pred {
-                    return Ok(w_obj);
+                    return Ok(pyre_object::gc_roots::shadow_stack_get(w_obj_slot));
                 }
             }
         }
@@ -9177,13 +9215,22 @@ pub fn next(obj: PyObjectRef) -> PyResult {
             use pyre_object::reversedobject as ro;
             let remaining = ro::w_reversed_get_remaining(obj);
             if remaining >= 0 {
+                // `getitem` runs `__getitem__` (Python) and can move the reversed
+                // iterator; pin it and write its state through the re-read pointer.
+                let _roots = pyre_object::gc_roots::push_roots();
+                pyre_object::gc_roots::pin_root(obj);
+                let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
                 let seq = ro::w_reversed_get_sequence(obj);
                 match getitem(seq, w_int_new(remaining)) {
                     Ok(w_item) => {
-                        ro::w_reversed_set_remaining(obj, remaining - 1);
+                        ro::w_reversed_set_remaining(
+                            pyre_object::gc_roots::shadow_stack_get(obj_slot),
+                            remaining - 1,
+                        );
                         return Ok(w_item);
                     }
                     Err(e) => {
+                        let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
                         ro::w_reversed_set_remaining(obj, -1);
                         ro::w_reversed_set_sequence(obj, pyre_object::PY_NULL);
                         if e.kind == PyErrorKind::IndexError || e.kind == PyErrorKind::StopIteration

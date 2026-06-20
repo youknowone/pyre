@@ -304,13 +304,19 @@ impl W_Pickler {
         let w_memo = self.w_memo;
         let self_ptr = self as *mut W_Pickler as PyObjectRef;
 
-        // Pin `w_file` and the memo list before the `persistent_id` lookup,
-        // whose allocation could otherwise relocate them.
+        // Pin everything that must survive the `persistent_id` /
+        // `reducer_override` / `dispatch_table` lookups below: each runs Python
+        // (a property / `__getattr__` / `copyreg` import) and can relocate
+        // objects under the moving GC.
         let _roots = pyre_object::gc_roots::push_roots();
+        pyre_object::gc_roots::pin_root(w_obj);
+        let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         pyre_object::gc_roots::pin_root(w_file);
         let file_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         pyre_object::gc_roots::pin_root(w_memo);
         let memo_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+        pyre_object::gc_roots::pin_root(buffer_callback);
+        let cb_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
 
         // `persistent_id` resolves to a subclass method override or the
         // instance value set through the getter (its getter raises while
@@ -318,28 +324,42 @@ impl W_Pickler {
         // is a subclass hook only.  An explicit `persistent_id = None` is kept
         // as the hook: `dump` then calls `None(obj)` and raises `TypeError`,
         // matching `_pickle` (only deleting/leaving it unset disables it).
-        let pers_func = crate::baseobjspace::findattr(self_ptr, "persistent_id")
+        // `findattr_result` propagates a hook property's own error instead of
+        // panicking; each resolved hook is pinned before the next lookup.
+        let pers_func = crate::baseobjspace::findattr_result(self_ptr, "persistent_id")?
             .unwrap_or(pyre_object::PY_NULL);
-        let reducer_override = crate::baseobjspace::findattr(self_ptr, "reducer_override")
+        pyre_object::gc_roots::pin_root(pers_func);
+        let pers_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+        let reducer_override = crate::baseobjspace::findattr_result(self_ptr, "reducer_override")?
             .filter(|&f| !unsafe { pyre_object::is_none(f) })
             .unwrap_or(pyre_object::PY_NULL);
+        pyre_object::gc_roots::pin_root(reducer_override);
+        let reducer_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         // `interp_pickle.py:686-690` — the internal `dispatch_table` field,
         // else a dynamically-resolved `dispatch_table` attribute (a subclass
-        // class attr / property), else the global `copyreg.dispatch_table`.
+        // class attr / property), else the global `copyreg.dispatch_table`.  An
+        // explicit `dispatch_table = None` is honored as the table (later
+        // subscripting `None[type]` raises `TypeError`); only an absent
+        // attribute falls back to `copyreg`.
         let dispatch_table = if !w_dispatch_table.is_null() {
             w_dispatch_table
-        } else if let Some(dt) = crate::baseobjspace::findattr(self_ptr, "dispatch_table")
-            .filter(|&d| !unsafe { pyre_object::is_none(d) })
-        {
+        } else if let Some(dt) = crate::baseobjspace::findattr_result(self_ptr, "dispatch_table")? {
             dt
         } else {
             copyreg_dispatch_table()
         };
+        pyre_object::gc_roots::pin_root(dispatch_table);
+        let dt_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
 
+        // Re-read every pinned value: the lookups / `copyreg` import above may
+        // have collected. `pickle_core` streams the frames to `w_file`.
+        let w_obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
         let w_memo = pyre_object::gc_roots::shadow_stack_get(memo_slot);
-        // `w_file` may have moved during the hook lookups; re-read the pin.
-        // `pickle_core` streams the frames to it as they are produced.
         let w_file = pyre_object::gc_roots::shadow_stack_get(file_slot);
+        let buffer_callback = pyre_object::gc_roots::shadow_stack_get(cb_slot);
+        let pers_func = pyre_object::gc_roots::shadow_stack_get(pers_slot);
+        let reducer_override = pyre_object::gc_roots::shadow_stack_get(reducer_slot);
+        let dispatch_table = pyre_object::gc_roots::shadow_stack_get(dt_slot);
         pickle_core(
             w_obj,
             w_file,
@@ -552,6 +572,12 @@ mod memo_proxy {
                     )
                 }
                 .unwrap();
+                // Gap slots from a sparse `set_memo` hold the `None` placeholder,
+                // not real memo entries; skip them so `copy()` exposes only the
+                // memoized objects (an id-keyed, gap-free snapshot).
+                if unsafe { pyre_object::is_none(obj) } {
+                    continue;
+                }
                 // `(index, obj)` — `w_tuple_new` pins its inputs across the malloc.
                 let tup = pyre_object::tupleobject::w_tuple_new(vec![
                     pyre_object::w_int_new(i as i64),
@@ -1711,6 +1737,14 @@ fn whichmodule(w_obj: PyObjectRef, name: &str) -> Result<PyObjectRef, PyError> {
             let modules = crate::importing::sys_modules_dict();
             let mut found: Option<String> = None;
             if !modules.is_null() {
+                // `getattribute_dotted` runs Python and can relocate objects, so
+                // pin `w_obj` and every candidate module up front (capturing each
+                // name as an owned String — GC-independent), then scan via the
+                // pinned slots. The snapshot loop itself triggers no collection.
+                let _roots = pyre_object::gc_roots::push_roots();
+                pyre_object::gc_roots::pin_root(w_obj);
+                let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+                let mut candidates: Vec<(String, usize)> = Vec::new();
                 for (w_modname, w_module) in
                     unsafe { pyre_object::dictmultiobject::w_dict_items(modules) }
                 {
@@ -1724,8 +1758,16 @@ fn whichmodule(w_obj: PyObjectRef, name: &str) -> Result<PyObjectRef, PyError> {
                     if modname == "__main__" || modname == "__mp_main__" {
                         continue;
                     }
+                    pyre_object::gc_roots::pin_root(w_module);
+                    candidates.push((modname, pyre_object::gc_roots::shadow_stack_len() - 1));
+                }
+                for (modname, mod_slot) in candidates {
+                    let w_module = pyre_object::gc_roots::shadow_stack_get(mod_slot);
                     if let Ok((resolved, _)) = getattribute_dotted(w_module, name) {
-                        if crate::baseobjspace::is_w(resolved, w_obj) {
+                        if crate::baseobjspace::is_w(
+                            resolved,
+                            pyre_object::gc_roots::shadow_stack_get(obj_slot),
+                        ) {
                             found = Some(modname);
                             break;
                         }
@@ -1862,12 +1904,15 @@ fn extension_code(module_name: &str, name: &str) -> Option<i64> {
     crate::baseobjspace::int_w(code).ok()
 }
 
-/// Emit the size-appropriate EXT opcode for a (positive) extension code.
+/// Emit the size-appropriate EXT opcode for an extension code. `save_global`
+/// requires `0 < code <= 0x7fffffff`; anything else is out of range.
 fn write_ext(buf: &mut Framer, code: i64) -> Result<(), PyError> {
+    if code <= 0 || code > 0x7fffffff {
+        return Err(PyError::runtime_error(format!(
+            "extension code {code} is out of range"
+        )));
+    }
     if code <= 0xff {
-        if code == 0 {
-            return Err(PyError::runtime_error("extension code 0 is out of range"));
-        }
         buf.push(op::EXT1);
         buf.push(code as u8);
     } else if code <= 0xffff {

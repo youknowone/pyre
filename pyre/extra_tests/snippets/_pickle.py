@@ -498,7 +498,7 @@ def _run_oob():
     try:
         pb.raw()
         raise AssertionError("expected error after release")
-    except (ValueError, Exception):
+    except ValueError:
         pass
 
 
