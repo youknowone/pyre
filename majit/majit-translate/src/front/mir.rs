@@ -4249,6 +4249,7 @@ impl<'a> Lowering<'a> {
                             )
                         })
                         .or_else(|| self.trait_into_string_alias(&segments, &args, &call.dest.ty))
+                        .or_else(|| self.wtf8_string_identity_alias(&segments, &args))
                         .or_else(|| {
                             self.oparg_arg_get_alias(&reg.kind, &segments, &args, &call.dest.ty)
                         })
@@ -5721,6 +5722,34 @@ impl<'a> Lowering<'a> {
         };
         let dest_path = self.tyref_adt_name_path(dest_ty)?;
         (dest_path == "alloc::string::String").then(|| arg.clone())
+    }
+
+    /// Resolve the WTF-8 string wrappers `Wtf8::new(&str) -> &Wtf8` and
+    /// `Wtf8Buf::from_string(String) -> Wtf8Buf` to their sole string
+    /// argument.  Rust's `&str` / `String` / `Wtf8` / `Wtf8Buf` all map
+    /// to the single immutable rpy_string value (`project_pyre_field_type`
+    /// — `s_unicode0`, matching upstream's one string type in `rstr.py`),
+    /// so the wrap is an identity at the annotation level; the boxing the
+    /// callers want (`box_str_constant`) happens downstream on the bound
+    /// value.  Both bodies are Opaque in the LLBC (external
+    /// `rustpython_wtf8` crate), leaving the generic `Call` permanently
+    /// unliftable.
+    fn wtf8_string_identity_alias(
+        &self,
+        segments: &[String],
+        args: &[Variable],
+    ) -> Option<Variable> {
+        let [arg] = args else {
+            return None;
+        };
+        matches!(
+            segments,
+            [a, b] if matches!(
+                (a.as_str(), b.as_str()),
+                ("Wtf8", "new") | ("Wtf8Buf", "from_string")
+            )
+        )
+        .then(|| arg.clone())
     }
 
     /// The fully-qualified `name_path()` of the ADT a [`TyRef`]
