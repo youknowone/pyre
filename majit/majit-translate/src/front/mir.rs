@@ -3290,6 +3290,7 @@ impl<'a> Lowering<'a> {
                 }
                 let op = self
                     .static_addr_op(&segments)
+                    .or_else(|| self.static_int_value_op(&segments))
                     .or_else(|| self.const_eval_global(id))
                     .or_else(|| primitive_float_const(&segments))
                     .unwrap_or_else(|| OpKind::Call {
@@ -3607,6 +3608,26 @@ impl<'a> Lowering<'a> {
         for (key, addr) in self.static_addrs.refs {
             if static_key_matches(&full, &stripped, key) {
                 return Some(OpKind::ConstRefAddr(*addr));
+            }
+        }
+        None
+    }
+
+    /// Value of an immutable size `const` baked at build time
+    /// (`HostStaticAddrs.int_values`).  The initializer is a
+    /// `size_of::<T>()` the front-end cannot evaluate from the LLBC
+    /// (Charon leaves the target-dependent layout symbolic), so the
+    /// driver captures its compile-time value and the read folds to the
+    /// same `ConstInt` an inline integer literal produces — rather than a
+    /// 0-arg accessor call no registry resolves.  The value is identical
+    /// at the call site (the JIT is native: host target == runtime
+    /// target).
+    fn static_int_value_op(&self, segments: &[String]) -> Option<OpKind> {
+        let full = segments.join("::");
+        let stripped = strip_crate_prefix(&full);
+        for (key, value) in self.static_addrs.int_values {
+            if static_key_matches(&full, &stripped, key) {
+                return Some(OpKind::ConstInt(*value));
             }
         }
         None

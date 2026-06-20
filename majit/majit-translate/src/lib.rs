@@ -367,6 +367,10 @@ pub type ImplFnAddrBindings<'a> = [(&'a str, &'a str, &'a str, i64)];
 pub struct HostStaticAddrs<'a> {
     pub pytypes: &'a [(&'a str, i64)],
     pub refs: &'a [(&'a str, i64)],
+    /// Immutable size `const`s baked as their compile-time value
+    /// (`ValueType::Int` `ConstInt`), keyed by crate-stripped
+    /// `module::NAME`.  Distinct from `refs`: the value, not the address.
+    pub int_values: &'a [(&'a str, i64)],
 }
 
 /// Multi-file analysis with explicit per-source module paths.

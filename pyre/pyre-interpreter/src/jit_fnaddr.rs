@@ -1264,6 +1264,33 @@ pub fn jit_static_ref_addrs() -> Vec<(&'static str, i64)> {
     ]
 }
 
+/// Build-time *values* of the immutable size constants pyre source reads
+/// through the flowgraph as opaque `LOAD_GLOBAL` constants.  Unlike the
+/// `refs`/`pytypes` siblings (which carry a static's *address*), these are
+/// compile-time `const`s whose initializer is a `size_of::<T>()` the
+/// front-end cannot evaluate (Charon leaves the target-dependent layout
+/// symbolic).  The value is identical at the codewriter call site, so the
+/// front-end bakes it directly as a `ConstInt` instead of minting an
+/// accessor call no registry can resolve.
+///
+/// Resolved in the same build-script process the translator runs in, so
+/// the captured size matches a direct `size_of::<T>()` at the call site
+/// (the JIT is native — host target == runtime target).  Keys are the
+/// crate-stripped `module::NAME` spelling `front::mir::static_int_value_op`
+/// matches against the `FunctionPath` segments.
+pub fn jit_static_int_values() -> Vec<(&'static str, i64)> {
+    vec![
+        (
+            "function::FUNCTION_OBJECT_SIZE",
+            crate::function::FUNCTION_OBJECT_SIZE as i64,
+        ),
+        (
+            "dictmultiobject::W_DICT_OBJECT_SIZE",
+            pyre_object::dictmultiobject::W_DICT_OBJECT_SIZE as i64,
+        ),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::jit_trace_fnaddrs;

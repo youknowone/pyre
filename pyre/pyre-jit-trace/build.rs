@@ -262,9 +262,11 @@ fn real_main() {
     // call site.
     let static_pytype_addrs = pyre_interpreter::jit_static_pytype_addrs();
     let static_ref_addrs = pyre_interpreter::jit_static_ref_addrs();
+    let static_int_values = pyre_interpreter::jit_static_int_values();
     let static_addrs = majit_translate::HostStaticAddrs {
         pytypes: &static_pytype_addrs,
         refs: &static_ref_addrs,
+        int_values: &static_int_values,
     };
     // Per-source crate-stripped module paths — the analyzer-side
     // metadata (`front::mir`) records
