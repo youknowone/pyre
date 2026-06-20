@@ -27,41 +27,54 @@ pub struct GcConfig {
     pub card_page_indices: u32,
 }
 
-fn read_size_from_env(varname: &str) -> Option<usize> {
-    // rpython/memory/gc/env.py:17-40 `_read_float_and_factor_from_env`
-    // accepts plain numbers plus K/M/G suffixes, optionally followed by B.
+/// env.py:17-36 `_read_float_and_factor_from_env`. Parse `varname` as a float
+/// with an optional `k`/`m`/`g` size suffix (optionally followed by `b`/`B`),
+/// returning `(value, factor)`. `None` mirrors PyPy's `(0.0, 0)` absent /
+/// unparseable result, which callers treat as "unset".
+fn read_float_and_factor_from_env(varname: &str) -> Option<(f64, f64)> {
     let raw = std::env::var(varname).ok()?;
     let mut value = raw.trim();
     if value.is_empty() {
         return None;
     }
+    // env.py:20-21 — a trailing b/B is dropped before the k/m/g check.
     if value.len() > 1 && matches!(value.as_bytes().last(), Some(b'b' | b'B')) {
         value = &value[..value.len() - 1];
     }
     if value.is_empty() {
         return None;
     }
+    // env.py:22-31 — a k/m/g suffix sets the factor; otherwise factor 1.
     let (number, factor) = match value.as_bytes().last().copied() {
         Some(b'k') | Some(b'K') => (&value[..value.len() - 1], 1024.0),
         Some(b'm') | Some(b'M') => (&value[..value.len() - 1], 1024.0 * 1024.0),
         Some(b'g') | Some(b'G') => (&value[..value.len() - 1], 1024.0 * 1024.0 * 1024.0),
-        Some(_) => (value, 1.0),
-        None => return None,
+        _ => (value, 1.0),
     };
     let parsed = number.parse::<f64>().ok()?;
-    let bytes = parsed * factor;
+    Some((parsed, factor))
+}
+
+/// env.py:38-44 `read_from_env` / `read_uint_from_env`: `value * factor` as an
+/// integer byte count. `None` (unset / unparseable / non-positive) lets callers
+/// fall back to the default, mirroring PyPy's `if x > 0` guards. PyPy's
+/// `read_uint_from_env` r_uint-wraps a negative product to a huge positive; pyre
+/// treats non-positive as unset, differing only on nonsensical negative input.
+fn read_uint_from_env(varname: &str) -> Option<usize> {
+    let (value, factor) = read_float_and_factor_from_env(varname)?;
+    let bytes = value * factor;
     (bytes > 0.0).then_some(bytes as usize)
 }
 
+/// env.py:46-50 `read_float_from_env`: the plain float, but only when no size
+/// factor was given (`factor != 1` → unset). Callers apply their own `> 1.0`
+/// threshold gate.
 fn read_float_from_env(varname: &str) -> Option<f64> {
-    // rpython/memory/gc/env.py:43-66 `read_float_from_env`: a plain float,
-    // or 0.0 (treated as absent) if it cannot be parsed.
-    let raw = std::env::var(varname).ok()?;
-    let value = raw.trim();
-    if value.is_empty() {
+    let (value, factor) = read_float_and_factor_from_env(varname)?;
+    if factor != 1.0 {
         return None;
     }
-    value.parse::<f64>().ok().filter(|v| *v > 0.0)
+    Some(value)
 }
 
 /// env.py:387-411 `get_darwin_sysctl_signed`: read a signed integer sysctl by
@@ -127,7 +140,7 @@ fn default_nursery_size() -> usize {
     //   if newsize <= 0: newsize = defaultsize
     // estimate_best_nursery_size never returns <= 0 (its floor is the 4MB
     // unknown-cache fallback), so the final `defaultsize` arm is unreachable.
-    read_size_from_env("PYPY_GC_NURSERY").unwrap_or_else(estimate_best_nursery_size)
+    read_uint_from_env("PYPY_GC_NURSERY").unwrap_or_else(estimate_best_nursery_size)
 }
 
 /// env.py:67 `addressable_size = float(2**63)` for a 64-bit host: the most
@@ -410,16 +423,16 @@ impl MiniMarkGC {
             .filter(|v| *v > 1.0)
             .unwrap_or(1.4);
         // incminimark.py:483-488 — min_heap_size: PYPY_GC_MIN, else nursery*8.
-        let mut min_heap_size = read_size_from_env("PYPY_GC_MIN")
+        let mut min_heap_size = read_uint_from_env("PYPY_GC_MIN")
             .map(|v| v as f64)
             .unwrap_or(nursery_size as f64 * 8.0);
         // incminimark.py:490-492 — max_heap_size: PYPY_GC_MAX, else 0 (unbounded).
-        let max_heap_size = read_size_from_env("PYPY_GC_MAX")
+        let max_heap_size = read_uint_from_env("PYPY_GC_MAX")
             .map(|v| v as f64)
             .unwrap_or(0.0);
         // incminimark.py:494-498 — max_delta: PYPY_GC_MAX_DELTA, else
         // 0.125 * env.get_total_memory().
-        let max_delta = read_size_from_env("PYPY_GC_MAX_DELTA")
+        let max_delta = read_uint_from_env("PYPY_GC_MAX_DELTA")
             .map(|v| v as f64)
             .unwrap_or_else(|| 0.125 * get_total_memory());
         // incminimark.py:562-563 — allocate_nursery floors min_heap_size by
@@ -1545,7 +1558,12 @@ impl MiniMarkGC {
         // `kept_alive_by_finalizer` accounting, so `total_memory_used` is the
         // post-sweep old-gen size directly.)
         let total_memory_used = self.get_total_memory_used() as f64;
-        self.set_major_threshold_from(
+        // The `bounded` result is intentionally dropped: incminimark.py:2603-2615
+        // raises MemoryError when `bounded and threshold_reached(reserving_size)`,
+        // but pyre has no GC out-of-memory path, so only the threshold-capping
+        // side effect of `set_major_threshold_from` is used (the PYPY_GC_MAX OOM
+        // policy is unported).
+        let _bounded = self.set_major_threshold_from(
             (total_memory_used * self.major_collection_threshold)
                 .min(total_memory_used + self.max_delta),
             0.0,
