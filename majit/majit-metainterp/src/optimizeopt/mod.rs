@@ -5793,8 +5793,8 @@ impl OptContext {
         ) {
             (Some(ref a), Some(ref b)) => a.same_box(b),
             _ => {
-                let query = self.get_box_replacement(query).to_opref();
-                let stored = self.get_box_replacement(stored).to_opref();
+                let query = self.get_replacement_opref(query);
+                let stored = self.get_replacement_opref(stored);
                 if query == stored {
                     return true;
                 }
