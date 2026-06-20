@@ -1,4 +1,4 @@
-Assess by static analysis whether our changes in git diff origin/main are equivalent
+Assess by static analysis whether our changes in git diff upstream/main are equivalent
 to the corresponding RPython/PyPy source code. The RPython and PyPy sources
 are available locally (under `rpython/` and `pypy/` in this repository).
 

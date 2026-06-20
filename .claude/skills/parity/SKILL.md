@@ -55,7 +55,7 @@ When the follow-up task is present, the same default applies to regressions foun
 Before touching any code, run a quick audit of the current state:
 
 ```bash
-git diff main...HEAD                 # committed changes on current branch
+git diff upstream/main...HEAD         # committed changes on current branch (base = upstream/main, the remote base, NOT local main/origin/main)
 git diff HEAD                         # working tree (unstaged + staged)
 git status --short                    # untracked files worth noting
 ```

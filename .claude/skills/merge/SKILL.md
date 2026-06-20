@@ -1,6 +1,6 @@
 ---
 name: merge
-description: Plan and execute a safe merge of the current working branch into main by accumulating only green-test changes onto a separate `<branch>-merge` branch. Invoked via `/merge`. Use this skill whenever the user asks to "merge", "land", "prepare for merge", "cherry-pick safely", or any equivalent request to move work from a long-running branch toward main. The skill enforces the house policy that `pyre/check.py` must be all green, and it prefers line-level imports over whole-commit cherry-picks (bare `git cherry-pick` is only safe for trivially conflict-free, self-contained commits). Default to using this skill any time the user hints at moving work from a long-running branch toward main, even without explicit keywords.
+description: Plan and execute a safe merge of the current working branch into `upstream/main` by accumulating only green-test changes onto a separate `<branch>-merge` branch. Invoked via `/merge`. Use this skill whenever the user asks to "merge", "land", "prepare for merge", "cherry-pick safely", or any equivalent request to move work from a long-running branch toward `upstream/main`. The skill enforces the house policy that `pyre/check.py` must be all green, and it prefers line-level imports over whole-commit cherry-picks (bare `git cherry-pick` is only safe for trivially conflict-free, self-contained commits). Default to using this skill any time the user hints at moving work from a long-running branch toward `upstream/main`, even without explicit keywords.
 ---
 
 # Safe Merge via `-merge` Branch
@@ -9,11 +9,11 @@ description: Plan and execute a safe merge of the current working branch into ma
 
 The working branch has accumulated many commits; some of them break `pyre/check.py`. House policy is:
 
-**`pyre/check.py` must be all green — no exceptions — before anything lands on main.**
+**`pyre/check.py` must be all green — no exceptions — before anything lands on `upstream/main`.**
 
 Cherry-picking by commit almost always breaks the build because commits depend on each other and on intermediate states that never made it through review. So we never move whole commits. We move **code**, one small slice at a time, and run the tests after each slice.
 
-Keep the original working branch untouched — it remains the source of truth for "what we eventually want". The `-merge` branch is a clean, always-green staging area that starts at main and only grows with verified slices.
+Keep the original working branch untouched — it remains the source of truth for "what we eventually want". The `-merge` branch is a clean, always-green staging area that starts at `upstream/main` and only grows with verified slices.
 
 ## Invocation
 
@@ -28,22 +28,24 @@ When the user types `/merge`:
 Determine:
 - `WORK` = the current branch (e.g. `stdlib`)
 - `MERGE` = `<WORK>-merge` (e.g. `stdlib-merge`)
-- `BASE` = `main`
+- `BASE` = `upstream/main`
 
 Run:
 
 ```bash
 git branch --show-current            # confirm WORK
-git rev-parse --verify main          # confirm BASE exists
+git rev-parse --verify upstream/main # confirm BASE exists
 git rev-parse --verify <MERGE> 2>/dev/null   # does MERGE already exist?
 ```
 
+This skill does **not** auto-fetch — `upstream/main` is whatever the user last fetched (they sync the `upstream` remote manually). If `upstream/main` is missing, stop and ask the user to add the remote (`git remote add upstream <URL>`) and fetch it; do not fall back to local `main`.
+
 If `<MERGE>` does **not** exist:
-- Create it at `main`: `git branch <MERGE> main`
+- Create it at `upstream/main`: `git branch <MERGE> upstream/main`
 - Do **not** check it out yet unless the user wants to start immediately. Confirm with the user before switching.
 
 If `<MERGE>` already exists:
-- Verify it is a descendant of (or equal to) `main`. If not, surface the divergence and ask the user whether to reset it to `main` or continue from its current tip.
+- Verify it is a descendant of (or equal to) `upstream/main`. If not, surface the divergence and ask the user whether to reset it to `upstream/main` or continue from its current tip.
 - Check whether `pyre/check.py` passes on `<MERGE>` before adding anything.
 
 State the plan concisely before moving code: which branch is source, which is destination, and what the user wants to land first.
@@ -54,10 +56,10 @@ Work from the current state of both branches:
 
 ```bash
 git diff <MERGE>..<WORK> --stat      # what's left to bring over
-git diff main..<MERGE> --stat        # what's already landed safely
+git diff upstream/main..<MERGE> --stat   # what's already landed safely
 ```
 
-`git diff main <MERGE>` is how we track progress — it grows with each safe slice. Show the user the remaining diff bucketed by file/area so they can point at what to try first.
+`git diff upstream/main <MERGE>` is how we track progress — it grows with each safe slice. Show the user the remaining diff bucketed by file/area so they can point at what to try first.
 
 ## Step 3 — Prefer line-by-line slices; cherry-pick only when trivially clean
 
@@ -83,8 +85,8 @@ Safe slicing procedure (line-by-line path):
    - A pure refactor (e.g. extracted local, renamed local variable) verifiable by inspection.
    - Comment, doc, or dead-code removal.
 2. Write the change **by hand** on `<MERGE>` — read the source from `WORK`, but apply it with `Edit`/`Write` onto `<MERGE>`. Do not use `git checkout <WORK> -- <file>` for partial changes; that grabs the whole file and usually breaks things.
-3. For a clean whole-file import where inspection confirms the file is self-contained (e.g. an isolated new module with no existing callers on main), `git checkout <WORK> -- <path>` is acceptable, but verify with the test run immediately after.
-4. Before committing, re-read the diff against main (`git diff main -- <file>`) and confirm only the intended lines moved.
+3. For a clean whole-file import where inspection confirms the file is self-contained (e.g. an isolated new module with no existing callers on `upstream/main`), `git checkout <WORK> -- <path>` is acceptable, but verify with the test run immediately after.
+4. Before committing, re-read the diff against the base (`git diff upstream/main -- <file>`) and confirm only the intended lines moved.
 
 ## Step 4 — Test every slice
 
@@ -127,7 +129,7 @@ to see what is left. The goal is to drive this diff toward empty, one green comm
 
 When the user decides to stop (either the diff is empty or the remaining work is not safely landable):
 
-- Report what landed on `<MERGE>` (`git log main..<MERGE> --oneline`).
+- Report what landed on `<MERGE>` (`git log upstream/main..<MERGE> --oneline`).
 - Report what is deferred, per-file, with the reason it could not land.
 - Confirm the original `WORK` branch is untouched (`git log <WORK>` unchanged vs. when we started).
 - Do **not** push, merge, or open a PR unless the user explicitly asks — CLAUDE.md rule.

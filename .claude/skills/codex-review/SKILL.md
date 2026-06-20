@@ -6,7 +6,7 @@ description: Run a Codex-CLI static-analysis parity review of the current diff a
 # Codex parity review cycle
 
 Each development cycle in this repo closes with a Codex-CLI review: Codex
-statically compares the working diff (`git diff origin/main`) against the local
+statically compares the working diff (`git diff upstream/main`) against the local
 RPython/PyPy sources and reports porting divergences in four sections. This
 skill runs that review and then **acts on the report** so the cycle actually
 converges instead of just producing a wall of text.
@@ -49,8 +49,11 @@ Notes:
   Do not let Codex modify files in this step.
 - `-m gpt-5.5` is the default; honor a `--model <name>` the user passes in their
   invocation.
-- Make sure `origin/main` is current first (`git fetch origin main`) so the diff
-  base matches what the PR will be measured against.
+- The diff base is `upstream/main` (the remote base, NOT local `main` or
+  `origin/main`). This skill does **not** auto-fetch — `upstream/main` is
+  whatever the user last fetched (they sync the `upstream` remote manually). If
+  `upstream/main` is missing, stop and ask the user to add the remote
+  (`git remote add upstream <URL>`) and fetch it; do not fall back to local `main`.
 
 If `codex` is missing, unauthenticated, or exits non-zero, stop and report that
 plainly — do not fabricate a review.

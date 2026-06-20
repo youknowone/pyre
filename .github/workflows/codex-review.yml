@@ -27,12 +27,19 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
-          # Full history so `git diff origin/main` has a merge base.
+          # Full history so `git diff upstream/main` has a merge base.
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Ensure origin/main is present
-        run: git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+      - name: Set up upstream/main as the review base
+        env:
+          BASE_REPO: ${{ github.event.pull_request.base.repo.clone_url }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+        run: |
+          # `upstream` is the PR's base repository; `upstream/main` is the base
+          # branch the diff is measured against (matches the local skills' base).
+          git remote add upstream "$BASE_REPO" 2>/dev/null || git remote set-url upstream "$BASE_REPO"
+          git fetch --no-tags upstream "$BASE_REF:refs/remotes/upstream/main"
 
       - name: Check Codex auth secret
         id: auth
