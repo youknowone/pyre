@@ -7138,31 +7138,51 @@ fn decode_branch_trampoline_ref_moves(code: &[u8], tramp_start: usize) -> Option
 /// Python opcode (a synthetic loop-close overshoot, which carries no
 /// kept temp).  Callers treat `None` as "no kept temp".
 fn branch_resume_target_stack_depth(target: usize) -> Option<u16> {
+    // #68: a `goto_if_not` walked inside an inlined callee sub-walk carries a
+    // `target` in the CALLEE jitcode's coordinates, not the top-level portal's.
+    // Resolve the code_ptr / metadata from the live intermediate callee
+    // (`FBW_INLINE_CODE_STACK.last()`) so the inverse-`pc_map` + depth lookup
+    // run against the right jitcode (mirror of `compute_inline_caller_frame`'s
+    // dispatch).  Mapping an inlined `target` through the portal's pc_map yields
+    // an unrelated Python pc — and thus a wrong `kept_stack` verdict, which
+    // mis-routes the branch guard's resume coordinate.
+    //
+    // The inverse-`pc_map` + forward-trivia-skip + depth lookup, run against an
+    // arbitrary jitcode's code_ptr / metadata.
+    let depth_for = |code_ptr: *const pyre_interpreter::CodeObject,
+                     metadata: &crate::PyJitCodeMetadata|
+     -> Option<u16> {
+        if code_ptr.is_null() || metadata.pc_map.is_empty() {
+            return None;
+        }
+        unsafe {
+            let code = &*code_ptr;
+            let py = python_pc_for_jitcode_pc(metadata, target) as usize;
+            let py = skip_python_trivia_forward(code, py);
+            crate::liveness::liveness_for(code_ptr)
+                .depth_at_py_pc()
+                .get(py)
+                .copied()
+        }
+    };
+    if let Some(caller_code) = FBW_INLINE_CODE_STACK.with(|s| s.borrow().last().copied()) {
+        let idx = crate::state::ensure_jitcode_index(caller_code as *const ())?;
+        let pjc = crate::state::pyjitcode_for_jitcode_index(idx)?;
+        return depth_for(pjc.code_ptr, &pjc.metadata);
+    }
     let full_body_sym = FULL_BODY_SNAPSHOT_SYM.with(|c| c.get());
     if full_body_sym.is_null() {
         return None;
     }
-    // SAFETY: identical contract to
-    // `walker_capture_snapshot_for_last_guard_impl` — the pointer is set
-    // only for the lifetime of the full-body `dispatch_via_miframe`, and
-    // only immutable layout fields (jitcode / pc_map / code_ptr) are read.
+    // SAFETY: identical contract to `walker_capture_snapshot_for_last_guard_impl`
+    // — the pointer is set only for the lifetime of the full-body
+    // `dispatch_via_miframe`, and only immutable layout fields are read.
     let sym = unsafe { &*full_body_sym };
     if sym.jitcode.is_null() {
         return None;
     }
-    unsafe {
-        let jc = &*sym.jitcode;
-        if jc.payload.code_ptr.is_null() {
-            return None;
-        }
-        let code = &*jc.payload.code_ptr;
-        let py = python_pc_for_jitcode_pc(&jc.payload.metadata, target) as usize;
-        let py = skip_python_trivia_forward(code, py);
-        crate::liveness::liveness_for(jc.payload.code_ptr)
-            .depth_at_py_pc()
-            .get(py)
-            .copied()
-    }
+    let jc = unsafe { &*sym.jitcode };
+    depth_for(jc.payload.code_ptr, &jc.payload.metadata)
 }
 
 /// The resume-merge Ref colors of a branch guard's kept operand-stack
