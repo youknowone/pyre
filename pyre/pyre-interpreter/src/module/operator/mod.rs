@@ -16,6 +16,23 @@ fn op_index(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     Ok(crate::call_function_or_identity(obj, "__index__"))
 }
 
+/// Shared body for the binary-arithmetic thunks (`add`/`sub`/`mul`): a
+/// wrong argument count is a `TypeError`, not a panic
+/// (`interp_operator.py` `@unwrap_spec` argument checking).  The operand
+/// error propagates, matching the `truediv`/`floordiv` thunks.
+fn op_binary<F>(args: &[PyObjectRef], name: &str, f: F) -> Result<PyObjectRef, crate::PyError>
+where
+    F: Fn(PyObjectRef, PyObjectRef) -> Result<PyObjectRef, crate::PyError>,
+{
+    if args.len() != 2 {
+        return Err(crate::PyError::type_error(format!(
+            "{name} expected 2 arguments, got {}",
+            args.len()
+        )));
+    }
+    f(args[0], args[1])
+}
+
 /// `interp_operator.py:213-219`:
 /// ```text
 /// @unwrap_spec(default='index')
@@ -93,9 +110,9 @@ crate::py_module! {
     },
     functions: {
         "index"    / 1 = op_index,
-        "add"      / 2 = |args| { assert!(args.len() == 2); Ok(add(args[0], args[1]).unwrap_or(w_none())) },
-        "sub"      / 2 = |args| { assert!(args.len() == 2); Ok(sub(args[0], args[1]).unwrap_or(w_none())) },
-        "mul"      / 2 = |args| { assert!(args.len() == 2); Ok(mul(args[0], args[1]).unwrap_or(w_none())) },
+        "add"      / 2 = |args| op_binary(args, "add", add),
+        "sub"      / 2 = |args| op_binary(args, "sub", sub),
+        "mul"      / 2 = |args| op_binary(args, "mul", mul),
         "truediv"  / 2 = |args| truediv(args[0], args[1]),
         "floordiv" / 2 = |args| floordiv(args[0], args[1]),
         "mod"      / 2 = |args| mod_(args[0], args[1]),
