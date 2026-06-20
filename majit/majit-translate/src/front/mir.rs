@@ -4247,6 +4247,52 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
+                // `<str>::is_empty(s)` is `len(s) == 0` (`ll_strlen` then a
+                // `ConstInt(0)` compare) — emit the `__len` + `BinOp("eq")`
+                // decomposition instead of leaving the graph-less
+                // trait-method extern.  `__len` routes through the rtyper's
+                // `len` op (`flowspace_adapter`), which on a `&str` operand
+                // lowers to `StringRepr.rtype_len` → `ll_strlen` → the
+                // `strlen` blackhole op; the `eq` of the two `Signed`
+                // operands lowers to `int_eq`.
+                if args.len() == 1
+                    && fmt_path_ends_with(&segments, &["str", "<Impl>", "is_empty"])
+                {
+                    let push_op = |graph: &mut FunctionGraph, kind: OpKind| {
+                        let res =
+                            graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                        graph.block_mut(bb_id).operations.push(SpaceOperation {
+                            result: Some(res.clone()),
+                            kind,
+                        });
+                        res
+                    };
+                    let len = push_op(
+                        &mut self.graph,
+                        OpKind::Call {
+                            target: CallTarget::FunctionPath {
+                                segments: vec!["__len".to_string()],
+                            },
+                            args: vec![args[0].clone()],
+                            result_ty: ValueType::Int,
+                        },
+                    );
+                    let zero = push_op(&mut self.graph, OpKind::ConstInt(0));
+                    let res = push_op(
+                        &mut self.graph,
+                        OpKind::BinOp {
+                            op: "eq".to_string(),
+                            lhs: len,
+                            rhs: zero,
+                            result_ty: ValueType::Int,
+                        },
+                    );
+                    self.local_var[dest_local] = Some(res);
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
                 let alias =
                     if let Some(payload) = self.expect_on_const_ok(&segments, &args, &arg_locals) {
                         // Identity unwrap: the receiver variable was bound

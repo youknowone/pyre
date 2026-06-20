@@ -1310,34 +1310,44 @@ pub fn translate_op(
                         ))));
                         return Ok(vec![FlowspaceOp::new("simple_call", call_args, result)]);
                     }
-                    // `<[T]>::len(slice)` — the slice-receiver `.len()`
-                    // method call.  Rust lowers `slice.len()` to a MIR
-                    // call to `core::slice::<impl [T]>::len`, not to the
-                    // `Rvalue::Len` that `front/mir.rs` lowers to a
-                    // `__len` synthetic.  There is no source body for the
-                    // intrinsic to register, so route it to the rtyper's
-                    // `len` operation (`rtyper.rs:2016 "len" arm` →
-                    // `Repr.rtype_len`), the same dispatch upstream
+                    // The `len` operation in its three spellings: the
+                    // `__len` synthetic `front/mir.rs` lowers `Rvalue::Len`
+                    // (and the `<str>::is_empty` decomposition) to; the
+                    // slice-receiver `core::slice::<Impl>::len`; and the
+                    // `<str>::len` method.  Rust lowers `slice.len()` /
+                    // `s.len()` to MIR calls to those intrinsics, which
+                    // have no source body to register.  Route all three to
+                    // the rtyper's `len` operation (`rtyper.rs:2016 "len"
+                    // arm` → `Repr.rtype_len`), the same dispatch upstream
                     // `op.len(v)` reaches via `unaryop.py:867-870`.  The
-                    // receiver annotates as `SomeList` (slices map to
-                    // `SomeList` in `bookkeeper`), so `rtype_len` lands on
-                    // the list repr's `ll_length` lowering.
-                    if segments.len() == 4
-                        && segments[0] == "core"
-                        && segments[1] == "slice"
-                        && segments[2] == "<Impl>"
-                        && segments[3] == "len"
-                    {
+                    // rtyper dispatches on the receiver repr: a slice maps
+                    // to `SomeList` (`ll_length`), a `&str` to `SomeString`
+                    // (`StringRepr.rtype_len` → `ll_strlen`).  The helper
+                    // is registered as an opname graph and lowered to the
+                    // `strlen`/`arraylen_gc` blackhole op
+                    // (`jit_codewriter::jtransform_opname::lower_graph`), so
+                    // these are real `len` ops, not symbolic residuals.
+                    let is_len_op = (segments.len() == 1 && segments[0] == "__len")
+                        || (segments.len() == 4
+                            && segments[0] == "core"
+                            && segments[1] == "slice"
+                            && segments[2] == "<Impl>"
+                            && segments[3] == "len")
+                        || (segments.len() >= 3
+                            && segments[segments.len() - 3] == "str"
+                            && segments[segments.len() - 2] == "<Impl>"
+                            && segments[segments.len() - 1] == "len");
+                    if is_len_op {
                         if arg_hls.len() != 1 {
                             return Err(TyperError::message(format!(
-                                "core::slice::<Impl>::len requires exactly one receiver arg, got {}",
+                                "len operation requires exactly one receiver arg, got {}",
                                 arg_hls.len()
                             )));
                         }
                         let mut iter = arg_hls.into_iter();
                         let arg = iter.next().ok_or_else(|| {
                             TyperError::message(
-                                "core::slice::<Impl>::len requires a receiver arg".to_string(),
+                                "len operation requires a receiver arg".to_string(),
                             )
                         })?;
                         return Ok(vec![FlowspaceOp::new("len", vec![arg], result)]);
