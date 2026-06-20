@@ -6106,7 +6106,7 @@ impl Drop for InlineParentFrameGuard {
 /// (or `false`) is the rollback escape hatch.  The multi-frame snapshot
 /// encode↔decode contract for walker-emitted callee-frame guards is validated
 /// byte-exact (function_calls + corpus) on both backends.
-fn fbw_inline_multiframe_enabled() -> bool {
+pub(crate) fn fbw_inline_multiframe_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| match std::env::var_os("PYRE_FBW_INLINE_MULTIFRAME") {
         Some(v) => {
@@ -7980,6 +7980,18 @@ fn compute_inline_caller_frame(
     ctx: &mut WalkContext<'_, '_>,
     call_jit_pc: usize,
 ) -> Option<InlineParentFrame> {
+    // #68 nested multiframe: when an inlined callee is already active
+    // (`FBW_INLINE_CODE_STACK.last()` is Some), the immediate caller of THIS
+    // call is that intermediate callee (a sym-less sub-jitcode), not the
+    // top-level `FULL_BODY_SNAPSHOT_SYM`.  Compute its paused frame from that
+    // jitcode (index / liveness / pc_map via its `PyJitCode`), reading the
+    // boxes from the caller's live register banks (`ctx.registers_*`, which ARE
+    // the intermediate callee's banks here) via the sym-less
+    // `collect_callee_active_boxes`.  The stack is empty for a top-level
+    // caller, falling through to the `FULL_BODY_SNAPSHOT_SYM` path below.
+    if let Some(caller_code) = FBW_INLINE_CODE_STACK.with(|s| s.borrow().last().copied()) {
+        return compute_nested_inline_caller_frame(ctx, call_jit_pc, caller_code);
+    }
     let caller_sym_ptr = FULL_BODY_SNAPSHOT_SYM.with(|c| c.get());
     if caller_sym_ptr.is_null() {
         return None;
@@ -8046,6 +8058,78 @@ fn compute_inline_caller_frame(
     if let (Some(saved), true) = (saved, result_color < ctx.registers_r.len()) {
         ctx.registers_r[result_color] = saved;
     }
+    Some(InlineParentFrame {
+        jitcode_index,
+        resume_py_pc: fallthrough_py_pc,
+        boxes,
+    })
+}
+
+/// Paused-caller-frame computation for a NESTED multiframe inline (#68): the
+/// immediate caller is an intermediate inlined callee (`caller_code`), a
+/// sym-less sub-jitcode whose live boxes are in `ctx.registers_*` (this `ctx`
+/// IS that callee's sub-walk).  Mirror of the top-level
+/// [`compute_inline_caller_frame`] body but keyed on `caller_code`'s own
+/// `PyJitCode` instead of `FULL_BODY_SNAPSHOT_SYM`, and reading boxes via the
+/// sym-less [`collect_callee_active_boxes`] (no portal-vable shadow to fold).
+fn compute_nested_inline_caller_frame(
+    ctx: &mut WalkContext<'_, '_>,
+    call_jit_pc: usize,
+    caller_code: usize,
+) -> Option<InlineParentFrame> {
+    let jitcode_index = crate::state::ensure_jitcode_index(caller_code as *const ())? as u32;
+    let pjc = crate::state::pyjitcode_for_jitcode_index(jitcode_index as i32)?;
+    if pjc.metadata.pc_map.is_empty() || pjc.code_ptr.is_null() {
+        return None;
+    }
+    let call_py = python_pc_for_jitcode_pc(&pjc.metadata, call_jit_pc) as usize;
+    // A CALL inside a try-block resumes at its own catch via a bit-14 marker
+    // pc, which the multi-frame capture's `py_pc < FLAG` assert rejects.
+    if pjc.after_residual_call_resume_pc_for(call_py).is_some() {
+        return None;
+    }
+    let fallthrough_py_pc = unsafe {
+        let code = &*pjc.code_ptr;
+        crate::metainterp::semantic_fallthrough_pc(code, call_py) as u32
+    };
+    // The call result is the top operand-stack slot at the return point.
+    let depth = unsafe {
+        crate::liveness::liveness_for(pjc.code_ptr)
+            .depth_at_py_pc()
+            .get(fallthrough_py_pc as usize)
+            .copied()
+            .unwrap_or(0) as usize
+    };
+    if depth == 0 {
+        return None;
+    }
+    let result_idx = depth - 1;
+    let stack_color_map = crate::state::stack_slot_color_map_at(jitcode_index as i32);
+    let result_color = *stack_color_map.get(result_idx)? as usize;
+    // Null the not-yet-produced result slot, build the box list, then restore
+    // the caller's register (the inlined callee, not the walk, produces the
+    // result; the inner frame supplies it on resume) — same as the top-level
+    // `in_a_call=true` shape.
+    let null_ref = ctx.trace_ctx.const_ref(pyre_object::PY_NULL as i64);
+    let saved = ctx.registers_r.get(result_color).copied();
+    if result_color < ctx.registers_r.len() {
+        ctx.registers_r[result_color] = null_ref;
+    }
+    let boxes = collect_callee_active_boxes(
+        ctx.registers_i,
+        ctx.registers_r,
+        ctx.registers_f,
+        jitcode_index,
+        fallthrough_py_pc,
+        call_jit_pc,
+    );
+    if let (Some(saved), true) = (saved, result_color < ctx.registers_r.len()) {
+        ctx.registers_r[result_color] = saved;
+    }
+    let boxes = match boxes {
+        Ok(b) => b,
+        Err(_) => return None,
+    };
     Some(InlineParentFrame {
         jitcode_index,
         resume_py_pc: fallthrough_py_pc,
@@ -8907,11 +8991,17 @@ fn callee_fast_path_inlinable(
             return false;
         };
         if d.opname.starts_with("goto_if_not") || d.opname.starts_with("switch") {
+            if std::env::var_os("PYRE_FBW_STRICT_DIAG").is_some() {
+                eprintln!("[strict-reject] pc={} op={} (branch)", d.pc, d.opname);
+            }
             return false;
         }
         if d.opname.contains("vable")
             && !inline_resolvable_static_vable_read(body_code, &d, callee_descr_refs, ctx)
         {
+            if std::env::var_os("PYRE_FBW_STRICT_DIAG").is_some() {
+                eprintln!("[strict-reject] pc={} op={} (non-static vable)", d.pc, d.opname);
+            }
             return false;
         }
         pc = d.next_pc;
@@ -8957,13 +9047,23 @@ fn inline_resolvable_static_vable_read(
 /// ([`walker_capture_snapshot_for_last_guard_impl`]'s parent-frame branch).
 /// A BACKWARD `goto_if_not` (a loop back-edge) and any `switch` still decline:
 /// a loop in the callee needs a `jit_merge_point` the inline snapshot does
-/// not model, and a multi-target switch is not yet handled.  Non-static vable
-/// reads decline exactly as in the strict predicate (a vable-bearing callee
-/// would abort `VableBoxNotSeeded`).
+/// not model, and a multi-target switch is not yet handled.
+///
+/// Vable reads are accepted in two cases: (a) a scalar static-field read
+/// (`pycode` / `w_globals`) resolvable without a seeded frame
+/// (`inline_resolvable_static_vable_read`), or (b) a frame-LOCAL read
+/// (`getfield_vable_r` / `getarrayitem_vable_r`) whose base register equals the
+/// seeded callee frame reg `callee_frame_reg` — the multiframe path seeds that
+/// frame as a virtual object graph (`emit_new_pyframe_inline_with_params`), so
+/// the optimizer folds the read to the seeded param value rather than aborting
+/// `VableBoxNotSeeded`.  Every `setfield_vable_*` / `setarrayitem_vable_*`
+/// (a write into a vable, which would escape the virtual frame) and any vable
+/// op against a base reg OTHER than the seeded frame still decline.
 fn callee_fast_path_inlinable_allowing_forward_branch(
     body_code: &[u8],
     callee_descr_refs: &[DescrRef],
     ctx: &WalkContext<'_, '_>,
+    callee_frame_reg: u16,
 ) -> bool {
     let mut pc = 0usize;
     while pc < body_code.len() {
@@ -8982,12 +9082,66 @@ fn callee_fast_path_inlinable_allowing_forward_branch(
         }
         if d.opname.contains("vable")
             && !inline_resolvable_static_vable_read(body_code, &d, callee_descr_refs, ctx)
+            && !inline_resolvable_seeded_frame_op(body_code, &d, callee_frame_reg)
         {
+            if std::env::var_os("PYRE_FBW_STRICT_DIAG").is_some() {
+                eprintln!(
+                    "[strict-reject-mf] pc={} op={} base_reg={:?} frame_reg={callee_frame_reg} \
+                     (non-static, foreign vable)",
+                    d.pc,
+                    d.opname,
+                    body_code.get(d.pc + 1).copied()
+                );
+            }
             return false;
         }
         pc = d.next_pc;
     }
     true
+}
+
+/// True iff `d` is a frame-LOCAL vable op — a `getfield_vable` /
+/// `getarrayitem_vable` read OR a `setfield_vable` / `setarrayitem_vable` write
+/// — whose base register byte (`body_code[d.pc + 1]`, the first operand for
+/// every `rX...` / `riX...` vable layout) equals the seeded callee frame
+/// register.  The multiframe inline seeds this frame as a VIRTUAL `PyFrame`
+/// (`emit_new_pyframe_inline_with_params`) whose locals array holds the param
+/// boxes; the post-trace optimizer keeps the frame + its array virtual, folding
+/// reads to the seeded/stored value (`optimize_getfield_gc` /
+/// `optimize_getarrayitem_gc`) and recording writes into `vinfo.items` /
+/// `vinfo.fields` WITHOUT forcing (`optimize_setarrayitem_gc` /
+/// `optimize_setfield_gc`).  A store INTO the callee's own virtual frame
+/// (param-init `STORE_FAST` prologue, intermediate local writes) is therefore
+/// foldable too — only a vable op against a DIFFERENT base reg (a genuinely
+/// foreign vable, e.g. the caller's frame the seed does not own) escapes the
+/// fold and must decline.  An int/float-base vable op (the `iid`/`ird`
+/// intbase set variants) is not a frame-local store and also declines.
+fn inline_resolvable_seeded_frame_op(
+    body_code: &[u8],
+    d: &DecodedOp,
+    callee_frame_reg: u16,
+) -> bool {
+    if callee_frame_reg == u16::MAX || callee_frame_reg > u8::MAX as u16 {
+        return false;
+    }
+    // Only ref-base vable ops (`getfield_vable_r/rd>r`,
+    // `getarrayitem_vable_r/ridd>r`, `setfield_vable_*/rXd`,
+    // `setarrayitem_vable_*/riXdd`) carry the frame ref in operand 0.  The
+    // intbase set variants (`setfield_vable_*/iXd`) take an Int base — not the
+    // seeded ref frame — so reject them.
+    let is_frame_vable = d.opname.starts_with("getfield_vable_r")
+        || d.opname.starts_with("getarrayitem_vable_r")
+        || (d.opname.starts_with("setfield_vable")
+            && d.argcodes.starts_with('r'))
+        || (d.opname.starts_with("setarrayitem_vable")
+            && d.argcodes.starts_with('r'));
+    if !is_frame_vable {
+        return false;
+    }
+    match body_code.get(d.pc + 1).copied() {
+        Some(base) => base as u16 == callee_frame_reg,
+        None => false,
+    }
 }
 
 /// Active boxes for an inlined callee's OWN frame in a multi-frame snapshot
@@ -9545,14 +9699,33 @@ fn try_walker_inline_user_call(
     // #68: under `PYRE_FBW_INLINE_MULTIFRAME`, a forward-branch-bearing callee
     // is inlinable with a multi-frame guard snapshot (its in-callee branch
     // guard resumes through `walker_capture_multi_frame_inline_snapshot` rather
-    // than collapsing to the caller boundary).  Restricted to a TOP-LEVEL
-    // caller (single inline level) for this slice: a nested caller's jitcode
-    // index is not the inherited `outer_jitcode_index`, and its paused-frame
-    // chain needs deeper grandparent plumbing.
-    let try_multiframe = !strict_inlinable
-        && fbw_inline_multiframe_enabled()
-        && ctx.is_top_level
-        && callee_fast_path_inlinable_allowing_forward_branch(body.code, callee_descr_refs, ctx);
+    // than collapsing to the caller boundary).  The relaxed predicate also
+    // accepts a callee whose only non-strict ops are reads off its OWN seeded
+    // frame register, so resolve that register up-front (the same
+    // `ensure_jitcode_index` + `portal_red_regs_at` the seeding below uses).
+    // A multiframe caller no longer needs to be TOP-LEVEL: a nested caller's
+    // paused frame is computed from `FBW_INLINE_CODE_STACK.last()` (the live
+    // intermediate callee jitcode) by `compute_inline_caller_frame`, bounded by
+    // a depth cap on the inline stack (the `n_parents == n_callees` valve in
+    // the snapshot path is the real desync safety net).
+    let multiframe_eligible = !strict_inlinable && fbw_inline_multiframe_enabled();
+    let callee_frame_reg = if multiframe_eligible {
+        crate::state::ensure_jitcode_index(callee_code_key as *const ())
+            .map(|jc| crate::state::portal_red_regs_at(jc).0)
+            .unwrap_or(u16::MAX)
+    } else {
+        u16::MAX
+    };
+    const FBW_MAX_MULTIFRAME_DEPTH: usize = 4;
+    let inline_depth = FBW_INLINE_CODE_STACK.with(|s| s.borrow().len());
+    let try_multiframe = multiframe_eligible
+        && inline_depth < FBW_MAX_MULTIFRAME_DEPTH
+        && callee_fast_path_inlinable_allowing_forward_branch(
+            body.code,
+            callee_descr_refs,
+            ctx,
+            callee_frame_reg,
+        );
     if !strict_inlinable && !try_multiframe {
         // #62: a self-recursive single-int call (`fib`'s shape) the fast-path
         // inline cannot serve is handled instead by the direct

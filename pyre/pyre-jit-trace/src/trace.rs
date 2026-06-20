@@ -1125,6 +1125,26 @@ fn full_body_walk_trace(
                     fbw_decline(crate::driver::make_green_key(w_code, start_pc));
                     TraceAction::Abort
                 }
+                // #68 multiframe (`PYRE_FBW_INLINE_MULTIFRAME`): a data-dependent
+                // `goto_if_not` whose branch input is not concrete at trace-time
+                // recurs identically on every retrace of this entry (the same
+                // jitcode walked from the same start_pc reaches the same
+                // non-concrete branch operand).  Relaxing the inline predicate
+                // lets a portal trace (e.g. a callee independently traced as its
+                // own origin) walk PAST its prior `LoopBearing` decline and reach
+                // such a branch, which would otherwise re-trace unbounded (each
+                // re-walk executes the body's residual calls before failing) —
+                // a slowdown worse than the trait leg.  Decline it permanently to
+                // the trait leg, mirroring the default path's behavior for the
+                // same location.  Gated on the flag so the default path's plain
+                // `Abort` (a capability landing mid-run can still pick it up) is
+                // byte-identical.
+                DE::GotoIfNotValueNotConcrete { .. }
+                    if crate::jitcode_dispatch::fbw_inline_multiframe_enabled() =>
+                {
+                    fbw_decline(crate::driver::make_green_key(w_code, start_pc));
+                    TraceAction::Abort
+                }
                 _ => TraceAction::Abort,
             }
         }
