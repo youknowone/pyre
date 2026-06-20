@@ -1187,7 +1187,12 @@ fn builtin_len(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 
 /// `abs(x)` — return the absolute value of a number.
 pub fn builtin_abs(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(args.len() == 1, "abs() takes exactly one argument");
+    if args.len() != 1 {
+        return Err(crate::PyError::type_error(format!(
+            "abs() takes exactly one argument ({} given)",
+            args.len()
+        )));
+    }
     let obj = args[0];
     unsafe {
         if is_bool(obj) {
