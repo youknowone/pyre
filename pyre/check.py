@@ -56,6 +56,12 @@ def _detect_pyre_stdlib():
 
 PYRE_STDLIB = _detect_pyre_stdlib()
 
+# Opt-in (`--fbw-inline-multiframe`): export PYRE_FBW_INLINE_MULTIFRAME=1 into
+# pyre child runs so the #68 forward-branch multi-frame inline path is exercised
+# and parity-checked. Off by default; the path is otherwise reached by no
+# corpus run, so this is the only local coverage gate for it.
+FBW_INLINE_MULTIFRAME = False
+
 BENCH_DIR = "pyre/bench"
 SYNTHETIC_BENCH_DIR = "pyre/bench/synth"
 SNAP_DIR = "pyre/check.snap"
@@ -222,6 +228,8 @@ def pyre_env():
     # in the environment wins.
     if PYRE_STDLIB and "PYRE_STDLIB" not in env:
         env["PYRE_STDLIB"] = PYRE_STDLIB
+    if FBW_INLINE_MULTIFRAME:
+        env["PYRE_FBW_INLINE_MULTIFRAME"] = "1"
     return env
 
 
@@ -879,6 +887,13 @@ def parse_args():
         default=20.0,
         help="per-script timeout in seconds for synthetic benchmarks",
     )
+    parser.add_argument(
+        "--fbw-inline-multiframe",
+        action="store_true",
+        help="run pyre with PYRE_FBW_INLINE_MULTIFRAME=1 (#68 forward-branch "
+        "multi-frame inline path); validates that path's parity before its "
+        "default-flip is contemplated",
+    )
     parser.add_argument("pyre_path", nargs="?", default="")
     args = parser.parse_args()
 
@@ -899,6 +914,9 @@ def parse_args():
 
 def main():
     args = parse_args()
+    if args.fbw_inline_multiframe:
+        global FBW_INLINE_MULTIFRAME
+        FBW_INLINE_MULTIFRAME = True
     chk = Check(args)
 
     backends = [args.backend] if args.backend else ["dynasm", "cranelift"]
