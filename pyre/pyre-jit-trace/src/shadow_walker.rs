@@ -252,23 +252,8 @@ pub fn shadow_validate_pre(
     };
 
     // Production sub-jitcode lookup over the shared
-    // `crate::jitcode_runtime::all_jitcodes()` table — same shape as
-    // `jitcode_dispatch::tests::production_sub_jitcodes`. The Arc<JitCode>
-    // entries live inside a `LazyLock<Vec<...>>`, so the `.code` slice
-    // is `'static`-rooted as `SubJitCodeBody` requires.
-    let sub_jitcode_lookup = |idx: usize| -> Option<crate::jitcode_dispatch::SubJitCodeBody> {
-        let all = crate::jitcode_runtime::all_jitcodes();
-        all.get(idx)
-            .map(|jc| crate::jitcode_dispatch::SubJitCodeBody {
-                code: jc.code.as_slice(),
-                num_regs_r: jc.num_regs_r() as usize,
-                num_regs_i: jc.num_regs_i() as usize,
-                num_regs_f: jc.num_regs_f() as usize,
-                constants_i: jc.constants_i.as_slice(),
-                constants_r: jc.constants_r.as_slice(),
-                constants_f: jc.constants_f.as_slice(),
-            })
-    };
+    // `crate::jitcode_runtime::all_jitcodes()` table.
+    let sub_jitcode_lookup = crate::jitcode_dispatch::sub_jitcode_body_by_index;
 
     // Walker emits ops directly into `miframe.ctx`. We only catch errors
     // here; the recorded ops are what `diff_recorded_ops` later

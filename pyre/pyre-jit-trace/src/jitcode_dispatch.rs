@@ -234,6 +234,33 @@ pub struct SubJitCodeBody {
 /// tests pass synthetic closures over a local fixture map).
 pub type SubJitCodeLookup = dyn Fn(usize) -> Option<SubJitCodeBody>;
 
+/// Build a [`SubJitCodeBody`] view over the build-time `ALL_JITCODES[idx]`
+/// entry (`crate::jitcode_runtime::all_jitcodes`). Returns `None` for an
+/// out-of-range index.
+///
+/// The all-jitcodes table is `Box::leak`'d at load
+/// (`jitcode_runtime::load_all_jitcodes`), so the borrowed `code` /
+/// `constants_*` slices are `'static` as [`SubJitCodeBody`] requires.
+///
+/// This is the production sub-jitcode lookup shape — the shadow walker,
+/// the per-opcode arm entry, and trace-time list-helper specializations
+/// that descend into a charon body (e.g. `w_list_append`) all resolve a
+/// callee body through it. RPython parity: a `BhDescr::JitCode {
+/// jitcode_index }` operand resolves to `ALL_JITCODES[jitcode_index]`.
+pub fn sub_jitcode_body_by_index(idx: usize) -> Option<SubJitCodeBody> {
+    crate::jitcode_runtime::all_jitcodes()
+        .get(idx)
+        .map(|jc| SubJitCodeBody {
+            code: jc.code.as_slice(),
+            num_regs_r: jc.num_regs_r(),
+            num_regs_i: jc.num_regs_i(),
+            num_regs_f: jc.num_regs_f(),
+            constants_i: jc.constants_i.as_slice(),
+            constants_r: jc.constants_r.as_slice(),
+            constants_f: jc.constants_f.as_slice(),
+        })
+}
+
 /// State the walker reads from / writes to while stepping. RPython
 /// equivalent: `MetaInterp` itself — the trace recorder, the symbolic
 /// register banks (`registers_i`, `registers_r`, `registers_f`), and
@@ -14387,21 +14414,35 @@ mod tests {
     /// `crate::jitcode_runtime::all_jitcodes()`. Used by the end-to-end
     /// arm acceptance tests (`walk_return_value_arm_*`,
     /// `walk_pop_top_arm_*`) so the walker can recurse into real
-    /// callee bodies. The runtime's `all_jitcodes()` is a
-    /// `LazyLock<Vec<Arc<JitCode>>>` — every `.code` slice it surfaces
-    /// is `'static`-rooted, satisfying `SubJitCodeBody`'s body
-    /// constraint.
+    /// callee bodies. Delegates to the production
+    /// [`super::sub_jitcode_body_by_index`].
     fn production_sub_jitcodes(idx: usize) -> Option<SubJitCodeBody> {
-        let all = crate::jitcode_runtime::all_jitcodes();
-        all.get(idx).map(|jc| SubJitCodeBody {
-            code: jc.code.as_slice(),
-            num_regs_r: jc.num_regs_r(),
-            num_regs_i: jc.num_regs_i(),
-            num_regs_f: jc.num_regs_f(),
-            constants_i: jc.constants_i.as_slice(),
-            constants_r: jc.constants_r.as_slice(),
-            constants_f: jc.constants_f.as_slice(),
-        })
+        super::sub_jitcode_body_by_index(idx)
+    }
+
+    #[test]
+    fn sub_jitcode_body_by_index_builds_w_list_append() {
+        // #171 P3 (Route C): the lst.append recognition arm descends into
+        // the charon `w_list_append` body via a by-index SubJitCodeBody.
+        // Confirm the shared builder resolves it to a well-formed body —
+        // non-empty bytecode and >= 2 ref registers for the (list, value)
+        // seed (calldescr arg_classes 'rr').
+        let idx = crate::jitcode_runtime::list_append_jitcode()
+            .expect("w_list_append must be present in ALL_JITCODES")
+            .index();
+        let body = super::sub_jitcode_body_by_index(idx)
+            .expect("by-index builder must resolve w_list_append");
+        assert!(
+            !body.code.is_empty(),
+            "w_list_append body must carry assembled bytecode"
+        );
+        assert!(
+            body.num_regs_r >= 2,
+            "w_list_append takes (list, value) => >= 2 ref registers, got {}",
+            body.num_regs_r
+        );
+        // Out-of-range index resolves to None (RPython: ALL_JITCODES miss).
+        assert!(super::sub_jitcode_body_by_index(usize::MAX).is_none());
     }
 
     /// Tests use the production `PyreJitCodeDescr` adapter
