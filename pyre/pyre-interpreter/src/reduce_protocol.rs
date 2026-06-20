@@ -86,15 +86,21 @@ pub fn object_getstate_default(w_obj: PyObjectRef) -> PyResult {
     let w_objdict = crate::baseobjspace::findattr(w_obj, "__dict__");
     let mut w_ret = match w_objdict {
         Some(d) if crate::baseobjspace::len_w(d)? > 0 => {
-            // Copy `__dict__`, dropping the internal `__dict_data__` key that a
-            // dict subclass keeps its mapping payload under: that payload is
-            // reconstructed through `dictitems`, not the instance state, so an
-            // attribute-less dict subclass must yield `None` here (matching the
-            // empty instance `__dict__` of a built-in subclass).
+            // Copy `__dict__`. For a dict subclass, drop the internal
+            // `__dict_data__` key it keeps its mapping payload under: that
+            // payload is reconstructed through `dictitems`, not the instance
+            // state, so an attribute-less dict subclass yields `None` here
+            // (matching the empty instance `__dict__` of a built-in subclass).
+            // A non-dict instance keeps a user attribute of that name.
+            let is_dict_inst = {
+                let w_dict_type = crate::typedef::gettypeobject(&pyre_object::pyobject::DICT_TYPE);
+                unsafe { crate::baseobjspace::isinstance_w(w_obj, w_dict_type) }
+            };
             let w_copy = pyre_object::w_dict_new();
             let mut count = 0usize;
             for (k, v) in unsafe { pyre_object::w_dict_items(d) } {
-                if unsafe { pyre_object::is_str(k) }
+                if is_dict_inst
+                    && unsafe { pyre_object::is_str(k) }
                     && unsafe { pyre_object::w_str_get_value(k) } == "__dict_data__"
                 {
                     continue;
