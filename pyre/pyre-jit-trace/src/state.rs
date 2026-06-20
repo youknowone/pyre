@@ -11771,6 +11771,21 @@ pub(crate) fn assemble_bridge_inline_pending(
         .collect();
     sym.concrete_namespace = w_globals;
     sym.concrete_execution_context = execution_context;
+    // perform_call threads the caller's `ec` down to every inlined callee
+    // (reds=['frame','ec'], interp_jit.py:67), so the callee shares the
+    // caller's ExecutionContext OpRef. Seed `sym.execution_context` from the
+    // immediate parent's symbolic ec (the root caller's `setup_bridge_sym`
+    // resolved it from `portal_ec_reg`, state.rs:7399) so an in-callee
+    // `ensure_execution_context` returns it directly. `sym.frame` is NONE for
+    // a reconstructed inline frame, so without this seed the recovery path
+    // would emit `GetfieldGcR(NONE)` (an unbacked VoidOp arg) and fail
+    // bridge regalloc.
+    if let Some(parent) = parent_frames.first() {
+        let parent_ec = unsafe { (*parent.sym).execution_context };
+        if !parent_ec.is_none() {
+            sym.execution_context = parent_ec;
+        }
+    }
     // pyjitpl.py:74-90 MIFrame.setup: size the per-kind banks + copy_constants.
     // The constant tail lands at `[num_regs_X..]`, beyond the live
     // valuestackdepth prefix (`num_regs_r` is the full Ref register file),
