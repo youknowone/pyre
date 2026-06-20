@@ -365,6 +365,19 @@ pub fn list_strategy_for(items: &[PyObjectRef]) -> ListStrategy {
 
 /// Allocate a new W_ListObject from a Vec of items.
 pub fn w_list_new(items: Vec<PyObjectRef>) -> PyObjectRef {
+    let strategy = list_strategy_for(&items);
+    w_list_new_with_strategy(items, strategy)
+}
+
+/// Like `w_list_new` but pins the Object strategy regardless of contents, so
+/// every element stays boxed by pointer identity (an all-int item set is NOT
+/// unboxed into `int_items`). Used where element identity must survive, e.g. the
+/// unpickler memo array.
+pub fn w_list_new_object(items: Vec<PyObjectRef>) -> PyObjectRef {
+    w_list_new_with_strategy(items, ListStrategy::Object)
+}
+
+fn w_list_new_with_strategy(items: Vec<PyObjectRef>, strategy: ListStrategy) -> PyObjectRef {
     // `gct_fv_gc_malloc` bracket pattern (`framework.py:853-856`):
     // pin every PyObjectRef in `items` before the GC malloc paths
     // below (`alloc_list_items_block`, `try_gc_alloc_stable`) so the
@@ -378,7 +391,6 @@ pub fn w_list_new(items: Vec<PyObjectRef>) -> PyObjectRef {
         crate::gc_roots::pin_root(item);
     }
 
-    let strategy = list_strategy_for(&items);
     let (length, items_block, int_items, float_items) = match strategy {
         ListStrategy::Empty | ListStrategy::Integer | ListStrategy::Float => {
             let int_items = if let ListStrategy::Integer = strategy {
