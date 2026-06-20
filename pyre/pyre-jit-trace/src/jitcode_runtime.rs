@@ -186,6 +186,63 @@ pub fn portal_jitcode() -> Option<Arc<JitCode>> {
     get_jitcode_by_index(idx)
 }
 
+// Cached index of the charon-extracted `w_list_append` body within
+// `ALL_JITCODES`.
+//
+// Unlike the portal (resolved by its `jitdriver_sd` flag) or opcode arms
+// (resolved by `entry_jitcode_index`), the list-op helper bodies carry
+// no runtime marker — they are ordinary `make_jitcodes` function entries
+// whose only stable handle is their `name`, which `get_jitcode` sets to
+// the graph's last path segment (call.rs:3071). The positional index
+// shifts whenever the jitcode set changes, so it must be resolved by
+// name and never hardcoded.
+//
+// This by-name lookup is the foundation #171 P3 needs to descend the FBW
+// walker into the orthodox charon list-append body (issue #62/#23): the
+// dynamic `lst.append` recognition arm resolves the body here, then
+// builds a by-index sub-walk from `get_jitcode_by_index`.
+thread_local! {
+    /// Cached `ALL_JITCODES` index of `w_list_append` for the current
+    /// thread. `thread_local!` because the initializer iterates
+    /// `ALL_JITCODES` (also thread_local).
+    static LIST_APPEND_JITCODE_INDEX: OnceCell<Option<usize>> = const { OnceCell::new() };
+}
+
+/// Scan `ALL_JITCODES` for the unique entry whose `name` equals `name`.
+///
+/// Returns `None` when no entry matches (e.g. compact test inputs that
+/// omit the helper). Panics on a duplicate leaf name — the by-name
+/// resolution model assumes the charon helper's path-last-segment name
+/// is unique within the pipeline, so a collision signals a structural
+/// regression that must surface immediately rather than silently pick
+/// the wrong body.
+fn compute_named_jitcode_index(name: &str) -> Option<usize> {
+    let all = all_jitcodes();
+    let mut hits = all
+        .iter()
+        .enumerate()
+        .filter(|(_, jc)| jc.name == name)
+        .map(|(i, _)| i);
+    let first = hits.next();
+    if hits.next().is_some() {
+        panic!(
+            "pyre-jit-trace: build-time pipeline has more than one jitcode \
+             named `{name}`; the list-op by-name resolver assumes the \
+             charon helper leaf name is unique"
+        );
+    }
+    first
+}
+
+/// The charon `w_list_append` body in `ALL_JITCODES`, resolved by name
+/// and cached per thread. `None` if the helper is absent from the
+/// build-time pipeline. See `LIST_APPEND_JITCODE_INDEX`.
+pub fn list_append_jitcode() -> Option<Arc<JitCode>> {
+    let idx = LIST_APPEND_JITCODE_INDEX
+        .with(|cell| *cell.get_or_init(|| compute_named_jitcode_index("w_list_append")))?;
+    get_jitcode_by_index(idx)
+}
+
 /// RPython: opcode dispatch arm table (analogue of PyPy's per-opcode
 /// Python methods). One `PipelineOpcodeArm` per Rust `match` arm.
 pub fn all_opcode_arms() -> &'static [PipelineOpcodeArm] {
@@ -1015,6 +1072,24 @@ mod tests {
         assert_eq!(
             jitdriver_count, 1,
             "RPython call.py:147 invariant: exactly one portal jitcode per JitDriverStaticData"
+        );
+    }
+
+    #[test]
+    fn list_append_jitcode_resolves_charon_body() {
+        // #171 P3 foundation (issue #62/#23): the orthodox charon
+        // `w_list_append` body must be present and reachable by name in
+        // the build-time pipeline so the FBW walker can descend into it.
+        // Confirm the by-name resolver finds it and that the body carries
+        // real bytecode (not an empty shell) — i.e. the function graph was
+        // assembled, carrying the array-op sequence the `list.int_*`
+        // oopspecs lower to.
+        let jc = list_append_jitcode()
+            .expect("build-time pipeline must contain the charon `w_list_append` jitcode");
+        assert_eq!(jc.name, "w_list_append");
+        assert!(
+            !jc.code.is_empty(),
+            "w_list_append jitcode should have non-empty bytecode (assembled body)"
         );
     }
 
