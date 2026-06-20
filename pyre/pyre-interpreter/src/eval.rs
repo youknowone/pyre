@@ -2321,8 +2321,10 @@ impl OpcodeStepExecutor for PyFrame {
                 })
             }
             CommonConstant::NotImplementedError => {
-                crate::make_builtin_function("NotImplementedError", |_args| {
-                    Err(crate::PyError::type_error("not implemented"))
+                crate::builtins::lookup_exc_class("NotImplementedError").unwrap_or_else(|| {
+                    crate::make_builtin_function("NotImplementedError", |_args| {
+                        Err(crate::PyError::type_error("not implemented"))
+                    })
                 })
             }
             CommonConstant::BuiltinTuple => {
