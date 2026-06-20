@@ -1,0 +1,119 @@
+name: codex-review
+
+# Static-analysis parity review of a PR's diff against the local RPython/PyPy
+# sources, run by the Codex CLI and posted back as a sticky PR comment. The
+# review prompt is the single source of truth in `.github/codex-review-prompt.md`,
+# shared with the `/codex-review` local skill. This job only *reports*; acting
+# on the findings is the skill's job.
+
+on:
+  pull_request:
+    branches: [ "main" ]
+    types: [ opened, synchronize, reopened ]
+
+concurrency:
+  group: codex-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  codex-review:
+    name: Codex parity review
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          # Full history so `git diff origin/main` has a merge base.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Ensure origin/main is present
+        run: git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+
+      - name: Check Codex auth secret
+        id: auth
+        env:
+          CODEX_AUTH_JSON: ${{ secrets.CODEX_AUTH_JSON }}
+        run: |
+          if [ -z "${CODEX_AUTH_JSON}" ]; then
+            echo "::notice::CODEX_AUTH_JSON secret is not set (e.g. a fork PR); skipping Codex review."
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        if: steps.auth.outputs.present == 'true'
+        with:
+          node-version: 22
+
+      - name: Install Codex CLI
+        if: steps.auth.outputs.present == 'true'
+        run: npm install -g @openai/codex
+
+      - name: Configure Codex auth (ChatGPT token)
+        if: steps.auth.outputs.present == 'true'
+        env:
+          CODEX_AUTH_JSON: ${{ secrets.CODEX_AUTH_JSON }}
+        run: |
+          mkdir -p "$HOME/.codex"
+          printf '%s' "${CODEX_AUTH_JSON}" > "$HOME/.codex/auth.json"
+          chmod 600 "$HOME/.codex/auth.json"
+
+      - name: Run Codex review
+        if: steps.auth.outputs.present == 'true'
+        run: |
+          set +e
+          PROMPT="$(cat .github/codex-review-prompt.md)"
+          codex exec --dangerously-bypass-approvals-and-sandbox -m gpt-5.5 \
+            --output-last-message report.md \
+            "$PROMPT" </dev/null > codex.log 2>&1
+          status=$?
+          if [ ! -s report.md ]; then
+            {
+              echo "Codex did not produce a report (exit ${status}). Last log lines:"
+              echo
+              echo '```'
+              tail -n 60 codex.log
+              echo '```'
+            } > report.md
+          fi
+          # Never fail the job on a review error — the comment carries the detail.
+          exit 0
+
+      - name: Post sticky review comment
+        if: steps.auth.outputs.present == 'true'
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        with:
+          script: |
+            const fs = require('fs');
+            const marker = '<!-- codex-parity-review -->';
+            let report = fs.readFileSync('report.md', 'utf8');
+            const LIMIT = 60000;
+            if (report.length > LIMIT) {
+              report = report.slice(0, LIMIT) +
+                '\n\n…report truncated; see the workflow logs for the full output.';
+            }
+            const body = [
+              marker,
+              '## 🤖 Codex parity review',
+              `Static analysis of this diff vs the local RPython/PyPy sources (commit ${context.sha.slice(0, 7)}).`,
+              '',
+              report,
+            ].join('\n');
+
+            const { owner, repo } = context.repo;
+            const issue_number = context.issue.number;
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner, repo, issue_number, per_page: 100,
+            });
+            const existing = comments.find(c => c.body && c.body.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number, body });
+            }
