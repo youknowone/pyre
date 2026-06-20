@@ -110,17 +110,6 @@ pub fn patch_constants_i_fnaddrs(jitcodes: &mut Vec<Arc<JitCode>>) {
     }
 }
 
-/// STR `GcStruct` layout (`rstr.py:1226` `extra_item_after_alloc=True`),
-/// byte-identical to `bh_alloc_lowlevel_string` / `bh_newstr` (pyre-jit
-/// `eval.rs`) and the `malloc_varsize(STR)` the cutover codewriter lowers
-/// `ll_strconcat` into: `[hash:i64 @0][length:usize @8][chars:u8 @16..][NUL]`.
-/// The `chars` array stores its length inline at `@8` (RPython array length
-/// prefix) and an extra trailing byte for the C null terminator.
-const STR_HASH_OFFSET: usize = 0;
-const STR_LEN_OFFSET: usize = std::mem::size_of::<usize>();
-const STR_CHARS_OFFSET: usize = 2 * std::mem::size_of::<usize>();
-const STR_BASE_SIZE: usize = STR_CHARS_OFFSET + 1;
-
 /// High 16 bits of a deferred prebuilt-string sentinel (see
 /// [`majit_translate::assembler::STR_CONST_SENTINEL_BASE`]).  x86-64 user
 /// addresses occupy `0..2^48`, so a real GCREF / host-static address always
@@ -128,27 +117,22 @@ const STR_BASE_SIZE: usize = STR_CHARS_OFFSET + 1;
 /// pattern.
 const SENTINEL_HIGH_MASK: u64 = 0xFFFF_0000_0000_0000;
 
-/// Allocate and fill one immortal runtime STR block for a prebuilt-string
-/// constant, returning its address.  `alloc_zeroed` (never freed, outside
-/// the nursery/oldgen) gives a block the collector treats as a non-moving
-/// root target (`can_move = false`); the trailing NUL at `chars + len` is
-/// the zeroed extra item.  The layout mirrors the runtime allocator exactly
-/// so the block is indistinguishable from a `bh_newstr` result to every
-/// downstream reader (`getarraysize`, `getarrayitem`, `ll_strhash`).
-fn materialize_prebuilt_str(bytes: &[u8], precomputed_hash: i64) -> i64 {
-    let total = STR_BASE_SIZE + bytes.len();
-    let layout = std::alloc::Layout::from_size_align(total, std::mem::align_of::<usize>())
-        .expect("prebuilt STR layout");
-    let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
-    assert!(!ptr.is_null(), "prebuilt STR alloc_zeroed returned null");
-    unsafe {
-        (ptr.add(STR_HASH_OFFSET) as *mut i64).write(precomputed_hash);
-        (ptr.add(STR_LEN_OFFSET) as *mut usize).write(bytes.len());
-        for (i, &b) in bytes.iter().enumerate() {
-            ptr.add(STR_CHARS_OFFSET + i).write(b);
-        }
-    }
-    ptr as i64
+/// Materialize one immortal runtime `W_StrObject` for a prebuilt-string
+/// constant, returning its address.  `box_str_constant` leaks (never freed,
+/// outside the nursery) a `W_StrObject` whose `value: *mut Wtf8Buf`
+/// indirection at `STR_VALUE_OFFSET` is exactly what the trace readers
+/// follow: `bh_strlen` / `bh_strgetitem` (`pyre_cpu.rs`) and the compiled
+/// `PyreStrDescr` fast path both dereference that pointer, so the block is
+/// indistinguishable from a `bh_newstr` result.  It is the same builder
+/// `pyre-jit`'s `flatten.rs` uses for runtime string literals, and interns
+/// identical literals by content (the runtime analog of the assembler's
+/// per-jitcode dedup).  `precomputed_hash` is unused at runtime —
+/// `W_StrObject` carries no hash slot, so `ll_strhash` recomputes it from
+/// `value` on demand.
+fn materialize_prebuilt_str(bytes: &[u8], _precomputed_hash: i64) -> i64 {
+    let wtf8 = rustpython_wtf8::Wtf8::from_bytes(bytes)
+        .expect("prebuilt STR constant bytes are not valid WTF-8");
+    pyre_object::strobject::box_str_constant(wtf8) as i64
 }
 
 /// Materialize every deferred prebuilt-string constant the codewriter
@@ -235,20 +219,11 @@ mod tests {
         Arc::new(jc)
     }
 
-    /// Read back a materialized STR block: `(length, bytes, hash)`.
-    unsafe fn read_str_block(addr: i64) -> (usize, Vec<u8>, i64) {
-        let p = addr as *const u8;
-        let hash = unsafe { *(p.add(STR_HASH_OFFSET) as *const i64) };
-        let len = unsafe { *(p.add(STR_LEN_OFFSET) as *const usize) };
-        let mut bytes = Vec::with_capacity(len);
-        for i in 0..len {
-            bytes.push(unsafe { *p.add(STR_CHARS_OFFSET + i) });
-        }
-        (len, bytes, hash)
-    }
-
     #[test]
-    fn materialize_str_consts_overwrites_sentinel_with_str_block() {
+    fn materialize_str_consts_overwrites_sentinel_with_str_object() {
+        use majit_ir::GcRef;
+        use majit_metainterp::cpu::Cpu;
+
         let descs = vec![StrConstDescriptor {
             constants_r_index: 0,
             bytes: b"hello".to_vec(),
@@ -262,12 +237,19 @@ mod tests {
         assert_eq!(
             (addr as u64) & SENTINEL_HIGH_MASK,
             0,
-            "a real STR address must have the sentinel high bits clear",
+            "a real W_StrObject address must have the sentinel high bits clear",
         );
-        let (len, bytes, hash) = unsafe { read_str_block(addr) };
-        assert_eq!(len, 5);
-        assert_eq!(bytes, b"hello");
-        assert_eq!(hash, 0x1234_5678);
+        // Validate against the exact readers a live trace uses — the
+        // `W_StrObject.value` indirection at `STR_VALUE_OFFSET`.  This is the
+        // test that would have caught the old low-level-block layout bug:
+        // `bh_strlen` follows the value pointer, so a non-`W_StrObject` block
+        // would read garbage / fault here.
+        let cpu = crate::pyre_cpu::PyreCpu::new();
+        assert_eq!(cpu.bh_strlen(GcRef(addr as usize)), Some(5));
+        let got: Vec<u8> = (0..5)
+            .map(|i| cpu.bh_strgetitem(GcRef(addr as usize), i).unwrap() as u8)
+            .collect();
+        assert_eq!(got, b"hello");
     }
 
     #[test]
@@ -284,12 +266,18 @@ mod tests {
         materialize_str_consts(&mut jcs);
         let a0 = jcs[0].body().constants_r[0];
         let a1 = jcs[1].body().constants_r[0];
-        assert_eq!(a0, a1, "identical literals must share one immortal block");
+        assert_eq!(
+            a0, a1,
+            "identical literals must share one immortal W_StrObject",
+        );
         assert_ne!(a0, sentinel(0));
     }
 
     #[test]
-    fn materialize_str_consts_empty_string_has_trailing_nul() {
+    fn materialize_str_consts_empty_string() {
+        use majit_ir::GcRef;
+        use majit_metainterp::cpu::Cpu;
+
         let descs = vec![StrConstDescriptor {
             constants_r_index: 0,
             bytes: Vec::new(),
@@ -298,11 +286,7 @@ mod tests {
         let mut jcs = vec![jitcode_with_str_consts(descs)];
         materialize_str_consts(&mut jcs);
         let addr = jcs[0].body().constants_r[0];
-        let (len, bytes, hash) = unsafe { read_str_block(addr) };
-        assert_eq!(len, 0);
-        assert!(bytes.is_empty());
-        assert_eq!(hash, -1);
-        let nul = unsafe { *(addr as *const u8).add(STR_CHARS_OFFSET) };
-        assert_eq!(nul, 0, "extra_item_after_alloc trailing NUL must be zeroed");
+        let cpu = crate::pyre_cpu::PyreCpu::new();
+        assert_eq!(cpu.bh_strlen(GcRef(addr as usize)), Some(0));
     }
 }
