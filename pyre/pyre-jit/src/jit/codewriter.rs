@@ -6624,6 +6624,7 @@ impl CodeWriter {
                         | Instruction::Nop
                         | Instruction::Cache
                         | Instruction::NotTaken
+                        | Instruction::CopyFreeVars { .. }
                         | Instruction::ExtendedArg => {
                             // RPython: no-op operations produce no jitcode output
                         }
@@ -9463,7 +9464,6 @@ impl CodeWriter {
                         | Instruction::DeleteDeref { .. }
                         | Instruction::DeleteGlobal { .. }
                         | Instruction::DeleteName { .. }
-                        | Instruction::CopyFreeVars { .. }
                         | Instruction::MakeCell { .. }
                         | Instruction::SetupAnnotations => {
                             emit_abort_permanent!(py_pc);
