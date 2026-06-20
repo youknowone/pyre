@@ -509,6 +509,22 @@ pub fn register_module(ns: &mut DictStorage) {
             1,
         ),
     );
+    // cycle(iterable) — W_Cycle___new__: store `space.iter(w_iterable)` and an
+    // empty `saved` list.  W_Cycle.next_w (baseobjspace::next) pulls from the
+    // source on the first pass, saving each element, then replays `saved`
+    // forever.
+    crate::dict_storage_store(
+        ns,
+        "cycle",
+        crate::make_builtin_function_with_arity(
+            "cycle",
+            |args| {
+                let iterator = crate::baseobjspace::iter(args[0])?;
+                Ok(pyre_object::itertoolsmodule::w_cycle_new(iterator))
+            },
+            1,
+        ),
+    );
     // batched(iterable, n, *, strict=False) — CPython 3.13 itertools.batched.
     // Batches the input into tuples of length `n`; the last tuple may be
     // shorter unless `strict` is set, in which case a short final batch

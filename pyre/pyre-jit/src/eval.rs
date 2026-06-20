@@ -1827,6 +1827,17 @@ thread_local! {
             <pyre_object::zipobject::W_Zip
                 as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
         );
+        // W_Cycle (`itertools.cycle`) — typed payload via `#[pyre_class]` in
+        // AUTO-ID mode.  Unlike the other itertools iterators, its `saved`
+        // list is owned solely by the W_Cycle (no external root), so the
+        // collector must trace both the `w_iterable` source and the `saved`
+        // replay buffer.  Tail of the tid chain so no earlier slot shifts.
+        register_pyre_class(
+            &mut gc,
+            &mut pytype_to_tid,
+            <pyre_object::itertoolsmodule::W_Cycle
+                as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+        );
         // rclass.py:340-346 — assign subclassrange_{min,max} to each
         // vtable entry. freeze_types() runs assign_inheritance_ids
         // (normalizecalls.py:373-389), then we write the computed ranges

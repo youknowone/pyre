@@ -365,6 +365,59 @@ pub unsafe fn is_pairwise(obj: PyObjectRef) -> bool {
     unsafe { py_type_check(obj, &PAIRWISE_TYPE) }
 }
 
+// ── W_Cycle — pypy/module/itertools/interp_itertools.py:class W_Cycle ──
+//
+// ```python
+// class W_Cycle(W_Root):
+//     def __init__(self, space, w_iterable):
+//         self.space = space
+//         self.saved_w = []
+//         self.w_iterable = space.iter(w_iterable)
+//         self.index = 0    # 0 during the first iteration; > 0 afterwards
+// ```
+//
+// `next_w` (in `baseobjspace::next`) pulls from `w_iterable` on the first
+// pass, appending each element to `saved`; once the source is exhausted it
+// replays `saved` forever.  `index` is 0 during the first pass and > 0 once
+// cycling.  Unlike the predicate iterators (whose referents are rooted by
+// the live predicate/iterable), `saved` is owned solely by the W_Cycle, so
+// the GC must trace it — the type is registered in the JIT GC driver
+// (`pyre-jit/src/eval.rs`) via `register_pyre_class` in AUTO-ID mode.
+#[pyre_class("itertools.cycle", static_name = "CYCLE")]
+pub struct W_Cycle {
+    pub w_iterable: PyObjectRef,
+    pub saved: PyObjectRef,
+    pub index: i64,
+}
+
+/// `w_iterable` must already be an iterator (`cycle`'s registrar applies
+/// `space.iter`).  Allocates an empty `saved` list.
+pub fn w_cycle_new(w_iterable: PyObjectRef) -> PyObjectRef {
+    // `gct_fv_gc_malloc` bracket pattern (`framework.py:853-856`).
+    let _roots = crate::gc_roots::push_roots();
+    crate::gc_roots::pin_root(w_iterable);
+    let saved = crate::listobject::w_list_new(Vec::new());
+    crate::gc_roots::pin_root(saved);
+    W_Cycle::allocate(W_Cycle {
+        ob: PyObject {
+            ob_type: std::ptr::null(),
+            w_class: std::ptr::null_mut(),
+        },
+        w_iterable,
+        saved,
+        index: 0,
+    })
+}
+
+/// Check if an object is a `W_Cycle`.
+///
+/// # Safety
+/// `obj` must be a valid, non-null pointer to a `PyObject`.
+#[inline]
+pub unsafe fn is_cycle(obj: PyObjectRef) -> bool {
+    unsafe { py_type_check(obj, &CYCLE_TYPE) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -444,6 +497,28 @@ mod tests {
         assert_eq!(
             <W_Pairwise as crate::lltype::GcType>::SIZE,
             W_PAIRWISE_OBJECT_SIZE
+        );
+    }
+
+    // W_Cycle is registered in AUTO-ID mode (no `type_id = N`), so the GC
+    // tid is stamped at JIT-driver init rather than asserted against a
+    // constant.  What must hold is that both traced edges — the source
+    // `w_iterable` and the owned `saved` replay buffer — are reported to
+    // the collector, and that the descriptor reflects the struct's size.
+    #[test]
+    fn w_cycle_gc_descriptor_traces_both_pointer_fields() {
+        assert_eq!(W_CYCLE_GC_PTR_OFFSETS.len(), 2);
+        assert_eq!(
+            W_CYCLE_GC_PTR_OFFSETS[0],
+            std::mem::offset_of!(W_Cycle, w_iterable)
+        );
+        assert_eq!(
+            W_CYCLE_GC_PTR_OFFSETS[1],
+            std::mem::offset_of!(W_Cycle, saved)
+        );
+        assert_eq!(
+            <W_Cycle as crate::lltype::GcType>::SIZE,
+            W_CYCLE_OBJECT_SIZE
         );
     }
 }

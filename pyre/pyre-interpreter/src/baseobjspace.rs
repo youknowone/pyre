@@ -2899,6 +2899,7 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyResul
             || pyre_object::itertoolsmodule::is_dropwhile(obj)
             || pyre_object::itertoolsmodule::is_filterfalse(obj)
             || pyre_object::itertoolsmodule::is_pairwise(obj)
+            || pyre_object::itertoolsmodule::is_cycle(obj)
         {
             let entry: Option<(fn(&[PyObjectRef]) -> PyResult, &str, u16)> = match name {
                 "__next__" => Some((iter_next_method, "__next__", 1)),
@@ -2906,7 +2907,13 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyResul
                 // takewhile/dropwhile expose `__reduce__` + `__setstate__`,
                 // filterfalse `__reduce__` only (interp_itertools.py
                 // W_TakeWhile/W_DropWhile/W_FilterFalse typedefs); pairwise
-                // exposes neither.
+                // exposes neither.  cycle exposes both (W_Cycle typedef).
+                "__reduce__" if pyre_object::itertoolsmodule::is_cycle(obj) => {
+                    Some((cycle_reduce_method, "__reduce__", 1))
+                }
+                "__setstate__" if pyre_object::itertoolsmodule::is_cycle(obj) => {
+                    Some((cycle_setstate_method, "__setstate__", 2))
+                }
                 "__reduce__" if pyre_object::itertoolsmodule::is_takewhile(obj) => {
                     Some((takewhile_reduce_method, "__reduce__", 1))
                 }
@@ -8501,6 +8508,7 @@ pub fn is_iterable(w_obj: PyObjectRef) -> bool {
             || pyre_object::itertoolsmodule::is_dropwhile(obj)
             || pyre_object::itertoolsmodule::is_filterfalse(obj)
             || pyre_object::itertoolsmodule::is_pairwise(obj)
+            || pyre_object::itertoolsmodule::is_cycle(obj)
         {
             return true;
         }
@@ -8685,6 +8693,7 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
             || pyre_object::itertoolsmodule::is_dropwhile(obj)
             || pyre_object::itertoolsmodule::is_filterfalse(obj)
             || pyre_object::itertoolsmodule::is_pairwise(obj)
+            || pyre_object::itertoolsmodule::is_cycle(obj)
         {
             return Ok(obj);
         }
@@ -9088,6 +9097,67 @@ pub fn next(obj: PyObjectRef) -> PyResult {
             let w_next = next(it.w_iterator)?;
             it.w_prev = w_next;
             return Ok(pyre_object::w_tuple_new(vec![w_prev, w_next]));
+        }
+        // itertools.cycle — interp_itertools.py W_Cycle.next_w
+        //
+        //     def next_w(self):
+        //         if self.index > 0:
+        //             if not self.saved_w:
+        //                 raise OperationError(self.space.w_StopIteration, ...)
+        //             try:
+        //                 w_obj = self.saved_w[self.index]
+        //             except IndexError:
+        //                 self.index = 1
+        //                 w_obj = self.saved_w[0]
+        //             else:
+        //                 self.index += 1
+        //         else:
+        //             try:
+        //                 w_obj = self.space.next(self.w_iterable)
+        //             except OperationError as e:  # StopIteration
+        //                 self.index = 1
+        //                 if not self.saved_w:
+        //                     raise
+        //                 w_obj = self.saved_w[0]
+        //             else:
+        //                 self.saved_w.append(w_obj)
+        //         return w_obj
+        if pyre_object::itertoolsmodule::is_cycle(obj) {
+            let it = &mut *(obj as *mut pyre_object::itertoolsmodule::W_Cycle);
+            // Cycling pass (index > 0): replay `saved` after the source ended.
+            if it.index > 0 {
+                let n = pyre_object::w_list_len(it.saved) as i64;
+                if n == 0 {
+                    return Err(PyError::stop_iteration());
+                }
+                if it.index < n {
+                    let w_obj = pyre_object::w_list_getitem(it.saved, it.index)
+                        .expect("cycle saved index in range");
+                    it.index += 1;
+                    return Ok(w_obj);
+                }
+                // `IndexError` — wrap to the start; index left at 1 so the
+                // next call reads `saved[1]`.
+                it.index = 1;
+                return Ok(pyre_object::w_list_getitem(it.saved, 0)
+                    .expect("cycle saved non-empty"));
+            }
+            // First pass (index == 0): pull from the source, saving each.
+            match next(it.w_iterable) {
+                Ok(w_obj) => {
+                    pyre_object::w_list_append(it.saved, w_obj);
+                    return Ok(w_obj);
+                }
+                Err(e) if e.kind == PyErrorKind::StopIteration => {
+                    it.index = 1;
+                    if pyre_object::w_list_len(it.saved) == 0 {
+                        return Err(PyError::stop_iteration());
+                    }
+                    return Ok(pyre_object::w_list_getitem(it.saved, 0)
+                        .expect("cycle saved non-empty"));
+                }
+                Err(e) => return Err(e),
+            }
         }
         // `pypy/objspace/std/dictmultiobject.py:809-845 _new_next`
         // line-by-line — two parity-mandated checks:
@@ -9658,6 +9728,56 @@ fn filterfalse_reduce_method(args: &[PyObjectRef]) -> PyResult {
     };
     let state = w_tuple_new(vec![w_pred, it.w_iterable]);
     Ok(w_tuple_new(vec![w_type, state]))
+}
+
+/// `cycle.__reduce__` — `interp_itertools.py W_Cycle.descr_reduce`:
+/// `(type(self), (iterable,), (list(saved), index))`.  The saved buffer is
+/// copied into a fresh list (`space.newlist(self.saved_w)`) so later
+/// cycling cannot mutate the pickled state.
+fn cycle_reduce_method(args: &[PyObjectRef]) -> PyResult {
+    // Capture every field before any allocation (`w_list_new` /
+    // `w_tuple_new` may collect): the saved elements go into a `Vec`
+    // that `w_list_new` pins, and `w_iterable` / `index` are read up
+    // front rather than across an allocation.
+    let w_type = crate::typedef::r#type(args[0]).unwrap_or(PY_NULL);
+    let it = unsafe { &*(args[0] as *const pyre_object::itertoolsmodule::W_Cycle) };
+    let w_iterable = it.w_iterable;
+    let index = it.index;
+    let n = unsafe { pyre_object::w_list_len(it.saved) };
+    let mut saved = Vec::with_capacity(n);
+    for i in 0..n as i64 {
+        saved.push(
+            unsafe { pyre_object::w_list_getitem(it.saved, i) }
+                .expect("cycle saved index in range"),
+        );
+    }
+    let state = w_tuple_new(vec![w_list_new(saved), w_int_new(index)]);
+    Ok(w_tuple_new(vec![w_type, w_tuple_new(vec![w_iterable]), state]))
+}
+
+/// `cycle.__setstate__` — `interp_itertools.py W_Cycle.descr_setstate`:
+/// unpack `(saved, index)`, replace `saved_w` with a fresh list of the
+/// unpacked elements, and restore `index`.  Reassigning the `saved`
+/// pointer field requires the GC write barrier so an old→young edge is
+/// recorded.
+fn cycle_setstate_method(args: &[PyObjectRef]) -> PyResult {
+    // `unpackiterable` iterates the pickled state and may collect; pin the
+    // receiver and the state tuple so they (and, transitively, the saved
+    // list reached through the tuple) survive each iteration.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let w_self = args[0];
+    let w_state = args.get(1).copied().unwrap_or(w_none());
+    pyre_object::gc_roots::pin_root(w_self);
+    pyre_object::gc_roots::pin_root(w_state);
+    let state_w = unpackiterable(w_state, 2)?;
+    let saved_w = unpackiterable(state_w[0], -1)?;
+    let w_saved = w_list_new(saved_w);
+    let index = int_w(state_w[1])?;
+    let it = unsafe { &mut *(w_self as *mut pyre_object::itertoolsmodule::W_Cycle) };
+    it.saved = w_saved;
+    pyre_object::gc_hook::try_gc_write_barrier(w_self as *mut u8);
+    it.index = index;
+    Ok(w_none())
 }
 
 /// PyPy: GeneratorIterator.descr_send(w_arg)
