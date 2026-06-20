@@ -5599,6 +5599,17 @@ fn builtin_reversed(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
             let last = current + (count - 1) * step;
             return Ok(pyre_object::w_range_iter_new(last, current - step, -step));
         }
+        // bytes / bytearray: yield the byte values in reverse.
+        if pyre_object::bytesobject::is_bytes_like(obj) {
+            let n = pyre_object::bytesobject::bytes_like_len(obj);
+            let mut items = Vec::with_capacity(n);
+            for i in (0..n).rev() {
+                items.push(w_int_new(
+                    pyre_object::bytesobject::bytes_like_getitem(obj, i) as i64,
+                ));
+            }
+            return Ok(pyre_object::w_seq_iter_new(pyre_object::w_list_new(items), n));
+        }
     }
     // `__reversed__` resolved through the type MRO (`functional.py:362-366`) —
     // honors a subclass override and the inherited builtin `list.__reversed__`,
