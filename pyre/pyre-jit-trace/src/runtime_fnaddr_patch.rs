@@ -177,7 +177,7 @@ pub fn materialize_str_consts(jitcodes: &mut Vec<Arc<JitCode>>) {
             };
             // The slot must still hold its non-canonical sentinel — never a
             // real address (which has the high bits clear).
-            debug_assert_eq!(
+            assert_eq!(
                 (body.constants_r[idx] as u64) & SENTINEL_HIGH_MASK,
                 (majit_translate::assembler::STR_CONST_SENTINEL_BASE as u64) & SENTINEL_HIGH_MASK,
                 "constants_r[{idx}] did not hold a prebuilt-string sentinel",
