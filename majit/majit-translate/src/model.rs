@@ -1077,8 +1077,10 @@ pub enum OpKind {
     /// keyed on (`blackhole.rs`).
     ///
     /// Only for opnames whose lowering is a single register-shaped insn with
-    /// no descriptor and no special effect classification; descriptor-bearing
-    /// ops (getfield/getarrayitem/…) keep their dedicated rich `OpKind`s.
+    /// no descriptor operand; effect classification remains opname-driven
+    /// (e.g. `newstr`/`newunicode` are `MemoryErrorOnly` in
+    /// `jit_codewriter::call::op_can_raise`).  Descriptor-bearing ops
+    /// (getfield/getarrayitem/…) keep their dedicated rich `OpKind`s.
     LoweredBlackholeOp {
         opname: String,
         args: Vec<crate::flowspace::model::Variable>,
