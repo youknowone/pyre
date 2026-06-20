@@ -102,8 +102,19 @@ impl W_Unpickler {
             )));
         };
         self.fix_imports = crate::baseobjspace::is_true(fix_imports)?;
-        self.w_file_read = crate::baseobjspace::getattr_str(file, "read")?;
-        self.w_file_readline = crate::baseobjspace::getattr_str(file, "readline")?;
+        // `file` must expose both `read` and `readline`; a missing either is a
+        // TypeError, not the bare AttributeError a direct `getattr` surfaces
+        // (`_Unpickler_SetInputStream`). Store `read` before resolving
+        // `readline` so the first bound method is rooted across that allocation.
+        self.w_file_read =
+            crate::baseobjspace::findattr_result(file, "read")?.unwrap_or(pyre_object::PY_NULL);
+        self.w_file_readline =
+            crate::baseobjspace::findattr_result(file, "readline")?.unwrap_or(pyre_object::PY_NULL);
+        if self.w_file_read.is_null() || self.w_file_readline.is_null() {
+            return Err(PyError::type_error(
+                "file must have 'read' and 'readline' attributes",
+            ));
+        }
         self.w_stack = pyre_object::w_none();
         self.w_metastack = pyre_object::w_none();
         // The memo persists across `load` calls (a multi-object stream may
