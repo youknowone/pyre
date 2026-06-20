@@ -1196,14 +1196,23 @@ pub fn is_pure_op(kind: &OpKind) -> bool {
         | OpKind::LoopHeader { .. }
         | OpKind::Live
         | OpKind::VableForce { .. }
-        // `LoweredBlackholeOp` carries register-shaped blackhole insns
-        // (`strlen`/`strgetitem`/`strsetitem`/`newstr`) whose side-effect
-        // class is opname-dependent (the `newstr` malloc + `strsetitem`
-        // store mutate).  Conservatively side-effecting so the dead-op
-        // sweep never drops a store or an allocation.
-        | OpKind::LoweredBlackholeOp { .. }
         | OpKind::Hint { .. }
         | OpKind::Abort { .. } => false,
+
+        // `LoweredBlackholeOp` carries register-shaped blackhole insns whose
+        // side-effect class is opname-dependent — the same split `op_can_raise`
+        // (`call.rs`) and upstream `lloperation.py:382-383` (sideeffects /
+        // canfold) make.  The read family
+        // (`strlen`/`unicodelen`/`strgetitem`/`unicodegetitem`) is
+        // pure/removable; the alloc/store/copy family
+        // (`newstr`/`newunicode`/`strsetitem`/`unicodesetitem`/
+        // `copystrcontent`/`copyunicodecontent`) mutates.  Any unlisted opname
+        // falls through to side-effecting, so the dead-op sweep never drops a
+        // store or an allocation by default.
+        OpKind::LoweredBlackholeOp { opname, .. } => matches!(
+            opname.as_str(),
+            "strlen" | "unicodelen" | "strgetitem" | "unicodegetitem"
+        ),
     }
 }
 
@@ -1456,6 +1465,31 @@ mod tests {
     use crate::call::CallControl;
     use crate::model::{CallTarget, FunctionGraph, OpKind, ValueType};
     use crate::parse::CallPath;
+
+    #[test]
+    fn lowered_blackhole_op_purity_is_opname_aware() {
+        let pure = |name: &str| {
+            is_pure_op(&OpKind::LoweredBlackholeOp {
+                opname: name.to_string(),
+                args: vec![],
+            })
+        };
+        // Read family: pure/removable when the result is dead.
+        for name in ["strlen", "unicodelen", "strgetitem", "unicodegetitem"] {
+            assert!(pure(name), "{name} is a pure read");
+        }
+        // Alloc / store / copy family: side-effecting, must never be dropped.
+        for name in [
+            "newstr",
+            "newunicode",
+            "strsetitem",
+            "unicodesetitem",
+            "copystrcontent",
+            "copyunicodecontent",
+        ] {
+            assert!(!pure(name), "{name} mutates and must be kept");
+        }
+    }
 
     fn make_simple_callee() -> FunctionGraph {
         // Callee: fn callee(base) -> value { ArrayRead(base, const(0)) }
