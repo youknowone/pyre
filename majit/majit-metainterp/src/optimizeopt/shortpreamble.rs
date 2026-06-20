@@ -681,16 +681,22 @@ impl ShortBoxes {
                  (shortpreamble.py:255-259)"
             );
         }
-        // shortpreamble.py:256 `box = label_args[i]` — record the original.
+        // shortpreamble.py:258 `self.short_inputargs.append(renamed)`: one
+        // renamed box per call, in caller order. The production caller
+        // (optimizer.rs preview loop) iterates `label_args + virtuals`
+        // (unroll.py:479) in order, appending one renamed box per slot, so
+        // this call's slot is `short_inputargs.len()`, captured before the
+        // push below.
+        let live_slot = self.short_inputargs.len();
+        // shortpreamble.py:256 `box = label_args[i]` — register the original
+        // so `is_reachable` / `produce_arg` membership resolve it.
         // `with_label_args` pre-seeds `label_args`; the standalone
-        // `create_short_boxes` path (empty `label_args`) appends here.
-        let label_arg_idx = match self.lookup_label_arg(arg) {
-            Some(idx) => idx,
-            None => {
-                self.label_args.push(arg);
-                self.label_args.len() - 1
-            }
-        };
+        // `create_short_boxes` path (empty `label_args`) appends here. A box
+        // duplicated across `label_args + virtuals` (a virtual field that
+        // coincides with a label arg) is registered once.
+        if self.lookup_label_arg(arg).is_none() {
+            self.label_args.push(arg);
+        }
         // shortpreamble.py:257 `renamed = OpHelpers.inputarg_from_tp(box.type)`
         // — a FRESH InputArg distinct from the original `box`. Its position
         // comes from the op-position counter so it is unique and accounted
@@ -700,22 +706,18 @@ impl ShortBoxes {
             arg_type,
             ctx.alloc_op_position_typed(arg_type).raw(),
         );
-        // shortpreamble.py:258 `self.short_inputargs.append(renamed)`: one
-        // renamed box per call, in caller order. The production caller
-        // (optimizer.rs preview loop) iterates `label_args + virtuals`
-        // (unroll.py:479) in order, appending one renamed box per slot, so
-        // `short_inputargs[i]` pairs positionally with that combined list.
-        //
-        // A box may appear twice in `label_args + virtuals` (a virtual field
-        // that coincides with a label arg). Upstream tolerates this: the
-        // `potential_ops[box]` assignment (shortpreamble.py:259) keys on the
-        // box, so the duplicate collapses to one produced entry while
-        // `short_inputargs` still holds a renamed box per slot. `label_arg_idx`
-        // is the box's first slot (`lookup_label_arg`), so the later duplicate
-        // slot's renamed box becomes a dead Label arg — never produced, never
-        // given info (shortpreamble.py:414-417 sets info only on produced
-        // boxes). `label_arg_idx == short_inputargs.len()` therefore holds only
-        // when the combined list is duplicate-free, so it is not asserted.
+        // shortpreamble.py:259 `self.potential_ops[box] = ShortInputArg(...)`
+        // is a plain dict assignment, so for a box duplicated across the
+        // combined list it OVERWRITES: the LAST slot's `ShortInputArg`
+        // survives and `produce_arg` returns `short_inputargs[LAST]`, leaving
+        // the FIRST slot's renamed box a dead Label arg — never produced,
+        // never given info (shortpreamble.py:414-417 sets info only on
+        // produced boxes). pyre mirrors that by stamping `label_arg_idx =
+        // live_slot` (this call's slot) on the `potential_ops` entry below;
+        // the later duplicate call overwrites with its later slot, so
+        // `produce_arg` returns the same LAST-slot renamed box. In the
+        // duplicate-free case `live_slot == lookup_label_arg(arg)`, so the
+        // rename is unchanged.
         self.short_inputargs.push(renamed);
         // shortpreamble.py:257 `ShortInputArg(box, renamed)` — `res` is the
         // original `box`; the SAME_AS replay arg is that box. Exported
@@ -737,7 +739,7 @@ impl ShortBoxes {
                 res: arg_box,
                 op: std::rc::Rc::new(same_as),
                 kind: PreambleOpKind::InputArg,
-                label_arg_idx: Some(label_arg_idx),
+                label_arg_idx: Some(live_slot),
                 invented_name: false,
                 same_as_source: None,
             }),
@@ -4147,6 +4149,50 @@ mod tests {
         assert_eq!(sb.lookup_label_arg(OpRef::int_op(10)), Some(0));
         assert_eq!(sb.lookup_label_arg(OpRef::ref_op(11)), Some(1));
         assert!(sb.is_reachable(OpRef::int_op(10)));
+    }
+
+    #[test]
+    fn test_duplicate_slot_keeps_last_renamed_inputarg() {
+        // shortpreamble.py:255-259 — when a box appears at TWO slots of the
+        // combined `label_args + virtuals` (a virtual field coinciding with a
+        // label arg; empirically RefOp(50)/RefOp(174) in synth/tuple_unpacking),
+        // the `potential_ops[box] = ShortInputArg(box, renamed)` dict assignment
+        // OVERWRITES, so the LAST slot's renamed inputarg is the live one and
+        // `produce_arg` returns `short_inputargs[LAST]`; the FIRST slot's renamed
+        // box is the dead Label arg. pyre stamps `label_arg_idx = live_slot` (the
+        // current call's slot) so the later (overwriting) call records the LAST
+        // slot, matching upstream. Before the fix `lookup_label_arg`'s
+        // first-occurrence made produce_arg return short_inputargs[FIRST].
+        let mut ctx = crate::optimizeopt::OptContext::new(256);
+        // The SAME box at both slots: the production caller (optimizer.rs preview
+        // loop) iterates label_args+virtuals, so a coinciding box reaches
+        // add_short_input_arg once per slot.
+        let label_args = [OpRef::ref_op(50), OpRef::ref_op(50)];
+        let mut sb = ShortBoxes::with_label_args(&label_args);
+        sb.add_short_input_arg(&mut ctx, OpRef::ref_op(50), majit_ir::Type::Ref);
+        sb.add_short_input_arg(&mut ctx, OpRef::ref_op(50), majit_ir::Type::Ref);
+
+        // Two FRESH distinct renamed boxes, one per slot (shortpreamble.py:258).
+        let si = sb.create_short_inputargs(&label_args);
+        assert_eq!(si.len(), 2);
+        assert_ne!(si[0].to_opref(), si[1].to_opref());
+
+        // The duplicate collapses to ONE produced InputArg entry, keyed at the
+        // LAST slot (label_arg_idx == Some(1)), not the first (Some(0)).
+        let produced = sb.produced_ops(&mut ctx);
+        let inputarg_entries: Vec<_> = produced
+            .iter()
+            .filter(|(r, p)| *r == OpRef::ref_op(50) && p.kind == PreambleOpKind::InputArg)
+            .collect();
+        assert_eq!(inputarg_entries.len(), 1);
+        // THE REGRESSION LOCK: the overwriting (later) call must record the LAST
+        // slot, matching upstream's dict-overwrite. Some(0) before the fix.
+        assert_eq!(inputarg_entries[0].1.label_arg_idx, Some(1));
+
+        // produce_arg returns the LAST slot's renamed box.
+        let produced_arg = sb.produce_arg(&mut ctx, OpRef::ref_op(50)).unwrap();
+        assert_eq!(produced_arg.to_opref(), si[1].to_opref());
+        assert_ne!(produced_arg.to_opref(), si[0].to_opref());
     }
 
     #[test]

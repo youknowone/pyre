@@ -1319,9 +1319,11 @@ impl UnrollOptimizer {
         // `produced_op.short_op.res`, the original). Shared by the two
         // consumers below. Every label/virtual slot produces an InputArg
         // entry, except a duplicate slot (one box appears twice in
-        // `label_args + virtuals`: the entry keys at its first slot, so the
-        // later dead slot stays None) and a const-folded slot (dropped at
-        // export, never surviving into Phase 2).
+        // `label_args + virtuals`: the `potential_ops[box]` overwrite keys the
+        // single entry at its LAST slot — shortpreamble.py:259, mirrored by
+        // `live_slot` in add_short_input_arg — so the earlier dead slot stays
+        // None) and a const-folded slot (dropped at export, never surviving
+        // into Phase 2).
         let mut slot_to_original: Vec<Option<OpRef>> = vec![None; initial_sp.inputargs.len()];
         for (_, produced) in &exported_short_boxes_produced {
             if !matches!(
