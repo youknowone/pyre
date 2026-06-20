@@ -269,7 +269,6 @@ pub fn install_builtin_modules() {
         "_json",
         "_csv",
         "marshal",
-        "_tracemalloc",
         "_stat",
         "_queue",
         "_zoneinfo",
@@ -278,6 +277,80 @@ pub fn install_builtin_modules() {
         register_builtin_module(name, empty_module_init);
     }
     register_builtin_module("_scproxy", init_scproxy);
+    register_builtin_module("_tracemalloc", init_tracemalloc);
+    register_builtin_module("_sysconfig", init_sysconfig_stub);
+}
+
+/// `_sysconfig` stub — exposes `config_vars()` returning an empty dict. On
+/// POSIX `sysconfig` only consults this for the build variables that pyre does
+/// not generate; importing it is enough to satisfy `test_sysconfig`.
+fn init_sysconfig_stub(ns: &mut DictStorage) {
+    crate::dict_storage_store(
+        ns,
+        "config_vars",
+        crate::make_builtin_function("config_vars", |_| Ok(pyre_object::w_dict_new())),
+    );
+}
+
+/// `_tracemalloc` stub — allocation tracking is not implemented, so the
+/// tracing primitives are neutral no-ops that let `tracemalloc` import and
+/// report an inactive tracer.
+fn init_tracemalloc(ns: &mut DictStorage) {
+    crate::dict_storage_store(
+        ns,
+        "start",
+        crate::make_builtin_function("start", |_| Ok(pyre_object::w_none())),
+    );
+    crate::dict_storage_store(
+        ns,
+        "stop",
+        crate::make_builtin_function("stop", |_| Ok(pyre_object::w_none())),
+    );
+    crate::dict_storage_store(
+        ns,
+        "clear_traces",
+        crate::make_builtin_function("clear_traces", |_| Ok(pyre_object::w_none())),
+    );
+    crate::dict_storage_store(
+        ns,
+        "reset_peak",
+        crate::make_builtin_function("reset_peak", |_| Ok(pyre_object::w_none())),
+    );
+    crate::dict_storage_store(
+        ns,
+        "is_tracing",
+        crate::make_builtin_function("is_tracing", |_| Ok(pyre_object::w_bool_from(false))),
+    );
+    crate::dict_storage_store(
+        ns,
+        "get_traceback_limit",
+        crate::make_builtin_function("get_traceback_limit", |_| Ok(pyre_object::w_int_new(1))),
+    );
+    crate::dict_storage_store(
+        ns,
+        "get_tracemalloc_memory",
+        crate::make_builtin_function("get_tracemalloc_memory", |_| Ok(pyre_object::w_int_new(0))),
+    );
+    crate::dict_storage_store(
+        ns,
+        "get_traced_memory",
+        crate::make_builtin_function("get_traced_memory", |_| {
+            Ok(pyre_object::w_tuple_new(vec![
+                pyre_object::w_int_new(0),
+                pyre_object::w_int_new(0),
+            ]))
+        }),
+    );
+    crate::dict_storage_store(
+        ns,
+        "_get_traces",
+        crate::make_builtin_function("_get_traces", |_| Ok(pyre_object::w_list_new(Vec::new()))),
+    );
+    crate::dict_storage_store(
+        ns,
+        "_get_object_traceback",
+        crate::make_builtin_function("_get_object_traceback", |_| Ok(pyre_object::w_none())),
+    );
 }
 
 /// `_scproxy` — the macOS SystemConfiguration proxy probe that
