@@ -294,6 +294,7 @@ fn slice_length(start: i64, stop: i64, step: i64) -> i64 {
 }
 
 fn array_getitem(args: &[PyObjectRef]) -> PyResult {
+    check_arity(args, 2, "array.__getitem__")?;
     let obj = args[0];
     let key = args[1];
     let len = unsafe { arr::w_array_len(obj) };
@@ -322,6 +323,7 @@ fn array_getitem(args: &[PyObjectRef]) -> PyResult {
 }
 
 fn array_setitem(args: &[PyObjectRef]) -> PyResult {
+    check_arity(args, 3, "array.__setitem__")?;
     let obj = args[0];
     let key = args[1];
     let w_value = args[2];
@@ -369,13 +371,24 @@ fn array_setitem(args: &[PyObjectRef]) -> PyResult {
     }
     let i = index_in_range(key, len, "array")?;
     let mut buf: Bytes = [0u8; 8];
+    // pack_into may run user code (`__index__`/`__int__`/`__float__`) that
+    // resizes the array mid-assignment (gh-142555); re-validate the slot
+    // against the current length before writing.
     let n = pack_into(tc, w_value, &mut buf)?;
     let vec = unsafe { arr::w_array_vec_mut(obj) };
-    vec[i * isz..i * isz + n].copy_from_slice(&buf[..n]);
+    let end = i * isz + n;
+    if end > vec.len() {
+        return Err(PyError::new(
+            PyErrorKind::IndexError,
+            "array assignment index out of range".to_string(),
+        ));
+    }
+    vec[i * isz..end].copy_from_slice(&buf[..n]);
     Ok(pyre_object::w_none())
 }
 
 fn array_delitem(args: &[PyObjectRef]) -> PyResult {
+    check_arity(args, 2, "array.__delitem__")?;
     let obj = args[0];
     let key = args[1];
     let len = unsafe { arr::w_array_len(obj) };
@@ -431,17 +444,35 @@ fn array_iter(args: &[PyObjectRef]) -> PyResult {
     Ok(pyre_object::w_seq_iter_new(args[0], len))
 }
 
+/// Ensure a method received at least `min_total` positional slots
+/// (`self` included); otherwise raise the "takes exactly N argument(s)"
+/// TypeError rather than panicking on an out-of-range `args` index.
+fn check_arity(args: &[PyObjectRef], min_total: usize, name: &str) -> Result<(), PyError> {
+    if args.len() < min_total {
+        let want = min_total - 1;
+        let noun = if want == 1 { "argument" } else { "arguments" };
+        return Err(PyError::type_error(format!(
+            "{name}() takes exactly {want} {noun} ({} given)",
+            args.len().saturating_sub(1)
+        )));
+    }
+    Ok(())
+}
+
 fn array_append_method(args: &[PyObjectRef]) -> PyResult {
+    check_arity(args, 2, "array.append")?;
     array_append(args[0], args[1])?;
     Ok(pyre_object::w_none())
 }
 
 fn array_extend_method(args: &[PyObjectRef]) -> PyResult {
+    check_arity(args, 2, "array.extend")?;
     array_extend_iterable(args[0], args[1])?;
     Ok(pyre_object::w_none())
 }
 
 fn array_insert_method(args: &[PyObjectRef]) -> PyResult {
+    check_arity(args, 3, "array.insert")?;
     let obj = args[0];
     let len = unsafe { arr::w_array_len(obj) };
     let isz = unsafe { arr::w_array_itemsize(obj) };
@@ -496,6 +527,7 @@ fn array_pop_method(args: &[PyObjectRef]) -> PyResult {
 }
 
 fn array_remove_method(args: &[PyObjectRef]) -> PyResult {
+    check_arity(args, 2, "array.remove")?;
     let obj = args[0];
     let idx = array_find(obj, args[1])?;
     match idx {
@@ -522,13 +554,55 @@ fn array_find(obj: PyObjectRef, w_value: PyObjectRef) -> Result<Option<usize>, P
 }
 
 fn array_index_method(args: &[PyObjectRef]) -> PyResult {
-    match array_find(args[0], args[1])? {
-        Some(i) => Ok(pyre_object::w_int_new(i as i64)),
-        None => Err(PyError::value_error("array.index(x): x not in array")),
+    check_arity(args, 2, "array.index")?;
+    let obj = args[0];
+    let w_value = args[1];
+    let len = unsafe { arr::w_array_len(obj) } as i64;
+    // Optional start/stop, unwrapped via __index__, clamped like descr_index.
+    let mut start = if args.len() >= 3 {
+        crate::builtins::getindex_w(args[2])?
+    } else {
+        0
+    };
+    let mut stop = if args.len() >= 4 {
+        crate::builtins::getindex_w(args[3])?
+    } else {
+        len
+    };
+    if start < 0 {
+        start += len;
+        if start < 0 {
+            start = 0;
+        }
     }
+    if stop < 0 {
+        stop += len;
+        if stop < 0 {
+            stop = 0;
+        }
+    }
+    if stop > len {
+        stop = len;
+    }
+    let mut i = start;
+    while i < stop {
+        let w_item = unsafe { arr::w_array_unpack_item(obj, i as usize) };
+        if crate::baseobjspace::eq_w(w_item, w_value)? {
+            return Ok(pyre_object::w_int_new(i));
+        }
+        i += 1;
+    }
+    Err(PyError::value_error("array.index(x): x not in array"))
+}
+
+fn array_clear_method(args: &[PyObjectRef]) -> PyResult {
+    // descr_clear — empty the buffer, preserving typecode/itemsize.
+    unsafe { arr::w_array_vec_mut(args[0]) }.clear();
+    Ok(pyre_object::w_none())
 }
 
 fn array_count_method(args: &[PyObjectRef]) -> PyResult {
+    check_arity(args, 2, "array.count")?;
     let obj = args[0];
     let len = unsafe { arr::w_array_len(obj) };
     let mut count = 0i64;
@@ -573,6 +647,7 @@ fn array_tolist_method(args: &[PyObjectRef]) -> PyResult {
 }
 
 fn array_fromlist_method(args: &[PyObjectRef]) -> PyResult {
+    check_arity(args, 2, "array.fromlist")?;
     array_extend_iterable(args[0], args[1])?;
     Ok(pyre_object::w_none())
 }
@@ -583,6 +658,7 @@ fn array_tobytes_method(args: &[PyObjectRef]) -> PyResult {
 }
 
 fn array_frombytes_method(args: &[PyObjectRef]) -> PyResult {
+    check_arity(args, 2, "array.frombytes")?;
     if !unsafe { pyre_object::bytesobject::is_bytes_like(args[1]) } {
         return Err(PyError::type_error(
             "a bytes-like object is required",
@@ -613,6 +689,7 @@ fn array_tounicode_method(args: &[PyObjectRef]) -> PyResult {
 }
 
 fn array_fromunicode_method(args: &[PyObjectRef]) -> PyResult {
+    check_arity(args, 2, "array.fromunicode")?;
     array_fromunicode(args[0], args[1])?;
     Ok(pyre_object::w_none())
 }
@@ -622,6 +699,7 @@ fn array_fromunicode_method(args: &[PyObjectRef]) -> PyResult {
 // ──────────────────────────────────────────────────────────────────────
 
 fn array_contains_method(args: &[PyObjectRef]) -> PyResult {
+    check_arity(args, 2, "array.__contains__")?;
     Ok(pyre_object::w_bool_from(
         array_find(args[0], args[1])?.is_some(),
     ))
@@ -724,26 +802,33 @@ fn array_richcompare(a: PyObjectRef, b: PyObjectRef, op: u8) -> PyResult {
 }
 
 fn array_eq_method(args: &[PyObjectRef]) -> PyResult {
+    check_arity(args, 2, "array.__eq__")?;
     array_richcompare(args[0], args[1], 0)
 }
 fn array_ne_method(args: &[PyObjectRef]) -> PyResult {
+    check_arity(args, 2, "array.__ne__")?;
     array_richcompare(args[0], args[1], 1)
 }
 fn array_lt_method(args: &[PyObjectRef]) -> PyResult {
+    check_arity(args, 2, "array.__lt__")?;
     array_richcompare(args[0], args[1], 2)
 }
 fn array_le_method(args: &[PyObjectRef]) -> PyResult {
+    check_arity(args, 2, "array.__le__")?;
     array_richcompare(args[0], args[1], 3)
 }
 fn array_gt_method(args: &[PyObjectRef]) -> PyResult {
+    check_arity(args, 2, "array.__gt__")?;
     array_richcompare(args[0], args[1], 4)
 }
 fn array_ge_method(args: &[PyObjectRef]) -> PyResult {
+    check_arity(args, 2, "array.__ge__")?;
     array_richcompare(args[0], args[1], 5)
 }
 
 // Arithmetic.
 fn array_add_method(args: &[PyObjectRef]) -> PyResult {
+    check_arity(args, 2, "array.__add__")?;
     let a = args[0];
     let b = args[1];
     if !unsafe { arr::is_array(b) } {
@@ -762,6 +847,7 @@ fn array_add_method(args: &[PyObjectRef]) -> PyResult {
 }
 
 fn array_iadd_method(args: &[PyObjectRef]) -> PyResult {
+    check_arity(args, 2, "array.__iadd__")?;
     let a = args[0];
     let b = args[1];
     if !unsafe { arr::is_array(b) } || unsafe { arr::w_array_typecode(b) } != unsafe { arr::w_array_typecode(a) } {
@@ -773,35 +859,44 @@ fn array_iadd_method(args: &[PyObjectRef]) -> PyResult {
     Ok(a)
 }
 
-fn array_repeat_bytes(obj: PyObjectRef, count: i64) -> PyObjectRef {
+fn array_repeat_bytes(obj: PyObjectRef, count: i64) -> PyResult {
     let tc = unsafe { arr::w_array_typecode(obj) };
     let isz = unsafe { arr::w_array_itemsize(obj) } as u8;
     let src = unsafe { arr::w_array_bytes(obj) };
     let n = count.max(0) as usize;
-    let mut out = Vec::with_capacity(src.len() * n);
+    // ovfcheck(oldlen * repeat) -> MemoryError on overflow (_mul_helper).
+    let total = src.len().checked_mul(n).ok_or_else(|| PyError::memory_error(""))?;
+    let mut out = Vec::with_capacity(total);
     for _ in 0..n {
         out.extend_from_slice(src);
     }
-    arr::w_array_from_bytes(tc, isz, out)
+    Ok(arr::w_array_from_bytes(tc, isz, out))
 }
 
 fn array_mul_method(args: &[PyObjectRef]) -> PyResult {
+    check_arity(args, 2, "array.__mul__")?;
     let count = crate::builtins::getindex_w(args[1])?;
-    Ok(array_repeat_bytes(args[0], count))
+    array_repeat_bytes(args[0], count)
 }
 
 fn array_imul_method(args: &[PyObjectRef]) -> PyResult {
+    check_arity(args, 2, "array.__imul__")?;
     let obj = args[0];
     let count = crate::builtins::getindex_w(args[1])?.max(0) as usize;
     let src = unsafe { arr::w_array_bytes(obj) }.to_vec();
-    let vec = unsafe { arr::w_array_vec_mut(obj) };
     if count == 0 {
-        vec.clear();
-    } else {
-        vec.reserve(src.len() * (count - 1));
-        for _ in 1..count {
-            vec.extend_from_slice(&src);
-        }
+        unsafe { arr::w_array_vec_mut(obj) }.clear();
+        return Ok(obj);
+    }
+    // ovfcheck(oldlen * repeat) -> MemoryError on overflow.
+    let extra = src
+        .len()
+        .checked_mul(count - 1)
+        .ok_or_else(|| PyError::memory_error(""))?;
+    let vec = unsafe { arr::w_array_vec_mut(obj) };
+    vec.reserve(extra);
+    for _ in 1..count {
+        vec.extend_from_slice(&src);
     }
     Ok(obj)
 }
@@ -834,15 +929,37 @@ fn array_reduce_ex_method(args: &[PyObjectRef]) -> PyResult {
 fn array_reconstructor(args: &[PyObjectRef]) -> PyResult {
     if args.len() < 4 {
         return Err(PyError::type_error(
-            "_array_reconstructor() takes 4 arguments",
+            "_array_reconstructor() takes exactly 4 arguments",
         ));
     }
-    let new_args = [PY_NULL, args[1]];
-    let obj = array_descr_new(&new_args)?;
-    if unsafe { pyre_object::bytesobject::is_bytes_like(args[3]) } {
-        let bytes = unsafe { pyre_object::bytesobject::bytes_like_data(args[3]) }.to_vec();
-        array_frombytes(obj, &bytes)?;
+    let w_cls = args[0];
+    if !unsafe { pyre_object::is_type(w_cls) } {
+        return Err(PyError::type_error(
+            "_array_reconstructor() argument 1 must be type, not other",
+        ));
     }
+    // mformat_code: int in [MACHINE_FORMAT_CODE_MIN, MACHINE_FORMAT_CODE_MAX].
+    if !unsafe { pyre_object::is_int(args[2]) } {
+        return Err(PyError::type_error(
+            "an integer is required (got type other)",
+        ));
+    }
+    let mformat = unsafe { pyre_object::w_int_get_value(args[2]) };
+    if !(0..=21).contains(&mformat) {
+        return Err(PyError::value_error("third argument must be a valid machine format code."));
+    }
+    if !unsafe { pyre_object::bytesobject::is_bytes_like(args[3]) } {
+        return Err(PyError::type_error(
+            "fourth argument should be bytes, not other",
+        ));
+    }
+    // pyre stores native machine-format bytes, so the native fast-path
+    // (mformat == native) is a direct frombytes; array_descr_new validates
+    // the typecode (ValueError) and retags any array subclass.
+    let new_args = [w_cls, args[1]];
+    let obj = array_descr_new(&new_args)?;
+    let bytes = unsafe { pyre_object::bytesobject::bytes_like_data(args[3]) }.to_vec();
+    array_frombytes(obj, &bytes)?;
     Ok(obj)
 }
 
@@ -883,8 +1000,14 @@ pub fn init_array_type(ns: &mut DictStorage) {
     m(ns, "extend", array_extend_method, 2);
     m(ns, "insert", array_insert_method, 3);
     m(ns, "remove", array_remove_method, 2);
-    m(ns, "index", array_index_method, 2);
+    // `index` accepts optional start/stop.
+    dict_storage_store(
+        ns,
+        "index",
+        crate::make_builtin_function("index", array_index_method),
+    );
     m(ns, "count", array_count_method, 2);
+    m(ns, "clear", array_clear_method, 1);
     m(ns, "reverse", array_reverse_method, 1);
     m(ns, "tolist", array_tolist_method, 1);
     m(ns, "fromlist", array_fromlist_method, 2);
