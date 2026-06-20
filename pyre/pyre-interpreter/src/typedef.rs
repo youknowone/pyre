@@ -929,6 +929,23 @@ unsafe fn stamp_new_descr_self(ns_ptr: *mut DictStorage, type_obj: PyObjectRef) 
             }
         }
     }
+    // typeobject.py:1738-1742 — `if isinstance(descrvalue, GetSetProperty):
+    // descrvalue = descrvalue.copy_for_type(w_type)`.  Bind every reqcls-less
+    // GetSetProperty in the namespace to its owning type so that
+    // `T.__dict__['x'].__objclass__` (descr_get_objclass reads `w_objclass`)
+    // resolves instead of raising "generic self has no __objclass__".
+    let mut rebinds: Vec<(String, PyObjectRef)> = Vec::new();
+    for (key, &descr) in (*ns_ptr).entries() {
+        if !descr.is_null() && pyre_object::getsetproperty::is_getset_property(descr) {
+            let bound = copy_for_type(descr, type_obj);
+            if !std::ptr::eq(bound, descr) {
+                rebinds.push((key.to_string(), bound));
+            }
+        }
+    }
+    for (key, bound) in rebinds {
+        (*ns_ptr).insert(key, bound);
+    }
 }
 
 /// Create the root `object` type. MRO = [object].
