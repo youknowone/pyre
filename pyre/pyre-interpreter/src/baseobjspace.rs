@@ -3204,7 +3204,25 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyResul
                 "__self__" => {
                     return Ok(pyre_object::methodobject::w_method_get_self(obj));
                 }
-                _ => {}
+                // `__class__` resolves to the `method` type itself (handled by
+                // the generic type dispatch below), never forwarded.
+                "__class__" => {}
+                _ => {
+                    // `classobject.c method_getattro` — attributes defined on
+                    // the method type win (`__call__` / `__repr__` / `__eq__`
+                    // / `__hash__`); any other name is forwarded to `__func__`
+                    // (`__name__` / `__qualname__` / `__code__` / `__doc__` /
+                    // `__defaults__` / `__annotations__` / …).
+                    let on_method_type = crate::typedef::r#type(obj)
+                        .map(|t| lookup_in_type_where(t, name).is_some())
+                        .unwrap_or(false);
+                    if !on_method_type {
+                        let func = pyre_object::methodobject::w_method_get_func(obj);
+                        if !func.is_null() {
+                            return getattr_str(func, name);
+                        }
+                    }
+                }
             }
         }
         if is_instance(obj) {
