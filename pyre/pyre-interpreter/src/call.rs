@@ -2744,7 +2744,12 @@ fn build_class_inner(
         frame.setdictscope(class_ns_ptr)?;
     }
 
-    frame.execute_frame(None, None)?;
+    // Route the class body through the JIT portal (like the exec / import
+    // run-sites) so a hot class-level loop can warm and compile.  The body's
+    // NEWLOCALS bindings land in a distinct `w_locals` dict; that dict's
+    // values are rooted by the `debugdata.w_locals` walk in
+    // `walk_pyframe_roots`.
+    frame.run_with_jit()?;
 
     // The body wrote through the custom mapping; mirror its final contents
     // into class_ns for the downstream type construction (classcell capture,

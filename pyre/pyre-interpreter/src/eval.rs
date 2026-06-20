@@ -460,6 +460,38 @@ fn walk_pyframe_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
                     visitor(&mut *(w_locals_object_slot as *mut majit_ir::GcRef));
                     let w_f_trace_slot = &mut d.w_f_trace as *mut PyObjectRef;
                     visitor(&mut *(w_f_trace_slot as *mut majit_ir::GcRef));
+                    // A NEWLOCALS class body (`setdictscope` with a plain dict,
+                    // call.rs build_class_inner) binds names into
+                    // `debugdata.w_locals` — a raw DictStorage distinct from the
+                    // globals storage and not exposed as `w_locals_object`.  The
+                    // values it stores live nowhere else this walker reaches (the
+                    // globals walk below covers only the globals storage; the
+                    // array walk covers fastlocals), so a minor collection would
+                    // relocate a young binding and leave a dangling ref that
+                    // faults on a later read or guard-failure resume.  Forward
+                    // those values in place, mirroring the globals walk.  Skip
+                    // the module alias (`w_locals` IS the globals storage,
+                    // walked below) and the mapping/object scope (`w_locals`
+                    // null — rooted via `w_locals_object`).
+                    let w_locals = d.w_locals;
+                    let globals_storage = if (*frame).w_globals_obj.is_null() {
+                        std::ptr::null_mut()
+                    } else {
+                        pyre_object::dictmultiobject::w_dict_get_dict_storage_proxy(
+                            (*frame).w_globals_obj,
+                        ) as *mut crate::DictStorage
+                    };
+                    if !w_locals.is_null() && w_locals != globals_storage {
+                        let value_slots: Vec<*mut PyObjectRef> = (&mut *w_locals)
+                            .values_mut()
+                            .iter_mut()
+                            .map(|value| value as *mut PyObjectRef)
+                            .collect();
+                        for value in value_slots {
+                            visitor(&mut *(value as *mut majit_ir::GcRef));
+                            walk_raw_function_roots(*value, visitor);
+                        }
+                    }
                 }
                 // pyframe.py:49 `self.w_globals` is the dict OBJECT.  Visit
                 // the canonical `w_globals` slot first so the visitor

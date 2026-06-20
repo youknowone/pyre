@@ -8146,6 +8146,17 @@ impl MIFrame {
         // whose MIFrame impls record the live namespace lookup/store IR and
         // advance the vsd shadow via push_value / pop_value — so the early
         // return bypasses `apply_walker_stack_effect`.
+        //
+        // These handlers record the LIVE namespace lookup / store, not a
+        // globals-only one.  Verified empirically once exec / import frames
+        // became portal-traced: an `exec(src, g, l)` (l is not g) hot loop
+        // compiles and still reads a locals-only name from `l` and a
+        // globals-only name from `g` (locals-first, then globals) and binds
+        // results back into `l` — so there is no LOAD_NAME==LOAD_GLOBAL /
+        // STORE_NAME==STORE_GLOBAL conflation to guard against on this path.
+        // A NEWLOCALS class body (its own distinct `w_locals` dict) is also
+        // portal-traced; its bindings are rooted by the `debugdata.w_locals`
+        // value walk in `walk_pyframe_roots`.
         if let Instruction::LoadName { namei } = instruction {
             use pyre_interpreter::OpcodeStepExecutor;
             let idx = namei.get(op_arg) as usize;
