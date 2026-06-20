@@ -1,7 +1,7 @@
 //! Harvest JIT-hint markers from the ullbc surrogate consts the
 //! `majit_macros` proc-macros emit (`_elidable_function_<NAME>`,
 //! `_jit_look_inside_<NAME>`, `_jit_loop_invariant_<NAME>`,
-//! `_jit_unroll_safe_<NAME>`).
+//! `_jit_unroll_safe_<NAME>`, `oopspec_<NAME>`).
 //!
 //! The source attribute (`#[elidable]` / `#[dont_look_inside]` / …) is
 //! consumed by the proc-macro at expansion time and does NOT survive in
@@ -71,6 +71,23 @@ pub fn harvest_hints_from_llbcs(llbcs: &[Llbc]) -> HashMap<String, Vec<String>> 
                     marker_path_to_fn_path(&path, "_jit_look_inside_"),
                     hint,
                 );
+                continue;
+            }
+            // `#[oopspec("spec")]` emits `oopspec_<NAME>: &'static str =
+            // "spec"` (majit_macros::oopspec, rlib/jit.py:255 `func.oopspec
+            // = spec`).  Unlike the fixed-hint markers, the payload is the
+            // const's *value*, so decode the string literal and emit a
+            // companion `oopspec:<spec>` hint that `lib.rs` consumes via
+            // `CallControl::mark_oopspec` — which `guess_call_kind` then
+            // classifies as `CallKind::Builtin` (call.py:135-136).
+            if leaf.starts_with("oopspec_") {
+                if let Some(spec) = global_marker_str(llbc, gd) {
+                    push_hint(
+                        &mut out,
+                        marker_path_to_fn_path(&path, "oopspec_"),
+                        &format!("oopspec:{spec}"),
+                    );
+                }
                 continue;
             }
             for (prefix, hints) in CONST_PREFIX_HINTS {
@@ -152,6 +169,55 @@ fn global_marker_bool(llbc: &Llbc, gd: &GlobalDecl) -> Option<bool> {
     None
 }
 
+/// Read the `&'static str` value of an oopspec marker const. The init
+/// body assigns `Local(0) = Const(ConstantExpr)` whose `kind` nests the
+/// string literal (`{"kind": {"Literal": {"Str": spec}}, "ty": …}`),
+/// mirroring [`global_marker_bool`]'s bool path.
+fn global_marker_str(llbc: &Llbc, gd: &GlobalDecl) -> Option<String> {
+    let init_id = gd.rest.get("init")?.as_u64()?;
+    let body = llbc.fn_by_id(init_id)?.unstructured()?;
+    for block in &body.body {
+        for stmt in &block.statements {
+            let StmtKind::Assign(place, Rvalue::Use(Operand::Const(value))) =
+                stmt.stmt_kind().ok()?
+            else {
+                continue;
+            };
+            if !matches!(place.kind, PlaceKind::Local(0)) {
+                continue;
+            }
+            if let Some(s) = decode_str_const(&value) {
+                return Some(s);
+            }
+        }
+    }
+    None
+}
+
+fn decode_str_const(value: &serde_json::Value) -> Option<String> {
+    if let Some(s) = value.as_str() {
+        return Some(s.to_string());
+    }
+    let obj = value.as_object()?;
+    for key in ["Str", "str"] {
+        if let Some(v) = obj.get(key) {
+            if let Some(s) = v.as_str() {
+                return Some(s.to_string());
+            }
+        }
+    }
+    // `ConstantExpr` nests the literal under `kind` →
+    // `{"Literal": {"Str": spec}}`; descend through both wrappers.
+    for key in ["kind", "Literal"] {
+        if let Some(nested) = obj.get(key) {
+            if let Some(s) = decode_str_const(nested) {
+                return Some(s);
+            }
+        }
+    }
+    None
+}
+
 fn decode_bool_const(value: &serde_json::Value) -> Option<bool> {
     if let Some(b) = value.as_bool() {
         return Some(b);
@@ -185,4 +251,44 @@ fn decode_bool_const(value: &serde_json::Value) -> Option<bool> {
         return decode_bool_const(kind);
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::decode_str_const;
+
+    #[test]
+    fn decode_str_const_reads_constant_expr_literal() {
+        // The exact shape Charon emits for `const X: &str = "spec"`:
+        // `Local(0) = Const(ConstantExpr{kind:{Literal:{Str:spec}}})`.
+        let value = serde_json::json!({
+            "kind": {"Literal": {"Str": "list.int_capacity(l)"}},
+            "ty": {"Deduplicated": 7911}
+        });
+        assert_eq!(
+            decode_str_const(&value).as_deref(),
+            Some("list.int_capacity(l)")
+        );
+    }
+
+    #[test]
+    fn decode_str_const_reads_bare_and_wrapped_strings() {
+        assert_eq!(
+            decode_str_const(&serde_json::json!("plain")).as_deref(),
+            Some("plain")
+        );
+        assert_eq!(
+            decode_str_const(&serde_json::json!({"Str": "wrapped"})).as_deref(),
+            Some("wrapped")
+        );
+    }
+
+    #[test]
+    fn decode_str_const_rejects_non_string() {
+        assert_eq!(decode_str_const(&serde_json::json!(42)), None);
+        assert_eq!(
+            decode_str_const(&serde_json::json!({"kind": {"Literal": {"Bool": true}}})),
+            None
+        );
+    }
 }
