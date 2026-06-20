@@ -842,9 +842,7 @@ unsafe fn complex_pow(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         (1.0, 0.0)
     } else if ar == 0.0 && ai == 0.0 {
         if bi != 0.0 || br < 0.0 {
-            return Err(PyError::zero_division(
-                "0.0 to a negative or complex power",
-            ));
+            return Err(PyError::zero_division("0.0 to a negative or complex power"));
         }
         (0.0, 0.0)
     } else {

@@ -11,6 +11,8 @@ pub mod _abc;
 #[allow(non_snake_case)]
 pub mod _ast;
 #[allow(non_snake_case)]
+pub mod _blake2;
+#[allow(non_snake_case)]
 pub mod _codecs;
 #[allow(non_snake_case)]
 pub mod _collections;
@@ -20,6 +22,8 @@ pub mod _contextvars;
 pub mod _ctypes;
 #[allow(non_snake_case)]
 pub mod _functools;
+#[allow(non_snake_case)]
+pub mod _hashlib;
 #[allow(non_snake_case)]
 pub mod _imp;
 pub mod _io;
@@ -47,19 +51,14 @@ pub mod _sre;
 #[allow(non_snake_case)]
 pub mod _struct;
 #[allow(non_snake_case)]
-pub mod _typing;
-#[allow(non_snake_case)]
-pub mod _hashlib;
-#[allow(non_snake_case)]
-pub mod _blake2;
-#[allow(non_snake_case)]
 pub mod _thread;
+#[allow(non_snake_case)]
+pub mod _typing;
 pub mod _weakref;
 pub mod atexit;
 pub mod binascii;
 pub mod cmath;
 pub mod errno;
-pub mod zlib;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod faulthandler;
 pub mod fcntl;
@@ -74,9 +73,9 @@ pub mod mmap;
 pub mod operator;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod posix;
-pub mod pyexpat;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod pwd;
+pub mod pyexpat;
 pub mod resource;
 pub mod select;
 pub mod sys;
@@ -85,3 +84,4 @@ pub mod termios;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod time;
 pub mod unicodedata;
+pub mod zlib;

@@ -1654,7 +1654,11 @@ pub(crate) fn type_new_wrap_special_methods(ns: &mut crate::DictStorage) {
             if unsafe { crate::function::is_function(f) }
                 && !unsafe { pyre_object::propertyobject::is_classmethod(f) }
             {
-                crate::dict_storage_store(ns, name, pyre_object::propertyobject::w_classmethod_new(f));
+                crate::dict_storage_store(
+                    ns,
+                    name,
+                    pyre_object::propertyobject::w_classmethod_new(f),
+                );
             }
         }
     }
@@ -5632,7 +5636,10 @@ fn builtin_reversed(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
                     pyre_object::bytesobject::bytes_like_getitem(obj, i) as i64,
                 ));
             }
-            return Ok(pyre_object::w_seq_iter_new(pyre_object::w_list_new(items), n));
+            return Ok(pyre_object::w_seq_iter_new(
+                pyre_object::w_list_new(items),
+                n,
+            ));
         }
     }
     // `__reversed__` resolved through the type MRO (`functional.py:362-366`) —
@@ -6509,11 +6516,7 @@ fn textio_enc_err(self_obj: PyObjectRef) -> (String, String) {
 /// Decode raw bytes through the wrapper's codec (honoring `encoding` /
 /// `errors`), or pass a str through, then apply universal-newline
 /// translation (`\r\n`/`\r` → `\n`).
-fn textio_decode(
-    obj: PyObjectRef,
-    encoding: &str,
-    errors: &str,
-) -> Result<String, crate::PyError> {
+fn textio_decode(obj: PyObjectRef, encoding: &str, errors: &str) -> Result<String, crate::PyError> {
     let s = unsafe {
         if pyre_object::bytesobject::is_bytes_like(obj) {
             let decoded = crate::typedef::bytes_method_decode(&[
@@ -7112,9 +7115,8 @@ fn complex_coerce(obj: PyObjectRef) -> Result<(f64, f64), crate::PyError> {
             if crate::baseobjspace::lookup_in_type(t, "__complex__").is_some() {
                 let res = crate::baseobjspace::call_method(obj, "__complex__", &[]);
                 if res.is_null() {
-                    return Err(crate::call::take_call_error().unwrap_or_else(|| {
-                        crate::PyError::type_error("__complex__ call failed")
-                    }));
+                    return Err(crate::call::take_call_error()
+                        .unwrap_or_else(|| crate::PyError::type_error("__complex__ call failed")));
                 }
                 if is_complex(res) {
                     return Ok((w_complex_get_real(res), w_complex_get_imag(res)));

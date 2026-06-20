@@ -95,7 +95,11 @@ fn hex_encode(data: &[u8], sep: Option<(u8, usize)>) -> Vec<u8> {
 }
 
 fn hex_decode(data: &[u8]) -> Result<Vec<u8>, crate::PyError> {
-    let stripped: Vec<u8> = data.iter().copied().filter(|b| !b.is_ascii_whitespace()).collect();
+    let stripped: Vec<u8> = data
+        .iter()
+        .copied()
+        .filter(|b| !b.is_ascii_whitespace())
+        .collect();
     if stripped.len() % 2 != 0 {
         return Err(crate::PyError::value_error("Odd-length string"));
     }

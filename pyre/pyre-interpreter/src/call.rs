@@ -1618,8 +1618,10 @@ pub fn call_with_kwargs(
         // The `function` type is non-acceptable-as-base too, but its
         // `tp_new` (`FunctionType(code, globals, ..., kwdefaults=...)`)
         // does take keyword arguments, so route those through `__new__`.
-        let is_function_type =
-            std::ptr::eq(callable, crate::typedef::gettypeobject(&crate::FUNCTION_TYPE));
+        let is_function_type = std::ptr::eq(
+            callable,
+            crate::typedef::gettypeobject(&crate::FUNCTION_TYPE),
+        );
         if !kwargs.is_empty()
             && !is_function_type
             && !unsafe { pyre_object::w_type_get_acceptable_as_base_class(callable) }

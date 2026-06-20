@@ -14,7 +14,9 @@ fn as_bytes(obj: PyObjectRef) -> Result<Vec<u8>, crate::PyError> {
         } else if is_str(obj) {
             Ok(w_str_get_value(obj).as_bytes().to_vec())
         } else {
-            Err(crate::PyError::type_error("a bytes-like object is required"))
+            Err(crate::PyError::type_error(
+                "a bytes-like object is required",
+            ))
         }
     }
 }

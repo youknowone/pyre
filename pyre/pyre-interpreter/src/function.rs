@@ -1532,7 +1532,14 @@ pub fn descr_function_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
     crate::builtins::kwarg_reject_unknown(
         kwargs,
-        &["code", "globals", "name", "argdefs", "closure", "kwdefaults"],
+        &[
+            "code",
+            "globals",
+            "name",
+            "argdefs",
+            "closure",
+            "kwdefaults",
+        ],
         "function",
     )?;
     // `positional[0]` is `cls`; the constructor parameters start at index 1.

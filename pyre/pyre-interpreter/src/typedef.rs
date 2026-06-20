@@ -5378,7 +5378,12 @@ fn init_type_type(ns: &mut DictStorage) {
     dict_storage_store(
         ns,
         "__bases__",
-        make_getset_property_named(bases_getter, bases_setter, pyre_object::PY_NULL, "__bases__"),
+        make_getset_property_named(
+            bases_getter,
+            bases_setter,
+            pyre_object::PY_NULL,
+            "__bases__",
+        ),
     );
 }
 
@@ -6025,7 +6030,11 @@ fn init_builtin_code_type(ns: &mut DictStorage) {
     }
     let argcount_getter = make_builtin_function_with_arity(
         "co_argcount",
-        |args| Ok(pyre_object::w_int_new(code_sig(args).map_or(0, |s| s.num_argnames()) as i64)),
+        |args| {
+            Ok(pyre_object::w_int_new(
+                code_sig(args).map_or(0, |s| s.num_argnames()) as i64,
+            ))
+        },
         2,
     );
     dict_storage_store(ns, "co_argcount", make_getset_descriptor(argcount_getter));
@@ -6806,7 +6815,10 @@ fn init_property_type(ns: &mut DictStorage) {
     dict_storage_store(
         ns,
         "__delete__",
-        make_builtin_function("__delete__", crate::baseobjspace::property_descr_delete_impl),
+        make_builtin_function(
+            "__delete__",
+            crate::baseobjspace::property_descr_delete_impl,
+        ),
     );
 }
 
@@ -7644,9 +7656,7 @@ fn complex_part_repr(val: f64) -> String {
         };
     }
     let s = crate::display::format_float_repr(val);
-    s.strip_suffix(".0")
-        .map(str::to_string)
-        .unwrap_or(s)
+    s.strip_suffix(".0").map(str::to_string).unwrap_or(s)
 }
 
 /// `complexobject.c complex_repr` — `Xj` for a pure-`+0` real part, else
@@ -7804,9 +7814,9 @@ fn init_complex_type(ns: &mut DictStorage) {
                         pyre_object::w_complex_get_imag(args[0]),
                     )
                 };
-                Ok(pyre_object::w_tuple_new(vec![
-                    pyre_object::w_complex_new(re, im),
-                ]))
+                Ok(pyre_object::w_tuple_new(vec![pyre_object::w_complex_new(
+                    re, im,
+                )]))
             },
             1,
         ),

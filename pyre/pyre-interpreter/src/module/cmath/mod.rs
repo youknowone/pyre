@@ -33,7 +33,9 @@ fn isclose_impl(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let rel_tol = tol("rel_tol", 1e-9)?;
     let abs_tol = tol("abs_tol", 0.0)?;
     if rel_tol < 0.0 || abs_tol < 0.0 {
-        return Err(crate::PyError::value_error("tolerances must be non-negative"));
+        return Err(crate::PyError::value_error(
+            "tolerances must be non-negative",
+        ));
     }
     // Exact equality (covers the inf == inf case).
     if ar == br && ai == bi {

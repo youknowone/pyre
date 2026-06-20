@@ -14,14 +14,26 @@ use md5::Md5;
 use sha1::Sha1;
 use sha2::{Digest, Sha224, Sha256, Sha384, Sha512};
 use sha3::{
-    digest::{ExtendableOutput, Update, XofReader},
     Sha3_224, Sha3_256, Sha3_384, Sha3_512, Shake128, Shake256,
+    digest::{ExtendableOutput, Update, XofReader},
 };
 
 /// The 14 always-supported digests hashlib advertises.
 const ALGORITHMS: &[&str] = &[
-    "md5", "sha1", "sha224", "sha256", "sha384", "sha512", "sha3_224", "sha3_256", "sha3_384",
-    "sha3_512", "shake_128", "shake_256", "blake2b", "blake2s",
+    "md5",
+    "sha1",
+    "sha224",
+    "sha256",
+    "sha384",
+    "sha512",
+    "sha3_224",
+    "sha3_256",
+    "sha3_384",
+    "sha3_512",
+    "shake_128",
+    "shake_256",
+    "blake2b",
+    "blake2s",
 ];
 
 /// One-shot digest of `data` under `name`.  `length` is the requested

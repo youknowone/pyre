@@ -1366,9 +1366,7 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
             // PEP 695 type-parameter construction (`class C[T]:`, `def f[T]()`).
             IntrinsicFunction1::TypeVar => self.typing_intrinsic_1("_intrinsic_typevar"),
             IntrinsicFunction1::ParamSpec => self.typing_intrinsic_1("_intrinsic_paramspec"),
-            IntrinsicFunction1::TypeVarTuple => {
-                self.typing_intrinsic_1("_intrinsic_typevartuple")
-            }
+            IntrinsicFunction1::TypeVarTuple => self.typing_intrinsic_1("_intrinsic_typevartuple"),
             IntrinsicFunction1::SubscriptGeneric => {
                 self.typing_intrinsic_1("_intrinsic_subscript_generic")
             }
