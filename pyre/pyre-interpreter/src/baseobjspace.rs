@@ -884,7 +884,9 @@ pub(crate) fn is_true_slot(obj: PyObjectRef) -> Result<bool, PyError> {
 /// PyPy: sliceobject.py descr_indices, mirroring CPython
 /// `PySlice_Unpack` + `PySlice_AdjustIndices`. Handles negative `step`
 /// (which CPython adjusts the start/stop bounds for separately from
-/// positive `step`).
+/// positive `step`). Each bound is evaluated through `__index__`
+/// (`_eval_slice_index`), so a `float` or other non-integer bound raises
+/// `TypeError` rather than being read as a raw integer field.
 pub(crate) unsafe fn normalize_slice(
     index: PyObjectRef,
     length: i64,
@@ -895,7 +897,7 @@ pub(crate) unsafe fn normalize_slice(
     let step = if is_none(step_obj) {
         1
     } else {
-        w_int_get_value(step_obj)
+        crate::sliceobject::eval_slice_index(step_obj)?
     };
     if step == 0 {
         return Err(PyError::new(
@@ -911,14 +913,14 @@ pub(crate) unsafe fn normalize_slice(
     let start = if is_none(start_obj) {
         if step > 0 { 0 } else { length - 1 }
     } else {
-        let v = w_int_get_value(start_obj);
+        let v = crate::sliceobject::eval_slice_index(start_obj)?;
         let v = if v < 0 { v + length } else { v };
         v.max(lower).min(upper)
     };
     let stop = if is_none(stop_obj) {
         if step > 0 { length } else { -1 }
     } else {
-        let v = w_int_get_value(stop_obj);
+        let v = crate::sliceobject::eval_slice_index(stop_obj)?;
         let v = if v < 0 { v + length } else { v };
         v.max(lower).min(upper)
     };
