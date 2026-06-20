@@ -4007,7 +4007,15 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
                 return Ok(pyre_object::w_dict_proxy_new(canonical));
             }
             if name == "__bases__" {
-                return Ok(w_type_get_bases(obj));
+                // typeobject.py:1027 descr_get__bases__ — `object` (the root
+                // type) carries no bases tuple; surface the empty tuple rather
+                // than the null sentinel so `reversed(cls.__bases__)` and the
+                // C3 helpers in `functools` don't dereference null.
+                let bases = w_type_get_bases(obj);
+                if bases.is_null() {
+                    return Ok(w_tuple_new(vec![]));
+                }
+                return Ok(bases);
             }
             // PEP 649 lazy annotations: when `cls.__annotations__` is
             // requested and only `__annotate_func__` (or `__annotate__`)
