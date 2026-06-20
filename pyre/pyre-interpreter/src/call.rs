@@ -3139,6 +3139,11 @@ pub(crate) fn call_init_subclass_on_bases(
         .collect();
     let frame = {
         let stored = BUILD_CLASS_EXEC_CTX.with(|c| c.get());
+        let stored = if stored.is_null() {
+            LAST_EXEC_CTX.with(|c| c.get())
+        } else {
+            stored
+        };
         if stored.is_null() {
             std::ptr::null_mut()
         } else {
