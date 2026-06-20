@@ -4435,6 +4435,43 @@ pub extern "C" fn bh_load_deref_value_fn(cell: i64, w_code_ptr: i64, deref_idx: 
     value as i64
 }
 
+/// STORE_DEREF residual (`store_deref_value` HLOp → `residual_call_r_r`).
+/// `cell` is the slot read from `locals_cells_stack_w`; `value` is the
+/// popped stack operand.  Mirrors `store_deref`: when the slot holds a
+/// cell, mutate the cell's contents in place (`w_cell_set`, incminimark
+/// write barrier inside) and return the unchanged cell so the caller
+/// re-stores the same pointer into the slot; otherwise return the raw
+/// `value` so the caller writes it into the slot directly.  Runs no user
+/// code and never raises (`CallFlavor::Plain`).
+pub extern "C" fn bh_store_deref_value_fn(cell: i64, value: i64) -> i64 {
+    let slot = cell as pyre_object::PyObjectRef;
+    if !slot.is_null() && unsafe { pyre_object::is_cell(slot) } {
+        unsafe { pyre_object::w_cell_set(slot, value as pyre_object::PyObjectRef) };
+        cell
+    } else {
+        value
+    }
+}
+
+/// MAKE_CELL residual (`make_cell_value` HLOp → `residual_call_r_r`).
+/// `current` is the slot read from `locals_cells_stack_w`.  Mirrors
+/// `make_cell`: wrap the value in a fresh cell when the slot does not
+/// already hold one (`initialize_frame_scopes` installs cells for pure
+/// cellvars, so only an argument slot promoted to a cellvar still holds a
+/// raw value here), and return the cell the caller stores back into the
+/// slot.  A slot already holding a cell is returned unchanged so a
+/// never-reassigned cellvar does not become a cell wrapping a cell.
+/// Allocates (may trigger a minor GC) but runs no user code and never
+/// raises (`CallFlavor::Plain`).
+pub extern "C" fn bh_make_cell_fn(current: i64) -> i64 {
+    let cur = current as pyre_object::PyObjectRef;
+    if cur.is_null() || !unsafe { pyre_object::is_cell(cur) } {
+        pyre_object::w_cell_new(cur) as i64
+    } else {
+        current
+    }
+}
+
 /// UNARY_NEGATIVE residual (`unary_negative` HLOp → `residual_call_r_r`).
 /// Computes `-value` through `opcode_ops::unary_negative_value` (`neg`); a
 /// user `__neg__` may run Python (`MayForce`).  On error the exception

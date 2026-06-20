@@ -3344,6 +3344,22 @@ pub struct LoweringContext {
     /// (`Plain` — reads heap, raises on an unbound free variable, runs no
     /// user code).
     pub load_deref_value_fn_idx: u16,
+    /// `store_deref_value_fn` descrs-pool index.  STORE_DEREF records the
+    /// `store_deref_value(cell, value)` HLOp lowered to `residual_call_r_r(
+    /// ConstInt(fn_idx), ListR([cell, value]), Descr) → reg` via
+    /// [`lower_store_deref_value_hlop_to_insn`] (the two-Ref shape); the result
+    /// is the slot value the codewriter re-stores via `setarrayitem_vable_r`.
+    /// `bh_store_deref_value_fn` mutates the cell's contents (`Plain` — writes
+    /// heap, runs no user code, never raises).
+    pub store_deref_value_fn_idx: u16,
+    /// `make_cell_fn` descrs-pool index.  MAKE_CELL records the
+    /// `make_cell_value(current)` HLOp lowered to `residual_call_r_r(ConstInt(
+    /// fn_idx), ListR([current]), Descr) → reg` via
+    /// [`lower_make_cell_hlop_to_insn`] (the single-Ref shape); the result is
+    /// the cell the codewriter stores via `setarrayitem_vable_r`.
+    /// `bh_make_cell_fn` allocates a fresh cell (`Plain` — runs no user code,
+    /// never raises).
+    pub make_cell_fn_idx: u16,
     /// `unary_negative_fn` descrs-pool index.  UNARY_NEGATIVE records the
     /// flowspace `neg(value)` op (operation.py:466) lowered to
     /// `residual_call_r_r(ConstInt(fn_idx), ListR([value]), Descr) → reg` via
@@ -4787,6 +4803,12 @@ where
     if let Some(insn) = lower_load_deref_value_hlop_to_insn(op, ctx, get_register, lower_constant) {
         return Some(insn);
     }
+    if let Some(insn) = lower_store_deref_value_hlop_to_insn(op, ctx, get_register, lower_constant) {
+        return Some(insn);
+    }
+    if let Some(insn) = lower_make_cell_hlop_to_insn(op, ctx, get_register, lower_constant) {
+        return Some(insn);
+    }
     if let Some(insn) = lower_unary_negative_hlop_to_insn(op, ctx, get_register, lower_constant) {
         return Some(insn);
     }
@@ -5117,6 +5139,81 @@ where
             Operand::ListOfKind(ListOfKind::new(Kind::Ref, vec![cell, code])),
             descr_operand,
         ],
+        dst_reg,
+    ))
+}
+
+/// Lower the STORE_DEREF pyre HLOp `store_deref_value(cell, value)` →
+/// `result: Ref` to `residual_call_r_r(ConstInt(store_deref_value_fn_idx),
+/// ListR([cell, value]), Descr) → reg`, the two-Ref shape.  `cell` is the
+/// slot read from `locals_cells_stack_w`; `value` is the popped stack
+/// operand.  The result is the slot value the codewriter re-stores via
+/// `setarrayitem_vable_r`: the unchanged cell after the in-place `w_cell_set`,
+/// or the raw `value` for a non-cell slot.  Writes mutable heap but runs no
+/// user code and never raises → `Plain`.
+///
+/// Returns `None` for a non-`store_deref_value` opname or unexpected arity so
+/// the caller can fall through to other lowering arms.
+pub fn lower_store_deref_value_hlop_to_insn<F, LC>(
+    op: &super::flow::SpaceOperation,
+    ctx: &LoweringContext,
+    get_register: &mut F,
+    lower_constant: &mut LC,
+) -> Option<Insn>
+where
+    F: FnMut(super::flow::Variable) -> Register,
+    LC: FnMut(&Constant) -> Operand,
+{
+    if op.opname != "store_deref_value" || op.args.len() != 2 {
+        return None;
+    }
+    let cell = operand_for_value_arg(&op.args[0], get_register, lower_constant)?;
+    let value = operand_for_value_arg(&op.args[1], get_register, lower_constant)?;
+    let dst_reg = match &op.result {
+        Some(super::flow::FlowValue::Variable(var)) => get_register(*var),
+        _ => return None,
+    };
+    Some(build_residual_call_r_r_insn_from_operands(
+        ctx.store_deref_value_fn_idx,
+        vec![cell, value],
+        CallFlavor::Plain,
+        majit_ir::PyreHelperKind::None,
+        dst_reg,
+    ))
+}
+
+/// Lower the MAKE_CELL pyre HLOp `make_cell_value(current)` → `result: Ref`
+/// to `residual_call_r_r(ConstInt(make_cell_fn_idx), ListR([current]),
+/// Descr) → reg`, the single-Ref shape.  `current` is the slot read from
+/// `locals_cells_stack_w`; the result is the cell the codewriter stores via
+/// `setarrayitem_vable_r`.  Allocates a fresh cell but runs no user code and
+/// never raises → `Plain`.
+///
+/// Returns `None` for a non-`make_cell_value` opname or unexpected arity so
+/// the caller can fall through to other lowering arms.
+pub fn lower_make_cell_hlop_to_insn<F, LC>(
+    op: &super::flow::SpaceOperation,
+    ctx: &LoweringContext,
+    get_register: &mut F,
+    lower_constant: &mut LC,
+) -> Option<Insn>
+where
+    F: FnMut(super::flow::Variable) -> Register,
+    LC: FnMut(&Constant) -> Operand,
+{
+    if op.opname != "make_cell_value" || op.args.len() != 1 {
+        return None;
+    }
+    let current = operand_for_value_arg(&op.args[0], get_register, lower_constant)?;
+    let dst_reg = match &op.result {
+        Some(super::flow::FlowValue::Variable(var)) => get_register(*var),
+        _ => return None,
+    };
+    Some(build_residual_call_r_r_insn_from_operands(
+        ctx.make_cell_fn_idx,
+        vec![current],
+        CallFlavor::Plain,
+        majit_ir::PyreHelperKind::None,
         dst_reg,
     ))
 }
@@ -6938,6 +7035,8 @@ mod tests {
             load_super_attr_fn_idx: 0,
             super_attr_unwrap_fn_idx: 0,
             load_deref_value_fn_idx: 0,
+            store_deref_value_fn_idx: 0,
+            make_cell_fn_idx: 0,
             unary_negative_fn_idx: 0,
             unary_invert_fn_idx: 0,
             unary_not_fn_idx: 0,
@@ -7093,6 +7192,8 @@ mod tests {
             load_super_attr_fn_idx: 0,
             super_attr_unwrap_fn_idx: 0,
             load_deref_value_fn_idx: 0,
+            store_deref_value_fn_idx: 0,
+            make_cell_fn_idx: 0,
             unary_negative_fn_idx: 0,
             unary_invert_fn_idx: 0,
             unary_not_fn_idx: 0,
@@ -7235,6 +7336,8 @@ mod tests {
             load_super_attr_fn_idx: 0,
             super_attr_unwrap_fn_idx: 0,
             load_deref_value_fn_idx: 0,
+            store_deref_value_fn_idx: 0,
+            make_cell_fn_idx: 0,
             unary_negative_fn_idx: 0,
             unary_invert_fn_idx: 0,
             unary_not_fn_idx: 0,
@@ -7340,6 +7443,8 @@ mod tests {
             load_super_attr_fn_idx: 0,
             super_attr_unwrap_fn_idx: 0,
             load_deref_value_fn_idx: 0,
+            store_deref_value_fn_idx: 0,
+            make_cell_fn_idx: 0,
             unary_negative_fn_idx: 0,
             unary_invert_fn_idx: 0,
             unary_not_fn_idx: 0,
@@ -7489,6 +7594,8 @@ mod tests {
             load_super_attr_fn_idx: 0,
             super_attr_unwrap_fn_idx: 0,
             load_deref_value_fn_idx: 0,
+            store_deref_value_fn_idx: 0,
+            make_cell_fn_idx: 0,
             unary_negative_fn_idx: 0,
             unary_invert_fn_idx: 0,
             unary_not_fn_idx: 0,
@@ -7683,6 +7790,8 @@ mod tests {
             load_super_attr_fn_idx: 0,
             super_attr_unwrap_fn_idx: 0,
             load_deref_value_fn_idx: 0,
+            store_deref_value_fn_idx: 0,
+            make_cell_fn_idx: 0,
             unary_negative_fn_idx: 0,
             unary_invert_fn_idx: 0,
             unary_not_fn_idx: 0,
@@ -7926,6 +8035,8 @@ mod tests {
             load_super_attr_fn_idx: 0,
             super_attr_unwrap_fn_idx: 0,
             load_deref_value_fn_idx: 0,
+            store_deref_value_fn_idx: 0,
+            make_cell_fn_idx: 0,
             unary_negative_fn_idx: 0,
             unary_invert_fn_idx: 0,
             unary_not_fn_idx: 0,
@@ -8035,6 +8146,8 @@ mod tests {
             load_super_attr_fn_idx: 0,
             super_attr_unwrap_fn_idx: 0,
             load_deref_value_fn_idx: 0,
+            store_deref_value_fn_idx: 0,
+            make_cell_fn_idx: 0,
             unary_negative_fn_idx: 0,
             unary_invert_fn_idx: 0,
             unary_not_fn_idx: 0,
@@ -8088,6 +8201,8 @@ mod tests {
             load_super_attr_fn_idx: 0,
             super_attr_unwrap_fn_idx: 0,
             load_deref_value_fn_idx: 0,
+            store_deref_value_fn_idx: 0,
+            make_cell_fn_idx: 0,
             unary_negative_fn_idx: 0,
             unary_invert_fn_idx: 0,
             unary_not_fn_idx: 0,
@@ -8218,6 +8333,8 @@ mod tests {
             load_super_attr_fn_idx: 0,
             super_attr_unwrap_fn_idx: 0,
             load_deref_value_fn_idx: 0,
+            store_deref_value_fn_idx: 0,
+            make_cell_fn_idx: 0,
             unary_negative_fn_idx: 0,
             unary_invert_fn_idx: 0,
             unary_not_fn_idx: 0,
@@ -8306,6 +8423,8 @@ mod tests {
             load_super_attr_fn_idx: 0,
             super_attr_unwrap_fn_idx: 0,
             load_deref_value_fn_idx: 0,
+            store_deref_value_fn_idx: 0,
+            make_cell_fn_idx: 0,
             unary_negative_fn_idx: 0,
             unary_invert_fn_idx: 0,
             unary_not_fn_idx: 0,
@@ -8365,6 +8484,8 @@ mod tests {
             load_super_attr_fn_idx: 0,
             super_attr_unwrap_fn_idx: 0,
             load_deref_value_fn_idx: 0,
+            store_deref_value_fn_idx: 0,
+            make_cell_fn_idx: 0,
             unary_negative_fn_idx: 0,
             unary_invert_fn_idx: 0,
             unary_not_fn_idx: 0,
@@ -8416,6 +8537,8 @@ mod tests {
             load_super_attr_fn_idx: 0,
             super_attr_unwrap_fn_idx: 0,
             load_deref_value_fn_idx: 0,
+            store_deref_value_fn_idx: 0,
+            make_cell_fn_idx: 0,
             unary_negative_fn_idx: 0,
             unary_invert_fn_idx: 0,
             unary_not_fn_idx: 0,
@@ -8474,6 +8597,8 @@ mod tests {
             load_super_attr_fn_idx: 0,
             super_attr_unwrap_fn_idx: 0,
             load_deref_value_fn_idx: 0,
+            store_deref_value_fn_idx: 0,
+            make_cell_fn_idx: 0,
             unary_negative_fn_idx: 0,
             unary_invert_fn_idx: 0,
             unary_not_fn_idx: 0,
@@ -8559,6 +8684,8 @@ mod tests {
             load_super_attr_fn_idx: 0,
             super_attr_unwrap_fn_idx: 0,
             load_deref_value_fn_idx: 0,
+            store_deref_value_fn_idx: 0,
+            make_cell_fn_idx: 0,
             unary_negative_fn_idx: 0,
             unary_invert_fn_idx: 0,
             unary_not_fn_idx: 0,
@@ -8607,6 +8734,8 @@ mod tests {
             load_super_attr_fn_idx: 0,
             super_attr_unwrap_fn_idx: 0,
             load_deref_value_fn_idx: 0,
+            store_deref_value_fn_idx: 0,
+            make_cell_fn_idx: 0,
             unary_negative_fn_idx: 0,
             unary_invert_fn_idx: 0,
             unary_not_fn_idx: 0,
@@ -8669,6 +8798,8 @@ mod tests {
             load_super_attr_fn_idx: 0,
             super_attr_unwrap_fn_idx: 0,
             load_deref_value_fn_idx: 0,
+            store_deref_value_fn_idx: 0,
+            make_cell_fn_idx: 0,
             unary_negative_fn_idx: 0,
             unary_invert_fn_idx: 0,
             unary_not_fn_idx: 0,
@@ -8747,6 +8878,8 @@ mod tests {
             load_super_attr_fn_idx: 0,
             super_attr_unwrap_fn_idx: 0,
             load_deref_value_fn_idx: 0,
+            store_deref_value_fn_idx: 0,
+            make_cell_fn_idx: 0,
             unary_negative_fn_idx: 0,
             unary_invert_fn_idx: 0,
             unary_not_fn_idx: 0,
@@ -8810,6 +8943,8 @@ mod tests {
             load_super_attr_fn_idx: 0,
             super_attr_unwrap_fn_idx: 0,
             load_deref_value_fn_idx: 0,
+            store_deref_value_fn_idx: 0,
+            make_cell_fn_idx: 0,
             unary_negative_fn_idx: 0,
             unary_invert_fn_idx: 0,
             unary_not_fn_idx: 0,
@@ -8888,6 +9023,8 @@ mod tests {
             load_super_attr_fn_idx: 0,
             super_attr_unwrap_fn_idx: 0,
             load_deref_value_fn_idx: 0,
+            store_deref_value_fn_idx: 0,
+            make_cell_fn_idx: 0,
             unary_negative_fn_idx: 0,
             unary_invert_fn_idx: 0,
             unary_not_fn_idx: 0,
@@ -8942,6 +9079,8 @@ mod tests {
             load_super_attr_fn_idx: 0,
             super_attr_unwrap_fn_idx: 0,
             load_deref_value_fn_idx: 0,
+            store_deref_value_fn_idx: 0,
+            make_cell_fn_idx: 0,
             unary_negative_fn_idx: 0,
             unary_invert_fn_idx: 0,
             unary_not_fn_idx: 0,
@@ -8996,6 +9135,8 @@ mod tests {
             load_super_attr_fn_idx: 0,
             super_attr_unwrap_fn_idx: 0,
             load_deref_value_fn_idx: 0,
+            store_deref_value_fn_idx: 0,
+            make_cell_fn_idx: 0,
             unary_negative_fn_idx: 0,
             unary_invert_fn_idx: 0,
             unary_not_fn_idx: 0,
@@ -9055,6 +9196,8 @@ mod tests {
             load_super_attr_fn_idx: 0,
             super_attr_unwrap_fn_idx: 0,
             load_deref_value_fn_idx: 0,
+            store_deref_value_fn_idx: 0,
+            make_cell_fn_idx: 0,
             unary_negative_fn_idx: 0,
             unary_invert_fn_idx: 0,
             unary_not_fn_idx: 0,
@@ -9128,6 +9271,8 @@ mod tests {
             load_super_attr_fn_idx: 0,
             super_attr_unwrap_fn_idx: 0,
             load_deref_value_fn_idx: 0,
+            store_deref_value_fn_idx: 0,
+            make_cell_fn_idx: 0,
             unary_negative_fn_idx: 0,
             unary_invert_fn_idx: 0,
             unary_not_fn_idx: 0,
@@ -10300,6 +10445,8 @@ mod tests {
             load_super_attr_fn_idx: 0,
             super_attr_unwrap_fn_idx: 0,
             load_deref_value_fn_idx: 0,
+            store_deref_value_fn_idx: 0,
+            make_cell_fn_idx: 0,
             unary_negative_fn_idx: 0,
             unary_invert_fn_idx: 0,
             unary_not_fn_idx: 0,
@@ -10595,6 +10742,8 @@ mod tests {
             load_super_attr_fn_idx: 0,
             super_attr_unwrap_fn_idx: 0,
             load_deref_value_fn_idx: 0,
+            store_deref_value_fn_idx: 0,
+            make_cell_fn_idx: 0,
             unary_negative_fn_idx: 0,
             unary_invert_fn_idx: 0,
             unary_not_fn_idx: 0,
@@ -10782,6 +10931,8 @@ mod tests {
             load_fast_check_fn_idx: 111,
             unary_negative_fn_idx: 112,
             list_extend_fn_idx: 113,
+            store_deref_value_fn_idx: 114,
+            make_cell_fn_idx: 115,
         };
         let code_const = Constant::new(
             super::super::flow::ConstantValue::Signed(0x2000),
@@ -11400,6 +11551,147 @@ mod tests {
                         assert!(
                             matches!(&list.content[..], [Operand::Register(r)] if r.index == 101),
                             "ListR = [value], got {:?}",
+                            list.content
+                        );
+                    }
+                    other => panic!("expected ListR, got {other:?}"),
+                }
+                assert_eq!(
+                    result,
+                    Some(Register {
+                        kind: Kind::Ref,
+                        index: 102
+                    }),
+                );
+            }
+            _ => panic!("expected Insn::Op, got {insn:?}"),
+        }
+    }
+
+    #[test]
+    fn lower_store_deref_value_hlop_emits_store_deref_value_fn_residual() {
+        // `store_deref_value(cell, value)` →
+        // `residual_call_r_r(ConstInt(store_deref_value_fn_idx),
+        // ListR([cell, value]), Descr) → reg` (Plain — mutates the cell's
+        // heap contents, runs no user code, never raises).
+        let cell_var = Variable::new(VariableId(8), Kind::Ref);
+        let value_var = Variable::new(VariableId(9), Kind::Ref);
+        let result_var = Variable::new(VariableId(10), Kind::Ref);
+        let (ctx, _, _) = load_attr_lowering_fixture();
+        let op = super::super::flow::SpaceOperation::new(
+            "store_deref_value",
+            vec![cell_var.into(), value_var.into()],
+            Some(result_var.into()),
+            0,
+        );
+        let mut get_register = |var: Variable| match var.id {
+            VariableId(8) => Register {
+                kind: Kind::Ref,
+                index: 101,
+            },
+            VariableId(9) => Register {
+                kind: Kind::Ref,
+                index: 103,
+            },
+            VariableId(10) => Register {
+                kind: Kind::Ref,
+                index: 102,
+            },
+            _ => panic!("unexpected var id {:?}", var.id),
+        };
+        let mut lower_constant = super::flatten_constant_operand_for_test;
+        let insn = super::lower_store_deref_value_hlop_to_insn(
+            &op,
+            &ctx,
+            &mut get_register,
+            &mut lower_constant,
+        )
+        .expect("2-arg store_deref_value lowering must succeed");
+        match insn {
+            Insn::Op {
+                opname,
+                args,
+                result,
+            } => {
+                assert_eq!(opname, "residual_call_r_r");
+                assert!(
+                    matches!(args[0], Operand::ConstInt(114)),
+                    "store_deref_value_fn pool index, got {:?}",
+                    args[0]
+                );
+                match &args[1] {
+                    Operand::ListOfKind(list) => {
+                        assert_eq!(list.kind, Kind::Ref);
+                        match &list.content[..] {
+                            [Operand::Register(cell), Operand::Register(value)] => {
+                                assert_eq!(cell.index, 101, "ListR[0] must be cell");
+                                assert_eq!(value.index, 103, "ListR[1] must be value");
+                            }
+                            other => panic!("ListR must be [cell, value], got {other:?}"),
+                        }
+                    }
+                    other => panic!("expected ListR, got {other:?}"),
+                }
+                assert_eq!(
+                    result,
+                    Some(Register {
+                        kind: Kind::Ref,
+                        index: 102
+                    }),
+                );
+            }
+            _ => panic!("expected Insn::Op, got {insn:?}"),
+        }
+    }
+
+    #[test]
+    fn lower_make_cell_hlop_emits_make_cell_fn_residual() {
+        // `make_cell_value(current)` →
+        // `residual_call_r_r(ConstInt(make_cell_fn_idx), ListR([current]),
+        // Descr) → reg` (Plain — allocates a fresh cell, runs no user code,
+        // never raises).
+        let current_var = Variable::new(VariableId(8), Kind::Ref);
+        let result_var = Variable::new(VariableId(9), Kind::Ref);
+        let (ctx, _, _) = load_attr_lowering_fixture();
+        let op = super::super::flow::SpaceOperation::new(
+            "make_cell_value",
+            vec![current_var.into()],
+            Some(result_var.into()),
+            0,
+        );
+        let mut get_register = |var: Variable| match var.id {
+            VariableId(8) => Register {
+                kind: Kind::Ref,
+                index: 101,
+            },
+            VariableId(9) => Register {
+                kind: Kind::Ref,
+                index: 102,
+            },
+            _ => panic!("unexpected var id {:?}", var.id),
+        };
+        let mut lower_constant = super::flatten_constant_operand_for_test;
+        let insn =
+            super::lower_make_cell_hlop_to_insn(&op, &ctx, &mut get_register, &mut lower_constant)
+                .expect("1-arg make_cell_value lowering must succeed");
+        match insn {
+            Insn::Op {
+                opname,
+                args,
+                result,
+            } => {
+                assert_eq!(opname, "residual_call_r_r");
+                assert!(
+                    matches!(args[0], Operand::ConstInt(115)),
+                    "make_cell_fn pool index, got {:?}",
+                    args[0]
+                );
+                match &args[1] {
+                    Operand::ListOfKind(list) => {
+                        assert_eq!(list.kind, Kind::Ref);
+                        assert!(
+                            matches!(&list.content[..], [Operand::Register(r)] if r.index == 101),
+                            "ListR = [current], got {:?}",
                             list.content
                         );
                     }

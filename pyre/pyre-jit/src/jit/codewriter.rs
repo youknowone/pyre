@@ -3527,6 +3527,8 @@ struct FnPtrIndices {
     load_super_attr_fn: HelperHandle,
     super_attr_unwrap_fn: HelperHandle,
     load_deref_value_fn: HelperHandle,
+    store_deref_value_fn: HelperHandle,
+    make_cell_fn: HelperHandle,
     unary_negative_fn: HelperHandle,
     unary_invert_fn: HelperHandle,
     unary_not_fn: HelperHandle,
@@ -3851,6 +3853,18 @@ fn register_helper_fn_pointers(
         cpu.load_deref_value_fn as *const (),
         CallFlavor::Plain,
     );
+    // `bh_store_deref_value_fn` mutates a cell's contents (or returns the raw
+    // slot value); it runs no user code and never raises → `Plain`.  Appended
+    // last to preserve fn_ptr indices.
+    let store_deref_value_fn = bind(
+        assembler,
+        cpu.store_deref_value_fn as *const (),
+        CallFlavor::Plain,
+    );
+    // `bh_make_cell_fn` allocates a fresh cell (or returns the existing one);
+    // it runs no user code and never raises → `Plain`.  Appended last to
+    // preserve fn_ptr indices.
+    let make_cell_fn = bind(assembler, cpu.make_cell_fn as *const (), CallFlavor::Plain);
     // `bh_unary_invert_fn` computes `~value`; a user `__invert__` may run
     // Python → `MayForce`.  Appended last to preserve fn_ptr indices.
     let unary_invert_fn = bind(
@@ -3964,6 +3978,8 @@ fn register_helper_fn_pointers(
         load_super_attr_fn,
         super_attr_unwrap_fn,
         load_deref_value_fn,
+        store_deref_value_fn,
+        make_cell_fn,
         unary_negative_fn,
         unary_invert_fn,
         unary_not_fn,
@@ -4975,6 +4991,16 @@ impl CodeWriter {
                     idx: load_deref_value_fn_idx,
                     flavor: _load_deref_value_fn_flavor,
                 },
+            store_deref_value_fn:
+                HelperHandle {
+                    idx: store_deref_value_fn_idx,
+                    flavor: _store_deref_value_fn_flavor,
+                },
+            make_cell_fn:
+                HelperHandle {
+                    idx: make_cell_fn_idx,
+                    flavor: _make_cell_fn_flavor,
+                },
             unary_negative_fn:
                 HelperHandle {
                     idx: unary_negative_fn_idx,
@@ -5081,6 +5107,8 @@ impl CodeWriter {
                 load_super_attr_fn_idx,
                 super_attr_unwrap_fn_idx,
                 load_deref_value_fn_idx,
+                store_deref_value_fn_idx,
+                make_cell_fn_idx,
                 unary_negative_fn_idx,
                 unary_invert_fn_idx,
                 unary_not_fn_idx,
@@ -9453,10 +9481,108 @@ impl CodeWriter {
                             emit_abort_permanent!(py_pc);
                         }
 
-                        // StoreDeref: pops 1 value. Net: -1.
-                        Instruction::StoreDeref { .. } => {
-                            pop_and_decr_depth(&mut current_state, &mut current_depth);
-                            emit_abort_permanent!(py_pc);
+                        // STORE_DEREF: pops the value and writes it into the
+                        // cell slot. Net: -1. The slot in
+                        // `locals_cells_stack_w` holds a cell object
+                        // (`initialize_frame_scopes` / MAKE_CELL / the closure
+                        // tuple install one), so `i` is the unified localsplus
+                        // index read like LOAD_FAST. The cell is read FIRST so
+                        // it lands above the value on the symbolic stack and
+                        // the two pinned slots stay distinct. The
+                        // `store_deref_value(cell, value)` HLOp →
+                        // `residual_call_r_r(store_deref_value_fn,
+                        // ListR[cell, value])` mutates the cell's contents in
+                        // place (`bh_store_deref_value_fn`, Plain — writes
+                        // heap, runs no user code) and returns the slot value:
+                        // the unchanged cell for a cell slot, or the raw
+                        // `value` for a non-cell slot. The result is stored
+                        // back into the slot via `setarrayitem_vable_r`
+                        // (jtransform.py:1898 `do_fixed_list_setitem`),
+                        // mirroring the STORE_FAST shadow write.
+                        Instruction::StoreDeref { i } => {
+                            let idx = i.get(op_arg).as_usize() as u16;
+                            emit_load_fast_ref!(current_depth, idx, py_pc);
+                            let cell_reg = emit_popvalue_ref!(current_depth, py_pc);
+                            let cell_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            if let super::flow::FlowValue::Variable(v) = &cell_value {
+                                pin!(Some(*v), cell_reg);
+                            }
+                            let value_reg = emit_popvalue_ref!(current_depth, py_pc);
+                            let value_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            if let super::flow::FlowValue::Variable(v) = &value_value {
+                                pin!(Some(*v), value_reg);
+                            }
+                            let result_value = emit_graph_op_with_result(
+                                &mut graph,
+                                &current_block.block(),
+                                "store_deref_value",
+                                vec![cell_value.into(), value_value.into()],
+                                Kind::Ref,
+                                py_pc as i64,
+                            );
+                            if is_portal {
+                                let local_slot = local_to_vable_slot(idx as usize) as i64;
+                                let v_idx: super::flow::FlowValue =
+                                    super::flow::Constant::signed(local_slot).into();
+                                record_graph_op(
+                                    &current_block.block(),
+                                    "setarrayitem_vable_r",
+                                    vable_setarrayitem_ref_graph_args(
+                                        frame_var.into(),
+                                        v_idx.into(),
+                                        super::flow::FlowValue::from(result_value).into(),
+                                    ),
+                                    None,
+                                    py_pc as i64,
+                                );
+                            }
+                            current_state.store_local_value(idx as usize, result_value.into());
+                        }
+
+                        // MAKE_CELL: wraps the slot value in a cell. Touches
+                        // only the localsplus slot (no operand-stack effect);
+                        // `i` is the unified localsplus index read like
+                        // LOAD_FAST. The `make_cell_value(current)` HLOp →
+                        // `residual_call_r_r(make_cell_fn, ListR[current])`
+                        // returns the cell to install: a fresh cell wrapping
+                        // the raw argument value, or the existing cell
+                        // unchanged (`bh_make_cell_fn`, Plain — allocates,
+                        // runs no user code). The result is stored into the
+                        // slot via `setarrayitem_vable_r`, mirroring the
+                        // STORE_FAST shadow write.
+                        Instruction::MakeCell { i } => {
+                            let idx = i.get(op_arg).as_usize() as u16;
+                            emit_load_fast_ref!(current_depth, idx, py_pc);
+                            let current_reg = emit_popvalue_ref!(current_depth, py_pc);
+                            let current_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            if let super::flow::FlowValue::Variable(v) = &current_value {
+                                pin!(Some(*v), current_reg);
+                            }
+                            let result_value = emit_graph_op_with_result(
+                                &mut graph,
+                                &current_block.block(),
+                                "make_cell_value",
+                                vec![current_value.into()],
+                                Kind::Ref,
+                                py_pc as i64,
+                            );
+                            if is_portal {
+                                let local_slot = local_to_vable_slot(idx as usize) as i64;
+                                let v_idx: super::flow::FlowValue =
+                                    super::flow::Constant::signed(local_slot).into();
+                                record_graph_op(
+                                    &current_block.block(),
+                                    "setarrayitem_vable_r",
+                                    vable_setarrayitem_ref_graph_args(
+                                        frame_var.into(),
+                                        v_idx.into(),
+                                        super::flow::FlowValue::from(result_value).into(),
+                                    ),
+                                    None,
+                                    py_pc as i64,
+                                );
+                            }
+                            current_state.store_local_value(idx as usize, result_value.into());
                         }
 
                         // Instructions that don't touch the operand stack (locals/cells only).
@@ -9464,7 +9590,6 @@ impl CodeWriter {
                         | Instruction::DeleteDeref { .. }
                         | Instruction::DeleteGlobal { .. }
                         | Instruction::DeleteName { .. }
-                        | Instruction::MakeCell { .. }
                         | Instruction::SetupAnnotations => {
                             emit_abort_permanent!(py_pc);
                         }
