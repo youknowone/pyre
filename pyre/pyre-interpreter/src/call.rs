@@ -581,6 +581,33 @@ pub fn call_callable(frame: &mut PyFrame, callable: PyObjectRef, args: &[PyObjec
     call_callable_with_mode(frame, callable, args, CallMode::Jit)
 }
 
+/// `typeobject.c type_call` is the metaclass's `tp_call`; calling a class
+/// dispatches through `type(cls).__call__`.  The base `type` has no
+/// `__call__` dict entry — the implicit `__new__`/`__init__` path below is
+/// its `tp_call` — so any `__call__` resolved on a *non-`type`* metaclass
+/// is a genuine override (enum.EnumType, custom metaclasses with
+/// `__call__`).  Returns the override bound to `callable`, or `None` when
+/// the default class-instantiation path should run.
+fn metaclass_call_override(callable: PyObjectRef) -> Option<PyObjectRef> {
+    let metaclass = crate::typedef::r#type(callable)?;
+    if std::ptr::eq(metaclass, crate::typedef::w_type()) {
+        return None;
+    }
+    // Resolve __call__ AND where it is defined; the default `type.__call__`
+    // (the implicit instantiation path) is not an override, so a metaclass
+    // that merely inherits it — e.g. ABCMeta — keeps the fast path.
+    let (where_defined, call_descr) =
+        unsafe { crate::baseobjspace::lookup_where(metaclass, "__call__") }?;
+    if std::ptr::eq(where_defined, crate::typedef::w_type()) {
+        return None;
+    }
+    let bound = unsafe { crate::baseobjspace::get(call_descr, callable, metaclass) }
+        .ok()
+        .flatten()
+        .unwrap_or(call_descr);
+    Some(bound)
+}
+
 fn call_callable_with_mode(
     frame: &mut PyFrame,
     callable: PyObjectRef,
@@ -606,6 +633,9 @@ fn call_callable_with_mode(
         return call_callable_with_mode(frame, func, &call_args, mode);
     }
     if unsafe { pyre_object::is_type(callable) } {
+        if let Some(bound) = metaclass_call_override(callable) {
+            return call_callable_with_mode(frame, bound, args, mode);
+        }
         return type_descr_call_with_mode(frame, callable, args, mode);
     }
 
@@ -1241,6 +1271,14 @@ pub fn call_with_kwargs(
         return call_with_kwargs(frame, func, &full_args, kwargs);
     }
 
+    // A class call routes through `type(cls).__call__` when the metaclass
+    // overrides it (enum functional API passes `module=`/`type=` kwargs).
+    if unsafe { pyre_object::is_type(callable) } {
+        if let Some(bound) = metaclass_call_override(callable) {
+            return call_with_kwargs(frame, bound, pos_args, kwargs);
+        }
+    }
+
     if unsafe { crate::is_function(callable) } {
         let code = unsafe { crate::getcode(callable) };
         // For builtins: pack kwargs into a dict as last arg.
@@ -1811,6 +1849,9 @@ pub fn call_function_impl_result(
         // Type object → descr_call: __new__ + __init__
         // PyPy: typeobject.py descr_call → lookup __new__, call, then __init__
         if pyre_object::is_type(callable) {
+            if let Some(bound) = metaclass_call_override(callable) {
+                return call_function_impl_result(bound, args);
+            }
             clear_call_error();
             let result = type_descr_call_impl(callable, args);
             if result.is_null() {
@@ -1901,6 +1942,25 @@ fn check_type_instantiable(w_type: PyObjectRef) -> Result<(), PyError> {
         )));
     }
     Ok(())
+}
+
+/// `type.__call__(cls, *args)` — the metaclass-level instantiation entry
+/// (`typeobject.c type_call`).  Runs `__new__`/`__init__` directly, WITHOUT
+/// re-dispatching through the metaclass (a custom metaclass `__call__` that
+/// delegates via `super().__call__` lands here), and surfaces the stashed
+/// error instead of a null sentinel.
+pub fn type_call_instantiate(
+    w_type: PyObjectRef,
+    args: &[PyObjectRef],
+) -> Result<PyObjectRef, PyError> {
+    clear_call_error();
+    let result = type_descr_call_impl(w_type, args);
+    if result.is_null() {
+        if let Some(err) = take_call_error() {
+            return Err(err);
+        }
+    }
+    Ok(result)
 }
 
 /// Type call without a PyFrame.

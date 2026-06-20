@@ -5103,6 +5103,22 @@ fn init_type_type(ns: &mut DictStorage) {
         "__init__",
         make_builtin_function("__init__", |_| Ok(pyre_object::w_none())),
     );
+    // type.__call__(cls, *args) — typeobject.c type_call.  The implicit
+    // instantiation path handles `Cls()` directly, but a custom metaclass
+    // whose `__call__` delegates via `super().__call__(...)` needs this
+    // entry to resolve to the default __new__/__init__ behaviour.
+    dict_storage_store(
+        ns,
+        "__call__",
+        make_builtin_function("__call__", |args| {
+            let Some((&cls, rest)) = args.split_first() else {
+                return Err(crate::PyError::type_error(
+                    "type.__call__() takes at least 1 argument (0 given)",
+                ));
+            };
+            crate::call::type_call_instantiate(cls, rest)
+        }),
+    );
     // type.__annotations__ / __dict__ / __mro__ / __name__ / __bases__
     // are exposed as getset descriptors so
     // `type.__dict__['<name>'].__get__(cls)` invokes the underlying getter
