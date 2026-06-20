@@ -257,6 +257,12 @@ pub fn init_typeobjects() {
         let type_type = new_typeobject_with_base("type", init_type_type, object_type);
         // hasdict/weakrefable/acceptable now set by typedef.py:34,37,43 logic
         // in new_typeobject_with_base_and_layout from init_type_type's dict contents.
+        // typeobject.py:691-701 W_TypeObject._lifeline_/getweakref/setweakref/
+        // delweakref — every type object supports weakrefs regardless of the
+        // `weakrefable` flag inferred from its dict.  Mark the metaclass so that
+        // instances of `type` (i.e. all classes) route through the weakref
+        // side table; subclassed metaclasses inherit it via copy_flags_from_bases.
+        unsafe { pyre_object::w_type_set_weakrefable(type_type, true) };
         reg.insert(&TYPE_TYPE as *const PyType as usize, type_type as usize);
         let _ = W_TYPE_TYPEOBJECT.set(type_type as usize);
 
