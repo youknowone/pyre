@@ -432,6 +432,32 @@ impl WasmBackend {
 
 unsafe impl Send for WasmBackend {}
 
+/// Report why a trace cannot be compiled by the wasm backend, or `None` if it
+/// can. Declined traces fall back to the interpreter (correct, unaccelerated)
+/// instead of producing an invalid trace module.
+fn wasm_unsupported_trace_reason(ops: &[Op]) -> Option<String> {
+    let mut has_label = false;
+    let mut has_jump = false;
+    for op in ops {
+        if op.opcode.is_call_assembler() {
+            // CALL_ASSEMBLER enters another trace's compiled token; the wasm
+            // backend has no inter-module trace chaining (#62).
+            return Some(format!("wasm backend: {:?} (loop-callee inline)", op.opcode));
+        }
+        match op.opcode {
+            majit_ir::OpCode::Label => has_label = true,
+            majit_ir::OpCode::Jump => has_jump = true,
+            _ => {}
+        }
+    }
+    // A JUMP with no LABEL targets an external loop; codegen's `br` would have
+    // no enclosing loop block, yielding invalid wasm.
+    if has_jump && !has_label {
+        return Some("wasm backend: JUMP to external loop (no local LABEL)".into());
+    }
+    None
+}
+
 impl majit_backend::Backend for WasmBackend {
     fn cpu_tracker(&self) -> &std::sync::Arc<majit_backend::CpuTotalTracker> {
         &self.cpu_tracker
@@ -530,6 +556,21 @@ impl majit_backend::Backend for WasmBackend {
         }
         let ops_owned: Vec<Op> = ops.iter().map(|rc| (**rc).clone()).collect();
         let ops: &[Op] = &ops_owned;
+
+        // Decline traces the wasm backend cannot compile correctly, so the
+        // metainterp falls back to the interpreter (correct, if unaccelerated)
+        // rather than installing a structurally-invalid trace module:
+        //   * CALL_ASSEMBLER inlines a loop-bearing callee by jumping into
+        //     another trace's compiled token. The wasm backend has no
+        //     inter-module trace chaining (each trace is its own module), so it
+        //     cannot execute the target — declining is the #62 loop-callee gap.
+        //   * A JUMP with no LABEL targets an external loop; codegen would emit
+        //     a `br 0` with no enclosing block, producing invalid wasm
+        //     ("expected i32 but nothing on stack").
+        if let Some(reason) = wasm_unsupported_trace_reason(ops) {
+            return Err(BackendError::Unsupported(reason));
+        }
+
         self.collect_constants_from_ops(ops);
         let trace_id = self.trace_counter;
         self.trace_counter += 1;
