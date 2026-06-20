@@ -2950,7 +2950,7 @@ impl OptUnroll {
         optimizer: &mut crate::optimizeopt::optimizer::Optimizer,
         ctx: &mut OptContext,
         exported_int_bounds: Option<
-            &crate::optimizeopt::vec_assoc::VecAssoc<OpRef, crate::optimizeopt::intutils::IntBound>,
+            &crate::optimizeopt::vec_assoc::VecAssoc<BoxRef, crate::optimizeopt::intutils::IntBound>,
         >,
     ) -> ExportedState {
         // unroll.py:454: end_args = [force_at_the_end_of_preamble(a) ...]
@@ -3223,7 +3223,7 @@ impl OptUnroll {
         arg_box: &BoxRef,
         ctx: &OptContext,
         exported_int_bounds: Option<
-            &crate::optimizeopt::vec_assoc::VecAssoc<OpRef, crate::optimizeopt::intutils::IntBound>,
+            &crate::optimizeopt::vec_assoc::VecAssoc<BoxRef, crate::optimizeopt::intutils::IntBound>,
         >,
         infos: &mut crate::optimizeopt::vec_assoc::VecAssoc<
             BoxRef,
@@ -3271,7 +3271,7 @@ impl OptUnroll {
         opref: OpRef,
         ctx: &OptContext,
         exported_int_bounds: Option<
-            &crate::optimizeopt::vec_assoc::VecAssoc<OpRef, crate::optimizeopt::intutils::IntBound>,
+            &crate::optimizeopt::vec_assoc::VecAssoc<BoxRef, crate::optimizeopt::intutils::IntBound>,
         >,
         infos: &mut crate::optimizeopt::vec_assoc::VecAssoc<
             BoxRef,
@@ -4320,7 +4320,7 @@ impl OptUnroll {
         opref: OpRef,
         ctx: &OptContext,
         exported_int_bounds: Option<
-            &crate::optimizeopt::vec_assoc::VecAssoc<OpRef, crate::optimizeopt::intutils::IntBound>,
+            &crate::optimizeopt::vec_assoc::VecAssoc<BoxRef, crate::optimizeopt::intutils::IntBound>,
         >,
     ) -> Option<crate::optimizeopt::info::OpInfo> {
         use crate::optimizeopt::info::{OpInfo, PtrInfo};
@@ -4389,7 +4389,12 @@ impl OptUnroll {
         // to attach `OpInfo::IntBound` alongside `OpInfo::Ptr` so this
         // branch becomes redundant and the side-table parameter
         // disappears.
-        if let Some(bound) = exported_int_bounds.and_then(|bounds| bounds.get(&resolved).cloned()) {
+        if let Some(bound) = exported_int_bounds.and_then(|bounds| {
+            // Same Phase-1 ctx as the export producer, so the canonical box for
+            // `opref` is the memoized `Rc` the bound was keyed under (ptr_eq).
+            ctx.get_box_replacement_box(opref)
+                .and_then(|b| bounds.get(&b).cloned())
+        }) {
             return Some(OpInfo::int_bound(bound));
         }
         None
@@ -4425,7 +4430,7 @@ pub(crate) fn export_state(
     optimizer: &mut crate::optimizeopt::optimizer::Optimizer,
     ctx: &mut OptContext,
     exported_int_bounds: Option<
-        &crate::optimizeopt::vec_assoc::VecAssoc<OpRef, crate::optimizeopt::intutils::IntBound>,
+        &crate::optimizeopt::vec_assoc::VecAssoc<BoxRef, crate::optimizeopt::intutils::IntBound>,
     >,
 ) -> ExportedState {
     OptUnroll::new().export_state_with_bounds(
@@ -6628,13 +6633,18 @@ mod tests {
         use crate::optimizeopt::intutils::IntBound;
 
         let mut ctx = crate::optimizeopt::OptContext::with_num_inputs(4, 0);
-        let mut exported_bounds: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, IntBound> =
+        let mut exported_bounds: crate::optimizeopt::vec_assoc::VecAssoc<BoxRef, IntBound> =
             crate::optimizeopt::vec_assoc::VecAssoc::new();
-        exported_bounds.insert(OpRef::int_op(21), IntBound::bounded(10, 20));
         // Bind the export-input position at its source (a forced end-arg is a
         // bound box in production); virtualstate.py:711-720 create_state
         // receives real AbstractValues.
         ctx.materialize_box_at(OpRef::int_op(21));
+        // Key by the canonical box identity the consumer resolves `int_op(21)`
+        // to, so the BoxRef-keyed lookup hits by `Rc::ptr_eq`.
+        let box21 = ctx
+            .get_box_replacement_box(OpRef::int_op(21))
+            .expect("int_op(21) bound to a box");
+        exported_bounds.insert(box21, IntBound::bounded(10, 20));
 
         let exported = export_state(
             &[OpRef::int_op(21)],

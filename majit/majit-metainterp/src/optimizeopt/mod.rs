@@ -8421,7 +8421,7 @@ pub trait Optimization {
         &self,
         _args: &[OpRef],
         _ctx: &OptContext,
-    ) -> crate::optimizeopt::vec_assoc::VecAssoc<OpRef, IntBound> {
+    ) -> crate::optimizeopt::vec_assoc::VecAssoc<crate::r#box::BoxRef, IntBound> {
         crate::optimizeopt::vec_assoc::VecAssoc::new()
     }
 

@@ -3351,17 +3351,18 @@ impl Optimization for OptIntBounds {
         &self,
         args: &[OpRef],
         ctx: &OptContext,
-    ) -> crate::optimizeopt::vec_assoc::VecAssoc<OpRef, IntBound> {
+    ) -> crate::optimizeopt::vec_assoc::VecAssoc<crate::r#box::BoxRef, IntBound> {
         let mut exported = crate::optimizeopt::vec_assoc::VecAssoc::new();
         for &arg in args {
-            // `&OptContext` here forbids the `materialize_box_at` fallback in
-            // `resolve_box`, so use the immutable forwarded-chain walk
-            // (`get_box_replacement(arg) ≡ get_box_replacement_box(arg)
-            // .to_opref()` with the unresolvable-arg fallthrough).
-            let resolved = ctx
-                .get_box_replacement_box(arg)
-                .map(|b| b.to_opref())
-                .unwrap_or(arg);
+            // An IntBound only lives on a value-bearing box; an unresolvable
+            // arg position carries none. Resolve the canonical box once and
+            // key the export by box identity (`Rc::ptr_eq`), matching RPython's
+            // `box._forwarded` IntBound storage. `&OptContext` here forbids the
+            // `materialize_box_at` fallback, so an unbound arg is simply skipped.
+            let Some(arg_box) = ctx.get_box_replacement_box(arg) else {
+                continue;
+            };
+            let resolved = arg_box.to_opref();
             // optimizer.py:118-119 `setintbound`: an IntBound is never stored
             // on a Const (history.py:220 a Const carries its value inline);
             // unroll.py:483 likewise skips Const args when exporting info, so
@@ -3374,14 +3375,11 @@ impl Optimization for OptIntBounds {
             if !matches!(ctx.opref_type(resolved), Some(majit_ir::Type::Int)) {
                 continue;
             }
-            if let Some(bound) = ctx
-                .get_box_replacement_box(arg)
-                .and_then(|b| ctx.peek_intbound_box(&b))
-            {
+            if let Some(bound) = ctx.peek_intbound_box(&arg_box) {
                 if bound.is_unbounded() {
                     continue;
                 }
-                exported.insert(resolved, bound);
+                exported.insert(arg_box, bound);
             }
         }
         exported

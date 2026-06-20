@@ -3981,12 +3981,17 @@ impl Optimizer {
         &self,
         args: &[OpRef],
         ctx: &mut OptContext,
-    ) -> crate::optimizeopt::vec_assoc::VecAssoc<OpRef, crate::optimizeopt::intutils::IntBound>
-    {
+    ) -> crate::optimizeopt::vec_assoc::VecAssoc<
+        crate::r#box::BoxRef,
+        crate::optimizeopt::intutils::IntBound,
+    > {
         let mut exported = crate::optimizeopt::vec_assoc::VecAssoc::new();
         for pass in &self.passes {
-            for (opref, bound) in pass.export_arg_int_bounds(args, ctx).iter() {
-                exported.insert(*opref, bound.clone());
+            // Each pass resolves through the same `ctx`, so a box for one
+            // canonical position is memoized to a single `Rc` — entries across
+            // passes dedup by `Rc::ptr_eq`.
+            for (box_key, bound) in pass.export_arg_int_bounds(args, ctx).iter() {
+                exported.insert(box_key.clone(), bound.clone());
             }
         }
         exported
