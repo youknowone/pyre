@@ -595,9 +595,15 @@ impl ShortBoxes {
 
     /// shortpreamble.py:259 `self.potential_ops[box]` — resolve a label
     /// arg to its slot by the ORIGINAL box opref (not the renamed
-    /// `short_inputargs` box, which is a distinct identity).
+    /// `short_inputargs` box, which is a distinct identity). `potential_ops`
+    /// is box-keyed, so a box duplicated across `label_args + virtuals` (a
+    /// virtual field coinciding with a label arg) OVERWRITES to the LAST
+    /// occurrence's `ShortInputArg`; `rposition` mirrors that overwrite,
+    /// returning the live slot — consistent with `add_short_input_arg`
+    /// stamping `label_arg_idx = live_slot` (the last slot). For a
+    /// duplicate-free box `rposition == position`.
     pub fn lookup_label_arg(&self, opref: OpRef) -> Option<usize> {
-        self.label_args.iter().position(|&a| a == opref)
+        self.label_args.iter().rposition(|&a| a == opref)
     }
 
     /// RPython parity: check if opref is reachable in the short preamble.
@@ -4193,6 +4199,13 @@ mod tests {
         let produced_arg = sb.produce_arg(&mut ctx, OpRef::ref_op(50)).unwrap();
         assert_eq!(produced_arg.to_opref(), si[1].to_opref());
         assert_ne!(produced_arg.to_opref(), si[0].to_opref());
+
+        // `lookup_label_arg` mirrors `potential_ops[box]`'s last-wins overwrite,
+        // resolving the duplicated box to the LAST/live slot. This keeps the
+        // non-InputArg export lookup (optimizer.rs `lookup_label_arg(
+        // canonical_result)`) consistent with the InputArg entry's `live_slot`
+        // above. `rposition`; was `Some(0)` (first) before the fix.
+        assert_eq!(sb.lookup_label_arg(OpRef::ref_op(50)), Some(1));
     }
 
     #[test]

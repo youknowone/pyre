@@ -3029,7 +3029,11 @@ impl Optimizer {
                     // arg it did not originally occupy must reuse
                     // `short_args[slot]`, which `lookup_label_arg(canonical_
                     // result)` reports (pre-217 forwarded-slot lookup, parity
-                    // with upstream Box-identity CompoundOp merge).
+                    // with upstream Box-identity CompoundOp merge). For a label
+                    // arg duplicated across `label_args + virtuals`,
+                    // `lookup_label_arg` resolves to the LAST/live slot
+                    // (`potential_ops[box]` overwrite), matching the InputArg
+                    // branch's `live_slot` and upstream's surviving ShortInputArg.
                     let label_arg_idx = if produced.kind
                         == crate::optimizeopt::shortpreamble::PreambleOpKind::InputArg
                     {
