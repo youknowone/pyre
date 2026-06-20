@@ -23,7 +23,6 @@ crate::py_module! {
         "BufferedWriter"  / * = |_| Ok(w_none()),
         "BufferedRWPair"  / * = |_| Ok(w_none()),
         "BufferedRandom"  / * = |_| Ok(w_none()),
-        "TextIOWrapper"   / * = crate::builtins::text_io_wrapper_new,
         "IncrementalNewlineDecoder" / * = |_| Ok(w_none()),
         "open"            / * = crate::builtins::builtin_open,
         "open_code"       / * = |_| Ok(w_none()),
@@ -66,5 +65,16 @@ crate::py_module! {
             unsafe { pyre_object::typeobject::w_type_ready(t) };
             crate::dict_storage_store(ns, name, t);
         }
+
+        // `TextIOWrapper` is a real (subclassable) type: stdlib modules such
+        // as argparse / pickle / _android_support derive from it
+        // (`class StdIOBuffer(io.TextIOWrapper)`).  Its `__init__` configures
+        // the underlying buffer + encoding so `TextIOWrapper(buffer, ...)`
+        // and a subclass's `super().__init__(...)` both work.
+        let text_io_wrapper = crate::builtins::text_io_wrapper_type();
+        unsafe {
+            pyre_object::w_type_set_acceptable_as_base_class(text_io_wrapper, true);
+        }
+        crate::dict_storage_store(ns, "TextIOWrapper", text_io_wrapper);
     }
 }

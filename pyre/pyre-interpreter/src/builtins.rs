@@ -6491,16 +6491,20 @@ fn textio_decode(
 }
 
 /// `io.TextIOWrapper(buffer, encoding=None, errors=None, newline=None, ...)`.
-pub fn text_io_wrapper_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
+/// Configure a `TextIOWrapper` instance from its constructor arguments.
+/// `positional[0]` is the underlying buffer; encoding/errors arrive
+/// positionally (1, 2) or as keywords.  The selector-path `_communicate`
+/// reads `.encoding`/`.errors` directly to decode raw byte chunks, so they
+/// are stamped as concrete strings.
+fn textio_configure(
+    self_obj: PyObjectRef,
+    positional: &[PyObjectRef],
+    kwargs: Option<PyObjectRef>,
+) -> Result<(), crate::PyError> {
     let buffer = positional
         .first()
         .copied()
         .ok_or_else(|| crate::PyError::type_error("TextIOWrapper() requires a buffer"))?;
-
-    // encoding/errors arrive positionally (1,2) or as keywords; the
-    // selector-path `_communicate` reads `.encoding`/`.errors` directly to
-    // decode the raw byte chunks, so they must be concrete strings.
     let str_arg = |obj: Option<PyObjectRef>| -> Option<String> {
         obj.and_then(|o| unsafe {
             if pyre_object::is_str(o) {
@@ -6516,16 +6520,34 @@ pub fn text_io_wrapper_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
     let errors = str_arg(positional.get(2).copied())
         .or_else(|| str_arg(crate::builtins::kwarg_get(kwargs, "errors")))
         .unwrap_or_else(|| "strict".to_string());
-
-    let wrapper = pyre_object::w_instance_new(text_io_wrapper_type());
-    let _ = crate::baseobjspace::setattr_str(wrapper, "__textio_buffer__", buffer);
-    let _ = crate::baseobjspace::setattr_str(wrapper, "closed", w_bool_from(false));
-    let _ = crate::baseobjspace::setattr_str(wrapper, "encoding", w_str_new(&encoding));
-    let _ = crate::baseobjspace::setattr_str(wrapper, "errors", w_str_new(&errors));
+    let _ = crate::baseobjspace::setattr_str(self_obj, "__textio_buffer__", buffer);
+    let _ = crate::baseobjspace::setattr_str(self_obj, "closed", w_bool_from(false));
+    let _ = crate::baseobjspace::setattr_str(self_obj, "encoding", w_str_new(&encoding));
+    let _ = crate::baseobjspace::setattr_str(self_obj, "errors", w_str_new(&errors));
     if let Ok(name) = crate::baseobjspace::getattr_str(buffer, "name") {
-        let _ = crate::baseobjspace::setattr_str(wrapper, "name", name);
+        let _ = crate::baseobjspace::setattr_str(self_obj, "name", name);
     }
+    Ok(())
+}
+
+pub fn text_io_wrapper_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    let wrapper = pyre_object::w_instance_new(text_io_wrapper_type());
+    textio_configure(wrapper, positional, kwargs)?;
     Ok(wrapper)
+}
+
+/// `_io.TextIOWrapper.__init__(self, buffer, encoding=None, errors=None,
+/// ...)` — configures `self` so the type is subclassable (a subclass's
+/// `super().__init__(...)` reaches here).
+fn textio_method_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let self_obj = args
+        .first()
+        .copied()
+        .ok_or_else(|| crate::PyError::type_error("__init__ requires self"))?;
+    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(&args[1..]);
+    textio_configure(self_obj, positional, kwargs)?;
+    Ok(w_none())
 }
 
 /// Forward an integer size argument to the underlying buffer; a missing or
@@ -6596,6 +6618,11 @@ pub fn text_io_wrapper_type() -> PyObjectRef {
 }
 
 fn init_text_io_wrapper_type(ns: &mut DictStorage) {
+    crate::dict_storage_store(
+        ns,
+        "__init__",
+        make_builtin_function("__init__", textio_method_init),
+    );
     crate::dict_storage_store(
         ns,
         "read",
