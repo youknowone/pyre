@@ -872,6 +872,20 @@ impl<'a> Transformer<'a> {
                 // redundant alias key.
                 RewriteResult::Identity(operand.clone())
             }
+            // `ll_str` on a string is identity (`rpython/rtyper/
+            // lltypesystem/rstr.py` `ll_str` returns the string
+            // unchanged).  The front-end's `format!` / `to_string`
+            // expansion emits `str(x)` for a string-typed value; over a
+            // Ref (string) operand it folds to a no-op alias so it does
+            // not fall through to the unwired `int_str/r>r` default.  A
+            // `str` over an Int operand keeps the integer render path.
+            OpKind::UnaryOp {
+                op: unop_name,
+                operand,
+                ..
+            } if unop_name == "str" && self.get_value_kind_var(operand) == 'r' => {
+                RewriteResult::Identity(operand.clone())
+            }
             // RPython `jtransform.py:1592` rename pass:
             //   ('cast_bool_to_float', 'cast_int_to_float'),
             // The Bool register class is 'int' at LL, so the same
@@ -1187,6 +1201,51 @@ impl<'a> Transformer<'a> {
                         args_r: vec![],
                         args_f: vec![lhs, rhs],
                         result_kind: 'f',
+                        indirect_targets: None,
+                    },
+                });
+                ops.push(SpaceOperation {
+                    result: None,
+                    kind: OpKind::Live,
+                });
+                RewriteResult::Replace(ops)
+            }
+            // RPython `pair(StringRepr, StringRepr).rtype_add`
+            // (`rpython/rtyper/lltypesystem/rstr.py` `ll_strconcat`)
+            // lowers `s1 + s2` to a residual call to the concat helper.
+            // Pyre's front-end emits a unified `BinOp { op: "add" }`
+            // (Rust `+` is one AST node); over two Ref (string) operands
+            // this lowers to the registered `jit_str_concat` host extern
+            // (`pyre_object::strobject`, address in `jit_fnaddr.rs`,
+            // descriptor `OopSpecIndex::StrConcat` in
+            // `STR_CONCAT_TARGETS`), assembling to the wired
+            // `residual_call_r_r/iRd>r`.  Without this the op falls
+            // through to the unwired `int_add/rr>r` default.
+            OpKind::BinOp {
+                op: binop_name,
+                lhs,
+                rhs,
+                ..
+            } if binop_name == "add"
+                && self.get_value_kind_var(lhs) == 'r'
+                && self.get_value_kind_var(rhs) == 'r' =>
+            {
+                let target = CallTarget::function_path(["jit_str_concat"]);
+                let (funcptr, funcptr_op) = self.direct_funcptr_value(graph, &target);
+                let mut ops = vec![funcptr_op];
+                ops.push(SpaceOperation {
+                    result: op.result.clone(),
+                    kind: OpKind::CallResidual {
+                        funcptr: CallFuncPtr::Value(funcptr),
+                        descriptor: CallDescriptor::from_signature(
+                            &[majit_ir::value::Type::Ref, majit_ir::value::Type::Ref],
+                            majit_ir::value::Type::Ref,
+                            EffectInfo::new(ExtraEffect::ElidableCanRaise, OopSpecIndex::StrConcat),
+                        ),
+                        args_i: vec![],
+                        args_r: vec![lhs.clone(), rhs.clone()],
+                        args_f: vec![],
+                        result_kind: 'r',
                         indirect_targets: None,
                     },
                 });
