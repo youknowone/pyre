@@ -526,8 +526,16 @@ fn build_function(
             OpCode::GuardOverflow => {
                 // Always fails (no overflow detected in wasm MVP).
                 emit_guard_exit(&mut sink, constants, guard_idx, op);
-                if let Some(d) = block_exit_depth {
-                    sink.br(d);
+                match block_exit_depth {
+                    Some(d) => {
+                        sink.br(d);
+                    }
+                    // Straight-line: return directly so the following ops and
+                    // the terminal Finish do not overwrite this exit.
+                    None => {
+                        sink.local_get(0);
+                        sink.return_();
+                    }
                 }
                 guard_idx += 1;
             }
@@ -864,6 +872,22 @@ fn build_function(
                     sink.local_set(1 + vi);
                 }
             }
+            OpCode::GetarrayitemGcF | OpCode::GetarrayitemGcPureF | OpCode::GetarrayitemRawF => {
+                let vi = op.pos.get().raw();
+                if !OpRef::raw_is_constant(vi) {
+                    // A Float item is 8 bytes; load it as f64 and carry its bit
+                    // pattern in the i64 value slot (the IntArray/value-slot ABI
+                    // is i64).
+                    emit_array_addr(&mut sink, constants, op);
+                    sink.f64_load(MemArg {
+                        offset: 0,
+                        align: 3,
+                        memory_index: 0,
+                    });
+                    sink.i64_reinterpret_f64();
+                    sink.local_set(1 + vi);
+                }
+            }
             OpCode::SetarrayitemGc | OpCode::SetarrayitemRaw => {
                 emit_array_addr(&mut sink, constants, op);
                 emit_resolve(&mut sink, constants, op.arg(2).to_opref()); // value
@@ -886,6 +910,21 @@ fn build_function(
                     // Simplified: use field_offset directly (RPython computes base+index*itemsize+offset)
                     let (size, signed) = field_size_sign_from_descr(op);
                     emit_sized_int_load(&mut sink, field_offset, size, signed);
+                    sink.local_set(1 + vi);
+                }
+            }
+            OpCode::GetinteriorfieldGcF => {
+                let vi = op.pos.get().raw();
+                if !OpRef::raw_is_constant(vi) {
+                    emit_resolve(&mut sink, constants, op.arg(0).to_opref()); // array ptr
+                    sink.i32_wrap_i64();
+                    let field_offset = field_offset_from_descr(op);
+                    sink.f64_load(MemArg {
+                        offset: field_offset,
+                        align: 3,
+                        memory_index: 0,
+                    });
+                    sink.i64_reinterpret_f64();
                     sink.local_set(1 + vi);
                 }
             }
@@ -1538,7 +1577,19 @@ fn build_function(
             | OpCode::Keepalive => {}
 
             _ => {
-                // Unsupported opcode — skip silently.
+                // An opcode with no codegen arm. If it produces a value (a
+                // result local that later ops read), silently skipping it
+                // leaves a stale slot and yields wrong results, so decline the
+                // whole trace and let the metainterp fall back to the
+                // interpreter (correct, unaccelerated). Side-effect-free
+                // metadata opcodes that produce no value are enumerated above.
+                let vi = op.pos.get().raw();
+                if !OpRef::raw_is_constant(vi) {
+                    return Err(BackendError::Unsupported(format!(
+                        "wasm codegen: unhandled value-producing opcode {:?}",
+                        op.opcode
+                    )));
+                }
             }
         }
     }
@@ -1665,8 +1716,20 @@ fn emit_guard_if_exit(
 ) {
     sink.if_(BlockType::Empty);
     emit_guard_exit(sink, constants, guard_idx, op);
-    if let Some(d) = block_exit_depth {
-        sink.br(d + 1);
+    match block_exit_depth {
+        // Loop traces: `br` out of this `if` and the enclosing exit `block`
+        // (the `+ 1` accounts for the `if`) to the function epilogue.
+        Some(d) => {
+            sink.br(d + 1);
+        }
+        // Straight-line traces have no enclosing block, so fall-through would
+        // reach the terminal Finish and overwrite frame[0] with its
+        // fail_index, discarding this guard's exit. Return the frame pointer
+        // directly (the epilogue's value) to hand control to the metainterp.
+        None => {
+            sink.local_get(0);
+            sink.return_();
+        }
     }
     sink.end();
 }
