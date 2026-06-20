@@ -57,6 +57,12 @@ pub fn jit_exc_take() -> i64 {
     value
 }
 
+/// Clear both exception slots without reading the value.
+pub fn jit_exc_clear() {
+    JIT_EXC_VALUE.store(0, Ordering::Relaxed);
+    JIT_EXC_TYPE.store(0, Ordering::Relaxed);
+}
+
 /// Address of `JIT_EXC_VALUE`, embedded as an immediate in JIT-emitted wasm
 /// so the trace can load/store it over the shared linear memory
 /// (`_store_and_reset_exception` parity).
@@ -438,6 +444,8 @@ unsafe impl Send for WasmBackend {}
 fn wasm_unsupported_trace_reason(ops: &[Op]) -> Option<String> {
     let mut has_label = false;
     let mut has_jump = false;
+    let mut has_new = false;
+    let mut has_call = false;
     for op in ops {
         if op.opcode.is_call_assembler() {
             // CALL_ASSEMBLER enters another trace's compiled token; the wasm
@@ -447,6 +455,11 @@ fn wasm_unsupported_trace_reason(ops: &[Op]) -> Option<String> {
         match op.opcode {
             majit_ir::OpCode::Label => has_label = true,
             majit_ir::OpCode::Jump => has_jump = true,
+            majit_ir::OpCode::New
+            | majit_ir::OpCode::NewWithVtable
+            | majit_ir::OpCode::NewArray
+            | majit_ir::OpCode::NewArrayClear => has_new = true,
+            opcode if opcode.is_call() => has_call = true,
             _ => {}
         }
     }
@@ -454,6 +467,15 @@ fn wasm_unsupported_trace_reason(ops: &[Op]) -> Option<String> {
     // no enclosing loop block, yielding invalid wasm.
     if has_jump && !has_label {
         return Some("wasm backend: JUMP to external loop (no local LABEL)".into());
+    }
+    // A loop that BOTH allocates and makes residual calls every iteration grows
+    // the heap without bound (the wasm backend has no GC malloc-nursery rewrite,
+    // so wasm_jit_alloc never collects) while the host-trampoline calls keep it
+    // running long enough to exhaust memory. Decline so the interpreter (with
+    // its GC) runs the loop. An all-inline allocating loop (no residual call)
+    // stays compiled: it is fast and its bounded run does not exhaust memory.
+    if has_label && has_new && has_call {
+        return Some("wasm backend: allocation + residual call in loop trace (no GC nursery)".into());
     }
     None
 }
@@ -699,6 +721,13 @@ impl majit_backend::Backend for WasmBackend {
         }
         #[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
         {
+            // The pending-exception cell is global, unlike the native
+            // per-jitframe `jf_guard_exc`. A residual raise on a blackhole
+            // resume path (publish_residual_call_exception) writes it outside
+            // any trace and nothing clears it, so clear it before running this
+            // trace; otherwise jit_exc_take below would surface a stale
+            // exception from a previous frame's resume as this trace's.
+            jit_exc_clear();
             glue::execute(compiled.func_handle, _frame_ptr);
 
             // A GuardNoException / GuardException exit leaves the pending
