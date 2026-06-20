@@ -3016,6 +3016,43 @@ impl<'a> Transformer<'a> {
                     ],
                 )
             }
+            "list.int_capacity" => {
+                let l = args.first()?.clone();
+                (
+                    "list.int_capacity → getfield_gc_i(int_items.heap_cap)",
+                    vec![SpaceOperation {
+                        result: op.result.clone(),
+                        kind: OpKind::FieldRead {
+                            base: l,
+                            field: FieldDescriptor::new(
+                                "int_items.heap_cap",
+                                Some(LIST_OWNER.to_string()),
+                            ),
+                            ty: ValueType::Int,
+                            pure: false,
+                        },
+                    }],
+                )
+            }
+            "list.int_set_len" => {
+                let l = args.first()?.clone();
+                let n = args.get(1)?.clone();
+                (
+                    "list.int_set_len → setfield_gc_i(int_items.len)",
+                    vec![SpaceOperation {
+                        result: op.result.clone(),
+                        kind: OpKind::FieldWrite {
+                            base: l,
+                            field: FieldDescriptor::new(
+                                "int_items.len",
+                                Some(LIST_OWNER.to_string()),
+                            ),
+                            value: crate::model::LinkArg::Value(n),
+                            ty: ValueType::Int,
+                        },
+                    }],
+                )
+            }
             _ => return None,
         };
         self.notes.push(GraphTransformNote {
@@ -8242,6 +8279,88 @@ mod tests {
             other => panic!("expected ArrayWrite, got {other:?}"),
         }
         assert_eq!(ops[1].result, None);
+    }
+
+    /// `list.int_capacity(l)` lowers to a single `getfield_gc_i(l,
+    /// int_items.heap_cap)`.
+    #[test]
+    fn handle_list_call_int_capacity_lowers_to_heap_cap_field() {
+        let config = GraphTransformConfig::default();
+        let mut graph = FunctionGraph::new("list_int_capacity");
+        let l = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let result = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let op = SpaceOperation {
+            result: Some(result.clone()),
+            kind: OpKind::ConstInt(0),
+        };
+        let mut transformer = Transformer::new(&config);
+        let rewrite = transformer
+            ._handle_list_call(
+                "list.int_capacity",
+                &op,
+                &[l.clone()],
+                &mut graph,
+                "list_int_capacity",
+            )
+            .expect("list.int_capacity must lower");
+        let RewriteResult::Replace(ops) = rewrite else {
+            panic!("expected Replace");
+        };
+        assert_eq!(ops.len(), 1);
+        match &ops[0].kind {
+            OpKind::FieldRead {
+                base, field, ty, ..
+            } => {
+                assert_eq!(base, &l);
+                assert_eq!(field.name, "int_items.heap_cap");
+                assert!(matches!(ty, ValueType::Int));
+            }
+            other => panic!("expected FieldRead, got {other:?}"),
+        }
+        assert_eq!(ops[0].result, Some(result));
+    }
+
+    /// `list.int_set_len(l, n)` lowers to a single `setfield_gc_i(l, n,
+    /// int_items.len)`.
+    #[test]
+    fn handle_list_call_int_set_len_lowers_to_len_field_write() {
+        let config = GraphTransformConfig::default();
+        let mut graph = FunctionGraph::new("list_int_set_len");
+        let l = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let n = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let op = SpaceOperation {
+            result: None,
+            kind: OpKind::ConstInt(0),
+        };
+        let mut transformer = Transformer::new(&config);
+        let rewrite = transformer
+            ._handle_list_call(
+                "list.int_set_len",
+                &op,
+                &[l.clone(), n.clone()],
+                &mut graph,
+                "list_int_set_len",
+            )
+            .expect("list.int_set_len must lower");
+        let RewriteResult::Replace(ops) = rewrite else {
+            panic!("expected Replace");
+        };
+        assert_eq!(ops.len(), 1);
+        match &ops[0].kind {
+            OpKind::FieldWrite {
+                base,
+                field,
+                value,
+                ty,
+            } => {
+                assert_eq!(base, &l);
+                assert_eq!(field.name, "int_items.len");
+                assert_eq!(value.as_variable(), Some(&n));
+                assert!(matches!(ty, ValueType::Int));
+            }
+            other => panic!("expected FieldWrite, got {other:?}"),
+        }
+        assert_eq!(ops[0].result, None);
     }
 
     /// An unhandled list oopspec spelling returns `None` so the caller

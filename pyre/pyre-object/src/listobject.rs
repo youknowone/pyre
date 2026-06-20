@@ -519,6 +519,22 @@ pub fn ll_list_int_setitem_fast(l: &mut W_ListObject, index: usize, item: i64) {
     l.int_items.as_mut_slice()[index] = item;
 }
 
+/// Allocated capacity for the Integer strategy. `ll_append`'s resize-ge
+/// fast case (rlist.py:285) inlines the append only while
+/// `len(items) >= length + 1`, i.e. spare capacity exists.
+#[majit_macros::oopspec("list.int_capacity(l)")]
+pub fn ll_list_int_capacity(l: &W_ListObject) -> usize {
+    l.int_items.heap_capacity()
+}
+
+/// Store the Integer-strategy live length (`_ll_list_resize_ge`'s
+/// `l.length = newsize`, rlist.py:293). The caller has already ensured
+/// the block has room, so this only bumps the length field.
+#[majit_macros::oopspec("list.int_set_len(l, n)")]
+pub fn ll_list_int_set_len(l: &mut W_ListObject, n: usize) {
+    l.int_items.set_len(n);
+}
+
 /// Get the item at the given index from a list.
 ///
 /// Supports negative indexing. Returns None if out of bounds.
@@ -635,7 +651,19 @@ pub unsafe fn w_list_append(obj: PyObjectRef, value: PyObjectRef) {
         }
         ListStrategy::Integer => {
             if is_plain_int1(value) {
-                list.int_items.push(plain_int_w(value));
+                // ll_append (rtyper/rlist.py:588): length = ll_length();
+                // _ll_resize_ge(length+1); ll_setitem_fast(length, item).
+                // The resize-ge fast case (rlist.py:285) inlines only while
+                // there is spare capacity; bump the length and store in
+                // place. Otherwise fall back to the resizing push.
+                let item = plain_int_w(value);
+                let length = ll_list_int_length(list);
+                if length < ll_list_int_capacity(list) {
+                    ll_list_int_set_len(list, length + 1);
+                    ll_list_int_setitem_fast(list, length, item);
+                } else {
+                    list.int_items.push(item);
+                }
             } else {
                 switch_to_object_strategy(list);
                 list.object_push(value);
