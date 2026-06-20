@@ -2275,9 +2275,14 @@ impl OptContext {
     /// the resulting OpRef.
     pub fn emit_constant_int(&mut self, value: i64) -> OpRef {
         let pos_ref = self.reserve_pos_typed(Type::Int);
+        // The SAME_AS source is the constant itself (`make_constant_box` below
+        // forwards the result to the same `Const`, so the op is a tautology
+        // `result = ConstInt(value)`). A constant operand binds directly; a
+        // position-only `from_opref(pos_ref)` self-reference would shed to the
+        // catch-all `Operand::Box` with no live producer (#9).
         let mut op = Op::new(
             OpCode::SameAsI,
-            &[crate::r#box::BoxRef::from_opref(pos_ref)],
+            &[crate::r#box::BoxRef::new_const(Value::Int(value))],
         );
         op.pos.set(pos_ref);
         let opref = self.emit_extra(self.current_pass_idx, op);
@@ -2290,9 +2295,10 @@ impl OptContext {
     /// return the resulting OpRef.
     pub fn emit_constant_ref(&mut self, value: GcRef) -> OpRef {
         let pos_ref = self.reserve_pos_typed(Type::Ref);
+        // SAME_AS source is the constant ref itself; see `emit_constant_int`.
         let mut op = Op::new(
             OpCode::SameAsR,
-            &[crate::r#box::BoxRef::from_opref(pos_ref)],
+            &[crate::r#box::BoxRef::new_const(Value::Ref(value))],
         );
         op.pos.set(pos_ref);
         let opref = self.emit_extra(self.current_pass_idx, op);
@@ -2305,9 +2311,10 @@ impl OptContext {
     /// the resulting OpRef.
     pub fn emit_constant_float(&mut self, value: f64) -> OpRef {
         let pos_ref = self.reserve_pos_typed(Type::Float);
+        // SAME_AS source is the constant float itself; see `emit_constant_int`.
         let mut op = Op::new(
             OpCode::SameAsF,
-            &[crate::r#box::BoxRef::from_opref(pos_ref)],
+            &[crate::r#box::BoxRef::new_const(Value::Float(value))],
         );
         op.pos.set(pos_ref);
         let opref = self.emit_extra(self.current_pass_idx, op);
