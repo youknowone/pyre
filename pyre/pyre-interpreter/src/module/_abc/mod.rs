@@ -42,34 +42,70 @@ fn register(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     Ok(subclass)
 }
 
-// `app_abc.py:_abc_subclasscheck` — direct MRO walk plus registry-based
-// virtual-subclass lookup (recursive `issubclass(subclass, rcls)`).
-fn subclass_of(cls: PyObjectRef, subclass: PyObjectRef) -> bool {
+// `_py_abc.ABCMeta.__subclasscheck__` (`_py_abc.py:108-147`): the subclass
+// hook first, then a direct `__mro__` test, then the recursive registry and
+// subclass walks.  The positive/negative caches are a pure optimisation and
+// are omitted; `issubclass` re-dispatches through `__subclasscheck__` so a
+// registered or descendant ABC applies its own hook in turn.
+fn subclass_of(cls: PyObjectRef, subclass: PyObjectRef) -> Result<bool, crate::PyError> {
+    // _py_abc.py:110-111 — `if not isinstance(subclass, type): raise
+    // TypeError('issubclass() arg 1 must be a class')`.  The `__mro__`/registry
+    // walks below dereference `subclass` as a type, so a non-type argument
+    // (`issubclass({}, ABC)`) must be rejected up front, not read as garbage.
+    if !unsafe { is_type(subclass) } {
+        return Err(crate::PyError::type_error(
+            "issubclass() arg 1 must be a class",
+        ));
+    }
+    // _py_abc.py:122-130 — `ok = cls.__subclasshook__(subclass)`.
+    if let Ok(hook) = crate::baseobjspace::getattr_str(cls, "__subclasshook__") {
+        if !hook.is_null() {
+            let ok = crate::call::call_function_impl_result(hook, &[subclass])?;
+            if !unsafe { is_not_implemented(ok) } {
+                return crate::baseobjspace::is_true(ok);
+            }
+        }
+    }
+    // _py_abc.py:131-134 — direct subclass via `__mro__`.
     unsafe {
         let mro_ptr = w_type_get_mro(subclass);
         if !mro_ptr.is_null() {
             for &t in &*mro_ptr {
                 if std::ptr::eq(t, cls) {
-                    return true;
+                    return Ok(true);
                 }
             }
         }
     }
+    // _py_abc.py:135-139 — subclass of a registered class (recursive).
     if let Ok(registry) = crate::baseobjspace::getattr_str(cls, "_abc_registry") {
         if !registry.is_null() && unsafe { is_list(registry) } {
-            unsafe {
-                let n = w_list_len(registry);
-                for i in 0..n {
-                    if let Some(rcls) = w_list_getitem(registry, i as i64) {
-                        if subclass_of(rcls, subclass) {
-                            return true;
-                        }
+            let n = unsafe { w_list_len(registry) };
+            for i in 0..n {
+                if let Some(rcls) = unsafe { w_list_getitem(registry, i as i64) } {
+                    // A registered entry that is not a class cannot be a base
+                    // class, so it can never make `subclass` a subclass — skip
+                    // it rather than letting `issubclass` raise.  `range` is
+                    // registered to `Sequence` but is a builtin function in
+                    // pyre, so without this guard a single bad entry aborts the
+                    // whole recursive check.
+                    if !unsafe { is_type(rcls) } {
+                        continue;
+                    }
+                    if crate::baseobjspace::issubclass(subclass, rcls)? {
+                        return Ok(true);
                     }
                 }
             }
         }
     }
-    false
+    // _py_abc.py:140-144 — subclass of a subclass (recursive).
+    for scls in unsafe { w_type_get_subclasses(cls) } {
+        if crate::baseobjspace::issubclass(subclass, scls)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn instancecheck(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -81,18 +117,22 @@ fn instancecheck(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if unsafe { crate::baseobjspace::isinstance_w(instance, cls) } {
         return Ok(w_bool_from(true));
     }
-    let subclass =
-        unsafe { crate::typedef::gettypefor((*instance).ob_type).unwrap_or(std::ptr::null_mut()) };
-    Ok(w_bool_from(
-        !subclass.is_null() && subclass_of(cls, subclass),
-    ))
+    // `type(instance)` — the instance's real class.  User-defined instances
+    // carry the generic layout marker in `ob_type` and the real class in
+    // `w_class`, so reading `ob_type` directly would resolve to `object`;
+    // `r#type` returns the class for both builtin and user instances.
+    let subclass = crate::typedef::r#type(instance).unwrap_or(std::ptr::null_mut());
+    if subclass.is_null() {
+        return Ok(w_bool_from(false));
+    }
+    Ok(w_bool_from(subclass_of(cls, subclass)?))
 }
 
 fn subclasscheck(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if args.len() < 2 {
         return Ok(w_bool_from(false));
     }
-    Ok(w_bool_from(subclass_of(args[0], args[1])))
+    Ok(w_bool_from(subclass_of(args[0], args[1])?))
 }
 
 crate::py_module! {
