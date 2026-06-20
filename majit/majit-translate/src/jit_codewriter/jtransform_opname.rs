@@ -699,6 +699,38 @@ mod tests {
         assert_eq!(jitcode.try_index(), Some(0));
     }
 
+    /// A `direct_call` to a registered opname helper must resolve as a
+    /// *regular* callee (it owns a generated JitCode), not a residual call to
+    /// a synthetic low-level helper.  Pre-fix the helper was visible only in
+    /// `opname_graphs`, so `target_to_path`/`graphs_from` missed it and
+    /// `guess_call_kind` returned `Residual`.
+    #[test]
+    fn registered_opname_helper_resolves_as_regular_callee() {
+        use crate::jit_codewriter::call::{CallControl, CallKind};
+        use crate::model::{CallTarget, OpKind, SpaceOperation, ValueType};
+        use crate::parse::CallPath;
+
+        let flow = build_fusable_str_helper();
+        let path = CallPath::from_segments(["ll_test_fusable_str_helper"]);
+
+        let mut callcontrol = CallControl::new();
+        callcontrol.register_opname_helper_graph(path.clone(), flow);
+
+        let target = CallTarget::function_path(["ll_test_fusable_str_helper"]);
+        assert_eq!(callcontrol.target_to_path(&target), Some(path.clone()));
+
+        let call_op = SpaceOperation {
+            result: None,
+            kind: OpKind::Call {
+                target,
+                args: vec![],
+                result_ty: ValueType::Void,
+            },
+        };
+        assert_eq!(callcontrol.graphs_from(&call_op), Some(vec![path]));
+        assert_eq!(callcontrol.guess_call_kind(&call_op), CallKind::Regular);
+    }
+
     /// End-to-end: the restructured production `ll_strconcat` helper lowers
     /// cleanly through Spine B.  The two `copystrcontent` ops become void
     /// `LoweredBlackholeOp`s, the source-length reads fuse to `strlen`, and

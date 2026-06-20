@@ -743,6 +743,14 @@ pub struct CallControl {
     /// `take_opname_graph` consumes the entry during the drain so the
     /// graph is lowered exactly once.
     opname_graphs: HashMap<CallPath, crate::flowspace::model::FunctionGraph>,
+    /// Persistent set of paths registered as opname-dispatch helpers.
+    /// Unlike [`Self::opname_graphs`] (drained by `take_opname_graph` once
+    /// the body is lowered), this survives the drain so a caller's
+    /// `direct_call` to the helper still resolves as a regular callee after
+    /// the helper itself has been assembled — the resolution twin of the
+    /// `function_graphs`/`candidate_graphs` registration a rich-`OpKind`
+    /// graph gets.
+    opname_helper_paths: HashSet<CallPath>,
 
     /// `call.py:22 virtualref_info = None` — class-level default,
     /// populated by `CodeWriter.setup_vrefinfo`
@@ -1225,6 +1233,7 @@ impl CallControl {
             finished_jitcodes: Vec::new(),
             unfinished_graphs: Vec::new(),
             opname_graphs: HashMap::new(),
+            opname_helper_paths: HashSet::new(),
             virtualref_info: None,
             callinfocollection: majit_ir::CallInfoCollection::new(),
             descr_indices: DescrIndexRegistry::default(),
@@ -3101,6 +3110,16 @@ impl CallControl {
         graph: crate::flowspace::model::FunctionGraph,
     ) -> std::sync::Arc<crate::jitcode::JitCode> {
         self.opname_graphs.insert(path.clone(), graph);
+        // Make the helper resolvable as a regular callee: record its path
+        // persistently (for `target_to_path`) and mark it a candidate (for
+        // `graphs_from`), mirroring the `function_graphs` + `candidate_graphs`
+        // pair a rich-`OpKind` helper receives via `find_all_graphs_bfs`.
+        // Without this, a `direct_call` to the helper misses both gates and
+        // `guess_call_kind` classifies it `Residual` — the caller would emit a
+        // residual call for a synthetic low-level helper instead of using the
+        // generated JitCode.
+        self.opname_helper_paths.insert(path.clone());
+        self.candidate_graphs.insert(path.clone());
         self.get_jitcode(&path)
     }
 
@@ -3477,7 +3496,12 @@ impl CallControl {
         match target {
             CallTarget::FunctionPath { segments } => {
                 let path = CallPath::from_segments(segments.iter().map(String::as_str));
-                if self.function_graphs.contains_key(&path) {
+                // A rich-`OpKind` graph resolves via `function_graphs`; an
+                // opname-dispatch helper has no rich twin there, so it is
+                // recognised by its persistent registration instead.
+                if self.function_graphs.contains_key(&path)
+                    || self.opname_helper_paths.contains(&path)
+                {
                     return Some(path);
                 }
                 // Cross-module reference fallback.  `front::mir` resolves
