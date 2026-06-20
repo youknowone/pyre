@@ -2863,6 +2863,28 @@ fn emit_frontend_store_name(
     );
 }
 
+fn emit_frontend_store_global(
+    _graph: &mut super::flow::FunctionGraph,
+    block: &super::flow::BlockRef,
+    frame: super::flow::FlowValue,
+    name: super::flow::FlowValue,
+    value: super::flow::FlowValue,
+    offset: i64,
+) {
+    // pyopcode.py:567 STORE_GLOBAL — writes the value directly into
+    // `w_globals`, bypassing `w_locals`.  Frame-receiver call shape like
+    // `emit_frontend_store_name`; lowers to `bh_store_global_fn(frame,
+    // w_name, value)` (`flatten::lower_store_global_hlop_to_insn`).  See
+    // `emit_frontend_setitem` for the void-result rationale.
+    record_graph_op(
+        block,
+        "store_global",
+        vec![frame.into(), name.into(), value.into()],
+        None,
+        offset,
+    );
+}
+
 fn emit_frontend_simple_call(
     graph: &mut super::flow::FunctionGraph,
     block: &super::flow::BlockRef,
@@ -3489,6 +3511,7 @@ struct FnPtrIndices {
     getattr_fn: HelperHandle,
     load_name_fn: HelperHandle,
     store_name_fn: HelperHandle,
+    store_global_fn: HelperHandle,
     newtuple_from_array_fn: HelperHandle,
     newlist_from_array_fn: HelperHandle,
     unpack_sequence_fn: HelperHandle,
@@ -3744,6 +3767,11 @@ fn register_helper_fn_pointers(
     // Bound after the existing fn_ptrs to preserve their indices.
     let load_name_fn = bind(assembler, cpu.load_name_fn as *const (), CallFlavor::Plain);
     let store_name_fn = bind(assembler, cpu.store_name_fn as *const (), CallFlavor::Plain);
+    // `bh_store_global_fn` delegates to the interpreter `store_global_value`
+    // (pyopcode.py:567 STORE_GLOBAL); same blackhole/deopt-only contract and
+    // `CallFlavor::Plain` classification as `store_name_fn`.  Bound adjacent
+    // to it to keep the namespace-store helpers contiguous.
+    let store_global_fn = bind(assembler, cpu.store_global_fn as *const (), CallFlavor::Plain);
     // `bh_store_attr_fn` calls `baseobjspace::setattr_str`, which can run
     // user `__setattr__` (forces virtualizables) and raise → `MayForce`.
     // Symmetric to `load_attr_fn`; appended last to preserve fn_ptr indices.
@@ -3940,6 +3968,7 @@ fn register_helper_fn_pointers(
         getattr_fn,
         load_name_fn,
         store_name_fn,
+        store_global_fn,
         newtuple_from_array_fn,
         newlist_from_array_fn,
         unpack_sequence_fn,
@@ -4801,6 +4830,11 @@ impl CodeWriter {
                     idx: store_name_fn_idx,
                     flavor: _store_name_fn_flavor,
                 },
+            store_global_fn:
+                HelperHandle {
+                    idx: store_global_fn_idx,
+                    flavor: _store_global_fn_flavor,
+                },
             newtuple_from_array_fn:
                 HelperHandle {
                     idx: newtuple_from_array_fn_idx,
@@ -5069,6 +5103,7 @@ impl CodeWriter {
                 getattr_fn_idx,
                 load_name_fn_idx,
                 store_name_fn_idx,
+                store_global_fn_idx,
                 newtuple_from_array_fn_idx,
                 newlist_from_array_fn_idx,
                 // `[u16; 15]` indexed by nargs (0..=14).  `call_fn_idx`
@@ -8217,15 +8252,31 @@ impl CodeWriter {
                                 py_pc as i64,
                             );
                         }
-                        Instruction::StoreGlobal { .. } => {
-                            // flowcontext.py:884-890 STORE_GLOBAL is
-                            // unsupported; the stack effect still consumes one
-                            // value.  Unlike STORE_NAME it bypasses w_locals
-                            // (`pyopcode.py:940`), and no hot path needs it
-                            // yet — keep the abort until a helper lands.
-                            emit_abort_permanent!(py_pc);
-                            pop_and_decr_depth(&mut current_state, &mut current_depth);
-                            emit_vsd!(current_depth, py_pc);
+                        Instruction::StoreGlobal { namei } => {
+                            // pyopcode.py:567 STORE_GLOBAL — pops the value and
+                            // writes it directly into `w_globals` (bypassing
+                            // `w_locals`) via the `store_global` HLOp →
+                            // `bh_store_global_fn(frame, w_name, value)`
+                            // residual call.  Traced via the trait leg
+                            // (`store_global_value`); the residual runs only on
+                            // blackhole/deopt.  Same void 3-Ref shape as the
+                            // StoreName arm.
+                            let name_idx = namei.get(op_arg) as usize;
+                            let attr_name =
+                                super::flow::Constant::string(code.names[name_idx].as_str());
+                            let value_reg = emit_popvalue_ref!(current_depth, py_pc);
+                            let stored_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            if let super::flow::FlowValue::Variable(v) = &stored_value {
+                                pin!(Some(*v), value_reg);
+                            }
+                            emit_frontend_store_global(
+                                &mut graph,
+                                &current_block.block(),
+                                frame_var.into(),
+                                attr_name.into(),
+                                stored_value,
+                                py_pc as i64,
+                            );
                         }
                         Instruction::MakeFunction { .. } => {
                             // Pops code object (TOS), pushes function. Net: 0.

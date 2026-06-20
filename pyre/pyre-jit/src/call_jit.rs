@@ -4015,6 +4015,36 @@ pub extern "C" fn bh_store_name_fn(frame_ptr: i64, w_name: i64, value: i64) -> i
     }
 }
 
+/// `STORE_GLOBAL` residual for the standalone (blackhole / deopt)
+/// per-CodeObject jitcode.  `pyopcode.py:567 STORE_GLOBAL` writes the
+/// value directly into `w_globals`, bypassing `w_locals`.  Delegates to
+/// the interpreter trait impl (`eval.rs store_global_value`), which
+/// routes through `w_dict_setitem_str` on the eagerly-resolved
+/// `w_globals_obj` (or the back-mirror dict storage when null).  Same
+/// blackhole-only execution contract and `w_name` ABI as
+/// `bh_store_name_fn`.  `STORE_GLOBAL` carries no nameindex-keyed cache,
+/// so the trait's `nameindex` argument is passed as 0.  Returns 1 on
+/// success; on error it sets `BH_LAST_EXC_VALUE` and returns 0.
+pub extern "C" fn bh_store_global_fn(frame_ptr: i64, w_name: i64, value: i64) -> i64 {
+    use pyre_interpreter::pyopcode::NamespaceOpcodeHandler;
+    assert!(
+        frame_ptr != 0,
+        "bh_store_global_fn requires a non-null PyFrame; every STORE_GLOBAL emit \
+         site must thread portal_frame_reg as the leading ref operand"
+    );
+    let frame = unsafe { &mut *(frame_ptr as *mut PyFrame) };
+    let name =
+        unsafe { pyre_object::strobject::w_str_get_value(w_name as pyre_object::PyObjectRef) };
+    match frame.store_global_value(name, 0, value as pyre_object::PyObjectRef) {
+        Ok(()) => 1,
+        Err(err) => {
+            let exc_obj = err.to_exc_object();
+            majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc_obj as i64));
+            0
+        }
+    }
+}
+
 /// Load a constant from the code object.
 /// jtransform.py parity: code comes from getfield_vable_r(frame, pycode).
 pub extern "C" fn bh_load_const_fn(w_code_ptr: i64, consti: i64) -> i64 {

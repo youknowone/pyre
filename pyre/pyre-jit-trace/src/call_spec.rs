@@ -128,6 +128,13 @@ pub const PYFRAME_CALL_EFFECTS: &[CallEffectSpec] = &[
     },
     CallEffectSpec {
         target: CallTargetSpec::Method {
+            name: "store_global_value",
+            receiver_root: PYFRAME_CALL_OWNER_ROOT,
+        },
+        effect: CallEffectKind::Residual,
+    },
+    CallEffectSpec {
+        target: CallTargetSpec::Method {
             name: "load_name",
             receiver_root: PYFRAME_CALL_OWNER_ROOT,
         },
@@ -411,6 +418,10 @@ pub const PYFRAME_CALL_EFFECTS: &[CallEffectSpec] = &[
     },
     CallEffectSpec {
         target: CallTargetSpec::FunctionPath(&["opcode_store_name"]),
+        effect: CallEffectKind::Residual,
+    },
+    CallEffectSpec {
+        target: CallTargetSpec::FunctionPath(&["opcode_store_global"]),
         effect: CallEffectKind::Residual,
     },
     CallEffectSpec {
