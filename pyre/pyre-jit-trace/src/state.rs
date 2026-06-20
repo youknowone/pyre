@@ -5309,6 +5309,52 @@ fn reconstruct_inline_recipe(
         return None;
     }
 
+    // The recipe banks are written and read by the register COLOR reported in
+    // the liveness stream (`registers_r[reg_idx]` below), but every consumer
+    // indexes by the SEMANTIC `locals_cells_stack_w` slot: the trait re-trace's
+    // `load_local_value` reads `registers_r[local_idx]` (trace_opcode.rs:2360)
+    // and `stack_slot_reg_idx` reads `registers_r[nlocals + stack_idx]`
+    // (trace_opcode.rs:628), and `assemble_bridge_inline_pending` reads
+    // `concrete_r[k]` by semantic slot k. This recipe is therefore only valid
+    // when each live color equals the semantic slot it denotes (color ==
+    // semantic). Regalloc pins that identity at call-boundary resume pcs (a
+    // straight-line callee resumes after its CALL with locals at colors
+    // `0..nlocals`), but a MID-BODY resume — e.g. a guard fired inside a
+    // callee branch (`goto_if_not` target) — coalesces colors so the live
+    // stack value sits at a renamed color the static `stack_slot_color_map`
+    // no longer matches. Faithfully rebuilding that frame needs a per-pc
+    // color→semantic map the metadata does not carry, so decline to the
+    // single-frame bridge (whose vable payload IS semantic-ordered) rather
+    // than rebuild the frame with mis-slotted boxes. Identity is checked via
+    // the same `semantic_ref_slot_for_reg_color` rule the encoder mirrors.
+    let local_color_map = local_slot_color_map_at(frame.jitcode_index);
+    let stack_color_map = stack_slot_color_map_at(frame.jitcode_index);
+    let stack_only = match crate::liveness::liveness_for(raw_code).stack_depth_at(frame.pc as usize)
+    {
+        Some(d) => d,
+        None => return None,
+    };
+    let live_local_indices: Vec<usize> = (0..nlocals)
+        .filter(|&idx| crate::liveness::liveness_for(raw_code).is_local_live(frame.pc as usize, idx))
+        .collect();
+    for &color in &reg_indices.ref_ {
+        match semantic_ref_slot_for_reg_color(
+            nlocals,
+            stack_only,
+            &local_color_map,
+            &stack_color_map,
+            &live_local_indices,
+            color as usize,
+        ) {
+            // color == semantic slot: the recipe's color-indexed fill is
+            // also the correct semantic fill.
+            Some(semantic_idx) if semantic_idx == color as usize => {}
+            // A live color whose semantic slot differs (or is unmappable):
+            // the color-indexed recipe would mis-slot it. Decline.
+            _ => return None,
+        }
+    }
+
     let mut registers_i: Vec<OpRef> = Vec::new();
     let mut registers_r: Vec<OpRef> = Vec::new();
     let mut registers_f: Vec<OpRef> = Vec::new();
