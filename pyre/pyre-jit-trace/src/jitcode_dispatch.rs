@@ -11558,6 +11558,110 @@ fn allocate_callee_register_banks(
     (regs_r, regs_i, regs_f, concrete_r, concrete_i)
 }
 
+/// Seed a callee jitcode's register banks with positional args and walk
+/// its body, returning the callee's terminal [`DispatchOutcome`]
+/// (`SubReturn` / `SubRaise` / `Terminate` / `SwitchToBlackhole`).
+///
+/// Shared descent core of the `inline_call_*` handlers
+/// ([`dispatch_inline_call_dr_kind`], `_dir`, `_dirf`) — they read the
+/// callee index + arglists from the caller bytecode, then delegate the
+/// bank allocation, arity check, arg seeding, sub-`WalkContext`
+/// construction, and `walk()` to here. A trace-time specialization can
+/// also call this directly to synthesize a descent into a charon helper
+/// body (e.g. `w_list_append`), passing args it already holds rather
+/// than reading them from bytecode.
+///
+/// `pc` is the caller-site pc, used only for arity-mismatch error
+/// reporting. An empty arg slice for an unused bank passes its arity
+/// check trivially. The callee runs with `is_top_level == false` and
+/// inherits the caller's descr pool + sub-jitcode lookup (RPython
+/// `pyjitpl.py:230-260 setup_call(argboxes_i, argboxes_r, argboxes_f)`).
+/// Only Ref-bank concrete shadows are seeded — matching the
+/// `inline_call_*` handlers, which thread `ref_arg_concretes` but no
+/// Int/Float concrete shadows across the frame boundary.
+fn run_sub_jitcode_walk(
+    ctx: &mut WalkContext<'_, '_>,
+    pc: usize,
+    sub_body: &SubJitCodeBody,
+    int_args: &[OpRef],
+    ref_args: &[OpRef],
+    ref_arg_concretes: &[ConcreteValue],
+    float_args: &[OpRef],
+) -> Result<DispatchOutcome, DispatchError> {
+    let (
+        mut callee_regs_r,
+        mut callee_regs_i,
+        mut callee_regs_f,
+        mut callee_concrete_r,
+        mut callee_concrete_i,
+    ) = allocate_callee_register_banks(sub_body, ctx.trace_ctx);
+
+    if int_args.len() > sub_body.num_regs_i {
+        return Err(DispatchError::InlineCallIntArityMismatch {
+            pc,
+            provided: int_args.len(),
+            callee_num_regs_i: sub_body.num_regs_i,
+        });
+    }
+    if ref_args.len() > sub_body.num_regs_r {
+        return Err(DispatchError::InlineCallArityMismatch {
+            pc,
+            provided: ref_args.len(),
+            callee_num_regs_r: sub_body.num_regs_r,
+        });
+    }
+    if float_args.len() > sub_body.num_regs_f {
+        return Err(DispatchError::InlineCallFloatArityMismatch {
+            pc,
+            provided: float_args.len(),
+            callee_num_regs_f: sub_body.num_regs_f,
+        });
+    }
+    for (i, arg) in int_args.iter().enumerate() {
+        callee_regs_i[i] = *arg;
+    }
+    for (i, arg) in ref_args.iter().enumerate() {
+        callee_regs_r[i] = *arg;
+    }
+    for (i, arg) in float_args.iter().enumerate() {
+        callee_regs_f[i] = *arg;
+    }
+    for (i, concrete) in ref_arg_concretes.iter().enumerate() {
+        callee_concrete_r[i] = *concrete;
+    }
+
+    let (callee_outcome, _callee_end_pc) = {
+        let mut sub_wc = WalkContext {
+            registers_r: &mut callee_regs_r,
+            registers_i: &mut callee_regs_i,
+            registers_f: &mut callee_regs_f,
+            concrete_registers_r: &mut callee_concrete_r,
+            concrete_registers_i: &mut callee_concrete_i,
+            descr_refs: ctx.descr_refs,
+            raw_descrs: ctx.raw_descrs,
+            is_authoritative_executor: ctx.is_authoritative_executor,
+            is_full_body_walk: ctx.is_full_body_walk,
+            trace_ctx: ctx.trace_ctx,
+            done_with_this_frame_descr_ref: ctx.done_with_this_frame_descr_ref.clone(),
+            done_with_this_frame_descr_int: ctx.done_with_this_frame_descr_int.clone(),
+            done_with_this_frame_descr_float: ctx.done_with_this_frame_descr_float.clone(),
+            done_with_this_frame_descr_void: ctx.done_with_this_frame_descr_void.clone(),
+            exit_frame_with_exception_descr_ref: ctx.exit_frame_with_exception_descr_ref.clone(),
+            is_top_level: false,
+            sub_jitcode_lookup: ctx.sub_jitcode_lookup,
+            last_exc_value: None,
+            last_exc_value_concrete: ConcreteValue::Null,
+            entry_py_pc: ctx.entry_py_pc,
+            outer_jitcode_index: ctx.outer_jitcode_index,
+            outer_active_boxes: ctx.outer_active_boxes.clone(),
+            store_subscr_fn_addr: ctx.store_subscr_fn_addr,
+            pending_guard_snapshot_error: None,
+        };
+        walk(sub_body.code, 0, &mut sub_wc)?
+    };
+    Ok(callee_outcome)
+}
+
 /// Operand layout `dR>X`:
 ///   2B descr index + 1B varlen + N×1B Ref args + 1B `>X` dst.
 ///
@@ -11600,57 +11704,7 @@ fn dispatch_inline_call_dr_kind(
     let (args, arg_width) = read_ref_var_list(code, op, 2, ctx)?;
     let arg_concretes = read_ref_var_list_concrete(code, op, 2, ctx);
 
-    let (
-        mut callee_regs_r,
-        mut callee_regs_i,
-        mut callee_regs_f,
-        mut callee_concrete_r,
-        mut callee_concrete_i,
-    ) = allocate_callee_register_banks(&sub_body, ctx.trace_ctx);
-
-    if args.len() > sub_body.num_regs_r {
-        return Err(DispatchError::InlineCallArityMismatch {
-            pc: op.pc,
-            provided: args.len(),
-            callee_num_regs_r: sub_body.num_regs_r,
-        });
-    }
-    for (i, arg) in args.iter().enumerate() {
-        callee_regs_r[i] = *arg;
-    }
-    for (i, concrete) in arg_concretes.iter().enumerate() {
-        callee_concrete_r[i] = *concrete;
-    }
-
-    let (callee_outcome, _callee_end_pc) = {
-        let mut sub_wc = WalkContext {
-            registers_r: &mut callee_regs_r,
-            registers_i: &mut callee_regs_i,
-            registers_f: &mut callee_regs_f,
-            concrete_registers_r: &mut callee_concrete_r,
-            concrete_registers_i: &mut callee_concrete_i,
-            descr_refs: ctx.descr_refs,
-            raw_descrs: ctx.raw_descrs,
-            is_authoritative_executor: ctx.is_authoritative_executor,
-            is_full_body_walk: ctx.is_full_body_walk,
-            trace_ctx: ctx.trace_ctx,
-            done_with_this_frame_descr_ref: ctx.done_with_this_frame_descr_ref.clone(),
-            done_with_this_frame_descr_int: ctx.done_with_this_frame_descr_int.clone(),
-            done_with_this_frame_descr_float: ctx.done_with_this_frame_descr_float.clone(),
-            done_with_this_frame_descr_void: ctx.done_with_this_frame_descr_void.clone(),
-            exit_frame_with_exception_descr_ref: ctx.exit_frame_with_exception_descr_ref.clone(),
-            is_top_level: false,
-            sub_jitcode_lookup: ctx.sub_jitcode_lookup,
-            last_exc_value: None,
-            last_exc_value_concrete: ConcreteValue::Null,
-            entry_py_pc: ctx.entry_py_pc,
-            outer_jitcode_index: ctx.outer_jitcode_index,
-            outer_active_boxes: ctx.outer_active_boxes.clone(),
-            store_subscr_fn_addr: ctx.store_subscr_fn_addr,
-            pending_guard_snapshot_error: None,
-        };
-        walk(sub_body.code, 0, &mut sub_wc)?
-    };
+    let callee_outcome = run_sub_jitcode_walk(ctx, op.pc, &sub_body, &[], &args, &arg_concretes, &[])?;
 
     match callee_outcome {
         DispatchOutcome::SubReturn {
@@ -11788,67 +11842,8 @@ fn dispatch_inline_call_dir_kind(
     let (ref_args, ref_width) = read_ref_var_list(code, op, 2 + int_width, ctx)?;
     let ref_arg_concretes = read_ref_var_list_concrete(code, op, 2 + int_width, ctx);
 
-    let (
-        mut callee_regs_r,
-        mut callee_regs_i,
-        mut callee_regs_f,
-        mut callee_concrete_r,
-        mut callee_concrete_i,
-    ) = allocate_callee_register_banks(&sub_body, ctx.trace_ctx);
-
-    if int_args.len() > sub_body.num_regs_i {
-        return Err(DispatchError::InlineCallIntArityMismatch {
-            pc: op.pc,
-            provided: int_args.len(),
-            callee_num_regs_i: sub_body.num_regs_i,
-        });
-    }
-    if ref_args.len() > sub_body.num_regs_r {
-        return Err(DispatchError::InlineCallArityMismatch {
-            pc: op.pc,
-            provided: ref_args.len(),
-            callee_num_regs_r: sub_body.num_regs_r,
-        });
-    }
-    for (i, arg) in int_args.iter().enumerate() {
-        callee_regs_i[i] = *arg;
-    }
-    for (i, arg) in ref_args.iter().enumerate() {
-        callee_regs_r[i] = *arg;
-    }
-    for (i, concrete) in ref_arg_concretes.iter().enumerate() {
-        callee_concrete_r[i] = *concrete;
-    }
-
-    let (callee_outcome, _callee_end_pc) = {
-        let mut sub_wc = WalkContext {
-            registers_r: &mut callee_regs_r,
-            registers_i: &mut callee_regs_i,
-            registers_f: &mut callee_regs_f,
-            concrete_registers_r: &mut callee_concrete_r,
-            concrete_registers_i: &mut callee_concrete_i,
-            descr_refs: ctx.descr_refs,
-            raw_descrs: ctx.raw_descrs,
-            is_authoritative_executor: ctx.is_authoritative_executor,
-            is_full_body_walk: ctx.is_full_body_walk,
-            trace_ctx: ctx.trace_ctx,
-            done_with_this_frame_descr_ref: ctx.done_with_this_frame_descr_ref.clone(),
-            done_with_this_frame_descr_int: ctx.done_with_this_frame_descr_int.clone(),
-            done_with_this_frame_descr_float: ctx.done_with_this_frame_descr_float.clone(),
-            done_with_this_frame_descr_void: ctx.done_with_this_frame_descr_void.clone(),
-            exit_frame_with_exception_descr_ref: ctx.exit_frame_with_exception_descr_ref.clone(),
-            is_top_level: false,
-            sub_jitcode_lookup: ctx.sub_jitcode_lookup,
-            last_exc_value: None,
-            last_exc_value_concrete: ConcreteValue::Null,
-            entry_py_pc: ctx.entry_py_pc,
-            outer_jitcode_index: ctx.outer_jitcode_index,
-            outer_active_boxes: ctx.outer_active_boxes.clone(),
-            store_subscr_fn_addr: ctx.store_subscr_fn_addr,
-            pending_guard_snapshot_error: None,
-        };
-        walk(sub_body.code, 0, &mut sub_wc)?
-    };
+    let callee_outcome =
+        run_sub_jitcode_walk(ctx, op.pc, &sub_body, &int_args, &ref_args, &ref_arg_concretes, &[])?;
 
     match callee_outcome {
         DispatchOutcome::SubReturn {
@@ -11971,77 +11966,15 @@ fn dispatch_inline_call_dirf_kind(
     let ref_arg_concretes = read_ref_var_list_concrete(code, op, 2 + int_width, ctx);
     let (float_args, float_width) = read_float_var_list(code, op, 2 + int_width + ref_width, ctx)?;
 
-    let (
-        mut callee_regs_r,
-        mut callee_regs_i,
-        mut callee_regs_f,
-        mut callee_concrete_r,
-        mut callee_concrete_i,
-    ) = allocate_callee_register_banks(&sub_body, ctx.trace_ctx);
-
-    if int_args.len() > sub_body.num_regs_i {
-        return Err(DispatchError::InlineCallIntArityMismatch {
-            pc: op.pc,
-            provided: int_args.len(),
-            callee_num_regs_i: sub_body.num_regs_i,
-        });
-    }
-    if ref_args.len() > sub_body.num_regs_r {
-        return Err(DispatchError::InlineCallArityMismatch {
-            pc: op.pc,
-            provided: ref_args.len(),
-            callee_num_regs_r: sub_body.num_regs_r,
-        });
-    }
-    if float_args.len() > sub_body.num_regs_f {
-        return Err(DispatchError::InlineCallFloatArityMismatch {
-            pc: op.pc,
-            provided: float_args.len(),
-            callee_num_regs_f: sub_body.num_regs_f,
-        });
-    }
-    for (i, arg) in int_args.iter().enumerate() {
-        callee_regs_i[i] = *arg;
-    }
-    for (i, arg) in ref_args.iter().enumerate() {
-        callee_regs_r[i] = *arg;
-    }
-    for (i, arg) in float_args.iter().enumerate() {
-        callee_regs_f[i] = *arg;
-    }
-    for (i, concrete) in ref_arg_concretes.iter().enumerate() {
-        callee_concrete_r[i] = *concrete;
-    }
-
-    let (callee_outcome, _callee_end_pc) = {
-        let mut sub_wc = WalkContext {
-            registers_r: &mut callee_regs_r,
-            registers_i: &mut callee_regs_i,
-            registers_f: &mut callee_regs_f,
-            concrete_registers_r: &mut callee_concrete_r,
-            concrete_registers_i: &mut callee_concrete_i,
-            descr_refs: ctx.descr_refs,
-            raw_descrs: ctx.raw_descrs,
-            is_authoritative_executor: ctx.is_authoritative_executor,
-            is_full_body_walk: ctx.is_full_body_walk,
-            trace_ctx: ctx.trace_ctx,
-            done_with_this_frame_descr_ref: ctx.done_with_this_frame_descr_ref.clone(),
-            done_with_this_frame_descr_int: ctx.done_with_this_frame_descr_int.clone(),
-            done_with_this_frame_descr_float: ctx.done_with_this_frame_descr_float.clone(),
-            done_with_this_frame_descr_void: ctx.done_with_this_frame_descr_void.clone(),
-            exit_frame_with_exception_descr_ref: ctx.exit_frame_with_exception_descr_ref.clone(),
-            is_top_level: false,
-            sub_jitcode_lookup: ctx.sub_jitcode_lookup,
-            last_exc_value: None,
-            last_exc_value_concrete: ConcreteValue::Null,
-            entry_py_pc: ctx.entry_py_pc,
-            outer_jitcode_index: ctx.outer_jitcode_index,
-            outer_active_boxes: ctx.outer_active_boxes.clone(),
-            store_subscr_fn_addr: ctx.store_subscr_fn_addr,
-            pending_guard_snapshot_error: None,
-        };
-        walk(sub_body.code, 0, &mut sub_wc)?
-    };
+    let callee_outcome = run_sub_jitcode_walk(
+        ctx,
+        op.pc,
+        &sub_body,
+        &int_args,
+        &ref_args,
+        &ref_arg_concretes,
+        &float_args,
+    )?;
 
     match callee_outcome {
         DispatchOutcome::SubReturn {
