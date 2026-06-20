@@ -4292,6 +4292,33 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
+                // `<String>::deref` / `<str>::deref` and the Wtf8 string
+                // family: a `Deref` between two string-value types is a
+                // pointer-follow with no transformation.  `String` / `&str`
+                // / `Wtf8` / `Wtf8Buf` all project to the single immutable
+                // `s_unicode0` value, so the deref is identity — alias the
+                // destination to the argument directly (the same zero-op
+                // shape as the reflexive `into` above) instead of falling
+                // through to the residual `method("deref", …)` build, an
+                // unregistered callee.  `deref_cast_root` returns `None` for
+                // these (the `&str` dest resolves no struct root), so the
+                // cast arm below declines; gate on the receiver AND the
+                // destination both being string values so slice / `Vec`
+                // derefs (`&[T]`, root `Builtin::Slice`) keep their ordinary
+                // path.
+                if args.len() == 1
+                    && is_deref_call(&reg, self.llbc)
+                    && first_arg_ty
+                        .as_ref()
+                        .is_some_and(|t| tyref_is_string_value(t, self.llbc))
+                    && tyref_is_string_value(&call.dest.ty, self.llbc)
+                {
+                    self.local_var[dest_local] = Some(args[0].clone());
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
                 // `<Box<T>>::deref` / `<Rc<T>>::deref` / `<Arc<T>>::deref`
                 // / the workspace `FrameBox::deref` (+ their `deref_mut`)
                 // whose `&T` is a registered struct.  The handle is one
@@ -8449,6 +8476,50 @@ fn tyref_strips_to_str(ty: &TyRef, llbc: &Llbc) -> bool {
         .and_then(|id| id.get("Builtin"))
         .and_then(serde_json::Value::as_str)
         == Some("Str")
+}
+
+/// Whether a `TyRef` resolves (behind `Ref` / dedup wrappers) to a
+/// string-family value: the `alloc::string::String` ADT, the
+/// `rustpython_wtf8` `Wtf8` / `Wtf8Buf` wrappers, or the `{Builtin: "Str"}`
+/// node (the bare `str` deref destination).  All four project to the
+/// single immutable `s_unicode0` value, so a `deref` between any two of
+/// them is value-identity.
+fn tyref_is_string_value(ty: &TyRef, llbc: &Llbc) -> bool {
+    let Some(node) = tyref_node(ty, llbc).and_then(|n| strip_ty_wrappers(n, llbc)) else {
+        return false;
+    };
+    // `{Builtin: "Str"}` — the bare `str` value (no ADT def-id).
+    if node
+        .get("Adt")
+        .and_then(|a| a.get("id"))
+        .and_then(|id| id.get("Builtin"))
+        .and_then(serde_json::Value::as_str)
+        == Some("Str")
+    {
+        return true;
+    }
+    // Named string ADTs: `alloc::string::String` and the WTF-8 wrappers.
+    adt_node_def_id(node)
+        .and_then(|id| llbc.type_by_id(id))
+        .is_some_and(|td| {
+            let np = td.item_meta.name_path();
+            np == "alloc::string::String"
+                || matches!(np.rsplit("::").next(), Some("Wtf8" | "Wtf8Buf"))
+        })
+}
+
+/// Whether `reg` resolves to a `Deref::deref` / `DerefMut::deref_mut`
+/// leaf, by the callee's `name_path` suffix.  Unlike `deref_cast_root`
+/// this makes no claim about the dereferenced type — the caller pairs it
+/// with a `tyref_is_string_value` receiver / dest gate.
+fn is_deref_call(reg: &RegularCall, llbc: &Llbc) -> bool {
+    let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+        return false;
+    };
+    llbc.fn_by_id(*id).is_some_and(|fd| {
+        let np = fd.item_meta.name_path();
+        np.ends_with("::deref") || np.ends_with("::deref_mut")
+    })
 }
 
 /// The qualified declaration path of a `TyRef`'s base ADT, after
