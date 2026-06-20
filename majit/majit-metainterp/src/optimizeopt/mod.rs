@@ -8125,37 +8125,47 @@ impl OptContext {
             let field_descr = ensure_field_descr_arc
                 .as_field_descr()
                 .expect("ensure_ptr_info_arg0: field op without FieldDescr");
-            // optimizer.py:479-484: parent_descr.is_object() decides Instance vs Struct.
-            let parent_descr = field_descr.get_parent_descr().unwrap_or_else(|| {
-                panic!(
-                    "ensure_ptr_info_arg0: FieldDescr.get_parent_descr() returned None \
-                     for opcode={:?} descr={:?} field_name={:?} index_in_parent={} \
-                     offset={} field_type={:?}; the FieldDescr implementation must \
-                     override get_parent_descr() for parity with optimizer.py:478",
-                    op.opcode,
-                    op.getdescr(),
-                    field_descr.field_name(),
-                    field_descr.index_in_parent(),
-                    field_descr.offset(),
-                    field_descr.field_type(),
-                )
-            });
-            let is_object = parent_descr
-                .as_size_descr()
-                .expect(
-                    "ensure_ptr_info_arg0: FieldDescr.get_parent_descr() must point at a SizeDescr",
-                )
-                .is_object();
-            let mut new_info = if is_object {
-                PtrInfo::instance(Some(parent_descr.clone()), None)
+            if field_descr.is_w_class() {
+                // The `w_class`/typeptr header carries class identity, not a
+                // value field, so it has no parent SizeDescr. arg0 is just a
+                // non-null instance with no known layout — the same PtrInfo
+                // GUARD_CLASS builds (optimizer.py:488-489). OptVirtualize folds
+                // this read for virtuals (virtualize.rs `is_w_class`); a
+                // non-virtual heap object's `__class__` read reaches here.
+                PtrInfo::instance(None, None)
             } else {
-                PtrInfo::struct_ptr(parent_descr.clone())
-            };
-            // optimizer.py:484: opinfo.init_fields(parent_descr, descr.get_index())
-            // info.py:180-188 init_fields(parent_descr, index) sets self.descr
-            // and pre-allocates _fields by parent slot count.
-            new_info.init_fields(parent_descr, field_descr.index_in_parent());
-            new_info
+                // optimizer.py:479-484: parent_descr.is_object() decides Instance vs Struct.
+                let parent_descr = field_descr.get_parent_descr().unwrap_or_else(|| {
+                    panic!(
+                        "ensure_ptr_info_arg0: FieldDescr.get_parent_descr() returned None \
+                         for opcode={:?} descr={:?} field_name={:?} index_in_parent={} \
+                         offset={} field_type={:?}; the FieldDescr implementation must \
+                         override get_parent_descr() for parity with optimizer.py:478",
+                        op.opcode,
+                        op.getdescr(),
+                        field_descr.field_name(),
+                        field_descr.index_in_parent(),
+                        field_descr.offset(),
+                        field_descr.field_type(),
+                    )
+                });
+                let is_object = parent_descr
+                    .as_size_descr()
+                    .expect(
+                        "ensure_ptr_info_arg0: FieldDescr.get_parent_descr() must point at a SizeDescr",
+                    )
+                    .is_object();
+                let mut new_info = if is_object {
+                    PtrInfo::instance(Some(parent_descr.clone()), None)
+                } else {
+                    PtrInfo::struct_ptr(parent_descr.clone())
+                };
+                // optimizer.py:484: opinfo.init_fields(parent_descr, descr.get_index())
+                // info.py:180-188 init_fields(parent_descr, index) sets self.descr
+                // and pre-allocates _fields by parent slot count.
+                new_info.init_fields(parent_descr, field_descr.index_in_parent());
+                new_info
+            }
         } else if op.opcode.is_getarrayitem()
             || op.opcode == OpCode::SetarrayitemGc
             || op.opcode == OpCode::ArraylenGc
