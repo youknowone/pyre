@@ -2494,6 +2494,40 @@ pub fn getdict(obj: PyObjectRef) -> PyObjectRef {
     }
 }
 
+/// `__slots__` storage fallback for a native-layout subclass instance.
+///
+/// A `W_Member` slot normally reads/writes the receiver's mapdict slot
+/// storage (`MapdictSlotsSupport`), which only a `W_InstanceObject` carries.
+/// A subclass of a builtin type with a fixed Rust payload (e.g. a subclass
+/// of `array.array`) keeps that native layout and has no mapdict, so the
+/// slot is instead backed by the instance `__dict__` — the same side table
+/// (`mapdict::INSTANCE_DICT`) that already holds the subclass's regular
+/// attributes. `None`/`false` means the receiver has no writable dict.
+pub(crate) fn native_slot_get(obj: PyObjectRef, name: &str) -> Option<PyObjectRef> {
+    let w_dict = getdict(obj);
+    if w_dict.is_null() {
+        return None;
+    }
+    unsafe { pyre_object::dictmultiobject::w_dict_getitem_str(w_dict, name) }
+}
+
+pub(crate) fn native_slot_set(obj: PyObjectRef, name: &str, value: PyObjectRef) -> bool {
+    let w_dict = getdict(obj);
+    if w_dict.is_null() {
+        return false;
+    }
+    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str(w_dict, name, value) };
+    true
+}
+
+pub(crate) fn native_slot_del(obj: PyObjectRef, name: &str) -> bool {
+    let w_dict = getdict(obj);
+    if w_dict.is_null() {
+        return false;
+    }
+    unsafe { pyre_object::dictmultiobject::w_dict_delitem_str(w_dict, name) }
+}
+
 /// interpreter/baseobjspace.py:70-73 W_Root.setdict(space, w_dict).
 ///
 /// ```python
@@ -6215,7 +6249,12 @@ pub(crate) unsafe fn get(
         }
         // typedef.py:511: w_result = w_obj.getslotvalue(self.index)
         let index = pyre_object::w_member_get_index(descr);
-        let found = crate::objspace::std::mapdict::getslotvalue(obj, index);
+        let found = if is_instance(obj) {
+            crate::objspace::std::mapdict::getslotvalue(obj, index)
+        } else {
+            // Native-layout subclass instance — slot backed by __dict__.
+            native_slot_get(obj, pyre_object::w_member_get_name(descr))
+        };
         // typedef.py:512-516: if w_result is None: raise
         // AttributeError("'%T' object has no attribute '%s'")
         if found.is_none() {
@@ -6293,7 +6332,22 @@ unsafe fn set(
         }
         // typedef.py:522: w_obj.setslotvalue(self.index, w_value)
         let index = pyre_object::w_member_get_index(descr);
-        crate::objspace::std::mapdict::setslotvalue(obj, index, value);
+        if is_instance(obj) {
+            crate::objspace::std::mapdict::setslotvalue(obj, index, value);
+        } else {
+            // Native-layout subclass instance — slot backed by __dict__.
+            let slot_name = pyre_object::w_member_get_name(descr);
+            if !native_slot_set(obj, slot_name, value) {
+                return Err(crate::PyError::new(
+                    crate::PyErrorKind::AttributeError,
+                    format!(
+                        "'{}' object attribute '{}' is read-only",
+                        (*(*obj).ob_type).name,
+                        slot_name,
+                    ),
+                ));
+            }
+        }
         return Ok(true);
     }
 
@@ -6347,7 +6401,12 @@ unsafe fn delete(descr: PyObjectRef, obj: PyObjectRef) -> Result<(), crate::PyEr
         }
         // typedef.py:527-531: success = w_obj.delslotvalue(self.index)
         let index = pyre_object::w_member_get_index(descr);
-        let removed = crate::objspace::std::mapdict::delslotvalue(obj, index);
+        let removed = if is_instance(obj) {
+            crate::objspace::std::mapdict::delslotvalue(obj, index)
+        } else {
+            // Native-layout subclass instance — slot backed by __dict__.
+            native_slot_del(obj, pyre_object::w_member_get_name(descr))
+        };
         if !removed {
             let slot_name = pyre_object::w_member_get_name(descr);
             return Err(crate::PyError::new(

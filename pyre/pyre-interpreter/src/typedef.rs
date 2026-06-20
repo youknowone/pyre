@@ -6336,7 +6336,11 @@ fn init_member_descriptor_type(ns: &mut DictStorage) {
             // None → AttributeError("'%T' object has no attribute '%s'").
             let slot_name = unsafe { pyre_object::w_member_get_name(descr) };
             let index = unsafe { pyre_object::w_member_get_index(descr) };
-            let found = unsafe { crate::objspace::std::mapdict::getslotvalue(obj, index) };
+            let found = if unsafe { pyre_object::is_instance(obj) } {
+                unsafe { crate::objspace::std::mapdict::getslotvalue(obj, index) }
+            } else {
+                crate::baseobjspace::native_slot_get(obj, slot_name)
+            };
             match found {
                 Some(v) => Ok(v),
                 None => Err(crate::PyError::new(
@@ -6379,7 +6383,21 @@ fn init_member_descriptor_type(ns: &mut DictStorage) {
             }
             // typedef.py:522: w_obj.setslotvalue(self.index, w_value)
             let index = unsafe { pyre_object::w_member_get_index(descr) };
-            unsafe { crate::objspace::std::mapdict::setslotvalue(obj, index, value) };
+            if unsafe { pyre_object::is_instance(obj) } {
+                unsafe { crate::objspace::std::mapdict::setslotvalue(obj, index, value) };
+            } else {
+                let slot_name = unsafe { pyre_object::w_member_get_name(descr) };
+                if !crate::baseobjspace::native_slot_set(obj, slot_name, value) {
+                    return Err(crate::PyError::new(
+                        crate::PyErrorKind::AttributeError,
+                        format!(
+                            "'{}' object attribute '{}' is read-only",
+                            unsafe { (*(*obj).ob_type).name },
+                            slot_name,
+                        ),
+                    ));
+                }
+            }
             Ok(pyre_object::w_none())
         }),
     );
@@ -6412,7 +6430,11 @@ fn init_member_descriptor_type(ns: &mut DictStorage) {
             // typedef.py:527-531: success = w_obj.delslotvalue(self.index)
             let slot_name = unsafe { pyre_object::w_member_get_name(descr) };
             let index = unsafe { pyre_object::w_member_get_index(descr) };
-            let removed = unsafe { crate::objspace::std::mapdict::delslotvalue(obj, index) };
+            let removed = if unsafe { pyre_object::is_instance(obj) } {
+                unsafe { crate::objspace::std::mapdict::delslotvalue(obj, index) }
+            } else {
+                crate::baseobjspace::native_slot_del(obj, slot_name)
+            };
             if !removed {
                 return Err(crate::PyError::new(
                     crate::PyErrorKind::AttributeError,
