@@ -635,12 +635,12 @@ pub fn binary_slice_values(
             let s = if pyre_object::is_none(start) {
                 0
             } else {
-                pyre_object::w_int_get_value(start)
+                crate::sliceobject::eval_slice_index(start)?
             };
             let e = if pyre_object::is_none(stop) {
                 len
             } else {
-                pyre_object::w_int_get_value(stop)
+                crate::sliceobject::eval_slice_index(stop)?
             };
             let s = if s < 0 { (len + s).max(0) } else { s.min(len) } as usize;
             let e = if e < 0 { (len + e).max(0) } else { e.min(len) } as usize;
@@ -662,12 +662,12 @@ pub fn binary_slice_values(
             let s = if pyre_object::is_none(start) {
                 0
             } else {
-                pyre_object::w_int_get_value(start)
+                crate::sliceobject::eval_slice_index(start)?
             };
             let e = if pyre_object::is_none(stop) {
                 len
             } else {
-                pyre_object::w_int_get_value(stop)
+                crate::sliceobject::eval_slice_index(stop)?
             };
             let s = if s < 0 { (len + s).max(0) } else { s.min(len) } as usize;
             let e = (if e < 0 { (len + e).max(0) } else { e.min(len) } as usize).max(s);
@@ -680,12 +680,12 @@ pub fn binary_slice_values(
             let s = if pyre_object::is_none(start) {
                 0
             } else {
-                pyre_object::w_int_get_value(start)
+                crate::sliceobject::eval_slice_index(start)?
             };
             let e = if pyre_object::is_none(stop) {
                 len
             } else {
-                pyre_object::w_int_get_value(stop)
+                crate::sliceobject::eval_slice_index(stop)?
             };
             let s = if s < 0 { (len + s).max(0) } else { s.min(len) } as usize;
             let e = if e < 0 { (len + e).max(0) } else { e.min(len) } as usize;
