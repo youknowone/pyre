@@ -1907,6 +1907,129 @@ fn rtyper_verbose_enabled() -> bool {
     std::env::var_os("PYRE_RTYPER_VERBOSE").is_some_and(|v| v == "1")
 }
 
+/// Map a captured prepass failure reason to its orthodox-disposition
+/// bucket — the named [`is_known_unported`] category (or, for the
+/// FunctionPath-not-registered family, the unregistered callee's nature)
+/// whose port closes it. Turns the opaque "two-phase Skip" count into a
+/// ranked, finite legacy-walker-deletion worklist: each bucket names a
+/// concrete piece of work (port a Repr, lower a construct in `front::mir`,
+/// residual-ize a helper, specialize a generic ADT).
+fn classify_unported_reason(reason: &str) -> &'static str {
+    // ── rtyper-stage named gaps (most specific first) ──
+    if reason.contains("rtyper_makerepr — port") {
+        "REPR-PORT (rlist/rdict/robject/iterator)"
+    } else if reason.contains("cannot unify instances with no common base class")
+        || reason.contains("don't know how to convert from")
+    {
+        "GENERIC-ADT-SPECIALIZE (per-instantiation classdef)"
+    } else if reason.contains("rtype_cast_ptr_to_int")
+        || reason.contains("is of instances of the non-pointers")
+        || reason.contains("noneify() not supported")
+    {
+        "FRONTEND-TYPED-PTR (address-of-local / host-static / null)"
+    } else if reason.contains("Call with CallTarget::Indirect") {
+        "DYN-TRAIT-INDIRECT (lower_indirect_calls)"
+    } else if reason.contains("no upstream pair(s1, s2).union() handler") {
+        "UNION-PAIR-PORT"
+    } else if reason.contains("rbase missing") {
+        "REPR-SETUP-ORDER (call_all_setups)"
+    } else if reason.contains("calltable row not found in CallFamily") {
+        "RPBC-CALLFAMILY (seeded-method registration)"
+    } else if reason.contains("InstanceRepr.convert_const") {
+        "FIELD-PROJECTION (typed-Ref field rows)"
+    } else if reason.contains("MissingRTypeAttribute")
+        || reason.contains("Cannot find attribute ")
+        || reason.contains("classdef-less instance")
+    {
+        "CLASSDEF-LESS-INSTANCE (typed-Ref ClassDef)"
+    } else if reason.contains("KeyError: no binding for arg")
+        || reason.contains("inputarg lacks annotation")
+        || (reason.contains("variable ") && reason.contains(" used before definition"))
+    {
+        "ANNOTATION-SLOT-GAP (cross-block threading)"
+    }
+    // ── FunctionPath-not-registered family, split by callee nature ──
+    else if reason.contains("not registered in PyreCallRegistry")
+        || reason.contains("translate_op")
+        || reason.contains("cachedgraph")
+    {
+        if reason.contains("core::ptr")
+            || reason.contains("from_raw_parts")
+            || reason.contains("box_assume_init")
+            || reason.contains("mut_ptr")
+            || reason.contains("const_ptr")
+        {
+            "FRONTEND-RAWPTR (raw_store/raw_load op)"
+        } else if reason.contains("GcType")
+            || reason.contains("type_id")
+            || reason.contains("__dyn_call")
+        {
+            "FRONTEND-VTABLE (gc_id / indirect_call)"
+        } else if reason.contains("SHADOW_STACK")
+            || reason.contains("TL_")
+            || reason.contains("TYPEOBJECT_CACHE")
+            || reason.contains("W_TYPE_TYPEOBJECT")
+            || reason.contains("CALL_DEPTH")
+            || reason.contains("PENDING_EXCEPTION")
+        {
+            "FRONTEND-THREADLOCAL/ONCELOCK (threadlocalref_get)"
+        } else if reason.contains("into_iter")
+            || reason.contains("reverse")
+            || reason.contains("chars")
+            || reason.contains("::iter")
+        {
+            "FRONTEND-ITERATOR (Vec-as-array / next protocol)"
+        } else if reason.contains("bigint")
+            || reason.contains("malachite")
+            || reason.contains("indexmap")
+            || reason.contains("IndexMap")
+        {
+            "RESIDUAL-FOREIGN (dont_look_inside + fnaddr)"
+        } else if (reason.contains("bool") && reason.contains("then"))
+            || reason.contains("filter")
+            || reason.contains("FnMut")
+            || reason.contains("FnOnce")
+        {
+            "RESIDUAL-CLOSURE (dont_look_inside)"
+        } else {
+            "FUNCPATH-OTHER (registry / residual)"
+        }
+    }
+    // ── annotator-stage catch-alls ──
+    else if reason.contains("UnionError") {
+        "UNION-ERROR (generic-ADT phi / pair)"
+    } else if reason.contains("Blocked block -- operation cannot succeed") {
+        "BLOCKED-BLOCK (annotation dead-end downstream)"
+    } else if reason.contains("compute_at_fixpoint failed")
+        || reason.contains("complete_pending_blocks failed")
+        || reason.contains("AnnotatorError")
+    {
+        "ANNOTATOR-FIXPOINT-OTHER (no inner cause surfaced)"
+    } else {
+        "UNCLASSIFIED"
+    }
+}
+
+/// Print a sorted disposition histogram for a prepass phase's failures
+/// (`PYRE_RTYPER_VERBOSE`). The ranked buckets are the legacy-walker
+/// deletion worklist; as each disposition's port lands its bucket shrinks.
+fn emit_disposition_histogram(phase: &str, reasons: &[String]) {
+    let mut counts: std::collections::BTreeMap<&'static str, usize> =
+        std::collections::BTreeMap::new();
+    for r in reasons {
+        *counts.entry(classify_unported_reason(r)).or_insert(0) += 1;
+    }
+    let mut rows: Vec<(&'static str, usize)> = counts.into_iter().collect();
+    rows.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+    eprintln!(
+        "[PREPASS histogram {phase}] {} failures by orthodox disposition:",
+        reasons.len()
+    );
+    for (cat, n) in rows {
+        eprintln!("[PREPASS histogram {phase}]   {n:>4}  {cat}");
+    }
+}
+
 fn run_two_phase_prepass_inner(
     call_registry: &PyreCallRegistry,
     candidate_graphs: &HashSet<crate::parse::CallPath>,
@@ -1922,6 +2045,7 @@ fn run_two_phase_prepass_inner(
     paths.sort_by_key(|p| p.canonical_key());
 
     // ── Phase A — annotate-all over the portal closure ───────────────
+    let mut phase_a_reasons: Vec<String> = Vec::new();
     for path in &paths {
         let Some(legacy) = function_graphs.get(path) else {
             continue;
@@ -1964,6 +2088,7 @@ fn run_two_phase_prepass_inner(
                         Ok(Ok(_)) => unreachable!(),
                     };
                     eprintln!("[PREPASS phaseA fail] {:?}: {reason}", path);
+                    phase_a_reasons.push(reason);
                 }
                 // Annotate-half failed (or panicked): repair shared-callee state
                 // and leave the graph uncached so publish Skips it to the legacy
@@ -1978,6 +2103,10 @@ fn run_two_phase_prepass_inner(
                 }));
             }
         }
+    }
+
+    if rtyper_verbose_enabled() {
+        emit_disposition_histogram("phaseA", &phase_a_reasons);
     }
 
     // ── compute_at_fixpoint runs per-subject inside drive_subject's
@@ -2007,6 +2136,7 @@ fn run_phase_b_rtype_isolated(
     let Ok((annotator, rtyper)) = call_registry.ensure_session() else {
         return;
     };
+    let mut phase_b_reasons: Vec<String> = Vec::new();
     loop {
         // Skip-tolerant repr setup: a single unported repr (e.g. DictRepr)
         // must not abort rtyping of every other annotated graph. The graph
@@ -2069,6 +2199,7 @@ fn run_phase_b_rtype_isolated(
                             "[PREPASS phaseB fail] {:?}: {reason}",
                             gopt.as_ref().map(GraphKey::of)
                         );
+                        phase_b_reasons.push(reason);
                     }
                     match &gopt {
                         Some(g) => {
@@ -2099,6 +2230,9 @@ fn run_phase_b_rtype_isolated(
                 }
             }
         }
+    }
+    if rtyper_verbose_enabled() {
+        emit_disposition_histogram("phaseB", &phase_b_reasons);
     }
     // MixLevelHelperAnnotator drain (rtyper.py:238-241) is a no-op while R4 is
     // unported — specialize_block never queues helper graphs today. When R4
