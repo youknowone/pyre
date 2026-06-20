@@ -358,7 +358,12 @@ impl Snapshot {
             frames
                 .into_iter()
                 .map(|(jitcode_index, pc, boxes)| {
-                    (jitcode_index, pc, majit_ir::resumedata::NO_JITCODE_PC, boxes)
+                    (
+                        jitcode_index,
+                        pc,
+                        majit_ir::resumedata::NO_JITCODE_PC,
+                        boxes,
+                    )
                 })
                 .collect(),
         )
@@ -4773,10 +4778,17 @@ mod tests {
         let mut memo = ResumeDataLoopMemo::new();
         let env = SimpleBoxEnv::new();
         let snapshot = Snapshot::multi_frame_boxes_with_jitcode_pc(vec![
-            (0, 10, majit_ir::resumedata::NO_JITCODE_PC, vec![OpRef::int_op(1).into()]),
+            (
+                0,
+                10,
+                majit_ir::resumedata::NO_JITCODE_PC,
+                vec![OpRef::int_op(1).into()],
+            ),
             (1, 20, 55, vec![OpRef::int_op(2).into()]),
         ]);
-        let items = crate::resumecode::unpack_all(&memo.number(&snapshot, &env, -1).unwrap().create_numbering());
+        let items = crate::resumecode::unpack_all(
+            &memo.number(&snapshot, &env, -1).unwrap().create_numbering(),
+        );
         // Frame 0: items[4]=jitcode(0) items[5]=pc(10) items[6]=jitcode_pc(sentinel) items[7]=box
         assert_eq!(items[4], 0);
         assert_eq!(items[5], 10);

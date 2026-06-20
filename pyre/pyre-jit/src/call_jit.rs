@@ -1497,32 +1497,30 @@ pub fn blackhole_resume_via_rd_numb(
 
     // resume.py:1339 jitcodes[jitcode_pos]: resolve jitcode_index + pc
     // through the trace-side MetaInterpStaticData.jitcodes store.
-    let resolve_jitcode = |jitcode_index: i32,
-                           pc: i32,
-                           carried_jitcode_pc: i32|
-     -> Option<resume::ResolvedJitCode> {
-        if pc < 0 {
-            return None;
-        }
-        let pyjitcode = pyre_jit_trace::state::pyjitcode_for_jitcode_index(jitcode_index)?;
-        if pyjitcode.has_abort_opcode() {
-            return None;
-        }
-        let op_live = pyre_jit_trace::state::blackhole_control_opcodes().0 as u8;
-        let resolved_pc =
-            pyjitcode.resolve_resume_pc_with_jitcode_pc(pc, carried_jitcode_pc, op_live)?;
-        // resume.py:1339 reads from one `jitcodes[]` store.  pyre's
-        // `state::code_for_jitcode_index` indices name the runtime
-        // `MetaInterpStaticData.jitcodes` table keyed by CodeObject; they
-        // are not the same index space as `jitcode_runtime::ALL_JITCODES`
-        // (build-time opcode-dispatch artifacts).  Do not cross-lookup the
-        // canonical store by `jitcode_index` until pyre actually shares a
-        // single JitCode object graph end-to-end.
-        Some(
-            resume::ResolvedJitCode::new(pyjitcode.jitcode.clone(), resolved_pc)
-                .with_virtualizable_stack_base(pyjitcode.metadata.stack_base),
-        )
-    };
+    let resolve_jitcode =
+        |jitcode_index: i32, pc: i32, carried_jitcode_pc: i32| -> Option<resume::ResolvedJitCode> {
+            if pc < 0 {
+                return None;
+            }
+            let pyjitcode = pyre_jit_trace::state::pyjitcode_for_jitcode_index(jitcode_index)?;
+            if pyjitcode.has_abort_opcode() {
+                return None;
+            }
+            let op_live = pyre_jit_trace::state::blackhole_control_opcodes().0 as u8;
+            let resolved_pc =
+                pyjitcode.resolve_resume_pc_with_jitcode_pc(pc, carried_jitcode_pc, op_live)?;
+            // resume.py:1339 reads from one `jitcodes[]` store.  pyre's
+            // `state::code_for_jitcode_index` indices name the runtime
+            // `MetaInterpStaticData.jitcodes` table keyed by CodeObject; they
+            // are not the same index space as `jitcode_runtime::ALL_JITCODES`
+            // (build-time opcode-dispatch artifacts).  Do not cross-lookup the
+            // canonical store by `jitcode_index` until pyre actually shares a
+            // single JitCode object graph end-to-end.
+            Some(
+                resume::ResolvedJitCode::new(pyjitcode.jitcode.clone(), resolved_pc)
+                    .with_virtualizable_stack_base(pyjitcode.metadata.stack_base),
+            )
+        };
 
     // resume.py:983-991 _prepare_virtuals: convert RdVirtualInfo → VirtualInfo
     // for lazy materialization in getvirtual_ptr/getvirtual_int.

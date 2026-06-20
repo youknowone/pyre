@@ -6205,19 +6205,21 @@ impl OptContext {
             for (i, &size) in sizes.iter().enumerate() {
                 let end = (offset + size).min(snapshot_boxes.len());
                 let frame_boxes: Vec<SnapshotBox> = snapshot_boxes[offset..end].to_vec();
-                let (jitcode_index, pc, jitcode_pc) = frame_pcs
-                    .get(i)
-                    .copied()
-                    .unwrap_or((0, 0, majit_ir::resumedata::NO_JITCODE_PC));
+                let (jitcode_index, pc, jitcode_pc) = frame_pcs.get(i).copied().unwrap_or((
+                    0,
+                    0,
+                    majit_ir::resumedata::NO_JITCODE_PC,
+                ));
                 frames.push((jitcode_index, pc, jitcode_pc, frame_boxes));
                 offset = end;
             }
             Snapshot::multi_frame_boxes_with_jitcode_pc(frames)
         } else {
-            let (jitcode_index, pc, jitcode_pc) = frame_pcs
-                .first()
-                .copied()
-                .unwrap_or((0, 0, majit_ir::resumedata::NO_JITCODE_PC));
+            let (jitcode_index, pc, jitcode_pc) =
+                frame_pcs
+                    .first()
+                    .copied()
+                    .unwrap_or((0, 0, majit_ir::resumedata::NO_JITCODE_PC));
             Snapshot::single_frame_boxes_with_jitcode_pc(
                 jitcode_index,
                 pc,

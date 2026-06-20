@@ -3759,8 +3759,18 @@ pub fn collect_iterable(obj: PyObjectRef) -> Result<Vec<PyObjectRef>, crate::PyE
 /// Create a `set` from a slice of elements.
 ///
 /// PyPy: `setobject.py` W_SetObject.descr_init → `_initialize_set`.
+/// Each `add` hashes the element through `space.hash_w`, so an unhashable
+/// one (or a raising / `None` / non-int `__hash__`) raises. Build the set
+/// element-by-element so the first such element surfaces in left-to-right
+/// order before it is stored; `w_set_add` keeps the `dict_keys_equal`
+/// dedup, and the hash itself is not used for storage.
 pub fn builtin_set_from_items(items: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    Ok(pyre_object::w_set_from_items(items))
+    let set = pyre_object::w_set_new();
+    for &item in items {
+        try_hash_value(item)?;
+        unsafe { pyre_object::w_set_add(set, item) };
+    }
+    Ok(set)
 }
 
 /// `dict()` — PyPy: dictobject.py W_DictMultiObject.descr_init

@@ -2257,43 +2257,42 @@ impl<S: JitState> JitDriver<S> {
                 let last_resolved: std::cell::RefCell<
                     Option<std::sync::Arc<majit_metainterp::JitCode>>,
                 > = std::cell::RefCell::new(None);
-                let resolve_jitcode =
-                    |jitcode_index: i32,
-                     pc: i32,
-                     _carried_jitcode_pc: i32|
-                     -> Option<crate::resume::ResolvedJitCode> {
-                        let resolved_jitcode = if last_resolved.borrow().is_none() {
-                            // Root frame: clone the dispatch JitCode
-                            // singleton registered at install time
-                            // (`register_dispatch_jitcode`).  Returns
-                            // None only when the proc-macro lowerer
-                            // rejected the dispatch body shape and
-                            // install skipped registration.
-                            dispatch_jitcode.as_ref()?.clone()
-                        } else {
-                            // Sub-frame: index into the parent's
-                            // `descrs` array.  Mirrors RPython
-                            // `BC_INLINE_CALL` operand decoding
-                            // (`blackhole.py:150-157`) where the `j`
-                            // argcode resolves through `descrs[idx]`.
-                            let parent = last_resolved
-                                .borrow()
-                                .as_ref()
-                                .expect("parent exists")
-                                .clone();
-                            parent
-                                .exec
-                                .descrs
-                                .get(jitcode_index as usize)
-                                .and_then(crate::jitcode::RuntimeBhDescr::as_jitcode)?
-                                .clone()
-                        };
-                        *last_resolved.borrow_mut() = Some(resolved_jitcode.clone());
-                        Some(crate::resume::ResolvedJitCode::new(
-                            resolved_jitcode,
-                            pc as usize,
-                        ))
+                let resolve_jitcode = |jitcode_index: i32,
+                                       pc: i32,
+                                       _carried_jitcode_pc: i32|
+                 -> Option<crate::resume::ResolvedJitCode> {
+                    let resolved_jitcode = if last_resolved.borrow().is_none() {
+                        // Root frame: clone the dispatch JitCode
+                        // singleton registered at install time
+                        // (`register_dispatch_jitcode`).  Returns
+                        // None only when the proc-macro lowerer
+                        // rejected the dispatch body shape and
+                        // install skipped registration.
+                        dispatch_jitcode.as_ref()?.clone()
+                    } else {
+                        // Sub-frame: index into the parent's
+                        // `descrs` array.  Mirrors RPython
+                        // `BC_INLINE_CALL` operand decoding
+                        // (`blackhole.py:150-157`) where the `j`
+                        // argcode resolves through `descrs[idx]`.
+                        let parent = last_resolved
+                            .borrow()
+                            .as_ref()
+                            .expect("parent exists")
+                            .clone();
+                        parent
+                            .exec
+                            .descrs
+                            .get(jitcode_index as usize)
+                            .and_then(crate::jitcode::RuntimeBhDescr::as_jitcode)?
+                            .clone()
                     };
+                    *last_resolved.borrow_mut() = Some(resolved_jitcode.clone());
+                    Some(crate::resume::ResolvedJitCode::new(
+                        resolved_jitcode,
+                        pc as usize,
+                    ))
+                };
 
                 let fallback_alloc = crate::resume::NullAllocator;
                 let allocator: &dyn crate::resume::BlackholeAllocator = self
@@ -4191,38 +4190,37 @@ impl<S: JitState> JitDriver<S> {
                 let last_resolved: std::cell::RefCell<
                     Option<std::sync::Arc<majit_metainterp::JitCode>>,
                 > = std::cell::RefCell::new(None);
-                let resolve_jitcode =
-                    |jitcode_index: i32,
-                     pc: i32,
-                     _carried_jitcode_pc: i32|
-                     -> Option<crate::resume::ResolvedJitCode> {
-                        let resolved_jitcode = if last_resolved.borrow().is_none() {
-                            // Root frame: clone the dispatch JitCode
-                            // singleton registered at install time
-                            // (`register_dispatch_jitcode`).  Returns
-                            // None only when the proc-macro lowerer
-                            // rejected the dispatch body shape and
-                            // install skipped registration.
-                            dispatch_jitcode.as_ref()?.clone()
-                        } else {
-                            let parent = last_resolved
-                                .borrow()
-                                .as_ref()
-                                .expect("parent exists")
-                                .clone();
-                            parent
-                                .exec
-                                .descrs
-                                .get(jitcode_index as usize)
-                                .and_then(crate::jitcode::RuntimeBhDescr::as_jitcode)?
-                                .clone()
-                        };
-                        *last_resolved.borrow_mut() = Some(resolved_jitcode.clone());
-                        Some(crate::resume::ResolvedJitCode::new(
-                            resolved_jitcode,
-                            pc as usize,
-                        ))
+                let resolve_jitcode = |jitcode_index: i32,
+                                       pc: i32,
+                                       _carried_jitcode_pc: i32|
+                 -> Option<crate::resume::ResolvedJitCode> {
+                    let resolved_jitcode = if last_resolved.borrow().is_none() {
+                        // Root frame: clone the dispatch JitCode
+                        // singleton registered at install time
+                        // (`register_dispatch_jitcode`).  Returns
+                        // None only when the proc-macro lowerer
+                        // rejected the dispatch body shape and
+                        // install skipped registration.
+                        dispatch_jitcode.as_ref()?.clone()
+                    } else {
+                        let parent = last_resolved
+                            .borrow()
+                            .as_ref()
+                            .expect("parent exists")
+                            .clone();
+                        parent
+                            .exec
+                            .descrs
+                            .get(jitcode_index as usize)
+                            .and_then(crate::jitcode::RuntimeBhDescr::as_jitcode)?
+                            .clone()
                     };
+                    *last_resolved.borrow_mut() = Some(resolved_jitcode.clone());
+                    Some(crate::resume::ResolvedJitCode::new(
+                        resolved_jitcode,
+                        pc as usize,
+                    ))
+                };
 
                 let fallback_alloc = crate::resume::NullAllocator;
                 let allocator: &dyn crate::resume::BlackholeAllocator = self
