@@ -506,6 +506,10 @@ fn dispatch_rtype_op(
         // checkidx=False branch (bare getarrayitem); the negative-index and
         // checkidx branches surface a TyperError until those helpers land.
         (FixedSizeListRepr, IntegerRepr, "getitem") => committed(r1.rtype_getitem(hop)),
+        // rlist.py:245-267 — the resized ListRepr shares the dispatch but
+        // reads through the `items` array out of its `length`/`items`
+        // header struct (getfield "items" → getarrayitem).
+        (ListRepr, IntegerRepr, "getitem") => committed(r1.rtype_getitem(hop)),
         // rrange.py:34-50 — pair(AbstractRangeRepr, IntegerRepr).rtype_getitem.
         // RangeRepr handles the constant-step + nonneg + dum_nocheck branch
         // (start + index*step); the checkidx, negative-index, and
@@ -599,6 +603,10 @@ fn dispatch_rtype_op(
         // setarrayitem); the checkidx (IndexError) and negative-index
         // branches surface a TyperError until those helpers land.
         (FixedSizeListRepr, IntegerRepr, "setitem") => committed(r1.rtype_setitem(hop)),
+        // rlist.py:272-284 — the resized ListRepr shares the dispatch but
+        // reads through the `items` array out of its `length`/`items`
+        // header struct (getfield "items" → setarrayitem).
+        (ListRepr, IntegerRepr, "setitem") => committed(r1.rtype_setitem(hop)),
 
         // rptr.py:165-184 — pointer comparison accepts any repr on the
         // other side and coerces both args to the pointer repr.

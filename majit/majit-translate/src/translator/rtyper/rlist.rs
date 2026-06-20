@@ -387,7 +387,6 @@ pub struct ListRepr {
     lltype: LowLevelType,
     /// `self.item_repr` (`rlist.py:111`) — the internal (gcref-wrapped)
     /// element repr.
-    #[allow(dead_code)]
     item_repr: Arc<dyn Repr>,
 }
 
@@ -462,6 +461,134 @@ impl Repr for ListRepr {
             },
         )?;
         hop.gendirectcall(&helper, vlist)
+    }
+
+    /// RPython `pair(AbstractBaseListRepr, IntegerRepr).rtype_getitem`
+    /// (`rlist.py:247-267`) for the resized list. Shares the dispatch with
+    /// [`FixedSizeListRepr::rtype_getitem`] (nonneg + `dum_nocheck` fast
+    /// path, `ll_getitem_nonneg` → `l.ll_getitem_fast(index)`), but the
+    /// resized receiver is the `Ptr(GcStruct("list", length, items))`
+    /// header, so `ll_getitem_fast` (`lltypesystem/rlist.py:259-262`) reads
+    /// the `items` array out of the struct first
+    /// (`l.ll_items()[index]` = `getfield(l, "items")` then
+    /// `getarrayitem`). The negative-index (`ll_getitem`) and `checkidx`
+    /// (IndexError-raising) branches surface a `TyperError` until those
+    /// helpers land.
+    ///
+    /// The upstream result `recast` (`rlist.py:266`) is omitted for the
+    /// same reason as `FixedSizeListRepr`: `ListRepr::new` keeps only the
+    /// internal `item_repr`, an identity recast for the primitive items a
+    /// live subject builds today. A GC-instance list (`external !=
+    /// internal`) is deferred to the #305 `external_item_repr` slice.
+    fn rtype_getitem(&self, hop: &HighLevelOp) -> RTypeResult {
+        use crate::annotator::model::SomeValue;
+        if hop.has_implicit_exception("IndexError") {
+            return Err(TyperError::message(
+                "list rtype_getitem: checkidx IndexError branch not yet ported",
+            ));
+        }
+        let s1 = hop
+            .args_s
+            .borrow()
+            .get(1)
+            .cloned()
+            .ok_or_else(|| TyperError::message("list rtype_getitem: args_s[1] missing"))?;
+        let nonneg = match &s1 {
+            SomeValue::Integer(i) => i.nonneg,
+            other => {
+                return Err(TyperError::message(format!(
+                    "list rtype_getitem: args_s[1] must be SomeInteger, got {other:?}"
+                )));
+            }
+        };
+        if !nonneg {
+            return Err(TyperError::message(
+                "list rtype_getitem: negative-index ll_getitem branch not yet ported",
+            ));
+        }
+        let args = hop.inputargs(vec![
+            ConvertedTo::Repr(self),
+            ConvertedTo::LowLevelType(&LowLevelType::Signed),
+        ])?;
+        hop.exception_cannot_occur()?;
+        let item_lltype = self.item_repr.lowleveltype().clone();
+        let ptr_lltype = self.lltype.clone();
+        let ptr_for_builder = ptr_lltype.clone();
+        let item_for_builder = item_lltype.clone();
+        let helper = hop.rtyper.lowlevel_helper_function_with_builder(
+            "ll_getitem_fast".to_string(),
+            vec![ptr_lltype, LowLevelType::Signed],
+            item_lltype,
+            move |_rtyper, _args, _result| {
+                build_ll_getitem_fast_helper_graph(
+                    "ll_getitem_fast",
+                    ptr_for_builder.clone(),
+                    item_for_builder.clone(),
+                )
+            },
+        )?;
+        hop.gendirectcall(&helper, args)
+    }
+
+    /// RPython `pair(AbstractBaseListRepr, IntegerRepr).rtype_setitem`
+    /// (`rlist.py:272-284`) for the resized list. Shares the dispatch with
+    /// [`FixedSizeListRepr::rtype_setitem`] (nonneg + `dum_nocheck`,
+    /// `ll_setitem_nonneg` → `l.ll_setitem_fast(index, item)`), but the
+    /// resized receiver reads the `items` array out of the
+    /// `Ptr(GcStruct("list", length, items))` header first
+    /// (`lltypesystem/rlist.py:264-267` `l.ll_items()[index] = item` =
+    /// `getfield(l, "items")` then `setarrayitem`). The `checkidx`
+    /// (implicit-IndexError) and negative-index (`ll_setitem`) branches
+    /// surface a `TyperError` until those helpers land.
+    fn rtype_setitem(&self, hop: &HighLevelOp) -> RTypeResult {
+        use crate::annotator::model::SomeValue;
+        if hop.has_implicit_exception("IndexError") {
+            return Err(TyperError::message(
+                "list rtype_setitem: checkidx IndexError branch not yet ported",
+            ));
+        }
+        let s1 = hop
+            .args_s
+            .borrow()
+            .get(1)
+            .cloned()
+            .ok_or_else(|| TyperError::message("list rtype_setitem: args_s[1] missing"))?;
+        let nonneg = match &s1 {
+            SomeValue::Integer(i) => i.nonneg,
+            other => {
+                return Err(TyperError::message(format!(
+                    "list rtype_setitem: args_s[1] must be SomeInteger, got {other:?}"
+                )));
+            }
+        };
+        if !nonneg {
+            return Err(TyperError::message(
+                "list rtype_setitem: negative-index ll_setitem branch not yet ported",
+            ));
+        }
+        let args = hop.inputargs(vec![
+            ConvertedTo::Repr(self),
+            ConvertedTo::LowLevelType(&LowLevelType::Signed),
+            ConvertedTo::Repr(self.item_repr.as_ref()),
+        ])?;
+        hop.exception_is_here()?;
+        let item_lltype = self.item_repr.lowleveltype().clone();
+        let ptr_lltype = self.lltype.clone();
+        let ptr_for_builder = ptr_lltype.clone();
+        let item_for_builder = item_lltype.clone();
+        let helper = hop.rtyper.lowlevel_helper_function_with_builder(
+            "ll_setitem_fast".to_string(),
+            vec![ptr_lltype, LowLevelType::Signed, item_lltype],
+            LowLevelType::Void,
+            move |_rtyper, _args, _result| {
+                build_ll_setitem_fast_helper_graph(
+                    "ll_setitem_fast",
+                    ptr_for_builder.clone(),
+                    item_for_builder.clone(),
+                )
+            },
+        )?;
+        hop.gendirectcall(&helper, args)
     }
 }
 
@@ -611,6 +738,149 @@ pub(crate) fn build_ll_fixed_setitem_fast_helper_graph(
         "setarrayitem",
         vec![
             Hlvalue::Variable(l_arg),
+            Hlvalue::Variable(index_arg),
+            Hlvalue::Variable(item_arg),
+        ],
+        Hlvalue::Variable(v_void),
+    ));
+    let none_const = Hlvalue::Constant(Constant::with_concretetype(
+        ConstValue::None,
+        LowLevelType::Void,
+    ));
+    startblock.closeblock(vec![
+        Link::new(vec![none_const], Some(graph.returnblock.clone()), None).into_ref(),
+    ]);
+
+    let func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(
+        graph,
+        vec!["l".to_string(), "index".to_string(), "item".to_string()],
+        func,
+    ))
+}
+
+/// Synthesise the resized-list `ll_getitem_fast`
+/// (`lltypesystem/rlist.py:259-262`):
+///
+/// ```python
+/// def ll_getitem_fast(l, index):
+///     ll_assert(index < l.ll_length(), "getitem out of bounds")
+///     return l.ll_items()[index]
+/// ```
+///
+/// The `ll_assert` is a debug-only bound check (no production op). Unlike
+/// [`build_ll_fixed_getitem_fast_helper_graph`] (whose receiver IS the
+/// `Ptr(GcArray)`), the resized receiver is the
+/// `Ptr(GcStruct("list", length, items))` header, so the body reads the
+/// `items` array out of the struct first: `getfield(l, "items")` →
+/// `getarrayitem(items, index) -> ITEM`.
+pub(crate) fn build_ll_getitem_fast_helper_graph(
+    name: &str,
+    ptr_lltype: LowLevelType,
+    item_lltype: LowLevelType,
+) -> Result<PyGraph, TyperError> {
+    let l_arg = variable_with_lltype("l", ptr_lltype);
+    let index_arg = variable_with_lltype("index", LowLevelType::Signed);
+    let startblock = Block::shared(vec![
+        Hlvalue::Variable(l_arg.clone()),
+        Hlvalue::Variable(index_arg.clone()),
+    ]);
+    let return_var = variable_with_lltype("result", item_lltype.clone());
+    let mut graph = FunctionGraph::with_return_var(
+        name.to_string(),
+        startblock.clone(),
+        Hlvalue::Variable(return_var),
+    );
+
+    let items_ptr_lltype = LowLevelType::Ptr(Box::new(Ptr {
+        TO: PtrTarget::Array(ArrayType::gc(item_lltype.clone())),
+    }));
+    let v_items = variable_with_lltype("items", items_ptr_lltype);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "getfield",
+        vec![Hlvalue::Variable(l_arg), void_field_const("items")],
+        Hlvalue::Variable(v_items.clone()),
+    ));
+    let v_item = variable_with_lltype("item", item_lltype);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "getarrayitem",
+        vec![Hlvalue::Variable(v_items), Hlvalue::Variable(index_arg)],
+        Hlvalue::Variable(v_item.clone()),
+    ));
+    startblock.closeblock(vec![
+        Link::new(
+            vec![Hlvalue::Variable(v_item)],
+            Some(graph.returnblock.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    let func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(
+        graph,
+        vec!["l".to_string(), "index".to_string()],
+        func,
+    ))
+}
+
+/// Synthesise the resized-list `ll_setitem_fast`
+/// (`lltypesystem/rlist.py:264-267`):
+///
+/// ```python
+/// def ll_setitem_fast(l, index, item):
+///     ll_assert(index < l.ll_length(), "setitem out of bounds")
+///     l.ll_items()[index] = item
+/// ```
+///
+/// The `ll_assert` is a debug-only bound check (no production op). The
+/// resized receiver reads the `items` array out of the
+/// `Ptr(GcStruct("list", length, items))` header first:
+/// `getfield(l, "items")` → `setarrayitem(items, index, item)`. The
+/// function falls off the end (`return None`), so the returnblock receives
+/// the `Void` `None` constant.
+pub(crate) fn build_ll_setitem_fast_helper_graph(
+    name: &str,
+    ptr_lltype: LowLevelType,
+    item_lltype: LowLevelType,
+) -> Result<PyGraph, TyperError> {
+    let l_arg = variable_with_lltype("l", ptr_lltype);
+    let index_arg = variable_with_lltype("index", LowLevelType::Signed);
+    let item_arg = variable_with_lltype("item", item_lltype.clone());
+    let startblock = Block::shared(vec![
+        Hlvalue::Variable(l_arg.clone()),
+        Hlvalue::Variable(index_arg.clone()),
+        Hlvalue::Variable(item_arg.clone()),
+    ]);
+    let return_var = variable_with_lltype("result", LowLevelType::Void);
+    let mut graph = FunctionGraph::with_return_var(
+        name.to_string(),
+        startblock.clone(),
+        Hlvalue::Variable(return_var),
+    );
+
+    let items_ptr_lltype = LowLevelType::Ptr(Box::new(Ptr {
+        TO: PtrTarget::Array(ArrayType::gc(item_lltype)),
+    }));
+    let v_items = variable_with_lltype("items", items_ptr_lltype);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "getfield",
+        vec![Hlvalue::Variable(l_arg), void_field_const("items")],
+        Hlvalue::Variable(v_items.clone()),
+    ));
+    let v_void = variable_with_lltype("v", LowLevelType::Void);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "setarrayitem",
+        vec![
+            Hlvalue::Variable(v_items),
             Hlvalue::Variable(index_arg),
             Hlvalue::Variable(item_arg),
         ],
@@ -1071,5 +1341,209 @@ mod tests {
             Some(item_repr),
         ]);
         assert!(list_repr.rtype_setitem(&hop).is_err());
+    }
+
+    /// rlist.py:247-267 nonneg + checkidx=False branch — `getitem` on a
+    /// resized `ListRepr` lowers to a `direct_call` of `ll_getitem_fast`
+    /// (the resized helper, distinct from `FixedSizeListRepr`'s
+    /// `ll_fixed_getitem_fast`), preceded by `hop.exception_cannot_occur()`.
+    #[test]
+    fn resized_list_getitem_nonneg_emits_direct_call_to_ll_getitem_fast() {
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = std::rc::Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata in test setup");
+
+        let list_repr: Arc<ListRepr> = Arc::new(
+            ListRepr::new(&rtyper, signed_repr() as Arc<dyn Repr>).expect("ListRepr::new"),
+        );
+        let list_lltype = list_repr.lowleveltype().clone();
+
+        let llops = std::rc::Rc::new(std::cell::RefCell::new(LowLevelOpList::new(
+            rtyper.clone(),
+            None,
+        )));
+        let v_list = Variable::new();
+        v_list.set_concretetype(Some(list_lltype));
+        let v_idx = Variable::new();
+        v_idx.set_concretetype(Some(LowLevelType::Signed));
+        let v_result = Variable::new();
+        v_result.set_concretetype(Some(LowLevelType::Signed));
+        let hop = HighLevelOp::new(
+            rtyper.clone(),
+            SpaceOperation::new(
+                "getitem".to_string(),
+                vec![Hlvalue::Variable(v_list), Hlvalue::Variable(v_idx)],
+                Hlvalue::Variable(v_result),
+            ),
+            Vec::new(),
+            llops.clone(),
+        );
+        hop.args_v.borrow_mut().extend(hop.spaceop.args.clone());
+        hop.args_s.borrow_mut().extend([
+            SomeValue::List(SomeList::new(ListDef::new(
+                None,
+                SomeValue::Integer(SomeInteger::new(false, false)),
+                /* mutated */ false,
+                /* resized */ true,
+            ))),
+            SomeValue::Integer(SomeInteger::new(/* nonneg */ true, false)),
+        ]);
+        hop.args_r.borrow_mut().extend([
+            Some(list_repr.clone() as Arc<dyn Repr>),
+            Some(signed_repr() as Arc<dyn Repr>),
+        ]);
+
+        let result = list_repr
+            .rtype_getitem(&hop)
+            .unwrap_or_else(|err| panic!("resized list getitem nonneg: {err:?}"));
+        assert!(matches!(result, Some(Hlvalue::Variable(_))));
+        let ops = llops.borrow();
+        assert_eq!(ops.ops.len(), 1);
+        assert_eq!(ops.ops[0].opname, "direct_call");
+        assert!(
+            ops._called_exception_is_here_or_cannot_occur,
+            "checkidx=False path must call hop.exception_cannot_occur()"
+        );
+        let Hlvalue::Constant(c) = &ops.ops[0].args[0] else {
+            panic!("expected Constant funcptr as direct_call arg 0");
+        };
+        let dbg = format!("{:?}", c.value);
+        assert!(
+            dbg.contains("ll_getitem_fast"),
+            "expected 'll_getitem_fast' in {dbg}"
+        );
+    }
+
+    /// rlist.py:272-284 nonneg + dum_nocheck branch — `setitem` on a
+    /// resized `ListRepr` lowers to a `direct_call` of `ll_setitem_fast`
+    /// (the resized helper, distinct from `FixedSizeListRepr`'s
+    /// `ll_fixed_setitem_fast`), preceded by `hop.exception_is_here()`.
+    #[test]
+    fn resized_list_setitem_nonneg_emits_direct_call_to_ll_setitem_fast() {
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = std::rc::Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata in test setup");
+
+        let list_repr: Arc<ListRepr> = Arc::new(
+            ListRepr::new(&rtyper, signed_repr() as Arc<dyn Repr>).expect("ListRepr::new"),
+        );
+        let list_lltype = list_repr.lowleveltype().clone();
+        let item_repr = list_repr.item_repr.clone();
+
+        let llops = std::rc::Rc::new(std::cell::RefCell::new(LowLevelOpList::new(
+            rtyper.clone(),
+            None,
+        )));
+        let v_list = Variable::new();
+        v_list.set_concretetype(Some(list_lltype));
+        let v_idx = Variable::new();
+        v_idx.set_concretetype(Some(LowLevelType::Signed));
+        let v_item = Variable::new();
+        v_item.set_concretetype(Some(LowLevelType::Signed));
+        let v_result = Variable::new();
+        v_result.set_concretetype(Some(LowLevelType::Void));
+        let hop = HighLevelOp::new(
+            rtyper.clone(),
+            SpaceOperation::new(
+                "setitem".to_string(),
+                vec![
+                    Hlvalue::Variable(v_list),
+                    Hlvalue::Variable(v_idx),
+                    Hlvalue::Variable(v_item),
+                ],
+                Hlvalue::Variable(v_result),
+            ),
+            Vec::new(),
+            llops.clone(),
+        );
+        hop.args_v.borrow_mut().extend(hop.spaceop.args.clone());
+        hop.args_s.borrow_mut().extend([
+            SomeValue::List(SomeList::new(ListDef::new(
+                None,
+                SomeValue::Integer(SomeInteger::new(false, false)),
+                /* mutated */ true,
+                /* resized */ true,
+            ))),
+            SomeValue::Integer(SomeInteger::new(/* nonneg */ true, false)),
+            SomeValue::Integer(SomeInteger::new(false, false)),
+        ]);
+        hop.args_r.borrow_mut().extend([
+            Some(list_repr.clone() as Arc<dyn Repr>),
+            Some(signed_repr() as Arc<dyn Repr>),
+            Some(item_repr),
+        ]);
+
+        let result = list_repr
+            .rtype_setitem(&hop)
+            .unwrap_or_else(|err| panic!("resized list setitem nonneg: {err:?}"));
+        assert!(result.is_some());
+        let ops = llops.borrow();
+        assert_eq!(ops.ops.len(), 1);
+        assert_eq!(ops.ops[0].opname, "direct_call");
+        assert!(
+            ops._called_exception_is_here_or_cannot_occur,
+            "rtype_setitem must call hop.exception_is_here()"
+        );
+        let Hlvalue::Constant(c) = &ops.ops[0].args[0] else {
+            panic!("expected Constant funcptr as direct_call arg 0");
+        };
+        let dbg = format!("{:?}", c.value);
+        assert!(
+            dbg.contains("ll_setitem_fast"),
+            "expected 'll_setitem_fast' in {dbg}"
+        );
+    }
+
+    /// The resized `ll_getitem_fast` helper body reads the `items` array
+    /// out of the `length`/`items` header struct before indexing:
+    /// `getfield(l, "items")` → `getarrayitem(items, index)` (vs
+    /// `FixedSizeListRepr`'s single `getarrayitem` on the bare array).
+    #[test]
+    fn build_ll_getitem_fast_helper_reads_items_then_getarrayitem() {
+        let rtyper = fresh_rtyper();
+        let repr = ListRepr::new(&rtyper, signed_repr() as Arc<dyn Repr>).expect("ListRepr::new");
+        let pygraph = build_ll_getitem_fast_helper_graph(
+            "ll_getitem_fast",
+            repr.lowleveltype().clone(),
+            LowLevelType::Signed,
+        )
+        .expect("build_ll_getitem_fast_helper_graph");
+        let graph = pygraph.graph.borrow();
+        let ops: Vec<_> = graph
+            .startblock
+            .borrow()
+            .operations
+            .iter()
+            .map(|op| op.opname.clone())
+            .collect();
+        assert_eq!(ops, vec!["getfield", "getarrayitem"]);
+    }
+
+    /// The resized `ll_setitem_fast` helper body reads the `items` array
+    /// out of the `length`/`items` header struct before storing:
+    /// `getfield(l, "items")` → `setarrayitem(items, index, item)`.
+    #[test]
+    fn build_ll_setitem_fast_helper_reads_items_then_setarrayitem() {
+        let rtyper = fresh_rtyper();
+        let repr = ListRepr::new(&rtyper, signed_repr() as Arc<dyn Repr>).expect("ListRepr::new");
+        let pygraph = build_ll_setitem_fast_helper_graph(
+            "ll_setitem_fast",
+            repr.lowleveltype().clone(),
+            LowLevelType::Signed,
+        )
+        .expect("build_ll_setitem_fast_helper_graph");
+        let graph = pygraph.graph.borrow();
+        let ops: Vec<_> = graph
+            .startblock
+            .borrow()
+            .operations
+            .iter()
+            .map(|op| op.opname.clone())
+            .collect();
+        assert_eq!(ops, vec!["getfield", "setarrayitem"]);
     }
 }
