@@ -18,11 +18,6 @@ crate::py_module! {
         "_io_app.py" => ["BytesIO", "StringIO"],
     },
     functions: {
-        "FileIO"          / * = |_| Ok(w_none()),
-        "BufferedReader"  / * = |_| Ok(w_none()),
-        "BufferedWriter"  / * = |_| Ok(w_none()),
-        "BufferedRWPair"  / * = |_| Ok(w_none()),
-        "BufferedRandom"  / * = |_| Ok(w_none()),
         "IncrementalNewlineDecoder" / * = |_| Ok(w_none()),
         "open"            / * = crate::builtins::builtin_open,
         "open_code"       / * = |_| Ok(w_none()),
@@ -55,6 +50,8 @@ crate::py_module! {
 
         // Abstract base classes as W_TypeObject (required for io.py class inheritance).
         let obj_type = crate::typedef::w_object();
+        let mut io_base_types: std::collections::HashMap<&str, pyre_object::PyObjectRef> =
+            std::collections::HashMap::new();
         for name in &["_IOBase", "_RawIOBase", "_BufferedIOBase", "_TextIOBase"] {
             let t = pyre_object::w_type_new(
                 name,
@@ -63,6 +60,29 @@ crate::py_module! {
             );
             unsafe { pyre_object::w_type_set_mro(t, vec![t, obj_type]) };
             unsafe { pyre_object::typeobject::w_type_ready(t) };
+            io_base_types.insert(name, t);
+            crate::dict_storage_store(ns, name, t);
+        }
+
+        // Concrete stream classes as subclassable W_TypeObjects.  stdlib
+        // modules derive from them at import (`class ExFileObject(
+        // io.BufferedReader)` in tarfile, `class _MockRawIO(...)` in
+        // test_io), so they must be real types, not function stubs.
+        // `FileIO` derives from `_RawIOBase`; the buffered classes from
+        // `_BufferedIOBase` (`Modules/_io/_iomodule.c` PyInit__io).
+        for (name, base_name) in &[
+            ("FileIO", "_RawIOBase"),
+            ("BufferedReader", "_BufferedIOBase"),
+            ("BufferedWriter", "_BufferedIOBase"),
+            ("BufferedRWPair", "_BufferedIOBase"),
+            ("BufferedRandom", "_BufferedIOBase"),
+        ] {
+            let base = io_base_types[base_name];
+            let t = crate::typedef::make_builtin_type_with_base(name, |_ns| {}, base);
+            unsafe {
+                pyre_object::w_type_set_acceptable_as_base_class(t, true);
+                pyre_object::typeobject::w_type_set_hasdict(t, true);
+            }
             crate::dict_storage_store(ns, name, t);
         }
 
