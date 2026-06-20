@@ -12136,15 +12136,15 @@ fn handle(
                     branch_resume_target_stack_depth(other_target).is_some_and(|d| d > 0);
                 // #124 Approach B (M4): the kept-stack guard resumes precisely
                 // at its own JitCode pc through the M3 carrier
-                // (`BRANCH_GUARD_JITCODE_PC` → rd_numb → `setposition`), so
-                // when M3 is enabled the gate opens and the guard compiles
-                // instead of declining to the interpreter.  `PYRE_RELAX_124`
-                // is the standalone validation opener — it exercises the
-                // kept-stack recovery path against the #124 repros without the
-                // M3 decode.  With both off, production keeps the conservative
-                // decline (a guard-failure deopt at depth > 0 would restore a
-                // wrong value into a loop-carried slot via the lossy
-                // `py_pc → pc_map` translation).
+                // (`BRANCH_GUARD_JITCODE_PC` → rd_numb → `setposition`), so the
+                // gate opens and the guard compiles instead of declining to the
+                // interpreter.  M3 is on by default, so production takes this
+                // path.  `PYRE_RELAX_124` is the standalone opener exercising
+                // the kept-stack recovery path without the M3 decode.  Only when
+                // M3 is force-disabled (`PYRE_M3_JITCODE_PC=0`) AND `PYRE_RELAX_124`
+                // is unset does the conservative decline apply (a guard-failure
+                // deopt at depth > 0 would otherwise restore a wrong value into a
+                // loop-carried slot via the lossy `py_pc → pc_map` translation).
                 let kept_stack_resume_enabled = crate::pyjitcode::m3_jitcode_pc_enabled()
                     || std::env::var_os("PYRE_RELAX_124").is_some();
                 if kept_stack && !kept_stack_resume_enabled {

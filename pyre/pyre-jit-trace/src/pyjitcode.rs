@@ -300,17 +300,23 @@ pub fn portal_red_pre_regalloc_slots(nlocals: usize, max_stackdepth: usize) -> (
     (portal_frame_reg, portal_ec_reg)
 }
 
-/// `#124` Approach B master switch (`PYRE_M3_JITCODE_PC`, default off).
+/// `#124` Approach B master switch (`PYRE_M3_JITCODE_PC`, default on).
 ///
-/// When set, guard frames resume at their carried direct JitCode pc
-/// instead of the lossy `pc_map` translation of the stored Python pc, and
-/// the encoder collects the guard-pc live box set directly rather than the
-/// resume-pc set patched by the positional kept-stack heuristic.  Off by
-/// default so production keeps the heuristic path; the kept-stack-precision
-/// payoff is validated by flipping the flag on (corpus + CI).
+/// Guard frames resume at their carried direct JitCode pc instead of the
+/// lossy `pc_map` translation of the stored Python pc, and the encoder
+/// collects the guard-pc live box set directly rather than the resume-pc set
+/// patched by the positional kept-stack heuristic.  On by default; set
+/// `PYRE_M3_JITCODE_PC=0` (or `false`) to force the legacy heuristic path
+/// back on as a rollback escape hatch.
 pub(crate) fn m3_jitcode_pc_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("PYRE_M3_JITCODE_PC").is_some())
+    *ENABLED.get_or_init(|| match std::env::var_os("PYRE_M3_JITCODE_PC") {
+        Some(v) => {
+            let v = v.to_string_lossy();
+            v != "0" && !v.eq_ignore_ascii_case("false")
+        }
+        None => true,
+    })
 }
 
 impl PyJitCode {
