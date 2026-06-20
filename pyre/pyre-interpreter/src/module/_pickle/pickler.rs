@@ -1,6 +1,6 @@
 //! `_pickle.Pickler` — `interp_pickle.py W_Pickler` (atom + container subset).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use malachite_bigint::BigInt;
 use pyre_object::PyObjectRef;
@@ -60,9 +60,16 @@ struct PickleCtx {
     pers_func: PyObjectRef,
     /// `buffer_callback` for proto-5 out-of-band buffers, or `None`/`PY_NULL`.
     buffer_callback: PyObjectRef,
-    /// `fast` mode — when set, memoization is skipped (no PUT/GET, no
-    /// recursion guard).
+    /// `fast` mode — when set, memoization is skipped (no PUT/GET); a
+    /// shallow cyclic-object guard (`fast_nesting` / `fast_memo`) still fires
+    /// past `FAST_NESTING_LIMIT`.
     fast: bool,
+    /// Live save recursion depth, for the fast-mode cyclic guard.
+    fast_nesting: i64,
+    /// Identity hashes of the objects on the active save path; populated only
+    /// past `FAST_NESTING_LIMIT` so fast mode raises `ValueError` on a cycle
+    /// instead of recursing into a stack overflow.
+    fast_memo: HashSet<usize>,
     /// Effective `dispatch_table` (the pickler's, else `copyreg.dispatch_table`)
     /// consulted by `type` for the reduce of an otherwise-unhandled object;
     /// `None`/`PY_NULL` when unavailable.
@@ -321,9 +328,10 @@ impl W_Pickler {
         // `persistent_id` resolves to a subclass method override or the
         // instance value set through the getter (its getter raises while
         // unset, so a base pickler resolves to `PY_NULL`); `reducer_override`
-        // is a subclass hook only.  An explicit `persistent_id = None` is kept
-        // as the hook: `dump` then calls `None(obj)` and raises `TypeError`,
-        // matching `_pickle` (only deleting/leaving it unset disables it).
+        // is a subclass hook only (absent on a base pickler).  An explicit
+        // `persistent_id = None` / `reducer_override = None` is kept as the
+        // hook: `dump` then calls `None(obj)` and raises `TypeError`, matching
+        // `_pickle` (only deleting/leaving it unset disables the hook).
         // `findattr_result` propagates a hook property's own error instead of
         // panicking; each resolved hook is pinned before the next lookup.
         let pers_func = crate::baseobjspace::findattr_result(self_ptr, "persistent_id")?
@@ -331,7 +339,6 @@ impl W_Pickler {
         pyre_object::gc_roots::pin_root(pers_func);
         let pers_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         let reducer_override = crate::baseobjspace::findattr_result(self_ptr, "reducer_override")?
-            .filter(|&f| !unsafe { pyre_object::is_none(f) })
             .unwrap_or(pyre_object::PY_NULL);
         pyre_object::gc_roots::pin_root(reducer_override);
         let reducer_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
@@ -730,6 +737,8 @@ pub(crate) fn pickle_core(
         pers_func,
         buffer_callback,
         fast,
+        fast_nesting: 0,
+        fast_memo: HashSet::new(),
         dispatch_table,
         reducer_override,
     };
@@ -763,6 +772,10 @@ pub(crate) fn pickle_core(
     }
 }
 
+/// `interp_pickle.py W_Pickler._fast_save_enter` — the recursion depth past
+/// which fast mode starts tracking the active path to detect cycles.
+const FAST_NESTING_LIMIT: i64 = 50;
+
 /// `interp_pickle.py W_Pickler.save` with the persistent-id hook: every
 /// object is first offered to `persistent_id`; a non-None result is saved
 /// as a persistent reference instead of by value.
@@ -775,17 +788,51 @@ fn save(ctx: &mut PickleCtx, buf: &mut Framer, w_obj: PyObjectRef) -> Result<(),
     pyre_object::gc_roots::pin_root(w_obj);
     let slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     buf.commit_frame(false)?;
-    if !ctx.pers_func.is_null() {
+    // Fast mode skips memoization, so a cyclic object would recurse until the
+    // stack overflows. Past `FAST_NESTING_LIMIT`, track the active path by
+    // identity hash and raise `ValueError` on a repeat (`_fast_save_enter`).
+    let fast_tracked = if ctx.fast {
+        ctx.fast_nesting += 1;
+        if ctx.fast_nesting >= FAST_NESTING_LIMIT {
+            let w_cur = pyre_object::gc_roots::shadow_stack_get(slot);
+            let h = pyre_object::gc_hook::gc_identity_hash(w_cur as usize);
+            if !ctx.fast_memo.insert(h) {
+                ctx.fast_nesting -= 1;
+                return Err(PyError::value_error(format!(
+                    "fast mode: can't pickle cyclic objects including object type {} at {:p}",
+                    crate::baseobjspace::object_functionstr_type_name(w_cur),
+                    w_cur as *const u8,
+                )));
+            }
+            Some(h)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let result = if !ctx.pers_func.is_null() {
         let w_pid = call_fn(
             ctx.pers_func,
             &[pyre_object::gc_roots::shadow_stack_get(slot)],
         )?;
         if !unsafe { pyre_object::is_none(w_pid) } {
-            return save_pers(ctx, buf, w_pid);
+            save_pers(ctx, buf, w_pid)
+        } else {
+            save_object(ctx, buf, pyre_object::gc_roots::shadow_stack_get(slot))
         }
-        return save_object(ctx, buf, pyre_object::gc_roots::shadow_stack_get(slot));
+    } else {
+        save_object(ctx, buf, pyre_object::gc_roots::shadow_stack_get(slot))
+    };
+    // `_fast_save_leave` — pop the path on the way out (success path; an error
+    // aborts the whole dump and discards the context).
+    if let Some(h) = fast_tracked {
+        ctx.fast_memo.remove(&h);
     }
-    save_object(ctx, buf, pyre_object::gc_roots::shadow_stack_get(slot))
+    if ctx.fast {
+        ctx.fast_nesting -= 1;
+    }
+    result
 }
 
 /// `interp_pickle.py save_pers` — emit a persistent reference. The
