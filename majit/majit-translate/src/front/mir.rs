@@ -2725,6 +2725,10 @@ impl<'a> Lowering<'a> {
             // same as the operand Variable. `as` casts that do not
             // change the JIT-visible kind collapse this way.
             Rvalue::Cast(kind, operand, ty) => {
+                // Classify the source BEFORE `resolve_operand` consumes
+                // `operand` (mirrors the `UnaryOp::Cast` twin above): only a
+                // Ref source may narrow to an instance downcast below.
+                let src_kind = self.operand_value_kind(&operand);
                 let v = self.resolve_operand(mir_bb, operand)?;
                 // #298: a same-bank ptr→ptr cast to a registered struct
                 // root (`obj as *const W_CodeObject`) keeps the i64
@@ -2742,8 +2746,10 @@ impl<'a> Lowering<'a> {
                 // (`lltype.py:964-975`) is pointer-to-pointer only, and
                 // int-to-pointer is the separate `cast_int_to_ptr`
                 // analyzer, so an `addr_usize as *const Struct` reinterpret
-                // must NOT be narrowed to an instance downcast.
+                // must NOT be narrowed to an instance downcast — the
+                // `src_kind` Ref guard enforces exactly that.
                 if cast_kind_is_raw_ptr(&kind)
+                    && matches!(src_kind, Some(ValueType::Ref(_)))
                     && let ValueType::Ref(_) = tyref_to_value_type(&ty, self.llbc)
                     && let Some(root) = tyref_class_root(&ty, self.llbc)
                 {
