@@ -4194,11 +4194,16 @@ impl OptUnroll {
                 crate::optimizeopt::shortpreamble::PreambleOpKind::Pure
                 | crate::optimizeopt::shortpreamble::PreambleOpKind::LoopInvariant => {
                     // The short-box result that coincides with a label/virtual
-                    // slot maps to that slot's body OpRef. `produced.label_arg_idx`
-                    // is `lookup_label_arg(canonical_result)` recorded at export
-                    // (optimizer.rs), and `source` == `canonical_result` ==
-                    // `preamble_op.pos`, so it equals the position of `source`
-                    // within the original `label_args + virtuals`. (The renamed
+                    // slot maps to that slot's body OpRef. For these non-InputArg
+                    // kinds the export records `label_arg_idx` as
+                    // `lookup_label_arg(canonical_result)` (optimizer.rs is
+                    // kind-aware: InputArg keeps the stamped original slot, every
+                    // other kind takes the FORWARDED-result lookup). `source` ==
+                    // `canonical_result` == `preamble_op.pos`, so this slot is the
+                    // position of the FORWARDED `source` within the original
+                    // `label_args + virtuals` — a Pure/LoopInvariant result proven
+                    // equal to a label arg it did not originally occupy still
+                    // reuses that slot's `short_args[slot]`. (The renamed
                     // `short_inputargs[slot]` is a distinct box and would never
                     // equal `source` anyway.)
                     if let Some(slot) = produced.label_arg_idx {
