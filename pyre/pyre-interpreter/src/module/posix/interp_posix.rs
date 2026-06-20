@@ -310,7 +310,6 @@ pub fn register_module(ns: &mut DictStorage) {
         "fchdir",
         "link",
         "symlink",
-        "readlink",
         "chmod",
         "fchmod",
         "lchmod",
@@ -592,6 +591,25 @@ pub fn register_module(ns: &mut DictStorage) {
         crate::make_builtin_function_with_arity("remove", posix_unlink, 1),
     );
 
+    // ── posix.readlink(path, *, dir_fd=None) ──
+    // Returns the symlink target; a non-symlink raises OSError(EINVAL), which
+    // `posixpath.realpath` relies on to stop following links.
+    crate::dict_storage_store(
+        ns,
+        "readlink",
+        crate::make_builtin_function("readlink", |args| {
+            let arg = args
+                .first()
+                .copied()
+                .ok_or_else(|| crate::PyError::type_error("readlink() requires 1 argument"))?;
+            let path = extract_path(arg)?;
+            match std::fs::read_link(&path) {
+                Ok(target) => Ok(pyre_object::w_str_new(&target.to_string_lossy())),
+                Err(e) => Err(io_err(e, &path)),
+            }
+        }),
+    );
+
     // ── posix.mkdir(path, mode=0o777) ──
     crate::dict_storage_store(
         ns,
@@ -753,10 +771,9 @@ pub fn register_module(ns: &mut DictStorage) {
             0,
         ),
     );
-    // os.fspath() — PyPy: posixmodule.c posix_fspath. Returns the argument
-    // unchanged for str/bytes/bytearray (the protocol's identity case);
-    // any other object would normally trigger __fspath__ but we don't
-    // model that protocol yet.
+    // os.fspath() — posixmodule.c posix_fspath / PyOS_FSPath.  str/bytes
+    // pass through unchanged (the protocol's identity case); any other
+    // object is resolved via `type(path).__fspath__(path)`.
     crate::dict_storage_store(
         ns,
         "fspath",
@@ -769,14 +786,23 @@ pub fn register_module(ns: &mut DictStorage) {
                         return Ok(arg);
                     }
                 }
-                // Try __fspath__ — for pathlib.Path-like objects.
-                if let Ok(method) = crate::baseobjspace::getattr_str(arg, "__fspath__") {
-                    let result = crate::call_function(method, &[arg]);
-                    if !result.is_null() {
-                        return Ok(result);
+                // `path_type.__fspath__(path)` — the descriptor read off the
+                // type is unbound, so `path` is supplied as the sole argument.
+                let path_type = crate::typedef::r#type(arg);
+                if let Some(pt) = path_type {
+                    if let Some(fspath_fn) =
+                        unsafe { crate::baseobjspace::lookup_in_type(pt, "__fspath__") }
+                    {
+                        return crate::call::call_function_impl_result(fspath_fn, &[arg]);
                     }
                 }
-                Ok(arg)
+                let type_name = match path_type {
+                    Some(pt) => unsafe { pyre_object::typeobject::w_type_get_name(pt) },
+                    None => "object",
+                };
+                Err(crate::PyError::type_error(format!(
+                    "expected str, bytes or os.PathLike object, not {type_name}"
+                )))
             },
             1,
         ),
