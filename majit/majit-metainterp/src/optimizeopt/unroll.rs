@@ -1359,17 +1359,22 @@ impl UnrollOptimizer {
             }
             initial_sp.inputarg_infos = infos;
         }
-        // shortpreamble.py:255-259 renamed-short_inputargs: the short-preamble
-        // Label is the renamed `short_inputargs`, but use_box guards still
-        // reference the ORIGINAL Phase-1 label args because pyre keeps disjoint
-        // Phase-1/Phase-2 box namespaces. Seed `phase1_inputargs` with the
-        // per-slot originals (paired 1:1 with the renamed Label / jump_args) so
-        // inline_short_preamble (unroll.rs:3691) maps an original-referencing
-        // guard arg to its jump_arg. Dead duplicate / const-folded slots
-        // (`slot_to_original == None`) fall back to the renamed Label box —
-        // that slot is never referenced by a guard (the box's live slot maps
-        // it first), so the fallback is inert. No-op when the Label already IS
-        // the originals (the two box sets coincide).
+        // shortpreamble.py:255-259 renamed-short_inputargs: in THIS import path
+        // the short-preamble Label is the renamed `short_inputargs`, so seed
+        // `phase1_inputargs` with the per-slot ORIGINALS (paired 1:1 with the
+        // renamed Label / jump_args) as the second inline-mapping leg — see the
+        // load-bearing analysis at the consuming site in inline_short_preamble.
+        // NOTE (measured): the originals seeded here are empirically INERT — post
+        // #217 produce_arg embeds the renamed boxes into the short ops, so no short
+        // op references an original (0 of the 176 corpus consumptions of the
+        // phase1 leg were original boxes; the load-bearing consumptions all come
+        // from the build_short_preamble_struct producer, whose phase1 holds the
+        // RENAMED boxes). The field cannot be dropped on that account because the
+        // OTHER producer is load-bearing; see the convergence note at the consumer.
+        // Dead duplicate / const-folded slots (`slot_to_original == None`) fall
+        // back to the renamed Label box, leaving phase1[i] == inputargs[i] there
+        // (no insert at the consumer). No-op when the Label already IS the
+        // originals (the two box sets coincide).
         if initial_sp.phase1_inputargs.is_none() {
             let phase1: Vec<BoxRef> = initial_sp
                 .inputargs
@@ -3776,11 +3781,37 @@ impl OptUnroll {
             }
         }
 
-        // RPython parity: also map Phase 1 inputargs → jump_args.
-        // Short ops may reference Phase 1 OpRefs (from produce_arg's
-        // label_arg_positions check) that aren't in the current inputargs.
-        // In RPython, renamed inputargs are stable across compilations,
-        // so this situation doesn't arise.
+        // Map the second short-inputarg domain that the `inputargs → jump_args`
+        // seeding above does NOT cover. pyre keeps disjoint Phase-1/Phase-2 box
+        // namespaces (the export serializes boxes to integer OpRef positions), so
+        // a short preamble has two inputarg domains — the ORIGINAL Phase-1 label
+        // boxes and the RENAMED short_inputargs (shortpreamble.py:256-259) — and
+        // `short_preamble.inputargs` carries only one of them. The two producers
+        // assign OPPOSITE domains:
+        //   - the import seeding (this file, the `slot_to_original` block above):
+        //     inputargs = renamed Label, phase1_inputargs = originals;
+        //   - build_short_preamble_struct (shortpreamble.rs `if inputargs !=
+        //     &short_inputargs`): inputargs = original label_args, phase1_inputargs
+        //     = renamed short_inputargs.
+        // In the second (Extended/active-builder) case the short ops reference the
+        // RENAMED boxes — produce_arg embedded them at export (#217) — which are
+        // NOT in `inputargs` (= originals there), so THIS leg is the sole mapper
+        // that resolves them to jump_args. Measured LOAD-BEARING: 176 consumptions
+        // across the check.py corpus on both backends, all GuardNonnullClass /
+        // GetfieldGcPure over ref inputargs (the redundant-guard / pure-getfield
+        // elimination on loop-carried references). Dropping this leg routes those
+        // args to the None → InvalidLoop arm below — correct, but it loses the loop
+        // inlining for those traces. (The originals-domain seeding from the import
+        // path is, by contrast, empirically inert: 0 of the 176 consumptions were
+        // original boxes, because post-#217 no short op references an original.)
+        // Upstream needs no analog: its single Box namespace is stable across the
+        // boundary, so the renamed inputarg IS the object the short ops reference
+        // and unroll.py:393-396 seeds only short_inputargs → jump_args.
+        // CONVERGENCE (issue #217 step 5 "known blocker"): make
+        // build_short_preamble_struct build the Label from the RENAMED
+        // short_inputargs (matching the import-seeding convention, #217, and
+        // upstream); then `inputargs` covers the renamed short-op args directly and
+        // this leg plus the phase1_inputargs field can be removed.
         if let Some(ref phase1) = short_preamble.phase1_inputargs {
             for (i, phase1_inputarg) in phase1.iter().enumerate() {
                 let phase1_inputarg = phase1_inputarg.to_opref();
