@@ -8615,6 +8615,29 @@ impl MIFrame {
             return Ok(Some(step));
         }
 
+        // JUMP_FORWARD — unconditional forward control flow: no guard, no loop
+        // close, no resume snapshot (`opimpl_goto`, pyjitpl.py:506 `self.pc =
+        // target`).  Delegate to the same pub `execute_jump_forward` the trait
+        // arm calls; its `jump_forward` → `set_next_instr(target)` sets the
+        // `pending_next_instr` the tracer consumes — the sole pc-advance source
+        // (the codewriter `emit_goto!` only emits graph IR, never advances the
+        // tracer).  `next_instr = self.orgpc + 1` (== the trait leg's `pc + 1`)
+        // feeds `jump_target_forward`'s `skip_caches(next_instr) + delta` for
+        // the identical target.  Returns `StepResult::Continue` — no CloseLoop
+        // coordination, unlike JumpBackward; forward by construction, so it
+        // never reaches the `can_enter_jit` / `loop_header` path.
+        if matches!(instruction, Instruction::JumpForward { .. }) {
+            let next_instr = self.orgpc + 1;
+            let step = pyre_interpreter::execute_jump_forward(
+                self,
+                code,
+                *instruction,
+                op_arg,
+                next_instr,
+            )?;
+            return Ok(Some(step));
+        }
+
         Ok(None)
     }
 
@@ -9935,6 +9958,16 @@ pub fn production_walker_handles(instruction: &Instruction) -> bool {
             // no guard; the dispatch gate keeps inline-frame ReturnValue on
             // the trait leg, so only the root exit is flipped.
             | Instruction::ReturnValue
+            // JumpForward — the unconditional forward sibling of the back-edge
+            // family, handled by the entry hook (NOT the arm walk, whose
+            // emit_goto! only emits graph IR and never advances the tracer pc).
+            // The hook delegates to the same pub execute_jump_forward the trait
+            // dispatch arm calls, returning StepResult::Continue (no loop close,
+            // so no CloseLoop outcome to reject); it records no guard and no
+            // resume data (`opimpl_goto`).  Forward by construction, so it never
+            // reaches the can_enter_jit / loop_header path; the gate keeps
+            // inline-frame JumpForward on the trait leg, like the rest.
+            | Instruction::JumpForward { .. }
             // JumpBackward / JumpBackwardNoInterrupt — the loop back-edge,
             // handled by the entry hook (NOT the arm walk, which surfaces
             // SubReturn / rejects the top-level CloseLoop outcome).  The hook
