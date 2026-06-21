@@ -5727,12 +5727,10 @@ impl<'a> AssemblerARM64<'a> {
         }
     }
 
-    /// _build_wb_slowpath parity: save all GPR + VFP regs, call helper, restore.
-    /// RPython: _push_all_regs_to_jitframe(also_push_vpf=True) + BL + _pop_all
-    /// opassembler.py:956-960: helper_num variant depends on live VFP bindings.
-    fn emit_wb_helper_call(&mut self, loc_base: crate::regloc::RegLoc, helper: i64) {
-        // _push_all_regs_to_jitframe: save x0-x15 (GPR) + d0-d15 (VFP)
-        // Total: 128 bytes GPR + 128 bytes VFP = 256 bytes
+    /// _push_all_regs_to_jitframe(also_push_vfp=True) parity: save x0-x15
+    /// (GPR) + d0-d15 (VFP) on the C stack. Total 256 bytes (16-aligned).
+    /// The pop counterpart is [`emit_pop_all_volatile_regs`].
+    fn emit_push_all_volatile_regs(&mut self) {
         dynasm!(self.mc ; .arch aarch64
             ; stp x0, x1, [sp, -256]!
             ; stp x2, x3, [sp, 16]
@@ -5751,12 +5749,11 @@ impl<'a> AssemblerARM64<'a> {
             ; stp d12, d13, [sp, 224]
             ; stp d14, d15, [sp, 240]
         );
-        if loc_base.value != 0 {
-            dynasm!(self.mc ; .arch aarch64 ; mov x0, X(loc_base.value));
-        }
-        self.emit_mov_imm64(2, helper);
-        dynasm!(self.mc ; .arch aarch64 ; blr x2);
-        // _pop_all_regs_from_jitframe: restore VFP then GPR
+    }
+
+    /// _pop_all_regs_from_jitframe parity: restore VFP then GPR saved by
+    /// [`emit_push_all_volatile_regs`].
+    fn emit_pop_all_volatile_regs(&mut self) {
         dynasm!(self.mc ; .arch aarch64
             ; ldp d14, d15, [sp, 240]
             ; ldp d12, d13, [sp, 224]
@@ -5775,6 +5772,19 @@ impl<'a> AssemblerARM64<'a> {
             ; ldp x2, x3, [sp, 16]
             ; ldp x0, x1, [sp], 256
         );
+    }
+
+    /// _build_wb_slowpath parity: save all GPR + VFP regs, call helper, restore.
+    /// RPython: _push_all_regs_to_jitframe(also_push_vpf=True) + BL + _pop_all
+    /// opassembler.py:956-960: helper_num variant depends on live VFP bindings.
+    fn emit_wb_helper_call(&mut self, loc_base: crate::regloc::RegLoc, helper: i64) {
+        self.emit_push_all_volatile_regs();
+        if loc_base.value != 0 {
+            dynasm!(self.mc ; .arch aarch64 ; mov x0, X(loc_base.value));
+        }
+        self.emit_mov_imm64(2, helper);
+        dynasm!(self.mc ; .arch aarch64 ; blr x2);
+        self.emit_pop_all_volatile_regs();
     }
 
     /// `_build_malloc_slowpath()` parity: preserve live state across the
@@ -6452,15 +6462,49 @@ impl<'a> AssemblerARM64<'a> {
     /// `emit_load_to_rax` carries register/slot/immediate, and
     /// `emit_call_from_arglocs` (func_index 1) loads the call args from their
     /// regalloc locations rather than re-resolving the op operands.
+    /// COND_CALL: if arg(0) != 0, call arg(1)(arg(2..)); discard result.
+    ///
+    /// `consider_discard_nargs_j2` emits no `before_call`, so the regalloc
+    /// does NOT spill caller-saved registers across this op. On the taken
+    /// path the callee clobbers x0..x13 + d0..d7, which would destroy any
+    /// value live across the cond_call (e.g. a residual-call result stored
+    /// into a frame after the cond_call). Save and restore all volatile
+    /// registers around the call — `_build_cond_call_slowpath(callee_only=
+    /// False)` parity, inlined like the WB slowpath.
     fn genop_discard_cond_call(&mut self, op: &Op, arglocs: &[Loc]) {
         let _ = op;
-        self.emit_load_to_rax(arglocs[0]);
+        // Test the condition in a scratch register (ip0/x16), not an
+        // allocatable register, so the test never clobbers a live value
+        // before it is saved.
+        self.emit_load_loc_to_ip0(arglocs[0]);
         let skip_label = self.mc.new_dynamic_label();
-        dynasm!(self.mc ; .arch aarch64 ; cbz x0, =>skip_label);
+        dynasm!(self.mc ; .arch aarch64 ; cbz x16, =>skip_label);
 
+        self.emit_push_all_volatile_regs();
         self.emit_call_from_arglocs(arglocs, 1);
+        self.emit_pop_all_volatile_regs();
 
         dynasm!(self.mc ; .arch aarch64 ; =>skip_label);
+    }
+
+    /// Load `loc` into the ip0 scratch register (x16) without touching any
+    /// allocatable register.
+    fn emit_load_loc_to_ip0(&mut self, loc: Loc) {
+        match loc {
+            Loc::Reg(r) if !r.is_xmm => {
+                dynasm!(self.mc ; .arch aarch64 ; mov x16, X(r.value));
+            }
+            Loc::Immed(imm) => {
+                self.emit_mov_imm64(16, imm.value);
+            }
+            Loc::Frame(f) if !f.ebp_loc.is_float => {
+                dynasm!(self.mc ; .arch aarch64 ; ldr x16, [x29, f.ebp_loc.value as u32]);
+            }
+            _ => {
+                self.emit_load_to_rax(loc);
+                dynasm!(self.mc ; .arch aarch64 ; mov x16, x0);
+            }
+        }
     }
 
     /// COND_CALL_VALUE_I/R: if arg(0) == 0, call function; else result = arg(0).
