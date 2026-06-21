@@ -9675,23 +9675,22 @@ fn emit_walker_loop_callee_call_assembler(
     // has a side-effect-free callee; a side-effecting prologue is out of scope
     // for this default-OFF first cut.
     //
-    // ⚠️ KNOWN MISCOMPILE (frame-escaping prologue): if the callee prologue
-    // contains a `LOAD_GLOBAL` (or any op that passes the still-virtual callee
-    // frame to a residual lookup call — `n = len(xs)` is the canonical case),
-    // that call escapes the frame and forces its `locals_cells_stack_w` array
-    // to a real allocation EARLY, before the remaining `STORE_FAST`s. The
-    // pre-force local (xs) is captured into the forced array, but the global
-    // call's own result (`n`), being a non-virtual escaped ref, becomes a lazy
-    // heap setarrayitem that lands in a DIFFERENT array than the one the
-    // CALL_ASSEMBLER's materialized frame reads — the callee's loop then reads
-    // `n` as NULL and the int guard_class SEGVs. A pure prologue (only
-    // LOAD_FAST/LOAD_CONST/STORE_FAST/int ops, e.g. `loop_callee_warm`) keeps
-    // the array virtual and is correct. The fix is to keep the inline-callee
-    // frame array unforced across the prologue (fold inline-callee LOAD_GLOBAL
-    // to a guarded constant via `inline_consts` instead of a frame-escaping
-    // residual lookup) OR to make the CA target the full function preamble like
-    // RPython rather than inlining the prologue into the caller. Until then the
-    // gate stays default-OFF. Repro: `n = len(<list>)` callee in a hot loop.
+    // ⚠️ KNOWN BLOCKER for default-ON (GC-stress guard-failure resume): the
+    // whole corpus passes flag-ON at the default (large) nursery on both
+    // backends, but under nursery pressure a guard that fails inside the
+    // CALL_ASSEMBLER'd callee loop resumes via the blackhole
+    // (`jit_blackhole_resume_from_guard` -> `blackhole_resume_via_rd_numb`)
+    // and reconstructs a STALE ref box — a minor GC moved the object but the
+    // CA-boundary resume state did not trace/update it, so the interpreter
+    // dereferences garbage and SEGVs. Ref-valued locals are affected; the
+    // result is byte-correct when no minor GC fires during the hot loop.
+    // Minimal repro: a loop-callee whose body does `b = bodies[i]; b.v += 1`
+    // over a list of objects, run with `PYPY_GC_NURSERY=65536`. This is the
+    // CA-boundary resume-numbering / virtualizable-frame-GC epic, not the
+    // prologue shape. (The earlier "frame-escaping LOAD_GLOBAL miscompile"
+    // theory was wrong: that SEGV was a COND_CALL caller-saved-register
+    // clobber in the backend, fixed in `genop_discard_cond_call`.) Until the
+    // resume GC-root gap is closed the gate stays default-OFF.
     let argbox_types: Vec<Type> = vec![Type::Ref; r_args.len()];
     let allboxes = build_allboxes(funcptr, r_args, &argbox_types, call_descr.arg_types());
     let exec = try_execute_residual_call_via_executor(
