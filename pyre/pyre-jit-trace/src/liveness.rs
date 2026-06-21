@@ -634,8 +634,30 @@ fn stack_effects(
         | Instruction::GetIter
         | Instruction::GetYieldFromIter
         | Instruction::GetAiter
-        | Instruction::LoadAttr { .. }
         | Instruction::GetAwaitable { .. } => (d, d),
+        // LOAD_ATTR pushes 1 (attr) for the plain form, or 2 (attr,
+        // self_or_null) for the method form — mirror of `execute_load_attr`
+        // `attr.is_method()` → `load_method` (which pushes `[attr, NULL]`).
+        // Without the method-form +1, `depth_at_py_pc` at a following
+        // method-call CALL undercounts the `null_or_self` slot, so a guard
+        // that resumes AT the CALL pc to re-execute it (the list-append fold)
+        // rebuilds the operand stack one slot short.  Mirrors the
+        // `LoadGlobal` / `LoadSuperAttr` method-form handling above.
+        Instruction::LoadAttr { namei } => {
+            if namei.get(op_arg).is_method() {
+                (d + 1, d + 1)
+            } else {
+                (d, d)
+            }
+        }
+        // LOAD_SPECIAL pops the object and pushes [attr, self_or_null]
+        // (net +1) — `execute_load_special` always routes through
+        // `load_method`, so it has no plain form.  Same depth-undercount
+        // class as the method-form LOAD_ATTR above (a guard resuming inside
+        // the `[LoadSpecial .. consuming CALL]` window — e.g. a `with` block's
+        // `__enter__` / `__exit__` call — would otherwise rebuild the operand
+        // stack one slot short).
+        Instruction::LoadSpecial { .. } => (d + 1, d + 1),
         // Push 1 onto TOS without popping (net +1)
         Instruction::GetLen
         | Instruction::MatchMapping
