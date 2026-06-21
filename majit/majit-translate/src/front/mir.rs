@@ -1779,6 +1779,23 @@ impl<'a> Lowering<'a> {
         postorder.into_iter().rev().collect()
     }
 
+    /// Stub `bb_id` as a dead bare-raise block: clear its body / exits /
+    /// exitswitch, close it with a `set_raise`, and mark it `dead`.  Used
+    /// for blocks the framestate threading must not lower — model-
+    /// unreachable orphan `on_unwind` chains and `If`-arms a const-bool
+    /// discriminant folded away (see [`Self::lower_framestate`]).  The
+    /// real-path `function_graph_to_flowspace` prunes `dead` blocks
+    /// (`remove_dead_blocks` parity), so the stub's orphan etype/evalue
+    /// never reach the rtyper as undefined operands.
+    fn stub_dead_block(&mut self, bb_id: BlockId) {
+        let blk = self.graph.block_mut(bb_id);
+        blk.operations.clear();
+        blk.exits.clear();
+        blk.exitswitch = None;
+        self.graph.set_raise(bb_id, "mir-dead");
+        self.graph.block_mut(bb_id).dead = true;
+    }
+
     /// Lower the body threading locals as block inputargs / phis via
     /// per-block [`FrameState`]s, instead of the function-wide monotonic
     /// `local_var` table.  Restricted to acyclic bodies (the caller gates
@@ -1835,11 +1852,30 @@ impl<'a> Lowering<'a> {
 
         // Pass 1 — RPO walk: setstate, inputargs, lower, snapshot, union.
         for &bb in &rpo {
-            let st = entry_state[bb].clone().ok_or_else(|| {
-                LowerError::Unsupported(format!(
-                    "framestate: reachable bb{bb} has no entry state (RPO/union bug)"
-                ))
-            })?;
+            let st = match entry_state[bb].clone() {
+                Some(st) => st,
+                None => {
+                    // No live predecessor edge reached this block.  RPO
+                    // over `model_succs` visits every model-predecessor
+                    // before `bb`, and each unions its *lowered* exits
+                    // into `bb`'s entry; a still-empty entry here means
+                    // every model edge into `bb` was an `If`-arm that
+                    // `lower_switch` folded away on a const-bool
+                    // discriminant (a translation-time `const` gate such
+                    // as `if WITHPREBUILTINT`), so `bb` is unreachable in
+                    // the produced graph even though `mir_model_reachable`
+                    // — which reads the raw terminator, pre-fold — marks
+                    // it reachable.  Stub it dead exactly like the model-
+                    // unreachable orphan chains below; the real-path
+                    // adapter's reachability prune removes it, and
+                    // threading dead state would only mint phis the legacy
+                    // fallback cannot type.  `bb` is never bb0 (the
+                    // startblock is seeded and visited first), so a bare
+                    // raise stub is well-formed.
+                    self.stub_dead_block(self.block_id[bb]);
+                    continue;
+                }
+            };
             self.setstate(&st);
             let bb_id = self.block_id[bb];
             // The startblock keeps its parameter inputargs + Input ops;
@@ -1901,30 +1937,33 @@ impl<'a> Lowering<'a> {
         // Model-unreachable blocks: orphan `on_unwind` cleanup chains that
         // no lowered exit targets — `lower_terminator` strips every unwind
         // edge (Goto / Assert / Drop / Call all forward to the success
-        // continuation only), so `model_succs` is exactly the set of
-        // lowered exits and an unreachable block here is genuinely
-        // unreferenced.  Mark them `dead` and stub a bare raise so the
-        // graph stays closed for the legacy fallback path, which consumes
-        // this same `FunctionGraph`.  The real path's
-        // `function_graph_to_flowspace` prunes `dead` blocks outright
-        // (`remove_dead_blocks` parity), so the stub's orphan etype/evalue
-        // never reach the rtyper as undefined operands.
+        // continuation only).  `model_succs` is a *superset* of the
+        // lowered exits — it reads the raw terminator and so still lists an
+        // `If`-arm a const-bool discriminant later folds away — but it is
+        // never a subset, so `reachable[bb]` false (outside the
+        // `model_succs` closure) is a sufficient deadness signal: such a
+        // block is genuinely unreferenced.  (The folded-arm case, where a
+        // block IS in the closure yet has no live lowered predecessor, is
+        // caught in Pass 1 by the empty-entry stub above.)  Mark them
+        // `dead` so the graph stays closed for the legacy fallback path,
+        // which consumes this same `FunctionGraph`.
         for bb in 0..n {
             if reachable[bb] {
                 continue;
             }
-            let bb_id = self.block_id[bb];
-            let blk = self.graph.block_mut(bb_id);
-            blk.operations.clear();
-            blk.exits.clear();
-            blk.exitswitch = None;
-            self.graph.set_raise(bb_id, "mir-dead");
-            self.graph.block_mut(bb_id).dead = true;
+            self.stub_dead_block(self.block_id[bb]);
         }
 
         // Pass 2 — re-argument the goto / branch links from framestates.
         for &bb in &rpo {
             let bb_id = self.block_id[bb];
+            // A block Pass 1 stubbed dead (empty-entry const-fold orphan)
+            // has no exit state and a bare-raise body — its links carry no
+            // framestate args to re-argument.  Skip it; the final guard
+            // and the real-path dead-block prune both ignore it too.
+            if self.graph.block(bb_id).dead {
+                continue;
+            }
             let ex = exit_state[bb].clone().ok_or_else(|| {
                 LowerError::Unsupported(format!("framestate: bb{bb} missing exit state in pass 2"))
             })?;
