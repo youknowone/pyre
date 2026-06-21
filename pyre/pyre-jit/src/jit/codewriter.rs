@@ -4022,11 +4022,20 @@ fn register_helper_fn_pointers(
         CallFlavor::MayForce,
     );
     // `bh_unpack_ex_fn` validates `a, *b, c = seq` and allocates the slot
-    // tuple (head items, starred list, tail items); like `unpack_sequence_fn`
-    // it can raise ValueError but materialises eagerly and does not force the
-    // virtualizable → `CallFlavor::Plain`.  `bh_unpack_item_fn` (already
-    // bound) indexes the result.  Appended last to preserve fn_ptr indices.
-    let unpack_ex_fn = bind(assembler, cpu.unpack_ex_fn as *const (), CallFlavor::Plain);
+    // tuple (head items, starred list, tail items).  For a non-list/tuple
+    // sequence it drives the iterator protocol
+    // (`runtime_ops::unpack_ex_slots` → `collect_iterable` →
+    // `baseobjspace::next`), so a user `__iter__`/`__next__` can run Python
+    // and force the virtualizable → `CallFlavor::MayForce`, symmetric with
+    // `store_slice_fn` and the `virtualizable_analyzer.analyze(op)` row of
+    // `getcalldescr` (`call.py:288`).  `bh_unpack_item_fn` (already bound)
+    // only indexes the materialised result tuple and stays `Plain`.  Appended
+    // last to preserve fn_ptr indices.
+    let unpack_ex_fn = bind(
+        assembler,
+        cpu.unpack_ex_fn as *const (),
+        CallFlavor::MayForce,
+    );
     FnPtrIndices {
         call_fn,
         load_global_fn,
@@ -9374,9 +9383,13 @@ impl CodeWriter {
                             // reads each slot through the opaque residual below.
                             let _ = emit_popvalue_ref!(current_depth, py_pc);
                             let seq_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            // A non-list/tuple sequence is iterated
+                            // (`collect_iterable` → user `__iter__`/`__next__`),
+                            // which can run Python and force the virtualizable →
+                            // `CallFlavor::MayForce` (emits `GUARD_NOT_FORCED`).
                             let tuple_var = residual_call!(
                                 unpack_ex_fn_idx,
-                                CallFlavor::Plain,
+                                CallFlavor::MayForce,
                                 vec![
                                     super::flow::Constant::signed(before as i64).into(),
                                     super::flow::Constant::signed(after as i64).into(),
