@@ -8870,22 +8870,32 @@ fn render_adt_type_args(
         .unwrap_or_default()
 }
 
-/// A type-argument is "reference-shaped" when it is NOT an unboxed
-/// primitive.  In the RPython-erased model every non-primitive payload —
-/// a heap class (`Tuple`, `W_Object`), a nested generic enum
-/// (`StepResult<…>`, `Option<…>`), or a tuple of references — is stored
-/// as a single word-sized GC pointer in its variant field, so the
-/// per-instantiation variant class computes the same one-word payload
-/// layout regardless of the Rust inline size.  Per-instantiation
-/// projection is scoped to these args; a primitive (`bool`, `usize`,
-/// `f64`) is unboxed and stays on the bare variant class, which unifies
-/// its integer/float payloads without a `UnionError`.
-fn type_arg_is_ref_shaped(arg: &str) -> bool {
-    const PRIMITIVE: &[&str] = &[
-        "bool", "char", "u8", "u16", "u32", "u64", "u128", "usize", "i8", "i16", "i32", "i64",
-        "i128", "isize", "f32", "f64", "()", "",
-    ];
-    !PRIMITIVE.contains(&arg)
+/// A type-argument drives a per-instantiation variant-class split unless
+/// it is in the deferred-or-degenerate set below.  A split mints a
+/// distinct `<…>`-suffixed variant classdef (`Result<bool>::Ok` vs
+/// `Result<i64>::Ok` vs `Result<Tuple>::Ok`) whose payload field sees only
+/// that one concrete type, so the field annotates to that type's own repr
+/// (`BoolRepr`, `IntegerRepr`, the GC-pointer `InstanceRepr`).  Without the
+/// split every instantiation collapses onto one bare variant class whose
+/// `__pos_0` unions the whole program — a cross-category `int ∪ float ∪
+/// char ∪ ()` merge that generalises to a generic `InstanceRepr` and walls
+/// the rtyper on the materialised store.
+///
+/// Reference payloads (a heap class `Tuple`/`W_Object`/`str`, a nested
+/// generic enum `Option<…>`, a tuple of references) are one word-sized GC
+/// pointer; the scalar integer/bool/char primitives are unboxed but each
+/// carries a well-defined int-banked repr, so all of these split.
+/// Excluded:
+///   - `f32`/`f64` — float bank; deferred until the codewriter field-descr
+///     carries the concrete bank (a suffixed-owner `setfield_gc_f`
+///     otherwise falls back to a GC-word descr).
+///   - `()` — the unit-`Ok` return widens to a genuine void return
+///     (`widen_unit_return_to_void`) and never materialises a payload field.
+///   - `""` — a degenerate/absent type-arg that would render a malformed
+///     `<>` suffix.
+fn type_arg_splits_per_instantiation(arg: &str) -> bool {
+    const DEFERRED: &[&str] = &["f32", "f64", "()", ""];
+    !DEFERRED.contains(&arg)
 }
 
 /// The `<…>` generic-argument suffix of an `AggregateKind::Adt` /
@@ -8893,9 +8903,9 @@ fn type_arg_is_ref_shaped(arg: &str) -> bool {
 /// instantiation), or `None` when the head is not a reference-payload
 /// `enum` instantiation.  Returned `Some` only when the head names an
 /// `enum` (struct generics keep collapsing to their flat classdef) whose
-/// every type-argument is [`type_arg_is_ref_shaped`] — the scope under
-/// which the per-instantiation variant class shares the bare variant's
-/// word-slot layout soundly.  Every projection site (receiver type,
+/// every type-argument [`type_arg_splits_per_instantiation`] — the scope
+/// under which the per-instantiation variant class carries a sound payload
+/// repr.  Every projection site (receiver type,
 /// variant constructor, variant field read, numbering pre-scan) routes
 /// through this one predicate so they all agree on which instantiations
 /// split and how they spell the suffix.
@@ -8916,7 +8926,11 @@ pub(crate) fn adt_head_instantiation_suffix(
         return None;
     }
     let type_args = render_adt_type_args(adt, llbc, 0);
-    if type_args.is_empty() || !type_args.iter().all(|a| type_arg_is_ref_shaped(a)) {
+    if type_args.is_empty()
+        || !type_args
+            .iter()
+            .all(|a| type_arg_splits_per_instantiation(a))
+    {
         return None;
     }
     Some(format!("<{}>", type_args.join(",")))
@@ -10575,22 +10589,29 @@ mod tests {
     use majit_charon_reader::Llbc;
 
     #[test]
-    fn type_arg_is_ref_shaped_excludes_only_primitives() {
-        use super::type_arg_is_ref_shaped;
+    fn type_arg_splits_per_instantiation_defers_only_float_unit_empty() {
+        use super::type_arg_splits_per_instantiation;
         // Bare named heap classes split (1-word GC pointer in the
-        // erased model → share the template's word-slot layout).
-        assert!(type_arg_is_ref_shaped("Tuple"));
-        assert!(type_arg_is_ref_shaped("W_Object"));
-        assert!(type_arg_is_ref_shaped("str"));
+        // erased model).
+        assert!(type_arg_splits_per_instantiation("Tuple"));
+        assert!(type_arg_splits_per_instantiation("W_Object"));
+        assert!(type_arg_splits_per_instantiation("str"));
         // Nested generics and tuples are also 1-word GC pointers in the
-        // erased model — they share the same word-slot layout, so they
-        // split too (`Result<StepResult<…>, PyError>` etc.).
-        assert!(type_arg_is_ref_shaped("Option<i32>"));
-        assert!(type_arg_is_ref_shaped("(A,B)"));
-        // Unboxed primitives stay on the bare variant (own layout;
-        // union cleanly as integers).
-        for p in ["bool", "u32", "usize", "i64", "f64", "char", "()", ""] {
-            assert!(!type_arg_is_ref_shaped(p), "{p} must not split");
+        // erased model (`Result<StepResult<…>, PyError>` etc.).
+        assert!(type_arg_splits_per_instantiation("Option<i32>"));
+        assert!(type_arg_splits_per_instantiation("(A,B)"));
+        // Scalar integer/bool/char primitives split too: each carries a
+        // well-defined int-banked repr, so the per-instantiation `__pos_0`
+        // annotates to that repr instead of a program-wide union.
+        for p in [
+            "bool", "char", "u8", "u32", "u64", "u128", "usize", "i8", "i64", "i128", "isize",
+        ] {
+            assert!(type_arg_splits_per_instantiation(p), "{p} must split");
+        }
+        // Deferred: floats (float bank, codewriter descr not yet bank-aware)
+        // and the unit/degenerate atoms (no materialised payload field).
+        for p in ["f32", "f64", "()", ""] {
+            assert!(!type_arg_splits_per_instantiation(p), "{p} must not split");
         }
     }
 
