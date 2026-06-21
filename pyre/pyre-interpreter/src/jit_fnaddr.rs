@@ -239,6 +239,43 @@ const MAP_BUILD_HELPER_PATHS: &[(&str, &str)] = &[
     ),
 ];
 
+/// Returns `true` when `addr` is the runtime address of a `PyFrame`
+/// operand-stack accessor (`pop` / `push` / `peek` / `peek_at`).
+///
+/// The full-body-walk tracer concretely executes plain residual calls during
+/// tracing to fold their results, but a residual targeting one of these
+/// accessors reads or mutates the live frame's operand stack — which during a
+/// walk is empty, because the walk tracks operand values symbolically in its
+/// register banks rather than on the real frame.  Executing one underflows
+/// (`pop` asserts `valuestackdepth > stack_base()`).  The walker uses this
+/// predicate to leave such a residual symbolic so it runs at runtime against a
+/// frame whose operand stack is populated.
+///
+/// The accessors are `#[inline]`, so a fresh `PyFrame::pop as *const ()` is
+/// not address-stable across call sites — it can resolve to a distinct
+/// out-of-line copy than the one the codewriter baked into the JitCode
+/// constant pool.  Match instead against the exact funcptrs the codewriter
+/// bakes: the values [`jit_trace_fnaddrs`] records for the accessor paths,
+/// computed through the very same coercion site (cached once, addresses are
+/// process-stable).
+pub fn is_pyframe_operand_stack_accessor(addr: usize) -> bool {
+    use std::sync::OnceLock;
+    static ACCESSOR_ADDRS: OnceLock<Vec<i64>> = OnceLock::new();
+    let addrs = ACCESSOR_ADDRS.get_or_init(|| {
+        jit_trace_fnaddrs()
+            .into_iter()
+            .filter(|(path, _)| {
+                path.ends_with("::PyFrame::pop")
+                    || path.ends_with("::PyFrame::push")
+                    || path.ends_with("::PyFrame::peek")
+                    || path.ends_with("::PyFrame::peek_at")
+            })
+            .map(|(_, fnaddr)| fnaddr)
+            .collect()
+    });
+    addrs.contains(&(addr as i64))
+}
+
 /// Build-time equivalent of `#[jit_module]::__majit_helper_trace_fnaddrs()`.
 ///
 /// The registry includes both the module-qualified path produced by the
@@ -1337,7 +1374,7 @@ pub fn jit_static_int_values() -> Vec<(&'static str, i64)> {
 
 #[cfg(test)]
 mod tests {
-    use super::jit_trace_fnaddrs;
+    use super::{is_pyframe_operand_stack_accessor, jit_trace_fnaddrs};
     use std::collections::HashMap;
 
     #[test]
@@ -1460,6 +1497,21 @@ mod tests {
             bindings["pyre_interpreter::var_nums_to_second_index"],
             second
         );
+    }
+
+    /// `is_pyframe_operand_stack_accessor` must recognise the funcptr the
+    /// codewriter bakes for `PyFrame::pop` — the `pop_value` sub-jitcode
+    /// residual the full-body walk must not concretely execute against the
+    /// paused outer frame — and must NOT flag `PyFrame::nlocals`, a registered
+    /// `PyFrame` method that is a constant read, safe to fold during a walk.
+    #[test]
+    fn is_pyframe_operand_stack_accessor_matches_registered_pop() {
+        let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
+        let pop = bindings["pyre_interpreter::pyframe::PyFrame::pop"];
+        assert!(is_pyframe_operand_stack_accessor(pop as usize));
+        let nlocals = bindings["pyre_interpreter::pyframe::PyFrame::nlocals"];
+        assert!(!is_pyframe_operand_stack_accessor(nlocals as usize));
+        assert!(!is_pyframe_operand_stack_accessor(0));
     }
 
     /// Negative parity guard: pyre intentionally does NOT publish a

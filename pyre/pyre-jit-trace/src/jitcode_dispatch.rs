@@ -4526,6 +4526,21 @@ fn try_execute_residual_call_via_executor(
     if (func_ptr as u64) >> 47 != 0 {
         return Ok(None);
     }
+    // A residual whose funcptr is a `PyFrame` operand-stack accessor
+    // (`pop`/`push`/`peek`/`peek_at`) reads or mutates the live frame's
+    // operand stack.  During a walk that stack is empty — the walk holds
+    // operand values symbolically in its register banks, not on the real
+    // frame (the portal lowers stack ops to vable array writes; these
+    // accessors appear only inside inlined callee sub-jitcode bodies such as
+    // `pop_value`).  Executing one here underflows `PyFrame::pop`'s
+    // `valuestackdepth > stack_base()` assertion against the paused outer
+    // frame.  Record it symbolically instead, mirroring the tracer's
+    // never-mutate-the-traced-frame discipline; it runs at runtime against a
+    // frame whose operand stack the compiled trace's preceding pushes have
+    // populated.
+    if pyre_interpreter::is_pyframe_operand_stack_accessor(func_ptr as usize) {
+        return Ok(None);
+    }
     if allboxes.len() - 1 > majit_translate::jit_codewriter::insns::MAX_HOST_CALL_ARITY {
         return Ok(None);
     }
