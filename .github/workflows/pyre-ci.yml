@@ -498,5 +498,13 @@ jobs:
     - name: Build pyre-wasm (${{ matrix.binding }})
       shell: bash
       run: |
+        # wasmi has no JS host, so getrandom uses its `custom` backend
+        # (see `__getrandom_v03_custom`), which needs this cfg; web uses
+        # `getrandom/wasm_js` via its feature instead. `.cargo/config.toml`
+        # supplies `--export-table` for wasm32, but a RUSTFLAGS env overrides
+        # (does not merge with) it, so re-include it when we set RUSTFLAGS.
+        if [ "${{ matrix.binding }}" = "wasmi" ]; then
+          export RUSTFLAGS='-C link-arg=--export-table --cfg getrandom_backend="custom"'
+        fi
         cargo build -p pyre-wasm --target wasm32-unknown-unknown \
           --no-default-features --features "${{ matrix.binding }}"
