@@ -3557,6 +3557,7 @@ struct FnPtrIndices {
     newlist_from_array_fn: HelperHandle,
     unpack_sequence_fn: HelperHandle,
     unpack_item_fn: HelperHandle,
+    unpack_ex_fn: HelperHandle,
     build_slice_fn: HelperHandle,
     normalize_raise_varargs_fn: HelperHandle,
     call_fn_0: HelperHandle,
@@ -4016,6 +4017,12 @@ fn register_helper_fn_pointers(
         cpu.store_slice_fn as *const (),
         CallFlavor::MayForce,
     );
+    // `bh_unpack_ex_fn` validates `a, *b, c = seq` and allocates the slot
+    // tuple (head items, starred list, tail items); like `unpack_sequence_fn`
+    // it can raise ValueError but materialises eagerly and does not force the
+    // virtualizable → `CallFlavor::Plain`.  `bh_unpack_item_fn` (already
+    // bound) indexes the result.  Appended last to preserve fn_ptr indices.
+    let unpack_ex_fn = bind(assembler, cpu.unpack_ex_fn as *const (), CallFlavor::Plain);
     FnPtrIndices {
         call_fn,
         load_global_fn,
@@ -4076,6 +4083,7 @@ fn register_helper_fn_pointers(
         load_fast_check_fn,
         list_extend_fn,
         store_slice_fn,
+        unpack_ex_fn,
     }
 }
 
@@ -5131,6 +5139,11 @@ impl CodeWriter {
                 HelperHandle {
                     idx: store_slice_fn_idx,
                     flavor: _store_slice_fn_flavor,
+                },
+            unpack_ex_fn:
+                HelperHandle {
+                    idx: unpack_ex_fn_idx,
+                    flavor: _unpack_ex_fn_flavor,
                 },
         } = register_helper_fn_pointers(&mut assembler, self.cpu());
 
@@ -9348,12 +9361,55 @@ impl CodeWriter {
                             let args = counts.get(op_arg);
                             let before = args.before as usize;
                             let after = args.after as usize;
-                            pop_and_decr_depth(&mut current_state, &mut current_depth);
-                            for _ in 0..before + 1 + after {
-                                push_fresh_ref(&mut current_state, &mut graph);
-                                current_depth += 1;
+                            let total = before + 1 + after;
+                            // Pop the sequence; `unpack_ex_fn(before, after, seq)`
+                            // splits it into the `before + 1 + after` slots
+                            // (head items, starred list, tail items) in TOS order
+                            // as a tuple — the UNPACK_SEQUENCE shape with a star
+                            // list slot. The result is a generic tuple (never a
+                            // SPECIALISED_TUPLE_II), so `unpack_item_fn(k, tuple)`
+                            // reads each slot through the opaque residual below.
+                            let _ = emit_popvalue_ref!(current_depth, py_pc);
+                            let seq_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            let tuple_var = residual_call!(
+                                unpack_ex_fn_idx,
+                                CallFlavor::Plain,
+                                vec![
+                                    super::flow::Constant::signed(before as i64).into(),
+                                    super::flow::Constant::signed(after as i64).into(),
+                                ],
+                                vec![seq_value],
+                                vec![],
+                                vec![Kind::Int, Kind::Int, Kind::Ref],
+                                ResKind::Ref,
+                                py_pc as i64,
+                            );
+                            let tuple_value = tuple_var
+                                .map(super::flow::FlowValue::from)
+                                .unwrap_or_else(|| fresh_ref_value(&mut graph));
+                            // Push the slots in reverse so the stack top is
+                            // slot[0] (unpack_ex pushes head items last).
+                            for k in (0..total).rev() {
+                                let item_dst = stack_base + current_depth;
+                                let item_var = residual_call!(
+                                    unpack_item_fn_idx,
+                                    CallFlavor::Plain,
+                                    majit_ir::PyreHelperKind::UnpackItem,
+                                    vec![super::flow::Constant::signed(k as i64).into()],
+                                    vec![tuple_value.clone()],
+                                    vec![],
+                                    vec![Kind::Int, Kind::Ref],
+                                    ResKind::Ref,
+                                    py_pc as i64,
+                                );
+                                let item_value = item_var
+                                    .map(super::flow::FlowValue::from)
+                                    .unwrap_or_else(|| fresh_ref_value(&mut graph));
+                                if let super::flow::FlowValue::Variable(v) = &item_value {
+                                    pin!(Some(*v), item_dst);
+                                }
+                                push_and_bump!(item_value, py_pc);
                             }
-                            emit_abort_permanent!(py_pc);
                         }
 
                         // BuildInterpolation: conditionally pops format_spec when (oparg & 1) != 0,

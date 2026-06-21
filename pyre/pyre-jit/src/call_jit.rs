@@ -4720,6 +4720,24 @@ pub extern "C" fn bh_unpack_item_fn(index: i64, seq: i64) -> i64 {
     }
 }
 
+/// UNPACK_EX: split `seq` for `a, *b, c = seq` into `before` head items, a
+/// starred middle list, and `after` tail items, returning the
+/// `before + 1 + after` slots in TOS order as a tuple (raising ValueError on
+/// too few values, or any iteration error from a non-sequence source). The
+/// portal reads each slot back out with `bh_unpack_item_fn`, mirroring
+/// `bh_unpack_sequence_fn`.
+pub extern "C" fn bh_unpack_ex_fn(before: i64, after: i64, seq: i64) -> i64 {
+    let seq = seq as pyre_object::PyObjectRef;
+    match pyre_interpreter::runtime_ops::unpack_ex_slots(before as usize, after as usize, seq) {
+        Ok(slots) => pyre_interpreter::runtime_ops::build_tuple_from_refs(&slots) as i64,
+        Err(err) => {
+            majit_metainterp::blackhole::BH_LAST_EXC_VALUE
+                .with(|c| c.set(err.to_exc_object() as i64));
+            0
+        }
+    }
+}
+
 /// Read the current (per-thread) exception saved in
 /// `pyre_interpreter::eval::CURRENT_EXCEPTION`. Matches the read at
 /// `pyopcode.py:786 PUSH_EXC_INFO` (implicit via `executioncontext.sys_exc_info`).

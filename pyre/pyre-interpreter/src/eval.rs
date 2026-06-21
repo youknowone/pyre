@@ -3736,40 +3736,13 @@ impl OpcodeStepExecutor for PyFrame {
         let before = args.before as usize;
         let after = args.after as usize;
         let value = self.pop();
-
-        let elements: Vec<PyObjectRef> = unsafe {
-            if pyre_object::is_tuple(value) {
-                pyre_object::w_tuple_items_copy_as_vec(value)
-            } else if pyre_object::is_list(value) {
-                pyre_object::w_list_items_copy_as_vec(value)
-            } else {
-                // Any other iterable is materialised via the iteration
-                // protocol, matching `unpack_sequence_exact`'s fallback.
-                crate::builtins::collect_iterable(value)?
-            }
-        };
-
-        let min_expected = before + after;
-        if elements.len() < min_expected {
-            return Err(PyError::value_error(&format!(
-                "not enough values to unpack (expected at least {}, got {})",
-                min_expected,
-                elements.len()
-            )));
+        // `unpack_ex_slots` returns the `before + 1 + after` slots in TOS
+        // order (head items, starred list, tail items); push bottom-first so
+        // the first head item ends on top.
+        let slots = crate::runtime_ops::unpack_ex_slots(before, after, value)?;
+        for item in slots.into_iter().rev() {
+            self.push(item);
         }
-
-        let middle_len = elements.len() - min_expected;
-
-        // Push after items (reversed), then middle list, then before items (reversed)
-        for i in (0..after).rev() {
-            self.push(elements[before + middle_len + i]);
-        }
-        let middle: Vec<PyObjectRef> = elements[before..before + middle_len].to_vec();
-        self.push(pyre_object::w_list_new(middle));
-        for i in (0..before).rev() {
-            self.push(elements[i]);
-        }
-
         Ok(())
     }
 

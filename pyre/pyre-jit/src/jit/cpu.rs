@@ -217,6 +217,10 @@ pub struct Cpu {
     pub unpack_sequence_fn: extern "C" fn(i64, i64) -> i64,
     /// Read item `index` out of the validated unpack tuple — (index, seq) → item.
     pub unpack_item_fn: extern "C" fn(i64, i64) -> i64,
+    /// UNPACK_EX residual — `(before, after, seq) → tuple` of the
+    /// `before + 1 + after` slots (head items, starred list, tail items)
+    /// in TOS order; read back with `unpack_item_fn`.
+    pub unpack_ex_fn: extern "C" fn(i64, i64, i64) -> i64,
     /// `bhimpl_build_slice` — (argc, start, stop, step) → new slice.
     pub build_slice_fn: extern "C" fn(i64, i64, i64, i64) -> i64,
     /// `RAISE_VARARGS` normalization helper used before `raise/r`.
@@ -349,6 +353,7 @@ impl Cpu {
             newlist_from_array_fn: crate::call_jit::bh_newlist_from_array,
             unpack_sequence_fn: crate::call_jit::bh_unpack_sequence_fn,
             unpack_item_fn: crate::call_jit::bh_unpack_item_fn,
+            unpack_ex_fn: crate::call_jit::bh_unpack_ex_fn,
             build_slice_fn: crate::call_jit::bh_build_slice_fn,
             normalize_raise_varargs_fn: crate::call_jit::bh_normalize_raise_varargs_with_frame,
             get_current_exception_fn: crate::call_jit::bh_get_current_exception,
