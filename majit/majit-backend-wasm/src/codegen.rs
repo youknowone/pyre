@@ -1401,8 +1401,7 @@ fn build_function(
             // `jit_call` trampoline to the `wasm_jit_alloc` helper, then write
             // the vtable / length fields with pointer-width (i32) stores.
             OpCode::New | OpCode::NewWithVtable => {
-                let jit_call =
-                    jit_call_idx.expect("New op present but jit_call not imported");
+                let jit_call = jit_call_idx.expect("New op present but jit_call not imported");
                 let vi = op.pos.get().raw();
                 // llmodel.py:778-782: size, type_id, vtable from the size descr.
                 let descr = op.getdescr();
@@ -1458,13 +1457,13 @@ fn build_function(
                 }
             }
             OpCode::NewArray | OpCode::NewArrayClear => {
-                let jit_call =
-                    jit_call_idx.expect("NewArray op present but jit_call not imported");
+                let jit_call = jit_call_idx.expect("NewArray op present but jit_call not imported");
                 let vi = op.pos.get().raw();
                 let descr = op.getdescr();
                 let ad = descr.as_ref().and_then(|d| d.as_array_descr());
-                let (base_size, item_size) =
-                    ad.map_or((16i64, 8i64), |ad| (ad.base_size() as i64, ad.item_size() as i64));
+                let (base_size, item_size) = ad.map_or((16i64, 8i64), |ad| {
+                    (ad.base_size() as i64, ad.item_size() as i64)
+                });
                 let len_offset = ad
                     .and_then(|ad| ad.len_descr())
                     .map_or(0i64, |ld| ld.offset() as i64);

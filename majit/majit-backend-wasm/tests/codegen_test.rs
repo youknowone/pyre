@@ -504,9 +504,17 @@ fn test_guard_subclass_lowers_to_subclassrange_check() {
     info.subclass_ranges.insert(0xCAFE, (10, 20));
 
     // gcremovetypeptr branch: vtable_offset = None.
-    let (bytes, guards) =
-        codegen::build_wasm_module(&inputargs, &ops, &constants, None, &HashMap::new(), &info, 0, 0)
-            .expect("wasm codegen should succeed when supports_guard_gc_type=true");
+    let (bytes, guards) = codegen::build_wasm_module(
+        &inputargs,
+        &ops,
+        &constants,
+        None,
+        &HashMap::new(),
+        &info,
+        0,
+        0,
+    )
+    .expect("wasm codegen should succeed when supports_guard_gc_type=true");
     validate_wasm(&bytes);
     assert_eq!(guards.len(), 1);
 

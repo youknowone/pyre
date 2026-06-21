@@ -1940,7 +1940,12 @@ pub fn str_len_descr() -> DescrRef {
     // `W_StrObject.len` is a `usize`: 8 bytes on 64-bit, 4 on wasm32 — a
     // hardcoded 8 reads the adjacent field into the high half on a 32-bit
     // target (blackhole resume of `len(str)`).
-    make_immutable_field_descr(STR_LEN_OFFSET, std::mem::size_of::<usize>(), Type::Int, false)
+    make_immutable_field_descr(
+        STR_LEN_OFFSET,
+        std::mem::size_of::<usize>(),
+        Type::Int,
+        false,
+    )
 }
 
 pub fn dict_storage_values_ptr_descr() -> DescrRef {

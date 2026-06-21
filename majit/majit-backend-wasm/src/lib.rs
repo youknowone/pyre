@@ -93,7 +93,6 @@ fn with_wasm_active_gc<R>(f: impl FnOnce(&dyn GcAllocator) -> R) -> Option<R> {
     })
 }
 
-
 /// `majit_gc::CheckIsObjectFn` installed by `set_gc_allocator`.
 /// Mirrors cranelift's `check_is_object_via_active_runtime`: dispatches
 /// through the wasm-thread-local GC allocator.
@@ -174,8 +173,12 @@ pub extern "C" fn wasm_jit_alloc_array(
     };
     WASM_ACTIVE_GC.with(|cell| match cell.borrow_mut().as_deref_mut() {
         Some(gc) => {
-            let obj =
-                gc.alloc_varsize_typed(type_id as u32, base_size as usize, item_size as usize, length);
+            let obj = gc.alloc_varsize_typed(
+                type_id as u32,
+                base_size as usize,
+                item_size as usize,
+                length,
+            );
             if obj.is_null() {
                 0
             } else {
@@ -450,7 +453,10 @@ fn wasm_unsupported_trace_reason(ops: &[Op]) -> Option<String> {
         if op.opcode.is_call_assembler() {
             // CALL_ASSEMBLER enters another trace's compiled token; the wasm
             // backend has no inter-module trace chaining (#62).
-            return Some(format!("wasm backend: {:?} (loop-callee inline)", op.opcode));
+            return Some(format!(
+                "wasm backend: {:?} (loop-callee inline)",
+                op.opcode
+            ));
         }
         match op.opcode {
             majit_ir::OpCode::Label => has_label = true,
@@ -475,7 +481,9 @@ fn wasm_unsupported_trace_reason(ops: &[Op]) -> Option<String> {
     // its GC) runs the loop. An all-inline allocating loop (no residual call)
     // stays compiled: it is fast and its bounded run does not exhaust memory.
     if has_label && has_new && has_call {
-        return Some("wasm backend: allocation + residual call in loop trace (no GC nursery)".into());
+        return Some(
+            "wasm backend: allocation + residual call in loop trace (no GC nursery)".into(),
+        );
     }
     None
 }

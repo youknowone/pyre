@@ -2137,7 +2137,15 @@ pub fn trace_and_compile_from_bridge(
     // routing is wasm-only.
     #[cfg(target_arch = "wasm32")]
     {
-        let _ = (frame, raw_values, exit_layout, guard_exc, green_key, trace_id, fail_index);
+        let _ = (
+            frame,
+            raw_values,
+            exit_layout,
+            guard_exc,
+            green_key,
+            trace_id,
+            fail_index,
+        );
         return false;
     }
 

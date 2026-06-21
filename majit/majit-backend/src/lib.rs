@@ -2095,10 +2095,7 @@ pub trait Backend: Send {
                 (4, true) => (addr as *const i32).read_unaligned() as i64,
                 (4, false) => (addr as *const u32).read_unaligned() as i64,
                 (8, _) => (addr as *const i64).read_unaligned(),
-                other => panic!(
-                    "bh_getfield_gc_i: unsupported (size, signed) = {:?}",
-                    other,
-                ),
+                other => panic!("bh_getfield_gc_i: unsupported (size, signed) = {:?}", other,),
             }
         }
     }
